@@ -1,0 +1,5 @@
+{
+  "name": "constitution",
+  "description": "Agent-workflow conventions: escalation dossier protocol, rule capitalization trigger, agent-push /touch capture with pluggable log providers (file/Notion) + layered config, layered rules injection (shipped < user < repo).",
+  "version": "0.4.0"
+}

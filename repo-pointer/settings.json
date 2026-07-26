@@ -1,0 +1,13 @@
+{
+  "extraKnownMarketplaces": {
+    "ostrom": {
+      "source": {
+        "source": "github",
+        "repo": "onsager-ai/ostrom"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "constitution@ostrom": true
+  }
+}
