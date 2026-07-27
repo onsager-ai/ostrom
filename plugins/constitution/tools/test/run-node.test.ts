@@ -72,6 +72,10 @@ describe("run-node shim", () => {
         VOLTA_HOME: join(root, "missing-volta"),
         ASDF_DATA_DIR: join(root, "missing-asdf"),
         PATH: "/usr/bin:/bin",
+        // Neutralise the system-wide fallbacks. Without this the test only
+        // passes on a machine that has no node in /usr/local/bin — true of a
+        // typical nvm-only dev box, false of every CI runner.
+        OSTROM_NODE_FALLBACKS: "",
       },
       encoding: "utf8",
     });
