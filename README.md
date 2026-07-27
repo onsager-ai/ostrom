@@ -27,7 +27,9 @@ personal constitution.
 - `plugins/constitution/` — the plugin: frozen rules (injected at SessionStart), /touch skill, /doctor skill
 - `plugins/constitution/hooks/inject-constitution.sh` — SessionStart hook: emits the layered constitution (shipped → user → repo)
 - `plugins/constitution/config/` — shipped defaults + reference examples for the /touch log (provider choice + layered YAML config) and for private rules (`rules.example.md`)
-- `plugins/constitution/scripts/doctor.sh` — read-only prober behind /doctor: checks plugin/marketplace/rules-layers/touch-durability/provider-reachability/environment/config-parser, one `STATUS|check|detail|remedy` line each
+- `plugins/constitution/scripts/run-node.sh` — Node-resolution shim behind /doctor (including non-interactive nvm/fnm/volta/asdf environments)
+- `plugins/constitution/tools/` — TypeScript source, tests, and build configuration for the /doctor prober
+- `plugins/constitution/dist/doctor.js` — committed, zero-runtime-dependency /doctor bundle
 - `repo-pointer/settings.json` — snippet to merge into each target repo's `.claude/settings.json`
 - `bootstrap.sh` — one command to make a fresh environment ostrom-aware (user-level enroll + config provisioning)
 - `LICENSE` — MIT
@@ -102,11 +104,12 @@ comment — match `frozen-rules.md`'s own style).
 
 ## Doctor
 
-`/doctor` runs `plugins/constitution/scripts/doctor.sh` and reports on
-seven checks: plugin installed, marketplace clone still fast-forwardable,
-which rules layers actually fired, touch-log target durability, provider
-reachability, local vs cloud environment, and whether the config parse
-itself was authoritative or a heuristic fallback.
+`/doctor` runs `plugins/constitution/scripts/run-node.sh`, which resolves
+Node from `PATH` or common version-manager locations and launches the
+committed TypeScript bundle. It reports on seven checks: plugin installed,
+marketplace clone still fast-forwardable, which rules layers actually
+fired, touch-log target durability, provider reachability, local vs cloud
+environment, and the supported shape of the config parser.
 
 It exists because silent degradation is the actual failure mode here, not
 a crash. The SessionStart hook injects the shipped rules and nothing else
