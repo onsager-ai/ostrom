@@ -1,3 +1,4 @@
 # Local Claude Code permission state is machine-specific and never versioned.
 .claude/settings.local.json
 .DS_Store
+node_modules/

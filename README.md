@@ -24,9 +24,12 @@ personal constitution.
 ## Layout
 
 - `.claude-plugin/marketplace.json` — marketplace catalog (this repo is the marketplace)
-- `plugins/constitution/` — the plugin: frozen rules (injected at SessionStart), /touch skill
+- `plugins/constitution/` — the plugin: frozen rules (injected at SessionStart), /touch skill, /doctor skill
 - `plugins/constitution/hooks/inject-constitution.sh` — SessionStart hook: emits the layered constitution (shipped → user → repo)
 - `plugins/constitution/config/` — shipped defaults + reference examples for the /touch log (provider choice + layered YAML config) and for private rules (`rules.example.md`)
+- `plugins/constitution/scripts/run-node.sh` — Node-resolution shim behind /doctor (including non-interactive nvm/fnm/volta/asdf environments)
+- `plugins/constitution/tools/` — TypeScript source, tests, and build configuration for the /doctor prober
+- `plugins/constitution/dist/doctor.js` — committed, zero-runtime-dependency /doctor bundle
 - `repo-pointer/settings.json` — snippet to merge into each target repo's `.claude/settings.json`
 - `bootstrap.sh` — one command to make a fresh environment ostrom-aware (user-level enroll + config provisioning)
 - `LICENSE` — MIT
@@ -98,6 +101,25 @@ a private repo layer) — **outside this repo**, same as the touch config's
 `secrets.yaml`. See `plugins/constitution/config/rules.example.md` for the
 format (a `##` rule heading, body, then a `Source:`/`Preconditions:` HTML
 comment — match `frozen-rules.md`'s own style).
+
+## Doctor
+
+`/doctor` runs `plugins/constitution/scripts/run-node.sh`, which resolves
+Node from `PATH` or common version-manager locations and launches the
+committed TypeScript bundle. It reports on seven checks: plugin installed,
+marketplace clone still fast-forwardable, which rules layers actually
+fired, touch-log target durability, provider reachability, local vs cloud
+environment, and the supported shape of the config parser.
+
+It exists because silent degradation is the actual failure mode here, not
+a crash. The SessionStart hook injects the shipped rules and nothing else
+when no user layer is present, and looks exactly like it's working. `/touch`
+falls back to the `file` provider and keeps appending to a local markdown
+file indefinitely, and that looks exactly like working too. Nothing errors
+— touches just never reach another machine, or a documented bootstrap
+one-liner 404s for months because nothing ever checked. `/doctor` is the
+thing that checks: read-only, mutates nothing, and turns each of those
+silent states into an `OK` / `WARN` / `FAIL` line with a concrete remedy.
 
 ## Touch-log config
 
