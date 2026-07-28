@@ -13,11 +13,12 @@ converts that silence into a short, actionable report.
 
 ## 1. Run the prober
 
-Run `scripts/doctor.sh` (sibling of `skills/`, i.e.
-`../../scripts/doctor.sh` from this file). It is read-only (it makes
-exactly one write of its own: a `git fetch` into the marketplace's cached
-clone, touching that clone's remote-tracking refs only) and always exits
-0; each line is:
+Run `scripts/run-node.sh` (sibling of `skills/`, i.e.
+`../../scripts/run-node.sh` from this file). The shim locates Node even
+when an interactive version manager has not put it on `PATH`, then runs
+the bundled doctor. The doctor is read-only (it makes exactly one write of
+its own: a `git fetch` into the marketplace's cached clone, touching that
+clone's remote-tracking refs only) and always exits 0; each line is:
 
 ```
 STATUS|check-name|detail|remedy
