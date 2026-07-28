@@ -61,14 +61,21 @@ if [ -f "$nvm_alias" ]; then
   esac
 fi
 
+# System-wide locations, searched last. Overridable via OSTROM_NODE_FALLBACKS
+# (space-separated paths) so a user can pin a specific runtime — and so the
+# test suite can exercise the not-found path on a machine that happens to have
+# a node in one of these directories. CI runners do; this developer machine
+# does not, which is precisely the kind of environment assumption this shim
+# exists to stop making.
+: "${OSTROM_NODE_FALLBACKS=/usr/local/bin/node /opt/homebrew/bin/node $HOME/.local/bin/node}"
+
+# shellcheck disable=SC2086  # deliberate word-splitting: the override is a path list
 for candidate in \
   "${FNM_DIR:-$HOME/.local/share/fnm}/aliases/default/bin/node" \
   "$HOME/.fnm/aliases/default/bin/node" \
   "${VOLTA_HOME:-$HOME/.volta}/bin/node" \
   "${ASDF_DATA_DIR:-$HOME/.asdf}/shims/node" \
-  /usr/local/bin/node \
-  /opt/homebrew/bin/node \
-  "$HOME/.local/bin/node"
+  $OSTROM_NODE_FALLBACKS
 do
   run_if_node "$candidate" "$@"
 done
