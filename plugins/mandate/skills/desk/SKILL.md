@@ -22,9 +22,10 @@ Read and merge these layers, most-specific wins:
 The v1 provider must resolve to `file`. Its fixed private records are
 `~/.claude/ostrom/queue.jsonl` and `~/.claude/ostrom/state.json`. Never
 create, display, or commit a roster anywhere else. If no mandates file is
-configured, say so and stop. Every project requires a free-text `delegated`
-outcome; a missing value is a config error. A `paused: true` project emits
-no proposals and is observed only for CI health.
+configured, say so and stop. Project scope is expressed with qualified glob
+selector lists; unmatched work follows the explicit project `default`. A
+`paused: true` project suppresses routine proposals, but reserved refs,
+tripwires, and CI drift remain active.
 
 ## 2. List pending records
 
@@ -32,6 +33,8 @@ Run:
 
 ```sh
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/queue.sh" list
+jq '.repos[] | {notice, unclassified, scope_changes}' \
+  "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/ostrom/state.json"
 ```
 
 Each JSON row is a pointer with exactly `id`, `repo`, `ref`, `kind`,
@@ -63,6 +66,11 @@ references.
 A tripwire never auto-proceeds. Only an explicit human approval may cross
 it. The dossier shape is the constitution plugin's frozen escalation
 protocol; this dependency points from mandate to constitution only.
+
+State notices are digest rollups, not approvable queue items. For a mandate
+change, use `scope_changes.entered` and `scope_changes.left` to show `/desk`
+detail. An unclassified count asks for roster triage; it does not authorize
+agent action.
 
 ## 4. Confirm
 

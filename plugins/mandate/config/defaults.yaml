@@ -7,18 +7,18 @@
 # Mandate content is private. This file ships mechanism defaults only; put
 # the real roster and its boundaries in the user layer. The parser supports
 # this intentionally small schema: root scalars, bounce_all, and projects
-# containing repo + delegated + paused + bounce.
+# containing selector lists plus default and paused scalars.
 
 provider: file
 cadence_hours: 24
 stuck_after_days: 7
 
-# Shared write-surface tripwires. Matching is case-insensitive against an
-# issue/PR title and labels. A more-specific layer may replace this list.
+# Shared write-surface tripwires. Selectors are case-insensitive qualified
+# globs. A more-specific layer may replace this list.
 bounce_all:
-  - merge to main
-  - production deployment
-  - external publication
-  - credential or secret
+  - title:*merge to main*
+  - title:*production deployment*
+  - title:*external publication*
+  - title:*credential*
 
 projects: []

@@ -77,10 +77,20 @@ remain machine-local at `~/.claude/ostrom/mandates.yaml`,
 `~/.claude/ostrom/queue.jsonl`, and `~/.claude/ostrom/state.json`; none
 belongs in this repository.
 
-Each project requires a free-text `delegated` outcome and may set
-`paused: true`. Work outside the delegated phrase is a human decision;
-paused projects produce no proposals and are read only for PR CI health.
-Tripwires still take precedence over delegated scope.
+Each project uses case-insensitive qualified glob selectors in `delegated`,
+`excluded`, and `bounce`; `reserved` is a list of exact issue/PR numbers.
+Supported selectors are `label:`, `scope:`, `type:`, `path:`, `ref:`, and
+`title:`. `*` is the only wildcard (`path:**` spans directory depth), and a
+`title:` selector must include `*`. Pull requests inherit the labels and refs
+of their closing issues.
+
+Classification precedence is reserved → shared/project bounce → excluded →
+delegated → `default`. The default is `unclassified`, which produces one
+per-repo `/desk` triage line rather than one queue row per item; projects may
+explicitly choose `default: delegated` or `default: excluded`. Pausing a
+project suppresses routine work but never reserved refs, tripwires, or failing
+CI. The first sweep baselines existing work, and selector changes re-baseline
+scope rather than flooding the queue.
 
 Run the read-only sweep daily outside Claude Code. For example, edit the
 placeholder clone path and install this with `crontab -e`:

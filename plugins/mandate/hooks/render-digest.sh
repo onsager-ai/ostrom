@@ -66,8 +66,56 @@ render_section "MOVED SINCE $cursor" '["moved"]'
 render_section "STUCK" '["stuck"]'
 render_section "DRIFT" '["drift"]'
 
+state_rollups='[]'
+dead_selectors='[]'
+if [ -s "$MANDATE_STATE_FILE" ]; then
+  state_rollups="$(
+    jq -c '
+      [
+        .repos
+        | to_entries[]
+        | {
+            repo: .key,
+            notice: (.value.notice.text // null),
+            unclassified: (.value.unclassified // 0)
+          }
+      ]
+    ' "$MANDATE_STATE_FILE" 2>/dev/null || echo '[]'
+  )"
+  dead_selectors="$(
+    jq -c '.dead_selectors // []' "$MANDATE_STATE_FILE" 2>/dev/null || echo '[]'
+  )"
+fi
+
+jq -r '.[] | .notice // empty' <<<"$state_rollups"
+jq -r '
+  .[]
+  | select(.unclassified > 0)
+  | .repo + ": " + (.unclassified | tostring) + " unclassified — /desk triage"
+' <<<"$state_rollups"
+jq -r '
+  .[]
+  | if .repo == null
+    then "dead selector — " + .source + " " + .selector
+    else .repo + ": dead selector — " + .source + " " + .selector
+    end
+' <<<"$dead_selectors"
+
 total_projects="$(jq '.projects | length' <<<"$config")"
-troubled_projects="$(jq '[.[].repo] | unique | length' <<<"$active")"
+troubled_projects="$(
+  jq -n \
+    --argjson active "$active" \
+    --argjson rollups "$state_rollups" \
+    --argjson dead "$dead_selectors" '
+    [
+      $active[].repo,
+      ($rollups[] | select(.notice != null or .unclassified > 0) | .repo),
+      ($dead[] | .repo // empty)
+    ]
+    | unique
+    | length
+  '
+)"
 nominal="$((total_projects - troubled_projects))"
 [ "$nominal" -lt 0 ] && nominal=0
 [ "$stale" -eq 1 ] && echo "STALE — mandate sweep overdue"
