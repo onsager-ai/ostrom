@@ -284,6 +284,16 @@ cp "$state" "$fixture/state.before"
 run_sweep >/dev/null
 cmp "$fixture/queue.before" "$queue"
 cmp "$fixture/state.before" "$state"
+steady_digest="$(
+  cd "$fixture/repo"
+  CLAUDE_CONFIG_DIR="$fixture/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/hooks/render-digest.sh"
+)"
+if grep -q 'baselined [0-9][0-9]* open items' <<<"$steady_digest"; then
+  echo "baseline notice survived an unchanged second sweep" >&2
+  exit 1
+fi
 
 # A later PR update produces one ready decision, proving inherited labels are
 # used by the live (non-baseline) classifier too.
@@ -319,6 +329,16 @@ policy_digest="$(
     bash "$PLUGIN_ROOT/hooks/render-digest.sh"
 )"
 grep -q 'mandate changed — 1 items entered scope, 1 left' <<<"$policy_digest"
+policy_digest_again="$(
+  cd "$fixture/repo"
+  CLAUDE_CONFIG_DIR="$fixture/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/hooks/render-digest.sh"
+)"
+if grep -q 'mandate changed —' <<<"$policy_digest_again"; then
+  echo "mandate-change notice rendered more than once" >&2
+  exit 1
+fi
 
 # Selectors that matched nowhere remain available only through explicit lint.
 jq -e '
@@ -387,6 +407,78 @@ portfolio_digest="$(
 grep -q '^8 projects nominal$' <<<"$portfolio_digest"
 if grep -Eq 'dead selector|unmatched in last sweep' <<<"$portfolio_digest"; then
   echo "mostly unmatched roster rendered selector diagnostics" >&2
+  exit 1
+fi
+
+# Baseline notices render once, survive unchanged sweeps as acknowledged
+# state, and become fresh one-shot news after a repo state reset.
+baseline_once="$fixture/baseline-once"
+mkdir -p "$baseline_once/config/ostrom" "$baseline_once/repo"
+cat >"$baseline_once/config/ostrom/mandates.yaml" <<'YAML'
+bounce_all: []
+projects:
+  - repo: example-org/rebaseline
+    delegated: []
+    excluded: []
+    reserved: []
+    default: unclassified
+    paused: false
+    bounce: []
+YAML
+run_baseline_once_sweep() {
+  (
+    cd "$baseline_once/repo"
+    PATH="$fixture/bin:$PATH" \
+      CLAUDE_CONFIG_DIR="$baseline_once/config" \
+      CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+      bash "$PLUGIN_ROOT/scripts/sweep.sh" >/dev/null
+  )
+}
+render_baseline_once() {
+  (
+    cd "$baseline_once/repo"
+    CLAUDE_CONFIG_DIR="$baseline_once/config" \
+      CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+      bash "$PLUGIN_ROOT/hooks/render-digest.sh"
+  )
+}
+
+run_baseline_once_sweep
+baseline_state_mtime="$(
+  stat -c %Y "$baseline_once/config/ostrom/state.json" 2>/dev/null ||
+    stat -f %m "$baseline_once/config/ostrom/state.json"
+)"
+first_baseline_digest="$(render_baseline_once)"
+grep -q '^example-org/rebaseline: baselined 0 open items$' \
+  <<<"$first_baseline_digest"
+reported_state_mtime="$(
+  stat -c %Y "$baseline_once/config/ostrom/state.json" 2>/dev/null ||
+    stat -f %m "$baseline_once/config/ostrom/state.json"
+)"
+[ "$baseline_state_mtime" -eq "$reported_state_mtime" ]
+jq -e '
+  .repos["example-org/rebaseline"].notice.reported == true
+' "$baseline_once/config/ostrom/state.json" >/dev/null
+
+run_baseline_once_sweep
+second_baseline_digest="$(render_baseline_once)"
+if grep -q 'baselined [0-9][0-9]* open items' <<<"$second_baseline_digest"; then
+  echo "baseline notice rendered after an unchanged second sweep" >&2
+  exit 1
+fi
+
+jq '.repos = {}' "$baseline_once/config/ostrom/state.json" \
+  >"$baseline_once/config/ostrom/state.reset"
+mv "$baseline_once/config/ostrom/state.reset" \
+  "$baseline_once/config/ostrom/state.json"
+run_baseline_once_sweep
+reset_baseline_digest="$(render_baseline_once)"
+grep -q '^example-org/rebaseline: baselined 0 open items$' \
+  <<<"$reset_baseline_digest"
+reset_baseline_digest_again="$(render_baseline_once)"
+if grep -q 'baselined [0-9][0-9]* open items' \
+  <<<"$reset_baseline_digest_again"; then
+  echo "reset baseline notice rendered more than once" >&2
   exit 1
 fi
 

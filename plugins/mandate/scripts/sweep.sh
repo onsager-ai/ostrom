@@ -460,11 +460,13 @@ while IFS= read -r project; do
           if $initial then
             {
               kind: "baseline",
+              reported: false,
               text: ($project.repo + ": baselined " + ($items | length | tostring) + " open items")
             }
           elif $policy_changed then
             {
               kind: "policy",
+              reported: false,
               text: (
                 $project.repo
                 + ": mandate changed — "

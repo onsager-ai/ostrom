@@ -109,6 +109,8 @@ remains explicit for a later addition.
 
 Run `/desk lint` explicitly to inspect selectors that matched no open item in
 the last sweep; unmatched selectors never add daily digest lines.
+Baseline and mandate-change summaries render once, then are acknowledged in
+the private state so they do not become permanent session noise.
 
 ## Cloud / CI
 
