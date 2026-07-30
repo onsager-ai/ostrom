@@ -1,0 +1,24 @@
+# Copy this file to ~/.claude/ostrom/mandates.yaml and replace every
+# placeholder. Never commit the resulting private roster.
+#
+# Layers resolve shipped defaults < user file < ./.ostrom/mandates.yaml.
+# Lists in a more-specific layer replace the corresponding earlier list.
+
+provider: file
+cadence_hours: 24
+stuck_after_days: 7
+
+bounce_all:
+  - merge to main
+  - production deployment
+  - external publication
+  - credential or secret
+
+projects:
+  - repo: example-org/example-repo
+    bounce:
+      - public release
+      - backwards-incompatible API
+  - repo: example-org/another-repo
+    bounce:
+      - public-readiness gate

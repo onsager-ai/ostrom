@@ -1,0 +1,24 @@
+# ostrom — mandate config (shipped defaults)
+#
+# Layered, most-specific wins:
+#   these defaults  <  ~/.claude/ostrom/mandates.yaml (user)
+#                   <  ./.ostrom/mandates.yaml (repo)
+#
+# Mandate content is private. This file ships mechanism defaults only; put
+# the real roster and its boundaries in the user layer. The parser supports
+# this intentionally small schema: root scalars, bounce_all, and projects
+# containing repo + bounce.
+
+provider: file
+cadence_hours: 24
+stuck_after_days: 7
+
+# Shared write-surface tripwires. Matching is case-insensitive against an
+# issue/PR title and labels. A more-specific layer may replace this list.
+bounce_all:
+  - merge to main
+  - production deployment
+  - external publication
+  - credential or secret
+
+projects: []
