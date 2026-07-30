@@ -267,6 +267,10 @@ digest="$(
 grep -q '^example-org/example-repo: baselined 10 open items$' <<<"$digest"
 grep -q '^example-org/another-repo: baselined 1 open items$' <<<"$digest"
 grep -q '^example-org/example-repo: 3 unclassified — /desk triage$' <<<"$digest"
+if grep -Eq 'dead selector|unmatched in last sweep' <<<"$digest"; then
+  echo "unmatched selectors leaked into the digest" >&2
+  exit 1
+fi
 
 # The hook stays local, and a repeat sweep with no upstream movement is a
 # serialized no-op.
@@ -316,12 +320,21 @@ policy_digest="$(
 )"
 grep -q 'mandate changed — 1 items entered scope, 1 left' <<<"$policy_digest"
 
-# A selector that matched nowhere in the complete sweep is audible.
+# Selectors that matched nowhere remain available only through explicit lint.
 jq -e '
   .dead_selectors
   | any(.source == "bounce_all" and .selector == "title:*never fires*")
 ' "$state" >/dev/null
-grep -q '^dead selector — bounce_all title:\*never fires\*$' <<<"$policy_digest"
+if grep -Eq 'dead selector|unmatched in last sweep' <<<"$policy_digest"; then
+  echo "unmatched selectors leaked into the policy digest" >&2
+  exit 1
+fi
+lint_output="$(
+  CLAUDE_CONFIG_DIR="$fixture/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/queue.sh" lint
+)"
+grep -q '^unmatched in last sweep — bounce_all title:\*never fires\*$' \
+  <<<"$lint_output"
 
 # Queue mutations remain compatible with selector reasons.
 CLAUDE_CONFIG_DIR="$fixture/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
@@ -371,6 +384,81 @@ portfolio_digest="$(
     bash "$PLUGIN_ROOT/hooks/render-digest.sh"
 )"
 [ "$(wc -l <<<"$portfolio_digest")" -le 20 ]
+grep -q '^8 projects nominal$' <<<"$portfolio_digest"
+if grep -Eq 'dead selector|unmatched in last sweep' <<<"$portfolio_digest"; then
+  echo "mostly unmatched roster rendered selector diagnostics" >&2
+  exit 1
+fi
+
+# Baseline notices and unclassified rollups are informational: without an
+# actionable queue row every configured project remains nominal.
+rollup="$fixture/rollup-only"
+mkdir -p "$rollup/config/ostrom" "$rollup/repo"
+cat >"$rollup/config/ostrom/mandates.yaml" <<'YAML'
+bounce_all: []
+projects:
+  - repo: example-org/rollup-one
+    delegated: []
+    excluded: []
+    reserved: []
+    default: unclassified
+    paused: false
+    bounce: []
+  - repo: example-org/rollup-two
+    delegated: []
+    excluded: []
+    reserved: []
+    default: unclassified
+    paused: false
+    bounce: []
+YAML
+cat >"$rollup/config/ostrom/state.json" <<'JSON'
+{
+  "version": 2,
+  "repos": {
+    "example-org/rollup-one": {
+      "cursor": "2026-07-30T00:00:00Z",
+      "notice": {
+        "kind": "baseline",
+        "text": "example-org/rollup-one: baselined 3 open items"
+      },
+      "unclassified": 3
+    },
+    "example-org/rollup-two": {
+      "cursor": "2026-07-30T00:00:00Z",
+      "notice": {
+        "kind": "baseline",
+        "text": "example-org/rollup-two: baselined 2 open items"
+      },
+      "unclassified": 2
+    }
+  },
+  "dead_selectors": [
+    {
+      "repo": "example-org/rollup-one",
+      "source": "delegated",
+      "selector": "label:nothing-open"
+    }
+  ]
+}
+JSON
+rollup_digest="$(
+  cd "$rollup/repo"
+  CLAUDE_CONFIG_DIR="$rollup/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/hooks/render-digest.sh"
+)"
+grep -q '^example-org/rollup-one: baselined 3 open items$' <<<"$rollup_digest"
+grep -q '^example-org/rollup-two: baselined 2 open items$' <<<"$rollup_digest"
+grep -q '^example-org/rollup-one: 3 unclassified — /desk triage$' \
+  <<<"$rollup_digest"
+grep -q '^example-org/rollup-two: 2 unclassified — /desk triage$' \
+  <<<"$rollup_digest"
+grep -q '^2 projects nominal$' <<<"$rollup_digest"
+if grep -Eq 'dead selector|unmatched in last sweep' <<<"$rollup_digest"; then
+  echo "rollup-only digest rendered selector diagnostics" >&2
+  exit 1
+fi
 
 # A healthy durable portfolio renders exactly one nominal line.
 mkdir -p "$fixture/healthy/config/ostrom" "$fixture/healthy/repo"

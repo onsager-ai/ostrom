@@ -1,9 +1,9 @@
 ---
 name: desk
-description: Read and decide mandate queue items. Use when the user types
+description: Read, lint, and decide mandate queue items. Use when the user types
   /desk, asks what portfolio decisions are waiting, or asks to approve,
-  reject, or defer a mandate proposal.
-argument-hint: "[list] | approve <repo#number> | reject <repo#number> | defer <repo#number>"
+  reject, defer, or lint a mandate.
+argument-hint: "[list] | lint | approve <repo#number> | reject <repo#number> | defer <repo#number>"
 ---
 
 # Mandate Desk
@@ -47,7 +47,20 @@ Blast radius. Do not fetch or copy an issue or PR body into the queue.
 If no action was supplied, stop after the list and ask for approve, reject,
 or defer only when records are present.
 
-## 3. Apply exactly one decision
+## 3. Lint selectors on request
+
+When the user runs `/desk lint`, run:
+
+```sh
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/queue.sh" lint
+```
+
+Present every selector that matched no open item in the last durable sweep.
+This is an on-demand config-quality diagnostic, not proof that a selector is
+invalid or authorization to change the private roster. Never include these
+diagnostics in the daily digest.
+
+## 4. Apply exactly one decision
 
 Resolve `<id>` from the displayed record; do not guess across ambiguous
 references.
@@ -72,7 +85,7 @@ change, use `scope_changes.entered` and `scope_changes.left` to show `/desk`
 detail. An unclassified count asks for roster triage; it does not authorize
 agent action.
 
-## 4. Confirm
+## 5. Confirm
 
 Confirm with the resulting queue record and, for approval only, the emitted
 handoff instruction. No commentary.

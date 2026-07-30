@@ -67,7 +67,6 @@ render_section "STUCK" '["stuck"]'
 render_section "DRIFT" '["drift"]'
 
 state_rollups='[]'
-dead_selectors='[]'
 if [ -s "$MANDATE_STATE_FILE" ]; then
   state_rollups="$(
     jq -c '
@@ -82,9 +81,6 @@ if [ -s "$MANDATE_STATE_FILE" ]; then
       ]
     ' "$MANDATE_STATE_FILE" 2>/dev/null || echo '[]'
   )"
-  dead_selectors="$(
-    jq -c '.dead_selectors // []' "$MANDATE_STATE_FILE" 2>/dev/null || echo '[]'
-  )"
 fi
 
 jq -r '.[] | .notice // empty' <<<"$state_rollups"
@@ -93,28 +89,18 @@ jq -r '
   | select(.unclassified > 0)
   | .repo + ": " + (.unclassified | tostring) + " unclassified — /desk triage"
 ' <<<"$state_rollups"
-jq -r '
-  .[]
-  | if .repo == null
-    then "dead selector — " + .source + " " + .selector
-    else .repo + ": dead selector — " + .source + " " + .selector
-    end
-' <<<"$dead_selectors"
 
 total_projects="$(jq '.projects | length' <<<"$config")"
 troubled_projects="$(
-  jq -n \
-    --argjson active "$active" \
-    --argjson rollups "$state_rollups" \
-    --argjson dead "$dead_selectors" '
+  jq '
     [
-      $active[].repo,
-      ($rollups[] | select(.notice != null or .unclassified > 0) | .repo),
-      ($dead[] | .repo // empty)
+      .[]
+      | select(.kind | IN("tripwire", "decision", "drift", "stuck"))
+      | .repo
     ]
     | unique
     | length
-  '
+  ' <<<"$active"
 )"
 nominal="$((total_projects - troubled_projects))"
 [ "$nominal" -lt 0 ] && nominal=0

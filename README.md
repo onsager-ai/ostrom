@@ -107,6 +107,9 @@ only a resolvable GitHub pointer and mandate metadata, never mirrored issue
 or PR bodies. v1 implements the `file` provider only; the provider seam
 remains explicit for a later addition.
 
+Run `/desk lint` explicitly to inspect selectors that matched no open item in
+the last sweep; unmatched selectors never add daily digest lines.
+
 ## Cloud / CI
 
 No token, no credential setup — the marketplace is public, so the

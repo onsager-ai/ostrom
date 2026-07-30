@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Mutate the private file-backed queue only after an explicit /desk decision.
+# Inspect the mandate state, or mutate the private queue after a /desk decision.
 
 set -euo pipefail
 umask 077
@@ -12,6 +12,22 @@ command -v jq >/dev/null 2>&1 || { echo "mandate queue: jq is required" >&2; exi
 
 action="${1:-list}"
 id="${2:-}"
+
+if [ "$action" = "lint" ]; then
+  if [ ! -s "$MANDATE_STATE_FILE" ]; then
+    echo "mandate lint: no sweep state at $MANDATE_STATE_FILE" >&2
+    exit 2
+  fi
+  jq -r '
+    (.dead_selectors // [])[]
+    | if .repo == null
+      then "unmatched in last sweep — " + .source + " " + .selector
+      else .repo + ": unmatched in last sweep — " + .source + " " + .selector
+      end
+  ' "$MANDATE_STATE_FILE"
+  exit 0
+fi
+
 queue="$(mandate_read_queue)" || {
   echo "mandate queue: cannot read $MANDATE_QUEUE_FILE" >&2
   exit 2
@@ -78,7 +94,7 @@ case "$action" in
     esac
     ;;
   *)
-    echo "usage: queue.sh list | approve <id> | reject <id> | defer <id>" >&2
+    echo "usage: queue.sh list | lint | approve <id> | reject <id> | defer <id>" >&2
     exit 2
     ;;
 esac
