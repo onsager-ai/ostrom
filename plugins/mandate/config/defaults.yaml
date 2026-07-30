@@ -7,7 +7,7 @@
 # Mandate content is private. This file ships mechanism defaults only; put
 # the real roster and its boundaries in the user layer. The parser supports
 # this intentionally small schema: root scalars, bounce_all, and projects
-# containing repo + bounce.
+# containing repo + delegated + paused + bounce.
 
 provider: file
 cadence_hours: 24

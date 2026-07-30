@@ -17,7 +17,8 @@ mandate_is_configured() {
 # Parse the deliberately small shipped schema without pretending to be a
 # general YAML parser. Supported input:
 #   root scalars; bounce_all: followed by two-space list items; projects:
-#   followed by "- repo:" entries, each with a six-space bounce list.
+#   followed by "- repo:" entries, each with delegated + paused scalars and
+#   a six-space bounce list.
 mandate_yaml_to_json() {
   file="$1"
   [ -f "$file" ] || {
@@ -103,6 +104,22 @@ mandate_yaml_to_json() {
         next
       }
 
+      if (section == "projects" && current_repo != "" && indent == 4 && text ~ /^delegated:[[:space:]]*/) {
+        value = text
+        sub(/^delegated:[[:space:]]*/, "", value)
+        value = unquote(value)
+        if (value == "") fail("empty delegated value for " current_repo)
+        else print "project_field\t" current_repo "\tdelegated\t" value
+        next
+      }
+      if (section == "projects" && current_repo != "" && indent == 4 && text ~ /^paused:[[:space:]]*/) {
+        value = text
+        sub(/^paused:[[:space:]]*/, "", value)
+        value = unquote(value)
+        if (value != "true" && value != "false") fail("paused must be true or false for " current_repo)
+        else print "project_field\t" current_repo "\tpaused\t" value
+        next
+      }
       if (section == "projects" && current_repo != "" && indent == 4 && text == "bounce:") {
         next
       }
@@ -135,7 +152,14 @@ mandate_yaml_to_json() {
           elif $parts[0] == "bounce_all" then
             .bounce_all += [$parts[1]]
           elif $parts[0] == "project" then
-            .projects += [{"repo": $parts[1], "bounce": []}]
+            .projects += [{"repo": $parts[1], "paused": false, "bounce": []}]
+          elif $parts[0] == "project_field" then
+            (.projects | map(.repo) | index($parts[1])) as $index
+            | if $index == null then error("project field appeared before its repo")
+              elif $parts[2] == "paused"
+              then .projects[$index].paused = ($parts[3] == "true")
+              else .projects[$index][$parts[2]] = $parts[3]
+              end
           elif $parts[0] == "project_bounce" then
             (.projects | map(.repo) | index($parts[1])) as $index
             | if $index == null
@@ -161,6 +185,22 @@ mandate_load_config() {
       '$shipped * $user * $repo'
   )" || return
 
+  missing_delegated="$(
+    jq -r '
+      .projects[]?
+      | select(
+          (has("delegated") | not)
+          or (.delegated | type) != "string"
+          or (.delegated | length) == 0
+        )
+      | (.repo // "<unknown>")
+    ' <<<"$config" | head -n 1
+  )"
+  if [ -n "$missing_delegated" ]; then
+    echo "mandate: invalid config: project $missing_delegated is missing required delegated outcome" >&2
+    return 2
+  fi
+
   if ! jq -e '
     .provider == "file"
     and (.cadence_hours | type == "number" and . > 0 and . == floor)
@@ -169,11 +209,13 @@ mandate_load_config() {
     and (.projects | type == "array")
     and all(.projects[];
       (.repo | type == "string" and test("^[^/[:space:]]+/[^/[:space:]]+$"))
+      and (.delegated | type == "string" and length > 0)
+      and (.paused | type == "boolean")
       and (.bounce | type == "array" and all(.[]; type == "string" and length > 0))
     )
     and (([.projects[].repo] | length) == ([.projects[].repo] | unique | length))
   ' >/dev/null <<<"$config"; then
-    echo "mandate: invalid config; provider must be file, cadence_hours a positive integer, and every project repo a unique owner/name slug" >&2
+    echo "mandate: invalid config; provider must be file, cadence_hours a positive integer, and every project must have a unique owner/name repo, delegated outcome, boolean paused value, and bounce list" >&2
     return 2
   fi
 

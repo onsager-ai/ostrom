@@ -48,18 +48,34 @@ fi
 
 sweep_started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 generated='[]'
-open_ids='[]'
+active_ids='[]'
 new_state="$old_state"
 
 while IFS= read -r project; do
   repo="$(jq -r '.repo' <<<"$project")"
+  paused="$(jq -r '.paused' <<<"$project")"
+  policy="$(
+    jq -cn \
+      --argjson project "$project" \
+      --argjson bounce_all "$(jq -c '.bounce_all' <<<"$config")" \
+      '{
+        delegated: $project.delegated,
+        paused: $project.paused,
+        bounce: $project.bounce,
+        bounce_all: $bounce_all
+      }'
+  )"
   gh_error="$work/gh-error"
 
-  if ! issues="$(gh issue list --repo "$repo" --state open --limit 100 \
-    --json number,title,labels,createdAt,updatedAt,url 2>"$gh_error")"; then
-    detail="$(tr '\n' ' ' <"$gh_error")"
-    echo "mandate sweep: failed to query open issues for $repo${detail:+: $detail}" >&2
-    exit 5
+  if [ "$paused" = "true" ]; then
+    issues='[]'
+  else
+    if ! issues="$(gh issue list --repo "$repo" --state open --limit 100 \
+      --json number,title,labels,createdAt,updatedAt,url 2>"$gh_error")"; then
+      detail="$(tr '\n' ' ' <"$gh_error")"
+      echo "mandate sweep: failed to query open issues for $repo${detail:+: $detail}" >&2
+      exit 5
+    fi
   fi
   if ! prs="$(gh pr list --repo "$repo" --state open --limit 100 \
     --json number,title,labels,createdAt,updatedAt,url,isDraft,reviewDecision,statusCheckRollup 2>"$gh_error")"; then
@@ -116,6 +132,7 @@ while IFS= read -r project; do
       --argjson project "$project" \
       --argjson config "$config" \
       --argjson items "$items" \
+      --argjson policy "$policy" \
       --argjson previous "$old_repo_state" '
       def tripwire_hit($haystack; $shared; $local):
         first(
@@ -126,6 +143,9 @@ while IFS= read -r project; do
               | ($haystack | ascii_downcase | contains($needle))
             )
         );
+      def inside_delegated_scope($haystack; $delegated):
+        ($delegated | ascii_downcase) as $scope
+        | ($haystack | ascii_downcase | contains($scope));
       def mandate_record($item; $kind; $reason; $hit):
         if $kind == "tripwire" then
           {
@@ -147,47 +167,72 @@ while IFS= read -r project; do
         | ($previous.items[$item.id] // null) as $old
         | select(
             ($previous.cursor // null) == null
+            or ($previous.policy // null) != $policy
             or $old == null
             or $old.fingerprint != $item.fingerprint
             or $item.updated > $previous.cursor
           )
-        | (([.title] + .labels) | join(" ")) as $haystack
-        | (tripwire_hit($haystack; $config.bounce_all; $project.bounce) // null) as $hit
-        | (
-            if $hit != null then
-              {kind: "tripwire", reason: ($hit.source + ": " + $hit.term)}
-            elif .type == "pr" and .ci == "failing" then
-              {kind: "drift", reason: "CI is failing"}
-            elif (($sweep_started | fromdateiso8601) - (.updated | fromdateiso8601)) >= ($config.stuck_after_days * 86400) then
-              {kind: "stuck", reason: ("no movement for " + ($config.stuck_after_days | tostring) + " days")}
-            elif .ready then
-              {kind: "decision", reason: "open PR passed CI"}
-            else
-              {kind: "moved", reason: "updated since the read cursor"}
-            end
-          ) as $classification
-        | {
-            id: .id,
-            repo: .repo,
-            ref: .ref,
-            kind: $classification.kind,
-            mandate: mandate_record($item; $classification.kind; $classification.reason; $hit),
-            state: "pending",
-            opened: .opened
-          }
+        | if $project.paused then
+            select(.type == "pr" and .ci == "failing")
+            | {
+                id: .id,
+                repo: .repo,
+                ref: .ref,
+                kind: "drift",
+                mandate: {reason: "paused project CI is failing"},
+                state: "pending",
+                opened: .opened
+              }
+          else
+            (([.title] + .labels) | join(" ")) as $haystack
+            | (tripwire_hit($haystack; $config.bounce_all; $project.bounce) // null) as $hit
+            | (inside_delegated_scope($haystack; $project.delegated)) as $inside
+            | (
+                if $hit != null then
+                  {kind: "tripwire", reason: ($hit.source + ": " + $hit.term)}
+                elif ($inside | not) then
+                  {
+                    kind: "decision",
+                    reason: ("out-of-mandate: outside delegated outcome \"" + $project.delegated + "\"")
+                  }
+                elif .type == "pr" and .ci == "failing" then
+                  {kind: "drift", reason: "CI is failing"}
+                elif (($sweep_started | fromdateiso8601) - (.updated | fromdateiso8601)) >= ($config.stuck_after_days * 86400) then
+                  {kind: "stuck", reason: ("no movement for " + ($config.stuck_after_days | tostring) + " days")}
+                elif .ready then
+                  {kind: "decision", reason: "open PR passed CI"}
+                else
+                  {kind: "moved", reason: "updated since the read cursor"}
+                end
+              ) as $classification
+            | {
+                id: .id,
+                repo: .repo,
+                ref: .ref,
+                kind: $classification.kind,
+                mandate: mandate_record($item; $classification.kind; $classification.reason; $hit),
+                state: "pending",
+                opened: .opened
+              }
+          end
       ]
     '
   )"
 
   generated="$(jq -cn --argjson all "$generated" --argjson rows "$rows" '$all + $rows')"
-  repo_open_ids="$(jq '[.[].id]' <<<"$items")"
-  open_ids="$(jq -cn --argjson all "$open_ids" --argjson ids "$repo_open_ids" '$all + $ids')"
+  if [ "$paused" = "true" ]; then
+    repo_active_ids="$(jq '[.[] | select(.type == "pr" and .ci == "failing") | .id]' <<<"$items")"
+  else
+    repo_active_ids="$(jq '[.[].id]' <<<"$items")"
+  fi
+  active_ids="$(jq -cn --argjson all "$active_ids" --argjson ids "$repo_active_ids" '$all + $ids')"
 
   new_repo_state="$(
     jq -cn \
       --arg sweep_started "$sweep_started" \
       --argjson previous "$old_repo_state" \
-      --argjson items "$items" '
+      --argjson items "$items" \
+      --argjson policy "$policy" '
       (reduce $items[] as $item ({};
         .[$item.id] = {
           updated: $item.updated,
@@ -204,6 +249,7 @@ while IFS= read -r project; do
       ) as $cursor
       | {
           cursor: $cursor,
+          policy: $policy,
           previous_cursor: (
             if $changed
             then ($previous.cursor // "initial")
@@ -227,11 +273,11 @@ final_queue="$(
   jq -cn \
     --argjson existing "$existing_queue" \
     --argjson generated "$generated" \
-    --argjson open_ids "$open_ids" '
+    --argjson active_ids "$active_ids" '
     (
       $existing
       | map(. as $row
-        | select($row.state == "approved" or ($open_ids | index($row.id)) != null)
+        | select($row.state == "approved" or ($active_ids | index($row.id)) != null)
       )
     ) as $still_relevant
     | reduce $generated[] as $row ($still_relevant;

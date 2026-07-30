@@ -40,6 +40,13 @@ case "$action" in
     trap 'rm -f "$tmp"' EXIT
     case "$action" in
       approve)
+        row_repo="$(jq -r '.repo' <<<"$row")"
+        if [ -s "$MANDATE_STATE_FILE" ] &&
+          jq -e --arg repo "$row_repo" '.repos[$repo].policy.paused == true' \
+            "$MANDATE_STATE_FILE" >/dev/null 2>&1; then
+          echo "mandate queue: $row_repo is paused; CI drift cannot mint a handoff token" >&2
+          exit 4
+        fi
         jq -c --arg id "$id" '
           map(if .id == $id then .state = "approved" else . end)[]' <<<"$queue" >"$tmp"
         mandate_write_if_changed "$tmp" "$MANDATE_QUEUE_FILE"

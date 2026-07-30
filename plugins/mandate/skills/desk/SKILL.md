@@ -22,7 +22,9 @@ Read and merge these layers, most-specific wins:
 The v1 provider must resolve to `file`. Its fixed private records are
 `~/.claude/ostrom/queue.jsonl` and `~/.claude/ostrom/state.json`. Never
 create, display, or commit a roster anywhere else. If no mandates file is
-configured, say so and stop.
+configured, say so and stop. Every project requires a free-text `delegated`
+outcome; a missing value is a config error. A `paused: true` project emits
+no proposals and is observed only for CI health.
 
 ## 2. List pending records
 
@@ -50,7 +52,8 @@ references.
 - **Approve** — run `queue.sh approve <id>`. This flips the row to
   `approved` and emits the instruction for the existing `/handoff` to Codex,
   including the minted `mandate:<id>` approval token. Relay that handoff
-  instruction; never invent a broader token.
+  instruction; never invent a broader token. CI drift from a paused project
+  cannot be approved; unpause the mandate first.
 - **Reject** — run `queue.sh reject <id>`. This removes the row. Do not call
   `/handoff`, comment on GitHub, close the referenced item, or cause any
   other side effect.

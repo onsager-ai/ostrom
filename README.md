@@ -77,13 +77,25 @@ remain machine-local at `~/.claude/ostrom/mandates.yaml`,
 `~/.claude/ostrom/queue.jsonl`, and `~/.claude/ostrom/state.json`; none
 belongs in this repository.
 
-The SessionStart hook runs the read-only `gh` sweep when the last successful
-sweep is at least 24 hours old, then renders the fixed exception digest:
-decisions, movement since the cursor, stuck work, drift, and one collapsed
-nominal-project count. Queue rows contain only a resolvable GitHub pointer
-and mandate metadata, never mirrored issue or PR bodies. v1 implements the
-`file` provider only; the provider seam remains explicit for a later
-addition.
+Each project requires a free-text `delegated` outcome and may set
+`paused: true`. Work outside the delegated phrase is a human decision;
+paused projects produce no proposals and are read only for PR CI health.
+Tripwires still take precedence over delegated scope.
+
+Run the read-only sweep daily outside Claude Code. For example, edit the
+placeholder clone path and install this with `crontab -e`:
+
+```cron
+0 8 * * * cd /absolute/path/to/ostrom && CLAUDE_PLUGIN_ROOT=/absolute/path/to/ostrom/plugins/mandate /bin/bash /absolute/path/to/ostrom/plugins/mandate/scripts/sweep.sh
+```
+
+The SessionStart hook never calls `gh`; it only renders the durable files
+written by the scheduled sweep. Empty sections disappear, so a healthy
+portfolio is exactly `N projects nominal`. If the state file is older than
+`cadence_hours`, the hook adds one short stale warning. Queue rows contain
+only a resolvable GitHub pointer and mandate metadata, never mirrored issue
+or PR bodies. v1 implements the `file` provider only; the provider seam
+remains explicit for a later addition.
 
 ## Cloud / CI
 

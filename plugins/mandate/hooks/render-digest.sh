@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
-# SessionStart hook: run the due daily sweep, then render a fixed digest.
+# SessionStart hook: render the last durable sweep as an exception digest.
 #
 # A machine with no private mandates.yaml emits nothing and exits 0. Once
-# configured, operational failures go to stderr but never break SessionStart;
-# the last durable queue still renders.
+# configured, this hook reads local files only and never makes a network call.
 
 set -u
 
@@ -27,11 +26,8 @@ fi
 now="$(date +%s)"
 cadence_seconds="$((cadence_hours * 3600))"
 
-if [ "${MANDATE_SKIP_SWEEP:-0}" != "1" ] && [ "$((now - state_mtime))" -ge "$cadence_seconds" ]; then
-  if ! CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" bash "$PLUGIN_ROOT/scripts/sweep.sh" >/dev/null; then
-    echo "mandate digest: daily sweep failed; rendering the last durable queue" >&2
-  fi
-fi
+stale=0
+[ "$((now - state_mtime))" -ge "$cadence_seconds" ] && stale=1
 
 if ! queue="$(mandate_read_queue 2>/dev/null)"; then
   echo "mandate digest: queue is malformed; run /desk after repairing $MANDATE_QUEUE_FILE" >&2
@@ -48,29 +44,32 @@ else
   cursor="initial"
 fi
 
-render_rows() {
-  kinds="$1"
-  jq -r --argjson kinds "$kinds" '
+render_section() {
+  heading="$1"
+  kinds="$2"
+  rows="$(
+    jq -r --argjson kinds "$kinds" '
     .[]
     | select(.kind as $kind | $kinds | index($kind))
     | .repo + .ref + " " + .kind + " — "
       + (.mandate.reason // .mandate)
       + (if .state == "deferred" then " [deferred]" else "" end)
-  ' <<<"$active"
+    ' <<<"$active"
+  )"
+  [ -n "$rows" ] || return 0
+  echo "$heading"
+  printf '%s\n' "$rows"
 }
 
-echo "DECISIONS WAITING"
-render_rows '["tripwire","decision"]'
-echo "MOVED SINCE $cursor"
-render_rows '["moved"]'
-echo "STUCK"
-render_rows '["stuck"]'
-echo "DRIFT"
-render_rows '["drift"]'
+render_section "DECISIONS WAITING" '["tripwire","decision"]'
+render_section "MOVED SINCE $cursor" '["moved"]'
+render_section "STUCK" '["stuck"]'
+render_section "DRIFT" '["drift"]'
 
 total_projects="$(jq '.projects | length' <<<"$config")"
 troubled_projects="$(jq '[.[].repo] | unique | length' <<<"$active")"
 nominal="$((total_projects - troubled_projects))"
 [ "$nominal" -lt 0 ] && nominal=0
+[ "$stale" -eq 1 ] && echo "STALE — mandate sweep overdue"
 echo "$nominal projects nominal"
 exit 0
