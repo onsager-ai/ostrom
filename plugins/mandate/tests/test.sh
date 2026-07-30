@@ -158,6 +158,11 @@ JSON
 [{"number":20,"title":"Prepare production deployment","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/20"}]
 JSON
       ;;
+    onsager-ai/duhem-hub)
+      cat <<'JSON'
+[{"number":14,"title":"spec(launch): public announcement","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/14"},{"number":15,"title":"spec(launch): installation guide","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/15"},{"number":16,"title":"spec(launch): release checklist","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/16"}]
+JSON
+      ;;
     *) echo '[]' ;;
   esac
   exit 0
@@ -165,10 +170,17 @@ fi
 if [ "$1 $2" = "pr list" ]; then
   case "$repo" in
     example-org/example-repo)
-      changed_at="2026-07-30T00:00:00Z"
-      [ "${FAKE_GH_MODE:-base}" = "changed" ] && changed_at="2026-08-01T00:00:00Z"
+      pr8_title="fix: routine maintenance"
+      if [ "${FAKE_GH_MODE:-base}" = "changed" ]; then
+        pr8_title="fix: refreshed routine maintenance title"
+      fi
       cat <<JSON
-[{"number":8,"title":"fix: routine maintenance","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"$changed_at","url":"https://example.invalid/pull/8","isDraft":false,"reviewDecision":"","statusCheckRollup":[{"conclusion":"SUCCESS","status":"COMPLETED"}],"closingIssuesReferences":[{"number":42,"labels":[{"name":"maintenance"}]}],"files":[{"path":"src/main.sh"}]},{"number":12,"title":"chore: update frozen rule","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/pull/12","isDraft":false,"reviewDecision":"","statusCheckRollup":[{"conclusion":"SUCCESS","status":"COMPLETED"}],"closingIssuesReferences":[],"files":[{"path":"rules/frozen-rules.md"}]},{"number":13,"title":"fix: broken checks","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/pull/13","isDraft":false,"reviewDecision":"","statusCheckRollup":[{"conclusion":"FAILURE","status":"COMPLETED"}],"closingIssuesReferences":[],"files":[]},{"number":16,"title":"docs: nested guide","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/pull/16","isDraft":true,"reviewDecision":"","statusCheckRollup":[],"closingIssuesReferences":[],"files":[{"path":"docs/reference/deep/guide.md"}]}]
+[{"number":8,"title":"$pr8_title","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/pull/8","isDraft":false,"reviewDecision":"","statusCheckRollup":[{"conclusion":"SUCCESS","status":"COMPLETED"}],"closingIssuesReferences":[{"number":42,"labels":[{"name":"maintenance"}]}],"files":[{"path":"src/main.sh"}]},{"number":12,"title":"chore: update the frozen rule using a deliberately enormous descriptive title that cannot fit on one digest line without deterministic truncation","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/pull/12","isDraft":false,"reviewDecision":"","statusCheckRollup":[{"conclusion":"SUCCESS","status":"COMPLETED"}],"closingIssuesReferences":[],"files":[{"path":"rules/frozen-rules.md"}]},{"number":13,"labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/pull/13","isDraft":false,"reviewDecision":"","statusCheckRollup":[{"conclusion":"FAILURE","status":"COMPLETED"}],"closingIssuesReferences":[],"files":[]},{"number":16,"title":"docs: nested guide","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/pull/16","isDraft":true,"reviewDecision":"","statusCheckRollup":[],"closingIssuesReferences":[],"files":[{"path":"docs/reference/deep/guide.md"}]}]
+JSON
+      ;;
+    onsager-ai/duhem-hub)
+      cat <<'JSON'
+[{"number":18,"title":"spec(launch): public announcement","labels":[],"createdAt":"2026-07-30T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/pull/18","isDraft":false,"reviewDecision":"","statusCheckRollup":[{"conclusion":"SUCCESS","status":"COMPLETED"}],"closingIssuesReferences":[{"number":14,"labels":[]}],"files":[]},{"number":17,"title":"spec(launch): installation guide","labels":[],"createdAt":"2026-07-30T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/pull/17","isDraft":false,"reviewDecision":"","statusCheckRollup":[{"conclusion":"SUCCESS","status":"COMPLETED"}],"closingIssuesReferences":[{"number":15,"labels":[]}],"files":[]},{"number":19,"title":"spec(launch): release checklist","labels":[],"createdAt":"2026-07-30T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/pull/19","isDraft":false,"reviewDecision":"","statusCheckRollup":[{"conclusion":"SUCCESS","status":"COMPLETED"}],"closingIssuesReferences":[{"number":16,"labels":[]}],"files":[]}]
 JSON
       ;;
     *) echo '[]' ;;
@@ -220,6 +232,40 @@ jq -e '
   | contains("title:*production deployment*")
 ' "$queue" >/dev/null
 [ "$(jq -s 'length' "$queue")" -eq 5 ]
+jq -s -e '
+  all(.[];
+    has("title")
+    and ((.title | type) == "string")
+    and ((.title | length) > 0)
+  )
+  and any(.[];
+    .id == "example-org/example-repo#13"
+    and .title == "(title unavailable)"
+  )
+' "$queue" >/dev/null
+
+# /desk reads the same titled records rather than making every number another
+# lookup task.
+desk_rows="$(
+  CLAUDE_CONFIG_DIR="$fixture/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/queue.sh" list
+)"
+jq -s -e '
+  length == 5
+  and all(.[];
+    ((.title | type) == "string")
+    and ((.title | length) > 0)
+  )
+' <<<"$desk_rows" >/dev/null
+
+# A legacy queue remains readable. Its one-time title enrichment upgrades the
+# durable rows without manufacturing queue changes.
+jq -c 'del(.title)' "$queue" >"$fixture/queue.legacy"
+mv "$fixture/queue.legacy" "$queue"
+migration_result="$(run_sweep)"
+grep -q '0 queue changes$' <<<"$migration_result"
+jq -s -e 'all(.[]; has("title") and ((.title | length) > 0))' \
+  "$queue" >/dev/null
 
 # Reserved wins over the delegated label on #10, excluded wins over delegated
 # on #15, and excluded does not suppress the #14 tripwire. Issues never get
@@ -264,6 +310,21 @@ digest="$(
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
     bash "$PLUGIN_ROOT/hooks/render-digest.sh"
 )"
+grep -q \
+  '^example-org/example-repo#10  feat(tooling): owner gate — reserved ref:#10$' \
+  <<<"$digest"
+grep -q \
+  '^example-org/example-repo#13  (title unavailable) — CI is failing; default:unclassified$' \
+  <<<"$digest"
+grep -q \
+  '^example-org/example-repo#14  Rotate credential safely — tripwire: bounce_all title:\*credential\*$' \
+  <<<"$digest"
+long_digest_row="$(
+  grep '^example-org/example-repo#12  ' <<<"$digest"
+)"
+[ "${#long_digest_row}" -le 100 ]
+grep -q '… — tripwire: project bounce path:rules/frozen-rules.md$' \
+  <<<"$long_digest_row"
 grep -q '^example-org/example-repo: baselined 10 open items$' <<<"$digest"
 grep -q '^example-org/another-repo: baselined 1 open items$' <<<"$digest"
 grep -q '^example-org/example-repo: 3 unclassified — /desk triage$' <<<"$digest"
@@ -295,14 +356,25 @@ if grep -q 'baselined [0-9][0-9]* open items' <<<"$steady_digest"; then
   exit 1
 fi
 
-# A later PR update produces one ready decision, proving inherited labels are
-# used by the live (non-baseline) classifier too.
+# A title-only upstream change produces one refreshed ready decision, proving
+# titles are not frozen and inherited labels reach the live classifier too.
 FAKE_GH_MODE=changed run_sweep >/dev/null
 jq -e '
   select(.id == "example-org/example-repo#8" and .kind == "decision")
-  | .mandate.reason
-  | startswith("delegated label:maintenance;")
+  | .title == "fix: refreshed routine maintenance title"
+  and (.mandate.reason | startswith("delegated label:maintenance;"))
 ' "$queue" >/dev/null
+refreshed_digest="$(
+  cd "$fixture/repo"
+  CLAUDE_CONFIG_DIR="$fixture/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/hooks/render-digest.sh"
+)"
+refreshed_row="$(grep '^example-org/example-repo#8  ' <<<"$refreshed_digest")"
+[ "${#refreshed_row}" -le 100 ]
+grep -q \
+  '^example-org/example-repo#8  fix: refreshed routine… — delegated label:maintenance; open PR passed CI$' \
+  <<<"$refreshed_row"
 
 # Editing a selector re-baselines scope: one item enters, one leaves, neither
 # is emitted as a routine row, and the detail is durable for /desk.
@@ -370,6 +442,67 @@ if jq -e 'select(.id == "example-org/example-repo#12")' "$queue" >/dev/null; the
   echo "rejected row remained in queue" >&2
   exit 1
 fi
+
+# The live duhem-hub shape is three issues plus the three PRs that close them.
+# Prefer the PRs, retain their recognizable titles, and name each collapsed
+# issue in the falsifiability reason: six raw candidates become three rows.
+dedup="$fixture/duhem-hub"
+mkdir -p "$dedup/config/ostrom" "$dedup/repo"
+cat >"$dedup/config/ostrom/mandates.yaml" <<'YAML'
+bounce_all: []
+projects:
+  - repo: onsager-ai/duhem-hub
+    delegated: []
+    excluded: []
+    reserved:
+      - 14
+      - 15
+      - 16
+    default: excluded
+    paused: false
+    bounce: []
+YAML
+(
+  cd "$dedup/repo"
+  PATH="$fixture/bin:$PATH" \
+    CLAUDE_CONFIG_DIR="$dedup/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/sweep.sh" >/dev/null
+)
+dedup_queue="$dedup/config/ostrom/queue.jsonl"
+jq -s -e '
+  length == 3
+  and ([.[].id] | sort)
+    == [
+      "onsager-ai/duhem-hub#17",
+      "onsager-ai/duhem-hub#18",
+      "onsager-ai/duhem-hub#19"
+    ]
+  and all(.[];
+    .kind == "decision"
+    and (.title | startswith("spec(launch):"))
+    and (.mandate.reason | test("^reserved ref:#[0-9]+ \\(closes #[0-9]+\\)$"))
+  )
+' "$dedup_queue" >/dev/null
+jq -e '
+  select(.id == "onsager-ai/duhem-hub#18")
+  | .title == "spec(launch): public announcement"
+  and .mandate.reason == "reserved ref:#14 (closes #14)"
+' "$dedup_queue" >/dev/null
+dedup_digest="$(
+  cd "$dedup/repo"
+  CLAUDE_CONFIG_DIR="$dedup/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/hooks/render-digest.sh"
+)"
+[ "$(grep -c '^onsager-ai/duhem-hub#' <<<"$dedup_digest")" -eq 3 ]
+if grep -Eq '^onsager-ai/duhem-hub#1[456]  ' <<<"$dedup_digest"; then
+  echo "closing issues were rendered beside their pull requests" >&2
+  exit 1
+fi
+grep -q \
+  '^onsager-ai/duhem-hub#18  spec(launch): public announcement — reserved ref:#14 (closes #14)$' \
+  <<<"$dedup_digest"
 
 # A representative eight-project first sweep remains a compact digest.
 portfolio="$fixture/portfolio"

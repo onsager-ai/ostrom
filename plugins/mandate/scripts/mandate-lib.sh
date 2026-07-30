@@ -288,13 +288,21 @@ mandate_read_queue() {
 
   jq -s '
     if all(.[];
-      (keys | sort) == ["id","kind","mandate","opened","ref","repo","state"]
+      (
+        (keys | sort) == ["id","kind","mandate","opened","ref","repo","state"]
+        or
+        (keys | sort) == ["id","kind","mandate","opened","ref","repo","state","title"]
+      )
       and (.id | type == "string")
       and (.repo | type == "string")
       and (.ref | type == "string" and test("^#[0-9]+$"))
       and (.kind | IN("tripwire", "decision", "moved", "stuck", "drift"))
       and (.state | IN("pending", "approved", "deferred"))
       and (.opened | type == "string")
+      and (
+        (has("title") | not)
+        or (((.title | type) == "string") and ((.title | length) > 0))
+      )
     )
     then .
     else error("queue contains a malformed row")

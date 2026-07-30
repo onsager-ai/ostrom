@@ -51,11 +51,28 @@ render_section() {
   kinds="$2"
   rows="$(
     jq -r --argjson kinds "$kinds" '
+    def title:
+      if (((.title // "") | type) == "string")
+        and (((.title // "") | length) > 0)
+      then .title
+      else "(title unavailable)"
+      end;
+    def truncate($text; $width):
+      if ($text | length) <= $width then $text
+      elif $width <= 1 then "…"
+      else $text[0:$width - 1] + "…"
+      end;
     .[]
     | select(.kind as $kind | $kinds | index($kind))
-    | .repo + .ref + " " + .kind + " — "
-      + (.mandate.reason // .mandate)
-      + (if .state == "deferred" then " [deferred]" else "" end)
+    | . as $row
+    | (.mandate.reason // .mandate) as $reason
+    | (if .state == "deferred" then " [deferred]" else "" end) as $suffix
+    | (.repo + .ref) as $ref
+    | (100 - (($ref | length) + 2 + 3 + ($reason | length) + ($suffix | length)))
+      as $title_width
+    | $ref + "  "
+      + truncate(($row | title); ([$title_width, 1] | max))
+      + " — " + $reason + $suffix
     ' <<<"$active"
   )"
   [ -n "$rows" ] || return 0

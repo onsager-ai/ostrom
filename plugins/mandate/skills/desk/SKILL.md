@@ -37,12 +37,13 @@ jq '.repos[] | {notice, unclassified, scope_changes}' \
   "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/ostrom/state.json"
 ```
 
-Each JSON row is a pointer with exactly `id`, `repo`, `ref`, `kind`,
+Each JSON row is a pointer with exactly `id`, `repo`, `ref`, `title`, `kind`,
 `mandate`, `state`, and `opened`. Present pending and deferred items in this
 order: tripwire/decision, moved, stuck, drift. Keep the resolvable
-`owner/repo#number` visible. For a tripwire, include all four fields from
-`mandate.dossier`: Question, Options ruled out, Recommended action, and
-Blast radius. Do not fetch or copy an issue or PR body into the queue.
+`owner/repo#number` and its title visible. For a tripwire, include all four
+fields from `mandate.dossier`: Question, Options ruled out, Recommended
+action, and Blast radius. Do not fetch or copy an issue or PR body into the
+queue.
 
 If no action was supplied, stop after the list and ask for approve, reject,
 or defer only when records are present.

@@ -49,6 +49,7 @@ fi
 sweep_started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 generated='[]'
 active_ids='[]'
+current_items='[]'
 selector_stats='[]'
 new_state="$old_state"
 
@@ -106,13 +107,22 @@ while IFS= read -r project; do
             number: .number,
             ref: ("#" + (.number | tostring)),
             type: $type,
-            title: .title,
+            title: (
+              ($item.title // "")
+              | if length > 0 then . else "(title unavailable)" end
+            ),
             labels: (
               ((.labels // []) | label_names)
               + [$linked[]? | ((.labels // []) | label_names)[]]
               | unique
             ),
             refs: ([.number] + [$linked[]? | .number] | unique),
+            closing_refs: (
+              if $type == "pr"
+              then [$linked[]? | .number] | unique
+              else []
+              end
+            ),
             files: (
               if $type == "pr"
               then [(.files // [])[]? | .path // empty] | unique
@@ -303,6 +313,23 @@ while IFS= read -r project; do
         then $classified.selector
         else $classified.source + " " + $classified.selector
         end;
+      def shadowed_issue($item; $active):
+        $item.type == "issue"
+        and any($active[]?;
+          .type == "pr"
+          and any(.closing_refs[]?; . == $item.number)
+        );
+      def closing_suffix($item; $active):
+        ([
+          $item.closing_refs[]? as $closed
+          | select(any($active[]?;
+              .type == "issue" and .number == $closed
+            ))
+          | $closed
+        ] | unique) as $closed
+        | if ($closed | length) == 0 then ""
+          else " (closes " + ($closed | map("#" + tostring) | join(", ")) + ")"
+          end;
 
       (($previous.cursor // null) == null) as $initial
       | (($previous.selector_hash // "") != $policy.selector_hash) as $policy_changed
@@ -336,6 +363,26 @@ while IFS= read -r project; do
         ] as $classified
       | ([
           $classified[]
+          | select(
+              if $initial or $policy_changed then
+                .classification.terminal == "reserved"
+                or .classification.terminal == "tripwire"
+                or (.type == "pr" and .ci == "failing")
+              else
+                .classification.terminal == "reserved"
+                or .classification.terminal == "tripwire"
+                or (.type == "pr" and .ci == "failing")
+                or (($project.paused | not) and .classification.terminal == "delegated")
+              end
+            )
+        ]) as $active
+      | ([
+          $active[]
+          | . as $item
+          | select(shadowed_issue($item; $active) | not)
+        ]) as $visible_active
+      | ([
+          $classified[]
           | . as $item
           | (
               $item.old == null
@@ -356,6 +403,7 @@ while IFS= read -r project; do
               )
               end
             )
+          | select(shadowed_issue($item; $active) | not)
           | (
               if $item.classification.terminal == "reserved" then
                 {
@@ -403,32 +451,23 @@ while IFS= read -r project; do
                 }
               end
             ) as $row
+          | (closing_suffix($item; $active)) as $closing_suffix
           | {
               id: $item.id,
               repo: $item.repo,
               ref: $item.ref,
+              title: $item.title,
               kind: $row.kind,
-              mandate: mandate_record($item; $row.kind; $row.reason),
+              mandate: mandate_record(
+                $item;
+                $row.kind;
+                ($row.reason + $closing_suffix)
+              ),
               state: "pending",
               opened: $item.opened
             }
         ]) as $rows
-      | ([
-          $classified[]
-          | select(
-              if $initial or $policy_changed then
-                .classification.terminal == "reserved"
-                or .classification.terminal == "tripwire"
-                or (.type == "pr" and .ci == "failing")
-              else
-                .classification.terminal == "reserved"
-                or .classification.terminal == "tripwire"
-                or (.type == "pr" and .ci == "failing")
-                or (($project.paused | not) and .classification.terminal == "delegated")
-              end
-            )
-          | .id
-        ]) as $active_ids
+      | ([$visible_active[] | .id]) as $active_ids
       | (reduce $classified[] as $item ({};
           .[$item.id] = {
             updated: $item.updated,
@@ -488,6 +527,15 @@ while IFS= read -r project; do
       | {
           rows: $rows,
           active_ids: $active_ids,
+          current_items: [
+            $classified[]
+            | . as $item
+            | {
+                id: .id,
+                title: .title,
+                closing_suffix: closing_suffix($item; $active)
+              }
+          ],
           selector_stats: [selector_stats],
           repo_state: {
             cursor: $cursor,
@@ -521,6 +569,13 @@ while IFS= read -r project; do
   generated="$(jq -cn --argjson all "$generated" --argjson rows "$rows" '$all + $rows')"
   repo_active_ids="$(jq -c '.active_ids' <<<"$analysis")"
   active_ids="$(jq -cn --argjson all "$active_ids" --argjson ids "$repo_active_ids" '$all + $ids')"
+  repo_current_items="$(jq -c '.current_items' <<<"$analysis")"
+  current_items="$(
+    jq -cn \
+      --argjson all "$current_items" \
+      --argjson items "$repo_current_items" \
+      '$all + $items'
+  )"
   repo_selector_stats="$(jq -c '.selector_stats' <<<"$analysis")"
   selector_stats="$(
     jq -cn --argjson all "$selector_stats" --argjson stats "$repo_selector_stats" \
@@ -566,7 +621,27 @@ final_queue="$(
   jq -cn \
     --argjson existing "$existing_queue" \
     --argjson generated "$generated" \
-    --argjson active_ids "$active_ids" '
+    --argjson active_ids "$active_ids" \
+    --argjson current_items "$current_items" '
+    def current($id):
+      first($current_items[] | select(.id == $id)) // null;
+    def enrich:
+      . as $row
+      | (current($row.id)) as $current
+      | .title = ($current.title // .title // "(title unavailable)")
+      | if ($current.closing_suffix // "") != ""
+          and (
+            (.mandate.reason // .mandate // "")
+            | endswith($current.closing_suffix)
+            | not
+          )
+        then
+          if (.mandate | type) == "object"
+          then .mandate.reason += $current.closing_suffix
+          else .mandate += $current.closing_suffix
+          end
+        else .
+        end;
     (
       $existing
       | map(. as $row
@@ -576,6 +651,7 @@ final_queue="$(
     | reduce $generated[] as $row ($still_relevant;
         map(select(.id != $row.id)) + [$row]
       )
+    | map(enrich)
     | sort_by(.opened, .id)
   '
 )"
@@ -584,9 +660,25 @@ queue_changes="$(
   jq -n \
     --argjson before "$existing_queue" \
     --argjson after "$final_queue" '
-    if $before == $after then 0
-    else ([($before - $after)[], ($after - $before)[]] | length)
-    end
+    (
+      $before
+      | map(. as $row
+        | if has("title") then .
+          else
+            (
+              first($after[] | select(.id == $row.id)).title
+              // "(title unavailable)"
+            ) as $title
+            | . + {title: $title}
+          end
+        )
+    ) as $comparable_before
+    | if $comparable_before == $after then 0
+      else ([
+        ($comparable_before - $after)[],
+        ($after - $comparable_before)[]
+      ] | length)
+      end
   '
 )"
 
