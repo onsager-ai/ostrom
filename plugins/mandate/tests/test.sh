@@ -162,7 +162,7 @@ JSON
 [{"number":20,"title":"Prepare production deployment","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/20"}]
 JSON
       ;;
-    onsager-ai/duhem-hub)
+    example-org/hub-repo)
       cat <<'JSON'
 [{"number":14,"title":"spec(launch): public announcement","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/14"},{"number":15,"title":"spec(launch): installation guide","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/15"},{"number":16,"title":"spec(launch): release checklist","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/16"}]
 JSON
@@ -198,7 +198,7 @@ if [ "$1 $2" = "pr list" ]; then
 [{"number":8,"title":"$pr8_title","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/pull/8","isDraft":false,"reviewDecision":"","statusCheckRollup":[{"conclusion":"SUCCESS","status":"COMPLETED"}],"closingIssuesReferences":[{"number":42,"labels":[{"name":"maintenance"}]}],"files":[{"path":"src/main.sh"}]},{"number":12,"title":"chore: update the frozen rule using a deliberately enormous descriptive title that cannot fit on one digest line without deterministic truncation","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/pull/12","isDraft":false,"reviewDecision":"","statusCheckRollup":[{"conclusion":"SUCCESS","status":"COMPLETED"}],"closingIssuesReferences":[],"files":[{"path":"rules/frozen-rules.md"}]},{"number":13,"labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/pull/13","isDraft":false,"reviewDecision":"","statusCheckRollup":[{"conclusion":"FAILURE","status":"COMPLETED"}],"closingIssuesReferences":[],"files":[]},{"number":16,"title":"docs: nested guide","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/pull/16","isDraft":true,"reviewDecision":"","statusCheckRollup":[],"closingIssuesReferences":[],"files":[{"path":"docs/reference/deep/guide.md"}]}]
 JSON
       ;;
-    onsager-ai/duhem-hub)
+    example-org/hub-repo)
       cat <<'JSON'
 [{"number":18,"title":"spec(launch): public announcement","labels":[],"createdAt":"2026-07-30T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/pull/18","isDraft":false,"reviewDecision":"","statusCheckRollup":[{"conclusion":"SUCCESS","status":"COMPLETED"}],"closingIssuesReferences":[{"number":14,"labels":[]}],"files":[]},{"number":17,"title":"spec(launch): installation guide","labels":[],"createdAt":"2026-07-30T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/pull/17","isDraft":false,"reviewDecision":"","statusCheckRollup":[{"conclusion":"SUCCESS","status":"COMPLETED"}],"closingIssuesReferences":[{"number":15,"labels":[]}],"files":[]},{"number":19,"title":"spec(launch): release checklist","labels":[],"createdAt":"2026-07-30T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/pull/19","isDraft":false,"reviewDecision":"","statusCheckRollup":[{"conclusion":"SUCCESS","status":"COMPLETED"}],"closingIssuesReferences":[{"number":16,"labels":[]}],"files":[]}]
 JSON
@@ -502,15 +502,15 @@ if jq -e 'select(.id == "example-org/example-repo#12")' "$queue" >/dev/null; the
   exit 1
 fi
 
-# The live duhem-hub shape is three issues plus the three PRs that close them.
+# The fixture shape is three issues plus the three PRs that close them.
 # Prefer the PRs, retain their recognizable titles, and name each collapsed
 # issue in the falsifiability reason: six raw candidates become three rows.
-dedup="$fixture/duhem-hub"
+dedup="$fixture/hub-repo"
 mkdir -p "$dedup/config/ostrom" "$dedup/repo"
 cat >"$dedup/config/ostrom/mandates.yaml" <<'YAML'
 bounce_all: []
 projects:
-  - repo: onsager-ai/duhem-hub
+  - repo: example-org/hub-repo
     delegated: []
     excluded: []
     reserved:
@@ -533,9 +533,9 @@ jq -s -e '
   length == 3
   and ([.[].id] | sort)
     == [
-      "onsager-ai/duhem-hub#17",
-      "onsager-ai/duhem-hub#18",
-      "onsager-ai/duhem-hub#19"
+      "example-org/hub-repo#17",
+      "example-org/hub-repo#18",
+      "example-org/hub-repo#19"
     ]
   and all(.[];
     .kind == "decision"
@@ -544,7 +544,7 @@ jq -s -e '
   )
 ' "$dedup_queue" >/dev/null
 jq -e '
-  select(.id == "onsager-ai/duhem-hub#18")
+  select(.id == "example-org/hub-repo#18")
   | .title == "spec(launch): public announcement"
   and .mandate.reason == "reserved ref:#14 (closes #14)"
 ' "$dedup_queue" >/dev/null
@@ -554,13 +554,13 @@ dedup_digest="$(
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
     bash "$PLUGIN_ROOT/hooks/render-digest.sh"
 )"
-[ "$(grep -c '^onsager-ai/duhem-hub#' <<<"$dedup_digest")" -eq 3 ]
-if grep -Eq '^onsager-ai/duhem-hub#1[456]  ' <<<"$dedup_digest"; then
+[ "$(grep -c '^example-org/hub-repo#' <<<"$dedup_digest")" -eq 3 ]
+if grep -Eq '^example-org/hub-repo#1[456]  ' <<<"$dedup_digest"; then
   echo "closing issues were rendered beside their pull requests" >&2
   exit 1
 fi
 grep -q \
-  '^onsager-ai/duhem-hub#18  spec(launch): public announcement — reserved ref:#14 (closes #14)$' \
+  '^example-org/hub-repo#18  spec(launch): public announcement — reserved ref:#14 (closes #14)$' \
   <<<"$dedup_digest"
 
 # Hitting either GitHub query limit is durable sweep state, not a silent
