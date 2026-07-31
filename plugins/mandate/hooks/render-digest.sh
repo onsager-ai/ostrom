@@ -62,19 +62,19 @@ render_section() {
       elif $width <= 1 then "…"
       else $text[0:$width - 1] + "…"
       end;
-    def truncate_reason($text; $width):
-      if ($text | length) <= $width then $text
-      elif $width <= 1 then "…"
-      else
-        (($width - 1) / 2 | ceil) as $left
-        | (($width - 1) - $left) as $right
-        | $text[0:$left] + "…"
-          + (if $right > 0 then $text[-$right:] else "" end)
-      end;
+    def essential_reason:
+      sub("; open PR passed CI$"; "")
+      | sub("; no movement for [0-9]+ days$"; "");
     .[]
     | select(.kind as $kind | $kinds | index($kind))
     | . as $row
-    | (.mandate.reason // .mandate) as $reason
+    | (.mandate.reason // .mandate) as $stored_reason
+    | (
+        if .kind == "moved"
+        then $stored_reason | sub("; updated since the read cursor$"; "")
+        else $stored_reason
+        end
+      ) as $reason
     | (if .state == "deferred" then " [deferred]" else "" end) as $suffix
     | (.repo + .ref) as $ref
     | ($row | title) as $title
@@ -83,10 +83,14 @@ render_section() {
         ($title | length),
         ([45, ($content_width - ($reason | length))] | max)
       ] | min) as $title_width
-    | ([$content_width - $title_width, 1] | max) as $reason_width
+    | ([
+        $content_width - $title_width,
+        ($reason | essential_reason | length),
+        1
+      ] | max) as $reason_width
     | $ref + "  "
       + truncate($title; $title_width)
-      + " — " + truncate_reason($reason; $reason_width) + $suffix
+      + " — " + truncate($reason; $reason_width) + $suffix
     ' <<<"$active"
   )"
   [ -n "$rows" ] || return 0

@@ -346,13 +346,15 @@ grep -q \
 long_digest_row="$(
   grep '^example-org/example-repo#12  ' <<<"$digest"
 )"
-[ "${#long_digest_row}" -le 100 ]
 long_rendered_title="${long_digest_row#*#12  }"
 long_rendered_title="${long_rendered_title%% — *}"
 [ "${#long_rendered_title}" -ge 45 ]
 grep -q '^chore: update the frozen rule.*…$' \
   <<<"$long_rendered_title"
-grep -q ' — tripwire:.*….*rules.md$' <<<"$long_digest_row"
+long_rendered_reason="${long_digest_row#* — }"
+[ "$long_rendered_reason" = \
+  "tripwire: project bounce path:rules/frozen-rules.md" ]
+[ "${#long_digest_row}" -gt 100 ]
 grep -q '^example-org/example-repo: baselined 10 open items$' <<<"$digest"
 grep -q '^example-org/another-repo: baselined 1 open items$' <<<"$digest"
 grep -q '^example-org/example-repo: 3 unclassified — /desk triage$' <<<"$digest"
@@ -389,7 +391,8 @@ fi
 FAKE_GH_MODE=changed run_sweep >/dev/null
 jq -e '
   select(.id == "example-org/example-repo#7" and .kind == "moved")
-  | .mandate.reason == "delegated scope:tooling"
+  | .mandate.reason
+      == "delegated scope:tooling; updated since the read cursor"
 ' "$queue" >/dev/null
 jq -e '
   select(.id == "example-org/example-repo#8" and .kind == "decision")
@@ -397,19 +400,20 @@ jq -e '
   and (.mandate.reason | startswith("delegated label:maintenance;"))
 ' "$queue" >/dev/null
 
-# Existing moved rows from the previous schema shed the redundant prose even
+# Existing moved rows written by 30eef35 regain the full stored reason even
 # when no new upstream event regenerates them.
 jq -c '
   if .id == "example-org/example-repo#7"
-  then .mandate.reason += "; updated since the read cursor"
+  then .mandate.reason |= sub("; updated since the read cursor$"; "")
   else .
   end
-' "$queue" >"$fixture/queue.old-moved-reason"
-mv "$fixture/queue.old-moved-reason" "$queue"
+' "$queue" >"$fixture/queue.short-moved-reason"
+mv "$fixture/queue.short-moved-reason" "$queue"
 FAKE_GH_MODE=changed run_sweep >/dev/null
 jq -e '
   select(.id == "example-org/example-repo#7")
-  | .mandate.reason == "delegated scope:tooling"
+  | .mandate.reason
+      == "delegated scope:tooling; updated since the read cursor"
 ' "$queue" >/dev/null
 
 refreshed_digest="$(
@@ -421,7 +425,7 @@ refreshed_digest="$(
 refreshed_row="$(grep '^example-org/example-repo#8  ' <<<"$refreshed_digest")"
 [ "${#refreshed_row}" -le 100 ]
 grep -q \
-  '^example-org/example-repo#8  fix: refreshed routine maintenance title — delegated .*….*PR passed CI$' \
+  '^example-org/example-repo#8  fix: refreshed routine maintenance title — delegated label:maintenance;.*…$' \
   <<<"$refreshed_row"
 grep -q \
   '^example-org/example-repo#7  .* — delegated scope:tooling$' \

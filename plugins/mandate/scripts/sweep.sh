@@ -452,7 +452,10 @@ while IFS= read -r project; do
               else
                 {
                   kind: "moved",
-                  reason: match_reason($item.classification)
+                  reason: (
+                    match_reason($item.classification)
+                    + "; updated since the read cursor"
+                  )
                 }
               end
             ) as $row
@@ -635,10 +638,15 @@ final_queue="$(
       . as $row
       | (current($row.id)) as $current
       | if .kind == "moved"
+          and (
+            (.mandate.reason // .mandate // "")
+            | endswith("; updated since the read cursor")
+            | not
+          )
         then
           if (.mandate | type) == "object"
-          then .mandate.reason |= sub("; updated since the read cursor$"; "")
-          else .mandate |= sub("; updated since the read cursor$"; "")
+          then .mandate.reason += "; updated since the read cursor"
+          else .mandate += "; updated since the read cursor"
           end
         else .
         end
