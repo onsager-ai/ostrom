@@ -51,11 +51,46 @@ render_section() {
   kinds="$2"
   rows="$(
     jq -r --argjson kinds "$kinds" '
+    def title:
+      if (((.title // "") | type) == "string")
+        and (((.title // "") | length) > 0)
+      then .title
+      else "(title unavailable)"
+      end;
+    def truncate($text; $width):
+      if ($text | length) <= $width then $text
+      elif $width <= 1 then "…"
+      else $text[0:$width - 1] + "…"
+      end;
+    def essential_reason:
+      sub("; open PR passed CI$"; "")
+      | sub("; no movement for [0-9]+ days$"; "");
     .[]
     | select(.kind as $kind | $kinds | index($kind))
-    | .repo + .ref + " " + .kind + " — "
-      + (.mandate.reason // .mandate)
-      + (if .state == "deferred" then " [deferred]" else "" end)
+    | . as $row
+    | (.mandate.reason // .mandate) as $stored_reason
+    | (
+        if .kind == "moved"
+        then $stored_reason | sub("; updated since the read cursor$"; "")
+        else $stored_reason
+        end
+      ) as $reason
+    | (if .state == "deferred" then " [deferred]" else "" end) as $suffix
+    | (.repo + .ref) as $ref
+    | ($row | title) as $title
+    | (100 - (($ref | length) + 2 + 3 + ($suffix | length))) as $content_width
+    | ([
+        ($title | length),
+        ([45, ($content_width - ($reason | length))] | max)
+      ] | min) as $title_width
+    | ([
+        $content_width - $title_width,
+        ($reason | essential_reason | length),
+        1
+      ] | max) as $reason_width
+    | $ref + "  "
+      + truncate($title; $title_width)
+      + " — " + truncate($reason; $reason_width) + $suffix
     ' <<<"$active"
   )"
   [ -n "$rows" ] || return 0
@@ -84,7 +119,8 @@ if [ -s "$MANDATE_STATE_FILE" ]; then
               else null
               end
             ),
-            unclassified: (.value.unclassified // 0)
+            unclassified: (.value.unclassified // 0),
+            item_cap: (.value.item_cap // null)
           }
       ]
     ' "$MANDATE_STATE_FILE" 2>/dev/null || echo '[]'
@@ -92,6 +128,12 @@ if [ -s "$MANDATE_STATE_FILE" ]; then
 fi
 
 jq -r '.[] | .notice // empty' <<<"$state_rollups"
+jq -r '
+  .[]
+  | select(.item_cap != null)
+  | .repo + ": item cap reached (" + (.item_cap | tostring)
+    + ") — sweep may be incomplete"
+' <<<"$state_rollups"
 jq -r '
   .[]
   | select(.unclassified > 0)
