@@ -11,6 +11,8 @@ source "$SCRIPT_DIR/mandate-lib.sh"
 command -v jq >/dev/null 2>&1 || { echo "mandate sweep: jq is required" >&2; exit 1; }
 command -v gh >/dev/null 2>&1 || { echo "mandate sweep: gh is required" >&2; exit 1; }
 
+query_limit=200
+
 if ! mandate_is_configured; then
   echo "mandate sweep: no mandates.yaml found at $MANDATE_USER_CONFIG or $MANDATE_REPO_CONFIG" >&2
   exit 2
@@ -57,18 +59,23 @@ while IFS= read -r project; do
   repo="$(jq -r '.repo' <<<"$project")"
   gh_error="$work/gh-error"
 
-  if ! issues="$(gh issue list --repo "$repo" --state open --limit 100 \
+  if ! issues="$(gh issue list --repo "$repo" --state open --limit "$query_limit" \
     --json number,title,labels,createdAt,updatedAt,url 2>"$gh_error")"; then
     detail="$(tr '\n' ' ' <"$gh_error")"
     echo "mandate sweep: failed to query open issues for $repo${detail:+: $detail}" >&2
     exit 5
   fi
-  if ! prs="$(gh pr list --repo "$repo" --state open --limit 100 \
+  if ! prs="$(gh pr list --repo "$repo" --state open --limit "$query_limit" \
     --json number,title,labels,createdAt,updatedAt,url,isDraft,reviewDecision,statusCheckRollup,closingIssuesReferences,files \
     2>"$gh_error")"; then
     detail="$(tr '\n' ' ' <"$gh_error")"
     echo "mandate sweep: failed to query open PRs and CI for $repo${detail:+: $detail}" >&2
     exit 5
+  fi
+  item_cap='null'
+  if [ "$(jq 'length' <<<"$issues")" -eq "$query_limit" ] ||
+    [ "$(jq 'length' <<<"$prs")" -eq "$query_limit" ]; then
+    item_cap="$query_limit"
   fi
 
   items="$(
@@ -178,6 +185,7 @@ while IFS= read -r project; do
       --argjson config "$config" \
       --argjson items "$items" \
       --argjson policy "$policy" \
+      --argjson item_cap "$item_cap" \
       --argjson previous "$old_repo_state" '
       def regex_char($char):
         if $char | IN("\\", ".", "+", "?", "^", "$", "(", ")", "[", "]", "{", "}", "|")
@@ -444,10 +452,7 @@ while IFS= read -r project; do
               else
                 {
                   kind: "moved",
-                  reason: (
-                    match_reason($item.classification)
-                    + "; updated since the read cursor"
-                  )
+                  reason: match_reason($item.classification)
                 }
               end
             ) as $row
@@ -551,6 +556,7 @@ while IFS= read -r project; do
             unclassified: (
               [$classified[] | select(.classification.terminal == "unclassified")] | length
             ),
+            item_cap: $item_cap,
             scope_changes: (
               if $policy_changed and ($initial | not)
               then {entered: $entered, left: $left}
@@ -628,6 +634,14 @@ final_queue="$(
     def enrich:
       . as $row
       | (current($row.id)) as $current
+      | if .kind == "moved"
+        then
+          if (.mandate | type) == "object"
+          then .mandate.reason |= sub("; updated since the read cursor$"; "")
+          else .mandate |= sub("; updated since the read cursor$"; "")
+          end
+        else .
+        end
       | .title = ($current.title // .title // "(title unavailable)")
       | if ($current.closing_suffix // "") != ""
           and (

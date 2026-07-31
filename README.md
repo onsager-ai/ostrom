@@ -105,8 +105,11 @@ portfolio is exactly `N projects nominal`. If the state file is older than
 `cadence_hours`, the hook adds one short stale warning. Queue rows contain a
 resolvable GitHub pointer, its sweep-refreshed title, and mandate metadata,
 never mirrored issue or PR bodies. When an open PR closes a queued issue,
-only the PR is shown. v1 implements the `file` provider only; the provider
-seam remains explicit for a later addition.
+only the PR is shown. Digest rows preserve at least 45 title characters when
+available, truncating long reasons first. Each issue and PR query reads up to
+200 open items; reaching that cap adds a persistent per-repo incomplete-sweep
+warning. v1 implements the `file` provider only; the provider seam remains
+explicit for a later addition.
 
 Run `/desk lint` explicitly to inspect selectors that matched no open item in
 the last sweep; unmatched selectors never add daily digest lines.

@@ -62,17 +62,31 @@ render_section() {
       elif $width <= 1 then "…"
       else $text[0:$width - 1] + "…"
       end;
+    def truncate_reason($text; $width):
+      if ($text | length) <= $width then $text
+      elif $width <= 1 then "…"
+      else
+        (($width - 1) / 2 | ceil) as $left
+        | (($width - 1) - $left) as $right
+        | $text[0:$left] + "…"
+          + (if $right > 0 then $text[-$right:] else "" end)
+      end;
     .[]
     | select(.kind as $kind | $kinds | index($kind))
     | . as $row
     | (.mandate.reason // .mandate) as $reason
     | (if .state == "deferred" then " [deferred]" else "" end) as $suffix
     | (.repo + .ref) as $ref
-    | (100 - (($ref | length) + 2 + 3 + ($reason | length) + ($suffix | length)))
-      as $title_width
+    | ($row | title) as $title
+    | (100 - (($ref | length) + 2 + 3 + ($suffix | length))) as $content_width
+    | ([
+        ($title | length),
+        ([45, ($content_width - ($reason | length))] | max)
+      ] | min) as $title_width
+    | ([$content_width - $title_width, 1] | max) as $reason_width
     | $ref + "  "
-      + truncate(($row | title); ([$title_width, 1] | max))
-      + " — " + $reason + $suffix
+      + truncate($title; $title_width)
+      + " — " + truncate_reason($reason; $reason_width) + $suffix
     ' <<<"$active"
   )"
   [ -n "$rows" ] || return 0
@@ -101,7 +115,8 @@ if [ -s "$MANDATE_STATE_FILE" ]; then
               else null
               end
             ),
-            unclassified: (.value.unclassified // 0)
+            unclassified: (.value.unclassified // 0),
+            item_cap: (.value.item_cap // null)
           }
       ]
     ' "$MANDATE_STATE_FILE" 2>/dev/null || echo '[]'
@@ -109,6 +124,12 @@ if [ -s "$MANDATE_STATE_FILE" ]; then
 fi
 
 jq -r '.[] | .notice // empty' <<<"$state_rollups"
+jq -r '
+  .[]
+  | select(.item_cap != null)
+  | .repo + ": item cap reached (" + (.item_cap | tostring)
+    + ") — sweep may be incomplete"
+' <<<"$state_rollups"
 jq -r '
   .[]
   | select(.unclassified > 0)

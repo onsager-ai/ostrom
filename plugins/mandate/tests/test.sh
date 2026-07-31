@@ -149,8 +149,12 @@ fi
 if [ "$1 $2" = "issue list" ]; then
   case "$repo" in
     example-org/example-repo)
-      cat <<'JSON'
-[{"number":7,"title":"feat(tooling): improve runner","labels":[],"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/7"},{"number":9,"title":"Untriaged request","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/9"},{"number":10,"title":"feat(tooling): owner gate","labels":[{"name":"maintenance"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/10"},{"number":11,"title":"Path-only issue","labels":[],"files":[{"path":"docs/guide.md"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/11"},{"number":14,"title":"Rotate credential safely","labels":[{"name":"ignored"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/14"},{"number":15,"title":"Routine excluded work","labels":[{"name":"ignored"},{"name":"maintenance"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/15"}]
+      issue7_title="feat(tooling): improve runner"
+      if [ "${FAKE_GH_MODE:-base}" = "changed" ]; then
+        issue7_title="feat(tooling): improve runner title refreshed upstream"
+      fi
+      cat <<JSON
+[{"number":7,"title":"$issue7_title","labels":[],"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/7"},{"number":9,"title":"Untriaged request","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/9"},{"number":10,"title":"feat(tooling): owner gate","labels":[{"name":"maintenance"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/10"},{"number":11,"title":"Path-only issue","labels":[],"files":[{"path":"docs/guide.md"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/11"},{"number":14,"title":"Rotate credential safely","labels":[{"name":"ignored"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/14"},{"number":15,"title":"Routine excluded work","labels":[{"name":"ignored"},{"name":"maintenance"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/15"}]
 JSON
       ;;
     example-org/another-repo)
@@ -162,6 +166,22 @@ JSON
       cat <<'JSON'
 [{"number":14,"title":"spec(launch): public announcement","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/14"},{"number":15,"title":"spec(launch): installation guide","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/15"},{"number":16,"title":"spec(launch): release checklist","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/16"}]
 JSON
+      ;;
+    example-org/capped)
+      jq -cn '
+        [
+          range(1; 201)
+          | . as $number
+          | {
+              number: $number,
+              title: ("Capped issue " + ($number | tostring)),
+              labels: [],
+              createdAt: "2026-07-29T00:00:00Z",
+              updatedAt: "2026-07-30T00:00:00Z",
+              url: ("https://example.invalid/issues/" + ($number | tostring))
+            }
+        ]
+      '
       ;;
     *) echo '[]' ;;
   esac
@@ -295,6 +315,10 @@ fi
 # Paused projects are queried for issues so their tripwires cannot be paused.
 grep -q $'example-org/another-repo\tissue list' "$fixture/gh-calls"
 grep -q $'example-org/another-repo\tpr list' "$fixture/gh-calls"
+grep -q $'example-org/another-repo\tissue list .*--limit 200' \
+  "$fixture/gh-calls"
+grep -q $'example-org/another-repo\tpr list .*--limit 200' \
+  "$fixture/gh-calls"
 
 # Baseline time, not an old upstream update, starts the stuck clock.
 jq -e '
@@ -323,8 +347,12 @@ long_digest_row="$(
   grep '^example-org/example-repo#12  ' <<<"$digest"
 )"
 [ "${#long_digest_row}" -le 100 ]
-grep -q '… — tripwire: project bounce path:rules/frozen-rules.md$' \
-  <<<"$long_digest_row"
+long_rendered_title="${long_digest_row#*#12  }"
+long_rendered_title="${long_rendered_title%% — *}"
+[ "${#long_rendered_title}" -ge 45 ]
+grep -q '^chore: update the frozen rule.*…$' \
+  <<<"$long_rendered_title"
+grep -q ' — tripwire:.*….*rules.md$' <<<"$long_digest_row"
 grep -q '^example-org/example-repo: baselined 10 open items$' <<<"$digest"
 grep -q '^example-org/another-repo: baselined 1 open items$' <<<"$digest"
 grep -q '^example-org/example-repo: 3 unclassified — /desk triage$' <<<"$digest"
@@ -360,10 +388,30 @@ fi
 # titles are not frozen and inherited labels reach the live classifier too.
 FAKE_GH_MODE=changed run_sweep >/dev/null
 jq -e '
+  select(.id == "example-org/example-repo#7" and .kind == "moved")
+  | .mandate.reason == "delegated scope:tooling"
+' "$queue" >/dev/null
+jq -e '
   select(.id == "example-org/example-repo#8" and .kind == "decision")
   | .title == "fix: refreshed routine maintenance title"
   and (.mandate.reason | startswith("delegated label:maintenance;"))
 ' "$queue" >/dev/null
+
+# Existing moved rows from the previous schema shed the redundant prose even
+# when no new upstream event regenerates them.
+jq -c '
+  if .id == "example-org/example-repo#7"
+  then .mandate.reason += "; updated since the read cursor"
+  else .
+  end
+' "$queue" >"$fixture/queue.old-moved-reason"
+mv "$fixture/queue.old-moved-reason" "$queue"
+FAKE_GH_MODE=changed run_sweep >/dev/null
+jq -e '
+  select(.id == "example-org/example-repo#7")
+  | .mandate.reason == "delegated scope:tooling"
+' "$queue" >/dev/null
+
 refreshed_digest="$(
   cd "$fixture/repo"
   CLAUDE_CONFIG_DIR="$fixture/config" \
@@ -373,8 +421,15 @@ refreshed_digest="$(
 refreshed_row="$(grep '^example-org/example-repo#8  ' <<<"$refreshed_digest")"
 [ "${#refreshed_row}" -le 100 ]
 grep -q \
-  '^example-org/example-repo#8  fix: refreshed routine… — delegated label:maintenance; open PR passed CI$' \
+  '^example-org/example-repo#8  fix: refreshed routine maintenance title — delegated .*….*PR passed CI$' \
   <<<"$refreshed_row"
+grep -q \
+  '^example-org/example-repo#7  .* — delegated scope:tooling$' \
+  <<<"$refreshed_digest"
+if grep -q 'updated since the read cursor' <<<"$refreshed_digest"; then
+  echo "moved-row heading was repeated in its reason" >&2
+  exit 1
+fi
 
 # Editing a selector re-baselines scope: one item enters, one leaves, neither
 # is emitted as a routine row, and the detail is durable for /desk.
@@ -503,6 +558,53 @@ fi
 grep -q \
   '^onsager-ai/duhem-hub#18  spec(launch): public announcement — reserved ref:#14 (closes #14)$' \
   <<<"$dedup_digest"
+
+# Hitting either GitHub query limit is durable sweep state, not a silent
+# partial portfolio. The digest keeps warning until a later sweep is below it.
+capped="$fixture/capped"
+mkdir -p "$capped/config/ostrom" "$capped/repo"
+cat >"$capped/config/ostrom/mandates.yaml" <<'YAML'
+bounce_all: []
+projects:
+  - repo: example-org/capped
+    delegated: []
+    excluded: []
+    reserved: []
+    default: excluded
+    paused: false
+    bounce: []
+YAML
+(
+  cd "$capped/repo"
+  PATH="$fixture/bin:$PATH" \
+    CLAUDE_CONFIG_DIR="$capped/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/sweep.sh" >/dev/null
+)
+jq -e '
+  .repos["example-org/capped"].item_cap == 200
+' "$capped/config/ostrom/state.json" >/dev/null
+capped_digest="$(
+  cd "$capped/repo"
+  CLAUDE_CONFIG_DIR="$capped/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/hooks/render-digest.sh"
+)"
+grep -q \
+  '^example-org/capped: item cap reached (200) — sweep may be incomplete$' \
+  <<<"$capped_digest"
+[ "$(
+  grep -c '^example-org/capped: item cap reached' <<<"$capped_digest"
+)" -eq 1 ]
+capped_digest_again="$(
+  cd "$capped/repo"
+  CLAUDE_CONFIG_DIR="$capped/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/hooks/render-digest.sh"
+)"
+grep -q \
+  '^example-org/capped: item cap reached (200) — sweep may be incomplete$' \
+  <<<"$capped_digest_again"
 
 # A representative eight-project first sweep remains a compact digest.
 portfolio="$fixture/portfolio"
