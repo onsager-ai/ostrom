@@ -8,6 +8,41 @@
 set -u
 umask 077
 
+# The digest is emitted twice: as `systemMessage` so Claude Code DISPLAYS it to
+# the operator, and as `additionalContext` so the assistant holds the same queue
+# without being told. Plain stdout would only do the second — the assistant would
+# know the portfolio and the human would not, which inverts the point of a digest
+# whose whole purpose is that the operator stops being an outsider to their own
+# projects.
+#
+# Everything below still `echo`s normally; stdout is buffered and wrapped once on
+# exit, so every early-return path (unconfigured machine, missing jq, malformed
+# queue) stays correct and silent.
+_digest_buf="$(mktemp)"
+exec 3>&1 1>"$_digest_buf"
+
+_emit_digest() {
+  exec 1>&3 3>&-
+  local body
+  body="$(cat "$_digest_buf" 2>/dev/null)"
+  rm -f "$_digest_buf"
+  [ -n "$body" ] || return 0
+  if command -v jq >/dev/null 2>&1; then
+    jq -n --arg m "$body" '{
+      systemMessage: $m,
+      hookSpecificOutput: {
+        hookEventName: "SessionStart",
+        additionalContext: $m
+      }
+    }'
+  else
+    # No jq: fall back to plain stdout rather than emitting nothing. Context-only
+    # delivery beats a silent hook.
+    printf '%s\n' "$body"
+  fi
+}
+trap _emit_digest EXIT
+
 PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 # shellcheck source=../scripts/mandate-lib.sh
 source "$PLUGIN_ROOT/scripts/mandate-lib.sh"

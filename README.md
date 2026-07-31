@@ -100,9 +100,12 @@ placeholder clone path and install this with `crontab -e`:
 ```
 
 The SessionStart hook never calls `gh`; it only renders the durable files
-written by the scheduled sweep. Empty sections disappear, so a healthy
-portfolio is exactly `N projects nominal`. If the state file is older than
-`cadence_hours`, the hook adds one short stale warning. Queue rows contain a
+written by the scheduled sweep. It emits one JSON document whose
+`systemMessage` displays the digest to the operator and whose
+`hookSpecificOutput.additionalContext` gives the assistant byte-identical
+text. Empty sections disappear, so a healthy portfolio's digest text is
+exactly `N projects nominal`. If the state file is older than `cadence_hours`,
+the hook adds one short stale warning. Queue rows contain a
 resolvable GitHub pointer, its sweep-refreshed title, and mandate metadata,
 never mirrored issue or PR bodies. When an open PR closes a queued issue,
 only the PR is shown. Digest rows preserve at least 45 title characters when

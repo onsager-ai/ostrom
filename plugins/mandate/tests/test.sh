@@ -334,17 +334,30 @@ digest="$(
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
     bash "$PLUGIN_ROOT/hooks/render-digest.sh"
 )"
+jq -e . <<<"$digest" >/dev/null
+jq -s -e '
+  length == 1
+  and ((.[0] | type) == "object")
+  and (.[0] | has("systemMessage"))
+  and ((.[0].systemMessage | type) == "string")
+  and ((.[0].hookSpecificOutput | type) == "object")
+  and (.[0].hookSpecificOutput | has("additionalContext"))
+  and ((.[0].hookSpecificOutput.additionalContext | type) == "string")
+  and .[0].systemMessage == .[0].hookSpecificOutput.additionalContext
+  and .[0].hookSpecificOutput.hookEventName == "SessionStart"
+' <<<"$digest" >/dev/null
+digest_text="$(jq -r '.systemMessage' <<<"$digest")"
 grep -q \
   '^example-org/example-repo#10  feat(tooling): owner gate — reserved ref:#10$' \
-  <<<"$digest"
+  <<<"$digest_text"
 grep -q \
   '^example-org/example-repo#13  (title unavailable) — CI is failing; default:unclassified$' \
-  <<<"$digest"
+  <<<"$digest_text"
 grep -q \
   '^example-org/example-repo#14  Rotate credential safely — tripwire: bounce_all title:\*credential\*$' \
-  <<<"$digest"
+  <<<"$digest_text"
 long_digest_row="$(
-  grep '^example-org/example-repo#12  ' <<<"$digest"
+  grep '^example-org/example-repo#12  ' <<<"$digest_text"
 )"
 long_rendered_title="${long_digest_row#*#12  }"
 long_rendered_title="${long_rendered_title%% — *}"
@@ -355,10 +368,10 @@ long_rendered_reason="${long_digest_row#* — }"
 [ "$long_rendered_reason" = \
   "tripwire: project bounce path:rules/frozen-rules.md" ]
 [ "${#long_digest_row}" -gt 100 ]
-grep -q '^example-org/example-repo: baselined 10 open items$' <<<"$digest"
-grep -q '^example-org/another-repo: baselined 1 open items$' <<<"$digest"
-grep -q '^example-org/example-repo: 3 unclassified — /desk triage$' <<<"$digest"
-if grep -Eq 'dead selector|unmatched in last sweep' <<<"$digest"; then
+grep -q '^example-org/example-repo: baselined 10 open items$' <<<"$digest_text"
+grep -q '^example-org/another-repo: baselined 1 open items$' <<<"$digest_text"
+grep -q '^example-org/example-repo: 3 unclassified — /desk triage$' <<<"$digest_text"
+if grep -Eq 'dead selector|unmatched in last sweep' <<<"$digest_text"; then
   echo "unmatched selectors leaked into the digest" >&2
   exit 1
 fi
@@ -381,7 +394,8 @@ steady_digest="$(
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
     bash "$PLUGIN_ROOT/hooks/render-digest.sh"
 )"
-if grep -q 'baselined [0-9][0-9]* open items' <<<"$steady_digest"; then
+steady_digest_text="$(jq -r '.systemMessage' <<<"$steady_digest")"
+if grep -q 'baselined [0-9][0-9]* open items' <<<"$steady_digest_text"; then
   echo "baseline notice survived an unchanged second sweep" >&2
   exit 1
 fi
@@ -422,15 +436,16 @@ refreshed_digest="$(
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
     bash "$PLUGIN_ROOT/hooks/render-digest.sh"
 )"
-refreshed_row="$(grep '^example-org/example-repo#8  ' <<<"$refreshed_digest")"
+refreshed_digest_text="$(jq -r '.systemMessage' <<<"$refreshed_digest")"
+refreshed_row="$(grep '^example-org/example-repo#8  ' <<<"$refreshed_digest_text")"
 [ "${#refreshed_row}" -le 100 ]
 grep -q \
   '^example-org/example-repo#8  fix: refreshed routine maintenance title — delegated label:maintenance;.*…$' \
   <<<"$refreshed_row"
 grep -q \
   '^example-org/example-repo#7  .* — delegated scope:tooling$' \
-  <<<"$refreshed_digest"
-if grep -q 'updated since the read cursor' <<<"$refreshed_digest"; then
+  <<<"$refreshed_digest_text"
+if grep -q 'updated since the read cursor' <<<"$refreshed_digest_text"; then
   echo "moved-row heading was repeated in its reason" >&2
   exit 1
 fi
@@ -459,14 +474,16 @@ policy_digest="$(
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
     bash "$PLUGIN_ROOT/hooks/render-digest.sh"
 )"
-grep -q 'mandate changed — 1 items entered scope, 1 left' <<<"$policy_digest"
+policy_digest_text="$(jq -r '.systemMessage' <<<"$policy_digest")"
+grep -q 'mandate changed — 1 items entered scope, 1 left' <<<"$policy_digest_text"
 policy_digest_again="$(
   cd "$fixture/repo"
   CLAUDE_CONFIG_DIR="$fixture/config" \
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
     bash "$PLUGIN_ROOT/hooks/render-digest.sh"
 )"
-if grep -q 'mandate changed —' <<<"$policy_digest_again"; then
+policy_digest_again_text="$(jq -r '.systemMessage' <<<"$policy_digest_again")"
+if grep -q 'mandate changed —' <<<"$policy_digest_again_text"; then
   echo "mandate-change notice rendered more than once" >&2
   exit 1
 fi
@@ -476,7 +493,7 @@ jq -e '
   .dead_selectors
   | any(.source == "bounce_all" and .selector == "title:*never fires*")
 ' "$state" >/dev/null
-if grep -Eq 'dead selector|unmatched in last sweep' <<<"$policy_digest"; then
+if grep -Eq 'dead selector|unmatched in last sweep' <<<"$policy_digest_text"; then
   echo "unmatched selectors leaked into the policy digest" >&2
   exit 1
 fi
@@ -554,14 +571,15 @@ dedup_digest="$(
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
     bash "$PLUGIN_ROOT/hooks/render-digest.sh"
 )"
-[ "$(grep -c '^example-org/hub-repo#' <<<"$dedup_digest")" -eq 3 ]
-if grep -Eq '^example-org/hub-repo#1[456]  ' <<<"$dedup_digest"; then
+dedup_digest_text="$(jq -r '.systemMessage' <<<"$dedup_digest")"
+[ "$(grep -c '^example-org/hub-repo#' <<<"$dedup_digest_text")" -eq 3 ]
+if grep -Eq '^example-org/hub-repo#1[456]  ' <<<"$dedup_digest_text"; then
   echo "closing issues were rendered beside their pull requests" >&2
   exit 1
 fi
 grep -q \
   '^example-org/hub-repo#18  spec(launch): public announcement — reserved ref:#14 (closes #14)$' \
-  <<<"$dedup_digest"
+  <<<"$dedup_digest_text"
 
 # Hitting either GitHub query limit is durable sweep state, not a silent
 # partial portfolio. The digest keeps warning until a later sweep is below it.
@@ -594,11 +612,12 @@ capped_digest="$(
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
     bash "$PLUGIN_ROOT/hooks/render-digest.sh"
 )"
+capped_digest_text="$(jq -r '.systemMessage' <<<"$capped_digest")"
 grep -q \
   '^example-org/capped: item cap reached (200) — sweep may be incomplete$' \
-  <<<"$capped_digest"
+  <<<"$capped_digest_text"
 [ "$(
-  grep -c '^example-org/capped: item cap reached' <<<"$capped_digest"
+  grep -c '^example-org/capped: item cap reached' <<<"$capped_digest_text"
 )" -eq 1 ]
 capped_digest_again="$(
   cd "$capped/repo"
@@ -606,9 +625,10 @@ capped_digest_again="$(
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
     bash "$PLUGIN_ROOT/hooks/render-digest.sh"
 )"
+capped_digest_again_text="$(jq -r '.systemMessage' <<<"$capped_digest_again")"
 grep -q \
   '^example-org/capped: item cap reached (200) — sweep may be incomplete$' \
-  <<<"$capped_digest_again"
+  <<<"$capped_digest_again_text"
 
 # A representative eight-project first sweep remains a compact digest.
 portfolio="$fixture/portfolio"
@@ -642,9 +662,10 @@ portfolio_digest="$(
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
     bash "$PLUGIN_ROOT/hooks/render-digest.sh"
 )"
-[ "$(wc -l <<<"$portfolio_digest")" -le 20 ]
-grep -q '^8 projects nominal$' <<<"$portfolio_digest"
-if grep -Eq 'dead selector|unmatched in last sweep' <<<"$portfolio_digest"; then
+portfolio_digest_text="$(jq -r '.systemMessage' <<<"$portfolio_digest")"
+[ "$(wc -l <<<"$portfolio_digest_text")" -le 20 ]
+grep -q '^8 projects nominal$' <<<"$portfolio_digest_text"
+if grep -Eq 'dead selector|unmatched in last sweep' <<<"$portfolio_digest_text"; then
   echo "mostly unmatched roster rendered selector diagnostics" >&2
   exit 1
 fi
@@ -688,8 +709,9 @@ baseline_state_mtime="$(
     stat -f %m "$baseline_once/config/ostrom/state.json"
 )"
 first_baseline_digest="$(render_baseline_once)"
+first_baseline_digest_text="$(jq -r '.systemMessage' <<<"$first_baseline_digest")"
 grep -q '^example-org/rebaseline: baselined 0 open items$' \
-  <<<"$first_baseline_digest"
+  <<<"$first_baseline_digest_text"
 reported_state_mtime="$(
   stat -c %Y "$baseline_once/config/ostrom/state.json" 2>/dev/null ||
     stat -f %m "$baseline_once/config/ostrom/state.json"
@@ -701,7 +723,8 @@ jq -e '
 
 run_baseline_once_sweep
 second_baseline_digest="$(render_baseline_once)"
-if grep -q 'baselined [0-9][0-9]* open items' <<<"$second_baseline_digest"; then
+second_baseline_digest_text="$(jq -r '.systemMessage' <<<"$second_baseline_digest")"
+if grep -q 'baselined [0-9][0-9]* open items' <<<"$second_baseline_digest_text"; then
   echo "baseline notice rendered after an unchanged second sweep" >&2
   exit 1
 fi
@@ -712,11 +735,15 @@ mv "$baseline_once/config/ostrom/state.reset" \
   "$baseline_once/config/ostrom/state.json"
 run_baseline_once_sweep
 reset_baseline_digest="$(render_baseline_once)"
+reset_baseline_digest_text="$(jq -r '.systemMessage' <<<"$reset_baseline_digest")"
 grep -q '^example-org/rebaseline: baselined 0 open items$' \
-  <<<"$reset_baseline_digest"
+  <<<"$reset_baseline_digest_text"
 reset_baseline_digest_again="$(render_baseline_once)"
+reset_baseline_digest_again_text="$(
+  jq -r '.systemMessage' <<<"$reset_baseline_digest_again"
+)"
 if grep -q 'baselined [0-9][0-9]* open items' \
-  <<<"$reset_baseline_digest_again"; then
+  <<<"$reset_baseline_digest_again_text"; then
   echo "reset baseline notice rendered more than once" >&2
   exit 1
 fi
@@ -779,14 +806,15 @@ rollup_digest="$(
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
     bash "$PLUGIN_ROOT/hooks/render-digest.sh"
 )"
-grep -q '^example-org/rollup-one: baselined 3 open items$' <<<"$rollup_digest"
-grep -q '^example-org/rollup-two: baselined 2 open items$' <<<"$rollup_digest"
+rollup_digest_text="$(jq -r '.systemMessage' <<<"$rollup_digest")"
+grep -q '^example-org/rollup-one: baselined 3 open items$' <<<"$rollup_digest_text"
+grep -q '^example-org/rollup-two: baselined 2 open items$' <<<"$rollup_digest_text"
 grep -q '^example-org/rollup-one: 3 unclassified — /desk triage$' \
-  <<<"$rollup_digest"
+  <<<"$rollup_digest_text"
 grep -q '^example-org/rollup-two: 2 unclassified — /desk triage$' \
-  <<<"$rollup_digest"
-grep -q '^2 projects nominal$' <<<"$rollup_digest"
-if grep -Eq 'dead selector|unmatched in last sweep' <<<"$rollup_digest"; then
+  <<<"$rollup_digest_text"
+grep -q '^2 projects nominal$' <<<"$rollup_digest_text"
+if grep -Eq 'dead selector|unmatched in last sweep' <<<"$rollup_digest_text"; then
   echo "rollup-only digest rendered selector diagnostics" >&2
   exit 1
 fi
@@ -820,7 +848,9 @@ healthy="$(
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
     bash "$PLUGIN_ROOT/hooks/render-digest.sh"
 )"
-[ "$healthy" = "2 projects nominal" ]
+healthy_text="$(jq -r '.systemMessage' <<<"$healthy")"
+[ "$healthy_text" = "2 projects nominal" ]
+[ "$(grep -c '^[0-9][0-9]* projects nominal$' <<<"$healthy_text")" -eq 1 ]
 
 touch -t 200001010000 "$fixture/healthy/config/ostrom/state.json"
 stale_digest="$(
@@ -829,19 +859,25 @@ stale_digest="$(
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
     bash "$PLUGIN_ROOT/hooks/render-digest.sh"
 )"
-[ "$(wc -l <<<"$stale_digest")" -eq 2 ]
-grep -q '^STALE — mandate sweep overdue$' <<<"$stale_digest"
-grep -q '^2 projects nominal$' <<<"$stale_digest"
+stale_digest_text="$(jq -r '.systemMessage' <<<"$stale_digest")"
+[ "$(wc -l <<<"$stale_digest_text")" -eq 2 ]
+grep -q '^STALE — mandate sweep overdue$' <<<"$stale_digest_text"
+grep -q '^2 projects nominal$' <<<"$stale_digest_text"
 
 empty="$fixture/empty-config"
 mkdir -p "$empty"
-unconfigured="$(
+unconfigured_stdout="$fixture/unconfigured.stdout"
+set +e
+(
   cd "$fixture/repo"
   CLAUDE_CONFIG_DIR="$empty" \
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
     bash "$PLUGIN_ROOT/hooks/render-digest.sh"
-)"
-[ -z "$unconfigured" ]
+) >"$unconfigured_stdout"
+unconfigured_status=$?
+set -e
+[ "$unconfigured_status" -eq 0 ]
+[ ! -s "$unconfigured_stdout" ]
 
 set +e
 missing_message="$(
