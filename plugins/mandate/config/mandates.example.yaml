@@ -9,23 +9,38 @@ cadence_hours: 24
 stuck_after_days: 7
 
 bounce_all:
-  - merge to main
-  - production deployment
-  - external publication
-  - credential or secret
+  - title:*merge to main*
+  - title:*production deployment*
+  - title:*external publication*
+  - title:*credential*
 
 projects:
   - repo: example-org/example-repo
-    # Required free text. The sweep matches this phrase case-insensitively
-    # against issue/PR titles and labels; misses bounce as out-of-mandate.
-    delegated: routine maintenance
+    # Selectors are case-insensitive. Supported prefixes are label, scope,
+    # type, path, ref, and title. Only * is a wildcard; path ** spans depth.
+    delegated:
+      - label:maintenance
+      - scope:tooling
+      - path:docs/**
+    excluded:
+      - label:wontfix
+    # Reserved refs are exact item or closing-issue numbers.
+    reserved:
+      - 42
+    # Unmatched items roll up for triage instead of flooding the queue.
+    default: unclassified
     paused: false
     bounce:
-      - public release
-      - backwards-incompatible API
+      - label:public-release
+      - title:*breaking API*
   - repo: example-org/another-repo
-    delegated: CI health maintenance
-    # Paused projects skip issues and emit only CI-failure drift from PRs.
+    delegated:
+      - type:ci
+      - scope:release
+    excluded: []
+    reserved: []
+    default: excluded
+    # Paused projects still evaluate reserved refs, tripwires, and CI drift.
     paused: true
     bounce:
-      - public-readiness gate
+      - path:.github/workflows/**

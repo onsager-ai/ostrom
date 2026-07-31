@@ -43,42 +43,28 @@ if [ -s "$MANDATE_STATE_FILE" ]; then
     exit 4
   fi
 else
-  old_state='{"version":1,"repos":{}}'
+  old_state='{"version":2,"repos":{},"dead_selectors":[]}'
 fi
 
 sweep_started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 generated='[]'
 active_ids='[]'
+selector_stats='[]'
 new_state="$old_state"
 
 while IFS= read -r project; do
   repo="$(jq -r '.repo' <<<"$project")"
-  paused="$(jq -r '.paused' <<<"$project")"
-  policy="$(
-    jq -cn \
-      --argjson project "$project" \
-      --argjson bounce_all "$(jq -c '.bounce_all' <<<"$config")" \
-      '{
-        delegated: $project.delegated,
-        paused: $project.paused,
-        bounce: $project.bounce,
-        bounce_all: $bounce_all
-      }'
-  )"
   gh_error="$work/gh-error"
 
-  if [ "$paused" = "true" ]; then
-    issues='[]'
-  else
-    if ! issues="$(gh issue list --repo "$repo" --state open --limit 100 \
-      --json number,title,labels,createdAt,updatedAt,url 2>"$gh_error")"; then
-      detail="$(tr '\n' ' ' <"$gh_error")"
-      echo "mandate sweep: failed to query open issues for $repo${detail:+: $detail}" >&2
-      exit 5
-    fi
+  if ! issues="$(gh issue list --repo "$repo" --state open --limit 100 \
+    --json number,title,labels,createdAt,updatedAt,url 2>"$gh_error")"; then
+    detail="$(tr '\n' ' ' <"$gh_error")"
+    echo "mandate sweep: failed to query open issues for $repo${detail:+: $detail}" >&2
+    exit 5
   fi
   if ! prs="$(gh pr list --repo "$repo" --state open --limit 100 \
-    --json number,title,labels,createdAt,updatedAt,url,isDraft,reviewDecision,statusCheckRollup 2>"$gh_error")"; then
+    --json number,title,labels,createdAt,updatedAt,url,isDraft,reviewDecision,statusCheckRollup,closingIssuesReferences,files \
+    2>"$gh_error")"; then
     detail="$(tr '\n' ' ' <"$gh_error")"
     echo "mandate sweep: failed to query open PRs and CI for $repo${detail:+: $detail}" >&2
     exit 5
@@ -98,16 +84,41 @@ while IFS= read -r project; do
           elif ($checks | length) > 0 and all($checks[]; success) then "passing"
           else "pending"
           end;
+      def label_names:
+        if type == "array" then [ .[]? | .name // empty ]
+        elif type == "object" then [ (.nodes // [])[]? | .name // empty ]
+        else []
+        end;
+      def linked_issues:
+        if (.closingIssuesReferences | type) == "array"
+        then .closingIssuesReferences
+        elif (.closingIssuesReferences | type) == "object"
+        then (.closingIssuesReferences.nodes // [])
+        else []
+        end;
       def normalized($type):
         . as $item
         | (if $type == "pr" then ($item | ci_state) else "none" end) as $ci
+        | (if $type == "pr" then ($item | linked_issues) else [] end) as $linked
         | {
             id: ($repo + "#" + (.number | tostring)),
             repo: $repo,
+            number: .number,
             ref: ("#" + (.number | tostring)),
             type: $type,
             title: .title,
-            labels: [(.labels // [])[] | .name],
+            labels: (
+              ((.labels // []) | label_names)
+              + [$linked[]? | ((.labels // []) | label_names)[]]
+              | unique
+            ),
+            refs: ([.number] + [$linked[]? | .number] | unique),
+            files: (
+              if $type == "pr"
+              then [(.files // [])[]? | .path // empty] | unique
+              else []
+              end
+            ),
             opened: .createdAt,
             updated: .updatedAt,
             ci: $ci,
@@ -117,6 +128,8 @@ while IFS= read -r project; do
         | .fingerprint = ([
             .title,
             (.labels | sort | join(",")),
+            (.refs | sort | map(tostring) | join(",")),
+            (.files | sort | join(",")),
             .ci,
             (.ready | tostring),
             .review
@@ -125,8 +138,30 @@ while IFS= read -r project; do
     '
   )"
 
+  policy="$(
+    jq -cn \
+      --argjson project "$project" \
+      --argjson bounce_all "$(jq -c '.bounce_all' <<<"$config")" '
+      {
+        delegated: $project.delegated,
+        excluded: $project.excluded,
+        reserved: $project.reserved,
+        bounce: $project.bounce,
+        bounce_all: $bounce_all,
+        default: $project.default
+      } as $selectors
+      | ($selectors | tojson | explode
+          | reduce .[] as $code (0; ((. * 31 + $code) % 2147483647))
+          | tostring) as $selector_hash
+      | $selectors + {
+          paused: $project.paused,
+          selector_hash: $selector_hash
+        }
+    '
+  )"
+
   old_repo_state="$(jq -c --arg repo "$repo" '.repos[$repo] // {}' <<<"$old_state")"
-  rows="$(
+  analysis="$(
     jq -cn \
       --arg sweep_started "$sweep_started" \
       --argjson project "$project" \
@@ -134,19 +169,121 @@ while IFS= read -r project; do
       --argjson items "$items" \
       --argjson policy "$policy" \
       --argjson previous "$old_repo_state" '
-      def tripwire_hit($haystack; $shared; $local):
-        first(
-          (($shared[]? | {source: "bounce_all", term: .}),
-           ($local[]? | {source: "project bounce", term: .}))
-          | select(
-              (.term | ascii_downcase) as $needle
-              | ($haystack | ascii_downcase | contains($needle))
+      def regex_char($char):
+        if $char | IN("\\", ".", "+", "?", "^", "$", "(", ")", "[", "]", "{", "}", "|")
+        then "\\" + $char
+        else $char
+        end;
+      def glob_regex($glob; $path):
+        reduce range(0; ($glob | length)) as $index
+          ({body: "", skip: 0};
+            if .skip > 0 then
+              .skip -= 1
+            else
+              ($glob[$index:$index + 1]) as $char
+              | if $char == "*" and $path and $glob[$index + 1:$index + 2] == "*"
+                then
+                  if $glob[$index + 2:$index + 3] == "/"
+                  then .body += "(?:.*/)?" | .skip = 2
+                  else .body += ".*" | .skip = 1
+                  end
+                elif $char == "*" and $path
+                then .body += "[^/]*"
+                elif $char == "*"
+                then .body += ".*"
+                else .body += regex_char($char)
+                end
+            end
+          )
+        | "^" + .body + "$";
+      def glob_match($value; $glob; $path):
+        $value | test(glob_regex($glob; $path); "i");
+      def conventional($item):
+        ((try ($item.title | capture(
+          "^(?<item_type>[^(:[:space:]]+)(\\((?<item_scope>[^)]*)\\))?:"
+        )) catch {}) // {}) as $parsed
+        | {
+            item_type: ($parsed.item_type // ""),
+            scopes: (
+              ($parsed.item_scope // "")
+              | split(",")
+              | map(gsub("^[[:space:]]+|[[:space:]]+$"; ""))
+              | map(select(length > 0))
             )
-        );
-      def inside_delegated_scope($haystack; $delegated):
-        ($delegated | ascii_downcase) as $scope
-        | ($haystack | ascii_downcase | contains($scope));
-      def mandate_record($item; $kind; $reason; $hit):
+          };
+      def selector_match($item; $selector):
+        ($item) as $bound_item
+        | ($selector) as $bound_selector
+        | ($bound_selector | capture("^(?<prefix>[^:]+):(?<glob>.*)$")) as $parsed
+        | (conventional($bound_item)) as $conventional
+        | if $parsed.prefix == "label"
+          then any($bound_item.labels[]?; glob_match(.; $parsed.glob; false))
+          elif $parsed.prefix == "scope"
+          then any($conventional.scopes[]?; glob_match(.; $parsed.glob; false))
+          elif $parsed.prefix == "type"
+          then glob_match($conventional.item_type; $parsed.glob; false)
+          elif $parsed.prefix == "path"
+          then $bound_item.type == "pr"
+            and any($bound_item.files[]?; glob_match(.; $parsed.glob; true))
+          elif $parsed.prefix == "ref"
+          then any($bound_item.refs[]?; ("#" + tostring) == $parsed.glob)
+          elif $parsed.prefix == "title"
+          then glob_match($bound_item.title; $parsed.glob; false)
+          else false
+          end;
+      def first_selector($item; $selectors; $source):
+        first(
+          $selectors[]?
+          | select(selector_match($item; .))
+          | {source: $source, selector: .}
+        ) // null;
+      def classify($item):
+        (first(
+          $project.reserved[]? as $number
+          | select(any($item.refs[]?; . == $number))
+          | {terminal: "reserved", source: "reserved", selector: ("ref:#" + ($number | tostring))}
+        ) // null) as $reserved
+        | (first_selector($item; $config.bounce_all; "bounce_all")) as $shared_bounce
+        | (first_selector($item; $project.bounce; "project bounce")) as $project_bounce
+        | (first_selector($item; $project.excluded; "excluded")) as $excluded
+        | (first_selector($item; $project.delegated; "delegated")) as $delegated
+        | if $reserved != null then $reserved
+          elif $shared_bounce != null then $shared_bounce + {terminal: "tripwire"}
+          elif $project_bounce != null then $project_bounce + {terminal: "tripwire"}
+          elif $excluded != null then $excluded + {terminal: "excluded"}
+          elif $delegated != null then $delegated + {terminal: "delegated"}
+          else {
+            terminal: $project.default,
+            source: "default",
+            selector: ("default:" + $project.default)
+          }
+          end;
+      def selector_stats:
+        ($config.bounce_all[]? | . as $selector | {
+          repo: null,
+          source: "bounce_all",
+          selector: $selector,
+          hit: any($items[]?; selector_match(.; $selector))
+        }),
+        ($project.bounce[]? | . as $selector | {
+          repo: $project.repo,
+          source: "project bounce",
+          selector: $selector,
+          hit: any($items[]?; selector_match(.; $selector))
+        }),
+        ($project.excluded[]? | . as $selector | {
+          repo: $project.repo,
+          source: "excluded",
+          selector: $selector,
+          hit: any($items[]?; selector_match(.; $selector))
+        }),
+        ($project.delegated[]? | . as $selector | {
+          repo: $project.repo,
+          source: "delegated",
+          selector: $selector,
+          hit: any($items[]?; selector_match(.; $selector))
+        });
+      def mandate_record($item; $kind; $reason):
         if $kind == "tripwire" then
           {
             reason: $reason,
@@ -161,113 +298,269 @@ while IFS= read -r project; do
           }
         else {reason: $reason}
         end;
-      [
-        $items[]
-        | . as $item
-        | ($previous.items[$item.id] // null) as $old
-        | select(
-            ($previous.cursor // null) == null
-            or ($previous.policy // null) != $policy
-            or $old == null
-            or $old.fingerprint != $item.fingerprint
-            or $item.updated > $previous.cursor
-          )
-        | if $project.paused then
-            select(.type == "pr" and .ci == "failing")
-            | {
-                id: .id,
-                repo: .repo,
-                ref: .ref,
-                kind: "drift",
-                mandate: {reason: "paused project CI is failing"},
-                state: "pending",
-                opened: .opened
-              }
-          else
-            (([.title] + .labels) | join(" ")) as $haystack
-            | (tripwire_hit($haystack; $config.bounce_all; $project.bounce) // null) as $hit
-            | (inside_delegated_scope($haystack; $project.delegated)) as $inside
-            | (
-                if $hit != null then
-                  {kind: "tripwire", reason: ($hit.source + ": " + $hit.term)}
-                elif ($inside | not) then
-                  {
-                    kind: "decision",
-                    reason: ("out-of-mandate: outside delegated outcome \"" + $project.delegated + "\"")
-                  }
-                elif .type == "pr" and .ci == "failing" then
-                  {kind: "drift", reason: "CI is failing"}
-                elif (($sweep_started | fromdateiso8601) - (.updated | fromdateiso8601)) >= ($config.stuck_after_days * 86400) then
-                  {kind: "stuck", reason: ("no movement for " + ($config.stuck_after_days | tostring) + " days")}
-                elif .ready then
-                  {kind: "decision", reason: "open PR passed CI"}
-                else
-                  {kind: "moved", reason: "updated since the read cursor"}
-                end
-              ) as $classification
-            | {
-                id: .id,
-                repo: .repo,
-                ref: .ref,
-                kind: $classification.kind,
-                mandate: mandate_record($item; $classification.kind; $classification.reason; $hit),
-                state: "pending",
-                opened: .opened
-              }
-          end
-      ]
-    '
-  )"
+      def match_reason($classified):
+        if $classified.source == "default"
+        then $classified.selector
+        else $classified.source + " " + $classified.selector
+        end;
 
-  generated="$(jq -cn --argjson all "$generated" --argjson rows "$rows" '$all + $rows')"
-  if [ "$paused" = "true" ]; then
-    repo_active_ids="$(jq '[.[] | select(.type == "pr" and .ci == "failing") | .id]' <<<"$items")"
-  else
-    repo_active_ids="$(jq '[.[].id]' <<<"$items")"
-  fi
-  active_ids="$(jq -cn --argjson all "$active_ids" --argjson ids "$repo_active_ids" '$all + $ids')"
-
-  new_repo_state="$(
-    jq -cn \
-      --arg sweep_started "$sweep_started" \
-      --argjson previous "$old_repo_state" \
-      --argjson items "$items" \
-      --argjson policy "$policy" '
-      (reduce $items[] as $item ({};
-        .[$item.id] = {
-          updated: $item.updated,
-          fingerprint: $item.fingerprint
-        }
-      )) as $next_items
+      (($previous.cursor // null) == null) as $initial
+      | (($previous.selector_hash // "") != $policy.selector_hash) as $policy_changed
+      | [
+          $items[]
+          | . as $item
+          | classify($item) as $classification
+          | ($previous.items[$item.id] // null) as $old
+          | (
+              if $initial or $policy_changed
+              then $sweep_started
+              else ($old.first_seen // $sweep_started)
+              end
+            ) as $first_seen
+          | (([
+              ($first_seen | fromdateiso8601),
+              ($item.updated | fromdateiso8601)
+            ] | max)) as $movement_clock
+          | . + {
+              classification: $classification,
+              first_seen: $first_seen,
+              stuck: (
+                ($initial | not)
+                and ($policy_changed | not)
+                and $classification.terminal == "delegated"
+                and (($sweep_started | fromdateiso8601) - $movement_clock)
+                  >= ($config.stuck_after_days * 86400)
+              ),
+              old: $old
+            }
+        ] as $classified
+      | ([
+          $classified[]
+          | . as $item
+          | (
+              $item.old == null
+              or $item.old.fingerprint != $item.fingerprint
+              or $item.updated > ($previous.cursor // "")
+              or ($item.stuck and (($item.old.stuck // false) | not))
+            ) as $event
+          | (
+              $item.classification.terminal == "reserved"
+              or $item.classification.terminal == "tripwire"
+              or ($item.type == "pr" and $item.ci == "failing")
+            ) as $safety
+          | select(
+              if $initial or $policy_changed then $safety
+              else $event and (
+                $safety
+                or (($project.paused | not) and $item.classification.terminal == "delegated")
+              )
+              end
+            )
+          | (
+              if $item.classification.terminal == "reserved" then
+                {
+                  kind: "decision",
+                  reason: ("reserved " + $item.classification.selector)
+                }
+              elif $item.classification.terminal == "tripwire" then
+                {
+                  kind: "tripwire",
+                  reason: ("tripwire: " + match_reason($item.classification))
+                }
+              elif $item.type == "pr" and $item.ci == "failing" then
+                {
+                  kind: "drift",
+                  reason: (
+                    "CI is failing; "
+                    + match_reason($item.classification)
+                  )
+                }
+              elif $item.stuck then
+                {
+                  kind: "stuck",
+                  reason: (
+                    match_reason($item.classification)
+                    + "; no movement for "
+                    + ($config.stuck_after_days | tostring)
+                    + " days"
+                  )
+                }
+              elif $item.ready then
+                {
+                  kind: "decision",
+                  reason: (
+                    match_reason($item.classification)
+                    + "; open PR passed CI"
+                  )
+                }
+              else
+                {
+                  kind: "moved",
+                  reason: (
+                    match_reason($item.classification)
+                    + "; updated since the read cursor"
+                  )
+                }
+              end
+            ) as $row
+          | {
+              id: $item.id,
+              repo: $item.repo,
+              ref: $item.ref,
+              kind: $row.kind,
+              mandate: mandate_record($item; $row.kind; $row.reason),
+              state: "pending",
+              opened: $item.opened
+            }
+        ]) as $rows
+      | ([
+          $classified[]
+          | select(
+              if $initial or $policy_changed then
+                .classification.terminal == "reserved"
+                or .classification.terminal == "tripwire"
+                or (.type == "pr" and .ci == "failing")
+              else
+                .classification.terminal == "reserved"
+                or .classification.terminal == "tripwire"
+                or (.type == "pr" and .ci == "failing")
+                or (($project.paused | not) and .classification.terminal == "delegated")
+              end
+            )
+          | .id
+        ]) as $active_ids
+      | (reduce $classified[] as $item ({};
+          .[$item.id] = {
+            updated: $item.updated,
+            fingerprint: $item.fingerprint,
+            first_seen: $item.first_seen,
+            classification: $item.classification.terminal,
+            matched_selector: $item.classification.selector,
+            stuck: $item.stuck
+          }
+        )) as $next_items
       | (($previous.items // {}) != $next_items) as $changed
-      |
-      (
-        if ($previous.cursor // null) == null
-        then ([$sweep_started, $items[].updated] | max)
-        else ([$previous.cursor, $items[].updated] | max)
-        end
-      ) as $cursor
+      | ([
+          $classified[]
+          | select(
+              .classification.terminal == "delegated"
+              and (.old.classification // "") != "delegated"
+            )
+          | .id
+        ]) as $entered
+      | ([
+          ($previous.items // {}) | to_entries[]
+          | select(
+              .value.classification == "delegated"
+              and (($next_items[.key].classification // "") != "delegated")
+            )
+          | .key
+        ]) as $left
+      | (
+          if $initial then
+            {
+              kind: "baseline",
+              reported: false,
+              text: ($project.repo + ": baselined " + ($items | length | tostring) + " open items")
+            }
+          elif $policy_changed then
+            {
+              kind: "policy",
+              reported: false,
+              text: (
+                $project.repo
+                + ": mandate changed — "
+                + ($entered | length | tostring)
+                + " items entered scope, "
+                + ($left | length | tostring)
+                + " left"
+              )
+            }
+          elif $changed then null
+          else ($previous.notice // null)
+          end
+        ) as $notice
+      | (
+          if $initial then ([$sweep_started, $items[].updated] | max)
+          else ([$previous.cursor, $items[].updated] | max)
+          end
+        ) as $cursor
       | {
-          cursor: $cursor,
-          policy: $policy,
-          previous_cursor: (
-            if $changed
-            then ($previous.cursor // "initial")
-            else ($previous.previous_cursor // $previous.cursor // "initial")
-            end
-          ),
-          items: $next_items
+          rows: $rows,
+          active_ids: $active_ids,
+          selector_stats: [selector_stats],
+          repo_state: {
+            cursor: $cursor,
+            previous_cursor: (
+              if $changed
+              then ($previous.cursor // "initial")
+              else ($previous.previous_cursor // $previous.cursor // "initial")
+              end
+            ),
+            selector_hash: $policy.selector_hash,
+            policy: $policy,
+            notice: $notice,
+            unclassified: (
+              [$classified[] | select(.classification.terminal == "unclassified")] | length
+            ),
+            scope_changes: (
+              if $policy_changed and ($initial | not)
+              then {entered: $entered, left: $left}
+              elif $changed
+              then {entered: [], left: []}
+              else ($previous.scope_changes // {entered: [], left: []})
+              end
+            ),
+            items: $next_items
+          }
         }
     '
   )"
+
+  rows="$(jq -c '.rows' <<<"$analysis")"
+  generated="$(jq -cn --argjson all "$generated" --argjson rows "$rows" '$all + $rows')"
+  repo_active_ids="$(jq -c '.active_ids' <<<"$analysis")"
+  active_ids="$(jq -cn --argjson all "$active_ids" --argjson ids "$repo_active_ids" '$all + $ids')"
+  repo_selector_stats="$(jq -c '.selector_stats' <<<"$analysis")"
+  selector_stats="$(
+    jq -cn --argjson all "$selector_stats" --argjson stats "$repo_selector_stats" \
+      '$all + $stats'
+  )"
+  new_repo_state="$(jq -c '.repo_state' <<<"$analysis")"
   new_state="$(
     jq -cn \
       --arg repo "$repo" \
       --argjson state "$new_state" \
       --argjson repo_state "$new_repo_state" \
-      '$state | .version = 1 | .repos[$repo] = $repo_state'
+      '$state | .version = 2 | .repos[$repo] = $repo_state'
   )"
 done < <(jq -c '.projects[]' <<<"$config")
+
+dead_selectors="$(
+  jq -cn --argjson stats "$selector_stats" '
+    $stats
+    | sort_by([(.repo // ""), .source, .selector])
+    | group_by([.repo, .source, .selector])
+    | map(
+        select(any(.[]; .hit) | not)
+        | first
+        | del(.hit)
+      )
+  '
+)"
+configured_repos="$(jq -c '[.projects[].repo]' <<<"$config")"
+new_state="$(
+  jq -cn \
+    --argjson state "$new_state" \
+    --argjson dead "$dead_selectors" \
+    --argjson configured_repos "$configured_repos" '
+    $state
+    | .dead_selectors = $dead
+    | .repos |= with_entries(
+        select(.key as $repo | ($configured_repos | index($repo)) != null)
+      )
+  '
+)"
 
 final_queue="$(
   jq -cn \
@@ -290,10 +583,11 @@ final_queue="$(
 queue_changes="$(
   jq -n \
     --argjson before "$existing_queue" \
-    --argjson after "$final_queue" \
-    'if $before == $after then 0 else
-       ([($before - $after)[], ($after - $before)[]] | length)
-     end'
+    --argjson after "$final_queue" '
+    if $before == $after then 0
+    else ([($before - $after)[], ($after - $before)[]] | length)
+    end
+  '
 )"
 
 jq -c '.[]' <<<"$final_queue" >"$work/queue.jsonl"

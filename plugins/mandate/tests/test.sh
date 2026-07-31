@@ -7,25 +7,65 @@ fixture="$(mktemp -d)"
 trap 'rm -rf "$fixture"' EXIT
 mkdir -p "$fixture/config/ostrom" "$fixture/repo" "$fixture/bin"
 
-cp "$PLUGIN_ROOT/config/mandates.example.yaml" "$fixture/config/ostrom/mandates.yaml"
+write_config() {
+  delegated_selector="${1:-label:maintenance}"
+  cat >"$fixture/config/ostrom/mandates.yaml" <<YAML
+provider: file
+cadence_hours: 24
+stuck_after_days: 1
+bounce_all:
+  - title:*credential*
+  - title:*never fires*
+projects:
+  - repo: example-org/example-repo
+    delegated:
+      - $delegated_selector
+      - scope:tooling
+      - path:docs/**
+    excluded:
+      - label:ignored
+    reserved:
+      - 10
+    default: unclassified
+    paused: false
+    bounce:
+      - path:rules/frozen-rules.md
+  - repo: example-org/another-repo
+    delegated:
+      - label:maintenance
+    excluded: []
+    reserved: []
+    default: excluded
+    paused: true
+    bounce:
+      - title:*production deployment*
+YAML
+}
+write_config
 
-# Prove shipped < user < repo precedence without involving a YAML library.
+# Prove shipped < user < repo precedence and generic project list parsing.
 mkdir -p "$fixture/layers/config/ostrom" "$fixture/layers/repo/.ostrom"
 cat >"$fixture/layers/config/ostrom/mandates.yaml" <<'YAML'
 cadence_hours: 12
 stuck_after_days: 5
 bounce_all:
-  - user boundary
+  - label:user-boundary
 projects:
   - repo: example-org/example-repo
-    delegated: user delegated outcome
+    delegated:
+      - label:user-scope
+    excluded:
+      - type:docs
+    reserved:
+      - 17
+    default: delegated
     bounce:
-      - user project boundary
+      - path:rules/*
 YAML
 cat >"$fixture/layers/repo/.ostrom/mandates.yaml" <<'YAML'
 stuck_after_days: 2
 bounce_all:
-  - repo boundary
+  - label:repo-boundary
 YAML
 layered="$(
   cd "$fixture/layers/repo"
@@ -37,30 +77,53 @@ jq -e '
   .provider == "file"
   and .cadence_hours == 12
   and .stuck_after_days == 2
-  and .bounce_all == ["repo boundary"]
+  and .bounce_all == ["label:repo-boundary"]
   and .projects[0].repo == "example-org/example-repo"
-  and .projects[0].delegated == "user delegated outcome"
+  and .projects[0].delegated == ["label:user-scope"]
+  and .projects[0].excluded == ["type:docs"]
+  and .projects[0].reserved == [17]
+  and .projects[0].default == "delegated"
   and .projects[0].paused == false
 ' <<<"$layered" >/dev/null
 
-# A project without the authorization half of its mandate fails clearly.
-mkdir -p "$fixture/missing-delegated/config/ostrom" "$fixture/missing-delegated/repo"
-cat >"$fixture/missing-delegated/config/ostrom/mandates.yaml" <<'YAML'
+assert_bad_selector() {
+  name="$1"
+  selector="$2"
+  expected="$3"
+  case_dir="$fixture/lint-$name"
+  mkdir -p "$case_dir/config/ostrom" "$case_dir/repo"
+  cat >"$case_dir/config/ostrom/mandates.yaml" <<YAML
+bounce_all: []
 projects:
   - repo: example-org/example-repo
+    delegated:
+      - $selector
+    excluded: []
+    reserved: []
     bounce: []
 YAML
-set +e
-delegated_message="$(
-  cd "$fixture/missing-delegated/repo"
-  CLAUDE_CONFIG_DIR="$fixture/missing-delegated/config" \
-    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-    bash -c 'source "$CLAUDE_PLUGIN_ROOT/scripts/mandate-lib.sh"; mandate_load_config' 2>&1
-)"
-delegated_status=$?
-set -e
-[ "$delegated_status" -eq 2 ]
-grep -q 'example-org/example-repo is missing required delegated outcome' <<<"$delegated_message"
+  set +e
+  message="$(
+    cd "$case_dir/repo"
+    CLAUDE_CONFIG_DIR="$case_dir/config" \
+      CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+      bash -c 'source "$CLAUDE_PLUGIN_ROOT/scripts/mandate-lib.sh"; mandate_load_config' \
+      2>&1
+  )"
+  status=$?
+  set -e
+  [ "$status" -eq 2 ]
+  grep -Fq "$expected" <<<"$message"
+}
+
+# Load-time selector lint is the regression guard for sentence matchers.
+assert_bad_selector sentence \
+  "platform and pipeline specs — grants and toolchains" \
+  "unknown selector prefix"
+assert_bad_selector title-star "title:production deployment" \
+  "title selector must contain *"
+assert_bad_selector title-run "title:*abcdefghijklmnopqrstuvwxyz*" \
+  "title selector literal run exceeds 24 characters"
 
 cat >"$fixture/bin/gh" <<'EOF'
 #!/usr/bin/env bash
@@ -76,7 +139,7 @@ for argument in "$@"; do
   previous="$argument"
 done
 if [ -n "${FAKE_GH_CALL_LOG:-}" ]; then
-  printf '%s\t%s %s\n' "$repo" "$1" "$2" >>"$FAKE_GH_CALL_LOG"
+  printf '%s\t%s\n' "$repo" "$*" >>"$FAKE_GH_CALL_LOG"
 fi
 
 if [ "$1 $2" = "auth status" ]; then
@@ -84,25 +147,32 @@ if [ "$1 $2" = "auth status" ]; then
   exit 0
 fi
 if [ "$1 $2" = "issue list" ]; then
-  if [ "$repo" = "example-org/another-repo" ]; then
-    echo "paused project issue query" >&2
-    exit 90
-  fi
-  cat <<'JSON'
-[{"number":7,"title":"Plan a production deployment","labels":[],"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/7"},{"number":9,"title":"Launch a marketing campaign","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/9"}]
+  case "$repo" in
+    example-org/example-repo)
+      cat <<'JSON'
+[{"number":7,"title":"feat(tooling): improve runner","labels":[],"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/7"},{"number":9,"title":"Untriaged request","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/9"},{"number":10,"title":"feat(tooling): owner gate","labels":[{"name":"maintenance"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/10"},{"number":11,"title":"Path-only issue","labels":[],"files":[{"path":"docs/guide.md"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/11"},{"number":14,"title":"Rotate credential safely","labels":[{"name":"ignored"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/14"},{"number":15,"title":"Routine excluded work","labels":[{"name":"ignored"},{"name":"maintenance"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/15"}]
 JSON
+      ;;
+    example-org/another-repo)
+      cat <<'JSON'
+[{"number":20,"title":"Prepare production deployment","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/20"}]
+JSON
+      ;;
+    *) echo '[]' ;;
+  esac
   exit 0
 fi
 if [ "$1 $2" = "pr list" ]; then
-  if [ "$repo" = "example-org/another-repo" ]; then
-    cat <<'JSON'
-[{"number":20,"title":"Plan a production deployment","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/pull/20","isDraft":false,"reviewDecision":"","statusCheckRollup":[{"conclusion":"FAILURE","status":"COMPLETED"}]}]
+  case "$repo" in
+    example-org/example-repo)
+      changed_at="2026-07-30T00:00:00Z"
+      [ "${FAKE_GH_MODE:-base}" = "changed" ] && changed_at="2026-08-01T00:00:00Z"
+      cat <<JSON
+[{"number":8,"title":"fix: routine maintenance","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"$changed_at","url":"https://example.invalid/pull/8","isDraft":false,"reviewDecision":"","statusCheckRollup":[{"conclusion":"SUCCESS","status":"COMPLETED"}],"closingIssuesReferences":[{"number":42,"labels":[{"name":"maintenance"}]}],"files":[{"path":"src/main.sh"}]},{"number":12,"title":"chore: update frozen rule","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/pull/12","isDraft":false,"reviewDecision":"","statusCheckRollup":[{"conclusion":"SUCCESS","status":"COMPLETED"}],"closingIssuesReferences":[],"files":[{"path":"rules/frozen-rules.md"}]},{"number":13,"title":"fix: broken checks","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/pull/13","isDraft":false,"reviewDecision":"","statusCheckRollup":[{"conclusion":"FAILURE","status":"COMPLETED"}],"closingIssuesReferences":[],"files":[]},{"number":16,"title":"docs: nested guide","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/pull/16","isDraft":true,"reviewDecision":"","statusCheckRollup":[],"closingIssuesReferences":[],"files":[{"path":"docs/reference/deep/guide.md"}]}]
 JSON
-  else
-    cat <<'JSON'
-[{"number":8,"title":"Routine maintenance","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/pull/8","isDraft":false,"reviewDecision":"","statusCheckRollup":[{"conclusion":"SUCCESS","status":"COMPLETED"}]}]
-JSON
-  fi
+      ;;
+    *) echo '[]' ;;
+  esac
   exit 0
 fi
 exit 1
@@ -114,138 +184,415 @@ run_sweep() {
     cd "$fixture/repo"
     PATH="$fixture/bin:$PATH" \
       FAKE_GH_CALL_LOG="$fixture/gh-calls" \
+      FAKE_GH_MODE="${FAKE_GH_MODE:-base}" \
       CLAUDE_CONFIG_DIR="$fixture/config" \
       CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
       bash "$PLUGIN_ROOT/scripts/sweep.sh"
   )
 }
 
+# The first sweep is a baseline. Only reserved, tripwire, and drift carve-outs
+# queue; the paused project's issue tripwire still fires.
 run_sweep >/dev/null
 queue="$fixture/config/ostrom/queue.jsonl"
 state="$fixture/config/ostrom/state.json"
 
-jq -e 'select(.id == "example-org/example-repo#7" and .kind == "tripwire")
-  | .mandate.dossier
-  | has("question") and has("options_ruled_out")
-    and has("recommended_action") and has("blast_radius")' "$queue" >/dev/null
-jq -e 'select(.id == "example-org/example-repo#8" and .kind == "decision")' "$queue" >/dev/null
 jq -e '
-  select(.id == "example-org/example-repo#9" and .kind == "decision")
+  select(.id == "example-org/example-repo#10" and .kind == "decision")
+  | .mandate.reason == "reserved ref:#10"
+' "$queue" >/dev/null
+jq -e '
+  select(.id == "example-org/example-repo#12" and .kind == "tripwire")
+  | .mandate.reason == "tripwire: project bounce path:rules/frozen-rules.md"
+  and (.mandate.dossier | has("question") and has("options_ruled_out")
+    and has("recommended_action") and has("blast_radius"))
+' "$queue" >/dev/null
+jq -e '
+  select(.id == "example-org/example-repo#13" and .kind == "drift")
+' "$queue" >/dev/null
+jq -e '
+  select(.id == "example-org/example-repo#14" and .kind == "tripwire")
+  | .mandate.reason == "tripwire: bounce_all title:*credential*"
+' "$queue" >/dev/null
+jq -e '
+  select(.id == "example-org/another-repo#20" and .kind == "tripwire")
   | .mandate.reason
-  | startswith("out-of-mandate:")
+  | contains("title:*production deployment*")
 ' "$queue" >/dev/null
+[ "$(jq -s 'length' "$queue")" -eq 5 ]
+
+# Reserved wins over the delegated label on #10, excluded wins over delegated
+# on #15, and excluded does not suppress the #14 tripwire. Issues never get
+# path data while a PR path can span arbitrary depth with **.
 jq -e '
-  select(.repo == "example-org/another-repo")
-  | .id == "example-org/another-repo#20"
-    and .kind == "drift"
-    and (.mandate.reason | contains("paused project CI"))
-' "$queue" >/dev/null
-[ "$(jq -s 'length' "$queue")" -eq 4 ]
-if grep -q $'example-org/another-repo\tissue list' "$fixture/gh-calls"; then
-  echo "paused project was queried for issues" >&2
+  .repos["example-org/example-repo"].items
+  | .["example-org/example-repo#10"].classification == "reserved"
+  and .["example-org/example-repo#11"].classification == "unclassified"
+  and .["example-org/example-repo#14"].classification == "tripwire"
+  and .["example-org/example-repo#15"].classification == "excluded"
+  and .["example-org/example-repo#16"].classification == "delegated"
+  and .["example-org/example-repo#16"].matched_selector == "path:docs/**"
+' "$state" >/dev/null
+
+# An unlabeled PR inherits its closing issue label but baseline does not queue
+# an ordinary ready decision.
+jq -e '
+  .repos["example-org/example-repo"].items
+  | .["example-org/example-repo#8"].classification == "delegated"
+  and .["example-org/example-repo#8"].matched_selector == "label:maintenance"
+' "$state" >/dev/null
+if jq -e 'select(.id == "example-org/example-repo#8")' "$queue" >/dev/null; then
+  echo "ordinary baseline item was queued" >&2
   exit 1
 fi
+
+# Paused projects are queried for issues so their tripwires cannot be paused.
+grep -q $'example-org/another-repo\tissue list' "$fixture/gh-calls"
 grep -q $'example-org/another-repo\tpr list' "$fixture/gh-calls"
 
-cp "$queue" "$fixture/queue.before"
-cp "$state" "$fixture/state.before"
-sleep 1
-run_sweep >/dev/null
-cmp "$fixture/queue.before" "$queue"
-cmp "$fixture/state.before" "$state"
-
-set +e
-paused_approval="$(
-  CLAUDE_CONFIG_DIR="$fixture/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-    bash "$PLUGIN_ROOT/scripts/queue.sh" approve 'example-org/another-repo#20' 2>&1
-)"
-paused_approval_status=$?
-set -e
-[ "$paused_approval_status" -eq 4 ]
-grep -q 'is paused; CI drift cannot mint a handoff token' <<<"$paused_approval"
+# Baseline time, not an old upstream update, starts the stuck clock.
 jq -e '
-  select(.id == "example-org/another-repo#20" and .state == "pending")
-' "$queue" >/dev/null
+  .repos["example-org/example-repo"].items["example-org/example-repo#7"]
+  | .first_seen > .updated and .stuck == false
+' "$state" >/dev/null
 
-hook_calls_before="$(wc -l <"$fixture/gh-calls")"
 digest="$(
   cd "$fixture/repo"
   PATH="$fixture/bin:$PATH" \
     FAKE_GH_CALL_LOG="$fixture/gh-calls" \
+    CLAUDE_CONFIG_DIR="$fixture/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/hooks/render-digest.sh"
+)"
+grep -q '^example-org/example-repo: baselined 10 open items$' <<<"$digest"
+grep -q '^example-org/another-repo: baselined 1 open items$' <<<"$digest"
+grep -q '^example-org/example-repo: 3 unclassified — /desk triage$' <<<"$digest"
+if grep -Eq 'dead selector|unmatched in last sweep' <<<"$digest"; then
+  echo "unmatched selectors leaked into the digest" >&2
+  exit 1
+fi
+
+# The hook stays local, and a repeat sweep with no upstream movement is a
+# serialized no-op.
+hook_calls_before="$(wc -l <"$fixture/gh-calls")"
+CLAUDE_CONFIG_DIR="$fixture/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+  bash "$PLUGIN_ROOT/hooks/render-digest.sh" >/dev/null
+hook_calls_after="$(wc -l <"$fixture/gh-calls")"
+[ "$hook_calls_before" -eq "$hook_calls_after" ]
+cp "$queue" "$fixture/queue.before"
+cp "$state" "$fixture/state.before"
+run_sweep >/dev/null
+cmp "$fixture/queue.before" "$queue"
+cmp "$fixture/state.before" "$state"
+steady_digest="$(
+  cd "$fixture/repo"
   CLAUDE_CONFIG_DIR="$fixture/config" \
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
     bash "$PLUGIN_ROOT/hooks/render-digest.sh"
 )"
-hook_calls_after="$(wc -l <"$fixture/gh-calls")"
-[ "$hook_calls_before" -eq "$hook_calls_after" ]
-printf '%s\n' "$digest" | awk '
-  NR == 1 && $0 != "DECISIONS WAITING" { exit 1 }
-  $0 == "DRIFT" { drift = NR }
-  END { exit !(drift > 1) }
-'
-grep -q 'example-org/example-repo#7 tripwire' <<<"$digest"
-if grep -Eq '^(MOVED SINCE|STUCK)' <<<"$digest"; then
-  echo "empty digest section was rendered" >&2
+if grep -q 'baselined [0-9][0-9]* open items' <<<"$steady_digest"; then
+  echo "baseline notice survived an unchanged second sweep" >&2
   exit 1
 fi
 
+# A later PR update produces one ready decision, proving inherited labels are
+# used by the live (non-baseline) classifier too.
+FAKE_GH_MODE=changed run_sweep >/dev/null
+jq -e '
+  select(.id == "example-org/example-repo#8" and .kind == "decision")
+  | .mandate.reason
+  | startswith("delegated label:maintenance;")
+' "$queue" >/dev/null
+
+# Editing a selector re-baselines scope: one item enters, one leaves, neither
+# is emitted as a routine row, and the detail is durable for /desk.
+write_config "title:*Untriaged*"
+run_sweep >/dev/null
+if jq -e '
+  select(.id == "example-org/example-repo#7"
+    or .id == "example-org/example-repo#8")
+' "$queue" >/dev/null; then
+  echo "selector edit re-flooded routine rows" >&2
+  exit 1
+fi
+jq -e '
+  .repos["example-org/example-repo"]
+  | .notice.text
+      == "example-org/example-repo: mandate changed — 1 items entered scope, 1 left"
+  and .scope_changes.entered == ["example-org/example-repo#9"]
+  and .scope_changes.left == ["example-org/example-repo#8"]
+' "$state" >/dev/null
+policy_digest="$(
+  cd "$fixture/repo"
+  CLAUDE_CONFIG_DIR="$fixture/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/hooks/render-digest.sh"
+)"
+grep -q 'mandate changed — 1 items entered scope, 1 left' <<<"$policy_digest"
+policy_digest_again="$(
+  cd "$fixture/repo"
+  CLAUDE_CONFIG_DIR="$fixture/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/hooks/render-digest.sh"
+)"
+if grep -q 'mandate changed —' <<<"$policy_digest_again"; then
+  echo "mandate-change notice rendered more than once" >&2
+  exit 1
+fi
+
+# Selectors that matched nowhere remain available only through explicit lint.
+jq -e '
+  .dead_selectors
+  | any(.source == "bounce_all" and .selector == "title:*never fires*")
+' "$state" >/dev/null
+if grep -Eq 'dead selector|unmatched in last sweep' <<<"$policy_digest"; then
+  echo "unmatched selectors leaked into the policy digest" >&2
+  exit 1
+fi
+lint_output="$(
+  CLAUDE_CONFIG_DIR="$fixture/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/queue.sh" lint
+)"
+grep -q '^unmatched in last sweep — bounce_all title:\*never fires\*$' \
+  <<<"$lint_output"
+
+# Queue mutations remain compatible with selector reasons.
 CLAUDE_CONFIG_DIR="$fixture/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-  bash "$PLUGIN_ROOT/scripts/queue.sh" approve 'example-org/example-repo#8' |
-  grep -q 'approval token mandate:example-org/example-repo#8'
-jq -e 'select(.id == "example-org/example-repo#8" and .state == "approved")' "$queue" >/dev/null
+  bash "$PLUGIN_ROOT/scripts/queue.sh" approve 'example-org/example-repo#10' |
+  grep -q 'approval token mandate:example-org/example-repo#10'
+jq -e '
+  select(.id == "example-org/example-repo#10" and .state == "approved")
+' "$queue" >/dev/null
 
 CLAUDE_CONFIG_DIR="$fixture/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-  bash "$PLUGIN_ROOT/scripts/queue.sh" reject 'example-org/example-repo#7' >/dev/null
-if jq -e 'select(.id == "example-org/example-repo#7")' "$queue" >/dev/null; then
+  bash "$PLUGIN_ROOT/scripts/queue.sh" reject 'example-org/example-repo#12' >/dev/null
+if jq -e 'select(.id == "example-org/example-repo#12")' "$queue" >/dev/null; then
   echo "rejected row remained in queue" >&2
   exit 1
 fi
 
-# A fresh healthy portfolio renders exactly one line, and the hook never
-# consults gh even when it is available on PATH.
+# A representative eight-project first sweep remains a compact digest.
+portfolio="$fixture/portfolio"
+mkdir -p "$portfolio/config/ostrom" "$portfolio/repo"
+cat >"$portfolio/config/ostrom/mandates.yaml" <<'YAML'
+bounce_all:
+  - title:*production deployment*
+projects:
+YAML
+for number in 1 2 3 4 5 6 7 8; do
+  {
+    echo "  - repo: example-org/repo-$number"
+    echo "    delegated: []"
+    echo "    excluded: []"
+    echo "    reserved: []"
+    echo "    default: excluded"
+    echo "    paused: false"
+    echo "    bounce: []"
+  } >>"$portfolio/config/ostrom/mandates.yaml"
+done
+(
+  cd "$portfolio/repo"
+  PATH="$fixture/bin:$PATH" \
+    CLAUDE_CONFIG_DIR="$portfolio/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/sweep.sh" >/dev/null
+)
+portfolio_digest="$(
+  cd "$portfolio/repo"
+  CLAUDE_CONFIG_DIR="$portfolio/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/hooks/render-digest.sh"
+)"
+[ "$(wc -l <<<"$portfolio_digest")" -le 20 ]
+grep -q '^8 projects nominal$' <<<"$portfolio_digest"
+if grep -Eq 'dead selector|unmatched in last sweep' <<<"$portfolio_digest"; then
+  echo "mostly unmatched roster rendered selector diagnostics" >&2
+  exit 1
+fi
+
+# Baseline notices render once, survive unchanged sweeps as acknowledged
+# state, and become fresh one-shot news after a repo state reset.
+baseline_once="$fixture/baseline-once"
+mkdir -p "$baseline_once/config/ostrom" "$baseline_once/repo"
+cat >"$baseline_once/config/ostrom/mandates.yaml" <<'YAML'
+bounce_all: []
+projects:
+  - repo: example-org/rebaseline
+    delegated: []
+    excluded: []
+    reserved: []
+    default: unclassified
+    paused: false
+    bounce: []
+YAML
+run_baseline_once_sweep() {
+  (
+    cd "$baseline_once/repo"
+    PATH="$fixture/bin:$PATH" \
+      CLAUDE_CONFIG_DIR="$baseline_once/config" \
+      CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+      bash "$PLUGIN_ROOT/scripts/sweep.sh" >/dev/null
+  )
+}
+render_baseline_once() {
+  (
+    cd "$baseline_once/repo"
+    CLAUDE_CONFIG_DIR="$baseline_once/config" \
+      CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+      bash "$PLUGIN_ROOT/hooks/render-digest.sh"
+  )
+}
+
+run_baseline_once_sweep
+baseline_state_mtime="$(
+  stat -c %Y "$baseline_once/config/ostrom/state.json" 2>/dev/null ||
+    stat -f %m "$baseline_once/config/ostrom/state.json"
+)"
+first_baseline_digest="$(render_baseline_once)"
+grep -q '^example-org/rebaseline: baselined 0 open items$' \
+  <<<"$first_baseline_digest"
+reported_state_mtime="$(
+  stat -c %Y "$baseline_once/config/ostrom/state.json" 2>/dev/null ||
+    stat -f %m "$baseline_once/config/ostrom/state.json"
+)"
+[ "$baseline_state_mtime" -eq "$reported_state_mtime" ]
+jq -e '
+  .repos["example-org/rebaseline"].notice.reported == true
+' "$baseline_once/config/ostrom/state.json" >/dev/null
+
+run_baseline_once_sweep
+second_baseline_digest="$(render_baseline_once)"
+if grep -q 'baselined [0-9][0-9]* open items' <<<"$second_baseline_digest"; then
+  echo "baseline notice rendered after an unchanged second sweep" >&2
+  exit 1
+fi
+
+jq '.repos = {}' "$baseline_once/config/ostrom/state.json" \
+  >"$baseline_once/config/ostrom/state.reset"
+mv "$baseline_once/config/ostrom/state.reset" \
+  "$baseline_once/config/ostrom/state.json"
+run_baseline_once_sweep
+reset_baseline_digest="$(render_baseline_once)"
+grep -q '^example-org/rebaseline: baselined 0 open items$' \
+  <<<"$reset_baseline_digest"
+reset_baseline_digest_again="$(render_baseline_once)"
+if grep -q 'baselined [0-9][0-9]* open items' \
+  <<<"$reset_baseline_digest_again"; then
+  echo "reset baseline notice rendered more than once" >&2
+  exit 1
+fi
+
+# Baseline notices and unclassified rollups are informational: without an
+# actionable queue row every configured project remains nominal.
+rollup="$fixture/rollup-only"
+mkdir -p "$rollup/config/ostrom" "$rollup/repo"
+cat >"$rollup/config/ostrom/mandates.yaml" <<'YAML'
+bounce_all: []
+projects:
+  - repo: example-org/rollup-one
+    delegated: []
+    excluded: []
+    reserved: []
+    default: unclassified
+    paused: false
+    bounce: []
+  - repo: example-org/rollup-two
+    delegated: []
+    excluded: []
+    reserved: []
+    default: unclassified
+    paused: false
+    bounce: []
+YAML
+cat >"$rollup/config/ostrom/state.json" <<'JSON'
+{
+  "version": 2,
+  "repos": {
+    "example-org/rollup-one": {
+      "cursor": "2026-07-30T00:00:00Z",
+      "notice": {
+        "kind": "baseline",
+        "text": "example-org/rollup-one: baselined 3 open items"
+      },
+      "unclassified": 3
+    },
+    "example-org/rollup-two": {
+      "cursor": "2026-07-30T00:00:00Z",
+      "notice": {
+        "kind": "baseline",
+        "text": "example-org/rollup-two: baselined 2 open items"
+      },
+      "unclassified": 2
+    }
+  },
+  "dead_selectors": [
+    {
+      "repo": "example-org/rollup-one",
+      "source": "delegated",
+      "selector": "label:nothing-open"
+    }
+  ]
+}
+JSON
+rollup_digest="$(
+  cd "$rollup/repo"
+  CLAUDE_CONFIG_DIR="$rollup/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/hooks/render-digest.sh"
+)"
+grep -q '^example-org/rollup-one: baselined 3 open items$' <<<"$rollup_digest"
+grep -q '^example-org/rollup-two: baselined 2 open items$' <<<"$rollup_digest"
+grep -q '^example-org/rollup-one: 3 unclassified — /desk triage$' \
+  <<<"$rollup_digest"
+grep -q '^example-org/rollup-two: 2 unclassified — /desk triage$' \
+  <<<"$rollup_digest"
+grep -q '^2 projects nominal$' <<<"$rollup_digest"
+if grep -Eq 'dead selector|unmatched in last sweep' <<<"$rollup_digest"; then
+  echo "rollup-only digest rendered selector diagnostics" >&2
+  exit 1
+fi
+
+# A healthy durable portfolio renders exactly one nominal line.
 mkdir -p "$fixture/healthy/config/ostrom" "$fixture/healthy/repo"
 cat >"$fixture/healthy/config/ostrom/mandates.yaml" <<'YAML'
+bounce_all: []
 projects:
   - repo: example-org/example-repo
-    delegated: routine maintenance
+    delegated: []
+    excluded: []
+    reserved: []
+    default: excluded
     paused: false
     bounce: []
   - repo: example-org/another-repo
-    delegated: CI health maintenance
+    delegated: []
+    excluded: []
+    reserved: []
+    default: excluded
     paused: true
     bounce: []
 YAML
 cat >"$fixture/healthy/config/ostrom/state.json" <<'JSON'
-{"version":1,"repos":{}}
+{"version":2,"repos":{},"dead_selectors":[]}
 JSON
-healthy_calls_before="$(wc -l <"$fixture/gh-calls")"
 healthy="$(
   cd "$fixture/healthy/repo"
-  PATH="$fixture/bin:$PATH" \
-    FAKE_GH_CALL_LOG="$fixture/gh-calls" \
-    CLAUDE_CONFIG_DIR="$fixture/healthy/config" \
+  CLAUDE_CONFIG_DIR="$fixture/healthy/config" \
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
     bash "$PLUGIN_ROOT/hooks/render-digest.sh"
 )"
-healthy_calls_after="$(wc -l <"$fixture/gh-calls")"
 [ "$healthy" = "2 projects nominal" ]
-[ "$healthy_calls_before" -eq "$healthy_calls_after" ]
 
 touch -t 200001010000 "$fixture/healthy/config/ostrom/state.json"
-stale_calls_before="$(wc -l <"$fixture/gh-calls")"
 stale_digest="$(
   cd "$fixture/healthy/repo"
-  PATH="$fixture/bin:$PATH" \
-    FAKE_GH_CALL_LOG="$fixture/gh-calls" \
-    CLAUDE_CONFIG_DIR="$fixture/healthy/config" \
+  CLAUDE_CONFIG_DIR="$fixture/healthy/config" \
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
     bash "$PLUGIN_ROOT/hooks/render-digest.sh"
 )"
-stale_calls_after="$(wc -l <"$fixture/gh-calls")"
 [ "$(wc -l <<<"$stale_digest")" -eq 2 ]
 grep -q '^STALE — mandate sweep overdue$' <<<"$stale_digest"
 grep -q '^2 projects nominal$' <<<"$stale_digest"
-[ "$stale_calls_before" -eq "$stale_calls_after" ]
 
 empty="$fixture/empty-config"
 mkdir -p "$empty"

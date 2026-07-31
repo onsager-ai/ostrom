@@ -17,8 +17,8 @@ mandate_is_configured() {
 # Parse the deliberately small shipped schema without pretending to be a
 # general YAML parser. Supported input:
 #   root scalars; bounce_all: followed by two-space list items; projects:
-#   followed by "- repo:" entries, each with delegated + paused scalars and
-#   a six-space bounce list.
+#   followed by "- repo:" entries, each with default + paused scalars and
+#   six-space delegated/excluded/reserved/bounce lists.
 mandate_yaml_to_json() {
   file="$1"
   [ -f "$file" ] || {
@@ -45,7 +45,7 @@ mandate_yaml_to_json() {
       printf "%s:%d: mandate config: %s\n", FILENAME, NR, message > "/dev/stderr"
       failed = 1
     }
-    BEGIN { section = ""; current_repo = ""; failed = 0 }
+    BEGIN { section = ""; current_repo = ""; project_list = ""; failed = 0 }
     {
       raw = $0
       if (raw ~ /\t/) {
@@ -62,6 +62,7 @@ mandate_yaml_to_json() {
       if (indent == 0) {
         section = ""
         current_repo = ""
+        project_list = ""
         if (text == "bounce_all:") {
           section = "bounce_all"
           print "array\tbounce_all"
@@ -99,19 +100,12 @@ mandate_yaml_to_json() {
         value = text
         sub(/^-[[:space:]]+repo:[[:space:]]*/, "", value)
         current_repo = unquote(value)
+        project_list = ""
         if (current_repo == "") fail("empty project repo")
         else print "project\t" current_repo
         next
       }
 
-      if (section == "projects" && current_repo != "" && indent == 4 && text ~ /^delegated:[[:space:]]*/) {
-        value = text
-        sub(/^delegated:[[:space:]]*/, "", value)
-        value = unquote(value)
-        if (value == "") fail("empty delegated value for " current_repo)
-        else print "project_field\t" current_repo "\tdelegated\t" value
-        next
-      }
       if (section == "projects" && current_repo != "" && indent == 4 && text ~ /^paused:[[:space:]]*/) {
         value = text
         sub(/^paused:[[:space:]]*/, "", value)
@@ -120,18 +114,32 @@ mandate_yaml_to_json() {
         else print "project_field\t" current_repo "\tpaused\t" value
         next
       }
-      if (section == "projects" && current_repo != "" && indent == 4 && text == "bounce:") {
+      if (section == "projects" && current_repo != "" && indent == 4 && text ~ /^default:[[:space:]]*/) {
+        value = text
+        sub(/^default:[[:space:]]*/, "", value)
+        value = unquote(value)
+        if (value !~ /^(delegated|excluded|unclassified)$/) {
+          fail("default must be delegated, excluded, or unclassified for " current_repo)
+        } else {
+          print "project_field\t" current_repo "\tdefault\t" value
+        }
         next
       }
-      if (section == "projects" && current_repo != "" && indent == 4 && text == "bounce: []") {
+      if (section == "projects" && current_repo != "" && indent == 4 &&
+          (text ~ /^(delegated|excluded|reserved|bounce):$/ ||
+           text ~ /^(delegated|excluded|reserved|bounce): \[\]$/)) {
+        project_list = text
+        sub(/:.*/, "", project_list)
+        print "project_array\t" current_repo "\t" project_list
         next
       }
       if (section == "projects" && current_repo != "" && indent == 6 && text ~ /^-[[:space:]]+/) {
         value = text
         sub(/^-[[:space:]]+/, "", value)
         value = unquote(value)
-        if (value == "") fail("empty project bounce entry")
-        else print "project_bounce\t" current_repo "\t" value
+        if (project_list == "") fail("project list entry has no list heading for " current_repo)
+        else if (value == "") fail("empty project " project_list " entry")
+        else print "project_list\t" current_repo "\t" project_list "\t" value
         next
       }
 
@@ -152,7 +160,21 @@ mandate_yaml_to_json() {
           elif $parts[0] == "bounce_all" then
             .bounce_all += [$parts[1]]
           elif $parts[0] == "project" then
-            .projects += [{"repo": $parts[1], "paused": false, "bounce": []}]
+            .projects += [{
+              "repo": $parts[1],
+              "paused": false,
+              "default": "unclassified",
+              "delegated": [],
+              "excluded": [],
+              "reserved": [],
+              "bounce": []
+            }]
+          elif $parts[0] == "project_array" then
+            (.projects | map(.repo) | index($parts[1])) as $index
+            | if $index == null
+              then error("project list appeared before its repo")
+              else .projects[$index][$parts[2]] = []
+              end
           elif $parts[0] == "project_field" then
             (.projects | map(.repo) | index($parts[1])) as $index
             | if $index == null then error("project field appeared before its repo")
@@ -160,11 +182,15 @@ mandate_yaml_to_json() {
               then .projects[$index].paused = ($parts[3] == "true")
               else .projects[$index][$parts[2]] = $parts[3]
               end
-          elif $parts[0] == "project_bounce" then
+          elif $parts[0] == "project_list" then
             (.projects | map(.repo) | index($parts[1])) as $index
             | if $index == null
-              then error("project bounce appeared before its repo")
-              else .projects[$index].bounce += [$parts[2]]
+              then error("project list entry appeared before its repo")
+              elif $parts[2] == "reserved"
+              then .projects[$index].reserved += [
+                ($parts[3] | ltrimstr("#") | tonumber)
+              ]
+              else .projects[$index][$parts[2]] += [$parts[3]]
               end
           else error("unknown parser record")
           end
@@ -185,22 +211,6 @@ mandate_load_config() {
       '$shipped * $user * $repo'
   )" || return
 
-  missing_delegated="$(
-    jq -r '
-      .projects[]?
-      | select(
-          (has("delegated") | not)
-          or (.delegated | type) != "string"
-          or (.delegated | length) == 0
-        )
-      | (.repo // "<unknown>")
-    ' <<<"$config" | head -n 1
-  )"
-  if [ -n "$missing_delegated" ]; then
-    echo "mandate: invalid config: project $missing_delegated is missing required delegated outcome" >&2
-    return 2
-  fi
-
   if ! jq -e '
     .provider == "file"
     and (.cadence_hours | type == "number" and . > 0 and . == floor)
@@ -209,13 +219,61 @@ mandate_load_config() {
     and (.projects | type == "array")
     and all(.projects[];
       (.repo | type == "string" and test("^[^/[:space:]]+/[^/[:space:]]+$"))
-      and (.delegated | type == "string" and length > 0)
       and (.paused | type == "boolean")
+      and (.default | IN("delegated", "excluded", "unclassified"))
+      and (.delegated | type == "array" and all(.[]; type == "string" and length > 0))
+      and (.excluded | type == "array" and all(.[]; type == "string" and length > 0))
+      and (.reserved | type == "array" and all(.[]; type == "number" and . > 0 and . == floor))
       and (.bounce | type == "array" and all(.[]; type == "string" and length > 0))
     )
     and (([.projects[].repo] | length) == ([.projects[].repo] | unique | length))
   ' >/dev/null <<<"$config"; then
-    echo "mandate: invalid config; provider must be file, cadence_hours a positive integer, and every project must have a unique owner/name repo, delegated outcome, boolean paused value, and bounce list" >&2
+    echo "mandate: invalid config; provider must be file, cadence_hours a positive integer, and every project must have a unique owner/name repo, valid default, boolean paused value, selector lists, and positive integer reserved refs" >&2
+    return 2
+  fi
+
+  selector_error="$(
+    jq -r '
+      def selector_records:
+        (.bounce_all[]? | {where: "bounce_all", selector: .}),
+        (.projects[]? as $project
+          | ($project.delegated[]? | {
+              where: ($project.repo + " delegated"), selector: .
+            }),
+            ($project.excluded[]? | {
+              where: ($project.repo + " excluded"), selector: .
+            }),
+            ($project.bounce[]? | {
+              where: ($project.repo + " bounce"), selector: .
+            })
+        );
+      def lint:
+        .selector as $selector
+        | ((try ($selector | capture("^(?<prefix>[^:]+):(?<glob>.*)$")) catch null) // null) as $parsed
+        | if $parsed == null or
+             ($parsed.prefix | IN("label", "scope", "type", "path", "ref", "title") | not)
+          then "unknown selector prefix"
+          elif $parsed.glob == ""
+          then "selector value is empty"
+          elif $parsed.prefix == "ref" and
+               ($parsed.glob | test("^#[1-9][0-9]*$") | not)
+          then "ref selector must be ref:#N"
+          elif $parsed.prefix == "title" and
+               ($parsed.glob | contains("*") | not)
+          then "title selector must contain *"
+          elif $parsed.prefix == "title" and
+               (($parsed.glob | split("*") | map(length) | max) > 24)
+          then "title selector literal run exceeds 24 characters"
+          else empty
+          end;
+      first(selector_records as $record
+        | ($record | lint) as $message
+        | "\($record.where) selector \"\($record.selector)\": \($message)"
+      ) // empty
+    ' <<<"$config"
+  )" || return
+  if [ -n "$selector_error" ]; then
+    echo "mandate: invalid config: $selector_error" >&2
     return 2
   fi
 
