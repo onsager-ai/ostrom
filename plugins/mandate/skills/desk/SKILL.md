@@ -1,0 +1,70 @@
+---
+name: desk
+description: Read and decide mandate queue items. Use when the user types
+  /desk, asks what portfolio decisions are waiting, or asks to approve,
+  reject, or defer a mandate proposal.
+argument-hint: "[list] | approve <repo#number> | reject <repo#number> | defer <repo#number>"
+---
+
+# Mandate Desk
+
+Show the durable pointer queue and apply only the decision the user makes.
+Approval is the sole path that emits a handoff instruction.
+
+## 1. Resolve config (layered YAML)
+
+Read and merge these layers, most-specific wins:
+
+1. shipped defaults — `config/defaults.yaml` in this plugin (sibling of `skills/`)
+2. user — `~/.claude/ostrom/mandates.yaml`
+3. repo — `./.ostrom/mandates.yaml` (if present)
+
+The v1 provider must resolve to `file`. Its fixed private records are
+`~/.claude/ostrom/queue.jsonl` and `~/.claude/ostrom/state.json`. Never
+create, display, or commit a roster anywhere else. If no mandates file is
+configured, say so and stop. Every project requires a free-text `delegated`
+outcome; a missing value is a config error. A `paused: true` project emits
+no proposals and is observed only for CI health.
+
+## 2. List pending records
+
+Run:
+
+```sh
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/queue.sh" list
+```
+
+Each JSON row is a pointer with exactly `id`, `repo`, `ref`, `kind`,
+`mandate`, `state`, and `opened`. Present pending and deferred items in this
+order: tripwire/decision, moved, stuck, drift. Keep the resolvable
+`owner/repo#number` visible. For a tripwire, include all four fields from
+`mandate.dossier`: Question, Options ruled out, Recommended action, and
+Blast radius. Do not fetch or copy an issue or PR body into the queue.
+
+If no action was supplied, stop after the list and ask for approve, reject,
+or defer only when records are present.
+
+## 3. Apply exactly one decision
+
+Resolve `<id>` from the displayed record; do not guess across ambiguous
+references.
+
+- **Approve** — run `queue.sh approve <id>`. This flips the row to
+  `approved` and emits the instruction for the existing `/handoff` to Codex,
+  including the minted `mandate:<id>` approval token. Relay that handoff
+  instruction; never invent a broader token. CI drift from a paused project
+  cannot be approved; unpause the mandate first.
+- **Reject** — run `queue.sh reject <id>`. This removes the row. Do not call
+  `/handoff`, comment on GitHub, close the referenced item, or cause any
+  other side effect.
+- **Defer** — run `queue.sh defer <id>`. This keeps the row and flips its
+  state to `deferred`. Do not call `/handoff`.
+
+A tripwire never auto-proceeds. Only an explicit human approval may cross
+it. The dossier shape is the constitution plugin's frozen escalation
+protocol; this dependency points from mandate to constitution only.
+
+## 4. Confirm
+
+Confirm with the resulting queue record and, for approval only, the emitted
+handoff instruction. No commentary.

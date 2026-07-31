@@ -1,0 +1,31 @@
+# Copy this file to ~/.claude/ostrom/mandates.yaml and replace every
+# placeholder. Never commit the resulting private roster.
+#
+# Layers resolve shipped defaults < user file < ./.ostrom/mandates.yaml.
+# Lists in a more-specific layer replace the corresponding earlier list.
+
+provider: file
+cadence_hours: 24
+stuck_after_days: 7
+
+bounce_all:
+  - merge to main
+  - production deployment
+  - external publication
+  - credential or secret
+
+projects:
+  - repo: example-org/example-repo
+    # Required free text. The sweep matches this phrase case-insensitively
+    # against issue/PR titles and labels; misses bounce as out-of-mandate.
+    delegated: routine maintenance
+    paused: false
+    bounce:
+      - public release
+      - backwards-incompatible API
+  - repo: example-org/another-repo
+    delegated: CI health maintenance
+    # Paused projects skip issues and emit only CI-failure drift from PRs.
+    paused: true
+    bounce:
+      - public-readiness gate

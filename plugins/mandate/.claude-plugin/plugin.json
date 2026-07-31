@@ -1,0 +1,5 @@
+{
+  "name": "mandate",
+  "description": "Portfolio steering for Claude Code: daily read-only GitHub sweeps, a private file-backed approval queue, tripwire dossiers, a fixed SessionStart digest, and the /desk decision surface.",
+  "version": "0.1.0"
+}

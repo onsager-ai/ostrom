@@ -1,8 +1,8 @@
 # ostrom
 
-A Claude Code plugin marketplace shipping a small mechanism for
-governing agent-workflow conventions, distributed to repos as a
-plugin.
+A Claude Code plugin marketplace shipping small mechanisms for
+governing agent-workflow conventions and steering a portfolio of
+projects.
 
 The spine is Elinor Ostrom's work on governing a commons: rules carry
 provenance (`Source:`) and falsifiable `Preconditions:`, a human
@@ -13,18 +13,24 @@ personal constitution.
 
 ## What it ships
 
-- **Layered SessionStart constitution injection** — shipped rules,
+- **`constitution` — layered SessionStart constitution injection** — shipped rules,
   then user rules, then repo rules (most-specific wins).
 - **The rule-capitalization trigger** — the agent proposes freezing a
   rule after the same class of correction recurs; it never
   self-installs one.
 - **Agent-push `/touch` intervention capture** — with pluggable log
   providers (file/Notion) and layered YAML config.
+- **`mandate` — a daily portfolio sweep and SessionStart digest** — reads
+  open GitHub issues, PRs, and CI through `gh`; keeps a private,
+  file-backed queue of pointers; and routes approve/reject/defer decisions
+  through `/desk`. Tripwires reuse constitution's escalation-dossier
+  protocol and never auto-proceed.
 
 ## Layout
 
 - `.claude-plugin/marketplace.json` — marketplace catalog (this repo is the marketplace)
 - `plugins/constitution/` — the plugin: frozen rules (injected at SessionStart), /touch skill, /doctor skill
+- `plugins/mandate/` — the independent portfolio plugin: daily sweep, SessionStart digest, private queue, and /desk skill
 - `plugins/constitution/hooks/inject-constitution.sh` — SessionStart hook: emits the layered constitution (shipped → user → repo)
 - `plugins/constitution/config/` — shipped defaults + reference examples for the /touch log (provider choice + layered YAML config) and for private rules (`rules.example.md`)
 - `plugins/constitution/scripts/run-node.sh` — Node-resolution shim behind /doctor (including non-interactive nvm/fnm/volta/asdf environments)
@@ -39,6 +45,7 @@ personal constitution.
 ```
 /plugin marketplace add onsager-ai/ostrom
 /plugin install constitution@ostrom
+/plugin install mandate@ostrom
 ```
 
 Or the scripted path, from a clone of this repo:
@@ -59,6 +66,36 @@ immediately with no Notion account — see [Touch-log config](#touch-log-config)
 Known caveat: a project's settings.json pointer registers the
 marketplace but external-source plugins still need the one-time
 install command per environment (claude-code issue #32606).
+
+## Mandate
+
+`mandate` resolves its small YAML schema in three layers: shipped defaults
+→ `~/.claude/ostrom/mandates.yaml` → `./.ostrom/mandates.yaml`.
+Copy `plugins/mandate/config/mandates.example.yaml` to the user path and
+replace its placeholder roster. The real roster, queue, and read cursors
+remain machine-local at `~/.claude/ostrom/mandates.yaml`,
+`~/.claude/ostrom/queue.jsonl`, and `~/.claude/ostrom/state.json`; none
+belongs in this repository.
+
+Each project requires a free-text `delegated` outcome and may set
+`paused: true`. Work outside the delegated phrase is a human decision;
+paused projects produce no proposals and are read only for PR CI health.
+Tripwires still take precedence over delegated scope.
+
+Run the read-only sweep daily outside Claude Code. For example, edit the
+placeholder clone path and install this with `crontab -e`:
+
+```cron
+0 8 * * * cd /absolute/path/to/ostrom && CLAUDE_PLUGIN_ROOT=/absolute/path/to/ostrom/plugins/mandate /bin/bash /absolute/path/to/ostrom/plugins/mandate/scripts/sweep.sh
+```
+
+The SessionStart hook never calls `gh`; it only renders the durable files
+written by the scheduled sweep. Empty sections disappear, so a healthy
+portfolio is exactly `N projects nominal`. If the state file is older than
+`cadence_hours`, the hook adds one short stale warning. Queue rows contain
+only a resolvable GitHub pointer and mandate metadata, never mirrored issue
+or PR bodies. v1 implements the `file` provider only; the provider seam
+remains explicit for a later addition.
 
 ## Cloud / CI
 
