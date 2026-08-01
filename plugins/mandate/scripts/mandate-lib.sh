@@ -292,8 +292,8 @@ mandate_read_queue() {
         (["id","kind","mandate","opened","ref","repo","state"] - keys | length) == 0
         and
         (keys - [
-          "age_days", "blocked_by", "id", "kind", "mandate",
-          "needs_judgment", "opened", "ref", "repo", "state", "stuck", "title"
+          "age_days", "aged_out", "blocked_by", "id", "kind", "mandate",
+          "needs_judgment", "opened", "ref", "repo", "state", "title"
         ] | length) == 0
       )
       and (.id | type == "string")
@@ -306,7 +306,7 @@ mandate_read_queue() {
         (has("age_days") | not)
         or (.age_days | type == "number" and . >= 0 and . == floor)
       )
-      and ((has("stuck") | not) or (.stuck | type == "boolean"))
+      and ((has("aged_out") | not) or (.aged_out | type == "boolean"))
       and (
         (has("needs_judgment") | not)
         or (.needs_judgment | type == "boolean")

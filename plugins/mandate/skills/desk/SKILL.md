@@ -39,7 +39,7 @@ jq '.repos[] | {notice, unclassified, scope_changes}' \
 
 Each JSON row is a pointer with `id`, `repo`, `ref`, `title`, `kind`,
 `mandate`, `state`, and `opened`, plus sweep facts when available: `age_days`,
-`stuck`, `needs_judgment`, and `blocked_by`. Present pending and deferred items
+`aged_out`, `needs_judgment`, and `blocked_by`. Present pending and deferred items
 in this order: tripwire/decision, moved, stuck, drift. Keep the resolvable
 `owner/repo#number` and its title visible. For a tripwire, include all four
 fields from `mandate.dossier`: Question, Options ruled out, Recommended

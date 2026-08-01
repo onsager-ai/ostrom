@@ -157,7 +157,7 @@ if [ "$1 $2" = "issue list" ]; then
         issue7_title="feat(tooling): improve runner title refreshed upstream"
       fi
       cat <<JSON
-[{"number":7,"title":"$issue7_title","labels":[],"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/7"},{"number":9,"title":"Untriaged request","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/9"},{"number":10,"title":"feat(tooling): owner gate","body":"Depends on #7.","labels":[{"name":"maintenance"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/10"},{"number":11,"title":"Path-only issue","labels":[],"files":[{"path":"docs/guide.md"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/11"},{"number":14,"title":"Rotate credential safely","labels":[{"name":"ignored"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/14"},{"number":15,"title":"Routine excluded work","labels":[{"name":"ignored"},{"name":"maintenance"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/15"}]
+[{"number":7,"title":"$issue7_title","labels":[],"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/7"},{"number":9,"title":"Untriaged request","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/9"},{"number":10,"title":"feat(tooling): owner gate","body":"Part of #167. Depends on #168.","labels":[{"name":"maintenance"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/10"},{"number":11,"title":"Path-only issue","labels":[],"files":[{"path":"docs/guide.md"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/11"},{"number":14,"title":"Rotate credential safely","body":"Part of #167","labels":[{"name":"ignored"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/14"},{"number":15,"title":"Routine excluded work","labels":[{"name":"ignored"},{"name":"maintenance"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/15"}]
 JSON
       ;;
     example-org/another-repo)
@@ -272,14 +272,18 @@ jq -s -e '
 jq -s -e '
   all(.[];
     .age_days == 3
-    and .stuck == true
+    and .aged_out == true
     and (.blocked_by | type) == "array"
   )
   and any(.[];
     .id == "example-org/example-repo#10"
     and .kind == "decision"
     and .needs_judgment == true
-    and .blocked_by == ["example-org/example-repo#7"]
+    and .blocked_by == ["example-org/example-repo#168"]
+  )
+  and any(.[];
+    .id == "example-org/example-repo#14"
+    and .blocked_by == []
   )
   and any(.[];
     .id == "example-org/example-repo#12"
@@ -312,7 +316,7 @@ jq -s -e '
 # A pre-brief queue remains valid and loadable without the additive facts.
 legacy_config="$fixture/legacy-queue/config"
 mkdir -p "$legacy_config/ostrom"
-jq -c 'del(.age_days, .stuck, .needs_judgment, .blocked_by)' "$queue" \
+jq -c 'del(.age_days, .aged_out, .needs_judgment, .blocked_by)' "$queue" \
   >"$legacy_config/ostrom/queue.jsonl"
 legacy_rows="$(
   CLAUDE_CONFIG_DIR="$legacy_config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
@@ -322,7 +326,7 @@ jq -s -e '
   length == 5
   and all(.[];
     (has("age_days") | not)
-    and (has("stuck") | not)
+    and (has("aged_out") | not)
     and (has("needs_judgment") | not)
     and (has("blocked_by") | not)
   )

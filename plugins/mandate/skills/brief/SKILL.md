@@ -40,9 +40,9 @@ jq '.repos | to_entries | map({repo: .key, items: .value.items, item_cap: .value
 ```
 
 Use only pending and deferred rows. The sweep fields are facts, not agent
-judgments: `age_days`, `stuck`, `needs_judgment`, and `blocked_by`. For an older
-row, derive `needs_judgment` from `kind` and treat absent `blocked_by` as empty;
-do not rewrite the queue.
+judgments: `age_days`, `aged_out`, `needs_judgment`, and `blocked_by`. For an
+older row, derive `needs_judgment` from `kind` and treat absent `blocked_by` as
+empty; do not rewrite the queue.
 
 Resolve every `blocked_by` pointer read-only. A pointer still present in the
 last sweep state is unsatisfied. For a pointer outside that state, use `gh` to
@@ -75,7 +75,7 @@ approval.
 
 Lead with honest counts for all three buckets and the unclassified remainder.
 Then show each bucket in proposed order with the resolvable
-`owner/repo#number`, title, age, stuck state, dependency status, and concise
+`owner/repo#number`, title, age, aged-out state, dependency status, and concise
 rationale. End with `Could not classify: none.` or a line naming every omitted
 row and the missing fact.
 

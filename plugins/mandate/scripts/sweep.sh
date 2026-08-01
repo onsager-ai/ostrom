@@ -108,7 +108,7 @@ while IFS= read -r project; do
         [
           $text
           | match(
-              "(?:depends[[:space:]]+on|blocked[[:space:]]+by|part[[:space:]]+of|gate[[:space:]]+for)[[:space:]]+((?:[[:alnum:]_.-]+/[[:alnum:]_.-]+)?#[1-9][0-9]*)";
+              "(?:depends[[:space:]]+on|blocked[[:space:]]+by|gate[[:space:]]+for)[[:space:]]+((?:[[:alnum:]_.-]+/[[:alnum:]_.-]+)?#[1-9][0-9]*)";
               "ig"
             )
           | .captures[0].string
@@ -497,7 +497,7 @@ while IFS= read -r project; do
               state: "pending",
               opened: $item.opened,
               age_days: $item.age_days,
-              stuck: ($item.age_days >= $config.stuck_after_days),
+              aged_out: ($item.age_days >= $config.stuck_after_days),
               needs_judgment: ($row.kind | IN("tripwire", "decision")),
               blocked_by: $item.blocked_by
             }
@@ -570,7 +570,7 @@ while IFS= read -r project; do
                 title: .title,
                 closing_suffix: closing_suffix($item; $active),
                 age_days: .age_days,
-                stuck: (.age_days >= $config.stuck_after_days),
+                aged_out: (.age_days >= $config.stuck_after_days),
                 blocked_by: .blocked_by
               }
           ],
@@ -666,7 +666,7 @@ final_queue="$(
       [
         $text
         | match(
-            "(?:depends[[:space:]]+on|blocked[[:space:]]+by|part[[:space:]]+of|gate[[:space:]]+for)[[:space:]]+((?:[[:alnum:]_.-]+/[[:alnum:]_.-]+)?#[1-9][0-9]*)";
+            "(?:depends[[:space:]]+on|blocked[[:space:]]+by|gate[[:space:]]+for)[[:space:]]+((?:[[:alnum:]_.-]+/[[:alnum:]_.-]+)?#[1-9][0-9]*)";
             "ig"
           )
         | .captures[0].string
@@ -695,7 +695,7 @@ final_queue="$(
       | if $current != null
         then
           .age_days = $current.age_days
-          | .stuck = $current.stuck
+          | .aged_out = $current.aged_out
         else .
         end
       | .needs_judgment = (.kind | IN("tripwire", "decision"))
