@@ -289,9 +289,12 @@ mandate_read_queue() {
   jq -s '
     if all(.[];
       (
-        (keys | sort) == ["id","kind","mandate","opened","ref","repo","state"]
-        or
-        (keys | sort) == ["id","kind","mandate","opened","ref","repo","state","title"]
+        (["id","kind","mandate","opened","ref","repo","state"] - keys | length) == 0
+        and
+        (keys - [
+          "age_days", "blocked_by", "id", "kind", "mandate",
+          "needs_judgment", "opened", "ref", "repo", "state", "stuck", "title"
+        ] | length) == 0
       )
       and (.id | type == "string")
       and (.repo | type == "string")
@@ -299,6 +302,25 @@ mandate_read_queue() {
       and (.kind | IN("tripwire", "decision", "moved", "stuck", "drift"))
       and (.state | IN("pending", "approved", "deferred"))
       and (.opened | type == "string")
+      and (
+        (has("age_days") | not)
+        or (.age_days | type == "number" and . >= 0 and . == floor)
+      )
+      and ((has("stuck") | not) or (.stuck | type == "boolean"))
+      and (
+        (has("needs_judgment") | not)
+        or (.needs_judgment | type == "boolean")
+      )
+      and (
+        (has("blocked_by") | not)
+        or (
+          .blocked_by | type == "array"
+          and all(.[];
+            type == "string"
+            and test("^[^/[:space:]#]+/[^/[:space:]#]+#[1-9][0-9]*$")
+          )
+        )
+      )
       and (
         (has("title") | not)
         or (((.title | type) == "string") and ((.title | length) > 0))

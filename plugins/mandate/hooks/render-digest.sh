@@ -60,7 +60,7 @@ state_mtime=0
 if [ -f "$MANDATE_STATE_FILE" ]; then
   state_mtime="$(stat -c %Y "$MANDATE_STATE_FILE" 2>/dev/null || stat -f %m "$MANDATE_STATE_FILE" 2>/dev/null || echo 0)"
 fi
-now="$(date +%s)"
+now="${MANDATE_NOW_EPOCH:-$(date +%s)}"
 cadence_seconds="$((cadence_hours * 3600))"
 
 stale=0
@@ -191,6 +191,20 @@ nominal="$((total_projects - troubled_projects))"
 [ "$nominal" -lt 0 ] && nominal=0
 [ "$stale" -eq 1 ] && echo "STALE — mandate sweep overdue"
 echo "$nominal projects nominal"
+
+# The digest asks for synthesis once per local day. A failed sentinel write is
+# a quiet loss of the prompt, never a failed SessionStart.
+today="${MANDATE_TODAY:-$(date +%Y-%m-%d)}"
+case "$today" in
+  [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9])
+    tap="$MANDATE_DATA_DIR/.tap-$today"
+    if (set -o noclobber; : >"$tap") 2>/dev/null; then
+      echo
+      echo "BRIEF"
+      echo "Produce today's /brief now. Separate blocked on you from blocked on no one; propose only. /desk remains the sole decision surface."
+    fi
+    ;;
+esac
 
 # Baselines and mandate changes are news, not permanent digest content.
 # Preserve the sweep-owned mtime because it is the cadence stamp.
