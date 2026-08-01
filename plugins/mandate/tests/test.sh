@@ -6,6 +6,9 @@ PLUGIN_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 fixture="$(mktemp -d)"
 trap 'rm -rf "$fixture"' EXIT
 mkdir -p "$fixture/config/ostrom" "$fixture/repo" "$fixture/bin"
+export MANDATE_SWEEP_TIME="2026-08-01T00:00:00Z"
+export MANDATE_TODAY="2026-08-01"
+export MANDATE_NOW_EPOCH="1785542400"
 
 write_config() {
   delegated_selector="${1:-label:maintenance}"
@@ -154,7 +157,7 @@ if [ "$1 $2" = "issue list" ]; then
         issue7_title="feat(tooling): improve runner title refreshed upstream"
       fi
       cat <<JSON
-[{"number":7,"title":"$issue7_title","labels":[],"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/7"},{"number":9,"title":"Untriaged request","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/9"},{"number":10,"title":"feat(tooling): owner gate","labels":[{"name":"maintenance"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/10"},{"number":11,"title":"Path-only issue","labels":[],"files":[{"path":"docs/guide.md"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/11"},{"number":14,"title":"Rotate credential safely","labels":[{"name":"ignored"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/14"},{"number":15,"title":"Routine excluded work","labels":[{"name":"ignored"},{"name":"maintenance"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/15"}]
+[{"number":7,"title":"$issue7_title","labels":[],"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/7"},{"number":9,"title":"Untriaged request","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/9"},{"number":10,"title":"feat(tooling): owner gate","body":"Part of #167. Depends on #168.","labels":[{"name":"maintenance"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/10"},{"number":11,"title":"Path-only issue","labels":[],"files":[{"path":"docs/guide.md"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/11"},{"number":14,"title":"Rotate credential safely","body":"Part of #167","labels":[{"name":"ignored"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/14"},{"number":15,"title":"Routine excluded work","labels":[{"name":"ignored"},{"name":"maintenance"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/15"}]
 JSON
       ;;
     example-org/another-repo)
@@ -195,7 +198,7 @@ if [ "$1 $2" = "pr list" ]; then
         pr8_title="fix: refreshed routine maintenance title"
       fi
       cat <<JSON
-[{"number":8,"title":"$pr8_title","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/pull/8","isDraft":false,"reviewDecision":"","statusCheckRollup":[{"conclusion":"SUCCESS","status":"COMPLETED"}],"closingIssuesReferences":[{"number":42,"labels":[{"name":"maintenance"}]}],"files":[{"path":"src/main.sh"}]},{"number":12,"title":"chore: update the frozen rule using a deliberately enormous descriptive title that cannot fit on one digest line without deterministic truncation","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/pull/12","isDraft":false,"reviewDecision":"","statusCheckRollup":[{"conclusion":"SUCCESS","status":"COMPLETED"}],"closingIssuesReferences":[],"files":[{"path":"rules/frozen-rules.md"}]},{"number":13,"labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/pull/13","isDraft":false,"reviewDecision":"","statusCheckRollup":[{"conclusion":"FAILURE","status":"COMPLETED"}],"closingIssuesReferences":[],"files":[]},{"number":16,"title":"docs: nested guide","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/pull/16","isDraft":true,"reviewDecision":"","statusCheckRollup":[],"closingIssuesReferences":[],"files":[{"path":"docs/reference/deep/guide.md"}]}]
+[{"number":8,"title":"$pr8_title","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/pull/8","isDraft":false,"reviewDecision":"","statusCheckRollup":[{"conclusion":"SUCCESS","status":"COMPLETED"}],"closingIssuesReferences":[{"number":42,"labels":[{"name":"maintenance"}]}],"files":[{"path":"src/main.sh"}]},{"number":12,"title":"chore: update the frozen rule using a deliberately enormous descriptive title that cannot fit on one digest line without deterministic truncation","body":"BLOCKED BY example-org/another-repo#20.","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/pull/12","isDraft":false,"reviewDecision":"","statusCheckRollup":[{"conclusion":"SUCCESS","status":"COMPLETED"}],"closingIssuesReferences":[],"files":[{"path":"rules/frozen-rules.md"}]},{"number":13,"labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/pull/13","isDraft":false,"reviewDecision":"","statusCheckRollup":[{"conclusion":"FAILURE","status":"COMPLETED"}],"closingIssuesReferences":[],"files":[]},{"number":16,"title":"docs: nested guide","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/pull/16","isDraft":true,"reviewDecision":"","statusCheckRollup":[],"closingIssuesReferences":[],"files":[{"path":"docs/reference/deep/guide.md"}]}]
 JSON
       ;;
     example-org/hub-repo)
@@ -264,6 +267,38 @@ jq -s -e '
   )
 ' "$queue" >/dev/null
 
+# Decision-support fields use the injected sweep clock and only mechanical
+# inputs. The threshold resolves from the layered config.
+jq -s -e '
+  all(.[];
+    .age_days == 3
+    and .aged_out == true
+    and (.blocked_by | type) == "array"
+  )
+  and any(.[];
+    .id == "example-org/example-repo#10"
+    and .kind == "decision"
+    and .needs_judgment == true
+    and .blocked_by == ["example-org/example-repo#168"]
+  )
+  and any(.[];
+    .id == "example-org/example-repo#14"
+    and .blocked_by == []
+  )
+  and any(.[];
+    .id == "example-org/example-repo#12"
+    and .kind == "tripwire"
+    and .needs_judgment == true
+    and .blocked_by == ["example-org/another-repo#20"]
+  )
+  and any(.[];
+    .id == "example-org/example-repo#13"
+    and .kind == "drift"
+    and .needs_judgment == false
+    and .blocked_by == []
+  )
+' "$queue" >/dev/null
+
 # /desk reads the same titled records rather than making every number another
 # lookup task.
 desk_rows="$(
@@ -277,6 +312,25 @@ jq -s -e '
     and ((.title | length) > 0)
   )
 ' <<<"$desk_rows" >/dev/null
+
+# A pre-brief queue remains valid and loadable without the additive facts.
+legacy_config="$fixture/legacy-queue/config"
+mkdir -p "$legacy_config/ostrom"
+jq -c 'del(.age_days, .aged_out, .needs_judgment, .blocked_by)' "$queue" \
+  >"$legacy_config/ostrom/queue.jsonl"
+legacy_rows="$(
+  CLAUDE_CONFIG_DIR="$legacy_config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/queue.sh" list
+)"
+jq -s -e '
+  length == 5
+  and all(.[];
+    (has("age_days") | not)
+    and (has("aged_out") | not)
+    and (has("needs_judgment") | not)
+    and (has("blocked_by") | not)
+  )
+' <<<"$legacy_rows" >/dev/null
 
 # A legacy queue remains readable. Its one-time title enrichment upgrades the
 # durable rows without manufacturing queue changes.
@@ -347,6 +401,9 @@ jq -s -e '
   and .[0].hookSpecificOutput.hookEventName == "SessionStart"
 ' <<<"$digest" >/dev/null
 digest_text="$(jq -r '.systemMessage' <<<"$digest")"
+grep -q '^BRIEF$' <<<"$digest_text"
+grep -q "^Produce today's /brief now\." <<<"$digest_text"
+[ -f "$fixture/config/ostrom/.tap-2026-08-01" ]
 grep -q \
   '^example-org/example-repo#10  feat(tooling): owner gate — reserved ref:#10$' \
   <<<"$digest_text"
@@ -379,8 +436,15 @@ fi
 # The hook stays local, and a repeat sweep with no upstream movement is a
 # serialized no-op.
 hook_calls_before="$(wc -l <"$fixture/gh-calls")"
-CLAUDE_CONFIG_DIR="$fixture/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-  bash "$PLUGIN_ROOT/hooks/render-digest.sh" >/dev/null
+second_digest="$(
+  CLAUDE_CONFIG_DIR="$fixture/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/hooks/render-digest.sh"
+)"
+second_digest_text="$(jq -r '.systemMessage' <<<"$second_digest")"
+if grep -q '^BRIEF$' <<<"$second_digest_text"; then
+  echo "brief directive rendered more than once in one day" >&2
+  exit 1
+fi
 hook_calls_after="$(wc -l <"$fixture/gh-calls")"
 [ "$hook_calls_before" -eq "$hook_calls_after" ]
 cp "$queue" "$fixture/queue.before"
@@ -849,7 +913,7 @@ healthy="$(
     bash "$PLUGIN_ROOT/hooks/render-digest.sh"
 )"
 healthy_text="$(jq -r '.systemMessage' <<<"$healthy")"
-[ "$healthy_text" = "2 projects nominal" ]
+grep -q '^BRIEF$' <<<"$healthy_text"
 [ "$(grep -c '^[0-9][0-9]* projects nominal$' <<<"$healthy_text")" -eq 1 ]
 
 touch -t 200001010000 "$fixture/healthy/config/ostrom/state.json"

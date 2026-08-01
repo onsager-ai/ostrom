@@ -48,7 +48,7 @@ else
   old_state='{"version":2,"repos":{},"dead_selectors":[]}'
 fi
 
-sweep_started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+sweep_started="${MANDATE_SWEEP_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 generated='[]'
 active_ids='[]'
 current_items='[]'
@@ -60,13 +60,13 @@ while IFS= read -r project; do
   gh_error="$work/gh-error"
 
   if ! issues="$(gh issue list --repo "$repo" --state open --limit "$query_limit" \
-    --json number,title,labels,createdAt,updatedAt,url 2>"$gh_error")"; then
+    --json number,title,body,labels,createdAt,updatedAt,url 2>"$gh_error")"; then
     detail="$(tr '\n' ' ' <"$gh_error")"
     echo "mandate sweep: failed to query open issues for $repo${detail:+: $detail}" >&2
     exit 5
   fi
   if ! prs="$(gh pr list --repo "$repo" --state open --limit "$query_limit" \
-    --json number,title,labels,createdAt,updatedAt,url,isDraft,reviewDecision,statusCheckRollup,closingIssuesReferences,files \
+    --json number,title,body,labels,createdAt,updatedAt,url,isDraft,reviewDecision,statusCheckRollup,closingIssuesReferences,files \
     2>"$gh_error")"; then
     detail="$(tr '\n' ' ' <"$gh_error")"
     echo "mandate sweep: failed to query open PRs and CI for $repo${detail:+: $detail}" >&2
@@ -104,6 +104,17 @@ while IFS= read -r project; do
         then (.closingIssuesReferences.nodes // [])
         else []
         end;
+      def dependency_refs($repo; $text):
+        [
+          $text
+          | match(
+              "(?:depends[[:space:]]+on|blocked[[:space:]]+by|gate[[:space:]]+for)[[:space:]]+((?:[[:alnum:]_.-]+/[[:alnum:]_.-]+)?#[1-9][0-9]*)";
+              "ig"
+            )
+          | .captures[0].string
+          | if startswith("#") then $repo + . else . end
+        ]
+        | unique;
       def normalized($type):
         . as $item
         | (if $type == "pr" then ($item | ci_state) else "none" end) as $ci
@@ -118,6 +129,7 @@ while IFS= read -r project; do
               ($item.title // "")
               | if length > 0 then . else "(title unavailable)" end
             ),
+            blocked_by: dependency_refs($repo; (.body // "")),
             labels: (
               ((.labels // []) | label_names)
               + [$linked[]? | ((.labels // []) | label_names)[]]
@@ -146,6 +158,7 @@ while IFS= read -r project; do
             .title,
             (.labels | sort | join(",")),
             (.refs | sort | map(tostring) | join(",")),
+            (.blocked_by | join(",")),
             (.files | sort | join(",")),
             .ci,
             (.ready | tostring),
@@ -356,10 +369,20 @@ while IFS= read -r project; do
               ($first_seen | fromdateiso8601),
               ($item.updated | fromdateiso8601)
             ] | max)) as $movement_clock
+          | (
+              (
+                (($sweep_started | fromdateiso8601) - ($item.opened | fromdateiso8601))
+                / 86400
+                | floor
+              ) as $days
+              | [$days, 0]
+              | max
+            ) as $age_days
           | . + {
               classification: $classification,
               first_seen: $first_seen,
-              stuck: (
+              age_days: $age_days,
+              movement_stuck: (
                 ($initial | not)
                 and ($policy_changed | not)
                 and $classification.terminal == "delegated"
@@ -396,7 +419,7 @@ while IFS= read -r project; do
               $item.old == null
               or $item.old.fingerprint != $item.fingerprint
               or $item.updated > ($previous.cursor // "")
-              or ($item.stuck and (($item.old.stuck // false) | not))
+              or ($item.movement_stuck and (($item.old.stuck // false) | not))
             ) as $event
           | (
               $item.classification.terminal == "reserved"
@@ -431,7 +454,7 @@ while IFS= read -r project; do
                     + match_reason($item.classification)
                   )
                 }
-              elif $item.stuck then
+              elif $item.movement_stuck then
                 {
                   kind: "stuck",
                   reason: (
@@ -472,7 +495,11 @@ while IFS= read -r project; do
                 ($row.reason + $closing_suffix)
               ),
               state: "pending",
-              opened: $item.opened
+              opened: $item.opened,
+              age_days: $item.age_days,
+              aged_out: ($item.age_days >= $config.stuck_after_days),
+              needs_judgment: ($row.kind | IN("tripwire", "decision")),
+              blocked_by: $item.blocked_by
             }
         ]) as $rows
       | ([$visible_active[] | .id]) as $active_ids
@@ -483,7 +510,7 @@ while IFS= read -r project; do
             first_seen: $item.first_seen,
             classification: $item.classification.terminal,
             matched_selector: $item.classification.selector,
-            stuck: $item.stuck
+            stuck: $item.movement_stuck
           }
         )) as $next_items
       | (($previous.items // {}) != $next_items) as $changed
@@ -541,7 +568,10 @@ while IFS= read -r project; do
             | {
                 id: .id,
                 title: .title,
-                closing_suffix: closing_suffix($item; $active)
+                closing_suffix: closing_suffix($item; $active),
+                age_days: .age_days,
+                aged_out: (.age_days >= $config.stuck_after_days),
+                blocked_by: .blocked_by
               }
           ],
           selector_stats: [selector_stats],
@@ -632,6 +662,17 @@ final_queue="$(
     --argjson generated "$generated" \
     --argjson active_ids "$active_ids" \
     --argjson current_items "$current_items" '
+    def dependency_refs($repo; $text):
+      [
+        $text
+        | match(
+            "(?:depends[[:space:]]+on|blocked[[:space:]]+by|gate[[:space:]]+for)[[:space:]]+((?:[[:alnum:]_.-]+/[[:alnum:]_.-]+)?#[1-9][0-9]*)";
+            "ig"
+          )
+        | .captures[0].string
+        | if startswith("#") then $repo + . else . end
+      ]
+      | unique;
     def current($id):
       first($current_items[] | select(.id == $id)) // null;
     def enrich:
@@ -651,6 +692,26 @@ final_queue="$(
         else .
         end
       | .title = ($current.title // .title // "(title unavailable)")
+      | if $current != null
+        then
+          .age_days = $current.age_days
+          | .aged_out = $current.aged_out
+        else .
+        end
+      | .needs_judgment = (.kind | IN("tripwire", "decision"))
+      | .blocked_by = (
+          (
+            ($current.blocked_by // .blocked_by // [])
+            + dependency_refs(
+                .repo;
+                (
+                  (.mandate.reason // .mandate // "")
+                  | if type == "string" then . else "" end
+                )
+              )
+          )
+          | unique
+        )
       | if ($current.closing_suffix // "") != ""
           and (
             (.mandate.reason // .mandate // "")
