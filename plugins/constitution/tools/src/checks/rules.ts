@@ -1,4 +1,4 @@
-import { readFileSync, statSync } from "node:fs";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { DoctorContext } from "../lib/context.js";
 import { git, run } from "../lib/process.js";
@@ -36,6 +36,102 @@ function ruleCount(source: string): number {
 
 function frozenRules(count: number): string {
   return `${count} frozen ${count === 1 ? "rule" : "rules"}`;
+}
+
+interface CachedPayload {
+  marketplace: string;
+  cacheVersion: string;
+  rules: string | undefined;
+  declaredVersion: string;
+}
+
+interface SemanticVersion {
+  core: [number, number, number];
+  prerelease: string[] | undefined;
+}
+
+function directories(path: string): string[] {
+  try {
+    return readdirSync(path, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name);
+  } catch {
+    return [];
+  }
+}
+
+function parseSemanticVersion(source: string): SemanticVersion | undefined {
+  const match =
+    /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(
+      source,
+    );
+  if (!match) return undefined;
+  return {
+    core: [Number(match[1]), Number(match[2]), Number(match[3])],
+    prerelease: match[4]?.split("."),
+  };
+}
+
+function comparePrerelease(
+  left: string[] | undefined,
+  right: string[] | undefined,
+): number {
+  if (!left && !right) return 0;
+  if (!left) return 1;
+  if (!right) return -1;
+
+  for (let index = 0; index < Math.max(left.length, right.length); index += 1) {
+    const leftPart = left[index];
+    const rightPart = right[index];
+    if (leftPart === undefined) return -1;
+    if (rightPart === undefined) return 1;
+    if (leftPart === rightPart) continue;
+
+    const leftNumeric = /^\d+$/.test(leftPart);
+    const rightNumeric = /^\d+$/.test(rightPart);
+    if (leftNumeric && rightNumeric) return Number(leftPart) - Number(rightPart);
+    if (leftNumeric) return -1;
+    if (rightNumeric) return 1;
+    return leftPart.localeCompare(rightPart);
+  }
+  return 0;
+}
+
+function compareVersions(left: string, right: string): number {
+  const leftVersion = parseSemanticVersion(left);
+  const rightVersion = parseSemanticVersion(right);
+  if (!leftVersion && !rightVersion) {
+    return left.localeCompare(right, undefined, { numeric: true });
+  }
+  if (!leftVersion) return -1;
+  if (!rightVersion) return 1;
+
+  for (let index = 0; index < leftVersion.core.length; index += 1) {
+    const difference =
+      leftVersion.core[index]! - rightVersion.core[index]!;
+    if (difference !== 0) return difference;
+  }
+  return comparePrerelease(leftVersion.prerelease, rightVersion.prerelease);
+}
+
+function cachedPayloads(context: DoctorContext): CachedPayload[] {
+  const cacheRoot = join(context.configDir, "plugins", "cache");
+  return directories(cacheRoot).sort().flatMap((marketplace) => {
+    const pluginCache = join(cacheRoot, marketplace, "constitution");
+    const cacheVersion = directories(pluginCache).sort(compareVersions).at(-1);
+    if (!cacheVersion) return [];
+
+    const payloadRoot = join(pluginCache, cacheVersion);
+    const json = read(join(payloadRoot, ".claude-plugin", "plugin.json"));
+    return [
+      {
+        marketplace,
+        cacheVersion,
+        rules: read(join(payloadRoot, "rules", "frozen-rules.md")),
+        declaredVersion: json === undefined ? "" : version(json),
+      },
+    ];
+  });
 }
 
 function findOstromCheckout(context: DoctorContext): string | undefined {
@@ -111,53 +207,37 @@ export function checkRulesLayers(context: DoctorContext): CheckResult {
 }
 
 export function checkRuleDistribution(context: DoctorContext): CheckResult {
-  const installedRulesPath = join(
-    context.pluginRoot,
-    "rules",
-    "frozen-rules.md",
+  const runningRules = read(
+    join(context.pluginRoot, "rules", "frozen-rules.md"),
   );
-  const installedJsonPath = join(
-    context.pluginRoot,
-    ".claude-plugin",
-    "plugin.json",
-  );
-  const installedRules = read(installedRulesPath);
-  const installedJson = read(installedJsonPath);
-
-  if (installedRules === undefined) {
-    return {
-      status: "FAIL",
-      name: "rule-distribution",
-      detail: `installed frozen-rules.md not readable at ${installedRulesPath}`,
-      remedy: "reinstall the constitution plugin",
-    };
-  }
-
-  const installedCount = ruleCount(installedRules);
-  if (installedCount === 0) {
-    return {
-      status: "FAIL",
-      name: "rule-distribution",
-      detail: "installed payload has 0 frozen rules",
-      remedy: "reinstall the constitution plugin",
-    };
-  }
-
-  if (installedJson === undefined || version(installedJson) === "") {
-    return {
-      status: "FAIL",
-      name: "rule-distribution",
-      detail: `installed payload has ${frozenRules(installedCount)}, but its plugin version is unreadable`,
-      remedy: "reinstall the constitution plugin",
-    };
+  const facts = [
+    runningRules === undefined
+      ? "running payload rule count unavailable"
+      : `running payload has ${frozenRules(ruleCount(runningRules))}`,
+  ];
+  const caches = cachedPayloads(context);
+  if (caches.length === 0) {
+    facts.push("no constitution marketplace cache found");
+  } else {
+    for (const cache of caches) {
+      const cacheLabel = `marketplace ${cache.marketplace} cache ${cache.cacheVersion}`;
+      if (cache.rules === undefined || cache.declaredVersion === "") {
+        facts.push(`${cacheLabel} payload or declared version is unreadable`);
+      } else {
+        facts.push(
+          `${cacheLabel} has ${frozenRules(ruleCount(cache.rules))} and declares version ${cache.declaredVersion}`,
+        );
+      }
+    }
   }
 
   const checkout = findOstromCheckout(context);
   if (!checkout) {
+    facts.push("repo checkout not found");
     return {
       status: "OK",
       name: "rule-distribution",
-      detail: `installed payload has ${frozenRules(installedCount)}`,
+      detail: facts.join("; "),
       remedy: "",
     };
   }
@@ -172,40 +252,78 @@ export function checkRuleDistribution(context: DoctorContext): CheckResult {
     return {
       status: "FAIL",
       name: "rule-distribution",
-      detail: "ostrom checkout found, but its constitution payload or version is unreadable",
+      detail: `${facts.join("; ")}; repo checkout found, but its constitution payload or version is unreadable`,
       remedy: "restore plugins/constitution/rules/frozen-rules.md and .claude-plugin/plugin.json in the checkout",
     };
   }
 
   const repoCount = ruleCount(repoRules);
-  const installedVersion = version(installedJson);
   const repoVersion = version(repoJson);
-  const counts = `installed payload has ${frozenRules(installedCount)}; repo has ${frozenRules(repoCount)}`;
-
-  if (installedRules === repoRules && installedVersion === repoVersion) {
+  facts.push(
+    `repo has ${frozenRules(repoCount)} and declares version ${repoVersion}`,
+  );
+  if (caches.length === 0) {
     return {
       status: "OK",
       name: "rule-distribution",
-      detail: `${counts}; both declare version ${installedVersion}`,
+      detail: facts.join("; "),
       remedy: "",
     };
   }
 
-  if (installedRules !== repoRules && installedVersion === repoVersion) {
+  const unreadable = caches.filter(
+    (cache) => cache.rules === undefined || cache.declaredVersion === "",
+  );
+  const missedBumps = caches.filter(
+    (cache) =>
+      cache.rules !== undefined &&
+      cache.rules !== repoRules &&
+      cache.declaredVersion === repoVersion,
+  );
+  const stale = caches.filter(
+    (cache) =>
+      cache.rules !== undefined &&
+      (cache.rules !== repoRules || cache.declaredVersion !== repoVersion) &&
+      cache.declaredVersion !== repoVersion,
+  );
+
+  if (unreadable.length === 0 && missedBumps.length === 0 && stale.length === 0) {
     return {
-      status: "FAIL",
+      status: "OK",
       name: "rule-distribution",
-      detail: `${counts}; both declare version ${installedVersion}, but rule content differs — plugin payload changed without a version bump (silent distribution bug)`,
-      remedy:
-        "re-add the ostrom marketplace to refresh the installed payload, or bump the constitution plugin version in the repo",
+      detail: facts.join("; "),
+      remedy: "",
     };
+  }
+
+  if (missedBumps.length > 0) {
+    facts.push(
+      `missed-version-bump signature in ${missedBumps.map((cache) => `marketplace ${cache.marketplace}`).join(", ")}: equal version ${repoVersion} with differing rule content`,
+    );
+  }
+  if (stale.length > 0) {
+    facts.push(
+      `cache differs from repo in ${stale.map((cache) => `marketplace ${cache.marketplace}`).join(", ")}`,
+    );
+  }
+
+  const remedies: string[] = [];
+  if (missedBumps.length > 0) {
+    remedies.push(
+      "bump the constitution plugin version in plugins/constitution/.claude-plugin/plugin.json",
+    );
+  }
+  const refresh = [...missedBumps, ...stale, ...unreadable];
+  if (refresh.length > 0) {
+    remedies.push(
+      `${missedBumps.length > 0 ? "then refresh" : "refresh"} the ${refresh.map((cache) => cache.marketplace).join(", ")} marketplace ${refresh.length === 1 ? "cache" : "caches"}; if one stays stale, remove and re-add that marketplace`,
+    );
   }
 
   return {
     status: "FAIL",
     name: "rule-distribution",
-    detail: `${counts}; installed version ${installedVersion}, repo version ${repoVersion}`,
-    remedy:
-      "/plugin marketplace update ostrom; if the installed payload stays stale, remove and re-add the marketplace",
+    detail: facts.join("; "),
+    remedy: remedies.join("; "),
   };
 }

@@ -16,11 +16,17 @@ jobs:
         working-directory: plugins/constitution/tools
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: plugins/constitution/tools/package-lock.json
+      - name: Require plugin version bumps for packaged payload changes
+        if: github.event_name == 'pull_request'
+        working-directory: .
+        run: .github/scripts/check-plugin-version-bumps.sh "${{ github.event.pull_request.base.sha }}"
       - run: npm ci
       - run: npm run typecheck
       - run: npm run test

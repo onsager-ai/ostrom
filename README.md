@@ -167,9 +167,12 @@ comment — match `frozen-rules.md`'s own style).
 Node from `PATH` or common version-manager locations and launches the
 committed TypeScript bundle. It reports on eight checks: plugin installed,
 marketplace clone still fast-forwardable, which rules layers actually
-fired, whether the installed frozen-rule payload matches a locatable ostrom
-checkout, touch-log target durability, provider reachability, local vs cloud
-environment, and the supported shape of the config parser.
+fired, whether each marketplace's highest cached frozen-rule payload matches
+a locatable ostrom checkout, touch-log target durability, provider
+reachability, local vs cloud environment, and the supported shape of the
+config parser. The distribution check also reports the running bundle's own
+rule count, but never mistakes that bundle for the marketplace cache it is
+checking.
 
 It exists because silent degradation is the actual failure mode here, not
 a crash. The SessionStart hook injects the shipped rules and nothing else

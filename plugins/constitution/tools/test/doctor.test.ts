@@ -141,7 +141,8 @@ function commonExpected(
     {
       status: "OK",
       name: "rule-distribution",
-      detail: "installed payload has 4 frozen rules",
+      detail:
+        "running payload has 4 frozen rules; no constitution marketplace cache found; repo checkout not found",
       remedy: "",
     },
     touch,
@@ -179,19 +180,28 @@ function fixtureRules(count: number, label = "rule"): string {
   return `# Frozen working conventions\n\n${headings.join("\n\n")}\n`;
 }
 
-function setInstalledPayload(
+function wireCachedPayload(
   fixture: Fixture,
+  marketplace: string,
+  cacheVersion: string,
   version: string,
   rules: string,
 ): void {
+  const payload = join(
+    fixture.configDir,
+    "plugins",
+    "cache",
+    marketplace,
+    "constitution",
+    cacheVersion,
+  );
+  mkdirSync(join(payload, ".claude-plugin"), { recursive: true });
+  mkdirSync(join(payload, "rules"), { recursive: true });
   writeFileSync(
-    join(fixture.installPath, ".claude-plugin", "plugin.json"),
+    join(payload, ".claude-plugin", "plugin.json"),
     JSON.stringify({ name: "constitution", version }),
   );
-  writeFileSync(
-    join(fixture.installPath, "rules", "frozen-rules.md"),
-    rules,
-  );
+  writeFileSync(join(payload, "rules", "frozen-rules.md"), rules);
 }
 
 function wireRepoPayload(
@@ -381,47 +391,35 @@ describe("doctor golden output", () => {
 });
 
 describe("rule distribution", () => {
-  it("reports the installed rule count without warning when no checkout is present", () => {
+  it("stays OK with running-payload facts when no cache or checkout is present", () => {
     const fixture = baseFixture();
 
     expect(run(fixture)).toContain(
-      "OK|rule-distribution|installed payload has 4 frozen rules|\n",
+      "OK|rule-distribution|running payload has 4 frozen rules; no constitution marketplace cache found; repo checkout not found|\n",
     );
   });
 
-  it("names the silent distribution bug when counts differ at the same version", () => {
+  it("stays OK for a marketplace-only user while reporting the cache", () => {
     const fixture = baseFixture();
-    setInstalledPayload(fixture, "0.6.0", fixtureRules(3));
-    wireRepoPayload(fixture, "0.6.0", fixtureRules(4));
+    wireCachedPayload(fixture, "company", "0.6.0", "0.6.0", fixtureRules(3));
 
     expect(run(fixture)).toContain(
-      "FAIL|rule-distribution|installed payload has 3 frozen rules; repo has 4 frozen rules; both declare version 0.6.0, but rule content differs — plugin payload changed without a version bump (silent distribution bug)|re-add the ostrom marketplace to refresh the installed payload, or bump the constitution plugin version in the repo\n",
+      "OK|rule-distribution|running payload has 4 frozen rules; marketplace company cache 0.6.0 has 3 frozen rules and declares version 0.6.0; repo checkout not found|\n",
     );
   });
 
-  it("detects changed rule content even when the heading count is unchanged", () => {
+  it("stays OK when a checkout exists but no marketplace cache does", () => {
     const fixture = baseFixture();
-    setInstalledPayload(fixture, "0.6.0", fixtureRules(4, "installed"));
-    wireRepoPayload(fixture, "0.6.0", fixtureRules(4, "repo"));
+    wireRepoPayload(fixture, "0.7.0", fixtureRules(4));
 
     expect(run(fixture)).toContain(
-      "FAIL|rule-distribution|installed payload has 4 frozen rules; repo has 4 frozen rules; both declare version 0.6.0, but rule content differs — plugin payload changed without a version bump (silent distribution bug)|",
+      "OK|rule-distribution|running payload has 4 frozen rules; no constitution marketplace cache found; repo has 4 frozen rules and declares version 0.7.0|\n",
     );
   });
 
-  it("fails on a version mismatch even when the rule content matches", () => {
+  it("detects a stale marketplace cache even when the running bundle matches the repo", () => {
     const fixture = baseFixture();
-    const rules = fixtureRules(4);
-    setInstalledPayload(fixture, "0.6.0", rules);
-    wireRepoPayload(fixture, "0.7.0", rules);
-
-    expect(run(fixture)).toContain(
-      "FAIL|rule-distribution|installed payload has 4 frozen rules; repo has 4 frozen rules; installed version 0.6.0, repo version 0.7.0|/plugin marketplace update ostrom; if the installed payload stays stale, remove and re-add the marketplace\n",
-    );
-  });
-
-  it("passes when the installed payload and repo declaration match", () => {
-    const fixture = baseFixture();
+    wireCachedPayload(fixture, "ostrom", "0.6.0", "0.6.0", fixtureRules(3));
     wireRepoPayload(
       fixture,
       "0.7.0",
@@ -429,7 +427,61 @@ describe("rule distribution", () => {
     );
 
     expect(run(fixture)).toContain(
-      "OK|rule-distribution|installed payload has 4 frozen rules; repo has 4 frozen rules; both declare version 0.7.0|\n",
+      "FAIL|rule-distribution|running payload has 4 frozen rules; marketplace ostrom cache 0.6.0 has 3 frozen rules and declares version 0.6.0; repo has 4 frozen rules and declares version 0.7.0; cache differs from repo in marketplace ostrom|refresh the ostrom marketplace cache; if one stays stale, remove and re-add that marketplace\n",
+    );
+  });
+
+  it("calls out equal-version content drift as a missed version bump", () => {
+    const fixture = baseFixture();
+    wireCachedPayload(
+      fixture,
+      "private",
+      "0.7.0",
+      "0.7.0",
+      fixtureRules(4, "cached"),
+    );
+    wireRepoPayload(fixture, "0.7.0", fixtureRules(4, "repo"));
+
+    expect(run(fixture)).toContain(
+      "missed-version-bump signature in marketplace private: equal version 0.7.0 with differing rule content|bump the constitution plugin version in plugins/constitution/.claude-plugin/plugin.json; then refresh the private marketplace cache",
+    );
+  });
+
+  it("selects the highest semantic version in each marketplace cache", () => {
+    const fixture = baseFixture();
+    const currentRules = fixtureRules(4, "current");
+    wireCachedPayload(fixture, "ostrom", "0.9.0", "0.9.0", fixtureRules(3));
+    wireCachedPayload(fixture, "ostrom", "0.10.0", "0.10.0", currentRules);
+    wireRepoPayload(fixture, "0.10.0", currentRules);
+
+    const report = run(fixture);
+    expect(report).toContain(
+      "OK|rule-distribution|running payload has 4 frozen rules; marketplace ostrom cache 0.10.0 has 4 frozen rules and declares version 0.10.0; repo has 4 frozen rules and declares version 0.10.0|\n",
+    );
+    expect(report).not.toContain("marketplace ostrom cache 0.9.0");
+  });
+
+  it("reports every marketplace that carries the constitution plugin", () => {
+    const fixture = baseFixture();
+    const rules = fixtureRules(4);
+    wireCachedPayload(fixture, "alpha", "0.7.0", "0.7.0", rules);
+    wireCachedPayload(fixture, "beta", "0.6.0", "0.6.0", fixtureRules(3));
+    wireRepoPayload(fixture, "0.7.0", rules);
+
+    const report = run(fixture);
+    expect(report).toContain("marketplace alpha cache 0.7.0");
+    expect(report).toContain("marketplace beta cache 0.6.0");
+    expect(report).toContain("cache differs from repo in marketplace beta");
+  });
+
+  it("passes when the highest cached payload and repo declaration match", () => {
+    const fixture = baseFixture();
+    const rules = fixtureRules(4);
+    wireCachedPayload(fixture, "renamed-marketplace", "0.7.0", "0.7.0", rules);
+    wireRepoPayload(fixture, "0.7.0", rules);
+
+    expect(run(fixture)).toContain(
+      "OK|rule-distribution|running payload has 4 frozen rules; marketplace renamed-marketplace cache 0.7.0 has 4 frozen rules and declares version 0.7.0; repo has 4 frozen rules and declares version 0.7.0|\n",
     );
   });
 });

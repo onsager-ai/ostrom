@@ -24,11 +24,14 @@ clone's remote-tracking refs only) and always exits 0; each line is:
 STATUS|check-name|detail|remedy
 ```
 
-`rule-distribution` always reports the number of `^## ` rules in the
-installed payload. When an ostrom checkout is locatable, it also compares
-that count, the full rule content, and the constitution plugin version
-against the checkout. No checkout is a normal marketplace installation,
-so that case stays `OK` with only the installed count.
+`rule-distribution` always reports the number of `^## ` rules in the running
+payload. It independently discovers every marketplace cache containing a
+`constitution` plugin, selects that marketplace's highest cached version,
+and compares the cached rule count, full rule content, and declared plugin
+version against a locatable ostrom checkout. A missing cache or checkout is
+normal, so either case stays `OK` with whatever partial facts are available.
+Equal declared versions with differing content are reported explicitly as a
+missed version bump.
 
 ## 2. Resolve any DEFER first
 
