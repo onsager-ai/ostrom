@@ -186,6 +186,19 @@ JSON
         ]
       '
       ;;
+    example-org/large-body)
+      jq -cn '
+        [{
+          number: 1,
+          title: "Large dependency report",
+          body: (("x" * 204800) + "\nDepends on #123"),
+          labels: [],
+          createdAt: "2026-07-29T00:00:00Z",
+          updatedAt: "2026-07-30T00:00:00Z",
+          url: "https://example.invalid/issues/1"
+        }]
+      '
+      ;;
     *) echo '[]' ;;
   esac
   exit 0
@@ -225,6 +238,35 @@ run_sweep() {
       bash "$PLUGIN_ROOT/scripts/sweep.sh"
   )
 }
+
+# Issue bodies can exceed Linux's per-argument limit. The sweep must extract
+# dependency refs without ever carrying the raw body through jq argv.
+large_body="$fixture/large-body"
+mkdir -p "$large_body/config/ostrom" "$large_body/repo"
+cat >"$large_body/config/ostrom/mandates.yaml" <<'YAML'
+bounce_all: []
+projects:
+  - repo: example-org/large-body
+    delegated: []
+    excluded: []
+    reserved:
+      - 1
+    default: excluded
+    paused: false
+    bounce: []
+YAML
+(
+  cd "$large_body/repo"
+  PATH="$fixture/bin:$PATH" \
+    CLAUDE_CONFIG_DIR="$large_body/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/sweep.sh" >/dev/null
+)
+jq -s -e '
+  length == 1
+  and .[0].id == "example-org/large-body#1"
+  and .[0].blocked_by == ["example-org/large-body#123"]
+' "$large_body/config/ostrom/queue.jsonl" >/dev/null
 
 # The first sweep is a baseline. Only reserved, tripwire, and drift carve-outs
 # queue; the paused project's issue tripwire still fires.

@@ -18,8 +18,11 @@ if ! mandate_is_configured; then
   exit 2
 fi
 
-config="$(mandate_load_config)" || exit
-project_count="$(jq '.projects | length' <<<"$config")"
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+
+mandate_load_config >"$work/config.json" || exit
+project_count="$(jq '.projects | length' "$work/config.json")"
 if [ "$project_count" -eq 0 ]; then
   echo "mandate sweep: mandates.yaml contains no projects" >&2
   exit 2
@@ -32,54 +35,57 @@ if ! gh auth status --hostname "$gh_host" >/dev/null 2>&1; then
 fi
 
 mkdir -p "$MANDATE_DATA_DIR"
-work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
-
-existing_queue="$(mandate_read_queue)" || {
+mandate_read_queue >"$work/existing-queue.json" || {
   echo "mandate sweep: cannot read $MANDATE_QUEUE_FILE" >&2
   exit 4
 }
 if [ -s "$MANDATE_STATE_FILE" ]; then
-  if ! old_state="$(jq -c 'if type == "object" then . else error("state is not an object") end' "$MANDATE_STATE_FILE")"; then
+  if ! jq -c 'if type == "object" then . else error("state is not an object") end' \
+    "$MANDATE_STATE_FILE" >"$work/old-state.json"; then
     echo "mandate sweep: cannot read $MANDATE_STATE_FILE" >&2
     exit 4
   fi
 else
-  old_state='{"version":2,"repos":{},"dead_selectors":[]}'
+  printf '%s\n' '{"version":2,"repos":{},"dead_selectors":[]}' \
+    >"$work/old-state.json"
 fi
 
 sweep_started="${MANDATE_SWEEP_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
-generated='[]'
-active_ids='[]'
-current_items='[]'
-selector_stats='[]'
-new_state="$old_state"
+printf '%s\n' '[]' >"$work/generated.json"
+printf '%s\n' '[]' >"$work/active-ids.json"
+printf '%s\n' '[]' >"$work/current-items.json"
+printf '%s\n' '[]' >"$work/selector-stats.json"
+cp "$work/old-state.json" "$work/new-state.json"
 
 while IFS= read -r project; do
-  repo="$(jq -r '.repo' <<<"$project")"
+  printf '%s\n' "$project" >"$work/project.json"
+  repo="$(jq -r '.repo' "$work/project.json")"
   gh_error="$work/gh-error"
 
-  if ! issues="$(gh issue list --repo "$repo" --state open --limit "$query_limit" \
-    --json number,title,body,labels,createdAt,updatedAt,url 2>"$gh_error")"; then
+  if ! gh issue list --repo "$repo" --state open --limit "$query_limit" \
+    --json number,title,body,labels,createdAt,updatedAt,url \
+    >"$work/issues.json" 2>"$gh_error"; then
     detail="$(tr '\n' ' ' <"$gh_error")"
     echo "mandate sweep: failed to query open issues for $repo${detail:+: $detail}" >&2
     exit 5
   fi
-  if ! prs="$(gh pr list --repo "$repo" --state open --limit "$query_limit" \
+  if ! gh pr list --repo "$repo" --state open --limit "$query_limit" \
     --json number,title,body,labels,createdAt,updatedAt,url,isDraft,reviewDecision,statusCheckRollup,closingIssuesReferences,files \
-    2>"$gh_error")"; then
+    >"$work/prs.json" 2>"$gh_error"; then
     detail="$(tr '\n' ' ' <"$gh_error")"
     echo "mandate sweep: failed to query open PRs and CI for $repo${detail:+: $detail}" >&2
     exit 5
   fi
   item_cap='null'
-  if [ "$(jq 'length' <<<"$issues")" -eq "$query_limit" ] ||
-    [ "$(jq 'length' <<<"$prs")" -eq "$query_limit" ]; then
+  if [ "$(jq 'length' "$work/issues.json")" -eq "$query_limit" ] ||
+    [ "$(jq 'length' "$work/prs.json")" -eq "$query_limit" ]; then
     item_cap="$query_limit"
   fi
 
-  items="$(
-    jq -cn --arg repo "$repo" --argjson issues "$issues" --argjson prs "$prs" '
+  jq -cn \
+    --arg repo "$repo" \
+    --slurpfile issues "$work/issues.json" \
+    --slurpfile prs "$work/prs.json" '
       def failure:
         ((.conclusion // .state // "") | ascii_upcase)
         | IN("FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STALE");
@@ -164,14 +170,15 @@ while IFS= read -r project; do
             (.ready | tostring),
             .review
           ] | join("|"));
-      [($issues[] | normalized("issue")), ($prs[] | normalized("pr"))]
-    '
-  )"
+      [($issues[0][] | normalized("issue")), ($prs[0][] | normalized("pr"))]
+    ' >"$work/items.json"
 
-  policy="$(
-    jq -cn \
-      --argjson project "$project" \
-      --argjson bounce_all "$(jq -c '.bounce_all' <<<"$config")" '
+  jq -cn \
+    --slurpfile project "$work/project.json" \
+    --slurpfile config "$work/config.json" '
+      ($project[0]) as $project
+      | ($config[0].bounce_all) as $bounce_all
+      |
       {
         delegated: $project.delegated,
         excluded: $project.excluded,
@@ -187,19 +194,24 @@ while IFS= read -r project; do
           paused: $project.paused,
           selector_hash: $selector_hash
         }
-    '
-  )"
+    ' >"$work/policy.json"
 
-  old_repo_state="$(jq -c --arg repo "$repo" '.repos[$repo] // {}' <<<"$old_state")"
-  analysis="$(
-    jq -cn \
+  jq -c --arg repo "$repo" '.repos[$repo] // {}' "$work/old-state.json" \
+    >"$work/previous.json"
+  jq -cn \
       --arg sweep_started "$sweep_started" \
-      --argjson project "$project" \
-      --argjson config "$config" \
-      --argjson items "$items" \
-      --argjson policy "$policy" \
+      --slurpfile project "$work/project.json" \
+      --slurpfile config "$work/config.json" \
+      --slurpfile items "$work/items.json" \
+      --slurpfile policy "$work/policy.json" \
       --argjson item_cap "$item_cap" \
-      --argjson previous "$old_repo_state" '
+      --slurpfile previous "$work/previous.json" '
+      ($project[0]) as $project
+      | ($config[0]) as $config
+      | ($items[0]) as $items
+      | ($policy[0]) as $policy
+      | ($previous[0]) as $previous
+      |
       def regex_char($char):
         if $char | IN("\\", ".", "+", "?", "^", "$", "(", ")", "[", "]", "{", "}", "|")
         then "\\" + $char
@@ -601,38 +613,39 @@ while IFS= read -r project; do
             items: $next_items
           }
         }
-    '
-  )"
+    ' >"$work/analysis.json"
 
-  rows="$(jq -c '.rows' <<<"$analysis")"
-  generated="$(jq -cn --argjson all "$generated" --argjson rows "$rows" '$all + $rows')"
-  repo_active_ids="$(jq -c '.active_ids' <<<"$analysis")"
-  active_ids="$(jq -cn --argjson all "$active_ids" --argjson ids "$repo_active_ids" '$all + $ids')"
-  repo_current_items="$(jq -c '.current_items' <<<"$analysis")"
-  current_items="$(
-    jq -cn \
-      --argjson all "$current_items" \
-      --argjson items "$repo_current_items" \
-      '$all + $items'
-  )"
-  repo_selector_stats="$(jq -c '.selector_stats' <<<"$analysis")"
-  selector_stats="$(
-    jq -cn --argjson all "$selector_stats" --argjson stats "$repo_selector_stats" \
-      '$all + $stats'
-  )"
-  new_repo_state="$(jq -c '.repo_state' <<<"$analysis")"
-  new_state="$(
-    jq -cn \
+  jq -cn \
+    --slurpfile all "$work/generated.json" \
+    --slurpfile analysis "$work/analysis.json" \
+    '$all[0] + $analysis[0].rows' >"$work/next.json"
+  mv "$work/next.json" "$work/generated.json"
+  jq -cn \
+    --slurpfile all "$work/active-ids.json" \
+    --slurpfile analysis "$work/analysis.json" \
+    '$all[0] + $analysis[0].active_ids' >"$work/next.json"
+  mv "$work/next.json" "$work/active-ids.json"
+  jq -cn \
+    --slurpfile all "$work/current-items.json" \
+    --slurpfile analysis "$work/analysis.json" \
+    '$all[0] + $analysis[0].current_items' >"$work/next.json"
+  mv "$work/next.json" "$work/current-items.json"
+  jq -cn \
+    --slurpfile all "$work/selector-stats.json" \
+    --slurpfile analysis "$work/analysis.json" \
+    '$all[0] + $analysis[0].selector_stats' >"$work/next.json"
+  mv "$work/next.json" "$work/selector-stats.json"
+  jq -cn \
       --arg repo "$repo" \
-      --argjson state "$new_state" \
-      --argjson repo_state "$new_repo_state" \
-      '$state | .version = 2 | .repos[$repo] = $repo_state'
-  )"
-done < <(jq -c '.projects[]' <<<"$config")
+      --slurpfile state "$work/new-state.json" \
+      --slurpfile analysis "$work/analysis.json" \
+      '$state[0] | .version = 2 | .repos[$repo] = $analysis[0].repo_state' \
+      >"$work/next.json"
+  mv "$work/next.json" "$work/new-state.json"
+done < <(jq -c '.projects[]' "$work/config.json")
 
-dead_selectors="$(
-  jq -cn --argjson stats "$selector_stats" '
-    $stats
+jq -cn --slurpfile stats "$work/selector-stats.json" '
+    $stats[0]
     | sort_by([(.repo // ""), .source, .selector])
     | group_by([.repo, .source, .selector])
     | map(
@@ -640,28 +653,32 @@ dead_selectors="$(
         | first
         | del(.hit)
       )
-  '
-)"
-configured_repos="$(jq -c '[.projects[].repo]' <<<"$config")"
-new_state="$(
-  jq -cn \
-    --argjson state "$new_state" \
-    --argjson dead "$dead_selectors" \
-    --argjson configured_repos "$configured_repos" '
-    $state
+  ' >"$work/dead-selectors.json"
+jq -c '[.projects[].repo]' "$work/config.json" >"$work/configured-repos.json"
+jq -cn \
+    --slurpfile state "$work/new-state.json" \
+    --slurpfile dead "$work/dead-selectors.json" \
+    --slurpfile configured_repos "$work/configured-repos.json" '
+    $state[0]
+    | ($dead[0]) as $dead
+    | ($configured_repos[0]) as $configured_repos
     | .dead_selectors = $dead
     | .repos |= with_entries(
         select(.key as $repo | ($configured_repos | index($repo)) != null)
       )
-  '
-)"
+  ' >"$work/next.json"
+mv "$work/next.json" "$work/new-state.json"
 
-final_queue="$(
-  jq -cn \
-    --argjson existing "$existing_queue" \
-    --argjson generated "$generated" \
-    --argjson active_ids "$active_ids" \
-    --argjson current_items "$current_items" '
+jq -cn \
+    --slurpfile existing "$work/existing-queue.json" \
+    --slurpfile generated "$work/generated.json" \
+    --slurpfile active_ids "$work/active-ids.json" \
+    --slurpfile current_items "$work/current-items.json" '
+    ($existing[0]) as $existing
+    | ($generated[0]) as $generated
+    | ($active_ids[0]) as $active_ids
+    | ($current_items[0]) as $current_items
+    |
     def dependency_refs($repo; $text):
       [
         $text
@@ -736,13 +753,15 @@ final_queue="$(
       )
     | map(enrich)
     | sort_by(.opened, .id)
-  '
-)"
+  ' >"$work/final-queue.json"
 
 queue_changes="$(
   jq -n \
-    --argjson before "$existing_queue" \
-    --argjson after "$final_queue" '
+    --slurpfile before "$work/existing-queue.json" \
+    --slurpfile after "$work/final-queue.json" '
+    ($before[0]) as $before
+    | ($after[0]) as $after
+    |
     (
       $before
       | map(. as $row
@@ -765,8 +784,8 @@ queue_changes="$(
   '
 )"
 
-jq -c '.[]' <<<"$final_queue" >"$work/queue.jsonl"
-jq -S . <<<"$new_state" >"$work/state.json"
+jq -c '.[]' "$work/final-queue.json" >"$work/queue.jsonl"
+jq -S . "$work/new-state.json" >"$work/state.json"
 mandate_write_if_changed "$work/queue.jsonl" "$MANDATE_QUEUE_FILE"
 mandate_write_if_changed "$work/state.json" "$MANDATE_STATE_FILE"
 
