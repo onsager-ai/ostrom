@@ -153,11 +153,15 @@ if [ "$1 $2" = "issue list" ]; then
   case "$repo" in
     example-org/example-repo)
       issue7_title="feat(tooling): improve runner"
+      issue7_body=""
       if [ "${FAKE_GH_MODE:-base}" = "changed" ]; then
         issue7_title="feat(tooling): improve runner title refreshed upstream"
       fi
+      if [ "${FAKE_GH_MODE:-base}" = "dependency-changed" ]; then
+        issue7_body="Depends on #168."
+      fi
       cat <<JSON
-[{"number":7,"title":"$issue7_title","labels":[],"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/7"},{"number":9,"title":"Untriaged request","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/9"},{"number":10,"title":"feat(tooling): owner gate","body":"Part of #167. Depends on #168.","labels":[{"name":"maintenance"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/10"},{"number":11,"title":"Path-only issue","labels":[],"files":[{"path":"docs/guide.md"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/11"},{"number":14,"title":"Rotate credential safely","body":"Part of #167","labels":[{"name":"ignored"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/14"},{"number":15,"title":"Routine excluded work","labels":[{"name":"ignored"},{"name":"maintenance"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/15"}]
+[{"number":7,"title":"$issue7_title","body":"$issue7_body","labels":[],"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/7"},{"number":9,"title":"Untriaged request","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/9"},{"number":10,"title":"feat(tooling): owner gate","body":"Part of #167. Depends on #168.","labels":[{"name":"maintenance"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/10"},{"number":11,"title":"Path-only issue","labels":[],"files":[{"path":"docs/guide.md"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/11"},{"number":14,"title":"Rotate credential safely","body":"Part of #167","labels":[{"name":"ignored"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/14"},{"number":15,"title":"Routine excluded work","labels":[{"name":"ignored"},{"name":"maintenance"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/15"}]
 JSON
       ;;
     example-org/another-repo)
@@ -503,6 +507,30 @@ steady_digest="$(
 steady_digest_text="$(jq -r '.systemMessage' <<<"$steady_digest")"
 if grep -q 'baselined [0-9][0-9]* open items' <<<"$steady_digest_text"; then
   echo "baseline notice survived an unchanged second sweep" >&2
+  exit 1
+fi
+
+# Dependency prose is decision-support metadata, not material movement. Two
+# otherwise identical items must retain the same fingerprint and emit no row.
+fingerprint_before="$(
+  jq -r '
+    .repos["example-org/example-repo"].items
+    | .["example-org/example-repo#7"].fingerprint
+  ' "$state"
+)"
+dependency_result="$(FAKE_GH_MODE=dependency-changed run_sweep)"
+fingerprint_after="$(
+  jq -r '
+    .repos["example-org/example-repo"].items
+    | .["example-org/example-repo#7"].fingerprint
+  ' "$state"
+)"
+[ "$fingerprint_before" = "$fingerprint_after" ]
+grep -q '0 queue changes$' <<<"$dependency_result"
+if jq -e '
+  select(.id == "example-org/example-repo#7" and .kind == "moved")
+' "$queue" >/dev/null; then
+  echo "dependency-only edit generated a moved row" >&2
   exit 1
 fi
 

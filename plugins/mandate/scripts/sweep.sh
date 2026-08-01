@@ -164,7 +164,6 @@ while IFS= read -r project; do
             .title,
             (.labels | sort | join(",")),
             (.refs | sort | map(tostring) | join(",")),
-            (.blocked_by | join(",")),
             (.files | sort | join(",")),
             .ci,
             (.ready | tostring),
