@@ -165,9 +165,10 @@ comment — match `frozen-rules.md`'s own style).
 
 `/doctor` runs `plugins/constitution/scripts/run-node.sh`, which resolves
 Node from `PATH` or common version-manager locations and launches the
-committed TypeScript bundle. It reports on seven checks: plugin installed,
+committed TypeScript bundle. It reports on eight checks: plugin installed,
 marketplace clone still fast-forwardable, which rules layers actually
-fired, touch-log target durability, provider reachability, local vs cloud
+fired, whether the installed frozen-rule payload matches a locatable ostrom
+checkout, touch-log target durability, provider reachability, local vs cloud
 environment, and the supported shape of the config parser.
 
 It exists because silent degradation is the actual failure mode here, not

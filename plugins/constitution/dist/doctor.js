@@ -3,7 +3,7 @@ import { dirname as dirname2, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // src/checks/rules.ts
-import { statSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 // src/lib/process.ts
@@ -32,6 +32,35 @@ function isFile(path) {
   } catch {
     return false;
   }
+}
+function read(path) {
+  try {
+    return readFileSync(path, "utf8");
+  } catch {
+    return void 0;
+  }
+}
+function version(source) {
+  return /"version"\s*:\s*"([^"]+)"/.exec(source)?.[1] ?? "";
+}
+function ruleCount(source) {
+  return source.match(/^## /gm)?.length ?? 0;
+}
+function frozenRules(count) {
+  return `${count} frozen ${count === 1 ? "rule" : "rules"}`;
+}
+function findOstromCheckout(context) {
+  for (const candidate of [context.cwd, context.pluginRoot]) {
+    const topLevel = git(candidate, ["rev-parse", "--show-toplevel"]);
+    if (topLevel.status !== 0) continue;
+    const root = topLevel.stdout.trim();
+    if (isFile(join(root, "plugins", "constitution", "rules", "frozen-rules.md")) && isFile(
+      join(root, "plugins", "constitution", ".claude-plugin", "plugin.json")
+    )) {
+      return root;
+    }
+  }
+  return void 0;
 }
 function computeRulesLayers(context) {
   const hook = join(context.pluginRoot, "hooks", "inject-constitution.sh");
@@ -80,6 +109,94 @@ function checkRulesLayers(context) {
     remedy: ""
   };
 }
+function checkRuleDistribution(context) {
+  const installedRulesPath = join(
+    context.pluginRoot,
+    "rules",
+    "frozen-rules.md"
+  );
+  const installedJsonPath = join(
+    context.pluginRoot,
+    ".claude-plugin",
+    "plugin.json"
+  );
+  const installedRules = read(installedRulesPath);
+  const installedJson = read(installedJsonPath);
+  if (installedRules === void 0) {
+    return {
+      status: "FAIL",
+      name: "rule-distribution",
+      detail: `installed frozen-rules.md not readable at ${installedRulesPath}`,
+      remedy: "reinstall the constitution plugin"
+    };
+  }
+  const installedCount = ruleCount(installedRules);
+  if (installedCount === 0) {
+    return {
+      status: "FAIL",
+      name: "rule-distribution",
+      detail: "installed payload has 0 frozen rules",
+      remedy: "reinstall the constitution plugin"
+    };
+  }
+  if (installedJson === void 0 || version(installedJson) === "") {
+    return {
+      status: "FAIL",
+      name: "rule-distribution",
+      detail: `installed payload has ${frozenRules(installedCount)}, but its plugin version is unreadable`,
+      remedy: "reinstall the constitution plugin"
+    };
+  }
+  const checkout = findOstromCheckout(context);
+  if (!checkout) {
+    return {
+      status: "OK",
+      name: "rule-distribution",
+      detail: `installed payload has ${frozenRules(installedCount)}`,
+      remedy: ""
+    };
+  }
+  const repoRules = read(
+    join(checkout, "plugins", "constitution", "rules", "frozen-rules.md")
+  );
+  const repoJson = read(
+    join(checkout, "plugins", "constitution", ".claude-plugin", "plugin.json")
+  );
+  if (repoRules === void 0 || repoJson === void 0 || version(repoJson) === "") {
+    return {
+      status: "FAIL",
+      name: "rule-distribution",
+      detail: "ostrom checkout found, but its constitution payload or version is unreadable",
+      remedy: "restore plugins/constitution/rules/frozen-rules.md and .claude-plugin/plugin.json in the checkout"
+    };
+  }
+  const repoCount = ruleCount(repoRules);
+  const installedVersion = version(installedJson);
+  const repoVersion = version(repoJson);
+  const counts = `installed payload has ${frozenRules(installedCount)}; repo has ${frozenRules(repoCount)}`;
+  if (installedRules === repoRules && installedVersion === repoVersion) {
+    return {
+      status: "OK",
+      name: "rule-distribution",
+      detail: `${counts}; both declare version ${installedVersion}`,
+      remedy: ""
+    };
+  }
+  if (installedRules !== repoRules && installedVersion === repoVersion) {
+    return {
+      status: "FAIL",
+      name: "rule-distribution",
+      detail: `${counts}; both declare version ${installedVersion}, but rule content differs \u2014 plugin payload changed without a version bump (silent distribution bug)`,
+      remedy: "re-add the ostrom marketplace to refresh the installed payload, or bump the constitution plugin version in the repo"
+    };
+  }
+  return {
+    status: "FAIL",
+    name: "rule-distribution",
+    detail: `${counts}; installed version ${installedVersion}, repo version ${repoVersion}`,
+    remedy: "/plugin marketplace update ostrom; if the installed payload stays stale, remove and re-add the marketplace"
+  };
+}
 
 // src/checks/environment.ts
 function checkEnvironment(context) {
@@ -108,7 +225,7 @@ function checkEnvironment(context) {
 }
 
 // src/checks/marketplace.ts
-import { readFileSync, statSync as statSync2 } from "node:fs";
+import { readFileSync as readFileSync2, statSync as statSync2 } from "node:fs";
 import { join as join2 } from "node:path";
 function checkMarketplace(context) {
   const knownJson = join2(context.configDir, "plugins", "known_marketplaces.json");
@@ -120,7 +237,7 @@ function checkMarketplace(context) {
   );
   let knownSource = "";
   try {
-    knownSource = readFileSync(knownJson, "utf8");
+    knownSource = readFileSync2(knownJson, "utf8");
   } catch {
   }
   let knownIsFile = false;
@@ -207,7 +324,7 @@ function checkConfigParser() {
 }
 
 // src/checks/plugin.ts
-import { readFileSync as readFileSync2, statSync as statSync3 } from "node:fs";
+import { readFileSync as readFileSync3, statSync as statSync3 } from "node:fs";
 import { join as join3 } from "node:path";
 function field(source, name) {
   const match = new RegExp(`"${name}"\\s*:\\s*"([^"]*)"`).exec(source);
@@ -232,7 +349,7 @@ function checkPlugin(context) {
   }
   let source = "";
   try {
-    source = readFileSync2(installedJson, "utf8");
+    source = readFileSync3(installedJson, "utf8");
   } catch {
   }
   const marker = source.indexOf('"constitution@ostrom"');
@@ -249,15 +366,15 @@ function checkPlugin(context) {
   const recordedVersion = field(block, "version");
   const pluginJson = join3(installPath, ".claude-plugin", "plugin.json");
   if (installPath && isFile2(pluginJson)) {
-    let version = "";
+    let version2 = "";
     try {
-      version = field(readFileSync2(pluginJson, "utf8"), "version");
+      version2 = field(readFileSync3(pluginJson, "utf8"), "version");
     } catch {
     }
     return {
       status: "OK",
       name: "plugin",
-      detail: `installed, version ${version}`,
+      detail: `installed, version ${version2}`,
       remedy: ""
     };
   }
@@ -289,7 +406,7 @@ import {
 import { dirname, join as join5 } from "node:path";
 
 // src/lib/config.ts
-import { existsSync, readFileSync as readFileSync3 } from "node:fs";
+import { existsSync, readFileSync as readFileSync4 } from "node:fs";
 import { join as join4 } from "node:path";
 function stripComment(input) {
   let singleQuoted = false;
@@ -365,7 +482,7 @@ function parseOstromYaml(source) {
 function load(path) {
   if (!existsSync(path)) return {};
   try {
-    return parseOstromYaml(readFileSync3(path, "utf8"));
+    return parseOstromYaml(readFileSync4(path, "utf8"));
   } catch {
     return {};
   }
@@ -561,6 +678,7 @@ function runDoctor(options) {
     checkPlugin(context),
     checkMarketplace(context),
     checkRulesLayers(context),
+    checkRuleDistribution(context),
     checkTouchDurability(context),
     checkProviderReachable(context),
     checkEnvironment(context),

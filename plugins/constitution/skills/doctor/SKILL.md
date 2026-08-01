@@ -24,6 +24,12 @@ clone's remote-tracking refs only) and always exits 0; each line is:
 STATUS|check-name|detail|remedy
 ```
 
+`rule-distribution` always reports the number of `^## ` rules in the
+installed payload. When an ostrom checkout is locatable, it also compares
+that count, the full rule content, and the constitution plugin version
+against the checkout. No checkout is a normal marketplace installation,
+so that case stays `OK` with only the installed count.
+
 ## 2. Resolve any DEFER first
 
 `provider-reachable` may come back `DEFER` for the `notion` provider —
@@ -59,7 +65,7 @@ checks carry it.
 
 ## 4. Keep it short, keep it clean
 
-If every check is `OK`, keep the whole report to a few lines — the seven
+If every check is `OK`, keep the whole report to a few lines — the eight
 check lines plus the verdict, nothing more.
 
 Never echo a secret, token, or the Notion data source id — the prober

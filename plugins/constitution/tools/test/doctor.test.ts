@@ -1,5 +1,6 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import {
+  cpSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -18,9 +19,9 @@ import { parseOstromYaml } from "../src/lib/config.js";
 import { runDoctor } from "../src/lib/doctor.js";
 import { formatResult, type CheckResult } from "../src/lib/result.js";
 
-const pluginRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
-const hook = join(pluginRoot, "hooks", "inject-constitution.sh");
-const frozenRules = join(pluginRoot, "rules", "frozen-rules.md");
+const sourcePluginRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+const hook = join(sourcePluginRoot, "hooks", "inject-constitution.sh");
+const frozenRules = join(sourcePluginRoot, "rules", "frozen-rules.md");
 const roots: string[] = [];
 
 interface Fixture {
@@ -79,17 +80,21 @@ function baseFixture(): Fixture {
   const installPath = join(root, "installed-constitution");
   mkdirSync(join(configDir, "plugins"), { recursive: true });
   mkdirSync(cwd, { recursive: true });
-  mkdirSync(join(installPath, ".claude-plugin"), { recursive: true });
-  writeFileSync(
-    join(installPath, ".claude-plugin", "plugin.json"),
-    '{"name":"constitution","version":"0.6.0"}\n',
-  );
+  mkdirSync(installPath, { recursive: true });
+  for (const directory of [".claude-plugin", "config", "hooks", "rules"]) {
+    cpSync(join(sourcePluginRoot, directory), join(installPath, directory), {
+      recursive: true,
+    });
+  }
+  const installedVersion = JSON.parse(
+    readFileSync(join(installPath, ".claude-plugin", "plugin.json"), "utf8"),
+  ).version as string;
   writeFileSync(
     join(configDir, "plugins", "installed_plugins.json"),
     JSON.stringify({
       plugins: {
         "constitution@ostrom": [
-          { installPath, version: "0.6.0" },
+          { installPath, version: installedVersion },
         ],
       },
     }),
@@ -102,7 +107,7 @@ function baseFixture(): Fixture {
 
 function run(fixture: Fixture, env: NodeJS.ProcessEnv = {}): string {
   return runDoctor({
-    pluginRoot,
+    pluginRoot: fixture.installPath,
     configDir: fixture.configDir,
     cwd: fixture.cwd,
     home: fixture.home,
@@ -123,7 +128,7 @@ function commonExpected(
     {
       status: "OK",
       name: "plugin",
-      detail: "installed, version 0.6.0",
+      detail: "installed, version 0.7.0",
       remedy: "",
     },
     {
@@ -133,6 +138,12 @@ function commonExpected(
       remedy: "",
     },
     { status: "OK", name: "rules-layers", detail: rulesDetail, remedy: "" },
+    {
+      status: "OK",
+      name: "rule-distribution",
+      detail: "installed payload has 4 frozen rules",
+      remedy: "",
+    },
     touch,
     provider,
     { status: "OK", name: "environment", detail: "local", remedy: "" },
@@ -158,6 +169,45 @@ function notionConfig(fixture: Fixture, extra = ""): void {
     join(configRepo, "config.yaml"),
     join(fixture.configDir, "ostrom", "config.yaml"),
   );
+}
+
+function fixtureRules(count: number, label = "rule"): string {
+  const headings = Array.from(
+    { length: count },
+    (_, index) => `## ${label} ${index + 1}\n\nbody ${index + 1}`,
+  );
+  return `# Frozen working conventions\n\n${headings.join("\n\n")}\n`;
+}
+
+function setInstalledPayload(
+  fixture: Fixture,
+  version: string,
+  rules: string,
+): void {
+  writeFileSync(
+    join(fixture.installPath, ".claude-plugin", "plugin.json"),
+    JSON.stringify({ name: "constitution", version }),
+  );
+  writeFileSync(
+    join(fixture.installPath, "rules", "frozen-rules.md"),
+    rules,
+  );
+}
+
+function wireRepoPayload(
+  fixture: Fixture,
+  version: string,
+  rules: string,
+): void {
+  initRepo(fixture.cwd, "README.md", "ostrom\n");
+  const constitution = join(fixture.cwd, "plugins", "constitution");
+  mkdirSync(join(constitution, ".claude-plugin"), { recursive: true });
+  mkdirSync(join(constitution, "rules"), { recursive: true });
+  writeFileSync(
+    join(constitution, ".claude-plugin", "plugin.json"),
+    JSON.stringify({ name: "constitution", version }),
+  );
+  writeFileSync(join(constitution, "rules", "frozen-rules.md"), rules);
 }
 
 afterEach(() => {
@@ -247,7 +297,7 @@ describe("doctor golden output", () => {
     const fixture = baseFixture();
     const missing = join(fixture.root, "does-not-exist");
     const report = runDoctor({
-      pluginRoot,
+      pluginRoot: fixture.installPath,
       configDir: missing,
       cwd: fixture.cwd,
       home: fixture.home,
@@ -257,7 +307,7 @@ describe("doctor golden output", () => {
       },
     });
 
-    expect(report.split("\n").filter(Boolean)).toHaveLength(7);
+    expect(report.split("\n").filter(Boolean)).toHaveLength(8);
     expect(existsSync(missing)).toBe(false);
   });
 
@@ -330,6 +380,60 @@ describe("doctor golden output", () => {
   });
 });
 
+describe("rule distribution", () => {
+  it("reports the installed rule count without warning when no checkout is present", () => {
+    const fixture = baseFixture();
+
+    expect(run(fixture)).toContain(
+      "OK|rule-distribution|installed payload has 4 frozen rules|\n",
+    );
+  });
+
+  it("names the silent distribution bug when counts differ at the same version", () => {
+    const fixture = baseFixture();
+    setInstalledPayload(fixture, "0.6.0", fixtureRules(3));
+    wireRepoPayload(fixture, "0.6.0", fixtureRules(4));
+
+    expect(run(fixture)).toContain(
+      "FAIL|rule-distribution|installed payload has 3 frozen rules; repo has 4 frozen rules; both declare version 0.6.0, but rule content differs — plugin payload changed without a version bump (silent distribution bug)|re-add the ostrom marketplace to refresh the installed payload, or bump the constitution plugin version in the repo\n",
+    );
+  });
+
+  it("detects changed rule content even when the heading count is unchanged", () => {
+    const fixture = baseFixture();
+    setInstalledPayload(fixture, "0.6.0", fixtureRules(4, "installed"));
+    wireRepoPayload(fixture, "0.6.0", fixtureRules(4, "repo"));
+
+    expect(run(fixture)).toContain(
+      "FAIL|rule-distribution|installed payload has 4 frozen rules; repo has 4 frozen rules; both declare version 0.6.0, but rule content differs — plugin payload changed without a version bump (silent distribution bug)|",
+    );
+  });
+
+  it("fails on a version mismatch even when the rule content matches", () => {
+    const fixture = baseFixture();
+    const rules = fixtureRules(4);
+    setInstalledPayload(fixture, "0.6.0", rules);
+    wireRepoPayload(fixture, "0.7.0", rules);
+
+    expect(run(fixture)).toContain(
+      "FAIL|rule-distribution|installed payload has 4 frozen rules; repo has 4 frozen rules; installed version 0.6.0, repo version 0.7.0|/plugin marketplace update ostrom; if the installed payload stays stale, remove and re-add the marketplace\n",
+    );
+  });
+
+  it("passes when the installed payload and repo declaration match", () => {
+    const fixture = baseFixture();
+    wireRepoPayload(
+      fixture,
+      "0.7.0",
+      readFileSync(join(fixture.installPath, "rules", "frozen-rules.md"), "utf8"),
+    );
+
+    expect(run(fixture)).toContain(
+      "OK|rule-distribution|installed payload has 4 frozen rules; repo has 4 frozen rules; both declare version 0.7.0|\n",
+    );
+  });
+});
+
 describe("supported config shape", () => {
   it("parses scalars, one nested level, inline lists, and comments", () => {
     expect(
@@ -361,7 +465,7 @@ describe("untouched SessionStart hook", () => {
       cwd: root,
       env: {
         ...process.env,
-        CLAUDE_PLUGIN_ROOT: pluginRoot,
+        CLAUDE_PLUGIN_ROOT: sourcePluginRoot,
         CLAUDE_CONFIG_DIR: configDir,
       },
       encoding: "utf8",

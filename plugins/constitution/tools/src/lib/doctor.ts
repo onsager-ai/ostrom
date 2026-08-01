@@ -2,7 +2,10 @@ import { checkEnvironment } from "../checks/environment.js";
 import { checkMarketplace } from "../checks/marketplace.js";
 import { checkConfigParser } from "../checks/parser.js";
 import { checkPlugin } from "../checks/plugin.js";
-import { checkRulesLayers } from "../checks/rules.js";
+import {
+  checkRuleDistribution,
+  checkRulesLayers,
+} from "../checks/rules.js";
 import {
   checkProviderReachable,
   checkTouchDurability,
@@ -31,6 +34,7 @@ export function runDoctor(options: DoctorOptions): string {
     checkPlugin(context),
     checkMarketplace(context),
     checkRulesLayers(context),
+    checkRuleDistribution(context),
     checkTouchDurability(context),
     checkProviderReachable(context),
     checkEnvironment(context),
