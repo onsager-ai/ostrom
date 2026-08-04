@@ -1348,4 +1348,197 @@ set -e
 [ "$auth_status" -eq 3 ]
 grep -q 'gh is not authenticated' <<<"$auth_message"
 
+# gate.yaml uses the mandate plugin's shipped < user < repo layering while
+# keeping its project schema separate from the private mandate roster.
+gate_layers="$fixture/gate-layers"
+mkdir -p "$gate_layers/config/ostrom" "$gate_layers/repo/.ostrom"
+cat >"$gate_layers/config/ostrom/gate.yaml" <<'YAML'
+provider: file
+bounce_all: []
+projects:
+  - repo: placeholder-org/placeholder-repo
+    required_checks:
+      - verify-*
+    bounce:
+      - path:protected/**
+    reserved:
+      - 41
+YAML
+cat >"$gate_layers/repo/.ostrom/gate.yaml" <<'YAML'
+bounce_all:
+  - title:*principal review*
+YAML
+gate_layered="$(
+  cd "$gate_layers/repo"
+  CLAUDE_CONFIG_DIR="$gate_layers/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash -c 'source "$CLAUDE_PLUGIN_ROOT/scripts/mandate-lib.sh"; mandate_load_gate_config'
+)"
+jq -e '
+  .provider == "file"
+  and .bounce_all == ["title:*principal review*"]
+  and .projects[0].repo == "placeholder-org/placeholder-repo"
+  and .projects[0].required_checks == ["verify-*"]
+  and .projects[0].bounce == ["path:protected/**"]
+  and .projects[0].reserved == [41]
+' <<<"$gate_layered" >/dev/null
+
+# The merge gate has a dedicated gh stub. No gate test can reach the network.
+gate_fixture="$fixture/gate"
+mkdir -p "$gate_fixture/config/ostrom" "$gate_fixture/repo" "$gate_fixture/bin"
+cat >"$gate_fixture/config/ostrom/gate.yaml" <<'YAML'
+provider: file
+bounce_all: []
+projects:
+  - repo: placeholder-org/placeholder-repo
+    required_checks:
+      - verify-*
+    bounce:
+      - title:*release*
+      - path:.github/workflows/**
+    reserved:
+      - 99
+YAML
+cat >"$gate_fixture/bin/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "$1 $2" = "pr view" ]; then
+  check_conclusion="SUCCESS"
+  if [ "${FAKE_GATE_MODE:-pass}" = "unknown-check" ]; then
+    check_conclusion="UNRECOGNIZED"
+  fi
+  jq -cn \
+    --argjson number "$3" \
+    --arg head "${FAKE_GATE_HEAD:-aaaaaaaaaaaaaaaa}" \
+    --arg conclusion "$check_conclusion" \
+    --arg title "$(
+      if [ "${FAKE_GATE_MODE:-pass}" = "tier" ]; then
+        printf '%s' 'release: publish placeholder artifact'
+      else
+        printf '%s' 'fix(core): safe placeholder change'
+      fi
+    )" '
+      {
+        number: $number,
+        title: $title,
+        author: {login: "builder-login"},
+        headRefOid: $head,
+        labels: [],
+        statusCheckRollup: [{
+          name: "verify-linux",
+          status: "COMPLETED",
+          conclusion: $conclusion
+        }],
+        closingIssuesReferences: []
+      }
+    '
+  exit 0
+fi
+if [ "$1 $2" = "pr diff" ]; then
+  if [ "${FAKE_GATE_MODE:-pass}" = "tier" ]; then
+    printf '%s\n' '.github/workflows/placeholder.yml'
+  else
+    printf '%s\n' 'src/placeholder.sh'
+  fi
+  exit 0
+fi
+if [ "$1 $2" = "api graphql" ]; then
+  if [ "${FAKE_GATE_MODE:-pass}" = "thread-author" ]; then
+    cat <<'JSON'
+{"data":{"repository":{"pullRequest":{"author":{"login":"builder-login"},"reviewThreads":{"nodes":[{"id":"THREAD_placeholder","isResolved":true,"resolvedBy":{"login":"builder-login"}}],"pageInfo":{"hasNextPage":false,"endCursor":"cursor-placeholder"}}}}}}
+JSON
+  else
+    cat <<'JSON'
+{"data":{"repository":{"pullRequest":{"author":{"login":"builder-login"},"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":"cursor-placeholder"}}}}}}
+JSON
+  fi
+  exit 0
+fi
+exit 1
+EOF
+chmod +x "$gate_fixture/bin/gh"
+
+run_gate() {
+  gate_mode="$1"
+  gate_number="$2"
+  gate_head="$3"
+  gate_output_file="$gate_fixture/$gate_mode-$gate_number-$gate_head.out"
+  set +e
+  (
+    cd "$gate_fixture/repo"
+    PATH="$gate_fixture/bin:$PATH" \
+      FAKE_GATE_MODE="$gate_mode" \
+      FAKE_GATE_HEAD="$gate_head" \
+      MANDATE_GATE_TIME="2026-08-04T12:00:00Z" \
+      CLAUDE_CONFIG_DIR="$gate_fixture/config" \
+      CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+      bash "$PLUGIN_ROOT/scripts/gate.sh" \
+        "placeholder-org/placeholder-repo#$gate_number"
+  ) >"$gate_output_file"
+  gate_status=$?
+  set -e
+  gate_output="$(cat "$gate_output_file")"
+}
+
+# All three verdicts retain distinct output and exit codes.
+run_gate pass 7 aaaaaaaaaaaaaaaa
+[ "$gate_status" -eq 0 ]
+grep -q '^verdict: pass ' <<<"$gate_output"
+grep -q '^condition required_checks: pass tier=content-derived ' <<<"$gate_output"
+grep -q '^condition review_threads: pass tier=content-derived ' <<<"$gate_output"
+
+run_gate tier 7 bbbbbbbbbbbbbbbb
+[ "$gate_status" -eq 1 ]
+grep -q '^verdict: fail ' <<<"$gate_output"
+tier_line="$(grep '^condition bounce_selectors: fail ' <<<"$gate_output")"
+grep -q 'tier=author-written,content-derived\|tier=content-derived,author-written' \
+  <<<"$tier_line"
+grep -q '"selector":"title:\*release\*","tier":"author-written"' \
+  <<<"$tier_line"
+grep -q '"selector":"path:.github/workflows/\*\*","tier":"content-derived"' \
+  <<<"$tier_line"
+
+run_gate unknown-check 7 cccccccccccccccc
+[ "$gate_status" -eq 2 ]
+grep -q '^verdict: inconclusive ' <<<"$gate_output"
+grep -q '^condition required_checks: inconclusive tier=content-derived ' \
+  <<<"$gate_output"
+
+# A thread closed by the PR author remains unresolved to the gate under #18.
+run_gate thread-author 7 dddddddddddddddd
+[ "$gate_status" -eq 1 ]
+grep -q '^condition review_threads: fail tier=content-derived ' <<<"$gate_output"
+grep -q '"resolved_by_pr_author":1' <<<"$gate_output"
+
+# Already-judged state is keyed by (PR, head SHA): an unchanged re-read is
+# marked, while a new commit on the same PR forces a fresh judgment.
+run_gate pass 8 eeeeeeeeeeeeeeee
+[ "$gate_status" -eq 0 ]
+grep -q 'already_judged=false$' <<<"$(head -n 1 <<<"$gate_output")"
+run_gate pass 8 eeeeeeeeeeeeeeee
+[ "$gate_status" -eq 0 ]
+grep -q 'already_judged=true$' <<<"$(head -n 1 <<<"$gate_output")"
+run_gate pass 8 ffffffffffffffff
+[ "$gate_status" -eq 0 ]
+grep -q 'already_judged=false$' <<<"$(head -n 1 <<<"$gate_output")"
+
+gate_log="$gate_fixture/config/ostrom/gate.jsonl"
+[ "$(wc -l <"$gate_log" | tr -d '[:space:]')" -eq 7 ]
+jq -s -e '
+  ([.[] | select(.pr == "placeholder-org/placeholder-repo#8")]
+    | map({head_sha, already_judged}))
+  == [
+    {head_sha: "eeeeeeeeeeeeeeee", already_judged: false},
+    {head_sha: "eeeeeeeeeeeeeeee", already_judged: true},
+    {head_sha: "ffffffffffffffff", already_judged: false}
+  ]
+  and all(.[];
+    (.conditions | length) == 4
+    and all(.conditions[];
+      has("result") and has("tier") and (.tier | type == "array")
+    )
+  )
+' "$gate_log" >/dev/null
+
 echo "mandate tests: ok"

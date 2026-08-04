@@ -10,6 +10,10 @@ MANDATE_DEFAULT_CONFIG="$MANDATE_PLUGIN_ROOT/config/defaults.yaml"
 MANDATE_QUEUE_FILE="$MANDATE_DATA_DIR/queue.jsonl"
 MANDATE_STATE_FILE="$MANDATE_DATA_DIR/state.json"
 MANDATE_EVENTS_FILE="$MANDATE_DATA_DIR/selector-events.jsonl"
+MANDATE_GATE_DEFAULT_CONFIG="$MANDATE_PLUGIN_ROOT/config/gate.defaults.yaml"
+MANDATE_GATE_USER_CONFIG="$MANDATE_DATA_DIR/gate.yaml"
+MANDATE_GATE_REPO_CONFIG="./.ostrom/gate.yaml"
+MANDATE_GATE_LOG="$MANDATE_DATA_DIR/gate.jsonl"
 
 mandate_is_configured() {
   [ -f "$MANDATE_USER_CONFIG" ] || [ -f "$MANDATE_REPO_CONFIG" ]
@@ -279,6 +283,229 @@ mandate_load_config() {
   fi
 
   printf '%s\n' "$config"
+}
+
+mandate_gate_is_configured() {
+  [ -f "$MANDATE_GATE_USER_CONFIG" ] || [ -f "$MANDATE_GATE_REPO_CONFIG" ]
+}
+
+# Parse gate.yaml's deliberately small schema. It mirrors the mandate roster's
+# project layering and selector vocabulary, but remains a separate config so
+# neither delivery role can change the conditions it is judged by.
+mandate_gate_yaml_to_json() {
+  gate_file="$1"
+  [ -f "$gate_file" ] || {
+    printf '{}\n'
+    return 0
+  }
+
+  awk '
+    function trim(s) {
+      sub(/^[[:space:]]+/, "", s)
+      sub(/[[:space:]]+$/, "", s)
+      return s
+    }
+    function unquote(s, first, last) {
+      s = trim(s)
+      first = substr(s, 1, 1)
+      last = substr(s, length(s), 1)
+      if (length(s) >= 2 && ((first == "\"" && last == "\"") || (first == "\047" && last == "\047"))) {
+        s = substr(s, 2, length(s) - 2)
+      }
+      return s
+    }
+    function fail(message) {
+      printf "%s:%d: gate config: %s\n", FILENAME, NR, message > "/dev/stderr"
+      failed = 1
+    }
+    BEGIN { section = ""; current_repo = ""; project_list = ""; failed = 0 }
+    {
+      raw = $0
+      if (raw ~ /\t/) {
+        fail("tabs are not supported")
+        next
+      }
+      sub(/[[:space:]]+#.*$/, "", raw)
+      if (raw ~ /^[[:space:]]*$/ || raw ~ /^[[:space:]]*#/) next
+
+      match(raw, /^ */)
+      indent = RLENGTH
+      text = substr(raw, indent + 1)
+
+      if (indent == 0) {
+        section = ""
+        current_repo = ""
+        project_list = ""
+        if (text == "bounce_all:") {
+          section = "bounce_all"
+          print "array\tbounce_all"
+        } else if (text == "bounce_all: []") {
+          print "array\tbounce_all"
+        } else if (text == "projects:") {
+          section = "projects"
+          print "array\tprojects"
+        } else if (text == "projects: []") {
+          print "array\tprojects"
+        } else if (text ~ /^provider:[[:space:]]*/) {
+          value = text
+          sub(/^provider:[[:space:]]*/, "", value)
+          value = unquote(value)
+          if (value == "") fail("empty provider")
+          else print "scalar\tprovider\t" value
+        } else {
+          fail("unsupported root entry: " text)
+        }
+        next
+      }
+
+      if (section == "bounce_all" && indent == 2 && text ~ /^-[[:space:]]+/) {
+        value = text
+        sub(/^-[[:space:]]+/, "", value)
+        value = unquote(value)
+        if (value == "") fail("empty bounce_all entry")
+        else print "bounce_all\t" value
+        next
+      }
+
+      if (section == "projects" && indent == 2 && text ~ /^-[[:space:]]+repo:[[:space:]]*/) {
+        value = text
+        sub(/^-[[:space:]]+repo:[[:space:]]*/, "", value)
+        current_repo = unquote(value)
+        project_list = ""
+        if (current_repo == "") fail("empty project repo")
+        else print "project\t" current_repo
+        next
+      }
+
+      if (section == "projects" && current_repo != "" && indent == 4 &&
+          (text ~ /^(required_checks|bounce|reserved):$/ ||
+           text ~ /^(required_checks|bounce|reserved): \[\]$/)) {
+        project_list = text
+        sub(/:.*/, "", project_list)
+        print "project_array\t" current_repo "\t" project_list
+        next
+      }
+      if (section == "projects" && current_repo != "" && indent == 6 && text ~ /^-[[:space:]]+/) {
+        value = text
+        sub(/^-[[:space:]]+/, "", value)
+        value = unquote(value)
+        if (project_list == "") fail("project list entry has no list heading for " current_repo)
+        else if (value == "") fail("empty project " project_list " entry")
+        else print "project_list\t" current_repo "\t" project_list "\t" value
+        next
+      }
+
+      fail("unsupported indentation or entry: " text)
+    }
+    END { if (failed) exit 2 }
+  ' "$gate_file" |
+    jq -Rn '
+      reduce inputs as $line ({};
+        ($line | split("\t")) as $parts
+        | if $parts[0] == "scalar" then
+            .[$parts[1]] = $parts[2]
+          elif $parts[0] == "array" then
+            .[$parts[1]] = []
+          elif $parts[0] == "bounce_all" then
+            .bounce_all += [$parts[1]]
+          elif $parts[0] == "project" then
+            .projects += [{
+              "repo": $parts[1],
+              "required_checks": [],
+              "bounce": [],
+              "reserved": []
+            }]
+          elif $parts[0] == "project_array" then
+            (.projects | map(.repo) | index($parts[1])) as $index
+            | if $index == null
+              then error("project list appeared before its repo")
+              else .projects[$index][$parts[2]] = []
+              end
+          elif $parts[0] == "project_list" then
+            (.projects | map(.repo) | index($parts[1])) as $index
+            | if $index == null
+              then error("project list entry appeared before its repo")
+              elif $parts[2] == "reserved"
+              then .projects[$index].reserved += [
+                ($parts[3] | ltrimstr("#") | tonumber)
+              ]
+              else .projects[$index][$parts[2]] += [$parts[3]]
+              end
+          else error("unknown parser record")
+          end
+      )
+    '
+}
+
+mandate_load_gate_config() {
+  gate_shipped="$(mandate_gate_yaml_to_json "$MANDATE_GATE_DEFAULT_CONFIG")" || return
+  gate_user="$(mandate_gate_yaml_to_json "$MANDATE_GATE_USER_CONFIG")" || return
+  gate_repo="$(mandate_gate_yaml_to_json "$MANDATE_GATE_REPO_CONFIG")" || return
+
+  gate_config="$(
+    jq -cn \
+      --argjson shipped "$gate_shipped" \
+      --argjson user "$gate_user" \
+      --argjson repo "$gate_repo" \
+      '$shipped * $user * $repo'
+  )" || return
+
+  if ! jq -e '
+    .provider == "file"
+    and (.bounce_all | type == "array" and all(.[]; type == "string" and length > 0))
+    and (.projects | type == "array")
+    and all(.projects[];
+      (.repo | type == "string" and test("^[^/[:space:]]+/[^/[:space:]]+$"))
+      and (.required_checks | type == "array" and all(.[]; type == "string" and length > 0))
+      and (.bounce | type == "array" and all(.[]; type == "string" and length > 0))
+      and (.reserved | type == "array" and all(.[]; type == "number" and . > 0 and . == floor))
+    )
+    and (([.projects[].repo] | length) == ([.projects[].repo] | unique | length))
+  ' >/dev/null <<<"$gate_config"; then
+    echo "mandate gate: invalid config; provider must be file, every project must have a unique owner/name repo, required-check and bounce selectors must be non-empty strings, and reserved refs must be positive integers" >&2
+    return 2
+  fi
+
+  gate_selector_error="$(
+    jq -r '
+      def selector_records:
+        (.bounce_all[]? | {where: "bounce_all", selector: .}),
+        (.projects[]? as $project
+          | ($project.bounce[]? | {
+              where: ($project.repo + " bounce"), selector: .
+            })
+        );
+      def lint:
+        .selector as $selector
+        | ((try ($selector | capture("^(?<prefix>[^:]+):(?<glob>.*)$")) catch null) // null) as $parsed
+        | if $parsed == null or
+             ($parsed.prefix | IN("label", "scope", "type", "path", "ref", "title") | not)
+          then "unknown selector prefix"
+          elif $parsed.glob == ""
+          then "selector value is empty"
+          elif $parsed.prefix == "ref" and
+               ($parsed.glob | test("^#[1-9][0-9]*$") | not)
+          then "ref selector must be ref:#N"
+          elif $parsed.prefix == "title" and
+               ($parsed.glob | contains("*") | not)
+          then "title selector must contain *"
+          elif $parsed.prefix == "title" and
+               (($parsed.glob | split("*") | map(length) | max) > 24)
+          then "title selector literal run exceeds 24 characters"
+          else empty
+          end;
+      first(selector_records as $record
+        | ($record | lint) as $message
+        | "\($record.where) selector \"\($record.selector)\": \($message)"
+      ) // empty
+    ' <<<"$gate_config"
+  )" || return
+  if [ -n "$gate_selector_error" ]; then
+    echo "mandate gate: invalid config: $gate_selector_error" >&2
+    return 2
+  fi
+
+  printf '%s\n' "$gate_config"
 }
 
 mandate_read_queue() {
