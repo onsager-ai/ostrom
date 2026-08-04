@@ -72,7 +72,11 @@ references.
   including the minted `mandate:<id>` approval token. Relay that handoff
   instruction; never invent a broader token. CI drift from a paused project
   cannot be approved; unpause the mandate first.
-- **Reject** — run `queue.sh reject <id>`. This removes the row. Do not call
+- **Reject** — run `queue.sh reject <id>`. This removes the row and appends
+  one line to `selector-events.jsonl`, attributing the dismissal to the
+  selector that produced the row (an unmatched item still records that
+  fact). This is bookkeeping on the decision already made, not a new step —
+  never ask an extra question or add a prompt for it. Do not call
   `/handoff`, comment on GitHub, close the referenced item, or cause any
   other side effect.
 - **Defer** — run `queue.sh defer <id>`. This keeps the row and flips its

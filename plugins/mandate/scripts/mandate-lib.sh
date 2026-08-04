@@ -9,6 +9,7 @@ MANDATE_REPO_CONFIG="./.ostrom/mandates.yaml"
 MANDATE_DEFAULT_CONFIG="$MANDATE_PLUGIN_ROOT/config/defaults.yaml"
 MANDATE_QUEUE_FILE="$MANDATE_DATA_DIR/queue.jsonl"
 MANDATE_STATE_FILE="$MANDATE_DATA_DIR/state.json"
+MANDATE_EVENTS_FILE="$MANDATE_DATA_DIR/selector-events.jsonl"
 
 mandate_is_configured() {
   [ -f "$MANDATE_USER_CONFIG" ] || [ -f "$MANDATE_REPO_CONFIG" ]
@@ -339,4 +340,45 @@ mandate_write_if_changed() {
     return 0
   fi
   mv "$source_file" "$destination"
+}
+
+# Append one line to the selector-events log: a queue decision plus the
+# selector and classification that produced the row it was decided about.
+# The lookup is read-only against the last sweep's state; the append is the
+# only write. An item absent from state (state.json missing, or the row
+# predates any sweep that classified it) still gets a row with null fields
+# instead of silently vanishing — the point is that every decision leaves a
+# trace, not that every trace is fully attributed.
+mandate_log_selector_event() {
+  event_id="$1"
+  event_repo="$2"
+  event_decision="$3"
+
+  lookup='{"matched_selector":null,"classification":null}'
+  if [ -s "$MANDATE_STATE_FILE" ]; then
+    lookup="$(
+      jq -c --arg repo "$event_repo" --arg id "$event_id" '
+        (.repos[$repo].items[$id] // {}) as $item
+        | {
+            matched_selector: ($item.matched_selector // null),
+            classification: ($item.classification // null)
+          }
+      ' "$MANDATE_STATE_FILE" 2>/dev/null
+    )" || lookup='{"matched_selector":null,"classification":null}'
+  fi
+
+  mkdir -p "$MANDATE_DATA_DIR"
+  jq -cn \
+    --arg ts "${MANDATE_EVENT_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" \
+    --arg id "$event_id" \
+    --arg decision "$event_decision" \
+    --argjson lookup "$lookup" '
+      {
+        ts: $ts,
+        id: $id,
+        decision: $decision,
+        matched_selector: $lookup.matched_selector,
+        classification: $lookup.classification
+      }
+    ' >>"$MANDATE_EVENTS_FILE"
 }
