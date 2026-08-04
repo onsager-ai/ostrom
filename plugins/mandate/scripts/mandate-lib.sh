@@ -368,17 +368,28 @@ mandate_log_selector_event() {
   fi
 
   mkdir -p "$MANDATE_DATA_DIR"
-  jq -cn \
-    --arg ts "${MANDATE_EVENT_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" \
-    --arg id "$event_id" \
-    --arg decision "$event_decision" \
-    --argjson lookup "$lookup" '
-      {
-        ts: $ts,
-        id: $id,
-        decision: $decision,
-        matched_selector: $lookup.matched_selector,
-        classification: $lookup.classification
-      }
-    ' >>"$MANDATE_EVENTS_FILE"
+  # Build the line in a variable and append it with one printf call rather
+  # than redirecting jq's stdout with >>: jq is not guaranteed to write its
+  # output in a single write(2), so two concurrent /desk actions could
+  # interleave partial lines and corrupt the JSONL. A single printf is one
+  # write and, being under PIPE_BUF, is atomic under O_APPEND — this only
+  # narrows the race, it does not close it (a write at or above PIPE_BUF, or
+  # a non-POSIX filesystem, can still interleave); a real guarantee needs
+  # file locking, deliberately not added here.
+  event_line="$(
+    jq -cn \
+      --arg ts "${MANDATE_EVENT_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" \
+      --arg id "$event_id" \
+      --arg decision "$event_decision" \
+      --argjson lookup "$lookup" '
+        {
+          ts: $ts,
+          id: $id,
+          decision: $decision,
+          matched_selector: $lookup.matched_selector,
+          classification: $lookup.classification
+        }
+      '
+  )"
+  printf '%s\n' "$event_line" >>"$MANDATE_EVENTS_FILE"
 }
