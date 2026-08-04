@@ -156,6 +156,42 @@ records are rejected instead of risking an interleaved append.
 The lease and trace are machine-local runtime state. Like the real roster,
 queue, and read cursors, they never belong in this repository.
 
+### After implementation: the gatekeeper loop
+
+The builder implements work, opens a pull request, and **stops**. It never
+merges its own delivery. In a separate session, the gatekeeper polls every
+repository in the mandate roster, evaluates each open pull request from its
+current GitHub artifacts through `/merge`, and takes only the action the gate
+permits: merge a pass, report a fail, or escalate an inconclusive result to the
+principal. The gatekeeper does not write code, suggest fixes, or review for
+quality. The builder's only response is a new commit.
+
+The principal starts and owns that separate gatekeeper session and answers its
+escalations. The builder must not start it: whoever controls when review runs
+can also decide when it does not. A different model from the builder is
+recommended, not required; the separate role provides structural independence,
+and a different model adds cognitive independence.
+
+From a project where the `mandate` plugin is installed, the principal starts a
+dedicated gatekeeper session with the same recurring wake mechanism as the
+sprint loop:
+
+```sh
+claude "/loop 30m /gatekeep"
+```
+
+Thirty to sixty minutes is the recommended polling period; the principal may
+choose within that range, but the gatekeeper should not run faster than the
+builder's sprint pass. Each wake covers all open pull requests and treats each
+one independently. An inconclusive result escalates once for a given pull
+request head SHA and then stays quiet until the artifact changes; repetition
+never turns it into a pass.
+
+The cost is explicit: **nothing merges while no gatekeeper is running**. That
+is the intended price of keeping merge authority out of the builder, not a
+defect or a hidden background service. Claude Code's `/loop` is session-scoped,
+so closing the gatekeeper session stops the polling.
+
 ### Selector accuracy
 
 `/desk lint` reports selectors that matched nothing, which is config hygiene,
