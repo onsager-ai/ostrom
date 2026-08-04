@@ -38,8 +38,15 @@ authorship. Do not accept those inputs from the builder. Do not re-derive,
 reinterpret, or override the verdict.
 
 The verdict line includes `already_judged=true|false`, keyed on the PR and its
-current head SHA. This marker controls duplicate comments only; it never
-changes the verdict.
+current head SHA. This marker controls **delivery only** — whether a report
+already sent for this exact artifact is sent again. It never changes the
+verdict, the action taken, or how the verdict is recorded.
+
+A caller running this protocol on a schedule may therefore suppress a repeated
+delivery for an unchanged head SHA; `/gatekeep` does exactly that, so an
+unevaluable condition escalates once instead of every wake. Suppression is the
+caller's, is always about delivery, and never converts `inconclusive` into
+`pass`. A new commit is a new head SHA and reports again.
 
 ## 3. Apply exactly the verdict
 
