@@ -119,6 +119,43 @@ the last sweep; unmatched selectors never add daily digest lines.
 Baseline and mandate-change summaries render once, then are acknowledged in
 the private state so they do not become permanent session noise.
 
+### Sprint lease and trace
+
+Builder wakes coordinate through a lease file at
+`${CLAUDE_CONFIG_DIR:-$HOME/.claude}/ostrom/sprint.lease`. Run
+`scripts/lease.sh acquire <owner> [ttl-seconds]` before starting work,
+`scripts/lease.sh release <owner>` when finished, and `scripts/lease.sh status`
+to inspect the current record. The file contains one JSON object with
+`owner`, `started_at`, and `expires_at` (times are Unix seconds). Creating the
+file with Bash `noclobber` uses O_EXCL semantics as the atomic acquisition
+point, so concurrent builders cannot both win. A held lease cannot be replaced
+before expiry, an expired lease can be reclaimed, and only its owner can
+release it. Release and expiry replacement use a short-lived O_EXCL guard only
+to serialize deletion; the guard contains no lease or trace data and is
+removed before normal return.
+
+Meaningful builder steps append to
+`${CLAUDE_CONFIG_DIR:-$HOME/.claude}/ostrom/sprint.jsonl` with:
+
+```json
+{"ts":"2026-01-01T00:00:00Z","kind":"commit","fact":{"sha":"0123456789abcdef"},"narration":{"reason":"placeholder change"}}
+```
+
+Use `scripts/trace.sh append <kind> <fact-json> <narration-json>` to write a
+record. `fact` holds actions, artifacts, identifiers, external results, and
+exit codes; `narration` holds reasons, beliefs, and conclusions. A builder or
+gatekeeper consuming another builder's trace uses `scripts/trace.sh read`,
+which emits only `ts`, `kind`, and `fact`. Narration is for the principal and
+requires the explicit `scripts/trace.sh read-narration` verb. This structural
+split prevents one builder's narration from becoming another builder's input.
+
+Each trace record, including its newline, is limited to 4096 bytes and is
+appended by one shell `printf`, matching the queue JSONL discipline. Oversized
+records are rejected instead of risking an interleaved append.
+
+The lease and trace are machine-local runtime state. Like the real roster,
+queue, and read cursors, they never belong in this repository.
+
 ### Selector accuracy
 
 `/desk lint` reports selectors that matched nothing, which is config hygiene,
