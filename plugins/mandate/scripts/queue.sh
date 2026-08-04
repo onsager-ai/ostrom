@@ -77,10 +77,17 @@ case "$action" in
         ' <<<"$approved"
         ;;
       reject)
+        row_repo="$(jq -r '.repo' <<<"$row")"
         jq -c --arg id "$id" 'map(select(.id != $id))[]' <<<"$queue" >"$tmp"
         mandate_write_if_changed "$tmp" "$MANDATE_QUEUE_FILE"
         rm -f "$tmp"
         trap - EXIT
+        # A rejection is a candidate false alarm: the queue put something in
+        # front of the human that did not warrant it. Attribute it to the
+        # selector that produced the row — including the "no selector
+        # matched" case, which must not be dropped either. No prompt, no
+        # extra step: this is bookkeeping on a decision already made.
+        mandate_log_selector_event "$id" "$row_repo" "reject"
         printf '%s\n' "$row"
         ;;
       defer)

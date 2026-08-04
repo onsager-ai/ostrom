@@ -232,8 +232,17 @@ JSON
 [{"number":18,"title":"spec(launch): public announcement","labels":[],"createdAt":"2026-07-30T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/pull/18","isDraft":false,"reviewDecision":"","statusCheckRollup":[{"conclusion":"SUCCESS","status":"COMPLETED"}],"closingIssuesReferences":[{"number":14,"labels":[]}],"files":[]},{"number":17,"title":"spec(launch): installation guide","labels":[],"createdAt":"2026-07-30T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/pull/17","isDraft":false,"reviewDecision":"","statusCheckRollup":[{"conclusion":"SUCCESS","status":"COMPLETED"}],"closingIssuesReferences":[{"number":15,"labels":[]}],"files":[]},{"number":19,"title":"spec(launch): release checklist","labels":[],"createdAt":"2026-07-30T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/pull/19","isDraft":false,"reviewDecision":"","statusCheckRollup":[{"conclusion":"SUCCESS","status":"COMPLETED"}],"closingIssuesReferences":[{"number":16,"labels":[]}],"files":[]}]
 JSON
       ;;
+    example-org/replay-repo)
+      cat <<'JSON'
+[{"number":101,"title":"chore: rotate deploy workflow","labels":[],"url":"https://example.invalid/pull/101","baseRefName":"main","mergedAt":"2026-07-15T00:00:00Z","closingIssuesReferences":[],"files":[{"path":".github/workflows/deploy.yml"}]},{"number":102,"title":"chore: production deployment prep","labels":[],"url":"https://example.invalid/pull/102","baseRefName":"main","mergedAt":"2026-07-16T00:00:00Z","closingIssuesReferences":[],"files":[{"path":".github/workflows/publish.yml"}]},{"number":100,"title":"chore: ancient workflow tweak","labels":[],"url":"https://example.invalid/pull/100","baseRefName":"main","mergedAt":"2020-01-01T00:00:00Z","closingIssuesReferences":[],"files":[{"path":".github/workflows/old.yml"}]}]
+JSON
+      ;;
     *) echo '[]' ;;
   esac
+  exit 0
+fi
+if [ "$1 $2" = "repo view" ]; then
+  echo '{"defaultBranchRef":{"name":"main"}}'
   exit 0
 fi
 exit 1
@@ -667,6 +676,104 @@ if jq -e 'select(.id == "example-org/example-repo#12")' "$queue" >/dev/null; the
   echo "rejected row remained in queue" >&2
   exit 1
 fi
+
+# A rejection appends exactly one line to selector-events.jsonl, attributing
+# the dismissal to the selector that produced the row. #12 was a tripwire
+# matched via the project's bounce path selector.
+events_file="$fixture/config/ostrom/selector-events.jsonl"
+[ -f "$events_file" ]
+[ "$(wc -l <"$events_file")" -eq 1 ]
+jq -e '
+  .id == "example-org/example-repo#12"
+  and .decision == "reject"
+  and .matched_selector == "path:rules/frozen-rules.md"
+  and .classification == "tripwire"
+  and ((.ts | type) == "string")
+' "$events_file" >/dev/null
+
+# Rejecting an item that matched no selector — #13 fell through to the
+# project default — records that fact instead of being dropped. The
+# sentinel "default:unclassified" is exactly what classify() already
+# produces for a no-match; nothing new is invented for the event log.
+CLAUDE_CONFIG_DIR="$fixture/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+  bash "$PLUGIN_ROOT/scripts/queue.sh" reject 'example-org/example-repo#13' >/dev/null
+if jq -e 'select(.id == "example-org/example-repo#13")' "$queue" >/dev/null; then
+  echo "rejected row remained in queue" >&2
+  exit 1
+fi
+[ "$(wc -l <"$events_file")" -eq 2 ]
+jq -s -e '
+  any(.[];
+    .id == "example-org/example-repo#13"
+    and .decision == "reject"
+    and .matched_selector == "default:unclassified"
+    and .classification == "unclassified"
+  )
+' "$events_file" >/dev/null
+
+# replay.sh per-selector report: state.json already has many classified
+# items and selector-events.jsonl already has the two rejections above (one
+# attributed to a selector, one attributed to no selector at all). Neither
+# fixture repo's static PR data carries a mergedAt, so this run exercises
+# only the report half, not the miss half.
+replay_fixture_output="$(
+  CLAUDE_CONFIG_DIR="$fixture/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    PATH="$fixture/bin:$PATH" \
+    MANDATE_REPLAY_TIME="2026-08-01T00:00:00Z" \
+    bash "$PLUGIN_ROOT/scripts/replay.sh" 30
+)"
+grep -q 'lower bound' <<<"$replay_fixture_output"
+grep -q '^  none flagged$' <<<"$replay_fixture_output"
+printf '%s\n' "$replay_fixture_output" | grep -Fq \
+  "$(printf 'content-derived\texample-org/example-repo\tproject bounce\tpath:rules/frozen-rules.md\t1\t1')"
+grep -q '^Dismissals attributed to no selector (the project default fired instead): 1$' \
+  <<<"$replay_fixture_output"
+grep -q '^Unmatched irreversible-surface merges (misses, lower bound): 0$' \
+  <<<"$replay_fixture_output"
+if grep -Eqi 'accuracy|[0-9]%' <<<"$replay_fixture_output"; then
+  echo "replay report collapsed the two error types into a single score" >&2
+  exit 1
+fi
+
+# replay.sh miss detection, in a dedicated repo with three merged PRs. #101
+# touches a workflow file and matches no bounce selector — a miss. #102
+# touches a workflow file too, but its title matches the project's bounce
+# selector, so the tripwire would have fired — not a miss. #100 would also
+# be a miss but merged outside the lookback window, proving the window is
+# honored rather than scanning full history.
+replay_dir="$fixture/replay"
+mkdir -p "$replay_dir/config/ostrom" "$replay_dir/repo"
+cat >"$replay_dir/config/ostrom/mandates.yaml" <<'YAML'
+bounce_all: []
+projects:
+  - repo: example-org/replay-repo
+    delegated: []
+    excluded: []
+    reserved: []
+    default: excluded
+    paused: false
+    bounce:
+      - title:*production deployment*
+YAML
+replay_miss_output="$(
+  cd "$replay_dir/repo"
+  CLAUDE_CONFIG_DIR="$replay_dir/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    PATH="$fixture/bin:$PATH" \
+    MANDATE_REPLAY_TIME="2026-08-01T00:00:00Z" \
+    bash "$PLUGIN_ROOT/scripts/replay.sh" 30
+)"
+grep -q 'example-org/replay-repo#101' <<<"$replay_miss_output"
+if grep -q 'example-org/replay-repo#102' <<<"$replay_miss_output"; then
+  echo "replay flagged a PR that matched a bounce selector" >&2
+  exit 1
+fi
+if grep -q 'example-org/replay-repo#100' <<<"$replay_miss_output"; then
+  echo "replay flagged a merged PR outside its lookback window" >&2
+  exit 1
+fi
+grep -q 'workflow file: .github/workflows/deploy.yml' <<<"$replay_miss_output"
+grep -q '^Unmatched irreversible-surface merges (misses, lower bound): 1$' \
+  <<<"$replay_miss_output"
 
 # The fixture shape is three issues plus the three PRs that close them.
 # Prefer the PRs, retain their recognizable titles, and name each collapsed
