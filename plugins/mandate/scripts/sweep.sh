@@ -441,7 +441,10 @@ while IFS= read -r project; do
               if $initial or $policy_changed then $safety
               else $event and (
                 $safety
-                or (($project.paused | not) and $item.classification.terminal == "delegated")
+                or (
+                  ($project.paused | not)
+                  and ($item.classification.terminal | IN("delegated", "unclassified"))
+                )
               )
               end
             )
@@ -456,6 +459,15 @@ while IFS= read -r project; do
                 {
                   kind: "tripwire",
                   reason: ("tripwire: " + match_reason($item.classification))
+                }
+              elif $item.classification.terminal == "unclassified" then
+                {
+                  kind: "decision",
+                  reason: (
+                    "no selector matched ("
+                    + match_reason($item.classification)
+                    + "); classification needed"
+                  )
                 }
               elif $item.type == "pr" and $item.ci == "failing" then
                 {

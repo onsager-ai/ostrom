@@ -203,6 +203,15 @@ JSON
         }]
       '
       ;;
+    example-org/uncat-repo)
+      uncat_title="Untriaged sample issue"
+      if [ "${FAKE_GH_MODE:-base}" = "retitled" ]; then
+        uncat_title="Untriaged sample issue (retitled)"
+      fi
+      cat <<JSON
+[{"number":30,"title":"$uncat_title","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/30"}]
+JSON
+      ;;
     *) echo '[]' ;;
   esac
   exit 0
@@ -272,8 +281,12 @@ jq -s -e '
   and .[0].blocked_by == ["example-org/large-body#123"]
 ' "$large_body/config/ostrom/queue.jsonl" >/dev/null
 
-# The first sweep is a baseline. Only reserved, tripwire, and drift carve-outs
-# queue; the paused project's issue tripwire still fires.
+# The first sweep is a baseline. Only reserved, tripwire, and CI-failing
+# carve-outs queue; the paused project's issue tripwire still fires. #13 is
+# both unclassified and CI-failing: the unclassified branch of the kind
+# ladder outranks CI-failing, so it surfaces as a decision ("no selector
+# matched") rather than a drift row — an agent can't act on either fact
+# until a human classifies it.
 run_sweep >/dev/null
 queue="$fixture/config/ostrom/queue.jsonl"
 state="$fixture/config/ostrom/state.json"
@@ -289,7 +302,9 @@ jq -e '
     and has("recommended_action") and has("blast_radius"))
 ' "$queue" >/dev/null
 jq -e '
-  select(.id == "example-org/example-repo#13" and .kind == "drift")
+  select(.id == "example-org/example-repo#13" and .kind == "decision")
+  | .mandate.reason
+      == "no selector matched (default:unclassified); classification needed"
 ' "$queue" >/dev/null
 jq -e '
   select(.id == "example-org/example-repo#14" and .kind == "tripwire")
@@ -339,8 +354,8 @@ jq -s -e '
   )
   and any(.[];
     .id == "example-org/example-repo#13"
-    and .kind == "drift"
-    and .needs_judgment == false
+    and .kind == "decision"
+    and .needs_judgment == true
     and .blocked_by == []
   )
 ' "$queue" >/dev/null
@@ -454,7 +469,7 @@ grep -q \
   '^example-org/example-repo#10  feat(tooling): owner gate — reserved ref:#10$' \
   <<<"$digest_text"
 grep -q \
-  '^example-org/example-repo#13  (title unavailable) — CI is failing; default:unclassified$' \
+  '^example-org/example-repo#13  (title unavailable) — no selector matched (default:unclassified); classification needed$' \
   <<<"$digest_text"
 grep -q \
   '^example-org/example-repo#14  Rotate credential safely — tripwire: bounce_all title:\*credential\*$' \
@@ -997,6 +1012,62 @@ stale_digest_text="$(jq -r '.systemMessage' <<<"$stale_digest")"
 [ "$(wc -l <<<"$stale_digest_text")" -eq 2 ]
 grep -q '^STALE — mandate sweep overdue$' <<<"$stale_digest_text"
 grep -q '^2 projects nominal$' <<<"$stale_digest_text"
+
+# Unclassified items are event-gated, not safety carve-outs: a dormant
+# unclassified item stays invisible sweep after sweep, but the moment it
+# moves (a title/fingerprint change) it surfaces as a decision — the
+# invisibility the audit found is fixed without dumping the whole dormant
+# backlog into one digest.
+uncat="$fixture/uncat"
+mkdir -p "$uncat/config/ostrom" "$uncat/repo"
+cat >"$uncat/config/ostrom/mandates.yaml" <<'YAML'
+bounce_all: []
+projects:
+  - repo: example-org/uncat-repo
+    delegated: []
+    excluded: []
+    reserved: []
+    default: unclassified
+    paused: false
+    bounce: []
+YAML
+run_uncat_sweep() {
+  (
+    cd "$uncat/repo"
+    PATH="$fixture/bin:$PATH" \
+      FAKE_GH_MODE="${FAKE_GH_MODE:-base}" \
+      CLAUDE_CONFIG_DIR="$uncat/config" \
+      CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+      bash "$PLUGIN_ROOT/scripts/sweep.sh"
+  )
+}
+uncat_queue="$uncat/config/ostrom/queue.jsonl"
+
+# Baseline sweep: unclassified is not a safety carve-out, so it does not
+# queue even on the very first sweep.
+run_uncat_sweep >/dev/null
+jq -e '
+  .repos["example-org/uncat-repo"].items["example-org/uncat-repo#30"]
+    .classification == "unclassified"
+' "$uncat/config/ostrom/state.json" >/dev/null
+[ ! -s "$uncat_queue" ] || [ "$(jq -s 'length' "$uncat_queue")" -eq 0 ]
+
+# A steady-state resweep with no upstream change is also silent: the
+# event-gated branch requires an event, and there is none.
+run_uncat_sweep >/dev/null
+[ ! -s "$uncat_queue" ] || [ "$(jq -s 'length' "$uncat_queue")" -eq 0 ]
+
+# A title change is a fingerprint event: the item now surfaces as a
+# decision, since nobody has said whether an agent may act on it.
+FAKE_GH_MODE=retitled run_uncat_sweep >/dev/null
+jq -e '
+  select(.id == "example-org/uncat-repo#30")
+  | .kind == "decision"
+  and .needs_judgment == true
+  and .mandate.reason
+    == "no selector matched (default:unclassified); classification needed"
+' "$uncat_queue" >/dev/null
+[ "$(jq -s 'length' "$uncat_queue")" -eq 1 ]
 
 empty="$fixture/empty-config"
 mkdir -p "$empty"
