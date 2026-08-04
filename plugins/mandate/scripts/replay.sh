@@ -216,13 +216,17 @@ while IFS= read -r project; do
           (
             [$item.files[]? | select(credential_shaped(.))]
             | if length > 0 then "credential-shaped path: " + .[0] else empty end
-          ),
-          (
-            if ($default_branch | length) > 0 and $item.base == $default_branch
-            then "merged directly to the default branch (" + $default_branch + ")"
-            else empty
-            end
           )
+          # Deliberately NOT a trigger: a base branch equal to the default one.
+          # #17 meant a change reaching the default branch WITHOUT review, i.e.
+          # a direct push. Read as "PR merged into main" it fires on every
+          # ordinary PR in a trunk-based repo: measured against the real
+          # portfolio it flagged 235 of 277 items on that condition alone,
+          # burying the 41 citing an actual content signal. A trigger that
+          # fires on nearly everything cannot discriminate, and the miss count
+          # it produces is unreadable. Detecting genuine review bypass needs
+          # commit-level data, a default-branch commit with no associated PR,
+          # which is a separate signal and not derivable from this PR scan.
         ];
 
       [
