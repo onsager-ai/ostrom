@@ -46,6 +46,137 @@ YAML
 }
 write_config
 
+# The sprint lease file is acquired with noclobber/O_EXCL. Concurrent builders
+# therefore cannot both win, and ownership protects release.
+lease_concurrent="$fixture/lease-concurrent"
+mkdir -p "$lease_concurrent/ostrom"
+set +e
+CLAUDE_CONFIG_DIR="$lease_concurrent" MANDATE_LEASE_NOW_EPOCH=100 \
+  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire builder-alpha 60 \
+  >"$lease_concurrent/alpha.out" 2>"$lease_concurrent/alpha.err" &
+lease_alpha_pid=$!
+CLAUDE_CONFIG_DIR="$lease_concurrent" MANDATE_LEASE_NOW_EPOCH=100 \
+  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire builder-beta 60 \
+  >"$lease_concurrent/beta.out" 2>"$lease_concurrent/beta.err" &
+lease_beta_pid=$!
+wait "$lease_alpha_pid"
+lease_alpha_status=$?
+wait "$lease_beta_pid"
+lease_beta_status=$?
+set -e
+[ $(( (lease_alpha_status == 0) + (lease_beta_status == 0) )) -eq 1 ]
+concurrent_lease="$(
+  CLAUDE_CONFIG_DIR="$lease_concurrent" \
+    bash "$PLUGIN_ROOT/scripts/lease.sh" status
+)"
+jq -e '
+  (.owner == "builder-alpha" or .owner == "builder-beta")
+  and .started_at == 100
+  and .expires_at == 160
+' <<<"$concurrent_lease" >/dev/null
+
+lease_expiry="$fixture/lease-expiry"
+CLAUDE_CONFIG_DIR="$lease_expiry" MANDATE_LEASE_NOW_EPOCH=200 \
+  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire builder-alpha 10 >/dev/null
+lease_before="$(
+  CLAUDE_CONFIG_DIR="$lease_expiry" bash "$PLUGIN_ROOT/scripts/lease.sh" status
+)"
+set +e
+CLAUDE_CONFIG_DIR="$lease_expiry" MANDATE_LEASE_NOW_EPOCH=209 \
+  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire builder-beta 10 >/dev/null 2>&1
+unexpired_status=$?
+set -e
+[ "$unexpired_status" -ne 0 ]
+lease_after_unexpired="$(
+  CLAUDE_CONFIG_DIR="$lease_expiry" bash "$PLUGIN_ROOT/scripts/lease.sh" status
+)"
+[ "$lease_before" = "$lease_after_unexpired" ]
+CLAUDE_CONFIG_DIR="$lease_expiry" MANDATE_LEASE_NOW_EPOCH=210 \
+  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire builder-beta 10 >/dev/null
+jq -e '
+  .owner == "builder-beta"
+  and .started_at == 210
+  and .expires_at == 220
+' <<<"$(
+  CLAUDE_CONFIG_DIR="$lease_expiry" bash "$PLUGIN_ROOT/scripts/lease.sh" status
+)" >/dev/null
+
+lease_release="$fixture/lease-release"
+CLAUDE_CONFIG_DIR="$lease_release" MANDATE_LEASE_NOW_EPOCH=300 \
+  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire builder-alpha 10 >/dev/null
+release_before="$(
+  CLAUDE_CONFIG_DIR="$lease_release" bash "$PLUGIN_ROOT/scripts/lease.sh" status
+)"
+set +e
+CLAUDE_CONFIG_DIR="$lease_release" \
+  bash "$PLUGIN_ROOT/scripts/lease.sh" release builder-beta >/dev/null 2>&1
+non_owner_status=$?
+set -e
+[ "$non_owner_status" -ne 0 ]
+[ "$release_before" = "$(
+  CLAUDE_CONFIG_DIR="$lease_release" bash "$PLUGIN_ROOT/scripts/lease.sh" status
+)" ]
+CLAUDE_CONFIG_DIR="$lease_release" \
+  bash "$PLUGIN_ROOT/scripts/lease.sh" release builder-alpha
+[ ! -e "$lease_release/ostrom/sprint.lease" ]
+[ ! -e "$lease_release/ostrom/.sprint.lease.guard" ]
+
+# Trace reads make the fact/narration split structural. The ordinary read
+# cannot return a top-level narration key; the principal must name the
+# narration-specific verb to inspect that region.
+trace_config="$fixture/trace"
+MANDATE_TRACE_TIME="2026-08-04T00:00:00Z" CLAUDE_CONFIG_DIR="$trace_config" \
+  bash "$PLUGIN_ROOT/scripts/trace.sh" append commit \
+    '{"sha":"0123456789abcdef"}' \
+    '{"reason":"placeholder change"}' >/dev/null
+newline_narration='{"reason":"first line\nsecond line with a \"quote\""}'
+MANDATE_TRACE_TIME="2026-08-04T00:01:00Z" CLAUDE_CONFIG_DIR="$trace_config" \
+  bash "$PLUGIN_ROOT/scripts/trace.sh" append gatekeeper-verdict \
+    '{"verdict":"pass","exit_code":0}' \
+    "$newline_narration" >/dev/null
+trace_file="$trace_config/ostrom/sprint.jsonl"
+[ "$(wc -l <"$trace_file" | tr -d '[:space:]')" -eq 2 ]
+jq -s -e '
+  length == 2
+  and .[0] == {
+    ts: "2026-08-04T00:00:00Z",
+    kind: "commit",
+    fact: {sha: "0123456789abcdef"},
+    narration: {reason: "placeholder change"}
+  }
+  and .[1].narration.reason
+    == "first line\nsecond line with a \"quote\""
+' "$trace_file" >/dev/null
+fact_rows="$(
+  CLAUDE_CONFIG_DIR="$trace_config" bash "$PLUGIN_ROOT/scripts/trace.sh" read
+)"
+jq -s -e '
+  length == 2
+  and all(.[]; has("ts") and has("kind") and has("fact") and (has("narration") | not))
+  and .[1].fact == {verdict: "pass", exit_code: 0}
+' <<<"$fact_rows" >/dev/null
+! grep -q 'narration' <<<"$fact_rows"
+narration_rows="$(
+  CLAUDE_CONFIG_DIR="$trace_config" \
+    bash "$PLUGIN_ROOT/scripts/trace.sh" read-narration
+)"
+jq -s -e '
+  length == 2
+  and all(.[]; has("narration") and (has("fact") | not))
+  and .[1].narration.reason
+    == "first line\nsecond line with a \"quote\""
+' <<<"$narration_rows" >/dev/null
+oversized_value="$(printf '%*s' 4100 '' | tr ' ' x)"
+set +e
+CLAUDE_CONFIG_DIR="$trace_config" \
+  bash "$PLUGIN_ROOT/scripts/trace.sh" append result \
+    "$(jq -cn --arg value "$oversized_value" '{value: $value}')" \
+    '{}' >/dev/null 2>&1
+oversized_status=$?
+set -e
+[ "$oversized_status" -eq 2 ]
+[ "$(wc -l <"$trace_file" | tr -d '[:space:]')" -eq 2 ]
+
 # Prove shipped < user < repo precedence and generic project list parsing.
 mkdir -p "$fixture/layers/config/ostrom" "$fixture/layers/repo/.ostrom"
 cat >"$fixture/layers/config/ostrom/mandates.yaml" <<'YAML'
