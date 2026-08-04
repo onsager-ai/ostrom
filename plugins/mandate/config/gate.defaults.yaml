@@ -1,0 +1,12 @@
+# ostrom — merge gate config (shipped defaults)
+#
+# Layered, most-specific wins:
+#   these defaults  <  ~/.claude/ostrom/gate.yaml (user)
+#                   <  ./.ostrom/gate.yaml (repo)
+#
+# Gate conditions are machine-local. The shipped layer contains mechanism
+# defaults only; the principal supplies every repository-specific condition.
+
+provider: file
+bounce_all: []
+projects: []
