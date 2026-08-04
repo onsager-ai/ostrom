@@ -291,20 +291,27 @@ if [ "${#capped_projects[@]}" -gt 0 ]; then
 fi
 
 # --- Per-selector report ---
-state_json='{}'
+# state.json and the events log are read via jq --slurpfile, never through
+# argv or a shell variable: a single argv argument is capped at
+# MAX_ARG_STRLEN (128 KiB on Linux), state.json grows with the portfolio,
+# and the events log grows without bound.
 if [ -s "$MANDATE_STATE_FILE" ]; then
-  state_json="$(cat "$MANDATE_STATE_FILE")"
+  cp "$MANDATE_STATE_FILE" "$work/state.json"
+else
+  printf '%s\n' '{}' >"$work/state.json"
 fi
-events_json='[]'
 if [ -s "$MANDATE_EVENTS_FILE" ]; then
-  events_json="$(jq -s '.' "$MANDATE_EVENTS_FILE")"
+  cp "$MANDATE_EVENTS_FILE" "$work/events.jsonl"
+else
+  : >"$work/events.jsonl"
 fi
 
 jq -cn \
   --slurpfile config "$work/config.json" \
-  --argjson state "$state_json" \
-  --argjson events "$events_json" '
+  --slurpfile state "$work/state.json" \
+  --slurpfile events "$work/events.jsonl" '
     ($config[0]) as $config
+    | ($state[0] // {}) as $state
     |
     def tier($selector):
       ($selector | capture("^(?<prefix>[^:]+):").prefix) as $prefix
@@ -367,12 +374,12 @@ echo "dismissed = /desk rejections of a row that selector produced, recorded in 
 echo "path: only applies to PRs (sweep.sh gates it on \$item.type == \"pr\"); for issues every prefix above is author-written and there is no content-derived gating at all."
 
 no_selector_dismissals="$(
-  jq '
+  jq -s '
     [.[] | select(
       .decision == "reject"
       and ((.matched_selector // "") | startswith("default:"))
     )] | length
-  ' <<<"$events_json"
+  ' "$work/events.jsonl"
 )"
 echo
 echo "Dismissals attributed to no selector (the project default fired instead): $no_selector_dismissals"
