@@ -119,6 +119,46 @@ the last sweep; unmatched selectors never add daily digest lines.
 Baseline and mandate-change summaries render once, then are acknowledged in
 the private state so they do not become permanent session noise.
 
+### Selector accuracy
+
+`/desk lint` reports selectors that matched nothing, which is config hygiene,
+not accuracy. Two different errors matter and they are not symmetric. A **miss**
+is a safety failure — something crossed a boundary unreviewed. A **false alarm**
+costs an interruption. Prefer recall wherever an irreversible action is in
+reach and accept the precision loss there; prefer precision everywhere else,
+because an interruption budget spent on noise is unavailable when it matters.
+
+Both are measured, and neither is reduced to a single score:
+
+- **False alarms** accrue going forward. Rejecting an item in `/desk` appends one
+  line to `~/.claude/ostrom/selector-events.jsonl` recording which selector put
+  it in front of you. Nothing extra is asked at decision time.
+- **Misses** are computed retroactively. `scripts/replay.sh` is read-only: it
+  scans merged pull requests for changes touching an irreversible surface —
+  workflow files, release tooling, credential-shaped paths — that matched no
+  bounce selector. Its output is a **lower bound**, not the miss rate: a change
+  that touched nothing on that list and matched nothing may still have been a
+  miss.
+
+The report is a table with one row per selector, and it names each prefix's
+tier, because they are not equally trustworthy:
+
+| Tier | Prefixes | Derived from |
+|---|---|---|
+| Content-derived | `path:`, `ref:` | the change itself |
+| Author-written | `title:`, `type:`, `scope:`, `label:` | text the item's author chose |
+
+`type:` and `scope:` are parsed out of the conventional-commit prefix of the
+item's **title**, and labels are set by whoever opened the item. So for any gate
+resting on the author-written tier, the party being gated selects whether the
+gate fires — a release pull request titled `chore: bump version` silently misses
+`type:release`. `path:` is also pull-request-only, so issues have no
+content-derived gating at all.
+
+Prefer content-derived prefixes and exact `reserved` refs wherever a condition
+carries real safety weight. A single accuracy number would hide precisely this
+split, which is why the report does not produce one.
+
 ## Cloud / CI
 
 No token, no credential setup — the marketplace is public, so the
