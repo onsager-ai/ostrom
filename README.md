@@ -177,8 +177,17 @@ dedicated gatekeeper session with the same recurring wake mechanism as the
 sprint loop:
 
 ```sh
-claude "/loop 30m /gatekeep"
+claude --settings ~/.claude/ostrom/roles/gatekeeper.settings.json "/loop 30m /gatekeep"
 ```
+
+The `--settings` flag is not decoration. It applies the gatekeeper profile from
+[`docs/role-permission-boundaries.md`](docs/role-permission-boundaries.md),
+which denies the writing capabilities this role must not hold — commit, push,
+branch mutation — and denies review-thread resolution to both delivery roles.
+Started without it, the session inherits the principal's default permissions,
+which are builder-like: the separation then exists only in prose, and a session
+able to commit is a session able to satisfy the conditions it is judging.
+Create the profile before the first run.
 
 Thirty to sixty minutes is the recommended polling period; the principal may
 choose within that range, but the gatekeeper should not run faster than the
