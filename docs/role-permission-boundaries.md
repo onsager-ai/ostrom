@@ -20,7 +20,7 @@ claim does not hold.
 
 **They are defence against inattention, not against intent.** They match command
 strings, and a command string has many equivalent spellings. `gh pr merge` is
-denied; the same merge through `gh api --method PUT /repos/{owner}/{repo}/pulls/{n}/merge`,
+denied; the same merge through `gh api --method PUT repos/{owner}/{repo}/pulls/{n}/merge`,
 through `gh api graphql` with `mergePullRequest`, through `curl`, or through the
 web interface is a different string. The lists below block the mutating `gh api`
 forms as well, which narrows the gap without closing it — enumerating every REST
@@ -47,10 +47,19 @@ unobservable and every verdict `inconclusive`. The gatekeeper would be locked
 out of the gate it exists to run, while appearing to work.
 
 Both profiles therefore deny the **mutating** forms only, in every spelling the
-matcher can name: `--method` and `-X` for PUT, POST, PATCH and DELETE, spaced
-and unspaced, plus graphql mutations. That narrows the surface without severing
-the reads either role depends on, and it does not close the gap — see the
-limits above.
+matcher can name: `--method` and `-X` for PUT, POST, PATCH and DELETE, spaced,
+unspaced and `=`-joined, plus graphql mutations. That narrows the surface
+without severing the reads either role depends on, and it does not close the
+gap — see the limits above.
+
+**Treat the list as incomplete, because it demonstrably is.** Three separate
+reviews of this one file each found a spelling the previous round had missed:
+`-XPUT` unspaced, then `--method=PUT` equals-joined, then `git push -f` with
+the flag last and no trailing space. Every one was a real hole, and every one
+was found by someone re-reading a list its author believed was finished. Adding
+the next spelling is worth doing and is not the same as closing the gap; if you
+are relying on this list rather than on branch protection, you are relying on
+the wrong thing.
 
 ## GitHub App identity prerequisite
 
@@ -106,6 +115,10 @@ claude --settings ~/.claude/ostrom/roles/builder.settings.json
       "Bash(gh api *--method POST*)",
       "Bash(gh api *--method PATCH*)",
       "Bash(gh api *--method DELETE*)",
+      "Bash(gh api *--method=PUT*)",
+      "Bash(gh api *--method=POST*)",
+      "Bash(gh api *--method=PATCH*)",
+      "Bash(gh api *--method=DELETE*)",
       "Bash(gh api *-X PUT*)",
       "Bash(gh api *-X POST*)",
       "Bash(gh api *-X PATCH*)",
@@ -120,6 +133,7 @@ claude --settings ~/.claude/ostrom/roles/builder.settings.json
       "Bash(git push *refs/tags/*)",
       "Bash(git push *--force*)",
       "Bash(git push *-f *)",
+      "Bash(git push *-f)",
       "Bash(gh release create *)",
       "Bash(gh release edit *)",
       "Bash(gh release delete *)",
@@ -183,10 +197,17 @@ claude --settings ~/.claude/ostrom/roles/gatekeeper.settings.json
       "Bash(gh pr close *)",
       "Bash(gh issue create *)",
       "Bash(gh issue edit *)",
+      "Bash(gh issue close *)",
+      "Bash(gh issue reopen *)",
+      "Bash(gh pr reopen *)",
       "Bash(gh api *--method PUT*)",
       "Bash(gh api *--method POST*)",
       "Bash(gh api *--method PATCH*)",
       "Bash(gh api *--method DELETE*)",
+      "Bash(gh api *--method=PUT*)",
+      "Bash(gh api *--method=POST*)",
+      "Bash(gh api *--method=PATCH*)",
+      "Bash(gh api *--method=DELETE*)",
       "Bash(gh api *-X PUT*)",
       "Bash(gh api *-X POST*)",
       "Bash(gh api *-X PATCH*)",
