@@ -84,8 +84,18 @@ caller's, is always about delivery, and never converts `inconclusive` into
 
 ## 4. Apply exactly the verdict
 
-- **Pass (exit 0)** — run `gh pr merge <PR number> --repo <owner/repo>`.
-  Perform no other mutation.
+- **Pass (exit 0)** — perform these two steps in order, using the installation
+  token minted for this repository:
+  1. Run `gh pr review <PR number> --repo <owner/repo> --approve`.
+  2. Then run `gh pr merge <PR number> --repo <owner/repo>`.
+
+  **The approval must come from the App, never from the principal's account.**
+  A session that has fallen back to the principal's identity will be refused
+  by GitHub at the approve step — one step earlier than it would have been
+  refused at merge, which is the correct and more legible failure.
+
+  An `excused` condition is part of a `pass`, so approval proceeds normally.
+  The exception reason already appears in the verdict output and trace.
 - **Fail (exit 1)** — if `already_judged=false`, leave the complete gate output
   as one PR comment using `gh pr comment --body-file`; use a temporary file so
   PR-controlled text is never interpolated into a shell command. If
@@ -96,7 +106,7 @@ caller's, is always about delivery, and never converts `inconclusive` into
   ```text
   Question: Should the principal wait for an observable gate result or decide this pull request outside the gate?
   Options ruled out: The gatekeeper inferring missing facts; treating inconclusive as pass or fail; asking the builder to argue the existing artifact.
-  Recommended action: The principal chooses whether to wait and re-run or use the one-PR exception path.
+  Recommended action: The principal chooses whether to wait and re-run or use the one-PR exception path by running bash "${CLAUDE_PLUGIN_ROOT}/scripts/excuse.sh" grant <owner/repo>#<PR number> <condition> <reason...>, then re-run the gate.
   Blast radius: This pull request only; no standing permission and no change to gate conditions.
   ```
 
@@ -105,6 +115,11 @@ caller's, is always about delivery, and never converts `inconclusive` into
 Any other exit code is a gate execution failure. Treat it as inconclusive,
 include the observed exit code in the Question field, address the same dossier
 to the principal, and stop.
+
+**Never approve on `fail`, `inconclusive`, or any other exit code.** An
+approval outlives the verdict that produced it; approving a PR that did not
+pass leaves a standing permission nobody granted. On a non-pass verdict the
+existing behaviour is unchanged: comment or escalate, and stop.
 
 ## 5. Stay narrow
 
