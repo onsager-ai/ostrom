@@ -8,6 +8,6 @@
     }
   },
   "enabledPlugins": {
-    "constitution@ostrom": true
+    "ostrom@ostrom": true
   }
 }
