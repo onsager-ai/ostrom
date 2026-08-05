@@ -520,8 +520,14 @@ if [ -n "$head_sha" ] && [ -s "$MANDATE_EXCEPTIONS_LOG" ]; then
         and .pr == $pr
         and .head_sha == $head_sha
       )]
-    ' "$MANDATE_EXCEPTIONS_LOG" >"$work/matching-exceptions.json" 2>/dev/null ||
+    ' "$MANDATE_EXCEPTIONS_LOG" >"$work/matching-exceptions.json" 2>/dev/null || {
+    # Fail closed, but never silently. A corrupted log means valid grants stop
+    # applying, and the resulting `fail` is indistinguishable from a PR that
+    # was never excused — the principal would re-grant an exception that is
+    # already there and watch it do nothing.
+    echo "mandate gate: could not read $MANDATE_EXCEPTIONS_LOG; ignoring all exceptions" >&2
     printf '%s\n' '[]' >"$work/matching-exceptions.json"
+  }
 fi
 
 jq --slurpfile exceptions "$work/matching-exceptions.json" '
