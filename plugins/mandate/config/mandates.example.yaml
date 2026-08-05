@@ -8,6 +8,11 @@ provider: file
 cadence_hours: 24
 stuck_after_days: 7
 
+# Directories to search recursively for local Git repositories. Every linked
+# worktree belonging to a discovered repository is scanned too.
+search_roots:
+  - /path/to/repositories
+
 bounce_all:
   - title:*merge to main*
   - title:*production deployment*

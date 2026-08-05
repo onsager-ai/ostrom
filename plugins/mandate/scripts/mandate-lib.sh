@@ -21,7 +21,7 @@ mandate_is_configured() {
 
 # Parse the deliberately small shipped schema without pretending to be a
 # general YAML parser. Supported input:
-#   root scalars; bounce_all: followed by two-space list items; projects:
+#   root scalars; bounce_all:/search_roots: followed by two-space list items; projects:
 #   followed by "- repo:" entries, each with default + paused scalars and
 #   six-space delegated/excluded/reserved/bounce lists.
 mandate_yaml_to_json() {
@@ -73,6 +73,11 @@ mandate_yaml_to_json() {
           print "array\tbounce_all"
         } else if (text == "bounce_all: []") {
           print "array\tbounce_all"
+        } else if (text == "search_roots:") {
+          section = "search_roots"
+          print "array\tsearch_roots"
+        } else if (text == "search_roots: []") {
+          print "array\tsearch_roots"
         } else if (text == "projects:") {
           section = "projects"
           print "array\tprojects"
@@ -98,6 +103,15 @@ mandate_yaml_to_json() {
         value = unquote(value)
         if (value == "") fail("empty bounce_all entry")
         else print "bounce_all\t" value
+        next
+      }
+
+      if (section == "search_roots" && indent == 2 && text ~ /^-[[:space:]]+/) {
+        value = text
+        sub(/^-[[:space:]]+/, "", value)
+        value = unquote(value)
+        if (value == "") fail("empty search_roots entry")
+        else print "search_root\t" value
         next
       }
 
@@ -164,6 +178,8 @@ mandate_yaml_to_json() {
             .[$parts[1]] = []
           elif $parts[0] == "bounce_all" then
             .bounce_all += [$parts[1]]
+          elif $parts[0] == "search_root" then
+            .search_roots += [$parts[1]]
           elif $parts[0] == "project" then
             .projects += [{
               "repo": $parts[1],
@@ -221,6 +237,7 @@ mandate_load_config() {
     and (.cadence_hours | type == "number" and . > 0 and . == floor)
     and (.stuck_after_days | type == "number" and . >= 0)
     and (.bounce_all | type == "array" and all(.[]; type == "string" and length > 0))
+    and (.search_roots | type == "array" and all(.[]; type == "string" and length > 0))
     and (.projects | type == "array")
     and all(.projects[];
       (.repo | type == "string" and test("^[^/[:space:]]+/[^/[:space:]]+$"))
@@ -233,7 +250,7 @@ mandate_load_config() {
     )
     and (([.projects[].repo] | length) == ([.projects[].repo] | unique | length))
   ' >/dev/null <<<"$config"; then
-    echo "mandate: invalid config; provider must be file, cadence_hours a positive integer, and every project must have a unique owner/name repo, valid default, boolean paused value, selector lists, and positive integer reserved refs" >&2
+    echo "mandate: invalid config; provider must be file, cadence_hours a positive integer, search_roots non-empty strings, and every project must have a unique owner/name repo, valid default, boolean paused value, selector lists, and positive integer reserved refs" >&2
     return 2
   fi
 

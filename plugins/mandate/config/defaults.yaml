@@ -13,6 +13,10 @@ provider: file
 cadence_hours: 24
 stuck_after_days: 7
 
+# Local repository discovery is opt-in. Never guess paths on the principal's
+# machine; a more-specific layer must replace this empty list explicitly.
+search_roots: []
+
 # Shared write-surface tripwires. Selectors are case-insensitive qualified
 # globs. A more-specific layer may replace this list.
 bounce_all:
