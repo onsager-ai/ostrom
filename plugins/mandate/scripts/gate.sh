@@ -504,7 +504,48 @@ jq -s '.' \
   "$work/threads-condition.json" \
   "$work/bounce-condition.json" \
   "$work/reserved-condition.json" \
-  >"$work/conditions.json"
+  >"$work/evaluated-conditions.json"
+
+# Exception records use the same append-only JSONL tuple lookup as the
+# already_judged delivery guard below. The extra repo and condition fields
+# keep a grant scoped to one condition of one PR artifact.
+printf '%s\n' '[]' >"$work/matching-exceptions.json"
+if [ -n "$head_sha" ] && [ -s "$MANDATE_EXCEPTIONS_LOG" ]; then
+  jq -s \
+    --arg repo "$repo" \
+    --argjson pr "$number" \
+    --arg head_sha "$head_sha" '
+      [.[] | select(
+        .repo == $repo
+        and .pr == $pr
+        and .head_sha == $head_sha
+      )]
+    ' "$MANDATE_EXCEPTIONS_LOG" >"$work/matching-exceptions.json" 2>/dev/null || {
+    # Fail closed, but never silently. A corrupted log means valid grants stop
+    # applying, and the resulting `fail` is indistinguishable from a PR that
+    # was never excused — the principal would re-grant an exception that is
+    # already there and watch it do nothing.
+    echo "mandate gate: could not read $MANDATE_EXCEPTIONS_LOG; ignoring all exceptions" >&2
+    printf '%s\n' '[]' >"$work/matching-exceptions.json"
+  }
+fi
+
+jq --slurpfile exceptions "$work/matching-exceptions.json" '
+  map(
+    . as $condition
+    | if (.result == "fail" or .result == "inconclusive")
+      then ([
+        $exceptions[0][]
+        | select(.condition == $condition.name)
+      ] | last) as $exception
+      | if $exception == null
+        then .
+        else .result = "excused" | .exception_reason = $exception.reason
+        end
+      else .
+      end
+  )
+' "$work/evaluated-conditions.json" >"$work/conditions.json"
 
 verdict="$(jq -r '
   if any(.[]; .result == "fail") then "fail"
@@ -550,6 +591,7 @@ jq -r '
   (.conditions[]
     | "condition \(.name): \(.result) tier="
       + (if (.tier | length) == 0 then "none" else (.tier | join(",")) end)
+      + (if has("exception_reason") then " exception_reason=" + (.exception_reason | tojson) else "" end)
       + " detail=" + (.detail | tojson)
   )
 ' <<<"$record"
