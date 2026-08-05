@@ -4,6 +4,7 @@
 MANDATE_PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 MANDATE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 MANDATE_DATA_DIR="$MANDATE_CONFIG_DIR/ostrom"
+MANDATE_SECRETS_FILE="$MANDATE_DATA_DIR/secrets.yaml"
 MANDATE_USER_CONFIG="$MANDATE_DATA_DIR/mandates.yaml"
 MANDATE_REPO_CONFIG="./.ostrom/mandates.yaml"
 MANDATE_DEFAULT_CONFIG="$MANDATE_PLUGIN_ROOT/config/defaults.yaml"
@@ -14,6 +15,111 @@ MANDATE_GATE_DEFAULT_CONFIG="$MANDATE_PLUGIN_ROOT/config/gate.defaults.yaml"
 MANDATE_GATE_USER_CONFIG="$MANDATE_DATA_DIR/gate.yaml"
 MANDATE_GATE_REPO_CONFIG="./.ostrom/gate.yaml"
 MANDATE_GATE_LOG="$MANDATE_DATA_DIR/gate.jsonl"
+
+# Read the gatekeeper GitHub App credentials from the machine-local secrets
+# file. This intentionally remains separate from the shipped/user/repository
+# config layers: credentials have no repository or shipped layer.
+mandate_load_gatekeeper_credentials() {
+  if [ ! -f "$MANDATE_SECRETS_FILE" ]; then
+    echo "app-token: secrets file is missing at the configured Ostrom secrets path" >&2
+    return 2
+  fi
+
+  credential_records="$(
+    awk '
+      function trim(s) {
+        sub(/^[[:space:]]+/, "", s)
+        sub(/[[:space:]]+$/, "", s)
+        return s
+      }
+      function unquote(s, first, last) {
+        s = trim(s)
+        first = substr(s, 1, 1)
+        last = substr(s, length(s), 1)
+        if (length(s) >= 2 && ((first == "\"" && last == "\"") || (first == "\047" && last == "\047"))) {
+          s = substr(s, 2, length(s) - 2)
+        }
+        return s
+      }
+      function fail(message) {
+        printf "app-token: could not parse gatekeeper credentials: %s\n", message > "/dev/stderr"
+        failed = 1
+      }
+      BEGIN { in_gatekeeper = 0; failed = 0 }
+      {
+        raw = $0
+        if (raw ~ /\t/) {
+          if (in_gatekeeper) fail("tabs are not supported")
+          next
+        }
+        if (raw ~ /^[[:space:]]*#/ || raw ~ /^[[:space:]]*$/) next
+
+        match(raw, /^ */)
+        indent = RLENGTH
+        text = substr(raw, indent + 1)
+
+        if (indent == 0) {
+          in_gatekeeper = (text == "gatekeeper:")
+          next
+        }
+        if (!in_gatekeeper) next
+
+        sub(/[[:space:]]+#.*$/, "", text)
+        if (text ~ /^[[:space:]]*$/) next
+        if (indent != 2 || text !~ /^(app_id|installation_id|private_key_path):[[:space:]]*/) {
+          fail("unsupported gatekeeper entry")
+          next
+        }
+
+        key = text
+        sub(/:.*/, "", key)
+        value = text
+        sub(/^[^:]+:[[:space:]]*/, "", value)
+        value = unquote(value)
+        if (seen[key]++) {
+          fail("duplicate " key " field")
+        } else if (value == "") {
+          fail("empty " key " field")
+        } else {
+          print key "\t" value
+        }
+      }
+      END { if (failed) exit 2 }
+    ' "$MANDATE_SECRETS_FILE"
+  )" || return
+
+  credentials="$(
+    printf '%s\n' "$credential_records" |
+      jq -Rn '
+        reduce inputs as $line ({};
+          ($line | split("\t")) as $parts
+          | .[$parts[0]] = $parts[1]
+        )
+      '
+  )" || {
+    echo "app-token: could not parse gatekeeper credentials" >&2
+    return 2
+  }
+
+  for required_field in app_id installation_id private_key_path; do
+    if ! jq -e --arg field "$required_field" \
+      '.[$field] | type == "string" and length > 0' \
+      >/dev/null <<<"$credentials"; then
+      echo "app-token: missing required gatekeeper field: $required_field" >&2
+      return 2
+    fi
+  done
+
+  if ! jq -e '
+    (.app_id | test("^[1-9][0-9]*$"))
+    and (.installation_id | test("^[1-9][0-9]*$"))
+  ' >/dev/null <<<"$credentials"; then
+    echo "app-token: gatekeeper app_id and installation_id must be positive integers" >&2
+    return 2
+  fi
+
+  printf '%s\n' "$credentials"
+}
 
 mandate_is_configured() {
   [ -f "$MANDATE_USER_CONFIG" ] || [ -f "$MANDATE_REPO_CONFIG" ]

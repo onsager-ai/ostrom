@@ -264,6 +264,79 @@ assert_bad_selector title-star "title:production deployment" \
 assert_bad_selector title-run "title:*abcdefghijklmnopqrstuvwxyz*" \
   "title selector literal run exceeds 24 characters"
 
+# GitHub App authentication fails closed before any network call. The curl
+# stub is the network boundary for every app-token test in this suite.
+app_token_fixture="$fixture/app-token"
+mkdir -p "$app_token_fixture/bin"
+cat >"$app_token_fixture/bin/curl" <<'EOF'
+#!/usr/bin/env bash
+if [ -n "${FAKE_CURL_CALL_LOG:-}" ]; then
+  printf 'curl was called\n' >>"$FAKE_CURL_CALL_LOG"
+fi
+exit 99
+EOF
+chmod +x "$app_token_fixture/bin/curl"
+app_token_curl_log="$app_token_fixture/curl.log"
+
+run_app_token_failure() {
+  app_token_name="$1"
+  app_token_config_dir="$2"
+  app_token_stdout="$app_token_fixture/$app_token_name.stdout"
+  app_token_stderr="$app_token_fixture/$app_token_name.stderr"
+  set +e
+  PATH="$app_token_fixture/bin:$PATH" \
+    GH_TOKEN="ambient-principal-value" \
+    GITHUB_TOKEN="ambient-principal-value" \
+    FAKE_CURL_CALL_LOG="$app_token_curl_log" \
+    CLAUDE_CONFIG_DIR="$app_token_config_dir" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/app-token.sh" \
+      >"$app_token_stdout" 2>"$app_token_stderr"
+  app_token_status=$?
+  set -e
+  [ "$app_token_status" -eq 2 ]
+  [ ! -s "$app_token_stdout" ]
+  [ ! -e "$app_token_curl_log" ]
+  ! grep -q 'ambient-principal-value' "$app_token_stderr"
+}
+
+app_token_missing_secrets="$app_token_fixture/missing-secrets"
+run_app_token_failure missing-secrets "$app_token_missing_secrets"
+grep -Fxq \
+  'app-token: secrets file is missing at the configured Ostrom secrets path' \
+  "$app_token_fixture/missing-secrets.stderr"
+
+app_token_missing_key="$app_token_fixture/missing-key"
+mkdir -p "$app_token_missing_key/ostrom"
+cat >"$app_token_missing_key/ostrom/secrets.yaml" <<YAML
+gatekeeper:
+  app_id: $$
+  installation_id: $PPID
+  private_key_path: $app_token_missing_key/absent.pem
+YAML
+run_app_token_failure missing-key "$app_token_missing_key"
+grep -Fxq 'app-token: gatekeeper private key file is missing or unreadable' \
+  "$app_token_fixture/missing-key.stderr"
+
+app_token_missing_field="$app_token_fixture/missing-field"
+mkdir -p "$app_token_missing_field/ostrom"
+cat >"$app_token_missing_field/ostrom/secrets.yaml" <<YAML
+gatekeeper:
+  app_id: $$
+  private_key_path: $app_token_missing_field/absent.pem
+YAML
+run_app_token_failure missing-field "$app_token_missing_field"
+grep -Fxq 'app-token: missing required gatekeeper field: installation_id' \
+  "$app_token_fixture/missing-field.stderr"
+
+# An ambient principal token is never returned or used as a fallback when App
+# credentials are absent.
+app_token_no_fallback="$app_token_fixture/no-fallback"
+run_app_token_failure no-fallback "$app_token_no_fallback"
+grep -Fxq \
+  'app-token: secrets file is missing at the configured Ostrom secrets path' \
+  "$app_token_fixture/no-fallback.stderr"
+
 cat >"$fixture/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail

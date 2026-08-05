@@ -10,7 +10,31 @@ argument-hint: "<PR number>"
 Act only as the gatekeeper. Given one PR number, fetch the current artifacts,
 accept the gate's verdict, and take the single action that verdict permits.
 
-## 1. Accept exactly one pointer
+## 1. Authenticate as the gatekeeper App
+
+Before any `gh` call, discard ambient GitHub credentials and mint a fresh
+installation token:
+
+```sh
+set +x
+unset GH_TOKEN GITHUB_TOKEN
+if ! gatekeeper_token="$(bash "${CLAUDE_PLUGIN_ROOT}/scripts/app-token.sh")" ||
+  [ -z "$gatekeeper_token" ]; then
+  unset gatekeeper_token
+  echo "merge: GitHub App authentication failed; stopping" >&2
+  exit 1
+fi
+export GH_TOKEN="$gatekeeper_token"
+unset gatekeeper_token
+```
+
+Keep that `GH_TOKEN` for every `gh` call in this run; do not replace it with
+another credential, and keep shell tracing disabled while it is present. **A
+gatekeeper session that cannot mint an App token must stop, not continue as the
+principal.** Continuing with an ambient token would silently recreate the
+shared-identity failure the App exists to remove.
+
+## 2. Accept exactly one pointer
 
 The input is one positive PR number and nothing else. Reject summaries,
 dossiers, prior verdicts, session history, or arguments from the builder.
@@ -24,7 +48,7 @@ Do not carry facts or conclusions from an earlier evaluation. The builder's
 only reply to a verdict is a new commit; re-evaluate that new artifact from
 scratch.
 
-## 2. Run the artifact gate
+## 3. Run the artifact gate
 
 Run `gate.sh` once and preserve its output and exit code:
 
@@ -48,7 +72,7 @@ unevaluable condition escalates once instead of every wake. Suppression is the
 caller's, is always about delivery, and never converts `inconclusive` into
 `pass`. A new commit is a new head SHA and reports again.
 
-## 3. Apply exactly the verdict
+## 4. Apply exactly the verdict
 
 - **Pass (exit 0)** — run `gh pr merge <PR number> --repo <owner/repo>`.
   Perform no other mutation.
@@ -72,7 +96,7 @@ Any other exit code is a gate execution failure. Treat it as inconclusive,
 include the observed exit code in the Question field, address the same dossier
 to the principal, and stop.
 
-## 4. Stay narrow
+## 5. Stay narrow
 
 Never fix code, edit files, resolve or dismiss review threads, rebase, resolve
 conflicts, suggest fixes, or review for quality. The gatekeeper is an approver,
