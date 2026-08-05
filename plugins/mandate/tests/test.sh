@@ -270,17 +270,55 @@ app_token_fixture="$fixture/app-token"
 mkdir -p "$app_token_fixture/bin"
 cat >"$app_token_fixture/bin/curl" <<'EOF'
 #!/usr/bin/env bash
+set -euo pipefail
+
+authorization_config="$(cat)"
+[ -n "$authorization_config" ]
+url=""
+for argument in "$@"; do
+  case "$argument" in
+    https://api.github.com/*) url="$argument" ;;
+  esac
+done
 if [ -n "${FAKE_CURL_CALL_LOG:-}" ]; then
-  printf 'curl was called\n' >>"$FAKE_CURL_CALL_LOG"
+  printf '%s\n' "$url" >>"$FAKE_CURL_CALL_LOG"
 fi
-exit 99
+
+case "${FAKE_CURL_MODE:-transport-failure}:$url" in
+  not-installed:https://api.github.com/repos/placeholder-owner/placeholder-repo/installation)
+    printf '{"message":"Not Found"}\n404'
+    ;;
+  success:https://api.github.com/repos/placeholder-owner/placeholder-repo/installation)
+    printf '{"id":%s}\n200' "$$"
+    ;;
+  success:https://api.github.com/app/installations/*/access_tokens)
+    printf '{"token":"stub-installation-token"}'
+    ;;
+  *) exit 99 ;;
+esac
 EOF
-chmod +x "$app_token_fixture/bin/curl"
+cat >"$app_token_fixture/bin/openssl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+case "${1:-}" in
+  base64)
+    base64 | tr -d '\n'
+    ;;
+  dgst)
+    cat >/dev/null
+    printf 'stub-signature'
+    ;;
+  *) exit 99 ;;
+esac
+EOF
+chmod +x "$app_token_fixture/bin/curl" "$app_token_fixture/bin/openssl"
 app_token_curl_log="$app_token_fixture/curl.log"
 
 run_app_token_failure() {
   app_token_name="$1"
   app_token_config_dir="$2"
+  shift 2
   app_token_stdout="$app_token_fixture/$app_token_name.stdout"
   app_token_stderr="$app_token_fixture/$app_token_name.stderr"
   set +e
@@ -290,7 +328,7 @@ run_app_token_failure() {
     FAKE_CURL_CALL_LOG="$app_token_curl_log" \
     CLAUDE_CONFIG_DIR="$app_token_config_dir" \
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-    bash "$PLUGIN_ROOT/scripts/app-token.sh" \
+    bash "$PLUGIN_ROOT/scripts/app-token.sh" "$@" \
       >"$app_token_stdout" 2>"$app_token_stderr"
   app_token_status=$?
   set -e
@@ -300,8 +338,14 @@ run_app_token_failure() {
   ! grep -q 'ambient-principal-value' "$app_token_stderr"
 }
 
+app_token_missing_argument="$app_token_fixture/missing-argument"
+run_app_token_failure missing-argument "$app_token_missing_argument"
+grep -Fxq 'app-token: usage: app-token.sh <owner>/<repo>' \
+  "$app_token_fixture/missing-argument.stderr"
+
 app_token_missing_secrets="$app_token_fixture/missing-secrets"
-run_app_token_failure missing-secrets "$app_token_missing_secrets"
+run_app_token_failure missing-secrets "$app_token_missing_secrets" \
+  placeholder-owner/placeholder-repo
 grep -Fxq \
   'app-token: secrets file is missing at the configured Ostrom secrets path' \
   "$app_token_fixture/missing-secrets.stderr"
@@ -311,10 +355,10 @@ mkdir -p "$app_token_missing_key/ostrom"
 cat >"$app_token_missing_key/ostrom/secrets.yaml" <<YAML
 gatekeeper:
   app_id: $$
-  installation_id: $PPID
   private_key_path: $app_token_missing_key/absent.pem
 YAML
-run_app_token_failure missing-key "$app_token_missing_key"
+run_app_token_failure missing-key "$app_token_missing_key" \
+  placeholder-owner/placeholder-repo
 grep -Fxq 'app-token: gatekeeper private key file is missing or unreadable' \
   "$app_token_fixture/missing-key.stderr"
 
@@ -323,19 +367,87 @@ mkdir -p "$app_token_missing_field/ostrom"
 cat >"$app_token_missing_field/ostrom/secrets.yaml" <<YAML
 gatekeeper:
   app_id: $$
-  private_key_path: $app_token_missing_field/absent.pem
 YAML
-run_app_token_failure missing-field "$app_token_missing_field"
-grep -Fxq 'app-token: missing required gatekeeper field: installation_id' \
+run_app_token_failure missing-field "$app_token_missing_field" \
+  placeholder-owner/placeholder-repo
+grep -Fxq 'app-token: missing required gatekeeper field: private_key_path' \
   "$app_token_fixture/missing-field.stderr"
 
-# An ambient principal token is never returned or used as a fallback when App
-# credentials are absent.
-app_token_no_fallback="$app_token_fixture/no-fallback"
-run_app_token_failure no-fallback "$app_token_no_fallback"
+# A repository lookup 404 names the repository and stops before the token
+# exchange. Ambient principal credentials are neither returned nor used.
+app_token_not_installed="$app_token_fixture/not-installed"
+mkdir -p "$app_token_not_installed/ostrom"
+app_token_not_installed_key="$app_token_not_installed/placeholder.pem"
+: >"$app_token_not_installed_key"
+cat >"$app_token_not_installed/ostrom/secrets.yaml" <<YAML
+gatekeeper:
+  app_id: $$
+  private_key_path: $app_token_not_installed_key
+YAML
+rm -f "$app_token_curl_log"
+set +e
+PATH="$app_token_fixture/bin:$PATH" \
+  GH_TOKEN="ambient-principal-value" \
+  GITHUB_TOKEN="ambient-principal-value" \
+  FAKE_CURL_MODE=not-installed \
+  FAKE_CURL_CALL_LOG="$app_token_curl_log" \
+  CLAUDE_CONFIG_DIR="$app_token_not_installed" \
+  CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+  bash "$PLUGIN_ROOT/scripts/app-token.sh" \
+    placeholder-owner/placeholder-repo \
+    >"$app_token_fixture/not-installed.stdout" \
+    2>"$app_token_fixture/not-installed.stderr"
+app_token_not_installed_status=$?
+set -e
+[ "$app_token_not_installed_status" -eq 2 ]
+[ ! -s "$app_token_fixture/not-installed.stdout" ]
 grep -Fxq \
-  'app-token: secrets file is missing at the configured Ostrom secrets path' \
-  "$app_token_fixture/no-fallback.stderr"
+  'app-token: GitHub App is not installed on repository placeholder-owner/placeholder-repo' \
+  "$app_token_fixture/not-installed.stderr"
+! grep -q 'ambient-principal-value' "$app_token_fixture/not-installed.stderr"
+[ "$(wc -l <"$app_token_curl_log" | tr -d '[:space:]')" -eq 1 ]
+grep -Fxq \
+  'https://api.github.com/repos/placeholder-owner/placeholder-repo/installation' \
+  "$app_token_curl_log"
+! grep -q '/access_tokens' "$app_token_curl_log"
+
+# A stale installation_id is accepted but discarded; the repository lookup,
+# not that obsolete value, selects the installation used for the exchange.
+app_token_stale_id="$app_token_fixture/stale-id"
+mkdir -p "$app_token_stale_id/ostrom"
+app_token_stale_key="$app_token_stale_id/placeholder.pem"
+: >"$app_token_stale_key"
+cat >"$app_token_stale_id/ostrom/secrets.yaml" <<YAML
+gatekeeper:
+  app_id: $$
+  installation_id: <OBSOLETE_INSTALLATION_ID>
+  private_key_path: $app_token_stale_key
+YAML
+rm -f "$app_token_curl_log"
+PATH="$app_token_fixture/bin:$PATH" \
+  GH_TOKEN="ambient-principal-value" \
+  GITHUB_TOKEN="ambient-principal-value" \
+  FAKE_CURL_MODE=success \
+  FAKE_CURL_CALL_LOG="$app_token_curl_log" \
+  CLAUDE_CONFIG_DIR="$app_token_stale_id" \
+  CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+  bash "$PLUGIN_ROOT/scripts/app-token.sh" \
+    placeholder-owner/placeholder-repo \
+    >"$app_token_fixture/stale-id.stdout" \
+    2>"$app_token_fixture/stale-id.stderr"
+grep -Fxq 'stub-installation-token' "$app_token_fixture/stale-id.stdout"
+[ ! -s "$app_token_fixture/stale-id.stderr" ]
+[ "$(wc -l <"$app_token_curl_log" | tr -d '[:space:]')" -eq 2 ]
+grep -Fxq \
+  'https://api.github.com/repos/placeholder-owner/placeholder-repo/installation' \
+  "$app_token_curl_log"
+grep -Eq \
+  '^https://api.github.com/app/installations/[1-9][0-9]*/access_tokens$' \
+  "$app_token_curl_log"
+! grep -q 'OBSOLETE_INSTALLATION_ID' \
+  "$app_token_fixture/stale-id.stdout" \
+  "$app_token_fixture/stale-id.stderr" \
+  "$app_token_curl_log"
 
 cat >"$fixture/bin/gh" <<'EOF'
 #!/usr/bin/env bash

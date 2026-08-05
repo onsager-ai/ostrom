@@ -32,13 +32,17 @@ principal completes the GitHub App setup decided in
    ```yaml
    gatekeeper:
      app_id: <APP_ID>
-     installation_id: <INSTALLATION_ID>
      private_key_path: <ABSOLUTE_PATH_TO_PRIVATE_KEY>
    ```
 
+   The installation is resolved from each `owner/repo` at mint time. A legacy
+   `installation_id` entry is obsolete, is ignored for backward compatibility,
+   and may be deleted.
+
 3. Launch the gatekeeper with the profile below. The profile clears inherited
    GitHub tokens, and `/gatekeep` or `/merge` must successfully mint a fresh
-   App installation token before making any `gh` call.
+   App installation token for each repository before making any `gh` call
+   against it.
 
 Until these steps are complete, the builder and gatekeeper remain the same
 GitHub actor: author-resolved threads cannot be distinguished from legitimate

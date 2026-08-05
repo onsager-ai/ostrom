@@ -73,6 +73,9 @@ mandate_load_gatekeeper_credentials() {
 
         key = text
         sub(/:.*/, "", key)
+        # installation_id is obsolete. Accept it for compatibility, but do
+        # not validate or return it as part of the credentials schema.
+        if (key == "installation_id") next
         value = text
         sub(/^[^:]+:[[:space:]]*/, "", value)
         value = unquote(value)
@@ -101,7 +104,7 @@ mandate_load_gatekeeper_credentials() {
     return 2
   }
 
-  for required_field in app_id installation_id private_key_path; do
+  for required_field in app_id private_key_path; do
     if ! jq -e --arg field "$required_field" \
       '.[$field] | type == "string" and length > 0' \
       >/dev/null <<<"$credentials"; then
@@ -111,10 +114,9 @@ mandate_load_gatekeeper_credentials() {
   done
 
   if ! jq -e '
-    (.app_id | test("^[1-9][0-9]*$"))
-    and (.installation_id | test("^[1-9][0-9]*$"))
+    .app_id | test("^[1-9][0-9]*$")
   ' >/dev/null <<<"$credentials"; then
-    echo "app-token: gatekeeper app_id and installation_id must be positive integers" >&2
+    echo "app-token: gatekeeper app_id must be a positive integer" >&2
     return 2
   fi
 
