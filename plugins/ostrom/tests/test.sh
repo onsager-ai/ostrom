@@ -1709,6 +1709,10 @@ cat >"$gate_fixture/bin/gh" <<'EOF'
 set -euo pipefail
 
 if [ "$1 $2" = "pr view" ]; then
+  if [ "${FAKE_GATE_MODE:-pass}" = "unresolvable-pr" ]; then
+    echo "placeholder pull request could not be resolved" >&2
+    exit 1
+  fi
   check_conclusion="SUCCESS"
   if [ "${FAKE_GATE_MODE:-pass}" = "unknown-check" ]; then
     check_conclusion="UNRECOGNIZED"
@@ -1763,6 +1767,128 @@ fi
 exit 1
 EOF
 chmod +x "$gate_fixture/bin/gh"
+
+# The exception verb rejects malformed authority and resolves the PR head
+# itself before appending one complete JSON object.
+excuse_log="$gate_fixture/config/ostrom/exceptions.jsonl"
+set +e
+excuse_message="$(
+  PATH="$gate_fixture/bin:$PATH" \
+    CLAUDE_CONFIG_DIR="$gate_fixture/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/excuse.sh" grant \
+      not-a-pr bounce_selectors "placeholder reason" 2>&1
+)"
+excuse_status=$?
+set -e
+[ "$excuse_status" -eq 2 ]
+grep -q '^usage: excuse.sh grant ' <<<"$excuse_message"
+[ ! -e "$excuse_log" ]
+
+set +e
+excuse_message="$(
+  PATH="$gate_fixture/bin:$PATH" \
+    CLAUDE_CONFIG_DIR="$gate_fixture/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/excuse.sh" grant \
+      placeholder-org/placeholder-repo#7 unknown "placeholder reason" 2>&1
+)"
+excuse_status=$?
+set -e
+[ "$excuse_status" -eq 2 ]
+grep -q 'required_checks, review_threads, bounce_selectors, reserved_refs' \
+  <<<"$excuse_message"
+[ ! -e "$excuse_log" ]
+
+set +e
+excuse_message="$(
+  PATH="$gate_fixture/bin:$PATH" \
+    CLAUDE_CONFIG_DIR="$gate_fixture/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/excuse.sh" grant \
+      placeholder-org/placeholder-repo#7 bounce_selectors '   ' 2>&1
+)"
+excuse_status=$?
+set -e
+[ "$excuse_status" -eq 2 ]
+grep -q 'reason must not be empty' <<<"$excuse_message"
+[ ! -e "$excuse_log" ]
+
+set +e
+excuse_message="$(
+  PATH="$gate_fixture/bin:$PATH" \
+    FAKE_GATE_MODE=unresolvable-pr \
+    CLAUDE_CONFIG_DIR="$gate_fixture/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/excuse.sh" grant \
+      placeholder-org/placeholder-repo#7 bounce_selectors \
+      "placeholder reason" 2>&1
+)"
+excuse_status=$?
+set -e
+[ "$excuse_status" -eq 3 ]
+grep -q 'could not resolve placeholder-org/placeholder-repo#7' \
+  <<<"$excuse_message"
+[ ! -e "$excuse_log" ]
+
+granted_head="1111111111111111111111111111111111111111"
+grant_output="$(
+  PATH="$gate_fixture/bin:$PATH" \
+    FAKE_GATE_HEAD="$granted_head" \
+    MANDATE_EXCUSE_TIME="2026-08-04T11:00:00Z" \
+    CLAUDE_CONFIG_DIR="$gate_fixture/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/excuse.sh" grant \
+      placeholder-org/placeholder-repo#7 bounce_selectors \
+      "principal accepted placeholder surface"
+)"
+jq -e --arg head "$granted_head" '
+  . == {
+    ts: "2026-08-04T11:00:00Z",
+    repo: "placeholder-org/placeholder-repo",
+    pr: 7,
+    head_sha: $head,
+    condition: "bounce_selectors",
+    reason: "principal accepted placeholder surface"
+  }
+' <<<"$grant_output" >/dev/null
+[ "$(wc -l <"$excuse_log" | tr -d '[:space:]')" -eq 1 ]
+
+# A SHA in the caller-supplied condition position is rejected; grant has no
+# SHA argument and always takes it from gh pr view.
+set +e
+PATH="$gate_fixture/bin:$PATH" \
+  CLAUDE_CONFIG_DIR="$gate_fixture/config" \
+  CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+  bash "$PLUGIN_ROOT/scripts/excuse.sh" grant \
+    placeholder-org/placeholder-repo#7 "$granted_head" bounce_selectors \
+    "placeholder reason" >/dev/null 2>&1
+excuse_status=$?
+set -e
+[ "$excuse_status" -eq 2 ]
+[ "$(wc -l <"$excuse_log" | tr -d '[:space:]')" -eq 1 ]
+
+list_output="$(
+  PATH="$gate_fixture/bin:$PATH" \
+    FAKE_GATE_HEAD="$granted_head" \
+    CLAUDE_CONFIG_DIR="$gate_fixture/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/excuse.sh" list \
+      placeholder-org/placeholder-repo#7
+)"
+grep -q '^current placeholder-org/placeholder-repo#7 bounce_selectors ' \
+  <<<"$list_output"
+grep -q 'reason="principal accepted placeholder surface"$' <<<"$list_output"
+list_output="$(
+  PATH="$gate_fixture/bin:$PATH" \
+    FAKE_GATE_HEAD="7777777777777777777777777777777777777777" \
+    CLAUDE_CONFIG_DIR="$gate_fixture/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/excuse.sh" list \
+      placeholder-org/placeholder-repo#7
+)"
+grep -q '^superseded placeholder-org/placeholder-repo#7 bounce_selectors ' \
+  <<<"$list_output"
 
 run_gate() {
   gate_mode="$1"
@@ -1828,8 +1954,73 @@ run_gate pass 8 ffffffffffffffff
 [ "$gate_status" -eq 0 ]
 grep -q 'already_judged=false$' <<<"$(head -n 1 <<<"$gate_output")"
 
+grant_gate_exception() {
+  exception_condition="$1"
+  exception_number="$2"
+  exception_head="$3"
+  shift 3
+  PATH="$gate_fixture/bin:$PATH" \
+    FAKE_GATE_HEAD="$exception_head" \
+    MANDATE_EXCUSE_TIME="2026-08-04T11:30:00Z" \
+    CLAUDE_CONFIG_DIR="$gate_fixture/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/excuse.sh" grant \
+      "placeholder-org/placeholder-repo#$exception_number" \
+      "$exception_condition" "$@" >/dev/null
+}
+
+# A matching failed condition becomes excused and therefore aggregates to
+# pass. Its reason remains visible in both output and the append-only trace.
+excused_fail_head="2222222222222222222222222222222222222222"
+grant_gate_exception bounce_selectors 9 "$excused_fail_head" \
+  "principal accepted protected placeholder surface"
+run_gate tier 9 "$excused_fail_head"
+[ "$gate_status" -eq 0 ]
+grep -q '^verdict: pass ' <<<"$gate_output"
+excused_line="$(grep '^condition bounce_selectors: excused ' <<<"$gate_output")"
+grep -q 'exception_reason="principal accepted protected placeholder surface"' \
+  <<<"$excused_line"
+! grep -q '^condition bounce_selectors: pass ' <<<"$gate_output"
+
+# A same-SHA re-run is idempotent: already_judged changes only delivery state,
+# while the exception and aggregate verdict remain the same.
+run_gate tier 9 "$excused_fail_head"
+[ "$gate_status" -eq 0 ]
+grep -q '^verdict: pass ' <<<"$gate_output"
+grep -q '^condition bounce_selectors: excused ' <<<"$gate_output"
+grep -q 'already_judged=true$' <<<"$(head -n 1 <<<"$gate_output")"
+
+# Inconclusive results are excusable by the same post-processing step.
+excused_inconclusive_head="3333333333333333333333333333333333333333"
+grant_gate_exception required_checks 10 "$excused_inconclusive_head" \
+  "principal accepted unavailable placeholder check"
+run_gate unknown-check 10 "$excused_inconclusive_head"
+[ "$gate_status" -eq 0 ]
+grep -q '^condition required_checks: excused ' <<<"$gate_output"
+grep -q 'exception_reason="principal accepted unavailable placeholder check"' \
+  <<<"$gate_output"
+
+# A new head SHA silently invalidates the grant.
+stale_exception_head="4444444444444444444444444444444444444444"
+current_exception_head="5555555555555555555555555555555555555555"
+grant_gate_exception bounce_selectors 11 "$stale_exception_head" \
+  "principal accepted earlier placeholder artifact"
+run_gate tier 11 "$current_exception_head"
+[ "$gate_status" -eq 1 ]
+grep -q '^condition bounce_selectors: fail ' <<<"$gate_output"
+! grep -q 'principal accepted earlier placeholder artifact' <<<"$gate_output"
+
+# A grant for a different condition cannot excuse the failing condition.
+different_condition_head="6666666666666666666666666666666666666666"
+grant_gate_exception reserved_refs 12 "$different_condition_head" \
+  "principal accepted only placeholder reserved refs"
+run_gate tier 12 "$different_condition_head"
+[ "$gate_status" -eq 1 ]
+grep -q '^condition bounce_selectors: fail ' <<<"$gate_output"
+! grep -q '^condition bounce_selectors: excused ' <<<"$gate_output"
+
 gate_log="$gate_fixture/config/ostrom/gate.jsonl"
-[ "$(wc -l <"$gate_log" | tr -d '[:space:]')" -eq 7 ]
+[ "$(wc -l <"$gate_log" | tr -d '[:space:]')" -eq 12 ]
 jq -s -e '
   ([.[] | select(.pr == "placeholder-org/placeholder-repo#8")]
     | map({head_sha, already_judged}))
@@ -1843,6 +2034,20 @@ jq -s -e '
     and all(.conditions[];
       has("result") and has("tier") and (.tier | type == "array")
     )
+  )
+' "$gate_log" >/dev/null
+jq -s -e --arg head "$excused_fail_head" '
+  ([.[] | select(
+    .pr == "placeholder-org/placeholder-repo#9" and .head_sha == $head
+  )]) as $runs
+  | ($runs | length) == 2
+  and all($runs[];
+    .verdict == "pass"
+    and (([.conditions[] | select(.name == "bounce_selectors")][0]) as $condition
+      | $condition.result == "excused"
+      and $condition.exception_reason
+        == "principal accepted protected placeholder surface"
+      and $condition.result != "pass")
   )
 ' "$gate_log" >/dev/null
 

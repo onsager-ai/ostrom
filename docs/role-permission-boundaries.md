@@ -74,6 +74,7 @@ claude --settings ~/.claude/ostrom/roles/builder.settings.json
       "Bash(gh release upload *)",
       "Edit(~/.claude/ostrom/mandates.yaml)",
       "Edit(~/.claude/ostrom/gate.yaml)",
+      "Edit(~/.claude/ostrom/exceptions.jsonl)",
       "Edit(/.ostrom/mandates.yaml)",
       "Edit(/.ostrom/gate.yaml)"
     ]
@@ -83,6 +84,7 @@ claude --settings ~/.claude/ostrom/roles/builder.settings.json
       "denyWrite": [
         "~/.claude/ostrom/mandates.yaml",
         "~/.claude/ostrom/gate.yaml",
+        "~/.claude/ostrom/exceptions.jsonl",
         ".ostrom/mandates.yaml",
         ".ostrom/gate.yaml"
       ]
@@ -129,7 +131,8 @@ claude --settings ~/.claude/ostrom/roles/gatekeeper.settings.json
       "Bash(gh release create *)",
       "Bash(gh release edit *)",
       "Bash(gh release delete *)",
-      "Bash(gh release upload *)"
+      "Bash(gh release upload *)",
+      "Edit(~/.claude/ostrom/exceptions.jsonl)"
     ]
   },
   "sandbox": {
@@ -137,6 +140,7 @@ claude --settings ~/.claude/ostrom/roles/gatekeeper.settings.json
       "denyWrite": [
         "~/.claude/ostrom/mandates.yaml",
         "~/.claude/ostrom/gate.yaml",
+        "~/.claude/ostrom/exceptions.jsonl",
         ".ostrom/mandates.yaml",
         ".ostrom/gate.yaml"
       ]
@@ -145,10 +149,10 @@ claude --settings ~/.claude/ostrom/roles/gatekeeper.settings.json
 }
 ```
 
-The gatekeeper can read artifacts and run `gh pr merge`. It cannot write code,
-stage or commit changes, push, open PRs, rebase or resolve code conflicts, edit
-the mandate roster or gate conditions, or create tags and releases through the
-named ordinary commands.
+The gatekeeper can read artifacts, approve a passing gate as the App, and run
+`gh pr merge`. It cannot write code, stage or commit changes, push, open PRs,
+rebase or resolve code conflicts, edit the mandate roster or gate conditions,
+or create tags and releases through the named ordinary commands.
 
 ## Principal
 
@@ -157,8 +161,37 @@ user settings remain at `~/.claude/settings.json`; no deny rules are proposed
 for the principal here. The principal alone may edit
 `~/.claude/ostrom/mandates.yaml`, `~/.claude/ostrom/gate.yaml`, or a repository's
 `.ostrom/mandates.yaml` and `.ostrom/gate.yaml`, resolve or dismiss review
-threads, merge outside the gate for one explicitly named PR, and create tags or
-releases.
+threads, grant a gate exception for one explicitly named PR artifact, and
+create tags or releases.
+
+## One-PR exception path
+
+An exception is a machine-local event, not gate policy. The principal grants
+one with:
+
+```sh
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/excuse.sh" grant <owner/repo>#<number> <condition> <reason...>
+```
+
+The verb accepts only `required_checks`, `review_threads`,
+`bounce_selectors`, or `reserved_refs`, requires a non-empty reason, resolves
+the pull request's current head SHA itself, and appends the grant to
+`${CLAUDE_CONFIG_DIR:-$HOME/.claude}/ostrom/exceptions.jsonl`. Run
+`excuse.sh list [<owner/repo>#<number>]` to see append order and whether each
+record is current or superseded by the pull request's present head SHA.
+
+The next gate run evaluates every condition normally, then reports a matching
+failed or inconclusive condition as `excused`, with its reason. An excused
+condition satisfies aggregation but is never represented as a per-condition
+`pass`. The grant is scoped to `(repo, PR, head SHA, condition)`: it remains
+effective across legitimate re-runs of the same artifact and silently stops
+matching after a new commit. Records are never consumed or deleted.
+
+Both delivery profiles deny writes to this log. The builder cannot grant its
+own exception, and the gatekeeper cannot append an exception for the condition
+blocking it. The latter matters equally: that ability would let the gatekeeper
+manufacture the authority it is meant only to act on. The principal grants;
+the gatekeeper acts, approves a resulting pass as the App, and merges.
 
 ## Review-thread boundary cannot be expressed precisely
 

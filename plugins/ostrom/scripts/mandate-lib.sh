@@ -15,6 +15,7 @@ MANDATE_GATE_DEFAULT_CONFIG="$MANDATE_PLUGIN_ROOT/config/gate.defaults.yaml"
 MANDATE_GATE_USER_CONFIG="$MANDATE_DATA_DIR/gate.yaml"
 MANDATE_GATE_REPO_CONFIG="./.ostrom/gate.yaml"
 MANDATE_GATE_LOG="$MANDATE_DATA_DIR/gate.jsonl"
+MANDATE_EXCEPTIONS_LOG="$MANDATE_DATA_DIR/exceptions.jsonl"
 
 # Read the gatekeeper GitHub App credentials from the machine-local secrets
 # file. This intentionally remains separate from the shipped/user/repository
