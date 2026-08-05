@@ -182,6 +182,8 @@ mkdir -p "$fixture/layers/config/ostrom" "$fixture/layers/repo/.ostrom"
 cat >"$fixture/layers/config/ostrom/mandates.yaml" <<'YAML'
 cadence_hours: 12
 stuck_after_days: 5
+search_roots:
+  - /placeholder/user-root
 bounce_all:
   - label:user-boundary
 projects:
@@ -198,6 +200,8 @@ projects:
 YAML
 cat >"$fixture/layers/repo/.ostrom/mandates.yaml" <<'YAML'
 stuck_after_days: 2
+search_roots:
+  - /placeholder/repo-root
 bounce_all:
   - label:repo-boundary
 YAML
@@ -211,6 +215,7 @@ jq -e '
   .provider == "file"
   and .cadence_hours == 12
   and .stuck_after_days == 2
+  and .search_roots == ["/placeholder/repo-root"]
   and .bounce_all == ["label:repo-boundary"]
   and .projects[0].repo == "example-org/example-repo"
   and .projects[0].delegated == ["label:user-scope"]
@@ -348,6 +353,7 @@ JSON
   exit 0
 fi
 if [ "$1 $2" = "pr list" ]; then
+  [ "${FAKE_GH_PR_FAIL:-0}" != "1" ] || exit 1
   case "$repo" in
     example-org/example-repo)
       pr8_title="fix: routine maintenance"
@@ -379,6 +385,120 @@ fi
 exit 1
 EOF
 chmod +x "$fixture/bin/gh"
+
+# Local drift builds real repositories because patch equivalence, upstream
+# absence, dirtiness, and linked-worktree discovery are Git behavior rather
+# than string-parsing behavior.
+local_drift="$fixture/local-drift"
+mkdir -p "$local_drift/config/ostrom" "$local_drift/root"
+git init --bare "$local_drift/origin.git" >/dev/null
+git init -b main "$local_drift/root/repository" >/dev/null
+git -C "$local_drift/root/repository" config user.name "Test User"
+git -C "$local_drift/root/repository" config user.email "test@example.invalid"
+printf '%s\n' base >"$local_drift/root/repository/tracked.txt"
+git -C "$local_drift/root/repository" add tracked.txt
+git -C "$local_drift/root/repository" commit -m "base" >/dev/null
+git -C "$local_drift/root/repository" remote add origin "$local_drift/origin.git"
+git -C "$local_drift/root/repository" push -u origin main >/dev/null
+cat >"$local_drift/config/ostrom/mandates.yaml" <<YAML
+search_roots:
+  - $local_drift/root
+bounce_all: []
+projects: []
+YAML
+
+clean_local_drift="$(
+  cd "$local_drift"
+  PATH="$fixture/bin:$PATH" \
+    CLAUDE_CONFIG_DIR="$local_drift/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/local-drift.sh"
+)"
+[ -z "$clean_local_drift" ]
+
+# The landed branch has one raw commit whose patch was replayed onto main under
+# a different SHA. git cherry must classify it as patch-equivalent debris.
+git -C "$local_drift/root/repository" switch -c landed >/dev/null
+printf '%s\n' landed >"$local_drift/root/repository/landed.txt"
+git -C "$local_drift/root/repository" add landed.txt
+git -C "$local_drift/root/repository" commit -m "landed patch" >/dev/null
+landed_commit="$(git -C "$local_drift/root/repository" rev-parse landed)"
+git -C "$local_drift/root/repository" switch main >/dev/null
+printf '%s\n' main >"$local_drift/root/repository/main.txt"
+git -C "$local_drift/root/repository" add main.txt
+git -C "$local_drift/root/repository" commit -m "main divergence" >/dev/null
+git -C "$local_drift/root/repository" cherry-pick "$landed_commit" >/dev/null
+git -C "$local_drift/root/repository" push origin main >/dev/null
+
+# The unpublished branch lives in a linked worktree outside the configured
+# root and deliberately has no upstream. It is dirty as a separate condition.
+git -C "$local_drift/root/repository" worktree add -b unpublished \
+  "$local_drift/linked-worktree" origin/main >/dev/null
+git -C "$local_drift/root/repository" config --unset-all branch.unpublished.remote \
+  >/dev/null 2>&1 || true
+git -C "$local_drift/root/repository" config --unset-all branch.unpublished.merge \
+  >/dev/null 2>&1 || true
+printf '%s\n' unpublished >"$local_drift/linked-worktree/unpublished.txt"
+git -C "$local_drift/linked-worktree" add unpublished.txt
+git -C "$local_drift/linked-worktree" commit -m "unpublished patch" >/dev/null
+printf '%s\n' dirty >"$local_drift/linked-worktree/dirty.txt"
+
+# A fully pushed branch with neither an open nor merged PR is the next-stage
+# failure. The gh stub returns an empty list without using the network.
+git -C "$local_drift/root/repository" switch -c pushed origin/main >/dev/null
+printf '%s\n' pushed >"$local_drift/root/repository/pushed.txt"
+git -C "$local_drift/root/repository" add pushed.txt
+git -C "$local_drift/root/repository" commit -m "pushed patch" >/dev/null
+git -C "$local_drift/root/repository" push -u origin pushed >/dev/null
+
+local_drift_output="$(
+  cd "$local_drift"
+  PATH="$fixture/bin:$PATH" \
+    CLAUDE_CONFIG_DIR="$local_drift/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/local-drift.sh"
+)"
+grep -Fq \
+  'LIMIT: git cherry is patch-id based: it catches rebases but not squash merges; squash-merged work can appear unpublished.' \
+  <<<"$local_drift_output"
+grep -Eq $'^landed\t.*branch=landed\traw_commits=1\tpatches_not_in_main=0\t' \
+  <<<"$local_drift_output"
+grep -Eq $'^unpublished\t.*worktree=.*linked-worktree\tbranch=unpublished\traw_commits=1\tpatches_not_in_main=1\tpublication=unpushed-no-upstream$' \
+  <<<"$local_drift_output"
+grep -Eq $'^dirty\t.*worktree=.*linked-worktree\tbranch=unpublished\tchanges=1$' \
+  <<<"$local_drift_output"
+grep -Eq $'^unpublished\t.*branch=pushed\traw_commits=1\tpatches_not_in_main=1\tpublication=pushed-no-open-pr-or-merge$' \
+  <<<"$local_drift_output"
+
+unknown_pr_output="$(
+  cd "$local_drift"
+  PATH="$fixture/bin:$PATH" \
+    FAKE_GH_PR_FAIL=1 \
+    CLAUDE_CONFIG_DIR="$local_drift/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/local-drift.sh"
+)"
+grep -Eq $'^unpublished\t.*branch=pushed\t.*publication=pr-status-unknown$' \
+  <<<"$unknown_pr_output"
+
+# SessionStart keeps its established no-gh invariant. Its local-only scan still
+# surfaces the unpushed work as exactly one detail-free digest line.
+cat >"$local_drift/config/ostrom/state.json" <<'JSON'
+{"version":2,"repos":{},"dead_selectors":[]}
+JSON
+: >"$local_drift/gh-calls"
+local_drift_digest="$(
+  cd "$local_drift"
+  PATH="$fixture/bin:$PATH" \
+    FAKE_GH_CALL_LOG="$local_drift/gh-calls" \
+    CLAUDE_CONFIG_DIR="$local_drift/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/hooks/render-digest.sh"
+)"
+local_drift_digest_text="$(jq -r '.systemMessage' <<<"$local_drift_digest")"
+[ "$(grep -c '^LOCAL DRIFT — run mandate local-drift.sh for details$' \
+  <<<"$local_drift_digest_text")" -eq 1 ]
+[ ! -s "$local_drift/gh-calls" ]
 
 run_sweep() {
   (

@@ -77,6 +77,13 @@ remain machine-local at `~/.claude/ostrom/mandates.yaml`,
 `~/.claude/ostrom/queue.jsonl`, and `~/.claude/ostrom/state.json`; none
 belongs in this repository.
 
+`search_roots` is an opt-in list of local directories. The local drift scan
+discovers Git repositories beneath each root, enumerates every linked worktree,
+and reports dirty, unpublished, patch-equivalent landed, and fully pushed
+branches with no open or merged PR. Shipped defaults leave the list empty, so
+no local paths are guessed. Run `plugins/mandate/scripts/local-drift.sh` for
+detail.
+
 Each project uses case-insensitive qualified glob selectors in `delegated`,
 `excluded`, and `bounce`; `reserved` is a list of exact issue/PR numbers.
 Supported selectors are `label:`, `scope:`, `type:`, `path:`, `ref:`, and
@@ -99,12 +106,14 @@ placeholder clone path and install this with `crontab -e`:
 0 8 * * * cd /absolute/path/to/ostrom && CLAUDE_PLUGIN_ROOT=/absolute/path/to/ostrom/plugins/mandate /bin/bash /absolute/path/to/ostrom/plugins/mandate/scripts/sweep.sh
 ```
 
-The SessionStart hook never calls `gh`; it only renders the durable files
-written by the scheduled sweep. It emits one JSON document whose
+The SessionStart hook never calls `gh`; it renders the durable files written by
+the scheduled sweep and performs only the local portion of the drift scan. It
+emits one JSON document whose
 `systemMessage` displays the digest to the operator and whose
 `hookSpecificOutput.additionalContext` gives the assistant byte-identical
 text. Empty sections disappear, so a healthy portfolio's digest text is
-exactly `N projects nominal`. If the state file is older than `cadence_hours`,
+exactly `N projects nominal`; local drift adds one detail-free line only when
+found. If the state file is older than `cadence_hours`,
 the hook adds one short stale warning. Queue rows contain a
 resolvable GitHub pointer, its sweep-refreshed title, and mandate metadata,
 never mirrored issue or PR bodies. When an open PR closes a queued issue,
