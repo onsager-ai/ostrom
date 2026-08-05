@@ -120,7 +120,13 @@ case "$action" in
     current_heads='{}'
     while IFS= read -r current_target; do
       [ -n "$current_target" ] || continue
-      current_head="$(resolve_head "$current_target" "$work/pr.json")" || exit $?
+      # A pull request that no longer resolves must not take the whole listing
+      # down with it. `list` reads an append-only audit log, and an audit log
+      # that refuses to print because one old record points at a deleted pull
+      # request is worse than one that prints the record and admits it cannot
+      # classify it.
+      current_head="$(resolve_head "$current_target" "$work/pr.json" 2>/dev/null)" ||
+        current_head=""
       current_heads="$(jq -c \
         --arg target "$current_target" \
         --arg head "$current_head" \
@@ -140,7 +146,9 @@ case "$action" in
       .[]
       | (.repo + "#" + (.pr | tostring)) as $target
       | select($filter == "" or $target == $filter)
-      | (if $heads[$target] == .head_sha then "current" else "superseded" end)
+      | (if ($heads[$target] // "") == "" then "unknown"
+         elif $heads[$target] == .head_sha then "current"
+         else "superseded" end)
         + " " + $target
         + " " + .condition
         + " head_sha=" + .head_sha
