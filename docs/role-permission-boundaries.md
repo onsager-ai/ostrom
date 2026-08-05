@@ -9,9 +9,41 @@ profile.
 Claude Code deny rules are evaluated before ask and allow rules. The current
 syntax uses command globs such as `Bash(git push *)` and gitignore-style edit
 paths such as `Edit(~/.claude/ostrom/gate.yaml)`. The profiles also disable
-permission-bypass mode. These controls are defence in depth; GitHub branch
-protection is the enforceable merge boundary because it is server-side and
-outside either delivery session.
+permission-bypass mode. These controls are defence in depth. GitHub branch
+protection is the enforceable merge boundary only after the builder and
+gatekeeper authenticate as distinct GitHub identities, because only then can
+the server distinguish their authority. A fresh installation starts with both
+roles sharing the principal's identity; in that state, the branch-protection
+claim does not hold.
+
+## GitHub App identity prerequisite
+
+Before enabling branch protection or starting a gatekeeper session, the
+principal completes the GitHub App setup decided in
+[#29](https://github.com/onsager-ai/ostrom/issues/29):
+
+1. Create a GitHub App with Pull requests read/write, Contents read/write,
+   Checks read, and Metadata read permissions, then install it only on the
+   repositories the gatekeeper covers.
+2. Store its machine-local credentials outside every repository at
+   `~/.claude/ostrom/secrets.yaml` (or the equivalent path below
+   `CLAUDE_CONFIG_DIR`) using this shape:
+
+   ```yaml
+   gatekeeper:
+     app_id: <APP_ID>
+     installation_id: <INSTALLATION_ID>
+     private_key_path: <ABSOLUTE_PATH_TO_PRIVATE_KEY>
+   ```
+
+3. Launch the gatekeeper with the profile below. The profile clears inherited
+   GitHub tokens, and `/gatekeep` or `/merge` must successfully mint a fresh
+   App installation token before making any `gh` call.
+
+Until these steps are complete, the builder and gatekeeper remain the same
+GitHub actor: author-resolved threads cannot be distinguished from legitimate
+gatekeeper resolutions, branch protection cannot enforce the role split, and
+`merged_by` has no independent audit value.
 
 ## Builder profile
 
@@ -72,6 +104,10 @@ claude --settings ~/.claude/ostrom/roles/gatekeeper.settings.json
 ```json
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "env": {
+    "GH_TOKEN": "",
+    "GITHUB_TOKEN": ""
+  },
   "permissions": {
     "disableBypassPermissionsMode": "disable",
     "deny": [
@@ -130,8 +166,10 @@ and harmless whitespace changes all bypass it. A binary/subcommand deny would
 also block the gatekeeper's required read.
 
 Do not replace that omission with a coarse deny that blocks unrelated GitHub
-work. GitHub branch protection is the enforceable server-side boundary, and
-the `gh pr merge` deny for the builder remains client-side defence in depth.
+work. Once the builder and gatekeeper use distinct GitHub identities, branch
+protection is the enforceable server-side boundary; in a fresh
+shared-identity installation it is not. The `gh pr merge` deny for the builder
+remains client-side defence in depth.
 For the thread-specific conflict of interest, `gate.sh` independently treats
 every thread resolved by the PR author as unresolved, so self-resolution
 cannot satisfy the condition. Stronger prevention requires a GitHub-side
