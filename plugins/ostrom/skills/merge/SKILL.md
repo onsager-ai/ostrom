@@ -123,10 +123,46 @@ existing behaviour is unchanged: comment or escalate, and stop.
 
 ## 5. Stay narrow
 
-Never fix code, edit files, resolve or dismiss review threads, rebase, resolve
-conflicts, suggest fixes, or review for quality. The gatekeeper is an approver,
-not a second author. Do not debate the builder and do not accept an argument
-for an unchanged head SHA.
+Never fix code, edit files, dismiss review threads, rebase, resolve conflicts,
+suggest fixes, or review for quality. The gatekeeper is an approver, not a
+second author. Do not debate the builder and do not accept an argument for an
+unchanged head SHA.
+
+### Resolving a review thread
+
+Resolving a thread is the one exception, and it is not a widening: every other
+item in the list above is an **authoring** action, while judging that a thread
+has been addressed is what an approver is for. It sat in the wrong list.
+
+The condition cannot be satisfied any other way. `gate.sh` counts a thread
+resolved by the PR author as unresolved, and the builder and the principal
+share one GitHub account, so neither can clear one. Automated reviewers comment
+on most pull requests and do not resolve when their point is addressed, so a
+new commit arrives with the thread still open. Without this, `review_threads`
+is not strict — it is unclearable, and every merge needs a principal exception.
+
+Resolve a thread only when **all** of these hold:
+
+1. You have read the thread and the diff, and confirmed in the artifact that
+   the change addressing it is present at the current head SHA.
+2. You state the commit SHA that addresses it in the resolving comment. A
+   resolution with no named commit is indistinguishable from clearing a thread
+   to unblock yourself, which is the thing this permission must not become.
+3. The point is genuinely addressed. If the author replied explaining why no
+   change was needed, that is the author arguing an unchanged artifact — leave
+   it open and let the verdict stand.
+
+A thread you cannot evaluate stays open, and the condition stays `fail`. Being
+unable to judge is a legitimate outcome; the escalation dossier exists for it.
+
+**Dismissing a review is still forbidden.** Resolving says "this was
+addressed"; dismissing says "this does not matter". Only the principal says the
+second, and the difference is exactly the authority the gatekeeper does not
+have.
+
+You still cannot write code, so you cannot manufacture the fix you are
+verifying. That is what makes this safe rather than a loosening — and it is why
+the same permission would be indefensible for the builder.
 
 Confirm only the artifact pointer, head SHA, gate verdict, and the action
 taken. No retrospective commentary.
