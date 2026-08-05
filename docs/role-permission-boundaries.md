@@ -40,6 +40,18 @@ being unable to merge. **The only control that does not depend on the session
 behaving is server-side branch protection**, and where a repository's plan does
 not offer it, the separation there is advisory.
 
+**Neither profile may deny `gh api` wholesale**, and the gatekeeper's case is
+the sharper one. `gate.sh` reads review threads through `gh api graphql` —
+there is no porcelain for it — so a blanket deny would make every condition
+unobservable and every verdict `inconclusive`. The gatekeeper would be locked
+out of the gate it exists to run, while appearing to work.
+
+Both profiles therefore deny the **mutating** forms only, in every spelling the
+matcher can name: `--method` and `-X` for PUT, POST, PATCH and DELETE, spaced
+and unspaced, plus graphql mutations. That narrows the surface without severing
+the reads either role depends on, and it does not close the gap — see the
+limits above.
+
 ## GitHub App identity prerequisite
 
 Before enabling branch protection or starting a gatekeeper session, the
@@ -98,6 +110,10 @@ claude --settings ~/.claude/ostrom/roles/builder.settings.json
       "Bash(gh api *-X POST*)",
       "Bash(gh api *-X PATCH*)",
       "Bash(gh api *-X DELETE*)",
+      "Bash(gh api *-XPUT*)",
+      "Bash(gh api *-XPOST*)",
+      "Bash(gh api *-XPATCH*)",
+      "Bash(gh api *-XDELETE*)",
       "Bash(gh api graphql*mutation*)",
       "Bash(git tag *)",
       "Bash(git push *--tags*)",
@@ -167,7 +183,19 @@ claude --settings ~/.claude/ostrom/roles/gatekeeper.settings.json
       "Bash(gh pr close *)",
       "Bash(gh issue create *)",
       "Bash(gh issue edit *)",
-      "Bash(gh api *)",
+      "Bash(gh api *--method PUT*)",
+      "Bash(gh api *--method POST*)",
+      "Bash(gh api *--method PATCH*)",
+      "Bash(gh api *--method DELETE*)",
+      "Bash(gh api *-X PUT*)",
+      "Bash(gh api *-X POST*)",
+      "Bash(gh api *-X PATCH*)",
+      "Bash(gh api *-X DELETE*)",
+      "Bash(gh api *-XPUT*)",
+      "Bash(gh api *-XPOST*)",
+      "Bash(gh api *-XPATCH*)",
+      "Bash(gh api *-XDELETE*)",
+      "Bash(gh api graphql*mutation*)",
       "Bash(git tag *)",
       "Bash(gh release create *)",
       "Bash(gh release edit *)",
