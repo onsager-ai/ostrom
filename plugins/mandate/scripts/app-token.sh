@@ -15,6 +15,23 @@ fail() {
   exit 2
 }
 
+if [ "$#" -ne 1 ]; then
+  fail "usage: app-token.sh <owner>/<repo>"
+fi
+repository="$1"
+case "$repository" in
+  */*) ;;
+  *) fail "usage: app-token.sh <owner>/<repo>" ;;
+esac
+owner="${repository%%/*}"
+repo="${repository#*/}"
+case "$owner" in
+  ''|*[!A-Za-z0-9_.-]*) fail "usage: app-token.sh <owner>/<repo>" ;;
+esac
+case "$repo" in
+  ''|*/*|*[!A-Za-z0-9_.-]*) fail "usage: app-token.sh <owner>/<repo>" ;;
+esac
+
 for required_command in jq openssl curl; do
   command -v "$required_command" >/dev/null 2>&1 || \
     fail "required command is unavailable: $required_command"
@@ -23,8 +40,6 @@ done
 credentials="$(mandate_load_gatekeeper_credentials)" || exit $?
 app_id="$(printf '%s' "$credentials" | jq -er '.app_id')" || \
   fail "could not read gatekeeper app_id"
-installation_id="$(printf '%s' "$credentials" | jq -er '.installation_id')" || \
-  fail "could not read gatekeeper installation_id"
 private_key_path="$(printf '%s' "$credentials" | jq -er '.private_key_path')" || \
   fail "could not read gatekeeper private_key_path"
 unset credentials
@@ -69,6 +84,35 @@ unset header payload encoded_header encoded_payload signing_input signature priv
 
 # Feed the Authorization header through stdin so the JWT is absent from the
 # process argument list. The response remains in memory and is never echoed.
+lookup_response="$(
+  printf 'header = "Authorization: Bearer %s"\n' "$jwt" |
+    curl --config - \
+      --silent \
+      --request GET \
+      --header 'Accept: application/vnd.github+json' \
+      --header 'X-GitHub-Api-Version: 2022-11-28' \
+      --write-out '\n%{http_code}' \
+      "https://api.github.com/repos/$repository/installation" \
+      2>/dev/null
+)" || fail "GitHub App installation lookup failed"
+
+lookup_status="${lookup_response##*$'\n'}"
+lookup_body="${lookup_response%$'\n'*}"
+unset lookup_response
+if [ "$lookup_status" = "404" ]; then
+  unset jwt lookup_body lookup_status
+  fail "GitHub App is not installed on repository $repository"
+fi
+if [ "$lookup_status" != "200" ]; then
+  unset jwt lookup_body lookup_status repository owner repo
+  fail "GitHub App installation lookup failed"
+fi
+installation_id="$(
+  printf '%s' "$lookup_body" |
+    jq -er '.id | select(type == "number" and . > 0) | tostring' 2>/dev/null
+)" || fail "GitHub App installation lookup response was invalid"
+unset lookup_body lookup_status repository owner repo
+
 response="$(
   printf 'header = "Authorization: Bearer %s"\n' "$jwt" |
     curl --config - \

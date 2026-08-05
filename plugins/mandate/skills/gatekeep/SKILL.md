@@ -24,31 +24,7 @@ independence.
 Accept no arguments, summaries, dossiers, previous verdicts, or claims from
 the builder. The builder's only reply is a new commit.
 
-## 2. Authenticate as the gatekeeper App
-
-At the start of every iteration, before any `gh` call, discard ambient GitHub
-credentials and mint a fresh installation token:
-
-```sh
-set +x
-unset GH_TOKEN GITHUB_TOKEN
-if ! gatekeeper_token="$(bash "${CLAUDE_PLUGIN_ROOT}/scripts/app-token.sh")" ||
-  [ -z "$gatekeeper_token" ]; then
-  unset gatekeeper_token
-  echo "gatekeep: GitHub App authentication failed; stopping" >&2
-  exit 1
-fi
-export GH_TOKEN="$gatekeeper_token"
-unset gatekeeper_token
-```
-
-Keep that `GH_TOKEN` for every `gh` call in the iteration; do not replace it
-with another credential, and keep shell tracing disabled while it is present.
-**A gatekeeper session that cannot mint an App token must stop, not continue as
-the principal.** Continuing with an ambient token would silently recreate the
-shared-identity failure the App exists to remove.
-
-## 3. Resolve the roster once per iteration
+## 2. Resolve the roster once per iteration
 
 Use the existing mandate config resolution. Do not read the YAML directly or
 implement another roster parser:
@@ -64,10 +40,42 @@ iteration. From the resolved JSON, take only each project's `repo` pointer.
 Every roster repository is in scope, including a project marked `paused`;
 gatekeeping open pull requests is not routine builder work.
 
+## 3. Authenticate per repository as the gatekeeper App
+
+At the start of every iteration, before any `gh` call, discard ambient GitHub
+credentials. Then, immediately before calling `gh` for each roster repository,
+mint a fresh token for that repository:
+
+```sh
+set +x
+unset GH_TOKEN GITHUB_TOKEN
+if ! gatekeeper_token="$(
+  bash "${CLAUDE_PLUGIN_ROOT}/scripts/app-token.sh" "$repository"
+)" ||
+  [ -z "$gatekeeper_token" ]; then
+  unset gatekeeper_token
+  echo "gatekeep: GitHub App authentication failed; stopping" >&2
+  exit 1
+fi
+export GH_TOKEN="$gatekeeper_token"
+unset gatekeeper_token
+```
+
+Keep that `GH_TOKEN` only for `gh` calls against that repository. Unset it
+before moving to another repository; do not replace it with another credential,
+and keep shell tracing disabled while it is present. `/merge` mints again for
+each candidate rather than reusing the enumeration token.
+
+**A gatekeeper session that cannot mint an App token must stop, not continue as the principal.**
+
+Continuing with an ambient token would silently recreate the shared-identity
+failure the App exists to remove.
+
 ## 4. Enumerate every open pull request
 
-Poll GitHub for all open pull requests in every roster repository. Paginate
-until there are no more results. Do not filter candidates through mandate
+Poll GitHub for all open pull requests in every roster repository, using only
+the token minted for that repository, and unset `GH_TOKEN` when its pagination
+is complete. Paginate until there are no more results. Do not filter candidates through mandate
 selectors, the queue, prior gate verdicts, draft state, labels, or conclusions
 from another pull request. An iteration covers the whole roster because the
 artifact gate evaluates each pull request independently.
