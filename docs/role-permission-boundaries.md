@@ -218,7 +218,6 @@ claude --settings ~/.claude/ostrom/roles/gatekeeper.settings.json
       "Bash(gh api *-XPOST*)",
       "Bash(gh api *-XPATCH*)",
       "Bash(gh api *-XDELETE*)",
-      "Bash(gh api graphql*mutation*)",
       "Bash(git tag *)",
       "Bash(gh release create *)",
       "Bash(gh release edit *)",
@@ -304,3 +303,18 @@ every thread resolved by the PR author as unresolved, so self-resolution
 cannot satisfy the condition. Stronger prevention requires a GitHub-side
 control or separate OS identity administered by the principal, not another
 fragile Claude Code command pattern.
+
+**The gatekeeper profile therefore carries no graphql-mutation deny, and the
+builder's stays.** Resolving a review thread is the `resolveReviewThread`
+mutation — there is no porcelain for it — so that deny would forbid the
+gatekeeper the one write its role requires, while leaving the gate condition
+satisfiable by nobody. This is the second time a deny written for the builder
+was copied onto the gatekeeper and locked it out of its own job; the first was
+a blanket `gh api` deny that would have made every verdict `inconclusive`.
+Before adding a deny to the gatekeeper, check what `gate.sh` and
+`/ostrom:merge` actually call.
+
+That deny was never load-bearing anyway: it matches only the literal word
+`mutation` in the command string, so `--input`, `-F query=@file` and a
+whitespace change all pass it. It is kept for the builder as the same kind of
+visible-refusal defence as the rest of the list, and for no stronger reason.
