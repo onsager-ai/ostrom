@@ -16,6 +16,30 @@ the server distinguish their authority. A fresh installation starts with both
 roles sharing the principal's identity; in that state, the branch-protection
 claim does not hold.
 
+## What these denies are, and are not
+
+**They are defence against inattention, not against intent.** They match command
+strings, and a command string has many equivalent spellings. `gh pr merge` is
+denied; the same merge through `gh api --method PUT /repos/{owner}/{repo}/pulls/{n}/merge`,
+through `gh api graphql` with `mergePullRequest`, through `curl`, or through the
+web interface is a different string. The lists below block the mutating `gh api`
+forms as well, which narrows the gap without closing it — enumerating every REST
+path and spelling is a race the matcher has already lost.
+
+Two further limits, both structural:
+
+- **Nothing forces `--settings`.** A session launched without it carries no deny
+  at all. The profile binds the session that opted into it.
+- **Enforcement is client-side.** These rules are evaluated by Claude Code, so a
+  path that reaches GitHub another way — an MCP tool, a hook, a helper script —
+  is not matched.
+
+The value of a client-side deny is real but specific: it converts a silent
+mistake into a visible refusal. That is worth having, and it is not the same as
+being unable to merge. **The only control that does not depend on the session
+behaving is server-side branch protection**, and where a repository's plan does
+not offer it, the separation there is advisory.
+
 ## GitHub App identity prerequisite
 
 Before enabling branch protection or starting a gatekeeper session, the
@@ -65,15 +89,29 @@ claude --settings ~/.claude/ostrom/roles/builder.settings.json
     "disableBypassPermissionsMode": "disable",
     "deny": [
       "Bash(gh pr merge *)",
+      "Bash(gh pr review *)",
+      "Bash(gh api *--method PUT*)",
+      "Bash(gh api *--method POST*)",
+      "Bash(gh api *--method PATCH*)",
+      "Bash(gh api *--method DELETE*)",
+      "Bash(gh api *-X PUT*)",
+      "Bash(gh api *-X POST*)",
+      "Bash(gh api *-X PATCH*)",
+      "Bash(gh api *-X DELETE*)",
+      "Bash(gh api graphql*mutation*)",
       "Bash(git tag *)",
       "Bash(git push *--tags*)",
       "Bash(git push *refs/tags/*)",
+      "Bash(git push *--force*)",
+      "Bash(git push *-f *)",
       "Bash(gh release create *)",
       "Bash(gh release edit *)",
       "Bash(gh release delete *)",
       "Bash(gh release upload *)",
       "Edit(~/.claude/ostrom/mandates.yaml)",
       "Edit(~/.claude/ostrom/gate.yaml)",
+      "Edit(~/.claude/ostrom/rules.md)",
+      "Edit(~/.claude/ostrom/roles/**)",
       "Edit(/.ostrom/mandates.yaml)",
       "Edit(/.ostrom/gate.yaml)"
     ]
@@ -125,6 +163,11 @@ claude --settings ~/.claude/ostrom/roles/gatekeeper.settings.json
       "Bash(git rebase *)",
       "Bash(git push *)",
       "Bash(gh pr create *)",
+      "Bash(gh pr edit *)",
+      "Bash(gh pr close *)",
+      "Bash(gh issue create *)",
+      "Bash(gh issue edit *)",
+      "Bash(gh api *)",
       "Bash(git tag *)",
       "Bash(gh release create *)",
       "Bash(gh release edit *)",
