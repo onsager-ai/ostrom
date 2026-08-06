@@ -97,7 +97,7 @@ fi
 metadata_ready=0
 head_sha=""
 if gh pr view "$number" --repo "$repo" \
-  --json number,title,author,headRefOid,labels,statusCheckRollup,closingIssuesReferences \
+  --json number,title,author,headRefOid,labels,statusCheckRollup,closingIssuesReferences,mergeable,isDraft \
   >"$work/pr.json" 2>"$work/pr-error"; then
   head_sha="$(jq -r '
     if (.headRefOid | type) == "string" then .headRefOid else empty end
@@ -111,6 +111,8 @@ if gh pr view "$number" --repo "$repo" \
     and (.labels | type == "array")
     and (.statusCheckRollup | type == "array")
     and (.closingIssuesReferences | type == "array")
+    and (.mergeable | type == "string")
+    and (.isDraft | type == "boolean")
   ' "$work/pr.json" >/dev/null 2>&1; then
     metadata_ready=1
   else
@@ -230,7 +232,40 @@ if [ "$config_ready" -eq 0 ]; then
   write_condition "$work/threads-condition.json" review_threads inconclusive '[]' "$detail"
   write_condition "$work/bounce-condition.json" bounce_selectors inconclusive '[]' "$detail"
   write_condition "$work/reserved-condition.json" reserved_refs inconclusive '[]' "$detail"
+  detail="$(jq -cn --arg reason "$config_error" '{mergeable: null, reason: $reason}')"
+  write_condition "$work/mergeable-condition.json" mergeable inconclusive '[]' "$detail"
+  detail="$(jq -cn --arg reason "$config_error" '{isDraft: null, reason: $reason}')"
+  write_condition "$work/draft-condition.json" draft inconclusive '[]' "$detail"
 else
+  if [ "$metadata_ready" -eq 0 ]; then
+    detail="$(jq -cn --arg reason "$metadata_error" '{mergeable: null, reason: $reason}')"
+    write_condition "$work/mergeable-condition.json" mergeable inconclusive '["content-derived"]' "$detail"
+    detail="$(jq -cn --arg reason "$metadata_error" '{isDraft: null, reason: $reason}')"
+    write_condition "$work/draft-condition.json" draft inconclusive '["content-derived"]' "$detail"
+  else
+    jq '
+      {
+        name: "mergeable",
+        result: (
+          if .mergeable == "MERGEABLE" then "pass"
+          elif .mergeable == "CONFLICTING" then "fail"
+          else "inconclusive"
+          end
+        ),
+        tier: ["content-derived"],
+        detail: {mergeable: .mergeable}
+      }
+    ' "$work/pr-safe.json" >"$work/mergeable-condition.json"
+    jq '
+      {
+        name: "draft",
+        result: (if .isDraft then "fail" else "pass" end),
+        tier: ["content-derived"],
+        detail: {isDraft: .isDraft}
+      }
+    ' "$work/pr-safe.json" >"$work/draft-condition.json"
+  fi
+
   if [ "$metadata_ready" -eq 0 ]; then
     detail="$(jq -cn --arg reason "$metadata_error" '{reason: $reason}')"
     write_condition "$work/checks-condition.json" required_checks inconclusive '["content-derived"]' "$detail"
@@ -500,6 +535,8 @@ else
 fi
 
 jq -s '.' \
+  "$work/mergeable-condition.json" \
+  "$work/draft-condition.json" \
   "$work/checks-condition.json" \
   "$work/threads-condition.json" \
   "$work/bounce-condition.json" \
