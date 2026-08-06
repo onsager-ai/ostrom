@@ -1717,10 +1717,22 @@ if [ "$1 $2" = "pr view" ]; then
   if [ "${FAKE_GATE_MODE:-pass}" = "unknown-check" ]; then
     check_conclusion="UNRECOGNIZED"
   fi
+  mergeable="MERGEABLE"
+  is_draft=false
+  if [ "${FAKE_GATE_MODE:-pass}" = "conflicting" ]; then
+    mergeable="CONFLICTING"
+  elif [ "${FAKE_GATE_MODE:-pass}" = "unknown-mergeable" ]; then
+    mergeable="UNKNOWN"
+  elif [ "${FAKE_GATE_MODE:-pass}" = "draft" ]; then
+    is_draft=true
+  fi
   jq -cn \
     --argjson number "$3" \
     --arg head "${FAKE_GATE_HEAD:-aaaaaaaaaaaaaaaa}" \
     --arg conclusion "$check_conclusion" \
+    --arg mergeable "$mergeable" \
+    --argjson is_draft "$is_draft" \
+    --arg mode "${FAKE_GATE_MODE:-pass}" \
     --arg title "$(
       if [ "${FAKE_GATE_MODE:-pass}" = "tier" ]; then
         printf '%s' 'release: publish placeholder artifact'
@@ -1739,8 +1751,14 @@ if [ "$1 $2" = "pr view" ]; then
           status: "COMPLETED",
           conclusion: $conclusion
         }],
-        closingIssuesReferences: []
+        closingIssuesReferences: [],
+        mergeable: $mergeable,
+        isDraft: $is_draft
       }
+      | if $mode == "missing-mergeable" then del(.mergeable)
+        elif $mode == "malformed-mergeable" then .mergeable = 7
+        else .
+        end
     '
   exit 0
 fi
@@ -1918,6 +1936,44 @@ run_gate pass 7 aaaaaaaaaaaaaaaa
 grep -q '^verdict: pass ' <<<"$gate_output"
 grep -q '^condition required_checks: pass tier=content-derived ' <<<"$gate_output"
 grep -q '^condition review_threads: pass tier=content-derived ' <<<"$gate_output"
+grep -q '^condition mergeable: pass tier=content-derived detail={"mergeable":"MERGEABLE"}$' \
+  <<<"$gate_output"
+grep -q '^condition draft: pass tier=content-derived detail={"isDraft":false}$' \
+  <<<"$gate_output"
+
+# GitHub mergeability and draft state are unconditional gate mechanisms.
+run_gate conflicting 13 1313131313131313
+[ "$gate_status" -eq 1 ]
+grep -q '^verdict: fail ' <<<"$gate_output"
+grep -q '^condition mergeable: fail tier=content-derived detail={"mergeable":"CONFLICTING"}$' \
+  <<<"$gate_output"
+
+# A clean pull request still fails while its author has left it as a draft.
+run_gate draft 14 1414141414141414
+[ "$gate_status" -eq 1 ]
+grep -q '^verdict: fail ' <<<"$gate_output"
+grep -q '^condition required_checks: pass ' <<<"$gate_output"
+grep -q '^condition mergeable: pass ' <<<"$gate_output"
+grep -q '^condition draft: fail tier=content-derived detail={"isDraft":true}$' \
+  <<<"$gate_output"
+
+run_gate unknown-mergeable 15 1515151515151515
+[ "$gate_status" -eq 2 ]
+grep -q '^verdict: inconclusive ' <<<"$gate_output"
+grep -q '^condition mergeable: inconclusive tier=content-derived detail={"mergeable":"UNKNOWN"}$' \
+  <<<"$gate_output"
+
+run_gate missing-mergeable 16 1616161616161616
+[ "$gate_status" -eq 2 ]
+grep -q '^verdict: inconclusive ' <<<"$gate_output"
+grep -q '^condition mergeable: inconclusive tier=content-derived detail={"mergeable":null,' \
+  <<<"$gate_output"
+
+run_gate malformed-mergeable 17 1717171717171717
+[ "$gate_status" -eq 2 ]
+grep -q '^verdict: inconclusive ' <<<"$gate_output"
+grep -q '^condition mergeable: inconclusive tier=content-derived detail={"mergeable":null,' \
+  <<<"$gate_output"
 
 run_gate tier 7 bbbbbbbbbbbbbbbb
 [ "$gate_status" -eq 1 ]
@@ -2020,7 +2076,7 @@ grep -q '^condition bounce_selectors: fail ' <<<"$gate_output"
 ! grep -q '^condition bounce_selectors: excused ' <<<"$gate_output"
 
 gate_log="$gate_fixture/config/ostrom/gate.jsonl"
-[ "$(wc -l <"$gate_log" | tr -d '[:space:]')" -eq 12 ]
+[ "$(wc -l <"$gate_log" | tr -d '[:space:]')" -eq 17 ]
 jq -s -e '
   ([.[] | select(.pr == "placeholder-org/placeholder-repo#8")]
     | map({head_sha, already_judged}))
@@ -2030,7 +2086,7 @@ jq -s -e '
     {head_sha: "ffffffffffffffff", already_judged: false}
   ]
   and all(.[];
-    (.conditions | length) == 4
+    (.conditions | length) == 6
     and all(.conditions[];
       has("result") and has("tier") and (.tier | type == "array")
     )
