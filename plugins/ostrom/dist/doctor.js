@@ -294,20 +294,180 @@ function checkPlugin(context) {
   };
 }
 
+// src/checks/trace-lease.ts
+import { existsSync, readFileSync as readFileSync3 } from "node:fs";
+import { join as join4 } from "node:path";
+var TRACE_STALE_SECONDS = 24 * 60 * 60;
+var MAX_DATE_EPOCH_SECONDS = 864e10;
+function nowEpoch(context) {
+  const explicit = context.env.MANDATE_NOW_EPOCH;
+  if (explicit && /^\d+$/.test(explicit)) return Number(explicit);
+  const sweepTime = context.env.MANDATE_SWEEP_TIME;
+  if (sweepTime) {
+    const parsed = Date.parse(sweepTime);
+    if (Number.isFinite(parsed)) return Math.floor(parsed / 1e3);
+  }
+  return Math.floor(Date.now() / 1e3);
+}
+function exactKeys(value, expected) {
+  return JSON.stringify(Object.keys(value).sort()) === JSON.stringify(expected);
+}
+function jsonObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+function traceHealth(path, now) {
+  if (!existsSync(path)) {
+    return {
+      status: "WARN",
+      detail: "trace absent",
+      remedy: "run /ostrom:gatekeep and confirm it creates sprint.jsonl"
+    };
+  }
+  let source;
+  try {
+    source = readFileSync3(path, "utf8");
+  } catch {
+    return {
+      status: "WARN",
+      detail: "trace unreadable",
+      remedy: "inspect sprint.jsonl and fix its permissions"
+    };
+  }
+  let contentEnd = source.length;
+  while (contentEnd > 0 && source[contentEnd - 1] === "\n") {
+    contentEnd -= 1;
+    if (contentEnd > 0 && source[contentEnd - 1] === "\r") {
+      contentEnd -= 1;
+    }
+  }
+  const lastLineStart = source.lastIndexOf("\n", contentEnd - 1) + 1;
+  const lastLine = source.slice(lastLineStart, contentEnd);
+  if (lastLine.length === 0) {
+    return {
+      status: "WARN",
+      detail: "trace present but empty",
+      remedy: "run /ostrom:gatekeep and confirm it appends a complete pass"
+    };
+  }
+  let record;
+  try {
+    record = JSON.parse(lastLine);
+  } catch {
+    return {
+      status: "WARN",
+      detail: "trace last record is unreadable",
+      remedy: "inspect sprint.jsonl and repair or remove its malformed last record"
+    };
+  }
+  if (!jsonObject(record) || !exactKeys(record, ["fact", "kind", "narration", "ts"]) || typeof record.ts !== "string" || record.ts.length === 0 || typeof record.kind !== "string" || record.kind.length === 0 || !jsonObject(record.fact) || !jsonObject(record.narration)) {
+    return {
+      status: "WARN",
+      detail: "trace last record has an invalid shape",
+      remedy: "inspect sprint.jsonl; records must be written by trace.sh append"
+    };
+  }
+  const timestamp = record.ts;
+  const timestampMs = Date.parse(timestamp);
+  if (!timestamp || !Number.isFinite(timestampMs)) {
+    return {
+      status: "WARN",
+      detail: "trace last record has an invalid timestamp",
+      remedy: "inspect sprint.jsonl; records must be written by trace.sh append"
+    };
+  }
+  const ageSeconds = now - Math.floor(timestampMs / 1e3);
+  if (ageSeconds > TRACE_STALE_SECONDS) {
+    return {
+      status: "WARN",
+      detail: `trace stale, last ${timestamp} (older than 24h)`,
+      remedy: "run /ostrom:gatekeep and confirm the recurring loop is active"
+    };
+  }
+  return {
+    status: "OK",
+    detail: `trace current, last ${timestamp}`,
+    remedy: ""
+  };
+}
+function validLease(value) {
+  if (!value || typeof value !== "object") return false;
+  if (!exactKeys(value, ["expires_at", "owner", "started_at"])) return false;
+  const lease = value;
+  return typeof lease.owner === "string" && lease.owner.length > 0 && Number.isSafeInteger(lease.started_at) && (lease.started_at ?? -1) >= 0 && (lease.started_at ?? Infinity) <= MAX_DATE_EPOCH_SECONDS && Number.isSafeInteger(lease.expires_at) && (lease.expires_at ?? -1) >= (lease.started_at ?? 0) && (lease.expires_at ?? Infinity) <= MAX_DATE_EPOCH_SECONDS;
+}
+function leaseHealth(path, now) {
+  if (!existsSync(path)) {
+    return { status: "OK", detail: "lease idle", remedy: "" };
+  }
+  let source;
+  try {
+    source = readFileSync3(path, "utf8");
+  } catch {
+    return {
+      status: "WARN",
+      detail: "lease unreadable",
+      remedy: "inspect sprint.lease and fix its permissions"
+    };
+  }
+  let lease;
+  try {
+    lease = JSON.parse(source);
+  } catch {
+    return {
+      status: "WARN",
+      detail: "lease unreadable",
+      remedy: "inspect sprint.lease; only lease.sh may create or remove it"
+    };
+  }
+  if (!validLease(lease)) {
+    return {
+      status: "WARN",
+      detail: "lease has an invalid shape",
+      remedy: "inspect sprint.lease; only lease.sh may create or remove it"
+    };
+  }
+  const expiry = new Date(lease.expires_at * 1e3).toISOString();
+  if (now >= lease.expires_at) {
+    return {
+      status: "WARN",
+      detail: `lease stale for ${lease.owner}, expired ${expiry}`,
+      remedy: "allow the next gatekeeper pass to reclaim the expired lease"
+    };
+  }
+  return {
+    status: "OK",
+    detail: `lease held by ${lease.owner} until ${expiry}`,
+    remedy: ""
+  };
+}
+function checkTraceLease(context) {
+  const dataDir = join4(context.configDir, "ostrom");
+  const now = nowEpoch(context);
+  const trace = traceHealth(join4(dataDir, "sprint.jsonl"), now);
+  const lease = leaseHealth(join4(dataDir, "sprint.lease"), now);
+  const warned = trace.status === "WARN" || lease.status === "WARN";
+  return {
+    status: warned ? "WARN" : "OK",
+    name: "trace-lease",
+    detail: `${trace.detail}; ${lease.detail}`,
+    remedy: [trace.remedy, lease.remedy].filter(Boolean).join("; ")
+  };
+}
+
 // src/checks/touch.ts
 import {
   accessSync,
   constants,
-  existsSync as existsSync2,
+  existsSync as existsSync3,
   lstatSync,
   realpathSync,
   statSync as statSync4
 } from "node:fs";
-import { dirname, join as join5 } from "node:path";
+import { dirname, join as join6 } from "node:path";
 
 // src/lib/config.ts
-import { existsSync, readFileSync as readFileSync3 } from "node:fs";
-import { join as join4 } from "node:path";
+import { existsSync as existsSync2, readFileSync as readFileSync4 } from "node:fs";
+import { join as join5 } from "node:path";
 function stripComment(input) {
   let singleQuoted = false;
   let doubleQuoted = false;
@@ -380,9 +540,9 @@ function parseOstromYaml(source) {
   return config;
 }
 function load(path) {
-  if (!existsSync(path)) return {};
+  if (!existsSync2(path)) return {};
   try {
-    return parseOstromYaml(readFileSync3(path, "utf8"));
+    return parseOstromYaml(readFileSync4(path, "utf8"));
   } catch {
     return {};
   }
@@ -406,9 +566,9 @@ function merge(base, override) {
 }
 function resolveTouchConfig(pluginRoot2, configDir2, cwd) {
   const paths = [
-    join4(pluginRoot2, "config", "touch-defaults.yaml"),
-    join4(configDir2, "ostrom", "config.yaml"),
-    join4(cwd, ".ostrom", "config.yaml")
+    join5(pluginRoot2, "config", "touch-defaults.yaml"),
+    join5(configDir2, "ostrom", "config.yaml"),
+    join5(cwd, ".ostrom", "config.yaml")
   ];
   const config = paths.reduce(
     (resolved, path) => merge(resolved, load(path)),
@@ -425,7 +585,7 @@ function resolveTouchConfig(pluginRoot2, configDir2, cwd) {
 }
 function expandTilde(path, home2) {
   if (path === "~") return home2;
-  if (path.startsWith("~/")) return join4(home2, path.slice(2));
+  if (path.startsWith("~/")) return join5(home2, path.slice(2));
   return path;
 }
 
@@ -473,7 +633,7 @@ function checkTouchDurability(context) {
     targetDetail = `unknown provider '${config.provider}' (durability undetermined)`;
     targetRemedy = "check the resolved touch config's provider value";
   }
-  const userConfig = join5(context.configDir, "ostrom", "config.yaml");
+  const userConfig = join6(context.configDir, "ostrom", "config.yaml");
   let configStatus;
   let configDetail;
   let configRemedy;
@@ -534,7 +694,7 @@ function checkProviderReachable(context) {
   }
   const directory = dirname(expandedPath);
   let existingDirectory = directory;
-  while (!existsSync2(existingDirectory) && existingDirectory !== "/" && existingDirectory !== "") {
+  while (!existsSync3(existingDirectory) && existingDirectory !== "/" && existingDirectory !== "") {
     existingDirectory = dirname(existingDirectory);
   }
   if (writable(existingDirectory)) {
@@ -580,6 +740,7 @@ function runDoctor(options) {
     checkRulesLayers(context),
     checkTouchDurability(context),
     checkProviderReachable(context),
+    checkTraceLease(context),
     checkEnvironment(context),
     checkConfigParser()
   ];

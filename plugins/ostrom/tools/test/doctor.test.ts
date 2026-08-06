@@ -99,6 +99,11 @@ function baseFixture(): Fixture {
     }),
   );
   mkdirSync(home, { recursive: true });
+  mkdirSync(join(configDir, "ostrom"), { recursive: true });
+  writeFileSync(
+    join(configDir, "ostrom", "sprint.jsonl"),
+    '{"ts":"2026-08-01T00:00:00Z","kind":"pass-ended","fact":{"outcome":"complete"},"narration":{}}\n',
+  );
   const fixture = { root, home, configDir, cwd, installPath };
   wireMarketplace(fixture);
   return fixture;
@@ -141,7 +146,7 @@ function run(fixture: Fixture, env: NodeJS.ProcessEnv = {}): string {
     configDir: fixture.configDir,
     cwd: fixture.cwd,
     home: fixture.home,
-    env: { ...process.env, ...env },
+    env: { ...process.env, MANDATE_NOW_EPOCH: "1785542400", ...env },
   });
 }
 
@@ -170,6 +175,12 @@ function commonExpected(
     { status: "OK", name: "rules-layers", detail: rulesDetail, remedy: "" },
     touch,
     provider,
+    {
+      status: "OK",
+      name: "trace-lease",
+      detail: "trace current, last 2026-08-01T00:00:00Z; lease idle",
+      remedy: "",
+    },
     { status: "OK", name: "environment", detail: "local", remedy: "" },
     {
       status: "OK",
@@ -378,20 +389,107 @@ describe("doctor golden output", () => {
       },
     });
 
-    expect(report.split("\n").filter(Boolean)).toHaveLength(7);
+    expect(report.split("\n").filter(Boolean)).toHaveLength(8);
     expect(existsSync(missing)).toBe(false);
+  });
+
+  it("warns when the sprint trace is absent", () => {
+    const fixture = baseFixture();
+    rmSync(join(fixture.configDir, "ostrom", "sprint.jsonl"));
+
+    expect(run(fixture)).toContain(
+      "WARN|trace-lease|trace absent; lease idle|run /ostrom:gatekeep and confirm it creates sprint.jsonl\n",
+    );
+  });
+
+  it("warns when the sprint trace is stale", () => {
+    const fixture = baseFixture();
+    writeFileSync(
+      join(fixture.configDir, "ostrom", "sprint.jsonl"),
+      '{"ts":"2026-07-30T00:00:00Z","kind":"pass-ended","fact":{},"narration":{}}\n',
+    );
+
+    expect(run(fixture)).toContain(
+      "WARN|trace-lease|trace stale, last 2026-07-30T00:00:00Z (older than 24h); lease idle|run /ostrom:gatekeep and confirm the recurring loop is active\n",
+    );
+  });
+
+  it("uses the last trace record before trailing newlines", () => {
+    const fixture = baseFixture();
+    writeFileSync(
+      join(fixture.configDir, "ostrom", "sprint.jsonl"),
+      '{"ts":"2026-07-30T00:00:00Z","kind":"pass-ended","fact":{},"narration":{}}\n' +
+        '{"ts":"2026-08-01T00:00:00Z","kind":"pass-ended","fact":{},"narration":{}}\n\n',
+    );
+
+    expect(run(fixture)).toContain(
+      "OK|trace-lease|trace current, last 2026-08-01T00:00:00Z; lease idle|\n",
+    );
+  });
+
+  it("warns when the sprint trace is empty", () => {
+    const fixture = baseFixture();
+    writeFileSync(join(fixture.configDir, "ostrom", "sprint.jsonl"), "");
+
+    expect(run(fixture)).toContain(
+      "WARN|trace-lease|trace present but empty; lease idle|run /ostrom:gatekeep and confirm it appends a complete pass\n",
+    );
+  });
+
+  it("preserves the malformed-record warning for a whitespace-only trace", () => {
+    const fixture = baseFixture();
+    writeFileSync(join(fixture.configDir, "ostrom", "sprint.jsonl"), " \t\n");
+
+    expect(run(fixture)).toContain(
+      "WARN|trace-lease|trace last record is unreadable; lease idle|inspect sprint.jsonl and repair or remove its malformed last record\n",
+    );
+  });
+
+  it("warns when the last sprint trace record is malformed", () => {
+    const fixture = baseFixture();
+    writeFileSync(
+      join(fixture.configDir, "ostrom", "sprint.jsonl"),
+      '{"ts":"2026-08-01T00:00:00Z","kind":"pass-ended","fact":{},"narration":{}}\nnot-json\n',
+    );
+
+    expect(run(fixture)).toContain(
+      "WARN|trace-lease|trace last record is unreadable; lease idle|inspect sprint.jsonl and repair or remove its malformed last record\n",
+    );
+  });
+
+  it("reports held and stale leases against deterministic time", () => {
+    const fixture = baseFixture();
+    const leasePath = join(fixture.configDir, "ostrom", "sprint.lease");
+    writeFileSync(
+      leasePath,
+      '{"owner":"gatekeeper-alpha","started_at":1785542400,"expires_at":1785546000}\n',
+    );
+    expect(run(fixture)).toContain(
+      "OK|trace-lease|trace current, last 2026-08-01T00:00:00Z; lease held by gatekeeper-alpha until 2026-08-01T01:00:00.000Z|\n",
+    );
+
+    writeFileSync(
+      leasePath,
+      '{"owner":"gatekeeper-alpha","started_at":1785538800,"expires_at":1785542400}\n',
+    );
+    expect(run(fixture)).toContain(
+      "WARN|trace-lease|trace current, last 2026-08-01T00:00:00Z; lease stale for gatekeeper-alpha, expired 2026-08-01T00:00:00.000Z|allow the next gatekeeper pass to reclaim the expired lease\n",
+    );
   });
 
   it("is deterministic across repeated runs and does not touch config or logs", () => {
     const fixture = baseFixture();
     notionConfig(fixture);
     const configPath = join(fixture.configDir, "ostrom", "config.yaml");
+    const tracePath = join(fixture.configDir, "ostrom", "sprint.jsonl");
     const target = readFileSync(configPath, "utf8");
+    const trace = readFileSync(tracePath, "utf8");
     const first = run(fixture);
     const second = run(fixture);
 
     expect(second).toBe(first);
     expect(readFileSync(configPath, "utf8")).toBe(target);
+    expect(readFileSync(tracePath, "utf8")).toBe(trace);
     expect(lstatSync(configPath).isSymbolicLink()).toBe(true);
     expect(readdirSync(fixture.cwd)).toEqual([]);
   });

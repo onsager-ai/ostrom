@@ -46,17 +46,50 @@ YAML
 }
 write_config
 
-# The sprint lease file is acquired with noclobber/O_EXCL. Concurrent builders
-# therefore cannot both win, and ownership protects release.
+# The gatekeeper instructions are the callers: they acquire/release the lease
+# and name every required trace event without consulting the trace for a lock.
+gatekeep_skill="$PLUGIN_ROOT/skills/gatekeep/SKILL.md"
+merge_skill="$PLUGIN_ROOT/skills/merge/SKILL.md"
+grep -q 'lease.sh\" acquire "\$lease_owner"' "$gatekeep_skill"
+grep -q 'lease.sh\" release "\$lease_owner"' "$gatekeep_skill"
+grep -q 'Never infer concurrency or lease' "$gatekeep_skill"
+for trace_kind in pass-started item-selected pass-ended; do
+  grep -q "trace.sh\" append $trace_kind" "$gatekeep_skill"
+done
+for trace_kind in artifact-produced gate-verdict-consumed; do
+  grep -q "trace.sh\" append $trace_kind" "$merge_skill"
+done
+
+# Two concurrent gatekeeper-pass starts cannot both proceed. The winner writes
+# the first trace record while the loser backs off without reading stale state.
 lease_concurrent="$fixture/lease-concurrent"
 mkdir -p "$lease_concurrent/ostrom"
+concurrent_trace="$lease_concurrent/ostrom/sprint.jsonl"
+[ ! -e "$concurrent_trace" ]
+
+gatekeeper_pass_start() {
+  pass_owner="$1"
+  set +e
+  CLAUDE_CONFIG_DIR="$lease_concurrent" MANDATE_LEASE_NOW_EPOCH=100 \
+    bash "$PLUGIN_ROOT/scripts/lease.sh" acquire "$pass_owner" 60
+  acquire_status=$?
+  set -e
+  if [ "$acquire_status" -ne 0 ]; then
+    return "$acquire_status"
+  fi
+  MANDATE_TRACE_TIME="2026-08-01T00:00:00Z" \
+    CLAUDE_CONFIG_DIR="$lease_concurrent" \
+    bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-started \
+      "$(jq -cn --arg owner "$pass_owner" '{owner: $owner}')" \
+      '{}' >/dev/null
+  printf '%s\n' "$pass_owner" >"$lease_concurrent/$pass_owner.proceeded"
+}
+
 set +e
-CLAUDE_CONFIG_DIR="$lease_concurrent" MANDATE_LEASE_NOW_EPOCH=100 \
-  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire builder-alpha 60 \
+gatekeeper_pass_start gatekeeper-alpha \
   >"$lease_concurrent/alpha.out" 2>"$lease_concurrent/alpha.err" &
 lease_alpha_pid=$!
-CLAUDE_CONFIG_DIR="$lease_concurrent" MANDATE_LEASE_NOW_EPOCH=100 \
-  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire builder-beta 60 \
+gatekeeper_pass_start gatekeeper-beta \
   >"$lease_concurrent/beta.out" 2>"$lease_concurrent/beta.err" &
 lease_beta_pid=$!
 wait "$lease_alpha_pid"
@@ -65,15 +98,54 @@ wait "$lease_beta_pid"
 lease_beta_status=$?
 set -e
 [ $(( (lease_alpha_status == 0) + (lease_beta_status == 0) )) -eq 1 ]
+[ $(( (lease_alpha_status == 3) + (lease_beta_status == 3) )) -eq 1 ]
 concurrent_lease="$(
   CLAUDE_CONFIG_DIR="$lease_concurrent" \
     bash "$PLUGIN_ROOT/scripts/lease.sh" status
 )"
 jq -e '
-  (.owner == "builder-alpha" or .owner == "builder-beta")
+  (.owner == "gatekeeper-alpha" or .owner == "gatekeeper-beta")
   and .started_at == 100
   and .expires_at == 160
 ' <<<"$concurrent_lease" >/dev/null
+[ -e "$lease_concurrent/gatekeeper-alpha.proceeded" ] || \
+  [ -e "$lease_concurrent/gatekeeper-beta.proceeded" ]
+[ ! -e "$lease_concurrent/gatekeeper-alpha.proceeded" ] || \
+  [ ! -e "$lease_concurrent/gatekeeper-beta.proceeded" ]
+[ -f "$concurrent_trace" ]
+[ "$(wc -l <"$concurrent_trace" | tr -d '[:space:]')" -eq 1 ]
+jq -e '.kind == "pass-started" and (.fact.owner | startswith("gatekeeper-"))' \
+  "$concurrent_trace" >/dev/null
+
+winning_owner="$(jq -r '.owner' <<<"$concurrent_lease")"
+MANDATE_TRACE_TIME="2026-08-01T00:01:00Z" \
+  CLAUDE_CONFIG_DIR="$lease_concurrent" \
+  bash "$PLUGIN_ROOT/scripts/trace.sh" append item-selected \
+    '{"repo":"example-org/example-repo","pr":51}' '{}' >/dev/null
+MANDATE_TRACE_TIME="2026-08-01T00:02:00Z" \
+  CLAUDE_CONFIG_DIR="$lease_concurrent" \
+  bash "$PLUGIN_ROOT/scripts/trace.sh" append artifact-produced \
+    '{"repo":"example-org/example-repo","pr":51,"head_sha":"0123456789abcdef"}' \
+    '{}' >/dev/null
+MANDATE_TRACE_TIME="2026-08-01T00:03:00Z" \
+  CLAUDE_CONFIG_DIR="$lease_concurrent" \
+  bash "$PLUGIN_ROOT/scripts/trace.sh" append gate-verdict-consumed \
+    '{"repo":"example-org/example-repo","pr":51,"head_sha":"0123456789abcdef","verdict":"pass","exit_code":0,"already_judged":false}' \
+    '{}' >/dev/null
+MANDATE_TRACE_TIME="2026-08-01T00:04:00Z" \
+  CLAUDE_CONFIG_DIR="$lease_concurrent" \
+  bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
+    '{"outcome":"complete","completed_candidates":1}' '{}' >/dev/null
+jq -s -e 'map(.kind) == [
+  "pass-started",
+  "item-selected",
+  "artifact-produced",
+  "gate-verdict-consumed",
+  "pass-ended"
+]' "$concurrent_trace" >/dev/null
+CLAUDE_CONFIG_DIR="$lease_concurrent" \
+  bash "$PLUGIN_ROOT/scripts/lease.sh" release "$winning_owner"
+[ ! -e "$lease_concurrent/ostrom/sprint.lease" ]
 
 lease_expiry="$fixture/lease-expiry"
 CLAUDE_CONFIG_DIR="$lease_expiry" MANDATE_LEASE_NOW_EPOCH=200 \
@@ -176,6 +248,48 @@ oversized_status=$?
 set -e
 [ "$oversized_status" -eq 2 ]
 [ "$(wc -l <"$trace_file" | tr -d '[:space:]')" -eq 2 ]
+
+# Doctor turns missing, stale, current, and expired trace/lease state into one
+# deterministic line. It reads MANDATE_NOW_EPOCH rather than the wall clock.
+doctor_config="$fixture/doctor"
+doctor_absent="$(
+  cd "$fixture/repo"
+  HOME="$fixture" CLAUDE_CONFIG_DIR="$doctor_config" \
+    node "$PLUGIN_ROOT/dist/doctor.js"
+)"
+grep -q '^WARN|trace-lease|trace absent; lease idle|' <<<"$doctor_absent"
+
+MANDATE_TRACE_TIME="2026-07-30T00:00:00Z" CLAUDE_CONFIG_DIR="$doctor_config" \
+  bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
+    '{"outcome":"complete"}' '{}' >/dev/null
+doctor_stale="$(
+  cd "$fixture/repo"
+  HOME="$fixture" CLAUDE_CONFIG_DIR="$doctor_config" \
+    node "$PLUGIN_ROOT/dist/doctor.js"
+)"
+grep -q '^WARN|trace-lease|trace stale, last 2026-07-30T00:00:00Z' \
+  <<<"$doctor_stale"
+
+MANDATE_TRACE_TIME="$MANDATE_SWEEP_TIME" CLAUDE_CONFIG_DIR="$doctor_config" \
+  bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
+    '{"outcome":"complete"}' '{}' >/dev/null
+doctor_current="$(
+  cd "$fixture/repo"
+  HOME="$fixture" CLAUDE_CONFIG_DIR="$doctor_config" \
+    node "$PLUGIN_ROOT/dist/doctor.js"
+)"
+grep -q '^OK|trace-lease|trace current, last 2026-08-01T00:00:00Z; lease idle|$' \
+  <<<"$doctor_current"
+
+CLAUDE_CONFIG_DIR="$doctor_config" MANDATE_LEASE_NOW_EPOCH=1785538800 \
+  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire gatekeeper-stale 1800 >/dev/null
+doctor_expired_lease="$(
+  cd "$fixture/repo"
+  HOME="$fixture" CLAUDE_CONFIG_DIR="$doctor_config" \
+    node "$PLUGIN_ROOT/dist/doctor.js"
+)"
+grep -q '^WARN|trace-lease|.*lease stale for gatekeeper-stale' \
+  <<<"$doctor_expired_lease"
 
 # Prove shipped < user < repo precedence and generic project list parsing.
 mkdir -p "$fixture/layers/config/ostrom" "$fixture/layers/repo/.ostrom"
