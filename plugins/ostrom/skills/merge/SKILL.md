@@ -71,6 +71,36 @@ threads directly from GitHub. Its review-thread query includes resolver
 authorship. Do not accept those inputs from the builder. Do not re-derive,
 reinterpret, or override the verdict.
 
+From the preserved verdict line, record the artifact pointer and the verdict
+consumption as two distinct trace events before taking any action. Here,
+`repository` is the resolved `owner/repo`, `pr_number` is the input pointer,
+`gate_exit` is the preserved exit code, and `head_sha`, `verdict`, and
+`already_judged` are the literal values parsed from the verdict line:
+
+```sh
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/trace.sh" append artifact-produced \
+  "$(jq -cn --arg repo "$repository" --argjson pr "$pr_number" \
+    --arg head_sha "$head_sha" \
+    '{repo: $repo, pr: $pr, head_sha: $head_sha}')" \
+  '{}'
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/trace.sh" append gate-verdict-consumed \
+  "$(jq -cn --arg repo "$repository" --argjson pr "$pr_number" \
+    --arg head_sha "$head_sha" --arg verdict "$verdict" \
+    --argjson exit_code "$gate_exit" \
+    --argjson already_judged "$already_judged" \
+    '{repo: $repo, pr: $pr, head_sha: $head_sha, verdict: $verdict,
+      exit_code: $exit_code, already_judged: $already_judged}')" \
+  '{}'
+```
+
+These values are facts because they are identifiers and external returns, not
+the gatekeeper's reasoning. If the verdict output contains a granted exception
+reason, copy that external return into the verdict record's fact object as
+`exception_reason`; do not move it into narration. The gatekeeper does not add
+a risk assessment or reinterpretation to narration. If either append fails,
+take no GitHub action; return control to `/ostrom:gatekeep`, which ends the pass
+and releases its lease.
+
 The verdict line includes `already_judged=true|false`, keyed on the PR and its
 current head SHA. This marker controls **delivery only** — whether a report
 already sent for this exact artifact is sent again. It never changes the
@@ -95,7 +125,8 @@ caller's, is always about delivery, and never converts `inconclusive` into
   refused at merge, which is the correct and more legible failure.
 
   An `excused` condition is part of a `pass`, so approval proceeds normally.
-  The exception reason already appears in the verdict output and trace.
+  The exception reason already appears in the verdict output and the
+  `gate-verdict-consumed` trace fact.
 - **Fail (exit 1)** — if `already_judged=false`, leave the complete gate output
   as one PR comment using `gh pr comment --body-file`; use a temporary file so
   PR-controlled text is never interpolated into a shell command. If

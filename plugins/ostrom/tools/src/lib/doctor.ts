@@ -3,6 +3,7 @@ import { checkMarketplace } from "../checks/marketplace.js";
 import { checkConfigParser } from "../checks/parser.js";
 import { checkPlugin } from "../checks/plugin.js";
 import { checkRulesLayers } from "../checks/rules.js";
+import { checkTraceLease } from "../checks/trace-lease.js";
 import {
   checkProviderReachable,
   checkTouchDurability,
@@ -33,6 +34,7 @@ export function runDoctor(options: DoctorOptions): string {
     checkRulesLayers(context),
     checkTouchDurability(context),
     checkProviderReachable(context),
+    checkTraceLease(context),
     checkEnvironment(context),
     checkConfigParser(),
   ];

@@ -24,7 +24,39 @@ independence.
 Accept no arguments, summaries, dossiers, previous verdicts, or claims from
 the builder. The builder's only reply is a new commit.
 
-## 2. Resolve the roster once per iteration
+## 2. Acquire the iteration lease and start its trace
+
+Before reading config, the trace, or any GitHub artifact, choose one unique,
+non-empty owner for this session and wake (for example,
+`gatekeeper-<session>-<wake>`), retain that exact string for cleanup, and run:
+
+```sh
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/lease.sh" acquire "$lease_owner"
+```
+
+Only exit 0 owns the pass. Exit 3 means another pass owns it: report that this
+wake backed off and stop without reading a stale answer, enumerating pull
+requests, calling `/ostrom:merge`, or appending to the trace. Any other nonzero
+exit is a lease failure; report it and stop. Never infer concurrency or lease
+ownership from `sprint.jsonl`, `gate.jsonl`, prior output, or wake timing.
+
+After acquisition, append the first trace record:
+
+```sh
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/trace.sh" append pass-started \
+  "$(jq -cn --arg owner "$lease_owner" '{owner: $owner}')" \
+  '{}'
+```
+
+Every trace append in this protocol supplies separate fact and narration JSON
+objects. Put identifiers, actions, and values returned by GitHub or the gate in
+`fact`. Put only reasons, beliefs, or conclusions in `narration`; use `{}` when
+there is none. Never put a PR number, commit SHA, verdict, exit code, or other
+external return only in narration. If a trace append fails, end the pass as a
+failure, release the lease as described in step 8, and stop rather than running
+an invisible pass.
+
+## 3. Resolve the roster once per iteration
 
 Use the existing mandate config resolution. Do not read the YAML directly or
 implement another roster parser:
@@ -40,7 +72,7 @@ iteration. From the resolved JSON, take only each project's `repo` pointer.
 Every roster repository is in scope, including a project marked `paused`;
 gatekeeping open pull requests is not routine builder work.
 
-## 3. Authenticate per repository as the gatekeeper App
+## 4. Authenticate per repository as the gatekeeper App
 
 At the start of every iteration, before any `gh` call, discard ambient GitHub
 credentials. Then, immediately before calling `gh` for each roster repository,
@@ -71,7 +103,7 @@ each candidate rather than reusing the enumeration token.
 Continuing with an ambient token would silently recreate the shared-identity
 failure the App exists to remove.
 
-## 4. Enumerate every open pull request
+## 5. Enumerate every open pull request
 
 Poll GitHub for all open pull requests in every roster repository, using only
 the token minted for that repository, and unset `GH_TOKEN` when its pagination
@@ -83,12 +115,21 @@ artifact gate evaluates each pull request independently.
 Build a list of `(repo, PR number)` pointers before evaluating any one of them.
 Do not accept a candidate list from the builder.
 
-## 5. Drive `/ostrom:merge` independently for each candidate
+## 6. Drive `/ostrom:merge` independently for each candidate
 
 For each candidate, establish its `repo` as the `GH_REPO` environment context
 used by `gh repo view`, then follow `../merge/SKILL.md` exactly with the PR
 number as its one and only input. Do not copy or restate its gate conditions,
 derive a verdict, override an action, or add a review step here.
+
+Immediately before invoking `/ostrom:merge`, record the selected pointer:
+
+```sh
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/trace.sh" append item-selected \
+  "$(jq -cn --arg repo "$repository" --argjson pr "$pr_number" \
+    '{repo: $repo, pr: $pr}')" \
+  '{}'
+```
 
 Start each candidate from only its pointer and the current GitHub artifacts.
 Carry no facts, conclusions, exceptions, or confidence from an earlier pull
@@ -109,7 +150,7 @@ inconclusive however many times the loop observes it. This guard suppresses
 only a repeat escalation. It does not reinterpret the verdict or permit a
 merge.
 
-## 6. Report the iteration
+## 7. Report the iteration
 
 Emit one line per candidate containing only its `owner/repo#number` pointer,
 the verdict, and the action taken. Actions include merged, verdict commented,
@@ -127,7 +168,28 @@ uses Claude Code's existing recurring-wake mechanism, for example:
 Do not build or invoke a separate scheduler and do not switch to event-driven
 delivery.
 
-## 7. Stay in the gatekeeper role
+## 8. End the trace and release the lease
+
+On every normal or error path after acquisition, append `pass-ended` before
+releasing the lease. Its fact object records the observed outcome and completed
+candidate count; narration may explain why an incomplete pass stopped but must
+not replace those facts. Then run, with the exact owner retained in step 2:
+
+```sh
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/trace.sh" append pass-ended \
+  "$(jq -cn --arg outcome "$pass_outcome" \
+    --argjson completed "$completed_candidates" \
+    '{outcome: $outcome, completed_candidates: $completed}')" \
+  "$pass_end_narration"
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/lease.sh" release "$lease_owner"
+```
+
+Use `{}` for `pass_end_narration` when there is no reasoning to report. Treat a
+release failure as an error and tell the principal; never remove or overwrite
+the lease file directly. A process crash may prevent cleanup, which is why the
+lease expires and the next pass can reclaim it.
+
+## 9. Stay in the gatekeeper role
 
 The gatekeeper never writes code, never suggests a fix, and never reviews for
 quality. It never edits the mandate roster or gate conditions, rebases or
