@@ -14,11 +14,15 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+import { checkPlugin } from "../src/checks/plugin.js";
 import { parseOstromYaml } from "../src/lib/config.js";
 import { runDoctor } from "../src/lib/doctor.js";
 import { formatResult, type CheckResult } from "../src/lib/result.js";
 
 const pluginRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+const pluginVersion = JSON.parse(
+  readFileSync(join(pluginRoot, ".claude-plugin", "plugin.json"), "utf8"),
+).version as string;
 const hook = join(pluginRoot, "hooks", "inject-constitution.sh");
 const frozenRules = join(pluginRoot, "rules", "frozen-rules.md");
 const roots: string[] = [];
@@ -82,14 +86,14 @@ function baseFixture(): Fixture {
   mkdirSync(join(installPath, ".claude-plugin"), { recursive: true });
   writeFileSync(
     join(installPath, ".claude-plugin", "plugin.json"),
-    '{"name":"ostrom","version":"1.0.0"}\n',
+    JSON.stringify({ name: "ostrom", version: pluginVersion }),
   );
   writeFileSync(
     join(configDir, "plugins", "installed_plugins.json"),
     JSON.stringify({
       plugins: {
         "ostrom@ostrom": [
-          { installPath, version: "1.0.0" },
+          { installPath, version: pluginVersion },
         ],
       },
     }),
@@ -98,6 +102,37 @@ function baseFixture(): Fixture {
   const fixture = { root, home, configDir, cwd, installPath };
   wireMarketplace(fixture);
   return fixture;
+}
+
+function pluginResult(
+  fixture: Fixture,
+  loadedPluginRoot = pluginRoot,
+): CheckResult {
+  return checkPlugin({
+    pluginRoot: loadedPluginRoot,
+    configDir: fixture.configDir,
+    cwd: fixture.cwd,
+    home: fixture.home,
+    env: process.env,
+    resolveConfig: () => ({
+      provider: "file",
+      path: "~/.claude/ostrom/touch-log.md",
+      autoCommit: "False",
+    }),
+  });
+}
+
+function writeRegistry(fixture: Fixture, version?: string): void {
+  writeFileSync(
+    join(fixture.configDir, "plugins", "installed_plugins.json"),
+    JSON.stringify({
+      plugins: {
+        "ostrom@ostrom": [
+          { installPath: fixture.installPath, ...(version ? { version } : {}) },
+        ],
+      },
+    }),
+  );
 }
 
 function run(fixture: Fixture, env: NodeJS.ProcessEnv = {}): string {
@@ -123,7 +158,7 @@ function commonExpected(
     {
       status: "OK",
       name: "plugin",
-      detail: "installed, version 1.0.0",
+      detail: `installed, loaded version ${pluginVersion}`,
       remedy: "",
     },
     {
@@ -145,6 +180,92 @@ function commonExpected(
     },
   ]);
 }
+
+describe("plugin check", () => {
+  it("reports OK when the loaded and registry versions agree", () => {
+    const fixture = baseFixture();
+
+    expect(pluginResult(fixture)).toEqual({
+      status: "OK",
+      name: "plugin",
+      detail: `installed, loaded version ${pluginVersion}`,
+      remedy: "",
+    });
+  });
+
+  it("warns and names both versions when the loaded and registry versions disagree", () => {
+    const fixture = baseFixture();
+    writeFileSync(
+      join(fixture.installPath, ".claude-plugin", "plugin.json"),
+      '{"name":"ostrom","version":"1.1.0"}\n',
+    );
+    writeRegistry(fixture, "1.1.0");
+
+    expect(pluginResult(fixture)).toEqual({
+      status: "WARN",
+      name: "plugin",
+      detail: `installed, loaded version ${pluginVersion}, registry version 1.1.0`,
+      remedy:
+        "restart the session to reconcile the loaded plugin with the registry",
+    });
+  });
+
+  it("falls back to the registry when the loaded plugin.json is unreadable", () => {
+    const fixture = baseFixture();
+
+    expect(pluginResult(fixture, join(fixture.root, "missing-plugin"))).toEqual({
+      status: "OK",
+      name: "plugin",
+      detail: `installed, version ${pluginVersion} (loaded plugin.json not readable, using registry version)`,
+      remedy: "",
+    });
+  });
+
+  it("fails unchanged when installed_plugins.json is absent", () => {
+    const fixture = baseFixture();
+    const installedJson = join(
+      fixture.configDir,
+      "plugins",
+      "installed_plugins.json",
+    );
+    rmSync(installedJson);
+
+    expect(pluginResult(fixture)).toEqual({
+      status: "FAIL",
+      name: "plugin",
+      detail: `no installed_plugins.json at ${installedJson}`,
+      remedy: "/plugin install ostrom@ostrom",
+    });
+  });
+
+  it("fails unchanged when the ostrom registry entry is absent", () => {
+    const fixture = baseFixture();
+    writeFileSync(
+      join(fixture.configDir, "plugins", "installed_plugins.json"),
+      '{"plugins":{}}\n',
+    );
+
+    expect(pluginResult(fixture)).toEqual({
+      status: "FAIL",
+      name: "plugin",
+      detail: "ostrom@ostrom not present in installed_plugins.json",
+      remedy: "/plugin install ostrom@ostrom",
+    });
+  });
+
+  it("fails unchanged when no version can be determined", () => {
+    const fixture = baseFixture();
+    rmSync(join(fixture.installPath, ".claude-plugin", "plugin.json"));
+    writeRegistry(fixture);
+
+    expect(pluginResult(fixture, join(fixture.root, "missing-plugin"))).toEqual({
+      status: "FAIL",
+      name: "plugin",
+      detail: "ostrom@ostrom entry found but no version could be determined",
+      remedy: "/plugin install ostrom@ostrom",
+    });
+  });
+});
 
 function notionConfig(fixture: Fixture, extra = ""): void {
   const configRepo = join(fixture.root, "private-config");

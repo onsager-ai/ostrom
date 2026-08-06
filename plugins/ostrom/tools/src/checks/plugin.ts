@@ -16,6 +16,17 @@ function isFile(path: string): boolean {
   }
 }
 
+function versionAt(pluginRoot: string): string {
+  if (!pluginRoot) return "";
+  const pluginJson = join(pluginRoot, ".claude-plugin", "plugin.json");
+  if (!isFile(pluginJson)) return "";
+  try {
+    return field(readFileSync(pluginJson, "utf8"), "version");
+  } catch {
+    return "";
+  }
+}
+
 export function checkPlugin(context: DoctorContext): CheckResult {
   const installedJson = join(context.configDir, "plugins", "installed_plugins.json");
   if (!isFile(installedJson)) {
@@ -46,27 +57,40 @@ export function checkPlugin(context: DoctorContext): CheckResult {
   const block = source.slice(marker);
   const installPath = field(block, "installPath");
   const recordedVersion = field(block, "version");
-  const pluginJson = join(installPath, ".claude-plugin", "plugin.json");
-  if (installPath && isFile(pluginJson)) {
-    let version = "";
-    try {
-      version = field(readFileSync(pluginJson, "utf8"), "version");
-    } catch {
-      // existsSync and readFileSync can race; preserve the registry fallback.
-    }
+  const loadedVersion = versionAt(context.pluginRoot);
+  const installPathVersion = versionAt(installPath);
+  const registryVersion = installPathVersion || recordedVersion;
+
+  if (loadedVersion && registryVersion) {
+    const matchesRegistry = loadedVersion === registryVersion;
+    return {
+      status: matchesRegistry ? "OK" : "WARN",
+      name: "plugin",
+      detail: matchesRegistry
+        ? `installed, loaded version ${loadedVersion}`
+        : `installed, loaded version ${loadedVersion}, registry version ${registryVersion}`,
+      remedy: matchesRegistry
+        ? ""
+        : "restart the session to reconcile the loaded plugin with the registry",
+    };
+  }
+  if (!loadedVersion && registryVersion) {
+    const registrySource = installPathVersion
+      ? "registry version"
+      : "registry-recorded version";
     return {
       status: "OK",
       name: "plugin",
-      detail: `installed, version ${version}`,
+      detail: `installed, version ${registryVersion} (loaded plugin.json not readable, using ${registrySource})`,
       remedy: "",
     };
   }
-  if (recordedVersion) {
+  if (loadedVersion) {
     return {
-      status: "OK",
+      status: "WARN",
       name: "plugin",
-      detail: `installed, version ${recordedVersion} (installPath plugin.json not readable, using registry-recorded version)`,
-      remedy: "",
+      detail: `installed, loaded version ${loadedVersion}, registry version not readable`,
+      remedy: "restart the session to reconcile the loaded plugin with the registry",
     };
   }
   return {
