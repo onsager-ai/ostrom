@@ -333,8 +333,16 @@ function traceHealth(path, now) {
       remedy: "inspect sprint.jsonl and fix its permissions"
     };
   }
-  const lines = source.split(/\r?\n/).filter((line) => line.length > 0);
-  if (lines.length === 0) {
+  let contentEnd = source.length;
+  while (contentEnd > 0 && source[contentEnd - 1] === "\n") {
+    contentEnd -= 1;
+    if (contentEnd > 0 && source[contentEnd - 1] === "\r") {
+      contentEnd -= 1;
+    }
+  }
+  const lastLineStart = source.lastIndexOf("\n", contentEnd - 1) + 1;
+  const lastLine = source.slice(lastLineStart, contentEnd);
+  if (lastLine.length === 0) {
     return {
       status: "WARN",
       detail: "trace present but empty",
@@ -343,7 +351,7 @@ function traceHealth(path, now) {
   }
   let record;
   try {
-    record = JSON.parse(lines.at(-1) ?? "");
+    record = JSON.parse(lastLine);
   } catch {
     return {
       status: "WARN",

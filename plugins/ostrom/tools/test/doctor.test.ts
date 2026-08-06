@@ -414,6 +414,49 @@ describe("doctor golden output", () => {
     );
   });
 
+  it("uses the last trace record before trailing newlines", () => {
+    const fixture = baseFixture();
+    writeFileSync(
+      join(fixture.configDir, "ostrom", "sprint.jsonl"),
+      '{"ts":"2026-07-30T00:00:00Z","kind":"pass-ended","fact":{},"narration":{}}\n' +
+        '{"ts":"2026-08-01T00:00:00Z","kind":"pass-ended","fact":{},"narration":{}}\n\n',
+    );
+
+    expect(run(fixture)).toContain(
+      "OK|trace-lease|trace current, last 2026-08-01T00:00:00Z; lease idle|\n",
+    );
+  });
+
+  it("warns when the sprint trace is empty", () => {
+    const fixture = baseFixture();
+    writeFileSync(join(fixture.configDir, "ostrom", "sprint.jsonl"), "");
+
+    expect(run(fixture)).toContain(
+      "WARN|trace-lease|trace present but empty; lease idle|run /ostrom:gatekeep and confirm it appends a complete pass\n",
+    );
+  });
+
+  it("preserves the malformed-record warning for a whitespace-only trace", () => {
+    const fixture = baseFixture();
+    writeFileSync(join(fixture.configDir, "ostrom", "sprint.jsonl"), " \t\n");
+
+    expect(run(fixture)).toContain(
+      "WARN|trace-lease|trace last record is unreadable; lease idle|inspect sprint.jsonl and repair or remove its malformed last record\n",
+    );
+  });
+
+  it("warns when the last sprint trace record is malformed", () => {
+    const fixture = baseFixture();
+    writeFileSync(
+      join(fixture.configDir, "ostrom", "sprint.jsonl"),
+      '{"ts":"2026-08-01T00:00:00Z","kind":"pass-ended","fact":{},"narration":{}}\nnot-json\n',
+    );
+
+    expect(run(fixture)).toContain(
+      "WARN|trace-lease|trace last record is unreadable; lease idle|inspect sprint.jsonl and repair or remove its malformed last record\n",
+    );
+  });
+
   it("reports held and stale leases against deterministic time", () => {
     const fixture = baseFixture();
     const leasePath = join(fixture.configDir, "ostrom", "sprint.lease");
