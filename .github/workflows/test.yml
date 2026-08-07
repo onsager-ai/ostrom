@@ -24,6 +24,9 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm run test
+      - name: Run plugin integration tests
+        working-directory: .
+        run: bash plugins/ostrom/tests/test.sh
       - name: Rebuild committed doctor bundle
         run: |
           npm run build

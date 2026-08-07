@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Coordinate builder wakes with a machine-local sprint lease.
+# Coordinate repeated role wakes with a machine-local named lease.
 
 set -euo pipefail
 umask 077
@@ -10,12 +10,19 @@ source "$SCRIPT_DIR/mandate-lib.sh"
 
 command -v jq >/dev/null 2>&1 || { echo "mandate lease: jq is required" >&2; exit 1; }
 
-LEASE_FILE="$MANDATE_DATA_DIR/sprint.lease"
-LEASE_GUARD="$MANDATE_DATA_DIR/.sprint.lease.guard"
+lease_name="${MANDATE_LEASE_NAME:-sprint.lease}"
+case "$lease_name" in
+  ''|[!A-Za-z0-9]*|*[!A-Za-z0-9._-]*)
+    echo "mandate lease: lease name must be a safe file name" >&2
+    exit 2
+    ;;
+esac
+LEASE_FILE="$MANDATE_DATA_DIR/$lease_name"
+LEASE_GUARD="$MANDATE_DATA_DIR/.$lease_name.guard"
 lease_guard_held=0
 
 usage() {
-  echo "usage: lease.sh acquire <owner> [ttl-seconds] | release <owner> | status" >&2
+  echo "usage: [MANDATE_LEASE_NAME=<name>] lease.sh acquire <owner> [ttl-seconds] | release <owner> | status" >&2
   exit 2
 }
 
@@ -57,7 +64,7 @@ lease_install() {
   )"
 
   # noclobber opens the absent path with O_EXCL semantics. Exactly one
-  # concurrent builder can create it; a loser cannot alter the held lease.
+  # concurrent pass can create it; a loser cannot alter the held lease.
   if (set -o noclobber; printf '%s\n' "$install_json" >"$LEASE_FILE") 2>/dev/null; then
     printf '%s\n' "$install_json"
     return 0
@@ -121,8 +128,8 @@ case "$action" in
       echo "mandate lease: lease reclamation is already in progress" >&2
       exit 3
     fi
-    # Re-read under the guard. Another builder may have reclaimed the lease
-    # after the first expiry check and before this builder acquired the guard.
+    # Re-read under the guard. Another pass may have reclaimed the lease after
+    # the first expiry check and before this pass acquired the guard.
     if ! lease_load; then
       lease_guard_release
       echo "mandate lease: lease changed during reclamation" >&2

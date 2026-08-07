@@ -5,6 +5,16 @@ set -euo pipefail
 PLUGIN_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 fixture="$(mktemp -d)"
 trap 'rm -rf "$fixture"' EXIT
+
+# Shipped plugin files must not retain private checkout paths. Build the
+# expression in pieces so this assertion does not match its own source.
+machine_path_pattern='~[/]projects[/]|[/]home[/]|dot''claude'
+if grep -R -I -n -E "$machine_path_pattern" \
+  --exclude-dir=node_modules "$PLUGIN_ROOT"; then
+  echo "mandate tests: shipped plugin contains a machine-specific path" >&2
+  exit 1
+fi
+
 mkdir -p "$fixture/config/ostrom" "$fixture/repo" "$fixture/bin"
 export MANDATE_SWEEP_TIME="2026-08-01T00:00:00Z"
 export MANDATE_TODAY="2026-08-01"
@@ -50,6 +60,10 @@ write_config
 # and name every required trace event without consulting the trace for a lock.
 gatekeep_skill="$PLUGIN_ROOT/skills/gatekeep/SKILL.md"
 merge_skill="$PLUGIN_ROOT/skills/merge/SKILL.md"
+work_skill="$PLUGIN_ROOT/skills/work/SKILL.md"
+work_frontmatter="$(
+  awk 'NR == 1 { next } /^---$/ { exit } { print }' "$work_skill"
+)"
 grep -q 'lease.sh\" acquire "\$lease_owner"' "$gatekeep_skill"
 grep -q 'lease.sh\" release "\$lease_owner"' "$gatekeep_skill"
 grep -q 'Never infer concurrency or lease' "$gatekeep_skill"
@@ -58,6 +72,16 @@ for trace_kind in pass-started item-selected pass-ended; do
 done
 for trace_kind in artifact-produced gate-verdict-consumed; do
   grep -q "trace.sh\" append $trace_kind" "$merge_skill"
+done
+grep -q 'MANDATE_LEASE_NAME=builder.lease' "$work_skill"
+grep -q 'scripts/sweep.sh' "$work_skill"
+grep -q '^argument-hint: "\[optional queue focus, e.g. project name or item class\]"$' \
+  <<<"$work_frontmatter"
+grep -q 'invocation input as a natural-language filter' "$work_skill"
+! grep -q '\$ARGUMENTS' "$work_skill"
+grep -q 'builder-<session>-wake<N>' "$work_skill"
+for trace_kind in pass-started item-worked pass-ended; do
+  grep -q "trace.sh\" append $trace_kind" "$work_skill"
 done
 
 # Two concurrent gatekeeper-pass starts cannot both proceed. The winner writes
@@ -146,6 +170,83 @@ jq -s -e 'map(.kind) == [
 CLAUDE_CONFIG_DIR="$lease_concurrent" \
   bash "$PLUGIN_ROOT/scripts/lease.sh" release "$winning_owner"
 [ ! -e "$lease_concurrent/ostrom/sprint.lease" ]
+
+# Named leases isolate the two roles, including their mutation guards. A held
+# gatekeeper lease and its guard do not block the builder lease; releasing the
+# builder lease leaves the gatekeeper lease and guard untouched.
+role_leases="$fixture/role-leases"
+CLAUDE_CONFIG_DIR="$role_leases" MANDATE_LEASE_NOW_EPOCH=150 \
+  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire gatekeeper-alpha 60 >/dev/null
+CLAUDE_CONFIG_DIR="$role_leases" MANDATE_LEASE_NOW_EPOCH=150 \
+  MANDATE_LEASE_NAME=builder.lease \
+  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire builder-alpha 60 >/dev/null
+jq -e '.owner == "gatekeeper-alpha"' \
+  "$role_leases/ostrom/sprint.lease" >/dev/null
+jq -e '.owner == "builder-alpha"' \
+  "$role_leases/ostrom/builder.lease" >/dev/null
+printf '%s\n' held >"$role_leases/ostrom/.sprint.lease.guard"
+CLAUDE_CONFIG_DIR="$role_leases" MANDATE_LEASE_NAME=builder.lease \
+  bash "$PLUGIN_ROOT/scripts/lease.sh" release builder-alpha
+[ ! -e "$role_leases/ostrom/builder.lease" ]
+[ ! -e "$role_leases/ostrom/.builder.lease.guard" ]
+[ -e "$role_leases/ostrom/sprint.lease" ]
+[ -e "$role_leases/ostrom/.sprint.lease.guard" ]
+rm -f "$role_leases/ostrom/.sprint.lease.guard"
+CLAUDE_CONFIG_DIR="$role_leases" \
+  bash "$PLUGIN_ROOT/scripts/lease.sh" release gatekeeper-alpha
+
+# A second owner on the builder lease backs off before it can touch an item or
+# append a trace row. The same named lease still mutually excludes its owners.
+builder_overlap="$fixture/builder-overlap"
+CLAUDE_CONFIG_DIR="$builder_overlap" MANDATE_LEASE_NOW_EPOCH=175 \
+  MANDATE_LEASE_NAME=builder.lease \
+  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire builder-alpha-wake1 60 >/dev/null
+set +e
+CLAUDE_CONFIG_DIR="$builder_overlap" MANDATE_LEASE_NOW_EPOCH=175 \
+  MANDATE_LEASE_NAME=builder.lease \
+  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire builder-beta-wake1 60 \
+  >/dev/null 2>&1
+builder_overlap_status=$?
+set -e
+[ "$builder_overlap_status" -eq 3 ]
+[ ! -e "$builder_overlap/item-touched" ]
+[ ! -e "$builder_overlap/ostrom/sprint.jsonl" ]
+CLAUDE_CONFIG_DIR="$builder_overlap" MANDATE_LEASE_NAME=builder.lease \
+  bash "$PLUGIN_ROOT/scripts/lease.sh" release builder-alpha-wake1
+
+# A mid-item builder failure remains durable and releases its named lease.
+builder_failure="$fixture/builder-failure"
+failure_owner="builder-fixture-wake1"
+CLAUDE_CONFIG_DIR="$builder_failure" MANDATE_LEASE_NOW_EPOCH=190 \
+  MANDATE_LEASE_NAME=builder.lease \
+  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire "$failure_owner" 60 >/dev/null
+MANDATE_TRACE_TIME="2026-08-01T00:00:00Z" \
+  CLAUDE_CONFIG_DIR="$builder_failure" \
+  bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-started \
+    "$(jq -cn --arg owner "$failure_owner" '{owner: $owner}')" \
+    '{}' >/dev/null
+MANDATE_TRACE_TIME="2026-08-01T00:01:00Z" \
+  CLAUDE_CONFIG_DIR="$builder_failure" \
+  bash "$PLUGIN_ROOT/scripts/trace.sh" append item-worked \
+    "$(jq -cn --arg owner "$failure_owner" \
+      '{owner: $owner, repo: "example-org/example-repo", ref: "#59",
+        action: "test", outcome: "failed", exit_code: 42}')" \
+    '{"reason":"fixture failure"}' >/dev/null
+MANDATE_TRACE_TIME="2026-08-01T00:02:00Z" \
+  CLAUDE_CONFIG_DIR="$builder_failure" \
+  bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
+    "$(jq -cn --arg owner "$failure_owner" \
+      '{owner: $owner, outcome: "failed", worked_items: 1}')" \
+    '{"reason":"item failed"}' >/dev/null
+CLAUDE_CONFIG_DIR="$builder_failure" MANDATE_LEASE_NAME=builder.lease \
+  bash "$PLUGIN_ROOT/scripts/lease.sh" release "$failure_owner"
+[ ! -e "$builder_failure/ostrom/builder.lease" ]
+jq -s -e '
+  map(.kind) == ["pass-started", "item-worked", "pass-ended"]
+  and all(.[]; .fact.owner == "builder-fixture-wake1")
+  and .[1].fact.exit_code == 42
+  and .[2].fact.outcome == "failed"
+' "$builder_failure/ostrom/sprint.jsonl" >/dev/null
 
 lease_expiry="$fixture/lease-expiry"
 CLAUDE_CONFIG_DIR="$lease_expiry" MANDATE_LEASE_NOW_EPOCH=200 \
@@ -258,10 +359,11 @@ doctor_absent="$(
     node "$PLUGIN_ROOT/dist/doctor.js"
 )"
 grep -q '^WARN|trace-lease|trace absent; lease idle|' <<<"$doctor_absent"
+grep -q '^WARN|builder-pass|no builder pass ever recorded|' <<<"$doctor_absent"
 
 MANDATE_TRACE_TIME="2026-07-30T00:00:00Z" CLAUDE_CONFIG_DIR="$doctor_config" \
   bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
-    '{"outcome":"complete"}' '{}' >/dev/null
+    '{"owner":"builder-fixture-wake1","outcome":"complete"}' '{}' >/dev/null
 doctor_stale="$(
   cd "$fixture/repo"
   HOME="$fixture" CLAUDE_CONFIG_DIR="$doctor_config" \
@@ -269,16 +371,20 @@ doctor_stale="$(
 )"
 grep -q '^WARN|trace-lease|trace stale, last 2026-07-30T00:00:00Z' \
   <<<"$doctor_stale"
+grep -q '^WARN|builder-pass|builder pass stale, last 2026-07-30T00:00:00Z (older than 24h cadence)|' \
+  <<<"$doctor_stale"
 
 MANDATE_TRACE_TIME="$MANDATE_SWEEP_TIME" CLAUDE_CONFIG_DIR="$doctor_config" \
   bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
-    '{"outcome":"complete"}' '{}' >/dev/null
+    '{"owner":"builder-fixture-wake2","outcome":"complete"}' '{}' >/dev/null
 doctor_current="$(
   cd "$fixture/repo"
   HOME="$fixture" CLAUDE_CONFIG_DIR="$doctor_config" \
     node "$PLUGIN_ROOT/dist/doctor.js"
 )"
 grep -q '^OK|trace-lease|trace current, last 2026-08-01T00:00:00Z; lease idle|$' \
+  <<<"$doctor_current"
+grep -q '^OK|builder-pass|builder pass current, last 2026-08-01T00:00:00Z (24h cadence)|$' \
   <<<"$doctor_current"
 
 CLAUDE_CONFIG_DIR="$doctor_config" MANDATE_LEASE_NOW_EPOCH=1785538800 \

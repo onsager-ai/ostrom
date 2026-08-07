@@ -583,6 +583,19 @@ function resolveTouchConfig(pluginRoot2, configDir2, cwd) {
     autoCommit: fileConfig.auto_commit === void 0 ? "False" : pythonStyleString(fileConfig.auto_commit)
   };
 }
+function resolveMandateCadenceHours(pluginRoot2, configDir2, cwd) {
+  const paths = [
+    join5(pluginRoot2, "config", "mandate-defaults.yaml"),
+    join5(configDir2, "ostrom", "mandates.yaml"),
+    join5(cwd, ".ostrom", "mandates.yaml")
+  ];
+  const config = paths.reduce(
+    (resolved, path) => merge(resolved, load(path)),
+    {}
+  );
+  const cadence = config.cadence_hours;
+  return typeof cadence === "number" && Number.isSafeInteger(cadence) && cadence > 0 ? cadence : void 0;
+}
 function expandTilde(path, home2) {
   if (path === "~") return home2;
   if (path.startsWith("~/")) return join5(home2, path.slice(2));
@@ -713,6 +726,116 @@ function checkProviderReachable(context) {
   };
 }
 
+// src/checks/builder-pass.ts
+import { existsSync as existsSync4, readFileSync as readFileSync5 } from "node:fs";
+import { join as join7 } from "node:path";
+function nowEpoch2(context) {
+  const explicit = context.env.MANDATE_NOW_EPOCH;
+  if (explicit && /^\d+$/.test(explicit)) return Number(explicit);
+  const sweepTime = context.env.MANDATE_SWEEP_TIME;
+  if (sweepTime) {
+    const parsed = Date.parse(sweepTime);
+    if (Number.isFinite(parsed)) return Math.floor(parsed / 1e3);
+  }
+  return Math.floor(Date.now() / 1e3);
+}
+function object(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+function lastBuilderPassEnded(source) {
+  let contentEnd = source.length;
+  while (contentEnd > 0) {
+    while (contentEnd > 0 && (source[contentEnd - 1] === "\n" || source[contentEnd - 1] === "\r")) {
+      contentEnd -= 1;
+    }
+    if (contentEnd === 0) break;
+    const lineStart = source.lastIndexOf("\n", contentEnd - 1) + 1;
+    const line = source.slice(lineStart, contentEnd);
+    contentEnd = lineStart > 0 ? lineStart - 1 : 0;
+    let record;
+    try {
+      record = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (!object(record) || record.kind !== "pass-ended" || !object(record.fact)) {
+      continue;
+    }
+    const owner = record.fact.owner;
+    if (typeof owner === "string" && owner.startsWith("builder-")) return record;
+  }
+  return void 0;
+}
+function checkBuilderPass(context) {
+  const cadenceHours = resolveMandateCadenceHours(
+    context.pluginRoot,
+    context.configDir,
+    context.cwd
+  );
+  if (cadenceHours === void 0) {
+    return {
+      status: "WARN",
+      name: "builder-pass",
+      detail: "builder cadence is invalid",
+      remedy: "set cadence_hours to a positive integer in mandates.yaml"
+    };
+  }
+  const tracePath = join7(context.configDir, "ostrom", "sprint.jsonl");
+  if (!existsSync4(tracePath)) {
+    return {
+      status: "WARN",
+      name: "builder-pass",
+      detail: "no builder pass ever recorded",
+      remedy: "run /ostrom:work and confirm it records pass-ended"
+    };
+  }
+  let source;
+  try {
+    source = readFileSync5(tracePath, "utf8");
+  } catch {
+    return {
+      status: "WARN",
+      name: "builder-pass",
+      detail: "builder pass history is unreadable",
+      remedy: "inspect sprint.jsonl and fix its permissions"
+    };
+  }
+  const record = lastBuilderPassEnded(source);
+  if (!record) {
+    return {
+      status: "WARN",
+      name: "builder-pass",
+      detail: "no builder pass ever recorded",
+      remedy: "run /ostrom:work and confirm it records pass-ended"
+    };
+  }
+  const timestamp = record.ts;
+  const timestampMs = typeof timestamp === "string" ? Date.parse(timestamp) : NaN;
+  if (!Number.isFinite(timestampMs)) {
+    return {
+      status: "WARN",
+      name: "builder-pass",
+      detail: "last builder pass has an invalid timestamp",
+      remedy: "inspect sprint.jsonl; records must be written by trace.sh append"
+    };
+  }
+  const ageSeconds = nowEpoch2(context) - Math.floor(timestampMs / 1e3);
+  if (ageSeconds > cadenceHours * 60 * 60) {
+    return {
+      status: "WARN",
+      name: "builder-pass",
+      detail: `builder pass stale, last ${timestamp} (older than ${cadenceHours}h cadence)`,
+      remedy: "run /ostrom:work and confirm the recurring builder loop is active"
+    };
+  }
+  return {
+    status: "OK",
+    name: "builder-pass",
+    detail: `builder pass current, last ${timestamp} (${cadenceHours}h cadence)`,
+    remedy: ""
+  };
+}
+
 // src/lib/result.ts
 function sanitize(value) {
   return value.replace(/[\r\n]/g, " ").replaceAll("|", "/");
@@ -741,6 +864,7 @@ function runDoctor(options) {
     checkTouchDurability(context),
     checkProviderReachable(context),
     checkTraceLease(context),
+    checkBuilderPass(context),
     checkEnvironment(context),
     checkConfigParser()
   ];
