@@ -82,7 +82,7 @@ mint a fresh token for that repository:
 set +x
 unset GH_TOKEN GITHUB_TOKEN
 if ! gatekeeper_token="$(
-  bash "${CLAUDE_PLUGIN_ROOT}/scripts/app-token.sh" "$repository"
+  bash "${CLAUDE_PLUGIN_ROOT}/scripts/app-token.sh" gatekeeper "$repository"
 )" ||
   [ -z "$gatekeeper_token" ]; then
   unset gatekeeper_token

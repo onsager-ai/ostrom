@@ -17,17 +17,30 @@ MANDATE_GATE_REPO_CONFIG="./.ostrom/gate.yaml"
 MANDATE_GATE_LOG="$MANDATE_DATA_DIR/gate.jsonl"
 MANDATE_EXCEPTIONS_LOG="$MANDATE_DATA_DIR/exceptions.jsonl"
 
-# Read the gatekeeper GitHub App credentials from the machine-local secrets
-# file. This intentionally remains separate from the shipped/user/repository
-# config layers: credentials have no repository or shipped layer.
-mandate_load_gatekeeper_credentials() {
+# Read one delivery role's GitHub App credentials from the machine-local
+# secrets file. This intentionally remains separate from the
+# shipped/user/repository config layers: credentials have no repository or
+# shipped layer.
+mandate_load_role_credentials() {
+  if [ "$#" -ne 1 ] || [ -z "${1:-}" ]; then
+    echo "app-token: mandate_load_role_credentials requires exactly one role" >&2
+    return 2
+  fi
+  local role="$1"
+  case "$role" in
+    [!a-z]*|*[!a-z0-9_-]*)
+      echo "app-token: invalid role: must match [a-z][a-z0-9_-]*" >&2
+      return 2
+      ;;
+  esac
+
   if [ ! -f "$MANDATE_SECRETS_FILE" ]; then
     echo "app-token: secrets file is missing at the configured Ostrom secrets path" >&2
     return 2
   fi
 
   credential_records="$(
-    awk '
+    awk -v role="$role" '
       function trim(s) {
         sub(/^[[:space:]]+/, "", s)
         sub(/[[:space:]]+$/, "", s)
@@ -43,14 +56,14 @@ mandate_load_gatekeeper_credentials() {
         return s
       }
       function fail(message) {
-        printf "app-token: could not parse gatekeeper credentials: %s\n", message > "/dev/stderr"
+        printf "app-token: could not parse %s credentials: %s\n", role, message > "/dev/stderr"
         failed = 1
       }
-      BEGIN { in_gatekeeper = 0; failed = 0 }
+      BEGIN { in_role = 0; found_role = 0; failed = 0 }
       {
         raw = $0
         if (raw ~ /\t/) {
-          if (in_gatekeeper) fail("tabs are not supported")
+          if (in_role) fail("tabs are not supported")
           next
         }
         if (raw ~ /^[[:space:]]*#/ || raw ~ /^[[:space:]]*$/) next
@@ -60,15 +73,16 @@ mandate_load_gatekeeper_credentials() {
         text = substr(raw, indent + 1)
 
         if (indent == 0) {
-          in_gatekeeper = (text == "gatekeeper:")
+          in_role = (text == role ":")
+          if (in_role) found_role = 1
           next
         }
-        if (!in_gatekeeper) next
+        if (!in_role) next
 
         sub(/[[:space:]]+#.*$/, "", text)
         if (text ~ /^[[:space:]]*$/) next
         if (indent != 2 || text !~ /^(app_id|installation_id|private_key_path):[[:space:]]*/) {
-          fail("unsupported gatekeeper entry")
+          fail("unsupported " role " entry")
           next
         }
 
@@ -88,7 +102,13 @@ mandate_load_gatekeeper_credentials() {
           print key "\t" value
         }
       }
-      END { if (failed) exit 2 }
+      END {
+        if (!found_role && !failed) {
+          printf "app-token: %s credentials are not configured\n", role > "/dev/stderr"
+          exit 2
+        }
+        if (failed) exit 2
+      }
     ' "$MANDATE_SECRETS_FILE"
   )" || return
 
@@ -101,7 +121,7 @@ mandate_load_gatekeeper_credentials() {
         )
       '
   )" || {
-    echo "app-token: could not parse gatekeeper credentials" >&2
+    echo "app-token: could not parse $role credentials" >&2
     return 2
   }
 
@@ -109,7 +129,7 @@ mandate_load_gatekeeper_credentials() {
     if ! jq -e --arg field "$required_field" \
       '.[$field] | type == "string" and length > 0' \
       >/dev/null <<<"$credentials"; then
-      echo "app-token: missing required gatekeeper field: $required_field" >&2
+      echo "app-token: missing required $role field: $required_field" >&2
       return 2
     fi
   done
@@ -117,7 +137,7 @@ mandate_load_gatekeeper_credentials() {
   if ! jq -e '
     .app_id | test("^[1-9][0-9]*$")
   ' >/dev/null <<<"$credentials"; then
-    echo "app-token: gatekeeper app_id must be a positive integer" >&2
+    echo "app-token: $role app_id must be a positive integer" >&2
     return 2
   fi
 

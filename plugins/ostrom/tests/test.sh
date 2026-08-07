@@ -420,7 +420,27 @@ case "${1:-}" in
     base64 | tr -d '\n'
     ;;
   dgst)
-    cat >/dev/null
+    signing_input="$(cat)"
+    if [ -n "${FAKE_OPENSSL_EXPECTED_KEY_PATH:-}" ]; then
+      [ "${4:-}" = "$FAKE_OPENSSL_EXPECTED_KEY_PATH" ] || exit 98
+    fi
+    if [ -n "${FAKE_OPENSSL_EXPECTED_APP_ID:-}" ]; then
+      encoded_payload="${signing_input#*.}"
+      encoded_payload="${encoded_payload%%.*}"
+      case $((${#encoded_payload} % 4)) in
+        0) payload_padding="" ;;
+        2) payload_padding="==" ;;
+        3) payload_padding="=" ;;
+        *) exit 98 ;;
+      esac
+      payload_json="$(
+        printf '%s' "$encoded_payload$payload_padding" |
+          tr '_-' '/+' |
+          base64 -d 2>/dev/null
+      )"
+      actual_app_id="$(jq -er '.iss | tostring' <<<"$payload_json")"
+      [ "$actual_app_id" = "$FAKE_OPENSSL_EXPECTED_APP_ID" ] || exit 98
+    fi
     printf 'stub-signature'
     ;;
   *) exit 99 ;;
@@ -435,6 +455,7 @@ run_app_token_failure() {
   shift 2
   app_token_stdout="$app_token_fixture/$app_token_name.stdout"
   app_token_stderr="$app_token_fixture/$app_token_name.stderr"
+  rm -f "$app_token_curl_log"
   set +e
   PATH="$app_token_fixture/bin:$PATH" \
     GH_TOKEN="ambient-principal-value" \
@@ -452,17 +473,105 @@ run_app_token_failure() {
   ! grep -q 'ambient-principal-value' "$app_token_stderr"
 }
 
+run_app_token_success() {
+  app_token_name="$1"
+  app_token_config_dir="$2"
+  app_token_role="$3"
+  expected_app_id="$4"
+  expected_key_path="$5"
+  app_token_stdout="$app_token_fixture/$app_token_name.stdout"
+  app_token_stderr="$app_token_fixture/$app_token_name.stderr"
+  rm -f "$app_token_curl_log"
+  PATH="$app_token_fixture/bin:$PATH" \
+    GH_TOKEN="ambient-principal-value" \
+    GITHUB_TOKEN="ambient-principal-value" \
+    FAKE_CURL_MODE=success \
+    FAKE_CURL_CALL_LOG="$app_token_curl_log" \
+    FAKE_OPENSSL_EXPECTED_APP_ID="$expected_app_id" \
+    FAKE_OPENSSL_EXPECTED_KEY_PATH="$expected_key_path" \
+    CLAUDE_CONFIG_DIR="$app_token_config_dir" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/app-token.sh" \
+      "$app_token_role" placeholder-owner/placeholder-repo \
+      >"$app_token_stdout" 2>"$app_token_stderr"
+  grep -Fxq 'stub-installation-token' "$app_token_stdout"
+  [ ! -s "$app_token_stderr" ]
+  [ "$(wc -l <"$app_token_curl_log" | tr -d '[:space:]')" -eq 2 ]
+  ! grep -q 'ambient-principal-value' \
+    "$app_token_stdout" "$app_token_stderr" "$app_token_curl_log"
+}
+
 app_token_missing_argument="$app_token_fixture/missing-argument"
 run_app_token_failure missing-argument "$app_token_missing_argument"
-grep -Fxq 'app-token: usage: app-token.sh <owner>/<repo>' \
+grep -Fxq 'app-token: usage: app-token.sh <role> <owner>/<repo>' \
   "$app_token_fixture/missing-argument.stderr"
+
+app_token_invalid_role="$app_token_fixture/invalid-role"
+for invalid_role_case in \
+  'invalid-empty:' \
+  'invalid-slash:gate/keeper' \
+  'invalid-space:gate keeper' \
+  'invalid-leading-digit:1gatekeeper'; do
+  invalid_role_name="${invalid_role_case%%:*}"
+  invalid_role="${invalid_role_case#*:}"
+  run_app_token_failure "$invalid_role_name" "$app_token_invalid_role" \
+    "$invalid_role" placeholder-owner/placeholder-repo
+  grep -Fxq \
+    'app-token: invalid role: must match [a-z][a-z0-9_-]*' \
+    "$app_token_fixture/$invalid_role_name.stderr"
+done
 
 app_token_missing_secrets="$app_token_fixture/missing-secrets"
 run_app_token_failure missing-secrets "$app_token_missing_secrets" \
-  placeholder-owner/placeholder-repo
+  gatekeeper placeholder-owner/placeholder-repo
 grep -Fxq \
   'app-token: secrets file is missing at the configured Ostrom secrets path' \
   "$app_token_fixture/missing-secrets.stderr"
+
+app_token_missing_role_block="$app_token_fixture/missing-role-block"
+mkdir -p "$app_token_missing_role_block/ostrom"
+cat >"$app_token_missing_role_block/ostrom/secrets.yaml" <<YAML
+gatekeeper:
+  app_id: 1 # APP_ID_PLACEHOLDER
+  private_key_path: $app_token_missing_role_block/gatekeeper-placeholder.pem
+YAML
+run_app_token_failure missing-role-block "$app_token_missing_role_block" \
+  builder placeholder-owner/placeholder-repo
+grep -Fxq 'app-token: builder credentials are not configured' \
+  "$app_token_fixture/missing-role-block.stderr"
+
+app_token_builder="$app_token_fixture/builder"
+mkdir -p "$app_token_builder/ostrom"
+app_token_builder_key="$app_token_builder/builder-placeholder.pem"
+: >"$app_token_builder_key"
+cat >"$app_token_builder/ostrom/secrets.yaml" <<YAML
+builder:
+  app_id: 2 # APP_ID_PLACEHOLDER
+  private_key_path: $app_token_builder_key
+YAML
+run_app_token_success builder "$app_token_builder" builder \
+  2 "$app_token_builder_key"
+
+# With both role blocks configured, the signer sees the app ID and key path
+# belonging to the requested role. The stub rejects either cross-role mix-up.
+app_token_both_roles="$app_token_fixture/both-roles"
+mkdir -p "$app_token_both_roles/ostrom"
+app_token_both_gatekeeper_key="$app_token_both_roles/gatekeeper-placeholder.pem"
+app_token_both_builder_key="$app_token_both_roles/builder-placeholder.pem"
+: >"$app_token_both_gatekeeper_key"
+: >"$app_token_both_builder_key"
+cat >"$app_token_both_roles/ostrom/secrets.yaml" <<YAML
+gatekeeper:
+  app_id: 1 # APP_ID_PLACEHOLDER_GATEKEEPER
+  private_key_path: $app_token_both_gatekeeper_key
+builder:
+  app_id: 2 # APP_ID_PLACEHOLDER_BUILDER
+  private_key_path: $app_token_both_builder_key
+YAML
+run_app_token_success both-roles-gatekeeper "$app_token_both_roles" gatekeeper \
+  1 "$app_token_both_gatekeeper_key"
+run_app_token_success both-roles-builder "$app_token_both_roles" builder \
+  2 "$app_token_both_builder_key"
 
 app_token_missing_key="$app_token_fixture/missing-key"
 mkdir -p "$app_token_missing_key/ostrom"
@@ -472,7 +581,7 @@ gatekeeper:
   private_key_path: $app_token_missing_key/absent.pem
 YAML
 run_app_token_failure missing-key "$app_token_missing_key" \
-  placeholder-owner/placeholder-repo
+  gatekeeper placeholder-owner/placeholder-repo
 grep -Fxq 'app-token: gatekeeper private key file is missing or unreadable' \
   "$app_token_fixture/missing-key.stderr"
 
@@ -483,7 +592,7 @@ gatekeeper:
   app_id: $$
 YAML
 run_app_token_failure missing-field "$app_token_missing_field" \
-  placeholder-owner/placeholder-repo
+  gatekeeper placeholder-owner/placeholder-repo
 grep -Fxq 'app-token: missing required gatekeeper field: private_key_path' \
   "$app_token_fixture/missing-field.stderr"
 
@@ -508,7 +617,7 @@ PATH="$app_token_fixture/bin:$PATH" \
   CLAUDE_CONFIG_DIR="$app_token_not_installed" \
   CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
   bash "$PLUGIN_ROOT/scripts/app-token.sh" \
-    placeholder-owner/placeholder-repo \
+    gatekeeper placeholder-owner/placeholder-repo \
     >"$app_token_fixture/not-installed.stdout" \
     2>"$app_token_fixture/not-installed.stderr"
 app_token_not_installed_status=$?
@@ -546,7 +655,7 @@ PATH="$app_token_fixture/bin:$PATH" \
   CLAUDE_CONFIG_DIR="$app_token_stale_id" \
   CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
   bash "$PLUGIN_ROOT/scripts/app-token.sh" \
-    placeholder-owner/placeholder-repo \
+    gatekeeper placeholder-owner/placeholder-repo \
     >"$app_token_fixture/stale-id.stdout" \
     2>"$app_token_fixture/stale-id.stderr"
 grep -Fxq 'stub-installation-token' "$app_token_fixture/stale-id.stdout"
