@@ -1,3 +1,5 @@
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { checkEnvironment } from "../checks/environment.js";
 import { checkMarketplace } from "../checks/marketplace.js";
 import { checkConfigParser } from "../checks/parser.js";
@@ -10,7 +12,7 @@ import {
 } from "../checks/touch.js";
 import { checkBuilderPass } from "../checks/builder-pass.js";
 import { resolveTouchConfig } from "./config.js";
-import type { DoctorContext } from "./context.js";
+import type { DoctorContext, TraceFile } from "./context.js";
 import { formatResult } from "./result.js";
 
 export interface DoctorOptions {
@@ -21,6 +23,27 @@ export interface DoctorOptions {
   env?: NodeJS.ProcessEnv;
 }
 
+// One doctor run may consult sprint.jsonl from more than one check. The file
+// only grows, so read it at most once per run and hand every check the same
+// cached result rather than each doing its own readFileSync.
+function createTraceReader(configDir: string): () => TraceFile {
+  let cached: TraceFile | undefined;
+  return () => {
+    if (cached) return cached;
+    const path = join(configDir, "ostrom", "sprint.jsonl");
+    if (!existsSync(path)) {
+      cached = { exists: false };
+      return cached;
+    }
+    try {
+      cached = { exists: true, content: readFileSync(path, "utf8") };
+    } catch (error) {
+      cached = { exists: true, error };
+    }
+    return cached;
+  };
+}
+
 export function runDoctor(options: DoctorOptions): string {
   const env = options.env ?? process.env;
   const context: DoctorContext = {
@@ -28,6 +51,7 @@ export function runDoctor(options: DoctorOptions): string {
     env,
     resolveConfig: () =>
       resolveTouchConfig(options.pluginRoot, options.configDir, options.cwd),
+    readTrace: createTraceReader(options.configDir),
   };
   const results = [
     checkPlugin(context),

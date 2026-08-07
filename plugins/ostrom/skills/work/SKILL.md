@@ -57,24 +57,23 @@ with an invisible pass.
 
 ## 3. Establish state
 
-Read, in order:
+Decide whether to sweep, and sweep before reading anything the sweep
+produces. Run the sweep when `state.json` is older than `cadence_hours`, or
+whenever anything has changed the repositories since it ran. A previous pass
+that closed issues or opened pull requests leaves the file young and its
+contents wrong. The sweep is cheap and idempotent; when in doubt, run it.
+
+```sh
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/sweep.sh"
+```
+
+Then read, in order:
 
 - `~/.claude/ostrom/mandates.yaml` — the authorization boundary: what each
   project delegates entirely and what bounces back.
 - `~/.claude/ostrom/queue.jsonl` — what the last sweep found. Rows are
   pointers, so resolve titles from GitHub rather than trusting cached text.
 - The SessionStart digest, if it is in context.
-
-Sweep first with:
-
-```sh
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/sweep.sh"
-```
-
-Run the sweep when `state.json` is older than `cadence_hours`, or whenever
-anything has changed the repositories since it ran. A previous pass that
-closed issues or opened pull requests leaves the file young and its contents
-wrong. The sweep is cheap and idempotent; when in doubt, run it.
 
 If the `/ostrom:work` invocation includes an optional focus, use that direct
 invocation input as a natural-language filter over the queue, such as `one

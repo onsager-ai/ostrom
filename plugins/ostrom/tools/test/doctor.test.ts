@@ -124,6 +124,7 @@ function pluginResult(
       path: "~/.claude/ostrom/touch-log.md",
       autoCommit: "False",
     }),
+    readTrace: () => ({ exists: false }),
   });
 }
 

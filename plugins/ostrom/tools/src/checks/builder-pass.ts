@@ -1,5 +1,3 @@
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
 import type { DoctorContext } from "../lib/context.js";
 import { resolveMandateCadenceHours } from "../lib/config.js";
 import type { CheckResult } from "../lib/result.js";
@@ -65,8 +63,8 @@ export function checkBuilderPass(context: DoctorContext): CheckResult {
     };
   }
 
-  const tracePath = join(context.configDir, "ostrom", "sprint.jsonl");
-  if (!existsSync(tracePath)) {
+  const trace = context.readTrace();
+  if (!trace.exists) {
     return {
       status: "WARN",
       name: "builder-pass",
@@ -74,11 +72,7 @@ export function checkBuilderPass(context: DoctorContext): CheckResult {
       remedy: "run /ostrom:work and confirm it records pass-ended",
     };
   }
-
-  let source: string;
-  try {
-    source = readFileSync(tracePath, "utf8");
-  } catch {
+  if (!("content" in trace)) {
     return {
       status: "WARN",
       name: "builder-pass",
@@ -87,7 +81,7 @@ export function checkBuilderPass(context: DoctorContext): CheckResult {
     };
   }
 
-  const record = lastBuilderPassEnded(source);
+  const record = lastBuilderPassEnded(trace.content);
   if (!record) {
     return {
       status: "WARN",

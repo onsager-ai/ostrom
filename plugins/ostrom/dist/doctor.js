@@ -2,6 +2,10 @@
 import { dirname as dirname2, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+// src/lib/doctor.ts
+import { existsSync as existsSync4, readFileSync as readFileSync5 } from "node:fs";
+import { join as join7 } from "node:path";
+
 // src/checks/rules.ts
 import { statSync } from "node:fs";
 import { join } from "node:path";
@@ -315,24 +319,22 @@ function exactKeys(value, expected) {
 function jsonObject(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
-function traceHealth(path, now) {
-  if (!existsSync(path)) {
+function traceHealth(trace, now) {
+  if (!trace.exists) {
     return {
       status: "WARN",
       detail: "trace absent",
       remedy: "run /ostrom:gatekeep and confirm it creates sprint.jsonl"
     };
   }
-  let source;
-  try {
-    source = readFileSync3(path, "utf8");
-  } catch {
+  if (!("content" in trace)) {
     return {
       status: "WARN",
       detail: "trace unreadable",
       remedy: "inspect sprint.jsonl and fix its permissions"
     };
   }
+  const source = trace.content;
   let contentEnd = source.length;
   while (contentEnd > 0 && source[contentEnd - 1] === "\n") {
     contentEnd -= 1;
@@ -443,7 +445,7 @@ function leaseHealth(path, now) {
 function checkTraceLease(context) {
   const dataDir = join4(context.configDir, "ostrom");
   const now = nowEpoch(context);
-  const trace = traceHealth(join4(dataDir, "sprint.jsonl"), now);
+  const trace = traceHealth(context.readTrace(), now);
   const lease = leaseHealth(join4(dataDir, "sprint.lease"), now);
   const warned = trace.status === "WARN" || lease.status === "WARN";
   return {
@@ -727,8 +729,6 @@ function checkProviderReachable(context) {
 }
 
 // src/checks/builder-pass.ts
-import { existsSync as existsSync4, readFileSync as readFileSync5 } from "node:fs";
-import { join as join7 } from "node:path";
 function nowEpoch2(context) {
   const explicit = context.env.MANDATE_NOW_EPOCH;
   if (explicit && /^\d+$/.test(explicit)) return Number(explicit);
@@ -780,8 +780,8 @@ function checkBuilderPass(context) {
       remedy: "set cadence_hours to a positive integer in mandates.yaml"
     };
   }
-  const tracePath = join7(context.configDir, "ostrom", "sprint.jsonl");
-  if (!existsSync4(tracePath)) {
+  const trace = context.readTrace();
+  if (!trace.exists) {
     return {
       status: "WARN",
       name: "builder-pass",
@@ -789,10 +789,7 @@ function checkBuilderPass(context) {
       remedy: "run /ostrom:work and confirm it records pass-ended"
     };
   }
-  let source;
-  try {
-    source = readFileSync5(tracePath, "utf8");
-  } catch {
+  if (!("content" in trace)) {
     return {
       status: "WARN",
       name: "builder-pass",
@@ -800,7 +797,7 @@ function checkBuilderPass(context) {
       remedy: "inspect sprint.jsonl and fix its permissions"
     };
   }
-  const record = lastBuilderPassEnded(source);
+  const record = lastBuilderPassEnded(trace.content);
   if (!record) {
     return {
       status: "WARN",
@@ -850,12 +847,30 @@ function formatResult(result) {
 }
 
 // src/lib/doctor.ts
+function createTraceReader(configDir2) {
+  let cached;
+  return () => {
+    if (cached) return cached;
+    const path = join7(configDir2, "ostrom", "sprint.jsonl");
+    if (!existsSync4(path)) {
+      cached = { exists: false };
+      return cached;
+    }
+    try {
+      cached = { exists: true, content: readFileSync5(path, "utf8") };
+    } catch (error) {
+      cached = { exists: true, error };
+    }
+    return cached;
+  };
+}
 function runDoctor(options) {
   const env = options.env ?? process.env;
   const context = {
     ...options,
     env,
-    resolveConfig: () => resolveTouchConfig(options.pluginRoot, options.configDir, options.cwd)
+    resolveConfig: () => resolveTouchConfig(options.pluginRoot, options.configDir, options.cwd),
+    readTrace: createTraceReader(options.configDir)
   };
   const results = [
     checkPlugin(context),

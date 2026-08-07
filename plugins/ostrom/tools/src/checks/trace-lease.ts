@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import type { DoctorContext } from "../lib/context.js";
+import type { DoctorContext, TraceFile } from "../lib/context.js";
 import type { CheckResult, Status } from "../lib/result.js";
 
 const TRACE_STALE_SECONDS = 24 * 60 * 60;
@@ -38,19 +38,15 @@ function jsonObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-function traceHealth(path: string, now: number): Health {
-  if (!existsSync(path)) {
+function traceHealth(trace: TraceFile, now: number): Health {
+  if (!trace.exists) {
     return {
       status: "WARN",
       detail: "trace absent",
       remedy: "run /ostrom:gatekeep and confirm it creates sprint.jsonl",
     };
   }
-
-  let source: string;
-  try {
-    source = readFileSync(path, "utf8");
-  } catch {
+  if (!("content" in trace)) {
     return {
       status: "WARN",
       detail: "trace unreadable",
@@ -58,6 +54,7 @@ function traceHealth(path: string, now: number): Health {
     };
   }
 
+  const source = trace.content;
   let contentEnd = source.length;
   while (contentEnd > 0 && source[contentEnd - 1] === "\n") {
     contentEnd -= 1;
@@ -195,7 +192,7 @@ function leaseHealth(path: string, now: number): Health {
 export function checkTraceLease(context: DoctorContext): CheckResult {
   const dataDir = join(context.configDir, "ostrom");
   const now = nowEpoch(context);
-  const trace = traceHealth(join(dataDir, "sprint.jsonl"), now);
+  const trace = traceHealth(context.readTrace(), now);
   const lease = leaseHealth(join(dataDir, "sprint.lease"), now);
   const warned = trace.status === "WARN" || lease.status === "WARN";
 
