@@ -176,6 +176,28 @@ export function resolveTouchConfig(
   };
 }
 
+export function resolveMandateCadenceHours(
+  pluginRoot: string,
+  configDir: string,
+  cwd: string,
+): number | undefined {
+  const paths = [
+    join(pluginRoot, "config", "mandate-defaults.yaml"),
+    join(configDir, "ostrom", "mandates.yaml"),
+    join(cwd, ".ostrom", "mandates.yaml"),
+  ];
+  const config = paths.reduce<Config>(
+    (resolved, path) => merge(resolved, load(path)),
+    {},
+  );
+  const cadence = config.cadence_hours;
+  return typeof cadence === "number" &&
+    Number.isSafeInteger(cadence) &&
+    cadence > 0
+    ? cadence
+    : undefined;
+}
+
 export function expandTilde(path: string, home: string): string {
   if (path === "~") return home;
   if (path.startsWith("~/")) return join(home, path.slice(2));

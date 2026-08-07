@@ -59,7 +59,7 @@ checks carry it.
 
 ## 4. Keep it short, keep it clean
 
-If every check is `OK`, keep the whole report to a few lines — the eight
+If every check is `OK`, keep the whole report to a few lines — the nine
 check lines plus the verdict, nothing more.
 
 Never echo a secret, token, or the Notion data source id — the prober

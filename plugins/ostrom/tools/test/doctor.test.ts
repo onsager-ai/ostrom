@@ -102,7 +102,7 @@ function baseFixture(): Fixture {
   mkdirSync(join(configDir, "ostrom"), { recursive: true });
   writeFileSync(
     join(configDir, "ostrom", "sprint.jsonl"),
-    '{"ts":"2026-08-01T00:00:00Z","kind":"pass-ended","fact":{"outcome":"complete"},"narration":{}}\n',
+    '{"ts":"2026-08-01T00:00:00Z","kind":"pass-ended","fact":{"owner":"builder-fixture-wake1","outcome":"complete"},"narration":{}}\n',
   );
   const fixture = { root, home, configDir, cwd, installPath };
   wireMarketplace(fixture);
@@ -124,6 +124,7 @@ function pluginResult(
       path: "~/.claude/ostrom/touch-log.md",
       autoCommit: "False",
     }),
+    readTrace: () => ({ exists: false }),
   });
 }
 
@@ -179,6 +180,12 @@ function commonExpected(
       status: "OK",
       name: "trace-lease",
       detail: "trace current, last 2026-08-01T00:00:00Z; lease idle",
+      remedy: "",
+    },
+    {
+      status: "OK",
+      name: "builder-pass",
+      detail: "builder pass current, last 2026-08-01T00:00:00Z (24h cadence)",
       remedy: "",
     },
     { status: "OK", name: "environment", detail: "local", remedy: "" },
@@ -389,7 +396,7 @@ describe("doctor golden output", () => {
       },
     });
 
-    expect(report.split("\n").filter(Boolean)).toHaveLength(8);
+    expect(report.split("\n").filter(Boolean)).toHaveLength(9);
     expect(existsSync(missing)).toBe(false);
   });
 
@@ -411,6 +418,45 @@ describe("doctor golden output", () => {
 
     expect(run(fixture)).toContain(
       "WARN|trace-lease|trace stale, last 2026-07-30T00:00:00Z (older than 24h); lease idle|run /ostrom:gatekeep and confirm the recurring loop is active\n",
+    );
+  });
+
+  it("distinguishes no recorded builder pass from stale builder history", () => {
+    const fixture = baseFixture();
+    const tracePath = join(fixture.configDir, "ostrom", "sprint.jsonl");
+    writeFileSync(
+      tracePath,
+      '{"ts":"2026-08-01T00:00:00Z","kind":"pass-ended","fact":{"owner":"gatekeeper-fixture-wake1"},"narration":{}}\n',
+    );
+
+    expect(run(fixture)).toContain(
+      "WARN|builder-pass|no builder pass ever recorded|run /ostrom:work and confirm it records pass-ended\n",
+    );
+
+    writeFileSync(
+      tracePath,
+      '{"ts":"2026-07-30T00:00:00Z","kind":"pass-ended","fact":{"owner":"builder-fixture-wake1"},"narration":{}}\n' +
+        '{"ts":"2026-08-01T00:00:00Z","kind":"pass-ended","fact":{"owner":"gatekeeper-fixture-wake1"},"narration":{}}\n',
+    );
+
+    expect(run(fixture)).toContain(
+      "WARN|builder-pass|builder pass stale, last 2026-07-30T00:00:00Z (older than 24h cadence)|run /ostrom:work and confirm the recurring builder loop is active\n",
+    );
+  });
+
+  it("uses the resolved mandate cadence for builder pass age", () => {
+    const fixture = baseFixture();
+    writeFileSync(
+      join(fixture.configDir, "ostrom", "mandates.yaml"),
+      "cadence_hours: 12\n",
+    );
+    writeFileSync(
+      join(fixture.configDir, "ostrom", "sprint.jsonl"),
+      '{"ts":"2026-07-31T11:00:00Z","kind":"pass-ended","fact":{"owner":"builder-fixture-wake1"},"narration":{}}\n',
+    );
+
+    expect(run(fixture)).toContain(
+      "WARN|builder-pass|builder pass stale, last 2026-07-31T11:00:00Z (older than 12h cadence)|run /ostrom:work and confirm the recurring builder loop is active\n",
     );
   });
 
