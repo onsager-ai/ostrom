@@ -1,0 +1,127 @@
+{
+  "_comment": "state.notice.text is intentionally excluded because it is narration-shaped; publish only notice.kind and notice.reported.",
+  "queue": [
+    "id",
+    "repo",
+    "ref",
+    "title",
+    "kind",
+    "mandate",
+    "state",
+    "opened",
+    "age_days",
+    "aged_out",
+    "needs_judgment",
+    "blocked_by"
+  ],
+  "queue.mandate": [
+    "reason",
+    "dossier"
+  ],
+  "queue.mandate.dossier": [
+    "question",
+    "recommended_action",
+    "blast_radius",
+    "options_ruled_out"
+  ],
+  "gate": [
+    "ts",
+    "pr",
+    "head_sha",
+    "verdict",
+    "already_judged",
+    "conditions"
+  ],
+  "gate.condition": [
+    "name",
+    "result",
+    "tier",
+    "detail",
+    "exception_reason"
+  ],
+  "gate.detail.mergeable": [
+    "mergeable"
+  ],
+  "gate.detail.draft": [
+    "isDraft"
+  ],
+  "gate.detail.review_threads": [
+    "unresolved",
+    "resolved_by_pr_author",
+    "resolved_with_missing_resolver"
+  ],
+  "gate.detail.bounce_selectors": [
+    "matches",
+    "unobservable"
+  ],
+  "gate.detail.bounce_selectors.match": [
+    "selector",
+    "tier"
+  ],
+  "gate.detail.bounce_selectors.unobservable": [
+    "selector",
+    "tier"
+  ],
+  "gate.detail.reserved_refs": [
+    "matches"
+  ],
+  "gate.detail.required_checks": [
+    "selectors"
+  ],
+  "gate.detail.required_checks.selector": [
+    "selector",
+    "result",
+    "matches"
+  ],
+  "gate.detail.required_checks.match": [
+    "name",
+    "state"
+  ],
+  "state": [
+    "version",
+    "dead_selectors",
+    "repos"
+  ],
+  "state.dead_selector": [
+    "repo",
+    "selector",
+    "source"
+  ],
+  "state.repo": [
+    "cursor",
+    "previous_cursor",
+    "selector_hash",
+    "items",
+    "policy",
+    "scope_changes",
+    "unclassified",
+    "item_cap",
+    "notice"
+  ],
+  "state.item": [
+    "classification",
+    "fingerprint",
+    "first_seen",
+    "updated",
+    "matched_selector",
+    "stuck"
+  ],
+  "state.policy": [
+    "default",
+    "delegated",
+    "reserved",
+    "bounce",
+    "bounce_all",
+    "excluded",
+    "paused",
+    "selector_hash"
+  ],
+  "state.scope_changes": [
+    "entered",
+    "left"
+  ],
+  "state.notice": [
+    "kind",
+    "reported"
+  ]
+}
