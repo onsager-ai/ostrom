@@ -809,3 +809,9 @@ mandate_write_if_changed "$work/state.json" "$MANDATE_STATE_FILE"
 # content diff.
 touch "$MANDATE_STATE_FILE"
 echo "mandate sweep: $project_count projects; $queue_changes queue changes"
+
+# Publishing is downstream of the governing sweep. A remote, auth, or merge
+# failure is reported but must never change the sweep's successful outcome.
+if ! bash "$SCRIPT_DIR/publish.sh"; then
+  echo "mandate sweep: publish failed; local records remain authoritative" >&2
+fi

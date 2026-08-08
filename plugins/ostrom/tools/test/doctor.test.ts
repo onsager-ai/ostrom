@@ -104,6 +104,11 @@ function baseFixture(): Fixture {
     join(configDir, "ostrom", "sprint.jsonl"),
     '{"ts":"2026-08-01T00:00:00Z","kind":"pass-ended","fact":{"owner":"builder-fixture-wake1","outcome":"complete"},"narration":{}}\n',
   );
+  mkdirSync(join(configDir, "ostrom", "publish"), { recursive: true });
+  writeFileSync(
+    join(configDir, "ostrom", "publish", "manifest.json"),
+    '{"published_at":"2026-08-01T00:00:00Z","expected_sweep_interval_hours":24}\n',
+  );
   const fixture = { root, home, configDir, cwd, installPath };
   wireMarketplace(fixture);
   return fixture;
@@ -186,6 +191,12 @@ function commonExpected(
       status: "OK",
       name: "builder-pass",
       detail: "builder pass current, last 2026-08-01T00:00:00Z (24h cadence)",
+      remedy: "",
+    },
+    {
+      status: "OK",
+      name: "publish",
+      detail: "publish current, last 2026-08-01T00:00:00Z (24h cadence)",
       remedy: "",
     },
     { status: "OK", name: "environment", detail: "local", remedy: "" },
@@ -396,7 +407,7 @@ describe("doctor golden output", () => {
       },
     });
 
-    expect(report.split("\n").filter(Boolean)).toHaveLength(9);
+    expect(report.split("\n").filter(Boolean)).toHaveLength(10);
     expect(existsSync(missing)).toBe(false);
   });
 
@@ -406,6 +417,37 @@ describe("doctor golden output", () => {
 
     expect(run(fixture)).toContain(
       "WARN|trace-lease|trace absent; lease idle|run /ostrom:gatekeep and confirm it creates sprint.jsonl\n",
+    );
+  });
+
+  it("reports missing, stale, and current publish state from the manifest cadence", () => {
+    const fixture = baseFixture();
+    const manifestPath = join(
+      fixture.configDir,
+      "ostrom",
+      "publish",
+      "manifest.json",
+    );
+
+    rmSync(manifestPath);
+    expect(run(fixture)).toContain(
+      "WARN|publish|no publish has been recorded|run mandate publish.sh and confirm the state branch is reachable\n",
+    );
+
+    writeFileSync(
+      manifestPath,
+      '{"published_at":"2026-07-31T11:00:00Z","expected_sweep_interval_hours":12}\n',
+    );
+    expect(run(fixture)).toContain(
+      "WARN|publish|publish stale, last 2026-07-31T11:00:00Z (older than 12h cadence)|run mandate publish.sh and confirm the state branch is reachable\n",
+    );
+
+    writeFileSync(
+      manifestPath,
+      '{"published_at":"2026-07-31T13:00:00Z","expected_sweep_interval_hours":12}\n',
+    );
+    expect(run(fixture)).toContain(
+      "OK|publish|publish current, last 2026-07-31T13:00:00Z (12h cadence)|\n",
     );
   });
 
