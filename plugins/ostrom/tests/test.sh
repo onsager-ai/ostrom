@@ -2566,6 +2566,45 @@ git --git-dir="$publisher_remote" show state:gate/2026-07-31.jsonl |
 env "${publish_env[@]}" bash "$PLUGIN_ROOT/scripts/publish.sh" >/dev/null
 [ "$(git --git-dir="$publisher_remote" rev-list --count state)" -eq 1 ]
 
+# A `--no-checkout` clone still populates the index from the remote's
+# default branch even though it skips the working tree, so a remote whose
+# default branch already carries a file (and has no `state` branch at all)
+# is the case that actually exercises the inheritance: `checkout --orphan`
+# would otherwise carry that file's index entry straight into the first
+# publish commit. Assert the resulting tree holds exactly the derived
+# paths and nothing else.
+orphan_remote="$publisher/orphan-remote.git"
+orphan_seed="$publisher/orphan-seed"
+git init --bare --quiet "$orphan_remote"
+git clone --quiet "$orphan_remote" "$orphan_seed"
+git -C "$orphan_seed" config user.name "Ostrom Test"
+git -C "$orphan_seed" config user.email "ostrom@example.test"
+git -C "$orphan_seed" checkout -b main --quiet
+printf 'unrelated default-branch content\n' >"$orphan_seed/README.md"
+git -C "$orphan_seed" add README.md
+git -C "$orphan_seed" commit --quiet -m "seed unrelated default branch"
+git -C "$orphan_seed" push --quiet origin HEAD:main
+git --git-dir="$orphan_remote" symbolic-ref HEAD refs/heads/main
+orphan_cache="$publisher/orphan-cache"
+orphan_env=(
+  CLAUDE_CONFIG_DIR="$publisher_config"
+  CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT"
+  MANDATE_PUBLISH_DIR="$orphan_cache"
+  MANDATE_PUBLISH_REMOTE="$orphan_remote"
+  MANDATE_PUBLISH_TIME="2026-08-01T00:05:00Z"
+  GIT_AUTHOR_NAME="Ostrom Test"
+  GIT_AUTHOR_EMAIL="ostrom@example.test"
+  GIT_COMMITTER_NAME="Ostrom Test"
+  GIT_COMMITTER_EMAIL="ostrom@example.test"
+)
+env "${orphan_env[@]}" bash "$PLUGIN_ROOT/scripts/publish.sh" >/dev/null
+[ "$(git --git-dir="$orphan_remote" rev-list --count state)" -eq 1 ]
+orphan_tree="$(git --git-dir="$orphan_remote" ls-tree -r --name-only state | sort)"
+expected_orphan_tree="$(printf '%s\n' \
+  gate/2026-07-31.jsonl gate/2026-08-01.jsonl manifest.json queue.jsonl \
+  rollup.json state.json | sort)"
+[ "$orphan_tree" = "$expected_orphan_tree" ]
+
 # A bare repository whose hook rejects the push cannot fail the governing
 # sweep or mutate any source record. The first sweep establishes a stable
 # baseline; only the second run is forced to fail publication.

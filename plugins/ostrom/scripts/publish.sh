@@ -447,6 +447,10 @@ fi
 mkdir -p "$(dirname "$publish_dir")"
 if [ ! -d "$publish_dir/.git" ]; then
   if [[ "$publish_remote" == */* && "$publish_remote" != /* && "$publish_remote" != *:* ]]; then
+    command -v gh >/dev/null 2>&1 || {
+      echo "mandate publish: gh is required to clone an owner/repo remote; pass a URL or path instead to skip it" >&2
+      exit 1
+    }
     gh repo clone "$publish_remote" "$publish_dir" -- --no-checkout >/dev/null
   else
     git clone --no-checkout "$publish_remote" "$publish_dir" >/dev/null
@@ -455,10 +459,18 @@ fi
 
 if git -C "$publish_dir" ls-remote --exit-code --heads origin state >/dev/null 2>&1; then
   git -C "$publish_dir" fetch --quiet origin state
-  git -C "$publish_dir" switch --force-create state FETCH_HEAD >/dev/null
+  git -C "$publish_dir" checkout -B state FETCH_HEAD >/dev/null
 else
-  git -C "$publish_dir" switch --orphan state >/dev/null 2>&1 || \
-    git -C "$publish_dir" switch state >/dev/null
+  if git -C "$publish_dir" checkout --orphan state >/dev/null 2>&1; then
+    # `checkout --orphan` (unlike `switch --orphan`) inherits whatever is
+    # currently staged. A `--no-checkout` clone still populates the index
+    # from the remote's default branch even though it skips the working
+    # tree, so clear it explicitly: the first publish commit must hold only
+    # the derived tree, never a stray entry carried over from that branch.
+    git -C "$publish_dir" read-tree --empty
+  else
+    git -C "$publish_dir" checkout state >/dev/null
+  fi
 fi
 
 # Reuse the branch timestamp when every non-manifest byte and every stable
