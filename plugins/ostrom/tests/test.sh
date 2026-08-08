@@ -2327,4 +2327,343 @@ jq -s -e --arg head "$excused_fail_head" '
   )
 ' "$gate_log" >/dev/null
 
+# The publisher's fixtures are synthetic and its only push target is a local
+# throwaway bare repository. Dry-run exits before any clone or remote access.
+publisher="$fixture/publisher"
+publisher_config="$publisher/config"
+publisher_data="$publisher_config/ostrom"
+publisher_remote="$publisher/state.git"
+publisher_cache="$publisher/cache"
+mkdir -p "$publisher_data"
+cat >"$publisher_data/mandates.yaml" <<'YAML'
+provider: file
+cadence_hours: 24
+stuck_after_days: 7
+bounce_all: []
+projects:
+  - repo: example-org/example-repo
+    delegated: []
+    excluded: []
+    reserved: []
+    default: unclassified
+    paused: false
+    bounce: []
+YAML
+cat >"$publisher_data/queue.jsonl" <<'JSONL'
+{"id":"example-org/example-repo#101","repo":"example-org/example-repo","ref":"#101","title":"chore(example): synthetic queue item","kind":"decision","mandate":{"reason":"synthetic policy reason","dossier":{"question":"synthetic question","recommended_action":"approve","blast_radius":"one synthetic file","options_ruled_out":["defer"]}},"state":"pending","opened":"2026-07-31T09:00:00Z","age_days":1,"aged_out":false,"needs_judgment":true,"blocked_by":[],"unlisted_queue_field":"drop-me"}
+JSONL
+cat >"$publisher_data/gate.jsonl" <<'JSONL'
+{"ts":"2026-04-01T12:00:00Z","pr":"example-org/example-repo#200","head_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","verdict":"fail","already_judged":false,"conditions":[{"name":"mergeable","result":"fail","tier":["content-derived"],"detail":{"mergeable":"CONFLICTING","reason":"synthetic reason"}}]}
+{"ts":"2026-07-31T23:59:59Z","pr":"example-org/example-repo#201","head_sha":null,"verdict":"inconclusive","already_judged":false,"conditions":[{"name":"required_checks","result":"inconclusive","tier":["content-derived"],"detail":{"selectors":[{"selector":"verify-*","result":"pass","matches":[{"name":"verify-linux","state":"SUCCESS"}]}],"reason":"synthetic reason"}}]}
+{"ts":"2026-08-01T00:00:01Z","pr":"example-org/example-repo#202","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","verdict":"pass","already_judged":false,"conditions":[{"name":"mergeable","result":"pass","tier":["content-derived"],"detail":{"mergeable":"CONFLICTING"}},{"name":"reserved_refs","result":"excused","tier":["author-written"],"detail":{"matches":["ref:#101"],"reason":"synthetic reason"},"exception_reason":"synthetic exception"},{"name":"bounce_selectors","result":"pass","tier":["author-written","content-derived"],"detail":{"matches":[{"selector":"title:*synthetic*","tier":"author-written"}],"unobservable":[{"selector":"path:synthetic/**","tier":"content-derived","error":"synthetic raw error"}],"reason":"synthetic reason"}},{"name":"future_condition","result":"pass","tier":[],"detail":{"future":"synthetic value"}}]}
+JSONL
+cat >"$publisher_data/state.json" <<'JSON'
+{
+  "version": 2,
+  "dead_selectors": [
+    {"repo": "example-org/example-repo", "selector": "label:synthetic", "source": "delegated"}
+  ],
+  "repos": {
+    "example-org/example-repo": {
+      "cursor": "cursor:synthetic-2",
+      "previous_cursor": "cursor:synthetic-1",
+      "selector_hash": "synthetic-selector-hash",
+      "items": {
+        "example-org/example-repo#101": {
+          "classification": "unclassified",
+          "fingerprint": "synthetic-fingerprint",
+          "first_seen": "2026-07-31T09:00:00Z",
+          "updated": "2026-08-01T00:00:00Z",
+          "matched_selector": "default:unclassified",
+          "stuck": false
+        }
+      },
+      "policy": {
+        "default": "unclassified",
+        "delegated": [],
+        "reserved": [],
+        "bounce": [],
+        "bounce_all": [],
+        "excluded": [],
+        "paused": false,
+        "selector_hash": "synthetic-selector-hash"
+      },
+      "scope_changes": {"entered": [], "left": []},
+      "unclassified": 1,
+      "item_cap": null,
+      "notice": {"kind": "baseline", "reported": false, "text": "synthetic explanatory notice"}
+    }
+  }
+}
+JSON
+
+run_publish_dry() {
+  CLAUDE_CONFIG_DIR="$publisher_config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    MANDATE_PUBLISH_TIME="2026-08-01T00:05:00Z" \
+    bash "$PLUGIN_ROOT/scripts/publish.sh" --dry-run
+}
+
+publisher_tree="$publisher/tree.json"
+run_publish_dry >"$publisher_tree"
+allowlist="$PLUGIN_ROOT/config/publish-allowlist.json"
+assert_tree_allowlisted() {
+  candidate_tree="$1"
+  jq -e --slurpfile allow_file "$allowlist" '
+    $allow_file[0] as $allow
+    | . as $tree
+    | all($tree["queue.jsonl"][];
+        ((keys - $allow.queue) | length) == 0
+        and ((.mandate | keys) - $allow["queue.mandate"] | length) == 0
+        and (if (.mandate.dossier | type) == "object"
+          then ((.mandate.dossier | keys) - $allow["queue.mandate.dossier"] | length) == 0
+          else true end)
+      )
+    and all(
+      $tree | to_entries[] | select(.key | startswith("gate/")) | .value[];
+      ((keys - $allow.gate) | length) == 0
+      and all(.conditions[];
+        ((keys - $allow["gate.condition"]) | length) == 0
+        and (if has("detail") then
+          (($allow["gate.detail." + .name] // null) != null)
+          and (((.detail | keys) - $allow["gate.detail." + .name] | length) == 0)
+          else true end)
+        and (if .name == "bounce_selectors" and has("detail") then
+          all(.detail.matches[];
+            ((keys - $allow["gate.detail.bounce_selectors.match"]) | length) == 0)
+          and all(.detail.unobservable[];
+            ((keys - $allow["gate.detail.bounce_selectors.unobservable"]) | length) == 0)
+          else true end)
+        and (if .name == "required_checks" and has("detail") then
+          all(.detail.selectors[];
+            ((keys - $allow["gate.detail.required_checks.selector"]) | length) == 0
+            and all(.matches[];
+              ((keys - $allow["gate.detail.required_checks.match"]) | length) == 0)
+          )
+          else true end)
+      )
+    )
+    and ((($tree["state.json"] | keys) - $allow.state | length) == 0)
+    and all($tree["state.json"].dead_selectors[];
+      ((keys - $allow["state.dead_selector"]) | length) == 0
+    )
+    and all($tree["state.json"].repos | to_entries[].value;
+      ((keys - $allow["state.repo"]) | length) == 0
+      and all(.items | to_entries[].value;
+        ((keys - $allow["state.item"]) | length) == 0
+      )
+      and (((.policy | keys) - $allow["state.policy"] | length) == 0)
+      and (((.scope_changes | keys) - $allow["state.scope_changes"] | length) == 0)
+      and (if (.notice | type) == "object"
+        then (((.notice | keys) - $allow["state.notice"] | length) == 0)
+        else true end)
+    )
+  ' "$candidate_tree" >/dev/null
+}
+assert_tree_allowlisted "$publisher_tree"
+
+# A workstation with live records exercises the same assertion without
+# making it a CI prerequisite. Dry-run never enters clone/bootstrap logic.
+real_config_dir="${OSTROM_TEST_REAL_CONFIG_DIR:-$HOME/.claude}"
+if [ -f "$real_config_dir/ostrom/mandates.yaml" ] && \
+  [ -f "$real_config_dir/ostrom/queue.jsonl" ] && \
+  [ -f "$real_config_dir/ostrom/gate.jsonl" ] && \
+  [ -f "$real_config_dir/ostrom/state.json" ]; then
+  CLAUDE_CONFIG_DIR="$real_config_dir" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/publish.sh" --dry-run \
+    >"$publisher/live-tree.json"
+  assert_tree_allowlisted "$publisher/live-tree.json"
+fi
+jq -e '
+  .["queue.jsonl"][0] | has("unlisted_queue_field") | not
+' "$publisher_tree" >/dev/null
+jq -e '
+  .["manifest.json"].dropped_fields.queue.unlisted_queue_field == 1
+  and .["manifest.json"].dropped_fields.state["repos.*.notice.text"] == 1
+' "$publisher_tree" >/dev/null
+# Unknown condition names fail closed: their envelope remains, their entire
+# detail disappears, and the omission is counted.
+jq -e '
+  first(
+    .["gate/2026-08-01.jsonl"][].conditions[]
+    | select(.name == "future_condition")
+  ) as $condition
+  | ($condition | has("detail") | not)
+  and .["manifest.json"].dropped_fields.gate["conditions[].detail"] == 1
+' "$publisher_tree" >/dev/null
+# The two observed free-text carriers are excluded while adjacent factual
+# detail survives, and both dropped paths are visible in the manifest.
+jq -e '
+  .["manifest.json"].dropped_fields.gate["conditions[].detail.reason"] == 4
+  and .["manifest.json"].dropped_fields.gate[
+    "conditions[].detail.unobservable[].error"
+  ] == 1
+  and first(
+    .["gate/2026-08-01.jsonl"][].conditions[]
+    | select(.name == "bounce_selectors")
+  ).detail.unobservable == [
+    {selector: "path:synthetic/**", tier: "content-derived"}
+  ]
+  and ([
+    . | to_entries[] | select(.key | startswith("gate/")) | .value[]
+    | .conditions[] | .detail? | .. | objects | keys[]
+    | select(. == "reason" or . == "error")
+  ] | length) == 0
+' "$publisher_tree" >/dev/null
+jq -e '
+  has("gate/2026-07-31.jsonl")
+  and (has("gate/2026-04-01.jsonl") | not)
+  and .["gate/2026-07-31.jsonl"][0].ts == "2026-07-31T23:59:59Z"
+  and has("gate/2026-08-01.jsonl")
+  and .["rollup.json"].verdicts_by_day["2026-04-01"].fail == 1
+  and .["rollup.json"].verdicts_by_day["2026-07-31"].inconclusive == 1
+  and .["rollup.json"].queue_age_buckets["0-1"] == 1
+  and .["rollup.json"].repo_classifications["example-org/example-repo"].unclassified == 1
+  and first(
+    .["gate/2026-08-01.jsonl"][].conditions[]
+    | select(.name == "mergeable")
+  ).detail.mergeable == "CONFLICTING"
+  and first(
+    .["gate/2026-07-31.jsonl"][].conditions[]
+    | select(.name == "required_checks")
+  ).detail.selectors[0].matches[0] == {name: "verify-linux", state: "SUCCESS"}
+' "$publisher_tree" >/dev/null
+
+# Backfill is a pure derivation: a second run at the same publication instant
+# produces identical daily files and an identical full tree.
+run_publish_dry >"$publisher/tree-again.json"
+cmp -s "$publisher_tree" "$publisher/tree-again.json"
+
+changed_allowlist="$publisher/changed-allowlist.json"
+jq '.queue += ["fixture_extension"]' "$allowlist" >"$changed_allowlist"
+CLAUDE_CONFIG_DIR="$publisher_config" \
+  CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+  MANDATE_PUBLISH_ALLOWLIST="$changed_allowlist" \
+  MANDATE_PUBLISH_TIME="2026-08-01T00:05:00Z" \
+  bash "$PLUGIN_ROOT/scripts/publish.sh" --dry-run \
+  >"$publisher/changed-tree.json"
+[ "$(jq -r '.["manifest.json"].schema_id' "$publisher_tree")" != \
+  "$(jq -r '.["manifest.json"].schema_id' "$publisher/changed-tree.json")" ]
+
+# A real commit and push round-trip goes only to this local bare repository.
+git init --bare --quiet "$publisher_remote"
+publish_env=(
+  CLAUDE_CONFIG_DIR="$publisher_config"
+  CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT"
+  MANDATE_PUBLISH_DIR="$publisher_cache"
+  MANDATE_PUBLISH_REMOTE="$publisher_remote"
+  MANDATE_PUBLISH_TIME="2026-08-01T00:05:00Z"
+  GIT_AUTHOR_NAME="Ostrom Test"
+  GIT_AUTHOR_EMAIL="ostrom@example.test"
+  GIT_COMMITTER_NAME="Ostrom Test"
+  GIT_COMMITTER_EMAIL="ostrom@example.test"
+)
+env "${publish_env[@]}" bash "$PLUGIN_ROOT/scripts/publish.sh" >/dev/null
+[ "$(git --git-dir="$publisher_remote" rev-list --count state)" -eq 1 ]
+git --git-dir="$publisher_remote" show state:gate/2026-07-31.jsonl |
+  jq -e '.ts == "2026-07-31T23:59:59Z"' >/dev/null
+env "${publish_env[@]}" bash "$PLUGIN_ROOT/scripts/publish.sh" >/dev/null
+[ "$(git --git-dir="$publisher_remote" rev-list --count state)" -eq 1 ]
+
+# A `--no-checkout` clone still populates the index from the remote's
+# default branch even though it skips the working tree, so a remote whose
+# default branch already carries a file (and has no `state` branch at all)
+# is the case that actually exercises the inheritance: `checkout --orphan`
+# would otherwise carry that file's index entry straight into the first
+# publish commit. Assert the resulting tree holds exactly the derived
+# paths and nothing else.
+orphan_remote="$publisher/orphan-remote.git"
+orphan_seed="$publisher/orphan-seed"
+git init --bare --quiet "$orphan_remote"
+git clone --quiet "$orphan_remote" "$orphan_seed"
+git -C "$orphan_seed" config user.name "Ostrom Test"
+git -C "$orphan_seed" config user.email "ostrom@example.test"
+git -C "$orphan_seed" checkout -b main --quiet
+printf 'unrelated default-branch content\n' >"$orphan_seed/README.md"
+git -C "$orphan_seed" add README.md
+git -C "$orphan_seed" commit --quiet -m "seed unrelated default branch"
+git -C "$orphan_seed" push --quiet origin HEAD:main
+git --git-dir="$orphan_remote" symbolic-ref HEAD refs/heads/main
+orphan_cache="$publisher/orphan-cache"
+orphan_env=(
+  CLAUDE_CONFIG_DIR="$publisher_config"
+  CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT"
+  MANDATE_PUBLISH_DIR="$orphan_cache"
+  MANDATE_PUBLISH_REMOTE="$orphan_remote"
+  MANDATE_PUBLISH_TIME="2026-08-01T00:05:00Z"
+  GIT_AUTHOR_NAME="Ostrom Test"
+  GIT_AUTHOR_EMAIL="ostrom@example.test"
+  GIT_COMMITTER_NAME="Ostrom Test"
+  GIT_COMMITTER_EMAIL="ostrom@example.test"
+)
+env "${orphan_env[@]}" bash "$PLUGIN_ROOT/scripts/publish.sh" >/dev/null
+[ "$(git --git-dir="$orphan_remote" rev-list --count state)" -eq 1 ]
+orphan_tree="$(git --git-dir="$orphan_remote" ls-tree -r --name-only state | sort)"
+expected_orphan_tree="$(printf '%s\n' \
+  gate/2026-07-31.jsonl gate/2026-08-01.jsonl manifest.json queue.jsonl \
+  rollup.json state.json | sort)"
+[ "$orphan_tree" = "$expected_orphan_tree" ]
+
+# A bare repository whose hook rejects the push cannot fail the governing
+# sweep or mutate any source record. The first sweep establishes a stable
+# baseline; only the second run is forced to fail publication.
+publish_sweep="$publisher/sweep-failure"
+rejecting_remote="$publish_sweep/rejecting.git"
+mkdir -p "$publish_sweep/config/ostrom" "$publish_sweep/repo"
+cp "$publisher_data/mandates.yaml" "$publish_sweep/config/ostrom/mandates.yaml"
+(
+  cd "$publish_sweep/repo"
+  PATH="$fixture/bin:$PATH" \
+    CLAUDE_CONFIG_DIR="$publish_sweep/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    MANDATE_PUBLISH_DIR="$publish_sweep/first-cache" \
+    MANDATE_PUBLISH_REMOTE="$publisher_remote" \
+    MANDATE_PUBLISH_TIME="2026-08-01T00:05:00Z" \
+    GIT_AUTHOR_NAME="Ostrom Test" \
+    GIT_AUTHOR_EMAIL="ostrom@example.test" \
+    GIT_COMMITTER_NAME="Ostrom Test" \
+    GIT_COMMITTER_EMAIL="ostrom@example.test" \
+    bash "$PLUGIN_ROOT/scripts/sweep.sh" >/dev/null
+)
+source_hashes_before="$(
+  sha256sum "$publish_sweep/config/ostrom/queue.jsonl" \
+    "$publish_sweep/config/ostrom/state.json"
+)"
+git init --bare --quiet "$rejecting_remote"
+git --git-dir="$rejecting_remote" config core.hooksPath "$rejecting_remote/hooks"
+cat >"$rejecting_remote/hooks/pre-receive" <<'SH'
+#!/bin/sh
+echo "synthetic push rejection" >&2
+exit 1
+SH
+chmod +x "$rejecting_remote/hooks/pre-receive"
+set +e
+(
+  cd "$publish_sweep/repo"
+  PATH="$fixture/bin:$PATH" \
+    CLAUDE_CONFIG_DIR="$publish_sweep/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    MANDATE_PUBLISH_DIR="$publish_sweep/failing-cache" \
+    MANDATE_PUBLISH_REMOTE="$rejecting_remote" \
+    MANDATE_PUBLISH_TIME="2026-08-01T00:05:00Z" \
+    GIT_AUTHOR_NAME="Ostrom Test" \
+    GIT_AUTHOR_EMAIL="ostrom@example.test" \
+    GIT_COMMITTER_NAME="Ostrom Test" \
+    GIT_COMMITTER_EMAIL="ostrom@example.test" \
+    bash "$PLUGIN_ROOT/scripts/sweep.sh" >/dev/null 2>"$publish_sweep/failure.err"
+)
+publish_sweep_status=$?
+set -e
+[ "$publish_sweep_status" -eq 0 ]
+grep -q 'mandate sweep: publish failed; local records remain authoritative' \
+  "$publish_sweep/failure.err"
+grep -q 'synthetic push rejection' "$publish_sweep/failure.err"
+source_hashes_after="$(
+  sha256sum "$publish_sweep/config/ostrom/queue.jsonl" \
+    "$publish_sweep/config/ostrom/state.json"
+)"
+[ "$source_hashes_before" = "$source_hashes_after" ]
+[ ! -e "$publish_sweep/config/ostrom/gate.jsonl" ]
+
 echo "mandate tests: ok"

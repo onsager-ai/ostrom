@@ -3,8 +3,8 @@ import { dirname as dirname2, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // src/lib/doctor.ts
-import { existsSync as existsSync4, readFileSync as readFileSync5 } from "node:fs";
-import { join as join7 } from "node:path";
+import { existsSync as existsSync5, readFileSync as readFileSync6 } from "node:fs";
+import { join as join8 } from "node:path";
 
 // src/checks/rules.ts
 import { statSync } from "node:fs";
@@ -833,6 +833,80 @@ function checkBuilderPass(context) {
   };
 }
 
+// src/checks/publish.ts
+import { existsSync as existsSync4, readFileSync as readFileSync5 } from "node:fs";
+import { join as join7 } from "node:path";
+function nowEpoch3(context) {
+  const explicit = context.env.MANDATE_NOW_EPOCH;
+  if (explicit && /^\d+$/.test(explicit)) return Number(explicit);
+  const sweepTime = context.env.MANDATE_SWEEP_TIME;
+  if (sweepTime) {
+    const parsed = Date.parse(sweepTime);
+    if (Number.isFinite(parsed)) return Math.floor(parsed / 1e3);
+  }
+  return Math.floor(Date.now() / 1e3);
+}
+function object2(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+function checkPublish(context) {
+  const publishDir = context.env.MANDATE_PUBLISH_DIR ?? join7(context.configDir, "ostrom", "publish");
+  const manifestPath = join7(publishDir, "manifest.json");
+  if (!existsSync4(manifestPath)) {
+    return {
+      status: "WARN",
+      name: "publish",
+      detail: "no publish has been recorded",
+      remedy: "run mandate publish.sh and confirm the state branch is reachable"
+    };
+  }
+  let manifest;
+  try {
+    manifest = JSON.parse(readFileSync5(manifestPath, "utf8"));
+  } catch {
+    return {
+      status: "WARN",
+      name: "publish",
+      detail: "publish manifest is unreadable",
+      remedy: "inspect the cached publish clone and repair or recreate it"
+    };
+  }
+  if (!object2(manifest)) {
+    return {
+      status: "WARN",
+      name: "publish",
+      detail: "publish manifest is malformed",
+      remedy: "run mandate publish.sh to regenerate the cached record tree"
+    };
+  }
+  const publishedAt = manifest.published_at;
+  const cadenceHours = manifest.expected_sweep_interval_hours;
+  const publishedMs = typeof publishedAt === "string" ? Date.parse(publishedAt) : Number.NaN;
+  if (!Number.isFinite(publishedMs) || typeof cadenceHours !== "number" || !Number.isInteger(cadenceHours) || cadenceHours <= 0) {
+    return {
+      status: "WARN",
+      name: "publish",
+      detail: "publish manifest has invalid cadence or timestamp",
+      remedy: "run mandate publish.sh to regenerate the cached record tree"
+    };
+  }
+  const ageSeconds = nowEpoch3(context) - Math.floor(publishedMs / 1e3);
+  if (ageSeconds > cadenceHours * 60 * 60) {
+    return {
+      status: "WARN",
+      name: "publish",
+      detail: `publish stale, last ${publishedAt} (older than ${cadenceHours}h cadence)`,
+      remedy: "run mandate publish.sh and confirm the state branch is reachable"
+    };
+  }
+  return {
+    status: "OK",
+    name: "publish",
+    detail: `publish current, last ${publishedAt} (${cadenceHours}h cadence)`,
+    remedy: ""
+  };
+}
+
 // src/lib/result.ts
 function sanitize(value) {
   return value.replace(/[\r\n]/g, " ").replaceAll("|", "/");
@@ -851,13 +925,13 @@ function createTraceReader(configDir2) {
   let cached;
   return () => {
     if (cached) return cached;
-    const path = join7(configDir2, "ostrom", "sprint.jsonl");
-    if (!existsSync4(path)) {
+    const path = join8(configDir2, "ostrom", "sprint.jsonl");
+    if (!existsSync5(path)) {
       cached = { exists: false };
       return cached;
     }
     try {
-      cached = { exists: true, content: readFileSync5(path, "utf8") };
+      cached = { exists: true, content: readFileSync6(path, "utf8") };
     } catch (error) {
       cached = { exists: true, error };
     }
@@ -880,6 +954,7 @@ function runDoctor(options) {
     checkProviderReachable(context),
     checkTraceLease(context),
     checkBuilderPass(context),
+    checkPublish(context),
     checkEnvironment(context),
     checkConfigParser()
   ];

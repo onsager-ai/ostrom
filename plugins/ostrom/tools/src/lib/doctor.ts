@@ -11,6 +11,7 @@ import {
   checkTouchDurability,
 } from "../checks/touch.js";
 import { checkBuilderPass } from "../checks/builder-pass.js";
+import { checkPublish } from "../checks/publish.js";
 import { resolveTouchConfig } from "./config.js";
 import type { DoctorContext, TraceFile } from "./context.js";
 import { formatResult } from "./result.js";
@@ -61,6 +62,7 @@ export function runDoctor(options: DoctorOptions): string {
     checkProviderReachable(context),
     checkTraceLease(context),
     checkBuilderPass(context),
+    checkPublish(context),
     checkEnvironment(context),
     checkConfigParser(),
   ];
