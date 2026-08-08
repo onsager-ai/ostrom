@@ -78,7 +78,8 @@ Then read, in order:
 If the `/ostrom:work` invocation includes an optional focus, use that direct
 invocation input as a natural-language filter over the queue, such as `one
 repository only` or `just tripwires`. Otherwise take items in this order:
-**tripwires and reserved refs → CI drift → delegated work**, oldest first.
+**tripwires and reserved refs → CI drift → open review threads on your own
+pull requests → delegated work**, oldest first.
 
 ## 4. Work each item
 
@@ -110,10 +111,25 @@ the worktree; those are the merging party's actions. The gatekeeper's advantage
 is position: it did not write the code and has not already argued that the code
 is correct. A gate the builder can satisfy is not a gate.
 
+**Answer your own open review threads.** A thread left open on a pull request
+you opened is the same shape as CI drift: work already begun, already failing a
+gate condition, and holding back something otherwise finished. That is why it
+outranks new delegated work. Read the thread, verify the point against the diff
+yourself, and then either fix it or reply saying why no change is warranted —
+both are answers; silence is not. An automated reviewer comments on most pull
+requests and will not chase you, so a thread nobody answers blocks the gate for
+as long as nobody answers it.
+
 Never resolve or dismiss a review thread on your own pull request, including a
 thread you believe is fixed. `gate.sh` counts a thread as unresolved when it is
 unresolved or was resolved by the PR author. Reply and let the reviewer close
 it.
+
+The two rules are one design. You answer; the gatekeeper judges whether the
+answer landed and resolves. A CI failure is safe to clear yourself because CI
+re-runs and re-judges independently — you certify nothing. A review thread has
+no re-judge, so resolving it is an assertion rather than a verification, and an
+assertion from the author is what the condition exists to refuse.
 
 After every item attempted, append exactly one `item-worked` record before
 moving on, including failed and blocked attempts. Its fact object carries the
