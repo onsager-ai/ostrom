@@ -64,12 +64,26 @@ cutoff="$(
 )"
 
 gate_source=/dev/null
-if [ -s "$MANDATE_GATE_LOG" ]; then
-  gate_source="$MANDATE_GATE_LOG"
+gate_log_state="present"
+if [ -e "$MANDATE_GATE_LOG" ]; then
+  if [ ! -r "$MANDATE_GATE_LOG" ]; then
+    echo "mandate audit: gate log exists but is not readable: $MANDATE_GATE_LOG" >&2
+    exit 4
+  fi
+  if [ -s "$MANDATE_GATE_LOG" ]; then
+    gate_source="$MANDATE_GATE_LOG"
+  else
+    gate_log_state="empty"
+  fi
+else
+  gate_log_state="absent"
 fi
 
 echo "mandate audit: merged-SHA gate verdicts over the last $days days"
 echo "Window: $cutoff through $audit_time (by mergedAt)."
+if [ "$gate_log_state" != "present" ]; then
+  echo "Gate log is $gate_log_state at $MANDATE_GATE_LOG: every count below reflects no recorded verdicts, not a measurement of zero."
+fi
 echo "Pass-with-excuse is a subset of pass; unknown join states remain separate."
 echo
 
@@ -99,13 +113,14 @@ while IFS= read -r project; do
             else ""
             end;
           def joined_merges:
-            [
+            (reduce $gate[] as $record ({}; .[$record.pr] += [$record])) as $gate_index
+            | [
               .[]
               | select((.mergedAt // "") != "" and .mergedAt >= $cutoff)
               | . as $pr
               | ($repo + "#" + ($pr.number | tostring)) as $id
               | ($pr.headRefOid // "") as $merged_sha
-              | [$gate[] | select(.pr == $id)] as $records
+              | ($gate_index[$id] // []) as $records
               | [
                   $records[]
                   | select((.head_sha | type) == "string" and (.head_sha | length) > 0)

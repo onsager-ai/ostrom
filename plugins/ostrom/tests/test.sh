@@ -781,7 +781,7 @@ JSON
       ;;
     example-org/audit-repo)
       cat <<'JSON'
-[{"number":200,"mergedAt":"2020-01-01T00:00:00Z","headRefOid":"0000000000000000000000000000000000000000","mergeCommit":{"oid":"0000000000000000000000000000000000000001"}},{"number":201,"mergedAt":"2026-07-10T00:00:00Z","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","mergeCommit":{"oid":"1111111111111111111111111111111111111111"}},{"number":202,"mergedAt":"2026-07-11T00:00:00Z","headRefOid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","mergeCommit":{"oid":"2222222222222222222222222222222222222222"}},{"number":203,"mergedAt":"2026-07-12T00:00:00Z","headRefOid":"cccccccccccccccccccccccccccccccccccccccc","mergeCommit":{"oid":"3333333333333333333333333333333333333333"}},{"number":204,"mergedAt":"2026-07-13T00:00:00Z","headRefOid":"dddddddddddddddddddddddddddddddddddddddd","mergeCommit":{"oid":"4444444444444444444444444444444444444444"}},{"number":205,"mergedAt":"2026-07-14T00:00:00Z","headRefOid":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","mergeCommit":{"oid":"5555555555555555555555555555555555555555"}},{"number":206,"mergedAt":"2026-07-15T00:00:00Z","headRefOid":"ffffffffffffffffffffffffffffffffffffffff","mergeCommit":{"oid":"6666666666666666666666666666666666666666"}},{"number":207,"mergedAt":"2026-07-16T00:00:00Z","headRefOid":"7777777777777777777777777777777777777777","mergeCommit":{"oid":"8888888888888888888888888888888888888888"}}]
+[{"number":200,"mergedAt":"2020-01-01T00:00:00Z","headRefOid":"0000000000000000000000000000000000000000","mergeCommit":{"oid":"0000000000000000000000000000000000000001"}},{"number":201,"mergedAt":"2026-07-10T00:00:00Z","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","mergeCommit":{"oid":"1111111111111111111111111111111111111111"}},{"number":202,"mergedAt":"2026-07-11T00:00:00Z","headRefOid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","mergeCommit":{"oid":"2222222222222222222222222222222222222222"}},{"number":203,"mergedAt":"2026-07-12T00:00:00Z","headRefOid":"cccccccccccccccccccccccccccccccccccccccc","mergeCommit":{"oid":"3333333333333333333333333333333333333333"}},{"number":204,"mergedAt":"2026-07-13T00:00:00Z","headRefOid":"dddddddddddddddddddddddddddddddddddddddd","mergeCommit":{"oid":"4444444444444444444444444444444444444444"}},{"number":205,"mergedAt":"2026-07-14T00:00:00Z","headRefOid":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","mergeCommit":{"oid":"5555555555555555555555555555555555555555"}},{"number":206,"mergedAt":"2026-07-15T00:00:00Z","headRefOid":"ffffffffffffffffffffffffffffffffffffffff","mergeCommit":{"oid":"6666666666666666666666666666666666666666"}},{"number":207,"mergedAt":"2026-07-16T00:00:00Z","headRefOid":"7777777777777777777777777777777777777777","mergeCommit":{"oid":"8888888888888888888888888888888888888888"}},{"number":208,"mergedAt":"2026-07-17T00:00:00Z","headRefOid":"abababababababababababababababababababab","mergeCommit":{"oid":"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"}}]
 JSON
       ;;
     *) echo '[]' ;;
@@ -1437,11 +1437,15 @@ grep -q '^Unmatched irreversible-surface merges (misses, lower bound): 1$' \
   <<<"$replay_miss_output"
 
 # audit.sh joins on the head SHA that actually merged, not merely PR identity.
-# The seven in-window merges cover pass, pass-with-excuse, fail,
+# The eight in-window merges cover pass, pass-with-excuse, fail,
 # inconclusive, no verdict, only a non-merged-SHA verdict, and only a null-SHA
 # verdict. #200 and its null-SHA record are outside the window. #202 has both
 # a null-SHA record and a usable pass, proving record-quality counts do not
-# disappear merely because the PR can ultimately be joined.
+# disappear merely because the PR can ultimately be joined. #208 carries two
+# records at the same merged SHA, fail then pass — this is the regression
+# fixture for the gate-log index (Fix 2): only the later record's verdict
+# ("pass") may be reported, so a reordering bug in the index would flip the
+# fail/pass counts below.
 audit_dir="$fixture/audit"
 audit_call_log="$fixture/audit-gh-calls.log"
 mkdir -p "$audit_dir/config/ostrom" "$audit_dir/repo"
@@ -1465,6 +1469,8 @@ cat >"$audit_dir/config/ostrom/gate.jsonl" <<'JSONL'
 {"ts":"2026-07-13T00:00:00Z","pr":"example-org/audit-repo#205","head_sha":"9999999999999999999999999999999999999999","verdict":"fail","already_judged":false,"conditions":[{"name":"bounce_selectors","result":"fail","tier":["author-written","content-derived"],"detail":{}}]}
 {"ts":"2026-07-14T00:00:00Z","pr":"example-org/audit-repo#206","head_sha":null,"verdict":"inconclusive","already_judged":false,"conditions":[{"name":"required_checks","result":"inconclusive","tier":["content-derived"],"detail":{}}]}
 {"ts":"2026-07-15T00:00:00Z","pr":"example-org/audit-repo#207","head_sha":"7777777777777777777777777777777777777777","verdict":"inconclusive","already_judged":false,"conditions":[{"name":"required_checks","result":"inconclusive","tier":["content-derived"],"detail":{}}]}
+{"ts":"2026-07-17T00:00:00Z","pr":"example-org/audit-repo#208","head_sha":"abababababababababababababababababababab","verdict":"fail","already_judged":false,"conditions":[{"name":"mergeable","result":"fail","tier":["content-derived"],"detail":{}}]}
+{"ts":"2026-07-17T01:00:00Z","pr":"example-org/audit-repo#208","head_sha":"abababababababababababababababababababab","verdict":"pass","already_judged":false,"conditions":[{"name":"mergeable","result":"pass","tier":["content-derived"],"detail":{}}]}
 JSONL
 audit_sources_before="$(
   sha256sum "$audit_dir/config/ostrom/mandates.yaml" \
@@ -1486,12 +1492,12 @@ audit_sources_after="$(
 grep -Fxq "$(printf 'no verdict at any SHA\t1')" <<<"$audit_output"
 grep -Fxq "$(printf 'only null-SHA verdicts (unjoinable)\t1')" <<<"$audit_output"
 grep -Fxq "$(printf 'verdict exists, but none at the merged SHA\t1')" <<<"$audit_output"
-grep -Fxq "$(printf 'pass at the merged SHA\t2')" <<<"$audit_output"
+grep -Fxq "$(printf 'pass at the merged SHA\t3')" <<<"$audit_output"
 grep -Fxq "$(printf 'of passes, contains an excused condition\t1')" <<<"$audit_output"
 grep -Fxq "$(printf 'fail or inconclusive at the merged SHA\t2')" <<<"$audit_output"
 grep -Fxq "$(printf '  fail\t1')" <<<"$audit_output"
 grep -Fxq "$(printf '  inconclusive\t1')" <<<"$audit_output"
-grep -Fxq "$(printf 'total merged PRs in window\t7')" <<<"$audit_output"
+grep -Fxq "$(printf 'total merged PRs in window\t8')" <<<"$audit_output"
 grep -Fxq "$(printf 'null head_sha records for merged PRs in window\t2')" \
   <<<"$audit_output"
 grep -Fxq "$(printf 'merged PRs touched by a null head_sha record\t2')" \
@@ -1500,6 +1506,15 @@ grep -Fxq "$(printf 'review_threads\t1')" <<<"$audit_output"
 grep -Fxq "$(printf 'required_checks\t1')" <<<"$audit_output"
 if grep -q "$(printf '^bounce_selectors\t')" <<<"$audit_output"; then
   echo "audit attributed a non-merged-SHA failure to the fail bucket" >&2
+  exit 1
+fi
+# #208's two same-SHA records must be resolved by the gate-log index in
+# their original file order: the later "pass" record wins, not the earlier
+# "fail" one. If the index (Fix 2) ever reordered records within a PR's
+# group, #208 would report as fail instead, which would also throw off the
+# fail/pass counts already asserted above.
+if grep -Fq "$(printf 'example-org/audit-repo#208\tfail')" <<<"$audit_output"; then
+  echo "audit picked the earlier gate record instead of the later one for #208" >&2
   exit 1
 fi
 grep -Fq "$(printf 'example-org/audit-repo#205\tnone at merged SHA\teeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\t5555555555555555555555555555555555555555\t0')" \
@@ -1517,6 +1532,85 @@ grep -Fxq $'example-org/audit-repo\tpr list --repo example-org/audit-repo --stat
 if grep -Eq '[0-9]+%' <<<"$audit_output"; then
   echo "audit collapsed separate evidence into a percentage" >&2
   exit 1
+fi
+
+# An absent gate log is a legitimate first-run state: the report must still
+# be produced, but it must say so explicitly, so zero counts are never
+# mistaken for a measurement.
+absent_gate_dir="$fixture/audit-absent-gate"
+mkdir -p "$absent_gate_dir/config/ostrom" "$absent_gate_dir/repo"
+cat >"$absent_gate_dir/config/ostrom/mandates.yaml" <<'YAML'
+bounce_all: []
+projects:
+  - repo: example-org/absent-gate-repo
+    delegated: []
+    excluded: []
+    reserved: []
+    default: excluded
+    paused: false
+    bounce: []
+YAML
+[ ! -e "$absent_gate_dir/config/ostrom/gate.jsonl" ]
+absent_gate_output="$(
+  cd "$absent_gate_dir/repo"
+  CLAUDE_CONFIG_DIR="$absent_gate_dir/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    PATH="$fixture/bin:$PATH" \
+    MANDATE_AUDIT_TIME="2026-08-01T00:00:00Z" \
+    bash "$PLUGIN_ROOT/scripts/audit.sh" 30
+)"
+grep -Fq "Gate log is absent at" <<<"$absent_gate_output"
+grep -Fxq "$(printf 'total merged PRs in window\t0')" <<<"$absent_gate_output"
+
+# An empty gate log means the same thing as absent (no verdicts recorded
+# yet) and must carry the same explicit notice.
+empty_gate_dir="$fixture/audit-empty-gate"
+mkdir -p "$empty_gate_dir/config/ostrom" "$empty_gate_dir/repo"
+sed 's/absent-gate-repo/empty-gate-repo/' \
+  "$absent_gate_dir/config/ostrom/mandates.yaml" \
+  >"$empty_gate_dir/config/ostrom/mandates.yaml"
+: >"$empty_gate_dir/config/ostrom/gate.jsonl"
+empty_gate_output="$(
+  cd "$empty_gate_dir/repo"
+  CLAUDE_CONFIG_DIR="$empty_gate_dir/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    PATH="$fixture/bin:$PATH" \
+    MANDATE_AUDIT_TIME="2026-08-01T00:00:00Z" \
+    bash "$PLUGIN_ROOT/scripts/audit.sh" 30
+)"
+grep -Fq "Gate log is empty at" <<<"$empty_gate_output"
+
+# A gate log that exists but cannot be read is a different situation
+# entirely from absent/empty: it is an unknown, not a zero, so audit.sh
+# must fail loudly rather than silently report no verdicts. chmod 000 does
+# not block root from reading, so this assertion only means something for
+# a non-root test run; skip it rather than fail spuriously under root.
+if [ "$(id -u)" -eq 0 ]; then
+  echo "mandate tests: skipping unreadable-gate-log assertion (running as root; chmod 000 does not block root reads)"
+else
+  unreadable_gate_dir="$fixture/audit-unreadable-gate"
+  mkdir -p "$unreadable_gate_dir/config/ostrom" "$unreadable_gate_dir/repo"
+  sed 's/absent-gate-repo/unreadable-gate-repo/' \
+    "$absent_gate_dir/config/ostrom/mandates.yaml" \
+    >"$unreadable_gate_dir/config/ostrom/mandates.yaml"
+  unreadable_gate_log="$unreadable_gate_dir/config/ostrom/gate.jsonl"
+  cat >"$unreadable_gate_log" <<'JSONL'
+{"ts":"2026-07-01T00:00:00Z","pr":"example-org/unreadable-gate-repo#1","head_sha":"1111111111111111111111111111111111111111","verdict":"pass","already_judged":false,"conditions":[]}
+JSONL
+  chmod 000 "$unreadable_gate_log"
+  set +e
+  unreadable_gate_output="$(
+    cd "$unreadable_gate_dir/repo"
+    CLAUDE_CONFIG_DIR="$unreadable_gate_dir/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+      PATH="$fixture/bin:$PATH" \
+      MANDATE_AUDIT_TIME="2026-08-01T00:00:00Z" \
+      bash "$PLUGIN_ROOT/scripts/audit.sh" 30 2>"$unreadable_gate_dir/stderr"
+  )"
+  unreadable_gate_status=$?
+  set -e
+  [ "$unreadable_gate_status" -ne 0 ]
+  [ -z "$unreadable_gate_output" ]
+  grep -q 'mandate audit:' "$unreadable_gate_dir/stderr"
+  grep -q 'gate log' "$unreadable_gate_dir/stderr"
+  chmod 644 "$unreadable_gate_log"
 fi
 
 # The fixture shape is three issues plus the three PRs that close them.
