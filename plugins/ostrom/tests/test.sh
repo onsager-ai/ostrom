@@ -779,6 +779,11 @@ JSON
 [{"number":101,"title":"chore: rotate deploy workflow","labels":[],"url":"https://example.invalid/pull/101","baseRefName":"main","mergedAt":"2026-07-15T00:00:00Z","closingIssuesReferences":[],"files":[{"path":".github/workflows/deploy.yml"}]},{"number":102,"title":"chore: production deployment prep","labels":[],"url":"https://example.invalid/pull/102","baseRefName":"main","mergedAt":"2026-07-16T00:00:00Z","closingIssuesReferences":[],"files":[{"path":".github/workflows/publish.yml"}]},{"number":100,"title":"chore: ancient workflow tweak","labels":[],"url":"https://example.invalid/pull/100","baseRefName":"main","mergedAt":"2020-01-01T00:00:00Z","closingIssuesReferences":[],"files":[{"path":".github/workflows/old.yml"}]}]
 JSON
       ;;
+    example-org/audit-repo)
+      cat <<'JSON'
+[{"number":200,"mergedAt":"2020-01-01T00:00:00Z","headRefOid":"0000000000000000000000000000000000000000","mergeCommit":{"oid":"0000000000000000000000000000000000000001"}},{"number":201,"mergedAt":"2026-07-10T00:00:00Z","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","mergeCommit":{"oid":"1111111111111111111111111111111111111111"}},{"number":202,"mergedAt":"2026-07-11T00:00:00Z","headRefOid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","mergeCommit":{"oid":"2222222222222222222222222222222222222222"}},{"number":203,"mergedAt":"2026-07-12T00:00:00Z","headRefOid":"cccccccccccccccccccccccccccccccccccccccc","mergeCommit":{"oid":"3333333333333333333333333333333333333333"}},{"number":204,"mergedAt":"2026-07-13T00:00:00Z","headRefOid":"dddddddddddddddddddddddddddddddddddddddd","mergeCommit":{"oid":"4444444444444444444444444444444444444444"}},{"number":205,"mergedAt":"2026-07-14T00:00:00Z","headRefOid":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","mergeCommit":{"oid":"5555555555555555555555555555555555555555"}},{"number":206,"mergedAt":"2026-07-15T00:00:00Z","headRefOid":"ffffffffffffffffffffffffffffffffffffffff","mergeCommit":{"oid":"6666666666666666666666666666666666666666"}},{"number":207,"mergedAt":"2026-07-16T00:00:00Z","headRefOid":"7777777777777777777777777777777777777777","mergeCommit":{"oid":"8888888888888888888888888888888888888888"}}]
+JSON
+      ;;
     *) echo '[]' ;;
   esac
   exit 0
@@ -1430,6 +1435,89 @@ fi
 grep -q 'workflow file: .github/workflows/deploy.yml' <<<"$replay_miss_output"
 grep -q '^Unmatched irreversible-surface merges (misses, lower bound): 1$' \
   <<<"$replay_miss_output"
+
+# audit.sh joins on the head SHA that actually merged, not merely PR identity.
+# The seven in-window merges cover pass, pass-with-excuse, fail,
+# inconclusive, no verdict, only a non-merged-SHA verdict, and only a null-SHA
+# verdict. #200 and its null-SHA record are outside the window. #202 has both
+# a null-SHA record and a usable pass, proving record-quality counts do not
+# disappear merely because the PR can ultimately be joined.
+audit_dir="$fixture/audit"
+audit_call_log="$fixture/audit-gh-calls.log"
+mkdir -p "$audit_dir/config/ostrom" "$audit_dir/repo"
+cat >"$audit_dir/config/ostrom/mandates.yaml" <<'YAML'
+bounce_all: []
+projects:
+  - repo: example-org/audit-repo
+    delegated: []
+    excluded: []
+    reserved: []
+    default: excluded
+    paused: false
+    bounce: []
+YAML
+cat >"$audit_dir/config/ostrom/gate.jsonl" <<'JSONL'
+{"ts":"2020-01-01T00:00:00Z","pr":"example-org/audit-repo#200","head_sha":null,"verdict":"inconclusive","already_judged":false,"conditions":[{"name":"mergeable","result":"inconclusive","tier":["content-derived"],"detail":{}}]}
+{"ts":"2026-07-09T00:00:00Z","pr":"example-org/audit-repo#201","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","verdict":"pass","already_judged":false,"conditions":[{"name":"mergeable","result":"pass","tier":["content-derived"],"detail":{}}]}
+{"ts":"2026-07-10T00:00:00Z","pr":"example-org/audit-repo#202","head_sha":null,"verdict":"inconclusive","already_judged":false,"conditions":[{"name":"mergeable","result":"inconclusive","tier":["content-derived"],"detail":{}}]}
+{"ts":"2026-07-10T01:00:00Z","pr":"example-org/audit-repo#202","head_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","verdict":"pass","already_judged":false,"conditions":[{"name":"reserved_refs","result":"excused","tier":["author-written"],"detail":{},"exception_reason":"principal accepted fixture"}]}
+{"ts":"2026-07-11T00:00:00Z","pr":"example-org/audit-repo#203","head_sha":"cccccccccccccccccccccccccccccccccccccccc","verdict":"fail","already_judged":false,"conditions":[{"name":"mergeable","result":"pass","tier":["content-derived"],"detail":{}},{"name":"review_threads","result":"fail","tier":["content-derived"],"detail":{}}]}
+{"ts":"2026-07-13T00:00:00Z","pr":"example-org/audit-repo#205","head_sha":"9999999999999999999999999999999999999999","verdict":"fail","already_judged":false,"conditions":[{"name":"bounce_selectors","result":"fail","tier":["author-written","content-derived"],"detail":{}}]}
+{"ts":"2026-07-14T00:00:00Z","pr":"example-org/audit-repo#206","head_sha":null,"verdict":"inconclusive","already_judged":false,"conditions":[{"name":"required_checks","result":"inconclusive","tier":["content-derived"],"detail":{}}]}
+{"ts":"2026-07-15T00:00:00Z","pr":"example-org/audit-repo#207","head_sha":"7777777777777777777777777777777777777777","verdict":"inconclusive","already_judged":false,"conditions":[{"name":"required_checks","result":"inconclusive","tier":["content-derived"],"detail":{}}]}
+JSONL
+audit_sources_before="$(
+  sha256sum "$audit_dir/config/ostrom/mandates.yaml" \
+    "$audit_dir/config/ostrom/gate.jsonl"
+)"
+audit_output="$(
+  cd "$audit_dir/repo"
+  CLAUDE_CONFIG_DIR="$audit_dir/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    PATH="$fixture/bin:$PATH" \
+    FAKE_GH_CALL_LOG="$audit_call_log" \
+    MANDATE_AUDIT_TIME="2026-08-01T00:00:00Z" \
+    bash "$PLUGIN_ROOT/scripts/audit.sh" 30
+)"
+audit_sources_after="$(
+  sha256sum "$audit_dir/config/ostrom/mandates.yaml" \
+    "$audit_dir/config/ostrom/gate.jsonl"
+)"
+[ "$audit_sources_before" = "$audit_sources_after" ]
+grep -Fxq "$(printf 'no verdict at any SHA\t1')" <<<"$audit_output"
+grep -Fxq "$(printf 'only null-SHA verdicts (unjoinable)\t1')" <<<"$audit_output"
+grep -Fxq "$(printf 'verdict exists, but none at the merged SHA\t1')" <<<"$audit_output"
+grep -Fxq "$(printf 'pass at the merged SHA\t2')" <<<"$audit_output"
+grep -Fxq "$(printf 'of passes, contains an excused condition\t1')" <<<"$audit_output"
+grep -Fxq "$(printf 'fail or inconclusive at the merged SHA\t2')" <<<"$audit_output"
+grep -Fxq "$(printf '  fail\t1')" <<<"$audit_output"
+grep -Fxq "$(printf '  inconclusive\t1')" <<<"$audit_output"
+grep -Fxq "$(printf 'total merged PRs in window\t7')" <<<"$audit_output"
+grep -Fxq "$(printf 'null head_sha records for merged PRs in window\t2')" \
+  <<<"$audit_output"
+grep -Fxq "$(printf 'merged PRs touched by a null head_sha record\t2')" \
+  <<<"$audit_output"
+grep -Fxq "$(printf 'review_threads\t1')" <<<"$audit_output"
+grep -Fxq "$(printf 'required_checks\t1')" <<<"$audit_output"
+if grep -q "$(printf '^bounce_selectors\t')" <<<"$audit_output"; then
+  echo "audit attributed a non-merged-SHA failure to the fail bucket" >&2
+  exit 1
+fi
+grep -Fq "$(printf 'example-org/audit-repo#205\tnone at merged SHA\teeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\t5555555555555555555555555555555555555555\t0')" \
+  <<<"$audit_output"
+grep -Fq "$(printf 'example-org/audit-repo#206\tonly null-SHA verdicts\tffffffffffffffffffffffffffffffffffffffff\t6666666666666666666666666666666666666666\t1')" \
+  <<<"$audit_output"
+if grep -q 'example-org/audit-repo#200' <<<"$audit_output"; then
+  echo "audit included a merged PR outside its lookback window" >&2
+  exit 1
+fi
+[ "$(wc -l <"$audit_call_log" | tr -d '[:space:]')" -eq 2 ]
+grep -Fxq -- $'-\tauth status --hostname github.com' "$audit_call_log"
+grep -Fxq $'example-org/audit-repo\tpr list --repo example-org/audit-repo --state merged --limit 200 --json number,mergedAt,headRefOid,mergeCommit' \
+  "$audit_call_log"
+if grep -Eq '[0-9]+%' <<<"$audit_output"; then
+  echo "audit collapsed separate evidence into a percentage" >&2
+  exit 1
+fi
 
 # The fixture shape is three issues plus the three PRs that close them.
 # Prefer the PRs, retain their recognizable titles, and name each collapsed
