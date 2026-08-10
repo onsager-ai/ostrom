@@ -75,11 +75,22 @@ Then read, in order:
   pointers, so resolve titles from GitHub rather than trusting cached text.
 - The SessionStart digest, if it is in context.
 
+Each row's `state` is `pending`, `approved`, or `deferred`. `needs_judgment`
+is derived from `kind` alone and is true for every tripwire and decision row
+regardless of `state`, so it marks the row's kind, not whether a judgment is
+still outstanding — never use it by itself to decide whether an item is the
+owner's call. `approved` means the principal has already ruled and minted a
+handoff token: treat it as cleared and work it like ordinary delegated work.
+`deferred` means the principal has explicitly parked it: leave it, and do not
+re-escalate it — re-raising a deferred item is noise, not diligence. Only a
+`pending` tripwire or reserved ref is genuinely the owner's call.
+
 If the `/ostrom:work` invocation includes an optional focus, use that direct
 invocation input as a natural-language filter over the queue, such as `one
 repository only` or `just tripwires`. Otherwise take items in this order:
-**tripwires and reserved refs → CI drift → open review threads on your own
-pull requests → delegated work**, oldest first.
+**pending tripwires and reserved refs → CI drift → open review threads on
+your own pull requests → delegated work**, oldest first. An approved
+tripwire is no longer a boundary; it belongs in the delegated tier.
 
 ## 4. Work each item
 
@@ -91,7 +102,9 @@ plainly and correct the record.
 **Respect the boundary.** A tripwire, reserved ref, or anything outside a
 project's `delegated` selectors is the owner's call. Produce an escalation
 dossier — question, options ruled out, recommended action, blast radius — and
-move on. Never widen a mandate to unblock yourself.
+move on. An approved row is not a boundary: the principal has already ruled
+and minted the handoff token, so work it like any other delegated item.
+Never widen a mandate to unblock yourself.
 
 **Delegate implementation.** Never implement inline. Spec the work first,
 then route by size: send a bounded, single-concern change to a subagent that
