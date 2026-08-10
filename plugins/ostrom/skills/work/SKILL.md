@@ -79,8 +79,14 @@ Each row's `state` is `pending`, `approved`, or `deferred`. `needs_judgment`
 is derived from `kind` alone and is true for every tripwire and decision row
 regardless of `state`, so it marks the row's kind, not whether a judgment is
 still outstanding — never use it by itself to decide whether an item is the
-owner's call. `approved` means the principal has already ruled and minted a
-handoff token: treat it as cleared and work it like ordinary delegated work.
+owner's call. `approved` clears the mandate boundary: the principal has already
+ruled and minted a handoff token, so the item needs no fresh escalation. It is
+no guarantee the work is still wanted — the queue keeps no approval timestamp,
+so an approval cannot be assumed to be the item's latest word. Before acting on
+an approved row, read the item itself, body and comments, for a later decision,
+hold, or superseding instruction (the same gap #63 tracks for classification);
+if one exists it wins over `state`, so record it and move on rather than
+implementing.
 `deferred` means the principal has explicitly parked it: leave it, and do not
 re-escalate it — re-raising a deferred item is noise, not diligence. Only a
 `pending` tripwire or reserved ref is genuinely the owner's call.
@@ -102,8 +108,13 @@ plainly and correct the record.
 **Respect the boundary.** A tripwire, reserved ref, or anything outside a
 project's `delegated` selectors is the owner's call. Produce an escalation
 dossier — question, options ruled out, recommended action, blast radius — and
-move on. An approved row is not a boundary: the principal has already ruled
-and minted the handoff token, so work it like any other delegated item.
+move on. An approved row clears that boundary: the principal has already ruled
+and minted the handoff token, so the item needs no fresh escalation. It carries
+no guarantee the work is still wanted, since the queue keeps no approval
+timestamp. Read the item itself, body and comments, for a later decision or
+hold before acting; if one exists it wins over `state`, so record it and move
+on rather than implementing. That is not license to re-escalate an approved row
+as though it were pending — read the item, then act.
 Never widen a mandate to unblock yourself.
 
 **Delegate implementation.** Never implement inline. Spec the work first,
