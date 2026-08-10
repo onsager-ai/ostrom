@@ -84,6 +84,112 @@ for trace_kind in pass-started item-worked pass-ended; do
   grep -q "trace.sh\" append $trace_kind" "$work_skill"
 done
 
+# The systemd wrapper fails closed when disarmed, backs off on its own outer
+# lease, preserves its role identity across processes, records measured cost,
+# and finalizes a signalled pass before releasing that lease.
+pass_fixture="$fixture/pass"
+pass_config="$pass_fixture/config"
+fake_claude="$pass_fixture/fake-claude"
+fake_marker="$pass_fixture/claude-started"
+mkdir -p "$pass_config/ostrom/roles"
+printf '{}\n' >"$pass_config/ostrom/roles/builder.settings.json"
+printf '{}\n' >"$pass_config/ostrom/roles/gatekeeper.settings.json"
+cat >"$fake_claude" <<'SH'
+#!/usr/bin/env bash
+case "${FAKE_CLAUDE_MODE:-complete}" in
+  complete)
+    printf '%s\n' '{"type":"assistant","message":"placeholder"}'
+    printf '%s\n' '{"type":"result","total_cost_usd":1.25}'
+    ;;
+  wait)
+    printf '%s\n' "$$" >"$FAKE_CLAUDE_MARKER"
+    trap 'exit 143' TERM
+    while :; do sleep 1; done
+    ;;
+  *)
+    exit 42
+    ;;
+esac
+SH
+chmod +x "$fake_claude"
+
+CLAUDE_CONFIG_DIR="$pass_config" CLAUDE_BIN="$fake_claude" \
+  FAKE_CLAUDE_MARKER="$fake_marker" \
+  bash "$PLUGIN_ROOT/scripts/pass.sh" builder >/dev/null 2>&1
+[ ! -e "$fake_marker" ]
+[ ! -e "$pass_config/ostrom/sprint.jsonl" ]
+
+: >"$pass_config/ostrom/loop-armed"
+# Stamp the fixture lease at real time, not a fixed epoch. A lease started at
+# epoch 400 is decades expired by the time pass.sh reads it, so pass.sh
+# correctly reclaims it and runs a full pass — which exercises reclamation,
+# not the timer overlap this case exists to cover.
+CLAUDE_CONFIG_DIR="$pass_config" \
+  MANDATE_LEASE_NAME=builder-pass.lease \
+  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire fixture-holder 3600 >/dev/null
+CLAUDE_CONFIG_DIR="$pass_config" CLAUDE_BIN="$fake_claude" \
+  FAKE_CLAUDE_MARKER="$fake_marker" \
+  bash "$PLUGIN_ROOT/scripts/pass.sh" builder >/dev/null 2>&1
+[ ! -e "$fake_marker" ]
+[ ! -e "$pass_config/ostrom/sprint.jsonl" ]
+CLAUDE_CONFIG_DIR="$pass_config" MANDATE_LEASE_NAME=builder-pass.lease \
+  bash "$PLUGIN_ROOT/scripts/lease.sh" release fixture-holder
+
+CLAUDE_CONFIG_DIR="$pass_config" CLAUDE_BIN="$fake_claude" \
+  FAKE_CLAUDE_MARKER="$fake_marker" \
+  bash "$PLUGIN_ROOT/scripts/pass.sh" builder >/dev/null
+[ ! -e "$pass_config/ostrom/builder-pass.lease" ]
+jq -s -e '
+  length == 2
+  and map(.kind) == ["pass-started", "pass-ended"]
+  and (.[0].fact.owner | test("^builder-[0-9a-f]{8}-wake1$"))
+  and .[1].fact.owner == .[0].fact.owner
+  and .[1].fact.outcome == "completed"
+  and .[1].fact.cost_usd == 1.25
+  and (.[1].fact.duration_seconds | type == "number" and . >= 0)
+' "$pass_config/ostrom/sprint.jsonl" >/dev/null
+
+CLAUDE_CONFIG_DIR="$pass_config" CLAUDE_BIN="$fake_claude" \
+  FAKE_CLAUDE_MARKER="$fake_marker" \
+  bash "$PLUGIN_ROOT/scripts/pass.sh" builder >/dev/null
+jq -s -e '
+  length == 4
+  and .[2].kind == "pass-started"
+  and .[3].kind == "pass-ended"
+  and (.[2].fact.owner | test("^builder-[0-9a-f]{8}-wake2$"))
+  and (.[0].fact.owner | split("-wake")[0])
+    == (.[2].fact.owner | split("-wake")[0])
+  and .[3].fact.owner == .[2].fact.owner
+' "$pass_config/ostrom/sprint.jsonl" >/dev/null
+
+FAKE_CLAUDE_MODE=wait FAKE_CLAUDE_MARKER="$fake_marker" \
+  CLAUDE_CONFIG_DIR="$pass_config" CLAUDE_BIN="$fake_claude" \
+  bash "$PLUGIN_ROOT/scripts/pass.sh" gatekeeper >/dev/null 2>&1 &
+signalled_pass_pid=$!
+for _attempt in $(seq 1 100); do
+  [ -s "$fake_marker" ] && break
+  sleep 0.05
+done
+[ -s "$fake_marker" ]
+signalled_child_pid="$(cat "$fake_marker")"
+kill -TERM "$signalled_pass_pid"
+set +e
+wait "$signalled_pass_pid"
+signalled_pass_status=$?
+set -e
+[ "$signalled_pass_status" -eq 143 ]
+[ ! -e "$pass_config/ostrom/gatekeeper-pass.lease" ]
+! kill -0 "$signalled_child_pid" 2>/dev/null
+jq -s -e '
+  (map(select(.fact.owner? | startswith("gatekeeper-")))) as $gatekeeper
+  | ($gatekeeper | length) == 2
+  and ($gatekeeper | map(.kind)) == ["pass-started", "pass-ended"]
+  and $gatekeeper[1].fact.owner == $gatekeeper[0].fact.owner
+  and $gatekeeper[1].fact.outcome == "timed-out"
+  and $gatekeeper[1].fact.cost_usd == null
+  and ($gatekeeper[1].fact.duration_seconds | type == "number" and . >= 0)
+' "$pass_config/ostrom/sprint.jsonl" >/dev/null
+
 # Two concurrent gatekeeper-pass starts cannot both proceed. The winner writes
 # the first trace record while the loser backs off without reading stale state.
 lease_concurrent="$fixture/lease-concurrent"
@@ -360,6 +466,7 @@ doctor_absent="$(
 )"
 grep -q '^WARN|trace-lease|trace absent; lease idle|' <<<"$doctor_absent"
 grep -q '^WARN|builder-pass|no builder pass ever recorded|' <<<"$doctor_absent"
+grep -q '^WARN|gatekeeper-pass|no gatekeeper pass ever recorded|' <<<"$doctor_absent"
 
 MANDATE_TRACE_TIME="2026-07-30T00:00:00Z" CLAUDE_CONFIG_DIR="$doctor_config" \
   bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
@@ -371,12 +478,17 @@ doctor_stale="$(
 )"
 grep -q '^WARN|trace-lease|trace stale, last 2026-07-30T00:00:00Z' \
   <<<"$doctor_stale"
-grep -q '^WARN|builder-pass|builder pass stale, last 2026-07-30T00:00:00Z (older than 24h cadence)|' \
+grep -q '^WARN|builder-pass|builder pass stale, last 2026-07-30T00:00:00Z (age 48h; older than 3h cadence)|' \
+  <<<"$doctor_stale"
+grep -q '^WARN|gatekeeper-pass|no gatekeeper pass ever recorded|' \
   <<<"$doctor_stale"
 
 MANDATE_TRACE_TIME="$MANDATE_SWEEP_TIME" CLAUDE_CONFIG_DIR="$doctor_config" \
   bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
     '{"owner":"builder-fixture-wake2","outcome":"complete"}' '{}' >/dev/null
+MANDATE_TRACE_TIME="$MANDATE_SWEEP_TIME" CLAUDE_CONFIG_DIR="$doctor_config" \
+  bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
+    '{"owner":"gatekeeper-fixture-wake1","outcome":"complete"}' '{}' >/dev/null
 doctor_current="$(
   cd "$fixture/repo"
   HOME="$fixture" CLAUDE_CONFIG_DIR="$doctor_config" \
@@ -384,7 +496,9 @@ doctor_current="$(
 )"
 grep -q '^OK|trace-lease|trace current, last 2026-08-01T00:00:00Z; lease idle|$' \
   <<<"$doctor_current"
-grep -q '^OK|builder-pass|builder pass current, last 2026-08-01T00:00:00Z (24h cadence)|$' \
+grep -q '^OK|builder-pass|builder pass current, last 2026-08-01T00:00:00Z (age 0m; 3h cadence)|$' \
+  <<<"$doctor_current"
+grep -q '^OK|gatekeeper-pass|gatekeeper pass current, last 2026-08-01T00:00:00Z (age 0m; 1h cadence)|$' \
   <<<"$doctor_current"
 
 CLAUDE_CONFIG_DIR="$doctor_config" MANDATE_LEASE_NOW_EPOCH=1785538800 \

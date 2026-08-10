@@ -8,8 +8,8 @@ argument-hint: "[optional queue focus, e.g. project name or item class]"
 
 # Mandate Work
 
-Work the portfolio queue forward for one pass. Wrap `/ostrom:work` in the
-session's recurring-wake mechanism to keep going.
+Work the portfolio queue forward for one pass. Recurrence belongs to the
+external pass timer; never create or renew an in-session recurring wake.
 
 Assume no context from any previous session. Everything needed is on disk or
 on GitHub. Relying on conversation memory makes the work unsustainable.

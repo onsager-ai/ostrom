@@ -102,7 +102,8 @@ function baseFixture(): Fixture {
   mkdirSync(join(configDir, "ostrom"), { recursive: true });
   writeFileSync(
     join(configDir, "ostrom", "sprint.jsonl"),
-    '{"ts":"2026-08-01T00:00:00Z","kind":"pass-ended","fact":{"owner":"builder-fixture-wake1","outcome":"complete"},"narration":{}}\n',
+    '{"ts":"2026-08-01T00:00:00Z","kind":"pass-ended","fact":{"owner":"builder-fixture-wake1","outcome":"completed"},"narration":{}}\n' +
+      '{"ts":"2026-08-01T00:00:00Z","kind":"pass-ended","fact":{"owner":"gatekeeper-fixture-wake1","outcome":"completed"},"narration":{}}\n',
   );
   mkdirSync(join(configDir, "ostrom", "publish"), { recursive: true });
   writeFileSync(
@@ -190,7 +191,15 @@ function commonExpected(
     {
       status: "OK",
       name: "builder-pass",
-      detail: "builder pass current, last 2026-08-01T00:00:00Z (24h cadence)",
+      detail:
+        "builder pass current, last 2026-08-01T00:00:00Z (age 0m; 3h cadence)",
+      remedy: "",
+    },
+    {
+      status: "OK",
+      name: "gatekeeper-pass",
+      detail:
+        "gatekeeper pass current, last 2026-08-01T00:00:00Z (age 0m; 1h cadence)",
       remedy: "",
     },
     {
@@ -407,7 +416,7 @@ describe("doctor golden output", () => {
       },
     });
 
-    expect(report.split("\n").filter(Boolean)).toHaveLength(10);
+    expect(report.split("\n").filter(Boolean)).toHaveLength(11);
     expect(existsSync(missing)).toBe(false);
   });
 
@@ -482,11 +491,11 @@ describe("doctor golden output", () => {
     );
 
     expect(run(fixture)).toContain(
-      "WARN|builder-pass|builder pass stale, last 2026-07-30T00:00:00Z (older than 24h cadence)|run /ostrom:work and confirm the recurring builder loop is active\n",
+      "WARN|builder-pass|builder pass stale, last 2026-07-30T00:00:00Z (age 48h; older than 3h cadence)|confirm ostrom-builder-pass.timer is active and loop-armed is present\n",
     );
   });
 
-  it("uses the resolved mandate cadence for builder pass age", () => {
+  it("uses the delivery timer cadence rather than mandate sweep cadence", () => {
     const fixture = baseFixture();
     writeFileSync(
       join(fixture.configDir, "ostrom", "mandates.yaml"),
@@ -498,7 +507,20 @@ describe("doctor golden output", () => {
     );
 
     expect(run(fixture)).toContain(
-      "WARN|builder-pass|builder pass stale, last 2026-07-31T11:00:00Z (older than 12h cadence)|run /ostrom:work and confirm the recurring builder loop is active\n",
+      "WARN|builder-pass|builder pass stale, last 2026-07-31T11:00:00Z (age 13h; older than 3h cadence)|confirm ostrom-builder-pass.timer is active and loop-armed is present\n",
+    );
+  });
+
+  it("reports gatekeeper pass age against the hourly timer cadence", () => {
+    const fixture = baseFixture();
+    writeFileSync(
+      join(fixture.configDir, "ostrom", "sprint.jsonl"),
+      '{"ts":"2026-08-01T00:00:00Z","kind":"pass-ended","fact":{"owner":"builder-fixture-wake1"},"narration":{}}\n' +
+        '{"ts":"2026-07-31T22:00:00Z","kind":"pass-ended","fact":{"owner":"gatekeeper-fixture-wake1"},"narration":{}}\n',
+    );
+
+    expect(run(fixture)).toContain(
+      "WARN|gatekeeper-pass|gatekeeper pass stale, last 2026-07-31T22:00:00Z (age 2h; older than 1h cadence)|confirm ostrom-gatekeeper-pass.timer is active and loop-armed is present\n",
     );
   });
 
