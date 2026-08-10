@@ -585,19 +585,6 @@ function resolveTouchConfig(pluginRoot2, configDir2, cwd) {
     autoCommit: fileConfig.auto_commit === void 0 ? "False" : pythonStyleString(fileConfig.auto_commit)
   };
 }
-function resolveMandateCadenceHours(pluginRoot2, configDir2, cwd) {
-  const paths = [
-    join5(pluginRoot2, "config", "mandate-defaults.yaml"),
-    join5(configDir2, "ostrom", "mandates.yaml"),
-    join5(cwd, ".ostrom", "mandates.yaml")
-  ];
-  const config = paths.reduce(
-    (resolved, path) => merge(resolved, load(path)),
-    {}
-  );
-  const cadence = config.cadence_hours;
-  return typeof cadence === "number" && Number.isSafeInteger(cadence) && cadence > 0 ? cadence : void 0;
-}
 function expandTilde(path, home2) {
   if (path === "~") return home2;
   if (path.startsWith("~/")) return join5(home2, path.slice(2));
@@ -729,6 +716,14 @@ function checkProviderReachable(context) {
 }
 
 // src/checks/builder-pass.ts
+var CADENCE_HOURS = {
+  builder: 3,
+  gatekeeper: 1
+};
+var ROLE_SKILL = {
+  builder: "/ostrom:work",
+  gatekeeper: "/ostrom:gatekeep"
+};
 function nowEpoch2(context) {
   const explicit = context.env.MANDATE_NOW_EPOCH;
   if (explicit && /^\d+$/.test(explicit)) return Number(explicit);
@@ -742,7 +737,14 @@ function nowEpoch2(context) {
 function object(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
-function lastBuilderPassEnded(source) {
+function formatAge(ageSeconds) {
+  const ageMinutes = Math.max(0, Math.floor(ageSeconds / 60));
+  if (ageMinutes < 60) return `${ageMinutes}m`;
+  const hours = Math.floor(ageMinutes / 60);
+  const minutes = ageMinutes % 60;
+  return minutes === 0 ? `${hours}h` : `${hours}h${minutes}m`;
+}
+function lastRolePassEnded(source, role) {
   let contentEnd = source.length;
   while (contentEnd > 0) {
     while (contentEnd > 0 && (source[contentEnd - 1] === "\n" || source[contentEnd - 1] === "\r")) {
@@ -762,48 +764,37 @@ function lastBuilderPassEnded(source) {
       continue;
     }
     const owner = record.fact.owner;
-    if (typeof owner === "string" && owner.startsWith("builder-")) return record;
+    if (typeof owner === "string" && owner.startsWith(`${role}-`)) return record;
   }
   return void 0;
 }
-function checkBuilderPass(context) {
-  const cadenceHours = resolveMandateCadenceHours(
-    context.pluginRoot,
-    context.configDir,
-    context.cwd
-  );
-  if (cadenceHours === void 0) {
-    return {
-      status: "WARN",
-      name: "builder-pass",
-      detail: "builder cadence is invalid",
-      remedy: "set cadence_hours to a positive integer in mandates.yaml"
-    };
-  }
+function checkRolePass(context, role) {
+  const cadenceHours = CADENCE_HOURS[role];
+  const checkName = `${role}-pass`;
   const trace = context.readTrace();
   if (!trace.exists) {
     return {
       status: "WARN",
-      name: "builder-pass",
-      detail: "no builder pass ever recorded",
-      remedy: "run /ostrom:work and confirm it records pass-ended"
+      name: checkName,
+      detail: `no ${role} pass ever recorded`,
+      remedy: `run ${ROLE_SKILL[role]} and confirm it records pass-ended`
     };
   }
   if (!("content" in trace)) {
     return {
       status: "WARN",
-      name: "builder-pass",
-      detail: "builder pass history is unreadable",
+      name: checkName,
+      detail: `${role} pass history is unreadable`,
       remedy: "inspect sprint.jsonl and fix its permissions"
     };
   }
-  const record = lastBuilderPassEnded(trace.content);
+  const record = lastRolePassEnded(trace.content, role);
   if (!record) {
     return {
       status: "WARN",
-      name: "builder-pass",
-      detail: "no builder pass ever recorded",
-      remedy: "run /ostrom:work and confirm it records pass-ended"
+      name: checkName,
+      detail: `no ${role} pass ever recorded`,
+      remedy: `run ${ROLE_SKILL[role]} and confirm it records pass-ended`
     };
   }
   const timestamp = record.ts;
@@ -811,26 +802,33 @@ function checkBuilderPass(context) {
   if (!Number.isFinite(timestampMs)) {
     return {
       status: "WARN",
-      name: "builder-pass",
-      detail: "last builder pass has an invalid timestamp",
+      name: checkName,
+      detail: `last ${role} pass has an invalid timestamp`,
       remedy: "inspect sprint.jsonl; records must be written by trace.sh append"
     };
   }
   const ageSeconds = nowEpoch2(context) - Math.floor(timestampMs / 1e3);
+  const age = formatAge(ageSeconds);
   if (ageSeconds > cadenceHours * 60 * 60) {
     return {
       status: "WARN",
-      name: "builder-pass",
-      detail: `builder pass stale, last ${timestamp} (older than ${cadenceHours}h cadence)`,
-      remedy: "run /ostrom:work and confirm the recurring builder loop is active"
+      name: checkName,
+      detail: `${role} pass stale, last ${timestamp} (age ${age}; older than ${cadenceHours}h cadence)`,
+      remedy: `confirm ostrom-${role}-pass.timer is active and loop-armed is present`
     };
   }
   return {
     status: "OK",
-    name: "builder-pass",
-    detail: `builder pass current, last ${timestamp} (${cadenceHours}h cadence)`,
+    name: checkName,
+    detail: `${role} pass current, last ${timestamp} (age ${age}; ${cadenceHours}h cadence)`,
     remedy: ""
   };
+}
+function checkBuilderPass(context) {
+  return checkRolePass(context, "builder");
+}
+function checkGatekeeperPass(context) {
+  return checkRolePass(context, "gatekeeper");
 }
 
 // src/checks/publish.ts
@@ -954,6 +952,7 @@ function runDoctor(options) {
     checkProviderReachable(context),
     checkTraceLease(context),
     checkBuilderPass(context),
+    checkGatekeeperPass(context),
     checkPublish(context),
     checkEnvironment(context),
     checkConfigParser()

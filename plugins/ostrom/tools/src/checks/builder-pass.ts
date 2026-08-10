@@ -1,6 +1,19 @@
 import type { DoctorContext } from "../lib/context.js";
-import { resolveMandateCadenceHours } from "../lib/config.js";
 import type { CheckResult } from "../lib/result.js";
+
+type DeliveryRole = "builder" | "gatekeeper";
+
+// Builder scheduling has three-hour overnight gaps; gatekeeping is hourly.
+// These are delivery-loop cadences, not mandate sweep cadence_hours.
+const CADENCE_HOURS: Record<DeliveryRole, number> = {
+  builder: 3,
+  gatekeeper: 1,
+};
+
+const ROLE_SKILL: Record<DeliveryRole, string> = {
+  builder: "/ostrom:work",
+  gatekeeper: "/ostrom:gatekeep",
+};
 
 function nowEpoch(context: DoctorContext): number {
   const explicit = context.env.MANDATE_NOW_EPOCH;
@@ -18,7 +31,18 @@ function object(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-function lastBuilderPassEnded(source: string): Record<string, unknown> | undefined {
+function formatAge(ageSeconds: number): string {
+  const ageMinutes = Math.max(0, Math.floor(ageSeconds / 60));
+  if (ageMinutes < 60) return `${ageMinutes}m`;
+  const hours = Math.floor(ageMinutes / 60);
+  const minutes = ageMinutes % 60;
+  return minutes === 0 ? `${hours}h` : `${hours}h${minutes}m`;
+}
+
+function lastRolePassEnded(
+  source: string,
+  role: DeliveryRole,
+): Record<string, unknown> | undefined {
   let contentEnd = source.length;
   while (contentEnd > 0) {
     while (
@@ -43,51 +67,42 @@ function lastBuilderPassEnded(source: string): Record<string, unknown> | undefin
       continue;
     }
     const owner = record.fact.owner;
-    if (typeof owner === "string" && owner.startsWith("builder-")) return record;
+    if (typeof owner === "string" && owner.startsWith(`${role}-`)) return record;
   }
   return undefined;
 }
 
-export function checkBuilderPass(context: DoctorContext): CheckResult {
-  const cadenceHours = resolveMandateCadenceHours(
-    context.pluginRoot,
-    context.configDir,
-    context.cwd,
-  );
-  if (cadenceHours === undefined) {
-    return {
-      status: "WARN",
-      name: "builder-pass",
-      detail: "builder cadence is invalid",
-      remedy: "set cadence_hours to a positive integer in mandates.yaml",
-    };
-  }
-
+function checkRolePass(
+  context: DoctorContext,
+  role: DeliveryRole,
+): CheckResult {
+  const cadenceHours = CADENCE_HOURS[role];
+  const checkName = `${role}-pass`;
   const trace = context.readTrace();
   if (!trace.exists) {
     return {
       status: "WARN",
-      name: "builder-pass",
-      detail: "no builder pass ever recorded",
-      remedy: "run /ostrom:work and confirm it records pass-ended",
+      name: checkName,
+      detail: `no ${role} pass ever recorded`,
+      remedy: `run ${ROLE_SKILL[role]} and confirm it records pass-ended`,
     };
   }
   if (!("content" in trace)) {
     return {
       status: "WARN",
-      name: "builder-pass",
-      detail: "builder pass history is unreadable",
+      name: checkName,
+      detail: `${role} pass history is unreadable`,
       remedy: "inspect sprint.jsonl and fix its permissions",
     };
   }
 
-  const record = lastBuilderPassEnded(trace.content);
+  const record = lastRolePassEnded(trace.content, role);
   if (!record) {
     return {
       status: "WARN",
-      name: "builder-pass",
-      detail: "no builder pass ever recorded",
-      remedy: "run /ostrom:work and confirm it records pass-ended",
+      name: checkName,
+      detail: `no ${role} pass ever recorded`,
+      remedy: `run ${ROLE_SKILL[role]} and confirm it records pass-ended`,
     };
   }
 
@@ -96,25 +111,34 @@ export function checkBuilderPass(context: DoctorContext): CheckResult {
   if (!Number.isFinite(timestampMs)) {
     return {
       status: "WARN",
-      name: "builder-pass",
-      detail: "last builder pass has an invalid timestamp",
+      name: checkName,
+      detail: `last ${role} pass has an invalid timestamp`,
       remedy: "inspect sprint.jsonl; records must be written by trace.sh append",
     };
   }
 
   const ageSeconds = nowEpoch(context) - Math.floor(timestampMs / 1000);
+  const age = formatAge(ageSeconds);
   if (ageSeconds > cadenceHours * 60 * 60) {
     return {
       status: "WARN",
-      name: "builder-pass",
-      detail: `builder pass stale, last ${timestamp} (older than ${cadenceHours}h cadence)`,
-      remedy: "run /ostrom:work and confirm the recurring builder loop is active",
+      name: checkName,
+      detail: `${role} pass stale, last ${timestamp} (age ${age}; older than ${cadenceHours}h cadence)`,
+      remedy: `confirm ostrom-${role}-pass.timer is active and loop-armed is present`,
     };
   }
   return {
     status: "OK",
-    name: "builder-pass",
-    detail: `builder pass current, last ${timestamp} (${cadenceHours}h cadence)`,
+    name: checkName,
+    detail: `${role} pass current, last ${timestamp} (age ${age}; ${cadenceHours}h cadence)`,
     remedy: "",
   };
+}
+
+export function checkBuilderPass(context: DoctorContext): CheckResult {
+  return checkRolePass(context, "builder");
+}
+
+export function checkGatekeeperPass(context: DoctorContext): CheckResult {
+  return checkRolePass(context, "gatekeeper");
 }

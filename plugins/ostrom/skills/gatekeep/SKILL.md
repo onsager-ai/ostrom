@@ -157,16 +157,8 @@ the verdict, and the action taken. Actions include merged, verdict commented,
 duplicate comment suppressed, escalated to principal, and repeat escalation
 suppressed. If no open pull requests exist, report that once.
 
-Then wait for the next poll. Recommend a period of 30–60 minutes and let the
-principal choose; do not poll faster than the builder's sprint pass. The loop
-uses Claude Code's existing recurring-wake mechanism, for example:
-
-```text
-/loop 30m /ostrom:gatekeep
-```
-
-Do not build or invoke a separate scheduler and do not switch to event-driven
-delivery.
+Then stop. The external pass timer owns the next poll; never create, renew, or
+wait on an in-session recurring wake. Do not switch to event-driven delivery.
 
 ## 8. End the trace and release the lease
 
