@@ -120,9 +120,13 @@ CLAUDE_CONFIG_DIR="$pass_config" CLAUDE_BIN="$fake_claude" \
 [ ! -e "$pass_config/ostrom/sprint.jsonl" ]
 
 : >"$pass_config/ostrom/loop-armed"
-CLAUDE_CONFIG_DIR="$pass_config" MANDATE_LEASE_NOW_EPOCH=400 \
+# Stamp the fixture lease at real time, not a fixed epoch. A lease started at
+# epoch 400 is decades expired by the time pass.sh reads it, so pass.sh
+# correctly reclaims it and runs a full pass — which exercises reclamation,
+# not the timer overlap this case exists to cover.
+CLAUDE_CONFIG_DIR="$pass_config" \
   MANDATE_LEASE_NAME=builder-pass.lease \
-  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire fixture-holder 60 >/dev/null
+  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire fixture-holder 3600 >/dev/null
 CLAUDE_CONFIG_DIR="$pass_config" CLAUDE_BIN="$fake_claude" \
   FAKE_CLAUDE_MARKER="$fake_marker" \
   bash "$PLUGIN_ROOT/scripts/pass.sh" builder >/dev/null 2>&1
