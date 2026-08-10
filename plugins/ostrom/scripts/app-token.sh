@@ -1,35 +1,42 @@
 #!/usr/bin/env bash
-# Mint a short-lived GitHub App installation token for the gatekeeper.
+# Mint a short-lived GitHub App installation token for a delivery role.
 
 # A caller may have tracing enabled. Disable it before credentials enter shell
 # variables or command input, and never enable it again in this process.
 set +x
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=mandate-lib.sh
-source "$SCRIPT_DIR/mandate-lib.sh"
-
 fail() {
   printf 'app-token: %s\n' "$1" >&2
   exit 2
 }
 
-if [ "$#" -ne 1 ]; then
-  fail "usage: app-token.sh <owner>/<repo>"
+if [ "$#" -ne 2 ]; then
+  fail "usage: app-token.sh <role> <owner>/<repo>"
 fi
-repository="$1"
+role="$1"
+case "$role" in
+  ''|[!a-z]*|*[!a-z0-9_-]*)
+    fail "invalid role: must match [a-z][a-z0-9_-]*"
+    ;;
+esac
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=mandate-lib.sh
+source "$SCRIPT_DIR/mandate-lib.sh"
+
+repository="$2"
 case "$repository" in
   */*) ;;
-  *) fail "usage: app-token.sh <owner>/<repo>" ;;
+  *) fail "usage: app-token.sh <role> <owner>/<repo>" ;;
 esac
 owner="${repository%%/*}"
 repo="${repository#*/}"
 case "$owner" in
-  ''|*[!A-Za-z0-9_.-]*) fail "usage: app-token.sh <owner>/<repo>" ;;
+  ''|*[!A-Za-z0-9_.-]*) fail "usage: app-token.sh <role> <owner>/<repo>" ;;
 esac
 case "$repo" in
-  ''|*/*|*[!A-Za-z0-9_.-]*) fail "usage: app-token.sh <owner>/<repo>" ;;
+  ''|*/*|*[!A-Za-z0-9_.-]*) fail "usage: app-token.sh <role> <owner>/<repo>" ;;
 esac
 
 for required_command in jq openssl curl; do
@@ -37,11 +44,11 @@ for required_command in jq openssl curl; do
     fail "required command is unavailable: $required_command"
 done
 
-credentials="$(mandate_load_gatekeeper_credentials)" || exit $?
+credentials="$(mandate_load_role_credentials "$role")" || exit $?
 app_id="$(printf '%s' "$credentials" | jq -er '.app_id')" || \
-  fail "could not read gatekeeper app_id"
+  fail "could not read $role app_id"
 private_key_path="$(printf '%s' "$credentials" | jq -er '.private_key_path')" || \
-  fail "could not read gatekeeper private_key_path"
+  fail "could not read $role private_key_path"
 unset credentials
 
 case "$private_key_path" in
@@ -49,7 +56,7 @@ case "$private_key_path" in
   '~/'*) private_key_path="$HOME/${private_key_path#"~/"}" ;;
 esac
 if [ ! -f "$private_key_path" ] || [ ! -r "$private_key_path" ]; then
-  fail "gatekeeper private key file is missing or unreadable"
+  fail "$role private key file is missing or unreadable"
 fi
 
 base64url() {
