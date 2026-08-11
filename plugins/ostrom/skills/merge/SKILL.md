@@ -23,30 +23,31 @@ not use an ambient GitHub credential to discover it.
 
 ## 2. Authenticate as the gatekeeper App
 
-Before any `gh` call, discard ambient GitHub credentials and mint a fresh
-installation token for the resolved repository:
+Never invoke `gh` directly, and never try to mint a token into a variable of
+your own. A session cannot run a command containing `$(...)`: the Bash tool
+cannot statically analyze it, and a non-interactive session has no prompt to
+fall back on, so the command is simply denied. Every `gh` call in this protocol
+goes through the wrapper, which performs the mint inside its own process:
 
 ```sh
-set +x
-unset GH_TOKEN GITHUB_TOKEN
-if ! gatekeeper_token="$(
-  bash "${CLAUDE_PLUGIN_ROOT}/scripts/app-token.sh" gatekeeper "$repository"
-)" ||
-  [ -z "$gatekeeper_token" ]; then
-  unset gatekeeper_token
-  echo "merge: GitHub App authentication failed; stopping" >&2
-  exit 1
-fi
-export GH_TOKEN="$gatekeeper_token"
-unset gatekeeper_token
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/gh-as.sh" gatekeeper "$repository" <gh arguments>
 ```
 
-Keep that `GH_TOKEN` only for `gh` calls against this repository in this run;
-do not replace it with another credential, and keep shell tracing disabled
-while it is present. Confirm the locally resolved repository read-only with:
+The wrapper discards inherited `GH_TOKEN` and `GITHUB_TOKEN`, mints a fresh
+installation token for exactly the repository named in its second argument, and
+exports that token only into the `gh` process it execs. The token's lifetime is
+that one wrapper process: it is never printed, never enters this session's
+environment, and there is nothing to unset afterwards. Never `export GH_TOKEN`
+yourself and never set it to a value you obtained some other way.
+
+If the wrapper cannot mint, it prints a `gh-as: ` diagnostic on stderr and
+exits non-zero without running `gh` at all.
+
+Confirm the locally resolved repository read-only with:
 
 ```sh
-gh repo view "$repository" --json nameWithOwner --jq .nameWithOwner
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/gh-as.sh" gatekeeper "$repository" \
+  repo view "$repository" --json nameWithOwner --jq .nameWithOwner
 ```
 
 **A gatekeeper session that cannot mint an App token must stop, not continue as the principal.**
@@ -114,10 +115,12 @@ caller's, is always about delivery, and never converts `inconclusive` into
 
 ## 4. Apply exactly the verdict
 
-- **Pass (exit 0)** — perform these three steps in order, using the
-  installation token minted for this repository:
-  1. Run `gh pr review <PR number> --repo <owner/repo> --approve`.
-  2. Then run `gh pr merge <PR number> --repo <owner/repo>`.
+- **Pass (exit 0)** — perform these three steps in order, routing both `gh`
+  calls through `gh-as.sh` so each acts as the App:
+  1. Run `bash "${CLAUDE_PLUGIN_ROOT}/scripts/gh-as.sh" gatekeeper <owner/repo>
+     pr review <PR number> --repo <owner/repo> --approve`.
+  2. Then run `bash "${CLAUDE_PLUGIN_ROOT}/scripts/gh-as.sh" gatekeeper
+     <owner/repo> pr merge <PR number> --repo <owner/repo>`.
   3. Then append a `decision-taken` trace record. Merging is the
      gatekeeper's own judgment on this artifact, and it is only safe to make
      without the principal because it is cheap to undo — the reversal
@@ -145,7 +148,9 @@ caller's, is always about delivery, and never converts `inconclusive` into
   The exception reason already appears in the verdict output and the
   `gate-verdict-consumed` trace fact.
 - **Fail (exit 1)** — if `already_judged=false`, leave the complete gate output
-  as one PR comment using `gh pr comment --body-file`; use a temporary file so
+  as one PR comment, again through `gh-as.sh`: `bash
+  "${CLAUDE_PLUGIN_ROOT}/scripts/gh-as.sh" gatekeeper <owner/repo> pr comment
+  <PR number> --repo <owner/repo> --body-file <path>`. Use a temporary file so
   PR-controlled text is never interpolated into a shell command. If
   `already_judged=true`, do not post again. Stop in both cases.
 - **Inconclusive (exit 2)** — address the principal and emit exactly this

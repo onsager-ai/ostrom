@@ -1284,6 +1284,198 @@ grep -Eq \
   "$app_token_fixture/stale-id.stderr" \
   "$app_token_curl_log"
 
+# gh-as.sh moves the mint inside a process boundary so a session issues one
+# statically-analyzable command instead of a command substitution it is not
+# permitted to run (#93). The wrapper resolves app-token.sh as a sibling, so
+# the fixture is a scripts/ directory holding the real wrapper beside a stub
+# mint; gh is stubbed on PATH the way every other external binary is here.
+gh_as_fixture="$fixture/gh-as"
+mkdir -p "$gh_as_fixture/scripts" "$gh_as_fixture/bin"
+cp "$PLUGIN_ROOT/scripts/gh-as.sh" "$gh_as_fixture/scripts/gh-as.sh"
+cat >"$gh_as_fixture/scripts/app-token.sh" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+
+if [ -n "${FAKE_APP_TOKEN_CALL_LOG:-}" ]; then
+  printf '%s\n' "$*" >>"$FAKE_APP_TOKEN_CALL_LOG"
+fi
+case "${FAKE_APP_TOKEN_MODE:-success}" in
+  success) printf 'stub-installation-token\n' ;;
+  empty) : ;;
+  failure)
+    echo 'app-token: GitHub App is not installed on repository stub' >&2
+    exit 2
+    ;;
+  *) exit 99 ;;
+esac
+EOF
+cat >"$gh_as_fixture/bin/gh" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+
+if [ -n "${FAKE_GH_AS_CALL_LOG:-}" ]; then
+  printf 'argv\t%s\n' "$*" >>"$FAKE_GH_AS_CALL_LOG"
+  printf 'GH_TOKEN\t%s\n' "${GH_TOKEN-<unset>}" >>"$FAKE_GH_AS_CALL_LOG"
+  printf 'GITHUB_TOKEN\t%s\n' "${GITHUB_TOKEN-<unset>}" >>"$FAKE_GH_AS_CALL_LOG"
+fi
+exit "${FAKE_GH_EXIT:-0}"
+EOF
+chmod +x "$gh_as_fixture/scripts/app-token.sh" "$gh_as_fixture/bin/gh"
+gh_as_token_log="$gh_as_fixture/app-token.log"
+gh_as_gh_log="$gh_as_fixture/gh.log"
+gh_as_gh_exit=0
+
+run_gh_as() {
+  gh_as_name="$1"
+  gh_as_mode="$2"
+  shift 2
+  gh_as_stdout="$gh_as_fixture/$gh_as_name.stdout"
+  gh_as_stderr="$gh_as_fixture/$gh_as_name.stderr"
+  rm -f "$gh_as_token_log" "$gh_as_gh_log"
+  set +e
+  PATH="$gh_as_fixture/bin:$PATH" \
+    GH_TOKEN="ambient-principal-value" \
+    GITHUB_TOKEN="ambient-principal-value" \
+    FAKE_APP_TOKEN_MODE="$gh_as_mode" \
+    FAKE_APP_TOKEN_CALL_LOG="$gh_as_token_log" \
+    FAKE_GH_AS_CALL_LOG="$gh_as_gh_log" \
+    FAKE_GH_EXIT="$gh_as_gh_exit" \
+    bash "$gh_as_fixture/scripts/gh-as.sh" "$@" \
+      >"$gh_as_stdout" 2>"$gh_as_stderr"
+  gh_as_status=$?
+  set -e
+  ! grep -q 'ambient-principal-value' "$gh_as_stdout" "$gh_as_stderr"
+}
+
+# A usage or validation error is refused before the mint, so neither a token
+# nor a gh call is produced by a malformed invocation.
+gh_as_usage='gh-as: usage: gh-as.sh <role> <owner>/<repo> <gh args...>'
+gh_as_case=0
+for gh_as_bad_usage in \
+  '' \
+  'gatekeeper' \
+  'gatekeeper example-org/example-repo'; do
+  gh_as_case=$((gh_as_case + 1))
+  # shellcheck disable=SC2086
+  run_gh_as "usage-$gh_as_case" success $gh_as_bad_usage
+  [ "$gh_as_status" -eq 2 ]
+  grep -Fxq "$gh_as_usage" "$gh_as_fixture/usage-$gh_as_case.stderr"
+  [ ! -s "$gh_as_fixture/usage-$gh_as_case.stdout" ]
+  [ ! -e "$gh_as_token_log" ]
+  [ ! -e "$gh_as_gh_log" ]
+done
+
+gh_as_case=0
+for gh_as_bad_role in '' 'gate/keeper' 'gate keeper' '1gatekeeper' 'Gatekeeper'; do
+  gh_as_case=$((gh_as_case + 1))
+  run_gh_as "role-$gh_as_case" success \
+    "$gh_as_bad_role" example-org/example-repo pr list
+  [ "$gh_as_status" -eq 2 ]
+  grep -Fxq 'gh-as: invalid role: must match [a-z][a-z0-9_-]*' \
+    "$gh_as_fixture/role-$gh_as_case.stderr"
+  [ ! -e "$gh_as_token_log" ]
+  [ ! -e "$gh_as_gh_log" ]
+done
+
+gh_as_case=0
+for gh_as_bad_repo in \
+  'example-repo' \
+  'example-org/' \
+  '/example-repo' \
+  'example-org/ex/tra' \
+  'example-org/bad;repo'; do
+  gh_as_case=$((gh_as_case + 1))
+  run_gh_as "repo-$gh_as_case" success \
+    gatekeeper "$gh_as_bad_repo" pr list
+  [ "$gh_as_status" -eq 2 ]
+  grep -Fxq "$gh_as_usage" "$gh_as_fixture/repo-$gh_as_case.stderr"
+  [ ! -e "$gh_as_token_log" ]
+  [ ! -e "$gh_as_gh_log" ]
+done
+
+# A failed or empty mint stops the wrapper. gh is never reached, so there is
+# no path on which an ambient principal credential reaches GitHub -- which is
+# the whole point of routing the call through here.
+for gh_as_mint_failure in failure empty; do
+  run_gh_as "mint-$gh_as_mint_failure" "$gh_as_mint_failure" \
+    gatekeeper example-org/example-repo pr list --repo example-org/example-repo
+  [ "$gh_as_status" -ne 0 ]
+  [ ! -s "$gh_as_fixture/mint-$gh_as_mint_failure.stdout" ]
+  grep -Fxq \
+    'gh-as: GitHub App authentication failed for gatekeeper on example-org/example-repo; refusing to run gh with ambient credentials' \
+    "$gh_as_fixture/mint-$gh_as_mint_failure.stderr"
+  grep -Fxq 'gatekeeper example-org/example-repo' "$gh_as_token_log"
+  [ ! -e "$gh_as_gh_log" ]
+done
+
+# The success path mints for exactly the named repository, hands gh the
+# remaining arguments unchanged, and gives it the minted GH_TOKEN with the
+# inherited GITHUB_TOKEN removed. The token never appears on stdout or stderr.
+run_gh_as success success \
+  gatekeeper example-org/example-repo \
+  pr view 8 --repo example-org/example-repo --json number
+[ "$gh_as_status" -eq 0 ]
+[ ! -s "$gh_as_fixture/success.stdout" ]
+[ ! -s "$gh_as_fixture/success.stderr" ]
+grep -Fxq 'gatekeeper example-org/example-repo' "$gh_as_token_log"
+[ "$(wc -l <"$gh_as_token_log" | tr -d '[:space:]')" -eq 1 ]
+grep -Fxq \
+  "$(printf 'argv\tpr view 8 --repo example-org/example-repo --json number')" \
+  "$gh_as_gh_log"
+grep -Fxq "$(printf 'GH_TOKEN\tstub-installation-token')" "$gh_as_gh_log"
+grep -Fxq "$(printf 'GITHUB_TOKEN\t<unset>')" "$gh_as_gh_log"
+! grep -q 'stub-installation-token' \
+  "$gh_as_fixture/success.stdout" "$gh_as_fixture/success.stderr"
+
+# gh's own exit status is the wrapper's; exec leaves nothing in between.
+gh_as_gh_exit=3
+run_gh_as passthrough success \
+  gatekeeper example-org/example-repo pr merge 8 --repo example-org/example-repo
+[ "$gh_as_status" -eq 3 ]
+gh_as_gh_exit=0
+
+# #93 regression guard. A session cannot execute a command containing $(...):
+# the Bash tool refuses what it cannot statically analyze, and a
+# non-interactive session has no prompt to fall back on, so the command is
+# denied outright rather than run. That is exactly how eight consecutive
+# gatekeeper passes died on the app-token.sh mint. Only fenced `sh` blocks are
+# checked -- those are the commands a session is told to run; prose and
+# `text`/`json` blocks are illustrative.
+#
+# The one grandfathered form is the argument-position `jq -cn` that the trace
+# protocol uses to build its fact and narration JSON. Those predate #93 and
+# are not what this guard is about; do not add another exemption to make a new
+# instruction pass -- move the substitution into a script instead, the way
+# gh-as.sh does.
+skill_substitutions="$(
+  for skill_file in "$PLUGIN_ROOT"/skills/*/SKILL.md; do
+    awk -v file="$skill_file" '
+      /^[[:space:]]*```sh$/ { in_sh = 1; next }
+      /^[[:space:]]*```/ { in_sh = 0; next }
+      in_sh && index($0, "$(") {
+        if ($0 ~ /"\$\(jq -cn/) { next }
+        printf "%s:%d:%s\n", file, NR, $0
+      }
+    ' "$skill_file"
+  done
+)"
+if [ -n "$skill_substitutions" ]; then
+  printf '%s\n' "$skill_substitutions" >&2
+  echo "mandate tests: a SKILL.md instructs a session to run a command containing \$(...); the Bash tool cannot statically analyze it and a non-interactive session has no prompt to fall back on, so the command is denied and the loop stops (#93)" >&2
+  exit 1
+fi
+
+# Sessions mint through the wrapper, never by calling app-token.sh themselves.
+if grep -n 'app-token\.sh' "$PLUGIN_ROOT"/skills/*/SKILL.md; then
+  echo "mandate tests: a SKILL.md invokes app-token.sh directly; a session cannot capture its output, so it must call scripts/gh-as.sh instead (#93)" >&2
+  exit 1
+fi
+grep -q 'scripts/gh-as.sh" gatekeeper' "$gatekeep_skill"
+grep -q 'scripts/gh-as.sh" gatekeeper' "$merge_skill"
+# The token's lifetime is the wrapper process, so no instruction may tell a
+# session to export or carry one of its own.
+! grep -q '^export GH_TOKEN' "$gatekeep_skill" "$merge_skill"
+
 cat >"$fixture/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail

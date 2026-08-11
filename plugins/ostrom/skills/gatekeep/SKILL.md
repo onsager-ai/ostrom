@@ -77,29 +77,36 @@ builder work.
 
 ## 4. Authenticate per repository as the gatekeeper App
 
-At the start of every iteration, before any `gh` call, discard ambient GitHub
-credentials. Then, immediately before calling `gh` for each roster repository,
-mint a fresh token for that repository:
+Never invoke `gh` directly, and never try to mint a token into a variable of
+your own. A session cannot run a command containing `$(...)`: the Bash tool
+cannot statically analyze it, and a non-interactive session has no prompt to
+fall back on, so the command is simply denied. Run every `gh` call for a roster
+repository through the wrapper instead, which performs the mint inside its own
+process:
 
 ```sh
-set +x
-unset GH_TOKEN GITHUB_TOKEN
-if ! gatekeeper_token="$(
-  bash "${CLAUDE_PLUGIN_ROOT}/scripts/app-token.sh" gatekeeper "$repository"
-)" ||
-  [ -z "$gatekeeper_token" ]; then
-  unset gatekeeper_token
-  echo "gatekeep: GitHub App authentication failed; stopping" >&2
-  exit 1
-fi
-export GH_TOKEN="$gatekeeper_token"
-unset gatekeeper_token
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/gh-as.sh" gatekeeper "$repository" <gh arguments>
 ```
 
-Keep that `GH_TOKEN` only for `gh` calls against that repository. Unset it
-before moving to another repository; do not replace it with another credential,
-and keep shell tracing disabled while it is present. `/ostrom:merge` mints again for
-each candidate rather than reusing the enumeration token.
+For example, to read a roster repository:
+
+```sh
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/gh-as.sh" gatekeeper "$repository" \
+  repo view "$repository" --json nameWithOwner --jq .nameWithOwner
+```
+
+The wrapper discards inherited `GH_TOKEN` and `GITHUB_TOKEN`, mints a fresh
+installation token for exactly the repository named in its second argument, and
+exports that token only into the `gh` process it execs. The token's lifetime is
+that one wrapper process: it is never printed, never enters this session's
+environment, and there is nothing to unset afterwards. Each call mints again,
+so a token can never be carried from one repository into a call against
+another. Never `export GH_TOKEN` yourself and never set it to a value you
+obtained some other way. `/ostrom:merge` uses the same wrapper for each
+candidate rather than reusing anything from enumeration.
+
+If the wrapper cannot mint, it prints a `gh-as: ` diagnostic on stderr and
+exits non-zero without running `gh` at all.
 
 **A gatekeeper session that cannot mint an App token must stop, not continue as the principal.**
 
@@ -108,9 +115,10 @@ failure the App exists to remove.
 
 ## 5. Enumerate every open pull request
 
-Poll GitHub for all open pull requests in every roster repository, using only
-the token minted for that repository, and unset `GH_TOKEN` when its pagination
-is complete. Paginate until there are no more results. Do not filter candidates through mandate
+Poll GitHub for all open pull requests in every roster repository, issuing
+every page through `gh-as.sh` with that repository as its second argument so
+each request carries a token minted for exactly the repository being read.
+Paginate until there are no more results. Do not filter candidates through mandate
 selectors, the queue, prior gate verdicts, draft state, labels, or conclusions
 from another pull request. An iteration covers the whole roster because the
 artifact gate evaluates each pull request independently.
@@ -120,8 +128,9 @@ Do not accept a candidate list from the builder.
 
 ## 6. Drive `/ostrom:merge` independently for each candidate
 
-For each candidate, establish its `repo` as the `GH_REPO` environment context
-used by `gh repo view`, then follow `../merge/SKILL.md` exactly with the PR
+For each candidate, establish its `repo` as the `GH_REPO` repository context
+that `/ostrom:merge` resolves in its step 1 — a pointer only, never a
+credential — then follow `../merge/SKILL.md` exactly with the PR
 number as its one and only input. Do not copy or restate its gate conditions,
 derive a verdict, override an action, or add a review step here.
 
