@@ -59,18 +59,21 @@ an invisible pass.
 ## 3. Resolve the roster once per iteration
 
 Use the existing mandate config resolution. Do not read the YAML directly or
-implement another roster parser:
+implement another roster parser. A headless session cannot statically permit
+`source`, since sourcing evaluates its argument as shell code, so call the
+library as a command instead of sourcing it:
 
 ```sh
-source "${CLAUDE_PLUGIN_ROOT}/scripts/mandate-lib.sh"
-mandate_load_config
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/mandate-lib.sh" config
 ```
 
-If mandate is not configured, config resolution fails, or the resolved
-`projects` list is empty, report that fact to the principal and stop this
-iteration. From the resolved JSON, take only each project's `repo` pointer.
-Every roster repository is in scope, including a project marked `paused`;
-gatekeeping open pull requests is not routine builder work.
+This prints the same resolved roster JSON `mandate_load_config` returns to
+every in-process caller. If mandate is not configured, config resolution
+fails, or the resolved `projects` list is empty, report that fact to the
+principal and stop this iteration. From the resolved JSON, take only each
+project's `repo` pointer. Every roster repository is in scope, including a
+project marked `paused`; gatekeeping open pull requests is not routine
+builder work.
 
 ## 4. Authenticate per repository as the gatekeeper App
 

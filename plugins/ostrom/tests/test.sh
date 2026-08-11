@@ -746,6 +746,30 @@ jq -e '
   and .projects[0].paused == false
 ' <<<"$layered" >/dev/null
 
+# A headless Bash tool refuses to statically permit `source "$path"`, since
+# sourcing evaluates its argument as shell code. gatekeep/SKILL.md step 3
+# works around that by executing mandate-lib.sh directly instead of sourcing
+# it (#86's sibling defect). Prove both paths resolve the same layered
+# config: sourcing must still define the functions every other script
+# relies on, and direct execution must print the identical resolved JSON on
+# stdout rather than requiring a second roster parser.
+dispatched="$(
+  cd "$fixture/layers/repo"
+  CLAUDE_CONFIG_DIR="$fixture/layers/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/mandate-lib.sh" config
+)"
+[ "$dispatched" = "$layered" ]
+
+set +e
+dispatch_usage="$(
+  bash "$PLUGIN_ROOT/scripts/mandate-lib.sh" 2>&1
+)"
+dispatch_usage_status=$?
+set -e
+[ "$dispatch_usage_status" -eq 2 ]
+grep -Fq 'usage:' <<<"$dispatch_usage"
+
 assert_bad_selector() {
   name="$1"
   selector="$2"
@@ -1233,8 +1257,27 @@ if [ "$1 $2" = "run list" ]; then
   exit 0
 fi
 if [ "$1" = "api" ]; then
-  case "$2" in
+  # Real `gh api` picks GET unless told otherwise, but silently switches to
+  # POST as soon as any -f/-F parameter is present with no explicit -X. #86
+  # was exactly that: a read issued as an unmarked POST, 404ing on an
+  # endpoint that only exists for GET. Emulate the same switch here so a
+  # regression to the un-prefixed call shape fails this suite, not just
+  # production.
+  if [ "$2" = "-X" ] && [ "$3" = "GET" ]; then
+    endpoint="$4"
+  else
+    endpoint="$2"
+    if printf '%s\n' "$@" | grep -qE '^(-f|--field|-F|--raw-field)$'; then
+      echo '{"message":"Not Found","documentation_url":"https://docs.github.com/rest"}' >&2
+      exit 1
+    fi
+  fi
+  case "$endpoint" in
     repos/example-org/landed-fix-repo/commits)
+      [ "${FAKE_GH_LANDED_FIX_FAIL:-0}" != "1" ] || {
+        echo '{"message":"Not Found","documentation_url":"https://docs.github.com/rest"}' >&2
+        exit 1
+      }
       # Emulates the shape `--jq` would already have reduced the raw GitHub
       # commit payload to: {sha, message, date}.
       cat <<'JSON'
@@ -1536,6 +1579,29 @@ jq -s -e '
     ))
   and (.[0].mandate.reason | contains("aaaaaaaa") | not)
 ' "$landed_fix/config/ostrom/queue.jsonl" >/dev/null
+
+# #86: a commit-search lookup that fails on every attempt this sweep is a
+# dead capability, not routine per-item degradation, and must say so once in
+# addition to (never instead of) the existing per-candidate line — 27
+# identical warnings is exactly how #86 stayed unnoticed.
+# FAKE_GH_LANDED_FIX_FAIL forces the one candidate here to fail regardless of
+# -X GET.
+landed_fix_all_fail_stderr="$fixture/landed-fix-all-fail.stderr"
+(
+  cd "$landed_fix/repo"
+  PATH="$fixture/bin:$PATH" \
+    CLAUDE_CONFIG_DIR="$landed_fix/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    MANDATE_SWEEP_TIME="2026-08-04T00:00:00Z" \
+    FAKE_GH_LANDED_FIX_FAIL=1 \
+    bash "$PLUGIN_ROOT/scripts/sweep.sh" >/dev/null 2>"$landed_fix_all_fail_stderr"
+)
+grep -Fq \
+  'failed to search default-branch commits for example-org/landed-fix-repo#301' \
+  "$landed_fix_all_fail_stderr"
+[ "$(grep -Fc \
+  'landed-fix lookup failed on every attempt this sweep (1/1); treat as a broken capability, not per-item noise' \
+  "$landed_fix_all_fail_stderr")" -eq 1 ]
 
 # The first sweep is a baseline. Only reserved, tripwire, and CI-failing
 # carve-outs queue; the paused project's issue tripwire still fires. #13 is

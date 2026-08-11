@@ -60,6 +60,12 @@ printf '%s\n' '[]' >"$work/selector-stats.json"
 printf '%s\n' '[]' >"$work/possibly-landed.json"
 cp "$work/old-state.json" "$work/new-state.json"
 
+# #86: counted across every repo, so a lookup that fails on every single
+# attempt this sweep can say so once instead of leaving that fact to be
+# inferred from N identical per-candidate warnings.
+landed_fix_attempts=0
+landed_fix_failures=0
+
 while IFS= read -r project; do
   printf '%s\n' "$project" >"$work/project.json"
   repo="$(jq -r '.repo' "$work/project.json")"
@@ -801,8 +807,15 @@ while IFS= read -r project; do
   if [ -n "$default_branch" ]; then
     while IFS=$'\t' read -r cand_number cand_opened; do
       [ -n "$cand_number" ] || continue
+      landed_fix_attempts=$((landed_fix_attempts + 1))
       commit_error="$work/gh-commit-error"
-      if gh api "repos/$repo/commits" \
+      # `gh api` picks its HTTP method implicitly: GET normally, but POST as
+      # soon as any -f/-F parameter is present. Every parameter below is -f,
+      # so an unmarked call here silently becomes
+      # `POST /repos/{owner}/{repo}/commits`, which doesn't exist, and 404s
+      # on every repository regardless of permissions (#86). -X GET pins the
+      # method this read actually needs.
+      if gh api -X GET "repos/$repo/commits" \
           -f "sha=$default_branch" \
           -f "since=$cand_opened" \
           -f "per_page=100" \
@@ -837,6 +850,7 @@ while IFS= read -r project; do
             end
           ' "$work/candidate-commits.json" >>"$work/candidate-result.jsonl"
       else
+        landed_fix_failures=$((landed_fix_failures + 1))
         detail="$(tr '\n' ' ' <"$commit_error")"
         echo "mandate sweep: failed to search default-branch commits for $repo#$cand_number${detail:+: $detail}; no landed-fix lead this sweep" >&2
       fi
@@ -884,6 +898,14 @@ while IFS= read -r project; do
       >"$work/next.json"
   mv "$work/next.json" "$work/new-state.json"
 done < <(jq -c '.projects[]' "$work/config.json")
+
+# #86: a lookup that fails on every attempt is a dead capability, not routine
+# per-item degradation, and the difference is invisible in N identical
+# stderr lines. Say it once, loudly, in addition to (not instead of) the
+# per-candidate lines already emitted above.
+if [ "$landed_fix_attempts" -gt 0 ] && [ "$landed_fix_failures" -eq "$landed_fix_attempts" ]; then
+  echo "mandate sweep: landed-fix lookup failed on every attempt this sweep ($landed_fix_failures/$landed_fix_attempts); treat as a broken capability, not per-item noise" >&2
+fi
 
 jq -cn --slurpfile stats "$work/selector-stats.json" '
     $stats[0]
