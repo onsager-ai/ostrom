@@ -20,6 +20,9 @@ case "$role" in
   builder)
     prompt='/ostrom:work'
     permission_mode=auto
+    # skills/work/SKILL.md step 2 acquires its protocol lease with
+    # MANDATE_LEASE_NAME=builder.lease.
+    inner_lease_name=builder.lease
     ;;
   gatekeeper)
     prompt='/ostrom:gatekeep'
@@ -29,6 +32,12 @@ case "$role" in
     # the pass fails closed at its first tool call) deliberately, so that
     # loosening it is an explicit act and not a side effect of this fix.
     permission_mode=manual
+    # skills/gatekeep/SKILL.md step 2 acquires its protocol lease with no
+    # MANDATE_LEASE_NAME override, which lands on lease.sh's default name,
+    # sprint.lease -- a legacy name predating the newer <role>.lease
+    # convention the builder uses, never renamed. Match what the skill
+    # actually does, not the newer pattern.
+    inner_lease_name=sprint.lease
     ;;
   *)
     usage
@@ -44,8 +53,16 @@ ARM_FILE="$MANDATE_DATA_DIR/loop-armed"
 SETTINGS="$MANDATE_DATA_DIR/roles/$role.settings.json"
 RUN_DIR="$MANDATE_DATA_DIR/pass-runs/$role"
 LEASE_NAME="$role-pass.lease"
+INNER_LEASE_NAME="$inner_lease_name"
 ID_FILE="$MANDATE_DATA_DIR/$role-pass-id"
 WAKE_FILE="$MANDATE_DATA_DIR/$role-wake-counter"
+
+# The wall-clock timeout (systemd's TimeoutStartSec) is the pass's intended
+# bound, because time maps directly to cost. A turn ceiling truncates on an
+# axis nobody budgets against, so it remains only as a runaway-loop backstop
+# -- set well above any turn count a real, working pass has been observed to
+# need.
+MAX_TURNS=200
 
 log_note() {
   echo "ostrom $role pass: $*" >&2
@@ -146,6 +163,7 @@ fi
 lease_acquired=1
 pass_started=0
 child_pid=""
+child_spawned=0
 outcome=""
 start_epoch="$(date +%s)"
 log=""
@@ -173,6 +191,68 @@ read_cost() {
     fi
   fi
   printf '%s\n' "$measured_cost"
+}
+
+# The inner lease (INNER_LEASE_NAME) is acquired by the Claude session this
+# script spawns, as step 2 of its own protocol -- one layer inside the outer
+# $LEASE_NAME this script acquires for itself. When the child is killed
+# before it reaches its own release step -- timeout, signal, max-turns,
+# crash -- that lease outlives it for its full TTL and silently stalls the
+# next pass, which is indistinguishable from an idle loop.
+#
+# Reclaim it here, but only when its started_at is at or after this pass's
+# own start_epoch: that is the one sound proof the held lease belongs to
+# *our* child and not to a concurrent interactive session of the same role,
+# whose lease must never be stolen. The inner session mints its own owner
+# string (a different id and wake counter from this wrapper's $owner), so
+# ownership cannot be checked by name -- only by timestamp. Release always
+# goes through lease.sh, using the owner string read off the held lease, so
+# lease.sh's own owner check still applies; this never deletes the lease
+# file directly and never forces past that check.
+#
+# The timestamp test alone is not sufficient, because finish() also runs on
+# early-exit paths -- the pass-started trace append failing, $SETTINGS
+# missing, $CLAUDE_BIN not executable -- where this pass never reached the
+# point of spawning a child at all. On those paths there is no child of ours
+# that could hold the inner lease, so any lease found there, however fresh
+# its started_at, belongs to a concurrent interactive session and must be
+# left alone. Reclamation therefore requires both proofs together: a child
+# spawned by this pass, and a held lease that started at or after this pass
+# began.
+release_inner_lease() {
+  if [ "$child_spawned" -eq 0 ]; then
+    log_note "this pass never spawned a child; any held inner lease $INNER_LEASE_NAME cannot be ours, leaving it alone"
+    return 0
+  fi
+
+  inner_lease_json="$(
+    MANDATE_LEASE_NAME="$INNER_LEASE_NAME" \
+      bash "$SCRIPT_DIR/lease.sh" status 2>/dev/null
+  )" || {
+    return 0
+  }
+
+  inner_owner="$(jq -r '.owner' <<<"$inner_lease_json" 2>/dev/null)" || return 0
+  inner_started_at="$(jq -r '.started_at' <<<"$inner_lease_json" 2>/dev/null)" || return 0
+  case "$inner_started_at" in
+    ''|*[!0-9]*)
+      log_note "inner lease $INNER_LEASE_NAME has an unreadable started_at; leaving it alone"
+      return 0
+      ;;
+  esac
+
+  if [ "$inner_started_at" -lt "$start_epoch" ]; then
+    log_note "inner lease $INNER_LEASE_NAME started at $inner_started_at, before this pass's own start at $start_epoch; leaving it to its own owner"
+    return 0
+  fi
+
+  log_note "releasing inner lease $INNER_LEASE_NAME held by $inner_owner (started_at=$inner_started_at, pass start=$start_epoch)"
+  if ! MANDATE_LEASE_NAME="$INNER_LEASE_NAME" \
+    bash "$SCRIPT_DIR/lease.sh" release "$inner_owner" >/dev/null 2>&1; then
+    log_note "could not release inner lease $INNER_LEASE_NAME held by $inner_owner"
+    return 1
+  fi
+  return 0
 }
 
 finish() {
@@ -205,6 +285,13 @@ finish() {
         log_note "could not append pass-ended"
         [ "$saved_status" -ne 0 ] || saved_status=1
       fi
+    fi
+
+    # Reclaim the inner lease before releasing the outer one, so the two are
+    # never both briefly free in a way that lets a new pass start against
+    # half-cleared state.
+    if ! release_inner_lease; then
+      [ "$saved_status" -ne 0 ] || saved_status=1
     fi
 
     # Lease release is attempted after every acquired path, even when trace
@@ -286,9 +373,10 @@ log="$RUN_DIR/$stamp-$owner.jsonl"
   --permission-mode "$permission_mode" \
   --output-format stream-json \
   --verbose \
-  --max-turns 40 \
+  --max-turns "$MAX_TURNS" \
   "$prompt" >"$log" 2>&1 &
 child_pid=$!
+child_spawned=1
 wait "$child_pid"
 run_status=$?
 child_pid=""

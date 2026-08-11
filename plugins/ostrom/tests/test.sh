@@ -158,6 +158,11 @@ jq -s -e '
 [ "$(grep -A1 '^--permission-mode$' "$builder_args" | tail -n1)" = auto ]
 ! grep -qx default "$builder_args"
 
+# The turn ceiling is a runaway-loop backstop set well above the wall-clock
+# timeout that actually bounds a pass, not the old, easily-exceeded 40.
+[ "$(grep -A1 '^--max-turns$' "$builder_args" | tail -n1)" = 200 ]
+! grep -qx 40 "$builder_args"
+
 CLAUDE_CONFIG_DIR="$pass_config" CLAUDE_BIN="$fake_claude" \
   FAKE_CLAUDE_MARKER="$fake_marker" \
   bash "$PLUGIN_ROOT/scripts/pass.sh" builder >/dev/null
@@ -369,6 +374,88 @@ jq -s -e '
   and .[1].fact.exit_code == 42
   and .[2].fact.outcome == "failed"
 ' "$builder_failure/ostrom/sprint.jsonl" >/dev/null
+
+# The Claude session pass.sh spawns acquires its own protocol lease
+# (builder.lease) as step 2 of its work. When pass.sh's child is killed
+# before that session reaches its own release step, the inner lease must not
+# outlive the pass -- that is the property pass.sh exists to guarantee, one
+# layer deeper than the outer *-pass.lease it already protects.
+inner_kill="$fixture/inner-lease-kill"
+mkdir -p "$inner_kill/ostrom/roles"
+printf '{}\n' >"$inner_kill/ostrom/roles/builder.settings.json"
+: >"$inner_kill/ostrom/loop-armed"
+inner_kill_marker="$inner_kill/claude-started"
+
+FAKE_CLAUDE_MODE=wait FAKE_CLAUDE_MARKER="$inner_kill_marker" \
+  CLAUDE_CONFIG_DIR="$inner_kill" CLAUDE_BIN="$fake_claude" \
+  bash "$PLUGIN_ROOT/scripts/pass.sh" builder \
+  >"$inner_kill/pass.out" 2>"$inner_kill/pass.err" &
+inner_kill_pass_pid=$!
+for _attempt in $(seq 1 100); do
+  [ -s "$inner_kill_marker" ] && break
+  sleep 0.05
+done
+[ -s "$inner_kill_marker" ]
+
+# Simulate the spawned session having reached step 2 of its own protocol and
+# acquired the inner lease, using the real clock (no epoch override) so its
+# started_at is provably at-or-after pass.sh's own recorded start_epoch.
+CLAUDE_CONFIG_DIR="$inner_kill" MANDATE_LEASE_NAME=builder.lease \
+  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire builder-childsession-wake9 \
+  >/dev/null
+
+kill -TERM "$inner_kill_pass_pid"
+set +e
+wait "$inner_kill_pass_pid"
+inner_kill_status=$?
+set -e
+[ "$inner_kill_status" -eq 143 ]
+[ ! -e "$inner_kill/ostrom/builder-pass.lease" ]
+[ ! -e "$inner_kill/ostrom/builder.lease" ]
+grep -q 'releasing inner lease builder.lease held by builder-childsession-wake9' \
+  "$inner_kill/pass.err"
+
+# An inner lease already held by a concurrent interactive session -- one
+# whose started_at predates this pass's own start -- must be left alone. This
+# is the regression test for the safety check: pass.sh cannot tell that lease
+# apart from its own child's by owner name, only by timestamp, and stealing
+# it would break the one guarantee a concurrent session relies on.
+#
+# Stamp the fixture lease at a fixed, far-past epoch rather than the real
+# clock. pass.sh reads its own start_epoch from the real clock, and lease.sh
+# timestamps are whole seconds -- acquiring "concurrently" at real time risks
+# landing in the same second as pass.sh's start_epoch, which the safety
+# check's inclusive ">=" correctly (per spec) treats as "ours". A fixed past
+# epoch keeps this test deterministic instead of occasionally exercising the
+# reclaim path it exists to rule out.
+inner_safe="$fixture/inner-lease-safety"
+mkdir -p "$inner_safe/ostrom/roles"
+printf '{}\n' >"$inner_safe/ostrom/roles/builder.settings.json"
+: >"$inner_safe/ostrom/loop-armed"
+
+CLAUDE_CONFIG_DIR="$inner_safe" MANDATE_LEASE_NAME=builder.lease \
+  MANDATE_LEASE_NOW_EPOCH=1000 \
+  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire builder-othersession-wake3 \
+  100000 >/dev/null
+preexisting_inner_lease="$(
+  CLAUDE_CONFIG_DIR="$inner_safe" MANDATE_LEASE_NAME=builder.lease \
+    bash "$PLUGIN_ROOT/scripts/lease.sh" status
+)"
+
+CLAUDE_CONFIG_DIR="$inner_safe" CLAUDE_BIN="$fake_claude" \
+  bash "$PLUGIN_ROOT/scripts/pass.sh" builder \
+  >"$inner_safe/pass.out" 2>"$inner_safe/pass.err"
+
+[ ! -e "$inner_safe/ostrom/builder-pass.lease" ]
+inner_lease_after="$(
+  CLAUDE_CONFIG_DIR="$inner_safe" MANDATE_LEASE_NAME=builder.lease \
+    bash "$PLUGIN_ROOT/scripts/lease.sh" status
+)"
+[ "$inner_lease_after" = "$preexisting_inner_lease" ]
+grep -q 'leaving it to its own owner' "$inner_safe/pass.err"
+
+CLAUDE_CONFIG_DIR="$inner_safe" MANDATE_LEASE_NAME=builder.lease \
+  bash "$PLUGIN_ROOT/scripts/lease.sh" release builder-othersession-wake3
 
 lease_expiry="$fixture/lease-expiry"
 CLAUDE_CONFIG_DIR="$lease_expiry" MANDATE_LEASE_NOW_EPOCH=200 \
