@@ -758,6 +758,30 @@ jq -e '
   and .projects[0].paused == false
 ' <<<"$layered" >/dev/null
 
+# A headless Bash tool refuses to statically permit `source "$path"`, since
+# sourcing evaluates its argument as shell code. gatekeep/SKILL.md step 3
+# works around that by executing mandate-lib.sh directly instead of sourcing
+# it (#86's sibling defect). Prove both paths resolve the same layered
+# config: sourcing must still define the functions every other script
+# relies on, and direct execution must print the identical resolved JSON on
+# stdout rather than requiring a second roster parser.
+dispatched="$(
+  cd "$fixture/layers/repo"
+  CLAUDE_CONFIG_DIR="$fixture/layers/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/mandate-lib.sh" config
+)"
+[ "$dispatched" = "$layered" ]
+
+set +e
+dispatch_usage="$(
+  bash "$PLUGIN_ROOT/scripts/mandate-lib.sh" 2>&1
+)"
+dispatch_usage_status=$?
+set -e
+[ "$dispatch_usage_status" -eq 2 ]
+grep -Fq 'usage:' <<<"$dispatch_usage"
+
 assert_bad_selector() {
   name="$1"
   selector="$2"
@@ -1250,21 +1274,43 @@ if [ "$1" = "api" ]; then
   # arguments, rather than assuming it is always the next one: gh api takes
   # flags like -X/-H/-f/-F/--jq before the endpoint, and callers are free to
   # add more of them (e.g. -X GET) without moving the endpoint's meaning.
+  # Also track whether this call would trigger gh's real implicit-POST
+  # switch: GET normally, but POST as soon as any -f/-F is present with no
+  # explicit -X/--method. #86 was exactly that shape — a read issued as an
+  # unmarked POST, 404ing on an endpoint that only exists for GET, with the
+  # endpoint written *before* its -f flags (`gh api "$path" -f ...`). The
+  # loop below must therefore keep scanning past the first positional token
+  # rather than stopping there, or a -f that trails the endpoint — exactly
+  # #86's shape — goes undetected and the regression this block exists to
+  # catch would fail to catch it.
   endpoint=""
+  method=""
+  has_field=0
   while [ "$#" -gt 0 ]; do
     case "$1" in
-      -X | --method | -H | --header | -f | --field | -F | --raw-field | --jq | --template)
+      -X | --method)
+        if [ "$#" -ge 2 ]; then method="$2"; shift 2; else shift; fi
+        ;;
+      -f | --field | -F | --raw-field)
+        has_field=1
+        if [ "$#" -ge 2 ]; then shift 2; else shift; fi
+        ;;
+      -H | --header | --jq | --template)
         if [ "$#" -ge 2 ]; then shift 2; else shift; fi
         ;;
       -*)
         shift
         ;;
       *)
-        endpoint="$1"
-        break
+        [ -n "$endpoint" ] || endpoint="$1"
+        shift
         ;;
     esac
   done
+  if [ -z "$method" ] && [ "$has_field" = "1" ]; then
+    echo '{"message":"Not Found","documentation_url":"https://docs.github.com/rest"}' >&2
+    exit 1
+  fi
   case "$endpoint" in
     repos/example-org/landed-fix-repo/commits)
       # Emulates the shape `--jq` would already have reduced the raw GitHub
