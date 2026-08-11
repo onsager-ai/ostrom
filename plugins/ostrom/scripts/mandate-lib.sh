@@ -766,3 +766,24 @@ mandate_log_selector_event() {
   )"
   printf '%s\n' "$event_line" >>"$MANDATE_EVENTS_FILE"
 }
+
+# A headless Bash tool can refuse to statically permit `source "$path"` at
+# all, because sourcing evaluates its argument as shell code and there is no
+# safe way to allow-list that ahead of time. Every other caller of this file
+# (sweep.sh, audit.sh, replay.sh, local-drift.sh, publish.sh, ...) sources it
+# from inside a script it already trusts, so this dispatch must not change
+# their behavior. It only runs when the file itself is the thing being
+# executed, giving a skill that cannot source it a plain command instead:
+# `bash mandate-lib.sh config` prints the same resolved roster JSON
+# `mandate_load_config` returns to any in-process caller.
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  case "${1:-}" in
+    config)
+      mandate_load_config
+      ;;
+    *)
+      echo "mandate-lib: usage: $0 config" >&2
+      exit 2
+      ;;
+  esac
+fi
