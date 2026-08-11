@@ -55,6 +55,9 @@ printf '%s\n' '[]' >"$work/generated.json"
 printf '%s\n' '[]' >"$work/active-ids.json"
 printf '%s\n' '[]' >"$work/current-items.json"
 printf '%s\n' '[]' >"$work/selector-stats.json"
+# Leads for #77's already-landed-but-not-closed check, keyed by issue id
+# ("owner/repo#N"), accumulated across repos the same way the lists above are.
+printf '%s\n' '[]' >"$work/possibly-landed.json"
 cp "$work/old-state.json" "$work/new-state.json"
 
 while IFS= read -r project; do
@@ -80,6 +83,34 @@ while IFS= read -r project; do
   if [ "$(jq 'length' "$work/issues.json")" -eq "$query_limit" ] ||
     [ "$(jq 'length' "$work/prs.json")" -eq "$query_limit" ]; then
     item_cap="$query_limit"
+  fi
+
+  # #78/#77 both need the default branch's own history — one lookup here,
+  # not two. Unlike the issue/PR queries above, a failure here degrades to
+  # "no drift row, no landed-fix lead" rather than aborting the sweep: this
+  # data augments the queue, it does not gate whether the sweep can run at
+  # all, and a rate-limited follow-up call must never take the whole queue
+  # down with it.
+  default_branch=""
+  if gh repo view "$repo" --json defaultBranchRef >"$work/repo-view.json" 2>"$gh_error"; then
+    default_branch="$(jq -r '.defaultBranchRef.name // ""' "$work/repo-view.json")"
+  else
+    detail="$(tr '\n' ' ' <"$gh_error")"
+    echo "mandate sweep: failed to read the default branch for $repo${detail:+: $detail}; skipping CI drift and landed-fix checks this sweep" >&2
+  fi
+
+  # One run-list call per repo, same shape as the issue/PR queries above.
+  # Judged later against only the LATEST run per workflow on this ref — an
+  # older failure a later run turned green must not read as drift.
+  printf '%s\n' '[]' >"$work/ci-runs.json"
+  if [ -n "$default_branch" ]; then
+    if ! gh run list --repo "$repo" --branch "$default_branch" --limit "$query_limit" \
+      --json databaseId,workflowDatabaseId,workflowName,name,headSha,conclusion,status,createdAt,url \
+      >"$work/ci-runs.json" 2>"$gh_error"; then
+      detail="$(tr '\n' ' ' <"$gh_error")"
+      echo "mandate sweep: failed to query default-branch CI runs for $repo${detail:+: $detail}; no drift row this sweep" >&2
+      printf '%s\n' '[]' >"$work/ci-runs.json"
+    fi
   fi
 
   jq -cn \
@@ -602,6 +633,15 @@ while IFS= read -r project; do
               }
           ],
           selector_stats: [selector_stats],
+          # #77 candidates: open issues about to read (or already reading)
+          # as "stuck". Kept separate from $rows because the landed-fix
+          # lookup below must run every sweep an issue sits stuck, not only
+          # the sweep that first classifies it that way.
+          stuck_issue_candidates: [
+            $classified[]
+            | select(.type == "issue" and .movement_stuck)
+            | {number: .number, opened: .opened}
+          ],
           repo_state: {
             cursor: $cursor,
             previous_cursor: (
@@ -630,20 +670,199 @@ while IFS= read -r project; do
         }
     ' >"$work/analysis.json"
 
+  # #78: fold the default branch's own CI into a "drift" row, the same kind
+  # and digest/troubled-project machinery an open PR's failing CI already
+  # uses. Regeneration is gated on .event the same way the rest of this
+  # script gates $rows on $event: a still-red workflow with no new run is
+  # carried forward via active_ids rather than rewritten every sweep, so an
+  # /ostrom:desk approval on it survives until the run actually changes.
+  jq -cn \
+    --arg repo "$repo" \
+    --arg sweep_started "$sweep_started" \
+    --argjson stuck_after_days "$(jq '.stuck_after_days' "$work/config.json")" \
+    --slurpfile runs "$work/ci-runs.json" \
+    --slurpfile old_state "$work/old-state.json" '
+    def failure_conclusion:
+      ((. // "") | ascii_upcase)
+      | IN("FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE");
+    ($old_state[0].repos[$repo].ci_drift // {}) as $previous_ci
+    | (($old_state[0].repos[$repo].cursor // null) == null) as $initial
+    | ($runs[0] | sort_by(.createdAt) | reverse) as $runs_desc
+    | ($runs_desc | group_by(.workflowDatabaseId // .name // "")) as $groups
+    | [
+        $groups[]
+        | (sort_by(.createdAt) | reverse) as $history
+        | $history[0] as $latest
+        # A run still in flight has no verdict yet; skip it this sweep
+        # rather than judging a workflow on data it has not produced.
+        | select($latest.status == "completed")
+        | select($latest.conclusion | failure_conclusion)
+        # Org/enterprise ruleset workflows can report with no workflow id
+        # (see `gh run list --help`). Without a numeric id there is no way
+        # to mint a stable ref that also satisfies the queue schema, so the
+        # workflow is skipped rather than guessed at.
+        | select(($latest.workflowDatabaseId | type) == "number")
+        | (
+            reduce $history[] as $run (
+              {done: false, red_since: $latest.createdAt};
+              if .done then .
+              elif ($run.status != "completed") then .
+              elif ($run.conclusion | failure_conclusion) then .red_since = $run.createdAt
+              else .done = true
+              end
+            )
+          ) as $streak
+        | ($latest.workflowDatabaseId | tostring) as $wf_key
+        | ($previous_ci[$wf_key] // null) as $old
+        | (
+            if ($old != null) and ($old.red_since < $streak.red_since)
+            then $old.red_since
+            else $streak.red_since
+            end
+          ) as $red_since
+        | {
+            workflow_id: $latest.workflowDatabaseId,
+            workflow_name: (
+              ($latest.workflowName // $latest.name // "")
+              | if length > 0 then . else "(workflow name unavailable)" end
+            ),
+            run_id: $latest.databaseId,
+            head_sha: ($latest.headSha // ""),
+            red_since: $red_since,
+            event: ($initial or $old == null or $old.run_id != $latest.databaseId)
+          }
+      ] as $failing
+    |
+    # A row not regenerated this sweep (no event) is still carried forward by
+    # id via active_ids below, but carrying it forward must not leave its
+    # age_days frozen at whatever sweep last rewrote it — that is the exact
+    # kind of stale queue fact this pair of fixes exists to remove. Compute
+    # age fresh for every currently-failing workflow, same as current_items
+    # already does for issues and PRs, so enrich() can refresh it below
+    # whether or not this sweep regenerated the row.
+    def with_age:
+      . as $item
+      | (($sweep_started | fromdateiso8601) - ($item.red_since | fromdateiso8601)) as $age_seconds
+      | ([($age_seconds / 86400 | floor), 0] | max) as $age_days
+      | $item + {age_days: $age_days, aged_out: ($age_days >= $stuck_after_days)};
+    ($failing | map(with_age)) as $failing_aged
+    | {
+        rows: [
+          $failing_aged[]
+          | select(.event)
+          | {
+              id: ($repo + "#" + (.workflow_id | tostring)),
+              repo: $repo,
+              ref: ("#" + (.workflow_id | tostring)),
+              title: ("CI failing on default branch: " + .workflow_name),
+              kind: "drift",
+              mandate: {
+                reason: (
+                  "default branch CI failing: " + .workflow_name
+                  + "; run " + (.run_id | tostring)
+                  + " at " + (.head_sha[0:8])
+                  + "; red since " + .red_since
+                )
+              },
+              state: "pending",
+              opened: .red_since,
+              age_days: .age_days,
+              aged_out: .aged_out,
+              needs_judgment: false,
+              blocked_by: []
+            }
+        ],
+        active_ids: [$failing[] | ($repo + "#" + (.workflow_id | tostring))],
+        current_items: [
+          $failing_aged[]
+          | {
+              id: ($repo + "#" + (.workflow_id | tostring)),
+              age_days: .age_days,
+              aged_out: .aged_out
+            }
+        ],
+        state: (
+          reduce $failing[] as $item ({};
+            .[($item.workflow_id | tostring)] = {
+              run_id: $item.run_id,
+              red_since: $item.red_since
+            }
+          )
+        )
+      }
+    ' >"$work/ci-drift.json"
+
+  # #77: for every issue about to read (or still reading) as "stuck", look
+  # for a default-branch commit naming it without a closing keyword. One
+  # call per candidate, capped at the issue's own opened date — never one
+  # call per open issue in the repo.
+  rm -f "$work/candidate-result.jsonl"
+  printf '%s\n' '[]' >"$work/repo-possibly-landed.json"
+  if [ -n "$default_branch" ]; then
+    while IFS=$'\t' read -r cand_number cand_opened; do
+      [ -n "$cand_number" ] || continue
+      commit_error="$work/gh-commit-error"
+      if gh api "repos/$repo/commits" \
+          -f "sha=$default_branch" \
+          -f "since=$cand_opened" \
+          -f "per_page=100" \
+          --jq '[.[] | {sha: .sha, message: .commit.message, date: (.commit.committer.date // .commit.author.date // "")}]' \
+          >"$work/candidate-commits.json" 2>"$commit_error"; then
+        jq -c \
+          --arg id "$repo#$cand_number" \
+          --argjson number "$cand_number" \
+          --arg opened "$cand_opened" '
+          def closing_count($msg; $n):
+            [$msg | scan("\\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)[[:space:]:]*#" + ($n|tostring) + "(?!\\d)"; "i")]
+            | length;
+          def bare_count($msg; $n):
+            [$msg | scan("#" + ($n|tostring) + "(?!\\d)"; "i")] | length;
+          (.) as $commits
+          | [
+              $commits[]
+              | select((.date // "") >= $opened)
+              | select(bare_count(.message; $number) > closing_count(.message; $number))
+            ] as $bare_matches
+          | if ($bare_matches | length) == 0 then empty
+            else
+              ($bare_matches | sort_by(.date) | .[0]) as $earliest
+              | {
+                  id: $id,
+                  possibly_landed: (
+                    "; possibly landed: " + ($earliest.sha[0:8])
+                    + " references #" + ($number | tostring)
+                    + " without a closing keyword"
+                  )
+                }
+            end
+          ' "$work/candidate-commits.json" >>"$work/candidate-result.jsonl"
+      else
+        detail="$(tr '\n' ' ' <"$commit_error")"
+        echo "mandate sweep: failed to search default-branch commits for $repo#$cand_number${detail:+: $detail}; no landed-fix lead this sweep" >&2
+      fi
+    done < <(jq -r '.stuck_issue_candidates[]? | [(.number|tostring), .opened] | @tsv' "$work/analysis.json")
+    if [ -s "$work/candidate-result.jsonl" ]; then
+      jq -cs '.' "$work/candidate-result.jsonl" >"$work/repo-possibly-landed.json"
+    fi
+  fi
+
   jq -cn \
     --slurpfile all "$work/generated.json" \
     --slurpfile analysis "$work/analysis.json" \
-    '$all[0] + $analysis[0].rows' >"$work/next.json"
+    --slurpfile ci_drift "$work/ci-drift.json" \
+    '$all[0] + $analysis[0].rows + $ci_drift[0].rows' >"$work/next.json"
   mv "$work/next.json" "$work/generated.json"
   jq -cn \
     --slurpfile all "$work/active-ids.json" \
     --slurpfile analysis "$work/analysis.json" \
-    '$all[0] + $analysis[0].active_ids' >"$work/next.json"
+    --slurpfile ci_drift "$work/ci-drift.json" \
+    '$all[0] + $analysis[0].active_ids + $ci_drift[0].active_ids' >"$work/next.json"
   mv "$work/next.json" "$work/active-ids.json"
   jq -cn \
     --slurpfile all "$work/current-items.json" \
     --slurpfile analysis "$work/analysis.json" \
-    '$all[0] + $analysis[0].current_items' >"$work/next.json"
+    --slurpfile ci_drift "$work/ci-drift.json" \
+    '$all[0] + $analysis[0].current_items + $ci_drift[0].current_items' >"$work/next.json"
   mv "$work/next.json" "$work/current-items.json"
   jq -cn \
     --slurpfile all "$work/selector-stats.json" \
@@ -651,10 +870,17 @@ while IFS= read -r project; do
     '$all[0] + $analysis[0].selector_stats' >"$work/next.json"
   mv "$work/next.json" "$work/selector-stats.json"
   jq -cn \
+    --slurpfile all "$work/possibly-landed.json" \
+    --slurpfile repo "$work/repo-possibly-landed.json" \
+    '$all[0] + $repo[0]' >"$work/next.json"
+  mv "$work/next.json" "$work/possibly-landed.json"
+  jq -cn \
       --arg repo "$repo" \
       --slurpfile state "$work/new-state.json" \
       --slurpfile analysis "$work/analysis.json" \
-      '$state[0] | .version = 2 | .repos[$repo] = $analysis[0].repo_state' \
+      --slurpfile ci_drift "$work/ci-drift.json" \
+      '$state[0] | .version = 2
+        | .repos[$repo] = ($analysis[0].repo_state + {ci_drift: $ci_drift[0].state})' \
       >"$work/next.json"
   mv "$work/next.json" "$work/new-state.json"
 done < <(jq -c '.projects[]' "$work/config.json")
@@ -688,11 +914,13 @@ jq -cn \
     --slurpfile existing "$work/existing-queue.json" \
     --slurpfile generated "$work/generated.json" \
     --slurpfile active_ids "$work/active-ids.json" \
-    --slurpfile current_items "$work/current-items.json" '
+    --slurpfile current_items "$work/current-items.json" \
+    --slurpfile possibly_landed "$work/possibly-landed.json" '
     ($existing[0]) as $existing
     | ($generated[0]) as $generated
     | ($active_ids[0]) as $active_ids
     | ($current_items[0]) as $current_items
+    | ($possibly_landed[0]) as $possibly_landed
     |
     def dependency_refs($repo; $text):
       [
@@ -707,6 +935,8 @@ jq -cn \
       | unique;
     def current($id):
       first($current_items[] | select(.id == $id)) // null;
+    def possibly_landed($id):
+      first($possibly_landed[] | select(.id == $id) | .possibly_landed) // "";
     def enrich:
       . as $row
       | (current($row.id)) as $current
@@ -754,6 +984,25 @@ jq -cn \
           if (.mandate | type) == "object"
           then .mandate.reason += $current.closing_suffix
           else .mandate += $current.closing_suffix
+          end
+        else .
+        end
+      # #77: a pointer, never a verdict. This only ever appends to the
+      # reason string on a "stuck" row — it must not touch state or kind, so
+      # a later reader cannot "improve" it into an auto-close. The builder
+      # still verifies the diff and closes.
+      | (possibly_landed(.id)) as $possibly_landed_suffix
+      | if .kind == "stuck"
+          and $possibly_landed_suffix != ""
+          and (
+            (.mandate.reason // .mandate // "")
+            | endswith($possibly_landed_suffix)
+            | not
+          )
+        then
+          if (.mandate | type) == "object"
+          then .mandate.reason += $possibly_landed_suffix
+          else .mandate += $possibly_landed_suffix
           end
         else .
         end;
