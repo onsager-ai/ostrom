@@ -2501,7 +2501,15 @@ fi
 if [ "$1 $2" = "api graphql" ]; then
   if [ "${FAKE_GATE_MODE:-pass}" = "thread-author" ]; then
     cat <<'JSON'
-{"data":{"repository":{"pullRequest":{"author":{"login":"builder-login"},"reviewThreads":{"nodes":[{"id":"THREAD_placeholder","isResolved":true,"resolvedBy":{"login":"builder-login"}}],"pageInfo":{"hasNextPage":false,"endCursor":"cursor-placeholder"}}}}}}
+{"data":{"repository":{"pullRequest":{"author":{"login":"builder-login"},"reviewThreads":{"nodes":[{"id":"THREAD_placeholder","isResolved":true,"resolvedBy":{"login":"builder-login"},"comments":{"nodes":[{"author":{"login":"placeholder-reviewer-bot"}}]}}],"pageInfo":{"hasNextPage":false,"endCursor":"cursor-placeholder"}}}}}}
+JSON
+  elif [ "${FAKE_GATE_MODE:-pass}" = "thread-unanswered" ]; then
+    cat <<'JSON'
+{"data":{"repository":{"pullRequest":{"author":{"login":"builder-login"},"reviewThreads":{"nodes":[{"id":"THREAD_placeholder","isResolved":false,"resolvedBy":null,"comments":{"nodes":[{"author":{"login":"placeholder-reviewer-bot"}}]}}],"pageInfo":{"hasNextPage":false,"endCursor":"cursor-placeholder"}}}}}}
+JSON
+  elif [ "${FAKE_GATE_MODE:-pass}" = "thread-answered" ]; then
+    cat <<'JSON'
+{"data":{"repository":{"pullRequest":{"author":{"login":"builder-login"},"reviewThreads":{"nodes":[{"id":"THREAD_placeholder","isResolved":false,"resolvedBy":null,"comments":{"nodes":[{"author":{"login":"builder-login"}}]}}],"pageInfo":{"hasNextPage":false,"endCursor":"cursor-placeholder"}}}}}}
 JSON
   else
     cat <<'JSON'
@@ -2721,10 +2729,38 @@ grep -q '^condition required_checks: inconclusive tier=content-derived ' \
   <<<"$gate_output"
 
 # A thread closed by the PR author remains unresolved to the gate under #18.
+# This is the rule #55 must not weaken: replying is not resolving, and
+# self-resolving is not either, so an author-resolved thread still fails —
+# and, being resolved, contributes to neither the answered nor the unanswered
+# count, both of which are 0 here alongside resolved_by_pr_author:1.
 run_gate thread-author 7 dddddddddddddddd
 [ "$gate_status" -eq 1 ]
 grep -q '^condition review_threads: fail tier=content-derived ' <<<"$gate_output"
+grep -q '"unresolved":0' <<<"$gate_output"
+grep -q '"answered":0' <<<"$gate_output"
+grep -q '"unanswered":0' <<<"$gate_output"
 grep -q '"resolved_by_pr_author":1' <<<"$gate_output"
+
+# A thread whose last comment is the reviewer's is unanswered: the author has
+# not spoken since. It still fails review_threads, same as any open thread.
+run_gate thread-unanswered 7 dededededededede
+[ "$gate_status" -eq 1 ]
+grep -q '^condition review_threads: fail tier=content-derived ' <<<"$gate_output"
+grep -q '"unresolved":1' <<<"$gate_output"
+grep -q '"answered":0' <<<"$gate_output"
+grep -q '"unanswered":1' <<<"$gate_output"
+grep -q '"resolved_by_pr_author":0' <<<"$gate_output"
+
+# A thread whose last comment is the author's is answered, not resolved. #55:
+# an answered thread still fails review_threads — the split adds information,
+# it does not let a reply substitute for resolution.
+run_gate thread-answered 7 efefefefefefefef
+[ "$gate_status" -eq 1 ]
+grep -q '^condition review_threads: fail tier=content-derived ' <<<"$gate_output"
+grep -q '"unresolved":1' <<<"$gate_output"
+grep -q '"answered":1' <<<"$gate_output"
+grep -q '"unanswered":0' <<<"$gate_output"
+grep -q '"resolved_by_pr_author":0' <<<"$gate_output"
 
 # Already-judged state is keyed by (PR, head SHA): an unchanged re-read is
 # marked, while a new commit on the same PR forces a fresh judgment.
@@ -2804,7 +2840,7 @@ grep -q '^condition bounce_selectors: fail ' <<<"$gate_output"
 ! grep -q '^condition bounce_selectors: excused ' <<<"$gate_output"
 
 gate_log="$gate_fixture/config/ostrom/gate.jsonl"
-[ "$(wc -l <"$gate_log" | tr -d '[:space:]')" -eq 17 ]
+[ "$(wc -l <"$gate_log" | tr -d '[:space:]')" -eq 19 ]
 jq -s -e '
   ([.[] | select(.pr == "placeholder-org/placeholder-repo#8")]
     | map({head_sha, already_judged}))
