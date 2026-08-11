@@ -15,6 +15,12 @@ const ROLE_SKILL: Record<DeliveryRole, string> = {
   gatekeeper: "/ostrom:gatekeep",
 };
 
+// One no-op is a legitimate skip -- a contended lease, a disarmed loop
+// checked mid-window -- and must stay quiet. A run this long can only mean
+// the loop has stopped taking ownership at all: this is the shape #73
+// measured in production, 19 passes in a row, none of them noticed.
+const NOOP_FAULT_THRESHOLD = 3;
+
 function nowEpoch(context: DoctorContext): number {
   const explicit = context.env.MANDATE_NOW_EPOCH;
   if (explicit && /^\d+$/.test(explicit)) return Number(explicit);
@@ -39,12 +45,20 @@ function formatAge(ageSeconds: number): string {
   return minutes === 0 ? `${hours}h` : `${hours}h${minutes}m`;
 }
 
-function lastRolePassEnded(
+// Walks the trace backward collecting this role's pass-ended records,
+// newest first, stopping once `limit` are found. The no-op streak check
+// only ever needs the most recent NOOP_FAULT_THRESHOLD, so this is the one
+// backward scan both the staleness check and the fault check read from --
+// scanning once from the end rather than parsing the whole (unboundedly
+// growing) trace forward.
+function recentRolePassEnded(
   source: string,
   role: DeliveryRole,
-): Record<string, unknown> | undefined {
+  limit: number,
+): Record<string, unknown>[] {
+  const records: Record<string, unknown>[] = [];
   let contentEnd = source.length;
-  while (contentEnd > 0) {
+  while (contentEnd > 0 && records.length < limit) {
     while (
       contentEnd > 0 &&
       (source[contentEnd - 1] === "\n" || source[contentEnd - 1] === "\r")
@@ -67,9 +81,11 @@ function lastRolePassEnded(
       continue;
     }
     const owner = record.fact.owner;
-    if (typeof owner === "string" && owner.startsWith(`${role}-`)) return record;
+    if (typeof owner === "string" && owner.startsWith(`${role}-`)) {
+      records.push(record);
+    }
   }
-  return undefined;
+  return records;
 }
 
 function checkRolePass(
@@ -96,7 +112,8 @@ function checkRolePass(
     };
   }
 
-  const record = lastRolePassEnded(trace.content, role);
+  const recent = recentRolePassEnded(trace.content, role, NOOP_FAULT_THRESHOLD);
+  const record = recent[0];
   if (!record) {
     return {
       status: "WARN",
@@ -119,6 +136,25 @@ function checkRolePass(
 
   const ageSeconds = nowEpoch(context) - Math.floor(timestampMs / 1000);
   const age = formatAge(ageSeconds);
+
+  // A run of no-ops this long means the loop is running (it stays "current"
+  // on the staleness check above) but has stopped taking ownership of
+  // anything -- a fault the age/cadence check alone cannot see, so it is
+  // judged first and overrides an otherwise-current verdict.
+  if (
+    recent.length === NOOP_FAULT_THRESHOLD &&
+    recent.every(
+      (candidate) => object(candidate.fact) && candidate.fact.outcome === "no-op",
+    )
+  ) {
+    return {
+      status: "FAIL",
+      name: checkName,
+      detail: `${role} loop has produced ${NOOP_FAULT_THRESHOLD} consecutive no-op passes, last ${timestamp} (age ${age})`,
+      remedy: `inspect pass-runs/${role} transcripts; the loop is running but the protocol never takes ownership`,
+    };
+  }
+
   if (ageSeconds > cadenceHours * 60 * 60) {
     return {
       status: "WARN",
