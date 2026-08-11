@@ -599,6 +599,175 @@ CLAUDE_CONFIG_DIR="$lease_release" \
 [ ! -e "$lease_release/ostrom/sprint.lease" ]
 [ ! -e "$lease_release/ostrom/.sprint.lease.guard" ]
 
+# Daily spend cap (#80): pass.sh sums cost_usd out of today's pass-ended
+# records, across every role, and stands down instead of spawning a child
+# once that total is at or above the cap -- unbounded spend while the
+# principal is asleep is the one loop failure nothing else can undo.
+cap_fixture="$fixture/daily-cap"
+cap_config="$cap_fixture/config"
+mkdir -p "$cap_config/ostrom/roles"
+printf '{}\n' >"$cap_config/ostrom/roles/builder.settings.json"
+: >"$cap_config/ostrom/loop-armed"
+cap_trace="$cap_config/ostrom/sprint.jsonl"
+cap_today_epoch=1786449600 # 2026-08-11T12:00:00Z
+
+# Yesterday's row alone is large enough to trip even the default cap, so if
+# it were ever misattributed to today the "under cap" run just below would
+# wrongly stand down instead of spawning.
+MANDATE_TRACE_TIME="2026-08-10T23:59:00Z" CLAUDE_CONFIG_DIR="$cap_config" \
+  bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
+    '{"owner":"builder-fixture-wake0","outcome":"completed","cost_usd":71,"duration_seconds":300}' \
+    '{}' >/dev/null
+# A malformed cost_usd (wrong type) and a missing one must both count as 0,
+# not abort the sum -- a gatekeeper row proves the sum is role-blind too.
+MANDATE_TRACE_TIME="2026-08-11T00:05:00Z" CLAUDE_CONFIG_DIR="$cap_config" \
+  bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
+    '{"owner":"gatekeeper-fixture-wake0","outcome":"completed","cost_usd":"oops","duration_seconds":300}' \
+    '{}' >/dev/null
+MANDATE_TRACE_TIME="2026-08-11T00:06:00Z" CLAUDE_CONFIG_DIR="$cap_config" \
+  bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
+    '{"owner":"gatekeeper-fixture-wake1","outcome":"completed","duration_seconds":300}' \
+    '{}' >/dev/null
+MANDATE_TRACE_TIME="2026-08-11T00:07:00Z" CLAUDE_CONFIG_DIR="$cap_config" \
+  bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
+    '{"owner":"builder-fixture-wake1","outcome":"completed","cost_usd":10,"duration_seconds":300}' \
+    '{}' >/dev/null
+
+# Today's well-formed total is 10; the default $50 cap leaves headroom, so
+# this pass spawns and runs to completion exactly as it would with no cap
+# in play at all.
+cap_undercap_args="$cap_fixture/undercap-args"
+CLAUDE_CONFIG_DIR="$cap_config" CLAUDE_BIN="$fake_claude" \
+  MANDATE_NOW_EPOCH="$cap_today_epoch" \
+  FAKE_CLAUDE_ARGS_FILE="$cap_undercap_args" \
+  FAKE_CLAUDE_INNER_OWNER="builder-inner-cap-wake1" \
+  FAKE_CLAUDE_TRACE_SH="$fake_claude_trace_sh" \
+  bash "$PLUGIN_ROOT/scripts/pass.sh" builder >/dev/null
+[ -s "$cap_undercap_args" ]
+jq -s -e '
+  length == 7
+  and .[4].kind == "pass-started"
+  and .[5].kind == "pass-started"
+  and .[6].kind == "pass-ended"
+  and .[6].fact.outcome == "completed"
+  and .[6].fact.cost_usd == 1.25
+' "$cap_trace" >/dev/null
+
+# Today's well-formed total is now 10 + 1.25 = 11.25. MANDATE_DAILY_CAP_USD
+# overrides the $50 default down to exactly that total: an at-or-over-cap
+# pass must record no-op/daily-cap and never spawn a child, and it must
+# leave neither the outer role-pass lease nor the inner protocol lease held
+# -- the whole point of checking after both lease paths are settled.
+cap_overcap_args="$cap_fixture/overcap-args"
+CLAUDE_CONFIG_DIR="$cap_config" CLAUDE_BIN="$fake_claude" \
+  MANDATE_NOW_EPOCH="$cap_today_epoch" MANDATE_DAILY_CAP_USD=11.25 \
+  FAKE_CLAUDE_ARGS_FILE="$cap_overcap_args" \
+  bash "$PLUGIN_ROOT/scripts/pass.sh" builder >/dev/null 2>&1
+[ ! -e "$cap_overcap_args" ]
+[ ! -e "$cap_config/ostrom/builder-pass.lease" ]
+[ ! -e "$cap_config/ostrom/builder.lease" ]
+jq -s -e '
+  length == 9
+  and .[7].kind == "pass-started"
+  and .[8].kind == "pass-ended"
+  and .[8].fact.owner == .[7].fact.owner
+  and .[8].fact.outcome == "no-op"
+  and .[8].fact.reason == "daily-cap"
+  and .[8].fact.cost_usd == null
+' "$cap_trace" >/dev/null
+
+# Yesterday's cost must never count toward today's total, tested in
+# isolation from the fixture above: a lone $999 row dated yesterday, a
+# $50 default cap, and today otherwise empty -- if the day boundary were
+# off by even a UTC comparison quirk, this pass would wrongly stand down.
+cap_yesterday="$fixture/daily-cap-yesterday"
+cap_yesterday_config="$cap_yesterday/config"
+mkdir -p "$cap_yesterday_config/ostrom/roles"
+printf '{}\n' >"$cap_yesterday_config/ostrom/roles/builder.settings.json"
+: >"$cap_yesterday_config/ostrom/loop-armed"
+MANDATE_TRACE_TIME="2026-08-10T23:59:59Z" CLAUDE_CONFIG_DIR="$cap_yesterday_config" \
+  bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
+    '{"owner":"builder-fixture-wake0","outcome":"completed","cost_usd":999,"duration_seconds":300}' \
+    '{}' >/dev/null
+cap_yesterday_args="$cap_yesterday/args"
+CLAUDE_CONFIG_DIR="$cap_yesterday_config" CLAUDE_BIN="$fake_claude" \
+  MANDATE_NOW_EPOCH="$cap_today_epoch" \
+  FAKE_CLAUDE_ARGS_FILE="$cap_yesterday_args" \
+  FAKE_CLAUDE_INNER_OWNER="builder-inner-yesterday-wake1" \
+  FAKE_CLAUDE_TRACE_SH="$fake_claude_trace_sh" \
+  bash "$PLUGIN_ROOT/scripts/pass.sh" builder >/dev/null
+[ -s "$cap_yesterday_args" ]
+jq -s -e '
+  length == 4
+  and .[3].kind == "pass-ended"
+  and .[3].fact.outcome == "completed"
+' "$cap_yesterday_config/ostrom/sprint.jsonl" >/dev/null
+
+# A malformed or missing cost_usd counts as exactly 0, isolated on its own
+# boundary: three bad rows plus one well-formed $7 row put today's true
+# total at 7. A cap of 7 must still trip (proving the bad rows did not
+# silently drop the day's total below the real one), and a cap of 8 must
+# not (proving they did not silently inflate it either).
+cap_malformed="$fixture/daily-cap-malformed"
+cap_malformed_config="$cap_malformed/config"
+mkdir -p "$cap_malformed_config/ostrom/roles"
+printf '{}\n' >"$cap_malformed_config/ostrom/roles/builder.settings.json"
+: >"$cap_malformed_config/ostrom/loop-armed"
+MANDATE_TRACE_TIME="2026-08-11T01:00:00Z" CLAUDE_CONFIG_DIR="$cap_malformed_config" \
+  bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
+    '{"owner":"builder-fixture-wake0","outcome":"completed","cost_usd":"oops","duration_seconds":300}' \
+    '{}' >/dev/null
+MANDATE_TRACE_TIME="2026-08-11T01:01:00Z" CLAUDE_CONFIG_DIR="$cap_malformed_config" \
+  bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
+    '{"owner":"builder-fixture-wake1","outcome":"completed","cost_usd":null,"duration_seconds":300}' \
+    '{}' >/dev/null
+MANDATE_TRACE_TIME="2026-08-11T01:02:00Z" CLAUDE_CONFIG_DIR="$cap_malformed_config" \
+  bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
+    '{"owner":"builder-fixture-wake2","outcome":"completed","duration_seconds":300}' \
+    '{}' >/dev/null
+MANDATE_TRACE_TIME="2026-08-11T01:03:00Z" CLAUDE_CONFIG_DIR="$cap_malformed_config" \
+  bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
+    '{"owner":"builder-fixture-wake3","outcome":"completed","cost_usd":7,"duration_seconds":300}' \
+    '{}' >/dev/null
+
+cap_malformed_trip_args="$cap_malformed/trip-args"
+CLAUDE_CONFIG_DIR="$cap_malformed_config" CLAUDE_BIN="$fake_claude" \
+  MANDATE_NOW_EPOCH="$cap_today_epoch" MANDATE_DAILY_CAP_USD=7 \
+  FAKE_CLAUDE_ARGS_FILE="$cap_malformed_trip_args" \
+  bash "$PLUGIN_ROOT/scripts/pass.sh" builder >/dev/null 2>&1
+[ ! -e "$cap_malformed_trip_args" ]
+jq -s -e '
+  length == 6
+  and .[5].kind == "pass-ended"
+  and .[5].fact.outcome == "no-op"
+  and .[5].fact.reason == "daily-cap"
+' "$cap_malformed_config/ostrom/sprint.jsonl" >/dev/null
+
+cap_malformed_spawn_args="$cap_malformed/spawn-args"
+CLAUDE_CONFIG_DIR="$cap_malformed_config" CLAUDE_BIN="$fake_claude" \
+  MANDATE_NOW_EPOCH="$cap_today_epoch" MANDATE_DAILY_CAP_USD=8 \
+  FAKE_CLAUDE_ARGS_FILE="$cap_malformed_spawn_args" \
+  bash "$PLUGIN_ROOT/scripts/pass.sh" builder >/dev/null
+[ -s "$cap_malformed_spawn_args" ]
+
+# An unparseable override (not a plain number) falls back to the $50
+# default rather than leaving the loops uncapped on a typo.
+cap_bad_override="$fixture/daily-cap-bad-override"
+cap_bad_override_config="$cap_bad_override/config"
+mkdir -p "$cap_bad_override_config/ostrom/roles"
+printf '{}\n' >"$cap_bad_override_config/ostrom/roles/builder.settings.json"
+: >"$cap_bad_override_config/ostrom/loop-armed"
+MANDATE_TRACE_TIME="2026-08-11T01:00:00Z" CLAUDE_CONFIG_DIR="$cap_bad_override_config" \
+  bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
+    '{"owner":"builder-fixture-wake0","outcome":"completed","cost_usd":9,"duration_seconds":300}' \
+    '{}' >/dev/null
+cap_bad_override_args="$cap_bad_override/args"
+CLAUDE_CONFIG_DIR="$cap_bad_override_config" CLAUDE_BIN="$fake_claude" \
+  MANDATE_NOW_EPOCH="$cap_today_epoch" MANDATE_DAILY_CAP_USD="not-a-number" \
+  FAKE_CLAUDE_ARGS_FILE="$cap_bad_override_args" \
+  bash "$PLUGIN_ROOT/scripts/pass.sh" builder >/dev/null
+[ -s "$cap_bad_override_args" ]
+
 # Trace reads make the fact/narration split structural. The ordinary read
 # cannot return a top-level narration key; the principal must name the
 # narration-specific verb to inspect that region.
