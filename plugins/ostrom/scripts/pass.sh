@@ -19,9 +19,16 @@ role="$1"
 case "$role" in
   builder)
     prompt='/ostrom:work'
+    permission_mode=auto
     ;;
   gatekeeper)
     prompt='/ostrom:gatekeep'
+    # The gatekeeper's authority is narrower than the builder's and its mode
+    # is pending a separate operator decision. `manual` preserves the
+    # pre-existing behaviour (every ask denied in this headless session, so
+    # the pass fails closed at its first tool call) deliberately, so that
+    # loosening it is an explicit act and not a side effect of this fix.
+    permission_mode=manual
     ;;
   *)
     usage
@@ -276,7 +283,7 @@ log="$RUN_DIR/$stamp-$owner.jsonl"
 "$CLAUDE_BIN" \
   --print \
   --settings "$SETTINGS" \
-  --permission-mode default \
+  --permission-mode "$permission_mode" \
   --output-format stream-json \
   --verbose \
   --max-turns 40 \

@@ -96,6 +96,9 @@ printf '{}\n' >"$pass_config/ostrom/roles/builder.settings.json"
 printf '{}\n' >"$pass_config/ostrom/roles/gatekeeper.settings.json"
 cat >"$fake_claude" <<'SH'
 #!/usr/bin/env bash
+if [ -n "${FAKE_CLAUDE_ARGS_FILE:-}" ]; then
+  printf '%s\n' "$@" >"$FAKE_CLAUDE_ARGS_FILE"
+fi
 case "${FAKE_CLAUDE_MODE:-complete}" in
   complete)
     printf '%s\n' '{"type":"assistant","message":"placeholder"}'
@@ -135,8 +138,9 @@ CLAUDE_CONFIG_DIR="$pass_config" CLAUDE_BIN="$fake_claude" \
 CLAUDE_CONFIG_DIR="$pass_config" MANDATE_LEASE_NAME=builder-pass.lease \
   bash "$PLUGIN_ROOT/scripts/lease.sh" release fixture-holder
 
+builder_args="$pass_fixture/builder-args"
 CLAUDE_CONFIG_DIR="$pass_config" CLAUDE_BIN="$fake_claude" \
-  FAKE_CLAUDE_MARKER="$fake_marker" \
+  FAKE_CLAUDE_MARKER="$fake_marker" FAKE_CLAUDE_ARGS_FILE="$builder_args" \
   bash "$PLUGIN_ROOT/scripts/pass.sh" builder >/dev/null
 [ ! -e "$pass_config/ostrom/builder-pass.lease" ]
 jq -s -e '
@@ -148,6 +152,11 @@ jq -s -e '
   and .[1].fact.cost_usd == 1.25
   and (.[1].fact.duration_seconds | type == "number" and . >= 0)
 ' "$pass_config/ostrom/sprint.jsonl" >/dev/null
+
+# The permission mode is role-scoped, not hardcoded, and neither role may
+# ever be handed the invalid "default" value.
+[ "$(grep -A1 '^--permission-mode$' "$builder_args" | tail -n1)" = auto ]
+! grep -qx default "$builder_args"
 
 CLAUDE_CONFIG_DIR="$pass_config" CLAUDE_BIN="$fake_claude" \
   FAKE_CLAUDE_MARKER="$fake_marker" \
@@ -162,7 +171,9 @@ jq -s -e '
   and .[3].fact.owner == .[2].fact.owner
 ' "$pass_config/ostrom/sprint.jsonl" >/dev/null
 
+gatekeeper_args="$pass_fixture/gatekeeper-args"
 FAKE_CLAUDE_MODE=wait FAKE_CLAUDE_MARKER="$fake_marker" \
+  FAKE_CLAUDE_ARGS_FILE="$gatekeeper_args" \
   CLAUDE_CONFIG_DIR="$pass_config" CLAUDE_BIN="$fake_claude" \
   bash "$PLUGIN_ROOT/scripts/pass.sh" gatekeeper >/dev/null 2>&1 &
 signalled_pass_pid=$!
@@ -189,6 +200,11 @@ jq -s -e '
   and $gatekeeper[1].fact.cost_usd == null
   and ($gatekeeper[1].fact.duration_seconds | type == "number" and . >= 0)
 ' "$pass_config/ostrom/sprint.jsonl" >/dev/null
+
+# The gatekeeper's mode is `manual`, not the builder's `auto`, and never the
+# invalid "default" value either.
+[ "$(grep -A1 '^--permission-mode$' "$gatekeeper_args" | tail -n1)" = manual ]
+! grep -qx default "$gatekeeper_args"
 
 # Two concurrent gatekeeper-pass starts cannot both proceed. The winner writes
 # the first trace record while the loser backs off without reading stale state.
