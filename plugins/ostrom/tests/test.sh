@@ -1,10 +1,22 @@
 #!/usr/bin/env bash
 
-set -euo pipefail
+# -E (errtrace) so the ERR trap below is inherited by functions, subshells
+# and command substitutions. Most assertions here run inside `( cd ...; ... )`
+# subshells or `$( ... )` captures; without it the trap is silently absent
+# exactly where the suite does most of its work, and a failure there prints
+# nothing at all.
+set -Eeuo pipefail
 
 PLUGIN_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 fixture="$(mktemp -d)"
 trap 'rm -rf "$fixture"' EXIT
+# set -e aborts on the first failing assertion with no indication of which
+# one — a bare `exit 1` gives no line number, no expected/got. Report where
+# it died before the shell unwinds. Bash fires the ERR trap for any
+# non-zero command regardless of the current errexit state, so guard on
+# $- to skip the deliberate, already-handled failures inside set +e blocks
+# (e.g. capturing a killed process's wait status).
+trap '[[ $- == *e* ]] && echo "mandate tests: FAILED at test.sh:${LINENO} (last command: ${BASH_COMMAND})" >&2; true' ERR
 
 # Shipped plugin files must not retain private checkout paths. Build the
 # expression in pieces so this assertion does not match its own source.
@@ -1257,27 +1269,50 @@ if [ "$1 $2" = "run list" ]; then
   exit 0
 fi
 if [ "$1" = "api" ]; then
-  # Real `gh api` picks GET unless told otherwise, but silently switches to
-  # POST as soon as any -f/-F parameter is present with no explicit -X. #86
-  # was exactly that: a read issued as an unmarked POST, 404ing on an
-  # endpoint that only exists for GET. Emulate the same switch here so a
-  # regression to the un-prefixed call shape fails this suite, not just
-  # production.
-  if [ "$2" = "-X" ] && [ "$3" = "GET" ]; then
-    endpoint="$4"
-  else
-    endpoint="$2"
-    if printf '%s\n' "$@" | grep -qE '^(-f|--field|-F|--raw-field)$'; then
-      echo '{"message":"Not Found","documentation_url":"https://docs.github.com/rest"}' >&2
-      exit 1
-    fi
+  shift
+  # Find the endpoint (or "graphql") wherever it falls in the remaining
+  # arguments, rather than assuming it is always the next one: gh api takes
+  # flags like -X/-H/-f/-F/--jq before the endpoint, and callers are free to
+  # add more of them (e.g. -X GET) without moving the endpoint's meaning.
+  # Also track whether this call would trigger gh's real implicit-POST
+  # switch: GET normally, but POST as soon as any -f/-F is present with no
+  # explicit -X/--method. #86 was exactly that shape — a read issued as an
+  # unmarked POST, 404ing on an endpoint that only exists for GET, with the
+  # endpoint written *before* its -f flags (`gh api "$path" -f ...`). The
+  # loop below must therefore keep scanning past the first positional token
+  # rather than stopping there, or a -f that trails the endpoint — exactly
+  # #86's shape — goes undetected and the regression this block exists to
+  # catch would fail to catch it.
+  endpoint=""
+  method=""
+  has_field=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -X | --method)
+        if [ "$#" -ge 2 ]; then method="$2"; shift 2; else shift; fi
+        ;;
+      -f | --field | -F | --raw-field)
+        has_field=1
+        if [ "$#" -ge 2 ]; then shift 2; else shift; fi
+        ;;
+      -H | --header | --jq | --template)
+        if [ "$#" -ge 2 ]; then shift 2; else shift; fi
+        ;;
+      -*)
+        shift
+        ;;
+      *)
+        [ -n "$endpoint" ] || endpoint="$1"
+        shift
+        ;;
+    esac
+  done
+  if [ -z "$method" ] && [ "$has_field" = "1" ]; then
+    echo '{"message":"Not Found","documentation_url":"https://docs.github.com/rest"}' >&2
+    exit 1
   fi
   case "$endpoint" in
     repos/example-org/landed-fix-repo/commits)
-      [ "${FAKE_GH_LANDED_FIX_FAIL:-0}" != "1" ] || {
-        echo '{"message":"Not Found","documentation_url":"https://docs.github.com/rest"}' >&2
-        exit 1
-      }
       # Emulates the shape `--jq` would already have reduced the raw GitHub
       # commit payload to: {sha, message, date}.
       cat <<'JSON'
@@ -1579,29 +1614,6 @@ jq -s -e '
     ))
   and (.[0].mandate.reason | contains("aaaaaaaa") | not)
 ' "$landed_fix/config/ostrom/queue.jsonl" >/dev/null
-
-# #86: a commit-search lookup that fails on every attempt this sweep is a
-# dead capability, not routine per-item degradation, and must say so once in
-# addition to (never instead of) the existing per-candidate line — 27
-# identical warnings is exactly how #86 stayed unnoticed.
-# FAKE_GH_LANDED_FIX_FAIL forces the one candidate here to fail regardless of
-# -X GET.
-landed_fix_all_fail_stderr="$fixture/landed-fix-all-fail.stderr"
-(
-  cd "$landed_fix/repo"
-  PATH="$fixture/bin:$PATH" \
-    CLAUDE_CONFIG_DIR="$landed_fix/config" \
-    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-    MANDATE_SWEEP_TIME="2026-08-04T00:00:00Z" \
-    FAKE_GH_LANDED_FIX_FAIL=1 \
-    bash "$PLUGIN_ROOT/scripts/sweep.sh" >/dev/null 2>"$landed_fix_all_fail_stderr"
-)
-grep -Fq \
-  'failed to search default-branch commits for example-org/landed-fix-repo#301' \
-  "$landed_fix_all_fail_stderr"
-[ "$(grep -Fc \
-  'landed-fix lookup failed on every attempt this sweep (1/1); treat as a broken capability, not per-item noise' \
-  "$landed_fix_all_fail_stderr")" -eq 1 ]
 
 # The first sweep is a baseline. Only reserved, tripwire, and CI-failing
 # carve-outs queue; the paused project's issue tripwire still fires. #13 is

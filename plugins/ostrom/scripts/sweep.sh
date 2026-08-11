@@ -60,11 +60,15 @@ printf '%s\n' '[]' >"$work/selector-stats.json"
 printf '%s\n' '[]' >"$work/possibly-landed.json"
 cp "$work/old-state.json" "$work/new-state.json"
 
-# #86: counted across every repo, so a lookup that fails on every single
-# attempt this sweep can say so once instead of leaving that fact to be
-# inferred from N identical per-candidate warnings.
+# #86: track landed-fix commit-search attempts/failures across the whole
+# sweep (all repos, all candidates) so a 100%-failing capability can be
+# reported once instead of once per candidate. Per-item lines are buffered
+# and only flushed verbatim when the failure is partial (i.e. transient);
+# see the summary after the repo loop below.
 landed_fix_attempts=0
 landed_fix_failures=0
+landed_fix_last_error=""
+: >"$work/landed-fix-failures.log"
 
 while IFS= read -r project; do
   printf '%s\n' "$project" >"$work/project.json"
@@ -807,14 +811,8 @@ while IFS= read -r project; do
   if [ -n "$default_branch" ]; then
     while IFS=$'\t' read -r cand_number cand_opened; do
       [ -n "$cand_number" ] || continue
-      landed_fix_attempts=$((landed_fix_attempts + 1))
       commit_error="$work/gh-commit-error"
-      # `gh api` picks its HTTP method implicitly: GET normally, but POST as
-      # soon as any -f/-F parameter is present. Every parameter below is -f,
-      # so an unmarked call here silently becomes
-      # `POST /repos/{owner}/{repo}/commits`, which doesn't exist, and 404s
-      # on every repository regardless of permissions (#86). -X GET pins the
-      # method this read actually needs.
+      landed_fix_attempts=$((landed_fix_attempts + 1))
       if gh api -X GET "repos/$repo/commits" \
           -f "sha=$default_branch" \
           -f "since=$cand_opened" \
@@ -850,9 +848,10 @@ while IFS= read -r project; do
             end
           ' "$work/candidate-commits.json" >>"$work/candidate-result.jsonl"
       else
-        landed_fix_failures=$((landed_fix_failures + 1))
         detail="$(tr '\n' ' ' <"$commit_error")"
-        echo "mandate sweep: failed to search default-branch commits for $repo#$cand_number${detail:+: $detail}; no landed-fix lead this sweep" >&2
+        landed_fix_failures=$((landed_fix_failures + 1))
+        landed_fix_last_error="$detail"
+        echo "mandate sweep: failed to search default-branch commits for $repo#$cand_number${detail:+: $detail}; no landed-fix lead this sweep" >>"$work/landed-fix-failures.log"
       fi
     done < <(jq -r '.stuck_issue_candidates[]? | [(.number|tostring), .opened] | @tsv' "$work/analysis.json")
     if [ -s "$work/candidate-result.jsonl" ]; then
@@ -899,12 +898,14 @@ while IFS= read -r project; do
   mv "$work/next.json" "$work/new-state.json"
 done < <(jq -c '.projects[]' "$work/config.json")
 
-# #86: a lookup that fails on every attempt is a dead capability, not routine
-# per-item degradation, and the difference is invisible in N identical
-# stderr lines. Say it once, loudly, in addition to (not instead of) the
-# per-candidate lines already emitted above.
+# #86: report the landed-fix commit search as one capability-level failure
+# when every attempt this sweep failed (a dead capability), or as the
+# per-item lines buffered above when only some attempts failed (transient).
+# A sweep with zero candidates has nothing to report either way.
 if [ "$landed_fix_attempts" -gt 0 ] && [ "$landed_fix_failures" -eq "$landed_fix_attempts" ]; then
-  echo "mandate sweep: landed-fix lookup failed on every attempt this sweep ($landed_fix_failures/$landed_fix_attempts); treat as a broken capability, not per-item noise" >&2
+  echo "mandate sweep: default-branch commit search failed for all $landed_fix_attempts stuck-issue candidate(s) this sweep; landed-fix lead unavailable this sweep, not just degraded${landed_fix_last_error:+ (last error: $landed_fix_last_error)}" >&2
+elif [ "$landed_fix_failures" -gt 0 ]; then
+  cat "$work/landed-fix-failures.log" >&2
 fi
 
 jq -cn --slurpfile stats "$work/selector-stats.json" '
