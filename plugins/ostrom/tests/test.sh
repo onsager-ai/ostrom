@@ -1,10 +1,22 @@
 #!/usr/bin/env bash
 
-set -euo pipefail
+# -E (errtrace) so the ERR trap below is inherited by functions, subshells
+# and command substitutions. Most assertions here run inside `( cd ...; ... )`
+# subshells or `$( ... )` captures; without it the trap is silently absent
+# exactly where the suite does most of its work, and a failure there prints
+# nothing at all.
+set -Eeuo pipefail
 
 PLUGIN_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 fixture="$(mktemp -d)"
 trap 'rm -rf "$fixture"' EXIT
+# set -e aborts on the first failing assertion with no indication of which
+# one — a bare `exit 1` gives no line number, no expected/got. Report where
+# it died before the shell unwinds. Bash fires the ERR trap for any
+# non-zero command regardless of the current errexit state, so guard on
+# $- to skip the deliberate, already-handled failures inside set +e blocks
+# (e.g. capturing a killed process's wait status).
+trap '[[ $- == *e* ]] && echo "mandate tests: FAILED at test.sh:${LINENO} (last command: ${BASH_COMMAND})" >&2; true' ERR
 
 # Shipped plugin files must not retain private checkout paths. Build the
 # expression in pieces so this assertion does not match its own source.
@@ -1233,7 +1245,27 @@ if [ "$1 $2" = "run list" ]; then
   exit 0
 fi
 if [ "$1" = "api" ]; then
-  case "$2" in
+  shift
+  # Find the endpoint (or "graphql") wherever it falls in the remaining
+  # arguments, rather than assuming it is always the next one: gh api takes
+  # flags like -X/-H/-f/-F/--jq before the endpoint, and callers are free to
+  # add more of them (e.g. -X GET) without moving the endpoint's meaning.
+  endpoint=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -X | --method | -H | --header | -f | --field | -F | --raw-field | --jq | --template)
+        if [ "$#" -ge 2 ]; then shift 2; else shift; fi
+        ;;
+      -*)
+        shift
+        ;;
+      *)
+        endpoint="$1"
+        break
+        ;;
+    esac
+  done
+  case "$endpoint" in
     repos/example-org/landed-fix-repo/commits)
       # Emulates the shape `--jq` would already have reduced the raw GitHub
       # commit payload to: {sha, message, date}.
