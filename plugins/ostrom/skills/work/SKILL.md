@@ -151,6 +151,17 @@ both are answers; silence is not. An automated reviewer comments on most pull
 requests and will not chase you, so a thread nobody answers blocks the gate for
 as long as nobody answers it.
 
+That rule covers an **unanswered** thread — the reviewer's comment is still the
+last word. Once you have replied, the thread is **answered**, and `gate.sh`
+reports the two counts separately for exactly this reason: an answered thread
+still fails `review_threads`, but it is no longer outstanding work. Do not
+re-read it looking for something to do, do not dispatch an implementer at it,
+and do not add a second reply restating the first — none of that moves the
+gate, and a thread that keeps growing looks like neglect rather than the
+settled position it is. An answered thread is stuck on the reviewer, who does
+not come back, or on the principal, who can override the gate; it is not stuck
+on you. Report it as awaiting the principal and move on.
+
 Never resolve or dismiss a review thread on your own pull request, including a
 thread you believe is fixed. `gate.sh` counts a thread as unresolved when it is
 unresolved or was resolved by the PR author. Reply and let the reviewer close

@@ -146,7 +146,12 @@ review_query='query($owner:String!, $repo:String!, $number:Int!, $cursor:String)
     pullRequest(number:$number) {
       author { login }
       reviewThreads(first:100, after:$cursor) {
-        nodes { id isResolved resolvedBy { login } }
+        nodes {
+          id
+          isResolved
+          resolvedBy { login }
+          comments(last:1) { nodes { author { login } } }
+        }
         pageInfo { hasNextPage endCursor }
       }
     }
@@ -192,6 +197,11 @@ while [ "$page" -lt 100 ]; do
           (.resolvedBy | type == "object")
           and (.resolvedBy.login | type == "string" and length > 0)
         )
+      )
+      and (.comments.nodes | type == "array")
+      and all(.comments.nodes[];
+        (.author == null)
+        or ((.author | type == "object") and (.author.login | type == "string" and length > 0))
       )
     )
   ' "$work/thread-page.json" >/dev/null 2>&1; then
@@ -350,8 +360,26 @@ else
     write_condition "$work/threads-condition.json" review_threads inconclusive '["content-derived"]' "$detail"
   else
     if [ -s "$work/threads.jsonl" ]; then
+      # answered/unanswered split open threads only (isResolved == false) by
+      # who spoke last: the PR author replying after the reviewer's most
+      # recent comment makes a thread "answered". This is informational only
+      # — it must NEVER change $result. An answered thread is still open work
+      # for the gate: the author cannot clear a thread by replying to it any
+      # more than by resolving it outright, because a reply is exactly as
+      # much an unverified self-assertion as a resolution is. Do not fold
+      # "answered" into the pass/fail logic, and do not let an author's own
+      # reply count toward resolved_by_pr_author below — that field tracks a
+      # different, already-forbidden act (self-resolving the thread), not
+      # replying to it, and the two must stay distinguishable.
       jq -s --arg author "$thread_author" '
-        ([.[] | select(.isResolved == false)] | length) as $unresolved
+        ([.[] | select(.isResolved == false)]) as $open
+        | ($open | length) as $unresolved
+        | ([$open[] | select(
+              ((.comments.nodes[-1].author.login // "") | length) > 0
+              and ((.comments.nodes[-1].author.login // "") | ascii_downcase)
+                == ($author | ascii_downcase)
+            )] | length) as $answered
+        | ($unresolved - $answered) as $unanswered
         | ([.[] | select(
               .isResolved == true
               and ((.resolvedBy.login // "") | ascii_downcase)
@@ -372,13 +400,15 @@ else
             tier: ["content-derived"],
             detail: {
               unresolved: $unresolved,
+              answered: $answered,
+              unanswered: $unanswered,
               resolved_by_pr_author: $by_author,
               resolved_with_missing_resolver: $missing_resolver
             }
           }
       ' "$work/threads.jsonl" >"$work/threads-condition.json"
     else
-      detail='{"unresolved":0,"resolved_by_pr_author":0,"resolved_with_missing_resolver":0}'
+      detail='{"unresolved":0,"answered":0,"unanswered":0,"resolved_by_pr_author":0,"resolved_with_missing_resolver":0}'
       write_condition "$work/threads-condition.json" review_threads pass '["content-derived"]' "$detail"
     fi
   fi

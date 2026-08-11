@@ -179,9 +179,25 @@ Resolve a thread only when **all** of these hold:
 2. You state the commit SHA that addresses it in the resolving comment. A
    resolution with no named commit is indistinguishable from clearing a thread
    to unblock yourself, which is the thing this permission must not become.
-3. The point is genuinely addressed. If the author replied explaining why no
-   change was needed, that is the author arguing an unchanged artifact — leave
-   it open and let the verdict stand.
+3. The point is genuinely addressed. A thread's reply settles into one of
+   three distinct shapes; treat them as distinct rather than reducing the
+   third to the second:
+
+   - **Fixed at this head.** The addressing change is present in this pull
+     request's diff. Resolve it, naming that commit per (2).
+   - **Fixed, but by a different pull request.** The reviewer's point was
+     correct, the author accepted it, and a separate, already-merged pull
+     request applied the fix. Check this against `main`, not against this
+     diff — the question "is the fix on `main`?" has a yes-or-no answer, so
+     this is not a judgment call any more than (1) is, only against a
+     different ref. Resolve it, naming the commit on `main` that fixed it.
+   - **Argued, not fixed.** The author replied explaining why no change was
+     warranted here, and nothing external settles it. That is the author
+     arguing an unchanged artifact — leave it open and let the verdict stand.
+
+   The first two are objective and resolvable; only the third is a standing
+   disagreement with no exit through this protocol, and it is the only one of
+   the three that should ever be reported as "the author argues."
 
 A thread you cannot evaluate stays open, and the condition stays `fail`. Being
 unable to judge is a legitimate outcome; the escalation dossier exists for it.
