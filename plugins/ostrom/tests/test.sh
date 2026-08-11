@@ -84,6 +84,22 @@ for trace_kind in pass-started item-worked pass-ended; do
   grep -q "trace.sh\" append $trace_kind" "$work_skill"
 done
 
+# #80's reversal half: the gatekeeper records a decision-taken trace record
+# with a reversal pointer at every point it exercises its own judgment —
+# merging and resolving a review thread — and the builder does the same for
+# filing and closing an issue. Each fact carries role, owner, repo, ref,
+# decision, and reversal; reasoning is narration, per trace.sh's own split.
+[ "$(grep -c "trace.sh\" append decision-taken" "$merge_skill")" -eq 2 ]
+[ "$(grep -c "trace.sh\" append decision-taken" "$work_skill")" -eq 1 ]
+for skill_file in "$merge_skill" "$work_skill"; do
+  grep -q 'role: "gatekeeper"\|role: "builder"' "$skill_file"
+  grep -q 'reversal: \$reversal' "$skill_file"
+done
+grep -q 'unresolve thread' "$merge_skill"
+grep -q 'revert .*: open a revert pull request' "$merge_skill"
+grep -q 'close <repo>#<new issue number>' "$work_skill"
+grep -q 'reopen <repo>#<ref>' "$work_skill"
+
 # The systemd wrapper fails closed when disarmed, backs off on its own outer
 # lease, preserves its role identity across processes, records measured cost,
 # and finalizes a signalled pass before releasing that lease.
@@ -2280,7 +2296,8 @@ stale_digest="$(
     bash "$PLUGIN_ROOT/hooks/render-digest.sh"
 )"
 stale_digest_text="$(jq -r '.systemMessage' <<<"$stale_digest")"
-[ "$(wc -l <<<"$stale_digest_text")" -eq 2 ]
+[ "$(wc -l <<<"$stale_digest_text")" -eq 3 ]
+grep -q '^DECISIONS TAKEN: nothing since your last read$' <<<"$stale_digest_text"
 grep -q '^STALE — mandate sweep overdue$' <<<"$stale_digest_text"
 grep -q '^2 projects nominal$' <<<"$stale_digest_text"
 
@@ -2354,6 +2371,122 @@ unconfigured_status=$?
 set -e
 [ "$unconfigured_status" -eq 0 ]
 [ ! -s "$unconfigured_stdout" ]
+
+# #80's transparency half: the digest leads with decisions taken since the
+# principal's last read, newest first, each carrying its reversal pointer.
+# "Since last read" is a small local watermark file, not a rewrite of the
+# append-only trace.
+decisions="$fixture/decisions"
+mkdir -p "$decisions/config/ostrom" "$decisions/repo"
+cat >"$decisions/config/ostrom/mandates.yaml" <<'YAML'
+provider: file
+cadence_hours: 24
+stuck_after_days: 1
+bounce_all: []
+projects:
+  - repo: example-org/example-repo
+    delegated: []
+    excluded: []
+    reserved:
+      - 10
+    default: excluded
+    paused: false
+    bounce: []
+YAML
+cat >"$decisions/config/ostrom/state.json" <<'JSON'
+{"version":2,"repos":{},"dead_selectors":[]}
+JSON
+run_decisions_digest() {
+  (
+    cd "$decisions/repo"
+    CLAUDE_CONFIG_DIR="$decisions/config" \
+      CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+      MANDATE_TODAY="2026-08-01" \
+      "$@" bash "$PLUGIN_ROOT/hooks/render-digest.sh"
+  )
+}
+
+# A trace with no decision-taken rows renders the one-line plain form, never
+# an empty section.
+none_yet_digest="$(run_decisions_digest env MANDATE_DIGEST_TIME="2026-08-01T00:00:00Z")"
+none_yet_text="$(jq -r '.systemMessage' <<<"$none_yet_digest")"
+grep -q '^DECISIONS TAKEN: nothing since your last read$' <<<"$none_yet_text"
+if grep -q '^DECISIONS TAKEN$' <<<"$none_yet_text"; then
+  echo "an empty decisions section rendered a heading with no rows" >&2
+  exit 1
+fi
+
+# Two decision-taken records land after the watermark set by the render
+# above. One is missing its reversal field entirely — it must degrade rather
+# than take the hook down with it.
+MANDATE_TRACE_TIME="2026-08-01T01:00:00Z" CLAUDE_CONFIG_DIR="$decisions/config" \
+  bash "$PLUGIN_ROOT/scripts/trace.sh" append decision-taken \
+  '{"role":"gatekeeper","owner":"gatekeeper-t-1","repo":"example-org/example-repo","ref":"#42","decision":"merged pull request","reversal":"revert example-org/example-repo#42: open a revert pull request or git revert its merge commit"}' \
+  '{"reason":"gate verdict: pass"}' >/dev/null
+MANDATE_TRACE_TIME="2026-08-01T01:05:00Z" CLAUDE_CONFIG_DIR="$decisions/config" \
+  bash "$PLUGIN_ROOT/scripts/trace.sh" append decision-taken \
+  '{"role":"builder","owner":"builder-t-1","repo":"example-org/example-repo","ref":"#43","decision":"filed issue"}' \
+  '{}' >/dev/null
+
+# A pending tripwire keeps the queue non-empty so the still-blocked section
+# has something to render below the new decisions.
+run_sweep_for_decisions() {
+  (
+    cd "$decisions/repo"
+    PATH="$fixture/bin:$PATH" \
+      FAKE_GH_CALL_LOG="$decisions/gh-calls" \
+      CLAUDE_CONFIG_DIR="$decisions/config" \
+      CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+      bash "$PLUGIN_ROOT/scripts/sweep.sh"
+  )
+}
+run_sweep_for_decisions >/dev/null
+
+with_decisions_digest="$(
+  run_decisions_digest env MANDATE_DIGEST_TIME="2026-08-01T02:00:00Z"
+)"
+with_decisions_text="$(jq -r '.systemMessage' <<<"$with_decisions_digest")"
+jq -e . <<<"$with_decisions_digest" >/dev/null
+grep -q '^DECISIONS TAKEN$' <<<"$with_decisions_text"
+grep -q \
+  '^example-org/example-repo#43  filed issue  \[reversal: reversal not recorded\]$' \
+  <<<"$with_decisions_text"
+grep -q \
+  '^example-org/example-repo#42  merged pull request — gate verdict: pass  \[reversal: revert example-org/example-repo#42: open a revert pull request or git revert its merge commit\]$' \
+  <<<"$with_decisions_text"
+decisions_line_43="$(grep -n '^example-org/example-repo#43' <<<"$with_decisions_text" | cut -d: -f1)"
+decisions_line_42="$(grep -n '^example-org/example-repo#42' <<<"$with_decisions_text" | cut -d: -f1)"
+[ "$decisions_line_43" -lt "$decisions_line_42" ]
+blocked_line="$(
+  grep -n '^example-org/example-repo#10  ' <<<"$with_decisions_text" | cut -d: -f1
+)"
+[ -n "$blocked_line" ]
+[ "$decisions_line_42" -lt "$blocked_line" ]
+
+# Reading the digest again with no new decisions and a later watermark
+# suppresses the ones already shown, proving the watermark advances.
+rerun_digest="$(run_decisions_digest env MANDATE_DIGEST_TIME="2026-08-01T03:00:00Z")"
+rerun_text="$(jq -r '.systemMessage' <<<"$rerun_digest")"
+grep -q '^DECISIONS TAKEN: nothing since your last read$' <<<"$rerun_text"
+if grep -q 'example-org/example-repo#42\|example-org/example-repo#43' \
+  <<<"$rerun_text"; then
+  echo "a decision already shown once rendered again after the watermark advanced" >&2
+  exit 1
+fi
+
+# A malformed line elsewhere in the trace must never crash the hook: the
+# digest still degrades to a shorter one, not an empty SessionStart.
+printf 'not-json-at-all\n' >>"$decisions/config/ostrom/sprint.jsonl"
+set +e
+malformed_trace_digest="$(
+  run_decisions_digest env MANDATE_DIGEST_TIME="2026-08-01T04:00:00Z" 2>"$decisions/stderr"
+)"
+malformed_trace_status=$?
+set -e
+[ "$malformed_trace_status" -eq 0 ]
+jq -e . <<<"$malformed_trace_digest" >/dev/null
+malformed_trace_text="$(jq -r '.systemMessage' <<<"$malformed_trace_digest")"
+grep -q '^DECISIONS TAKEN: nothing since your last read$' <<<"$malformed_trace_text"
 
 set +e
 missing_message="$(
