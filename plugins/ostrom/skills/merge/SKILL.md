@@ -114,10 +114,27 @@ caller's, is always about delivery, and never converts `inconclusive` into
 
 ## 4. Apply exactly the verdict
 
-- **Pass (exit 0)** — perform these two steps in order, using the installation
-  token minted for this repository:
+- **Pass (exit 0)** — perform these three steps in order, using the
+  installation token minted for this repository:
   1. Run `gh pr review <PR number> --repo <owner/repo> --approve`.
   2. Then run `gh pr merge <PR number> --repo <owner/repo>`.
+  3. Then append a `decision-taken` trace record. Merging is the
+     gatekeeper's own judgment on this artifact, and it is only safe to make
+     without the principal because it is cheap to undo — the reversal
+     pointer is what makes that true rather than merely asserted, so it is
+     recorded in the same step as the merge, not deferred to a later pass:
+
+     ```sh
+     bash "${CLAUDE_PLUGIN_ROOT}/scripts/trace.sh" append decision-taken \
+       "$(jq -cn --arg owner "$lease_owner" --arg repo "$repository" \
+         --arg ref "#$pr_number" --arg head_sha "$head_sha" \
+         --arg reversal "revert $repository#$pr_number: open a revert pull request or \`git revert\` its merge commit" \
+         '{role: "gatekeeper", owner: $owner, repo: $repo, ref: $ref,
+           head_sha: $head_sha, decision: "merged pull request",
+           reversal: $reversal}')" \
+       "$(jq -cn --arg verdict "$verdict" \
+         '{reason: ("gate verdict: " + $verdict)}')"
+     ```
 
   **The approval must come from the App, never from the principal's account.**
   A session that has fallen back to the principal's identity will be refused
@@ -198,6 +215,24 @@ Resolve a thread only when **all** of these hold:
    The first two are objective and resolvable; only the third is a standing
    disagreement with no exit through this protocol, and it is the only one of
    the three that should ever be reported as "the author argues."
+
+Immediately after resolving, append a `decision-taken` trace record naming the
+same commit and pointing back at the thread. This is what lets a principal who
+finds a thread resolved wrongly unresolve it directly, rather than
+reconstructing the judgment from the PR history:
+
+```sh
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/trace.sh" append decision-taken \
+  "$(jq -cn --arg owner "$lease_owner" --arg repo "$repository" \
+    --arg ref "#$pr_number" --arg thread_id "$thread_id" \
+    --arg commit "$addressing_commit" \
+    --arg reversal "unresolve thread $thread_id on $repository#$pr_number" \
+    '{role: "gatekeeper", owner: $owner, repo: $repo, ref: $ref,
+      decision: "resolved review thread", thread_id: $thread_id,
+      reversal: $reversal}')" \
+  "$(jq -cn --arg commit "$addressing_commit" \
+    '{reason: ("addressed at " + $commit)}')"
+```
 
 A thread you cannot evaluate stays open, and the condition stays `fail`. Being
 unable to judge is a legitimate outcome; the escalation dossier exists for it.

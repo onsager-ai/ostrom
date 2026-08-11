@@ -133,6 +133,79 @@ render_section() {
   printf '%s\n' "$rows"
 }
 
+# Decisions taken lead the digest: a returning principal should read what
+# happened, not what is stuck. "Since last read" needs its own watermark —
+# the trace is an append-only log, so marking individual records read the way
+# a state.json notice is marked `reported` would mean rewriting sprint.jsonl,
+# which nothing else in this subsystem does. A small sentinel file instead,
+# parallel to the .tap-$today gate below, records only the moment of the last
+# render.
+trace_file="$MANDATE_DATA_DIR/sprint.jsonl"
+decisions_watermark_file="$MANDATE_DATA_DIR/.digest-decisions-read"
+digest_now="${MANDATE_DIGEST_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
+
+decisions_since="1970-01-01T00:00:00Z"
+if [ -s "$decisions_watermark_file" ]; then
+  candidate_since="$(head -n 1 "$decisions_watermark_file" 2>/dev/null || true)"
+  case "$candidate_since" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z)
+      decisions_since="$candidate_since"
+      ;;
+  esac
+fi
+
+# A trace record's shape is never trusted blindly here. This reads the file
+# directly rather than through `trace.sh read`, deliberately: that command
+# aborts entirely on the first malformed record anywhere in the trace, which
+# would take down this section over a corrupt line from an unrelated kind. A
+# non-JSON line is skipped instead of aborting the read, and every fact field
+# the renderer touches falls back to a placeholder rather than erroring, so a
+# `decision-taken` row missing a field degrades this section instead of the
+# hook.
+decisions_json='[]'
+if [ -s "$trace_file" ]; then
+  decisions_json="$(
+    jq -R -c '
+      try fromjson catch empty
+      | select(type == "object" and .kind == "decision-taken")
+      | {
+          ts: (if (.ts | type) == "string" then .ts else "" end),
+          repo: (if ((.fact // {}).repo | type) == "string"
+                 then .fact.repo else "(repo unknown)" end),
+          ref: (if ((.fact // {}).ref | type) == "string"
+                then .fact.ref else "" end),
+          decision: (if ((.fact // {}).decision | type) == "string"
+                     and (((.fact // {}).decision | length) > 0)
+                     then .fact.decision else "(decision unavailable)" end),
+          reversal: (if ((.fact // {}).reversal | type) == "string"
+                     and (((.fact // {}).reversal | length) > 0)
+                     then .fact.reversal else "reversal not recorded" end),
+          reason: (if (((.narration // {}).reason) | type) == "string"
+                   then .narration.reason else "" end)
+        }
+    ' "$trace_file" 2>/dev/null | jq -s '.' 2>/dev/null
+  )"
+  [ -n "$decisions_json" ] || decisions_json='[]'
+fi
+
+decisions_rows="$(
+  jq -r --arg since "$decisions_since" '
+    [ .[] | select(.ts > $since) ] | sort_by(.ts) | reverse
+    | .[]
+    | (.repo + .ref) as $ref
+    | $ref + "  " + .decision
+      + (if (.reason | length) > 0 then " — " + .reason else "" end)
+      + "  [reversal: " + .reversal + "]"
+  ' <<<"$decisions_json" 2>/dev/null || true
+)"
+
+if [ -n "$decisions_rows" ]; then
+  echo "DECISIONS TAKEN"
+  printf '%s\n' "$decisions_rows"
+else
+  echo "DECISIONS TAKEN: nothing since your last read"
+fi
+
 render_section "DECISIONS WAITING" '["tripwire","decision"]'
 render_section "MOVED SINCE $cursor" '["moved"]'
 render_section "STUCK" '["stuck"]'
@@ -227,4 +300,11 @@ if [ -s "$MANDATE_STATE_FILE" ] && jq -e '
     rm -f "$notice_state"
   fi
 fi
+
+# Advance the decisions watermark only here, once the digest has actually
+# rendered a full pass over the trace. A failed write is a quiet loss of the
+# cursor, never a failed SessionStart; the next render simply re-shows
+# whatever this one would have hidden.
+printf '%s\n' "$digest_now" >"$decisions_watermark_file" 2>/dev/null || true
+
 exit 0

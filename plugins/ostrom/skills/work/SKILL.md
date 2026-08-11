@@ -203,6 +203,30 @@ merged in a while, that is information for the owner, not a reason to merge.
 - Anything learned that changes how the next pass runs belongs in the
   repository — a rule, a spec, or an issue comment.
 
+Filing an issue and closing one are both the builder's own judgment inside its
+boundary, not the principal's, and each is only safe to make unsupervised
+because it is cheap to undo — a filed issue is undone by closing it, a closed
+issue by reopening it. At the moment of either action, append a
+`decision-taken` trace record naming that reversal. Keep it separate from the
+item's `item-worked` record: that one covers what happened to the item, this
+one covers how to undo the action taken on it.
+
+```sh
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/trace.sh" append decision-taken \
+  "$(jq -cn --arg owner "$lease_owner" --arg repo "$repository" \
+    --arg ref "#$item_number" --arg decision "$item_decision" \
+    --arg reversal "$item_reversal" \
+    '{role: "builder", owner: $owner, repo: $repo, ref: $ref,
+      decision: $decision, reversal: $reversal}')" \
+  "$item_decision_narration"
+```
+
+For a filed issue, `$item_decision` is `filed issue` and `$item_reversal` is
+`close <repo>#<new issue number>`. For a closed one, `$item_decision` is
+`closed issue` and `$item_reversal` is `reopen <repo>#<ref>`. Use `{}` for
+`$item_decision_narration` when there is no reasoning beyond the action
+itself.
+
 ## 6. Report and stop
 
 Report briefly, visually, and inline; do not attach a file. Never give a bare
