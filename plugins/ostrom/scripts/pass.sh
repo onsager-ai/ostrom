@@ -56,6 +56,11 @@ LEASE_NAME="$role-pass.lease"
 INNER_LEASE_NAME="$inner_lease_name"
 ID_FILE="$MANDATE_DATA_DIR/$role-pass-id"
 WAKE_FILE="$MANDATE_DATA_DIR/$role-wake-counter"
+# trace.sh keeps this path to itself; it offers no "where" or "watermark"
+# subcommand, so it is duplicated here rather than adding one for a single
+# caller. context.ts's readTrace() duplicates the same path on the doctor
+# side for the same reason.
+TRACE_FILE="$MANDATE_DATA_DIR/sprint.jsonl"
 
 # The wall-clock timeout (systemd's TimeoutStartSec) is the pass's intended
 # bound, because time maps directly to cost. A turn ceiling truncates on an
@@ -165,6 +170,7 @@ pass_started=0
 child_pid=""
 child_spawned=0
 outcome=""
+outcome_reason=""
 start_epoch="$(date +%s)"
 log=""
 
@@ -191,6 +197,36 @@ read_cost() {
     fi
   fi
   printf '%s\n' "$measured_cost"
+}
+
+# The wrapper's own pass-started row (appended below, before the child is
+# spawned) proves only that this process ran; it says nothing about whether
+# the protocol it invoked ever began. work/SKILL.md and gatekeep/SKILL.md
+# step 2 append their own pass-started row, under an independently minted
+# owner, only after the inner session acquires its protocol lease -- so "did
+# the protocol begin" reduces to "did a second pass-started row, not ours,
+# land in the trace after this one". That owner cannot be predicted or
+# matched by name (see release_inner_lease's comment for why), so presence is
+# judged by kind and role prefix alone, scanned only over the lines appended
+# after $trace_watermark -- never the wrapper's own row, which precedes it.
+inner_pass_started() {
+  [ -f "$TRACE_FILE" ] || { printf 'false\n'; return; }
+  tail -n +"$((trace_watermark + 1))" "$TRACE_FILE" 2>/dev/null | jq -Rn \
+    --arg prefix "$role-" \
+    --arg owner "$owner" '
+      reduce inputs as $line
+        (false;
+          . or (
+            ($line | try fromjson catch null) as $event
+            | (($event | type) == "object")
+              and ($event.kind == "pass-started")
+              and ((try ($event.fact.owner) catch null) as $inner_owner
+                | ($inner_owner | type) == "string"
+                  and ($inner_owner | startswith($prefix))
+                  and ($inner_owner != $owner))
+          )
+        )
+    '
 }
 
 # The inner lease (INNER_LEASE_NAME) is acquired by the Claude session this
@@ -278,8 +314,10 @@ finish() {
           --arg outcome "$outcome" \
           --argjson cost_usd "$cost_usd" \
           --argjson duration_seconds "$duration_seconds" \
+          --arg reason "$outcome_reason" \
           '{owner: $owner, outcome: $outcome, cost_usd: $cost_usd,
-            duration_seconds: $duration_seconds}'
+            duration_seconds: $duration_seconds}
+            + (if $reason == "" then {} else {reason: $reason} end)'
       )"
       if ! bash "$SCRIPT_DIR/trace.sh" append pass-ended "$end_fact" '{}' >/dev/null; then
         log_note "could not append pass-ended"
@@ -352,6 +390,13 @@ if ! bash "$SCRIPT_DIR/trace.sh" append pass-started "$start_fact" '{}' >/dev/nu
 fi
 pass_started=1
 
+# Watermark the trace at the line this pass's own row lands on, immediately
+# after writing it and before anything else can append -- everything from
+# here on is either this pass's child or a concurrent pass of some other
+# role, never a race against our own write above.
+trace_watermark="$(wc -l <"$TRACE_FILE" 2>/dev/null | tr -d '[:space:]')"
+[ -n "$trace_watermark" ] || trace_watermark=0
+
 [ -f "$SETTINGS" ] || {
   log_note "$SETTINGS missing"
   outcome=failed
@@ -381,10 +426,43 @@ wait "$child_pid"
 run_status=$?
 child_pid=""
 
-if [ "$run_status" -eq 0 ]; then
-  outcome=completed
+if [ "$(inner_pass_started)" = "true" ]; then
+  # The protocol took ownership; today's exit-code-derived outcome applies
+  # exactly as it did before this pass began telling no-op apart from it.
+  if [ "$run_status" -eq 0 ]; then
+    outcome=completed
+  else
+    outcome=failed
+    log_note "Claude run failed (rc=$run_status); transcript at $log"
+  fi
+elif [ "$run_status" -eq 0 ]; then
+  # claude exited cleanly, but no session-owned pass-started row ever
+  # followed ours: the protocol never began. This is the exact failure #73
+  # exists to surface. "blocked" is the default reason, since this wrapper
+  # cannot read the child's transcript to say more -- but if the inner lease
+  # is currently held by a session that started before this pass did, that
+  # is a knowable, more specific cause: the child found its own protocol
+  # lease already contended and stopped, exactly as its instructions require
+  # (see release_inner_lease's comment for the same started_at test, used
+  # there to decide reclaim rather than to name a reason here).
+  outcome=no-op
+  outcome_reason=blocked
+  inner_status_json="$(
+    MANDATE_LEASE_NAME="$INNER_LEASE_NAME" \
+      bash "$SCRIPT_DIR/lease.sh" status 2>/dev/null
+  )" || inner_status_json=""
+  if [ -n "$inner_status_json" ]; then
+    inner_status_started_at="$(jq -r '.started_at' <<<"$inner_status_json" 2>/dev/null)"
+    case "$inner_status_started_at" in
+      ''|*[!0-9]*) ;;
+      *)
+        [ "$inner_status_started_at" -lt "$start_epoch" ] && outcome_reason=lease-held
+        ;;
+    esac
+  fi
+  log_note "claude exited 0 but the protocol never started (reason=$outcome_reason); recording no-op"
 else
   outcome=failed
-  log_note "Claude run failed (rc=$run_status); transcript at $log"
+  log_note "Claude run failed (rc=$run_status) and the protocol never started; transcript at $log"
 fi
 exit "$run_status"

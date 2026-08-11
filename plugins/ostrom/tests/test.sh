@@ -99,6 +99,15 @@ cat >"$fake_claude" <<'SH'
 if [ -n "${FAKE_CLAUDE_ARGS_FILE:-}" ]; then
   printf '%s\n' "$@" >"$FAKE_CLAUDE_ARGS_FILE"
 fi
+# Real work/SKILL.md and gatekeep/SKILL.md sessions append their own
+# pass-started row, under their own minted owner, once they reach step 2 of
+# the protocol. FAKE_CLAUDE_INNER_OWNER opts a fixture into simulating that;
+# leaving it unset simulates a session that never got that far -- the
+# no-op shape pass.sh must now catch.
+if [ -n "${FAKE_CLAUDE_INNER_OWNER:-}" ]; then
+  bash "$FAKE_CLAUDE_TRACE_SH" append pass-started \
+    "$(printf '{"owner":"%s"}' "$FAKE_CLAUDE_INNER_OWNER")" '{}' >/dev/null
+fi
 case "${FAKE_CLAUDE_MODE:-complete}" in
   complete)
     printf '%s\n' '{"type":"assistant","message":"placeholder"}'
@@ -115,6 +124,7 @@ case "${FAKE_CLAUDE_MODE:-complete}" in
 esac
 SH
 chmod +x "$fake_claude"
+fake_claude_trace_sh="$PLUGIN_ROOT/scripts/trace.sh"
 
 CLAUDE_CONFIG_DIR="$pass_config" CLAUDE_BIN="$fake_claude" \
   FAKE_CLAUDE_MARKER="$fake_marker" \
@@ -141,16 +151,24 @@ CLAUDE_CONFIG_DIR="$pass_config" MANDATE_LEASE_NAME=builder-pass.lease \
 builder_args="$pass_fixture/builder-args"
 CLAUDE_CONFIG_DIR="$pass_config" CLAUDE_BIN="$fake_claude" \
   FAKE_CLAUDE_MARKER="$fake_marker" FAKE_CLAUDE_ARGS_FILE="$builder_args" \
+  FAKE_CLAUDE_INNER_OWNER="builder-inner-session-wake1" \
+  FAKE_CLAUDE_TRACE_SH="$fake_claude_trace_sh" \
   bash "$PLUGIN_ROOT/scripts/pass.sh" builder >/dev/null
 [ ! -e "$pass_config/ostrom/builder-pass.lease" ]
+# The regression test for #73: a pass whose inner session did take ownership
+# -- proven by its own pass-started row landing after the wrapper's -- is
+# still reported completed, never collapsed into no-op just because a
+# second row now exists in the trace.
 jq -s -e '
-  length == 2
-  and map(.kind) == ["pass-started", "pass-ended"]
+  length == 3
+  and map(.kind) == ["pass-started", "pass-started", "pass-ended"]
   and (.[0].fact.owner | test("^builder-[0-9a-f]{8}-wake1$"))
-  and .[1].fact.owner == .[0].fact.owner
-  and .[1].fact.outcome == "completed"
-  and .[1].fact.cost_usd == 1.25
-  and (.[1].fact.duration_seconds | type == "number" and . >= 0)
+  and .[1].fact.owner == "builder-inner-session-wake1"
+  and .[2].fact.owner == .[0].fact.owner
+  and .[2].fact.outcome == "completed"
+  and (.[2].fact | has("reason") | not)
+  and .[2].fact.cost_usd == 1.25
+  and (.[2].fact.duration_seconds | type == "number" and . >= 0)
 ' "$pass_config/ostrom/sprint.jsonl" >/dev/null
 
 # The permission mode is role-scoped, not hardcoded, and neither role may
@@ -165,15 +183,54 @@ jq -s -e '
 
 CLAUDE_CONFIG_DIR="$pass_config" CLAUDE_BIN="$fake_claude" \
   FAKE_CLAUDE_MARKER="$fake_marker" \
+  FAKE_CLAUDE_INNER_OWNER="builder-inner-session-wake2" \
+  FAKE_CLAUDE_TRACE_SH="$fake_claude_trace_sh" \
   bash "$PLUGIN_ROOT/scripts/pass.sh" builder >/dev/null
 jq -s -e '
-  length == 4
-  and .[2].kind == "pass-started"
-  and .[3].kind == "pass-ended"
-  and (.[2].fact.owner | test("^builder-[0-9a-f]{8}-wake2$"))
+  length == 6
+  and .[3].kind == "pass-started"
+  and .[4].kind == "pass-started"
+  and .[5].kind == "pass-ended"
+  and (.[3].fact.owner | test("^builder-[0-9a-f]{8}-wake2$"))
+  and .[4].fact.owner == "builder-inner-session-wake2"
   and (.[0].fact.owner | split("-wake")[0])
-    == (.[2].fact.owner | split("-wake")[0])
-  and .[3].fact.owner == .[2].fact.owner
+    == (.[3].fact.owner | split("-wake")[0])
+  and .[5].fact.owner == .[3].fact.owner
+  and .[5].fact.outcome == "completed"
+' "$pass_config/ostrom/sprint.jsonl" >/dev/null
+
+# A pass whose child exits cleanly but whose inner session never appended its
+# own pass-started row -- the exact shape measured in production, 19 times in
+# a row -- is a no-op, not a completed pass: the wrapper ran, the protocol
+# never took ownership, and that distinction must survive into the trace.
+noop_args="$pass_fixture/noop-args"
+CLAUDE_CONFIG_DIR="$pass_config" CLAUDE_BIN="$fake_claude" \
+  FAKE_CLAUDE_MARKER="$fake_marker" FAKE_CLAUDE_ARGS_FILE="$noop_args" \
+  bash "$PLUGIN_ROOT/scripts/pass.sh" builder >/dev/null
+jq -s -e '
+  length == 8
+  and .[6].kind == "pass-started"
+  and .[7].kind == "pass-ended"
+  and (.[6].fact.owner | test("^builder-[0-9a-f]{8}-wake3$"))
+  and .[7].fact.owner == .[6].fact.owner
+  and .[7].fact.outcome == "no-op"
+  and .[7].fact.reason == "blocked"
+' "$pass_config/ostrom/sprint.jsonl" >/dev/null
+
+# A child that exits non-zero before the inner session ever took ownership is
+# still a failure, not a no-op -- a crash before the protocol starts is not a
+# legitimate skip, and must not borrow no-op's quiet reporting.
+CLAUDE_CONFIG_DIR="$pass_config" CLAUDE_BIN="$fake_claude" \
+  FAKE_CLAUDE_MARKER="$fake_marker" FAKE_CLAUDE_MODE=fail \
+  bash "$PLUGIN_ROOT/scripts/pass.sh" builder >/dev/null 2>&1 || true
+jq -s -e '
+  length == 10
+  and .[8].kind == "pass-started"
+  and .[9].kind == "pass-ended"
+  and (.[8].fact.owner | test("^builder-[0-9a-f]{8}-wake4$"))
+  and .[9].fact.owner == .[8].fact.owner
+  and .[9].fact.outcome == "failed"
+  and (.[9].fact | has("reason") | not)
 ' "$pass_config/ostrom/sprint.jsonl" >/dev/null
 
 gatekeeper_args="$pass_fixture/gatekeeper-args"
@@ -453,6 +510,17 @@ inner_lease_after="$(
 )"
 [ "$inner_lease_after" = "$preexisting_inner_lease" ]
 grep -q 'leaving it to its own owner' "$inner_safe/pass.err"
+
+# The same pre-existing, concurrently-held inner lease that proves reclaim
+# must not touch it also makes the no-op reason knowable: the child found
+# its own protocol lease already contended, so this is "lease-held", not
+# the generic "blocked" a no-op with no diagnosable cause would carry.
+jq -s -e '
+  length == 2
+  and .[1].kind == "pass-ended"
+  and .[1].fact.outcome == "no-op"
+  and .[1].fact.reason == "lease-held"
+' "$inner_safe/ostrom/sprint.jsonl" >/dev/null
 
 CLAUDE_CONFIG_DIR="$inner_safe" MANDATE_LEASE_NAME=builder.lease \
   bash "$PLUGIN_ROOT/scripts/lease.sh" release builder-othersession-wake3

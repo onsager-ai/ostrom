@@ -724,6 +724,7 @@ var ROLE_SKILL = {
   builder: "/ostrom:work",
   gatekeeper: "/ostrom:gatekeep"
 };
+var NOOP_FAULT_THRESHOLD = 3;
 function nowEpoch2(context) {
   const explicit = context.env.MANDATE_NOW_EPOCH;
   if (explicit && /^\d+$/.test(explicit)) return Number(explicit);
@@ -744,9 +745,10 @@ function formatAge(ageSeconds) {
   const minutes = ageMinutes % 60;
   return minutes === 0 ? `${hours}h` : `${hours}h${minutes}m`;
 }
-function lastRolePassEnded(source, role) {
+function recentRolePassEnded(source, role, limit) {
+  const records = [];
   let contentEnd = source.length;
-  while (contentEnd > 0) {
+  while (contentEnd > 0 && records.length < limit) {
     while (contentEnd > 0 && (source[contentEnd - 1] === "\n" || source[contentEnd - 1] === "\r")) {
       contentEnd -= 1;
     }
@@ -764,9 +766,11 @@ function lastRolePassEnded(source, role) {
       continue;
     }
     const owner = record.fact.owner;
-    if (typeof owner === "string" && owner.startsWith(`${role}-`)) return record;
+    if (typeof owner === "string" && owner.startsWith(`${role}-`)) {
+      records.push(record);
+    }
   }
-  return void 0;
+  return records;
 }
 function checkRolePass(context, role) {
   const cadenceHours = CADENCE_HOURS[role];
@@ -788,7 +792,8 @@ function checkRolePass(context, role) {
       remedy: "inspect sprint.jsonl and fix its permissions"
     };
   }
-  const record = lastRolePassEnded(trace.content, role);
+  const recent = recentRolePassEnded(trace.content, role, NOOP_FAULT_THRESHOLD);
+  const record = recent[0];
   if (!record) {
     return {
       status: "WARN",
@@ -809,6 +814,16 @@ function checkRolePass(context, role) {
   }
   const ageSeconds = nowEpoch2(context) - Math.floor(timestampMs / 1e3);
   const age = formatAge(ageSeconds);
+  if (recent.length === NOOP_FAULT_THRESHOLD && recent.every(
+    (candidate) => object(candidate.fact) && candidate.fact.outcome === "no-op"
+  )) {
+    return {
+      status: "FAIL",
+      name: checkName,
+      detail: `${role} loop has produced ${NOOP_FAULT_THRESHOLD} consecutive no-op passes, last ${timestamp} (age ${age})`,
+      remedy: `inspect pass-runs/${role} transcripts; the loop is running but the protocol never takes ownership`
+    };
+  }
   if (ageSeconds > cadenceHours * 60 * 60) {
     return {
       status: "WARN",

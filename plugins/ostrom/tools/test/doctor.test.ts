@@ -524,6 +524,57 @@ describe("doctor golden output", () => {
     );
   });
 
+  it("stays quiet for a single isolated no-op pass", () => {
+    const fixture = baseFixture();
+    writeFileSync(
+      join(fixture.configDir, "ostrom", "sprint.jsonl"),
+      '{"ts":"2026-08-01T00:00:00Z","kind":"pass-ended","fact":{"owner":"builder-fixture-wake1","outcome":"no-op","reason":"blocked"}}\n' +
+        '{"ts":"2026-08-01T00:00:00Z","kind":"pass-ended","fact":{"owner":"gatekeeper-fixture-wake1","outcome":"completed"}}\n',
+    );
+
+    // One contended lease reads as nominal: same "current" wording as any
+    // other pass-ended, with no mention of the no-op it happened to be.
+    expect(run(fixture)).toContain(
+      "OK|builder-pass|builder pass current, last 2026-08-01T00:00:00Z (age 0m; 3h cadence)|\n",
+    );
+  });
+
+  it("reports a fault after three consecutive no-op passes for a role", () => {
+    const fixture = baseFixture();
+    writeFileSync(
+      join(fixture.configDir, "ostrom", "sprint.jsonl"),
+      '{"ts":"2026-07-31T22:00:00Z","kind":"pass-ended","fact":{"owner":"builder-fixture-wake1","outcome":"no-op","reason":"blocked"}}\n' +
+        '{"ts":"2026-07-31T23:00:00Z","kind":"pass-ended","fact":{"owner":"builder-fixture-wake2","outcome":"no-op","reason":"blocked"}}\n' +
+        '{"ts":"2026-08-01T00:00:00Z","kind":"pass-ended","fact":{"owner":"builder-fixture-wake3","outcome":"no-op","reason":"blocked"}}\n' +
+        '{"ts":"2026-08-01T00:00:00Z","kind":"pass-ended","fact":{"owner":"gatekeeper-fixture-wake1","outcome":"completed"}}\n',
+    );
+
+    // Three in a row is a fault even though the last one is well inside the
+    // 3h cadence -- the loop is running on schedule and producing nothing,
+    // which the age/cadence check alone cannot see.
+    expect(run(fixture)).toContain(
+      "FAIL|builder-pass|builder loop has produced 3 consecutive no-op passes, last 2026-08-01T00:00:00Z (age 0m)|inspect pass-runs/builder transcripts; the loop is running but the protocol never takes ownership\n",
+    );
+  });
+
+  it("clears the no-op fault the moment a pass completes again", () => {
+    const fixture = baseFixture();
+    writeFileSync(
+      join(fixture.configDir, "ostrom", "sprint.jsonl"),
+      '{"ts":"2026-07-31T21:00:00Z","kind":"pass-ended","fact":{"owner":"builder-fixture-wake1","outcome":"no-op","reason":"blocked"}}\n' +
+        '{"ts":"2026-07-31T22:00:00Z","kind":"pass-ended","fact":{"owner":"builder-fixture-wake2","outcome":"no-op","reason":"blocked"}}\n' +
+        '{"ts":"2026-07-31T23:00:00Z","kind":"pass-ended","fact":{"owner":"builder-fixture-wake3","outcome":"no-op","reason":"blocked"}}\n' +
+        '{"ts":"2026-08-01T00:00:00Z","kind":"pass-ended","fact":{"owner":"builder-fixture-wake4","outcome":"completed"}}\n',
+    );
+
+    // The streak the fault check counts is the trailing run ending at the
+    // most recent pass, not "any three no-ops in history" -- a working pass
+    // breaks it immediately.
+    expect(run(fixture)).toContain(
+      "OK|builder-pass|builder pass current, last 2026-08-01T00:00:00Z (age 0m; 3h cadence)|\n",
+    );
+  });
+
   it("uses the last trace record before trailing newlines", () => {
     const fixture = baseFixture();
     writeFileSync(
