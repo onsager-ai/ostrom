@@ -77,29 +77,30 @@ builder work.
 
 ## 4. Authenticate per repository as the gatekeeper App
 
-At the start of every iteration, before any `gh` call, discard ambient GitHub
-credentials. Then, immediately before calling `gh` for each roster repository,
-mint a fresh token for that repository:
+`gatekeeper.settings.json` sets `GH_TOKEN` and `GITHUB_TOKEN` to empty, so
+there is no ambient credential here to discard or fall back to by accident.
+Never call `gh` directly, and never run a script that itself calls `gh`
+(such as `gate.sh`) directly either. A session's Bash tool statically
+rejects command substitution before permission matching, so this step
+cannot capture `app-token.sh`'s output into a variable
+(`token="$(app-token.sh ...)"`) the way an interactive shell would — no
+allow rule can fix that rejection, because it never reaches allow-rule
+matching in the first place. Route every `gh` call for a roster repository
+through `gh-as.sh`, naming the role and the repository ahead of the command
+to run:
 
 ```sh
-set +x
-unset GH_TOKEN GITHUB_TOKEN
-if ! gatekeeper_token="$(
-  bash "${CLAUDE_PLUGIN_ROOT}/scripts/app-token.sh" gatekeeper "$repository"
-)" ||
-  [ -z "$gatekeeper_token" ]; then
-  unset gatekeeper_token
-  echo "gatekeep: GitHub App authentication failed; stopping" >&2
-  exit 1
-fi
-export GH_TOKEN="$gatekeeper_token"
-unset gatekeeper_token
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/gh-as.sh" gatekeeper "$repository" \
+  gh pr list --repo "$repository" --state open --limit 100 --json number
 ```
 
-Keep that `GH_TOKEN` only for `gh` calls against that repository. Unset it
-before moving to another repository; do not replace it with another credential,
-and keep shell tracing disabled while it is present. `/ostrom:merge` mints again for
-each candidate rather than reusing the enumeration token.
+`gh-as.sh` mints a fresh installation token for that repository inside its
+own process, exports it only there, and `exec`s the given command — the
+token never enters this session's shell state, is never assigned to a
+variable here, and is never written to disk. Exit `111` means `gh-as.sh`
+itself could not authenticate and the given command never ran at all; report
+that and stop this iteration rather than retry with an ambient credential.
+Any other exit code is the given command's own, unchanged.
 
 **A gatekeeper session that cannot mint an App token must stop, not continue as the principal.**
 
@@ -108,9 +109,10 @@ failure the App exists to remove.
 
 ## 5. Enumerate every open pull request
 
-Poll GitHub for all open pull requests in every roster repository, using only
-the token minted for that repository, and unset `GH_TOKEN` when its pagination
-is complete. Paginate until there are no more results. Do not filter candidates through mandate
+Poll GitHub for all open pull requests in every roster repository, issuing
+every call through `gh-as.sh` as in step 4. Each invocation mints and uses
+its own token and exits with it, so there is no persisted `GH_TOKEN` to
+unset between repositories or between pages. Paginate until there are no more results. Do not filter candidates through mandate
 selectors, the queue, prior gate verdicts, draft state, labels, or conclusions
 from another pull request. An iteration covers the whole roster because the
 artifact gate evaluates each pull request independently.
