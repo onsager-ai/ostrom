@@ -1163,6 +1163,18 @@ JSON
 [{"number":30,"title":"$uncat_title","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/30"}]
 JSON
       ;;
+    example-org/ci-drift-repo)
+      if [ "${FAKE_GH_ISSUE_MODE:-none}" = "urgent" ]; then
+        echo '[{"number":1,"title":"urgent: page the on-call","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/1"}]'
+      else
+        echo '[]'
+      fi
+      ;;
+    example-org/landed-fix-repo)
+      cat <<'JSON'
+[{"number":301,"title":"bug: widget throws on empty input","body":"","labels":[{"name":"bug"}],"createdAt":"2026-07-01T00:00:00Z","updatedAt":"2026-07-01T00:00:00Z","url":"https://example.invalid/issues/301"}]
+JSON
+      ;;
     *) echo '[]' ;;
   esac
   exit 0
@@ -1200,6 +1212,40 @@ JSON
 fi
 if [ "$1 $2" = "repo view" ]; then
   echo '{"defaultBranchRef":{"name":"main"}}'
+  exit 0
+fi
+if [ "$1 $2" = "run list" ]; then
+  case "$repo" in
+    example-org/ci-drift-repo)
+      case "${FAKE_GH_RUN_MODE:-red}" in
+        red)
+          echo '[{"databaseId":9001,"workflowDatabaseId":501,"workflowName":"Acceptance","name":"Acceptance","headSha":"cafefeed00000000","conclusion":"failure","status":"completed","createdAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/runs/9001"}]'
+          ;;
+        red-then-green)
+          echo '[{"databaseId":9002,"workflowDatabaseId":501,"workflowName":"Acceptance","name":"Acceptance","headSha":"1111111100000000","conclusion":"success","status":"completed","createdAt":"2026-07-31T00:00:00Z","url":"https://example.invalid/runs/9002"},{"databaseId":9001,"workflowDatabaseId":501,"workflowName":"Acceptance","name":"Acceptance","headSha":"cafefeed00000000","conclusion":"failure","status":"completed","createdAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/runs/9001"}]'
+          ;;
+        no-workflows) echo '[]' ;;
+        *) echo '[]' ;;
+      esac
+      ;;
+    *) echo '[]' ;;
+  esac
+  exit 0
+fi
+if [ "$1" = "api" ]; then
+  case "$2" in
+    repos/example-org/landed-fix-repo/commits)
+      # Emulates the shape `--jq` would already have reduced the raw GitHub
+      # commit payload to: {sha, message, date}.
+      cat <<'JSON'
+[
+  {"sha":"95d5ccc0deadbeef00000000000000000000000","message":"#301 GET /widgets 500: guard against nil pointer","date":"2026-07-05T00:00:00Z"},
+  {"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","message":"unrelated change, predates the issue, also says #301","date":"2026-06-01T00:00:00Z"}
+]
+JSON
+      ;;
+    *) echo '[]' ;;
+  esac
   exit 0
 fi
 exit 1
@@ -1360,6 +1406,136 @@ jq -s -e '
   and .[0].id == "example-org/large-body#1"
   and .[0].blocked_by == ["example-org/large-body#123"]
 ' "$large_body/config/ostrom/queue.jsonl" >/dev/null
+
+# #78: the sweep reads the default branch's own CI, not only open PRs'
+# statusCheckRollup, and emits a "drift" row for it — the same kind and
+# digest/troubled-project machinery a failing PR's CI already uses.
+ci_drift="$fixture/ci-drift"
+mkdir -p "$ci_drift/config/ostrom" "$ci_drift/repo"
+cat >"$ci_drift/config/ostrom/mandates.yaml" <<'YAML'
+bounce_all:
+  - title:*urgent*
+projects:
+  - repo: example-org/ci-drift-repo
+    delegated: []
+    excluded: []
+    reserved: []
+    default: excluded
+    paused: false
+    bounce: []
+YAML
+
+run_ci_drift_sweep() {
+  (
+    cd "$ci_drift/repo"
+    PATH="$fixture/bin:$PATH" \
+      CLAUDE_CONFIG_DIR="$ci_drift/config" \
+      CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+      MANDATE_SWEEP_TIME="2026-08-01T00:00:00Z" \
+      FAKE_GH_RUN_MODE="${FAKE_GH_RUN_MODE:-red}" \
+      FAKE_GH_ISSUE_MODE="${FAKE_GH_ISSUE_MODE:-none}" \
+      bash "$PLUGIN_ROOT/scripts/sweep.sh" >/dev/null
+  )
+}
+
+# A red default branch with no other activity: exactly one drift row, and it
+# carries the workflow name, run id, head sha, and how long it has been red
+# rather than making the builder re-derive any of that.
+FAKE_GH_RUN_MODE=red run_ci_drift_sweep
+jq -s -e '
+  length == 1
+  and .[0].id == "example-org/ci-drift-repo#501"
+  and .[0].kind == "drift"
+  and .[0].state == "pending"
+  and (.[0].mandate.reason | contains("Acceptance"))
+  and (.[0].mandate.reason | contains("run 9001"))
+  and (.[0].mandate.reason | contains("cafefeed"))
+  and (.[0].mandate.reason | contains("red since 2026-07-30T00:00:00Z"))
+' "$ci_drift/config/ostrom/queue.jsonl" >/dev/null
+
+# A default branch that failed and was then fixed by a later run must not
+# read as drift: the row above must disappear, not linger from the prior
+# sweep.
+FAKE_GH_RUN_MODE=red-then-green run_ci_drift_sweep
+[ "$(jq -s 'length' "$ci_drift/config/ostrom/queue.jsonl")" -eq 0 ]
+
+# A repo with no workflow runs at all produces no row and no error — the
+# absence of CI is not itself drift.
+FAKE_GH_RUN_MODE=no-workflows run_ci_drift_sweep
+[ "$(jq -s 'length' "$ci_drift/config/ostrom/queue.jsonl")" -eq 0 ]
+
+# A red default branch alongside an unrelated troubled row: both surface: the
+# drift row is not masked by, nor does it mask, the tripwire.
+FAKE_GH_RUN_MODE=red FAKE_GH_ISSUE_MODE=urgent run_ci_drift_sweep
+jq -s -e '
+  length == 2
+  and any(.[]; .kind == "drift" and .id == "example-org/ci-drift-repo#501")
+  and any(.[]; .kind == "tripwire" and .id == "example-org/ci-drift-repo#1")
+' "$ci_drift/config/ostrom/queue.jsonl" >/dev/null
+
+# The digest already treats any "drift"-kind row as troubling a project; a
+# red default branch reaches that machinery with no rendering changes.
+ci_drift_digest="$(
+  cd "$ci_drift/repo"
+  PATH="$fixture/bin:$PATH" CLAUDE_CONFIG_DIR="$ci_drift/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    MANDATE_NOW_EPOCH=1785542400 MANDATE_TODAY=2026-08-01 \
+    bash "$PLUGIN_ROOT/hooks/render-digest.sh"
+)"
+jq -r '.systemMessage' <<<"$ci_drift_digest" | grep -q '^0 projects nominal$'
+
+# #77: an issue about to read (or already reading) "stuck" gets a lead when a
+# default-branch commit references it by bare number after it was opened —
+# never a verdict, and never on state or kind.
+landed_fix="$fixture/landed-fix"
+mkdir -p "$landed_fix/config/ostrom" "$landed_fix/repo"
+cat >"$landed_fix/config/ostrom/mandates.yaml" <<'YAML'
+stuck_after_days: 1
+bounce_all: []
+projects:
+  - repo: example-org/landed-fix-repo
+    delegated:
+      - label:bug
+    excluded: []
+    reserved: []
+    default: unclassified
+    paused: false
+    bounce: []
+YAML
+(
+  cd "$landed_fix/repo"
+  PATH="$fixture/bin:$PATH" \
+    CLAUDE_CONFIG_DIR="$landed_fix/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    MANDATE_SWEEP_TIME="2026-08-01T00:00:00Z" \
+    bash "$PLUGIN_ROOT/scripts/sweep.sh" >/dev/null
+)
+# Baseline sweep: not yet stuck, no lead expected.
+jq -s -e 'length == 0' "$landed_fix/config/ostrom/queue.jsonl" >/dev/null
+
+(
+  cd "$landed_fix/repo"
+  PATH="$fixture/bin:$PATH" \
+    CLAUDE_CONFIG_DIR="$landed_fix/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    MANDATE_SWEEP_TIME="2026-08-03T00:00:00Z" \
+    bash "$PLUGIN_ROOT/scripts/sweep.sh" >/dev/null
+)
+# Now stuck. The lead names the earliest commit that both postdates the
+# issue's opened date and references it without a closing keyword — the
+# older commit in the stub predates the issue and must not be offered even
+# though it also contains a bare "#301". state and kind are untouched: this
+# is a pointer for the builder to verify, not an auto-close.
+jq -s -e '
+  length == 1
+  and .[0].id == "example-org/landed-fix-repo#301"
+  and .[0].kind == "stuck"
+  and .[0].state == "pending"
+  and (.[0].mandate.reason | endswith(
+      "; possibly landed: 95d5ccc0 references #301 without a closing keyword"
+    ))
+  and (.[0].mandate.reason | contains("aaaaaaaa") | not)
+' "$landed_fix/config/ostrom/queue.jsonl" >/dev/null
 
 # The first sweep is a baseline. Only reserved, tripwire, and CI-failing
 # carve-outs queue; the paused project's issue tripwire still fires. #13 is
