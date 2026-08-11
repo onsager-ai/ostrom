@@ -1284,6 +1284,149 @@ grep -Eq \
   "$app_token_fixture/stale-id.stderr" \
   "$app_token_curl_log"
 
+# gh-as.sh is the only sanctioned way a session-issued command mints and
+# uses a role token: a session's Bash tool cannot itself capture
+# app-token.sh's stdout into a variable, so gh-as.sh does that internally and
+# execs the given command with the token exported only in its own process.
+# These tests are the regression guard for #93's central property: the token
+# must never appear in anything gh-as.sh itself writes, while still actually
+# reaching the wrapped command's environment.
+gh_as_fixture="$fixture/gh-as"
+mkdir -p "$gh_as_fixture/bin" "$gh_as_fixture/config/ostrom"
+gh_as_key="$gh_as_fixture/gatekeeper-placeholder.pem"
+: >"$gh_as_key"
+cat >"$gh_as_fixture/config/ostrom/secrets.yaml" <<YAML
+gatekeeper:
+  app_id: $$
+  private_key_path: $gh_as_key
+YAML
+
+# A fake gh that behaves like the real one: it never echoes GH_TOKEN or
+# GITHUB_TOKEN to its own stdout or stderr. It records what it actually
+# received on a side channel instead, so the test can confirm the token was
+# delivered without trusting output a real `gh` would never produce either.
+# `exit-code <n>` lets a test control the wrapped command's own exit status,
+# to prove gh-as.sh passes it through unchanged.
+cat >"$gh_as_fixture/bin/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+: >"$GH_AS_TEST_SEEN_FILE"
+printf '%s\n' "${GH_TOKEN:-}" >>"$GH_AS_TEST_SEEN_FILE"
+printf '%s\n' "${GITHUB_TOKEN:-}" >>"$GH_AS_TEST_SEEN_FILE"
+printf 'gh-as-test: called with %s\n' "$*"
+if [ "${1:-}" = "exit-code" ]; then
+  exit "$2"
+fi
+EOF
+chmod +x "$gh_as_fixture/bin/gh"
+
+# Success: the token reaches the wrapped command's environment, but never
+# gh-as.sh's own stdout or stderr, and its exit code is the wrapped
+# command's own, unchanged.
+gh_as_seen="$gh_as_fixture/token-seen"
+gh_as_stdout="$gh_as_fixture/success.stdout"
+gh_as_stderr="$gh_as_fixture/success.stderr"
+rm -f "$gh_as_seen" "$app_token_curl_log"
+PATH="$gh_as_fixture/bin:$app_token_fixture/bin:$PATH" \
+  GH_TOKEN="" \
+  GITHUB_TOKEN="" \
+  FAKE_CURL_MODE=success \
+  FAKE_CURL_CALL_LOG="$app_token_curl_log" \
+  GH_AS_TEST_SEEN_FILE="$gh_as_seen" \
+  CLAUDE_CONFIG_DIR="$gh_as_fixture/config" \
+  CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+  bash "$PLUGIN_ROOT/scripts/gh-as.sh" gatekeeper \
+    placeholder-owner/placeholder-repo \
+    gh pr list --repo placeholder-owner/placeholder-repo \
+    >"$gh_as_stdout" 2>"$gh_as_stderr"
+gh_as_status=$?
+[ "$gh_as_status" -eq 0 ]
+grep -Fxq 'stub-installation-token' <(sed -n '1p' "$gh_as_seen")
+grep -Fxq 'stub-installation-token' <(sed -n '2p' "$gh_as_seen")
+grep -Fq 'gh-as-test: called with pr list --repo placeholder-owner/placeholder-repo' \
+  "$gh_as_stdout"
+[ ! -s "$gh_as_stderr" ]
+! grep -q 'stub-installation-token' "$gh_as_stdout" "$gh_as_stderr"
+
+# gh-as.sh's own exit-111 space and the wrapped command's exit codes stay
+# distinguishable: a wrapped command that itself fails passes its own code
+# through unchanged, never 111.
+gh_as_wrapped_fail_stdout="$gh_as_fixture/wrapped-fail.stdout"
+gh_as_wrapped_fail_stderr="$gh_as_fixture/wrapped-fail.stderr"
+rm -f "$gh_as_seen"
+set +e
+PATH="$gh_as_fixture/bin:$app_token_fixture/bin:$PATH" \
+  GH_TOKEN="" \
+  GITHUB_TOKEN="" \
+  FAKE_CURL_MODE=success \
+  GH_AS_TEST_SEEN_FILE="$gh_as_seen" \
+  CLAUDE_CONFIG_DIR="$gh_as_fixture/config" \
+  CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+  bash "$PLUGIN_ROOT/scripts/gh-as.sh" gatekeeper \
+    placeholder-owner/placeholder-repo \
+    gh exit-code 7 \
+    >"$gh_as_wrapped_fail_stdout" 2>"$gh_as_wrapped_fail_stderr"
+gh_as_wrapped_fail_status=$?
+set -e
+[ "$gh_as_wrapped_fail_status" -eq 7 ]
+[ -s "$gh_as_seen" ]
+! grep -q 'stub-installation-token' \
+  "$gh_as_wrapped_fail_stdout" "$gh_as_wrapped_fail_stderr"
+
+# Failure: minting fails closed (no secrets configured), the wrapped command
+# never runs at all, and an ambient credential already present in the
+# session's own environment is neither used nor leaked into the failure
+# output. Exit 111 is reserved for exactly this path.
+gh_as_no_secrets="$gh_as_fixture/no-secrets"
+mkdir -p "$gh_as_no_secrets/ostrom"
+gh_as_auth_fail_stdout="$gh_as_fixture/auth-fail.stdout"
+gh_as_auth_fail_stderr="$gh_as_fixture/auth-fail.stderr"
+rm -f "$gh_as_seen"
+set +e
+PATH="$gh_as_fixture/bin:$app_token_fixture/bin:$PATH" \
+  GH_TOKEN="ambient-principal-value" \
+  GITHUB_TOKEN="ambient-principal-value" \
+  GH_AS_TEST_SEEN_FILE="$gh_as_seen" \
+  CLAUDE_CONFIG_DIR="$gh_as_no_secrets" \
+  CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+  bash "$PLUGIN_ROOT/scripts/gh-as.sh" gatekeeper \
+    placeholder-owner/placeholder-repo \
+    gh pr list --repo placeholder-owner/placeholder-repo \
+    >"$gh_as_auth_fail_stdout" 2>"$gh_as_auth_fail_stderr"
+gh_as_auth_fail_status=$?
+set -e
+[ "$gh_as_auth_fail_status" -eq 111 ]
+[ ! -s "$gh_as_auth_fail_stdout" ]
+[ ! -e "$gh_as_seen" ]
+grep -Fq 'gh-as: could not mint a gatekeeper token for placeholder-owner/placeholder-repo' \
+  "$gh_as_auth_fail_stderr"
+! grep -q 'ambient-principal-value' \
+  "$gh_as_auth_fail_stdout" "$gh_as_auth_fail_stderr"
+! grep -q 'stub-installation-token' \
+  "$gh_as_auth_fail_stdout" "$gh_as_auth_fail_stderr"
+
+# Role scoping holds through the wrapper: a builder-scoped call against a
+# config with no builder block fails the same way app-token.sh itself would,
+# rather than silently reaching the gatekeeper's key.
+gh_as_role_stdout="$gh_as_fixture/wrong-role.stdout"
+gh_as_role_stderr="$gh_as_fixture/wrong-role.stderr"
+set +e
+PATH="$gh_as_fixture/bin:$app_token_fixture/bin:$PATH" \
+  GH_TOKEN="" \
+  GITHUB_TOKEN="" \
+  FAKE_CURL_MODE=success \
+  CLAUDE_CONFIG_DIR="$gh_as_fixture/config" \
+  CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+  bash "$PLUGIN_ROOT/scripts/gh-as.sh" builder \
+    placeholder-owner/placeholder-repo \
+    gh pr list --repo placeholder-owner/placeholder-repo \
+    >"$gh_as_role_stdout" 2>"$gh_as_role_stderr"
+gh_as_role_status=$?
+set -e
+[ "$gh_as_role_status" -eq 111 ]
+[ ! -s "$gh_as_role_stdout" ]
+grep -Fq 'builder credentials are not configured' "$gh_as_role_stderr"
+
 cat >"$fixture/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
