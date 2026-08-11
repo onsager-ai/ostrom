@@ -101,6 +101,13 @@ repository only` or `just tripwires`. Otherwise take items in this order:
 your own pull requests → delegated work**, oldest first. An approved
 tripwire is no longer a boundary; it belongs in the delegated tier.
 
+Within CI drift, a red **default branch** outranks a red pull request. A broken
+`main` invalidates every pull request built on it, so fixing a PR's checks
+first can mean debugging a failure that was never that PR's. The queue could
+not express this until the sweep learned to read default-branch runs at all — a
+red `main` went unseen for two and a half days because CI state was only ever
+read from open pull requests.
+
 ## 4. Work each item
 
 **Verify before acting.** Check the named file, symbol, or command yourself. A
