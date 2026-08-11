@@ -163,6 +163,7 @@ fi
 lease_acquired=1
 pass_started=0
 child_pid=""
+child_spawned=0
 outcome=""
 start_epoch="$(date +%s)"
 log=""
@@ -208,7 +209,22 @@ read_cost() {
 # goes through lease.sh, using the owner string read off the held lease, so
 # lease.sh's own owner check still applies; this never deletes the lease
 # file directly and never forces past that check.
+#
+# The timestamp test alone is not sufficient, because finish() also runs on
+# early-exit paths -- the pass-started trace append failing, $SETTINGS
+# missing, $CLAUDE_BIN not executable -- where this pass never reached the
+# point of spawning a child at all. On those paths there is no child of ours
+# that could hold the inner lease, so any lease found there, however fresh
+# its started_at, belongs to a concurrent interactive session and must be
+# left alone. Reclamation therefore requires both proofs together: a child
+# spawned by this pass, and a held lease that started at or after this pass
+# began.
 release_inner_lease() {
+  if [ "$child_spawned" -eq 0 ]; then
+    log_note "this pass never spawned a child; any held inner lease $INNER_LEASE_NAME cannot be ours, leaving it alone"
+    return 0
+  fi
+
   inner_lease_json="$(
     MANDATE_LEASE_NAME="$INNER_LEASE_NAME" \
       bash "$SCRIPT_DIR/lease.sh" status 2>/dev/null
@@ -360,6 +376,7 @@ log="$RUN_DIR/$stamp-$owner.jsonl"
   --max-turns "$MAX_TURNS" \
   "$prompt" >"$log" 2>&1 &
 child_pid=$!
+child_spawned=1
 wait "$child_pid"
 run_status=$?
 child_pid=""
