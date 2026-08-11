@@ -69,6 +69,20 @@ TRACE_FILE="$MANDATE_DATA_DIR/sprint.jsonl"
 # need.
 MAX_TURNS=200
 
+# Total measured spend, across every role, that this pass's own UTC day may
+# reach before further passes stand down for the rest of it. This is a
+# budget for the system, not per role -- one role staying under it while
+# another burns through it is still an unbounded day. MANDATE_DAILY_CAP_USD
+# overrides the default for tuning without editing this script; anything
+# that is not a plain number (unset, empty, typo'd) falls back to the
+# default rather than leaving the loops uncapped on a bad override.
+DAILY_CAP_USD=50
+if [ -n "${MANDATE_DAILY_CAP_USD:-}" ]; then
+  if parsed_cap="$(jq -n --arg v "$MANDATE_DAILY_CAP_USD" '$v | tonumber' 2>/dev/null)"; then
+    DAILY_CAP_USD="$parsed_cap"
+  fi
+fi
+
 log_note() {
   echo "ostrom $role pass: $*" >&2
 }
@@ -197,6 +211,34 @@ read_cost() {
     fi
   fi
   printf '%s\n' "$measured_cost"
+}
+
+# Sum cost_usd out of every pass-ended row (any role) whose ts falls on the
+# given UTC day (a plain YYYY-MM-DD prefix match against the ISO-8601 ts
+# trace.sh always writes). A line that fails to parse as JSON, or whose
+# fact.cost_usd is missing or not a number, contributes 0 rather than
+# aborting the reduce: a pass whose cost was never measured is a gap in the
+# record, and a cap that refuses to run because one malformed row exists
+# would be a worse failure than a slightly under-counted day.
+daily_spend_usd() {
+  spend_day="$1"
+  [ -f "$TRACE_FILE" ] || { printf '0\n'; return; }
+  jq -Rn --arg day "$spend_day" '
+    reduce inputs as $line
+      (0;
+        ($line | try fromjson catch null) as $event
+        | if (($event | type) == "object")
+            and ($event.kind == "pass-ended")
+            and (($event.ts | type) == "string")
+            and ($event.ts | startswith($day))
+          then . + (
+            ($event.fact.cost_usd?) as $cost
+            | if ($cost | type) == "number" then $cost else 0 end
+          )
+          else .
+          end
+      )
+  ' "$TRACE_FILE"
 }
 
 # The wrapper's own pass-started row (appended below, before the child is
@@ -407,6 +449,33 @@ trace_watermark="$(wc -l <"$TRACE_FILE" 2>/dev/null | tr -d '[:space:]')"
   outcome=failed
   exit 1
 }
+
+# The daily spend cap sits here, after both leases are already accounted for
+# and before the one action that actually costs money: spawning the child.
+# A capped pass exits through the same finish() path as the SETTINGS and
+# CLAUDE_BIN checks just above -- $lease_acquired is 1, $pass_started is 1 --
+# so it releases the outer lease and never spawns anything to hold the inner
+# one either way; no separate cleanup is needed to keep this pass lease-free.
+#
+# This deliberately never touches $ARM_FILE. That file is the principal's
+# kill switch -- the one control surface they use to start and stop the
+# loops -- and a cap that disarmed the loops to enforce a budget would take
+# that control surface away in the name of protecting it. Standing down for
+# the rest of the UTC day is self-clearing at midnight and leaves $ARM_FILE
+# meaning exactly what it meant before this cap existed. Do not "simplify"
+# this into a disarm.
+now_epoch="${MANDATE_NOW_EPOCH:-$(date +%s)}"
+case "$now_epoch" in
+  ''|*[!0-9]*) now_epoch="$(date +%s)" ;;
+esac
+today="$(date -u -d "@$now_epoch" +%Y-%m-%d)"
+daily_total_usd="$(daily_spend_usd "$today")"
+if [ "$(jq -n --argjson total "$daily_total_usd" --argjson cap "$DAILY_CAP_USD" '$total >= $cap')" = true ]; then
+  log_note "daily spend cap reached: \$$daily_total_usd of \$$DAILY_CAP_USD spent today ($today UTC, all roles); skipping this pass"
+  outcome=no-op
+  outcome_reason=daily-cap
+  exit 0
+fi
 
 mkdir -p "$RUN_DIR"
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
