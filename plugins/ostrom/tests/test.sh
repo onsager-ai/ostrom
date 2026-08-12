@@ -199,6 +199,38 @@ jq -s -e '
   and (.[2].fact.duration_seconds | type == "number" and . >= 0)
 ' "$pass_config/ostrom/sprint.jsonl" >/dev/null
 
+# #99 (production path): the rest of this suite exports MANDATE_NOW_EPOCH
+# globally (above) so every simulated day is deterministic, so this fixture
+# gets its own config dir and explicitly unsets it for one call -- the one
+# way to exercise what a real deployment does, where no caller ever sets
+# MANDATE_NOW_EPOCH at all. pass.sh must keep stamping the pass-started/
+# pass-ended rows it writes about its own pass with the real wall clock
+# exactly as before this fix, so trace.sh's own real-UTC default keeps doing
+# the stamping and production behaviour is unchanged.
+pass_realclock="$fixture/pass-realclock"
+pass_realclock_config="$pass_realclock/config"
+mkdir -p "$pass_realclock_config/ostrom/roles"
+printf '{}\n' >"$pass_realclock_config/ostrom/roles/builder.settings.json"
+: >"$pass_realclock_config/ostrom/loop-armed"
+# Read the real date on both sides of the run and accept either, so a pass
+# that straddles UTC midnight does not make this assertion flake -- the
+# claim is "the real clock, not the simulated day", not "this exact date".
+real_today_before="$(date -u +%Y-%m-%d)"
+env -u MANDATE_NOW_EPOCH \
+  CLAUDE_CONFIG_DIR="$pass_realclock_config" CLAUDE_BIN="$fake_claude" \
+  FAKE_CLAUDE_INNER_OWNER="builder-inner-realclock-wake1" \
+  FAKE_CLAUDE_TRACE_SH="$fake_claude_trace_sh" \
+  bash "$PLUGIN_ROOT/scripts/pass.sh" builder >/dev/null
+real_today_after="$(date -u +%Y-%m-%d)"
+jq -s -e \
+  --arg before "$real_today_before" \
+  --arg after "$real_today_after" '
+  def on_a_real_day: (startswith($before) or startswith($after));
+  length == 3
+  and (.[0].ts | on_a_real_day)
+  and (.[2].ts | on_a_real_day)
+' "$pass_realclock_config/ostrom/sprint.jsonl" >/dev/null
+
 # The permission mode is role-scoped, not hardcoded, and neither role may
 # ever be handed the invalid "default" value.
 [ "$(grep -A1 '^--permission-mode$' "$builder_args" | tail -n1)" = auto ]
@@ -651,6 +683,20 @@ jq -s -e '
   and .[6].kind == "pass-ended"
   and .[6].fact.outcome == "completed"
   and .[6].fact.cost_usd == 1.25
+' "$cap_trace" >/dev/null
+
+# #99: pass.sh derives "today" from MANDATE_NOW_EPOCH (the simulated day
+# above) to sum the cap against, but before this fix it appended its own
+# pass-started/pass-ended rows with no MANDATE_TRACE_TIME, so trace.sh
+# stamped them with the real wall clock instead -- the two clocks agreed
+# only by coincidence, while the real date happened to match the fixture's
+# simulated day. This is the regression test that would have caught it: the
+# wrapper's own two rows from the run just above must both carry a ts on the
+# simulated day (2026-08-11), never on whatever day the machine clock
+# actually reads.
+jq -s -e '
+  (.[4].ts | startswith("2026-08-11"))
+  and (.[6].ts | startswith("2026-08-11"))
 ' "$cap_trace" >/dev/null
 
 # Today's well-formed total is now 10 + 1.25 = 11.25. MANDATE_DAILY_CAP_USD

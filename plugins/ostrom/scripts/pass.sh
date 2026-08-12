@@ -83,6 +83,35 @@ if [ -n "${MANDATE_DAILY_CAP_USD:-}" ]; then
   fi
 fi
 
+# The pass-started and pass-ended rows this script appends about its own
+# pass (below, and in finish()) must be stamped from the same clock the
+# daily cap sums against further down: MANDATE_NOW_EPOCH, when a test
+# harness sets it, simulates "today" for the cap check, but trace.sh's own
+# default falls back to the real wall clock -- so a row written here without
+# an explicit stamp would silently disagree with the day this script itself
+# believes it is. Derive it once, in trace.sh's own timestamp shape.
+#
+# An explicit MANDATE_TRACE_TIME from the caller always wins: it is a more
+# specific instruction than the epoch this script derives its own stamp
+# from. When MANDATE_NOW_EPOCH is unset (production, always), this stays
+# empty and both trace.sh calls fall back to their own real-UTC default
+# exactly as before this fix.
+#
+# This is deliberately kept local to the two `trace.sh append` calls this
+# script makes about its own pass-started/pass-ended rows, passed as a
+# same-command prefix rather than exported: the child spawned below inherits
+# this process's real environment, not this derived value, so its own trace
+# rows (about its own work, not this wrapper's) are unaffected.
+pass_trace_time="${MANDATE_TRACE_TIME:-}"
+if [ -z "$pass_trace_time" ] && [ -n "${MANDATE_NOW_EPOCH:-}" ]; then
+  case "$MANDATE_NOW_EPOCH" in
+    ''|*[!0-9]*) ;;
+    *)
+      pass_trace_time="$(date -u -d "@$MANDATE_NOW_EPOCH" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" || pass_trace_time=""
+      ;;
+  esac
+fi
+
 log_note() {
   echo "ostrom $role pass: $*" >&2
 }
@@ -361,7 +390,8 @@ finish() {
             duration_seconds: $duration_seconds}
             + (if $reason == "" then {} else {reason: $reason} end)'
       )"
-      if ! bash "$SCRIPT_DIR/trace.sh" append pass-ended "$end_fact" '{}' >/dev/null; then
+      if ! MANDATE_TRACE_TIME="$pass_trace_time" \
+        bash "$SCRIPT_DIR/trace.sh" append pass-ended "$end_fact" '{}' >/dev/null; then
         log_note "could not append pass-ended"
         [ "$saved_status" -ne 0 ] || saved_status=1
       fi
@@ -425,7 +455,8 @@ printf '%s\n' "$wake" >"$wake_tmp"
 mv "$wake_tmp" "$WAKE_FILE"
 
 start_fact="$(jq -cn --arg owner "$owner" '{owner: $owner}')"
-if ! bash "$SCRIPT_DIR/trace.sh" append pass-started "$start_fact" '{}' >/dev/null; then
+if ! MANDATE_TRACE_TIME="$pass_trace_time" \
+  bash "$SCRIPT_DIR/trace.sh" append pass-started "$start_fact" '{}' >/dev/null; then
   log_note "could not append pass-started"
   outcome=failed
   exit 1
