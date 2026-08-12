@@ -41,13 +41,18 @@
 # took" from "the override was dropped and git fell back to whatever
 # credential.helper the operator already has configured" by watching the
 # exec'd process's exit code alone. When the wrapped command is `git`
-# itself, this script instead checks the installed git's version up front
-# and refuses to run at all below 2.31, before a token is even minted —
-# there is no reason to mint a live token for a command that will not be
-# allowed to run. That check keys off the wrapped command being `git`
-# itself, not off whether it happens to invoke `git`: a wrapped *script*
-# that calls `git` internally (such as `gate.sh`) is not covered, because
-# this script has no way to know what binaries that script will run.
+# itself, this script instead checks its version up front and refuses to
+# run at all below 2.31, before a token is even minted — there is no
+# reason to mint a live token for a command that will not be allowed to
+# run. The check runs "$1" --version, not a bare `git --version`: the
+# wrapped command may be given as a path (`/opt/git-2.20/bin/git`) rather
+# than a bare name resolved off PATH, and it is that exact binary — not
+# whatever `git` happens to mean in this script's own PATH — that will
+# receive the exec and do the actual push. That check keys off the wrapped
+# command being `git` itself, not off whether it happens to invoke `git`:
+# a wrapped *script* that calls `git` internally (such as `gate.sh`) is
+# not covered, because this script has no way to know what binaries that
+# script will run.
 #
 # Usage: gh-as.sh <role> <owner>/<repo> <command> [args...]
 #
@@ -81,8 +86,11 @@ shift 2
 # anything else — including minting a token nothing will end up using.
 case "$1" in
   git | */git)
-    git_version_output="$(git --version 2>/dev/null)" ||
-      fail "cannot enforce the ephemeral git credential helper: git --version failed, so a git push would silently fall back to the operator's own credentials"
+    # Probe "$1" itself, not a bare `git` -- the wrapped command may be a
+    # path to a specific git binary, and that is the one that will
+    # actually exec and push, regardless of what `git` resolves to here.
+    git_version_output="$("$1" --version 2>/dev/null)" ||
+      fail "cannot enforce the ephemeral git credential helper: $1 --version failed, so a git push would silently fall back to the operator's own credentials"
     case "$git_version_output" in
       git\ version\ [0-9]*)
         git_version="${git_version_output#git version }"

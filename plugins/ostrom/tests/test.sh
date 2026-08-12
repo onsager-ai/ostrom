@@ -1620,6 +1620,41 @@ grep -Fq 'gh-as-test: called with pr list --repo placeholder-owner/placeholder-r
   "$gh_as_nongit_stdout"
 [ ! -s "$gh_as_nongit_stderr" ]
 
+# The `*/git` arm of the pattern exists so a wrapped command given as a
+# path is recognised too -- but the version probe has to run that exact
+# path, not a bare `git`, or a modern git elsewhere on PATH would mask a
+# stale one at the path actually being exec'd. PATH here resolves bare
+# `git` to the modern fixture above; only the explicit path points at the
+# old one. If the check ever regressed to probing `git --version` instead
+# of "$1" --version, this would wrongly pass.
+gh_as_old_git_by_path_seen="$gh_as_fixture/old-git-by-path-seen"
+gh_as_old_git_by_path_stdout="$gh_as_fixture/old-git-by-path.stdout"
+gh_as_old_git_by_path_stderr="$gh_as_fixture/old-git-by-path.stderr"
+rm -f "$gh_as_old_git_by_path_seen" "$app_token_curl_log"
+set +e
+PATH="$gh_as_fixture/bin:$app_token_fixture/bin:$PATH" \
+  GH_TOKEN="" \
+  GITHUB_TOKEN="" \
+  FAKE_CURL_MODE=success \
+  FAKE_CURL_CALL_LOG="$app_token_curl_log" \
+  CLAUDE_CONFIG_DIR="$app_token_builder" \
+  CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+  GH_AS_GIT_SEEN_FILE="$gh_as_old_git_by_path_seen" \
+  bash "$PLUGIN_ROOT/scripts/gh-as.sh" builder \
+    placeholder-owner/placeholder-repo \
+    "$gh_as_old_git_bin/git" push \
+    https://github.com/placeholder-owner/placeholder-repo.git \
+    HEAD:refs/heads/placeholder \
+    >"$gh_as_old_git_by_path_stdout" 2>"$gh_as_old_git_by_path_stderr"
+gh_as_old_git_by_path_status=$?
+set -e
+[ "$gh_as_old_git_by_path_status" -eq 111 ]
+[ ! -e "$gh_as_old_git_by_path_seen" ]
+[ ! -e "$app_token_curl_log" ]
+[ ! -s "$gh_as_old_git_by_path_stdout" ]
+grep -Fq '2.30.2' "$gh_as_old_git_by_path_stderr"
+grep -Fq 'older than 2.31' "$gh_as_old_git_by_path_stderr"
+
 cat >"$fixture/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
