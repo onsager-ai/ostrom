@@ -1427,6 +1427,63 @@ set -e
 [ ! -s "$gh_as_role_stdout" ]
 grep -Fq 'builder credentials are not configured' "$gh_as_role_stderr"
 
+# `git` does not read GH_TOKEN itself, so gh-as.sh also points it at a
+# credential helper -- `gh auth git-credential`, which does -- scoped to
+# this one process via the GIT_CONFIG_COUNT/KEY/VALUE environment form,
+# never via `git config` or `gh auth setup-git`, either of which would
+# leave a helper reference behind in a config file on disk after this
+# process exits. This is #41's regression guard: the credential helper must
+# reach a wrapped `git` the same way GH_TOKEN reaches a wrapped `gh`, must
+# clear any credential.helper already configured elsewhere first (an
+# operator's own helper trying first could otherwise satisfy the request
+# with the operator's own stored credentials, silently defeating the whole
+# point), and must never appear in gh-as.sh's own stdout or stderr.
+cat >"$gh_as_fixture/bin/git" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+: >"$GH_AS_GIT_SEEN_FILE"
+{
+  printf 'count=%s\n' "${GIT_CONFIG_COUNT:-}"
+  printf 'key0=%s\n' "${GIT_CONFIG_KEY_0:-}"
+  printf 'value0=%s\n' "${GIT_CONFIG_VALUE_0:-}"
+  printf 'key1=%s\n' "${GIT_CONFIG_KEY_1:-}"
+  printf 'value1=%s\n' "${GIT_CONFIG_VALUE_1:-}"
+  printf 'gh_token=%s\n' "${GH_TOKEN:-}"
+} >>"$GH_AS_GIT_SEEN_FILE"
+printf 'gh-as-git-test: called with %s\n' "$*"
+EOF
+chmod +x "$gh_as_fixture/bin/git"
+
+gh_as_git_seen="$gh_as_fixture/git-token-seen"
+gh_as_git_stdout="$gh_as_fixture/git-push.stdout"
+gh_as_git_stderr="$gh_as_fixture/git-push.stderr"
+rm -f "$gh_as_git_seen"
+PATH="$gh_as_fixture/bin:$app_token_fixture/bin:$PATH" \
+  GH_TOKEN="" \
+  GITHUB_TOKEN="" \
+  FAKE_CURL_MODE=success \
+  CLAUDE_CONFIG_DIR="$app_token_builder" \
+  CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+  GH_AS_GIT_SEEN_FILE="$gh_as_git_seen" \
+  bash "$PLUGIN_ROOT/scripts/gh-as.sh" builder \
+    placeholder-owner/placeholder-repo \
+    git push https://github.com/placeholder-owner/placeholder-repo.git \
+    HEAD:refs/heads/placeholder \
+    >"$gh_as_git_stdout" 2>"$gh_as_git_stderr"
+gh_as_git_status=$?
+[ "$gh_as_git_status" -eq 0 ]
+[ -s "$gh_as_git_seen" ]
+grep -Fxq 'count=2' "$gh_as_git_seen"
+grep -Fxq 'key0=credential.helper' "$gh_as_git_seen"
+grep -Fxq 'value0=' "$gh_as_git_seen"
+grep -Fxq 'key1=credential.helper' "$gh_as_git_seen"
+grep -Fxq 'value1=!gh auth git-credential' "$gh_as_git_seen"
+grep -Fxq 'gh_token=stub-installation-token' "$gh_as_git_seen"
+grep -Fq 'gh-as-git-test: called with push https://github.com/placeholder-owner/placeholder-repo.git HEAD:refs/heads/placeholder' \
+  "$gh_as_git_stdout"
+[ ! -s "$gh_as_git_stderr" ]
+! grep -q 'stub-installation-token' "$gh_as_git_stdout" "$gh_as_git_stderr"
+
 cat >"$fixture/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail

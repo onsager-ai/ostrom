@@ -21,6 +21,21 @@
 # this script writes to stdout or stderr on its own path ever includes the
 # token; only the exec'd command's own output follows.
 #
+# `git` does not read GH_TOKEN itself — only `gh` does — so a `git push`
+# needs a credential helper to bridge the two. This script points git at
+# `gh auth git-credential`, which does read GH_TOKEN, for exactly the
+# duration of the exec'd process, using the GIT_CONFIG_COUNT/KEY/VALUE
+# environment form (supported since Git 2.31) rather than `git config` or
+# `gh auth setup-git`: both of those write to a config file — `~/.gitconfig`
+# or `.git/config` — and would leave a helper reference behind after this
+# process exits. An environment variable dies with the process that set it.
+# The first pair clears any credential.helper already configured in
+# `~/.gitconfig` or the repository's own config (an operator's personal
+# helper would otherwise be tried first and could satisfy the request with
+# the operator's own stored credentials, silently defeating the whole
+# point); the second pair is the only helper left standing. Harmless for a
+# wrapped command that never calls `git`.
+#
 # Usage: gh-as.sh <role> <owner>/<repo> <command> [args...]
 #
 # Exit code 111 means this script itself did not authenticate — a usage
@@ -56,5 +71,8 @@ if [ -z "$token" ]; then
 fi
 
 export GH_TOKEN="$token" GITHUB_TOKEN="$token"
+export GIT_CONFIG_COUNT=2
+export GIT_CONFIG_KEY_0="credential.helper" GIT_CONFIG_VALUE_0=""
+export GIT_CONFIG_KEY_1="credential.helper" GIT_CONFIG_VALUE_1="!gh auth git-credential"
 unset token role repository SCRIPT_DIR
 exec "$@"
