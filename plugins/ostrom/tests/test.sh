@@ -113,6 +113,22 @@ if grep -qE 'gh pr merge[^`]*--body' "$merge_skill"; then
   echo "merge protocol must not pass --body to gh pr merge" >&2
   exit 1
 fi
+
+# The gatekeeper must not approve. Since #107 every delivery role
+# authenticates as the same App, so the App that authored the pull request is
+# the App that would review it, and GitHub refuses self-approval outright.
+# The first armed gatekeeper pass halted on exactly this. The verdict is
+# recorded as a PR comment and a decision-taken record instead. Same `if`
+# form: `!` would be exempt from set -e and assert nothing.
+# Matched as an invocation -- routed through gh-as.sh, as every protocol call
+# is -- so the prose below that names the forbidden command does not trip it.
+if grep -qE 'gh-as\.sh[^`]*gh pr review[^`]*--approve' "$merge_skill" "$gatekeep_skill"; then
+  echo "merge protocol must not approve: one App cannot approve its own PR" >&2
+  exit 1
+fi
+grep -q 'Do not approve' "$merge_skill"
+grep -q 'gh pr comment <PR number> --repo <owner/repo> --body-file <file>' \
+  "$merge_skill"
 grep -q 'Ostrom-Role: builder' "$merge_skill"
 for role_doc in "$work_skill" "$gatekeep_skill" "$merge_skill"; do
   grep -qi 'advisory' "$role_doc"

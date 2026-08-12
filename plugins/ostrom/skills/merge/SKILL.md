@@ -132,8 +132,23 @@ caller's, is always about delivery, and never converts `inconclusive` into
 - **Pass (exit 0)** — perform these three steps in order, routing each `gh`
   call through `gh-as.sh` as in step 2 so it runs with a token minted for
   this repository rather than this session's own empty credentials:
-  1. Run
-     `bash "${CLAUDE_PLUGIN_ROOT}/scripts/gh-as.sh" gatekeeper "$repository" gh pr review <PR number> --repo <owner/repo> --approve`.
+  1. Record the verdict on the pull request as a comment, writing it to a
+     temporary file first so no PR-controlled text is interpolated into a
+     shell command:
+     `bash "${CLAUDE_PLUGIN_ROOT}/scripts/gh-as.sh" gatekeeper "$repository" gh pr comment <PR number> --repo <owner/repo> --body-file <file>`.
+
+     **Do not approve.** `gh pr review --approve` is not part of this
+     protocol and must not be added back. Every delivery role authenticates
+     as the same App (#107), so the App that authored the pull request is the
+     App that would review it, and GitHub refuses self-approval outright —
+     there is no permission or flag that changes this. The step is not merely
+     blocked; it is meaningless. An approval from the authoring identity
+     asserts nothing a reader should believe.
+
+     What the approval used to carry now lives in two better places: this
+     comment, which a human browsing GitHub can see, and the `decision-taken`
+     record below, which is machine-readable and carries a reversal pointer
+     an approval never had.
   2. Then run
      `bash "${CLAUDE_PLUGIN_ROOT}/scripts/gh-as.sh" gatekeeper "$repository" gh pr merge <PR number> --repo <owner/repo>`.
      Do not pass `--body` here to stamp a gatekeeper role trailer. On a squash
@@ -161,12 +176,13 @@ caller's, is always about delivery, and never converts `inconclusive` into
          '{reason: ("gate verdict: " + $verdict)}')"
      ```
 
-  **The approval must come from the App, never from the principal's account.**
-  A session that has fallen back to the principal's identity will be refused
-  by GitHub at the approve step — one step earlier than it would have been
-  refused at merge, which is the correct and more legible failure.
+  **Every one of these calls must go through `gh-as.sh`, never the
+  principal's account.** Removing the approve step removed the place where a
+  fallback to the principal's identity used to be caught early, so nothing
+  now fails before the merge itself. Route every call through the wrapper and
+  treat exit `111` as a stop.
 
-  An `excused` condition is part of a `pass`, so approval proceeds normally.
+  An `excused` condition is part of a `pass`, so the merge proceeds normally.
   The exception reason already appears in the verdict output and the
   `gate-verdict-consumed` trace fact.
 - **Fail (exit 1)** — if `already_judged=false`, leave the complete gate output
@@ -191,15 +207,16 @@ Any other exit code is a gate execution failure. Treat it as inconclusive,
 include the observed exit code in the Question field, address the same dossier
 to the principal, and stop.
 
-**Never approve on `fail`, `inconclusive`, or any other exit code.** An
-approval outlives the verdict that produced it; approving a PR that did not
-pass leaves a standing permission nobody granted. On a non-pass verdict the
-existing behaviour is unchanged: comment or escalate, and stop.
+**Never merge on `fail`, `inconclusive`, or any other exit code**, and never
+post a verdict comment that reads as a pass. On a non-pass verdict the
+existing behaviour is unchanged: comment the gate output or escalate, and
+stop. The merge is now the first irreversible action in this protocol rather
+than the second, so there is no earlier step left to catch a mistake.
 
 ## 5. Stay narrow
 
 Never fix code, edit files, dismiss review threads, rebase, resolve conflicts,
-suggest fixes, or review for quality. The gatekeeper is an approver, not a
+suggest fixes, or review for quality. The gatekeeper is a judge, not a
 second author. Do not debate the builder and do not accept an argument for an
 unchanged head SHA.
 
@@ -207,7 +224,7 @@ unchanged head SHA.
 
 Resolving a thread is the one exception, and it is not a widening: every other
 item in the list above is an **authoring** action, while judging that a thread
-has been addressed is what an approver is for. It sat in the wrong list.
+has been addressed is what a judge is for. It sat in the wrong list.
 
 The condition cannot be satisfied any other way. `gate.sh` counts a thread
 resolved by the PR author as unresolved, and the builder and the principal
