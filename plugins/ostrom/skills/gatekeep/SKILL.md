@@ -75,7 +75,7 @@ project's `repo` pointer. Every roster repository is in scope, including a
 project marked `paused`; gatekeeping open pull requests is not routine
 builder work.
 
-## 4. Authenticate per repository as the gatekeeper App
+## 4. Authenticate per repository through the shared App
 
 `gatekeeper.settings.json` sets `GH_TOKEN` and `GITHUB_TOKEN` to empty, so
 there is no ambient credential here to discard or fall back to by accident.
@@ -102,10 +102,17 @@ itself could not authenticate and the given command never ran at all; report
 that and stop this iteration rather than retry with an ambient credential.
 Any other exit code is the given command's own, unchanged.
 
+The required `gatekeeper` argument names the caller at the call site; it does
+not narrow the shared token. The gatekeeper's own role is recorded in its
+`decision-taken` trace record, not stamped onto the merge commit — see
+`/ostrom:merge` step 4 for why. An `Ostrom-Role: builder` trailer arriving on a
+commit under review was written by the builder itself, so it is self-asserted
+advisory metadata, not evidence of who acted and never an input to the gate.
+
 **A gatekeeper session that cannot mint an App token must stop, not continue as the principal.**
 
-Continuing with an ambient token would silently recreate the shared-identity
-failure the App exists to remove.
+Continuing with an ambient token would escape the App's repository blast
+radius.
 
 ## 5. Enumerate every open pull request
 

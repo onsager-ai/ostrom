@@ -1,4 +1,4 @@
-# Claude Code permission boundaries for delivery roles
+# Harness and App boundaries for delivery roles
 
 These are installation instructions for the principal. They are proposals,
 not repository-enforced policy, and nothing in this repository installs them.
@@ -6,15 +6,21 @@ The principal creates the two role profiles below and launches each delivery
 role with its matching `--settings` file. The principal does not use either
 profile.
 
-Claude Code deny rules are evaluated before ask and allow rules. The current
-syntax uses command globs such as `Bash(git push *)` and gitignore-style edit
-paths such as `Edit(~/.claude/ostrom/gate.yaml)`. The profiles also disable
-permission-bypass mode. These controls are defence in depth. GitHub branch
-protection is the enforceable merge boundary only after the builder and
-gatekeeper authenticate as distinct GitHub identities, because only then can
-the server distinguish their authority. A fresh installation starts with both
-roles sharing the principal's identity; in that state, the branch-protection
-claim does not hold.
+The security model is deliberately split:
+
+> **The harness is the enforcement boundary. The App is the blast radius.**
+
+The shared GitHub App bounds which repositories and GitHub capabilities a
+compromised delivery loop can reach at all. It does not distinguish builder,
+gatekeeper, sweep, or a future role: GitHub grants pull-request writes as one
+permission, so an App that can open a pull request can also merge one. The
+role settings and protocols decide which role may exercise each capability
+inside that blast radius.
+
+The role argument to `app-token.sh` and `gh-as.sh` remains required even when
+every role resolves to the shared credential. It names the caller at the call
+site, making the route legible; it does not narrow the installation token and
+is not an access control.
 
 ## What these denies are, and are not
 
@@ -34,11 +40,12 @@ Two further limits, both structural:
   path that reaches GitHub another way — an MCP tool, a hook, a helper script —
   is not matched.
 
-The value of a client-side deny is real but specific: it converts a silent
-mistake into a visible refusal. That is worth having, and it is not the same as
-being unable to merge. **The only control that does not depend on the session
-behaving is server-side branch protection**, and where a repository's plan does
-not offer it, the separation there is advisory.
+The value of a client-side deny is real but specific: inside the supported
+harness it converts a forbidden role action into a visible refusal. It does
+not make the shared App incapable of the action. A session launched outside
+the profile, or a command path the matcher does not cover, is outside this
+role boundary but remains inside the App's repository and permission blast
+radius.
 
 **Neither profile may deny `gh api` wholesale**, and the gatekeeper's case is
 the sharper one. `gate.sh` reads review threads through `gh api graphql` —
@@ -57,64 +64,62 @@ reviews of this one file each found a spelling the previous round had missed:
 `-XPUT` unspaced, then `--method=PUT` equals-joined, then `git push -f` with
 the flag last and no trailing space. Every one was a real hole, and every one
 was found by someone re-reading a list its author believed was finished. Adding
-the next spelling is worth doing and is not the same as closing the gap; if you
-are relying on this list rather than on branch protection, you are relying on
-the wrong thing.
+the next spelling is worth doing and is not the same as closing the gap.
 
-## GitHub App identity prerequisite
+## Shared GitHub App prerequisite
 
-Before enabling branch protection or starting a gatekeeper session, the
-principal completes the GitHub App setup decided in
-[#29](https://github.com/onsager-ai/ostrom/issues/29):
-
-1. Create a GitHub App with Pull requests read/write, Contents read/write,
-   Checks read, and Metadata read permissions, then install it only on the
-   repositories the gatekeeper covers.
-2. Store its machine-local credentials outside every repository at
-   `~/.claude/ostrom/secrets.yaml` (or the equivalent path below
-   `CLAUDE_CONFIG_DIR`) using this shape:
-
-   ```yaml
-   gatekeeper:
-     app_id: <APP_ID>
-     private_key_path: <ABSOLUTE_PATH_TO_PRIVATE_KEY>
-   ```
-
-   The installation is resolved from each `owner/repo` at mint time. A legacy
-   `installation_id` entry is obsolete, is ignored for backward compatibility,
-   and may be deleted.
-
-3. Launch the gatekeeper with the profile below. The profile clears inherited
-   GitHub tokens, and `/gatekeep` or `/merge` must successfully mint a fresh
-   App installation token for each repository before making any `gh` call
-   against it.
-
-Until these steps are complete, the builder and gatekeeper remain the same
-GitHub actor: author-resolved threads cannot be distinguished from legitimate
-gatekeeper resolutions, branch protection cannot enforce the role split, and
-`merged_by` has no independent audit value.
-
-The builder authenticates the same way against its own `builder:` block in
-the same `secrets.yaml`, added in [#97](https://github.com/onsager-ai/ostrom/issues/97):
+The existing writer App is the one credential for every delivery role. Its
+machine-local credentials live outside every repository at
+`~/.claude/ostrom/secrets.yaml` (or below `CLAUDE_CONFIG_DIR`) in exactly this
+shape:
 
 ```yaml
-builder:
+shared:
   app_id: <APP_ID>
   private_key_path: <ABSOLUTE_PATH_TO_PRIVATE_KEY>
 ```
 
-`scripts/sweep.sh` — the unattended portfolio reader behind the mandate
-queue — mints its own token from the **gatekeeper** block rather than a
-third identity ([#106](https://github.com/onsager-ai/ostrom/issues/106)): a
-GitHub App installation token grants the same effective access regardless of
-which role minted it, since it is Claude Code's per-role deny lists that
-actually separate builder from gatekeeper, and those apply only inside a
-harness-driven session, not to a freestanding script. The gatekeeper App's
-installation must therefore keep covering every repository in the mandate
-roster, not only the ones with an open pull request at any given moment —
-the sweep reads issues, PRs, default-branch CI, and commit history across
-the whole roster on every run, and a repository the gatekeeper App is not
-installed on reads as an authentication fault there, not an empty result.
+No real App ID or key path belongs in a repository. A legacy
+`installation_id` field is accepted and ignored, but should be removed. During
+cutover, a role-named block such as `builder:` or `gatekeeper:` takes
+precedence over `shared:` so rollback remains a one-block config change. The
+steady-state file has only the `shared:` block.
+
+`app-token.sh` still receives both the role and `owner/repo`. It resolves the
+credential by role first and `shared:` second, mints a JWT in memory, then
+looks up the installation for that repository before exchanging the JWT for
+an installation token. A token is scoped to one installation; a token minted
+for a repository in one organisation must not be reused for another
+organisation's repositories. `gh-as.sh` contains the token in its own process
+and never falls back to ambient `GH_TOKEN` or `GITHUB_TOKEN` when minting
+fails.
+
+The shared App's installation must therefore cover **every repository in the mandate roster**, in every organisation the roster spans — not only the ones with an open pull request at any given moment. `scripts/sweep.sh` reads issues, pull requests, default-branch CI, and commit history across the whole roster on every run, and mints one token per organisation for that reason ([#106](https://github.com/onsager-ai/ostrom/issues/106)). A repository the App is not installed on is an authentication fault there, not an empty result, and the sweep must report it as one — a silently empty queue reads as a healthy, quiet portfolio.
+
+There is no second read-only App. Every role runs on the same machine and can
+reach the same plugin cache and secrets file, so a second key would not form a
+meaningful isolation boundary in this deployment. It would add another
+credential to hold and rotate without materially reducing the shared-machine
+blast radius.
+
+Retire a former role App only after a real end-to-end pass has used the shared
+credential. Keep the old key until then: while it remains, rollback is a
+one-block configuration change.
+
+## Advisory role attribution
+
+Because GitHub renders every delivery action as the same App actor, builder
+commits and pull request bodies carry `Ostrom-Role: builder`. The marker is
+written by the same agent it names. It is a record for human legibility, not a
+control or evidence of who acted; no gate, audit, or authorization decision may treat it as proof.
+
+The gatekeeper deliberately does not stamp the merge commit. `gh pr merge
+--body` replaces the squash commit message rather than appending to it, and
+that default message is what carries the builder's own commits — trailer
+included — onto the default branch. Stamping the merge would delete more
+attribution than it adds. The gatekeeper's role is recorded in its
+`decision-taken` trace record, which is durable and machine-readable, and is
+where an audit should look.
 
 ## Builder profile
 
@@ -262,10 +267,12 @@ claude --settings ~/.claude/ostrom/roles/gatekeeper.settings.json
 }
 ```
 
-The gatekeeper can read artifacts, approve a passing gate as the App, and run
-`gh pr merge`. It cannot write code, stage or commit changes, push, open PRs,
-rebase or resolve code conflicts, edit the mandate roster or gate conditions,
-or create tags and releases through the named ordinary commands.
+The gatekeeper can read artifacts, request an approval, and run `gh pr merge`.
+It cannot write code, stage or commit changes, push, open PRs, rebase or
+resolve code conflicts, edit the mandate roster or gate conditions, or create
+tags and releases through the named ordinary commands. GitHub actor-based
+checks still see the same App as the builder; the profile, not the actor name,
+is the role boundary.
 
 ## Principal
 
@@ -273,9 +280,8 @@ The principal installs neither delivery-role profile. The principal's normal
 user settings remain at `~/.claude/settings.json`; no deny rules are proposed
 for the principal here. The principal alone may edit
 `~/.claude/ostrom/mandates.yaml`, `~/.claude/ostrom/gate.yaml`, or a repository's
-`.ostrom/mandates.yaml` and `.ostrom/gate.yaml`, resolve or dismiss review
-threads, grant a gate exception for one explicitly named PR artifact, and
-create tags or releases.
+`.ostrom/mandates.yaml` and `.ostrom/gate.yaml`, dismiss reviews, grant a gate
+exception for one explicitly named PR artifact, and create tags or releases.
 
 ## One-PR exception path
 
@@ -304,37 +310,40 @@ Both delivery profiles deny writes to this log. The builder cannot grant its
 own exception, and the gatekeeper cannot append an exception for the condition
 blocking it. The latter matters equally: that ability would let the gatekeeper
 manufacture the authority it is meant only to act on. The principal grants;
-the gatekeeper acts, approves a resulting pass as the App, and merges.
+the gatekeeper acts on the resulting pass and merges.
 
-## Review-thread boundary cannot be expressed precisely
+## Shared-actor limitations that remain
 
 There is deliberately no `Bash(gh api graphql *)` deny in either profile.
 GitHub has no `gh` porcelain command for resolving a review thread. Reading a
 thread and calling the `resolveReviewThread` mutation both use `gh api
 graphql`. A payload-text deny is not a boundary: `--input`, `-F query=@file`,
 and harmless whitespace changes all bypass it. A binary/subcommand deny would
-also block the gatekeeper's required read.
+also block the gatekeeper's required read. Do not replace that omission with a
+coarse deny that blocks unrelated GitHub work. The `gh pr merge` deny for the
+builder remains a harness control; the shared App itself can merge.
 
-Do not replace that omission with a coarse deny that blocks unrelated GitHub
-work. Once the builder and gatekeeper use distinct GitHub identities, branch
-protection is the enforceable server-side boundary; in a fresh
-shared-identity installation it is not. The `gh pr merge` deny for the builder
-remains client-side defence in depth.
-For the thread-specific conflict of interest, `gate.sh` independently treats
-every thread resolved by the PR author as unresolved, so self-resolution
-cannot satisfy the condition. Stronger prevention requires a GitHub-side
-control or separate OS identity administered by the principal, not another
-fragile Claude Code command pattern.
+Two existing actor-based assumptions do not survive the shared App cutover:
+
+- GitHub does not accept an approval from the pull request's own actor. A pull
+  request opened by the shared App and an approval attempted by the
+  gatekeeper are the same actor to GitHub, even though the harness roles differ.
+- `gate.sh` counts a thread resolved by the pull request author as unresolved.
+  A gatekeeper resolution now has that same actor too, so the gate cannot
+  distinguish it from builder self-resolution.
+
+`Ostrom-Role` markers cannot repair either assumption because they are
+self-asserted and advisory. The approve-first and author-resolver paths must be
+changed or explicitly excepted before an end-to-end shared-App pass can prove
+the cutover. This is an operational precondition, not evidence for retaining
+per-role Apps.
 
 **The gatekeeper profile therefore carries no graphql-mutation deny, and the
 builder's stays.** Resolving a review thread is the `resolveReviewThread`
 mutation — there is no porcelain for it — so that deny would forbid the
-gatekeeper the one write its role requires, while leaving the gate condition
-satisfiable by nobody. This is the second time a deny written for the builder
-was copied onto the gatekeeper and locked it out of its own job; the first was
-a blanket `gh api` deny that would have made every verdict `inconclusive`.
-Before adding a deny to the gatekeeper, check what `gate.sh` and
-`/ostrom:merge` actually call.
+gatekeeper the write its protocol assigns it without fixing the shared-actor
+conflict. Before adding a deny to the gatekeeper, check what `gate.sh` and
+`/ostrom:merge` actually call and settle the actor-independent thread rule.
 
 That deny was never load-bearing anyway: it matches only the literal word
 `mutation` in the command string, so `--input`, `-F query=@file` and a

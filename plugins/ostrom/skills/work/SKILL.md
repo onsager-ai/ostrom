@@ -108,20 +108,19 @@ not express this until the sweep learned to read default-branch runs at all — 
 red `main` went unseen for two and a half days because CI state was only ever
 read from open pull requests.
 
-## 4. Authenticate as the builder App
+## 4. Authenticate through the shared App
 
 The builder writes code, commits, and pushes; every one of those actions
-must be attributed to the builder's own GitHub identity, not to whoever is
-running this session. Never call `gh` directly against a GitHub remote, and
-never run a script that itself calls `gh` (such as `gate.sh`) directly
-either — that script belongs to the gatekeeper's protocol, not this one. A
-session's Bash tool statically rejects command substitution before
-permission matching, so this step cannot capture `app-token.sh`'s output
-into a variable (`token="$(app-token.sh ...)"`) the way an interactive shell
-would — no allow rule can fix that rejection, because it never reaches
-allow-rule matching in the first place. Route every `gh` call for an item's
-repository through `gh-as.sh`, naming the `builder` role and the repository
-ahead of the command to run:
+must use the shared App rather than whoever is running this session. Never
+call `gh` directly against a GitHub remote, and never run a script that itself
+calls `gh` (such as `gate.sh`) directly either — that script belongs to the
+gatekeeper's protocol, not this one. A session's Bash tool statically rejects
+command substitution before permission matching, so this step cannot capture
+`app-token.sh`'s output into a variable (`token="$(app-token.sh ...)"`) the way
+an interactive shell would — no allow rule can fix that rejection, because it
+never reaches allow-rule matching in the first place. Route every `gh` call
+for an item's repository through `gh-as.sh`, naming the `builder` role and the
+repository ahead of the command to run:
 
 ```sh
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/gh-as.sh" builder "$repository" \
@@ -153,15 +152,18 @@ command never ran at all; report that and stop work on the item rather than
 retry with an ambient credential. Any other exit code is the given command's
 own, unchanged.
 
+The `builder` argument remains required even though it normally resolves to
+the same credential as every other role. It makes the caller legible at the
+call site; it does not restrict what the resulting token can do.
+
 **A builder session that cannot mint an App token must stop working that
 item, not continue as the principal.** Continuing with an ambient token
-would silently recreate the shared-identity failure the App exists to
-remove. `builder.settings.json` is expected to eventually null `GH_TOKEN`
-and `GITHUB_TOKEN` the same way `gatekeeper.settings.json` already does,
-removing the ambient fallback entirely; until that lands, this protocol
-routes through `gh-as.sh` regardless of what credential happens to already
-be present in the session's own environment — a working `gh-as.sh` call
-never needs one.
+would escape the App's repository blast radius. `builder.settings.json` is
+expected to eventually null `GH_TOKEN` and `GITHUB_TOKEN` the same way
+`gatekeeper.settings.json` already does, removing the ambient fallback
+entirely; until that lands, this protocol routes through `gh-as.sh` regardless
+of what credential happens to already be present in the session's own
+environment — a working `gh-as.sh` call never needs one.
 
 ## 5. Work each item
 
@@ -197,6 +199,14 @@ Either way, review the returned diff against the spec. The summary is not
 evidence: confirm the artifact changed, run the tests, probe the load-bearing
 claim, and scan for what the implementer was never asked about — leaked
 secrets, private data in public files, and edits outside scope.
+
+Every commit the builder creates ends with the trailer
+`Ostrom-Role: builder`, and every pull request body the builder creates ends
+with the same standalone line. Add the trailer when committing and add the PR
+marker to `$body_file` before the `gh pr create` call in step 4. These markers
+restore role legibility now that GitHub renders every role as one App actor.
+They are written by the builder itself, so they are advisory records, not
+evidence of who acted and never a gate condition.
 
 **Hand it off; do not land it.** Get the pull request open and CI green, then
 stop. The gatekeeper merges. Do not squash-merge, delete the branch, or remove

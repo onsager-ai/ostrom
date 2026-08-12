@@ -21,7 +21,7 @@ checkout's GitHub `origin` URL for a direct `/ostrom:merge` invocation. Reject t
 if this does not yield exactly one unambiguous `owner/repo`; do not guess and do
 not use an ambient GitHub credential to discover it.
 
-## 2. Authenticate as the gatekeeper App
+## 2. Authenticate through the shared App
 
 `gatekeeper.settings.json` sets `GH_TOKEN` and `GITHUB_TOKEN` to empty, so
 there is no ambient credential here to discard or fall back to by accident.
@@ -48,10 +48,16 @@ assigned to a variable here, and is never written to disk. Exit `111` means
 all; report that and stop rather than retry with an ambient credential. Any
 other exit code is the given command's own, unchanged.
 
+The required `gatekeeper` argument names the caller at the call site; it does
+not narrow the shared token. Any `Ostrom-Role:` marker reaching this protocol —
+on a commit or in a pull request body — was written by the role it names, so it
+is a self-asserted advisory record, not evidence of who acted, and never an
+input to the gate.
+
 **A gatekeeper session that cannot mint an App token must stop, not continue as the principal.**
 
-Continuing with an ambient token would silently recreate the shared-identity
-failure the App exists to remove.
+Continuing with an ambient token would escape the App's repository blast
+radius.
 
 Do not carry facts or conclusions from an earlier evaluation. The builder's
 only reply to a verdict is a new commit; re-evaluate that new artifact from
@@ -130,6 +136,13 @@ caller's, is always about delivery, and never converts `inconclusive` into
      `bash "${CLAUDE_PLUGIN_ROOT}/scripts/gh-as.sh" gatekeeper "$repository" gh pr review <PR number> --repo <owner/repo> --approve`.
   2. Then run
      `bash "${CLAUDE_PLUGIN_ROOT}/scripts/gh-as.sh" gatekeeper "$repository" gh pr merge <PR number> --repo <owner/repo>`.
+     Do not pass `--body` here to stamp a gatekeeper role trailer. On a squash
+     merge `--body` *replaces* the default commit message rather than appending
+     to it, and that default is where the builder's own commits — including
+     their `Ostrom-Role: builder` trailer — survive into the default branch.
+     Stamping the merge would erase more attribution than it adds. The
+     gatekeeper's role is recorded in the `decision-taken` record below, which
+     is durable, machine-readable, and the actual audit path.
   3. Then append a `decision-taken` trace record. Merging is the
      gatekeeper's own judgment on this artifact, and it is only safe to make
      without the principal because it is cheap to undo — the reversal
