@@ -557,6 +557,22 @@ describe("doctor golden output", () => {
     );
   });
 
+  it("reports a fault after three consecutive failed passes for a role", () => {
+    const fixture = baseFixture();
+    writeFileSync(
+      join(fixture.configDir, "ostrom", "sprint.jsonl"),
+      '{"ts":"2026-07-31T22:00:00Z","kind":"pass-ended","fact":{"owner":"gatekeeper-fixture-wake1","outcome":"failed"}}\n' +
+        '{"ts":"2026-07-31T23:00:00Z","kind":"pass-ended","fact":{"owner":"gatekeeper-fixture-wake2","outcome":"failed"}}\n' +
+        '{"ts":"2026-08-01T00:00:00Z","kind":"pass-ended","fact":{"owner":"gatekeeper-fixture-wake3","outcome":"failed"}}\n',
+    );
+
+    // Fresh timestamps prove the timer is firing, but three protocol-owned
+    // failures are no healthier than three passes that never took ownership.
+    expect(run(fixture)).toContain(
+      "FAIL|gatekeeper-pass|gatekeeper loop has produced 3 consecutive failed passes, last 2026-08-01T00:00:00Z (age 0m)|inspect pass-runs/gatekeeper transcripts; the protocol takes ownership but does not complete\n",
+    );
+  });
+
   it("clears the no-op fault the moment a pass completes again", () => {
     const fixture = baseFixture();
     writeFileSync(

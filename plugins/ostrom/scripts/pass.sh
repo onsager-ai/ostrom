@@ -300,6 +300,50 @@ inner_pass_started() {
     '
 }
 
+# A clean claude exit says only that the headless client itself shut down
+# normally. Once the protocol has taken ownership, its pass-ended row is the
+# only signal that knows whether the work succeeded. Find that row in the
+# same post-watermark window as inner_pass_started(), first capturing the
+# independently minted inner owner from the role-prefixed pass-started row.
+# Builder rows repeat that owner and are matched exactly; gatekeeper rows do
+# not currently carry any owner at all, so absence must remain a valid match.
+# Rows that do carry a wrapper or another role's owner are never allowed to
+# override this pass, and a missing or malformed outcome leaves the exit-code
+# fallback in place.
+inner_pass_outcome() {
+  [ -f "$TRACE_FILE" ] || { printf '\n'; return; }
+  tail -n +"$((trace_watermark + 1))" "$TRACE_FILE" 2>/dev/null | jq -Rnr \
+    --arg prefix "$role-" \
+    --arg owner "$owner" '
+      reduce inputs as $line
+        ({inner_owner: null, outcome: null};
+          ($line | try fromjson catch null) as $event
+          | if (($event | type) == "object")
+              and ($event.kind == "pass-started")
+              and ((try ($event.fact.owner) catch null) as $candidate_owner
+                | ($candidate_owner | type) == "string"
+                  and ($candidate_owner | startswith($prefix))
+                  and ($candidate_owner != $owner))
+            then {
+              inner_owner: $event.fact.owner,
+              outcome: null
+            }
+            elif (.inner_owner != null)
+              and (($event | type) == "object")
+              and ($event.kind == "pass-ended")
+              and ((try ($event.fact.outcome) catch null) | type) == "string"
+              and (
+                ((try ($event.fact.owner) catch null) | type) == "null"
+                or $event.fact.owner == .inner_owner
+              )
+            then .outcome = $event.fact.outcome
+            else .
+            end
+        )
+      | .outcome // ""
+    '
+}
+
 # The inner lease (INNER_LEASE_NAME) is acquired by the Claude session this
 # script spawns, as step 2 of its own protocol -- one layer inside the outer
 # $LEASE_NAME this script acquires for itself. When the child is killed
@@ -527,10 +571,19 @@ run_status=$?
 child_pid=""
 
 if [ "$(inner_pass_started)" = "true" ]; then
-  # The protocol took ownership; today's exit-code-derived outcome applies
-  # exactly as it did before this pass began telling no-op apart from it.
   if [ "$run_status" -eq 0 ]; then
-    outcome=completed
+    inner_outcome="$(inner_pass_outcome)"
+    if [ -n "$inner_outcome" ]; then
+      # The wrapper remains authoritative for transport failures, signals,
+      # and timeouts; only its otherwise-successful result yields to the
+      # protocol's more informed account of what happened after ownership.
+      outcome="$inner_outcome"
+      if [ "$inner_outcome" != completed ]; then
+        log_note "inner protocol reported outcome=$inner_outcome; recording it instead of completed"
+      fi
+    else
+      outcome=completed
+    fi
   else
     outcome=failed
     log_note "Claude run failed (rc=$run_status); transcript at $log"
