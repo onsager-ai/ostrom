@@ -456,6 +456,102 @@ function checkTraceLease(context) {
   };
 }
 
+// src/checks/work-orders.ts
+import { spawnSync as spawnSync2 } from "node:child_process";
+function object(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+function dispatchFact(value) {
+  return object(value) && value.schema_version === 1 && typeof value.item_id === "string" && value.item_id.length > 0 && typeof value.order_id === "string" && value.order_id.length > 0 && typeof value.unit_name === "string" && value.unit_name.length > 0 && typeof value.backend === "string" && value.backend.length > 0;
+}
+function inFlight(source) {
+  const dispatched = /* @__PURE__ */ new Map();
+  const terminal = /* @__PURE__ */ new Set();
+  for (const line of source.split(/\r?\n/)) {
+    if (!line) continue;
+    let record;
+    try {
+      record = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (!object(record) || !object(record.fact)) continue;
+    if (record.kind === "work-dispatched" && dispatchFact(record.fact)) {
+      dispatched.set(record.fact.order_id, record.fact);
+    } else if ((record.kind === "work-completed" || record.kind === "work-failed") && typeof record.fact.order_id === "string") {
+      terminal.add(record.fact.order_id);
+    }
+  }
+  return [...dispatched.entries()].filter(([orderId]) => !terminal.has(orderId)).map(([, fact]) => fact);
+}
+function systemdUnitState(context, unitName) {
+  const systemctl = context.env.MANDATE_SYSTEMCTL_BIN || "systemctl";
+  const result = spawnSync2(
+    systemctl,
+    ["--user", "show", `${unitName}.service`, "--property=ActiveState", "--value"],
+    { encoding: "utf8", env: context.env }
+  );
+  if (result.status === 4) return null;
+  if (result.status !== 0) return void 0;
+  const state = result.stdout.trim();
+  return state || null;
+}
+function checkWorkOrders(context) {
+  const trace = context.readTrace();
+  if (!trace.exists || !("content" in trace)) {
+    return {
+      status: "OK",
+      name: "work-orders",
+      detail: "no work orders in flight",
+      remedy: ""
+    };
+  }
+  const orders = inFlight(trace.content);
+  if (orders.length === 0) {
+    return {
+      status: "OK",
+      name: "work-orders",
+      detail: "no work orders in flight",
+      remedy: ""
+    };
+  }
+  const faults = [];
+  const unknown = [];
+  const visible = [];
+  for (const order of orders) {
+    visible.push(`${order.item_id} (${order.unit_name})`);
+    if (order.backend !== "systemd") continue;
+    const state = systemdUnitState(context, order.unit_name);
+    if (state === void 0) {
+      unknown.push(order);
+    } else if (!state || !["active", "activating", "reloading", "deactivating"].includes(state)) {
+      faults.push(order);
+    }
+  }
+  if (faults.length > 0) {
+    return {
+      status: "FAIL",
+      name: "work-orders",
+      detail: `${orders.length} in flight; unit exited without terminal row: ${faults.map((order) => `${order.item_id} (${order.unit_name})`).join(", ")}`,
+      remedy: "inspect the transient unit journal and append work-failed before clearing its per-item lease"
+    };
+  }
+  if (unknown.length > 0) {
+    return {
+      status: "WARN",
+      name: "work-orders",
+      detail: `${orders.length} in flight; could not inspect unit state: ${unknown.map((order) => `${order.item_id} (${order.unit_name})`).join(", ")}`,
+      remedy: "confirm the user systemd manager is reachable and inspect the transient unit"
+    };
+  }
+  return {
+    status: "OK",
+    name: "work-orders",
+    detail: `${orders.length} in flight: ${visible.join(", ")}`,
+    remedy: ""
+  };
+}
+
 // src/checks/touch.ts
 import {
   accessSync,
@@ -735,7 +831,7 @@ function nowEpoch2(context) {
   }
   return Math.floor(Date.now() / 1e3);
 }
-function object(value) {
+function object2(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 function formatAge(ageSeconds) {
@@ -762,7 +858,7 @@ function recentRolePassEnded(source, role, limit) {
     } catch {
       continue;
     }
-    if (!object(record) || record.kind !== "pass-ended" || !object(record.fact)) {
+    if (!object2(record) || record.kind !== "pass-ended" || !object2(record.fact)) {
       continue;
     }
     const owner = record.fact.owner;
@@ -815,7 +911,7 @@ function checkRolePass(context, role) {
   const ageSeconds = nowEpoch2(context) - Math.floor(timestampMs / 1e3);
   const age = formatAge(ageSeconds);
   if (recent.length === PASS_FAULT_THRESHOLD && recent.every(
-    (candidate) => object(candidate.fact) && candidate.fact.outcome === "no-op"
+    (candidate) => object2(candidate.fact) && candidate.fact.outcome === "no-op"
   )) {
     return {
       status: "FAIL",
@@ -825,7 +921,7 @@ function checkRolePass(context, role) {
     };
   }
   if (recent.length === PASS_FAULT_THRESHOLD && recent.every(
-    (candidate) => object(candidate.fact) && candidate.fact.outcome === "failed"
+    (candidate) => object2(candidate.fact) && candidate.fact.outcome === "failed"
   )) {
     return {
       status: "FAIL",
@@ -869,7 +965,7 @@ function nowEpoch3(context) {
   }
   return Math.floor(Date.now() / 1e3);
 }
-function object2(value) {
+function object3(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 function checkPublish(context) {
@@ -894,7 +990,7 @@ function checkPublish(context) {
       remedy: "inspect the cached publish clone and repair or recreate it"
     };
   }
-  if (!object2(manifest)) {
+  if (!object3(manifest)) {
     return {
       status: "WARN",
       name: "publish",
@@ -976,6 +1072,7 @@ function runDoctor(options) {
     checkTouchDurability(context),
     checkProviderReachable(context),
     checkTraceLease(context),
+    checkWorkOrders(context),
     checkBuilderPass(context),
     checkGatekeeperPass(context),
     checkPublish(context),

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run one unattended delivery pass for a named role.
 #
-# systemd owns recurrence; this process owns one bounded Claude session. The
+# systemd owns recurrence; this process owns one bounded Claude triage session. The
 # outer lease is deliberately distinct from the protocol lease acquired by the
 # skill itself, so timer overlap is rejected without making the skill block on
 # its own wrapper.
@@ -62,11 +62,10 @@ WAKE_FILE="$MANDATE_DATA_DIR/$role-wake-counter"
 # side for the same reason.
 TRACE_FILE="$MANDATE_DATA_DIR/sprint.jsonl"
 
-# The wall-clock timeout (systemd's TimeoutStartSec) is the pass's intended
-# bound, because time maps directly to cost. A turn ceiling truncates on an
-# axis nobody budgets against, so it remains only as a runaway-loop backstop
-# -- set well above any turn count a real, working pass has been observed to
-# need.
+# The wall-clock timeout (systemd's TimeoutStartSec) bounds triage and reclaims
+# a stuck pass. Implementation is dispatched into separate transient units and
+# never inherits this timeout. A turn ceiling remains only as a triage
+# runaway-loop backstop.
 MAX_TURNS=200
 
 # Total measured spend, across every role, that this pass's own UTC day may
