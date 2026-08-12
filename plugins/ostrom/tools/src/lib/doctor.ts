@@ -6,6 +6,7 @@ import { checkConfigParser } from "../checks/parser.js";
 import { checkPlugin } from "../checks/plugin.js";
 import { checkRulesLayers } from "../checks/rules.js";
 import { checkTraceLease } from "../checks/trace-lease.js";
+import { checkWorkOrders } from "../checks/work-orders.js";
 import {
   checkProviderReachable,
   checkTouchDurability,
@@ -64,6 +65,7 @@ export function runDoctor(options: DoctorOptions): string {
     checkTouchDurability(context),
     checkProviderReachable(context),
     checkTraceLease(context),
+    checkWorkOrders(context),
     checkBuilderPass(context),
     checkGatekeeperPass(context),
     checkPublish(context),

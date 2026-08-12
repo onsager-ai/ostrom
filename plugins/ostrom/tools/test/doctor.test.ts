@@ -190,6 +190,12 @@ function commonExpected(
     },
     {
       status: "OK",
+      name: "work-orders",
+      detail: "no work orders in flight",
+      remedy: "",
+    },
+    {
+      status: "OK",
       name: "builder-pass",
       detail:
         "builder pass current, last 2026-08-01T00:00:00Z (age 0m; 3h cadence)",
@@ -416,7 +422,7 @@ describe("doctor golden output", () => {
       },
     });
 
-    expect(report.split("\n").filter(Boolean)).toHaveLength(11);
+    expect(report.split("\n").filter(Boolean)).toHaveLength(12);
     expect(existsSync(missing)).toBe(false);
   });
 
@@ -469,6 +475,47 @@ describe("doctor golden output", () => {
 
     expect(run(fixture)).toContain(
       "WARN|trace-lease|trace stale, last 2026-07-30T00:00:00Z (older than 24h); lease idle|run /ostrom:gatekeep and confirm the recurring loop is active\n",
+    );
+  });
+
+  it("reports an active work order in flight", () => {
+    const fixture = baseFixture();
+    const systemctl = join(fixture.root, "systemctl-active");
+    writeFileSync(systemctl, "#!/bin/sh\nprintf 'active\\n'\n");
+    command("chmod", ["+x", systemctl]);
+    writeFileSync(
+      join(fixture.configDir, "ostrom", "sprint.jsonl"),
+      '{"ts":"2026-08-01T00:00:00Z","kind":"pass-ended","fact":{"owner":"builder-fixture-wake1","outcome":"completed"},"narration":{}}\n' +
+        '{"ts":"2026-08-01T00:00:00Z","kind":"pass-ended","fact":{"owner":"gatekeeper-fixture-wake1","outcome":"completed"},"narration":{}}\n' +
+        '{"ts":"2026-08-01T00:01:00Z","kind":"work-dispatched","fact":{"schema_version":1,"item_id":"example-org/example-repo#123","order_id":"order-placeholder","unit_name":"ostrom-implementer-0123456789abcdef","backend":"systemd","cost_ceiling_usd":20,"token_ceiling":500000,"cost_usd":null,"duration_seconds":0},"narration":{}}\n',
+    );
+
+    expect(run(fixture, { MANDATE_SYSTEMCTL_BIN: systemctl })).toContain(
+      "OK|work-orders|1 in flight: example-org/example-repo#123 (ostrom-implementer-0123456789abcdef)|\n",
+    );
+  });
+
+  it("faults when a dispatched unit exits without a terminal row", () => {
+    const fixture = baseFixture();
+    const systemctl = join(fixture.root, "systemctl-exited");
+    writeFileSync(systemctl, "#!/bin/sh\nexit 4\n");
+    command("chmod", ["+x", systemctl]);
+    const tracePath = join(fixture.configDir, "ostrom", "sprint.jsonl");
+    const dispatch =
+      '{"ts":"2026-08-01T00:01:00Z","kind":"work-dispatched","fact":{"schema_version":1,"item_id":"example-org/example-repo#123","order_id":"order-placeholder","unit_name":"ostrom-implementer-0123456789abcdef","backend":"systemd","cost_ceiling_usd":20,"token_ceiling":500000,"cost_usd":null,"duration_seconds":0},"narration":{}}\n';
+    writeFileSync(tracePath, readFileSync(tracePath, "utf8") + dispatch);
+
+    expect(run(fixture, { MANDATE_SYSTEMCTL_BIN: systemctl })).toContain(
+      "FAIL|work-orders|1 in flight; unit exited without terminal row: example-org/example-repo#123 (ostrom-implementer-0123456789abcdef)|inspect the transient unit journal and append work-failed before clearing its per-item lease\n",
+    );
+
+    writeFileSync(
+      tracePath,
+      readFileSync(tracePath, "utf8") +
+        '{"ts":"2026-08-01T00:02:00Z","kind":"work-failed","fact":{"schema_version":1,"item_id":"example-org/example-repo#123","order_id":"order-placeholder","unit_name":"ostrom-implementer-0123456789abcdef","backend":"systemd","cost_ceiling_usd":20,"token_ceiling":500000,"cost_usd":null,"duration_seconds":60,"pr_url":null,"reason":"signal-TERM"},"narration":{}}\n',
+    );
+    expect(run(fixture, { MANDATE_SYSTEMCTL_BIN: systemctl })).toContain(
+      "OK|work-orders|no work orders in flight|\n",
     );
   });
 

@@ -972,6 +972,375 @@ CLAUDE_CONFIG_DIR="$cap_bad_override_config" CLAUDE_BIN="$fake_claude" \
   bash "$PLUGIN_ROOT/scripts/pass.sh" builder >/dev/null
 [ -s "$cap_bad_override_args" ]
 
+# #104: triage writes a versioned, canonical order and hands only its path to
+# the backend-neutral dispatch verb. The systemd backend returns immediately,
+# leaving a per-item lease and work-dispatched row owned by the outliving unit.
+dispatch_fixture="$fixture/dispatch"
+dispatch_config="$dispatch_fixture/config"
+dispatch_bin="$dispatch_fixture/bin"
+mkdir -p "$dispatch_config/ostrom" "$dispatch_bin"
+dispatch_candidate="$dispatch_fixture/candidate.json"
+cat >"$dispatch_candidate" <<'JSON'
+{"schema_version":1,"item_id":"example-org/example-repo#123","repository":"example-org/example-repo","item_ref":"#123","branch_name":"feat/123-placeholder","spec":"Implement one synthetic behavior.","acceptance_criteria":["The synthetic behavior is observable."],"constraints":["Use placeholder data only."]}
+JSON
+dispatch_order="$(
+  CLAUDE_CONFIG_DIR="$dispatch_config" \
+    MANDATE_TRACE_TIME="2026-08-11T02:00:00Z" \
+    bash "$PLUGIN_ROOT/scripts/work-order.sh" create "$dispatch_candidate"
+)"
+bash "$PLUGIN_ROOT/scripts/work-order.sh" validate "$dispatch_order"
+jq -e '
+  keys == ["acceptance_criteria", "branch_name", "constraints",
+    "cost_ceiling_usd", "created_at", "item_id", "item_ref", "order_id",
+    "repository", "schema_version", "spec", "token_ceiling"]
+  and .schema_version == 1
+  and .cost_ceiling_usd == 20
+  and .token_ceiling == 500000
+  and .item_id == "example-org/example-repo#123"
+' "$dispatch_order" >/dev/null
+
+fake_dispatch_gh="$dispatch_bin/gh-as"
+cat >"$fake_dispatch_gh" <<'SH'
+#!/usr/bin/env bash
+if [ "${FAKE_OPEN_PR:-0}" -eq 1 ]; then
+  printf '%s\n' '[{"number":77,"body":"Closes example-org/example-repo#123","url":"https://example.test/pull/77"}]'
+else
+  printf '%s\n' '[]'
+fi
+SH
+fake_systemd_run="$dispatch_bin/systemd-run"
+cat >"$fake_systemd_run" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$@" >"$FAKE_SYSTEMD_ARGS"
+printf 'called\n' >>"$FAKE_SYSTEMD_CALLS"
+SH
+fake_dispatch_codex="$dispatch_bin/codex"
+cat >"$fake_dispatch_codex" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+chmod +x "$fake_dispatch_gh" "$fake_systemd_run" "$fake_dispatch_codex"
+dispatch_args="$dispatch_fixture/systemd-args"
+dispatch_calls="$dispatch_fixture/systemd-calls"
+dispatch_unit="$(
+  CLAUDE_CONFIG_DIR="$dispatch_config" \
+    MANDATE_TRACE_TIME="2026-08-11T02:01:00Z" \
+    MANDATE_NOW_EPOCH="$cap_today_epoch" \
+    MANDATE_GH_AS_BIN="$fake_dispatch_gh" \
+    MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
+    CODEX_BIN="$fake_dispatch_codex" \
+    FAKE_SYSTEMD_ARGS="$dispatch_args" \
+    FAKE_SYSTEMD_CALLS="$dispatch_calls" \
+    bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$dispatch_order"
+)"
+[ "$dispatch_unit" = "ostrom-implementer-9bb890b1b3b47926" ]
+[ "$(wc -l <"$dispatch_calls" | tr -d '[:space:]')" -eq 1 ]
+grep -qx 'RuntimeMaxSec=infinity' "$dispatch_args"
+grep -qx 'KillMode=control-group' "$dispatch_args"
+grep -qx "$PLUGIN_ROOT/scripts/implement.sh" "$dispatch_args"
+dispatch_lease="$dispatch_config/ostrom/implementer-item-9bb890b1b3b47926c7fff1a3e7e38413f8ad65bea2a5b126acc3c6098fd7fb82.lease"
+jq -e --arg owner "$dispatch_unit" '.owner == $owner' "$dispatch_lease" >/dev/null
+jq -s -e '
+  length == 1
+  and .[0].kind == "work-dispatched"
+  and .[0].fact.schema_version == 1
+  and .[0].fact.item_id == "example-org/example-repo#123"
+  and .[0].fact.unit_name == "ostrom-implementer-9bb890b1b3b47926"
+  and .[0].fact.backend == "systemd"
+  and .[0].fact.cost_usd == null
+  and .[0].fact.duration_seconds == 0
+' "$dispatch_config/ostrom/sprint.jsonl" >/dev/null
+
+# All three duplicate guards fail closed independently. A live lease refuses
+# first; after its controlled release, the unmatched dispatch row refuses;
+# after a terminal row, an open PR reference refuses.
+set +e
+CLAUDE_CONFIG_DIR="$dispatch_config" \
+  MANDATE_NOW_EPOCH="$cap_today_epoch" \
+  MANDATE_GH_AS_BIN="$fake_dispatch_gh" \
+  MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
+  CODEX_BIN="$fake_dispatch_codex" \
+  FAKE_SYSTEMD_ARGS="$dispatch_args" FAKE_SYSTEMD_CALLS="$dispatch_calls" \
+  bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$dispatch_order" >/dev/null 2>&1
+live_lease_dispatch_status=$?
+set -e
+[ "$live_lease_dispatch_status" -eq 3 ]
+[ "$(wc -l <"$dispatch_calls" | tr -d '[:space:]')" -eq 1 ]
+CLAUDE_CONFIG_DIR="$dispatch_config" \
+  MANDATE_LEASE_NAME="${dispatch_lease##*/}" \
+  bash "$PLUGIN_ROOT/scripts/lease.sh" release "$dispatch_unit"
+set +e
+CLAUDE_CONFIG_DIR="$dispatch_config" \
+  MANDATE_NOW_EPOCH="$cap_today_epoch" \
+  MANDATE_GH_AS_BIN="$fake_dispatch_gh" \
+  MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
+  CODEX_BIN="$fake_dispatch_codex" \
+  FAKE_SYSTEMD_ARGS="$dispatch_args" FAKE_SYSTEMD_CALLS="$dispatch_calls" \
+  bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$dispatch_order" >/dev/null 2>&1
+inflight_dispatch_status=$?
+set -e
+[ "$inflight_dispatch_status" -eq 3 ]
+dispatch_order_id="$(jq -r '.order_id' "$dispatch_order")"
+MANDATE_TRACE_TIME="2026-08-11T02:02:00Z" \
+  CLAUDE_CONFIG_DIR="$dispatch_config" \
+  bash "$PLUGIN_ROOT/scripts/trace.sh" append work-failed \
+    "$(jq -cn --arg order_id "$dispatch_order_id" \
+      '{schema_version:1,item_id:"example-org/example-repo#123",
+        order_id:$order_id,unit_name:"ostrom-implementer-9bb890b1b3b47926",
+        backend:"systemd",cost_ceiling_usd:20,token_ceiling:500000,
+        cost_usd:0,duration_seconds:60,pr_url:null,reason:"synthetic",
+        usage:{input_tokens:0,cached_input_tokens:0,output_tokens:0,
+          reasoning_output_tokens:0}}')" \
+    '{}' >/dev/null
+set +e
+FAKE_OPEN_PR=1 CLAUDE_CONFIG_DIR="$dispatch_config" \
+  MANDATE_NOW_EPOCH="$cap_today_epoch" \
+  MANDATE_GH_AS_BIN="$fake_dispatch_gh" \
+  MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
+  CODEX_BIN="$fake_dispatch_codex" \
+  FAKE_SYSTEMD_ARGS="$dispatch_args" FAKE_SYSTEMD_CALLS="$dispatch_calls" \
+  bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$dispatch_order" >/dev/null 2>&1
+open_pr_dispatch_status=$?
+set -e
+[ "$open_pr_dispatch_status" -eq 3 ]
+[ "$(wc -l <"$dispatch_calls" | tr -d '[:space:]')" -eq 1 ]
+
+# Two unmatched orders consume the default concurrency limit even if they are
+# for different items. The new item's speculative lease is released when the
+# dispatcher refuses it.
+concurrency_config="$dispatch_fixture/concurrency-config"
+mkdir -p "$concurrency_config/ostrom"
+cat >"$concurrency_config/ostrom/sprint.jsonl" <<'JSONL'
+{"ts":"2026-08-11T01:00:00Z","kind":"work-dispatched","fact":{"schema_version":1,"item_id":"example-org/example-repo#130","order_id":"order-a","unit_name":"ostrom-implementer-aaaaaaaaaaaaaaaa","backend":"systemd","cost_ceiling_usd":20,"token_ceiling":500000,"cost_usd":null,"duration_seconds":0},"narration":{}}
+{"ts":"2026-08-11T01:01:00Z","kind":"work-dispatched","fact":{"schema_version":1,"item_id":"example-org/example-repo#131","order_id":"order-b","unit_name":"ostrom-implementer-bbbbbbbbbbbbbbbb","backend":"systemd","cost_ceiling_usd":20,"token_ceiling":500000,"cost_usd":null,"duration_seconds":0},"narration":{}}
+JSONL
+concurrency_candidate="$dispatch_fixture/concurrency-candidate.json"
+cat >"$concurrency_candidate" <<'JSON'
+{"schema_version":1,"item_id":"example-org/example-repo#132","repository":"example-org/example-repo","item_ref":"#132","branch_name":"feat/132-placeholder","spec":"Implement a concurrency fixture.","acceptance_criteria":["The fixture is observable."],"constraints":["Use placeholder data only."]}
+JSON
+concurrency_order="$(
+  CLAUDE_CONFIG_DIR="$concurrency_config" \
+    MANDATE_TRACE_TIME="2026-08-11T01:02:00Z" \
+    bash "$PLUGIN_ROOT/scripts/work-order.sh" create "$concurrency_candidate"
+)"
+set +e
+CLAUDE_CONFIG_DIR="$concurrency_config" \
+  MANDATE_NOW_EPOCH="$cap_today_epoch" \
+  MANDATE_GH_AS_BIN="$fake_dispatch_gh" \
+  MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
+  CODEX_BIN="$fake_dispatch_codex" \
+  FAKE_SYSTEMD_ARGS="$dispatch_args" FAKE_SYSTEMD_CALLS="$dispatch_calls" \
+  bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$concurrency_order" >/dev/null 2>&1
+concurrency_dispatch_status=$?
+set -e
+[ "$concurrency_dispatch_status" -eq 3 ]
+concurrency_hash="$(bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash 'example-org/example-repo#132')"
+[ ! -e "$concurrency_config/ostrom/implementer-item-$concurrency_hash.lease" ]
+[ "$(wc -l <"$dispatch_calls" | tr -d '[:space:]')" -eq 1 ]
+
+# The daily cap is checked again immediately before dispatch, including the
+# new order's full reservation. Reaching it creates no unit and leaks no lease.
+cap_dispatch_candidate="$dispatch_fixture/cap-candidate.json"
+cat >"$cap_dispatch_candidate" <<'JSON'
+{"schema_version":1,"item_id":"example-org/example-repo#124","repository":"example-org/example-repo","item_ref":"#124","branch_name":"feat/124-placeholder","spec":"Implement another synthetic behavior.","acceptance_criteria":["The other behavior is observable."],"constraints":["Use placeholder data only."]}
+JSON
+cap_dispatch_order="$(
+  CLAUDE_CONFIG_DIR="$dispatch_config" \
+    MANDATE_TRACE_TIME="2026-08-11T02:03:00Z" \
+    bash "$PLUGIN_ROOT/scripts/work-order.sh" create "$cap_dispatch_candidate"
+)"
+MANDATE_TRACE_TIME="2026-08-11T02:04:00Z" \
+  CLAUDE_CONFIG_DIR="$dispatch_config" \
+  bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
+    '{"owner":"builder-synthetic-wake1","outcome":"completed","cost_usd":50,"duration_seconds":1}' \
+    '{}' >/dev/null
+set +e
+CLAUDE_CONFIG_DIR="$dispatch_config" \
+  MANDATE_NOW_EPOCH="$cap_today_epoch" \
+  MANDATE_GH_AS_BIN="$fake_dispatch_gh" \
+  MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
+  CODEX_BIN="$fake_dispatch_codex" \
+  FAKE_SYSTEMD_ARGS="$dispatch_args" FAKE_SYSTEMD_CALLS="$dispatch_calls" \
+  bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$cap_dispatch_order" >/dev/null 2>&1
+cap_dispatch_status=$?
+set -e
+[ "$cap_dispatch_status" -eq 3 ]
+cap_item_hash="$(bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash 'example-org/example-repo#124')"
+[ ! -e "$dispatch_config/ostrom/implementer-item-$cap_item_hash.lease" ]
+[ "$(wc -l <"$dispatch_calls" | tr -d '[:space:]')" -eq 1 ]
+
+# The implementer owns cleanup for its whole lifetime. A TERM during Codex
+# kills the child, records work-failed, and releases the per-item lease. A
+# separate completed order proves the same wrapper commits, pushes, and opens
+# its PR after the offline Codex process has exited.
+implement_fixture="$fixture/implementer"
+implement_config="$implement_fixture/config"
+implement_source="$implement_fixture/source"
+implement_remote="$implement_fixture/origin.git"
+implement_bin="$implement_fixture/bin"
+mkdir -p "$implement_config/ostrom" "$implement_source" "$implement_bin"
+git -C "$implement_source" init -b main >/dev/null
+git -C "$implement_source" config user.name "Ostrom Test"
+git -C "$implement_source" config user.email "ostrom@example.test"
+printf 'base\n' >"$implement_source/base.txt"
+git -C "$implement_source" add base.txt
+git -C "$implement_source" commit -m fixture >/dev/null
+git init --bare "$implement_remote" >/dev/null
+git -C "$implement_source" remote add origin "$implement_remote"
+git -C "$implement_source" push -u origin main >/dev/null
+
+fake_implement_gh="$implement_bin/gh-as"
+cat >"$fake_implement_gh" <<'SH'
+#!/usr/bin/env bash
+shift 2
+if [ "$1" = gh ] && [ "$2" = repo ] && [ "$3" = view ]; then
+  printf 'main\n'
+  exit 0
+fi
+if [ "$1" = gh ] && [ "$2" = pr ] && [ "$3" = create ]; then
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = --body-file ]; then
+      cp "$2" "$FAKE_PR_BODY"
+      break
+    fi
+    shift
+  done
+  printf 'https://example.test/pull/125\n'
+  exit 0
+fi
+args=("$@")
+for index in "${!args[@]}"; do
+  case "${args[$index]}" in
+    https://github.com/*.git) args[$index]="$FAKE_GIT_REMOTE" ;;
+  esac
+done
+exec "${args[@]}"
+SH
+fake_codex="$implement_bin/codex"
+cat >"$fake_codex" <<'SH'
+#!/usr/bin/env bash
+worktree=""
+result=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -C) worktree="$2"; shift 2 ;;
+    -o) result="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+case "${FAKE_CODEX_MODE:-complete}" in
+  wait)
+    printf '%s\n' "$$" >"$FAKE_CODEX_MARKER"
+    trap 'exit 143' TERM
+    while :; do sleep 1; done
+    ;;
+  complete)
+    printf 'implemented\n' >"$worktree/generated.txt"
+    printf 'Synthetic implementation completed.\n' >"$result"
+    printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":50,"reasoning_output_tokens":10}}'
+    ;;
+esac
+SH
+chmod +x "$fake_implement_gh" "$fake_codex"
+
+implement_kill_candidate="$implement_fixture/kill-candidate.json"
+cat >"$implement_kill_candidate" <<'JSON'
+{"schema_version":1,"item_id":"example-org/example-repo#125","repository":"example-org/example-repo","item_ref":"#125","branch_name":"feat/125-placeholder","spec":"Implement a synthetic killed order.","acceptance_criteria":["The synthetic change exists."],"constraints":["Use placeholder data only."]}
+JSON
+implement_kill_order="$(
+  CLAUDE_CONFIG_DIR="$implement_config" \
+    MANDATE_TRACE_TIME="2026-08-11T03:00:00Z" \
+    bash "$PLUGIN_ROOT/scripts/work-order.sh" create "$implement_kill_candidate"
+)"
+implement_kill_hash="$(bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash 'example-org/example-repo#125')"
+implement_kill_unit="ostrom-implementer-${implement_kill_hash:0:16}"
+implement_kill_lease="implementer-item-$implement_kill_hash.lease"
+CLAUDE_CONFIG_DIR="$implement_config" MANDATE_LEASE_NAME="$implement_kill_lease" \
+  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire "$implement_kill_unit" 3600 >/dev/null
+implement_kill_marker="$implement_fixture/codex-started"
+FAKE_CODEX_MODE=wait FAKE_CODEX_MARKER="$implement_kill_marker" \
+  CODEX_BIN="$fake_codex" CLAUDE_CONFIG_DIR="$implement_config" \
+  MANDATE_IMPLEMENTER_SOURCE_REPO="$implement_source" \
+  MANDATE_GH_AS_BIN="$fake_implement_gh" FAKE_GIT_REMOTE="$implement_remote" \
+  FAKE_PR_BODY="$implement_fixture/unused-pr-body" \
+  bash "$PLUGIN_ROOT/scripts/implement.sh" \
+    "$implement_kill_order" "$implement_kill_unit" \
+    >"$implement_fixture/kill.out" 2>"$implement_fixture/kill.err" &
+implement_kill_pid=$!
+for _attempt in $(seq 1 100); do
+  [ -s "$implement_kill_marker" ] && break
+  sleep 0.05
+done
+[ -s "$implement_kill_marker" ]
+implement_codex_pid="$(cat "$implement_kill_marker")"
+kill -TERM "$implement_kill_pid"
+set +e
+wait "$implement_kill_pid"
+implement_kill_status=$?
+set -e
+[ "$implement_kill_status" -eq 143 ]
+[ ! -e "$implement_config/ostrom/$implement_kill_lease" ]
+if kill -0 "$implement_codex_pid" 2>/dev/null; then
+  echo "killed implementer left its Codex child running" >&2
+  exit 1
+fi
+jq -s -e '
+  length == 1
+  and .[0].kind == "work-failed"
+  and .[0].fact.item_id == "example-org/example-repo#125"
+  and .[0].fact.reason == "signal-TERM"
+  and .[0].fact.cost_usd == 0
+  and (.[0].fact.duration_seconds | type == "number")
+' "$implement_config/ostrom/sprint.jsonl" >/dev/null
+
+implement_ok_candidate="$implement_fixture/ok-candidate.json"
+cat >"$implement_ok_candidate" <<'JSON'
+{"schema_version":1,"item_id":"example-org/example-repo#126","repository":"example-org/example-repo","item_ref":"#126","branch_name":"feat/126-placeholder","spec":"Implement a synthetic completed order.","acceptance_criteria":["The generated placeholder file exists."],"constraints":["Use placeholder data only."]}
+JSON
+implement_ok_order="$(
+  CLAUDE_CONFIG_DIR="$implement_config" \
+    MANDATE_TRACE_TIME="2026-08-11T03:01:00Z" \
+    bash "$PLUGIN_ROOT/scripts/work-order.sh" create "$implement_ok_candidate"
+)"
+implement_ok_hash="$(bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash 'example-org/example-repo#126')"
+implement_ok_unit="ostrom-implementer-${implement_ok_hash:0:16}"
+implement_ok_lease="implementer-item-$implement_ok_hash.lease"
+CLAUDE_CONFIG_DIR="$implement_config" MANDATE_LEASE_NAME="$implement_ok_lease" \
+  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire "$implement_ok_unit" 3600 >/dev/null
+implement_pr_body="$implement_fixture/pr-body"
+CODEX_BIN="$fake_codex" CLAUDE_CONFIG_DIR="$implement_config" \
+  MANDATE_IMPLEMENTER_SOURCE_REPO="$implement_source" \
+  MANDATE_GH_AS_BIN="$fake_implement_gh" FAKE_GIT_REMOTE="$implement_remote" \
+  FAKE_PR_BODY="$implement_pr_body" \
+  bash "$PLUGIN_ROOT/scripts/implement.sh" \
+    "$implement_ok_order" "$implement_ok_unit" \
+    >"$implement_fixture/ok.out" 2>"$implement_fixture/ok.err"
+grep -q 'https://example.test/pull/125' "$implement_fixture/ok.out"
+[ ! -e "$implement_config/ostrom/$implement_ok_lease" ]
+git --git-dir="$implement_remote" show-ref --verify \
+  refs/heads/feat/126-placeholder >/dev/null
+[ "$(git --git-dir="$implement_remote" log -1 --format='%(trailers:key=Ostrom-Role,valueonly)' refs/heads/feat/126-placeholder)" = builder ]
+grep -q 'workspace-write' "$implement_pr_body"
+grep -q 'approval policy `never`' "$implement_pr_body"
+grep -q '^Ostrom-Role: builder$' "$implement_pr_body"
+jq -s -e '
+  .[-1].kind == "work-completed"
+  and .[-1].fact.item_id == "example-org/example-repo#126"
+  and .[-1].fact.pr_url == "https://example.test/pull/125"
+  and .[-1].fact.reason == null
+  and (.[-1].fact.cost_usd | type == "number" and . > 0 and . < 20)
+  and .[-1].fact.usage.output_tokens == 50
+' "$implement_config/ostrom/sprint.jsonl" >/dev/null
+
+# Triage itself contains no implementation route. This is an effective
+# negative assertion, so use an if block rather than `! grep` (#112).
+if grep -q 'send a bounded, single-concern change to a subagent' "$work_skill"; then
+  echo "builder triage must not implement through an in-process subagent" >&2
+  exit 1
+fi
+grep -q 'scripts/work-order.sh' "$work_skill"
+grep -q 'scripts/dispatch.sh' "$work_skill"
+
 # Trace reads make the fact/narration split structural. The ordinary read
 # cannot return a top-level narration key; the principal must name the
 # narration-specific verb to inspect that region.

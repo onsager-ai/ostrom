@@ -1,25 +1,28 @@
 ---
 name: work
-description: Advance the portfolio queue one pass by verifying, delegating,
-  reviewing, and reporting; this loop is the builder's and must run in a
-  builder session.
+description: Triage the portfolio queue one pass by verifying, writing durable
+  work orders, dispatching implementers, and reporting; this loop is the
+  builder's and must run in a builder session.
 argument-hint: "[optional queue focus, e.g. project name or item class]"
 ---
 
 # Mandate Work
 
-Work the portfolio queue forward for one pass. Recurrence belongs to the
-external pass timer; never create or renew an in-session recurring wake.
+Triage the portfolio queue for one pass. Recurrence belongs to the external
+pass timer; never create or renew an in-session recurring wake. This pass ends
+after dispatch. Implementation runs in a separate transient unit and must
+outlive this session when necessary.
 
 Assume no context from any previous session. Everything needed is on disk or
 on GitHub. Relying on conversation memory makes the work unsustainable.
 
 ## 1. Stay in the builder role
 
-Run this loop only in a builder session. The builder verifies and delegates
-implementation, reviews returned work, commits, and opens pull requests. It
-never merges its own work; `/ostrom:gatekeep` runs independently in a separate
-gatekeeper session.
+Run this loop only in a builder session. The builder verifies queue items,
+writes durable work orders, and dispatches implementers. It does not implement,
+review returned diffs, create worktrees, commit, push, or open pull requests in
+this pass. The implementer owns those steps and `/ostrom:gatekeep` independently
+judges what it produces.
 
 ## 2. Acquire the builder lease and start its trace
 
@@ -110,29 +113,30 @@ read from open pull requests.
 
 ## 4. Authenticate through the shared App
 
-The builder writes code, commits, and pushes; every one of those actions
-must use the shared App rather than whoever is running this session. Never
-call `gh` directly against a GitHub remote, and never run a script that itself
-calls `gh` (such as `gate.sh`) directly either — that script belongs to the
-gatekeeper's protocol, not this one. A session's Bash tool statically rejects
+Every GitHub read or mutation in triage, and every authenticated action the
+implementer later performs, must use the shared App rather than whoever is
+running this session. Never call `gh` directly against a GitHub remote, and
+never run a script that itself calls `gh` (such as `gate.sh`) directly either —
+that script belongs to the gatekeeper's protocol, not this one. A session's
+Bash tool statically rejects
 command substitution before permission matching, so this step cannot capture
 `app-token.sh`'s output into a variable (`token="$(app-token.sh ...)"`) the way
 an interactive shell would — no allow rule can fix that rejection, because it
-never reaches allow-rule matching in the first place. Route every `gh` call
-for an item's repository through `gh-as.sh`, naming the `builder` role and the
-repository ahead of the command to run:
+never reaches allow-rule matching in the first place. Route every triage `gh`
+call for an item's repository through `gh-as.sh`, naming the `builder` role and
+the repository ahead of the command to run:
 
 ```sh
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/gh-as.sh" builder "$repository" \
-  gh pr create --repo "$repository" --title "$title" --body-file "$body_file"
+  gh issue view "$item_number" --repo "$repository" --comments
 ```
 
 `gh-as.sh` mints a fresh installation token for that repository inside its
 own process, exports it only there, and `exec`s the given command — the
 token never enters this session's shell state, is never assigned to a
-variable here, and is never written to disk. `git` does not read that token
-on its own, so `gh-as.sh` also points `git` at a credential helper scoped to
-that same process, and `git push` goes through it the same way:
+variable here, and is never written to disk. The implementer wrapper follows
+the same rule for `git push`: `git` does not read that token on its own, so
+`gh-as.sh` supplies a credential helper scoped to that process:
 
 ```sh
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/gh-as.sh" builder "$repository" \
@@ -144,8 +148,8 @@ whatever the checkout's `origin` happens to be. A checkout cloned over SSH
 authenticates by SSH key — the operator's own — and a credential helper has
 no effect on an SSH remote; the explicit HTTPS URL is what puts the App
 token in the authentication path at all. `git commit` itself needs no
-token — it never leaves the checkout — so only `git push` and every `gh`
-call in this protocol route through `gh-as.sh`.
+token — it never leaves the checkout — so only `git push` and every `gh` call
+in the implementer protocol route through `gh-as.sh`.
 
 Exit `111` means `gh-as.sh` itself could not authenticate and the given
 command never ran at all; report that and stop work on the item rather than
@@ -165,7 +169,7 @@ entirely; until that lands, this protocol routes through `gh-as.sh` regardless
 of what credential happens to already be present in the session's own
 environment — a working `gh-as.sh` call never needs one.
 
-## 5. Work each item
+## 5. Triage and dispatch each item
 
 **Verify before acting.** Check the named file, symbol, or command yourself. A
 claim not checked is not a finding. This applies equally to previous-session
@@ -180,76 +184,73 @@ and minted the handoff token, so the item needs no fresh escalation. It carries
 no guarantee the work is still wanted, since the queue keeps no approval
 timestamp. Read the item itself, body and comments, for a later decision, hold,
 or superseding instruction before acting. Only one that changes, cancels,
-holds, or narrows the work wins over `state`; record it and move on rather
-than implementing. One that reaffirms, re-approves, or merely clarifies the
-work is a reason to proceed. If what you find is genuinely ambiguous, ask the
-narrow question on the item and move on rather than guessing. That is not
-license to re-escalate an approved row as though it were pending — read the
-item, then act.
-Never widen a mandate to unblock yourself.
+holds, or narrows the work wins over `state`; record it and move on. One that
+reaffirms, re-approves, or merely clarifies the work is a reason to proceed. If
+what you find is genuinely ambiguous, ask the narrow question on the item and
+move on rather than guessing. Never widen a mandate to unblock yourself.
 
-**Delegate implementation.** Never implement inline. Spec the work first,
-then route by size: send a bounded, single-concern change to a subagent that
-stays in this transcript; send substantial or multi-file work to a separate
-implementer harness in a git worktree. When either route fits, prefer the
-asynchronous worktree route. A pass is cheap to repeat, and the next pass can
-pick up a long build.
+**Write a work order; never implement inline.** Do not spawn an implementation
+subagent inside this process tree. Do not edit a checkout, create a worktree,
+run implementation tests, commit, push, or open a pull request. Instead, write
+a temporary candidate JSON file with exactly this schema:
 
-Either way, review the returned diff against the spec. The summary is not
-evidence: confirm the artifact changed, run the tests, probe the load-bearing
-claim, and scan for what the implementer was never asked about — leaked
-secrets, private data in public files, and edits outside scope.
+```json
+{
+  "schema_version": 1,
+  "item_id": "owner/repository#123",
+  "repository": "owner/repository",
+  "item_ref": "#123",
+  "branch_name": "feat/123-placeholder",
+  "spec": "Complete, self-contained implementation specification.",
+  "acceptance_criteria": ["Observable criterion."],
+  "constraints": ["Scope or safety constraint."]
+}
+```
 
-Every commit the builder creates ends with the trailer
-`Ostrom-Role: builder`, and every pull request body the builder creates ends
-with the same standalone line. Add the trailer when committing and add the PR
-marker to `$body_file` before the `gh pr create` call in step 4. These markers
-restore role legibility now that GitHub renders every role as one App actor.
-They are written by the builder itself, so they are advisory records, not
-evidence of who acted and never a gate condition.
+Use placeholders above only as a shape example; populate the candidate from
+the verified item. `spec` must contain all context an implementer needs without
+conversation memory. Acceptance criteria must be observable. Constraints must
+include the mandate boundary, repository-local instructions, required tests,
+the prohibition on private data and credentials, and the required
+`Ostrom-Role: builder` commit and pull-request marker. That marker is advisory
+role attribution, never identity evidence or a gate condition.
 
-**Hand it off; do not land it.** Get the pull request open and CI green, then
-stop. The gatekeeper merges. Do not squash-merge, delete the branch, or remove
-the worktree; those are the merging party's actions. The gatekeeper's advantage
-is position: it did not write the code and has not already argued that the code
-is correct. A gate the builder can satisfy is not a gate.
+Create the canonical durable order, then dispatch it through the backend seam:
 
-**Answer your own open review threads.** A thread left open on a pull request
-you opened is the same shape as CI drift: work already begun, already failing a
-gate condition, and holding back something otherwise finished. That is why it
-outranks new delegated work. Read the thread, verify the point against the diff
-yourself, and then either fix it or reply saying why no change is warranted —
-both are answers; silence is not. An automated reviewer comments on most pull
-requests and will not chase you, so a thread nobody answers blocks the gate for
-as long as nobody answers it.
+```sh
+order_file="$(bash "${CLAUDE_PLUGIN_ROOT}/scripts/work-order.sh" create "$candidate_file")"
+unit_name="$(bash "${CLAUDE_PLUGIN_ROOT}/scripts/dispatch.sh" "$order_file")"
+```
 
-That rule covers an **unanswered** thread — the reviewer's comment is still the
-last word. Once you have replied, the thread is **answered**, and `gate.sh`
-reports the two counts separately for exactly this reason: an answered thread
-still fails `review_threads`, but it is no longer outstanding work. Do not
-re-read it looking for something to do, do not dispatch an implementer at it,
-and do not add a second reply restating the first — none of that moves the
-gate, and a thread that keeps growing looks like neglect rather than the
-settled position it is. An answered thread is stuck on the reviewer, who does
-not come back, or on the principal, who can override the gate; it is not stuck
-on you. Report it as awaiting the principal and move on.
+Do not invoke `systemd-run` yourself. `dispatch.sh` is the protocol verb and
+selects the backend; triage and the work-order format must not assume that the
+implementer runs on this machine, shares this filesystem, or has a systemd
+journal. The current systemd backend atomically checks all three duplicate
+guards before launch: no live per-item implementer lease, no open pull request
+referencing the item, and no `work-dispatched` row without a matching terminal
+row. It also checks the daily cap, reserves the order ceiling, and enforces the
+concurrency limit. Never reproduce or weaken those checks in prose.
 
-Never resolve or dismiss a review thread on your own pull request, including a
-thread you believe is fixed. `gate.sh` counts a thread as unresolved when it is
-unresolved or was resolved by the PR author. Reply and let the reviewer close
-it.
+Dispatch success is the end of work on that item for this pass. The transient
+implementer owns its worktree, offline `codex exec`, tests, commit,
+authenticated push, and pull request. The gatekeeper owns merge and cleanup. A
+review thread or CI failure that requires code is another work-order candidate;
+an answered thread with no new reviewer response remains awaiting the
+principal and must not be dispatched again.
 
-The two rules are one design. You answer; the gatekeeper judges whether the
-answer landed and resolves. A CI failure is safe to clear yourself because CI
-re-runs and re-judges independently — you certify nothing. A review thread has
-no re-judge, so resolving it is an assertion rather than a verification, and an
-assertion from the author is what the condition exists to refuse.
+Codex is the default harness. If a terminal `work-failed` row says
+`codex-unavailable`, or its unit journal shows a Codex authentication failure,
+do not silently retry the same unavailable harness. Report the order for the
+documented Claude implementer fallback, preserving the same order file,
+per-item lease name, trace shapes, worktree isolation, bounds, and
+`Ostrom-Role: builder` markers. Harness fallback changes execution only; it
+never changes the durable dispatch contract.
 
 After every item attempted, append exactly one `item-worked` record before
-moving on, including failed and blocked attempts. Its fact object carries the
-owner, durable item pointer, action taken, outcome, and every external return
-used in the report. Add fields such as `pr`, `head_sha`, or `exit_code` when
-observed; do not hide them in narration. For example:
+moving on, including failed and blocked dispatches. Its fact object carries the
+owner, durable item pointer, action (`work-order-dispatch`), outcome, and every
+external return used in the report. Add `order_id`, `order_file`, `unit_name`,
+or `exit_code` when observed; do not hide them in narration. For example:
 
 ```sh
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/trace.sh" append item-worked \
@@ -262,9 +263,10 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/trace.sh" append item-worked \
 ```
 
 Use `{}` for `item_narration` when no reasoning is needed. Increment the
-worked-item count only after this append succeeds. Report the pull request
-number and stop work on that item once its handoff is complete. If nothing has
-merged in a while, that is information for the owner, not a reason to merge.
+worked-item count only after this append succeeds. Report the order and unit,
+not a pull request that does not exist yet, and stop work on that item once its
+dispatch is complete. If nothing has merged in a while, that is information
+for the owner, not a reason to merge.
 
 ## 6. Preserve durable state
 
@@ -302,8 +304,9 @@ itself.
 ## 7. Report and stop
 
 Report briefly, visually, and inline; do not attach a file. Never give a bare
-issue number without its title. Say what landed, what failed, and what needs
-the owner. Name what was sampled rather than verified.
+issue number without its title. Say what was dispatched, what failed, and what
+needs the owner. Name what was sampled rather than verified. Never wait for an
+implementer or review its result in this pass.
 
 Stop when the queue is drained or every remaining item is blocked on an owner
 decision. Do not invent work to stay busy; an empty queue is a good outcome
