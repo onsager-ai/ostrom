@@ -94,6 +94,28 @@ GitHub actor: author-resolved threads cannot be distinguished from legitimate
 gatekeeper resolutions, branch protection cannot enforce the role split, and
 `merged_by` has no independent audit value.
 
+The builder authenticates the same way against its own `builder:` block in
+the same `secrets.yaml`, added in [#97](https://github.com/onsager-ai/ostrom/issues/97):
+
+```yaml
+builder:
+  app_id: <APP_ID>
+  private_key_path: <ABSOLUTE_PATH_TO_PRIVATE_KEY>
+```
+
+`scripts/sweep.sh` — the unattended portfolio reader behind the mandate
+queue — mints its own token from the **gatekeeper** block rather than a
+third identity ([#106](https://github.com/onsager-ai/ostrom/issues/106)): a
+GitHub App installation token grants the same effective access regardless of
+which role minted it, since it is Claude Code's per-role deny lists that
+actually separate builder from gatekeeper, and those apply only inside a
+harness-driven session, not to a freestanding script. The gatekeeper App's
+installation must therefore keep covering every repository in the mandate
+roster, not only the ones with an open pull request at any given moment —
+the sweep reads issues, PRs, default-branch CI, and commit history across
+the whole roster on every run, and a repository the gatekeeper App is not
+installed on reads as an authentication fault there, not an empty result.
+
 ## Builder profile
 
 The principal puts this JSON at
