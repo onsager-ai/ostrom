@@ -14,6 +14,9 @@ fail() {
 if [ "$#" -ne 2 ]; then
   fail "usage: app-token.sh <role> <owner>/<repo>"
 fi
+# A shared App means this name may not select a credential, but keeping it
+# required makes every harness call name its caller. It is a legibility
+# control, not an access control.
 role="$1"
 case "$role" in
   ''|[!a-z]*|*[!a-z0-9_-]*)

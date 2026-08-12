@@ -21,7 +21,7 @@ checkout's GitHub `origin` URL for a direct `/ostrom:merge` invocation. Reject t
 if this does not yield exactly one unambiguous `owner/repo`; do not guess and do
 not use an ambient GitHub credential to discover it.
 
-## 2. Authenticate as the gatekeeper App
+## 2. Authenticate through the shared App
 
 `gatekeeper.settings.json` sets `GH_TOKEN` and `GITHUB_TOKEN` to empty, so
 there is no ambient credential here to discard or fall back to by accident.
@@ -48,10 +48,15 @@ assigned to a variable here, and is never written to disk. Exit `111` means
 all; report that and stop rather than retry with an ambient credential. Any
 other exit code is the given command's own, unchanged.
 
+The required `gatekeeper` argument names the caller at the call site; it does
+not narrow the shared token. The role marker added below is likewise a
+self-asserted advisory record, not evidence of who acted and never an input to
+the gate.
+
 **A gatekeeper session that cannot mint an App token must stop, not continue as the principal.**
 
-Continuing with an ambient token would silently recreate the shared-identity
-failure the App exists to remove.
+Continuing with an ambient token would escape the App's repository blast
+radius.
 
 Do not carry facts or conclusions from an earlier evaluation. The builder's
 only reply to a verdict is a new commit; re-evaluate that new artifact from
@@ -129,7 +134,9 @@ caller's, is always about delivery, and never converts `inconclusive` into
   1. Run
      `bash "${CLAUDE_PLUGIN_ROOT}/scripts/gh-as.sh" gatekeeper "$repository" gh pr review <PR number> --repo <owner/repo> --approve`.
   2. Then run
-     `bash "${CLAUDE_PLUGIN_ROOT}/scripts/gh-as.sh" gatekeeper "$repository" gh pr merge <PR number> --repo <owner/repo>`.
+     `bash "${CLAUDE_PLUGIN_ROOT}/scripts/gh-as.sh" gatekeeper "$repository" gh pr merge <PR number> --repo <owner/repo> --body "Ostrom-Role: gatekeeper"`.
+     This makes the merge commit carry the gatekeeper role trailer even though
+     GitHub shows the same App actor for every role.
   3. Then append a `decision-taken` trace record. Merging is the
      gatekeeper's own judgment on this artifact, and it is only safe to make
      without the principal because it is cheap to undo — the reversal

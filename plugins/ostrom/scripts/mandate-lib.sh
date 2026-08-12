@@ -17,16 +17,17 @@ MANDATE_GATE_REPO_CONFIG="./.ostrom/gate.yaml"
 MANDATE_GATE_LOG="$MANDATE_DATA_DIR/gate.jsonl"
 MANDATE_EXCEPTIONS_LOG="$MANDATE_DATA_DIR/exceptions.jsonl"
 
-# Read one delivery role's GitHub App credentials from the machine-local
-# secrets file. This intentionally remains separate from the
-# shipped/user/repository config layers: credentials have no repository or
-# shipped layer.
+# Read a delivery role's GitHub App credentials from the machine-local secrets
+# file, preferring a role block so the shared-App cutover stays reversible.
+# This intentionally remains separate from the shipped/user/repository config
+# layers: credentials have no repository or shipped layer.
 mandate_load_role_credentials() {
   if [ "$#" -ne 1 ] || [ -z "${1:-}" ]; then
     echo "app-token: mandate_load_role_credentials requires exactly one role" >&2
     return 2
   fi
   local role="$1"
+  local credential_name credential_records credentials required_field
   case "$role" in
     [!a-z]*|*[!a-z0-9_-]*)
       echo "app-token: invalid role: must match [a-z][a-z0-9_-]*" >&2
@@ -39,8 +40,23 @@ mandate_load_role_credentials() {
     return 2
   fi
 
-  credential_records="$(
+  credential_name="$(
     awk -v role="$role" '
+      $0 == role ":" { found_role = 1 }
+      $0 == "shared:" { found_shared = 1 }
+      END {
+        if (found_role) print role
+        else if (found_shared) print "shared"
+        else exit 2
+      }
+    ' "$MANDATE_SECRETS_FILE"
+  )" || {
+    echo "app-token: neither $role nor shared credentials are configured" >&2
+    return 2
+  }
+
+  credential_records="$(
+    awk -v credential_name="$credential_name" '
       function trim(s) {
         sub(/^[[:space:]]+/, "", s)
         sub(/[[:space:]]+$/, "", s)
@@ -56,14 +72,14 @@ mandate_load_role_credentials() {
         return s
       }
       function fail(message) {
-        printf "app-token: could not parse %s credentials: %s\n", role, message > "/dev/stderr"
+        printf "app-token: could not parse %s credentials: %s\n", credential_name, message > "/dev/stderr"
         failed = 1
       }
-      BEGIN { in_role = 0; found_role = 0; failed = 0 }
+      BEGIN { in_credentials = 0; found_credentials = 0; failed = 0 }
       {
         raw = $0
         if (raw ~ /\t/) {
-          if (in_role) fail("tabs are not supported")
+          if (in_credentials) fail("tabs are not supported")
           next
         }
         if (raw ~ /^[[:space:]]*#/ || raw ~ /^[[:space:]]*$/) next
@@ -73,16 +89,16 @@ mandate_load_role_credentials() {
         text = substr(raw, indent + 1)
 
         if (indent == 0) {
-          in_role = (text == role ":")
-          if (in_role) found_role = 1
+          in_credentials = (text == credential_name ":")
+          if (in_credentials) found_credentials = 1
           next
         }
-        if (!in_role) next
+        if (!in_credentials) next
 
         sub(/[[:space:]]+#.*$/, "", text)
         if (text ~ /^[[:space:]]*$/) next
         if (indent != 2 || text !~ /^(app_id|installation_id|private_key_path):[[:space:]]*/) {
-          fail("unsupported " role " entry")
+          fail("unsupported " credential_name " entry")
           next
         }
 
@@ -103,8 +119,8 @@ mandate_load_role_credentials() {
         }
       }
       END {
-        if (!found_role && !failed) {
-          printf "app-token: %s credentials are not configured\n", role > "/dev/stderr"
+        if (!found_credentials && !failed) {
+          printf "app-token: %s credentials are not configured\n", credential_name > "/dev/stderr"
           exit 2
         }
         if (failed) exit 2
@@ -121,7 +137,7 @@ mandate_load_role_credentials() {
         )
       '
   )" || {
-    echo "app-token: could not parse $role credentials" >&2
+    echo "app-token: could not parse $credential_name credentials" >&2
     return 2
   }
 
@@ -129,7 +145,7 @@ mandate_load_role_credentials() {
     if ! jq -e --arg field "$required_field" \
       '.[$field] | type == "string" and length > 0' \
       >/dev/null <<<"$credentials"; then
-      echo "app-token: missing required $role field: $required_field" >&2
+      echo "app-token: missing required $credential_name field: $required_field" >&2
       return 2
     fi
   done
@@ -137,7 +153,7 @@ mandate_load_role_credentials() {
   if ! jq -e '
     .app_id | test("^[1-9][0-9]*$")
   ' >/dev/null <<<"$credentials"; then
-    echo "app-token: $role app_id must be a positive integer" >&2
+    echo "app-token: $credential_name app_id must be a positive integer" >&2
     return 2
   fi
 

@@ -73,6 +73,7 @@ write_config
 gatekeep_skill="$PLUGIN_ROOT/skills/gatekeep/SKILL.md"
 merge_skill="$PLUGIN_ROOT/skills/merge/SKILL.md"
 work_skill="$PLUGIN_ROOT/skills/work/SKILL.md"
+role_boundary_doc="$PLUGIN_ROOT/../../docs/role-permission-boundaries.md"
 work_frontmatter="$(
   awk 'NR == 1 { next } /^---$/ { exit } { print }' "$work_skill"
 )"
@@ -95,6 +96,21 @@ grep -q 'builder-<session>-wake<N>' "$work_skill"
 for trace_kind in pass-started item-worked pass-ended; do
   grep -q "trace.sh\" append $trace_kind" "$work_skill"
 done
+
+# One App erases actor-level role attribution, so every authoring protocol
+# carries a self-asserted role marker while every consumer says that marker is
+# advisory rather than turning it back into an identity control.
+grep -q 'Ostrom-Role: builder' "$work_skill"
+grep -q 'Ostrom-Role: gatekeeper' "$gatekeep_skill"
+grep -q -- '--body "Ostrom-Role: gatekeeper"' "$merge_skill"
+for role_doc in "$work_skill" "$gatekeep_skill" "$merge_skill"; do
+  grep -qi 'advisory' "$role_doc"
+  grep -qi 'evidence' "$role_doc"
+done
+grep -q 'The harness is the enforcement boundary. The App is the blast radius.' \
+  "$role_boundary_doc"
+grep -q 'no gate, audit, or authorization decision may treat it as proof' \
+  "$role_boundary_doc"
 
 # #80's reversal half: the gatekeeper records a decision-taken trace record
 # with a reversal pointer at every point it exercises its own judgment —
@@ -1310,7 +1326,7 @@ gatekeeper:
 YAML
 run_app_token_failure missing-role-block "$app_token_missing_role_block" \
   builder placeholder-owner/placeholder-repo
-grep -Fxq 'app-token: builder credentials are not configured' \
+grep -Fxq 'app-token: neither builder nor shared credentials are configured' \
   "$app_token_fixture/missing-role-block.stderr"
 
 app_token_builder="$app_token_fixture/builder"
@@ -1324,6 +1340,71 @@ builder:
 YAML
 run_app_token_success builder "$app_token_builder" builder \
   2 "$app_token_builder_key"
+
+# A role with no dedicated block resolves to the shared App. The signer stub
+# checks both fields, so this proves fallback selected the shared credential
+# rather than merely reaching the network with some parseable values.
+app_token_shared="$app_token_fixture/shared"
+mkdir -p "$app_token_shared/ostrom"
+app_token_shared_key="$app_token_shared/shared-placeholder.pem"
+: >"$app_token_shared_key"
+cat >"$app_token_shared/ostrom/secrets.yaml" <<YAML
+shared:
+  app_id: 3 # APP_ID_PLACEHOLDER_SHARED
+  private_key_path: $app_token_shared_key
+YAML
+run_app_token_success shared-fallback "$app_token_shared" reporter \
+  3 "$app_token_shared_key"
+
+# An explicit role block remains the reversible override during cutover. A
+# different shared ID and key make accidental fallback observable here.
+app_token_role_override="$app_token_fixture/role-override"
+mkdir -p "$app_token_role_override/ostrom"
+app_token_role_override_key="$app_token_role_override/builder-placeholder.pem"
+app_token_role_override_shared_key="$app_token_role_override/shared-placeholder.pem"
+: >"$app_token_role_override_key"
+: >"$app_token_role_override_shared_key"
+cat >"$app_token_role_override/ostrom/secrets.yaml" <<YAML
+shared:
+  app_id: 3 # APP_ID_PLACEHOLDER_SHARED
+  private_key_path: $app_token_role_override_shared_key
+builder:
+  app_id: 4 # APP_ID_PLACEHOLDER_BUILDER
+  private_key_path: $app_token_role_override_key
+YAML
+run_app_token_success role-override "$app_token_role_override" builder \
+  4 "$app_token_role_override_key"
+
+# A malformed role override must not silently fall through to a valid shared
+# block. Presence selects the override; validity decides whether minting may
+# continue.
+app_token_malformed_override="$app_token_fixture/malformed-override"
+mkdir -p "$app_token_malformed_override/ostrom"
+cat >"$app_token_malformed_override/ostrom/secrets.yaml" <<YAML
+shared:
+  app_id: 3 # APP_ID_PLACEHOLDER_SHARED
+  private_key_path: $app_token_shared_key
+builder:
+  app_id: 4 # APP_ID_PLACEHOLDER_BUILDER
+YAML
+run_app_token_failure malformed-override "$app_token_malformed_override" \
+  builder placeholder-owner/placeholder-repo
+grep -Fxq 'app-token: missing required builder field: private_key_path' \
+  "$app_token_fixture/malformed-override.stderr"
+
+# A present but malformed shared block is an authentication failure, never a
+# reason to try ambient principal credentials.
+app_token_malformed_shared="$app_token_fixture/malformed-shared"
+mkdir -p "$app_token_malformed_shared/ostrom"
+cat >"$app_token_malformed_shared/ostrom/secrets.yaml" <<YAML
+shared:
+  app_id: APP_ID_PLACEHOLDER_INVALID
+  private_key_path: $app_token_shared_key
+YAML
+run_app_token_failure malformed-shared "$app_token_malformed_shared" \
+  gatekeeper placeholder-owner/placeholder-repo
+grep -Fxq 'app-token: shared app_id must be a positive integer' \
+  "$app_token_fixture/malformed-shared.stderr"
 
 # With both role blocks configured, the signer sees the app ID and key path
 # belonging to the requested role. The stub rejects either cross-role mix-up.
@@ -1566,9 +1647,9 @@ grep -Fq 'gh-as: could not mint a gatekeeper token for placeholder-owner/placeho
 ! grep -q 'stub-installation-token' \
   "$gh_as_auth_fail_stdout" "$gh_as_auth_fail_stderr"
 
-# Role scoping holds through the wrapper: a builder-scoped call against a
-# config with no builder block fails the same way app-token.sh itself would,
-# rather than silently reaching the gatekeeper's key.
+# Role resolution holds through the wrapper: a builder call against a config
+# with neither builder nor shared credentials fails rather than silently
+# reaching the gatekeeper's compatibility block.
 gh_as_role_stdout="$gh_as_fixture/wrong-role.stdout"
 gh_as_role_stderr="$gh_as_fixture/wrong-role.stderr"
 set +e
@@ -1586,7 +1667,8 @@ gh_as_role_status=$?
 set -e
 [ "$gh_as_role_status" -eq 111 ]
 [ ! -s "$gh_as_role_stdout" ]
-grep -Fq 'builder credentials are not configured' "$gh_as_role_stderr"
+grep -Fq 'neither builder nor shared credentials are configured' \
+  "$gh_as_role_stderr"
 
 # `git` does not read GH_TOKEN itself, so gh-as.sh also points it at a
 # credential helper -- `gh auth git-credential`, which does -- scoped to
@@ -3655,9 +3737,9 @@ grep -q 'never falls back to an ambient credential' <<<"$auth_message"
 # (#78). An ambient GH_TOKEN/GITHUB_TOKEN in the invoking environment must
 # never rescue this: the sweep mints its own token or it does not run.
 # Two distinct missing-credential shapes, both covered: no secrets.yaml at
-# all, and a secrets.yaml that configures some other role but never falls
-# back to it -- the sweep must name its own role, gatekeeper, and refuse
-# rather than silently borrow another role's block.
+# all, and a secrets.yaml that configures some other role but has no shared
+# fallback -- the sweep must name its own role, gatekeeper, and refuse rather
+# than silently borrow another role's block.
 no_credential="$fixture/no-credential"
 mkdir -p "$no_credential/config/ostrom" "$no_credential/repo"
 cat >"$no_credential/config/ostrom/mandates.yaml" <<'YAML'
@@ -3711,7 +3793,8 @@ other_role_message="$(
 other_role_status=$?
 set -e
 [ "$other_role_status" -eq 111 ]
-grep -q 'gatekeeper credentials are not configured' <<<"$other_role_message"
+grep -q 'neither gatekeeper nor shared credentials are configured' \
+  <<<"$other_role_message"
 grep -q 'could not mint a gatekeeper token' <<<"$other_role_message"
 ! grep -q 'ambient-principal-value' <<<"$other_role_message"
 [ ! -e "$other_role_only/config/ostrom/queue.jsonl" ]
