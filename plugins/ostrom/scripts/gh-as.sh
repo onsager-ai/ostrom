@@ -21,6 +21,39 @@
 # this script writes to stdout or stderr on its own path ever includes the
 # token; only the exec'd command's own output follows.
 #
+# `git` does not read GH_TOKEN itself — only `gh` does — so a `git push`
+# needs a credential helper to bridge the two. This script points git at
+# `gh auth git-credential`, which does read GH_TOKEN, for exactly the
+# duration of the exec'd process, using the GIT_CONFIG_COUNT/KEY/VALUE
+# environment form (supported since Git 2.31) rather than `git config` or
+# `gh auth setup-git`: both of those write to a config file — `~/.gitconfig`
+# or `.git/config` — and would leave a helper reference behind after this
+# process exits. An environment variable dies with the process that set it.
+# The first pair clears any credential.helper already configured in
+# `~/.gitconfig` or the repository's own config (an operator's personal
+# helper would otherwise be tried first and could satisfy the request with
+# the operator's own stored credentials, silently defeating the whole
+# point); the second pair is the only helper left standing. Harmless for a
+# wrapped command that never calls `git`.
+#
+# An older git silently ignores the GIT_CONFIG_COUNT/KEY/VALUE environment
+# form instead of erroring on it, so this script cannot tell "the override
+# took" from "the override was dropped and git fell back to whatever
+# credential.helper the operator already has configured" by watching the
+# exec'd process's exit code alone. When the wrapped command is `git`
+# itself, this script instead checks its version up front and refuses to
+# run at all below 2.31, before a token is even minted — there is no
+# reason to mint a live token for a command that will not be allowed to
+# run. The check runs "$1" --version, not a bare `git --version`: the
+# wrapped command may be given as a path (`/opt/git-2.20/bin/git`) rather
+# than a bare name resolved off PATH, and it is that exact binary — not
+# whatever `git` happens to mean in this script's own PATH — that will
+# receive the exec and do the actual push. That check keys off the wrapped
+# command being `git` itself, not off whether it happens to invoke `git`:
+# a wrapped *script* that calls `git` internally (such as `gate.sh`) is
+# not covered, because this script has no way to know what binaries that
+# script will run.
+#
 # Usage: gh-as.sh <role> <owner>/<repo> <command> [args...]
 #
 # Exit code 111 means this script itself did not authenticate — a usage
@@ -47,6 +80,46 @@ role="$1"
 repository="$2"
 shift 2
 
+# See the comment block above: the GIT_CONFIG_COUNT/KEY/VALUE override this
+# script relies on is only honoured from Git 2.31 onward, and an older git
+# ignores it rather than erroring, so this has to be checked before doing
+# anything else — including minting a token nothing will end up using.
+case "$1" in
+  git | */git)
+    # Probe "$1" itself, not a bare `git` -- the wrapped command may be a
+    # path to a specific git binary, and that is the one that will
+    # actually exec and push, regardless of what `git` resolves to here.
+    git_version_output="$("$1" --version 2>/dev/null)" ||
+      fail "cannot enforce the ephemeral git credential helper: $1 --version failed, so a git push would silently fall back to the operator's own credentials"
+    case "$git_version_output" in
+      git\ version\ [0-9]*)
+        git_version="${git_version_output#git version }"
+        git_version="${git_version%% *}"
+        ;;
+      *)
+        fail "cannot enforce the ephemeral git credential helper: could not parse a version from \"$git_version_output\", so a git push would silently fall back to the operator's own credentials"
+        ;;
+    esac
+    git_minor="${git_version#*.}"
+    git_major="${git_version%%.*}"
+    git_minor="${git_minor%%.*}"
+    case "$git_major" in
+      '' | *[!0-9]*)
+        fail "cannot enforce the ephemeral git credential helper: could not parse a version from \"$git_version_output\", so a git push would silently fall back to the operator's own credentials"
+        ;;
+    esac
+    case "$git_minor" in
+      '' | *[!0-9]*)
+        fail "cannot enforce the ephemeral git credential helper: could not parse a version from \"$git_version_output\", so a git push would silently fall back to the operator's own credentials"
+        ;;
+    esac
+    if [ "$git_major" -lt 2 ] || { [ "$git_major" -eq 2 ] && [ "$git_minor" -lt 31 ]; }; then
+      fail "cannot enforce the ephemeral git credential helper: git $git_version is older than 2.31, so a git push would silently fall back to the operator's own credentials"
+    fi
+    unset git_version_output git_version git_major git_minor
+    ;;
+esac
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 token="$(bash "$SCRIPT_DIR/app-token.sh" "$role" "$repository")" ||
@@ -56,5 +129,8 @@ if [ -z "$token" ]; then
 fi
 
 export GH_TOKEN="$token" GITHUB_TOKEN="$token"
+export GIT_CONFIG_COUNT=2
+export GIT_CONFIG_KEY_0="credential.helper" GIT_CONFIG_VALUE_0=""
+export GIT_CONFIG_KEY_1="credential.helper" GIT_CONFIG_VALUE_1="!gh auth git-credential"
 unset token role repository SCRIPT_DIR
 exec "$@"

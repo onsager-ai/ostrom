@@ -1473,6 +1473,234 @@ set -e
 [ ! -s "$gh_as_role_stdout" ]
 grep -Fq 'builder credentials are not configured' "$gh_as_role_stderr"
 
+# `git` does not read GH_TOKEN itself, so gh-as.sh also points it at a
+# credential helper -- `gh auth git-credential`, which does -- scoped to
+# this one process via the GIT_CONFIG_COUNT/KEY/VALUE environment form,
+# never via `git config` or `gh auth setup-git`, either of which would
+# leave a helper reference behind in a config file on disk after this
+# process exits. This is #41's regression guard: the credential helper must
+# reach a wrapped `git` the same way GH_TOKEN reaches a wrapped `gh`, must
+# clear any credential.helper already configured elsewhere first (an
+# operator's own helper trying first could otherwise satisfy the request
+# with the operator's own stored credentials, silently defeating the whole
+# point), and must never appear in gh-as.sh's own stdout or stderr.
+# gh-as.sh probes `git --version` before doing anything else, so every fake
+# `git` in this file has to answer that call the way a real, current git
+# would; this one reports a version comfortably above 2.31 so the version
+# check falls through to the normal path exercised below.
+cat >"$gh_as_fixture/bin/git" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = "--version" ]; then
+  printf 'git version 2.43.0\n'
+  exit 0
+fi
+: >"$GH_AS_GIT_SEEN_FILE"
+{
+  printf 'count=%s\n' "${GIT_CONFIG_COUNT:-}"
+  printf 'key0=%s\n' "${GIT_CONFIG_KEY_0:-}"
+  printf 'value0=%s\n' "${GIT_CONFIG_VALUE_0:-}"
+  printf 'key1=%s\n' "${GIT_CONFIG_KEY_1:-}"
+  printf 'value1=%s\n' "${GIT_CONFIG_VALUE_1:-}"
+  printf 'gh_token=%s\n' "${GH_TOKEN:-}"
+} >>"$GH_AS_GIT_SEEN_FILE"
+printf 'gh-as-git-test: called with %s\n' "$*"
+EOF
+chmod +x "$gh_as_fixture/bin/git"
+
+gh_as_git_seen="$gh_as_fixture/git-token-seen"
+gh_as_git_stdout="$gh_as_fixture/git-push.stdout"
+gh_as_git_stderr="$gh_as_fixture/git-push.stderr"
+rm -f "$gh_as_git_seen"
+PATH="$gh_as_fixture/bin:$app_token_fixture/bin:$PATH" \
+  GH_TOKEN="" \
+  GITHUB_TOKEN="" \
+  FAKE_CURL_MODE=success \
+  CLAUDE_CONFIG_DIR="$app_token_builder" \
+  CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+  GH_AS_GIT_SEEN_FILE="$gh_as_git_seen" \
+  bash "$PLUGIN_ROOT/scripts/gh-as.sh" builder \
+    placeholder-owner/placeholder-repo \
+    git push https://github.com/placeholder-owner/placeholder-repo.git \
+    HEAD:refs/heads/placeholder \
+    >"$gh_as_git_stdout" 2>"$gh_as_git_stderr"
+gh_as_git_status=$?
+[ "$gh_as_git_status" -eq 0 ]
+[ -s "$gh_as_git_seen" ]
+grep -Fxq 'count=2' "$gh_as_git_seen"
+grep -Fxq 'key0=credential.helper' "$gh_as_git_seen"
+grep -Fxq 'value0=' "$gh_as_git_seen"
+grep -Fxq 'key1=credential.helper' "$gh_as_git_seen"
+grep -Fxq 'value1=!gh auth git-credential' "$gh_as_git_seen"
+grep -Fxq 'gh_token=stub-installation-token' "$gh_as_git_seen"
+grep -Fq 'gh-as-git-test: called with push https://github.com/placeholder-owner/placeholder-repo.git HEAD:refs/heads/placeholder' \
+  "$gh_as_git_stdout"
+[ ! -s "$gh_as_git_stderr" ]
+! grep -q 'stub-installation-token' "$gh_as_git_stdout" "$gh_as_git_stderr"
+
+# #97 review: the GIT_CONFIG_COUNT/KEY/VALUE form is only honoured from Git
+# 2.31 onward, and an older git ignores it rather than erroring, so a stale
+# git would silently fall back to whatever credential.helper the operator
+# already has configured -- exactly the leak this script exists to close.
+# gh-as.sh checks the wrapped git's version before minting anything, and
+# only when the wrapped command is `git` itself.
+gh_as_old_git_bin="$gh_as_fixture/bin-old-git"
+mkdir -p "$gh_as_old_git_bin"
+cat >"$gh_as_old_git_bin/git" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = "--version" ]; then
+  printf 'git version 2.30.2\n'
+  exit 0
+fi
+# gh-as.sh should never reach here for an old git -- if it does, the
+# version check did not fail closed, and the test must catch that.
+: >"$GH_AS_GIT_SEEN_FILE"
+printf 'gh-as-old-git-test: called with %s\n' "$*" >>"$GH_AS_GIT_SEEN_FILE"
+EOF
+chmod +x "$gh_as_old_git_bin/git"
+
+gh_as_old_git_seen="$gh_as_fixture/old-git-seen"
+gh_as_old_git_stdout="$gh_as_fixture/old-git.stdout"
+gh_as_old_git_stderr="$gh_as_fixture/old-git.stderr"
+rm -f "$gh_as_old_git_seen" "$app_token_curl_log"
+set +e
+PATH="$gh_as_old_git_bin:$gh_as_fixture/bin:$app_token_fixture/bin:$PATH" \
+  GH_TOKEN="" \
+  GITHUB_TOKEN="" \
+  FAKE_CURL_MODE=success \
+  FAKE_CURL_CALL_LOG="$app_token_curl_log" \
+  CLAUDE_CONFIG_DIR="$app_token_builder" \
+  CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+  GH_AS_GIT_SEEN_FILE="$gh_as_old_git_seen" \
+  bash "$PLUGIN_ROOT/scripts/gh-as.sh" builder \
+    placeholder-owner/placeholder-repo \
+    git push https://github.com/placeholder-owner/placeholder-repo.git \
+    HEAD:refs/heads/placeholder \
+    >"$gh_as_old_git_stdout" 2>"$gh_as_old_git_stderr"
+gh_as_old_git_status=$?
+set -e
+[ "$gh_as_old_git_status" -eq 111 ]
+[ ! -e "$gh_as_old_git_seen" ]
+[ ! -e "$app_token_curl_log" ]
+[ ! -s "$gh_as_old_git_stdout" ]
+grep -Fq '2.30.2' "$gh_as_old_git_stderr"
+grep -Fq 'older than 2.31' "$gh_as_old_git_stderr"
+
+# The mirror image: a git new enough to honour GIT_CONFIG_COUNT/KEY/VALUE
+# clears the check and reaches the same normal path proven above.
+gh_as_new_git_bin="$gh_as_fixture/bin-new-git"
+mkdir -p "$gh_as_new_git_bin"
+cat >"$gh_as_new_git_bin/git" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = "--version" ]; then
+  printf 'git version 2.45.0\n'
+  exit 0
+fi
+: >"$GH_AS_GIT_SEEN_FILE"
+{
+  printf 'count=%s\n' "${GIT_CONFIG_COUNT:-}"
+  printf 'key0=%s\n' "${GIT_CONFIG_KEY_0:-}"
+  printf 'value0=%s\n' "${GIT_CONFIG_VALUE_0:-}"
+  printf 'key1=%s\n' "${GIT_CONFIG_KEY_1:-}"
+  printf 'value1=%s\n' "${GIT_CONFIG_VALUE_1:-}"
+  printf 'gh_token=%s\n' "${GH_TOKEN:-}"
+} >>"$GH_AS_GIT_SEEN_FILE"
+printf 'gh-as-new-git-test: called with %s\n' "$*"
+EOF
+chmod +x "$gh_as_new_git_bin/git"
+
+gh_as_new_git_seen="$gh_as_fixture/new-git-seen"
+gh_as_new_git_stdout="$gh_as_fixture/new-git.stdout"
+gh_as_new_git_stderr="$gh_as_fixture/new-git.stderr"
+rm -f "$gh_as_new_git_seen"
+PATH="$gh_as_new_git_bin:$gh_as_fixture/bin:$app_token_fixture/bin:$PATH" \
+  GH_TOKEN="" \
+  GITHUB_TOKEN="" \
+  FAKE_CURL_MODE=success \
+  CLAUDE_CONFIG_DIR="$app_token_builder" \
+  CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+  GH_AS_GIT_SEEN_FILE="$gh_as_new_git_seen" \
+  bash "$PLUGIN_ROOT/scripts/gh-as.sh" builder \
+    placeholder-owner/placeholder-repo \
+    git push https://github.com/placeholder-owner/placeholder-repo.git \
+    HEAD:refs/heads/placeholder \
+    >"$gh_as_new_git_stdout" 2>"$gh_as_new_git_stderr"
+gh_as_new_git_status=$?
+[ "$gh_as_new_git_status" -eq 0 ]
+[ -s "$gh_as_new_git_seen" ]
+grep -Fxq 'count=2' "$gh_as_new_git_seen"
+grep -Fxq 'key0=credential.helper' "$gh_as_new_git_seen"
+grep -Fxq 'value0=' "$gh_as_new_git_seen"
+grep -Fxq 'key1=credential.helper' "$gh_as_new_git_seen"
+grep -Fxq 'value1=!gh auth git-credential' "$gh_as_new_git_seen"
+grep -Fxq 'gh_token=stub-installation-token' "$gh_as_new_git_seen"
+grep -Fq 'gh-as-new-git-test: called with push https://github.com/placeholder-owner/placeholder-repo.git HEAD:refs/heads/placeholder' \
+  "$gh_as_new_git_stdout"
+[ ! -s "$gh_as_new_git_stderr" ]
+
+# The check keys off the wrapped command being `git` itself, not off
+# whether the system happens to have an old git lying around: a wrapped
+# `gh` call must succeed normally even with the old fake `git` from above
+# still first on PATH.
+gh_as_nongit_seen="$gh_as_fixture/nongit-seen"
+gh_as_nongit_stdout="$gh_as_fixture/nongit.stdout"
+gh_as_nongit_stderr="$gh_as_fixture/nongit.stderr"
+rm -f "$gh_as_nongit_seen"
+PATH="$gh_as_old_git_bin:$gh_as_fixture/bin:$app_token_fixture/bin:$PATH" \
+  GH_TOKEN="" \
+  GITHUB_TOKEN="" \
+  FAKE_CURL_MODE=success \
+  GH_AS_TEST_SEEN_FILE="$gh_as_nongit_seen" \
+  CLAUDE_CONFIG_DIR="$gh_as_fixture/config" \
+  CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+  bash "$PLUGIN_ROOT/scripts/gh-as.sh" gatekeeper \
+    placeholder-owner/placeholder-repo \
+    gh pr list --repo placeholder-owner/placeholder-repo \
+    >"$gh_as_nongit_stdout" 2>"$gh_as_nongit_stderr"
+gh_as_nongit_status=$?
+[ "$gh_as_nongit_status" -eq 0 ]
+grep -Fxq 'stub-installation-token' <(sed -n '1p' "$gh_as_nongit_seen")
+grep -Fq 'gh-as-test: called with pr list --repo placeholder-owner/placeholder-repo' \
+  "$gh_as_nongit_stdout"
+[ ! -s "$gh_as_nongit_stderr" ]
+
+# The `*/git` arm of the pattern exists so a wrapped command given as a
+# path is recognised too -- but the version probe has to run that exact
+# path, not a bare `git`, or a modern git elsewhere on PATH would mask a
+# stale one at the path actually being exec'd. PATH here resolves bare
+# `git` to the modern fixture above; only the explicit path points at the
+# old one. If the check ever regressed to probing `git --version` instead
+# of "$1" --version, this would wrongly pass.
+gh_as_old_git_by_path_seen="$gh_as_fixture/old-git-by-path-seen"
+gh_as_old_git_by_path_stdout="$gh_as_fixture/old-git-by-path.stdout"
+gh_as_old_git_by_path_stderr="$gh_as_fixture/old-git-by-path.stderr"
+rm -f "$gh_as_old_git_by_path_seen" "$app_token_curl_log"
+set +e
+PATH="$gh_as_fixture/bin:$app_token_fixture/bin:$PATH" \
+  GH_TOKEN="" \
+  GITHUB_TOKEN="" \
+  FAKE_CURL_MODE=success \
+  FAKE_CURL_CALL_LOG="$app_token_curl_log" \
+  CLAUDE_CONFIG_DIR="$app_token_builder" \
+  CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+  GH_AS_GIT_SEEN_FILE="$gh_as_old_git_by_path_seen" \
+  bash "$PLUGIN_ROOT/scripts/gh-as.sh" builder \
+    placeholder-owner/placeholder-repo \
+    "$gh_as_old_git_bin/git" push \
+    https://github.com/placeholder-owner/placeholder-repo.git \
+    HEAD:refs/heads/placeholder \
+    >"$gh_as_old_git_by_path_stdout" 2>"$gh_as_old_git_by_path_stderr"
+gh_as_old_git_by_path_status=$?
+set -e
+[ "$gh_as_old_git_by_path_status" -eq 111 ]
+[ ! -e "$gh_as_old_git_by_path_seen" ]
+[ ! -e "$app_token_curl_log" ]
+[ ! -s "$gh_as_old_git_by_path_stdout" ]
+grep -Fq '2.30.2' "$gh_as_old_git_by_path_stderr"
+grep -Fq 'older than 2.31' "$gh_as_old_git_by_path_stderr"
+
 cat >"$fixture/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail

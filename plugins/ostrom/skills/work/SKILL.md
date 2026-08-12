@@ -52,7 +52,7 @@ objects. Put identifiers, actions, and values returned by GitHub or another
 tool in `fact`. Put only reasons, beliefs, and conclusions in `narration`; use
 `{}` when there is none. Never put an issue or PR number, commit SHA, action,
 verdict, or exit code only in narration. If any trace append fails, end the
-pass as a failure and release the lease through step 7 rather than continuing
+pass as a failure and release the lease through step 8 rather than continuing
 with an invisible pass.
 
 ## 3. Establish state
@@ -108,7 +108,62 @@ not express this until the sweep learned to read default-branch runs at all — 
 red `main` went unseen for two and a half days because CI state was only ever
 read from open pull requests.
 
-## 4. Work each item
+## 4. Authenticate as the builder App
+
+The builder writes code, commits, and pushes; every one of those actions
+must be attributed to the builder's own GitHub identity, not to whoever is
+running this session. Never call `gh` directly against a GitHub remote, and
+never run a script that itself calls `gh` (such as `gate.sh`) directly
+either — that script belongs to the gatekeeper's protocol, not this one. A
+session's Bash tool statically rejects command substitution before
+permission matching, so this step cannot capture `app-token.sh`'s output
+into a variable (`token="$(app-token.sh ...)"`) the way an interactive shell
+would — no allow rule can fix that rejection, because it never reaches
+allow-rule matching in the first place. Route every `gh` call for an item's
+repository through `gh-as.sh`, naming the `builder` role and the repository
+ahead of the command to run:
+
+```sh
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/gh-as.sh" builder "$repository" \
+  gh pr create --repo "$repository" --title "$title" --body-file "$body_file"
+```
+
+`gh-as.sh` mints a fresh installation token for that repository inside its
+own process, exports it only there, and `exec`s the given command — the
+token never enters this session's shell state, is never assigned to a
+variable here, and is never written to disk. `git` does not read that token
+on its own, so `gh-as.sh` also points `git` at a credential helper scoped to
+that same process, and `git push` goes through it the same way:
+
+```sh
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/gh-as.sh" builder "$repository" \
+  git push "https://github.com/$repository.git" "HEAD:refs/heads/$branch"
+```
+
+Push to that explicit `https://github.com/<owner>/<repo>.git` URL, not to
+whatever the checkout's `origin` happens to be. A checkout cloned over SSH
+authenticates by SSH key — the operator's own — and a credential helper has
+no effect on an SSH remote; the explicit HTTPS URL is what puts the App
+token in the authentication path at all. `git commit` itself needs no
+token — it never leaves the checkout — so only `git push` and every `gh`
+call in this protocol route through `gh-as.sh`.
+
+Exit `111` means `gh-as.sh` itself could not authenticate and the given
+command never ran at all; report that and stop work on the item rather than
+retry with an ambient credential. Any other exit code is the given command's
+own, unchanged.
+
+**A builder session that cannot mint an App token must stop working that
+item, not continue as the principal.** Continuing with an ambient token
+would silently recreate the shared-identity failure the App exists to
+remove. `builder.settings.json` is expected to eventually null `GH_TOKEN`
+and `GITHUB_TOKEN` the same way `gatekeeper.settings.json` already does,
+removing the ambient fallback entirely; until that lands, this protocol
+routes through `gh-as.sh` regardless of what credential happens to already
+be present in the session's own environment — a working `gh-as.sh` call
+never needs one.
+
+## 5. Work each item
 
 **Verify before acting.** Check the named file, symbol, or command yourself. A
 claim not checked is not a finding. This applies equally to previous-session
@@ -201,7 +256,7 @@ worked-item count only after this append succeeds. Report the pull request
 number and stop work on that item once its handoff is complete. If nothing has
 merged in a while, that is information for the owner, not a reason to merge.
 
-## 5. Preserve durable state
+## 6. Preserve durable state
 
 - Work that outlives this pass belongs in a GitHub issue in the repository that
   owns it, never in a session task list. If a list is forming, file it.
@@ -234,7 +289,7 @@ For a filed issue, `$item_decision` is `filed issue` and `$item_reversal` is
 `$item_decision_narration` when there is no reasoning beyond the action
 itself.
 
-## 6. Report and stop
+## 7. Report and stop
 
 Report briefly, visually, and inline; do not attach a file. Never give a bare
 issue number without its title. Say what landed, what failed, and what needs
@@ -244,7 +299,7 @@ Stop when the queue is drained or every remaining item is blocked on an owner
 decision. Do not invent work to stay busy; an empty queue is a good outcome
 and should be reported in one line.
 
-## 7. End the trace and release the builder lease
+## 8. End the trace and release the builder lease
 
 Route every normal or error path after acquisition through this cleanup,
 including a sweep failure, config failure, trace failure, and failure midway
