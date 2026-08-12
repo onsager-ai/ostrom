@@ -94,6 +94,8 @@ organisation's repositories. `gh-as.sh` contains the token in its own process
 and never falls back to ambient `GH_TOKEN` or `GITHUB_TOKEN` when minting
 fails.
 
+The shared App's installation must therefore cover **every repository in the mandate roster**, in every organisation the roster spans — not only the ones with an open pull request at any given moment. `scripts/sweep.sh` reads issues, pull requests, default-branch CI, and commit history across the whole roster on every run, and mints one token per organisation for that reason ([#106](https://github.com/onsager-ai/ostrom/issues/106)). A repository the App is not installed on is an authentication fault there, not an empty result, and the sweep must report it as one — a silently empty queue reads as a healthy, quiet portfolio.
+
 There is no second read-only App. Every role runs on the same machine and can
 reach the same plugin cache and secrets file, so a second key would not form a
 meaningful isolation boundary in this deployment. It would add another
@@ -107,10 +109,17 @@ one-block configuration change.
 ## Advisory role attribution
 
 Because GitHub renders every delivery action as the same App actor, builder
-commits and pull request bodies carry `Ostrom-Role: builder`, while merge
-commits carry `Ostrom-Role: gatekeeper`. The marker is written by the same
-agent it names. It is a record for human legibility, not a control or evidence
-of who acted; no gate, audit, or authorization decision may treat it as proof.
+commits and pull request bodies carry `Ostrom-Role: builder`. The marker is
+written by the same agent it names. It is a record for human legibility, not a
+control or evidence of who acted; no gate, audit, or authorization decision may treat it as proof.
+
+The gatekeeper deliberately does not stamp the merge commit. `gh pr merge
+--body` replaces the squash commit message rather than appending to it, and
+that default message is what carries the builder's own commits — trailer
+included — onto the default branch. Stamping the merge would delete more
+attribution than it adds. The gatekeeper's role is recorded in its
+`decision-taken` trace record, which is durable and machine-readable, and is
+where an audit should look.
 
 ## Builder profile
 

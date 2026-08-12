@@ -103,10 +103,11 @@ that and stop this iteration rather than retry with an ambient credential.
 Any other exit code is the given command's own, unchanged.
 
 The required `gatekeeper` argument names the caller at the call site; it does
-not narrow the shared token. `/ostrom:merge` records the same role as the
-`Ostrom-Role: gatekeeper` trailer on a merge commit. That marker is
-self-asserted advisory metadata, not evidence of who acted and never an input
-to the gate.
+not narrow the shared token. The gatekeeper's own role is recorded in its
+`decision-taken` trace record, not stamped onto the merge commit — see
+`/ostrom:merge` step 4 for why. An `Ostrom-Role: builder` trailer arriving on a
+commit under review was written by the builder itself, so it is self-asserted
+advisory metadata, not evidence of who acted and never an input to the gate.
 
 **A gatekeeper session that cannot mint an App token must stop, not continue as the principal.**
 

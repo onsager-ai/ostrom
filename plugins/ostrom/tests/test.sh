@@ -101,8 +101,19 @@ done
 # carries a self-asserted role marker while every consumer says that marker is
 # advisory rather than turning it back into an identity control.
 grep -q 'Ostrom-Role: builder' "$work_skill"
-grep -q 'Ostrom-Role: gatekeeper' "$gatekeep_skill"
-grep -q -- '--body "Ostrom-Role: gatekeeper"' "$merge_skill"
+grep -q 'Ostrom-Role: builder' "$gatekeep_skill"
+# The gatekeeper must NOT stamp the merge commit. `gh pr merge --body`
+# replaces the squash commit message rather than appending to it, and that
+# default message is the only thing carrying the builder's own trailer onto
+# the default branch. Stamping the merge would erase more attribution than it
+# adds; the gatekeeper's role is in its `decision-taken` record instead.
+# Written as an `if`, not `! grep`: bash exempts `!`-inverted commands from
+# `set -e` and from the ERR trap, so a leading `!` here would assert nothing.
+if grep -qE 'gh pr merge[^`]*--body' "$merge_skill"; then
+  echo "merge protocol must not pass --body to gh pr merge" >&2
+  exit 1
+fi
+grep -q 'Ostrom-Role: builder' "$merge_skill"
 for role_doc in "$work_skill" "$gatekeep_skill" "$merge_skill"; do
   grep -qi 'advisory' "$role_doc"
   grep -qi 'evidence' "$role_doc"

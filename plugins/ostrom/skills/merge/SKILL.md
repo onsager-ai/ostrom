@@ -49,9 +49,10 @@ all; report that and stop rather than retry with an ambient credential. Any
 other exit code is the given command's own, unchanged.
 
 The required `gatekeeper` argument names the caller at the call site; it does
-not narrow the shared token. The role marker added below is likewise a
-self-asserted advisory record, not evidence of who acted and never an input to
-the gate.
+not narrow the shared token. Any `Ostrom-Role:` marker reaching this protocol —
+on a commit or in a pull request body — was written by the role it names, so it
+is a self-asserted advisory record, not evidence of who acted, and never an
+input to the gate.
 
 **A gatekeeper session that cannot mint an App token must stop, not continue as the principal.**
 
@@ -134,9 +135,14 @@ caller's, is always about delivery, and never converts `inconclusive` into
   1. Run
      `bash "${CLAUDE_PLUGIN_ROOT}/scripts/gh-as.sh" gatekeeper "$repository" gh pr review <PR number> --repo <owner/repo> --approve`.
   2. Then run
-     `bash "${CLAUDE_PLUGIN_ROOT}/scripts/gh-as.sh" gatekeeper "$repository" gh pr merge <PR number> --repo <owner/repo> --body "Ostrom-Role: gatekeeper"`.
-     This makes the merge commit carry the gatekeeper role trailer even though
-     GitHub shows the same App actor for every role.
+     `bash "${CLAUDE_PLUGIN_ROOT}/scripts/gh-as.sh" gatekeeper "$repository" gh pr merge <PR number> --repo <owner/repo>`.
+     Do not pass `--body` here to stamp a gatekeeper role trailer. On a squash
+     merge `--body` *replaces* the default commit message rather than appending
+     to it, and that default is where the builder's own commits — including
+     their `Ostrom-Role: builder` trailer — survive into the default branch.
+     Stamping the merge would erase more attribution than it adds. The
+     gatekeeper's role is recorded in the `decision-taken` record below, which
+     is durable, machine-readable, and the actual audit path.
   3. Then append a `decision-taken` trace record. Merging is the
      gatekeeper's own judgment on this artifact, and it is only safe to make
      without the principal because it is cheap to undo — the reversal
