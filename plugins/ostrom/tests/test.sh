@@ -1916,6 +1916,71 @@ exit 1
 EOF
 chmod +x "$fixture/bin/gh"
 
+# #106: sweep.sh now authenticates as the gatekeeper App for its own `gh`
+# calls instead of trusting whatever ambient token invoked it. These two
+# fakes are the network boundary for every sweep.sh test below: a curl that
+# succeeds for any repository's installation lookup and token exchange
+# (the sweep's anchor repository differs across the fixtures below, and this
+# mock exists to prove the sweep's own selection, classification and
+# queue-diff logic is unaffected by which repo resolves the installation,
+# not to duplicate app-token.sh's own dedicated tests above), and an openssl
+# that stubs out JWT signing the same way those tests do.
+cat >"$fixture/bin/curl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+cat >/dev/null
+url=""
+for argument in "$@"; do
+  case "$argument" in
+    https://api.github.com/*) url="$argument" ;;
+  esac
+done
+case "$url" in
+  https://api.github.com/repos/*/installation)
+    printf '{"id":9001}\n200'
+    ;;
+  https://api.github.com/app/installations/*/access_tokens)
+    printf '{"token":"stub-sweep-fixture-token"}'
+    ;;
+  *) exit 99 ;;
+esac
+EOF
+chmod +x "$fixture/bin/curl"
+cat >"$fixture/bin/openssl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+  base64)
+    base64 | tr -d '\n'
+    ;;
+  dgst)
+    cat >/dev/null
+    printf 'stub-signature'
+    ;;
+  *) exit 99 ;;
+esac
+EOF
+chmod +x "$fixture/bin/openssl"
+
+# One shared placeholder private key: app-token.sh only checks that the path
+# exists and is readable, since openssl itself is stubbed above.
+gatekeeper_fixture_key="$fixture/gatekeeper-fixture.pem"
+: >"$gatekeeper_fixture_key"
+
+# Every mandate config directory a sweep.sh test points CLAUDE_CONFIG_DIR at
+# needs its own gatekeeper credentials block, because MANDATE_DATA_DIR (and
+# so secrets.yaml) follows CLAUDE_CONFIG_DIR and most fixtures below set it
+# independently of one another.
+write_gatekeeper_secrets() {
+  mkdir -p "$1/ostrom"
+  cat >"$1/ostrom/secrets.yaml" <<YAML
+gatekeeper:
+  app_id: 900100
+  private_key_path: $gatekeeper_fixture_key
+YAML
+}
+write_gatekeeper_secrets "$fixture/config"
+
 # Local drift builds real repositories because patch equivalence, upstream
 # absence, dirtiness, and linked-worktree discovery are Git behavior rather
 # than string-parsing behavior.
@@ -2046,6 +2111,7 @@ run_sweep() {
 # dependency refs without ever carrying the raw body through jq argv.
 large_body="$fixture/large-body"
 mkdir -p "$large_body/config/ostrom" "$large_body/repo"
+write_gatekeeper_secrets "$large_body/config"
 cat >"$large_body/config/ostrom/mandates.yaml" <<'YAML'
 bounce_all: []
 projects:
@@ -2076,6 +2142,7 @@ jq -s -e '
 # digest/troubled-project machinery a failing PR's CI already uses.
 ci_drift="$fixture/ci-drift"
 mkdir -p "$ci_drift/config/ostrom" "$ci_drift/repo"
+write_gatekeeper_secrets "$ci_drift/config"
 cat >"$ci_drift/config/ostrom/mandates.yaml" <<'YAML'
 bounce_all:
   - title:*urgent*
@@ -2153,6 +2220,7 @@ jq -r '.systemMessage' <<<"$ci_drift_digest" | grep -q '^0 projects nominal$'
 # never a verdict, and never on state or kind.
 landed_fix="$fixture/landed-fix"
 mkdir -p "$landed_fix/config/ostrom" "$landed_fix/repo"
+write_gatekeeper_secrets "$landed_fix/config"
 cat >"$landed_fix/config/ostrom/mandates.yaml" <<'YAML'
 stuck_after_days: 1
 bounce_all: []
@@ -2868,6 +2936,7 @@ fi
 # issue in the falsifiability reason: six raw candidates become three rows.
 dedup="$fixture/hub-repo"
 mkdir -p "$dedup/config/ostrom" "$dedup/repo"
+write_gatekeeper_secrets "$dedup/config"
 cat >"$dedup/config/ostrom/mandates.yaml" <<'YAML'
 bounce_all: []
 projects:
@@ -2929,6 +2998,7 @@ grep -q \
 # partial portfolio. The digest keeps warning until a later sweep is below it.
 capped="$fixture/capped"
 mkdir -p "$capped/config/ostrom" "$capped/repo"
+write_gatekeeper_secrets "$capped/config"
 cat >"$capped/config/ostrom/mandates.yaml" <<'YAML'
 bounce_all: []
 projects:
@@ -2977,6 +3047,7 @@ grep -q \
 # A representative eight-project first sweep remains a compact digest.
 portfolio="$fixture/portfolio"
 mkdir -p "$portfolio/config/ostrom" "$portfolio/repo"
+write_gatekeeper_secrets "$portfolio/config"
 cat >"$portfolio/config/ostrom/mandates.yaml" <<'YAML'
 bounce_all:
   - title:*production deployment*
@@ -3018,6 +3089,7 @@ fi
 # state, and become fresh one-shot news after a repo state reset.
 baseline_once="$fixture/baseline-once"
 mkdir -p "$baseline_once/config/ostrom" "$baseline_once/repo"
+write_gatekeeper_secrets "$baseline_once/config"
 cat >"$baseline_once/config/ostrom/mandates.yaml" <<'YAML'
 bounce_all: []
 projects:
@@ -3216,6 +3288,7 @@ grep -q '^2 projects nominal$' <<<"$stale_digest_text"
 # backlog into one digest.
 uncat="$fixture/uncat"
 mkdir -p "$uncat/config/ostrom" "$uncat/repo"
+write_gatekeeper_secrets "$uncat/config"
 cat >"$uncat/config/ostrom/mandates.yaml" <<'YAML'
 bounce_all: []
 projects:
@@ -3286,6 +3359,7 @@ set -e
 # append-only trace.
 decisions="$fixture/decisions"
 mkdir -p "$decisions/config/ostrom" "$decisions/repo"
+write_gatekeeper_secrets "$decisions/config"
 cat >"$decisions/config/ostrom/mandates.yaml" <<'YAML'
 provider: file
 cadence_hours: 24
@@ -3420,7 +3494,75 @@ auth_message="$(
 auth_status=$?
 set -e
 [ "$auth_status" -eq 3 ]
-grep -q 'gh is not authenticated' <<<"$auth_message"
+grep -q 'gh reports not authenticated' <<<"$auth_message"
+grep -q 'never falls back to an ambient credential' <<<"$auth_message"
+
+# #106's central property: a missing gatekeeper credential must fail loudly,
+# with no queue write at all, never a silently empty-but-healthy queue --
+# the exact shape that hid a red default branch for two and a half days
+# (#78). An ambient GH_TOKEN/GITHUB_TOKEN in the invoking environment must
+# never rescue this: the sweep mints its own token or it does not run.
+# Two distinct missing-credential shapes, both covered: no secrets.yaml at
+# all, and a secrets.yaml that configures some other role but never falls
+# back to it -- the sweep must name its own role, gatekeeper, and refuse
+# rather than silently borrow another role's block.
+no_credential="$fixture/no-credential"
+mkdir -p "$no_credential/config/ostrom" "$no_credential/repo"
+cat >"$no_credential/config/ostrom/mandates.yaml" <<'YAML'
+bounce_all: []
+projects:
+  - repo: example-org/no-credential-repo
+    delegated: []
+    excluded: []
+    reserved: []
+    default: excluded
+    paused: false
+    bounce: []
+YAML
+set +e
+no_credential_message="$(
+  cd "$no_credential/repo"
+  PATH="$fixture/bin:$PATH" \
+    GH_TOKEN="ambient-principal-value" \
+    GITHUB_TOKEN="ambient-principal-value" \
+    CLAUDE_CONFIG_DIR="$no_credential/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/sweep.sh" 2>&1
+)"
+no_credential_status=$?
+set -e
+[ "$no_credential_status" -eq 111 ]
+grep -q 'secrets file is missing' <<<"$no_credential_message"
+grep -q 'could not mint a gatekeeper token' <<<"$no_credential_message"
+! grep -q 'ambient-principal-value' <<<"$no_credential_message"
+[ ! -e "$no_credential/config/ostrom/queue.jsonl" ]
+
+other_role_only="$fixture/other-role-only"
+mkdir -p "$other_role_only/config/ostrom" "$other_role_only/repo"
+cp "$no_credential/config/ostrom/mandates.yaml" \
+  "$other_role_only/config/ostrom/mandates.yaml"
+cat >"$other_role_only/config/ostrom/secrets.yaml" <<YAML
+builder:
+  app_id: 900200
+  private_key_path: $gatekeeper_fixture_key
+YAML
+set +e
+other_role_message="$(
+  cd "$other_role_only/repo"
+  PATH="$fixture/bin:$PATH" \
+    GH_TOKEN="ambient-principal-value" \
+    GITHUB_TOKEN="ambient-principal-value" \
+    CLAUDE_CONFIG_DIR="$other_role_only/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/sweep.sh" 2>&1
+)"
+other_role_status=$?
+set -e
+[ "$other_role_status" -eq 111 ]
+grep -q 'gatekeeper credentials are not configured' <<<"$other_role_message"
+grep -q 'could not mint a gatekeeper token' <<<"$other_role_message"
+! grep -q 'ambient-principal-value' <<<"$other_role_message"
+[ ! -e "$other_role_only/config/ostrom/queue.jsonl" ]
 
 # gate.yaml uses the mandate subsystem's shipped < user < repo layering while
 # keeping its project schema separate from the private mandate roster.
@@ -4196,6 +4338,7 @@ expected_orphan_tree="$(printf '%s\n' \
 publish_sweep="$publisher/sweep-failure"
 rejecting_remote="$publish_sweep/rejecting.git"
 mkdir -p "$publish_sweep/config/ostrom" "$publish_sweep/repo"
+write_gatekeeper_secrets "$publish_sweep/config"
 cp "$publisher_data/mandates.yaml" "$publish_sweep/config/ostrom/mandates.yaml"
 (
   cd "$publish_sweep/repo"

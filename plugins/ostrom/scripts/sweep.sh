@@ -18,6 +18,53 @@ if ! mandate_is_configured; then
   exit 2
 fi
 
+# #106: this script is invoked directly, by a timer or by an interactive
+# session, with no other process guaranteed to route its `gh` calls through
+# a scoped identity first. Authenticate itself before doing anything else,
+# once, for the run's entire duration, then exec back into a second
+# invocation of this same script under that token -- the same shape gate.sh
+# already runs in (one gh-as.sh invocation wrapping a script that makes many
+# `gh` calls internally), rather than minting a fresh token per call. This
+# sweep reads every repository in the roster on every run, so minting per
+# call would multiply the round trips against GitHub's App endpoints by the
+# number of `gh` calls the loop below makes, on a timer that already queries
+# the whole roster; minting once and holding that token for the run keeps
+# the auth cost flat regardless of roster size, at the cost of a live token
+# outliving any single call.
+#
+# Identity: the gatekeeper's, not a new third App. A GitHub App installation
+# token grants the same effective access regardless of which role minted
+# it -- Claude Code's per-role deny lists are what actually separate builder
+# from gatekeeper, and those apply only inside a harness-driven session, not
+# to a freestanding script like this one. Introducing a third App would add
+# a credential to hold and rotate without adding any enforcement a session
+# doesn't already provide, and creating one is the principal's ceremony to
+# run, not this change's. The gatekeeper is also already the role that
+# authenticates once and reads every open pull request across the whole
+# roster (see skills/gatekeep/SKILL.md step 5) -- this sweep is the read-only
+# counterpart of exactly that pattern, just triggered on a timer instead of
+# on demand. If `gatekeeper` credentials are not configured, this fails
+# below with a visible fault; it never falls back to an ambient token.
+if [ "${MANDATE_SWEEP_AUTHENTICATED:-}" != "1" ]; then
+  anchor_probe="$(mktemp)"
+  mandate_load_config >"$anchor_probe" || {
+    anchor_status=$?
+    rm -f "$anchor_probe"
+    exit "$anchor_status"
+  }
+  anchor_project_count="$(jq '.projects | length' "$anchor_probe")"
+  if [ "$anchor_project_count" -eq 0 ]; then
+    rm -f "$anchor_probe"
+    echo "mandate sweep: mandates.yaml contains no projects" >&2
+    exit 2
+  fi
+  anchor_repo="$(jq -r '.projects[0].repo' "$anchor_probe")"
+  rm -f "$anchor_probe"
+  export MANDATE_SWEEP_AUTHENTICATED=1
+  exec bash "$SCRIPT_DIR/gh-as.sh" gatekeeper "$anchor_repo" \
+    bash "${BASH_SOURCE[0]}" "$@"
+fi
+
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
@@ -30,7 +77,7 @@ fi
 
 gh_host="${GH_HOST:-github.com}"
 if ! gh auth status --hostname "$gh_host" >/dev/null 2>&1; then
-  echo "mandate sweep: gh is not authenticated for $gh_host; run 'gh auth login'" >&2
+  echo "mandate sweep: gh reports not authenticated for $gh_host using the freshly minted gatekeeper token; the sweep never falls back to an ambient credential" >&2
   exit 3
 fi
 
