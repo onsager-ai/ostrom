@@ -1718,6 +1718,25 @@ if [ -n "${FAKE_GH_CALL_LOG:-}" ]; then
   printf '%s\t%s\n' "$repo" "$*" >>"$FAKE_GH_CALL_LOG"
 fi
 
+# #109: refuse a call whose GH_TOKEN doesn't match the organisation being
+# queried, the same way the real GitHub API 404s a token minted for one
+# installation when it's used against a repository under another. The curl
+# fake mints "stub-sweep-token-org-<id>" where <id> is derived from the
+# repository's own owner, so this is only ever a no-op for a correctly
+# org-scoped token -- it exists to fail loudly if sweep.sh ever goes back
+# to minting one token for a roster that spans more than one organisation.
+case "$repo" in
+  */*)
+    owner="${repo%%/*}"
+    expected_id="$(printf '%s' "$owner" | cksum | awk '{print $1}')"
+    expected_token="stub-sweep-token-org-$expected_id"
+    if [ -n "${GH_TOKEN:-}" ] && [ "${GH_TOKEN:-}" != "$expected_token" ]; then
+      echo '{"message":"Not Found","status":"404"}' >&2
+      exit 1
+    fi
+    ;;
+esac
+
 if [ "$1 $2" = "auth status" ]; then
   [ "${FAKE_GH_AUTH_FAIL:-0}" != "1" ]
   exit 0
@@ -1796,6 +1815,14 @@ JSON
       cat <<'JSON'
 [{"number":301,"title":"bug: widget throws on empty input","body":"","labels":[{"name":"bug"}],"createdAt":"2026-07-01T00:00:00Z","updatedAt":"2026-07-01T00:00:00Z","url":"https://example.invalid/issues/301"}]
 JSON
+      ;;
+    # #109: two different organisations, so a sweep.sh that mints only one
+    # token for the whole run can read one repo and 404 the other.
+    org-alpha/repo-one)
+      echo '[{"number":1,"title":"chore: rotate the alpha widget","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/1"}]'
+      ;;
+    org-beta/repo-two)
+      echo '[{"number":1,"title":"chore: rotate the beta widget","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/1"}]'
       ;;
     *) echo '[]' ;;
   esac
@@ -1916,15 +1943,20 @@ exit 1
 EOF
 chmod +x "$fixture/bin/gh"
 
-# #106: sweep.sh now authenticates as the gatekeeper App for its own `gh`
-# calls instead of trusting whatever ambient token invoked it. These two
-# fakes are the network boundary for every sweep.sh test below: a curl that
-# succeeds for any repository's installation lookup and token exchange
-# (the sweep's anchor repository differs across the fixtures below, and this
-# mock exists to prove the sweep's own selection, classification and
-# queue-diff logic is unaffected by which repo resolves the installation,
-# not to duplicate app-token.sh's own dedicated tests above), and an openssl
-# that stubs out JWT signing the same way those tests do.
+# #106/#109: sweep.sh now authenticates as the gatekeeper App for its own
+# `gh` calls instead of trusting whatever ambient token invoked it, minting
+# one token per GitHub organisation in the roster rather than one for the
+# whole run (#109: a single installation token cannot read a second
+# organisation's repositories -- see sweep.sh's own comment on sweep_org).
+# This curl fake is the network boundary for every sweep.sh test below, and
+# it deliberately makes that org-scoping real rather than trivially true:
+# the installation "id" it hands back is derived from the repository's own
+# owner, and the token it later mints for that id embeds the same value.
+# The gh fake below then refuses any call whose GH_TOKEN doesn't match the
+# repository being queried -- so a test whose roster spans two
+# organisations, but whose sweep.sh mistakenly mints only one token for
+# the whole run, fails exactly the way a real second-organisation 404
+# would, instead of silently mocking success everywhere.
 cat >"$fixture/bin/curl" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -1937,10 +1969,15 @@ for argument in "$@"; do
 done
 case "$url" in
   https://api.github.com/repos/*/installation)
-    printf '{"id":9001}\n200'
+    owner="${url#https://api.github.com/repos/}"
+    owner="${owner%%/*}"
+    id="$(printf '%s' "$owner" | cksum | awk '{print $1}')"
+    printf '{"id":%s}\n200' "$id"
     ;;
   https://api.github.com/app/installations/*/access_tokens)
-    printf '{"token":"stub-sweep-fixture-token"}'
+    id="${url#https://api.github.com/app/installations/}"
+    id="${id%%/*}"
+    printf '{"token":"stub-sweep-token-org-%s"}' "$id"
     ;;
   *) exit 99 ;;
 esac
@@ -3563,6 +3600,57 @@ grep -q 'gatekeeper credentials are not configured' <<<"$other_role_message"
 grep -q 'could not mint a gatekeeper token' <<<"$other_role_message"
 ! grep -q 'ambient-principal-value' <<<"$other_role_message"
 [ ! -e "$other_role_only/config/ostrom/queue.jsonl" ]
+
+# #109: a roster spanning two GitHub organisations. A single whole-run token
+# minted off the first project's repo authenticates for one installation
+# only; the curl/gh fakes above turn a second organisation's repositories
+# reading under that wrong token into a hard failure, the same shape as a
+# real cross-organisation 404. Before the fix this either aborted the sweep
+# entirely or (worse) let org-beta's repository silently read as empty --
+# either way losing an entire organisation from the queue while the sweep
+# reported success. A single-organisation fixture cannot exercise this: it
+# is only ever wrong once a second installation enters the picture.
+cross_org="$fixture/cross-org"
+mkdir -p "$cross_org/config/ostrom" "$cross_org/repo"
+write_gatekeeper_secrets "$cross_org/config"
+cat >"$cross_org/config/ostrom/mandates.yaml" <<'YAML'
+bounce_all: []
+projects:
+  - repo: org-alpha/repo-one
+    delegated: []
+    excluded: []
+    reserved:
+      - 1
+    default: excluded
+    paused: false
+    bounce: []
+  - repo: org-beta/repo-two
+    delegated: []
+    excluded: []
+    reserved:
+      - 1
+    default: excluded
+    paused: false
+    bounce: []
+YAML
+cross_org_calls="$cross_org/gh-calls"
+: >"$cross_org_calls"
+(
+  cd "$cross_org/repo"
+  PATH="$fixture/bin:$PATH" \
+    FAKE_GH_CALL_LOG="$cross_org_calls" \
+    CLAUDE_CONFIG_DIR="$cross_org/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/sweep.sh" >/dev/null
+)
+# Both organisations' repositories were actually queried under a working
+# token, not just carried forward from a stale queue.
+grep -q '^org-alpha/repo-one	issue list' "$cross_org_calls"
+grep -q '^org-beta/repo-two	issue list' "$cross_org_calls"
+jq -s -e '
+  (map(.id) | index("org-alpha/repo-one#1")) != null
+  and (map(.id) | index("org-beta/repo-two#1")) != null
+' "$cross_org/config/ostrom/queue.jsonl" >/dev/null
 
 # gate.yaml uses the mandate subsystem's shipped < user < repo layering while
 # keeping its project schema separate from the private mandate roster.
