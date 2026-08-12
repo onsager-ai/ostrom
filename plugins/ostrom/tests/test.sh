@@ -2354,6 +2354,20 @@ JSON
 [{"number":20,"title":"Prepare production deployment","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/20"}]
 JSON
       ;;
+    example-org/policy-cursor-repo)
+      policy_cursor_title="Routine delegated work"
+      policy_cursor_updated="2026-07-30T00:00:00Z"
+      if [ "${FAKE_GH_MODE:-base}" = "policy-pending" ]; then
+        policy_cursor_title="Routine delegated work, pending"
+        policy_cursor_updated="2026-08-02T00:00:00Z"
+      elif [ "${FAKE_GH_MODE:-base}" = "policy-changed" ]; then
+        policy_cursor_title="Routine delegated work, changed with policy"
+        policy_cursor_updated="2026-08-03T00:00:00Z"
+      fi
+      cat <<JSON
+[{"number":1,"title":"$policy_cursor_title","labels":[{"name":"maintenance"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"$policy_cursor_updated","url":"https://example.invalid/issues/1"}]
+JSON
+      ;;
     example-org/hub-repo)
       cat <<'JSON'
 [{"number":14,"title":"spec(launch): public announcement","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/14"},{"number":15,"title":"spec(launch): installation guide","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/15"},{"number":16,"title":"spec(launch): release checklist","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/16"}]
@@ -2736,6 +2750,65 @@ run_sweep() {
       bash "$PLUGIN_ROOT/scripts/sweep.sh"
   )
 }
+
+# #122: a policy change intentionally suppresses delegated rows for one
+# sweep, but it must not advance past the events it withheld. First baseline
+# the repository, then create a pending delegated row before changing both
+# the item and a selector. The unchanged follow-up sweep must recover that
+# same row from behind the held cursor.
+policy_cursor="$fixture/policy-cursor"
+mkdir -p "$policy_cursor/config/ostrom" "$policy_cursor/repo"
+write_gatekeeper_secrets "$policy_cursor/config"
+cat >"$policy_cursor/config/ostrom/mandates.yaml" <<'YAML'
+bounce_all: []
+projects:
+  - repo: example-org/policy-cursor-repo
+    delegated:
+      - label:maintenance
+    excluded: []
+    reserved: []
+    default: excluded
+    paused: false
+    bounce: []
+YAML
+run_policy_cursor_sweep() {
+  (
+    cd "$policy_cursor/repo"
+    PATH="$fixture/bin:$PATH" \
+      FAKE_GH_MODE="${FAKE_GH_MODE:-base}" \
+      CLAUDE_CONFIG_DIR="$policy_cursor/config" \
+      CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+      bash "$PLUGIN_ROOT/scripts/sweep.sh"
+  )
+}
+
+run_policy_cursor_sweep >/dev/null
+FAKE_GH_MODE=policy-pending run_policy_cursor_sweep >/dev/null
+policy_cursor_queue="$policy_cursor/config/ostrom/queue.jsonl"
+jq -s -e '
+  length == 1
+  and .[0].id == "example-org/policy-cursor-repo#1"
+  and .[0].state == "pending"
+' "$policy_cursor_queue" >/dev/null
+
+sed -i '/    excluded: \[\]/c\    excluded:\n      - label:held' \
+  "$policy_cursor/config/ostrom/mandates.yaml"
+policy_cursor_suppressed="$(FAKE_GH_MODE=policy-changed run_policy_cursor_sweep)"
+grep -q \
+  'mandate sweep: 1 projects; 1 queue changes; 1 delegated row suppressed by mandate change' \
+  <<<"$policy_cursor_suppressed"
+if jq -e 'select(.id == "example-org/policy-cursor-repo#1")' \
+  "$policy_cursor_queue" >/dev/null; then
+  echo "policy change emitted a delegated row during its suppression sweep" >&2
+  exit 1
+fi
+
+FAKE_GH_MODE=policy-changed run_policy_cursor_sweep >/dev/null
+jq -s -e '
+  length == 1
+  and .[0].id == "example-org/policy-cursor-repo#1"
+  and .[0].state == "pending"
+' "$policy_cursor_queue" >/dev/null
 
 # Issue bodies can exceed Linux's per-argument limit. The sweep must extract
 # dependency refs without ever carrying the raw body through jq argv.

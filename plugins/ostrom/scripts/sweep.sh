@@ -567,6 +567,32 @@ sweep_org() {
               }
           ]) as $rows
         | ([$visible_active[] | .id]) as $active_ids
+        | (
+            if $policy_changed and ($initial | not) then
+              [
+                $classified[]
+                | . as $item
+                | (
+                    $item.old == null
+                    or $item.old.fingerprint != $item.fingerprint
+                    or $item.updated > ($previous.cursor // "")
+                    or ($item.movement_stuck and (($item.old.stuck // false) | not))
+                  ) as $event
+                | (
+                    $item.classification.terminal == "reserved"
+                    or $item.classification.terminal == "tripwire"
+                    or ($item.type == "pr" and $item.ci == "failing")
+                  ) as $safety
+                | select(
+                    $event
+                    and ($safety | not)
+                    and ($project.paused | not)
+                    and $item.classification.terminal == "delegated"
+                  )
+              ] | length
+            else 0
+            end
+          ) as $suppressed_delegated
         | (reduce $classified[] as $item ({};
             .[$item.id] = {
               updated: $item.updated,
@@ -620,11 +646,13 @@ sweep_org() {
           ) as $notice
         | (
             if $initial then ([$sweep_started, $items[].updated] | max)
+            elif $policy_changed then $previous.cursor
             else ([$previous.cursor, $items[].updated] | max)
             end
           ) as $cursor
         | {
             rows: $rows,
+            suppressed_delegated: $suppressed_delegated,
             active_ids: $active_ids,
             current_items: [
               $classified[]
@@ -877,6 +905,8 @@ sweep_org() {
       --slurpfile analysis "$work/analysis.json" \
       '$all[0] + $analysis[0].selector_stats' >"$work/next.json"
     mv "$work/next.json" "$work/selector-stats.json"
+    jq -r '.suppressed_delegated' "$work/analysis.json" \
+      >>"$work/policy-suppressed.count"
     jq -cn \
       --slurpfile all "$work/possibly-landed.json" \
       --slurpfile repo "$work/repo-possibly-landed.json" \
@@ -948,6 +978,7 @@ printf '%s\n' '[]' >"$work/generated.json"
 printf '%s\n' '[]' >"$work/active-ids.json"
 printf '%s\n' '[]' >"$work/current-items.json"
 printf '%s\n' '[]' >"$work/selector-stats.json"
+: >"$work/policy-suppressed.count"
 # Leads for #77's already-landed-but-not-closed check, keyed by issue id
 # ("owner/repo#N"), accumulated across repos the same way the lists above are.
 printf '%s\n' '[]' >"$work/possibly-landed.json"
@@ -981,6 +1012,8 @@ while IFS= read -r org; do
     bash "$SCRIPT_DIR/gh-as.sh" gatekeeper "$anchor_repo" \
     bash "${BASH_SOURCE[0]}"
 done < <(jq -r '[.projects[].repo | split("/")[0]] | unique | .[]' "$work/config.json")
+
+policy_suppressed="$(jq -s 'add // 0' "$work/policy-suppressed.count")"
 
 landed_fix_attempts="$(wc -l <"$work/landed-fix-attempts.count" | tr -d '[:space:]')"
 landed_fix_failures="$(wc -l <"$work/landed-fix-failures.log" | tr -d '[:space:]')"
@@ -1168,7 +1201,13 @@ mandate_write_if_changed "$work/state.json" "$MANDATE_STATE_FILE"
 # serialized state, so a repeat sweep with no upstream activity has an empty
 # content diff.
 touch "$MANDATE_STATE_FILE"
-echo "mandate sweep: $project_count projects; $queue_changes queue changes"
+if [ "$policy_suppressed" -gt 0 ]; then
+  policy_suppressed_noun="delegated rows"
+  [ "$policy_suppressed" -ne 1 ] || policy_suppressed_noun="delegated row"
+  echo "mandate sweep: $project_count projects; $queue_changes queue changes; $policy_suppressed $policy_suppressed_noun suppressed by mandate change"
+else
+  echo "mandate sweep: $project_count projects; $queue_changes queue changes"
+fi
 
 # Publishing is downstream of the governing sweep. A remote, auth, or merge
 # failure is reported but must never change the sweep's successful outcome.
