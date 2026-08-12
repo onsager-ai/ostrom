@@ -1634,6 +1634,26 @@ if [ "$1" = "api" ]; then
 ]
 JSON
       ;;
+    repos/example-org/approved-closure-repo/issues/*)
+      # #85: emulates `--jq '.state'` on the issues endpoint (raw output, so
+      # a bare word rather than a JSON string) for the approved-row closure
+      # probe. #900/#901 stand in for a merged PR and a closed-unmerged PR —
+      # both surface as plain "closed" on this endpoint, which is exactly
+      # why a positive "closed" observation, not merged-vs-closed detail, is
+      # what the probe keys on. #903 fails on demand via
+      # FAKE_GH_CLOSURE_FAIL so the probe-failure retention path is
+      # exercised without also failing the other probes in the same sweep.
+      issue_number="${endpoint##*/}"
+      case "$issue_number" in
+        903 | 905)
+          [ "${FAKE_GH_CLOSURE_FAIL:-0}" != "1" ] || exit 1
+          echo open
+          ;;
+        900 | 901) echo closed ;;
+        902) echo open ;;
+        *) echo open ;;
+      esac
+      ;;
     *) echo '[]' ;;
   esac
   exit 0
@@ -1926,6 +1946,108 @@ jq -s -e '
     ))
   and (.[0].mandate.reason | contains("aaaaaaaa") | not)
 ' "$landed_fix/config/ostrom/queue.jsonl" >/dev/null
+
+# #85: an approved row must not survive forever just because a sweep's
+# enumeration doesn't reach it — but it must survive absence, and only drop
+# on a positive "closed" observation from the issues-endpoint probe. This
+# fixture's repo has no case in the gh stub's issue-list/pr-list switch, so
+# it always enumerates empty: every id below is unconditionally absent from
+# active_ids, and the test exercises the closure probe directly rather than
+# racing real enumeration data.
+approved_closure="$fixture/approved-closure"
+mkdir -p "$approved_closure/config/ostrom" "$approved_closure/repo"
+cat >"$approved_closure/config/ostrom/mandates.yaml" <<'YAML'
+bounce_all: []
+projects:
+  - repo: example-org/approved-closure-repo
+    delegated: []
+    excluded: []
+    reserved: []
+    default: excluded
+    paused: false
+    bounce: []
+YAML
+approved_closure_queue="$approved_closure/config/ostrom/queue.jsonl"
+cat >"$approved_closure_queue" <<'JSONL'
+{"id":"example-org/approved-closure-repo#900","repo":"example-org/approved-closure-repo","ref":"#900","kind":"decision","mandate":{"reason":"approved manually"},"state":"approved","opened":"2026-07-01T00:00:00Z","title":"merged pr"}
+{"id":"example-org/approved-closure-repo#901","repo":"example-org/approved-closure-repo","ref":"#901","kind":"decision","mandate":{"reason":"approved manually"},"state":"approved","opened":"2026-07-01T00:00:00Z","title":"closed unmerged pr"}
+{"id":"example-org/approved-closure-repo#902","repo":"example-org/approved-closure-repo","ref":"#902","kind":"decision","mandate":{"reason":"approved manually"},"state":"approved","opened":"2026-07-01T00:00:00Z","title":"still open pr"}
+{"id":"example-org/approved-closure-repo#904","repo":"example-org/approved-closure-repo","ref":"#904","kind":"decision","mandate":{"reason":"reserved ref:#904"},"state":"pending","opened":"2026-07-01T00:00:00Z","title":"unrelated pending row"}
+JSONL
+run_approved_closure_sweep() {
+  (
+    cd "$approved_closure/repo"
+    PATH="$fixture/bin:$PATH" \
+      CLAUDE_CONFIG_DIR="$approved_closure/config" \
+      CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+      FAKE_GH_CLOSURE_FAIL="${FAKE_GH_CLOSURE_FAIL:-0}" \
+      bash "$PLUGIN_ROOT/scripts/sweep.sh"
+  )
+}
+approved_closure_stderr="$approved_closure/stderr"
+run_approved_closure_sweep >/dev/null 2>"$approved_closure_stderr"
+
+# #85: a merged PR (900) and a closed-but-unmerged PR (901) both read
+# "closed" on the issues endpoint — the same field this fix keys on — and
+# neither survives the next sweep: absence stopped being enough to keep an
+# approved row once closure is positively observed.
+if jq -e 'select(.id == "example-org/approved-closure-repo#900")' \
+  "$approved_closure_queue" >/dev/null; then
+  echo "#85: merged approved row survived a positive closed observation" >&2
+  exit 1
+fi
+if jq -e 'select(.id == "example-org/approved-closure-repo#901")' \
+  "$approved_closure_queue" >/dev/null; then
+  echo "#85: closed-unmerged approved row survived a positive closed observation" >&2
+  exit 1
+fi
+
+# #85: an approved row that is absent from enumeration but whose probe says
+# "open" is retained, with state still "approved" — absence alone still
+# does not delete an approved row.
+jq -e '
+  select(.id == "example-org/approved-closure-repo#902")
+  | .state == "approved"
+' "$approved_closure_queue" >/dev/null
+
+# #85: pending-row behavior is byte-identical to before this fix — #904 is
+# absent and not approved, so it is still dropped exactly as it always was,
+# never touched by the closure probe (which only ever looks at approved
+# rows).
+if jq -e 'select(.id == "example-org/approved-closure-repo#904")' \
+  "$approved_closure_queue" >/dev/null; then
+  echo "#85: pending row behavior changed by the closure probe" >&2
+  exit 1
+fi
+
+# No probes failed this run, so no closure-probe summary line is expected.
+if grep -q 'could not be checked for closure' "$approved_closure_stderr"; then
+  echo "#85: unexpected closure-probe-failure summary with no failing probes" >&2
+  exit 1
+fi
+
+# #85: a probe that fails (gh api exits non-zero) must not drop the row
+# either — degrade, never abort, same posture as absence itself. Two
+# distinct approved rows both fail their probe here to also prove the
+# failure is reported as a single summary line, not one line per row (the
+# repo's existing #86 posture on per-candidate spam).
+cat >"$approved_closure_queue" <<'JSONL'
+{"id":"example-org/approved-closure-repo#903","repo":"example-org/approved-closure-repo","ref":"#903","kind":"decision","mandate":{"reason":"approved manually"},"state":"approved","opened":"2026-07-01T00:00:00Z","title":"probe fails"}
+{"id":"example-org/approved-closure-repo#905","repo":"example-org/approved-closure-repo","ref":"#905","kind":"decision","mandate":{"reason":"approved manually"},"state":"approved","opened":"2026-07-01T00:00:00Z","title":"probe also fails"}
+JSONL
+approved_closure_fail_stderr="$approved_closure/stderr-fail"
+FAKE_GH_CLOSURE_FAIL=1 run_approved_closure_sweep >/dev/null 2>"$approved_closure_fail_stderr"
+jq -e '
+  select(.id == "example-org/approved-closure-repo#903")
+  | .state == "approved"
+' "$approved_closure_queue" >/dev/null
+jq -e '
+  select(.id == "example-org/approved-closure-repo#905")
+  | .state == "approved"
+' "$approved_closure_queue" >/dev/null
+[ "$(grep -c 'could not be checked for closure' "$approved_closure_fail_stderr")" -eq 1 ]
+grep -q '^mandate sweep: 2 approved rows could not be checked for closure; retained$' \
+  "$approved_closure_fail_stderr"
 
 # The first sweep is a baseline. Only reserved, tripwire, and CI-failing
 # carve-outs queue; the paused project's issue tripwire still fires. #13 is

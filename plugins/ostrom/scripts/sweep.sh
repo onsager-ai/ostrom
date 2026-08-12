@@ -933,17 +933,66 @@ jq -cn \
   ' >"$work/next.json"
 mv "$work/next.json" "$work/new-state.json"
 
+# #85: an approved row survives being missing from this sweep's enumeration
+# (API hiccup, rate limit, item cap, label change) — that is the deliberate
+# behavior the carry-over below preserves. What it must not survive is the
+# item actually being done. For every approved row absent from active_ids,
+# probe its current state once via the issues endpoint (it answers for PRs
+# too, which is what confirmed the leak in #85) and drop the row only on a
+# positive "closed" observation. A failed or inconclusive probe changes
+# nothing: the row is retained exactly as absence alone would retain it.
+# Plain GET only — no -f/-F field flags, which is the #86 shape (an unmarked
+# read silently promoted to POST).
+printf '%s\n' '[]' >"$work/closed-approved-ids.json"
+rm -f "$work/closed-approved-ids.jsonl"
+approved_closure_unobservable=0
+while IFS=$'\t' read -r cand_id cand_repo cand_number; do
+  [ -n "$cand_id" ] || continue
+  closure_error="$work/closure-error"
+  if closure_state="$(gh api "repos/$cand_repo/issues/$cand_number" \
+      --jq '.state' 2>"$closure_error")"; then
+    if [ "$closure_state" = "closed" ]; then
+      jq -cn --arg id "$cand_id" '$id' >>"$work/closed-approved-ids.jsonl"
+    elif [ "$closure_state" != "open" ]; then
+      approved_closure_unobservable=$((approved_closure_unobservable + 1))
+    fi
+  else
+    approved_closure_unobservable=$((approved_closure_unobservable + 1))
+  fi
+done < <(
+  jq -r \
+    --slurpfile active_ids "$work/active-ids.json" '
+    ($active_ids[0]) as $active_ids
+    | .[]
+    | . as $row
+    | select(
+        $row.state == "approved"
+        and (($active_ids | index($row.id)) == null)
+      )
+    | [$row.id, $row.repo, ($row.ref | ltrimstr("#"))]
+    | @tsv
+  ' "$work/existing-queue.json"
+)
+if [ -s "$work/closed-approved-ids.jsonl" ]; then
+  jq -cs '.' "$work/closed-approved-ids.jsonl" >"$work/closed-approved-ids.json"
+fi
+if [ "$approved_closure_unobservable" -gt 0 ]; then
+  echo "mandate sweep: $approved_closure_unobservable approved rows could not be checked for closure; retained" >&2
+fi
+
 jq -cn \
     --slurpfile existing "$work/existing-queue.json" \
     --slurpfile generated "$work/generated.json" \
     --slurpfile active_ids "$work/active-ids.json" \
     --slurpfile current_items "$work/current-items.json" \
-    --slurpfile possibly_landed "$work/possibly-landed.json" '
+    --slurpfile possibly_landed "$work/possibly-landed.json" \
+    --slurpfile closed_approved "$work/closed-approved-ids.json" '
     ($existing[0]) as $existing
     | ($generated[0]) as $generated
     | ($active_ids[0]) as $active_ids
     | ($current_items[0]) as $current_items
     | ($possibly_landed[0]) as $possibly_landed
+    | ($closed_approved[0]) as $closed_approved
     |
     def dependency_refs($repo; $text):
       [
@@ -1032,7 +1081,17 @@ jq -cn \
     (
       $existing
       | map(. as $row
-        | select($row.state == "approved" or ($active_ids | index($row.id)) != null)
+        # #85: an approved row survives absence, but not a positive "closed"
+        # observation from the probe above ($closed_approved). A row still
+        # present in $active_ids is open by construction and was never
+        # probed, so it always survives regardless of $closed_approved.
+        | select(
+            (
+              $row.state == "approved"
+              and (($closed_approved | index($row.id)) == null)
+            )
+            or ($active_ids | index($row.id)) != null
+          )
       )
     ) as $still_relevant
     | reduce $generated[] as $row ($still_relevant;
