@@ -197,12 +197,12 @@ lease expires and the next pass can reclaim it.
 
 The gatekeeper never writes code, never suggests a fix, and never reviews for
 quality. It never edits the mandate roster or gate conditions, rebases or
-resolves conflicts, dismisses review threads, or debates the builder. It is an
-approver, not a second author. When `/ostrom:merge` stops, this driver records
+resolves conflicts, dismisses review threads, or debates the builder. It is a
+judge, not a second author. When `/ostrom:merge` stops, this driver records
 the permitted action and moves to the next independent candidate.
 
 It may **resolve** a review thread, under the conditions in
 `../merge/SKILL.md`: only after confirming in the artifact that the change is
 present at the current head SHA, and only while naming that commit in the
-resolving comment. Judging a thread addressed is approver work; dismissing one
+resolving comment. Judging a thread addressed is judge work; dismissing one
 is not, and remains the principal's alone.
