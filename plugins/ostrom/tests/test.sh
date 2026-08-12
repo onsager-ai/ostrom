@@ -136,6 +136,13 @@ if [ -n "${FAKE_CLAUDE_INNER_OWNER:-}" ]; then
   bash "$FAKE_CLAUDE_TRACE_SH" append pass-started \
     "$(printf '{"owner":"%s"}' "$FAKE_CLAUDE_INNER_OWNER")" '{}' >/dev/null
 fi
+# Gatekeeper pass-ended facts deliberately omit owner, matching the weaker
+# production shape pass.sh must still reconcile with the role-prefixed start.
+if [ -n "${FAKE_CLAUDE_INNER_OUTCOME:-}" ]; then
+  bash "$FAKE_CLAUDE_TRACE_SH" append pass-ended \
+    "$(printf '{"outcome":"%s","completed_candidates":0}' "$FAKE_CLAUDE_INNER_OUTCOME")" \
+    '{}' >/dev/null
+fi
 case "${FAKE_CLAUDE_MODE:-complete}" in
   complete)
     printf '%s\n' '{"type":"assistant","message":"placeholder"}'
@@ -292,6 +299,114 @@ jq -s -e '
   and .[9].fact.outcome == "failed"
   and (.[9].fact | has("reason") | not)
 ' "$pass_config/ostrom/sprint.jsonl" >/dev/null
+
+# Once the inner protocol records its own result, a clean client exit cannot
+# overwrite that better-informed outcome. The gatekeeper-shaped inner end row
+# has no owner, so correlation comes from its role-prefixed start and this
+# wrapper's post-start watermark rather than a field production does not emit.
+outcome_fixture="$fixture/inner-outcome"
+outcome_config="$outcome_fixture/config"
+outcome_marker="$outcome_fixture/claude-started"
+mkdir -p "$outcome_config/ostrom/roles"
+printf '{}\n' >"$outcome_config/ostrom/roles/gatekeeper.settings.json"
+: >"$outcome_config/ostrom/loop-armed"
+
+CLAUDE_CONFIG_DIR="$outcome_config" CLAUDE_BIN="$fake_claude" \
+  FAKE_CLAUDE_INNER_OWNER="gatekeeper-inner-fixture-wake1" \
+  FAKE_CLAUDE_INNER_OUTCOME=failed \
+  FAKE_CLAUDE_TRACE_SH="$fake_claude_trace_sh" \
+  bash "$PLUGIN_ROOT/scripts/pass.sh" gatekeeper >/dev/null
+jq -s -e '
+  length == 4
+  and map(.kind) == ["pass-started", "pass-started", "pass-ended", "pass-ended"]
+  and .[1].fact.owner == "gatekeeper-inner-fixture-wake1"
+  and (.[2].fact | has("owner") | not)
+  and .[2].fact.outcome == "failed"
+  and .[3].fact.owner == .[0].fact.owner
+  and .[3].fact.outcome == "failed"
+  and .[3].fact.cost_usd == 1.25
+' "$outcome_config/ostrom/sprint.jsonl" >/dev/null
+
+CLAUDE_CONFIG_DIR="$outcome_config" CLAUDE_BIN="$fake_claude" \
+  FAKE_CLAUDE_INNER_OWNER="gatekeeper-inner-fixture-wake2" \
+  FAKE_CLAUDE_INNER_OUTCOME=completed \
+  FAKE_CLAUDE_TRACE_SH="$fake_claude_trace_sh" \
+  bash "$PLUGIN_ROOT/scripts/pass.sh" gatekeeper >/dev/null
+jq -s -e '
+  length == 8
+  and .[6].kind == "pass-ended"
+  and .[6].fact.outcome == "completed"
+  and .[7].kind == "pass-ended"
+  and .[7].fact.owner == .[4].fact.owner
+  and .[7].fact.outcome == "completed"
+' "$outcome_config/ostrom/sprint.jsonl" >/dev/null
+
+# With no inner rows at all, #73's no-op classification and reason survive
+# unchanged rather than being mistaken for a missing outcome on a real run.
+CLAUDE_CONFIG_DIR="$outcome_config" CLAUDE_BIN="$fake_claude" \
+  bash "$PLUGIN_ROOT/scripts/pass.sh" gatekeeper >/dev/null
+jq -s -e '
+  length == 10
+  and .[8].kind == "pass-started"
+  and .[9].kind == "pass-ended"
+  and .[9].fact.owner == .[8].fact.owner
+  and .[9].fact.outcome == "no-op"
+  and .[9].fact.reason == "blocked"
+' "$outcome_config/ostrom/sprint.jsonl" >/dev/null
+
+# Transport authority remains outside the protocol: systemd's TERM timeout
+# and another trapped signal must override even an already-written inner row.
+: >"$outcome_marker"
+FAKE_CLAUDE_MODE=wait FAKE_CLAUDE_MARKER="$outcome_marker" \
+  FAKE_CLAUDE_INNER_OWNER="gatekeeper-inner-fixture-wake4" \
+  FAKE_CLAUDE_INNER_OUTCOME=failed \
+  FAKE_CLAUDE_TRACE_SH="$fake_claude_trace_sh" \
+  CLAUDE_CONFIG_DIR="$outcome_config" CLAUDE_BIN="$fake_claude" \
+  bash "$PLUGIN_ROOT/scripts/pass.sh" gatekeeper >/dev/null 2>&1 &
+outcome_timeout_pid=$!
+for _attempt in $(seq 1 100); do
+  [ -s "$outcome_marker" ] && break
+  sleep 0.05
+done
+[ -s "$outcome_marker" ]
+kill -TERM "$outcome_timeout_pid"
+set +e
+wait "$outcome_timeout_pid"
+outcome_timeout_status=$?
+set -e
+[ "$outcome_timeout_status" -eq 143 ]
+jq -s -e '
+  length == 14
+  and .[12].fact.outcome == "failed"
+  and .[13].fact.owner == .[10].fact.owner
+  and .[13].fact.outcome == "timed-out"
+' "$outcome_config/ostrom/sprint.jsonl" >/dev/null
+
+: >"$outcome_marker"
+FAKE_CLAUDE_MODE=wait FAKE_CLAUDE_MARKER="$outcome_marker" \
+  FAKE_CLAUDE_INNER_OWNER="gatekeeper-inner-fixture-wake5" \
+  FAKE_CLAUDE_INNER_OUTCOME=completed \
+  FAKE_CLAUDE_TRACE_SH="$fake_claude_trace_sh" \
+  CLAUDE_CONFIG_DIR="$outcome_config" CLAUDE_BIN="$fake_claude" \
+  bash "$PLUGIN_ROOT/scripts/pass.sh" gatekeeper >/dev/null 2>&1 &
+outcome_signal_pid=$!
+for _attempt in $(seq 1 100); do
+  [ -s "$outcome_marker" ] && break
+  sleep 0.05
+done
+[ -s "$outcome_marker" ]
+kill -HUP "$outcome_signal_pid"
+set +e
+wait "$outcome_signal_pid"
+outcome_signal_status=$?
+set -e
+[ "$outcome_signal_status" -eq 129 ]
+jq -s -e '
+  length == 18
+  and .[16].fact.outcome == "completed"
+  and .[17].fact.owner == .[14].fact.owner
+  and .[17].fact.outcome == "failed"
+' "$outcome_config/ostrom/sprint.jsonl" >/dev/null
 
 gatekeeper_args="$pass_fixture/gatekeeper-args"
 FAKE_CLAUDE_MODE=wait FAKE_CLAUDE_MARKER="$fake_marker" \

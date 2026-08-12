@@ -19,7 +19,7 @@ const ROLE_SKILL: Record<DeliveryRole, string> = {
 // checked mid-window -- and must stay quiet. A run this long can only mean
 // the loop has stopped taking ownership at all: this is the shape #73
 // measured in production, 19 passes in a row, none of them noticed.
-const NOOP_FAULT_THRESHOLD = 3;
+const PASS_FAULT_THRESHOLD = 3;
 
 function nowEpoch(context: DoctorContext): number {
   const explicit = context.env.MANDATE_NOW_EPOCH;
@@ -46,8 +46,8 @@ function formatAge(ageSeconds: number): string {
 }
 
 // Walks the trace backward collecting this role's pass-ended records,
-// newest first, stopping once `limit` are found. The no-op streak check
-// only ever needs the most recent NOOP_FAULT_THRESHOLD, so this is the one
+// newest first, stopping once `limit` are found. The outcome streak checks
+// only ever need the most recent PASS_FAULT_THRESHOLD, so this is the one
 // backward scan both the staleness check and the fault check read from --
 // scanning once from the end rather than parsing the whole (unboundedly
 // growing) trace forward.
@@ -112,7 +112,7 @@ function checkRolePass(
     };
   }
 
-  const recent = recentRolePassEnded(trace.content, role, NOOP_FAULT_THRESHOLD);
+  const recent = recentRolePassEnded(trace.content, role, PASS_FAULT_THRESHOLD);
   const record = recent[0];
   if (!record) {
     return {
@@ -142,7 +142,7 @@ function checkRolePass(
   // anything -- a fault the age/cadence check alone cannot see, so it is
   // judged first and overrides an otherwise-current verdict.
   if (
-    recent.length === NOOP_FAULT_THRESHOLD &&
+    recent.length === PASS_FAULT_THRESHOLD &&
     recent.every(
       (candidate) => object(candidate.fact) && candidate.fact.outcome === "no-op",
     )
@@ -150,8 +150,25 @@ function checkRolePass(
     return {
       status: "FAIL",
       name: checkName,
-      detail: `${role} loop has produced ${NOOP_FAULT_THRESHOLD} consecutive no-op passes, last ${timestamp} (age ${age})`,
+      detail: `${role} loop has produced ${PASS_FAULT_THRESHOLD} consecutive no-op passes, last ${timestamp} (age ${age})`,
       remedy: `inspect pass-runs/${role} transcripts; the loop is running but the protocol never takes ownership`,
+    };
+  }
+
+  // The protocol did take ownership in this shape, but repeatedly reported
+  // that it failed. Treating those fresh wrapper rows as healthy would hide
+  // the same dead loop as a no-op streak, one layer deeper.
+  if (
+    recent.length === PASS_FAULT_THRESHOLD &&
+    recent.every(
+      (candidate) => object(candidate.fact) && candidate.fact.outcome === "failed",
+    )
+  ) {
+    return {
+      status: "FAIL",
+      name: checkName,
+      detail: `${role} loop has produced ${PASS_FAULT_THRESHOLD} consecutive failed passes, last ${timestamp} (age ${age})`,
+      remedy: `inspect pass-runs/${role} transcripts; the protocol takes ownership but does not complete`,
     };
   }
 

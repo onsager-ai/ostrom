@@ -724,7 +724,7 @@ var ROLE_SKILL = {
   builder: "/ostrom:work",
   gatekeeper: "/ostrom:gatekeep"
 };
-var NOOP_FAULT_THRESHOLD = 3;
+var PASS_FAULT_THRESHOLD = 3;
 function nowEpoch2(context) {
   const explicit = context.env.MANDATE_NOW_EPOCH;
   if (explicit && /^\d+$/.test(explicit)) return Number(explicit);
@@ -792,7 +792,7 @@ function checkRolePass(context, role) {
       remedy: "inspect sprint.jsonl and fix its permissions"
     };
   }
-  const recent = recentRolePassEnded(trace.content, role, NOOP_FAULT_THRESHOLD);
+  const recent = recentRolePassEnded(trace.content, role, PASS_FAULT_THRESHOLD);
   const record = recent[0];
   if (!record) {
     return {
@@ -814,14 +814,24 @@ function checkRolePass(context, role) {
   }
   const ageSeconds = nowEpoch2(context) - Math.floor(timestampMs / 1e3);
   const age = formatAge(ageSeconds);
-  if (recent.length === NOOP_FAULT_THRESHOLD && recent.every(
+  if (recent.length === PASS_FAULT_THRESHOLD && recent.every(
     (candidate) => object(candidate.fact) && candidate.fact.outcome === "no-op"
   )) {
     return {
       status: "FAIL",
       name: checkName,
-      detail: `${role} loop has produced ${NOOP_FAULT_THRESHOLD} consecutive no-op passes, last ${timestamp} (age ${age})`,
+      detail: `${role} loop has produced ${PASS_FAULT_THRESHOLD} consecutive no-op passes, last ${timestamp} (age ${age})`,
       remedy: `inspect pass-runs/${role} transcripts; the loop is running but the protocol never takes ownership`
+    };
+  }
+  if (recent.length === PASS_FAULT_THRESHOLD && recent.every(
+    (candidate) => object(candidate.fact) && candidate.fact.outcome === "failed"
+  )) {
+    return {
+      status: "FAIL",
+      name: checkName,
+      detail: `${role} loop has produced ${PASS_FAULT_THRESHOLD} consecutive failed passes, last ${timestamp} (age ${age})`,
+      remedy: `inspect pass-runs/${role} transcripts; the protocol takes ownership but does not complete`
     };
   }
   if (ageSeconds > cadenceHours * 60 * 60) {
