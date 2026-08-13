@@ -21,7 +21,7 @@ personal constitution.
   self-installs one.
 - **Agent-push `/ostrom:touch` intervention capture** — with pluggable log
   providers (file/Notion) and layered YAML config.
-- **Mandate portfolio steering** — a daily sweep and SessionStart digest that reads
+- **Mandate portfolio steering** — an hourly sweep and SessionStart digest that reads
   open GitHub issues, PRs, and CI through `gh`; keeps a private,
   file-backed queue of pointers; and routes approve/reject/defer decisions
   through `/ostrom:desk`. Tripwires reuse constitution's escalation-dossier
@@ -117,11 +117,18 @@ project suppresses routine work but never reserved refs, tripwires, or failing
 CI. The first sweep baselines existing work, and selector changes re-baseline
 scope rather than flooding the queue.
 
-Run the read-only sweep daily outside Claude Code. For example, edit the
-placeholder clone path and install this with `crontab -e`:
+Run the read-only sweep hourly outside Claude Code. Incremental runs ask the
+issues REST change feed only for updates after the stored cursor and reuse each
+repository's ETag, so a quiet repository receives a rate-limit-free `304`.
+Open pull requests are still listed in full because check-rollup and changed-file
+data can move without advancing a PR's `updatedAt`; the PR set is small, and
+refreshing it prevents stale CI drift. The sweep automatically performs a full
+issue reconciliation every 24 hours to remove closed items and heal a missed or
+clock-skewed cursor. For example, edit the placeholder clone path and install
+this with `crontab -e`:
 
 ```cron
-0 8 * * * cd /absolute/path/to/ostrom && CLAUDE_PLUGIN_ROOT=/absolute/path/to/ostrom/plugins/ostrom /bin/bash /absolute/path/to/ostrom/plugins/ostrom/scripts/sweep.sh
+0 * * * * cd /absolute/path/to/ostrom && CLAUDE_PLUGIN_ROOT=/absolute/path/to/ostrom/plugins/ostrom /bin/bash /absolute/path/to/ostrom/plugins/ostrom/scripts/sweep.sh
 ```
 
 The SessionStart hook never calls `gh`; it renders the durable files written by
@@ -137,8 +144,8 @@ resolvable GitHub pointer, its sweep-refreshed title, and mandate metadata,
 never mirrored issue or PR bodies. When an open PR closes a queued issue,
 only the PR is shown. Digest rows preserve at least 45 title characters when
 available, truncating only the non-selector tail of long reasons. Each issue
-and PR query reads up to 200 open items; reaching that cap adds a persistent
-per-repo incomplete-sweep warning. v1 implements the `file` provider only; the
+and PR query reads up to 200 open items; reaching that cap is a loud fault and
+the sweep refuses to write truncated state. v1 implements the `file` provider only; the
 provider seam remains explicit for a later addition.
 
 Run `/ostrom:desk lint` explicitly to inspect selectors that matched no open item in
