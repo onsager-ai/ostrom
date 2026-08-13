@@ -40,12 +40,15 @@ item_ref="$(jq -r '.item_ref' "$order_file")"
 order_id="$(jq -r '.order_id' "$order_file")"
 cost_ceiling_usd="$(jq -r '.cost_ceiling_usd' "$order_file")"
 token_ceiling="$(jq -r '.token_ceiling' "$order_file")"
+branch_name="$(jq -r '.branch_name' "$order_file")"
 item_hash="$(bash "$SCRIPT_DIR/work-order.sh" item-hash "$item_id")"
 unit_name="ostrom-implementer-${item_hash:0:16}"
 
 append_dispatch_failure() {
   local reason="$1"
   local duration_seconds="${2:-0}"
+  local worktree_path="${3:-}"
+  local preserved_branch="${4:-}"
   local failed_fact
   failed_fact="$(jq -cn \
     --arg item_id "$item_id" --arg order_id "$order_id" \
@@ -53,16 +56,66 @@ append_dispatch_failure() {
     --argjson cost_ceiling_usd "$cost_ceiling_usd" \
     --argjson token_ceiling "$token_ceiling" \
     --argjson duration_seconds "$duration_seconds" \
-    --arg reason "$reason" \
+    --arg reason "$reason" --arg worktree_path "$worktree_path" \
+    --arg branch_name "$preserved_branch" \
     '{schema_version: 1, item_id: $item_id, order_id: $order_id,
       unit_name: $unit_name, backend: $backend,
       cost_ceiling_usd: $cost_ceiling_usd, token_ceiling: $token_ceiling,
       cost_usd: 0, duration_seconds: $duration_seconds,
       pr_url: null, reason: $reason,
+      worktree_path: (if $worktree_path == "" then null else $worktree_path end),
+      branch_name: (if $branch_name == "" then null else $branch_name end),
       usage: {input_tokens: 0, cached_input_tokens: 0,
         output_tokens: 0, reasoning_output_tokens: 0}}')"
   bash "$SCRIPT_DIR/trace.sh" append work-failed "$failed_fact" '{}' >/dev/null
 }
+
+local_default_ref() {
+  local worktree="$1"
+  local ref candidate count
+  ref="$(git -C "$worktree" symbolic-ref -q refs/remotes/origin/HEAD 2>/dev/null)" || ref=""
+  if [ -n "$ref" ] && git -C "$worktree" rev-parse --verify "$ref^{commit}" >/dev/null 2>&1; then
+    printf '%s\n' "$ref"
+    return 0
+  fi
+  for candidate in refs/remotes/origin/main refs/remotes/origin/master; do
+    if git -C "$worktree" rev-parse --verify "$candidate^{commit}" >/dev/null 2>&1; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  ref="$(git -C "$worktree" for-each-ref --format='%(refname)' refs/remotes/origin \
+    | grep -v '/HEAD$' || true)"
+  count="$(printf '%s\n' "$ref" | sed '/^$/d' | wc -l | tr -d '[:space:]')"
+  if [ "$count" -eq 1 ]; then
+    printf '%s\n' "$ref"
+    return 0
+  fi
+  return 1
+}
+
+# A mismatching worktree that contains preserved work cannot be satisfied by
+# the implementer. Reject it before reserving the item lease, a concurrency
+# slot, or the order's cost ceiling. The implementer repeats this check after
+# fetch, under the lease, to close the preflight race and retarget clean trees.
+worktree_root="$MANDATE_DATA_DIR/implementer-worktrees/$item_hash"
+if [ -e "$worktree_root" ]; then
+  existing_branch="$(git -C "$worktree_root" branch --show-current 2>/dev/null)" || existing_branch=""
+  if [ -n "$existing_branch" ] && [ "$existing_branch" != "$branch_name" ]; then
+    worktree_status="$(git -C "$worktree_root" status --porcelain 2>/dev/null)" || worktree_status=unreadable
+    default_ref="$(local_default_ref "$worktree_root")" || default_ref=""
+    ahead_count=unknown
+    if [ -n "$default_ref" ]; then
+      ahead_count="$(git -C "$worktree_root" rev-list --count "$default_ref..HEAD" 2>/dev/null)" || ahead_count=unknown
+    fi
+    if [ -n "$worktree_status" ] || [ "$ahead_count" = unknown ] || [ "$ahead_count" -gt 0 ]; then
+      append_dispatch_failure worktree-branch-mismatch 0 "$worktree_root" "$existing_branch" ||
+        echo "ostrom dispatch: could not record work-failed" >&2
+      echo "ostrom dispatch: worktree branch mismatch preserves work at $worktree_root on $existing_branch (order expects $branch_name)" >&2
+      exit 3
+    fi
+  fi
+fi
 
 codex_unavailable() {
   local detail="$1"

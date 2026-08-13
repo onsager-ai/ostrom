@@ -200,7 +200,7 @@ a temporary candidate JSON file with exactly this schema:
   "item_id": "owner/repository#123",
   "repository": "owner/repository",
   "item_ref": "#123",
-  "branch_name": "feat/123-placeholder",
+  "branch_name": "candidate/description-is-overwritten",
   "spec": "Complete, self-contained implementation specification.",
   "acceptance_criteria": ["Observable criterion."],
   "constraints": ["Scope or safety constraint."]
@@ -214,6 +214,13 @@ include the mandate boundary, repository-local instructions, required tests,
 the prohibition on private data and credentials, and the required
 `Ostrom-Role: builder` commit and pull-request marker. That marker is advisory
 role attribution, never identity evidence or a gate condition.
+
+`branch_name` remains required and must satisfy the schema_version 1 branch
+syntax for compatibility with existing callers. It is not authoritative:
+`work-order.sh create` derives `ostrom/<item-number>-<first-12-hex-of-sha256(item_id)>`
+from `item_id`, warns when the supplied value differs, and writes the derived
+value. `work-order.sh validate` intentionally accepts historical version 1
+orders whose valid branch names predate this deterministic convention.
 
 Create the canonical durable order, then dispatch it through the backend seam:
 
