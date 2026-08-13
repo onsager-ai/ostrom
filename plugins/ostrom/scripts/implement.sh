@@ -243,13 +243,13 @@ jq -r '
   + "\n\nConstraints:\n" + (.constraints | map("- " + .) | join("\n"))
 ' "$order_file" >"$prompt_file"
 
-# Explicitly non-interactive: approval=never cannot hang waiting for a human.
-# workspace-write permits the diff but keeps network off; the wrapper performs
-# every authenticated/network mutation after Codex exits.
+# Codex exec is non-interactive; keep its never-approve policy explicit in
+# configuration. workspace-write permits the diff but keeps network off; the
+# wrapper performs every authenticated/network mutation after Codex exits.
 "$CODEX_BIN" exec --json \
   -C "$worktree_root" \
   -s workspace-write \
-  -a never \
+  -c approval_policy=\"never\" \
   -c sandbox_workspace_write.network_access=false \
   -c web_search=\"disabled\" \
   -c features.rollout_budget.enabled=true \
@@ -265,6 +265,13 @@ child_pid=""
 if [ "$codex_status" -ne 0 ]; then
   case "$codex_status" in
     126|127) failure_reason=codex-unavailable ;;
+    2)
+      if grep -q '^Usage: codex exec ' "$events_file"; then
+        failure_reason=codex-invocation-invalid
+      else
+        failure_reason=codex-exit-2
+      fi
+      ;;
     *) failure_reason="codex-exit-$codex_status" ;;
   esac
   exit "$codex_status"

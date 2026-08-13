@@ -1223,12 +1223,27 @@ SH
 fake_codex="$implement_bin/codex"
 cat >"$fake_codex" <<'SH'
 #!/usr/bin/env bash
+usage_error() {
+  printf "error: unexpected argument '%s' found\n\n" "$1" >&2
+  printf 'Usage: codex exec [OPTIONS] [PROMPT]\n' >&2
+  exit 2
+}
+
+[ "${1:-}" = exec ] || usage_error "${1:-}"
+shift
 worktree=""
 result=""
 while [ "$#" -gt 0 ]; do
+  # Keep this accepted option set aligned with the pinned codex exec CLI.
+  # Unknown options deliberately fail like clap so wrapper drift breaks CI.
   case "$1" in
-    -C) worktree="$2"; shift 2 ;;
-    -o) result="$2"; shift 2 ;;
+    --json) shift ;;
+    -C|--cd) worktree="$2"; shift 2 ;;
+    -s|--sandbox) shift 2 ;;
+    -c|--config) shift 2 ;;
+    -o|--output-last-message) result="$2"; shift 2 ;;
+    --) shift; break ;;
+    -*) usage_error "$1" ;;
     *) shift ;;
   esac
 done
@@ -1237,6 +1252,9 @@ case "${FAKE_CODEX_MODE:-complete}" in
     printf '%s\n' "$$" >"$FAKE_CODEX_MARKER"
     trap 'exit 143' TERM
     while :; do sleep 1; done
+    ;;
+  usage)
+    usage_error '--removed-flag'
     ;;
   complete)
     printf 'implemented\n' >"$worktree/generated.txt"
@@ -1296,6 +1314,46 @@ jq -s -e '
   and .[0].fact.cost_usd == 0
   and (.[0].fact.duration_seconds | type == "number")
 ' "$implement_config/ostrom/sprint.jsonl" >/dev/null
+
+# A clap usage error means the wrapper called Codex incorrectly, not that the
+# model failed. Keep that distinct from an ordinary codex-exit-2 terminal row.
+implement_usage_candidate="$implement_fixture/usage-candidate.json"
+cat >"$implement_usage_candidate" <<'JSON'
+{"schema_version":1,"item_id":"example-org/example-repo#130","repository":"example-org/example-repo","item_ref":"#130","branch_name":"fix/130-placeholder","spec":"Exercise an invalid harness invocation.","acceptance_criteria":["The usage failure is classified."],"constraints":["Use placeholder data only."]}
+JSON
+implement_usage_order="$(
+  CLAUDE_CONFIG_DIR="$implement_config" \
+    MANDATE_TRACE_TIME="2026-08-11T03:00:30Z" \
+    bash "$PLUGIN_ROOT/scripts/work-order.sh" create "$implement_usage_candidate"
+)"
+implement_usage_order_id="$(jq -r '.order_id' "$implement_usage_order")"
+implement_usage_hash="$(bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash 'example-org/example-repo#130')"
+implement_usage_unit="ostrom-implementer-${implement_usage_hash:0:16}"
+implement_usage_lease="implementer-item-$implement_usage_hash.lease"
+CLAUDE_CONFIG_DIR="$implement_config" MANDATE_LEASE_NAME="$implement_usage_lease" \
+  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire "$implement_usage_unit" 3600 >/dev/null
+set +e
+FAKE_CODEX_MODE=usage \
+  CODEX_BIN="$fake_codex" CLAUDE_CONFIG_DIR="$implement_config" \
+  MANDATE_IMPLEMENTER_SOURCE_REPO="$implement_source" \
+  MANDATE_GH_AS_BIN="$fake_implement_gh" FAKE_GIT_REMOTE="$implement_remote" \
+  FAKE_PR_BODY="$implement_fixture/unused-usage-pr-body" \
+  bash "$PLUGIN_ROOT/scripts/implement.sh" \
+    "$implement_usage_order" "$implement_usage_unit" \
+    >"$implement_fixture/usage.out" 2>"$implement_fixture/usage.err"
+implement_usage_status=$?
+set -e
+[ "$implement_usage_status" -eq 2 ]
+[ ! -e "$implement_config/ostrom/$implement_usage_lease" ]
+jq -s -e --arg order_id "$implement_usage_order_id" '
+  [.[] | select(.fact.order_id == $order_id)] | length == 1
+  and .[0].kind == "work-failed"
+  and .[0].fact.reason == "codex-invocation-invalid"
+' "$implement_config/ostrom/sprint.jsonl" >/dev/null
+if grep -q '"reason":"codex-exit-2"' "$implement_config/ostrom/sprint.jsonl"; then
+  echo "Codex usage error was misclassified as an exec status" >&2
+  exit 1
+fi
 
 implement_ok_candidate="$implement_fixture/ok-candidate.json"
 cat >"$implement_ok_candidate" <<'JSON'
