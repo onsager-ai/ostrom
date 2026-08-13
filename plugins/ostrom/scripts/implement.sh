@@ -42,11 +42,15 @@ GH_AS_BIN="${MANDATE_GH_AS_BIN:-$SCRIPT_DIR/gh-as.sh}"
 dispatch_backend="${MANDATE_DISPATCH_BACKEND:-systemd}"
 start_epoch="$(date +%s)"
 child_pid=""
+monitor_pid=""
 terminal_written=0
 failure_reason="implementer-exited"
 pr_url=""
 events_file=""
+events_pipe=""
+streaming_ceiling_marker=""
 worktree_root=""
+streaming_ceiling_mode="${MANDATE_IMPLEMENTER_STREAMING_CEILING:-enabled}"
 
 usage_fact() {
   if [ -n "$events_file" ] && [ -s "$events_file" ]; then
@@ -99,6 +103,50 @@ weighted_token_count() {
   '
 }
 
+monitor_codex_events() {
+  monitored_pid="$1"
+  while IFS= read -r event_line || [ -n "$event_line" ]; do
+    printf '%s\n' "$event_line" >>"$events_file"
+    if [ "$streaming_ceiling_mode" = disabled ] || \
+      [ -s "$streaming_ceiling_marker" ] || \
+      ! jq -e '
+        type == "object" and .type == "turn.completed"
+        and (.usage | type == "object")
+      ' >/dev/null 2>&1 <<<"$event_line"; then
+      continue
+    fi
+    streamed_usage="$(usage_fact)"
+    streamed_weighted_tokens="$(weighted_token_count <<<"$streamed_usage")"
+    if [ "$streamed_weighted_tokens" -gt "$token_ceiling" ] && \
+      kill -TERM "$monitored_pid" 2>/dev/null; then
+      printf '%s\n' "$streamed_weighted_tokens" >"$streaming_ceiling_marker"
+    fi
+  done
+}
+
+preserved_work_fact() {
+  preserved_path=""
+  preserved_branch=""
+  if [ -n "$worktree_root" ] && [ -e "$worktree_root" ]; then
+    worktree_status="$(git -C "$worktree_root" status --porcelain 2>/dev/null || true)"
+    ahead_count=0
+    if [ -n "${default_branch:-}" ]; then
+      ahead_count="$(git -C "$worktree_root" rev-list --count \
+        "refs/remotes/origin/$default_branch..HEAD" 2>/dev/null || printf '0\n')"
+    fi
+    if [ -n "$worktree_status" ] || [ "$ahead_count" -gt 0 ]; then
+      preserved_path="$worktree_root"
+      preserved_branch="$(git -C "$worktree_root" branch --show-current \
+        2>/dev/null || true)"
+      [ -n "$preserved_branch" ] || preserved_branch="$branch_name"
+    fi
+  fi
+  jq -cn --arg worktree_path "$preserved_path" \
+    --arg branch_name "$preserved_branch" \
+    '{worktree_path: (if $worktree_path == "" then null else $worktree_path end),
+      branch_name: (if $branch_name == "" then null else $branch_name end)}'
+}
+
 append_terminal() {
   kind="$1"
   reason="$2"
@@ -117,6 +165,10 @@ append_terminal() {
     --argjson token_ceiling "$token_ceiling" \
     --argjson cost_ceiling_usd "$cost_ceiling_usd" \
     '($weighted_tokens / $token_ceiling * $cost_ceiling_usd)')"
+  preserved_work='{"worktree_path":null,"branch_name":null}'
+  if [ "$kind" = work-failed ]; then
+    preserved_work="$(preserved_work_fact)"
+  fi
   terminal_fact="$(jq -cn \
     --arg item_id "$item_id" --arg order_id "$order_id" \
     --arg unit_name "$unit_name" --arg backend "$dispatch_backend" \
@@ -126,7 +178,7 @@ append_terminal() {
     --argjson cost_usd "$cost_usd" \
     --argjson duration_seconds "$duration_seconds" \
     --arg pr_url "$pr_url" --arg reason "$reason" \
-    --arg worktree_path "$worktree_root" \
+    --argjson preserved_work "$preserved_work" \
     --argjson usage "$usage" \
     '{schema_version: 1, item_id: $item_id, order_id: $order_id,
       unit_name: $unit_name, backend: $backend,
@@ -135,8 +187,8 @@ append_terminal() {
       duration_seconds: $duration_seconds,
       pr_url: (if $pr_url == "" then null else $pr_url end),
       reason: (if $reason == "" then null else $reason end),
-      worktree_path: (if $reason == "token-ceiling-exceeded"
-        and $worktree_path != "" then $worktree_path else null end),
+      worktree_path: $preserved_work.worktree_path,
+      branch_name: $preserved_work.branch_name,
       usage: $usage}')"
   if bash "$SCRIPT_DIR/trace.sh" append "$kind" "$terminal_fact" '{}' >/dev/null; then
     terminal_written=1
@@ -153,6 +205,17 @@ finish() {
     kill -TERM "$child_pid" 2>/dev/null || true
     wait "$child_pid" 2>/dev/null || true
     child_pid=""
+  fi
+  if [ -n "$monitor_pid" ]; then
+    if kill -0 "$monitor_pid" 2>/dev/null; then
+      kill -TERM "$monitor_pid" 2>/dev/null || true
+    fi
+    wait "$monitor_pid" 2>/dev/null || true
+    monitor_pid=""
+  fi
+  if [ -n "$events_pipe" ]; then
+    rm -f "$events_pipe"
+    events_pipe=""
   fi
   if [ "$terminal_written" -eq 0 ]; then
     append_terminal work-failed "$failure_reason" || {
@@ -269,6 +332,8 @@ mkdir -p "$runs_dir"
 prompt_file="$runs_dir/prompt.md"
 result_file="$runs_dir/result.md"
 events_file="$runs_dir/events.jsonl"
+events_pipe="$runs_dir/events.pipe"
+streaming_ceiling_marker="$runs_dir/token-ceiling-terminated"
 jq -r '
   "Implement this work order. Work only in the current worktree. Do not commit, push, open a pull request, or use the network; the outer harness owns those steps. Run proportionate tests. Do not redesign the agreed spec.\n\n"
   + "Item: " + .item_id + "\nBranch: " + .branch_name + "\n"
@@ -282,8 +347,15 @@ jq -r '
 # Codex exec is non-interactive; keep its never-approve policy explicit in
 # configuration. workspace-write permits the diff but keeps network off; the
 # wrapper performs every authenticated/network mutation after Codex exits.
-# In-run token budgeting is not available on the pinned CLI, so the weighted-
-# token ceiling is enforced after the run from the reported usage instead.
+# The pinned CLI cannot parse rollout_budget configuration, so supervise its
+# JSON event stream and terminate the child as soon as completed-turn usage
+# crosses the weighted-token ceiling. The post-run check remains a backstop.
+rm -f "$events_pipe" "$streaming_ceiling_marker"
+: >"$events_file"
+if ! mkfifo "$events_pipe"; then
+  failure_reason=event-stream-create-failed
+  exit 1
+fi
 "$CODEX_BIN" exec --json \
   -C "$worktree_root" \
   -s workspace-write \
@@ -291,11 +363,21 @@ jq -r '
   -c sandbox_workspace_write.network_access=false \
   -c web_search=\"disabled\" \
   -o "$result_file" \
-  <"$prompt_file" >"$events_file" 2>&1 &
+  <"$prompt_file" >"$events_pipe" 2>&1 &
 child_pid=$!
+monitor_codex_events "$child_pid" <"$events_pipe" &
+monitor_pid=$!
 wait "$child_pid"
 codex_status=$?
 child_pid=""
+wait "$monitor_pid" 2>/dev/null || true
+monitor_pid=""
+rm -f "$events_pipe"
+events_pipe=""
+if [ -s "$streaming_ceiling_marker" ]; then
+  failure_reason=token-ceiling-terminated
+  exit 1
+fi
 if [ "$codex_status" -ne 0 ]; then
   case "$codex_status" in
     126|127) failure_reason=codex-unavailable ;;
