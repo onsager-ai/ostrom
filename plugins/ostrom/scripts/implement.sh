@@ -50,6 +50,7 @@ events_file=""
 events_pipe=""
 streaming_ceiling_marker=""
 worktree_root=""
+source_repository=""
 streaming_ceiling_mode="${MANDATE_IMPLEMENTER_STREAMING_CEILING:-enabled}"
 
 usage_fact() {
@@ -178,6 +179,7 @@ append_terminal() {
     --argjson cost_usd "$cost_usd" \
     --argjson duration_seconds "$duration_seconds" \
     --arg pr_url "$pr_url" --arg reason "$reason" \
+    --arg source_repository_path "$source_repository" \
     --argjson preserved_work "$preserved_work" \
     --argjson usage "$usage" \
     '{schema_version: 1, item_id: $item_id, order_id: $order_id,
@@ -187,6 +189,8 @@ append_terminal() {
       duration_seconds: $duration_seconds,
       pr_url: (if $pr_url == "" then null else $pr_url end),
       reason: (if $reason == "" then null else $reason end),
+      source_repository_path: (if $source_repository_path == ""
+        then null else $source_repository_path end),
       worktree_path: $preserved_work.worktree_path,
       branch_name: $preserved_work.branch_name,
       usage: $usage}')"
@@ -252,6 +256,11 @@ if [ "$(jq -r '.owner' <<<"$lease_json")" != "$lease_owner" ]; then
 fi
 
 find_source_repository() {
+  local config root marker candidate remote normalized
+  local -a matching_candidates=()
+  local -a primary_candidates=()
+  local -a linked_candidates=()
+
   if [ -n "${MANDATE_IMPLEMENTER_SOURCE_REPO:-}" ]; then
     [ -d "$MANDATE_IMPLEMENTER_SOURCE_REPO" ] || return 1
     printf '%s\n' "$MANDATE_IMPLEMENTER_SOURCE_REPO"
@@ -267,17 +276,72 @@ find_source_repository() {
       normalized="${normalized#https://github.com/}"
       normalized="${normalized#git@github.com:}"
       if [ "$normalized" = "$repository" ]; then
-        printf '%s\n' "$candidate"
-        return 0
+        matching_candidates+=("$candidate")
       fi
     done < <(find "$root" -name .git -print -prune 2>/dev/null)
   done < <(jq -r '.search_roots[]' <<<"$config")
+
+  if [ "${#matching_candidates[@]}" -gt 0 ]; then
+    # Sort all matches before classification. The lexicographically first
+    # primary clone therefore wins deterministically, independent of root or
+    # filesystem traversal order; duplicate paths from overlapping roots are
+    # removed at the same time.
+    while IFS= read -r candidate; do
+      if [ -d "$candidate/.git" ]; then
+        primary_candidates+=("$candidate")
+      elif [ -f "$candidate/.git" ]; then
+        linked_candidates+=("$candidate")
+      fi
+    done < <(printf '%s\n' "${matching_candidates[@]}" | LC_ALL=C sort -u)
+  fi
+
+  if [ "${#primary_candidates[@]}" -gt 0 ]; then
+    printf '%s\n' "${primary_candidates[0]}"
+    return 0
+  fi
+  if [ "${#linked_candidates[@]}" -gt 0 ]; then
+    # A linked worktree inherits whatever branch and commits its operator left
+    # there. Report the first sorted match for diagnosis, but never use it as
+    # a source checkout.
+    printf 'source-repository-linked-worktree-only path=%s\n' \
+      "${linked_candidates[0]}"
+    # Reserve a private status so config/parser failures retain the historical
+    # source-repository-not-found classification in the caller.
+    return 10
+  fi
   return 1
 }
 
-source_repository="$(find_source_repository)" || {
-  failure_reason=source-repository-not-found
-  exit 1
+source_resolution="$(find_source_repository)"
+source_resolution_status=$?
+case "$source_resolution_status" in
+  0) source_repository="$source_resolution" ;;
+  10)
+    failure_reason="$source_resolution"
+    exit 1
+    ;;
+  *)
+    failure_reason=source-repository-not-found
+    exit 1
+    ;;
+esac
+
+branch_checkout_path() {
+  local target_ref="refs/heads/$1"
+  local listed_worktree=""
+  local record
+
+  while IFS= read -r record; do
+    case "$record" in
+      worktree\ *) listed_worktree="${record#worktree }" ;;
+      "branch $target_ref")
+        printf '%s\n' "$listed_worktree"
+        return 0
+        ;;
+      '') listed_worktree="" ;;
+    esac
+  done < <(git -C "$source_repository" worktree list --porcelain 2>/dev/null)
+  return 1
 }
 
 if ! command -v "$CODEX_BIN" >/dev/null 2>&1; then
@@ -340,6 +404,16 @@ if [ -e "$worktree_root" ]; then
     fi
   fi
 else
+  # Never reuse a branch created outside this item-keyed worktree. Its commit
+  # history and cleanliness are not protocol-owned or provably safe, even when
+  # Git reports that no worktree currently has it checked out.
+  if git -C "$source_repository" show-ref --verify --quiet \
+    "refs/heads/$branch_name"; then
+    existing_branch_path="$(branch_checkout_path "$branch_name")" || \
+      existing_branch_path=not-checked-out
+    failure_reason="worktree-branch-already-exists branch=$branch_name path=$existing_branch_path"
+    exit 1
+  fi
   if ! git -C "$source_repository" worktree add -b "$branch_name" \
     "$worktree_root" "refs/remotes/origin/$default_branch"; then
     failure_reason=worktree-create-failed
