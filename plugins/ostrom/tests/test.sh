@@ -986,9 +986,41 @@ JSON
 dispatch_order="$(
   CLAUDE_CONFIG_DIR="$dispatch_config" \
     MANDATE_TRACE_TIME="2026-08-11T02:00:00Z" \
-    bash "$PLUGIN_ROOT/scripts/work-order.sh" create "$dispatch_candidate"
+    bash "$PLUGIN_ROOT/scripts/work-order.sh" create "$dispatch_candidate" \
+      2>"$dispatch_fixture/branch-overwrite.err"
 )"
 bash "$PLUGIN_ROOT/scripts/work-order.sh" validate "$dispatch_order"
+dispatch_branch="$(jq -r '.branch_name' "$dispatch_order")"
+[ "$dispatch_branch" = "$(
+  bash "$PLUGIN_ROOT/scripts/work-order.sh" branch-name \
+    'example-org/example-repo#123'
+)" ]
+[ "$dispatch_branch" = 'ostrom/123-9bb890b1b3b4' ]
+grep -Fq "overwriting candidate branch_name 'feat/123-placeholder' with item-derived '$dispatch_branch'" \
+  "$dispatch_fixture/branch-overwrite.err"
+
+# #142: branch naming is an item identity property, not fresh candidate prose.
+# Replacing the same item's order with different free text must produce the
+# same branch even though the order id and creation time change.
+first_dispatch_branch="$dispatch_branch"
+jq '.branch_name = "reworded/completely-different"' \
+  "$dispatch_candidate" >"$dispatch_fixture/reworded-candidate.json"
+dispatch_order="$({
+  CLAUDE_CONFIG_DIR="$dispatch_config" \
+    MANDATE_TRACE_TIME="2026-08-11T02:00:01Z" \
+    bash "$PLUGIN_ROOT/scripts/work-order.sh" create \
+      "$dispatch_fixture/reworded-candidate.json"
+} 2>"$dispatch_fixture/reworded-branch-overwrite.err")"
+[ "$(jq -r '.branch_name' "$dispatch_order")" = "$first_dispatch_branch" ]
+grep -Fq "overwriting candidate branch_name 'reworded/completely-different' with item-derived '$first_dispatch_branch'" \
+  "$dispatch_fixture/reworded-branch-overwrite.err"
+
+# Compatibility is validation-only: an order written before deterministic
+# naming landed still satisfies the unchanged schema_version 1 contract.
+jq '.branch_name = "feat/123-historical"' "$dispatch_order" \
+  >"$dispatch_fixture/historical-order.json"
+bash "$PLUGIN_ROOT/scripts/work-order.sh" validate \
+  "$dispatch_fixture/historical-order.json"
 jq -e '
   keys == ["acceptance_criteria", "branch_name", "constraints",
     "cost_ceiling_usd", "created_at", "item_id", "item_ref", "order_id",
@@ -997,6 +1029,7 @@ jq -e '
   and .cost_ceiling_usd == 20
   and .token_ceiling == 500000
   and .item_id == "example-org/example-repo#123"
+  and .branch_name == "ostrom/123-9bb890b1b3b4"
 ' "$dispatch_order" >/dev/null
 
 fake_dispatch_gh="$dispatch_bin/gh-as"
@@ -1126,6 +1159,7 @@ concurrency_order="$(
 set +e
 CLAUDE_CONFIG_DIR="$concurrency_config" \
   MANDATE_NOW_EPOCH="$cap_today_epoch" \
+  MANDATE_MAX_IMPLEMENTERS=2 \
   MANDATE_GH_AS_BIN="$fake_dispatch_gh" \
   MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
   CODEX_BIN="$fake_dispatch_codex" \
@@ -1157,6 +1191,7 @@ MANDATE_TRACE_TIME="2026-08-11T02:04:00Z" \
 set +e
 CLAUDE_CONFIG_DIR="$dispatch_config" \
   MANDATE_NOW_EPOCH="$cap_today_epoch" \
+  MANDATE_DAILY_CAP_USD=50 \
   MANDATE_GH_AS_BIN="$fake_dispatch_gh" \
   MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
   CODEX_BIN="$fake_dispatch_codex" \
@@ -1316,6 +1351,152 @@ esac
 SH
 chmod +x "$fake_implement_gh" "$fake_codex"
 
+create_implement_order() {
+  local case_name="$1"
+  local item_number="$2"
+  local order_config="${3:-$implement_config}"
+  local candidate_file="$implement_fixture/$case_name-candidate.json"
+  cat >"$candidate_file" <<JSON
+{"schema_version":1,"item_id":"example-org/example-repo#$item_number","repository":"example-org/example-repo","item_ref":"#$item_number","branch_name":"candidate/$case_name","spec":"Exercise synthetic worktree reuse.","acceptance_criteria":["The existing worktree is handled safely."],"constraints":["Use placeholder data only."]}
+JSON
+  CLAUDE_CONFIG_DIR="$order_config" \
+    MANDATE_TRACE_TIME="2026-08-11T03:00:10Z" \
+    bash "$PLUGIN_ROOT/scripts/work-order.sh" create "$candidate_file" \
+      2>/dev/null
+}
+
+run_implement_order() {
+  local order_file="$1"
+  local case_name="$2"
+  local runtime_config="${3:-$implement_config}"
+  local item_id item_hash unit lease
+  item_id="$(jq -r '.item_id' "$order_file")"
+  item_hash="$(bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash "$item_id")"
+  unit="ostrom-implementer-${item_hash:0:16}"
+  lease="implementer-item-$item_hash.lease"
+  CLAUDE_CONFIG_DIR="$runtime_config" MANDATE_LEASE_NAME="$lease" \
+    bash "$PLUGIN_ROOT/scripts/lease.sh" acquire "$unit" 3600 >/dev/null
+  FAKE_CODEX_MODE=complete CODEX_BIN="$fake_codex" \
+    CLAUDE_CONFIG_DIR="$runtime_config" \
+    MANDATE_IMPLEMENTER_SOURCE_REPO="$implement_source" \
+    MANDATE_GH_AS_BIN="$fake_implement_gh" FAKE_GIT_REMOTE="$implement_remote" \
+    FAKE_PR_BODY="$implement_fixture/$case_name-pr-body" \
+    bash "$PLUGIN_ROOT/scripts/implement.sh" "$order_file" "$unit" \
+      >"$implement_fixture/$case_name.out" \
+      2>"$implement_fixture/$case_name.err"
+}
+
+# #142: a repeat order on the already-matching deterministic branch reuses the
+# item-keyed worktree. The preexisting uncommitted file reaches the pushed
+# commit, proving reuse does not discard it.
+reuse_config="$implement_fixture/reuse-config"
+reuse_order="$(create_implement_order reuse 140 "$reuse_config")"
+reuse_item_hash="$(bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash 'example-org/example-repo#140')"
+reuse_branch="$(jq -r '.branch_name' "$reuse_order")"
+reuse_worktree="$reuse_config/ostrom/implementer-worktrees/$reuse_item_hash"
+mkdir -p "$(dirname "$reuse_worktree")"
+git -C "$implement_source" worktree add -b "$reuse_branch" \
+  "$reuse_worktree" refs/remotes/origin/main >/dev/null
+printf 'preserved before redispatch\n' >"$reuse_worktree/preserved.txt"
+run_implement_order "$reuse_order" reuse "$reuse_config"
+[ "$(git -C "$reuse_worktree" branch --show-current)" = "$reuse_branch" ]
+[ "$(git --git-dir="$implement_remote" show "$reuse_branch:preserved.txt")" = \
+  'preserved before redispatch' ]
+
+# A historical order can target a different branch than a clean, not-ahead
+# item worktree. The implementer retargets it after fetch and proceeds.
+retarget_config="$implement_fixture/retarget-config"
+retarget_order="$(create_implement_order retarget 141 "$retarget_config")"
+retarget_branch='fix/141-historical-order'
+jq --arg branch "$retarget_branch" '.branch_name = $branch' \
+  "$retarget_order" >"$implement_fixture/retarget-historical-order.json"
+retarget_order="$implement_fixture/retarget-historical-order.json"
+bash "$PLUGIN_ROOT/scripts/work-order.sh" validate "$retarget_order"
+retarget_item_hash="$(bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash 'example-org/example-repo#141')"
+retarget_worktree="$retarget_config/ostrom/implementer-worktrees/$retarget_item_hash"
+git -C "$implement_source" worktree add -b old/141-reworded \
+  "$retarget_worktree" refs/remotes/origin/main >/dev/null
+run_implement_order "$retarget_order" retarget "$retarget_config"
+[ "$(git -C "$retarget_worktree" branch --show-current)" = "$retarget_branch" ]
+git --git-dir="$implement_remote" show-ref --verify \
+  "refs/heads/$retarget_branch" >/dev/null
+
+# A dirty mismatch is unsatisfiable without human choice. Dispatch records the
+# exact worktree and existing branch before acquiring a lease, consuming a
+# concurrency slot, reserving cost, querying GitHub, or launching systemd.
+dirty_config="$implement_fixture/dirty-preflight-config"
+mkdir -p "$dirty_config/ostrom/implementer-worktrees"
+dirty_order="$(create_implement_order dirty-preflight 142 "$dirty_config")"
+dirty_item_hash="$(bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash 'example-org/example-repo#142')"
+dirty_branch="$(jq -r '.branch_name' "$dirty_order")"
+dirty_worktree="$dirty_config/ostrom/implementer-worktrees/$dirty_item_hash"
+git -C "$implement_source" worktree add -b old/142-stranded \
+  "$dirty_worktree" refs/remotes/origin/main >/dev/null
+printf 'must survive\n' >"$dirty_worktree/preserved.txt"
+cat >"$dirty_config/ostrom/sprint.jsonl" <<'JSONL'
+{"ts":"2026-08-11T01:00:00Z","kind":"work-dispatched","fact":{"schema_version":1,"item_id":"example-org/example-repo#999","order_id":"already-inflight","unit_name":"ostrom-implementer-ffffffffffffffff","backend":"systemd","cost_ceiling_usd":20,"token_ceiling":500000,"cost_usd":null,"duration_seconds":0},"narration":{}}
+{"ts":"2026-08-11T01:01:00Z","kind":"pass-ended","fact":{"owner":"builder-fixture-wake0","outcome":"completed","cost_usd":50,"duration_seconds":1},"narration":{}}
+JSONL
+set +e
+CLAUDE_CONFIG_DIR="$dirty_config" MANDATE_GH_AS_BIN="$fake_dispatch_gh" \
+  MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" CODEX_BIN="$fake_dispatch_codex" \
+  MANDATE_MAX_IMPLEMENTERS=1 MANDATE_DAILY_CAP_USD=1 \
+  FAKE_SYSTEMD_ARGS="$implement_fixture/dirty-systemd-args" \
+  FAKE_SYSTEMD_CALLS="$implement_fixture/dirty-systemd-calls" \
+  bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$dirty_order" \
+    >"$implement_fixture/dirty.out" 2>"$implement_fixture/dirty.err"
+dirty_status=$?
+set -e
+[ "$dirty_status" -eq 3 ]
+[ -f "$dirty_worktree/preserved.txt" ]
+[ "$(git -C "$dirty_worktree" branch --show-current)" = old/142-stranded ]
+[ ! -e "$dirty_config/ostrom/implementer-item-$dirty_item_hash.lease" ]
+[ ! -e "$implement_fixture/dirty-systemd-calls" ]
+jq -s -e --arg path "$dirty_worktree" '
+  ([.[] | select(.kind == "work-dispatched")] | length) == 1
+  and ([.[] | select(.kind == "work-failed"
+    and .fact.reason == "worktree-branch-mismatch")] | length) == 1
+  and (last | .kind == "work-failed")
+  and (last | .fact.worktree_path == $path)
+  and (last | .fact.branch_name == "old/142-stranded")
+  and (last | .fact.cost_usd == 0)
+' "$dirty_config/ostrom/sprint.jsonl" >/dev/null
+
+# Clean working files are not enough when retargeting would abandon commits.
+# The same preflight rejects an ahead branch without a lease or launch.
+ahead_config="$implement_fixture/ahead-preflight-config"
+mkdir -p "$ahead_config/ostrom/work-orders" \
+  "$ahead_config/ostrom/implementer-worktrees"
+ahead_source="$implement_fixture/ahead-source"
+git clone "$implement_remote" "$ahead_source" >/dev/null 2>&1
+git -C "$ahead_source" config user.name "Ostrom Test"
+git -C "$ahead_source" config user.email "ostrom@example.test"
+git -C "$ahead_source" remote set-head origin main
+ahead_candidate="$implement_fixture/ahead-candidate.json"
+cat >"$ahead_candidate" <<'JSON'
+{"schema_version":1,"item_id":"example-org/example-repo#143","repository":"example-org/example-repo","item_ref":"#143","branch_name":"candidate/ahead","spec":"Exercise ahead worktree preservation.","acceptance_criteria":["Ahead commits survive."],"constraints":["Use placeholder data only."]}
+JSON
+ahead_order="$(CLAUDE_CONFIG_DIR="$ahead_config" bash "$PLUGIN_ROOT/scripts/work-order.sh" create "$ahead_candidate" 2>/dev/null)"
+ahead_item_hash="$(bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash 'example-org/example-repo#143')"
+ahead_worktree="$ahead_config/ostrom/implementer-worktrees/$ahead_item_hash"
+git -C "$ahead_source" worktree add -b old/143-ahead \
+  "$ahead_worktree" refs/remotes/origin/main >/dev/null
+printf 'committed work\n' >"$ahead_worktree/ahead.txt"
+git -C "$ahead_worktree" add ahead.txt
+git -C "$ahead_worktree" commit -m 'fixture ahead work' >/dev/null
+set +e
+CLAUDE_CONFIG_DIR="$ahead_config" MANDATE_GH_AS_BIN="$fake_dispatch_gh" \
+  MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" CODEX_BIN="$fake_dispatch_codex" \
+  FAKE_SYSTEMD_ARGS="$implement_fixture/ahead-systemd-args" \
+  FAKE_SYSTEMD_CALLS="$implement_fixture/ahead-systemd-calls" \
+  bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$ahead_order" >/dev/null 2>&1
+ahead_status=$?
+set -e
+[ "$ahead_status" -eq 3 ]
+[ ! -e "$ahead_config/ostrom/implementer-item-$ahead_item_hash.lease" ]
+[ ! -e "$implement_fixture/ahead-systemd-calls" ]
+[ "$(git -C "$ahead_worktree" rev-list --count refs/remotes/origin/main..HEAD)" -eq 1 ]
+
 run_implement_usage_case() {
   case_number="$1"
   case_usage="$2"
@@ -1331,6 +1512,7 @@ JSON
       bash "$PLUGIN_ROOT/scripts/work-order.sh" create "$case_candidate"
   )"
   IMPLEMENT_CASE_ORDER_ID="$(jq -r '.order_id' "$IMPLEMENT_CASE_ORDER")"
+  IMPLEMENT_CASE_BRANCH="$(jq -r '.branch_name' "$IMPLEMENT_CASE_ORDER")"
   IMPLEMENT_CASE_ITEM_HASH="$(
     bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash \
       "example-org/example-repo#$case_number"
@@ -1526,6 +1708,7 @@ implement_ok_order="$(
     bash "$PLUGIN_ROOT/scripts/work-order.sh" create "$implement_ok_candidate"
 )"
 implement_ok_item_hash="$(bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash 'example-org/example-repo#126')"
+implement_ok_branch="$(jq -r '.branch_name' "$implement_ok_order")"
 implement_ok_unit="ostrom-implementer-${implement_ok_item_hash:0:16}"
 implement_ok_lease="implementer-item-$implement_ok_item_hash.lease"
 CLAUDE_CONFIG_DIR="$implement_config" MANDATE_LEASE_NAME="$implement_ok_lease" \
@@ -1541,8 +1724,8 @@ CODEX_BIN="$fake_codex" CLAUDE_CONFIG_DIR="$implement_config" \
 grep -q 'https://example.test/pull/125' "$implement_fixture/ok.out"
 [ ! -e "$implement_config/ostrom/$implement_ok_lease" ]
 git --git-dir="$implement_remote" show-ref --verify \
-  refs/heads/feat/126-placeholder >/dev/null
-[ "$(git --git-dir="$implement_remote" log -1 --format='%(trailers:key=Ostrom-Role,valueonly)' refs/heads/feat/126-placeholder)" = builder ]
+  "refs/heads/$implement_ok_branch" >/dev/null
+[ "$(git --git-dir="$implement_remote" log -1 --format='%(trailers:key=Ostrom-Role,valueonly)' "refs/heads/$implement_ok_branch")" = builder ]
 grep -q 'workspace-write' "$implement_pr_body"
 grep -q 'approval policy `never`' "$implement_pr_body"
 grep -q '^Ostrom-Role: builder$' "$implement_pr_body"
@@ -1588,13 +1771,14 @@ fi
 [ -n "$(git -C "$IMPLEMENT_CASE_WORKTREE" status --porcelain)" ]
 jq -s -e \
   --arg order_id "$IMPLEMENT_CASE_ORDER_ID" \
-  --arg worktree_path "$IMPLEMENT_CASE_WORKTREE" '
+  --arg worktree_path "$IMPLEMENT_CASE_WORKTREE" \
+  --arg branch_name "$IMPLEMENT_CASE_BRANCH" '
   [.[] | select(.fact.order_id == $order_id)] | length == 1
   and .[0].kind == "work-failed"
   and .[0].fact.reason == "token-ceiling-terminated"
   and .[0].fact.weighted_tokens == 894110
   and .[0].fact.worktree_path == $worktree_path
-  and .[0].fact.branch_name == "fix/138-placeholder"
+  and .[0].fact.branch_name == $branch_name
 ' "$implement_config/ostrom/sprint.jsonl" >/dev/null
 
 # A large genuinely-fresh run still breaches. The failure row preserves all
@@ -1607,7 +1791,7 @@ run_implement_usage_case 135 \
 [ -f "$IMPLEMENT_CASE_WORKTREE/generated.txt" ]
 [ -n "$(git -C "$IMPLEMENT_CASE_WORKTREE" status --porcelain)" ]
 if git --git-dir="$implement_remote" show-ref --verify \
-  refs/heads/fix/135-placeholder >/dev/null 2>&1; then
+  "refs/heads/$IMPLEMENT_CASE_BRANCH" >/dev/null 2>&1; then
   echo "over-ceiling implementation was pushed" >&2
   exit 1
 fi
@@ -1617,7 +1801,8 @@ if [ -e "$implement_fixture/135-pr-body" ]; then
 fi
 jq -s -e \
   --arg order_id "$IMPLEMENT_CASE_ORDER_ID" \
-  --arg worktree_path "$IMPLEMENT_CASE_WORKTREE" '
+  --arg worktree_path "$IMPLEMENT_CASE_WORKTREE" \
+  --arg branch_name "$IMPLEMENT_CASE_BRANCH" '
   [.[] | select(.fact.order_id == $order_id)] | length == 1
   and .[0].kind == "work-failed"
   and .[0].fact.reason == "token-ceiling-exceeded"
@@ -1627,7 +1812,7 @@ jq -s -e \
   and .[0].fact.usage.output_tokens == 22074
   and .[0].fact.usage.cached_input_tokens_available == true
   and .[0].fact.worktree_path == $worktree_path
-  and .[0].fact.branch_name == "fix/135-placeholder"
+  and .[0].fact.branch_name == $branch_name
 ' "$implement_config/ostrom/sprint.jsonl" >/dev/null
 
 # A harness that omits cached_input_tokens produces an explicit unknown split.
@@ -1659,12 +1844,13 @@ run_implement_usage_case 139 \
 [ -n "$(git -C "$IMPLEMENT_CASE_WORKTREE" status --porcelain)" ]
 jq -s -e \
   --arg order_id "$IMPLEMENT_CASE_ORDER_ID" \
-  --arg worktree_path "$IMPLEMENT_CASE_WORKTREE" '
+  --arg worktree_path "$IMPLEMENT_CASE_WORKTREE" \
+  --arg branch_name "$IMPLEMENT_CASE_BRANCH" '
   [.[] | select(.fact.order_id == $order_id)] | length == 1
   and .[0].kind == "work-failed"
   and .[0].fact.reason == "codex-exit-1"
   and .[0].fact.worktree_path == $worktree_path
-  and .[0].fact.branch_name == "fix/139-placeholder"
+  and .[0].fact.branch_name == $branch_name
 ' "$implement_config/ostrom/sprint.jsonl" >/dev/null
 
 # A malformed harness report cannot make fresh input or the weight negative.

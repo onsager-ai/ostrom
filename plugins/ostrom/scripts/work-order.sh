@@ -6,7 +6,9 @@
 # Rust dispatcher can consume Bash-era orders without guessing at an ad-hoc
 # shape. The filename is <item_hash>.json, where item_hash is sha256(item_id);
 # rewriting it creates a new order_id while preserving the one-file-per-item
-# contract.
+# contract. New orders derive branch_name from item_id. Validation deliberately
+# continues to accept every historically valid schema_version 1 branch_name so
+# orders already on disk can recover through implementer's retarget path.
 
 set -euo pipefail
 umask 077
@@ -28,7 +30,7 @@ DEFAULT_COST_CEILING_USD=20
 DEFAULT_TOKEN_CEILING=500000
 
 usage() {
-  echo "usage: work-order.sh create <candidate-json-file> | validate <work-order-file> | item-hash <item-id>" >&2
+  echo "usage: work-order.sh create <candidate-json-file> | validate <work-order-file> | item-hash <item-id> | branch-name <item-id>" >&2
   exit 2
 }
 
@@ -64,6 +66,17 @@ order_schema='
 
 item_hash() {
   printf '%s' "$1" | sha256sum | awk '{print $1}'
+}
+
+branch_name() {
+  local item_id="$1"
+  local hash number
+  hash="$(item_hash "$item_id")"
+  number="${item_id##*#}"
+  case "$number" in
+    ''|*[!0-9]*) printf 'ostrom/item-%s\n' "${hash:0:20}" ;;
+    *) printf 'ostrom/%s-%s\n' "$number" "${hash:0:12}" ;;
+  esac
 }
 
 validate_order() {
@@ -104,6 +117,11 @@ case "${1:-}" in
 
     item_id="$(jq -r '.item_id' "$candidate")"
     item_hash="$(item_hash "$item_id")"
+    deterministic_branch="$(branch_name "$item_id")"
+    supplied_branch="$(jq -r '.branch_name' "$candidate")"
+    if [ "$supplied_branch" != "$deterministic_branch" ]; then
+      echo "ostrom work order: overwriting candidate branch_name '$supplied_branch' with item-derived '$deterministic_branch'" >&2
+    fi
     created_at="${MANDATE_TRACE_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
     order_id="$(printf '%s\n%s\n%s\n' "$item_id" "$created_at" "$RANDOM" | sha256sum | awk '{print $1}')"
     orders_dir="$MANDATE_DATA_DIR/work-orders"
@@ -139,11 +157,13 @@ case "${1:-}" in
     jq -c \
       --arg order_id "$order_id" \
       --arg created_at "$created_at" \
+      --arg branch_name "$deterministic_branch" \
       --argjson cost_ceiling_usd "$cost_ceiling" \
       --argjson token_ceiling "$token_ceiling" \
       '. + {
         order_id: $order_id,
         created_at: $created_at,
+        branch_name: $branch_name,
         cost_ceiling_usd: $cost_ceiling_usd,
         token_ceiling: $token_ceiling
       }' "$candidate" >"$tmp"
@@ -160,6 +180,11 @@ case "${1:-}" in
     [ "$#" -eq 2 ] || usage
     [ -n "$2" ] || usage
     item_hash "$2"
+    ;;
+  branch-name)
+    [ "$#" -eq 2 ] || usage
+    [ -n "$2" ] || usage
+    branch_name "$2"
     ;;
   *)
     usage

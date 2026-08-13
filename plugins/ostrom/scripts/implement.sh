@@ -314,8 +314,30 @@ if [ -e "$worktree_root" ]; then
     exit 1
   }
   if [ "$existing_branch" != "$branch_name" ]; then
-    failure_reason=worktree-branch-mismatch
-    exit 1
+    worktree_status="$(git -C "$worktree_root" status --porcelain 2>/dev/null)" || {
+      failure_reason=worktree-unreadable
+      exit 1
+    }
+    ahead_count="$(git -C "$worktree_root" rev-list --count \
+      "refs/remotes/origin/$default_branch..HEAD" 2>/dev/null)" || {
+      failure_reason=worktree-unreadable
+      exit 1
+    }
+    if [ -n "$worktree_status" ] || [ "$ahead_count" -gt 0 ]; then
+      failure_reason=worktree-branch-mismatch
+      exit 1
+    fi
+    if git -C "$worktree_root" show-ref --verify --quiet \
+      "refs/heads/$branch_name"; then
+      if ! git -C "$worktree_root" switch "$branch_name"; then
+        failure_reason=worktree-retarget-failed
+        exit 1
+      fi
+    elif ! git -C "$worktree_root" switch -c "$branch_name" \
+      "refs/remotes/origin/$default_branch"; then
+      failure_reason=worktree-retarget-failed
+      exit 1
+    fi
   fi
 else
   if ! git -C "$source_repository" worktree add -b "$branch_name" \
