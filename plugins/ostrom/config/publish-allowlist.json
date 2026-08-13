@@ -79,6 +79,8 @@
   ],
   "state": [
     "version",
+    "sweep_mode",
+    "last_full_reconciliation",
     "dead_selectors",
     "repos"
   ],

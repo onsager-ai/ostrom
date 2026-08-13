@@ -3191,6 +3191,33 @@ JSON
 [{"number":1,"title":"$policy_cursor_title","labels":[{"name":"maintenance"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"$policy_cursor_updated","url":"https://example.invalid/issues/1"}]
 JSON
       ;;
+    example-org/incremental-repo)
+      incremental_one_title="Routine issue one"
+      incremental_one_updated="2026-07-30T00:00:00Z"
+      incremental_two_title="Routine issue two"
+      incremental_two_updated="2026-07-30T00:00:00Z"
+      case "${FAKE_GH_MODE:-base}" in
+        incremental-delta)
+          incremental_one_title="Routine issue one updated after cursor"
+          incremental_one_updated="2026-08-01T00:30:00Z"
+          incremental_two_title="Routine issue two changed before cursor"
+          incremental_two_updated="2026-07-31T23:00:00Z"
+          ;;
+        parity)
+          incremental_one_title="Routine issue one updated after cursor"
+          incremental_one_updated="2026-08-01T00:30:00Z"
+          ;;
+        closed)
+          cat <<JSON
+[{"number":2,"title":"$incremental_two_title","labels":[{"name":"maintenance"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"$incremental_two_updated","url":"https://example.invalid/issues/2"}]
+JSON
+          exit 0
+          ;;
+      esac
+      cat <<JSON
+[{"number":1,"title":"$incremental_one_title","labels":[{"name":"maintenance"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"$incremental_one_updated","url":"https://example.invalid/issues/1"},{"number":2,"title":"$incremental_two_title","labels":[{"name":"maintenance"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"$incremental_two_updated","url":"https://example.invalid/issues/2"}]
+JSON
+      ;;
     example-org/hub-repo)
       cat <<'JSON'
 [{"number":14,"title":"spec(launch): public announcement","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/14"},{"number":15,"title":"spec(launch): installation guide","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/15"},{"number":16,"title":"spec(launch): release checklist","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/issues/16"}]
@@ -3329,6 +3356,7 @@ if [ "$1" = "api" ]; then
   endpoint=""
   method=""
   has_field=0
+  if_none_match=""
   while [ "$#" -gt 0 ]; do
     case "$1" in
       -X | --method)
@@ -3338,7 +3366,17 @@ if [ "$1" = "api" ]; then
         has_field=1
         if [ "$#" -ge 2 ]; then shift 2; else shift; fi
         ;;
-      -H | --header | --jq | --template)
+      -H | --header)
+        if [ "$#" -ge 2 ]; then
+          case "$2" in
+            If-None-Match:*) if_none_match="${2#If-None-Match: }" ;;
+          esac
+          shift 2
+        else
+          shift
+        fi
+        ;;
+      --jq | --template)
         if [ "$#" -ge 2 ]; then shift 2; else shift; fi
         ;;
       -*)
@@ -3354,6 +3392,44 @@ if [ "$1" = "api" ]; then
     echo '{"message":"Not Found","documentation_url":"https://docs.github.com/rest"}' >&2
     exit 1
   fi
+  case "$endpoint" in
+    repos/*/*/issues\?*)
+      api_repo="${endpoint#repos/}"
+      api_repo="${api_repo%%/issues\?*}"
+      feed_kind=full
+      case "$endpoint" in *'&since='*) feed_kind=incremental ;; esac
+      fixture_etag="\"fixture-${api_repo//\//-}-$feed_kind-${FAKE_GH_MODE:-base}-${FAKE_GH_ISSUE_MODE:-none}\""
+      if [ -n "$if_none_match" ] && [ "$if_none_match" = "$fixture_etag" ]; then
+        printf 'HTTP/2.0 304 Not Modified\netag: %s\n\n' "$fixture_etag"
+        exit 0
+      fi
+
+      query="${endpoint#*\?}"
+      page=1
+      since=""
+      old_ifs="$IFS"
+      IFS='&'
+      for parameter in $query; do
+        case "$parameter" in
+          page=*) page="${parameter#page=}" ;;
+          since=*) since="${parameter#since=}" ;;
+        esac
+      done
+      IFS="$old_ifs"
+      api_issues="$("$0" issue list --repo "$api_repo" --state open --limit 200)"
+      if [ -n "$since" ]; then
+        api_issues="$(
+          jq -c --arg since "$since" \
+            '[.[] | select((.updatedAt // .updated_at // "") > $since)]' \
+            <<<"$api_issues"
+        )"
+      fi
+      page_start=$(((page - 1) * 100))
+      api_issues="$(jq -c --argjson start "$page_start" '.[$start:$start + 100]' <<<"$api_issues")"
+      printf 'HTTP/2.0 200 OK\netag: %s\n\n%s\n' "$fixture_etag" "$api_issues"
+      exit 0
+      ;;
+  esac
   case "$endpoint" in
     repos/example-org/landed-fix-repo/commits)
       # Emulates the shape `--jq` would already have reduced the raw GitHub
@@ -3568,6 +3644,7 @@ run_sweep() {
     PATH="$fixture/bin:$PATH" \
       FAKE_GH_CALL_LOG="$fixture/gh-calls" \
       FAKE_GH_MODE="${FAKE_GH_MODE:-base}" \
+      MANDATE_SWEEP_MODE=full \
       CLAUDE_CONFIG_DIR="$fixture/config" \
       CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
       bash "$PLUGIN_ROOT/scripts/sweep.sh"
@@ -3599,6 +3676,7 @@ run_policy_cursor_sweep() {
     cd "$policy_cursor/repo"
     PATH="$fixture/bin:$PATH" \
       FAKE_GH_MODE="${FAKE_GH_MODE:-base}" \
+      MANDATE_SWEEP_MODE=full \
       CLAUDE_CONFIG_DIR="$policy_cursor/config" \
       CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
       bash "$PLUGIN_ROOT/scripts/sweep.sh"
@@ -3689,6 +3767,7 @@ run_ci_drift_sweep() {
       CLAUDE_CONFIG_DIR="$ci_drift/config" \
       CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
       MANDATE_SWEEP_TIME="2026-08-01T00:00:00Z" \
+      MANDATE_SWEEP_MODE=full \
       FAKE_GH_RUN_MODE="${FAKE_GH_RUN_MODE:-red}" \
       FAKE_GH_ISSUE_MODE="${FAKE_GH_ISSUE_MODE:-none}" \
       bash "$PLUGIN_ROOT/scripts/sweep.sh" >/dev/null
@@ -4520,8 +4599,152 @@ grep -q \
   '^example-org/hub-repo#18  spec(launch): public announcement — reserved ref:#14 (closes #14)$' \
   <<<"$dedup_digest_text"
 
-# Hitting either GitHub query limit is durable sweep state, not a silent
-# partial portfolio. The digest keeps warning until a later sweep is below it.
+# #145: issue acquisition is incremental between daily reconciliations. The
+# persisted normalized records are the merge base; PRs remain a full listing.
+make_incremental_fixture() {
+  incremental_root="$1"
+  mkdir -p "$incremental_root/config/ostrom" "$incremental_root/repo"
+  write_gatekeeper_secrets "$incremental_root/config"
+  cat >"$incremental_root/config/ostrom/mandates.yaml" <<'YAML'
+bounce_all: []
+projects:
+  - repo: example-org/incremental-repo
+    delegated:
+      - label:maintenance
+    excluded: []
+    reserved: []
+    default: excluded
+    paused: false
+    bounce: []
+YAML
+  : >"$incremental_root/gh-calls"
+}
+
+run_incremental_fixture() {
+  incremental_root="$1"
+  incremental_mode="$2"
+  incremental_time="$3"
+  requested_mode="$4"
+  (
+    cd "$incremental_root/repo"
+    PATH="$fixture/bin:$PATH" \
+      FAKE_GH_CALL_LOG="$incremental_root/gh-calls" \
+      FAKE_GH_MODE="$incremental_mode" \
+      MANDATE_SWEEP_TIME="$incremental_time" \
+      MANDATE_SWEEP_MODE="$requested_mode" \
+      CLAUDE_CONFIG_DIR="$incremental_root/config" \
+      CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+      bash "$PLUGIN_ROOT/scripts/sweep.sh" >/dev/null
+  )
+}
+
+incremental="$fixture/incremental"
+make_incremental_fixture "$incremental"
+run_incremental_fixture "$incremental" base "2026-08-01T00:00:00Z" full
+incremental_state="$incremental/config/ostrom/state.json"
+incremental_queue="$incremental/config/ostrom/queue.jsonl"
+jq -e '
+  .sweep_mode == "full"
+  and .last_full_reconciliation == "2026-08-01T00:00:00Z"
+  and (.repos["example-org/incremental-repo"].etag | type) == "string"
+  and (.repos["example-org/incremental-repo"].records | length) == 2
+' "$incremental_state" >/dev/null
+cp "$incremental_queue" "$incremental/queue.before-quiet"
+
+# The first incremental pass uses the full pass's validator conditionally on
+# a since-bounded URL. A real server may answer 200 because that URL is a
+# different representation; either way the empty delta emits no queue row.
+: >"$incremental/gh-calls"
+run_incremental_fixture "$incremental" base "2026-08-01T00:10:00Z" auto
+cmp "$incremental/queue.before-quiet" "$incremental_queue"
+grep -q 'api -X GET --include -H If-None-Match:' "$incremental/gh-calls"
+grep -q 'repos/example-org/incremental-repo/issues?.*since=2026-08-01T00:00:00Z' \
+  "$incremental/gh-calls"
+grep -q $'example-org/incremental-repo\tpr list ' "$incremental/gh-calls"
+jq -e '.sweep_mode == "incremental"' "$incremental_state" >/dev/null
+
+# Now the validator belongs to the exact incremental URL. The next quiet pass
+# receives 304, retains both issue records, and still writes no new queue row.
+cp "$incremental_state" "$incremental/state.before-304"
+: >"$incremental/gh-calls"
+run_incremental_fixture "$incremental" base "2026-08-01T00:20:00Z" auto
+cmp "$incremental/queue.before-quiet" "$incremental_queue"
+cmp "$incremental/state.before-304" "$incremental_state"
+grep -q 'api -X GET --include -H If-None-Match:' "$incremental/gh-calls"
+
+# A missing validator from a previous-version state is an unconditional read,
+# not a load failure. The response repopulates the additive ETag field.
+jq 'del(.repos["example-org/incremental-repo"].etag)' "$incremental_state" \
+  >"$incremental/state-without-etag"
+mv "$incremental/state-without-etag" "$incremental_state"
+: >"$incremental/gh-calls"
+run_incremental_fixture "$incremental" base "2026-08-01T00:25:00Z" incremental
+if grep -q 'api -X GET --include -H If-None-Match:' "$incremental/gh-calls"; then
+  echo "state without an ETag still issued a conditional request" >&2
+  exit 1
+fi
+jq -e '(.repos["example-org/incremental-repo"].etag | type) == "string"' \
+  "$incremental_state" >/dev/null
+
+# Only the issue updated after the cursor is in the delta. The older update is
+# absent and therefore cannot overwrite its retained normalized record.
+run_incremental_fixture "$incremental" incremental-delta \
+  "2026-08-01T01:00:00Z" auto
+jq -e '
+  .repos["example-org/incremental-repo"] as $repo
+  | $repo.cursor == "2026-08-01T00:30:00Z"
+  and $repo.records["example-org/incremental-repo#1"].title
+    == "Routine issue one updated after cursor"
+  and $repo.records["example-org/incremental-repo#2"].title
+    == "Routine issue two"
+  and $repo.items["example-org/incremental-repo#2"].updated
+    == "2026-07-30T00:00:00Z"
+' "$incremental_state" >/dev/null
+jq -s -e '
+  length == 1
+  and .[0].id == "example-org/incremental-repo#1"
+' "$incremental_queue" >/dev/null
+
+# Leaving the open set is invisible to `since`, so the incremental pass keeps
+# the issue. Once 24 hours have elapsed, auto selects a full reconciliation and
+# removes both its item state and its pending queue row.
+run_incremental_fixture "$incremental" closed "2026-08-01T02:00:00Z" auto
+jq -e '
+  .sweep_mode == "incremental"
+  and (.repos["example-org/incremental-repo"].items
+    | has("example-org/incremental-repo#1"))
+' "$incremental_state" >/dev/null
+run_incremental_fixture "$incremental" closed "2026-08-02T01:00:01Z" auto
+jq -e '
+  .sweep_mode == "full"
+  and .last_full_reconciliation == "2026-08-02T01:00:01Z"
+  and (.repos["example-org/incremental-repo"].items
+    | has("example-org/incremental-repo#1") | not)
+  and (.repos["example-org/incremental-repo"].records
+    | has("example-org/incremental-repo#1") | not)
+' "$incremental_state" >/dev/null
+[ "$(jq -s 'length' "$incremental_queue")" -eq 0 ]
+
+# Given the same truthful upstream fixture, delta merge and a complete listing
+# converge on identical per-repository state and queue content.
+parity_incremental="$fixture/parity-incremental"
+parity_full="$fixture/parity-full"
+make_incremental_fixture "$parity_incremental"
+make_incremental_fixture "$parity_full"
+run_incremental_fixture "$parity_incremental" base "2026-08-01T00:00:00Z" full
+run_incremental_fixture "$parity_full" base "2026-08-01T00:00:00Z" full
+run_incremental_fixture "$parity_incremental" parity "2026-08-01T01:00:00Z" incremental
+run_incremental_fixture "$parity_full" parity "2026-08-01T01:00:00Z" full
+jq '.repos["example-org/incremental-repo"] | del(.etag, .cursor, .previous_cursor)' \
+  "$parity_incremental/config/ostrom/state.json" >"$parity_incremental/repo-state"
+jq '.repos["example-org/incremental-repo"] | del(.etag, .cursor, .previous_cursor)' \
+  "$parity_full/config/ostrom/state.json" >"$parity_full/repo-state"
+cmp "$parity_incremental/repo-state" "$parity_full/repo-state"
+cmp "$parity_incremental/config/ostrom/queue.jsonl" \
+  "$parity_full/config/ostrom/queue.jsonl"
+
+# Hitting either GitHub query limit is a loud fault, not a partial portfolio
+# that can be mistaken for authoritative state.
 capped="$fixture/capped"
 mkdir -p "$capped/config/ostrom" "$capped/repo"
 write_gatekeeper_secrets "$capped/config"
@@ -4536,39 +4759,22 @@ projects:
     paused: false
     bounce: []
 YAML
+set +e
 (
   cd "$capped/repo"
   PATH="$fixture/bin:$PATH" \
     CLAUDE_CONFIG_DIR="$capped/config" \
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-    bash "$PLUGIN_ROOT/scripts/sweep.sh" >/dev/null
+    bash "$PLUGIN_ROOT/scripts/sweep.sh" >/dev/null 2>"$capped/error"
 )
-jq -e '
-  .repos["example-org/capped"].item_cap == 200
-' "$capped/config/ostrom/state.json" >/dev/null
-capped_digest="$(
-  cd "$capped/repo"
-  CLAUDE_CONFIG_DIR="$capped/config" \
-    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-    bash "$PLUGIN_ROOT/hooks/render-digest.sh"
-)"
-capped_digest_text="$(jq -r '.systemMessage' <<<"$capped_digest")"
+capped_status=$?
+set -e
+[ "$capped_status" -eq 6 ]
 grep -q \
-  '^example-org/capped: item cap reached (200) — sweep may be incomplete$' \
-  <<<"$capped_digest_text"
-[ "$(
-  grep -c '^example-org/capped: item cap reached' <<<"$capped_digest_text"
-)" -eq 1 ]
-capped_digest_again="$(
-  cd "$capped/repo"
-  CLAUDE_CONFIG_DIR="$capped/config" \
-    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-    bash "$PLUGIN_ROOT/hooks/render-digest.sh"
-)"
-capped_digest_again_text="$(jq -r '.systemMessage' <<<"$capped_digest_again")"
-grep -q \
-  '^example-org/capped: item cap reached (200) — sweep may be incomplete$' \
-  <<<"$capped_digest_again_text"
+  '^mandate sweep: issues change feed for example-org/capped reached query_limit 200; refusing a truncated sweep$' \
+  "$capped/error"
+[ ! -e "$capped/config/ostrom/state.json" ]
+[ ! -e "$capped/config/ostrom/queue.jsonl" ]
 
 # A representative eight-project first sweep remains a compact digest.
 portfolio="$fixture/portfolio"
@@ -4831,6 +5037,7 @@ run_uncat_sweep() {
     cd "$uncat/repo"
     PATH="$fixture/bin:$PATH" \
       FAKE_GH_MODE="${FAKE_GH_MODE:-base}" \
+      MANDATE_SWEEP_MODE=full \
       CLAUDE_CONFIG_DIR="$uncat/config" \
       CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
       bash "$PLUGIN_ROOT/scripts/sweep.sh"
@@ -5665,6 +5872,8 @@ JSONL
 cat >"$publisher_data/state.json" <<'JSON'
 {
   "version": 2,
+  "sweep_mode": "incremental",
+  "last_full_reconciliation": "2026-08-01T00:00:00Z",
   "dead_selectors": [
     {"repo": "example-org/example-repo", "selector": "label:synthetic", "source": "delegated"}
   ],
@@ -5766,6 +5975,10 @@ assert_tree_allowlisted() {
   ' "$candidate_tree" >/dev/null
 }
 assert_tree_allowlisted "$publisher_tree"
+jq -e '
+  .["state.json"].sweep_mode == "incremental"
+  and .["state.json"].last_full_reconciliation == "2026-08-01T00:00:00Z"
+' "$publisher_tree" >/dev/null
 
 # A workstation with live records exercises the same assertion without
 # making it a CI prerequisite. Dry-run never enters clone/bootstrap logic.
@@ -5923,6 +6136,7 @@ cp "$publisher_data/mandates.yaml" "$publish_sweep/config/ostrom/mandates.yaml"
   PATH="$fixture/bin:$PATH" \
     CLAUDE_CONFIG_DIR="$publish_sweep/config" \
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    MANDATE_SWEEP_MODE=full \
     MANDATE_PUBLISH_DIR="$publish_sweep/first-cache" \
     MANDATE_PUBLISH_REMOTE="$publisher_remote" \
     MANDATE_PUBLISH_TIME="2026-08-01T00:05:00Z" \
@@ -5950,6 +6164,7 @@ set +e
   PATH="$fixture/bin:$PATH" \
     CLAUDE_CONFIG_DIR="$publish_sweep/config" \
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    MANDATE_SWEEP_MODE=full \
     MANDATE_PUBLISH_DIR="$publish_sweep/failing-cache" \
     MANDATE_PUBLISH_REMOTE="$rejecting_remote" \
     MANDATE_PUBLISH_TIME="2026-08-01T00:05:00Z" \

@@ -5,7 +5,7 @@
 # Lists in a more-specific layer replace the corresponding earlier list.
 
 provider: file
-cadence_hours: 24
+cadence_hours: 1
 stuck_after_days: 7
 
 # Directories to search recursively for local Git repositories. Every linked
