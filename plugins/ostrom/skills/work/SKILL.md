@@ -24,6 +24,10 @@ review returned diffs, create worktrees, commit, push, or open pull requests in
 this pass. The implementer owns those steps and `/ostrom:gatekeep` independently
 judges what it produces.
 
+When an implementer branch has diverged or conflicts, merge the published head
+forward and push ordinarily; never rebase or force-push, because the published
+head is the artifact the gatekeeper judges.
+
 ## 2. Acquire the builder lease and start its trace
 
 Before reading config, the trace, queue state, or any GitHub artifact, choose

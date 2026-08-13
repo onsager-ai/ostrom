@@ -51,6 +51,8 @@ events_pipe=""
 streaming_ceiling_marker=""
 worktree_root=""
 streaming_ceiling_mode="${MANDATE_IMPLEMENTER_STREAMING_CEILING:-enabled}"
+repair_remote_head=""
+repair_conflicted_paths='[]'
 
 usage_fact() {
   if [ -n "$events_file" ] && [ -s "$events_file" ]; then
@@ -178,6 +180,8 @@ append_terminal() {
     --argjson cost_usd "$cost_usd" \
     --argjson duration_seconds "$duration_seconds" \
     --arg pr_url "$pr_url" --arg reason "$reason" \
+    --arg remote_head_sha "$repair_remote_head" \
+    --argjson conflicted_paths "$repair_conflicted_paths" \
     --argjson preserved_work "$preserved_work" \
     --argjson usage "$usage" \
     '{schema_version: 1, item_id: $item_id, order_id: $order_id,
@@ -189,6 +193,8 @@ append_terminal() {
       reason: (if $reason == "" then null else $reason end),
       worktree_path: $preserved_work.worktree_path,
       branch_name: $preserved_work.branch_name,
+      remote_head_sha: (if $remote_head_sha == "" then null else $remote_head_sha end),
+      conflicted_paths: $conflicted_paths,
       usage: $usage}')"
   if bash "$SCRIPT_DIR/trace.sh" append "$kind" "$terminal_fact" '{}' >/dev/null; then
     terminal_written=1
@@ -452,11 +458,51 @@ if ! git -C "$worktree_root" diff --quiet || \
     exit 1
   fi
 fi
-if ! bash "$GH_AS_BIN" builder "$repository" \
+push_output="$runs_dir/push-output.txt"
+if bash "$GH_AS_BIN" builder "$repository" \
   git -C "$worktree_root" push \
-    "https://github.com/$repository.git" "HEAD:refs/heads/$branch_name"; then
-  failure_reason=push-failed
-  exit 1
+    "https://github.com/$repository.git" "HEAD:refs/heads/$branch_name" \
+    >"$push_output" 2>&1; then
+  cat "$push_output" >&2
+else
+  cat "$push_output" >&2
+  if ! grep -Eqi 'non-fast-forward|fetch first' "$push_output"; then
+    failure_reason=push-failed
+    exit 1
+  fi
+
+  # A published branch may advance while the implementer works. Preserve the
+  # artifact already under review by merging that head forward; history is
+  # never rewritten, and the ordinary push gets only one retry.
+  if ! bash "$GH_AS_BIN" builder "$repository" \
+    git -C "$worktree_root" fetch \
+      "https://github.com/$repository.git" "refs/heads/$branch_name"; then
+    failure_reason=push-failed
+    exit 1
+  fi
+  repair_remote_head="$(git -C "$worktree_root" rev-parse FETCH_HEAD 2>/dev/null)" || {
+    failure_reason=push-failed
+    exit 1
+  }
+  if ! git -C "$worktree_root" merge --no-edit FETCH_HEAD; then
+    repair_conflicted_paths="$(
+      git -C "$worktree_root" diff --name-only -z --diff-filter=U |
+        jq -Rs 'split("\u0000") | map(select(length > 0))'
+    )"
+    if [ "$(jq 'length' <<<"$repair_conflicted_paths")" -gt 0 ]; then
+      failure_reason=branch-conflicted
+      git -C "$worktree_root" merge --abort || true
+      exit 1
+    fi
+    failure_reason=push-failed
+    exit 1
+  fi
+  if ! bash "$GH_AS_BIN" builder "$repository" \
+    git -C "$worktree_root" push \
+      "https://github.com/$repository.git" "HEAD:refs/heads/$branch_name"; then
+    failure_reason=push-failed
+    exit 1
+  fi
 fi
 
 body_file="$runs_dir/pr-body.md"
