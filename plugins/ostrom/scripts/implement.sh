@@ -246,16 +246,14 @@ jq -r '
 # Codex exec is non-interactive; keep its never-approve policy explicit in
 # configuration. workspace-write permits the diff but keeps network off; the
 # wrapper performs every authenticated/network mutation after Codex exits.
+# In-run token budgeting is not available on the pinned CLI, so the weighted-
+# token ceiling is enforced after the run from the reported usage instead.
 "$CODEX_BIN" exec --json \
   -C "$worktree_root" \
   -s workspace-write \
   -c approval_policy=\"never\" \
   -c sandbox_workspace_write.network_access=false \
   -c web_search=\"disabled\" \
-  -c features.rollout_budget.enabled=true \
-  -c "features.rollout_budget.limit_tokens=$token_ceiling" \
-  -c features.rollout_budget.prefill_token_weight=0.2 \
-  -c features.rollout_budget.sampling_token_weight=1.0 \
   -o "$result_file" \
   <"$prompt_file" >"$events_file" 2>&1 &
 child_pid=$!
@@ -265,6 +263,15 @@ child_pid=""
 if [ "$codex_status" -ne 0 ]; then
   case "$codex_status" in
     126|127) failure_reason=codex-unavailable ;;
+    1)
+      if grep -Eq \
+        '^Error loading config\.toml:|^Error: features\.[[:alnum:]_.]+ is required when [[:alnum:]_.]+ is enabled$' \
+        "$events_file"; then
+        failure_reason=codex-invocation-invalid
+      else
+        failure_reason=codex-exit-1
+      fi
+      ;;
     2)
       if grep -q '^Usage: codex exec ' "$events_file"; then
         failure_reason=codex-invocation-invalid
