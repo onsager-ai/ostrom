@@ -5951,9 +5951,61 @@ cat >"$publisher_data/state.json" <<'JSON'
 }
 JSON
 
+# A scratch config with the implicit destination is refused before any GitHub
+# or Git command can face the real hub. The dedicated status lets sweep.sh
+# report this as a deliberate skip rather than success or infrastructure
+# failure. These spies must remain untouched.
+publish_spy_bin="$publisher/spy-bin"
+publish_spy_log="$publisher/destination-command.log"
+mkdir -p "$publish_spy_bin"
+for publish_spy_command in gh git; do
+  cat >"$publish_spy_bin/$publish_spy_command" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$OSTROM_TEST_PUBLISH_SPY_LOG"
+exit 97
+SH
+  chmod +x "$publish_spy_bin/$publish_spy_command"
+done
+set +e
+PATH="$publish_spy_bin:$PATH" \
+  OSTROM_TEST_PUBLISH_SPY_LOG="$publish_spy_log" \
+  CLAUDE_CONFIG_DIR="$publisher_config" \
+  CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+  MANDATE_PUBLISH_TIME="2026-08-01T00:05:00Z" \
+  bash "$PLUGIN_ROOT/scripts/publish.sh" \
+  >"$publisher/refused.out" 2>"$publisher/refused.err"
+publish_refused_status=$?
+set -e
+if [ "$publish_refused_status" -ne 3 ]; then
+  echo "scratch publish must return the deliberate-skip status" >&2
+  exit 1
+fi
+if [ "$(grep -Fc "$publisher_config" "$publisher/refused.err")" -eq 0 ]; then
+  echo "scratch publish refusal must name its config directory" >&2
+  exit 1
+fi
+if [ "$(grep -Fc 'onsager-ai/ostrom-hub' "$publisher/refused.err")" -eq 0 ]; then
+  echo "scratch publish refusal must name the refused destination" >&2
+  exit 1
+fi
+if [ -s "$publisher/refused.out" ]; then
+  echo "scratch publish refusal must not report successful output" >&2
+  exit 1
+fi
+if [ -e "$publish_spy_log" ]; then
+  echo "scratch publish must not attempt a destination-facing command" >&2
+  exit 1
+fi
+if [ "$(grep -Fc 'destination follows the config the sweep read' \
+  "$PLUGIN_ROOT/scripts/publish.sh")" -eq 0 ]; then
+  echo "publish header must explain that destination follows sweep config" >&2
+  exit 1
+fi
+
 run_publish_dry() {
   CLAUDE_CONFIG_DIR="$publisher_config" \
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    MANDATE_PUBLISH_REMOTE="$publisher_remote" \
     MANDATE_PUBLISH_TIME="2026-08-01T00:05:00Z" \
     bash "$PLUGIN_ROOT/scripts/publish.sh" --dry-run
 }
@@ -6098,6 +6150,7 @@ jq '.queue += ["fixture_extension"]' "$allowlist" >"$changed_allowlist"
 CLAUDE_CONFIG_DIR="$publisher_config" \
   CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
   MANDATE_PUBLISH_ALLOWLIST="$changed_allowlist" \
+  MANDATE_PUBLISH_REMOTE="$publisher_remote" \
   MANDATE_PUBLISH_TIME="2026-08-01T00:05:00Z" \
   bash "$PLUGIN_ROOT/scripts/publish.sh" --dry-run \
   >"$publisher/changed-tree.json"
@@ -6123,6 +6176,117 @@ git --git-dir="$publisher_remote" show state:gate/2026-07-31.jsonl |
   jq -e '.ts == "2026-07-31T23:59:59Z"' >/dev/null
 env "${publish_env[@]}" bash "$PLUGIN_ROOT/scripts/publish.sh" >/dev/null
 [ "$(git --git-dir="$publisher_remote" rev-list --count state)" -eq 1 ]
+
+# An explicit non-default destination is the caller's scratch-to-scratch
+# declaration and must bypass only the implicit-hub guard.
+override_remote="$publisher/explicit-override.git"
+override_cache="$publisher/explicit-override-cache"
+git init --bare --quiet "$override_remote"
+set +e
+CLAUDE_CONFIG_DIR="$publisher_config" \
+  CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+  MANDATE_PUBLISH_DIR="$override_cache" \
+  MANDATE_PUBLISH_REMOTE="$override_remote" \
+  MANDATE_PUBLISH_TIME="2026-08-01T00:05:00Z" \
+  GIT_AUTHOR_NAME="Ostrom Test" \
+  GIT_AUTHOR_EMAIL="ostrom@example.test" \
+  GIT_COMMITTER_NAME="Ostrom Test" \
+  GIT_COMMITTER_EMAIL="ostrom@example.test" \
+  bash "$PLUGIN_ROOT/scripts/publish.sh" \
+  >"$publisher/explicit-override.out" 2>"$publisher/explicit-override.err"
+explicit_override_status=$?
+set -e
+if [ "$explicit_override_status" -ne 0 ]; then
+  echo "scratch publish must honor an explicit non-default destination" >&2
+  exit 1
+fi
+explicit_override_count="$(
+  git --git-dir="$override_remote" rev-list --count state 2>/dev/null || printf '0\n'
+)"
+if [ "$explicit_override_count" -ne 1 ]; then
+  echo "explicit scratch destination must receive one state publication" >&2
+  exit 1
+fi
+
+# Both spellings of the operator config retain the implicit hub destination:
+# unset CLAUDE_CONFIG_DIR and an explicit $HOME/.claude. A purpose-built gh
+# adapter maps that exact owner/repo argument to a local bare repository, so
+# the test exercises clone, state-branch publication, and content without
+# network access.
+operator_home="$publisher/operator-home"
+operator_config="$operator_home/.claude"
+operator_remote="$publisher/operator-default.git"
+operator_bin="$publisher/operator-bin"
+operator_clone_log="$publisher/operator-clone.log"
+mkdir -p "$operator_config" "$operator_bin"
+cp -R "$publisher_data" "$operator_config/ostrom"
+git init --bare --quiet "$operator_remote"
+cat >"$operator_bin/gh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "$#" -ne 6 ] || [ "$1" != repo ] || [ "$2" != clone ] || \
+  [ "$3" != onsager-ai/ostrom-hub ] || [ "$5" != -- ] || \
+  [ "$6" != --no-checkout ]; then
+  exit 98
+fi
+printf '%s\n' "$3" >>"$OSTROM_TEST_OPERATOR_CLONE_LOG"
+exec "$OSTROM_TEST_REAL_GIT" clone --no-checkout \
+  "$OSTROM_TEST_OPERATOR_REMOTE" "$4"
+SH
+chmod +x "$operator_bin/gh"
+operator_publish_env=(
+  HOME="$operator_home"
+  PATH="$operator_bin:$PATH"
+  CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT"
+  MANDATE_PUBLISH_TIME="2026-08-01T00:05:00Z"
+  OSTROM_TEST_OPERATOR_CLONE_LOG="$operator_clone_log"
+  OSTROM_TEST_OPERATOR_REMOTE="$operator_remote"
+  OSTROM_TEST_REAL_GIT="$(command -v git)"
+  GIT_AUTHOR_NAME="Ostrom Test"
+  GIT_AUTHOR_EMAIL="ostrom@example.test"
+  GIT_COMMITTER_NAME="Ostrom Test"
+  GIT_COMMITTER_EMAIL="ostrom@example.test"
+)
+set +e
+(
+  unset CLAUDE_CONFIG_DIR
+  env "${operator_publish_env[@]}" \
+    MANDATE_PUBLISH_DIR="$publisher/operator-unset-cache" \
+    bash "$PLUGIN_ROOT/scripts/publish.sh"
+) >"$publisher/operator-unset.out" 2>"$publisher/operator-unset.err"
+operator_unset_status=$?
+set -e
+if [ "$operator_unset_status" -ne 0 ]; then
+  echo "unset CLAUDE_CONFIG_DIR must retain operator publication" >&2
+  exit 1
+fi
+set +e
+env "${operator_publish_env[@]}" \
+  CLAUDE_CONFIG_DIR="$operator_config" \
+  MANDATE_PUBLISH_DIR="$publisher/operator-explicit-cache" \
+  bash "$PLUGIN_ROOT/scripts/publish.sh" \
+  >"$publisher/operator-explicit.out" 2>"$publisher/operator-explicit.err"
+operator_explicit_status=$?
+set -e
+if [ "$operator_explicit_status" -ne 0 ]; then
+  echo "explicit default CLAUDE_CONFIG_DIR must retain operator publication" >&2
+  exit 1
+fi
+if [ "$(grep -Fc 'onsager-ai/ostrom-hub' "$operator_clone_log")" -ne 2 ]; then
+  echo "both operator config forms must use the unchanged default destination" >&2
+  exit 1
+fi
+operator_publish_count="$(git --git-dir="$operator_remote" rev-list --count state)"
+if [ "$operator_publish_count" -ne 1 ]; then
+  echo "operator config must publish the unchanged snapshot to state" >&2
+  exit 1
+fi
+operator_tree_id="$(git --git-dir="$operator_remote" rev-parse 'state^{tree}')"
+explicit_tree_id="$(git --git-dir="$publisher_remote" rev-parse 'state^{tree}')"
+if [ "$operator_tree_id" != "$explicit_tree_id" ]; then
+  echo "operator config publication content must remain unchanged" >&2
+  exit 1
+fi
 
 # A `--no-checkout` clone still populates the index from the remote's
 # default branch even though it skips the working tree, so a remote whose
@@ -6171,6 +6335,60 @@ rejecting_remote="$publish_sweep/rejecting.git"
 mkdir -p "$publish_sweep/config/ostrom" "$publish_sweep/repo"
 write_gatekeeper_secrets "$publish_sweep/config"
 cp "$publisher_data/mandates.yaml" "$publish_sweep/config/ostrom/mandates.yaml"
+
+# The sweep translates the publisher's config-guard status into a deliberate
+# skip. The gh call log proves that removing the guard would attempt the real
+# owner/repo destination, while the guarded run never reaches repo clone.
+set +e
+(
+  cd "$publish_sweep/repo"
+  PATH="$fixture/bin:$PATH" \
+    FAKE_GH_CALL_LOG="$publish_sweep/guard-gh.log" \
+    CLAUDE_CONFIG_DIR="$publish_sweep/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    MANDATE_SWEEP_MODE=full \
+    MANDATE_PUBLISH_DIR="$publish_sweep/guard-cache" \
+    MANDATE_PUBLISH_TIME="2026-08-01T00:05:00Z" \
+    GIT_AUTHOR_NAME="Ostrom Test" \
+    GIT_AUTHOR_EMAIL="ostrom@example.test" \
+    GIT_COMMITTER_NAME="Ostrom Test" \
+    GIT_COMMITTER_EMAIL="ostrom@example.test" \
+    bash "$PLUGIN_ROOT/scripts/sweep.sh" \
+    >"$publish_sweep/guard.out" 2>"$publish_sweep/guard.err"
+)
+guard_sweep_status=$?
+set -e
+if [ "$guard_sweep_status" -ne 0 ]; then
+  echo "scratch publish guard must not fail the governing sweep" >&2
+  exit 1
+fi
+if [ "$(grep -Fc "$publish_sweep/config" "$publish_sweep/guard.err")" -eq 0 ]; then
+  echo "sweep publish refusal must name the scratch config directory" >&2
+  exit 1
+fi
+if [ "$(grep -Fc 'onsager-ai/ostrom-hub' "$publish_sweep/guard.err")" -eq 0 ]; then
+  echo "sweep publish refusal must name the refused destination" >&2
+  exit 1
+fi
+if [ "$(grep -Fc 'mandate sweep: publish deliberately skipped by config guard' \
+  "$publish_sweep/guard.err")" -eq 0 ]; then
+  echo "sweep must report a guarded publication as a deliberate skip" >&2
+  exit 1
+fi
+if grep -Fq 'mandate sweep: publish failed' "$publish_sweep/guard.err"; then
+  echo "config-guard skip must remain distinct from publish failure" >&2
+  exit 1
+fi
+if grep -Fq 'mandate publish: published' "$publish_sweep/guard.out"; then
+  echo "config-guard skip must remain distinct from publish success" >&2
+  exit 1
+fi
+if grep -Fq $'\trepo clone onsager-ai/ostrom-hub ' \
+  "$publish_sweep/guard-gh.log"; then
+  echo "scratch sweep must not attempt to clone the real hub" >&2
+  exit 1
+fi
+
 (
   cd "$publish_sweep/repo"
   PATH="$fixture/bin:$PATH" \
