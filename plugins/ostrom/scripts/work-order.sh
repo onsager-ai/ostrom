@@ -4,8 +4,9 @@
 # Durable contract (schema_version 1): a work order is one canonical JSON file
 # per item under work-orders/. Its exact fields are validated here so a future
 # Rust dispatcher can consume Bash-era orders without guessing at an ad-hoc
-# shape. The filename is sha256(item_id).json; rewriting it creates a new
-# order_id while preserving the one-file-per-item contract.
+# shape. The filename is <item_hash>.json, where item_hash is sha256(item_id);
+# rewriting it creates a new order_id while preserving the one-file-per-item
+# contract.
 
 set -euo pipefail
 umask 077
@@ -102,17 +103,18 @@ case "${1:-}" in
     fi
 
     item_id="$(jq -r '.item_id' "$candidate")"
-    hash="$(item_hash "$item_id")"
+    item_hash="$(item_hash "$item_id")"
     created_at="${MANDATE_TRACE_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
     order_id="$(printf '%s\n%s\n%s\n' "$item_id" "$created_at" "$RANDOM" | sha256sum | awk '{print $1}')"
     orders_dir="$MANDATE_DATA_DIR/work-orders"
-    target="$orders_dir/$hash.json"
+    target="$orders_dir/$item_hash.json"
     mkdir -p "$orders_dir"
 
     # A running implementer reads this deterministic per-item path. Never
-    # replace the artifact beneath it: dispatch acquires the same hash-derived
-    # lease before launch and retains it until the terminal row is durable.
-    implementer_lease="$MANDATE_DATA_DIR/implementer-item-$hash.lease"
+    # replace the artifact beneath it: dispatch acquires the same
+    # item_hash-derived lease before launch and retains it until the terminal
+    # row is durable.
+    implementer_lease="$MANDATE_DATA_DIR/implementer-item-$item_hash.lease"
     if [ -e "$implementer_lease" ]; then
       echo "ostrom work order: item has a live implementer lease; refusing to replace $target" >&2
       exit 3

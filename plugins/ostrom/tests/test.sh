@@ -1134,8 +1134,8 @@ CLAUDE_CONFIG_DIR="$concurrency_config" \
 concurrency_dispatch_status=$?
 set -e
 [ "$concurrency_dispatch_status" -eq 3 ]
-concurrency_hash="$(bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash 'example-org/example-repo#132')"
-[ ! -e "$concurrency_config/ostrom/implementer-item-$concurrency_hash.lease" ]
+concurrency_item_hash="$(bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash 'example-org/example-repo#132')"
+[ ! -e "$concurrency_config/ostrom/implementer-item-$concurrency_item_hash.lease" ]
 [ "$(wc -l <"$dispatch_calls" | tr -d '[:space:]')" -eq 1 ]
 
 # The daily cap is checked again immediately before dispatch, including the
@@ -1331,13 +1331,13 @@ JSON
       bash "$PLUGIN_ROOT/scripts/work-order.sh" create "$case_candidate"
   )"
   IMPLEMENT_CASE_ORDER_ID="$(jq -r '.order_id' "$IMPLEMENT_CASE_ORDER")"
-  IMPLEMENT_CASE_HASH="$(
+  IMPLEMENT_CASE_ITEM_HASH="$(
     bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash \
       "example-org/example-repo#$case_number"
   )"
-  IMPLEMENT_CASE_UNIT="ostrom-implementer-${IMPLEMENT_CASE_HASH:0:16}"
-  IMPLEMENT_CASE_LEASE="implementer-item-$IMPLEMENT_CASE_HASH.lease"
-  IMPLEMENT_CASE_WORKTREE="$implement_config/ostrom/implementer-worktrees/$IMPLEMENT_CASE_HASH"
+  IMPLEMENT_CASE_UNIT="ostrom-implementer-${IMPLEMENT_CASE_ITEM_HASH:0:16}"
+  IMPLEMENT_CASE_LEASE="implementer-item-$IMPLEMENT_CASE_ITEM_HASH.lease"
+  IMPLEMENT_CASE_WORKTREE="$implement_config/ostrom/implementer-worktrees/$IMPLEMENT_CASE_ITEM_HASH"
   IMPLEMENT_CASE_CODEX_MARKER="$implement_fixture/$case_number-codex-pid"
   IMPLEMENT_CASE_SURVIVED_MARKER="$implement_fixture/$case_number-codex-survived"
   CLAUDE_CONFIG_DIR="$implement_config" \
@@ -1384,9 +1384,9 @@ implement_kill_order="$(
     MANDATE_TRACE_TIME="2026-08-11T03:00:00Z" \
     bash "$PLUGIN_ROOT/scripts/work-order.sh" create "$implement_kill_candidate"
 )"
-implement_kill_hash="$(bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash 'example-org/example-repo#125')"
-implement_kill_unit="ostrom-implementer-${implement_kill_hash:0:16}"
-implement_kill_lease="implementer-item-$implement_kill_hash.lease"
+implement_kill_item_hash="$(bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash 'example-org/example-repo#125')"
+implement_kill_unit="ostrom-implementer-${implement_kill_item_hash:0:16}"
+implement_kill_lease="implementer-item-$implement_kill_item_hash.lease"
 CLAUDE_CONFIG_DIR="$implement_config" MANDATE_LEASE_NAME="$implement_kill_lease" \
   bash "$PLUGIN_ROOT/scripts/lease.sh" acquire "$implement_kill_unit" 3600 >/dev/null
 implement_kill_marker="$implement_fixture/codex-started"
@@ -1437,9 +1437,9 @@ implement_usage_order="$(
     bash "$PLUGIN_ROOT/scripts/work-order.sh" create "$implement_usage_candidate"
 )"
 implement_usage_order_id="$(jq -r '.order_id' "$implement_usage_order")"
-implement_usage_hash="$(bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash 'example-org/example-repo#130')"
-implement_usage_unit="ostrom-implementer-${implement_usage_hash:0:16}"
-implement_usage_lease="implementer-item-$implement_usage_hash.lease"
+implement_usage_item_hash="$(bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash 'example-org/example-repo#130')"
+implement_usage_unit="ostrom-implementer-${implement_usage_item_hash:0:16}"
+implement_usage_lease="implementer-item-$implement_usage_item_hash.lease"
 CLAUDE_CONFIG_DIR="$implement_config" MANDATE_LEASE_NAME="$implement_usage_lease" \
   bash "$PLUGIN_ROOT/scripts/lease.sh" acquire "$implement_usage_unit" 3600 >/dev/null
 set +e
@@ -1490,9 +1490,9 @@ JSON
   )"
   implement_config_order_id="$(jq -r '.order_id' "$implement_config_order")"
   implement_config_item_id="$(jq -r '.item_id' "$implement_config_order")"
-  implement_config_hash="$(bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash "$implement_config_item_id")"
-  implement_config_unit="ostrom-implementer-${implement_config_hash:0:16}"
-  implement_config_lease="implementer-item-$implement_config_hash.lease"
+  implement_config_item_hash="$(bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash "$implement_config_item_id")"
+  implement_config_unit="ostrom-implementer-${implement_config_item_hash:0:16}"
+  implement_config_lease="implementer-item-$implement_config_item_hash.lease"
   CLAUDE_CONFIG_DIR="$implement_config" MANDATE_LEASE_NAME="$implement_config_lease" \
     bash "$PLUGIN_ROOT/scripts/lease.sh" acquire "$implement_config_unit" 3600 >/dev/null
   set +e
@@ -1525,9 +1525,9 @@ implement_ok_order="$(
     MANDATE_TRACE_TIME="2026-08-11T03:01:00Z" \
     bash "$PLUGIN_ROOT/scripts/work-order.sh" create "$implement_ok_candidate"
 )"
-implement_ok_hash="$(bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash 'example-org/example-repo#126')"
-implement_ok_unit="ostrom-implementer-${implement_ok_hash:0:16}"
-implement_ok_lease="implementer-item-$implement_ok_hash.lease"
+implement_ok_item_hash="$(bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash 'example-org/example-repo#126')"
+implement_ok_unit="ostrom-implementer-${implement_ok_item_hash:0:16}"
+implement_ok_lease="implementer-item-$implement_ok_item_hash.lease"
 CLAUDE_CONFIG_DIR="$implement_config" MANDATE_LEASE_NAME="$implement_ok_lease" \
   bash "$PLUGIN_ROOT/scripts/lease.sh" acquire "$implement_ok_unit" 3600 >/dev/null
 implement_pr_body="$implement_fixture/pr-body"
@@ -1845,9 +1845,9 @@ broken_implement_order="$(
     bash "$PLUGIN_ROOT/scripts/work-order.sh" create "$broken_implement_candidate"
 )"
 broken_implement_order_id="$(jq -r '.order_id' "$broken_implement_order")"
-broken_implement_hash="$(bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash 'example-org/example-repo#129')"
-broken_implement_unit="ostrom-implementer-${broken_implement_hash:0:16}"
-broken_implement_lease="implementer-item-$broken_implement_hash.lease"
+broken_implement_item_hash="$(bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash 'example-org/example-repo#129')"
+broken_implement_unit="ostrom-implementer-${broken_implement_item_hash:0:16}"
+broken_implement_lease="implementer-item-$broken_implement_item_hash.lease"
 CLAUDE_CONFIG_DIR="$implement_config" MANDATE_LEASE_NAME="$broken_implement_lease" \
   bash "$PLUGIN_ROOT/scripts/lease.sh" acquire "$broken_implement_unit" 3600 >/dev/null
 set +e
@@ -1875,11 +1875,108 @@ if grep -q 'send a bounded, single-concern change to a subagent' "$work_skill"; 
 fi
 grep -q 'scripts/work-order.sh' "$work_skill"
 grep -q 'scripts/dispatch.sh' "$work_skill"
+grep -Fq 'order_id="$(jq -r '\''.order_id'\'' "$order_file")"' "$work_skill"
+grep -q 'filename.*stem is `item_hash`' "$work_skill"
 if grep -q 'documented Claude implementer fallback' "$work_skill"; then
   echo "builder protocol names a Claude fallback that does not exist" >&2
   exit 1
 fi
 grep -q 'order stays undispatched' "$work_skill"
+
+# #134: order_id is the value inside the durable order, never the stable
+# filename stem (item_hash). A synthetic builder pass proves the dispatched
+# and worked records join one-to-one, while a pre-cutover ambiguous row remains
+# structurally readable without being rewritten.
+trace_join_config="$fixture/trace-order-join"
+trace_join_candidate="$fixture/trace-order-join-candidate.json"
+cat >"$trace_join_candidate" <<'JSON'
+{"schema_version":1,"item_id":"example-org/example-repo#134","repository":"example-org/example-repo","item_ref":"#134","branch_name":"fix/134-placeholder","spec":"Exercise an unambiguous trace join.","acceptance_criteria":["The trace rows join."],"constraints":["Use placeholder data only."]}
+JSON
+trace_join_order="$(
+  CLAUDE_CONFIG_DIR="$trace_join_config" \
+    MANDATE_TRACE_TIME="2026-08-13T00:00:00Z" \
+    bash "$PLUGIN_ROOT/scripts/work-order.sh" create "$trace_join_candidate"
+)"
+trace_join_order_id="$(jq -r '.order_id' "$trace_join_order")"
+trace_join_item_hash="${trace_join_order##*/}"
+trace_join_item_hash="${trace_join_item_hash%.json}"
+trace_join_unit="ostrom-implementer-${trace_join_item_hash:0:16}"
+trace_join_owner="builder-fixture-wake134"
+MANDATE_TRACE_TIME="2026-08-13T00:00:01Z" \
+  CLAUDE_CONFIG_DIR="$trace_join_config" \
+  bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-started \
+    "$(jq -cn --arg owner "$trace_join_owner" '{owner:$owner}')" \
+    '{}' >/dev/null
+MANDATE_TRACE_TIME="2026-08-13T00:00:02Z" \
+  CLAUDE_CONFIG_DIR="$trace_join_config" \
+  bash "$PLUGIN_ROOT/scripts/trace.sh" append work-dispatched \
+    "$(jq -cn --arg order_id "$trace_join_order_id" --arg unit_name "$trace_join_unit" \
+      '{schema_version:1,item_id:"example-org/example-repo#134",
+        order_id:$order_id,unit_name:$unit_name,
+        backend:"systemd",cost_ceiling_usd:20,token_ceiling:500000,
+        cost_usd:null,duration_seconds:0}')" \
+    '{}' >/dev/null
+set +e
+MANDATE_TRACE_TIME="2026-08-13T00:00:03Z" \
+  CLAUDE_CONFIG_DIR="$trace_join_config" \
+  bash "$PLUGIN_ROOT/scripts/trace.sh" append item-worked \
+    "$(jq -cn --arg owner "$trace_join_owner" \
+      --arg order_id "$trace_join_item_hash" \
+      '{owner:$owner,repo:"example-org/example-repo",ref:"#134",
+        action:"work-order-dispatch",outcome:"completed",order_id:$order_id}')" \
+    '{}' >"$fixture/trace-order-join-invalid.out" \
+    2>"$fixture/trace-order-join-invalid.err"
+trace_join_invalid_status=$?
+set -e
+[ "$trace_join_invalid_status" -ne 0 ]
+grep -q "item-worked order_id.*matches no work order's order_id field" \
+  "$fixture/trace-order-join-invalid.err"
+[ "$(wc -l <"$trace_join_config/ostrom/sprint.jsonl" | tr -d '[:space:]')" -eq 2 ]
+MANDATE_TRACE_TIME="2026-08-13T00:00:04Z" \
+  CLAUDE_CONFIG_DIR="$trace_join_config" \
+  bash "$PLUGIN_ROOT/scripts/trace.sh" append item-worked \
+    "$(jq -cn --arg owner "$trace_join_owner" \
+      --arg order_id "$trace_join_order_id" \
+      --arg order_file "$trace_join_order" --arg unit_name "$trace_join_unit" \
+      '{owner:$owner,repo:"example-org/example-repo",ref:"#134",
+        action:"work-order-dispatch",outcome:"completed",order_id:$order_id,
+        order_file:$order_file,unit_name:$unit_name}')" \
+    '{}' >/dev/null
+MANDATE_TRACE_TIME="2026-08-13T00:00:05Z" \
+  CLAUDE_CONFIG_DIR="$trace_join_config" \
+  bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
+    "$(jq -cn --arg owner "$trace_join_owner" \
+      '{owner:$owner,outcome:"completed",worked_items:1}')" \
+    '{}' >/dev/null
+jq -s -e '
+  map(.kind) == ["pass-started", "work-dispatched", "item-worked", "pass-ended"]
+  and ([.[] | select(.kind == "work-dispatched")] | length) == 1
+  and ([.[] | select(.kind == "item-worked")] | length) == 1
+  and ([.[] | select(.kind == "work-dispatched")] as $dispatched
+    | [.[] | select(.kind == "item-worked")] as $worked
+    | all($dispatched[];
+        . as $dispatch
+        | ([$worked[] | select(.fact.order_id == $dispatch.fact.order_id)] | length) == 1))
+' "$trace_join_config/ostrom/sprint.jsonl" >/dev/null
+
+historical_trace_config="$fixture/trace-order-historical"
+mkdir -p "$historical_trace_config/ostrom"
+jq -cn --arg order_id "$trace_join_item_hash" '
+  {ts:"2026-08-12T23:59:59Z",kind:"item-worked",
+    fact:{owner:"builder-historical-wake1",repo:"example-org/example-repo",
+      ref:"#134",action:"work-order-dispatch",outcome:"completed",
+      order_id:$order_id},narration:{}}
+' >"$historical_trace_config/ostrom/sprint.jsonl"
+historical_fact_rows="$(
+  CLAUDE_CONFIG_DIR="$historical_trace_config" \
+    bash "$PLUGIN_ROOT/scripts/trace.sh" read
+)"
+jq -s -e --arg order_id "$trace_join_item_hash" '
+  length == 1
+  and .[0].kind == "item-worked"
+  and .[0].fact.order_id == $order_id
+  and (.[0] | has("narration") | not)
+' <<<"$historical_fact_rows" >/dev/null
 
 # Trace reads make the fact/narration split structural. The ordinary read
 # cannot return a top-level narration key; the principal must name the
