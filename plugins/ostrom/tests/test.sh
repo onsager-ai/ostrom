@@ -1223,12 +1223,45 @@ SH
 fake_codex="$implement_bin/codex"
 cat >"$fake_codex" <<'SH'
 #!/usr/bin/env bash
+usage_error() {
+  printf "error: unexpected argument '%s' found\n\n" "$1" >&2
+  printf 'Usage: codex exec [OPTIONS] [PROMPT]\n' >&2
+  exit 2
+}
+
+config_error() {
+  printf '%s\n' \
+    'Error loading config.toml: data did not match any variant of untagged enum FeatureToml' >&2
+  exit 1
+}
+
+validate_config() {
+  # Keep this payload allow-list aligned with the pinned CLI. In particular,
+  # it intentionally accepts no features.* override: rollout_budget cannot be
+  # configured through -c because its required reminder value is rejected.
+  case "$1" in
+    'approval_policy="never"'|\
+      'sandbox_workspace_write.network_access=false'|\
+      'web_search="disabled"') ;;
+    *) config_error ;;
+  esac
+}
+
+[ "${1:-}" = exec ] || usage_error "${1:-}"
+shift
 worktree=""
 result=""
 while [ "$#" -gt 0 ]; do
+  # Keep this accepted option set aligned with the pinned codex exec CLI.
+  # Unknown options deliberately fail like clap so wrapper drift breaks CI.
   case "$1" in
-    -C) worktree="$2"; shift 2 ;;
-    -o) result="$2"; shift 2 ;;
+    --json) shift ;;
+    -C|--cd) worktree="$2"; shift 2 ;;
+    -s|--sandbox) shift 2 ;;
+    -c|--config) validate_config "$2"; shift 2 ;;
+    -o|--output-last-message) result="$2"; shift 2 ;;
+    --) shift; break ;;
+    -*) usage_error "$1" ;;
     *) shift ;;
   esac
 done
@@ -1238,6 +1271,21 @@ case "${FAKE_CODEX_MODE:-complete}" in
     trap 'exit 143' TERM
     while :; do sleep 1; done
     ;;
+  usage)
+    usage_error '--removed-flag'
+    ;;
+  config)
+    config_error
+    ;;
+  config-required)
+    printf '%s\n' \
+      'Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled' >&2
+    exit 1
+    ;;
+  model-failure)
+    printf 'Synthetic model failure.\n' >&2
+    exit 1
+    ;;
   complete)
     printf 'implemented\n' >"$worktree/generated.txt"
     printf 'Synthetic implementation completed.\n' >"$result"
@@ -1246,6 +1294,19 @@ case "${FAKE_CODEX_MODE:-complete}" in
 esac
 SH
 chmod +x "$fake_implement_gh" "$fake_codex"
+
+# The fake must reject a recognized flag whose config payload is not on the
+# pinned-CLI allow-list, rather than treating every -c argument as valid.
+set +e
+"$fake_codex" exec -c features.rollout_budget.enabled=true \
+  >"$implement_fixture/rejected-config.out" \
+  2>"$implement_fixture/rejected-config.err"
+rejected_config_status=$?
+set -e
+[ "$rejected_config_status" -eq 1 ]
+grep -q \
+  '^Error loading config\.toml: data did not match any variant of untagged enum FeatureToml$' \
+  "$implement_fixture/rejected-config.err"
 
 implement_kill_candidate="$implement_fixture/kill-candidate.json"
 cat >"$implement_kill_candidate" <<'JSON'
@@ -1296,6 +1357,97 @@ jq -s -e '
   and .[0].fact.cost_usd == 0
   and (.[0].fact.duration_seconds | type == "number")
 ' "$implement_config/ostrom/sprint.jsonl" >/dev/null
+
+# A clap usage error means the wrapper called Codex incorrectly, not that the
+# model failed. Keep that distinct from an ordinary codex-exit-2 terminal row.
+implement_usage_candidate="$implement_fixture/usage-candidate.json"
+cat >"$implement_usage_candidate" <<'JSON'
+{"schema_version":1,"item_id":"example-org/example-repo#130","repository":"example-org/example-repo","item_ref":"#130","branch_name":"fix/130-placeholder","spec":"Exercise an invalid harness invocation.","acceptance_criteria":["The usage failure is classified."],"constraints":["Use placeholder data only."]}
+JSON
+implement_usage_order="$(
+  CLAUDE_CONFIG_DIR="$implement_config" \
+    MANDATE_TRACE_TIME="2026-08-11T03:00:30Z" \
+    bash "$PLUGIN_ROOT/scripts/work-order.sh" create "$implement_usage_candidate"
+)"
+implement_usage_order_id="$(jq -r '.order_id' "$implement_usage_order")"
+implement_usage_hash="$(bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash 'example-org/example-repo#130')"
+implement_usage_unit="ostrom-implementer-${implement_usage_hash:0:16}"
+implement_usage_lease="implementer-item-$implement_usage_hash.lease"
+CLAUDE_CONFIG_DIR="$implement_config" MANDATE_LEASE_NAME="$implement_usage_lease" \
+  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire "$implement_usage_unit" 3600 >/dev/null
+set +e
+FAKE_CODEX_MODE=usage \
+  CODEX_BIN="$fake_codex" CLAUDE_CONFIG_DIR="$implement_config" \
+  MANDATE_IMPLEMENTER_SOURCE_REPO="$implement_source" \
+  MANDATE_GH_AS_BIN="$fake_implement_gh" FAKE_GIT_REMOTE="$implement_remote" \
+  FAKE_PR_BODY="$implement_fixture/unused-usage-pr-body" \
+  bash "$PLUGIN_ROOT/scripts/implement.sh" \
+    "$implement_usage_order" "$implement_usage_unit" \
+    >"$implement_fixture/usage.out" 2>"$implement_fixture/usage.err"
+implement_usage_status=$?
+set -e
+[ "$implement_usage_status" -eq 2 ]
+[ ! -e "$implement_config/ostrom/$implement_usage_lease" ]
+jq -s -e --arg order_id "$implement_usage_order_id" '
+  [.[] | select(.fact.order_id == $order_id)] | length == 1
+  and .[0].kind == "work-failed"
+  and .[0].fact.reason == "codex-invocation-invalid"
+' "$implement_config/ostrom/sprint.jsonl" >/dev/null
+if grep -q '"reason":"codex-exit-2"' "$implement_config/ostrom/sprint.jsonl"; then
+  echo "Codex usage error was misclassified as an exec status" >&2
+  exit 1
+fi
+
+# Codex reports rejected config through exit 1, both as a config.toml load
+# failure and as a required-feature-field error. They are harness invocation
+# failures too; an unrelated exit-1 remains a model failure.
+config_modes=(config config-required model-failure)
+config_item_numbers=(131 132 133)
+config_expected_reasons=(
+  codex-invocation-invalid
+  codex-invocation-invalid
+  codex-exit-1
+)
+for config_index in "${!config_modes[@]}"; do
+  config_mode="${config_modes[$config_index]}"
+  config_item_number="${config_item_numbers[$config_index]}"
+  config_expected_reason="${config_expected_reasons[$config_index]}"
+  implement_config_candidate="$implement_fixture/$config_mode-candidate.json"
+  cat >"$implement_config_candidate" <<JSON
+{"schema_version":1,"item_id":"example-org/example-repo#$config_item_number","repository":"example-org/example-repo","item_ref":"#$config_item_number","branch_name":"fix/$config_item_number-placeholder","spec":"Exercise an exit-one harness result.","acceptance_criteria":["The failure is classified."],"constraints":["Use placeholder data only."]}
+JSON
+  implement_config_order="$(
+    CLAUDE_CONFIG_DIR="$implement_config" \
+      MANDATE_TRACE_TIME="2026-08-11T03:00:45Z" \
+      bash "$PLUGIN_ROOT/scripts/work-order.sh" create "$implement_config_candidate"
+  )"
+  implement_config_order_id="$(jq -r '.order_id' "$implement_config_order")"
+  implement_config_item_id="$(jq -r '.item_id' "$implement_config_order")"
+  implement_config_hash="$(bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash "$implement_config_item_id")"
+  implement_config_unit="ostrom-implementer-${implement_config_hash:0:16}"
+  implement_config_lease="implementer-item-$implement_config_hash.lease"
+  CLAUDE_CONFIG_DIR="$implement_config" MANDATE_LEASE_NAME="$implement_config_lease" \
+    bash "$PLUGIN_ROOT/scripts/lease.sh" acquire "$implement_config_unit" 3600 >/dev/null
+  set +e
+  FAKE_CODEX_MODE="$config_mode" \
+    CODEX_BIN="$fake_codex" CLAUDE_CONFIG_DIR="$implement_config" \
+    MANDATE_IMPLEMENTER_SOURCE_REPO="$implement_source" \
+    MANDATE_GH_AS_BIN="$fake_implement_gh" FAKE_GIT_REMOTE="$implement_remote" \
+    FAKE_PR_BODY="$implement_fixture/unused-$config_mode-pr-body" \
+    bash "$PLUGIN_ROOT/scripts/implement.sh" \
+      "$implement_config_order" "$implement_config_unit" \
+      >"$implement_fixture/$config_mode.out" 2>"$implement_fixture/$config_mode.err"
+  implement_config_status=$?
+  set -e
+  [ "$implement_config_status" -eq 1 ]
+  [ ! -e "$implement_config/ostrom/$implement_config_lease" ]
+  jq -s -e --arg order_id "$implement_config_order_id" \
+    --arg reason "$config_expected_reason" '
+    [.[] | select(.fact.order_id == $order_id)] | length == 1
+    and .[0].kind == "work-failed"
+    and .[0].fact.reason == $reason
+  ' "$implement_config/ostrom/sprint.jsonl" >/dev/null
+done
 
 implement_ok_candidate="$implement_fixture/ok-candidate.json"
 cat >"$implement_ok_candidate" <<'JSON'
