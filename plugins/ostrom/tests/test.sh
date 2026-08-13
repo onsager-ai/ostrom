@@ -1386,6 +1386,147 @@ run_implement_order() {
       2>"$implement_fixture/$case_name.err"
 }
 
+# #155: repository discovery must inspect every remote match and prefer a
+# primary clone even when an earlier search root contains a linked worktree.
+# Keeping the linked worktree in the first root makes the old return-on-first
+# implementation fail this fixture deterministically.
+resolution_backing="$implement_fixture/resolution-backing"
+resolution_linked_root="$implement_fixture/resolution-linked-root"
+resolution_primary_root="$implement_fixture/resolution-primary-root"
+resolution_linked="$resolution_linked_root/linked-worktree"
+resolution_primary="$resolution_primary_root/primary-clone"
+mkdir -p "$resolution_linked_root" "$resolution_primary_root"
+git clone --branch main "$implement_remote" "$resolution_backing" >/dev/null 2>&1
+git -C "$resolution_backing" remote set-url origin \
+  https://github.com/example-org/example-repo.git
+git -C "$resolution_backing" worktree add -b fixture/resolution-linked \
+  "$resolution_linked" refs/remotes/origin/main >/dev/null
+git clone --branch main "$implement_remote" "$resolution_primary" >/dev/null 2>&1
+git -C "$resolution_primary" config user.name "Ostrom Test"
+git -C "$resolution_primary" config user.email "ostrom@example.test"
+git -C "$resolution_primary" remote set-url origin \
+  https://github.com/example-org/example-repo.git
+resolution_config="$implement_fixture/resolution-config"
+mkdir -p "$resolution_config/ostrom"
+cat >"$resolution_config/ostrom/mandates.yaml" <<YAML
+search_roots:
+  - $resolution_linked_root
+  - $resolution_primary_root
+YAML
+resolution_order="$(create_implement_order source-resolution 144 "$resolution_config")"
+resolution_order_id="$(jq -r '.order_id' "$resolution_order")"
+resolution_item_hash="$(
+  bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash \
+    'example-org/example-repo#144'
+)"
+resolution_unit="ostrom-implementer-${resolution_item_hash:0:16}"
+resolution_lease="implementer-item-$resolution_item_hash.lease"
+resolution_worktree="$resolution_config/ostrom/implementer-worktrees/$resolution_item_hash"
+CLAUDE_CONFIG_DIR="$resolution_config" MANDATE_LEASE_NAME="$resolution_lease" \
+  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire "$resolution_unit" 3600 >/dev/null
+FAKE_CODEX_MODE=complete CODEX_BIN="$fake_codex" \
+  CLAUDE_CONFIG_DIR="$resolution_config" \
+  MANDATE_GH_AS_BIN="$fake_implement_gh" FAKE_GIT_REMOTE="$implement_remote" \
+  FAKE_PR_BODY="$implement_fixture/source-resolution-pr-body" \
+  bash "$PLUGIN_ROOT/scripts/implement.sh" "$resolution_order" "$resolution_unit" \
+    >"$implement_fixture/source-resolution.out" \
+    2>"$implement_fixture/source-resolution.err"
+[ "$(git -C "$resolution_worktree" rev-parse --git-common-dir)" = \
+  "$resolution_primary/.git" ]
+jq -s -e --arg order_id "$resolution_order_id" \
+  --arg source_repository_path "$resolution_primary" '
+  [.[] | select(.fact.order_id == $order_id)] | length == 1
+  and .[0].kind == "work-completed"
+  and .[0].fact.source_repository_path == $source_repository_path
+' "$resolution_config/ostrom/sprint.jsonl" >/dev/null
+
+# A linked worktree by itself is diagnostic evidence, not a safe source
+# checkout. The terminal reason names the sorted match and no worktree is made.
+linked_only_config="$implement_fixture/linked-only-config"
+mkdir -p "$linked_only_config/ostrom"
+cat >"$linked_only_config/ostrom/mandates.yaml" <<YAML
+search_roots:
+  - $resolution_linked_root
+YAML
+linked_only_order="$(create_implement_order linked-only 145 "$linked_only_config")"
+linked_only_order_id="$(jq -r '.order_id' "$linked_only_order")"
+linked_only_item_hash="$(
+  bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash \
+    'example-org/example-repo#145'
+)"
+linked_only_unit="ostrom-implementer-${linked_only_item_hash:0:16}"
+linked_only_lease="implementer-item-$linked_only_item_hash.lease"
+CLAUDE_CONFIG_DIR="$linked_only_config" MANDATE_LEASE_NAME="$linked_only_lease" \
+  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire "$linked_only_unit" 3600 >/dev/null
+set +e
+CODEX_BIN="$fake_codex" CLAUDE_CONFIG_DIR="$linked_only_config" \
+  MANDATE_GH_AS_BIN="$fake_implement_gh" FAKE_GIT_REMOTE="$implement_remote" \
+  FAKE_PR_BODY="$implement_fixture/unused-linked-only-pr-body" \
+  bash "$PLUGIN_ROOT/scripts/implement.sh" \
+    "$linked_only_order" "$linked_only_unit" \
+    >"$implement_fixture/linked-only.out" \
+    2>"$implement_fixture/linked-only.err"
+linked_only_status=$?
+set -e
+[ "$linked_only_status" -eq 1 ]
+[ ! -e "$linked_only_config/ostrom/$linked_only_lease" ]
+[ ! -e "$linked_only_config/ostrom/implementer-worktrees/$linked_only_item_hash" ]
+jq -s -e --arg order_id "$linked_only_order_id" \
+  --arg reason "source-repository-linked-worktree-only path=$resolution_linked" '
+  [.[] | select(.fact.order_id == $order_id)] | length == 1
+  and .[0].kind == "work-failed"
+  and .[0].fact.reason == $reason
+  and .[0].fact.source_repository_path == null
+' "$linked_only_config/ostrom/sprint.jsonl" >/dev/null
+
+# A local branch created outside the item-keyed worktree is never inherited:
+# the terminal reason identifies both the branch and its owning worktree.
+branch_conflict_config="$implement_fixture/branch-conflict-config"
+branch_conflict_order="$(
+  create_implement_order branch-conflict 146 "$branch_conflict_config"
+)"
+branch_conflict_order_id="$(jq -r '.order_id' "$branch_conflict_order")"
+branch_conflict_branch="$(jq -r '.branch_name' "$branch_conflict_order")"
+branch_conflict_item_hash="$(
+  bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash \
+    'example-org/example-repo#146'
+)"
+branch_conflict_unit="ostrom-implementer-${branch_conflict_item_hash:0:16}"
+branch_conflict_lease="implementer-item-$branch_conflict_item_hash.lease"
+branch_conflict_existing="$implement_fixture/branch-conflict-existing"
+branch_conflict_target="$branch_conflict_config/ostrom/implementer-worktrees/$branch_conflict_item_hash"
+git -C "$implement_source" worktree add -b "$branch_conflict_branch" \
+  "$branch_conflict_existing" refs/remotes/origin/main >/dev/null
+CLAUDE_CONFIG_DIR="$branch_conflict_config" \
+  MANDATE_LEASE_NAME="$branch_conflict_lease" \
+  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire \
+    "$branch_conflict_unit" 3600 >/dev/null
+set +e
+FAKE_CODEX_MODE=complete CODEX_BIN="$fake_codex" \
+  CLAUDE_CONFIG_DIR="$branch_conflict_config" \
+  MANDATE_IMPLEMENTER_SOURCE_REPO="$implement_source" \
+  MANDATE_GH_AS_BIN="$fake_implement_gh" FAKE_GIT_REMOTE="$implement_remote" \
+  FAKE_PR_BODY="$implement_fixture/unused-branch-conflict-pr-body" \
+  bash "$PLUGIN_ROOT/scripts/implement.sh" \
+    "$branch_conflict_order" "$branch_conflict_unit" \
+    >"$implement_fixture/branch-conflict.out" \
+    2>"$implement_fixture/branch-conflict.err"
+branch_conflict_status=$?
+set -e
+[ "$branch_conflict_status" -eq 1 ]
+[ ! -e "$branch_conflict_config/ostrom/$branch_conflict_lease" ]
+[ ! -e "$branch_conflict_target" ]
+[ "$(git -C "$branch_conflict_existing" branch --show-current)" = \
+  "$branch_conflict_branch" ]
+jq -s -e --arg order_id "$branch_conflict_order_id" \
+  --arg reason "worktree-branch-already-exists branch=$branch_conflict_branch path=$branch_conflict_existing" \
+  --arg source_repository_path "$implement_source" '
+  [.[] | select(.fact.order_id == $order_id)] | length == 1
+  and .[0].kind == "work-failed"
+  and .[0].fact.reason == $reason
+  and .[0].fact.source_repository_path == $source_repository_path
+' "$branch_conflict_config/ostrom/sprint.jsonl" >/dev/null
+
 # #142: a repeat order on the already-matching deterministic branch reuses the
 # item-keyed worktree. The preexisting uncommitted file reaches the pushed
 # commit, proving reuse does not discard it.
