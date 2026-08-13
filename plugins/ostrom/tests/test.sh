@@ -1286,6 +1286,23 @@ case "${FAKE_CODEX_MODE:-complete}" in
     printf 'Synthetic model failure.\n' >&2
     exit 1
     ;;
+  partial-failure)
+    printf 'partial implementation\n' >"$worktree/generated.txt"
+    printf '%s\n' \
+      '{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":50,"reasoning_output_tokens":10}}'
+    printf 'Synthetic model failure after changing the worktree.\n' >&2
+    exit 1
+    ;;
+  ceiling)
+    printf 'partial implementation\n' >"$worktree/generated.txt"
+    printf '%s\n' "$$" >"$FAKE_CODEX_MARKER"
+    trap 'exit 143' TERM
+    printf '%s\n' "$FAKE_CODEX_USAGE_JSON"
+    for _ceiling_wait in $(seq 1 100); do
+      sleep 0.02
+    done
+    printf 'not terminated\n' >"$FAKE_CODEX_SURVIVED_MARKER"
+    ;;
   complete)
     printf 'implemented\n' >"$worktree/generated.txt"
     printf 'Synthetic implementation completed.\n' >"$result"
@@ -1302,6 +1319,8 @@ chmod +x "$fake_implement_gh" "$fake_codex"
 run_implement_usage_case() {
   case_number="$1"
   case_usage="$2"
+  case_mode="${3:-complete}"
+  case_streaming_ceiling="${4:-enabled}"
   case_candidate="$implement_fixture/$case_number-candidate.json"
   cat >"$case_candidate" <<JSON
 {"schema_version":1,"item_id":"example-org/example-repo#$case_number","repository":"example-org/example-repo","item_ref":"#$case_number","branch_name":"fix/$case_number-placeholder","spec":"Exercise synthetic token accounting.","acceptance_criteria":["Token accounting matches the reported components."],"constraints":["Use placeholder data only."]}
@@ -1319,12 +1338,17 @@ JSON
   IMPLEMENT_CASE_UNIT="ostrom-implementer-${IMPLEMENT_CASE_HASH:0:16}"
   IMPLEMENT_CASE_LEASE="implementer-item-$IMPLEMENT_CASE_HASH.lease"
   IMPLEMENT_CASE_WORKTREE="$implement_config/ostrom/implementer-worktrees/$IMPLEMENT_CASE_HASH"
+  IMPLEMENT_CASE_CODEX_MARKER="$implement_fixture/$case_number-codex-pid"
+  IMPLEMENT_CASE_SURVIVED_MARKER="$implement_fixture/$case_number-codex-survived"
   CLAUDE_CONFIG_DIR="$implement_config" \
     MANDATE_LEASE_NAME="$IMPLEMENT_CASE_LEASE" \
     bash "$PLUGIN_ROOT/scripts/lease.sh" acquire \
       "$IMPLEMENT_CASE_UNIT" 3600 >/dev/null
   set +e
-  FAKE_CODEX_USAGE_JSON="$case_usage" \
+  FAKE_CODEX_MODE="$case_mode" FAKE_CODEX_USAGE_JSON="$case_usage" \
+    FAKE_CODEX_MARKER="$IMPLEMENT_CASE_CODEX_MARKER" \
+    FAKE_CODEX_SURVIVED_MARKER="$IMPLEMENT_CASE_SURVIVED_MARKER" \
+    MANDATE_IMPLEMENTER_STREAMING_CEILING="$case_streaming_ceiling" \
     CODEX_BIN="$fake_codex" CLAUDE_CONFIG_DIR="$implement_config" \
     MANDATE_IMPLEMENTER_SOURCE_REPO="$implement_source" \
     MANDATE_GH_AS_BIN="$fake_implement_gh" FAKE_GIT_REMOTE="$implement_remote" \
@@ -1547,10 +1571,38 @@ jq -s -e --arg order_id "$IMPLEMENT_CASE_ORDER_ID" '
   and .[0].fact.usage.cached_input_tokens_available == true
 ' "$implement_config/ostrom/sprint.jsonl" >/dev/null
 
+# A completed-turn event that takes cumulative usage over the ceiling stops
+# the still-running child. The distinct terminal reason and absence of the
+# survival marker prove this is the streaming path, not the post-run backstop.
+run_implement_usage_case 138 \
+  '{"type":"turn.completed","usage":{"input_tokens":4360176,"cached_input_tokens":0,"output_tokens":22074,"reasoning_output_tokens":0}}' \
+  ceiling
+[ "$IMPLEMENT_CASE_STATUS" -eq 1 ]
+[ -s "$IMPLEMENT_CASE_CODEX_MARKER" ]
+if kill -0 "$(cat "$IMPLEMENT_CASE_CODEX_MARKER")" 2>/dev/null; then
+  echo "streaming ceiling left its Codex child running" >&2
+  exit 1
+fi
+[ ! -e "$IMPLEMENT_CASE_SURVIVED_MARKER" ]
+[ -f "$IMPLEMENT_CASE_WORKTREE/generated.txt" ]
+[ -n "$(git -C "$IMPLEMENT_CASE_WORKTREE" status --porcelain)" ]
+jq -s -e \
+  --arg order_id "$IMPLEMENT_CASE_ORDER_ID" \
+  --arg worktree_path "$IMPLEMENT_CASE_WORKTREE" '
+  [.[] | select(.fact.order_id == $order_id)] | length == 1
+  and .[0].kind == "work-failed"
+  and .[0].fact.reason == "token-ceiling-terminated"
+  and .[0].fact.weighted_tokens == 894110
+  and .[0].fact.worktree_path == $worktree_path
+  and .[0].fact.branch_name == "fix/138-placeholder"
+' "$implement_config/ostrom/sprint.jsonl" >/dev/null
+
 # A large genuinely-fresh run still breaches. The failure row preserves all
 # measured components and the dirty worktree so its completed diff is usable.
+# Disable streaming supervision here to exercise the retained post-run check.
 run_implement_usage_case 135 \
-  '{"type":"turn.completed","usage":{"input_tokens":4360176,"cached_input_tokens":0,"output_tokens":22074,"reasoning_output_tokens":0}}'
+  '{"type":"turn.completed","usage":{"input_tokens":4360176,"cached_input_tokens":0,"output_tokens":22074,"reasoning_output_tokens":0}}' \
+  complete disabled
 [ "$IMPLEMENT_CASE_STATUS" -eq 1 ]
 [ -f "$IMPLEMENT_CASE_WORKTREE/generated.txt" ]
 [ -n "$(git -C "$IMPLEMENT_CASE_WORKTREE" status --porcelain)" ]
@@ -1575,13 +1627,15 @@ jq -s -e \
   and .[0].fact.usage.output_tokens == 22074
   and .[0].fact.usage.cached_input_tokens_available == true
   and .[0].fact.worktree_path == $worktree_path
+  and .[0].fact.branch_name == "fix/135-placeholder"
 ' "$implement_config/ostrom/sprint.jsonl" >/dev/null
 
 # A harness that omits cached_input_tokens produces an explicit unknown split.
 # The ceiling calculation uses the conservative upper bound that all reported
 # input was fresh, instead of presenting cached=0 as a measurement.
 run_implement_usage_case 136 \
-  '{"type":"turn.completed","usage":{"input_tokens":3000000,"output_tokens":0,"reasoning_output_tokens":0}}'
+  '{"type":"turn.completed","usage":{"input_tokens":3000000,"output_tokens":0,"reasoning_output_tokens":0}}' \
+  complete disabled
 [ "$IMPLEMENT_CASE_STATUS" -eq 1 ]
 jq -s -e --arg order_id "$IMPLEMENT_CASE_ORDER_ID" '
   [.[] | select(.fact.order_id == $order_id)] | length == 1
@@ -1592,6 +1646,25 @@ jq -s -e --arg order_id "$IMPLEMENT_CASE_ORDER_ID" '
   and .[0].fact.usage.cached_input_tokens == null
   and .[0].fact.usage.output_tokens == 0
   and .[0].fact.usage.cached_input_tokens_available == false
+' "$implement_config/ostrom/sprint.jsonl" >/dev/null
+
+# Worktree preservation applies to every terminal failure after edits, not
+# only token-ceiling failures. A model failure leaves a durable path + branch
+# pointer and does not stage or commit a possibly incomplete repair.
+run_implement_usage_case 139 \
+  '{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":50,"reasoning_output_tokens":10}}' \
+  partial-failure
+[ "$IMPLEMENT_CASE_STATUS" -eq 1 ]
+[ -f "$IMPLEMENT_CASE_WORKTREE/generated.txt" ]
+[ -n "$(git -C "$IMPLEMENT_CASE_WORKTREE" status --porcelain)" ]
+jq -s -e \
+  --arg order_id "$IMPLEMENT_CASE_ORDER_ID" \
+  --arg worktree_path "$IMPLEMENT_CASE_WORKTREE" '
+  [.[] | select(.fact.order_id == $order_id)] | length == 1
+  and .[0].kind == "work-failed"
+  and .[0].fact.reason == "codex-exit-1"
+  and .[0].fact.worktree_path == $worktree_path
+  and .[0].fact.branch_name == "fix/139-placeholder"
 ' "$implement_config/ostrom/sprint.jsonl" >/dev/null
 
 # A malformed harness report cannot make fresh input or the weight negative.
