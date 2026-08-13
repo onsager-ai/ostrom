@@ -1331,12 +1331,33 @@ case "${FAKE_CODEX_MODE:-complete}" in
   ceiling)
     printf 'partial implementation\n' >"$worktree/generated.txt"
     printf '%s\n' "$$" >"$FAKE_CODEX_MARKER"
-    trap 'exit 143' TERM
+    trap 'printf "received\n" >"$FAKE_CODEX_TERM_MARKER"; sleep 0.2; printf "completed\n" >"$FAKE_CODEX_TERM_MARKER"; exit 143' TERM
     printf '%s\n' "$FAKE_CODEX_USAGE_JSON"
     for _ceiling_wait in $(seq 1 100); do
       sleep 0.02
     done
     printf 'not terminated\n' >"$FAKE_CODEX_SURVIVED_MARKER"
+    ;;
+  ceiling-ignore-term)
+    printf 'partial implementation\n' >"$worktree/generated.txt"
+    printf '%s\n' "$$" >"$FAKE_CODEX_MARKER"
+    trap '' TERM
+    printf '%s\n' "$FAKE_CODEX_USAGE_JSON"
+    for _ceiling_wait in $(seq 1 80); do
+      sleep 0.1
+    done
+    printf 'not killed\n' >"$FAKE_CODEX_SURVIVED_MARKER"
+    ;;
+  wedged-monitor)
+    # Keep the event pipe open after Codex exits so the monitor remains in its
+    # read loop. The test stops that monitor before terminating the wrapper,
+    # simulating a process that cannot act on TERM during finish().
+    (
+      trap 'exit 0' TERM
+      while :; do sleep 1; done
+    ) &
+    printf '%s\n' "$!" >"$FAKE_CODEX_SURVIVED_MARKER"
+    printf '%s\n' "$$" >"$FAKE_CODEX_MARKER"
     ;;
   complete)
     printf 'implemented\n' >"$worktree/generated.txt"
@@ -1502,6 +1523,7 @@ run_implement_usage_case() {
   case_usage="$2"
   case_mode="${3:-complete}"
   case_streaming_ceiling="${4:-enabled}"
+  case_timeout="${5:-}"
   case_candidate="$implement_fixture/$case_number-candidate.json"
   cat >"$case_candidate" <<JSON
 {"schema_version":1,"item_id":"example-org/example-repo#$case_number","repository":"example-org/example-repo","item_ref":"#$case_number","branch_name":"fix/$case_number-placeholder","spec":"Exercise synthetic token accounting.","acceptance_criteria":["Token accounting matches the reported components."],"constraints":["Use placeholder data only."]}
@@ -1522,21 +1544,28 @@ JSON
   IMPLEMENT_CASE_WORKTREE="$implement_config/ostrom/implementer-worktrees/$IMPLEMENT_CASE_ITEM_HASH"
   IMPLEMENT_CASE_CODEX_MARKER="$implement_fixture/$case_number-codex-pid"
   IMPLEMENT_CASE_SURVIVED_MARKER="$implement_fixture/$case_number-codex-survived"
+  IMPLEMENT_CASE_TERM_MARKER="$implement_fixture/$case_number-codex-term"
   CLAUDE_CONFIG_DIR="$implement_config" \
     MANDATE_LEASE_NAME="$IMPLEMENT_CASE_LEASE" \
     bash "$PLUGIN_ROOT/scripts/lease.sh" acquire \
       "$IMPLEMENT_CASE_UNIT" 3600 >/dev/null
   set +e
+  case_command=(bash "$PLUGIN_ROOT/scripts/implement.sh" \
+    "$IMPLEMENT_CASE_ORDER" "$IMPLEMENT_CASE_UNIT")
+  if [ -n "$case_timeout" ]; then
+    case_command=(timeout --kill-after=1s "$case_timeout" "${case_command[@]}")
+  fi
   FAKE_CODEX_MODE="$case_mode" FAKE_CODEX_USAGE_JSON="$case_usage" \
     FAKE_CODEX_MARKER="$IMPLEMENT_CASE_CODEX_MARKER" \
     FAKE_CODEX_SURVIVED_MARKER="$IMPLEMENT_CASE_SURVIVED_MARKER" \
+    FAKE_CODEX_TERM_MARKER="$IMPLEMENT_CASE_TERM_MARKER" \
     MANDATE_IMPLEMENTER_STREAMING_CEILING="$case_streaming_ceiling" \
+    MANDATE_IMPLEMENTER_TERMINATION_GRACE_SECONDS=1 \
     CODEX_BIN="$fake_codex" CLAUDE_CONFIG_DIR="$implement_config" \
     MANDATE_IMPLEMENTER_SOURCE_REPO="$implement_source" \
     MANDATE_GH_AS_BIN="$fake_implement_gh" FAKE_GIT_REMOTE="$implement_remote" \
     FAKE_PR_BODY="$implement_fixture/$case_number-pr-body" \
-    bash "$PLUGIN_ROOT/scripts/implement.sh" \
-      "$IMPLEMENT_CASE_ORDER" "$IMPLEMENT_CASE_UNIT" \
+    "${case_command[@]}" \
       >"$implement_fixture/$case_number.out" \
       2>"$implement_fixture/$case_number.err"
   IMPLEMENT_CASE_STATUS=$?
@@ -1573,6 +1602,7 @@ CLAUDE_CONFIG_DIR="$implement_config" MANDATE_LEASE_NAME="$implement_kill_lease"
   bash "$PLUGIN_ROOT/scripts/lease.sh" acquire "$implement_kill_unit" 3600 >/dev/null
 implement_kill_marker="$implement_fixture/codex-started"
 FAKE_CODEX_MODE=wait FAKE_CODEX_MARKER="$implement_kill_marker" \
+  MANDATE_IMPLEMENTER_TERMINATION_GRACE_SECONDS=1 \
   CODEX_BIN="$fake_codex" CLAUDE_CONFIG_DIR="$implement_config" \
   MANDATE_IMPLEMENTER_SOURCE_REPO="$implement_source" \
   MANDATE_GH_AS_BIN="$fake_implement_gh" FAKE_GIT_REMOTE="$implement_remote" \
@@ -1603,8 +1633,83 @@ jq -s -e '
   and .[0].kind == "work-failed"
   and .[0].fact.item_id == "example-org/example-repo#125"
   and .[0].fact.reason == "signal-TERM"
+  and .[0].fact.termination_signal == "SIGTERM"
   and .[0].fact.cost_usd == 0
   and (.[0].fact.duration_seconds | type == "number")
+' "$implement_config/ostrom/sprint.jsonl" >/dev/null
+
+# finish() must bound monitor cleanup too. Leave the FIFO open after Codex
+# exits, stop the monitor so it cannot act on TERM, and terminate the wrapper.
+# The watchdog makes a reverted bare wait a five-second failure, not stuck CI.
+wedged_monitor_order="$(create_implement_order wedged-monitor 146)"
+wedged_monitor_order_id="$(jq -r '.order_id' "$wedged_monitor_order")"
+wedged_monitor_item_hash="$(
+  bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash \
+    'example-org/example-repo#146'
+)"
+wedged_monitor_unit="ostrom-implementer-${wedged_monitor_item_hash:0:16}"
+wedged_monitor_lease="implementer-item-$wedged_monitor_item_hash.lease"
+CLAUDE_CONFIG_DIR="$implement_config" MANDATE_LEASE_NAME="$wedged_monitor_lease" \
+  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire \
+    "$wedged_monitor_unit" 3600 >/dev/null
+wedged_monitor_codex_marker="$implement_fixture/wedged-monitor-codex"
+wedged_monitor_holder_marker="$implement_fixture/wedged-monitor-holder"
+FAKE_CODEX_MODE=wedged-monitor \
+  FAKE_CODEX_MARKER="$wedged_monitor_codex_marker" \
+  FAKE_CODEX_SURVIVED_MARKER="$wedged_monitor_holder_marker" \
+  MANDATE_IMPLEMENTER_TERMINATION_GRACE_SECONDS=1 \
+  CODEX_BIN="$fake_codex" CLAUDE_CONFIG_DIR="$implement_config" \
+  MANDATE_IMPLEMENTER_SOURCE_REPO="$implement_source" \
+  MANDATE_GH_AS_BIN="$fake_implement_gh" FAKE_GIT_REMOTE="$implement_remote" \
+  FAKE_PR_BODY="$implement_fixture/unused-wedged-monitor-pr-body" \
+  bash "$PLUGIN_ROOT/scripts/implement.sh" \
+    "$wedged_monitor_order" "$wedged_monitor_unit" \
+    >"$implement_fixture/wedged-monitor.out" \
+    2>"$implement_fixture/wedged-monitor.err" &
+wedged_monitor_wrapper_pid=$!
+wedged_monitor_pid=""
+for _attempt in $(seq 1 100); do
+  if [ -s "$wedged_monitor_codex_marker" ] && \
+    [ -s "$wedged_monitor_holder_marker" ]; then
+    direct_children="$(
+      ps -o pid= --ppid "$wedged_monitor_wrapper_pid" | awk 'NF { print $1 }'
+    )"
+    if [ "$(wc -w <<<"$direct_children" | tr -d '[:space:]')" -eq 1 ]; then
+      wedged_monitor_pid="$direct_children"
+      break
+    fi
+  fi
+  sleep 0.05
+done
+[ -n "$wedged_monitor_pid" ]
+wedged_monitor_holder_pid="$(cat "$wedged_monitor_holder_marker")"
+kill -STOP "$wedged_monitor_pid"
+kill -TERM "$wedged_monitor_wrapper_pid"
+wedged_monitor_timeout_marker="$implement_fixture/wedged-monitor-timeout"
+(
+  sleep 5
+  if kill -0 "$wedged_monitor_wrapper_pid" 2>/dev/null; then
+    : >"$wedged_monitor_timeout_marker"
+    kill -KILL "$wedged_monitor_wrapper_pid" 2>/dev/null || true
+  fi
+) &
+wedged_monitor_watchdog_pid=$!
+set +e
+wait "$wedged_monitor_wrapper_pid"
+wedged_monitor_status=$?
+set -e
+kill "$wedged_monitor_watchdog_pid" 2>/dev/null || true
+wait "$wedged_monitor_watchdog_pid" 2>/dev/null || true
+kill -TERM "$wedged_monitor_holder_pid" 2>/dev/null || true
+kill -KILL "$wedged_monitor_pid" 2>/dev/null || true
+[ ! -e "$wedged_monitor_timeout_marker" ]
+[ "$wedged_monitor_status" -eq 143 ]
+[ ! -e "$implement_config/ostrom/$wedged_monitor_lease" ]
+jq -s -e --arg order_id "$wedged_monitor_order_id" '
+  [.[] | select(.fact.order_id == $order_id)] | length == 1
+  and .[0].kind == "work-failed"
+  and .[0].fact.reason == "signal-TERM"
+  and .[0].fact.termination_signal == "SIGKILL"
 ' "$implement_config/ostrom/sprint.jsonl" >/dev/null
 
 # A clap usage error means the wrapper called Codex incorrectly, not that the
@@ -1759,7 +1864,7 @@ jq -s -e --arg order_id "$IMPLEMENT_CASE_ORDER_ID" '
 # survival marker prove this is the streaming path, not the post-run backstop.
 run_implement_usage_case 138 \
   '{"type":"turn.completed","usage":{"input_tokens":4360176,"cached_input_tokens":0,"output_tokens":22074,"reasoning_output_tokens":0}}' \
-  ceiling
+  ceiling enabled 5s
 [ "$IMPLEMENT_CASE_STATUS" -eq 1 ]
 [ -s "$IMPLEMENT_CASE_CODEX_MARKER" ]
 if kill -0 "$(cat "$IMPLEMENT_CASE_CODEX_MARKER")" 2>/dev/null; then
@@ -1767,6 +1872,7 @@ if kill -0 "$(cat "$IMPLEMENT_CASE_CODEX_MARKER")" 2>/dev/null; then
   exit 1
 fi
 [ ! -e "$IMPLEMENT_CASE_SURVIVED_MARKER" ]
+[ "$(cat "$IMPLEMENT_CASE_TERM_MARKER")" = completed ]
 [ -f "$IMPLEMENT_CASE_WORKTREE/generated.txt" ]
 [ -n "$(git -C "$IMPLEMENT_CASE_WORKTREE" status --porcelain)" ]
 jq -s -e \
@@ -1776,9 +1882,31 @@ jq -s -e \
   [.[] | select(.fact.order_id == $order_id)] | length == 1
   and .[0].kind == "work-failed"
   and .[0].fact.reason == "token-ceiling-terminated"
+  and .[0].fact.termination_signal == "SIGTERM"
   and .[0].fact.weighted_tokens == 894110
   and .[0].fact.worktree_path == $worktree_path
   and .[0].fact.branch_name == $branch_name
+' "$implement_config/ostrom/sprint.jsonl" >/dev/null
+
+# A sibling fixture ignores TERM. SIGKILL must end it before the test's tight
+# outer timeout, and the terminal fact must distinguish that escalation from
+# the cooperative case above. Reverting escalation makes this timeout or
+# leaves the survival marker behind.
+run_implement_usage_case 144 \
+  '{"type":"turn.completed","usage":{"input_tokens":4360176,"cached_input_tokens":0,"output_tokens":22074,"reasoning_output_tokens":0}}' \
+  ceiling-ignore-term enabled 5s
+[ "$IMPLEMENT_CASE_STATUS" -eq 1 ]
+[ -s "$IMPLEMENT_CASE_CODEX_MARKER" ]
+if kill -0 "$(cat "$IMPLEMENT_CASE_CODEX_MARKER")" 2>/dev/null; then
+  echo "streaming ceiling left its TERM-ignoring Codex child running" >&2
+  exit 1
+fi
+[ ! -e "$IMPLEMENT_CASE_SURVIVED_MARKER" ]
+jq -s -e --arg order_id "$IMPLEMENT_CASE_ORDER_ID" '
+  [.[] | select(.fact.order_id == $order_id)] | length == 1
+  and .[0].kind == "work-failed"
+  and .[0].fact.reason == "token-ceiling-terminated"
+  and .[0].fact.termination_signal == "SIGKILL"
 ' "$implement_config/ostrom/sprint.jsonl" >/dev/null
 
 # A large genuinely-fresh run still breaches. The failure row preserves all
