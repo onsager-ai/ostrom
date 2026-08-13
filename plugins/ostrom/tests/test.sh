@@ -1197,6 +1197,10 @@ if [ "$1" = gh ] && [ "$2" = repo ] && [ "$3" = view ]; then
   printf 'main\n'
   exit 0
 fi
+if [ "$1" = gh ] && [ "$2" = pr ] && [ "$3" = list ]; then
+  printf '[]\n'
+  exit 0
+fi
 if [ "$1" = gh ] && [ "$2" = pr ] && [ "$3" = create ]; then
   while [ "$#" -gt 0 ]; do
     if [ "$1" = --body-file ]; then
@@ -1332,6 +1336,194 @@ jq -s -e '
   and .[-1].fact.usage.output_tokens == 50
 ' "$implement_config/ostrom/sprint.jsonl" >/dev/null
 
+# #123: dispatch must find Codex when it exists only inside nvm, give the
+# transient unit the Node interpreter required by Codex's env shebang, and
+# leave a matched dispatch/terminal pair after the implementer completes.
+nvm_dispatch_home="$implement_fixture/nvm-home"
+nvm_dispatch_dir="$nvm_dispatch_home/.nvm"
+nvm_old_bin="$nvm_dispatch_dir/versions/node/v24.9.0/bin"
+nvm_new_bin="$nvm_dispatch_dir/versions/node/v24.18.0/bin"
+mkdir -p "$nvm_dispatch_dir/alias" "$nvm_old_bin" "$nvm_new_bin"
+printf '24\n' >"$nvm_dispatch_dir/alias/default"
+for fake_nvm_node in "$nvm_old_bin/node" "$nvm_new_bin/node"; do
+  cat >"$fake_nvm_node" <<'SH'
+#!/usr/bin/env bash
+script="$1"
+shift
+exec bash "$script" "$@"
+SH
+done
+cat >"$nvm_old_bin/codex" <<'SH'
+#!/usr/bin/env node
+exit 99
+SH
+cat >"$nvm_new_bin/codex" <<'SH'
+#!/usr/bin/env node
+if [ "${1:-}" = --version ]; then
+  printf 'codex fixture\n'
+  exit 0
+fi
+printf '%s\n' "${1:-}" >>"$FAKE_CODEX_CALLS"
+worktree=""
+result=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -C) worktree="$2"; shift 2 ;;
+    -o) result="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+printf 'implemented through nvm\n' >"$worktree/generated.txt"
+printf 'Synthetic nvm implementation completed.\n' >"$result"
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":50,"reasoning_output_tokens":10}}'
+SH
+chmod +x "$nvm_old_bin/node" "$nvm_new_bin/node" \
+  "$nvm_old_bin/codex" "$nvm_new_bin/codex"
+
+fake_running_systemd="$implement_bin/systemd-run-exec"
+cat >"$fake_running_systemd" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$@" >"$FAKE_SYSTEMD_ARGS"
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --setenv)
+      export "$2"
+      shift 2
+      ;;
+    --unit|--description|--property)
+      shift 2
+      ;;
+    --user|--collect|--no-block)
+      shift
+      ;;
+    *)
+      exec "$@"
+      ;;
+  esac
+done
+exit 2
+SH
+chmod +x "$fake_running_systemd"
+
+nvm_dispatch_candidate="$implement_fixture/nvm-dispatch-candidate.json"
+cat >"$nvm_dispatch_candidate" <<'JSON'
+{"schema_version":1,"item_id":"example-org/example-repo#127","repository":"example-org/example-repo","item_ref":"#127","branch_name":"feat/127-placeholder","spec":"Implement through an nvm-only Codex fixture.","acceptance_criteria":["The generated placeholder file exists."],"constraints":["Use placeholder data only."]}
+JSON
+nvm_dispatch_order="$(
+  CLAUDE_CONFIG_DIR="$implement_config" \
+    MANDATE_TRACE_TIME="2026-08-11T03:02:00Z" \
+    bash "$PLUGIN_ROOT/scripts/work-order.sh" create "$nvm_dispatch_candidate"
+)"
+nvm_dispatch_order_id="$(jq -r '.order_id' "$nvm_dispatch_order")"
+nvm_dispatch_args="$implement_fixture/nvm-systemd-args"
+nvm_codex_calls="$implement_fixture/nvm-codex-calls"
+nvm_dispatch_unit="$(
+  env -u CODEX_BIN \
+    HOME="$nvm_dispatch_home" NVM_DIR="$nvm_dispatch_dir" \
+    PATH="/usr/bin:/bin" OSTROM_NODE_FALLBACKS="" \
+    CLAUDE_CONFIG_DIR="$implement_config" \
+    MANDATE_TRACE_TIME="2026-08-11T03:03:00Z" \
+    MANDATE_NOW_EPOCH="$cap_today_epoch" \
+    MANDATE_GH_AS_BIN="$fake_implement_gh" \
+    MANDATE_SYSTEMD_RUN_BIN="$fake_running_systemd" \
+    MANDATE_IMPLEMENTER_SOURCE_REPO="$implement_source" \
+    FAKE_GIT_REMOTE="$implement_remote" \
+    FAKE_PR_BODY="$implement_fixture/nvm-pr-body" \
+    FAKE_SYSTEMD_ARGS="$nvm_dispatch_args" \
+    FAKE_CODEX_CALLS="$nvm_codex_calls" \
+    bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$nvm_dispatch_order"
+)"
+[ -n "$nvm_dispatch_unit" ]
+grep -qx 'exec' "$nvm_codex_calls"
+grep -qx "PATH=$nvm_new_bin:/usr/bin:/bin" "$nvm_dispatch_args"
+jq -s -e --arg order_id "$nvm_dispatch_order_id" '
+  [.[] | select(.fact.order_id == $order_id)] as $rows
+  | $rows | length == 2
+  and .[0].kind == "work-dispatched"
+  and .[1].kind == "work-completed"
+  and .[0].fact.item_id == .[1].fact.item_id
+  and .[0].fact.unit_name == .[1].fact.unit_name
+' "$implement_config/ostrom/sprint.jsonl" >/dev/null
+
+# A missing Codex fails before systemd launch but still produces a terminal
+# protocol row with the stable unavailable reason. It must not masquerade as
+# an exec-status failure or create a dangling work-dispatched reservation.
+missing_dispatch_config="$implement_fixture/missing-dispatch-config"
+mkdir -p "$missing_dispatch_config/ostrom"
+missing_dispatch_candidate="$implement_fixture/missing-dispatch-candidate.json"
+cat >"$missing_dispatch_candidate" <<'JSON'
+{"schema_version":1,"item_id":"example-org/example-repo#128","repository":"example-org/example-repo","item_ref":"#128","branch_name":"feat/128-placeholder","spec":"Exercise a missing Codex fixture.","acceptance_criteria":["The failure is classified."],"constraints":["Use placeholder data only."]}
+JSON
+missing_dispatch_order="$(
+  CLAUDE_CONFIG_DIR="$missing_dispatch_config" \
+    MANDATE_TRACE_TIME="2026-08-11T03:04:00Z" \
+    bash "$PLUGIN_ROOT/scripts/work-order.sh" create "$missing_dispatch_candidate"
+)"
+set +e
+HOME="$implement_fixture/missing-home" \
+  NVM_DIR="$implement_fixture/missing-nvm" \
+  PATH="/usr/bin:/bin" OSTROM_NODE_FALLBACKS="" \
+  CODEX_BIN="missing-codex" \
+  CLAUDE_CONFIG_DIR="$missing_dispatch_config" \
+  MANDATE_TRACE_TIME="2026-08-11T03:05:00Z" \
+  MANDATE_SYSTEMD_RUN_BIN="$fake_running_systemd" \
+  FAKE_SYSTEMD_ARGS="$implement_fixture/missing-systemd-args" \
+  bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$missing_dispatch_order" \
+    >"$implement_fixture/missing.out" 2>"$implement_fixture/missing.err"
+missing_dispatch_status=$?
+set -e
+[ "$missing_dispatch_status" -eq 1 ]
+jq -s -e '
+  length == 1
+  and .[0].kind == "work-failed"
+  and .[0].fact.reason == "codex-unavailable"
+  and .[0].fact.cost_usd == 0
+' "$missing_dispatch_config/ostrom/sprint.jsonl" >/dev/null
+if grep -q 'codex-exit-' "$missing_dispatch_config/ostrom/sprint.jsonl"; then
+  echo "missing Codex was misclassified as an exec status" >&2
+  exit 1
+fi
+[ ! -e "$implement_fixture/missing-systemd-args" ]
+
+# The implementer also preserves that classification if the harness becomes
+# unexecutable between dispatch's preflight and the child process launch.
+broken_codex="$implement_fixture/broken-codex"
+cat >"$broken_codex" <<'SH'
+#!/usr/bin/env missing-node-interpreter
+SH
+chmod +x "$broken_codex"
+broken_implement_candidate="$implement_fixture/broken-implement-candidate.json"
+cat >"$broken_implement_candidate" <<'JSON'
+{"schema_version":1,"item_id":"example-org/example-repo#129","repository":"example-org/example-repo","item_ref":"#129","branch_name":"feat/129-placeholder","spec":"Exercise a harness exec failure.","acceptance_criteria":["The failure is classified."],"constraints":["Use placeholder data only."]}
+JSON
+broken_implement_order="$(
+  CLAUDE_CONFIG_DIR="$implement_config" \
+    MANDATE_TRACE_TIME="2026-08-11T03:06:00Z" \
+    bash "$PLUGIN_ROOT/scripts/work-order.sh" create "$broken_implement_candidate"
+)"
+broken_implement_order_id="$(jq -r '.order_id' "$broken_implement_order")"
+broken_implement_hash="$(bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash 'example-org/example-repo#129')"
+broken_implement_unit="ostrom-implementer-${broken_implement_hash:0:16}"
+broken_implement_lease="implementer-item-$broken_implement_hash.lease"
+CLAUDE_CONFIG_DIR="$implement_config" MANDATE_LEASE_NAME="$broken_implement_lease" \
+  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire "$broken_implement_unit" 3600 >/dev/null
+set +e
+CODEX_BIN="$broken_codex" CLAUDE_CONFIG_DIR="$implement_config" \
+  MANDATE_IMPLEMENTER_SOURCE_REPO="$implement_source" \
+  MANDATE_GH_AS_BIN="$fake_implement_gh" FAKE_GIT_REMOTE="$implement_remote" \
+  FAKE_PR_BODY="$implement_fixture/unused-broken-pr-body" \
+  bash "$PLUGIN_ROOT/scripts/implement.sh" \
+    "$broken_implement_order" "$broken_implement_unit" \
+    >"$implement_fixture/broken.out" 2>"$implement_fixture/broken.err"
+broken_implement_status=$?
+set -e
+[ "$broken_implement_status" -eq 127 ]
+jq -s -e --arg order_id "$broken_implement_order_id" '
+  [.[] | select(.fact.order_id == $order_id)] | length == 1
+  and .[0].kind == "work-failed"
+  and .[0].fact.reason == "codex-unavailable"
+' "$implement_config/ostrom/sprint.jsonl" >/dev/null
+
 # Triage itself contains no implementation route. This is an effective
 # negative assertion, so use an if block rather than `! grep` (#112).
 if grep -q 'send a bounded, single-concern change to a subagent' "$work_skill"; then
@@ -1340,6 +1532,11 @@ if grep -q 'send a bounded, single-concern change to a subagent' "$work_skill"; 
 fi
 grep -q 'scripts/work-order.sh' "$work_skill"
 grep -q 'scripts/dispatch.sh' "$work_skill"
+if grep -q 'documented Claude implementer fallback' "$work_skill"; then
+  echo "builder protocol names a Claude fallback that does not exist" >&2
+  exit 1
+fi
+grep -q 'order stays undispatched' "$work_skill"
 
 # Trace reads make the fact/narration split structural. The ordinary read
 # cannot return a top-level narration key; the principal must name the

@@ -263,7 +263,10 @@ wait "$child_pid"
 codex_status=$?
 child_pid=""
 if [ "$codex_status" -ne 0 ]; then
-  failure_reason="codex-exit-$codex_status"
+  case "$codex_status" in
+    126|127) failure_reason=codex-unavailable ;;
+    *) failure_reason="codex-exit-$codex_status" ;;
+  esac
   exit "$codex_status"
 fi
 

@@ -20,6 +20,22 @@ afterEach(() => {
 });
 
 describe("run-node shim", () => {
+  it("prints an absolute node path in resolve-only mode", () => {
+    const root = mkdtempSync(join(tmpdir(), "ostrom-node-"));
+    roots.push(root);
+    const node = join(root, "bin", "node");
+    fakeNode(node, "unused");
+
+    const result = spawnSync("bash", [shim, "--resolve-only"], {
+      env: { HOME: root, PATH: `${dirname(node)}:/usr/bin:/bin` },
+      encoding: "utf8",
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(result.stdout).toBe(`${node}\n`);
+  });
+
   it("prefers node already on PATH", () => {
     const root = mkdtempSync(join(tmpdir(), "ostrom-node-"));
     roots.push(root);
