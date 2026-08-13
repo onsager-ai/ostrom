@@ -1419,8 +1419,17 @@ else
   echo "mandate sweep: $project_count projects; $queue_changes queue changes"
 fi
 
-# Publishing is downstream of the governing sweep. A remote, auth, or merge
-# failure is reported but must never change the sweep's successful outcome.
-if ! bash "$SCRIPT_DIR/publish.sh"; then
-  echo "mandate sweep: publish failed; local records remain authoritative" >&2
-fi
+# Publishing is downstream of the governing sweep. A config guard skip is a
+# deliberate outcome distinct from publication failures; neither can change
+# the sweep's successful outcome.
+publish_status=0
+bash "$SCRIPT_DIR/publish.sh" || publish_status=$?
+case "$publish_status" in
+  0) ;;
+  3)
+    echo "mandate sweep: publish deliberately skipped by config guard; local records remain authoritative" >&2
+    ;;
+  *)
+    echo "mandate sweep: publish failed; local records remain authoritative" >&2
+    ;;
+esac
