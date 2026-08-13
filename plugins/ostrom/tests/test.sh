@@ -1289,11 +1289,54 @@ case "${FAKE_CODEX_MODE:-complete}" in
   complete)
     printf 'implemented\n' >"$worktree/generated.txt"
     printf 'Synthetic implementation completed.\n' >"$result"
-    printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":50,"reasoning_output_tokens":10}}'
+    fake_usage_json="${FAKE_CODEX_USAGE_JSON:-}"
+    if [ -z "$fake_usage_json" ]; then
+      fake_usage_json='{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":50,"reasoning_output_tokens":10}}'
+    fi
+    printf '%s\n' "$fake_usage_json"
     ;;
 esac
 SH
 chmod +x "$fake_implement_gh" "$fake_codex"
+
+run_implement_usage_case() {
+  case_number="$1"
+  case_usage="$2"
+  case_candidate="$implement_fixture/$case_number-candidate.json"
+  cat >"$case_candidate" <<JSON
+{"schema_version":1,"item_id":"example-org/example-repo#$case_number","repository":"example-org/example-repo","item_ref":"#$case_number","branch_name":"fix/$case_number-placeholder","spec":"Exercise synthetic token accounting.","acceptance_criteria":["Token accounting matches the reported components."],"constraints":["Use placeholder data only."]}
+JSON
+  IMPLEMENT_CASE_ORDER="$(
+    CLAUDE_CONFIG_DIR="$implement_config" \
+      MANDATE_TRACE_TIME="2026-08-11T03:00:15Z" \
+      bash "$PLUGIN_ROOT/scripts/work-order.sh" create "$case_candidate"
+  )"
+  IMPLEMENT_CASE_ORDER_ID="$(jq -r '.order_id' "$IMPLEMENT_CASE_ORDER")"
+  IMPLEMENT_CASE_HASH="$(
+    bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash \
+      "example-org/example-repo#$case_number"
+  )"
+  IMPLEMENT_CASE_UNIT="ostrom-implementer-${IMPLEMENT_CASE_HASH:0:16}"
+  IMPLEMENT_CASE_LEASE="implementer-item-$IMPLEMENT_CASE_HASH.lease"
+  IMPLEMENT_CASE_WORKTREE="$implement_config/ostrom/implementer-worktrees/$IMPLEMENT_CASE_HASH"
+  CLAUDE_CONFIG_DIR="$implement_config" \
+    MANDATE_LEASE_NAME="$IMPLEMENT_CASE_LEASE" \
+    bash "$PLUGIN_ROOT/scripts/lease.sh" acquire \
+      "$IMPLEMENT_CASE_UNIT" 3600 >/dev/null
+  set +e
+  FAKE_CODEX_USAGE_JSON="$case_usage" \
+    CODEX_BIN="$fake_codex" CLAUDE_CONFIG_DIR="$implement_config" \
+    MANDATE_IMPLEMENTER_SOURCE_REPO="$implement_source" \
+    MANDATE_GH_AS_BIN="$fake_implement_gh" FAKE_GIT_REMOTE="$implement_remote" \
+    FAKE_PR_BODY="$implement_fixture/$case_number-pr-body" \
+    bash "$PLUGIN_ROOT/scripts/implement.sh" \
+      "$IMPLEMENT_CASE_ORDER" "$IMPLEMENT_CASE_UNIT" \
+      >"$implement_fixture/$case_number.out" \
+      2>"$implement_fixture/$case_number.err"
+  IMPLEMENT_CASE_STATUS=$?
+  set -e
+  [ ! -e "$implement_config/ostrom/$IMPLEMENT_CASE_LEASE" ]
+}
 
 # The fake must reject a recognized flag whose config payload is not on the
 # pinned-CLI allow-list, rather than treating every -c argument as valid.
@@ -1486,6 +1529,81 @@ jq -s -e '
   and .[-1].fact.reason == null
   and (.[-1].fact.cost_usd | type == "number" and . > 0 and . < 20)
   and .[-1].fact.usage.output_tokens == 50
+' "$implement_config/ostrom/sprint.jsonl" >/dev/null
+
+# #135: cached input is one tenth the price of fresh input. These observed
+# counts are 96.7% cached and weigh 135,356, below the 500,000 ceiling; the
+# old single-input formula weighs 894,110 and rejects the completed work.
+run_implement_usage_case 134 \
+  '{"type":"turn.completed","usage":{"input_tokens":4360176,"cached_input_tokens":4215296,"output_tokens":22074,"reasoning_output_tokens":0}}'
+[ "$IMPLEMENT_CASE_STATUS" -eq 0 ]
+jq -s -e --arg order_id "$IMPLEMENT_CASE_ORDER_ID" '
+  [.[] | select(.fact.order_id == $order_id)] | length == 1
+  and .[0].kind == "work-completed"
+  and .[0].fact.weighted_tokens == 135356
+  and .[0].fact.usage.fresh_input_tokens == 144880
+  and .[0].fact.usage.cached_input_tokens == 4215296
+  and .[0].fact.usage.output_tokens == 22074
+  and .[0].fact.usage.cached_input_tokens_available == true
+' "$implement_config/ostrom/sprint.jsonl" >/dev/null
+
+# A large genuinely-fresh run still breaches. The failure row preserves all
+# measured components and the dirty worktree so its completed diff is usable.
+run_implement_usage_case 135 \
+  '{"type":"turn.completed","usage":{"input_tokens":4360176,"cached_input_tokens":0,"output_tokens":22074,"reasoning_output_tokens":0}}'
+[ "$IMPLEMENT_CASE_STATUS" -eq 1 ]
+[ -f "$IMPLEMENT_CASE_WORKTREE/generated.txt" ]
+[ -n "$(git -C "$IMPLEMENT_CASE_WORKTREE" status --porcelain)" ]
+if git --git-dir="$implement_remote" show-ref --verify \
+  refs/heads/fix/135-placeholder >/dev/null 2>&1; then
+  echo "over-ceiling implementation was pushed" >&2
+  exit 1
+fi
+if [ -e "$implement_fixture/135-pr-body" ]; then
+  echo "over-ceiling implementation opened a pull request" >&2
+  exit 1
+fi
+jq -s -e \
+  --arg order_id "$IMPLEMENT_CASE_ORDER_ID" \
+  --arg worktree_path "$IMPLEMENT_CASE_WORKTREE" '
+  [.[] | select(.fact.order_id == $order_id)] | length == 1
+  and .[0].kind == "work-failed"
+  and .[0].fact.reason == "token-ceiling-exceeded"
+  and .[0].fact.weighted_tokens == 894110
+  and .[0].fact.usage.fresh_input_tokens == 4360176
+  and .[0].fact.usage.cached_input_tokens == 0
+  and .[0].fact.usage.output_tokens == 22074
+  and .[0].fact.usage.cached_input_tokens_available == true
+  and .[0].fact.worktree_path == $worktree_path
+' "$implement_config/ostrom/sprint.jsonl" >/dev/null
+
+# A harness that omits cached_input_tokens produces an explicit unknown split.
+# The ceiling calculation uses the conservative upper bound that all reported
+# input was fresh, instead of presenting cached=0 as a measurement.
+run_implement_usage_case 136 \
+  '{"type":"turn.completed","usage":{"input_tokens":3000000,"output_tokens":0,"reasoning_output_tokens":0}}'
+[ "$IMPLEMENT_CASE_STATUS" -eq 1 ]
+jq -s -e --arg order_id "$IMPLEMENT_CASE_ORDER_ID" '
+  [.[] | select(.fact.order_id == $order_id)] | length == 1
+  and .[0].kind == "work-failed"
+  and .[0].fact.reason == "token-ceiling-exceeded"
+  and .[0].fact.weighted_tokens == 600000
+  and .[0].fact.usage.fresh_input_tokens == null
+  and .[0].fact.usage.cached_input_tokens == null
+  and .[0].fact.usage.output_tokens == 0
+  and .[0].fact.usage.cached_input_tokens_available == false
+' "$implement_config/ostrom/sprint.jsonl" >/dev/null
+
+# A malformed harness report cannot make fresh input or the weight negative.
+run_implement_usage_case 137 \
+  '{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":200,"output_tokens":0,"reasoning_output_tokens":0}}'
+[ "$IMPLEMENT_CASE_STATUS" -eq 0 ]
+jq -s -e --arg order_id "$IMPLEMENT_CASE_ORDER_ID" '
+  [.[] | select(.fact.order_id == $order_id)] | length == 1
+  and .[0].kind == "work-completed"
+  and .[0].fact.weighted_tokens == 4
+  and .[0].fact.usage.fresh_input_tokens == 0
+  and .[0].fact.usage.cached_input_tokens == 200
 ' "$implement_config/ostrom/sprint.jsonl" >/dev/null
 
 # #123: dispatch must find Codex when it exists only inside nvm, give the

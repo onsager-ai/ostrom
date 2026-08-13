@@ -46,24 +46,57 @@ terminal_written=0
 failure_reason="implementer-exited"
 pr_url=""
 events_file=""
+worktree_root=""
 
 usage_fact() {
   if [ -n "$events_file" ] && [ -s "$events_file" ]; then
     jq -Rn '
       reduce inputs as $line
-        ({input_tokens: 0, cached_input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0};
+        ({input_tokens: 0, cached_input_tokens: 0, output_tokens: 0,
+          reasoning_output_tokens: 0, cached_input_tokens_available: true,
+          completed_turns: 0};
           ($line | try fromjson catch null) as $event
           | if (($event | type) == "object") and $event.type == "turn.completed"
               and (($event.usage | type) == "object")
-            then .input_tokens += ($event.usage.input_tokens // 0)
-              | .cached_input_tokens += ($event.usage.cached_input_tokens // 0)
+            then .completed_turns += 1
+              | .input_tokens += ($event.usage.input_tokens // 0)
+              | if (($event.usage.cached_input_tokens? | type) == "number")
+                then .cached_input_tokens += $event.usage.cached_input_tokens
+                else .cached_input_tokens_available = false
+                end
               | .output_tokens += ($event.usage.output_tokens // 0)
               | .reasoning_output_tokens += ($event.usage.reasoning_output_tokens // 0)
             else . end)
-    ' "$events_file" 2>/dev/null || printf '{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0}\n'
+      | if .completed_turns == 0 or (.cached_input_tokens_available | not)
+        then .fresh_input_tokens = null
+          | .cached_input_tokens = null
+          | .cached_input_tokens_available = false
+        else .fresh_input_tokens = ([.input_tokens - .cached_input_tokens, 0] | max)
+        end
+      | del(.completed_turns)
+    ' "$events_file" 2>/dev/null || printf '%s\n' \
+      '{"input_tokens":0,"fresh_input_tokens":null,"cached_input_tokens":null,"output_tokens":0,"reasoning_output_tokens":0,"cached_input_tokens_available":false}'
   else
-    printf '{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0}\n'
+    printf '%s\n' \
+      '{"input_tokens":0,"fresh_input_tokens":null,"cached_input_tokens":null,"output_tokens":0,"reasoning_output_tokens":0,"cached_input_tokens_available":false}'
   fi
+}
+
+weighted_token_count() {
+  # OpenAI prices GPT-5-Codex cached input at $0.125/M versus $1.25/M
+  # fresh input (1:10):
+  # https://developers.openai.com/api/docs/models/gpt-5-codex
+  # Apply that ratio to Ostrom's 0.2 fresh weight, giving cached input 0.02.
+  # If the harness omits the cached count, use the explicit upper bound that
+  # all input was fresh; usage_fact records the component split as unknown.
+  jq '
+    (if .cached_input_tokens_available
+      then ((.fresh_input_tokens // 0) * 0.2
+        + (.cached_input_tokens // 0) * 0.02)
+      else ((.input_tokens // 0) * 0.2)
+      end
+      + (.output_tokens // 0)) | ceil
+  '
 }
 
 append_terminal() {
@@ -73,9 +106,7 @@ append_terminal() {
   duration_seconds=$((end_epoch - start_epoch))
   [ "$duration_seconds" -ge 0 ] || duration_seconds=0
   usage="$(usage_fact)"
-  weighted_tokens="$(jq '
-    ((.input_tokens // 0) * 0.2 + (.output_tokens // 0)) | ceil
-  ' <<<"$usage")"
+  weighted_tokens="$(weighted_token_count <<<"$usage")"
   # schema_version 1 cost_usd is Ostrom's normalized order-cost estimate:
   # weighted_tokens / token_ceiling * cost_ceiling_usd. It is numeric on
   # terminal rows (including zero before the first completed turn), never a
@@ -91,16 +122,21 @@ append_terminal() {
     --arg unit_name "$unit_name" --arg backend "$dispatch_backend" \
     --argjson cost_ceiling_usd "$cost_ceiling_usd" \
     --argjson token_ceiling "$token_ceiling" \
+    --argjson weighted_tokens "$weighted_tokens" \
     --argjson cost_usd "$cost_usd" \
     --argjson duration_seconds "$duration_seconds" \
     --arg pr_url "$pr_url" --arg reason "$reason" \
+    --arg worktree_path "$worktree_root" \
     --argjson usage "$usage" \
     '{schema_version: 1, item_id: $item_id, order_id: $order_id,
       unit_name: $unit_name, backend: $backend,
       cost_ceiling_usd: $cost_ceiling_usd, token_ceiling: $token_ceiling,
-      cost_usd: $cost_usd, duration_seconds: $duration_seconds,
+      weighted_tokens: $weighted_tokens, cost_usd: $cost_usd,
+      duration_seconds: $duration_seconds,
       pr_url: (if $pr_url == "" then null else $pr_url end),
       reason: (if $reason == "" then null else $reason end),
+      worktree_path: (if $reason == "token-ceiling-exceeded"
+        and $worktree_path != "" then $worktree_path else null end),
       usage: $usage}')"
   if bash "$SCRIPT_DIR/trace.sh" append "$kind" "$terminal_fact" '{}' >/dev/null; then
     terminal_written=1
@@ -285,9 +321,7 @@ if [ "$codex_status" -ne 0 ]; then
 fi
 
 usage="$(usage_fact)"
-weighted_tokens="$(jq '
-  ((.input_tokens // 0) * 0.2 + (.output_tokens // 0)) | ceil
-' <<<"$usage")"
+weighted_tokens="$(weighted_token_count <<<"$usage")"
 if [ "$weighted_tokens" -gt "$token_ceiling" ]; then
   failure_reason=token-ceiling-exceeded
   exit 1
