@@ -240,11 +240,10 @@ principal and must not be dispatched again.
 
 Codex is the default harness. If a terminal `work-failed` row says
 `codex-unavailable`, or its unit journal shows a Codex authentication failure,
-do not silently retry the same unavailable harness. Report the order for the
-documented Claude implementer fallback, preserving the same order file,
-per-item lease name, trace shapes, worktree isolation, bounds, and
-`Ostrom-Role: builder` markers. Harness fallback changes execution only; it
-never changes the durable dispatch contract.
+do not silently retry the same unavailable harness. No Claude implementer
+fallback currently exists. The order stays undispatched; report the order and
+failure so the unavailable harness can be repaired or separate fallback work
+can be authorized.
 
 After every item attempted, append exactly one `item-worked` record before
 moving on, including failed and blocked dispatches. Its fact object carries the

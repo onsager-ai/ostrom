@@ -23,6 +23,7 @@ GH_AS_BIN="${MANDATE_GH_AS_BIN:-$SCRIPT_DIR/gh-as.sh}"
 SYSTEMD_RUN_BIN="${MANDATE_SYSTEMD_RUN_BIN:-systemd-run}"
 IMPLEMENTER_BIN="${MANDATE_IMPLEMENTER_BIN:-$SCRIPT_DIR/implement.sh}"
 CODEX_COMMAND="${CODEX_BIN:-codex}"
+backend="${MANDATE_DISPATCH_BACKEND:-systemd}"
 
 usage() {
   echo "usage: dispatch.sh <work-order-file>" >&2
@@ -41,10 +42,82 @@ cost_ceiling_usd="$(jq -r '.cost_ceiling_usd' "$order_file")"
 token_ceiling="$(jq -r '.token_ceiling' "$order_file")"
 item_hash="$(bash "$SCRIPT_DIR/work-order.sh" item-hash "$item_id")"
 unit_name="ostrom-implementer-${item_hash:0:16}"
-resolved_codex_bin="$(command -v "$CODEX_COMMAND" 2>/dev/null)" || {
-  echo "ostrom dispatch: Codex is unavailable: $CODEX_COMMAND was not found" >&2
+
+append_dispatch_failure() {
+  local reason="$1"
+  local duration_seconds="${2:-0}"
+  local failed_fact
+  failed_fact="$(jq -cn \
+    --arg item_id "$item_id" --arg order_id "$order_id" \
+    --arg unit_name "$unit_name" --arg backend "$backend" \
+    --argjson cost_ceiling_usd "$cost_ceiling_usd" \
+    --argjson token_ceiling "$token_ceiling" \
+    --argjson duration_seconds "$duration_seconds" \
+    --arg reason "$reason" \
+    '{schema_version: 1, item_id: $item_id, order_id: $order_id,
+      unit_name: $unit_name, backend: $backend,
+      cost_ceiling_usd: $cost_ceiling_usd, token_ceiling: $token_ceiling,
+      cost_usd: 0, duration_seconds: $duration_seconds,
+      pr_url: null, reason: $reason,
+      usage: {input_tokens: 0, cached_input_tokens: 0,
+        output_tokens: 0, reasoning_output_tokens: 0}}')"
+  bash "$SCRIPT_DIR/trace.sh" append work-failed "$failed_fact" '{}' >/dev/null
+}
+
+codex_unavailable() {
+  local detail="$1"
+  append_dispatch_failure codex-unavailable ||
+    echo "ostrom dispatch: could not record work-failed" >&2
+  echo "ostrom dispatch: Codex is unavailable: $detail" >&2
   exit 1
 }
+
+absolute_executable() {
+  local candidate="$1"
+  local candidate_dir candidate_name
+  [ -x "$candidate" ] || return 1
+  case "$candidate" in
+    /*) printf '%s\n' "$candidate" ;;
+    *)
+      candidate_dir="$(dirname "$candidate")"
+      candidate_name="$(basename "$candidate")"
+      candidate_dir="$(cd -P "$candidate_dir" 2>/dev/null && pwd)" || return 1
+      printf '%s/%s\n' "$candidate_dir" "$candidate_name"
+      ;;
+  esac
+}
+
+resolve_codex() {
+  local candidate nvm_dir
+  candidate="$(command -v "$CODEX_COMMAND" 2>/dev/null)" || candidate=""
+  if [ -n "$candidate" ]; then
+    absolute_executable "$candidate" && return 0
+  fi
+
+  # An explicit path is authoritative. Bare command names also search nvm's
+  # installed versions because non-interactive sessions do not load nvm.
+  case "$CODEX_COMMAND" in */*) return 1 ;; esac
+  nvm_dir="${NVM_DIR:-$HOME/.nvm}"
+  while IFS= read -r candidate; do
+    absolute_executable "$candidate" && return 0
+  done < <(printf '%s\n' "$nvm_dir"/versions/node/*/bin/"$CODEX_COMMAND" | LC_ALL=C sort -Vr)
+  return 1
+}
+
+resolved_codex_bin="$(resolve_codex)" ||
+  codex_unavailable "$CODEX_COMMAND was not found"
+resolved_node_bin="$(bash "$SCRIPT_DIR/run-node.sh" --resolve-only 2>/dev/null)" ||
+  codex_unavailable "Node.js could not be resolved for $resolved_codex_bin"
+node_bin_dir="$(dirname "$resolved_node_bin")"
+inherited_path="${PATH:-/usr/local/bin:/usr/bin:/bin}"
+unit_path="$node_bin_dir:$inherited_path"
+
+# Exercise the resolved executable with exactly the PATH the transient unit
+# receives. This catches an env shebang whose interpreter exists for neither
+# the user manager nor the accepted Codex path before reserving a dispatch.
+if ! PATH="$unit_path" "$resolved_codex_bin" --version >/dev/null 2>&1; then
+  codex_unavailable "$resolved_codex_bin cannot execute with resolved Node $resolved_node_bin"
+fi
 
 # Lease naming is a durable interoperability contract: every implementation
 # derives `implementer-item-<lowercase sha256(item_id)>.lease`. It is per item,
@@ -167,7 +240,6 @@ if [ "$(jq -n --argjson projected "$projected_spend" --argjson cap "$daily_cap_u
   exit 3
 fi
 
-backend="${MANDATE_DISPATCH_BACKEND:-systemd}"
 case "$backend" in
   systemd) ;;
   *)
@@ -209,26 +281,14 @@ if ! "$SYSTEMD_RUN_BIN" --user \
   --setenv "MANDATE_MAX_IMPLEMENTERS=$max_implementers" \
   --setenv "MANDATE_DISPATCH_BACKEND=$backend" \
   --setenv "CODEX_BIN=$resolved_codex_bin" \
+  --setenv "PATH=$unit_path" \
   "$IMPLEMENTER_BIN" "$order_file" "$unit_name"; then
   trap 'release_dispatch_lease; exit 129' HUP
   trap 'release_dispatch_lease; exit 130' INT
   trap 'release_dispatch_lease; exit 143' TERM
   dispatch_duration=$(( $(date +%s) - dispatch_started ))
   [ "$dispatch_duration" -ge 0 ] || dispatch_duration=0
-  failed_fact="$(jq -cn \
-    --arg item_id "$item_id" --arg order_id "$order_id" \
-    --arg unit_name "$unit_name" --arg backend "$backend" \
-    --argjson cost_ceiling_usd "$cost_ceiling_usd" \
-    --argjson token_ceiling "$token_ceiling" \
-    --argjson duration_seconds "$dispatch_duration" \
-    '{schema_version: 1, item_id: $item_id, order_id: $order_id,
-      unit_name: $unit_name, backend: $backend,
-      cost_ceiling_usd: $cost_ceiling_usd, token_ceiling: $token_ceiling,
-      cost_usd: 0, duration_seconds: $duration_seconds,
-      pr_url: null, reason: "dispatch-failed",
-      usage: {input_tokens: 0, cached_input_tokens: 0,
-        output_tokens: 0, reasoning_output_tokens: 0}}')"
-  bash "$SCRIPT_DIR/trace.sh" append work-failed "$failed_fact" '{}' >/dev/null || true
+  append_dispatch_failure dispatch-failed "$dispatch_duration" || true
   echo "ostrom dispatch: systemd backend failed to launch $unit_name" >&2
   exit 1
 fi
