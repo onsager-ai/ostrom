@@ -51,6 +51,33 @@ case "$action" in
       exit 2
     fi
 
+    # Cutover 2026-08-13: historical item-worked rows may carry the stable
+    # item_hash in order_id and remain readable, but new rows must use an
+    # order_id taken from the contents of a durable work-order file. The two
+    # hashes are unrelated, so accepting an unresolvable value would make
+    # cross-kind trace joins silently meaningless.
+    if [ "$kind" = "item-worked" ] && jq -e 'has("order_id")' >/dev/null <<<"$fact_json"; then
+      if ! jq -e '.order_id | type == "string" and length > 0' >/dev/null <<<"$fact_json"; then
+        echo "mandate trace: item-worked order_id must be a non-empty string from a work order's order_id field" >&2
+        exit 2
+      fi
+      order_id="$(jq -r '.order_id' <<<"$fact_json")"
+      order_id_found=0
+      for order_file in "$MANDATE_DATA_DIR"/work-orders/*.json; do
+        [ -f "$order_file" ] || continue
+        if jq -e --arg order_id "$order_id" \
+          'type == "object" and .order_id == $order_id' \
+          "$order_file" >/dev/null 2>&1; then
+          order_id_found=1
+          break
+        fi
+      done
+      if [ "$order_id_found" -ne 1 ]; then
+        echo "mandate trace: item-worked order_id '$order_id' matches no work order's order_id field" >&2
+        exit 2
+      fi
+    fi
+
     record="$(
       jq -cn \
         --arg ts "${MANDATE_TRACE_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" \

@@ -249,17 +249,33 @@ After every item attempted, append exactly one `item-worked` record before
 moving on, including failed and blocked dispatches. Its fact object carries the
 owner, durable item pointer, action (`work-order-dispatch`), outcome, and every
 external return used in the report. Add `order_id`, `order_file`, `unit_name`,
-or `exit_code` when observed; do not hide them in narration. For example:
+or `exit_code` when observed; do not hide them in narration. When an order
+file exists, `order_id` comes only from the `order_id` field in that file's
+contents. Read it exactly this way:
+
+```sh
+order_id="$(jq -r '.order_id' "$order_file")"
+```
+
+Do not derive `order_id` from the order filename. Its stem is `item_hash`, the
+sha256 of `item_id`, and stays stable across replacement orders for that item.
+For example:
 
 ```sh
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/trace.sh" append item-worked \
   "$(jq -cn --arg owner "$lease_owner" --arg repo "$repository" \
     --arg ref "$item_ref" --arg action "$item_action" \
-    --arg outcome "$item_outcome" \
+    --arg outcome "$item_outcome" --arg order_id "$order_id" \
+    --arg order_file "$order_file" --arg unit_name "$unit_name" \
     '{owner: $owner, repo: $repo, ref: $ref, action: $action,
-      outcome: $outcome}')" \
+      outcome: $outcome, order_id: $order_id, order_file: $order_file,
+      unit_name: $unit_name}')" \
   "$item_narration"
 ```
+
+The trace contract cut over on 2026-08-13. Rows written before that date with
+`item_hash` in `order_id` are retained and still parse; they are not backfilled
+because the real historical order ID cannot be derived from `item_hash`.
 
 Use `{}` for `item_narration` when no reasoning is needed. Increment the
 worked-item count only after this append succeeds. Report the order and unit,

@@ -120,9 +120,9 @@ if ! PATH="$unit_path" "$resolved_codex_bin" --version >/dev/null 2>&1; then
 fi
 
 # Lease naming is a durable interoperability contract: every implementation
-# derives `implementer-item-<lowercase sha256(item_id)>.lease`. It is per item,
-# never per role or dispatch attempt, so Bash and Rust dispatchers exclude one
-# another safely during cutover.
+# derives `implementer-item-<item_hash>.lease`, where item_hash is lowercase
+# sha256(item_id). It is per item, never per role or dispatch attempt, so Bash
+# and Rust dispatchers exclude one another safely during cutover.
 lease_name="implementer-item-$item_hash.lease"
 lease_owner="$unit_name"
 lease_acquired=0
