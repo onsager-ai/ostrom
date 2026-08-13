@@ -83,6 +83,46 @@ grep -q 'Never infer concurrency or lease' "$gatekeep_skill"
 for trace_kind in pass-started item-selected pass-ended; do
   grep -q "trace.sh\" append $trace_kind" "$gatekeep_skill"
 done
+
+# #151: one repository's token-mint failure is a visible, bounded skip rather
+# than the end of the whole gatekeeper pass. These are protocol-contract tests
+# because gatekeeping is implemented by gatekeep/SKILL.md rather than by a
+# driver script. The continuation assertion is the regression case: the old
+# protocol said to stop the iteration and therefore fails this check.
+if grep -Fq 'stop this iteration' "$gatekeep_skill"; then
+  echo "gatekeeper protocol must distinguish a repository skip from ending the pass" >&2
+  exit 1
+fi
+grep -Fq 'exact same `gh-as.sh` invocation once immediately' \
+  "$gatekeep_skill"
+grep -Fq 'continue to the next repository' "$gatekeep_skill"
+grep -Fq 'Continue enumerating every other roster repository' "$gatekeep_skill"
+grep -Fq 'Judge every candidate gathered' "$gatekeep_skill"
+grep -Fq 'even when `skipped_repos` is not' "$gatekeep_skill"
+
+# A skip is reported both to the principal and in the terminal fact. The
+# completed count remains independent of the skipped-repository list, and a
+# pass that reaches the end with skips has the explicit non-error outcome.
+grep -Fq 'repository once to `skipped_repos`' "$gatekeep_skill"
+grep -Fq -- '--argjson completed "$completed_candidates"' "$gatekeep_skill"
+grep -Fq -- '--argjson skipped "$skipped_repos"' "$gatekeep_skill"
+grep -Fq 'skipped_repos: $skipped' "$gatekeep_skill"
+if grep -Fq 'failed_repo' "$gatekeep_skill"; then
+  echo "gatekeeper terminal fact must carry skipped_repos, not one failed_repo" >&2
+  exit 1
+fi
+grep -Fq 'existing outcome `completed`' "$gatekeep_skill"
+grep -Fq 'Use outcome `partial`' "$gatekeep_skill"
+grep -Fq 'a productive pass with skips is not' "$gatekeep_skill"
+
+# Missing or malformed credentials are session-wide, not a repository skip:
+# they still end the pass. Neither that path nor the retry/skip path may ever
+# escape the App blast radius through an ambient principal credential.
+grep -Fq '**Credentials cannot be loaded at all.**' "$gatekeep_skill"
+grep -Fq 'outcome to `error`' "$gatekeep_skill"
+grep -Fq 'release the lease, and end the' "$gatekeep_skill"
+grep -Fq '**No exit-`111` path may run the command under an ambient credential' \
+  "$gatekeep_skill"
 for trace_kind in artifact-produced gate-verdict-consumed; do
   grep -q "trace.sh\" append $trace_kind" "$merge_skill"
 done
