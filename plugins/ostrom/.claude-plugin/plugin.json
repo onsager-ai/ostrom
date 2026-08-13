@@ -1,5 +1,5 @@
 {
   "name": "ostrom",
   "description": "Agent-workflow conventions and portfolio steering: layered rules, /ostrom:touch capture, /ostrom:doctor diagnostics, daily GitHub sweeps, a private pointer queue, tripwire dossiers, and /ostrom:brief, /ostrom:desk, /ostrom:work, /ostrom:merge, and /ostrom:gatekeep surfaces.",
-  "version": "1.21.0"
+  "version": "1.22.0"
 }
