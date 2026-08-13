@@ -1075,9 +1075,42 @@ jq -e '
 fake_dispatch_gh="$dispatch_bin/gh-as"
 cat >"$fake_dispatch_gh" <<'SH'
 #!/usr/bin/env bash
-if [ "${FAKE_OPEN_PR:-0}" -eq 1 ]; then
-  printf '%s\n' '[{"number":77,"body":"Closes example-org/example-repo#123","url":"https://example.test/pull/77"}]'
-else
+if [ -n "${FAKE_GH_CALLS:-}" ]; then
+  printf '%s\n' "$*" >>"$FAKE_GH_CALLS"
+fi
+if [ "$4" = api ] && [ "$5" = --paginate ] && [ "$6" = --slurp ]; then
+  if [ "${FAKE_REMOTE_QUERY_FAIL:-0}" -eq 1 ]; then
+    exit 42
+  fi
+  if [ -n "${FAKE_REMOTE_BRANCH_NAME:-}" ]; then
+    jq -cn \
+      --arg main_sha "${FAKE_DEFAULT_SHA:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" \
+      --arg branch_name "$FAKE_REMOTE_BRANCH_NAME" \
+      --arg branch_sha "${FAKE_REMOTE_BRANCH_SHA:-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}" \
+      '[[{name:"main",commit:{sha:$main_sha}},
+        {name:$branch_name,commit:{sha:$branch_sha}}]]'
+  else
+    printf '%s\n' '[[{"name":"main","commit":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]]'
+  fi
+  exit 0
+fi
+if [ "$4" = repo ] && [ "$5" = view ]; then
+  printf '%s\n' main
+  exit 0
+fi
+if [ "$4" = api ] && [[ "$5" == repos/*/compare/* ]]; then
+  printf '%s\n' "${FAKE_REMOTE_AHEAD:-0}"
+  exit 0
+fi
+if [ "$4" = pr ] && [ "$5" = list ]; then
+  if [ "${FAKE_OPEN_PR:-0}" -eq 1 ]; then
+    printf '%s\n' '[{"number":77,"body":"Closes example-org/example-repo#123","url":"https://example.test/pull/77"}]'
+  else
+    printf '%s\n' '[]'
+  fi
+  exit 0
+fi
+if [ "${FAKE_OPEN_PR:-0}" -ne 1 ]; then
   printf '%s\n' '[]'
 fi
 SH
@@ -1095,6 +1128,140 @@ SH
 chmod +x "$fake_dispatch_gh" "$fake_systemd_run" "$fake_dispatch_codex"
 dispatch_args="$dispatch_fixture/systemd-args"
 dispatch_calls="$dispatch_fixture/systemd-calls"
+: >"$dispatch_calls"
+
+# #153: a remote branch is durable work even without a pull request. The
+# branch read, default lookup, and comparison all use the builder wrapper;
+# rejection precedes the lease and the work-dispatched reservation.
+branch_guard_config="$dispatch_fixture/branch-guard-config"
+branch_guard_gh_calls="$dispatch_fixture/branch-guard-gh-calls"
+branch_guard_stderr="$dispatch_fixture/branch-guard.err"
+mkdir -p "$branch_guard_config/ostrom"
+set +e
+FAKE_REMOTE_BRANCH_NAME="$dispatch_branch" \
+  FAKE_REMOTE_BRANCH_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+  FAKE_REMOTE_AHEAD=4 FAKE_GH_CALLS="$branch_guard_gh_calls" \
+  CLAUDE_CONFIG_DIR="$branch_guard_config" \
+  MANDATE_TRACE_TIME="2026-08-11T02:00:30Z" \
+  MANDATE_NOW_EPOCH="$cap_today_epoch" \
+  MANDATE_GH_AS_BIN="$fake_dispatch_gh" \
+  MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
+  CODEX_BIN="$fake_dispatch_codex" \
+  FAKE_SYSTEMD_ARGS="$dispatch_args" FAKE_SYSTEMD_CALLS="$dispatch_calls" \
+  bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$dispatch_order" \
+    >"$dispatch_fixture/branch-guard.out" 2>"$branch_guard_stderr"
+branch_guard_status=$?
+set -e
+if [ "$branch_guard_status" -ne 3 ]; then
+  echo "remote branch guard did not exit 3" >&2
+  exit 1
+fi
+branch_guard_item_hash="$(
+  bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash \
+    'example-org/example-repo#123'
+)"
+if [ -e "$branch_guard_config/ostrom/implementer-item-$branch_guard_item_hash.lease" ]; then
+  echo "remote branch guard leaked an implementer lease" >&2
+  exit 1
+fi
+if [ -s "$dispatch_calls" ]; then
+  echo "remote branch guard launched a systemd unit" >&2
+  exit 1
+fi
+if jq -s -e 'any(.[]; .kind == "work-dispatched")' \
+  "$branch_guard_config/ostrom/sprint.jsonl" >/dev/null; then
+  echo "remote branch guard reserved concurrency or cost" >&2
+  exit 1
+fi
+if jq -s -e --arg branch "$dispatch_branch" '
+  length != 1
+  or .[0].kind != "work-failed"
+  or .[0].fact.reason != "branch-already-pushed"
+  or .[0].fact.repository != "example-org/example-repo"
+  or .[0].fact.branch_name != $branch
+  or .[0].fact.head_sha != "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  or .[0].fact.ahead_of_default != 4
+' "$branch_guard_config/ostrom/sprint.jsonl" >/dev/null; then
+  echo "remote branch guard did not record the required work-failed detail" >&2
+  exit 1
+fi
+expected_branch_guard_error="repository=example-org/example-repo branch=$dispatch_branch head=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ahead=4"
+if [ "$(grep -Fc "$expected_branch_guard_error" "$branch_guard_stderr")" -ne 1 ]; then
+  echo "remote branch guard stderr omitted branch detail" >&2
+  exit 1
+fi
+if [ "$(grep -Fc 'builder example-org/example-repo gh api --paginate --slurp repos/example-org/example-repo/branches?per_page=100' "$branch_guard_gh_calls")" -ne 1 ]; then
+  echo "remote branch guard did not query branches through the builder wrapper" >&2
+  exit 1
+fi
+if [ "$(grep -c '^builder example-org/example-repo gh ' "$branch_guard_gh_calls")" -ne "$(wc -l <"$branch_guard_gh_calls" | tr -d '[:space:]')" ]; then
+  echo "remote branch guard made a remote read outside the builder wrapper" >&2
+  exit 1
+fi
+
+# A branch with the item number at the start of a path component matches the
+# deterministic ostrom/<number>-... position even when its wording predates
+# the order's derived branch name.
+set +e
+FAKE_REMOTE_BRANCH_NAME='chore/123-existing-work' \
+  FAKE_REMOTE_BRANCH_SHA=cccccccccccccccccccccccccccccccccccccccc \
+  FAKE_REMOTE_AHEAD=2 CLAUDE_CONFIG_DIR="$branch_guard_config" \
+  MANDATE_TRACE_TIME="2026-08-11T02:00:31Z" \
+  MANDATE_NOW_EPOCH="$cap_today_epoch" \
+  MANDATE_GH_AS_BIN="$fake_dispatch_gh" \
+  MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
+  CODEX_BIN="$fake_dispatch_codex" \
+  FAKE_SYSTEMD_ARGS="$dispatch_args" FAKE_SYSTEMD_CALLS="$dispatch_calls" \
+  bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$dispatch_order" >/dev/null 2>&1
+numbered_branch_guard_status=$?
+set -e
+if [ "$numbered_branch_guard_status" -ne 3 ]; then
+  echo "number-position remote branch guard did not exit 3" >&2
+  exit 1
+fi
+if [ "$(jq -s -r 'last.fact.branch_name' "$branch_guard_config/ostrom/sprint.jsonl")" != 'chore/123-existing-work' ]; then
+  echo "number-position remote branch guard recorded the wrong branch" >&2
+  exit 1
+fi
+if jq -s -e 'any(.[]; .kind == "work-dispatched")' \
+  "$branch_guard_config/ostrom/sprint.jsonl" >/dev/null; then
+  echo "number-position remote branch guard reserved work" >&2
+  exit 1
+fi
+
+# Failure to enumerate remote branches fails closed before any reservation.
+branch_query_failure_config="$dispatch_fixture/branch-query-failure-config"
+branch_query_failure_stderr="$dispatch_fixture/branch-query-failure.err"
+mkdir -p "$branch_query_failure_config/ostrom"
+set +e
+FAKE_REMOTE_QUERY_FAIL=1 CLAUDE_CONFIG_DIR="$branch_query_failure_config" \
+  MANDATE_NOW_EPOCH="$cap_today_epoch" \
+  MANDATE_GH_AS_BIN="$fake_dispatch_gh" \
+  MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
+  CODEX_BIN="$fake_dispatch_codex" \
+  FAKE_SYSTEMD_ARGS="$dispatch_args" FAKE_SYSTEMD_CALLS="$dispatch_calls" \
+  bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$dispatch_order" \
+    >/dev/null 2>"$branch_query_failure_stderr"
+branch_query_failure_status=$?
+set -e
+if [ "$branch_query_failure_status" -eq 0 ]; then
+  echo "remote branch query failure dispatched blind" >&2
+  exit 1
+fi
+if [ -e "$branch_query_failure_config/ostrom/implementer-item-$branch_guard_item_hash.lease" ]; then
+  echo "remote branch query failure leaked an implementer lease" >&2
+  exit 1
+fi
+if [ -e "$branch_query_failure_config/ostrom/sprint.jsonl" ]; then
+  echo "remote branch query failure reserved work" >&2
+  exit 1
+fi
+if [ "$(grep -Fc 'could not verify remote branches for example-org/example-repo#123 in example-org/example-repo' "$branch_query_failure_stderr")" -ne 1 ]; then
+  echo "remote branch query failure was not reported" >&2
+  exit 1
+fi
+
+clean_dispatch_gh_calls="$dispatch_fixture/clean-dispatch-gh-calls"
 dispatch_unit="$(
   CLAUDE_CONFIG_DIR="$dispatch_config" \
     MANDATE_TRACE_TIME="2026-08-11T02:01:00Z" \
@@ -1102,10 +1269,19 @@ dispatch_unit="$(
     MANDATE_GH_AS_BIN="$fake_dispatch_gh" \
     MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
     CODEX_BIN="$fake_dispatch_codex" \
+    FAKE_GH_CALLS="$clean_dispatch_gh_calls" \
     FAKE_SYSTEMD_ARGS="$dispatch_args" \
     FAKE_SYSTEMD_CALLS="$dispatch_calls" \
     bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$dispatch_order"
 )"
+if [ "$(grep -Fc 'builder example-org/example-repo gh api --paginate --slurp repos/example-org/example-repo/branches?per_page=100' "$clean_dispatch_gh_calls")" -ne 1 ]; then
+  echo "clean dispatch did not perform the remote branch preflight" >&2
+  exit 1
+fi
+if [ "$dispatch_unit" != "ostrom-implementer-9bb890b1b3b47926" ]; then
+  echo "clean remote branch preflight changed successful dispatch" >&2
+  exit 1
+fi
 [ "$dispatch_unit" = "ostrom-implementer-9bb890b1b3b47926" ]
 [ "$(wc -l <"$dispatch_calls" | tr -d '[:space:]')" -eq 1 ]
 grep -qx 'RuntimeMaxSec=infinity' "$dispatch_args"
@@ -1124,9 +1300,9 @@ jq -s -e '
   and .[0].fact.duration_seconds == 0
 ' "$dispatch_config/ostrom/sprint.jsonl" >/dev/null
 
-# All three duplicate guards fail closed independently. A live lease refuses
-# first; after its controlled release, the unmatched dispatch row refuses;
-# after a terminal row, an open PR reference refuses.
+# The three pre-existing duplicate guards still fail closed independently. A
+# live lease refuses first; after its controlled release, the unmatched
+# dispatch row refuses; after a terminal row, an open PR reference refuses.
 set +e
 CLAUDE_CONFIG_DIR="$dispatch_config" \
   MANDATE_NOW_EPOCH="$cap_today_epoch" \
@@ -1268,6 +1444,10 @@ fake_implement_gh="$implement_bin/gh-as"
 cat >"$fake_implement_gh" <<'SH'
 #!/usr/bin/env bash
 shift 2
+if [ "$1" = gh ] && [ "$2" = api ] && [ "$3" = --paginate ] && [ "$4" = --slurp ]; then
+  printf '%s\n' '[[{"name":"main","commit":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]]'
+  exit 0
+fi
 if [ "$1" = gh ] && [ "$2" = repo ] && [ "$3" = view ]; then
   printf 'main\n'
   exit 0
@@ -2035,6 +2215,7 @@ HOME="$implement_fixture/missing-home" \
   CODEX_BIN="missing-codex" \
   CLAUDE_CONFIG_DIR="$missing_dispatch_config" \
   MANDATE_TRACE_TIME="2026-08-11T03:05:00Z" \
+  MANDATE_GH_AS_BIN="$fake_implement_gh" \
   MANDATE_SYSTEMD_RUN_BIN="$fake_running_systemd" \
   FAKE_SYSTEMD_ARGS="$implement_fixture/missing-systemd-args" \
   bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$missing_dispatch_order" \

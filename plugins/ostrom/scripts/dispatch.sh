@@ -49,6 +49,9 @@ append_dispatch_failure() {
   local duration_seconds="${2:-0}"
   local worktree_path="${3:-}"
   local preserved_branch="${4:-}"
+  local failed_repository="${5:-}"
+  local head_sha="${6:-}"
+  local ahead_of_default="${7:-}"
   local failed_fact
   failed_fact="$(jq -cn \
     --arg item_id "$item_id" --arg order_id "$order_id" \
@@ -58,6 +61,8 @@ append_dispatch_failure() {
     --argjson duration_seconds "$duration_seconds" \
     --arg reason "$reason" --arg worktree_path "$worktree_path" \
     --arg branch_name "$preserved_branch" \
+    --arg repository "$failed_repository" --arg head_sha "$head_sha" \
+    --arg ahead_of_default "$ahead_of_default" \
     '{schema_version: 1, item_id: $item_id, order_id: $order_id,
       unit_name: $unit_name, backend: $backend,
       cost_ceiling_usd: $cost_ceiling_usd, token_ceiling: $token_ceiling,
@@ -65,6 +70,11 @@ append_dispatch_failure() {
       pr_url: null, reason: $reason,
       worktree_path: (if $worktree_path == "" then null else $worktree_path end),
       branch_name: (if $branch_name == "" then null else $branch_name end),
+      repository: (if $repository == "" then null else $repository end),
+      head_sha: (if $head_sha == "" then null else $head_sha end),
+      ahead_of_default: (if $ahead_of_default == "" then null
+        elif $ahead_of_default == "unknown" then "unknown"
+        else ($ahead_of_default | tonumber) end),
       usage: {input_tokens: 0, cached_input_tokens: 0,
         output_tokens: 0, reasoning_output_tokens: 0}}')"
   bash "$SCRIPT_DIR/trace.sh" append work-failed "$failed_fact" '{}' >/dev/null
@@ -115,6 +125,73 @@ if [ -e "$worktree_root" ]; then
       exit 3
     fi
   fi
+fi
+
+# A pushed branch is durable work even when no pull request references the
+# item yet. Enumerate every remote branch through the builder credential and
+# reject matching work before resolving the backend, acquiring the item lease,
+# or calculating either concurrency or spend reservations.
+remote_branch_pages="$({
+  bash "$GH_AS_BIN" builder "$repository" \
+    gh api --paginate --slurp "repos/$repository/branches?per_page=100"
+} 2>/dev/null)" || {
+  echo "ostrom dispatch: could not verify remote branches for $item_id in $repository" >&2
+  exit 1
+}
+if ! jq -e '
+  type == "array"
+  and all(.[]; type == "array")
+  and all(.[][];
+    type == "object"
+    and (.name | type == "string")
+    and (.commit.sha | type == "string" and test("^[0-9a-fA-F]{40}$")))
+' >/dev/null 2>&1 <<<"$remote_branch_pages"; then
+  echo "ostrom dispatch: could not verify remote branches for $item_id in $repository: invalid response" >&2
+  exit 1
+fi
+
+item_number="${item_id##*#}"
+case "$item_number" in *[!0-9]*|'') item_number="" ;; esac
+matching_remote_branch="$(jq -r \
+  --arg expected "$branch_name" --arg number "$item_number" '
+  [ .[][]
+    | select(.name == $expected
+        or ($number != "" and (.name | test("(^|/)" + $number + "-"))))
+  ]
+  | sort_by(if .name == $expected then 0 else 1 end)
+  | first // empty
+  | [.name, .commit.sha]
+  | @tsv
+' <<<"$remote_branch_pages")"
+if [ -n "$matching_remote_branch" ]; then
+  IFS=$'\t' read -r pushed_branch pushed_head_sha <<<"$matching_remote_branch"
+  ahead_of_default=unknown
+  default_branch="$({
+    bash "$GH_AS_BIN" builder "$repository" \
+      gh repo view "$repository" --json defaultBranchRef \
+        --jq '.defaultBranchRef.name'
+  } 2>/dev/null)" || default_branch=""
+  if [ -n "$default_branch" ]; then
+    default_head_sha="$(jq -r --arg branch "$default_branch" '
+      first(.[][] | select(.name == $branch) | .commit.sha) // empty
+    ' <<<"$remote_branch_pages")"
+    if [ -n "$default_head_sha" ]; then
+      compared_ahead="$({
+        bash "$GH_AS_BIN" builder "$repository" \
+          gh api "repos/$repository/compare/$default_head_sha...$pushed_head_sha" \
+            --jq '.ahead_by'
+      } 2>/dev/null)" || compared_ahead=""
+      case "$compared_ahead" in
+        ''|*[!0-9]*) ;;
+        *) ahead_of_default="$compared_ahead" ;;
+      esac
+    fi
+  fi
+  append_dispatch_failure branch-already-pushed 0 "" "$pushed_branch" \
+    "$repository" "$pushed_head_sha" "$ahead_of_default" ||
+      echo "ostrom dispatch: could not record work-failed" >&2
+  echo "ostrom dispatch: remote work already exists: repository=$repository branch=$pushed_branch head=$pushed_head_sha ahead=$ahead_of_default" >&2
+  exit 3
 fi
 
 codex_unavailable() {
