@@ -165,6 +165,7 @@ fetch_issues() {
 # repository always has been.
 sweep_org() {
   local org="$1"
+  local semantic_enabled="${MANDATE_SEMANTIC_ENABLED:-0}"
 
   while IFS= read -r project; do
     printf '%s\n' "$project" >"$work/project.json"
@@ -241,6 +242,7 @@ sweep_org() {
 
     jq -cn \
       --arg repo "$repo" \
+      --argjson semantic_enabled "$semantic_enabled" \
       --slurpfile issues "$work/issues.json" \
       --slurpfile prs "$work/prs.json" '
         def failure:
@@ -317,6 +319,10 @@ sweep_org() {
               ready: ($type == "pr" and (.isDraft | not) and $ci == "passing"),
               review: (.reviewDecision // "")
             }
+          | if $semantic_enabled
+            then .body = ($item.body // "")
+            else .
+            end
           | .fingerprint = ([
               .title,
               (.labels | sort | join(",")),
@@ -336,6 +342,31 @@ sweep_org() {
           ($prs[0][] | normalized("pr"))
         ]
       ' >"$work/fresh-items.json"
+
+    # A complete PR listing replaces PR records on every pass. When semantic
+    # derivation is enabled, retain its source-keyed advisory result until the
+    # cursor reports that item changed; otherwise an unchanged PR would lose
+    # its cached verdict simply because PR acquisition is intentionally full.
+    if [ "$semantic_enabled" -eq 1 ]; then
+      jq -cn \
+        --slurpfile fresh "$work/fresh-items.json" \
+        --slurpfile previous "$work/previous.json" '
+          ($previous[0].records // {}) as $records
+          | [
+              $fresh[0][]
+              | . as $item
+              | ($records[$item.id] // {}) as $old
+              | if ($old.semantic_derivation // null) != null
+                then . + {
+                  semantic_derivation: $old.semantic_derivation,
+                  semantic_content_hash: $old.semantic_content_hash
+                }
+                else .
+                end
+            ]
+        ' >"$work/next.json"
+      mv "$work/next.json" "$work/fresh-items.json"
+    fi
 
     if [ "$sweep_mode" = "full" ] && [ "$issue_http_status" != "304" ]; then
       cp "$work/fresh-items.json" "$work/items.json"
@@ -862,6 +893,308 @@ sweep_org() {
           }
       ' >"$work/analysis.json"
 
+    if [ "$semantic_enabled" -eq 1 ]; then
+      # Re-check persisted advisory authority against today's mechanical
+      # result before it can be emitted. Mechanical inputs such as a linked
+      # reserved ref or PR path can change independently of the model's text
+      # hash; a once-valid cached escalation must not then appear to clear the
+      # stronger current result. New/cache-hit model results receive the same
+      # guard in the TypeScript harness below.
+      jq -cn \
+        --slurpfile items "$work/items.json" \
+        --slurpfile analysis "$work/analysis.json" '
+          ($analysis[0].repo_state.items) as $mechanical
+          | [
+              $items[0][]
+              | . as $item
+              | ($item.semantic_derivation.authority // null) as $authority
+              | ($mechanical[$item.id].classification) as $classification
+              | if $authority == null then .
+                elif ($authority.classification | IN("delegated", "excluded") | not)
+                    and ($classification != "reserved" or $authority.classification == "reserved")
+                    and ($classification != "tripwire" or $authority.classification == "tripwire")
+                then .
+                else del(.semantic_content_hash, .semantic_derivation)
+                end
+            ]
+        ' >"$work/next.json"
+      mv "$work/next.json" "$work/items.json"
+
+      # Only records reported as changed by the incremental cursor are allowed
+      # to trigger comment reads. On an initial baseline every item is new;
+      # daily full reconciliation does not make unchanged items candidates.
+      jq -cn \
+        --slurpfile fresh "$work/fresh-items.json" \
+        --slurpfile previous "$work/previous.json" '
+          ($previous[0]) as $previous
+          | [
+              $fresh[0][]
+              | select(
+                  ($previous.records[.id] // null) == null
+                  or .updated > ($previous.cursor // "")
+                )
+            ]
+        ' >"$work/semantic-candidates.json"
+
+      : >"$work/semantic-comments.jsonl"
+      while IFS=$'\t' read -r semantic_id semantic_number; do
+        [ -n "$semantic_number" ] || continue
+        if ! gh api -X GET "repos/$repo/issues/$semantic_number/comments?per_page=100" \
+            >"$work/semantic-item-comments.json" 2>"$work/semantic-comments-error"; then
+          detail="$(tr '\n' ' ' <"$work/semantic-comments-error")"
+          echo "mandate sweep: failed to read comments for $semantic_id${detail:+: $detail}; semantic derivation skipped for this item" >&2
+          printf '%s\t%s\n' "$semantic_id" "$semantic_number" \
+            >>"$work/semantic-comment-failures.tsv"
+          continue
+        fi
+        if ! jq -e 'type == "array" and length < 100' \
+            "$work/semantic-item-comments.json" >/dev/null; then
+          echo "mandate sweep: comment query for $semantic_id reached its 100-comment safety cap or returned malformed data; semantic derivation skipped for this item" >&2
+          printf '%s\t%s\n' "$semantic_id" "$semantic_number" \
+            >>"$work/semantic-comment-failures.tsv"
+          continue
+        fi
+        jq -cn \
+          --arg id "$semantic_id" \
+          --slurpfile comments "$work/semantic-item-comments.json" \
+          '{id: $id, comments: [$comments[0][]? | (.body // "") | select(type == "string")]}' \
+          >>"$work/semantic-comments.jsonl"
+      done < <(jq -r '.[] | [.id, (.number | tostring)] | @tsv' "$work/semantic-candidates.json")
+
+      if [ -s "$work/semantic-comments.jsonl" ]; then
+        jq -s '.' "$work/semantic-comments.jsonl" >"$work/semantic-comments.json"
+      else
+        printf '%s\n' '[]' >"$work/semantic-comments.json"
+      fi
+
+      jq -cn \
+        --slurpfile candidates "$work/semantic-candidates.json" \
+        --slurpfile comments "$work/semantic-comments.json" \
+        --slurpfile analysis "$work/analysis.json" \
+        --slurpfile previous "$work/previous.json" '
+          ($comments[0] | INDEX(.id)) as $comments_by_id
+          | ($analysis[0].repo_state.items) as $mechanical
+          | {
+              items: [
+                $candidates[0][]
+                | . as $item
+                | select($comments_by_id[$item.id] != null)
+                | {
+                    id: $item.id,
+                    content: {
+                      title: $item.title,
+                      labels: $item.labels,
+                      body: ($item.body // ""),
+                      comments: $comments_by_id[$item.id].comments
+                    },
+                    mechanical: {
+                      classification: $mechanical[$item.id].classification,
+                      matched_selector: $mechanical[$item.id].matched_selector,
+                      matched_source: "mechanical"
+                    }
+                  }
+              ],
+              cache: ($previous[0].semantic_cache // {})
+            }
+        ' >"$work/semantic-request.json"
+
+      # An executable port is orchestrated by Bash so it has exactly the same
+      # stdin/stdout process contract as the rest of the sweep. The TypeScript
+      # harness still validates the returned data and owns the safety guard.
+      # With no executable port, the harness uses its credential-gated bundled
+      # adapter instead.
+      if [ -n "${MANDATE_SEMANTIC_DERIVER:-}" ]; then
+        : >"$work/semantic-port-results.jsonl"
+        while IFS= read -r semantic_id; do
+          jq -c --arg id "$semantic_id" \
+            '{version: 1, content: (.items[] | select(.id == $id) | .content)}' \
+            "$work/semantic-request.json" >"$work/semantic-port-input.json"
+          if "$MANDATE_SEMANTIC_DERIVER" \
+              <"$work/semantic-port-input.json" \
+              >"$work/semantic-port-output.json" \
+              2>"$work/semantic-port-error" \
+              && jq -e . "$work/semantic-port-output.json" >/dev/null 2>&1; then
+            jq -cn \
+              --arg id "$semantic_id" \
+              --slurpfile raw "$work/semantic-port-output.json" \
+              '{id: $id, raw_verdict: $raw[0]}' \
+              >>"$work/semantic-port-results.jsonl"
+          else
+            detail="$(tr '\n' ' ' <"$work/semantic-port-error")"
+            jq -cn \
+              --arg id "$semantic_id" \
+              --arg error "semantic deriver failed${detail:+: $detail}" \
+              '{id: $id, port_error: $error}' \
+              >>"$work/semantic-port-results.jsonl"
+          fi
+        done < <(jq -r '.items[].id' "$work/semantic-request.json")
+        if [ -s "$work/semantic-port-results.jsonl" ]; then
+          jq -s 'INDEX(.id)' "$work/semantic-port-results.jsonl" \
+            >"$work/semantic-port-results.json"
+          jq -cn \
+            --slurpfile request "$work/semantic-request.json" \
+            --slurpfile port "$work/semantic-port-results.json" '
+              $request[0]
+              | .items |= map(
+                  . as $item
+                  | (($port[0][$item.id] // {}) | del(.id)) as $port_fields
+                  | $item + $port_fields
+                )
+            ' >"$work/next.json"
+          mv "$work/next.json" "$work/semantic-request.json"
+        fi
+      fi
+
+      if ! "$MANDATE_SEMANTIC_NODE" "$MANDATE_PLUGIN_ROOT/dist/semantic-derivation-cli.js" \
+          <"$work/semantic-request.json" >"$work/semantic-results.json"; then
+        echo "mandate sweep: semantic derivation harness failed; continuing with the mechanical verdicts" >&2
+        printf '%s\n' '[]' >"$work/semantic-results.json"
+      fi
+      if ! jq -e 'type == "array"' "$work/semantic-results.json" >/dev/null 2>&1; then
+        echo "mandate sweep: semantic derivation harness returned malformed output; continuing with the mechanical verdicts" >&2
+        printf '%s\n' '[]' >"$work/semantic-results.json"
+      fi
+      while IFS=$'\t' read -r rejected_id rejected_error; do
+        [ -n "$rejected_id" ] || continue
+        echo "mandate sweep: semantic verdict for $rejected_id was rejected: $rejected_error" >&2
+      done < <(jq -r '.[] | select(.status == "rejected" and (.cached | not)) | [.id, .error] | @tsv' "$work/semantic-results.json")
+
+      # Attach accepted findings beside the mechanical fields. The existing
+      # fingerprint is never read or rewritten here. Rejected results remove
+      # any stale advisory attached to older source content, and both accepted
+      # and rejected results enter the content-hash cache so unchanged text is
+      # never re-judged.
+      jq -cn \
+        --slurpfile items "$work/items.json" \
+        --slurpfile results "$work/semantic-results.json" '
+          ($results[0] | INDEX(.id)) as $by_id
+          | [
+              $items[0][]
+              | . as $item
+              | ($by_id[$item.id] // null) as $result
+              | if $result == null then .
+                elif $result.status == "accepted" then
+                  . + {
+                    semantic_content_hash: $result.content_hash,
+                    semantic_derivation: $result.derivation
+                  }
+                else
+                  del(.semantic_content_hash, .semantic_derivation)
+                end
+            ]
+        ' >"$work/next.json"
+      mv "$work/next.json" "$work/items.json"
+
+      jq -cn \
+        --slurpfile analysis "$work/analysis.json" \
+        --slurpfile items "$work/items.json" \
+        --slurpfile results "$work/semantic-results.json" '
+          ($items[0] | INDEX(.id)) as $items_by_id
+          | ($analysis[0].current_items | INDEX(.id)) as $current_by_id
+          | def finding($derivation; $kind):
+              any(($derivation.findings // [])[]?; .kind == $kind);
+          def semantic_fields($item; $mechanical):
+              if ($item.semantic_derivation // null) == null then {}
+              else {
+                classification: $mechanical.classification,
+                matched_selector: $mechanical.matched_selector,
+                semantic_derivation: $item.semantic_derivation
+              }
+              end;
+          def reprioritize($row; $derivation):
+              if finding($derivation; "already_decided")
+                  or ($derivation.authority // null) != null
+              then $row | .kind = "decision" | .needs_judgment = true
+              elif $row.kind == "stuck" and finding($derivation; "parked")
+              then $row | .kind = "moved" | .needs_judgment = false
+              else $row
+              end;
+          ($analysis[0]) as $analysis
+          | ($analysis.repo_state.items) as $mechanical
+          | ($analysis.rows | map(
+              . as $row
+              | ($items_by_id[$row.id] // {}) as $item
+              | if ($item.semantic_derivation // null) == null then .
+                else reprioritize(
+                  . + semantic_fields($item; $mechanical[$row.id]);
+                  $item.semantic_derivation
+                )
+                end
+            )) as $attached_rows
+          | ([ $attached_rows[].id ]) as $attached_ids
+          | ([
+              $results[0][]
+              | select(.status == "accepted")
+              | . as $result
+              | select(
+                  finding($result.derivation; "already_decided")
+                  or ($result.derivation.authority // null) != null
+                )
+              | select(($attached_ids | index($result.id)) == null)
+              | ($items_by_id[$result.id]) as $item
+              | ($mechanical[$result.id]) as $mech
+              | {
+                  id: $item.id,
+                  repo: $item.repo,
+                  ref: $item.ref,
+                  title: $item.title,
+                  kind: "decision",
+                  mandate: {reason: ("semantic advisory beside " + $mech.classification + " " + $mech.matched_selector)},
+                  state: "pending",
+                  opened: $item.opened,
+                  age_days: $current_by_id[$item.id].age_days,
+                  aged_out: $current_by_id[$item.id].aged_out,
+                  needs_judgment: true,
+                  blocked_by: $item.blocked_by,
+                  classification: $mech.classification,
+                  matched_selector: $mech.matched_selector,
+                  semantic_derivation: $result.derivation
+                }
+            ]) as $semantic_rows
+          | ($analysis.current_items | map(
+              . as $current
+              | ($items_by_id[$current.id] // {}) as $item
+              | if ($item.semantic_derivation // null) == null then .
+                else . + semantic_fields($item; $mechanical[$current.id])
+                end
+            )) as $current_items
+          | ([$items[0][]
+              | select(
+                  (.semantic_derivation // null) != null
+                  and (
+                    finding(.semantic_derivation; "already_decided")
+                    or (.semantic_derivation.authority // null) != null
+                  )
+                )
+              | .id]) as $semantic_active
+          | ($analysis.repo_state.semantic_cache // {}) as $old_cache
+          | (reduce $results[0][] as $result ($old_cache;
+              .[$result.content_hash] = (
+                if $result.status == "accepted"
+                then {status: "accepted", derivation: $result.derivation}
+                else {status: "rejected", error: $result.error}
+                end
+              )
+            )) as $cache
+          | $analysis
+          | .rows = ($attached_rows + $semantic_rows)
+          | .active_ids = ((.active_ids + $semantic_active) | unique)
+          | .current_items = $current_items
+          | .repo_state.semantic_cache = $cache
+          | .repo_state.items |= with_entries(
+              . as $entry
+              | ($items_by_id[$entry.key] // {}) as $item
+              | if ($item.semantic_derivation // null) == null then .
+                else .value += {
+                  semantic_content_hash: $item.semantic_content_hash,
+                  semantic_derivation: $item.semantic_derivation
+                }
+                end
+            )
+        ' >"$work/next.json"
+      mv "$work/next.json" "$work/analysis.json"
+    fi
+
     # #147: a merge with no timely passing verdict is a fault observed after
     # the fact. The all-state PR response above, gate.jsonl, and
     # exceptions.jsonl are already in hand; this is deliberately only a local
@@ -1343,6 +1676,16 @@ if [ "$project_count" -eq 0 ]; then
   exit 2
 fi
 
+semantic_enabled=0
+semantic_node=""
+if mandate_semantic_is_configured; then
+  semantic_node="$(bash "$SCRIPT_DIR/run-node.sh" --resolve-only)" || {
+    echo "mandate sweep: semantic derivation is configured but Node.js 18+ is unavailable" >&2
+    exit 2
+  }
+  semantic_enabled=1
+fi
+
 mkdir -p "$MANDATE_DATA_DIR"
 mandate_read_queue >"$work/existing-queue.json" || {
   echo "mandate sweep: cannot read $MANDATE_QUEUE_FILE" >&2
@@ -1460,6 +1803,7 @@ while IFS= read -r org; do
   # against the same instant regardless of which one is processed first.
   MANDATE_SWEEP_ORG="$org" MANDATE_SWEEP_WORK="$work" MANDATE_SWEEP_TIME="$sweep_started" \
     MANDATE_SWEEP_MODE_EFFECTIVE="$sweep_mode" \
+    MANDATE_SEMANTIC_ENABLED="$semantic_enabled" MANDATE_SEMANTIC_NODE="$semantic_node" \
     bash "$SCRIPT_DIR/gh-as.sh" gatekeeper "$anchor_repo" \
     bash "${BASH_SOURCE[0]}"
 done < <(jq -r '[.projects[].repo | split("/")[0]] | unique | .[]' "$work/config.json")
