@@ -1,7 +1,31 @@
-use std::{fs, process::Command};
+use std::{
+    fs,
+    path::Path,
+    process::{Command, Output},
+};
 
 use serde_json::json;
 use tempfile::tempdir;
+
+fn run_readers(ostrom_home: &Path, claude_config_dir: &Path) -> (Output, Output) {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("workspace root");
+    let rust = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .env("OSTROM_HOME", ostrom_home)
+        .args(["queue", "list", "--format=json"])
+        .output()
+        .expect("run Rust reader");
+    let bash = Command::new("bash")
+        .arg(repo_root.join("plugins/ostrom/scripts/queue.sh"))
+        .arg("list")
+        .env("CLAUDE_CONFIG_DIR", claude_config_dir)
+        .env("CLAUDE_PLUGIN_ROOT", repo_root.join("plugins/ostrom"))
+        .output()
+        .expect("run Bash reader");
+    (rust, bash)
+}
 
 #[test]
 fn rust_queue_is_byte_identical_to_bash_over_runtime_input() {
@@ -41,28 +65,12 @@ fn rust_queue_is_byte_identical_to_bash_over_runtime_input() {
     }
     fs::write(ostrom_home.join("queue.jsonl"), queue).expect("write synthetic queue");
 
-    let rust = Command::new(env!("CARGO_BIN_EXE_ostrom"))
-        .env("OSTROM_HOME", &ostrom_home)
-        .args(["queue", "list", "--format=json"])
-        .output()
-        .expect("run Rust reader");
+    let (rust, bash) = run_readers(&ostrom_home, fixture.path());
     assert!(
         rust.status.success(),
         "Rust stderr: {}",
         String::from_utf8_lossy(&rust.stderr)
     );
-
-    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("workspace root");
-    let bash = Command::new("bash")
-        .arg(repo_root.join("plugins/ostrom/scripts/queue.sh"))
-        .arg("list")
-        .env("CLAUDE_CONFIG_DIR", fixture.path())
-        .env("CLAUDE_PLUGIN_ROOT", repo_root.join("plugins/ostrom"))
-        .output()
-        .expect("run Bash reader");
     assert!(
         bash.status.success(),
         "Bash stderr: {}",
@@ -84,4 +92,60 @@ fn rust_queue_is_byte_identical_to_bash_over_runtime_input() {
         rendered.iter().any(|row| row["needs_judgment"] == false),
         "parity fixture must exercise a non-judgment classification"
     );
+}
+
+#[test]
+fn rust_and_bash_reject_the_same_malformed_blocked_by_rows() {
+    let fixture = tempdir().expect("temp dir");
+    let ostrom_home = fixture.path().join("ostrom");
+    fs::create_dir(&ostrom_home).expect("ostrom fixture dir");
+
+    for (case, blocked_by) in [
+        ("owner contains hash", "synthetic#org/project#1"),
+        ("repository contains hash", "synthetic-org/pro#ject#1"),
+        ("issue number starts at zero", "synthetic-org/project#0"),
+        (
+            "repository has an extra segment",
+            "synthetic-org/group/project#1",
+        ),
+        (
+            "repository contains whitespace",
+            "synthetic-org/project name#1",
+        ),
+    ] {
+        let row = json!({
+            "id": "synthetic-org/project#1",
+            "repo": "synthetic-org/project",
+            "ref": "#1",
+            "title": "Synthetic malformed queue item",
+            "kind": "decision",
+            "mandate": {"reason": "synthetic placeholder reason"},
+            "state": "pending",
+            "opened": "2030-01-02T03:04:05Z",
+            "blocked_by": [blocked_by]
+        });
+        fs::write(
+            ostrom_home.join("queue.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::to_string(&row).expect("serialize malformed row")
+            ),
+        )
+        .expect("write malformed queue");
+
+        let (rust, bash) = run_readers(&ostrom_home, fixture.path());
+        let rust_rejected = !rust.status.success();
+        let bash_rejected = !bash.status.success();
+        assert_eq!(
+            rust_rejected,
+            bash_rejected,
+            "reader disagreement for {case}; Rust stderr: {}; Bash stderr: {}",
+            String::from_utf8_lossy(&rust.stderr),
+            String::from_utf8_lossy(&bash.stderr)
+        );
+        assert!(
+            rust_rejected,
+            "both readers accepted malformed case: {case}"
+        );
+    }
 }

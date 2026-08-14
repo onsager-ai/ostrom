@@ -188,6 +188,9 @@ fn valid_blocked_by(value: &str) -> bool {
     let Some((repository, number)) = value.rsplit_once('#') else {
         return false;
     };
+    if repository.contains('#') {
+        return false;
+    }
     let mut repository_parts = repository.split('/');
     matches!(
         (
@@ -216,7 +219,22 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{list_queue_json, read_queue};
+    use super::{list_queue_json, read_queue, valid_blocked_by};
+
+    #[test]
+    fn blocked_by_matches_bash_grammar() {
+        assert!(valid_blocked_by("synthetic-org/project#1"));
+        for malformed in [
+            "synthetic#org/project#1",
+            "synthetic-org/pro#ject#1",
+            "synthetic-org/project#0",
+            "synthetic-org/project#01",
+            "synthetic-org/group/project#1",
+            "synthetic-org/project name#1",
+        ] {
+            assert!(!valid_blocked_by(malformed), "accepted {malformed}");
+        }
+    }
 
     #[test]
     fn malformed_queue_is_named_by_line() {
