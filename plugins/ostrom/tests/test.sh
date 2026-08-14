@@ -27,6 +27,15 @@ if grep -R -I -n -E "$machine_path_pattern" \
   exit 1
 fi
 
+# A leading `!` used as an assertion is exempt from both `set -e` and the ERR
+# trap, so it computes a result that the suite silently discards. Assemble the
+# expression in pieces so this self-check does not match its own source.
+dead_assertion_pattern='^[[:space:]]*''!''[[:space:]]'
+if grep -n -E "$dead_assertion_pattern" "${BASH_SOURCE[0]}"; then
+  echo "mandate tests: test.sh must not contain leading ! assertions" >&2
+  exit 1
+fi
+
 mkdir -p "$fixture/config/ostrom" "$fixture/repo" "$fixture/bin"
 sweep_search_root="$fixture/search-root"
 sweep_resolved_source="$sweep_search_root/example-org/example-repo"
@@ -142,7 +151,10 @@ grep -q 'scripts/sweep.sh' "$work_skill"
 grep -q '^argument-hint: "\[optional queue focus, e.g. project name or item class\]"$' \
   <<<"$work_frontmatter"
 grep -q 'invocation input as a natural-language filter' "$work_skill"
-! grep -q '\$ARGUMENTS' "$work_skill"
+if grep -q '\$ARGUMENTS' "$work_skill"; then
+  echo 'work protocol must not retain a literal $ARGUMENTS placeholder' >&2
+  exit 1
+fi
 grep -q 'builder-<session>-wake<N>' "$work_skill"
 for trace_kind in pass-started item-worked pass-ended; do
   grep -q "trace.sh\" append $trace_kind" "$work_skill"
@@ -335,12 +347,18 @@ jq -s -e \
 # The permission mode is role-scoped, not hardcoded, and neither role may
 # ever be handed the invalid "default" value.
 [ "$(grep -A1 '^--permission-mode$' "$builder_args" | tail -n1)" = auto ]
-! grep -qx default "$builder_args"
+if grep -qx default "$builder_args"; then
+  echo 'builder pass must not use the invalid default permission mode' >&2
+  exit 1
+fi
 
 # The turn ceiling is a runaway-loop backstop set well above the wall-clock
 # timeout that actually bounds a pass, not the old, easily-exceeded 40.
 [ "$(grep -A1 '^--max-turns$' "$builder_args" | tail -n1)" = 200 ]
-! grep -qx 40 "$builder_args"
+if grep -qx 40 "$builder_args"; then
+  echo 'builder pass max-turns must not regress to 40' >&2
+  exit 1
+fi
 
 CLAUDE_CONFIG_DIR="$pass_config" CLAUDE_BIN="$fake_claude" \
   FAKE_CLAUDE_MARKER="$fake_marker" \
@@ -521,7 +539,10 @@ signalled_pass_status=$?
 set -e
 [ "$signalled_pass_status" -eq 143 ]
 [ ! -e "$pass_config/ostrom/gatekeeper-pass.lease" ]
-! kill -0 "$signalled_child_pid" 2>/dev/null
+if kill -0 "$signalled_child_pid" 2>/dev/null; then
+  echo 'terminating a pass must not leave its Claude child running' >&2
+  exit 1
+fi
 jq -s -e '
   (map(select(.fact.owner? | startswith("gatekeeper-")))) as $gatekeeper
   | ($gatekeeper | length) == 2
@@ -535,7 +556,10 @@ jq -s -e '
 # The gatekeeper's mode is `manual`, not the builder's `auto`, and never the
 # invalid "default" value either.
 [ "$(grep -A1 '^--permission-mode$' "$gatekeeper_args" | tail -n1)" = manual ]
-! grep -qx default "$gatekeeper_args"
+if grep -qx default "$gatekeeper_args"; then
+  echo 'gatekeeper pass must not use the invalid default permission mode' >&2
+  exit 1
+fi
 
 # Two concurrent gatekeeper-pass starts cannot both proceed. The winner writes
 # the first trace record while the loser backs off without reading stale state.
@@ -3143,7 +3167,10 @@ jq -s -e '
   and all(.[]; has("ts") and has("kind") and has("fact") and (has("narration") | not))
   and .[1].fact == {verdict: "pass", exit_code: 0}
 ' <<<"$fact_rows" >/dev/null
-! grep -q 'narration' <<<"$fact_rows"
+if grep -q 'narration' <<<"$fact_rows"; then
+  echo 'fact trace output must omit narration fields' >&2
+  exit 1
+fi
 narration_rows="$(
   CLAUDE_CONFIG_DIR="$trace_config" \
     bash "$PLUGIN_ROOT/scripts/trace.sh" read-narration
@@ -3423,7 +3450,10 @@ run_app_token_failure() {
   [ "$app_token_status" -eq 2 ]
   [ ! -s "$app_token_stdout" ]
   [ ! -e "$app_token_curl_log" ]
-  ! grep -q 'ambient-principal-value' "$app_token_stderr"
+  if grep -q 'ambient-principal-value' "$app_token_stderr"; then
+    echo 'app-token failure output must not leak an ambient principal credential' >&2
+    exit 1
+  fi
 }
 
 run_app_token_success() {
@@ -3450,8 +3480,11 @@ run_app_token_success() {
   grep -Fxq 'stub-installation-token' "$app_token_stdout"
   [ ! -s "$app_token_stderr" ]
   [ "$(wc -l <"$app_token_curl_log" | tr -d '[:space:]')" -eq 2 ]
-  ! grep -q 'ambient-principal-value' \
-    "$app_token_stdout" "$app_token_stderr" "$app_token_curl_log"
+  if grep -q 'ambient-principal-value' \
+    "$app_token_stdout" "$app_token_stderr" "$app_token_curl_log"; then
+    echo 'app-token success output and request log must not leak an ambient principal credential' >&2
+    exit 1
+  fi
 }
 
 app_token_missing_argument="$app_token_fixture/missing-argument"
@@ -3645,12 +3678,18 @@ set -e
 grep -Fxq \
   'app-token: GitHub App is not installed on repository placeholder-owner/placeholder-repo' \
   "$app_token_fixture/not-installed.stderr"
-! grep -q 'ambient-principal-value' "$app_token_fixture/not-installed.stderr"
+if grep -q 'ambient-principal-value' "$app_token_fixture/not-installed.stderr"; then
+  echo 'repository-not-installed output must not leak an ambient principal credential' >&2
+  exit 1
+fi
 [ "$(wc -l <"$app_token_curl_log" | tr -d '[:space:]')" -eq 1 ]
 grep -Fxq \
   'https://api.github.com/repos/placeholder-owner/placeholder-repo/installation' \
   "$app_token_curl_log"
-! grep -q '/access_tokens' "$app_token_curl_log"
+if grep -q '/access_tokens' "$app_token_curl_log"; then
+  echo 'repository-not-installed lookup must stop before the access-token exchange' >&2
+  exit 1
+fi
 
 # A stale installation_id is accepted but discarded; the repository lookup,
 # not that obsolete value, selects the installation used for the exchange.
@@ -3685,10 +3724,13 @@ grep -Fxq \
 grep -Eq \
   '^https://api.github.com/app/installations/[1-9][0-9]*/access_tokens$' \
   "$app_token_curl_log"
-! grep -q 'OBSOLETE_INSTALLATION_ID' \
+if grep -q 'OBSOLETE_INSTALLATION_ID' \
   "$app_token_fixture/stale-id.stdout" \
   "$app_token_fixture/stale-id.stderr" \
-  "$app_token_curl_log"
+  "$app_token_curl_log"; then
+  echo 'stale installation ID must not select or leak into the token exchange' >&2
+  exit 1
+fi
 
 # gh-as.sh is the only sanctioned way a session-issued command mints and
 # uses a role token: a session's Bash tool cannot itself capture
@@ -3752,7 +3794,10 @@ grep -Fxq 'stub-installation-token' <(sed -n '2p' "$gh_as_seen")
 grep -Fq 'gh-as-test: called with pr list --repo placeholder-owner/placeholder-repo' \
   "$gh_as_stdout"
 [ ! -s "$gh_as_stderr" ]
-! grep -q 'stub-installation-token' "$gh_as_stdout" "$gh_as_stderr"
+if grep -q 'stub-installation-token' "$gh_as_stdout" "$gh_as_stderr"; then
+  echo 'gh-as success output must not leak the minted installation token' >&2
+  exit 1
+fi
 
 # gh-as.sh's own exit-111 space and the wrapped command's exit codes stay
 # distinguishable: a wrapped command that itself fails passes its own code
@@ -3776,8 +3821,11 @@ gh_as_wrapped_fail_status=$?
 set -e
 [ "$gh_as_wrapped_fail_status" -eq 7 ]
 [ -s "$gh_as_seen" ]
-! grep -q 'stub-installation-token' \
-  "$gh_as_wrapped_fail_stdout" "$gh_as_wrapped_fail_stderr"
+if grep -q 'stub-installation-token' \
+  "$gh_as_wrapped_fail_stdout" "$gh_as_wrapped_fail_stderr"; then
+  echo 'gh-as wrapped-command failure output must not leak the minted installation token' >&2
+  exit 1
+fi
 
 # Failure: minting fails closed (no secrets configured), the wrapped command
 # never runs at all, and an ambient credential already present in the
@@ -3806,10 +3854,16 @@ set -e
 [ ! -e "$gh_as_seen" ]
 grep -Fq 'gh-as: could not mint a gatekeeper token for placeholder-owner/placeholder-repo' \
   "$gh_as_auth_fail_stderr"
-! grep -q 'ambient-principal-value' \
-  "$gh_as_auth_fail_stdout" "$gh_as_auth_fail_stderr"
-! grep -q 'stub-installation-token' \
-  "$gh_as_auth_fail_stdout" "$gh_as_auth_fail_stderr"
+if grep -q 'ambient-principal-value' \
+  "$gh_as_auth_fail_stdout" "$gh_as_auth_fail_stderr"; then
+  echo 'gh-as authentication failure output must not leak an ambient principal credential' >&2
+  exit 1
+fi
+if grep -q 'stub-installation-token' \
+  "$gh_as_auth_fail_stdout" "$gh_as_auth_fail_stderr"; then
+  echo 'gh-as authentication failure output must not contain a minted installation token' >&2
+  exit 1
+fi
 
 # Role resolution holds through the wrapper: a builder call against a config
 # with neither builder nor shared credentials fails rather than silently
@@ -3897,7 +3951,10 @@ grep -Fxq 'gh_token=stub-installation-token' "$gh_as_git_seen"
 grep -Fq 'gh-as-git-test: called with push https://github.com/placeholder-owner/placeholder-repo.git HEAD:refs/heads/placeholder' \
   "$gh_as_git_stdout"
 [ ! -s "$gh_as_git_stderr" ]
-! grep -q 'stub-installation-token' "$gh_as_git_stdout" "$gh_as_git_stderr"
+if grep -q 'stub-installation-token' "$gh_as_git_stdout" "$gh_as_git_stderr"; then
+  echo 'gh-as git output must not leak the minted installation token' >&2
+  exit 1
+fi
 
 # #97 review: the GIT_CONFIG_COUNT/KEY/VALUE form is only honoured from Git
 # 2.31 onward, and an older git ignores it rather than erroring, so a stale
@@ -6905,7 +6962,10 @@ set -e
 [ "$no_credential_status" -eq 111 ]
 grep -q 'secrets file is missing' <<<"$no_credential_message"
 grep -q 'could not mint a gatekeeper token' <<<"$no_credential_message"
-! grep -q 'ambient-principal-value' <<<"$no_credential_message"
+if grep -q 'ambient-principal-value' <<<"$no_credential_message"; then
+  echo 'sweep missing-credential output must not leak an ambient principal credential' >&2
+  exit 1
+fi
 [ ! -e "$no_credential/config/ostrom/queue.jsonl" ]
 
 other_role_only="$fixture/other-role-only"
@@ -6933,7 +6993,10 @@ set -e
 grep -q 'neither gatekeeper nor shared credentials are configured' \
   <<<"$other_role_message"
 grep -q 'could not mint a gatekeeper token' <<<"$other_role_message"
-! grep -q 'ambient-principal-value' <<<"$other_role_message"
+if grep -q 'ambient-principal-value' <<<"$other_role_message"; then
+  echo 'sweep role-mismatch output must not leak an ambient principal credential' >&2
+  exit 1
+fi
 [ ! -e "$other_role_only/config/ostrom/queue.jsonl" ]
 
 # #109: a roster spanning two GitHub organisations. A single whole-run token
@@ -7433,7 +7496,10 @@ grep -q '^verdict: pass ' <<<"$gate_output"
 excused_line="$(grep '^condition bounce_selectors: excused ' <<<"$gate_output")"
 grep -q 'exception_reason="principal accepted protected placeholder surface"' \
   <<<"$excused_line"
-! grep -q '^condition bounce_selectors: pass ' <<<"$gate_output"
+if grep -q '^condition bounce_selectors: pass ' <<<"$gate_output"; then
+  echo 'an excused failed condition must not also be reported as pass' >&2
+  exit 1
+fi
 
 # A same-SHA re-run is idempotent: already_judged changes only delivery state,
 # while the exception and aggregate verdict remain the same.
@@ -7461,7 +7527,10 @@ grant_gate_exception bounce_selectors 11 "$stale_exception_head" \
 run_gate tier 11 "$current_exception_head"
 [ "$gate_status" -eq 1 ]
 grep -q '^condition bounce_selectors: fail ' <<<"$gate_output"
-! grep -q 'principal accepted earlier placeholder artifact' <<<"$gate_output"
+if grep -q 'principal accepted earlier placeholder artifact' <<<"$gate_output"; then
+  echo 'a stale exception reason must not appear after the head SHA changes' >&2
+  exit 1
+fi
 
 # A grant for a different condition cannot excuse the failing condition.
 different_condition_head="6666666666666666666666666666666666666666"
@@ -7470,7 +7539,10 @@ grant_gate_exception reserved_refs 12 "$different_condition_head" \
 run_gate tier 12 "$different_condition_head"
 [ "$gate_status" -eq 1 ]
 grep -q '^condition bounce_selectors: fail ' <<<"$gate_output"
-! grep -q '^condition bounce_selectors: excused ' <<<"$gate_output"
+if grep -q '^condition bounce_selectors: excused ' <<<"$gate_output"; then
+  echo 'an exception for a different condition must not excuse bounce_selectors' >&2
+  exit 1
+fi
 
 gate_log="$gate_fixture/config/ostrom/gate.jsonl"
 [ "$(wc -l <"$gate_log" | tr -d '[:space:]')" -eq 19 ]
