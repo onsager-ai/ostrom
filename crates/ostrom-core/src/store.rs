@@ -45,9 +45,12 @@ pub enum QueueState {
     Deferred,
 }
 
-/// The portable queue projection contains facts only. The local compatibility
-/// adapter may retain the Bash queue's `mandate.reason`, but it cannot cross
-/// this interface because there is nowhere to put it.
+/// The portable queue projection contains facts and Ostrom's classifications.
+/// Narration such as `mandate.reason` and `mandate.dossier` stays in the local
+/// compatibility adapter. Values derivable from facts already here (such as
+/// `age_days` and `aged_out` from `opened` plus a threshold) are omitted, but
+/// judgments computed by Ostrom must cross the port so consumers can display
+/// them without re-deriving them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueueFact {
     pub id: String,
@@ -58,6 +61,7 @@ pub struct QueueFact {
     pub state: QueueState,
     pub opened: String,
     pub blocked_by: Vec<String>,
+    pub needs_judgment: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
