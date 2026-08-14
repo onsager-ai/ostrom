@@ -52,6 +52,98 @@ streaming_ceiling_marker=""
 worktree_root=""
 source_repository=""
 streaming_ceiling_mode="${MANDATE_IMPLEMENTER_STREAMING_CEILING:-enabled}"
+# Five seconds lets Codex flush its terminal event and run ordinary signal
+# cleanup without letting an uncooperative process retain the item lease and
+# dispatch slot indefinitely. Tests shorten this through the environment.
+termination_grace_seconds="${MANDATE_IMPLEMENTER_TERMINATION_GRACE_SECONDS:-5}"
+termination_grace_checks=0
+termination_signal=""
+process_wait_status=0
+
+record_termination_signal() {
+  signal_name="$1"
+  # Any required KILL escalation is the operationally significant outcome,
+  # even if another process in the pair stopped cooperatively on TERM.
+  if [ "$signal_name" = SIGKILL ] || [ -z "$termination_signal" ]; then
+    termination_signal="$signal_name"
+  fi
+}
+
+reap_exited_process() {
+  reaped_pid="$1"
+  if wait "$reaped_pid" 2>/dev/null; then
+    process_wait_status=0
+  else
+    process_wait_status=$?
+  fi
+}
+
+bounded_wait_for_exit() {
+  bounded_pid="$1"
+  remaining_checks="$termination_grace_checks"
+  while [ "$remaining_checks" -gt 0 ]; do
+    if ! kill -0 "$bounded_pid" 2>/dev/null; then
+      reap_exited_process "$bounded_pid"
+      return 0
+    fi
+    sleep 0.1
+    remaining_checks=$((remaining_checks - 1))
+  done
+  if ! kill -0 "$bounded_pid" 2>/dev/null; then
+    reap_exited_process "$bounded_pid"
+    return 0
+  fi
+  return 1
+}
+
+terminate_process() {
+  terminated_pid="$1"
+  term_already_sent="${2:-no}"
+  process_wait_status=0
+
+  if ! kill -0 "$terminated_pid" 2>/dev/null; then
+    reap_exited_process "$terminated_pid"
+    [ "$term_already_sent" = yes ] && record_termination_signal SIGTERM
+    return 0
+  fi
+
+  if [ "$term_already_sent" = yes ]; then
+    record_termination_signal SIGTERM
+  elif kill -TERM "$terminated_pid" 2>/dev/null; then
+    record_termination_signal SIGTERM
+  else
+    reap_exited_process "$terminated_pid"
+    return 0
+  fi
+
+  if bounded_wait_for_exit "$terminated_pid"; then
+    return 0
+  fi
+  if kill -KILL "$terminated_pid" 2>/dev/null; then
+    record_termination_signal SIGKILL
+    # SIGKILL normally completes immediately, but keep even this reap bounded:
+    # a process stuck in uninterruptible kernel sleep must not hold the wrapper.
+    if ! bounded_wait_for_exit "$terminated_pid"; then
+      process_wait_status=137
+    fi
+  else
+    reap_exited_process "$terminated_pid"
+  fi
+}
+
+wait_for_codex_child() {
+  watched_pid="$1"
+  while kill -0 "$watched_pid" 2>/dev/null; do
+    if [ -s "$streaming_ceiling_marker" ]; then
+      terminate_process "$watched_pid" yes
+      codex_status="$process_wait_status"
+      return 0
+    fi
+    sleep 0.1
+  done
+  reap_exited_process "$watched_pid"
+  codex_status="$process_wait_status"
+}
 
 usage_fact() {
   if [ -n "$events_file" ] && [ -s "$events_file" ]; then
@@ -179,6 +271,7 @@ append_terminal() {
     --argjson cost_usd "$cost_usd" \
     --argjson duration_seconds "$duration_seconds" \
     --arg pr_url "$pr_url" --arg reason "$reason" \
+    --arg termination_signal "$termination_signal" \
     --arg source_repository_path "$source_repository" \
     --argjson preserved_work "$preserved_work" \
     --argjson usage "$usage" \
@@ -189,6 +282,7 @@ append_terminal() {
       duration_seconds: $duration_seconds,
       pr_url: (if $pr_url == "" then null else $pr_url end),
       reason: (if $reason == "" then null else $reason end),
+      termination_signal: (if $termination_signal == "" then null else $termination_signal end),
       source_repository_path: (if $source_repository_path == ""
         then null else $source_repository_path end),
       worktree_path: $preserved_work.worktree_path,
@@ -205,16 +299,12 @@ append_terminal() {
 finish() {
   saved_status=$?
   trap - EXIT HUP INT TERM
-  if [ -n "$child_pid" ] && kill -0 "$child_pid" 2>/dev/null; then
-    kill -TERM "$child_pid" 2>/dev/null || true
-    wait "$child_pid" 2>/dev/null || true
+  if [ -n "$child_pid" ]; then
+    terminate_process "$child_pid"
     child_pid=""
   fi
   if [ -n "$monitor_pid" ]; then
-    if kill -0 "$monitor_pid" 2>/dev/null; then
-      kill -TERM "$monitor_pid" 2>/dev/null || true
-    fi
-    wait "$monitor_pid" 2>/dev/null || true
+    terminate_process "$monitor_pid"
     monitor_pid=""
   fi
   if [ -n "$events_pipe" ]; then
@@ -238,6 +328,7 @@ on_signal() {
   signal_name="$1"
   signal_status="$2"
   failure_reason="signal-${signal_name}"
+  record_termination_signal "SIG${signal_name}"
   exit "$signal_status"
 }
 
@@ -245,6 +336,14 @@ trap finish EXIT
 trap 'on_signal HUP 129' HUP
 trap 'on_signal INT 130' INT
 trap 'on_signal TERM 143' TERM
+
+case "$termination_grace_seconds" in
+  ''|*[!0-9]*|0)
+    failure_reason=termination-grace-invalid
+    exit 2
+    ;;
+esac
+termination_grace_checks=$((termination_grace_seconds * 10))
 
 lease_json="$(MANDATE_LEASE_NAME="$lease_name" bash "$SCRIPT_DIR/lease.sh" status 2>/dev/null)" || {
   failure_reason=lease-missing
@@ -463,14 +562,14 @@ fi
 child_pid=$!
 monitor_codex_events "$child_pid" <"$events_pipe" &
 monitor_pid=$!
-wait "$child_pid"
-codex_status=$?
+wait_for_codex_child "$child_pid"
 child_pid=""
 wait "$monitor_pid" 2>/dev/null || true
 monitor_pid=""
 rm -f "$events_pipe"
 events_pipe=""
 if [ -s "$streaming_ceiling_marker" ]; then
+  [ -n "$termination_signal" ] || record_termination_signal SIGTERM
   failure_reason=token-ceiling-terminated
   exit 1
 fi
