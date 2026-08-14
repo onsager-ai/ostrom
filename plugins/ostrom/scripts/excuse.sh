@@ -49,9 +49,9 @@ case "$action" in
     reason="$*"
     valid_target "$target" || usage
     case "$condition" in
-      required_checks|review_threads|bounce_selectors|reserved_refs) ;;
+      required_checks|review_threads|bounce_selectors|reserved_refs|merge_protocol) ;;
       *)
-        echo "mandate excuse: condition must be one of required_checks, review_threads, bounce_selectors, reserved_refs" >&2
+        echo "mandate excuse: condition must be one of required_checks, review_threads, bounce_selectors, reserved_refs, merge_protocol" >&2
         exit 2
         ;;
     esac

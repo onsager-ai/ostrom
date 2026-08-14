@@ -228,6 +228,7 @@ if [ -s "$MANDATE_STATE_FILE" ]; then
               end
             ),
             unclassified: (.value.unclassified // 0),
+            merge_gate_faults: (.value.merge_gate_fault_count // 0),
             item_cap: (.value.item_cap // null)
           }
       ]
@@ -246,6 +247,13 @@ jq -r '
   .[]
   | select(.unclassified > 0)
   | .repo + ": " + (.unclassified | tostring) + " unclassified — /ostrom:desk triage"
+' <<<"$state_rollups"
+jq -r '
+  .[]
+  | select(.merge_gate_faults > 0)
+  | .repo + ": " + (.merge_gate_faults | tostring)
+    + (if .merge_gate_faults == 1 then " merge gate fault" else " merge gate faults" end)
+    + " — /ostrom:desk triage"
 ' <<<"$state_rollups"
 
 total_projects="$(jq '.projects | length' <<<"$config")"
