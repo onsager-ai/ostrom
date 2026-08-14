@@ -358,6 +358,7 @@ sweep_org() {
           reserved: $project.reserved,
           bounce: $project.bounce,
           bounce_all: $bounce_all,
+          parked_label: $config[0].parked_label,
           default: $project.default
         } as $selectors
         | ($selectors | tojson | explode
@@ -453,6 +454,9 @@ sweep_org() {
             | select(selector_match($item; .))
             | {source: $source, selector: .}
           ) // null;
+        def parked($item):
+          ($config.parked_label | ascii_downcase) as $marker
+          | any($item.labels[]?; ascii_downcase == $marker);
         def classify($item):
           (first(
             $project.reserved[]? as $number
@@ -569,11 +573,13 @@ sweep_org() {
               ) as $age_days
             | . + {
                 classification: $classification,
+                parked: parked($item),
                 first_seen: $first_seen,
                 age_days: $age_days,
                 movement_stuck: (
                   ($initial | not)
                   and ($policy_changed | not)
+                  and (parked($item) | not)
                   and $classification.terminal == "delegated"
                   and (($sweep_started | fromdateiso8601) - $movement_clock)
                     >= ($config.stuck_after_days * 86400)
@@ -581,18 +587,24 @@ sweep_org() {
                 old: $old
               }
           ] as $classified
+        # Parking is downstream of classification: it suppresses routine
+        # activity without changing reserved or tripwire precedence.
         | ([
             $classified[]
             | select(
                 if $initial or $policy_changed then
                   .classification.terminal == "reserved"
                   or .classification.terminal == "tripwire"
-                  or (.type == "pr" and .ci == "failing")
+                  or ((.parked | not) and .type == "pr" and .ci == "failing")
                 else
                   .classification.terminal == "reserved"
                   or .classification.terminal == "tripwire"
-                  or (.type == "pr" and .ci == "failing")
-                  or (($project.paused | not) and .classification.terminal == "delegated")
+                  or ((.parked | not) and .type == "pr" and .ci == "failing")
+                  or (
+                    (.parked | not)
+                    and ($project.paused | not)
+                    and .classification.terminal == "delegated"
+                  )
                 end
               )
           ]) as $active
@@ -613,17 +625,30 @@ sweep_org() {
             | (
                 $item.classification.terminal == "reserved"
                 or $item.classification.terminal == "tripwire"
-                or ($item.type == "pr" and $item.ci == "failing")
+                or (
+                  ($item.parked | not)
+                  and $item.type == "pr"
+                  and $item.ci == "failing"
+                )
               ) as $safety
             | select(
                 if $initial or $policy_changed then $safety
-                else $event and (
-                  $safety
-                  or (
-                    ($project.paused | not)
-                    and ($item.classification.terminal | IN("delegated", "unclassified"))
+                else
+                  $event
+                  and (
+                    $item.classification.terminal == "reserved"
+                    or $item.classification.terminal == "tripwire"
+                    or (
+                      ($item.parked | not)
+                      and (
+                        ($item.type == "pr" and $item.ci == "failing")
+                        or (
+                          ($project.paused | not)
+                          and ($item.classification.terminal | IN("delegated", "unclassified"))
+                        )
+                      )
+                    )
                   )
-                )
                 end
               )
             | select(shadowed_issue($item; $active) | not)
@@ -718,11 +743,16 @@ sweep_org() {
                 | (
                     $item.classification.terminal == "reserved"
                     or $item.classification.terminal == "tripwire"
-                    or ($item.type == "pr" and $item.ci == "failing")
+                    or (
+                      ($item.parked | not)
+                      and $item.type == "pr"
+                      and $item.ci == "failing"
+                    )
                   ) as $safety
                 | select(
                     $event
                     and ($safety | not)
+                    and ($item.parked | not)
                     and ($project.paused | not)
                     and $item.classification.terminal == "delegated"
                   )
@@ -737,6 +767,7 @@ sweep_org() {
               first_seen: $item.first_seen,
               classification: $item.classification.terminal,
               matched_selector: $item.classification.selector,
+              parked: $item.parked,
               stuck: $item.movement_stuck
             }
           )) as $next_items
@@ -810,6 +841,7 @@ sweep_org() {
                   closing_suffix: closing_suffix($item; $active),
                   age_days: .age_days,
                   aged_out: (.age_days >= $config.stuck_after_days),
+                  parked: .parked,
                   blocked_by: .blocked_by
                 }
             ],
@@ -835,8 +867,15 @@ sweep_org() {
               policy: $policy,
               notice: $notice,
               unclassified: (
-                [$classified[] | select(.classification.terminal == "unclassified")] | length
+                [
+                  $classified[]
+                  | select(
+                      (.parked | not)
+                      and .classification.terminal == "unclassified"
+                    )
+                ] | length
               ),
+              parked: ([$classified[] | select(.parked)] | length),
               item_cap: $item_cap,
               scope_changes: (
                 if $policy_changed and ($initial | not)
@@ -1429,6 +1468,7 @@ jq -cn \
             or (
               $row.state == "approved"
               and ($closed_approved_ids | index($row.id)) == null
+              and ((current($row.id).parked // false) | not)
             )
           )
       )

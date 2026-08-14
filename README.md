@@ -117,6 +117,13 @@ project suppresses routine work but never reserved refs, tripwires, or failing
 CI. The first sweep baselines existing work, and selector changes re-baseline
 scope rather than flooding the queue.
 
+The portfolio-level `parked_label` defaults to `status:parked`. An item with
+that GitHub label remains in the roster and is counted in the digest, but it
+does not enter the routine moved or stuck tiers (or other routine digest item
+listings) until the label is removed. Parking is a deferral, not an
+authorization change: reserved refs and shared or project tripwires still
+surface normally. Unparking requires no queue-state edit.
+
 Run the read-only sweep hourly outside Claude Code. Incremental runs ask the
 issues REST change feed only for updates after the stored cursor and reuse each
 repository's ETag, so a quiet repository receives a rate-limit-free `304`.
@@ -136,9 +143,10 @@ the scheduled sweep and performs only the local portion of the drift scan. It
 emits one JSON document whose
 `systemMessage` displays the digest to the operator and whose
 `hookSpecificOutput.additionalContext` gives the assistant byte-identical
-text. Empty sections disappear, so a healthy portfolio's digest text is
-exactly `N projects nominal`; local drift adds one detail-free line only when
-found. If the state file is older than `cadence_hours`,
+text. Empty sections disappear, so a healthy portfolio with no parked work has
+digest text of exactly `N projects nominal`; parked work adds one `N parked`
+line, and local drift adds one detail-free line only when found. If the state
+file is older than `cadence_hours`,
 the hook adds one short stale warning. Queue rows contain a
 resolvable GitHub pointer, its sweep-refreshed title, and mandate metadata,
 never mirrored issue or PR bodies. When an open PR closes a queued issue,

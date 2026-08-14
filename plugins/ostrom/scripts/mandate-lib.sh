@@ -228,7 +228,7 @@ mandate_yaml_to_json() {
           print "array\tprojects"
         } else if (text == "projects: []") {
           print "array\tprojects"
-        } else if (text ~ /^(provider|cadence_hours|stuck_after_days):[[:space:]]*/) {
+        } else if (text ~ /^(provider|cadence_hours|stuck_after_days|parked_label):[[:space:]]*/) {
           key = text
           sub(/:.*/, "", key)
           value = text
@@ -374,13 +374,14 @@ mandate_load_config() {
       --argjson shipped "$shipped" \
       --argjson user "$user" \
       --argjson repo "$repo" \
-      '$shipped * $user * $repo'
+      '$shipped * $user * $repo | .parked_label //= "status:parked"'
   )" || return
 
   if ! jq -e '
     .provider == "file"
     and (.cadence_hours | type == "number" and . > 0 and . == floor)
     and (.stuck_after_days | type == "number" and . >= 0)
+    and (.parked_label | type == "string" and length > 0)
     and (.bounce_all | type == "array" and all(.[]; type == "string" and length > 0))
     and (.search_roots | type == "array" and all(.[]; type == "string" and length > 0))
     and (.projects | type == "array")
@@ -395,7 +396,7 @@ mandate_load_config() {
     )
     and (([.projects[].repo] | length) == ([.projects[].repo] | unique | length))
   ' >/dev/null <<<"$config"; then
-    echo "mandate: invalid config; provider must be file, cadence_hours a positive integer, search_roots non-empty strings, and every project must have a unique owner/name repo, valid default, boolean paused value, selector lists, and positive integer reserved refs" >&2
+    echo "mandate: invalid config; provider must be file, cadence_hours a positive integer, parked_label a non-empty string, search_roots non-empty strings, and every project must have a unique owner/name repo, valid default, boolean paused value, selector lists, and positive integer reserved refs" >&2
     return 2
   fi
 

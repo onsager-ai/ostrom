@@ -12,6 +12,10 @@
 provider: file
 cadence_hours: 1
 stuck_after_days: 7
+# Portfolio-wide deferral marker. Matching is case-insensitive. Parked items
+# remain in sweep state and still surface when reserved or matched by a shared
+# or project tripwire, but do not produce routine queue tiers.
+parked_label: status:parked
 
 # Local repository discovery is opt-in. Never guess paths on the principal's
 # machine; a more-specific layer must replace this empty list explicitly.

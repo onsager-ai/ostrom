@@ -2968,6 +2968,7 @@ mkdir -p "$fixture/layers/config/ostrom" "$fixture/layers/repo/.ostrom"
 cat >"$fixture/layers/config/ostrom/mandates.yaml" <<'YAML'
 cadence_hours: 12
 stuck_after_days: 5
+parked_label: status:user-parked
 search_roots:
   - /placeholder/user-root
 bounce_all:
@@ -2986,6 +2987,7 @@ projects:
 YAML
 cat >"$fixture/layers/repo/.ostrom/mandates.yaml" <<'YAML'
 stuck_after_days: 2
+parked_label: hold:sequenced
 search_roots:
   - /placeholder/repo-root
 bounce_all:
@@ -3001,6 +3003,7 @@ jq -e '
   .provider == "file"
   and .cadence_hours == 12
   and .stuck_after_days == 2
+  and .parked_label == "hold:sequenced"
   and .search_roots == ["/placeholder/repo-root"]
   and .bounce_all == ["label:repo-boundary"]
   and .projects[0].repo == "example-org/example-repo"
@@ -3961,6 +3964,17 @@ JSON
 [{"number":301,"title":"bug: widget throws on empty input","body":"","labels":[{"name":"bug"}],"createdAt":"2026-07-01T00:00:00Z","updatedAt":"2026-07-01T00:00:00Z","url":"https://example.invalid/issues/301"}]
 JSON
       ;;
+    example-org/parked-repo)
+      parked_one_labels='[{"name":"maintenance"},{"name":"status:parked"}]'
+      parked_one_updated="2026-07-10T00:00:00Z"
+      if [ "${FAKE_GH_MODE:-base}" = "parked-unparked" ]; then
+        parked_one_labels='[{"name":"maintenance"}]'
+        parked_one_updated="2026-08-23T00:00:00Z"
+      fi
+      cat <<JSON
+[{"number":1,"title":"chore: deliberately sequenced work","labels":$parked_one_labels,"createdAt":"2026-07-01T00:00:00Z","updatedAt":"$parked_one_updated","url":"https://example.invalid/issues/1"},{"number":2,"title":"chore: rotate credential after sequencing","labels":[{"name":"status:parked"}],"createdAt":"2026-07-01T00:00:00Z","updatedAt":"2026-07-10T00:00:00Z","url":"https://example.invalid/issues/2"},{"number":3,"title":"chore: principal review after sequencing","labels":[{"name":"Status:Parked"},{"name":"principal-review"}],"createdAt":"2026-07-01T00:00:00Z","updatedAt":"2026-07-10T00:00:00Z","url":"https://example.invalid/issues/3"},{"number":4,"title":"chore: reserved sequenced work","labels":[{"name":"status:parked"},{"name":"maintenance"}],"createdAt":"2026-07-01T00:00:00Z","updatedAt":"2026-07-10T00:00:00Z","url":"https://example.invalid/issues/4"},{"number":5,"title":"chore: custom parked marker","labels":[{"name":"hold:sequenced"},{"name":"maintenance"}],"createdAt":"2026-07-01T00:00:00Z","updatedAt":"2026-07-10T00:00:00Z","url":"https://example.invalid/issues/5"}]
+JSON
+      ;;
     # #109: two different organisations, so a sweep.sh that mints only one
     # token for the whole run can read one repo and 404 the other.
     org-alpha/repo-one)
@@ -4661,6 +4675,172 @@ jq -s -e '
     ))
   and (.[0].mandate.reason | contains("aaaaaaaa") | not)
 ' "$landed_fix/config/ostrom/queue.jsonl" >/dev/null
+
+# #144: parking is a portfolio-wide deferral, not an authorization selector.
+# The default marker suppresses routine tiers while the item remains in the
+# sweep roster, and reserved/shared-bounce/project-bounce precedence still
+# surfaces parked boundary items.
+parked="$fixture/parked"
+parked_queue="$parked/config/ostrom/queue.jsonl"
+parked_state="$parked/config/ostrom/state.json"
+mkdir -p "$parked/config/ostrom" "$parked/repo"
+write_gatekeeper_secrets "$parked/config"
+cat >"$parked/config/ostrom/mandates.yaml" <<'YAML'
+stuck_after_days: 7
+bounce_all:
+  - title:*credential*
+projects:
+  - repo: example-org/parked-repo
+    delegated:
+      - label:maintenance
+    excluded: []
+    reserved:
+      - 4
+    default: excluded
+    paused: false
+    bounce:
+      - label:principal-review
+YAML
+
+resolved_parked_default="$(
+  cd "$parked/repo"
+  CLAUDE_CONFIG_DIR="$parked/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/mandate-lib.sh" config
+)"
+jq -e '.parked_label == "status:parked"' \
+  <<<"$resolved_parked_default" >/dev/null
+
+run_parked_sweep() {
+  parked_time="$1"
+  (
+    cd "$parked/repo"
+    PATH="$fixture/bin:$PATH" \
+      FAKE_GH_MODE="${FAKE_GH_MODE:-base}" \
+      MANDATE_SWEEP_MODE=full \
+      MANDATE_SWEEP_TIME="$parked_time" \
+      CLAUDE_CONFIG_DIR="$parked/config" \
+      CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+      bash "$PLUGIN_ROOT/scripts/sweep.sh"
+  )
+}
+
+run_parked_sweep "2026-08-14T00:00:00Z" >/dev/null
+jq -s -e '
+  length == 3
+  and any(.[];
+    .id == "example-org/parked-repo#2"
+    and .kind == "tripwire"
+    and .mandate.reason == "tripwire: bounce_all title:*credential*"
+  )
+  and any(.[];
+    .id == "example-org/parked-repo#3"
+    and .kind == "tripwire"
+    and .mandate.reason == "tripwire: project bounce label:principal-review"
+  )
+  and any(.[];
+    .id == "example-org/parked-repo#4"
+    and .kind == "decision"
+    and .mandate.reason == "reserved ref:#4"
+  )
+  and all(.[]; .id != "example-org/parked-repo#1")
+' "$parked_queue" >/dev/null
+jq -e '
+  .repos["example-org/parked-repo"] as $repo
+  | $repo.parked == 4
+    and ($repo.records | has("example-org/parked-repo#1"))
+    and $repo.items["example-org/parked-repo#1"].parked == true
+    and $repo.items["example-org/parked-repo#1"].stuck == false
+' "$parked_state" >/dev/null
+
+# More than a stuck threshold later, the old routine item is still neither
+# moved nor stuck. The differently labelled control proves ordinary tiering
+# remains active when the configured marker is absent.
+run_parked_sweep "2026-08-22T00:00:00Z" >/dev/null
+jq -s -e '
+  any(.[];
+    .id == "example-org/parked-repo#5"
+    and .kind == "stuck"
+    and .age_days >= 30
+  )
+  and all(.[]; .id != "example-org/parked-repo#1")
+' "$parked_queue" >/dev/null
+jq -e '
+  .repos["example-org/parked-repo"].items["example-org/parked-repo#1"]
+  | .parked == true and .stuck == false
+' "$parked_state" >/dev/null
+
+parked_digest="$(
+  cd "$parked/repo"
+  CLAUDE_CONFIG_DIR="$parked/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    MANDATE_NOW_EPOCH=1787356800 MANDATE_TODAY=2026-08-22 \
+    bash "$PLUGIN_ROOT/hooks/render-digest.sh"
+)"
+parked_digest_text="$(jq -r '.systemMessage' <<<"$parked_digest")"
+[ "$(grep -c '^4 parked$' <<<"$parked_digest_text")" -eq 1 ]
+if grep -q '^example-org/parked-repo#1  ' <<<"$parked_digest_text"; then
+  echo "parked routine item leaked into digest listings" >&2
+  exit 1
+fi
+grep -q '^example-org/parked-repo#2  ' <<<"$parked_digest_text"
+grep -q '^example-org/parked-repo#3  ' <<<"$parked_digest_text"
+grep -q '^example-org/parked-repo#4  ' <<<"$parked_digest_text"
+
+# Removing only the GitHub marker restores normal movement and, after the
+# configured interval, stuck tiering. No queue-state edit participates.
+FAKE_GH_MODE=parked-unparked \
+  run_parked_sweep "2026-08-23T00:00:00Z" >/dev/null
+jq -e '
+  select(.id == "example-org/parked-repo#1" and .kind == "moved")
+' "$parked_queue" >/dev/null
+jq -e '.repos["example-org/parked-repo"].parked == 3' \
+  "$parked_state" >/dev/null
+FAKE_GH_MODE=parked-unparked \
+  run_parked_sweep "2026-08-31T00:00:00Z" >/dev/null
+jq -e '
+  select(.id == "example-org/parked-repo#1" and .kind == "stuck")
+' "$parked_queue" >/dev/null
+
+# A portfolio-level override changes the marker everywhere without adding a
+# per-project exclusion. The previously stuck custom-marker control is removed
+# from routine tiers and represented only by the count.
+cat >"$parked/config/ostrom/mandates.yaml" <<'YAML'
+stuck_after_days: 7
+parked_label: hold:sequenced
+bounce_all:
+  - title:*credential*
+projects:
+  - repo: example-org/parked-repo
+    delegated:
+      - label:maintenance
+    excluded: []
+    reserved:
+      - 4
+    default: excluded
+    paused: false
+    bounce:
+      - label:principal-review
+YAML
+FAKE_GH_MODE=parked-unparked \
+  run_parked_sweep "2026-09-01T00:00:00Z" >/dev/null
+jq -s -e '
+  all(.[]; .id != "example-org/parked-repo#5")
+' "$parked_queue" >/dev/null
+jq -e '
+  .repos["example-org/parked-repo"].parked == 1
+  and .repos["example-org/parked-repo"].items["example-org/parked-repo#5"].parked == true
+' "$parked_state" >/dev/null
+custom_parked_digest="$(
+  cd "$parked/repo"
+  CLAUDE_CONFIG_DIR="$parked/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    MANDATE_NOW_EPOCH=1788220800 MANDATE_TODAY=2026-09-01 \
+    bash "$PLUGIN_ROOT/hooks/render-digest.sh"
+)"
+custom_parked_text="$(jq -r '.systemMessage' <<<"$custom_parked_digest")"
+[ "$(grep -c '^1 parked$' <<<"$custom_parked_text")" -eq 1 ]
+if grep -q '^example-org/parked-repo#5  ' <<<"$custom_parked_text"; then
+  echo "custom parked-label item leaked into digest listings" >&2
+  exit 1
+fi
 
 # The first sweep is a baseline. Only reserved, tripwire, and CI-failing
 # carve-outs queue; the paused project's issue tripwire still fires. #13 is

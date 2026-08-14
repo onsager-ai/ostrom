@@ -228,6 +228,7 @@ if [ -s "$MANDATE_STATE_FILE" ]; then
               end
             ),
             unclassified: (.value.unclassified // 0),
+            parked: (.value.parked // 0),
             item_cap: (.value.item_cap // null)
           }
       ]
@@ -247,6 +248,8 @@ jq -r '
   | select(.unclassified > 0)
   | .repo + ": " + (.unclassified | tostring) + " unclassified — /ostrom:desk triage"
 ' <<<"$state_rollups"
+parked_count="$(jq '[.[].parked] | add // 0' <<<"$state_rollups")"
+[ "$parked_count" -eq 0 ] || echo "$parked_count parked"
 
 total_projects="$(jq '.projects | length' <<<"$config")"
 troubled_projects="$(

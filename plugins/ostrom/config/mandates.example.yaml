@@ -7,6 +7,9 @@
 provider: file
 cadence_hours: 1
 stuck_after_days: 7
+# Portfolio-wide deferral marker. Remove this GitHub label to restore normal
+# tiering; reserved refs and tripwires still surface while it is present.
+parked_label: status:parked
 
 # Directories to search recursively for local Git repositories. Every linked
 # worktree belonging to a discovered repository is scanned too.

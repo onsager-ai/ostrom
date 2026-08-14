@@ -46,6 +46,12 @@ fields from `mandate.dossier`: Question, Options ruled out, Recommended
 action, and Blast radius. Do not fetch or copy an issue or PR body into the
 queue.
 
+The portfolio-level `parked_label` is a deferral marker, not a queue tier. A
+matching item remains in sweep state and contributes to the digest's one-line
+parked count, but has no moved, stuck, or other routine item listing. Reserved
+refs and shared or project tripwires still appear as decision/tripwire rows.
+Removing the label restores normal tiering without a queue-state edit.
+
 If no action was supplied, stop after the list and ask for approve, reject,
 or defer only when records are present.
 
