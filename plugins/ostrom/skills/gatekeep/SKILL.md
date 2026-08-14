@@ -48,6 +48,9 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/trace.sh" append pass-started \
   '{}'
 ```
 
+Immediately after that successful append, initialize `completed_candidates` to
+`0` and `skipped_repos` to `[]`; maintain both values for the rest of the pass.
+
 Every trace append in this protocol supplies separate fact and narration JSON
 objects. Put identifiers, actions, and values returned by GitHub or the gate in
 `fact`. Put only reasons, beliefs, or conclusions in `narration`; use `{}` when
@@ -70,7 +73,7 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/mandate-lib.sh" config
 This prints the same resolved roster JSON `mandate_load_config` returns to
 every in-process caller. If mandate is not configured, config resolution
 fails, or the resolved `projects` list is empty, report that fact to the
-principal and stop this iteration. From the resolved JSON, take only each
+principal and end the pass. From the resolved JSON, take only each
 project's `repo` pointer. Every roster repository is in scope, including a
 project marked `paused`; gatekeeping open pull requests is not routine
 builder work.
@@ -98,9 +101,8 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/gh-as.sh" gatekeeper "$repository" \
 own process, exports it only there, and `exec`s the given command — the
 token never enters this session's shell state, is never assigned to a
 variable here, and is never written to disk. Exit `111` means `gh-as.sh`
-itself could not authenticate and the given command never ran at all; report
-that and stop this iteration rather than retry with an ambient credential.
-Any other exit code is the given command's own, unchanged.
+itself could not authenticate and the given command never ran at all. Any
+other exit code is the given command's own, unchanged.
 
 The required `gatekeeper` argument names the caller at the call site; it does
 not narrow the shared token. The gatekeeper's own role is recorded in its
@@ -109,10 +111,31 @@ not narrow the shared token. The gatekeeper's own role is recorded in its
 commit under review was written by the builder itself, so it is self-asserted
 advisory metadata, not evidence of who acted and never an input to the gate.
 
-**A gatekeeper session that cannot mint an App token must stop, not continue as the principal.**
+Keep these two exit-`111` cases distinct:
 
-Continuing with an ambient token would escape the App's repository blast
-radius.
+- **Credentials cannot be loaded at all.** An error saying that the secrets
+  file is absent, neither `gatekeeper` nor shared credentials are configured,
+  a credential field is missing or malformed, the private key is unavailable,
+  or another session-wide authentication prerequisite failed means this pass
+  has no authority it can use. Do not retry the repository call. Set the pass
+  outcome to `error`, report the credential-loading failure without exposing
+  credential values, append the terminal row, release the lease, and end the
+  pass.
+- **Minting fails for one repository.** Any other exit `111` from a correctly
+  formed roster-repository invocation is scoped to that repository. Retry the
+  exact same `gh-as.sh` invocation once immediately, still with the
+  `gatekeeper` role and that repository. If the retry also exits `111`, add the
+  repository once to `skipped_repos`, report that it was skipped, discard any
+  partially enumerated candidates for it, and continue to the next repository.
+  One immediate retry is the deliberate bound: it cheaply absorbs a transient
+  installation lookup or token exchange failure without repeatedly delaying a
+  pass against a genuinely broken repository.
+
+**No exit-`111` path may run the command under an ambient credential, continue
+as the principal, call `gh` directly, or fall back to any token already in the
+environment.** Ending the pass for an unusable credential configuration and
+skipping a repository after its bounded retry both fail closed. An ambient
+token would escape the App's repository blast radius.
 
 ## 5. Enumerate every open pull request
 
@@ -124,8 +147,15 @@ selectors, the queue, prior gate verdicts, draft state, labels, or conclusions
 from another pull request. An iteration covers the whole roster because the
 artifact gate evaluates each pull request independently.
 
+Apply step 4's bounded retry to every pagination call. If a repository is
+skipped after a later page fails, discard the earlier pages from that
+repository so a partial enumeration is never mistaken for its complete set.
+Continue enumerating every other roster repository.
+
 Build a list of `(repo, PR number)` pointers before evaluating any one of them.
-Do not accept a candidate list from the builder.
+Do not accept a candidate list from the builder. Judge every candidate gathered
+from successfully enumerated repositories even when `skipped_repos` is not
+empty.
 
 ## 6. Drive `/ostrom:merge` independently for each candidate
 
@@ -167,7 +197,11 @@ merge.
 Emit one line per candidate containing only its `owner/repo#number` pointer,
 the verdict, and the action taken. Actions include merged, verdict commented,
 duplicate comment suppressed, escalated to principal, and repeat escalation
-suppressed. If no open pull requests exist, report that once.
+suppressed. Also emit one line per skipped repository naming its `owner/repo`
+pointer and that token minting still failed after one retry. If no open pull
+requests exist in the repositories that were successfully enumerated, report
+that once; do not describe a skipped repository as having no open pull
+requests.
 
 Then stop. The external pass timer owns the next poll; never create, renew, or
 wait on an in-session recurring wake. Do not switch to event-driven delivery.
@@ -175,15 +209,29 @@ wait on an in-session recurring wake. Do not switch to event-driven delivery.
 ## 8. End the trace and release the lease
 
 On every normal or error path after acquisition, append `pass-ended` before
-releasing the lease. Its fact object records the observed outcome and completed
-candidate count; narration may explain why an incomplete pass stopped but must
-not replace those facts. Then run, with the exact owner retained in step 2:
+releasing the lease. Increment `completed_candidates` only after a selected
+candidate has returned from `/ostrom:merge` with its action recorded. Add each
+repository that exhausts the retry in step 4 to `skipped_repos` once. The
+terminal fact uses the two values maintained since step 2 to record the observed
+outcome, truthful completed-candidate count, and skipped-repository list;
+narration may explain why an incomplete pass stopped but must not replace those
+facts.
+
+Use the existing outcome `completed` when the pass reaches the end without a
+skipped repository. Use outcome `partial` when the pass reaches the end after
+skipping one or more repositories, including when it successfully judged
+candidates in the other repositories; a productive pass with skips is not
+`error`. Reserve `error` for a pass-ending failure such as credentials that
+cannot be loaded at all or a trace failure. Then run, with the exact owner
+retained in step 2:
 
 ```sh
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/trace.sh" append pass-ended \
   "$(jq -cn --arg outcome "$pass_outcome" \
     --argjson completed "$completed_candidates" \
-    '{outcome: $outcome, completed_candidates: $completed}')" \
+    --argjson skipped "$skipped_repos" \
+    '{outcome: $outcome, completed_candidates: $completed,
+      skipped_repos: $skipped}')" \
   "$pass_end_narration"
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/lease.sh" release "$lease_owner"
 ```

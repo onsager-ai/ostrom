@@ -10,7 +10,7 @@
 # containing selector lists plus default and paused scalars.
 
 provider: file
-cadence_hours: 24
+cadence_hours: 1
 stuck_after_days: 7
 
 # Local repository discovery is opt-in. Never guess paths on the principal's

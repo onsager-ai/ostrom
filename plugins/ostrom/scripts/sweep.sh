@@ -12,11 +12,111 @@ command -v jq >/dev/null 2>&1 || { echo "mandate sweep: jq is required" >&2; exi
 command -v gh >/dev/null 2>&1 || { echo "mandate sweep: gh is required" >&2; exit 1; }
 
 query_limit=200
+full_reconciliation_seconds=$((24 * 60 * 60))
 
 if ! mandate_is_configured; then
   echo "mandate sweep: no mandates.yaml found at $MANDATE_USER_CONFIG or $MANDATE_REPO_CONFIG" >&2
   exit 2
 fi
+
+# Fetch GitHub's issues change feed one page at a time so the first page's
+# validator can be persisted and reused. `gh api --include` deliberately keeps
+# the HTTP status and ETag beside the JSON body: a conditional 304 is a normal,
+# empty delta, while every other non-2xx response is a sweep fault.
+fetch_issue_page() {
+  local repo="$1"
+  local since="$2"
+  local page="$3"
+  local etag="$4"
+  local response="$work/issues-response-$page"
+  local body="$work/issues-page-$page.json"
+  local endpoint status detail
+  local -a headers=()
+
+  endpoint="repos/$repo/issues?state=open&sort=updated&direction=asc&per_page=100&page=$page"
+  if [ -n "$since" ]; then
+    endpoint="$endpoint&since=$since"
+  fi
+  if [ "$page" -eq 1 ] && [ -n "$etag" ]; then
+    headers=(-H "If-None-Match: $etag")
+  fi
+
+  if ! gh api -X GET --include "${headers[@]}" "$endpoint" \
+    >"$response" 2>"$work/gh-error"; then
+    status="$(awk 'toupper($1) ~ /^HTTP\// {code=$2} END {print code}' "$response")"
+    if [ "$status" != "304" ]; then
+      detail="$(tr '\n' ' ' <"$work/gh-error")"
+      echo "mandate sweep: failed to query the issues change feed for $repo${detail:+: $detail}" >&2
+      return 5
+    fi
+  fi
+
+  status="$(awk 'toupper($1) ~ /^HTTP\// {code=$2} END {print code}' "$response")"
+  case "$status" in
+    304)
+      printf '%s\n' '[]' >"$body"
+      ;;
+    2??)
+      awk '
+        toupper($1) ~ /^HTTP\// { body = 0; next }
+        body { print }
+        /^[[:space:]]*$/ { body = 1 }
+      ' "$response" >"$body"
+      if ! jq -e 'type == "array"' "$body" >/dev/null; then
+        echo "mandate sweep: issues change feed for $repo returned a non-array body" >&2
+        return 5
+      fi
+      ;;
+    *)
+      detail="$(tr '\n' ' ' <"$work/gh-error")"
+      echo "mandate sweep: issues change feed for $repo returned HTTP ${status:-unknown}${detail:+: $detail}" >&2
+      return 5
+      ;;
+  esac
+
+  if [ "$page" -eq 1 ]; then
+    issue_http_status="$status"
+    issue_etag="$(awk '
+      tolower($1) == "etag:" {
+        sub(/^[^:]*:[[:space:]]*/, "")
+        sub(/\r$/, "")
+        value = $0
+      }
+      END { print value }
+    ' "$response")"
+  fi
+}
+
+fetch_issues() {
+  local repo="$1"
+  local since="$2"
+  local previous_etag="$3"
+  local first_count second_count
+
+  issue_http_status=""
+  issue_etag=""
+  fetch_issue_page "$repo" "$since" 1 "$previous_etag" || return $?
+  first_count="$(jq 'length' "$work/issues-page-1.json")"
+  if [ "$issue_http_status" = "304" ] || [ "$first_count" -lt 100 ]; then
+    cp "$work/issues-page-1.json" "$work/issues.json"
+    return
+  fi
+
+  fetch_issue_page "$repo" "$since" 2 "" || return $?
+  second_count="$(jq 'length' "$work/issues-page-2.json")"
+  jq -cn \
+    --slurpfile first "$work/issues-page-1.json" \
+    --slurpfile second "$work/issues-page-2.json" \
+    '$first[0] + $second[0]' >"$work/issues.json"
+  # A page-one ETag validates only page one, not the entire delta. Do not
+  # reuse it when pagination was necessary or a later page could change while
+  # page one stayed byte-identical.
+  issue_etag=""
+  if [ "$first_count" -eq 100 ] && [ "$second_count" -eq 100 ]; then
+    echo "mandate sweep: issues change feed for $repo reached query_limit $query_limit; refusing a truncated sweep" >&2
+    return 6
+  fi
+}
 
 # #106/#109: sweep_org() below is the entire per-repository body -- every
 # `gh` call the sweep makes. It runs once per distinct GitHub organisation
@@ -70,14 +170,23 @@ sweep_org() {
     printf '%s\n' "$project" >"$work/project.json"
     repo="$(jq -r '.repo' "$work/project.json")"
     gh_error="$work/gh-error"
+    jq -c --arg repo "$repo" '.repos[$repo] // {}' "$work/old-state.json" \
+      >"$work/previous.json"
+    previous_cursor="$(jq -r '.cursor // ""' "$work/previous.json")"
+    previous_etag="$(jq -r '.etag // ""' "$work/previous.json")"
 
-    if ! gh issue list --repo "$repo" --state open --limit "$query_limit" \
-      --json number,title,body,labels,createdAt,updatedAt,url \
-      >"$work/issues.json" 2>"$gh_error"; then
-      detail="$(tr '\n' ' ' <"$gh_error")"
-      echo "mandate sweep: failed to query open issues for $repo${detail:+: $detail}" >&2
-      exit 5
+    issue_since=""
+    if [ "$sweep_mode" = "incremental" ]; then
+      issue_since="$previous_cursor"
     fi
+    fetch_issues "$repo" "$issue_since" "$previous_etag" || exit $?
+    issue_cursor_candidate="$(
+      jq -r '[.[] | (.updatedAt // .updated_at // empty)] | max // ""' \
+        "$work/issues.json"
+    )"
+    # Pull requests intentionally stay on a complete open listing. Check and
+    # file changes do not reliably move updatedAt, so putting PRs behind the
+    # issues change-feed cursor would leave stale CI and path classifications.
     if ! gh pr list --repo "$repo" --state open --limit "$query_limit" \
       --json number,title,body,labels,createdAt,updatedAt,url,isDraft,reviewDecision,statusCheckRollup,closingIssuesReferences,files \
       >"$work/prs.json" 2>"$gh_error"; then
@@ -85,11 +194,11 @@ sweep_org() {
       echo "mandate sweep: failed to query open PRs and CI for $repo${detail:+: $detail}" >&2
       exit 5
     fi
-    item_cap='null'
-    if [ "$(jq 'length' "$work/issues.json")" -eq "$query_limit" ] ||
-      [ "$(jq 'length' "$work/prs.json")" -eq "$query_limit" ]; then
-      item_cap="$query_limit"
+    if [ "$(jq 'length' "$work/prs.json")" -eq "$query_limit" ]; then
+      echo "mandate sweep: open PR query for $repo reached query_limit $query_limit; refusing a truncated sweep" >&2
+      exit 6
     fi
+    item_cap='null'
 
     # #78/#77 both need the default branch's own history — one lookup here,
     # not two. Unlike the issue/PR queries above, a failure here degrades to
@@ -206,8 +315,36 @@ sweep_org() {
               (.ready | tostring),
               .review
             ] | join("|"));
-        [($issues[0][] | normalized("issue")), ($prs[0][] | normalized("pr"))]
-      ' >"$work/items.json"
+        [
+          ($issues[0][]
+            | select((.pull_request // null) == null)
+            | .createdAt = (.createdAt // .created_at)
+            | .updatedAt = (.updatedAt // .updated_at)
+            | .url = (.url // .html_url)
+            | normalized("issue")),
+          ($prs[0][] | normalized("pr"))
+        ]
+      ' >"$work/fresh-items.json"
+
+    if [ "$sweep_mode" = "full" ] && [ "$issue_http_status" != "304" ]; then
+      cp "$work/fresh-items.json" "$work/items.json"
+    else
+      # The issues response is a delta, while the PR response is a complete
+      # open set. Retain untouched issues, replace every PR, then overlay all
+      # fresh records by id. The same merge is safe for a conditional full
+      # request that returned 304 because its complete open representation is
+      # unchanged. A later non-304 full reconciliation is what removes an
+      # issue that left the open set without appearing in `since` results.
+      jq -cn \
+        --slurpfile previous "$work/previous.json" \
+        --slurpfile fresh "$work/fresh-items.json" '
+          ([($previous[0].records // {})[] | select(.type != "pr")]) as $issues
+          | reduce $fresh[0][] as $item ($issues;
+              map(select(.id != $item.id)) + [$item]
+            )
+          | sort_by(.id)
+        ' >"$work/items.json"
+    fi
 
     jq -cn \
       --slurpfile project "$work/project.json" \
@@ -232,10 +369,10 @@ sweep_org() {
           }
       ' >"$work/policy.json"
 
-    jq -c --arg repo "$repo" '.repos[$repo] // {}' "$work/old-state.json" \
-      >"$work/previous.json"
     jq -cn \
         --arg sweep_started "$sweep_started" \
+        --arg sweep_mode "$sweep_mode" \
+        --arg issue_cursor_candidate "$issue_cursor_candidate" \
         --slurpfile project "$work/project.json" \
         --slurpfile config "$work/config.json" \
         --slurpfile items "$work/items.json" \
@@ -645,9 +782,19 @@ sweep_org() {
             end
           ) as $notice
         | (
-            if $initial then ([$sweep_started, $items[].updated] | max)
+            if $initial then $sweep_started
             elif $policy_changed then $previous.cursor
-            else ([$previous.cursor, $items[].updated] | max)
+            elif $sweep_mode == "full" then $sweep_started
+            else (
+              [
+                $previous.cursor,
+                (if $issue_cursor_candidate > $sweep_started
+                  then $sweep_started
+                  else $issue_cursor_candidate
+                  end)
+              ]
+              | max
+            )
             end
           ) as $cursor
         | {
@@ -679,7 +826,7 @@ sweep_org() {
             repo_state: {
               cursor: $cursor,
               previous_cursor: (
-                if $changed
+                if $changed or $cursor != ($previous.cursor // null)
                 then ($previous.cursor // "initial")
                 else ($previous.previous_cursor // $previous.cursor // "initial")
                 end
@@ -917,8 +1064,17 @@ sweep_org() {
         --slurpfile state "$work/new-state.json" \
         --slurpfile analysis "$work/analysis.json" \
         --slurpfile ci_drift "$work/ci-drift.json" \
+        --slurpfile records "$work/items.json" \
+        --arg etag "${issue_etag:-$previous_etag}" \
         '$state[0] | .version = 2
-          | .repos[$repo] = ($analysis[0].repo_state + {ci_drift: $ci_drift[0].state})' \
+          | .repos[$repo] = (
+              $analysis[0].repo_state
+              + {
+                  ci_drift: $ci_drift[0].state,
+                  etag: (if $etag == "" then null else $etag end),
+                  records: (reduce $records[0][] as $record ({}; .[$record.id] = $record))
+                }
+            )' \
         >"$work/next.json"
     mv "$work/next.json" "$work/new-state.json"
   done < <(jq -c --arg org "$org" '.projects[] | select((.repo | split("/")[0]) == $org)' "$work/config.json")
@@ -939,6 +1095,7 @@ if [ -n "${MANDATE_SWEEP_ORG:-}" ]; then
   fi
 
   sweep_started="${MANDATE_SWEEP_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
+  sweep_mode="$MANDATE_SWEEP_MODE_EFFECTIVE"
   sweep_org "$MANDATE_SWEEP_ORG"
   exit 0
 fi
@@ -974,6 +1131,45 @@ else
 fi
 
 sweep_started="${MANDATE_SWEEP_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
+requested_sweep_mode="${MANDATE_SWEEP_MODE:-auto}"
+case "$requested_sweep_mode" in
+  auto | full | incremental) ;;
+  *)
+    echo "mandate sweep: MANDATE_SWEEP_MODE must be auto, full, or incremental" >&2
+    exit 2
+    ;;
+esac
+
+state_supports_incremental="$(
+  jq -r \
+    --slurpfile config "$work/config.json" '
+      . as $state
+      | all($config[0].projects[];
+          .repo as $repo
+          | ($state.repos[$repo].cursor | type) == "string"
+          and ($state.repos[$repo].records | type) == "object"
+        )
+    ' "$work/old-state.json"
+)"
+full_reconciliation_due="$(
+  jq -nr \
+    --arg now "$sweep_started" \
+    --arg last "$(jq -r '.last_full_reconciliation // ""' "$work/old-state.json")" \
+    --argjson interval "$full_reconciliation_seconds" '
+      try (
+        $last == ""
+        or ((($now | fromdateiso8601) - ($last | fromdateiso8601)) as $age
+          | $age < 0 or $age >= $interval)
+      ) catch true
+    '
+)"
+if [ "$requested_sweep_mode" = "full" ] || \
+  [ "$state_supports_incremental" != "true" ] || \
+  { [ "$requested_sweep_mode" = "auto" ] && [ "$full_reconciliation_due" = "true" ]; }; then
+  sweep_mode="full"
+else
+  sweep_mode="incremental"
+fi
 printf '%s\n' '[]' >"$work/generated.json"
 printf '%s\n' '[]' >"$work/active-ids.json"
 printf '%s\n' '[]' >"$work/current-items.json"
@@ -1009,6 +1205,7 @@ while IFS= read -r org; do
   # driver already computed, so every organisation's rows are classified
   # against the same instant regardless of which one is processed first.
   MANDATE_SWEEP_ORG="$org" MANDATE_SWEEP_WORK="$work" MANDATE_SWEEP_TIME="$sweep_started" \
+    MANDATE_SWEEP_MODE_EFFECTIVE="$sweep_mode" \
     bash "$SCRIPT_DIR/gh-as.sh" gatekeeper "$anchor_repo" \
     bash "${BASH_SOURCE[0]}"
 done < <(jq -r '[.projects[].repo | split("/")[0]] | unique | .[]' "$work/config.json")
@@ -1051,6 +1248,19 @@ jq -cn \
     | .repos |= with_entries(
         select(.key as $repo | ($configured_repos | index($repo)) != null)
       )
+  ' >"$work/next.json"
+mv "$work/next.json" "$work/new-state.json"
+
+jq -cn \
+    --slurpfile state "$work/new-state.json" \
+    --arg mode "$sweep_mode" \
+    --arg sweep_started "$sweep_started" '
+    $state[0]
+    | .sweep_mode = $mode
+    | if $mode == "full"
+      then .last_full_reconciliation = $sweep_started
+      else .
+      end
   ' >"$work/next.json"
 mv "$work/next.json" "$work/new-state.json"
 
@@ -1197,7 +1407,7 @@ jq -S . "$work/new-state.json" >"$work/state.json"
 mandate_write_if_changed "$work/queue.jsonl" "$MANDATE_QUEUE_FILE"
 mandate_write_if_changed "$work/state.json" "$MANDATE_STATE_FILE"
 
-# The state file mtime is the daily-cadence stamp. Touching it changes no
+# The state file mtime is the configured-cadence stamp. Touching it changes no
 # serialized state, so a repeat sweep with no upstream activity has an empty
 # content diff.
 touch "$MANDATE_STATE_FILE"
@@ -1209,8 +1419,17 @@ else
   echo "mandate sweep: $project_count projects; $queue_changes queue changes"
 fi
 
-# Publishing is downstream of the governing sweep. A remote, auth, or merge
-# failure is reported but must never change the sweep's successful outcome.
-if ! bash "$SCRIPT_DIR/publish.sh"; then
-  echo "mandate sweep: publish failed; local records remain authoritative" >&2
-fi
+# Publishing is downstream of the governing sweep. A config guard skip is a
+# deliberate outcome distinct from publication failures; neither can change
+# the sweep's successful outcome.
+publish_status=0
+bash "$SCRIPT_DIR/publish.sh" || publish_status=$?
+case "$publish_status" in
+  0) ;;
+  3)
+    echo "mandate sweep: publish deliberately skipped by config guard; local records remain authoritative" >&2
+    ;;
+  *)
+    echo "mandate sweep: publish failed; local records remain authoritative" >&2
+    ;;
+esac

@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Derive the public governance record tree and publish it to an orphan branch.
+# The publish destination follows the config the sweep read: a non-operator
+# config may publish only when its caller names a non-default destination.
 
 set -euo pipefail
 umask 077
@@ -21,13 +23,6 @@ case "${1:-}" in
 esac
 [ "$#" -le 1 ] || usage
 
-for command_name in git jq; do
-  command -v "$command_name" >/dev/null 2>&1 || {
-    echo "mandate publish: $command_name is required" >&2
-    exit 1
-  }
-done
-
 allowlist_file="${MANDATE_PUBLISH_ALLOWLIST:-$MANDATE_PLUGIN_ROOT/config/publish-allowlist.json}"
 publish_dir="${MANDATE_PUBLISH_DIR:-$MANDATE_DATA_DIR/publish}"
 default_publish_repo="ostrom"
@@ -37,6 +32,23 @@ publish_time="${MANDATE_PUBLISH_TIME:-${MANDATE_SWEEP_TIME:-$(date -u +%Y-%m-%dT
 queue_file="$MANDATE_QUEUE_FILE"
 gate_file="$MANDATE_GATE_LOG"
 state_file="$MANDATE_STATE_FILE"
+
+# Exit 3 is a protocol outcome consumed by sweep.sh: the publication was
+# deliberately skipped before any destination-facing command was attempted.
+publish_skip_status=3
+operator_config_dir="$HOME/.claude"
+if [ "$MANDATE_CONFIG_DIR" != "$operator_config_dir" ] && \
+  [ "$publish_remote" = "$default_publish_repo" ]; then
+  echo "mandate publish: skipped scratch config directory '$MANDATE_CONFIG_DIR'; refused destination '$publish_remote'" >&2
+  exit "$publish_skip_status"
+fi
+
+for command_name in git jq; do
+  command -v "$command_name" >/dev/null 2>&1 || {
+    echo "mandate publish: $command_name is required" >&2
+    exit 1
+  }
+done
 
 jq -e '
   type == "object"
