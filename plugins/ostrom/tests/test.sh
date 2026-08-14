@@ -148,6 +148,9 @@ for trace_kind in artifact-produced gate-verdict-consumed; do
 done
 grep -q 'MANDATE_LEASE_NAME=builder.lease' "$work_skill"
 grep -q 'scripts/sweep.sh' "$work_skill"
+grep -Fq 'A per-repository concurrency refusal skips only that candidate' \
+  "$work_skill"
+grep -Fq 'continue to the next candidate instead of ending the' "$work_skill"
 grep -q '^argument-hint: "\[optional queue focus, e.g. project name or item class\]"$' \
   <<<"$work_frontmatter"
 grep -q 'invocation input as a natural-language filter' "$work_skill"
@@ -1592,9 +1595,8 @@ set -e
 [ "$open_pr_dispatch_status" -eq 3 ]
 [ "$(wc -l <"$dispatch_calls" | tr -d '[:space:]')" -eq 1 ]
 
-# Two unmatched orders consume the default concurrency limit even if they are
-# for different items. The new item's speculative lease is released when the
-# dispatcher refuses it.
+# Two unmatched orders consume the global capacity limit. The global refusal
+# keeps its established text even though both rows happen to share a repo.
 concurrency_config="$dispatch_fixture/concurrency-config"
 write_dispatch_config "$concurrency_config"
 cat >"$concurrency_config/ostrom/sprint.jsonl" <<'JSONL'
@@ -1610,6 +1612,7 @@ concurrency_order="$(
     MANDATE_TRACE_TIME="2026-08-11T01:02:00Z" \
     bash "$PLUGIN_ROOT/scripts/work-order.sh" create "$concurrency_candidate"
 )"
+concurrency_stderr="$dispatch_fixture/concurrency.err"
 set +e
 CLAUDE_CONFIG_DIR="$concurrency_config" \
   MANDATE_NOW_EPOCH="$cap_today_epoch" \
@@ -1618,13 +1621,153 @@ CLAUDE_CONFIG_DIR="$concurrency_config" \
   MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
   CODEX_BIN="$fake_dispatch_codex" \
   FAKE_SYSTEMD_ARGS="$dispatch_args" FAKE_SYSTEMD_CALLS="$dispatch_calls" \
-  bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$concurrency_order" >/dev/null 2>&1
+  bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$concurrency_order" \
+    >/dev/null 2>"$concurrency_stderr"
 concurrency_dispatch_status=$?
 set -e
 [ "$concurrency_dispatch_status" -eq 3 ]
+grep -Fxq 'ostrom dispatch: concurrency limit reached (2/2)' \
+  "$concurrency_stderr"
+if grep -Fq 'per-repository concurrency limit reached' "$concurrency_stderr"; then
+  echo "global concurrency refusal used the repository-specific reason" >&2
+  exit 1
+fi
 concurrency_item_hash="$(bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash 'example-org/example-repo#132')"
 [ ! -e "$concurrency_config/ostrom/implementer-item-$concurrency_item_hash.lease" ]
 [ "$(wc -l <"$dispatch_calls" | tr -d '[:space:]')" -eq 1 ]
+
+# The existing global override contract still rejects zero and non-integers
+# with exit 2, before either capacity guard can refuse the order.
+for invalid_global_limit in 0 not-an-integer; do
+  set +e
+  CLAUDE_CONFIG_DIR="$concurrency_config" \
+    MANDATE_NOW_EPOCH="$cap_today_epoch" \
+    MANDATE_MAX_IMPLEMENTERS="$invalid_global_limit" \
+    MANDATE_GH_AS_BIN="$fake_dispatch_gh" \
+    MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
+    CODEX_BIN="$fake_dispatch_codex" \
+    FAKE_SYSTEMD_ARGS="$dispatch_args" FAKE_SYSTEMD_CALLS="$dispatch_calls" \
+    bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$concurrency_order" \
+      >/dev/null 2>"$dispatch_fixture/invalid-global-$invalid_global_limit.err"
+  invalid_global_status=$?
+  set -e
+  [ "$invalid_global_status" -eq 2 ]
+  grep -Fxq 'ostrom dispatch: MANDATE_MAX_IMPLEMENTERS must be a positive integer' \
+    "$dispatch_fixture/invalid-global-$invalid_global_limit.err"
+done
+
+# With global room remaining, the default per-repository cap of 1 refuses a
+# second item in the same repository and names the collision scope distinctly.
+repository_default_config="$dispatch_fixture/repository-default-config"
+write_dispatch_config "$repository_default_config"
+cat >"$repository_default_config/ostrom/sprint.jsonl" <<'JSONL'
+{"ts":"2026-08-11T01:00:00Z","kind":"work-dispatched","fact":{"schema_version":1,"item_id":"example-org/example-repo#130","order_id":"same-repository-order","unit_name":"ostrom-implementer-aaaaaaaaaaaaaaaa","backend":"systemd","cost_ceiling_usd":20,"token_ceiling":500000,"cost_usd":null,"duration_seconds":0},"narration":{}}
+JSONL
+repository_default_stderr="$dispatch_fixture/repository-default.err"
+set +e
+CLAUDE_CONFIG_DIR="$repository_default_config" \
+  MANDATE_NOW_EPOCH="$cap_today_epoch" \
+  MANDATE_MAX_IMPLEMENTERS=6 \
+  MANDATE_GH_AS_BIN="$fake_dispatch_gh" \
+  MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
+  CODEX_BIN="$fake_dispatch_codex" \
+  FAKE_SYSTEMD_ARGS="$dispatch_fixture/repository-default-systemd-args" \
+  FAKE_SYSTEMD_CALLS="$dispatch_fixture/repository-default-systemd-calls" \
+  bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$concurrency_order" \
+    >/dev/null 2>"$repository_default_stderr"
+repository_default_status=$?
+set -e
+[ "$repository_default_status" -eq 3 ]
+grep -Fxq \
+  'ostrom dispatch: per-repository concurrency limit reached for example-org/example-repo (1/1)' \
+  "$repository_default_stderr"
+if grep -Fq 'ostrom dispatch: concurrency limit reached (' \
+    "$repository_default_stderr"; then
+  echo "repository concurrency refusal used the global reason" >&2
+  exit 1
+fi
+[ ! -e "$dispatch_fixture/repository-default-systemd-calls" ]
+[ ! -e "$repository_default_config/ostrom/implementer-item-$concurrency_item_hash.lease" ]
+
+# An in-flight row from another repository does not consume this repository's
+# collision allowance, so both repositories can remain in flight concurrently.
+different_repository_config="$dispatch_fixture/different-repository-config"
+write_dispatch_config "$different_repository_config"
+cat >"$different_repository_config/ostrom/sprint.jsonl" <<'JSONL'
+{"ts":"2026-08-11T01:00:00Z","kind":"work-dispatched","fact":{"schema_version":1,"item_id":"example-org/another-repo#130","order_id":"other-repository-order","unit_name":"ostrom-implementer-aaaaaaaaaaaaaaaa","backend":"systemd","cost_ceiling_usd":20,"token_ceiling":500000,"cost_usd":null,"duration_seconds":0},"narration":{}}
+JSONL
+different_repository_unit="$(
+  CLAUDE_CONFIG_DIR="$different_repository_config" \
+    MANDATE_NOW_EPOCH="$cap_today_epoch" \
+    MANDATE_MAX_IMPLEMENTERS=2 \
+    MANDATE_GH_AS_BIN="$fake_dispatch_gh" \
+    MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
+    CODEX_BIN="$fake_dispatch_codex" \
+    FAKE_SYSTEMD_ARGS="$dispatch_fixture/different-repository-systemd-args" \
+    FAKE_SYSTEMD_CALLS="$dispatch_fixture/different-repository-systemd-calls" \
+    bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$concurrency_order"
+)"
+[ "$different_repository_unit" = "ostrom-implementer-${concurrency_item_hash:0:16}" ]
+[ "$(wc -l <"$dispatch_fixture/different-repository-systemd-calls" | tr -d '[:space:]')" -eq 1 ]
+jq -s -e '
+  length == 2
+  and ([.[].fact.item_id | sub("#.*$"; "")] | unique | length) == 2
+' "$different_repository_config/ostrom/sprint.jsonl" >/dev/null
+
+# Tests can raise the collision allowance without editing an operator roster.
+environment_override_config="$dispatch_fixture/environment-override-config"
+write_dispatch_config "$environment_override_config"
+cat >"$environment_override_config/ostrom/sprint.jsonl" <<'JSONL'
+{"ts":"2026-08-11T01:00:00Z","kind":"work-dispatched","fact":{"schema_version":1,"item_id":"example-org/example-repo#130","order_id":"environment-override-order","unit_name":"ostrom-implementer-aaaaaaaaaaaaaaaa","backend":"systemd","cost_ceiling_usd":20,"token_ceiling":500000,"cost_usd":null,"duration_seconds":0},"narration":{}}
+JSONL
+environment_override_unit="$(
+  CLAUDE_CONFIG_DIR="$environment_override_config" \
+    MANDATE_NOW_EPOCH="$cap_today_epoch" \
+    MANDATE_MAX_IMPLEMENTERS=6 \
+    MANDATE_MAX_IMPLEMENTERS_PER_REPOSITORY=2 \
+    MANDATE_GH_AS_BIN="$fake_dispatch_gh" \
+    MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
+    CODEX_BIN="$fake_dispatch_codex" \
+    FAKE_SYSTEMD_ARGS="$dispatch_fixture/environment-override-systemd-args" \
+    FAKE_SYSTEMD_CALLS="$dispatch_fixture/environment-override-systemd-calls" \
+    bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$concurrency_order"
+)"
+[ "$environment_override_unit" = "ostrom-implementer-${concurrency_item_hash:0:16}" ]
+[ "$(wc -l <"$dispatch_fixture/environment-override-systemd-calls" | tr -d '[:space:]')" -eq 1 ]
+
+# The same raised allowance is honoured when it comes from this project's
+# roster entry, proving dispatch consumes mandate-lib's parsed project value.
+project_override_config="$dispatch_fixture/project-override-config"
+mkdir -p "$project_override_config/ostrom"
+cat >"$project_override_config/ostrom/mandates.yaml" <<YAML
+search_roots:
+  - $dispatch_search_root
+projects:
+  - repo: example-org/example-repo
+    max_implementers_per_repository: 2
+    delegated: []
+    excluded: []
+    reserved: []
+    default: excluded
+    paused: false
+    bounce: []
+YAML
+cat >"$project_override_config/ostrom/sprint.jsonl" <<'JSONL'
+{"ts":"2026-08-11T01:00:00Z","kind":"work-dispatched","fact":{"schema_version":1,"item_id":"example-org/example-repo#130","order_id":"project-override-order","unit_name":"ostrom-implementer-aaaaaaaaaaaaaaaa","backend":"systemd","cost_ceiling_usd":20,"token_ceiling":500000,"cost_usd":null,"duration_seconds":0},"narration":{}}
+JSONL
+project_override_unit="$(
+  CLAUDE_CONFIG_DIR="$project_override_config" \
+    MANDATE_NOW_EPOCH="$cap_today_epoch" \
+    MANDATE_MAX_IMPLEMENTERS=6 \
+    MANDATE_GH_AS_BIN="$fake_dispatch_gh" \
+    MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
+    CODEX_BIN="$fake_dispatch_codex" \
+    FAKE_SYSTEMD_ARGS="$dispatch_fixture/project-override-systemd-args" \
+    FAKE_SYSTEMD_CALLS="$dispatch_fixture/project-override-systemd-calls" \
+    bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$concurrency_order"
+)"
+[ "$project_override_unit" = "ostrom-implementer-${concurrency_item_hash:0:16}" ]
+[ "$(wc -l <"$dispatch_fixture/project-override-systemd-calls" | tr -d '[:space:]')" -eq 1 ]
 
 # The daily cap is checked again immediately before dispatch, including the
 # new order's full reservation. Reaching it creates no unit and leaks no lease.
@@ -3258,6 +3401,7 @@ bounce_all:
   - label:user-boundary
 projects:
   - repo: example-org/example-repo
+    max_implementers_per_repository: 2
     delegated:
       - label:user-scope
     excluded:
@@ -3293,7 +3437,27 @@ jq -e '
   and .projects[0].reserved == [17]
   and .projects[0].default == "delegated"
   and .projects[0].paused == false
+  and .projects[0].max_implementers_per_repository == 2
 ' <<<"$layered" >/dev/null
+
+# The optional roster key is resolved by mandate-lib rather than by dispatch.
+# A repository without the key keeps the conservative collision default of 1.
+configured_repository_limit="$(
+  CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" bash -c '
+    source "$CLAUDE_PLUGIN_ROOT/scripts/mandate-lib.sh"
+    mandate_project_max_implementers_per_repository \
+      example-org/example-repo "$1"
+  ' _ "$layered"
+)"
+[ "$configured_repository_limit" -eq 2 ]
+default_repository_limit="$(
+  CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" bash -c '
+    source "$CLAUDE_PLUGIN_ROOT/scripts/mandate-lib.sh"
+    mandate_project_max_implementers_per_repository \
+      example-org/another-repo "$1"
+  ' _ "$layered"
+)"
+[ "$default_repository_limit" -eq 1 ]
 
 # A headless Bash tool refuses to statically permit `source "$path"`, since
 # sourcing evaluates its argument as shell code. gatekeep/SKILL.md step 3

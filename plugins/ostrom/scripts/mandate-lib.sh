@@ -175,8 +175,9 @@ mandate_is_configured() {
 # Parse the deliberately small shipped schema without pretending to be a
 # general YAML parser. Supported input:
 #   root scalars; bounce_all:/search_roots: followed by two-space list items; projects:
-#   followed by "- repo:" entries, each with default + paused scalars and
-#   six-space delegated/excluded/reserved/bounce lists.
+#   followed by "- repo:" entries, each with default + paused scalars, an
+#   optional max_implementers_per_repository positive integer, and six-space
+#   delegated/excluded/reserved/bounce lists.
 mandate_yaml_to_json() {
   file="$1"
   [ -f "$file" ] || {
@@ -298,6 +299,18 @@ mandate_yaml_to_json() {
         next
       }
       if (section == "projects" && current_repo != "" && indent == 4 &&
+          text ~ /^max_implementers_per_repository:[[:space:]]*/) {
+        value = text
+        sub(/^max_implementers_per_repository:[[:space:]]*/, "", value)
+        value = unquote(value)
+        if (value !~ /^[1-9][0-9]*$/) {
+          fail("max_implementers_per_repository must be a positive integer for " current_repo)
+        } else {
+          print "project_field\t" current_repo "\tmax_implementers_per_repository\t" value
+        }
+        next
+      }
+      if (section == "projects" && current_repo != "" && indent == 4 &&
           (text ~ /^(delegated|excluded|reserved|bounce):$/ ||
            text ~ /^(delegated|excluded|reserved|bounce): \[\]$/)) {
         project_list = text
@@ -354,6 +367,8 @@ mandate_yaml_to_json() {
             | if $index == null then error("project field appeared before its repo")
               elif $parts[2] == "paused"
               then .projects[$index].paused = ($parts[3] == "true")
+              elif $parts[2] == "max_implementers_per_repository"
+              then .projects[$index][$parts[2]] = ($parts[3] | tonumber)
               else .projects[$index][$parts[2]] = $parts[3]
               end
           elif $parts[0] == "project_list" then
@@ -400,10 +415,12 @@ mandate_load_config() {
       and (.excluded | type == "array" and all(.[]; type == "string" and length > 0))
       and (.reserved | type == "array" and all(.[]; type == "number" and . > 0 and . == floor))
       and (.bounce | type == "array" and all(.[]; type == "string" and length > 0))
+      and ((.max_implementers_per_repository // 1)
+        | type == "number" and . > 0 and . == floor)
     )
     and (([.projects[].repo] | length) == ([.projects[].repo] | unique | length))
   ' >/dev/null <<<"$config"; then
-    echo "mandate: invalid config; provider must be file, cadence_hours a positive integer, search_roots non-empty strings, and every project must have a unique owner/name repo, valid default, boolean paused value, selector lists, and positive integer reserved refs" >&2
+    echo "mandate: invalid config; provider must be file, cadence_hours a positive integer, search_roots non-empty strings, and every project must have a unique owner/name repo, valid default, boolean paused value, selector lists, positive integer reserved refs, and an optional positive max_implementers_per_repository" >&2
     return 2
   fi
 
@@ -453,6 +470,25 @@ mandate_load_config() {
   fi
 
   printf '%s\n' "$config"
+}
+
+# Return the collision cap for one roster repository. Capacity remains the
+# dispatcher's global concern; this project value only prevents concurrent
+# implementers from creating branches that can collide in the same repository.
+mandate_project_max_implementers_per_repository() {
+  local repository="$1"
+  local config="${2:-}"
+  local default_limit="${3:-1}"
+
+  if [ -z "$config" ]; then
+    config="$(mandate_load_config)" || return
+  fi
+
+  jq -er --arg repository "$repository" --argjson default "$default_limit" '
+    ([.projects[]?
+      | select(.repo == $repository)
+      | .max_implementers_per_repository][0]) // $default
+  ' <<<"$config"
 }
 
 # Resolve a roster repository to a primary local checkout. All callers share

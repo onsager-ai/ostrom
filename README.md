@@ -109,6 +109,11 @@ Supported selectors are `label:`, `scope:`, `type:`, `path:`, `ref:`, and
 `title:` selector must include `*`. Pull requests inherit the labels and refs
 of their closing issues.
 
+Each project may set `max_implementers_per_repository` to a positive integer;
+omitting it defaults to 1. This per-repository limit prevents implementer
+branches from colliding. It is independent of `MANDATE_MAX_IMPLEMENTERS`, the
+global dispatch capacity limit for shared compute and budget.
+
 Classification precedence is reserved → shared/project bounce → excluded →
 delegated → `default`. The default is `unclassified`, which produces one
 per-repo `/ostrom:desk` triage line rather than one queue row per item; projects may

@@ -242,6 +242,11 @@ referencing the item, and no `work-dispatched` row without a matching terminal
 row. It also checks the daily cap, reserves the order ceiling, and enforces the
 concurrency limit. Never reproduce or weaken those checks in prose.
 
+A per-repository concurrency refusal skips only that candidate: record the
+attempt as usual and continue to the next candidate instead of ending the
+pass. Candidates from another repository may still use available global
+capacity.
+
 Dispatch success is the end of work on that item for this pass. The transient
 implementer owns its worktree, offline `codex exec`, tests, commit,
 authenticated push, and pull request. The gatekeeper owns merge and cleanup. A

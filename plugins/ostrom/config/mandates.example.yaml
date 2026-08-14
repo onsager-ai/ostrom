@@ -21,6 +21,9 @@ bounce_all:
 
 projects:
   - repo: example-org/example-repo
+    # This prevents branch collisions within this repository; omit it for 1.
+    # Global shared-compute capacity is configured separately by dispatch.
+    max_implementers_per_repository: 1
     # Selectors are case-insensitive. Supported prefixes are label, scope,
     # type, path, ref, and title. Only * is a wildcard; path ** spans depth.
     delegated:

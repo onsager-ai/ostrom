@@ -16,7 +16,11 @@ source "$SCRIPT_DIR/mandate-lib.sh"
 command -v jq >/dev/null 2>&1 || { echo "ostrom dispatch: jq is required" >&2; exit 1; }
 
 DEFAULT_DAILY_CAP_USD=50
+# MANDATE_MAX_IMPLEMENTERS is a global capacity cap for shared compute and
+# budget. MANDATE_MAX_IMPLEMENTERS_PER_REPOSITORY overrides the roster's
+# collision cap for tests; each project otherwise defaults to one implementer.
 DEFAULT_MAX_IMPLEMENTERS=2
+DEFAULT_MAX_IMPLEMENTERS_PER_REPOSITORY=1
 IMPLEMENTER_LEASE_TTL_SECONDS="${MANDATE_IMPLEMENTER_LEASE_TTL_SECONDS:-2592000}"
 TRACE_FILE="$MANDATE_DATA_DIR/sprint.jsonl"
 GH_AS_BIN="${MANDATE_GH_AS_BIN:-$SCRIPT_DIR/gh-as.sh}"
@@ -383,9 +387,40 @@ case "$max_implementers" in
     exit 2
     ;;
 esac
+max_implementers_per_repository="${MANDATE_MAX_IMPLEMENTERS_PER_REPOSITORY:-}"
+if [ -z "$max_implementers_per_repository" ]; then
+  max_implementers_per_repository="$(
+    mandate_project_max_implementers_per_repository \
+      "$repository" "$dispatch_config" \
+      "$DEFAULT_MAX_IMPLEMENTERS_PER_REPOSITORY"
+  )" || {
+    echo "ostrom dispatch: could not resolve per-repository implementer limit for $repository" >&2
+    exit 2
+  }
+fi
+case "$max_implementers_per_repository" in
+  ''|*[!0-9]*|0)
+    echo "ostrom dispatch: MANDATE_MAX_IMPLEMENTERS_PER_REPOSITORY must be a positive integer" >&2
+    exit 2
+    ;;
+esac
 inflight_count="$(jq 'length' <<<"$inflight")"
+# This global limit protects shared capacity. It deliberately says nothing
+# about branch collision risk within any one repository.
 if [ "$inflight_count" -ge "$max_implementers" ]; then
   echo "ostrom dispatch: concurrency limit reached ($inflight_count/$max_implementers)" >&2
+  exit 3
+fi
+repository_inflight_count="$(jq --arg repository "$repository" '
+  [.[]
+    | select((.item_id | type) == "string")
+    | select((.item_id | sub("#.*$"; "")) == $repository)]
+  | length
+' <<<"$inflight")"
+# This per-repository limit protects branches from colliding. It is independent
+# of the shared capacity available to implementers in different repositories.
+if [ "$repository_inflight_count" -ge "$max_implementers_per_repository" ]; then
+  echo "ostrom dispatch: per-repository concurrency limit reached for $repository ($repository_inflight_count/$max_implementers_per_repository)" >&2
   exit 3
 fi
 
@@ -461,6 +496,7 @@ if ! "$SYSTEMD_RUN_BIN" --user \
   --setenv "CLAUDE_PLUGIN_ROOT=$MANDATE_PLUGIN_ROOT" \
   --setenv "MANDATE_DAILY_CAP_USD=$daily_cap_usd" \
   --setenv "MANDATE_MAX_IMPLEMENTERS=$max_implementers" \
+  --setenv "MANDATE_MAX_IMPLEMENTERS_PER_REPOSITORY=$max_implementers_per_repository" \
   --setenv "MANDATE_DISPATCH_BACKEND=$backend" \
   --setenv "CODEX_BIN=$resolved_codex_bin" \
   --setenv "PATH=$unit_path" \
