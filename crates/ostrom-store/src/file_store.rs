@@ -1,7 +1,14 @@
-use std::{fs, io::Write, path::PathBuf};
+use std::{
+    fs,
+    io::{BufRead, BufReader, Write},
+    path::PathBuf,
+};
 
 use async_trait::async_trait;
-use ostrom_core::{STORE_SCHEMA_VERSION, StoreFault, SweepPass, SweepStore, WriteDisposition};
+use ostrom_core::{
+    PassId, STORE_SCHEMA_VERSION, StoreFault, SweepPass, SweepStore, WriteDisposition,
+};
+use serde::Deserialize;
 
 use crate::{OstromPaths, set_private_file_mode};
 
@@ -12,6 +19,16 @@ use crate::{OstromPaths, set_private_file_mode};
 /// separate compatibility APIs until the sweep itself moves in phase 2.
 pub struct JsonlSweepStore {
     journal: PathBuf,
+}
+
+#[derive(Deserialize)]
+struct StoredPassIdentity {
+    attempt: StoredAttemptIdentity,
+}
+
+#[derive(Deserialize)]
+struct StoredAttemptIdentity {
+    pass_id: PassId,
 }
 
 impl JsonlSweepStore {
@@ -32,6 +49,24 @@ impl JsonlSweepStore {
             .map(|line| serde_json::from_str(line).map_err(|_| StoreFault::MalformedRecord))
             .collect()
     }
+
+    fn find_record_by_pass_id(&self, pass_id: &PassId) -> Result<Option<SweepPass>, StoreFault> {
+        if !self.journal.exists() {
+            return Ok(None);
+        }
+        let file = fs::File::open(&self.journal).map_err(|_| StoreFault::Read)?;
+        for line in BufReader::new(file).lines() {
+            let line = line.map_err(|_| StoreFault::Read)?;
+            let identity: StoredPassIdentity =
+                serde_json::from_str(&line).map_err(|_| StoreFault::MalformedRecord)?;
+            if &identity.attempt.pass_id == pass_id {
+                return serde_json::from_str(&line)
+                    .map(Some)
+                    .map_err(|_| StoreFault::MalformedRecord);
+            }
+        }
+        Ok(None)
+    }
 }
 
 #[async_trait]
@@ -40,12 +75,8 @@ impl SweepStore for JsonlSweepStore {
         if pass.attempt.schema_version != STORE_SCHEMA_VERSION {
             return Err(StoreFault::UnsupportedSchema);
         }
-        let records = self.read_records()?;
-        if let Some(existing) = records
-            .iter()
-            .find(|record| record.attempt.pass_id == pass.attempt.pass_id)
-        {
-            return if existing == pass {
+        if let Some(existing) = self.find_record_by_pass_id(&pass.attempt.pass_id)? {
+            return if existing == *pass {
                 Ok(WriteDisposition::Unchanged)
             } else {
                 Err(StoreFault::PassConflict)
@@ -73,14 +104,30 @@ impl SweepStore for JsonlSweepStore {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs::OpenOptions, io::Write};
+
     use ostrom_core::{
         AttemptOutcome, PassAttempt, PassId, STORE_SCHEMA_VERSION, StoreFault, SweepPass,
-        SweepStore, conformance::check_store,
+        SweepStore, WriteDisposition, conformance::check_store,
     };
     use tempfile::tempdir;
 
     use super::JsonlSweepStore;
     use crate::OstromPaths;
+
+    fn pass(id: &str) -> SweepPass {
+        SweepPass {
+            attempt: PassAttempt {
+                schema_version: STORE_SCHEMA_VERSION,
+                pass_id: PassId(id.to_owned()),
+                started_at: "2030-01-02T03:04:05Z".to_owned(),
+                outcome: AttemptOutcome::Failed,
+            },
+            queue: Vec::new(),
+            gates: Vec::new(),
+            states: Vec::new(),
+        }
+    }
 
     #[tokio::test]
     async fn file_store_passes_shared_conformance_battery() {
@@ -103,22 +150,51 @@ mod tests {
             config: fixture.path().join("config"),
             state: blocked_state,
         };
-        let pass = SweepPass {
-            attempt: PassAttempt {
-                schema_version: STORE_SCHEMA_VERSION,
-                pass_id: PassId("synthetic-write-fault".to_owned()),
-                started_at: "2030-01-02T03:04:05Z".to_owned(),
-                outcome: AttemptOutcome::Failed,
-            },
-            queue: Vec::new(),
-            gates: Vec::new(),
-            states: Vec::new(),
-        };
+        let pass = pass("synthetic-write-fault");
         let error = JsonlSweepStore::new(&paths)
             .write_pass(&pass)
             .await
             .expect_err("blocked path must fail loudly");
         assert_eq!(error, StoreFault::AttemptWrite);
         assert!(error.to_string().contains("attempt record write failed"));
+    }
+
+    #[tokio::test]
+    async fn duplicate_scan_stops_after_the_matching_pass() {
+        let fixture = tempdir().expect("temp dir");
+        let paths = OstromPaths {
+            config: fixture.path().join("config"),
+            state: fixture.path().join("state"),
+        };
+        let mut store = JsonlSweepStore::new(&paths);
+        let pass = pass("synthetic-idempotent-pass");
+        assert_eq!(
+            store.write_pass(&pass).await.expect("initial write"),
+            WriteDisposition::Written
+        );
+        let mut conflicting = pass.clone();
+        conflicting.attempt.outcome = AttemptOutcome::Completed;
+        assert_eq!(
+            store
+                .write_pass(&conflicting)
+                .await
+                .expect_err("reused pass id must conflict"),
+            StoreFault::PassConflict
+        );
+        OpenOptions::new()
+            .append(true)
+            .open(&store.journal)
+            .expect("open journal")
+            .write_all(b"{malformed historical tail}\n")
+            .expect("append malformed tail");
+
+        assert_eq!(
+            store.write_pass(&pass).await.expect("idempotent write"),
+            WriteDisposition::Unchanged
+        );
+        assert_eq!(
+            store.passes().await.expect_err("full read checks all rows"),
+            StoreFault::MalformedRecord
+        );
     }
 }
