@@ -12,11 +12,15 @@ set -euo pipefail
   echo "queue parity: OSTROM_HOME is not a directory: $OSTROM_HOME" >&2
   exit 2
 }
+if ! ostrom_home_abs="$(cd "$OSTROM_HOME" 2>/dev/null && pwd -P)"; then
+  echo "queue parity: could not resolve OSTROM_HOME: $OSTROM_HOME" >&2
+  exit 2
+fi
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
-ln -s "$OSTROM_HOME" "$work/ostrom"
+ln -s "$ostrom_home_abs" "$work/ostrom"
 
 CLAUDE_CONFIG_DIR="$work" CLAUDE_PLUGIN_ROOT="$repo_root/plugins/ostrom" \
   bash "$repo_root/plugins/ostrom/scripts/queue.sh" list >"$work/bash.jsonl"
