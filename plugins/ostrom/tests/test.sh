@@ -4260,7 +4260,7 @@ JSON
       ;;
     example-org/landed-fix-repo)
       cat <<'JSON'
-[{"number":301,"title":"bug: widget throws on empty input","body":"","labels":[{"name":"bug"}],"createdAt":"2026-07-01T00:00:00Z","updatedAt":"2026-07-01T00:00:00Z","url":"https://example.invalid/issues/301"}]
+[{"number":273,"title":"perf: keep the sweep metered","body":"","labels":[{"name":"bug"}],"createdAt":"2026-07-01T00:00:00Z","updatedAt":"2026-07-01T00:00:00Z","url":"https://example.invalid/issues/273"},{"number":278,"title":"fix: preserve the cited work order","body":"","labels":[{"name":"bug"}],"createdAt":"2026-07-01T00:00:00Z","updatedAt":"2026-07-01T00:00:00Z","url":"https://example.invalid/issues/278"},{"number":280,"title":"feat: finish the parent workflow","body":"","labels":[{"name":"bug"}],"createdAt":"2026-07-01T00:00:00Z","updatedAt":"2026-07-01T00:00:00Z","url":"https://example.invalid/issues/280"},{"number":301,"title":"bug: widget throws on empty input","body":"","labels":[{"name":"bug"}],"createdAt":"2026-07-01T00:00:00Z","updatedAt":"2026-07-01T00:00:00Z","url":"https://example.invalid/issues/301"}]
 JSON
       ;;
     # #109: two different organisations, so a sweep.sh that mints only one
@@ -4470,6 +4470,9 @@ if [ "$1" = "api" ]; then
       # commit payload to: {sha, message, date}.
       cat <<'JSON'
 [
+  {"sha":"27327327deadbeef000000000000000000000000","message":"perf: meter the semantic pass per #273 metered ~$0","date":"2026-07-05T00:00:00Z"},
+  {"sha":"27827827deadbeef000000000000000000000000","message":"fix: preserve the work described in #278\n\nCloses #279","date":"2026-07-05T00:00:00Z"},
+  {"sha":"28028028deadbeef000000000000000000000000","message":"feat: continue the parent workflow\n\nPart of #280","date":"2026-07-05T00:00:00Z"},
   {"sha":"95d5ccc0deadbeef00000000000000000000000","message":"#301 GET /widgets 500: guard against nil pointer","date":"2026-07-05T00:00:00Z"},
   {"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","message":"unrelated change, predates the issue, also says #301","date":"2026-06-01T00:00:00Z"}
 ]
@@ -5134,20 +5137,35 @@ jq -s -e 'length == 0' "$landed_fix/config/ostrom/queue.jsonl" >/dev/null
     MANDATE_SWEEP_TIME="2026-08-03T00:00:00Z" \
     bash "$PLUGIN_ROOT/scripts/sweep.sh" >/dev/null
 )
-# Now stuck. The lead names the earliest commit that both postdates the
-# issue's opened date and references it without a closing keyword — the
-# older commit in the stub predates the issue and must not be offered even
-# though it also contains a bare "#301". state and kind are untouched: this
-# is a pointer for the builder to verify, not an auto-close.
+# Now stuck. Qualified references and commits that explicitly close a
+# different issue are citations, not leads. The unqualified #301 reference
+# remains the positive fixture: it names the earliest matching commit after
+# the issue opened, while the older commit must not be offered. State and kind
+# are untouched because the lead is only a pointer for the builder to verify.
 jq -s -e '
-  length == 1
-  and .[0].id == "example-org/landed-fix-repo#301"
-  and .[0].kind == "stuck"
-  and .[0].state == "pending"
-  and (.[0].mandate.reason | endswith(
+  length == 4
+  and ([.[].id] | sort) == [
+    "example-org/landed-fix-repo#273",
+    "example-org/landed-fix-repo#278",
+    "example-org/landed-fix-repo#280",
+    "example-org/landed-fix-repo#301"
+  ]
+  and all(.[]; .kind == "stuck")
+  and all(.[]; .state == "pending")
+  and all(
+    .[] | select(.id | IN(
+      "example-org/landed-fix-repo#273",
+      "example-org/landed-fix-repo#278",
+      "example-org/landed-fix-repo#280"
+    ));
+    .mandate.reason | contains("possibly landed") | not
+  )
+  and (first(.[] | select(.id == "example-org/landed-fix-repo#301")) as $row
+    | $row.mandate.reason | endswith(
       "; possibly landed: 95d5ccc0 references #301 without a closing keyword"
-    ))
-  and (.[0].mandate.reason | contains("aaaaaaaa") | not)
+    )
+    and ($row.mandate.reason | contains("aaaaaaaa") | not)
+  )
 ' "$landed_fix/config/ostrom/queue.jsonl" >/dev/null
 
 # The first sweep is a baseline. Only reserved, tripwire, and CI-failing

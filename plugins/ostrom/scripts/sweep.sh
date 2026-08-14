@@ -1546,11 +1546,33 @@ sweep_org() {
               | length;
             def bare_count($msg; $n):
               [$msg | scan("#" + ($n|tostring) + "(?!\\d)"; "i")] | length;
+            def qualified_count($msg; $n):
+              [
+                $msg
+                | scan(
+                    "\\b(?:part[[:space:]]+of|refs?|see|cc|related(?:[[:space:]]+to)?|supersedes|per)[[:space:][:punct:]]*#"
+                    + ($n|tostring) + "(?!\\d)";
+                    "i"
+                  )
+              ]
+              | length;
+            def closes_other($msg; $n):
+              [
+                $msg
+                | scan(
+                    "\\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)[[:space:]:]*#([0-9]+)";
+                    "i"
+                  )
+                | .[0]
+              ]
+              | any(. != ($n | tostring));
             (.) as $commits
             | [
                 $commits[]
                 | select((.date // "") >= $opened)
                 | select(bare_count(.message; $number) > closing_count(.message; $number))
+                | select(qualified_count(.message; $number) == 0)
+                | select(closes_other(.message; $number) | not)
               ] as $bare_matches
             | if ($bare_matches | length) == 0 then empty
               else
