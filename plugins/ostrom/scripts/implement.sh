@@ -50,9 +50,102 @@ events_file=""
 events_pipe=""
 streaming_ceiling_marker=""
 worktree_root=""
+source_repository=""
 streaming_ceiling_mode="${MANDATE_IMPLEMENTER_STREAMING_CEILING:-enabled}"
 repair_remote_head=""
 repair_conflicted_paths='[]'
+# Five seconds lets Codex flush its terminal event and run ordinary signal
+# cleanup without letting an uncooperative process retain the item lease and
+# dispatch slot indefinitely. Tests shorten this through the environment.
+termination_grace_seconds="${MANDATE_IMPLEMENTER_TERMINATION_GRACE_SECONDS:-5}"
+termination_grace_checks=0
+termination_signal=""
+process_wait_status=0
+
+record_termination_signal() {
+  signal_name="$1"
+  # Any required KILL escalation is the operationally significant outcome,
+  # even if another process in the pair stopped cooperatively on TERM.
+  if [ "$signal_name" = SIGKILL ] || [ -z "$termination_signal" ]; then
+    termination_signal="$signal_name"
+  fi
+}
+
+reap_exited_process() {
+  reaped_pid="$1"
+  if wait "$reaped_pid" 2>/dev/null; then
+    process_wait_status=0
+  else
+    process_wait_status=$?
+  fi
+}
+
+bounded_wait_for_exit() {
+  bounded_pid="$1"
+  remaining_checks="$termination_grace_checks"
+  while [ "$remaining_checks" -gt 0 ]; do
+    if ! kill -0 "$bounded_pid" 2>/dev/null; then
+      reap_exited_process "$bounded_pid"
+      return 0
+    fi
+    sleep 0.1
+    remaining_checks=$((remaining_checks - 1))
+  done
+  if ! kill -0 "$bounded_pid" 2>/dev/null; then
+    reap_exited_process "$bounded_pid"
+    return 0
+  fi
+  return 1
+}
+
+terminate_process() {
+  terminated_pid="$1"
+  term_already_sent="${2:-no}"
+  process_wait_status=0
+
+  if ! kill -0 "$terminated_pid" 2>/dev/null; then
+    reap_exited_process "$terminated_pid"
+    [ "$term_already_sent" = yes ] && record_termination_signal SIGTERM
+    return 0
+  fi
+
+  if [ "$term_already_sent" = yes ]; then
+    record_termination_signal SIGTERM
+  elif kill -TERM "$terminated_pid" 2>/dev/null; then
+    record_termination_signal SIGTERM
+  else
+    reap_exited_process "$terminated_pid"
+    return 0
+  fi
+
+  if bounded_wait_for_exit "$terminated_pid"; then
+    return 0
+  fi
+  if kill -KILL "$terminated_pid" 2>/dev/null; then
+    record_termination_signal SIGKILL
+    # SIGKILL normally completes immediately, but keep even this reap bounded:
+    # a process stuck in uninterruptible kernel sleep must not hold the wrapper.
+    if ! bounded_wait_for_exit "$terminated_pid"; then
+      process_wait_status=137
+    fi
+  else
+    reap_exited_process "$terminated_pid"
+  fi
+}
+
+wait_for_codex_child() {
+  watched_pid="$1"
+  while kill -0 "$watched_pid" 2>/dev/null; do
+    if [ -s "$streaming_ceiling_marker" ]; then
+      terminate_process "$watched_pid" yes
+      codex_status="$process_wait_status"
+      return 0
+    fi
+    sleep 0.1
+  done
+  reap_exited_process "$watched_pid"
+  codex_status="$process_wait_status"
+}
 
 usage_fact() {
   if [ -n "$events_file" ] && [ -s "$events_file" ]; then
@@ -182,6 +275,8 @@ append_terminal() {
     --arg pr_url "$pr_url" --arg reason "$reason" \
     --arg remote_head_sha "$repair_remote_head" \
     --argjson conflicted_paths "$repair_conflicted_paths" \
+    --arg termination_signal "$termination_signal" \
+    --arg source_repository_path "$source_repository" \
     --argjson preserved_work "$preserved_work" \
     --argjson usage "$usage" \
     '{schema_version: 1, item_id: $item_id, order_id: $order_id,
@@ -191,6 +286,9 @@ append_terminal() {
       duration_seconds: $duration_seconds,
       pr_url: (if $pr_url == "" then null else $pr_url end),
       reason: (if $reason == "" then null else $reason end),
+      termination_signal: (if $termination_signal == "" then null else $termination_signal end),
+      source_repository_path: (if $source_repository_path == ""
+        then null else $source_repository_path end),
       worktree_path: $preserved_work.worktree_path,
       branch_name: $preserved_work.branch_name,
       remote_head_sha: (if $remote_head_sha == "" then null else $remote_head_sha end),
@@ -207,16 +305,12 @@ append_terminal() {
 finish() {
   saved_status=$?
   trap - EXIT HUP INT TERM
-  if [ -n "$child_pid" ] && kill -0 "$child_pid" 2>/dev/null; then
-    kill -TERM "$child_pid" 2>/dev/null || true
-    wait "$child_pid" 2>/dev/null || true
+  if [ -n "$child_pid" ]; then
+    terminate_process "$child_pid"
     child_pid=""
   fi
   if [ -n "$monitor_pid" ]; then
-    if kill -0 "$monitor_pid" 2>/dev/null; then
-      kill -TERM "$monitor_pid" 2>/dev/null || true
-    fi
-    wait "$monitor_pid" 2>/dev/null || true
+    terminate_process "$monitor_pid"
     monitor_pid=""
   fi
   if [ -n "$events_pipe" ]; then
@@ -240,6 +334,7 @@ on_signal() {
   signal_name="$1"
   signal_status="$2"
   failure_reason="signal-${signal_name}"
+  record_termination_signal "SIG${signal_name}"
   exit "$signal_status"
 }
 
@@ -247,6 +342,14 @@ trap finish EXIT
 trap 'on_signal HUP 129' HUP
 trap 'on_signal INT 130' INT
 trap 'on_signal TERM 143' TERM
+
+case "$termination_grace_seconds" in
+  ''|*[!0-9]*|0)
+    failure_reason=termination-grace-invalid
+    exit 2
+    ;;
+esac
+termination_grace_checks=$((termination_grace_seconds * 10))
 
 lease_json="$(MANDATE_LEASE_NAME="$lease_name" bash "$SCRIPT_DIR/lease.sh" status 2>/dev/null)" || {
   failure_reason=lease-missing
@@ -258,6 +361,11 @@ if [ "$(jq -r '.owner' <<<"$lease_json")" != "$lease_owner" ]; then
 fi
 
 find_source_repository() {
+  local config root marker candidate remote normalized
+  local -a matching_candidates=()
+  local -a primary_candidates=()
+  local -a linked_candidates=()
+
   if [ -n "${MANDATE_IMPLEMENTER_SOURCE_REPO:-}" ]; then
     [ -d "$MANDATE_IMPLEMENTER_SOURCE_REPO" ] || return 1
     printf '%s\n' "$MANDATE_IMPLEMENTER_SOURCE_REPO"
@@ -273,17 +381,72 @@ find_source_repository() {
       normalized="${normalized#https://github.com/}"
       normalized="${normalized#git@github.com:}"
       if [ "$normalized" = "$repository" ]; then
-        printf '%s\n' "$candidate"
-        return 0
+        matching_candidates+=("$candidate")
       fi
     done < <(find "$root" -name .git -print -prune 2>/dev/null)
   done < <(jq -r '.search_roots[]' <<<"$config")
+
+  if [ "${#matching_candidates[@]}" -gt 0 ]; then
+    # Sort all matches before classification. The lexicographically first
+    # primary clone therefore wins deterministically, independent of root or
+    # filesystem traversal order; duplicate paths from overlapping roots are
+    # removed at the same time.
+    while IFS= read -r candidate; do
+      if [ -d "$candidate/.git" ]; then
+        primary_candidates+=("$candidate")
+      elif [ -f "$candidate/.git" ]; then
+        linked_candidates+=("$candidate")
+      fi
+    done < <(printf '%s\n' "${matching_candidates[@]}" | LC_ALL=C sort -u)
+  fi
+
+  if [ "${#primary_candidates[@]}" -gt 0 ]; then
+    printf '%s\n' "${primary_candidates[0]}"
+    return 0
+  fi
+  if [ "${#linked_candidates[@]}" -gt 0 ]; then
+    # A linked worktree inherits whatever branch and commits its operator left
+    # there. Report the first sorted match for diagnosis, but never use it as
+    # a source checkout.
+    printf 'source-repository-linked-worktree-only path=%s\n' \
+      "${linked_candidates[0]}"
+    # Reserve a private status so config/parser failures retain the historical
+    # source-repository-not-found classification in the caller.
+    return 10
+  fi
   return 1
 }
 
-source_repository="$(find_source_repository)" || {
-  failure_reason=source-repository-not-found
-  exit 1
+source_resolution="$(find_source_repository)"
+source_resolution_status=$?
+case "$source_resolution_status" in
+  0) source_repository="$source_resolution" ;;
+  10)
+    failure_reason="$source_resolution"
+    exit 1
+    ;;
+  *)
+    failure_reason=source-repository-not-found
+    exit 1
+    ;;
+esac
+
+branch_checkout_path() {
+  local target_ref="refs/heads/$1"
+  local listed_worktree=""
+  local record
+
+  while IFS= read -r record; do
+    case "$record" in
+      worktree\ *) listed_worktree="${record#worktree }" ;;
+      "branch $target_ref")
+        printf '%s\n' "$listed_worktree"
+        return 0
+        ;;
+      '') listed_worktree="" ;;
+    esac
+  done < <(git -C "$source_repository" worktree list --porcelain 2>/dev/null)
+  return 1
 }
 
 if ! command -v "$CODEX_BIN" >/dev/null 2>&1; then
@@ -346,6 +509,16 @@ if [ -e "$worktree_root" ]; then
     fi
   fi
 else
+  # Never reuse a branch created outside this item-keyed worktree. Its commit
+  # history and cleanliness are not protocol-owned or provably safe, even when
+  # Git reports that no worktree currently has it checked out.
+  if git -C "$source_repository" show-ref --verify --quiet \
+    "refs/heads/$branch_name"; then
+    existing_branch_path="$(branch_checkout_path "$branch_name")" || \
+      existing_branch_path=not-checked-out
+    failure_reason="worktree-branch-already-exists branch=$branch_name path=$existing_branch_path"
+    exit 1
+  fi
   if ! git -C "$source_repository" worktree add -b "$branch_name" \
     "$worktree_root" "refs/remotes/origin/$default_branch"; then
     failure_reason=worktree-create-failed
@@ -395,14 +568,14 @@ fi
 child_pid=$!
 monitor_codex_events "$child_pid" <"$events_pipe" &
 monitor_pid=$!
-wait "$child_pid"
-codex_status=$?
+wait_for_codex_child "$child_pid"
 child_pid=""
 wait "$monitor_pid" 2>/dev/null || true
 monitor_pid=""
 rm -f "$events_pipe"
 events_pipe=""
 if [ -s "$streaming_ceiling_marker" ]; then
+  [ -n "$termination_signal" ] || record_termination_signal SIGTERM
   failure_reason=token-ceiling-terminated
   exit 1
 fi

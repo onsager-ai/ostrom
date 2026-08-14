@@ -1075,9 +1075,42 @@ jq -e '
 fake_dispatch_gh="$dispatch_bin/gh-as"
 cat >"$fake_dispatch_gh" <<'SH'
 #!/usr/bin/env bash
-if [ "${FAKE_OPEN_PR:-0}" -eq 1 ]; then
-  printf '%s\n' '[{"number":77,"body":"Closes example-org/example-repo#123","url":"https://example.test/pull/77"}]'
-else
+if [ -n "${FAKE_GH_CALLS:-}" ]; then
+  printf '%s\n' "$*" >>"$FAKE_GH_CALLS"
+fi
+if [ "$4" = api ] && [ "$5" = --paginate ] && [ "$6" = --slurp ]; then
+  if [ "${FAKE_REMOTE_QUERY_FAIL:-0}" -eq 1 ]; then
+    exit 42
+  fi
+  if [ -n "${FAKE_REMOTE_BRANCH_NAME:-}" ]; then
+    jq -cn \
+      --arg main_sha "${FAKE_DEFAULT_SHA:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" \
+      --arg branch_name "$FAKE_REMOTE_BRANCH_NAME" \
+      --arg branch_sha "${FAKE_REMOTE_BRANCH_SHA:-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}" \
+      '[[{name:"main",commit:{sha:$main_sha}},
+        {name:$branch_name,commit:{sha:$branch_sha}}]]'
+  else
+    printf '%s\n' '[[{"name":"main","commit":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]]'
+  fi
+  exit 0
+fi
+if [ "$4" = repo ] && [ "$5" = view ]; then
+  printf '%s\n' main
+  exit 0
+fi
+if [ "$4" = api ] && [[ "$5" == repos/*/compare/* ]]; then
+  printf '%s\n' "${FAKE_REMOTE_AHEAD:-0}"
+  exit 0
+fi
+if [ "$4" = pr ] && [ "$5" = list ]; then
+  if [ "${FAKE_OPEN_PR:-0}" -eq 1 ]; then
+    printf '%s\n' '[{"number":77,"body":"Closes example-org/example-repo#123","url":"https://example.test/pull/77"}]'
+  else
+    printf '%s\n' '[]'
+  fi
+  exit 0
+fi
+if [ "${FAKE_OPEN_PR:-0}" -ne 1 ]; then
   printf '%s\n' '[]'
 fi
 SH
@@ -1095,6 +1128,140 @@ SH
 chmod +x "$fake_dispatch_gh" "$fake_systemd_run" "$fake_dispatch_codex"
 dispatch_args="$dispatch_fixture/systemd-args"
 dispatch_calls="$dispatch_fixture/systemd-calls"
+: >"$dispatch_calls"
+
+# #153: a remote branch is durable work even without a pull request. The
+# branch read, default lookup, and comparison all use the builder wrapper;
+# rejection precedes the lease and the work-dispatched reservation.
+branch_guard_config="$dispatch_fixture/branch-guard-config"
+branch_guard_gh_calls="$dispatch_fixture/branch-guard-gh-calls"
+branch_guard_stderr="$dispatch_fixture/branch-guard.err"
+mkdir -p "$branch_guard_config/ostrom"
+set +e
+FAKE_REMOTE_BRANCH_NAME="$dispatch_branch" \
+  FAKE_REMOTE_BRANCH_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+  FAKE_REMOTE_AHEAD=4 FAKE_GH_CALLS="$branch_guard_gh_calls" \
+  CLAUDE_CONFIG_DIR="$branch_guard_config" \
+  MANDATE_TRACE_TIME="2026-08-11T02:00:30Z" \
+  MANDATE_NOW_EPOCH="$cap_today_epoch" \
+  MANDATE_GH_AS_BIN="$fake_dispatch_gh" \
+  MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
+  CODEX_BIN="$fake_dispatch_codex" \
+  FAKE_SYSTEMD_ARGS="$dispatch_args" FAKE_SYSTEMD_CALLS="$dispatch_calls" \
+  bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$dispatch_order" \
+    >"$dispatch_fixture/branch-guard.out" 2>"$branch_guard_stderr"
+branch_guard_status=$?
+set -e
+if [ "$branch_guard_status" -ne 3 ]; then
+  echo "remote branch guard did not exit 3" >&2
+  exit 1
+fi
+branch_guard_item_hash="$(
+  bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash \
+    'example-org/example-repo#123'
+)"
+if [ -e "$branch_guard_config/ostrom/implementer-item-$branch_guard_item_hash.lease" ]; then
+  echo "remote branch guard leaked an implementer lease" >&2
+  exit 1
+fi
+if [ -s "$dispatch_calls" ]; then
+  echo "remote branch guard launched a systemd unit" >&2
+  exit 1
+fi
+if jq -s -e 'any(.[]; .kind == "work-dispatched")' \
+  "$branch_guard_config/ostrom/sprint.jsonl" >/dev/null; then
+  echo "remote branch guard reserved concurrency or cost" >&2
+  exit 1
+fi
+if jq -s -e --arg branch "$dispatch_branch" '
+  length != 1
+  or .[0].kind != "work-failed"
+  or .[0].fact.reason != "branch-already-pushed"
+  or .[0].fact.repository != "example-org/example-repo"
+  or .[0].fact.branch_name != $branch
+  or .[0].fact.head_sha != "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  or .[0].fact.ahead_of_default != 4
+' "$branch_guard_config/ostrom/sprint.jsonl" >/dev/null; then
+  echo "remote branch guard did not record the required work-failed detail" >&2
+  exit 1
+fi
+expected_branch_guard_error="repository=example-org/example-repo branch=$dispatch_branch head=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ahead=4"
+if [ "$(grep -Fc "$expected_branch_guard_error" "$branch_guard_stderr")" -ne 1 ]; then
+  echo "remote branch guard stderr omitted branch detail" >&2
+  exit 1
+fi
+if [ "$(grep -Fc 'builder example-org/example-repo gh api --paginate --slurp repos/example-org/example-repo/branches?per_page=100' "$branch_guard_gh_calls")" -ne 1 ]; then
+  echo "remote branch guard did not query branches through the builder wrapper" >&2
+  exit 1
+fi
+if [ "$(grep -c '^builder example-org/example-repo gh ' "$branch_guard_gh_calls")" -ne "$(wc -l <"$branch_guard_gh_calls" | tr -d '[:space:]')" ]; then
+  echo "remote branch guard made a remote read outside the builder wrapper" >&2
+  exit 1
+fi
+
+# A branch with the item number at the start of a path component matches the
+# deterministic ostrom/<number>-... position even when its wording predates
+# the order's derived branch name.
+set +e
+FAKE_REMOTE_BRANCH_NAME='chore/123-existing-work' \
+  FAKE_REMOTE_BRANCH_SHA=cccccccccccccccccccccccccccccccccccccccc \
+  FAKE_REMOTE_AHEAD=2 CLAUDE_CONFIG_DIR="$branch_guard_config" \
+  MANDATE_TRACE_TIME="2026-08-11T02:00:31Z" \
+  MANDATE_NOW_EPOCH="$cap_today_epoch" \
+  MANDATE_GH_AS_BIN="$fake_dispatch_gh" \
+  MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
+  CODEX_BIN="$fake_dispatch_codex" \
+  FAKE_SYSTEMD_ARGS="$dispatch_args" FAKE_SYSTEMD_CALLS="$dispatch_calls" \
+  bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$dispatch_order" >/dev/null 2>&1
+numbered_branch_guard_status=$?
+set -e
+if [ "$numbered_branch_guard_status" -ne 3 ]; then
+  echo "number-position remote branch guard did not exit 3" >&2
+  exit 1
+fi
+if [ "$(jq -s -r 'last.fact.branch_name' "$branch_guard_config/ostrom/sprint.jsonl")" != 'chore/123-existing-work' ]; then
+  echo "number-position remote branch guard recorded the wrong branch" >&2
+  exit 1
+fi
+if jq -s -e 'any(.[]; .kind == "work-dispatched")' \
+  "$branch_guard_config/ostrom/sprint.jsonl" >/dev/null; then
+  echo "number-position remote branch guard reserved work" >&2
+  exit 1
+fi
+
+# Failure to enumerate remote branches fails closed before any reservation.
+branch_query_failure_config="$dispatch_fixture/branch-query-failure-config"
+branch_query_failure_stderr="$dispatch_fixture/branch-query-failure.err"
+mkdir -p "$branch_query_failure_config/ostrom"
+set +e
+FAKE_REMOTE_QUERY_FAIL=1 CLAUDE_CONFIG_DIR="$branch_query_failure_config" \
+  MANDATE_NOW_EPOCH="$cap_today_epoch" \
+  MANDATE_GH_AS_BIN="$fake_dispatch_gh" \
+  MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
+  CODEX_BIN="$fake_dispatch_codex" \
+  FAKE_SYSTEMD_ARGS="$dispatch_args" FAKE_SYSTEMD_CALLS="$dispatch_calls" \
+  bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$dispatch_order" \
+    >/dev/null 2>"$branch_query_failure_stderr"
+branch_query_failure_status=$?
+set -e
+if [ "$branch_query_failure_status" -eq 0 ]; then
+  echo "remote branch query failure dispatched blind" >&2
+  exit 1
+fi
+if [ -e "$branch_query_failure_config/ostrom/implementer-item-$branch_guard_item_hash.lease" ]; then
+  echo "remote branch query failure leaked an implementer lease" >&2
+  exit 1
+fi
+if [ -e "$branch_query_failure_config/ostrom/sprint.jsonl" ]; then
+  echo "remote branch query failure reserved work" >&2
+  exit 1
+fi
+if [ "$(grep -Fc 'could not verify remote branches for example-org/example-repo#123 in example-org/example-repo' "$branch_query_failure_stderr")" -ne 1 ]; then
+  echo "remote branch query failure was not reported" >&2
+  exit 1
+fi
+
+clean_dispatch_gh_calls="$dispatch_fixture/clean-dispatch-gh-calls"
 dispatch_unit="$(
   CLAUDE_CONFIG_DIR="$dispatch_config" \
     MANDATE_TRACE_TIME="2026-08-11T02:01:00Z" \
@@ -1102,10 +1269,19 @@ dispatch_unit="$(
     MANDATE_GH_AS_BIN="$fake_dispatch_gh" \
     MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
     CODEX_BIN="$fake_dispatch_codex" \
+    FAKE_GH_CALLS="$clean_dispatch_gh_calls" \
     FAKE_SYSTEMD_ARGS="$dispatch_args" \
     FAKE_SYSTEMD_CALLS="$dispatch_calls" \
     bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$dispatch_order"
 )"
+if [ "$(grep -Fc 'builder example-org/example-repo gh api --paginate --slurp repos/example-org/example-repo/branches?per_page=100' "$clean_dispatch_gh_calls")" -ne 1 ]; then
+  echo "clean dispatch did not perform the remote branch preflight" >&2
+  exit 1
+fi
+if [ "$dispatch_unit" != "ostrom-implementer-9bb890b1b3b47926" ]; then
+  echo "clean remote branch preflight changed successful dispatch" >&2
+  exit 1
+fi
 [ "$dispatch_unit" = "ostrom-implementer-9bb890b1b3b47926" ]
 [ "$(wc -l <"$dispatch_calls" | tr -d '[:space:]')" -eq 1 ]
 grep -qx 'RuntimeMaxSec=infinity' "$dispatch_args"
@@ -1124,9 +1300,9 @@ jq -s -e '
   and .[0].fact.duration_seconds == 0
 ' "$dispatch_config/ostrom/sprint.jsonl" >/dev/null
 
-# All three duplicate guards fail closed independently. A live lease refuses
-# first; after its controlled release, the unmatched dispatch row refuses;
-# after a terminal row, an open PR reference refuses.
+# The three pre-existing duplicate guards still fail closed independently. A
+# live lease refuses first; after its controlled release, the unmatched
+# dispatch row refuses; after a terminal row, an open PR reference refuses.
 set +e
 CLAUDE_CONFIG_DIR="$dispatch_config" \
   MANDATE_NOW_EPOCH="$cap_today_epoch" \
@@ -1272,6 +1448,10 @@ if [ -n "${FAKE_IMPLEMENT_COMMANDS:-}" ]; then
   printf '%q ' "$@" >>"$FAKE_IMPLEMENT_COMMANDS"
   printf '\n' >>"$FAKE_IMPLEMENT_COMMANDS"
 fi
+if [ "$1" = gh ] && [ "$2" = api ] && [ "$3" = --paginate ] && [ "$4" = --slurp ]; then
+  printf '%s\n' '[[{"name":"main","commit":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]]'
+  exit 0
+fi
 if [ "$1" = gh ] && [ "$2" = repo ] && [ "$3" = view ]; then
   printf 'main\n'
   exit 0
@@ -1375,12 +1555,33 @@ case "${FAKE_CODEX_MODE:-complete}" in
   ceiling)
     printf 'partial implementation\n' >"$worktree/generated.txt"
     printf '%s\n' "$$" >"$FAKE_CODEX_MARKER"
-    trap 'exit 143' TERM
+    trap 'printf "received\n" >"$FAKE_CODEX_TERM_MARKER"; sleep 0.2; printf "completed\n" >"$FAKE_CODEX_TERM_MARKER"; exit 143' TERM
     printf '%s\n' "$FAKE_CODEX_USAGE_JSON"
     for _ceiling_wait in $(seq 1 100); do
       sleep 0.02
     done
     printf 'not terminated\n' >"$FAKE_CODEX_SURVIVED_MARKER"
+    ;;
+  ceiling-ignore-term)
+    printf 'partial implementation\n' >"$worktree/generated.txt"
+    printf '%s\n' "$$" >"$FAKE_CODEX_MARKER"
+    trap '' TERM
+    printf '%s\n' "$FAKE_CODEX_USAGE_JSON"
+    for _ceiling_wait in $(seq 1 80); do
+      sleep 0.1
+    done
+    printf 'not killed\n' >"$FAKE_CODEX_SURVIVED_MARKER"
+    ;;
+  wedged-monitor)
+    # Keep the event pipe open after Codex exits so the monitor remains in its
+    # read loop. The test stops that monitor before terminating the wrapper,
+    # simulating a process that cannot act on TERM during finish().
+    (
+      trap 'exit 0' TERM
+      while :; do sleep 1; done
+    ) &
+    printf '%s\n' "$!" >"$FAKE_CODEX_SURVIVED_MARKER"
+    printf '%s\n' "$$" >"$FAKE_CODEX_MARKER"
     ;;
   complete)
     printf 'implemented\n' >"$worktree/generated.txt"
@@ -1436,6 +1637,147 @@ run_implement_order() {
       >"$implement_fixture/$case_name.out" \
       2>"$implement_fixture/$case_name.err"
 }
+
+# #155: repository discovery must inspect every remote match and prefer a
+# primary clone even when an earlier search root contains a linked worktree.
+# Keeping the linked worktree in the first root makes the old return-on-first
+# implementation fail this fixture deterministically.
+resolution_backing="$implement_fixture/resolution-backing"
+resolution_linked_root="$implement_fixture/resolution-linked-root"
+resolution_primary_root="$implement_fixture/resolution-primary-root"
+resolution_linked="$resolution_linked_root/linked-worktree"
+resolution_primary="$resolution_primary_root/primary-clone"
+mkdir -p "$resolution_linked_root" "$resolution_primary_root"
+git clone --branch main "$implement_remote" "$resolution_backing" >/dev/null 2>&1
+git -C "$resolution_backing" remote set-url origin \
+  https://github.com/example-org/example-repo.git
+git -C "$resolution_backing" worktree add -b fixture/resolution-linked \
+  "$resolution_linked" refs/remotes/origin/main >/dev/null
+git clone --branch main "$implement_remote" "$resolution_primary" >/dev/null 2>&1
+git -C "$resolution_primary" config user.name "Ostrom Test"
+git -C "$resolution_primary" config user.email "ostrom@example.test"
+git -C "$resolution_primary" remote set-url origin \
+  https://github.com/example-org/example-repo.git
+resolution_config="$implement_fixture/resolution-config"
+mkdir -p "$resolution_config/ostrom"
+cat >"$resolution_config/ostrom/mandates.yaml" <<YAML
+search_roots:
+  - $resolution_linked_root
+  - $resolution_primary_root
+YAML
+resolution_order="$(create_implement_order source-resolution 144 "$resolution_config")"
+resolution_order_id="$(jq -r '.order_id' "$resolution_order")"
+resolution_item_hash="$(
+  bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash \
+    'example-org/example-repo#144'
+)"
+resolution_unit="ostrom-implementer-${resolution_item_hash:0:16}"
+resolution_lease="implementer-item-$resolution_item_hash.lease"
+resolution_worktree="$resolution_config/ostrom/implementer-worktrees/$resolution_item_hash"
+CLAUDE_CONFIG_DIR="$resolution_config" MANDATE_LEASE_NAME="$resolution_lease" \
+  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire "$resolution_unit" 3600 >/dev/null
+FAKE_CODEX_MODE=complete CODEX_BIN="$fake_codex" \
+  CLAUDE_CONFIG_DIR="$resolution_config" \
+  MANDATE_GH_AS_BIN="$fake_implement_gh" FAKE_GIT_REMOTE="$implement_remote" \
+  FAKE_PR_BODY="$implement_fixture/source-resolution-pr-body" \
+  bash "$PLUGIN_ROOT/scripts/implement.sh" "$resolution_order" "$resolution_unit" \
+    >"$implement_fixture/source-resolution.out" \
+    2>"$implement_fixture/source-resolution.err"
+[ "$(git -C "$resolution_worktree" rev-parse --git-common-dir)" = \
+  "$resolution_primary/.git" ]
+jq -s -e --arg order_id "$resolution_order_id" \
+  --arg source_repository_path "$resolution_primary" '
+  [.[] | select(.fact.order_id == $order_id)] | length == 1
+  and .[0].kind == "work-completed"
+  and .[0].fact.source_repository_path == $source_repository_path
+' "$resolution_config/ostrom/sprint.jsonl" >/dev/null
+
+# A linked worktree by itself is diagnostic evidence, not a safe source
+# checkout. The terminal reason names the sorted match and no worktree is made.
+linked_only_config="$implement_fixture/linked-only-config"
+mkdir -p "$linked_only_config/ostrom"
+cat >"$linked_only_config/ostrom/mandates.yaml" <<YAML
+search_roots:
+  - $resolution_linked_root
+YAML
+linked_only_order="$(create_implement_order linked-only 145 "$linked_only_config")"
+linked_only_order_id="$(jq -r '.order_id' "$linked_only_order")"
+linked_only_item_hash="$(
+  bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash \
+    'example-org/example-repo#145'
+)"
+linked_only_unit="ostrom-implementer-${linked_only_item_hash:0:16}"
+linked_only_lease="implementer-item-$linked_only_item_hash.lease"
+CLAUDE_CONFIG_DIR="$linked_only_config" MANDATE_LEASE_NAME="$linked_only_lease" \
+  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire "$linked_only_unit" 3600 >/dev/null
+set +e
+CODEX_BIN="$fake_codex" CLAUDE_CONFIG_DIR="$linked_only_config" \
+  MANDATE_GH_AS_BIN="$fake_implement_gh" FAKE_GIT_REMOTE="$implement_remote" \
+  FAKE_PR_BODY="$implement_fixture/unused-linked-only-pr-body" \
+  bash "$PLUGIN_ROOT/scripts/implement.sh" \
+    "$linked_only_order" "$linked_only_unit" \
+    >"$implement_fixture/linked-only.out" \
+    2>"$implement_fixture/linked-only.err"
+linked_only_status=$?
+set -e
+[ "$linked_only_status" -eq 1 ]
+[ ! -e "$linked_only_config/ostrom/$linked_only_lease" ]
+[ ! -e "$linked_only_config/ostrom/implementer-worktrees/$linked_only_item_hash" ]
+jq -s -e --arg order_id "$linked_only_order_id" \
+  --arg reason "source-repository-linked-worktree-only path=$resolution_linked" '
+  [.[] | select(.fact.order_id == $order_id)] | length == 1
+  and .[0].kind == "work-failed"
+  and .[0].fact.reason == $reason
+  and .[0].fact.source_repository_path == null
+' "$linked_only_config/ostrom/sprint.jsonl" >/dev/null
+
+# A local branch created outside the item-keyed worktree is never inherited:
+# the terminal reason identifies both the branch and its owning worktree.
+branch_conflict_config="$implement_fixture/branch-conflict-config"
+branch_conflict_order="$(
+  create_implement_order branch-conflict 146 "$branch_conflict_config"
+)"
+branch_conflict_order_id="$(jq -r '.order_id' "$branch_conflict_order")"
+branch_conflict_branch="$(jq -r '.branch_name' "$branch_conflict_order")"
+branch_conflict_item_hash="$(
+  bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash \
+    'example-org/example-repo#146'
+)"
+branch_conflict_unit="ostrom-implementer-${branch_conflict_item_hash:0:16}"
+branch_conflict_lease="implementer-item-$branch_conflict_item_hash.lease"
+branch_conflict_existing="$implement_fixture/branch-conflict-existing"
+branch_conflict_target="$branch_conflict_config/ostrom/implementer-worktrees/$branch_conflict_item_hash"
+git -C "$implement_source" worktree add -b "$branch_conflict_branch" \
+  "$branch_conflict_existing" refs/remotes/origin/main >/dev/null
+CLAUDE_CONFIG_DIR="$branch_conflict_config" \
+  MANDATE_LEASE_NAME="$branch_conflict_lease" \
+  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire \
+    "$branch_conflict_unit" 3600 >/dev/null
+set +e
+FAKE_CODEX_MODE=complete CODEX_BIN="$fake_codex" \
+  CLAUDE_CONFIG_DIR="$branch_conflict_config" \
+  MANDATE_IMPLEMENTER_SOURCE_REPO="$implement_source" \
+  MANDATE_GH_AS_BIN="$fake_implement_gh" FAKE_GIT_REMOTE="$implement_remote" \
+  FAKE_PR_BODY="$implement_fixture/unused-branch-conflict-pr-body" \
+  bash "$PLUGIN_ROOT/scripts/implement.sh" \
+    "$branch_conflict_order" "$branch_conflict_unit" \
+    >"$implement_fixture/branch-conflict.out" \
+    2>"$implement_fixture/branch-conflict.err"
+branch_conflict_status=$?
+set -e
+[ "$branch_conflict_status" -eq 1 ]
+[ ! -e "$branch_conflict_config/ostrom/$branch_conflict_lease" ]
+[ ! -e "$branch_conflict_target" ]
+[ "$(git -C "$branch_conflict_existing" branch --show-current)" = \
+  "$branch_conflict_branch" ]
+jq -s -e --arg order_id "$branch_conflict_order_id" \
+  --arg reason "worktree-branch-already-exists branch=$branch_conflict_branch path=$branch_conflict_existing" \
+  --arg source_repository_path "$implement_source" '
+  [.[] | select(.fact.order_id == $order_id)] | length == 1
+  and .[0].kind == "work-failed"
+  and .[0].fact.reason == $reason
+  and .[0].fact.source_repository_path == $source_repository_path
+' "$branch_conflict_config/ostrom/sprint.jsonl" >/dev/null
 
 # #142: a repeat order on the already-matching deterministic branch reuses the
 # item-keyed worktree. The preexisting uncommitted file reaches the pushed
@@ -1553,6 +1895,7 @@ run_implement_usage_case() {
   case_usage="$2"
   case_mode="${3:-complete}"
   case_streaming_ceiling="${4:-enabled}"
+  case_timeout="${5:-}"
   case_candidate="$implement_fixture/$case_number-candidate.json"
   cat >"$case_candidate" <<JSON
 {"schema_version":1,"item_id":"example-org/example-repo#$case_number","repository":"example-org/example-repo","item_ref":"#$case_number","branch_name":"fix/$case_number-placeholder","spec":"Exercise synthetic token accounting.","acceptance_criteria":["Token accounting matches the reported components."],"constraints":["Use placeholder data only."]}
@@ -1573,21 +1916,28 @@ JSON
   IMPLEMENT_CASE_WORKTREE="$implement_config/ostrom/implementer-worktrees/$IMPLEMENT_CASE_ITEM_HASH"
   IMPLEMENT_CASE_CODEX_MARKER="$implement_fixture/$case_number-codex-pid"
   IMPLEMENT_CASE_SURVIVED_MARKER="$implement_fixture/$case_number-codex-survived"
+  IMPLEMENT_CASE_TERM_MARKER="$implement_fixture/$case_number-codex-term"
   CLAUDE_CONFIG_DIR="$implement_config" \
     MANDATE_LEASE_NAME="$IMPLEMENT_CASE_LEASE" \
     bash "$PLUGIN_ROOT/scripts/lease.sh" acquire \
       "$IMPLEMENT_CASE_UNIT" 3600 >/dev/null
   set +e
+  case_command=(bash "$PLUGIN_ROOT/scripts/implement.sh" \
+    "$IMPLEMENT_CASE_ORDER" "$IMPLEMENT_CASE_UNIT")
+  if [ -n "$case_timeout" ]; then
+    case_command=(timeout --kill-after=1s "$case_timeout" "${case_command[@]}")
+  fi
   FAKE_CODEX_MODE="$case_mode" FAKE_CODEX_USAGE_JSON="$case_usage" \
     FAKE_CODEX_MARKER="$IMPLEMENT_CASE_CODEX_MARKER" \
     FAKE_CODEX_SURVIVED_MARKER="$IMPLEMENT_CASE_SURVIVED_MARKER" \
+    FAKE_CODEX_TERM_MARKER="$IMPLEMENT_CASE_TERM_MARKER" \
     MANDATE_IMPLEMENTER_STREAMING_CEILING="$case_streaming_ceiling" \
+    MANDATE_IMPLEMENTER_TERMINATION_GRACE_SECONDS=1 \
     CODEX_BIN="$fake_codex" CLAUDE_CONFIG_DIR="$implement_config" \
     MANDATE_IMPLEMENTER_SOURCE_REPO="$implement_source" \
     MANDATE_GH_AS_BIN="$fake_implement_gh" FAKE_GIT_REMOTE="$implement_remote" \
     FAKE_PR_BODY="$implement_fixture/$case_number-pr-body" \
-    bash "$PLUGIN_ROOT/scripts/implement.sh" \
-      "$IMPLEMENT_CASE_ORDER" "$IMPLEMENT_CASE_UNIT" \
+    "${case_command[@]}" \
       >"$implement_fixture/$case_number.out" \
       2>"$implement_fixture/$case_number.err"
   IMPLEMENT_CASE_STATUS=$?
@@ -1624,6 +1974,7 @@ CLAUDE_CONFIG_DIR="$implement_config" MANDATE_LEASE_NAME="$implement_kill_lease"
   bash "$PLUGIN_ROOT/scripts/lease.sh" acquire "$implement_kill_unit" 3600 >/dev/null
 implement_kill_marker="$implement_fixture/codex-started"
 FAKE_CODEX_MODE=wait FAKE_CODEX_MARKER="$implement_kill_marker" \
+  MANDATE_IMPLEMENTER_TERMINATION_GRACE_SECONDS=1 \
   CODEX_BIN="$fake_codex" CLAUDE_CONFIG_DIR="$implement_config" \
   MANDATE_IMPLEMENTER_SOURCE_REPO="$implement_source" \
   MANDATE_GH_AS_BIN="$fake_implement_gh" FAKE_GIT_REMOTE="$implement_remote" \
@@ -1654,8 +2005,83 @@ jq -s -e '
   and .[0].kind == "work-failed"
   and .[0].fact.item_id == "example-org/example-repo#125"
   and .[0].fact.reason == "signal-TERM"
+  and .[0].fact.termination_signal == "SIGTERM"
   and .[0].fact.cost_usd == 0
   and (.[0].fact.duration_seconds | type == "number")
+' "$implement_config/ostrom/sprint.jsonl" >/dev/null
+
+# finish() must bound monitor cleanup too. Leave the FIFO open after Codex
+# exits, stop the monitor so it cannot act on TERM, and terminate the wrapper.
+# The watchdog makes a reverted bare wait a five-second failure, not stuck CI.
+wedged_monitor_order="$(create_implement_order wedged-monitor 147)"
+wedged_monitor_order_id="$(jq -r '.order_id' "$wedged_monitor_order")"
+wedged_monitor_item_hash="$(
+  bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash \
+    'example-org/example-repo#147'
+)"
+wedged_monitor_unit="ostrom-implementer-${wedged_monitor_item_hash:0:16}"
+wedged_monitor_lease="implementer-item-$wedged_monitor_item_hash.lease"
+CLAUDE_CONFIG_DIR="$implement_config" MANDATE_LEASE_NAME="$wedged_monitor_lease" \
+  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire \
+    "$wedged_monitor_unit" 3600 >/dev/null
+wedged_monitor_codex_marker="$implement_fixture/wedged-monitor-codex"
+wedged_monitor_holder_marker="$implement_fixture/wedged-monitor-holder"
+FAKE_CODEX_MODE=wedged-monitor \
+  FAKE_CODEX_MARKER="$wedged_monitor_codex_marker" \
+  FAKE_CODEX_SURVIVED_MARKER="$wedged_monitor_holder_marker" \
+  MANDATE_IMPLEMENTER_TERMINATION_GRACE_SECONDS=1 \
+  CODEX_BIN="$fake_codex" CLAUDE_CONFIG_DIR="$implement_config" \
+  MANDATE_IMPLEMENTER_SOURCE_REPO="$implement_source" \
+  MANDATE_GH_AS_BIN="$fake_implement_gh" FAKE_GIT_REMOTE="$implement_remote" \
+  FAKE_PR_BODY="$implement_fixture/unused-wedged-monitor-pr-body" \
+  bash "$PLUGIN_ROOT/scripts/implement.sh" \
+    "$wedged_monitor_order" "$wedged_monitor_unit" \
+    >"$implement_fixture/wedged-monitor.out" \
+    2>"$implement_fixture/wedged-monitor.err" &
+wedged_monitor_wrapper_pid=$!
+wedged_monitor_pid=""
+for _attempt in $(seq 1 100); do
+  if [ -s "$wedged_monitor_codex_marker" ] && \
+    [ -s "$wedged_monitor_holder_marker" ]; then
+    direct_children="$(
+      ps -o pid= --ppid "$wedged_monitor_wrapper_pid" | awk 'NF { print $1 }'
+    )"
+    if [ "$(wc -w <<<"$direct_children" | tr -d '[:space:]')" -eq 1 ]; then
+      wedged_monitor_pid="$direct_children"
+      break
+    fi
+  fi
+  sleep 0.05
+done
+[ -n "$wedged_monitor_pid" ]
+wedged_monitor_holder_pid="$(cat "$wedged_monitor_holder_marker")"
+kill -STOP "$wedged_monitor_pid"
+kill -TERM "$wedged_monitor_wrapper_pid"
+wedged_monitor_timeout_marker="$implement_fixture/wedged-monitor-timeout"
+(
+  sleep 5
+  if kill -0 "$wedged_monitor_wrapper_pid" 2>/dev/null; then
+    : >"$wedged_monitor_timeout_marker"
+    kill -KILL "$wedged_monitor_wrapper_pid" 2>/dev/null || true
+  fi
+) &
+wedged_monitor_watchdog_pid=$!
+set +e
+wait "$wedged_monitor_wrapper_pid"
+wedged_monitor_status=$?
+set -e
+kill "$wedged_monitor_watchdog_pid" 2>/dev/null || true
+wait "$wedged_monitor_watchdog_pid" 2>/dev/null || true
+kill -TERM "$wedged_monitor_holder_pid" 2>/dev/null || true
+kill -KILL "$wedged_monitor_pid" 2>/dev/null || true
+[ ! -e "$wedged_monitor_timeout_marker" ]
+[ "$wedged_monitor_status" -eq 143 ]
+[ ! -e "$implement_config/ostrom/$wedged_monitor_lease" ]
+jq -s -e --arg order_id "$wedged_monitor_order_id" '
+  [.[] | select(.fact.order_id == $order_id)] | length == 1
+  and .[0].kind == "work-failed"
+  and .[0].fact.reason == "signal-TERM"
+  and .[0].fact.termination_signal == "SIGKILL"
 ' "$implement_config/ostrom/sprint.jsonl" >/dev/null
 
 # A clap usage error means the wrapper called Codex incorrectly, not that the
@@ -1794,12 +2220,12 @@ jq -s -e '
 # merge commit, retries once, and continues through the ordinary PR outcome.
 repair_success_config="$implement_fixture/repair-success-config"
 repair_success_order="$(
-  create_implement_order repair-success 144 "$repair_success_config"
+  create_implement_order repair-success 203 "$repair_success_config"
 )"
 repair_success_order_id="$(jq -r '.order_id' "$repair_success_order")"
 repair_success_item_hash="$(
   bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash \
-    'example-org/example-repo#144'
+    'example-org/example-repo#203'
 )"
 repair_success_branch="$(jq -r '.branch_name' "$repair_success_order")"
 repair_success_worktree="$repair_success_config/ostrom/implementer-worktrees/$repair_success_item_hash"
@@ -1866,12 +2292,12 @@ fi
 # the implementer's own completed commit without attempting a second push.
 repair_conflict_config="$implement_fixture/repair-conflict-config"
 repair_conflict_order="$(
-  create_implement_order repair-conflict 145 "$repair_conflict_config"
+  create_implement_order repair-conflict 204 "$repair_conflict_config"
 )"
 repair_conflict_order_id="$(jq -r '.order_id' "$repair_conflict_order")"
 repair_conflict_item_hash="$(
   bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash \
-    'example-org/example-repo#145'
+    'example-org/example-repo#204'
 )"
 repair_conflict_branch="$(jq -r '.branch_name' "$repair_conflict_order")"
 repair_conflict_worktree="$repair_conflict_config/ostrom/implementer-worktrees/$repair_conflict_item_hash"
@@ -1997,7 +2423,7 @@ jq -s -e --arg order_id "$IMPLEMENT_CASE_ORDER_ID" '
 # survival marker prove this is the streaming path, not the post-run backstop.
 run_implement_usage_case 138 \
   '{"type":"turn.completed","usage":{"input_tokens":4360176,"cached_input_tokens":0,"output_tokens":22074,"reasoning_output_tokens":0}}' \
-  ceiling
+  ceiling enabled 5s
 [ "$IMPLEMENT_CASE_STATUS" -eq 1 ]
 [ -s "$IMPLEMENT_CASE_CODEX_MARKER" ]
 if kill -0 "$(cat "$IMPLEMENT_CASE_CODEX_MARKER")" 2>/dev/null; then
@@ -2005,6 +2431,7 @@ if kill -0 "$(cat "$IMPLEMENT_CASE_CODEX_MARKER")" 2>/dev/null; then
   exit 1
 fi
 [ ! -e "$IMPLEMENT_CASE_SURVIVED_MARKER" ]
+[ "$(cat "$IMPLEMENT_CASE_TERM_MARKER")" = completed ]
 [ -f "$IMPLEMENT_CASE_WORKTREE/generated.txt" ]
 [ -n "$(git -C "$IMPLEMENT_CASE_WORKTREE" status --porcelain)" ]
 jq -s -e \
@@ -2014,9 +2441,31 @@ jq -s -e \
   [.[] | select(.fact.order_id == $order_id)] | length == 1
   and .[0].kind == "work-failed"
   and .[0].fact.reason == "token-ceiling-terminated"
+  and .[0].fact.termination_signal == "SIGTERM"
   and .[0].fact.weighted_tokens == 894110
   and .[0].fact.worktree_path == $worktree_path
   and .[0].fact.branch_name == $branch_name
+' "$implement_config/ostrom/sprint.jsonl" >/dev/null
+
+# A sibling fixture ignores TERM. SIGKILL must end it before the test's tight
+# outer timeout, and the terminal fact must distinguish that escalation from
+# the cooperative case above. Reverting escalation makes this timeout or
+# leaves the survival marker behind.
+run_implement_usage_case 144 \
+  '{"type":"turn.completed","usage":{"input_tokens":4360176,"cached_input_tokens":0,"output_tokens":22074,"reasoning_output_tokens":0}}' \
+  ceiling-ignore-term enabled 5s
+[ "$IMPLEMENT_CASE_STATUS" -eq 1 ]
+[ -s "$IMPLEMENT_CASE_CODEX_MARKER" ]
+if kill -0 "$(cat "$IMPLEMENT_CASE_CODEX_MARKER")" 2>/dev/null; then
+  echo "streaming ceiling left its TERM-ignoring Codex child running" >&2
+  exit 1
+fi
+[ ! -e "$IMPLEMENT_CASE_SURVIVED_MARKER" ]
+jq -s -e --arg order_id "$IMPLEMENT_CASE_ORDER_ID" '
+  [.[] | select(.fact.order_id == $order_id)] | length == 1
+  and .[0].kind == "work-failed"
+  and .[0].fact.reason == "token-ceiling-terminated"
+  and .[0].fact.termination_signal == "SIGKILL"
 ' "$implement_config/ostrom/sprint.jsonl" >/dev/null
 
 # A large genuinely-fresh run still breaches. The failure row preserves all
@@ -2233,6 +2682,7 @@ HOME="$implement_fixture/missing-home" \
   CODEX_BIN="missing-codex" \
   CLAUDE_CONFIG_DIR="$missing_dispatch_config" \
   MANDATE_TRACE_TIME="2026-08-11T03:05:00Z" \
+  MANDATE_GH_AS_BIN="$fake_implement_gh" \
   MANDATE_SYSTEMD_RUN_BIN="$fake_running_systemd" \
   FAKE_SYSTEMD_ARGS="$implement_fixture/missing-systemd-args" \
   bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$missing_dispatch_order" \
@@ -6149,9 +6599,61 @@ cat >"$publisher_data/state.json" <<'JSON'
 }
 JSON
 
+# A scratch config with the implicit destination is refused before any GitHub
+# or Git command can face the real hub. The dedicated status lets sweep.sh
+# report this as a deliberate skip rather than success or infrastructure
+# failure. These spies must remain untouched.
+publish_spy_bin="$publisher/spy-bin"
+publish_spy_log="$publisher/destination-command.log"
+mkdir -p "$publish_spy_bin"
+for publish_spy_command in gh git; do
+  cat >"$publish_spy_bin/$publish_spy_command" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$OSTROM_TEST_PUBLISH_SPY_LOG"
+exit 97
+SH
+  chmod +x "$publish_spy_bin/$publish_spy_command"
+done
+set +e
+PATH="$publish_spy_bin:$PATH" \
+  OSTROM_TEST_PUBLISH_SPY_LOG="$publish_spy_log" \
+  CLAUDE_CONFIG_DIR="$publisher_config" \
+  CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+  MANDATE_PUBLISH_TIME="2026-08-01T00:05:00Z" \
+  bash "$PLUGIN_ROOT/scripts/publish.sh" \
+  >"$publisher/refused.out" 2>"$publisher/refused.err"
+publish_refused_status=$?
+set -e
+if [ "$publish_refused_status" -ne 3 ]; then
+  echo "scratch publish must return the deliberate-skip status" >&2
+  exit 1
+fi
+if [ "$(grep -Fc "$publisher_config" "$publisher/refused.err")" -eq 0 ]; then
+  echo "scratch publish refusal must name its config directory" >&2
+  exit 1
+fi
+if [ "$(grep -Fc 'onsager-ai/ostrom-hub' "$publisher/refused.err")" -eq 0 ]; then
+  echo "scratch publish refusal must name the refused destination" >&2
+  exit 1
+fi
+if [ -s "$publisher/refused.out" ]; then
+  echo "scratch publish refusal must not report successful output" >&2
+  exit 1
+fi
+if [ -e "$publish_spy_log" ]; then
+  echo "scratch publish must not attempt a destination-facing command" >&2
+  exit 1
+fi
+if [ "$(grep -Fc 'destination follows the config the sweep read' \
+  "$PLUGIN_ROOT/scripts/publish.sh")" -eq 0 ]; then
+  echo "publish header must explain that destination follows sweep config" >&2
+  exit 1
+fi
+
 run_publish_dry() {
   CLAUDE_CONFIG_DIR="$publisher_config" \
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    MANDATE_PUBLISH_REMOTE="$publisher_remote" \
     MANDATE_PUBLISH_TIME="2026-08-01T00:05:00Z" \
     bash "$PLUGIN_ROOT/scripts/publish.sh" --dry-run
 }
@@ -6296,6 +6798,7 @@ jq '.queue += ["fixture_extension"]' "$allowlist" >"$changed_allowlist"
 CLAUDE_CONFIG_DIR="$publisher_config" \
   CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
   MANDATE_PUBLISH_ALLOWLIST="$changed_allowlist" \
+  MANDATE_PUBLISH_REMOTE="$publisher_remote" \
   MANDATE_PUBLISH_TIME="2026-08-01T00:05:00Z" \
   bash "$PLUGIN_ROOT/scripts/publish.sh" --dry-run \
   >"$publisher/changed-tree.json"
@@ -6321,6 +6824,117 @@ git --git-dir="$publisher_remote" show state:gate/2026-07-31.jsonl |
   jq -e '.ts == "2026-07-31T23:59:59Z"' >/dev/null
 env "${publish_env[@]}" bash "$PLUGIN_ROOT/scripts/publish.sh" >/dev/null
 [ "$(git --git-dir="$publisher_remote" rev-list --count state)" -eq 1 ]
+
+# An explicit non-default destination is the caller's scratch-to-scratch
+# declaration and must bypass only the implicit-hub guard.
+override_remote="$publisher/explicit-override.git"
+override_cache="$publisher/explicit-override-cache"
+git init --bare --quiet "$override_remote"
+set +e
+CLAUDE_CONFIG_DIR="$publisher_config" \
+  CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+  MANDATE_PUBLISH_DIR="$override_cache" \
+  MANDATE_PUBLISH_REMOTE="$override_remote" \
+  MANDATE_PUBLISH_TIME="2026-08-01T00:05:00Z" \
+  GIT_AUTHOR_NAME="Ostrom Test" \
+  GIT_AUTHOR_EMAIL="ostrom@example.test" \
+  GIT_COMMITTER_NAME="Ostrom Test" \
+  GIT_COMMITTER_EMAIL="ostrom@example.test" \
+  bash "$PLUGIN_ROOT/scripts/publish.sh" \
+  >"$publisher/explicit-override.out" 2>"$publisher/explicit-override.err"
+explicit_override_status=$?
+set -e
+if [ "$explicit_override_status" -ne 0 ]; then
+  echo "scratch publish must honor an explicit non-default destination" >&2
+  exit 1
+fi
+explicit_override_count="$(
+  git --git-dir="$override_remote" rev-list --count state 2>/dev/null || printf '0\n'
+)"
+if [ "$explicit_override_count" -ne 1 ]; then
+  echo "explicit scratch destination must receive one state publication" >&2
+  exit 1
+fi
+
+# Both spellings of the operator config retain the implicit hub destination:
+# unset CLAUDE_CONFIG_DIR and an explicit $HOME/.claude. A purpose-built gh
+# adapter maps that exact owner/repo argument to a local bare repository, so
+# the test exercises clone, state-branch publication, and content without
+# network access.
+operator_home="$publisher/operator-home"
+operator_config="$operator_home/.claude"
+operator_remote="$publisher/operator-default.git"
+operator_bin="$publisher/operator-bin"
+operator_clone_log="$publisher/operator-clone.log"
+mkdir -p "$operator_config" "$operator_bin"
+cp -R "$publisher_data" "$operator_config/ostrom"
+git init --bare --quiet "$operator_remote"
+cat >"$operator_bin/gh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "$#" -ne 6 ] || [ "$1" != repo ] || [ "$2" != clone ] || \
+  [ "$3" != onsager-ai/ostrom-hub ] || [ "$5" != -- ] || \
+  [ "$6" != --no-checkout ]; then
+  exit 98
+fi
+printf '%s\n' "$3" >>"$OSTROM_TEST_OPERATOR_CLONE_LOG"
+exec "$OSTROM_TEST_REAL_GIT" clone --no-checkout \
+  "$OSTROM_TEST_OPERATOR_REMOTE" "$4"
+SH
+chmod +x "$operator_bin/gh"
+operator_publish_env=(
+  HOME="$operator_home"
+  PATH="$operator_bin:$PATH"
+  CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT"
+  MANDATE_PUBLISH_TIME="2026-08-01T00:05:00Z"
+  OSTROM_TEST_OPERATOR_CLONE_LOG="$operator_clone_log"
+  OSTROM_TEST_OPERATOR_REMOTE="$operator_remote"
+  OSTROM_TEST_REAL_GIT="$(command -v git)"
+  GIT_AUTHOR_NAME="Ostrom Test"
+  GIT_AUTHOR_EMAIL="ostrom@example.test"
+  GIT_COMMITTER_NAME="Ostrom Test"
+  GIT_COMMITTER_EMAIL="ostrom@example.test"
+)
+set +e
+(
+  unset CLAUDE_CONFIG_DIR
+  env "${operator_publish_env[@]}" \
+    MANDATE_PUBLISH_DIR="$publisher/operator-unset-cache" \
+    bash "$PLUGIN_ROOT/scripts/publish.sh"
+) >"$publisher/operator-unset.out" 2>"$publisher/operator-unset.err"
+operator_unset_status=$?
+set -e
+if [ "$operator_unset_status" -ne 0 ]; then
+  echo "unset CLAUDE_CONFIG_DIR must retain operator publication" >&2
+  exit 1
+fi
+set +e
+env "${operator_publish_env[@]}" \
+  CLAUDE_CONFIG_DIR="$operator_config" \
+  MANDATE_PUBLISH_DIR="$publisher/operator-explicit-cache" \
+  bash "$PLUGIN_ROOT/scripts/publish.sh" \
+  >"$publisher/operator-explicit.out" 2>"$publisher/operator-explicit.err"
+operator_explicit_status=$?
+set -e
+if [ "$operator_explicit_status" -ne 0 ]; then
+  echo "explicit default CLAUDE_CONFIG_DIR must retain operator publication" >&2
+  exit 1
+fi
+if [ "$(grep -Fc 'onsager-ai/ostrom-hub' "$operator_clone_log")" -ne 2 ]; then
+  echo "both operator config forms must use the unchanged default destination" >&2
+  exit 1
+fi
+operator_publish_count="$(git --git-dir="$operator_remote" rev-list --count state)"
+if [ "$operator_publish_count" -ne 1 ]; then
+  echo "operator config must publish the unchanged snapshot to state" >&2
+  exit 1
+fi
+operator_tree_id="$(git --git-dir="$operator_remote" rev-parse 'state^{tree}')"
+explicit_tree_id="$(git --git-dir="$publisher_remote" rev-parse 'state^{tree}')"
+if [ "$operator_tree_id" != "$explicit_tree_id" ]; then
+  echo "operator config publication content must remain unchanged" >&2
+  exit 1
+fi
 
 # A `--no-checkout` clone still populates the index from the remote's
 # default branch even though it skips the working tree, so a remote whose
@@ -6369,6 +6983,60 @@ rejecting_remote="$publish_sweep/rejecting.git"
 mkdir -p "$publish_sweep/config/ostrom" "$publish_sweep/repo"
 write_gatekeeper_secrets "$publish_sweep/config"
 cp "$publisher_data/mandates.yaml" "$publish_sweep/config/ostrom/mandates.yaml"
+
+# The sweep translates the publisher's config-guard status into a deliberate
+# skip. The gh call log proves that removing the guard would attempt the real
+# owner/repo destination, while the guarded run never reaches repo clone.
+set +e
+(
+  cd "$publish_sweep/repo"
+  PATH="$fixture/bin:$PATH" \
+    FAKE_GH_CALL_LOG="$publish_sweep/guard-gh.log" \
+    CLAUDE_CONFIG_DIR="$publish_sweep/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    MANDATE_SWEEP_MODE=full \
+    MANDATE_PUBLISH_DIR="$publish_sweep/guard-cache" \
+    MANDATE_PUBLISH_TIME="2026-08-01T00:05:00Z" \
+    GIT_AUTHOR_NAME="Ostrom Test" \
+    GIT_AUTHOR_EMAIL="ostrom@example.test" \
+    GIT_COMMITTER_NAME="Ostrom Test" \
+    GIT_COMMITTER_EMAIL="ostrom@example.test" \
+    bash "$PLUGIN_ROOT/scripts/sweep.sh" \
+    >"$publish_sweep/guard.out" 2>"$publish_sweep/guard.err"
+)
+guard_sweep_status=$?
+set -e
+if [ "$guard_sweep_status" -ne 0 ]; then
+  echo "scratch publish guard must not fail the governing sweep" >&2
+  exit 1
+fi
+if [ "$(grep -Fc "$publish_sweep/config" "$publish_sweep/guard.err")" -eq 0 ]; then
+  echo "sweep publish refusal must name the scratch config directory" >&2
+  exit 1
+fi
+if [ "$(grep -Fc 'onsager-ai/ostrom-hub' "$publish_sweep/guard.err")" -eq 0 ]; then
+  echo "sweep publish refusal must name the refused destination" >&2
+  exit 1
+fi
+if [ "$(grep -Fc 'mandate sweep: publish deliberately skipped by config guard' \
+  "$publish_sweep/guard.err")" -eq 0 ]; then
+  echo "sweep must report a guarded publication as a deliberate skip" >&2
+  exit 1
+fi
+if grep -Fq 'mandate sweep: publish failed' "$publish_sweep/guard.err"; then
+  echo "config-guard skip must remain distinct from publish failure" >&2
+  exit 1
+fi
+if grep -Fq 'mandate publish: published' "$publish_sweep/guard.out"; then
+  echo "config-guard skip must remain distinct from publish success" >&2
+  exit 1
+fi
+if grep -Fq $'\trepo clone onsager-ai/ostrom-hub ' \
+  "$publish_sweep/guard-gh.log"; then
+  echo "scratch sweep must not attempt to clone the real hub" >&2
+  exit 1
+fi
+
 (
   cd "$publish_sweep/repo"
   PATH="$fixture/bin:$PATH" \
