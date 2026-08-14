@@ -7,8 +7,8 @@
 use thiserror::Error;
 
 use crate::{
-    AttemptOutcome, PassAttempt, PassId, StoreFault, SweepPass, SweepStore, WriteDisposition,
-    store::STORE_SCHEMA_VERSION,
+    AttemptOutcome, PassAttempt, PassId, QueueFact, QueueKind, QueueState, RepositoryName,
+    StoreFault, SweepPass, SweepStore, WriteDisposition, store::STORE_SCHEMA_VERSION,
 };
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -33,7 +33,17 @@ fn pass(id: &str, outcome: AttemptOutcome) -> SweepPass {
             started_at: "2030-01-02T03:04:05Z".to_owned(),
             outcome,
         },
-        queue: Vec::new(),
+        queue: vec![QueueFact {
+            id: "synthetic-org/project#42".to_owned(),
+            repo: RepositoryName::new("synthetic-org/project").expect("valid fixture repository"),
+            reference: "#42".to_owned(),
+            title: "Synthetic classification fixture".to_owned(),
+            kind: QueueKind::Decision,
+            state: QueueState::Pending,
+            opened: "2030-01-01T00:00:00Z".to_owned(),
+            blocked_by: vec!["synthetic-org/dependency#7".to_owned()],
+            needs_judgment: true,
+        }],
         gates: Vec::new(),
         states: Vec::new(),
     }

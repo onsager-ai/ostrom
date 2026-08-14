@@ -69,4 +69,19 @@ fn rust_queue_is_byte_identical_to_bash_over_runtime_input() {
         String::from_utf8_lossy(&bash.stderr)
     );
     assert_eq!(rust.stdout, bash.stdout, "queue parity invariant failed");
+
+    let rendered = rust
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<serde_json::Value>(line).expect("rendered queue row"))
+        .collect::<Vec<_>>();
+    assert!(
+        rendered.iter().any(|row| row["needs_judgment"] == true),
+        "parity fixture must exercise a judgment classification"
+    );
+    assert!(
+        rendered.iter().any(|row| row["needs_judgment"] == false),
+        "parity fixture must exercise a non-judgment classification"
+    );
 }
