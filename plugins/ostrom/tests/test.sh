@@ -4022,6 +4022,11 @@ JSON
 [{"number":200,"mergedAt":"2020-01-01T00:00:00Z","headRefOid":"0000000000000000000000000000000000000000","mergeCommit":{"oid":"0000000000000000000000000000000000000001"}},{"number":201,"mergedAt":"2026-07-10T00:00:00Z","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","mergeCommit":{"oid":"1111111111111111111111111111111111111111"}},{"number":202,"mergedAt":"2026-07-11T00:00:00Z","headRefOid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","mergeCommit":{"oid":"2222222222222222222222222222222222222222"}},{"number":203,"mergedAt":"2026-07-12T00:00:00Z","headRefOid":"cccccccccccccccccccccccccccccccccccccccc","mergeCommit":{"oid":"3333333333333333333333333333333333333333"}},{"number":204,"mergedAt":"2026-07-13T00:00:00Z","headRefOid":"dddddddddddddddddddddddddddddddddddddddd","mergeCommit":{"oid":"4444444444444444444444444444444444444444"}},{"number":205,"mergedAt":"2026-07-14T00:00:00Z","headRefOid":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","mergeCommit":{"oid":"5555555555555555555555555555555555555555"}},{"number":206,"mergedAt":"2026-07-15T00:00:00Z","headRefOid":"ffffffffffffffffffffffffffffffffffffffff","mergeCommit":{"oid":"6666666666666666666666666666666666666666"}},{"number":207,"mergedAt":"2026-07-16T00:00:00Z","headRefOid":"7777777777777777777777777777777777777777","mergeCommit":{"oid":"8888888888888888888888888888888888888888"}},{"number":208,"mergedAt":"2026-07-17T00:00:00Z","headRefOid":"abababababababababababababababababababab","mergeCommit":{"oid":"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"}}]
 JSON
       ;;
+    example-org/merge-invariant-repo)
+      cat <<'JSON'
+[{"number":301,"title":"Synthetic merge without a verdict","state":"MERGED","createdAt":"2026-07-01T00:00:00Z","mergedAt":"2026-07-20T12:00:00Z","headRefOid":"1111111111111111111111111111111111111111"},{"number":302,"title":"Synthetic merge against a failing gate","state":"MERGED","createdAt":"2026-07-02T00:00:00Z","mergedAt":"2026-07-21T12:00:00Z","headRefOid":"2222222222222222222222222222222222222222"},{"number":303,"title":"Synthetic merge against an inconclusive gate","state":"MERGED","createdAt":"2026-07-03T00:00:00Z","mergedAt":"2026-07-22T12:00:00Z","headRefOid":"3333333333333333333333333333333333333333"},{"number":304,"title":"Synthetic merge after a passing gate","state":"MERGED","createdAt":"2026-07-04T00:00:00Z","mergedAt":"2026-07-23T12:00:00Z","headRefOid":"4444444444444444444444444444444444444444"},{"number":305,"title":"Synthetic merge before a late pass","state":"MERGED","createdAt":"2026-07-05T00:00:00Z","mergedAt":"2026-07-24T12:00:00Z","headRefOid":"5555555555555555555555555555555555555555"},{"number":306,"title":"Synthetic excused manual merge","state":"MERGED","createdAt":"2026-07-06T00:00:00Z","mergedAt":"2026-07-25T12:00:00Z","headRefOid":"6666666666666666666666666666666666666666"}]
+JSON
+      ;;
     *) echo '[]' ;;
   esac
   exit 0
@@ -5324,6 +5329,139 @@ JSONL
   chmod 644 "$unreadable_gate_log"
 fi
 
+# #147: the sweep backfills merged PRs from its existing PR listing and joins
+# them to gate.jsonl by the head SHA that landed. These synthetic merges cover
+# every invariant outcome: no verdict at that SHA (despite a verdict for the
+# same PR at another SHA), fail, inconclusive, timely pass, late pass, and an
+# explicitly excused manual merge. A second synthetic repository has no
+# merges, proving the empty side of the join is quiet.
+merge_invariant="$fixture/merge-invariant"
+merge_invariant_calls="$merge_invariant/gh-calls.log"
+mkdir -p "$merge_invariant/config/ostrom" "$merge_invariant/repo"
+write_gatekeeper_secrets "$merge_invariant/config"
+cat >"$merge_invariant/config/ostrom/mandates.yaml" <<'YAML'
+bounce_all: []
+projects:
+  - repo: example-org/merge-invariant-repo
+    delegated: []
+    excluded: []
+    reserved: []
+    default: excluded
+    paused: false
+    bounce: []
+  - repo: example-org/no-merges-repo
+    delegated: []
+    excluded: []
+    reserved: []
+    default: excluded
+    paused: false
+    bounce: []
+YAML
+cat >"$merge_invariant/config/ostrom/gate.jsonl" <<'JSONL'
+{"ts":"2026-07-19T10:00:00Z","pr":"example-org/merge-invariant-repo#301","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","verdict":"pass","already_judged":false,"conditions":[]}
+{"ts":"2026-07-21T10:00:00Z","pr":"example-org/merge-invariant-repo#302","head_sha":"2222222222222222222222222222222222222222","verdict":"fail","already_judged":false,"conditions":[]}
+{"ts":"2026-07-22T10:00:00Z","pr":"example-org/merge-invariant-repo#303","head_sha":"3333333333333333333333333333333333333333","verdict":"inconclusive","already_judged":false,"conditions":[]}
+{"ts":"2026-07-23T10:00:00Z","pr":"example-org/merge-invariant-repo#304","head_sha":"4444444444444444444444444444444444444444","verdict":"pass","already_judged":false,"conditions":[]}
+{"ts":"2026-07-24T13:00:00Z","pr":"example-org/merge-invariant-repo#305","head_sha":"5555555555555555555555555555555555555555","verdict":"pass","already_judged":false,"conditions":[]}
+JSONL
+cat >"$merge_invariant/config/ostrom/exceptions.jsonl" <<'JSONL'
+{"ts":"2026-07-25T13:00:00Z","repo":"example-org/merge-invariant-repo","pr":306,"head_sha":"6666666666666666666666666666666666666666","condition":"merge_protocol","reason":"principal accepted the synthetic manual merge"}
+JSONL
+merge_invariant_output="$(
+  cd "$merge_invariant/repo"
+  PATH="$fixture/bin:$PATH" \
+    FAKE_GH_CALL_LOG="$merge_invariant_calls" \
+    CLAUDE_CONFIG_DIR="$merge_invariant/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/sweep.sh"
+)"
+grep -q '^mandate sweep: 2 projects; 4 queue changes$' \
+  <<<"$merge_invariant_output"
+merge_invariant_queue="$merge_invariant/config/ostrom/queue.jsonl"
+merge_invariant_state="$merge_invariant/config/ostrom/state.json"
+jq -s -e '
+  length == 4
+  and all(.[];
+    .repo == "example-org/merge-invariant-repo"
+    and .kind == "decision"
+    and .state == "pending"
+    and .needs_judgment == true
+  )
+  and any(.[];
+    .id == "example-org/merge-invariant-repo#301"
+    and .mandate.reason == "merge gate fault: no verdict for merged head 1111111111111111111111111111111111111111"
+  )
+  and any(.[];
+    .id == "example-org/merge-invariant-repo#302"
+    and .mandate.reason == "merge gate fault: fail verdict for merged head 2222222222222222222222222222222222222222"
+  )
+  and any(.[];
+    .id == "example-org/merge-invariant-repo#303"
+    and .mandate.reason == "merge gate fault: inconclusive verdict for merged head 3333333333333333333333333333333333333333"
+  )
+  and any(.[];
+    .id == "example-org/merge-invariant-repo#305"
+    and .mandate.reason == "merge gate fault: pass recorded after merge for head 5555555555555555555555555555555555555555"
+  )
+  and (any(.[]; .id == "example-org/merge-invariant-repo#304") | not)
+  and (any(.[]; .id == "example-org/merge-invariant-repo#306") | not)
+' "$merge_invariant_queue" >/dev/null
+jq -e '
+  .repos["example-org/merge-invariant-repo"] as $repo
+  | $repo.merge_gate_fault_count == 4
+  and ($repo.merge_gate_merges | length) == 6
+  and $repo.merge_gate_faults["example-org/merge-invariant-repo#301"].shape == "no_verdict"
+  and $repo.merge_gate_faults["example-org/merge-invariant-repo#302"].shape == "non_pass"
+  and $repo.merge_gate_faults["example-org/merge-invariant-repo#302"].verdict == "fail"
+  and $repo.merge_gate_faults["example-org/merge-invariant-repo#303"].verdict == "inconclusive"
+  and $repo.merge_gate_faults["example-org/merge-invariant-repo#305"].shape == "pass_after_merge"
+  and ($repo.merge_gate_faults | has("example-org/merge-invariant-repo#304") | not)
+  and ($repo.merge_gate_faults | has("example-org/merge-invariant-repo#306") | not)
+  and $repo.merge_gate_excuses["example-org/merge-invariant-repo#306"].reason
+    == "principal accepted the synthetic manual merge"
+  and .repos["example-org/no-merges-repo"].merge_gate_fault_count == 0
+  and (.repos["example-org/no-merges-repo"].merge_gate_merges | length) == 0
+  and (.repos["example-org/no-merges-repo"].merge_gate_faults | length) == 0
+' "$merge_invariant_state" >/dev/null
+
+# The backfill reused the one PR call each repository already gets. There is
+# no separate merged-PR API call and, because this is detective, the sweep
+# still exits successfully after finding the four faults.
+[ "$(grep -c $'example-org/merge-invariant-repo\tpr list ' "$merge_invariant_calls")" -eq 1 ]
+[ "$(grep -c $'example-org/no-merges-repo\tpr list ' "$merge_invariant_calls")" -eq 1 ]
+grep -Fq $'example-org/merge-invariant-repo\tpr list --repo example-org/merge-invariant-repo --state all --limit 200' \
+  "$merge_invariant_calls"
+if grep -q -- '--state merged' "$merge_invariant_calls"; then
+  echo "merge invariant sweep added a separate merged-PR API call" >&2
+  exit 1
+fi
+
+merge_invariant_digest="$(
+  cd "$merge_invariant/repo"
+  CLAUDE_CONFIG_DIR="$merge_invariant/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/hooks/render-digest.sh"
+)"
+merge_invariant_digest_text="$(jq -r '.systemMessage' <<<"$merge_invariant_digest")"
+grep -q '^example-org/merge-invariant-repo: 4 merge gate faults — /ostrom:desk triage$' \
+  <<<"$merge_invariant_digest_text"
+grep -q '^example-org/merge-invariant-repo#301  Synthetic merge without a verdict — merge gate fault:' \
+  <<<"$merge_invariant_digest_text"
+
+# Once baselined, unchanged history carries the existing rows rather than
+# recreating them, so explanations or queue actions are not overwritten.
+cp "$merge_invariant_queue" "$merge_invariant/queue.before"
+merge_invariant_repeat="$(
+  cd "$merge_invariant/repo"
+  PATH="$fixture/bin:$PATH" \
+    CLAUDE_CONFIG_DIR="$merge_invariant/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/sweep.sh"
+)"
+grep -q '^mandate sweep: 2 projects; 0 queue changes$' \
+  <<<"$merge_invariant_repeat"
+cmp "$merge_invariant/queue.before" "$merge_invariant_queue"
+
 # The fixture shape is three issues plus the three PRs that close them.
 # Prefer the PRs, retain their recognizable titles, and name each collapsed
 # issue in the falsifiability reason: six raw candidates become three rows.
@@ -6363,6 +6501,33 @@ jq -e --arg head "$granted_head" '
   }
 ' <<<"$grant_output" >/dev/null
 [ "$(wc -l <"$excuse_log" | tr -d '[:space:]')" -eq 1 ]
+
+# A manual-merge explanation uses the same SHA-scoped exception mechanism,
+# with its own condition name. Keep it in a separate synthetic config so the
+# gate-condition fixture below still contains exactly one exception.
+merge_protocol_excuse_config="$gate_fixture/merge-protocol-config"
+merge_protocol_excuse_output="$(
+  PATH="$gate_fixture/bin:$PATH" \
+    FAKE_GATE_HEAD="$granted_head" \
+    MANDATE_EXCUSE_TIME="2026-08-04T12:00:00Z" \
+    CLAUDE_CONFIG_DIR="$merge_protocol_excuse_config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/excuse.sh" grant \
+      placeholder-org/placeholder-repo#8 merge_protocol \
+      "principal explained placeholder manual merge"
+)"
+jq -e --arg head "$granted_head" '
+  .repo == "placeholder-org/placeholder-repo"
+  and .pr == 8
+  and .head_sha == $head
+  and .condition == "merge_protocol"
+  and .reason == "principal explained placeholder manual merge"
+' <<<"$merge_protocol_excuse_output" >/dev/null
+jq -s -e '
+  length == 1
+  and .[0].condition == "merge_protocol"
+  and .[0].reason == "principal explained placeholder manual merge"
+' "$merge_protocol_excuse_config/ostrom/exceptions.jsonl" >/dev/null
 
 # A SHA in the caller-supplied condition position is rejected; grant has no
 # SHA argument and always takes it from gh pr view.

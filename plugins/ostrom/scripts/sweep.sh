@@ -184,20 +184,31 @@ sweep_org() {
       jq -r '[.[] | (.updatedAt // .updated_at // empty)] | max // ""' \
         "$work/issues.json"
     )"
-    # Pull requests intentionally stay on a complete open listing. Check and
-    # file changes do not reliably move updatedAt, so putting PRs behind the
+    # Pull requests intentionally stay on one complete listing. Check and file
+    # changes do not reliably move updatedAt, so putting open PRs behind the
     # issues change-feed cursor would leave stale CI and path classifications.
-    if ! gh pr list --repo "$repo" --state open --limit "$query_limit" \
-      --json number,title,body,labels,createdAt,updatedAt,url,isDraft,reviewDecision,statusCheckRollup,closingIssuesReferences,files \
-      >"$work/prs.json" 2>"$gh_error"; then
+    # The same response also carries merged PRs for the gate-invariant join
+    # below. This changes no call count: one all-state listing replaces the
+    # former open-only listing, then the two populations are split locally.
+    if ! gh pr list --repo "$repo" --state all --limit "$query_limit" \
+      --json number,title,body,labels,createdAt,updatedAt,url,isDraft,reviewDecision,statusCheckRollup,closingIssuesReferences,files,state,mergedAt,headRefOid \
+      >"$work/all-prs.json" 2>"$gh_error"; then
       detail="$(tr '\n' ' ' <"$gh_error")"
-      echo "mandate sweep: failed to query open PRs and CI for $repo${detail:+: $detail}" >&2
+      echo "mandate sweep: failed to query PRs, CI, and merged heads for $repo${detail:+: $detail}" >&2
       exit 5
     fi
-    if [ "$(jq 'length' "$work/prs.json")" -eq "$query_limit" ]; then
-      echo "mandate sweep: open PR query for $repo reached query_limit $query_limit; refusing a truncated sweep" >&2
+    if [ "$(jq 'length' "$work/all-prs.json")" -eq "$query_limit" ]; then
+      echo "mandate sweep: PR query for $repo reached query_limit $query_limit; refusing a truncated sweep" >&2
       exit 6
     fi
+    jq -c '[.[] | select(
+      .state == "OPEN"
+      or ((has("state") | not) and (.mergedAt // null) == null)
+    )]' "$work/all-prs.json" >"$work/prs.json"
+    jq -c '[.[] | select(
+      .state == "MERGED"
+      or ((.mergedAt // "") | type == "string" and length > 0)
+    )]' "$work/all-prs.json" >"$work/merged-prs.json"
     item_cap='null'
 
     # #78/#77 both need the default branch's own history — one lookup here,
@@ -851,6 +862,161 @@ sweep_org() {
           }
       ' >"$work/analysis.json"
 
+    # #147: a merge with no timely passing verdict is a fault observed after
+    # the fact. The all-state PR response above, gate.jsonl, and
+    # exceptions.jsonl are already in hand; this is deliberately only a local
+    # join. Faults use ordinary decision rows, so they can be explained,
+    # deferred, or otherwise handled without changing merge behaviour.
+    jq -cn \
+      --arg repo "$repo" \
+      --arg sweep_started "$sweep_started" \
+      --argjson stuck_after_days "$(jq '.stuck_after_days' "$work/config.json")" \
+      --slurpfile merged "$work/merged-prs.json" \
+      --slurpfile gate "$work/gate-records.json" \
+      --slurpfile exceptions "$work/exception-records.json" \
+      --slurpfile previous "$work/previous.json" '
+      def timestamp_before($candidate; $boundary):
+        try (($candidate | fromdateiso8601) < ($boundary | fromdateiso8601))
+        catch false;
+      def age_days($opened):
+        try (
+          ((($sweep_started | fromdateiso8601) - ($opened | fromdateiso8601)) / 86400 | floor)
+          | [., 0] | max
+        ) catch 0;
+      def reason($fault):
+        if $fault.shape == "no_verdict" then
+          "merge gate fault: no verdict for merged head " + $fault.head_sha
+        elif $fault.shape == "non_pass" then
+          "merge gate fault: " + $fault.verdict
+          + " verdict for merged head " + $fault.head_sha
+        else
+          "merge gate fault: pass recorded after merge for head " + $fault.head_sha
+        end;
+      (reduce $gate[0][] as $record ({};
+        if (($record.head_sha // null) | type) == "string"
+            and ($record.head_sha | length) > 0
+        then .[$record.head_sha] += [$record]
+        else .
+        end
+      )) as $gate_by_sha
+      | ($previous[0].merge_gate_merges // {}) as $known_merges
+      | (reduce $merged[0][] as $pr ($known_merges;
+          select(($pr.number | type) == "number")
+          | ($repo + "#" + ($pr.number | tostring)) as $id
+          | .[$id] = {
+              id: $id,
+              number: $pr.number,
+              title: (
+                ($pr.title // "")
+                | if type == "string" and length > 0
+                  then . else "(title unavailable)" end
+              ),
+              created_at: ($pr.createdAt // $pr.mergedAt // $sweep_started),
+              merged_at: ($pr.mergedAt // ""),
+              head_sha: ($pr.headRefOid // "")
+            }
+        )) as $merges
+      | [
+          $merges[]
+          | select((.merged_at | type) == "string" and (.merged_at | length) > 0)
+          | . as $merge
+          | ($gate_by_sha[$merge.head_sha] // []) as $records
+          | ([$records[] | select(
+              .verdict == "pass"
+              and timestamp_before((.ts // ""); $merge.merged_at)
+            )]) as $timely_passes
+          | ([$records[] | select(.verdict == "pass")]) as $passes
+          | (
+              if ($timely_passes | length) > 0 then null
+              elif ($records | length) == 0 then {
+                shape: "no_verdict",
+                verdict: "none",
+                gate_ts: null
+              }
+              elif ($passes | length) > 0 then {
+                shape: "pass_after_merge",
+                verdict: "pass",
+                gate_ts: ($passes[0].ts // null)
+              }
+              else {
+                shape: "non_pass",
+                verdict: (($records | last).verdict // "inconclusive"),
+                gate_ts: (($records | last).ts // null)
+              }
+              end
+            ) as $violation
+          | select($violation != null)
+          | ([
+              $exceptions[0][]
+              | select(
+                  .repo == $repo
+                  and .pr == $merge.number
+                  and .head_sha == $merge.head_sha
+                  and .condition == "merge_protocol"
+                  and ((.reason // null) | type) == "string"
+                )
+            ] | last // null) as $exception
+          | $merge + $violation + {
+              exception: $exception,
+              fingerprint: ([$violation.shape, $merge.head_sha,
+                $violation.verdict, ($violation.gate_ts // "")] | join("|"))
+            }
+        ] as $violations
+      | ([$violations[] | select(.exception == null)]) as $faults
+      | ([$violations[] | select(.exception != null)]) as $excused
+      | ($previous[0].merge_gate_faults // {}) as $old_faults
+      | {
+          rows: [
+            $faults[]
+            | select(($old_faults[.id].fingerprint // "") != .fingerprint)
+            | . as $fault
+            | (age_days($fault.merged_at)) as $age
+            | {
+                id: $fault.id,
+                repo: $repo,
+                ref: ("#" + ($fault.number | tostring)),
+                title: $fault.title,
+                kind: "decision",
+                mandate: {reason: reason($fault)},
+                state: "pending",
+                opened: $fault.merged_at,
+                age_days: $age,
+                aged_out: ($age >= $stuck_after_days),
+                needs_judgment: true,
+                blocked_by: []
+              }
+          ],
+          active_ids: [$faults[].id],
+          current_items: [
+            $faults[]
+            | (age_days(.merged_at)) as $age
+            | {
+                id,
+                title,
+                age_days: $age,
+                aged_out: ($age >= $stuck_after_days)
+              }
+          ],
+          merges: $merges,
+          faults: (reduce $faults[] as $fault ({};
+            .[$fault.id] = {
+              shape: $fault.shape,
+              head_sha: $fault.head_sha,
+              verdict: $fault.verdict,
+              gate_ts: $fault.gate_ts,
+              fingerprint: $fault.fingerprint
+            }
+          )),
+          excuses: (reduce $excused[] as $item ({};
+            .[$item.id] = {
+              head_sha: $item.head_sha,
+              reason: $item.exception.reason
+            }
+          )),
+          fault_count: ($faults | length)
+        }
+      ' >"$work/merge-gate.json"
+
     # #78: fold the default branch's own CI into a "drift" row, the same kind
     # and digest/troubled-project machinery an open PR's failing CI already
     # uses. Regeneration is gated on .event the same way the rest of this
@@ -1032,14 +1198,16 @@ sweep_org() {
     jq -cn \
       --slurpfile all "$work/generated.json" \
       --slurpfile analysis "$work/analysis.json" \
+      --slurpfile merge_gate "$work/merge-gate.json" \
       --slurpfile ci_drift "$work/ci-drift.json" \
-      '$all[0] + $analysis[0].rows + $ci_drift[0].rows' >"$work/next.json"
+      '$all[0] + $analysis[0].rows + $merge_gate[0].rows + $ci_drift[0].rows' >"$work/next.json"
     mv "$work/next.json" "$work/generated.json"
     jq -cn \
       --slurpfile all "$work/active-ids.json" \
       --slurpfile analysis "$work/analysis.json" \
+      --slurpfile merge_gate "$work/merge-gate.json" \
       --slurpfile ci_drift "$work/ci-drift.json" \
-      '$all[0] + $analysis[0].active_ids + $ci_drift[0].active_ids' >"$work/next.json"
+      '$all[0] + $analysis[0].active_ids + $merge_gate[0].active_ids + $ci_drift[0].active_ids' >"$work/next.json"
     mv "$work/next.json" "$work/active-ids.json"
 
     # An approval is deliberately durable across an item disappearing from
@@ -1099,8 +1267,9 @@ sweep_org() {
     jq -cn \
       --slurpfile all "$work/current-items.json" \
       --slurpfile analysis "$work/analysis.json" \
+      --slurpfile merge_gate "$work/merge-gate.json" \
       --slurpfile ci_drift "$work/ci-drift.json" \
-      '$all[0] + $analysis[0].current_items + $ci_drift[0].current_items' >"$work/next.json"
+      '$all[0] + $analysis[0].current_items + $merge_gate[0].current_items + $ci_drift[0].current_items' >"$work/next.json"
     mv "$work/next.json" "$work/current-items.json"
     jq -cn \
       --slurpfile all "$work/selector-stats.json" \
@@ -1118,6 +1287,7 @@ sweep_org() {
         --arg repo "$repo" \
         --slurpfile state "$work/new-state.json" \
         --slurpfile analysis "$work/analysis.json" \
+        --slurpfile merge_gate "$work/merge-gate.json" \
         --slurpfile ci_drift "$work/ci-drift.json" \
         --slurpfile records "$work/items.json" \
         --arg etag "${issue_etag:-$previous_etag}" \
@@ -1126,6 +1296,10 @@ sweep_org() {
               $analysis[0].repo_state
               + {
                   ci_drift: $ci_drift[0].state,
+                  merge_gate_merges: $merge_gate[0].merges,
+                  merge_gate_faults: $merge_gate[0].faults,
+                  merge_gate_excuses: $merge_gate[0].excuses,
+                  merge_gate_fault_count: $merge_gate[0].fault_count,
                   etag: (if $etag == "" then null else $etag end),
                   records: (reduce $records[0][] as $record ({}; .[$record.id] = $record))
                 }
@@ -1234,6 +1408,27 @@ printf '%s\n' '[]' >"$work/selector-stats.json"
 # ("owner/repo#N"), accumulated across repos the same way the lists above are.
 printf '%s\n' '[]' >"$work/possibly-landed.json"
 cp "$work/old-state.json" "$work/new-state.json"
+
+# Snapshot the append-only evidence once for every organisation subprocess.
+# Missing or empty logs are legitimate first-run states. Malformed evidence is
+# reported but cannot turn this detective check into a failed sweep; treating
+# unreadable verdicts as absent keeps the possible faults visible.
+printf '%s\n' '[]' >"$work/gate-records.json"
+if [ -s "$MANDATE_GATE_LOG" ]; then
+  if ! jq -s '[.[] | select(type == "object")]' "$MANDATE_GATE_LOG" \
+      >"$work/gate-records.json" 2>/dev/null; then
+    echo "mandate sweep: could not read $MANDATE_GATE_LOG; merge gate faults will be classified as having no verdict" >&2
+    printf '%s\n' '[]' >"$work/gate-records.json"
+  fi
+fi
+printf '%s\n' '[]' >"$work/exception-records.json"
+if [ -s "$MANDATE_EXCEPTIONS_LOG" ]; then
+  if ! jq -s '[.[] | select(type == "object")]' "$MANDATE_EXCEPTIONS_LOG" \
+      >"$work/exception-records.json" 2>/dev/null; then
+    echo "mandate sweep: could not read $MANDATE_EXCEPTIONS_LOG; ignoring merge gate exceptions" >&2
+    printf '%s\n' '[]' >"$work/exception-records.json"
+  fi
+fi
 
 # #86: track landed-fix commit-search attempts/failures across the whole
 # sweep (all organisations, all repos, all candidates) so a 100%-failing
