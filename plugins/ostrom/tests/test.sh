@@ -28,6 +28,12 @@ if grep -R -I -n -E "$machine_path_pattern" \
 fi
 
 mkdir -p "$fixture/config/ostrom" "$fixture/repo" "$fixture/bin"
+sweep_search_root="$fixture/search-root"
+sweep_resolved_source="$sweep_search_root/example-org/example-repo"
+mkdir -p "$sweep_resolved_source"
+git -C "$sweep_resolved_source" init -b main >/dev/null
+git -C "$sweep_resolved_source" remote add origin \
+  https://github.com/example-org/example-repo.git
 export MANDATE_SWEEP_TIME="2026-08-01T00:00:00Z"
 export MANDATE_TODAY="2026-08-01"
 export MANDATE_NOW_EPOCH="1785542400"
@@ -41,6 +47,8 @@ write_config() {
 provider: file
 cadence_hours: 24
 stuck_after_days: 1
+search_roots:
+  - $sweep_search_root
 bounce_all:
   - title:*credential*
   - title:*never fires*
@@ -1021,7 +1029,21 @@ CLAUDE_CONFIG_DIR="$cap_bad_override_config" CLAUDE_BIN="$fake_claude" \
 dispatch_fixture="$fixture/dispatch"
 dispatch_config="$dispatch_fixture/config"
 dispatch_bin="$dispatch_fixture/bin"
-mkdir -p "$dispatch_config/ostrom" "$dispatch_bin"
+dispatch_search_root="$dispatch_fixture/search-root"
+dispatch_source="$dispatch_search_root/example-org/example-repo"
+mkdir -p "$dispatch_source" "$dispatch_bin"
+git -C "$dispatch_source" init -b main >/dev/null
+git -C "$dispatch_source" remote add origin \
+  https://github.com/example-org/example-repo.git
+write_dispatch_config() {
+  local target_config="$1"
+  mkdir -p "$target_config/ostrom"
+  cat >"$target_config/ostrom/mandates.yaml" <<YAML
+search_roots:
+  - $dispatch_search_root
+YAML
+}
+write_dispatch_config "$dispatch_config"
 dispatch_candidate="$dispatch_fixture/candidate.json"
 cat >"$dispatch_candidate" <<'JSON'
 {"schema_version":1,"item_id":"example-org/example-repo#123","repository":"example-org/example-repo","item_ref":"#123","branch_name":"feat/123-placeholder","spec":"Implement one synthetic behavior.","acceptance_criteria":["The synthetic behavior is observable."],"constraints":["Use placeholder data only."]}
@@ -1140,13 +1162,60 @@ dispatch_args="$dispatch_fixture/systemd-args"
 dispatch_calls="$dispatch_fixture/systemd-calls"
 : >"$dispatch_calls"
 
+# #169: a repository absent from every configured search root is refused
+# locally, before a GitHub read, item lease, spend reservation, or unit launch.
+# The terminal row names both the stable reason and the repository.
+missing_source_config="$dispatch_fixture/missing-source-config"
+missing_source_root="$dispatch_fixture/missing-source-root"
+missing_source_gh_calls="$dispatch_fixture/missing-source-gh-calls"
+missing_source_systemd_calls="$dispatch_fixture/missing-source-systemd-calls"
+missing_source_stderr="$dispatch_fixture/missing-source.err"
+mkdir -p "$missing_source_config/ostrom" "$missing_source_root"
+cat >"$missing_source_config/ostrom/mandates.yaml" <<YAML
+search_roots:
+  - $missing_source_root
+YAML
+set +e
+FAKE_GH_CALLS="$missing_source_gh_calls" \
+  CLAUDE_CONFIG_DIR="$missing_source_config" \
+  MANDATE_TRACE_TIME="2026-08-11T02:00:20Z" \
+  MANDATE_NOW_EPOCH="$cap_today_epoch" \
+  MANDATE_GH_AS_BIN="$fake_dispatch_gh" \
+  MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
+  CODEX_BIN="$fake_dispatch_codex" \
+  FAKE_SYSTEMD_ARGS="$dispatch_args" \
+  FAKE_SYSTEMD_CALLS="$missing_source_systemd_calls" \
+  bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$dispatch_order" \
+    >/dev/null 2>"$missing_source_stderr"
+missing_source_status=$?
+set -e
+[ "$missing_source_status" -eq 3 ]
+[ ! -e "$missing_source_gh_calls" ]
+[ ! -e "$missing_source_systemd_calls" ]
+missing_source_item_hash="$(
+  bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash \
+    'example-org/example-repo#123'
+)"
+[ ! -e "$missing_source_config/ostrom/implementer-item-$missing_source_item_hash.lease" ]
+jq -s -e '
+  length == 1
+  and .[0].kind == "work-failed"
+  and .[0].fact.reason == "source-repository-not-found"
+  and .[0].fact.repository == "example-org/example-repo"
+  and .[0].fact.cost_usd == 0
+  and ([.[] | select(.kind == "work-dispatched")] | length) == 0
+' "$missing_source_config/ostrom/sprint.jsonl" >/dev/null
+grep -Fq \
+  'source-repository-not-found: repository=example-org/example-repo' \
+  "$missing_source_stderr"
+
 # #153: a remote branch is durable work even without a pull request. The
 # branch read, default lookup, and comparison all use the builder wrapper;
 # rejection precedes the lease and the work-dispatched reservation.
 branch_guard_config="$dispatch_fixture/branch-guard-config"
 branch_guard_gh_calls="$dispatch_fixture/branch-guard-gh-calls"
 branch_guard_stderr="$dispatch_fixture/branch-guard.err"
-mkdir -p "$branch_guard_config/ostrom"
+write_dispatch_config "$branch_guard_config"
 set +e
 FAKE_REMOTE_BRANCH_NAME="$dispatch_branch" \
   FAKE_REMOTE_BRANCH_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
@@ -1221,7 +1290,7 @@ merged_branch_config="$dispatch_fixture/merged-branch-config"
 merged_branch_gh_calls="$dispatch_fixture/merged-branch-gh-calls"
 merged_branch_systemd_args="$dispatch_fixture/merged-branch-systemd-args"
 merged_branch_systemd_calls="$dispatch_fixture/merged-branch-systemd-calls"
-mkdir -p "$merged_branch_config/ostrom"
+write_dispatch_config "$merged_branch_config"
 : >"$merged_branch_systemd_calls"
 merged_branch_unit="$(
   FAKE_REMOTE_BRANCH_NAME="$dispatch_branch" \
@@ -1273,7 +1342,7 @@ fi
 for branch_pr_case in open closed-unmerged; do
   branch_pr_case_config="$dispatch_fixture/$branch_pr_case-branch-config"
   branch_pr_case_stderr="$dispatch_fixture/$branch_pr_case-branch.err"
-  mkdir -p "$branch_pr_case_config/ostrom"
+  write_dispatch_config "$branch_pr_case_config"
   case "$branch_pr_case" in
     open)
       branch_pr_case_json='[{"number":89,"state":"OPEN","mergedAt":null}]'
@@ -1316,7 +1385,7 @@ done
 # reservations, just like the neighbouring GitHub-backed guards.
 branch_pr_query_failure_config="$dispatch_fixture/branch-pr-query-failure-config"
 branch_pr_query_failure_stderr="$dispatch_fixture/branch-pr-query-failure.err"
-mkdir -p "$branch_pr_query_failure_config/ostrom"
+write_dispatch_config "$branch_pr_query_failure_config"
 set +e
 FAKE_REMOTE_BRANCH_NAME="$dispatch_branch" \
   FAKE_REMOTE_BRANCH_SHA=ffffffffffffffffffffffffffffffffffffffff \
@@ -1377,7 +1446,7 @@ fi
 # Failure to enumerate remote branches fails closed before any reservation.
 branch_query_failure_config="$dispatch_fixture/branch-query-failure-config"
 branch_query_failure_stderr="$dispatch_fixture/branch-query-failure.err"
-mkdir -p "$branch_query_failure_config/ostrom"
+write_dispatch_config "$branch_query_failure_config"
 set +e
 FAKE_REMOTE_QUERY_FAIL=1 CLAUDE_CONFIG_DIR="$branch_query_failure_config" \
   MANDATE_NOW_EPOCH="$cap_today_epoch" \
@@ -1503,7 +1572,7 @@ set -e
 # for different items. The new item's speculative lease is released when the
 # dispatcher refuses it.
 concurrency_config="$dispatch_fixture/concurrency-config"
-mkdir -p "$concurrency_config/ostrom"
+write_dispatch_config "$concurrency_config"
 cat >"$concurrency_config/ostrom/sprint.jsonl" <<'JSONL'
 {"ts":"2026-08-11T01:00:00Z","kind":"work-dispatched","fact":{"schema_version":1,"item_id":"example-org/example-repo#130","order_id":"order-a","unit_name":"ostrom-implementer-aaaaaaaaaaaaaaaa","backend":"systemd","cost_ceiling_usd":20,"token_ceiling":500000,"cost_usd":null,"duration_seconds":0},"narration":{}}
 {"ts":"2026-08-11T01:01:00Z","kind":"work-dispatched","fact":{"schema_version":1,"item_id":"example-org/example-repo#131","order_id":"order-b","unit_name":"ostrom-implementer-bbbbbbbbbbbbbbbb","backend":"systemd","cost_ceiling_usd":20,"token_ceiling":500000,"cost_usd":null,"duration_seconds":0},"narration":{}}
@@ -2829,6 +2898,7 @@ HOME="$implement_fixture/missing-home" \
   MANDATE_TRACE_TIME="2026-08-11T03:05:00Z" \
   MANDATE_GH_AS_BIN="$fake_implement_gh" \
   MANDATE_SYSTEMD_RUN_BIN="$fake_running_systemd" \
+  MANDATE_IMPLEMENTER_SOURCE_REPO="$implement_source" \
   FAKE_SYSTEMD_ARGS="$implement_fixture/missing-systemd-args" \
   bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$missing_dispatch_order" \
     >"$implement_fixture/missing.out" 2>"$implement_fixture/missing.err"
@@ -4836,6 +4906,15 @@ run_sweep >/dev/null
 queue="$fixture/config/ostrom/queue.jsonl"
 state="$fixture/config/ostrom/state.json"
 
+# #169: sweep records repository availability as a roster defect. The local
+# checkout resolves normally, while the other roster repository remains in a
+# separate top-level set rather than being recast as stuck work.
+jq -e --arg resolved "example-org/example-repo" \
+  --arg missing "example-org/another-repo" '
+  .unresolvable_repositories == [$missing]
+  and (.unresolvable_repositories | index($resolved)) == null
+' "$state" >/dev/null
+
 jq -e '
   select(.id == "example-org/example-repo#10" and .kind == "decision")
   | .mandate.reason == "reserved ref:#10"
@@ -5034,6 +5113,15 @@ long_rendered_reason="${long_digest_row#* — }"
 grep -q '^example-org/example-repo: baselined 10 open items$' <<<"$digest_text"
 grep -q '^example-org/another-repo: baselined 1 open items$' <<<"$digest_text"
 grep -q '^example-org/example-repo: 3 unclassified — /ostrom:desk triage$' <<<"$digest_text"
+grep -q '^UNDISPATCHABLE REPOSITORIES$' <<<"$digest_text"
+grep -q \
+  '^example-org/another-repo — source repository not found under search_roots$' \
+  <<<"$digest_text"
+if grep -q '^example-org/example-repo — source repository not found' \
+  <<<"$digest_text"; then
+  echo "resolvable repository was reported as undispatchable" >&2
+  exit 1
+fi
 if grep -Eq 'dead selector|unmatched in last sweep' <<<"$digest_text"; then
   echo "unmatched selectors leaked into the digest" >&2
   exit 1
@@ -6058,14 +6146,23 @@ grep -q \
 
 # A representative eight-project first sweep remains a compact digest.
 portfolio="$fixture/portfolio"
-mkdir -p "$portfolio/config/ostrom" "$portfolio/repo"
+portfolio_search_root="$portfolio/search-root"
+mkdir -p "$portfolio/config/ostrom" "$portfolio/repo" \
+  "$portfolio_search_root/example-org"
 write_gatekeeper_secrets "$portfolio/config"
-cat >"$portfolio/config/ostrom/mandates.yaml" <<'YAML'
+cat >"$portfolio/config/ostrom/mandates.yaml" <<YAML
+search_roots:
+  - $portfolio_search_root
 bounce_all:
   - title:*production deployment*
 projects:
 YAML
 for number in 1 2 3 4 5 6 7 8; do
+  portfolio_source="$portfolio_search_root/example-org/repo-$number"
+  mkdir -p "$portfolio_source"
+  git -C "$portfolio_source" init -b main >/dev/null
+  git -C "$portfolio_source" remote add origin \
+    "https://github.com/example-org/repo-$number.git"
   {
     echo "  - repo: example-org/repo-$number"
     echo "    delegated: []"
@@ -7181,6 +7278,7 @@ cat >"$publisher_data/state.json" <<'JSON'
   "version": 2,
   "sweep_mode": "incremental",
   "last_full_reconciliation": "2026-08-01T00:00:00Z",
+  "unresolvable_repositories": ["example-org/missing-repo"],
   "dead_selectors": [
     {"repo": "example-org/example-repo", "selector": "label:synthetic", "source": "delegated"}
   ],
@@ -7337,6 +7435,7 @@ assert_tree_allowlisted "$publisher_tree"
 jq -e '
   .["state.json"].sweep_mode == "incremental"
   and .["state.json"].last_full_reconciliation == "2026-08-01T00:00:00Z"
+  and .["state.json"].unresolvable_repositories == ["example-org/missing-repo"]
 ' "$publisher_tree" >/dev/null
 
 # A workstation with live records exercises the same assertion without

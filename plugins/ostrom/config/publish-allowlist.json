@@ -82,6 +82,7 @@
     "sweep_mode",
     "last_full_reconciliation",
     "dead_selectors",
+    "unresolvable_repositories",
     "repos"
   ],
   "state.dead_selector": [
