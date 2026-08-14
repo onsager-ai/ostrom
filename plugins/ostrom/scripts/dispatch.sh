@@ -128,9 +128,11 @@ if [ -e "$worktree_root" ]; then
 fi
 
 # A pushed branch is durable work even when no pull request references the
-# item yet. Enumerate every remote branch through the builder credential and
-# reject matching work before resolving the backend, acquiring the item lease,
-# or calculating either concurrency or spend reservations.
+# item yet. A branch whose pull request was merged is landed work, though, and
+# squash merges do not put the branch's own commits into the default branch's
+# history. Enumerate remote state through the builder credential and reject
+# only work that has not landed before resolving the backend, acquiring the
+# item lease, or calculating either concurrency or spend reservations.
 remote_branch_pages="$({
   bash "$GH_AS_BIN" builder "$repository" \
     gh api --paginate --slurp "repos/$repository/branches?per_page=100"
@@ -187,11 +189,28 @@ if [ -n "$matching_remote_branch" ]; then
       esac
     fi
   fi
-  append_dispatch_failure branch-already-pushed 0 "" "$pushed_branch" \
-    "$repository" "$pushed_head_sha" "$ahead_of_default" ||
-      echo "ostrom dispatch: could not record work-failed" >&2
-  echo "ostrom dispatch: remote work already exists: repository=$repository branch=$pushed_branch head=$pushed_head_sha ahead=$ahead_of_default" >&2
-  exit 3
+  branch_pull_requests="$({
+    bash "$GH_AS_BIN" builder "$repository" \
+      gh pr list --repo "$repository" --head "$pushed_branch" --state all \
+        --json number,state,mergedAt
+  } 2>/dev/null)" || {
+    echo "ostrom dispatch: could not verify pull requests for branch $pushed_branch in $repository" >&2
+    exit 1
+  }
+  branch_is_landed=0
+  # A reused branch remains live work if it also has an open or closed,
+  # unmerged PR. Only an exclusively merged PR history proves it landed.
+  if jq -e 'length > 0 and all(.[]; .state == "MERGED")' \
+      >/dev/null 2>&1 <<<"$branch_pull_requests"; then
+    branch_is_landed=1
+  fi
+  if [ "$branch_is_landed" -eq 0 ]; then
+    append_dispatch_failure branch-already-pushed 0 "" "$pushed_branch" \
+      "$repository" "$pushed_head_sha" "$ahead_of_default" ||
+        echo "ostrom dispatch: could not record work-failed" >&2
+    echo "ostrom dispatch: remote work already exists: repository=$repository branch=$pushed_branch head=$pushed_head_sha ahead=$ahead_of_default" >&2
+    exit 3
+  fi
 fi
 
 codex_unavailable() {

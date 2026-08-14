@@ -1103,6 +1103,13 @@ if [ "$4" = api ] && [[ "$5" == repos/*/compare/* ]]; then
   exit 0
 fi
 if [ "$4" = pr ] && [ "$5" = list ]; then
+  if [[ " $* " == *" --head "* ]]; then
+    if [ "${FAKE_BRANCH_PR_QUERY_FAIL:-0}" -eq 1 ]; then
+      exit 42
+    fi
+    printf '%s\n' "${FAKE_BRANCH_PRS:-[]}"
+    exit 0
+  fi
   if [ "${FAKE_OPEN_PR:-0}" -eq 1 ]; then
     printf '%s\n' '[{"number":77,"body":"Closes example-org/example-repo#123","url":"https://example.test/pull/77"}]'
   else
@@ -1196,6 +1203,141 @@ if [ "$(grep -Fc 'builder example-org/example-repo gh api --paginate --slurp rep
 fi
 if [ "$(grep -c '^builder example-org/example-repo gh ' "$branch_guard_gh_calls")" -ne "$(wc -l <"$branch_guard_gh_calls" | tr -d '[:space:]')" ]; then
   echo "remote branch guard made a remote read outside the builder wrapper" >&2
+  exit 1
+fi
+if [ "$(grep -Fc "builder example-org/example-repo gh pr list --repo example-org/example-repo --head $dispatch_branch --state all --json number,state,mergedAt" "$branch_guard_gh_calls")" -ne 1 ]; then
+  echo "remote branch guard did not query branch pull requests through the builder wrapper" >&2
+  exit 1
+fi
+
+# #167: a squash-merged PR proves that its undeleted head branch is landed
+# work even though compare reports the branch's original commits as ahead.
+# Dispatch continues through the remaining duplicate guards, writes no
+# branch-already-pushed failure, and launches the backend normally.
+merged_branch_config="$dispatch_fixture/merged-branch-config"
+merged_branch_gh_calls="$dispatch_fixture/merged-branch-gh-calls"
+merged_branch_systemd_args="$dispatch_fixture/merged-branch-systemd-args"
+merged_branch_systemd_calls="$dispatch_fixture/merged-branch-systemd-calls"
+mkdir -p "$merged_branch_config/ostrom"
+: >"$merged_branch_systemd_calls"
+merged_branch_unit="$(
+  FAKE_REMOTE_BRANCH_NAME="$dispatch_branch" \
+    FAKE_REMOTE_BRANCH_SHA=dddddddddddddddddddddddddddddddddddddddd \
+    FAKE_REMOTE_AHEAD=2 \
+    FAKE_BRANCH_PRS='[{"number":88,"state":"MERGED","mergedAt":"2026-08-07T12:00:00Z"}]' \
+    FAKE_GH_CALLS="$merged_branch_gh_calls" \
+    CLAUDE_CONFIG_DIR="$merged_branch_config" \
+    MANDATE_TRACE_TIME="2026-08-11T02:00:32Z" \
+    MANDATE_NOW_EPOCH="$cap_today_epoch" \
+    MANDATE_GH_AS_BIN="$fake_dispatch_gh" \
+    MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
+    CODEX_BIN="$fake_dispatch_codex" \
+    FAKE_SYSTEMD_ARGS="$merged_branch_systemd_args" \
+    FAKE_SYSTEMD_CALLS="$merged_branch_systemd_calls" \
+    bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$dispatch_order"
+)"
+if [ "$merged_branch_unit" != 'ostrom-implementer-9bb890b1b3b47926' ]; then
+  echo "merged branch did not proceed through dispatch" >&2
+  exit 1
+fi
+if [ "$(wc -l <"$merged_branch_systemd_calls" | tr -d '[:space:]')" -ne 1 ]; then
+  echo "merged branch did not launch exactly one systemd unit" >&2
+  exit 1
+fi
+if jq -s -e 'any(.[];
+    .kind == "work-failed"
+    and .fact.reason == "branch-already-pushed")' \
+    "$merged_branch_config/ostrom/sprint.jsonl" >/dev/null; then
+  echo "merged branch recorded a branch-already-pushed failure" >&2
+  exit 1
+fi
+if ! jq -s -e 'length == 1 and .[0].kind == "work-dispatched"' \
+    "$merged_branch_config/ostrom/sprint.jsonl" >/dev/null; then
+  echo "merged branch did not reach the remaining dispatch guards" >&2
+  exit 1
+fi
+if [ "$(grep -Fc "builder example-org/example-repo gh pr list --repo example-org/example-repo --head $dispatch_branch --state all --json number,state,mergedAt" "$merged_branch_gh_calls")" -ne 1 ]; then
+  echo "merged branch PR was not queried through the builder wrapper" >&2
+  exit 1
+fi
+if [ "$(grep -Fc 'builder example-org/example-repo gh pr list --repo example-org/example-repo --state open --limit 1000 --json number,title,body,url' "$merged_branch_gh_calls")" -ne 1 ]; then
+  echo "merged branch did not continue to the open-PR guard" >&2
+  exit 1
+fi
+
+# Open and closed-unmerged pull requests are still durable, unlanded work.
+# Both keep the existing exit status and branch-already-pushed trace reason.
+for branch_pr_case in open closed-unmerged; do
+  branch_pr_case_config="$dispatch_fixture/$branch_pr_case-branch-config"
+  branch_pr_case_stderr="$dispatch_fixture/$branch_pr_case-branch.err"
+  mkdir -p "$branch_pr_case_config/ostrom"
+  case "$branch_pr_case" in
+    open)
+      branch_pr_case_json='[{"number":89,"state":"OPEN","mergedAt":null}]'
+      ;;
+    closed-unmerged)
+      branch_pr_case_json='[{"number":90,"state":"CLOSED","mergedAt":null}]'
+      ;;
+  esac
+  set +e
+  FAKE_REMOTE_BRANCH_NAME="$dispatch_branch" \
+    FAKE_REMOTE_BRANCH_SHA=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee \
+    FAKE_REMOTE_AHEAD=3 FAKE_BRANCH_PRS="$branch_pr_case_json" \
+    CLAUDE_CONFIG_DIR="$branch_pr_case_config" \
+    MANDATE_TRACE_TIME="2026-08-11T02:00:33Z" \
+    MANDATE_NOW_EPOCH="$cap_today_epoch" \
+    MANDATE_GH_AS_BIN="$fake_dispatch_gh" \
+    MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
+    CODEX_BIN="$fake_dispatch_codex" \
+    FAKE_SYSTEMD_ARGS="$dispatch_args" FAKE_SYSTEMD_CALLS="$dispatch_calls" \
+    bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$dispatch_order" \
+      >/dev/null 2>"$branch_pr_case_stderr"
+  branch_pr_case_status=$?
+  set -e
+  if [ "$branch_pr_case_status" -ne 3 ]; then
+    echo "$branch_pr_case branch did not exit 3" >&2
+    exit 1
+  fi
+  if ! jq -s -e '
+      length == 1
+      and .[0].kind == "work-failed"
+      and .[0].fact.reason == "branch-already-pushed"
+      and .[0].fact.ahead_of_default == 3
+    ' "$branch_pr_case_config/ostrom/sprint.jsonl" >/dev/null; then
+    echo "$branch_pr_case branch did not record branch-already-pushed" >&2
+    exit 1
+  fi
+done
+
+# Failure to classify a matched branch's pull requests fails closed before
+# reservations, just like the neighbouring GitHub-backed guards.
+branch_pr_query_failure_config="$dispatch_fixture/branch-pr-query-failure-config"
+branch_pr_query_failure_stderr="$dispatch_fixture/branch-pr-query-failure.err"
+mkdir -p "$branch_pr_query_failure_config/ostrom"
+set +e
+FAKE_REMOTE_BRANCH_NAME="$dispatch_branch" \
+  FAKE_REMOTE_BRANCH_SHA=ffffffffffffffffffffffffffffffffffffffff \
+  FAKE_REMOTE_AHEAD=1 FAKE_BRANCH_PR_QUERY_FAIL=1 \
+  CLAUDE_CONFIG_DIR="$branch_pr_query_failure_config" \
+  MANDATE_NOW_EPOCH="$cap_today_epoch" \
+  MANDATE_GH_AS_BIN="$fake_dispatch_gh" \
+  MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
+  CODEX_BIN="$fake_dispatch_codex" \
+  FAKE_SYSTEMD_ARGS="$dispatch_args" FAKE_SYSTEMD_CALLS="$dispatch_calls" \
+  bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$dispatch_order" \
+    >/dev/null 2>"$branch_pr_query_failure_stderr"
+branch_pr_query_failure_status=$?
+set -e
+if [ "$branch_pr_query_failure_status" -ne 1 ]; then
+  echo "branch PR query failure did not exit 1" >&2
+  exit 1
+fi
+if [ -e "$branch_pr_query_failure_config/ostrom/sprint.jsonl" ]; then
+  echo "branch PR query failure recorded or reserved work" >&2
+  exit 1
+fi
+if [ "$(grep -Fc "could not verify pull requests for branch $dispatch_branch in example-org/example-repo" "$branch_pr_query_failure_stderr")" -ne 1 ]; then
+  echo "branch PR query failure was not reported" >&2
   exit 1
 fi
 
