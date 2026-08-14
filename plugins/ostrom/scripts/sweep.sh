@@ -30,10 +30,18 @@ fetch_issue_page() {
   local etag="$4"
   local response="$work/issues-response-$page"
   local body="$work/issues-page-$page.json"
-  local endpoint status detail
+  local endpoint issue_state status detail
   local -a headers=()
 
-  endpoint="repos/$repo/issues?state=open&sort=updated&direction=asc&per_page=100&page=$page"
+  issue_state="open"
+  if [ -n "$since" ]; then
+    # A closure is an updated event, but it disappears from the open-only
+    # representation. The cursor-bounded feed must therefore include closed
+    # items so reconciliation receives a positive tombstone rather than
+    # trying to infer terminal state from absence.
+    issue_state="all"
+  fi
+  endpoint="repos/$repo/issues?state=$issue_state&sort=updated&direction=asc&per_page=100&page=$page"
   if [ -n "$since" ]; then
     endpoint="$endpoint&since=$since"
   fi
@@ -118,6 +126,23 @@ fetch_issues() {
   fi
 }
 
+extract_closed_issue_ids() {
+  local repo="$1"
+  local source="$2"
+  local destination="$3"
+
+  jq -c \
+    --arg repo "$repo" '
+      [
+        .[]
+        | select((.pull_request // null) == null)
+        | select(((.state // "") | ascii_downcase) == "closed")
+        | select((.number | type) == "number")
+        | $repo + "#" + (.number | tostring)
+      ]
+    ' "$source" >"$destination"
+}
+
 # #106/#109: sweep_org() below is the entire per-repository body -- every
 # `gh` call the sweep makes. It runs once per distinct GitHub organisation
 # in the roster, each time inside its own gh-as.sh invocation, so every
@@ -176,11 +201,28 @@ sweep_org() {
     previous_cursor="$(jq -r '.cursor // ""' "$work/previous.json")"
     previous_etag="$(jq -r '.etag // ""' "$work/previous.json")"
 
+    printf '%s\n' '[]' >"$work/closed-issue-ids.json"
+    # A scheduled full pass still needs a cursor-bounded all-state read before
+    # its complete open listing. That small delta supplies positive closure
+    # tombstones without enumerating every historical closed issue, while the
+    # open listing still discovers items a previous delta might have missed.
+    if [ "$sweep_mode" = "full" ] && [ -n "$previous_cursor" ]; then
+      fetch_issues "$repo" "$previous_cursor" "" || exit $?
+      extract_closed_issue_ids \
+        "$repo" "$work/issues.json" "$work/closed-issue-ids.json"
+    fi
+
     issue_since=""
     if [ "$sweep_mode" = "incremental" ]; then
       issue_since="$previous_cursor"
     fi
     fetch_issues "$repo" "$issue_since" "$previous_etag" || exit $?
+    if [ "$sweep_mode" = "incremental" ]; then
+      extract_closed_issue_ids \
+        "$repo" "$work/issues.json" "$work/closed-issue-ids.json"
+    fi
+    jq -c '.[] | {id: ., resolution: "closed-issue"}' \
+      "$work/closed-issue-ids.json" >>"$work/closed-items.jsonl"
     issue_cursor_candidate="$(
       jq -r '[.[] | (.updatedAt // .updated_at // empty)] | max // ""' \
         "$work/issues.json"
@@ -335,6 +377,7 @@ sweep_org() {
         [
           ($issues[0][]
             | select((.pull_request // null) == null)
+            | select(((.state // "open") | ascii_downcase) != "closed")
             | .createdAt = (.createdAt // .created_at)
             | .updatedAt = (.updatedAt // .updated_at)
             | .url = (.url // .html_url)
@@ -368,19 +411,24 @@ sweep_org() {
       mv "$work/next.json" "$work/fresh-items.json"
     fi
 
-    if [ "$sweep_mode" = "full" ] && [ "$issue_http_status" != "304" ]; then
+    if [ -z "$previous_cursor" ] && [ "$issue_http_status" != "304" ]; then
       cp "$work/fresh-items.json" "$work/items.json"
     else
-      # The issues response is a delta, while the PR response is a complete
-      # open set. Retain untouched issues, replace every PR, then overlay all
-      # fresh records by id. The same merge is safe for a conditional full
-      # request that returned 304 because its complete open representation is
-      # unchanged. A later non-304 full reconciliation is what removes an
-      # issue that left the open set without appearing in `since` results.
+      # Retain issues absent from this response except for positively observed
+      # closed-item tombstones, replace every PR, then overlay all fresh open
+      # records by id. This is the delta merge on incremental passes; on full
+      # passes it also prevents an incomplete-but-successful open listing from
+      # turning absence into false closure evidence.
       jq -cn \
         --slurpfile previous "$work/previous.json" \
-        --slurpfile fresh "$work/fresh-items.json" '
-          ([($previous[0].records // {})[] | select(.type != "pr")]) as $issues
+        --slurpfile fresh "$work/fresh-items.json" \
+        --slurpfile closed "$work/closed-issue-ids.json" '
+          ([
+            ($previous[0].records // {})[]
+            | select(.type != "pr")
+            | . as $record
+            | select(($closed[0] | index($record.id)) == null)
+          ]) as $issues
           | reduce $fresh[0][] as $item ($issues;
               map(select(.id != $item.id)) + [$item]
             )
@@ -1544,12 +1592,13 @@ sweep_org() {
     mv "$work/next.json" "$work/active-ids.json"
 
     # An approval is deliberately durable across an item disappearing from
-    # the open enumeration: absence can be an API or rate-limit failure, not
-    # proof that the work is done. For approved rows that would otherwise be
-    # carried over, make one positive state read instead. A merged PR and a
-    # closed-unmerged PR are recorded distinctly, although both are terminal
-    # for queue purposes. Any command failure or malformed/incomplete response
-    # records nothing, so the final reconciliation retains the approval.
+    # enumeration: absence can be an API or rate-limit failure, not proof that
+    # the work is done. Closed issues already have a positive feed observation;
+    # for other approved rows that would otherwise be carried over, preserve
+    # #85's positive PR state read. A merged PR and a closed-unmerged PR are
+    # recorded distinctly, although both are terminal for queue purposes. Any
+    # command failure or malformed/incomplete response records nothing, so the
+    # final reconciliation retains the approval.
     while IFS=$'\t' read -r approved_id approved_number; do
       if gh pr view "$approved_number" --repo "$repo" --json state,mergedAt \
           >"$work/approved-pr-state.json" 2>"$work/approved-pr-state-error"; then
@@ -1577,7 +1626,7 @@ sweep_org() {
                 --arg id "$approved_id" \
                 --arg resolution "$approved_resolution" \
                 '{id: $id, resolution: $resolution}' \
-                >>"$work/closed-approved.jsonl"
+                >>"$work/closed-items.jsonl"
               ;;
           esac
         fi
@@ -1585,11 +1634,13 @@ sweep_org() {
     done < <(
       jq -r \
         --arg repo "$repo" \
-        --slurpfile active_ids "$work/active-ids.json" '
+        --slurpfile active_ids "$work/active-ids.json" \
+        --slurpfile closed_items "$work/closed-items.jsonl" '
         .[]
         | . as $row
         | select(.state == "approved" and .repo == $repo)
         | select(($active_ids[0] | index($row.id)) == null)
+        | select(($closed_items | map(.id) | index($row.id)) == null)
         | select(.id | startswith($repo + "#"))
         | (.id | split("#")[-1]) as $number
         | select($number | test("^[1-9][0-9]*$"))
@@ -1798,10 +1849,12 @@ fi
 : >"$work/landed-fix-attempts.count"
 : >"$work/landed-fix-failures.log"
 : >"$work/landed-fix-last-error.txt"
-# Positive terminal observations for carried-over approvals. This is JSONL
-# because each authenticated per-organisation subprocess appends its own
-# observations; an empty file means every absent approval remains durable.
-: >"$work/closed-approved.jsonl"
+# Positive terminal observations for queue items. This is JSONL because each
+# authenticated per-organisation subprocess appends its own observations; an
+# empty file means absence alone cannot remove a row. Closed issues come from
+# the cursor-bounded all-state feed, while #85's approved-PR fallback appends
+# merged and closed-unmerged pull requests to the same evidence stream.
+: >"$work/closed-items.jsonl"
 
 while IFS= read -r org; do
   anchor_repo="$(
@@ -1884,13 +1937,13 @@ jq -cn \
     --slurpfile active_ids "$work/active-ids.json" \
     --slurpfile current_items "$work/current-items.json" \
     --slurpfile possibly_landed "$work/possibly-landed.json" \
-    --slurpfile closed_approved "$work/closed-approved.jsonl" '
+    --slurpfile closed_items "$work/closed-items.jsonl" '
     ($existing[0]) as $existing
     | ($generated[0]) as $generated
     | ($active_ids[0]) as $active_ids
     | ($current_items[0]) as $current_items
     | ($possibly_landed[0]) as $possibly_landed
-    | ($closed_approved | map(.id)) as $closed_approved_ids
+    | ($closed_items | map(.id)) as $closed_item_ids
     |
     def dependency_refs($repo; $text):
       [
@@ -1983,7 +2036,7 @@ jq -cn \
             ($active_ids | index($row.id)) != null
             or (
               $row.state == "approved"
-              and ($closed_approved_ids | index($row.id)) == null
+              and ($closed_item_ids | index($row.id)) == null
             )
           )
       )
