@@ -1444,6 +1444,10 @@ fake_implement_gh="$implement_bin/gh-as"
 cat >"$fake_implement_gh" <<'SH'
 #!/usr/bin/env bash
 shift 2
+if [ -n "${FAKE_IMPLEMENT_COMMANDS:-}" ]; then
+  printf '%q ' "$@" >>"$FAKE_IMPLEMENT_COMMANDS"
+  printf '\n' >>"$FAKE_IMPLEMENT_COMMANDS"
+fi
 if [ "$1" = gh ] && [ "$2" = api ] && [ "$3" = --paginate ] && [ "$4" = --slurp ]; then
   printf '%s\n' '[[{"name":"main","commit":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]]'
   exit 0
@@ -1588,6 +1592,12 @@ case "${FAKE_CODEX_MODE:-complete}" in
     fi
     printf '%s\n' "$fake_usage_json"
     ;;
+  conflict)
+    printf 'implementer version\n' >"$worktree/base.txt"
+    printf 'Synthetic conflicting implementation completed.\n' >"$result"
+    printf '%s\n' \
+      '{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":50,"reasoning_output_tokens":10}}'
+    ;;
 esac
 SH
 chmod +x "$fake_implement_gh" "$fake_codex"
@@ -1621,6 +1631,7 @@ run_implement_order() {
     CLAUDE_CONFIG_DIR="$runtime_config" \
     MANDATE_IMPLEMENTER_SOURCE_REPO="$implement_source" \
     MANDATE_GH_AS_BIN="$fake_implement_gh" FAKE_GIT_REMOTE="$implement_remote" \
+    FAKE_IMPLEMENT_COMMANDS="${FAKE_IMPLEMENT_COMMANDS:-}" \
     FAKE_PR_BODY="$implement_fixture/$case_name-pr-body" \
     bash "$PLUGIN_ROOT/scripts/implement.sh" "$order_file" "$unit" \
       >"$implement_fixture/$case_name.out" \
@@ -2203,6 +2214,193 @@ jq -s -e '
   and (.[-1].fact.cost_usd | type == "number" and . > 0 and . < 20)
   and .[-1].fact.usage.output_tokens == 50
 ' "$implement_config/ostrom/sprint.jsonl" >/dev/null
+
+# #102: a published branch that advances independently is merged forward.
+# The first push rejects, the wrapper fetches that exact branch, creates a
+# merge commit, retries once, and continues through the ordinary PR outcome.
+repair_success_config="$implement_fixture/repair-success-config"
+repair_success_order="$(
+  create_implement_order repair-success 203 "$repair_success_config"
+)"
+repair_success_order_id="$(jq -r '.order_id' "$repair_success_order")"
+repair_success_item_hash="$(
+  bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash \
+    'example-org/example-repo#203'
+)"
+repair_success_branch="$(jq -r '.branch_name' "$repair_success_order")"
+repair_success_worktree="$repair_success_config/ostrom/implementer-worktrees/$repair_success_item_hash"
+mkdir -p "$(dirname "$repair_success_worktree")"
+git -C "$implement_source" worktree add -b "$repair_success_branch" \
+  "$repair_success_worktree" refs/remotes/origin/main >/dev/null
+repair_success_publisher="$implement_fixture/repair-success-publisher"
+git clone -b main "$implement_remote" "$repair_success_publisher" >/dev/null 2>&1
+git -C "$repair_success_publisher" config user.name "Ostrom Test"
+git -C "$repair_success_publisher" config user.email "ostrom@example.test"
+git -C "$repair_success_publisher" switch -c "$repair_success_branch" >/dev/null
+printf 'published independently\n' >"$repair_success_publisher/published.txt"
+git -C "$repair_success_publisher" add published.txt
+git -C "$repair_success_publisher" commit -m 'fixture published head' >/dev/null
+git -C "$repair_success_publisher" push origin "$repair_success_branch" >/dev/null
+repair_success_commands="$implement_fixture/repair-success-commands"
+FAKE_IMPLEMENT_COMMANDS="$repair_success_commands" \
+  run_implement_order "$repair_success_order" repair-success \
+    "$repair_success_config"
+if [ "$(grep -c ' push ' "$repair_success_commands")" -ne 2 ]; then
+  echo "diverged branch did not receive exactly one push retry" >&2
+  exit 1
+fi
+if [ "$(grep -c "fetch .*refs/heads/$repair_success_branch" "$repair_success_commands")" -ne 1 ]; then
+  echo "diverged branch was not fetched exactly once for repair" >&2
+  exit 1
+fi
+if [ "$(git --git-dir="$implement_remote" show "$repair_success_branch:published.txt")" != \
+  'published independently' ]; then
+  echo "merge-forward push lost the published branch commit" >&2
+  exit 1
+fi
+if [ "$(git --git-dir="$implement_remote" show "$repair_success_branch:generated.txt")" != \
+  'implemented' ]; then
+  echo "merge-forward push lost the implementer commit" >&2
+  exit 1
+fi
+if [ "$(git --git-dir="$implement_remote" rev-list --parents -n 1 \
+  "$repair_success_branch" | awk '{print NF - 1}')" -ne 2 ]; then
+  echo "diverged branch repair did not create a merge commit" >&2
+  exit 1
+fi
+repair_success_record="$(
+  jq -sc --arg order_id "$repair_success_order_id" \
+    '[.[] | select(.fact.order_id == $order_id)]' \
+    "$repair_success_config/ostrom/sprint.jsonl"
+)"
+if [ "$(jq 'length' <<<"$repair_success_record")" -ne 1 ]; then
+  echo "merge-forward success did not write one terminal record" >&2
+  exit 1
+fi
+if [ "$(jq -r '.[0].kind' <<<"$repair_success_record")" != work-completed ]; then
+  echo "merge-forward success did not reach the completed PR outcome" >&2
+  exit 1
+fi
+if [ "$(jq -r '.[0].fact.pr_url' <<<"$repair_success_record")" != \
+  'https://example.test/pull/125' ]; then
+  echo "merge-forward success did not preserve the ordinary PR result" >&2
+  exit 1
+fi
+
+# A conflicting published head is actionable rather than infrastructure-like.
+# Capture the unmerged paths and published SHA, abort the merge, and preserve
+# the implementer's own completed commit without attempting a second push.
+repair_conflict_config="$implement_fixture/repair-conflict-config"
+repair_conflict_order="$(
+  create_implement_order repair-conflict 204 "$repair_conflict_config"
+)"
+repair_conflict_order_id="$(jq -r '.order_id' "$repair_conflict_order")"
+repair_conflict_item_hash="$(
+  bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash \
+    'example-org/example-repo#204'
+)"
+repair_conflict_branch="$(jq -r '.branch_name' "$repair_conflict_order")"
+repair_conflict_worktree="$repair_conflict_config/ostrom/implementer-worktrees/$repair_conflict_item_hash"
+mkdir -p "$(dirname "$repair_conflict_worktree")"
+git -C "$implement_source" worktree add -b "$repair_conflict_branch" \
+  "$repair_conflict_worktree" refs/remotes/origin/main >/dev/null
+repair_conflict_publisher="$implement_fixture/repair-conflict-publisher"
+git clone -b main "$implement_remote" "$repair_conflict_publisher" >/dev/null 2>&1
+git -C "$repair_conflict_publisher" config user.name "Ostrom Test"
+git -C "$repair_conflict_publisher" config user.email "ostrom@example.test"
+git -C "$repair_conflict_publisher" switch -c "$repair_conflict_branch" >/dev/null
+printf 'published version\n' >"$repair_conflict_publisher/base.txt"
+git -C "$repair_conflict_publisher" add base.txt
+git -C "$repair_conflict_publisher" commit -m 'fixture conflicting head' >/dev/null
+git -C "$repair_conflict_publisher" push origin "$repair_conflict_branch" >/dev/null
+repair_conflict_remote_head="$(
+  git -C "$repair_conflict_publisher" rev-parse HEAD
+)"
+repair_conflict_unit="ostrom-implementer-${repair_conflict_item_hash:0:16}"
+repair_conflict_lease="implementer-item-$repair_conflict_item_hash.lease"
+CLAUDE_CONFIG_DIR="$repair_conflict_config" \
+  MANDATE_LEASE_NAME="$repair_conflict_lease" \
+  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire \
+    "$repair_conflict_unit" 3600 >/dev/null
+repair_conflict_commands="$implement_fixture/repair-conflict-commands"
+set +e
+FAKE_CODEX_MODE=conflict CODEX_BIN="$fake_codex" \
+  CLAUDE_CONFIG_DIR="$repair_conflict_config" \
+  MANDATE_IMPLEMENTER_SOURCE_REPO="$implement_source" \
+  MANDATE_GH_AS_BIN="$fake_implement_gh" FAKE_GIT_REMOTE="$implement_remote" \
+  FAKE_IMPLEMENT_COMMANDS="$repair_conflict_commands" \
+  FAKE_PR_BODY="$implement_fixture/repair-conflict-pr-body" \
+  bash "$PLUGIN_ROOT/scripts/implement.sh" \
+    "$repair_conflict_order" "$repair_conflict_unit" \
+    >"$implement_fixture/repair-conflict.out" \
+    2>"$implement_fixture/repair-conflict.err"
+repair_conflict_status=$?
+set -e
+if [ "$repair_conflict_status" -ne 1 ]; then
+  echo "conflicting branch repair did not fail" >&2
+  exit 1
+fi
+if [ "$(grep -c ' push ' "$repair_conflict_commands")" -ne 1 ]; then
+  echo "conflicting branch repair attempted a push retry" >&2
+  exit 1
+fi
+if [ "$(grep -c "fetch .*refs/heads/$repair_conflict_branch" "$repair_conflict_commands")" -ne 1 ]; then
+  echo "conflicting branch was not fetched exactly once for repair" >&2
+  exit 1
+fi
+if git -C "$repair_conflict_worktree" rev-parse -q --verify MERGE_HEAD \
+  >/dev/null 2>&1; then
+  echo "conflicting branch repair left a merge in progress" >&2
+  exit 1
+fi
+if [ "$(git -C "$repair_conflict_worktree" show HEAD:base.txt)" != \
+  'implementer version' ]; then
+  echo "merge abort did not restore the implementer's completed work" >&2
+  exit 1
+fi
+if git -C "$repair_conflict_worktree" merge-base --is-ancestor \
+  "$repair_conflict_remote_head" HEAD; then
+  echo "conflict path retained the unpublishable merge result" >&2
+  exit 1
+fi
+if [ -e "$implement_fixture/repair-conflict-pr-body" ]; then
+  echo "conflicting branch repair opened a pull request" >&2
+  exit 1
+fi
+repair_conflict_record="$(
+  jq -sc --arg order_id "$repair_conflict_order_id" \
+    '[.[] | select(.fact.order_id == $order_id)]' \
+    "$repair_conflict_config/ostrom/sprint.jsonl"
+)"
+if [ "$(jq 'length' <<<"$repair_conflict_record")" -ne 1 ]; then
+  echo "conflicting branch repair did not write one terminal record" >&2
+  exit 1
+fi
+if [ "$(jq -r '.[0].fact.reason' <<<"$repair_conflict_record")" != \
+  branch-conflicted ]; then
+  echo "conflicting branch repair was not classified as branch-conflicted" >&2
+  exit 1
+fi
+if [ "$(jq -r '.[0].fact.worktree_path' <<<"$repair_conflict_record")" != \
+  "$repair_conflict_worktree" ]; then
+  echo "conflict failure record omitted the preserved worktree" >&2
+  exit 1
+fi
+if [ "$(jq -r '.[0].fact.branch_name' <<<"$repair_conflict_record")" != \
+  "$repair_conflict_branch" ]; then
+  echo "conflict failure record omitted the branch name" >&2
+  exit 1
+fi
+if [ "$(jq -r '.[0].fact.remote_head_sha' <<<"$repair_conflict_record")" != \
+  "$repair_conflict_remote_head" ]; then
+  echo "conflict failure record omitted the published head SHA" >&2
+  exit 1
+fi
+if [ "$(jq -c '.[0].fact.conflicted_paths' <<<"$repair_conflict_record")" != \
+  '["base.txt"]' ]; then
+  echo "conflict failure record omitted the conflicted paths" >&2
+  exit 1
+fi
 
 # #135: cached input is one tenth the price of fresh input. These observed
 # counts are 96.7% cached and weigh 135,356, below the 500,000 ceiling; the
