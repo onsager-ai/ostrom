@@ -3973,6 +3973,28 @@ JSON
   esac
   exit 0
 fi
+if [ "$1 $2" = "pr view" ]; then
+  number="$3"
+  case "$repo#$number" in
+    example-org/approval-carryover#401)
+      echo '{"state":"MERGED","mergedAt":"2026-07-31T00:00:00Z"}'
+      ;;
+    example-org/approval-carryover#402)
+      echo '{"state":"CLOSED","mergedAt":null}'
+      ;;
+    example-org/approval-carryover#403)
+      echo 'synthetic rate limit' >&2
+      exit 1
+      ;;
+    example-org/approval-carryover#405)
+      echo '{not-json'
+      ;;
+    *)
+      exit 1
+      ;;
+  esac
+  exit 0
+fi
 if [ "$1 $2" = "pr list" ]; then
   [ "${FAKE_GH_PR_FAIL:-0}" != "1" ] || exit 1
   case "$repo" in
@@ -4338,6 +4360,84 @@ run_sweep() {
       bash "$PLUGIN_ROOT/scripts/sweep.sh"
   )
 }
+
+# #85: approvals survive absence from the open enumeration, but not a
+# positive terminal PR observation. Each synthetic row is already in the
+# queue while this repository enumerates no open items. The PR-state fake
+# distinguishes merged, closed-unmerged, read failure, and malformed output;
+# the pending row proves the pre-existing non-approved retention rule is
+# unchanged. These assertions use explicit failing commands/branches rather
+# than `!`, whose status is exempt from errexit in Bash.
+approval_carryover="$fixture/approval-carryover"
+approval_carryover_queue="$approval_carryover/config/ostrom/queue.jsonl"
+approval_carryover_calls="$approval_carryover/gh-calls"
+mkdir -p "$approval_carryover/config/ostrom" "$approval_carryover/repo"
+write_gatekeeper_secrets "$approval_carryover/config"
+cat >"$approval_carryover/config/ostrom/mandates.yaml" <<'YAML'
+bounce_all: []
+projects:
+  - repo: example-org/approval-carryover
+    delegated: []
+    excluded: []
+    reserved: []
+    default: excluded
+    paused: false
+    bounce: []
+YAML
+cat >"$approval_carryover_queue" <<'JSONL'
+{"id":"example-org/approval-carryover#401","repo":"example-org/approval-carryover","ref":"#401","title":"Synthetic merged pull request","kind":"decision","mandate":{"reason":"synthetic approval"},"state":"approved","opened":"2026-07-01T00:00:00Z","age_days":31,"aged_out":true,"needs_judgment":true,"blocked_by":[]}
+{"id":"example-org/approval-carryover#402","repo":"example-org/approval-carryover","ref":"#402","title":"Synthetic closed pull request","kind":"decision","mandate":{"reason":"synthetic approval"},"state":"approved","opened":"2026-07-02T00:00:00Z","age_days":30,"aged_out":true,"needs_judgment":true,"blocked_by":[]}
+{"id":"example-org/approval-carryover#403","repo":"example-org/approval-carryover","ref":"#403","title":"Synthetic unavailable pull request","kind":"decision","mandate":{"reason":"synthetic approval"},"state":"approved","opened":"2026-07-03T00:00:00Z","age_days":29,"aged_out":true,"needs_judgment":true,"blocked_by":[]}
+{"id":"example-org/approval-carryover#404","repo":"example-org/approval-carryover","ref":"#404","title":"Synthetic pending pull request","kind":"decision","mandate":{"reason":"synthetic decision"},"state":"pending","opened":"2026-07-04T00:00:00Z","age_days":28,"aged_out":true,"needs_judgment":true,"blocked_by":[]}
+{"id":"example-org/approval-carryover#405","repo":"example-org/approval-carryover","ref":"#405","title":"Synthetic malformed response pull request","kind":"decision","mandate":{"reason":"synthetic approval"},"state":"approved","opened":"2026-07-05T00:00:00Z","age_days":27,"aged_out":true,"needs_judgment":true,"blocked_by":[]}
+JSONL
+: >"$approval_carryover_calls"
+(
+  cd "$approval_carryover/repo"
+  PATH="$fixture/bin:$PATH" \
+    FAKE_GH_CALL_LOG="$approval_carryover_calls" \
+    MANDATE_SWEEP_MODE=full \
+    CLAUDE_CONFIG_DIR="$approval_carryover/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/sweep.sh" >/dev/null
+)
+
+if jq -e 'select(.id == "example-org/approval-carryover#401")' \
+    "$approval_carryover_queue" >/dev/null; then
+  echo "merged approved row survived sweep" >&2
+  exit 1
+fi
+if jq -e 'select(.id == "example-org/approval-carryover#402")' \
+    "$approval_carryover_queue" >/dev/null; then
+  echo "closed-unmerged approved row survived sweep" >&2
+  exit 1
+fi
+jq -e '
+  select(.id == "example-org/approval-carryover#403")
+  | .state == "approved"
+' "$approval_carryover_queue" >/dev/null
+jq -e '
+  select(.id == "example-org/approval-carryover#405")
+  | .state == "approved"
+' "$approval_carryover_queue" >/dev/null
+if jq -e 'select(.id == "example-org/approval-carryover#404")' \
+    "$approval_carryover_queue" >/dev/null; then
+  echo "absent pending row no longer follows the existing retention rule" >&2
+  exit 1
+fi
+
+for approval_number in 401 402 403 405; do
+  if [ "$(grep -Fc "pr view $approval_number --repo example-org/approval-carryover --json state,mergedAt" \
+      "$approval_carryover_calls")" -ne 1 ]; then
+    echo "carried-over approval #$approval_number did not receive exactly one state read" >&2
+    exit 1
+  fi
+done
+if grep -Fq 'pr view 404 --repo example-org/approval-carryover' \
+    "$approval_carryover_calls"; then
+  echo "pending row received an approval-only state read" >&2
+  exit 1
+fi
 
 # #122: a policy change intentionally suppresses delegated rows for one
 # sweep, but it must not advance past the events it withheld. First baseline
