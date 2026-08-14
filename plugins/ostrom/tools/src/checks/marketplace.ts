@@ -4,7 +4,21 @@ import type { DoctorContext } from "../lib/context.js";
 import { git } from "../lib/process.js";
 import type { CheckResult } from "../lib/result.js";
 
-export function checkMarketplace(context: DoctorContext): CheckResult {
+export interface MarketplaceInspection {
+  directory: string;
+  cloneAvailable: boolean;
+  fetchAvailable: boolean;
+  result: CheckResult;
+}
+
+const inspectionCache = new WeakMap<DoctorContext, MarketplaceInspection>();
+
+export function inspectMarketplace(
+  context: DoctorContext,
+): MarketplaceInspection {
+  const cached = inspectionCache.get(context);
+  if (cached) return cached;
+
   const knownJson = join(context.configDir, "plugins", "known_marketplaces.json");
   const marketplaceDir = join(
     context.configDir,
@@ -31,41 +45,69 @@ export function checkMarketplace(context: DoctorContext): CheckResult {
     // Report a missing clone through the normal diagnosis.
   }
   if (!knownIsFile || !/"ostrom"\s*:/.test(knownSource)) {
-    return {
-      status: "FAIL",
-      name: "marketplace",
-      detail: "ostrom not registered in known_marketplaces.json",
-      remedy: "/plugin marketplace add onsager-ai/ostrom",
+    const inspection: MarketplaceInspection = {
+      directory: marketplaceDir,
+      cloneAvailable: false,
+      fetchAvailable: false,
+      result: {
+        status: "FAIL",
+        name: "marketplace",
+        detail: "ostrom not registered in known_marketplaces.json",
+        remedy: "/plugin marketplace add onsager-ai/ostrom",
+      },
     };
+    inspectionCache.set(context, inspection);
+    return inspection;
   }
   if (!cloneIsDirectory) {
-    return {
-      status: "FAIL",
-      name: "marketplace",
-      detail: `registered, but no cached clone at ${marketplaceDir}`,
-      remedy: "/plugin marketplace add onsager-ai/ostrom",
+    const inspection: MarketplaceInspection = {
+      directory: marketplaceDir,
+      cloneAvailable: false,
+      fetchAvailable: false,
+      result: {
+        status: "FAIL",
+        name: "marketplace",
+        detail: `registered, but no cached clone at ${marketplaceDir}`,
+        remedy: "/plugin marketplace add onsager-ai/ostrom",
+      },
     };
+    inspectionCache.set(context, inspection);
+    return inspection;
   }
 
   const fetch = git(marketplaceDir, ["fetch", "origin", "main"]);
   if (fetch.status !== 0) {
     const firstLine = `${fetch.stdout}${fetch.stderr}`.split(/\r?\n/, 1)[0] ?? "";
-    return {
-      status: "WARN",
-      name: "marketplace",
-      detail: `cannot verify freshness, git fetch failed (offline?): ${firstLine}`,
-      remedy: "",
+    const inspection: MarketplaceInspection = {
+      directory: marketplaceDir,
+      cloneAvailable: true,
+      fetchAvailable: false,
+      result: {
+        status: "WARN",
+        name: "marketplace",
+        detail: `cannot verify freshness, git fetch failed (offline?): ${firstLine}`,
+        remedy: "",
+      },
     };
+    inspectionCache.set(context, inspection);
+    return inspection;
   }
   if (
     git(marketplaceDir, ["rev-parse", "--verify", "origin/main"]).status !== 0
   ) {
-    return {
-      status: "WARN",
-      name: "marketplace",
-      detail: "fetched, but origin/main not found (default branch may differ)",
-      remedy: "",
+    const inspection: MarketplaceInspection = {
+      directory: marketplaceDir,
+      cloneAvailable: true,
+      fetchAvailable: true,
+      result: {
+        status: "WARN",
+        name: "marketplace",
+        detail: "fetched, but origin/main not found (default branch may differ)",
+        remedy: "",
+      },
     };
+    inspectionCache.set(context, inspection);
+    return inspection;
   }
   if (
     git(marketplaceDir, [
@@ -75,30 +117,55 @@ export function checkMarketplace(context: DoctorContext): CheckResult {
       "origin/main",
     ]).status === 0
   ) {
-    return {
-      status: "OK",
-      name: "marketplace",
-      detail: "cached clone can fast-forward to origin/main",
-      remedy: "",
+    const inspection: MarketplaceInspection = {
+      directory: marketplaceDir,
+      cloneAvailable: true,
+      fetchAvailable: true,
+      result: {
+        status: "OK",
+        name: "marketplace",
+        detail: "cached clone can fast-forward to origin/main",
+        remedy: "",
+      },
     };
+    inspectionCache.set(context, inspection);
+    return inspection;
   }
   if (
     git(marketplaceDir, ["merge-base", "HEAD", "origin/main"]).status === 0
   ) {
-    return {
-      status: "WARN",
+    const inspection: MarketplaceInspection = {
+      directory: marketplaceDir,
+      cloneAvailable: true,
+      fetchAvailable: true,
+      result: {
+        status: "WARN",
+        name: "marketplace",
+        detail:
+          "cached clone has diverged from origin/main (shared history, not fast-forwardable)",
+        remedy: "/plugin marketplace update ostrom",
+      },
+    };
+    inspectionCache.set(context, inspection);
+    return inspection;
+  }
+  const inspection: MarketplaceInspection = {
+    directory: marketplaceDir,
+    cloneAvailable: true,
+    fetchAvailable: true,
+    result: {
+      status: "FAIL",
       name: "marketplace",
       detail:
-        "cached clone has diverged from origin/main (shared history, not fast-forwardable)",
-      remedy: "/plugin marketplace update ostrom",
-    };
-  }
-  return {
-    status: "FAIL",
-    name: "marketplace",
-    detail:
-      "cached clone and origin/main have unrelated histories (marketplace was republished from a fresh history)",
-    remedy:
-      "/plugin marketplace remove ostrom && /plugin marketplace add onsager-ai/ostrom",
+        "cached clone and origin/main have unrelated histories (marketplace was republished from a fresh history)",
+      remedy:
+        "/plugin marketplace remove ostrom && /plugin marketplace add onsager-ai/ostrom",
+    },
   };
+  inspectionCache.set(context, inspection);
+  return inspection;
+}
+
+export function checkMarketplace(context: DoctorContext): CheckResult {
+  return inspectMarketplace(context).result;
 }

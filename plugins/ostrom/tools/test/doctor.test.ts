@@ -14,7 +14,9 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+import { checkPluginCacheDrift } from "../src/checks/plugin-cache-drift.js";
 import { checkPlugin } from "../src/checks/plugin.js";
+import type { DoctorContext } from "../src/lib/context.js";
 import { parseOstromYaml } from "../src/lib/config.js";
 import { runDoctor } from "../src/lib/doctor.js";
 import { formatResult, type CheckResult } from "../src/lib/result.js";
@@ -61,6 +63,23 @@ function initRepo(path: string, filename: string, contents: string): void {
 function wireMarketplace(fixture: Fixture): void {
   const origin = join(fixture.root, "marketplace-origin");
   initRepo(origin, "README.md", "marketplace\n");
+  mkdirSync(
+    join(origin, "plugins", "ostrom", ".claude-plugin"),
+    { recursive: true },
+  );
+  mkdirSync(join(origin, "plugins", "ostrom", "skills", "fixture"), {
+    recursive: true,
+  });
+  writeFileSync(
+    join(origin, "plugins", "ostrom", ".claude-plugin", "plugin.json"),
+    JSON.stringify({ name: "ostrom", version: pluginVersion }),
+  );
+  writeFileSync(
+    join(origin, "plugins", "ostrom", "skills", "fixture", "SKILL.md"),
+    "fixture protocol\n",
+  );
+  command("git", ["add", "."], origin);
+  command("git", ["commit", "-m", "add plugin fixture"], origin);
   const marketplaceParent = join(
     fixture.configDir,
     "plugins",
@@ -84,9 +103,14 @@ function baseFixture(): Fixture {
   mkdirSync(join(configDir, "plugins"), { recursive: true });
   mkdirSync(cwd, { recursive: true });
   mkdirSync(join(installPath, ".claude-plugin"), { recursive: true });
+  mkdirSync(join(installPath, "skills", "fixture"), { recursive: true });
   writeFileSync(
     join(installPath, ".claude-plugin", "plugin.json"),
     JSON.stringify({ name: "ostrom", version: pluginVersion }),
+  );
+  writeFileSync(
+    join(installPath, "skills", "fixture", "SKILL.md"),
+    "fixture protocol\n",
   );
   writeFileSync(
     join(configDir, "plugins", "installed_plugins.json"),
@@ -115,11 +139,11 @@ function baseFixture(): Fixture {
   return fixture;
 }
 
-function pluginResult(
+function doctorContext(
   fixture: Fixture,
   loadedPluginRoot = pluginRoot,
-): CheckResult {
-  return checkPlugin({
+): DoctorContext {
+  return {
     pluginRoot: loadedPluginRoot,
     configDir: fixture.configDir,
     cwd: fixture.cwd,
@@ -131,7 +155,14 @@ function pluginResult(
       autoCommit: "False",
     }),
     readTrace: () => ({ exists: false }),
-  });
+  };
+}
+
+function pluginResult(
+  fixture: Fixture,
+  loadedPluginRoot = pluginRoot,
+): CheckResult {
+  return checkPlugin(doctorContext(fixture, loadedPluginRoot));
 }
 
 function writeRegistry(fixture: Fixture, version?: string): void {
@@ -177,6 +208,12 @@ function commonExpected(
       status: "OK",
       name: "marketplace",
       detail: "cached clone can fast-forward to origin/main",
+      remedy: "",
+    },
+    {
+      status: "OK",
+      name: "plugin-cache-drift",
+      detail: `version ${pluginVersion} and shipped files agree with the marketplace checkout`,
       remedy: "",
     },
     { status: "OK", name: "rules-layers", detail: rulesDetail, remedy: "" },
@@ -311,6 +348,69 @@ describe("plugin check", () => {
   });
 });
 
+describe("plugin cache drift check", () => {
+  it("reports OK when same-version shipped files agree", () => {
+    const fixture = baseFixture();
+
+    expect(checkPluginCacheDrift(doctorContext(fixture))).toEqual({
+      status: "OK",
+      name: "plugin-cache-drift",
+      detail: `version ${pluginVersion} and shipped files agree with the marketplace checkout`,
+      remedy: "",
+    });
+  });
+
+  it("fails and names a changed file when same-version contents drift", () => {
+    const fixture = baseFixture();
+    writeFileSync(
+      join(fixture.installPath, "skills", "fixture", "SKILL.md"),
+      "cached protocol\n",
+    );
+
+    expect(checkPluginCacheDrift(doctorContext(fixture))).toEqual({
+      status: "FAIL",
+      name: "plugin-cache-drift",
+      detail: `version ${pluginVersion} agrees but shipped files drift: content differs: skills/fixture/SKILL.md`,
+      remedy: "update and reinstall ostrom@ostrom, then restart the session",
+    });
+  });
+
+  it("warns when the marketplace clone cannot be fetched", () => {
+    const fixture = baseFixture();
+    const marketplace = join(
+      fixture.configDir,
+      "plugins",
+      "marketplaces",
+      "ostrom",
+    );
+    command(
+      "git",
+      ["remote", "set-url", "origin", join(fixture.root, "missing-origin")],
+      marketplace,
+    );
+
+    const result = checkPluginCacheDrift(doctorContext(fixture));
+    expect(result.status).toBe("WARN");
+    expect(result.name).toBe("plugin-cache-drift");
+    expect(result.detail).toContain("git fetch failed (offline?)");
+  });
+
+  it("warns when the marketplace clone is missing", () => {
+    const fixture = baseFixture();
+    rmSync(
+      join(fixture.configDir, "plugins", "marketplaces", "ostrom"),
+      { recursive: true },
+    );
+
+    expect(checkPluginCacheDrift(doctorContext(fixture))).toEqual({
+      status: "WARN",
+      name: "plugin-cache-drift",
+      detail: `cannot compare shipped files: registered, but no cached clone at ${join(fixture.configDir, "plugins", "marketplaces", "ostrom")}`,
+      remedy: "/plugin marketplace add onsager-ai/ostrom",
+    });
+  });
+});
+
 function notionConfig(fixture: Fixture, extra = ""): void {
   const configRepo = join(fixture.root, "private-config");
   initRepo(
@@ -422,7 +522,7 @@ describe("doctor golden output", () => {
       },
     });
 
-    expect(report.split("\n").filter(Boolean)).toHaveLength(12);
+    expect(report.split("\n").filter(Boolean)).toHaveLength(13);
     expect(existsSync(missing)).toBe(false);
   });
 

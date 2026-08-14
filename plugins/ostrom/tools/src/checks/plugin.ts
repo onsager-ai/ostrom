@@ -3,7 +3,7 @@ import { join } from "node:path";
 import type { DoctorContext } from "../lib/context.js";
 import type { CheckResult } from "../lib/result.js";
 
-function field(source: string, name: string): string {
+export function pluginJsonField(source: string, name: string): string {
   const match = new RegExp(`"${name}"\\s*:\\s*"([^"]*)"`).exec(source);
   return match?.[1] ?? "";
 }
@@ -16,26 +16,36 @@ function isFile(path: string): boolean {
   }
 }
 
-function versionAt(pluginRoot: string): string {
+export function pluginVersionAt(pluginRoot: string): string {
   if (!pluginRoot) return "";
   const pluginJson = join(pluginRoot, ".claude-plugin", "plugin.json");
   if (!isFile(pluginJson)) return "";
   try {
-    return field(readFileSync(pluginJson, "utf8"), "version");
+    return pluginJsonField(readFileSync(pluginJson, "utf8"), "version");
   } catch {
     return "";
   }
 }
 
-export function checkPlugin(context: DoctorContext): CheckResult {
+export interface PluginInstallation {
+  installPath: string;
+  recordedVersion: string;
+  loadedVersion: string;
+  installPathVersion: string;
+  registryVersion: string;
+}
+
+export type PluginResolution =
+  | { kind: "missing-registry"; path: string }
+  | { kind: "plugin-absent" }
+  | { kind: "found"; installation: PluginInstallation };
+
+export function resolvePluginInstallation(
+  context: DoctorContext,
+): PluginResolution {
   const installedJson = join(context.configDir, "plugins", "installed_plugins.json");
   if (!isFile(installedJson)) {
-    return {
-      status: "FAIL",
-      name: "plugin",
-      detail: `no installed_plugins.json at ${installedJson}`,
-      remedy: "/plugin install ostrom@ostrom",
-    };
+    return { kind: "missing-registry", path: installedJson };
   }
 
   let source = "";
@@ -46,6 +56,37 @@ export function checkPlugin(context: DoctorContext): CheckResult {
   }
   const marker = source.indexOf('"ostrom@ostrom"');
   if (marker < 0) {
+    return { kind: "plugin-absent" };
+  }
+
+  const block = source.slice(marker);
+  const installPath = pluginJsonField(block, "installPath");
+  const recordedVersion = pluginJsonField(block, "version");
+  const loadedVersion = pluginVersionAt(context.pluginRoot);
+  const installPathVersion = pluginVersionAt(installPath);
+  return {
+    kind: "found",
+    installation: {
+      installPath,
+      recordedVersion,
+      loadedVersion,
+      installPathVersion,
+      registryVersion: installPathVersion || recordedVersion,
+    },
+  };
+}
+
+export function checkPlugin(context: DoctorContext): CheckResult {
+  const resolution = resolvePluginInstallation(context);
+  if (resolution.kind === "missing-registry") {
+    return {
+      status: "FAIL",
+      name: "plugin",
+      detail: `no installed_plugins.json at ${resolution.path}`,
+      remedy: "/plugin install ostrom@ostrom",
+    };
+  }
+  if (resolution.kind === "plugin-absent") {
     return {
       status: "FAIL",
       name: "plugin",
@@ -54,12 +95,11 @@ export function checkPlugin(context: DoctorContext): CheckResult {
     };
   }
 
-  const block = source.slice(marker);
-  const installPath = field(block, "installPath");
-  const recordedVersion = field(block, "version");
-  const loadedVersion = versionAt(context.pluginRoot);
-  const installPathVersion = versionAt(installPath);
-  const registryVersion = installPathVersion || recordedVersion;
+  const {
+    installPathVersion,
+    loadedVersion,
+    registryVersion,
+  } = resolution.installation;
 
   if (loadedVersion && registryVersion) {
     const matchesRegistry = loadedVersion === registryVersion;

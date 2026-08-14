@@ -4,6 +4,7 @@ import { checkEnvironment } from "../checks/environment.js";
 import { checkMarketplace } from "../checks/marketplace.js";
 import { checkConfigParser } from "../checks/parser.js";
 import { checkPlugin } from "../checks/plugin.js";
+import { checkPluginCacheDrift } from "../checks/plugin-cache-drift.js";
 import { checkRulesLayers } from "../checks/rules.js";
 import { checkTraceLease } from "../checks/trace-lease.js";
 import { checkWorkOrders } from "../checks/work-orders.js";
@@ -61,6 +62,7 @@ export function runDoctor(options: DoctorOptions): string {
   const results = [
     checkPlugin(context),
     checkMarketplace(context),
+    checkPluginCacheDrift(context),
     checkRulesLayers(context),
     checkTouchDurability(context),
     checkProviderReachable(context),
