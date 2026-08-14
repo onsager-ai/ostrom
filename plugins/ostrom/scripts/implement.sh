@@ -583,6 +583,21 @@ if ! git -C "$worktree_root" diff --quiet || \
     exit 1
   fi
 fi
+publish_paths="$(
+  git -C "$worktree_root" diff --name-only \
+    "refs/remotes/origin/$default_branch...HEAD"
+)" || {
+  failure_reason=workflow-file-check-failed
+  exit 1
+}
+while IFS= read -r publish_path; do
+  case "$publish_path" in
+    .github/workflows/*)
+      failure_reason="workflow-file-unpushable path=$publish_path"
+      exit 1
+      ;;
+  esac
+done <<<"$publish_paths"
 push_output="$runs_dir/push-output.txt"
 if bash "$GH_AS_BIN" builder "$repository" \
   git -C "$worktree_root" push \

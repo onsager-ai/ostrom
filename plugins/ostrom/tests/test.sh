@@ -1993,9 +1993,45 @@ jq -s -e --arg order_id "$branch_conflict_order_id" \
   and .[0].fact.source_repository_path == $source_repository_path
 ' "$branch_conflict_config/ostrom/sprint.jsonl" >/dev/null
 
+# A workflow change is committed for recovery, then rejected before the
+# authenticated push. The terminal reason identifies the first offending path.
+workflow_config="$implement_fixture/workflow-config"
+workflow_order="$(create_implement_order workflow-unpushable 148 "$workflow_config")"
+workflow_order_id="$(jq -r '.order_id' "$workflow_order")"
+workflow_item_hash="$(
+  bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash \
+    'example-org/example-repo#148'
+)"
+workflow_branch="$(jq -r '.branch_name' "$workflow_order")"
+workflow_worktree="$workflow_config/ostrom/implementer-worktrees/$workflow_item_hash"
+mkdir -p "$(dirname "$workflow_worktree")"
+git -C "$implement_source" worktree add -b "$workflow_branch" \
+  "$workflow_worktree" refs/remotes/origin/main >/dev/null
+mkdir -p "$workflow_worktree/.github/workflows"
+printf '%s\n' 'name: synthetic' >"$workflow_worktree/.github/workflows/test.yml"
+workflow_commands="$implement_fixture/workflow-unpushable-commands"
+set +e
+FAKE_IMPLEMENT_COMMANDS="$workflow_commands" \
+  run_implement_order "$workflow_order" workflow-unpushable "$workflow_config"
+workflow_status=$?
+set -e
+[ "$workflow_status" -eq 1 ]
+[ "$(git -C "$workflow_worktree" show HEAD:.github/workflows/test.yml)" = \
+  'name: synthetic' ]
+if grep -q ' push ' "$workflow_commands"; then
+  echo "workflow-file guard attempted a push" >&2
+  exit 1
+fi
+jq -s -e --arg order_id "$workflow_order_id" '
+  [.[] | select(.fact.order_id == $order_id)] | length == 1
+  and .[0].kind == "work-failed"
+  and .[0].fact.reason
+    == "workflow-file-unpushable path=.github/workflows/test.yml"
+' "$workflow_config/ostrom/sprint.jsonl" >/dev/null
+
 # #142: a repeat order on the already-matching deterministic branch reuses the
 # item-keyed worktree. The preexisting uncommitted file reaches the pushed
-# commit, proving reuse does not discard it.
+# commit, proving reuse does not discard it and ordinary changes still push.
 reuse_config="$implement_fixture/reuse-config"
 reuse_order="$(create_implement_order reuse 140 "$reuse_config")"
 reuse_item_hash="$(bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash 'example-org/example-repo#140')"
@@ -2005,10 +2041,16 @@ mkdir -p "$(dirname "$reuse_worktree")"
 git -C "$implement_source" worktree add -b "$reuse_branch" \
   "$reuse_worktree" refs/remotes/origin/main >/dev/null
 printf 'preserved before redispatch\n' >"$reuse_worktree/preserved.txt"
-run_implement_order "$reuse_order" reuse "$reuse_config"
+reuse_commands="$implement_fixture/reuse-commands"
+FAKE_IMPLEMENT_COMMANDS="$reuse_commands" \
+  run_implement_order "$reuse_order" reuse "$reuse_config"
 [ "$(git -C "$reuse_worktree" branch --show-current)" = "$reuse_branch" ]
 [ "$(git --git-dir="$implement_remote" show "$reuse_branch:preserved.txt")" = \
   'preserved before redispatch' ]
+if [ "$(grep -c ' push ' "$reuse_commands")" -ne 1 ]; then
+  echo "ordinary implementation did not push exactly once" >&2
+  exit 1
+fi
 
 # A historical order can target a different branch than a clean, not-ahead
 # item worktree. The implementer retargets it after fetch and proceeds.
