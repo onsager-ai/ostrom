@@ -33,6 +33,8 @@ pub enum StoreError {
     },
     #[error("malformed queue row {line}: {message}")]
     MalformedQueue { line: usize, message: String },
+    #[error("malformed trace record: {message}")]
+    MalformedTrace { message: String },
     #[error("malformed lease {name}: {message}")]
     MalformedLease { name: String, message: String },
     #[error("malformed pass state for {role}: {message}")]

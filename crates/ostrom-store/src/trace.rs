@@ -102,8 +102,7 @@ fn parse_trace_line(line_number: usize, line: &str) -> Result<TraceFactRecord, M
 
 pub fn append_trace(path: &Path, record: &TraceAppend) -> Result<Vec<u8>, StoreError> {
     if record.ts.is_empty() || record.kind.is_empty() {
-        return Err(StoreError::MalformedQueue {
-            line: 0,
+        return Err(StoreError::MalformedTrace {
             message: "trace ts and kind must not be empty".to_owned(),
         });
     }
@@ -139,9 +138,31 @@ pub fn append_trace(path: &Path, record: &TraceAppend) -> Result<Vec<u8>, StoreE
 mod tests {
     use std::fs;
 
+    use serde_json::Map;
     use tempfile::tempdir;
 
-    use super::read_trace;
+    use super::{TraceAppend, append_trace, read_trace};
+    use crate::StoreError;
+
+    #[test]
+    fn malformed_append_is_named_as_a_trace_error_without_a_fake_line() {
+        let fixture = tempdir().expect("temp dir");
+        let error = append_trace(
+            &fixture.path().join("sprint.jsonl"),
+            &TraceAppend {
+                ts: String::new(),
+                kind: "pass-started".to_owned(),
+                fact: Map::new(),
+                narration: Map::new(),
+            },
+        )
+        .expect_err("empty trace timestamp must fail");
+        assert!(matches!(error, StoreError::MalformedTrace { .. }));
+        assert_eq!(
+            error.to_string(),
+            "malformed trace record: trace ts and kind must not be empty"
+        );
+    }
 
     #[test]
     fn malformed_row_is_named_without_discarding_later_rows() {
