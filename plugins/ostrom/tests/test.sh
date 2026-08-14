@@ -4026,10 +4026,12 @@ set -euo pipefail
 
 repo="-"
 previous=""
+issue_state="open"
 for argument in "$@"; do
   if [ "$previous" = "--repo" ]; then
     repo="$argument"
-    break
+  elif [ "$previous" = "--state" ]; then
+    issue_state="$argument"
   fi
   previous="$argument"
 done
@@ -4111,6 +4113,12 @@ JSON
           incremental_one_updated="2026-08-01T00:30:00Z"
           ;;
         closed)
+          if [ "$issue_state" = "all" ]; then
+            cat <<JSON
+[{"number":1,"title":"$incremental_one_title","state":"closed","labels":[{"name":"maintenance"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-08-01T01:30:00Z","url":"https://example.invalid/issues/1"},{"number":2,"title":"$incremental_two_title","state":"open","labels":[{"name":"maintenance"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"$incremental_two_updated","url":"https://example.invalid/issues/2"}]
+JSON
+            exit 0
+          fi
           cat <<JSON
 [{"number":2,"title":"$incremental_two_title","labels":[{"name":"maintenance"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"$incremental_two_updated","url":"https://example.invalid/issues/2"}]
 JSON
@@ -4120,6 +4128,38 @@ JSON
       cat <<JSON
 [{"number":1,"title":"$incremental_one_title","labels":[{"name":"maintenance"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"$incremental_one_updated","url":"https://example.invalid/issues/1"},{"number":2,"title":"$incremental_two_title","labels":[{"name":"maintenance"}],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"$incremental_two_updated","url":"https://example.invalid/issues/2"}]
 JSON
+      ;;
+    example-org/closure-repo)
+      jq -cn \
+        --arg mode "${FAKE_GH_MODE:-base}" \
+        --arg issue_state "$issue_state" '
+          [range(1; 14) as $number
+            | select(
+                ($mode != "closed")
+                or $issue_state == "all"
+                or $number == 13
+              )
+            | {
+                number: $number,
+                title: ("Synthetic closure item " + ($number | tostring)),
+                state: (
+                  if $mode == "closed" and $number < 13
+                  then "closed"
+                  else "open"
+                  end
+                ),
+                labels: [{name: "maintenance"}],
+                createdAt: "2026-07-29T00:00:00Z",
+                updatedAt: (
+                  if $mode == "closed" and $number < 13
+                  then "2026-08-01T01:30:00Z"
+                  else "2026-07-30T00:00:00Z"
+                  end
+                ),
+                url: ("https://example.invalid/issues/" + ($number | tostring))
+              }
+          ]
+        '
       ;;
     example-org/semantic-repo)
       cat <<'JSON'
@@ -4331,6 +4371,12 @@ if [ "$1" = "api" ]; then
     repos/*/*/issues\?*)
       api_repo="${endpoint#repos/}"
       api_repo="${api_repo%%/issues\?*}"
+      if [ "$api_repo" = "example-org/closure-repo" ] && \
+          [ "${FAKE_GH_MODE:-base}" = "feed-failure" ]; then
+        printf 'HTTP/2.0 503 Service Unavailable\n\n'
+        echo 'synthetic issue feed failure' >&2
+        exit 1
+      fi
       feed_kind=full
       case "$endpoint" in *'&since='*) feed_kind=incremental ;; esac
       fixture_etag="\"fixture-${api_repo//\//-}-$feed_kind-${FAKE_GH_MODE:-base}-${FAKE_GH_ISSUE_MODE:-none}\""
@@ -4342,16 +4388,18 @@ if [ "$1" = "api" ]; then
       query="${endpoint#*\?}"
       page=1
       since=""
+      state="open"
       old_ifs="$IFS"
       IFS='&'
       for parameter in $query; do
         case "$parameter" in
           page=*) page="${parameter#page=}" ;;
           since=*) since="${parameter#since=}" ;;
+          state=*) state="${parameter#state=}" ;;
         esac
       done
       IFS="$old_ifs"
-      api_issues="$("$0" issue list --repo "$api_repo" --state open --limit 200)"
+      api_issues="$("$0" issue list --repo "$api_repo" --state "$state" --limit 200)"
       if [ -n "$since" ]; then
         api_issues="$(
           jq -c --arg since "$since" \
@@ -4670,6 +4718,170 @@ done
 if grep -Fq 'pr view 404 --repo example-org/approval-carryover' \
     "$approval_carryover_calls"; then
   echo "pending row received an approval-only state read" >&2
+  exit 1
+fi
+
+# #178: the cursor-bounded issue feed carries positive closure tombstones.
+# Seed every state/kind combination after a full baseline, plus one unchanged
+# open issue. A successful empty delta and a failed feed both retain every row;
+# a later all-state delta removes exactly the positively closed items. The
+# approved cases also prove that issue closures do not depend on `gh pr view`,
+# while #85's fixture above continues to exercise merged-PR resolution.
+closure_fixture="$fixture/closure-observation"
+closure_queue="$closure_fixture/config/ostrom/queue.jsonl"
+closure_state="$closure_fixture/config/ostrom/state.json"
+closure_calls="$closure_fixture/gh-calls"
+mkdir -p "$closure_fixture/config/ostrom" "$closure_fixture/repo"
+write_gatekeeper_secrets "$closure_fixture/config"
+cat >"$closure_fixture/config/ostrom/mandates.yaml" <<'YAML'
+stuck_after_days: 30
+bounce_all: []
+projects:
+  - repo: example-org/closure-repo
+    delegated:
+      - label:maintenance
+    excluded: []
+    reserved: []
+    default: excluded
+    paused: false
+    bounce: []
+YAML
+: >"$closure_calls"
+(
+  cd "$closure_fixture/repo"
+  PATH="$fixture/bin:$PATH" \
+    FAKE_GH_CALL_LOG="$closure_calls" \
+    FAKE_GH_MODE=base \
+    MANDATE_SWEEP_TIME="2026-08-01T00:00:00Z" \
+    MANDATE_SWEEP_MODE=full \
+    CLAUDE_CONFIG_DIR="$closure_fixture/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/sweep.sh" >/dev/null
+)
+
+: >"$closure_queue"
+closure_number=0
+for closure_state_name in pending approved deferred; do
+  for closure_kind in tripwire decision moved stuck; do
+    closure_number=$((closure_number + 1))
+    jq -cn \
+      --argjson number "$closure_number" \
+      --arg state "$closure_state_name" \
+      --arg kind "$closure_kind" '
+        {
+          id: ("example-org/closure-repo#" + ($number | tostring)),
+          repo: "example-org/closure-repo",
+          ref: ("#" + ($number | tostring)),
+          title: ("Synthetic closure item " + ($number | tostring)),
+          kind: $kind,
+          mandate: {
+            reason: (
+              "synthetic closure observation"
+              + if $kind == "moved"
+                then "; updated since the read cursor"
+                else ""
+                end
+            )
+          },
+          state: $state,
+          opened: "2026-07-29T00:00:00Z",
+          age_days: 3,
+          aged_out: false,
+          needs_judgment: ($kind | IN("tripwire", "decision")),
+          blocked_by: []
+        }
+      ' >>"$closure_queue"
+  done
+done
+jq -cn '
+  {
+    id: "example-org/closure-repo#13",
+    repo: "example-org/closure-repo",
+    ref: "#13",
+    title: "Synthetic closure item 13",
+    kind: "moved",
+    mandate: {
+      reason: "synthetic unchanged open item; updated since the read cursor"
+    },
+    state: "pending",
+    opened: "2026-07-29T00:00:00Z",
+    age_days: 3,
+    aged_out: false,
+    needs_judgment: false,
+    blocked_by: []
+  }
+' >>"$closure_queue"
+jq -s -c 'sort_by(.id)[]' "$closure_queue" >"$closure_fixture/sorted-queue"
+mv "$closure_fixture/sorted-queue" "$closure_queue"
+cp "$closure_queue" "$closure_fixture/queue.before-empty"
+
+# Remove the validator so this is a successful 200 with an empty array, not a
+# conditional 304. Absence alone must retain all thirteen rows.
+jq 'del(.repos["example-org/closure-repo"].etag)' "$closure_state" \
+  >"$closure_fixture/state-without-etag"
+mv "$closure_fixture/state-without-etag" "$closure_state"
+(
+  cd "$closure_fixture/repo"
+  PATH="$fixture/bin:$PATH" \
+    FAKE_GH_CALL_LOG="$closure_calls" \
+    FAKE_GH_MODE=base \
+    MANDATE_SWEEP_TIME="2026-08-01T00:30:00Z" \
+    MANDATE_SWEEP_MODE=incremental \
+    CLAUDE_CONFIG_DIR="$closure_fixture/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/sweep.sh" >/dev/null
+)
+cmp "$closure_fixture/queue.before-empty" "$closure_queue"
+
+# A failed state feed aborts before reconciliation writes either queue or
+# state. Capture the expected failure explicitly; `! command` is unsafe here.
+cp "$closure_queue" "$closure_fixture/queue.before-failure"
+cp "$closure_state" "$closure_fixture/state.before-failure"
+set +e
+(
+  cd "$closure_fixture/repo"
+  PATH="$fixture/bin:$PATH" \
+    FAKE_GH_CALL_LOG="$closure_calls" \
+    FAKE_GH_MODE=feed-failure \
+    MANDATE_SWEEP_TIME="2026-08-01T01:00:00Z" \
+    MANDATE_SWEEP_MODE=incremental \
+    CLAUDE_CONFIG_DIR="$closure_fixture/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/sweep.sh" >/dev/null 2>"$closure_fixture/feed-failure.stderr"
+)
+closure_failure_status=$?
+set -e
+if [ "$closure_failure_status" -eq 0 ]; then
+  echo "failed issue state feed did not fail the sweep" >&2
+  exit 1
+fi
+cmp "$closure_fixture/queue.before-failure" "$closure_queue"
+cmp "$closure_fixture/state.before-failure" "$closure_state"
+grep -Fq 'failed to query the issues change feed for example-org/closure-repo' \
+  "$closure_fixture/feed-failure.stderr"
+
+: >"$closure_calls"
+(
+  cd "$closure_fixture/repo"
+  PATH="$fixture/bin:$PATH" \
+    FAKE_GH_CALL_LOG="$closure_calls" \
+    FAKE_GH_MODE=closed \
+    MANDATE_SWEEP_TIME="2026-08-01T02:00:00Z" \
+    MANDATE_SWEEP_MODE=full \
+    CLAUDE_CONFIG_DIR="$closure_fixture/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/sweep.sh" >/dev/null
+)
+jq -s -e '
+  length == 1
+  and .[0].id == "example-org/closure-repo#13"
+  and .[0].state == "pending"
+' "$closure_queue" >/dev/null
+grep -Fq \
+  'repos/example-org/closure-repo/issues?state=all&sort=updated&direction=asc&per_page=100&page=1&since=2026-08-01T00:00:00Z' \
+  "$closure_calls"
+if grep -Fq $'example-org/closure-repo\tpr view ' "$closure_calls"; then
+  echo "positively closed issue was sent through the PR-only fallback" >&2
   exit 1
 fi
 
@@ -5887,15 +6099,22 @@ jq -s -e '
   and .[0].id == "example-org/incremental-repo#1"
 ' "$incremental_queue" >/dev/null
 
-# Leaving the open set is invisible to `since`, so the incremental pass keeps
-# the issue. Once 24 hours have elapsed, auto selects a full reconciliation and
-# removes both its item state and its pending queue row.
+# A closure is returned by the cursor-bounded all-state feed and acts as a
+# positive tombstone immediately; it does not wait for the daily full pass.
+: >"$incremental/gh-calls"
 run_incremental_fixture "$incremental" closed "2026-08-01T02:00:00Z" auto
 jq -e '
   .sweep_mode == "incremental"
   and (.repos["example-org/incremental-repo"].items
-    | has("example-org/incremental-repo#1"))
+    | has("example-org/incremental-repo#1") | not)
+  and (.repos["example-org/incremental-repo"].records
+    | has("example-org/incremental-repo#1") | not)
 ' "$incremental_state" >/dev/null
+[ "$(jq -s 'length' "$incremental_queue")" -eq 0 ]
+grep -q 'repos/example-org/incremental-repo/issues?state=all&.*since=2026-08-01T00:30:00Z' \
+  "$incremental/gh-calls"
+
+# The next due full reconciliation cannot resurrect the positively closed row.
 run_incremental_fixture "$incremental" closed "2026-08-02T01:00:01Z" auto
 jq -e '
   .sweep_mode == "full"
