@@ -1041,6 +1041,61 @@ sweep_org() {
       --slurpfile ci_drift "$work/ci-drift.json" \
       '$all[0] + $analysis[0].active_ids + $ci_drift[0].active_ids' >"$work/next.json"
     mv "$work/next.json" "$work/active-ids.json"
+
+    # An approval is deliberately durable across an item disappearing from
+    # the open enumeration: absence can be an API or rate-limit failure, not
+    # proof that the work is done. For approved rows that would otherwise be
+    # carried over, make one positive state read instead. A merged PR and a
+    # closed-unmerged PR are recorded distinctly, although both are terminal
+    # for queue purposes. Any command failure or malformed/incomplete response
+    # records nothing, so the final reconciliation retains the approval.
+    while IFS=$'\t' read -r approved_id approved_number; do
+      if gh pr view "$approved_number" --repo "$repo" --json state,mergedAt \
+          >"$work/approved-pr-state.json" 2>"$work/approved-pr-state-error"; then
+        if approved_resolution="$(
+          jq -er '
+            if type != "object"
+                or (has("state") | not)
+                or (has("mergedAt") | not)
+            then error("incomplete pull request state")
+            elif .state == "MERGED"
+                and (.mergedAt | type) == "string"
+                and (.mergedAt | length) > 0
+            then "merged"
+            elif .state == "CLOSED" and .mergedAt == null
+            then "closed-unmerged"
+            elif .state == "OPEN" and .mergedAt == null
+            then "open"
+            else error("unrecognized pull request state")
+            end
+          ' "$work/approved-pr-state.json" 2>/dev/null
+        )"; then
+          case "$approved_resolution" in
+            merged | closed-unmerged)
+              jq -cn \
+                --arg id "$approved_id" \
+                --arg resolution "$approved_resolution" \
+                '{id: $id, resolution: $resolution}' \
+                >>"$work/closed-approved.jsonl"
+              ;;
+          esac
+        fi
+      fi
+    done < <(
+      jq -r \
+        --arg repo "$repo" \
+        --slurpfile active_ids "$work/active-ids.json" '
+        .[]
+        | . as $row
+        | select(.state == "approved" and .repo == $repo)
+        | select(($active_ids[0] | index($row.id)) == null)
+        | select(.id | startswith($repo + "#"))
+        | (.id | split("#")[-1]) as $number
+        | select($number | test("^[1-9][0-9]*$"))
+        | [.id, $number]
+        | @tsv
+      ' "$work/existing-queue.json"
+    )
     jq -cn \
       --slurpfile all "$work/current-items.json" \
       --slurpfile analysis "$work/analysis.json" \
@@ -1191,6 +1246,10 @@ cp "$work/old-state.json" "$work/new-state.json"
 : >"$work/landed-fix-attempts.count"
 : >"$work/landed-fix-failures.log"
 : >"$work/landed-fix-last-error.txt"
+# Positive terminal observations for carried-over approvals. This is JSONL
+# because each authenticated per-organisation subprocess appends its own
+# observations; an empty file means every absent approval remains durable.
+: >"$work/closed-approved.jsonl"
 
 while IFS= read -r org; do
   anchor_repo="$(
@@ -1269,12 +1328,14 @@ jq -cn \
     --slurpfile generated "$work/generated.json" \
     --slurpfile active_ids "$work/active-ids.json" \
     --slurpfile current_items "$work/current-items.json" \
-    --slurpfile possibly_landed "$work/possibly-landed.json" '
+    --slurpfile possibly_landed "$work/possibly-landed.json" \
+    --slurpfile closed_approved "$work/closed-approved.jsonl" '
     ($existing[0]) as $existing
     | ($generated[0]) as $generated
     | ($active_ids[0]) as $active_ids
     | ($current_items[0]) as $current_items
     | ($possibly_landed[0]) as $possibly_landed
+    | ($closed_approved | map(.id)) as $closed_approved_ids
     |
     def dependency_refs($repo; $text):
       [
@@ -1363,7 +1424,13 @@ jq -cn \
     (
       $existing
       | map(. as $row
-        | select($row.state == "approved" or ($active_ids | index($row.id)) != null)
+        | select(
+            ($active_ids | index($row.id)) != null
+            or (
+              $row.state == "approved"
+              and ($closed_approved_ids | index($row.id)) == null
+            )
+          )
       )
     ) as $still_relevant
     | reduce $generated[] as $row ($still_relevant;
