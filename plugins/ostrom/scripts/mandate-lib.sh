@@ -17,6 +17,14 @@ MANDATE_GATE_REPO_CONFIG="./.ostrom/gate.yaml"
 MANDATE_GATE_LOG="$MANDATE_DATA_DIR/gate.jsonl"
 MANDATE_EXCEPTIONS_LOG="$MANDATE_DATA_DIR/exceptions.jsonl"
 
+# Semantic derivation is an optional port. An explicit executable is useful
+# for hermetic fixtures and alternate providers; otherwise the bundled
+# adapter is enabled only by Anthropic's standard credential. Neither value
+# is part of mandate policy, and absence preserves the mechanical sweep.
+mandate_semantic_is_configured() {
+  [ -n "${MANDATE_SEMANTIC_DERIVER:-}" ] || [ -n "${ANTHROPIC_API_KEY:-}" ]
+}
+
 # Read a delivery role's GitHub App credentials from the machine-local secrets
 # file, preferring a role block so the shared-App cutover stays reversible.
 # This intentionally remains separate from the shipped/user/repository config
@@ -682,8 +690,9 @@ mandate_read_queue() {
         (["id","kind","mandate","opened","ref","repo","state"] - keys | length) == 0
         and
         (keys - [
-          "age_days", "aged_out", "blocked_by", "id", "kind", "mandate",
-          "needs_judgment", "opened", "ref", "repo", "state", "title"
+          "age_days", "aged_out", "blocked_by", "classification", "id", "kind",
+          "mandate", "matched_selector", "needs_judgment", "opened", "ref",
+          "repo", "semantic_derivation", "state", "title"
         ] | length) == 0
       )
       and (.id | type == "string")
@@ -714,6 +723,36 @@ mandate_read_queue() {
       and (
         (has("title") | not)
         or (((.title | type) == "string") and ((.title | length) > 0))
+      )
+      and (
+        (has("semantic_derivation") | not)
+        and (has("classification") | not)
+        and (has("matched_selector") | not)
+        or (
+          has("semantic_derivation")
+          and has("classification")
+          and has("matched_selector")
+          and (.classification | IN("delegated", "excluded", "unclassified", "reserved", "tripwire"))
+          and (.matched_selector | type == "string" and length > 0)
+          and (.semantic_derivation | type == "object")
+          and (.semantic_derivation.findings | type == "array")
+          and all(.semantic_derivation.findings[];
+            (.kind | IN("parked", "already_decided", "genuinely_stuck", "actually_a_release"))
+            and (.confidence | type == "number" and . >= 0 and . <= 1)
+            and (.evidence | type == "object")
+            and (.evidence.source | IN("title", "label", "body", "comment"))
+            and (.evidence.quote | type == "string" and length > 0)
+          )
+          and (
+            .semantic_derivation.authority == null
+            or (
+              (.semantic_derivation.authority.classification | IN("unclassified", "reserved", "tripwire"))
+              and (.semantic_derivation.authority.confidence | type == "number" and . >= 0 and . <= 1)
+              and (.semantic_derivation.authority.evidence.source | IN("title", "label", "body", "comment"))
+              and (.semantic_derivation.authority.evidence.quote | type == "string" and length > 0)
+            )
+          )
+        )
       )
     )
     then .

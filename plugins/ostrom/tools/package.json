@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "esbuild src/doctor.ts --bundle --platform=node --target=node18 --format=esm --outfile=../dist/doctor.js",
+    "build": "esbuild src/doctor.ts src/semantic-derivation-cli.ts --bundle --platform=node --target=node18 --format=esm --outdir=../dist",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
