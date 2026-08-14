@@ -127,6 +127,39 @@ if [ -e "$worktree_root" ]; then
   fi
 fi
 
+# Refuse an order whose roster repository has no usable primary checkout
+# before any remote duplicate check, item lease, concurrency slot, or spend
+# reservation. The implementer repeats the same shared resolution after unit
+# start to close the race with an operator moving a checkout.
+dispatch_config="$(mandate_load_config)" || dispatch_config=""
+if [ -n "${MANDATE_IMPLEMENTER_SOURCE_REPO:-}" ]; then
+  if [ -d "$MANDATE_IMPLEMENTER_SOURCE_REPO" ]; then
+    source_repository="$MANDATE_IMPLEMENTER_SOURCE_REPO"
+    source_resolution_status=0
+  else
+    source_resolution_status=1
+  fi
+elif [ -n "$dispatch_config" ]; then
+  if source_repository="$(mandate_find_source_repository "$repository" "$dispatch_config")"; then
+    source_resolution_status=0
+  else
+    source_resolution_status=$?
+  fi
+else
+  source_resolution_status=1
+fi
+case "$source_resolution_status" in
+  0) ;;
+  10) source_failure_reason=source-repository-linked-worktree-only ;;
+  *) source_failure_reason=source-repository-not-found ;;
+esac
+if [ "$source_resolution_status" -ne 0 ]; then
+  append_dispatch_failure "$source_failure_reason" 0 "" "" "$repository" ||
+    echo "ostrom dispatch: could not record work-failed" >&2
+  echo "ostrom dispatch: $source_failure_reason: repository=$repository" >&2
+  exit 3
+fi
+
 # A pushed branch is durable work even when no pull request references the
 # item yet. A branch whose pull request was merged is landed work, though, and
 # squash merges do not put the branch's own commits into the default branch's

@@ -1676,6 +1676,20 @@ if [ "$project_count" -eq 0 ]; then
   exit 2
 fi
 
+# Repository availability is a roster property, not an item state. Resolve it
+# once per sweep using the implementer's shared matcher and keep missing
+# checkouts separate from ordinary stuck work. This walk is filesystem-only.
+: >"$work/unresolvable-repositories.txt"
+roster_config="$(cat "$work/config.json")"
+while IFS= read -r roster_repository; do
+  if ! mandate_find_source_repository \
+      "$roster_repository" "$roster_config" >/dev/null; then
+    printf '%s\n' "$roster_repository" >>"$work/unresolvable-repositories.txt"
+  fi
+done < <(jq -r '.projects[].repo' "$work/config.json")
+jq -Rn '[inputs | select(length > 0)]' \
+  "$work/unresolvable-repositories.txt" >"$work/unresolvable-repositories.json"
+
 semantic_enabled=0
 semantic_node=""
 if mandate_semantic_is_configured; then
@@ -1698,7 +1712,7 @@ if [ -s "$MANDATE_STATE_FILE" ]; then
     exit 4
   fi
 else
-  printf '%s\n' '{"version":2,"repos":{},"dead_selectors":[]}' \
+  printf '%s\n' '{"version":2,"repos":{},"dead_selectors":[],"unresolvable_repositories":[]}' \
     >"$work/old-state.json"
 fi
 
@@ -1838,11 +1852,13 @@ jq -c '[.projects[].repo]' "$work/config.json" >"$work/configured-repos.json"
 jq -cn \
     --slurpfile state "$work/new-state.json" \
     --slurpfile dead "$work/dead-selectors.json" \
+    --slurpfile unresolvable "$work/unresolvable-repositories.json" \
     --slurpfile configured_repos "$work/configured-repos.json" '
     $state[0]
     | ($dead[0]) as $dead
     | ($configured_repos[0]) as $configured_repos
     | .dead_selectors = $dead
+    | .unresolvable_repositories = $unresolvable[0]
     | .repos |= with_entries(
         select(.key as $repo | ($configured_repos | index($repo)) != null)
       )

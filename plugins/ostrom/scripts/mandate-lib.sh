@@ -455,6 +455,61 @@ mandate_load_config() {
   printf '%s\n' "$config"
 }
 
+# Resolve a roster repository to a primary local checkout. All callers share
+# this matcher so sweep diagnostics, dispatch preflight, and the implementer
+# cannot disagree about what is usable. A linked worktree is evidence that the
+# remote matches, but it is not a safe source checkout: its branch and commits
+# belong to another worktree owner.
+mandate_find_source_repository() {
+  local repository="$1"
+  local config="${2:-}"
+  local root marker candidate remote normalized
+  local -a matching_candidates=()
+  local -a primary_candidates=()
+  local -a linked_candidates=()
+
+  if [ -z "$config" ]; then
+    config="$(mandate_load_config)" || return
+  fi
+
+  while IFS= read -r root; do
+    [ -d "$root" ] || continue
+    while IFS= read -r marker; do
+      candidate="${marker%/.git}"
+      remote="$(git -C "$candidate" remote get-url origin 2>/dev/null)" || continue
+      normalized="${remote%.git}"
+      normalized="${normalized#https://github.com/}"
+      normalized="${normalized#git@github.com:}"
+      if [ "$normalized" = "$repository" ]; then
+        matching_candidates+=("$candidate")
+      fi
+    done < <(find "$root" -name .git -print -prune 2>/dev/null)
+  done < <(jq -r '.search_roots[]' <<<"$config")
+
+  if [ "${#matching_candidates[@]}" -gt 0 ]; then
+    # Sort before classification so overlapping roots and filesystem traversal
+    # order cannot change which primary checkout wins.
+    while IFS= read -r candidate; do
+      if [ -d "$candidate/.git" ]; then
+        primary_candidates+=("$candidate")
+      elif [ -f "$candidate/.git" ]; then
+        linked_candidates+=("$candidate")
+      fi
+    done < <(printf '%s\n' "${matching_candidates[@]}" | LC_ALL=C sort -u)
+  fi
+
+  if [ "${#primary_candidates[@]}" -gt 0 ]; then
+    printf '%s\n' "${primary_candidates[0]}"
+    return 0
+  fi
+  if [ "${#linked_candidates[@]}" -gt 0 ]; then
+    printf 'source-repository-linked-worktree-only path=%s\n' \
+      "${linked_candidates[0]}"
+    return 10
+  fi
+  return 1
+}
+
 mandate_gate_is_configured() {
   [ -f "$MANDATE_GATE_USER_CONFIG" ] || [ -f "$MANDATE_GATE_REPO_CONFIG" ]
 }
