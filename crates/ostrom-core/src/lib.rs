@@ -1,3 +1,7 @@
+// Keep the store port substrate-neutral: a path in the port would mean a
+// database-backed implementation cannot satisfy the trait honestly.
+#![deny(clippy::disallowed_types)]
+
 //! Pure Ostrom domain types and the public store port.
 //!
 //! This crate deliberately has no filesystem, environment, or network API.

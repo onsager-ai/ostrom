@@ -117,22 +117,3 @@ pub trait SweepStore: Send {
 
     async fn passes(&self) -> Result<Vec<SweepPass>, StoreFault>;
 }
-
-#[cfg(test)]
-mod architecture_tests {
-    #[test]
-    fn public_store_port_has_no_filesystem_or_io_types() {
-        let source = include_str!("store.rs");
-        let forbidden_types = [
-            ["std", "path", "Path"].join("::"),
-            ["std", "path", "PathBuf"].join("::"),
-            ["std", "io", "Error"].join("::"),
-        ];
-        for forbidden in forbidden_types {
-            assert!(
-                !source.contains(&forbidden),
-                "store trait invariant violated: public port contains {forbidden}"
-            );
-        }
-    }
-}
