@@ -2150,6 +2150,15 @@ jq -cn \
           end
         else .
         end;
+    def carry_principal_fields($generated; $existing):
+      reduce [
+        "state"
+      ][] as $field ($generated;
+        if (($existing // {}) | has($field))
+        then .[$field] = $existing[$field]
+        else .
+        end
+      );
     (
       $existing
       | map(. as $row
@@ -2163,7 +2172,9 @@ jq -cn \
       )
     ) as $still_relevant
     | reduce $generated[] as $row ($still_relevant;
-        map(select(.id != $row.id)) + [$row]
+        (first($existing[]? | select(.id == $row.id)) // null) as $existing_row
+        | map(select(.id != $row.id))
+          + [carry_principal_fields($row; $existing_row)]
       )
     | map(enrich)
     | sort_by(.opened, .id)
