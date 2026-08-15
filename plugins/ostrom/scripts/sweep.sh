@@ -191,6 +191,30 @@ extract_closed_issue_ids() {
 sweep_org() {
   local org="$1"
   local semantic_enabled="${MANDATE_SEMANTIC_ENABLED:-0}"
+  local merge_lookback_seconds merge_cutoff
+
+  # Keep a minimum 30-day merge window, and extend it to seven days beyond
+  # both the configured sweep cadence and stuck horizon. The extra week makes
+  # the window comfortably wider than either clock even after missed sweeps;
+  # state.json retains already observed merges after they age out of it.
+  merge_lookback_seconds="$(
+    jq -nr --slurpfile config "$work/config.json" '
+      [
+        30 * 86400,
+        ($config[0].stuck_after_days + 7) * 86400,
+        ($config[0].cadence_hours + (7 * 24)) * 3600
+      ]
+      | max
+    '
+  )"
+  merge_cutoff="$(
+    jq -nr \
+      --arg sweep_started "$sweep_started" \
+      --argjson lookback "$merge_lookback_seconds" '
+        (($sweep_started | fromdateiso8601) - $lookback)
+        | strftime("%Y-%m-%d")
+      '
+  )"
 
   while IFS= read -r project; do
     printf '%s\n' "$project" >"$work/project.json"
@@ -227,62 +251,52 @@ sweep_org() {
       jq -r '[.[] | (.updatedAt // .updated_at // empty)] | max // ""' \
         "$work/issues.json"
     )"
-    # Pull requests intentionally stay on one complete listing. Check and file
-    # changes do not reliably move updatedAt, so putting open PRs behind the
-    # issues change-feed cursor would leave stale CI and path classifications.
-    # The same response also carries merged PRs for the gate-invariant join
-    # below. Size gh's paginated listing from GitHub's live total plus one
-    # sentinel row: lifetime history can grow without hitting a fixed cap,
-    # while reaching the sentinel still fails closed if the count changed or
-    # the listing was truncated during acquisition.
-    repo_owner="${repo%%/*}"
-    repo_name="${repo#*/}"
-    if ! pr_total_count="$(
-      gh api graphql \
-        -f query='query PullRequestCount($owner: String!, $name: String!) {
-          repository(owner: $owner, name: $name) {
-            pullRequests { totalCount }
-          }
-        }' \
-        -f owner="$repo_owner" \
-        -f name="$repo_name" \
-        --jq '.data.repository.pullRequests.totalCount' \
-        2>"$gh_error"
-    )"; then
-      detail="$(tr '\n' ' ' <"$gh_error")"
-      echo "mandate sweep: failed to query the PR count for $repo${detail:+: $detail}" >&2
-      exit 5
-    fi
-    case "$pr_total_count" in
-      '' | *[!0-9]*)
-        echo "mandate sweep: PR count for $repo was not a nonnegative integer" >&2
-        exit 5
-        ;;
-    esac
-    pr_query_limit=$((pr_total_count + 1))
-    if ! gh pr list --repo "$repo" --state all --limit "$pr_query_limit" \
+    # Open PRs intentionally stay on one complete listing. Check and file
+    # changes do not reliably move updatedAt, so putting them behind the issues
+    # change-feed cursor would leave stale CI and path classifications. Merged
+    # PRs use the recency window computed above; the gate-invariant join below
+    # seeds itself from state.json, so already observed merges remain complete.
+    if ! gh pr list --repo "$repo" --state open --limit "$query_limit" \
       --json number,title,body,labels,createdAt,updatedAt,url,isDraft,reviewDecision,statusCheckRollup,closingIssuesReferences,files,state,mergedAt,headRefOid,mergeable \
-      >"$work/all-prs.json" 2>"$gh_error"; then
+      >"$work/prs.json" 2>"$gh_error"; then
       detail="$(tr '\n' ' ' <"$gh_error")"
-      echo "mandate sweep: failed to query PRs, CI, and merged heads for $repo${detail:+: $detail}" >&2
+      echo "mandate sweep: failed to query open PRs, CI, and files for $repo${detail:+: $detail}" >&2
       exit 5
     fi
-    if ! pr_result_count="$(jq -er 'if type == "array" then length else error("not an array") end' "$work/all-prs.json" 2>/dev/null)"; then
-      echo "mandate sweep: PR query for $repo returned a non-array body" >&2
+    if ! pr_result_count="$(jq -er 'if type == "array" then length else error("not an array") end' "$work/prs.json" 2>/dev/null)"; then
+      echo "mandate sweep: open PR query for $repo returned a non-array body" >&2
       exit 5
     fi
-    if [ "$pr_result_count" -ge "$pr_query_limit" ]; then
-      echo "mandate sweep: PR query for $repo reached query_limit $pr_query_limit; refusing a truncated sweep" >&2
+    if [ "$pr_result_count" -ge "$query_limit" ]; then
+      echo "mandate sweep: open PR query for $repo reached query_limit $query_limit; refusing a truncated sweep" >&2
       exit 6
     fi
     jq -c '[.[] | select(
       .state == "OPEN"
       or ((has("state") | not) and (.mergedAt // null) == null)
-    )]' "$work/all-prs.json" >"$work/prs.json"
+    )]' "$work/prs.json" >"$work/open-prs.json"
+    mv "$work/open-prs.json" "$work/prs.json"
+    if ! gh pr list --repo "$repo" --state merged \
+      --search "merged:>=$merge_cutoff" --limit "$query_limit" \
+      --json number,title,createdAt,mergedAt,headRefOid \
+      >"$work/merged-prs.json" 2>"$gh_error"; then
+      detail="$(tr '\n' ' ' <"$gh_error")"
+      echo "mandate sweep: failed to query recent merged PR heads for $repo${detail:+: $detail}" >&2
+      exit 5
+    fi
+    if ! merged_pr_result_count="$(jq -er 'if type == "array" then length else error("not an array") end' "$work/merged-prs.json" 2>/dev/null)"; then
+      echo "mandate sweep: merged PR query for $repo returned a non-array body" >&2
+      exit 5
+    fi
+    if [ "$merged_pr_result_count" -ge "$query_limit" ]; then
+      echo "mandate sweep: merged PR query for $repo reached query_limit $query_limit within the recency window; refusing a truncated sweep" >&2
+      exit 6
+    fi
     jq -c '[.[] | select(
       .state == "MERGED"
       or ((.mergedAt // "") | type == "string" and length > 0)
-    )]' "$work/all-prs.json" >"$work/merged-prs.json"
+    )]' "$work/merged-prs.json" >"$work/recent-merged-prs.json"
+    mv "$work/recent-merged-prs.json" "$work/merged-prs.json"
     item_cap='null'
 
     # #78/#77 both need the default branch's own history — one lookup here,
@@ -1328,10 +1342,11 @@ sweep_org() {
     fi
 
     # #147: a merge with no timely passing verdict is a fault observed after
-    # the fact. The all-state PR response above, gate.jsonl, and
-    # exceptions.jsonl are already in hand; this is deliberately only a local
-    # join. Faults use ordinary decision rows, so they can be explained,
-    # deferred, or otherwise handled without changing merge behaviour.
+    # the fact. The recent merged-PR response above, retained merge state,
+    # gate.jsonl, and exceptions.jsonl are already in hand; this is deliberately
+    # only a local join. Faults use ordinary decision rows, so they can be
+    # explained, deferred, or otherwise handled without changing merge
+    # behaviour.
     jq -cn \
       --arg repo "$repo" \
       --arg sweep_started "$sweep_started" \

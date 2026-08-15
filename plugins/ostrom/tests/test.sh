@@ -4982,11 +4982,25 @@ if [ "$1 $2" = "pr list" ]; then
   [ "${FAKE_GH_PR_FAIL:-0}" != "1" ] || exit 1
   case "$repo" in
     example-org/pr-history)
-      pr_history_count=254
-      if [ "${FAKE_GH_PR_SENTINEL:-0}" = "1" ]; then
-        pr_history_count=255
-      fi
-      jq -cn --argjson count "$pr_history_count" '
+      if [ "$issue_state" = "open" ] && [ "${FAKE_GH_OPEN_PR_CAP:-0}" = "1" ]; then
+        jq -cn '
+          [range(1; 201) as $number | {
+            number: $number,
+            title: ("Synthetic open PR " + ($number | tostring)),
+            state: "OPEN",
+            mergedAt: null
+          }]
+        '
+      elif [ "$issue_state" = "open" ]; then
+        cat <<'JSON'
+[{"number":1,"title":"fix: keep the active pull request classified","body":"","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/pull/1","isDraft":false,"reviewDecision":"","statusCheckRollup":[{"conclusion":"SUCCESS","status":"COMPLETED"}],"closingIssuesReferences":[],"files":[{"path":"src/history.sh"}],"state":"OPEN","mergedAt":null,"headRefOid":"1111111111111111111111111111111111111111","mergeable":"MERGEABLE"}]
+JSON
+      elif [ "$issue_state" = "merged" ]; then
+        cat <<'JSON'
+[{"number":2,"title":"fix: retain the merged gate population","createdAt":"2026-07-28T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","state":"MERGED","mergedAt":"2026-07-30T12:00:00Z","headRefOid":"2222222222222222222222222222222222222222"}]
+JSON
+      else
+        jq -cn '
         [range(1; $count + 1) as $number
           | if $number == 1 then {
               number: $number,
@@ -5022,7 +5036,8 @@ if [ "$1 $2" = "pr list" ]; then
             }
             end
         ]
-      '
+        ' --argjson count 254
+      fi
       ;;
     example-org/example-repo)
       pr8_title="fix: routine maintenance"
@@ -5053,9 +5068,13 @@ JSON
 JSON
       ;;
     example-org/merge-invariant-repo)
-      cat <<'JSON'
+      if [ "$issue_state" = "merged" ] && [ "${FAKE_GH_MERGES_AGED_OUT:-0}" = "1" ]; then
+        echo '[]'
+      else
+        cat <<'JSON'
 [{"number":301,"title":"Synthetic merge without a verdict","state":"MERGED","createdAt":"2026-07-01T00:00:00Z","mergedAt":"2026-07-20T12:00:00Z","headRefOid":"1111111111111111111111111111111111111111"},{"number":302,"title":"Synthetic merge against a failing gate","state":"MERGED","createdAt":"2026-07-02T00:00:00Z","mergedAt":"2026-07-21T12:00:00Z","headRefOid":"2222222222222222222222222222222222222222"},{"number":303,"title":"Synthetic merge against an inconclusive gate","state":"MERGED","createdAt":"2026-07-03T00:00:00Z","mergedAt":"2026-07-22T12:00:00Z","headRefOid":"3333333333333333333333333333333333333333"},{"number":304,"title":"Synthetic merge after a passing gate","state":"MERGED","createdAt":"2026-07-04T00:00:00Z","mergedAt":"2026-07-23T12:00:00Z","headRefOid":"4444444444444444444444444444444444444444"},{"number":305,"title":"Synthetic merge before a late pass","state":"MERGED","createdAt":"2026-07-05T00:00:00Z","mergedAt":"2026-07-24T12:00:00Z","headRefOid":"5555555555555555555555555555555555555555"},{"number":306,"title":"Synthetic excused manual merge","state":"MERGED","createdAt":"2026-07-06T00:00:00Z","mergedAt":"2026-07-25T12:00:00Z","headRefOid":"6666666666666666666666666666666666666666"}]
 JSON
+      fi
       ;;
     *) echo '[]' ;;
   esac
@@ -6137,7 +6156,9 @@ grep -q $'example-org/another-repo\tissue list' "$fixture/gh-calls"
 grep -q $'example-org/another-repo\tpr list' "$fixture/gh-calls"
 grep -q $'example-org/another-repo\tissue list .*--limit 200' \
   "$fixture/gh-calls"
-grep -q $'example-org/another-repo\tpr list .*--limit 1' \
+grep -q $'example-org/another-repo\tpr list .*--state open --limit 200' \
+  "$fixture/gh-calls"
+grep -q $'example-org/another-repo\tpr list .*--state merged --search merged:>=2026-07-02 --limit 200' \
   "$fixture/gh-calls"
 
 # Baseline time, not an old upstream update, starts the stuck clock.
@@ -6666,7 +6687,7 @@ JSONL
   chmod 644 "$unreadable_gate_log"
 fi
 
-# #147: the sweep backfills merged PRs from its existing PR listing and joins
+# #147: the sweep fetches recent merged PRs separately and joins
 # them to gate.jsonl by the head SHA that landed. These synthetic merges cover
 # every invariant outcome: no verdict at that SHA (despite a verdict for the
 # same PR at another SHA), fail, inconclusive, timely pass, late pass, and an
@@ -6761,17 +6782,15 @@ jq -e '
   and (.repos["example-org/no-merges-repo"].merge_gate_faults | length) == 0
 ' "$merge_invariant_state" >/dev/null
 
-# The backfill reused the one PR call each repository already gets. There is
-# no separate merged-PR API call and, because this is detective, the sweep
-# still exits successfully after finding the four faults.
-[ "$(grep -c $'example-org/merge-invariant-repo\tpr list ' "$merge_invariant_calls")" -eq 1 ]
-[ "$(grep -c $'example-org/no-merges-repo\tpr list ' "$merge_invariant_calls")" -eq 1 ]
-grep -Fq $'example-org/merge-invariant-repo\tpr list --repo example-org/merge-invariant-repo --state all --limit 7' \
+# Each repository gets one complete-open query and one recency-bounded merged
+# query. Because the merge check is detective, the sweep still exits
+# successfully after finding the four faults.
+[ "$(grep -c $'example-org/merge-invariant-repo\tpr list ' "$merge_invariant_calls")" -eq 2 ]
+[ "$(grep -c $'example-org/no-merges-repo\tpr list ' "$merge_invariant_calls")" -eq 2 ]
+grep -Fq $'example-org/merge-invariant-repo\tpr list --repo example-org/merge-invariant-repo --state open --limit 200' \
   "$merge_invariant_calls"
-if grep -q -- '--state merged' "$merge_invariant_calls"; then
-  echo "merge invariant sweep added a separate merged-PR API call" >&2
-  exit 1
-fi
+grep -Fq $'example-org/merge-invariant-repo\tpr list --repo example-org/merge-invariant-repo --state merged --search merged:>=2026-07-02 --limit 200' \
+  "$merge_invariant_calls"
 
 merge_invariant_digest="$(
   cd "$merge_invariant/repo"
@@ -6791,6 +6810,7 @@ cp "$merge_invariant_queue" "$merge_invariant/queue.before"
 merge_invariant_repeat="$(
   cd "$merge_invariant/repo"
   PATH="$fixture/bin:$PATH" \
+    FAKE_GH_MERGES_AGED_OUT=1 \
     CLAUDE_CONFIG_DIR="$merge_invariant/config" \
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
     bash "$PLUGIN_ROOT/scripts/sweep.sh"
@@ -7339,10 +7359,9 @@ jq -s -e '
 ' "$semantic_queue" >/dev/null
 [ "$(wc -l <"$semantic_calls")" -eq 3 ]
 
-# #200: lifetime PR history sizes gh's internal pagination dynamically rather
-# than tripping the issue/feed constant. The one all-state result still feeds
-# both consumers: the open row retains checks and files, and the merged row is
-# retained by the gate-invariant join.
+# #202: lifetime PR history never enters either bounded query. The complete
+# open result retains checks and files, while the recent merged result feeds
+# the gate-invariant join.
 pr_history="$fixture/pr-history"
 mkdir -p "$pr_history/config/ostrom" "$pr_history/repo"
 write_gatekeeper_secrets "$pr_history/config"
@@ -7367,8 +7386,14 @@ pr_history_calls="$pr_history/gh-calls"
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
     bash "$PLUGIN_ROOT/scripts/sweep.sh" >/dev/null
 )
-grep -Fq $'example-org/pr-history\tpr list --repo example-org/pr-history --state all --limit 255' \
+grep -Fq $'example-org/pr-history\tpr list --repo example-org/pr-history --state open --limit 200' \
   "$pr_history_calls"
+grep -Fq $'example-org/pr-history\tpr list --repo example-org/pr-history --state merged --search merged:>=2026-07-02 --limit 200' \
+  "$pr_history_calls"
+if grep -q -- '--state all' "$pr_history_calls"; then
+  echo "PR history sweep queried lifetime pull-request history" >&2
+  exit 1
+fi
 jq -e '
   .repos["example-org/pr-history"] as $repo
   | $repo.records["example-org/pr-history#1"] as $open
@@ -7386,9 +7411,8 @@ jq -e '
     == "merge gate fault: no verdict for merged head 2222222222222222222222222222222222222222"
 ' "$pr_history/config/ostrom/queue.jsonl" >/dev/null
 
-# The total-count sentinel remains a loud fail-closed guard. Simulate a PR
-# appearing after GitHub reported 254: a 255-row response reaches the dynamic
-# limit and no partial queue or state is installed.
+# The complete-open query retains a loud fail-closed guard. Simulate 200 open
+# PRs reaching its fixed activity bound; no partial queue or state is installed.
 pr_history_capped="$fixture/pr-history-capped"
 mkdir -p "$pr_history_capped/config/ostrom" "$pr_history_capped/repo"
 write_gatekeeper_secrets "$pr_history_capped/config"
@@ -7398,7 +7422,7 @@ set +e
 (
   cd "$pr_history_capped/repo"
   PATH="$fixture/bin:$PATH" \
-    FAKE_GH_PR_SENTINEL=1 \
+    FAKE_GH_OPEN_PR_CAP=1 \
     CLAUDE_CONFIG_DIR="$pr_history_capped/config" \
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
     bash "$PLUGIN_ROOT/scripts/sweep.sh" >/dev/null \
@@ -7408,7 +7432,7 @@ pr_history_capped_status=$?
 set -e
 [ "$pr_history_capped_status" -eq 6 ]
 grep -q \
-  '^mandate sweep: PR query for example-org/pr-history reached query_limit 255; refusing a truncated sweep$' \
+  '^mandate sweep: open PR query for example-org/pr-history reached query_limit 200; refusing a truncated sweep$' \
   "$pr_history_capped/error"
 [ ! -e "$pr_history_capped/config/ostrom/state.json" ]
 [ ! -e "$pr_history_capped/config/ostrom/queue.jsonl" ]
