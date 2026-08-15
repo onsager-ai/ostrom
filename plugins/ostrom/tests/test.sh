@@ -4981,6 +4981,49 @@ fi
 if [ "$1 $2" = "pr list" ]; then
   [ "${FAKE_GH_PR_FAIL:-0}" != "1" ] || exit 1
   case "$repo" in
+    example-org/pr-history)
+      pr_history_count=254
+      if [ "${FAKE_GH_PR_SENTINEL:-0}" = "1" ]; then
+        pr_history_count=255
+      fi
+      jq -cn --argjson count "$pr_history_count" '
+        [range(1; $count + 1) as $number
+          | if $number == 1 then {
+              number: $number,
+              title: "fix: keep the active pull request classified",
+              body: "",
+              labels: [],
+              createdAt: "2026-07-29T00:00:00Z",
+              updatedAt: "2026-07-30T00:00:00Z",
+              url: "https://example.invalid/pull/1",
+              isDraft: false,
+              reviewDecision: "",
+              statusCheckRollup: [{conclusion: "SUCCESS", status: "COMPLETED"}],
+              closingIssuesReferences: [],
+              files: [{path: "src/history.sh"}],
+              state: "OPEN",
+              mergedAt: null,
+              headRefOid: "1111111111111111111111111111111111111111",
+              mergeable: "MERGEABLE"
+            }
+            elif $number == 2 then {
+              number: $number,
+              title: "fix: retain the merged gate population",
+              createdAt: "2026-07-28T00:00:00Z",
+              updatedAt: "2026-07-30T00:00:00Z",
+              state: "MERGED",
+              mergedAt: "2026-07-30T12:00:00Z",
+              headRefOid: "2222222222222222222222222222222222222222"
+            }
+            else {
+              number: $number,
+              state: "CLOSED",
+              mergedAt: null
+            }
+            end
+        ]
+      '
+      ;;
     example-org/example-repo)
       pr8_title="fix: routine maintenance"
       pr8_mergeable="MERGEABLE"
@@ -5059,6 +5102,9 @@ if [ "$1" = "api" ]; then
   method=""
   has_field=0
   if_none_match=""
+  graphql_owner=""
+  graphql_name=""
+  graphql_pr_count_query=0
   while [ "$#" -gt 0 ]; do
     case "$1" in
       -X | --method)
@@ -5066,7 +5112,16 @@ if [ "$1" = "api" ]; then
         ;;
       -f | --field | -F | --raw-field)
         has_field=1
-        if [ "$#" -ge 2 ]; then shift 2; else shift; fi
+        if [ "$#" -ge 2 ]; then
+          case "$2" in
+            owner=*) graphql_owner="${2#owner=}" ;;
+            name=*) graphql_name="${2#name=}" ;;
+            query=*PullRequestCount*totalCount*) graphql_pr_count_query=1 ;;
+          esac
+          shift 2
+        else
+          shift
+        fi
         ;;
       -H | --header)
         if [ "$#" -ge 2 ]; then
@@ -5090,6 +5145,16 @@ if [ "$1" = "api" ]; then
         ;;
     esac
   done
+  if [ "$endpoint" = "graphql" ] && [ "$graphql_pr_count_query" = "1" ]; then
+    case "$graphql_owner/$graphql_name" in
+      example-org/example-repo) echo 4 ;;
+      example-org/hub-repo) echo 3 ;;
+      example-org/merge-invariant-repo) echo 6 ;;
+      example-org/pr-history) echo 254 ;;
+      *) echo 0 ;;
+    esac
+    exit 0
+  fi
   if [ -z "$method" ] && [ "$has_field" = "1" ]; then
     echo '{"message":"Not Found","documentation_url":"https://docs.github.com/rest"}' >&2
     exit 1
@@ -6072,7 +6137,7 @@ grep -q $'example-org/another-repo\tissue list' "$fixture/gh-calls"
 grep -q $'example-org/another-repo\tpr list' "$fixture/gh-calls"
 grep -q $'example-org/another-repo\tissue list .*--limit 200' \
   "$fixture/gh-calls"
-grep -q $'example-org/another-repo\tpr list .*--limit 200' \
+grep -q $'example-org/another-repo\tpr list .*--limit 1' \
   "$fixture/gh-calls"
 
 # Baseline time, not an old upstream update, starts the stuck clock.
@@ -6701,7 +6766,7 @@ jq -e '
 # still exits successfully after finding the four faults.
 [ "$(grep -c $'example-org/merge-invariant-repo\tpr list ' "$merge_invariant_calls")" -eq 1 ]
 [ "$(grep -c $'example-org/no-merges-repo\tpr list ' "$merge_invariant_calls")" -eq 1 ]
-grep -Fq $'example-org/merge-invariant-repo\tpr list --repo example-org/merge-invariant-repo --state all --limit 200' \
+grep -Fq $'example-org/merge-invariant-repo\tpr list --repo example-org/merge-invariant-repo --state all --limit 7' \
   "$merge_invariant_calls"
 if grep -q -- '--state merged' "$merge_invariant_calls"; then
   echo "merge invariant sweep added a separate merged-PR API call" >&2
@@ -7274,8 +7339,82 @@ jq -s -e '
 ' "$semantic_queue" >/dev/null
 [ "$(wc -l <"$semantic_calls")" -eq 3 ]
 
-# Hitting either GitHub query limit is a loud fault, not a partial portfolio
-# that can be mistaken for authoritative state.
+# #200: lifetime PR history sizes gh's internal pagination dynamically rather
+# than tripping the issue/feed constant. The one all-state result still feeds
+# both consumers: the open row retains checks and files, and the merged row is
+# retained by the gate-invariant join.
+pr_history="$fixture/pr-history"
+mkdir -p "$pr_history/config/ostrom" "$pr_history/repo"
+write_gatekeeper_secrets "$pr_history/config"
+cat >"$pr_history/config/ostrom/mandates.yaml" <<'YAML'
+bounce_all: []
+projects:
+  - repo: example-org/pr-history
+    delegated:
+      - path:src/**
+    excluded: []
+    reserved: []
+    default: excluded
+    paused: false
+    bounce: []
+YAML
+pr_history_calls="$pr_history/gh-calls"
+(
+  cd "$pr_history/repo"
+  PATH="$fixture/bin:$PATH" \
+    FAKE_GH_CALL_LOG="$pr_history_calls" \
+    CLAUDE_CONFIG_DIR="$pr_history/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/sweep.sh" >/dev/null
+)
+grep -Fq $'example-org/pr-history\tpr list --repo example-org/pr-history --state all --limit 255' \
+  "$pr_history_calls"
+jq -e '
+  .repos["example-org/pr-history"] as $repo
+  | $repo.records["example-org/pr-history#1"] as $open
+  | $open.type == "pr"
+  and $open.ci == "passing"
+  and $open.files == ["src/history.sh"]
+  and $repo.items["example-org/pr-history#1"].classification == "delegated"
+  and ($repo.merge_gate_merges | length) == 1
+  and $repo.merge_gate_merges["example-org/pr-history#2"].head_sha
+    == "2222222222222222222222222222222222222222"
+' "$pr_history/config/ostrom/state.json" >/dev/null
+jq -e '
+  select(.id == "example-org/pr-history#2")
+  | .mandate.reason
+    == "merge gate fault: no verdict for merged head 2222222222222222222222222222222222222222"
+' "$pr_history/config/ostrom/queue.jsonl" >/dev/null
+
+# The total-count sentinel remains a loud fail-closed guard. Simulate a PR
+# appearing after GitHub reported 254: a 255-row response reaches the dynamic
+# limit and no partial queue or state is installed.
+pr_history_capped="$fixture/pr-history-capped"
+mkdir -p "$pr_history_capped/config/ostrom" "$pr_history_capped/repo"
+write_gatekeeper_secrets "$pr_history_capped/config"
+cp "$pr_history/config/ostrom/mandates.yaml" \
+  "$pr_history_capped/config/ostrom/mandates.yaml"
+set +e
+(
+  cd "$pr_history_capped/repo"
+  PATH="$fixture/bin:$PATH" \
+    FAKE_GH_PR_SENTINEL=1 \
+    CLAUDE_CONFIG_DIR="$pr_history_capped/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/sweep.sh" >/dev/null \
+      2>"$pr_history_capped/error"
+)
+pr_history_capped_status=$?
+set -e
+[ "$pr_history_capped_status" -eq 6 ]
+grep -q \
+  '^mandate sweep: PR query for example-org/pr-history reached query_limit 255; refusing a truncated sweep$' \
+  "$pr_history_capped/error"
+[ ! -e "$pr_history_capped/config/ostrom/state.json" ]
+[ ! -e "$pr_history_capped/config/ostrom/queue.jsonl" ]
+
+# Hitting the issues change-feed query limit is likewise a loud fault, not a
+# partial portfolio that can be mistaken for authoritative state.
 capped="$fixture/capped"
 mkdir -p "$capped/config/ostrom" "$capped/repo"
 write_gatekeeper_secrets "$capped/config"

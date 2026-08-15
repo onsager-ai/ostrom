@@ -231,17 +231,48 @@ sweep_org() {
     # changes do not reliably move updatedAt, so putting open PRs behind the
     # issues change-feed cursor would leave stale CI and path classifications.
     # The same response also carries merged PRs for the gate-invariant join
-    # below. This changes no call count: one all-state listing replaces the
-    # former open-only listing, then the two populations are split locally.
-    if ! gh pr list --repo "$repo" --state all --limit "$query_limit" \
+    # below. Size gh's paginated listing from GitHub's live total plus one
+    # sentinel row: lifetime history can grow without hitting a fixed cap,
+    # while reaching the sentinel still fails closed if the count changed or
+    # the listing was truncated during acquisition.
+    repo_owner="${repo%%/*}"
+    repo_name="${repo#*/}"
+    if ! pr_total_count="$(
+      gh api graphql \
+        -f query='query PullRequestCount($owner: String!, $name: String!) {
+          repository(owner: $owner, name: $name) {
+            pullRequests { totalCount }
+          }
+        }' \
+        -f owner="$repo_owner" \
+        -f name="$repo_name" \
+        --jq '.data.repository.pullRequests.totalCount' \
+        2>"$gh_error"
+    )"; then
+      detail="$(tr '\n' ' ' <"$gh_error")"
+      echo "mandate sweep: failed to query the PR count for $repo${detail:+: $detail}" >&2
+      exit 5
+    fi
+    case "$pr_total_count" in
+      '' | *[!0-9]*)
+        echo "mandate sweep: PR count for $repo was not a nonnegative integer" >&2
+        exit 5
+        ;;
+    esac
+    pr_query_limit=$((pr_total_count + 1))
+    if ! gh pr list --repo "$repo" --state all --limit "$pr_query_limit" \
       --json number,title,body,labels,createdAt,updatedAt,url,isDraft,reviewDecision,statusCheckRollup,closingIssuesReferences,files,state,mergedAt,headRefOid,mergeable \
       >"$work/all-prs.json" 2>"$gh_error"; then
       detail="$(tr '\n' ' ' <"$gh_error")"
       echo "mandate sweep: failed to query PRs, CI, and merged heads for $repo${detail:+: $detail}" >&2
       exit 5
     fi
-    if [ "$(jq 'length' "$work/all-prs.json")" -eq "$query_limit" ]; then
-      echo "mandate sweep: PR query for $repo reached query_limit $query_limit; refusing a truncated sweep" >&2
+    if ! pr_result_count="$(jq -er 'if type == "array" then length else error("not an array") end' "$work/all-prs.json" 2>/dev/null)"; then
+      echo "mandate sweep: PR query for $repo returned a non-array body" >&2
+      exit 5
+    fi
+    if [ "$pr_result_count" -ge "$pr_query_limit" ]; then
+      echo "mandate sweep: PR query for $repo reached query_limit $pr_query_limit; refusing a truncated sweep" >&2
       exit 6
     fi
     jq -c '[.[] | select(
