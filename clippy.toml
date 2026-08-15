@@ -1,0 +1,5 @@
+disallowed-types = [
+    "std::path::Path",
+    "std::path::PathBuf",
+    "std::io::Error",
+]

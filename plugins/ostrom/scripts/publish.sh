@@ -265,6 +265,12 @@ jq -S --slurpfile allow_file "$allowlist_file" '
         if $object | has($key) then .[$key] = $object[$key] else . end
       );
   keep("state")
+  | .unresolvable_repositories = (
+      if (.unresolvable_repositories | type) == "array"
+      then [.unresolvable_repositories[] | select(type == "string")]
+      else []
+      end
+    )
   | .dead_selectors = (
       if (.dead_selectors | type) == "array"
       then [.dead_selectors[] | select(type == "object") | keep("state.dead_selector")]

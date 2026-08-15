@@ -45,6 +45,9 @@ inside one plugin.
 - `plugins/ostrom/scripts/run-node.sh` — Node-resolution shim behind `/ostrom:doctor` (including non-interactive nvm/fnm/volta/asdf environments)
 - `plugins/ostrom/tools/` — TypeScript source, tests, and build configuration for the `/ostrom:doctor` prober
 - `plugins/ostrom/dist/doctor.js` — committed, zero-runtime-dependency `/ostrom:doctor` bundle
+- `crates/ostrom-core/` — pure Rust domain types and the async, substrate-neutral store port
+- `crates/ostrom-store/` — XDG paths plus legacy-compatible JSONL/file persistence
+- `crates/ostrom-cli/` — the additive phase-1 `ostrom` binary
 - `repo-pointer/settings.json` — snippet to merge into each target repo's `.claude/settings.json`
 - `bootstrap.sh` — one command to make a fresh environment ostrom-aware (user-level enroll + config provisioning)
 - `LICENSE` — MIT
@@ -57,6 +60,28 @@ the installed plugin cache. Changing a skill body requires changing the
 `version` field in that same plugin's `.claude-plugin/plugin.json`. CI enforces
 this requirement per plugin so a protocol change cannot remain hidden behind
 an unchanged cache key.
+### Rust CLI (phase 1)
+
+The Rust workspace is additive: systemd and the plugin still invoke the Bash
+scripts. The new reader resolves config with
+`ProjectDirs::from("ai", "onsager", "ostrom")` and state through the matching
+XDG state directory. Setting `OSTROM_HOME` explicitly makes both roots that
+directory, which is the hermetic test and parity surface.
+
+```bash
+cargo run -p ostrom-cli -- queue list --format=json
+OSTROM_HOME=/path/to/ostrom-state scripts/queue-parity.sh
+```
+
+`ostrom migrate` moves legacy files into the XDG roots after refusing any
+unexpired named lease. It rewrites in-tree private-key paths, preserves key
+mode `0600`, and leaves the old directory as a compatibility pointer so the
+Bash callers continue to work. Running it twice is a no-op. Stop unattended
+passes before an operator performs the migration even though the command also
+checks their lease files.
+
+`ostrom-core` is not published to crates.io. Out-of-tree consumers may pin a
+Git revision; registering the public crate name remains a principal decision.
 
 ## Install
 
@@ -117,6 +142,11 @@ Supported selectors are `label:`, `scope:`, `type:`, `path:`, `ref:`, and
 `title:`. `*` is the only wildcard (`path:**` spans directory depth), and a
 `title:` selector must include `*`. Pull requests inherit the labels and refs
 of their closing issues.
+
+Each project may set `max_implementers_per_repository` to a positive integer;
+omitting it defaults to 1. This per-repository limit prevents implementer
+branches from colliding. It is independent of `MANDATE_MAX_IMPLEMENTERS`, the
+global dispatch capacity limit for shared compute and budget.
 
 Classification precedence is reserved → shared/project bounce → excluded →
 delegated → `default`. The default is `unclassified`, which produces one

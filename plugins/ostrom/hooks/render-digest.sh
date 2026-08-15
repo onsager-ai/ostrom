@@ -211,6 +211,21 @@ render_section "MOVED SINCE $cursor" '["moved"]'
 render_section "STUCK" '["stuck"]'
 render_section "DRIFT" '["drift"]'
 
+unresolvable_repositories='[]'
+if [ -s "$MANDATE_STATE_FILE" ]; then
+  unresolvable_repositories="$(
+    jq -c '[
+      (.unresolvable_repositories // [])[]
+      | select(type == "string" and length > 0)
+    ] | unique' "$MANDATE_STATE_FILE" 2>/dev/null || echo '[]'
+  )"
+fi
+if [ "$(jq 'length' <<<"$unresolvable_repositories")" -gt 0 ]; then
+  echo "UNDISPATCHABLE REPOSITORIES"
+  jq -r '.[] + " — source repository not found under search_roots"' \
+    <<<"$unresolvable_repositories"
+fi
+
 state_rollups='[]'
 if [ -s "$MANDATE_STATE_FILE" ]; then
   state_rollups="$(
@@ -228,6 +243,7 @@ if [ -s "$MANDATE_STATE_FILE" ]; then
               end
             ),
             unclassified: (.value.unclassified // 0),
+            merge_gate_faults: (.value.merge_gate_fault_count // 0),
             item_cap: (.value.item_cap // null)
           }
       ]
@@ -247,15 +263,22 @@ jq -r '
   | select(.unclassified > 0)
   | .repo + ": " + (.unclassified | tostring) + " unclassified — /ostrom:desk triage"
 ' <<<"$state_rollups"
+jq -r '
+  .[]
+  | select(.merge_gate_faults > 0)
+  | .repo + ": " + (.merge_gate_faults | tostring)
+    + (if .merge_gate_faults == 1 then " merge gate fault" else " merge gate faults" end)
+    + " — /ostrom:desk triage"
+' <<<"$state_rollups"
 
 total_projects="$(jq '.projects | length' <<<"$config")"
 troubled_projects="$(
-  jq '
-    [
-      .[]
-      | select(.kind | IN("tripwire", "decision", "drift", "stuck"))
-      | .repo
-    ]
+  jq --argjson unresolvable "$unresolvable_repositories" '
+    ([
+       .[]
+       | select(.kind | IN("tripwire", "decision", "drift", "stuck"))
+       | .repo
+     ] + $unresolvable)
     | unique
     | length
   ' <<<"$active"

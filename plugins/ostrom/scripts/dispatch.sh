@@ -16,7 +16,11 @@ source "$SCRIPT_DIR/mandate-lib.sh"
 command -v jq >/dev/null 2>&1 || { echo "ostrom dispatch: jq is required" >&2; exit 1; }
 
 DEFAULT_DAILY_CAP_USD=50
+# MANDATE_MAX_IMPLEMENTERS is a global capacity cap for shared compute and
+# budget. MANDATE_MAX_IMPLEMENTERS_PER_REPOSITORY overrides the roster's
+# collision cap for tests; each project otherwise defaults to one implementer.
 DEFAULT_MAX_IMPLEMENTERS=2
+DEFAULT_MAX_IMPLEMENTERS_PER_REPOSITORY=1
 IMPLEMENTER_LEASE_TTL_SECONDS="${MANDATE_IMPLEMENTER_LEASE_TTL_SECONDS:-2592000}"
 TRACE_FILE="$MANDATE_DATA_DIR/sprint.jsonl"
 GH_AS_BIN="${MANDATE_GH_AS_BIN:-$SCRIPT_DIR/gh-as.sh}"
@@ -127,10 +131,45 @@ if [ -e "$worktree_root" ]; then
   fi
 fi
 
+# Refuse an order whose roster repository has no usable primary checkout
+# before any remote duplicate check, item lease, concurrency slot, or spend
+# reservation. The implementer repeats the same shared resolution after unit
+# start to close the race with an operator moving a checkout.
+dispatch_config="$(mandate_load_config)" || dispatch_config=""
+if [ -n "${MANDATE_IMPLEMENTER_SOURCE_REPO:-}" ]; then
+  if [ -d "$MANDATE_IMPLEMENTER_SOURCE_REPO" ]; then
+    source_repository="$MANDATE_IMPLEMENTER_SOURCE_REPO"
+    source_resolution_status=0
+  else
+    source_resolution_status=1
+  fi
+elif [ -n "$dispatch_config" ]; then
+  if source_repository="$(mandate_find_source_repository "$repository" "$dispatch_config")"; then
+    source_resolution_status=0
+  else
+    source_resolution_status=$?
+  fi
+else
+  source_resolution_status=1
+fi
+case "$source_resolution_status" in
+  0) ;;
+  10) source_failure_reason=source-repository-linked-worktree-only ;;
+  *) source_failure_reason=source-repository-not-found ;;
+esac
+if [ "$source_resolution_status" -ne 0 ]; then
+  append_dispatch_failure "$source_failure_reason" 0 "" "" "$repository" ||
+    echo "ostrom dispatch: could not record work-failed" >&2
+  echo "ostrom dispatch: $source_failure_reason: repository=$repository" >&2
+  exit 3
+fi
+
 # A pushed branch is durable work even when no pull request references the
-# item yet. Enumerate every remote branch through the builder credential and
-# reject matching work before resolving the backend, acquiring the item lease,
-# or calculating either concurrency or spend reservations.
+# item yet. A branch whose pull request was merged is landed work, though, and
+# squash merges do not put the branch's own commits into the default branch's
+# history. Enumerate remote state through the builder credential and reject
+# only work that has not landed before resolving the backend, acquiring the
+# item lease, or calculating either concurrency or spend reservations.
 remote_branch_pages="$({
   bash "$GH_AS_BIN" builder "$repository" \
     gh api --paginate --slurp "repos/$repository/branches?per_page=100"
@@ -187,11 +226,28 @@ if [ -n "$matching_remote_branch" ]; then
       esac
     fi
   fi
-  append_dispatch_failure branch-already-pushed 0 "" "$pushed_branch" \
-    "$repository" "$pushed_head_sha" "$ahead_of_default" ||
-      echo "ostrom dispatch: could not record work-failed" >&2
-  echo "ostrom dispatch: remote work already exists: repository=$repository branch=$pushed_branch head=$pushed_head_sha ahead=$ahead_of_default" >&2
-  exit 3
+  branch_pull_requests="$({
+    bash "$GH_AS_BIN" builder "$repository" \
+      gh pr list --repo "$repository" --head "$pushed_branch" --state all \
+        --json number,state,mergedAt
+  } 2>/dev/null)" || {
+    echo "ostrom dispatch: could not verify pull requests for branch $pushed_branch in $repository" >&2
+    exit 1
+  }
+  branch_is_landed=0
+  # A reused branch remains live work if it also has an open or closed,
+  # unmerged PR. Only an exclusively merged PR history proves it landed.
+  if jq -e 'length > 0 and all(.[]; .state == "MERGED")' \
+      >/dev/null 2>&1 <<<"$branch_pull_requests"; then
+    branch_is_landed=1
+  fi
+  if [ "$branch_is_landed" -eq 0 ]; then
+    append_dispatch_failure branch-already-pushed 0 "" "$pushed_branch" \
+      "$repository" "$pushed_head_sha" "$ahead_of_default" ||
+        echo "ostrom dispatch: could not record work-failed" >&2
+    echo "ostrom dispatch: remote work already exists: repository=$repository branch=$pushed_branch head=$pushed_head_sha ahead=$ahead_of_default" >&2
+    exit 3
+  fi
 fi
 
 codex_unavailable() {
@@ -331,9 +387,40 @@ case "$max_implementers" in
     exit 2
     ;;
 esac
+max_implementers_per_repository="${MANDATE_MAX_IMPLEMENTERS_PER_REPOSITORY:-}"
+if [ -z "$max_implementers_per_repository" ]; then
+  max_implementers_per_repository="$(
+    mandate_project_max_implementers_per_repository \
+      "$repository" "$dispatch_config" \
+      "$DEFAULT_MAX_IMPLEMENTERS_PER_REPOSITORY"
+  )" || {
+    echo "ostrom dispatch: could not resolve per-repository implementer limit for $repository" >&2
+    exit 2
+  }
+fi
+case "$max_implementers_per_repository" in
+  ''|*[!0-9]*|0)
+    echo "ostrom dispatch: MANDATE_MAX_IMPLEMENTERS_PER_REPOSITORY must be a positive integer" >&2
+    exit 2
+    ;;
+esac
 inflight_count="$(jq 'length' <<<"$inflight")"
+# This global limit protects shared capacity. It deliberately says nothing
+# about branch collision risk within any one repository.
 if [ "$inflight_count" -ge "$max_implementers" ]; then
   echo "ostrom dispatch: concurrency limit reached ($inflight_count/$max_implementers)" >&2
+  exit 3
+fi
+repository_inflight_count="$(jq --arg repository "$repository" '
+  [.[]
+    | select((.item_id | type) == "string")
+    | select((.item_id | sub("#.*$"; "")) == $repository)]
+  | length
+' <<<"$inflight")"
+# This per-repository limit protects branches from colliding. It is independent
+# of the shared capacity available to implementers in different repositories.
+if [ "$repository_inflight_count" -ge "$max_implementers_per_repository" ]; then
+  echo "ostrom dispatch: per-repository concurrency limit reached for $repository ($repository_inflight_count/$max_implementers_per_repository)" >&2
   exit 3
 fi
 
@@ -409,6 +496,7 @@ if ! "$SYSTEMD_RUN_BIN" --user \
   --setenv "CLAUDE_PLUGIN_ROOT=$MANDATE_PLUGIN_ROOT" \
   --setenv "MANDATE_DAILY_CAP_USD=$daily_cap_usd" \
   --setenv "MANDATE_MAX_IMPLEMENTERS=$max_implementers" \
+  --setenv "MANDATE_MAX_IMPLEMENTERS_PER_REPOSITORY=$max_implementers_per_repository" \
   --setenv "MANDATE_DISPATCH_BACKEND=$backend" \
   --setenv "CODEX_BIN=$resolved_codex_bin" \
   --setenv "PATH=$unit_path" \

@@ -30,10 +30,18 @@ fetch_issue_page() {
   local etag="$4"
   local response="$work/issues-response-$page"
   local body="$work/issues-page-$page.json"
-  local endpoint status detail
+  local endpoint issue_state status detail
   local -a headers=()
 
-  endpoint="repos/$repo/issues?state=open&sort=updated&direction=asc&per_page=100&page=$page"
+  issue_state="open"
+  if [ -n "$since" ]; then
+    # A closure is an updated event, but it disappears from the open-only
+    # representation. The cursor-bounded feed must therefore include closed
+    # items so reconciliation receives a positive tombstone rather than
+    # trying to infer terminal state from absence.
+    issue_state="all"
+  fi
+  endpoint="repos/$repo/issues?state=$issue_state&sort=updated&direction=asc&per_page=100&page=$page"
   if [ -n "$since" ]; then
     endpoint="$endpoint&since=$since"
   fi
@@ -118,6 +126,23 @@ fetch_issues() {
   fi
 }
 
+extract_closed_issue_ids() {
+  local repo="$1"
+  local source="$2"
+  local destination="$3"
+
+  jq -c \
+    --arg repo "$repo" '
+      [
+        .[]
+        | select((.pull_request // null) == null)
+        | select(((.state // "") | ascii_downcase) == "closed")
+        | select((.number | type) == "number")
+        | $repo + "#" + (.number | tostring)
+      ]
+    ' "$source" >"$destination"
+}
+
 # #106/#109: sweep_org() below is the entire per-repository body -- every
 # `gh` call the sweep makes. It runs once per distinct GitHub organisation
 # in the roster, each time inside its own gh-as.sh invocation, so every
@@ -165,6 +190,7 @@ fetch_issues() {
 # repository always has been.
 sweep_org() {
   local org="$1"
+  local semantic_enabled="${MANDATE_SEMANTIC_ENABLED:-0}"
 
   while IFS= read -r project; do
     printf '%s\n' "$project" >"$work/project.json"
@@ -175,29 +201,57 @@ sweep_org() {
     previous_cursor="$(jq -r '.cursor // ""' "$work/previous.json")"
     previous_etag="$(jq -r '.etag // ""' "$work/previous.json")"
 
+    printf '%s\n' '[]' >"$work/closed-issue-ids.json"
+    # A scheduled full pass still needs a cursor-bounded all-state read before
+    # its complete open listing. That small delta supplies positive closure
+    # tombstones without enumerating every historical closed issue, while the
+    # open listing still discovers items a previous delta might have missed.
+    if [ "$sweep_mode" = "full" ] && [ -n "$previous_cursor" ]; then
+      fetch_issues "$repo" "$previous_cursor" "" || exit $?
+      extract_closed_issue_ids \
+        "$repo" "$work/issues.json" "$work/closed-issue-ids.json"
+    fi
+
     issue_since=""
     if [ "$sweep_mode" = "incremental" ]; then
       issue_since="$previous_cursor"
     fi
     fetch_issues "$repo" "$issue_since" "$previous_etag" || exit $?
+    if [ "$sweep_mode" = "incremental" ]; then
+      extract_closed_issue_ids \
+        "$repo" "$work/issues.json" "$work/closed-issue-ids.json"
+    fi
+    jq -c '.[] | {id: ., resolution: "closed-issue"}' \
+      "$work/closed-issue-ids.json" >>"$work/closed-items.jsonl"
     issue_cursor_candidate="$(
       jq -r '[.[] | (.updatedAt // .updated_at // empty)] | max // ""' \
         "$work/issues.json"
     )"
-    # Pull requests intentionally stay on a complete open listing. Check and
-    # file changes do not reliably move updatedAt, so putting PRs behind the
+    # Pull requests intentionally stay on one complete listing. Check and file
+    # changes do not reliably move updatedAt, so putting open PRs behind the
     # issues change-feed cursor would leave stale CI and path classifications.
-    if ! gh pr list --repo "$repo" --state open --limit "$query_limit" \
-      --json number,title,body,labels,createdAt,updatedAt,url,isDraft,reviewDecision,statusCheckRollup,closingIssuesReferences,files \
-      >"$work/prs.json" 2>"$gh_error"; then
+    # The same response also carries merged PRs for the gate-invariant join
+    # below. This changes no call count: one all-state listing replaces the
+    # former open-only listing, then the two populations are split locally.
+    if ! gh pr list --repo "$repo" --state all --limit "$query_limit" \
+      --json number,title,body,labels,createdAt,updatedAt,url,isDraft,reviewDecision,statusCheckRollup,closingIssuesReferences,files,state,mergedAt,headRefOid,mergeable \
+      >"$work/all-prs.json" 2>"$gh_error"; then
       detail="$(tr '\n' ' ' <"$gh_error")"
-      echo "mandate sweep: failed to query open PRs and CI for $repo${detail:+: $detail}" >&2
+      echo "mandate sweep: failed to query PRs, CI, and merged heads for $repo${detail:+: $detail}" >&2
       exit 5
     fi
-    if [ "$(jq 'length' "$work/prs.json")" -eq "$query_limit" ]; then
-      echo "mandate sweep: open PR query for $repo reached query_limit $query_limit; refusing a truncated sweep" >&2
+    if [ "$(jq 'length' "$work/all-prs.json")" -eq "$query_limit" ]; then
+      echo "mandate sweep: PR query for $repo reached query_limit $query_limit; refusing a truncated sweep" >&2
       exit 6
     fi
+    jq -c '[.[] | select(
+      .state == "OPEN"
+      or ((has("state") | not) and (.mergedAt // null) == null)
+    )]' "$work/all-prs.json" >"$work/prs.json"
+    jq -c '[.[] | select(
+      .state == "MERGED"
+      or ((.mergedAt // "") | type == "string" and length > 0)
+    )]' "$work/all-prs.json" >"$work/merged-prs.json"
     item_cap='null'
 
     # #78/#77 both need the default branch's own history — one lookup here,
@@ -230,6 +284,7 @@ sweep_org() {
 
     jq -cn \
       --arg repo "$repo" \
+      --argjson semantic_enabled "$semantic_enabled" \
       --slurpfile issues "$work/issues.json" \
       --slurpfile prs "$work/prs.json" '
         def failure:
@@ -271,6 +326,7 @@ sweep_org() {
           . as $item
           | (if $type == "pr" then ($item | ci_state) else "none" end) as $ci
           | (if $type == "pr" then ($item | linked_issues) else [] end) as $linked
+          | (if $type == "pr" then ($item.mergeable // "") else "" end) as $mergeable
           | {
               id: ($repo + "#" + (.number | tostring)),
               repo: $repo,
@@ -303,21 +359,32 @@ sweep_org() {
               opened: .createdAt,
               updated: .updatedAt,
               ci: $ci,
-              ready: ($type == "pr" and (.isDraft | not) and $ci == "passing"),
+              ready: (
+                $type == "pr"
+                and (.isDraft | not)
+                and $ci == "passing"
+                and $mergeable != "CONFLICTING"
+              ),
               review: (.reviewDecision // "")
             }
+          | if $semantic_enabled
+            then .body = ($item.body // "")
+            else .
+            end
           | .fingerprint = ([
               .title,
               (.labels | sort | join(",")),
               (.refs | sort | map(tostring) | join(",")),
               (.files | sort | join(",")),
               .ci,
+              $mergeable,
               (.ready | tostring),
               .review
             ] | join("|"));
         [
           ($issues[0][]
             | select((.pull_request // null) == null)
+            | select(((.state // "open") | ascii_downcase) != "closed")
             | .createdAt = (.createdAt // .created_at)
             | .updatedAt = (.updatedAt // .updated_at)
             | .url = (.url // .html_url)
@@ -326,19 +393,49 @@ sweep_org() {
         ]
       ' >"$work/fresh-items.json"
 
-    if [ "$sweep_mode" = "full" ] && [ "$issue_http_status" != "304" ]; then
+    # A complete PR listing replaces PR records on every pass. When semantic
+    # derivation is enabled, retain its source-keyed advisory result until the
+    # cursor reports that item changed; otherwise an unchanged PR would lose
+    # its cached verdict simply because PR acquisition is intentionally full.
+    if [ "$semantic_enabled" -eq 1 ]; then
+      jq -cn \
+        --slurpfile fresh "$work/fresh-items.json" \
+        --slurpfile previous "$work/previous.json" '
+          ($previous[0].records // {}) as $records
+          | [
+              $fresh[0][]
+              | . as $item
+              | ($records[$item.id] // {}) as $old
+              | if ($old.semantic_derivation // null) != null
+                then . + {
+                  semantic_derivation: $old.semantic_derivation,
+                  semantic_content_hash: $old.semantic_content_hash
+                }
+                else .
+                end
+            ]
+        ' >"$work/next.json"
+      mv "$work/next.json" "$work/fresh-items.json"
+    fi
+
+    if [ -z "$previous_cursor" ] && [ "$issue_http_status" != "304" ]; then
       cp "$work/fresh-items.json" "$work/items.json"
     else
-      # The issues response is a delta, while the PR response is a complete
-      # open set. Retain untouched issues, replace every PR, then overlay all
-      # fresh records by id. The same merge is safe for a conditional full
-      # request that returned 304 because its complete open representation is
-      # unchanged. A later non-304 full reconciliation is what removes an
-      # issue that left the open set without appearing in `since` results.
+      # Retain issues absent from this response except for positively observed
+      # closed-item tombstones, replace every PR, then overlay all fresh open
+      # records by id. This is the delta merge on incremental passes; on full
+      # passes it also prevents an incomplete-but-successful open listing from
+      # turning absence into false closure evidence.
       jq -cn \
         --slurpfile previous "$work/previous.json" \
-        --slurpfile fresh "$work/fresh-items.json" '
-          ([($previous[0].records // {})[] | select(.type != "pr")]) as $issues
+        --slurpfile fresh "$work/fresh-items.json" \
+        --slurpfile closed "$work/closed-issue-ids.json" '
+          ([
+            ($previous[0].records // {})[]
+            | select(.type != "pr")
+            | . as $record
+            | select(($closed[0] | index($record.id)) == null)
+          ]) as $issues
           | reduce $fresh[0][] as $item ($issues;
               map(select(.id != $item.id)) + [$item]
             )
@@ -851,6 +948,463 @@ sweep_org() {
           }
       ' >"$work/analysis.json"
 
+    if [ "$semantic_enabled" -eq 1 ]; then
+      # Re-check persisted advisory authority against today's mechanical
+      # result before it can be emitted. Mechanical inputs such as a linked
+      # reserved ref or PR path can change independently of the model's text
+      # hash; a once-valid cached escalation must not then appear to clear the
+      # stronger current result. New/cache-hit model results receive the same
+      # guard in the TypeScript harness below.
+      jq -cn \
+        --slurpfile items "$work/items.json" \
+        --slurpfile analysis "$work/analysis.json" '
+          ($analysis[0].repo_state.items) as $mechanical
+          | [
+              $items[0][]
+              | . as $item
+              | ($item.semantic_derivation.authority // null) as $authority
+              | ($mechanical[$item.id].classification) as $classification
+              | if $authority == null then .
+                elif ($authority.classification | IN("delegated", "excluded") | not)
+                    and ($classification != "reserved" or $authority.classification == "reserved")
+                    and ($classification != "tripwire" or $authority.classification == "tripwire")
+                then .
+                else del(.semantic_content_hash, .semantic_derivation)
+                end
+            ]
+        ' >"$work/next.json"
+      mv "$work/next.json" "$work/items.json"
+
+      # Only records reported as changed by the incremental cursor are allowed
+      # to trigger comment reads. On an initial baseline every item is new;
+      # daily full reconciliation does not make unchanged items candidates.
+      jq -cn \
+        --slurpfile fresh "$work/fresh-items.json" \
+        --slurpfile previous "$work/previous.json" '
+          ($previous[0]) as $previous
+          | [
+              $fresh[0][]
+              | select(
+                  ($previous.records[.id] // null) == null
+                  or .updated > ($previous.cursor // "")
+                )
+            ]
+        ' >"$work/semantic-candidates.json"
+
+      : >"$work/semantic-comments.jsonl"
+      while IFS=$'\t' read -r semantic_id semantic_number; do
+        [ -n "$semantic_number" ] || continue
+        if ! gh api -X GET "repos/$repo/issues/$semantic_number/comments?per_page=100" \
+            >"$work/semantic-item-comments.json" 2>"$work/semantic-comments-error"; then
+          detail="$(tr '\n' ' ' <"$work/semantic-comments-error")"
+          echo "mandate sweep: failed to read comments for $semantic_id${detail:+: $detail}; semantic derivation skipped for this item" >&2
+          printf '%s\t%s\n' "$semantic_id" "$semantic_number" \
+            >>"$work/semantic-comment-failures.tsv"
+          continue
+        fi
+        if ! jq -e 'type == "array" and length < 100' \
+            "$work/semantic-item-comments.json" >/dev/null; then
+          echo "mandate sweep: comment query for $semantic_id reached its 100-comment safety cap or returned malformed data; semantic derivation skipped for this item" >&2
+          printf '%s\t%s\n' "$semantic_id" "$semantic_number" \
+            >>"$work/semantic-comment-failures.tsv"
+          continue
+        fi
+        jq -cn \
+          --arg id "$semantic_id" \
+          --slurpfile comments "$work/semantic-item-comments.json" \
+          '{id: $id, comments: [$comments[0][]? | (.body // "") | select(type == "string")]}' \
+          >>"$work/semantic-comments.jsonl"
+      done < <(jq -r '.[] | [.id, (.number | tostring)] | @tsv' "$work/semantic-candidates.json")
+
+      if [ -s "$work/semantic-comments.jsonl" ]; then
+        jq -s '.' "$work/semantic-comments.jsonl" >"$work/semantic-comments.json"
+      else
+        printf '%s\n' '[]' >"$work/semantic-comments.json"
+      fi
+
+      jq -cn \
+        --slurpfile candidates "$work/semantic-candidates.json" \
+        --slurpfile comments "$work/semantic-comments.json" \
+        --slurpfile analysis "$work/analysis.json" \
+        --slurpfile previous "$work/previous.json" '
+          ($comments[0] | INDEX(.id)) as $comments_by_id
+          | ($analysis[0].repo_state.items) as $mechanical
+          | {
+              items: [
+                $candidates[0][]
+                | . as $item
+                | select($comments_by_id[$item.id] != null)
+                | {
+                    id: $item.id,
+                    content: {
+                      title: $item.title,
+                      labels: $item.labels,
+                      body: ($item.body // ""),
+                      comments: $comments_by_id[$item.id].comments
+                    },
+                    mechanical: {
+                      classification: $mechanical[$item.id].classification,
+                      matched_selector: $mechanical[$item.id].matched_selector,
+                      matched_source: "mechanical"
+                    }
+                  }
+              ],
+              cache: ($previous[0].semantic_cache // {})
+            }
+        ' >"$work/semantic-request.json"
+
+      # An executable port is orchestrated by Bash so it has exactly the same
+      # stdin/stdout process contract as the rest of the sweep. The TypeScript
+      # harness still validates the returned data and owns the safety guard.
+      # With no executable port, the harness uses its credential-gated bundled
+      # adapter instead.
+      if [ -n "${MANDATE_SEMANTIC_DERIVER:-}" ]; then
+        : >"$work/semantic-port-results.jsonl"
+        while IFS= read -r semantic_id; do
+          jq -c --arg id "$semantic_id" \
+            '{version: 1, content: (.items[] | select(.id == $id) | .content)}' \
+            "$work/semantic-request.json" >"$work/semantic-port-input.json"
+          if "$MANDATE_SEMANTIC_DERIVER" \
+              <"$work/semantic-port-input.json" \
+              >"$work/semantic-port-output.json" \
+              2>"$work/semantic-port-error" \
+              && jq -e . "$work/semantic-port-output.json" >/dev/null 2>&1; then
+            jq -cn \
+              --arg id "$semantic_id" \
+              --slurpfile raw "$work/semantic-port-output.json" \
+              '{id: $id, raw_verdict: $raw[0]}' \
+              >>"$work/semantic-port-results.jsonl"
+          else
+            detail="$(tr '\n' ' ' <"$work/semantic-port-error")"
+            jq -cn \
+              --arg id "$semantic_id" \
+              --arg error "semantic deriver failed${detail:+: $detail}" \
+              '{id: $id, port_error: $error}' \
+              >>"$work/semantic-port-results.jsonl"
+          fi
+        done < <(jq -r '.items[].id' "$work/semantic-request.json")
+        if [ -s "$work/semantic-port-results.jsonl" ]; then
+          jq -s 'INDEX(.id)' "$work/semantic-port-results.jsonl" \
+            >"$work/semantic-port-results.json"
+          jq -cn \
+            --slurpfile request "$work/semantic-request.json" \
+            --slurpfile port "$work/semantic-port-results.json" '
+              $request[0]
+              | .items |= map(
+                  . as $item
+                  | (($port[0][$item.id] // {}) | del(.id)) as $port_fields
+                  | $item + $port_fields
+                )
+            ' >"$work/next.json"
+          mv "$work/next.json" "$work/semantic-request.json"
+        fi
+      fi
+
+      if ! "$MANDATE_SEMANTIC_NODE" "$MANDATE_PLUGIN_ROOT/dist/semantic-derivation-cli.js" \
+          <"$work/semantic-request.json" >"$work/semantic-results.json"; then
+        echo "mandate sweep: semantic derivation harness failed; continuing with the mechanical verdicts" >&2
+        printf '%s\n' '[]' >"$work/semantic-results.json"
+      fi
+      if ! jq -e 'type == "array"' "$work/semantic-results.json" >/dev/null 2>&1; then
+        echo "mandate sweep: semantic derivation harness returned malformed output; continuing with the mechanical verdicts" >&2
+        printf '%s\n' '[]' >"$work/semantic-results.json"
+      fi
+      while IFS=$'\t' read -r rejected_id rejected_error; do
+        [ -n "$rejected_id" ] || continue
+        echo "mandate sweep: semantic verdict for $rejected_id was rejected: $rejected_error" >&2
+      done < <(jq -r '.[] | select(.status == "rejected" and (.cached | not)) | [.id, .error] | @tsv' "$work/semantic-results.json")
+
+      # Attach accepted findings beside the mechanical fields. The existing
+      # fingerprint is never read or rewritten here. Rejected results remove
+      # any stale advisory attached to older source content, and both accepted
+      # and rejected results enter the content-hash cache so unchanged text is
+      # never re-judged.
+      jq -cn \
+        --slurpfile items "$work/items.json" \
+        --slurpfile results "$work/semantic-results.json" '
+          ($results[0] | INDEX(.id)) as $by_id
+          | [
+              $items[0][]
+              | . as $item
+              | ($by_id[$item.id] // null) as $result
+              | if $result == null then .
+                elif $result.status == "accepted" then
+                  . + {
+                    semantic_content_hash: $result.content_hash,
+                    semantic_derivation: $result.derivation
+                  }
+                else
+                  del(.semantic_content_hash, .semantic_derivation)
+                end
+            ]
+        ' >"$work/next.json"
+      mv "$work/next.json" "$work/items.json"
+
+      jq -cn \
+        --slurpfile analysis "$work/analysis.json" \
+        --slurpfile items "$work/items.json" \
+        --slurpfile results "$work/semantic-results.json" '
+          ($items[0] | INDEX(.id)) as $items_by_id
+          | ($analysis[0].current_items | INDEX(.id)) as $current_by_id
+          | def finding($derivation; $kind):
+              any(($derivation.findings // [])[]?; .kind == $kind);
+          def semantic_fields($item; $mechanical):
+              if ($item.semantic_derivation // null) == null then {}
+              else {
+                classification: $mechanical.classification,
+                matched_selector: $mechanical.matched_selector,
+                semantic_derivation: $item.semantic_derivation
+              }
+              end;
+          def reprioritize($row; $derivation):
+              if finding($derivation; "already_decided")
+                  or ($derivation.authority // null) != null
+              then $row | .kind = "decision" | .needs_judgment = true
+              elif $row.kind == "stuck" and finding($derivation; "parked")
+              then $row | .kind = "moved" | .needs_judgment = false
+              else $row
+              end;
+          ($analysis[0]) as $analysis
+          | ($analysis.repo_state.items) as $mechanical
+          | ($analysis.rows | map(
+              . as $row
+              | ($items_by_id[$row.id] // {}) as $item
+              | if ($item.semantic_derivation // null) == null then .
+                else reprioritize(
+                  . + semantic_fields($item; $mechanical[$row.id]);
+                  $item.semantic_derivation
+                )
+                end
+            )) as $attached_rows
+          | ([ $attached_rows[].id ]) as $attached_ids
+          | ([
+              $results[0][]
+              | select(.status == "accepted")
+              | . as $result
+              | select(
+                  finding($result.derivation; "already_decided")
+                  or ($result.derivation.authority // null) != null
+                )
+              | select(($attached_ids | index($result.id)) == null)
+              | ($items_by_id[$result.id]) as $item
+              | ($mechanical[$result.id]) as $mech
+              | {
+                  id: $item.id,
+                  repo: $item.repo,
+                  ref: $item.ref,
+                  title: $item.title,
+                  kind: "decision",
+                  mandate: {reason: ("semantic advisory beside " + $mech.classification + " " + $mech.matched_selector)},
+                  state: "pending",
+                  opened: $item.opened,
+                  age_days: $current_by_id[$item.id].age_days,
+                  aged_out: $current_by_id[$item.id].aged_out,
+                  needs_judgment: true,
+                  blocked_by: $item.blocked_by,
+                  classification: $mech.classification,
+                  matched_selector: $mech.matched_selector,
+                  semantic_derivation: $result.derivation
+                }
+            ]) as $semantic_rows
+          | ($analysis.current_items | map(
+              . as $current
+              | ($items_by_id[$current.id] // {}) as $item
+              | if ($item.semantic_derivation // null) == null then .
+                else . + semantic_fields($item; $mechanical[$current.id])
+                end
+            )) as $current_items
+          | ([$items[0][]
+              | select(
+                  (.semantic_derivation // null) != null
+                  and (
+                    finding(.semantic_derivation; "already_decided")
+                    or (.semantic_derivation.authority // null) != null
+                  )
+                )
+              | .id]) as $semantic_active
+          | ($analysis.repo_state.semantic_cache // {}) as $old_cache
+          | (reduce $results[0][] as $result ($old_cache;
+              .[$result.content_hash] = (
+                if $result.status == "accepted"
+                then {status: "accepted", derivation: $result.derivation}
+                else {status: "rejected", error: $result.error}
+                end
+              )
+            )) as $cache
+          | $analysis
+          | .rows = ($attached_rows + $semantic_rows)
+          | .active_ids = ((.active_ids + $semantic_active) | unique)
+          | .current_items = $current_items
+          | .repo_state.semantic_cache = $cache
+          | .repo_state.items |= with_entries(
+              . as $entry
+              | ($items_by_id[$entry.key] // {}) as $item
+              | if ($item.semantic_derivation // null) == null then .
+                else .value += {
+                  semantic_content_hash: $item.semantic_content_hash,
+                  semantic_derivation: $item.semantic_derivation
+                }
+                end
+            )
+        ' >"$work/next.json"
+      mv "$work/next.json" "$work/analysis.json"
+    fi
+
+    # #147: a merge with no timely passing verdict is a fault observed after
+    # the fact. The all-state PR response above, gate.jsonl, and
+    # exceptions.jsonl are already in hand; this is deliberately only a local
+    # join. Faults use ordinary decision rows, so they can be explained,
+    # deferred, or otherwise handled without changing merge behaviour.
+    jq -cn \
+      --arg repo "$repo" \
+      --arg sweep_started "$sweep_started" \
+      --argjson stuck_after_days "$(jq '.stuck_after_days' "$work/config.json")" \
+      --slurpfile merged "$work/merged-prs.json" \
+      --slurpfile gate "$work/gate-records.json" \
+      --slurpfile exceptions "$work/exception-records.json" \
+      --slurpfile previous "$work/previous.json" '
+      def timestamp_before($candidate; $boundary):
+        try (($candidate | fromdateiso8601) < ($boundary | fromdateiso8601))
+        catch false;
+      def age_days($opened):
+        try (
+          ((($sweep_started | fromdateiso8601) - ($opened | fromdateiso8601)) / 86400 | floor)
+          | [., 0] | max
+        ) catch 0;
+      def reason($fault):
+        if $fault.shape == "no_verdict" then
+          "merge gate fault: no verdict for merged head " + $fault.head_sha
+        elif $fault.shape == "non_pass" then
+          "merge gate fault: " + $fault.verdict
+          + " verdict for merged head " + $fault.head_sha
+        else
+          "merge gate fault: pass recorded after merge for head " + $fault.head_sha
+        end;
+      (reduce $gate[0][] as $record ({};
+        if (($record.head_sha // null) | type) == "string"
+            and ($record.head_sha | length) > 0
+        then .[$record.head_sha] += [$record]
+        else .
+        end
+      )) as $gate_by_sha
+      | ($previous[0].merge_gate_merges // {}) as $known_merges
+      | (reduce $merged[0][] as $pr ($known_merges;
+          select(($pr.number | type) == "number")
+          | ($repo + "#" + ($pr.number | tostring)) as $id
+          | .[$id] = {
+              id: $id,
+              number: $pr.number,
+              title: (
+                ($pr.title // "")
+                | if type == "string" and length > 0
+                  then . else "(title unavailable)" end
+              ),
+              created_at: ($pr.createdAt // $pr.mergedAt // $sweep_started),
+              merged_at: ($pr.mergedAt // ""),
+              head_sha: ($pr.headRefOid // "")
+            }
+        )) as $merges
+      | [
+          $merges[]
+          | select((.merged_at | type) == "string" and (.merged_at | length) > 0)
+          | . as $merge
+          | ($gate_by_sha[$merge.head_sha] // []) as $records
+          | ([$records[] | select(
+              .verdict == "pass"
+              and timestamp_before((.ts // ""); $merge.merged_at)
+            )]) as $timely_passes
+          | ([$records[] | select(.verdict == "pass")]) as $passes
+          | (
+              if ($timely_passes | length) > 0 then null
+              elif ($records | length) == 0 then {
+                shape: "no_verdict",
+                verdict: "none",
+                gate_ts: null
+              }
+              elif ($passes | length) > 0 then {
+                shape: "pass_after_merge",
+                verdict: "pass",
+                gate_ts: ($passes[0].ts // null)
+              }
+              else {
+                shape: "non_pass",
+                verdict: (($records | last).verdict // "inconclusive"),
+                gate_ts: (($records | last).ts // null)
+              }
+              end
+            ) as $violation
+          | select($violation != null)
+          | ([
+              $exceptions[0][]
+              | select(
+                  .repo == $repo
+                  and .pr == $merge.number
+                  and .head_sha == $merge.head_sha
+                  and .condition == "merge_protocol"
+                  and ((.reason // null) | type) == "string"
+                )
+            ] | last // null) as $exception
+          | $merge + $violation + {
+              exception: $exception,
+              fingerprint: ([$violation.shape, $merge.head_sha,
+                $violation.verdict, ($violation.gate_ts // "")] | join("|"))
+            }
+        ] as $violations
+      | ([$violations[] | select(.exception == null)]) as $faults
+      | ([$violations[] | select(.exception != null)]) as $excused
+      | ($previous[0].merge_gate_faults // {}) as $old_faults
+      | {
+          rows: [
+            $faults[]
+            | select(($old_faults[.id].fingerprint // "") != .fingerprint)
+            | . as $fault
+            | (age_days($fault.merged_at)) as $age
+            | {
+                id: $fault.id,
+                repo: $repo,
+                ref: ("#" + ($fault.number | tostring)),
+                title: $fault.title,
+                kind: "decision",
+                mandate: {reason: reason($fault)},
+                state: "pending",
+                opened: $fault.merged_at,
+                age_days: $age,
+                aged_out: ($age >= $stuck_after_days),
+                needs_judgment: true,
+                blocked_by: []
+              }
+          ],
+          active_ids: [$faults[].id],
+          current_items: [
+            $faults[]
+            | (age_days(.merged_at)) as $age
+            | {
+                id,
+                title,
+                age_days: $age,
+                aged_out: ($age >= $stuck_after_days)
+              }
+          ],
+          merges: $merges,
+          faults: (reduce $faults[] as $fault ({};
+            .[$fault.id] = {
+              shape: $fault.shape,
+              head_sha: $fault.head_sha,
+              verdict: $fault.verdict,
+              gate_ts: $fault.gate_ts,
+              fingerprint: $fault.fingerprint
+            }
+          )),
+          excuses: (reduce $excused[] as $item ({};
+            .[$item.id] = {
+              head_sha: $item.head_sha,
+              reason: $item.exception.reason
+            }
+          )),
+          fault_count: ($faults | length)
+        }
+      ' >"$work/merge-gate.json"
+
     # #78: fold the default branch's own CI into a "drift" row, the same kind
     # and digest/troubled-project machinery an open PR's failing CI already
     # uses. Regeneration is gated on .event the same way the rest of this
@@ -999,11 +1553,33 @@ sweep_org() {
               | length;
             def bare_count($msg; $n):
               [$msg | scan("#" + ($n|tostring) + "(?!\\d)"; "i")] | length;
+            def qualified_count($msg; $n):
+              [
+                $msg
+                | scan(
+                    "\\b(?:part[[:space:]]+of|refs?|see|cc|related(?:[[:space:]]+to)?|supersedes|per)[[:space:][:punct:]]*#"
+                    + ($n|tostring) + "(?!\\d)";
+                    "i"
+                  )
+              ]
+              | length;
+            def closes_other($msg; $n):
+              [
+                $msg
+                | scan(
+                    "\\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)[[:space:]:]*#([0-9]+)";
+                    "i"
+                  )
+                | .[0]
+              ]
+              | any(. != ($n | tostring));
             (.) as $commits
             | [
                 $commits[]
                 | select((.date // "") >= $opened)
                 | select(bare_count(.message; $number) > closing_count(.message; $number))
+                | select(qualified_count(.message; $number) == 0)
+                | select(closes_other(.message; $number) | not)
               ] as $bare_matches
             | if ($bare_matches | length) == 0 then empty
               else
@@ -1032,20 +1608,81 @@ sweep_org() {
     jq -cn \
       --slurpfile all "$work/generated.json" \
       --slurpfile analysis "$work/analysis.json" \
+      --slurpfile merge_gate "$work/merge-gate.json" \
       --slurpfile ci_drift "$work/ci-drift.json" \
-      '$all[0] + $analysis[0].rows + $ci_drift[0].rows' >"$work/next.json"
+      '$all[0] + $analysis[0].rows + $merge_gate[0].rows + $ci_drift[0].rows' >"$work/next.json"
     mv "$work/next.json" "$work/generated.json"
     jq -cn \
       --slurpfile all "$work/active-ids.json" \
       --slurpfile analysis "$work/analysis.json" \
+      --slurpfile merge_gate "$work/merge-gate.json" \
       --slurpfile ci_drift "$work/ci-drift.json" \
-      '$all[0] + $analysis[0].active_ids + $ci_drift[0].active_ids' >"$work/next.json"
+      '$all[0] + $analysis[0].active_ids + $merge_gate[0].active_ids + $ci_drift[0].active_ids' >"$work/next.json"
     mv "$work/next.json" "$work/active-ids.json"
+
+    # An approval is deliberately durable across an item disappearing from
+    # enumeration: absence can be an API or rate-limit failure, not proof that
+    # the work is done. Closed issues already have a positive feed observation;
+    # for other approved rows that would otherwise be carried over, preserve
+    # #85's positive PR state read. A merged PR and a closed-unmerged PR are
+    # recorded distinctly, although both are terminal for queue purposes. Any
+    # command failure or malformed/incomplete response records nothing, so the
+    # final reconciliation retains the approval.
+    while IFS=$'\t' read -r approved_id approved_number; do
+      if gh pr view "$approved_number" --repo "$repo" --json state,mergedAt \
+          >"$work/approved-pr-state.json" 2>"$work/approved-pr-state-error"; then
+        if approved_resolution="$(
+          jq -er '
+            if type != "object"
+                or (has("state") | not)
+                or (has("mergedAt") | not)
+            then error("incomplete pull request state")
+            elif .state == "MERGED"
+                and (.mergedAt | type) == "string"
+                and (.mergedAt | length) > 0
+            then "merged"
+            elif .state == "CLOSED" and .mergedAt == null
+            then "closed-unmerged"
+            elif .state == "OPEN" and .mergedAt == null
+            then "open"
+            else error("unrecognized pull request state")
+            end
+          ' "$work/approved-pr-state.json" 2>/dev/null
+        )"; then
+          case "$approved_resolution" in
+            merged | closed-unmerged)
+              jq -cn \
+                --arg id "$approved_id" \
+                --arg resolution "$approved_resolution" \
+                '{id: $id, resolution: $resolution}' \
+                >>"$work/closed-items.jsonl"
+              ;;
+          esac
+        fi
+      fi
+    done < <(
+      jq -r \
+        --arg repo "$repo" \
+        --slurpfile active_ids "$work/active-ids.json" \
+        --slurpfile closed_items "$work/closed-items.jsonl" '
+        .[]
+        | . as $row
+        | select(.state == "approved" and .repo == $repo)
+        | select(($active_ids[0] | index($row.id)) == null)
+        | select(($closed_items | map(.id) | index($row.id)) == null)
+        | select(.id | startswith($repo + "#"))
+        | (.id | split("#")[-1]) as $number
+        | select($number | test("^[1-9][0-9]*$"))
+        | [.id, $number]
+        | @tsv
+      ' "$work/existing-queue.json"
+    )
     jq -cn \
       --slurpfile all "$work/current-items.json" \
       --slurpfile analysis "$work/analysis.json" \
+      --slurpfile merge_gate "$work/merge-gate.json" \
       --slurpfile ci_drift "$work/ci-drift.json" \
-      '$all[0] + $analysis[0].current_items + $ci_drift[0].current_items' >"$work/next.json"
+      '$all[0] + $analysis[0].current_items + $merge_gate[0].current_items + $ci_drift[0].current_items' >"$work/next.json"
     mv "$work/next.json" "$work/current-items.json"
     jq -cn \
       --slurpfile all "$work/selector-stats.json" \
@@ -1063,6 +1700,7 @@ sweep_org() {
         --arg repo "$repo" \
         --slurpfile state "$work/new-state.json" \
         --slurpfile analysis "$work/analysis.json" \
+        --slurpfile merge_gate "$work/merge-gate.json" \
         --slurpfile ci_drift "$work/ci-drift.json" \
         --slurpfile records "$work/items.json" \
         --arg etag "${issue_etag:-$previous_etag}" \
@@ -1071,6 +1709,10 @@ sweep_org() {
               $analysis[0].repo_state
               + {
                   ci_drift: $ci_drift[0].state,
+                  merge_gate_merges: $merge_gate[0].merges,
+                  merge_gate_faults: $merge_gate[0].faults,
+                  merge_gate_excuses: $merge_gate[0].excuses,
+                  merge_gate_fault_count: $merge_gate[0].fault_count,
                   etag: (if $etag == "" then null else $etag end),
                   records: (reduce $records[0][] as $record ({}; .[$record.id] = $record))
                 }
@@ -1114,6 +1756,30 @@ if [ "$project_count" -eq 0 ]; then
   exit 2
 fi
 
+# Repository availability is a roster property, not an item state. Resolve it
+# once per sweep using the implementer's shared matcher and keep missing
+# checkouts separate from ordinary stuck work. This walk is filesystem-only.
+: >"$work/unresolvable-repositories.txt"
+roster_config="$(cat "$work/config.json")"
+while IFS= read -r roster_repository; do
+  if ! mandate_find_source_repository \
+      "$roster_repository" "$roster_config" >/dev/null; then
+    printf '%s\n' "$roster_repository" >>"$work/unresolvable-repositories.txt"
+  fi
+done < <(jq -r '.projects[].repo' "$work/config.json")
+jq -Rn '[inputs | select(length > 0)]' \
+  "$work/unresolvable-repositories.txt" >"$work/unresolvable-repositories.json"
+
+semantic_enabled=0
+semantic_node=""
+if mandate_semantic_is_configured; then
+  semantic_node="$(bash "$SCRIPT_DIR/run-node.sh" --resolve-only)" || {
+    echo "mandate sweep: semantic derivation is configured but Node.js 18+ is unavailable" >&2
+    exit 2
+  }
+  semantic_enabled=1
+fi
+
 mkdir -p "$MANDATE_DATA_DIR"
 mandate_read_queue >"$work/existing-queue.json" || {
   echo "mandate sweep: cannot read $MANDATE_QUEUE_FILE" >&2
@@ -1126,7 +1792,7 @@ if [ -s "$MANDATE_STATE_FILE" ]; then
     exit 4
   fi
 else
-  printf '%s\n' '{"version":2,"repos":{},"dead_selectors":[]}' \
+  printf '%s\n' '{"version":2,"repos":{},"dead_selectors":[],"unresolvable_repositories":[]}' \
     >"$work/old-state.json"
 fi
 
@@ -1180,6 +1846,27 @@ printf '%s\n' '[]' >"$work/selector-stats.json"
 printf '%s\n' '[]' >"$work/possibly-landed.json"
 cp "$work/old-state.json" "$work/new-state.json"
 
+# Snapshot the append-only evidence once for every organisation subprocess.
+# Missing or empty logs are legitimate first-run states. Malformed evidence is
+# reported but cannot turn this detective check into a failed sweep; treating
+# unreadable verdicts as absent keeps the possible faults visible.
+printf '%s\n' '[]' >"$work/gate-records.json"
+if [ -s "$MANDATE_GATE_LOG" ]; then
+  if ! jq -s '[.[] | select(type == "object")]' "$MANDATE_GATE_LOG" \
+      >"$work/gate-records.json" 2>/dev/null; then
+    echo "mandate sweep: could not read $MANDATE_GATE_LOG; merge gate faults will be classified as having no verdict" >&2
+    printf '%s\n' '[]' >"$work/gate-records.json"
+  fi
+fi
+printf '%s\n' '[]' >"$work/exception-records.json"
+if [ -s "$MANDATE_EXCEPTIONS_LOG" ]; then
+  if ! jq -s '[.[] | select(type == "object")]' "$MANDATE_EXCEPTIONS_LOG" \
+      >"$work/exception-records.json" 2>/dev/null; then
+    echo "mandate sweep: could not read $MANDATE_EXCEPTIONS_LOG; ignoring merge gate exceptions" >&2
+    printf '%s\n' '[]' >"$work/exception-records.json"
+  fi
+fi
+
 # #86: track landed-fix commit-search attempts/failures across the whole
 # sweep (all organisations, all repos, all candidates) so a 100%-failing
 # capability can be reported once instead of once per candidate. Per-item
@@ -1191,6 +1878,12 @@ cp "$work/old-state.json" "$work/new-state.json"
 : >"$work/landed-fix-attempts.count"
 : >"$work/landed-fix-failures.log"
 : >"$work/landed-fix-last-error.txt"
+# Positive terminal observations for queue items. This is JSONL because each
+# authenticated per-organisation subprocess appends its own observations; an
+# empty file means absence alone cannot remove a row. Closed issues come from
+# the cursor-bounded all-state feed, while #85's approved-PR fallback appends
+# merged and closed-unmerged pull requests to the same evidence stream.
+: >"$work/closed-items.jsonl"
 
 while IFS= read -r org; do
   anchor_repo="$(
@@ -1206,6 +1899,7 @@ while IFS= read -r org; do
   # against the same instant regardless of which one is processed first.
   MANDATE_SWEEP_ORG="$org" MANDATE_SWEEP_WORK="$work" MANDATE_SWEEP_TIME="$sweep_started" \
     MANDATE_SWEEP_MODE_EFFECTIVE="$sweep_mode" \
+    MANDATE_SEMANTIC_ENABLED="$semantic_enabled" MANDATE_SEMANTIC_NODE="$semantic_node" \
     bash "$SCRIPT_DIR/gh-as.sh" gatekeeper "$anchor_repo" \
     bash "${BASH_SOURCE[0]}"
 done < <(jq -r '[.projects[].repo | split("/")[0]] | unique | .[]' "$work/config.json")
@@ -1240,11 +1934,13 @@ jq -c '[.projects[].repo]' "$work/config.json" >"$work/configured-repos.json"
 jq -cn \
     --slurpfile state "$work/new-state.json" \
     --slurpfile dead "$work/dead-selectors.json" \
+    --slurpfile unresolvable "$work/unresolvable-repositories.json" \
     --slurpfile configured_repos "$work/configured-repos.json" '
     $state[0]
     | ($dead[0]) as $dead
     | ($configured_repos[0]) as $configured_repos
     | .dead_selectors = $dead
+    | .unresolvable_repositories = $unresolvable[0]
     | .repos |= with_entries(
         select(.key as $repo | ($configured_repos | index($repo)) != null)
       )
@@ -1269,12 +1965,14 @@ jq -cn \
     --slurpfile generated "$work/generated.json" \
     --slurpfile active_ids "$work/active-ids.json" \
     --slurpfile current_items "$work/current-items.json" \
-    --slurpfile possibly_landed "$work/possibly-landed.json" '
+    --slurpfile possibly_landed "$work/possibly-landed.json" \
+    --slurpfile closed_items "$work/closed-items.jsonl" '
     ($existing[0]) as $existing
     | ($generated[0]) as $generated
     | ($active_ids[0]) as $active_ids
     | ($current_items[0]) as $current_items
     | ($possibly_landed[0]) as $possibly_landed
+    | ($closed_items | map(.id)) as $closed_item_ids
     |
     def dependency_refs($repo; $text):
       [
@@ -1363,7 +2061,13 @@ jq -cn \
     (
       $existing
       | map(. as $row
-        | select($row.state == "approved" or ($active_ids | index($row.id)) != null)
+        | select(
+            ($active_ids | index($row.id)) != null
+            or (
+              $row.state == "approved"
+              and ($closed_item_ids | index($row.id)) == null
+            )
+          )
       )
     ) as $still_relevant
     | reduce $generated[] as $row ($still_relevant;

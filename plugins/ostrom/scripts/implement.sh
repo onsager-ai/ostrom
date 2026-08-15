@@ -361,60 +361,12 @@ if [ "$(jq -r '.owner' <<<"$lease_json")" != "$lease_owner" ]; then
 fi
 
 find_source_repository() {
-  local config root marker candidate remote normalized
-  local -a matching_candidates=()
-  local -a primary_candidates=()
-  local -a linked_candidates=()
-
   if [ -n "${MANDATE_IMPLEMENTER_SOURCE_REPO:-}" ]; then
     [ -d "$MANDATE_IMPLEMENTER_SOURCE_REPO" ] || return 1
     printf '%s\n' "$MANDATE_IMPLEMENTER_SOURCE_REPO"
     return
   fi
-  config="$(mandate_load_config)" || return
-  while IFS= read -r root; do
-    [ -d "$root" ] || continue
-    while IFS= read -r marker; do
-      candidate="${marker%/.git}"
-      remote="$(git -C "$candidate" remote get-url origin 2>/dev/null)" || continue
-      normalized="${remote%.git}"
-      normalized="${normalized#https://github.com/}"
-      normalized="${normalized#git@github.com:}"
-      if [ "$normalized" = "$repository" ]; then
-        matching_candidates+=("$candidate")
-      fi
-    done < <(find "$root" -name .git -print -prune 2>/dev/null)
-  done < <(jq -r '.search_roots[]' <<<"$config")
-
-  if [ "${#matching_candidates[@]}" -gt 0 ]; then
-    # Sort all matches before classification. The lexicographically first
-    # primary clone therefore wins deterministically, independent of root or
-    # filesystem traversal order; duplicate paths from overlapping roots are
-    # removed at the same time.
-    while IFS= read -r candidate; do
-      if [ -d "$candidate/.git" ]; then
-        primary_candidates+=("$candidate")
-      elif [ -f "$candidate/.git" ]; then
-        linked_candidates+=("$candidate")
-      fi
-    done < <(printf '%s\n' "${matching_candidates[@]}" | LC_ALL=C sort -u)
-  fi
-
-  if [ "${#primary_candidates[@]}" -gt 0 ]; then
-    printf '%s\n' "${primary_candidates[0]}"
-    return 0
-  fi
-  if [ "${#linked_candidates[@]}" -gt 0 ]; then
-    # A linked worktree inherits whatever branch and commits its operator left
-    # there. Report the first sorted match for diagnosis, but never use it as
-    # a source checkout.
-    printf 'source-repository-linked-worktree-only path=%s\n' \
-      "${linked_candidates[0]}"
-    # Reserve a private status so config/parser failures retain the historical
-    # source-repository-not-found classification in the caller.
-    return 10
-  fi
-  return 1
+  mandate_find_source_repository "$repository"
 }
 
 source_resolution="$(find_source_repository)"
@@ -631,6 +583,21 @@ if ! git -C "$worktree_root" diff --quiet || \
     exit 1
   fi
 fi
+publish_paths="$(
+  git -C "$worktree_root" diff --name-only \
+    "refs/remotes/origin/$default_branch...HEAD"
+)" || {
+  failure_reason=workflow-file-check-failed
+  exit 1
+}
+while IFS= read -r publish_path; do
+  case "$publish_path" in
+    .github/workflows/*)
+      failure_reason="workflow-file-unpushable path=$publish_path"
+      exit 1
+      ;;
+  esac
+done <<<"$publish_paths"
 push_output="$runs_dir/push-output.txt"
 if bash "$GH_AS_BIN" builder "$repository" \
   git -C "$worktree_root" push \

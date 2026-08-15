@@ -17,6 +17,14 @@ MANDATE_GATE_REPO_CONFIG="./.ostrom/gate.yaml"
 MANDATE_GATE_LOG="$MANDATE_DATA_DIR/gate.jsonl"
 MANDATE_EXCEPTIONS_LOG="$MANDATE_DATA_DIR/exceptions.jsonl"
 
+# Semantic derivation is an optional port. An explicit executable is useful
+# for hermetic fixtures and alternate providers; otherwise the bundled
+# adapter is enabled only by Anthropic's standard credential. Neither value
+# is part of mandate policy, and absence preserves the mechanical sweep.
+mandate_semantic_is_configured() {
+  [ -n "${MANDATE_SEMANTIC_DERIVER:-}" ] || [ -n "${ANTHROPIC_API_KEY:-}" ]
+}
+
 # Read a delivery role's GitHub App credentials from the machine-local secrets
 # file, preferring a role block so the shared-App cutover stays reversible.
 # This intentionally remains separate from the shipped/user/repository config
@@ -167,8 +175,9 @@ mandate_is_configured() {
 # Parse the deliberately small shipped schema without pretending to be a
 # general YAML parser. Supported input:
 #   root scalars; bounce_all:/search_roots: followed by two-space list items; projects:
-#   followed by "- repo:" entries, each with default + paused scalars and
-#   six-space delegated/excluded/reserved/bounce lists.
+#   followed by "- repo:" entries, each with default + paused scalars, an
+#   optional max_implementers_per_repository positive integer, and six-space
+#   delegated/excluded/reserved/bounce lists.
 mandate_yaml_to_json() {
   file="$1"
   [ -f "$file" ] || {
@@ -290,6 +299,18 @@ mandate_yaml_to_json() {
         next
       }
       if (section == "projects" && current_repo != "" && indent == 4 &&
+          text ~ /^max_implementers_per_repository:[[:space:]]*/) {
+        value = text
+        sub(/^max_implementers_per_repository:[[:space:]]*/, "", value)
+        value = unquote(value)
+        if (value !~ /^[1-9][0-9]*$/) {
+          fail("max_implementers_per_repository must be a positive integer for " current_repo)
+        } else {
+          print "project_field\t" current_repo "\tmax_implementers_per_repository\t" value
+        }
+        next
+      }
+      if (section == "projects" && current_repo != "" && indent == 4 &&
           (text ~ /^(delegated|excluded|reserved|bounce):$/ ||
            text ~ /^(delegated|excluded|reserved|bounce): \[\]$/)) {
         project_list = text
@@ -346,6 +367,8 @@ mandate_yaml_to_json() {
             | if $index == null then error("project field appeared before its repo")
               elif $parts[2] == "paused"
               then .projects[$index].paused = ($parts[3] == "true")
+              elif $parts[2] == "max_implementers_per_repository"
+              then .projects[$index][$parts[2]] = ($parts[3] | tonumber)
               else .projects[$index][$parts[2]] = $parts[3]
               end
           elif $parts[0] == "project_list" then
@@ -392,10 +415,12 @@ mandate_load_config() {
       and (.excluded | type == "array" and all(.[]; type == "string" and length > 0))
       and (.reserved | type == "array" and all(.[]; type == "number" and . > 0 and . == floor))
       and (.bounce | type == "array" and all(.[]; type == "string" and length > 0))
+      and ((.max_implementers_per_repository // 1)
+        | type == "number" and . > 0 and . == floor)
     )
     and (([.projects[].repo] | length) == ([.projects[].repo] | unique | length))
   ' >/dev/null <<<"$config"; then
-    echo "mandate: invalid config; provider must be file, cadence_hours a positive integer, search_roots non-empty strings, and every project must have a unique owner/name repo, valid default, boolean paused value, selector lists, and positive integer reserved refs" >&2
+    echo "mandate: invalid config; provider must be file, cadence_hours a positive integer, search_roots non-empty strings, and every project must have a unique owner/name repo, valid default, boolean paused value, selector lists, positive integer reserved refs, and an optional positive max_implementers_per_repository" >&2
     return 2
   fi
 
@@ -445,6 +470,80 @@ mandate_load_config() {
   fi
 
   printf '%s\n' "$config"
+}
+
+# Return the collision cap for one roster repository. Capacity remains the
+# dispatcher's global concern; this project value only prevents concurrent
+# implementers from creating branches that can collide in the same repository.
+mandate_project_max_implementers_per_repository() {
+  local repository="$1"
+  local config="${2:-}"
+  local default_limit="${3:-1}"
+
+  if [ -z "$config" ]; then
+    config="$(mandate_load_config)" || return
+  fi
+
+  jq -er --arg repository "$repository" --argjson default "$default_limit" '
+    ([.projects[]?
+      | select(.repo == $repository)
+      | .max_implementers_per_repository][0]) // $default
+  ' <<<"$config"
+}
+
+# Resolve a roster repository to a primary local checkout. All callers share
+# this matcher so sweep diagnostics, dispatch preflight, and the implementer
+# cannot disagree about what is usable. A linked worktree is evidence that the
+# remote matches, but it is not a safe source checkout: its branch and commits
+# belong to another worktree owner.
+mandate_find_source_repository() {
+  local repository="$1"
+  local config="${2:-}"
+  local root marker candidate remote normalized
+  local -a matching_candidates=()
+  local -a primary_candidates=()
+  local -a linked_candidates=()
+
+  if [ -z "$config" ]; then
+    config="$(mandate_load_config)" || return
+  fi
+
+  while IFS= read -r root; do
+    [ -d "$root" ] || continue
+    while IFS= read -r marker; do
+      candidate="${marker%/.git}"
+      remote="$(git -C "$candidate" remote get-url origin 2>/dev/null)" || continue
+      normalized="${remote%.git}"
+      normalized="${normalized#https://github.com/}"
+      normalized="${normalized#git@github.com:}"
+      if [ "$normalized" = "$repository" ]; then
+        matching_candidates+=("$candidate")
+      fi
+    done < <(find "$root" -name .git -print -prune 2>/dev/null)
+  done < <(jq -r '.search_roots[]' <<<"$config")
+
+  if [ "${#matching_candidates[@]}" -gt 0 ]; then
+    # Sort before classification so overlapping roots and filesystem traversal
+    # order cannot change which primary checkout wins.
+    while IFS= read -r candidate; do
+      if [ -d "$candidate/.git" ]; then
+        primary_candidates+=("$candidate")
+      elif [ -f "$candidate/.git" ]; then
+        linked_candidates+=("$candidate")
+      fi
+    done < <(printf '%s\n' "${matching_candidates[@]}" | LC_ALL=C sort -u)
+  fi
+
+  if [ "${#primary_candidates[@]}" -gt 0 ]; then
+    printf '%s\n' "${primary_candidates[0]}"
+    return 0
+  fi
+  if [ "${#linked_candidates[@]}" -gt 0 ]; then
+    printf 'source-repository-linked-worktree-only path=%s\n' \
+      "${linked_candidates[0]}"
+    return 10
+  fi
+  return 1
 }
 
 mandate_gate_is_configured() {
@@ -682,8 +781,9 @@ mandate_read_queue() {
         (["id","kind","mandate","opened","ref","repo","state"] - keys | length) == 0
         and
         (keys - [
-          "age_days", "aged_out", "blocked_by", "id", "kind", "mandate",
-          "needs_judgment", "opened", "ref", "repo", "state", "title"
+          "age_days", "aged_out", "blocked_by", "classification", "id", "kind",
+          "mandate", "matched_selector", "needs_judgment", "opened", "ref",
+          "repo", "semantic_derivation", "state", "title"
         ] | length) == 0
       )
       and (.id | type == "string")
@@ -714,6 +814,36 @@ mandate_read_queue() {
       and (
         (has("title") | not)
         or (((.title | type) == "string") and ((.title | length) > 0))
+      )
+      and (
+        (has("semantic_derivation") | not)
+        and (has("classification") | not)
+        and (has("matched_selector") | not)
+        or (
+          has("semantic_derivation")
+          and has("classification")
+          and has("matched_selector")
+          and (.classification | IN("delegated", "excluded", "unclassified", "reserved", "tripwire"))
+          and (.matched_selector | type == "string" and length > 0)
+          and (.semantic_derivation | type == "object")
+          and (.semantic_derivation.findings | type == "array")
+          and all(.semantic_derivation.findings[];
+            (.kind | IN("parked", "already_decided", "genuinely_stuck", "actually_a_release"))
+            and (.confidence | type == "number" and . >= 0 and . <= 1)
+            and (.evidence | type == "object")
+            and (.evidence.source | IN("title", "label", "body", "comment"))
+            and (.evidence.quote | type == "string" and length > 0)
+          )
+          and (
+            .semantic_derivation.authority == null
+            or (
+              (.semantic_derivation.authority.classification | IN("unclassified", "reserved", "tripwire"))
+              and (.semantic_derivation.authority.confidence | type == "number" and . >= 0 and . <= 1)
+              and (.semantic_derivation.authority.evidence.source | IN("title", "label", "body", "comment"))
+              and (.semantic_derivation.authority.evidence.quote | type == "string" and length > 0)
+            )
+          )
+        )
       )
     )
     then .
