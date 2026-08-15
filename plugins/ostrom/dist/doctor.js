@@ -3,8 +3,8 @@ import { dirname as dirname2, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // src/lib/doctor.ts
-import { existsSync as existsSync5, readFileSync as readFileSync6 } from "node:fs";
-import { join as join8 } from "node:path";
+import { existsSync as existsSync5, readFileSync as readFileSync7 } from "node:fs";
+import { join as join9 } from "node:path";
 
 // src/checks/rules.ts
 import { statSync } from "node:fs";
@@ -114,7 +114,10 @@ function checkEnvironment(context) {
 // src/checks/marketplace.ts
 import { readFileSync, statSync as statSync2 } from "node:fs";
 import { join as join2 } from "node:path";
-function checkMarketplace(context) {
+var inspectionCache = /* @__PURE__ */ new WeakMap();
+function inspectMarketplace(context) {
+  const cached = inspectionCache.get(context);
+  if (cached) return cached;
   const knownJson = join2(context.configDir, "plugins", "known_marketplaces.json");
   const marketplaceDir = join2(
     context.configDir,
@@ -138,38 +141,66 @@ function checkMarketplace(context) {
   } catch {
   }
   if (!knownIsFile || !/"ostrom"\s*:/.test(knownSource)) {
-    return {
-      status: "FAIL",
-      name: "marketplace",
-      detail: "ostrom not registered in known_marketplaces.json",
-      remedy: "/plugin marketplace add onsager-ai/ostrom"
+    const inspection2 = {
+      directory: marketplaceDir,
+      cloneAvailable: false,
+      fetchAvailable: false,
+      result: {
+        status: "FAIL",
+        name: "marketplace",
+        detail: "ostrom not registered in known_marketplaces.json",
+        remedy: "/plugin marketplace add onsager-ai/ostrom"
+      }
     };
+    inspectionCache.set(context, inspection2);
+    return inspection2;
   }
   if (!cloneIsDirectory) {
-    return {
-      status: "FAIL",
-      name: "marketplace",
-      detail: `registered, but no cached clone at ${marketplaceDir}`,
-      remedy: "/plugin marketplace add onsager-ai/ostrom"
+    const inspection2 = {
+      directory: marketplaceDir,
+      cloneAvailable: false,
+      fetchAvailable: false,
+      result: {
+        status: "FAIL",
+        name: "marketplace",
+        detail: `registered, but no cached clone at ${marketplaceDir}`,
+        remedy: "/plugin marketplace add onsager-ai/ostrom"
+      }
     };
+    inspectionCache.set(context, inspection2);
+    return inspection2;
   }
   const fetch = git(marketplaceDir, ["fetch", "origin", "main"]);
   if (fetch.status !== 0) {
     const firstLine = `${fetch.stdout}${fetch.stderr}`.split(/\r?\n/, 1)[0] ?? "";
-    return {
-      status: "WARN",
-      name: "marketplace",
-      detail: `cannot verify freshness, git fetch failed (offline?): ${firstLine}`,
-      remedy: ""
+    const inspection2 = {
+      directory: marketplaceDir,
+      cloneAvailable: true,
+      fetchAvailable: false,
+      result: {
+        status: "WARN",
+        name: "marketplace",
+        detail: `cannot verify freshness, git fetch failed (offline?): ${firstLine}`,
+        remedy: ""
+      }
     };
+    inspectionCache.set(context, inspection2);
+    return inspection2;
   }
   if (git(marketplaceDir, ["rev-parse", "--verify", "origin/main"]).status !== 0) {
-    return {
-      status: "WARN",
-      name: "marketplace",
-      detail: "fetched, but origin/main not found (default branch may differ)",
-      remedy: ""
+    const inspection2 = {
+      directory: marketplaceDir,
+      cloneAvailable: true,
+      fetchAvailable: true,
+      result: {
+        status: "WARN",
+        name: "marketplace",
+        detail: "fetched, but origin/main not found (default branch may differ)",
+        remedy: ""
+      }
     };
+    inspectionCache.set(context, inspection2);
+    return inspection2;
   }
   if (git(marketplaceDir, [
     "merge-base",
@@ -177,27 +208,51 @@ function checkMarketplace(context) {
     "HEAD",
     "origin/main"
   ]).status === 0) {
-    return {
-      status: "OK",
-      name: "marketplace",
-      detail: "cached clone can fast-forward to origin/main",
-      remedy: ""
+    const inspection2 = {
+      directory: marketplaceDir,
+      cloneAvailable: true,
+      fetchAvailable: true,
+      result: {
+        status: "OK",
+        name: "marketplace",
+        detail: "cached clone can fast-forward to origin/main",
+        remedy: ""
+      }
     };
+    inspectionCache.set(context, inspection2);
+    return inspection2;
   }
   if (git(marketplaceDir, ["merge-base", "HEAD", "origin/main"]).status === 0) {
-    return {
-      status: "WARN",
-      name: "marketplace",
-      detail: "cached clone has diverged from origin/main (shared history, not fast-forwardable)",
-      remedy: "/plugin marketplace update ostrom"
+    const inspection2 = {
+      directory: marketplaceDir,
+      cloneAvailable: true,
+      fetchAvailable: true,
+      result: {
+        status: "WARN",
+        name: "marketplace",
+        detail: "cached clone has diverged from origin/main (shared history, not fast-forwardable)",
+        remedy: "/plugin marketplace update ostrom"
+      }
     };
+    inspectionCache.set(context, inspection2);
+    return inspection2;
   }
-  return {
-    status: "FAIL",
-    name: "marketplace",
-    detail: "cached clone and origin/main have unrelated histories (marketplace was republished from a fresh history)",
-    remedy: "/plugin marketplace remove ostrom && /plugin marketplace add onsager-ai/ostrom"
+  const inspection = {
+    directory: marketplaceDir,
+    cloneAvailable: true,
+    fetchAvailable: true,
+    result: {
+      status: "FAIL",
+      name: "marketplace",
+      detail: "cached clone and origin/main have unrelated histories (marketplace was republished from a fresh history)",
+      remedy: "/plugin marketplace remove ostrom && /plugin marketplace add onsager-ai/ostrom"
+    }
   };
+  inspectionCache.set(context, inspection);
+  return inspection;
+}
+function checkMarketplace(context) {
+  return inspectMarketplace(context).result;
 }
 
 // src/checks/parser.ts
@@ -213,7 +268,7 @@ function checkConfigParser() {
 // src/checks/plugin.ts
 import { readFileSync as readFileSync2, statSync as statSync3 } from "node:fs";
 import { join as join3 } from "node:path";
-function field(source, name) {
+function pluginJsonField(source, name) {
   const match = new RegExp(`"${name}"\\s*:\\s*"([^"]*)"`).exec(source);
   return match?.[1] ?? "";
 }
@@ -224,25 +279,20 @@ function isFile2(path) {
     return false;
   }
 }
-function versionAt(pluginRoot2) {
+function pluginVersionAt(pluginRoot2) {
   if (!pluginRoot2) return "";
   const pluginJson = join3(pluginRoot2, ".claude-plugin", "plugin.json");
   if (!isFile2(pluginJson)) return "";
   try {
-    return field(readFileSync2(pluginJson, "utf8"), "version");
+    return pluginJsonField(readFileSync2(pluginJson, "utf8"), "version");
   } catch {
     return "";
   }
 }
-function checkPlugin(context) {
+function resolvePluginInstallation(context) {
   const installedJson = join3(context.configDir, "plugins", "installed_plugins.json");
   if (!isFile2(installedJson)) {
-    return {
-      status: "FAIL",
-      name: "plugin",
-      detail: `no installed_plugins.json at ${installedJson}`,
-      remedy: "/plugin install ostrom@ostrom"
-    };
+    return { kind: "missing-registry", path: installedJson };
   }
   let source = "";
   try {
@@ -251,6 +301,35 @@ function checkPlugin(context) {
   }
   const marker = source.indexOf('"ostrom@ostrom"');
   if (marker < 0) {
+    return { kind: "plugin-absent" };
+  }
+  const block = source.slice(marker);
+  const installPath = pluginJsonField(block, "installPath");
+  const recordedVersion = pluginJsonField(block, "version");
+  const loadedVersion = pluginVersionAt(context.pluginRoot);
+  const installPathVersion = pluginVersionAt(installPath);
+  return {
+    kind: "found",
+    installation: {
+      installPath,
+      recordedVersion,
+      loadedVersion,
+      installPathVersion,
+      registryVersion: installPathVersion || recordedVersion
+    }
+  };
+}
+function checkPlugin(context) {
+  const resolution = resolvePluginInstallation(context);
+  if (resolution.kind === "missing-registry") {
+    return {
+      status: "FAIL",
+      name: "plugin",
+      detail: `no installed_plugins.json at ${resolution.path}`,
+      remedy: "/plugin install ostrom@ostrom"
+    };
+  }
+  if (resolution.kind === "plugin-absent") {
     return {
       status: "FAIL",
       name: "plugin",
@@ -258,12 +337,11 @@ function checkPlugin(context) {
       remedy: "/plugin install ostrom@ostrom"
     };
   }
-  const block = source.slice(marker);
-  const installPath = field(block, "installPath");
-  const recordedVersion = field(block, "version");
-  const loadedVersion = versionAt(context.pluginRoot);
-  const installPathVersion = versionAt(installPath);
-  const registryVersion = installPathVersion || recordedVersion;
+  const {
+    installPathVersion,
+    loadedVersion,
+    registryVersion
+  } = resolution.installation;
   if (loadedVersion && registryVersion) {
     const matchesRegistry = loadedVersion === registryVersion;
     return {
@@ -298,9 +376,180 @@ function checkPlugin(context) {
   };
 }
 
-// src/checks/trace-lease.ts
-import { existsSync, readFileSync as readFileSync3 } from "node:fs";
+// src/checks/plugin-cache-drift.ts
+import { createHash } from "node:crypto";
+import {
+  lstatSync,
+  readFileSync as readFileSync3,
+  readdirSync,
+  readlinkSync
+} from "node:fs";
 import { join as join4 } from "node:path";
+var shippedDirectories = ["skills", "scripts", "hooks", "rules"];
+var marketplacePluginRoot = "plugins/ostrom";
+function blobHash(contents) {
+  return createHash("sha1").update(`blob ${contents.byteLength}\0`).update(contents).digest("hex");
+}
+function installedFiles(pluginRoot2) {
+  const files = /* @__PURE__ */ new Map();
+  function walk(path, relativePath) {
+    const stat = lstatSync(path);
+    if (stat.isDirectory()) {
+      if (relativePath.split("/").includes("node_modules")) return;
+      for (const entry of readdirSync(path, { withFileTypes: true })) {
+        walk(join4(path, entry.name), `${relativePath}/${entry.name}`);
+      }
+      return;
+    }
+    if (!stat.isFile() && !stat.isSymbolicLink()) return;
+    const contents = stat.isSymbolicLink() ? Buffer.from(readlinkSync(path)) : readFileSync3(path);
+    const mode = stat.isSymbolicLink() ? "120000" : stat.mode & 73 ? "100755" : "100644";
+    files.set(relativePath, { mode, object: blobHash(contents) });
+  }
+  for (const directory of shippedDirectories) {
+    const path = join4(pluginRoot2, directory);
+    try {
+      walk(path, directory);
+    } catch (error) {
+      const code = error.code;
+      if (code !== "ENOENT") throw error;
+    }
+  }
+  return files;
+}
+function marketplaceFiles(marketplaceDir) {
+  const result = git(marketplaceDir, [
+    "ls-tree",
+    "-r",
+    "-z",
+    "HEAD",
+    "--",
+    ...shippedDirectories.map(
+      (directory) => `${marketplacePluginRoot}/${directory}`
+    )
+  ]);
+  if (result.status !== 0) return void 0;
+  const files = /* @__PURE__ */ new Map();
+  for (const record of result.stdout.split("\0")) {
+    if (!record) continue;
+    const match = /^(\d+) blob ([0-9a-f]+)\t(.+)$/.exec(record);
+    if (!match?.[1] || !match[2] || !match[3]) continue;
+    const relativePath = match[3].slice(`${marketplacePluginRoot}/`.length);
+    if (relativePath.split("/").includes("node_modules")) continue;
+    files.set(relativePath, { mode: match[1], object: match[2] });
+  }
+  return files;
+}
+function marketplaceVersion(marketplaceDir) {
+  const result = git(marketplaceDir, [
+    "show",
+    `HEAD:${marketplacePluginRoot}/.claude-plugin/plugin.json`
+  ]);
+  if (result.status !== 0) return "";
+  return pluginJsonField(result.stdout, "version");
+}
+function differences(installed, marketplace) {
+  const paths = [.../* @__PURE__ */ new Set([...installed.keys(), ...marketplace.keys()])].sort();
+  const result = [];
+  for (const path of paths) {
+    const installedFile = installed.get(path);
+    const marketplaceFile = marketplace.get(path);
+    if (!installedFile) {
+      result.push(`missing from installed cache: ${path}`);
+    } else if (!marketplaceFile) {
+      result.push(`only in installed cache: ${path}`);
+    } else if (installedFile.object !== marketplaceFile.object) {
+      result.push(`content differs: ${path}`);
+    } else if (installedFile.mode !== marketplaceFile.mode) {
+      result.push(`mode differs: ${path}`);
+    }
+  }
+  return result;
+}
+function summarize(items) {
+  const shown = items.slice(0, 8);
+  const remaining = items.length - shown.length;
+  return remaining > 0 ? `${shown.join("; ")}; plus ${remaining} more` : shown.join("; ");
+}
+function checkPluginCacheDrift(context) {
+  const resolution = resolvePluginInstallation(context);
+  if (resolution.kind !== "found") {
+    const detail = resolution.kind === "missing-registry" ? `installed plugin registry missing at ${resolution.path}` : "ostrom@ostrom not present in installed plugin registry";
+    return {
+      status: "WARN",
+      name: "plugin-cache-drift",
+      detail: `cannot compare shipped files: ${detail}`,
+      remedy: "/plugin install ostrom@ostrom"
+    };
+  }
+  const marketplace = inspectMarketplace(context);
+  if (!marketplace.cloneAvailable || !marketplace.fetchAvailable) {
+    return {
+      status: "WARN",
+      name: "plugin-cache-drift",
+      detail: `cannot compare shipped files: ${marketplace.result.detail}`,
+      remedy: marketplace.result.remedy
+    };
+  }
+  const installedVersion = resolution.installation.registryVersion;
+  const checkoutVersion = marketplaceVersion(marketplace.directory);
+  if (!installedVersion || !checkoutVersion) {
+    return {
+      status: "WARN",
+      name: "plugin-cache-drift",
+      detail: "cannot compare shipped files: installed or marketplace version is unreadable",
+      remedy: "reinstall ostrom@ostrom, then restart the session"
+    };
+  }
+  if (installedVersion !== checkoutVersion) {
+    return {
+      status: "WARN",
+      name: "plugin-cache-drift",
+      detail: `versions differ: installed cache ${installedVersion}, marketplace checkout ${checkoutVersion}`,
+      remedy: "update and reinstall ostrom@ostrom, then restart the session"
+    };
+  }
+  let installed;
+  try {
+    installed = installedFiles(resolution.installation.installPath);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      status: "WARN",
+      name: "plugin-cache-drift",
+      detail: `cannot read installed shipped files: ${message}`,
+      remedy: "reinstall ostrom@ostrom, then restart the session"
+    };
+  }
+  const checkout = marketplaceFiles(marketplace.directory);
+  if (!checkout) {
+    return {
+      status: "WARN",
+      name: "plugin-cache-drift",
+      detail: "cannot read shipped files from the marketplace checkout's current commit",
+      remedy: "/plugin marketplace update ostrom"
+    };
+  }
+  const drift = differences(installed, checkout);
+  if (drift.length > 0) {
+    return {
+      status: "FAIL",
+      name: "plugin-cache-drift",
+      detail: `version ${installedVersion} agrees but shipped files drift: ${summarize(drift)}`,
+      remedy: "update and reinstall ostrom@ostrom, then restart the session"
+    };
+  }
+  return {
+    status: "OK",
+    name: "plugin-cache-drift",
+    detail: `version ${installedVersion} and shipped files agree with the marketplace checkout`,
+    remedy: ""
+  };
+}
+
+// src/checks/trace-lease.ts
+import { existsSync, readFileSync as readFileSync4 } from "node:fs";
+import { join as join5 } from "node:path";
 var TRACE_STALE_SECONDS = 24 * 60 * 60;
 var MAX_DATE_EPOCH_SECONDS = 864e10;
 function nowEpoch(context) {
@@ -403,7 +652,7 @@ function leaseHealth(path, now) {
   }
   let source;
   try {
-    source = readFileSync3(path, "utf8");
+    source = readFileSync4(path, "utf8");
   } catch {
     return {
       status: "WARN",
@@ -443,10 +692,10 @@ function leaseHealth(path, now) {
   };
 }
 function checkTraceLease(context) {
-  const dataDir = join4(context.configDir, "ostrom");
+  const dataDir = join5(context.configDir, "ostrom");
   const now = nowEpoch(context);
   const trace = traceHealth(context.readTrace(), now);
-  const lease = leaseHealth(join4(dataDir, "sprint.lease"), now);
+  const lease = leaseHealth(join5(dataDir, "sprint.lease"), now);
   const warned = trace.status === "WARN" || lease.status === "WARN";
   return {
     status: warned ? "WARN" : "OK",
@@ -553,8 +802,8 @@ function checkWorkOrders(context) {
 }
 
 // src/lib/config.ts
-import { existsSync as existsSync2, readFileSync as readFileSync4 } from "node:fs";
-import { join as join5 } from "node:path";
+import { existsSync as existsSync2, readFileSync as readFileSync5 } from "node:fs";
+import { join as join6 } from "node:path";
 function stripComment(input) {
   let singleQuoted = false;
   let doubleQuoted = false;
@@ -629,7 +878,7 @@ function parseOstromYaml(source) {
 function load(path) {
   if (!existsSync2(path)) return {};
   try {
-    return parseOstromYaml(readFileSync4(path, "utf8"));
+    return parseOstromYaml(readFileSync5(path, "utf8"));
   } catch {
     return {};
   }
@@ -653,9 +902,9 @@ function merge(base, override) {
 }
 function resolveTouchConfig(pluginRoot2, configDir2, cwd) {
   const paths = [
-    join5(pluginRoot2, "config", "touch-defaults.yaml"),
-    join5(configDir2, "ostrom", "config.yaml"),
-    join5(cwd, ".ostrom", "config.yaml")
+    join6(pluginRoot2, "config", "touch-defaults.yaml"),
+    join6(configDir2, "ostrom", "config.yaml"),
+    join6(cwd, ".ostrom", "config.yaml")
   ];
   const config = paths.reduce(
     (resolved, path) => merge(resolved, load(path)),
@@ -672,9 +921,9 @@ function resolveTouchConfig(pluginRoot2, configDir2, cwd) {
 }
 function resolveMandateSearchRoots(pluginRoot2, configDir2, cwd) {
   const paths = [
-    join5(pluginRoot2, "config", "mandate-defaults.yaml"),
-    join5(configDir2, "ostrom", "mandates.yaml"),
-    join5(cwd, ".ostrom", "mandates.yaml")
+    join6(pluginRoot2, "config", "mandate-defaults.yaml"),
+    join6(configDir2, "ostrom", "mandates.yaml"),
+    join6(cwd, ".ostrom", "mandates.yaml")
   ];
   const config = paths.reduce(
     (resolved, path) => merge(resolved, load(path)),
@@ -685,7 +934,7 @@ function resolveMandateSearchRoots(pluginRoot2, configDir2, cwd) {
 }
 function expandTilde(path, home2) {
   if (path === "~") return home2;
-  if (path.startsWith("~/")) return join5(home2, path.slice(2));
+  if (path.startsWith("~/")) return join6(home2, path.slice(2));
   return path;
 }
 
@@ -718,11 +967,11 @@ import {
   accessSync,
   constants,
   existsSync as existsSync3,
-  lstatSync,
+  lstatSync as lstatSync2,
   realpathSync,
   statSync as statSync4
 } from "node:fs";
-import { dirname, join as join6 } from "node:path";
+import { dirname, join as join7 } from "node:path";
 function insideGit(path) {
   return git(path, ["rev-parse", "--is-inside-work-tree"]).status === 0;
 }
@@ -766,13 +1015,13 @@ function checkTouchDurability(context) {
     targetDetail = `unknown provider '${config.provider}' (durability undetermined)`;
     targetRemedy = "check the resolved touch config's provider value";
   }
-  const userConfig = join6(context.configDir, "ostrom", "config.yaml");
+  const userConfig = join7(context.configDir, "ostrom", "config.yaml");
   let configStatus;
   let configDetail;
   let configRemedy;
   let symlink = false;
   try {
-    symlink = lstatSync(userConfig).isSymbolicLink();
+    symlink = lstatSync2(userConfig).isSymbolicLink();
   } catch {
   }
   if (symlink) {
@@ -988,8 +1237,8 @@ function checkGatekeeperPass(context) {
 }
 
 // src/checks/publish.ts
-import { existsSync as existsSync4, readFileSync as readFileSync5 } from "node:fs";
-import { join as join7 } from "node:path";
+import { existsSync as existsSync4, readFileSync as readFileSync6 } from "node:fs";
+import { join as join8 } from "node:path";
 function nowEpoch3(context) {
   const explicit = context.env.MANDATE_NOW_EPOCH;
   if (explicit && /^\d+$/.test(explicit)) return Number(explicit);
@@ -1004,8 +1253,8 @@ function object3(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 function checkPublish(context) {
-  const publishDir = context.env.MANDATE_PUBLISH_DIR ?? join7(context.configDir, "ostrom", "publish");
-  const manifestPath = join7(publishDir, "manifest.json");
+  const publishDir = context.env.MANDATE_PUBLISH_DIR ?? join8(context.configDir, "ostrom", "publish");
+  const manifestPath = join8(publishDir, "manifest.json");
   if (!existsSync4(manifestPath)) {
     return {
       status: "WARN",
@@ -1016,7 +1265,7 @@ function checkPublish(context) {
   }
   let manifest;
   try {
-    manifest = JSON.parse(readFileSync5(manifestPath, "utf8"));
+    manifest = JSON.parse(readFileSync6(manifestPath, "utf8"));
   } catch {
     return {
       status: "WARN",
@@ -1079,13 +1328,13 @@ function createTraceReader(configDir2) {
   let cached;
   return () => {
     if (cached) return cached;
-    const path = join8(configDir2, "ostrom", "sprint.jsonl");
+    const path = join9(configDir2, "ostrom", "sprint.jsonl");
     if (!existsSync5(path)) {
       cached = { exists: false };
       return cached;
     }
     try {
-      cached = { exists: true, content: readFileSync6(path, "utf8") };
+      cached = { exists: true, content: readFileSync7(path, "utf8") };
     } catch (error) {
       cached = { exists: true, error };
     }
@@ -1103,6 +1352,7 @@ function runDoctor(options) {
   const results = [
     checkPlugin(context),
     checkMarketplace(context),
+    checkPluginCacheDrift(context),
     checkRulesLayers(context),
     checkTouchDurability(context),
     checkProviderReachable(context),

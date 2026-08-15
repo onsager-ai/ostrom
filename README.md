@@ -52,6 +52,14 @@ inside one plugin.
 - `bootstrap.sh` — one command to make a fresh environment ostrom-aware (user-level enroll + config provisioning)
 - `LICENSE` — MIT
 
+### Changing shipped skills
+
+Files matching `plugins/*/skills/*/SKILL.md` are shipped behaviour, not
+documentation: builder, gatekeeper, and desk sessions execute that text from
+the installed plugin cache. Changing a skill body requires changing the
+`version` field in that same plugin's `.claude-plugin/plugin.json`. CI enforces
+this requirement per plugin so a protocol change cannot remain hidden behind
+an unchanged cache key.
 ### Rust CLI (phase 1)
 
 The Rust workspace is additive: systemd and the plugin still invoke the Bash
