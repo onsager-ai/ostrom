@@ -45,6 +45,11 @@ impl OstromPaths {
     pub fn trace_file(&self) -> PathBuf {
         self.state.join("sprint.jsonl")
     }
+
+    #[must_use]
+    pub fn sweep_journal_file(&self) -> PathBuf {
+        self.state.join("sweep-passes.jsonl")
+    }
 }
 
 #[cfg(test)]
