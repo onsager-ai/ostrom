@@ -35,8 +35,17 @@ impl JsonlSweepStore {
     #[must_use]
     pub fn new(paths: &OstromPaths) -> Self {
         Self {
-            journal: paths.state.join("sweep-passes.jsonl"),
+            journal: paths.sweep_journal_file(),
         }
+    }
+
+    fn decode_record(line: &str) -> Result<SweepPass, StoreFault> {
+        let pass: SweepPass =
+            serde_json::from_str(line).map_err(|_| StoreFault::MalformedRecord)?;
+        if pass.attempt.schema_version != STORE_SCHEMA_VERSION {
+            return Err(StoreFault::UnsupportedSchema);
+        }
+        Ok(pass)
     }
 
     fn read_records(&self) -> Result<Vec<SweepPass>, StoreFault> {
@@ -44,10 +53,7 @@ impl JsonlSweepStore {
             return Ok(Vec::new());
         }
         let contents = fs::read_to_string(&self.journal).map_err(|_| StoreFault::Read)?;
-        contents
-            .lines()
-            .map(|line| serde_json::from_str(line).map_err(|_| StoreFault::MalformedRecord))
-            .collect()
+        contents.lines().map(Self::decode_record).collect()
     }
 
     fn find_record_by_pass_id(&self, pass_id: &PassId) -> Result<Option<SweepPass>, StoreFault> {
@@ -60,9 +66,7 @@ impl JsonlSweepStore {
             let identity: StoredPassIdentity =
                 serde_json::from_str(&line).map_err(|_| StoreFault::MalformedRecord)?;
             if &identity.attempt.pass_id == pass_id {
-                return serde_json::from_str(&line)
-                    .map(Some)
-                    .map_err(|_| StoreFault::MalformedRecord);
+                return Self::decode_record(&line).map(Some);
             }
         }
         Ok(None)
@@ -104,7 +108,7 @@ impl SweepStore for JsonlSweepStore {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs::OpenOptions, io::Write};
+    use std::{fs, fs::OpenOptions, io::Write};
 
     use ostrom_core::{
         AttemptOutcome, PassAttempt, PassId, STORE_SCHEMA_VERSION, StoreFault, SweepPass,
@@ -195,6 +199,67 @@ mod tests {
         assert_eq!(
             store.passes().await.expect_err("full read checks all rows"),
             StoreFault::MalformedRecord
+        );
+    }
+
+    #[tokio::test]
+    async fn jsonl_bytes_follow_the_bash_compact_line_discipline() {
+        let fixture = tempdir().expect("temp dir");
+        let paths = OstromPaths {
+            config: fixture.path().join("config"),
+            state: fixture.path().join("state"),
+        };
+        let mut store = JsonlSweepStore::new(&paths);
+        let pass = pass("synthetic-byte-parity");
+        store.write_pass(&pass).await.expect("write pass");
+
+        let expected = concat!(
+            r#"{"attempt":{"schema_version":1,"pass_id":"synthetic-byte-parity","started_at":"2030-01-02T03:04:05Z","outcome":"failed"},"queue":[],"gates":[],"states":[]}"#,
+            "\n"
+        );
+        assert_eq!(
+            fs::read(&store.journal).expect("read journal"),
+            expected.as_bytes(),
+            "the file implementation must use the same compact JSON plus newline bytes as jq -c"
+        );
+
+        let before_duplicate = fs::read(&store.journal).expect("read before duplicate");
+        assert_eq!(
+            store.write_pass(&pass).await.expect("repeat pass"),
+            WriteDisposition::Unchanged
+        );
+        assert_eq!(
+            fs::read(&store.journal).expect("read after duplicate"),
+            before_duplicate,
+            "idempotency must be absence of a write, not a duplicate marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_historical_schema_is_a_named_fault() {
+        let fixture = tempdir().expect("temp dir");
+        let paths = OstromPaths {
+            config: fixture.path().join("config"),
+            state: fixture.path().join("state"),
+        };
+        fs::create_dir_all(&paths.state).expect("state dir");
+        let mut unsupported = pass("synthetic-future-schema");
+        unsupported.attempt.schema_version = STORE_SCHEMA_VERSION + 1;
+        fs::write(
+            paths.sweep_journal_file(),
+            format!(
+                "{}\n",
+                serde_json::to_string(&unsupported).expect("serialize fixture")
+            ),
+        )
+        .expect("write fixture");
+
+        assert_eq!(
+            JsonlSweepStore::new(&paths)
+                .passes()
+                .await
+                .expect_err("unsupported schema must not be read as current"),
+            StoreFault::UnsupportedSchema
         );
     }
 }
