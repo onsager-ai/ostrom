@@ -21,6 +21,8 @@ DEFAULT_DAILY_CAP_USD=50
 # collision cap for tests; each project otherwise defaults to one implementer.
 DEFAULT_MAX_IMPLEMENTERS=2
 DEFAULT_MAX_IMPLEMENTERS_PER_REPOSITORY=1
+REMOTE_BRANCH_PAGE_SIZE=100
+REMOTE_BRANCH_PAGE_LIMIT=100
 IMPLEMENTER_LEASE_TTL_SECONDS="${MANDATE_IMPLEMENTER_LEASE_TTL_SECONDS:-2592000}"
 TRACE_FILE="$MANDATE_DATA_DIR/sprint.jsonl"
 GH_AS_BIN="${MANDATE_GH_AS_BIN:-$SCRIPT_DIR/gh-as.sh}"
@@ -47,6 +49,11 @@ token_ceiling="$(jq -r '.token_ceiling' "$order_file")"
 branch_name="$(jq -r '.branch_name' "$order_file")"
 item_hash="$(bash "$SCRIPT_DIR/work-order.sh" item-hash "$item_id")"
 unit_name="ostrom-implementer-${item_hash:0:16}"
+branch_listing_outcome=""
+branch_listing_page_count=0
+branch_listing_branch_count=0
+branch_listing_matched_branch=""
+branch_listing_error=""
 
 append_dispatch_failure() {
   local reason="$1"
@@ -67,6 +74,11 @@ append_dispatch_failure() {
     --arg branch_name "$preserved_branch" \
     --arg repository "$failed_repository" --arg head_sha "$head_sha" \
     --arg ahead_of_default "$ahead_of_default" \
+    --arg branch_listing_outcome "$branch_listing_outcome" \
+    --argjson branch_listing_page_count "$branch_listing_page_count" \
+    --argjson branch_listing_branch_count "$branch_listing_branch_count" \
+    --arg branch_listing_matched_branch "$branch_listing_matched_branch" \
+    --arg branch_listing_error "$branch_listing_error" \
     '{schema_version: 1, item_id: $item_id, order_id: $order_id,
       unit_name: $unit_name, backend: $backend,
       cost_ceiling_usd: $cost_ceiling_usd, token_ceiling: $token_ceiling,
@@ -80,8 +92,29 @@ append_dispatch_failure() {
         elif $ahead_of_default == "unknown" then "unknown"
         else ($ahead_of_default | tonumber) end),
       usage: {input_tokens: 0, cached_input_tokens: 0,
-        output_tokens: 0, reasoning_output_tokens: 0}}')"
+        output_tokens: 0, reasoning_output_tokens: 0}}
+      | if $branch_listing_outcome == "" then . else
+          .branch_listing = {
+            outcome: $branch_listing_outcome,
+            page_count: $branch_listing_page_count,
+            branch_count: $branch_listing_branch_count,
+            matched_branch: (if $branch_listing_matched_branch == "" then null
+              else $branch_listing_matched_branch end),
+            error: (if $branch_listing_error == "" then null
+              else $branch_listing_error end)
+          }
+        end')"
   bash "$SCRIPT_DIR/trace.sh" append work-failed "$failed_fact" '{}' >/dev/null
+}
+
+refuse_degraded_branch_listing() {
+  branch_listing_outcome=listing-degraded
+  branch_listing_error="${1:0:2000}"
+  append_dispatch_failure branch-listing-degraded 0 "" "" "$repository" ||
+    echo "ostrom dispatch: could not record degraded branch listing" >&2
+  printf 'ostrom dispatch: could not verify remote branches for %s in %s: %s\n' \
+    "$item_id" "$repository" "$branch_listing_error" >&2
+  exit 1
 }
 
 local_default_ref() {
@@ -171,24 +204,66 @@ fi
 # history. Enumerate remote state through the builder credential and reject
 # only work that has not landed before resolving the backend, acquiring the
 # item lease, or calculating either concurrency or spend reservations.
-remote_branch_pages="$({
-  bash "$GH_AS_BIN" builder "$repository" \
-    gh api --paginate --slurp "repos/$repository/branches?per_page=100"
-} 2>/dev/null)" || {
-  echo "ostrom dispatch: could not verify remote branches for $item_id in $repository" >&2
-  exit 1
-}
-if ! jq -e '
-  type == "array"
-  and all(.[]; type == "array")
-  and all(.[][];
-    type == "object"
-    and (.name | type == "string")
-    and (.commit.sha | type == "string" and test("^[0-9a-fA-F]{40}$")))
-' >/dev/null 2>&1 <<<"$remote_branch_pages"; then
-  echo "ostrom dispatch: could not verify remote branches for $item_id in $repository: invalid response" >&2
-  exit 1
-fi
+# Walk pages explicitly instead of trusting gh's Link-header pagination. A
+# short terminal page proves the scan reached the end; a full page always
+# requires another successful read. This also handles repositories whose
+# branch count is an exact multiple of the page size by requiring the empty
+# page that follows it. As with repair-prs.sh's query cap, reaching the bound
+# is an unproven negative and therefore refuses the dispatch.
+remote_branch_page_lines=""
+branch_page_number=1
+while [ "$branch_page_number" -le "$REMOTE_BRANCH_PAGE_LIMIT" ]; do
+  branch_stderr_file="$(mktemp "${TMPDIR:-/tmp}/ostrom-dispatch-branches.XXXXXX")" ||
+    refuse_degraded_branch_listing "could not allocate branch-listing diagnostics"
+  branch_query_status=0
+  if remote_branch_page="$({
+    bash "$GH_AS_BIN" builder "$repository" \
+      gh api "repos/$repository/branches?per_page=$REMOTE_BRANCH_PAGE_SIZE&page=$branch_page_number"
+  } 2>"$branch_stderr_file")"; then
+    :
+  else
+    branch_query_status=$?
+  fi
+  remote_branch_stderr="$(<"$branch_stderr_file")"
+  rm -f "$branch_stderr_file"
+
+  if [ "$branch_query_status" -ne 0 ]; then
+    branch_query_error="page $branch_page_number failed (rc=$branch_query_status)"
+    if [ -n "$remote_branch_stderr" ]; then
+      branch_query_error="$branch_query_error: $remote_branch_stderr"
+    fi
+    refuse_degraded_branch_listing "$branch_query_error"
+  fi
+  if [ -n "$remote_branch_stderr" ]; then
+    refuse_degraded_branch_listing \
+      "page $branch_page_number wrote stderr: $remote_branch_stderr"
+  fi
+  if ! jq -e --argjson page_size "$REMOTE_BRANCH_PAGE_SIZE" '
+    type == "array"
+    and length <= $page_size
+    and all(.[];
+      type == "object"
+      and (.name | type == "string")
+      and (.commit.sha | type == "string" and test("^[0-9a-fA-F]{40}$")))
+  ' >/dev/null 2>&1 <<<"$remote_branch_page"; then
+    refuse_degraded_branch_listing \
+      "page $branch_page_number response was malformed"
+  fi
+
+  branch_page_length="$(jq 'length' <<<"$remote_branch_page")"
+  branch_listing_page_count=$((branch_listing_page_count + 1))
+  branch_listing_branch_count=$((branch_listing_branch_count + branch_page_length))
+  remote_branch_page_lines+="$remote_branch_page"$'\n'
+  if [ "$branch_page_length" -lt "$REMOTE_BRANCH_PAGE_SIZE" ]; then
+    break
+  fi
+  if [ "$branch_page_number" -eq "$REMOTE_BRANCH_PAGE_LIMIT" ]; then
+    refuse_degraded_branch_listing \
+      "listing reached page limit $REMOTE_BRANCH_PAGE_LIMIT without proving exhaustion"
+  fi
+  branch_page_number=$((branch_page_number + 1))
+done
+remote_branch_pages="$(jq -sc '.' <<<"$remote_branch_page_lines")"
 
 item_number="${item_id##*#}"
 case "$item_number" in *[!0-9]*|'') item_number="" ;; esac
@@ -205,6 +280,8 @@ matching_remote_branch="$(jq -r \
 ' <<<"$remote_branch_pages")"
 if [ -n "$matching_remote_branch" ]; then
   IFS=$'\t' read -r pushed_branch pushed_head_sha <<<"$matching_remote_branch"
+  branch_listing_outcome=matched
+  branch_listing_matched_branch="$pushed_branch"
   ahead_of_default=unknown
   default_branch="$({
     bash "$GH_AS_BIN" builder "$repository" \
@@ -249,6 +326,8 @@ if [ -n "$matching_remote_branch" ]; then
     echo "ostrom dispatch: remote work already exists: repository=$repository branch=$pushed_branch head=$pushed_head_sha ahead=$ahead_of_default" >&2
     exit 3
   fi
+else
+  branch_listing_outcome=proven-exhaustive-no-match
 fi
 
 codex_unavailable() {
@@ -477,10 +556,22 @@ dispatch_fact="$(jq -cn \
   --arg unit_name "$unit_name" --arg backend "$backend" \
   --argjson cost_ceiling_usd "$cost_ceiling_usd" \
   --argjson token_ceiling "$token_ceiling" \
+  --arg branch_listing_outcome "$branch_listing_outcome" \
+  --argjson branch_listing_page_count "$branch_listing_page_count" \
+  --argjson branch_listing_branch_count "$branch_listing_branch_count" \
+  --arg branch_listing_matched_branch "$branch_listing_matched_branch" \
   '{schema_version: 1, item_id: $item_id, order_id: $order_id,
     unit_name: $unit_name, backend: $backend,
     cost_ceiling_usd: $cost_ceiling_usd, token_ceiling: $token_ceiling,
-    cost_usd: null, duration_seconds: 0}')"
+    cost_usd: null, duration_seconds: 0,
+    branch_listing: {
+      outcome: $branch_listing_outcome,
+      page_count: $branch_listing_page_count,
+      branch_count: $branch_listing_branch_count,
+      matched_branch: (if $branch_listing_matched_branch == "" then null
+        else $branch_listing_matched_branch end),
+      error: null
+    }}')"
 if ! bash "$SCRIPT_DIR/trace.sh" append work-dispatched "$dispatch_fact" '{}' >/dev/null; then
   echo "ostrom dispatch: could not record work-dispatched" >&2
   exit 1
