@@ -155,6 +155,7 @@ fi
 case "$source_resolution_status" in
   0) ;;
   10) source_failure_reason=source-repository-linked-worktree-only ;;
+  11) source_failure_reason=source-repository-roots-unconfigured ;;
   *) source_failure_reason=source-repository-not-found ;;
 esac
 if [ "$source_resolution_status" -ne 0 ]; then

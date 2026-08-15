@@ -495,11 +495,12 @@ mandate_project_max_implementers_per_repository() {
 # this matcher so sweep diagnostics, dispatch preflight, and the implementer
 # cannot disagree about what is usable. A linked worktree is evidence that the
 # remote matches, but it is not a safe source checkout: its branch and commits
-# belong to another worktree owner.
+# belong to another worktree owner. Status 11 distinguishes an unconfigured
+# search_roots list from status 1, where roots exist but contain no match.
 mandate_find_source_repository() {
   local repository="$1"
   local config="${2:-}"
-  local root marker candidate remote normalized
+  local root_count root marker candidate remote normalized
   local -a matching_candidates=()
   local -a primary_candidates=()
   local -a linked_candidates=()
@@ -507,6 +508,9 @@ mandate_find_source_repository() {
   if [ -z "$config" ]; then
     config="$(mandate_load_config)" || return
   fi
+
+  root_count="$(jq -er '.search_roots | length' <<<"$config")" || return
+  [ "$root_count" -gt 0 ] || return 11
 
   while IFS= read -r root; do
     [ -d "$root" ] || continue

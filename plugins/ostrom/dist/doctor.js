@@ -552,17 +552,6 @@ function checkWorkOrders(context) {
   };
 }
 
-// src/checks/touch.ts
-import {
-  accessSync,
-  constants,
-  existsSync as existsSync3,
-  lstatSync,
-  realpathSync,
-  statSync as statSync4
-} from "node:fs";
-import { dirname, join as join6 } from "node:path";
-
 // src/lib/config.ts
 import { existsSync as existsSync2, readFileSync as readFileSync4 } from "node:fs";
 import { join as join5 } from "node:path";
@@ -681,13 +670,59 @@ function resolveTouchConfig(pluginRoot2, configDir2, cwd) {
     autoCommit: fileConfig.auto_commit === void 0 ? "False" : pythonStyleString(fileConfig.auto_commit)
   };
 }
+function resolveMandateSearchRoots(pluginRoot2, configDir2, cwd) {
+  const paths = [
+    join5(pluginRoot2, "config", "mandate-defaults.yaml"),
+    join5(configDir2, "ostrom", "mandates.yaml"),
+    join5(cwd, ".ostrom", "mandates.yaml")
+  ];
+  const config = paths.reduce(
+    (resolved, path) => merge(resolved, load(path)),
+    {}
+  );
+  const searchRoots = config.search_roots;
+  return Array.isArray(searchRoots) ? searchRoots : [];
+}
 function expandTilde(path, home2) {
   if (path === "~") return home2;
   if (path.startsWith("~/")) return join5(home2, path.slice(2));
   return path;
 }
 
+// src/checks/dispatch-source-roots.ts
+function checkDispatchSourceRoots(context) {
+  const searchRoots = resolveMandateSearchRoots(
+    context.pluginRoot,
+    context.configDir,
+    context.cwd
+  );
+  if (searchRoots.length === 0) {
+    return {
+      status: "FAIL",
+      name: "dispatch-source-roots",
+      detail: "search_roots is empty; dispatch cannot resolve source repositories",
+      remedy: "configure search_roots with a parent directory containing the roster checkouts"
+    };
+  }
+  const noun = searchRoots.length === 1 ? "root" : "roots";
+  return {
+    status: "OK",
+    name: "dispatch-source-roots",
+    detail: `${searchRoots.length} search ${noun} configured for dispatch`,
+    remedy: ""
+  };
+}
+
 // src/checks/touch.ts
+import {
+  accessSync,
+  constants,
+  existsSync as existsSync3,
+  lstatSync,
+  realpathSync,
+  statSync as statSync4
+} from "node:fs";
+import { dirname, join as join6 } from "node:path";
 function insideGit(path) {
   return git(path, ["rev-parse", "--is-inside-work-tree"]).status === 0;
 }
@@ -1071,6 +1106,7 @@ function runDoctor(options) {
     checkRulesLayers(context),
     checkTouchDurability(context),
     checkProviderReachable(context),
+    checkDispatchSourceRoots(context),
     checkTraceLease(context),
     checkWorkOrders(context),
     checkBuilderPass(context),
