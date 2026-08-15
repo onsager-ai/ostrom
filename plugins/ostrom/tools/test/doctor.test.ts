@@ -561,7 +561,7 @@ describe("doctor golden output", () => {
       },
     });
 
-    expect(report.split("\n").filter(Boolean)).toHaveLength(13);
+    expect(report.split("\n").filter(Boolean)).toHaveLength(14);
     expect(existsSync(missing)).toBe(false);
   });
 
