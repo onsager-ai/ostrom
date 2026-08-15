@@ -100,6 +100,27 @@ function baseFixture(): Fixture {
   );
   mkdirSync(home, { recursive: true });
   mkdirSync(join(configDir, "ostrom"), { recursive: true });
+  const sourceRoot = join(root, "source-root");
+  const sourceRepository = join(
+    sourceRoot,
+    "example-org",
+    "example-repo",
+  );
+  initRepo(sourceRepository, "README.md", "source checkout\n");
+  command(
+    "git",
+    [
+      "remote",
+      "add",
+      "origin",
+      "https://github.com/example-org/example-repo.git",
+    ],
+    sourceRepository,
+  );
+  writeFileSync(
+    join(configDir, "ostrom", "mandates.yaml"),
+    `search_roots:\n  - ${sourceRoot}\n`,
+  );
   writeFileSync(
     join(configDir, "ostrom", "sprint.jsonl"),
     '{"ts":"2026-08-01T00:00:00Z","kind":"pass-ended","fact":{"owner":"builder-fixture-wake1","outcome":"completed"},"narration":{}}\n' +
@@ -182,6 +203,12 @@ function commonExpected(
     { status: "OK", name: "rules-layers", detail: rulesDetail, remedy: "" },
     touch,
     provider,
+    {
+      status: "OK",
+      name: "dispatch-source-roots",
+      detail: "1 search root configured for dispatch",
+      remedy: "",
+    },
     {
       status: "OK",
       name: "trace-lease",
@@ -360,6 +387,18 @@ describe("doctor golden output", () => {
     );
   });
 
+  it("faults when search_roots is empty because dispatch cannot run", () => {
+    const fixture = baseFixture();
+    writeFileSync(
+      join(fixture.configDir, "ostrom", "mandates.yaml"),
+      "search_roots: []\n",
+    );
+
+    expect(run(fixture)).toContain(
+      "FAIL|dispatch-source-roots|search_roots is empty; dispatch cannot resolve source repositories|configure search_roots with a parent directory containing the roster checkouts\n",
+    );
+  });
+
   it("treats a comment-only user rules layer as correct by design", () => {
     const fixture = baseFixture();
     mkdirSync(join(fixture.configDir, "ostrom"), { recursive: true });
@@ -422,7 +461,7 @@ describe("doctor golden output", () => {
       },
     });
 
-    expect(report.split("\n").filter(Boolean)).toHaveLength(12);
+    expect(report.split("\n").filter(Boolean)).toHaveLength(13);
     expect(existsSync(missing)).toBe(false);
   });
 

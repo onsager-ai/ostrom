@@ -14,8 +14,9 @@ provider: file
 cadence_hours: 1
 stuck_after_days: 7
 
-# Local repository discovery is opt-in. Never guess paths on the principal's
-# machine; a more-specific layer must replace this empty list explicitly.
+# Dispatch scans these parent directories for a git checkout whose origin
+# matches each work order's repository. Dispatch cannot function until at
+# least one root is configured; never guess paths on the principal's machine.
 search_roots: []
 
 # Shared write-surface tripwires. Selectors are case-insensitive qualified

@@ -198,6 +198,24 @@ export function resolveMandateCadenceHours(
     : undefined;
 }
 
+export function resolveMandateSearchRoots(
+  pluginRoot: string,
+  configDir: string,
+  cwd: string,
+): string[] {
+  const paths = [
+    join(pluginRoot, "config", "mandate-defaults.yaml"),
+    join(configDir, "ostrom", "mandates.yaml"),
+    join(cwd, ".ostrom", "mandates.yaml"),
+  ];
+  const config = paths.reduce<Config>(
+    (resolved, path) => merge(resolved, load(path)),
+    {},
+  );
+  const searchRoots = config.search_roots;
+  return Array.isArray(searchRoots) ? searchRoots : [];
+}
+
 export function expandTilde(path: string, home: string): string {
   if (path === "~") return home;
   if (path.startsWith("~/")) return join(home, path.slice(2));

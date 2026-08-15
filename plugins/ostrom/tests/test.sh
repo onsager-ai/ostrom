@@ -1204,6 +1204,55 @@ dispatch_args="$dispatch_fixture/systemd-args"
 dispatch_calls="$dispatch_fixture/systemd-calls"
 : >"$dispatch_calls"
 
+# #129: the shipped empty search_roots list is an explicit dispatch fault,
+# distinct from configured roots that contain no matching checkout. Refusal
+# happens before remote reads, leases, spend reservations, and unit launch;
+# the terminal fact carries every identifier needed to classify it.
+empty_source_config="$dispatch_fixture/empty-source-config"
+empty_source_gh_calls="$dispatch_fixture/empty-source-gh-calls"
+empty_source_systemd_calls="$dispatch_fixture/empty-source-systemd-calls"
+empty_source_stderr="$dispatch_fixture/empty-source.err"
+mkdir -p "$empty_source_config/ostrom"
+cat >"$empty_source_config/ostrom/mandates.yaml" <<'YAML'
+search_roots: []
+YAML
+set +e
+FAKE_GH_CALLS="$empty_source_gh_calls" \
+  CLAUDE_CONFIG_DIR="$empty_source_config" \
+  MANDATE_TRACE_TIME="2026-08-11T02:00:10Z" \
+  MANDATE_NOW_EPOCH="$cap_today_epoch" \
+  MANDATE_GH_AS_BIN="$fake_dispatch_gh" \
+  MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
+  CODEX_BIN="$fake_dispatch_codex" \
+  FAKE_SYSTEMD_ARGS="$dispatch_args" \
+  FAKE_SYSTEMD_CALLS="$empty_source_systemd_calls" \
+  bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$dispatch_order" \
+    >/dev/null 2>"$empty_source_stderr"
+empty_source_status=$?
+set -e
+[ "$empty_source_status" -eq 3 ]
+[ ! -e "$empty_source_gh_calls" ]
+[ ! -e "$empty_source_systemd_calls" ]
+empty_source_item_hash="$(
+  bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash \
+    'example-org/example-repo#123'
+)"
+[ ! -e "$empty_source_config/ostrom/implementer-item-$empty_source_item_hash.lease" ]
+empty_source_order_id="$(jq -r '.order_id' "$dispatch_order")"
+jq -s -e --arg order_id "$empty_source_order_id" '
+  length == 1
+  and .[0].kind == "work-failed"
+  and .[0].fact.item_id == "example-org/example-repo#123"
+  and .[0].fact.order_id == $order_id
+  and .[0].fact.reason == "source-repository-roots-unconfigured"
+  and .[0].fact.repository == "example-org/example-repo"
+  and .[0].fact.cost_usd == 0
+  and ([.[] | select(.kind == "work-dispatched")] | length) == 0
+' "$empty_source_config/ostrom/sprint.jsonl" >/dev/null
+grep -Fq \
+  'source-repository-roots-unconfigured: repository=example-org/example-repo' \
+  "$empty_source_stderr"
+
 # #169: a repository absent from every configured search root is refused
 # locally, before a GitHub read, item lease, spend reservation, or unit launch.
 # The terminal row names both the stable reason and the repository.
@@ -1239,9 +1288,11 @@ missing_source_item_hash="$(
     'example-org/example-repo#123'
 )"
 [ ! -e "$missing_source_config/ostrom/implementer-item-$missing_source_item_hash.lease" ]
-jq -s -e '
+jq -s -e --arg order_id "$empty_source_order_id" '
   length == 1
   and .[0].kind == "work-failed"
+  and .[0].fact.item_id == "example-org/example-repo#123"
+  and .[0].fact.order_id == $order_id
   and .[0].fact.reason == "source-repository-not-found"
   and .[0].fact.repository == "example-org/example-repo"
   and .[0].fact.cost_usd == 0
