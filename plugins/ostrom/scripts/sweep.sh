@@ -234,7 +234,7 @@ sweep_org() {
     # below. This changes no call count: one all-state listing replaces the
     # former open-only listing, then the two populations are split locally.
     if ! gh pr list --repo "$repo" --state all --limit "$query_limit" \
-      --json number,title,body,labels,createdAt,updatedAt,url,isDraft,reviewDecision,statusCheckRollup,closingIssuesReferences,files,state,mergedAt,headRefOid \
+      --json number,title,body,labels,createdAt,updatedAt,url,isDraft,reviewDecision,statusCheckRollup,closingIssuesReferences,files,state,mergedAt,headRefOid,mergeable \
       >"$work/all-prs.json" 2>"$gh_error"; then
       detail="$(tr '\n' ' ' <"$gh_error")"
       echo "mandate sweep: failed to query PRs, CI, and merged heads for $repo${detail:+: $detail}" >&2
@@ -326,6 +326,7 @@ sweep_org() {
           . as $item
           | (if $type == "pr" then ($item | ci_state) else "none" end) as $ci
           | (if $type == "pr" then ($item | linked_issues) else [] end) as $linked
+          | (if $type == "pr" then ($item.mergeable // "") else "" end) as $mergeable
           | {
               id: ($repo + "#" + (.number | tostring)),
               repo: $repo,
@@ -358,7 +359,12 @@ sweep_org() {
               opened: .createdAt,
               updated: .updatedAt,
               ci: $ci,
-              ready: ($type == "pr" and (.isDraft | not) and $ci == "passing"),
+              ready: (
+                $type == "pr"
+                and (.isDraft | not)
+                and $ci == "passing"
+                and $mergeable != "CONFLICTING"
+              ),
               review: (.reviewDecision // "")
             }
           | if $semantic_enabled
@@ -371,6 +377,7 @@ sweep_org() {
               (.refs | sort | map(tostring) | join(",")),
               (.files | sort | join(",")),
               .ci,
+              $mergeable,
               (.ready | tostring),
               .review
             ] | join("|"));

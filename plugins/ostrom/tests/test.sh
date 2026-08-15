@@ -93,6 +93,7 @@ write_config
 gatekeep_skill="$PLUGIN_ROOT/skills/gatekeep/SKILL.md"
 merge_skill="$PLUGIN_ROOT/skills/merge/SKILL.md"
 work_skill="$PLUGIN_ROOT/skills/work/SKILL.md"
+repair_script="$PLUGIN_ROOT/scripts/repair-prs.sh"
 role_boundary_doc="$PLUGIN_ROOT/../../docs/role-permission-boundaries.md"
 work_frontmatter="$(
   awk 'NR == 1 { next } /^---$/ { exit } { print }' "$work_skill"
@@ -162,6 +163,20 @@ grep -q 'builder-<session>-wake<N>' "$work_skill"
 for trace_kind in pass-started item-worked pass-ended; do
   grep -q "trace.sh\" append $trace_kind" "$work_skill"
 done
+grep -q 'scripts/repair-prs.sh' "$work_skill"
+grep -Fq 'per-pass cap is **3 repair attempts**' "$work_skill"
+grep -Fq 'Each `pr-repair` fact has `role`, `owner`, `repo`, `ref`' \
+  "$work_skill"
+repair_protocol_line="$(grep -n 'scripts/repair-prs.sh' "$work_skill" | head -n 1 | cut -d: -f1)"
+selection_protocol_line="$(grep -n 'Then read, in order:' "$work_skill" | head -n 1 | cut -d: -f1)"
+if [ "$repair_protocol_line" -ge "$selection_protocol_line" ]; then
+  echo "builder repair must run before queue-backed work selection" >&2
+  exit 1
+fi
+if grep -nE 'push .*(--force|-f )|rebase|reset --hard' "$repair_script"; then
+  echo "published PR repair must preserve the reviewed history" >&2
+  exit 1
+fi
 
 # One App erases actor-level role attribution, so every authoring protocol
 # carries a self-asserted role marker while every consumer says that marker is
@@ -3181,6 +3196,238 @@ if grep -q 'documented Claude implementer fallback' "$work_skill"; then
 fi
 grep -q 'order stays undispatched' "$work_skill"
 
+# #185: the builder repairs its own already-published conflicting pull
+# requests before selecting more work. The fixture has a dispatchable queue
+# row at the same time as two clean forward merges, one genuine content
+# conflict, a failing builder PR, a human PR carrying the advisory marker, and
+# one eligible PR beyond the cap.
+published_repair="$fixture/published-repair"
+published_repair_config="$published_repair/config"
+published_repair_source="$published_repair/source"
+published_repair_remote="$published_repair/origin.git"
+published_repair_bin="$published_repair/bin"
+published_repair_prs="$published_repair/prs.json"
+published_repair_calls="$published_repair/calls"
+mkdir -p "$published_repair_config/ostrom" "$published_repair_source" \
+  "$published_repair_bin"
+cat >"$published_repair_config/ostrom/mandates.yaml" <<YAML
+provider: file
+cadence_hours: 24
+stuck_after_days: 1
+search_roots:
+  - $published_repair
+bounce_all: []
+projects:
+  - repo: example-org/repair-repo
+    delegated:
+      - label:maintenance
+    excluded: []
+    reserved: []
+    default: delegated
+    paused: false
+    bounce: []
+YAML
+cat >"$published_repair_config/ostrom/queue.jsonl" <<'JSON'
+{"id":"example-org/repair-repo#99","repo":"example-org/repair-repo","ref":"#99","title":"Dispatchable work","kind":"moved","mandate":{"reason":"default:delegated"},"state":"pending","opened":"2026-08-01T00:00:00Z"}
+JSON
+git -C "$published_repair_source" init -b main >/dev/null
+git -C "$published_repair_source" config user.name "Ostrom Test"
+git -C "$published_repair_source" config user.email "ostrom@example.test"
+printf 'initial\n' >"$published_repair_source/conflict.txt"
+git -C "$published_repair_source" add conflict.txt
+git -C "$published_repair_source" commit -m 'fixture initial' >/dev/null
+published_repair_initial="$(git -C "$published_repair_source" rev-parse HEAD)"
+git init --bare "$published_repair_remote" >/dev/null
+git -C "$published_repair_source" remote add origin "$published_repair_remote"
+git -C "$published_repair_source" push -u origin main >/dev/null
+
+create_published_repair_branch() {
+  local branch="$1"
+  local path="$2"
+  local content="$3"
+  git -C "$published_repair_source" switch -c "$branch" \
+    "$published_repair_initial" >/dev/null
+  printf '%s\n' "$content" >"$published_repair_source/$path"
+  git -C "$published_repair_source" add "$path"
+  git -C "$published_repair_source" commit -m "fixture $branch" >/dev/null
+  git -C "$published_repair_source" push origin "$branch" >/dev/null
+  git -C "$published_repair_source" rev-parse HEAD
+}
+
+published_repair_head_1="$(
+  create_published_repair_branch builder-clean-one clean-one.txt 'clean one'
+)"
+published_repair_head_2="$(
+  create_published_repair_branch builder-conflict conflict.txt 'head version'
+)"
+published_repair_head_3="$(
+  create_published_repair_branch builder-failing failing.txt 'failing checks'
+)"
+published_repair_head_4="$(
+  create_published_repair_branch human-branch human.txt 'human work'
+)"
+published_repair_head_5="$(
+  create_published_repair_branch builder-clean-two clean-two.txt 'clean two'
+)"
+published_repair_head_6="$(
+  create_published_repair_branch builder-capped capped.txt 'beyond cap'
+)"
+git -C "$published_repair_source" switch main >/dev/null
+printf 'base version\n' >"$published_repair_source/conflict.txt"
+printf 'base advanced\n' >"$published_repair_source/base-forward.txt"
+git -C "$published_repair_source" add conflict.txt base-forward.txt
+git -C "$published_repair_source" commit -m 'fixture base advance' >/dev/null
+published_repair_base="$(git -C "$published_repair_source" rev-parse HEAD)"
+git -C "$published_repair_source" push origin main >/dev/null
+
+jq -cn \
+  --arg h1 "$published_repair_head_1" \
+  --arg h2 "$published_repair_head_2" \
+  --arg h3 "$published_repair_head_3" \
+  --arg h4 "$published_repair_head_4" \
+  --arg h5 "$published_repair_head_5" \
+  --arg h6 "$published_repair_head_6" '
+    def checks($conclusion):
+      [{name: "test", conclusion: $conclusion, status: "COMPLETED"}];
+    def pr($number; $head; $sha; $author; $is_bot; $conclusion): {
+      number: $number,
+      body: "Synthetic fixture.\n\nOstrom-Role: builder\n",
+      author: {login: $author, is_bot: $is_bot},
+      mergeable: "CONFLICTING",
+      statusCheckRollup: checks($conclusion),
+      headRefName: $head,
+      baseRefName: "main",
+      headRefOid: $sha,
+      isCrossRepository: false
+    };
+    [
+      pr(1; "builder-clean-one"; $h1; "ostrom-builder[bot]"; true; "SUCCESS"),
+      pr(2; "builder-conflict"; $h2; "ostrom-builder[bot]"; true; "SUCCESS"),
+      pr(3; "builder-failing"; $h3; "ostrom-builder[bot]"; true; "FAILURE"),
+      pr(4; "human-branch"; $h4; "human-author"; false; "SUCCESS"),
+      pr(5; "builder-clean-two"; $h5; "ostrom-builder[bot]"; true; "SUCCESS"),
+      pr(6; "builder-capped"; $h6; "ostrom-builder[bot]"; true; "SUCCESS")
+    ]
+  ' >"$published_repair_prs"
+
+published_repair_gh_as="$published_repair_bin/gh-as"
+cat >"$published_repair_gh_as" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"$PUBLISHED_REPAIR_CALLS"
+role="$1"
+repository="$2"
+shift 2
+[ "$role" = builder ]
+[ "$repository" = example-org/repair-repo ]
+if [ "$1" = gh ] && [ "$2" = pr ] && [ "$3" = list ]; then
+  cat "$PUBLISHED_REPAIR_PRS"
+  exit 0
+fi
+args=("$@")
+for index in "${!args[@]}"; do
+  case "${args[$index]}" in
+    https://github.com/example-org/repair-repo.git)
+      args[$index]="$PUBLISHED_REPAIR_REMOTE"
+      ;;
+  esac
+done
+exec "${args[@]}"
+SH
+chmod +x "$published_repair_gh_as"
+
+published_repair_summary="$(
+  CLAUDE_CONFIG_DIR="$published_repair_config" \
+    MANDATE_GH_AS_BIN="$published_repair_gh_as" \
+    MANDATE_TRACE_TIME="2026-08-15T00:00:00Z" \
+    PUBLISHED_REPAIR_CALLS="$published_repair_calls" \
+    PUBLISHED_REPAIR_PRS="$published_repair_prs" \
+    PUBLISHED_REPAIR_REMOTE="$published_repair_remote" \
+    bash "$PLUGIN_ROOT/scripts/repair-prs.sh" builder-fixture-wake185
+)"
+jq -e '
+  .cap == 3
+  and .attempted == 3
+  and .repaired == 2
+  and .conflicted == 1
+  and .skipped == 1
+  and .failed == 0
+' <<<"$published_repair_summary" >/dev/null
+
+published_repair_new_head_1="$(
+  git --git-dir="$published_repair_remote" rev-parse builder-clean-one
+)"
+[ "$published_repair_new_head_1" != "$published_repair_head_1" ]
+published_repair_parents_1="$(
+  git --git-dir="$published_repair_remote" rev-list --parents -n 1 \
+    builder-clean-one
+)"
+[ "$(awk '{print $2}' <<<"$published_repair_parents_1")" = \
+  "$published_repair_head_1" ]
+[ "$(awk '{print $3}' <<<"$published_repair_parents_1")" = \
+  "$published_repair_base" ]
+git --git-dir="$published_repair_remote" merge-base --is-ancestor \
+  "$published_repair_base" builder-clean-one
+[ "$(git --git-dir="$published_repair_remote" rev-parse \
+  "$published_repair_head_1^")" = "$published_repair_initial" ]
+[ "$(git --git-dir="$published_repair_remote" log -1 \
+  --format='%(trailers:key=Ostrom-Role,valueonly)' builder-clean-one)" = builder ]
+
+published_repair_parents_5="$(
+  git --git-dir="$published_repair_remote" rev-list --parents -n 1 \
+    builder-clean-two
+)"
+[ "$(awk '{print $2}' <<<"$published_repair_parents_5")" = \
+  "$published_repair_head_5" ]
+[ "$(awk '{print $3}' <<<"$published_repair_parents_5")" = \
+  "$published_repair_base" ]
+git --git-dir="$published_repair_remote" merge-base --is-ancestor \
+  "$published_repair_base" builder-clean-two
+
+# Genuine conflict, failing checks, human authorship, and the cap all leave
+# the published heads byte-for-byte unchanged.
+[ "$(git --git-dir="$published_repair_remote" rev-parse builder-conflict)" = \
+  "$published_repair_head_2" ]
+[ "$(git --git-dir="$published_repair_remote" rev-parse builder-failing)" = \
+  "$published_repair_head_3" ]
+[ "$(git --git-dir="$published_repair_remote" rev-parse human-branch)" = \
+  "$published_repair_head_4" ]
+[ "$(git --git-dir="$published_repair_remote" rev-parse builder-capped)" = \
+  "$published_repair_head_6" ]
+
+published_repair_trace="$published_repair_config/ostrom/sprint.jsonl"
+jq -s -e '
+  length == 4
+  and all(.[];
+    .kind == "pr-repair"
+    and .fact.role == "builder"
+    and .fact.owner == "builder-fixture-wake185"
+    and .fact.action == "merge-base-forward"
+    and .fact.cap == 3
+  )
+  and ([.[] | select(.fact.ref == "#1" and .fact.outcome == "repaired")]
+    | length) == 1
+  and ([.[] | select(.fact.ref == "#2" and .fact.outcome == "conflicted"
+    and .fact.conflicted_paths == ["conflict.txt"])] | length) == 1
+  and ([.[] | select(.fact.ref == "#5" and .fact.outcome == "repaired")]
+    | length) == 1
+  and ([.[] | select(.fact.ref == "#6" and .fact.outcome == "skipped-cap"
+    and .narration.reason == "per-pass repair cap reached")] | length) == 1
+  and ([.[] | select(.fact.ref == "#3" or .fact.ref == "#4")] | length) == 0
+' "$published_repair_trace" >/dev/null
+
+[ "$(grep -c '^builder example-org/repair-repo gh pr list ' \
+  "$published_repair_calls")" -eq 1 ]
+[ "$(grep -c ' git .* fetch .*https://github.com/example-org/repair-repo.git ' \
+  "$published_repair_calls")" -eq 3 ]
+[ "$(grep -c ' git .* push https://github.com/example-org/repair-repo.git ' \
+  "$published_repair_calls")" -eq 2 ]
+if grep -Eq 'builder-failing|human-branch|builder-capped' \
+  <(grep ' git .* fetch ' "$published_repair_calls"); then
+  echo "ineligible or capped pull request reached the repair fetch path" >&2
+  exit 1
+fi
+
 # #134: order_id is the value inside the durable order, never the stable
 # filename stem (item_hash). A synthetic builder pass proves the dispatched
 # and worked records join one-to-one, while a pre-cutover ambiguous row remains
@@ -4523,11 +4770,15 @@ if [ "$1 $2" = "pr list" ]; then
   case "$repo" in
     example-org/example-repo)
       pr8_title="fix: routine maintenance"
+      pr8_mergeable="MERGEABLE"
       if [ "${FAKE_GH_MODE:-base}" = "changed" ]; then
         pr8_title="fix: refreshed routine maintenance title"
       fi
+      if [ "${FAKE_GH_MODE:-base}" = "conflicting" ]; then
+        pr8_mergeable="CONFLICTING"
+      fi
       cat <<JSON
-[{"number":8,"title":"$pr8_title","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/pull/8","isDraft":false,"reviewDecision":"","statusCheckRollup":[{"conclusion":"SUCCESS","status":"COMPLETED"}],"closingIssuesReferences":[{"number":42,"labels":[{"name":"maintenance"}]}],"files":[{"path":"src/main.sh"}]},{"number":12,"title":"chore: update the frozen rule using a deliberately enormous descriptive title that cannot fit on one digest line without deterministic truncation","body":"BLOCKED BY example-org/another-repo#20.","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/pull/12","isDraft":false,"reviewDecision":"","statusCheckRollup":[{"conclusion":"SUCCESS","status":"COMPLETED"}],"closingIssuesReferences":[],"files":[{"path":"rules/frozen-rules.md"}]},{"number":13,"labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/pull/13","isDraft":false,"reviewDecision":"","statusCheckRollup":[{"conclusion":"FAILURE","status":"COMPLETED"}],"closingIssuesReferences":[],"files":[]},{"number":16,"title":"docs: nested guide","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/pull/16","isDraft":true,"reviewDecision":"","statusCheckRollup":[],"closingIssuesReferences":[],"files":[{"path":"docs/reference/deep/guide.md"}]}]
+[{"number":8,"title":"$pr8_title","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/pull/8","isDraft":false,"mergeable":"$pr8_mergeable","reviewDecision":"","statusCheckRollup":[{"conclusion":"SUCCESS","status":"COMPLETED"}],"closingIssuesReferences":[{"number":42,"labels":[{"name":"maintenance"}]}],"files":[{"path":"src/main.sh"}]},{"number":12,"title":"chore: update the frozen rule using a deliberately enormous descriptive title that cannot fit on one digest line without deterministic truncation","body":"BLOCKED BY example-org/another-repo#20.","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/pull/12","isDraft":false,"reviewDecision":"","statusCheckRollup":[{"conclusion":"SUCCESS","status":"COMPLETED"}],"closingIssuesReferences":[],"files":[{"path":"rules/frozen-rules.md"}]},{"number":13,"labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/pull/13","isDraft":false,"reviewDecision":"","statusCheckRollup":[{"conclusion":"FAILURE","status":"COMPLETED"}],"closingIssuesReferences":[],"files":[]},{"number":16,"title":"docs: nested guide","labels":[],"createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-30T00:00:00Z","url":"https://example.invalid/pull/16","isDraft":true,"reviewDecision":"","statusCheckRollup":[],"closingIssuesReferences":[],"files":[{"path":"docs/reference/deep/guide.md"}]}]
 JSON
       ;;
     example-org/hub-repo)
@@ -5543,6 +5794,65 @@ if jq -e 'select(.id == "example-org/example-repo#8")' "$queue" >/dev/null; then
   echo "ordinary baseline item was queued" >&2
   exit 1
 fi
+
+# A green PR becoming conflicting is movement for its author to repair, not a
+# fresh principal decision. The mergeability value participates in the
+# fingerprint so the transition is visible even when updatedAt does not move.
+conflicting_sweep="$fixture/conflicting-sweep"
+conflicting_sweep_source="$conflicting_sweep/search/example-org/example-repo"
+mkdir -p "$conflicting_sweep/config/ostrom" "$conflicting_sweep/repo" \
+  "$conflicting_sweep_source"
+write_gatekeeper_secrets "$conflicting_sweep/config"
+git -C "$conflicting_sweep_source" init -b main >/dev/null
+git -C "$conflicting_sweep_source" remote add origin \
+  https://github.com/example-org/example-repo.git
+cat >"$conflicting_sweep/config/ostrom/mandates.yaml" <<YAML
+provider: file
+cadence_hours: 24
+stuck_after_days: 1
+search_roots:
+  - $conflicting_sweep/search
+bounce_all: []
+projects:
+  - repo: example-org/example-repo
+    delegated:
+      - label:maintenance
+    excluded: []
+    reserved: []
+    default: delegated
+    paused: false
+    bounce: []
+YAML
+run_conflicting_sweep() {
+  (
+    cd "$conflicting_sweep/repo"
+    PATH="$fixture/bin:$PATH" \
+      FAKE_GH_MODE="$1" \
+      MANDATE_SWEEP_MODE=full \
+      CLAUDE_CONFIG_DIR="$conflicting_sweep/config" \
+      CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+      bash "$PLUGIN_ROOT/scripts/sweep.sh" >/dev/null
+  )
+}
+run_conflicting_sweep base
+run_conflicting_sweep conflicting
+conflicting_sweep_queue="$conflicting_sweep/config/ostrom/queue.jsonl"
+jq -e '
+  select(.id == "example-org/example-repo#8")
+  | .kind == "moved"
+  and .needs_judgment == false
+  and (.mandate.reason | contains("updated since the read cursor"))
+' "$conflicting_sweep_queue" >/dev/null
+if jq -e '
+    select(.id == "example-org/example-repo#8" and .kind == "decision")
+  ' "$conflicting_sweep_queue" >/dev/null; then
+  echo "conflicting green pull request was classified as a decision" >&2
+  exit 1
+fi
+jq -e '
+  .repos["example-org/example-repo"].items["example-org/example-repo#8"]
+  | .fingerprint | contains("CONFLICTING")
+' "$conflicting_sweep/config/ostrom/state.json" >/dev/null
 
 # Paused projects are queried for issues so their tripwires cannot be paused.
 grep -q $'example-org/another-repo\tissue list' "$fixture/gh-calls"

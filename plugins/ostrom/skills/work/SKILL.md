@@ -20,9 +20,10 @@ on GitHub. Relying on conversation memory makes the work unsustainable.
 
 Run this loop only in a builder session. The builder verifies queue items,
 writes durable work orders, and dispatches implementers. It does not implement,
-review returned diffs, create worktrees, commit, push, or open pull requests in
-this pass. The implementer owns those steps and `/ostrom:gatekeep` independently
-judges what it produces.
+review returned diffs, create implementation worktrees, or open pull requests
+in this pass. The one author-side maintenance exception is step 3's bounded
+repair of already-published builder pull requests. The implementer owns new
+work and `/ostrom:gatekeep` independently judges what it produces.
 
 When an implementer branch has diverged or conflicts, merge the published head
 forward and push ordinarily; never rebase or force-push, because the published
@@ -64,11 +65,42 @@ with an invisible pass.
 
 ## 3. Establish state
 
-Decide whether to sweep, and sweep before reading anything the sweep
-produces. Run the sweep when `state.json` is older than `cadence_hours`, or
-whenever anything has changed the repositories since it ran. A previous pass
-that closed issues or opened pull requests leaves the file young and its
-contents wrong. The sweep is cheap and idempotent; when in doubt, run it.
+Before selecting new work or reading the queue, repair the builder's stale
+published pull requests across the complete configured roster:
+
+```sh
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/repair-prs.sh" "$lease_owner"
+```
+
+This ordering is mandatory even when dispatchable work is already waiting:
+published work outranks producing more work. `repair-prs.sh` considers only an
+open pull request that is both machine-authored and marked with the exact
+`Ostrom-Role: builder` body line, reports every eligible attempt on the trace,
+and leaves human-authored pull requests alone even if they carry that marker.
+It also requires completed green checks and `mergeable == CONFLICTING`.
+
+The per-pass cap is **3 repair attempts**. A content conflict consumes an
+attempt; every otherwise-eligible pull request beyond the cap gets its own
+`pr-repair` trace row with outcome `skipped-cap`, so the bound never silently
+truncates the roster. Each `pr-repair` fact has `role`, `owner`, `repo`, `ref`,
+`action` (`merge-base-forward`), `outcome`, `head_branch`, `base_branch`,
+`head_sha`, `base_sha`, `conflicted_paths`, and `cap`, plus `exit_code` when a
+command returned one. Narration contains only a reason when needed. A
+successful attempt creates a merge commit whose first parent is the published
+head and whose second parent is the fetched base, then pushes it ordinarily.
+A content conflict is aborted locally, records the unmerged paths in fact, and
+does not end the repair scan or the builder pass.
+
+If the repair script fails, route the pass through step 8 cleanup; do not
+select or dispatch new work after an incomplete or invisible repair scan. Read
+its JSON summary from stdout for the report, but do not use a repair conflict
+or an individual push failure as a reason to stop: those outcomes are already
+facts and the script continues through the bounded candidate set.
+
+After the repair scan, sweep before reading anything the sweep produces. A
+successful repair changed a repository and therefore invalidated even a young
+`state.json`; an unsuccessful or empty scan does not make a sweep less useful.
+The sweep is cheap and idempotent, so run it every builder pass here.
 
 ```sh
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/sweep.sh"
@@ -139,7 +171,8 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/gh-as.sh" builder "$repository" \
 own process, exports it only there, and `exec`s the given command — the
 token never enters this session's shell state, is never assigned to a
 variable here, and is never written to disk. The implementer wrapper follows
-the same rule for `git push`: `git` does not read that token on its own, so
+the same rule for `git push`, as does `repair-prs.sh` for every repair-path
+GitHub read, fetch, and push: `git` does not read that token on its own, so
 `gh-as.sh` supplies a credential helper scoped to that process:
 
 ```sh
