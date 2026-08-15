@@ -25,7 +25,9 @@ create, display, or commit a roster anywhere else. If no mandates file is
 configured, say so and stop. Project scope is expressed with qualified glob
 selector lists; unmatched work follows the explicit project `default`. A
 `paused: true` project suppresses routine proposals, but reserved refs,
-tripwires, and CI drift remain active.
+tripwires, and CI drift remain active. The optional root-level `hold_labels`
+list contains case-insensitive label globs and parks matching delegated items
+without removing their queue records.
 
 ## 2. List pending records
 
@@ -40,7 +42,8 @@ jq '.repos[] | {notice, unclassified, scope_changes}' \
 Each JSON row is a pointer with `id`, `repo`, `ref`, `title`, `kind`,
 `mandate`, `state`, and `opened`, plus sweep facts when available: `age_days`,
 `aged_out`, `needs_judgment`, and `blocked_by`. Present pending and deferred items
-in this order: tripwire/decision, moved, stuck, drift. Keep the resolvable
+in this order: tripwire/decision, moved, stuck, drift, parked. Parked rows are
+informational holds, not approvable dispatch candidates. Keep the resolvable
 `owner/repo#number` and its title visible. For a tripwire, include all four
 fields from `mandate.dossier`: Question, Options ruled out, Recommended
 action, and Blast radius. Do not fetch or copy an issue or PR body into the
