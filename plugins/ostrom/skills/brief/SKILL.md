@@ -23,7 +23,9 @@ Read and merge these layers, most-specific wins:
 The v1 provider must resolve to `file`. Its fixed private records are
 `~/.claude/ostrom/queue.jsonl` and `~/.claude/ostrom/state.json`. Never create,
 display, or commit a roster anywhere else. If no mandates file is configured,
-say so and stop.
+say so and stop. The optional root-level `hold_labels` list contains
+case-insensitive label globs; matching delegated work remains in the queue as
+`kind: "parked"` but is not execution debt while that label remains.
 
 Read `~/.claude/ostrom/direction.md` only if it exists. Use recorded direction
 calls to note concrete conflicts with queued items. If the file is absent,
@@ -43,6 +45,9 @@ Use only pending and deferred rows. The sweep fields are facts, not agent
 judgments: `age_days`, `aged_out`, `needs_judgment`, and `blocked_by`. For an
 older row, derive `needs_judgment` from `kind` and treat absent `blocked_by` as
 empty; do not rewrite the queue.
+
+Count `parked` rows separately and do not place them in an execution or
+judgment bucket.
 
 Resolve every `blocked_by` pointer read-only. A pointer still present in the
 last sweep state is unsatisfied. For a pointer outside that state, use `gh` to

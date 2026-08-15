@@ -377,6 +377,10 @@ case "$source_resolution_status" in
     failure_reason="$source_resolution"
     exit 1
     ;;
+  11)
+    failure_reason=source-repository-roots-unconfigured
+    exit 1
+    ;;
   *)
     failure_reason=source-repository-not-found
     exit 1

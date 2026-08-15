@@ -82,6 +82,9 @@ checks their lease files.
 
 `ostrom-core` is not published to crates.io. Out-of-tree consumers may pin a
 Git revision; registering the public crate name remains a principal decision.
+The store transaction, fact-only record boundary, reusable conformance battery,
+and pre-1.0 semver policy are documented in
+[`docs/store-port.md`](docs/store-port.md).
 
 ## Install
 

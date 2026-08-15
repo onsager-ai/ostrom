@@ -109,7 +109,9 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/sweep.sh"
 Then read, in order:
 
 - `~/.claude/ostrom/mandates.yaml` — the authorization boundary: what each
-  project delegates entirely and what bounces back.
+  project delegates entirely and what bounces back. Its optional root-level
+  `hold_labels` list contains case-insensitive label globs; a matching otherwise
+  delegated item remains visible as `kind: "parked"` but is not dispatchable.
 - `~/.claude/ostrom/queue.jsonl` — what the last sweep found. Rows are
   pointers, so resolve titles from GitHub rather than trusting cached text.
 - The SessionStart digest, if it is in context.
@@ -138,7 +140,10 @@ invocation input as a natural-language filter over the queue, such as `one
 repository only` or `just tripwires`. Otherwise take items in this order:
 **pending tripwires and reserved refs → CI drift → open review threads on
 your own pull requests → delegated work**, oldest first. An approved
-tripwire is no longer a boundary; it belongs in the delegated tier.
+tripwire is no longer a boundary; it belongs in the delegated tier. Never
+select a `parked` row in any tier, regardless of its state: a `parked` row is
+never a dispatch candidate. It remains in the queue only so deliberately held
+work stays visible until its hold label is removed.
 
 Within CI drift, a red **default branch** outranks a red pull request. A broken
 `main` invalidates every pull request built on it, so fixing a PR's checks
