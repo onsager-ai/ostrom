@@ -210,6 +210,8 @@ render_section "DECISIONS WAITING" '["tripwire","decision"]'
 render_section "MOVED SINCE $cursor" '["moved"]'
 render_section "STUCK" '["stuck"]'
 render_section "DRIFT" '["drift"]'
+parked_count="$(jq '[.[] | select(.kind == "parked")] | length' <<<"$active")"
+[ "$parked_count" -eq 0 ] || echo "$parked_count parked"
 
 unresolvable_repositories='[]'
 if [ -s "$MANDATE_STATE_FILE" ]; then

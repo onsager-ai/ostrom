@@ -448,6 +448,7 @@ sweep_org() {
       --slurpfile config "$work/config.json" '
         ($project[0]) as $project
         | ($config[0].bounce_all) as $bounce_all
+        | ($config[0].hold_labels) as $hold_labels
         |
         {
           delegated: $project.delegated,
@@ -457,6 +458,14 @@ sweep_org() {
           bounce_all: $bounce_all,
           default: $project.default
         } as $selectors
+        # Preserve the pre-hold policy byte-for-byte when the optional list is
+        # empty. A real hold policy still participates in change detection.
+        | ($selectors + (
+            if ($hold_labels | length) > 0
+            then {hold_labels: $hold_labels}
+            else {}
+            end
+          )) as $selectors
         | ($selectors | tojson | explode
             | reduce .[] as $code (0; ((. * 31 + $code) % 2147483647))
             | tostring) as $selector_hash
@@ -549,6 +558,12 @@ sweep_org() {
             $selectors[]?
             | select(selector_match($item; .))
             | {source: $source, selector: .}
+          ) // null;
+        def hold_glob($item):
+          first(
+            $config.hold_labels[]? as $glob
+            | select(any($item.labels[]?; glob_match(.; $glob; false)))
+            | $glob
           ) // null;
         def classify($item):
           (first(
@@ -644,6 +659,12 @@ sweep_org() {
             $items[]
             | . as $item
             | classify($item) as $classification
+            | (
+                if $classification.terminal == "delegated"
+                then hold_glob($item)
+                else null
+                end
+              ) as $hold_glob
             | ($previous.items[$item.id] // null) as $old
             | (
                 if $initial or $policy_changed
@@ -666,12 +687,15 @@ sweep_org() {
               ) as $age_days
             | . + {
                 classification: $classification,
+                hold_glob: $hold_glob,
+                parked: ($hold_glob != null),
                 first_seen: $first_seen,
                 age_days: $age_days,
                 movement_stuck: (
                   ($initial | not)
                   and ($policy_changed | not)
                   and $classification.terminal == "delegated"
+                  and $hold_glob == null
                   and (($sweep_started | fromdateiso8601) - $movement_clock)
                     >= ($config.stuck_after_days * 86400)
                 ),
@@ -685,11 +709,13 @@ sweep_org() {
                   .classification.terminal == "reserved"
                   or .classification.terminal == "tripwire"
                   or (.type == "pr" and .ci == "failing")
+                  or .parked
                 else
                   .classification.terminal == "reserved"
                   or .classification.terminal == "tripwire"
                   or (.type == "pr" and .ci == "failing")
                   or (($project.paused | not) and .classification.terminal == "delegated")
+                  or .parked
                 end
               )
           ]) as $active
@@ -711,6 +737,7 @@ sweep_org() {
                 $item.classification.terminal == "reserved"
                 or $item.classification.terminal == "tripwire"
                 or ($item.type == "pr" and $item.ci == "failing")
+                or $item.parked
               ) as $safety
             | select(
                 if $initial or $policy_changed then $safety
@@ -751,6 +778,11 @@ sweep_org() {
                       "CI is failing; "
                       + match_reason($item.classification)
                     )
+                  }
+                elif $item.parked then
+                  {
+                    kind: "parked",
+                    reason: ("hold label " + $item.hold_glob)
                   }
                 elif $item.movement_stuck then
                   {
@@ -822,20 +854,24 @@ sweep_org() {
                     and ($safety | not)
                     and ($project.paused | not)
                     and $item.classification.terminal == "delegated"
+                    and ($item.parked | not)
                   )
               ] | length
             else 0
             end
           ) as $suppressed_delegated
         | (reduce $classified[] as $item ({};
-            .[$item.id] = {
-              updated: $item.updated,
-              fingerprint: $item.fingerprint,
-              first_seen: $item.first_seen,
-              classification: $item.classification.terminal,
-              matched_selector: $item.classification.selector,
-              stuck: $item.movement_stuck
-            }
+            .[$item.id] = (
+              {
+                updated: $item.updated,
+                fingerprint: $item.fingerprint,
+                first_seen: $item.first_seen,
+                classification: $item.classification.terminal,
+                matched_selector: $item.classification.selector,
+                stuck: $item.movement_stuck
+              }
+              + (if $item.parked then {parked: true} else {} end)
+            )
           )) as $next_items
         | (($previous.items // {}) != $next_items) as $changed
         | ([
@@ -917,7 +953,7 @@ sweep_org() {
             # the sweep that first classifies it that way.
             stuck_issue_candidates: [
               $classified[]
-              | select(.type == "issue" and .movement_stuck)
+              | select(.type == "issue" and .movement_stuck and (.parked | not))
               | {number: .number, opened: .opened}
             ],
             repo_state: {
@@ -964,7 +1000,9 @@ sweep_org() {
               | . as $item
               | ($item.semantic_derivation.authority // null) as $authority
               | ($mechanical[$item.id].classification) as $classification
-              | if $authority == null then .
+              | if ($mechanical[$item.id].parked // false) then
+                  del(.semantic_content_hash, .semantic_derivation)
+                elif $authority == null then .
                 elif ($authority.classification | IN("delegated", "excluded") | not)
                     and ($classification != "reserved" or $authority.classification == "reserved")
                     and ($classification != "tripwire" or $authority.classification == "tripwire")
@@ -980,10 +1018,12 @@ sweep_org() {
       # daily full reconciliation does not make unchanged items candidates.
       jq -cn \
         --slurpfile fresh "$work/fresh-items.json" \
+        --slurpfile analysis "$work/analysis.json" \
         --slurpfile previous "$work/previous.json" '
           ($previous[0]) as $previous
           | [
               $fresh[0][]
+              | select(($analysis[0].repo_state.items[.id].parked // false) | not)
               | select(
                   ($previous.records[.id] // null) == null
                   or .updated > ($previous.cursor // "")
@@ -1166,8 +1206,12 @@ sweep_org() {
               end;
           ($analysis[0]) as $analysis
           | ($analysis.repo_state.items) as $mechanical
+          # Mechanical holds bypass semantic reprioritization completely. Keep
+          # their rows beside, rather than inside, the advisory transformation.
+          | ($analysis.rows | map(select(.kind == "parked"))) as $parked_rows
           | ($analysis.rows | map(
-              . as $row
+              select(.kind != "parked")
+              | . as $row
               | ($items_by_id[$row.id] // {}) as $item
               | if ($item.semantic_derivation // null) == null then .
                 else reprioritize(
@@ -1181,6 +1225,7 @@ sweep_org() {
               $results[0][]
               | select(.status == "accepted")
               | . as $result
+              | select(($mechanical[$result.id].parked // false) | not)
               | select(
                   finding($result.derivation; "already_decided")
                   or ($result.derivation.authority // null) != null
@@ -1215,7 +1260,8 @@ sweep_org() {
             )) as $current_items
           | ([$items[0][]
               | select(
-                  (.semantic_derivation // null) != null
+                  (($mechanical[.id].parked // false) | not)
+                  and (.semantic_derivation // null) != null
                   and (
                     finding(.semantic_derivation; "already_decided")
                     or (.semantic_derivation.authority // null) != null
@@ -1232,7 +1278,7 @@ sweep_org() {
               )
             )) as $cache
           | $analysis
-          | .rows = ($attached_rows + $semantic_rows)
+          | .rows = ($parked_rows + $attached_rows + $semantic_rows)
           | .active_ids = ((.active_ids + $semantic_active) | unique)
           | .current_items = $current_items
           | .repo_state.semantic_cache = $cache

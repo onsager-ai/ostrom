@@ -13,6 +13,11 @@ stuck_after_days: 7
 search_roots:
   - /path/to/repositories
 
+# Label globs that park delegated work without removing it from the queue.
+# Both exact labels such as status:parked and globs such as status:* work.
+hold_labels:
+  - status:parked
+
 bounce_all:
   - title:*merge to main*
   - title:*production deployment*
