@@ -115,6 +115,7 @@ write_config
 gatekeep_skill="$PLUGIN_ROOT/skills/gatekeep/SKILL.md"
 merge_skill="$PLUGIN_ROOT/skills/merge/SKILL.md"
 work_skill="$PLUGIN_ROOT/skills/work/SKILL.md"
+brief_skill="$PLUGIN_ROOT/skills/brief/SKILL.md"
 repair_script="$PLUGIN_ROOT/scripts/repair-prs.sh"
 role_boundary_doc="$PLUGIN_ROOT/../../docs/role-permission-boundaries.md"
 work_frontmatter="$(
@@ -200,7 +201,8 @@ fi
 # leaves every mandate boundary intact, and unblocking power now applies even
 # when the principal and plan rankings are silent.
 selection_fixture="$fixture/work-ranking"
-selection_data="$selection_fixture/config/ostrom"
+OSTROM_HOME="$selection_fixture/config"
+selection_data="$OSTROM_HOME/ostrom"
 mkdir -p "$selection_data" "$selection_fixture/repo"
 cat >"$selection_data/mandates.yaml" <<'YAML'
 provider: file
@@ -258,7 +260,7 @@ jq -n --slurpfile queue "$selection_data/queue.jsonl" '
 
 (
   cd "$selection_fixture/repo"
-  CLAUDE_CONFIG_DIR="$selection_fixture/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+  CLAUDE_CONFIG_DIR="$OSTROM_HOME" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
     bash "$PLUGIN_ROOT/scripts/select-work.sh" list
 ) >"$selection_fixture/no-ranking.jsonl"
 jq -s -e 'map(.id) == [
@@ -330,7 +332,7 @@ jq '
 mv "$selection_data/state.next" "$selection_data/state.json"
 (
   cd "$selection_fixture/repo"
-  CLAUDE_CONFIG_DIR="$selection_fixture/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+  CLAUDE_CONFIG_DIR="$OSTROM_HOME" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
     bash "$PLUGIN_ROOT/scripts/select-work.sh" list
 ) >"$selection_fixture/ranked.jsonl"
 jq -s -e '
@@ -352,32 +354,148 @@ jq -s -e '
 
 (
   cd "$selection_fixture/repo"
-  CLAUDE_CONFIG_DIR="$selection_fixture/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+  CLAUDE_CONFIG_DIR="$OSTROM_HOME" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
     bash "$PLUGIN_ROOT/scripts/select-work.sh" select builder-ranking-wake1
 ) >"$selection_fixture/selected-ranked.json"
 (
   cd "$selection_fixture/repo"
-  CLAUDE_CONFIG_DIR="$selection_fixture/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+  CLAUDE_CONFIG_DIR="$OSTROM_HOME" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
     bash "$PLUGIN_ROOT/scripts/select-work.sh" select builder-ranking-wake1 \
       example-org/ranking-repo#2
 ) >"$selection_fixture/selected-unblocker.json"
-jq -e '.id == "example-org/ranking-repo#2"' "$selection_fixture/selected-ranked.json" >/dev/null
-jq -e '.id == "example-org/ranking-repo#3"' "$selection_fixture/selected-unblocker.json" >/dev/null
+jq -c 'select(.id == "example-org/ranking-repo#2")' \
+  "$selection_data/queue.jsonl" >"$selection_fixture/expected-ranked.json"
+jq -c 'select(.id == "example-org/ranking-repo#3")' \
+  "$selection_data/queue.jsonl" >"$selection_fixture/expected-unblocker.json"
+# Instrumentation must leave selection stdout byte-identical in every
+# pre-existing no-plan/work-ranking/dependency case.
+cmp "$selection_fixture/expected-ranked.json" \
+  "$selection_fixture/selected-ranked.json"
+cmp "$selection_fixture/expected-unblocker.json" \
+  "$selection_fixture/selected-unblocker.json"
 jq -s -e '
-  map(.kind) == ["work-graph-gated", "work-ranked", "work-graph-gated", "work-ranked"]
-  and .[0].fact.gated == "example-org/ranking-repo#21"
-  and .[0].fact.unsatisfied == ["example-org/ranking-repo#3"]
-  and .[0].fact.selected == "example-org/ranking-repo#2"
-  and .[1].fact.ranking == "work_ranking"
-  and .[1].fact.ranking_position == 6
-  and .[1].fact.selected == "example-org/ranking-repo#2"
-  and .[1].fact.displaced == "example-org/ranking-repo#1"
-  and .[2].fact.gated == "example-org/ranking-repo#21"
-  and .[2].fact.selected == "example-org/ranking-repo#3"
-  and .[3].fact.ranking == "dependency-unblocks"
-  and .[3].fact.selected == "example-org/ranking-repo#3"
-  and .[3].fact.displaced == "example-org/ranking-repo#1"
+  map(select(.kind == "work-graph-gated")) as $gated
+  | map(select(.kind == "work-ranked")) as $ranked
+  | map(select(.kind == "plan-selection")) as $plans
+  | ($gated | length) == 2
+  and $gated[0].fact.gated == "example-org/ranking-repo#21"
+  and $gated[0].fact.unsatisfied == ["example-org/ranking-repo#3"]
+  and $gated[0].fact.selected == "example-org/ranking-repo#2"
+  and $gated[1].fact.gated == "example-org/ranking-repo#21"
+  and $gated[1].fact.selected == "example-org/ranking-repo#3"
+  and ($ranked | length) == 2
+  and $ranked[0].fact.ranking == "work_ranking"
+  and $ranked[0].fact.ranking_position == 6
+  and $ranked[0].fact.selected == "example-org/ranking-repo#2"
+  and $ranked[0].fact.displaced == "example-org/ranking-repo#1"
+  and $ranked[1].fact.ranking == "dependency-unblocks"
+  and $ranked[1].fact.selected == "example-org/ranking-repo#3"
+  and $ranked[1].fact.displaced == "example-org/ranking-repo#1"
+  and ($plans | length) == 2
+  and all($plans[];
+    .fact.plan_status == "absent"
+    and (.fact | has("plan_rejection_clause") | not)
+  )
 ' "$selection_data/sprint.jsonl" >/dev/null
+
+# #239: every actual selection records whether a computed plan applied. A
+# rejected plan names the first failed guard clause and remains byte-identical
+# to the existing mechanical fallback; an accepted plan records application
+# while preserving the pre-instrumentation goal-plan order.
+selection_basis="$(jq -sc '[.[] | {
+  id,
+  opened,
+  kind,
+  state,
+  blocked_by: (.blocked_by // [])
+}]' "$selection_data/queue.jsonl")"
+selection_candidates="$(jq -sc '[.[] | select(
+  .kind != "parked"
+  and .state != "deferred"
+  and ((.kind | IN("moved", "stuck"))
+    or (.state == "approved" and (.kind | IN("tripwire", "decision"))))
+) | .id]' "$selection_data/queue.jsonl")"
+selection_ranking='["example-org/ranking-repo#10","example-org/ranking-repo#11","example-org/ranking-repo#12","example-org/ranking-repo#13","example-org/ranking-repo#99","example-org/ranking-repo#2"]'
+jq -n \
+  --argjson ranking "$selection_ranking" \
+  --argjson ordered "$selection_candidates" '{
+    plan_version: 1,
+    queue_basis: [],
+    ranking: {work_ranking: $ranking, ordered: $ordered}
+  }' >"$selection_data/plan.json"
+(
+  cd "$selection_fixture/repo"
+  CLAUDE_CONFIG_DIR="$OSTROM_HOME" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/select-work.sh" list
+) >"$selection_fixture/rejected-plan.jsonl" 2>/dev/null
+cmp "$selection_fixture/ranked.jsonl" "$selection_fixture/rejected-plan.jsonl"
+(
+  cd "$selection_fixture/repo"
+  CLAUDE_CONFIG_DIR="$OSTROM_HOME" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/select-work.sh" select builder-ranking-wake2 \
+      example-org/ranking-repo#2
+) >"$selection_fixture/selected-rejected-plan.json" \
+  2>"$selection_fixture/selected-rejected-plan.err"
+cmp "$selection_fixture/selected-unblocker.json" \
+  "$selection_fixture/selected-rejected-plan.json"
+grep -Fq 'stale or invalid plan.json ignored; using mechanical ranking' \
+  "$selection_fixture/selected-rejected-plan.err"
+jq -s -e '
+  map(select(.kind == "plan-selection")) | last
+  | .fact.owner == "builder-ranking-wake2"
+  and .fact.repo == "example-org/ranking-repo"
+  and .fact.ref == "#3"
+  and .fact.action == "delegated-selection"
+  and .fact.selected == "example-org/ranking-repo#3"
+  and .fact.plan_status == "rejected"
+  and .fact.plan_rejection_clause == "queue_basis"
+' "$selection_data/sprint.jsonl" >/dev/null
+
+accepted_plan_order='["example-org/ranking-repo#4","example-org/ranking-repo#3","example-org/ranking-repo#1","example-org/ranking-repo#20","example-org/ranking-repo#2"]'
+jq -n \
+  --argjson basis "$selection_basis" \
+  --argjson ranking "$selection_ranking" \
+  --argjson ordered "$accepted_plan_order" '{
+    plan_version: 1,
+    queue_basis: $basis,
+    ranking: {work_ranking: $ranking, ordered: $ordered}
+  }' >"$selection_data/plan.json"
+(
+  cd "$selection_fixture/repo"
+  CLAUDE_CONFIG_DIR="$OSTROM_HOME" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/select-work.sh" list
+) >"$selection_fixture/accepted-plan.jsonl"
+jq -nc --slurpfile rows "$selection_data/queue.jsonl" \
+  --argjson ids '["example-org/ranking-repo#2","example-org/ranking-repo#4","example-org/ranking-repo#3","example-org/ranking-repo#1","example-org/ranking-repo#20"]' '
+    $ids[] as $id | $rows[] | select(.id == $id)
+  ' >"$selection_fixture/expected-accepted-plan.jsonl"
+cmp "$selection_fixture/expected-accepted-plan.jsonl" \
+  "$selection_fixture/accepted-plan.jsonl"
+(
+  cd "$selection_fixture/repo"
+  CLAUDE_CONFIG_DIR="$OSTROM_HOME" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/select-work.sh" select builder-ranking-wake3 \
+      example-org/ranking-repo#2
+) >"$selection_fixture/selected-accepted-plan.json"
+jq -c 'select(.id == "example-org/ranking-repo#4")' \
+  "$selection_data/queue.jsonl" >"$selection_fixture/expected-accepted-plan.json"
+cmp "$selection_fixture/expected-accepted-plan.json" \
+  "$selection_fixture/selected-accepted-plan.json"
+jq -s -e '
+  map(select(.kind == "plan-selection")) | last
+  | .fact.plan_status == "applied"
+  and (.fact | has("plan_rejection_clause") | not)
+' "$selection_data/sprint.jsonl" >/dev/null
+
+# The brief consumes the same fact-only trace. In particular, its zero-rate
+# rendering calls non-application a problem and never folds absent plans into
+# the rejected-plan denominator.
+grep -Fq 'bash "${CLAUDE_PLUGIN_ROOT}/scripts/trace.sh" read' "$brief_skill"
+grep -Fq '**Plan match rate**' "$brief_skill"
+grep -Fq 'PROBLEM: computed plans never applied' "$brief_skill"
+grep -Fq 'no plan present: S' "$brief_skill"
+grep -Fq 'no plan present in S selections' "$brief_skill"
+grep -Fq 'Never combine absent' "$brief_skill"
 
 # A swept stale pointer is a reported fault, never a silent omission.
 cat >"$selection_data/mandates.yaml" <<'YAML'
@@ -402,7 +520,7 @@ mv "$selection_data/state.next" "$selection_data/state.json"
 set +e
 (
   cd "$selection_fixture/repo"
-  CLAUDE_CONFIG_DIR="$selection_fixture/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+  CLAUDE_CONFIG_DIR="$OSTROM_HOME" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
     bash "$PLUGIN_ROOT/scripts/select-work.sh" list
 ) >"$selection_fixture/stale.out" 2>"$selection_fixture/stale.err"
 stale_selection_status=$?
