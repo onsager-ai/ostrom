@@ -210,6 +210,7 @@ render_section "DECISIONS WAITING" '["tripwire","decision"]'
 render_section "MOVED SINCE $cursor" '["moved"]'
 render_section "STUCK" '["stuck"]'
 render_section "DRIFT" '["drift"]'
+render_section "UNEXPLAINED WRITES — INVESTIGATE NOW" '["unexplained-write"]'
 render_section "MERGE GATE FAULTS" '["merge-gate-fault"]'
 parked_count="$(jq '[.[] | select(.kind == "parked")] | length' <<<"$active")"
 [ "$parked_count" -eq 0 ] || echo "$parked_count parked"
@@ -247,6 +248,7 @@ if [ -s "$MANDATE_STATE_FILE" ]; then
             ),
             unclassified: (.value.unclassified // 0),
             merge_gate_faults: (.value.merge_gate_fault_count // 0),
+            unexplained_writes: (.value.unexplained_write_count // 0),
             item_cap: (.value.item_cap // null)
           }
       ]
@@ -268,6 +270,13 @@ jq -r '
 ' <<<"$state_rollups"
 jq -r '
   .[]
+  | select(.unexplained_writes > 0)
+  | .repo + ": " + (.unexplained_writes | tostring)
+    + (if .unexplained_writes == 1 then " unexplained write" else " unexplained writes" end)
+    + " — investigate immediately"
+' <<<"$state_rollups"
+jq -r '
+  .[]
   | select(.merge_gate_faults > 0)
   | .repo + ": " + (.merge_gate_faults | tostring)
     + (if .merge_gate_faults == 1 then " merge gate fault" else " merge gate faults" end)
@@ -279,7 +288,7 @@ troubled_projects="$(
   jq --argjson unresolvable "$unresolvable_repositories" '
     ([
        .[]
-       | select(.kind | IN("tripwire", "decision", "drift", "stuck", "merge-gate-fault"))
+       | select(.kind | IN("tripwire", "decision", "drift", "stuck", "merge-gate-fault", "unexplained-write"))
        | .repo
      ] + $unresolvable)
     | unique
