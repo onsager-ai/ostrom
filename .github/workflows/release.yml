@@ -40,12 +40,12 @@ jobs:
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
-        run: rustup toolchain install 1.85.0 --profile minimal --target "$TARGET"
+        run: rustup toolchain install 1.86.0 --profile minimal --target "$TARGET"
       - name: Build release binaries
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
-        run: cargo +1.85.0 build --locked --release --package ostrom-cli --target "$TARGET"
+        run: cargo +1.86.0 build --locked --release --package ostrom-cli --target "$TARGET"
       - name: Assert binary version
         shell: bash
         env:
