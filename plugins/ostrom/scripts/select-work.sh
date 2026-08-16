@@ -106,6 +106,8 @@ candidates="$(jq -c '.candidates' <<<"$candidates_and_gated")"
 # work_ranking/dependency/age order remains the mechanical fallback.
 plan_order='[]'
 has_plan=false
+plan_status="absent"
+plan_rejection_clause=""
 if [ -s "$MANDATE_PLAN_FILE" ]; then
   queue_basis="$(jq -cn --argjson queue "$queue" '[
     $queue[] | {
@@ -131,7 +133,33 @@ if [ -s "$MANDATE_PLAN_FILE" ]; then
       ' "$MANDATE_PLAN_FILE" >/dev/null 2>&1; then
     plan_order="$(jq -c '.ranking.ordered' "$MANDATE_PLAN_FILE")"
     has_plan=true
+    plan_status="applied"
   else
+    plan_status="rejected"
+    # Diagnose the already-rejected plan without feeding this result back into
+    # has_plan or plan_order. Clause order deliberately mirrors the guard.
+    plan_rejection_clause="$(
+      jq -r \
+        --argjson basis "$queue_basis" \
+        --argjson ranking "$(jq '.work_ranking' <<<"$config")" \
+        --argjson candidates "$candidates" '
+          if ((try (.plan_version == 1) catch false) | not) then
+            "plan_version"
+          elif ((try (.queue_basis == $basis) catch false) | not) then
+            "queue_basis"
+          elif ((try (.ranking.work_ranking == $ranking) catch false) | not) then
+            "work_ranking"
+          elif ((try (.ranking.ordered | type == "array") catch false) | not) then
+            "ordered_not_array"
+          elif ((.ranking.ordered | length) != (.ranking.ordered | unique | length)) then
+            "ordered_duplicates"
+          elif ((.ranking.ordered | sort) != ($candidates | map(.id) | sort)) then
+            "candidate_set_mismatch"
+          else
+            "predicate_error"
+          end
+        ' "$MANDATE_PLAN_FILE" 2>/dev/null
+    )" || plan_rejection_clause="malformed_json"
     echo "mandate selection: stale or invalid plan.json ignored; using mechanical ranking" >&2
   fi
 fi
@@ -263,5 +291,27 @@ if [ -n "$age_first" ] && [ "$(jq -r '.id' <<<"$selected")" != "$(jq -r '.id' <<
     ')"
   bash "$SCRIPT_DIR/trace.sh" append work-ranked "$trace_fact" '{}' >/dev/null
 fi
+
+plan_trace_fact="$(jq -cn \
+  --arg owner "$owner" \
+  --arg repo "$(jq -r '.repo' <<<"$selected")" \
+  --arg ref "$(jq -r '.ref' <<<"$selected")" \
+  --arg selected "$(jq -r '.id' <<<"$selected")" \
+  --arg plan_status "$plan_status" \
+  --arg plan_rejection_clause "$plan_rejection_clause" '
+    {
+      owner: $owner,
+      repo: $repo,
+      ref: $ref,
+      action: "delegated-selection",
+      selected: $selected,
+      plan_status: $plan_status
+    }
+    + if $plan_status == "rejected"
+      then {plan_rejection_clause: $plan_rejection_clause}
+      else {}
+      end
+  ')"
+bash "$SCRIPT_DIR/trace.sh" append plan-selection "$plan_trace_fact" '{}' >/dev/null
 
 printf '%s\n' "$selected"
