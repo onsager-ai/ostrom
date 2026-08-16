@@ -8,6 +8,32 @@
 set -Eeuo pipefail
 
 PLUGIN_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export MANDATE_SWEEP_TIME="2026-08-01T00:00:00Z"
+export MANDATE_TODAY="2026-08-01"
+export MANDATE_NOW_EPOCH="1785542400"
+# Semantic tests opt in explicitly below. Ambient operator configuration must
+# never turn this otherwise hermetic suite into a model or network client.
+unset ANTHROPIC_API_KEY MANDATE_SEMANTIC_DERIVER MANDATE_SEMANTIC_MODEL
+# Operator concurrency overrides must not replace roster values in fixtures
+# that deliberately exercise the parsed per-project setting. Individual tests
+# still set either variable on their own command when testing the override.
+unset MANDATE_MAX_IMPLEMENTERS MANDATE_MAX_IMPLEMENTERS_PER_REPOSITORY
+# Per-invocation paths, clocks, names, and helper overrides can redirect a
+# fixture or change its result when inherited from a live operator session.
+# Tests that exercise an override set it explicitly on the command under test.
+scrub_per_invocation_environment() {
+  unset CLAUDE_CONFIG_DIR \
+    MANDATE_AUDIT_TIME MANDATE_DAILY_CAP_USD MANDATE_DIGEST_TIME \
+    MANDATE_EXCUSE_TIME MANDATE_GATE_TIME MANDATE_GH_AS_BIN \
+    MANDATE_IMPLEMENTER_SOURCE_REPO MANDATE_IMPLEMENTER_STREAMING_CEILING \
+    MANDATE_IMPLEMENTER_TERMINATION_GRACE_SECONDS \
+    MANDATE_LEASE_NAME MANDATE_LEASE_NOW_EPOCH MANDATE_LEASE_TTL_SECONDS \
+    MANDATE_PUBLISH_ALLOWLIST MANDATE_PUBLISH_DIR MANDATE_PUBLISH_REMOTE \
+    MANDATE_PUBLISH_TIME MANDATE_REPLAY_TIME MANDATE_SWEEP_MODE \
+    MANDATE_SYSTEMD_RUN_BIN MANDATE_TRACE_TIME
+}
+scrub_per_invocation_environment
+
 fixture="$(mktemp -d)"
 trap 'rm -rf "$fixture"' EXIT
 # set -e aborts on the first failing assertion with no indication of which
@@ -45,16 +71,6 @@ mkdir -p "$sweep_resolved_source"
 git -C "$sweep_resolved_source" init -b main >/dev/null
 git -C "$sweep_resolved_source" remote add origin \
   https://github.com/example-org/example-repo.git
-export MANDATE_SWEEP_TIME="2026-08-01T00:00:00Z"
-export MANDATE_TODAY="2026-08-01"
-export MANDATE_NOW_EPOCH="1785542400"
-# Semantic tests opt in explicitly below. Ambient operator configuration must
-# never turn this otherwise hermetic suite into a model or network client.
-unset ANTHROPIC_API_KEY MANDATE_SEMANTIC_DERIVER MANDATE_SEMANTIC_MODEL
-# Operator concurrency overrides must not replace roster values in fixtures
-# that deliberately exercise the parsed per-project setting. Individual tests
-# still set either variable on their own command when testing the override.
-unset MANDATE_MAX_IMPLEMENTERS MANDATE_MAX_IMPLEMENTERS_PER_REPOSITORY
 
 write_config() {
   delegated_selector="${1:-label:maintenance}"
@@ -674,7 +690,12 @@ CLAUDE_CONFIG_DIR="$lease_concurrent" \
 
 # Named leases isolate the two roles, including their mutation guards. A held
 # gatekeeper lease and its guard do not block the builder lease; releasing the
-# builder lease leaves the gatekeeper lease and guard untouched.
+# builder lease leaves the gatekeeper lease and guard untouched. Seed the same
+# hostile ambient lease name that a live builder carries, then apply the suite's
+# top-level scrub so removing MANDATE_LEASE_NAME from it breaks this fixture.
+export MANDATE_LEASE_NAME=hostile.lease
+scrub_per_invocation_environment
+[ -z "${MANDATE_LEASE_NAME+x}" ]
 role_leases="$fixture/role-leases"
 CLAUDE_CONFIG_DIR="$role_leases" MANDATE_LEASE_NOW_EPOCH=150 \
   bash "$PLUGIN_ROOT/scripts/lease.sh" acquire gatekeeper-alpha 60 >/dev/null
