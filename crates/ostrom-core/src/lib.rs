@@ -15,6 +15,7 @@ mod check;
 mod domain;
 mod plan;
 mod store;
+mod work_graph;
 
 #[cfg(feature = "conformance")]
 pub mod conformance;
@@ -43,4 +44,8 @@ pub use store::{
     AttemptOutcome, CHECK_STORE_SCHEMA_VERSION, CheckRun, CheckRunId, CheckStore, CheckStoreFault,
     GateFact, PassAttempt, PassId, QueueFact, QueueKind, QueueState, RepoStateFact,
     STORE_SCHEMA_VERSION, StoreFault, SweepPass, SweepStore, WriteDisposition,
+};
+pub use work_graph::{
+    WORK_GRAPH_VERSION, WorkEdge, WorkEdgeSource, WorkGraph, WorkGraphFault, WorkGraphNode,
+    WorkNodeInput, build_work_graph,
 };

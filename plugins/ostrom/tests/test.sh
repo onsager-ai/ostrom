@@ -196,10 +196,9 @@ if [ "$repair_protocol_line" -ge "$selection_protocol_line" ]; then
   exit 1
 fi
 
-# #221: an absent ranking is byte-for-byte the legacy delegated order. An
-# active ranking reorders only the already-dispatchable set, leaves every
-# mandate boundary intact, uses direct reverse dependency edges when the
-# recorded list is silent, and traces every departure from age order.
+# #221/#119: ranking only reorders the graph-dispatchable set. The graph gate
+# leaves every mandate boundary intact, and unblocking power now applies even
+# when the principal and plan rankings are silent.
 selection_fixture="$fixture/work-ranking"
 selection_data="$selection_fixture/config/ostrom"
 mkdir -p "$selection_data" "$selection_fixture/repo"
@@ -228,24 +227,71 @@ cat >"$selection_data/queue.jsonl" <<'JSONL'
 {"id":"example-org/ranking-repo#13","repo":"example-org/ranking-repo","ref":"#13","title":"Otherwise unauthorized","kind":"decision","mandate":{"reason":"default:unclassified"},"state":"pending","opened":"2026-06-04T00:00:00Z","blocked_by":[]}
 {"id":"example-org/ranking-repo#14","repo":"example-org/ranking-repo","ref":"#14","title":"Principal deferred","kind":"moved","mandate":{"reason":"delegated"},"state":"deferred","opened":"2026-06-05T00:00:00Z","blocked_by":[]}
 {"id":"example-org/ranking-repo#20","repo":"example-org/ranking-repo","ref":"#20","title":"Work blocked by three","kind":"moved","mandate":{"reason":"delegated"},"state":"pending","opened":"2026-07-21T00:00:00Z","blocked_by":["example-org/ranking-repo#3"]}
+{"id":"example-org/ranking-repo#21","repo":"example-org/ranking-repo","ref":"#21","title":"Old work blocked by three","kind":"moved","mandate":{"reason":"delegated"},"state":"pending","opened":"2026-05-01T00:00:00Z","blocked_by":["example-org/ranking-repo#3"]}
 JSONL
 
-legacy_selection="$selection_fixture/legacy.jsonl"
-jq -sc '
-  map(select(
-    .kind != "parked"
-    and .state != "deferred"
-    and ((.kind | IN("moved", "stuck"))
-      or (.state == "approved" and (.kind | IN("tripwire", "decision"))))
-  ))
-  | sort_by(.opened, .id)[]
-' "$selection_data/queue.jsonl" >"$legacy_selection"
+jq -n --slurpfile queue "$selection_data/queue.jsonl" '
+  ($queue | map(.id)) as $ids
+  | {
+      version: 2,
+      dependency_graph: {
+        graph_version: 1,
+        configured_repositories: ["example-org/ranking-repo"],
+        nodes: [$queue[] | {
+          id,
+          open: true,
+          dependencies: (.blocked_by // []),
+          unsatisfied: (.blocked_by // []),
+          children: [],
+          dispatchable: ((.blocked_by // []) | length == 0),
+          unblocking_power: (if .id == "example-org/ranking-repo#3" then 2 else 0 end)
+        }],
+        edges: ([20, 21] | map({
+          dependency: "example-org/ranking-repo#3",
+          item: ("example-org/ranking-repo#" + tostring),
+          sources: ["body"]
+        })),
+        faults: []
+      }
+    }
+' >"$selection_data/state.json"
+
 (
   cd "$selection_fixture/repo"
   CLAUDE_CONFIG_DIR="$selection_fixture/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
     bash "$PLUGIN_ROOT/scripts/select-work.sh" list
 ) >"$selection_fixture/no-ranking.jsonl"
-cmp "$legacy_selection" "$selection_fixture/no-ranking.jsonl"
+jq -s -e 'map(.id) == [
+  "example-org/ranking-repo#3",
+  "example-org/ranking-repo#1",
+  "example-org/ranking-repo#2",
+  "example-org/ranking-repo#4"
+]' "$selection_fixture/no-ranking.jsonl" >/dev/null
+
+# Closing the blocker changes only observed graph state. With the roster
+# unchanged both downstream items become selectable on the next graph read.
+cp "$selection_data/state.json" "$selection_data/state.blocked"
+jq '
+  .dependency_graph.nodes |= map(
+    if .id == "example-org/ranking-repo#20"
+        or .id == "example-org/ranking-repo#21"
+    then .unsatisfied = [] | .dispatchable = true
+    elif .id == "example-org/ranking-repo#3"
+    then .unblocking_power = 0
+    else . end
+  )
+' "$selection_data/state.json" >"$selection_data/state.next"
+mv "$selection_data/state.next" "$selection_data/state.json"
+(
+  cd "$selection_fixture/repo"
+  CLAUDE_CONFIG_DIR="$selection_fixture/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/select-work.sh" list
+) >"$selection_fixture/blocker-closed.jsonl"
+jq -s -e '
+  any(.[]; .id == "example-org/ranking-repo#20")
+  and any(.[]; .id == "example-org/ranking-repo#21")
+' "$selection_fixture/blocker-closed.jsonl" >/dev/null
+mv "$selection_data/state.blocked" "$selection_data/state.json"
 
 cat >"$selection_data/mandates.yaml" <<'YAML'
 provider: file
@@ -268,9 +314,20 @@ projects:
     paused: false
     bounce: []
 YAML
-cat >"$selection_data/state.json" <<'JSON'
-{"version":2,"work_ranking":["example-org/ranking-repo#10","example-org/ranking-repo#11","example-org/ranking-repo#12","example-org/ranking-repo#13","example-org/ranking-repo#99","example-org/ranking-repo#2"],"work_ranking_faults":[],"repos":{"example-org/ranking-repo":{"records":{"example-org/ranking-repo#1":{},"example-org/ranking-repo#2":{},"example-org/ranking-repo#3":{},"example-org/ranking-repo#4":{},"example-org/ranking-repo#10":{},"example-org/ranking-repo#11":{},"example-org/ranking-repo#12":{},"example-org/ranking-repo#13":{},"example-org/ranking-repo#14":{},"example-org/ranking-repo#20":{},"example-org/ranking-repo#99":{}}}}}
-JSON
+jq '
+  .work_ranking = ["example-org/ranking-repo#10","example-org/ranking-repo#11","example-org/ranking-repo#12","example-org/ranking-repo#13","example-org/ranking-repo#99","example-org/ranking-repo#2"]
+  | .work_ranking_faults = []
+  | .repos = {"example-org/ranking-repo": {records: {
+      "example-org/ranking-repo#1":{}, "example-org/ranking-repo#2":{},
+      "example-org/ranking-repo#3":{}, "example-org/ranking-repo#4":{},
+      "example-org/ranking-repo#10":{}, "example-org/ranking-repo#11":{},
+      "example-org/ranking-repo#12":{}, "example-org/ranking-repo#13":{},
+      "example-org/ranking-repo#14":{}, "example-org/ranking-repo#20":{},
+      "example-org/ranking-repo#21":{},
+      "example-org/ranking-repo#99":{}
+    }}}
+' "$selection_data/state.json" >"$selection_data/state.next"
+mv "$selection_data/state.next" "$selection_data/state.json"
 (
   cd "$selection_fixture/repo"
   CLAUDE_CONFIG_DIR="$selection_fixture/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
@@ -281,8 +338,7 @@ jq -s -e '
     "example-org/ranking-repo#2",
     "example-org/ranking-repo#3",
     "example-org/ranking-repo#1",
-    "example-org/ranking-repo#4",
-    "example-org/ranking-repo#20"
+    "example-org/ranking-repo#4"
   ]
   and all(.[];
     .id != "example-org/ranking-repo#10"
@@ -308,14 +364,19 @@ jq -s -e '
 jq -e '.id == "example-org/ranking-repo#2"' "$selection_fixture/selected-ranked.json" >/dev/null
 jq -e '.id == "example-org/ranking-repo#3"' "$selection_fixture/selected-unblocker.json" >/dev/null
 jq -s -e '
-  map(.kind) == ["work-ranked", "work-ranked"]
-  and .[0].fact.ranking == "work_ranking"
-  and .[0].fact.ranking_position == 6
+  map(.kind) == ["work-graph-gated", "work-ranked", "work-graph-gated", "work-ranked"]
+  and .[0].fact.gated == "example-org/ranking-repo#21"
+  and .[0].fact.unsatisfied == ["example-org/ranking-repo#3"]
   and .[0].fact.selected == "example-org/ranking-repo#2"
-  and .[0].fact.displaced == "example-org/ranking-repo#1"
-  and .[1].fact.ranking == "dependency-unblocks"
-  and .[1].fact.selected == "example-org/ranking-repo#3"
+  and .[1].fact.ranking == "work_ranking"
+  and .[1].fact.ranking_position == 6
+  and .[1].fact.selected == "example-org/ranking-repo#2"
   and .[1].fact.displaced == "example-org/ranking-repo#1"
+  and .[2].fact.gated == "example-org/ranking-repo#21"
+  and .[2].fact.selected == "example-org/ranking-repo#3"
+  and .[3].fact.ranking == "dependency-unblocks"
+  and .[3].fact.selected == "example-org/ranking-repo#3"
+  and .[3].fact.displaced == "example-org/ranking-repo#1"
 ' "$selection_data/sprint.jsonl" >/dev/null
 
 # A swept stale pointer is a reported fault, never a silent omission.
@@ -323,11 +384,21 @@ cat >"$selection_data/mandates.yaml" <<'YAML'
 work_ranking:
   - example-org/ranking-repo#404
 bounce_all: []
-projects: []
+projects:
+  - repo: example-org/ranking-repo
+    delegated: []
+    excluded: []
+    reserved: []
+    default: delegated
+    paused: false
+    bounce: []
 YAML
-cat >"$selection_data/state.json" <<'JSON'
-{"version":2,"work_ranking":["example-org/ranking-repo#404"],"work_ranking_faults":["example-org/ranking-repo#404"],"repos":{}}
-JSON
+jq '
+  .work_ranking = ["example-org/ranking-repo#404"]
+  | .work_ranking_faults = ["example-org/ranking-repo#404"]
+  | .repos = {}
+' "$selection_data/state.json" >"$selection_data/state.next"
+mv "$selection_data/state.next" "$selection_data/state.json"
 set +e
 (
   cd "$selection_fixture/repo"
@@ -5548,6 +5619,7 @@ if [ "$1" = "api" ]; then
   graphql_owner=""
   graphql_name=""
   graphql_pr_count_query=0
+  graphql_dependency_query=0
   while [ "$#" -gt 0 ]; do
     case "$1" in
       -X | --method)
@@ -5560,6 +5632,7 @@ if [ "$1" = "api" ]; then
             owner=*) graphql_owner="${2#owner=}" ;;
             name=*) graphql_name="${2#name=}" ;;
             query=*PullRequestCount*totalCount*) graphql_pr_count_query=1 ;;
+            query=*OstromDependencyGraph*) graphql_dependency_query=1 ;;
           esac
           shift 2
         else
@@ -5597,6 +5670,10 @@ if [ "$1" = "api" ]; then
       example-org/pr-history) echo 254 ;;
       *) echo 0 ;;
     esac
+    exit 0
+  fi
+  if [ "$endpoint" = "graphql" ] && [ "$graphql_dependency_query" = "1" ]; then
+    printf '%s\n' '{"data":{"repository":{"issues":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}'
     exit 0
   fi
   if [ -z "$method" ] && [ "$has_field" = "1" ]; then

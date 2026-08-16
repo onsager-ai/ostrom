@@ -227,17 +227,26 @@ pub struct QueueItem {
     pub state: String,
     #[serde(default)]
     pub blocked_by: Vec<String>,
+    #[serde(default = "default_true")]
+    pub graph_dispatchable: bool,
+    #[serde(default)]
+    pub unblocking_power: usize,
 }
 
 impl QueueItem {
     #[must_use]
     pub fn dispatchable(&self) -> bool {
-        self.kind != "parked"
+        self.graph_dispatchable
+            && self.kind != "parked"
             && self.state != "deferred"
             && (matches!(self.kind.as_str(), "moved" | "stuck")
                 || (self.state == "approved"
                     && matches!(self.kind.as_str(), "tripwire" | "decision")))
     }
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -696,44 +705,49 @@ pub fn compose_ranking(
         .filter(|item| !result.contains(&item.id) && !demoted.contains(&item.id))
         .copied()
         .collect::<Vec<_>>();
-    remainder.sort_by_key(|item| (&item.opened, &item.id));
+    remainder.sort_by_key(|item| {
+        (
+            std::cmp::Reverse(item.unblocking_power),
+            &item.opened,
+            &item.id,
+        )
+    });
     result.extend(remainder.into_iter().map(|item| item.id.clone()));
     let mut tail = dispatchable
         .iter()
         .filter(|item| demoted.contains(&item.id))
         .copied()
         .collect::<Vec<_>>();
-    tail.sort_by_key(|item| (&item.opened, &item.id));
+    tail.sort_by_key(|item| {
+        (
+            std::cmp::Reverse(item.unblocking_power),
+            &item.opened,
+            &item.id,
+        )
+    });
     result.extend(tail.into_iter().map(|item| item.id.clone()));
     result
 }
 
-/// Reproduce the pre-plan selector exactly: a principal prefix, then the
-/// dependency-unblocks heuristic introduced with that prefix, with age as the
-/// final floor. Plan uses this whenever no goal consequence speaks.
+/// Apply the mechanical precedence below a goal plan: principal ranking,
+/// unblocking power, then age as the final floor.
 #[must_use]
 pub fn mechanical_ranking(queue: &[QueueItem], principal: &[String]) -> Vec<String> {
     let mut dispatchable = queue
         .iter()
         .filter(|item| item.dispatchable())
         .collect::<Vec<_>>();
-    if principal.is_empty() {
-        dispatchable.sort_by_key(|item| (&item.opened, &item.id));
-        return dispatchable
-            .into_iter()
-            .map(|item| item.id.clone())
-            .collect();
-    }
     dispatchable.sort_by_key(|item| {
         let rank = principal.iter().position(|id| id == &item.id);
-        let unblocks = queue
-            .iter()
-            .filter(|candidate| candidate.state != "deferred" && candidate.kind != "parked")
-            .filter(|candidate| candidate.blocked_by.contains(&item.id))
-            .count();
         match rank {
             Some(rank) => (0, rank, 0_isize, &item.opened, &item.id),
-            None => (1, 0, -(unblocks as isize), &item.opened, &item.id),
+            None => (
+                1,
+                0,
+                -(item.unblocking_power as isize),
+                &item.opened,
+                &item.id,
+            ),
         }
     });
     dispatchable
@@ -795,6 +809,8 @@ acknowledgements: []
             kind: kind.to_owned(),
             state: state.to_owned(),
             blocked_by: Vec::new(),
+            graph_dispatchable: true,
+            unblocking_power: 0,
         }
     }
 
@@ -1169,6 +1185,14 @@ acknowledgements: []
             "2030-01-04",
         );
         blocker.blocked_by = vec!["example-org/example-repo#2".to_owned()];
+        blocker.graph_dispatchable = false;
+        let mut unblocker = queue(
+            "example-org/example-repo#2",
+            "moved",
+            "pending",
+            "2030-01-02",
+        );
+        unblocker.unblocking_power = 1;
         let items = vec![
             queue(
                 "example-org/example-repo#1",
@@ -1176,12 +1200,7 @@ acknowledgements: []
                 "pending",
                 "2030-01-01",
             ),
-            queue(
-                "example-org/example-repo#2",
-                "moved",
-                "pending",
-                "2030-01-02",
-            ),
+            unblocker,
             queue(
                 "example-org/example-repo#3",
                 "moved",
@@ -1197,6 +1216,48 @@ acknowledgements: []
                 "example-org/example-repo#2",
                 "example-org/example-repo#1",
             ]
+        );
+    }
+
+    #[test]
+    fn graph_never_promotes_unauthorized_or_blocked_items() {
+        let mut graph_blocked = queue(
+            "example-org/example-repo#1",
+            "moved",
+            "pending",
+            "2030-01-01",
+        );
+        graph_blocked.graph_dispatchable = false;
+        graph_blocked.unblocking_power = 99;
+        let mut held = queue(
+            "example-org/example-repo#2",
+            "parked",
+            "pending",
+            "2030-01-02",
+        );
+        held.unblocking_power = 98;
+        let mut tripwire = queue(
+            "example-org/example-repo#3",
+            "tripwire",
+            "pending",
+            "2030-01-03",
+        );
+        tripwire.unblocking_power = 97;
+        let allowed = queue(
+            "example-org/example-repo#4",
+            "moved",
+            "pending",
+            "2030-01-04",
+        );
+        let queue = vec![graph_blocked, held, tripwire, allowed];
+        let promoted = vec![
+            "example-org/example-repo#1".to_owned(),
+            "example-org/example-repo#2".to_owned(),
+            "example-org/example-repo#3".to_owned(),
+        ];
+        assert_eq!(
+            compose_ranking(&queue, &promoted, &promoted, &BTreeSet::new()),
+            vec!["example-org/example-repo#4"]
         );
     }
 }

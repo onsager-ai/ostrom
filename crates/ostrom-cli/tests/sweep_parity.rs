@@ -362,6 +362,9 @@ case "$1 $2" in
     printf 'HTTP/2 304 Not Modified\r\netag: fixture-etag\r\n\r\n'
     exit 1
     ;;
+  "api graphql")
+    printf '%s\n' '{"data":{"repository":{"issues":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}'
+    ;;
   "pr list") printf '%s\n' '[]' ;;
   "repo view") printf '%s\n' '{"defaultBranchRef":{"name":"main"}}' ;;
   "run list") printf '%s\n' '[]' ;;
@@ -405,6 +408,7 @@ esac
     let calls = fs::read_to_string(log).expect("read gh call log");
     assert!(calls.contains("If-None-Match: fixture-etag"));
     assert!(calls.contains("since=2026-07-31T00:00:00Z"));
+    assert!(calls.contains("api graphql -f query=query OstromDependencyGraph"));
     assert!(calls.contains("pr list --repo example-org/example-repo --state open --limit 200"));
     assert!(calls.contains(
         "pr list --repo example-org/example-repo --state merged --search merged:>=2026-07-02 --limit 200"
