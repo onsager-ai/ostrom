@@ -5070,9 +5070,29 @@ JSON
       fi
       ;;
     example-org/landed-fix-repo)
-      cat <<'JSON'
+      if [ "${FAKE_GH_MODE:-base}" = "landed-closed" ]; then
+        if [ "$issue_state" = "all" ]; then
+          cat <<'JSON'
+[{
+  "number":273,"title":"perf: keep the sweep metered","body":"","state":"open","labels":[{"name":"bug"}],"createdAt":"2026-07-01T00:00:00Z","updatedAt":"2026-07-01T00:00:00Z","url":"https://example.invalid/issues/273"
+},{
+  "number":278,"title":"fix: preserve the cited work order","body":"","state":"open","labels":[{"name":"bug"}],"createdAt":"2026-07-01T00:00:00Z","updatedAt":"2026-07-01T00:00:00Z","url":"https://example.invalid/issues/278"
+},{
+  "number":280,"title":"feat: finish the parent workflow","body":"","state":"open","labels":[{"name":"bug"}],"createdAt":"2026-07-01T00:00:00Z","updatedAt":"2026-07-01T00:00:00Z","url":"https://example.invalid/issues/280"
+},{
+  "number":301,"title":"bug: widget throws on empty input","body":"","state":"closed","labels":[{"name":"bug"}],"createdAt":"2026-07-01T00:00:00Z","updatedAt":"2026-08-04T00:00:00Z","url":"https://example.invalid/issues/301"
+}]
+JSON
+        else
+          cat <<'JSON'
+[{"number":273,"title":"perf: keep the sweep metered","body":"","labels":[{"name":"bug"}],"createdAt":"2026-07-01T00:00:00Z","updatedAt":"2026-07-01T00:00:00Z","url":"https://example.invalid/issues/273"},{"number":278,"title":"fix: preserve the cited work order","body":"","labels":[{"name":"bug"}],"createdAt":"2026-07-01T00:00:00Z","updatedAt":"2026-07-01T00:00:00Z","url":"https://example.invalid/issues/278"},{"number":280,"title":"feat: finish the parent workflow","body":"","labels":[{"name":"bug"}],"createdAt":"2026-07-01T00:00:00Z","updatedAt":"2026-07-01T00:00:00Z","url":"https://example.invalid/issues/280"}]
+JSON
+        fi
+      else
+        cat <<'JSON'
 [{"number":273,"title":"perf: keep the sweep metered","body":"","labels":[{"name":"bug"}],"createdAt":"2026-07-01T00:00:00Z","updatedAt":"2026-07-01T00:00:00Z","url":"https://example.invalid/issues/273"},{"number":278,"title":"fix: preserve the cited work order","body":"","labels":[{"name":"bug"}],"createdAt":"2026-07-01T00:00:00Z","updatedAt":"2026-07-01T00:00:00Z","url":"https://example.invalid/issues/278"},{"number":280,"title":"feat: finish the parent workflow","body":"","labels":[{"name":"bug"}],"createdAt":"2026-07-01T00:00:00Z","updatedAt":"2026-07-01T00:00:00Z","url":"https://example.invalid/issues/280"},{"number":301,"title":"bug: widget throws on empty input","body":"","labels":[{"name":"bug"}],"createdAt":"2026-07-01T00:00:00Z","updatedAt":"2026-07-01T00:00:00Z","url":"https://example.invalid/issues/301"}]
 JSON
+      fi
       ;;
     # #109: two different organisations, so a sweep.sh that mints only one
     # token for the whole run can read one repo and 404 the other.
@@ -6158,10 +6178,76 @@ jq -s -e '
     .mandate.reason | contains("possibly landed") | not
   )
   and (first(.[] | select(.id == "example-org/landed-fix-repo#301")) as $row
-    | $row.mandate.reason | endswith(
+    | $row.kind == "stuck"
+    and $row.needs_judgment == false
+    and ($row.mandate.reason | endswith(
       "; possibly landed: 95d5ccc0 references #301 without a closing keyword"
-    )
+    ))
     and ($row.mandate.reason | contains("aaaaaaaa") | not)
+  )
+  and (first(.[] | select(.id == "example-org/landed-fix-repo#273")) as $row
+    | $row.kind == "stuck"
+    and $row.mandate.reason
+      == "delegated label:bug; no movement for 1 days"
+  )
+' "$landed_fix/config/ostrom/queue.jsonl" >/dev/null
+
+# The issue feed is authoritative in both directions. The open #301 above
+# remains ordinary delegated work even though the commit heuristic found a
+# possible landing. Once that same issue is positively CLOSED, it cannot stay
+# in the delegated tier. Retain it as the existing non-dispatchable parked
+# shape so a phase-scoped implementation closing its parent remains visible.
+(
+  cd "$landed_fix/repo"
+  PATH="$fixture/bin:$PATH" \
+    FAKE_GH_MODE=landed-closed \
+    CLAUDE_CONFIG_DIR="$landed_fix/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    MANDATE_SWEEP_MODE=full \
+    MANDATE_SWEEP_TIME="2026-08-04T00:00:00Z" \
+    bash "$PLUGIN_ROOT/scripts/sweep.sh" >/dev/null
+)
+jq -s -e '
+  length == 4
+  and (first(.[] | select(.id == "example-org/landed-fix-repo#301")) as $row
+    | $row.kind == "parked"
+    and $row.state == "pending"
+    and $row.needs_judgment == false
+    and ($row.mandate.reason | startswith(
+      "issue state CLOSED; retained for review; "
+    ))
+    and ($row.mandate.reason | contains(
+      "possibly landed: 95d5ccc0 references #301 without a closing keyword"
+    ))
+  )
+  and ([.[] | select(
+    .id == "example-org/landed-fix-repo#301"
+    and (.kind | IN("stuck", "moved"))
+  )] | length) == 0
+  and (first(.[] | select(.id == "example-org/landed-fix-repo#273")) as $row
+    | $row.kind == "stuck"
+    and $row.needs_judgment == false
+  )
+' "$landed_fix/config/ostrom/queue.jsonl" >/dev/null
+
+# A later feed need not replay the closure event. The visible parked evidence
+# survives absence, just as the closed-issue tombstone was a positive fact;
+# it is not downgraded back into inferred delegated work.
+(
+  cd "$landed_fix/repo"
+  PATH="$fixture/bin:$PATH" \
+    FAKE_GH_MODE=landed-closed \
+    CLAUDE_CONFIG_DIR="$landed_fix/config" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    MANDATE_SWEEP_MODE=full \
+    MANDATE_SWEEP_TIME="2026-08-05T00:00:00Z" \
+    bash "$PLUGIN_ROOT/scripts/sweep.sh" >/dev/null
+)
+jq -s -e '
+  length == 4
+  and (first(.[] | select(.id == "example-org/landed-fix-repo#301")) as $row
+    | $row.kind == "parked"
+    and $row.needs_judgment == false
   )
 ' "$landed_fix/config/ostrom/queue.jsonl" >/dev/null
 
