@@ -14,14 +14,17 @@ const ALLOWED: &[&str] = &[
     "age_days",
     "aged_out",
     "blocked_by",
+    "classification",
     "id",
     "kind",
     "mandate",
+    "matched_selector",
     "needs_judgment",
     "opened",
     "ref",
     "repo",
     "state",
+    "semantic_derivation",
     "title",
 ];
 
@@ -143,7 +146,10 @@ fn validate_queue(value: &Value) -> Result<(), String> {
         return Err("ref must have the shape #N".to_owned());
     }
     let kind = require_string(object, "kind")?;
-    if !matches!(kind, "tripwire" | "decision" | "moved" | "stuck" | "drift") {
+    if !matches!(
+        kind,
+        "tripwire" | "decision" | "moved" | "stuck" | "drift" | "parked" | "merge-gate-fault"
+    ) {
         return Err("kind is not recognized".to_owned());
     }
     let state = require_string(object, "state")?;
