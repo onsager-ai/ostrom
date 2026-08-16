@@ -126,6 +126,52 @@ fetch_issues() {
   fi
 }
 
+# The ostrom/ namespace is derived from durable work orders. Enumerate it with
+# the same bounded, fail-closed pagination used for the other complete GitHub
+# listings: a truncated branch view must not turn missing evidence into an
+# unexplained-write alarm.
+fetch_branch_page() {
+  local repo="$1"
+  local page="$2"
+  local body="$work/branches-page-$page.json"
+  local detail
+
+  if ! gh api -X GET \
+      "repos/$repo/branches?per_page=100&page=$page" \
+      >"$body" 2>"$work/gh-error"; then
+    detail="$(tr '\n' ' ' <"$work/gh-error")"
+    echo "mandate sweep: failed to query pushed branches for $repo${detail:+: $detail}" >&2
+    return 5
+  fi
+  if ! jq -e 'type == "array"' "$body" >/dev/null 2>&1; then
+    echo "mandate sweep: branch query for $repo returned a non-array body" >&2
+    return 5
+  fi
+}
+
+fetch_branches() {
+  local repo="$1"
+  local first_count second_count
+
+  fetch_branch_page "$repo" 1 || return $?
+  first_count="$(jq 'length' "$work/branches-page-1.json")"
+  if [ "$first_count" -lt 100 ]; then
+    cp "$work/branches-page-1.json" "$work/branches.json"
+    return
+  fi
+
+  fetch_branch_page "$repo" 2 || return $?
+  second_count="$(jq 'length' "$work/branches-page-2.json")"
+  jq -cn \
+    --slurpfile first "$work/branches-page-1.json" \
+    --slurpfile second "$work/branches-page-2.json" \
+    '$first[0] + $second[0]' >"$work/branches.json"
+  if [ "$second_count" -eq 100 ]; then
+    echo "mandate sweep: branch query for $repo reached query_limit $query_limit; refusing a truncated sweep" >&2
+    return 6
+  fi
+}
+
 extract_closed_issue_ids() {
   local repo="$1"
   local source="$2"
@@ -310,7 +356,19 @@ sweep_org() {
       default_branch="$(jq -r '.defaultBranchRef.name // ""' "$work/repo-view.json")"
     else
       detail="$(tr '\n' ' ' <"$gh_error")"
-      echo "mandate sweep: failed to read the default branch for $repo${detail:+: $detail}; skipping CI drift and landed-fix checks this sweep" >&2
+      echo "mandate sweep: failed to read the default branch for $repo${detail:+: $detail}; skipping CI drift, landed-fix, and pushed-branch checks this sweep" >&2
+    fi
+
+    # Branch authorship is not present in the branch-list representation. The
+    # reserved ostrom/ namespace supplies the equivalent scope signal: every
+    # such pushed branch must join to a durable work order for this repository.
+    # If the default branch cannot be identified, skip this detector rather
+    # than risk filing the repository's ordinary write head as an anomaly.
+    printf '%s\n' '[]' >"$work/branches.json"
+    printf '%s\n' '{"degraded":true}' >"$work/branches-status.json"
+    if [ -n "$default_branch" ]; then
+      fetch_branches "$repo" || exit $?
+      printf '%s\n' '{"degraded":false}' >"$work/branches-status.json"
     fi
 
     # One run-list call per repo, same shape as the issue/PR queries above.
@@ -1341,7 +1399,7 @@ sweep_org() {
       mv "$work/next.json" "$work/analysis.json"
     fi
 
-    # #147/#208: a merge with no timely passing verdict is a fault observed
+    # #147/#208/#219: a merge with no timely passing verdict is a fault observed
     # after the fact, but only once verdict recording existed for this
     # repository and only when the merged work belonged to the loop. The floor
     # comes from the repository's earliest gate record; machine authorship and
@@ -1357,6 +1415,7 @@ sweep_org() {
       --slurpfile merged "$work/merged-prs.json" \
       --slurpfile gate "$work/gate-records.json" \
       --slurpfile exceptions "$work/exception-records.json" \
+      --slurpfile queue "$work/existing-queue.json" \
       --slurpfile previous "$work/previous.json" '
       def timestamp_before($candidate; $boundary):
         try (($candidate | fromdateiso8601) < ($boundary | fromdateiso8601))
@@ -1492,12 +1551,30 @@ sweep_org() {
               exception: $exception,
               scope_evidence: {
                 basis: ([
+                  if ($merge.machine_authored | not) then "human_authorship" else empty end,
                   if $merge.machine_authored then "machine_authorship" else empty end,
                   if (($merge.work_order_refs // []) | length) > 0
-                  then "work_order" else empty end
+                  then "work_order" else empty end,
+                  if ($records | length) > 0 then "gate_verdict" else empty end
                 ]),
                 machine_author: $merge.machine_author,
-                work_order_refs: ($merge.work_order_refs // [])
+                work_order_refs: ($merge.work_order_refs // []),
+                gate_verdict: (
+                  if ($records | length) > 0 then {
+                    verdict: $violation.verdict,
+                    ts: $violation.gate_ts
+                  } else null end
+                ),
+                classification: (
+                  # A cited work order still explains a no-verdict fault: it
+                  # is requested loop work whose gate execution failed, not an
+                  # unauthorised write. The fault remains actionable below.
+                  if ($merge.machine_authored | not)
+                      or (($merge.work_order_refs // []) | length) > 0
+                  then "explained"
+                  else "unexplained"
+                  end
+                )
               },
               fingerprint: (["scope-v1", $violation.shape, $merge.head_sha,
                 $violation.verdict, ($violation.gate_ts // ""),
@@ -1507,21 +1584,34 @@ sweep_org() {
         ] as $violations
       | ([$violations[] | select(.exception == null)]) as $faults
       | ([$violations[] | select(.exception != null)]) as $excused
+      | ([$faults[] | select(.scope_evidence.classification == "explained")]) as $ordinary_faults
+      | ([$faults[] | select(.scope_evidence.classification == "unexplained")]) as $anomalies
       | ($previous[0].merge_gate_faults // {}) as $old_faults
       | {
           rows: [
             $faults[]
-            | select(($old_faults[.id].fingerprint // "") != .fingerprint)
             | . as $fault
+            | (if $fault.scope_evidence.classification == "unexplained"
+               then "unexplained-write" else "merge-gate-fault" end) as $kind
+            | select(
+                ($old_faults[$fault.id].fingerprint // "") != $fault.fingerprint
+                or (first($queue[0][]? | select(.id == $fault.id)).kind // "") != $kind
+              )
             | (age_days($fault.merged_at)) as $age
             | {
                 id: $fault.id,
                 repo: $repo,
                 ref: ("#" + ($fault.number | tostring)),
                 title: $fault.title,
-                kind: "merge-gate-fault",
+                kind: $kind,
                 mandate: {
-                  reason: reason($fault),
+                  reason: (
+                    if $kind == "unexplained-write"
+                    then "unexplained write: machine-authored merge has no matching work order; "
+                      + reason($fault)
+                    else reason($fault)
+                    end
+                  ),
                   scope_evidence: $fault.scope_evidence
                 },
                 state: "pending",
@@ -1561,9 +1651,103 @@ sweep_org() {
             }
           )),
           floor: $verdict_floor,
-          fault_count: ($faults | length)
+          fault_count: ($ordinary_faults | length),
+          anomaly_count: ($anomalies | length)
         }
       ' >"$work/merge-gate.json"
+
+    # #219: a pushed branch in the loop-owned namespace must be backed by a
+    # durable work order. This is a separate write shape, but it enters the
+    # same alarm kind and evidence vocabulary as an unexplained merge.
+    jq -cn \
+      --arg repo "$repo" \
+      --arg default_branch "$default_branch" \
+      --arg sweep_started "$sweep_started" \
+      --argjson branch_read_degraded "$(jq '.degraded' "$work/branches-status.json")" \
+      --slurpfile branches "$work/branches.json" \
+      --slurpfile orders "$work/work-orders.json" \
+      --slurpfile queue "$work/existing-queue.json" \
+      --slurpfile previous "$work/previous.json" '
+      def branch_sha($branch):
+        if (($branch.commit.sha // null) | type) == "string"
+        then $branch.commit.sha else "" end;
+      ($previous[0].unexplained_branch_writes // {}) as $old_writes
+      | (if $branch_read_degraded then [] else [
+          $branches[0][]
+          | select((.name | type) == "string")
+          | select(.name != $default_branch and (.name | startswith("ostrom/")))
+          | . as $branch
+          | ([
+              $orders[0][]
+              | select(.repository == $repo and .branch_name == $branch.name)
+              | {item_id, order_id, branch_name}
+            ] | unique_by(.order_id)) as $matches
+          | select(($matches | length) == 0)
+          | {
+              id: ($repo + "@refs/heads/" + $branch.name),
+              repo: $repo,
+              ref: ("@" + $branch.name),
+              title: ("Pushed branch " + $branch.name),
+              branch_name: $branch.name,
+              branch_sha: branch_sha($branch),
+              opened: $sweep_started,
+              scope_evidence: {
+                basis: [],
+                machine_author: null,
+                work_order_refs: [],
+                gate_verdict: null,
+                classification: "unexplained",
+                branch_name: $branch.name,
+                branch_sha: branch_sha($branch),
+                matching_work_orders: $matches
+              },
+              fingerprint: (["branch-v1", $branch.name, branch_sha($branch)] | join("|"))
+            }
+        ] end) as $writes
+      | {
+          rows: [
+            $writes[]
+            | . as $write
+            | select(
+                ($old_writes[$write.id].fingerprint // "") != $write.fingerprint
+                or (first($queue[0][]? | select(.id == $write.id)).kind // "")
+                  != "unexplained-write"
+              )
+            | {
+                id: $write.id,
+                repo: $repo,
+                ref: $write.ref,
+                title: $write.title,
+                kind: "unexplained-write",
+                mandate: {
+                  reason: ("unexplained write: pushed branch " + $write.branch_name
+                    + " has no matching work order"),
+                  scope_evidence: $write.scope_evidence
+                },
+                state: "pending",
+                opened: $write.opened,
+                age_days: 0,
+                aged_out: false,
+                needs_judgment: false,
+                blocked_by: []
+              }
+          ],
+          active_ids: [$writes[].id],
+          current_items: [
+            $writes[]
+            | {id, title, age_days: 0, aged_out: false}
+          ],
+          writes: (reduce $writes[] as $write ({};
+            .[$write.id] = {
+              branch_name: $write.branch_name,
+              branch_sha: $write.branch_sha,
+              scope_evidence: $write.scope_evidence,
+              fingerprint: $write.fingerprint
+            }
+          )),
+          count: ($writes | length)
+        }
+      ' >"$work/branch-writes.json"
 
     # #78: fold the default branch's own CI into a "drift" row, the same kind
     # and digest/troubled-project machinery an open PR's failing CI already
@@ -1769,15 +1953,19 @@ sweep_org() {
       --slurpfile all "$work/generated.json" \
       --slurpfile analysis "$work/analysis.json" \
       --slurpfile merge_gate "$work/merge-gate.json" \
+      --slurpfile branch_writes "$work/branch-writes.json" \
       --slurpfile ci_drift "$work/ci-drift.json" \
-      '$all[0] + $analysis[0].rows + $merge_gate[0].rows + $ci_drift[0].rows' >"$work/next.json"
+      '$all[0] + $analysis[0].rows + $merge_gate[0].rows
+        + $branch_writes[0].rows + $ci_drift[0].rows' >"$work/next.json"
     mv "$work/next.json" "$work/generated.json"
     jq -cn \
       --slurpfile all "$work/active-ids.json" \
       --slurpfile analysis "$work/analysis.json" \
       --slurpfile merge_gate "$work/merge-gate.json" \
+      --slurpfile branch_writes "$work/branch-writes.json" \
       --slurpfile ci_drift "$work/ci-drift.json" \
-      '$all[0] + $analysis[0].active_ids + $merge_gate[0].active_ids + $ci_drift[0].active_ids' >"$work/next.json"
+      '$all[0] + $analysis[0].active_ids + $merge_gate[0].active_ids
+        + $branch_writes[0].active_ids + $ci_drift[0].active_ids' >"$work/next.json"
     mv "$work/next.json" "$work/active-ids.json"
 
     # An approval is deliberately durable across an item disappearing from
@@ -1841,8 +2029,10 @@ sweep_org() {
       --slurpfile all "$work/current-items.json" \
       --slurpfile analysis "$work/analysis.json" \
       --slurpfile merge_gate "$work/merge-gate.json" \
+      --slurpfile branch_writes "$work/branch-writes.json" \
       --slurpfile ci_drift "$work/ci-drift.json" \
-      '$all[0] + $analysis[0].current_items + $merge_gate[0].current_items + $ci_drift[0].current_items' >"$work/next.json"
+      '$all[0] + $analysis[0].current_items + $merge_gate[0].current_items
+        + $branch_writes[0].current_items + $ci_drift[0].current_items' >"$work/next.json"
     mv "$work/next.json" "$work/current-items.json"
     jq -cn \
       --slurpfile all "$work/selector-stats.json" \
@@ -1861,6 +2051,7 @@ sweep_org() {
         --slurpfile state "$work/new-state.json" \
         --slurpfile analysis "$work/analysis.json" \
         --slurpfile merge_gate "$work/merge-gate.json" \
+        --slurpfile branch_writes "$work/branch-writes.json" \
         --slurpfile ci_drift "$work/ci-drift.json" \
         --slurpfile records "$work/items.json" \
         --arg etag "${issue_etag:-$previous_etag}" \
@@ -1874,6 +2065,10 @@ sweep_org() {
                   merge_gate_faults: $merge_gate[0].faults,
                   merge_gate_excuses: $merge_gate[0].excuses,
                   merge_gate_fault_count: $merge_gate[0].fault_count,
+                  unexplained_branch_writes: $branch_writes[0].writes,
+                  unexplained_write_count: (
+                    $merge_gate[0].anomaly_count + $branch_writes[0].count
+                  ),
                   etag: (if $etag == "" then null else $etag end),
                   records: (reduce $records[0][] as $record ({}; .[$record.id] = $record))
                 }
@@ -2028,6 +2223,31 @@ if [ -s "$MANDATE_EXCEPTIONS_LOG" ]; then
     echo "mandate sweep: could not read $MANDATE_EXCEPTIONS_LOG; ignoring merge gate exceptions" >&2
     printf '%s\n' '[]' >"$work/exception-records.json"
   fi
+fi
+
+# Work orders are private, durable evidence. Snapshot only the fields needed
+# for the branch join, tolerate an absent directory, and ignore malformed or
+# unrelated JSON without making the sweep depend on a new operator artifact.
+: >"$work/work-order-records.jsonl"
+for work_order_file in "$MANDATE_DATA_DIR/work-orders/"*.json; do
+  [ -f "$work_order_file" ] || continue
+  if ! jq -ce '
+      select(
+        type == "object"
+        and (.repository | type) == "string"
+        and (.branch_name | type) == "string"
+        and (.item_id | type) == "string"
+        and (.order_id | type) == "string"
+      )
+      | {repository, branch_name, item_id, order_id}
+    ' "$work_order_file" >>"$work/work-order-records.jsonl" 2>/dev/null; then
+    echo "mandate sweep: ignoring malformed work order while classifying pushed branches" >&2
+  fi
+done
+if [ -s "$work/work-order-records.jsonl" ]; then
+  jq -s '.' "$work/work-order-records.jsonl" >"$work/work-orders.json"
+else
+  printf '%s\n' '[]' >"$work/work-orders.json"
 fi
 
 # #86: track landed-fix commit-search attempts/failures across the whole

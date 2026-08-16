@@ -51,6 +51,10 @@ export MANDATE_NOW_EPOCH="1785542400"
 # Semantic tests opt in explicitly below. Ambient operator configuration must
 # never turn this otherwise hermetic suite into a model or network client.
 unset ANTHROPIC_API_KEY MANDATE_SEMANTIC_DERIVER MANDATE_SEMANTIC_MODEL
+# Operator concurrency overrides must not replace roster values in fixtures
+# that deliberately exercise the parsed per-project setting. Individual tests
+# still set either variable on their own command when testing the override.
+unset MANDATE_MAX_IMPLEMENTERS MANDATE_MAX_IMPLEMENTERS_PER_REPOSITORY
 
 write_config() {
   delegated_selector="${1:-label:maintenance}"
@@ -5316,7 +5320,7 @@ JSON
         echo '[]'
       else
         cat <<'JSON'
-[{"number":300,"title":"Synthetic pre-floor machine merge","author":{"login":"builder-app[bot]","is_bot":true},"closingIssuesReferences":[{"number":200}],"state":"MERGED","createdAt":"2026-07-01T00:00:00Z","mergedAt":"2026-07-18T12:00:00Z","headRefOid":"0000000000000000000000000000000000000000"},{"number":301,"title":"Synthetic merge without a verdict","author":{"login":"human-contributor","is_bot":false},"closingIssuesReferences":[{"number":201}],"state":"MERGED","createdAt":"2026-07-01T00:00:00Z","mergedAt":"2026-07-20T12:00:00Z","headRefOid":"1111111111111111111111111111111111111111"},{"number":302,"title":"Synthetic merge against a failing gate","author":{"login":"builder-app","is_bot":true},"closingIssuesReferences":[],"state":"MERGED","createdAt":"2026-07-02T00:00:00Z","mergedAt":"2026-07-21T12:00:00Z","headRefOid":"2222222222222222222222222222222222222222"},{"number":303,"title":"Synthetic merge against an inconclusive gate","author":{"login":"builder-fallback[bot]","is_bot":false},"closingIssuesReferences":[],"state":"MERGED","createdAt":"2026-07-03T00:00:00Z","mergedAt":"2026-07-22T12:00:00Z","headRefOid":"3333333333333333333333333333333333333333"},{"number":304,"title":"Synthetic merge after a passing gate","author":{"login":"human-contributor","is_bot":false},"closingIssuesReferences":[{"number":204}],"state":"MERGED","createdAt":"2026-07-04T00:00:00Z","mergedAt":"2026-07-23T12:00:00Z","headRefOid":"4444444444444444444444444444444444444444"},{"number":305,"title":"Synthetic merge before a late pass","author":{"login":"builder-app","is_bot":true},"closingIssuesReferences":[],"state":"MERGED","createdAt":"2026-07-05T00:00:00Z","mergedAt":"2026-07-24T12:00:00Z","headRefOid":"5555555555555555555555555555555555555555"},{"number":306,"title":"Synthetic excused loop merge","author":{"login":"builder-app","is_bot":true},"closingIssuesReferences":[],"state":"MERGED","createdAt":"2026-07-06T00:00:00Z","mergedAt":"2026-07-25T12:00:00Z","headRefOid":"6666666666666666666666666666666666666666"},{"number":307,"title":"Synthetic human merge outside the loop","author":{"login":"human-contributor","is_bot":false},"closingIssuesReferences":[],"state":"MERGED","createdAt":"2026-07-07T00:00:00Z","mergedAt":"2026-07-26T12:00:00Z","headRefOid":"7777777777777777777777777777777777777777"}]
+[{"number":300,"title":"Synthetic pre-floor machine merge","author":{"login":"builder-app[bot]","is_bot":true},"closingIssuesReferences":[{"number":200}],"state":"MERGED","createdAt":"2026-07-01T00:00:00Z","mergedAt":"2026-07-18T12:00:00Z","headRefOid":"0000000000000000000000000000000000000000"},{"number":301,"title":"Synthetic merge without a verdict","author":{"login":"builder-app","is_bot":true},"closingIssuesReferences":[{"number":201}],"state":"MERGED","createdAt":"2026-07-01T00:00:00Z","mergedAt":"2026-07-20T12:00:00Z","headRefOid":"1111111111111111111111111111111111111111"},{"number":302,"title":"Synthetic merge against a failing gate","author":{"login":"builder-app","is_bot":true},"closingIssuesReferences":[{"number":202}],"state":"MERGED","createdAt":"2026-07-02T00:00:00Z","mergedAt":"2026-07-21T12:00:00Z","headRefOid":"2222222222222222222222222222222222222222"},{"number":303,"title":"Synthetic merge against an inconclusive gate","author":{"login":"builder-fallback[bot]","is_bot":false},"closingIssuesReferences":[{"number":203}],"state":"MERGED","createdAt":"2026-07-03T00:00:00Z","mergedAt":"2026-07-22T12:00:00Z","headRefOid":"3333333333333333333333333333333333333333"},{"number":304,"title":"Synthetic merge after a passing gate","author":{"login":"builder-app","is_bot":true},"closingIssuesReferences":[{"number":204}],"state":"MERGED","createdAt":"2026-07-04T00:00:00Z","mergedAt":"2026-07-23T12:00:00Z","headRefOid":"4444444444444444444444444444444444444444"},{"number":305,"title":"Synthetic merge before a late pass","author":{"login":"builder-app","is_bot":true},"closingIssuesReferences":[{"number":205}],"state":"MERGED","createdAt":"2026-07-05T00:00:00Z","mergedAt":"2026-07-24T12:00:00Z","headRefOid":"5555555555555555555555555555555555555555"},{"number":306,"title":"Synthetic excused loop merge","author":{"login":"builder-app","is_bot":true},"closingIssuesReferences":[{"number":206}],"state":"MERGED","createdAt":"2026-07-06T00:00:00Z","mergedAt":"2026-07-25T12:00:00Z","headRefOid":"6666666666666666666666666666666666666666"},{"number":307,"title":"Synthetic human merge outside the loop","author":{"login":"human-contributor","is_bot":false},"closingIssuesReferences":[],"state":"MERGED","createdAt":"2026-07-07T00:00:00Z","mergedAt":"2026-07-26T12:00:00Z","headRefOid":"7777777777777777777777777777777777777777"},{"number":308,"title":"Synthetic unexplained App merge","author":{"login":"builder-app","is_bot":true},"closingIssuesReferences":[],"state":"MERGED","createdAt":"2026-07-08T00:00:00Z","mergedAt":"2026-07-27T12:00:00Z","headRefOid":"9999999999999999999999999999999999999999"}]
 JSON
       fi
       ;;
@@ -5421,7 +5425,7 @@ if [ "$1" = "api" ]; then
     case "$graphql_owner/$graphql_name" in
       example-org/example-repo) echo 4 ;;
       example-org/hub-repo) echo 3 ;;
-      example-org/merge-invariant-repo) echo 8 ;;
+      example-org/merge-invariant-repo) echo 9 ;;
       example-org/no-gate-history-repo) echo 1 ;;
       example-org/pr-history) echo 254 ;;
       *) echo 0 ;;
@@ -5433,6 +5437,19 @@ if [ "$1" = "api" ]; then
     exit 1
   fi
   case "$endpoint" in
+    repos/*/*/branches\?*)
+      api_repo="${endpoint#repos/}"
+      api_repo="${api_repo%%/branches\?*}"
+      case "$api_repo" in
+        example-org/merge-invariant-repo)
+          cat <<'JSON'
+[{"name":"main","commit":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},{"name":"ostrom/901-deadbeefcafe","commit":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},{"name":"ostrom/999-feedfacecafe","commit":{"sha":"cccccccccccccccccccccccccccccccccccccccc"}}]
+JSON
+          ;;
+        *) echo '[]' ;;
+      esac
+      exit 0
+      ;;
     repos/*/*/issues\?*)
       api_repo="${endpoint#repos/}"
       api_repo="${api_repo%%/issues\?*}"
@@ -7089,17 +7106,19 @@ JSONL
   chmod 644 "$unreadable_gate_log"
 fi
 
-# #147: the sweep fetches recent merged PRs separately and joins
+# #147/#219: the sweep fetches recent merged PRs separately and joins
 # them to gate.jsonl by the head SHA that landed. These synthetic merges cover
 # every invariant outcome: a pre-floor merge, no verdict at that SHA (despite
 # a verdict for the same PR at another SHA), fail, inconclusive, timely pass,
-# late pass, an explicitly excused loop merge, and a human merge outside the
-# loop. A second synthetic repository has a machine-authored historical merge
-# but no verdict history, proving that repository onboarding derives its own
-# quiet floor instead of borrowing another repository's epoch.
+# late pass, an explicitly excused loop merge, a human merge outside the loop,
+# and an App merge with neither a work order nor a verdict. The branch listing
+# also has one order-backed ostrom/ branch and one unaccounted branch. A second
+# synthetic repository has a machine-authored historical merge but no verdict
+# history, proving that repository onboarding derives its own quiet floor
+# instead of borrowing another repository's epoch.
 merge_invariant="$fixture/merge-invariant"
 merge_invariant_calls="$merge_invariant/gh-calls.log"
-mkdir -p "$merge_invariant/config/ostrom" "$merge_invariant/repo"
+mkdir -p "$merge_invariant/config/ostrom/work-orders" "$merge_invariant/repo"
 write_gatekeeper_secrets "$merge_invariant/config"
 cat >"$merge_invariant/config/ostrom/mandates.yaml" <<'YAML'
 bounce_all: []
@@ -7119,6 +7138,9 @@ projects:
     paused: false
     bounce: []
 YAML
+cat >"$merge_invariant/config/ostrom/work-orders/synthetic.json" <<'JSON'
+{"repository":"example-org/merge-invariant-repo","branch_name":"ostrom/901-deadbeefcafe","item_id":"example-org/merge-invariant-repo#901","order_id":"synthetic-order-901"}
+JSON
 cat >"$merge_invariant/config/ostrom/gate.jsonl" <<'JSONL'
 {"ts":"2026-07-19T10:00:00Z","pr":"example-org/merge-invariant-repo#301","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","verdict":"pass","already_judged":false,"conditions":[]}
 {"ts":"2026-07-21T10:00:00Z","pr":"example-org/merge-invariant-repo#302","head_sha":"2222222222222222222222222222222222222222","verdict":"fail","already_judged":false,"conditions":[]}
@@ -7137,30 +7159,37 @@ merge_invariant_output="$(
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
     bash "$PLUGIN_ROOT/scripts/sweep.sh"
 )"
-grep -q '^mandate sweep: 2 projects; 4 queue changes$' \
+grep -q '^mandate sweep: 2 projects; 6 queue changes$' \
   <<<"$merge_invariant_output"
 merge_invariant_queue="$merge_invariant/config/ostrom/queue.jsonl"
 merge_invariant_state="$merge_invariant/config/ostrom/state.json"
 jq -s -e '
-  length == 4
+  length == 6
   and all(.[];
     .repo == "example-org/merge-invariant-repo"
-    and .kind == "merge-gate-fault"
     and .state == "pending"
     and .needs_judgment == false
-    and (.mandate.scope_evidence.basis | length) > 0
   )
+  and ([.[] | select(.kind == "merge-gate-fault")] | length) == 4
+  and ([.[] | select(.kind == "unexplained-write")] | length) == 2
   and any(.[];
     .id == "example-org/merge-invariant-repo#301"
+    and .kind == "merge-gate-fault"
     and .mandate.reason == "merge gate fault: no verdict for merged head 1111111111111111111111111111111111111111"
-    and .mandate.scope_evidence.basis == ["work_order"]
-    and .mandate.scope_evidence.machine_author == null
+    and .mandate.scope_evidence.basis == ["machine_authorship", "work_order"]
+    and .mandate.scope_evidence.classification == "explained"
+    and .mandate.scope_evidence.gate_verdict == null
+    and .mandate.scope_evidence.machine_author.login == "builder-app"
     and .mandate.scope_evidence.work_order_refs == ["example-org/merge-invariant-repo#201"]
   )
   and any(.[];
     .id == "example-org/merge-invariant-repo#302"
+    and .kind == "merge-gate-fault"
     and .mandate.reason == "merge gate fault: fail verdict for merged head 2222222222222222222222222222222222222222"
-    and .mandate.scope_evidence.basis == ["machine_authorship"]
+    and .mandate.scope_evidence.basis == ["machine_authorship", "work_order", "gate_verdict"]
+    and .mandate.scope_evidence.classification == "explained"
+    and .mandate.scope_evidence.gate_verdict.verdict == "fail"
+    and .mandate.scope_evidence.gate_verdict.ts == "2026-07-21T10:00:00Z"
     and .mandate.scope_evidence.machine_author.login == "builder-app"
     and .mandate.scope_evidence.machine_author.is_bot == true
   )
@@ -7174,23 +7203,49 @@ jq -s -e '
     .id == "example-org/merge-invariant-repo#305"
     and .mandate.reason == "merge gate fault: pass recorded after merge for head 5555555555555555555555555555555555555555"
   )
+  and any(.[];
+    .id == "example-org/merge-invariant-repo#308"
+    and .kind == "unexplained-write"
+    and .mandate.reason == "unexplained write: machine-authored merge has no matching work order; merge gate fault: no verdict for merged head 9999999999999999999999999999999999999999"
+    and .mandate.scope_evidence.basis == ["machine_authorship"]
+    and .mandate.scope_evidence.classification == "unexplained"
+    and .mandate.scope_evidence.work_order_refs == []
+    and .mandate.scope_evidence.gate_verdict == null
+  )
+  and any(.[];
+    .id == "example-org/merge-invariant-repo@refs/heads/ostrom/999-feedfacecafe"
+    and .ref == "@ostrom/999-feedfacecafe"
+    and .kind == "unexplained-write"
+    and .mandate.reason == "unexplained write: pushed branch ostrom/999-feedfacecafe has no matching work order"
+    and .mandate.scope_evidence.basis == []
+    and .mandate.scope_evidence.classification == "unexplained"
+    and .mandate.scope_evidence.branch_name == "ostrom/999-feedfacecafe"
+    and .mandate.scope_evidence.matching_work_orders == []
+  )
   and (any(.[]; .id == "example-org/merge-invariant-repo#300") | not)
   and (any(.[]; .id == "example-org/merge-invariant-repo#304") | not)
   and (any(.[]; .id == "example-org/merge-invariant-repo#306") | not)
   and (any(.[]; .id == "example-org/merge-invariant-repo#307") | not)
+  and (any(.[]; .ref == "@ostrom/901-deadbeefcafe") | not)
   and (any(.[]; .repo == "example-org/no-gate-history-repo") | not)
 ' "$merge_invariant_queue" >/dev/null
 jq -e '
   .repos["example-org/merge-invariant-repo"] as $repo
   | $repo.merge_gate_fault_count == 4
+  and $repo.unexplained_write_count == 2
   and $repo.merge_gate_floor == "2026-07-19T10:00:00Z"
-  and ($repo.merge_gate_merges | length) == 8
+  and ($repo.merge_gate_merges | length) == 9
   and ($repo.merge_gate_faults | has("example-org/merge-invariant-repo#300") | not)
   and $repo.merge_gate_faults["example-org/merge-invariant-repo#301"].shape == "no_verdict"
   and $repo.merge_gate_faults["example-org/merge-invariant-repo#302"].shape == "non_pass"
   and $repo.merge_gate_faults["example-org/merge-invariant-repo#302"].verdict == "fail"
   and $repo.merge_gate_faults["example-org/merge-invariant-repo#303"].verdict == "inconclusive"
   and $repo.merge_gate_faults["example-org/merge-invariant-repo#305"].shape == "pass_after_merge"
+  and $repo.merge_gate_faults["example-org/merge-invariant-repo#308"].scope_evidence.classification == "unexplained"
+  and $repo.merge_gate_faults["example-org/merge-invariant-repo#308"].fingerprint
+    == "scope-v1|no_verdict|9999999999999999999999999999999999999999|none||true|"
+  and $repo.unexplained_branch_writes["example-org/merge-invariant-repo@refs/heads/ostrom/999-feedfacecafe"].fingerprint
+    == "branch-v1|ostrom/999-feedfacecafe|cccccccccccccccccccccccccccccccccccccccc"
   and ($repo.merge_gate_faults | has("example-org/merge-invariant-repo#304") | not)
   and ($repo.merge_gate_faults | has("example-org/merge-invariant-repo#306") | not)
   and $repo.merge_gate_excuses["example-org/merge-invariant-repo#306"].reason
@@ -7202,8 +7257,9 @@ jq -e '
 ' "$merge_invariant_state" >/dev/null
 
 # Each repository gets one complete-open query and one recency-bounded merged
-# query. Because the merge check is detective, the sweep still exits
-# successfully after finding the four faults.
+# query, plus a bounded branch listing. Because the checks are detective, the
+# sweep still exits successfully after finding the four ordinary faults and
+# two alarms.
 [ "$(grep -c $'example-org/merge-invariant-repo\tpr list ' "$merge_invariant_calls")" -eq 2 ]
 [ "$(grep -c $'example-org/no-gate-history-repo\tpr list ' "$merge_invariant_calls")" -eq 2 ]
 grep -Fq $'example-org/merge-invariant-repo\tpr list --repo example-org/merge-invariant-repo --state open --limit 200' \
@@ -7211,6 +7267,8 @@ grep -Fq $'example-org/merge-invariant-repo\tpr list --repo example-org/merge-in
 grep -Fq $'example-org/merge-invariant-repo\tpr list --repo example-org/merge-invariant-repo --state merged --search merged:>=2026-07-02 --limit 200' \
   "$merge_invariant_calls"
 grep -Fq -- '--json number,title,author,closingIssuesReferences,createdAt,mergedAt,headRefOid' \
+  "$merge_invariant_calls"
+grep -Fq -- $'-\tapi -X GET repos/example-org/merge-invariant-repo/branches?per_page=100&page=1' \
   "$merge_invariant_calls"
 
 merge_invariant_digest="$(
@@ -7220,7 +7278,14 @@ merge_invariant_digest="$(
     bash "$PLUGIN_ROOT/hooks/render-digest.sh"
 )"
 merge_invariant_digest_text="$(jq -r '.systemMessage' <<<"$merge_invariant_digest")"
+grep -q '^example-org/merge-invariant-repo: 2 unexplained writes — investigate immediately$' \
+  <<<"$merge_invariant_digest_text"
 grep -q '^example-org/merge-invariant-repo: 4 merge gate faults — /ostrom:desk triage$' \
+  <<<"$merge_invariant_digest_text"
+grep -q '^UNEXPLAINED WRITES — INVESTIGATE NOW$' <<<"$merge_invariant_digest_text"
+grep -q '^example-org/merge-invariant-repo#308  Synthetic unexplained App merge — unexplained write:' \
+  <<<"$merge_invariant_digest_text"
+grep -q '^example-org/merge-invariant-repo@ostrom/999-feedfacecafe  Pushed branch ostrom/999-feedfacecafe — unexplained write:' \
   <<<"$merge_invariant_digest_text"
 grep -q '^MERGE GATE FAULTS$' <<<"$merge_invariant_digest_text"
 grep -q '^example-org/merge-invariant-repo#301  Synthetic merge without a verdict — merge gate fault:' \

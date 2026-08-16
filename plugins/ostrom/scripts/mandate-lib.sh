@@ -809,8 +809,17 @@ mandate_read_queue() {
       )
       and (.id | type == "string")
       and (.repo | type == "string")
-      and (.ref | type == "string" and test("^#[0-9]+$"))
-      and (.kind | IN("tripwire", "decision", "moved", "stuck", "drift", "parked", "merge-gate-fault"))
+      and (.kind | IN("tripwire", "decision", "moved", "stuck", "drift", "parked", "merge-gate-fault", "unexplained-write"))
+      and (
+        (.ref | type == "string")
+        and (
+          (.ref | test("^#[0-9]+$"))
+          or (
+            .kind == "unexplained-write"
+            and (.ref | test("^@[^[:cntrl:][:space:]]+$"))
+          )
+        )
+      )
       and (.state | IN("pending", "approved", "deferred"))
       and (.opened | type == "string")
       and (
