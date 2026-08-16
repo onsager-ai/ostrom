@@ -12,10 +12,10 @@ import { join } from "node:path";
 
 // src/lib/process.ts
 import { spawnSync } from "node:child_process";
-function run(command, args, options = {}) {
-  const result = spawnSync(command, args, {
-    cwd: options.cwd,
-    env: options.env,
+function run(command, args2, options2 = {}) {
+  const result = spawnSync(command, args2, {
+    cwd: options2.cwd,
+    env: options2.env,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"]
   });
@@ -25,8 +25,8 @@ function run(command, args, options = {}) {
     stderr: result.stderr ?? result.error?.message ?? ""
   };
 }
-function git(cwd, args) {
-  return run("git", ["-C", cwd, ...args]);
+function git(cwd, args2) {
+  return run("git", ["-C", cwd, ...args2]);
 }
 
 // src/checks/rules.ts
@@ -1375,27 +1375,29 @@ function checkRunners(context) {
     "config-parser": () => checkConfigParser()
   };
 }
-function createContext(options) {
-  const env = options.env ?? process.env;
+function createContext(options2) {
+  const env = options2.env ?? process.env;
   return {
-    ...options,
+    ...options2,
     env,
-    resolveConfig: () => resolveTouchConfig(options.pluginRoot, options.configDir, options.cwd),
-    readTrace: createTraceReader(options.configDir)
+    resolveConfig: () => resolveTouchConfig(options2.pluginRoot, options2.configDir, options2.cwd),
+    readTrace: createTraceReader(options2.configDir)
   };
 }
-function runDoctor(options) {
-  const runners = checkRunners(createContext(options));
+function runDoctor(options2) {
+  const runners = checkRunners(createContext(options2));
   const results = DOCTOR_CHECK_NAMES.map((name) => runners[name]());
   return `${results.map(formatResult).join("\n")}
 `;
 }
-function runDoctorCheck(options, name) {
+function runDoctorCheck(options2, name) {
   if (!DOCTOR_CHECK_NAMES.includes(name)) {
     throw new Error(`unknown doctor check: ${name}`);
   }
-  const result = checkRunners(createContext(options))[name]();
-  return `${formatResult(result)}\n`;
+  const exactName = name;
+  const result = checkRunners(createContext(options2))[exactName]();
+  return `${formatResult(result)}
+`;
 }
 
 // src/doctor.ts
@@ -1416,7 +1418,8 @@ if (args.length === 0) {
   try {
     process.stdout.write(runDoctorCheck(options, args[1]));
   } catch (error) {
-    process.stderr.write(`${error instanceof Error ? error.message : "doctor check failed"}\n`);
+    process.stderr.write(`${error instanceof Error ? error.message : "doctor check failed"}
+`);
     process.exitCode = 2;
   }
 } else {
