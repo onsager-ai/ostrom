@@ -393,7 +393,7 @@ struct RunnerResult {
     detail: Option<String>,
 }
 
-impl<'a> RunnerStamp<'a> {
+impl RunnerStamp<'_> {
     /// Stamp a raw runner result. Runner-supplied envelope fields are removed
     /// before strict result parsing, then replaced from trusted metadata.
     pub fn stamp(self, mut result: Value) -> Result<CheckReceipt, CheckContractError> {
