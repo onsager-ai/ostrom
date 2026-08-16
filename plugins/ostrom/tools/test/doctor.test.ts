@@ -18,7 +18,11 @@ import { checkPluginCacheDrift } from "../src/checks/plugin-cache-drift.js";
 import { checkPlugin } from "../src/checks/plugin.js";
 import type { DoctorContext } from "../src/lib/context.js";
 import { parseOstromYaml } from "../src/lib/config.js";
-import { runDoctor } from "../src/lib/doctor.js";
+import {
+  DOCTOR_CHECK_NAMES,
+  runDoctor,
+  runDoctorCheck,
+} from "../src/lib/doctor.js";
 import { formatResult, type CheckResult } from "../src/lib/result.js";
 
 const pluginRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -457,6 +461,42 @@ afterEach(() => {
 });
 
 describe("doctor golden output", () => {
+  it("addresses every doctor check individually by exact name", () => {
+    const fixture = baseFixture();
+    for (const name of DOCTOR_CHECK_NAMES) {
+      const line = runDoctorCheck(
+        {
+          pluginRoot,
+          configDir: fixture.configDir,
+          cwd: fixture.cwd,
+          home: fixture.home,
+          env: {
+            ...process.env,
+            MANDATE_NOW_EPOCH: "1785542400",
+          },
+        },
+        name,
+      );
+      expect(line.split("|")[1]).toBe(name);
+      expect(line.trimEnd().split("\n")).toHaveLength(1);
+    }
+  });
+
+  it("refuses an inexact or unknown doctor check name", () => {
+    const fixture = baseFixture();
+    expect(() =>
+      runDoctorCheck(
+        {
+          pluginRoot,
+          configDir: fixture.configDir,
+          cwd: fixture.cwd,
+          home: fixture.home,
+        },
+        "Environment",
+      ),
+    ).toThrow("unknown doctor check: Environment");
+  });
+
   it("matches the fully-wired machine golden", () => {
     const fixture = baseFixture();
     notionConfig(fixture);

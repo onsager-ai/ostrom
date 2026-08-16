@@ -119,6 +119,42 @@ pub fn resolve_check(
     enumeration: &CatalogueEnumeration,
     action: &ActionDefinition,
 ) -> Result<ResolvedCheck, CheckContractError> {
+    let definition = select_check(id, enumeration)?;
+    if action.uses != definition.uses {
+        return Err(CheckContractError::UnresolvedAction);
+    }
+    validate_action(action)?;
+
+    let fresh_for_seconds = resolve_fresh_for(&definition.with, action.default_fresh_for_seconds)?;
+    let basis = if definition.uses.split_once('/').map(|part| part.0) == Some("agent") {
+        CheckBasis::Judged
+    } else {
+        CheckBasis::Mechanical
+    };
+    let material = DigestMaterial {
+        catalogue_entry: CatalogueDigestMaterial { id, definition },
+        resolved_action: action,
+    };
+    let mut canonical = serde_json::to_value(&material).expect("digest material is serializable");
+    canonicalize_json(&mut canonical);
+    let canonical = serde_json::to_vec(&canonical).expect("canonical JSON is serializable");
+
+    Ok(ResolvedCheck {
+        id: id.to_owned(),
+        definition: definition.clone(),
+        definition_digest: DefinitionDigest(format!("sha256:{}", sha256_hex(&canonical))),
+        basis,
+        producer: action.producer.clone(),
+        fresh_for_seconds,
+    })
+}
+
+/// Select one authored check by exact id without interpreting its opaque
+/// provider parameters.
+pub fn select_check<'a>(
+    id: &str,
+    enumeration: &'a CatalogueEnumeration,
+) -> Result<&'a CheckDefinition, CheckContractError> {
     if !enumeration.complete {
         return Err(CheckContractError::CheckCatalogTruncated);
     }
@@ -147,33 +183,7 @@ pub fn resolve_check(
     if matches.next().is_some() {
         return Err(CheckContractError::AmbiguousCheck);
     }
-    if action.uses != definition.uses {
-        return Err(CheckContractError::UnresolvedAction);
-    }
-    validate_action(action)?;
-
-    let fresh_for_seconds = resolve_fresh_for(&definition.with, action.default_fresh_for_seconds)?;
-    let basis = if definition.uses.split_once('/').map(|part| part.0) == Some("agent") {
-        CheckBasis::Judged
-    } else {
-        CheckBasis::Mechanical
-    };
-    let material = DigestMaterial {
-        catalogue_entry: CatalogueDigestMaterial { id, definition },
-        resolved_action: action,
-    };
-    let mut canonical = serde_json::to_value(&material).expect("digest material is serializable");
-    canonicalize_json(&mut canonical);
-    let canonical = serde_json::to_vec(&canonical).expect("canonical JSON is serializable");
-
-    Ok(ResolvedCheck {
-        id: id.to_owned(),
-        definition: definition.clone(),
-        definition_digest: DefinitionDigest(format!("sha256:{}", sha256_hex(&canonical))),
-        basis,
-        producer: action.producer.clone(),
-        fresh_for_seconds,
-    })
+    Ok(definition)
 }
 
 fn canonicalize_json(value: &mut Value) {

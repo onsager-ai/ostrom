@@ -1341,44 +1341,85 @@ function createTraceReader(configDir2) {
     return cached;
   };
 }
-function runDoctor(options) {
+var DOCTOR_CHECK_NAMES = [
+  "plugin",
+  "marketplace",
+  "plugin-cache-drift",
+  "rules-layers",
+  "touch-durability",
+  "provider-reachable",
+  "dispatch-source-roots",
+  "trace-lease",
+  "work-orders",
+  "builder-pass",
+  "gatekeeper-pass",
+  "publish",
+  "environment",
+  "config-parser"
+];
+function checkRunners(context) {
+  return {
+    plugin: () => checkPlugin(context),
+    marketplace: () => checkMarketplace(context),
+    "plugin-cache-drift": () => checkPluginCacheDrift(context),
+    "rules-layers": () => checkRulesLayers(context),
+    "touch-durability": () => checkTouchDurability(context),
+    "provider-reachable": () => checkProviderReachable(context),
+    "dispatch-source-roots": () => checkDispatchSourceRoots(context),
+    "trace-lease": () => checkTraceLease(context),
+    "work-orders": () => checkWorkOrders(context),
+    "builder-pass": () => checkBuilderPass(context),
+    "gatekeeper-pass": () => checkGatekeeperPass(context),
+    publish: () => checkPublish(context),
+    environment: () => checkEnvironment(context),
+    "config-parser": () => checkConfigParser()
+  };
+}
+function createContext(options) {
   const env = options.env ?? process.env;
-  const context = {
+  return {
     ...options,
     env,
     resolveConfig: () => resolveTouchConfig(options.pluginRoot, options.configDir, options.cwd),
     readTrace: createTraceReader(options.configDir)
   };
-  const results = [
-    checkPlugin(context),
-    checkMarketplace(context),
-    checkPluginCacheDrift(context),
-    checkRulesLayers(context),
-    checkTouchDurability(context),
-    checkProviderReachable(context),
-    checkDispatchSourceRoots(context),
-    checkTraceLease(context),
-    checkWorkOrders(context),
-    checkBuilderPass(context),
-    checkGatekeeperPass(context),
-    checkPublish(context),
-    checkEnvironment(context),
-    checkConfigParser()
-  ];
+}
+function runDoctor(options) {
+  const runners = checkRunners(createContext(options));
+  const results = DOCTOR_CHECK_NAMES.map((name) => runners[name]());
   return `${results.map(formatResult).join("\n")}
 `;
+}
+function runDoctorCheck(options, name) {
+  if (!DOCTOR_CHECK_NAMES.includes(name)) {
+    throw new Error(`unknown doctor check: ${name}`);
+  }
+  const result = checkRunners(createContext(options))[name]();
+  return `${formatResult(result)}\n`;
 }
 
 // src/doctor.ts
 var pluginRoot = resolve(dirname2(fileURLToPath(import.meta.url)), "..");
 var home = process.env.HOME ?? "";
 var configDir = process.env.CLAUDE_CONFIG_DIR ?? resolve(home, ".claude");
-process.stdout.write(
-  runDoctor({
-    pluginRoot,
-    configDir,
-    cwd: process.cwd(),
-    home,
-    env: process.env
-  })
-);
+var options = {
+  pluginRoot,
+  configDir,
+  cwd: process.cwd(),
+  home,
+  env: process.env
+};
+var args = process.argv.slice(2);
+if (args.length === 0) {
+  process.stdout.write(runDoctor(options));
+} else if (args.length === 2 && args[0] === "--check" && args[1]) {
+  try {
+    process.stdout.write(runDoctorCheck(options, args[1]));
+  } catch (error) {
+    process.stderr.write(`${error instanceof Error ? error.message : "doctor check failed"}\n`);
+    process.exitCode = 2;
+  }
+} else {
+  process.stderr.write("usage: doctor.js [--check <exact-name>]\n");
+  process.exitCode = 2;
+}
