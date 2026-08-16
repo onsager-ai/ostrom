@@ -1,14 +1,19 @@
 use std::{
-    env,
+    collections::{BTreeMap, BTreeSet},
+    env, fs,
     io::{self, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use directories::BaseDirs;
-use ostrom_core::RepositoryName;
+use ostrom_checks::{ActionFault, ActionRegistry};
+use ostrom_core::{
+    Catalogue, CatalogueEnumeration, CheckContractError, CheckDocument, CheckFault, RepositoryName,
+    ResolvedCheck,
+};
 use ostrom_store::{
     ExecutableAssessmentDeriver, MigrationOutcome, OstromPaths, PlanOptions, PublishTarget,
     SweepMode, SweepOptions, UnavailableAssessmentDeriver, acquire_org_from_github,
@@ -189,6 +194,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let plugin_root = env::var_os("OSTROM_PLUGIN_ROOT")
                 .or_else(|| env::var_os("CLAUDE_PLUGIN_ROOT"))
                 .map_or_else(|| cwd.join("plugins/ostrom"), PathBuf::from);
+            let check_resolutions = resolve_plan_checks(&paths, &cwd, &plugin_root)?;
             let options = PlanOptions {
                 sweep: SweepOptions {
                     paths: paths.clone(),
@@ -200,9 +206,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     fixture,
                     publish: PublishTarget::Disabled,
                 },
-                // Action resolution is owned by #234. Until that projection is
-                // wired in, absent entries fail closed as unresolved checks.
-                resolved_checks: Default::default(),
+                resolved_checks: check_resolutions.resolved,
+                check_resolution_faults: check_resolutions.faults,
+                catalogue_fault: check_resolutions.catalogue_fault,
             };
             let mut deriver: Box<dyn ostrom_store::AssessmentDeriver> =
                 if let Some(executable) = env::var_os("OSTROM_PLAN_DERIVER") {
@@ -221,6 +227,100 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+struct PlanCheckResolutions {
+    resolved: BTreeMap<String, ResolvedCheck>,
+    faults: BTreeMap<String, CheckFault>,
+    catalogue_fault: Option<CheckFault>,
+}
+
+fn resolve_plan_checks(
+    paths: &OstromPaths,
+    cwd: &Path,
+    plugin_root: &Path,
+) -> Result<PlanCheckResolutions, ActionFault> {
+    let mut enumeration = CatalogueEnumeration {
+        catalogues: Vec::new(),
+        complete: true,
+    };
+    let mut catalogue_fault = None;
+    let sources = BTreeSet::from([
+        paths.config.join("checks.yaml"),
+        cwd.join(".ostrom/checks.yaml"),
+    ]);
+    for source in sources {
+        match fs::read_to_string(&source) {
+            Ok(text) => match CheckDocument::from_yaml(&text) {
+                Ok(document) => enumeration.catalogues.push(Catalogue { document }),
+                Err(error) => {
+                    enumeration.complete = false;
+                    catalogue_fault.get_or_insert_with(|| contract_fault(&error));
+                }
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => {
+                enumeration.complete = false;
+                catalogue_fault.get_or_insert_with(truncated_catalogue_fault);
+            }
+        }
+    }
+
+    if catalogue_fault.is_some() {
+        return Ok(PlanCheckResolutions {
+            resolved: BTreeMap::new(),
+            faults: BTreeMap::new(),
+            catalogue_fault,
+        });
+    }
+
+    let ids = enumeration
+        .catalogues
+        .iter()
+        .flat_map(|catalogue| catalogue.document.checks.keys().cloned())
+        .collect::<BTreeSet<_>>();
+    let registry = ActionRegistry::core(plugin_root.join("dist/doctor.js"))?;
+    let mut resolved = BTreeMap::new();
+    let mut faults = BTreeMap::new();
+    for id in ids {
+        match registry.prepare(&id, &enumeration) {
+            Ok(prepared) => {
+                resolved.insert(id, prepared.resolved().clone());
+            }
+            Err(error) => {
+                faults.insert(id, action_fault(&error));
+            }
+        }
+    }
+    Ok(PlanCheckResolutions {
+        resolved,
+        faults,
+        catalogue_fault,
+    })
+}
+
+fn contract_fault(error: &CheckContractError) -> CheckFault {
+    CheckFault {
+        name: error
+            .fault_name()
+            .unwrap_or("invalid_check_definition")
+            .to_owned(),
+        detail: None,
+    }
+}
+
+fn truncated_catalogue_fault() -> CheckFault {
+    CheckFault {
+        name: "check_catalog_truncated".to_owned(),
+        detail: None,
+    }
+}
+
+fn action_fault(error: &ActionFault) -> CheckFault {
+    CheckFault {
+        name: error.name().to_owned(),
+        detail: error.detail().map(str::to_owned),
+    }
 }
 
 fn legacy_home() -> Result<PathBuf, Box<dyn std::error::Error>> {
