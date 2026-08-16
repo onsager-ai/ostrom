@@ -2,9 +2,10 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{RepositoryName, Verdict};
+use crate::{CheckReceipt, RepositoryName, Verdict};
 
 pub const STORE_SCHEMA_VERSION: u32 = 1;
+pub const CHECK_STORE_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -137,6 +138,52 @@ pub trait SweepStore: Send {
     async fn write_pass(&mut self, pass: &SweepPass) -> Result<WriteDisposition, StoreFault>;
 
     async fn passes(&self) -> Result<Vec<SweepPass>, StoreFault>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CheckRunId(pub String);
+
+/// One durable executor pass over zero or more checks.
+///
+/// The run record is the transaction boundary. In particular, an empty
+/// `receipts` collection is still persisted so callers can distinguish an
+/// executor run that selected nothing from an executor that never ran.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckRun {
+    pub schema_version: u32,
+    pub run_id: CheckRunId,
+    pub completed_at: String,
+    pub receipts: Vec<CheckReceipt>,
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum CheckStoreFault {
+    #[error("check store record uses an unsupported schema version")]
+    UnsupportedSchema,
+    #[error("check run write failed")]
+    RunWrite,
+    #[error("check run payload write failed")]
+    PayloadWrite,
+    #[error("check store read failed")]
+    Read,
+    #[error("check run identifier was reused with different content")]
+    RunConflict,
+    #[error("check store contains a malformed record")]
+    MalformedRecord,
+}
+
+/// Substrate-neutral persistence boundary for out-of-band check execution.
+///
+/// Implementations use [`CheckRun::run_id`] as the idempotency key. An exact
+/// retry returns [`WriteDisposition::Unchanged`], while different content
+/// under the same id returns [`CheckStoreFault::RunConflict`].
+#[async_trait]
+pub trait CheckStore: Send {
+    async fn write_run(&mut self, run: &CheckRun) -> Result<WriteDisposition, CheckStoreFault>;
+
+    async fn runs(&self) -> Result<Vec<CheckRun>, CheckStoreFault>;
 }
 
 #[cfg(test)]

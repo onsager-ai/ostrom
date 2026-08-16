@@ -11,17 +11,25 @@
 //! additions may land in minor releases; breaking changes require a minor
 //! version bump and migration notes.
 
+mod check;
 mod domain;
 mod store;
 
 #[cfg(feature = "conformance")]
 pub mod conformance;
 
+pub use check::{
+    ActionDefinition, CHECKS_VERSION, Catalogue, CatalogueEnumeration, CheckBasis,
+    CheckContractError, CheckDefinition, CheckDocument, CheckEvaluation, CheckFault, CheckReceipt,
+    CheckState, CheckVerdict, DefinitionDigest, Evidence, FreshnessError, RESULT_VERSION,
+    ResolvedCheck, RunnerStamp, resolve_check, resolve_fresh_for,
+};
 pub use domain::{
     ConfigError, DefaultDisposition, GateConfig, GateProject, Mandate, MandateConfig,
     ProjectMandate, RepositoryName, Role, Selector, SelectorError, Verdict,
 };
 pub use store::{
-    AttemptOutcome, GateFact, PassAttempt, PassId, QueueFact, QueueKind, QueueState, RepoStateFact,
+    AttemptOutcome, CHECK_STORE_SCHEMA_VERSION, CheckRun, CheckRunId, CheckStore, CheckStoreFault,
+    GateFact, PassAttempt, PassId, QueueFact, QueueKind, QueueState, RepoStateFact,
     STORE_SCHEMA_VERSION, StoreFault, SweepPass, SweepStore, WriteDisposition,
 };

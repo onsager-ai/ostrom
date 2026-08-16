@@ -1,17 +1,18 @@
 //! Store conformance battery for in-tree and out-of-tree implementations.
 //!
-//! Enable the `conformance` feature and call [`check_store`] with a fresh,
-//! disposable implementation instance. Returning a structured failure instead
-//! of panicking lets consumers integrate the same battery into their preferred
-//! test framework. The battery uses only the public port; it does not assume
-//! that the implementation has files, a process-local runtime, or any other
-//! particular substrate.
+//! Enable the `conformance` feature and call [`check_store`] or
+//! [`check_check_store`] with a fresh, disposable implementation instance.
+//! Returning a structured failure instead of panicking lets consumers
+//! integrate the same batteries into their preferred test framework. They use
+//! only the public ports and assume no filesystem, process-local runtime, or
+//! other particular substrate.
 
 use thiserror::Error;
 
 use crate::{
-    AttemptOutcome, PassAttempt, PassId, QueueFact, QueueKind, QueueState, RepositoryName,
-    StoreFault, SweepPass, SweepStore, WriteDisposition, store::STORE_SCHEMA_VERSION,
+    AttemptOutcome, CHECK_STORE_SCHEMA_VERSION, CheckRun, CheckRunId, CheckStore, CheckStoreFault,
+    PassAttempt, PassId, QueueFact, QueueKind, QueueState, RepositoryName, StoreFault, SweepPass,
+    SweepStore, WriteDisposition, store::STORE_SCHEMA_VERSION,
 };
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -123,6 +124,62 @@ pub async fn check_store<S: SweepStore>(store: &mut S) -> Result<(), Conformance
         || !failed.states.is_empty()
     {
         return Err(ConformanceFailure::EmptyFailedAttempt);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum CheckStoreConformanceFailure {
+    #[error("initial empty-run write failed: {0}")]
+    InitialWrite(CheckStoreFault),
+    #[error("check run idempotency invariant failed")]
+    Idempotency,
+    #[error("check store content invariant failed")]
+    Content,
+    #[error("check run conflict invariant failed")]
+    Conflict,
+}
+
+/// Exercise the durable empty-run, read-back, idempotency, and conflict
+/// invariants of any [`CheckStore`] implementation.
+pub async fn check_check_store<S: CheckStore>(
+    store: &mut S,
+) -> Result<(), CheckStoreConformanceFailure> {
+    let run = CheckRun {
+        schema_version: CHECK_STORE_SCHEMA_VERSION,
+        run_id: CheckRunId("conformance-empty-check-run".to_owned()),
+        completed_at: "2030-01-02T03:04:05Z".to_owned(),
+        receipts: Vec::new(),
+    };
+    if store
+        .write_run(&run)
+        .await
+        .map_err(CheckStoreConformanceFailure::InitialWrite)?
+        != WriteDisposition::Written
+    {
+        return Err(CheckStoreConformanceFailure::Content);
+    }
+    if store
+        .write_run(&run)
+        .await
+        .map_err(|_| CheckStoreConformanceFailure::Idempotency)?
+        != WriteDisposition::Unchanged
+    {
+        return Err(CheckStoreConformanceFailure::Idempotency);
+    }
+    if store
+        .runs()
+        .await
+        .map_err(|_| CheckStoreConformanceFailure::Content)?
+        != vec![run.clone()]
+    {
+        return Err(CheckStoreConformanceFailure::Content);
+    }
+
+    let mut conflicting = run;
+    conflicting.completed_at = "2030-01-02T03:04:06Z".to_owned();
+    if store.write_run(&conflicting).await != Err(CheckStoreFault::RunConflict) {
+        return Err(CheckStoreConformanceFailure::Conflict);
     }
     Ok(())
 }
