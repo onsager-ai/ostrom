@@ -402,12 +402,19 @@ jq -s -e '
 # rejected plan names the first failed guard clause and remains byte-identical
 # to the existing mechanical fallback; an accepted plan records application
 # while preserving the pre-instrumentation goal-plan order.
-selection_basis="$(jq -sc '[.[] | {
+# Mirrors the basis select-work.sh computes, including the graph fields #119
+# added. A basis missing them is rejected on the queue_basis clause, which is
+# the predicate working rather than a fixture worth loosening.
+selection_basis="$(jq -sc \
+  --argjson graph "$(jq -c '.dependency_graph.nodes | map({key: .id, value: .}) | from_entries' \
+    "$selection_data/state.json")" '[.[] | {
   id,
   opened,
   kind,
   state,
-  blocked_by: (.blocked_by // [])
+  blocked_by: (.blocked_by // []),
+  graph_dispatchable: ($graph[.id].dispatchable // false),
+  unblocking_power: ($graph[.id].unblocking_power // 0)
 }]' "$selection_data/queue.jsonl")"
 selection_candidates="$(jq -sc '[.[] | select(
   .kind != "parked"
@@ -451,7 +458,8 @@ jq -s -e '
   and .fact.plan_rejection_clause == "queue_basis"
 ' "$selection_data/sprint.jsonl" >/dev/null
 
-accepted_plan_order='["example-org/ranking-repo#4","example-org/ranking-repo#3","example-org/ranking-repo#1","example-org/ranking-repo#20","example-org/ranking-repo#2"]'
+# #119 gates #20 out of the candidate set, so a plan naming it can never match.
+accepted_plan_order='["example-org/ranking-repo#4","example-org/ranking-repo#3","example-org/ranking-repo#1","example-org/ranking-repo#2"]'
 jq -n \
   --argjson basis "$selection_basis" \
   --argjson ranking "$selection_ranking" \
@@ -466,7 +474,7 @@ jq -n \
     bash "$PLUGIN_ROOT/scripts/select-work.sh" list
 ) >"$selection_fixture/accepted-plan.jsonl"
 jq -nc --slurpfile rows "$selection_data/queue.jsonl" \
-  --argjson ids '["example-org/ranking-repo#2","example-org/ranking-repo#4","example-org/ranking-repo#3","example-org/ranking-repo#1","example-org/ranking-repo#20"]' '
+  --argjson ids '["example-org/ranking-repo#2","example-org/ranking-repo#4","example-org/ranking-repo#3","example-org/ranking-repo#1"]' '
     $ids[] as $id | $rows[] | select(.id == $id)
   ' >"$selection_fixture/expected-accepted-plan.jsonl"
 cmp "$selection_fixture/expected-accepted-plan.jsonl" \
