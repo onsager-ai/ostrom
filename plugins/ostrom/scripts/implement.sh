@@ -54,6 +54,7 @@ source_repository=""
 streaming_ceiling_mode="${MANDATE_IMPLEMENTER_STREAMING_CEILING:-enabled}"
 repair_remote_head=""
 repair_conflicted_paths='[]'
+withheld_paths='[]'
 # Five seconds lets Codex flush its terminal event and run ordinary signal
 # cleanup without letting an uncooperative process retain the item lease and
 # dispatch slot indefinitely. Tests shorten this through the environment.
@@ -275,6 +276,7 @@ append_terminal() {
     --arg pr_url "$pr_url" --arg reason "$reason" \
     --arg remote_head_sha "$repair_remote_head" \
     --argjson conflicted_paths "$repair_conflicted_paths" \
+    --argjson withheld_paths "$withheld_paths" \
     --arg termination_signal "$termination_signal" \
     --arg source_repository_path "$source_repository" \
     --argjson preserved_work "$preserved_work" \
@@ -293,6 +295,7 @@ append_terminal() {
       branch_name: $preserved_work.branch_name,
       remote_head_sha: (if $remote_head_sha == "" then null else $remote_head_sha end),
       conflicted_paths: $conflicted_paths,
+      withheld_paths: $withheld_paths,
       usage: $usage}')"
   if bash "$SCRIPT_DIR/trace.sh" append "$kind" "$terminal_fact" '{}' >/dev/null; then
     terminal_written=1
@@ -492,7 +495,7 @@ events_file="$runs_dir/events.jsonl"
 events_pipe="$runs_dir/events.pipe"
 streaming_ceiling_marker="$runs_dir/token-ceiling-terminated"
 jq -r '
-  "Implement this work order. Work only in the current worktree. Do not commit, push, open a pull request, or use the network; the outer harness owns those steps. Run proportionate tests. Do not redesign the agreed spec.\n\n"
+  "Implement this work order. Work only in the current worktree. Do not commit, push, open a pull request, or use the network; the outer harness owns those steps. Do not modify anything under `.github/workflows/`; any such edit will be reverted before publication rather than published. Run proportionate tests. Do not redesign the agreed spec.\n\n"
   + "Item: " + .item_id + "\nBranch: " + .branch_name + "\n"
   + "Cost ceiling: $" + (.cost_ceiling_usd | tostring)
   + "; weighted-token ceiling: " + (.token_ceiling | tostring) + "\n\n"
@@ -594,14 +597,48 @@ publish_paths="$(
   failure_reason=workflow-file-check-failed
   exit 1
 }
+withheld_publish_paths=()
 while IFS= read -r publish_path; do
   case "$publish_path" in
     .github/workflows/*)
-      failure_reason="workflow-file-unpushable path=$publish_path"
-      exit 1
+      withheld_publish_paths+=("$publish_path")
       ;;
   esac
 done <<<"$publish_paths"
+if [ "${#withheld_publish_paths[@]}" -gt 0 ]; then
+  withheld_paths="$(
+    printf '%s\0' "${withheld_publish_paths[@]}" |
+      jq -Rs 'split("\u0000") | map(select(length > 0))'
+  )"
+  for withheld_path in "${withheld_publish_paths[@]}"; do
+    if git -C "$worktree_root" cat-file -e \
+      "refs/remotes/origin/$default_branch:$withheld_path" 2>/dev/null; then
+      if ! git -C "$worktree_root" checkout \
+        "refs/remotes/origin/$default_branch" -- "$withheld_path"; then
+        failure_reason=workflow-file-check-failed
+        exit 1
+      fi
+    elif ! git -C "$worktree_root" rm -f -- "$withheld_path"; then
+      failure_reason=workflow-file-check-failed
+      exit 1
+    fi
+  done
+  if ! git -C "$worktree_root" commit --amend --no-edit --allow-empty; then
+    failure_reason=commit-failed
+    exit 1
+  fi
+  if git -C "$worktree_root" diff --quiet \
+    "refs/remotes/origin/$default_branch...HEAD"; then
+    failure_reason="workflow-file-unpushable path=${withheld_publish_paths[0]}"
+    exit 1
+  else
+    restored_diff_status=$?
+    if [ "$restored_diff_status" -ne 1 ]; then
+      failure_reason=workflow-file-check-failed
+      exit 1
+    fi
+  fi
+fi
 push_output="$runs_dir/push-output.txt"
 if bash "$GH_AS_BIN" builder "$repository" \
   git -C "$worktree_root" push \
@@ -650,11 +687,16 @@ else
 fi
 
 body_file="$runs_dir/pr-body.md"
-jq -r '
+jq -r --argjson withheld_paths "$withheld_paths" '
   "Closes " + .item_id + "\n\n"
   + "## Work order\n\n" + .spec + "\n\n"
   + "## Acceptance criteria\n\n"
   + (.acceptance_criteria | map("- " + .) | join("\n")) + "\n\n"
+  + (if ($withheld_paths | length) > 0 then
+      "## Withheld workflow paths\n\n"
+      + "These paths were restored to the default branch and are not included in this pull request:\n\n"
+      + ($withheld_paths | map("- `" + . + "`") | join("\n")) + "\n\n"
+    else "" end)
   + "## Implementation harness\n\n"
   + "Codex ran non-interactively with `workspace-write`, approval policy `never`, and network disabled. The outer implementer wrapper performed fetch, commit, push, and pull-request creation outside the Codex sandbox.\n\n"
   + "The order reserved $" + (.cost_ceiling_usd | tostring)
