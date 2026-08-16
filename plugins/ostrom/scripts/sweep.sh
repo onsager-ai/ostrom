@@ -2129,13 +2129,16 @@ jq -cn \
     --slurpfile active_ids "$work/active-ids.json" \
     --slurpfile current_items "$work/current-items.json" \
     --slurpfile possibly_landed "$work/possibly-landed.json" \
-    --slurpfile closed_items "$work/closed-items.jsonl" '
+    --slurpfile closed_items "$work/closed-items.jsonl" \
+    --slurpfile configured_repos "$work/configured-repos.json" '
     ($existing[0]) as $existing
     | ($generated[0]) as $generated
     | ($active_ids[0]) as $active_ids
     | ($current_items[0]) as $current_items
     | ($possibly_landed[0]) as $possibly_landed
     | ($closed_items | map(.id)) as $closed_item_ids
+    | ([$closed_items[] | select(.resolution == "closed-issue") | .id]) as $closed_issue_ids
+    | ($configured_repos[0]) as $configured_repos
     |
     def dependency_refs($repo; $text):
       [
@@ -2152,6 +2155,50 @@ jq -cn \
       first($current_items[] | select(.id == $id)) // null;
     def possibly_landed($id):
       first($possibly_landed[] | select(.id == $id) | .possibly_landed) // "";
+    def reason_text($row):
+      ($row.mandate.reason // $row.mandate // "")
+      | if type == "string" then . else "" end;
+    def has_landed_reference($row):
+      $row != null
+      and (
+        (reason_text($row) | contains("possibly landed:"))
+        or possibly_landed($row.id) != ""
+      );
+    # #209: an authoritative issue closure normally consumes its queue row.
+    # Keep the narrower closed-plus-possibly-landed disagreement visible in
+    # the existing parked shape: the builder already treats that kind as
+    # non-dispatchable, while the reason preserves why the closure may have
+    # hidden unfinished phases. The marker also carries that positive fact
+    # across later feeds that need not replay the closure event.
+    def retained_closed_reference($row):
+      $row.kind == "parked"
+      and (reason_text($row) | startswith("issue state CLOSED; retained for review; "));
+    def park_closed_reference:
+      . as $row
+      | (possibly_landed($row.id)) as $possibly_landed_suffix
+      | .kind = "parked"
+      | if retained_closed_reference(.) then .
+        elif (.mandate | type) == "object" then
+          .mandate.reason = (
+            "issue state CLOSED; retained for review; "
+            + reason_text($row)
+            + if $possibly_landed_suffix != ""
+                and (reason_text($row) | contains($possibly_landed_suffix) | not)
+              then $possibly_landed_suffix
+              else ""
+              end
+          )
+        else
+          .mandate = (
+            "issue state CLOSED; retained for review; "
+            + reason_text($row)
+            + if $possibly_landed_suffix != ""
+                and (reason_text($row) | contains($possibly_landed_suffix) | not)
+              then $possibly_landed_suffix
+              else ""
+              end
+          )
+        end;
     def enrich:
       . as $row
       | (current($row.id)) as $current
@@ -2234,18 +2281,43 @@ jq -cn \
       $existing
       | map(. as $row
         | select(
-            ($active_ids | index($row.id)) != null
+            (
+              ($closed_issue_ids | index($row.id)) != null
+              and has_landed_reference($row)
+            )
+            or (
+              ($active_ids | index($row.id)) != null
+              and ($closed_issue_ids | index($row.id)) == null
+              and (retained_closed_reference($row) | not)
+            )
             or (
               $row.state == "approved"
               and ($closed_item_ids | index($row.id)) == null
             )
+            or (
+              retained_closed_reference($row)
+              and current($row.id) == null
+              and ($configured_repos | index($row.repo)) != null
+            )
           )
+        | if ($closed_issue_ids | index($row.id)) != null
+          then park_closed_reference
+          else .
+          end
       )
     ) as $still_relevant
     | reduce $generated[] as $row ($still_relevant;
         (first($existing[]? | select(.id == $row.id)) // null) as $existing_row
-        | map(select(.id != $row.id))
-          + [carry_principal_fields($row; $existing_row)]
+        | if ($closed_issue_ids | index($row.id)) != null then
+            if has_landed_reference($row) or has_landed_reference($existing_row) then
+              map(select(.id != $row.id))
+              + [carry_principal_fields($row; $existing_row) | park_closed_reference]
+            else .
+            end
+          else
+            map(select(.id != $row.id))
+            + [carry_principal_fields($row; $existing_row)]
+          end
       )
     | map(enrich)
     | sort_by(.opened, .id)
