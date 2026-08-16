@@ -21,8 +21,13 @@ export function cargoVersion() {
   return match[1];
 }
 
+// The launcher is deliberately unscoped: `npm i -g ostrom` is the name people
+// type, and it is the package a human installs. The scope exists to keep the
+// five platform packages unsquattable as a set, not to namespace the entry
+// point. Do not "fix" this back to `${scope}/${name}` — 0.1.0 shipped that way
+// by accident and had to be reissued.
 export function mainPackageName() {
-  return `${config.scope}/${config.mainPackage.name}`;
+  return config.mainPackage.name;
 }
 
 export function platformPackageName(platform) {
