@@ -17,6 +17,7 @@ clap.workspace = true
 chrono.workspace = true
 directories.workspace = true
 ostrom-core = { path = "../ostrom-core" }
+ostrom-checks = { path = "../ostrom-checks" }
 ostrom-store = { path = "../ostrom-store" }
 
 [dev-dependencies]

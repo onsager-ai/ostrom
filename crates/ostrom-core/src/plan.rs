@@ -160,7 +160,8 @@ pub enum GoalsError {
 #[serde(deny_unknown_fields)]
 pub struct EvaluatedCheck {
     pub evaluation: CheckEvaluation,
-    pub basis: CheckBasis,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basis: Option<CheckBasis>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observation_age_seconds: Option<u64>,
 }
@@ -186,8 +187,20 @@ impl EvaluatedCheck {
             });
         Self {
             evaluation,
-            basis: check.basis,
+            basis: Some(check.basis),
             observation_age_seconds,
+        }
+    }
+
+    #[must_use]
+    pub fn from_resolution_fault(fault: CheckFault) -> Self {
+        Self {
+            evaluation: CheckEvaluation {
+                state: CheckState::NeverRun,
+                fault: Some(fault),
+            },
+            basis: None,
+            observation_age_seconds: None,
         }
     }
 }
@@ -238,6 +251,7 @@ pub struct GoalFacts {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next: Option<String>,
     pub met_when_status: Vec<MetWhenStatus>,
+    pub basis: GoalBasis,
     pub impediments: Vec<Impediment>,
     pub met: bool,
 }
@@ -479,12 +493,20 @@ pub fn derive_goal_facts(
                         .render(check_status.basis)
                         .to_owned(),
                     fault: check_status.evaluation.fault.clone(),
-                    basis: Some(check_status.basis),
+                    basis: check_status.basis,
                     observation_age_seconds: check_status.observation_age_seconds,
                 },
             )
         })
         .collect::<Vec<_>>();
+    let basis = if met_when_status
+        .iter()
+        .any(|status| status.basis == Some(CheckBasis::Judged))
+    {
+        GoalBasis::IncludesJudgment
+    } else {
+        GoalBasis::Mechanical
+    };
     let checks_met = !goal.met_when.is_empty()
         && met_when_status
             .iter()
@@ -510,6 +532,7 @@ pub fn derive_goal_facts(
         },
         next,
         met_when_status,
+        basis,
         impediments,
         met: goal.state == GoalState::Met || (goal.state == GoalState::Active && checks_met),
     }
@@ -783,19 +806,23 @@ acknowledgements: []
     }
 
     fn resolved() -> ResolvedCheck {
-        let document = CheckDocument::from_yaml(
-            "checks_version: 1\nchecks:\n  sweep-parity:\n    uses: fixture/observe\n    with: {}\n",
-        )
+        resolved_as("sweep-parity", "fixture/observe")
+    }
+
+    fn resolved_as(id: &str, uses: &str) -> ResolvedCheck {
+        let document = CheckDocument::from_yaml(&format!(
+            "checks_version: 1\nchecks:\n  {id}:\n    uses: {uses}\n    with: {{}}\n"
+        ))
         .expect("check document");
         let action = ActionDefinition {
-            uses: "fixture/observe".to_owned(),
+            uses: uses.to_owned(),
             producer: "fixture".to_owned(),
             default_fresh_for_seconds: 300,
             definition: json!({}),
             source_revision: "fixture-revision".to_owned(),
         };
         resolve_check(
-            "sweep-parity",
+            id,
             &CatalogueEnumeration {
                 catalogues: vec![Catalogue { document }],
                 complete: true,
@@ -803,6 +830,48 @@ acknowledgements: []
             &action,
         )
         .expect("resolved check")
+    }
+
+    #[test]
+    fn goal_basis_includes_judgment_if_any_check_domain_is_judged() {
+        let now = Utc.with_ymd_and_hms(2030, 1, 2, 3, 4, 5).unwrap();
+        let mechanical = resolved();
+        let judged = resolved_as("judged-reading", "agent/evaluate");
+        assert_eq!(judged.basis, CheckBasis::Judged);
+
+        let mechanical_checks = BTreeMap::from([(
+            mechanical.id.clone(),
+            EvaluatedCheck::from_contract(&mechanical, &[], now),
+        )]);
+        let mechanical_facts = derive_goal_facts(&goal(), &[], &[], &mechanical_checks);
+        assert_eq!(mechanical_facts.basis, GoalBasis::Mechanical);
+        assert_eq!(
+            serde_json::to_value(&mechanical_facts).expect("mechanical facts serialize")["basis"],
+            "mechanical"
+        );
+
+        let mut mixed_goal = goal();
+        mixed_goal.met_when.push(judged.id.clone());
+        let mixed_checks = BTreeMap::from([
+            (
+                mechanical.id.clone(),
+                EvaluatedCheck::from_contract(&mechanical, &[], now),
+            ),
+            (
+                judged.id.clone(),
+                EvaluatedCheck::from_contract(&judged, &[], now),
+            ),
+        ]);
+        let mixed_facts = derive_goal_facts(&mixed_goal, &[], &[], &mixed_checks);
+        assert_eq!(mixed_facts.basis, GoalBasis::IncludesJudgment);
+        assert_eq!(
+            mixed_facts.met_when_status[1].basis,
+            Some(CheckBasis::Judged)
+        );
+        assert_eq!(
+            serde_json::to_value(&mixed_facts).expect("mixed facts serialize")["basis"],
+            "includes_judgment"
+        );
     }
 
     #[test]

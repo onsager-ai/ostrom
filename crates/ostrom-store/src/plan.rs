@@ -8,10 +8,10 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use ostrom_core::{
-    Acknowledgement, Assessment, AssessmentDraft, CheckStoreFault, EvaluatedCheck, GoalActionVerb,
-    GoalFacts, GoalState, GoalsDocument, GoalsError, MilestoneInput, PLAN_VERSION, QueueItem,
-    ResolvedCheck, cited_fact_basis, compose_ranking, consequence, derive_goal_facts, fact_table,
-    mechanical_ranking, validate_assessment,
+    Acknowledgement, Assessment, AssessmentDraft, CheckFault, CheckStoreFault, EvaluatedCheck,
+    GoalActionVerb, GoalFacts, GoalState, GoalsDocument, GoalsError, MilestoneInput, PLAN_VERSION,
+    QueueItem, ResolvedCheck, cited_fact_basis, compose_ranking, consequence, derive_goal_facts,
+    fact_table, mechanical_ranking, validate_assessment,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -81,6 +81,8 @@ impl AssessmentDeriver for UnavailableAssessmentDeriver {
 pub struct PlanOptions {
     pub sweep: SweepOptions,
     pub resolved_checks: BTreeMap<String, ResolvedCheck>,
+    pub check_resolution_faults: BTreeMap<String, CheckFault>,
+    pub catalogue_fault: Option<CheckFault>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -187,7 +189,7 @@ pub fn run_plan(
         .iter()
         .flat_map(|run| run.receipts.iter().cloned())
         .collect::<Vec<_>>();
-    let evaluated_checks = options
+    let mut evaluated_checks = options
         .resolved_checks
         .values()
         .map(|check| {
@@ -197,6 +199,19 @@ pub fn run_plan(
             )
         })
         .collect::<BTreeMap<_, _>>();
+    evaluated_checks.extend(options.check_resolution_faults.iter().map(|(id, fault)| {
+        (
+            id.clone(),
+            EvaluatedCheck::from_resolution_fault(fault.clone()),
+        )
+    }));
+    if let Some(fault) = &options.catalogue_fault {
+        for check in goals.goals.iter().flat_map(|goal| &goal.met_when) {
+            evaluated_checks
+                .entry(check.clone())
+                .or_insert_with(|| EvaluatedCheck::from_resolution_fault(fault.clone()));
+        }
+    }
     let queue_documents = read_queue(&options.sweep.paths.queue_file())?;
     let queue = queue_documents
         .iter()
@@ -691,6 +706,8 @@ mod tests {
                 publish: crate::PublishTarget::Disabled,
             },
             resolved_checks: BTreeMap::from([("sweep-parity".to_owned(), resolved)]),
+            check_resolution_faults: BTreeMap::new(),
+            catalogue_fault: None,
         };
         let plan = run_plan(&options, &mut UnavailableAssessmentDeriver).expect("run plan");
         assert_eq!(plan.sweep.check_runs, 1);

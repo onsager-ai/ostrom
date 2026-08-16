@@ -706,6 +706,7 @@ dependencies = [
  "chrono",
  "clap",
  "directories",
+ "ostrom-checks",
  "ostrom-core",
  "ostrom-store",
  "serde_json",
