@@ -5208,8 +5208,17 @@ JSON
         echo '[]'
       else
         cat <<'JSON'
-[{"number":301,"title":"Synthetic merge without a verdict","state":"MERGED","createdAt":"2026-07-01T00:00:00Z","mergedAt":"2026-07-20T12:00:00Z","headRefOid":"1111111111111111111111111111111111111111"},{"number":302,"title":"Synthetic merge against a failing gate","state":"MERGED","createdAt":"2026-07-02T00:00:00Z","mergedAt":"2026-07-21T12:00:00Z","headRefOid":"2222222222222222222222222222222222222222"},{"number":303,"title":"Synthetic merge against an inconclusive gate","state":"MERGED","createdAt":"2026-07-03T00:00:00Z","mergedAt":"2026-07-22T12:00:00Z","headRefOid":"3333333333333333333333333333333333333333"},{"number":304,"title":"Synthetic merge after a passing gate","state":"MERGED","createdAt":"2026-07-04T00:00:00Z","mergedAt":"2026-07-23T12:00:00Z","headRefOid":"4444444444444444444444444444444444444444"},{"number":305,"title":"Synthetic merge before a late pass","state":"MERGED","createdAt":"2026-07-05T00:00:00Z","mergedAt":"2026-07-24T12:00:00Z","headRefOid":"5555555555555555555555555555555555555555"},{"number":306,"title":"Synthetic excused manual merge","state":"MERGED","createdAt":"2026-07-06T00:00:00Z","mergedAt":"2026-07-25T12:00:00Z","headRefOid":"6666666666666666666666666666666666666666"}]
+[{"number":300,"title":"Synthetic pre-floor machine merge","author":{"login":"builder-app[bot]","is_bot":true},"closingIssuesReferences":[{"number":200}],"state":"MERGED","createdAt":"2026-07-01T00:00:00Z","mergedAt":"2026-07-18T12:00:00Z","headRefOid":"0000000000000000000000000000000000000000"},{"number":301,"title":"Synthetic merge without a verdict","author":{"login":"human-contributor","is_bot":false},"closingIssuesReferences":[{"number":201}],"state":"MERGED","createdAt":"2026-07-01T00:00:00Z","mergedAt":"2026-07-20T12:00:00Z","headRefOid":"1111111111111111111111111111111111111111"},{"number":302,"title":"Synthetic merge against a failing gate","author":{"login":"builder-app","is_bot":true},"closingIssuesReferences":[],"state":"MERGED","createdAt":"2026-07-02T00:00:00Z","mergedAt":"2026-07-21T12:00:00Z","headRefOid":"2222222222222222222222222222222222222222"},{"number":303,"title":"Synthetic merge against an inconclusive gate","author":{"login":"builder-fallback[bot]","is_bot":false},"closingIssuesReferences":[],"state":"MERGED","createdAt":"2026-07-03T00:00:00Z","mergedAt":"2026-07-22T12:00:00Z","headRefOid":"3333333333333333333333333333333333333333"},{"number":304,"title":"Synthetic merge after a passing gate","author":{"login":"human-contributor","is_bot":false},"closingIssuesReferences":[{"number":204}],"state":"MERGED","createdAt":"2026-07-04T00:00:00Z","mergedAt":"2026-07-23T12:00:00Z","headRefOid":"4444444444444444444444444444444444444444"},{"number":305,"title":"Synthetic merge before a late pass","author":{"login":"builder-app","is_bot":true},"closingIssuesReferences":[],"state":"MERGED","createdAt":"2026-07-05T00:00:00Z","mergedAt":"2026-07-24T12:00:00Z","headRefOid":"5555555555555555555555555555555555555555"},{"number":306,"title":"Synthetic excused loop merge","author":{"login":"builder-app","is_bot":true},"closingIssuesReferences":[],"state":"MERGED","createdAt":"2026-07-06T00:00:00Z","mergedAt":"2026-07-25T12:00:00Z","headRefOid":"6666666666666666666666666666666666666666"},{"number":307,"title":"Synthetic human merge outside the loop","author":{"login":"human-contributor","is_bot":false},"closingIssuesReferences":[],"state":"MERGED","createdAt":"2026-07-07T00:00:00Z","mergedAt":"2026-07-26T12:00:00Z","headRefOid":"7777777777777777777777777777777777777777"}]
 JSON
+      fi
+      ;;
+    example-org/no-gate-history-repo)
+      if [ "$issue_state" = "merged" ]; then
+        cat <<'JSON'
+[{"number":401,"title":"Synthetic merge before repository onboarding","author":{"login":"builder-app","is_bot":true},"closingIssuesReferences":[{"number":400}],"state":"MERGED","createdAt":"2026-07-01T00:00:00Z","mergedAt":"2026-07-27T12:00:00Z","headRefOid":"8888888888888888888888888888888888888888"}]
+JSON
+      else
+        echo '[]'
       fi
       ;;
     *) echo '[]' ;;
@@ -5304,7 +5313,8 @@ if [ "$1" = "api" ]; then
     case "$graphql_owner/$graphql_name" in
       example-org/example-repo) echo 4 ;;
       example-org/hub-repo) echo 3 ;;
-      example-org/merge-invariant-repo) echo 6 ;;
+      example-org/merge-invariant-repo) echo 8 ;;
+      example-org/no-gate-history-repo) echo 1 ;;
       example-org/pr-history) echo 254 ;;
       *) echo 0 ;;
     esac
@@ -6907,10 +6917,12 @@ fi
 
 # #147: the sweep fetches recent merged PRs separately and joins
 # them to gate.jsonl by the head SHA that landed. These synthetic merges cover
-# every invariant outcome: no verdict at that SHA (despite a verdict for the
-# same PR at another SHA), fail, inconclusive, timely pass, late pass, and an
-# explicitly excused manual merge. A second synthetic repository has no
-# merges, proving the empty side of the join is quiet.
+# every invariant outcome: a pre-floor merge, no verdict at that SHA (despite
+# a verdict for the same PR at another SHA), fail, inconclusive, timely pass,
+# late pass, an explicitly excused loop merge, and a human merge outside the
+# loop. A second synthetic repository has a machine-authored historical merge
+# but no verdict history, proving that repository onboarding derives its own
+# quiet floor instead of borrowing another repository's epoch.
 merge_invariant="$fixture/merge-invariant"
 merge_invariant_calls="$merge_invariant/gh-calls.log"
 mkdir -p "$merge_invariant/config/ostrom" "$merge_invariant/repo"
@@ -6925,7 +6937,7 @@ projects:
     default: excluded
     paused: false
     bounce: []
-  - repo: example-org/no-merges-repo
+  - repo: example-org/no-gate-history-repo
     delegated: []
     excluded: []
     reserved: []
@@ -6941,7 +6953,7 @@ cat >"$merge_invariant/config/ostrom/gate.jsonl" <<'JSONL'
 {"ts":"2026-07-24T13:00:00Z","pr":"example-org/merge-invariant-repo#305","head_sha":"5555555555555555555555555555555555555555","verdict":"pass","already_judged":false,"conditions":[]}
 JSONL
 cat >"$merge_invariant/config/ostrom/exceptions.jsonl" <<'JSONL'
-{"ts":"2026-07-25T13:00:00Z","repo":"example-org/merge-invariant-repo","pr":306,"head_sha":"6666666666666666666666666666666666666666","condition":"merge_protocol","reason":"principal accepted the synthetic manual merge"}
+{"ts":"2026-07-25T13:00:00Z","repo":"example-org/merge-invariant-repo","pr":306,"head_sha":"6666666666666666666666666666666666666666","condition":"merge_protocol","reason":"principal accepted the synthetic loop merge"}
 JSONL
 merge_invariant_output="$(
   cd "$merge_invariant/repo"
@@ -6959,33 +6971,47 @@ jq -s -e '
   length == 4
   and all(.[];
     .repo == "example-org/merge-invariant-repo"
-    and .kind == "decision"
+    and .kind == "merge-gate-fault"
     and .state == "pending"
-    and .needs_judgment == true
+    and .needs_judgment == false
+    and (.mandate.scope_evidence.basis | length) > 0
   )
   and any(.[];
     .id == "example-org/merge-invariant-repo#301"
     and .mandate.reason == "merge gate fault: no verdict for merged head 1111111111111111111111111111111111111111"
+    and .mandate.scope_evidence.basis == ["work_order"]
+    and .mandate.scope_evidence.machine_author == null
+    and .mandate.scope_evidence.work_order_refs == ["example-org/merge-invariant-repo#201"]
   )
   and any(.[];
     .id == "example-org/merge-invariant-repo#302"
     and .mandate.reason == "merge gate fault: fail verdict for merged head 2222222222222222222222222222222222222222"
+    and .mandate.scope_evidence.basis == ["machine_authorship"]
+    and .mandate.scope_evidence.machine_author.login == "builder-app"
+    and .mandate.scope_evidence.machine_author.is_bot == true
   )
   and any(.[];
     .id == "example-org/merge-invariant-repo#303"
     and .mandate.reason == "merge gate fault: inconclusive verdict for merged head 3333333333333333333333333333333333333333"
+    and .mandate.scope_evidence.machine_author.login == "builder-fallback[bot]"
+    and .mandate.scope_evidence.machine_author.is_bot == false
   )
   and any(.[];
     .id == "example-org/merge-invariant-repo#305"
     and .mandate.reason == "merge gate fault: pass recorded after merge for head 5555555555555555555555555555555555555555"
   )
+  and (any(.[]; .id == "example-org/merge-invariant-repo#300") | not)
   and (any(.[]; .id == "example-org/merge-invariant-repo#304") | not)
   and (any(.[]; .id == "example-org/merge-invariant-repo#306") | not)
+  and (any(.[]; .id == "example-org/merge-invariant-repo#307") | not)
+  and (any(.[]; .repo == "example-org/no-gate-history-repo") | not)
 ' "$merge_invariant_queue" >/dev/null
 jq -e '
   .repos["example-org/merge-invariant-repo"] as $repo
   | $repo.merge_gate_fault_count == 4
-  and ($repo.merge_gate_merges | length) == 6
+  and $repo.merge_gate_floor == "2026-07-19T10:00:00Z"
+  and ($repo.merge_gate_merges | length) == 8
+  and ($repo.merge_gate_faults | has("example-org/merge-invariant-repo#300") | not)
   and $repo.merge_gate_faults["example-org/merge-invariant-repo#301"].shape == "no_verdict"
   and $repo.merge_gate_faults["example-org/merge-invariant-repo#302"].shape == "non_pass"
   and $repo.merge_gate_faults["example-org/merge-invariant-repo#302"].verdict == "fail"
@@ -6994,20 +7020,23 @@ jq -e '
   and ($repo.merge_gate_faults | has("example-org/merge-invariant-repo#304") | not)
   and ($repo.merge_gate_faults | has("example-org/merge-invariant-repo#306") | not)
   and $repo.merge_gate_excuses["example-org/merge-invariant-repo#306"].reason
-    == "principal accepted the synthetic manual merge"
-  and .repos["example-org/no-merges-repo"].merge_gate_fault_count == 0
-  and (.repos["example-org/no-merges-repo"].merge_gate_merges | length) == 0
-  and (.repos["example-org/no-merges-repo"].merge_gate_faults | length) == 0
+    == "principal accepted the synthetic loop merge"
+  and .repos["example-org/no-gate-history-repo"].merge_gate_floor == null
+  and .repos["example-org/no-gate-history-repo"].merge_gate_fault_count == 0
+  and (.repos["example-org/no-gate-history-repo"].merge_gate_merges | length) == 1
+  and (.repos["example-org/no-gate-history-repo"].merge_gate_faults | length) == 0
 ' "$merge_invariant_state" >/dev/null
 
 # Each repository gets one complete-open query and one recency-bounded merged
 # query. Because the merge check is detective, the sweep still exits
 # successfully after finding the four faults.
 [ "$(grep -c $'example-org/merge-invariant-repo\tpr list ' "$merge_invariant_calls")" -eq 2 ]
-[ "$(grep -c $'example-org/no-merges-repo\tpr list ' "$merge_invariant_calls")" -eq 2 ]
+[ "$(grep -c $'example-org/no-gate-history-repo\tpr list ' "$merge_invariant_calls")" -eq 2 ]
 grep -Fq $'example-org/merge-invariant-repo\tpr list --repo example-org/merge-invariant-repo --state open --limit 200' \
   "$merge_invariant_calls"
 grep -Fq $'example-org/merge-invariant-repo\tpr list --repo example-org/merge-invariant-repo --state merged --search merged:>=2026-07-02 --limit 200' \
+  "$merge_invariant_calls"
+grep -Fq -- '--json number,title,author,closingIssuesReferences,createdAt,mergedAt,headRefOid' \
   "$merge_invariant_calls"
 
 merge_invariant_digest="$(
@@ -7019,6 +7048,7 @@ merge_invariant_digest="$(
 merge_invariant_digest_text="$(jq -r '.systemMessage' <<<"$merge_invariant_digest")"
 grep -q '^example-org/merge-invariant-repo: 4 merge gate faults — /ostrom:desk triage$' \
   <<<"$merge_invariant_digest_text"
+grep -q '^MERGE GATE FAULTS$' <<<"$merge_invariant_digest_text"
 grep -q '^example-org/merge-invariant-repo#301  Synthetic merge without a verdict — merge gate fault:' \
   <<<"$merge_invariant_digest_text"
 
@@ -7620,14 +7650,16 @@ jq -e '
   and $open.files == ["src/history.sh"]
   and $repo.items["example-org/pr-history#1"].classification == "delegated"
   and ($repo.merge_gate_merges | length) == 1
+  and $repo.merge_gate_floor == null
+  and $repo.merge_gate_fault_count == 0
   and $repo.merge_gate_merges["example-org/pr-history#2"].head_sha
     == "2222222222222222222222222222222222222222"
 ' "$pr_history/config/ostrom/state.json" >/dev/null
-jq -e '
-  select(.id == "example-org/pr-history#2")
-  | .mandate.reason
-    == "merge gate fault: no verdict for merged head 2222222222222222222222222222222222222222"
-' "$pr_history/config/ostrom/queue.jsonl" >/dev/null
+if jq -e 'select(.id == "example-org/pr-history#2")' \
+    "$pr_history/config/ostrom/queue.jsonl" >/dev/null; then
+  echo "repository with no verdict history raised a merge gate fault" >&2
+  exit 1
+fi
 
 # The complete-open query retains a loud fail-closed guard. Simulate 200 open
 # PRs reaching its fixed activity bound; no partial queue or state is installed.
