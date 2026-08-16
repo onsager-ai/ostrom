@@ -1,0 +1,65 @@
+{
+  "$comment": "Single source of truth for npm package names, platform metadata, and the release build matrix. Replace the placeholder scope before the first publish.",
+  "scope": "@ostrom-placeholder",
+  "binaryNames": ["ostrom"],
+  "cargoWorkspace": "Cargo.toml",
+  "repositoryUrl": "git+https://github.com/onsager-ai/ostrom.git",
+  "mainPackage": {
+    "dir": "npm/ostrom",
+    "name": "ostrom"
+  },
+  "platformDir": "npm/platforms",
+  "stagingDir": "target/npm-packages",
+  "platforms": [
+    {
+      "dir": "cli-linux-x64",
+      "platform": "linux-x64",
+      "nodeKey": "linux-x64",
+      "os": "linux",
+      "cpu": "x64",
+      "target": "x86_64-unknown-linux-gnu",
+      "runner": "ubuntu-22.04",
+      "ext": ""
+    },
+    {
+      "dir": "cli-linux-arm64",
+      "platform": "linux-arm64",
+      "nodeKey": "linux-arm64",
+      "os": "linux",
+      "cpu": "arm64",
+      "target": "aarch64-unknown-linux-gnu",
+      "runner": "ubuntu-24.04-arm",
+      "ext": ""
+    },
+    {
+      "dir": "cli-darwin-x64",
+      "platform": "darwin-x64",
+      "nodeKey": "darwin-x64",
+      "os": "darwin",
+      "cpu": "x64",
+      "target": "x86_64-apple-darwin",
+      "runner": "macos-15-intel",
+      "ext": ""
+    },
+    {
+      "dir": "cli-darwin-arm64",
+      "platform": "darwin-arm64",
+      "nodeKey": "darwin-arm64",
+      "os": "darwin",
+      "cpu": "arm64",
+      "target": "aarch64-apple-darwin",
+      "runner": "macos-14",
+      "ext": ""
+    },
+    {
+      "dir": "cli-windows-x64",
+      "platform": "windows-x64",
+      "nodeKey": "win32-x64",
+      "os": "win32",
+      "cpu": "x64",
+      "target": "x86_64-pc-windows-msvc",
+      "runner": "windows-latest",
+      "ext": ".exe"
+    }
+  ]
+}

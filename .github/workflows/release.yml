@@ -1,0 +1,131 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  meta:
+    name: Resolve version and build matrix
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      is-release: ${{ steps.meta.outputs.is-release }}
+      npm-tag: ${{ steps.meta.outputs.npm-tag }}
+      matrix: ${{ steps.meta.outputs.matrix }}
+      verification-dir: ${{ steps.meta.outputs.verification-dir }}
+      verification-binaries: ${{ steps.meta.outputs.verification-binaries }}
+      main-dir: ${{ steps.meta.outputs.main-dir }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - id: meta
+        name: Read npm release configuration
+        run: node npm/scripts/release-meta.mjs
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: meta
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.meta.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install pinned Rust toolchain
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: rustup toolchain install 1.85.0 --profile minimal --target "$TARGET"
+      - name: Build release binaries
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo +1.85.0 build --locked --release --package ostrom-cli --target "$TARGET"
+      - name: Assert binary version
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          BINARIES: ${{ matrix.binaries }}
+          EXPECTED_VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          IFS=',' read -ra names <<< "$BINARIES"
+          for name in "${names[@]}"; do
+            "target/$TARGET/release/$name" --version > binary-version.txt
+            node npm/scripts/assert-version.mjs \
+              --version-output binary-version.txt \
+              --expected "$EXPECTED_VERSION"
+          done
+      - name: Upload release binaries
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: binary-${{ matrix.platform }}
+          path: ${{ matrix.artifactPaths }}
+          if-no-files-found: error
+          retention-days: 1
+
+  package-and-publish:
+    name: Pack and publish npm distribution
+    needs: [meta, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Set up Node.js for npm provenance
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Download release binaries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: binary-*
+          path: artifacts
+      - name: Stage platform and launcher packages
+        run: >-
+          node npm/scripts/stage-packages.mjs
+          --artifacts artifacts
+          --version "${{ needs.meta.outputs.version }}"
+      - name: Verify package and binary versions
+        env:
+          BINARIES: ${{ needs.meta.outputs.verification-binaries }}
+          PLATFORM_DIR: ${{ needs.meta.outputs.verification-dir }}
+          MAIN_DIR: ${{ needs.meta.outputs.main-dir }}
+        run: |
+          IFS=',' read -ra names <<< "$BINARIES"
+          for name in "${names[@]}"; do
+            "target/npm-packages/$PLATFORM_DIR/$name" --version > "target/npm-packages/$name-version.txt"
+            node npm/scripts/assert-version.mjs \
+              --version-output "target/npm-packages/$name-version.txt" \
+              --package "target/npm-packages/$MAIN_DIR/package.json"
+          done
+          node npm/scripts/verify-packages.mjs
+      - name: Pack all six packages
+        run: bash npm/scripts/pack.sh
+      - name: Publish platform packages with provenance
+        if: needs.meta.outputs.is-release == 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: >-
+          node npm/scripts/publish.mjs
+          --target platforms
+          --tag "${{ needs.meta.outputs.npm-tag }}"
+      - name: Wait for platform package propagation
+        if: needs.meta.outputs.is-release == 'true'
+        run: >-
+          node npm/scripts/wait-for-platforms.mjs
+          --version "${{ needs.meta.outputs.version }}"
+      - name: Publish launcher package with provenance
+        if: needs.meta.outputs.is-release == 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: >-
+          node npm/scripts/publish.mjs
+          --target main
+          --tag "${{ needs.meta.outputs.npm-tag }}"
