@@ -2790,10 +2790,10 @@ jq -cn \
                 | length)
             }],
         edges: $edges,
-        faults: if ($cycles | length) == 0 then [] else [{
+        faults: (if ($cycles | length) == 0 then [] else [{
           name: "dependency_cycle",
           nodes: $cycles
-        }] end
+        }] end)
       }
   ' >"$work/dependency-graph.json"
 
