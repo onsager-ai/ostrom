@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -26,7 +26,9 @@ impl CheckDocument {
         }
         for definition in document.checks.values() {
             definition.validate_uses()?;
+            definition.validate_agent_parameters()?;
         }
+        validate_local_evidence_graph(&document)?;
         Ok(document)
     }
 }
@@ -50,6 +52,86 @@ impl CheckDefinition {
             Err(CheckContractError::InvalidActionName)
         }
     }
+
+    fn validate_agent_parameters(&self) -> Result<(), CheckContractError> {
+        if self.uses.split_once('/').map(|part| part.0) != Some("agent") {
+            return Ok(());
+        }
+        agent_parameters(self).map(|_| ())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvidenceReference {
+    pub from: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentParameters {
+    pub prompt: String,
+    pub evidence: Vec<EvidenceReference>,
+    pub model: Option<String>,
+}
+
+/// Decode the core-owned `agent/*` parameters. Harnesses receive this bounded
+/// input and cannot add provider-specific context keys.
+pub fn agent_parameters(
+    definition: &CheckDefinition,
+) -> Result<AgentParameters, CheckContractError> {
+    if definition.uses.split_once('/').map(|part| part.0) != Some("agent") {
+        return Err(CheckContractError::InvalidAgentParameters);
+    }
+    let allowed = ["evidence", "fresh_for", "model", "prompt"];
+    if definition
+        .with
+        .keys()
+        .any(|key| !allowed.contains(&key.as_str()))
+    {
+        return Err(CheckContractError::InvalidAgentParameters);
+    }
+    let prompt = definition
+        .with
+        .get("prompt")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(CheckContractError::InvalidAgentParameters)?
+        .to_owned();
+    let evidence = definition
+        .with
+        .get("evidence")
+        .cloned()
+        .ok_or(CheckContractError::JudgedEvidenceRequired)
+        .and_then(|value| {
+            serde_json::from_value::<Vec<EvidenceReference>>(value)
+                .map_err(|_| CheckContractError::InvalidAgentParameters)
+        })?;
+    if evidence.is_empty() {
+        return Err(CheckContractError::JudgedEvidenceRequired);
+    }
+    let mut names = BTreeSet::new();
+    if evidence
+        .iter()
+        .any(|item| item.from.trim().is_empty() || !names.insert(item.from.as_str()))
+    {
+        return Err(CheckContractError::InvalidAgentParameters);
+    }
+    let model = definition
+        .with
+        .get("model")
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+                .ok_or(CheckContractError::InvalidAgentParameters)
+        })
+        .transpose()?;
+    Ok(AgentParameters {
+        prompt,
+        evidence,
+        model,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -62,6 +144,92 @@ pub struct CatalogueEnumeration {
     pub catalogues: Vec<Catalogue>,
     /// Attests that every configured source was read to completion.
     pub complete: bool,
+}
+
+fn validate_local_evidence_graph(document: &CheckDocument) -> Result<(), CheckContractError> {
+    validate_evidence_cycles(&document.checks, false)
+}
+
+fn validate_catalogue_evidence_graph(
+    enumeration: &CatalogueEnumeration,
+) -> Result<(), CheckContractError> {
+    let mut definitions = BTreeMap::new();
+    let mut duplicates = BTreeSet::new();
+    for catalogue in &enumeration.catalogues {
+        for (id, definition) in &catalogue.document.checks {
+            if definitions.insert(id.clone(), definition.clone()).is_some() {
+                duplicates.insert(id.clone());
+            }
+        }
+    }
+    for definition in definitions.values() {
+        if definition.uses.starts_with("agent/") {
+            for reference in agent_parameters(definition)?.evidence {
+                if duplicates.contains(&reference.from) {
+                    return Err(CheckContractError::AmbiguousCheck);
+                }
+                if !definitions.contains_key(&reference.from) {
+                    return Err(CheckContractError::UnresolvedCheck);
+                }
+            }
+        }
+    }
+    validate_evidence_cycles(&definitions, true)
+}
+
+fn validate_evidence_cycles(
+    definitions: &BTreeMap<String, CheckDefinition>,
+    require_local_references: bool,
+) -> Result<(), CheckContractError> {
+    fn visit(
+        id: &str,
+        definitions: &BTreeMap<String, CheckDefinition>,
+        require_local_references: bool,
+        visiting: &mut BTreeSet<String>,
+        visited: &mut BTreeSet<String>,
+    ) -> Result<(), CheckContractError> {
+        if visited.contains(id) {
+            return Ok(());
+        }
+        if !visiting.insert(id.to_owned()) {
+            return Err(CheckContractError::EvidenceCycle);
+        }
+        let definition = &definitions[id];
+        if definition.uses.starts_with("agent/") {
+            for reference in agent_parameters(definition)?.evidence {
+                if reference.from == id {
+                    return Err(CheckContractError::EvidenceSelfReference);
+                }
+                if definitions.contains_key(&reference.from) {
+                    visit(
+                        &reference.from,
+                        definitions,
+                        require_local_references,
+                        visiting,
+                        visited,
+                    )?;
+                } else if require_local_references {
+                    return Err(CheckContractError::UnresolvedCheck);
+                }
+            }
+        }
+        visiting.remove(id);
+        visited.insert(id.to_owned());
+        Ok(())
+    }
+
+    let mut visiting = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    for id in definitions.keys() {
+        visit(
+            id,
+            definitions,
+            require_local_references,
+            &mut visiting,
+            &mut visited,
+        )?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -167,8 +335,10 @@ pub fn select_check<'a>(
         }
         for definition in catalogue.document.checks.values() {
             definition.validate_uses()?;
+            definition.validate_agent_parameters()?;
         }
     }
+    validate_catalogue_evidence_graph(enumeration)?;
 
     let mut matches = enumeration.catalogues.iter().filter_map(|catalogue| {
         catalogue
@@ -290,6 +460,16 @@ pub enum CheckContractError {
     UnresolvedAction,
     #[error("resolved action metadata is malformed")]
     MalformedAction,
+    #[error("invalid_agent_parameters")]
+    InvalidAgentParameters,
+    #[error("judged_evidence_required")]
+    JudgedEvidenceRequired,
+    #[error("evidence_self_reference")]
+    EvidenceSelfReference,
+    #[error("evidence_cycle")]
+    EvidenceCycle,
+    #[error("evidence_incomplete")]
+    EvidenceIncomplete,
     #[error(transparent)]
     Freshness(#[from] FreshnessError),
     #[error("malformed_receipt")]
@@ -305,6 +485,11 @@ impl CheckContractError {
             Self::UnresolvedCheck => Some("unresolved_check"),
             Self::AmbiguousCheck => Some("ambiguous_check"),
             Self::UnresolvedAction => Some("unresolved_action"),
+            Self::InvalidAgentParameters => Some("invalid_agent_parameters"),
+            Self::JudgedEvidenceRequired => Some("judged_evidence_required"),
+            Self::EvidenceSelfReference => Some("evidence_self_reference"),
+            Self::EvidenceCycle => Some("evidence_cycle"),
+            Self::EvidenceIncomplete => Some("evidence_incomplete"),
             Self::MalformedReceipt => Some("malformed_receipt"),
             _ => None,
         }
@@ -318,11 +503,69 @@ pub enum CheckVerdict {
     Fail,
 }
 
+impl CheckVerdict {
+    #[must_use]
+    pub fn render(self, basis: CheckBasis) -> &'static str {
+        match (basis, self) {
+            (CheckBasis::Judged, Self::Pass) => "judged pass",
+            (CheckBasis::Judged, Self::Fail) => "judged fail",
+            (CheckBasis::Mechanical, Self::Pass) => "pass",
+            (CheckBasis::Mechanical, Self::Fail) => "fail",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Evidence {
     pub name: String,
     pub digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fresh_until: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JudgmentClause {
+    pub evidence: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JudgeStamp {
+    pub harness: String,
+    pub model: String,
+    pub version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordedOutput {
+    pub basis: CheckBasis,
+    pub verdict: CheckVerdict,
+    pub rendered: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<Evidence>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub because: Vec<JudgmentClause>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judged_by: Option<JudgeStamp>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvidenceBundleItem {
+    pub name: String,
+    pub digest: String,
+    pub output: RecordedOutput,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JudgmentInput {
+    pub prompt: String,
+    pub evidence: Vec<EvidenceBundleItem>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -340,6 +583,10 @@ pub struct CheckReceipt {
     pub verdict: Option<CheckVerdict>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<Evidence>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub because: Vec<JudgmentClause>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judged_by: Option<JudgeStamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -347,7 +594,12 @@ pub struct CheckReceipt {
 }
 
 impl CheckReceipt {
-    fn validate(&self) -> Result<(), CheckContractError> {
+    pub fn validate(&self) -> Result<(), CheckContractError> {
+        let evidence_names = self
+            .evidence
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect::<BTreeSet<_>>();
         if self.result_version != RESULT_VERSION
             || self.check.is_empty()
             || self.attempt_id.is_empty()
@@ -364,11 +616,54 @@ impl CheckReceipt {
                 .evidence
                 .iter()
                 .any(|item| item.name.is_empty() || item.digest.is_empty())
+            || evidence_names.len() != self.evidence.len()
+            || self
+                .because
+                .iter()
+                .any(|clause| clause.evidence.is_empty() || clause.detail.trim().is_empty())
+            || self.judged_by.as_ref().is_some_and(|judge| {
+                judge.harness.is_empty() || judge.model.is_empty() || judge.version.is_empty()
+            })
         {
             return Err(CheckContractError::MalformedReceipt);
         }
+        match self.basis {
+            CheckBasis::Mechanical => {
+                if self.judged_by.is_some() || !self.because.is_empty() {
+                    return Err(CheckContractError::MalformedReceipt);
+                }
+            }
+            CheckBasis::Judged => {
+                if self.judged_by.is_none()
+                    || (self.verdict.is_some()
+                        && (self.evidence.is_empty() || self.because.is_empty()))
+                    || (self.error.is_some()
+                        && (!self.evidence.is_empty() || !self.because.is_empty()))
+                {
+                    return Err(CheckContractError::MalformedReceipt);
+                }
+                if self
+                    .because
+                    .iter()
+                    .any(|clause| !evidence_names.contains(clause.evidence.as_str()))
+                {
+                    return Err(CheckContractError::EvidenceIncomplete);
+                }
+            }
+        }
         Ok(())
     }
+}
+
+/// Identify the exact recorded observation supplied to a judge. Attempt and
+/// timing metadata are included deliberately: a re-run is a new observation
+/// even when it returns the same value.
+#[must_use]
+pub fn receipt_digest(receipt: &CheckReceipt) -> String {
+    let mut canonical = serde_json::to_value(receipt).expect("receipt serializes");
+    canonicalize_json(&mut canonical);
+    let bytes = serde_json::to_vec(&canonical).expect("canonical receipt serializes");
+    format!("sha256:{}", sha256_hex(&bytes))
 }
 
 #[derive(Debug, Clone)]
@@ -387,6 +682,8 @@ struct RunnerResult {
     verdict: Option<CheckVerdict>,
     #[serde(default)]
     evidence: Vec<Evidence>,
+    #[serde(default)]
+    because: Vec<JudgmentClause>,
     #[serde(default)]
     error: Option<String>,
     #[serde(default)]
@@ -408,6 +705,7 @@ impl RunnerStamp<'_> {
             "completed_at",
             "basis",
             "producer",
+            "judged_by",
         ] {
             object.remove(field);
         }
@@ -424,6 +722,8 @@ impl RunnerStamp<'_> {
             producer: self.resolved.producer.clone(),
             verdict: result.verdict,
             evidence: result.evidence,
+            because: result.because,
+            judged_by: None,
             error: result.error,
             detail: result.detail,
         };
@@ -445,6 +745,65 @@ impl RunnerStamp<'_> {
             producer: self.resolved.producer.clone(),
             verdict: None,
             evidence: Vec::new(),
+            because: Vec::new(),
+            judged_by: None,
+            error: Some(name.into()),
+            detail,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct JudgmentRunnerStamp<'a> {
+    pub resolved: &'a ResolvedCheck,
+    pub attempt_id: &'a str,
+    pub observed_at: DateTime<Utc>,
+    pub completed_at: DateTime<Utc>,
+    pub judge: JudgeStamp,
+    pub evidence: Vec<Evidence>,
+}
+
+impl JudgmentRunnerStamp<'_> {
+    pub fn verdict(
+        self,
+        verdict: CheckVerdict,
+        because: Vec<JudgmentClause>,
+    ) -> Result<CheckReceipt, CheckContractError> {
+        let receipt = CheckReceipt {
+            result_version: RESULT_VERSION,
+            check: self.resolved.id.clone(),
+            definition_digest: self.resolved.definition_digest.clone(),
+            attempt_id: self.attempt_id.to_owned(),
+            observed_at: self.observed_at,
+            completed_at: self.completed_at,
+            basis: self.resolved.basis,
+            producer: self.resolved.producer.clone(),
+            verdict: Some(verdict),
+            evidence: self.evidence,
+            because,
+            judged_by: Some(self.judge),
+            error: None,
+            detail: None,
+        };
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
+    #[must_use]
+    pub fn fault(self, name: impl Into<String>, detail: Option<String>) -> CheckReceipt {
+        CheckReceipt {
+            result_version: RESULT_VERSION,
+            check: self.resolved.id.clone(),
+            definition_digest: self.resolved.definition_digest.clone(),
+            attempt_id: self.attempt_id.to_owned(),
+            observed_at: self.observed_at,
+            completed_at: self.completed_at,
+            basis: self.resolved.basis,
+            producer: self.resolved.producer.clone(),
+            verdict: None,
+            evidence: Vec::new(),
+            because: Vec::new(),
+            judged_by: Some(self.judge),
             error: Some(name.into()),
             detail,
         }
@@ -458,6 +817,22 @@ pub enum CheckState {
     Stale,
     Passing,
     Failing,
+}
+
+impl CheckState {
+    #[must_use]
+    pub fn render(self, basis: CheckBasis) -> &'static str {
+        match (basis, self) {
+            (CheckBasis::Judged, Self::Passing) => "judged pass",
+            (CheckBasis::Judged, Self::Failing) => "judged fail",
+            (CheckBasis::Judged, Self::Stale) => "judged stale",
+            (CheckBasis::Judged, Self::NeverRun) => "judged never run",
+            (CheckBasis::Mechanical, Self::Passing) => "pass",
+            (CheckBasis::Mechanical, Self::Failing) => "fail",
+            (CheckBasis::Mechanical, Self::Stale) => "stale",
+            (CheckBasis::Mechanical, Self::NeverRun) => "never run",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -522,7 +897,11 @@ impl ResolvedCheck {
                 .ok()
                 .and_then(Duration::try_seconds)
                 .and_then(|duration| receipt.observed_at.checked_add_signed(duration));
-            if expires_at.is_some_and(|expires_at| expires_at < evaluated_at) {
+            let evidence_stale = self.basis == CheckBasis::Judged
+                && receipt.evidence.iter().any(|evidence| {
+                    evidence_is_stale(evidence, receipts, evaluated_at, &mut BTreeSet::new())
+                });
+            if expires_at.is_some_and(|expires_at| expires_at < evaluated_at) || evidence_stale {
                 CheckState::Stale
             } else if receipt.verdict == Some(CheckVerdict::Pass) {
                 CheckState::Passing
@@ -532,6 +911,36 @@ impl ResolvedCheck {
         });
         CheckEvaluation { state, fault }
     }
+}
+
+fn evidence_is_stale(
+    evidence: &Evidence,
+    receipts: &[CheckReceipt],
+    evaluated_at: DateTime<Utc>,
+    visiting: &mut BTreeSet<String>,
+) -> bool {
+    if evidence
+        .fresh_until
+        .is_none_or(|fresh_until| fresh_until < evaluated_at)
+        || !visiting.insert(evidence.name.clone())
+    {
+        return true;
+    }
+    let Some(receipt) = receipts
+        .iter()
+        .filter(|candidate| candidate.check == evidence.name)
+        .max_by_key(|candidate| candidate.completed_at)
+    else {
+        return true;
+    };
+    let stale = receipt_digest(receipt) != evidence.digest
+        || (receipt.basis == CheckBasis::Judged
+            && receipt
+                .evidence
+                .iter()
+                .any(|nested| evidence_is_stale(nested, receipts, evaluated_at, visiting)));
+    visiting.remove(&evidence.name);
+    stale
 }
 
 // Small dependency-free SHA-256 keeps the contract usable in the existing
@@ -842,9 +1251,21 @@ checks:
 
     #[test]
     fn only_agent_actions_are_judged() {
-        let document =
-            CheckDocument::from_yaml(&DOCUMENT.replace("fixture/observe", "agent/inspect"))
-                .expect("agent fixture parses");
+        let document = CheckDocument::from_yaml(
+            r#"
+checks_version: 1
+checks:
+  source:
+    uses: fixture/observe
+    with: {}
+  hub-serves-current-records:
+    uses: agent/inspect
+    with:
+      prompt: inspect the bounded source
+      evidence: [{from: source}]
+"#,
+        )
+        .expect("agent fixture parses");
         let mut action = action();
         action.uses = "agent/inspect".to_owned();
         assert_eq!(
@@ -922,5 +1343,58 @@ checks:
         let mut parameters = BTreeMap::new();
         parameters.insert("provider_payload".to_owned(), json!({"nested": [true, 42]}));
         assert_eq!(resolve_fresh_for(&parameters, 60), Ok(60));
+    }
+
+    #[test]
+    fn judged_checks_require_bounded_evidence_at_authoring_time() {
+        let source = r#"
+checks_version: 1
+checks:
+  opinion:
+    uses: agent/claude
+    with:
+      prompt: is the observation material
+"#;
+        let error = CheckDocument::from_yaml(source).expect_err("evidence is mandatory");
+        assert_eq!(error.fault_name(), Some("judged_evidence_required"));
+    }
+
+    #[test]
+    fn evidence_graph_rejects_direct_and_indirect_cycles() {
+        let direct = r#"
+checks_version: 1
+checks:
+  opinion:
+    uses: agent/claude
+    with:
+      prompt: inspect
+      evidence: [{from: opinion}]
+"#;
+        assert_eq!(
+            CheckDocument::from_yaml(direct)
+                .expect_err("self-reference must fail")
+                .fault_name(),
+            Some("evidence_self_reference")
+        );
+        let indirect = r#"
+checks_version: 1
+checks:
+  first:
+    uses: agent/claude
+    with:
+      prompt: inspect second
+      evidence: [{from: second}]
+  second:
+    uses: agent/claude
+    with:
+      prompt: inspect first
+      evidence: [{from: first}]
+"#;
+        assert_eq!(
+            CheckDocument::from_yaml(indirect)
+                .expect_err("cycle must fail")
+                .fault_name(),
+            Some("evidence_cycle")
+        );
     }
 }

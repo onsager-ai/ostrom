@@ -1,6 +1,6 @@
 [package]
 name = "ostrom-checks"
-description = "Mechanical check provider registry and built-in executors for Ostrom"
+description = "Mechanical check providers and bounded judgment harnesses for Ostrom"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,6 +12,7 @@ publish = false
 chrono.workspace = true
 ostrom-core = { path = "../ostrom-core" }
 reqwest.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 

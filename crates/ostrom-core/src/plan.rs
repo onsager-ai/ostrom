@@ -231,6 +231,7 @@ impl QueueItem {
 #[serde(deny_unknown_fields)]
 pub struct GoalFacts {
     pub goal: String,
+    pub basis: GoalBasis,
     pub milestones: Vec<MilestoneFact>,
     pub progress: ProgressFact,
     pub movement: MovementFact,
@@ -239,6 +240,13 @@ pub struct GoalFacts {
     pub met_when_status: Vec<MetWhenStatus>,
     pub impediments: Vec<Impediment>,
     pub met: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalBasis {
+    Mechanical,
+    IncludesJudgment,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -271,6 +279,7 @@ pub struct MovementFact {
 pub struct MetWhenStatus {
     pub check: String,
     pub state: CheckState,
+    pub rendered: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fault: Option<CheckFault>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -451,6 +460,9 @@ pub fn derive_goal_facts(
                 || MetWhenStatus {
                     check: check.clone(),
                     state: CheckState::NeverRun,
+                    rendered: CheckState::NeverRun
+                        .render(CheckBasis::Mechanical)
+                        .to_owned(),
                     fault: Some(CheckFault {
                         name: "unresolved_check".to_owned(),
                         detail: None,
@@ -461,6 +473,11 @@ pub fn derive_goal_facts(
                 |check_status| MetWhenStatus {
                     check: check.clone(),
                     state: check_status.evaluation.state,
+                    rendered: check_status
+                        .evaluation
+                        .state
+                        .render(check_status.basis)
+                        .to_owned(),
                     fault: check_status.evaluation.fault.clone(),
                     basis: Some(check_status.basis),
                     observation_age_seconds: check_status.observation_age_seconds,
@@ -474,6 +491,14 @@ pub fn derive_goal_facts(
             .all(|status| status.state == CheckState::Passing && status.fault.is_none());
     GoalFacts {
         goal: goal.id.clone(),
+        basis: if met_when_status
+            .iter()
+            .any(|status| status.basis == Some(CheckBasis::Judged))
+        {
+            GoalBasis::IncludesJudgment
+        } else {
+            GoalBasis::Mechanical
+        },
         milestones,
         progress: ProgressFact {
             complete,
@@ -514,6 +539,7 @@ pub fn fact_table(facts: &GoalFacts, queue: &[QueueItem]) -> BTreeMap<String, Va
         ),
     );
     table.insert("goal.met".to_owned(), json!(facts.met));
+    table.insert("goal.basis".to_owned(), json!(facts.basis));
     if let Some(next) = &facts.next {
         table.insert("next.id".to_owned(), json!(next));
         if let Some(item) = queue.iter().find(|item| &item.id == next) {
@@ -525,12 +551,15 @@ pub fn fact_table(facts: &GoalFacts, queue: &[QueueItem]) -> BTreeMap<String, Va
     let mut checks_by_state = BTreeMap::<String, Vec<String>>::new();
     let mut faulted_checks = Vec::new();
     for status in &facts.met_when_status {
-        let state = serde_json::to_value(status.state).expect("check state serializes");
+        let state = serde_json::to_value(&status.rendered).expect("check rendering serializes");
         checks_by_state
             .entry(state.as_str().unwrap_or("unknown").to_owned())
             .or_default()
             .push(status.check.clone());
         table.insert(format!("met_when.{}.state", status.check), state);
+        if let Some(basis) = status.basis {
+            table.insert(format!("met_when.{}.basis", status.check), json!(basis));
+        }
         if let Some(fault) = &status.fault {
             table.insert(format!("met_when.{}.fault", status.check), json!(fault));
             faulted_checks.push(status.check.clone());
@@ -848,6 +877,45 @@ acknowledgements: []
             EvaluatedCheck::from_contract(&check, &[receipt, fault], now),
         )]);
         assert!(!derive_goal_facts(&goal(), &[], &[], &checks).met);
+    }
+
+    #[test]
+    fn goal_basis_propagates_judgment_taint() {
+        let now = Utc.with_ymd_and_hms(2030, 1, 2, 3, 4, 5).unwrap();
+        let mechanical = resolved();
+        let mechanical_checks = BTreeMap::from([(
+            "sweep-parity".to_owned(),
+            EvaluatedCheck::from_contract(&mechanical, &[], now),
+        )]);
+        assert_eq!(
+            derive_goal_facts(&goal(), &[], &[], &mechanical_checks).basis,
+            GoalBasis::Mechanical
+        );
+
+        let mut judged = mechanical;
+        judged.basis = CheckBasis::Judged;
+        let judged_checks = BTreeMap::from([(
+            "sweep-parity".to_owned(),
+            EvaluatedCheck::from_contract(&judged, &[], now),
+        )]);
+        let facts = derive_goal_facts(&goal(), &[], &[], &judged_checks);
+        assert_eq!(facts.basis, GoalBasis::IncludesJudgment);
+        assert_eq!(facts.met_when_status[0].rendered, "judged never run");
+    }
+
+    #[test]
+    fn every_judged_state_rendering_is_qualified() {
+        for (state, rendered) in [
+            (CheckState::NeverRun, "judged never run"),
+            (CheckState::Stale, "judged stale"),
+            (CheckState::Passing, "judged pass"),
+            (CheckState::Failing, "judged fail"),
+        ] {
+            assert_eq!(state.render(CheckBasis::Judged), rendered);
+            assert!(state.render(CheckBasis::Judged).starts_with("judged "));
+        }
+        assert_eq!(CheckVerdict::Pass.render(CheckBasis::Judged), "judged pass");
+        assert_eq!(CheckVerdict::Fail.render(CheckBasis::Judged), "judged fail");
     }
 
     #[test]

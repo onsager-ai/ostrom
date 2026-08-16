@@ -20,10 +20,12 @@ mod store;
 pub mod conformance;
 
 pub use check::{
-    ActionDefinition, CHECKS_VERSION, Catalogue, CatalogueEnumeration, CheckBasis,
+    ActionDefinition, AgentParameters, CHECKS_VERSION, Catalogue, CatalogueEnumeration, CheckBasis,
     CheckContractError, CheckDefinition, CheckDocument, CheckEvaluation, CheckFault, CheckReceipt,
-    CheckState, CheckVerdict, DefinitionDigest, Evidence, FreshnessError, RESULT_VERSION,
-    ResolvedCheck, RunnerStamp, resolve_check, resolve_fresh_for, select_check,
+    CheckState, CheckVerdict, DefinitionDigest, Evidence, EvidenceBundleItem, EvidenceReference,
+    FreshnessError, JudgeStamp, JudgmentClause, JudgmentInput, JudgmentRunnerStamp, RESULT_VERSION,
+    RecordedOutput, ResolvedCheck, RunnerStamp, agent_parameters, receipt_digest, resolve_check,
+    resolve_fresh_for, select_check,
 };
 pub use domain::{
     ConfigError, DefaultDisposition, GateConfig, GateProject, Mandate, MandateConfig,
@@ -32,10 +34,10 @@ pub use domain::{
 pub use plan::{
     Acknowledgement, AcknowledgementResponse, Assessment, AssessmentDraft, AssessmentError,
     Because, Consequence, EvaluatedCheck, GOALS_VERSION, Goal, GoalAction, GoalActionVerb,
-    GoalFacts, GoalService, GoalState, GoalsDocument, GoalsError, Impediment, MetWhenStatus,
-    MilestoneFact, MilestoneInput, MovementFact, PLAN_VERSION, ProgressFact, QueueItem, Reading,
-    cited_fact_basis, compose_ranking, consequence, derive_goal_facts, fact_table,
-    mechanical_ranking, validate_assessment,
+    GoalBasis, GoalFacts, GoalService, GoalState, GoalsDocument, GoalsError, Impediment,
+    MetWhenStatus, MilestoneFact, MilestoneInput, MovementFact, PLAN_VERSION, ProgressFact,
+    QueueItem, Reading, cited_fact_basis, compose_ranking, consequence, derive_goal_facts,
+    fact_table, mechanical_ranking, validate_assessment,
 };
 pub use store::{
     AttemptOutcome, CHECK_STORE_SCHEMA_VERSION, CheckRun, CheckRunId, CheckStore, CheckStoreFault,
