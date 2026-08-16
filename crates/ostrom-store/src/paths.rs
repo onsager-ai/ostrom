@@ -50,6 +50,11 @@ impl OstromPaths {
     pub fn sweep_journal_file(&self) -> PathBuf {
         self.state.join("sweep-passes.jsonl")
     }
+
+    #[must_use]
+    pub fn check_journal_file(&self) -> PathBuf {
+        self.state.join("check-runs.jsonl")
+    }
 }
 
 #[cfg(test)]

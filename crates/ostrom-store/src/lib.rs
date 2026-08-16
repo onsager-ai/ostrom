@@ -1,5 +1,6 @@
 //! Filesystem implementation and compatibility readers.
 
+mod check_store;
 mod file_store;
 mod lease;
 mod migration;
@@ -9,6 +10,7 @@ mod queue;
 mod sweep;
 mod trace;
 
+pub use check_store::JsonlCheckStore;
 pub use file_store::JsonlSweepStore;
 pub use lease::{LeaseRecord, read_lease, write_lease};
 pub use migration::{MigrationOutcome, migrate};
