@@ -28,6 +28,37 @@ esac
 config="$(mandate_load_config)" || exit
 queue="$(mandate_read_queue)" || exit
 
+if [ ! -s "$MANDATE_STATE_FILE" ]; then
+  echo "mandate selection: dependency graph has no sweep state; run sweep before selecting work" >&2
+  exit 4
+fi
+state="$(jq -c 'if type == "object" then . else error("state is not an object") end' "$MANDATE_STATE_FILE")" || {
+  echo "mandate selection: cannot read $MANDATE_STATE_FILE" >&2
+  exit 4
+}
+if ! jq -e --argjson queue "$queue" --argjson config "$config" '
+    .dependency_graph as $graph
+    | $graph.graph_version == 1
+    and $graph.configured_repositories == ($config.projects | map(.repo) | sort)
+    and ($graph.nodes | type == "array")
+    and ($graph.edges | type == "array")
+    and ($graph.faults | type == "array")
+    and (([$queue[].id] - [$graph.nodes[].id]) | length) == 0
+    and all($queue[];
+      . as $row
+      | (($row.blocked_by // []) | sort) == ([$graph.edges[]
+          | select(.item == $row.id and (.sources | index("body") != null))
+          | .dependency] | sort)
+    )
+  ' >/dev/null <<<"$state"; then
+  echo "mandate selection: dependency graph is absent, stale, or invalid; run sweep before selecting work" >&2
+  exit 4
+fi
+jq -r '
+  .dependency_graph.faults[]?
+  | "mandate selection: dependency graph fault \(.name): \(.nodes | join(", "))"
+' <<<"$state" >&2
+
 # The sweep copies the ranking and any verified stale pointers into state.
 # Refuse an active ranking that has not passed through that sweep: otherwise a
 # config edit could steer one pass before its stale references were checked.
@@ -37,10 +68,6 @@ if [ "$ranking_count" -gt 0 ]; then
     echo "mandate selection: active work_ranking has no sweep state; run sweep before selecting work" >&2
     exit 4
   fi
-  state="$(jq -c 'if type == "object" then . else error("state is not an object") end' "$MANDATE_STATE_FILE")" || {
-    echo "mandate selection: cannot read $MANDATE_STATE_FILE" >&2
-    exit 4
-  }
   if ! jq -e --argjson ranking "$(jq '.work_ranking' <<<"$config")" \
       '.work_ranking == $ranking' >/dev/null <<<"$state"; then
     echo "mandate selection: active work_ranking differs from the last sweep; run sweep before selecting work" >&2
@@ -54,8 +81,8 @@ if [ "$ranking_count" -gt 0 ]; then
   fi
 fi
 
-candidates="$(jq -cn --argjson queue "$queue" '
-  def dispatchable:
+candidates_and_gated="$(jq -cn --argjson queue "$queue" --argjson state "$state" '
+  def authorized:
     .kind != "parked"
     and .state != "deferred"
     and (
@@ -65,8 +92,14 @@ candidates="$(jq -cn --argjson queue "$queue" '
         and (.kind | IN("tripwire", "decision"))
       )
     );
-  [$queue[] | select(dispatchable)]
+  ($state.dependency_graph.nodes | map({key: .id, value: .}) | from_entries) as $graph
+  | [$queue[] | select(authorized) | . + {graph: $graph[.id]}] as $authorized
+  | {
+      candidates: [$authorized[] | select(.graph.dispatchable) | del(.graph)],
+      gated: [$authorized[] | select(.graph.dispatchable | not)]
+    }
 ')"
+candidates="$(jq -c '.candidates' <<<"$candidates_and_gated")"
 
 # A plan is advisory and usable only for the exact queue/authorization facts
 # it observed. A stale or malformed plan cannot steer selection; the existing
@@ -80,9 +113,11 @@ if [ -s "$MANDATE_PLAN_FILE" ]; then
       opened,
       kind,
       state,
-      blocked_by: (.blocked_by // [])
+      blocked_by: (.blocked_by // []),
+      graph_dispatchable: ($graph[.id].dispatchable // false),
+      unblocking_power: ($graph[.id].unblocking_power // 0)
     }
-  ]')"
+  ]' --argjson graph "$(jq -c '.dependency_graph.nodes | map({key: .id, value: .}) | from_entries' <<<"$state")")"
   if jq -e \
       --argjson basis "$queue_basis" \
       --argjson ranking "$(jq '.work_ranking' <<<"$config")" \
@@ -106,22 +141,16 @@ ordered="$(
     --argjson config "$config" \
     --argjson queue "$queue" \
     --argjson candidates "$candidates" \
+    --argjson graph "$(jq -c '.dependency_graph.nodes | map({key: .id, value: .}) | from_entries' <<<"$state")" \
     --argjson plan_order "$plan_order" \
     --argjson has_plan "$has_plan" '
       ($config.work_ranking) as $ranking
-      | if (($ranking | length) == 0 and ($has_plan | not)) then
-          $candidates | sort_by(.opened, .id)
-        else
-          $candidates
+      | $candidates
           | map(
               . as $candidate
               | ($ranking | index($candidate.id)) as $rank
               | ($plan_order | index($candidate.id)) as $plan_rank
-              | ([
-                  $queue[]
-                  | select(.state != "deferred" and .kind != "parked")
-                  | select((.blocked_by // []) | index($candidate.id) != null)
-                ] | length) as $unblocks
+              | ($graph[$candidate.id].unblocking_power // 0) as $unblocks
               | {
                   row: $candidate,
                   key: (
@@ -134,7 +163,6 @@ ordered="$(
             )
           | sort_by(.key)
           | map(.row)
-        end
     '
 )" || exit
 
@@ -150,6 +178,41 @@ remaining="$(jq -c --argjson attempted "$attempted" '[.[] | . as $row | select((
 selected="$(jq -c 'first // empty' <<<"$remaining")"
 if [ -z "$selected" ]; then
   exit 3
+fi
+
+# Record a graph gate only when it changed this selection: the oldest
+# authorization-valid, not-yet-attempted item was structurally or temporally
+# gated and a different item was selected in its place.
+authorized_age_first="$(jq -c --argjson attempted "$attempted" '
+  [(.candidates + .gated)[]
+    | . as $row
+    | select(($attempted | index($row.id)) == null)]
+  | sort_by(.opened, .id)
+  | first // empty
+' <<<"$candidates_and_gated")"
+if [ -n "$authorized_age_first" ] \
+    && [ "$(jq -r '.id' <<<"$authorized_age_first")" != "$(jq -r '.id' <<<"$selected")" ] \
+    && [ "$(jq -r 'has("graph")' <<<"$authorized_age_first")" = true ]; then
+  graph_gated_id="$(jq -r '.id' <<<"$authorized_age_first")"
+  graph_gate_fact="$(jq -cn \
+    --arg owner "$owner" \
+    --arg selected "$(jq -r '.id' <<<"$selected")" \
+    --arg gated "$graph_gated_id" \
+    --argjson node "$(jq -c '.graph' <<<"$authorized_age_first")" \
+    --argjson cycle "$(jq --arg id "$graph_gated_id" '
+      any(.dependency_graph.faults[]?; .name == "dependency_cycle" and (.nodes | index($id) != null))
+    ' <<<"$state")" '
+      {
+        owner: $owner,
+        action: "dependency-graph-gate",
+        selected: $selected,
+        gated: $gated,
+        unsatisfied: $node.unsatisfied,
+        children: $node.children,
+        cycle: $cycle
+      }
+    ')"
+  bash "$SCRIPT_DIR/trace.sh" append work-graph-gated "$graph_gate_fact" '{}' >/dev/null
 fi
 
 # Compare the chosen row with the exact legacy order over the same remaining

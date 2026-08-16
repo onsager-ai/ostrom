@@ -494,12 +494,30 @@ projects:
         + "\n";
     fs::write(data.join("queue.jsonl"), queue).expect("queue");
     fs::write(
+        data.join("state.json"),
+        serde_json::to_vec(&json!({
+            "version": 2,
+            "dependency_graph": {
+                "graph_version": 1,
+                "configured_repositories": ["example-org/example-repo"],
+                "nodes": [
+                    {"id":"example-org/example-repo#1","open":true,"dependencies":[],"unsatisfied":[],"children":[],"dispatchable":true,"unblocking_power":10},
+                    {"id":"example-org/example-repo#2","open":true,"dependencies":[],"unsatisfied":[],"children":[],"dispatchable":true,"unblocking_power":0}
+                ],
+                "edges": [],
+                "faults": []
+            }
+        }))
+        .expect("state JSON"),
+    )
+    .expect("state");
+    fs::write(
         data.join("plan.json"),
         serde_json::to_vec(&json!({
             "plan_version": 1,
             "queue_basis": [
-                {"id":"example-org/example-repo#1","opened":"2026-07-01T00:00:00Z","kind":"moved","state":"pending","blocked_by":[]},
-                {"id":"example-org/example-repo#2","opened":"2026-07-02T00:00:00Z","kind":"moved","state":"pending","blocked_by":[]}
+                {"id":"example-org/example-repo#1","opened":"2026-07-01T00:00:00Z","kind":"moved","state":"pending","blocked_by":[],"graph_dispatchable":true,"unblocking_power":10},
+                {"id":"example-org/example-repo#2","opened":"2026-07-02T00:00:00Z","kind":"moved","state":"pending","blocked_by":[],"graph_dispatchable":true,"unblocking_power":0}
             ],
             "ranking": {
                 "work_ranking": [],

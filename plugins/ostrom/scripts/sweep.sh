@@ -126,6 +126,57 @@ fetch_issues() {
   fi
 }
 
+# GitHub's REST issue feed does not expose parent/sub-issue relationships.
+# Read that structural surface once per repository under the same
+# organisation-scoped token as every other sweep query.
+fetch_issue_relationships() {
+  local repo="$1"
+  local owner="${repo%%/*}"
+  local name="${repo#*/}"
+  local query cursor
+  query='query OstromDependencyGraph($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){issues(first:100,after:$cursor,states:OPEN){nodes{number parent{number repository{nameWithOwner}} subIssues(first:100){nodes{number state repository{nameWithOwner}} pageInfo{hasNextPage}}} pageInfo{hasNextPage endCursor}}}}'
+  if ! gh api graphql -f "query=$query" -F "owner=$owner" -F "name=$name" \
+      >"$work/issue-relationships-response.json" 2>"$work/gh-error"; then
+    detail="$(tr '\n' ' ' <"$work/gh-error")"
+    echo "mandate sweep: failed to query sub-issue relationships for $repo${detail:+: $detail}" >&2
+    return 5
+  fi
+  if ! jq -e '
+      (.data.repository.issues.nodes | type) == "array"
+      and all(.data.repository.issues.nodes[];
+        .subIssues.pageInfo.hasNextPage == false)
+    ' "$work/issue-relationships-response.json" >/dev/null 2>&1; then
+    echo "mandate sweep: sub-issue query for $repo was malformed or a parent reached 100 children; refusing a truncated dependency graph" >&2
+    return 6
+  fi
+  if [ "$(jq -r '.data.repository.issues.pageInfo.hasNextPage' "$work/issue-relationships-response.json")" = true ]; then
+    cursor="$(jq -er '.data.repository.issues.pageInfo.endCursor | select(type == "string" and length > 0)' "$work/issue-relationships-response.json")" || return 6
+    if ! gh api graphql -f "query=$query" -F "owner=$owner" -F "name=$name" \
+        -F "cursor=$cursor" >"$work/issue-relationships-page-2.json" 2>"$work/gh-error"; then
+      detail="$(tr '\n' ' ' <"$work/gh-error")"
+      echo "mandate sweep: failed to query the second sub-issue page for $repo${detail:+: $detail}" >&2
+      return 5
+    fi
+    if ! jq -e '
+        (.data.repository.issues.nodes | type) == "array"
+        and (.data.repository.issues.pageInfo.hasNextPage == false)
+        and all(.data.repository.issues.nodes[];
+          .subIssues.pageInfo.hasNextPage == false)
+      ' "$work/issue-relationships-page-2.json" >/dev/null 2>&1; then
+      echo "mandate sweep: sub-issue query for $repo reached query_limit 200 or a parent reached 100 children; refusing a truncated dependency graph" >&2
+      return 6
+    fi
+    jq -cn \
+      --slurpfile first "$work/issue-relationships-response.json" \
+      --slurpfile second "$work/issue-relationships-page-2.json" \
+      '$first[0].data.repository.issues.nodes + $second[0].data.repository.issues.nodes' \
+      >"$work/issue-relationships.json"
+  else
+    jq -c '.data.repository.issues.nodes' \
+      "$work/issue-relationships-response.json" >"$work/issue-relationships.json"
+  fi
+}
+
 # The ostrom/ namespace is derived from durable work orders. Enumerate it with
 # the same bounded, fail-closed pagination used for the other complete GitHub
 # listings: a truncated branch view must not turn missing evidence into an
@@ -287,6 +338,7 @@ sweep_org() {
       issue_since="$previous_cursor"
     fi
     fetch_issues "$repo" "$issue_since" "$previous_etag" || exit $?
+    fetch_issue_relationships "$repo" || exit $?
     if [ "$sweep_mode" = "incremental" ]; then
       extract_closed_issue_ids \
         "$repo" "$work/issues.json" "$work/closed-issue-ids.json"
@@ -389,6 +441,7 @@ sweep_org() {
       --arg repo "$repo" \
       --argjson semantic_enabled "$semantic_enabled" \
       --slurpfile issues "$work/issues.json" \
+      --slurpfile relationships "$work/issue-relationships.json" \
       --slurpfile prs "$work/prs.json" '
         def failure:
           ((.conclusion // .state // "") | ascii_upcase)
@@ -414,6 +467,9 @@ sweep_org() {
           then (.closingIssuesReferences.nodes // [])
           else []
           end;
+        def issue_ref($default_repo):
+          (.repository.nameWithOwner // $default_repo)
+          + "#" + (.number | tostring);
         def dependency_refs($repo; $text):
           [
             $text
@@ -429,6 +485,7 @@ sweep_org() {
           . as $item
           | (if $type == "pr" then ($item | ci_state) else "none" end) as $ci
           | (if $type == "pr" then ($item | linked_issues) else [] end) as $linked
+          | (first($relationships[0][]? | select(.number == $item.number)) // {}) as $relation
           | (if $type == "pr" then ($item.mergeable // "") else "" end) as $mergeable
           | {
               id: ($repo + "#" + (.number | tostring)),
@@ -441,6 +498,24 @@ sweep_org() {
                 | if length > 0 then . else "(title unavailable)" end
               ),
               blocked_by: dependency_refs($repo; (.body // "")),
+              parent: (
+                if $type == "issue" and ($relation.parent // null) != null
+                then ($relation.parent | issue_ref($repo))
+                else null
+                end
+              ),
+              children: (
+                if $type == "issue"
+                then [($relation.subIssues.nodes // [])[]? | issue_ref($repo)] | unique
+                else []
+                end
+              ),
+              closes: (
+                if $type == "pr"
+                then [$linked[]? | issue_ref($repo)] | unique
+                else []
+                end
+              ),
               labels: (
                 ((.labels // []) | label_names)
                 + [$linked[]? | ((.labels // []) | label_names)[]]
@@ -2605,6 +2680,128 @@ jq -cn \
     | map(enrich)
     | sort_by(.opened, .id)
   ' >"$work/final-queue.json"
+
+# The graph is authorization-neutral. It is derived from every open roster
+# record (including excluded and tripwire items) plus supplemental queue rows;
+# the selector applies the existing mandate predicate before consulting it.
+jq -cn \
+    --slurpfile state "$work/new-state.json" \
+    --slurpfile queue "$work/final-queue.json" \
+    --slurpfile configured "$work/configured-repos.json" '
+    def repo_of: split("#")[0];
+    def expand:
+      . as $edges
+      | ($edges + [
+          $edges[] as $left
+          | $edges[] as $right
+          | select($left.item == $right.dependency)
+          | {dependency: $left.dependency, item: $right.item}
+        ])
+      | unique_by([.dependency, .item]);
+    ([$state[0].repos[].records[]? | {
+        id,
+        body_dependencies: (.blocked_by // []),
+        parent: (.parent // null),
+        children: (.children // []),
+        closes: (.closes // [])
+      }]
+      | map(. as $record
+          | .body_dependencies = ((.body_dependencies + [
+              $queue[0][]
+              | select(.id == $record.id)
+              | (.blocked_by // [])[]?
+            ]) | unique))) as $records
+    | ($records | map(.id)) as $record_ids
+    | ($records + [
+        $queue[0][]
+        | select(.id as $id | ($record_ids | index($id)) == null)
+        | {
+            id,
+            body_dependencies: (.blocked_by // []),
+            parent: null,
+            children: [],
+            closes: []
+          }
+      ] | sort_by(.id) | unique_by(.id)) as $nodes
+    | ([
+        $nodes[] as $node
+        | (
+            [$node.body_dependencies[]? | {
+              dependency: ., item: $node.id, source: "body"
+            }]
+            + [select($node.parent != null) | {
+              dependency: $node.id, item: $node.parent, source: "sub-issue"
+            }]
+            + [$node.children[]? | {
+              dependency: ., item: $node.id, source: "sub-issue"
+            }]
+            + [$node.closes[]? | {
+              dependency: $node.id, item: ., source: "pull-request"
+            }]
+          )[]
+      ]
+      | sort_by([.dependency, .item, .source])
+      | group_by([.dependency, .item])
+      | map({
+          dependency: .[0].dependency,
+          item: .[0].item,
+          sources: ([.[].source] | unique)
+        })) as $edges
+    | ($nodes | map(.id)) as $open_ids
+    | ([$edges[] as $edge
+        | select(
+            ($open_ids | index($edge.dependency)) != null
+            and ($open_ids | index($edge.item)) != null
+          )
+        | {dependency: $edge.dependency, item: $edge.item}]
+      | until((expand | length) == length; expand)) as $closure
+    | ([$closure[] | select(.dependency == .item) | .item] | unique) as $cycles
+    | ([$nodes[] as $node
+        | ([$edges[] | select(.item == $node.id) | .dependency] | unique) as $dependencies
+        | ([$dependencies[] as $dependency
+            | select(
+                ($open_ids | index($dependency)) != null
+                or (($dependency | repo_of) as $repo
+                  | ($configured[0] | index($repo)) == null)
+              )
+            | $dependency] | unique) as $unsatisfied
+        | ([$node.children[]?] | unique) as $children
+        | {
+            id: $node.id,
+            open: true,
+            dependencies: $dependencies,
+            unsatisfied: $unsatisfied,
+            children: $children,
+            dispatchable: (
+              ($unsatisfied | length) == 0
+              and ($children | length) == 0
+              and ($cycles | index($node.id)) == null
+            ),
+            unblocking_power: 0
+          }
+      ]) as $base
+    | {
+        graph_version: 1,
+        configured_repositories: ($configured[0] | sort),
+        nodes: [$base[] as $node
+          | $node + {
+              unblocking_power: ([$base[]
+                | select(.unsatisfied == [$node.id])]
+                | length)
+            }],
+        edges: $edges,
+        faults: (if ($cycles | length) == 0 then [] else [{
+          name: "dependency_cycle",
+          nodes: $cycles
+        }] end)
+      }
+  ' >"$work/dependency-graph.json"
+
+jq -r '.faults[]? | "mandate sweep: dependency graph fault \(.name): \(.nodes | join(", "))"' \
+  "$work/dependency-graph.json" >&2
+jq -c --slurpfile graph "$work/dependency-graph.json" \
+  '.dependency_graph = $graph[0]' "$work/new-state.json" >"$work/next.json"
+mv "$work/next.json" "$work/new-state.json"
 
 queue_changes="$(
   jq -n \

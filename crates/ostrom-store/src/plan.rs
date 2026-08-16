@@ -10,8 +10,8 @@ use chrono::{DateTime, Utc};
 use ostrom_core::{
     Acknowledgement, Assessment, AssessmentDraft, CheckFault, CheckStoreFault, EvaluatedCheck,
     GoalActionVerb, GoalFacts, GoalState, GoalsDocument, GoalsError, MilestoneInput, PLAN_VERSION,
-    QueueItem, ResolvedCheck, cited_fact_basis, compose_ranking, consequence, derive_goal_facts,
-    fact_table, mechanical_ranking, validate_assessment,
+    QueueItem, ResolvedCheck, WorkGraph, WorkGraphNode, cited_fact_basis, compose_ranking,
+    consequence, derive_goal_facts, fact_table, mechanical_ranking, validate_assessment,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -213,9 +213,24 @@ pub fn run_plan(
         }
     }
     let queue_documents = read_queue(&options.sweep.paths.queue_file())?;
+    let dependency_graph = read_dependency_graph(&options.sweep.paths.state.join("state.json"))?;
+    let graph_nodes = dependency_graph
+        .as_ref()
+        .into_iter()
+        .flat_map(|graph| graph.nodes.iter())
+        .map(|node| (node.id.as_str(), node))
+        .collect::<BTreeMap<_, _>>();
     let queue = queue_documents
         .iter()
-        .map(queue_item)
+        .map(|document| {
+            queue_item(
+                document,
+                graph_nodes
+                    .get(document.value()["id"].as_str().unwrap_or_default())
+                    .copied(),
+                dependency_graph.is_some(),
+            )
+        })
         .collect::<Result<Vec<_>, _>>()?;
     for milestone in &mut milestone_input {
         if let Some(item) = queue.iter().find(|item| item.id == milestone.id) {
@@ -242,6 +257,14 @@ pub fn run_plan(
             name: "check_store_fault".to_owned(),
             detail,
         });
+    }
+    if let Some(graph) = &dependency_graph {
+        faults.extend(graph.faults.iter().map(|fault| PlanFault {
+            stage: "graph".to_owned(),
+            goal: None,
+            name: fault.name.clone(),
+            detail: fault.nodes.join(", "),
+        }));
     }
     let mut plans = Vec::new();
     let mut computed = Vec::new();
@@ -470,7 +493,11 @@ fn dependency_array(item: &Value) -> Vec<String> {
         .collect()
 }
 
-fn queue_item(document: &QueueDocument) -> Result<QueueItem, PlanError> {
+fn queue_item(
+    document: &QueueDocument,
+    graph: Option<&WorkGraphNode>,
+    graph_required: bool,
+) -> Result<QueueItem, PlanError> {
     let value = document.value();
     let field = |name: &str| {
         value[name]
@@ -490,7 +517,22 @@ fn queue_item(document: &QueueDocument) -> Result<QueueItem, PlanError> {
             .filter_map(Value::as_str)
             .map(str::to_owned)
             .collect(),
+        graph_dispatchable: graph.map_or(!graph_required, |node| node.dispatchable),
+        unblocking_power: graph.map_or(0, |node| node.unblocking_power),
     })
+}
+
+fn read_dependency_graph(path: &Path) -> Result<Option<WorkGraph>, PlanError> {
+    let value: Value = serde_json::from_slice(
+        &fs::read(path).map_err(|error| PlanError::Input(error.to_string()))?,
+    )
+    .map_err(|error| PlanError::Input(error.to_string()))?;
+    value
+        .get("dependency_graph")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|error| PlanError::Input(format!("dependency graph is malformed: {error}")))
 }
 
 fn read_work_ranking(path: &Path) -> Result<Vec<String>, PlanError> {

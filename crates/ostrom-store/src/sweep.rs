@@ -6,7 +6,10 @@ use std::{
 };
 
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
-use ostrom_core::{DefaultDisposition, MandateConfig, ProjectMandate, RepositoryName, Selector};
+use ostrom_core::{
+    DefaultDisposition, MandateConfig, ProjectMandate, RepositoryName, Selector, WorkNodeInput,
+    build_work_graph,
+};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -115,6 +118,12 @@ struct NormalizedItem {
     item_type: String,
     title: String,
     blocked_by: Vec<String>,
+    #[serde(default)]
+    parent: Option<String>,
+    #[serde(default)]
+    children: Vec<String>,
+    #[serde(default)]
+    closes: Vec<String>,
     labels: Vec<String>,
     refs: Vec<u64>,
     closing_refs: Vec<u64>,
@@ -312,6 +321,12 @@ pub(crate) fn run_sweep_with_mirror(
     let before = read_queue(&options.paths.queue_file())?;
     let queue_changes = symmetric_queue_changes(&before, &final_rows);
     write_queue(&options.paths.queue_file(), &final_rows)?;
+    let graph = graph_from_state(&new_state, &final_rows, &configured);
+    for fault in &graph.faults {
+        faults.push(format!("{}: {}", fault.name, fault.nodes.join(", ")));
+    }
+    new_state["dependency_graph"] =
+        serde_json::to_value(graph).expect("work dependency graph serializes");
     write_json_private(&state_path, &new_state)?;
 
     if let PublishTarget::Repository(repository) = &options.publish {
@@ -449,6 +464,7 @@ fn acquire_repository(
     let (mut issues, issue_etag, issue_not_modified) =
         fetch_issues(repo_name, issue_since, previous_etag)?;
     issues.extend(closed_delta);
+    enrich_issue_relationships(repo_name, &mut issues)?;
 
     let open_prs = gh_json(&[
         "pr",
@@ -1008,6 +1024,30 @@ fn normalize_item(
     files.sort();
     files.dedup();
     let blocked_by = dependency_refs(repo, string_field(source, &["body"]))?;
+    let parent = issue_reference(
+        repo,
+        source.get("parent").or_else(|| source.get("parentIssue")),
+    );
+    let mut children = source
+        .get("subIssues")
+        .and_then(|value| value.get("nodes").or(Some(value)))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|child| issue_reference(repo, Some(child)))
+        .collect::<Vec<_>>();
+    children.sort();
+    children.dedup();
+    let mut closes = if item_type == "pr" {
+        linked
+            .iter()
+            .filter_map(|issue| issue_reference(repo, Some(issue)))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    closes.sort();
+    closes.dedup();
     let ci = if item_type == "pr" {
         pr_ci_state(source)
     } else {
@@ -1044,6 +1084,9 @@ fn normalize_item(
         item_type: item_type.to_owned(),
         title,
         blocked_by,
+        parent,
+        children,
+        closes,
         labels,
         refs,
         closing_refs,
@@ -2033,6 +2076,180 @@ fn linked_issues(source: &Value) -> Vec<&Value> {
             .collect(),
         _ => Vec::new(),
     }
+}
+
+fn issue_reference(default_repo: &str, issue: Option<&Value>) -> Option<String> {
+    let issue = issue?;
+    let number = number_field(issue, &["number"])?;
+    let repo = issue
+        .get("repository")
+        .and_then(|repository| nonempty_string(repository, &["nameWithOwner", "name_with_owner"]))
+        .unwrap_or(default_repo);
+    Some(format!("{repo}#{number}"))
+}
+
+fn enrich_issue_relationships(repo: &str, issues: &mut [Value]) -> Result<(), SweepError> {
+    let Some((owner, name)) = repo.split_once('/') else {
+        return Ok(());
+    };
+    let query = r#"query OstromDependencyGraph($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){issues(first:100,after:$cursor,states:OPEN){nodes{number parent{number repository{nameWithOwner}} subIssues(first:100){nodes{number state repository{nameWithOwner}} pageInfo{hasNextPage}}} pageInfo{hasNextPage endCursor}}}}"#;
+    let query_field = format!("query={query}");
+    let owner_field = format!("owner={owner}");
+    let name_field = format!("name={name}");
+    let first = gh_json(&[
+        "api",
+        "graphql",
+        "-f",
+        &query_field,
+        "-F",
+        &owner_field,
+        "-F",
+        &name_field,
+    ])?;
+    let first_connection = dependency_connection(repo, &first)?;
+    reject_truncated_children(repo, first_connection)?;
+    let mut relationships = first_connection["nodes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if first_connection["pageInfo"]["hasNextPage"].as_bool() == Some(true) {
+        let cursor = first_connection["pageInfo"]["endCursor"]
+            .as_str()
+            .filter(|cursor| !cursor.is_empty())
+            .ok_or_else(|| {
+                SweepError::Acquisition(format!(
+                    "sub-issue query for {repo} returned no second-page cursor"
+                ))
+            })?;
+        let cursor_field = format!("cursor={cursor}");
+        let second = gh_json(&[
+            "api",
+            "graphql",
+            "-f",
+            &query_field,
+            "-F",
+            &owner_field,
+            "-F",
+            &name_field,
+            "-F",
+            &cursor_field,
+        ])?;
+        let second_connection = dependency_connection(repo, &second)?;
+        reject_truncated_children(repo, second_connection)?;
+        if second_connection["pageInfo"]["hasNextPage"].as_bool() == Some(true) {
+            return Err(SweepError::Acquisition(format!(
+                "sub-issue query for {repo} reached query_limit 200; refusing a truncated dependency graph"
+            )));
+        }
+        relationships.extend(
+            second_connection["nodes"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default(),
+        );
+    }
+    for issue in issues {
+        let Some(number) = number_field(issue, &["number"]) else {
+            continue;
+        };
+        let Some(relationship) = relationships
+            .iter()
+            .find(|relationship| number_field(relationship, &["number"]) == Some(number))
+        else {
+            continue;
+        };
+        if let Some(object) = issue.as_object_mut() {
+            if let Some(parent) = relationship.get("parent") {
+                object.insert("parent".to_owned(), parent.clone());
+            }
+            if let Some(children) = relationship.get("subIssues") {
+                object.insert("subIssues".to_owned(), children.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn dependency_connection<'a>(repo: &str, response: &'a Value) -> Result<&'a Value, SweepError> {
+    response.pointer("/data/repository/issues").ok_or_else(|| {
+        SweepError::Acquisition(format!(
+            "sub-issue query for {repo} returned no issue connection"
+        ))
+    })
+}
+
+fn reject_truncated_children(repo: &str, connection: &Value) -> Result<(), SweepError> {
+    if connection
+        .get("nodes")
+        .and_then(Value::as_array)
+        .is_none_or(|nodes| {
+            nodes.iter().any(|item| {
+                item.pointer("/subIssues/pageInfo/hasNextPage")
+                    .and_then(Value::as_bool)
+                    != Some(false)
+            })
+        })
+    {
+        return Err(SweepError::Acquisition(format!(
+            "sub-issue query for {repo} was malformed or a parent reached 100 children; refusing a truncated dependency graph"
+        )));
+    }
+    Ok(())
+}
+
+fn graph_from_state(
+    state: &Value,
+    queue: &[QueueDocument],
+    configured: &BTreeSet<&str>,
+) -> ostrom_core::WorkGraph {
+    let mut inputs = state
+        .get("repos")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|repos| repos.values())
+        .filter_map(|repo| repo.get("records").and_then(Value::as_object))
+        .flat_map(|records| records.values())
+        .filter_map(|record| serde_json::from_value::<NormalizedItem>(record.clone()).ok())
+        .map(|item| WorkNodeInput {
+            id: item.id,
+            open: true,
+            body_dependencies: item.blocked_by,
+            parent: item.parent,
+            children: item.children,
+            closes: item.closes,
+        })
+        .collect::<Vec<_>>();
+    for document in queue {
+        let row = document.value();
+        let Some(id) = row["id"].as_str() else {
+            continue;
+        };
+        let dependencies = row["blocked_by"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if let Some(input) = inputs.iter_mut().find(|input| input.id == id) {
+            input.body_dependencies.extend(dependencies);
+            input.body_dependencies.sort();
+            input.body_dependencies.dedup();
+            continue;
+        }
+        inputs.push(WorkNodeInput {
+            id: id.to_owned(),
+            open: true,
+            body_dependencies: dependencies,
+            parent: None,
+            children: Vec::new(),
+            closes: Vec::new(),
+        });
+    }
+    build_work_graph(
+        &inputs,
+        &configured.iter().map(|repo| (*repo).to_owned()).collect(),
+    )
 }
 
 fn label_names(labels: Option<&Value>) -> Vec<String> {
