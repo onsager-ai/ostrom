@@ -11,6 +11,57 @@ Registration has no basis or judgment field. The reserved `agent` domain is
 rejected with `judged_domain_registration`, leaving `ostrom-core`'s domain
 derivation as the only source of basis truth.
 
+## Judged checks
+
+`agent` is resolved separately through `JudgmentRegistry`; it is not an action
+provider and cannot bypass the mechanical registry's reservation. Its verb is
+the registered harness name. The shipped proof adapter is `agent/claude`, a
+JSON-stdio executable harness whose environment is cleared before invocation.
+An absent verb returns `unregistered_harness`.
+
+The core-owned parameters are intentionally closed: `prompt`, non-empty
+`evidence: [{from: <check-id>}]`, optional `model`, and the universal
+`fresh_for`. Evidence references use the same exact catalogue namespace as
+checks. Missing references, ambiguity, self-reference, and cycles fail before
+execution.
+
+The harness request is one JSON object:
+
+```json
+{
+  "model": "opus",
+  "prompt": "is the remaining difference material",
+  "evidence": [
+    {
+      "name": "sweep-parity-diff-is-empty",
+      "digest": "sha256:...",
+      "output": {
+        "basis": "mechanical",
+        "verdict": "pass",
+        "rendered": "pass"
+      }
+    }
+  ]
+}
+```
+
+Each digest identifies the exact source receipt, including its attempt and
+timestamps. Re-running a source therefore makes an older judgment stale even
+when the source returns the same verdict. The evidence's source freshness is
+also stamped into the judged receipt, so source staleness composes directly.
+
+A successful harness response has `verdict` and a non-empty `because` array;
+each clause has `evidence` (one supplied name) and non-empty `detail`. A name
+outside the bundle returns `evidence_incomplete` and no receipt is accepted.
+An error response is recorded as an error-only receipt, so inability to
+determine a verdict is never converted to `fail`. The executor stamps harness,
+model, and version and records the exact evidence digests.
+
+Rendered judged states are always qualified (`judged pass`, `judged fail`,
+`judged stale`, or `judged never run`). Goal facts carry `basis: mechanical`
+unless a contributing `met_when` check is judged, in which case they carry
+`basis: includes_judgment`.
+
 The shipped registry contains:
 
 - `http/get`: `url` and `expect` are required; `timeout` is optional.
