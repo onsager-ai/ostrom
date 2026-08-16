@@ -2,8 +2,15 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::{Command, Output},
+    time::{Duration, Instant},
 };
 
+use chrono::{DateTime, Utc};
+use ostrom_checks::ActionRegistry;
+use ostrom_core::{
+    CHECK_STORE_SCHEMA_VERSION, Catalogue, CatalogueEnumeration, CheckDocument, CheckRun,
+    CheckRunId, CheckVerdict, RunnerStamp,
+};
 use serde_json::{Value, json};
 use tempfile::tempdir;
 
@@ -60,6 +67,52 @@ fn run(home: &Path, command: &str) -> Output {
         .current_dir(home)
         .output()
         .expect("run ostrom")
+}
+
+fn write_check_run(home: &Path, catalogue: &str, observations: &[(&str, &str)]) {
+    let enumeration = CatalogueEnumeration {
+        catalogues: vec![Catalogue {
+            document: CheckDocument::from_yaml(catalogue).expect("fixture check catalogue"),
+        }],
+        complete: true,
+    };
+    let registry = ActionRegistry::core(home.join("dist/doctor.js")).expect("core registry");
+    let completed_at = "2026-08-01T00:00:00Z";
+    let receipts = observations
+        .iter()
+        .map(|(id, observed_at)| {
+            let prepared = registry
+                .prepare(id, &enumeration)
+                .expect("fixture check resolves");
+            let observed_at = DateTime::parse_from_rfc3339(observed_at)
+                .expect("fixture observation timestamp")
+                .with_timezone(&Utc);
+            RunnerStamp {
+                resolved: prepared.resolved(),
+                attempt_id: &format!("{id}-attempt"),
+                observed_at,
+                completed_at: DateTime::parse_from_rfc3339(completed_at)
+                    .expect("fixture completion timestamp")
+                    .with_timezone(&Utc),
+            }
+            .stamp(json!({"result_version": 1, "verdict": CheckVerdict::Pass}))
+            .expect("fixture receipt")
+        })
+        .collect();
+    let run = CheckRun {
+        schema_version: CHECK_STORE_SCHEMA_VERSION,
+        run_id: CheckRunId("fixture-plan-checks".to_owned()),
+        completed_at: completed_at.to_owned(),
+        receipts,
+    };
+    fs::write(
+        home.join("check-runs.jsonl"),
+        format!(
+            "{}\n",
+            serde_json::to_string(&run).expect("serialize fixture check run")
+        ),
+    )
+    .expect("write fixture check run");
 }
 
 #[test]
@@ -152,6 +205,162 @@ acknowledgements: []
         "never_run"
     );
     assert_eq!(document["goals"][0]["facts"]["met"], false);
+}
+
+#[test]
+fn catalogue_checks_drive_met_state_and_keep_resolution_faults_named() {
+    let home = tempdir().expect("plan home");
+    configure(home.path());
+    let catalogue = r#"
+checks_version: 1
+checks:
+  fresh-pass:
+    uses: cmd/run
+    with: {script: "exit 0"}
+  never-observed:
+    uses: cmd/run
+    with: {script: "exit 0"}
+  stale-pass:
+    uses: cmd/run
+    with: {script: "exit 0"}
+  absent-provider:
+    uses: missing/observe
+    with: {}
+"#;
+    fs::write(home.path().join("checks.yaml"), catalogue).expect("write checks");
+    fs::write(
+        home.path().join("goals.yaml"),
+        r#"
+goals_version: 1
+goals:
+  - {id: fresh, intent: fresh evidence passes, state: active, met_when: [fresh-pass]}
+  - {id: never, intent: absent evidence fails closed, state: active, met_when: [fresh-pass, never-observed]}
+  - {id: stale, intent: expired evidence fails closed, state: active, met_when: [fresh-pass, stale-pass]}
+  - {id: unknown, intent: unknown names fail closed, state: active, met_when: [not-authored]}
+  - {id: unregistered, intent: absent providers fail closed, state: active, met_when: [absent-provider]}
+actions: []
+acknowledgements: []
+"#,
+    )
+    .expect("write goals");
+    write_check_run(
+        home.path(),
+        catalogue,
+        &[
+            ("fresh-pass", "2026-08-01T00:00:00Z"),
+            ("stale-pass", "2026-07-31T23:00:00Z"),
+        ],
+    );
+
+    let output = run(home.path(), "plan");
+    assert!(
+        output.status.success(),
+        "plan stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: Value =
+        serde_json::from_slice(&fs::read(home.path().join("plan.json")).expect("plan output"))
+            .expect("parse plan");
+    let goals = document["goals"].as_array().expect("goal plans");
+    let goal = |id: &str| {
+        goals
+            .iter()
+            .find(|goal| goal["id"] == id)
+            .expect("goal plan")
+    };
+
+    assert_eq!(goal("fresh")["facts"]["met"], true);
+    assert_eq!(
+        goal("fresh")["facts"]["met_when_status"][0]["state"],
+        "passing"
+    );
+    assert_eq!(goal("fresh")["facts"]["basis"], "mechanical");
+    assert_eq!(goal("never")["facts"]["met"], false);
+    assert_eq!(
+        goal("never")["facts"]["met_when_status"][1]["state"],
+        "never_run"
+    );
+    assert_eq!(goal("stale")["facts"]["met"], false);
+    assert_eq!(
+        goal("stale")["facts"]["met_when_status"][1]["state"],
+        "stale"
+    );
+    assert_eq!(
+        goal("unknown")["facts"]["met_when_status"][0]["fault"]["name"],
+        "unresolved_check"
+    );
+    assert_eq!(
+        goal("unregistered")["facts"]["met_when_status"][0]["fault"]["name"],
+        "unregistered_action"
+    );
+    assert_eq!(document["sweep"]["check_runs"], 1);
+}
+
+#[test]
+fn unreadable_catalogue_faults_every_reference_instead_of_resolving_a_subset() {
+    let home = tempdir().expect("plan home");
+    configure(home.path());
+    fs::write(
+        home.path().join("checks.yaml"),
+        "checks_version: 1\nchecks:\n  valid-check:\n    uses: cmd/run\n    with: {script: \"exit 0\"}\n",
+    )
+    .expect("write user catalogue");
+    fs::create_dir_all(home.path().join(".ostrom/checks.yaml"))
+        .expect("create unreadable catalogue fixture");
+    fs::write(
+        home.path().join("goals.yaml"),
+        "goals_version: 1\ngoals:\n  - id: guarded\n    intent: catalogue completeness is required\n    state: active\n    met_when: [valid-check]\n",
+    )
+    .expect("write goals");
+
+    let output = run(home.path(), "plan");
+    assert!(output.status.success());
+    let document: Value =
+        serde_json::from_slice(&fs::read(home.path().join("plan.json")).expect("plan output"))
+            .expect("parse plan");
+    let facts = &document["goals"][0]["facts"];
+    assert_eq!(facts["met"], false);
+    assert_eq!(
+        facts["met_when_status"][0]["fault"]["name"],
+        "check_catalog_truncated"
+    );
+}
+
+#[test]
+fn plan_prepares_but_never_executes_authored_actions() {
+    let home = tempdir().expect("plan home");
+    configure(home.path());
+    let marker = home.path().join("action-executed");
+    let script = format!("touch {}; sleep 30", marker.display());
+    fs::write(
+        home.path().join("checks.yaml"),
+        format!(
+            "checks_version: 1\nchecks:\n  out-of-band:\n    uses: cmd/run\n    with:\n      script: {}\n      timeout: 30s\n",
+            serde_json::to_string(&script).expect("quote fixture script")
+        ),
+    )
+    .expect("write checks");
+    fs::write(
+        home.path().join("goals.yaml"),
+        "goals_version: 1\ngoals:\n  - id: nonblocking\n    intent: execution stays out of band\n    state: active\n    met_when: [out-of-band]\n",
+    )
+    .expect("write goals");
+
+    let started = Instant::now();
+    let output = run(home.path(), "plan");
+    assert!(output.status.success());
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "plan waited for the 30-second action"
+    );
+    assert!(!marker.exists(), "plan executed the authored action");
+    let document: Value =
+        serde_json::from_slice(&fs::read(home.path().join("plan.json")).expect("plan output"))
+            .expect("parse plan");
+    assert_eq!(
+        document["goals"][0]["facts"]["met_when_status"][0]["state"],
+        "never_run"
+    );
 }
 
 #[cfg(unix)]
