@@ -36,6 +36,19 @@ state="$(jq -c 'if type == "object" then . else error("state is not an object") 
   echo "mandate selection: cannot read $MANDATE_STATE_FILE" >&2
   exit 4
 }
+
+# Linux caps a single argv entry at MAX_ARG_STRLEN (128KiB), independently of
+# the much larger ARG_MAX total. A real state.json is already ~900KiB, so
+# passing it through --argjson fails with "Argument list too long" — and
+# because that failure is a jq exec error rather than a queue fault, selection
+# returned zero rows and exit 0, which reads as a quiet portfolio.
+#
+# Only the node map is ever needed downstream, and it is read from a file so
+# neither it nor the state can reintroduce the limit as the portfolio grows.
+graph_file="$(mktemp)"
+trap 'rm -f "$graph_file"' EXIT
+jq -c '.dependency_graph.nodes | map({key: .id, value: .}) | from_entries' \
+  <<<"$state" >"$graph_file"
 if ! jq -e --argjson queue "$queue" --argjson config "$config" '
     .dependency_graph as $graph
     | $graph.graph_version == 1
@@ -81,7 +94,7 @@ if [ "$ranking_count" -gt 0 ]; then
   fi
 fi
 
-candidates_and_gated="$(jq -cn --argjson queue "$queue" --argjson state "$state" '
+candidates_and_gated="$(jq -cn --argjson queue "$queue" --slurpfile graph_rows "$graph_file" '
   def authorized:
     .kind != "parked"
     and .state != "deferred"
@@ -92,7 +105,7 @@ candidates_and_gated="$(jq -cn --argjson queue "$queue" --argjson state "$state"
         and (.kind | IN("tripwire", "decision"))
       )
     );
-  ($state.dependency_graph.nodes | map({key: .id, value: .}) | from_entries) as $graph
+  ($graph_rows[0]) as $graph
   | [$queue[] | select(authorized) | . + {graph: $graph[.id]}] as $authorized
   | {
       candidates: [$authorized[] | select(.graph.dispatchable) | del(.graph)],
@@ -109,17 +122,19 @@ has_plan=false
 plan_status="absent"
 plan_rejection_clause=""
 if [ -s "$MANDATE_PLAN_FILE" ]; then
-  queue_basis="$(jq -cn --argjson queue "$queue" '[
-    $queue[] | {
-      id,
-      opened,
-      kind,
-      state,
-      blocked_by: (.blocked_by // []),
-      graph_dispatchable: ($graph[.id].dispatchable // false),
-      unblocking_power: ($graph[.id].unblocking_power // 0)
-    }
-  ]' --argjson graph "$(jq -c '.dependency_graph.nodes | map({key: .id, value: .}) | from_entries' <<<"$state")")"
+  queue_basis="$(jq -cn --argjson queue "$queue" --slurpfile graph_rows "$graph_file" '
+    ($graph_rows[0]) as $graph
+    | [
+      $queue[] | {
+        id,
+        opened,
+        kind,
+        state,
+        blocked_by: (.blocked_by // []),
+        graph_dispatchable: ($graph[.id].dispatchable // false),
+        unblocking_power: ($graph[.id].unblocking_power // 0)
+      }
+    ]')"
   if jq -e \
       --argjson basis "$queue_basis" \
       --argjson ranking "$(jq '.work_ranking' <<<"$config")" \
@@ -169,10 +184,11 @@ ordered="$(
     --argjson config "$config" \
     --argjson queue "$queue" \
     --argjson candidates "$candidates" \
-    --argjson graph "$(jq -c '.dependency_graph.nodes | map({key: .id, value: .}) | from_entries' <<<"$state")" \
+    --slurpfile graph_rows "$graph_file" \
     --argjson plan_order "$plan_order" \
     --argjson has_plan "$has_plan" '
-      ($config.work_ranking) as $ranking
+      ($graph_rows[0]) as $graph
+      | ($config.work_ranking) as $ranking
       | $candidates
           | map(
               . as $candidate
