@@ -1,7 +1,9 @@
 {
-  "$comment": "Single source of truth for npm package names, platform metadata, and the release build matrix. Replace the placeholder scope before the first publish.",
-  "scope": "@ostrom-placeholder",
-  "binaryNames": ["ostrom"],
+  "$comment": "Single source of truth for npm package names, platform metadata, and the release build matrix.",
+  "scope": "@ostrom",
+  "binaryNames": [
+    "ostrom"
+  ],
   "cargoWorkspace": "Cargo.toml",
   "repositoryUrl": "git+https://github.com/onsager-ai/ostrom.git",
   "mainPackage": {
