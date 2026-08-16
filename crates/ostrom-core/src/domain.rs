@@ -171,6 +171,8 @@ pub struct ProjectMandate {
     pub reserved: Vec<u64>,
     #[serde(default)]
     pub bounce: Vec<Selector>,
+    #[serde(default)]
+    pub max_implementers_per_repository: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,6 +184,8 @@ pub struct MandateConfig {
     pub stuck_after_days: u64,
     #[serde(default)]
     pub search_roots: Vec<String>,
+    #[serde(default)]
+    pub hold_labels: Vec<String>,
     #[serde(default)]
     pub bounce_all: Vec<Selector>,
     #[serde(default)]
@@ -211,6 +215,9 @@ impl MandateConfig {
         if self.search_roots.iter().any(String::is_empty) {
             return Err(ConfigError::Invalid("search roots must not be empty"));
         }
+        if self.hold_labels.iter().any(String::is_empty) {
+            return Err(ConfigError::Invalid("hold labels must not be empty"));
+        }
         let mut repositories = std::collections::HashSet::new();
         for project in &self.projects {
             if !repositories.insert(project.repo.as_str()) {
@@ -219,6 +226,11 @@ impl MandateConfig {
             if project.reserved.contains(&0) {
                 return Err(ConfigError::Invalid(
                     "reserved refs must be positive integers",
+                ));
+            }
+            if project.max_implementers_per_repository == Some(0) {
+                return Err(ConfigError::Invalid(
+                    "max implementers per repository must be positive",
                 ));
             }
         }

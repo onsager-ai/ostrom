@@ -47,7 +47,7 @@ inside one plugin.
 - `plugins/ostrom/dist/doctor.js` — committed, zero-runtime-dependency `/ostrom:doctor` bundle
 - `crates/ostrom-core/` — pure Rust domain types and the async, substrate-neutral store port
 - `crates/ostrom-store/` — XDG paths plus legacy-compatible JSONL/file persistence
-- `crates/ostrom-cli/` — the additive phase-1 `ostrom` binary
+- `crates/ostrom-cli/` — the additive `ostrom` binary and sweep entry point
 - `repo-pointer/settings.json` — snippet to merge into each target repo's `.claude/settings.json`
 - `bootstrap.sh` — one command to make a fresh environment ostrom-aware (user-level enroll + config provisioning)
 - `LICENSE` — MIT
@@ -60,18 +60,26 @@ the installed plugin cache. Changing a skill body requires changing the
 `version` field in that same plugin's `.claude-plugin/plugin.json`. CI enforces
 this requirement per plugin so a protocol change cannot remain hidden behind
 an unchanged cache key.
-### Rust CLI (phase 1)
+### Rust CLI (phase 2)
 
-The Rust workspace is additive: systemd and the plugin still invoke the Bash
-scripts. The new reader resolves config with
+The Rust workspace remains additive: systemd and the plugin still invoke the
+Bash scripts until an operator performs the cutover. The binary resolves config with
 `ProjectDirs::from("ai", "onsager", "ostrom")` and state through the matching
 XDG state directory. Setting `OSTROM_HOME` explicitly makes both roots that
 directory, which is the hermetic test and parity surface.
 
 ```bash
 cargo run -p ostrom-cli -- queue list --format=json
-OSTROM_HOME=/path/to/ostrom-state scripts/queue-parity.sh
+OSTROM_HOME=/path/to/ostrom-state cargo run -p ostrom-cli -- sweep
 ```
+
+`ostrom sweep` authenticates once per distinct roster organization, performs
+bounded issue, open-PR, recent-merge, and default-branch CI reads, and writes
+the private queue and incremental state. Publishing is disabled unless an
+explicit typed destination is supplied with `--publish-repository owner/repo`;
+a scratch `OSTROM_HOME` can therefore never inherit the production hub target.
+The checked-in Bash sweep remains the live fallback and is not invoked by the
+Rust sweep.
 
 `ostrom migrate` moves legacy files into the XDG roots after refusing any
 unexpired named lease. It rewrites in-tree private-key paths, preserves key

@@ -10,11 +10,14 @@ publish = false
 
 [dependencies]
 async-trait.workspace = true
+chrono.workspace = true
 directories.workspace = true
 ostrom-core = { path = "../ostrom-core" }
+regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

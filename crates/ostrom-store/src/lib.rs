@@ -6,6 +6,7 @@ mod migration;
 mod pass_state;
 mod paths;
 mod queue;
+mod sweep;
 mod trace;
 
 pub use file_store::JsonlSweepStore;
@@ -14,6 +15,10 @@ pub use migration::{MigrationOutcome, migrate};
 pub use pass_state::{PassState, read_pass_state, write_pass_state};
 pub use paths::OstromPaths;
 pub use queue::{QueueDocument, list_queue_json, read_queue, write_queue};
+pub use sweep::{
+    PublishTarget, RepositorySnapshot, SweepError, SweepFixture, SweepMode, SweepOptions,
+    SweepOutcome, acquire_org_from_github, encode_org_snapshots, run_sweep,
+};
 pub use trace::{
     MalformedTraceRow, TraceAppend, TraceFactRecord, TraceRead, append_trace, read_trace,
 };
