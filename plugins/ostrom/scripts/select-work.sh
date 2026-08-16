@@ -68,19 +68,55 @@ candidates="$(jq -cn --argjson queue "$queue" '
   [$queue[] | select(dispatchable)]
 ')"
 
+# A plan is advisory and usable only for the exact queue/authorization facts
+# it observed. A stale or malformed plan cannot steer selection; the existing
+# work_ranking/dependency/age order remains the mechanical fallback.
+plan_order='[]'
+has_plan=false
+if [ -s "$MANDATE_PLAN_FILE" ]; then
+  queue_basis="$(jq -cn --argjson queue "$queue" '[
+    $queue[] | {
+      id,
+      opened,
+      kind,
+      state,
+      blocked_by: (.blocked_by // [])
+    }
+  ]')"
+  if jq -e \
+      --argjson basis "$queue_basis" \
+      --argjson ranking "$(jq '.work_ranking' <<<"$config")" \
+      --argjson candidates "$candidates" '
+        .plan_version == 1
+        and .queue_basis == $basis
+        and .ranking.work_ranking == $ranking
+        and (.ranking.ordered | type == "array")
+        and (.ranking.ordered | length) == (.ranking.ordered | unique | length)
+        and (.ranking.ordered | sort) == ($candidates | map(.id) | sort)
+      ' "$MANDATE_PLAN_FILE" >/dev/null 2>&1; then
+    plan_order="$(jq -c '.ranking.ordered' "$MANDATE_PLAN_FILE")"
+    has_plan=true
+  else
+    echo "mandate selection: stale or invalid plan.json ignored; using mechanical ranking" >&2
+  fi
+fi
+
 ordered="$(
   jq -cn \
     --argjson config "$config" \
     --argjson queue "$queue" \
-    --argjson candidates "$candidates" '
+    --argjson candidates "$candidates" \
+    --argjson plan_order "$plan_order" \
+    --argjson has_plan "$has_plan" '
       ($config.work_ranking) as $ranking
-      | if ($ranking | length) == 0 then
+      | if (($ranking | length) == 0 and ($has_plan | not)) then
           $candidates | sort_by(.opened, .id)
         else
           $candidates
           | map(
               . as $candidate
               | ($ranking | index($candidate.id)) as $rank
+              | ($plan_order | index($candidate.id)) as $plan_rank
               | ([
                   $queue[]
                   | select(.state != "deferred" and .kind != "parked")
@@ -90,7 +126,8 @@ ordered="$(
                   row: $candidate,
                   key: (
                     if $rank != null then [0, $rank, 0, $candidate.opened, $candidate.id]
-                    else [1, 0, -$unblocks, $candidate.opened, $candidate.id]
+                    elif $has_plan and $plan_rank != null then [1, $plan_rank, 0, $candidate.opened, $candidate.id]
+                    else [2, 0, -$unblocks, $candidate.opened, $candidate.id]
                     end
                   )
                 }
@@ -132,6 +169,9 @@ if [ -n "$age_first" ] && [ "$(jq -r '.id' <<<"$selected")" != "$(jq -r '.id' <<
   if [ "$ranking_position" -ge 0 ]; then
     ranking_name="work_ranking"
     ranking_position=$((ranking_position + 1))
+  elif [ "$has_plan" = true ] && [ "$(jq --arg id "$selected_id" 'index($id) != null' <<<"$plan_order")" = true ]; then
+    ranking_name="goal-plan"
+    ranking_position="$(jq --arg id "$selected_id" 'index($id) + 1' <<<"$plan_order")"
   else
     ranking_name="dependency-unblocks"
     ranking_position=0

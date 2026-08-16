@@ -6,6 +6,7 @@ mod lease;
 mod migration;
 mod pass_state;
 mod paths;
+mod plan;
 mod queue;
 mod sweep;
 mod trace;
@@ -16,6 +17,11 @@ pub use lease::{LeaseRecord, read_lease, write_lease};
 pub use migration::{MigrationOutcome, migrate};
 pub use pass_state::{PassState, read_pass_state, write_pass_state};
 pub use paths::OstromPaths;
+pub use plan::{
+    AssessmentDeriver, AssessmentInput, ExecutableAssessmentDeriver, GoalPlan, PlanDocument,
+    PlanError, PlanFault, PlanOptions, PlanRanking, PlanSweep, UnavailableAssessmentDeriver,
+    run_plan,
+};
 pub use queue::{QueueDocument, list_queue_json, read_queue, write_queue};
 pub use sweep::{
     PublishTarget, RepositorySnapshot, SweepError, SweepFixture, SweepMode, SweepOptions,
