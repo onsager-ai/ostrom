@@ -251,7 +251,6 @@ pub struct GoalFacts {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next: Option<String>,
     pub met_when_status: Vec<MetWhenStatus>,
-    pub basis: GoalBasis,
     pub impediments: Vec<Impediment>,
     pub met: bool,
 }
@@ -487,11 +486,13 @@ pub fn derive_goal_facts(
                 |check_status| MetWhenStatus {
                     check: check.clone(),
                     state: check_status.evaluation.state,
-                    rendered: check_status
-                        .evaluation
-                        .state
-                        .render(check_status.basis)
-                        .to_owned(),
+                    // A check that did not resolve has no basis, and therefore
+                    // no verdict to qualify. Rendering it as mechanical would
+                    // launder an unknown basis into a claimed one.
+                    rendered: match check_status.basis {
+                        Some(basis) => check_status.evaluation.state.render(basis).to_owned(),
+                        None => "unresolved".to_owned(),
+                    },
                     fault: check_status.evaluation.fault.clone(),
                     basis: check_status.basis,
                     observation_age_seconds: check_status.observation_age_seconds,
@@ -513,14 +514,6 @@ pub fn derive_goal_facts(
             .all(|status| status.state == CheckState::Passing && status.fault.is_none());
     GoalFacts {
         goal: goal.id.clone(),
-        basis: if met_when_status
-            .iter()
-            .any(|status| status.basis == Some(CheckBasis::Judged))
-        {
-            GoalBasis::IncludesJudgment
-        } else {
-            GoalBasis::Mechanical
-        },
         milestones,
         progress: ProgressFact {
             complete,
@@ -810,10 +803,19 @@ acknowledgements: []
     }
 
     fn resolved_as(id: &str, uses: &str) -> ResolvedCheck {
-        let document = CheckDocument::from_yaml(&format!(
-            "checks_version: 1\nchecks:\n  {id}:\n    uses: {uses}\n    with: {{}}\n"
-        ))
-        .expect("check document");
+        // A judged check must declare a prompt and at least one evidence
+        // reference, and that reference must resolve within the same
+        // catalogue. An empty `with` is a validation error for the agent
+        // domain, so the fixture supplies a mechanical producer to cite
+        // rather than skipping the rule.
+        let yaml = if uses.starts_with("agent/") {
+            format!(
+                "checks_version: 1\nchecks:\n  evidence-producer:\n    uses: fixture/observe\n    with: {{}}\n  {id}:\n    uses: {uses}\n    with:\n      prompt: is the remaining difference material\n      evidence:\n        - from: evidence-producer\n"
+            )
+        } else {
+            format!("checks_version: 1\nchecks:\n  {id}:\n    uses: {uses}\n    with: {{}}\n")
+        };
+        let document = CheckDocument::from_yaml(&yaml).expect("check document");
         let action = ActionDefinition {
             uses: uses.to_owned(),
             producer: "fixture".to_owned(),
