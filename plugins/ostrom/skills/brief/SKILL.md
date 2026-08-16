@@ -27,6 +27,12 @@ say so and stop. The optional root-level `hold_labels` list contains
 case-insensitive label globs; matching delegated work remains in the queue as
 `kind: "parked"` but is not execution debt while that label remains.
 
+The optional root-level `work_ranking` is a highest-first ordered list of
+canonical item IDs recorded by the principal. Read it as a fact, never as an
+approval or authorization change. Confirm that `state.json` records the same
+list from the last sweep and read `work_ranking_faults`; a mismatch means the
+ranking has not been swept, while a non-empty fault list names stale pointers.
+
 Read `~/.claude/ostrom/direction.md` only if it exists. Use recorded direction
 calls to note concrete conflicts with queued items. If the file is absent,
 continue with structural output. Never create it.
@@ -79,6 +85,11 @@ approval.
 ## 4. Report
 
 Lead with honest counts for all three buckets and the unclassified remainder.
+Immediately after the counts, show **Active work ranking** as the ordered item
+IDs, or `none`. Name every `work_ranking_faults` pointer beside it so stale
+direction is conspicuous rather than silently omitted. The structural buckets
+remain authorization-aware; a ranked held, reserved, tripwire, deferred, or
+otherwise unauthorized row stays in its existing bucket.
 Then show each bucket in proposed order with the resolvable
 `owner/repo#number`, title, age, aged-out state, dependency status, and concise
 rationale. End with `Could not classify: none.` or a line naming every omitted

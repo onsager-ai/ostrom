@@ -159,6 +159,13 @@ omitting it defaults to 1. This per-repository limit prevents implementer
 branches from colliding. It is independent of `MANDATE_MAX_IMPLEMENTERS`, the
 global dispatch capacity limit for shared compute and budget.
 
+The root `work_ranking` list records principal direction as highest-first
+`owner/repo#number` pointers. It reorders only delegated work that is already
+dispatchable; reserved refs, tripwires, holds, deferrals, and selector
+boundaries keep precedence. The shipped empty list preserves oldest-first
+selection exactly. A sweep exposes a pointer that no longer exists as a queue
+and state fault rather than silently dropping it.
+
 Classification precedence is reserved → shared/project bounce → excluded →
 delegated → `default`. The default is `unclassified`, which produces one
 per-repo `/ostrom:desk` triage line rather than one queue row per item; projects may

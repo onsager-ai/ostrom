@@ -195,6 +195,151 @@ if [ "$repair_protocol_line" -ge "$selection_protocol_line" ]; then
   echo "builder repair must run before queue-backed work selection" >&2
   exit 1
 fi
+
+# #221: an absent ranking is byte-for-byte the legacy delegated order. An
+# active ranking reorders only the already-dispatchable set, leaves every
+# mandate boundary intact, uses direct reverse dependency edges when the
+# recorded list is silent, and traces every departure from age order.
+selection_fixture="$fixture/work-ranking"
+selection_data="$selection_fixture/config/ostrom"
+mkdir -p "$selection_data" "$selection_fixture/repo"
+cat >"$selection_data/mandates.yaml" <<'YAML'
+provider: file
+cadence_hours: 1
+stuck_after_days: 7
+bounce_all: []
+projects:
+  - repo: example-org/ranking-repo
+    delegated: []
+    excluded: []
+    reserved: []
+    default: delegated
+    paused: false
+    bounce: []
+YAML
+cat >"$selection_data/queue.jsonl" <<'JSONL'
+{"id":"example-org/ranking-repo#1","repo":"example-org/ranking-repo","ref":"#1","title":"Old delegated item","kind":"moved","mandate":{"reason":"delegated"},"state":"pending","opened":"2026-07-01T00:00:00Z","blocked_by":[]}
+{"id":"example-org/ranking-repo#2","repo":"example-org/ranking-repo","ref":"#2","title":"New ranked item","kind":"stuck","mandate":{"reason":"delegated"},"state":"pending","opened":"2026-07-10T00:00:00Z","blocked_by":[]}
+{"id":"example-org/ranking-repo#3","repo":"example-org/ranking-repo","ref":"#3","title":"Direct unblocker","kind":"moved","mandate":{"reason":"delegated"},"state":"pending","opened":"2026-07-20T00:00:00Z","blocked_by":[]}
+{"id":"example-org/ranking-repo#4","repo":"example-org/ranking-repo","ref":"#4","title":"Equal-age leaf","kind":"moved","mandate":{"reason":"delegated"},"state":"pending","opened":"2026-07-20T00:00:00Z","blocked_by":[]}
+{"id":"example-org/ranking-repo#10","repo":"example-org/ranking-repo","ref":"#10","title":"Pending tripwire","kind":"tripwire","mandate":{"reason":"tripwire"},"state":"pending","opened":"2026-06-01T00:00:00Z","blocked_by":[]}
+{"id":"example-org/ranking-repo#11","repo":"example-org/ranking-repo","ref":"#11","title":"Held work","kind":"parked","mandate":{"reason":"hold label"},"state":"pending","opened":"2026-06-02T00:00:00Z","blocked_by":[]}
+{"id":"example-org/ranking-repo#12","repo":"example-org/ranking-repo","ref":"#12","title":"Reserved ref","kind":"decision","mandate":{"reason":"reserved ref:#12"},"state":"pending","opened":"2026-06-03T00:00:00Z","blocked_by":[]}
+{"id":"example-org/ranking-repo#13","repo":"example-org/ranking-repo","ref":"#13","title":"Otherwise unauthorized","kind":"decision","mandate":{"reason":"default:unclassified"},"state":"pending","opened":"2026-06-04T00:00:00Z","blocked_by":[]}
+{"id":"example-org/ranking-repo#14","repo":"example-org/ranking-repo","ref":"#14","title":"Principal deferred","kind":"moved","mandate":{"reason":"delegated"},"state":"deferred","opened":"2026-06-05T00:00:00Z","blocked_by":[]}
+{"id":"example-org/ranking-repo#20","repo":"example-org/ranking-repo","ref":"#20","title":"Work blocked by three","kind":"moved","mandate":{"reason":"delegated"},"state":"pending","opened":"2026-07-21T00:00:00Z","blocked_by":["example-org/ranking-repo#3"]}
+JSONL
+
+legacy_selection="$selection_fixture/legacy.jsonl"
+jq -sc '
+  map(select(
+    .kind != "parked"
+    and .state != "deferred"
+    and ((.kind | IN("moved", "stuck"))
+      or (.state == "approved" and (.kind | IN("tripwire", "decision"))))
+  ))
+  | sort_by(.opened, .id)[]
+' "$selection_data/queue.jsonl" >"$legacy_selection"
+(
+  cd "$selection_fixture/repo"
+  CLAUDE_CONFIG_DIR="$selection_fixture/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/select-work.sh" list
+) >"$selection_fixture/no-ranking.jsonl"
+cmp "$legacy_selection" "$selection_fixture/no-ranking.jsonl"
+
+cat >"$selection_data/mandates.yaml" <<'YAML'
+provider: file
+cadence_hours: 1
+stuck_after_days: 7
+work_ranking:
+  - example-org/ranking-repo#10
+  - example-org/ranking-repo#11
+  - example-org/ranking-repo#12
+  - example-org/ranking-repo#13
+  - example-org/ranking-repo#99
+  - example-org/ranking-repo#2
+bounce_all: []
+projects:
+  - repo: example-org/ranking-repo
+    delegated: []
+    excluded: []
+    reserved: []
+    default: delegated
+    paused: false
+    bounce: []
+YAML
+cat >"$selection_data/state.json" <<'JSON'
+{"version":2,"work_ranking":["example-org/ranking-repo#10","example-org/ranking-repo#11","example-org/ranking-repo#12","example-org/ranking-repo#13","example-org/ranking-repo#99","example-org/ranking-repo#2"],"work_ranking_faults":[],"repos":{"example-org/ranking-repo":{"records":{"example-org/ranking-repo#1":{},"example-org/ranking-repo#2":{},"example-org/ranking-repo#3":{},"example-org/ranking-repo#4":{},"example-org/ranking-repo#10":{},"example-org/ranking-repo#11":{},"example-org/ranking-repo#12":{},"example-org/ranking-repo#13":{},"example-org/ranking-repo#14":{},"example-org/ranking-repo#20":{},"example-org/ranking-repo#99":{}}}}}
+JSON
+(
+  cd "$selection_fixture/repo"
+  CLAUDE_CONFIG_DIR="$selection_fixture/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/select-work.sh" list
+) >"$selection_fixture/ranked.jsonl"
+jq -s -e '
+  map(.id) == [
+    "example-org/ranking-repo#2",
+    "example-org/ranking-repo#3",
+    "example-org/ranking-repo#1",
+    "example-org/ranking-repo#4",
+    "example-org/ranking-repo#20"
+  ]
+  and all(.[];
+    .id != "example-org/ranking-repo#10"
+    and .id != "example-org/ranking-repo#11"
+    and .id != "example-org/ranking-repo#12"
+    and .id != "example-org/ranking-repo#13"
+    and .id != "example-org/ranking-repo#14"
+    and .id != "example-org/ranking-repo#99"
+  )
+' "$selection_fixture/ranked.jsonl" >/dev/null
+
+(
+  cd "$selection_fixture/repo"
+  CLAUDE_CONFIG_DIR="$selection_fixture/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/select-work.sh" select builder-ranking-wake1
+) >"$selection_fixture/selected-ranked.json"
+(
+  cd "$selection_fixture/repo"
+  CLAUDE_CONFIG_DIR="$selection_fixture/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/select-work.sh" select builder-ranking-wake1 \
+      example-org/ranking-repo#2
+) >"$selection_fixture/selected-unblocker.json"
+jq -e '.id == "example-org/ranking-repo#2"' "$selection_fixture/selected-ranked.json" >/dev/null
+jq -e '.id == "example-org/ranking-repo#3"' "$selection_fixture/selected-unblocker.json" >/dev/null
+jq -s -e '
+  map(.kind) == ["work-ranked", "work-ranked"]
+  and .[0].fact.ranking == "work_ranking"
+  and .[0].fact.ranking_position == 6
+  and .[0].fact.selected == "example-org/ranking-repo#2"
+  and .[0].fact.displaced == "example-org/ranking-repo#1"
+  and .[1].fact.ranking == "dependency-unblocks"
+  and .[1].fact.selected == "example-org/ranking-repo#3"
+  and .[1].fact.displaced == "example-org/ranking-repo#1"
+' "$selection_data/sprint.jsonl" >/dev/null
+
+# A swept stale pointer is a reported fault, never a silent omission.
+cat >"$selection_data/mandates.yaml" <<'YAML'
+work_ranking:
+  - example-org/ranking-repo#404
+bounce_all: []
+projects: []
+YAML
+cat >"$selection_data/state.json" <<'JSON'
+{"version":2,"work_ranking":["example-org/ranking-repo#404"],"work_ranking_faults":["example-org/ranking-repo#404"],"repos":{}}
+JSON
+set +e
+(
+  cd "$selection_fixture/repo"
+  CLAUDE_CONFIG_DIR="$selection_fixture/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/select-work.sh" list
+) >"$selection_fixture/stale.out" 2>"$selection_fixture/stale.err"
+stale_selection_status=$?
+set -e
+[ "$stale_selection_status" -eq 4 ]
+grep -Fq 'stale work_ranking item example-org/ranking-repo#404 no longer exists' \
+  "$selection_fixture/stale.err"
+
 if grep -nE 'push .*(--force|-f )|rebase|reset --hard' "$repair_script"; then
   echo "published PR repair must preserve the reviewed history" >&2
   exit 1
@@ -4112,6 +4257,7 @@ jq -e '
   and .search_roots == ["/placeholder/repo-root"]
   and .bounce_all == ["label:repo-boundary"]
   and .hold_labels == []
+  and .work_ranking == []
   and .projects[0].repo == "example-org/example-repo"
   and .projects[0].delegated == ["label:user-scope"]
   and .projects[0].excluded == ["type:docs"]
@@ -7575,6 +7721,7 @@ git -C "$hold_source" remote add origin \
   https://github.com/example-org/hold-repo.git
 write_hold_config() {
   hold_pattern="$1"
+  ranked_item="${2:-}"
   if [ "$hold_pattern" = absent ]; then
     hold_config_line=""
   elif [ "$hold_pattern" = empty ]; then
@@ -7583,11 +7730,18 @@ write_hold_config() {
     hold_config_line="hold_labels:
   - $hold_pattern"
   fi
+  if [ -n "$ranked_item" ]; then
+    work_ranking_line="work_ranking:
+  - $ranked_item"
+  else
+    work_ranking_line="work_ranking: []"
+  fi
   cat >"$hold/config/ostrom/mandates.yaml" <<YAML
 stuck_after_days: 1
 search_roots:
   - $hold_search_root
 $hold_config_line
+$work_ranking_line
 bounce_all: []
 projects:
   - repo: example-org/hold-repo
@@ -7680,6 +7834,23 @@ jq -s -e '
   and .[0].mandate.reason == "hold label status:*"
   and ([.[] | select(.kind == "stuck")] | length) == 0
 ' "$hold_queue" >/dev/null
+
+# The shell sweep reads the same durable ranking as the selector. A pointer
+# absent from the successfully acquired open-item records persists as a drift
+# fault and is copied into state for both the builder and brief.
+write_hold_config 'status:*' 'example-org/hold-repo#404'
+run_hold_sweep '2026-08-08T00:00:00Z' parked
+jq -s -e '
+  any(.[];
+    .id == "example-org/hold-repo#404"
+    and .kind == "drift"
+    and .mandate.reason
+      == "work_ranking item no longer exists: example-org/hold-repo#404")
+' "$hold_queue" >/dev/null
+jq -e '
+  .work_ranking == ["example-org/hold-repo#404"]
+  and .work_ranking_faults == ["example-org/hold-repo#404"]
+' "$hold_state" >/dev/null
 
 # #146: semantic derivation is a fixture-backed port beside the unchanged
 # mechanical verdict. The fixture deliberately obeys hostile body text for #3

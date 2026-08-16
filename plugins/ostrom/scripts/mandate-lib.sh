@@ -174,7 +174,7 @@ mandate_is_configured() {
 
 # Parse the deliberately small shipped schema without pretending to be a
 # general YAML parser. Supported input:
-#   root scalars; bounce_all:/hold_labels:/search_roots: followed by two-space list items; projects:
+#   root scalars; bounce_all:/hold_labels:/work_ranking:/search_roots: followed by two-space list items; projects:
 #   followed by "- repo:" entries, each with default + paused scalars, an
 #   optional max_implementers_per_repository positive integer, and six-space
 #   delegated/excluded/reserved/bounce lists.
@@ -232,6 +232,11 @@ mandate_yaml_to_json() {
           print "array\thold_labels"
         } else if (text == "hold_labels: []") {
           print "array\thold_labels"
+        } else if (text == "work_ranking:") {
+          section = "work_ranking"
+          print "array\twork_ranking"
+        } else if (text == "work_ranking: []") {
+          print "array\twork_ranking"
         } else if (text == "search_roots:") {
           section = "search_roots"
           print "array\tsearch_roots"
@@ -271,6 +276,15 @@ mandate_yaml_to_json() {
         value = unquote(value)
         if (value == "") fail("empty hold_labels entry")
         else print "hold_label\t" value
+        next
+      }
+
+      if (section == "work_ranking" && indent == 2 && text ~ /^-[[:space:]]+/) {
+        value = text
+        sub(/^-[[:space:]]+/, "", value)
+        value = unquote(value)
+        if (value == "") fail("empty work_ranking entry")
+        else print "work_rank\t" value
         next
       }
 
@@ -360,6 +374,8 @@ mandate_yaml_to_json() {
             .bounce_all += [$parts[1]]
           elif $parts[0] == "hold_label" then
             .hold_labels += [$parts[1]]
+          elif $parts[0] == "work_rank" then
+            .work_ranking += [$parts[1]]
           elif $parts[0] == "search_root" then
             .search_roots += [$parts[1]]
           elif $parts[0] == "project" then
@@ -413,7 +429,7 @@ mandate_load_config() {
       --argjson shipped "$shipped" \
       --argjson user "$user" \
       --argjson repo "$repo" \
-      '$shipped * $user * $repo | .hold_labels //= []'
+      '$shipped * $user * $repo | .hold_labels //= [] | .work_ranking //= []'
   )" || return
 
   if ! jq -e '
@@ -422,6 +438,12 @@ mandate_load_config() {
     and (.stuck_after_days | type == "number" and . >= 0)
     and (.bounce_all | type == "array" and all(.[]; type == "string" and length > 0))
     and (.hold_labels | type == "array" and all(.[]; type == "string" and length > 0))
+    and (.work_ranking | type == "array"
+      and all(.[];
+        type == "string"
+        and test("^[^/[:space:]#]+/[^/[:space:]#]+#[1-9][0-9]*$")
+      )
+      and length == (unique | length))
     and (.search_roots | type == "array" and all(.[]; type == "string" and length > 0))
     and (.projects | type == "array")
     and all(.projects[];
@@ -437,7 +459,7 @@ mandate_load_config() {
     )
     and (([.projects[].repo] | length) == ([.projects[].repo] | unique | length))
   ' >/dev/null <<<"$config"; then
-    echo "mandate: invalid config; provider must be file, cadence_hours a positive integer, hold_labels and search_roots non-empty strings, and every project must have a unique owner/name repo, valid default, boolean paused value, selector lists, positive integer reserved refs, and an optional positive max_implementers_per_repository" >&2
+    echo "mandate: invalid config; provider must be file, cadence_hours a positive integer, hold_labels and search_roots non-empty strings, work_ranking unique owner/repo#N item IDs, and every project must have a unique owner/name repo, valid default, boolean paused value, selector lists, positive integer reserved refs, and an optional positive max_implementers_per_repository" >&2
     return 2
   fi
 

@@ -7,8 +7,8 @@
 # Mandate content is private. This file ships mechanism defaults only; put
 # the real roster and its boundaries in the user layer. The parser supports
 # this intentionally small schema: root scalars, bounce_all, hold_labels,
-# search_roots, and projects containing selector lists, default and paused
-# scalars, and an optional per-repository implementer collision cap.
+# work_ranking, search_roots, and projects containing selector lists, default
+# and paused scalars, and an optional per-repository implementer collision cap.
 
 provider: file
 cadence_hours: 1
@@ -22,6 +22,11 @@ search_roots: []
 # Label globs that mechanically park otherwise delegated items. Matching is
 # case-insensitive and uses the same * wildcard as label: selectors.
 hold_labels: []
+
+# Principal-authored ordering over already-dispatchable delegated work. Entries
+# are canonical owner/repository#number item IDs in highest-first order. This
+# cannot widen a mandate or cross a hold; an empty list preserves oldest-first.
+work_ranking: []
 
 # Shared write-surface tripwires. Selectors are case-insensitive qualified
 # globs. A more-specific layer may replace this list.
