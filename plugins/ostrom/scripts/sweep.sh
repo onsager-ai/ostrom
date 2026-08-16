@@ -278,7 +278,7 @@ sweep_org() {
     mv "$work/open-prs.json" "$work/prs.json"
     if ! gh pr list --repo "$repo" --state merged \
       --search "merged:>=$merge_cutoff" --limit "$query_limit" \
-      --json number,title,createdAt,mergedAt,headRefOid \
+      --json number,title,author,closingIssuesReferences,createdAt,mergedAt,headRefOid \
       >"$work/merged-prs.json" 2>"$gh_error"; then
       detail="$(tr '\n' ' ' <"$gh_error")"
       echo "mandate sweep: failed to query recent merged PR heads for $repo${detail:+: $detail}" >&2
@@ -1341,16 +1341,19 @@ sweep_org() {
       mv "$work/next.json" "$work/analysis.json"
     fi
 
-    # #147: a merge with no timely passing verdict is a fault observed after
-    # the fact. The recent merged-PR response above, retained merge state,
-    # gate.jsonl, and exceptions.jsonl are already in hand; this is deliberately
-    # only a local join. Faults use ordinary decision rows, so they can be
-    # explained, deferred, or otherwise handled without changing merge
-    # behaviour.
+    # #147/#208: a merge with no timely passing verdict is a fault observed
+    # after the fact, but only once verdict recording existed for this
+    # repository and only when the merged work belonged to the loop. The floor
+    # comes from the repository's earliest gate record; machine authorship and
+    # closing work-order references are retained from the merged PR itself.
+    # This remains a local join over append-only evidence. A surviving fault is
+    # operational evidence, not a choice the principal can approve into being
+    # correct, so it has its own non-judgment queue kind.
     jq -cn \
       --arg repo "$repo" \
       --arg sweep_started "$sweep_started" \
       --argjson stuck_after_days "$(jq '.stuck_after_days' "$work/config.json")" \
+      --argjson gate_read_degraded "$(jq '.degraded' "$work/gate-records-status.json")" \
       --slurpfile merged "$work/merged-prs.json" \
       --slurpfile gate "$work/gate-records.json" \
       --slurpfile exceptions "$work/exception-records.json" \
@@ -1358,6 +1361,8 @@ sweep_org() {
       def timestamp_before($candidate; $boundary):
         try (($candidate | fromdateiso8601) < ($boundary | fromdateiso8601))
         catch false;
+      def timestamp_fact($candidate):
+        try {ts: $candidate, epoch: ($candidate | fromdateiso8601)} catch empty;
       def age_days($opened):
         try (
           ((($sweep_started | fromdateiso8601) - ($opened | fromdateiso8601)) / 86400 | floor)
@@ -1372,6 +1377,24 @@ sweep_org() {
         else
           "merge gate fault: pass recorded after merge for head " + $fault.head_sha
         end;
+      def closing_refs($pr):
+        (if (($pr.closingIssuesReferences // null) | type) == "array"
+         then $pr.closingIssuesReferences
+         elif (($pr.closingIssuesReferences // null) | type) == "object"
+         then ($pr.closingIssuesReferences.nodes // [])
+         else []
+         end)
+        | [ .[]? | .number // empty
+            | select(type == "number" and . > 0 and . == floor) ]
+        | unique;
+      def author_login($pr):
+        if (($pr.author.login // null) | type) == "string"
+        then $pr.author.login
+        else ""
+        end;
+      def machine_authored($pr):
+        (($pr.author.is_bot // false) == true)
+        or (author_login($pr) | endswith("[bot]"));
       (reduce $gate[0][] as $record ({};
         if (($record.head_sha // null) | type) == "string"
             and ($record.head_sha | length) > 0
@@ -1379,6 +1402,13 @@ sweep_org() {
         else .
         end
       )) as $gate_by_sha
+      | ([
+          $gate[0][]
+          | select((.pr // null) | type == "string")
+          | select(.pr | startswith($repo + "#"))
+          | select((.verdict // "") | IN("pass", "fail", "inconclusive"))
+          | timestamp_fact(.ts // "")
+        ] | if length > 0 then min_by(.epoch).ts else null end) as $recorded_floor
       | ($previous[0].merge_gate_merges // {}) as $known_merges
       | (reduce $merged[0][] as $pr ($known_merges;
           select(($pr.number | type) == "number")
@@ -1393,13 +1423,35 @@ sweep_org() {
               ),
               created_at: ($pr.createdAt // $pr.mergedAt // $sweep_started),
               merged_at: ($pr.mergedAt // ""),
-              head_sha: ($pr.headRefOid // "")
+              head_sha: ($pr.headRefOid // ""),
+              machine_authored: machine_authored($pr),
+              machine_author: (
+                if machine_authored($pr) then {
+                  login: author_login($pr),
+                  is_bot: (($pr.author.is_bot // false) == true)
+                } else null end
+              ),
+              work_order_refs: [closing_refs($pr)[] | $repo + "#" + tostring]
             }
         )) as $merges
+      | (if $gate_read_degraded
+         then ($recorded_floor // $previous[0].merge_gate_floor // null)
+         else $recorded_floor
+         end) as $verdict_floor
       | [
           $merges[]
           | select((.merged_at | type) == "string" and (.merged_at | length) > 0)
           | . as $merge
+          | select(
+              $merge.machine_authored
+              or (($merge.work_order_refs // []) | length) > 0
+            )
+          | select(
+              if $verdict_floor != null
+              then timestamp_before($merge.merged_at; $verdict_floor) | not
+              else $gate_read_degraded
+              end
+            )
           | ($gate_by_sha[$merge.head_sha] // []) as $records
           | ([$records[] | select(
               .verdict == "pass"
@@ -1438,8 +1490,19 @@ sweep_org() {
             ] | last // null) as $exception
           | $merge + $violation + {
               exception: $exception,
-              fingerprint: ([$violation.shape, $merge.head_sha,
-                $violation.verdict, ($violation.gate_ts // "")] | join("|"))
+              scope_evidence: {
+                basis: ([
+                  if $merge.machine_authored then "machine_authorship" else empty end,
+                  if (($merge.work_order_refs // []) | length) > 0
+                  then "work_order" else empty end
+                ]),
+                machine_author: $merge.machine_author,
+                work_order_refs: ($merge.work_order_refs // [])
+              },
+              fingerprint: (["scope-v1", $violation.shape, $merge.head_sha,
+                $violation.verdict, ($violation.gate_ts // ""),
+                ($merge.machine_authored | tostring),
+                (($merge.work_order_refs // []) | join(","))] | join("|"))
             }
         ] as $violations
       | ([$violations[] | select(.exception == null)]) as $faults
@@ -1456,13 +1519,16 @@ sweep_org() {
                 repo: $repo,
                 ref: ("#" + ($fault.number | tostring)),
                 title: $fault.title,
-                kind: "decision",
-                mandate: {reason: reason($fault)},
+                kind: "merge-gate-fault",
+                mandate: {
+                  reason: reason($fault),
+                  scope_evidence: $fault.scope_evidence
+                },
                 state: "pending",
                 opened: $fault.merged_at,
                 age_days: $age,
                 aged_out: ($age >= $stuck_after_days),
-                needs_judgment: true,
+                needs_judgment: false,
                 blocked_by: []
               }
           ],
@@ -1484,6 +1550,7 @@ sweep_org() {
               head_sha: $fault.head_sha,
               verdict: $fault.verdict,
               gate_ts: $fault.gate_ts,
+              scope_evidence: $fault.scope_evidence,
               fingerprint: $fault.fingerprint
             }
           )),
@@ -1493,6 +1560,7 @@ sweep_org() {
               reason: $item.exception.reason
             }
           )),
+          floor: $verdict_floor,
           fault_count: ($faults | length)
         }
       ' >"$work/merge-gate.json"
@@ -1802,6 +1870,7 @@ sweep_org() {
               + {
                   ci_drift: $ci_drift[0].state,
                   merge_gate_merges: $merge_gate[0].merges,
+                  merge_gate_floor: $merge_gate[0].floor,
                   merge_gate_faults: $merge_gate[0].faults,
                   merge_gate_excuses: $merge_gate[0].excuses,
                   merge_gate_fault_count: $merge_gate[0].fault_count,
@@ -1943,11 +2012,13 @@ cp "$work/old-state.json" "$work/new-state.json"
 # reported but cannot turn this detective check into a failed sweep; treating
 # unreadable verdicts as absent keeps the possible faults visible.
 printf '%s\n' '[]' >"$work/gate-records.json"
+printf '%s\n' '{"degraded":false}' >"$work/gate-records-status.json"
 if [ -s "$MANDATE_GATE_LOG" ]; then
   if ! jq -s '[.[] | select(type == "object")]' "$MANDATE_GATE_LOG" \
       >"$work/gate-records.json" 2>/dev/null; then
     echo "mandate sweep: could not read $MANDATE_GATE_LOG; merge gate faults will be classified as having no verdict" >&2
     printf '%s\n' '[]' >"$work/gate-records.json"
+    printf '%s\n' '{"degraded":true}' >"$work/gate-records-status.json"
   fi
 fi
 printf '%s\n' '[]' >"$work/exception-records.json"

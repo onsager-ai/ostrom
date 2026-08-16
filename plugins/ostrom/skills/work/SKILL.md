@@ -135,6 +135,10 @@ rather than guessing.
 re-escalate it — re-raising a deferred item is noise, not diligence. Only a
 `pending` tripwire or reserved ref is genuinely the owner's call.
 
+`merge-gate-fault` rows are detective evidence about an already-merged pull
+request. Report them as operational faults, but never select or dispatch them
+as new implementation work and never ask the principal to approve them.
+
 If the `/ostrom:work` invocation includes an optional focus, use that direct
 invocation input as a natural-language filter over the queue, such as `one
 repository only` or `just tripwires`. Otherwise take items in this order:

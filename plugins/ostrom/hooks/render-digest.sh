@@ -210,6 +210,7 @@ render_section "DECISIONS WAITING" '["tripwire","decision"]'
 render_section "MOVED SINCE $cursor" '["moved"]'
 render_section "STUCK" '["stuck"]'
 render_section "DRIFT" '["drift"]'
+render_section "MERGE GATE FAULTS" '["merge-gate-fault"]'
 parked_count="$(jq '[.[] | select(.kind == "parked")] | length' <<<"$active")"
 [ "$parked_count" -eq 0 ] || echo "$parked_count parked"
 
@@ -278,7 +279,7 @@ troubled_projects="$(
   jq --argjson unresolvable "$unresolvable_repositories" '
     ([
        .[]
-       | select(.kind | IN("tripwire", "decision", "drift", "stuck"))
+       | select(.kind | IN("tripwire", "decision", "drift", "stuck", "merge-gate-fault"))
        | .repo
      ] + $unresolvable)
     | unique

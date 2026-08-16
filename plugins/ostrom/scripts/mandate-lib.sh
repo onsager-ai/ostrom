@@ -810,7 +810,7 @@ mandate_read_queue() {
       and (.id | type == "string")
       and (.repo | type == "string")
       and (.ref | type == "string" and test("^#[0-9]+$"))
-      and (.kind | IN("tripwire", "decision", "moved", "stuck", "drift", "parked"))
+      and (.kind | IN("tripwire", "decision", "moved", "stuck", "drift", "parked", "merge-gate-fault"))
       and (.state | IN("pending", "approved", "deferred"))
       and (.opened | type == "string")
       and (

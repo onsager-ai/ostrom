@@ -42,8 +42,10 @@ jq '.repos[] | {notice, unclassified, scope_changes}' \
 Each JSON row is a pointer with `id`, `repo`, `ref`, `title`, `kind`,
 `mandate`, `state`, and `opened`, plus sweep facts when available: `age_days`,
 `aged_out`, `needs_judgment`, and `blocked_by`. Present pending and deferred items
-in this order: tripwire/decision, moved, stuck, drift, parked. Parked rows are
-informational holds, not approvable dispatch candidates. Keep the resolvable
+in this order: tripwire/decision, moved, stuck, drift, merge-gate-fault,
+parked. Merge-gate-fault rows are operational evidence from the detective
+merge check, not decisions the principal can approve into correctness. Parked
+rows are informational holds, not approvable dispatch candidates. Keep the resolvable
 `owner/repo#number` and its title visible. For a tripwire, include all four
 fields from `mandate.dossier`: Question, Options ruled out, Recommended
 action, and Blast radius. Do not fetch or copy an issue or PR body into the
