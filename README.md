@@ -88,6 +88,25 @@ and pre-1.0 semver policy are documented in
 
 ## Install
 
+### CLI (primary)
+
+The primary CLI distribution is npm. The public package name is intentionally
+pending registration; once selected, install it with:
+
+```sh
+npm install --global <npm-package-name>
+ostrom --version
+```
+
+The npm package is a thin launcher around a platform-specific optional
+dependency. The compiled binary is already inside that dependency: installation
+does not download or modify an executable with a lifecycle script. Prebuilt
+packages cover Linux x64/arm64, macOS x64/arm64, and Windows x64.
+
+For a source checkout, `cargo install --path crates/ostrom-cli` is the fallback.
+
+### Claude Code plugin
+
 ```
 /plugin marketplace add onsager-ai/ostrom
 /plugin install ostrom@ostrom
