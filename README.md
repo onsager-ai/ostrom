@@ -71,6 +71,7 @@ directory, which is the hermetic test and parity surface.
 ```bash
 cargo run -p ostrom-cli -- queue list --format=json
 OSTROM_HOME=/path/to/ostrom-state cargo run -p ostrom-cli -- sweep
+OSTROM_HOME=/path/to/ostrom-state cargo run -p ostrom-cli -- plan
 ```
 
 `ostrom sweep` authenticates once per distinct roster organization, performs
@@ -80,6 +81,15 @@ explicit typed destination is supplied with `--publish-repository owner/repo`;
 a scratch `OSTROM_HOME` can therefore never inherit the production hub target.
 The checked-in Bash sweep remains the live fallback and is not invoked by the
 Rust sweep.
+
+`ostrom plan` runs that same sweep first, then strictly reads `goals.yaml`,
+mirrors durable check receipts, derives goal facts, and writes private
+`plan.json` plus its acknowledgement ledger. Semantic assessment is an
+explicit executable port named by `OSTROM_PLAN_DERIVER`; when it is absent or
+returns an invalid/uncited result, the plan records a visible fault and keeps a
+mechanical authorization-preserving ranking. The builder selector consumes a
+plan only when its queue basis and principal `work_ranking` still match,
+otherwise it visibly falls back to the existing ordering.
 
 `ostrom migrate` moves legacy files into the XDG roots after refusing any
 unexpired named lease. It rewrites in-tree private-key paths, preserves key

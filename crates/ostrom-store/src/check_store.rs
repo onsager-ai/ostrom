@@ -47,6 +47,11 @@ impl JsonlCheckStore {
         contents.lines().map(Self::decode_record).collect()
     }
 
+    /// Read a point-in-time snapshot for consumers such as the plan pass.
+    pub fn snapshot(&self) -> Result<Vec<CheckRun>, CheckStoreFault> {
+        self.read_records()
+    }
+
     fn find_record(&self, run_id: &CheckRunId) -> Result<Option<CheckRun>, CheckStoreFault> {
         if !self.journal.exists() {
             return Ok(None);

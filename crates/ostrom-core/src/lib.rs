@@ -13,6 +13,7 @@
 
 mod check;
 mod domain;
+mod plan;
 mod store;
 
 #[cfg(feature = "conformance")]
@@ -27,6 +28,14 @@ pub use check::{
 pub use domain::{
     ConfigError, DefaultDisposition, GateConfig, GateProject, Mandate, MandateConfig,
     ProjectMandate, RepositoryName, Role, Selector, SelectorError, Verdict,
+};
+pub use plan::{
+    Acknowledgement, AcknowledgementResponse, Assessment, AssessmentDraft, AssessmentError,
+    Because, Consequence, EvaluatedCheck, GOALS_VERSION, Goal, GoalAction, GoalActionVerb,
+    GoalFacts, GoalService, GoalState, GoalsDocument, GoalsError, Impediment, MetWhenStatus,
+    MilestoneFact, MilestoneInput, MovementFact, PLAN_VERSION, ProgressFact, QueueItem, Reading,
+    cited_fact_basis, compose_ranking, consequence, derive_goal_facts, fact_table,
+    mechanical_ranking, validate_assessment,
 };
 pub use store::{
     AttemptOutcome, CHECK_STORE_SCHEMA_VERSION, CheckRun, CheckRunId, CheckStore, CheckStoreFault,

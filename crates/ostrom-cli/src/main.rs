@@ -10,8 +10,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use directories::BaseDirs;
 use ostrom_core::RepositoryName;
 use ostrom_store::{
-    MigrationOutcome, OstromPaths, PublishTarget, SweepMode, SweepOptions, acquire_org_from_github,
-    encode_org_snapshots, list_queue_json, migrate, run_sweep,
+    ExecutableAssessmentDeriver, MigrationOutcome, OstromPaths, PlanOptions, PublishTarget,
+    SweepMode, SweepOptions, UnavailableAssessmentDeriver, acquire_org_from_github,
+    encode_org_snapshots, list_queue_json, migrate, run_plan, run_sweep,
 };
 
 #[derive(Debug, Parser)]
@@ -45,6 +46,18 @@ enum Command {
         #[arg(long, hide = true)]
         inner_org: Option<String>,
         /// One clock shared by every organization worker.
+        #[arg(long, hide = true)]
+        started_at: Option<String>,
+    },
+    /// Reconcile the portfolio, assess authored goals, and write plan.json.
+    Plan {
+        /// Force full/incremental acquisition or select automatically.
+        #[arg(long, value_enum, default_value_t = CliSweepMode::Auto)]
+        mode: CliSweepMode,
+        /// Recorded GitHub responses for a hermetic parity run.
+        #[arg(long, hide = true)]
+        fixture: Option<PathBuf>,
+        /// One clock shared by the sweep and goal evaluation.
         #[arg(long, hide = true)]
         started_at: Option<String>,
     },
@@ -157,6 +170,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             for fault in &outcome.faults {
                 eprintln!("mandate sweep: {fault}");
             }
+        }
+        Command::Plan {
+            mode,
+            fixture,
+            started_at,
+        } => {
+            let started_at = started_at
+                .as_deref()
+                .map(DateTime::parse_from_rfc3339)
+                .transpose()?
+                .map_or_else(
+                    || DateTime::<Utc>::from(SystemTime::now()),
+                    |value| value.with_timezone(&Utc),
+                );
+            let cwd = env::current_dir()?;
+            let executable = env::current_exe()?;
+            let plugin_root = env::var_os("OSTROM_PLUGIN_ROOT")
+                .or_else(|| env::var_os("CLAUDE_PLUGIN_ROOT"))
+                .map_or_else(|| cwd.join("plugins/ostrom"), PathBuf::from);
+            let options = PlanOptions {
+                sweep: SweepOptions {
+                    paths: paths.clone(),
+                    working_directory: cwd,
+                    executable,
+                    plugin_root,
+                    started_at,
+                    requested_mode: mode.into(),
+                    fixture,
+                    publish: PublishTarget::Disabled,
+                },
+                // Action resolution is owned by #234. Until that projection is
+                // wired in, absent entries fail closed as unresolved checks.
+                resolved_checks: Default::default(),
+            };
+            let mut deriver: Box<dyn ostrom_store::AssessmentDeriver> =
+                if let Some(executable) = env::var_os("OSTROM_PLAN_DERIVER") {
+                    Box::new(ExecutableAssessmentDeriver::new(PathBuf::from(executable)))
+                } else {
+                    Box::new(UnavailableAssessmentDeriver)
+                };
+            let plan = run_plan(&options, deriver.as_mut())?;
+            println!(
+                "ostrom plan: {} goals; {} ranked items; {} faults; wrote {}",
+                plan.goals.len(),
+                plan.ranking.ordered.len(),
+                plan.faults.len(),
+                paths.state.join("plan.json").display()
+            );
         }
     }
     Ok(())

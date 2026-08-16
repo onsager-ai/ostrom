@@ -154,6 +154,12 @@ struct RepoAnalysis {
 }
 
 pub fn run_sweep(options: &SweepOptions) -> Result<SweepOutcome, SweepError> {
+    run_sweep_with_mirror(options).map(|(outcome, _mirror)| outcome)
+}
+
+pub(crate) fn run_sweep_with_mirror(
+    options: &SweepOptions,
+) -> Result<(SweepOutcome, Vec<RepositorySnapshot>), SweepError> {
     let config = load_config(&options.paths, &options.working_directory)?;
     if config.projects.is_empty() {
         return Err(SweepError::Config(
@@ -180,6 +186,7 @@ pub fn run_sweep(options: &SweepOptions) -> Result<SweepOutcome, SweepError> {
         acquire_by_organization(options, &config, &old_state, mode)?
     };
 
+    let mirror = snapshots.clone();
     let mut snapshots_by_repo = snapshots
         .into_iter()
         .map(|snapshot| (snapshot.repo.as_str().to_owned(), snapshot))
@@ -315,12 +322,15 @@ pub fn run_sweep(options: &SweepOptions) -> Result<SweepOutcome, SweepError> {
         }
     }
 
-    Ok(SweepOutcome {
-        project_count: config.projects.len(),
-        queue_changes,
-        mode,
-        faults,
-    })
+    Ok((
+        SweepOutcome {
+            project_count: config.projects.len(),
+            queue_changes,
+            mode,
+            faults,
+        },
+        mirror,
+    ))
 }
 
 pub fn acquire_org_from_github(
