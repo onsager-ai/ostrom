@@ -22,7 +22,7 @@ pub use check::{
     ActionDefinition, CHECKS_VERSION, Catalogue, CatalogueEnumeration, CheckBasis,
     CheckContractError, CheckDefinition, CheckDocument, CheckEvaluation, CheckFault, CheckReceipt,
     CheckState, CheckVerdict, DefinitionDigest, Evidence, FreshnessError, RESULT_VERSION,
-    ResolvedCheck, RunnerStamp, resolve_check, resolve_fresh_for,
+    ResolvedCheck, RunnerStamp, resolve_check, resolve_fresh_for, select_check,
 };
 pub use domain::{
     ConfigError, DefaultDisposition, GateConfig, GateProject, Mandate, MandateConfig,

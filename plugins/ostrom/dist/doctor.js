@@ -12,10 +12,10 @@ import { join } from "node:path";
 
 // src/lib/process.ts
 import { spawnSync } from "node:child_process";
-function run(command, args, options = {}) {
-  const result = spawnSync(command, args, {
-    cwd: options.cwd,
-    env: options.env,
+function run(command, args2, options2 = {}) {
+  const result = spawnSync(command, args2, {
+    cwd: options2.cwd,
+    env: options2.env,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"]
   });
@@ -25,8 +25,8 @@ function run(command, args, options = {}) {
     stderr: result.stderr ?? result.error?.message ?? ""
   };
 }
-function git(cwd, args) {
-  return run("git", ["-C", cwd, ...args]);
+function git(cwd, args2) {
+  return run("git", ["-C", cwd, ...args2]);
 }
 
 // src/checks/rules.ts
@@ -1341,31 +1341,62 @@ function createTraceReader(configDir2) {
     return cached;
   };
 }
-function runDoctor(options) {
-  const env = options.env ?? process.env;
-  const context = {
-    ...options,
-    env,
-    resolveConfig: () => resolveTouchConfig(options.pluginRoot, options.configDir, options.cwd),
-    readTrace: createTraceReader(options.configDir)
+var DOCTOR_CHECK_NAMES = [
+  "plugin",
+  "marketplace",
+  "plugin-cache-drift",
+  "rules-layers",
+  "touch-durability",
+  "provider-reachable",
+  "dispatch-source-roots",
+  "trace-lease",
+  "work-orders",
+  "builder-pass",
+  "gatekeeper-pass",
+  "publish",
+  "environment",
+  "config-parser"
+];
+function checkRunners(context) {
+  return {
+    plugin: () => checkPlugin(context),
+    marketplace: () => checkMarketplace(context),
+    "plugin-cache-drift": () => checkPluginCacheDrift(context),
+    "rules-layers": () => checkRulesLayers(context),
+    "touch-durability": () => checkTouchDurability(context),
+    "provider-reachable": () => checkProviderReachable(context),
+    "dispatch-source-roots": () => checkDispatchSourceRoots(context),
+    "trace-lease": () => checkTraceLease(context),
+    "work-orders": () => checkWorkOrders(context),
+    "builder-pass": () => checkBuilderPass(context),
+    "gatekeeper-pass": () => checkGatekeeperPass(context),
+    publish: () => checkPublish(context),
+    environment: () => checkEnvironment(context),
+    "config-parser": () => checkConfigParser()
   };
-  const results = [
-    checkPlugin(context),
-    checkMarketplace(context),
-    checkPluginCacheDrift(context),
-    checkRulesLayers(context),
-    checkTouchDurability(context),
-    checkProviderReachable(context),
-    checkDispatchSourceRoots(context),
-    checkTraceLease(context),
-    checkWorkOrders(context),
-    checkBuilderPass(context),
-    checkGatekeeperPass(context),
-    checkPublish(context),
-    checkEnvironment(context),
-    checkConfigParser()
-  ];
+}
+function createContext(options2) {
+  const env = options2.env ?? process.env;
+  return {
+    ...options2,
+    env,
+    resolveConfig: () => resolveTouchConfig(options2.pluginRoot, options2.configDir, options2.cwd),
+    readTrace: createTraceReader(options2.configDir)
+  };
+}
+function runDoctor(options2) {
+  const runners = checkRunners(createContext(options2));
+  const results = DOCTOR_CHECK_NAMES.map((name) => runners[name]());
   return `${results.map(formatResult).join("\n")}
+`;
+}
+function runDoctorCheck(options2, name) {
+  if (!DOCTOR_CHECK_NAMES.includes(name)) {
+    throw new Error(`unknown doctor check: ${name}`);
+  }
+  const exactName = name;
+  const result = checkRunners(createContext(options2))[exactName]();
+  return `${formatResult(result)}
 `;
 }
 
@@ -1373,12 +1404,25 @@ function runDoctor(options) {
 var pluginRoot = resolve(dirname2(fileURLToPath(import.meta.url)), "..");
 var home = process.env.HOME ?? "";
 var configDir = process.env.CLAUDE_CONFIG_DIR ?? resolve(home, ".claude");
-process.stdout.write(
-  runDoctor({
-    pluginRoot,
-    configDir,
-    cwd: process.cwd(),
-    home,
-    env: process.env
-  })
-);
+var options = {
+  pluginRoot,
+  configDir,
+  cwd: process.cwd(),
+  home,
+  env: process.env
+};
+var args = process.argv.slice(2);
+if (args.length === 0) {
+  process.stdout.write(runDoctor(options));
+} else if (args.length === 2 && args[0] === "--check" && args[1]) {
+  try {
+    process.stdout.write(runDoctorCheck(options, args[1]));
+  } catch (error) {
+    process.stderr.write(`${error instanceof Error ? error.message : "doctor check failed"}
+`);
+    process.exitCode = 2;
+  }
+} else {
+  process.stderr.write("usage: doctor.js [--check <exact-name>]\n");
+  process.exitCode = 2;
+}
