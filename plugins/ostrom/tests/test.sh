@@ -1199,6 +1199,26 @@ if [ "$4" = api ] && [[ "$5" == repos/*/compare/* ]]; then
   printf '%s\n' "${FAKE_REMOTE_AHEAD:-0}"
   exit 0
 fi
+if [ "$4" = issue ] && [ "$5" = view ]; then
+  if [ "${FAKE_CLOSING_PR_QUERY_FAIL:-0}" -eq 1 ]; then
+    exit 42
+  fi
+  jq -cn --argjson refs "${FAKE_CLOSING_PR_REFERENCES:-[]}" \
+    '{closedByPullRequestsReferences:$refs}'
+  exit 0
+fi
+if [ "$4" = pr ] && [ "$5" = view ]; then
+  if [ "${FAKE_CLOSING_PR_RESOLVE_FAIL:-0}" -eq 1 ]; then
+    exit 42
+  fi
+  jq -cn --argjson number "${FAKE_CLOSING_PR_NUMBER:-91}" \
+    --arg state "${FAKE_CLOSING_PR_STATE:-OPEN}" \
+    --arg merged_at "${FAKE_CLOSING_PR_MERGED_AT:-}" \
+    --arg url "$6" \
+    '{number:$number,state:$state,
+      mergedAt:(if $merged_at == "" then null else $merged_at end),url:$url}'
+  exit 0
+fi
 if [ "$4" = pr ] && [ "$5" = list ]; then
   if [[ " $* " == *" --head "* ]]; then
     if [ "${FAKE_BRANCH_PR_QUERY_FAIL:-0}" -eq 1 ]; then
@@ -1207,7 +1227,9 @@ if [ "$4" = pr ] && [ "$5" = list ]; then
     printf '%s\n' "${FAKE_BRANCH_PRS:-[]}"
     exit 0
   fi
-  if [ "${FAKE_OPEN_PR:-0}" -eq 1 ]; then
+  if [ "${FAKE_PART_OF_PR:-0}" -eq 1 ]; then
+    printf '%s\n' '[{"number":3,"title":"Partial implementation","body":"Part of #2 — step 2 only","url":"https://example.test/pull/3"}]'
+  elif [ "${FAKE_OPEN_PR:-0}" -eq 1 ]; then
     printf '%s\n' '[{"number":77,"body":"Closes example-org/example-repo#123","url":"https://example.test/pull/77"}]'
   else
     printf '%s\n' '[]'
@@ -1383,6 +1405,8 @@ if jq -s -e --arg branch "$dispatch_branch" '
   or .[0].fact.branch_name != $branch
   or .[0].fact.head_sha != "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
   or .[0].fact.ahead_of_default != 4
+  or .[0].fact.matched_key.type != "branch_name"
+  or .[0].fact.matched_key.value != $branch
   or .[0].fact.branch_listing.outcome != "matched"
   or .[0].fact.branch_listing.page_count != 1
   or .[0].fact.branch_listing.branch_count != 2
@@ -1438,6 +1462,8 @@ jq -s -e --arg branch "$dispatch_branch" '
   and .[0].fact.reason == "branch-already-pushed"
   and .[0].fact.branch_name == $branch
   and .[0].fact.head_sha == "dddddddddddddddddddddddddddddddddddddddd"
+  and .[0].fact.matched_key.type == "branch_name"
+  and .[0].fact.matched_key.value == $branch
   and .[0].fact.branch_listing.outcome == "matched"
   and .[0].fact.branch_listing.page_count == 2
   and .[0].fact.branch_listing.branch_count == 101
@@ -1578,35 +1604,130 @@ if [ "$(grep -Fc "could not verify pull requests for branch $dispatch_branch in 
   exit 1
 fi
 
-# A branch with the item number at the start of a path component matches the
-# deterministic ostrom/<number>-... position even when its wording predates
-# the order's derived branch name.
-set +e
-FAKE_REMOTE_BRANCH_NAME='chore/123-existing-work' \
-  FAKE_REMOTE_BRANCH_SHA=cccccccccccccccccccccccccccccccccccccccc \
-  FAKE_REMOTE_AHEAD=2 CLAUDE_CONFIG_DIR="$branch_guard_config" \
-  MANDATE_TRACE_TIME="2026-08-11T02:00:31Z" \
-  MANDATE_NOW_EPOCH="$cap_today_epoch" \
-  MANDATE_GH_AS_BIN="$fake_dispatch_gh" \
-  MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
-  CODEX_BIN="$fake_dispatch_codex" \
-  FAKE_SYSTEMD_ARGS="$dispatch_args" FAKE_SYSTEMD_CALLS="$dispatch_calls" \
-  bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$dispatch_order" >/dev/null 2>&1
-numbered_branch_guard_status=$?
-set -e
-if [ "$numbered_branch_guard_status" -ne 3 ]; then
-  echo "number-position remote branch guard did not exit 3" >&2
-  exit 1
-fi
-if [ "$(jq -s -r 'last.fact.branch_name' "$branch_guard_config/ostrom/sprint.jsonl")" != 'chore/123-existing-work' ]; then
-  echo "number-position remote branch guard recorded the wrong branch" >&2
-  exit 1
-fi
-if jq -s -e 'any(.[]; .kind == "work-dispatched")' \
-  "$branch_guard_config/ostrom/sprint.jsonl" >/dev/null; then
-  echo "number-position remote branch guard reserved work" >&2
-  exit 1
-fi
+# #199: a branch that merely contains the item number is not identity
+# evidence. This deliberately replaces the old assertion that treated the
+# numeric coincidence as pre-deterministic work.
+numbered_branch_config="$dispatch_fixture/numbered-branch-config"
+numbered_branch_calls="$dispatch_fixture/numbered-branch-systemd-calls"
+numbered_branch_args="$dispatch_fixture/numbered-branch-systemd-args"
+write_dispatch_config "$numbered_branch_config"
+cat >"$dispatch_fixture/numbered-branch-candidate.json" <<'JSON'
+{"schema_version":1,"item_id":"example-org/example-repo#119","repository":"example-org/example-repo","item_ref":"#119","branch_name":"placeholder/119","spec":"Exercise exact branch identity.","acceptance_criteria":["Numeric branch prose is not identity."],"constraints":["Use placeholder data only."]}
+JSON
+numbered_branch_order="$({
+  CLAUDE_CONFIG_DIR="$numbered_branch_config" \
+    MANDATE_TRACE_TIME="2026-08-11T02:00:34Z" \
+    bash "$PLUGIN_ROOT/scripts/work-order.sh" create \
+      "$dispatch_fixture/numbered-branch-candidate.json"
+} 2>/dev/null)"
+: >"$numbered_branch_calls"
+numbered_branch_unit="$({
+  FAKE_REMOTE_BRANCH_NAME='chore/119-bump' \
+    FAKE_REMOTE_BRANCH_SHA=cccccccccccccccccccccccccccccccccccccccc \
+    CLAUDE_CONFIG_DIR="$numbered_branch_config" \
+    MANDATE_TRACE_TIME="2026-08-11T02:00:35Z" \
+    MANDATE_NOW_EPOCH="$cap_today_epoch" \
+    MANDATE_GH_AS_BIN="$fake_dispatch_gh" \
+    MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
+    CODEX_BIN="$fake_dispatch_codex" \
+    FAKE_SYSTEMD_ARGS="$numbered_branch_args" \
+    FAKE_SYSTEMD_CALLS="$numbered_branch_calls" \
+    bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$numbered_branch_order"
+} 2>/dev/null)"
+[ -n "$numbered_branch_unit" ]
+[ "$(wc -l <"$numbered_branch_calls" | tr -d '[:space:]')" -eq 1 ]
+jq -s -e '
+  length == 1
+  and .[0].kind == "work-dispatched"
+  and .[0].fact.item_id == "example-org/example-repo#119"
+  and .[0].fact.branch_listing.outcome == "proven-exhaustive-no-match"
+  and .[0].fact.branch_listing.branch_count == 2
+  and .[0].fact.branch_listing.matched_branch == null
+' "$numbered_branch_config/ostrom/sprint.jsonl" >/dev/null
+
+# A "Part of" pull request is partial-work prose, not a closing relation. The
+# old hand-named branch and the open partial PR both leave the item dispatchable.
+part_of_config="$dispatch_fixture/part-of-config"
+part_of_calls="$dispatch_fixture/part-of-systemd-calls"
+part_of_args="$dispatch_fixture/part-of-systemd-args"
+write_dispatch_config "$part_of_config"
+cat >"$dispatch_fixture/part-of-candidate.json" <<'JSON'
+{"schema_version":1,"item_id":"example-org/example-repo#2","repository":"example-org/example-repo","item_ref":"#2","branch_name":"placeholder/2","spec":"Exercise partial pull-request evidence.","acceptance_criteria":["Part-of work remains dispatchable."],"constraints":["Use placeholder data only."]}
+JSON
+part_of_order="$({
+  CLAUDE_CONFIG_DIR="$part_of_config" \
+    MANDATE_TRACE_TIME="2026-08-11T02:00:36Z" \
+    bash "$PLUGIN_ROOT/scripts/work-order.sh" create \
+      "$dispatch_fixture/part-of-candidate.json"
+} 2>/dev/null)"
+: >"$part_of_calls"
+part_of_unit="$({
+  FAKE_REMOTE_BRANCH_NAME='spec/2-two-region-store' FAKE_PART_OF_PR=1 \
+    FAKE_REMOTE_BRANCH_SHA=dddddddddddddddddddddddddddddddddddddddd \
+    CLAUDE_CONFIG_DIR="$part_of_config" \
+    MANDATE_TRACE_TIME="2026-08-11T02:00:37Z" \
+    MANDATE_NOW_EPOCH="$cap_today_epoch" \
+    MANDATE_GH_AS_BIN="$fake_dispatch_gh" \
+    MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
+    CODEX_BIN="$fake_dispatch_codex" \
+    FAKE_SYSTEMD_ARGS="$part_of_args" \
+    FAKE_SYSTEMD_CALLS="$part_of_calls" \
+    bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$part_of_order"
+} 2>/dev/null)"
+[ -n "$part_of_unit" ]
+[ "$(wc -l <"$part_of_calls" | tr -d '[:space:]')" -eq 1 ]
+jq -s -e '
+  length == 1
+  and .[0].kind == "work-dispatched"
+  and .[0].fact.item_id == "example-org/example-repo#2"
+  and .[0].fact.branch_listing.outcome == "proven-exhaustive-no-match"
+  and .[0].fact.branch_listing.matched_branch == null
+' "$part_of_config/ostrom/sprint.jsonl" >/dev/null
+
+# Open and merged closing pull requests are authoritative compatibility keys
+# for work whose historical branch does not match the deterministic name.
+for closing_pr_state in OPEN MERGED; do
+  closing_pr_case="$(tr '[:upper:]' '[:lower:]' <<<"$closing_pr_state")"
+  closing_pr_config="$dispatch_fixture/$closing_pr_case-closing-pr-config"
+  closing_pr_calls="$dispatch_fixture/$closing_pr_case-closing-pr-gh-calls"
+  closing_pr_stderr="$dispatch_fixture/$closing_pr_case-closing-pr.err"
+  closing_pr_url="https://example.test/pull/91"
+  write_dispatch_config "$closing_pr_config"
+  set +e
+  FAKE_CLOSING_PR_REFERENCES='[{"url":"https://example.test/pull/91"}]' \
+    FAKE_CLOSING_PR_STATE="$closing_pr_state" \
+    FAKE_CLOSING_PR_MERGED_AT="2026-08-11T02:00:00Z" \
+    FAKE_GH_CALLS="$closing_pr_calls" \
+    CLAUDE_CONFIG_DIR="$closing_pr_config" \
+    MANDATE_TRACE_TIME="2026-08-11T02:00:38Z" \
+    MANDATE_NOW_EPOCH="$cap_today_epoch" \
+    MANDATE_GH_AS_BIN="$fake_dispatch_gh" \
+    MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
+    CODEX_BIN="$fake_dispatch_codex" \
+    FAKE_SYSTEMD_ARGS="$dispatch_args" FAKE_SYSTEMD_CALLS="$dispatch_calls" \
+    bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$dispatch_order" \
+      >/dev/null 2>"$closing_pr_stderr"
+  closing_pr_status=$?
+  set -e
+  [ "$closing_pr_status" -eq 3 ]
+  jq -s -e --arg url "$closing_pr_url" '
+    length == 1
+    and .[0].kind == "work-failed"
+    and .[0].fact.reason == "branch-already-pushed"
+    and .[0].fact.matched_key == {
+      type: "closing_pull_request", value: $url}
+    and .[0].fact.branch_listing.outcome == "proven-exhaustive-no-match"
+    and .[0].fact.branch_listing.matched_branch == null
+  ' "$closing_pr_config/ostrom/sprint.jsonl" >/dev/null
+  grep -Fq "matched_key=closing_pull_request:$closing_pr_url" \
+    "$closing_pr_stderr"
+  grep -Fqx \
+    'builder example-org/example-repo gh issue view #123 --repo example-org/example-repo --json closedByPullRequestsReferences' \
+    "$closing_pr_calls"
+  grep -Fqx \
+    "builder example-org/example-repo gh pr view $closing_pr_url --json number,state,mergedAt,url" \
+    "$closing_pr_calls"
+done
 
 # Failure to enumerate remote branches fails closed before any reservation.
 branch_query_failure_config="$dispatch_fixture/branch-query-failure-config"
@@ -2045,6 +2166,10 @@ if [ "$1" = gh ] && [ "$2" = api ] && \
 fi
 if [ "$1" = gh ] && [ "$2" = repo ] && [ "$3" = view ]; then
   printf 'main\n'
+  exit 0
+fi
+if [ "$1" = gh ] && [ "$2" = issue ] && [ "$3" = view ]; then
+  printf '%s\n' '{"closedByPullRequestsReferences":[]}'
   exit 0
 fi
 if [ "$1" = gh ] && [ "$2" = pr ] && [ "$3" = list ]; then

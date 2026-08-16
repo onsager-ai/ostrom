@@ -54,6 +54,8 @@ branch_listing_page_count=0
 branch_listing_branch_count=0
 branch_listing_matched_branch=""
 branch_listing_error=""
+matched_key_type=""
+matched_key_value=""
 
 append_dispatch_failure() {
   local reason="$1"
@@ -79,6 +81,8 @@ append_dispatch_failure() {
     --argjson branch_listing_branch_count "$branch_listing_branch_count" \
     --arg branch_listing_matched_branch "$branch_listing_matched_branch" \
     --arg branch_listing_error "$branch_listing_error" \
+    --arg matched_key_type "$matched_key_type" \
+    --arg matched_key_value "$matched_key_value" \
     '{schema_version: 1, item_id: $item_id, order_id: $order_id,
       unit_name: $unit_name, backend: $backend,
       cost_ceiling_usd: $cost_ceiling_usd, token_ceiling: $token_ceiling,
@@ -93,6 +97,9 @@ append_dispatch_failure() {
         else ($ahead_of_default | tonumber) end),
       usage: {input_tokens: 0, cached_input_tokens: 0,
         output_tokens: 0, reasoning_output_tokens: 0}}
+      | if $matched_key_value == "" then . else
+          .matched_key = {type: $matched_key_type, value: $matched_key_value}
+        end
       | if $branch_listing_outcome == "" then . else
           .branch_listing = {
             outcome: $branch_listing_outcome,
@@ -198,12 +205,15 @@ if [ "$source_resolution_status" -ne 0 ]; then
   exit 3
 fi
 
-# A pushed branch is durable work even when no pull request references the
-# item yet. A branch whose pull request was merged is landed work, though, and
-# squash merges do not put the branch's own commits into the default branch's
-# history. Enumerate remote state through the builder credential and reject
-# only work that has not landed before resolving the backend, acquiring the
-# item lease, or calculating either concurrency or spend reservations.
+# The exact branch name recorded in the work order is authoritative evidence
+# of pushed work even when no pull request references the item yet. A branch
+# whose pull request was merged is landed work, though, and squash merges do
+# not put the branch's own commits into the default branch's history. Older
+# hand-named branches are deliberately not guessed from the item number; the
+# item's closing pull-request links provide their authoritative evidence.
+# Enumerate remote state through the builder credential and reject only work
+# that has not landed before resolving the backend, acquiring the item lease,
+# or calculating either concurrency or spend reservations.
 # Walk pages explicitly instead of trusting gh's Link-header pagination. A
 # short terminal page proves the scan reached the end; a full page always
 # requires another successful read. This also handles repositories whose
@@ -265,16 +275,9 @@ while [ "$branch_page_number" -le "$REMOTE_BRANCH_PAGE_LIMIT" ]; do
 done
 remote_branch_pages="$(jq -sc '.' <<<"$remote_branch_page_lines")"
 
-item_number="${item_id##*#}"
-case "$item_number" in *[!0-9]*|'') item_number="" ;; esac
 matching_remote_branch="$(jq -r \
-  --arg expected "$branch_name" --arg number "$item_number" '
-  [ .[][]
-    | select(.name == $expected
-        or ($number != "" and (.name | test("(^|/)" + $number + "-"))))
-  ]
-  | sort_by(if .name == $expected then 0 else 1 end)
-  | first // empty
+  --arg expected "$branch_name" '
+  first(.[][] | select(.name == $expected)) // empty
   | [.name, .commit.sha]
   | @tsv
 ' <<<"$remote_branch_pages")"
@@ -320,15 +323,70 @@ if [ -n "$matching_remote_branch" ]; then
     branch_is_landed=1
   fi
   if [ "$branch_is_landed" -eq 0 ]; then
+    matched_key_type=branch_name
+    matched_key_value="$branch_name"
     append_dispatch_failure branch-already-pushed 0 "" "$pushed_branch" \
       "$repository" "$pushed_head_sha" "$ahead_of_default" ||
         echo "ostrom dispatch: could not record work-failed" >&2
-    echo "ostrom dispatch: remote work already exists: repository=$repository branch=$pushed_branch head=$pushed_head_sha ahead=$ahead_of_default" >&2
+    echo "ostrom dispatch: remote work already exists: matched_key=branch_name:$branch_name repository=$repository branch=$pushed_branch head=$pushed_head_sha ahead=$ahead_of_default" >&2
     exit 3
   fi
 else
   branch_listing_outcome=proven-exhaustive-no-match
 fi
+
+# Compatibility for work published before deterministic branch naming comes
+# from GitHub's closing-reference relation, not from branch-name prose. Resolve
+# each linked pull request so a closed-unmerged reference does not count while
+# an open or merged closing pull request does. A plain "Part of" reference is
+# absent from closedByPullRequestsReferences and therefore remains dispatchable.
+closing_pr_references="$({
+  bash "$GH_AS_BIN" builder "$repository" \
+    gh issue view "$item_ref" --repo "$repository" \
+      --json closedByPullRequestsReferences
+} 2>/dev/null)" || {
+  echo "ostrom dispatch: could not verify closing pull requests for $item_id" >&2
+  exit 1
+}
+if ! jq -e '
+  type == "object"
+  and (.closedByPullRequestsReferences | type == "array")
+  and all(.closedByPullRequestsReferences[];
+    type == "object"
+    and (.url | type == "string" and length > 0))
+' >/dev/null 2>&1 <<<"$closing_pr_references"; then
+  echo "ostrom dispatch: closing pull request references were malformed for $item_id" >&2
+  exit 1
+fi
+while IFS= read -r closing_pr_url; do
+  [ -n "$closing_pr_url" ] || continue
+  closing_pr="$({
+    bash "$GH_AS_BIN" builder "$repository" \
+      gh pr view "$closing_pr_url" --json number,state,mergedAt,url
+  } 2>/dev/null)" || {
+    echo "ostrom dispatch: could not resolve closing pull request $closing_pr_url for $item_id" >&2
+    exit 1
+  }
+  if ! jq -e --arg expected_url "$closing_pr_url" '
+    type == "object"
+    and (.number | type == "number")
+    and (.state == "OPEN" or .state == "CLOSED" or .state == "MERGED")
+    and (.url == $expected_url)
+  ' >/dev/null 2>&1 <<<"$closing_pr"; then
+    echo "ostrom dispatch: closing pull request state was malformed for $closing_pr_url" >&2
+    exit 1
+  fi
+  if jq -e '.state == "OPEN" or .state == "MERGED"' \
+      >/dev/null <<<"$closing_pr"; then
+    matched_key_type=closing_pull_request
+    matched_key_value="$closing_pr_url"
+    append_dispatch_failure branch-already-pushed 0 "" "" "$repository" ||
+      echo "ostrom dispatch: could not record work-failed" >&2
+    echo "ostrom dispatch: remote work already exists: matched_key=closing_pull_request:$closing_pr_url item=$item_id" >&2
+    exit 3
+  fi
+done < <(jq -r '.closedByPullRequestsReferences | map(.url) | unique[]' \
+  <<<"$closing_pr_references")
 
 codex_unavailable() {
   local detail="$1"
