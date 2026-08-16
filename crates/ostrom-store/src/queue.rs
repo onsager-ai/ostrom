@@ -157,8 +157,9 @@ fn validate_queue(value: &Value) -> Result<(), String> {
         return Err("state is not recognized".to_owned());
     }
     require_string(object, "opened")?;
-    if let Some(value) = object.get("age_days")
-        && value.as_u64().is_none()
+    if object
+        .get("age_days")
+        .is_some_and(|value| value.as_u64().is_none())
     {
         return Err("age_days must be a non-negative integer".to_owned());
     }
