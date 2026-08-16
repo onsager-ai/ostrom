@@ -68,6 +68,72 @@ fn fixture_sweep_queue_is_byte_identical_to_recorded_cross_org_output() {
 }
 
 #[test]
+fn fixture_sweep_turns_a_stale_work_ranking_pointer_into_a_visible_fault() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let home = tempdir().expect("temporary OSTROM_HOME");
+    let ranked_roster = ROSTER.replace(
+        "hold_labels: []\n",
+        concat!(
+            "hold_labels: []\n",
+            "work_ranking:\n",
+            "  - example-org/example-repo#999\n",
+        ),
+    );
+    fs::write(home.path().join("mandates.yaml"), ranked_roster)
+        .expect("write ranked fixture roster");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .args([
+            "sweep",
+            "--fixture",
+            root.join("tests/fixtures/sweep-cross-org.json")
+                .to_str()
+                .expect("fixture path is UTF-8"),
+            "--started-at",
+            "2026-08-01T00:00:00Z",
+        ])
+        .env("OSTROM_HOME", home.path())
+        .current_dir(home.path())
+        .output()
+        .expect("run ranked fixture sweep");
+    assert!(
+        output.status.success(),
+        "sweep stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("recorded work_ranking item no longer exists: example-org/example-repo#999"),
+        "stale ranking was not reported: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let queue = fs::read_to_string(home.path().join("queue.jsonl")).expect("read fault queue");
+    let fault = queue
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("parse queue row"))
+        .find(|row| row["id"] == "example-org/example-repo#999")
+        .expect("stale ranking fault row");
+    assert_eq!(fault["kind"], "drift");
+    assert_eq!(
+        fault["mandate"]["reason"],
+        "work_ranking item no longer exists: example-org/example-repo#999"
+    );
+    let state: serde_json::Value = serde_json::from_slice(
+        &fs::read(home.path().join("state.json")).expect("read ranked state"),
+    )
+    .expect("parse ranked state");
+    assert_eq!(
+        state["work_ranking"],
+        serde_json::json!(["example-org/example-repo#999"])
+    );
+    assert_eq!(
+        state["work_ranking_faults"],
+        serde_json::json!(["example-org/example-repo#999"])
+    );
+}
+
+#[test]
 fn fixture_sweep_refuses_a_query_at_the_exhaustiveness_cap() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let home = tempdir().expect("temporary OSTROM_HOME");

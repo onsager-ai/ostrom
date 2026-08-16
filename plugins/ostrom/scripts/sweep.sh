@@ -2330,6 +2330,64 @@ jq -cn \
   ' >"$work/next.json"
 mv "$work/next.json" "$work/new-state.json"
 
+# A ranking pointer is a principal-authored fact, but it is only meaningful
+# while its source item exists. Every successfully acquired repository keeps
+# all open issues and pull requests under records, including excluded and
+# safety-boundary items. Validate against that authorization-neutral view so
+# ranking can never make absence look like eligibility or make an excluded
+# item look stale merely because it has no queue row.
+jq -cn \
+    --slurpfile config "$work/config.json" \
+    --slurpfile state "$work/new-state.json" \
+    --slurpfile existing "$work/existing-queue.json" \
+    --arg sweep_started "$sweep_started" '
+    ($state[0]) as $state
+    | [
+        $config[0].work_ranking[] as $item
+        | ($item | capture("^(?<repo>[^#]+)(?<ref>#[1-9][0-9]*)$")) as $pointer
+        | select(($state.repos[$pointer.repo].records | type) == "object")
+        | select($state.repos[$pointer.repo].records | has($item) | not)
+        | {
+            id: $item,
+            repo: $pointer.repo,
+            ref: $pointer.ref,
+            title: "Ranking fault: recorded item no longer exists",
+            kind: "drift",
+            mandate: {reason: ("work_ranking item no longer exists: " + $item)},
+            state: "pending",
+            opened: (
+              first(
+                $existing[0][]
+                | select(
+                    .id == $item
+                    and .kind == "drift"
+                    and ((.mandate.reason // "")
+                      == ("work_ranking item no longer exists: " + $item))
+                  )
+                | .opened
+              ) // $sweep_started
+            ),
+            age_days: 0,
+            aged_out: false,
+            needs_judgment: false,
+            blocked_by: []
+          }
+      ]
+  ' >"$work/work-ranking-faults.json"
+
+jq -c \
+    --slurpfile config "$work/config.json" \
+    --slurpfile faults "$work/work-ranking-faults.json" '
+    .
+    | .work_ranking = $config[0].work_ranking
+    | .work_ranking_faults = [$faults[0][].id]
+  ' "$work/new-state.json" >"$work/next.json"
+mv "$work/next.json" "$work/new-state.json"
+
+jq -c --slurpfile faults "$work/work-ranking-faults.json" \
+  '. + $faults[0]' "$work/generated.json" >"$work/next.json"
+mv "$work/next.json" "$work/generated.json"
+
 jq -cn \
     --slurpfile state "$work/new-state.json" \
     --arg mode "$sweep_mode" \
@@ -2393,6 +2451,9 @@ jq -cn \
     def retained_closed_reference($row):
       $row.kind == "parked"
       and (reason_text($row) | startswith("issue state CLOSED; retained for review; "));
+    def ranking_fault($row):
+      $row.kind == "drift"
+      and (reason_text($row) | startswith("work_ranking item no longer exists: "));
     def park_closed_reference:
       . as $row
       | (possibly_landed($row.id)) as $possibly_landed_suffix
@@ -2528,7 +2589,9 @@ jq -cn \
     ) as $still_relevant
     | reduce $generated[] as $row ($still_relevant;
         (first($existing[]? | select(.id == $row.id)) // null) as $existing_row
-        | if ($closed_issue_ids | index($row.id)) != null then
+        | if ranking_fault($row) then
+            map(select(.id != $row.id)) + [$row]
+          elif ($closed_issue_ids | index($row.id)) != null then
             if has_landed_reference($row) or has_landed_reference($existing_row) then
               map(select(.id != $row.id))
               + [carry_principal_fields($row; $existing_row) | park_closed_reference]

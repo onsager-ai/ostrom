@@ -187,6 +187,7 @@ pub fn run_sweep(options: &SweepOptions) -> Result<SweepOutcome, SweepError> {
     let mut generated = Vec::new();
     let mut active_ids = BTreeSet::new();
     let mut current = BTreeMap::new();
+    let mut verified_repositories = BTreeSet::new();
     let mut new_state = old_state.clone();
     ensure_state_shape(&mut new_state);
 
@@ -202,6 +203,7 @@ pub fn run_sweep(options: &SweepOptions) -> Result<SweepOutcome, SweepError> {
             generated.push(row);
             continue;
         };
+        verified_repositories.insert(repo.to_owned());
         for warning in &snapshot.warnings {
             faults.push(format!("{repo}: {warning}"));
             let row = fault_row(repo, warning, options.started_at);
@@ -241,6 +243,63 @@ pub fn run_sweep(options: &SweepOptions) -> Result<SweepOutcome, SweepError> {
     if let Some(repos) = new_state.get_mut("repos").and_then(Value::as_object_mut) {
         repos.retain(|repo, _| configured.contains(repo.as_str()));
     }
+
+    let mut ranking_faults = Vec::new();
+    for item in &config.work_ranking {
+        let Some((repo, reference)) = item.rsplit_once('#') else {
+            continue;
+        };
+        if !verified_repositories.contains(repo) {
+            continue;
+        }
+        let exists = new_state
+            .get("repos")
+            .and_then(|repos| repos.get(repo))
+            .and_then(|state| state.get("records"))
+            .and_then(Value::as_object)
+            .is_some_and(|records| records.contains_key(item));
+        if exists {
+            continue;
+        }
+        let reason = format!("work_ranking item no longer exists: {item}");
+        let opened = existing
+            .iter()
+            .find(|row| {
+                string_field(row.value(), &["id"]) == item
+                    && string_field(row.value(), &["kind"]) == "drift"
+                    && row
+                        .value()
+                        .get("mandate")
+                        .and_then(|mandate| mandate.get("reason"))
+                        .and_then(Value::as_str)
+                        == Some(reason.as_str())
+            })
+            .map_or_else(
+                || format_time(options.started_at),
+                |row| string_field(row.value(), &["opened"]).to_owned(),
+            );
+        generated.retain(|row| string_field(row, &["id"]) != item);
+        generated.push(json!({
+            "id": item,
+            "repo": repo,
+            "ref": format!("#{reference}"),
+            "title": "Ranking fault: recorded item no longer exists",
+            "kind": "drift",
+            "mandate": {"reason": reason},
+            "state": "pending",
+            "opened": opened,
+            "age_days": 0,
+            "aged_out": false,
+            "needs_judgment": false,
+            "blocked_by": [],
+        }));
+        ranking_faults.push(item.clone());
+        faults.push(format!(
+            "recorded work_ranking item no longer exists: {item}"
+        ));
+    }
+    new_state["work_ranking"] = json!(&config.work_ranking);
+    new_state["work_ranking_faults"] = json!(ranking_faults);
 
     let final_rows = reconcile_queue(existing, generated, &active_ids, &current, &configured)?;
     let before = read_queue(&options.paths.queue_file())?;
@@ -1596,12 +1655,20 @@ fn reconcile_queue(
         .collect::<Vec<_>>();
     for mut row in generated {
         let id = string_field(&row, &["id"]).to_owned();
-        if let Some(old) = existing_values
-            .iter()
-            .find(|candidate| string_field(candidate, &["id"]) == id)
-        {
-            if let Some(state) = old.get("state") {
-                row["state"] = state.clone();
+        let ranking_fault = string_field(&row, &["kind"]) == "drift"
+            && row
+                .get("mandate")
+                .and_then(|mandate| mandate.get("reason"))
+                .and_then(Value::as_str)
+                .is_some_and(|reason| reason.starts_with("work_ranking item no longer exists: "));
+        if !ranking_fault {
+            if let Some(old) = existing_values
+                .iter()
+                .find(|candidate| string_field(candidate, &["id"]) == id)
+            {
+                if let Some(state) = old.get("state") {
+                    row["state"] = state.clone();
+                }
             }
         }
         result.retain(|candidate| string_field(candidate, &["id"]) != id);
