@@ -2145,7 +2145,11 @@ git -C "$implement_source" init -b main >/dev/null
 git -C "$implement_source" config user.name "Ostrom Test"
 git -C "$implement_source" config user.email "ostrom@example.test"
 printf 'base\n' >"$implement_source/base.txt"
+mkdir -p "$implement_source/.github/workflows"
+printf '%s\n' 'name: baseline' \
+  >"$implement_source/.github/workflows/existing.yml"
 git -C "$implement_source" add base.txt
+git -C "$implement_source" add .github/workflows/existing.yml
 git -C "$implement_source" commit -m fixture >/dev/null
 git init --bare "$implement_remote" >/dev/null
 git -C "$implement_source" remote add origin "$implement_remote"
@@ -2308,6 +2312,11 @@ case "${FAKE_CODEX_MODE:-complete}" in
     fi
     printf '%s\n' "$fake_usage_json"
     ;;
+  no-change)
+    printf 'Synthetic workflow-only implementation completed.\n' >"$result"
+    printf '%s\n' \
+      '{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":50,"reasoning_output_tokens":10}}'
+    ;;
   conflict)
     printf 'implementer version\n' >"$worktree/base.txt"
     printf 'Synthetic conflicting implementation completed.\n' >"$result"
@@ -2343,7 +2352,7 @@ run_implement_order() {
   lease="implementer-item-$item_hash.lease"
   CLAUDE_CONFIG_DIR="$runtime_config" MANDATE_LEASE_NAME="$lease" \
     bash "$PLUGIN_ROOT/scripts/lease.sh" acquire "$unit" 3600 >/dev/null
-  FAKE_CODEX_MODE=complete CODEX_BIN="$fake_codex" \
+  FAKE_CODEX_MODE="${FAKE_CODEX_MODE:-complete}" CODEX_BIN="$fake_codex" \
     CLAUDE_CONFIG_DIR="$runtime_config" \
     MANDATE_IMPLEMENTER_SOURCE_REPO="$implement_source" \
     MANDATE_GH_AS_BIN="$fake_implement_gh" FAKE_GIT_REMOTE="$implement_remote" \
@@ -2495,41 +2504,108 @@ jq -s -e --arg order_id "$branch_conflict_order_id" \
   and .[0].fact.source_repository_path == $source_repository_path
 ' "$branch_conflict_config/ostrom/sprint.jsonl" >/dev/null
 
-# A workflow change is committed for recovery, then rejected before the
-# authenticated push. The terminal reason identifies the first offending path.
-workflow_config="$implement_fixture/workflow-config"
-workflow_order="$(create_implement_order workflow-unpushable 148 "$workflow_config")"
-workflow_order_id="$(jq -r '.order_id' "$workflow_order")"
-workflow_item_hash="$(
+# When workflow files are the order's only changes, the harness restores and
+# amends them out, then preserves the established failure reason and skips the
+# authenticated push.
+workflow_only_config="$implement_fixture/workflow-only-config"
+workflow_only_order="$(
+  create_implement_order workflow-unpushable 148 "$workflow_only_config"
+)"
+workflow_only_order_id="$(jq -r '.order_id' "$workflow_only_order")"
+workflow_only_item_hash="$(
   bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash \
     'example-org/example-repo#148'
 )"
-workflow_branch="$(jq -r '.branch_name' "$workflow_order")"
-workflow_worktree="$workflow_config/ostrom/implementer-worktrees/$workflow_item_hash"
-mkdir -p "$(dirname "$workflow_worktree")"
-git -C "$implement_source" worktree add -b "$workflow_branch" \
-  "$workflow_worktree" refs/remotes/origin/main >/dev/null
-mkdir -p "$workflow_worktree/.github/workflows"
-printf '%s\n' 'name: synthetic' >"$workflow_worktree/.github/workflows/test.yml"
-workflow_commands="$implement_fixture/workflow-unpushable-commands"
+workflow_only_branch="$(jq -r '.branch_name' "$workflow_only_order")"
+workflow_only_worktree="$workflow_only_config/ostrom/implementer-worktrees/$workflow_only_item_hash"
+mkdir -p "$(dirname "$workflow_only_worktree")"
+git -C "$implement_source" worktree add -b "$workflow_only_branch" \
+  "$workflow_only_worktree" refs/remotes/origin/main >/dev/null
+printf '%s\n' 'name: synthetic' \
+  >"$workflow_only_worktree/.github/workflows/test.yml"
+workflow_only_commands="$implement_fixture/workflow-only-commands"
 set +e
-FAKE_IMPLEMENT_COMMANDS="$workflow_commands" \
-  run_implement_order "$workflow_order" workflow-unpushable "$workflow_config"
-workflow_status=$?
+FAKE_CODEX_MODE=no-change FAKE_IMPLEMENT_COMMANDS="$workflow_only_commands" \
+  run_implement_order "$workflow_only_order" workflow-only \
+    "$workflow_only_config"
+workflow_only_status=$?
 set -e
-[ "$workflow_status" -eq 1 ]
-[ "$(git -C "$workflow_worktree" show HEAD:.github/workflows/test.yml)" = \
-  'name: synthetic' ]
-if grep -q ' push ' "$workflow_commands"; then
+[ "$workflow_only_status" -eq 1 ]
+[ "$(git -C "$workflow_only_worktree" show HEAD:.github/workflows/existing.yml)" = \
+  'name: baseline' ]
+if git -C "$workflow_only_worktree" cat-file -e \
+  HEAD:.github/workflows/test.yml 2>/dev/null; then
+  echo "new workflow file survived withholding" >&2
+  exit 1
+fi
+if grep -q ' push ' "$workflow_only_commands"; then
   echo "workflow-file guard attempted a push" >&2
   exit 1
 fi
-jq -s -e --arg order_id "$workflow_order_id" '
+jq -s -e --arg order_id "$workflow_only_order_id" '
   [.[] | select(.fact.order_id == $order_id)] | length == 1
   and .[0].kind == "work-failed"
   and .[0].fact.reason
     == "workflow-file-unpushable path=.github/workflows/test.yml"
-' "$workflow_config/ostrom/sprint.jsonl" >/dev/null
+  and .[0].fact.withheld_paths == [
+    ".github/workflows/test.yml"
+  ]
+' "$workflow_only_config/ostrom/sprint.jsonl" >/dev/null
+
+# Workflow edits alongside ordinary implementation are withheld as a group.
+# Existing paths regain default-branch content, newly added paths disappear,
+# and the amended harness commit still reaches the remote and a pull request.
+workflow_mixed_config="$implement_fixture/workflow-mixed-config"
+workflow_mixed_order="$(
+  create_implement_order workflow-mixed 149 "$workflow_mixed_config"
+)"
+workflow_mixed_order_id="$(jq -r '.order_id' "$workflow_mixed_order")"
+workflow_mixed_item_hash="$(
+  bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash \
+    'example-org/example-repo#149'
+)"
+workflow_mixed_branch="$(jq -r '.branch_name' "$workflow_mixed_order")"
+workflow_mixed_worktree="$workflow_mixed_config/ostrom/implementer-worktrees/$workflow_mixed_item_hash"
+mkdir -p "$(dirname "$workflow_mixed_worktree")"
+git -C "$implement_source" worktree add -b "$workflow_mixed_branch" \
+  "$workflow_mixed_worktree" refs/remotes/origin/main >/dev/null
+printf '%s\n' 'name: changed' \
+  >"$workflow_mixed_worktree/.github/workflows/existing.yml"
+printf '%s\n' 'name: synthetic' \
+  >"$workflow_mixed_worktree/.github/workflows/test.yml"
+workflow_mixed_commands="$implement_fixture/workflow-mixed-commands"
+FAKE_IMPLEMENT_COMMANDS="$workflow_mixed_commands" \
+  run_implement_order "$workflow_mixed_order" workflow-mixed \
+    "$workflow_mixed_config"
+[ "$(git --git-dir="$implement_remote" show \
+  "$workflow_mixed_branch:.github/workflows/existing.yml")" = \
+  'name: baseline' ]
+if git --git-dir="$implement_remote" cat-file -e \
+  "$workflow_mixed_branch:.github/workflows/test.yml" 2>/dev/null; then
+  echo "new workflow file was published" >&2
+  exit 1
+fi
+[ "$(git --git-dir="$implement_remote" diff --name-only \
+  "main...$workflow_mixed_branch")" = 'generated.txt' ]
+[ "$(git --git-dir="$implement_remote" rev-list --count \
+  "main..$workflow_mixed_branch")" -eq 1 ]
+if [ "$(grep -c ' push ' "$workflow_mixed_commands")" -ne 1 ]; then
+  echo "mixed workflow implementation did not push exactly once" >&2
+  exit 1
+fi
+workflow_mixed_pr_body="$implement_fixture/workflow-mixed-pr-body"
+grep -q '^## Withheld workflow paths$' "$workflow_mixed_pr_body"
+grep -Fq -- '- `.github/workflows/existing.yml`' "$workflow_mixed_pr_body"
+grep -Fq -- '- `.github/workflows/test.yml`' "$workflow_mixed_pr_body"
+jq -s -e --arg order_id "$workflow_mixed_order_id" '
+  [.[] | select(.fact.order_id == $order_id)] | length == 1
+  and .[0].kind == "work-completed"
+  and .[0].fact.reason == null
+  and .[0].fact.withheld_paths == [
+    ".github/workflows/existing.yml",
+    ".github/workflows/test.yml"
+  ]
+' "$workflow_mixed_config/ostrom/sprint.jsonl" >/dev/null
 
 # #142: a repeat order on the already-matching deterministic branch reuses the
 # item-keyed worktree. The preexisting uncommitted file reaches the pushed
@@ -2942,6 +3018,7 @@ implement_ok_order="$(
     MANDATE_TRACE_TIME="2026-08-11T03:01:00Z" \
     bash "$PLUGIN_ROOT/scripts/work-order.sh" create "$implement_ok_candidate"
 )"
+implement_ok_order_id="$(jq -r '.order_id' "$implement_ok_order")"
 implement_ok_item_hash="$(bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash 'example-org/example-repo#126')"
 implement_ok_branch="$(jq -r '.branch_name' "$implement_ok_order")"
 implement_ok_unit="ostrom-implementer-${implement_ok_item_hash:0:16}"
@@ -2960,17 +3037,28 @@ grep -q 'https://example.test/pull/125' "$implement_fixture/ok.out"
 [ ! -e "$implement_config/ostrom/$implement_ok_lease" ]
 git --git-dir="$implement_remote" show-ref --verify \
   "refs/heads/$implement_ok_branch" >/dev/null
+[ "$(git --git-dir="$implement_remote" diff --name-only \
+  "main...$implement_ok_branch")" = 'generated.txt' ]
 [ "$(git --git-dir="$implement_remote" log -1 --format='%(trailers:key=Ostrom-Role,valueonly)' "refs/heads/$implement_ok_branch")" = builder ]
 grep -q 'workspace-write' "$implement_pr_body"
 grep -q 'approval policy `never`' "$implement_pr_body"
 grep -q '^Ostrom-Role: builder$' "$implement_pr_body"
-jq -s -e '
-  .[-1].kind == "work-completed"
-  and .[-1].fact.item_id == "example-org/example-repo#126"
-  and .[-1].fact.pr_url == "https://example.test/pull/125"
-  and .[-1].fact.reason == null
-  and (.[-1].fact.cost_usd | type == "number" and . > 0 and . < 20)
-  and .[-1].fact.usage.output_tokens == 50
+if grep -q '^## Withheld workflow paths$' "$implement_pr_body"; then
+  echo "ordinary implementation reported withheld workflow paths" >&2
+  exit 1
+fi
+grep -Fq \
+  'Do not modify anything under `.github/workflows/`; any such edit will be reverted before publication rather than published.' \
+  "$implement_config/ostrom/implementer-runs/$implement_ok_order_id/prompt.md"
+jq -s -e --arg order_id "$implement_ok_order_id" '
+  [.[] | select(.fact.order_id == $order_id)] | length == 1
+  and .[0].kind == "work-completed"
+  and .[0].fact.item_id == "example-org/example-repo#126"
+  and .[0].fact.pr_url == "https://example.test/pull/125"
+  and .[0].fact.reason == null
+  and .[0].fact.withheld_paths == []
+  and (.[0].fact.cost_usd | type == "number" and . > 0 and . < 20)
+  and .[0].fact.usage.output_tokens == 50
 ' "$implement_config/ostrom/sprint.jsonl" >/dev/null
 
 # #102: a published branch that advances independently is merged forward.
