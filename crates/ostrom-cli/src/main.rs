@@ -16,7 +16,7 @@ use ostrom_core::{
 };
 use ostrom_store::{
     ExecutableAssessmentDeriver, MigrationOutcome, OstromPaths, PlanOptions, PublishTarget,
-    SweepMode, SweepOptions, UnavailableAssessmentDeriver, acquire_org_from_github,
+    SweepError, SweepMode, SweepOptions, UnavailableAssessmentDeriver, acquire_org_from_github,
     encode_org_snapshots, list_queue_json, migrate, run_plan, run_sweep,
 };
 
@@ -135,18 +135,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             inner_org,
             started_at,
         } => {
-            let started_at = started_at
-                .as_deref()
-                .map(DateTime::parse_from_rfc3339)
-                .transpose()?
-                .map_or_else(
-                    || DateTime::<Utc>::from(SystemTime::now()),
-                    |value| value.with_timezone(&Utc),
-                );
+            let started_at = resolve_started_at(started_at.as_deref())?;
             if let Some(org) = inner_org {
                 let cwd = env::current_dir()?;
                 let snapshots =
-                    acquire_org_from_github(&paths, &cwd, &org, started_at, mode.into())?;
+                    match acquire_org_from_github(&paths, &cwd, &org, started_at, mode.into()) {
+                        Ok(snapshots) => snapshots,
+                        Err(error @ SweepError::BranchListingTruncated(_)) => {
+                            eprintln!("{error}");
+                            std::process::exit(6);
+                        }
+                        Err(error) => return Err(error.into()),
+                    };
                 io::stdout().write_all(&encode_org_snapshots(snapshots)?)?;
                 return Ok(());
             }
@@ -181,14 +181,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             fixture,
             started_at,
         } => {
-            let started_at = started_at
-                .as_deref()
-                .map(DateTime::parse_from_rfc3339)
-                .transpose()?
-                .map_or_else(
-                    || DateTime::<Utc>::from(SystemTime::now()),
-                    |value| value.with_timezone(&Utc),
-                );
+            let started_at = resolve_started_at(started_at.as_deref())?;
             let cwd = env::current_dir()?;
             let executable = env::current_exe()?;
             let plugin_root = env::var_os("OSTROM_PLUGIN_ROOT")
@@ -321,6 +314,36 @@ fn action_fault(error: &ActionFault) -> CheckFault {
         name: error.name().to_owned(),
         detail: error.detail().map(str::to_owned),
     }
+}
+
+fn resolve_started_at(value: Option<&str>) -> Result<DateTime<Utc>, io::Error> {
+    if let Some(value) = value {
+        return parse_started_at(value, "--started-at");
+    }
+    match env::var("MANDATE_SWEEP_TIME") {
+        // The shell reads this as `${MANDATE_SWEEP_TIME:-<now>}`, so an empty
+        // value means absent rather than malformed. A non-empty value that
+        // will not parse is an error: a parity harness that silently un-pins
+        // its clock produces a confident wrong answer.
+        Ok(value) if value.is_empty() => Ok(DateTime::<Utc>::from(SystemTime::now())),
+        Ok(value) => parse_started_at(&value, "MANDATE_SWEEP_TIME"),
+        Err(env::VarError::NotPresent) => Ok(DateTime::<Utc>::from(SystemTime::now())),
+        Err(env::VarError::NotUnicode(_)) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "MANDATE_SWEEP_TIME must be a valid Unicode RFC3339 instant",
+        )),
+    }
+}
+
+fn parse_started_at(value: &str, source: &str) -> Result<DateTime<Utc>, io::Error> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|value| value.with_timezone(&Utc))
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{source} is not a valid RFC3339 instant: {error}"),
+            )
+        })
 }
 
 fn legacy_home() -> Result<PathBuf, Box<dyn std::error::Error>> {

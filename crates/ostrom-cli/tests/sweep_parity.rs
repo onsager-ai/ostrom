@@ -359,6 +359,9 @@ printf '%s\n' "$*" >> "$OSTROM_TEST_GH_LOG"
 case "$1 $2" in
   "auth status") exit 0 ;;
   "api -X")
+    case "$*" in
+      *"/branches?"*) printf '%s\n' '[]'; exit 0 ;;
+    esac
     printf 'HTTP/2 304 Not Modified\r\netag: fixture-etag\r\n\r\n'
     exit 1
     ;;
@@ -414,5 +417,498 @@ esac
         "pr list --repo example-org/example-repo --state merged --search merged:>=2026-07-02 --limit 200"
     ));
     assert!(!calls.contains("--state all --limit 200"));
+    assert!(
+        calls.contains("api -X GET repos/example-org/example-repo/branches?per_page=100&page=1")
+    );
     assert!(calls.contains("run list --repo example-org/example-repo --branch main --limit 200"));
+}
+
+const PLACEHOLDER_ROSTER: &str = r#"
+provider: file
+cadence_hours: 1
+stuck_after_days: 7
+search_roots: []
+hold_labels: []
+bounce_all: []
+projects:
+  - repo: placeholder-org/alpha
+    delegated: []
+    excluded: []
+    reserved: []
+    default: excluded
+    paused: false
+    bounce: []
+"#;
+
+fn write_placeholder_fixture(home: &Path, repository: serde_json::Value) -> std::path::PathBuf {
+    fs::write(home.join("mandates.yaml"), PLACEHOLDER_ROSTER).expect("write placeholder roster");
+    let fixture = home.join("fixture.json");
+    fs::write(
+        &fixture,
+        serde_json::to_vec(&serde_json::json!({"repositories": [repository]}))
+            .expect("serialize placeholder fixture"),
+    )
+    .expect("write placeholder fixture");
+    fixture
+}
+
+fn run_placeholder_sweep(home: &Path, fixture: &Path, extra: &[&str]) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ostrom"));
+    command.args(["sweep", "--fixture"]);
+    command.arg(fixture);
+    command.args(extra);
+    command
+        .env("OSTROM_HOME", home)
+        .current_dir(home)
+        .output()
+        .expect("run placeholder sweep")
+}
+
+fn placeholder_repository() -> serde_json::Value {
+    serde_json::json!({
+        "repo": "placeholder-org/alpha",
+        "issues": [],
+        "open_prs": [],
+        "merged_prs": [],
+        "default_branch": "main",
+        "branches": [],
+        "branch_read_degraded": false,
+        "ci_runs": [],
+    })
+}
+
+#[test]
+fn unexplained_merges_and_reserved_branches_share_the_alarm_kind() {
+    let home = tempdir().expect("temporary OSTROM_HOME");
+    let mut repository = placeholder_repository();
+    repository["default_branch"] = serde_json::json!("ostrom/default");
+    repository["branches"] = serde_json::json!([
+        {"name": "ostrom/default", "commit": {"sha": "default-sha"}},
+        {"name": "ostrom/unmatched", "commit": {"sha": "branch-sha"}},
+        {"name": "ostrom/matched", "commit": {"sha": "matched-sha"}},
+        {"name": "feature/outside", "commit": {"sha": "outside-sha"}}
+    ]);
+    repository["merged_prs"] = serde_json::json!([
+        {
+            "number": 1,
+            "title": "Machine merge without order",
+            "author": {"login": "builder[bot]", "is_bot": true},
+            "closingIssuesReferences": [],
+            "createdAt": "2026-07-04T00:00:00Z",
+            "mergedAt": "2026-07-05T00:00:00Z",
+            "headRefOid": "machine-unexplained-sha"
+        },
+        {
+            "number": 2,
+            "title": "Machine merge with order",
+            "author": {"login": "builder[bot]", "is_bot": true},
+            "closingIssuesReferences": [{"number": 99}],
+            "createdAt": "2026-07-04T00:00:00Z",
+            "mergedAt": "2026-07-05T00:00:00Z",
+            "headRefOid": "machine-explained-sha"
+        },
+        {
+            "number": 3,
+            "title": "Human merge with order",
+            "author": {"login": "placeholder-human", "is_bot": false},
+            "closingIssuesReferences": [{"number": 99}],
+            "createdAt": "2026-07-04T00:00:00Z",
+            "mergedAt": "2026-07-05T00:00:00Z",
+            "headRefOid": "human-explained-sha"
+        }
+    ]);
+    let fixture = write_placeholder_fixture(home.path(), repository);
+    fs::write(
+        home.path().join("gate.jsonl"),
+        concat!(
+            r#"{"ts":"2026-07-01T00:00:00Z","pr":"placeholder-org/alpha#90","head_sha":"floor-sha","verdict":"pass"}"#,
+            "\n",
+        ),
+    )
+    .expect("write placeholder gate floor");
+    fs::create_dir(home.path().join("work-orders")).expect("create work-order directory");
+    fs::write(
+        home.path().join("work-orders/matched.json"),
+        r#"{"repository":"placeholder-org/alpha","branch_name":"ostrom/matched","item_id":"placeholder-org/alpha#99","order_id":"placeholder-order"}"#,
+    )
+    .expect("write matching work order");
+    fs::write(
+        home.path().join("state.json"),
+        r#"{"version":2,"repos":{"placeholder-org/alpha":{"merge_gate_faults":{"placeholder-org/alpha#1":{"fingerprint":"scope-v1|no_verdict|machine-unexplained-sha|none||true|"}}}}}"#,
+    )
+    .expect("write prior merge fingerprint");
+    fs::write(
+        home.path().join("queue.jsonl"),
+        concat!(
+            r##"{"id":"placeholder-org/alpha#1","repo":"placeholder-org/alpha","ref":"#1","title":"Machine merge without order","kind":"merge-gate-fault","mandate":{"reason":"merge gate fault: no verdict for merged head machine-unexplained-sha"},"state":"pending","opened":"2026-07-05T00:00:00Z","age_days":0,"aged_out":false,"needs_judgment":false,"blocked_by":[]}"##,
+            "\n",
+        ),
+    )
+    .expect("write prior queue kind");
+
+    let output = run_placeholder_sweep(
+        home.path(),
+        &fixture,
+        &["--started-at", "2026-08-01T00:00:00Z"],
+    );
+    assert!(
+        output.status.success(),
+        "sweep stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rows = fs::read_to_string(home.path().join("queue.jsonl")).expect("read queue");
+    let rows = rows
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("parse queue row"))
+        .collect::<Vec<_>>();
+    let row = |id: &str| {
+        rows.iter()
+            .find(|row| row["id"] == id)
+            .unwrap_or_else(|| panic!("missing queue row {id}"))
+    };
+
+    let unexplained_merge = row("placeholder-org/alpha#1");
+    assert_eq!(unexplained_merge["kind"], "unexplained-write");
+    assert_eq!(
+        unexplained_merge["mandate"]["reason"],
+        "unexplained write: machine-authored merge has no matching work order; merge gate fault: no verdict for merged head machine-unexplained-sha"
+    );
+    assert_eq!(
+        unexplained_merge["mandate"]["scope_evidence"]["classification"],
+        "unexplained"
+    );
+    for id in ["placeholder-org/alpha#2", "placeholder-org/alpha#3"] {
+        assert_eq!(row(id)["kind"], "merge-gate-fault");
+        assert!(
+            row(id)["mandate"]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.starts_with("merge gate fault: no verdict"))
+        );
+    }
+
+    let branch = row("placeholder-org/alpha@refs/heads/ostrom/unmatched");
+    assert_eq!(branch["ref"], "@ostrom/unmatched");
+    assert_eq!(branch["title"], "Pushed branch ostrom/unmatched");
+    assert_eq!(branch["kind"], "unexplained-write");
+    assert_eq!(
+        branch["mandate"]["reason"],
+        "unexplained write: pushed branch ostrom/unmatched has no matching work order"
+    );
+    assert_eq!(branch["opened"], "2026-08-01T00:00:00Z");
+    assert_eq!(branch["age_days"], 0);
+    assert_eq!(branch["aged_out"], false);
+    assert_eq!(branch["needs_judgment"], false);
+    assert_eq!(branch["blocked_by"], serde_json::json!([]));
+    assert!(
+        rows.iter().all(|row| {
+            !matches!(
+                row["id"].as_str(),
+                Some("placeholder-org/alpha@refs/heads/ostrom/matched")
+                    | Some("placeholder-org/alpha@refs/heads/ostrom/default")
+                    | Some("placeholder-org/alpha@refs/heads/feature/outside")
+            )
+        }),
+        "an excluded branch produced an alarm"
+    );
+
+    let state: serde_json::Value = serde_json::from_slice(
+        &fs::read(home.path().join("state.json")).expect("read sweep state"),
+    )
+    .expect("parse sweep state");
+    let repo_state = &state["repos"]["placeholder-org/alpha"];
+    assert_eq!(repo_state["merge_gate_fault_count"], 2);
+    assert_eq!(repo_state["unexplained_write_count"], 2);
+    assert_eq!(
+        repo_state["unexplained_branch_writes"]["placeholder-org/alpha@refs/heads/ostrom/unmatched"]
+            ["fingerprint"],
+        "branch-v1|ostrom/unmatched|branch-sha"
+    );
+}
+
+#[test]
+fn degraded_branch_evidence_suppresses_reserved_namespace_alarms() {
+    let home = tempdir().expect("temporary OSTROM_HOME");
+    let mut repository = placeholder_repository();
+    repository["branches"] = serde_json::json!([
+        {"name": "ostrom/unmatched", "commit": {"sha": "branch-sha"}}
+    ]);
+    repository["branch_read_degraded"] = serde_json::json!(true);
+    let fixture = write_placeholder_fixture(home.path(), repository);
+
+    let output = run_placeholder_sweep(
+        home.path(),
+        &fixture,
+        &["--started-at", "2026-08-01T00:00:00Z"],
+    );
+    assert!(output.status.success());
+    let queue = fs::read_to_string(home.path().join("queue.jsonl")).expect("read queue");
+    assert!(!queue.contains("@refs/heads/"));
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(home.path().join("state.json")).expect("read state"))
+            .expect("parse state");
+    assert_eq!(
+        state["repos"]["placeholder-org/alpha"]["unexplained_branch_writes"],
+        serde_json::json!({})
+    );
+}
+
+#[test]
+fn malformed_work_orders_warn_and_do_not_fail_the_sweep() {
+    let home = tempdir().expect("temporary OSTROM_HOME");
+    let fixture = write_placeholder_fixture(home.path(), placeholder_repository());
+    fs::create_dir(home.path().join("work-orders")).expect("create work-order directory");
+    fs::write(home.path().join("work-orders/malformed.json"), "not JSON")
+        .expect("write malformed work order");
+
+    let output = run_placeholder_sweep(
+        home.path(),
+        &fixture,
+        &["--started-at", "2026-08-01T00:00:00Z"],
+    );
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("ignoring malformed work order while classifying pushed branches")
+    );
+}
+
+#[test]
+fn fixture_refuses_a_full_second_branch_page() {
+    let home = tempdir().expect("temporary OSTROM_HOME");
+    let mut repository = placeholder_repository();
+    repository["branches"] = serde_json::Value::Array(vec![
+        serde_json::json!({"name": "feature/placeholder", "commit": {"sha": "placeholder-sha"}});
+        200
+    ]);
+    let fixture = write_placeholder_fixture(home.path(), repository);
+
+    let output = run_placeholder_sweep(
+        home.path(),
+        &fixture,
+        &["--started-at", "2026-08-01T00:00:00Z"],
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains(
+        "branch query for placeholder-org/alpha reached query_limit 200; refusing a truncated sweep"
+    ));
+    assert!(!home.path().join("queue.jsonl").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn github_worker_refuses_a_full_second_branch_page() {
+    use std::{env, os::unix::fs::PermissionsExt};
+
+    let home = tempdir().expect("temporary OSTROM_HOME");
+    let bin = home.path().join("bin");
+    fs::create_dir(&bin).expect("create fake binary directory");
+    fs::write(home.path().join("mandates.yaml"), PLACEHOLDER_ROSTER)
+        .expect("write placeholder roster");
+    let fake_gh = bin.join("gh");
+    fs::write(
+        &fake_gh,
+        r#"#!/usr/bin/env bash
+set -eu
+branch_page() {
+  printf '['
+  index=0
+  while [ "$index" -lt 100 ]; do
+    [ "$index" -eq 0 ] || printf ','
+    printf '{"name":"feature/placeholder-%s","commit":{"sha":"placeholder-sha-%s"}}' "$index" "$index"
+    index=$((index + 1))
+  done
+  printf ']\n'
+}
+case "$1 $2" in
+  "auth status") exit 0 ;;
+  "api -X")
+    case "$*" in
+      *"/issues?"*) printf 'HTTP/2 200 OK\r\netag: placeholder-etag\r\n\r\n[]' ;;
+      *"/branches?"*) branch_page ;;
+      *) exit 9 ;;
+    esac
+    ;;
+  "api graphql")
+    printf '%s\n' '{"data":{"repository":{"issues":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}'
+    ;;
+  "pr list") printf '%s\n' '[]' ;;
+  "repo view") printf '%s\n' '{"defaultBranchRef":{"name":"main"}}' ;;
+  *) exit 9 ;;
+esac
+"#,
+    )
+    .expect("write fake gh");
+    fs::set_permissions(&fake_gh, fs::Permissions::from_mode(0o700))
+        .expect("make fake gh executable");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        env::var("PATH").expect("PATH is configured")
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .args([
+            "sweep",
+            "--inner-org",
+            "placeholder-org",
+            "--mode",
+            "full",
+            "--started-at",
+            "2026-08-01T00:00:00Z",
+        ])
+        .env("OSTROM_HOME", home.path())
+        .env("PATH", path)
+        .current_dir(home.path())
+        .output()
+        .expect("run GitHub worker");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains(
+        "branch query for placeholder-org/alpha reached query_limit 200; refusing a truncated sweep"
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn outer_sweep_propagates_branch_truncation_without_writing_a_queue() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = tempdir().expect("temporary OSTROM_HOME");
+    let plugin = home.path().join("plugin");
+    fs::create_dir_all(plugin.join("scripts")).expect("create fake plugin");
+    fs::write(home.path().join("mandates.yaml"), PLACEHOLDER_ROSTER)
+        .expect("write placeholder roster");
+    let fake_auth = plugin.join("scripts/gh-as.sh");
+    fs::write(
+        &fake_auth,
+        concat!(
+            "#!/usr/bin/env bash\n",
+            "printf '%s\\n' 'branch query for placeholder-org/alpha reached query_limit 200; refusing a truncated sweep' >&2\n",
+            "exit 6\n",
+        ),
+    )
+    .expect("write truncating organization worker");
+    fs::set_permissions(&fake_auth, fs::Permissions::from_mode(0o700))
+        .expect("make organization worker executable");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .args(["sweep", "--started-at", "2026-08-01T00:00:00Z"])
+        .env("OSTROM_HOME", home.path())
+        .env("OSTROM_PLUGIN_ROOT", plugin)
+        .current_dir(home.path())
+        .output()
+        .expect("run outer sweep");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains(
+        "branch query for placeholder-org/alpha reached query_limit 200; refusing a truncated sweep"
+    ));
+    assert!(!home.path().join("queue.jsonl").exists());
+}
+
+#[test]
+fn mandate_sweep_time_pins_sweep_and_cli_time_takes_precedence() {
+    let home = tempdir().expect("temporary OSTROM_HOME");
+    let mut repository = placeholder_repository();
+    repository["branches"] = serde_json::json!([
+        {"name": "ostrom/unmatched", "commit": {"sha": "branch-sha"}}
+    ]);
+    let fixture = write_placeholder_fixture(home.path(), repository);
+
+    let pinned = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .args(["sweep", "--fixture"])
+        .arg(&fixture)
+        .env("OSTROM_HOME", home.path())
+        .env("MANDATE_SWEEP_TIME", "2026-08-02T03:04:05Z")
+        .current_dir(home.path())
+        .output()
+        .expect("run environment-pinned sweep");
+    assert!(pinned.status.success());
+    let queue = fs::read_to_string(home.path().join("queue.jsonl")).expect("read pinned queue");
+    assert!(queue.contains(r#""opened":"2026-08-02T03:04:05Z""#));
+
+    let overridden = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .args([
+            "sweep",
+            "--fixture",
+            fixture.to_str().expect("fixture path is UTF-8"),
+            "--started-at",
+            "2026-08-03T04:05:06Z",
+        ])
+        .env("OSTROM_HOME", home.path())
+        .env("MANDATE_SWEEP_TIME", "malformed")
+        .current_dir(home.path())
+        .output()
+        .expect("run CLI-overridden sweep");
+    assert!(overridden.status.success());
+    let state: serde_json::Value = serde_json::from_slice(
+        &fs::read(home.path().join("state.json")).expect("read overridden state"),
+    )
+    .expect("parse overridden state");
+    assert_eq!(state["last_full_reconciliation"], "2026-08-03T04:05:06Z");
+
+    let malformed = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .args(["sweep", "--fixture"])
+        .arg(&fixture)
+        .env("OSTROM_HOME", home.path())
+        .env("MANDATE_SWEEP_TIME", "malformed")
+        .current_dir(home.path())
+        .output()
+        .expect("run malformed environment clock sweep");
+    assert!(!malformed.status.success());
+    assert!(
+        String::from_utf8_lossy(&malformed.stderr)
+            .contains("MANDATE_SWEEP_TIME is not a valid RFC3339 instant")
+    );
+}
+
+#[test]
+fn mandate_sweep_time_applies_to_plan_and_rejects_malformed_values() {
+    let home = tempdir().expect("temporary OSTROM_HOME");
+    let fixture = write_placeholder_fixture(home.path(), placeholder_repository());
+    let pinned = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .args(["plan", "--fixture"])
+        .arg(&fixture)
+        .env("OSTROM_HOME", home.path())
+        .env("MANDATE_SWEEP_TIME", "2026-08-04T05:06:07Z")
+        .current_dir(home.path())
+        .output()
+        .expect("run environment-pinned plan");
+    assert!(
+        pinned.status.success(),
+        "plan stderr: {}",
+        String::from_utf8_lossy(&pinned.stderr)
+    );
+    let state: serde_json::Value = serde_json::from_slice(
+        &fs::read(home.path().join("state.json")).expect("read plan sweep state"),
+    )
+    .expect("parse plan sweep state");
+    assert_eq!(state["last_full_reconciliation"], "2026-08-04T05:06:07Z");
+
+    let overridden = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .args([
+            "plan",
+            "--fixture",
+            fixture.to_str().expect("fixture path is UTF-8"),
+            "--started-at",
+            "2026-08-05T06:07:08Z",
+        ])
+        .env("OSTROM_HOME", home.path())
+        .env("MANDATE_SWEEP_TIME", "malformed")
+        .current_dir(home.path())
+        .output()
+        .expect("run CLI-overridden plan");
+    assert!(overridden.status.success());
+
+    let malformed = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .args(["plan", "--fixture"])
+        .arg(&fixture)
+        .env("OSTROM_HOME", home.path())
+        .env("MANDATE_SWEEP_TIME", "malformed")
+        .current_dir(home.path())
+        .output()
+        .expect("run malformed environment clock plan");
+    assert!(!malformed.status.success());
+    assert!(
+        String::from_utf8_lossy(&malformed.stderr)
+            .contains("MANDATE_SWEEP_TIME is not a valid RFC3339 instant")
+    );
 }

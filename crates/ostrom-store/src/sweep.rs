@@ -35,8 +35,12 @@ pub enum SweepError {
     State(String),
     #[error("GitHub acquisition failed: {0}")]
     Acquisition(String),
+    #[error("{0}")]
+    BranchListingTruncated(String),
     #[error("sweep fixture is malformed: {0}")]
     Fixture(String),
+    #[error("could not read local work orders: {0}")]
+    WorkOrders(String),
     #[error("publish failed: {0}")]
     Publish(String),
     #[error(transparent)]
@@ -100,6 +104,10 @@ pub struct RepositorySnapshot {
     pub merged_prs: Vec<Value>,
     #[serde(default)]
     pub default_branch: Option<String>,
+    #[serde(default)]
+    pub branches: Vec<Value>,
+    #[serde(default)]
+    pub branch_read_degraded: bool,
     #[serde(default)]
     pub ci_runs: Vec<Value>,
     #[serde(default)]
@@ -166,6 +174,20 @@ struct RepoAnalysis {
     state: Value,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct WorkOrderEvidence {
+    repository: String,
+    branch_name: String,
+    item_id: String,
+    order_id: String,
+}
+
+struct RepositoryEvidence<'a> {
+    paths: &'a OstromPaths,
+    work_orders: &'a [WorkOrderEvidence],
+    queued_kinds: &'a BTreeMap<String, String>,
+}
+
 pub fn run_sweep(options: &SweepOptions) -> Result<SweepOutcome, SweepError> {
     run_sweep_with_mirror(options).map(|(outcome, _mirror)| outcome)
 }
@@ -180,6 +202,12 @@ pub(crate) fn run_sweep_with_mirror(
         ));
     }
     let existing = read_queue(&options.paths.queue_file())?;
+    let mut queued_kinds = BTreeMap::new();
+    for row in &existing {
+        queued_kinds
+            .entry(string_field(row.value(), &["id"]).to_owned())
+            .or_insert_with(|| string_field(row.value(), &["kind"]).to_owned());
+    }
     let state_path = options.paths.state.join("state.json");
     let old_state = read_state(&state_path)?;
     let mode = effective_mode(
@@ -198,6 +226,8 @@ pub(crate) fn run_sweep_with_mirror(
     } else {
         acquire_by_organization(options, &config, &old_state, mode)?
     };
+    let (work_orders, work_order_warnings) = load_work_orders(&options.paths)?;
+    faults.extend(work_order_warnings);
 
     let mirror = snapshots.clone();
     let mut snapshots_by_repo = snapshots
@@ -235,6 +265,11 @@ pub(crate) fn run_sweep_with_mirror(
             .and_then(|repos| repos.get(repo))
             .cloned()
             .unwrap_or_else(|| json!({}));
+        let evidence = RepositoryEvidence {
+            paths: &options.paths,
+            work_orders: &work_orders,
+            queued_kinds: &queued_kinds,
+        };
         let analysis = analyze_repository(
             &config,
             project,
@@ -242,7 +277,7 @@ pub(crate) fn run_sweep_with_mirror(
             &previous,
             mode,
             options.started_at,
-            &options.paths,
+            &evidence,
         )?;
         generated.extend(analysis.generated);
         active_ids.extend(analysis.active_ids);
@@ -461,6 +496,9 @@ fn acquire_by_organization(
             .map_err(|error| SweepError::Acquisition(error.to_string()))?;
         if !output.status.success() {
             let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            if output.status.code() == Some(6) {
+                return Err(SweepError::BranchListingTruncated(detail));
+            }
             faults.push(format!(
                 "authentication or GitHub query failed for organization {org}{}",
                 if detail.is_empty() {
@@ -554,7 +592,7 @@ fn acquire_repository(
     let merged_prs = exhaustive_array(merged_prs, repo_name, "recent merged pull-request query")?;
 
     let mut warnings = Vec::new();
-    let (default_branch, ci_runs) = match gh_json(&[
+    let (default_branch, branches, branch_read_degraded, ci_runs) = match gh_json(&[
         "repo",
         "view",
         repo_name,
@@ -566,6 +604,15 @@ fn acquire_repository(
                 .pointer("/defaultBranchRef/name")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
+            let (branches, branch_read_degraded) = if branch.is_some() {
+                (fetch_branches(repo_name)?, false)
+            } else {
+                warnings.push(
+                    "default-branch lookup returned no branch; skipping pushed-branch checks this sweep"
+                        .to_owned(),
+                );
+                (Vec::new(), true)
+            };
             let runs = if let Some(branch) = &branch {
                 match gh_json(&[
                     "run",
@@ -597,11 +644,13 @@ fn acquire_repository(
             } else {
                 Vec::new()
             };
-            (branch, runs)
+            (branch, branches, branch_read_degraded, runs)
         }
         Err(error) => {
-            warnings.push(format!("default-branch lookup failed: {error}"));
-            (None, Vec::new())
+            warnings.push(format!(
+                "default-branch lookup failed: {error}; skipping pushed-branch checks this sweep"
+            ));
+            (None, Vec::new(), true, Vec::new())
         }
     };
 
@@ -613,9 +662,30 @@ fn acquire_repository(
         open_prs,
         merged_prs,
         default_branch,
+        branches,
+        branch_read_degraded,
         ci_runs,
         warnings,
     })
+}
+
+fn fetch_branches(repo: &str) -> Result<Vec<Value>, SweepError> {
+    let mut branches = Vec::new();
+    for page in 1..=2 {
+        let endpoint = format!("repos/{repo}/branches?per_page=100&page={page}");
+        let value = gh_json(&["api", "-X", "GET", &endpoint])?;
+        let page_values = value.as_array().cloned().ok_or_else(|| {
+            SweepError::Acquisition(format!("branch query for {repo} returned a non-array body"))
+        })?;
+        let count = page_values.len();
+        branches.extend(page_values);
+        if count < 100 {
+            return Ok(branches);
+        }
+    }
+    Err(SweepError::BranchListingTruncated(format!(
+        "branch query for {repo} reached query_limit {QUERY_LIMIT}; refusing a truncated sweep"
+    )))
 }
 
 fn fetch_issues(
@@ -783,7 +853,7 @@ fn analyze_repository(
     previous: &Value,
     mode: SweepMode,
     started_at: DateTime<Utc>,
-    paths: &OstromPaths,
+    evidence: &RepositoryEvidence<'_>,
 ) -> Result<RepoAnalysis, SweepError> {
     let repo = project.repo.as_str();
     let previous_cursor = previous.get("cursor").and_then(Value::as_str);
@@ -948,13 +1018,26 @@ fn analyze_repository(
         repo,
         &snapshot.merged_prs,
         previous,
-        paths,
+        evidence.paths,
         started_at,
         config.stuck_after_days,
+        evidence.queued_kinds,
     );
     generated.extend(gate.generated);
     active_ids.extend(gate.active_ids);
     current.extend(gate.current);
+
+    let branch_writes = analyze_branch_writes(
+        repo,
+        snapshot,
+        previous,
+        evidence.work_orders,
+        evidence.queued_kinds,
+        started_at,
+    );
+    generated.extend(branch_writes.generated);
+    active_ids.extend(branch_writes.active_ids);
+    current.extend(branch_writes.current);
 
     let issue_cursor = snapshot
         .issues
@@ -1018,6 +1101,9 @@ fn analyze_repository(
         "merge_gate_floor": gate.extra_state["floor"],
         "merge_gate_faults": gate.extra_state["faults"],
         "merge_gate_fault_count": gate.extra_state["fault_count"],
+        "unexplained_branch_writes": branch_writes.extra_state["writes"],
+        "unexplained_write_count": gate.extra_state["anomaly_count"].as_u64().unwrap_or_default()
+            + branch_writes.extra_state["count"].as_u64().unwrap_or_default(),
     });
     if let Some(old) = previous.get("notice") {
         state["notice"] = old.clone();
@@ -1501,6 +1587,7 @@ fn analyze_merge_gate(
     paths: &OstromPaths,
     started_at: DateTime<Utc>,
     stuck_after_days: u64,
+    queued_kinds: &BTreeMap<String, String>,
 ) -> SupplementalAnalysis {
     let gate_read = read_jsonl_values(&paths.state.join("gate.jsonl"));
     let gate_degraded = gate_read.is_err();
@@ -1553,9 +1640,19 @@ fn analyze_merge_gate(
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
         let machine_authored = is_bot || author_login.ends_with("[bot]");
-        let work_order_refs = linked_issues(pull)
+        // Deduplicate and order by issue *number*, not by the rendered string.
+        // These references reach the fingerprint through a join, so ordering
+        // them lexicographically would place #10 before #9 and re-emit the
+        // fault on a sweep where nothing about the merge changed.
+        let mut work_order_numbers = linked_issues(pull)
             .iter()
             .filter_map(|issue| number_field(issue, &["number"]))
+            .filter(|issue| *issue > 0)
+            .collect::<Vec<_>>();
+        work_order_numbers.sort_unstable();
+        work_order_numbers.dedup();
+        let work_order_refs = work_order_numbers
+            .into_iter()
             .map(|issue| format!("{repo}#{issue}"))
             .collect::<Vec<_>>();
         known.insert(
@@ -1591,6 +1688,8 @@ fn analyze_merge_gate(
     let mut active_ids = BTreeSet::new();
     let mut current = BTreeMap::new();
     let mut faults = Map::new();
+    let mut ordinary_fault_count = 0_u64;
+    let mut anomaly_count = 0_u64;
     for merge in known.values() {
         let merged_at = string_field(merge, &["merged_at"]);
         let in_scope = merge
@@ -1671,6 +1770,8 @@ fn analyze_merge_gate(
         let mut basis = Vec::new();
         if machine_authored {
             basis.push("machine_authorship");
+        } else {
+            basis.push("human_authorship");
         }
         if work_order_refs
             .as_array()
@@ -1678,6 +1779,39 @@ fn analyze_merge_gate(
         {
             basis.push("work_order");
         }
+        if !records.is_empty() {
+            basis.push("gate_verdict");
+        }
+        // A cited order explains requested loop work even when gate execution
+        // produced no verdict; the surviving fault is still actionable.
+        let classification = if !machine_authored
+            || work_order_refs
+                .as_array()
+                .is_some_and(|refs| !refs.is_empty())
+        {
+            "explained"
+        } else {
+            "unexplained"
+        };
+        let kind = if classification == "unexplained" {
+            "unexplained-write"
+        } else {
+            "merge-gate-fault"
+        };
+        let scope_evidence = json!({
+            "basis": basis,
+            "machine_author": merge["machine_author"],
+            "work_order_refs": work_order_refs,
+            "gate_verdict": if records.is_empty() {
+                Value::Null
+            } else {
+                json!({
+                    "verdict": verdict,
+                    "ts": if gate_ts.is_empty() { Value::Null } else { json!(gate_ts) },
+                })
+            },
+            "classification": classification,
+        });
         let fingerprint = format!(
             "scope-v1|{shape}|{sha}|{verdict}|{gate_ts}|{machine_authored}|{}",
             work_order_refs
@@ -1699,20 +1833,24 @@ fn analyze_merge_gate(
             .and_then(|fault| fault.get("fingerprint"))
             .and_then(Value::as_str)
             != Some(fingerprint.as_str())
+            || queued_kinds.get(&id).map(String::as_str) != Some(kind)
         {
+            let reason = if kind == "unexplained-write" {
+                format!(
+                    "unexplained write: machine-authored merge has no matching work order; {reason}"
+                )
+            } else {
+                reason
+            };
             generated.push(json!({
                 "id": id,
                 "repo": repo,
                 "ref": format!("#{merge_number}"),
                 "title": merge["title"],
-                "kind": "merge-gate-fault",
+                "kind": kind,
                 "mandate": {
                     "reason": reason,
-                    "scope_evidence": {
-                        "basis": basis,
-                        "machine_author": merge["machine_author"],
-                        "work_order_refs": work_order_refs,
-                    }
+                    "scope_evidence": scope_evidence,
                 },
                 "state": "pending",
                 "opened": merged_at,
@@ -1722,9 +1860,21 @@ fn analyze_merge_gate(
                 "blocked_by": [],
             }));
         }
+        if classification == "unexplained" {
+            anomaly_count += 1;
+        } else {
+            ordinary_fault_count += 1;
+        }
         faults.insert(
             id,
-            json!({"shape": shape, "head_sha": sha, "verdict": verdict, "gate_ts": if gate_ts.is_empty() { Value::Null } else { json!(gate_ts) }, "fingerprint": fingerprint}),
+            json!({
+                "shape": shape,
+                "head_sha": sha,
+                "verdict": verdict,
+                "gate_ts": if gate_ts.is_empty() { Value::Null } else { json!(gate_ts) },
+                "scope_evidence": scope_evidence,
+                "fingerprint": fingerprint,
+            }),
         );
     }
     SupplementalAnalysis {
@@ -1735,8 +1885,125 @@ fn analyze_merge_gate(
             "merges": known,
             "floor": floor,
             "faults": faults,
-            "fault_count": faults.len(),
+            "fault_count": ordinary_fault_count,
+            "anomaly_count": anomaly_count,
         }),
+    }
+}
+
+fn analyze_branch_writes(
+    repo: &str,
+    snapshot: &RepositorySnapshot,
+    previous: &Value,
+    work_orders: &[WorkOrderEvidence],
+    queued_kinds: &BTreeMap<String, String>,
+    started_at: DateTime<Utc>,
+) -> SupplementalAnalysis {
+    let mut generated = Vec::new();
+    let mut active_ids = BTreeSet::new();
+    let mut current = BTreeMap::new();
+    let mut writes = Map::new();
+    if snapshot.branch_read_degraded || snapshot.default_branch.is_none() {
+        return SupplementalAnalysis {
+            generated,
+            active_ids,
+            current,
+            extra_state: json!({"writes": writes, "count": 0}),
+        };
+    }
+
+    let default_branch = snapshot.default_branch.as_deref().unwrap_or_default();
+    let old_writes = previous
+        .get("unexplained_branch_writes")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    for branch in &snapshot.branches {
+        let Some(branch_name) = branch.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        if branch_name == default_branch || !branch_name.starts_with("ostrom/") {
+            continue;
+        }
+        let matching_work_orders = work_orders
+            .iter()
+            .filter(|order| order.repository == repo && order.branch_name == branch_name)
+            .map(|order| {
+                json!({
+                    "item_id": order.item_id,
+                    "order_id": order.order_id,
+                    "branch_name": order.branch_name,
+                })
+            })
+            .collect::<Vec<_>>();
+        if !matching_work_orders.is_empty() {
+            continue;
+        }
+        let branch_sha = branch
+            .pointer("/commit/sha")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let id = format!("{repo}@refs/heads/{branch_name}");
+        let title = format!("Pushed branch {branch_name}");
+        let fingerprint = format!("branch-v1|{branch_name}|{branch_sha}");
+        let scope_evidence = json!({
+            "basis": [],
+            "machine_author": null,
+            "work_order_refs": [],
+            "gate_verdict": null,
+            "classification": "unexplained",
+            "branch_name": branch_name,
+            "branch_sha": branch_sha,
+            "matching_work_orders": [],
+        });
+        active_ids.insert(id.clone());
+        current.insert(
+            id.clone(),
+            json!({"id": id, "title": title, "age_days": 0, "aged_out": false}),
+        );
+        if old_writes
+            .get(&id)
+            .and_then(|write| write.get("fingerprint"))
+            .and_then(Value::as_str)
+            != Some(fingerprint.as_str())
+            || queued_kinds.get(&id).map(String::as_str) != Some("unexplained-write")
+        {
+            generated.push(json!({
+                "id": id,
+                "repo": repo,
+                "ref": format!("@{branch_name}"),
+                "title": title,
+                "kind": "unexplained-write",
+                "mandate": {
+                    "reason": format!(
+                        "unexplained write: pushed branch {branch_name} has no matching work order"
+                    ),
+                    "scope_evidence": scope_evidence,
+                },
+                "state": "pending",
+                "opened": format_time(started_at),
+                "age_days": 0,
+                "aged_out": false,
+                "needs_judgment": false,
+                "blocked_by": [],
+            }));
+        }
+        writes.insert(
+            id,
+            json!({
+                "branch_name": branch_name,
+                "branch_sha": branch_sha,
+                "scope_evidence": scope_evidence,
+                "fingerprint": fingerprint,
+            }),
+        );
+    }
+    let count = writes.len();
+    SupplementalAnalysis {
+        generated,
+        active_ids,
+        current,
+        extra_state: json!({"writes": writes, "count": count}),
     }
 }
 
@@ -1822,6 +2089,45 @@ fn fault_row(repo: &str, reason: &str, started_at: DateTime<Utc>) -> Value {
         "needs_judgment": false,
         "blocked_by": [],
     })
+}
+
+fn load_work_orders(
+    paths: &OstromPaths,
+) -> Result<(Vec<WorkOrderEvidence>, Vec<String>), SweepError> {
+    let directory = paths.state.join("work-orders");
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        Err(error) => return Err(SweepError::WorkOrders(error.to_string())),
+    };
+    let mut files = entries
+        .map(|entry| {
+            entry
+                .map(|entry| entry.path())
+                .map_err(|error| SweepError::WorkOrders(error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    files.sort();
+
+    let mut orders = Vec::new();
+    let mut warnings = Vec::new();
+    for path in files {
+        if !path.is_file() || path.extension().is_none_or(|extension| extension != "json") {
+            continue;
+        }
+        let order = fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<WorkOrderEvidence>(&bytes).ok());
+        if let Some(order) = order {
+            orders.push(order);
+        } else {
+            warnings
+                .push("ignoring malformed work order while classifying pushed branches".to_owned());
+        }
+    }
+    Ok((orders, warnings))
 }
 
 fn load_config(paths: &OstromPaths, cwd: &Path) -> Result<MandateConfig, SweepError> {
@@ -1919,6 +2225,7 @@ fn validate_fixture(config: &MandateConfig, fixture: &SweepFixture) -> Result<()
             ),
             ("issues change feed", snapshot.issues.len()),
             ("default-branch CI query", snapshot.ci_runs.len()),
+            ("branch query", snapshot.branches.len()),
         ] {
             if count >= QUERY_LIMIT {
                 return Err(SweepError::Fixture(format!(
@@ -2434,6 +2741,8 @@ pub fn encode_org_snapshots(repositories: Vec<RepositorySnapshot>) -> Result<Vec
 
 #[cfg(test)]
 mod tests {
+    use tempfile::tempdir;
+
     use super::*;
 
     fn roster(repositories: &[&str]) -> MandateConfig {
@@ -2504,5 +2813,30 @@ mod tests {
                 .all(|permission| permission.ends_with(":read")),
             "a sweep reads; a write permission in the grant is a defect"
         );
+    }
+
+    #[test]
+    fn local_work_order_snapshot_tolerates_absence_and_malformed_files() {
+        let home = tempdir().expect("temporary Ostrom paths");
+        let paths = OstromPaths {
+            config: home.path().to_path_buf(),
+            state: home.path().to_path_buf(),
+        };
+        let (orders, warnings) = load_work_orders(&paths).expect("absent directory is empty");
+        assert!(orders.is_empty());
+        assert!(warnings.is_empty());
+
+        let directory = home.path().join("work-orders");
+        fs::create_dir(&directory).expect("create work-order directory");
+        fs::write(directory.join("malformed.json"), "not JSON")
+            .expect("write malformed work order");
+        fs::write(
+            directory.join("valid.json"),
+            r##"{"repository":"placeholder-org/alpha","branch_name":"ostrom/item","item_id":"placeholder-org/alpha#1","order_id":"placeholder-order"}"##,
+        )
+        .expect("write valid work order");
+        let (orders, warnings) = load_work_orders(&paths).expect("read work-order snapshot");
+        assert_eq!(orders.len(), 1);
+        assert_eq!(warnings.len(), 1);
     }
 }
