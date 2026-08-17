@@ -49,7 +49,8 @@ all; report that and stop rather than retry with an ambient credential. Any
 other exit code is the given command's own, unchanged.
 
 The required `gatekeeper` argument names the caller at the call site; it does
-not narrow the shared token. Any `Ostrom-Role:` marker reaching this protocol —
+not narrow the shared token. `gh-as.sh` derives repository and permission
+scope from each command below, and refuses commands it cannot scope. Any `Ostrom-Role:` marker reaching this protocol —
 on a commit or in a pull request body — was written by the role it names, so it
 is a self-asserted advisory record, not evidence of who acted, and never an
 input to the gate.
@@ -129,7 +130,7 @@ caller's, is always about delivery, and never converts `inconclusive` into
 
 ## 4. Apply exactly the verdict
 
-- **Pass (exit 0)** — perform these three steps in order, routing each `gh`
+- **Pass (exit 0)** — perform these four steps in order, routing each `gh`
   call through `gh-as.sh` as in step 2 so it runs with a token minted for
   this repository rather than this session's own empty credentials:
   1. Record the verdict on the pull request as a comment, writing it to a
@@ -176,11 +177,171 @@ caller's, is always about delivery, and never converts `inconclusive` into
          '{reason: ("gate verdict: " + $verdict)}')"
      ```
 
+  4. Immediately after the `decision-taken` append, verify GitHub's
+     close-keyword effect. This is an observation after the merge, not another
+     gate and not permission to undo the merge or close an issue. Read the
+     pull request's declared closing references, then read every referenced
+     issue's current state and title, routing every read through `gh-as.sh`
+     with the `gatekeeper` role:
+
+     ```sh
+     declared='[]'
+     still_open='[]'
+     stranded='[]'
+     check_errors='[]'
+
+     if closing_result="$(
+       bash "${CLAUDE_PLUGIN_ROOT}/scripts/gh-as.sh" gatekeeper "$repository" \
+         gh pr view "$pr_number" --repo "$repository" \
+           --json closingIssuesReferences
+     )"; then
+       closing_exit=0
+     else
+       closing_exit=$?
+     fi
+
+     if [ "$closing_exit" -eq 0 ]; then
+       if declared="$(
+         jq -ce '[.closingIssuesReferences[].number]' <<<"$closing_result"
+       )"; then
+         closing_parse_exit=0
+       else
+         closing_parse_exit=$?
+         declared='[]'
+         check_errors="$(
+           jq -cn '[{operation: "parse-closing-references"}]'
+         )"
+       fi
+     else
+       check_errors="$(
+         jq -cn --argjson exit_code "$closing_exit" \
+           '[{operation: "read-closing-references", exit_code: $exit_code}]'
+       )"
+     fi
+
+     if [ "$(jq 'length' <<<"$check_errors")" -eq 0 ]; then
+       while IFS= read -r issue_number; do
+         if issue_result="$(
+           bash "${CLAUDE_PLUGIN_ROOT}/scripts/gh-as.sh" gatekeeper "$repository" \
+             gh issue view "$issue_number" --repo "$repository" \
+               --json number,state,title
+         )"; then
+           issue_exit=0
+         else
+           issue_exit=$?
+         fi
+
+         if [ "$issue_exit" -ne 0 ]; then
+           check_errors="$(
+             jq -cn --argjson errors "$check_errors" \
+               --argjson number "$issue_number" \
+               --argjson exit_code "$issue_exit" \
+               '$errors + [{operation: "read-issue", number: $number,
+                 exit_code: $exit_code}]'
+           )"
+           continue
+         fi
+
+         if issue="$(
+           jq -ce --argjson expected_number "$issue_number" \
+             'select(.number == $expected_number)
+              | select(.state == "OPEN" or .state == "CLOSED")
+              | select(.title | type == "string")
+              | {number, state, title}' <<<"$issue_result"
+         )"; then
+           issue_parse_exit=0
+         else
+           issue_parse_exit=$?
+           check_errors="$(
+             jq -cn --argjson errors "$check_errors" \
+               --argjson number "$issue_number" \
+               '$errors + [{operation: "parse-issue", number: $number}]'
+           )"
+         fi
+         if [ "$issue_parse_exit" -eq 0 ] && \
+           [ "$(jq -r '.state' <<<"$issue")" = "OPEN" ]; then
+           still_open="$(
+             jq -cn --argjson open "$still_open" \
+               --argjson number "$issue_number" '$open + [$number]'
+           )"
+           stranded="$(
+             jq -cn --argjson issues "$stranded" --argjson issue "$issue" \
+               '$issues + [$issue]'
+           )"
+         fi
+       done < <(jq -r '.[]' <<<"$declared")
+     fi
+
+     if [ "$(jq 'length' <<<"$check_errors")" -ne 0 ]; then
+       # The vocabulary has no success-shaped value for an observation
+       # failure. Keep it in the non-success bucket and distinguish the
+       # failure with the structured check_errors facts below.
+       close_outcome="some-open"
+       close_narration="$(
+         jq -cn '{reason: "the post-merge close-keyword check could not observe every required GitHub result"}'
+       )"
+     elif [ "$(jq 'length' <<<"$declared")" -eq 0 ]; then
+       close_outcome="none-declared"
+       close_narration="$(
+         jq -cn '{reason: "the pull request declared no closing references"}'
+       )"
+     elif [ "$(jq 'length' <<<"$still_open")" -eq 0 ]; then
+       close_outcome="all-closed"
+       close_narration="$(
+         jq -cn '{reason: "GitHub applied every declared close keyword"}'
+       )"
+     else
+       close_outcome="some-open"
+       close_narration="$(
+         jq -cn '{reason: "GitHub did not apply every declared close keyword"}'
+       )"
+     fi
+
+     bash "${CLAUDE_PLUGIN_ROOT}/scripts/trace.sh" append close-keyword-checked \
+       "$(jq -cn --arg owner "$lease_owner" --arg repo "$repository" \
+         --arg ref "#$pr_number" --arg head_sha "$head_sha" \
+         --argjson declared "$declared" --argjson still_open "$still_open" \
+         --arg outcome "$close_outcome" --argjson check_errors "$check_errors" \
+         '{role: "gatekeeper", owner: $owner, repo: $repo, ref: $ref,
+           head_sha: $head_sha, declared: $declared, still_open: $still_open,
+           outcome: $outcome, check_errors: $check_errors}')" \
+       "$close_narration"
+     ```
+
+     Append that `close-keyword-checked` record exactly once, including when a
+     read or parse fails. `declared` and `still_open` contain issue numbers,
+     while `check_errors` contains each failed operation, the referenced issue
+     number when known, and the observed exit code when a command ran. Thus no
+     issue number, state, outcome, or check failure exists only in narration.
+     `some-open` is deliberately the conservative non-success outcome when
+     `check_errors` is non-empty; it does not assert that an unobservable issue
+     was confirmed open, because `still_open` contains only confirmed `OPEN`
+     issues.
+
+     After the append, include the result in the user-facing report for this
+     pull request:
+
+     - For every object in `stranded`, say that
+       `<owner>/<repo>#<number> — <title>` remained open after the merge. Name
+       every stranded issue; do not report this as an ordinary successful
+       merge.
+     - If `check_errors` is non-empty, report that the post-merge check failed,
+       name each failed operation and its exit code when present, and do not
+       claim that the declared issues all closed. Exit `111` specifically means
+       the App authentication failed and the `gh` read never ran.
+     - Only an error-free `all-closed` or `none-declared` result may use the
+       ordinary successful-merge report.
+
+     The merge has already happened. Do not revert it and do not close a
+     stranded issue. A failure here is recorded and reported before stopping;
+     it is never retried with an ambient credential.
+
   **Every one of these calls must go through `gh-as.sh`, never the
   principal's account.** Removing the approve step removed the place where a
   fallback to the principal's identity used to be caught early, so nothing
-  now fails before the merge itself. Route every call through the wrapper and
-  treat exit `111` as a stop.
+  now fails before the merge itself. Route every call through the wrapper. An
+  exit `111` before the merge is a stop; in post-merge step 4 it is first
+  recorded and reported as the already-merged check failure described there.
 
   An `excused` condition is part of a `pass`, so the merge proceeds normally.
   The exception reason already appears in the verdict output and the
@@ -235,7 +396,8 @@ is not strict — it is unclearable, and every merge needs a principal exception
 
 Resolving still means calling `gh`, so it is still bound by step 2: route the
 `gh api graphql` call that resolves the thread through `gh-as.sh` the same
-way, naming `gatekeeper` and this repository ahead of it.
+way, naming `gatekeeper` and this repository ahead of it. `gh-as.sh` derives
+`metadata:read,pull_requests:write` for that mutation.
 
 Resolve a thread only when **all** of these hold:
 

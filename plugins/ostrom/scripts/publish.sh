@@ -32,6 +32,37 @@ publish_time="${MANDATE_PUBLISH_TIME:-${MANDATE_SWEEP_TIME:-$(date -u +%Y-%m-%dT
 queue_file="$MANDATE_QUEUE_FILE"
 gate_file="$MANDATE_GATE_LOG"
 state_file="$MANDATE_STATE_FILE"
+GH_AS_BIN="${MANDATE_GH_AS_BIN:-$SCRIPT_DIR/gh-as.sh}"
+
+github_publish_remote=false
+if [[ "$publish_remote" == */* && "$publish_remote" != /* && "$publish_remote" != *:* ]]; then
+  github_publish_remote=true
+fi
+
+# Only destination-facing git commands need a token. Read and write calls mint
+# independently so cloning/fetching cannot mutate and the final push cannot
+# reach any repository except the configured publication destination.
+publish_git_read() {
+  if $github_publish_remote; then
+    bash "$GH_AS_BIN" publisher "$publish_remote" \
+      --repositories "$publish_remote" \
+      --permissions metadata:read,contents:read -- \
+      git "$@"
+  else
+    git "$@"
+  fi
+}
+
+publish_git_write() {
+  if $github_publish_remote; then
+    bash "$GH_AS_BIN" publisher "$publish_remote" \
+      --repositories "$publish_remote" \
+      --permissions metadata:read,contents:write -- \
+      git "$@"
+  else
+    git "$@"
+  fi
+}
 
 # Exit 3 is a protocol outcome consumed by sweep.sh: the publication was
 # deliberately skipped before any destination-facing command was attempted.
@@ -464,19 +495,22 @@ fi
 
 mkdir -p "$(dirname "$publish_dir")"
 if [ ! -d "$publish_dir/.git" ]; then
-  if [[ "$publish_remote" == */* && "$publish_remote" != /* && "$publish_remote" != *:* ]]; then
+  if $github_publish_remote; then
     command -v gh >/dev/null 2>&1 || {
       echo "mandate publish: gh is required to clone an owner/repo remote; pass a URL or path instead to skip it" >&2
       exit 1
     }
-    gh repo clone "$publish_remote" "$publish_dir" -- --no-checkout >/dev/null
+    bash "$GH_AS_BIN" publisher "$publish_remote" \
+      --repositories "$publish_remote" \
+      --permissions metadata:read,contents:read -- \
+      gh repo clone "$publish_remote" "$publish_dir" -- --no-checkout >/dev/null
   else
     git clone --no-checkout "$publish_remote" "$publish_dir" >/dev/null
   fi
 fi
 
-if git -C "$publish_dir" ls-remote --exit-code --heads origin state >/dev/null 2>&1; then
-  git -C "$publish_dir" fetch --quiet origin state
+if publish_git_read -C "$publish_dir" ls-remote --exit-code --heads origin state >/dev/null 2>&1; then
+  publish_git_read -C "$publish_dir" fetch --quiet origin state
   git -C "$publish_dir" checkout -B state FETCH_HEAD >/dev/null
 else
   if git -C "$publish_dir" checkout --orphan state >/dev/null 2>&1; then
@@ -535,5 +569,5 @@ if git -C "$publish_dir" diff --cached --quiet; then
 fi
 
 git -C "$publish_dir" commit --quiet -m "chore(state): publish governance snapshot $publish_time"
-git -C "$publish_dir" push --quiet origin HEAD:state
+publish_git_write -C "$publish_dir" push --quiet origin HEAD:state
 echo "mandate publish: published $publish_time"

@@ -240,7 +240,12 @@ own, unchanged.
 
 The `builder` argument remains required even though it normally resolves to
 the same credential as every other role. It makes the caller legible at the
-call site; it does not restrict what the resulting token can do.
+call site; it does not restrict what the resulting token can do. `gh-as.sh`
+instead derives a repository-local scope from the command: `issues:read` for
+issue triage, `issues:write` only for filing/commenting/closing/reopening an
+issue, `contents:read` for a fetch, `contents:write` for a push, and
+`pull_requests:write` only when creating a pull request. Every derived scope
+also includes `metadata:read`; a command with no known derivation is refused.
 
 **A builder session that cannot mint an App token must stop working that
 item, not continue as the principal.** Continuing with an ambient token
