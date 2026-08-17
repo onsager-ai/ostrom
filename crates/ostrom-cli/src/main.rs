@@ -15,11 +15,12 @@ use ostrom_core::{
     ResolvedCheck,
 };
 use ostrom_store::{
-    AuditOptions, ExecutableAssessmentDeriver, MigrationOutcome, OstromPaths, PlanOptions,
-    PublishTarget, SweepError, SweepMode, SweepOptions, SweepParityOptions,
+    AuditOptions, DispatchOutcome, DispatchRequest, ExecutableAssessmentDeriver, MigrationOutcome,
+    OstromPaths, PlanOptions, PublishTarget, SelectAction, SelectError, SelectOutcome,
+    SelectRequest, SweepError, SweepMode, SweepOptions, SweepParityOptions,
     UnavailableAssessmentDeriver, acquire_org_from_github, audit, encode_org_snapshots,
-    grant_excuse, list_excuses, list_queue_json, local_drift, migrate, run_plan, run_sweep,
-    run_sweep_parity,
+    encode_selection, grant_excuse, list_excuses, list_queue_json, local_drift, migrate,
+    run_dispatch, run_plan, run_selection, run_sweep, run_sweep_parity,
 };
 
 #[derive(Debug, Parser)]
@@ -31,6 +32,16 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Turn a durable work order into a running implementer.
+    Dispatch {
+        #[arg(allow_hyphen_values = true)]
+        arguments: Vec<String>,
+    },
+    /// Select graph-dispatchable work using the settled mandate precedence.
+    SelectWork {
+        #[arg(allow_hyphen_values = true)]
+        arguments: Vec<String>,
+    },
     /// Inspect the private queue.
     Queue {
         #[command(subcommand)]
@@ -160,6 +171,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let paths = OstromPaths::resolve()?;
     match cli.command {
+        Command::Dispatch { arguments } => {
+            run_dispatch_command(arguments);
+        }
+        Command::SelectWork { arguments } => {
+            run_select_work(arguments);
+        }
         Command::Queue {
             command: QueueCommand::List { format },
         } => match format {
@@ -387,6 +404,118 @@ fn optional_environment_time(name: &str) -> Result<Option<DateTime<Utc>>, String
                 .map_err(|_| format!("{name} must be an RFC 3339 timestamp"))
         })
         .transpose()
+}
+
+fn run_dispatch_command(arguments: Vec<String>) -> ! {
+    let [order_file] = arguments.as_slice() else {
+        eprintln!("usage: dispatch.sh <work-order-file>");
+        std::process::exit(2);
+    };
+    let working_directory = env::current_dir().unwrap_or_else(|error| {
+        eprintln!("ostrom dispatch: could not resolve working directory: {error}");
+        std::process::exit(1);
+    });
+    let plugin_root = env::var_os("OSTROM_PLUGIN_ROOT")
+        .or_else(|| env::var_os("CLAUDE_PLUGIN_ROOT"))
+        .map_or_else(|| working_directory.join("plugins/ostrom"), PathBuf::from);
+    let request = DispatchRequest {
+        paths: compatible_command_paths(),
+        working_directory,
+        plugin_root,
+        order_file: PathBuf::from(order_file),
+    };
+    match run_dispatch(&request) {
+        Ok(DispatchOutcome::Started(unit)) => {
+            println!("{unit}");
+            std::process::exit(0);
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(error.code);
+        }
+    }
+}
+
+fn run_select_work(arguments: Vec<String>) -> ! {
+    let usage = || {
+        eprintln!("usage: select-work.sh list | select <owner> [already-attempted-id ...]");
+        std::process::exit(2);
+    };
+    let action = match arguments.as_slice() {
+        [action] if action == "list" => SelectAction::List,
+        [action, owner, attempted @ ..] if action == "select" && !owner.is_empty() => {
+            SelectAction::Select {
+                owner: owner.clone(),
+                attempted: attempted.iter().cloned().collect(),
+            }
+        }
+        [action, owner, ..] if action == "select" && owner.is_empty() => {
+            eprintln!("mandate selection: owner must not be empty");
+            std::process::exit(2);
+        }
+        _ => usage(),
+    };
+    let paths = compatible_command_paths();
+    let request = SelectRequest {
+        paths,
+        working_directory: env::current_dir().unwrap_or_else(|error| {
+            eprintln!("mandate selection: could not resolve working directory: {error}");
+            std::process::exit(1);
+        }),
+        action,
+    };
+    match run_selection(&request) {
+        Ok((outcome, diagnostics)) => {
+            for diagnostic in diagnostics {
+                eprintln!("{diagnostic}");
+            }
+            if outcome == SelectOutcome::Empty {
+                let code = if matches!(request.action, SelectAction::Select { .. }) {
+                    3
+                } else {
+                    0
+                };
+                std::process::exit(code);
+            }
+            if let Err(error) = io::stdout().write_all(&encode_selection(&outcome)) {
+                eprintln!("mandate selection: could not write selection: {error}");
+                std::process::exit(1);
+            }
+            std::process::exit(0);
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            let code = match error {
+                SelectError::MissingState
+                | SelectError::StateRead { .. }
+                | SelectError::InvalidGraph
+                | SelectError::RankingMismatch
+                | SelectError::StaleRanking(_) => 4,
+                _ => 1,
+            };
+            std::process::exit(code);
+        }
+    }
+}
+
+fn compatible_command_paths() -> OstromPaths {
+    if env::var_os("OSTROM_HOME").is_some_and(|home| !home.to_string_lossy().trim().is_empty()) {
+        return OstromPaths::resolve().unwrap_or_else(|error| {
+            eprintln!("ostrom: {error}");
+            std::process::exit(1);
+        });
+    }
+    if let Some(config) = env::var_os("CLAUDE_CONFIG_DIR") {
+        let root = PathBuf::from(config).join("ostrom");
+        return OstromPaths {
+            config: root.clone(),
+            state: root,
+        };
+    }
+    OstromPaths::resolve().unwrap_or_else(|error| {
+        eprintln!("ostrom: {error}");
+        std::process::exit(1);
+    })
 }
 
 struct PlanCheckResolutions {

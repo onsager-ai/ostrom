@@ -2146,7 +2146,7 @@ fn load_work_orders(
     Ok((orders, warnings))
 }
 
-pub(crate) fn load_config(paths: &OstromPaths, cwd: &Path) -> Result<MandateConfig, SweepError> {
+pub fn load_config(paths: &OstromPaths, cwd: &Path) -> Result<MandateConfig, SweepError> {
     let user_path = paths.config.join("mandates.yaml");
     let repo_path = cwd.join(".ostrom/mandates.yaml");
     if !user_path.exists() && !repo_path.exists() {
@@ -2168,7 +2168,7 @@ pub(crate) fn load_config(paths: &OstromPaths, cwd: &Path) -> Result<MandateConf
     MandateConfig::from_yaml(&serialized).map_err(|error| SweepError::Config(error.to_string()))
 }
 
-pub(crate) fn load_config_or_defaults(
+pub fn load_config_or_defaults(
     paths: &OstromPaths,
     cwd: &Path,
 ) -> Result<MandateConfig, SweepError> {

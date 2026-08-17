@@ -2,6 +2,7 @@
 
 mod app_token;
 mod check_store;
+mod dispatch;
 mod file_store;
 mod lease;
 mod leaves;
@@ -11,11 +12,13 @@ mod pass_state;
 mod paths;
 mod plan;
 mod queue;
+mod selection;
 mod sweep;
 mod trace;
 
 pub use app_token::AppTokenError;
 pub use check_store::JsonlCheckStore;
+pub use dispatch::{DispatchError, DispatchOutcome, DispatchRequest, run_dispatch};
 pub use file_store::JsonlSweepStore;
 pub use lease::{LeaseRecord, read_lease, write_lease};
 pub use leaves::{
@@ -32,9 +35,14 @@ pub use plan::{
     run_plan,
 };
 pub use queue::{QueueDocument, list_queue_json, read_queue, write_queue};
+pub use selection::{
+    PlanApplication, SelectAction, SelectError, SelectOutcome, SelectRequest, encode_selection,
+    run_selection,
+};
 pub use sweep::{
     PublishTarget, RepositorySnapshot, SweepError, SweepFixture, SweepMode, SweepOptions,
-    SweepOutcome, acquire_org_from_github, encode_org_snapshots, run_sweep,
+    SweepOutcome, acquire_org_from_github, encode_org_snapshots, load_config,
+    load_config_or_defaults, run_sweep,
 };
 pub use trace::{
     MalformedTraceRow, TraceAppend, TraceFactRecord, TraceRead, append_trace, read_trace,

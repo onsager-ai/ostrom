@@ -157,7 +157,7 @@ sentiment, or backlog heuristics. Use the mechanical selector, retaining every
 item ID already attempted in this pass and passing those IDs on later calls:
 
 ```sh
-selected_row="$(bash "${CLAUDE_PLUGIN_ROOT}/scripts/select-work.sh" \
+selected_row="$(ostrom select-work \
   select "$lease_owner" "${attempted_item_ids[@]}")"
 ```
 
@@ -313,10 +313,10 @@ Create the canonical durable order, then dispatch it through the backend seam:
 
 ```sh
 order_file="$(bash "${CLAUDE_PLUGIN_ROOT}/scripts/work-order.sh" create "$candidate_file")"
-unit_name="$(bash "${CLAUDE_PLUGIN_ROOT}/scripts/dispatch.sh" "$order_file")"
+unit_name="$(ostrom dispatch "$order_file")"
 ```
 
-Do not invoke `systemd-run` yourself. `dispatch.sh` is the protocol verb and
+Do not invoke `systemd-run` yourself. `ostrom dispatch` is the protocol verb and
 selects the backend; triage and the work-order format must not assume that the
 implementer runs on this machine, shares this filesystem, or has a systemd
 journal. The current systemd backend atomically checks all three duplicate
