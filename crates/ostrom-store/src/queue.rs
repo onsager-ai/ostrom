@@ -140,15 +140,30 @@ fn validate_queue(value: &Value) -> Result<(), String> {
     require_string(object, "id")?;
     require_string(object, "repo")?;
     let reference = require_string(object, "ref")?;
-    if reference.strip_prefix('#').is_none_or(|digits| {
-        digits.is_empty() || !digits.chars().all(|character| character.is_ascii_digit())
-    }) {
-        return Err("ref must have the shape #N".to_owned());
-    }
     let kind = require_string(object, "kind")?;
+    let issue_reference = reference.strip_prefix('#').is_some_and(|digits| {
+        !digits.is_empty() && digits.chars().all(|character| character.is_ascii_digit())
+    });
+    let branch_reference = kind == "unexplained-write"
+        && reference.strip_prefix('@').is_some_and(|branch| {
+            !branch.is_empty()
+                && !branch
+                    .chars()
+                    .any(|character| character.is_whitespace() || character.is_control())
+        });
+    if !issue_reference && !branch_reference {
+        return Err("ref must have the shape #N or an unexplained-write @branch".to_owned());
+    }
     if !matches!(
         kind,
-        "tripwire" | "decision" | "moved" | "stuck" | "drift" | "parked" | "merge-gate-fault"
+        "tripwire"
+            | "decision"
+            | "moved"
+            | "stuck"
+            | "drift"
+            | "parked"
+            | "merge-gate-fault"
+            | "unexplained-write"
     ) {
         return Err("kind is not recognized".to_owned());
     }
@@ -226,7 +241,9 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{list_queue_json, read_queue, valid_blocked_by};
+    use serde_json::json;
+
+    use super::{QueueDocument, list_queue_json, read_queue, valid_blocked_by};
 
     #[test]
     fn blocked_by_matches_bash_grammar() {
@@ -250,6 +267,21 @@ mod tests {
         fs::write(&queue, "{not json}\n").expect("write fixture");
         let error = read_queue(&queue).expect_err("bad queue must fail");
         assert!(error.to_string().contains("malformed queue row 1"));
+    }
+
+    #[test]
+    fn unexplained_branch_write_accepts_its_reserved_reference_shape() {
+        let row = json!({
+            "id": "placeholder-org/alpha@refs/heads/ostrom/item",
+            "repo": "placeholder-org/alpha",
+            "ref": "@ostrom/item",
+            "title": "Pushed branch ostrom/item",
+            "kind": "unexplained-write",
+            "mandate": {"reason": "placeholder alarm"},
+            "state": "pending",
+            "opened": "2026-08-01T00:00:00Z",
+        });
+        QueueDocument::from_value(row).expect("unexplained branch row is valid");
     }
 
     #[test]
