@@ -105,8 +105,10 @@ itself could not authenticate and the given command never ran at all. Any
 other exit code is the given command's own, unchanged.
 
 The required `gatekeeper` argument names the caller at the call site; it does
-not narrow the shared token. The gatekeeper's own role is recorded in its
-`decision-taken` trace record, not stamped onto the merge commit — see
+not narrow the shared token. `gh-as.sh` derives the repository-local
+`metadata:read,pull_requests:read` scope from this exact `gh pr list` command;
+every pagination retry must repeat the same command shape. The gatekeeper's own role is
+recorded in its `decision-taken` trace record, not stamped onto the merge commit — see
 `/ostrom:merge` step 4 for why. An `Ostrom-Role: builder` trailer arriving on a
 commit under review was written by the builder itself, so it is self-asserted
 advisory metadata, not evidence of who acted and never an input to the gate.

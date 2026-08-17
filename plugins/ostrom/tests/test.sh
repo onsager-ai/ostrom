@@ -1147,6 +1147,14 @@ cat >"$fake_dispatch_gh" <<'SH'
 if [ -n "${FAKE_GH_CALLS:-}" ]; then
   printf '%s\n' "$*" >>"$FAKE_GH_CALLS"
 fi
+# Strip gh-as.sh's explicit scope envelope, then retain the historical
+# positional shape used by this fake below ($3 is the command, $4 its verb).
+while [ "$#" -gt 0 ] && [ "$1" != -- ]; do
+  shift
+done
+[ "${1:-}" = -- ] || exit 98
+shift
+set -- ignored ignored "$@"
 if [ "$4" = api ] && [[ "$5" == repos/*/branches\?per_page=100\&page=* ]]; then
   branch_page="${5##*page=}"
   if [ "${FAKE_REMOTE_QUERY_FAIL:-0}" -eq 1 ] || \
@@ -1421,15 +1429,15 @@ if [ "$(grep -Fc "$expected_branch_guard_error" "$branch_guard_stderr")" -ne 1 ]
   echo "remote branch guard stderr omitted branch detail" >&2
   exit 1
 fi
-if [ "$(grep -Fc 'builder example-org/example-repo gh api repos/example-org/example-repo/branches?per_page=100&page=1' "$branch_guard_gh_calls")" -ne 1 ]; then
+if [ "$(grep -Fc 'builder example-org/example-repo --repositories example-org/example-repo --permissions metadata:read,contents:read -- gh api repos/example-org/example-repo/branches?per_page=100&page=1' "$branch_guard_gh_calls")" -ne 1 ]; then
   echo "remote branch guard did not query branches through the builder wrapper" >&2
   exit 1
 fi
-if [ "$(grep -c '^builder example-org/example-repo gh ' "$branch_guard_gh_calls")" -ne "$(wc -l <"$branch_guard_gh_calls" | tr -d '[:space:]')" ]; then
+if [ "$(grep -c '^builder example-org/example-repo --repositories example-org/example-repo --permissions [a-z_:,]* -- gh ' "$branch_guard_gh_calls")" -ne "$(wc -l <"$branch_guard_gh_calls" | tr -d '[:space:]')" ]; then
   echo "remote branch guard made a remote read outside the builder wrapper" >&2
   exit 1
 fi
-if [ "$(grep -Fc "builder example-org/example-repo gh pr list --repo example-org/example-repo --head $dispatch_branch --state all --json number,state,mergedAt" "$branch_guard_gh_calls")" -ne 1 ]; then
+if [ "$(grep -Fc "builder example-org/example-repo --repositories example-org/example-repo --permissions metadata:read,pull_requests:read -- gh pr list --repo example-org/example-repo --head $dispatch_branch --state all --json number,state,mergedAt" "$branch_guard_gh_calls")" -ne 1 ]; then
   echo "remote branch guard did not query branch pull requests through the builder wrapper" >&2
   exit 1
 fi
@@ -1470,7 +1478,7 @@ jq -s -e --arg branch "$dispatch_branch" '
   and .[0].fact.branch_listing.matched_branch == $branch
 ' "$multi_page_branch_config/ostrom/sprint.jsonl" >/dev/null
 grep -Fqx \
-  'builder example-org/example-repo gh api repos/example-org/example-repo/branches?per_page=100&page=2' \
+  'builder example-org/example-repo --repositories example-org/example-repo --permissions metadata:read,contents:read -- gh api repos/example-org/example-repo/branches?per_page=100&page=2' \
   "$multi_page_branch_calls"
 
 # #167: a squash-merged PR proves that its undeleted head branch is landed
@@ -1519,11 +1527,11 @@ if ! jq -s -e 'length == 1 and .[0].kind == "work-dispatched"' \
   echo "merged branch did not reach the remaining dispatch guards" >&2
   exit 1
 fi
-if [ "$(grep -Fc "builder example-org/example-repo gh pr list --repo example-org/example-repo --head $dispatch_branch --state all --json number,state,mergedAt" "$merged_branch_gh_calls")" -ne 1 ]; then
+if [ "$(grep -Fc "builder example-org/example-repo --repositories example-org/example-repo --permissions metadata:read,pull_requests:read -- gh pr list --repo example-org/example-repo --head $dispatch_branch --state all --json number,state,mergedAt" "$merged_branch_gh_calls")" -ne 1 ]; then
   echo "merged branch PR was not queried through the builder wrapper" >&2
   exit 1
 fi
-if [ "$(grep -Fc 'builder example-org/example-repo gh pr list --repo example-org/example-repo --state open --limit 1000 --json number,title,body,url' "$merged_branch_gh_calls")" -ne 1 ]; then
+if [ "$(grep -Fc 'builder example-org/example-repo --repositories example-org/example-repo --permissions metadata:read,pull_requests:read -- gh pr list --repo example-org/example-repo --state open --limit 1000 --json number,title,body,url' "$merged_branch_gh_calls")" -ne 1 ]; then
   echo "merged branch did not continue to the open-PR guard" >&2
   exit 1
 fi
@@ -1722,10 +1730,10 @@ for closing_pr_state in OPEN MERGED; do
   grep -Fq "matched_key=closing_pull_request:$closing_pr_url" \
     "$closing_pr_stderr"
   grep -Fqx \
-    'builder example-org/example-repo gh issue view #123 --repo example-org/example-repo --json closedByPullRequestsReferences' \
+    'builder example-org/example-repo --repositories example-org/example-repo --permissions metadata:read,issues:read,pull_requests:read -- gh issue view #123 --repo example-org/example-repo --json closedByPullRequestsReferences' \
     "$closing_pr_calls"
   grep -Fqx \
-    "builder example-org/example-repo gh pr view $closing_pr_url --json number,state,mergedAt,url" \
+    "builder example-org/example-repo --repositories example-org/example-repo --permissions metadata:read,pull_requests:read -- gh pr view $closing_pr_url --json number,state,mergedAt,url" \
     "$closing_pr_calls"
 done
 
@@ -1840,7 +1848,7 @@ dispatch_unit="$(
     FAKE_SYSTEMD_CALLS="$dispatch_calls" \
     bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$dispatch_order"
 )"
-if [ "$(grep -Fc 'builder example-org/example-repo gh api repos/example-org/example-repo/branches?per_page=100&page=1' "$clean_dispatch_gh_calls")" -ne 1 ]; then
+if [ "$(grep -Fc 'builder example-org/example-repo --repositories example-org/example-repo --permissions metadata:read,contents:read -- gh api repos/example-org/example-repo/branches?per_page=100&page=1' "$clean_dispatch_gh_calls")" -ne 1 ]; then
   echo "clean dispatch did not perform the remote branch preflight" >&2
   exit 1
 fi
@@ -2159,6 +2167,11 @@ fake_implement_gh="$implement_bin/gh-as"
 cat >"$fake_implement_gh" <<'SH'
 #!/usr/bin/env bash
 shift 2
+while [ "$#" -gt 0 ] && [ "$1" != -- ]; do
+  shift
+done
+[ "${1:-}" = -- ] || exit 98
+shift
 if [ -n "${FAKE_IMPLEMENT_COMMANDS:-}" ]; then
   printf '%q ' "$@" >>"$FAKE_IMPLEMENT_COMMANDS"
   printf '\n' >>"$FAKE_IMPLEMENT_COMMANDS"
@@ -3728,6 +3741,11 @@ repository="$2"
 shift 2
 [ "$role" = builder ]
 [ "$repository" = example-org/repair-repo ]
+while [ "$#" -gt 0 ] && [ "$1" != -- ]; do
+  shift
+done
+[ "${1:-}" = -- ] || exit 98
+shift
 if [ "$1" = gh ] && [ "$2" = pr ] && [ "$3" = list ]; then
   cat "$PUBLISHED_REPAIR_PRS"
   exit 0
@@ -3824,7 +3842,7 @@ jq -s -e '
   and ([.[] | select(.fact.ref == "#3" or .fact.ref == "#4")] | length) == 0
 ' "$published_repair_trace" >/dev/null
 
-[ "$(grep -c '^builder example-org/repair-repo gh pr list ' \
+[ "$(grep -c '^builder example-org/repair-repo --repositories example-org/repair-repo --permissions metadata:read,pull_requests:read,checks:read,statuses:read -- gh pr list ' \
   "$published_repair_calls")" -eq 1 ]
 [ "$(grep -c ' git .* fetch .*https://github.com/example-org/repair-repo.git ' \
   "$published_repair_calls")" -eq 3 ]
@@ -4181,6 +4199,11 @@ assert_bad_selector title-run "title:*abcdefghijklmnopqrstuvwxyz*" \
 # GitHub App authentication fails closed before any network call. The curl
 # stub is the network boundary for every app-token test in this suite.
 app_token_fixture="$fixture/app-token"
+if grep -Fq -- "--data ''" "$PLUGIN_ROOT/scripts/app-token.sh"; then
+  echo 'app-token must never perform an empty, unscoped token exchange' >&2
+  exit 1
+fi
+grep -Fq -- '--data "$exchange_body"' "$PLUGIN_ROOT/scripts/app-token.sh"
 mkdir -p "$app_token_fixture/bin"
 cat >"$app_token_fixture/bin/curl" <<'EOF'
 #!/usr/bin/env bash
@@ -4189,10 +4212,16 @@ set -euo pipefail
 authorization_config="$(cat)"
 [ -n "$authorization_config" ]
 url=""
+request_body=""
+previous=""
 for argument in "$@"; do
+  if [ "$previous" = --data ]; then
+    request_body="$argument"
+  fi
   case "$argument" in
     https://api.github.com/*) url="$argument" ;;
   esac
+  previous="$argument"
 done
 if [ -n "${FAKE_CURL_CALL_LOG:-}" ]; then
   printf '%s\n' "$url" >>"$FAKE_CURL_CALL_LOG"
@@ -4203,10 +4232,32 @@ case "${FAKE_CURL_MODE:-transport-failure}:$url" in
     printf '{"message":"Not Found"}\n404'
     ;;
   success:https://api.github.com/repos/placeholder-owner/placeholder-repo/installation)
-    printf '{"id":%s}\n200' "$$"
+    printf '{"id":%s,"permissions":{"metadata":"read","contents":"write","issues":"write","pull_requests":"write","checks":"read","statuses":"read","actions":"read"}}\n200' "$$"
+    ;;
+  limited:https://api.github.com/repos/placeholder-owner/placeholder-repo/installation)
+    printf '{"id":%s,"permissions":{"metadata":"read","pull_requests":"read"}}\n200' "$$"
     ;;
   success:https://api.github.com/app/installations/*/access_tokens)
-    printf '{"token":"stub-installation-token"}'
+    jq -e '
+      type == "object"
+      and keys == ["permissions", "repositories"]
+      and (.repositories | type == "array" and length > 0
+        and all(.[]; type == "string" and length > 0))
+      and (.permissions | type == "object" and length > 0
+        and all(to_entries[]; .value == "read" or .value == "write"))
+    ' >/dev/null <<<"$request_body" || exit 97
+    jq -cn --argjson scope "$request_body" '
+      $scope + {
+        token: (
+          if any($scope.permissions[]; . == "write")
+          then "stub-installation-token-write"
+          else "stub-installation-token-read"
+          end
+        ),
+        repository_selection: "selected"
+      }
+    '
+    printf '\n201'
     ;;
   *) exit 99 ;;
 esac
@@ -4248,6 +4299,10 @@ esac
 EOF
 chmod +x "$app_token_fixture/bin/curl" "$app_token_fixture/bin/openssl"
 app_token_curl_log="$app_token_fixture/curl.log"
+app_token_test_scope=(
+  --repositories placeholder-owner/placeholder-repo
+  --permissions metadata:read,pull_requests:read
+)
 
 run_app_token_failure() {
   app_token_name="$1"
@@ -4255,6 +4310,10 @@ run_app_token_failure() {
   shift 2
   app_token_stdout="$app_token_fixture/$app_token_name.stdout"
   app_token_stderr="$app_token_fixture/$app_token_name.stderr"
+  app_token_args=("$@")
+  if [ "$#" -ge 2 ] && [[ " $* " != *" --repositories "* ]]; then
+    app_token_args+=("${app_token_test_scope[@]}")
+  fi
   rm -f "$app_token_curl_log"
   set +e
   PATH="$app_token_fixture/bin:$PATH" \
@@ -4263,7 +4322,7 @@ run_app_token_failure() {
     FAKE_CURL_CALL_LOG="$app_token_curl_log" \
     CLAUDE_CONFIG_DIR="$app_token_config_dir" \
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-    bash "$PLUGIN_ROOT/scripts/app-token.sh" "$@" \
+    bash "$PLUGIN_ROOT/scripts/app-token.sh" "${app_token_args[@]}" \
       >"$app_token_stdout" 2>"$app_token_stderr"
   app_token_status=$?
   set -e
@@ -4296,10 +4355,28 @@ run_app_token_success() {
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
     bash "$PLUGIN_ROOT/scripts/app-token.sh" \
       "$app_token_role" placeholder-owner/placeholder-repo \
-      >"$app_token_stdout" 2>"$app_token_stderr"
-  grep -Fxq 'stub-installation-token' "$app_token_stdout"
+      "${app_token_test_scope[@]}" \
+      >"$app_token_stdout" 2>"$app_token_stderr" || {
+        cat "$app_token_stderr" >&2
+        return 1
+      }
+  grep -Fxq 'stub-installation-token-read' "$app_token_stdout"
   [ ! -s "$app_token_stderr" ]
   [ "$(wc -l <"$app_token_curl_log" | tr -d '[:space:]')" -eq 2 ]
+  jq -s -e --arg role "$app_token_role" '
+    last.kind == "installation-token-minted"
+    and last.fact == {
+      role: $role,
+      repositories: ["placeholder-owner/placeholder-repo"],
+      permissions: {metadata: "read", pull_requests: "read"}
+    }
+    and last.narration == {}
+  ' "$app_token_config_dir/ostrom/sprint.jsonl" >/dev/null
+  if grep -Eq 'stub-installation-token|"installation_id"|"app_id"' \
+      "$app_token_config_dir/ostrom/sprint.jsonl"; then
+    echo 'granted-scope trace must not contain credentials or installation identifiers' >&2
+    exit 1
+  fi
   if grep -q 'ambient-principal-value' \
     "$app_token_stdout" "$app_token_stderr" "$app_token_curl_log"; then
     echo 'app-token success output and request log must not leak an ambient principal credential' >&2
@@ -4309,8 +4386,30 @@ run_app_token_success() {
 
 app_token_missing_argument="$app_token_fixture/missing-argument"
 run_app_token_failure missing-argument "$app_token_missing_argument"
-grep -Fxq 'app-token: usage: app-token.sh <role> <owner>/<repo>' \
+grep -Fxq 'app-token: usage: app-token.sh <role> <owner>/<repo> --repositories <repo[,repo...]> --permissions <permission:level[,permission:level...]>' \
   "$app_token_fixture/missing-argument.stderr"
+
+# #217: omitting scope is a distinct fail-closed caller error and happens
+# before credentials or any network endpoint can be touched.
+app_token_unscoped="$app_token_fixture/unscoped"
+mkdir -p "$app_token_unscoped"
+set +e
+PATH="$app_token_fixture/bin:$PATH" \
+  FAKE_CURL_CALL_LOG="$app_token_curl_log" \
+  CLAUDE_CONFIG_DIR="$app_token_unscoped" \
+  CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+  bash "$PLUGIN_ROOT/scripts/app-token.sh" \
+    gatekeeper placeholder-owner/placeholder-repo \
+    >"$app_token_fixture/unscoped.stdout" \
+    2>"$app_token_fixture/unscoped.stderr"
+app_token_unscoped_status=$?
+set -e
+[ "$app_token_unscoped_status" -eq 2 ]
+[ ! -s "$app_token_fixture/unscoped.stdout" ]
+grep -Fxq \
+  'app-token: unscoped token request rejected: caller must supply --repositories' \
+  "$app_token_fixture/unscoped.stderr"
+[ ! -e "$app_token_curl_log" ]
 
 app_token_invalid_role="$app_token_fixture/invalid-role"
 for invalid_role_case in \
@@ -4489,6 +4588,7 @@ PATH="$app_token_fixture/bin:$PATH" \
   CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
   bash "$PLUGIN_ROOT/scripts/app-token.sh" \
     gatekeeper placeholder-owner/placeholder-repo \
+    "${app_token_test_scope[@]}" \
     >"$app_token_fixture/not-installed.stdout" \
     2>"$app_token_fixture/not-installed.stderr"
 app_token_not_installed_status=$?
@@ -4533,9 +4633,10 @@ PATH="$app_token_fixture/bin:$PATH" \
   CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
   bash "$PLUGIN_ROOT/scripts/app-token.sh" \
     gatekeeper placeholder-owner/placeholder-repo \
+    "${app_token_test_scope[@]}" \
     >"$app_token_fixture/stale-id.stdout" \
     2>"$app_token_fixture/stale-id.stderr"
-grep -Fxq 'stub-installation-token' "$app_token_fixture/stale-id.stdout"
+grep -Fxq 'stub-installation-token-read' "$app_token_fixture/stale-id.stdout"
 [ ! -s "$app_token_fixture/stale-id.stderr" ]
 [ "$(wc -l <"$app_token_curl_log" | tr -d '[:space:]')" -eq 2 ]
 grep -Fxq \
@@ -4551,6 +4652,66 @@ if grep -q 'OBSOLETE_INSTALLATION_ID' \
   echo 'stale installation ID must not select or leak into the token exchange' >&2
   exit 1
 fi
+
+# A syntactically valid scope that exceeds the installation is an App
+# configuration refusal, distinct from malformed caller scope and network
+# failure, and it stops before the exchange endpoint.
+app_token_limited="$app_token_fixture/limited"
+mkdir -p "$app_token_limited/ostrom"
+app_token_limited_key="$app_token_limited/placeholder.pem"
+: >"$app_token_limited_key"
+cat >"$app_token_limited/ostrom/secrets.yaml" <<YAML
+shared:
+  app_id: 5
+  private_key_path: $app_token_limited_key
+YAML
+rm -f "$app_token_curl_log"
+set +e
+PATH="$app_token_fixture/bin:$PATH" \
+  FAKE_CURL_MODE=limited FAKE_CURL_CALL_LOG="$app_token_curl_log" \
+  CLAUDE_CONFIG_DIR="$app_token_limited" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+  bash "$PLUGIN_ROOT/scripts/app-token.sh" publisher \
+    placeholder-owner/placeholder-repo \
+    --repositories placeholder-owner/placeholder-repo \
+    --permissions metadata:read,contents:write \
+    >"$app_token_fixture/limited.stdout" 2>"$app_token_fixture/limited.stderr"
+app_token_limited_status=$?
+set -e
+[ "$app_token_limited_status" -eq 2 ]
+[ ! -s "$app_token_fixture/limited.stdout" ]
+grep -Fq \
+  'app-token: scope refused: GitHub App installation lacks requested permission(s): contents:write (installation grants none)' \
+  "$app_token_fixture/limited.stderr"
+[ "$(wc -l <"$app_token_curl_log" | tr -d '[:space:]')" -eq 1 ]
+if grep -q '/access_tokens' "$app_token_curl_log"; then
+  echo 'permission refusal must stop before the token exchange' >&2
+  exit 1
+fi
+
+run_app_token_failure malformed-scope "$app_token_limited" \
+  publisher placeholder-owner/placeholder-repo \
+  --repositories placeholder-owner/placeholder-repo \
+  --permissions contents:admin
+grep -Fxq \
+  'app-token: caller scope is invalid: permission contents must request read or write' \
+  "$app_token_fixture/malformed-scope.stderr"
+
+app_token_network_stderr="$app_token_fixture/network.stderr"
+rm -f "$app_token_curl_log"
+set +e
+PATH="$app_token_fixture/bin:$PATH" \
+  FAKE_CURL_MODE=transport-failure FAKE_CURL_CALL_LOG="$app_token_curl_log" \
+  CLAUDE_CONFIG_DIR="$app_token_limited" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+  bash "$PLUGIN_ROOT/scripts/app-token.sh" publisher \
+    placeholder-owner/placeholder-repo \
+    --repositories placeholder-owner/placeholder-repo \
+    --permissions metadata:read \
+    >/dev/null 2>"$app_token_network_stderr"
+app_token_network_status=$?
+set -e
+[ "$app_token_network_status" -eq 2 ]
+grep -Fxq 'app-token: GitHub App installation lookup network failure' \
+  "$app_token_network_stderr"
 
 # gh-as.sh is the only sanctioned way a session-issued command mints and
 # uses a role token: a session's Bash tool cannot itself capture
@@ -4582,11 +4743,62 @@ set -euo pipefail
 printf '%s\n' "${GH_TOKEN:-}" >>"$GH_AS_TEST_SEEN_FILE"
 printf '%s\n' "${GITHUB_TOKEN:-}" >>"$GH_AS_TEST_SEEN_FILE"
 printf 'gh-as-test: called with %s\n' "$*"
+if [ "${1:-} ${2:-}" = "api --method" ] && [ "${3:-}" = PATCH ]; then
+  if [ "${GH_TOKEN:-}" != stub-installation-token-write ]; then
+    echo 'HTTP 403: Resource not accessible by integration' >&2
+    exit 1
+  fi
+fi
+if [ "${1:-} ${2:-} ${3:-}" = "repo view placeholder-owner/other-repo" ]; then
+  echo 'HTTP 404: Not Found' >&2
+  exit 1
+fi
 if [ "${1:-}" = "exit-code" ]; then
   exit "$2"
 fi
 EOF
 chmod +x "$gh_as_fixture/bin/gh"
+gh_as_read_scope=(
+  --repositories placeholder-owner/placeholder-repo
+  --permissions metadata:read,pull_requests:read
+  --
+)
+gh_as_write_scope=(
+  --repositories placeholder-owner/placeholder-repo
+  --permissions metadata:read,contents:write
+  --
+)
+
+# The compatibility invocation keeps role/repository/command in their original
+# positions. gh-as derives this known command's read-only scope, while an
+# unknown command fails before minting rather than inheriting the App ceiling.
+gh_as_derived_seen="$gh_as_fixture/derived-seen"
+gh_as_derived_stderr="$gh_as_fixture/derived.err"
+PATH="$gh_as_fixture/bin:$app_token_fixture/bin:$PATH" \
+  GH_TOKEN="" GITHUB_TOKEN="" FAKE_CURL_MODE=success \
+  GH_AS_TEST_SEEN_FILE="$gh_as_derived_seen" \
+  CLAUDE_CONFIG_DIR="$gh_as_fixture/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+  bash "$PLUGIN_ROOT/scripts/gh-as.sh" gatekeeper \
+    placeholder-owner/placeholder-repo gh pr list \
+    >/dev/null 2>"$gh_as_derived_stderr"
+[ ! -s "$gh_as_derived_stderr" ]
+grep -Fxq 'stub-installation-token-read' "$gh_as_derived_seen"
+
+gh_as_unknown_stderr="$gh_as_fixture/unknown.err"
+rm -f "$app_token_curl_log"
+set +e
+PATH="$gh_as_fixture/bin:$app_token_fixture/bin:$PATH" \
+  FAKE_CURL_CALL_LOG="$app_token_curl_log" \
+  CLAUDE_CONFIG_DIR="$gh_as_fixture/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+  bash "$PLUGIN_ROOT/scripts/gh-as.sh" gatekeeper \
+    placeholder-owner/placeholder-repo true \
+    >/dev/null 2>"$gh_as_unknown_stderr"
+gh_as_unknown_status=$?
+set -e
+[ "$gh_as_unknown_status" -eq 111 ]
+grep -Fq 'gh-as: unscoped token request rejected: command has no known scope' \
+  "$gh_as_unknown_stderr"
+[ ! -e "$app_token_curl_log" ]
 
 # Success: the token reaches the wrapped command's environment, but never
 # gh-as.sh's own stdout or stderr, and its exit code is the wrapped
@@ -4605,12 +4817,13 @@ PATH="$gh_as_fixture/bin:$app_token_fixture/bin:$PATH" \
   CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
   bash "$PLUGIN_ROOT/scripts/gh-as.sh" gatekeeper \
     placeholder-owner/placeholder-repo \
+    "${gh_as_read_scope[@]}" \
     gh pr list --repo placeholder-owner/placeholder-repo \
     >"$gh_as_stdout" 2>"$gh_as_stderr"
 gh_as_status=$?
 [ "$gh_as_status" -eq 0 ]
-grep -Fxq 'stub-installation-token' <(sed -n '1p' "$gh_as_seen")
-grep -Fxq 'stub-installation-token' <(sed -n '2p' "$gh_as_seen")
+grep -Fxq 'stub-installation-token-read' <(sed -n '1p' "$gh_as_seen")
+grep -Fxq 'stub-installation-token-read' <(sed -n '2p' "$gh_as_seen")
 grep -Fq 'gh-as-test: called with pr list --repo placeholder-owner/placeholder-repo' \
   "$gh_as_stdout"
 [ ! -s "$gh_as_stderr" ]
@@ -4618,6 +4831,101 @@ if grep -q 'stub-installation-token' "$gh_as_stdout" "$gh_as_stderr"; then
   echo 'gh-as success output must not leak the minted installation token' >&2
   exit 1
 fi
+
+# Every command shape used by the interactive protocols keeps the historical
+# role/repository/command positions while deriving the action's actual scope.
+assert_derived_gh_scope() {
+  derived_name="$1"
+  expected_permissions="$2"
+  shift 2
+  derived_seen="$gh_as_fixture/derived-$derived_name-seen"
+  PATH="$gh_as_fixture/bin:$app_token_fixture/bin:$PATH" \
+    GH_TOKEN="" GITHUB_TOKEN="" FAKE_CURL_MODE=success \
+    GH_AS_TEST_SEEN_FILE="$derived_seen" \
+    CLAUDE_CONFIG_DIR="$gh_as_fixture/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/gh-as.sh" gatekeeper \
+      placeholder-owner/placeholder-repo "$@" >/dev/null
+  jq -s -e --argjson expected "$expected_permissions" '
+    last.fact.repositories == ["placeholder-owner/placeholder-repo"]
+    and last.fact.permissions == $expected
+  ' "$gh_as_fixture/config/ostrom/sprint.jsonl" >/dev/null
+}
+
+assert_derived_gh_scope closing-references \
+  '{"metadata":"read","issues":"read","pull_requests":"read"}' \
+  gh pr view 1 --repo placeholder-owner/placeholder-repo \
+    --json closingIssuesReferences
+assert_derived_gh_scope issue-read \
+  '{"metadata":"read","issues":"read"}' \
+  gh issue view 2 --repo placeholder-owner/placeholder-repo --json number,state,title
+assert_derived_gh_scope pr-comment \
+  '{"metadata":"read","issues":"write","pull_requests":"read"}' \
+  gh pr comment 1 --repo placeholder-owner/placeholder-repo --body fixture
+assert_derived_gh_scope pr-merge \
+  '{"metadata":"read","contents":"write","pull_requests":"write"}' \
+  gh pr merge 1 --repo placeholder-owner/placeholder-repo
+assert_derived_gh_scope review-thread-resolution \
+  '{"metadata":"read","pull_requests":"write"}' \
+  gh api graphql -f 'query=mutation { resolveReviewThread(input: {}) { thread { id } } }'
+
+fake_gate="$gh_as_fixture/gate.sh"
+cat >"$fake_gate" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[ "${GH_TOKEN:-}" = stub-installation-token-read ]
+[ "${GITHUB_TOKEN:-}" = stub-installation-token-read ]
+EOF
+chmod +x "$fake_gate"
+PATH="$gh_as_fixture/bin:$app_token_fixture/bin:$PATH" \
+  GH_TOKEN="" GITHUB_TOKEN="" FAKE_CURL_MODE=success \
+  CLAUDE_CONFIG_DIR="$gh_as_fixture/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+  bash "$PLUGIN_ROOT/scripts/gh-as.sh" gatekeeper \
+    placeholder-owner/placeholder-repo bash "$fake_gate"
+jq -s -e '
+  last.fact.repositories == ["placeholder-owner/placeholder-repo"]
+  and last.fact.permissions == {
+    metadata: "read", issues: "read", pull_requests: "read",
+    checks: "read", statuses: "read"
+  }
+' "$gh_as_fixture/config/ostrom/sprint.jsonl" >/dev/null
+
+# The mocked GitHub boundary enforces the scope carried by the minted token:
+# a read-only token gets a real command-level 403 on an attempted mutation,
+# and a token narrowed to one repository gets a 404 on cross-repository use.
+gh_as_readonly_stderr="$gh_as_fixture/read-only-write.err"
+set +e
+PATH="$gh_as_fixture/bin:$app_token_fixture/bin:$PATH" \
+  GH_TOKEN="" GITHUB_TOKEN="" FAKE_CURL_MODE=success \
+  GH_AS_TEST_SEEN_FILE="$gh_as_fixture/read-only-seen" \
+  CLAUDE_CONFIG_DIR="$gh_as_fixture/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+  bash "$PLUGIN_ROOT/scripts/gh-as.sh" gatekeeper \
+    placeholder-owner/placeholder-repo "${gh_as_read_scope[@]}" \
+    gh api --method PATCH repos/placeholder-owner/placeholder-repo/issues/1 \
+    >/dev/null 2>"$gh_as_readonly_stderr"
+gh_as_readonly_status=$?
+set -e
+[ "$gh_as_readonly_status" -eq 1 ]
+grep -Fq 'HTTP 403: Resource not accessible by integration' \
+  "$gh_as_readonly_stderr"
+if grep -q 'stub-installation-token' "$gh_as_readonly_stderr"; then
+  echo 'read-only refusal must not leak the scoped token' >&2
+  exit 1
+fi
+
+gh_as_cross_repo_stderr="$gh_as_fixture/cross-repository.err"
+set +e
+PATH="$gh_as_fixture/bin:$app_token_fixture/bin:$PATH" \
+  GH_TOKEN="" GITHUB_TOKEN="" FAKE_CURL_MODE=success \
+  GH_AS_TEST_SEEN_FILE="$gh_as_fixture/cross-repository-seen" \
+  CLAUDE_CONFIG_DIR="$gh_as_fixture/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+  bash "$PLUGIN_ROOT/scripts/gh-as.sh" gatekeeper \
+    placeholder-owner/placeholder-repo "${gh_as_read_scope[@]}" \
+    gh repo view placeholder-owner/other-repo \
+    >/dev/null 2>"$gh_as_cross_repo_stderr"
+gh_as_cross_repo_status=$?
+set -e
+[ "$gh_as_cross_repo_status" -eq 1 ]
+grep -Fq 'HTTP 404: Not Found' "$gh_as_cross_repo_stderr"
 
 # gh-as.sh's own exit-111 space and the wrapped command's exit codes stay
 # distinguishable: a wrapped command that itself fails passes its own code
@@ -4635,6 +4943,7 @@ PATH="$gh_as_fixture/bin:$app_token_fixture/bin:$PATH" \
   CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
   bash "$PLUGIN_ROOT/scripts/gh-as.sh" gatekeeper \
     placeholder-owner/placeholder-repo \
+    "${gh_as_read_scope[@]}" \
     gh exit-code 7 \
     >"$gh_as_wrapped_fail_stdout" 2>"$gh_as_wrapped_fail_stderr"
 gh_as_wrapped_fail_status=$?
@@ -4665,6 +4974,7 @@ PATH="$gh_as_fixture/bin:$app_token_fixture/bin:$PATH" \
   CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
   bash "$PLUGIN_ROOT/scripts/gh-as.sh" gatekeeper \
     placeholder-owner/placeholder-repo \
+    "${gh_as_read_scope[@]}" \
     gh pr list --repo placeholder-owner/placeholder-repo \
     >"$gh_as_auth_fail_stdout" 2>"$gh_as_auth_fail_stderr"
 gh_as_auth_fail_status=$?
@@ -4699,6 +5009,7 @@ PATH="$gh_as_fixture/bin:$app_token_fixture/bin:$PATH" \
   CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
   bash "$PLUGIN_ROOT/scripts/gh-as.sh" builder \
     placeholder-owner/placeholder-repo \
+    "${gh_as_read_scope[@]}" \
     gh pr list --repo placeholder-owner/placeholder-repo \
     >"$gh_as_role_stdout" 2>"$gh_as_role_stderr"
 gh_as_role_status=$?
@@ -4756,6 +5067,7 @@ PATH="$gh_as_fixture/bin:$app_token_fixture/bin:$PATH" \
   GH_AS_GIT_SEEN_FILE="$gh_as_git_seen" \
   bash "$PLUGIN_ROOT/scripts/gh-as.sh" builder \
     placeholder-owner/placeholder-repo \
+    "${gh_as_write_scope[@]}" \
     git push https://github.com/placeholder-owner/placeholder-repo.git \
     HEAD:refs/heads/placeholder \
     >"$gh_as_git_stdout" 2>"$gh_as_git_stderr"
@@ -4767,7 +5079,7 @@ grep -Fxq 'key0=credential.helper' "$gh_as_git_seen"
 grep -Fxq 'value0=' "$gh_as_git_seen"
 grep -Fxq 'key1=credential.helper' "$gh_as_git_seen"
 grep -Fxq 'value1=!gh auth git-credential' "$gh_as_git_seen"
-grep -Fxq 'gh_token=stub-installation-token' "$gh_as_git_seen"
+grep -Fxq 'gh_token=stub-installation-token-write' "$gh_as_git_seen"
 grep -Fq 'gh-as-git-test: called with push https://github.com/placeholder-owner/placeholder-repo.git HEAD:refs/heads/placeholder' \
   "$gh_as_git_stdout"
 [ ! -s "$gh_as_git_stderr" ]
@@ -4813,6 +5125,7 @@ PATH="$gh_as_old_git_bin:$gh_as_fixture/bin:$app_token_fixture/bin:$PATH" \
   GH_AS_GIT_SEEN_FILE="$gh_as_old_git_seen" \
   bash "$PLUGIN_ROOT/scripts/gh-as.sh" builder \
     placeholder-owner/placeholder-repo \
+    "${gh_as_write_scope[@]}" \
     git push https://github.com/placeholder-owner/placeholder-repo.git \
     HEAD:refs/heads/placeholder \
     >"$gh_as_old_git_stdout" 2>"$gh_as_old_git_stderr"
@@ -4862,6 +5175,7 @@ PATH="$gh_as_new_git_bin:$gh_as_fixture/bin:$app_token_fixture/bin:$PATH" \
   GH_AS_GIT_SEEN_FILE="$gh_as_new_git_seen" \
   bash "$PLUGIN_ROOT/scripts/gh-as.sh" builder \
     placeholder-owner/placeholder-repo \
+    "${gh_as_write_scope[@]}" \
     git push https://github.com/placeholder-owner/placeholder-repo.git \
     HEAD:refs/heads/placeholder \
     >"$gh_as_new_git_stdout" 2>"$gh_as_new_git_stderr"
@@ -4873,7 +5187,7 @@ grep -Fxq 'key0=credential.helper' "$gh_as_new_git_seen"
 grep -Fxq 'value0=' "$gh_as_new_git_seen"
 grep -Fxq 'key1=credential.helper' "$gh_as_new_git_seen"
 grep -Fxq 'value1=!gh auth git-credential' "$gh_as_new_git_seen"
-grep -Fxq 'gh_token=stub-installation-token' "$gh_as_new_git_seen"
+grep -Fxq 'gh_token=stub-installation-token-write' "$gh_as_new_git_seen"
 grep -Fq 'gh-as-new-git-test: called with push https://github.com/placeholder-owner/placeholder-repo.git HEAD:refs/heads/placeholder' \
   "$gh_as_new_git_stdout"
 [ ! -s "$gh_as_new_git_stderr" ]
@@ -4895,11 +5209,12 @@ PATH="$gh_as_old_git_bin:$gh_as_fixture/bin:$app_token_fixture/bin:$PATH" \
   CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
   bash "$PLUGIN_ROOT/scripts/gh-as.sh" gatekeeper \
     placeholder-owner/placeholder-repo \
+    "${gh_as_read_scope[@]}" \
     gh pr list --repo placeholder-owner/placeholder-repo \
     >"$gh_as_nongit_stdout" 2>"$gh_as_nongit_stderr"
 gh_as_nongit_status=$?
 [ "$gh_as_nongit_status" -eq 0 ]
-grep -Fxq 'stub-installation-token' <(sed -n '1p' "$gh_as_nongit_seen")
+grep -Fxq 'stub-installation-token-read' <(sed -n '1p' "$gh_as_nongit_seen")
 grep -Fq 'gh-as-test: called with pr list --repo placeholder-owner/placeholder-repo' \
   "$gh_as_nongit_stdout"
 [ ! -s "$gh_as_nongit_stderr" ]
@@ -4926,6 +5241,7 @@ PATH="$gh_as_fixture/bin:$app_token_fixture/bin:$PATH" \
   GH_AS_GIT_SEEN_FILE="$gh_as_old_git_by_path_seen" \
   bash "$PLUGIN_ROOT/scripts/gh-as.sh" builder \
     placeholder-owner/placeholder-repo \
+    "${gh_as_write_scope[@]}" \
     "$gh_as_old_git_bin/git" push \
     https://github.com/placeholder-owner/placeholder-repo.git \
     HEAD:refs/heads/placeholder \
@@ -5528,22 +5844,34 @@ cat >"$fixture/bin/curl" <<'EOF'
 set -euo pipefail
 cat >/dev/null
 url=""
+request_body=""
+previous=""
 for argument in "$@"; do
+  if [ "$previous" = --data ]; then
+    request_body="$argument"
+  fi
   case "$argument" in
     https://api.github.com/*) url="$argument" ;;
   esac
+  previous="$argument"
 done
 case "$url" in
   https://api.github.com/repos/*/installation)
     owner="${url#https://api.github.com/repos/}"
     owner="${owner%%/*}"
     id="$(printf '%s' "$owner" | cksum | awk '{print $1}')"
-    printf '{"id":%s}\n200' "$id"
+    printf '{"id":%s,"permissions":{"metadata":"read","contents":"write","issues":"write","pull_requests":"write","checks":"read","statuses":"read","actions":"read"}}\n200' "$id"
     ;;
   https://api.github.com/app/installations/*/access_tokens)
     id="${url#https://api.github.com/app/installations/}"
     id="${id%%/*}"
-    printf '{"token":"stub-sweep-token-org-%s"}' "$id"
+    jq -cn --arg token "stub-sweep-token-org-$id" --argjson scope "$request_body" '
+      $scope + {
+        token: $token,
+        repository_selection: "selected"
+      }
+    '
+    printf '\n201'
     ;;
   *) exit 99 ;;
 esac
@@ -9349,6 +9677,7 @@ operator_config="$operator_home/.claude"
 operator_remote="$publisher/operator-default.git"
 operator_bin="$publisher/operator-bin"
 operator_clone_log="$publisher/operator-clone.log"
+operator_gh_as_log="$publisher/operator-gh-as.log"
 mkdir -p "$operator_config" "$operator_bin"
 cp -R "$publisher_data" "$operator_config/ostrom"
 git init --bare --quiet "$operator_remote"
@@ -9365,12 +9694,33 @@ exec "$OSTROM_TEST_REAL_GIT" clone --no-checkout \
   "$OSTROM_TEST_OPERATOR_REMOTE" "$4"
 SH
 chmod +x "$operator_bin/gh"
+cat >"$operator_bin/gh-as" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"$OSTROM_TEST_OPERATOR_GH_AS_LOG"
+[ "$1" = publisher ]
+[ "$2" = onsager-ai/ostrom-hub ]
+shift 2
+[ "$1" = --repositories ]
+[ "$2" = onsager-ai/ostrom-hub ]
+[ "$3" = --permissions ]
+case "$4" in
+  metadata:read,contents:read|metadata:read,contents:write) ;;
+  *) exit 98 ;;
+esac
+[ "$5" = -- ]
+shift 5
+exec "$@"
+SH
+chmod +x "$operator_bin/gh-as"
 operator_publish_env=(
   HOME="$operator_home"
   PATH="$operator_bin:$PATH"
   CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT"
+  MANDATE_GH_AS_BIN="$operator_bin/gh-as"
   MANDATE_PUBLISH_TIME="2026-08-01T00:05:00Z"
   OSTROM_TEST_OPERATOR_CLONE_LOG="$operator_clone_log"
+  OSTROM_TEST_OPERATOR_GH_AS_LOG="$operator_gh_as_log"
   OSTROM_TEST_OPERATOR_REMOTE="$operator_remote"
   OSTROM_TEST_REAL_GIT="$(command -v git)"
   GIT_AUTHOR_NAME="Ostrom Test"
@@ -9405,6 +9755,10 @@ if [ "$operator_explicit_status" -ne 0 ]; then
 fi
 if [ "$(grep -Fc 'onsager-ai/ostrom-hub' "$operator_clone_log")" -ne 2 ]; then
   echo "both operator config forms must use the unchanged default destination" >&2
+  exit 1
+fi
+if [ "$(grep -c '^publisher onsager-ai/ostrom-hub --repositories onsager-ai/ostrom-hub --permissions metadata:read,contents:' "$operator_gh_as_log")" -lt 6 ]; then
+  echo "operator publication must scope every destination command to ostrom-hub" >&2
   exit 1
 fi
 operator_publish_count="$(git --git-dir="$operator_remote" rev-list --count state)"

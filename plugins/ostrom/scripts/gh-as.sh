@@ -54,6 +54,11 @@
 # not covered, because this script has no way to know what binaries that
 # script will run.
 #
+# Known commands keep the compatibility form below and have their scope
+# derived from the action. Internal callers may instead put explicit
+# --repositories/--permissions options and `--` after the leading role and
+# repository.
+#
 # Usage: gh-as.sh <role> <owner>/<repo> <command> [args...]
 #
 # Exit code 111 means this script itself did not authenticate — a usage
@@ -73,12 +78,120 @@ fail() {
   exit "$EXIT_AUTH_FAILURE"
 }
 
+usage='usage: gh-as.sh <role> <owner>/<repo> [--repositories <repo[,repo...]> --permissions <permission:level[,permission:level...]> --] <command> [args...]'
+
 if [ "$#" -lt 3 ]; then
-  fail "usage: gh-as.sh <role> <owner>/<repo> <command> [args...]"
+  fail "$usage"
 fi
 role="$1"
 repository="$2"
 shift 2
+
+repositories=""
+permissions=""
+case "${1:-}" in
+  --repositories|--permissions)
+    while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do
+      case "$1" in
+        --repositories)
+          [ -z "$repositories" ] || fail "caller scope is invalid: --repositories was supplied more than once"
+          [ "$#" -ge 2 ] || fail "$usage"
+          repositories="$2"
+          shift 2
+          ;;
+        --permissions)
+          [ -z "$permissions" ] || fail "caller scope is invalid: --permissions was supplied more than once"
+          [ "$#" -ge 2 ] || fail "$usage"
+          permissions="$2"
+          shift 2
+          ;;
+        *) fail "$usage" ;;
+      esac
+    done
+    [ -n "$repositories" ] || \
+      fail "unscoped token request rejected: caller must supply --repositories"
+    [ -n "$permissions" ] || \
+      fail "unscoped token request rejected: caller must supply --permissions"
+    [ "$#" -gt 0 ] && [ "$1" = "--" ] || fail "$usage"
+    shift
+    [ "$#" -gt 0 ] || fail "$usage"
+    ;;
+esac
+
+derive_permissions() {
+  command_name="${1##*/}"
+  case "$command_name" in
+    git)
+      shift
+      for git_argument in "$@"; do
+        case "$git_argument" in
+          fetch|clone|ls-remote)
+            printf '%s\n' 'metadata:read,contents:read'
+            return 0
+            ;;
+          push)
+            printf '%s\n' 'metadata:read,contents:write'
+            return 0
+            ;;
+        esac
+      done
+      ;;
+    gh)
+      case "${2:-}:${3:-}" in
+        repo:view) printf '%s\n' 'metadata:read'; return 0 ;;
+        repo:clone) printf '%s\n' 'metadata:read,contents:read'; return 0 ;;
+        issue:view|issue:list|issue:status)
+          printf '%s\n' 'metadata:read,issues:read'; return 0
+          ;;
+        issue:comment|issue:create|issue:edit|issue:close|issue:reopen)
+          printf '%s\n' 'metadata:read,issues:write'; return 0
+          ;;
+        pr:list|pr:diff|pr:checks|pr:status)
+          printf '%s\n' 'metadata:read,pull_requests:read'; return 0
+          ;;
+        pr:view)
+          if [[ " $* " == *" closingIssuesReferences "* ]]; then
+            printf '%s\n' 'metadata:read,issues:read,pull_requests:read'
+          else
+            printf '%s\n' 'metadata:read,pull_requests:read'
+          fi
+          return 0
+          ;;
+        pr:comment)
+          printf '%s\n' 'metadata:read,issues:write,pull_requests:read'; return 0
+          ;;
+        pr:create)
+          printf '%s\n' 'metadata:read,pull_requests:write'; return 0
+          ;;
+        pr:merge)
+          printf '%s\n' 'metadata:read,contents:write,pull_requests:write'; return 0
+          ;;
+        run:list) printf '%s\n' 'metadata:read,actions:read'; return 0 ;;
+        api:graphql)
+          # The only direct protocol call is review-thread resolution. Read
+          # GraphQL calls live inside gate.sh and use that script's read scope.
+          printf '%s\n' 'metadata:read,pull_requests:write'; return 0
+          ;;
+      esac
+      ;;
+    bash)
+      script_name="${2:-}"
+      case "${script_name##*/}" in
+        gate.sh)
+          printf '%s\n' 'metadata:read,issues:read,pull_requests:read,checks:read,statuses:read'
+          return 0
+          ;;
+      esac
+      ;;
+  esac
+  return 1
+}
+
+if [ -z "$repositories" ]; then
+  repositories="$repository"
+  permissions="$(derive_permissions "$@")" || \
+    fail "unscoped token request rejected: command has no known scope; supply --repositories and --permissions"
+fi
 
 # See the comment block above: the GIT_CONFIG_COUNT/KEY/VALUE override this
 # script relies on is only honoured from Git 2.31 onward, and an older git
@@ -122,7 +235,8 @@ esac
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-token="$(bash "$SCRIPT_DIR/app-token.sh" "$role" "$repository")" ||
+token="$(bash "$SCRIPT_DIR/app-token.sh" "$role" "$repository" \
+  --repositories "$repositories" --permissions "$permissions")" ||
   fail "could not mint a $role token for $repository"
 if [ -z "$token" ]; then
   fail "minted an empty $role token for $repository"
@@ -132,5 +246,5 @@ export GH_TOKEN="$token" GITHUB_TOKEN="$token"
 export GIT_CONFIG_COUNT=2
 export GIT_CONFIG_KEY_0="credential.helper" GIT_CONFIG_VALUE_0=""
 export GIT_CONFIG_KEY_1="credential.helper" GIT_CONFIG_VALUE_1="!gh auth git-credential"
-unset token role repository SCRIPT_DIR
+unset token role repository repositories permissions SCRIPT_DIR
 exec "$@"

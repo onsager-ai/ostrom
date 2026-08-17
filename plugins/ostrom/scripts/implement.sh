@@ -415,6 +415,7 @@ fi
 
 default_branch="$({
   bash "$GH_AS_BIN" builder "$repository" \
+    --repositories "$repository" --permissions metadata:read -- \
     gh repo view "$repository" --json defaultBranchRef --jq '.defaultBranchRef.name'
 } 2>/dev/null)" || {
   failure_reason=default-branch-query-failed
@@ -426,6 +427,8 @@ default_branch="$({
 }
 
 if ! bash "$GH_AS_BIN" builder "$repository" \
+  --repositories "$repository" \
+  --permissions metadata:read,contents:read -- \
   git -C "$source_repository" fetch \
     "https://github.com/$repository.git" \
     "$default_branch:refs/remotes/origin/$default_branch"; then
@@ -641,6 +644,8 @@ if [ "${#withheld_publish_paths[@]}" -gt 0 ]; then
 fi
 push_output="$runs_dir/push-output.txt"
 if bash "$GH_AS_BIN" builder "$repository" \
+  --repositories "$repository" \
+  --permissions metadata:read,contents:write -- \
   git -C "$worktree_root" push \
     "https://github.com/$repository.git" "HEAD:refs/heads/$branch_name" \
     >"$push_output" 2>&1; then
@@ -656,6 +661,8 @@ else
   # artifact already under review by merging that head forward; history is
   # never rewritten, and the ordinary push gets only one retry.
   if ! bash "$GH_AS_BIN" builder "$repository" \
+    --repositories "$repository" \
+    --permissions metadata:read,contents:read -- \
     git -C "$worktree_root" fetch \
       "https://github.com/$repository.git" "refs/heads/$branch_name"; then
     failure_reason=push-failed
@@ -679,6 +686,8 @@ else
     exit 1
   fi
   if ! bash "$GH_AS_BIN" builder "$repository" \
+    --repositories "$repository" \
+    --permissions metadata:read,contents:write -- \
     git -C "$worktree_root" push \
       "https://github.com/$repository.git" "HEAD:refs/heads/$branch_name"; then
     failure_reason=push-failed
@@ -706,6 +715,8 @@ jq -r --argjson withheld_paths "$withheld_paths" '
 pr_title="Implement $item_id"
 pr_url="$({
   bash "$GH_AS_BIN" builder "$repository" \
+    --repositories "$repository" \
+    --permissions metadata:read,pull_requests:write -- \
     gh pr create --repo "$repository" --base "$default_branch" \
       --head "$branch_name" --title "$pr_title" --body-file "$body_file"
 } 2>/dev/null)" || {

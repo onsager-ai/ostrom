@@ -19,8 +19,11 @@ inside that blast radius.
 
 The role argument to `app-token.sh` and `gh-as.sh` remains required even when
 every role resolves to the shared credential. It names the caller at the call
-site, making the route legible; it does not narrow the installation token and
-is not an access control.
+site, making the route legible; it is not an access control. Every call also
+produces a non-empty repository set and permission map: `gh-as.sh` derives
+them from a known command or accepts explicit values after the leading role
+and repository, while `app-token.sh` requires them. Neither script infers
+scope from the role or defaults to the App's ceiling.
 
 ## What these denies are, and are not
 
@@ -85,14 +88,19 @@ cutover, a role-named block such as `builder:` or `gatekeeper:` takes
 precedence over `shared:` so rollback remains a one-block config change. The
 steady-state file has only the `shared:` block.
 
-`app-token.sh` still receives both the role and `owner/repo`. It resolves the
-credential by role first and `shared:` second, mints a JWT in memory, then
-looks up the installation for that repository before exchanging the JWT for
-an installation token. A token is scoped to one installation; a token minted
+`app-token.sh` receives the role, a lookup `owner/repo`, and explicit
+`--repositories` and `--permissions` scope from `gh-as.sh`. It resolves the credential by role
+first and `shared:` second, mints a JWT in memory, looks up the installation
+for that repository, verifies that the installation holds the requested
+permissions, and sends both scope fields in the token exchange. A token is
+scoped to one installation and only the named repositories; a token minted
 for a repository in one organisation must not be reused for another
-organisation's repositories. `gh-as.sh` contains the token in its own process
-and never falls back to ambient `GH_TOKEN` or `GITHUB_TOKEN` when minting
-fails.
+organisation's repositories. `gh-as.sh` derives scope from known command
+shapes (or carries an explicit scope through), contains the token in its own
+process, and never falls back to ambient `GH_TOKEN` or
+`GITHUB_TOKEN` when minting fails. The granted repository and permission
+scope is recorded as an `installation-token-minted` trace fact; credential and
+installation identifiers are not recorded.
 
 The shared App's installation must therefore cover **every repository in the mandate roster**, in every organisation the roster spans — not only the ones with an open pull request at any given moment. `scripts/sweep.sh` reads issues, pull requests, default-branch CI, and commit history across the whole roster on every run, and mints one token per organisation for that reason ([#106](https://github.com/onsager-ai/ostrom/issues/106)). A repository the App is not installed on is an authentication fault there, not an empty result, and the sweep must report it as one — a silently empty queue reads as a healthy, quiet portfolio.
 
