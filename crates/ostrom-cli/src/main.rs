@@ -1033,14 +1033,24 @@ fn run_select_work(arguments: Vec<String>) -> ! {
 /// `ostrom migrate` — which is every operator today, since the shell wrote to
 /// `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/ostrom` and nothing has moved it.
 ///
-/// Resolving that legacy root belongs here, in the layer the operator invokes,
-/// and only when the directory actually exists so a fresh install still lands
-/// on XDG.
+/// Resolving that legacy root belongs here, in the layer the operator invokes.
+/// An explicit `CLAUDE_CONFIG_DIR` is honoured as given; the *implicit*
+/// `$HOME/.claude/ostrom` fallback applies only when that directory exists, so
+/// a fresh install still lands on XDG.
 fn compatible_command_paths() -> OstromPaths {
     if env::var_os("OSTROM_HOME").is_some_and(|home| !home.to_string_lossy().trim().is_empty()) {
         return resolved_or_exit();
     }
-    if let Some(config) = env::var_os("CLAUDE_CONFIG_DIR") {
+    // Empty means unset, matching the shell's `${CLAUDE_CONFIG_DIR:-...}`.
+    // Without the filter an empty value resolves to the *relative* path
+    // `ostrom/`, which reads whatever happens to be under the working
+    // directory — the same defect `MANDATE_SECRETS_FILE` had. An explicit
+    // non-empty value is honoured even if the directory does not exist yet,
+    // because it is an instruction rather than a guess; the caller then gets a
+    // named refusal that quotes it back.
+    if let Some(config) =
+        env::var_os("CLAUDE_CONFIG_DIR").filter(|value| !value.to_string_lossy().trim().is_empty())
+    {
         return collapsed_root(PathBuf::from(config).join("ostrom"));
     }
     if let Some(base) = BaseDirs::new() {
