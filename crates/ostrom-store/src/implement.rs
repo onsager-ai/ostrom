@@ -1053,8 +1053,11 @@ fn gh_output(
         || request.plugin_root.join("scripts/gh-as.sh"),
         PathBuf::from,
     );
-    let output = Command::new("bash")
-        .arg(gh_as)
+    // Execute the wrapper directly rather than through `bash`. The shipped
+    // script is mode 755 with a shebang, so the interpreter is its own
+    // business — and forcing `bash` breaks a MANDATE_GH_AS_BIN override that
+    // names a non-shell executable, which is the whole point of the override.
+    let output = Command::new(gh_as)
         .arg("builder")
         .arg(repository)
         .arg("--repositories")

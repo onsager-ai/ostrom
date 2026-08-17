@@ -172,6 +172,10 @@ impl Fixture {
     }
 }
 
+/// Stubs carry a shebang and mode 755 because the credential wrapper is now
+/// executed directly rather than through `bash` — which is the whole point of
+/// `MANDATE_GH_AS_BIN` being a path override, and would silently regress if a
+/// stub were ever written without them.
 fn executable(path: &Path, body: &str) {
     fs::write(path, format!("#!/usr/bin/env bash\nset -eu\n{body}\n")).expect("write stub");
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod stub");

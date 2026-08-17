@@ -313,7 +313,7 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
             1,
         ));
     }
-    if !request.claude_bin.is_file() {
+    if !is_executable_file(&request.claude_bin) {
         guard.outcome = Some("failed".to_owned());
         return Err(PassError::failed(
             request.role,
@@ -587,6 +587,24 @@ fn release_inner_lease(guard: &PassGuard) {
     }
 }
 
+/// `is_file()` is not the check the message claims, and not the check the
+/// shell made. `pass.sh` used `-x`, so a present-but-unexecutable path failed
+/// here with a named reason; without the mode test it survives to
+/// `Command::spawn`, which reports a permission error against a path the
+/// operator has to work backwards from.
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    path.metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
+}
+
 fn daily_spend(paths: &OstromPaths, day: &str) -> f64 {
     read_trace(&paths.trace_file())
         .map(|trace| {
@@ -763,5 +781,35 @@ fn kill_command() -> &'static str {
         "/bin/kill"
     } else {
         "kill"
+    }
+}
+
+#[cfg(all(test, unix))]
+mod executable_tests {
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    use tempfile::tempdir;
+
+    use super::is_executable_file;
+
+    #[test]
+    fn a_present_but_unexecutable_file_is_not_accepted() {
+        // pass.sh used `-x`. A plain is_file() check would let this through to
+        // Command::spawn, which reports a permission error against a path the
+        // operator then has to work backwards from.
+        let fixture = tempdir().expect("temporary directory");
+        let path = fixture.path().join("placeholder-claude");
+        fs::write(&path, "#!/usr/bin/env bash\nexit 0\n").expect("write stub");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("drop the mode bits");
+        assert!(!is_executable_file(&path));
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("restore the mode");
+        assert!(is_executable_file(&path));
+    }
+
+    #[test]
+    fn a_directory_is_not_an_executable_file() {
+        let fixture = tempdir().expect("temporary directory");
+        assert!(!is_executable_file(fixture.path()));
     }
 }
