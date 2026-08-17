@@ -18,8 +18,11 @@ rust-version = "1.86"
 async-trait = "0.1.89"
 chrono = { version = "=0.4.44", default-features = false, features = ["std", "serde"] }
 clap = { version = "4.5.45", features = ["derive"] }
+base64 = "=0.22.1"
 directories = "6.0.0"
 regex = "=1.12.3"
+rsa = { version = "=0.9.8", features = ["sha2"] }
+sha2 = "=0.10.9"
 reqwest = { version = "=0.12.28", default-features = false, features = ["blocking", "rustls-tls"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = { version = "1.0.143", features = ["preserve_order"] }

@@ -16,9 +16,10 @@ use ostrom_core::{
 };
 use ostrom_store::{
     AuditOptions, ExecutableAssessmentDeriver, MigrationOutcome, OstromPaths, PlanOptions,
-    PublishTarget, SweepError, SweepMode, SweepOptions, UnavailableAssessmentDeriver,
-    acquire_org_from_github, audit, encode_org_snapshots, grant_excuse, list_excuses,
-    list_queue_json, local_drift, migrate, run_plan, run_sweep,
+    PublishTarget, SweepError, SweepMode, SweepOptions, SweepParityOptions,
+    UnavailableAssessmentDeriver, acquire_org_from_github, audit, encode_org_snapshots,
+    grant_excuse, list_excuses, list_queue_json, local_drift, migrate, run_plan, run_sweep,
+    run_sweep_parity,
 };
 
 #[derive(Debug, Parser)]
@@ -37,6 +38,11 @@ enum Command {
     },
     /// Move legacy Claude-hosted data to XDG config and state roots.
     Migrate,
+    /// Compare native and legacy command output in isolated scratch homes.
+    Parity {
+        #[command(subcommand)]
+        command: ParityCommand,
+    },
     /// Reconcile the governed GitHub roster into the private queue.
     Sweep {
         /// Force full/incremental acquisition or select automatically.
@@ -48,7 +54,7 @@ enum Command {
         /// Explicit publication destination. Omission means no publication.
         #[arg(long)]
         publish_repository: Option<String>,
-        /// Internal organization worker, always run beneath gh-as.sh.
+        /// Internal organization worker, run beneath a native minted token.
         #[arg(long, hide = true)]
         inner_org: Option<String>,
         /// One clock shared by every organization worker.
@@ -108,6 +114,19 @@ enum QueueCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum ParityCommand {
+    /// Compare native and legacy sweep rows by id and field.
+    Sweep {
+        /// One clock shared by both implementations.
+        #[arg(long)]
+        started_at: Option<String>,
+        /// Recorded GitHub responses for a hermetic native-side test.
+        #[arg(long, hide = true)]
+        fixture: Option<PathBuf>,
+    },
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum OutputFormat {
     Json,
@@ -130,7 +149,14 @@ impl From<CliSweepMode> for SweepMode {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let paths = OstromPaths::resolve()?;
     match cli.command {
@@ -157,6 +183,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 MigrationOutcome::NothingToMigrate => {
                     println!("no legacy Ostrom state exists; nothing to migrate")
                 }
+            }
+        }
+        Command::Parity {
+            command:
+                ParityCommand::Sweep {
+                    started_at,
+                    fixture,
+                },
+        } => {
+            let started_at = resolve_started_at(started_at.as_deref())?;
+            let cwd = env::current_dir()?;
+            let executable = env::current_exe()?;
+            let plugin_root = env::var_os("OSTROM_PLUGIN_ROOT")
+                .or_else(|| env::var_os("CLAUDE_PLUGIN_ROOT"))
+                .map_or_else(|| cwd.join("plugins/ostrom"), PathBuf::from);
+            let options = SweepParityOptions::from_environment(
+                cwd,
+                executable,
+                plugin_root,
+                started_at,
+                fixture,
+            )?;
+            let outcome = run_sweep_parity(&options)?;
+            if outcome.differences.is_empty() {
+                println!(
+                    "parity sweep: zero divergences across {} row(s)",
+                    outcome.row_count
+                );
+            } else {
+                for (field, ids) in &outcome.differences {
+                    println!(
+                        "parity sweep: {field} differs on {} row(s): {}",
+                        ids.len(),
+                        ids.join(", ")
+                    );
+                }
+                std::process::exit(1);
             }
         }
         Command::Sweep {

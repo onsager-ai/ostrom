@@ -15,7 +15,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 
-use crate::{OstromPaths, QueueDocument, StoreError, io_error, read_queue, write_queue};
+use crate::{
+    AppTokenError, OstromPaths, QueueDocument, StoreError,
+    app_token::{AppTokenRequest, mint_installation_token},
+    io_error, read_queue, write_queue,
+};
 
 const QUERY_LIMIT: usize = 200;
 const FULL_RECONCILIATION_HOURS: i64 = 24;
@@ -35,6 +39,8 @@ pub enum SweepError {
     State(String),
     #[error("GitHub acquisition failed: {0}")]
     Acquisition(String),
+    #[error(transparent)]
+    AppToken(#[from] AppTokenError),
     #[error("{0}")]
     BranchListingTruncated(String),
     #[error("sweep fixture is malformed: {0}")]
@@ -422,8 +428,8 @@ pub fn acquire_org_from_github(
 
 /// The credential request for one organization's acquisition worker.
 struct OrganizationScope {
-    /// Any roster repository under the organization. `gh-as.sh` resolves the
-    /// installation from it and nothing else, so which one is immaterial.
+    /// Any roster repository under the organization. The App lookup resolves
+    /// the installation from it and nothing else, so which one is immaterial.
     anchor: String,
     /// Every roster repository under the organization. The inner worker reads
     /// all of them, so all of them must be in the grant.
@@ -451,22 +457,22 @@ fn organization_scopes(config: &MandateConfig) -> BTreeMap<String, OrganizationS
     organizations
 }
 
-/// The `gh-as.sh` arguments up to and including the `--` that ends them.
+/// The credential request for one organization's acquisition worker.
 ///
-/// Scope is mandatory on both halves: `gh-as.sh` refuses a request that names
+/// Scope is mandatory on both halves. The minter rejects a request naming
 /// neither repositories nor permissions rather than falling back to the
 /// installation's full grant, so omitting either leaves the sweep unable to
-/// authenticate at all.
-fn gh_as_credential_arguments(scope: &OrganizationScope) -> Vec<String> {
-    vec![
-        "gatekeeper".to_owned(),
-        scope.anchor.clone(),
-        "--repositories".to_owned(),
-        scope.repositories.join(","),
-        "--permissions".to_owned(),
-        SWEEP_TOKEN_PERMISSIONS.to_owned(),
-        "--".to_owned(),
-    ]
+/// authenticate at all — which is what happened while this call was unscoped.
+fn organization_token_request<'a>(
+    scope: &'a OrganizationScope,
+    repositories: &'a str,
+) -> AppTokenRequest<'a> {
+    AppTokenRequest {
+        role: "gatekeeper",
+        anchor_repository: &scope.anchor,
+        repositories: Some(repositories),
+        permissions: Some(SWEEP_TOKEN_PERMISSIONS),
+    }
 }
 
 fn acquire_by_organization(
@@ -478,10 +484,18 @@ fn acquire_by_organization(
     let mut snapshots = Vec::new();
     let mut faults = Vec::new();
     for (org, scope) in organization_scopes(config) {
-        let output = Command::new("bash")
-            .arg(options.plugin_root.join("scripts/gh-as.sh"))
-            .args(gh_as_credential_arguments(&scope))
-            .arg(&options.executable)
+        let repositories = scope.repositories.join(",");
+        let request = organization_token_request(&scope, &repositories);
+        let token = match mint_installation_token(&options.paths, request) {
+            Ok(token) => token,
+            Err(error) => {
+                faults.push(format!(
+                    "authentication or GitHub query failed for organization {org}: {error}"
+                ));
+                continue;
+            }
+        };
+        let output = Command::new(&options.executable)
             .args([
                 "sweep",
                 "--inner-org",
@@ -491,6 +505,8 @@ fn acquire_by_organization(
                 "--mode",
                 mode_name(mode),
             ])
+            .env("GH_TOKEN", token.expose())
+            .env("GITHUB_TOKEN", token.expose())
             .current_dir(&options.working_directory)
             .output()
             .map_err(|error| SweepError::Acquisition(error.to_string()))?;
@@ -2804,19 +2820,12 @@ mod tests {
         // unable to authenticate at all.
         let scopes =
             organization_scopes(&roster(&["placeholder-org/alpha", "placeholder-org/beta"]));
-        let arguments = gh_as_credential_arguments(&scopes["placeholder-org"]);
-        assert_eq!(
-            arguments,
-            vec![
-                "gatekeeper".to_owned(),
-                "placeholder-org/alpha".to_owned(),
-                "--repositories".to_owned(),
-                "placeholder-org/alpha,placeholder-org/beta".to_owned(),
-                "--permissions".to_owned(),
-                SWEEP_TOKEN_PERMISSIONS.to_owned(),
-                "--".to_owned(),
-            ]
-        );
+        let repositories = scopes["placeholder-org"].repositories.join(",");
+        let request = organization_token_request(&scopes["placeholder-org"], &repositories);
+        assert_eq!(request.role, "gatekeeper");
+        assert_eq!(request.anchor_repository, "placeholder-org/alpha");
+        assert_eq!(request.repositories, Some(repositories.as_str()));
+        assert_eq!(request.permissions, Some(SWEEP_TOKEN_PERMISSIONS));
     }
 
     #[test]

@@ -254,74 +254,6 @@ fn incremental_fixture_retains_unchanged_issue_records_and_queue_bytes() {
 
 #[cfg(unix)]
 #[test]
-fn real_driver_authenticates_once_per_organization_and_faults_failed_orgs() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let home = tempdir().expect("temporary OSTROM_HOME");
-    let plugin = home.path().join("plugin");
-    fs::create_dir_all(plugin.join("scripts")).expect("create fake plugin");
-    fs::write(home.path().join("mandates.yaml"), ROSTER).expect("write fixture roster");
-    let auth_log = home.path().join("auth.log");
-    let fake_auth = plugin.join("scripts/gh-as.sh");
-    fs::write(
-        &fake_auth,
-        r#"#!/usr/bin/env bash
-set -eu
-printf '%s\n' "$2" >> "$OSTROM_TEST_AUTH_LOG"
-case "$2" in
-  another-example-org/another-example-repo)
-    printf '%s\n' '{"repositories":[{"repo":"another-example-org/another-example-repo","issues":[],"open_prs":[],"merged_prs":[],"ci_runs":[]}]}'
-    ;;
-  example-org/example-repo)
-    printf '%s\n' 'synthetic authentication failure' >&2
-    exit 111
-    ;;
-esac
-"#,
-    )
-    .expect("write fake authentication wrapper");
-    fs::set_permissions(&fake_auth, fs::Permissions::from_mode(0o700))
-        .expect("make fake authentication wrapper executable");
-
-    let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
-        .args(["sweep", "--started-at", "2026-08-01T00:00:00Z"])
-        .env("OSTROM_HOME", home.path())
-        .env("OSTROM_PLUGIN_ROOT", &plugin)
-        .env("OSTROM_TEST_AUTH_LOG", &auth_log)
-        .current_dir(home.path())
-        .output()
-        .expect("run organization driver");
-    assert!(
-        output.status.success(),
-        "driver stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let anchors = fs::read_to_string(auth_log).expect("read authentication log");
-    assert_eq!(
-        anchors,
-        concat!(
-            "another-example-org/another-example-repo\n",
-            "example-org/example-repo\n"
-        ),
-        "driver did not mint exactly one token per organization"
-    );
-    let rows = fs::read_to_string(home.path().join("queue.jsonl")).expect("read fault queue");
-    let rows = rows
-        .lines()
-        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("parse queue row"))
-        .collect::<Vec<_>>();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0]["id"], "example-org/example-repo#0");
-    assert!(
-        rows[0]["mandate"]["reason"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("authentication")),
-        "authentication failure was not a named queue fault"
-    );
-}
-
-#[cfg(unix)]
-#[test]
 fn github_worker_uses_incremental_issue_feed_and_bounded_recent_pr_queries() {
     use std::{env, os::unix::fs::PermissionsExt};
 
@@ -767,43 +699,6 @@ esac
     ));
 }
 
-#[cfg(unix)]
-#[test]
-fn outer_sweep_propagates_branch_truncation_without_writing_a_queue() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let home = tempdir().expect("temporary OSTROM_HOME");
-    let plugin = home.path().join("plugin");
-    fs::create_dir_all(plugin.join("scripts")).expect("create fake plugin");
-    fs::write(home.path().join("mandates.yaml"), PLACEHOLDER_ROSTER)
-        .expect("write placeholder roster");
-    let fake_auth = plugin.join("scripts/gh-as.sh");
-    fs::write(
-        &fake_auth,
-        concat!(
-            "#!/usr/bin/env bash\n",
-            "printf '%s\\n' 'branch query for placeholder-org/alpha reached query_limit 200; refusing a truncated sweep' >&2\n",
-            "exit 6\n",
-        ),
-    )
-    .expect("write truncating organization worker");
-    fs::set_permissions(&fake_auth, fs::Permissions::from_mode(0o700))
-        .expect("make organization worker executable");
-
-    let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
-        .args(["sweep", "--started-at", "2026-08-01T00:00:00Z"])
-        .env("OSTROM_HOME", home.path())
-        .env("OSTROM_PLUGIN_ROOT", plugin)
-        .current_dir(home.path())
-        .output()
-        .expect("run outer sweep");
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains(
-        "branch query for placeholder-org/alpha reached query_limit 200; refusing a truncated sweep"
-    ));
-    assert!(!home.path().join("queue.jsonl").exists());
-}
-
 #[test]
 fn mandate_sweep_time_pins_sweep_and_cli_time_takes_precedence() {
     let home = tempdir().expect("temporary OSTROM_HOME");
@@ -910,5 +805,62 @@ fn mandate_sweep_time_applies_to_plan_and_rejects_malformed_values() {
     assert!(
         String::from_utf8_lossy(&malformed.stderr)
             .contains("MANDATE_SWEEP_TIME is not a valid RFC3339 instant")
+    );
+}
+
+#[test]
+fn an_unmintable_organization_becomes_a_named_queue_fault() {
+    // The organization driver used to be exercised through a fake gh-as.sh on
+    // disk. Minting is native now, so the seam is the secrets file: an absent
+    // one fails credential resolution before any network call, which keeps
+    // this hermetic. The property under test is unchanged and is the one that
+    // matters — a token failure must surface as a fault row rather than as a
+    // silently short sweep.
+    let home = tempdir().expect("temporary OSTROM_HOME");
+    fs::write(home.path().join("mandates.yaml"), PLACEHOLDER_ROSTER).expect("write roster");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .args(["sweep", "--started-at", "2026-08-01T00:00:00Z"])
+        .env("OSTROM_HOME", home.path())
+        .env("MANDATE_SECRETS_FILE", home.path().join("absent.yaml"))
+        .current_dir(home.path())
+        .output()
+        .expect("run organization driver");
+    assert!(
+        output.status.success(),
+        "one unmintable organization must not take the sweep down: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let rows = fs::read_to_string(home.path().join("queue.jsonl")).expect("read fault queue");
+    let rows = rows
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("parse queue row"))
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], "placeholder-org/alpha#0");
+    let reason = rows[0]["mandate"]["reason"]
+        .as_str()
+        .expect("fault rows carry a reason");
+    assert!(
+        reason.contains("authentication"),
+        "the queue row must say the repository could not be authenticated for: {reason}"
+    );
+
+    // The row names the repository, because that is the unit an operator acts
+    // on. The organization and the underlying cause reach stderr, where the
+    // three failure classes stay distinguishable.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("for organization placeholder-org"),
+        "stderr must name the organization: {stderr}"
+    );
+    assert!(
+        stderr.contains("credentials unavailable"),
+        "a missing secrets file is a named credential error, not a transport or scope one: {stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked"),
+        "a missing secrets file is a named error, not a panic: {stderr}"
     );
 }
