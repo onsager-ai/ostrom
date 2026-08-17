@@ -100,6 +100,8 @@ while IFS= read -r repository; do
   [ -n "$repository" ] || continue
   repo_prs="$work/prs-$(printf '%s' "$repository" | tr '/:' '__').json"
   if bash "$GH_AS_BIN" builder "$repository" \
+    --repositories "$repository" \
+    --permissions metadata:read,pull_requests:read,checks:read,statuses:read -- \
     gh pr list --repo "$repository" --state open --limit "$QUERY_LIMIT" \
       --json number,body,author,mergeable,statusCheckRollup,headRefName,baseRefName,headRefOid,isCrossRepository \
       >"$repo_prs"; then
@@ -186,6 +188,8 @@ while IFS= read -r candidate; do
 
   remote_url="https://github.com/$repository.git"
   if bash "$GH_AS_BIN" builder "$repository" \
+    --repositories "$repository" \
+    --permissions metadata:read,contents:read -- \
     git -C "$candidate_work" fetch --no-tags "$remote_url" \
       "refs/heads/$head_branch:refs/remotes/repair/head" \
       "refs/heads/$base_branch:refs/remotes/repair/base"; then
@@ -276,6 +280,8 @@ Ostrom-Role: builder"
   fi
 
   if bash "$GH_AS_BIN" builder "$repository" \
+    --repositories "$repository" \
+    --permissions metadata:read,contents:write -- \
     git -C "$candidate_work" push "$remote_url" \
       "HEAD:refs/heads/$head_branch"; then
     repaired=$((repaired + 1))

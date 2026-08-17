@@ -49,7 +49,8 @@ all; report that and stop rather than retry with an ambient credential. Any
 other exit code is the given command's own, unchanged.
 
 The required `gatekeeper` argument names the caller at the call site; it does
-not narrow the shared token. Any `Ostrom-Role:` marker reaching this protocol —
+not narrow the shared token. `gh-as.sh` derives repository and permission
+scope from each command below, and refuses commands it cannot scope. Any `Ostrom-Role:` marker reaching this protocol —
 on a commit or in a pull request body — was written by the role it names, so it
 is a self-asserted advisory record, not evidence of who acted, and never an
 input to the gate.
@@ -395,7 +396,8 @@ is not strict — it is unclearable, and every merge needs a principal exception
 
 Resolving still means calling `gh`, so it is still bound by step 2: route the
 `gh api graphql` call that resolves the thread through `gh-as.sh` the same
-way, naming `gatekeeper` and this repository ahead of it.
+way, naming `gatekeeper` and this repository ahead of it. `gh-as.sh` derives
+`metadata:read,pull_requests:write` for that mutation.
 
 Resolve a thread only when **all** of these hold:
 

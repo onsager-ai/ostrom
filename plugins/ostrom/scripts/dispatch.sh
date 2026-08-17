@@ -228,6 +228,8 @@ while [ "$branch_page_number" -le "$REMOTE_BRANCH_PAGE_LIMIT" ]; do
   branch_query_status=0
   if remote_branch_page="$({
     bash "$GH_AS_BIN" builder "$repository" \
+      --repositories "$repository" \
+      --permissions metadata:read,contents:read -- \
       gh api "repos/$repository/branches?per_page=$REMOTE_BRANCH_PAGE_SIZE&page=$branch_page_number"
   } 2>"$branch_stderr_file")"; then
     :
@@ -288,6 +290,7 @@ if [ -n "$matching_remote_branch" ]; then
   ahead_of_default=unknown
   default_branch="$({
     bash "$GH_AS_BIN" builder "$repository" \
+      --repositories "$repository" --permissions metadata:read -- \
       gh repo view "$repository" --json defaultBranchRef \
         --jq '.defaultBranchRef.name'
   } 2>/dev/null)" || default_branch=""
@@ -298,6 +301,8 @@ if [ -n "$matching_remote_branch" ]; then
     if [ -n "$default_head_sha" ]; then
       compared_ahead="$({
         bash "$GH_AS_BIN" builder "$repository" \
+          --repositories "$repository" \
+          --permissions metadata:read,contents:read -- \
           gh api "repos/$repository/compare/$default_head_sha...$pushed_head_sha" \
             --jq '.ahead_by'
       } 2>/dev/null)" || compared_ahead=""
@@ -309,6 +314,8 @@ if [ -n "$matching_remote_branch" ]; then
   fi
   branch_pull_requests="$({
     bash "$GH_AS_BIN" builder "$repository" \
+      --repositories "$repository" \
+      --permissions metadata:read,pull_requests:read -- \
       gh pr list --repo "$repository" --head "$pushed_branch" --state all \
         --json number,state,mergedAt
   } 2>/dev/null)" || {
@@ -342,6 +349,8 @@ fi
 # absent from closedByPullRequestsReferences and therefore remains dispatchable.
 closing_pr_references="$({
   bash "$GH_AS_BIN" builder "$repository" \
+    --repositories "$repository" \
+    --permissions metadata:read,issues:read,pull_requests:read -- \
     gh issue view "$item_ref" --repo "$repository" \
       --json closedByPullRequestsReferences
 } 2>/dev/null)" || {
@@ -362,6 +371,8 @@ while IFS= read -r closing_pr_url; do
   [ -n "$closing_pr_url" ] || continue
   closing_pr="$({
     bash "$GH_AS_BIN" builder "$repository" \
+      --repositories "$repository" \
+      --permissions metadata:read,pull_requests:read -- \
       gh pr view "$closing_pr_url" --json number,state,mergedAt,url
   } 2>/dev/null)" || {
     echo "ostrom dispatch: could not resolve closing pull request $closing_pr_url for $item_id" >&2
@@ -495,6 +506,8 @@ fi
 
 open_prs="$({
   bash "$GH_AS_BIN" builder "$repository" \
+    --repositories "$repository" \
+    --permissions metadata:read,pull_requests:read -- \
     gh pr list --repo "$repository" --state open --limit 1000 \
       --json number,title,body,url
 } 2>/dev/null)" || {

@@ -244,7 +244,8 @@ extract_closed_issue_ids() {
 # `gh` call the sweep makes. It runs once per distinct GitHub organisation
 # in the roster, each time inside its own gh-as.sh invocation, so every
 # organisation's repositories are read under a token minted for that
-# organisation's own App installation.
+# organisation's own App installation and explicitly narrowed to the roster
+# repositories the process will query.
 #
 # A GitHub App installation token is scoped to one installation, and one
 # installation covers at most one organisation's repositories (a token
@@ -2349,6 +2350,13 @@ while IFS= read -r org; do
       'first(.projects[] | select((.repo | split("/")[0]) == $org) | .repo)' \
       "$work/config.json"
   )"
+  scoped_repositories="$(
+    jq -r --arg org "$org" '
+      [.projects[] | select((.repo | split("/")[0]) == $org) | .repo]
+      | unique
+      | join(",")
+    ' "$work/config.json"
+  )"
   # anchor_repo only tells gh-as.sh/app-token.sh which installation to
   # resolve a token for; sweep_org (invoked as this exact process, under
   # that token) then reads every repository under $org, not just the
@@ -2359,6 +2367,8 @@ while IFS= read -r org; do
     MANDATE_SWEEP_MODE_EFFECTIVE="$sweep_mode" \
     MANDATE_SEMANTIC_ENABLED="$semantic_enabled" MANDATE_SEMANTIC_NODE="$semantic_node" \
     bash "$SCRIPT_DIR/gh-as.sh" gatekeeper "$anchor_repo" \
+    --repositories "$scoped_repositories" \
+    --permissions metadata:read,issues:read,pull_requests:read,checks:read,statuses:read,actions:read,contents:read -- \
     bash "${BASH_SOURCE[0]}"
 done < <(jq -r '[.projects[].repo | split("/")[0]] | unique | .[]' "$work/config.json")
 
