@@ -785,6 +785,11 @@ fn role_name(role: CliPassRole) -> &'static str {
     }
 }
 
+// SIGHUP and SIGTERM do not exist on Windows, and signal-hook configures them
+// out rather than stubbing them. The pass supervisor is a POSIX job-control
+// mechanism; on Windows the flags stay unset and the supervisor simply waits
+// for its worker, which is the same behaviour as a run that receives no signal.
+#[cfg(unix)]
 fn register_signals() -> io::Result<SignalFlags> {
     use signal_hook::{consts::signal, flag};
 
@@ -793,6 +798,11 @@ fn register_signals() -> io::Result<SignalFlags> {
     flag::register(signal::SIGINT, flags.int_flag())?;
     flag::register(signal::SIGTERM, flags.term_flag())?;
     Ok(flags)
+}
+
+#[cfg(not(unix))]
+fn register_signals() -> io::Result<SignalFlags> {
+    Ok(SignalFlags::default())
 }
 
 fn supervise(arguments: &[OsString]) -> ! {
