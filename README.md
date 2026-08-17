@@ -108,11 +108,10 @@ and pre-1.0 semver policy are documented in
 
 ### CLI (primary)
 
-The primary CLI distribution is npm. The public package name is intentionally
-pending registration; once selected, install it with:
+The primary CLI distribution is npm:
 
 ```sh
-npm install --global <npm-package-name>
+npm install --global @ostrom/cli
 ostrom --version
 ```
 
