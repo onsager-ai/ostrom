@@ -784,7 +784,7 @@ mandate_load_gate_config() {
         .selector as $selector
         | ((try ($selector | capture("^(?<prefix>[^:]+):(?<glob>.*)$")) catch null) // null) as $parsed
         | if $parsed == null or
-             ($parsed.prefix | IN("label", "scope", "type", "path", "ref", "title") | not)
+             ($parsed.prefix | IN("label", "scope", "type", "path", "ref", "title", "substance") | not)
           then "unknown selector prefix"
           elif $parsed.glob == ""
           then "selector value is empty"
