@@ -1,10 +1,12 @@
 //! Filesystem implementation and compatibility readers.
 
+mod app_token;
 mod check_store;
 mod file_store;
 mod lease;
 mod leaves;
 mod migration;
+mod parity;
 mod pass_state;
 mod paths;
 mod plan;
@@ -12,6 +14,7 @@ mod queue;
 mod sweep;
 mod trace;
 
+pub use app_token::AppTokenError;
 pub use check_store::JsonlCheckStore;
 pub use file_store::JsonlSweepStore;
 pub use lease::{LeaseRecord, read_lease, write_lease};
@@ -20,6 +23,7 @@ pub use leaves::{
     local_drift,
 };
 pub use migration::{MigrationOutcome, migrate};
+pub use parity::{ParityError, SweepParityOptions, SweepParityOutcome, run_sweep_parity};
 pub use pass_state::{PassState, read_pass_state, write_pass_state};
 pub use paths::OstromPaths;
 pub use plan::{
