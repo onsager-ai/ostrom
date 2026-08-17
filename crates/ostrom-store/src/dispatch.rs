@@ -26,6 +26,8 @@ const DEFAULT_MAX_IMPLEMENTERS_PER_REPOSITORY: usize = 1;
 const REMOTE_BRANCH_PAGE_SIZE: usize = 100;
 const REMOTE_BRANCH_PAGE_LIMIT: usize = 100;
 const DEFAULT_IMPLEMENTER_LEASE_TTL_SECONDS: u64 = 2_592_000;
+// The production comparison window keeps rollback to one environment change.
+const DEFAULT_IMPLEMENTER_ENGINE: &str = "shell";
 
 #[derive(Debug, Clone)]
 pub struct DispatchRequest {
@@ -452,17 +454,22 @@ fn after_lease(
         ));
     }
 
+    let implementer_engine = env::var("MANDATE_IMPLEMENTER_ENGINE")
+        .unwrap_or_else(|_| DEFAULT_IMPLEMENTER_ENGINE.to_owned());
+    let (implementer, implementer_verb) = implementer_launch(
+        &context.request.plugin_root,
+        &implementer_engine,
+        env::var_os("MANDATE_IMPLEMENTER_BIN"),
+        env::var_os("MANDATE_OSTROM_BIN"),
+    )?;
     append_dispatched(context)?;
     let systemd = env::var_os("MANDATE_SYSTEMD_RUN_BIN")
         .map_or_else(|| PathBuf::from("systemd-run"), PathBuf::from);
-    let implementer = env::var_os("MANDATE_IMPLEMENTER_BIN").map_or_else(
-        || context.request.plugin_root.join("scripts/implement.sh"),
-        PathBuf::from,
-    );
     let config_dir = env::var_os("CLAUDE_CONFIG_DIR")
         .map_or_else(|| context.request.paths.config.clone(), PathBuf::from);
     let started = Instant::now();
-    let status = Command::new(systemd)
+    let mut launch = Command::new(systemd);
+    launch
         .args([
             "--user",
             "--unit",
@@ -495,7 +502,11 @@ fn after_lease(
             "--setenv",
             &format!("PATH={unit_path}"),
         ])
-        .arg(&implementer)
+        .arg(&implementer);
+    if let Some(verb) = implementer_verb {
+        launch.arg(verb);
+    }
+    let status = launch
         .arg(&context.request.order_file)
         .arg(&context.unit_name)
         .status();
@@ -520,6 +531,28 @@ fn after_lease(
     Ok(DispatchOutcome::Started(context.unit_name.clone()))
 }
 
+fn implementer_launch(
+    plugin_root: &Path,
+    engine: &str,
+    shell_override: Option<std::ffi::OsString>,
+    rust_override: Option<std::ffi::OsString>,
+) -> Result<(PathBuf, Option<&'static str>), DispatchError> {
+    match engine {
+        "shell" => Ok((
+            shell_override.map_or_else(|| plugin_root.join("scripts/implement.sh"), PathBuf::from),
+            None,
+        )),
+        "rust" => Ok((
+            rust_override.map_or_else(|| PathBuf::from("ostrom"), PathBuf::from),
+            Some("implement"),
+        )),
+        other => Err(DispatchError::new(
+            2,
+            format!("ostrom dispatch: unsupported implementer engine: {other}"),
+        )),
+    }
+}
+
 fn preflight_worktree(context: &DispatchContext<'_>) -> Result<(), DispatchError> {
     let root = context
         .request
@@ -537,6 +570,9 @@ fn preflight_worktree(context: &DispatchContext<'_>) -> Result<(), DispatchError
     let status =
         git_text(&root, &["status", "--porcelain"]).unwrap_or_else(|| "unreadable".to_owned());
     let default_ref = local_default_ref(&root);
+    let unpublished = default_ref
+        .as_deref()
+        .and_then(|reference| has_unpublished_tree(&root, reference));
     let ahead = default_ref
         .as_deref()
         .and_then(|reference| {
@@ -546,7 +582,7 @@ fn preflight_worktree(context: &DispatchContext<'_>) -> Result<(), DispatchError
             )
         })
         .and_then(|value| value.parse::<u64>().ok());
-    if !status.is_empty() || ahead.is_none() || ahead.is_some_and(|value| value > 0) {
+    if !status.is_empty() || unpublished.is_none() || unpublished == Some(true) {
         let detail = FailureDetail {
             worktree_path: Some(root.clone()),
             branch_name: Some(existing.clone()),
@@ -566,6 +602,22 @@ fn preflight_worktree(context: &DispatchContext<'_>) -> Result<(), DispatchError
         ));
     }
     Ok(())
+}
+
+fn has_unpublished_tree(worktree: &Path, default_ref: &str) -> Option<bool> {
+    // Squash merging changes ancestry forever; equal trees prove the branch's
+    // work landed even while its original commit remains ahead of main.
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["diff", "--quiet", default_ref, "HEAD"])
+        .status()
+        .ok()?;
+    match status.code() {
+        Some(0) => Some(false),
+        Some(1) => Some(true),
+        _ => None,
+    }
 }
 
 fn resolve_source_repository(
@@ -1414,6 +1466,29 @@ fn render_number(number: f64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        process::Command,
+    };
+
+    use tempfile::tempdir;
+
+    use super::{DEFAULT_IMPLEMENTER_ENGINE, has_unpublished_tree, implementer_launch};
+
+    fn git(path: &Path, arguments: &[&str]) {
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(arguments)
+                .status()
+                .expect("run git")
+                .success(),
+            "git {arguments:?}"
+        );
+    }
+
     #[test]
     fn launch_boundary_is_an_explicit_command_not_an_in_process_side_effect() {
         let source = include_str!("dispatch.rs");
@@ -1421,5 +1496,55 @@ mod tests {
         for forbidden in [["git", "push"], ["git", "branch"]] {
             assert!(!source.contains(&forbidden.join(" ")));
         }
+    }
+
+    #[test]
+    fn implementer_defaults_to_shell_and_rust_requires_explicit_selection() {
+        let root = Path::new("/placeholder/plugin");
+        assert_eq!(DEFAULT_IMPLEMENTER_ENGINE, "shell");
+        assert_eq!(
+            implementer_launch(root, DEFAULT_IMPLEMENTER_ENGINE, None, None)
+                .expect("default launch"),
+            (root.join("scripts/implement.sh"), None)
+        );
+        assert_eq!(
+            implementer_launch(root, "rust", None, None).expect("Rust launch"),
+            (PathBuf::from("ostrom"), Some("implement"))
+        );
+    }
+
+    #[test]
+    fn dispatch_mismatch_guard_accepts_a_real_squash_merge() {
+        let fixture = tempdir().expect("temporary repository");
+        let repo = fixture.path().join("placeholder-alpha");
+        fs::create_dir(&repo).expect("create repository");
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "fixture@example.invalid"]);
+        git(&repo, &["config", "user.name", "Fixture"]);
+        fs::write(repo.join("README.md"), "base\n").expect("write base");
+        git(&repo, &["add", "README.md"]);
+        git(&repo, &["commit", "-m", "base"]);
+        git(&repo, &["switch", "-c", "candidate/placeholder"]);
+        fs::write(repo.join("README.md"), "base\nchange\n").expect("write change");
+        git(&repo, &["commit", "-am", "change"]);
+        git(&repo, &["switch", "main"]);
+        git(&repo, &["merge", "--squash", "candidate/placeholder"]);
+        git(&repo, &["commit", "-m", "squash change"]);
+        git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git(&repo, &["switch", "candidate/placeholder"]);
+
+        assert_eq!(
+            has_unpublished_tree(&repo, "refs/remotes/origin/main"),
+            Some(false)
+        );
+        assert_eq!(
+            super::git_text(
+                &repo,
+                &["rev-list", "--count", "refs/remotes/origin/main..HEAD"]
+            )
+            .as_deref(),
+            Some("1"),
+            "the ancestry-only guard would refuse this branch forever"
+        );
     }
 }

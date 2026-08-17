@@ -49,7 +49,8 @@ scrub_per_invocation_environment() {
   unset CLAUDE_CONFIG_DIR OSTROM_HOME \
     MANDATE_AUDIT_TIME MANDATE_DAILY_CAP_USD MANDATE_DIGEST_TIME \
     MANDATE_EXCUSE_TIME MANDATE_GATE_TIME MANDATE_GH_AS_BIN \
-    MANDATE_IMPLEMENTER_SOURCE_REPO MANDATE_IMPLEMENTER_STREAMING_CEILING \
+    MANDATE_IMPLEMENTER_ENGINE MANDATE_IMPLEMENTER_SOURCE_REPO \
+    MANDATE_IMPLEMENTER_STREAMING_CEILING MANDATE_OSTROM_BIN \
     MANDATE_IMPLEMENTER_TERMINATION_GRACE_SECONDS \
     MANDATE_LEASE_NAME MANDATE_LEASE_NOW_EPOCH MANDATE_LEASE_TTL_SECONDS \
     MANDATE_PUBLISH_ALLOWLIST MANDATE_PUBLISH_DIR MANDATE_PUBLISH_REMOTE \
@@ -812,13 +813,13 @@ fi
 # pass-started row, under their own minted owner, once they reach step 2 of
 # the protocol. FAKE_CLAUDE_INNER_OWNER opts a fixture into simulating that;
 # leaving it unset simulates a session that never got that far -- the
-# no-op shape pass.sh must now catch.
+# no-op shape the pass command must now catch.
 if [ -n "${FAKE_CLAUDE_INNER_OWNER:-}" ]; then
   OSTROM_HOME="$CLAUDE_CONFIG_DIR/ostrom" "$FAKE_CLAUDE_OSTROM" trace append pass-started \
     "$(printf '{"owner":"%s"}' "$FAKE_CLAUDE_INNER_OWNER")" '{}' >/dev/null
 fi
 # Gatekeeper pass-ended facts deliberately omit owner, matching the weaker
-# production shape pass.sh must still reconcile with the role-prefixed start.
+# production shape the pass command must still reconcile with the role-prefixed start.
 if [ -n "${FAKE_CLAUDE_INNER_OUTCOME:-}" ]; then
   OSTROM_HOME="$CLAUDE_CONFIG_DIR/ostrom" "$FAKE_CLAUDE_OSTROM" trace append pass-ended \
     "$(printf '{"outcome":"%s","completed_candidates":0}' "$FAKE_CLAUDE_INNER_OUTCOME")" \
@@ -844,13 +845,13 @@ fake_claude_ostrom="$OSTROM_BIN"
 
 CLAUDE_CONFIG_DIR="$pass_config" CLAUDE_BIN="$fake_claude" \
   FAKE_CLAUDE_MARKER="$fake_marker" \
-  bash "$PLUGIN_ROOT/scripts/pass.sh" builder >/dev/null 2>&1
+  "$OSTROM_BIN" pass builder >/dev/null 2>&1
 [ ! -e "$fake_marker" ]
 [ ! -e "$pass_config/ostrom/sprint.jsonl" ]
 
 : >"$pass_config/ostrom/loop-armed"
 # Stamp the fixture lease at real time, not a fixed epoch. A lease started at
-# epoch 400 is decades expired by the time pass.sh reads it, so pass.sh
+# epoch 400 is decades expired by the time the pass command reads it, so it
 # correctly reclaims it and runs a full pass — which exercises reclamation,
 # not the timer overlap this case exists to cover.
 CLAUDE_CONFIG_DIR="$pass_config" \
@@ -858,7 +859,7 @@ CLAUDE_CONFIG_DIR="$pass_config" \
   run_ostrom lease acquire fixture-holder 3600 >/dev/null
 CLAUDE_CONFIG_DIR="$pass_config" CLAUDE_BIN="$fake_claude" \
   FAKE_CLAUDE_MARKER="$fake_marker" \
-  bash "$PLUGIN_ROOT/scripts/pass.sh" builder >/dev/null 2>&1
+  "$OSTROM_BIN" pass builder >/dev/null 2>&1
 [ ! -e "$fake_marker" ]
 [ ! -e "$pass_config/ostrom/sprint.jsonl" ]
 CLAUDE_CONFIG_DIR="$pass_config" MANDATE_LEASE_NAME=builder-pass.lease \
@@ -869,7 +870,7 @@ CLAUDE_CONFIG_DIR="$pass_config" CLAUDE_BIN="$fake_claude" \
   FAKE_CLAUDE_MARKER="$fake_marker" FAKE_CLAUDE_ARGS_FILE="$builder_args" \
   FAKE_CLAUDE_INNER_OWNER="builder-inner-session-wake1" \
   FAKE_CLAUDE_OSTROM="$fake_claude_ostrom" \
-  bash "$PLUGIN_ROOT/scripts/pass.sh" builder >/dev/null
+  "$OSTROM_BIN" pass builder >/dev/null
 [ ! -e "$pass_config/ostrom/builder-pass.lease" ]
 # The regression test for #73: a pass whose inner session did take ownership
 # -- proven by its own pass-started row landing after the wrapper's -- is
@@ -891,7 +892,7 @@ jq -s -e '
 # globally (above) so every simulated day is deterministic, so this fixture
 # gets its own config dir and explicitly unsets it for one call -- the one
 # way to exercise what a real deployment does, where no caller ever sets
-# MANDATE_NOW_EPOCH at all. pass.sh must keep stamping the pass-started/
+# MANDATE_NOW_EPOCH at all. the pass command must keep stamping the pass-started/
 # pass-ended rows it writes about its own pass with the real wall clock
 # exactly as before this fix, so ostrom trace's own real-UTC default keeps doing
 # the stamping and production behaviour is unchanged.
@@ -908,7 +909,7 @@ env -u MANDATE_NOW_EPOCH \
   CLAUDE_CONFIG_DIR="$pass_realclock_config" CLAUDE_BIN="$fake_claude" \
   FAKE_CLAUDE_INNER_OWNER="builder-inner-realclock-wake1" \
   FAKE_CLAUDE_OSTROM="$fake_claude_ostrom" \
-  bash "$PLUGIN_ROOT/scripts/pass.sh" builder >/dev/null
+  "$OSTROM_BIN" pass builder >/dev/null
 real_today_after="$(date -u +%Y-%m-%d)"
 jq -s -e \
   --arg before "$real_today_before" \
@@ -939,7 +940,7 @@ CLAUDE_CONFIG_DIR="$pass_config" CLAUDE_BIN="$fake_claude" \
   FAKE_CLAUDE_MARKER="$fake_marker" \
   FAKE_CLAUDE_INNER_OWNER="builder-inner-session-wake2" \
   FAKE_CLAUDE_OSTROM="$fake_claude_ostrom" \
-  bash "$PLUGIN_ROOT/scripts/pass.sh" builder >/dev/null
+  "$OSTROM_BIN" pass builder >/dev/null
 jq -s -e '
   length == 6
   and .[3].kind == "pass-started"
@@ -960,7 +961,7 @@ jq -s -e '
 noop_args="$pass_fixture/noop-args"
 CLAUDE_CONFIG_DIR="$pass_config" CLAUDE_BIN="$fake_claude" \
   FAKE_CLAUDE_MARKER="$fake_marker" FAKE_CLAUDE_ARGS_FILE="$noop_args" \
-  bash "$PLUGIN_ROOT/scripts/pass.sh" builder >/dev/null
+  "$OSTROM_BIN" pass builder >/dev/null
 jq -s -e '
   length == 8
   and .[6].kind == "pass-started"
@@ -976,7 +977,7 @@ jq -s -e '
 # legitimate skip, and must not borrow no-op's quiet reporting.
 CLAUDE_CONFIG_DIR="$pass_config" CLAUDE_BIN="$fake_claude" \
   FAKE_CLAUDE_MARKER="$fake_marker" FAKE_CLAUDE_MODE=fail \
-  bash "$PLUGIN_ROOT/scripts/pass.sh" builder >/dev/null 2>&1 || true
+  "$OSTROM_BIN" pass builder >/dev/null 2>&1 || true
 jq -s -e '
   length == 10
   and .[8].kind == "pass-started"
@@ -1002,7 +1003,7 @@ CLAUDE_CONFIG_DIR="$outcome_config" CLAUDE_BIN="$fake_claude" \
   FAKE_CLAUDE_INNER_OWNER="gatekeeper-inner-fixture-wake1" \
   FAKE_CLAUDE_INNER_OUTCOME=failed \
   FAKE_CLAUDE_OSTROM="$fake_claude_ostrom" \
-  bash "$PLUGIN_ROOT/scripts/pass.sh" gatekeeper >/dev/null
+  "$OSTROM_BIN" pass gatekeeper >/dev/null
 jq -s -e '
   length == 4
   and map(.kind) == ["pass-started", "pass-started", "pass-ended", "pass-ended"]
@@ -1018,7 +1019,7 @@ CLAUDE_CONFIG_DIR="$outcome_config" CLAUDE_BIN="$fake_claude" \
   FAKE_CLAUDE_INNER_OWNER="gatekeeper-inner-fixture-wake2" \
   FAKE_CLAUDE_INNER_OUTCOME=completed \
   FAKE_CLAUDE_OSTROM="$fake_claude_ostrom" \
-  bash "$PLUGIN_ROOT/scripts/pass.sh" gatekeeper >/dev/null
+  "$OSTROM_BIN" pass gatekeeper >/dev/null
 jq -s -e '
   length == 8
   and .[6].kind == "pass-ended"
@@ -1031,7 +1032,7 @@ jq -s -e '
 # With no inner rows at all, #73's no-op classification and reason survive
 # unchanged rather than being mistaken for a missing outcome on a real run.
 CLAUDE_CONFIG_DIR="$outcome_config" CLAUDE_BIN="$fake_claude" \
-  bash "$PLUGIN_ROOT/scripts/pass.sh" gatekeeper >/dev/null
+  "$OSTROM_BIN" pass gatekeeper >/dev/null
 jq -s -e '
   length == 10
   and .[8].kind == "pass-started"
@@ -1049,7 +1050,7 @@ FAKE_CLAUDE_MODE=wait FAKE_CLAUDE_MARKER="$outcome_marker" \
   FAKE_CLAUDE_INNER_OUTCOME=failed \
   FAKE_CLAUDE_OSTROM="$fake_claude_ostrom" \
   CLAUDE_CONFIG_DIR="$outcome_config" CLAUDE_BIN="$fake_claude" \
-  bash "$PLUGIN_ROOT/scripts/pass.sh" gatekeeper >/dev/null 2>&1 &
+  "$OSTROM_BIN" pass gatekeeper >/dev/null 2>&1 &
 outcome_timeout_pid=$!
 for _attempt in $(seq 1 100); do
   [ -s "$outcome_marker" ] && break
@@ -1075,7 +1076,7 @@ FAKE_CLAUDE_MODE=wait FAKE_CLAUDE_MARKER="$outcome_marker" \
   FAKE_CLAUDE_INNER_OUTCOME=completed \
   FAKE_CLAUDE_OSTROM="$fake_claude_ostrom" \
   CLAUDE_CONFIG_DIR="$outcome_config" CLAUDE_BIN="$fake_claude" \
-  bash "$PLUGIN_ROOT/scripts/pass.sh" gatekeeper >/dev/null 2>&1 &
+  "$OSTROM_BIN" pass gatekeeper >/dev/null 2>&1 &
 outcome_signal_pid=$!
 for _attempt in $(seq 1 100); do
   [ -s "$outcome_marker" ] && break
@@ -1099,7 +1100,7 @@ gatekeeper_args="$pass_fixture/gatekeeper-args"
 FAKE_CLAUDE_MODE=wait FAKE_CLAUDE_MARKER="$fake_marker" \
   FAKE_CLAUDE_ARGS_FILE="$gatekeeper_args" \
   CLAUDE_CONFIG_DIR="$pass_config" CLAUDE_BIN="$fake_claude" \
-  bash "$PLUGIN_ROOT/scripts/pass.sh" gatekeeper >/dev/null 2>&1 &
+  "$OSTROM_BIN" pass gatekeeper >/dev/null 2>&1 &
 signalled_pass_pid=$!
 for _attempt in $(seq 1 100); do
   [ -s "$fake_marker" ] && break
@@ -1305,10 +1306,10 @@ jq -s -e '
   and .[2].fact.outcome == "failed"
 ' "$builder_failure/ostrom/sprint.jsonl" >/dev/null
 
-# The Claude session pass.sh spawns acquires its own protocol lease
-# (builder.lease) as step 2 of its work. When pass.sh's child is killed
+# The Claude session the pass command spawns acquires its own protocol lease
+# (builder.lease) as step 2 of its work. When the pass command's child is killed
 # before that session reaches its own release step, the inner lease must not
-# outlive the pass -- that is the property pass.sh exists to guarantee, one
+# outlive the pass -- that is the property the pass command exists to guarantee, one
 # layer deeper than the outer *-pass.lease it already protects.
 inner_kill="$fixture/inner-lease-kill"
 mkdir -p "$inner_kill/ostrom/roles"
@@ -1318,7 +1319,7 @@ inner_kill_marker="$inner_kill/claude-started"
 
 FAKE_CLAUDE_MODE=wait FAKE_CLAUDE_MARKER="$inner_kill_marker" \
   CLAUDE_CONFIG_DIR="$inner_kill" CLAUDE_BIN="$fake_claude" \
-  bash "$PLUGIN_ROOT/scripts/pass.sh" builder \
+  "$OSTROM_BIN" pass builder \
   >"$inner_kill/pass.out" 2>"$inner_kill/pass.err" &
 inner_kill_pass_pid=$!
 for _attempt in $(seq 1 100); do
@@ -1329,7 +1330,7 @@ done
 
 # Simulate the spawned session having reached step 2 of its own protocol and
 # acquired the inner lease, using the real clock (no epoch override) so its
-# started_at is provably at-or-after pass.sh's own recorded start_epoch.
+# started_at is provably at-or-after the pass command's own recorded start_epoch.
 CLAUDE_CONFIG_DIR="$inner_kill" MANDATE_LEASE_NAME=builder.lease \
   run_ostrom lease acquire builder-childsession-wake9 \
   >/dev/null
@@ -1347,14 +1348,14 @@ grep -q 'releasing inner lease builder.lease held by builder-childsession-wake9'
 
 # An inner lease already held by a concurrent interactive session -- one
 # whose started_at predates this pass's own start -- must be left alone. This
-# is the regression test for the safety check: pass.sh cannot tell that lease
+# is the regression test for the safety check: the pass cannot tell that lease
 # apart from its own child's by owner name, only by timestamp, and stealing
 # it would break the one guarantee a concurrent session relies on.
 #
 # Stamp the fixture lease at a fixed, far-past epoch rather than the real
-# clock. pass.sh reads its own start_epoch from the real clock, and ostrom lease
+# clock. the pass command reads its own start_epoch from the real clock, and ostrom lease
 # timestamps are whole seconds -- acquiring "concurrently" at real time risks
-# landing in the same second as pass.sh's start_epoch, which the safety
+# landing in the same second as the pass command's start_epoch, which the safety
 # check's inclusive ">=" correctly (per spec) treats as "ours". A fixed past
 # epoch keeps this test deterministic instead of occasionally exercising the
 # reclaim path it exists to rule out.
@@ -1373,7 +1374,7 @@ preexisting_inner_lease="$(
 )"
 
 CLAUDE_CONFIG_DIR="$inner_safe" CLAUDE_BIN="$fake_claude" \
-  bash "$PLUGIN_ROOT/scripts/pass.sh" builder \
+  "$OSTROM_BIN" pass builder \
   >"$inner_safe/pass.out" 2>"$inner_safe/pass.err"
 
 [ ! -e "$inner_safe/ostrom/builder-pass.lease" ]
@@ -1444,7 +1445,7 @@ CLAUDE_CONFIG_DIR="$lease_release" \
 [ ! -e "$lease_release/ostrom/sprint.lease" ]
 [ ! -e "$lease_release/ostrom/.sprint.lease.guard" ]
 
-# Daily spend cap (#80): pass.sh sums cost_usd out of today's pass-ended
+# Daily spend cap (#80): the pass command sums cost_usd out of today's pass-ended
 # records, across every role, and stands down instead of spawning a child
 # once that total is at or above the cap -- unbounded spend while the
 # principal is asleep is the one loop failure nothing else can undo.
@@ -1487,7 +1488,7 @@ CLAUDE_CONFIG_DIR="$cap_config" CLAUDE_BIN="$fake_claude" \
   FAKE_CLAUDE_ARGS_FILE="$cap_undercap_args" \
   FAKE_CLAUDE_INNER_OWNER="builder-inner-cap-wake1" \
   FAKE_CLAUDE_OSTROM="$fake_claude_ostrom" \
-  bash "$PLUGIN_ROOT/scripts/pass.sh" builder >/dev/null
+  "$OSTROM_BIN" pass builder >/dev/null
 [ -s "$cap_undercap_args" ]
 jq -s -e '
   length == 7
@@ -1498,7 +1499,7 @@ jq -s -e '
   and .[6].fact.cost_usd == 1.25
 ' "$cap_trace" >/dev/null
 
-# #99: pass.sh derives "today" from MANDATE_NOW_EPOCH (the simulated day
+# #99: the pass command derives "today" from MANDATE_NOW_EPOCH (the simulated day
 # above) to sum the cap against, but before this fix it appended its own
 # pass-started/pass-ended rows with no MANDATE_TRACE_TIME, so ostrom trace
 # stamped them with the real wall clock instead -- the two clocks agreed
@@ -1521,7 +1522,7 @@ cap_overcap_args="$cap_fixture/overcap-args"
 CLAUDE_CONFIG_DIR="$cap_config" CLAUDE_BIN="$fake_claude" \
   MANDATE_NOW_EPOCH="$cap_today_epoch" MANDATE_DAILY_CAP_USD=11.25 \
   FAKE_CLAUDE_ARGS_FILE="$cap_overcap_args" \
-  bash "$PLUGIN_ROOT/scripts/pass.sh" builder >/dev/null 2>&1
+  "$OSTROM_BIN" pass builder >/dev/null 2>&1
 [ ! -e "$cap_overcap_args" ]
 [ ! -e "$cap_config/ostrom/builder-pass.lease" ]
 [ ! -e "$cap_config/ostrom/builder.lease" ]
@@ -1554,7 +1555,7 @@ CLAUDE_CONFIG_DIR="$cap_yesterday_config" CLAUDE_BIN="$fake_claude" \
   FAKE_CLAUDE_ARGS_FILE="$cap_yesterday_args" \
   FAKE_CLAUDE_INNER_OWNER="builder-inner-yesterday-wake1" \
   FAKE_CLAUDE_OSTROM="$fake_claude_ostrom" \
-  bash "$PLUGIN_ROOT/scripts/pass.sh" builder >/dev/null
+  "$OSTROM_BIN" pass builder >/dev/null
 [ -s "$cap_yesterday_args" ]
 jq -s -e '
   length == 4
@@ -1593,7 +1594,7 @@ cap_malformed_trip_args="$cap_malformed/trip-args"
 CLAUDE_CONFIG_DIR="$cap_malformed_config" CLAUDE_BIN="$fake_claude" \
   MANDATE_NOW_EPOCH="$cap_today_epoch" MANDATE_DAILY_CAP_USD=7 \
   FAKE_CLAUDE_ARGS_FILE="$cap_malformed_trip_args" \
-  bash "$PLUGIN_ROOT/scripts/pass.sh" builder >/dev/null 2>&1
+  "$OSTROM_BIN" pass builder >/dev/null 2>&1
 [ ! -e "$cap_malformed_trip_args" ]
 jq -s -e '
   length == 6
@@ -1606,7 +1607,7 @@ cap_malformed_spawn_args="$cap_malformed/spawn-args"
 CLAUDE_CONFIG_DIR="$cap_malformed_config" CLAUDE_BIN="$fake_claude" \
   MANDATE_NOW_EPOCH="$cap_today_epoch" MANDATE_DAILY_CAP_USD=8 \
   FAKE_CLAUDE_ARGS_FILE="$cap_malformed_spawn_args" \
-  bash "$PLUGIN_ROOT/scripts/pass.sh" builder >/dev/null
+  "$OSTROM_BIN" pass builder >/dev/null
 [ -s "$cap_malformed_spawn_args" ]
 
 # An unparseable override (not a plain number) falls back to the $50
@@ -1624,7 +1625,7 @@ cap_bad_override_args="$cap_bad_override/args"
 CLAUDE_CONFIG_DIR="$cap_bad_override_config" CLAUDE_BIN="$fake_claude" \
   MANDATE_NOW_EPOCH="$cap_today_epoch" MANDATE_DAILY_CAP_USD="not-a-number" \
   FAKE_CLAUDE_ARGS_FILE="$cap_bad_override_args" \
-  bash "$PLUGIN_ROOT/scripts/pass.sh" builder >/dev/null
+  "$OSTROM_BIN" pass builder >/dev/null
 [ -s "$cap_bad_override_args" ]
 
 # #104: triage writes a versioned, canonical order and hands only its path to
