@@ -5,10 +5,12 @@ mod check_store;
 mod dispatch;
 mod file_store;
 mod gate;
+mod implement;
 mod lease;
 mod leaves;
 mod migration;
 mod parity;
+mod pass;
 mod pass_state;
 mod paths;
 mod plan;
@@ -23,9 +25,10 @@ pub use check_store::JsonlCheckStore;
 pub use dispatch::{DispatchError, DispatchOutcome, DispatchRequest, run_dispatch};
 pub use file_store::JsonlSweepStore;
 pub use gate::{GateError, GateOptions, GateOutput, run_gate};
+pub use implement::{ImplementError, ImplementRequest, run_implement};
 pub use lease::{
-    LeaseActionError, LeaseRecord, acquire_lease, lease_status, read_lease, release_lease,
-    validate_lease_name, write_lease,
+    LeaseActionError, LeaseRecord, OwnedLease, acquire_lease, lease_status, read_lease,
+    release_lease, validate_lease_name, write_lease,
 };
 pub use leaves::{
     AuditError, AuditOptions, ExcuseError, LocalDriftError, audit, grant_excuse, list_excuses,
@@ -33,6 +36,7 @@ pub use leaves::{
 };
 pub use migration::{MigrationOutcome, migrate};
 pub use parity::{ParityError, SweepParityOptions, SweepParityOutcome, run_sweep_parity};
+pub use pass::{PassError, PassRequest, PassRole, SignalFlags, run_pass};
 pub use pass_state::{PassState, read_pass_state, write_pass_state};
 pub use paths::OstromPaths;
 pub use plan::{

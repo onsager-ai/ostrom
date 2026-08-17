@@ -198,6 +198,71 @@ pub fn lease_status(state_root: &Path, name: &str) -> Result<Vec<u8>, LeaseActio
     Ok(output)
 }
 
+/// RAII ownership for a lease acquired or adopted through the public lease API.
+///
+/// Acquisition remains exclusive-create in `acquire_lease`; this type only
+/// adds reliable ordinary-error and unwind cleanup around that contract.
+#[derive(Debug)]
+pub struct OwnedLease {
+    state_root: PathBuf,
+    name: String,
+    owner: String,
+    armed: bool,
+}
+
+impl OwnedLease {
+    pub fn acquire(
+        state_root: &Path,
+        name: &str,
+        owner: &str,
+        now: u64,
+        ttl: u64,
+    ) -> Result<Self, LeaseActionError> {
+        acquire_lease(state_root, name, owner, now, ttl)?;
+        Ok(Self {
+            state_root: state_root.to_path_buf(),
+            name: name.to_owned(),
+            owner: owner.to_owned(),
+            armed: true,
+        })
+    }
+
+    pub fn adopt(state_root: &Path, name: &str, owner: &str) -> Result<Self, LeaseActionError> {
+        validate_lease_name(name)?;
+        let bytes = lease_status(state_root, name)?;
+        let record: LeaseRecord =
+            serde_json::from_slice(&bytes).map_err(|_| LeaseActionError::NoReadableLease)?;
+        if record.owner != owner {
+            return Err(LeaseActionError::OwnerMismatch);
+        }
+        Ok(Self {
+            state_root: state_root.to_path_buf(),
+            name: name.to_owned(),
+            owner: owner.to_owned(),
+            armed: true,
+        })
+    }
+
+    pub fn release(&mut self) -> Result<(), LeaseActionError> {
+        if !self.armed {
+            return Ok(());
+        }
+        release_lease(&self.state_root, &self.name, &self.owner)?;
+        self.armed = false;
+        Ok(())
+    }
+
+    pub fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for OwnedLease {
+    fn drop(&mut self) {
+        let _ = self.release();
+    }
+}
+
 fn lease_bytes(record: &LeaseRecord) -> Vec<u8> {
     let mut bytes = serde_json::to_vec(record).expect("lease serializes");
     bytes.push(b'\n');

@@ -1,9 +1,12 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env, fs,
+    env,
+    ffi::OsString,
+    fs,
     io::{self, Write},
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use chrono::{DateTime, Utc};
@@ -16,14 +19,15 @@ use ostrom_core::{
 };
 use ostrom_store::{
     AuditOptions, DispatchOutcome, DispatchRequest, ExecutableAssessmentDeriver, GateError,
-    GateOptions, MigrationOutcome, OstromPaths, PlanOptions, PublishTarget, QueueDecision,
-    SelectAction, SelectError, SelectOutcome, SelectRequest, SweepError, SweepMode, SweepOptions,
-    SweepParityOptions, TraceAppend, TraceView, UnavailableAssessmentDeriver, acquire_lease,
-    acquire_org_from_github, append_trace_checked, audit, branch_name, create_work_order,
-    decide_queue_item, encode_org_snapshots, encode_selection, grant_excuse, item_hash,
-    lease_status, lint_queue_state, list_excuses, list_queue_json, local_drift, migrate,
-    read_trace_json, release_lease, run_dispatch, run_gate, run_plan, run_selection, run_sweep,
-    run_sweep_parity, validate_lease_name, validate_work_order_file,
+    GateOptions, ImplementRequest, MigrationOutcome, OstromPaths, PassRequest, PassRole,
+    PlanOptions, PublishTarget, QueueDecision, SelectAction, SelectError, SelectOutcome,
+    SelectRequest, SignalFlags, SweepError, SweepMode, SweepOptions, SweepParityOptions,
+    TraceAppend, TraceView, UnavailableAssessmentDeriver, acquire_lease, acquire_org_from_github,
+    append_trace_checked, audit, branch_name, create_work_order, decide_queue_item,
+    encode_org_snapshots, encode_selection, grant_excuse, item_hash, lease_status,
+    lint_queue_state, list_excuses, list_queue_json, local_drift, migrate, read_trace_json,
+    release_lease, run_dispatch, run_gate, run_implement, run_pass, run_plan, run_selection,
+    run_sweep, run_sweep_parity, validate_lease_name, validate_work_order_file,
 };
 
 #[derive(Debug, Parser)]
@@ -35,6 +39,24 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Run one unattended delivery pass for a role.
+    Pass { role: CliPassRole },
+    /// Execute one durable work order in its item worktree.
+    Implement {
+        work_order_file: PathBuf,
+        unit_name: String,
+    },
+    #[command(name = "__pass-worker", hide = true)]
+    PassWorker {
+        role: CliPassRole,
+        supervisor_pid: u32,
+    },
+    #[command(name = "__implement-worker", hide = true)]
+    ImplementWorker {
+        work_order_file: PathBuf,
+        unit_name: String,
+        supervisor_pid: u32,
+    },
     /// Turn a durable work order into a running implementer.
     Dispatch {
         #[arg(allow_hyphen_values = true)]
@@ -220,6 +242,21 @@ enum CliSweepMode {
     Incremental,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliPassRole {
+    Builder,
+    Gatekeeper,
+}
+
+impl From<CliPassRole> for PassRole {
+    fn from(value: CliPassRole) -> Self {
+        match value {
+            CliPassRole::Builder => Self::Builder,
+            CliPassRole::Gatekeeper => Self::Gatekeeper,
+        }
+    }
+}
+
 impl From<CliSweepMode> for SweepMode {
     fn from(value: CliSweepMode) -> Self {
         match value {
@@ -241,6 +278,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let paths = OstromPaths::resolve()?;
     match cli.command {
+        Command::Pass { role } => supervise(&["__pass-worker".into(), role_name(role).into()]),
+        Command::Implement {
+            work_order_file,
+            unit_name,
+        } => supervise(&[
+            "__implement-worker".into(),
+            work_order_file.into_os_string(),
+            unit_name.into(),
+        ]),
+        Command::PassWorker {
+            role,
+            supervisor_pid,
+        } => run_pass_worker(role, supervisor_pid),
+        Command::ImplementWorker {
+            work_order_file,
+            unit_name,
+            supervisor_pid,
+        } => run_implement_worker(work_order_file, unit_name, supervisor_pid),
         Command::Dispatch { arguments } => {
             run_dispatch_command(arguments);
         }
@@ -721,6 +776,128 @@ fn work_order_usage() -> ! {
 fn exit_message(message: &str, code: i32) -> ! {
     eprintln!("{message}");
     std::process::exit(code);
+}
+
+fn role_name(role: CliPassRole) -> &'static str {
+    match role {
+        CliPassRole::Builder => "builder",
+        CliPassRole::Gatekeeper => "gatekeeper",
+    }
+}
+
+fn register_signals() -> io::Result<SignalFlags> {
+    use signal_hook::{consts::signal, flag};
+
+    let flags = SignalFlags::default();
+    flag::register(signal::SIGHUP, flags.hup_flag())?;
+    flag::register(signal::SIGINT, flags.int_flag())?;
+    flag::register(signal::SIGTERM, flags.term_flag())?;
+    Ok(flags)
+}
+
+fn supervise(arguments: &[OsString]) -> ! {
+    let signals = register_signals().unwrap_or_else(|error| {
+        eprintln!("ostrom: could not install signal handlers: {error}");
+        std::process::exit(1);
+    });
+    let executable = env::current_exe().unwrap_or_else(|error| {
+        eprintln!("ostrom: could not resolve executable: {error}");
+        std::process::exit(1);
+    });
+    let mut child = std::process::Command::new(executable)
+        .args(arguments)
+        .arg(std::process::id().to_string())
+        .spawn()
+        .unwrap_or_else(|error| {
+            eprintln!("ostrom: could not start worker: {error}");
+            std::process::exit(1);
+        });
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => std::process::exit(status.code().unwrap_or(1)),
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("ostrom: could not wait for worker: {error}");
+                std::process::exit(1);
+            }
+        }
+        if let Some(name) = signals.take_pending() {
+            let command = if Path::new("/bin/kill").is_file() {
+                "/bin/kill"
+            } else {
+                "kill"
+            };
+            let _ = std::process::Command::new(command)
+                .args([format!("-{name}"), child.id().to_string()])
+                .status();
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn run_pass_worker(role: CliPassRole, supervisor_pid: u32) -> ! {
+    let signals = register_signals().unwrap_or_else(|error| {
+        eprintln!("ostrom: could not install signal handlers: {error}");
+        std::process::exit(1);
+    });
+    let claude_bin = env::var_os("CLAUDE_BIN").map_or_else(
+        || {
+            BaseDirs::new().map_or_else(
+                || PathBuf::from("claude"),
+                |dirs| dirs.home_dir().join(".local/bin/claude"),
+            )
+        },
+        PathBuf::from,
+    );
+    let request = PassRequest {
+        paths: compatible_command_paths(),
+        role: role.into(),
+        claude_bin,
+        signals,
+        supervisor_pid: Some(supervisor_pid),
+    };
+    match run_pass(&request) {
+        Ok(()) => std::process::exit(0),
+        Err(error) => {
+            if error.exit_code() != 0 {
+                eprintln!("{error}");
+            }
+            std::process::exit(error.exit_code());
+        }
+    }
+}
+
+fn run_implement_worker(work_order_file: PathBuf, unit_name: String, supervisor_pid: u32) -> ! {
+    let signals = register_signals().unwrap_or_else(|error| {
+        eprintln!("ostrom: could not install signal handlers: {error}");
+        std::process::exit(1);
+    });
+    let working_directory = env::current_dir().unwrap_or_else(|error| {
+        eprintln!("ostrom implementer: could not resolve working directory: {error}");
+        std::process::exit(1);
+    });
+    let plugin_root = env::var_os("OSTROM_PLUGIN_ROOT")
+        .or_else(|| env::var_os("CLAUDE_PLUGIN_ROOT"))
+        .map_or_else(|| working_directory.join("plugins/ostrom"), PathBuf::from);
+    let request = ImplementRequest {
+        paths: compatible_command_paths(),
+        working_directory,
+        plugin_root,
+        order_file: work_order_file,
+        unit_name,
+        signals,
+        supervisor_pid: Some(supervisor_pid),
+    };
+    match run_implement(&request) {
+        Ok(url) => {
+            println!("{url}");
+            std::process::exit(0);
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(error.code);
+        }
+    }
 }
 
 fn environment_time(name: &str) -> Result<DateTime<Utc>, String> {
