@@ -45,6 +45,7 @@ trap 'rm -rf "$fixture"' EXIT
 trap '[[ $- == *e* ]] && echo "mandate tests: FAILED at test.sh:${LINENO} (last command: ${BASH_COMMAND})" >&2; true' ERR
 
 bash "$PLUGIN_ROOT/tests/test-skill-version-bump.sh"
+bash "$PLUGIN_ROOT/tests/test-shell-freeze.sh"
 
 # Shipped plugin files must not retain private checkout paths. Build the
 # expression in pieces so this assertion does not match its own source.
