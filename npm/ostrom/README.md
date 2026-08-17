@@ -8,6 +8,6 @@ The public npm package name is intentionally pending. Once it is registered,
 install the CLI with:
 
 ```sh
-npm install --global <npm-package-name>
+npm install --global @ostrom/cli
 ostrom --version
 ```

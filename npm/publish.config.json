@@ -8,7 +8,7 @@
   "repositoryUrl": "git+https://github.com/onsager-ai/ostrom.git",
   "mainPackage": {
     "dir": "npm/ostrom",
-    "name": "ostrom"
+    "name": "cli"
   },
   "platformDir": "npm/platforms",
   "stagingDir": "target/npm-packages",

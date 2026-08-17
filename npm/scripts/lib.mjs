@@ -21,13 +21,14 @@ export function cargoVersion() {
   return match[1];
 }
 
-// The launcher is deliberately unscoped: `npm i -g ostrom` is the name people
-// type, and it is the package a human installs. The scope exists to keep the
-// five platform packages unsquattable as a set, not to namespace the entry
-// point. Do not "fix" this back to `${scope}/${name}` — 0.1.0 shipped that way
-// by accident and had to be reissued.
+// The launcher is scoped, and stays scoped. An unscoped `ostrom` is refused by
+// npm's new-name similarity check as too close to `astro` (edit distance 2,
+// ~4M weekly downloads), and that check has no override short of a support
+// exception. Scoped names bypass it entirely, which is what npm's own 403
+// suggests. The package name is not the command: this installs a binary called
+// `ostrom` regardless, so the name only appears in the install line.
 export function mainPackageName() {
-  return config.mainPackage.name;
+  return `${config.scope}/${config.mainPackage.name}`;
 }
 
 export function platformPackageName(platform) {
