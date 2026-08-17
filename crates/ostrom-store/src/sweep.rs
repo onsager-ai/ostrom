@@ -19,6 +19,10 @@ use crate::{OstromPaths, QueueDocument, StoreError, io_error, read_queue, write_
 
 const QUERY_LIMIT: usize = 200;
 const FULL_RECONCILIATION_HOURS: i64 = 24;
+/// Read-only scope for an acquisition token, kept identical to the set
+/// `scripts/sweep.sh` requests so both paths mint the same grant. A sweep
+/// reads; it never writes, so no write permission belongs here.
+const SWEEP_TOKEN_PERMISSIONS: &str = "metadata:read,issues:read,pull_requests:read,checks:read,statuses:read,actions:read,contents:read";
 const SHIPPED_DEFAULTS: &str = include_str!("../../../plugins/ostrom/config/mandate-defaults.yaml");
 
 #[derive(Debug, Error)]
@@ -381,24 +385,67 @@ pub fn acquire_org_from_github(
     Ok(repositories)
 }
 
+/// The credential request for one organization's acquisition worker.
+struct OrganizationScope {
+    /// Any roster repository under the organization. `gh-as.sh` resolves the
+    /// installation from it and nothing else, so which one is immaterial.
+    anchor: String,
+    /// Every roster repository under the organization. The inner worker reads
+    /// all of them, so all of them must be in the grant.
+    repositories: Vec<String>,
+}
+
+/// Group the roster by organization, one credential request per group.
+fn organization_scopes(config: &MandateConfig) -> BTreeMap<String, OrganizationScope> {
+    let mut organizations = BTreeMap::<String, OrganizationScope>::new();
+    for project in &config.projects {
+        let repo = project.repo.as_str().to_owned();
+        organizations
+            .entry(owner(project.repo.as_str()).to_owned())
+            .or_insert_with(|| OrganizationScope {
+                anchor: repo.clone(),
+                repositories: Vec::new(),
+            })
+            .repositories
+            .push(repo);
+    }
+    for scope in organizations.values_mut() {
+        scope.repositories.sort();
+        scope.repositories.dedup();
+    }
+    organizations
+}
+
+/// The `gh-as.sh` arguments up to and including the `--` that ends them.
+///
+/// Scope is mandatory on both halves: `gh-as.sh` refuses a request that names
+/// neither repositories nor permissions rather than falling back to the
+/// installation's full grant, so omitting either leaves the sweep unable to
+/// authenticate at all.
+fn gh_as_credential_arguments(scope: &OrganizationScope) -> Vec<String> {
+    vec![
+        "gatekeeper".to_owned(),
+        scope.anchor.clone(),
+        "--repositories".to_owned(),
+        scope.repositories.join(","),
+        "--permissions".to_owned(),
+        SWEEP_TOKEN_PERMISSIONS.to_owned(),
+        "--".to_owned(),
+    ]
+}
+
 fn acquire_by_organization(
     options: &SweepOptions,
     config: &MandateConfig,
     _old_state: &Value,
     mode: SweepMode,
 ) -> Result<(Vec<RepositorySnapshot>, Vec<String>), SweepError> {
-    let mut organizations = BTreeMap::<String, String>::new();
-    for project in &config.projects {
-        organizations
-            .entry(owner(project.repo.as_str()).to_owned())
-            .or_insert_with(|| project.repo.as_str().to_owned());
-    }
     let mut snapshots = Vec::new();
     let mut faults = Vec::new();
-    for (org, anchor) in organizations {
+    for (org, scope) in organization_scopes(config) {
         let output = Command::new("bash")
             .arg(options.plugin_root.join("scripts/gh-as.sh"))
-            .args(["gatekeeper", &anchor])
+            .args(gh_as_credential_arguments(&scope))
             .arg(&options.executable)
             .args([
                 "sweep",
@@ -532,7 +579,16 @@ fn acquire_repository(
                     "--json",
                     "databaseId,workflowDatabaseId,workflowName,name,headSha,conclusion,status,createdAt,url",
                 ]) {
-                    Ok(value) => exhaustive_array(value, repo_name, "default-branch CI query")?,
+                    // Deliberately not exhaustive_array. A change feed that
+                    // hits the limit may have silently dropped items, so it
+                    // must refuse. This query is different in kind: `gh run
+                    // list` returns newest-first and the result is judged
+                    // only against the LATEST run per workflow on this ref,
+                    // so anything past the limit is older than something we
+                    // already hold and cannot change a verdict. Refusing here
+                    // takes the whole sweep down on any repository with 200+
+                    // default-branch runs — crawlab-pro and duhem both do.
+                    Ok(value) => value.as_array().cloned().unwrap_or_default(),
                     Err(error) => {
                         warnings.push(format!("default-branch CI query failed: {error}"));
                         Vec::new()
@@ -2374,4 +2430,79 @@ fn read_jsonl_values(path: &Path) -> Result<Vec<Value>, SweepError> {
 pub fn encode_org_snapshots(repositories: Vec<RepositorySnapshot>) -> Result<Vec<u8>, SweepError> {
     serde_json::to_vec(&OrgSnapshots { repositories })
         .map_err(|error| SweepError::Acquisition(error.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roster(repositories: &[&str]) -> MandateConfig {
+        let projects = repositories
+            .iter()
+            .map(|repo| format!("  - repo: {repo}\n"))
+            .collect::<String>();
+        MandateConfig::from_yaml(&format!(
+            "cadence_hours: 1\nstuck_after_days: 7\nprojects:\n{projects}"
+        ))
+        .expect("the fixture roster is valid")
+    }
+
+    #[test]
+    fn every_roster_repository_under_an_organization_enters_its_scope() {
+        let scopes = roster(&["placeholder-org/alpha", "placeholder-org/beta"]);
+        let scopes = organization_scopes(&scopes);
+        let scope = &scopes["placeholder-org"];
+        assert_eq!(
+            scope.repositories,
+            vec!["placeholder-org/alpha", "placeholder-org/beta"]
+        );
+    }
+
+    #[test]
+    fn each_organization_is_scoped_to_its_own_repositories_only() {
+        let scopes = organization_scopes(&roster(&[
+            "placeholder-org/alpha",
+            "other-placeholder-org/gamma",
+        ]));
+        assert_eq!(
+            scopes["placeholder-org"].repositories,
+            vec!["placeholder-org/alpha"]
+        );
+        assert_eq!(
+            scopes["other-placeholder-org"].repositories,
+            vec!["other-placeholder-org/gamma"]
+        );
+    }
+
+    #[test]
+    fn the_credential_request_names_both_halves_of_the_scope() {
+        // gh-as.sh refuses an unscoped request rather than falling back to the
+        // installation's full grant, so dropping either half leaves the sweep
+        // unable to authenticate at all.
+        let scopes =
+            organization_scopes(&roster(&["placeholder-org/alpha", "placeholder-org/beta"]));
+        let arguments = gh_as_credential_arguments(&scopes["placeholder-org"]);
+        assert_eq!(
+            arguments,
+            vec![
+                "gatekeeper".to_owned(),
+                "placeholder-org/alpha".to_owned(),
+                "--repositories".to_owned(),
+                "placeholder-org/alpha,placeholder-org/beta".to_owned(),
+                "--permissions".to_owned(),
+                SWEEP_TOKEN_PERMISSIONS.to_owned(),
+                "--".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_acquisition_grant_requests_no_write_permission() {
+        assert!(
+            SWEEP_TOKEN_PERMISSIONS
+                .split(',')
+                .all(|permission| permission.ends_with(":read")),
+            "a sweep reads; a write permission in the grant is a defect"
+        );
+    }
 }
