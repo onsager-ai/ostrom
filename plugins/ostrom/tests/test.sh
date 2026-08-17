@@ -600,6 +600,172 @@ grep -q 'revert .*: open a revert pull request' "$merge_skill"
 grep -q 'close <repo>#<new issue number>' "$work_skill"
 grep -q 'reopen <repo>#<ref>' "$work_skill"
 
+# #50: the pass protocol observes close-keyword effects only after recording
+# the merge decision, and emits exactly one result record. Execute the shipped
+# code block itself below so weakening any branch cannot leave a prose-only
+# promise that still passes this suite.
+[ "$(grep -c 'trace.sh" append close-keyword-checked' "$merge_skill")" -eq 1 ]
+merge_decision_line="$(
+  grep -n 'trace.sh" append decision-taken' "$merge_skill" | head -n 1 | cut -d: -f1
+)"
+thread_decision_line="$(
+  grep -n 'trace.sh" append decision-taken' "$merge_skill" | tail -n 1 | cut -d: -f1
+)"
+close_keyword_line="$(
+  grep -n 'trace.sh" append close-keyword-checked' "$merge_skill" | cut -d: -f1
+)"
+[ "$close_keyword_line" -gt "$merge_decision_line" ]
+[ "$close_keyword_line" -lt "$thread_decision_line" ]
+grep -Fq 'gh pr view "$pr_number" --repo "$repository"' "$merge_skill"
+grep -Fq -- '--json closingIssuesReferences' "$merge_skill"
+grep -Fq 'gh issue view "$issue_number" --repo "$repository"' "$merge_skill"
+grep -Fq -- '--json number,state,title' "$merge_skill"
+grep -Fq '<owner>/<repo>#<number> — <title>' "$merge_skill"
+grep -Fq 'do not report this as an ordinary successful' "$merge_skill"
+grep -Fq 'Exit `111` specifically means' "$merge_skill"
+if grep -qE 'gh-as\.sh[^`]*gh issue close' "$merge_skill"; then
+  echo "merge protocol must report stranded issues without closing them" >&2
+  exit 1
+fi
+
+close_keyword_fixture="$fixture/close-keyword"
+close_keyword_plugin="$close_keyword_fixture/plugin"
+close_keyword_script="$close_keyword_fixture/check.sh"
+close_keyword_trace="$close_keyword_fixture/trace.jsonl"
+close_keyword_calls="$close_keyword_fixture/gh-as.calls"
+mkdir -p "$close_keyword_plugin/scripts"
+
+# Extract the runnable part of pass step 4, dropping Markdown indentation and
+# stopping at its closing fence. The assertions below therefore exercise the
+# same jq construction and outcome selection the gatekeeper is instructed to
+# run, rather than a test-only reimplementation.
+awk '
+  /^     declared='\''\[\]'\''$/ { copying = 1 }
+  copying && /^     ```$/ { exit }
+  copying { sub(/^     /, ""); print }
+' "$merge_skill" >"$close_keyword_script"
+grep -Fq 'close_outcome="all-closed"' "$close_keyword_script"
+grep -Fq 'close_outcome="some-open"' "$close_keyword_script"
+grep -Fq 'close_outcome="none-declared"' "$close_keyword_script"
+
+cat >"$close_keyword_plugin/scripts/gh-as.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+role="$1"
+repository="$2"
+shift 2
+[ "$role" = "gatekeeper" ]
+[ "$repository" = "example-org/example-repo" ]
+printf '%s %s %s\n' "$role" "$repository" "$*" >>"$FAKE_CLOSE_CALLS"
+
+[ "$1" = "gh" ]
+shift
+if [ "$1 $2" = "pr view" ]; then
+  if [ "$FAKE_CLOSE_MODE" = "check-failure" ]; then
+    exit 111
+  elif [ "$FAKE_CLOSE_MODE" = "none-declared" ]; then
+    printf '%s\n' '{"closingIssuesReferences":[]}'
+  else
+    printf '%s\n' '{"closingIssuesReferences":[{"number":50}]}'
+  fi
+elif [ "$1 $2" = "issue view" ] && [ "$3" = "50" ]; then
+  if [ "$FAKE_CLOSE_MODE" = "some-open" ]; then
+    printf '%s\n' '{"number":50,"state":"OPEN","title":"Synthetic stranded issue"}'
+  else
+    printf '%s\n' '{"number":50,"state":"CLOSED","title":"Synthetic closed issue"}'
+  fi
+else
+  exit 64
+fi
+SH
+
+cat >"$close_keyword_plugin/scripts/trace.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+[ "$1" = "append" ]
+jq -cn --arg kind "$2" --argjson fact "$3" --argjson narration "$4" \
+  '{kind: $kind, fact: $fact, narration: $narration}' >>"$FAKE_CLOSE_TRACE"
+SH
+chmod +x "$close_keyword_plugin/scripts/gh-as.sh" \
+  "$close_keyword_plugin/scripts/trace.sh" "$close_keyword_script"
+
+run_close_keyword_check() {
+  close_mode="$1"
+  : >"$close_keyword_trace"
+  : >"$close_keyword_calls"
+  CLAUDE_PLUGIN_ROOT="$close_keyword_plugin" \
+    FAKE_CLOSE_MODE="$close_mode" \
+    FAKE_CLOSE_TRACE="$close_keyword_trace" \
+    FAKE_CLOSE_CALLS="$close_keyword_calls" \
+    repository="example-org/example-repo" pr_number=7 \
+    lease_owner="gatekeeper-fixture" \
+    head_sha="5050505050505050505050505050505050505050" \
+    bash "$close_keyword_script"
+}
+
+# #50 all-closed case: a declared issue observed CLOSED produces the complete
+# declared list, no stranded numbers, and the explicit all-closed outcome.
+run_close_keyword_check all-closed
+[ "$(wc -l <"$close_keyword_trace" | tr -d '[:space:]')" -eq 1 ]
+jq -e '
+  .kind == "close-keyword-checked"
+  and .fact.role == "gatekeeper"
+  and .fact.owner == "gatekeeper-fixture"
+  and .fact.repo == "example-org/example-repo"
+  and .fact.ref == "#7"
+  and .fact.head_sha == "5050505050505050505050505050505050505050"
+  and .fact.declared == [50]
+  and .fact.still_open == []
+  and .fact.outcome == "all-closed"
+  and .fact.check_errors == []
+' "$close_keyword_trace" >/dev/null
+[ "$(grep -c 'gatekeeper example-org/example-repo gh issue view 50 ' \
+  "$close_keyword_calls")" -eq 1 ]
+
+# #50 some-open case: issue 50 observed OPEN must remain present in still_open;
+# testing that exact number prevents a later empty-array weakening from passing.
+run_close_keyword_check some-open
+[ "$(wc -l <"$close_keyword_trace" | tr -d '[:space:]')" -eq 1 ]
+jq -e '
+  .kind == "close-keyword-checked"
+  and .fact.declared == [50]
+  and .fact.still_open == [50]
+  and .fact.outcome == "some-open"
+  and .fact.check_errors == []
+' "$close_keyword_trace" >/dev/null
+
+# #50 none-declared case: an empty closingIssuesReferences array is distinct
+# from all-closed and does not trigger an issue lookup.
+run_close_keyword_check none-declared
+[ "$(wc -l <"$close_keyword_trace" | tr -d '[:space:]')" -eq 1 ]
+jq -e '
+  .kind == "close-keyword-checked"
+  and .fact.declared == []
+  and .fact.still_open == []
+  and .fact.outcome == "none-declared"
+  and .fact.check_errors == []
+' "$close_keyword_trace" >/dev/null
+if grep -Fq ' gh issue view ' "$close_keyword_calls"; then
+  echo "close-keyword check must not invent an issue when none was declared" >&2
+  exit 1
+fi
+
+# #50 check-failure case: gh-as exit 111 is factual and conservative, never
+# silently rewritten as all-closed even though the merge already happened.
+run_close_keyword_check check-failure
+[ "$(wc -l <"$close_keyword_trace" | tr -d '[:space:]')" -eq 1 ]
+jq -e '
+  .kind == "close-keyword-checked"
+  and .fact.declared == []
+  and .fact.still_open == []
+  and .fact.outcome == "some-open"
+  and .fact.check_errors == [{
+    operation: "read-closing-references",
+    exit_code: 111
+  }]
+' "$close_keyword_trace" >/dev/null
+
 # The systemd wrapper fails closed when disarmed, backs off on its own outer
 # lease, preserves its role identity across processes, records measured cost,
 # and finalizes a signalled pass before releasing that lease.
