@@ -249,8 +249,8 @@ the private state so they do not become permanent session noise.
 
 Builder wakes coordinate through a lease file at
 `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/ostrom/sprint.lease`. Run
-`scripts/lease.sh acquire <owner> [ttl-seconds]` before starting work,
-`scripts/lease.sh release <owner>` when finished, and `scripts/lease.sh status`
+`ostrom lease acquire <owner> [ttl-seconds]` before starting work,
+`ostrom lease release <owner>` when finished, and `ostrom lease status`
 to inspect the current record. The file contains one JSON object with
 `owner`, `started_at`, and `expires_at` (times are Unix seconds). Creating the
 file with Bash `noclobber` uses O_EXCL semantics as the atomic acquisition
@@ -267,12 +267,12 @@ Meaningful builder steps append to
 {"ts":"2026-01-01T00:00:00Z","kind":"commit","fact":{"sha":"0123456789abcdef"},"narration":{"reason":"placeholder change"}}
 ```
 
-Use `scripts/trace.sh append <kind> <fact-json> <narration-json>` to write a
+Use `ostrom trace append <kind> <fact-json> <narration-json>` to write a
 record. `fact` holds actions, artifacts, identifiers, external results, and
 exit codes; `narration` holds reasons, beliefs, and conclusions. A builder or
-gatekeeper consuming another builder's trace uses `scripts/trace.sh read`,
+gatekeeper consuming another builder's trace uses `ostrom trace read`,
 which emits only `ts`, `kind`, and `fact`. Narration is for the principal and
-requires the explicit `scripts/trace.sh read-narration` verb. This structural
+requires the explicit `ostrom trace read-narration` verb. This structural
 split prevents one builder's narration from becoming another builder's input.
 
 Each trace record, including its newline, is limited to 4096 bytes and is

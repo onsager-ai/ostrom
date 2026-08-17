@@ -34,7 +34,7 @@ without removing their queue records.
 Run:
 
 ```sh
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/queue.sh" list
+ostrom queue list
 jq '.repos[] | {notice, unclassified, scope_changes}' \
   "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/ostrom/state.json"
 ```
@@ -59,7 +59,7 @@ or defer only when records are present.
 When the user runs `/ostrom:desk lint`, run:
 
 ```sh
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/queue.sh" lint
+ostrom queue lint
 ```
 
 Present every selector that matched no open item in the last durable sweep.
@@ -72,19 +72,19 @@ diagnostics in the daily digest.
 Resolve `<id>` from the displayed record; do not guess across ambiguous
 references.
 
-- **Approve** — run `queue.sh approve <id>`. This flips the row to
+- **Approve** — run `ostrom queue approve <id>`. This flips the row to
   `approved` and emits the instruction for the existing `/handoff` to Codex,
   including the minted `mandate:<id>` approval token. Relay that handoff
   instruction; never invent a broader token. CI drift from a paused project
   cannot be approved; unpause the mandate first.
-- **Reject** — run `queue.sh reject <id>`. This removes the row and appends
+- **Reject** — run `ostrom queue reject <id>`. This removes the row and appends
   one line to `selector-events.jsonl`, attributing the dismissal to the
   selector that produced the row (an unmatched item still records that
   fact). This is bookkeeping on the decision already made, not a new step —
   never ask an extra question or add a prompt for it. Do not call
   `/handoff`, comment on GitHub, close the referenced item, or cause any
   other side effect.
-- **Defer** — run `queue.sh defer <id>`. This keeps the row and flips its
+- **Defer** — run `ostrom queue defer <id>`. This keeps the row and flips its
   state to `deferred`. Do not call `/handoff`.
 
 A tripwire never auto-proceeds. Only an explicit human approval may cross

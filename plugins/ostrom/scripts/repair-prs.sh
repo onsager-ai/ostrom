@@ -86,7 +86,7 @@ append_repair_trace() {
       '
   )" || return 1
 
-  bash "$SCRIPT_DIR/trace.sh" append pr-repair \
+  OSTROM_HOME="$MANDATE_DATA_DIR" ostrom trace append pr-repair \
     "$trace_fact" "$trace_narration" >/dev/null
 }
 

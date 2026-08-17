@@ -22,7 +22,7 @@ usage() {
 [ "$#" -eq 2 ] || usage
 order_file="$1"
 unit_name="$2"
-bash "$SCRIPT_DIR/work-order.sh" validate "$order_file" || exit
+OSTROM_HOME="$MANDATE_DATA_DIR" ostrom work-order validate "$order_file" || exit
 
 item_id="$(jq -r '.item_id' "$order_file")"
 repository="$(jq -r '.repository' "$order_file")"
@@ -31,7 +31,7 @@ branch_name="$(jq -r '.branch_name' "$order_file")"
 order_id="$(jq -r '.order_id' "$order_file")"
 cost_ceiling_usd="$(jq -r '.cost_ceiling_usd' "$order_file")"
 token_ceiling="$(jq -r '.token_ceiling' "$order_file")"
-item_hash="$(bash "$SCRIPT_DIR/work-order.sh" item-hash "$item_id")"
+item_hash="$(OSTROM_HOME="$MANDATE_DATA_DIR" ostrom work-order item-hash "$item_id")"
 
 # Durable lease-name contract; see dispatch.sh. The transient unit owns this
 # per-item lease from dispatch until this process records a terminal row.
@@ -297,7 +297,7 @@ append_terminal() {
       conflicted_paths: $conflicted_paths,
       withheld_paths: $withheld_paths,
       usage: $usage}')"
-  if bash "$SCRIPT_DIR/trace.sh" append "$kind" "$terminal_fact" '{}' >/dev/null; then
+  if OSTROM_HOME="$MANDATE_DATA_DIR" ostrom trace append "$kind" "$terminal_fact" '{}' >/dev/null; then
     terminal_written=1
     return 0
   fi
@@ -326,7 +326,7 @@ finish() {
     }
   fi
   if ! MANDATE_LEASE_NAME="$lease_name" \
-    bash "$SCRIPT_DIR/lease.sh" release "$lease_owner" >/dev/null 2>&1; then
+    OSTROM_HOME="$MANDATE_DATA_DIR" ostrom lease release "$lease_owner" >/dev/null 2>&1; then
     echo "ostrom implementer: could not release $lease_name" >&2
     [ "$saved_status" -ne 0 ] || saved_status=1
   fi
@@ -354,7 +354,7 @@ case "$termination_grace_seconds" in
 esac
 termination_grace_checks=$((termination_grace_seconds * 10))
 
-lease_json="$(MANDATE_LEASE_NAME="$lease_name" bash "$SCRIPT_DIR/lease.sh" status 2>/dev/null)" || {
+lease_json="$(MANDATE_LEASE_NAME="$lease_name" OSTROM_HOME="$MANDATE_DATA_DIR" ostrom lease status 2>/dev/null)" || {
   failure_reason=lease-missing
   exit 1
 }
@@ -730,7 +730,7 @@ if ! append_terminal work-completed ""; then
   exit 1
 fi
 if ! MANDATE_LEASE_NAME="$lease_name" \
-  bash "$SCRIPT_DIR/lease.sh" release "$lease_owner" >/dev/null; then
+  OSTROM_HOME="$MANDATE_DATA_DIR" ostrom lease release "$lease_owner" >/dev/null; then
   failure_reason=lease-release-failed
   exit 1
 fi

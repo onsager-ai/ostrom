@@ -1,0 +1,1 @@
+mandate trace: fact-json must be a JSON object

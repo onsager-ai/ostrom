@@ -13,6 +13,25 @@ OSTROM_BIN="${OSTROM_BIN:-$PLUGIN_ROOT/../../target/debug/ostrom}"
   echo "mandate tests: ostrom binary is missing at $OSTROM_BIN; build ostrom-cli first" >&2
   exit 1
 }
+
+# The surviving shell drivers now invoke `ostrom` by name, exactly as an
+# installed session does. Put the built binary first on PATH so the suite
+# exercises the same resolution path rather than a private handle to it.
+PATH="$(cd "$(dirname "$OSTROM_BIN")" && pwd):$PATH"
+export PATH
+
+# Direct leaf invocations inherit each shell fixture's configured legacy data
+# directory explicitly. This keeps the suite hermetic while the remaining
+# shell drivers and the native state store coexist during cutover.
+run_ostrom() {
+  local native_home
+  if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+    native_home="$CLAUDE_CONFIG_DIR/ostrom"
+  else
+    native_home="$fixture/native-stateless"
+  fi
+  OSTROM_HOME="$native_home" "$OSTROM_BIN" "$@"
+}
 export MANDATE_SWEEP_TIME="2026-08-01T00:00:00Z"
 export MANDATE_TODAY="2026-08-01"
 export MANDATE_NOW_EPOCH="1785542400"
@@ -128,11 +147,11 @@ role_boundary_doc="$PLUGIN_ROOT/../../docs/role-permission-boundaries.md"
 work_frontmatter="$(
   awk 'NR == 1 { next } /^---$/ { exit } { print }' "$work_skill"
 )"
-grep -q 'lease.sh\" acquire "\$lease_owner"' "$gatekeep_skill"
-grep -q 'lease.sh\" release "\$lease_owner"' "$gatekeep_skill"
+grep -q 'ostrom lease acquire "\$lease_owner"' "$gatekeep_skill"
+grep -q 'ostrom lease release "\$lease_owner"' "$gatekeep_skill"
 grep -q 'Never infer concurrency or lease' "$gatekeep_skill"
 for trace_kind in pass-started item-selected pass-ended; do
-  grep -q "trace.sh\" append $trace_kind" "$gatekeep_skill"
+  grep -q "ostrom trace append $trace_kind" "$gatekeep_skill"
 done
 
 # #151: one repository's token-mint failure is a visible, bounded skip rather
@@ -175,7 +194,7 @@ grep -Fq 'release the lease, and end the' "$gatekeep_skill"
 grep -Fq '**No exit-`111` path may run the command under an ambient credential' \
   "$gatekeep_skill"
 for trace_kind in artifact-produced gate-verdict-consumed; do
-  grep -q "trace.sh\" append $trace_kind" "$merge_skill"
+  grep -q "ostrom trace append $trace_kind" "$merge_skill"
 done
 grep -q 'MANDATE_LEASE_NAME=builder.lease' "$work_skill"
 grep -q 'scripts/sweep.sh' "$work_skill"
@@ -191,7 +210,7 @@ if grep -q '\$ARGUMENTS' "$work_skill"; then
 fi
 grep -q 'builder-<session>-wake<N>' "$work_skill"
 for trace_kind in pass-started item-worked pass-ended; do
-  grep -q "trace.sh\" append $trace_kind" "$work_skill"
+  grep -q "ostrom trace append $trace_kind" "$work_skill"
 done
 grep -q 'scripts/repair-prs.sh' "$work_skill"
 grep -Fq 'per-pass cap is **3 repair attempts**' "$work_skill"
@@ -505,7 +524,7 @@ jq -s -e '
 # The brief consumes the same fact-only trace. In particular, its zero-rate
 # rendering calls non-application a problem and never folds absent plans into
 # the rejected-plan denominator.
-grep -Fq 'bash "${CLAUDE_PLUGIN_ROOT}/scripts/trace.sh" read' "$brief_skill"
+grep -Fq 'ostrom trace read' "$brief_skill"
 grep -Fq '**Plan match rate**' "$brief_skill"
 grep -Fq 'PROBLEM: computed plans never applied' "$brief_skill"
 grep -Fq 'no plan present: S' "$brief_skill"
@@ -595,9 +614,9 @@ grep -q 'no gate, audit, or authorization decision may treat it as proof' \
 # with a reversal pointer at every point it exercises its own judgment —
 # merging and resolving a review thread — and the builder does the same for
 # filing and closing an issue. Each fact carries role, owner, repo, ref,
-# decision, and reversal; reasoning is narration, per trace.sh's own split.
-[ "$(grep -c "trace.sh\" append decision-taken" "$merge_skill")" -eq 2 ]
-[ "$(grep -c "trace.sh\" append decision-taken" "$work_skill")" -eq 1 ]
+# decision, and reversal; reasoning is narration, per ostrom trace's own split.
+[ "$(grep -c "ostrom trace append decision-taken" "$merge_skill")" -eq 2 ]
+[ "$(grep -c "ostrom trace append decision-taken" "$work_skill")" -eq 1 ]
 for skill_file in "$merge_skill" "$work_skill"; do
   grep -q 'role: "gatekeeper"\|role: "builder"' "$skill_file"
   grep -q 'reversal: \$reversal' "$skill_file"
@@ -611,15 +630,15 @@ grep -q 'reopen <repo>#<ref>' "$work_skill"
 # the merge decision, and emits exactly one result record. Execute the shipped
 # code block itself below so weakening any branch cannot leave a prose-only
 # promise that still passes this suite.
-[ "$(grep -c 'trace.sh" append close-keyword-checked' "$merge_skill")" -eq 1 ]
+[ "$(grep -c 'ostrom trace append close-keyword-checked' "$merge_skill")" -eq 1 ]
 merge_decision_line="$(
-  grep -n 'trace.sh" append decision-taken' "$merge_skill" | head -n 1 | cut -d: -f1
+  grep -n 'ostrom trace append decision-taken' "$merge_skill" | head -n 1 | cut -d: -f1
 )"
 thread_decision_line="$(
-  grep -n 'trace.sh" append decision-taken' "$merge_skill" | tail -n 1 | cut -d: -f1
+  grep -n 'ostrom trace append decision-taken' "$merge_skill" | tail -n 1 | cut -d: -f1
 )"
 close_keyword_line="$(
-  grep -n 'trace.sh" append close-keyword-checked' "$merge_skill" | cut -d: -f1
+  grep -n 'ostrom trace append close-keyword-checked' "$merge_skill" | cut -d: -f1
 )"
 [ "$close_keyword_line" -gt "$merge_decision_line" ]
 [ "$close_keyword_line" -lt "$thread_decision_line" ]
@@ -640,7 +659,7 @@ close_keyword_plugin="$close_keyword_fixture/plugin"
 close_keyword_script="$close_keyword_fixture/check.sh"
 close_keyword_trace="$close_keyword_fixture/trace.jsonl"
 close_keyword_calls="$close_keyword_fixture/gh-as.calls"
-mkdir -p "$close_keyword_plugin/scripts"
+mkdir -p "$close_keyword_plugin/scripts" "$close_keyword_plugin/bin"
 
 # Extract the runnable part of pass step 4, dropping Markdown indentation and
 # stopping at its closing fence. The assertions below therefore exercise the
@@ -687,21 +706,22 @@ else
 fi
 SH
 
-cat >"$close_keyword_plugin/scripts/trace.sh" <<'SH'
+cat >"$close_keyword_plugin/bin/ostrom" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
-[ "$1" = "append" ]
-jq -cn --arg kind "$2" --argjson fact "$3" --argjson narration "$4" \
+[ "$1 $2" = "trace append" ]
+jq -cn --arg kind "$3" --argjson fact "$4" --argjson narration "$5" \
   '{kind: $kind, fact: $fact, narration: $narration}' >>"$FAKE_CLOSE_TRACE"
 SH
 chmod +x "$close_keyword_plugin/scripts/gh-as.sh" \
-  "$close_keyword_plugin/scripts/trace.sh" "$close_keyword_script"
+  "$close_keyword_plugin/bin/ostrom" "$close_keyword_script"
 
 run_close_keyword_check() {
   close_mode="$1"
   : >"$close_keyword_trace"
   : >"$close_keyword_calls"
   CLAUDE_PLUGIN_ROOT="$close_keyword_plugin" \
+    PATH="$close_keyword_plugin/bin:$PATH" \
     FAKE_CLOSE_MODE="$close_mode" \
     FAKE_CLOSE_TRACE="$close_keyword_trace" \
     FAKE_CLOSE_CALLS="$close_keyword_calls" \
@@ -794,13 +814,13 @@ fi
 # leaving it unset simulates a session that never got that far -- the
 # no-op shape pass.sh must now catch.
 if [ -n "${FAKE_CLAUDE_INNER_OWNER:-}" ]; then
-  bash "$FAKE_CLAUDE_TRACE_SH" append pass-started \
+  OSTROM_HOME="$CLAUDE_CONFIG_DIR/ostrom" "$FAKE_CLAUDE_OSTROM" trace append pass-started \
     "$(printf '{"owner":"%s"}' "$FAKE_CLAUDE_INNER_OWNER")" '{}' >/dev/null
 fi
 # Gatekeeper pass-ended facts deliberately omit owner, matching the weaker
 # production shape pass.sh must still reconcile with the role-prefixed start.
 if [ -n "${FAKE_CLAUDE_INNER_OUTCOME:-}" ]; then
-  bash "$FAKE_CLAUDE_TRACE_SH" append pass-ended \
+  OSTROM_HOME="$CLAUDE_CONFIG_DIR/ostrom" "$FAKE_CLAUDE_OSTROM" trace append pass-ended \
     "$(printf '{"outcome":"%s","completed_candidates":0}' "$FAKE_CLAUDE_INNER_OUTCOME")" \
     '{}' >/dev/null
 fi
@@ -820,7 +840,7 @@ case "${FAKE_CLAUDE_MODE:-complete}" in
 esac
 SH
 chmod +x "$fake_claude"
-fake_claude_trace_sh="$PLUGIN_ROOT/scripts/trace.sh"
+fake_claude_ostrom="$OSTROM_BIN"
 
 CLAUDE_CONFIG_DIR="$pass_config" CLAUDE_BIN="$fake_claude" \
   FAKE_CLAUDE_MARKER="$fake_marker" \
@@ -835,20 +855,20 @@ CLAUDE_CONFIG_DIR="$pass_config" CLAUDE_BIN="$fake_claude" \
 # not the timer overlap this case exists to cover.
 CLAUDE_CONFIG_DIR="$pass_config" \
   MANDATE_LEASE_NAME=builder-pass.lease \
-  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire fixture-holder 3600 >/dev/null
+  run_ostrom lease acquire fixture-holder 3600 >/dev/null
 CLAUDE_CONFIG_DIR="$pass_config" CLAUDE_BIN="$fake_claude" \
   FAKE_CLAUDE_MARKER="$fake_marker" \
   bash "$PLUGIN_ROOT/scripts/pass.sh" builder >/dev/null 2>&1
 [ ! -e "$fake_marker" ]
 [ ! -e "$pass_config/ostrom/sprint.jsonl" ]
 CLAUDE_CONFIG_DIR="$pass_config" MANDATE_LEASE_NAME=builder-pass.lease \
-  bash "$PLUGIN_ROOT/scripts/lease.sh" release fixture-holder
+  run_ostrom lease release fixture-holder
 
 builder_args="$pass_fixture/builder-args"
 CLAUDE_CONFIG_DIR="$pass_config" CLAUDE_BIN="$fake_claude" \
   FAKE_CLAUDE_MARKER="$fake_marker" FAKE_CLAUDE_ARGS_FILE="$builder_args" \
   FAKE_CLAUDE_INNER_OWNER="builder-inner-session-wake1" \
-  FAKE_CLAUDE_TRACE_SH="$fake_claude_trace_sh" \
+  FAKE_CLAUDE_OSTROM="$fake_claude_ostrom" \
   bash "$PLUGIN_ROOT/scripts/pass.sh" builder >/dev/null
 [ ! -e "$pass_config/ostrom/builder-pass.lease" ]
 # The regression test for #73: a pass whose inner session did take ownership
@@ -873,7 +893,7 @@ jq -s -e '
 # way to exercise what a real deployment does, where no caller ever sets
 # MANDATE_NOW_EPOCH at all. pass.sh must keep stamping the pass-started/
 # pass-ended rows it writes about its own pass with the real wall clock
-# exactly as before this fix, so trace.sh's own real-UTC default keeps doing
+# exactly as before this fix, so ostrom trace's own real-UTC default keeps doing
 # the stamping and production behaviour is unchanged.
 pass_realclock="$fixture/pass-realclock"
 pass_realclock_config="$pass_realclock/config"
@@ -887,7 +907,7 @@ real_today_before="$(date -u +%Y-%m-%d)"
 env -u MANDATE_NOW_EPOCH \
   CLAUDE_CONFIG_DIR="$pass_realclock_config" CLAUDE_BIN="$fake_claude" \
   FAKE_CLAUDE_INNER_OWNER="builder-inner-realclock-wake1" \
-  FAKE_CLAUDE_TRACE_SH="$fake_claude_trace_sh" \
+  FAKE_CLAUDE_OSTROM="$fake_claude_ostrom" \
   bash "$PLUGIN_ROOT/scripts/pass.sh" builder >/dev/null
 real_today_after="$(date -u +%Y-%m-%d)"
 jq -s -e \
@@ -918,7 +938,7 @@ fi
 CLAUDE_CONFIG_DIR="$pass_config" CLAUDE_BIN="$fake_claude" \
   FAKE_CLAUDE_MARKER="$fake_marker" \
   FAKE_CLAUDE_INNER_OWNER="builder-inner-session-wake2" \
-  FAKE_CLAUDE_TRACE_SH="$fake_claude_trace_sh" \
+  FAKE_CLAUDE_OSTROM="$fake_claude_ostrom" \
   bash "$PLUGIN_ROOT/scripts/pass.sh" builder >/dev/null
 jq -s -e '
   length == 6
@@ -981,7 +1001,7 @@ printf '{}\n' >"$outcome_config/ostrom/roles/gatekeeper.settings.json"
 CLAUDE_CONFIG_DIR="$outcome_config" CLAUDE_BIN="$fake_claude" \
   FAKE_CLAUDE_INNER_OWNER="gatekeeper-inner-fixture-wake1" \
   FAKE_CLAUDE_INNER_OUTCOME=failed \
-  FAKE_CLAUDE_TRACE_SH="$fake_claude_trace_sh" \
+  FAKE_CLAUDE_OSTROM="$fake_claude_ostrom" \
   bash "$PLUGIN_ROOT/scripts/pass.sh" gatekeeper >/dev/null
 jq -s -e '
   length == 4
@@ -997,7 +1017,7 @@ jq -s -e '
 CLAUDE_CONFIG_DIR="$outcome_config" CLAUDE_BIN="$fake_claude" \
   FAKE_CLAUDE_INNER_OWNER="gatekeeper-inner-fixture-wake2" \
   FAKE_CLAUDE_INNER_OUTCOME=completed \
-  FAKE_CLAUDE_TRACE_SH="$fake_claude_trace_sh" \
+  FAKE_CLAUDE_OSTROM="$fake_claude_ostrom" \
   bash "$PLUGIN_ROOT/scripts/pass.sh" gatekeeper >/dev/null
 jq -s -e '
   length == 8
@@ -1027,7 +1047,7 @@ jq -s -e '
 FAKE_CLAUDE_MODE=wait FAKE_CLAUDE_MARKER="$outcome_marker" \
   FAKE_CLAUDE_INNER_OWNER="gatekeeper-inner-fixture-wake4" \
   FAKE_CLAUDE_INNER_OUTCOME=failed \
-  FAKE_CLAUDE_TRACE_SH="$fake_claude_trace_sh" \
+  FAKE_CLAUDE_OSTROM="$fake_claude_ostrom" \
   CLAUDE_CONFIG_DIR="$outcome_config" CLAUDE_BIN="$fake_claude" \
   bash "$PLUGIN_ROOT/scripts/pass.sh" gatekeeper >/dev/null 2>&1 &
 outcome_timeout_pid=$!
@@ -1053,7 +1073,7 @@ jq -s -e '
 FAKE_CLAUDE_MODE=wait FAKE_CLAUDE_MARKER="$outcome_marker" \
   FAKE_CLAUDE_INNER_OWNER="gatekeeper-inner-fixture-wake5" \
   FAKE_CLAUDE_INNER_OUTCOME=completed \
-  FAKE_CLAUDE_TRACE_SH="$fake_claude_trace_sh" \
+  FAKE_CLAUDE_OSTROM="$fake_claude_ostrom" \
   CLAUDE_CONFIG_DIR="$outcome_config" CLAUDE_BIN="$fake_claude" \
   bash "$PLUGIN_ROOT/scripts/pass.sh" gatekeeper >/dev/null 2>&1 &
 outcome_signal_pid=$!
@@ -1127,7 +1147,7 @@ gatekeeper_pass_start() {
   pass_owner="$1"
   set +e
   CLAUDE_CONFIG_DIR="$lease_concurrent" MANDATE_LEASE_NOW_EPOCH=100 \
-    bash "$PLUGIN_ROOT/scripts/lease.sh" acquire "$pass_owner" 60
+    run_ostrom lease acquire "$pass_owner" 60
   acquire_status=$?
   set -e
   if [ "$acquire_status" -ne 0 ]; then
@@ -1135,7 +1155,7 @@ gatekeeper_pass_start() {
   fi
   MANDATE_TRACE_TIME="2026-08-01T00:00:00Z" \
     CLAUDE_CONFIG_DIR="$lease_concurrent" \
-    bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-started \
+    run_ostrom trace append pass-started \
       "$(jq -cn --arg owner "$pass_owner" '{owner: $owner}')" \
       '{}' >/dev/null
   printf '%s\n' "$pass_owner" >"$lease_concurrent/$pass_owner.proceeded"
@@ -1157,7 +1177,7 @@ set -e
 [ $(( (lease_alpha_status == 3) + (lease_beta_status == 3) )) -eq 1 ]
 concurrent_lease="$(
   CLAUDE_CONFIG_DIR="$lease_concurrent" \
-    bash "$PLUGIN_ROOT/scripts/lease.sh" status
+    run_ostrom lease status
 )"
 jq -e '
   (.owner == "gatekeeper-alpha" or .owner == "gatekeeper-beta")
@@ -1176,21 +1196,21 @@ jq -e '.kind == "pass-started" and (.fact.owner | startswith("gatekeeper-"))' \
 winning_owner="$(jq -r '.owner' <<<"$concurrent_lease")"
 MANDATE_TRACE_TIME="2026-08-01T00:01:00Z" \
   CLAUDE_CONFIG_DIR="$lease_concurrent" \
-  bash "$PLUGIN_ROOT/scripts/trace.sh" append item-selected \
+  run_ostrom trace append item-selected \
     '{"repo":"example-org/example-repo","pr":51}' '{}' >/dev/null
 MANDATE_TRACE_TIME="2026-08-01T00:02:00Z" \
   CLAUDE_CONFIG_DIR="$lease_concurrent" \
-  bash "$PLUGIN_ROOT/scripts/trace.sh" append artifact-produced \
+  run_ostrom trace append artifact-produced \
     '{"repo":"example-org/example-repo","pr":51,"head_sha":"0123456789abcdef"}' \
     '{}' >/dev/null
 MANDATE_TRACE_TIME="2026-08-01T00:03:00Z" \
   CLAUDE_CONFIG_DIR="$lease_concurrent" \
-  bash "$PLUGIN_ROOT/scripts/trace.sh" append gate-verdict-consumed \
+  run_ostrom trace append gate-verdict-consumed \
     '{"repo":"example-org/example-repo","pr":51,"head_sha":"0123456789abcdef","verdict":"pass","exit_code":0,"already_judged":false}' \
     '{}' >/dev/null
 MANDATE_TRACE_TIME="2026-08-01T00:04:00Z" \
   CLAUDE_CONFIG_DIR="$lease_concurrent" \
-  bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
+  run_ostrom trace append pass-ended \
     '{"outcome":"complete","completed_candidates":1}' '{}' >/dev/null
 jq -s -e 'map(.kind) == [
   "pass-started",
@@ -1200,7 +1220,7 @@ jq -s -e 'map(.kind) == [
   "pass-ended"
 ]' "$concurrent_trace" >/dev/null
 CLAUDE_CONFIG_DIR="$lease_concurrent" \
-  bash "$PLUGIN_ROOT/scripts/lease.sh" release "$winning_owner"
+  run_ostrom lease release "$winning_owner"
 [ ! -e "$lease_concurrent/ostrom/sprint.lease" ]
 
 # Named leases isolate the two roles, including their mutation guards. A held
@@ -1213,35 +1233,35 @@ scrub_per_invocation_environment
 [ -z "${MANDATE_LEASE_NAME+x}" ]
 role_leases="$fixture/role-leases"
 CLAUDE_CONFIG_DIR="$role_leases" MANDATE_LEASE_NOW_EPOCH=150 \
-  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire gatekeeper-alpha 60 >/dev/null
+  run_ostrom lease acquire gatekeeper-alpha 60 >/dev/null
 CLAUDE_CONFIG_DIR="$role_leases" MANDATE_LEASE_NOW_EPOCH=150 \
   MANDATE_LEASE_NAME=builder.lease \
-  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire builder-alpha 60 >/dev/null
+  run_ostrom lease acquire builder-alpha 60 >/dev/null
 jq -e '.owner == "gatekeeper-alpha"' \
   "$role_leases/ostrom/sprint.lease" >/dev/null
 jq -e '.owner == "builder-alpha"' \
   "$role_leases/ostrom/builder.lease" >/dev/null
 printf '%s\n' held >"$role_leases/ostrom/.sprint.lease.guard"
 CLAUDE_CONFIG_DIR="$role_leases" MANDATE_LEASE_NAME=builder.lease \
-  bash "$PLUGIN_ROOT/scripts/lease.sh" release builder-alpha
+  run_ostrom lease release builder-alpha
 [ ! -e "$role_leases/ostrom/builder.lease" ]
 [ ! -e "$role_leases/ostrom/.builder.lease.guard" ]
 [ -e "$role_leases/ostrom/sprint.lease" ]
 [ -e "$role_leases/ostrom/.sprint.lease.guard" ]
 rm -f "$role_leases/ostrom/.sprint.lease.guard"
 CLAUDE_CONFIG_DIR="$role_leases" \
-  bash "$PLUGIN_ROOT/scripts/lease.sh" release gatekeeper-alpha
+  run_ostrom lease release gatekeeper-alpha
 
 # A second owner on the builder lease backs off before it can touch an item or
 # append a trace row. The same named lease still mutually excludes its owners.
 builder_overlap="$fixture/builder-overlap"
 CLAUDE_CONFIG_DIR="$builder_overlap" MANDATE_LEASE_NOW_EPOCH=175 \
   MANDATE_LEASE_NAME=builder.lease \
-  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire builder-alpha-wake1 60 >/dev/null
+  run_ostrom lease acquire builder-alpha-wake1 60 >/dev/null
 set +e
 CLAUDE_CONFIG_DIR="$builder_overlap" MANDATE_LEASE_NOW_EPOCH=175 \
   MANDATE_LEASE_NAME=builder.lease \
-  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire builder-beta-wake1 60 \
+  run_ostrom lease acquire builder-beta-wake1 60 \
   >/dev/null 2>&1
 builder_overlap_status=$?
 set -e
@@ -1249,34 +1269,34 @@ set -e
 [ ! -e "$builder_overlap/item-touched" ]
 [ ! -e "$builder_overlap/ostrom/sprint.jsonl" ]
 CLAUDE_CONFIG_DIR="$builder_overlap" MANDATE_LEASE_NAME=builder.lease \
-  bash "$PLUGIN_ROOT/scripts/lease.sh" release builder-alpha-wake1
+  run_ostrom lease release builder-alpha-wake1
 
 # A mid-item builder failure remains durable and releases its named lease.
 builder_failure="$fixture/builder-failure"
 failure_owner="builder-fixture-wake1"
 CLAUDE_CONFIG_DIR="$builder_failure" MANDATE_LEASE_NOW_EPOCH=190 \
   MANDATE_LEASE_NAME=builder.lease \
-  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire "$failure_owner" 60 >/dev/null
+  run_ostrom lease acquire "$failure_owner" 60 >/dev/null
 MANDATE_TRACE_TIME="2026-08-01T00:00:00Z" \
   CLAUDE_CONFIG_DIR="$builder_failure" \
-  bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-started \
+  run_ostrom trace append pass-started \
     "$(jq -cn --arg owner "$failure_owner" '{owner: $owner}')" \
     '{}' >/dev/null
 MANDATE_TRACE_TIME="2026-08-01T00:01:00Z" \
   CLAUDE_CONFIG_DIR="$builder_failure" \
-  bash "$PLUGIN_ROOT/scripts/trace.sh" append item-worked \
+  run_ostrom trace append item-worked \
     "$(jq -cn --arg owner "$failure_owner" \
       '{owner: $owner, repo: "example-org/example-repo", ref: "#59",
         action: "test", outcome: "failed", exit_code: 42}')" \
     '{"reason":"fixture failure"}' >/dev/null
 MANDATE_TRACE_TIME="2026-08-01T00:02:00Z" \
   CLAUDE_CONFIG_DIR="$builder_failure" \
-  bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
+  run_ostrom trace append pass-ended \
     "$(jq -cn --arg owner "$failure_owner" \
       '{owner: $owner, outcome: "failed", worked_items: 1}')" \
     '{"reason":"item failed"}' >/dev/null
 CLAUDE_CONFIG_DIR="$builder_failure" MANDATE_LEASE_NAME=builder.lease \
-  bash "$PLUGIN_ROOT/scripts/lease.sh" release "$failure_owner"
+  run_ostrom lease release "$failure_owner"
 [ ! -e "$builder_failure/ostrom/builder.lease" ]
 jq -s -e '
   map(.kind) == ["pass-started", "item-worked", "pass-ended"]
@@ -1311,7 +1331,7 @@ done
 # acquired the inner lease, using the real clock (no epoch override) so its
 # started_at is provably at-or-after pass.sh's own recorded start_epoch.
 CLAUDE_CONFIG_DIR="$inner_kill" MANDATE_LEASE_NAME=builder.lease \
-  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire builder-childsession-wake9 \
+  run_ostrom lease acquire builder-childsession-wake9 \
   >/dev/null
 
 kill -TERM "$inner_kill_pass_pid"
@@ -1332,7 +1352,7 @@ grep -q 'releasing inner lease builder.lease held by builder-childsession-wake9'
 # it would break the one guarantee a concurrent session relies on.
 #
 # Stamp the fixture lease at a fixed, far-past epoch rather than the real
-# clock. pass.sh reads its own start_epoch from the real clock, and lease.sh
+# clock. pass.sh reads its own start_epoch from the real clock, and ostrom lease
 # timestamps are whole seconds -- acquiring "concurrently" at real time risks
 # landing in the same second as pass.sh's start_epoch, which the safety
 # check's inclusive ">=" correctly (per spec) treats as "ours". A fixed past
@@ -1345,11 +1365,11 @@ printf '{}\n' >"$inner_safe/ostrom/roles/builder.settings.json"
 
 CLAUDE_CONFIG_DIR="$inner_safe" MANDATE_LEASE_NAME=builder.lease \
   MANDATE_LEASE_NOW_EPOCH=1000 \
-  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire builder-othersession-wake3 \
+  run_ostrom lease acquire builder-othersession-wake3 \
   100000 >/dev/null
 preexisting_inner_lease="$(
   CLAUDE_CONFIG_DIR="$inner_safe" MANDATE_LEASE_NAME=builder.lease \
-    bash "$PLUGIN_ROOT/scripts/lease.sh" status
+    run_ostrom lease status
 )"
 
 CLAUDE_CONFIG_DIR="$inner_safe" CLAUDE_BIN="$fake_claude" \
@@ -1359,7 +1379,7 @@ CLAUDE_CONFIG_DIR="$inner_safe" CLAUDE_BIN="$fake_claude" \
 [ ! -e "$inner_safe/ostrom/builder-pass.lease" ]
 inner_lease_after="$(
   CLAUDE_CONFIG_DIR="$inner_safe" MANDATE_LEASE_NAME=builder.lease \
-    bash "$PLUGIN_ROOT/scripts/lease.sh" status
+    run_ostrom lease status
 )"
 [ "$inner_lease_after" = "$preexisting_inner_lease" ]
 grep -q 'leaving it to its own owner' "$inner_safe/pass.err"
@@ -1376,51 +1396,51 @@ jq -s -e '
 ' "$inner_safe/ostrom/sprint.jsonl" >/dev/null
 
 CLAUDE_CONFIG_DIR="$inner_safe" MANDATE_LEASE_NAME=builder.lease \
-  bash "$PLUGIN_ROOT/scripts/lease.sh" release builder-othersession-wake3
+  run_ostrom lease release builder-othersession-wake3
 
 lease_expiry="$fixture/lease-expiry"
 CLAUDE_CONFIG_DIR="$lease_expiry" MANDATE_LEASE_NOW_EPOCH=200 \
-  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire builder-alpha 10 >/dev/null
+  run_ostrom lease acquire builder-alpha 10 >/dev/null
 lease_before="$(
-  CLAUDE_CONFIG_DIR="$lease_expiry" bash "$PLUGIN_ROOT/scripts/lease.sh" status
+  CLAUDE_CONFIG_DIR="$lease_expiry" run_ostrom lease status
 )"
 set +e
 CLAUDE_CONFIG_DIR="$lease_expiry" MANDATE_LEASE_NOW_EPOCH=209 \
-  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire builder-beta 10 >/dev/null 2>&1
+  run_ostrom lease acquire builder-beta 10 >/dev/null 2>&1
 unexpired_status=$?
 set -e
 [ "$unexpired_status" -ne 0 ]
 lease_after_unexpired="$(
-  CLAUDE_CONFIG_DIR="$lease_expiry" bash "$PLUGIN_ROOT/scripts/lease.sh" status
+  CLAUDE_CONFIG_DIR="$lease_expiry" run_ostrom lease status
 )"
 [ "$lease_before" = "$lease_after_unexpired" ]
 CLAUDE_CONFIG_DIR="$lease_expiry" MANDATE_LEASE_NOW_EPOCH=210 \
-  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire builder-beta 10 >/dev/null
+  run_ostrom lease acquire builder-beta 10 >/dev/null
 jq -e '
   .owner == "builder-beta"
   and .started_at == 210
   and .expires_at == 220
 ' <<<"$(
-  CLAUDE_CONFIG_DIR="$lease_expiry" bash "$PLUGIN_ROOT/scripts/lease.sh" status
+  CLAUDE_CONFIG_DIR="$lease_expiry" run_ostrom lease status
 )" >/dev/null
 
 lease_release="$fixture/lease-release"
 CLAUDE_CONFIG_DIR="$lease_release" MANDATE_LEASE_NOW_EPOCH=300 \
-  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire builder-alpha 10 >/dev/null
+  run_ostrom lease acquire builder-alpha 10 >/dev/null
 release_before="$(
-  CLAUDE_CONFIG_DIR="$lease_release" bash "$PLUGIN_ROOT/scripts/lease.sh" status
+  CLAUDE_CONFIG_DIR="$lease_release" run_ostrom lease status
 )"
 set +e
 CLAUDE_CONFIG_DIR="$lease_release" \
-  bash "$PLUGIN_ROOT/scripts/lease.sh" release builder-beta >/dev/null 2>&1
+  run_ostrom lease release builder-beta >/dev/null 2>&1
 non_owner_status=$?
 set -e
 [ "$non_owner_status" -ne 0 ]
 [ "$release_before" = "$(
-  CLAUDE_CONFIG_DIR="$lease_release" bash "$PLUGIN_ROOT/scripts/lease.sh" status
+  CLAUDE_CONFIG_DIR="$lease_release" run_ostrom lease status
 )" ]
 CLAUDE_CONFIG_DIR="$lease_release" \
-  bash "$PLUGIN_ROOT/scripts/lease.sh" release builder-alpha
+  run_ostrom lease release builder-alpha
 [ ! -e "$lease_release/ostrom/sprint.lease" ]
 [ ! -e "$lease_release/ostrom/.sprint.lease.guard" ]
 
@@ -1440,21 +1460,21 @@ cap_today_epoch=1786449600 # 2026-08-11T12:00:00Z
 # it were ever misattributed to today the "under cap" run just below would
 # wrongly stand down instead of spawning.
 MANDATE_TRACE_TIME="2026-08-10T23:59:00Z" CLAUDE_CONFIG_DIR="$cap_config" \
-  bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
+  run_ostrom trace append pass-ended \
     '{"owner":"builder-fixture-wake0","outcome":"completed","cost_usd":71,"duration_seconds":300}' \
     '{}' >/dev/null
 # A malformed cost_usd (wrong type) and a missing one must both count as 0,
 # not abort the sum -- a gatekeeper row proves the sum is role-blind too.
 MANDATE_TRACE_TIME="2026-08-11T00:05:00Z" CLAUDE_CONFIG_DIR="$cap_config" \
-  bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
+  run_ostrom trace append pass-ended \
     '{"owner":"gatekeeper-fixture-wake0","outcome":"completed","cost_usd":"oops","duration_seconds":300}' \
     '{}' >/dev/null
 MANDATE_TRACE_TIME="2026-08-11T00:06:00Z" CLAUDE_CONFIG_DIR="$cap_config" \
-  bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
+  run_ostrom trace append pass-ended \
     '{"owner":"gatekeeper-fixture-wake1","outcome":"completed","duration_seconds":300}' \
     '{}' >/dev/null
 MANDATE_TRACE_TIME="2026-08-11T00:07:00Z" CLAUDE_CONFIG_DIR="$cap_config" \
-  bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
+  run_ostrom trace append pass-ended \
     '{"owner":"builder-fixture-wake1","outcome":"completed","cost_usd":10,"duration_seconds":300}' \
     '{}' >/dev/null
 
@@ -1466,7 +1486,7 @@ CLAUDE_CONFIG_DIR="$cap_config" CLAUDE_BIN="$fake_claude" \
   MANDATE_NOW_EPOCH="$cap_today_epoch" \
   FAKE_CLAUDE_ARGS_FILE="$cap_undercap_args" \
   FAKE_CLAUDE_INNER_OWNER="builder-inner-cap-wake1" \
-  FAKE_CLAUDE_TRACE_SH="$fake_claude_trace_sh" \
+  FAKE_CLAUDE_OSTROM="$fake_claude_ostrom" \
   bash "$PLUGIN_ROOT/scripts/pass.sh" builder >/dev/null
 [ -s "$cap_undercap_args" ]
 jq -s -e '
@@ -1480,7 +1500,7 @@ jq -s -e '
 
 # #99: pass.sh derives "today" from MANDATE_NOW_EPOCH (the simulated day
 # above) to sum the cap against, but before this fix it appended its own
-# pass-started/pass-ended rows with no MANDATE_TRACE_TIME, so trace.sh
+# pass-started/pass-ended rows with no MANDATE_TRACE_TIME, so ostrom trace
 # stamped them with the real wall clock instead -- the two clocks agreed
 # only by coincidence, while the real date happened to match the fixture's
 # simulated day. This is the regression test that would have caught it: the
@@ -1525,7 +1545,7 @@ mkdir -p "$cap_yesterday_config/ostrom/roles"
 printf '{}\n' >"$cap_yesterday_config/ostrom/roles/builder.settings.json"
 : >"$cap_yesterday_config/ostrom/loop-armed"
 MANDATE_TRACE_TIME="2026-08-10T23:59:59Z" CLAUDE_CONFIG_DIR="$cap_yesterday_config" \
-  bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
+  run_ostrom trace append pass-ended \
     '{"owner":"builder-fixture-wake0","outcome":"completed","cost_usd":999,"duration_seconds":300}' \
     '{}' >/dev/null
 cap_yesterday_args="$cap_yesterday/args"
@@ -1533,7 +1553,7 @@ CLAUDE_CONFIG_DIR="$cap_yesterday_config" CLAUDE_BIN="$fake_claude" \
   MANDATE_NOW_EPOCH="$cap_today_epoch" \
   FAKE_CLAUDE_ARGS_FILE="$cap_yesterday_args" \
   FAKE_CLAUDE_INNER_OWNER="builder-inner-yesterday-wake1" \
-  FAKE_CLAUDE_TRACE_SH="$fake_claude_trace_sh" \
+  FAKE_CLAUDE_OSTROM="$fake_claude_ostrom" \
   bash "$PLUGIN_ROOT/scripts/pass.sh" builder >/dev/null
 [ -s "$cap_yesterday_args" ]
 jq -s -e '
@@ -1553,19 +1573,19 @@ mkdir -p "$cap_malformed_config/ostrom/roles"
 printf '{}\n' >"$cap_malformed_config/ostrom/roles/builder.settings.json"
 : >"$cap_malformed_config/ostrom/loop-armed"
 MANDATE_TRACE_TIME="2026-08-11T01:00:00Z" CLAUDE_CONFIG_DIR="$cap_malformed_config" \
-  bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
+  run_ostrom trace append pass-ended \
     '{"owner":"builder-fixture-wake0","outcome":"completed","cost_usd":"oops","duration_seconds":300}' \
     '{}' >/dev/null
 MANDATE_TRACE_TIME="2026-08-11T01:01:00Z" CLAUDE_CONFIG_DIR="$cap_malformed_config" \
-  bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
+  run_ostrom trace append pass-ended \
     '{"owner":"builder-fixture-wake1","outcome":"completed","cost_usd":null,"duration_seconds":300}' \
     '{}' >/dev/null
 MANDATE_TRACE_TIME="2026-08-11T01:02:00Z" CLAUDE_CONFIG_DIR="$cap_malformed_config" \
-  bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
+  run_ostrom trace append pass-ended \
     '{"owner":"builder-fixture-wake2","outcome":"completed","duration_seconds":300}' \
     '{}' >/dev/null
 MANDATE_TRACE_TIME="2026-08-11T01:03:00Z" CLAUDE_CONFIG_DIR="$cap_malformed_config" \
-  bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
+  run_ostrom trace append pass-ended \
     '{"owner":"builder-fixture-wake3","outcome":"completed","cost_usd":7,"duration_seconds":300}' \
     '{}' >/dev/null
 
@@ -1597,7 +1617,7 @@ mkdir -p "$cap_bad_override_config/ostrom/roles"
 printf '{}\n' >"$cap_bad_override_config/ostrom/roles/builder.settings.json"
 : >"$cap_bad_override_config/ostrom/loop-armed"
 MANDATE_TRACE_TIME="2026-08-11T01:00:00Z" CLAUDE_CONFIG_DIR="$cap_bad_override_config" \
-  bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
+  run_ostrom trace append pass-ended \
     '{"owner":"builder-fixture-wake0","outcome":"completed","cost_usd":9,"duration_seconds":300}' \
     '{}' >/dev/null
 cap_bad_override_args="$cap_bad_override/args"
@@ -1635,13 +1655,13 @@ JSON
 dispatch_order="$(
   CLAUDE_CONFIG_DIR="$dispatch_config" \
     MANDATE_TRACE_TIME="2026-08-11T02:00:00Z" \
-    bash "$PLUGIN_ROOT/scripts/work-order.sh" create "$dispatch_candidate" \
+    run_ostrom work-order create "$dispatch_candidate" \
       2>"$dispatch_fixture/branch-overwrite.err"
 )"
-bash "$PLUGIN_ROOT/scripts/work-order.sh" validate "$dispatch_order"
+run_ostrom work-order validate "$dispatch_order"
 dispatch_branch="$(jq -r '.branch_name' "$dispatch_order")"
 [ "$dispatch_branch" = "$(
-  bash "$PLUGIN_ROOT/scripts/work-order.sh" branch-name \
+  run_ostrom work-order branch-name \
     'example-org/example-repo#123'
 )" ]
 [ "$dispatch_branch" = 'ostrom/123-9bb890b1b3b4' ]
@@ -1657,7 +1677,7 @@ jq '.branch_name = "reworded/completely-different"' \
 dispatch_order="$({
   CLAUDE_CONFIG_DIR="$dispatch_config" \
     MANDATE_TRACE_TIME="2026-08-11T02:00:01Z" \
-    bash "$PLUGIN_ROOT/scripts/work-order.sh" create \
+    run_ostrom work-order create \
       "$dispatch_fixture/reworded-candidate.json"
 } 2>"$dispatch_fixture/reworded-branch-overwrite.err")"
 [ "$(jq -r '.branch_name' "$dispatch_order")" = "$first_dispatch_branch" ]
@@ -1668,7 +1688,7 @@ grep -Fq "overwriting candidate branch_name 'reworded/completely-different' with
 # naming landed still satisfies the unchanged schema_version 1 contract.
 jq '.branch_name = "feat/123-historical"' "$dispatch_order" \
   >"$dispatch_fixture/historical-order.json"
-bash "$PLUGIN_ROOT/scripts/work-order.sh" validate \
+run_ostrom work-order validate \
   "$dispatch_fixture/historical-order.json"
 jq -e '
   keys == ["acceptance_criteria", "branch_name", "constraints",
@@ -1834,7 +1854,7 @@ set -e
 [ ! -e "$empty_source_gh_calls" ]
 [ ! -e "$empty_source_systemd_calls" ]
 empty_source_item_hash="$(
-  bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash \
+  run_ostrom work-order item-hash \
     'example-org/example-repo#123'
 )"
 [ ! -e "$empty_source_config/ostrom/implementer-item-$empty_source_item_hash.lease" ]
@@ -1884,7 +1904,7 @@ set -e
 [ ! -e "$missing_source_gh_calls" ]
 [ ! -e "$missing_source_systemd_calls" ]
 missing_source_item_hash="$(
-  bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash \
+  run_ostrom work-order item-hash \
     'example-org/example-repo#123'
 )"
 [ ! -e "$missing_source_config/ostrom/implementer-item-$missing_source_item_hash.lease" ]
@@ -1929,7 +1949,7 @@ if [ "$branch_guard_status" -ne 3 ]; then
   exit 1
 fi
 branch_guard_item_hash="$(
-  bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash \
+  run_ostrom work-order item-hash \
     'example-org/example-repo#123'
 )"
 if [ -e "$branch_guard_config/ostrom/implementer-item-$branch_guard_item_hash.lease" ]; then
@@ -2165,7 +2185,7 @@ JSON
 numbered_branch_order="$({
   CLAUDE_CONFIG_DIR="$numbered_branch_config" \
     MANDATE_TRACE_TIME="2026-08-11T02:00:34Z" \
-    bash "$PLUGIN_ROOT/scripts/work-order.sh" create \
+    run_ostrom work-order create \
       "$dispatch_fixture/numbered-branch-candidate.json"
 } 2>/dev/null)"
 : >"$numbered_branch_calls"
@@ -2205,7 +2225,7 @@ JSON
 part_of_order="$({
   CLAUDE_CONFIG_DIR="$part_of_config" \
     MANDATE_TRACE_TIME="2026-08-11T02:00:36Z" \
-    bash "$PLUGIN_ROOT/scripts/work-order.sh" create \
+    run_ostrom work-order create \
       "$dispatch_fixture/part-of-candidate.json"
 } 2>/dev/null)"
 : >"$part_of_calls"
@@ -2436,7 +2456,7 @@ set -e
 [ "$(wc -l <"$dispatch_calls" | tr -d '[:space:]')" -eq 1 ]
 CLAUDE_CONFIG_DIR="$dispatch_config" \
   MANDATE_LEASE_NAME="${dispatch_lease##*/}" \
-  bash "$PLUGIN_ROOT/scripts/lease.sh" release "$dispatch_unit"
+  run_ostrom lease release "$dispatch_unit"
 set +e
 CLAUDE_CONFIG_DIR="$dispatch_config" \
   MANDATE_NOW_EPOCH="$cap_today_epoch" \
@@ -2451,7 +2471,7 @@ set -e
 dispatch_order_id="$(jq -r '.order_id' "$dispatch_order")"
 MANDATE_TRACE_TIME="2026-08-11T02:02:00Z" \
   CLAUDE_CONFIG_DIR="$dispatch_config" \
-  bash "$PLUGIN_ROOT/scripts/trace.sh" append work-failed \
+  run_ostrom trace append work-failed \
     "$(jq -cn --arg order_id "$dispatch_order_id" \
       '{schema_version:1,item_id:"example-org/example-repo#123",
         order_id:$order_id,unit_name:"ostrom-implementer-9bb890b1b3b47926",
@@ -2488,7 +2508,7 @@ JSON
 concurrency_order="$(
   CLAUDE_CONFIG_DIR="$concurrency_config" \
     MANDATE_TRACE_TIME="2026-08-11T01:02:00Z" \
-    bash "$PLUGIN_ROOT/scripts/work-order.sh" create "$concurrency_candidate"
+    run_ostrom work-order create "$concurrency_candidate"
 )"
 concurrency_stderr="$dispatch_fixture/concurrency.err"
 set +e
@@ -2510,7 +2530,7 @@ if grep -Fq 'per-repository concurrency limit reached' "$concurrency_stderr"; th
   echo "global concurrency refusal used the repository-specific reason" >&2
   exit 1
 fi
-concurrency_item_hash="$(bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash 'example-org/example-repo#132')"
+concurrency_item_hash="$(run_ostrom work-order item-hash 'example-org/example-repo#132')"
 [ ! -e "$concurrency_config/ostrom/implementer-item-$concurrency_item_hash.lease" ]
 [ "$(wc -l <"$dispatch_calls" | tr -d '[:space:]')" -eq 1 ]
 
@@ -2656,11 +2676,11 @@ JSON
 cap_dispatch_order="$(
   CLAUDE_CONFIG_DIR="$dispatch_config" \
     MANDATE_TRACE_TIME="2026-08-11T02:03:00Z" \
-    bash "$PLUGIN_ROOT/scripts/work-order.sh" create "$cap_dispatch_candidate"
+    run_ostrom work-order create "$cap_dispatch_candidate"
 )"
 MANDATE_TRACE_TIME="2026-08-11T02:04:00Z" \
   CLAUDE_CONFIG_DIR="$dispatch_config" \
-  bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
+  run_ostrom trace append pass-ended \
     '{"owner":"builder-synthetic-wake1","outcome":"completed","cost_usd":50,"duration_seconds":1}' \
     '{}' >/dev/null
 set +e
@@ -2675,7 +2695,7 @@ CLAUDE_CONFIG_DIR="$dispatch_config" \
 cap_dispatch_status=$?
 set -e
 [ "$cap_dispatch_status" -eq 3 ]
-cap_item_hash="$(bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash 'example-org/example-repo#124')"
+cap_item_hash="$(run_ostrom work-order item-hash 'example-org/example-repo#124')"
 [ ! -e "$dispatch_config/ostrom/implementer-item-$cap_item_hash.lease" ]
 [ "$(wc -l <"$dispatch_calls" | tr -d '[:space:]')" -eq 1 ]
 
@@ -2890,7 +2910,7 @@ create_implement_order() {
 JSON
   CLAUDE_CONFIG_DIR="$order_config" \
     MANDATE_TRACE_TIME="2026-08-11T03:00:10Z" \
-    bash "$PLUGIN_ROOT/scripts/work-order.sh" create "$candidate_file" \
+    run_ostrom work-order create "$candidate_file" \
       2>/dev/null
 }
 
@@ -2900,11 +2920,11 @@ run_implement_order() {
   local runtime_config="${3:-$implement_config}"
   local item_id item_hash unit lease
   item_id="$(jq -r '.item_id' "$order_file")"
-  item_hash="$(bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash "$item_id")"
+  item_hash="$(run_ostrom work-order item-hash "$item_id")"
   unit="ostrom-implementer-${item_hash:0:16}"
   lease="implementer-item-$item_hash.lease"
   CLAUDE_CONFIG_DIR="$runtime_config" MANDATE_LEASE_NAME="$lease" \
-    bash "$PLUGIN_ROOT/scripts/lease.sh" acquire "$unit" 3600 >/dev/null
+    run_ostrom lease acquire "$unit" 3600 >/dev/null
   FAKE_CODEX_MODE="${FAKE_CODEX_MODE:-complete}" CODEX_BIN="$fake_codex" \
     CLAUDE_CONFIG_DIR="$runtime_config" \
     MANDATE_IMPLEMENTER_SOURCE_REPO="$implement_source" \
@@ -2946,14 +2966,14 @@ YAML
 resolution_order="$(create_implement_order source-resolution 144 "$resolution_config")"
 resolution_order_id="$(jq -r '.order_id' "$resolution_order")"
 resolution_item_hash="$(
-  bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash \
+  run_ostrom work-order item-hash \
     'example-org/example-repo#144'
 )"
 resolution_unit="ostrom-implementer-${resolution_item_hash:0:16}"
 resolution_lease="implementer-item-$resolution_item_hash.lease"
 resolution_worktree="$resolution_config/ostrom/implementer-worktrees/$resolution_item_hash"
 CLAUDE_CONFIG_DIR="$resolution_config" MANDATE_LEASE_NAME="$resolution_lease" \
-  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire "$resolution_unit" 3600 >/dev/null
+  run_ostrom lease acquire "$resolution_unit" 3600 >/dev/null
 FAKE_CODEX_MODE=complete CODEX_BIN="$fake_codex" \
   CLAUDE_CONFIG_DIR="$resolution_config" \
   MANDATE_GH_AS_BIN="$fake_implement_gh" FAKE_GIT_REMOTE="$implement_remote" \
@@ -2981,13 +3001,13 @@ YAML
 linked_only_order="$(create_implement_order linked-only 145 "$linked_only_config")"
 linked_only_order_id="$(jq -r '.order_id' "$linked_only_order")"
 linked_only_item_hash="$(
-  bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash \
+  run_ostrom work-order item-hash \
     'example-org/example-repo#145'
 )"
 linked_only_unit="ostrom-implementer-${linked_only_item_hash:0:16}"
 linked_only_lease="implementer-item-$linked_only_item_hash.lease"
 CLAUDE_CONFIG_DIR="$linked_only_config" MANDATE_LEASE_NAME="$linked_only_lease" \
-  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire "$linked_only_unit" 3600 >/dev/null
+  run_ostrom lease acquire "$linked_only_unit" 3600 >/dev/null
 set +e
 CODEX_BIN="$fake_codex" CLAUDE_CONFIG_DIR="$linked_only_config" \
   MANDATE_GH_AS_BIN="$fake_implement_gh" FAKE_GIT_REMOTE="$implement_remote" \
@@ -3018,7 +3038,7 @@ branch_conflict_order="$(
 branch_conflict_order_id="$(jq -r '.order_id' "$branch_conflict_order")"
 branch_conflict_branch="$(jq -r '.branch_name' "$branch_conflict_order")"
 branch_conflict_item_hash="$(
-  bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash \
+  run_ostrom work-order item-hash \
     'example-org/example-repo#146'
 )"
 branch_conflict_unit="ostrom-implementer-${branch_conflict_item_hash:0:16}"
@@ -3029,7 +3049,7 @@ git -C "$implement_source" worktree add -b "$branch_conflict_branch" \
   "$branch_conflict_existing" refs/remotes/origin/main >/dev/null
 CLAUDE_CONFIG_DIR="$branch_conflict_config" \
   MANDATE_LEASE_NAME="$branch_conflict_lease" \
-  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire \
+  run_ostrom lease acquire \
     "$branch_conflict_unit" 3600 >/dev/null
 set +e
 FAKE_CODEX_MODE=complete CODEX_BIN="$fake_codex" \
@@ -3066,7 +3086,7 @@ workflow_only_order="$(
 )"
 workflow_only_order_id="$(jq -r '.order_id' "$workflow_only_order")"
 workflow_only_item_hash="$(
-  bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash \
+  run_ostrom work-order item-hash \
     'example-org/example-repo#148'
 )"
 workflow_only_branch="$(jq -r '.branch_name' "$workflow_only_order")"
@@ -3114,7 +3134,7 @@ workflow_mixed_order="$(
 )"
 workflow_mixed_order_id="$(jq -r '.order_id' "$workflow_mixed_order")"
 workflow_mixed_item_hash="$(
-  bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash \
+  run_ostrom work-order item-hash \
     'example-org/example-repo#149'
 )"
 workflow_mixed_branch="$(jq -r '.branch_name' "$workflow_mixed_order")"
@@ -3165,7 +3185,7 @@ jq -s -e --arg order_id "$workflow_mixed_order_id" '
 # commit, proving reuse does not discard it and ordinary changes still push.
 reuse_config="$implement_fixture/reuse-config"
 reuse_order="$(create_implement_order reuse 140 "$reuse_config")"
-reuse_item_hash="$(bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash 'example-org/example-repo#140')"
+reuse_item_hash="$(run_ostrom work-order item-hash 'example-org/example-repo#140')"
 reuse_branch="$(jq -r '.branch_name' "$reuse_order")"
 reuse_worktree="$reuse_config/ostrom/implementer-worktrees/$reuse_item_hash"
 mkdir -p "$(dirname "$reuse_worktree")"
@@ -3191,8 +3211,8 @@ retarget_branch='fix/141-historical-order'
 jq --arg branch "$retarget_branch" '.branch_name = $branch' \
   "$retarget_order" >"$implement_fixture/retarget-historical-order.json"
 retarget_order="$implement_fixture/retarget-historical-order.json"
-bash "$PLUGIN_ROOT/scripts/work-order.sh" validate "$retarget_order"
-retarget_item_hash="$(bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash 'example-org/example-repo#141')"
+run_ostrom work-order validate "$retarget_order"
+retarget_item_hash="$(run_ostrom work-order item-hash 'example-org/example-repo#141')"
 retarget_worktree="$retarget_config/ostrom/implementer-worktrees/$retarget_item_hash"
 git -C "$implement_source" worktree add -b old/141-reworded \
   "$retarget_worktree" refs/remotes/origin/main >/dev/null
@@ -3207,7 +3227,7 @@ git --git-dir="$implement_remote" show-ref --verify \
 dirty_config="$implement_fixture/dirty-preflight-config"
 mkdir -p "$dirty_config/ostrom/implementer-worktrees"
 dirty_order="$(create_implement_order dirty-preflight 142 "$dirty_config")"
-dirty_item_hash="$(bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash 'example-org/example-repo#142')"
+dirty_item_hash="$(run_ostrom work-order item-hash 'example-org/example-repo#142')"
 dirty_branch="$(jq -r '.branch_name' "$dirty_order")"
 dirty_worktree="$dirty_config/ostrom/implementer-worktrees/$dirty_item_hash"
 git -C "$implement_source" worktree add -b old/142-stranded \
@@ -3256,8 +3276,8 @@ ahead_candidate="$implement_fixture/ahead-candidate.json"
 cat >"$ahead_candidate" <<'JSON'
 {"schema_version":1,"item_id":"example-org/example-repo#143","repository":"example-org/example-repo","item_ref":"#143","branch_name":"candidate/ahead","spec":"Exercise ahead worktree preservation.","acceptance_criteria":["Ahead commits survive."],"constraints":["Use placeholder data only."]}
 JSON
-ahead_order="$(CLAUDE_CONFIG_DIR="$ahead_config" bash "$PLUGIN_ROOT/scripts/work-order.sh" create "$ahead_candidate" 2>/dev/null)"
-ahead_item_hash="$(bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash 'example-org/example-repo#143')"
+ahead_order="$(CLAUDE_CONFIG_DIR="$ahead_config" run_ostrom work-order create "$ahead_candidate" 2>/dev/null)"
+ahead_item_hash="$(run_ostrom work-order item-hash 'example-org/example-repo#143')"
 ahead_worktree="$ahead_config/ostrom/implementer-worktrees/$ahead_item_hash"
 git -C "$ahead_source" worktree add -b old/143-ahead \
   "$ahead_worktree" refs/remotes/origin/main >/dev/null
@@ -3290,12 +3310,12 @@ JSON
   IMPLEMENT_CASE_ORDER="$(
     CLAUDE_CONFIG_DIR="$implement_config" \
       MANDATE_TRACE_TIME="2026-08-11T03:00:15Z" \
-      bash "$PLUGIN_ROOT/scripts/work-order.sh" create "$case_candidate"
+      run_ostrom work-order create "$case_candidate"
   )"
   IMPLEMENT_CASE_ORDER_ID="$(jq -r '.order_id' "$IMPLEMENT_CASE_ORDER")"
   IMPLEMENT_CASE_BRANCH="$(jq -r '.branch_name' "$IMPLEMENT_CASE_ORDER")"
   IMPLEMENT_CASE_ITEM_HASH="$(
-    bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash \
+    run_ostrom work-order item-hash \
       "example-org/example-repo#$case_number"
   )"
   IMPLEMENT_CASE_UNIT="ostrom-implementer-${IMPLEMENT_CASE_ITEM_HASH:0:16}"
@@ -3306,7 +3326,7 @@ JSON
   IMPLEMENT_CASE_TERM_MARKER="$implement_fixture/$case_number-codex-term"
   CLAUDE_CONFIG_DIR="$implement_config" \
     MANDATE_LEASE_NAME="$IMPLEMENT_CASE_LEASE" \
-    bash "$PLUGIN_ROOT/scripts/lease.sh" acquire \
+    run_ostrom lease acquire \
       "$IMPLEMENT_CASE_UNIT" 3600 >/dev/null
   set +e
   case_command=(bash "$PLUGIN_ROOT/scripts/implement.sh" \
@@ -3352,13 +3372,13 @@ JSON
 implement_kill_order="$(
   CLAUDE_CONFIG_DIR="$implement_config" \
     MANDATE_TRACE_TIME="2026-08-11T03:00:00Z" \
-    bash "$PLUGIN_ROOT/scripts/work-order.sh" create "$implement_kill_candidate"
+    run_ostrom work-order create "$implement_kill_candidate"
 )"
-implement_kill_item_hash="$(bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash 'example-org/example-repo#125')"
+implement_kill_item_hash="$(run_ostrom work-order item-hash 'example-org/example-repo#125')"
 implement_kill_unit="ostrom-implementer-${implement_kill_item_hash:0:16}"
 implement_kill_lease="implementer-item-$implement_kill_item_hash.lease"
 CLAUDE_CONFIG_DIR="$implement_config" MANDATE_LEASE_NAME="$implement_kill_lease" \
-  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire "$implement_kill_unit" 3600 >/dev/null
+  run_ostrom lease acquire "$implement_kill_unit" 3600 >/dev/null
 implement_kill_marker="$implement_fixture/codex-started"
 FAKE_CODEX_MODE=wait FAKE_CODEX_MARKER="$implement_kill_marker" \
   MANDATE_IMPLEMENTER_TERMINATION_GRACE_SECONDS=1 \
@@ -3403,13 +3423,13 @@ jq -s -e '
 wedged_monitor_order="$(create_implement_order wedged-monitor 147)"
 wedged_monitor_order_id="$(jq -r '.order_id' "$wedged_monitor_order")"
 wedged_monitor_item_hash="$(
-  bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash \
+  run_ostrom work-order item-hash \
     'example-org/example-repo#147'
 )"
 wedged_monitor_unit="ostrom-implementer-${wedged_monitor_item_hash:0:16}"
 wedged_monitor_lease="implementer-item-$wedged_monitor_item_hash.lease"
 CLAUDE_CONFIG_DIR="$implement_config" MANDATE_LEASE_NAME="$wedged_monitor_lease" \
-  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire \
+  run_ostrom lease acquire \
     "$wedged_monitor_unit" 3600 >/dev/null
 wedged_monitor_codex_marker="$implement_fixture/wedged-monitor-codex"
 wedged_monitor_holder_marker="$implement_fixture/wedged-monitor-holder"
@@ -3480,14 +3500,14 @@ JSON
 implement_usage_order="$(
   CLAUDE_CONFIG_DIR="$implement_config" \
     MANDATE_TRACE_TIME="2026-08-11T03:00:30Z" \
-    bash "$PLUGIN_ROOT/scripts/work-order.sh" create "$implement_usage_candidate"
+    run_ostrom work-order create "$implement_usage_candidate"
 )"
 implement_usage_order_id="$(jq -r '.order_id' "$implement_usage_order")"
-implement_usage_item_hash="$(bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash 'example-org/example-repo#130')"
+implement_usage_item_hash="$(run_ostrom work-order item-hash 'example-org/example-repo#130')"
 implement_usage_unit="ostrom-implementer-${implement_usage_item_hash:0:16}"
 implement_usage_lease="implementer-item-$implement_usage_item_hash.lease"
 CLAUDE_CONFIG_DIR="$implement_config" MANDATE_LEASE_NAME="$implement_usage_lease" \
-  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire "$implement_usage_unit" 3600 >/dev/null
+  run_ostrom lease acquire "$implement_usage_unit" 3600 >/dev/null
 set +e
 FAKE_CODEX_MODE=usage \
   CODEX_BIN="$fake_codex" CLAUDE_CONFIG_DIR="$implement_config" \
@@ -3532,15 +3552,15 @@ JSON
   implement_config_order="$(
     CLAUDE_CONFIG_DIR="$implement_config" \
       MANDATE_TRACE_TIME="2026-08-11T03:00:45Z" \
-      bash "$PLUGIN_ROOT/scripts/work-order.sh" create "$implement_config_candidate"
+      run_ostrom work-order create "$implement_config_candidate"
   )"
   implement_config_order_id="$(jq -r '.order_id' "$implement_config_order")"
   implement_config_item_id="$(jq -r '.item_id' "$implement_config_order")"
-  implement_config_item_hash="$(bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash "$implement_config_item_id")"
+  implement_config_item_hash="$(run_ostrom work-order item-hash "$implement_config_item_id")"
   implement_config_unit="ostrom-implementer-${implement_config_item_hash:0:16}"
   implement_config_lease="implementer-item-$implement_config_item_hash.lease"
   CLAUDE_CONFIG_DIR="$implement_config" MANDATE_LEASE_NAME="$implement_config_lease" \
-    bash "$PLUGIN_ROOT/scripts/lease.sh" acquire "$implement_config_unit" 3600 >/dev/null
+    run_ostrom lease acquire "$implement_config_unit" 3600 >/dev/null
   set +e
   FAKE_CODEX_MODE="$config_mode" \
     CODEX_BIN="$fake_codex" CLAUDE_CONFIG_DIR="$implement_config" \
@@ -3569,15 +3589,15 @@ JSON
 implement_ok_order="$(
   CLAUDE_CONFIG_DIR="$implement_config" \
     MANDATE_TRACE_TIME="2026-08-11T03:01:00Z" \
-    bash "$PLUGIN_ROOT/scripts/work-order.sh" create "$implement_ok_candidate"
+    run_ostrom work-order create "$implement_ok_candidate"
 )"
 implement_ok_order_id="$(jq -r '.order_id' "$implement_ok_order")"
-implement_ok_item_hash="$(bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash 'example-org/example-repo#126')"
+implement_ok_item_hash="$(run_ostrom work-order item-hash 'example-org/example-repo#126')"
 implement_ok_branch="$(jq -r '.branch_name' "$implement_ok_order")"
 implement_ok_unit="ostrom-implementer-${implement_ok_item_hash:0:16}"
 implement_ok_lease="implementer-item-$implement_ok_item_hash.lease"
 CLAUDE_CONFIG_DIR="$implement_config" MANDATE_LEASE_NAME="$implement_ok_lease" \
-  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire "$implement_ok_unit" 3600 >/dev/null
+  run_ostrom lease acquire "$implement_ok_unit" 3600 >/dev/null
 implement_pr_body="$implement_fixture/pr-body"
 CODEX_BIN="$fake_codex" CLAUDE_CONFIG_DIR="$implement_config" \
   MANDATE_IMPLEMENTER_SOURCE_REPO="$implement_source" \
@@ -3623,7 +3643,7 @@ repair_success_order="$(
 )"
 repair_success_order_id="$(jq -r '.order_id' "$repair_success_order")"
 repair_success_item_hash="$(
-  bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash \
+  run_ostrom work-order item-hash \
     'example-org/example-repo#203'
 )"
 repair_success_branch="$(jq -r '.branch_name' "$repair_success_order")"
@@ -3695,7 +3715,7 @@ repair_conflict_order="$(
 )"
 repair_conflict_order_id="$(jq -r '.order_id' "$repair_conflict_order")"
 repair_conflict_item_hash="$(
-  bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash \
+  run_ostrom work-order item-hash \
     'example-org/example-repo#204'
 )"
 repair_conflict_branch="$(jq -r '.branch_name' "$repair_conflict_order")"
@@ -3719,7 +3739,7 @@ repair_conflict_unit="ostrom-implementer-${repair_conflict_item_hash:0:16}"
 repair_conflict_lease="implementer-item-$repair_conflict_item_hash.lease"
 CLAUDE_CONFIG_DIR="$repair_conflict_config" \
   MANDATE_LEASE_NAME="$repair_conflict_lease" \
-  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire \
+  run_ostrom lease acquire \
     "$repair_conflict_unit" 3600 >/dev/null
 repair_conflict_commands="$implement_fixture/repair-conflict-commands"
 set +e
@@ -4027,15 +4047,18 @@ JSON
 nvm_dispatch_order="$(
   CLAUDE_CONFIG_DIR="$implement_config" \
     MANDATE_TRACE_TIME="2026-08-11T03:02:00Z" \
-    bash "$PLUGIN_ROOT/scripts/work-order.sh" create "$nvm_dispatch_candidate"
+    run_ostrom work-order create "$nvm_dispatch_candidate"
 )"
 nvm_dispatch_order_id="$(jq -r '.order_id' "$nvm_dispatch_order")"
 nvm_dispatch_args="$implement_fixture/nvm-systemd-args"
 nvm_codex_calls="$implement_fixture/nvm-codex-calls"
+nvm_ostrom_bin="$implement_fixture/ostrom-bin"
+mkdir -p "$nvm_ostrom_bin"
+ln -s "$OSTROM_BIN" "$nvm_ostrom_bin/ostrom"
 nvm_dispatch_unit="$(
   env -u CODEX_BIN \
     HOME="$nvm_dispatch_home" NVM_DIR="$nvm_dispatch_dir" \
-    PATH="/usr/bin:/bin" OSTROM_NODE_FALLBACKS="" \
+    PATH="$nvm_ostrom_bin:/usr/bin:/bin" OSTROM_NODE_FALLBACKS="" \
     CLAUDE_CONFIG_DIR="$implement_config" \
     MANDATE_TRACE_TIME="2026-08-11T03:03:00Z" \
     MANDATE_NOW_EPOCH="$cap_today_epoch" \
@@ -4050,7 +4073,7 @@ nvm_dispatch_unit="$(
 )"
 [ -n "$nvm_dispatch_unit" ]
 grep -qx 'exec' "$nvm_codex_calls"
-grep -qx "PATH=$nvm_new_bin:/usr/bin:/bin" "$nvm_dispatch_args"
+grep -qx "PATH=$nvm_new_bin:$nvm_ostrom_bin:/usr/bin:/bin" "$nvm_dispatch_args"
 jq -s -e --arg order_id "$nvm_dispatch_order_id" '
   [.[] | select(.fact.order_id == $order_id)] as $rows
   | $rows | length == 2
@@ -4072,12 +4095,12 @@ JSON
 missing_dispatch_order="$(
   CLAUDE_CONFIG_DIR="$missing_dispatch_config" \
     MANDATE_TRACE_TIME="2026-08-11T03:04:00Z" \
-    bash "$PLUGIN_ROOT/scripts/work-order.sh" create "$missing_dispatch_candidate"
+    run_ostrom work-order create "$missing_dispatch_candidate"
 )"
 set +e
 HOME="$implement_fixture/missing-home" \
   NVM_DIR="$implement_fixture/missing-nvm" \
-  PATH="/usr/bin:/bin" OSTROM_NODE_FALLBACKS="" \
+  PATH="$nvm_ostrom_bin:/usr/bin:/bin" OSTROM_NODE_FALLBACKS="" \
   CODEX_BIN="missing-codex" \
   CLAUDE_CONFIG_DIR="$missing_dispatch_config" \
   MANDATE_TRACE_TIME="2026-08-11T03:05:00Z" \
@@ -4116,14 +4139,14 @@ JSON
 broken_implement_order="$(
   CLAUDE_CONFIG_DIR="$implement_config" \
     MANDATE_TRACE_TIME="2026-08-11T03:06:00Z" \
-    bash "$PLUGIN_ROOT/scripts/work-order.sh" create "$broken_implement_candidate"
+    run_ostrom work-order create "$broken_implement_candidate"
 )"
 broken_implement_order_id="$(jq -r '.order_id' "$broken_implement_order")"
-broken_implement_item_hash="$(bash "$PLUGIN_ROOT/scripts/work-order.sh" item-hash 'example-org/example-repo#129')"
+broken_implement_item_hash="$(run_ostrom work-order item-hash 'example-org/example-repo#129')"
 broken_implement_unit="ostrom-implementer-${broken_implement_item_hash:0:16}"
 broken_implement_lease="implementer-item-$broken_implement_item_hash.lease"
 CLAUDE_CONFIG_DIR="$implement_config" MANDATE_LEASE_NAME="$broken_implement_lease" \
-  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire "$broken_implement_unit" 3600 >/dev/null
+  run_ostrom lease acquire "$broken_implement_unit" 3600 >/dev/null
 set +e
 CODEX_BIN="$broken_codex" CLAUDE_CONFIG_DIR="$implement_config" \
   MANDATE_IMPLEMENTER_SOURCE_REPO="$implement_source" \
@@ -4147,7 +4170,7 @@ if grep -q 'send a bounded, single-concern change to a subagent' "$work_skill"; 
   echo "builder triage must not implement through an in-process subagent" >&2
   exit 1
 fi
-grep -q 'scripts/work-order.sh' "$work_skill"
+grep -q 'ostrom work-order' "$work_skill"
 grep -q 'ostrom dispatch' "$work_skill"
 grep -Fq 'order_id="$(jq -r '\''.order_id'\'' "$order_file")"' "$work_skill"
 grep -q 'filename.*stem is `item_hash`' "$work_skill"
@@ -4406,7 +4429,7 @@ JSON
 trace_join_order="$(
   CLAUDE_CONFIG_DIR="$trace_join_config" \
     MANDATE_TRACE_TIME="2026-08-13T00:00:00Z" \
-    bash "$PLUGIN_ROOT/scripts/work-order.sh" create "$trace_join_candidate"
+    run_ostrom work-order create "$trace_join_candidate"
 )"
 trace_join_order_id="$(jq -r '.order_id' "$trace_join_order")"
 trace_join_item_hash="${trace_join_order##*/}"
@@ -4415,12 +4438,12 @@ trace_join_unit="ostrom-implementer-${trace_join_item_hash:0:16}"
 trace_join_owner="builder-fixture-wake134"
 MANDATE_TRACE_TIME="2026-08-13T00:00:01Z" \
   CLAUDE_CONFIG_DIR="$trace_join_config" \
-  bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-started \
+  run_ostrom trace append pass-started \
     "$(jq -cn --arg owner "$trace_join_owner" '{owner:$owner}')" \
     '{}' >/dev/null
 MANDATE_TRACE_TIME="2026-08-13T00:00:02Z" \
   CLAUDE_CONFIG_DIR="$trace_join_config" \
-  bash "$PLUGIN_ROOT/scripts/trace.sh" append work-dispatched \
+  run_ostrom trace append work-dispatched \
     "$(jq -cn --arg order_id "$trace_join_order_id" --arg unit_name "$trace_join_unit" \
       '{schema_version:1,item_id:"example-org/example-repo#134",
         order_id:$order_id,unit_name:$unit_name,
@@ -4430,7 +4453,7 @@ MANDATE_TRACE_TIME="2026-08-13T00:00:02Z" \
 set +e
 MANDATE_TRACE_TIME="2026-08-13T00:00:03Z" \
   CLAUDE_CONFIG_DIR="$trace_join_config" \
-  bash "$PLUGIN_ROOT/scripts/trace.sh" append item-worked \
+  run_ostrom trace append item-worked \
     "$(jq -cn --arg owner "$trace_join_owner" \
       --arg order_id "$trace_join_item_hash" \
       '{owner:$owner,repo:"example-org/example-repo",ref:"#134",
@@ -4445,7 +4468,7 @@ grep -q "item-worked order_id.*matches no work order's order_id field" \
 [ "$(wc -l <"$trace_join_config/ostrom/sprint.jsonl" | tr -d '[:space:]')" -eq 2 ]
 MANDATE_TRACE_TIME="2026-08-13T00:00:04Z" \
   CLAUDE_CONFIG_DIR="$trace_join_config" \
-  bash "$PLUGIN_ROOT/scripts/trace.sh" append item-worked \
+  run_ostrom trace append item-worked \
     "$(jq -cn --arg owner "$trace_join_owner" \
       --arg order_id "$trace_join_order_id" \
       --arg order_file "$trace_join_order" --arg unit_name "$trace_join_unit" \
@@ -4455,7 +4478,7 @@ MANDATE_TRACE_TIME="2026-08-13T00:00:04Z" \
     '{}' >/dev/null
 MANDATE_TRACE_TIME="2026-08-13T00:00:05Z" \
   CLAUDE_CONFIG_DIR="$trace_join_config" \
-  bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
+  run_ostrom trace append pass-ended \
     "$(jq -cn --arg owner "$trace_join_owner" \
       '{owner:$owner,outcome:"completed",worked_items:1}')" \
     '{}' >/dev/null
@@ -4480,7 +4503,7 @@ jq -cn --arg order_id "$trace_join_item_hash" '
 ' >"$historical_trace_config/ostrom/sprint.jsonl"
 historical_fact_rows="$(
   CLAUDE_CONFIG_DIR="$historical_trace_config" \
-    bash "$PLUGIN_ROOT/scripts/trace.sh" read
+    run_ostrom trace read
 )"
 jq -s -e --arg order_id "$trace_join_item_hash" '
   length == 1
@@ -4494,12 +4517,12 @@ jq -s -e --arg order_id "$trace_join_item_hash" '
 # narration-specific verb to inspect that region.
 trace_config="$fixture/trace"
 MANDATE_TRACE_TIME="2026-08-04T00:00:00Z" CLAUDE_CONFIG_DIR="$trace_config" \
-  bash "$PLUGIN_ROOT/scripts/trace.sh" append commit \
+  run_ostrom trace append commit \
     '{"sha":"0123456789abcdef"}' \
     '{"reason":"placeholder change"}' >/dev/null
 newline_narration='{"reason":"first line\nsecond line with a \"quote\""}'
 MANDATE_TRACE_TIME="2026-08-04T00:01:00Z" CLAUDE_CONFIG_DIR="$trace_config" \
-  bash "$PLUGIN_ROOT/scripts/trace.sh" append gatekeeper-verdict \
+  run_ostrom trace append gatekeeper-verdict \
     '{"verdict":"pass","exit_code":0}' \
     "$newline_narration" >/dev/null
 trace_file="$trace_config/ostrom/sprint.jsonl"
@@ -4516,7 +4539,7 @@ jq -s -e '
     == "first line\nsecond line with a \"quote\""
 ' "$trace_file" >/dev/null
 fact_rows="$(
-  CLAUDE_CONFIG_DIR="$trace_config" bash "$PLUGIN_ROOT/scripts/trace.sh" read
+  CLAUDE_CONFIG_DIR="$trace_config" run_ostrom trace read
 )"
 jq -s -e '
   length == 2
@@ -4529,7 +4552,7 @@ if grep -q 'narration' <<<"$fact_rows"; then
 fi
 narration_rows="$(
   CLAUDE_CONFIG_DIR="$trace_config" \
-    bash "$PLUGIN_ROOT/scripts/trace.sh" read-narration
+    run_ostrom trace read-narration
 )"
 jq -s -e '
   length == 2
@@ -4540,7 +4563,7 @@ jq -s -e '
 oversized_value="$(printf '%*s' 4100 '' | tr ' ' x)"
 set +e
 CLAUDE_CONFIG_DIR="$trace_config" \
-  bash "$PLUGIN_ROOT/scripts/trace.sh" append result \
+  run_ostrom trace append result \
     "$(jq -cn --arg value "$oversized_value" '{value: $value}')" \
     '{}' >/dev/null 2>&1
 oversized_status=$?
@@ -4561,7 +4584,7 @@ grep -q '^WARN|builder-pass|no builder pass ever recorded|' <<<"$doctor_absent"
 grep -q '^WARN|gatekeeper-pass|no gatekeeper pass ever recorded|' <<<"$doctor_absent"
 
 MANDATE_TRACE_TIME="2026-07-30T00:00:00Z" CLAUDE_CONFIG_DIR="$doctor_config" \
-  bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
+  run_ostrom trace append pass-ended \
     '{"owner":"builder-fixture-wake1","outcome":"complete"}' '{}' >/dev/null
 doctor_stale="$(
   cd "$fixture/repo"
@@ -4576,10 +4599,10 @@ grep -q '^WARN|gatekeeper-pass|no gatekeeper pass ever recorded|' \
   <<<"$doctor_stale"
 
 MANDATE_TRACE_TIME="$MANDATE_SWEEP_TIME" CLAUDE_CONFIG_DIR="$doctor_config" \
-  bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
+  run_ostrom trace append pass-ended \
     '{"owner":"builder-fixture-wake2","outcome":"complete"}' '{}' >/dev/null
 MANDATE_TRACE_TIME="$MANDATE_SWEEP_TIME" CLAUDE_CONFIG_DIR="$doctor_config" \
-  bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
+  run_ostrom trace append pass-ended \
     '{"owner":"gatekeeper-fixture-wake1","outcome":"complete"}' '{}' >/dev/null
 doctor_current="$(
   cd "$fixture/repo"
@@ -4594,7 +4617,7 @@ grep -q '^OK|gatekeeper-pass|gatekeeper pass current, last 2026-08-01T00:00:00Z 
   <<<"$doctor_current"
 
 CLAUDE_CONFIG_DIR="$doctor_config" MANDATE_LEASE_NOW_EPOCH=1785538800 \
-  bash "$PLUGIN_ROOT/scripts/lease.sh" acquire gatekeeper-stale 1800 >/dev/null
+  run_ostrom lease acquire gatekeeper-stale 1800 >/dev/null
 doctor_expired_lease="$(
   cd "$fixture/repo"
   HOME="$fixture" CLAUDE_CONFIG_DIR="$doctor_config" \
@@ -7323,7 +7346,7 @@ jq -s -e '
 # lookup task.
 desk_rows="$(
   CLAUDE_CONFIG_DIR="$fixture/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-    bash "$PLUGIN_ROOT/scripts/queue.sh" list
+    run_ostrom queue list
 )"
 jq -s -e '
   length == 5
@@ -7340,7 +7363,7 @@ jq -c 'del(.age_days, .aged_out, .needs_judgment, .blocked_by)' "$queue" \
   >"$legacy_config/ostrom/queue.jsonl"
 legacy_rows="$(
   CLAUDE_CONFIG_DIR="$legacy_config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-    bash "$PLUGIN_ROOT/scripts/queue.sh" list
+    run_ostrom queue list
 )"
 jq -s -e '
   length == 5
@@ -7686,21 +7709,21 @@ if grep -Eq 'dead selector|unmatched in last sweep' <<<"$policy_digest_text"; th
 fi
 lint_output="$(
   CLAUDE_CONFIG_DIR="$fixture/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-    bash "$PLUGIN_ROOT/scripts/queue.sh" lint
+    run_ostrom queue lint
 )"
 grep -q '^unmatched in last sweep — bounce_all title:\*never fires\*$' \
   <<<"$lint_output"
 
 # Queue mutations remain compatible with selector reasons.
 CLAUDE_CONFIG_DIR="$fixture/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-  bash "$PLUGIN_ROOT/scripts/queue.sh" approve 'example-org/example-repo#10' |
+  run_ostrom queue approve 'example-org/example-repo#10' |
   grep -q 'approval token mandate:example-org/example-repo#10'
 jq -e '
   select(.id == "example-org/example-repo#10" and .state == "approved")
 ' "$queue" >/dev/null
 
 CLAUDE_CONFIG_DIR="$fixture/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-  bash "$PLUGIN_ROOT/scripts/queue.sh" reject 'example-org/example-repo#12' >/dev/null
+  run_ostrom queue reject 'example-org/example-repo#12' >/dev/null
 if jq -e 'select(.id == "example-org/example-repo#12")' "$queue" >/dev/null; then
   echo "rejected row remained in queue" >&2
   exit 1
@@ -7725,7 +7748,7 @@ jq -e '
 # sentinel "default:unclassified" is exactly what classify() already
 # produces for a no-match; nothing new is invented for the event log.
 CLAUDE_CONFIG_DIR="$fixture/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-  bash "$PLUGIN_ROOT/scripts/queue.sh" reject 'example-org/example-repo#13' >/dev/null
+  run_ostrom queue reject 'example-org/example-repo#13' >/dev/null
 if jq -e 'select(.id == "example-org/example-repo#13")' "$queue" >/dev/null; then
   echo "rejected row remained in queue" >&2
   exit 1
@@ -9231,11 +9254,11 @@ fi
 # above. One is missing its reversal field entirely — it must degrade rather
 # than take the hook down with it.
 MANDATE_TRACE_TIME="2026-08-01T01:00:00Z" CLAUDE_CONFIG_DIR="$decisions/config" \
-  bash "$PLUGIN_ROOT/scripts/trace.sh" append decision-taken \
+  run_ostrom trace append decision-taken \
   '{"role":"gatekeeper","owner":"gatekeeper-t-1","repo":"example-org/example-repo","ref":"#42","decision":"merged pull request","reversal":"revert example-org/example-repo#42: open a revert pull request or git revert its merge commit"}' \
   '{"reason":"gate verdict: pass"}' >/dev/null
 MANDATE_TRACE_TIME="2026-08-01T01:05:00Z" CLAUDE_CONFIG_DIR="$decisions/config" \
-  bash "$PLUGIN_ROOT/scripts/trace.sh" append decision-taken \
+  run_ostrom trace append decision-taken \
   '{"role":"builder","owner":"builder-t-1","repo":"example-org/example-repo","ref":"#43","decision":"filed issue"}' \
   '{}' >/dev/null
 

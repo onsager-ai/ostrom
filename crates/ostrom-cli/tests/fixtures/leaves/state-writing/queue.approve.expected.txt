@@ -1,0 +1,2 @@
+{"id":"placeholder-org/alpha#11","repo":"placeholder-org/alpha","ref":"#11","title":"Placeholder pending item","kind":"decision","mandate":{"reason":"placeholder approval reason"},"state":"approved","opened":"2026-08-01T00:00:00Z","matched_selector":"label:placeholder","classification":"delegated","semantic_derivation":{"findings":[],"authority":null}}
+HANDOFF placeholder-org/alpha #11 — invoke /handoff with approval token mandate:placeholder-org/alpha#11; mandate: placeholder approval reason

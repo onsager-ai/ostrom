@@ -31,7 +31,7 @@ non-empty owner for this session and wake (for example,
 `gatekeeper-<session>-<wake>`), retain that exact string for cleanup, and run:
 
 ```sh
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/lease.sh" acquire "$lease_owner"
+ostrom lease acquire "$lease_owner"
 ```
 
 Only exit 0 owns the pass. Exit 3 means another pass owns it: report that this
@@ -43,7 +43,7 @@ ownership from `sprint.jsonl`, `gate.jsonl`, prior output, or wake timing.
 After acquisition, append the first trace record:
 
 ```sh
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/trace.sh" append pass-started \
+ostrom trace append pass-started \
   "$(jq -cn --arg owner "$lease_owner" '{owner: $owner}')" \
   '{}'
 ```
@@ -169,7 +169,7 @@ derive a verdict, override an action, or add a review step here.
 Immediately before invoking `/ostrom:merge`, record the selected pointer:
 
 ```sh
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/trace.sh" append item-selected \
+ostrom trace append item-selected \
   "$(jq -cn --arg repo "$repository" --argjson pr "$pr_number" \
     '{repo: $repo, pr: $pr}')" \
   '{}'
@@ -228,14 +228,14 @@ cannot be loaded at all or a trace failure. Then run, with the exact owner
 retained in step 2:
 
 ```sh
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/trace.sh" append pass-ended \
+ostrom trace append pass-ended \
   "$(jq -cn --arg outcome "$pass_outcome" \
     --argjson completed "$completed_candidates" \
     --argjson skipped "$skipped_repos" \
     '{outcome: $outcome, completed_candidates: $completed,
       skipped_repos: $skipped}')" \
   "$pass_end_narration"
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/lease.sh" release "$lease_owner"
+ostrom lease release "$lease_owner"
 ```
 
 Use `{}` for `pass_end_narration` when there is no reasoning to report. Treat a

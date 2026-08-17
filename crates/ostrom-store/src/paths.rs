@@ -47,6 +47,21 @@ impl OstromPaths {
     }
 
     #[must_use]
+    pub fn sweep_state_file(&self) -> PathBuf {
+        self.state.join("state.json")
+    }
+
+    #[must_use]
+    pub fn selector_events_file(&self) -> PathBuf {
+        self.state.join("selector-events.jsonl")
+    }
+
+    #[must_use]
+    pub fn work_orders_dir(&self) -> PathBuf {
+        self.state.join("work-orders")
+    }
+
+    #[must_use]
     pub fn sweep_journal_file(&self) -> PathBuf {
         self.state.join("sweep-passes.jsonl")
     }

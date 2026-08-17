@@ -16,12 +16,14 @@ use ostrom_core::{
 };
 use ostrom_store::{
     AuditOptions, DispatchOutcome, DispatchRequest, ExecutableAssessmentDeriver, GateError,
-    GateOptions, MigrationOutcome, OstromPaths, PlanOptions, PublishTarget, SelectAction,
-    SelectError, SelectOutcome, SelectRequest, SweepError, SweepMode, SweepOptions,
-    SweepParityOptions, UnavailableAssessmentDeriver, acquire_org_from_github, audit,
-    encode_org_snapshots, encode_selection, grant_excuse, list_excuses, list_queue_json,
-    local_drift, migrate, run_dispatch, run_gate, run_plan, run_selection, run_sweep,
-    run_sweep_parity,
+    GateOptions, MigrationOutcome, OstromPaths, PlanOptions, PublishTarget, QueueDecision,
+    SelectAction, SelectError, SelectOutcome, SelectRequest, SweepError, SweepMode, SweepOptions,
+    SweepParityOptions, TraceAppend, TraceView, UnavailableAssessmentDeriver, acquire_lease,
+    acquire_org_from_github, append_trace_checked, audit, branch_name, create_work_order,
+    decide_queue_item, encode_org_snapshots, encode_selection, grant_excuse, item_hash,
+    lease_status, lint_queue_state, list_excuses, list_queue_json, local_drift, migrate,
+    read_trace_json, release_lease, run_dispatch, run_gate, run_plan, run_selection, run_sweep,
+    run_sweep_parity, validate_lease_name, validate_work_order_file,
 };
 
 #[derive(Debug, Parser)]
@@ -52,6 +54,21 @@ enum Command {
     Queue {
         #[command(subcommand)]
         command: QueueCommand,
+    },
+    /// Append or read the machine-local sprint trace.
+    Trace {
+        #[command(subcommand)]
+        command: TraceCommand,
+    },
+    /// Coordinate repeated role wakes with a named lease.
+    Lease {
+        #[command(subcommand)]
+        command: LeaseCommand,
+    },
+    /// Create and validate durable implementation work orders.
+    WorkOrder {
+        #[command(subcommand)]
+        command: WorkOrderCommand,
     },
     /// Move legacy Claude-hosted data to XDG config and state roots.
     Migrate,
@@ -129,6 +146,53 @@ enum QueueCommand {
         #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
         format: OutputFormat,
     },
+    /// Approve one pending or deferred item.
+    Approve { id: String },
+    /// Reject and remove one pending or deferred item.
+    Reject { id: String },
+    /// Defer one pending item.
+    Defer { id: String },
+    /// Print selectors that did not match in the last sweep.
+    Lint,
+}
+
+#[derive(Debug, Subcommand)]
+enum TraceCommand {
+    /// Append one fact/narration record.
+    Append {
+        kind: String,
+        fact_json: String,
+        narration_json: String,
+    },
+    /// Read facts while structurally omitting narration.
+    Read,
+    /// Read the principal-facing narration projection.
+    ReadNarration,
+}
+
+#[derive(Debug, Subcommand)]
+enum LeaseCommand {
+    /// Acquire the configured named lease.
+    Acquire {
+        owner: String,
+        ttl_seconds: Option<String>,
+    },
+    /// Release the configured named lease if the owner matches.
+    Release { owner: String },
+    /// Print the configured named lease.
+    Status,
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkOrderCommand {
+    /// Create or replace the durable order for one candidate.
+    Create { candidate_json_file: PathBuf },
+    /// Validate an existing schema-version 1 order.
+    Validate { work_order_file: PathBuf },
+    /// Hash an exact item identifier.
+    ItemHash { item_id: String },
+    /// Derive the branch name for an exact item identifier.
+    BranchName { item_id: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -215,13 +279,76 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(output.exit_code);
             }
         }
-        Command::Queue {
-            command: QueueCommand::List { format },
-        } => match format {
-            OutputFormat::Json => {
-                io::stdout().write_all(&list_queue_json(&paths.queue_file())?)?;
+        Command::Queue { command } => match command {
+            QueueCommand::List { format } => match format {
+                OutputFormat::Json => match list_queue_json(&paths.queue_file()) {
+                    Ok(output) => io::stdout().write_all(&output)?,
+                    Err(_) => exit_message(
+                        &format!(
+                            "mandate queue: cannot read {}",
+                            paths.queue_file().display()
+                        ),
+                        2,
+                    ),
+                },
+            },
+            QueueCommand::Lint => match lint_queue_state(&paths.sweep_state_file()) {
+                Ok(output) => io::stdout().write_all(&output)?,
+                Err(error) => exit_message(&error.to_string(), error.exit_code()),
+            },
+            QueueCommand::Approve { id } => {
+                run_queue_decision(&paths, &id, QueueDecision::Approve)?
+            }
+            QueueCommand::Reject { id } => run_queue_decision(&paths, &id, QueueDecision::Reject)?,
+            QueueCommand::Defer { id } => run_queue_decision(&paths, &id, QueueDecision::Defer)?,
+        },
+        Command::Trace { command } => match command {
+            TraceCommand::Append {
+                kind,
+                fact_json,
+                narration_json,
+            } => {
+                if kind.is_empty() {
+                    exit_message("mandate trace: kind must not be empty", 2);
+                }
+                let fact = parse_json_object(&fact_json).unwrap_or_else(|| {
+                    exit_message("mandate trace: fact-json must be a JSON object", 2)
+                });
+                let narration = parse_json_object(&narration_json).unwrap_or_else(|| {
+                    exit_message("mandate trace: narration-json must be a JSON object", 2)
+                });
+                let timestamp = env::var("MANDATE_TRACE_TIME")
+                    .ok()
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| {
+                        DateTime::<Utc>::from(SystemTime::now())
+                            .format("%Y-%m-%dT%H:%M:%SZ")
+                            .to_string()
+                    });
+                let record = TraceAppend {
+                    ts: timestamp,
+                    kind,
+                    fact,
+                    narration,
+                };
+                match append_trace_checked(&paths.trace_file(), &paths.work_orders_dir(), &record) {
+                    Ok(output) => io::stdout().write_all(&output)?,
+                    Err(error) => exit_message(&error.to_string(), error.exit_code()),
+                }
+            }
+            TraceCommand::Read => match read_trace_json(&paths.trace_file(), TraceView::Facts) {
+                Ok(output) => io::stdout().write_all(&output)?,
+                Err(error) => exit_message(&error.to_string(), error.exit_code()),
+            },
+            TraceCommand::ReadNarration => {
+                match read_trace_json(&paths.trace_file(), TraceView::Narration) {
+                    Ok(output) => io::stdout().write_all(&output)?,
+                    Err(error) => exit_message(&error.to_string(), error.exit_code()),
+                }
             }
         },
+        Command::Lease { command } => run_lease_command(&paths, command)?,
+        Command::WorkOrder { command } => run_work_order_command(&paths, command)?,
         Command::Migrate => {
             let legacy = legacy_home()?;
             let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
@@ -425,6 +552,175 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+fn run_queue_decision(
+    paths: &OstromPaths,
+    id: &str,
+    decision: QueueDecision,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let event_time = env::var("MANDATE_EVENT_TIME")
+        .ok()
+        .filter(|value| !value.is_empty());
+    match decide_queue_item(
+        &paths.queue_file(),
+        &paths.sweep_state_file(),
+        &paths.selector_events_file(),
+        id,
+        decision,
+        event_time.as_deref(),
+    ) {
+        Ok(output) => io::stdout().write_all(&output)?,
+        Err(error) => exit_message(&error.to_string(), error.exit_code()),
+    }
+    Ok(())
+}
+
+fn parse_json_object(text: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()?
+        .as_object()
+        .cloned()
+}
+
+fn run_lease_command(
+    paths: &OstromPaths,
+    command: LeaseCommand,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let name = env::var("MANDATE_LEASE_NAME")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "sprint.lease".to_owned());
+    if let Err(error) = validate_lease_name(&name) {
+        exit_message(&error.to_string(), error.exit_code());
+    }
+    match command {
+        LeaseCommand::Acquire { owner, ttl_seconds } => {
+            if owner.is_empty() {
+                lease_usage();
+            }
+            let ttl = ttl_seconds
+                .or_else(|| {
+                    env::var("MANDATE_LEASE_TTL_SECONDS")
+                        .ok()
+                        .filter(|value| !value.is_empty())
+                })
+                .unwrap_or_else(|| "3600".to_owned());
+            let ttl = parse_decimal_u64(&ttl)
+                .filter(|value| *value > 0)
+                .unwrap_or_else(|| {
+                    exit_message("mandate lease: ttl-seconds must be a positive integer", 2)
+                });
+            let now_text = env::var("MANDATE_LEASE_NOW_EPOCH")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| {
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map_or(0, |duration| duration.as_secs())
+                        .to_string()
+                });
+            let now = parse_decimal_u64(&now_text).unwrap_or_else(|| {
+                exit_message("mandate lease: current time must be Unix seconds", 2)
+            });
+            match acquire_lease(&paths.state, &name, &owner, now, ttl) {
+                Ok(output) => io::stdout().write_all(&output)?,
+                Err(error) => exit_message(&error.to_string(), error.exit_code()),
+            }
+        }
+        LeaseCommand::Release { owner } => {
+            if owner.is_empty() {
+                lease_usage();
+            }
+            if let Err(error) = release_lease(&paths.state, &name, &owner) {
+                exit_message(&error.to_string(), error.exit_code());
+            }
+        }
+        LeaseCommand::Status => match lease_status(&paths.state, &name) {
+            Ok(output) => io::stdout().write_all(&output)?,
+            Err(error) => exit_message(&error.to_string(), error.exit_code()),
+        },
+    }
+    Ok(())
+}
+
+fn parse_decimal_u64(value: &str) -> Option<u64> {
+    (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| value.parse().ok())
+        .flatten()
+}
+
+fn lease_usage() -> ! {
+    exit_message(
+        "usage: [MANDATE_LEASE_NAME=<name>] lease.sh acquire <owner> [ttl-seconds] | release <owner> | status",
+        2,
+    )
+}
+
+fn run_work_order_command(
+    paths: &OstromPaths,
+    command: WorkOrderCommand,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        WorkOrderCommand::Create {
+            candidate_json_file,
+        } => {
+            let created_at = env::var("MANDATE_TRACE_TIME")
+                .ok()
+                .filter(|value| !value.is_empty());
+            let cost = env::var("MANDATE_ORDER_COST_CEILING_USD")
+                .ok()
+                .filter(|value| !value.is_empty());
+            let tokens = env::var("MANDATE_ORDER_TOKEN_CEILING")
+                .ok()
+                .filter(|value| !value.is_empty());
+            match create_work_order(
+                &paths.state,
+                &candidate_json_file,
+                created_at.as_deref(),
+                cost.as_deref(),
+                tokens.as_deref(),
+            ) {
+                Ok(created) => {
+                    if let Some(warning) = created.branch_warning {
+                        eprintln!("{warning}");
+                    }
+                    println!("{}", created.target.display());
+                }
+                Err(error) => exit_message(&error.to_string(), error.exit_code()),
+            }
+        }
+        WorkOrderCommand::Validate { work_order_file } => {
+            if let Err(error) = validate_work_order_file(&work_order_file) {
+                exit_message(&error.to_string(), error.exit_code());
+            }
+        }
+        WorkOrderCommand::ItemHash { item_id } => {
+            if item_id.is_empty() {
+                work_order_usage();
+            }
+            println!("{}", item_hash(&item_id));
+        }
+        WorkOrderCommand::BranchName { item_id } => {
+            if item_id.is_empty() {
+                work_order_usage();
+            }
+            println!("{}", branch_name(&item_id));
+        }
+    }
+    Ok(())
+}
+
+fn work_order_usage() -> ! {
+    exit_message(
+        "usage: work-order.sh create <candidate-json-file> | validate <work-order-file> | item-hash <item-id> | branch-name <item-id>",
+        2,
+    )
+}
+
+fn exit_message(message: &str, code: i32) -> ! {
+    eprintln!("{message}");
+    std::process::exit(code);
 }
 
 fn environment_time(name: &str) -> Result<DateTime<Utc>, String> {

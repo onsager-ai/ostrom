@@ -13,7 +13,7 @@
 #   2. A per-selector table: how many currently-open items each selector is
 #      responsible for classifying (from the last sweep's state), and how
 #      many of the rows it produced a human dismissed via `/ostrom:desk` reject
-#      (from selector-events.jsonl, appended by queue.sh). Dismissals
+#      (from selector-events.jsonl, appended by ostrom queue). Dismissals
 #      attributed to no selector at all (the project default fired instead)
 #      are counted separately, not folded into any selector's row.
 #
