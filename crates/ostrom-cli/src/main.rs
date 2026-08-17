@@ -276,7 +276,7 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    let paths = OstromPaths::resolve()?;
+    let paths = compatible_command_paths();
     match cli.command {
         Command::Pass { role } => supervise(&["__pass-worker".into(), role_name(role).into()]),
         Command::Implement {
@@ -336,16 +336,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Queue { command } => match command {
             QueueCommand::List { format } => match format {
-                OutputFormat::Json => match list_queue_json(&paths.queue_file()) {
-                    Ok(output) => io::stdout().write_all(&output)?,
-                    Err(_) => exit_message(
-                        &format!(
-                            "mandate queue: cannot read {}",
-                            paths.queue_file().display()
+                OutputFormat::Json => {
+                    if let Err(message) = state_root_present(&paths) {
+                        exit_message(&message, 2);
+                    }
+                    match list_queue_json(&paths.queue_file()) {
+                        Ok(output) => io::stdout().write_all(&output)?,
+                        Err(_) => exit_message(
+                            &format!(
+                                "mandate queue: cannot read {}",
+                                paths.queue_file().display()
+                            ),
+                            2,
                         ),
-                        2,
-                    ),
-                },
+                    }
+                }
             },
             QueueCommand::Lint => match lint_queue_state(&paths.sweep_state_file()) {
                 Ok(output) => io::stdout().write_all(&output)?,
@@ -1019,20 +1024,59 @@ fn run_select_work(arguments: Vec<String>) -> ! {
     }
 }
 
+/// Resolve the state root the way the shell did, for every command.
+///
+/// The store's own resolver deliberately refuses to fall through to an
+/// operator's home when `OSTROM_HOME` is unset, so a test with an incomplete
+/// fixture cannot read live data. That guarantee belongs in the store. It also
+/// means the store alone cannot find the roster of an operator who has not run
+/// `ostrom migrate` — which is every operator today, since the shell wrote to
+/// `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/ostrom` and nothing has moved it.
+///
+/// Resolving that legacy root belongs here, in the layer the operator invokes,
+/// and only when the directory actually exists so a fresh install still lands
+/// on XDG.
 fn compatible_command_paths() -> OstromPaths {
     if env::var_os("OSTROM_HOME").is_some_and(|home| !home.to_string_lossy().trim().is_empty()) {
-        return OstromPaths::resolve().unwrap_or_else(|error| {
-            eprintln!("ostrom: {error}");
-            std::process::exit(1);
-        });
+        return resolved_or_exit();
     }
     if let Some(config) = env::var_os("CLAUDE_CONFIG_DIR") {
-        let root = PathBuf::from(config).join("ostrom");
-        return OstromPaths {
-            config: root.clone(),
-            state: root,
-        };
+        return collapsed_root(PathBuf::from(config).join("ostrom"));
     }
+    if let Some(base) = BaseDirs::new() {
+        let legacy = base.home_dir().join(".claude/ostrom");
+        if legacy.is_dir() {
+            return collapsed_root(legacy);
+        }
+    }
+    resolved_or_exit()
+}
+
+/// Refuse to report an empty queue from a state root that does not exist.
+///
+/// A missing root and an empty queue render identically — no rows, exit zero —
+/// and the two mean opposite things. `ostrom queue list` read the wrong root
+/// against a live 130-row queue and reported nothing at all, which is the same
+/// failure `select-work.sh` had in production: a broken read that looks like a
+/// quiet portfolio. Naming the directory it looked in is the whole fix.
+fn state_root_present(paths: &OstromPaths) -> Result<(), String> {
+    if paths.state.is_dir() {
+        return Ok(());
+    }
+    Err(format!(
+        "mandate queue: no Ostrom state root at {}; run a sweep, or set OSTROM_HOME or CLAUDE_CONFIG_DIR",
+        paths.state.display()
+    ))
+}
+
+fn collapsed_root(root: PathBuf) -> OstromPaths {
+    OstromPaths {
+        config: root.clone(),
+        state: root,
+    }
+}
+
+fn resolved_or_exit() -> OstromPaths {
     OstromPaths::resolve().unwrap_or_else(|error| {
         eprintln!("ostrom: {error}");
         std::process::exit(1);
