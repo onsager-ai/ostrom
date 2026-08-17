@@ -531,11 +531,8 @@ projects:
         .ancestors()
         .nth(2)
         .expect("workspace root");
-    let output = Command::new("bash")
-        .args([
-            root.join("plugins/ostrom/scripts/select-work.sh"),
-            "list".into(),
-        ])
+    let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .args(["select-work", "list"])
         .env("CLAUDE_CONFIG_DIR", fixture.path())
         .env("CLAUDE_PLUGIN_ROOT", root.join("plugins/ostrom"))
         .current_dir(fixture.path())

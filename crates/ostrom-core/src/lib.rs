@@ -12,6 +12,7 @@
 //! version bump and migration notes.
 
 mod check;
+mod dispatch;
 mod domain;
 mod plan;
 mod store;
@@ -26,7 +27,11 @@ pub use check::{
     CheckState, CheckVerdict, DefinitionDigest, Evidence, EvidenceBundleItem, EvidenceReference,
     FreshnessError, JudgeStamp, JudgmentClause, JudgmentInput, JudgmentRunnerStamp, RESULT_VERSION,
     RecordedOutput, ResolvedCheck, RunnerStamp, agent_parameters, receipt_digest, resolve_check,
-    resolve_fresh_for, select_check,
+    resolve_fresh_for, select_check, sha256_hex,
+};
+pub use dispatch::{
+    BranchListing, BranchListingFault, BranchListingOutcome, RemoteBranch, WorkOrder,
+    WorkOrderError, resolve_exact_branch,
 };
 pub use domain::{
     ConfigError, DefaultDisposition, GateConfig, GateProject, Mandate, MandateConfig,

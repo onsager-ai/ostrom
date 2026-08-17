@@ -10,7 +10,7 @@ set -Eeuo pipefail
 PLUGIN_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OSTROM_BIN="${OSTROM_BIN:-$PLUGIN_ROOT/../../target/debug/ostrom}"
 [ -x "$OSTROM_BIN" ] || {
-  echo "mandate tests: ostrom binary is required at $OSTROM_BIN" >&2
+  echo "mandate tests: ostrom binary is missing at $OSTROM_BIN; build ostrom-cli first" >&2
   exit 1
 }
 export MANDATE_SWEEP_TIME="2026-08-01T00:00:00Z"
@@ -268,7 +268,7 @@ jq -n --slurpfile queue "$selection_data/queue.jsonl" '
 (
   cd "$selection_fixture/repo"
   CLAUDE_CONFIG_DIR="$OSTROM_HOME" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-    bash "$PLUGIN_ROOT/scripts/select-work.sh" list
+    "$OSTROM_BIN" select-work list
 ) >"$selection_fixture/no-ranking.jsonl"
 jq -s -e 'map(.id) == [
   "example-org/ranking-repo#3",
@@ -294,7 +294,7 @@ mv "$selection_data/state.next" "$selection_data/state.json"
 (
   cd "$selection_fixture/repo"
   CLAUDE_CONFIG_DIR="$selection_fixture/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-    bash "$PLUGIN_ROOT/scripts/select-work.sh" list
+    "$OSTROM_BIN" select-work list
 ) >"$selection_fixture/blocker-closed.jsonl"
 jq -s -e '
   any(.[]; .id == "example-org/ranking-repo#20")
@@ -340,7 +340,7 @@ mv "$selection_data/state.next" "$selection_data/state.json"
 (
   cd "$selection_fixture/repo"
   CLAUDE_CONFIG_DIR="$OSTROM_HOME" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-    bash "$PLUGIN_ROOT/scripts/select-work.sh" list
+    "$OSTROM_BIN" select-work list
 ) >"$selection_fixture/ranked.jsonl"
 jq -s -e '
   map(.id) == [
@@ -362,12 +362,12 @@ jq -s -e '
 (
   cd "$selection_fixture/repo"
   CLAUDE_CONFIG_DIR="$OSTROM_HOME" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-    bash "$PLUGIN_ROOT/scripts/select-work.sh" select builder-ranking-wake1
+    "$OSTROM_BIN" select-work select builder-ranking-wake1
 ) >"$selection_fixture/selected-ranked.json"
 (
   cd "$selection_fixture/repo"
   CLAUDE_CONFIG_DIR="$OSTROM_HOME" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-    bash "$PLUGIN_ROOT/scripts/select-work.sh" select builder-ranking-wake1 \
+    "$OSTROM_BIN" select-work select builder-ranking-wake1 \
       example-org/ranking-repo#2
 ) >"$selection_fixture/selected-unblocker.json"
 jq -c 'select(.id == "example-org/ranking-repo#2")' \
@@ -440,13 +440,13 @@ jq -n \
 (
   cd "$selection_fixture/repo"
   CLAUDE_CONFIG_DIR="$OSTROM_HOME" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-    bash "$PLUGIN_ROOT/scripts/select-work.sh" list
+    "$OSTROM_BIN" select-work list
 ) >"$selection_fixture/rejected-plan.jsonl" 2>/dev/null
 cmp "$selection_fixture/ranked.jsonl" "$selection_fixture/rejected-plan.jsonl"
 (
   cd "$selection_fixture/repo"
   CLAUDE_CONFIG_DIR="$OSTROM_HOME" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-    bash "$PLUGIN_ROOT/scripts/select-work.sh" select builder-ranking-wake2 \
+    "$OSTROM_BIN" select-work select builder-ranking-wake2 \
       example-org/ranking-repo#2
 ) >"$selection_fixture/selected-rejected-plan.json" \
   2>"$selection_fixture/selected-rejected-plan.err"
@@ -478,7 +478,7 @@ jq -n \
 (
   cd "$selection_fixture/repo"
   CLAUDE_CONFIG_DIR="$OSTROM_HOME" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-    bash "$PLUGIN_ROOT/scripts/select-work.sh" list
+    "$OSTROM_BIN" select-work list
 ) >"$selection_fixture/accepted-plan.jsonl"
 jq -nc --slurpfile rows "$selection_data/queue.jsonl" \
   --argjson ids '["example-org/ranking-repo#2","example-org/ranking-repo#4","example-org/ranking-repo#3","example-org/ranking-repo#1"]' '
@@ -489,7 +489,7 @@ cmp "$selection_fixture/expected-accepted-plan.jsonl" \
 (
   cd "$selection_fixture/repo"
   CLAUDE_CONFIG_DIR="$OSTROM_HOME" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-    bash "$PLUGIN_ROOT/scripts/select-work.sh" select builder-ranking-wake3 \
+    "$OSTROM_BIN" select-work select builder-ranking-wake3 \
       example-org/ranking-repo#2
 ) >"$selection_fixture/selected-accepted-plan.json"
 jq -c 'select(.id == "example-org/ranking-repo#4")' \
@@ -536,7 +536,7 @@ set +e
 (
   cd "$selection_fixture/repo"
   CLAUDE_CONFIG_DIR="$OSTROM_HOME" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-    bash "$PLUGIN_ROOT/scripts/select-work.sh" list
+    "$OSTROM_BIN" select-work list
 ) >"$selection_fixture/stale.out" 2>"$selection_fixture/stale.err"
 stale_selection_status=$?
 set -e
@@ -1826,7 +1826,7 @@ FAKE_GH_CALLS="$empty_source_gh_calls" \
   CODEX_BIN="$fake_dispatch_codex" \
   FAKE_SYSTEMD_ARGS="$dispatch_args" \
   FAKE_SYSTEMD_CALLS="$empty_source_systemd_calls" \
-  bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$dispatch_order" \
+  "$OSTROM_BIN" dispatch "$dispatch_order" \
     >/dev/null 2>"$empty_source_stderr"
 empty_source_status=$?
 set -e
@@ -1876,7 +1876,7 @@ FAKE_GH_CALLS="$missing_source_gh_calls" \
   CODEX_BIN="$fake_dispatch_codex" \
   FAKE_SYSTEMD_ARGS="$dispatch_args" \
   FAKE_SYSTEMD_CALLS="$missing_source_systemd_calls" \
-  bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$dispatch_order" \
+  "$OSTROM_BIN" dispatch "$dispatch_order" \
     >/dev/null 2>"$missing_source_stderr"
 missing_source_status=$?
 set -e
@@ -1920,7 +1920,7 @@ FAKE_REMOTE_BRANCH_NAME="$dispatch_branch" \
   MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
   CODEX_BIN="$fake_dispatch_codex" \
   FAKE_SYSTEMD_ARGS="$dispatch_args" FAKE_SYSTEMD_CALLS="$dispatch_calls" \
-  bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$dispatch_order" \
+  "$OSTROM_BIN" dispatch "$dispatch_order" \
     >"$dispatch_fixture/branch-guard.out" 2>"$branch_guard_stderr"
 branch_guard_status=$?
 set -e
@@ -1999,7 +1999,7 @@ FAKE_REMOTE_MULTIPAGE=1 FAKE_REMOTE_BRANCH_NAME="$dispatch_branch" \
   MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
   CODEX_BIN="$fake_dispatch_codex" \
   FAKE_SYSTEMD_ARGS="$dispatch_args" FAKE_SYSTEMD_CALLS="$dispatch_calls" \
-  bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$dispatch_order" \
+  "$OSTROM_BIN" dispatch "$dispatch_order" \
     >/dev/null 2>"$multi_page_branch_stderr"
 multi_page_branch_status=$?
 set -e
@@ -2045,7 +2045,7 @@ merged_branch_unit="$(
     CODEX_BIN="$fake_dispatch_codex" \
     FAKE_SYSTEMD_ARGS="$merged_branch_systemd_args" \
     FAKE_SYSTEMD_CALLS="$merged_branch_systemd_calls" \
-    bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$dispatch_order"
+    "$OSTROM_BIN" dispatch "$dispatch_order"
 )"
 if [ "$merged_branch_unit" != 'ostrom-implementer-9bb890b1b3b47926' ]; then
   echo "merged branch did not proceed through dispatch" >&2
@@ -2101,7 +2101,7 @@ for branch_pr_case in open closed-unmerged; do
     MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
     CODEX_BIN="$fake_dispatch_codex" \
     FAKE_SYSTEMD_ARGS="$dispatch_args" FAKE_SYSTEMD_CALLS="$dispatch_calls" \
-    bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$dispatch_order" \
+    "$OSTROM_BIN" dispatch "$dispatch_order" \
       >/dev/null 2>"$branch_pr_case_stderr"
   branch_pr_case_status=$?
   set -e
@@ -2135,7 +2135,7 @@ FAKE_REMOTE_BRANCH_NAME="$dispatch_branch" \
   MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
   CODEX_BIN="$fake_dispatch_codex" \
   FAKE_SYSTEMD_ARGS="$dispatch_args" FAKE_SYSTEMD_CALLS="$dispatch_calls" \
-  bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$dispatch_order" \
+  "$OSTROM_BIN" dispatch "$dispatch_order" \
     >/dev/null 2>"$branch_pr_query_failure_stderr"
 branch_pr_query_failure_status=$?
 set -e
@@ -2180,7 +2180,7 @@ numbered_branch_unit="$({
     CODEX_BIN="$fake_dispatch_codex" \
     FAKE_SYSTEMD_ARGS="$numbered_branch_args" \
     FAKE_SYSTEMD_CALLS="$numbered_branch_calls" \
-    bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$numbered_branch_order"
+    "$OSTROM_BIN" dispatch "$numbered_branch_order"
 } 2>/dev/null)"
 [ -n "$numbered_branch_unit" ]
 [ "$(wc -l <"$numbered_branch_calls" | tr -d '[:space:]')" -eq 1 ]
@@ -2220,7 +2220,7 @@ part_of_unit="$({
     CODEX_BIN="$fake_dispatch_codex" \
     FAKE_SYSTEMD_ARGS="$part_of_args" \
     FAKE_SYSTEMD_CALLS="$part_of_calls" \
-    bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$part_of_order"
+    "$OSTROM_BIN" dispatch "$part_of_order"
 } 2>/dev/null)"
 [ -n "$part_of_unit" ]
 [ "$(wc -l <"$part_of_calls" | tr -d '[:space:]')" -eq 1 ]
@@ -2253,7 +2253,7 @@ for closing_pr_state in OPEN MERGED; do
     MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
     CODEX_BIN="$fake_dispatch_codex" \
     FAKE_SYSTEMD_ARGS="$dispatch_args" FAKE_SYSTEMD_CALLS="$dispatch_calls" \
-    bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$dispatch_order" \
+    "$OSTROM_BIN" dispatch "$dispatch_order" \
       >/dev/null 2>"$closing_pr_stderr"
   closing_pr_status=$?
   set -e
@@ -2288,7 +2288,7 @@ FAKE_REMOTE_QUERY_FAIL=1 CLAUDE_CONFIG_DIR="$branch_query_failure_config" \
   MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
   CODEX_BIN="$fake_dispatch_codex" \
   FAKE_SYSTEMD_ARGS="$dispatch_args" FAKE_SYSTEMD_CALLS="$dispatch_calls" \
-  bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$dispatch_order" \
+  "$OSTROM_BIN" dispatch "$dispatch_order" \
     >/dev/null 2>"$branch_query_failure_stderr"
 branch_query_failure_status=$?
 set -e
@@ -2333,7 +2333,7 @@ FAKE_REMOTE_MULTIPAGE=1 FAKE_REMOTE_QUERY_FAIL_PAGE=2 \
   MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
   CODEX_BIN="$fake_dispatch_codex" \
   FAKE_SYSTEMD_ARGS="$dispatch_args" FAKE_SYSTEMD_CALLS="$dispatch_calls" \
-  bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$dispatch_order" \
+  "$OSTROM_BIN" dispatch "$dispatch_order" \
     >/dev/null 2>"$truncated_branch_stderr"
 truncated_branch_status=$?
 set -e
@@ -2362,7 +2362,7 @@ FAKE_REMOTE_MALFORMED_PAGE=1 CLAUDE_CONFIG_DIR="$malformed_branch_config" \
   MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
   CODEX_BIN="$fake_dispatch_codex" \
   FAKE_SYSTEMD_ARGS="$dispatch_args" FAKE_SYSTEMD_CALLS="$dispatch_calls" \
-  bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$dispatch_order" \
+  "$OSTROM_BIN" dispatch "$dispatch_order" \
     >/dev/null 2>"$malformed_branch_stderr"
 malformed_branch_status=$?
 set -e
@@ -2386,7 +2386,7 @@ dispatch_unit="$(
     FAKE_GH_CALLS="$clean_dispatch_gh_calls" \
     FAKE_SYSTEMD_ARGS="$dispatch_args" \
     FAKE_SYSTEMD_CALLS="$dispatch_calls" \
-    bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$dispatch_order"
+    "$OSTROM_BIN" dispatch "$dispatch_order"
 )"
 if [ "$(grep -Fc 'builder example-org/example-repo --repositories example-org/example-repo --permissions metadata:read,contents:read -- gh api repos/example-org/example-repo/branches?per_page=100&page=1' "$clean_dispatch_gh_calls")" -ne 1 ]; then
   echo "clean dispatch did not perform the remote branch preflight" >&2
@@ -2429,7 +2429,7 @@ CLAUDE_CONFIG_DIR="$dispatch_config" \
   MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
   CODEX_BIN="$fake_dispatch_codex" \
   FAKE_SYSTEMD_ARGS="$dispatch_args" FAKE_SYSTEMD_CALLS="$dispatch_calls" \
-  bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$dispatch_order" >/dev/null 2>&1
+  "$OSTROM_BIN" dispatch "$dispatch_order" >/dev/null 2>&1
 live_lease_dispatch_status=$?
 set -e
 [ "$live_lease_dispatch_status" -eq 3 ]
@@ -2444,7 +2444,7 @@ CLAUDE_CONFIG_DIR="$dispatch_config" \
   MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
   CODEX_BIN="$fake_dispatch_codex" \
   FAKE_SYSTEMD_ARGS="$dispatch_args" FAKE_SYSTEMD_CALLS="$dispatch_calls" \
-  bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$dispatch_order" >/dev/null 2>&1
+  "$OSTROM_BIN" dispatch "$dispatch_order" >/dev/null 2>&1
 inflight_dispatch_status=$?
 set -e
 [ "$inflight_dispatch_status" -eq 3 ]
@@ -2467,7 +2467,7 @@ FAKE_OPEN_PR=1 CLAUDE_CONFIG_DIR="$dispatch_config" \
   MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
   CODEX_BIN="$fake_dispatch_codex" \
   FAKE_SYSTEMD_ARGS="$dispatch_args" FAKE_SYSTEMD_CALLS="$dispatch_calls" \
-  bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$dispatch_order" >/dev/null 2>&1
+  "$OSTROM_BIN" dispatch "$dispatch_order" >/dev/null 2>&1
 open_pr_dispatch_status=$?
 set -e
 [ "$open_pr_dispatch_status" -eq 3 ]
@@ -2499,7 +2499,7 @@ CLAUDE_CONFIG_DIR="$concurrency_config" \
   MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
   CODEX_BIN="$fake_dispatch_codex" \
   FAKE_SYSTEMD_ARGS="$dispatch_args" FAKE_SYSTEMD_CALLS="$dispatch_calls" \
-  bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$concurrency_order" \
+  "$OSTROM_BIN" dispatch "$concurrency_order" \
     >/dev/null 2>"$concurrency_stderr"
 concurrency_dispatch_status=$?
 set -e
@@ -2525,7 +2525,7 @@ for invalid_global_limit in 0 not-an-integer; do
     MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
     CODEX_BIN="$fake_dispatch_codex" \
     FAKE_SYSTEMD_ARGS="$dispatch_args" FAKE_SYSTEMD_CALLS="$dispatch_calls" \
-    bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$concurrency_order" \
+    "$OSTROM_BIN" dispatch "$concurrency_order" \
       >/dev/null 2>"$dispatch_fixture/invalid-global-$invalid_global_limit.err"
   invalid_global_status=$?
   set -e
@@ -2551,7 +2551,7 @@ CLAUDE_CONFIG_DIR="$repository_default_config" \
   CODEX_BIN="$fake_dispatch_codex" \
   FAKE_SYSTEMD_ARGS="$dispatch_fixture/repository-default-systemd-args" \
   FAKE_SYSTEMD_CALLS="$dispatch_fixture/repository-default-systemd-calls" \
-  bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$concurrency_order" \
+  "$OSTROM_BIN" dispatch "$concurrency_order" \
     >/dev/null 2>"$repository_default_stderr"
 repository_default_status=$?
 set -e
@@ -2583,7 +2583,7 @@ different_repository_unit="$(
     CODEX_BIN="$fake_dispatch_codex" \
     FAKE_SYSTEMD_ARGS="$dispatch_fixture/different-repository-systemd-args" \
     FAKE_SYSTEMD_CALLS="$dispatch_fixture/different-repository-systemd-calls" \
-    bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$concurrency_order"
+    "$OSTROM_BIN" dispatch "$concurrency_order"
 )"
 [ "$different_repository_unit" = "ostrom-implementer-${concurrency_item_hash:0:16}" ]
 [ "$(wc -l <"$dispatch_fixture/different-repository-systemd-calls" | tr -d '[:space:]')" -eq 1 ]
@@ -2608,7 +2608,7 @@ environment_override_unit="$(
     CODEX_BIN="$fake_dispatch_codex" \
     FAKE_SYSTEMD_ARGS="$dispatch_fixture/environment-override-systemd-args" \
     FAKE_SYSTEMD_CALLS="$dispatch_fixture/environment-override-systemd-calls" \
-    bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$concurrency_order"
+    "$OSTROM_BIN" dispatch "$concurrency_order"
 )"
 [ "$environment_override_unit" = "ostrom-implementer-${concurrency_item_hash:0:16}" ]
 [ "$(wc -l <"$dispatch_fixture/environment-override-systemd-calls" | tr -d '[:space:]')" -eq 1 ]
@@ -2642,7 +2642,7 @@ project_override_unit="$(
     CODEX_BIN="$fake_dispatch_codex" \
     FAKE_SYSTEMD_ARGS="$dispatch_fixture/project-override-systemd-args" \
     FAKE_SYSTEMD_CALLS="$dispatch_fixture/project-override-systemd-calls" \
-    bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$concurrency_order"
+    "$OSTROM_BIN" dispatch "$concurrency_order"
 )"
 [ "$project_override_unit" = "ostrom-implementer-${concurrency_item_hash:0:16}" ]
 [ "$(wc -l <"$dispatch_fixture/project-override-systemd-calls" | tr -d '[:space:]')" -eq 1 ]
@@ -2671,7 +2671,7 @@ CLAUDE_CONFIG_DIR="$dispatch_config" \
   MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" \
   CODEX_BIN="$fake_dispatch_codex" \
   FAKE_SYSTEMD_ARGS="$dispatch_args" FAKE_SYSTEMD_CALLS="$dispatch_calls" \
-  bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$cap_dispatch_order" >/dev/null 2>&1
+  "$OSTROM_BIN" dispatch "$cap_dispatch_order" >/dev/null 2>&1
 cap_dispatch_status=$?
 set -e
 [ "$cap_dispatch_status" -eq 3 ]
@@ -3223,7 +3223,7 @@ CLAUDE_CONFIG_DIR="$dirty_config" MANDATE_GH_AS_BIN="$fake_dispatch_gh" \
   MANDATE_MAX_IMPLEMENTERS=1 MANDATE_DAILY_CAP_USD=1 \
   FAKE_SYSTEMD_ARGS="$implement_fixture/dirty-systemd-args" \
   FAKE_SYSTEMD_CALLS="$implement_fixture/dirty-systemd-calls" \
-  bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$dirty_order" \
+  "$OSTROM_BIN" dispatch "$dirty_order" \
     >"$implement_fixture/dirty.out" 2>"$implement_fixture/dirty.err"
 dirty_status=$?
 set -e
@@ -3269,7 +3269,7 @@ CLAUDE_CONFIG_DIR="$ahead_config" MANDATE_GH_AS_BIN="$fake_dispatch_gh" \
   MANDATE_SYSTEMD_RUN_BIN="$fake_systemd_run" CODEX_BIN="$fake_dispatch_codex" \
   FAKE_SYSTEMD_ARGS="$implement_fixture/ahead-systemd-args" \
   FAKE_SYSTEMD_CALLS="$implement_fixture/ahead-systemd-calls" \
-  bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$ahead_order" >/dev/null 2>&1
+  "$OSTROM_BIN" dispatch "$ahead_order" >/dev/null 2>&1
 ahead_status=$?
 set -e
 [ "$ahead_status" -eq 3 ]
@@ -4046,7 +4046,7 @@ nvm_dispatch_unit="$(
     FAKE_PR_BODY="$implement_fixture/nvm-pr-body" \
     FAKE_SYSTEMD_ARGS="$nvm_dispatch_args" \
     FAKE_CODEX_CALLS="$nvm_codex_calls" \
-    bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$nvm_dispatch_order"
+    "$OSTROM_BIN" dispatch "$nvm_dispatch_order"
 )"
 [ -n "$nvm_dispatch_unit" ]
 grep -qx 'exec' "$nvm_codex_calls"
@@ -4085,7 +4085,7 @@ HOME="$implement_fixture/missing-home" \
   MANDATE_SYSTEMD_RUN_BIN="$fake_running_systemd" \
   MANDATE_IMPLEMENTER_SOURCE_REPO="$implement_source" \
   FAKE_SYSTEMD_ARGS="$implement_fixture/missing-systemd-args" \
-  bash "$PLUGIN_ROOT/scripts/dispatch.sh" "$missing_dispatch_order" \
+  "$OSTROM_BIN" dispatch "$missing_dispatch_order" \
     >"$implement_fixture/missing.out" 2>"$implement_fixture/missing.err"
 missing_dispatch_status=$?
 set -e
@@ -4148,7 +4148,7 @@ if grep -q 'send a bounded, single-concern change to a subagent' "$work_skill"; 
   exit 1
 fi
 grep -q 'scripts/work-order.sh' "$work_skill"
-grep -q 'scripts/dispatch.sh' "$work_skill"
+grep -q 'ostrom dispatch' "$work_skill"
 grep -Fq 'order_id="$(jq -r '\''.order_id'\'' "$order_file")"' "$work_skill"
 grep -q 'filename.*stem is `item_hash`' "$work_skill"
 if grep -q 'documented Claude implementer fallback' "$work_skill"; then
