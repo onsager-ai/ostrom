@@ -1,0 +1,3 @@
+LOCAL DRIFT
+LIMIT: git cherry is patch-id based: it catches rebases but not squash merges; squash-merged work can appear unpublished. Counts are raw_commits / patches_not_in_main; review before deleting.
+unknown	root=placeholder-missing-root	reason=search-root-unreadable

@@ -3,6 +3,7 @@
 mod check_store;
 mod file_store;
 mod lease;
+mod leaves;
 mod migration;
 mod pass_state;
 mod paths;
@@ -14,6 +15,10 @@ mod trace;
 pub use check_store::JsonlCheckStore;
 pub use file_store::JsonlSweepStore;
 pub use lease::{LeaseRecord, read_lease, write_lease};
+pub use leaves::{
+    AuditError, AuditOptions, ExcuseError, LocalDriftError, audit, grant_excuse, list_excuses,
+    local_drift,
+};
 pub use migration::{MigrationOutcome, migrate};
 pub use pass_state::{PassState, read_pass_state, write_pass_state};
 pub use paths::OstromPaths;

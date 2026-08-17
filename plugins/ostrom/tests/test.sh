@@ -8,6 +8,11 @@
 set -Eeuo pipefail
 
 PLUGIN_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+OSTROM_BIN="${OSTROM_BIN:-$PLUGIN_ROOT/../../target/debug/ostrom}"
+[ -x "$OSTROM_BIN" ] || {
+  echo "mandate tests: ostrom binary is required at $OSTROM_BIN" >&2
+  exit 1
+}
 export MANDATE_SWEEP_TIME="2026-08-01T00:00:00Z"
 export MANDATE_TODAY="2026-08-01"
 export MANDATE_NOW_EPOCH="1785542400"
@@ -22,7 +27,7 @@ unset MANDATE_MAX_IMPLEMENTERS MANDATE_MAX_IMPLEMENTERS_PER_REPOSITORY
 # fixture or change its result when inherited from a live operator session.
 # Tests that exercise an override set it explicitly on the command under test.
 scrub_per_invocation_environment() {
-  unset CLAUDE_CONFIG_DIR \
+  unset CLAUDE_CONFIG_DIR OSTROM_HOME \
     MANDATE_AUDIT_TIME MANDATE_DAILY_CAP_USD MANDATE_DIGEST_TIME \
     MANDATE_EXCUSE_TIME MANDATE_GATE_TIME MANDATE_GH_AS_BIN \
     MANDATE_IMPLEMENTER_SOURCE_REPO MANDATE_IMPLEMENTER_STREAMING_CEILING \
@@ -66,6 +71,7 @@ if grep -n -E "$dead_assertion_pattern" "${BASH_SOURCE[0]}"; then
 fi
 
 mkdir -p "$fixture/config/ostrom" "$fixture/repo" "$fixture/bin"
+ln -s "$OSTROM_BIN" "$fixture/bin/ostrom"
 sweep_search_root="$fixture/search-root"
 sweep_resolved_source="$sweep_search_root/example-org/example-repo"
 mkdir -p "$sweep_resolved_source"
@@ -6490,9 +6496,10 @@ YAML
 clean_local_drift="$(
   cd "$local_drift"
   PATH="$fixture/bin:$PATH" \
+    OSTROM_HOME="$local_drift/config/ostrom" \
     CLAUDE_CONFIG_DIR="$local_drift/config" \
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-    bash "$PLUGIN_ROOT/scripts/local-drift.sh"
+    ostrom local-drift
 )"
 [ -z "$clean_local_drift" ]
 
@@ -6534,9 +6541,10 @@ git -C "$local_drift/root/repository" push -u origin pushed >/dev/null
 local_drift_output="$(
   cd "$local_drift"
   PATH="$fixture/bin:$PATH" \
+    OSTROM_HOME="$local_drift/config/ostrom" \
     CLAUDE_CONFIG_DIR="$local_drift/config" \
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-    bash "$PLUGIN_ROOT/scripts/local-drift.sh"
+    ostrom local-drift
 )"
 grep -Fq \
   'LIMIT: git cherry is patch-id based: it catches rebases but not squash merges; squash-merged work can appear unpublished.' \
@@ -6554,9 +6562,10 @@ unknown_pr_output="$(
   cd "$local_drift"
   PATH="$fixture/bin:$PATH" \
     FAKE_GH_PR_FAIL=1 \
+    OSTROM_HOME="$local_drift/config/ostrom" \
     CLAUDE_CONFIG_DIR="$local_drift/config" \
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-    bash "$PLUGIN_ROOT/scripts/local-drift.sh"
+    ostrom local-drift
 )"
 grep -Eq $'^unpublished\t.*branch=pushed\t.*publication=pr-status-unknown$' \
   <<<"$unknown_pr_output"
@@ -6571,12 +6580,13 @@ local_drift_digest="$(
   cd "$local_drift"
   PATH="$fixture/bin:$PATH" \
     FAKE_GH_CALL_LOG="$local_drift/gh-calls" \
+    OSTROM_HOME="$local_drift/config/ostrom" \
     CLAUDE_CONFIG_DIR="$local_drift/config" \
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
     bash "$PLUGIN_ROOT/hooks/render-digest.sh"
 )"
 local_drift_digest_text="$(jq -r '.systemMessage' <<<"$local_drift_digest")"
-[ "$(grep -c '^LOCAL DRIFT — run mandate local-drift.sh for details$' \
+[ "$(grep -c '^LOCAL DRIFT — run ostrom local-drift for details$' \
   <<<"$local_drift_digest_text")" -eq 1 ]
 [ ! -s "$local_drift/gh-calls" ]
 
@@ -7837,10 +7847,11 @@ audit_sources_before="$(
 audit_output="$(
   cd "$audit_dir/repo"
   CLAUDE_CONFIG_DIR="$audit_dir/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    OSTROM_HOME="$audit_dir/config/ostrom" \
     PATH="$fixture/bin:$PATH" \
     FAKE_GH_CALL_LOG="$audit_call_log" \
     MANDATE_AUDIT_TIME="2026-08-01T00:00:00Z" \
-    bash "$PLUGIN_ROOT/scripts/audit.sh" 30
+    ostrom audit --days 30
 )"
 audit_sources_after="$(
   sha256sum "$audit_dir/config/ostrom/mandates.yaml" \
@@ -7912,9 +7923,10 @@ YAML
 absent_gate_output="$(
   cd "$absent_gate_dir/repo"
   CLAUDE_CONFIG_DIR="$absent_gate_dir/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    OSTROM_HOME="$absent_gate_dir/config/ostrom" \
     PATH="$fixture/bin:$PATH" \
     MANDATE_AUDIT_TIME="2026-08-01T00:00:00Z" \
-    bash "$PLUGIN_ROOT/scripts/audit.sh" 30
+    ostrom audit --days 30
 )"
 grep -Fq "Gate log is absent at" <<<"$absent_gate_output"
 grep -Fxq "$(printf 'total merged PRs in window\t0')" <<<"$absent_gate_output"
@@ -7930,9 +7942,10 @@ sed 's/absent-gate-repo/empty-gate-repo/' \
 empty_gate_output="$(
   cd "$empty_gate_dir/repo"
   CLAUDE_CONFIG_DIR="$empty_gate_dir/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    OSTROM_HOME="$empty_gate_dir/config/ostrom" \
     PATH="$fixture/bin:$PATH" \
     MANDATE_AUDIT_TIME="2026-08-01T00:00:00Z" \
-    bash "$PLUGIN_ROOT/scripts/audit.sh" 30
+    ostrom audit --days 30
 )"
 grep -Fq "Gate log is empty at" <<<"$empty_gate_output"
 
@@ -7958,9 +7971,10 @@ JSONL
   unreadable_gate_output="$(
     cd "$unreadable_gate_dir/repo"
     CLAUDE_CONFIG_DIR="$unreadable_gate_dir/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+      OSTROM_HOME="$unreadable_gate_dir/config/ostrom" \
       PATH="$fixture/bin:$PATH" \
       MANDATE_AUDIT_TIME="2026-08-01T00:00:00Z" \
-      bash "$PLUGIN_ROOT/scripts/audit.sh" 30 2>"$unreadable_gate_dir/stderr"
+      ostrom audit --days 30 2>"$unreadable_gate_dir/stderr"
   )"
   unreadable_gate_status=$?
   set -e
@@ -9677,23 +9691,25 @@ excuse_log="$gate_fixture/config/ostrom/exceptions.jsonl"
 set +e
 excuse_message="$(
   PATH="$gate_fixture/bin:$PATH" \
+    OSTROM_HOME="$gate_fixture/config/ostrom" \
     CLAUDE_CONFIG_DIR="$gate_fixture/config" \
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-    bash "$PLUGIN_ROOT/scripts/excuse.sh" grant \
+    "$OSTROM_BIN" excuse grant \
       not-a-pr bounce_selectors "placeholder reason" 2>&1
 )"
 excuse_status=$?
 set -e
 [ "$excuse_status" -eq 2 ]
-grep -q '^usage: excuse.sh grant ' <<<"$excuse_message"
+grep -q '^usage: ostrom excuse grant ' <<<"$excuse_message"
 [ ! -e "$excuse_log" ]
 
 set +e
 excuse_message="$(
   PATH="$gate_fixture/bin:$PATH" \
+    OSTROM_HOME="$gate_fixture/config/ostrom" \
     CLAUDE_CONFIG_DIR="$gate_fixture/config" \
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-    bash "$PLUGIN_ROOT/scripts/excuse.sh" grant \
+    "$OSTROM_BIN" excuse grant \
       placeholder-org/placeholder-repo#7 unknown "placeholder reason" 2>&1
 )"
 excuse_status=$?
@@ -9706,9 +9722,10 @@ grep -q 'required_checks, review_threads, bounce_selectors, reserved_refs' \
 set +e
 excuse_message="$(
   PATH="$gate_fixture/bin:$PATH" \
+    OSTROM_HOME="$gate_fixture/config/ostrom" \
     CLAUDE_CONFIG_DIR="$gate_fixture/config" \
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-    bash "$PLUGIN_ROOT/scripts/excuse.sh" grant \
+    "$OSTROM_BIN" excuse grant \
       placeholder-org/placeholder-repo#7 bounce_selectors '   ' 2>&1
 )"
 excuse_status=$?
@@ -9721,9 +9738,10 @@ set +e
 excuse_message="$(
   PATH="$gate_fixture/bin:$PATH" \
     FAKE_GATE_MODE=unresolvable-pr \
+    OSTROM_HOME="$gate_fixture/config/ostrom" \
     CLAUDE_CONFIG_DIR="$gate_fixture/config" \
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-    bash "$PLUGIN_ROOT/scripts/excuse.sh" grant \
+    "$OSTROM_BIN" excuse grant \
       placeholder-org/placeholder-repo#7 bounce_selectors \
       "placeholder reason" 2>&1
 )"
@@ -9739,9 +9757,10 @@ grant_output="$(
   PATH="$gate_fixture/bin:$PATH" \
     FAKE_GATE_HEAD="$granted_head" \
     MANDATE_EXCUSE_TIME="2026-08-04T11:00:00Z" \
+    OSTROM_HOME="$gate_fixture/config/ostrom" \
     CLAUDE_CONFIG_DIR="$gate_fixture/config" \
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-    bash "$PLUGIN_ROOT/scripts/excuse.sh" grant \
+    "$OSTROM_BIN" excuse grant \
       placeholder-org/placeholder-repo#7 bounce_selectors \
       "principal accepted placeholder surface"
 )"
@@ -9765,9 +9784,10 @@ merge_protocol_excuse_output="$(
   PATH="$gate_fixture/bin:$PATH" \
     FAKE_GATE_HEAD="$granted_head" \
     MANDATE_EXCUSE_TIME="2026-08-04T12:00:00Z" \
+    OSTROM_HOME="$merge_protocol_excuse_config/ostrom" \
     CLAUDE_CONFIG_DIR="$merge_protocol_excuse_config" \
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-    bash "$PLUGIN_ROOT/scripts/excuse.sh" grant \
+    "$OSTROM_BIN" excuse grant \
       placeholder-org/placeholder-repo#8 merge_protocol \
       "principal explained placeholder manual merge"
 )"
@@ -9788,9 +9808,10 @@ jq -s -e '
 # SHA argument and always takes it from gh pr view.
 set +e
 PATH="$gate_fixture/bin:$PATH" \
+  OSTROM_HOME="$gate_fixture/config/ostrom" \
   CLAUDE_CONFIG_DIR="$gate_fixture/config" \
   CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-  bash "$PLUGIN_ROOT/scripts/excuse.sh" grant \
+  "$OSTROM_BIN" excuse grant \
     placeholder-org/placeholder-repo#7 "$granted_head" bounce_selectors \
     "placeholder reason" >/dev/null 2>&1
 excuse_status=$?
@@ -9801,9 +9822,10 @@ set -e
 list_output="$(
   PATH="$gate_fixture/bin:$PATH" \
     FAKE_GATE_HEAD="$granted_head" \
+    OSTROM_HOME="$gate_fixture/config/ostrom" \
     CLAUDE_CONFIG_DIR="$gate_fixture/config" \
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-    bash "$PLUGIN_ROOT/scripts/excuse.sh" list \
+    "$OSTROM_BIN" excuse list \
       placeholder-org/placeholder-repo#7
 )"
 grep -q '^current placeholder-org/placeholder-repo#7 bounce_selectors ' \
@@ -9812,9 +9834,10 @@ grep -q 'reason="principal accepted placeholder surface"$' <<<"$list_output"
 list_output="$(
   PATH="$gate_fixture/bin:$PATH" \
     FAKE_GATE_HEAD="7777777777777777777777777777777777777777" \
+    OSTROM_HOME="$gate_fixture/config/ostrom" \
     CLAUDE_CONFIG_DIR="$gate_fixture/config" \
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-    bash "$PLUGIN_ROOT/scripts/excuse.sh" list \
+    "$OSTROM_BIN" excuse list \
       placeholder-org/placeholder-repo#7
 )"
 grep -q '^superseded placeholder-org/placeholder-repo#7 bounce_selectors ' \
@@ -10019,9 +10042,10 @@ grant_gate_exception() {
   PATH="$gate_fixture/bin:$PATH" \
     FAKE_GATE_HEAD="$exception_head" \
     MANDATE_EXCUSE_TIME="2026-08-04T11:30:00Z" \
+    OSTROM_HOME="$gate_fixture/config/ostrom" \
     CLAUDE_CONFIG_DIR="$gate_fixture/config" \
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-    bash "$PLUGIN_ROOT/scripts/excuse.sh" grant \
+    "$OSTROM_BIN" excuse grant \
       "placeholder-org/placeholder-repo#$exception_number" \
       "$exception_condition" "$@" >/dev/null
 }

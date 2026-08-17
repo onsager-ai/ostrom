@@ -180,8 +180,7 @@ exceptions remain machine-local at `~/.claude/ostrom/mandates.yaml`,
 discovers Git repositories beneath each root, enumerates every linked worktree,
 and reports dirty, unpublished, patch-equivalent landed, and fully pushed
 branches with no open or merged PR. Shipped defaults leave the list empty, so
-no local paths are guessed. Run `plugins/ostrom/scripts/local-drift.sh` for
-detail.
+no local paths are guessed. Run `ostrom local-drift` for detail.
 
 Each project uses case-insensitive qualified glob selectors in `delegated`,
 `excluded`, and `bounce`; `reserved` is a list of exact issue/PR numbers.

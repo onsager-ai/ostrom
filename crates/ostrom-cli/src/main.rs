@@ -15,9 +15,10 @@ use ostrom_core::{
     ResolvedCheck,
 };
 use ostrom_store::{
-    ExecutableAssessmentDeriver, MigrationOutcome, OstromPaths, PlanOptions, PublishTarget,
-    SweepError, SweepMode, SweepOptions, UnavailableAssessmentDeriver, acquire_org_from_github,
-    encode_org_snapshots, list_queue_json, migrate, run_plan, run_sweep,
+    AuditOptions, ExecutableAssessmentDeriver, MigrationOutcome, OstromPaths, PlanOptions,
+    PublishTarget, SweepError, SweepMode, SweepOptions, UnavailableAssessmentDeriver,
+    acquire_org_from_github, audit, encode_org_snapshots, grant_excuse, list_excuses,
+    list_queue_json, local_drift, migrate, run_plan, run_sweep,
 };
 
 #[derive(Debug, Parser)]
@@ -66,6 +67,36 @@ enum Command {
         #[arg(long, hide = true)]
         started_at: Option<String>,
     },
+    /// Audit merged pull requests against verdicts recorded at their merged SHA.
+    Audit {
+        /// Number of days in the merged-at window.
+        #[arg(long, default_value_t = 30)]
+        days: u64,
+    },
+    /// Grant or inspect SHA-scoped merge-gate exceptions.
+    Excuse {
+        #[command(subcommand)]
+        command: ExcuseCommand,
+    },
+    /// Scan local Git repositories for drift without changing them.
+    LocalDrift {
+        /// Suppress network-backed pull-request classification.
+        #[arg(long)]
+        local_only: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ExcuseCommand {
+    /// Grant one condition exception at the pull request's current head SHA.
+    Grant {
+        target: String,
+        condition: String,
+        #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
+        reason: Vec<String>,
+    },
+    /// List exception events, optionally for exactly one pull request.
+    List { target: Option<String> },
 }
 
 #[derive(Debug, Subcommand)]
@@ -218,8 +249,81 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 paths.state.join("plan.json").display()
             );
         }
+        Command::Audit { days } => {
+            let audit_time = environment_time("MANDATE_AUDIT_TIME").unwrap_or_else(|message| {
+                eprintln!("mandate audit: {message}");
+                std::process::exit(2);
+            });
+            let working_directory = env::current_dir()?;
+            match audit(&AuditOptions {
+                paths,
+                working_directory,
+                days,
+                audit_time,
+            }) {
+                Ok(output) => io::stdout().write_all(output.as_bytes())?,
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::exit(error.exit_code());
+                }
+            }
+        }
+        Command::Excuse { command } => match command {
+            ExcuseCommand::Grant {
+                target,
+                condition,
+                reason,
+            } => {
+                let timestamp =
+                    optional_environment_time("MANDATE_EXCUSE_TIME").unwrap_or_else(|message| {
+                        eprintln!("mandate excuse: {message}");
+                        std::process::exit(3);
+                    });
+                match grant_excuse(&paths, &target, &condition, &reason, timestamp) {
+                    Ok(output) => io::stdout().write_all(output.as_bytes())?,
+                    Err(error) => {
+                        eprintln!("{error}");
+                        std::process::exit(error.exit_code());
+                    }
+                }
+            }
+            ExcuseCommand::List { target } => match list_excuses(&paths, target.as_deref()) {
+                Ok(output) => io::stdout().write_all(output.as_bytes())?,
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::exit(error.exit_code());
+                }
+            },
+        },
+        Command::LocalDrift { local_only } => {
+            let working_directory = env::current_dir()?;
+            match local_drift(&paths, &working_directory, local_only) {
+                Ok(output) => io::stdout().write_all(output.as_bytes())?,
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::exit(error.exit_code());
+                }
+            }
+        }
     }
     Ok(())
+}
+
+fn environment_time(name: &str) -> Result<DateTime<Utc>, String> {
+    optional_environment_time(name)
+        .map(|value| value.unwrap_or_else(|| DateTime::<Utc>::from(SystemTime::now())))
+}
+
+fn optional_environment_time(name: &str) -> Result<Option<DateTime<Utc>>, String> {
+    env::var(name)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            DateTime::parse_from_rfc3339(&value)
+                .map(|parsed| parsed.with_timezone(&Utc))
+                .map_err(|_| format!("{name} must be an RFC 3339 timestamp"))
+        })
+        .transpose()
 }
 
 struct PlanCheckResolutions {

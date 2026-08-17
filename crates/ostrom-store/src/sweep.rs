@@ -2130,7 +2130,7 @@ fn load_work_orders(
     Ok((orders, warnings))
 }
 
-fn load_config(paths: &OstromPaths, cwd: &Path) -> Result<MandateConfig, SweepError> {
+pub(crate) fn load_config(paths: &OstromPaths, cwd: &Path) -> Result<MandateConfig, SweepError> {
     let user_path = paths.config.join("mandates.yaml");
     let repo_path = cwd.join(".ostrom/mandates.yaml");
     if !user_path.exists() && !repo_path.exists() {
@@ -2150,6 +2150,20 @@ fn load_config(paths: &OstromPaths, cwd: &Path) -> Result<MandateConfig, SweepEr
     let serialized =
         serde_yaml::to_string(&merged).map_err(|error| SweepError::Config(error.to_string()))?;
     MandateConfig::from_yaml(&serialized).map_err(|error| SweepError::Config(error.to_string()))
+}
+
+pub(crate) fn load_config_or_defaults(
+    paths: &OstromPaths,
+    cwd: &Path,
+) -> Result<MandateConfig, SweepError> {
+    let user_path = paths.config.join("mandates.yaml");
+    let repo_path = cwd.join(".ostrom/mandates.yaml");
+    if user_path.exists() || repo_path.exists() {
+        load_config(paths, cwd)
+    } else {
+        MandateConfig::from_yaml(SHIPPED_DEFAULTS)
+            .map_err(|error| SweepError::Config(error.to_string()))
+    }
 }
 
 fn merge_yaml(base: &mut serde_yaml::Value, overlay: serde_yaml::Value) {

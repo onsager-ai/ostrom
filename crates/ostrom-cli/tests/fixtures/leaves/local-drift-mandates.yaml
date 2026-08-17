@@ -1,0 +1,7 @@
+provider: file
+cadence_hours: 24
+stuck_after_days: 7
+search_roots:
+  - placeholder-missing-root
+bounce_all: []
+projects: []

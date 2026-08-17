@@ -1,0 +1,46 @@
+mandate audit: merged-SHA gate verdicts over the last 30 days
+Window: 2026-07-02T00:00:00Z through 2026-08-01T00:00:00Z (by mergedAt).
+Pass-with-excuse is a subset of pass; unknown join states remain separate.
+
+REPOSITORY placeholder-org/alpha
+MERGE OUTCOMES
+bucket	count
+no verdict at any SHA	1
+only null-SHA verdicts (unjoinable)	1
+verdict exists, but none at the merged SHA	1
+merged PR missing headRefOid	1
+pass at the merged SHA	1
+of passes, contains an excused condition	1
+fail or inconclusive at the merged SHA	2
+  fail	1
+  inconclusive	1
+unrecognized verdict at the merged SHA	1
+total merged PRs in window	8
+
+RECORD QUALITY
+measure	count
+null head_sha records for merged PRs in window	2
+merged PRs touched by a null head_sha record	2
+
+FAILED CONDITION BREAKDOWN
+condition	merged PRs
+review_threads	1
+
+INCONCLUSIVE CONDITION BREAKDOWN
+condition	merged PRs
+required_checks	1
+
+UNKNOWN JOIN DETAILS
+pr	reason	merged head	merge commit	null-SHA records
+placeholder-org/alpha#3	none at merged SHA	3333333333333333333333333333333333333333	a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3	0
+placeholder-org/alpha#4	only null-SHA verdicts	4444444444444444444444444444444444444444	a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4	1
+placeholder-org/alpha#5	unrecognized verdict	5555555555555555555555555555555555555555	a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5	0
+placeholder-org/alpha#7	missing headRefOid	-	a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7	0
+placeholder-org/alpha#8	no verdict at any SHA	8888888888888888888888888888888888888888	a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8	0
+
+NON-PASS VERDICTS AT THE MERGED SHA
+pr	verdict	merged head	merge commit
+placeholder-org/alpha#2	fail	2222222222222222222222222222222222222222	a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2
+placeholder-org/alpha#6	inconclusive	6666666666666666666666666666666666666666	a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6
+
+No score is calculated: outcome, exception use, join coverage, and condition failures are separate counts.

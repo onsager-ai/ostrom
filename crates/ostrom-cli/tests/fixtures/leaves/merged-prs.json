@@ -1,0 +1,11 @@
+[
+  {"number":1,"mergedAt":"2026-07-10T12:00:00Z","headRefOid":"1111111111111111111111111111111111111111","mergeCommit":{"oid":"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"}},
+  {"number":2,"mergedAt":"2026-07-11T12:00:00Z","headRefOid":"2222222222222222222222222222222222222222","mergeCommit":{"oid":"a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2"}},
+  {"number":3,"mergedAt":"2026-07-12T12:00:00Z","headRefOid":"3333333333333333333333333333333333333333","mergeCommit":{"oid":"a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3"}},
+  {"number":4,"mergedAt":"2026-07-13T12:00:00Z","headRefOid":"4444444444444444444444444444444444444444","mergeCommit":{"oid":"a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4"}},
+  {"number":5,"mergedAt":"2026-07-14T12:00:00Z","headRefOid":"5555555555555555555555555555555555555555","mergeCommit":{"oid":"a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5"}},
+  {"number":6,"mergedAt":"2026-07-15T12:00:00Z","headRefOid":"6666666666666666666666666666666666666666","mergeCommit":{"oid":"a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6"}},
+  {"number":7,"mergedAt":"2026-07-16T12:00:00Z","headRefOid":null,"mergeCommit":"a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7"},
+  {"number":8,"mergedAt":"2026-07-17T12:00:00Z","headRefOid":"8888888888888888888888888888888888888888","mergeCommit":{"oid":"a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8"}},
+  {"number":9,"mergedAt":"2026-06-01T12:00:00Z","headRefOid":"9999999999999999999999999999999999999999","mergeCommit":{"oid":"a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9"}}
+]
