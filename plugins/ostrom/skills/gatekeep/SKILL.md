@@ -118,7 +118,7 @@ Keep these two exit-`111` cases distinct:
   a credential field is missing or malformed, the private key is unavailable,
   or another session-wide authentication prerequisite failed means this pass
   has no authority it can use. Do not retry the repository call. Set the pass
-  outcome to `error`, report the credential-loading failure without exposing
+  outcome to `failed`, report the credential-loading failure without exposing
   credential values, append the terminal row, release the lease, and end the
   pass.
 - **Minting fails for one repository.** Any other exit `111` from a correctly
@@ -217,13 +217,11 @@ outcome, truthful completed-candidate count, and skipped-repository list;
 narration may explain why an incomplete pass stopped but must not replace those
 facts.
 
-Use the existing outcome `completed` when the pass reaches the end without a
-skipped repository. Use outcome `partial` when the pass reaches the end after
-skipping one or more repositories, including when it successfully judged
-candidates in the other repositories; a productive pass with skips is not
-`error`. Reserve `error` for a pass-ending failure such as credentials that
-cannot be loaded at all or a trace failure. Then run, with the exact owner
-retained in step 2:
+Choose `pass_outcome` only from the closed set `completed`,
+`completed-no-dispatch`, `no-op`, `failed`, and `blocked`. A productive pass
+with skips is `completed`, not `blocked`; reserve `failed` for a pass-ending
+failure such as credentials that cannot be loaded at all or a trace failure.
+Then run, with the exact owner retained in step 2:
 
 ```sh
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/trace.sh" append pass-ended \

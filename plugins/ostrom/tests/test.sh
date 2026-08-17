@@ -155,15 +155,19 @@ if grep -Fq 'failed_repo' "$gatekeep_skill"; then
   echo "gatekeeper terminal fact must carry skipped_repos, not one failed_repo" >&2
   exit 1
 fi
-grep -Fq 'existing outcome `completed`' "$gatekeep_skill"
-grep -Fq 'Use outcome `partial`' "$gatekeep_skill"
-grep -Fq 'a productive pass with skips is not' "$gatekeep_skill"
+for pass_outcome in completed completed-no-dispatch no-op failed blocked; do
+  grep -Fq "\`$pass_outcome\`" "$gatekeep_skill"
+  grep -Fq "\`$pass_outcome\`" "$work_skill"
+done
+grep -Fq 'Choose `pass_outcome` only from the closed set' "$gatekeep_skill"
+grep -Fq 'Choose `pass_outcome`' "$work_skill"
+grep -Fq 'with skips is `completed`, not `blocked`' "$gatekeep_skill"
 
 # Missing or malformed credentials are session-wide, not a repository skip:
 # they still end the pass. Neither that path nor the retry/skip path may ever
 # escape the App blast radius through an ambient principal credential.
 grep -Fq '**Credentials cannot be loaded at all.**' "$gatekeep_skill"
-grep -Fq 'outcome to `error`' "$gatekeep_skill"
+grep -Fq 'outcome to `failed`' "$gatekeep_skill"
 grep -Fq 'release the lease, and end the' "$gatekeep_skill"
 grep -Fq '**No exit-`111` path may run the command under an ambient credential' \
   "$gatekeep_skill"
@@ -873,7 +877,8 @@ jq -s -e '
   length == 14
   and .[12].fact.outcome == "failed"
   and .[13].fact.owner == .[10].fact.owner
-  and .[13].fact.outcome == "timed-out"
+  and .[13].fact.outcome == "failed"
+  and .[13].fact.reason == "timed-out"
 ' "$outcome_config/ostrom/sprint.jsonl" >/dev/null
 
 : >"$outcome_marker"
@@ -930,7 +935,8 @@ jq -s -e '
   | ($gatekeeper | length) == 2
   and ($gatekeeper | map(.kind)) == ["pass-started", "pass-ended"]
   and $gatekeeper[1].fact.owner == $gatekeeper[0].fact.owner
-  and $gatekeeper[1].fact.outcome == "timed-out"
+  and $gatekeeper[1].fact.outcome == "failed"
+  and $gatekeeper[1].fact.reason == "timed-out"
   and $gatekeeper[1].fact.cost_usd == null
   and ($gatekeeper[1].fact.duration_seconds | type == "number" and . >= 0)
 ' "$pass_config/ostrom/sprint.jsonl" >/dev/null
@@ -1018,7 +1024,7 @@ MANDATE_TRACE_TIME="2026-08-01T00:03:00Z" \
 MANDATE_TRACE_TIME="2026-08-01T00:04:00Z" \
   CLAUDE_CONFIG_DIR="$lease_concurrent" \
   bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
-    '{"outcome":"complete","completed_candidates":1}' '{}' >/dev/null
+    '{"outcome":"completed","completed_candidates":1}' '{}' >/dev/null
 jq -s -e 'map(.kind) == [
   "pass-started",
   "item-selected",
@@ -4346,6 +4352,57 @@ jq -s -e '
   and .[1].narration.reason
     == "first line\nsecond line with a \"quote\""
 ' <<<"$narration_rows" >/dev/null
+
+# New pass-ended rows use one closed outcome vocabulary. Validation happens
+# only on append: historical free-form values, including sentence-shaped
+# values, remain structurally readable on both read paths.
+trace_outcome_config="$fixture/trace-outcomes"
+for pass_outcome in completed completed-no-dispatch no-op failed blocked; do
+  CLAUDE_CONFIG_DIR="$trace_outcome_config" \
+    bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
+      "$(jq -cn --arg outcome "$pass_outcome" '{outcome:$outcome}')" \
+      '{}' >/dev/null
+done
+[ "$(wc -l <"$trace_outcome_config/ostrom/sprint.jsonl" | tr -d '[:space:]')" -eq 5 ]
+
+set +e
+CLAUDE_CONFIG_DIR="$trace_outcome_config" \
+  bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
+    '{"outcome":"complete"}' '{}' \
+    >"$fixture/trace-outcome-invalid.out" \
+    2>"$fixture/trace-outcome-invalid.err"
+trace_outcome_invalid_status=$?
+set -e
+[ "$trace_outcome_invalid_status" -ne 0 ]
+grep -q 'pass-ended fact.outcome' "$fixture/trace-outcome-invalid.err"
+[ "$(wc -l <"$trace_outcome_config/ostrom/sprint.jsonl" | tr -d '[:space:]')" -eq 5 ]
+
+historical_outcome_config="$fixture/trace-historical-outcomes"
+mkdir -p "$historical_outcome_config/ostrom"
+cat >"$historical_outcome_config/ostrom/sprint.jsonl" <<'JSONL'
+{"ts":"2026-08-01T00:00:00Z","kind":"pass-ended","fact":{"owner":"builder-history-wake1","outcome":"complete"},"narration":{}}
+{"ts":"2026-08-01T01:00:00Z","kind":"pass-ended","fact":{"owner":"builder-history-wake2","outcome":"partial"},"narration":{}}
+{"ts":"2026-08-01T02:00:00Z","kind":"pass-ended","fact":{"owner":"builder-history-wake3","outcome":"timed-out"},"narration":{}}
+{"ts":"2026-08-01T03:00:00Z","kind":"pass-ended","fact":{"owner":"builder-history-wake4","outcome":"Completed after reviewing the available queue."},"narration":{}}
+JSONL
+historical_outcome_facts="$(
+  CLAUDE_CONFIG_DIR="$historical_outcome_config" \
+    bash "$PLUGIN_ROOT/scripts/trace.sh" read
+)"
+historical_outcome_narration="$(
+  CLAUDE_CONFIG_DIR="$historical_outcome_config" \
+    bash "$PLUGIN_ROOT/scripts/trace.sh" read-narration
+)"
+jq -s -e '
+  length == 4
+  and .[0].fact.outcome == "complete"
+  and .[1].fact.outcome == "partial"
+  and .[2].fact.outcome == "timed-out"
+  and .[3].fact.outcome == "Completed after reviewing the available queue."
+' <<<"$historical_outcome_facts" >/dev/null
+jq -s -e 'length == 4 and all(.[]; .narration == {})' \
+  <<<"$historical_outcome_narration" >/dev/null
+
 oversized_value="$(printf '%*s' 4100 '' | tr ' ' x)"
 set +e
 CLAUDE_CONFIG_DIR="$trace_config" \
@@ -4371,7 +4428,7 @@ grep -q '^WARN|gatekeeper-pass|no gatekeeper pass ever recorded|' <<<"$doctor_ab
 
 MANDATE_TRACE_TIME="2026-07-30T00:00:00Z" CLAUDE_CONFIG_DIR="$doctor_config" \
   bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
-    '{"owner":"builder-fixture-wake1","outcome":"complete"}' '{}' >/dev/null
+    '{"owner":"builder-fixture-wake1","outcome":"completed"}' '{}' >/dev/null
 doctor_stale="$(
   cd "$fixture/repo"
   HOME="$fixture" CLAUDE_CONFIG_DIR="$doctor_config" \
@@ -4386,10 +4443,10 @@ grep -q '^WARN|gatekeeper-pass|no gatekeeper pass ever recorded|' \
 
 MANDATE_TRACE_TIME="$MANDATE_SWEEP_TIME" CLAUDE_CONFIG_DIR="$doctor_config" \
   bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
-    '{"owner":"builder-fixture-wake2","outcome":"complete"}' '{}' >/dev/null
+    '{"owner":"builder-fixture-wake2","outcome":"completed"}' '{}' >/dev/null
 MANDATE_TRACE_TIME="$MANDATE_SWEEP_TIME" CLAUDE_CONFIG_DIR="$doctor_config" \
   bash "$PLUGIN_ROOT/scripts/trace.sh" append pass-ended \
-    '{"owner":"gatekeeper-fixture-wake1","outcome":"complete"}' '{}' >/dev/null
+    '{"owner":"gatekeeper-fixture-wake1","outcome":"completed"}' '{}' >/dev/null
 doctor_current="$(
   cd "$fixture/repo"
   HOME="$fixture" CLAUDE_CONFIG_DIR="$doctor_config" \

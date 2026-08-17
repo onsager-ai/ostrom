@@ -1105,6 +1105,11 @@ var ROLE_SKILL = {
   gatekeeper: "/ostrom:gatekeep"
 };
 var PASS_FAULT_THRESHOLD = 3;
+var OUTPUT_KINDS = /* @__PURE__ */ new Set([
+  "work-dispatched",
+  "decision-taken",
+  "pr-repair"
+]);
 function nowEpoch2(context) {
   const explicit = context.env.MANDATE_NOW_EPOCH;
   if (explicit && /^\d+$/.test(explicit)) return Number(explicit);
@@ -1125,10 +1130,15 @@ function formatAge(ageSeconds) {
   const minutes = ageMinutes % 60;
   return minutes === 0 ? `${hours}h` : `${hours}h${minutes}m`;
 }
+function hasNonZeroTerminalCount(fact) {
+  return [fact.worked_items, fact.completed_candidates].some(
+    (count) => typeof count === "number" && Number.isFinite(count) && count > 0
+  );
+}
 function recentRolePassEnded(source, role, limit) {
-  const records = [];
+  const passes = [];
   let contentEnd = source.length;
-  while (contentEnd > 0 && records.length < limit) {
+  while (contentEnd > 0 && (passes.length < limit || passes.some((pass) => !pass.started))) {
     while (contentEnd > 0 && (source[contentEnd - 1] === "\n" || source[contentEnd - 1] === "\r")) {
       contentEnd -= 1;
     }
@@ -1142,15 +1152,32 @@ function recentRolePassEnded(source, role, limit) {
     } catch {
       continue;
     }
-    if (!object2(record) || record.kind !== "pass-ended" || !object2(record.fact)) {
+    if (!object2(record)) continue;
+    if (record.kind === "pass-ended" && object2(record.fact)) {
+      const owner = record.fact.owner;
+      if (passes.length < limit && typeof owner === "string" && owner.startsWith(`${role}-`)) {
+        passes.push({
+          record,
+          terminalOutput: hasNonZeroTerminalCount(record.fact),
+          outputRecordSeen: false,
+          owner,
+          started: false
+        });
+      }
       continue;
     }
-    const owner = record.fact.owner;
-    if (typeof owner === "string" && owner.startsWith(`${role}-`)) {
-      records.push(record);
+    const openPasses = passes.filter((pass) => !pass.started);
+    if (OUTPUT_KINDS.has(String(record.kind))) {
+      for (const pass of openPasses) pass.outputRecordSeen = true;
+    }
+    if (record.kind === "pass-started" && object2(record.fact)) {
+      const owner = record.fact.owner;
+      if (typeof owner !== "string") continue;
+      const matchingPass = openPasses.find((pass) => pass.owner === owner);
+      if (matchingPass) matchingPass.started = true;
     }
   }
-  return records;
+  return passes;
 }
 function checkRolePass(context, role) {
   const cadenceHours = CADENCE_HOURS[role];
@@ -1173,8 +1200,8 @@ function checkRolePass(context, role) {
     };
   }
   const recent = recentRolePassEnded(trace.content, role, PASS_FAULT_THRESHOLD);
-  const record = recent[0];
-  if (!record) {
+  const newest = recent[0];
+  if (!newest) {
     return {
       status: "WARN",
       name: checkName,
@@ -1182,6 +1209,7 @@ function checkRolePass(context, role) {
       remedy: `run ${ROLE_SKILL[role]} and confirm it records pass-ended`
     };
   }
+  const record = newest.record;
   const timestamp = record.ts;
   const timestampMs = typeof timestamp === "string" ? Date.parse(timestamp) : NaN;
   if (!Number.isFinite(timestampMs)) {
@@ -1194,8 +1222,11 @@ function checkRolePass(context, role) {
   }
   const ageSeconds = nowEpoch2(context) - Math.floor(timestampMs / 1e3);
   const age = formatAge(ageSeconds);
-  if (recent.length === PASS_FAULT_THRESHOLD && recent.every(
-    (candidate) => object2(candidate.fact) && candidate.fact.outcome === "no-op"
+  const producedNothing = recent.length === PASS_FAULT_THRESHOLD && recent.every(
+    (candidate) => !candidate.terminalOutput && !(candidate.started && candidate.outputRecordSeen)
+  );
+  if (producedNothing && recent.every(
+    (candidate) => object2(candidate.record.fact) && candidate.record.fact.outcome === "no-op"
   )) {
     return {
       status: "FAIL",
@@ -1204,14 +1235,22 @@ function checkRolePass(context, role) {
       remedy: `inspect pass-runs/${role} transcripts; the loop is running but the protocol never takes ownership`
     };
   }
-  if (recent.length === PASS_FAULT_THRESHOLD && recent.every(
-    (candidate) => object2(candidate.fact) && candidate.fact.outcome === "failed"
+  if (producedNothing && recent.every(
+    (candidate) => object2(candidate.record.fact) && candidate.record.fact.outcome === "failed"
   )) {
     return {
       status: "FAIL",
       name: checkName,
       detail: `${role} loop has produced ${PASS_FAULT_THRESHOLD} consecutive failed passes, last ${timestamp} (age ${age})`,
       remedy: `inspect pass-runs/${role} transcripts; the protocol takes ownership but does not complete`
+    };
+  }
+  if (producedNothing) {
+    return {
+      status: "FAIL",
+      name: checkName,
+      detail: `${role} loop has produced no output for ${PASS_FAULT_THRESHOLD} consecutive passes, last ${timestamp} (age ${age})`,
+      remedy: `inspect pass-runs/${role} transcripts and the queue; the protocol runs but dispatches no work, records no decision, and repairs no pull request`
     };
   }
   if (ageSeconds > cadenceHours * 60 * 60) {
