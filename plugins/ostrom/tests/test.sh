@@ -8,6 +8,32 @@
 set -Eeuo pipefail
 
 PLUGIN_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export MANDATE_SWEEP_TIME="2026-08-01T00:00:00Z"
+export MANDATE_TODAY="2026-08-01"
+export MANDATE_NOW_EPOCH="1785542400"
+# Semantic tests opt in explicitly below. Ambient operator configuration must
+# never turn this otherwise hermetic suite into a model or network client.
+unset ANTHROPIC_API_KEY MANDATE_SEMANTIC_DERIVER MANDATE_SEMANTIC_MODEL
+# Operator concurrency overrides must not replace roster values in fixtures
+# that deliberately exercise the parsed per-project setting. Individual tests
+# still set either variable on their own command when testing the override.
+unset MANDATE_MAX_IMPLEMENTERS MANDATE_MAX_IMPLEMENTERS_PER_REPOSITORY
+# Per-invocation paths, clocks, names, and helper overrides can redirect a
+# fixture or change its result when inherited from a live operator session.
+# Tests that exercise an override set it explicitly on the command under test.
+scrub_per_invocation_environment() {
+  unset CLAUDE_CONFIG_DIR \
+    MANDATE_AUDIT_TIME MANDATE_DAILY_CAP_USD MANDATE_DIGEST_TIME \
+    MANDATE_EXCUSE_TIME MANDATE_GATE_TIME MANDATE_GH_AS_BIN \
+    MANDATE_IMPLEMENTER_SOURCE_REPO MANDATE_IMPLEMENTER_STREAMING_CEILING \
+    MANDATE_IMPLEMENTER_TERMINATION_GRACE_SECONDS \
+    MANDATE_LEASE_NAME MANDATE_LEASE_NOW_EPOCH MANDATE_LEASE_TTL_SECONDS \
+    MANDATE_PUBLISH_ALLOWLIST MANDATE_PUBLISH_DIR MANDATE_PUBLISH_REMOTE \
+    MANDATE_PUBLISH_TIME MANDATE_REPLAY_TIME MANDATE_SWEEP_MODE \
+    MANDATE_SYSTEMD_RUN_BIN MANDATE_TRACE_TIME
+}
+scrub_per_invocation_environment
+
 fixture="$(mktemp -d)"
 trap 'rm -rf "$fixture"' EXIT
 # set -e aborts on the first failing assertion with no indication of which
@@ -45,12 +71,6 @@ mkdir -p "$sweep_resolved_source"
 git -C "$sweep_resolved_source" init -b main >/dev/null
 git -C "$sweep_resolved_source" remote add origin \
   https://github.com/example-org/example-repo.git
-export MANDATE_SWEEP_TIME="2026-08-01T00:00:00Z"
-export MANDATE_TODAY="2026-08-01"
-export MANDATE_NOW_EPOCH="1785542400"
-# Semantic tests opt in explicitly below. Ambient operator configuration must
-# never turn this otherwise hermetic suite into a model or network client.
-unset ANTHROPIC_API_KEY MANDATE_SEMANTIC_DERIVER MANDATE_SEMANTIC_MODEL
 
 write_config() {
   delegated_selector="${1:-label:maintenance}"
@@ -95,6 +115,7 @@ write_config
 gatekeep_skill="$PLUGIN_ROOT/skills/gatekeep/SKILL.md"
 merge_skill="$PLUGIN_ROOT/skills/merge/SKILL.md"
 work_skill="$PLUGIN_ROOT/skills/work/SKILL.md"
+brief_skill="$PLUGIN_ROOT/skills/brief/SKILL.md"
 repair_script="$PLUGIN_ROOT/scripts/repair-prs.sh"
 role_boundary_doc="$PLUGIN_ROOT/../../docs/role-permission-boundaries.md"
 work_frontmatter="$(
@@ -175,6 +196,347 @@ if [ "$repair_protocol_line" -ge "$selection_protocol_line" ]; then
   echo "builder repair must run before queue-backed work selection" >&2
   exit 1
 fi
+
+# #221/#119: ranking only reorders the graph-dispatchable set. The graph gate
+# leaves every mandate boundary intact, and unblocking power now applies even
+# when the principal and plan rankings are silent.
+selection_fixture="$fixture/work-ranking"
+OSTROM_HOME="$selection_fixture/config"
+selection_data="$OSTROM_HOME/ostrom"
+mkdir -p "$selection_data" "$selection_fixture/repo"
+cat >"$selection_data/mandates.yaml" <<'YAML'
+provider: file
+cadence_hours: 1
+stuck_after_days: 7
+bounce_all: []
+projects:
+  - repo: example-org/ranking-repo
+    delegated: []
+    excluded: []
+    reserved: []
+    default: delegated
+    paused: false
+    bounce: []
+YAML
+cat >"$selection_data/queue.jsonl" <<'JSONL'
+{"id":"example-org/ranking-repo#1","repo":"example-org/ranking-repo","ref":"#1","title":"Old delegated item","kind":"moved","mandate":{"reason":"delegated"},"state":"pending","opened":"2026-07-01T00:00:00Z","blocked_by":[]}
+{"id":"example-org/ranking-repo#2","repo":"example-org/ranking-repo","ref":"#2","title":"New ranked item","kind":"stuck","mandate":{"reason":"delegated"},"state":"pending","opened":"2026-07-10T00:00:00Z","blocked_by":[]}
+{"id":"example-org/ranking-repo#3","repo":"example-org/ranking-repo","ref":"#3","title":"Direct unblocker","kind":"moved","mandate":{"reason":"delegated"},"state":"pending","opened":"2026-07-20T00:00:00Z","blocked_by":[]}
+{"id":"example-org/ranking-repo#4","repo":"example-org/ranking-repo","ref":"#4","title":"Equal-age leaf","kind":"moved","mandate":{"reason":"delegated"},"state":"pending","opened":"2026-07-20T00:00:00Z","blocked_by":[]}
+{"id":"example-org/ranking-repo#10","repo":"example-org/ranking-repo","ref":"#10","title":"Pending tripwire","kind":"tripwire","mandate":{"reason":"tripwire"},"state":"pending","opened":"2026-06-01T00:00:00Z","blocked_by":[]}
+{"id":"example-org/ranking-repo#11","repo":"example-org/ranking-repo","ref":"#11","title":"Held work","kind":"parked","mandate":{"reason":"hold label"},"state":"pending","opened":"2026-06-02T00:00:00Z","blocked_by":[]}
+{"id":"example-org/ranking-repo#12","repo":"example-org/ranking-repo","ref":"#12","title":"Reserved ref","kind":"decision","mandate":{"reason":"reserved ref:#12"},"state":"pending","opened":"2026-06-03T00:00:00Z","blocked_by":[]}
+{"id":"example-org/ranking-repo#13","repo":"example-org/ranking-repo","ref":"#13","title":"Otherwise unauthorized","kind":"decision","mandate":{"reason":"default:unclassified"},"state":"pending","opened":"2026-06-04T00:00:00Z","blocked_by":[]}
+{"id":"example-org/ranking-repo#14","repo":"example-org/ranking-repo","ref":"#14","title":"Principal deferred","kind":"moved","mandate":{"reason":"delegated"},"state":"deferred","opened":"2026-06-05T00:00:00Z","blocked_by":[]}
+{"id":"example-org/ranking-repo#20","repo":"example-org/ranking-repo","ref":"#20","title":"Work blocked by three","kind":"moved","mandate":{"reason":"delegated"},"state":"pending","opened":"2026-07-21T00:00:00Z","blocked_by":["example-org/ranking-repo#3"]}
+{"id":"example-org/ranking-repo#21","repo":"example-org/ranking-repo","ref":"#21","title":"Old work blocked by three","kind":"moved","mandate":{"reason":"delegated"},"state":"pending","opened":"2026-05-01T00:00:00Z","blocked_by":["example-org/ranking-repo#3"]}
+JSONL
+
+jq -n --slurpfile queue "$selection_data/queue.jsonl" '
+  ($queue | map(.id)) as $ids
+  | {
+      version: 2,
+      dependency_graph: {
+        graph_version: 1,
+        configured_repositories: ["example-org/ranking-repo"],
+        nodes: [$queue[] | {
+          id,
+          open: true,
+          dependencies: (.blocked_by // []),
+          unsatisfied: (.blocked_by // []),
+          children: [],
+          dispatchable: ((.blocked_by // []) | length == 0),
+          unblocking_power: (if .id == "example-org/ranking-repo#3" then 2 else 0 end)
+        }],
+        edges: ([20, 21] | map({
+          dependency: "example-org/ranking-repo#3",
+          item: ("example-org/ranking-repo#" + tostring),
+          sources: ["body"]
+        })),
+        faults: []
+      }
+    }
+' >"$selection_data/state.json"
+
+(
+  cd "$selection_fixture/repo"
+  CLAUDE_CONFIG_DIR="$OSTROM_HOME" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/select-work.sh" list
+) >"$selection_fixture/no-ranking.jsonl"
+jq -s -e 'map(.id) == [
+  "example-org/ranking-repo#3",
+  "example-org/ranking-repo#1",
+  "example-org/ranking-repo#2",
+  "example-org/ranking-repo#4"
+]' "$selection_fixture/no-ranking.jsonl" >/dev/null
+
+# Closing the blocker changes only observed graph state. With the roster
+# unchanged both downstream items become selectable on the next graph read.
+cp "$selection_data/state.json" "$selection_data/state.blocked"
+jq '
+  .dependency_graph.nodes |= map(
+    if .id == "example-org/ranking-repo#20"
+        or .id == "example-org/ranking-repo#21"
+    then .unsatisfied = [] | .dispatchable = true
+    elif .id == "example-org/ranking-repo#3"
+    then .unblocking_power = 0
+    else . end
+  )
+' "$selection_data/state.json" >"$selection_data/state.next"
+mv "$selection_data/state.next" "$selection_data/state.json"
+(
+  cd "$selection_fixture/repo"
+  CLAUDE_CONFIG_DIR="$selection_fixture/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/select-work.sh" list
+) >"$selection_fixture/blocker-closed.jsonl"
+jq -s -e '
+  any(.[]; .id == "example-org/ranking-repo#20")
+  and any(.[]; .id == "example-org/ranking-repo#21")
+' "$selection_fixture/blocker-closed.jsonl" >/dev/null
+mv "$selection_data/state.blocked" "$selection_data/state.json"
+
+cat >"$selection_data/mandates.yaml" <<'YAML'
+provider: file
+cadence_hours: 1
+stuck_after_days: 7
+work_ranking:
+  - example-org/ranking-repo#10
+  - example-org/ranking-repo#11
+  - example-org/ranking-repo#12
+  - example-org/ranking-repo#13
+  - example-org/ranking-repo#99
+  - example-org/ranking-repo#2
+bounce_all: []
+projects:
+  - repo: example-org/ranking-repo
+    delegated: []
+    excluded: []
+    reserved: []
+    default: delegated
+    paused: false
+    bounce: []
+YAML
+jq '
+  .work_ranking = ["example-org/ranking-repo#10","example-org/ranking-repo#11","example-org/ranking-repo#12","example-org/ranking-repo#13","example-org/ranking-repo#99","example-org/ranking-repo#2"]
+  | .work_ranking_faults = []
+  | .repos = {"example-org/ranking-repo": {records: {
+      "example-org/ranking-repo#1":{}, "example-org/ranking-repo#2":{},
+      "example-org/ranking-repo#3":{}, "example-org/ranking-repo#4":{},
+      "example-org/ranking-repo#10":{}, "example-org/ranking-repo#11":{},
+      "example-org/ranking-repo#12":{}, "example-org/ranking-repo#13":{},
+      "example-org/ranking-repo#14":{}, "example-org/ranking-repo#20":{},
+      "example-org/ranking-repo#21":{},
+      "example-org/ranking-repo#99":{}
+    }}}
+' "$selection_data/state.json" >"$selection_data/state.next"
+mv "$selection_data/state.next" "$selection_data/state.json"
+(
+  cd "$selection_fixture/repo"
+  CLAUDE_CONFIG_DIR="$OSTROM_HOME" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/select-work.sh" list
+) >"$selection_fixture/ranked.jsonl"
+jq -s -e '
+  map(.id) == [
+    "example-org/ranking-repo#2",
+    "example-org/ranking-repo#3",
+    "example-org/ranking-repo#1",
+    "example-org/ranking-repo#4"
+  ]
+  and all(.[];
+    .id != "example-org/ranking-repo#10"
+    and .id != "example-org/ranking-repo#11"
+    and .id != "example-org/ranking-repo#12"
+    and .id != "example-org/ranking-repo#13"
+    and .id != "example-org/ranking-repo#14"
+    and .id != "example-org/ranking-repo#99"
+  )
+' "$selection_fixture/ranked.jsonl" >/dev/null
+
+(
+  cd "$selection_fixture/repo"
+  CLAUDE_CONFIG_DIR="$OSTROM_HOME" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/select-work.sh" select builder-ranking-wake1
+) >"$selection_fixture/selected-ranked.json"
+(
+  cd "$selection_fixture/repo"
+  CLAUDE_CONFIG_DIR="$OSTROM_HOME" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/select-work.sh" select builder-ranking-wake1 \
+      example-org/ranking-repo#2
+) >"$selection_fixture/selected-unblocker.json"
+jq -c 'select(.id == "example-org/ranking-repo#2")' \
+  "$selection_data/queue.jsonl" >"$selection_fixture/expected-ranked.json"
+jq -c 'select(.id == "example-org/ranking-repo#3")' \
+  "$selection_data/queue.jsonl" >"$selection_fixture/expected-unblocker.json"
+# Instrumentation must leave selection stdout byte-identical in every
+# pre-existing no-plan/work-ranking/dependency case.
+cmp "$selection_fixture/expected-ranked.json" \
+  "$selection_fixture/selected-ranked.json"
+cmp "$selection_fixture/expected-unblocker.json" \
+  "$selection_fixture/selected-unblocker.json"
+jq -s -e '
+  map(select(.kind == "work-graph-gated")) as $gated
+  | map(select(.kind == "work-ranked")) as $ranked
+  | map(select(.kind == "plan-selection")) as $plans
+  | ($gated | length) == 2
+  and $gated[0].fact.gated == "example-org/ranking-repo#21"
+  and $gated[0].fact.unsatisfied == ["example-org/ranking-repo#3"]
+  and $gated[0].fact.selected == "example-org/ranking-repo#2"
+  and $gated[1].fact.gated == "example-org/ranking-repo#21"
+  and $gated[1].fact.selected == "example-org/ranking-repo#3"
+  and ($ranked | length) == 2
+  and $ranked[0].fact.ranking == "work_ranking"
+  and $ranked[0].fact.ranking_position == 6
+  and $ranked[0].fact.selected == "example-org/ranking-repo#2"
+  and $ranked[0].fact.displaced == "example-org/ranking-repo#1"
+  and $ranked[1].fact.ranking == "dependency-unblocks"
+  and $ranked[1].fact.selected == "example-org/ranking-repo#3"
+  and $ranked[1].fact.displaced == "example-org/ranking-repo#1"
+  and ($plans | length) == 2
+  and all($plans[];
+    .fact.plan_status == "absent"
+    and (.fact | has("plan_rejection_clause") | not)
+  )
+' "$selection_data/sprint.jsonl" >/dev/null
+
+# #239: every actual selection records whether a computed plan applied. A
+# rejected plan names the first failed guard clause and remains byte-identical
+# to the existing mechanical fallback; an accepted plan records application
+# while preserving the pre-instrumentation goal-plan order.
+# Mirrors the basis select-work.sh computes, including the graph fields #119
+# added. A basis missing them is rejected on the queue_basis clause, which is
+# the predicate working rather than a fixture worth loosening.
+selection_basis="$(jq -sc \
+  --argjson graph "$(jq -c '.dependency_graph.nodes | map({key: .id, value: .}) | from_entries' \
+    "$selection_data/state.json")" '[.[] | {
+  id,
+  opened,
+  kind,
+  state,
+  blocked_by: (.blocked_by // []),
+  graph_dispatchable: ($graph[.id].dispatchable // false),
+  unblocking_power: ($graph[.id].unblocking_power // 0)
+}]' "$selection_data/queue.jsonl")"
+selection_candidates="$(jq -sc '[.[] | select(
+  .kind != "parked"
+  and .state != "deferred"
+  and ((.kind | IN("moved", "stuck"))
+    or (.state == "approved" and (.kind | IN("tripwire", "decision"))))
+) | .id]' "$selection_data/queue.jsonl")"
+selection_ranking='["example-org/ranking-repo#10","example-org/ranking-repo#11","example-org/ranking-repo#12","example-org/ranking-repo#13","example-org/ranking-repo#99","example-org/ranking-repo#2"]'
+jq -n \
+  --argjson ranking "$selection_ranking" \
+  --argjson ordered "$selection_candidates" '{
+    plan_version: 1,
+    queue_basis: [],
+    ranking: {work_ranking: $ranking, ordered: $ordered}
+  }' >"$selection_data/plan.json"
+(
+  cd "$selection_fixture/repo"
+  CLAUDE_CONFIG_DIR="$OSTROM_HOME" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/select-work.sh" list
+) >"$selection_fixture/rejected-plan.jsonl" 2>/dev/null
+cmp "$selection_fixture/ranked.jsonl" "$selection_fixture/rejected-plan.jsonl"
+(
+  cd "$selection_fixture/repo"
+  CLAUDE_CONFIG_DIR="$OSTROM_HOME" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/select-work.sh" select builder-ranking-wake2 \
+      example-org/ranking-repo#2
+) >"$selection_fixture/selected-rejected-plan.json" \
+  2>"$selection_fixture/selected-rejected-plan.err"
+cmp "$selection_fixture/selected-unblocker.json" \
+  "$selection_fixture/selected-rejected-plan.json"
+grep -Fq 'stale or invalid plan.json ignored; using mechanical ranking' \
+  "$selection_fixture/selected-rejected-plan.err"
+jq -s -e '
+  map(select(.kind == "plan-selection")) | last
+  | .fact.owner == "builder-ranking-wake2"
+  and .fact.repo == "example-org/ranking-repo"
+  and .fact.ref == "#3"
+  and .fact.action == "delegated-selection"
+  and .fact.selected == "example-org/ranking-repo#3"
+  and .fact.plan_status == "rejected"
+  and .fact.plan_rejection_clause == "queue_basis"
+' "$selection_data/sprint.jsonl" >/dev/null
+
+# #119 gates #20 out of the candidate set, so a plan naming it can never match.
+accepted_plan_order='["example-org/ranking-repo#4","example-org/ranking-repo#3","example-org/ranking-repo#1","example-org/ranking-repo#2"]'
+jq -n \
+  --argjson basis "$selection_basis" \
+  --argjson ranking "$selection_ranking" \
+  --argjson ordered "$accepted_plan_order" '{
+    plan_version: 1,
+    queue_basis: $basis,
+    ranking: {work_ranking: $ranking, ordered: $ordered}
+  }' >"$selection_data/plan.json"
+(
+  cd "$selection_fixture/repo"
+  CLAUDE_CONFIG_DIR="$OSTROM_HOME" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/select-work.sh" list
+) >"$selection_fixture/accepted-plan.jsonl"
+jq -nc --slurpfile rows "$selection_data/queue.jsonl" \
+  --argjson ids '["example-org/ranking-repo#2","example-org/ranking-repo#4","example-org/ranking-repo#3","example-org/ranking-repo#1"]' '
+    $ids[] as $id | $rows[] | select(.id == $id)
+  ' >"$selection_fixture/expected-accepted-plan.jsonl"
+cmp "$selection_fixture/expected-accepted-plan.jsonl" \
+  "$selection_fixture/accepted-plan.jsonl"
+(
+  cd "$selection_fixture/repo"
+  CLAUDE_CONFIG_DIR="$OSTROM_HOME" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/select-work.sh" select builder-ranking-wake3 \
+      example-org/ranking-repo#2
+) >"$selection_fixture/selected-accepted-plan.json"
+jq -c 'select(.id == "example-org/ranking-repo#4")' \
+  "$selection_data/queue.jsonl" >"$selection_fixture/expected-accepted-plan.json"
+cmp "$selection_fixture/expected-accepted-plan.json" \
+  "$selection_fixture/selected-accepted-plan.json"
+jq -s -e '
+  map(select(.kind == "plan-selection")) | last
+  | .fact.plan_status == "applied"
+  and (.fact | has("plan_rejection_clause") | not)
+' "$selection_data/sprint.jsonl" >/dev/null
+
+# The brief consumes the same fact-only trace. In particular, its zero-rate
+# rendering calls non-application a problem and never folds absent plans into
+# the rejected-plan denominator.
+grep -Fq 'bash "${CLAUDE_PLUGIN_ROOT}/scripts/trace.sh" read' "$brief_skill"
+grep -Fq '**Plan match rate**' "$brief_skill"
+grep -Fq 'PROBLEM: computed plans never applied' "$brief_skill"
+grep -Fq 'no plan present: S' "$brief_skill"
+grep -Fq 'no plan present in S selections' "$brief_skill"
+grep -Fq 'Never combine absent' "$brief_skill"
+
+# A swept stale pointer is a reported fault, never a silent omission.
+cat >"$selection_data/mandates.yaml" <<'YAML'
+work_ranking:
+  - example-org/ranking-repo#404
+bounce_all: []
+projects:
+  - repo: example-org/ranking-repo
+    delegated: []
+    excluded: []
+    reserved: []
+    default: delegated
+    paused: false
+    bounce: []
+YAML
+jq '
+  .work_ranking = ["example-org/ranking-repo#404"]
+  | .work_ranking_faults = ["example-org/ranking-repo#404"]
+  | .repos = {}
+' "$selection_data/state.json" >"$selection_data/state.next"
+mv "$selection_data/state.next" "$selection_data/state.json"
+set +e
+(
+  cd "$selection_fixture/repo"
+  CLAUDE_CONFIG_DIR="$OSTROM_HOME" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+    bash "$PLUGIN_ROOT/scripts/select-work.sh" list
+) >"$selection_fixture/stale.out" 2>"$selection_fixture/stale.err"
+stale_selection_status=$?
+set -e
+[ "$stale_selection_status" -eq 4 ]
+grep -Fq 'stale work_ranking item example-org/ranking-repo#404 no longer exists' \
+  "$selection_fixture/stale.err"
+
 if grep -nE 'push .*(--force|-f )|rebase|reset --hard' "$repair_script"; then
   echo "published PR repair must preserve the reviewed history" >&2
   exit 1
@@ -237,6 +599,172 @@ grep -q 'unresolve thread' "$merge_skill"
 grep -q 'revert .*: open a revert pull request' "$merge_skill"
 grep -q 'close <repo>#<new issue number>' "$work_skill"
 grep -q 'reopen <repo>#<ref>' "$work_skill"
+
+# #50: the pass protocol observes close-keyword effects only after recording
+# the merge decision, and emits exactly one result record. Execute the shipped
+# code block itself below so weakening any branch cannot leave a prose-only
+# promise that still passes this suite.
+[ "$(grep -c 'trace.sh" append close-keyword-checked' "$merge_skill")" -eq 1 ]
+merge_decision_line="$(
+  grep -n 'trace.sh" append decision-taken' "$merge_skill" | head -n 1 | cut -d: -f1
+)"
+thread_decision_line="$(
+  grep -n 'trace.sh" append decision-taken' "$merge_skill" | tail -n 1 | cut -d: -f1
+)"
+close_keyword_line="$(
+  grep -n 'trace.sh" append close-keyword-checked' "$merge_skill" | cut -d: -f1
+)"
+[ "$close_keyword_line" -gt "$merge_decision_line" ]
+[ "$close_keyword_line" -lt "$thread_decision_line" ]
+grep -Fq 'gh pr view "$pr_number" --repo "$repository"' "$merge_skill"
+grep -Fq -- '--json closingIssuesReferences' "$merge_skill"
+grep -Fq 'gh issue view "$issue_number" --repo "$repository"' "$merge_skill"
+grep -Fq -- '--json number,state,title' "$merge_skill"
+grep -Fq '<owner>/<repo>#<number> — <title>' "$merge_skill"
+grep -Fq 'do not report this as an ordinary successful' "$merge_skill"
+grep -Fq 'Exit `111` specifically means' "$merge_skill"
+if grep -qE 'gh-as\.sh[^`]*gh issue close' "$merge_skill"; then
+  echo "merge protocol must report stranded issues without closing them" >&2
+  exit 1
+fi
+
+close_keyword_fixture="$fixture/close-keyword"
+close_keyword_plugin="$close_keyword_fixture/plugin"
+close_keyword_script="$close_keyword_fixture/check.sh"
+close_keyword_trace="$close_keyword_fixture/trace.jsonl"
+close_keyword_calls="$close_keyword_fixture/gh-as.calls"
+mkdir -p "$close_keyword_plugin/scripts"
+
+# Extract the runnable part of pass step 4, dropping Markdown indentation and
+# stopping at its closing fence. The assertions below therefore exercise the
+# same jq construction and outcome selection the gatekeeper is instructed to
+# run, rather than a test-only reimplementation.
+awk '
+  /^     declared='\''\[\]'\''$/ { copying = 1 }
+  copying && /^     ```$/ { exit }
+  copying { sub(/^     /, ""); print }
+' "$merge_skill" >"$close_keyword_script"
+grep -Fq 'close_outcome="all-closed"' "$close_keyword_script"
+grep -Fq 'close_outcome="some-open"' "$close_keyword_script"
+grep -Fq 'close_outcome="none-declared"' "$close_keyword_script"
+
+cat >"$close_keyword_plugin/scripts/gh-as.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+role="$1"
+repository="$2"
+shift 2
+[ "$role" = "gatekeeper" ]
+[ "$repository" = "example-org/example-repo" ]
+printf '%s %s %s\n' "$role" "$repository" "$*" >>"$FAKE_CLOSE_CALLS"
+
+[ "$1" = "gh" ]
+shift
+if [ "$1 $2" = "pr view" ]; then
+  if [ "$FAKE_CLOSE_MODE" = "check-failure" ]; then
+    exit 111
+  elif [ "$FAKE_CLOSE_MODE" = "none-declared" ]; then
+    printf '%s\n' '{"closingIssuesReferences":[]}'
+  else
+    printf '%s\n' '{"closingIssuesReferences":[{"number":50}]}'
+  fi
+elif [ "$1 $2" = "issue view" ] && [ "$3" = "50" ]; then
+  if [ "$FAKE_CLOSE_MODE" = "some-open" ]; then
+    printf '%s\n' '{"number":50,"state":"OPEN","title":"Synthetic stranded issue"}'
+  else
+    printf '%s\n' '{"number":50,"state":"CLOSED","title":"Synthetic closed issue"}'
+  fi
+else
+  exit 64
+fi
+SH
+
+cat >"$close_keyword_plugin/scripts/trace.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+[ "$1" = "append" ]
+jq -cn --arg kind "$2" --argjson fact "$3" --argjson narration "$4" \
+  '{kind: $kind, fact: $fact, narration: $narration}' >>"$FAKE_CLOSE_TRACE"
+SH
+chmod +x "$close_keyword_plugin/scripts/gh-as.sh" \
+  "$close_keyword_plugin/scripts/trace.sh" "$close_keyword_script"
+
+run_close_keyword_check() {
+  close_mode="$1"
+  : >"$close_keyword_trace"
+  : >"$close_keyword_calls"
+  CLAUDE_PLUGIN_ROOT="$close_keyword_plugin" \
+    FAKE_CLOSE_MODE="$close_mode" \
+    FAKE_CLOSE_TRACE="$close_keyword_trace" \
+    FAKE_CLOSE_CALLS="$close_keyword_calls" \
+    repository="example-org/example-repo" pr_number=7 \
+    lease_owner="gatekeeper-fixture" \
+    head_sha="5050505050505050505050505050505050505050" \
+    bash "$close_keyword_script"
+}
+
+# #50 all-closed case: a declared issue observed CLOSED produces the complete
+# declared list, no stranded numbers, and the explicit all-closed outcome.
+run_close_keyword_check all-closed
+[ "$(wc -l <"$close_keyword_trace" | tr -d '[:space:]')" -eq 1 ]
+jq -e '
+  .kind == "close-keyword-checked"
+  and .fact.role == "gatekeeper"
+  and .fact.owner == "gatekeeper-fixture"
+  and .fact.repo == "example-org/example-repo"
+  and .fact.ref == "#7"
+  and .fact.head_sha == "5050505050505050505050505050505050505050"
+  and .fact.declared == [50]
+  and .fact.still_open == []
+  and .fact.outcome == "all-closed"
+  and .fact.check_errors == []
+' "$close_keyword_trace" >/dev/null
+[ "$(grep -c 'gatekeeper example-org/example-repo gh issue view 50 ' \
+  "$close_keyword_calls")" -eq 1 ]
+
+# #50 some-open case: issue 50 observed OPEN must remain present in still_open;
+# testing that exact number prevents a later empty-array weakening from passing.
+run_close_keyword_check some-open
+[ "$(wc -l <"$close_keyword_trace" | tr -d '[:space:]')" -eq 1 ]
+jq -e '
+  .kind == "close-keyword-checked"
+  and .fact.declared == [50]
+  and .fact.still_open == [50]
+  and .fact.outcome == "some-open"
+  and .fact.check_errors == []
+' "$close_keyword_trace" >/dev/null
+
+# #50 none-declared case: an empty closingIssuesReferences array is distinct
+# from all-closed and does not trigger an issue lookup.
+run_close_keyword_check none-declared
+[ "$(wc -l <"$close_keyword_trace" | tr -d '[:space:]')" -eq 1 ]
+jq -e '
+  .kind == "close-keyword-checked"
+  and .fact.declared == []
+  and .fact.still_open == []
+  and .fact.outcome == "none-declared"
+  and .fact.check_errors == []
+' "$close_keyword_trace" >/dev/null
+if grep -Fq ' gh issue view ' "$close_keyword_calls"; then
+  echo "close-keyword check must not invent an issue when none was declared" >&2
+  exit 1
+fi
+
+# #50 check-failure case: gh-as exit 111 is factual and conservative, never
+# silently rewritten as all-closed even though the merge already happened.
+run_close_keyword_check check-failure
+[ "$(wc -l <"$close_keyword_trace" | tr -d '[:space:]')" -eq 1 ]
+jq -e '
+  .kind == "close-keyword-checked"
+  and .fact.declared == []
+  and .fact.still_open == []
+  and .fact.outcome == "some-open"
+  and .fact.check_errors == [{
+    operation: "read-closing-references",
+    exit_code: 111
+  }]
+' "$close_keyword_trace" >/dev/null
 
 # The systemd wrapper fails closed when disarmed, backs off on its own outer
 # lease, preserves its role identity across processes, records measured cost,
@@ -670,7 +1198,12 @@ CLAUDE_CONFIG_DIR="$lease_concurrent" \
 
 # Named leases isolate the two roles, including their mutation guards. A held
 # gatekeeper lease and its guard do not block the builder lease; releasing the
-# builder lease leaves the gatekeeper lease and guard untouched.
+# builder lease leaves the gatekeeper lease and guard untouched. Seed the same
+# hostile ambient lease name that a live builder carries, then apply the suite's
+# top-level scrub so removing MANDATE_LEASE_NAME from it breaks this fixture.
+export MANDATE_LEASE_NAME=hostile.lease
+scrub_per_invocation_environment
+[ -z "${MANDATE_LEASE_NAME+x}" ]
 role_leases="$fixture/role-leases"
 CLAUDE_CONFIG_DIR="$role_leases" MANDATE_LEASE_NOW_EPOCH=150 \
   bash "$PLUGIN_ROOT/scripts/lease.sh" acquire gatekeeper-alpha 60 >/dev/null
@@ -4105,6 +4638,7 @@ jq -e '
   and .search_roots == ["/placeholder/repo-root"]
   and .bounce_all == ["label:repo-boundary"]
   and .hold_labels == []
+  and .work_ranking == []
   and .projects[0].repo == "example-org/example-repo"
   and .projects[0].delegated == ["label:user-scope"]
   and .projects[0].excluded == ["type:docs"]
@@ -5632,7 +6166,7 @@ JSON
         echo '[]'
       else
         cat <<'JSON'
-[{"number":300,"title":"Synthetic pre-floor machine merge","author":{"login":"builder-app[bot]","is_bot":true},"closingIssuesReferences":[{"number":200}],"state":"MERGED","createdAt":"2026-07-01T00:00:00Z","mergedAt":"2026-07-18T12:00:00Z","headRefOid":"0000000000000000000000000000000000000000"},{"number":301,"title":"Synthetic merge without a verdict","author":{"login":"human-contributor","is_bot":false},"closingIssuesReferences":[{"number":201}],"state":"MERGED","createdAt":"2026-07-01T00:00:00Z","mergedAt":"2026-07-20T12:00:00Z","headRefOid":"1111111111111111111111111111111111111111"},{"number":302,"title":"Synthetic merge against a failing gate","author":{"login":"builder-app","is_bot":true},"closingIssuesReferences":[],"state":"MERGED","createdAt":"2026-07-02T00:00:00Z","mergedAt":"2026-07-21T12:00:00Z","headRefOid":"2222222222222222222222222222222222222222"},{"number":303,"title":"Synthetic merge against an inconclusive gate","author":{"login":"builder-fallback[bot]","is_bot":false},"closingIssuesReferences":[],"state":"MERGED","createdAt":"2026-07-03T00:00:00Z","mergedAt":"2026-07-22T12:00:00Z","headRefOid":"3333333333333333333333333333333333333333"},{"number":304,"title":"Synthetic merge after a passing gate","author":{"login":"human-contributor","is_bot":false},"closingIssuesReferences":[{"number":204}],"state":"MERGED","createdAt":"2026-07-04T00:00:00Z","mergedAt":"2026-07-23T12:00:00Z","headRefOid":"4444444444444444444444444444444444444444"},{"number":305,"title":"Synthetic merge before a late pass","author":{"login":"builder-app","is_bot":true},"closingIssuesReferences":[],"state":"MERGED","createdAt":"2026-07-05T00:00:00Z","mergedAt":"2026-07-24T12:00:00Z","headRefOid":"5555555555555555555555555555555555555555"},{"number":306,"title":"Synthetic excused loop merge","author":{"login":"builder-app","is_bot":true},"closingIssuesReferences":[],"state":"MERGED","createdAt":"2026-07-06T00:00:00Z","mergedAt":"2026-07-25T12:00:00Z","headRefOid":"6666666666666666666666666666666666666666"},{"number":307,"title":"Synthetic human merge outside the loop","author":{"login":"human-contributor","is_bot":false},"closingIssuesReferences":[],"state":"MERGED","createdAt":"2026-07-07T00:00:00Z","mergedAt":"2026-07-26T12:00:00Z","headRefOid":"7777777777777777777777777777777777777777"}]
+[{"number":300,"title":"Synthetic pre-floor machine merge","author":{"login":"builder-app[bot]","is_bot":true},"closingIssuesReferences":[{"number":200}],"state":"MERGED","createdAt":"2026-07-01T00:00:00Z","mergedAt":"2026-07-18T12:00:00Z","headRefOid":"0000000000000000000000000000000000000000"},{"number":301,"title":"Synthetic merge without a verdict","author":{"login":"builder-app","is_bot":true},"closingIssuesReferences":[{"number":201}],"state":"MERGED","createdAt":"2026-07-01T00:00:00Z","mergedAt":"2026-07-20T12:00:00Z","headRefOid":"1111111111111111111111111111111111111111"},{"number":302,"title":"Synthetic merge against a failing gate","author":{"login":"builder-app","is_bot":true},"closingIssuesReferences":[{"number":202}],"state":"MERGED","createdAt":"2026-07-02T00:00:00Z","mergedAt":"2026-07-21T12:00:00Z","headRefOid":"2222222222222222222222222222222222222222"},{"number":303,"title":"Synthetic merge against an inconclusive gate","author":{"login":"builder-fallback[bot]","is_bot":false},"closingIssuesReferences":[{"number":203}],"state":"MERGED","createdAt":"2026-07-03T00:00:00Z","mergedAt":"2026-07-22T12:00:00Z","headRefOid":"3333333333333333333333333333333333333333"},{"number":304,"title":"Synthetic merge after a passing gate","author":{"login":"builder-app","is_bot":true},"closingIssuesReferences":[{"number":204}],"state":"MERGED","createdAt":"2026-07-04T00:00:00Z","mergedAt":"2026-07-23T12:00:00Z","headRefOid":"4444444444444444444444444444444444444444"},{"number":305,"title":"Synthetic merge before a late pass","author":{"login":"builder-app","is_bot":true},"closingIssuesReferences":[{"number":205}],"state":"MERGED","createdAt":"2026-07-05T00:00:00Z","mergedAt":"2026-07-24T12:00:00Z","headRefOid":"5555555555555555555555555555555555555555"},{"number":306,"title":"Synthetic excused loop merge","author":{"login":"builder-app","is_bot":true},"closingIssuesReferences":[{"number":206}],"state":"MERGED","createdAt":"2026-07-06T00:00:00Z","mergedAt":"2026-07-25T12:00:00Z","headRefOid":"6666666666666666666666666666666666666666"},{"number":307,"title":"Synthetic human merge outside the loop","author":{"login":"human-contributor","is_bot":false},"closingIssuesReferences":[],"state":"MERGED","createdAt":"2026-07-07T00:00:00Z","mergedAt":"2026-07-26T12:00:00Z","headRefOid":"7777777777777777777777777777777777777777"},{"number":308,"title":"Synthetic unexplained App merge","author":{"login":"builder-app","is_bot":true},"closingIssuesReferences":[],"state":"MERGED","createdAt":"2026-07-08T00:00:00Z","mergedAt":"2026-07-27T12:00:00Z","headRefOid":"9999999999999999999999999999999999999999"}]
 JSON
       fi
       ;;
@@ -5693,6 +6227,7 @@ if [ "$1" = "api" ]; then
   graphql_owner=""
   graphql_name=""
   graphql_pr_count_query=0
+  graphql_dependency_query=0
   while [ "$#" -gt 0 ]; do
     case "$1" in
       -X | --method)
@@ -5705,6 +6240,7 @@ if [ "$1" = "api" ]; then
             owner=*) graphql_owner="${2#owner=}" ;;
             name=*) graphql_name="${2#name=}" ;;
             query=*PullRequestCount*totalCount*) graphql_pr_count_query=1 ;;
+            query=*OstromDependencyGraph*) graphql_dependency_query=1 ;;
           esac
           shift 2
         else
@@ -5737,11 +6273,15 @@ if [ "$1" = "api" ]; then
     case "$graphql_owner/$graphql_name" in
       example-org/example-repo) echo 4 ;;
       example-org/hub-repo) echo 3 ;;
-      example-org/merge-invariant-repo) echo 8 ;;
+      example-org/merge-invariant-repo) echo 9 ;;
       example-org/no-gate-history-repo) echo 1 ;;
       example-org/pr-history) echo 254 ;;
       *) echo 0 ;;
     esac
+    exit 0
+  fi
+  if [ "$endpoint" = "graphql" ] && [ "$graphql_dependency_query" = "1" ]; then
+    printf '%s\n' '{"data":{"repository":{"issues":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}'
     exit 0
   fi
   if [ -z "$method" ] && [ "$has_field" = "1" ]; then
@@ -5749,6 +6289,19 @@ if [ "$1" = "api" ]; then
     exit 1
   fi
   case "$endpoint" in
+    repos/*/*/branches\?*)
+      api_repo="${endpoint#repos/}"
+      api_repo="${api_repo%%/branches\?*}"
+      case "$api_repo" in
+        example-org/merge-invariant-repo)
+          cat <<'JSON'
+[{"name":"main","commit":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},{"name":"ostrom/901-deadbeefcafe","commit":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},{"name":"ostrom/999-feedfacecafe","commit":{"sha":"cccccccccccccccccccccccccccccccccccccccc"}}]
+JSON
+          ;;
+        *) echo '[]' ;;
+      esac
+      exit 0
+      ;;
     repos/*/*/issues\?*)
       api_repo="${endpoint#repos/}"
       api_repo="${api_repo%%/issues\?*}"
@@ -7417,17 +7970,19 @@ JSONL
   chmod 644 "$unreadable_gate_log"
 fi
 
-# #147: the sweep fetches recent merged PRs separately and joins
+# #147/#219: the sweep fetches recent merged PRs separately and joins
 # them to gate.jsonl by the head SHA that landed. These synthetic merges cover
 # every invariant outcome: a pre-floor merge, no verdict at that SHA (despite
 # a verdict for the same PR at another SHA), fail, inconclusive, timely pass,
-# late pass, an explicitly excused loop merge, and a human merge outside the
-# loop. A second synthetic repository has a machine-authored historical merge
-# but no verdict history, proving that repository onboarding derives its own
-# quiet floor instead of borrowing another repository's epoch.
+# late pass, an explicitly excused loop merge, a human merge outside the loop,
+# and an App merge with neither a work order nor a verdict. The branch listing
+# also has one order-backed ostrom/ branch and one unaccounted branch. A second
+# synthetic repository has a machine-authored historical merge but no verdict
+# history, proving that repository onboarding derives its own quiet floor
+# instead of borrowing another repository's epoch.
 merge_invariant="$fixture/merge-invariant"
 merge_invariant_calls="$merge_invariant/gh-calls.log"
-mkdir -p "$merge_invariant/config/ostrom" "$merge_invariant/repo"
+mkdir -p "$merge_invariant/config/ostrom/work-orders" "$merge_invariant/repo"
 write_gatekeeper_secrets "$merge_invariant/config"
 cat >"$merge_invariant/config/ostrom/mandates.yaml" <<'YAML'
 bounce_all: []
@@ -7447,6 +8002,9 @@ projects:
     paused: false
     bounce: []
 YAML
+cat >"$merge_invariant/config/ostrom/work-orders/synthetic.json" <<'JSON'
+{"repository":"example-org/merge-invariant-repo","branch_name":"ostrom/901-deadbeefcafe","item_id":"example-org/merge-invariant-repo#901","order_id":"synthetic-order-901"}
+JSON
 cat >"$merge_invariant/config/ostrom/gate.jsonl" <<'JSONL'
 {"ts":"2026-07-19T10:00:00Z","pr":"example-org/merge-invariant-repo#301","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","verdict":"pass","already_judged":false,"conditions":[]}
 {"ts":"2026-07-21T10:00:00Z","pr":"example-org/merge-invariant-repo#302","head_sha":"2222222222222222222222222222222222222222","verdict":"fail","already_judged":false,"conditions":[]}
@@ -7465,30 +8023,37 @@ merge_invariant_output="$(
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
     bash "$PLUGIN_ROOT/scripts/sweep.sh"
 )"
-grep -q '^mandate sweep: 2 projects; 4 queue changes$' \
+grep -q '^mandate sweep: 2 projects; 6 queue changes$' \
   <<<"$merge_invariant_output"
 merge_invariant_queue="$merge_invariant/config/ostrom/queue.jsonl"
 merge_invariant_state="$merge_invariant/config/ostrom/state.json"
 jq -s -e '
-  length == 4
+  length == 6
   and all(.[];
     .repo == "example-org/merge-invariant-repo"
-    and .kind == "merge-gate-fault"
     and .state == "pending"
     and .needs_judgment == false
-    and (.mandate.scope_evidence.basis | length) > 0
   )
+  and ([.[] | select(.kind == "merge-gate-fault")] | length) == 4
+  and ([.[] | select(.kind == "unexplained-write")] | length) == 2
   and any(.[];
     .id == "example-org/merge-invariant-repo#301"
+    and .kind == "merge-gate-fault"
     and .mandate.reason == "merge gate fault: no verdict for merged head 1111111111111111111111111111111111111111"
-    and .mandate.scope_evidence.basis == ["work_order"]
-    and .mandate.scope_evidence.machine_author == null
+    and .mandate.scope_evidence.basis == ["machine_authorship", "work_order"]
+    and .mandate.scope_evidence.classification == "explained"
+    and .mandate.scope_evidence.gate_verdict == null
+    and .mandate.scope_evidence.machine_author.login == "builder-app"
     and .mandate.scope_evidence.work_order_refs == ["example-org/merge-invariant-repo#201"]
   )
   and any(.[];
     .id == "example-org/merge-invariant-repo#302"
+    and .kind == "merge-gate-fault"
     and .mandate.reason == "merge gate fault: fail verdict for merged head 2222222222222222222222222222222222222222"
-    and .mandate.scope_evidence.basis == ["machine_authorship"]
+    and .mandate.scope_evidence.basis == ["machine_authorship", "work_order", "gate_verdict"]
+    and .mandate.scope_evidence.classification == "explained"
+    and .mandate.scope_evidence.gate_verdict.verdict == "fail"
+    and .mandate.scope_evidence.gate_verdict.ts == "2026-07-21T10:00:00Z"
     and .mandate.scope_evidence.machine_author.login == "builder-app"
     and .mandate.scope_evidence.machine_author.is_bot == true
   )
@@ -7502,23 +8067,49 @@ jq -s -e '
     .id == "example-org/merge-invariant-repo#305"
     and .mandate.reason == "merge gate fault: pass recorded after merge for head 5555555555555555555555555555555555555555"
   )
+  and any(.[];
+    .id == "example-org/merge-invariant-repo#308"
+    and .kind == "unexplained-write"
+    and .mandate.reason == "unexplained write: machine-authored merge has no matching work order; merge gate fault: no verdict for merged head 9999999999999999999999999999999999999999"
+    and .mandate.scope_evidence.basis == ["machine_authorship"]
+    and .mandate.scope_evidence.classification == "unexplained"
+    and .mandate.scope_evidence.work_order_refs == []
+    and .mandate.scope_evidence.gate_verdict == null
+  )
+  and any(.[];
+    .id == "example-org/merge-invariant-repo@refs/heads/ostrom/999-feedfacecafe"
+    and .ref == "@ostrom/999-feedfacecafe"
+    and .kind == "unexplained-write"
+    and .mandate.reason == "unexplained write: pushed branch ostrom/999-feedfacecafe has no matching work order"
+    and .mandate.scope_evidence.basis == []
+    and .mandate.scope_evidence.classification == "unexplained"
+    and .mandate.scope_evidence.branch_name == "ostrom/999-feedfacecafe"
+    and .mandate.scope_evidence.matching_work_orders == []
+  )
   and (any(.[]; .id == "example-org/merge-invariant-repo#300") | not)
   and (any(.[]; .id == "example-org/merge-invariant-repo#304") | not)
   and (any(.[]; .id == "example-org/merge-invariant-repo#306") | not)
   and (any(.[]; .id == "example-org/merge-invariant-repo#307") | not)
+  and (any(.[]; .ref == "@ostrom/901-deadbeefcafe") | not)
   and (any(.[]; .repo == "example-org/no-gate-history-repo") | not)
 ' "$merge_invariant_queue" >/dev/null
 jq -e '
   .repos["example-org/merge-invariant-repo"] as $repo
   | $repo.merge_gate_fault_count == 4
+  and $repo.unexplained_write_count == 2
   and $repo.merge_gate_floor == "2026-07-19T10:00:00Z"
-  and ($repo.merge_gate_merges | length) == 8
+  and ($repo.merge_gate_merges | length) == 9
   and ($repo.merge_gate_faults | has("example-org/merge-invariant-repo#300") | not)
   and $repo.merge_gate_faults["example-org/merge-invariant-repo#301"].shape == "no_verdict"
   and $repo.merge_gate_faults["example-org/merge-invariant-repo#302"].shape == "non_pass"
   and $repo.merge_gate_faults["example-org/merge-invariant-repo#302"].verdict == "fail"
   and $repo.merge_gate_faults["example-org/merge-invariant-repo#303"].verdict == "inconclusive"
   and $repo.merge_gate_faults["example-org/merge-invariant-repo#305"].shape == "pass_after_merge"
+  and $repo.merge_gate_faults["example-org/merge-invariant-repo#308"].scope_evidence.classification == "unexplained"
+  and $repo.merge_gate_faults["example-org/merge-invariant-repo#308"].fingerprint
+    == "scope-v1|no_verdict|9999999999999999999999999999999999999999|none||true|"
+  and $repo.unexplained_branch_writes["example-org/merge-invariant-repo@refs/heads/ostrom/999-feedfacecafe"].fingerprint
+    == "branch-v1|ostrom/999-feedfacecafe|cccccccccccccccccccccccccccccccccccccccc"
   and ($repo.merge_gate_faults | has("example-org/merge-invariant-repo#304") | not)
   and ($repo.merge_gate_faults | has("example-org/merge-invariant-repo#306") | not)
   and $repo.merge_gate_excuses["example-org/merge-invariant-repo#306"].reason
@@ -7530,8 +8121,9 @@ jq -e '
 ' "$merge_invariant_state" >/dev/null
 
 # Each repository gets one complete-open query and one recency-bounded merged
-# query. Because the merge check is detective, the sweep still exits
-# successfully after finding the four faults.
+# query, plus a bounded branch listing. Because the checks are detective, the
+# sweep still exits successfully after finding the four ordinary faults and
+# two alarms.
 [ "$(grep -c $'example-org/merge-invariant-repo\tpr list ' "$merge_invariant_calls")" -eq 2 ]
 [ "$(grep -c $'example-org/no-gate-history-repo\tpr list ' "$merge_invariant_calls")" -eq 2 ]
 grep -Fq $'example-org/merge-invariant-repo\tpr list --repo example-org/merge-invariant-repo --state open --limit 200' \
@@ -7539,6 +8131,8 @@ grep -Fq $'example-org/merge-invariant-repo\tpr list --repo example-org/merge-in
 grep -Fq $'example-org/merge-invariant-repo\tpr list --repo example-org/merge-invariant-repo --state merged --search merged:>=2026-07-02 --limit 200' \
   "$merge_invariant_calls"
 grep -Fq -- '--json number,title,author,closingIssuesReferences,createdAt,mergedAt,headRefOid' \
+  "$merge_invariant_calls"
+grep -Fq -- $'-\tapi -X GET repos/example-org/merge-invariant-repo/branches?per_page=100&page=1' \
   "$merge_invariant_calls"
 
 merge_invariant_digest="$(
@@ -7548,7 +8142,14 @@ merge_invariant_digest="$(
     bash "$PLUGIN_ROOT/hooks/render-digest.sh"
 )"
 merge_invariant_digest_text="$(jq -r '.systemMessage' <<<"$merge_invariant_digest")"
+grep -q '^example-org/merge-invariant-repo: 2 unexplained writes — investigate immediately$' \
+  <<<"$merge_invariant_digest_text"
 grep -q '^example-org/merge-invariant-repo: 4 merge gate faults — /ostrom:desk triage$' \
+  <<<"$merge_invariant_digest_text"
+grep -q '^UNEXPLAINED WRITES — INVESTIGATE NOW$' <<<"$merge_invariant_digest_text"
+grep -q '^example-org/merge-invariant-repo#308  Synthetic unexplained App merge — unexplained write:' \
+  <<<"$merge_invariant_digest_text"
+grep -q '^example-org/merge-invariant-repo@ostrom/999-feedfacecafe  Pushed branch ostrom/999-feedfacecafe — unexplained write:' \
   <<<"$merge_invariant_digest_text"
 grep -q '^MERGE GATE FAULTS$' <<<"$merge_invariant_digest_text"
 grep -q '^example-org/merge-invariant-repo#301  Synthetic merge without a verdict — merge gate fault:' \
@@ -7817,6 +8418,7 @@ git -C "$hold_source" remote add origin \
   https://github.com/example-org/hold-repo.git
 write_hold_config() {
   hold_pattern="$1"
+  ranked_item="${2:-}"
   if [ "$hold_pattern" = absent ]; then
     hold_config_line=""
   elif [ "$hold_pattern" = empty ]; then
@@ -7825,11 +8427,18 @@ write_hold_config() {
     hold_config_line="hold_labels:
   - $hold_pattern"
   fi
+  if [ -n "$ranked_item" ]; then
+    work_ranking_line="work_ranking:
+  - $ranked_item"
+  else
+    work_ranking_line="work_ranking: []"
+  fi
   cat >"$hold/config/ostrom/mandates.yaml" <<YAML
 stuck_after_days: 1
 search_roots:
   - $hold_search_root
 $hold_config_line
+$work_ranking_line
 bounce_all: []
 projects:
   - repo: example-org/hold-repo
@@ -7922,6 +8531,23 @@ jq -s -e '
   and .[0].mandate.reason == "hold label status:*"
   and ([.[] | select(.kind == "stuck")] | length) == 0
 ' "$hold_queue" >/dev/null
+
+# The shell sweep reads the same durable ranking as the selector. A pointer
+# absent from the successfully acquired open-item records persists as a drift
+# fault and is copied into state for both the builder and brief.
+write_hold_config 'status:*' 'example-org/hold-repo#404'
+run_hold_sweep '2026-08-08T00:00:00Z' parked
+jq -s -e '
+  any(.[];
+    .id == "example-org/hold-repo#404"
+    and .kind == "drift"
+    and .mandate.reason
+      == "work_ranking item no longer exists: example-org/hold-repo#404")
+' "$hold_queue" >/dev/null
+jq -e '
+  .work_ranking == ["example-org/hold-repo#404"]
+  and .work_ranking_faults == ["example-org/hold-repo#404"]
+' "$hold_state" >/dev/null
 
 # #146: semantic derivation is a fixture-backed port beside the unchanged
 # mechanical verdict. The fixture deliberately obeys hostile body text for #3
@@ -8858,6 +9484,11 @@ projects:
     bounce:
       - title:*release*
       - path:.github/workflows/**
+      - label:principal-review
+      - scope:infra
+      - type:feat
+      - ref:#42
+      - substance:fly-spend
     reserved:
       - 99
 YAML
@@ -8892,7 +9523,7 @@ if [ "$1 $2" = "pr view" ]; then
     --arg mode "${FAKE_GATE_MODE:-pass}" \
     --arg title "$(
       if [ "${FAKE_GATE_MODE:-pass}" = "tier" ]; then
-        printf '%s' 'release: publish placeholder artifact'
+        printf '%s' 'feat(infra): release placeholder artifact'
       else
         printf '%s' 'fix(core): safe placeholder change'
       fi
@@ -8902,13 +9533,13 @@ if [ "$1 $2" = "pr view" ]; then
         title: $title,
         author: {login: "builder-login"},
         headRefOid: $head,
-        labels: [],
+        labels: (if $mode == "tier" then [{name: "principal-review"}] else [] end),
         statusCheckRollup: [{
           name: "verify-linux",
           status: "COMPLETED",
           conclusion: $conclusion
         }],
-        closingIssuesReferences: [],
+        closingIssuesReferences: (if $mode == "tier" then [{number: 42}] else [] end),
         mergeable: $mergeable,
         isDraft: $is_draft
       }
@@ -8920,11 +9551,99 @@ if [ "$1 $2" = "pr view" ]; then
   exit 0
 fi
 if [ "$1 $2" = "pr diff" ]; then
-  if [ "${FAKE_GATE_MODE:-pass}" = "tier" ]; then
-    printf '%s\n' '.github/workflows/placeholder.yml'
-  else
-    printf '%s\n' 'src/placeholder.sh'
+  name_only=false
+  for argument in "$@"; do
+    if [ "$argument" = "--name-only" ]; then
+      name_only=true
+    fi
+  done
+  if [ "$name_only" = true ]; then
+    case "${FAKE_GATE_MODE:-pass}" in
+      fly-*|diff-content-error) printf '%s\n' 'deploy/fly.toml' ;;
+      tier) printf '%s\n' '.github/workflows/placeholder.yml' ;;
+      *) printf '%s\n' 'src/placeholder.sh' ;;
+    esac
+    exit 0
   fi
+  if [ -n "${FAKE_GATE_CALL_LOG:-}" ]; then
+    printf '%s\n' 'diff-content' >>"$FAKE_GATE_CALL_LOG"
+  fi
+  case "${FAKE_GATE_MODE:-pass}" in
+    diff-content-error)
+      echo 'placeholder diff content could not be fetched' >&2
+      exit 1
+      ;;
+    fly-env)
+      cat <<'DIFF'
+diff --git a/deploy/fly.toml b/deploy/fly.toml
+index 1111111..2222222 100644
+--- a/deploy/fly.toml
++++ b/deploy/fly.toml
+@@ -1,4 +1,4 @@
+ [env]
+-  region = "placeholder-old"
++  region = "placeholder-new"
+ [http_service]
+DIFF
+      ;;
+    fly-machine)
+      cat <<'DIFF'
+diff --git a/deploy/fly.toml b/deploy/fly.toml
+index 1111111..2222222 100644
+--- a/deploy/fly.toml
++++ b/deploy/fly.toml
+@@ -1,2 +1,2 @@
+ [[vm]]
+-size = "shared-cpu-placeholder"
++size = "performance-placeholder"
+DIFF
+      ;;
+    fly-count)
+      cat <<'DIFF'
+diff --git a/deploy/fly.toml b/deploy/fly.toml
+index 1111111..2222222 100644
+--- a/deploy/fly.toml
++++ b/deploy/fly.toml
+@@ -1 +1 @@
+-count = 1
++count = 2
+DIFF
+      ;;
+    fly-region)
+      cat <<'DIFF'
+diff --git a/deploy/fly.toml b/deploy/fly.toml
+index 1111111..2222222 100644
+--- a/deploy/fly.toml
++++ b/deploy/fly.toml
+@@ -1 +1 @@
+-region = "placeholder-a"
++region = "placeholder-b"
+DIFF
+      ;;
+    fly-scaling)
+      cat <<'DIFF'
+diff --git a/deploy/fly.toml b/deploy/fly.toml
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/deploy/fly.toml
+@@ -0,0 +1,2 @@
++[scaling]
++count = 2
+DIFF
+      ;;
+    *)
+      cat <<'DIFF'
+diff --git a/src/placeholder.sh b/src/placeholder.sh
+index 1111111..2222222 100644
+--- a/src/placeholder.sh
++++ b/src/placeholder.sh
+@@ -1 +1 @@
+-placeholder=old
++placeholder=new
+DIFF
+      ;;
+  esac
   exit 0
 fi
 if [ "$1 $2" = "api graphql" ]; then
@@ -9104,15 +9823,19 @@ run_gate() {
   gate_mode="$1"
   gate_number="$2"
   gate_head="$3"
+  gate_config_dir="${4:-$gate_fixture/config}"
   gate_output_file="$gate_fixture/$gate_mode-$gate_number-$gate_head.out"
+  gate_call_log="$gate_fixture/$gate_mode-$gate_number-$gate_head.calls"
+  : >"$gate_call_log"
   set +e
   (
     cd "$gate_fixture/repo"
     PATH="$gate_fixture/bin:$PATH" \
       FAKE_GATE_MODE="$gate_mode" \
       FAKE_GATE_HEAD="$gate_head" \
+      FAKE_GATE_CALL_LOG="$gate_call_log" \
       MANDATE_GATE_TIME="2026-08-04T12:00:00Z" \
-      CLAUDE_CONFIG_DIR="$gate_fixture/config" \
+      CLAUDE_CONFIG_DIR="$gate_config_dir" \
       CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
       bash "$PLUGIN_ROOT/scripts/gate.sh" \
         "placeholder-org/placeholder-repo#$gate_number"
@@ -9177,6 +9900,63 @@ grep -q '"selector":"title:\*release\*","tier":"author-written"' \
   <<<"$tier_line"
 grep -q '"selector":"path:.github/workflows/\*\*","tier":"content-derived"' \
   <<<"$tier_line"
+grep -q '"selector":"label:principal-review","tier":"author-written"' \
+  <<<"$tier_line"
+grep -q '"selector":"scope:infra","tier":"author-written"' \
+  <<<"$tier_line"
+grep -q '"selector":"type:feat","tier":"author-written"' \
+  <<<"$tier_line"
+grep -q '"selector":"ref:#42","tier":"content-derived"' \
+  <<<"$tier_line"
+
+# Substance predicates inspect one reusable unified diff rather than treating
+# any change to fly.toml as spend. Even a sensitive-looking lower-case env key
+# remains outside the predicate while the hunk is observably inside [env].
+run_gate fly-env 18 1818181818181818
+[ "$gate_status" -eq 0 ]
+grep -q '^condition bounce_selectors: pass tier=none ' <<<"$gate_output"
+
+assert_fly_spend_bounces() {
+  fly_mode="$1"
+  fly_number="$2"
+  fly_head="$3"
+  run_gate "$fly_mode" "$fly_number" "$fly_head"
+  [ "$gate_status" -eq 1 ]
+  fly_line="$(grep '^condition bounce_selectors: fail ' <<<"$gate_output")"
+  grep -q 'tier=content-derived ' <<<"$fly_line"
+  grep -q '"selector":"substance:fly-spend","tier":"content-derived"' \
+    <<<"$fly_line"
+}
+
+assert_fly_spend_bounces fly-machine 19 1919191919191919
+[ "$(grep -c '^diff-content$' "$gate_call_log")" -eq 1 ]
+assert_fly_spend_bounces fly-count 20 2020202020202020
+assert_fly_spend_bounces fly-region 21 2121212121212121
+assert_fly_spend_bounces fly-scaling 22 2222222222222223
+
+# A configured, known predicate fails closed when the one diff-content fetch
+# fails: it is unobservable and makes the condition inconclusive, never pass.
+run_gate diff-content-error 23 2323232323232323
+[ "$gate_status" -eq 2 ]
+diff_error_line="$(grep '^condition bounce_selectors: inconclusive ' <<<"$gate_output")"
+grep -q '"selector":"substance:fly-spend","tier":"content-derived"' \
+  <<<"$diff_error_line"
+grep -q 'placeholder diff content could not be fetched' <<<"$diff_error_line"
+
+# Predicate names are a closed set. The config syntax admits future names,
+# but gate evaluation reports an unknown name as unobservable.
+unknown_substance_config="$gate_fixture/unknown-substance-config"
+mkdir -p "$unknown_substance_config/ostrom"
+sed 's/substance:fly-spend/substance:placeholder-unknown/' \
+  "$gate_fixture/config/ostrom/gate.yaml" \
+  >"$unknown_substance_config/ostrom/gate.yaml"
+run_gate unknown-substance 24 2424242424242424 "$unknown_substance_config"
+[ "$gate_status" -eq 2 ]
+unknown_substance_line="$(grep '^condition bounce_selectors: inconclusive ' <<<"$gate_output")"
+grep -q '"selector":"substance:placeholder-unknown","tier":"content-derived"' \
+  <<<"$unknown_substance_line"
+grep -q 'unknown substance predicate: placeholder-unknown' \
+  <<<"$unknown_substance_line"
 
 run_gate unknown-check 7 cccccccccccccccc
 [ "$gate_status" -eq 2 ]
@@ -9305,7 +10085,7 @@ if grep -q '^condition bounce_selectors: excused ' <<<"$gate_output"; then
 fi
 
 gate_log="$gate_fixture/config/ostrom/gate.jsonl"
-[ "$(wc -l <"$gate_log" | tr -d '[:space:]')" -eq 19 ]
+[ "$(wc -l <"$gate_log" | tr -d '[:space:]')" -eq 25 ]
 jq -s -e '
   ([.[] | select(.pr == "placeholder-org/placeholder-repo#8")]
     | map({head_sha, already_judged}))

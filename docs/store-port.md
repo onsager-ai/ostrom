@@ -27,6 +27,13 @@ part of the same typed configuration that selected the sweep inputs; the
 existing scratch-config guard is evaluated before any configured publish
 destination is contacted.
 
+The check executor has a parallel `ostrom-core::CheckStore` boundary. One
+`CheckRun` is one transaction and may contain zero receipts: a stored empty run
+means the executor ran and selected nothing, while no stored runs means it has
+never run. Implementations key idempotency by `run_id`. The in-tree
+`ostrom-store::JsonlCheckStore` appends compact records to
+`check-runs.jsonl` beneath the resolved XDG state root (or `OSTROM_HOME`).
+
 ## Out-of-tree implementations
 
 Consumers should pin a Git revision of this repository and depend on

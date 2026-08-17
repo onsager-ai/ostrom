@@ -27,6 +27,12 @@ say so and stop. The optional root-level `hold_labels` list contains
 case-insensitive label globs; matching delegated work remains in the queue as
 `kind: "parked"` but is not execution debt while that label remains.
 
+The optional root-level `work_ranking` is a highest-first ordered list of
+canonical item IDs recorded by the principal. Read it as a fact, never as an
+approval or authorization change. Confirm that `state.json` records the same
+list from the last sweep and read `work_ranking_faults`; a mismatch means the
+ranking has not been swept, while a non-empty fault list names stale pointers.
+
 Read `~/.claude/ostrom/direction.md` only if it exists. Use recorded direction
 calls to note concrete conflicts with queued items. If the file is absent,
 continue with structural output. Never create it.
@@ -39,6 +45,7 @@ Run:
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/queue.sh" list
 jq '.repos | to_entries | map({repo: .key, items: .value.items, item_cap: .value.item_cap})' \
   "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/ostrom/state.json"
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/trace.sh" read
 ```
 
 Use only pending and deferred rows. The sweep fields are facts, not agent
@@ -48,6 +55,13 @@ empty; do not rewrite the queue.
 
 Count `parked` rows separately and do not place them in an execution or
 judgment bucket.
+
+From the trace, keep `plan-selection` facts and calculate the plan match rate
+over selections where `plan_status` is `applied` or `rejected`; selections
+where it is `absent` are reported separately and are not part of that
+denominator. Count rejection clauses and choose the largest count as the
+dominant clause (break ties lexically). Treat malformed trace input as missing
+observability, never as a queue fact.
 
 Resolve every `blocked_by` pointer read-only. A pointer still present in the
 last sweep state is unsatisfied. For a pointer outside that state, use `gh` to
@@ -79,6 +93,21 @@ approval.
 ## 4. Report
 
 Lead with honest counts for all three buckets and the unclassified remainder.
+Immediately after the counts, show **Active work ranking** as the ordered item
+IDs, or `none`. Name every `work_ranking_faults` pointer beside it so stale
+direction is conspicuous rather than silently omitted. The structural buckets
+remain authorization-aware; a ranked held, reserved, tripwire, deferred, or
+otherwise unauthorized row stays in its existing bucket.
+
+Immediately after **Active work ranking**, show **Plan match rate** for the
+current sprint trace. Render a positive rate as `A/P (R%); dominant rejection:
+CLAUSE (N); no plan present: S` (use `none (0)` when there were no rejections,
+and round `R` to the nearest whole percent). A zero rate must read `0/P (0%) —
+PROBLEM: computed plans never applied; dominant rejection: CLAUSE (N); no plan
+present: S`. If every recorded selection has `plan_status: absent`, render `not
+yet measurable — no plan present in S selections`; if there are no selection
+records, render `unavailable — no selections recorded`. Never combine absent
+plans with rejected plans.
 Then show each bucket in proposed order with the resolvable
 `owner/repo#number`, title, age, aged-out state, dependency status, and concise
 rationale. End with `Could not classify: none.` or a line naming every omitted

@@ -11,17 +11,41 @@
 //! additions may land in minor releases; breaking changes require a minor
 //! version bump and migration notes.
 
+mod check;
 mod domain;
+mod plan;
 mod store;
+mod work_graph;
 
 #[cfg(feature = "conformance")]
 pub mod conformance;
 
+pub use check::{
+    ActionDefinition, AgentParameters, CHECKS_VERSION, Catalogue, CatalogueEnumeration, CheckBasis,
+    CheckContractError, CheckDefinition, CheckDocument, CheckEvaluation, CheckFault, CheckReceipt,
+    CheckState, CheckVerdict, DefinitionDigest, Evidence, EvidenceBundleItem, EvidenceReference,
+    FreshnessError, JudgeStamp, JudgmentClause, JudgmentInput, JudgmentRunnerStamp, RESULT_VERSION,
+    RecordedOutput, ResolvedCheck, RunnerStamp, agent_parameters, receipt_digest, resolve_check,
+    resolve_fresh_for, select_check,
+};
 pub use domain::{
     ConfigError, DefaultDisposition, GateConfig, GateProject, Mandate, MandateConfig,
     ProjectMandate, RepositoryName, Role, Selector, SelectorError, Verdict,
 };
+pub use plan::{
+    Acknowledgement, AcknowledgementResponse, Assessment, AssessmentDraft, AssessmentError,
+    Because, Consequence, EvaluatedCheck, GOALS_VERSION, Goal, GoalAction, GoalActionVerb,
+    GoalBasis, GoalFacts, GoalService, GoalState, GoalsDocument, GoalsError, Impediment,
+    MetWhenStatus, MilestoneFact, MilestoneInput, MovementFact, PLAN_VERSION, ProgressFact,
+    QueueItem, Reading, cited_fact_basis, compose_ranking, consequence, derive_goal_facts,
+    fact_table, mechanical_ranking, validate_assessment,
+};
 pub use store::{
-    AttemptOutcome, GateFact, PassAttempt, PassId, QueueFact, QueueKind, QueueState, RepoStateFact,
+    AttemptOutcome, CHECK_STORE_SCHEMA_VERSION, CheckRun, CheckRunId, CheckStore, CheckStoreFault,
+    GateFact, PassAttempt, PassId, QueueFact, QueueKind, QueueState, RepoStateFact,
     STORE_SCHEMA_VERSION, StoreFault, SweepPass, SweepStore, WriteDisposition,
+};
+pub use work_graph::{
+    WORK_GRAPH_VERSION, WorkEdge, WorkEdgeSource, WorkGraph, WorkGraphFault, WorkGraphNode,
+    WorkNodeInput, build_work_graph,
 };

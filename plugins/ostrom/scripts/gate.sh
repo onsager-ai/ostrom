@@ -137,6 +137,22 @@ else
 fi
 diff_error="$(error_text "$work/diff-error")"
 
+diff_content_ready=0
+diff_content_error="diff content was not requested"
+: >"$work/diff"
+if [ "$config_ready" -eq 1 ] && jq -ne '
+  (($config[0].bounce_all // []) + ($project[0].bounce // []))
+  | any(.[]; startswith("substance:"))
+' --slurpfile config "$work/config.json" \
+  --slurpfile project "$work/project.json" >/dev/null; then
+  if gh pr diff "$number" --repo "$repo" \
+    >"$work/diff" 2>"$work/diff-content-error"; then
+    diff_content_ready=1
+  else
+    diff_content_error="$(error_text "$work/diff-content-error")"
+  fi
+fi
+
 threads_ready=0
 threads_error=""
 thread_author=""
@@ -416,8 +432,11 @@ else
   jq -cn \
     --argjson metadata_ready "$metadata_ready" \
     --argjson diff_ready "$diff_ready" \
+    --argjson diff_content_ready "$diff_content_ready" \
     --arg metadata_error "$metadata_error" \
     --arg diff_error "$diff_error" \
+    --arg diff_content_error "$diff_content_error" \
+    --rawfile diff_content "$work/diff" \
     --slurpfile config "$work/config.json" \
     --slurpfile project "$work/project.json" \
     --slurpfile pr "$work/pr-safe.json" \
@@ -464,6 +483,86 @@ else
               | map(select(length > 0))
             )
           };
+      def substance_known($name):
+        $name == "fly-spend";
+      def fly_table:
+        ((try capture(
+          "^\\[{1,2}[[:space:]]*(?<table>[A-Za-z0-9_.-]+)[[:space:]]*\\]{1,2}(?:[[:space:]]*#.*)?$"
+        ).table catch null) // null);
+      def fly_spend_table($table):
+        (($table // "") | split(".") | last) | IN("vm", "scaling");
+      def fly_spend_line($table):
+        (gsub("^[[:space:]]+"; "")) as $content
+        | ($content | test(
+            "^(?:[A-Za-z0-9_-]+\\.)*(?:vm|memory|cpu|cpus|count|region)[[:space:]]*="
+          ))
+          or ($content | test(
+            "^\\[{1,2}[[:space:]]*(?:[A-Za-z0-9_-]+\\.)*(?:vm|scaling)[[:space:]]*\\]{1,2}(?:[[:space:]]*#.*)?$"
+          ))
+          or (
+            fly_spend_table($table)
+            and (($content | fly_table) == null)
+            and ($content | test("^[A-Za-z0-9_.-]+[[:space:]]*="))
+          );
+      def fly_spend($item):
+        reduce ($item.diff | split("\n")[]) as $line
+          ({
+            old_path: "", new_path: "", old_table: null, new_table: null,
+            in_hunk: false, matched: false
+          };
+            if $line | startswith("diff --git ")
+            then .old_path = "" | .new_path = ""
+              | .old_table = null | .new_table = null | .in_hunk = false
+            elif ($line | startswith("--- ")) and (.in_hunk | not)
+            then .old_path = (
+              $line | ltrimstr("--- ") | gsub("^\"|\"$"; "") | ltrimstr("a/")
+            )
+            elif ($line | startswith("+++ ")) and (.in_hunk | not)
+            then .new_path = (
+              $line | ltrimstr("+++ ") | gsub("^\"|\"$"; "") | ltrimstr("b/")
+            )
+            elif $line | startswith("@@")
+            then .old_table = null | .new_table = null | .in_hunk = true
+            elif .in_hunk
+              and ((.old_path | test("(^|/)fly\\.toml$"))
+                or (.new_path | test("(^|/)fly\\.toml$")))
+              and ($line | startswith(" "))
+            then ($line[1:] | fly_table) as $table
+              | if $table == null then .
+                else .old_table = $table | .new_table = $table
+                end
+            elif .in_hunk
+              and ((.old_path | test("(^|/)fly\\.toml$"))
+                or (.new_path | test("(^|/)fly\\.toml$")))
+              and ($line | startswith("-"))
+            then ($line[1:]) as $content
+              | ($content | fly_table) as $table
+              | (.old_table) as $section
+              | if $section != "env" and ($content | fly_spend_line($section))
+                then .matched = true
+                else .
+                end
+              | if $table == null then . else .old_table = $table end
+            elif .in_hunk
+              and ((.old_path | test("(^|/)fly\\.toml$"))
+                or (.new_path | test("(^|/)fly\\.toml$")))
+              and ($line | startswith("+"))
+            then ($line[1:]) as $content
+              | ($content | fly_table) as $table
+              | (.new_table) as $section
+              | if $section != "env" and ($content | fly_spend_line($section))
+                then .matched = true
+                else .
+                end
+              | if $table == null then . else .new_table = $table end
+            else .
+            end
+          )
+        | .matched;
+      def substance_match($item; $name):
+        if $name == "fly-spend" then fly_spend($item)
+        else false
+        end;
       def selector_match($item; $selector):
         ($item) as $bound_item
         | ($selector) as $bound_selector
@@ -482,11 +581,13 @@ else
           then any($bound_item.refs[]?; ("#" + tostring) == $parsed.glob)
           elif $parsed.prefix == "title"
           then glob_match($bound_item.title; $parsed.glob; false)
+          elif $parsed.prefix == "substance"
+          then substance_match($bound_item; $parsed.glob)
           else false
           end;
       def tier($selector):
         ($selector | capture("^(?<prefix>[^:]+):").prefix) as $prefix
-        | if $prefix == "path" or $prefix == "ref"
+        | if $prefix == "path" or $prefix == "ref" or $prefix == "substance"
           then "content-derived"
           else "author-written"
           end;
@@ -496,6 +597,7 @@ else
             title: ($raw.title // ""),
             labels: [($raw.labels // [])[]? | .name // empty],
             files: ($paths[0] // []),
+            diff: $diff_content,
             refs: (
               [($raw.number // empty)]
               + [($raw.closingIssuesReferences // [])[]? | .number // empty]
@@ -506,8 +608,13 @@ else
       | ([
           $selectors[]
           | . as $selector
-          | ($selector | capture("^(?<prefix>[^:]+):").prefix) as $prefix
-          | (if $prefix == "path" then $diff_ready == 1 else $metadata_ready == 1 end) as $observable
+          | ($selector | capture("^(?<prefix>[^:]+):(?<value>.*)$")) as $parsed
+          | ($parsed.prefix) as $prefix
+          | (if $prefix == "path" then $diff_ready == 1
+             elif $prefix == "substance"
+             then substance_known($parsed.value) and $diff_content_ready == 1
+             else $metadata_ready == 1
+             end) as $observable
           | {
               selector: $selector,
               tier: tier($selector),
@@ -516,6 +623,9 @@ else
               error: (
                 if $observable then null
                 elif $prefix == "path" then $diff_error
+                elif $prefix == "substance" and (substance_known($parsed.value) | not)
+                then "unknown substance predicate: " + $parsed.value
+                elif $prefix == "substance" then $diff_content_error
                 else $metadata_error
                 end
               )

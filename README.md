@@ -47,7 +47,7 @@ inside one plugin.
 - `plugins/ostrom/dist/doctor.js` — committed, zero-runtime-dependency `/ostrom:doctor` bundle
 - `crates/ostrom-core/` — pure Rust domain types and the async, substrate-neutral store port
 - `crates/ostrom-store/` — XDG paths plus legacy-compatible JSONL/file persistence
-- `crates/ostrom-cli/` — the additive phase-1 `ostrom` binary
+- `crates/ostrom-cli/` — the additive `ostrom` binary and sweep entry point
 - `repo-pointer/settings.json` — snippet to merge into each target repo's `.claude/settings.json`
 - `bootstrap.sh` — one command to make a fresh environment ostrom-aware (user-level enroll + config provisioning)
 - `LICENSE` — MIT
@@ -60,18 +60,36 @@ the installed plugin cache. Changing a skill body requires changing the
 `version` field in that same plugin's `.claude-plugin/plugin.json`. CI enforces
 this requirement per plugin so a protocol change cannot remain hidden behind
 an unchanged cache key.
-### Rust CLI (phase 1)
+### Rust CLI (phase 2)
 
-The Rust workspace is additive: systemd and the plugin still invoke the Bash
-scripts. The new reader resolves config with
+The Rust workspace remains additive: systemd and the plugin still invoke the
+Bash scripts until an operator performs the cutover. The binary resolves config with
 `ProjectDirs::from("ai", "onsager", "ostrom")` and state through the matching
 XDG state directory. Setting `OSTROM_HOME` explicitly makes both roots that
 directory, which is the hermetic test and parity surface.
 
 ```bash
 cargo run -p ostrom-cli -- queue list --format=json
-OSTROM_HOME=/path/to/ostrom-state scripts/queue-parity.sh
+OSTROM_HOME=/path/to/ostrom-state cargo run -p ostrom-cli -- sweep
+OSTROM_HOME=/path/to/ostrom-state cargo run -p ostrom-cli -- plan
 ```
+
+`ostrom sweep` authenticates once per distinct roster organization, performs
+bounded issue, open-PR, recent-merge, and default-branch CI reads, and writes
+the private queue and incremental state. Publishing is disabled unless an
+explicit typed destination is supplied with `--publish-repository owner/repo`;
+a scratch `OSTROM_HOME` can therefore never inherit the production hub target.
+The checked-in Bash sweep remains the live fallback and is not invoked by the
+Rust sweep.
+
+`ostrom plan` runs that same sweep first, then strictly reads `goals.yaml`,
+mirrors durable check receipts, derives goal facts, and writes private
+`plan.json` plus its acknowledgement ledger. Semantic assessment is an
+explicit executable port named by `OSTROM_PLAN_DERIVER`; when it is absent or
+returns an invalid/uncited result, the plan records a visible fault and keeps a
+mechanical authorization-preserving ranking. The builder selector consumes a
+plan only when its queue basis and principal `work_ranking` still match,
+otherwise it visibly falls back to the existing ordering.
 
 `ostrom migrate` moves legacy files into the XDG roots after refusing any
 unexpired named lease. It rewrites in-tree private-key paths, preserves key
@@ -87,6 +105,24 @@ and pre-1.0 semver policy are documented in
 [`docs/store-port.md`](docs/store-port.md).
 
 ## Install
+
+### CLI (primary)
+
+The primary CLI distribution is npm:
+
+```sh
+npm install --global @ostrom/cli
+ostrom --version
+```
+
+The npm package is a thin launcher around a platform-specific optional
+dependency. The compiled binary is already inside that dependency: installation
+does not download or modify an executable with a lifecycle script. Prebuilt
+packages cover Linux x64/arm64, macOS x64/arm64, and Windows x64.
+
+For a source checkout, `cargo install --path crates/ostrom-cli` is the fallback.
+
+### Claude Code plugin
 
 ```
 /plugin marketplace add onsager-ai/ostrom
@@ -150,6 +186,13 @@ Each project may set `max_implementers_per_repository` to a positive integer;
 omitting it defaults to 1. This per-repository limit prevents implementer
 branches from colliding. It is independent of `MANDATE_MAX_IMPLEMENTERS`, the
 global dispatch capacity limit for shared compute and budget.
+
+The root `work_ranking` list records principal direction as highest-first
+`owner/repo#number` pointers. It reorders only delegated work that is already
+dispatchable; reserved refs, tripwires, holds, deferrals, and selector
+boundaries keep precedence. The shipped empty list preserves oldest-first
+selection exactly. A sweep exposes a pointer that no longer exists as a queue
+and state fault rather than silently dropping it.
 
 Classification precedence is reserved → shared/project bounce → excluded →
 delegated → `default`. The default is `unclassified`, which produces one

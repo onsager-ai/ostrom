@@ -18,6 +18,10 @@ search_roots:
 hold_labels:
   - status:parked
 
+# Highest-first direction over work that is already dispatchable. Leave empty
+# to retain oldest-first exactly; this does not override any selector or hold.
+work_ranking: []
+
 bounce_all:
   - title:*merge to main*
   - title:*production deployment*

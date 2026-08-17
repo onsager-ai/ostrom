@@ -112,6 +112,9 @@ Then read, in order:
   project delegates entirely and what bounces back. Its optional root-level
   `hold_labels` list contains case-insensitive label globs; a matching otherwise
   delegated item remains visible as `kind: "parked"` but is not dispatchable.
+  Its optional root-level `work_ranking` is a highest-first list of canonical
+  `owner/repo#number` item IDs. It orders only work that is dispatchable after
+  every authorization and hold check; it never changes that candidate set.
 - `~/.claude/ostrom/queue.jsonl` — what the last sweep found. Rows are
   pointers, so resolve titles from GitHub rather than trusting cached text.
 - The SessionStart digest, if it is in context.
@@ -143,11 +146,44 @@ If the `/ostrom:work` invocation includes an optional focus, use that direct
 invocation input as a natural-language filter over the queue, such as `one
 repository only` or `just tripwires`. Otherwise take items in this order:
 **pending tripwires and reserved refs → CI drift → open review threads on
-your own pull requests → delegated work**, oldest first. An approved
+your own pull requests → delegated work**. An approved
 tripwire is no longer a boundary; it belongs in the delegated tier. Never
 select a `parked` row in any tier, regardless of its state: a `parked` row is
 never a dispatch candidate. It remains in the queue only so deliberately held
 work stays visible until its hold label is removed.
+
+For the delegated tier, do not infer importance from titles, bodies, labels,
+sentiment, or backlog heuristics. Use the mechanical selector, retaining every
+item ID already attempted in this pass and passing those IDs on later calls:
+
+```sh
+selected_row="$(bash "${CLAUDE_PLUGIN_ROOT}/scripts/select-work.sh" \
+  select "$lease_owner" "${attempted_item_ids[@]}")"
+```
+
+Exit 3 means no delegated candidate remains. Any other nonzero exit is a
+selection fault; stop the pass through step 8 rather than choosing by hand.
+The helper first fixes the dispatchable set: pending tripwires and reserved
+decisions, `parked` or `deferred` rows, and anything not already authorized
+are excluded before ranking. It then reads the resolved `work_ranking`.
+With an empty list it emits the exact legacy order, `(opened, id)`, without a
+dependency tie-break or any other new judgment. With a non-empty list, named
+dispatchable items come first in recorded order; among unranked items, prefer
+the item named by the most other queue rows' `blocked_by` edges, then fall back
+to `(opened, id)`. This is only a direct unblock preference, not a dependency
+graph executor.
+
+The sweep verifies every ranked pointer against its authorization-neutral
+open-item records. A pointer that no longer exists becomes a visible `drift`
+row and makes the selector fail; never silently skip it. When the helper takes
+an item ahead of the oldest remaining candidate, it appends `work-ranked`
+before returning the row. The fact names `work_ranking` and its recorded
+position, or `dependency-unblocks` when that tie-break caused the departure.
+Treat failure of that trace append as a selection failure. Direct invocation
+focus may inspect the helper's `list` output, derive the IDs outside the focus,
+and pass those IDs to `select` beside the already-attempted IDs. Do not choose
+directly from `list`: `select` is what preserves the relative order and writes
+the required trace.
 
 Within CI drift, a red **default branch** outranks a red pull request. A broken
 `main` invalidates every pull request built on it, so fixing a PR's checks

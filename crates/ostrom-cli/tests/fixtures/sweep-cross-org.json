@@ -1,0 +1,93 @@
+{
+  "repositories": [
+    {
+      "repo": "example-org/example-repo",
+      "issues": [
+        {
+          "number": 10,
+          "title": "Routine maintenance",
+          "body": "",
+          "labels": [],
+          "created_at": "2026-07-01T00:00:00Z",
+          "updated_at": "2026-07-20T00:00:00Z",
+          "state": "open"
+        }
+      ],
+      "issue_etag": "fixture-example-etag",
+      "open_prs": [],
+      "merged_prs": [
+        {
+          "number": 30,
+          "title": "Complete governed work order",
+          "author": {"login": "human-example", "is_bot": false},
+          "closingIssuesReferences": [{"number": 10}],
+          "createdAt": "2026-07-14T00:00:00Z",
+          "mergedAt": "2026-07-15T00:00:00Z",
+          "headRefOid": "1111111111111111111111111111111111111111",
+          "state": "MERGED"
+        },
+        {
+          "number": 31,
+          "title": "Human merge outside loop scope",
+          "author": {"login": "human-example", "is_bot": false},
+          "closingIssuesReferences": [],
+          "createdAt": "2026-07-15T00:00:00Z",
+          "mergedAt": "2026-07-16T00:00:00Z",
+          "headRefOid": "3333333333333333333333333333333333333333",
+          "state": "MERGED"
+        },
+        {
+          "number": 32,
+          "title": "Machine merge before verdict recording existed",
+          "author": {"login": "builder-example[bot]", "is_bot": true},
+          "closingIssuesReferences": [],
+          "createdAt": "2026-07-07T00:00:00Z",
+          "mergedAt": "2026-07-08T00:00:00Z",
+          "headRefOid": "4444444444444444444444444444444444444444",
+          "state": "MERGED"
+        }
+      ],
+      "default_branch": "main",
+      "ci_runs": []
+    },
+    {
+      "repo": "another-example-org/another-example-repo",
+      "issues": [],
+      "issue_etag": "fixture-another-etag",
+      "open_prs": [
+        {
+          "number": 20,
+          "title": "fix(core): repair parser",
+          "body": "Depends on example-org/example-repo#10",
+          "labels": [],
+          "createdAt": "2026-07-05T00:00:00Z",
+          "updatedAt": "2026-07-21T00:00:00Z",
+          "isDraft": false,
+          "reviewDecision": "",
+          "statusCheckRollup": [{"conclusion": "FAILURE", "state": "COMPLETED"}],
+          "closingIssuesReferences": [],
+          "files": [{"path": "src/parser.rs"}],
+          "state": "OPEN",
+          "mergedAt": null,
+          "headRefOid": "2222222222222222222222222222222222222222",
+          "mergeable": "MERGEABLE"
+        }
+      ],
+      "merged_prs": [],
+      "default_branch": "main",
+      "ci_runs": [
+        {
+          "databaseId": 9001,
+          "workflowDatabaseId": 77,
+          "workflowName": "Acceptance",
+          "name": "Acceptance",
+          "headSha": "cafefeedcafefeedcafefeedcafefeedcafefeed",
+          "conclusion": "FAILURE",
+          "status": "completed",
+          "createdAt": "2026-07-12T00:00:00Z",
+          "url": "https://example.invalid/actions/runs/9001"
+        }
+      ]
+    }
+  ]
+}

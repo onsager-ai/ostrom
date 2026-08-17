@@ -171,6 +171,8 @@ pub struct ProjectMandate {
     pub reserved: Vec<u64>,
     #[serde(default)]
     pub bounce: Vec<Selector>,
+    #[serde(default)]
+    pub max_implementers_per_repository: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,6 +184,10 @@ pub struct MandateConfig {
     pub stuck_after_days: u64,
     #[serde(default)]
     pub search_roots: Vec<String>,
+    #[serde(default)]
+    pub hold_labels: Vec<String>,
+    #[serde(default)]
+    pub work_ranking: Vec<String>,
     #[serde(default)]
     pub bounce_all: Vec<Selector>,
     #[serde(default)]
@@ -211,6 +217,19 @@ impl MandateConfig {
         if self.search_roots.iter().any(String::is_empty) {
             return Err(ConfigError::Invalid("search roots must not be empty"));
         }
+        if self.hold_labels.iter().any(String::is_empty) {
+            return Err(ConfigError::Invalid("hold labels must not be empty"));
+        }
+        let mut ranked_items = std::collections::HashSet::new();
+        if self
+            .work_ranking
+            .iter()
+            .any(|item| !valid_item_id(item) || !ranked_items.insert(item.as_str()))
+        {
+            return Err(ConfigError::Invalid(
+                "work ranking must contain unique owner/repo#N item IDs",
+            ));
+        }
         let mut repositories = std::collections::HashSet::new();
         for project in &self.projects {
             if !repositories.insert(project.repo.as_str()) {
@@ -221,9 +240,29 @@ impl MandateConfig {
                     "reserved refs must be positive integers",
                 ));
             }
+            if project.max_implementers_per_repository == Some(0) {
+                return Err(ConfigError::Invalid(
+                    "max implementers per repository must be positive",
+                ));
+            }
         }
         Ok(())
     }
+}
+
+fn valid_item_id(value: &str) -> bool {
+    if value.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let Some((repository, number)) = value.rsplit_once('#') else {
+        return false;
+    };
+    let mut parts = repository.split('/');
+    matches!(
+        (parts.next(), parts.next(), parts.next()),
+        (Some(owner), Some(name), None) if !owner.is_empty() && !name.is_empty()
+    ) && number.starts_with(|character: char| character.is_ascii_digit() && character != '0')
+        && number.chars().all(|character| character.is_ascii_digit())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -321,6 +360,8 @@ cadence_hours: 1
 stuck_after_days: 7
 search_roots:
   - /synthetic/repos
+work_ranking:
+  - example-org/example-repo#42
 bounce_all:
   - title:*credential*
 projects:
@@ -351,6 +392,24 @@ projects:
             parsed,
             MandateConfig::from_yaml(&emitted).expect("emitted roster should parse")
         );
+    }
+
+    #[test]
+    fn work_ranking_rejects_duplicates_and_malformed_item_ids() {
+        for ranking in [
+            "  - example-org/example-repo#42\n  - example-org/example-repo#42",
+            "  - example-org/example-repo#0",
+            "  - example-org#42",
+        ] {
+            let roster = ROSTER.replace(
+                "work_ranking:\n  - example-org/example-repo#42",
+                &format!("work_ranking:\n{ranking}"),
+            );
+            assert!(
+                MandateConfig::from_yaml(&roster).is_err(),
+                "accepted invalid work ranking:\n{ranking}"
+            );
+        }
     }
 
     #[test]
