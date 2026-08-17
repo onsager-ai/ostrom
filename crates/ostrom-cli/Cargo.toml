@@ -13,7 +13,6 @@ name = "ostrom"
 path = "src/main.rs"
 
 [dependencies]
-signal-hook.workspace = true
 clap.workspace = true
 chrono.workspace = true
 directories.workspace = true
@@ -27,3 +26,8 @@ tempfile.workspace = true
 
 [lints]
 workspace = true
+
+# Signals are a POSIX mechanism; signal-hook configures its constants out on
+# Windows rather than stubbing them, so the dependency itself is unix-only.
+[target.'cfg(unix)'.dependencies]
+signal-hook.workspace = true
