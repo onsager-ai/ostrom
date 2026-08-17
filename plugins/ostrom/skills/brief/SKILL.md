@@ -42,10 +42,10 @@ continue with structural output. Never create it.
 Run:
 
 ```sh
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/queue.sh" list
+ostrom queue list
 jq '.repos | to_entries | map({repo: .key, items: .value.items, item_cap: .value.item_cap})' \
   "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/ostrom/state.json"
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/trace.sh" read
+ostrom trace read
 ```
 
 Use only pending and deferred rows. The sweep fields are facts, not agent
@@ -113,6 +113,6 @@ Then show each bucket in proposed order with the resolvable
 rationale. End with `Could not classify: none.` or a line naming every omitted
 row and the missing fact.
 
-Propose only. Never approve, reject, or defer a row, and never call `queue.sh`
+Propose only. Never approve, reject, or defer a row, and never call `ostrom queue`
 with a mutating verb. `/ostrom:desk` remains the sole decision surface. `/ostrom:brief` stays
 available as a manual pull.

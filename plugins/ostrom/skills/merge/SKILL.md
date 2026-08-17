@@ -96,12 +96,12 @@ consumption as two distinct trace events before taking any action. Here,
 `already_judged` are the literal values parsed from the verdict line:
 
 ```sh
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/trace.sh" append artifact-produced \
+ostrom trace append artifact-produced \
   "$(jq -cn --arg repo "$repository" --argjson pr "$pr_number" \
     --arg head_sha "$head_sha" \
     '{repo: $repo, pr: $pr, head_sha: $head_sha}')" \
   '{}'
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/trace.sh" append gate-verdict-consumed \
+ostrom trace append gate-verdict-consumed \
   "$(jq -cn --arg repo "$repository" --argjson pr "$pr_number" \
     --arg head_sha "$head_sha" --arg verdict "$verdict" \
     --argjson exit_code "$gate_exit" \
@@ -168,7 +168,7 @@ caller's, is always about delivery, and never converts `inconclusive` into
      recorded in the same step as the merge, not deferred to a later pass:
 
      ```sh
-     bash "${CLAUDE_PLUGIN_ROOT}/scripts/trace.sh" append decision-taken \
+     ostrom trace append decision-taken \
        "$(jq -cn --arg owner "$lease_owner" --arg repo "$repository" \
          --arg ref "#$pr_number" --arg head_sha "$head_sha" \
          --arg reversal "revert $repository#$pr_number: open a revert pull request or \`git revert\` its merge commit" \
@@ -299,7 +299,7 @@ caller's, is always about delivery, and never converts `inconclusive` into
        )"
      fi
 
-     bash "${CLAUDE_PLUGIN_ROOT}/scripts/trace.sh" append close-keyword-checked \
+     ostrom trace append close-keyword-checked \
        "$(jq -cn --arg owner "$lease_owner" --arg repo "$repository" \
          --arg ref "#$pr_number" --arg head_sha "$head_sha" \
          --argjson declared "$declared" --argjson still_open "$still_open" \
@@ -434,7 +434,7 @@ finds a thread resolved wrongly unresolve it directly, rather than
 reconstructing the judgment from the PR history:
 
 ```sh
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/trace.sh" append decision-taken \
+ostrom trace append decision-taken \
   "$(jq -cn --arg owner "$lease_owner" --arg repo "$repository" \
     --arg ref "#$pr_number" --arg thread_id "$thread_id" \
     --arg commit "$addressing_commit" \

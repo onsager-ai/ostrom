@@ -33,7 +33,7 @@ case "$role" in
     # loosening it is an explicit act and not a side effect of this fix.
     permission_mode=manual
     # skills/gatekeep/SKILL.md step 2 acquires its protocol lease with no
-    # MANDATE_LEASE_NAME override, which lands on lease.sh's default name,
+    # MANDATE_LEASE_NAME override, which lands on ostrom lease's default name,
     # sprint.lease -- a legacy name predating the newer <role>.lease
     # convention the builder uses, never renamed. Match what the skill
     # actually does, not the newer pattern.
@@ -56,7 +56,7 @@ LEASE_NAME="$role-pass.lease"
 INNER_LEASE_NAME="$inner_lease_name"
 ID_FILE="$MANDATE_DATA_DIR/$role-pass-id"
 WAKE_FILE="$MANDATE_DATA_DIR/$role-wake-counter"
-# trace.sh keeps this path to itself; it offers no "where" or "watermark"
+# ostrom trace keeps this path to itself; it offers no "where" or "watermark"
 # subcommand, so it is duplicated here rather than adding one for a single
 # caller. context.ts's readTrace() duplicates the same path on the doctor
 # side for the same reason.
@@ -85,18 +85,18 @@ fi
 # The pass-started and pass-ended rows this script appends about its own
 # pass (below, and in finish()) must be stamped from the same clock the
 # daily cap sums against further down: MANDATE_NOW_EPOCH, when a test
-# harness sets it, simulates "today" for the cap check, but trace.sh's own
+# harness sets it, simulates "today" for the cap check, but ostrom trace's own
 # default falls back to the real wall clock -- so a row written here without
 # an explicit stamp would silently disagree with the day this script itself
-# believes it is. Derive it once, in trace.sh's own timestamp shape.
+# believes it is. Derive it once, in ostrom trace's own timestamp shape.
 #
 # An explicit MANDATE_TRACE_TIME from the caller always wins: it is a more
 # specific instruction than the epoch this script derives its own stamp
 # from. When MANDATE_NOW_EPOCH is unset (production, always), this stays
-# empty and both trace.sh calls fall back to their own real-UTC default
+# empty and both ostrom trace calls fall back to their own real-UTC default
 # exactly as before this fix.
 #
-# This is deliberately kept local to the two `trace.sh append` calls this
+# This is deliberately kept local to the two `ostrom trace append` calls this
 # script makes about its own pass-started/pass-ended rows, passed as a
 # same-command prefix rather than exported: the child spawned below inherits
 # this process's real environment, not this derived value, so its own trace
@@ -196,7 +196,7 @@ trap 'defer_signal INT 130' INT
 trap 'defer_signal TERM 143' TERM
 
 MANDATE_LEASE_NAME="$LEASE_NAME" \
-  bash "$SCRIPT_DIR/lease.sh" acquire "$owner" >/dev/null
+  OSTROM_HOME="$MANDATE_DATA_DIR" ostrom lease acquire "$owner" >/dev/null
 lease_status=$?
 if [ "$lease_status" -eq 3 ]; then
   log_note "another pass already holds $LEASE_NAME; skipping"
@@ -243,7 +243,7 @@ read_cost() {
 
 # Sum cost_usd out of every pass-ended row (any role) whose ts falls on the
 # given UTC day (a plain YYYY-MM-DD prefix match against the ISO-8601 ts
-# trace.sh always writes). A line that fails to parse as JSON, or whose
+# ostrom trace always writes). A line that fails to parse as JSON, or whose
 # fact.cost_usd is missing or not a number, contributes 0 rather than
 # aborting the reduce: a pass whose cost was never measured is a gap in the
 # record, and a cap that refuses to run because one malformed row exists
@@ -356,8 +356,8 @@ inner_pass_outcome() {
 # whose lease must never be stolen. The inner session mints its own owner
 # string (a different id and wake counter from this wrapper's $owner), so
 # ownership cannot be checked by name -- only by timestamp. Release always
-# goes through lease.sh, using the owner string read off the held lease, so
-# lease.sh's own owner check still applies; this never deletes the lease
+# goes through ostrom lease, using the owner string read off the held lease, so
+# ostrom lease's own owner check still applies; this never deletes the lease
 # file directly and never forces past that check.
 #
 # The timestamp test alone is not sufficient, because finish() also runs on
@@ -377,7 +377,7 @@ release_inner_lease() {
 
   inner_lease_json="$(
     MANDATE_LEASE_NAME="$INNER_LEASE_NAME" \
-      bash "$SCRIPT_DIR/lease.sh" status 2>/dev/null
+      OSTROM_HOME="$MANDATE_DATA_DIR" ostrom lease status 2>/dev/null
   )" || {
     return 0
   }
@@ -398,7 +398,7 @@ release_inner_lease() {
 
   log_note "releasing inner lease $INNER_LEASE_NAME held by $inner_owner (started_at=$inner_started_at, pass start=$start_epoch)"
   if ! MANDATE_LEASE_NAME="$INNER_LEASE_NAME" \
-    bash "$SCRIPT_DIR/lease.sh" release "$inner_owner" >/dev/null 2>&1; then
+    OSTROM_HOME="$MANDATE_DATA_DIR" ostrom lease release "$inner_owner" >/dev/null 2>&1; then
     log_note "could not release inner lease $INNER_LEASE_NAME held by $inner_owner"
     return 1
   fi
@@ -434,7 +434,7 @@ finish() {
             + (if $reason == "" then {} else {reason: $reason} end)'
       )"
       if ! MANDATE_TRACE_TIME="$pass_trace_time" \
-        bash "$SCRIPT_DIR/trace.sh" append pass-ended "$end_fact" '{}' >/dev/null; then
+        OSTROM_HOME="$MANDATE_DATA_DIR" ostrom trace append pass-ended "$end_fact" '{}' >/dev/null; then
         log_note "could not append pass-ended"
         [ "$saved_status" -ne 0 ] || saved_status=1
       fi
@@ -450,7 +450,7 @@ finish() {
     # Lease release is attempted after every acquired path, even when trace
     # finalization failed. A leaked lease turns a failed pass into silent idle.
     if ! MANDATE_LEASE_NAME="$LEASE_NAME" \
-      bash "$SCRIPT_DIR/lease.sh" release "$owner" >/dev/null; then
+      OSTROM_HOME="$MANDATE_DATA_DIR" ostrom lease release "$owner" >/dev/null; then
       log_note "could not release $LEASE_NAME"
       [ "$saved_status" -ne 0 ] || saved_status=1
     fi
@@ -499,7 +499,7 @@ mv "$wake_tmp" "$WAKE_FILE"
 
 start_fact="$(jq -cn --arg owner "$owner" '{owner: $owner}')"
 if ! MANDATE_TRACE_TIME="$pass_trace_time" \
-  bash "$SCRIPT_DIR/trace.sh" append pass-started "$start_fact" '{}' >/dev/null; then
+  OSTROM_HOME="$MANDATE_DATA_DIR" ostrom trace append pass-started "$start_fact" '{}' >/dev/null; then
   log_note "could not append pass-started"
   outcome=failed
   exit 1
@@ -601,7 +601,7 @@ elif [ "$run_status" -eq 0 ]; then
   outcome_reason=blocked
   inner_status_json="$(
     MANDATE_LEASE_NAME="$INNER_LEASE_NAME" \
-      bash "$SCRIPT_DIR/lease.sh" status 2>/dev/null
+      OSTROM_HOME="$MANDATE_DATA_DIR" ostrom lease status 2>/dev/null
   )" || inner_status_json=""
   if [ -n "$inner_status_json" ]; then
     inner_status_started_at="$(jq -r '.started_at' <<<"$inner_status_json" 2>/dev/null)"

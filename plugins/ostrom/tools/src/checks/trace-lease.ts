@@ -95,7 +95,7 @@ function traceHealth(trace: TraceFile, now: number): Health {
     return {
       status: "WARN",
       detail: "trace last record has an invalid shape",
-      remedy: "inspect sprint.jsonl; records must be written by trace.sh append",
+      remedy: "inspect sprint.jsonl; records must be written by ostrom trace append",
     };
   }
 
@@ -105,7 +105,7 @@ function traceHealth(trace: TraceFile, now: number): Health {
     return {
       status: "WARN",
       detail: "trace last record has an invalid timestamp",
-      remedy: "inspect sprint.jsonl; records must be written by trace.sh append",
+      remedy: "inspect sprint.jsonl; records must be written by ostrom trace append",
     };
   }
 
@@ -163,14 +163,14 @@ function leaseHealth(path: string, now: number): Health {
     return {
       status: "WARN",
       detail: "lease unreadable",
-      remedy: "inspect sprint.lease; only lease.sh may create or remove it",
+      remedy: "inspect sprint.lease; only ostrom lease may create or remove it",
     };
   }
   if (!validLease(lease)) {
     return {
       status: "WARN",
       detail: "lease has an invalid shape",
-      remedy: "inspect sprint.lease; only lease.sh may create or remove it",
+      remedy: "inspect sprint.lease; only ostrom lease may create or remove it",
     };
   }
 

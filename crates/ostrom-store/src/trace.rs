@@ -2,6 +2,7 @@ use std::{fs, io::Write, path::Path};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use thiserror::Error;
 
 use crate::{StoreError, io_error, set_private_file_mode};
 
@@ -39,6 +40,53 @@ pub struct TraceAppend {
     pub kind: String,
     pub fact: serde_json::Map<String, Value>,
     pub narration: serde_json::Map<String, Value>,
+}
+
+/// Facts and narration remain separate read paths because narration is
+/// principal-facing context, not evidence one delivery role may consume from
+/// another role's trace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraceView {
+    Facts,
+    Narration,
+}
+
+#[derive(Debug, Error)]
+pub enum TraceActionError {
+    #[error("mandate trace: kind must not be empty")]
+    EmptyKind,
+    #[error("mandate trace: fact-json must be a JSON object")]
+    FactNotObject,
+    #[error("mandate trace: narration-json must be a JSON object")]
+    NarrationNotObject,
+    #[error(
+        "mandate trace: item-worked order_id must be a non-empty string from a work order's order_id field"
+    )]
+    InvalidOrderId,
+    #[error("mandate trace: item-worked order_id '{0}' matches no work order's order_id field")]
+    UnknownOrderId(String),
+    #[error("mandate trace: record is {bytes} bytes; maximum is 4096")]
+    TooLarge { bytes: usize },
+    #[error("mandate trace: malformed sprint trace record")]
+    MalformedRead,
+    #[error("mandate trace: {0}")]
+    Store(#[from] StoreError),
+}
+
+impl TraceActionError {
+    #[must_use]
+    pub const fn exit_code(&self) -> i32 {
+        match self {
+            Self::Store(_) => 1,
+            Self::EmptyKind
+            | Self::FactNotObject
+            | Self::NarrationNotObject
+            | Self::InvalidOrderId
+            | Self::UnknownOrderId(_)
+            | Self::TooLarge { .. }
+            | Self::MalformedRead => 2,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -132,6 +180,96 @@ pub fn append_trace(path: &Path, record: &TraceAppend) -> Result<Vec<u8>, StoreE
     file.write_all(&bytes)
         .map_err(|error| io_error("append trace", path, error))?;
     Ok(bytes)
+}
+
+pub fn append_trace_checked(
+    path: &Path,
+    work_orders: &Path,
+    record: &TraceAppend,
+) -> Result<Vec<u8>, TraceActionError> {
+    if record.kind.is_empty() {
+        return Err(TraceActionError::EmptyKind);
+    }
+    if record.kind == "item-worked" {
+        if let Some(order_id) = record.fact.get("order_id") {
+            let order_id = order_id
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .ok_or(TraceActionError::InvalidOrderId)?;
+            if !order_id_exists(work_orders, order_id) {
+                return Err(TraceActionError::UnknownOrderId(order_id.to_owned()));
+            }
+        }
+    }
+    append_trace(path, record).map_err(|error| match error {
+        StoreError::TraceTooLarge { bytes } => TraceActionError::TooLarge { bytes },
+        other => TraceActionError::Store(other),
+    })
+}
+
+pub fn read_trace_json(path: &Path, view: TraceView) -> Result<Vec<u8>, TraceActionError> {
+    if !path.metadata().is_ok_and(|metadata| metadata.len() > 0) {
+        return Ok(Vec::new());
+    }
+    let contents = fs::read_to_string(path)
+        .map_err(|error| TraceActionError::Store(io_error("read trace", path, error)))?;
+    let mut output = Vec::new();
+    for line in contents.lines() {
+        let value: Value =
+            serde_json::from_str(line).map_err(|_| TraceActionError::MalformedRead)?;
+        validate_trace_value(&value)?;
+        let mut row = serde_json::Map::new();
+        row.insert("ts".to_owned(), value["ts"].clone());
+        row.insert("kind".to_owned(), value["kind"].clone());
+        match view {
+            TraceView::Facts => row.insert("fact".to_owned(), value["fact"].clone()),
+            TraceView::Narration => row.insert("narration".to_owned(), value["narration"].clone()),
+        };
+        serde_json::to_writer(&mut output, &row).expect("writing JSON to memory cannot fail");
+        output.push(b'\n');
+    }
+    Ok(output)
+}
+
+fn validate_trace_value(value: &Value) -> Result<(), TraceActionError> {
+    let Some(object) = value.as_object() else {
+        return Err(TraceActionError::MalformedRead);
+    };
+    let expected = ["fact", "kind", "narration", "ts"];
+    if object.len() != expected.len() || expected.iter().any(|key| !object.contains_key(*key)) {
+        return Err(TraceActionError::MalformedRead);
+    }
+    if object
+        .get("ts")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+        || object
+            .get("kind")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        || !object.get("fact").is_some_and(Value::is_object)
+        || !object.get("narration").is_some_and(Value::is_object)
+    {
+        return Err(TraceActionError::MalformedRead);
+    }
+    Ok(())
+}
+
+fn order_id_exists(directory: &Path, order_id: &str) -> bool {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|entry| {
+        let path = entry.path();
+        path.extension().and_then(|extension| extension.to_str()) == Some("json")
+            && fs::read_to_string(path)
+                .ok()
+                .and_then(|contents| serde_json::from_str::<Value>(&contents).ok())
+                .and_then(|value| value.get("order_id").cloned())
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .as_deref()
+                == Some(order_id)
+    })
 }
 
 #[cfg(test)]

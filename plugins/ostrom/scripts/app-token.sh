@@ -335,7 +335,7 @@ scope_fact="$(
   unset token
   fail "could not encode the granted scope for tracing"
 }
-if ! bash "$SCRIPT_DIR/trace.sh" append installation-token-minted \
+if ! OSTROM_HOME="$MANDATE_DATA_DIR" ostrom trace append installation-token-minted \
   "$scope_fact" '{}' >/dev/null; then
   unset token
   fail "minted scoped token but could not record its granted scope on the trace"

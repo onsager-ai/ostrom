@@ -19,9 +19,9 @@ directories.workspace = true
 ostrom-core = { path = "../ostrom-core" }
 ostrom-checks = { path = "../ostrom-checks" }
 ostrom-store = { path = "../ostrom-store" }
+serde_json.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
 tempfile.workspace = true
 
 [lints]

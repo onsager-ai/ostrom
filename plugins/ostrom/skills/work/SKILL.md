@@ -38,7 +38,7 @@ for cleanup, then run:
 
 ```sh
 MANDATE_LEASE_NAME=builder.lease \
-  bash "${CLAUDE_PLUGIN_ROOT}/scripts/lease.sh" acquire "$lease_owner"
+  ostrom lease acquire "$lease_owner"
 ```
 
 Only exit 0 owns the pass. Exit 3 means another builder pass owns it: report
@@ -50,7 +50,7 @@ failure; report it and stop. Never infer concurrency or lease ownership from
 Immediately after acquisition, append the first trace record:
 
 ```sh
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/trace.sh" append pass-started \
+ostrom trace append pass-started \
   "$(jq -cn --arg owner "$lease_owner" '{owner: $owner}')" \
   '{}'
 ```
@@ -304,15 +304,15 @@ role attribution, never identity evidence or a gate condition.
 
 `branch_name` remains required and must satisfy the schema_version 1 branch
 syntax for compatibility with existing callers. It is not authoritative:
-`work-order.sh create` derives `ostrom/<item-number>-<first-12-hex-of-sha256(item_id)>`
+`ostrom work-order create` derives `ostrom/<item-number>-<first-12-hex-of-sha256(item_id)>`
 from `item_id`, warns when the supplied value differs, and writes the derived
-value. `work-order.sh validate` intentionally accepts historical version 1
+value. `ostrom work-order validate` intentionally accepts historical version 1
 orders whose valid branch names predate this deterministic convention.
 
 Create the canonical durable order, then dispatch it through the backend seam:
 
 ```sh
-order_file="$(bash "${CLAUDE_PLUGIN_ROOT}/scripts/work-order.sh" create "$candidate_file")"
+order_file="$(ostrom work-order create "$candidate_file")"
 unit_name="$(ostrom dispatch "$order_file")"
 ```
 
@@ -361,7 +361,7 @@ sha256 of `item_id`, and stays stable across replacement orders for that item.
 For example:
 
 ```sh
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/trace.sh" append item-worked \
+ostrom trace append item-worked \
   "$(jq -cn --arg owner "$lease_owner" --arg repo "$repository" \
     --arg ref "$item_ref" --arg action "$item_action" \
     --arg outcome "$item_outcome" --arg order_id "$order_id" \
@@ -400,7 +400,7 @@ item's `item-worked` record: that one covers what happened to the item, this
 one covers how to undo the action taken on it.
 
 ```sh
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/trace.sh" append decision-taken \
+ostrom trace append decision-taken \
   "$(jq -cn --arg owner "$lease_owner" --arg repo "$repository" \
     --arg ref "#$item_number" --arg decision "$item_decision" \
     --arg reversal "$item_reversal" \
@@ -436,13 +436,13 @@ why an incomplete pass stopped, but must not replace those facts. Then release
 the named lease with the exact owner retained in step 2:
 
 ```sh
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/trace.sh" append pass-ended \
+ostrom trace append pass-ended \
   "$(jq -cn --arg owner "$lease_owner" --arg outcome "$pass_outcome" \
     --argjson worked "$worked_items" \
     '{owner: $owner, outcome: $outcome, worked_items: $worked}')" \
   "$pass_end_narration"
 MANDATE_LEASE_NAME=builder.lease \
-  bash "${CLAUDE_PLUGIN_ROOT}/scripts/lease.sh" release "$lease_owner"
+  ostrom lease release "$lease_owner"
 ```
 
 Use `{}` for `pass_end_narration` when there is no reasoning to report. If the

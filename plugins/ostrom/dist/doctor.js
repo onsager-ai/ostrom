@@ -614,7 +614,7 @@ function traceHealth(trace, now) {
     return {
       status: "WARN",
       detail: "trace last record has an invalid shape",
-      remedy: "inspect sprint.jsonl; records must be written by trace.sh append"
+      remedy: "inspect sprint.jsonl; records must be written by ostrom trace append"
     };
   }
   const timestamp = record.ts;
@@ -623,7 +623,7 @@ function traceHealth(trace, now) {
     return {
       status: "WARN",
       detail: "trace last record has an invalid timestamp",
-      remedy: "inspect sprint.jsonl; records must be written by trace.sh append"
+      remedy: "inspect sprint.jsonl; records must be written by ostrom trace append"
     };
   }
   const ageSeconds = now - Math.floor(timestampMs / 1e3);
@@ -667,14 +667,14 @@ function leaseHealth(path, now) {
     return {
       status: "WARN",
       detail: "lease unreadable",
-      remedy: "inspect sprint.lease; only lease.sh may create or remove it"
+      remedy: "inspect sprint.lease; only ostrom lease may create or remove it"
     };
   }
   if (!validLease(lease)) {
     return {
       status: "WARN",
       detail: "lease has an invalid shape",
-      remedy: "inspect sprint.lease; only lease.sh may create or remove it"
+      remedy: "inspect sprint.lease; only ostrom lease may create or remove it"
     };
   }
   const expiry = new Date(lease.expires_at * 1e3).toISOString();
@@ -1189,7 +1189,7 @@ function checkRolePass(context, role) {
       status: "WARN",
       name: checkName,
       detail: `last ${role} pass has an invalid timestamp`,
-      remedy: "inspect sprint.jsonl; records must be written by trace.sh append"
+      remedy: "inspect sprint.jsonl; records must be written by ostrom trace append"
     };
   }
   const ageSeconds = nowEpoch2(context) - Math.floor(timestampMs / 1e3);

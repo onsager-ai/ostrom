@@ -1,0 +1,1 @@
+{"repos":{"placeholder-org/alpha":{"policy":{"paused":false},"items":{"placeholder-org/alpha#11":{"matched_selector":"label:placeholder","classification":"delegated"}}}},"dead_selectors":[{"repo":null,"source":"bounce_all","selector":"label:placeholder-missing"},{"repo":"placeholder-org/alpha","source":"delegated","selector":"type:placeholder-missing"}]}

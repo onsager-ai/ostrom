@@ -130,7 +130,7 @@ function checkRolePass(
       status: "WARN",
       name: checkName,
       detail: `last ${role} pass has an invalid timestamp`,
-      remedy: "inspect sprint.jsonl; records must be written by trace.sh append",
+      remedy: "inspect sprint.jsonl; records must be written by ostrom trace append",
     };
   }
 

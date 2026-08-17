@@ -1,0 +1,1 @@
+{"schema_version":1,"item_id":"placeholder-org/alpha#42","repository":"placeholder-org/alpha","item_ref":"#42","branch_name":"placeholder/overwritten","spec":"Implement the placeholder behavior.","acceptance_criteria":["The placeholder behavior is observable."],"constraints":["Use placeholder data only."]}

@@ -155,7 +155,7 @@ if [ -s "$decisions_watermark_file" ]; then
 fi
 
 # A trace record's shape is never trusted blindly here. This reads the file
-# directly rather than through `trace.sh read`, deliberately: that command
+# directly rather than through `ostrom trace read`, deliberately: that command
 # aborts entirely on the first malformed record anywhere in the trace, which
 # would take down this section over a corrupt line from an unrelated kind. A
 # non-JSON line is skipped instead of aborting the read, and every fact field

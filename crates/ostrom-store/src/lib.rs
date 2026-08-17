@@ -16,13 +16,17 @@ mod queue;
 mod selection;
 mod sweep;
 mod trace;
+mod work_order;
 
 pub use app_token::AppTokenError;
 pub use check_store::JsonlCheckStore;
 pub use dispatch::{DispatchError, DispatchOutcome, DispatchRequest, run_dispatch};
 pub use file_store::JsonlSweepStore;
 pub use gate::{GateError, GateOptions, GateOutput, run_gate};
-pub use lease::{LeaseRecord, read_lease, write_lease};
+pub use lease::{
+    LeaseActionError, LeaseRecord, acquire_lease, lease_status, read_lease, release_lease,
+    validate_lease_name, write_lease,
+};
 pub use leaves::{
     AuditError, AuditOptions, ExcuseError, LocalDriftError, audit, grant_excuse, list_excuses,
     local_drift,
@@ -36,7 +40,10 @@ pub use plan::{
     PlanError, PlanFault, PlanOptions, PlanRanking, PlanSweep, UnavailableAssessmentDeriver,
     run_plan,
 };
-pub use queue::{QueueDocument, list_queue_json, read_queue, write_queue};
+pub use queue::{
+    QueueActionError, QueueDecision, QueueDocument, decide_queue_item, lint_queue_state,
+    list_queue_json, read_queue, write_queue,
+};
 pub use selection::{
     PlanApplication, SelectAction, SelectError, SelectOutcome, SelectRequest, encode_selection,
     run_selection,
@@ -47,7 +54,12 @@ pub use sweep::{
     load_config_or_defaults, run_sweep,
 };
 pub use trace::{
-    MalformedTraceRow, TraceAppend, TraceFactRecord, TraceRead, append_trace, read_trace,
+    MalformedTraceRow, TraceActionError, TraceAppend, TraceFactRecord, TraceRead, TraceView,
+    append_trace, append_trace_checked, read_trace, read_trace_json,
+};
+pub use work_order::{
+    CreatedWorkOrder, WorkOrderError, branch_name, create_work_order, item_hash,
+    validate_work_order_file,
 };
 
 use thiserror::Error;
