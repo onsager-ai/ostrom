@@ -89,3 +89,58 @@ fn an_explicit_root_still_wins_over_the_legacy_fallback() {
     assert!(output.status.success());
     assert_eq!(String::from_utf8_lossy(&output.stdout).lines().count(), 1);
 }
+
+#[test]
+fn the_default_session_path_finds_the_legacy_root_under_home() {
+    // This is the case an actual session takes: neither variable set, and the
+    // roster still where the shell wrote it. It is the path the defect was in,
+    // and it was the one path the first fix did not cover.
+    let home = tempdir().expect("temporary HOME");
+    let root = home.path().join(".claude/ostrom");
+    fs::create_dir_all(&root).expect("create legacy root");
+    fs::write(root.join("queue.jsonl"), ROW).expect("write placeholder queue");
+
+    let output = ostrom()
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env("HOME", home.path())
+        .output()
+        .expect("run queue list");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).lines().count(), 1);
+}
+
+#[test]
+fn an_empty_claude_config_dir_reads_as_unset_not_as_a_relative_path() {
+    // `PathBuf::from("").join("ostrom")` is the *relative* path `ostrom/`,
+    // which would read whatever sits under the working directory. The shell
+    // spelled this `${CLAUDE_CONFIG_DIR:-...}`; empty means unset.
+    let home = tempdir().expect("temporary HOME");
+    let root = home.path().join(".claude/ostrom");
+    fs::create_dir_all(&root).expect("create legacy root");
+    fs::write(root.join("queue.jsonl"), ROW).expect("write placeholder queue");
+
+    let decoy = home.path().join("working/ostrom");
+    fs::create_dir_all(&decoy).expect("create decoy relative root");
+    fs::write(decoy.join("queue.jsonl"), "").expect("write empty decoy queue");
+
+    let output = ostrom()
+        .env("CLAUDE_CONFIG_DIR", "")
+        .env("HOME", home.path())
+        .current_dir(home.path().join("working"))
+        .output()
+        .expect("run queue list");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).lines().count(),
+        1,
+        "an empty value must fall through to the legacy root, not to ./ostrom"
+    );
+}

@@ -313,11 +313,11 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
             1,
         ));
     }
-    if !request.claude_bin.is_file() {
+    if !is_executable_file(&request.claude_bin) {
         guard.outcome = Some("failed".to_owned());
         return Err(PassError::failed(
             request.role,
-            format!("{} not executable", request.claude_bin.display()),
+            format!("{} is not marked executable", request.claude_bin.display()),
             1,
         ));
     }
@@ -587,6 +587,33 @@ fn release_inner_lease(guard: &PassGuard) {
     }
 }
 
+/// Whether the file is *marked* executable, which is what the message says.
+///
+/// `is_file()` alone was neither: a path with no execute bit passed the guard
+/// and then failed in `Command::spawn`, reporting a permission error against a
+/// path the operator has to work backwards from.
+///
+/// This is deliberately not full `-x` parity. The shell's `-x` is `access(2)`
+/// with `X_OK`, which answers "can *this* process execute it" and so accounts
+/// for ownership and group; the mode test answers "is it marked executable at
+/// all". Closing that gap needs `access(2)`, which is not in std and does not
+/// justify a dependency for a diagnostic. The remaining case — marked
+/// executable but not executable *by us* — still fails at spawn, exactly as it
+/// did before this guard existed. So the message states what is checked rather
+/// than implying the stronger claim.
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    path.metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
+}
+
 fn daily_spend(paths: &OstromPaths, day: &str) -> f64 {
     read_trace(&paths.trace_file())
         .map(|trace| {
@@ -763,5 +790,35 @@ fn kill_command() -> &'static str {
         "/bin/kill"
     } else {
         "kill"
+    }
+}
+
+#[cfg(all(test, unix))]
+mod executable_tests {
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    use tempfile::tempdir;
+
+    use super::is_executable_file;
+
+    #[test]
+    fn a_present_but_unexecutable_file_is_not_accepted() {
+        // pass.sh used `-x`. A plain is_file() check would let this through to
+        // Command::spawn, which reports a permission error against a path the
+        // operator then has to work backwards from.
+        let fixture = tempdir().expect("temporary directory");
+        let path = fixture.path().join("placeholder-claude");
+        fs::write(&path, "#!/usr/bin/env bash\nexit 0\n").expect("write stub");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("drop the mode bits");
+        assert!(!is_executable_file(&path));
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("restore the mode");
+        assert!(is_executable_file(&path));
+    }
+
+    #[test]
+    fn a_directory_is_not_an_executable_file() {
+        let fixture = tempdir().expect("temporary directory");
+        assert!(!is_executable_file(fixture.path()));
     }
 }
