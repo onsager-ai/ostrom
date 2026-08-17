@@ -8990,6 +8990,11 @@ projects:
     bounce:
       - title:*release*
       - path:.github/workflows/**
+      - label:principal-review
+      - scope:infra
+      - type:feat
+      - ref:#42
+      - substance:fly-spend
     reserved:
       - 99
 YAML
@@ -9024,7 +9029,7 @@ if [ "$1 $2" = "pr view" ]; then
     --arg mode "${FAKE_GATE_MODE:-pass}" \
     --arg title "$(
       if [ "${FAKE_GATE_MODE:-pass}" = "tier" ]; then
-        printf '%s' 'release: publish placeholder artifact'
+        printf '%s' 'feat(infra): release placeholder artifact'
       else
         printf '%s' 'fix(core): safe placeholder change'
       fi
@@ -9034,13 +9039,13 @@ if [ "$1 $2" = "pr view" ]; then
         title: $title,
         author: {login: "builder-login"},
         headRefOid: $head,
-        labels: [],
+        labels: (if $mode == "tier" then [{name: "principal-review"}] else [] end),
         statusCheckRollup: [{
           name: "verify-linux",
           status: "COMPLETED",
           conclusion: $conclusion
         }],
-        closingIssuesReferences: [],
+        closingIssuesReferences: (if $mode == "tier" then [{number: 42}] else [] end),
         mergeable: $mergeable,
         isDraft: $is_draft
       }
@@ -9052,11 +9057,99 @@ if [ "$1 $2" = "pr view" ]; then
   exit 0
 fi
 if [ "$1 $2" = "pr diff" ]; then
-  if [ "${FAKE_GATE_MODE:-pass}" = "tier" ]; then
-    printf '%s\n' '.github/workflows/placeholder.yml'
-  else
-    printf '%s\n' 'src/placeholder.sh'
+  name_only=false
+  for argument in "$@"; do
+    if [ "$argument" = "--name-only" ]; then
+      name_only=true
+    fi
+  done
+  if [ "$name_only" = true ]; then
+    case "${FAKE_GATE_MODE:-pass}" in
+      fly-*|diff-content-error) printf '%s\n' 'deploy/fly.toml' ;;
+      tier) printf '%s\n' '.github/workflows/placeholder.yml' ;;
+      *) printf '%s\n' 'src/placeholder.sh' ;;
+    esac
+    exit 0
   fi
+  if [ -n "${FAKE_GATE_CALL_LOG:-}" ]; then
+    printf '%s\n' 'diff-content' >>"$FAKE_GATE_CALL_LOG"
+  fi
+  case "${FAKE_GATE_MODE:-pass}" in
+    diff-content-error)
+      echo 'placeholder diff content could not be fetched' >&2
+      exit 1
+      ;;
+    fly-env)
+      cat <<'DIFF'
+diff --git a/deploy/fly.toml b/deploy/fly.toml
+index 1111111..2222222 100644
+--- a/deploy/fly.toml
++++ b/deploy/fly.toml
+@@ -1,4 +1,4 @@
+ [env]
+-  region = "placeholder-old"
++  region = "placeholder-new"
+ [http_service]
+DIFF
+      ;;
+    fly-machine)
+      cat <<'DIFF'
+diff --git a/deploy/fly.toml b/deploy/fly.toml
+index 1111111..2222222 100644
+--- a/deploy/fly.toml
++++ b/deploy/fly.toml
+@@ -1,2 +1,2 @@
+ [[vm]]
+-size = "shared-cpu-placeholder"
++size = "performance-placeholder"
+DIFF
+      ;;
+    fly-count)
+      cat <<'DIFF'
+diff --git a/deploy/fly.toml b/deploy/fly.toml
+index 1111111..2222222 100644
+--- a/deploy/fly.toml
++++ b/deploy/fly.toml
+@@ -1 +1 @@
+-count = 1
++count = 2
+DIFF
+      ;;
+    fly-region)
+      cat <<'DIFF'
+diff --git a/deploy/fly.toml b/deploy/fly.toml
+index 1111111..2222222 100644
+--- a/deploy/fly.toml
++++ b/deploy/fly.toml
+@@ -1 +1 @@
+-region = "placeholder-a"
++region = "placeholder-b"
+DIFF
+      ;;
+    fly-scaling)
+      cat <<'DIFF'
+diff --git a/deploy/fly.toml b/deploy/fly.toml
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/deploy/fly.toml
+@@ -0,0 +1,2 @@
++[scaling]
++count = 2
+DIFF
+      ;;
+    *)
+      cat <<'DIFF'
+diff --git a/src/placeholder.sh b/src/placeholder.sh
+index 1111111..2222222 100644
+--- a/src/placeholder.sh
++++ b/src/placeholder.sh
+@@ -1 +1 @@
+-placeholder=old
++placeholder=new
+DIFF
+      ;;
+  esac
   exit 0
 fi
 if [ "$1 $2" = "api graphql" ]; then
@@ -9236,15 +9329,19 @@ run_gate() {
   gate_mode="$1"
   gate_number="$2"
   gate_head="$3"
+  gate_config_dir="${4:-$gate_fixture/config}"
   gate_output_file="$gate_fixture/$gate_mode-$gate_number-$gate_head.out"
+  gate_call_log="$gate_fixture/$gate_mode-$gate_number-$gate_head.calls"
+  : >"$gate_call_log"
   set +e
   (
     cd "$gate_fixture/repo"
     PATH="$gate_fixture/bin:$PATH" \
       FAKE_GATE_MODE="$gate_mode" \
       FAKE_GATE_HEAD="$gate_head" \
+      FAKE_GATE_CALL_LOG="$gate_call_log" \
       MANDATE_GATE_TIME="2026-08-04T12:00:00Z" \
-      CLAUDE_CONFIG_DIR="$gate_fixture/config" \
+      CLAUDE_CONFIG_DIR="$gate_config_dir" \
       CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
       bash "$PLUGIN_ROOT/scripts/gate.sh" \
         "placeholder-org/placeholder-repo#$gate_number"
@@ -9309,6 +9406,63 @@ grep -q '"selector":"title:\*release\*","tier":"author-written"' \
   <<<"$tier_line"
 grep -q '"selector":"path:.github/workflows/\*\*","tier":"content-derived"' \
   <<<"$tier_line"
+grep -q '"selector":"label:principal-review","tier":"author-written"' \
+  <<<"$tier_line"
+grep -q '"selector":"scope:infra","tier":"author-written"' \
+  <<<"$tier_line"
+grep -q '"selector":"type:feat","tier":"author-written"' \
+  <<<"$tier_line"
+grep -q '"selector":"ref:#42","tier":"content-derived"' \
+  <<<"$tier_line"
+
+# Substance predicates inspect one reusable unified diff rather than treating
+# any change to fly.toml as spend. Even a sensitive-looking lower-case env key
+# remains outside the predicate while the hunk is observably inside [env].
+run_gate fly-env 18 1818181818181818
+[ "$gate_status" -eq 0 ]
+grep -q '^condition bounce_selectors: pass tier=none ' <<<"$gate_output"
+
+assert_fly_spend_bounces() {
+  fly_mode="$1"
+  fly_number="$2"
+  fly_head="$3"
+  run_gate "$fly_mode" "$fly_number" "$fly_head"
+  [ "$gate_status" -eq 1 ]
+  fly_line="$(grep '^condition bounce_selectors: fail ' <<<"$gate_output")"
+  grep -q 'tier=content-derived ' <<<"$fly_line"
+  grep -q '"selector":"substance:fly-spend","tier":"content-derived"' \
+    <<<"$fly_line"
+}
+
+assert_fly_spend_bounces fly-machine 19 1919191919191919
+[ "$(grep -c '^diff-content$' "$gate_call_log")" -eq 1 ]
+assert_fly_spend_bounces fly-count 20 2020202020202020
+assert_fly_spend_bounces fly-region 21 2121212121212121
+assert_fly_spend_bounces fly-scaling 22 2222222222222223
+
+# A configured, known predicate fails closed when the one diff-content fetch
+# fails: it is unobservable and makes the condition inconclusive, never pass.
+run_gate diff-content-error 23 2323232323232323
+[ "$gate_status" -eq 2 ]
+diff_error_line="$(grep '^condition bounce_selectors: inconclusive ' <<<"$gate_output")"
+grep -q '"selector":"substance:fly-spend","tier":"content-derived"' \
+  <<<"$diff_error_line"
+grep -q 'placeholder diff content could not be fetched' <<<"$diff_error_line"
+
+# Predicate names are a closed set. The config syntax admits future names,
+# but gate evaluation reports an unknown name as unobservable.
+unknown_substance_config="$gate_fixture/unknown-substance-config"
+mkdir -p "$unknown_substance_config/ostrom"
+sed 's/substance:fly-spend/substance:placeholder-unknown/' \
+  "$gate_fixture/config/ostrom/gate.yaml" \
+  >"$unknown_substance_config/ostrom/gate.yaml"
+run_gate unknown-substance 24 2424242424242424 "$unknown_substance_config"
+[ "$gate_status" -eq 2 ]
+unknown_substance_line="$(grep '^condition bounce_selectors: inconclusive ' <<<"$gate_output")"
+grep -q '"selector":"substance:placeholder-unknown","tier":"content-derived"' \
+  <<<"$unknown_substance_line"
+grep -q 'unknown substance predicate: placeholder-unknown' \
+  <<<"$unknown_substance_line"
 
 run_gate unknown-check 7 cccccccccccccccc
 [ "$gate_status" -eq 2 ]
@@ -9437,7 +9591,7 @@ if grep -q '^condition bounce_selectors: excused ' <<<"$gate_output"; then
 fi
 
 gate_log="$gate_fixture/config/ostrom/gate.jsonl"
-[ "$(wc -l <"$gate_log" | tr -d '[:space:]')" -eq 19 ]
+[ "$(wc -l <"$gate_log" | tr -d '[:space:]')" -eq 25 ]
 jq -s -e '
   ([.[] | select(.pr == "placeholder-org/placeholder-repo#8")]
     | map({head_sha, already_judged}))
