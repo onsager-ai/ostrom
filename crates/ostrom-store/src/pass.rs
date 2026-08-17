@@ -317,7 +317,7 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
         guard.outcome = Some("failed".to_owned());
         return Err(PassError::failed(
             request.role,
-            format!("{} not executable", request.claude_bin.display()),
+            format!("{} is not marked executable", request.claude_bin.display()),
             1,
         ));
     }
@@ -587,11 +587,20 @@ fn release_inner_lease(guard: &PassGuard) {
     }
 }
 
-/// `is_file()` is not the check the message claims, and not the check the
-/// shell made. `pass.sh` used `-x`, so a present-but-unexecutable path failed
-/// here with a named reason; without the mode test it survives to
-/// `Command::spawn`, which reports a permission error against a path the
-/// operator has to work backwards from.
+/// Whether the file is *marked* executable, which is what the message says.
+///
+/// `is_file()` alone was neither: a path with no execute bit passed the guard
+/// and then failed in `Command::spawn`, reporting a permission error against a
+/// path the operator has to work backwards from.
+///
+/// This is deliberately not full `-x` parity. The shell's `-x` is `access(2)`
+/// with `X_OK`, which answers "can *this* process execute it" and so accounts
+/// for ownership and group; the mode test answers "is it marked executable at
+/// all". Closing that gap needs `access(2)`, which is not in std and does not
+/// justify a dependency for a diagnostic. The remaining case — marked
+/// executable but not executable *by us* — still fails at spawn, exactly as it
+/// did before this guard existed. So the message states what is checked rather
+/// than implying the stronger claim.
 #[cfg(unix)]
 fn is_executable_file(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
