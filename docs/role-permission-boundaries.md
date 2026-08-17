@@ -51,7 +51,7 @@ role boundary but remains inside the App's repository and permission blast
 radius.
 
 **Neither profile may deny `gh api` wholesale**, and the gatekeeper's case is
-the sharper one. `gate.sh` reads review threads through `gh api graphql` —
+the sharper one. `ostrom gate` reads review threads through `gh api graphql` —
 there is no porcelain for it — so a blanket deny would make every condition
 unobservable and every verdict `inconclusive`. The gatekeeper would be locked
 out of the gate it exists to run, while appearing to work.
@@ -336,7 +336,7 @@ Two existing actor-based assumptions do not survive the shared App cutover:
 - GitHub does not accept an approval from the pull request's own actor. A pull
   request opened by the shared App and an approval attempted by the
   gatekeeper are the same actor to GitHub, even though the harness roles differ.
-- `gate.sh` counts a thread resolved by the pull request author as unresolved.
+- `ostrom gate` counts a thread resolved by the pull request author as unresolved.
   A gatekeeper resolution now has that same actor too, so the gate cannot
   distinguish it from builder self-resolution.
 
@@ -350,7 +350,7 @@ per-role Apps.
 builder's stays.** Resolving a review thread is the `resolveReviewThread`
 mutation — there is no porcelain for it — so that deny would forbid the
 gatekeeper the write its protocol assigns it without fixing the shared-actor
-conflict. Before adding a deny to the gatekeeper, check what `gate.sh` and
+conflict. Before adding a deny to the gatekeeper, check what `ostrom gate` and
 `/ostrom:merge` actually call and settle the actor-independent thread rule.
 
 That deny was never load-bearing anyway: it matches only the literal word

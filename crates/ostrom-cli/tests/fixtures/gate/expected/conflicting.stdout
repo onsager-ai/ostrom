@@ -1,0 +1,7 @@
+verdict: fail pr=placeholder-org/alpha#13 head_sha=1313131313131313 already_judged=false
+condition mergeable: fail tier=content-derived detail={"mergeable":"CONFLICTING"}
+condition draft: pass tier=content-derived detail={"isDraft":false}
+condition required_checks: pass tier=content-derived detail={"selectors":[{"selector":"verify-*","result":"pass","matches":[{"name":"verify-linux","state":"SUCCESS"}]}]}
+condition review_threads: pass tier=content-derived detail={"unresolved":0,"answered":0,"unanswered":0,"resolved_by_pr_author":0,"resolved_with_missing_resolver":0}
+condition bounce_selectors: pass tier=none detail={"matches":[],"unobservable":[]}
+condition reserved_refs: pass tier=none detail={"matches":[]}

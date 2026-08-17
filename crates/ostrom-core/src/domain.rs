@@ -106,6 +106,46 @@ impl Selector {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct GateSelector(String);
+
+impl GateSelector {
+    pub fn new(value: impl Into<String>) -> Result<Self, SelectorError> {
+        let value = value.into();
+        if value
+            .strip_prefix("substance:")
+            .is_some_and(|pattern| !pattern.is_empty())
+        {
+            return Ok(Self(value));
+        }
+        Selector::new(value.clone())?;
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for GateSelector {
+    type Err = SelectorError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl<'de> Deserialize<'de> for GateSelector {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
 impl FromStr for Selector {
     type Err = SelectorError;
 
@@ -272,7 +312,7 @@ pub struct GateProject {
     #[serde(default)]
     pub required_checks: Vec<String>,
     #[serde(default)]
-    pub bounce: Vec<Selector>,
+    pub bounce: Vec<GateSelector>,
     #[serde(default)]
     pub reserved: Vec<u64>,
 }
@@ -283,7 +323,7 @@ pub struct GateConfig {
     #[serde(default = "default_provider")]
     pub provider: String,
     #[serde(default)]
-    pub bounce_all: Vec<Selector>,
+    pub bounce_all: Vec<GateSelector>,
     #[serde(default)]
     pub projects: Vec<GateProject>,
 }

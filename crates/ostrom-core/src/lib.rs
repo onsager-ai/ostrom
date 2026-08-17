@@ -34,7 +34,7 @@ pub use dispatch::{
     WorkOrderError, resolve_exact_branch,
 };
 pub use domain::{
-    ConfigError, DefaultDisposition, GateConfig, GateProject, Mandate, MandateConfig,
+    ConfigError, DefaultDisposition, GateConfig, GateProject, GateSelector, Mandate, MandateConfig,
     ProjectMandate, RepositoryName, Role, Selector, SelectorError, Verdict,
 };
 pub use plan::{

@@ -25,8 +25,8 @@ not use an ambient GitHub credential to discover it.
 
 `gatekeeper.settings.json` sets `GH_TOKEN` and `GITHUB_TOKEN` to empty, so
 there is no ambient credential here to discard or fall back to by accident.
-Never call `gh` directly, and never run a script that itself calls `gh`
-(such as `gate.sh`) directly either, for the rest of this protocol. A
+Never call `gh` directly, and never run a command that itself calls `gh`
+(such as `ostrom gate`) directly either, for the rest of this protocol. A
 session's Bash tool statically rejects command substitution before
 permission matching, so this step cannot capture `app-token.sh`'s output
 into a variable (`token="$(app-token.sh ...)"`) the way an interactive shell
@@ -66,23 +66,25 @@ scratch.
 
 ## 3. Run the artifact gate
 
-`gate.sh` calls `gh` itself, so it needs the same per-repository token as
+`ostrom gate` calls `gh` itself, so it needs the same per-repository token as
 every other call in this protocol, routed through `gh-as.sh` as in step 2.
 Run it once, capturing its exit code before doing anything else with it:
 
 ```sh
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/gh-as.sh" gatekeeper "$repository" \
-  bash "${CLAUDE_PLUGIN_ROOT}/scripts/gate.sh" "<owner/repo>#<PR number>"
+  --repositories "$repository" \
+  --permissions metadata:read,issues:read,pull_requests:read,checks:read,statuses:read \
+  -- ostrom gate "<owner/repo>#<PR number>"
 gate_exit=$?
 ```
 
 `gh-as.sh` exits `111` only when it could not authenticate — in that case
-`gate.sh` never ran at all, and `$gate_exit` is not a verdict. Treat `111`
+`ostrom gate` never ran at all, and `$gate_exit` is not a verdict. Treat `111`
 the same way step 2 treats an authentication failure: report it and stop,
-rather than mistake it for one of `gate.sh`'s own exit codes (`0` pass, `1`
+rather than mistake it for one of `ostrom gate`'s own exit codes (`0` pass, `1`
 fail, `2` inconclusive, `64` usage error). Any other value in `$gate_exit` is
-`gate.sh`'s own exit code, unchanged, and is handled as in step 4 below.
-`gate.sh` fetches the diff paths, required
+`ostrom gate`'s own exit code, unchanged, and is handled as in step 4 below.
+`ostrom gate` fetches the diff paths, required
 checks, labels and refs, and review threads directly from GitHub. Its
 review-thread query includes resolver authorship. Do not accept those inputs
 from the builder. Do not re-derive, reinterpret, or override the verdict.
@@ -387,7 +389,7 @@ Resolving a thread is the one exception, and it is not a widening: every other
 item in the list above is an **authoring** action, while judging that a thread
 has been addressed is what a judge is for. It sat in the wrong list.
 
-The condition cannot be satisfied any other way. `gate.sh` counts a thread
+The condition cannot be satisfied any other way. `ostrom gate` counts a thread
 resolved by the PR author as unresolved, and the builder and the principal
 share one GitHub account, so neither can clear one. Automated reviewers comment
 on most pull requests and do not resolve when their point is addressed, so a

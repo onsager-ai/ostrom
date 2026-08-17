@@ -82,8 +82,8 @@ builder work.
 
 `gatekeeper.settings.json` sets `GH_TOKEN` and `GITHUB_TOKEN` to empty, so
 there is no ambient credential here to discard or fall back to by accident.
-Never call `gh` directly, and never run a script that itself calls `gh`
-(such as `gate.sh`) directly either. A session's Bash tool statically
+Never call `gh` directly, and never run a command that itself calls `gh`
+(such as `ostrom gate`) directly either. A session's Bash tool statically
 rejects command substitution before permission matching, so this step
 cannot capture `app-token.sh`'s output into a variable
 (`token="$(app-token.sh ...)"`) the way an interactive shell would — no

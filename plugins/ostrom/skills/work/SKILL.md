@@ -197,8 +197,8 @@ read from open pull requests.
 Every GitHub read or mutation in triage, and every authenticated action the
 implementer later performs, must use the shared App rather than whoever is
 running this session. Never call `gh` directly against a GitHub remote, and
-never run a script that itself calls `gh` (such as `gate.sh`) directly either —
-that script belongs to the gatekeeper's protocol, not this one. A session's
+never run a command that itself calls `gh` (such as `ostrom gate`) directly
+either — that command belongs to the gatekeeper's protocol, not this one. A session's
 Bash tool statically rejects
 command substitution before permission matching, so this step cannot capture
 `app-token.sh`'s output into a variable (`token="$(app-token.sh ...)"`) the way
