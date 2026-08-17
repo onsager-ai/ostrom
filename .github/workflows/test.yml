@@ -55,6 +55,18 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: bash plugins/ostrom/tests/check-skill-version-bump.sh "$BASE_SHA" "$HEAD_SHA"
+      - name: Prevent shell implementation growth
+        if: github.event_name == 'pull_request'
+        working-directory: .
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PULL_REQUEST_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          labels_json="$PULL_REQUEST_LABELS"
+          PULL_REQUEST_LABELS="$(jq -r '.[]' <<<"$labels_json")"
+          export PULL_REQUEST_LABELS
+          bash plugins/ostrom/tests/check-shell-freeze.sh "$BASE_SHA" "$HEAD_SHA"
       - run: npm ci
       - run: npm run typecheck
       - run: npm run test

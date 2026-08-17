@@ -60,6 +60,14 @@ the installed plugin cache. Changing a skill body requires changing the
 `version` field in that same plugin's `.claude-plugin/plugin.json`. CI enforces
 this requirement per plugin so a protocol change cannot remain hidden behind
 an unchanged cache key.
+
+### Shell implementation freeze
+
+The implementation under `plugins/ostrom/scripts/` is frozen: new behaviour
+belongs in `crates/`, while deletions from the shell are always welcome. A
+small defect fix that must grow a shell file needs the `bash-bugfix` pull
+request label. Issue #263 tracks removing the shell implementation entirely.
+
 ### Rust CLI (phase 2)
 
 The Rust workspace remains additive: systemd and the plugin still invoke the
