@@ -55,15 +55,33 @@ impl OstromPaths {
     pub fn check_journal_file(&self) -> PathBuf {
         self.state.join("check-runs.jsonl")
     }
+
+    /// Credentials stay outside layered policy configuration. The explicit
+    /// override is needed by isolated runtimes that cannot place a secret in
+    /// the config root, and an empty override retains the established default.
+    #[must_use]
+    pub fn secrets_file(&self) -> PathBuf {
+        resolve_secrets_file(&self.config, env::var_os("MANDATE_SECRETS_FILE"))
+    }
+}
+
+fn resolve_secrets_file(
+    config: &std::path::Path,
+    override_path: Option<std::ffi::OsString>,
+) -> PathBuf {
+    override_path
+        .filter(|path| !path.is_empty())
+        .map_or_else(|| config.join("secrets.yaml"), PathBuf::from)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{env, process::Command};
+    use std::{env, path::PathBuf, process::Command};
 
-    use super::OstromPaths;
+    use super::{OstromPaths, resolve_secrets_file};
 
     const EMPTY_HOME_CHILD: &str = "OSTROM_TEST_EMPTY_HOME_CHILD";
+    const SECRETS_OVERRIDE_CHILD: &str = "OSTROM_TEST_SECRETS_OVERRIDE_CHILD";
 
     #[test]
     fn empty_ostrom_home_does_not_resolve_relative_path() {
@@ -84,6 +102,36 @@ mod tests {
             ])
             .status()
             .expect("run empty OSTROM_HOME test subprocess");
+        assert!(status.success());
+    }
+
+    #[test]
+    fn secrets_file_honors_environment_override_and_defaults_to_config() {
+        if let Some(expected) = env::var_os(SECRETS_OVERRIDE_CHILD) {
+            let paths = OstromPaths::resolve().expect("resolve explicit test paths");
+            assert_eq!(paths.secrets_file(), PathBuf::from(expected));
+            return;
+        }
+
+        let fixture = tempfile::tempdir().expect("temporary OSTROM_HOME");
+        let config = fixture.path().join("config");
+        assert_eq!(
+            resolve_secrets_file(&config, None),
+            config.join("secrets.yaml")
+        );
+
+        let override_path = fixture.path().join("isolated/secrets.yaml");
+        let status = Command::new(env::current_exe().expect("current test executable"))
+            .env("OSTROM_HOME", fixture.path())
+            .env("MANDATE_SECRETS_FILE", &override_path)
+            .env(SECRETS_OVERRIDE_CHILD, &override_path)
+            .args([
+                "--exact",
+                "paths::tests::secrets_file_honors_environment_override_and_defaults_to_config",
+                "--nocapture",
+            ])
+            .status()
+            .expect("run secrets override test subprocess");
         assert!(status.success());
     }
 }

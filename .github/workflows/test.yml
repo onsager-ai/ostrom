@@ -43,6 +43,12 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.86.0 --profile minimal
+        working-directory: .
+      - name: Build Ostrom CLI for plugin integration tests
+        run: cargo +1.86.0 build --locked --package ostrom-cli
+        working-directory: .
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22

@@ -297,8 +297,8 @@ troubled_projects="$(
 )"
 nominal="$((total_projects - troubled_projects))"
 [ "$nominal" -lt 0 ] && nominal=0
-local_drift="$(bash "$PLUGIN_ROOT/scripts/local-drift.sh" --local-only 2>/dev/null || true)"
-[ -n "$local_drift" ] && echo "LOCAL DRIFT — run mandate local-drift.sh for details"
+local_drift="$(ostrom local-drift --local-only 2>/dev/null || true)"
+[ -n "$local_drift" ] && echo "LOCAL DRIFT — run ostrom local-drift for details"
 [ "$stale" -eq 1 ] && echo "STALE — mandate sweep overdue"
 echo "$nominal projects nominal"
 

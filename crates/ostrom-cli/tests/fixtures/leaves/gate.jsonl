@@ -1,0 +1,7 @@
+{"ts":"2026-07-10T00:00:00Z","pr":"placeholder-org/alpha#1","head_sha":null,"verdict":"inconclusive","already_judged":false,"conditions":[{"name":"required_checks","result":"inconclusive"}]}
+{"ts":"2026-07-10T01:00:00Z","pr":"placeholder-org/alpha#1","head_sha":"1111111111111111111111111111111111111111","verdict":"pass","already_judged":false,"conditions":[{"name":"reserved_refs","result":"excused"}]}
+{"ts":"2026-07-11T00:00:00Z","pr":"placeholder-org/alpha#2","head_sha":"2222222222222222222222222222222222222222","verdict":"fail","already_judged":false,"conditions":[{"name":"review_threads","result":"fail"}]}
+{"ts":"2026-07-12T00:00:00Z","pr":"placeholder-org/alpha#3","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","verdict":"fail","already_judged":false,"conditions":[{"name":"bounce_selectors","result":"fail"}]}
+{"ts":"2026-07-13T00:00:00Z","pr":"placeholder-org/alpha#4","head_sha":null,"verdict":"inconclusive","already_judged":false,"conditions":[{"name":"required_checks","result":"inconclusive"}]}
+{"ts":"2026-07-14T00:00:00Z","pr":"placeholder-org/alpha#5","head_sha":"5555555555555555555555555555555555555555","verdict":"future","already_judged":false,"conditions":[]}
+{"ts":"2026-07-15T00:00:00Z","pr":"placeholder-org/alpha#6","head_sha":"6666666666666666666666666666666666666666","verdict":"inconclusive","already_judged":false,"conditions":[{"name":"required_checks","result":"inconclusive"}]}

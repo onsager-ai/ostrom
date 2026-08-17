@@ -358,7 +358,7 @@ caller's, is always about delivery, and never converts `inconclusive` into
   ```text
   Question: Should the principal wait for an observable gate result or decide this pull request outside the gate?
   Options ruled out: The gatekeeper inferring missing facts; treating inconclusive as pass or fail; asking the builder to argue the existing artifact.
-  Recommended action: The principal chooses whether to wait and re-run or use the one-PR exception path by running bash "${CLAUDE_PLUGIN_ROOT}/scripts/excuse.sh" grant <owner/repo>#<PR number> <condition> <reason...>, then re-run the gate.
+  Recommended action: The principal chooses whether to wait and re-run or use the one-PR exception path by running `ostrom excuse grant <owner/repo>#<PR number> <condition> <reason...>`, then re-run the gate.
   Blast radius: This pull request only; no standing permission and no change to gate conditions.
   ```
 

@@ -297,14 +297,14 @@ An exception is a machine-local event, not gate policy. The principal grants
 one with:
 
 ```sh
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/excuse.sh" grant <owner/repo>#<number> <condition> <reason...>
+ostrom excuse grant <owner/repo>#<number> <condition> <reason...>
 ```
 
 The verb accepts only `required_checks`, `review_threads`,
-`bounce_selectors`, or `reserved_refs`, requires a non-empty reason, resolves
-the pull request's current head SHA itself, and appends the grant to
-`${CLAUDE_CONFIG_DIR:-$HOME/.claude}/ostrom/exceptions.jsonl`. Run
-`excuse.sh list [<owner/repo>#<number>]` to see append order and whether each
+`bounce_selectors`, `reserved_refs`, or `merge_protocol`, requires a non-empty reason, resolves
+the pull request's current head SHA itself, and appends the grant to the
+resolved Ostrom state directory (or `OSTROM_HOME` when explicitly set). Run
+`ostrom excuse list [<owner/repo>#<number>]` to see append order and whether each
 record is current or superseded by the pull request's present head SHA.
 
 The next gate run evaluates every condition normally, then reports a matching

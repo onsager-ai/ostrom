@@ -1,0 +1,13 @@
+provider: file
+cadence_hours: 24
+stuck_after_days: 7
+search_roots: []
+bounce_all: []
+projects:
+  - repo: placeholder-org/alpha
+    delegated: []
+    excluded: []
+    reserved: []
+    default: excluded
+    paused: false
+    bounce: []
