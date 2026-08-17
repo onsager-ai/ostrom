@@ -9859,9 +9859,10 @@ run_gate() {
       FAKE_GATE_HEAD="$gate_head" \
       FAKE_GATE_CALL_LOG="$gate_call_log" \
       MANDATE_GATE_TIME="2026-08-04T12:00:00Z" \
+      OSTROM_HOME="$gate_config_dir/ostrom" \
       CLAUDE_CONFIG_DIR="$gate_config_dir" \
       CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-      bash "$PLUGIN_ROOT/scripts/gate.sh" \
+      "$OSTROM_BIN" gate \
         "placeholder-org/placeholder-repo#$gate_number"
   ) >"$gate_output_file"
   gate_status=$?

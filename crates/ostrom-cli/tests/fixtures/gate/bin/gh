@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ -n "${GATE_COMMAND_LOG:-}" ]; then
+  printf '%s %s\n' "$1" "$2" >>"$GATE_COMMAND_LOG"
+fi
+
+mode="${GATE_FIXTURE_MODE:-pass}"
+if [ "$1 $2" = "pr view" ]; then
+  if [ "$mode" = "unresolvable" ]; then
+    printf '%s\n' 'placeholder pull request could not be resolved' >&2
+    exit 1
+  fi
+  check_conclusion=SUCCESS
+  mergeable=MERGEABLE
+  is_draft=false
+  title='fix(core): safe placeholder change'
+  case "$mode" in
+    check-failure) check_conclusion=FAILURE ;;
+    conflicting) mergeable=CONFLICTING ;;
+    draft) is_draft=true ;;
+    bounce) title='feat(core): protected placeholder change' ;;
+  esac
+  jq -cn \
+    --argjson number "$3" \
+    --arg head "${GATE_FIXTURE_HEAD:-aaaaaaaaaaaaaaaa}" \
+    --arg check_conclusion "$check_conclusion" \
+    --arg mergeable "$mergeable" \
+    --argjson is_draft "$is_draft" \
+    --arg title "$title" '
+      {
+        number: $number,
+        title: $title,
+        author: {login: "placeholder-builder"},
+        headRefOid: $head,
+        labels: [],
+        statusCheckRollup: [{
+          name: "verify-linux",
+          status: "COMPLETED",
+          conclusion: $check_conclusion
+        }],
+        closingIssuesReferences: [],
+        mergeable: $mergeable,
+        isDraft: $is_draft
+      }
+    '
+  exit 0
+fi
+
+if [ "$1 $2" = "pr diff" ]; then
+  if [[ " $* " == *" --name-only "* ]]; then
+    printf '%s\n' 'src/placeholder.rs'
+    exit 0
+  fi
+  printf '%s\n' 'gate fixture did not request diff content' >&2
+  exit 1
+fi
+
+if [ "$1 $2" = "api graphql" ]; then
+  if [ "$mode" = "thread-failure" ]; then
+    printf '%s\n' '{"data":{"repository":{"pullRequest":{"author":{"login":"placeholder-builder"},"reviewThreads":{"nodes":[{"id":"THREAD_placeholder","isResolved":false,"resolvedBy":null,"comments":{"nodes":[{"author":{"login":"placeholder-reviewer"}}]}}],"pageInfo":{"hasNextPage":false,"endCursor":"cursor-placeholder"}}}}}}'
+  else
+    printf '%s\n' '{"data":{"repository":{"pullRequest":{"author":{"login":"placeholder-builder"},"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":"cursor-placeholder"}}}}}}'
+  fi
+  exit 0
+fi
+
+printf '%s\n' "gate fixture rejected command: $*" >&2
+exit 97

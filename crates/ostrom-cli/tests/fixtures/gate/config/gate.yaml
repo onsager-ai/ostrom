@@ -1,0 +1,10 @@
+provider: file
+bounce_all: []
+projects:
+  - repo: placeholder-org/alpha
+    required_checks:
+      - verify-*
+    bounce:
+      - title:*protected*
+    reserved:
+      - 99

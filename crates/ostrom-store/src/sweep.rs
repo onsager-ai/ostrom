@@ -2182,7 +2182,7 @@ pub fn load_config_or_defaults(
     }
 }
 
-fn merge_yaml(base: &mut serde_yaml::Value, overlay: serde_yaml::Value) {
+pub(crate) fn merge_yaml(base: &mut serde_yaml::Value, overlay: serde_yaml::Value) {
     match (base, overlay) {
         (serde_yaml::Value::Mapping(base), serde_yaml::Value::Mapping(overlay)) => {
             for (key, value) in overlay {

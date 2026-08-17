@@ -15,12 +15,13 @@ use ostrom_core::{
     ResolvedCheck,
 };
 use ostrom_store::{
-    AuditOptions, DispatchOutcome, DispatchRequest, ExecutableAssessmentDeriver, MigrationOutcome,
-    OstromPaths, PlanOptions, PublishTarget, SelectAction, SelectError, SelectOutcome,
-    SelectRequest, SweepError, SweepMode, SweepOptions, SweepParityOptions,
-    UnavailableAssessmentDeriver, acquire_org_from_github, audit, encode_org_snapshots,
-    encode_selection, grant_excuse, list_excuses, list_queue_json, local_drift, migrate,
-    run_dispatch, run_plan, run_selection, run_sweep, run_sweep_parity,
+    AuditOptions, DispatchOutcome, DispatchRequest, ExecutableAssessmentDeriver, GateError,
+    GateOptions, MigrationOutcome, OstromPaths, PlanOptions, PublishTarget, SelectAction,
+    SelectError, SelectOutcome, SelectRequest, SweepError, SweepMode, SweepOptions,
+    SweepParityOptions, UnavailableAssessmentDeriver, acquire_org_from_github, audit,
+    encode_org_snapshots, encode_selection, grant_excuse, list_excuses, list_queue_json,
+    local_drift, migrate, run_dispatch, run_gate, run_plan, run_selection, run_sweep,
+    run_sweep_parity,
 };
 
 #[derive(Debug, Parser)]
@@ -41,6 +42,11 @@ enum Command {
     SelectWork {
         #[arg(allow_hyphen_values = true)]
         arguments: Vec<String>,
+    },
+    /// Evaluate one pull request against the artifact merge gate.
+    Gate {
+        #[arg(num_args = 0.., allow_hyphen_values = true)]
+        target: Vec<String>,
     },
     /// Inspect the private queue.
     Queue {
@@ -176,6 +182,38 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::SelectWork { arguments } => {
             run_select_work(arguments);
+        }
+        Command::Gate { target } => {
+            if target.len() != 1 {
+                let error = GateError::InvalidTarget;
+                eprintln!("{error}");
+                std::process::exit(error.exit_code());
+            }
+            let timestamp = env::var("MANDATE_GATE_TIME")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| {
+                    DateTime::<Utc>::from(SystemTime::now())
+                        .format("%Y-%m-%dT%H:%M:%SZ")
+                        .to_string()
+                });
+            let output = match run_gate(&GateOptions {
+                paths,
+                working_directory: env::current_dir()?,
+                target: target[0].clone(),
+                timestamp,
+            }) {
+                Ok(output) => output,
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::exit(error.exit_code());
+                }
+            };
+            io::stdout().write_all(output.stdout.as_bytes())?;
+            io::stderr().write_all(output.stderr.as_bytes())?;
+            if output.exit_code != 0 {
+                std::process::exit(output.exit_code);
+            }
         }
         Command::Queue {
             command: QueueCommand::List { format },

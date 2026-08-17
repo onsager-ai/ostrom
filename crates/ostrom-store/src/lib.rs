@@ -4,6 +4,7 @@ mod app_token;
 mod check_store;
 mod dispatch;
 mod file_store;
+mod gate;
 mod lease;
 mod leaves;
 mod migration;
@@ -20,6 +21,7 @@ pub use app_token::AppTokenError;
 pub use check_store::JsonlCheckStore;
 pub use dispatch::{DispatchError, DispatchOutcome, DispatchRequest, run_dispatch};
 pub use file_store::JsonlSweepStore;
+pub use gate::{GateError, GateOptions, GateOutput, run_gate};
 pub use lease::{LeaseRecord, read_lease, write_lease};
 pub use leaves::{
     AuditError, AuditOptions, ExcuseError, LocalDriftError, audit, grant_excuse, list_excuses,
