@@ -21,6 +21,20 @@ const ROLE_SKILL: Record<DeliveryRole, string> = {
 // measured in production, 19 passes in a row, none of them noticed.
 const PASS_FAULT_THRESHOLD = 3;
 
+const OUTPUT_KINDS = new Set([
+  "work-dispatched",
+  "decision-taken",
+  "pr-repair",
+]);
+
+interface RecentRolePass {
+  record: Record<string, unknown>;
+  terminalOutput: boolean;
+  outputRecordSeen: boolean;
+  owner: string;
+  started: boolean;
+}
+
 function nowEpoch(context: DoctorContext): number {
   const explicit = context.env.MANDATE_NOW_EPOCH;
   if (explicit && /^\d+$/.test(explicit)) return Number(explicit);
@@ -45,20 +59,30 @@ function formatAge(ageSeconds: number): string {
   return minutes === 0 ? `${hours}h` : `${hours}h${minutes}m`;
 }
 
-// Walks the trace backward collecting this role's pass-ended records,
-// newest first, stopping once `limit` are found. The outcome streak checks
-// only ever need the most recent PASS_FAULT_THRESHOLD, so this is the one
-// backward scan both the staleness check and the fault check read from --
-// scanning once from the end rather than parsing the whole (unboundedly
-// growing) trace forward.
+function hasNonZeroTerminalCount(fact: Record<string, unknown>): boolean {
+  return [fact.worked_items, fact.completed_candidates].some(
+    (count) => typeof count === "number" && Number.isFinite(count) && count > 0,
+  );
+}
+
+// Walks the trace backward collecting this role's pass-ended records, newest
+// first. Once `limit` ends are found, the scan continues only far enough to
+// reach their matching pass-started rows. Output records encountered inside
+// each boundary mark that pass productive; the terminal counts emitted by the
+// two role protocols are a fallback for traces recorded before those output
+// kinds existed. This keeps both the age and fault checks on one bounded scan
+// from the end instead of parsing the unbounded trace forward.
 function recentRolePassEnded(
   source: string,
   role: DeliveryRole,
   limit: number,
-): Record<string, unknown>[] {
-  const records: Record<string, unknown>[] = [];
+): RecentRolePass[] {
+  const passes: RecentRolePass[] = [];
   let contentEnd = source.length;
-  while (contentEnd > 0 && records.length < limit) {
+  while (
+    contentEnd > 0 &&
+    (passes.length < limit || passes.some((pass) => !pass.started))
+  ) {
     while (
       contentEnd > 0 &&
       (source[contentEnd - 1] === "\n" || source[contentEnd - 1] === "\r")
@@ -77,15 +101,39 @@ function recentRolePassEnded(
     } catch {
       continue;
     }
-    if (!object(record) || record.kind !== "pass-ended" || !object(record.fact)) {
+    if (!object(record)) continue;
+
+    if (record.kind === "pass-ended" && object(record.fact)) {
+      const owner = record.fact.owner;
+      if (
+        passes.length < limit &&
+        typeof owner === "string" &&
+        owner.startsWith(`${role}-`)
+      ) {
+        passes.push({
+          record,
+          terminalOutput: hasNonZeroTerminalCount(record.fact),
+          outputRecordSeen: false,
+          owner,
+          started: false,
+        });
+      }
       continue;
     }
-    const owner = record.fact.owner;
-    if (typeof owner === "string" && owner.startsWith(`${role}-`)) {
-      records.push(record);
+
+    const openPasses = passes.filter((pass) => !pass.started);
+    if (OUTPUT_KINDS.has(String(record.kind))) {
+      for (const pass of openPasses) pass.outputRecordSeen = true;
+    }
+
+    if (record.kind === "pass-started" && object(record.fact)) {
+      const owner = record.fact.owner;
+      if (typeof owner !== "string") continue;
+      const matchingPass = openPasses.find((pass) => pass.owner === owner);
+      if (matchingPass) matchingPass.started = true;
     }
   }
-  return records;
+  return passes;
 }
 
 function checkRolePass(
@@ -113,8 +161,8 @@ function checkRolePass(
   }
 
   const recent = recentRolePassEnded(trace.content, role, PASS_FAULT_THRESHOLD);
-  const record = recent[0];
-  if (!record) {
+  const newest = recent[0];
+  if (!newest) {
     return {
       status: "WARN",
       name: checkName,
@@ -122,6 +170,7 @@ function checkRolePass(
       remedy: `run ${ROLE_SKILL[role]} and confirm it records pass-ended`,
     };
   }
+  const record = newest.record;
 
   const timestamp = record.ts;
   const timestampMs = typeof timestamp === "string" ? Date.parse(timestamp) : NaN;
@@ -136,15 +185,24 @@ function checkRolePass(
 
   const ageSeconds = nowEpoch(context) - Math.floor(timestampMs / 1000);
   const age = formatAge(ageSeconds);
+  const producedNothing =
+    recent.length === PASS_FAULT_THRESHOLD &&
+    recent.every(
+      (candidate) =>
+        !candidate.terminalOutput &&
+        !(candidate.started && candidate.outputRecordSeen),
+    );
 
   // A run of no-ops this long means the loop is running (it stays "current"
   // on the staleness check above) but has stopped taking ownership of
   // anything -- a fault the age/cadence check alone cannot see, so it is
   // judged first and overrides an otherwise-current verdict.
   if (
-    recent.length === PASS_FAULT_THRESHOLD &&
+    producedNothing &&
     recent.every(
-      (candidate) => object(candidate.fact) && candidate.fact.outcome === "no-op",
+      (candidate) =>
+        object(candidate.record.fact) &&
+        candidate.record.fact.outcome === "no-op",
     )
   ) {
     return {
@@ -159,9 +217,11 @@ function checkRolePass(
   // that it failed. Treating those fresh wrapper rows as healthy would hide
   // the same dead loop as a no-op streak, one layer deeper.
   if (
-    recent.length === PASS_FAULT_THRESHOLD &&
+    producedNothing &&
     recent.every(
-      (candidate) => object(candidate.fact) && candidate.fact.outcome === "failed",
+      (candidate) =>
+        object(candidate.record.fact) &&
+        candidate.record.fact.outcome === "failed",
     )
   ) {
     return {
@@ -169,6 +229,15 @@ function checkRolePass(
       name: checkName,
       detail: `${role} loop has produced ${PASS_FAULT_THRESHOLD} consecutive failed passes, last ${timestamp} (age ${age})`,
       remedy: `inspect pass-runs/${role} transcripts; the protocol takes ownership but does not complete`,
+    };
+  }
+
+  if (producedNothing) {
+    return {
+      status: "FAIL",
+      name: checkName,
+      detail: `${role} loop has produced no output for ${PASS_FAULT_THRESHOLD} consecutive passes, last ${timestamp} (age ${age})`,
+      remedy: `inspect pass-runs/${role} transcripts and the queue; the protocol runs but dispatches no work, records no decision, and repairs no pull request`,
     };
   }
 

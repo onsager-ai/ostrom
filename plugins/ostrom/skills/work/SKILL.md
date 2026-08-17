@@ -433,7 +433,9 @@ including a sweep failure, config failure, trace failure, and failure midway
 through an item. First append `pass-ended`; its fact object records the same
 builder owner, observed outcome, and worked-item count. Narration may explain
 why an incomplete pass stopped, but must not replace those facts. Then release
-the named lease with the exact owner retained in step 2:
+the named lease with the exact owner retained in step 2. Choose `pass_outcome`
+only from the closed set `completed`, `completed-no-dispatch`, `no-op`,
+`failed`, and `blocked`:
 
 ```sh
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/trace.sh" append pass-ended \

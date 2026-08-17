@@ -46,6 +46,20 @@ case "$action" in
       echo "mandate trace: fact-json must be a JSON object" >&2
       exit 2
     fi
+    if [ "$kind" = "pass-ended" ] && ! jq -e '
+      .outcome as $outcome
+      | ($outcome | type) == "string"
+      and ([
+        "completed",
+        "completed-no-dispatch",
+        "no-op",
+        "failed",
+        "blocked"
+      ] | index($outcome)) != null
+    ' >/dev/null 2>&1 <<<"$fact_json"; then
+      echo "mandate trace: pass-ended fact.outcome must be one of completed, completed-no-dispatch, no-op, failed, blocked" >&2
+      exit 2
+    fi
     if ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"$narration_json"; then
       echo "mandate trace: narration-json must be a JSON object" >&2
       exit 2

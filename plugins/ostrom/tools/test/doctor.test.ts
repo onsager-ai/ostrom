@@ -799,18 +799,85 @@ describe("doctor golden output", () => {
     );
   });
 
-  it("clears the no-op fault the moment a pass completes again", () => {
+  it("reports a fault after three consecutive passes produce no output", () => {
+    const fixture = baseFixture();
+    writeFileSync(
+      join(fixture.configDir, "ostrom", "sprint.jsonl"),
+      '{"ts":"2026-07-31T22:00:00Z","kind":"pass-ended","fact":{"owner":"builder-fixture-wake1","outcome":"completed-no-dispatch","worked_items":0},"narration":{}}\n' +
+        '{"ts":"2026-07-31T23:00:00Z","kind":"pass-ended","fact":{"owner":"builder-fixture-wake2","outcome":"completed-no-dispatch","worked_items":0},"narration":{}}\n' +
+        '{"ts":"2026-08-01T00:00:00Z","kind":"pass-ended","fact":{"owner":"builder-fixture-wake3","outcome":"completed-no-dispatch","worked_items":0},"narration":{}}\n',
+    );
+
+    expect(run(fixture)).toContain(
+      "FAIL|builder-pass|builder loop has produced no output for 3 consecutive passes, last 2026-08-01T00:00:00Z (age 0m)|inspect pass-runs/builder transcripts and the queue; the protocol runs but dispatches no work, records no decision, and repairs no pull request\n",
+    );
+  });
+
+  it("trusts dispatched work over three misleading pass outcomes", () => {
+    const fixture = baseFixture();
+    writeFileSync(
+      join(fixture.configDir, "ostrom", "sprint.jsonl"),
+      '{"ts":"2026-07-31T21:58:00Z","kind":"pass-started","fact":{"owner":"builder-fixture-wake1"},"narration":{}}\n' +
+        '{"ts":"2026-07-31T21:59:00Z","kind":"work-dispatched","fact":{},"narration":{}}\n' +
+        '{"ts":"2026-07-31T22:00:00Z","kind":"pass-ended","fact":{"owner":"builder-fixture-wake1","outcome":"no-op"},"narration":{}}\n' +
+        '{"ts":"2026-07-31T22:58:00Z","kind":"pass-started","fact":{"owner":"builder-fixture-wake2"},"narration":{}}\n' +
+        '{"ts":"2026-07-31T22:59:00Z","kind":"work-dispatched","fact":{},"narration":{}}\n' +
+        '{"ts":"2026-07-31T23:00:00Z","kind":"pass-ended","fact":{"owner":"builder-fixture-wake2","outcome":"no-op"},"narration":{}}\n' +
+        '{"ts":"2026-07-31T23:58:00Z","kind":"pass-started","fact":{"owner":"builder-fixture-wake3"},"narration":{}}\n' +
+        '{"ts":"2026-07-31T23:59:00Z","kind":"work-dispatched","fact":{},"narration":{}}\n' +
+        '{"ts":"2026-08-01T00:00:00Z","kind":"pass-ended","fact":{"owner":"builder-fixture-wake3","outcome":"no-op"},"narration":{}}\n',
+    );
+
+    expect(run(fixture)).toContain(
+      "OK|builder-pass|builder pass current, last 2026-08-01T00:00:00Z (age 0m; 3h cadence)|\n",
+    );
+  });
+
+  it("does not fault on one zero-output pass between productive passes", () => {
+    const fixture = baseFixture();
+    writeFileSync(
+      join(fixture.configDir, "ostrom", "sprint.jsonl"),
+      '{"ts":"2026-07-31T21:58:00Z","kind":"pass-started","fact":{"owner":"builder-fixture-wake1"},"narration":{}}\n' +
+        '{"ts":"2026-07-31T21:59:00Z","kind":"decision-taken","fact":{},"narration":{}}\n' +
+        '{"ts":"2026-07-31T22:00:00Z","kind":"pass-ended","fact":{"owner":"builder-fixture-wake1","outcome":"completed"},"narration":{}}\n' +
+        '{"ts":"2026-07-31T22:58:00Z","kind":"pass-started","fact":{"owner":"builder-fixture-wake2"},"narration":{}}\n' +
+        '{"ts":"2026-07-31T23:00:00Z","kind":"pass-ended","fact":{"owner":"builder-fixture-wake2","outcome":"completed-no-dispatch"},"narration":{}}\n' +
+        '{"ts":"2026-07-31T23:58:00Z","kind":"pass-started","fact":{"owner":"builder-fixture-wake3"},"narration":{}}\n' +
+        '{"ts":"2026-07-31T23:59:00Z","kind":"pr-repair","fact":{},"narration":{}}\n' +
+        '{"ts":"2026-08-01T00:00:00Z","kind":"pass-ended","fact":{"owner":"builder-fixture-wake3","outcome":"completed"},"narration":{}}\n',
+    );
+
+    expect(run(fixture)).toContain(
+      "OK|builder-pass|builder pass current, last 2026-08-01T00:00:00Z (age 0m; 3h cadence)|\n",
+    );
+  });
+
+  it("uses non-zero role terminal counts as productive output", () => {
+    const fixture = baseFixture();
+    writeFileSync(
+      join(fixture.configDir, "ostrom", "sprint.jsonl"),
+      '{"ts":"2026-07-31T22:00:00Z","kind":"pass-ended","fact":{"owner":"gatekeeper-fixture-wake1","outcome":"completed","completed_candidates":1},"narration":{}}\n' +
+        '{"ts":"2026-07-31T23:00:00Z","kind":"pass-ended","fact":{"owner":"gatekeeper-fixture-wake2","outcome":"completed","completed_candidates":1},"narration":{}}\n' +
+        '{"ts":"2026-08-01T00:00:00Z","kind":"pass-ended","fact":{"owner":"gatekeeper-fixture-wake3","outcome":"completed","completed_candidates":1},"narration":{}}\n',
+    );
+
+    expect(run(fixture)).toContain(
+      "OK|gatekeeper-pass|gatekeeper pass current, last 2026-08-01T00:00:00Z (age 0m; 1h cadence)|\n",
+    );
+  });
+
+  it("clears the no-op fault the moment a pass produces output again", () => {
     const fixture = baseFixture();
     writeFileSync(
       join(fixture.configDir, "ostrom", "sprint.jsonl"),
       '{"ts":"2026-07-31T21:00:00Z","kind":"pass-ended","fact":{"owner":"builder-fixture-wake1","outcome":"no-op","reason":"blocked"}}\n' +
         '{"ts":"2026-07-31T22:00:00Z","kind":"pass-ended","fact":{"owner":"builder-fixture-wake2","outcome":"no-op","reason":"blocked"}}\n' +
         '{"ts":"2026-07-31T23:00:00Z","kind":"pass-ended","fact":{"owner":"builder-fixture-wake3","outcome":"no-op","reason":"blocked"}}\n' +
-        '{"ts":"2026-08-01T00:00:00Z","kind":"pass-ended","fact":{"owner":"builder-fixture-wake4","outcome":"completed"}}\n',
+        '{"ts":"2026-08-01T00:00:00Z","kind":"pass-ended","fact":{"owner":"builder-fixture-wake4","outcome":"completed","worked_items":1}}\n',
     );
 
     // The streak the fault check counts is the trailing run ending at the
-    // most recent pass, not "any three no-ops in history" -- a working pass
+    // most recent pass, not "any three no-ops in history" -- produced output
     // breaks it immediately.
     expect(run(fixture)).toContain(
       "OK|builder-pass|builder pass current, last 2026-08-01T00:00:00Z (age 0m; 3h cadence)|\n",

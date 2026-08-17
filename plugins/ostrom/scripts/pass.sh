@@ -471,7 +471,8 @@ on_signal() {
   trap '' HUP INT TERM
   if [ "$signal_name" = TERM ]; then
     # systemd uses SIGTERM when TimeoutStartSec expires.
-    outcome=timed-out
+    outcome=failed
+    outcome_reason=timed-out
   else
     outcome=failed
   fi
