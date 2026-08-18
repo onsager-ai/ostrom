@@ -208,7 +208,11 @@ fn mint_installation_token_with_secrets(
     api_base: &str,
     secrets_path: impl FnOnce() -> Result<PathBuf, AppTokenError>,
 ) -> Result<InstallationToken, AppTokenError> {
+    // GitHub rejects a request with no User-Agent using 403 and an
+    // administrative-rules message, which reads as a permission failure and is
+    // not one. reqwest sends no default. See ostrom_core::USER_AGENT.
     let client = Client::builder()
+        .user_agent(ostrom_core::USER_AGENT)
         .build()
         .map_err(|_| AppTokenError::LookupNetwork)?;
     let mut transport = ReqwestTransport { client, api_base };
@@ -606,6 +610,77 @@ mod tests {
     use super::*;
 
     const TOKEN_SENTINEL: &str = "placeholder-installation-token-sentinel";
+
+    /// The one property `FakeTransport` cannot check, and the one that broke.
+    ///
+    /// GitHub rejects a request carrying no `User-Agent` with **403 and an
+    /// administrative-rules message** — not 401, so it reads as a permission
+    /// problem rather than a malformed request. `reqwest` sends no default, so
+    /// the native minter had never authenticated against real GitHub; every
+    /// production sweep had run through the shell path, and the first one that
+    /// did not wrote an 11-row queue over a 135-row one.
+    ///
+    /// The transport trait takes a JWT and a repository and hides headers
+    /// entirely, so no test at that seam can observe this. This one drives the
+    /// real `ReqwestTransport` against a socket and reads the bytes on the wire.
+    #[test]
+    fn the_real_transport_sends_a_user_agent() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            thread,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture socket");
+        let port = listener.local_addr().expect("fixture address").port();
+        let served = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept lookup");
+            // Read until the header block is complete. A single `read` returns
+            // whatever happened to arrive, which is routinely nothing yet — the
+            // first version of this test passed once and then failed, which is
+            // the same wall-clock flakiness this suite fixed elsewhere today.
+            let mut raw = Vec::new();
+            let mut buffer = [0_u8; 512];
+            while !raw.windows(4).any(|window| window == b"\r\n\r\n") {
+                match stream.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => raw.extend_from_slice(&buffer[..read]),
+                    Err(error) => panic!("read request: {error}"),
+                }
+            }
+            let request = String::from_utf8_lossy(&raw).into_owned();
+            stream
+                .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n")
+                .expect("write reply");
+            request
+        });
+
+        let base = format!("http://127.0.0.1:{port}");
+        let client = Client::builder()
+            .user_agent(ostrom_core::USER_AGENT)
+            .build()
+            .expect("build client");
+        let mut transport = ReqwestTransport {
+            client,
+            api_base: &base,
+        };
+        let _ = transport.lookup("placeholder.jwt.value", "placeholder-org/alpha");
+
+        let request = served.join().expect("fixture thread");
+        let header = request
+            .lines()
+            .find(|line| line.to_ascii_lowercase().starts_with("user-agent:"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no User-Agent header on the wire ({} bytes):\n{request}",
+                    request.len()
+                )
+            });
+        assert!(
+            header.contains("ostrom/"),
+            "User-Agent must identify ostrom, got: {header}"
+        );
+    }
 
     fn paths(root: &Path) -> OstromPaths {
         OstromPaths {
