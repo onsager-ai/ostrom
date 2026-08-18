@@ -21,8 +21,13 @@ jobs:
       verification-dir: ${{ steps.meta.outputs.verification-dir }}
       verification-binaries: ${{ steps.meta.outputs.verification-binaries }}
       main-dir: ${{ steps.meta.outputs.main-dir }}
+      declared-msrv: ${{ steps.msrv.outputs.declared }}
+      rust-toolchain: ${{ steps.msrv.outputs.toolchain }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - id: msrv
+        name: Read rust-version from Cargo.toml
+        run: bash plugins/ostrom/tests/resolve-msrv.sh Cargo.toml >> "$GITHUB_OUTPUT"
       - id: meta
         name: Read npm release configuration
         run: node npm/scripts/release-meta.mjs
@@ -45,18 +50,20 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.meta.outputs.matrix) }}
     runs-on: ${{ matrix.os }}
+    env:
+      MSRV_TOOLCHAIN: ${{ needs.meta.outputs.rust-toolchain }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Install pinned Rust toolchain
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
-        run: rustup toolchain install 1.86.0 --profile minimal --target "$TARGET"
+        run: rustup toolchain install "$MSRV_TOOLCHAIN" --profile minimal --target "$TARGET"
       - name: Build release binaries
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
-        run: cargo +1.86.0 build --locked --release --package ostrom-cli --target "$TARGET"
+        run: cargo +"$MSRV_TOOLCHAIN" build --locked --release --package ostrom-cli --target "$TARGET"
       - name: Assert binary version
         shell: bash
         env:

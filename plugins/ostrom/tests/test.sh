@@ -70,6 +70,7 @@ trap '[[ $- == *e* ]] && echo "mandate tests: FAILED at test.sh:${LINENO} (last 
 
 bash "$PLUGIN_ROOT/tests/test-skill-version-bump.sh"
 bash "$PLUGIN_ROOT/tests/test-shell-freeze.sh"
+bash "$PLUGIN_ROOT/tests/test-msrv.sh"
 
 # Shipped plugin files must not retain private checkout paths. Build the
 # expression in pieces so this assertion does not match its own source.
