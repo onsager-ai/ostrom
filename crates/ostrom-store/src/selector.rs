@@ -37,8 +37,14 @@ pub(crate) fn selector_match(candidate: &SelectorCandidate<'_>, selector: &Selec
     }
 }
 
+/// Compiled once. `conventional` is a selector precondition evaluated for every
+/// candidate against every selector, so recompiling per call is real work in the
+/// sweep's hot path for no benefit.
+static CONVENTIONAL: std::sync::LazyLock<Option<Regex>> =
+    std::sync::LazyLock::new(|| Regex::new(r"^([^(:\s]+)(?:\(([^)]*)\))?:").ok());
+
 fn conventional(title: &str) -> (String, Vec<String>) {
-    let Ok(regex) = Regex::new(r"^([^(:\s]+)(?:\(([^)]*)\))?:") else {
+    let Some(regex) = CONVENTIONAL.as_ref() else {
         return (String::new(), Vec::new());
     };
     let Some(captures) = regex.captures(title) else {

@@ -154,7 +154,11 @@ pub fn replay(options: &ReplayOptions) -> Result<String, ReplayError> {
                 "--state",
                 "merged",
                 "--limit",
-                "200",
+                // Derived from QUERY_LIMIT rather than repeated: the truncation
+                // guard below compares against it, so a second literal here
+                // could drift into either false truncation errors or silently
+                // truncated replays.
+                &QUERY_LIMIT.to_string(),
                 "--json",
                 "number,title,labels,url,files,baseRefName,mergedAt,closingIssuesReferences",
             ])
@@ -581,10 +585,15 @@ fn nonempty_string(value: Option<&Value>) -> Option<&str> {
     (!value.is_empty()).then_some(value)
 }
 
+/// Being a regular file is not enough — a non-executable `gh` on PATH would
+/// pass this and then fail downstream as a confusing query error rather than
+/// the intended "gh is required". This is the third time the same defect has
+/// appeared in this codebase (#286 in the pass guard, #289 in dispatch
+/// resolution), so it reuses the one helper rather than writing a third test.
 fn command_exists(name: &str) -> bool {
     env::var_os("PATH").is_some_and(|path| {
         env::split_paths(&path)
             .map(|directory| directory.join(name))
-            .any(|candidate| candidate.is_file())
+            .any(|candidate| crate::pass::is_executable_file(&candidate))
     })
 }

@@ -1452,6 +1452,16 @@ fn classify(
             selector: format!("ref:#{number}"),
         });
     }
+    // Built once per item rather than per selector: it only borrows from
+    // `item` and is identical for every selector in every group, so rebuilding
+    // it inside the inner loop was repeated work in the sweep's hot path.
+    let candidate = SelectorCandidate {
+        item_type: &item.item_type,
+        title: &item.title,
+        labels: &item.labels,
+        refs: &item.refs,
+        files: &item.files,
+    };
     for (selectors, source, terminal) in [
         (&config.bounce_all, "bounce_all", "tripwire"),
         (&project.bounce, "project bounce", "tripwire"),
@@ -1459,16 +1469,7 @@ fn classify(
         (&project.delegated, "delegated", "delegated"),
     ] {
         for selector in selectors {
-            if selector_match(
-                &SelectorCandidate {
-                    item_type: &item.item_type,
-                    title: &item.title,
-                    labels: &item.labels,
-                    refs: &item.refs,
-                    files: &item.files,
-                },
-                selector,
-            ) {
+            if selector_match(&candidate, selector) {
                 return Ok(Classification {
                     terminal: terminal.to_owned(),
                     source: source.to_owned(),
