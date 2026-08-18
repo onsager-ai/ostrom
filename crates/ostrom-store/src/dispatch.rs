@@ -1021,7 +1021,7 @@ fn resolve_codex(context: &DispatchContext<'_>) -> Result<PathBuf, DispatchError
 
 fn resolve_node(context: &DispatchContext<'_>, codex: &Path) -> Result<PathBuf, DispatchError> {
     let output = Command::new("bash")
-        .arg(context.request.plugin_root.join("scripts/run-node.sh"))
+        .arg(context.request.plugin_root.join("runtime/run-node.sh"))
         .arg("--resolve-only")
         .output();
     let resolved = output

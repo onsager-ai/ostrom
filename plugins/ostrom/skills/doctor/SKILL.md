@@ -13,8 +13,8 @@ converts that silence into a short, actionable report.
 
 ## 1. Run the prober
 
-Run `scripts/run-node.sh` (sibling of `skills/`, i.e.
-`../../scripts/run-node.sh` from this file). The shim locates Node even
+Run `runtime/run-node.sh` (sibling of `skills/`, i.e.
+`../../runtime/run-node.sh` from this file). The shim locates Node even
 when an interactive version manager has not put it on `PATH`, then runs
 the bundled doctor. The doctor is read-only (it makes exactly one write of
 its own: a `git fetch` into the marketplace's cached clone, touching that

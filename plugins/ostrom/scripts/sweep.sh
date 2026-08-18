@@ -2205,7 +2205,7 @@ jq -Rn '[inputs | select(length > 0)]' \
 semantic_enabled=0
 semantic_node=""
 if mandate_semantic_is_configured; then
-  semantic_node="$(bash "$SCRIPT_DIR/run-node.sh" --resolve-only)" || {
+  semantic_node="$(bash "$SCRIPT_DIR/../runtime/run-node.sh" --resolve-only)" || {
     echo "mandate sweep: semantic derivation is configured but Node.js 18+ is unavailable" >&2
     exit 2
   }

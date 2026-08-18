@@ -42,7 +42,7 @@ inside one plugin.
 - `plugins/ostrom/` — the unified plugin: layered rules and touch capture plus portfolio sweep, digest, private queue, and gatekeeper skills
 - `plugins/ostrom/hooks/` — both SessionStart hooks: layered constitution injection and durable mandate-digest rendering
 - `plugins/ostrom/config/` — separate shipped defaults for touch (`touch-defaults.yaml`) and mandates (`mandate-defaults.yaml`), plus reference examples
-- `plugins/ostrom/scripts/run-node.sh` — Node-resolution shim behind `/ostrom:doctor` (including non-interactive nvm/fnm/volta/asdf environments)
+- `plugins/ostrom/runtime/run-node.sh` — Node-resolution shim behind `/ostrom:doctor` (including non-interactive nvm/fnm/volta/asdf environments)
 - `plugins/ostrom/tools/` — TypeScript source, tests, and build configuration for the `/ostrom:doctor` prober
 - `plugins/ostrom/dist/doctor.js` — committed, zero-runtime-dependency `/ostrom:doctor` bundle
 - `crates/ostrom-core/` — pure Rust domain types and the async, substrate-neutral store port
@@ -418,7 +418,7 @@ comment — match `frozen-rules.md`'s own style).
 
 ## Doctor
 
-`/ostrom:doctor` runs `plugins/ostrom/scripts/run-node.sh`, which resolves
+`/ostrom:doctor` runs `plugins/ostrom/runtime/run-node.sh`, which resolves
 Node from `PATH` or common version-manager locations and launches the
 committed TypeScript bundle. It reports on seven checks: plugin installed,
 marketplace clone still fast-forwardable, which rules layers actually
