@@ -208,7 +208,28 @@ struct RepositoryEvidence<'a> {
     queued_kinds: &'a BTreeMap<String, String>,
 }
 
-struct SweepToken(String);
+/// Wraps the minted token rather than copying it out.
+///
+/// `InstallationToken` deliberately has no `Debug`, `Display` or `Clone`, so a
+/// secret cannot drift into a formatted error or a second owner. Calling
+/// `expose().to_owned()` here would hand that guarantee back for nothing — the
+/// only consumer passes it straight into a child environment. The test variant
+/// carries its own placeholder string because no real token exists to wrap.
+enum SweepToken {
+    Minted(crate::app_token::InstallationToken),
+    #[cfg(test)]
+    Placeholder(String),
+}
+
+impl SweepToken {
+    fn expose(&self) -> &str {
+        match self {
+            Self::Minted(token) => token.expose(),
+            #[cfg(test)]
+            Self::Placeholder(value) => value.as_str(),
+        }
+    }
+}
 
 trait InstallationTokenMinter {
     fn mint(
@@ -226,7 +247,7 @@ impl InstallationTokenMinter for GitHubInstallationTokenMinter {
         paths: &OstromPaths,
         request: AppTokenRequest<'_>,
     ) -> Result<SweepToken, AppTokenError> {
-        mint_installation_token(paths, request).map(|token| SweepToken(token.expose().to_owned()))
+        mint_installation_token(paths, request).map(SweepToken::Minted)
     }
 }
 
@@ -581,8 +602,8 @@ fn acquire_by_organization(
                 "--mode",
                 mode_name(mode),
             ])
-            .env("GH_TOKEN", &token.0)
-            .env("GITHUB_TOKEN", &token.0)
+            .env("GH_TOKEN", token.expose())
+            .env("GITHUB_TOKEN", token.expose())
             .current_dir(&options.working_directory)
             .output()
             .map_err(|error| SweepError::Acquisition(error.to_string()))?;
@@ -2979,7 +3000,9 @@ mod tests {
             request: AppTokenRequest<'_>,
         ) -> Result<SweepToken, AppTokenError> {
             if self.successful_anchors.contains(request.anchor_repository) {
-                Ok(SweepToken("placeholder-installation-token".to_owned()))
+                Ok(SweepToken::Placeholder(
+                    "placeholder-installation-token".to_owned(),
+                ))
             } else {
                 Err(AppTokenError::LookupHttp(403))
             }
