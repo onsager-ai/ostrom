@@ -20,14 +20,14 @@ use ostrom_core::{
 use ostrom_store::{
     AuditOptions, DispatchOutcome, DispatchRequest, ExecutableAssessmentDeriver, GateError,
     GateOptions, ImplementRequest, MigrationOutcome, OstromPaths, PassRequest, PassRole,
-    PlanOptions, PublishTarget, QueueDecision, SelectAction, SelectError, SelectOutcome,
-    SelectRequest, SignalFlags, SweepError, SweepMode, SweepOptions, SweepParityOptions,
-    TraceAppend, TraceView, UnavailableAssessmentDeriver, acquire_lease, acquire_org_from_github,
-    append_trace_checked, audit, branch_name, create_work_order, decide_queue_item,
-    encode_org_snapshots, encode_selection, grant_excuse, item_hash, lease_status,
-    lint_queue_state, list_excuses, list_queue_json, local_drift, migrate, read_trace_json,
-    release_lease, run_dispatch, run_gate, run_implement, run_pass, run_plan, run_selection,
-    run_sweep, run_sweep_parity, validate_lease_name, validate_work_order_file,
+    PlanOptions, PublishDestination, PublishTarget, QueueDecision, SelectAction, SelectError,
+    SelectOutcome, SelectRequest, SignalFlags, SweepError, SweepMode, SweepOptions,
+    SweepParityOptions, TraceAppend, TraceView, UnavailableAssessmentDeriver, acquire_lease,
+    acquire_org_from_github, append_trace_checked, audit, branch_name, create_work_order,
+    decide_queue_item, encode_org_snapshots, encode_selection, grant_excuse, item_hash,
+    lease_status, lint_queue_state, list_excuses, list_queue_json, local_drift, migrate,
+    read_trace_json, release_lease, run_dispatch, run_gate, run_implement, run_pass, run_plan,
+    run_selection, run_sweep, run_sweep_parity, validate_lease_name, validate_work_order_file,
 };
 
 #[derive(Debug, Parser)]
@@ -487,7 +487,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
             let publish = publish_repository.map_or(Ok(PublishTarget::Disabled), |repository| {
-                RepositoryName::new(repository).map(PublishTarget::Repository)
+                RepositoryName::new(repository)
+                    .map(PublishDestination::explicit)
+                    .map(PublishTarget::Explicit)
             })?;
             let cwd = env::current_dir()?;
             let executable = env::current_exe()?;
