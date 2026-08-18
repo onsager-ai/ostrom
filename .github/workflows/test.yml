@@ -1,7 +1,14 @@
 name: test
 
 on:
+  # `labeled` and `unlabeled` are here for the shell freeze. Its failure message
+  # tells you to label the pull request `bash-bugfix`, but the check reads
+  # `github.event.pull_request.labels` from the event payload — so with the
+  # default trigger set a label added after opening is never seen, and re-running
+  # the job just replays the stale payload. The advertised escape hatch only
+  # worked if you happened to label before opening.
   pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
   push:
     branches: [main]
 
