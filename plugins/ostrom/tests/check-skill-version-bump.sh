@@ -33,9 +33,21 @@ version_at() {
   '
 }
 
-mapfile -t changed_skills < <(
+# Skills are not the only shipped surface. `scripts/`, `hooks/` and the built
+# `dist/` bundle reach an installed session through the same versioned plugin
+# cache, and that cache is keyed by version: an unchanged version means the
+# cached tree is never refetched, so a fix to one of them silently never ships.
+#
+# ostrom#293 is the worked example. It fixed the defect that had the builder
+# working zero items every hour, changed no SKILL.md, and so did not bump the
+# version — leaving the repaired script in the repository and the broken one in
+# every installed cache, permanently and with nothing reporting it.
+mapfile -t changed_shipped < <(
   git diff --name-only --diff-filter=ACMRD "$merge_base" "$head_ref" -- \
-    'plugins/*/skills/*/SKILL.md' |
+    'plugins/*/skills/*/SKILL.md' \
+    'plugins/*/scripts/*' \
+    'plugins/*/hooks/*' \
+    'plugins/*/dist/*' |
     LC_ALL=C sort
 )
 
@@ -43,8 +55,8 @@ declare -A base_versions=()
 declare -A head_versions=()
 status=0
 
-for skill_path in "${changed_skills[@]}"; do
-  if [[ ! "$skill_path" =~ ^plugins/([^/]+)/skills/[^/]+/SKILL\.md$ ]]; then
+for shipped_path in "${changed_shipped[@]}"; do
+  if [[ ! "$shipped_path" =~ ^plugins/([^/]+)/(skills|scripts|hooks|dist)/ ]]; then
     continue
   fi
 
@@ -57,7 +69,7 @@ for skill_path in "${changed_skills[@]}"; do
 
   if [[ "${base_versions[$plugin]}" == "${head_versions[$plugin]}" ]]; then
     printf '%s\n' \
-      "protocol version check: plugin '$plugin' changed skill file '$skill_path' without changing version in $manifest (still ${head_versions[$plugin]})" \
+      "protocol version check: plugin '$plugin' changed shipped file '$shipped_path' without changing version in $manifest (still ${head_versions[$plugin]}); the cache is keyed by version, so this change would never reach an installed session" \
       >&2
     status=1
   fi
