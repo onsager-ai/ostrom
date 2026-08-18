@@ -14,6 +14,7 @@ mod pass;
 mod pass_state;
 mod paths;
 mod plan;
+mod publish;
 mod queue;
 mod selection;
 mod sweep;
@@ -44,6 +45,7 @@ pub use plan::{
     PlanError, PlanFault, PlanOptions, PlanRanking, PlanSweep, UnavailableAssessmentDeriver,
     run_plan,
 };
+pub use publish::{PublishDestination, PublishError};
 pub use queue::{
     QueueActionError, QueueDecision, QueueDocument, decide_queue_item, lint_queue_state,
     list_queue_json, read_queue, write_queue,

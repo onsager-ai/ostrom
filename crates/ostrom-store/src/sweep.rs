@@ -16,9 +16,11 @@ use serde_json::{Map, Value, json};
 use thiserror::Error;
 
 use crate::{
-    AppTokenError, OstromPaths, QueueDocument, StoreError,
+    AppTokenError, OstromPaths, PublishDestination, PublishError, QueueDocument, StoreError,
     app_token::{AppTokenRequest, mint_installation_token},
-    io_error, read_queue, set_private_file_mode, write_queue,
+    io_error,
+    publish::{PublishOptions, PublishOutcome, publish},
+    read_queue, set_private_file_mode, write_queue,
 };
 
 const QUERY_LIMIT: usize = 200;
@@ -61,8 +63,8 @@ pub enum SweepError {
     Fixture(String),
     #[error("could not read local work orders: {0}")]
     WorkOrders(String),
-    #[error("publish failed: {0}")]
-    Publish(String),
+    #[error(transparent)]
+    Publish(#[from] PublishError),
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -70,7 +72,9 @@ pub enum SweepError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PublishTarget {
     Disabled,
-    Repository(RepositoryName),
+    /// No config or environment-derived variant exists because scratch state
+    /// must be unable to inherit an operator's publication target.
+    Explicit(PublishDestination),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -470,11 +474,27 @@ fn run_sweep_with_minter(
     write_queue(&options.paths.queue_file(), &final_rows)?;
     write_json_private(&state_path, &new_state)?;
 
-    if let PublishTarget::Repository(repository) = &options.publish {
-        if let Err(error) = publish(options, repository) {
-            faults.push(format!(
+    // Publication observes only a durable successful generation. Every
+    // refusal path, including zero acquisition, returns above the writes and
+    // therefore cannot reach this edge.
+    if let PublishTarget::Explicit(destination) = &options.publish {
+        match publish(&PublishOptions {
+            paths: &options.paths,
+            plugin_root: &options.plugin_root,
+            destination,
+            published_at: options.started_at,
+            cadence_hours: config.cadence_hours,
+        }) {
+            Ok(PublishOutcome::Published) => {
+                println!(
+                    "mandate publish: published {}",
+                    format_time(options.started_at)
+                );
+            }
+            Ok(PublishOutcome::Unchanged) => println!("mandate publish: unchanged"),
+            Err(error) => faults.push(format!(
                 "publish failed; local records remain authoritative: {error}"
-            ));
+            )),
         }
     }
 
@@ -2428,40 +2448,6 @@ fn backup_previous_sweep(paths: &OstromPaths) -> Result<(), SweepError> {
     Ok(())
 }
 
-fn publish(options: &SweepOptions, repository: &RepositoryName) -> Result<(), SweepError> {
-    let compatibility =
-        tempfile::tempdir().map_err(|error| SweepError::Publish(error.to_string()))?;
-    let data = compatibility.path().join("ostrom");
-    fs::create_dir(&data).map_err(|error| SweepError::Publish(error.to_string()))?;
-    for (source, name) in [
-        (options.paths.queue_file(), "queue.jsonl"),
-        (options.paths.state.join("state.json"), "state.json"),
-        (options.paths.state.join("gate.jsonl"), "gate.jsonl"),
-    ] {
-        if source.exists() {
-            fs::copy(&source, data.join(name)).map_err(|error| {
-                SweepError::Publish(format!("could not stage {}: {error}", source.display()))
-            })?;
-        }
-    }
-    let status = Command::new("bash")
-        .arg(options.plugin_root.join("scripts/publish.sh"))
-        .current_dir(&options.working_directory)
-        .env("CLAUDE_CONFIG_DIR", compatibility.path())
-        .env("MANDATE_PUBLISH_REMOTE", repository.as_str())
-        .env("MANDATE_PUBLISH_DIR", options.paths.state.join("publish"))
-        .env("MANDATE_SWEEP_TIME", format_time(options.started_at))
-        .status()
-        .map_err(|error| SweepError::Publish(error.to_string()))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(SweepError::Publish(format!(
-            "publisher exited with status {status}"
-        )))
-    }
-}
-
 fn symmetric_queue_changes(before: &[QueueDocument], after: &[QueueDocument]) -> usize {
     let before = before
         .iter()
@@ -3028,13 +3014,35 @@ mod tests {
 
     #[cfg(unix)]
     fn run_acquisition_guard_child(home: &Path, test_name: &str, scenario: &str) -> Output {
-        Command::new(env::current_exe().expect("current test executable"))
+        let mut command = Command::new(env::current_exe().expect("current test executable"));
+        command
             .args(["--exact", test_name, "--nocapture"])
             .env("OSTROM_HOME", home)
             .env(ACQUISITION_GUARD_CHILD, scenario)
-            .current_dir(home)
-            .output()
-            .expect("run isolated acquisition fixture")
+            .current_dir(home);
+        if scenario == "total-failure" {
+            let bin = home.join("publication-spy-bin");
+            fs::create_dir(&bin).expect("create publication spy directory");
+            for name in ["git", "gh"] {
+                let executable = bin.join(name);
+                fs::write(
+                    &executable,
+                    "#!/bin/sh\nprintf '%s %s\\n' \"$0\" \"$*\" >>\"$OSTROM_TEST_PUBLISH_COMMAND_LOG\"\nexit 97\n",
+                )
+                .expect("write publication command spy");
+                fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
+                    .expect("make publication command spy executable");
+            }
+            let mut path = vec![bin];
+            path.extend(env::split_paths(&env::var_os("PATH").expect("test PATH")));
+            command
+                .env("PATH", env::join_paths(path).expect("join spy PATH"))
+                .env(
+                    "OSTROM_TEST_PUBLISH_COMMAND_LOG",
+                    home.join("publication-commands.log"),
+                );
+        }
+        command.output().expect("run isolated acquisition fixture")
     }
 
     #[cfg(unix)]
@@ -3109,12 +3117,17 @@ printf '{"repositories":[{"repo":"%s","issues":[],"open_prs":[],"merged_prs":[],
 
     #[cfg(unix)]
     #[test]
-    fn every_repository_failure_exits_nonzero_and_preserves_durable_bytes() {
+    fn every_repository_failure_refuses_writes_and_publication() {
         if env::var(ACQUISITION_GUARD_CHILD).as_deref() == Ok("total-failure") {
             let mut minter = FixtureMinter {
                 successful_anchors: BTreeSet::new(),
             };
-            let error = run_sweep_with_minter(&acquisition_guard_options(), &mut minter)
+            let mut options = acquisition_guard_options();
+            options.publish = PublishTarget::Explicit(PublishDestination::explicit(
+                RepositoryName::new("placeholder-org/alpha")
+                    .expect("valid placeholder publication destination"),
+            ));
+            let error = run_sweep_with_minter(&options, &mut minter)
                 .expect_err("zero acquired repositories must refuse");
             assert!(matches!(
                 &error,
@@ -3132,10 +3145,16 @@ printf '{"repositories":[{"repo":"%s","issues":[],"open_prs":[],"merged_prs":[],
         let home = tempdir().expect("temporary OSTROM_HOME");
         write_acquisition_guard_roster(home.path());
         write_fixture_github_worker(home.path());
+        fs::create_dir(home.path().join("config")).expect("create publisher config directory");
+        fs::write(
+            home.path().join("config/publish-allowlist.json"),
+            include_str!("../../../plugins/ostrom/config/publish-allowlist.json"),
+        )
+        .expect("write publisher allowlist");
         let (queue_before, state_before) = write_prior_generation(home.path());
         let output = run_acquisition_guard_child(
             home.path(),
-            "sweep::tests::every_repository_failure_exits_nonzero_and_preserves_durable_bytes",
+            "sweep::tests::every_repository_failure_refuses_writes_and_publication",
             "total-failure",
         );
 
@@ -3155,6 +3174,14 @@ printf '{"repositories":[{"repo":"%s","issues":[],"open_prs":[],"merged_prs":[],
             state_before
         );
         assert!(!home.path().join("previous").exists());
+        assert!(
+            !home.path().join("publish").exists(),
+            "a refused sweep must return before publication"
+        );
+        assert!(
+            !home.path().join("publication-commands.log").exists(),
+            "a refused sweep must not attempt a publication command"
+        );
     }
 
     #[cfg(unix)]
