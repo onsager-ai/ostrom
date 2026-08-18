@@ -4093,6 +4093,27 @@ search_roots:
   - $published_repair
 bounce_all: []
 projects:
+  - repo: placeholder-org/unreadable
+    delegated: []
+    excluded: []
+    reserved: []
+    default: delegated
+    paused: false
+    bounce: []
+  - repo: placeholder-org/malformed
+    delegated: []
+    excluded: []
+    reserved: []
+    default: delegated
+    paused: false
+    bounce: []
+  - repo: placeholder-org/truncated
+    delegated: []
+    excluded: []
+    reserved: []
+    default: delegated
+    paused: false
+    bounce: []
   - repo: example-org/repair-repo
     delegated:
       - label:maintenance
@@ -4181,7 +4202,9 @@ jq -cn \
       pr(3; "builder-failing"; $h3; "ostrom-builder[bot]"; true; "FAILURE"),
       pr(4; "human-branch"; $h4; "human-author"; false; "SUCCESS"),
       pr(5; "builder-clean-two"; $h5; "ostrom-builder[bot]"; true; "SUCCESS"),
-      pr(6; "builder-capped"; $h6; "ostrom-builder[bot]"; true; "SUCCESS")
+      pr(6; "builder-capped"; $h6; "ostrom-builder[bot]"; true; "SUCCESS"),
+      pr(7; "builder-check-unreadable"; "7777777777777777777777777777777777777777";
+        "ostrom-builder[bot]"; true; "SUCCESS")
     ]
   ' >"$published_repair_prs"
 
@@ -4194,14 +4217,43 @@ role="$1"
 repository="$2"
 shift 2
 [ "$role" = builder ]
-[ "$repository" = example-org/repair-repo ]
 while [ "$#" -gt 0 ] && [ "$1" != -- ]; do
   shift
 done
 [ "${1:-}" = -- ] || exit 98
 shift
 if [ "$1" = gh ] && [ "$2" = pr ] && [ "$3" = list ]; then
-  cat "$PUBLISHED_REPAIR_PRS"
+  case "$repository" in
+    placeholder-org/unreadable)
+      exit 17
+      ;;
+    placeholder-org/malformed)
+      printf '%s\n' '{"unexpected":"listing shape"}'
+      exit 0
+      ;;
+    placeholder-org/truncated)
+      jq -cn '[range(0; 1000) | {number: .}]'
+      exit 0
+      ;;
+    example-org/repair-repo)
+      jq 'map(del(.statusCheckRollup))' "$PUBLISHED_REPAIR_PRS"
+      exit 0
+      ;;
+    *)
+      exit 97
+      ;;
+  esac
+fi
+if [ "$1" = gh ] && [ "$2" = pr ] && [ "$3" = view ]; then
+  [ "$repository" = example-org/repair-repo ]
+  number="$4"
+  if [ "$number" = 7 ]; then
+    exit 29
+  fi
+  jq --argjson number "$number" '
+    first(.[] | select(.number == $number))
+    | {statusCheckRollup}
+  ' "$PUBLISHED_REPAIR_PRS"
   exit 0
 fi
 args=("$@")
@@ -4218,6 +4270,7 @@ chmod +x "$published_repair_gh_as"
 
 published_repair_summary="$(
   CLAUDE_CONFIG_DIR="$published_repair_config" \
+    OSTROM_HOME="$published_repair_config/ostrom" \
     MANDATE_GH_AS_BIN="$published_repair_gh_as" \
     MANDATE_TRACE_TIME="2026-08-15T00:00:00Z" \
     PUBLISHED_REPAIR_CALLS="$published_repair_calls" \
@@ -4230,8 +4283,11 @@ jq -e '
   and .attempted == 3
   and .repaired == 2
   and .conflicted == 1
-  and .skipped == 1
+  and .skipped == 2
   and .failed == 0
+  and .repositories == 4
+  and .scanned_repositories == 1
+  and .repository_failures == 3
 ' <<<"$published_repair_summary" >/dev/null
 
 published_repair_new_head_1="$(
@@ -4277,7 +4333,7 @@ git --git-dir="$published_repair_remote" merge-base --is-ancestor \
 
 published_repair_trace="$published_repair_config/ostrom/sprint.jsonl"
 jq -s -e '
-  length == 4
+  length == 8
   and all(.[];
     .kind == "pr-repair"
     and .fact.role == "builder"
@@ -4293,11 +4349,39 @@ jq -s -e '
     | length) == 1
   and ([.[] | select(.fact.ref == "#6" and .fact.outcome == "skipped-cap"
     and .narration.reason == "per-pass repair cap reached")] | length) == 1
+  and ([.[] | select(.fact.repo == "placeholder-org/unreadable"
+    and .fact.ref == null
+    and .fact.outcome == "enumeration-failed"
+    and .fact.exit_code == 17)] | length) == 1
+  and ([.[] | select(.fact.repo == "placeholder-org/malformed"
+    and .fact.ref == null
+    and .fact.outcome == "enumeration-malformed"
+    and .fact.exit_code == 1)] | length) == 1
+  and ([.[] | select(.fact.repo == "placeholder-org/truncated"
+    and .fact.ref == null
+    and .fact.outcome == "enumeration-truncated"
+    and .fact.exit_code == 6)] | length) == 1
+  and ([.[] | select(.fact.repo == "example-org/repair-repo"
+    and .fact.ref == "#7"
+    and .fact.outcome == "check-fetch-failed"
+    and .fact.exit_code == 29)] | length) == 1
   and ([.[] | select(.fact.ref == "#3" or .fact.ref == "#4")] | length) == 0
 ' "$published_repair_trace" >/dev/null
 
-[ "$(grep -c '^builder example-org/repair-repo --repositories example-org/repair-repo --permissions metadata:read,pull_requests:read,checks:read,statuses:read -- gh pr list ' \
+[ "$(grep -c '^builder example-org/repair-repo --repositories example-org/repair-repo --permissions metadata:read,pull_requests:read -- gh pr list ' \
   "$published_repair_calls")" -eq 1 ]
+[ "$(grep -c '^builder example-org/repair-repo --repositories example-org/repair-repo --permissions metadata:read,pull_requests:read,checks:read,statuses:read -- gh pr view ' \
+  "$published_repair_calls")" -eq 6 ]
+if grep -Fq 'gh pr list' "$published_repair_calls" && \
+    grep -F 'gh pr list' "$published_repair_calls" | grep -Fq statusCheckRollup; then
+  echo "repair enumeration requested candidate-only check state" >&2
+  exit 1
+fi
+if grep -Fq 'gh pr view 4 ' "$published_repair_calls"; then
+  echo "non-candidate pull request reached the check-state fetch" >&2
+  exit 1
+fi
+[ "$(grep -c 'gh pr view 7 ' "$published_repair_calls")" -eq 1 ]
 [ "$(grep -c ' git .* fetch .*https://github.com/example-org/repair-repo.git ' \
   "$published_repair_calls")" -eq 3 ]
 [ "$(grep -c ' git .* push https://github.com/example-org/repair-repo.git ' \
@@ -4307,6 +4391,68 @@ if grep -Eq 'builder-failing|human-branch|builder-capped' \
   echo "ineligible or capped pull request reached the repair fetch path" >&2
   exit 1
 fi
+
+# A non-empty roster with no readable listing is an aggregate scan failure,
+# even though every repository still gets its own precise trace outcome.
+published_repair_failed_config="$published_repair/all-failed-config"
+published_repair_failed_calls="$published_repair/all-failed-calls"
+mkdir -p "$published_repair_failed_config/ostrom"
+cat >"$published_repair_failed_config/ostrom/mandates.yaml" <<'YAML'
+provider: file
+cadence_hours: 24
+stuck_after_days: 1
+search_roots: []
+bounce_all: []
+projects:
+  - repo: placeholder-org/unreadable
+    delegated: []
+    excluded: []
+    reserved: []
+    default: delegated
+    paused: false
+    bounce: []
+  - repo: placeholder-org/malformed
+    delegated: []
+    excluded: []
+    reserved: []
+    default: delegated
+    paused: false
+    bounce: []
+  - repo: placeholder-org/truncated
+    delegated: []
+    excluded: []
+    reserved: []
+    default: delegated
+    paused: false
+    bounce: []
+YAML
+set +e
+CLAUDE_CONFIG_DIR="$published_repair_failed_config" \
+  OSTROM_HOME="$published_repair_failed_config/ostrom" \
+  MANDATE_GH_AS_BIN="$published_repair_gh_as" \
+  MANDATE_TRACE_TIME="2026-08-15T00:01:00Z" \
+  PUBLISHED_REPAIR_CALLS="$published_repair_failed_calls" \
+  PUBLISHED_REPAIR_PRS="$published_repair_prs" \
+  PUBLISHED_REPAIR_REMOTE="$published_repair_remote" \
+  bash "$PLUGIN_ROOT/scripts/repair-prs.sh" builder-fixture-all-failed \
+    >"$published_repair/all-failed.out" \
+    2>"$published_repair/all-failed.err"
+published_repair_failed_status=$?
+set -e
+[ "$published_repair_failed_status" -eq 1 ]
+jq -e '
+  .repositories == 3
+  and .scanned_repositories == 0
+  and .repository_failures == 3
+' "$published_repair/all-failed.out" >/dev/null
+jq -s -e '
+  length == 3
+  and ([.[].fact.outcome] | sort) == [
+    "enumeration-failed",
+    "enumeration-malformed",
+    "enumeration-truncated"
+  ]
+' "$published_repair_failed_config/ostrom/sprint.jsonl" >/dev/null
 
 # #134: order_id is the value inside the durable order, never the stable
 # filename stem (item_hash). A synthetic builder pass proves the dispatched

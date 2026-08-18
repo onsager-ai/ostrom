@@ -34,6 +34,9 @@ repaired=0
 conflicted=0
 skipped=0
 failed=0
+repositories=0
+scanned_repositories=0
+repository_failures=0
 work="$(mktemp -d "${TMPDIR:-/tmp}/ostrom-pr-repair.XXXXXX")" || exit 1
 
 cleanup() {
@@ -57,7 +60,7 @@ append_repair_trace() {
     jq -cn \
       --arg owner "$lease_owner" \
       --arg repo "$trace_repo" \
-      --arg ref "#$trace_number" \
+      --arg number "$trace_number" \
       --arg head_branch "$trace_head" \
       --arg base_branch "$trace_base" \
       --arg outcome "$trace_outcome" \
@@ -70,7 +73,7 @@ append_repair_trace() {
           role: "builder",
           owner: $owner,
           repo: $repo,
-          ref: $ref,
+          ref: (if $number == "" then null else "#" + $number end),
           action: "merge-base-forward",
           outcome: $outcome,
           head_branch: $head_branch,
@@ -98,50 +101,52 @@ candidates_file="$work/candidates.jsonl"
 
 while IFS= read -r repository; do
   [ -n "$repository" ] || continue
+  repositories=$((repositories + 1))
   repo_prs="$work/prs-$(printf '%s' "$repository" | tr '/:' '__').json"
   if bash "$GH_AS_BIN" builder "$repository" \
     --repositories "$repository" \
-    --permissions metadata:read,pull_requests:read,checks:read,statuses:read -- \
+    --permissions metadata:read,pull_requests:read -- \
     gh pr list --repo "$repository" --state open --limit "$QUERY_LIMIT" \
-      --json number,body,author,mergeable,statusCheckRollup,headRefName,baseRefName,headRefOid,isCrossRepository \
+      --json number,body,author,mergeable,headRefName,baseRefName,headRefOid,isCrossRepository \
       >"$repo_prs"; then
     :
   else
     query_status=$?
+    repository_failures=$((repository_failures + 1))
     echo "mandate repair: failed to enumerate open pull requests for $repository (rc=$query_status)" >&2
-    exit "$query_status"
+    append_repair_trace "$repository" "" "" "" enumeration-failed \
+      "" "" '[]' "$query_status" \
+      '{"reason":"open pull requests could not be enumerated"}' || exit 1
+    continue
   fi
   if ! jq -e 'type == "array"' "$repo_prs" >/dev/null 2>&1; then
+    repository_failures=$((repository_failures + 1))
     echo "mandate repair: pull-request listing for $repository was malformed" >&2
-    exit 1
+    append_repair_trace "$repository" "" "" "" enumeration-malformed \
+      "" "" '[]' 1 \
+      '{"reason":"open pull-request listing was not an array"}' || exit 1
+    continue
   fi
   if [ "$(jq 'length' "$repo_prs")" -eq "$QUERY_LIMIT" ]; then
+    repository_failures=$((repository_failures + 1))
     echo "mandate repair: pull-request listing for $repository reached query limit $QUERY_LIMIT; refusing a truncated scan" >&2
-    exit 6
+    append_repair_trace "$repository" "" "" "" enumeration-truncated \
+      "" "" '[]' 6 \
+      '{"reason":"open pull-request listing reached the query limit"}' || exit 1
+    continue
   fi
 
-  jq -c \
+  repo_candidates="$work/candidates-$(printf '%s' "$repository" | tr '/:' '__').jsonl"
+  if jq -c \
     --arg repo "$repository" '
-      def failure:
-        ((.conclusion // .state // "") | ascii_upcase)
-        | IN("FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STALE");
-      def success:
-        ((.conclusion // .state // "") | ascii_upcase)
-        | IN("SUCCESS", "NEUTRAL", "SKIPPED");
-      def green:
-        (.statusCheckRollup // []) as $checks
-        | ($checks | length) > 0
-        and (any($checks[]?; failure) | not)
-        and all($checks[]; success);
       .[]
       | select(.mergeable == "CONFLICTING")
       | select(
           (.author.is_bot == true)
           or ((.author.login // "") | endswith("[bot]"))
-        )
+      )
       | select((.body // "") | test("(^|\\n)Ostrom-Role: builder(\\r?\\n|$)"))
       | select(.isCrossRepository != true)
-      | select(green)
       | {
           repo: $repo,
           number,
@@ -149,7 +154,72 @@ while IFS= read -r repository; do
           base: .baseRefName,
           listed_head_sha: (.headRefOid // "")
         }
-    ' "$repo_prs" >>"$candidates_file" || exit 1
+    ' "$repo_prs" >"$repo_candidates"; then
+    scanned_repositories=$((scanned_repositories + 1))
+  else
+    repository_failures=$((repository_failures + 1))
+    echo "mandate repair: pull-request listing for $repository was malformed" >&2
+    append_repair_trace "$repository" "" "" "" enumeration-malformed \
+      "" "" '[]' 1 \
+      '{"reason":"open pull-request listing could not be filtered"}' || exit 1
+    continue
+  fi
+
+  while IFS= read -r candidate; do
+    [ -n "$candidate" ] || continue
+    number="$(jq -r '.number' <<<"$candidate")"
+    head_branch="$(jq -r '.head' <<<"$candidate")"
+    base_branch="$(jq -r '.base' <<<"$candidate")"
+    listed_head_sha="$(jq -r '.listed_head_sha' <<<"$candidate")"
+    candidate_checks="$work/checks-$(printf '%s' "$repository" | tr '/:' '__')-$number.json"
+
+    # Deliberately the same four permissions this scan has always requested.
+    # #262 never identified which check node was unreadable, and broadening the
+    # grant on a guess is tuning until the symptom stops rather than fixing a
+    # cause — the failure it was reaching for is now visible and non-fatal as
+    # `check-fetch-failed`, which is the mechanism for diagnosing it properly.
+    # Widening a role's grant is the principal's call, not this fix's.
+    if bash "$GH_AS_BIN" builder "$repository" \
+      --repositories "$repository" \
+      --permissions metadata:read,pull_requests:read,checks:read,statuses:read -- \
+      gh pr view "$number" --repo "$repository" \
+        --json statusCheckRollup >"$candidate_checks"; then
+      :
+    else
+      check_status=$?
+      skipped=$((skipped + 1))
+      echo "mandate repair: failed to read checks for $repository#$number (rc=$check_status)" >&2
+      append_repair_trace "$repository" "$number" "$head_branch" \
+        "$base_branch" check-fetch-failed "$listed_head_sha" "" '[]' \
+        "$check_status" '{"reason":"candidate check state could not be read"}' || exit 1
+      continue
+    fi
+    if ! jq -e '
+      type == "object"
+      and (.statusCheckRollup | type == "array")
+    ' "$candidate_checks" >/dev/null 2>&1; then
+      skipped=$((skipped + 1))
+      echo "mandate repair: check state for $repository#$number was malformed" >&2
+      append_repair_trace "$repository" "$number" "$head_branch" \
+        "$base_branch" check-fetch-malformed "$listed_head_sha" "" '[]' 1 \
+        '{"reason":"candidate check state was malformed"}' || exit 1
+      continue
+    fi
+    if jq -e '
+      def failure:
+        ((.conclusion // .state // "") | ascii_upcase)
+        | IN("FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STALE");
+      def success:
+        ((.conclusion // .state // "") | ascii_upcase)
+        | IN("SUCCESS", "NEUTRAL", "SKIPPED");
+      .statusCheckRollup as $checks
+      | ($checks | length) > 0
+      and (any($checks[]?; failure) | not)
+      and all($checks[]; success)
+    ' "$candidate_checks" >/dev/null; then
+      printf '%s\n' "$candidate" >>"$candidates_file"
+    fi
+  done <"$repo_candidates"
 done <"$repos_file"
 
 while IFS= read -r candidate; do
@@ -303,5 +373,14 @@ jq -cn \
   --argjson conflicted "$conflicted" \
   --argjson skipped "$skipped" \
   --argjson failed "$failed" \
+  --argjson repositories "$repositories" \
+  --argjson scanned_repositories "$scanned_repositories" \
+  --argjson repository_failures "$repository_failures" \
   '{cap: $cap, attempted: $attempted, repaired: $repaired,
-    conflicted: $conflicted, skipped: $skipped, failed: $failed}'
+    conflicted: $conflicted, skipped: $skipped, failed: $failed,
+    repositories: $repositories, scanned_repositories: $scanned_repositories,
+    repository_failures: $repository_failures}'
+
+if [ "$repositories" -gt 0 ] && [ "$scanned_repositories" -eq 0 ]; then
+  exit 1
+fi
