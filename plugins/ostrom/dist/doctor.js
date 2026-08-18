@@ -1385,7 +1385,7 @@ function resolveOnPath(context) {
   const path = context.env.PATH ?? context.env.Path ?? context.env.path ?? "";
   for (const directory of path.split(delimiter)) {
     for (const name of executableNames(context.env)) {
-      const candidate = resolve(directory || context.cwd, name);
+      const candidate = resolve(context.cwd, directory || ".", name);
       try {
         if (!statSync5(candidate).isFile()) continue;
         accessSync2(candidate, constants2.X_OK);

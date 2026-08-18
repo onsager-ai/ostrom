@@ -101,7 +101,13 @@ function resolveOnPath(context: DoctorContext): string | undefined {
   const path = context.env.PATH ?? context.env.Path ?? context.env.path ?? "";
   for (const directory of path.split(delimiter)) {
     for (const name of executableNames(context.env)) {
-      const candidate = resolve(directory || context.cwd, name);
+      // A relative PATH segment resolves against the *inspected* environment's
+      // working directory, not this process's. `resolve()` would silently use
+      // `process.cwd()` instead, which makes the answer depend on where doctor
+      // happens to have been started from — and defeats the point of taking cwd
+      // from the context at all. An empty segment already means "here", and
+      // means the same "here".
+      const candidate = resolve(context.cwd, directory || ".", name);
       try {
         if (!statSync(candidate).isFile()) continue;
         accessSync(candidate, constants.X_OK);

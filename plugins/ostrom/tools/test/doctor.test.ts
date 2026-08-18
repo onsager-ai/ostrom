@@ -12,7 +12,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, dirname, join, resolve } from "node:path";
+import { delimiter, dirname, join, relative as relativePath, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { checkPluginCacheDrift } from "../src/checks/plugin-cache-drift.js";
@@ -369,6 +369,23 @@ describe("CLI compatibility check", () => {
       "OK|cli-version|not checked because ostrom is absent|\n",
     );
     expect(existsSync(installMarker)).toBe(false);
+  });
+
+  // A relative PATH segment must resolve against the inspected environment's
+  // working directory, not this process's. Reading it from `process.cwd()`
+  // makes the answer depend on where doctor was started from, which is exactly
+  // what taking cwd from the context is meant to avoid.
+  it("resolves a relative PATH entry against the context cwd", () => {
+    const fixture = baseFixture();
+    writeOstromStub(fixture, "0.2.2");
+    const relative = relativePath(fixture.cwd, fixture.binDir);
+
+    expect(
+      cliCheck(fixture, { PATH: relative }, pluginRoot, "cli-installed"),
+    ).toBe("OK|cli-installed|ostrom found on PATH|\n");
+    expect(cliCheck(fixture, { PATH: relative })).toBe(
+      "OK|cli-version|installed version 0.2.2 satisfies required 0.2.2|\n",
+    );
   });
 
   it("reports an older CLI with installed and required versions", () => {
