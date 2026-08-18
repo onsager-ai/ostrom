@@ -170,9 +170,20 @@ impl PassGuard {
                 "cost_usd".to_owned(),
                 self.cost_usd.map_or(Value::Null, |cost| json!(cost)),
             );
+            // A pinned trace clock pins the duration too. `MANDATE_TRACE_TIME`
+            // exists so a run's recorded output is reproducible, and a wall-clock
+            // duration defeats that: the recorded-parity fixture compares the
+            // trace byte for byte, so the same pass emitted 0 on an idle machine
+            // and 1 under CI load, failing intermittently and for no real reason.
+            // Under a pinned clock no time passes, which is the honest reading of
+            // "the clock is fixed" rather than a special case for tests.
             fact.insert(
                 "duration_seconds".to_owned(),
-                json!(now.saturating_sub(self.started_epoch)),
+                json!(if pinned_trace_time().is_some() {
+                    0
+                } else {
+                    now.saturating_sub(self.started_epoch)
+                }),
             );
             if let Some(reason) = &self.reason {
                 fact.insert("reason".to_owned(), json!(reason));
@@ -677,6 +688,14 @@ fn prune_transcripts(directory: &Path) {
     for (_, path) in paths.into_iter().skip(30) {
         let _ = fs::remove_file(path);
     }
+}
+
+/// The pinned trace instant, if one is set. Empty means unset, matching the
+/// shell's `${VAR:-default}` semantics used everywhere else in this crate.
+fn pinned_trace_time() -> Option<String> {
+    env::var("MANDATE_TRACE_TIME")
+        .ok()
+        .filter(|value| !value.is_empty())
 }
 
 fn pass_trace_time() -> String {

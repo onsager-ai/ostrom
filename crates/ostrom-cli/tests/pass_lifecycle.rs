@@ -116,6 +116,26 @@ fn recorded_shell_output_is_byte_identical() {
     fixture.assert_released();
 }
 
+/// The recorded fixture compares the trace byte for byte, so any wall-clock
+/// field in it is a latent flake. This is the case that actually failed in CI:
+/// the same pass emitted `duration_seconds` 0 on an idle machine and 1 under
+/// load. Forcing the pass to take over a second must not change a single byte.
+#[test]
+fn a_slow_pass_records_the_same_bytes_under_a_pinned_clock() {
+    let fixture = Fixture::new(concat!(
+        "sleep 2\n",
+        "printf '%s\\n' '{\"ts\":\"2026-08-01T00:00:00Z\",\"kind\":\"pass-started\",\"fact\":{\"owner\":\"builder-placeholder-session-wake7\"},\"narration\":{}}' >>\"$OSTROM_HOME/sprint.jsonl\"\n",
+        "printf '%s\\n' '{\"type\":\"result\",\"total_cost_usd\":1.25}'"
+    ));
+    let output = fixture.command().output().expect("run pass");
+    assert!(output.status.success());
+    assert_eq!(
+        fs::read(fixture.state.join("sprint.jsonl")).expect("read native trace"),
+        include_bytes!("fixtures/pass/builder-trace.expected.jsonl")
+    );
+    fixture.assert_released();
+}
+
 #[test]
 fn error_exit_releases_and_finalizes() {
     let fixture = Fixture::new("exit 42");
