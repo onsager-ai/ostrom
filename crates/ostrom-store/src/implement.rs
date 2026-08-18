@@ -20,8 +20,12 @@ use serde_json::{Map, Value, json};
 use thiserror::Error;
 
 use crate::{
-    LeaseActionError, OstromPaths, OwnedLease, SignalFlags, TraceAppend, append_trace,
-    load_config_or_defaults,
+    LeaseActionError, OstromPaths, OwnedLease, SignalFlags, TraceAppend,
+    app_token::{
+        AuthenticatedCommandError, GitHubInstallationTokenMinter, InstallationTokenMinter,
+        ScopedAppTokenRequest, authenticated_output,
+    },
+    append_trace, load_config_or_defaults,
 };
 
 #[derive(Debug, Clone)]
@@ -236,6 +240,14 @@ impl Drop for TerminalGuard {
 }
 
 pub fn run_implement(request: &ImplementRequest) -> Result<String, ImplementError> {
+    let mut minter = GitHubInstallationTokenMinter;
+    run_implement_with_minter(request, &mut minter)
+}
+
+fn run_implement_with_minter(
+    request: &ImplementRequest,
+    minter: &mut dyn InstallationTokenMinter,
+) -> Result<String, ImplementError> {
     let order_bytes = fs::read(&request.order_file).map_err(|_| {
         ImplementError::new(
             2,
@@ -282,7 +294,7 @@ pub fn run_implement(request: &ImplementRequest) -> Result<String, ImplementErro
         conflicted_paths: Vec::new(),
         withheld_paths: Vec::new(),
     };
-    match implement_inner(request, &mut guard) {
+    match implement_inner(request, &mut guard, minter) {
         Ok(url) => {
             guard.pr_url = Some(url.clone());
             guard.append_terminal("work-completed", None)?;
@@ -299,6 +311,7 @@ pub fn run_implement(request: &ImplementRequest) -> Result<String, ImplementErro
 fn implement_inner(
     request: &ImplementRequest,
     guard: &mut TerminalGuard,
+    minter: &mut dyn InstallationTokenMinter,
 ) -> Result<String, ImplementError> {
     let _ = termination_grace()?;
     check_interrupt(request, guard, None)?;
@@ -314,7 +327,7 @@ fn implement_inner(
             format!("Codex is unavailable: {}", codex.display()),
         ));
     }
-    let default_branch = gh_text(
+    let default_branch = default_branch_result(gh_text(
         request,
         &guard.order.repository,
         "metadata:read",
@@ -328,21 +341,8 @@ fn implement_inner(
             "--jq",
             ".defaultBranchRef.name",
         ],
-    )
-    .map_err(|_| {
-        ImplementError::new(
-            1,
-            "default-branch-query-failed",
-            "could not query default branch",
-        )
-    })?;
-    if default_branch.is_empty() {
-        return Err(ImplementError::new(
-            1,
-            "default-branch-missing",
-            "default branch is missing",
-        ));
-    }
+        minter,
+    ))?;
     guard.default_branch = Some(default_branch.clone());
     let remote = format!("https://github.com/{}.git", guard.order.repository);
     gh_status(
@@ -357,8 +357,11 @@ fn implement_inner(
             &remote,
             &format!("{default_branch}:refs/remotes/origin/{default_branch}"),
         ],
+        minter,
     )
-    .map_err(|_| ImplementError::new(1, "fetch-failed", "default branch fetch failed"))?;
+    .map_err(|error| {
+        github_operation_error(error, "fetch-failed", "default branch fetch failed")
+    })?;
 
     let worktree = request
         .paths
@@ -490,8 +493,8 @@ fn implement_inner(
         )?;
     }
     withhold_workflows(guard, &worktree, &default_branch)?;
-    publish_branch(request, guard, &worktree, &remote)?;
-    create_pull_request(request, guard, &runs, &default_branch)
+    publish_branch(request, guard, &worktree, &remote, minter)?;
+    create_pull_request(request, guard, &runs, &default_branch, minter)
 }
 
 fn prepare_worktree(
@@ -814,6 +817,7 @@ fn publish_branch(
     guard: &mut TerminalGuard,
     worktree: &Path,
     remote: &str,
+    minter: &mut dyn InstallationTokenMinter,
 ) -> Result<(), ImplementError> {
     let worktree_text = worktree.display().to_string();
     let refspec = format!("HEAD:refs/heads/{}", guard.order.branch_name);
@@ -822,8 +826,9 @@ fn publish_branch(
         &guard.order.repository,
         "metadata:read,contents:write",
         &["git", "-C", &worktree_text, "push", remote, &refspec],
+        minter,
     )
-    .map_err(|_| ImplementError::new(1, "push-failed", "could not run push"))?;
+    .map_err(|error| github_boundary_error(error, "push-failed", "could not run push"))?;
     if first_push.status.success() {
         return Ok(());
     }
@@ -850,8 +855,11 @@ fn publish_branch(
             remote,
             &format!("refs/heads/{}", guard.order.branch_name),
         ],
+        minter,
     )
-    .map_err(|_| ImplementError::new(1, "push-failed", "could not fetch advanced branch"))?;
+    .map_err(|error| {
+        github_operation_error(error, "push-failed", "could not fetch advanced branch")
+    })?;
     guard.remote_head_sha = git_text(worktree, &["rev-parse", "FETCH_HEAD"]);
     if !git_success(worktree, &["merge", "--no-edit", "FETCH_HEAD"]) {
         guard.conflicted_paths = git_text(worktree, &["diff", "--name-only", "--diff-filter=U"])
@@ -874,9 +882,10 @@ fn publish_branch(
         &guard.order.repository,
         "metadata:read,contents:write",
         &["git", "-C", &worktree_text, "push", remote, &refspec],
+        minter,
     )
     .map(|_| ())
-    .map_err(|_| ImplementError::new(1, "push-failed", "push retry failed"))
+    .map_err(|error| github_operation_error(error, "push-failed", "push retry failed"))
 }
 
 fn create_pull_request(
@@ -884,6 +893,7 @@ fn create_pull_request(
     guard: &TerminalGuard,
     runs: &Path,
     default_branch: &str,
+    minter: &mut dyn InstallationTokenMinter,
 ) -> Result<String, ImplementError> {
     let body = runs.join("pr-body.md");
     fs::write(
@@ -910,8 +920,11 @@ fn create_pull_request(
             "--body-file",
             &body.display().to_string(),
         ],
+        minter,
     )
-    .map_err(|_| ImplementError::new(1, "pr-create-failed", "pull request creation failed"))
+    .map_err(|error| {
+        github_operation_error(error, "pr-create-failed", "pull request creation failed")
+    })
 }
 
 fn prompt(order: &WorkOrder) -> String {
@@ -1076,9 +1089,15 @@ fn gh_status(
     repository: &str,
     permissions: &str,
     command: &[&str],
-) -> Result<Output, ()> {
-    let output = gh_output(request, repository, permissions, command)?;
-    output.status.success().then_some(output).ok_or(())
+    minter: &mut dyn InstallationTokenMinter,
+) -> Result<Output, GitHubOperationError> {
+    let output = gh_output(request, repository, permissions, command, minter)
+        .map_err(GitHubOperationError::Boundary)?;
+    output
+        .status
+        .success()
+        .then_some(output)
+        .ok_or(GitHubOperationError::Rejected)
 }
 
 fn gh_output(
@@ -1086,27 +1105,14 @@ fn gh_output(
     repository: &str,
     permissions: &str,
     command: &[&str],
-) -> Result<Output, ()> {
-    let gh_as = env::var_os("MANDATE_GH_AS_BIN").map_or_else(
-        || request.plugin_root.join("scripts/gh-as.sh"),
-        PathBuf::from,
-    );
-    // Execute the wrapper directly rather than through `bash`. The shipped
-    // script is mode 755 with a shebang, so the interpreter is its own
-    // business — and forcing `bash` breaks a MANDATE_GH_AS_BIN override that
-    // names a non-shell executable, which is the whole point of the override.
-    let output = Command::new(gh_as)
-        .arg("builder")
-        .arg(repository)
-        .arg("--repositories")
-        .arg(repository)
-        .arg("--permissions")
-        .arg(permissions)
-        .arg("--")
-        .args(command)
-        .output()
-        .map_err(|_| ())?;
-    Ok(output)
+    minter: &mut dyn InstallationTokenMinter,
+) -> Result<Output, AuthenticatedCommandError> {
+    authenticated_output(
+        &request.paths,
+        ScopedAppTokenRequest::new("builder", repository, repository, permissions),
+        command,
+        minter,
+    )
 }
 
 fn gh_text(
@@ -1114,9 +1120,72 @@ fn gh_text(
     repository: &str,
     permissions: &str,
     command: &[&str],
-) -> Result<String, ()> {
-    gh_status(request, repository, permissions, command)
+    minter: &mut dyn InstallationTokenMinter,
+) -> Result<String, GitHubOperationError> {
+    gh_status(request, repository, permissions, command, minter)
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+enum GitHubOperationError {
+    Boundary(AuthenticatedCommandError),
+    Rejected,
+}
+
+fn github_boundary_error(
+    error: AuthenticatedCommandError,
+    rejected_reason: &'static str,
+    rejected_message: &'static str,
+) -> ImplementError {
+    github_operation_error(
+        GitHubOperationError::Boundary(error),
+        rejected_reason,
+        rejected_message,
+    )
+}
+
+fn github_operation_error(
+    error: GitHubOperationError,
+    rejected_reason: &'static str,
+    rejected_message: &'static str,
+) -> ImplementError {
+    match error {
+        GitHubOperationError::Boundary(AuthenticatedCommandError::Authentication(error)) => {
+            ImplementError::new(
+                1,
+                "github-authentication-failed",
+                format!("GitHub authentication failed: {error}"),
+            )
+        }
+        GitHubOperationError::Boundary(AuthenticatedCommandError::Transport(error)) => {
+            ImplementError::new(
+                1,
+                "github-command-transport-failed",
+                format!("authenticated command transport failed: {error}"),
+            )
+        }
+        GitHubOperationError::Rejected => ImplementError::new(1, rejected_reason, rejected_message),
+    }
+}
+
+fn default_branch_result(
+    result: Result<String, GitHubOperationError>,
+) -> Result<String, ImplementError> {
+    let branch = result.map_err(|error| {
+        github_operation_error(
+            error,
+            "default-branch-query-failed",
+            "could not query default branch",
+        )
+    })?;
+    if branch.is_empty() {
+        Err(ImplementError::new(
+            1,
+            "default-branch-missing",
+            "default branch is missing",
+        ))
+    } else {
+        Ok(branch)
+    }
 }
 
 fn command_available(command: &Path) -> bool {
@@ -1191,7 +1260,10 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{has_unpublished_tree, prepare_worktree};
+    use super::{
+        GitHubOperationError, default_branch_result, has_unpublished_tree, prepare_worktree,
+    };
+    use crate::{AppTokenError, app_token::AuthenticatedCommandError};
 
     fn git(path: &std::path::Path, args: &[&str]) {
         let status = Command::new("git")
@@ -1201,6 +1273,26 @@ mod tests {
             .status()
             .expect("run git");
         assert!(status.success(), "git {args:?}");
+    }
+
+    #[test]
+    fn default_branch_faults_name_authentication_transport_and_empty_results() {
+        let authentication = default_branch_result(Err(GitHubOperationError::Boundary(
+            AuthenticatedCommandError::Authentication(AppTokenError::Credentials(
+                "placeholder credentials unavailable".to_owned(),
+            )),
+        )))
+        .expect_err("authentication must be named");
+        assert_eq!(authentication.reason, "github-authentication-failed");
+
+        let transport = default_branch_result(Err(GitHubOperationError::Boundary(
+            AuthenticatedCommandError::Transport("placeholder spawn failure".to_owned()),
+        )))
+        .expect_err("transport must be named");
+        assert_eq!(transport.reason, "github-command-transport-failed");
+
+        let empty = default_branch_result(Ok(String::new())).expect_err("empty branch must fail");
+        assert_eq!(empty.reason, "default-branch-missing");
     }
 
     #[test]

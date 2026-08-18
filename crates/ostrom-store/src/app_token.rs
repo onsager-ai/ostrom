@@ -2,13 +2,17 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
     path::{Path, PathBuf},
+    process::{Command, Output},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{SecondsFormat, Utc};
 use directories::BaseDirs;
-use reqwest::blocking::Client;
+use reqwest::{
+    blocking::Client,
+    header::{HeaderMap, HeaderValue, USER_AGENT},
+};
 use rsa::{
     RsaPrivateKey,
     pkcs1::DecodeRsaPrivateKey,
@@ -77,6 +81,155 @@ impl InstallationToken {
     pub(crate) fn expose(&self) -> &str {
         &self.0
     }
+}
+
+/// A production command path cannot represent a request with either half of
+/// its scope omitted. `AppTokenRequest` retains optional fields only at the
+/// validation boundary so the native minter can prove that malformed callers
+/// are rejected before credentials or transport are touched.
+pub(crate) struct ScopedAppTokenRequest<'a> {
+    role: &'a str,
+    anchor_repository: &'a str,
+    repositories: &'a str,
+    permissions: &'a str,
+}
+
+impl<'a> ScopedAppTokenRequest<'a> {
+    pub(crate) fn new(
+        role: &'a str,
+        anchor_repository: &'a str,
+        repositories: &'a str,
+        permissions: &'a str,
+    ) -> Self {
+        Self {
+            role,
+            anchor_repository,
+            repositories,
+            permissions,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn anchor_repository(&self) -> &str {
+        self.anchor_repository
+    }
+
+    #[cfg(test)]
+    pub(crate) fn role(&self) -> &str {
+        self.role
+    }
+
+    #[cfg(test)]
+    pub(crate) fn repositories(&self) -> &str {
+        self.repositories
+    }
+
+    #[cfg(test)]
+    pub(crate) fn permissions(&self) -> &str {
+        self.permissions
+    }
+
+    fn into_request(self) -> AppTokenRequest<'a> {
+        AppTokenRequest {
+            role: self.role,
+            anchor_repository: self.anchor_repository,
+            repositories: Some(self.repositories),
+            permissions: Some(self.permissions),
+        }
+    }
+}
+
+/// Keeps the non-copying production token shape while allowing unit tests to
+/// exercise the child boundary without a credential exchange.
+pub(crate) enum ScopedInstallationToken {
+    Minted(InstallationToken),
+    #[cfg(test)]
+    Placeholder(String),
+}
+
+impl ScopedInstallationToken {
+    pub(crate) fn expose(&self) -> &str {
+        match self {
+            Self::Minted(token) => token.expose(),
+            #[cfg(test)]
+            Self::Placeholder(value) => value.as_str(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn placeholder(value: impl Into<String>) -> Self {
+        Self::Placeholder(value.into())
+    }
+}
+
+pub(crate) trait InstallationTokenMinter {
+    fn mint(
+        &mut self,
+        paths: &OstromPaths,
+        request: ScopedAppTokenRequest<'_>,
+    ) -> Result<ScopedInstallationToken, AppTokenError>;
+}
+
+pub(crate) struct GitHubInstallationTokenMinter;
+
+impl InstallationTokenMinter for GitHubInstallationTokenMinter {
+    fn mint(
+        &mut self,
+        paths: &OstromPaths,
+        request: ScopedAppTokenRequest<'_>,
+    ) -> Result<ScopedInstallationToken, AppTokenError> {
+        mint_installation_token(paths, request.into_request()).map(ScopedInstallationToken::Minted)
+    }
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum AuthenticatedCommandError {
+    #[error("GitHub authentication failed: {0}")]
+    Authentication(#[source] AppTokenError),
+    #[error("authenticated command transport failed: {0}")]
+    Transport(String),
+}
+
+pub(crate) fn authenticated_output<S: AsRef<std::ffi::OsStr>>(
+    paths: &OstromPaths,
+    request: ScopedAppTokenRequest<'_>,
+    command: &[S],
+    minter: &mut dyn InstallationTokenMinter,
+) -> Result<Output, AuthenticatedCommandError> {
+    // Process-level lifecycle tests cannot inject a Rust trait across the
+    // binary boundary. Keep the established explicit override for those
+    // hermetic fixtures; the shipped path never resolves or executes a plugin
+    // script, and every non-fixture invocation continues through native minting.
+    // Empty means unset, matching the shell's `${VAR:-default}` and the sibling
+    // read in publish.rs. Without the filter an exported-but-empty override would
+    // take this branch, fail at `Command::new("")`, and mask native minting
+    // entirely — the defect class #266 fixed for MANDATE_SECRETS_FILE and #286
+    // for CLAUDE_CONFIG_DIR.
+    if let Some(executable) = env::var_os("MANDATE_GH_AS_BIN").filter(|value| !value.is_empty()) {
+        return Command::new(executable)
+            .arg(request.role)
+            .arg(request.anchor_repository)
+            .arg("--repositories")
+            .arg(request.repositories)
+            .arg("--permissions")
+            .arg(request.permissions)
+            .arg("--")
+            .args(command)
+            .output()
+            .map_err(|error| AuthenticatedCommandError::Transport(error.to_string()));
+    }
+    let token = minter
+        .mint(paths, request)
+        .map_err(AuthenticatedCommandError::Authentication)?;
+    let (program, arguments) = command.split_first().ok_or_else(|| {
+        AuthenticatedCommandError::Transport("child command was empty".to_owned())
+    })?;
+    Command::new(program)
+        .args(arguments)
+        .env("GH_TOKEN", token.expose())
+        .env("GITHUB_TOKEN", token.expose())
+        .output()
+        .map_err(|error| AuthenticatedCommandError::Transport(error.to_string()))
 }
 
 #[derive(Debug)]
@@ -212,11 +365,20 @@ fn mint_installation_token_with_secrets(
     // administrative-rules message, which reads as a permission failure and is
     // not one. reqwest sends no default. See ostrom_core::USER_AGENT.
     let client = Client::builder()
-        .user_agent(ostrom_core::USER_AGENT)
+        .default_headers(github_headers())
         .build()
         .map_err(|_| AppTokenError::LookupNetwork)?;
     let mut transport = ReqwestTransport { client, api_base };
     mint_installation_token_with_transport(paths, request, secrets_path, &mut transport)
+}
+
+fn github_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        USER_AGENT,
+        HeaderValue::from_static(ostrom_core::USER_AGENT),
+    );
+    headers
 }
 
 fn mint_installation_token_with_transport(
@@ -611,23 +773,29 @@ mod tests {
 
     const TOKEN_SENTINEL: &str = "placeholder-installation-token-sentinel";
 
-    /// The one property `FakeTransport` cannot check, and the one that broke.
-    ///
-    /// GitHub rejects a request carrying no `User-Agent` with **403 and an
-    /// administrative-rules message** — not 401, so it reads as a permission
-    /// problem rather than a malformed request. `reqwest` sends no default, so
-    /// the native minter had never authenticated against real GitHub; every
-    /// production sweep had run through the shell path, and the first one that
-    /// did not wrote an 11-row queue over a 135-row one.
-    ///
-    /// This drives **the production entry point** against a socket rather than
-    /// building its own client. The first version of this test constructed a
-    /// client with `.user_agent(...)` inline, which proved only that reqwest
-    /// sends a header when you set one — it would have passed with the call
-    /// removed from `mint_installation_token_with_secrets`, where the bug
-    /// actually lived. Caught in review on #299.
+    /// GitHub returns a misleading 403 when the User-Agent is absent. Testing
+    /// the exact header map consumed by the production client keeps that
+    /// incident pinned without opening even a loopback network connection.
     #[test]
     fn the_production_minter_sends_a_user_agent() {
+        let headers = github_headers();
+        let header = headers
+            .get(USER_AGENT)
+            .and_then(|value| value.to_str().ok())
+            .expect("production client has a User-Agent");
+        assert!(
+            header.contains("ostrom/"),
+            "User-Agent must identify ostrom, got: {header}"
+        );
+    }
+
+    /// The header-map test above cannot see the wiring. `github_headers()` is
+    /// consumed in exactly one place — `.default_headers(...)` on the client
+    /// builder — so deleting that call leaves the map correct and the request
+    /// bare, which is the same one-indirection gap that made #299's first test
+    /// worthless and required #301 to fix it. This one reads the bytes.
+    #[test]
+    fn the_production_minter_sends_a_user_agent_on_the_wire() {
         use std::{
             io::{Read, Write},
             net::TcpListener,
@@ -700,6 +868,128 @@ mod tests {
             repositories,
             permissions,
         }
+    }
+
+    #[derive(Default)]
+    struct RecordingMinter {
+        requests: Vec<(String, String, String, String)>,
+        authentication_failure: bool,
+    }
+
+    impl InstallationTokenMinter for RecordingMinter {
+        fn mint(
+            &mut self,
+            _paths: &OstromPaths,
+            request: ScopedAppTokenRequest<'_>,
+        ) -> Result<ScopedInstallationToken, AppTokenError> {
+            self.requests.push((
+                request.role.to_owned(),
+                request.anchor_repository.to_owned(),
+                request.repositories.to_owned(),
+                request.permissions.to_owned(),
+            ));
+            if self.authentication_failure {
+                Err(AppTokenError::Credentials(
+                    "placeholder credentials unavailable".to_owned(),
+                ))
+            } else {
+                Ok(ScopedInstallationToken::placeholder(TOKEN_SENTINEL))
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scoped_token_reaches_only_the_child_environment() {
+        let root = tempdir().expect("temporary command boundary");
+        let mut minter = RecordingMinter::default();
+        let output = authenticated_output(
+            &paths(root.path()),
+            ScopedAppTokenRequest::new(
+                "builder",
+                "placeholder-org/alpha",
+                "placeholder-org/alpha",
+                "metadata:read,contents:read",
+            ),
+            &[
+                "/bin/sh",
+                "-c",
+                "[ \"$GH_TOKEN\" = \"$GITHUB_TOKEN\" ] && [ \"$GH_TOKEN\" = \"placeholder-installation-token-sentinel\" ] && printf boundary-ok",
+            ],
+            &mut minter,
+        )
+        .expect("run authenticated child");
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"boundary-ok");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(TOKEN_SENTINEL));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(TOKEN_SENTINEL));
+        assert_eq!(
+            minter.requests,
+            [(
+                "builder".to_owned(),
+                "placeholder-org/alpha".to_owned(),
+                "placeholder-org/alpha".to_owned(),
+                "metadata:read,contents:read".to_owned(),
+            )]
+        );
+        assert!(
+            fs::read_dir(root.path())
+                .expect("inspect command boundary")
+                .next()
+                .is_none(),
+            "the command boundary must not persist credentials"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authentication_transport_and_empty_output_are_distinct() {
+        let root = tempdir().expect("temporary command faults");
+        let scope = || {
+            ScopedAppTokenRequest::new(
+                "builder",
+                "placeholder-org/alpha",
+                "placeholder-org/alpha",
+                "metadata:read",
+            )
+        };
+        let mut authentication = RecordingMinter {
+            authentication_failure: true,
+            ..RecordingMinter::default()
+        };
+        let authentication = authenticated_output(
+            &paths(root.path()),
+            scope(),
+            &["/placeholder/command-must-not-run"],
+            &mut authentication,
+        )
+        .expect_err("authentication must fail before spawn");
+        assert!(matches!(
+            authentication,
+            AuthenticatedCommandError::Authentication(_)
+        ));
+
+        let mut transport = RecordingMinter::default();
+        let transport = authenticated_output(
+            &paths(root.path()),
+            scope(),
+            &["/placeholder/missing-command"],
+            &mut transport,
+        )
+        .expect_err("missing child is a transport failure");
+        assert!(matches!(transport, AuthenticatedCommandError::Transport(_)));
+
+        let mut empty = RecordingMinter::default();
+        let empty = authenticated_output(
+            &paths(root.path()),
+            scope(),
+            &["/bin/sh", "-c", "true"],
+            &mut empty,
+        )
+        .expect("empty output is a successful child result");
+        assert!(empty.status.success());
+        assert!(empty.stdout.is_empty());
     }
 
     fn write_credentials(root: &Path) -> (PathBuf, String) {
