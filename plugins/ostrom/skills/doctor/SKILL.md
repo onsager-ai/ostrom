@@ -18,7 +18,9 @@ Run `scripts/run-node.sh` (sibling of `skills/`, i.e.
 when an interactive version manager has not put it on `PATH`, then runs
 the bundled doctor. The doctor is read-only (it makes exactly one write of
 its own: a `git fetch` into the marketplace's cached clone, touching that
-clone's remote-tracking refs only) and always exits 0; each line is:
+clone's remote-tracking refs only). CLI install and upgrade commands are
+remedies for the operator to choose; doctor must report them and never run
+them. The prober always exits 0; each line is:
 
 ```
 STATUS|check-name|detail|remedy

@@ -1,5 +1,6 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -11,7 +12,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { checkPluginCacheDrift } from "../src/checks/plugin-cache-drift.js";
@@ -39,6 +40,14 @@ interface Fixture {
   configDir: string;
   cwd: string;
   installPath: string;
+  binDir: string;
+}
+
+function writeOstromStub(fixture: Fixture, version: string): string {
+  const path = join(fixture.binDir, "ostrom");
+  writeFileSync(path, `#!/bin/sh\nprintf 'ostrom ${version}\\n'\n`);
+  chmodSync(path, 0o755);
+  return path;
 }
 
 function command(commandName: string, args: string[], cwd?: string): string {
@@ -104,6 +113,7 @@ function baseFixture(): Fixture {
   const configDir = join(root, "claude");
   const cwd = join(root, "project");
   const installPath = join(root, "installed-ostrom");
+  const binDir = join(root, "bin");
   mkdirSync(join(configDir, "plugins"), { recursive: true });
   mkdirSync(cwd, { recursive: true });
   mkdirSync(join(installPath, ".claude-plugin"), { recursive: true });
@@ -127,6 +137,7 @@ function baseFixture(): Fixture {
     }),
   );
   mkdirSync(home, { recursive: true });
+  mkdirSync(binDir, { recursive: true });
   mkdirSync(join(configDir, "ostrom"), { recursive: true });
   const sourceRoot = join(root, "source-root");
   const sourceRepository = join(
@@ -159,7 +170,8 @@ function baseFixture(): Fixture {
     join(configDir, "ostrom", "publish", "manifest.json"),
     '{"published_at":"2026-08-01T00:00:00Z","expected_sweep_interval_hours":24}\n',
   );
-  const fixture = { root, home, configDir, cwd, installPath };
+  const fixture = { root, home, configDir, cwd, installPath, binDir };
+  writeOstromStub(fixture, "0.2.2");
   wireMarketplace(fixture);
   return fixture;
 }
@@ -173,7 +185,10 @@ function doctorContext(
     configDir: fixture.configDir,
     cwd: fixture.cwd,
     home: fixture.home,
-    env: process.env,
+    env: {
+      ...process.env,
+      PATH: `${fixture.binDir}${delimiter}${process.env.PATH ?? ""}`,
+    },
     resolveConfig: () => ({
       provider: "file",
       path: "~/.claude/ostrom/touch-log.md",
@@ -209,8 +224,35 @@ function run(fixture: Fixture, env: NodeJS.ProcessEnv = {}): string {
     configDir: fixture.configDir,
     cwd: fixture.cwd,
     home: fixture.home,
-    env: { ...process.env, MANDATE_NOW_EPOCH: "1785542400", ...env },
+    env: {
+      ...process.env,
+      PATH: `${fixture.binDir}${delimiter}${process.env.PATH ?? ""}`,
+      MANDATE_NOW_EPOCH: "1785542400",
+      ...env,
+    },
   });
+}
+
+function cliCheck(
+  fixture: Fixture,
+  env: NodeJS.ProcessEnv = {},
+  loadedPluginRoot = pluginRoot,
+  name: "cli-installed" | "cli-version" = "cli-version",
+): string {
+  return runDoctorCheck(
+    {
+      pluginRoot: loadedPluginRoot,
+      configDir: fixture.configDir,
+      cwd: fixture.cwd,
+      home: fixture.home,
+      env: {
+        ...process.env,
+        PATH: fixture.binDir,
+        ...env,
+      },
+    },
+    name,
+  );
 }
 
 function output(results: CheckResult[]): string {
@@ -223,6 +265,24 @@ function commonExpected(
   provider: CheckResult,
 ): string {
   return output([
+    {
+      status: "OK",
+      name: "cli-installed",
+      detail: "ostrom found on PATH",
+      remedy: "",
+    },
+    {
+      status: "OK",
+      name: "cli-version",
+      detail: "installed version 0.2.2 satisfies required 0.2.2",
+      remedy: "",
+    },
+    {
+      status: "OK",
+      name: "cli-launcher",
+      detail: "resolved executable is not a Node launcher",
+      remedy: "",
+    },
     {
       status: "OK",
       name: "plugin",
@@ -292,6 +352,113 @@ function commonExpected(
     },
   ]);
 }
+
+describe("CLI compatibility check", () => {
+  it("reports a missing CLI with the install command and never runs npm", () => {
+    const fixture = baseFixture();
+    rmSync(join(fixture.binDir, "ostrom"));
+    const installMarker = join(fixture.root, "npm-was-run");
+    const npm = join(fixture.binDir, "npm");
+    writeFileSync(npm, `#!/bin/sh\ntouch '${installMarker}'\n`);
+    chmodSync(npm, 0o755);
+
+    expect(cliCheck(fixture, {}, pluginRoot, "cli-installed")).toBe(
+      "FAIL|cli-installed|ostrom is not installed or is absent from PATH|npm install -g @ostrom/cli\n",
+    );
+    expect(cliCheck(fixture)).toBe(
+      "OK|cli-version|not checked because ostrom is absent|\n",
+    );
+    expect(existsSync(installMarker)).toBe(false);
+  });
+
+  it("reports an older CLI with installed and required versions", () => {
+    const fixture = baseFixture();
+    writeOstromStub(fixture, "0.1.2");
+
+    expect(cliCheck(fixture, {}, pluginRoot, "cli-installed")).toBe(
+      "OK|cli-installed|ostrom found on PATH|\n",
+    );
+    expect(cliCheck(fixture)).toBe(
+      "FAIL|cli-version|installed ostrom CLI version 0.1.2 is older than required 0.2.2|npm update -g @ostrom/cli\n",
+    );
+  });
+
+  it("accepts a CLI at the declared floor", () => {
+    const fixture = baseFixture();
+
+    expect(cliCheck(fixture)).toBe(
+      "OK|cli-version|installed version 0.2.2 satisfies required 0.2.2|\n",
+    );
+  });
+
+  it("compares semantic versions rather than strings", () => {
+    const fixture = baseFixture();
+    writeOstromStub(fixture, "0.10.0");
+    const manifestRoot = join(fixture.root, "plugin-with-semver-floor");
+    mkdirSync(join(manifestRoot, ".claude-plugin"), { recursive: true });
+    writeFileSync(
+      join(manifestRoot, ".claude-plugin", "plugin.json"),
+      '{"minimumCliVersion":"0.9.0"}\n',
+    );
+
+    expect(cliCheck(fixture, {}, manifestRoot)).toBe(
+      "OK|cli-version|installed version 0.10.0 satisfies required 0.9.0|\n",
+    );
+  });
+
+  it("reports the packaged native binary behind a Node launcher", () => {
+    const fixture = baseFixture();
+    const packageRoot = join(fixture.root, "global", "@ostrom", "cli");
+    const platformName = `cli-${process.platform}-${process.arch}`;
+    const platformRoot = join(
+      packageRoot,
+      "node_modules",
+      "@ostrom",
+      platformName,
+    );
+    const launcher = join(packageRoot, "bin.js");
+    const native = join(platformRoot, "ostrom");
+    mkdirSync(platformRoot, { recursive: true });
+    writeFileSync(
+      join(packageRoot, "package.json"),
+      JSON.stringify({
+        ostrom: {
+          platformPackages: {
+            [`${process.platform}-${process.arch}`]: `@ostrom/${platformName}`,
+          },
+        },
+      }),
+    );
+    writeFileSync(launcher, "#!/usr/bin/env node\nprocess.exit(99);\n");
+    chmodSync(launcher, 0o755);
+    writeFileSync(
+      join(platformRoot, "package.json"),
+      JSON.stringify({ name: `@ostrom/${platformName}`, main: "ostrom" }),
+    );
+    writeFileSync(native, "#!/bin/sh\nprintf 'ostrom 0.2.2\\n'\n");
+    chmodSync(native, 0o755);
+    rmSync(join(fixture.binDir, "ostrom"));
+    symlinkSync(launcher, join(fixture.binDir, "ostrom"));
+
+    expect(cliCheck(fixture)).toContain(
+      "OK|cli-version|installed version 0.2.2 satisfies required 0.2.2|",
+    );
+    expect(
+      runDoctorCheck(
+        {
+          pluginRoot,
+          configDir: fixture.configDir,
+          cwd: fixture.cwd,
+          home: fixture.home,
+          env: { PATH: fixture.binDir },
+        },
+        "cli-launcher",
+      ),
+    ).toBe(
+      `WARN|cli-launcher|ostrom resolves to the Node launcher at ${join(fixture.binDir, "ostrom")}; native binary is ${native}|configure non-interactive units to invoke ${native} directly\n`,
+    );
+  });
+});
 
 describe("plugin check", () => {
   it("reports OK when the loaded and registry versions agree", () => {
@@ -472,6 +639,7 @@ describe("doctor golden output", () => {
           home: fixture.home,
           env: {
             ...process.env,
+            PATH: `${fixture.binDir}${delimiter}${process.env.PATH ?? ""}`,
             MANDATE_NOW_EPOCH: "1785542400",
           },
         },
@@ -598,10 +766,11 @@ describe("doctor golden output", () => {
       env: {
         HOME: fixture.home,
         CLAUDE_CONFIG_DIR: missing,
+        PATH: fixture.binDir,
       },
     });
 
-    expect(report.split("\n").filter(Boolean)).toHaveLength(14);
+    expect(report.split("\n").filter(Boolean)).toHaveLength(17);
     expect(existsSync(missing)).toBe(false);
   });
 

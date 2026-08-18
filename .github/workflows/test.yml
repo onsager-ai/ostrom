@@ -68,6 +68,14 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: plugins/ostrom/tools/package-lock.json
+      - name: Check the plugin CLI floor is published
+        working-directory: .
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            node npm/scripts/assert-plugin-cli-floor.mjs --allow-inconclusive
+          else
+            node npm/scripts/assert-plugin-cli-floor.mjs
+          fi
       - name: Require a plugin version change for shipped skill changes
         if: github.event_name == 'pull_request'
         working-directory: .
