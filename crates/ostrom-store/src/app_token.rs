@@ -200,7 +200,12 @@ pub(crate) fn authenticated_output<S: AsRef<std::ffi::OsStr>>(
     // binary boundary. Keep the established explicit override for those
     // hermetic fixtures; the shipped path never resolves or executes a plugin
     // script, and every non-fixture invocation continues through native minting.
-    if let Some(executable) = env::var_os("MANDATE_GH_AS_BIN") {
+    // Empty means unset, matching the shell's `${VAR:-default}` and the sibling
+    // read in publish.rs. Without the filter an exported-but-empty override would
+    // take this branch, fail at `Command::new("")`, and mask native minting
+    // entirely — the defect class #266 fixed for MANDATE_SECRETS_FILE and #286
+    // for CLAUDE_CONFIG_DIR.
+    if let Some(executable) = env::var_os("MANDATE_GH_AS_BIN").filter(|value| !value.is_empty()) {
         return Command::new(executable)
             .arg(request.role)
             .arg(request.anchor_repository)
