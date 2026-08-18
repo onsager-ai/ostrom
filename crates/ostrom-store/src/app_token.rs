@@ -620,25 +620,29 @@ mod tests {
     /// production sweep had run through the shell path, and the first one that
     /// did not wrote an 11-row queue over a 135-row one.
     ///
-    /// The transport trait takes a JWT and a repository and hides headers
-    /// entirely, so no test at that seam can observe this. This one drives the
-    /// real `ReqwestTransport` against a socket and reads the bytes on the wire.
+    /// This drives **the production entry point** against a socket rather than
+    /// building its own client. The first version of this test constructed a
+    /// client with `.user_agent(...)` inline, which proved only that reqwest
+    /// sends a header when you set one — it would have passed with the call
+    /// removed from `mint_installation_token_with_secrets`, where the bug
+    /// actually lived. Caught in review on #299.
     #[test]
-    fn the_real_transport_sends_a_user_agent() {
+    fn the_production_minter_sends_a_user_agent() {
         use std::{
             io::{Read, Write},
             net::TcpListener,
             thread,
         };
 
+        let root = tempdir().expect("temporary minter fixture");
+        let (secrets, _) = write_credentials(root.path());
+
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture socket");
         let port = listener.local_addr().expect("fixture address").port();
         let served = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept lookup");
-            // Read until the header block is complete. A single `read` returns
-            // whatever happened to arrive, which is routinely nothing yet — the
-            // first version of this test passed once and then failed, which is
-            // the same wall-clock flakiness this suite fixed elsewhere today.
+            // Read until the header block completes. A single `read` returns
+            // whatever happened to arrive, which is routinely nothing yet.
             let mut raw = Vec::new();
             let mut buffer = [0_u8; 512];
             while !raw.windows(4).any(|window| window == b"\r\n\r\n") {
@@ -648,32 +652,29 @@ mod tests {
                     Err(error) => panic!("read request: {error}"),
                 }
             }
-            let request = String::from_utf8_lossy(&raw).into_owned();
-            stream
-                .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n")
-                .expect("write reply");
-            request
+            // The minter's own error path is irrelevant here; the request is
+            // the artifact under test.
+            let _ = stream
+                .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n");
+            String::from_utf8_lossy(&raw).into_owned()
         });
 
         let base = format!("http://127.0.0.1:{port}");
-        let client = Client::builder()
-            .user_agent(ostrom_core::USER_AGENT)
-            .build()
-            .expect("build client");
-        let mut transport = ReqwestTransport {
-            client,
-            api_base: &base,
-        };
-        let _ = transport.lookup("placeholder.jwt.value", "placeholder-org/alpha");
+        let _ = mint_installation_token_with_secrets(
+            &paths(root.path()),
+            request(Some("placeholder-org/alpha"), Some("metadata:read")),
+            &base,
+            || Ok(secrets.clone()),
+        );
 
-        let request = served.join().expect("fixture thread");
-        let header = request
+        let request_text = served.join().expect("fixture thread");
+        let header = request_text
             .lines()
             .find(|line| line.to_ascii_lowercase().starts_with("user-agent:"))
             .unwrap_or_else(|| {
                 panic!(
-                    "no User-Agent header on the wire ({} bytes):\n{request}",
-                    request.len()
+                    "no User-Agent header on the wire ({} bytes):\n{request_text}",
+                    request_text.len()
                 )
             });
         assert!(
