@@ -1,21 +1,31 @@
-# Implementer binary comparison window
+# Implementer operation and diagnosis
 
-`ostrom dispatch` deliberately launches `plugins/ostrom/scripts/implement.sh`
-by default during the production comparison window. Select the Rust
-implementation explicitly with:
+`ostrom dispatch <work-order-file>` always starts the Rust implementer as a
+transient user unit:
 
-```sh
-MANDATE_IMPLEMENTER_ENGINE=rust ostrom dispatch /path/to/work-order.json
+```text
+ostrom implement <work-order-file> <unit-name>
 ```
 
-The transient unit then runs `ostrom implement <work-order-file> <unit-name>`.
-`MANDATE_OSTROM_BIN` may name an absolute CLI path if `ostrom` is not on the
-unit's `PATH`.
+There is one implementation engine and no fallback. Dispatch resolves the
+`ostrom` executable before reserving work or invoking `systemd-run`. Set
+`MANDATE_OSTROM_BIN` to an absolute executable path when the interactive
+`PATH` does not represent the transient unit environment. This is especially
+important for npm launchers whose `#!/usr/bin/env node` shebang also requires
+the resolved Node directory on the unit's `PATH`.
 
-To roll back, unset `MANDATE_IMPLEMENTER_ENGINE` or set it to `shell`. The
-existing `MANDATE_IMPLEMENTER_BIN` override selects an alternate shell
-implementer only when the shell engine is active.
+For a failed launch, start with the dispatch error and the terminal row in
+`$OSTROM_HOME/sprint.jsonl`. `ostrom-unavailable` means
+`MANDATE_OSTROM_BIN` was invalid or, when the override was unset, `ostrom`
+could not be resolved on `PATH`. `codex-unavailable` means the Codex executable
+or its Node interpreter could not be resolved or executed. Neither failure
+starts the transient unit.
 
-After the comparison window, cutover is the one-line change from `"shell"` to
-`"rust"` in `DEFAULT_IMPLEMENTER_ENGINE`; deleting the fallback script remains
-a separate retirement step.
+After a unit starts, inspect it with `systemctl --user status <unit-name>` and
+`journalctl --user-unit <unit-name>`. A terminal `work-failed` row names the
+implementer reason and records any preserved worktree. Failed or terminated
+runs deliberately retain unpublished edits under
+`$OSTROM_HOME/implementer-worktrees/<item-hash>`; retrying the same item reuses
+that worktree. The item lease is released only after the terminal row is
+durable, and systemd uses `KillMode=control-group` so termination covers Codex
+and its descendants.

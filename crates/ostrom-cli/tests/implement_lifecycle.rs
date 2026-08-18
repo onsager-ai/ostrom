@@ -89,6 +89,23 @@ impl Fixture {
                 "done\n",
                 "case \"${FAKE_CODEX_MODE:-complete}\" in\n",
                 "  over) printf '%s\\n' '{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":0,\"cached_input_tokens\":0,\"output_tokens\":101,\"reasoning_output_tokens\":0}}' ;;\n",
+                "  usage) printf '%s\\n' 'Usage: codex exec [OPTIONS]' >&2; exit 2 ;;\n",
+                "  config) printf '%s\\n' 'Error loading config.toml: placeholder configuration' >&2; exit 1 ;;\n",
+                "  config-required) printf '%s\\n' 'Error: features.placeholder is required when fixture is enabled' >&2; exit 1 ;;\n",
+                "  model-failure) exit 1 ;;\n",
+                "  partial-failure)\n",
+                "    printf '%s\\n' partial >\"$worktree/partial.txt\"\n",
+                "    printf '%s\\n' \"$FAKE_CODEX_USAGE_JSON\"\n",
+                "    exit 1 ;;\n",
+                "  workflow-only)\n",
+                "    mkdir -p \"$worktree/.github/workflows\"\n",
+                "    printf '%s\\n' 'name: placeholder' >\"$worktree/.github/workflows/test.yml\"\n",
+                "    printf '%s\\n' done >\"$result\"\n",
+                "    printf '%s\\n' '{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":10,\"cached_input_tokens\":5,\"output_tokens\":10,\"reasoning_output_tokens\":1}}' ;;\n",
+                "  conflict)\n",
+                "    printf '%s\\n' 'implementer version' >\"$worktree/base.txt\"\n",
+                "    printf '%s\\n' done >\"$result\"\n",
+                "    printf '%s\\n' '{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":10,\"cached_input_tokens\":5,\"output_tokens\":10,\"reasoning_output_tokens\":1}}' ;;\n",
                 "  wait)\n",
                 "    printf '%s\\n' preserved >>\"$worktree/README.md\"\n",
                 "    printf '%s\\n' \"$$\" >\"$OSTROM_HOME/codex.pid\"\n",
@@ -99,7 +116,9 @@ impl Fixture {
                 "  *)\n",
                 "    printf '%s\\n' completed >>\"$worktree/README.md\"\n",
                 "    printf '%s\\n' done >\"$result\"\n",
-                "    printf '%s\\n' '{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":10,\"cached_input_tokens\":5,\"output_tokens\":10,\"reasoning_output_tokens\":1}}' ;;\n",
+                "    usage=${FAKE_CODEX_USAGE_JSON:-}\n",
+                "    if [ -z \"$usage\" ]; then usage='{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":10,\"cached_input_tokens\":5,\"output_tokens\":10,\"reasoning_output_tokens\":1}}'; fi\n",
+                "    printf '%s\\n' \"$usage\" ;;\n",
                 "esac"
             ),
         );
@@ -170,6 +189,14 @@ impl Fixture {
             .map(|line| serde_json::from_str(line).expect("trace JSON"))
             .collect()
     }
+
+    fn worktree(&self) -> PathBuf {
+        let order = WorkOrder::from_json(&fs::read(&self.order_file).expect("read order"))
+            .expect("valid work order");
+        self.state
+            .join("implementer-worktrees")
+            .join(order.item_hash())
+    }
 }
 
 /// Stubs carry a shebang and mode 755 because the credential wrapper is now
@@ -192,6 +219,20 @@ fn git(path: &Path, arguments: &[&str]) {
             .success(),
         "git {arguments:?}"
     );
+}
+
+fn git_output(path: &Path, arguments: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(arguments)
+        .output()
+        .expect("run git");
+    assert!(output.status.success(), "git {arguments:?}");
+    String::from_utf8(output.stdout)
+        .expect("git output is UTF-8")
+        .trim()
+        .to_owned()
 }
 
 fn wait_for(path: &Path) {
@@ -233,6 +274,359 @@ fn token_ceiling_is_recorded_after_codex_completes() {
 }
 
 #[test]
+fn completed_run_uses_the_rust_cli_publication_boundary() {
+    let fixture = Fixture::new(100);
+    fixture.acquire();
+    let output = fixture
+        .command("complete")
+        .stdout(Stdio::piped())
+        .output()
+        .expect("run implementer");
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout)
+            .expect("UTF-8 output")
+            .trim(),
+        "https://example.invalid/placeholder/pull/7"
+    );
+    assert!(!fixture.lease_file.exists());
+    let worktree = fixture.worktree();
+    assert!(
+        fs::read_to_string(worktree.join("README.md"))
+            .expect("read implementation")
+            .contains("completed")
+    );
+    let terminal = fixture.trace().pop().expect("completion trace");
+    assert_eq!(terminal["kind"], "work-completed");
+    assert_eq!(
+        terminal["fact"]["pr_url"],
+        "https://example.invalid/placeholder/pull/7"
+    );
+    let body = fixture
+        .state
+        .join("implementer-runs")
+        .join(terminal["fact"]["order_id"].as_str().expect("order id"))
+        .join("pr-body.md");
+    let body = fs::read_to_string(body).expect("read pull request body");
+    assert!(body.contains("workspace-write"));
+    assert!(body.contains("approval policy `never`"));
+    assert!(body.contains("Ostrom-Role: builder"));
+}
+
+#[test]
+fn source_resolution_prefers_a_primary_clone_over_a_linked_worktree() {
+    let fixture = Fixture::new(100);
+    let linked_root = fixture.root.path().join("linked-root");
+    let linked = linked_root.join("linked");
+    fs::create_dir(&linked_root).expect("create linked root");
+    git(
+        &fixture.source,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "fixture/linked",
+            &linked.display().to_string(),
+            "refs/remotes/origin/main",
+        ],
+    );
+    fs::write(
+        fixture.state.join("mandates.yaml"),
+        format!(
+            "search_roots:\n  - {}\n  - {}\n",
+            linked_root.display(),
+            fixture.source.display()
+        ),
+    )
+    .expect("write config");
+    fixture.acquire();
+    let status = fixture
+        .command("complete")
+        .env_remove("MANDATE_IMPLEMENTER_SOURCE_REPO")
+        .status()
+        .expect("run implementer");
+    assert!(status.success());
+    let terminal = fixture.trace().pop().expect("completion trace");
+    assert_eq!(
+        terminal["fact"]["source_repository_path"],
+        fixture.source.display().to_string()
+    );
+}
+
+#[test]
+fn linked_worktree_only_source_is_named_and_creates_no_item_worktree() {
+    let fixture = Fixture::new(100);
+    let linked_root = fixture.root.path().join("linked-root");
+    let linked = linked_root.join("linked");
+    fs::create_dir(&linked_root).expect("create linked root");
+    git(
+        &fixture.source,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "fixture/linked",
+            &linked.display().to_string(),
+            "refs/remotes/origin/main",
+        ],
+    );
+    fs::write(
+        fixture.state.join("mandates.yaml"),
+        format!("search_roots:\n  - {}\n", linked_root.display()),
+    )
+    .expect("write config");
+    fixture.acquire();
+    let status = fixture
+        .command("complete")
+        .env_remove("MANDATE_IMPLEMENTER_SOURCE_REPO")
+        .status()
+        .expect("run implementer");
+    assert!(!status.success());
+    assert!(!fixture.lease_file.exists());
+    assert!(!fixture.worktree().exists());
+    let terminal = fixture.trace().pop().expect("failure trace");
+    assert_eq!(
+        terminal["fact"]["reason"],
+        "source-repository-linked-worktree-only"
+    );
+    assert_eq!(
+        terminal["fact"]["message"],
+        format!(
+            "source repository was found only as a linked worktree: {}",
+            linked.display()
+        )
+    );
+}
+
+#[test]
+fn branch_owned_by_another_worktree_is_rejected_without_reuse() {
+    let fixture = Fixture::new(100);
+    let order = WorkOrder::from_json(&fs::read(&fixture.order_file).expect("read order"))
+        .expect("valid order");
+    let existing = fixture.root.path().join("external-worktree");
+    git(
+        &fixture.source,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &order.branch_name,
+            &existing.display().to_string(),
+            "refs/remotes/origin/main",
+        ],
+    );
+    fixture.acquire();
+    let status = fixture
+        .command("complete")
+        .status()
+        .expect("run implementer");
+    assert!(!status.success());
+    assert!(!fixture.lease_file.exists());
+    assert!(!fixture.worktree().exists());
+    let terminal = fixture.trace().pop().expect("failure trace");
+    assert_eq!(terminal["fact"]["reason"], "worktree-branch-already-exists");
+    assert_eq!(
+        terminal["fact"]["message"],
+        format!(
+            "branch {} already exists outside the item worktree: {}",
+            order.branch_name,
+            existing.display()
+        )
+    );
+}
+
+#[test]
+fn workflow_only_change_is_withheld_and_never_published() {
+    let fixture = Fixture::new(100);
+    fixture.acquire();
+    let status = fixture
+        .command("workflow-only")
+        .status()
+        .expect("run implementer");
+    assert!(!status.success());
+    assert!(!fixture.lease_file.exists());
+    let terminal = fixture.trace().pop().expect("failure trace");
+    assert_eq!(terminal["fact"]["reason"], "workflow-file-unpushable");
+    assert_eq!(
+        terminal["fact"]["message"],
+        "only workflow files changed; withheld paths: .github/workflows/test.yml"
+    );
+    assert_eq!(
+        terminal["fact"]["withheld_paths"],
+        json!([".github/workflows/test.yml"])
+    );
+}
+
+#[test]
+fn codex_invocation_failures_are_named_and_release_the_lease() {
+    for (mode, code, reason) in [
+        ("usage", 2, "codex-invocation-invalid"),
+        ("config", 1, "codex-invocation-invalid"),
+        ("config-required", 1, "codex-invocation-invalid"),
+        ("model-failure", 1, "codex-exit-1"),
+    ] {
+        let fixture = Fixture::new(100);
+        fixture.acquire();
+        let status = fixture.command(mode).status().expect("run implementer");
+        assert_eq!(status.code(), Some(code));
+        assert!(!fixture.lease_file.exists());
+        assert_eq!(
+            fixture.trace().pop().expect("failure trace")["fact"]["reason"],
+            reason
+        );
+    }
+}
+
+#[test]
+fn unavailable_codex_interpreter_is_named_and_releases_the_lease() {
+    let fixture = Fixture::new(100);
+    fs::write(
+        &fixture.codex,
+        "#!/usr/bin/env missing-placeholder-runtime\n",
+    )
+    .expect("write broken Codex");
+    fs::set_permissions(&fixture.codex, fs::Permissions::from_mode(0o755))
+        .expect("chmod broken Codex");
+    fixture.acquire();
+    let status = fixture
+        .command("complete")
+        .status()
+        .expect("run implementer");
+    assert_eq!(status.code(), Some(127));
+    assert!(!fixture.lease_file.exists());
+    assert_eq!(
+        fixture.trace().pop().expect("failure trace")["fact"]["reason"],
+        "codex-unavailable"
+    );
+}
+
+#[test]
+fn conflicting_published_branch_is_named_and_aborts_the_merge() {
+    let fixture = Fixture::new(100);
+    let order = WorkOrder::from_json(&fs::read(&fixture.order_file).expect("read order"))
+        .expect("valid order");
+    let remote = fixture.root.path().join("origin.git");
+    fs::create_dir(&remote).expect("create remote");
+    git(&remote, &["init", "--bare"]);
+    git(
+        &fixture.source,
+        &["push", &remote.display().to_string(), "main:main"],
+    );
+    let publisher = fixture.root.path().join("publisher");
+    assert!(
+        Command::new("git")
+            .args([
+                "clone",
+                "--branch",
+                "main",
+                &remote.display().to_string(),
+                &publisher.display().to_string(),
+            ])
+            .status()
+            .expect("clone publisher")
+            .success()
+    );
+    git(
+        &publisher,
+        &["config", "user.email", "fixture@example.invalid"],
+    );
+    git(&publisher, &["config", "user.name", "Fixture"]);
+    git(&publisher, &["switch", "-c", &order.branch_name]);
+    fs::write(publisher.join("base.txt"), "published version\n").expect("write published change");
+    git(&publisher, &["add", "base.txt"]);
+    git(&publisher, &["commit", "-m", "published placeholder"]);
+    git(&publisher, &["push", "origin", &order.branch_name]);
+    let remote_head = git_output(&publisher, &["rev-parse", "HEAD"]);
+
+    executable(
+        &fixture.gh_as,
+        concat!(
+            "while [ \"$#\" -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n",
+            "shift\n",
+            "if [ \"$1\" = gh ] && [ \"$2\" = repo ]; then printf '%s\\n' main; exit 0; fi\n",
+            "if [ \"$1\" = gh ] && [ \"$2\" = pr ]; then : >\"$FAKE_PR_MARKER\"; exit 1; fi\n",
+            "args=()\n",
+            "for value in \"$@\"; do\n",
+            "  if [ \"$value\" = https://github.com/placeholder-org/alpha.git ]; then value=$FAKE_GIT_REMOTE; fi\n",
+            "  args+=(\"$value\")\n",
+            "done\n",
+            "exec \"${args[@]}\""
+        ),
+    );
+    let pr_marker = fixture.root.path().join("pr-called");
+    fixture.acquire();
+    let status = fixture
+        .command("conflict")
+        .env("FAKE_GIT_REMOTE", &remote)
+        .env("FAKE_PR_MARKER", &pr_marker)
+        .status()
+        .expect("run implementer");
+    assert_eq!(status.code(), Some(1));
+    assert!(!fixture.lease_file.exists());
+    assert!(!pr_marker.exists());
+    let worktree = fixture.worktree();
+    assert_eq!(
+        fs::read_to_string(worktree.join("base.txt")).expect("read restored change"),
+        "implementer version\n"
+    );
+    assert!(
+        !Command::new("git")
+            .args([
+                "-C",
+                &worktree.display().to_string(),
+                "rev-parse",
+                "-q",
+                "--verify",
+                "MERGE_HEAD",
+            ])
+            .status()
+            .expect("inspect merge state")
+            .success()
+    );
+    let terminal = fixture.trace().pop().expect("failure trace");
+    assert_eq!(terminal["fact"]["reason"], "branch-conflicted");
+    assert_eq!(terminal["fact"]["remote_head_sha"], remote_head);
+    assert_eq!(terminal["fact"]["conflicted_paths"], json!(["base.txt"]));
+}
+
+#[test]
+fn cached_token_accounting_and_failure_preservation_use_reported_components() {
+    let completed = Fixture::new(500_000);
+    completed.acquire();
+    let status = completed
+        .command("complete")
+        .env(
+            "FAKE_CODEX_USAGE_JSON",
+            r#"{"type":"turn.completed","usage":{"input_tokens":4360176,"cached_input_tokens":4215296,"output_tokens":22074,"reasoning_output_tokens":0}}"#,
+        )
+        .status()
+        .expect("run cached implementer");
+    assert!(status.success());
+    let terminal = completed.trace().pop().expect("completion trace");
+    assert_eq!(terminal["fact"]["weighted_tokens"], 135_356);
+    assert_eq!(terminal["fact"]["usage"]["fresh_input_tokens"], 144_880);
+    assert_eq!(terminal["fact"]["usage"]["cached_input_tokens"], 4_215_296);
+
+    let failed = Fixture::new(500_000);
+    failed.acquire();
+    let status = failed
+        .command("partial-failure")
+        .env(
+            "FAKE_CODEX_USAGE_JSON",
+            r#"{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":50,"reasoning_output_tokens":10}}"#,
+        )
+        .status()
+        .expect("run failed implementer");
+    assert!(!status.success());
+    let terminal = failed.trace().pop().expect("failure trace");
+    assert_eq!(terminal["fact"]["reason"], "codex-exit-1");
+    assert_eq!(
+        terminal["fact"]["worktree_path"],
+        failed.worktree().display().to_string()
+    );
+}
+
+#[test]
 fn terminated_run_preserves_and_reuses_worktree_without_orphans() {
     let fixture = Fixture::new(100);
     fixture.acquire();
@@ -243,6 +637,7 @@ fn terminated_run_preserves_and_reuses_worktree_without_orphans() {
     assert!(!fixture.lease_file.exists());
     let first = fixture.trace().pop().expect("failure trace");
     assert_eq!(first["fact"]["reason"], "signal-TERM");
+    assert_eq!(first["fact"]["termination_signal"], "SIGKILL");
     let worktree = PathBuf::from(
         first["fact"]["worktree_path"]
             .as_str()

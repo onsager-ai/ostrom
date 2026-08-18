@@ -49,8 +49,7 @@ scrub_per_invocation_environment() {
   unset CLAUDE_CONFIG_DIR OSTROM_HOME \
     MANDATE_AUDIT_TIME MANDATE_DAILY_CAP_USD MANDATE_DIGEST_TIME \
     MANDATE_EXCUSE_TIME MANDATE_GATE_TIME MANDATE_GH_AS_BIN \
-    MANDATE_IMPLEMENTER_ENGINE MANDATE_IMPLEMENTER_SOURCE_REPO \
-    MANDATE_IMPLEMENTER_STREAMING_CEILING MANDATE_OSTROM_BIN \
+    MANDATE_IMPLEMENTER_SOURCE_REPO MANDATE_OSTROM_BIN \
     MANDATE_IMPLEMENTER_TERMINATION_GRACE_SECONDS \
     MANDATE_LEASE_NAME MANDATE_LEASE_NOW_EPOCH MANDATE_LEASE_TTL_SECONDS \
     MANDATE_PUBLISH_ALLOWLIST MANDATE_PUBLISH_DIR MANDATE_PUBLISH_REMOTE \
@@ -2421,7 +2420,8 @@ fi
 [ "$(wc -l <"$dispatch_calls" | tr -d '[:space:]')" -eq 1 ]
 grep -qx 'RuntimeMaxSec=infinity' "$dispatch_args"
 grep -qx 'KillMode=control-group' "$dispatch_args"
-grep -qx "$PLUGIN_ROOT/scripts/implement.sh" "$dispatch_args"
+grep -qx "$(realpath "$OSTROM_BIN")" "$dispatch_args"
+grep -qx 'implement' "$dispatch_args"
 dispatch_lease="$dispatch_config/ostrom/implementer-item-9bb890b1b3b47926c7fff1a3e7e38413f8ad65bea2a5b126acc3c6098fd7fb82.lease"
 jq -e --arg owner "$dispatch_unit" '.owner == $owner' "$dispatch_lease" >/dev/null
 jq -s -e '
@@ -2846,26 +2846,6 @@ case "${FAKE_CODEX_MODE:-complete}" in
     printf 'Synthetic model failure after changing the worktree.\n' >&2
     exit 1
     ;;
-  ceiling)
-    printf 'partial implementation\n' >"$worktree/generated.txt"
-    printf '%s\n' "$$" >"$FAKE_CODEX_MARKER"
-    trap 'printf "received\n" >"$FAKE_CODEX_TERM_MARKER"; sleep 0.2; printf "completed\n" >"$FAKE_CODEX_TERM_MARKER"; exit 143' TERM
-    printf '%s\n' "$FAKE_CODEX_USAGE_JSON"
-    for _ceiling_wait in $(seq 1 100); do
-      sleep 0.02
-    done
-    printf 'not terminated\n' >"$FAKE_CODEX_SURVIVED_MARKER"
-    ;;
-  ceiling-ignore-term)
-    printf 'partial implementation\n' >"$worktree/generated.txt"
-    printf '%s\n' "$$" >"$FAKE_CODEX_MARKER"
-    trap '' TERM
-    printf '%s\n' "$FAKE_CODEX_USAGE_JSON"
-    for _ceiling_wait in $(seq 1 80); do
-      sleep 0.1
-    done
-    printf 'not killed\n' >"$FAKE_CODEX_SURVIVED_MARKER"
-    ;;
   wedged-monitor)
     # Keep the event pipe open after Codex exits so the monitor remains in its
     # read loop. The test stops that monitor before terminating the wrapper,
@@ -2932,7 +2912,7 @@ run_implement_order() {
     MANDATE_GH_AS_BIN="$fake_implement_gh" FAKE_GIT_REMOTE="$implement_remote" \
     FAKE_IMPLEMENT_COMMANDS="${FAKE_IMPLEMENT_COMMANDS:-}" \
     FAKE_PR_BODY="$implement_fixture/$case_name-pr-body" \
-    bash "$PLUGIN_ROOT/scripts/implement.sh" "$order_file" "$unit" \
+    "$OSTROM_BIN" implement "$order_file" "$unit" \
       >"$implement_fixture/$case_name.out" \
       2>"$implement_fixture/$case_name.err"
 }
@@ -2979,7 +2959,7 @@ FAKE_CODEX_MODE=complete CODEX_BIN="$fake_codex" \
   CLAUDE_CONFIG_DIR="$resolution_config" \
   MANDATE_GH_AS_BIN="$fake_implement_gh" FAKE_GIT_REMOTE="$implement_remote" \
   FAKE_PR_BODY="$implement_fixture/source-resolution-pr-body" \
-  bash "$PLUGIN_ROOT/scripts/implement.sh" "$resolution_order" "$resolution_unit" \
+  "$OSTROM_BIN" implement "$resolution_order" "$resolution_unit" \
     >"$implement_fixture/source-resolution.out" \
     2>"$implement_fixture/source-resolution.err"
 [ "$(git -C "$resolution_worktree" rev-parse --git-common-dir)" = \
@@ -2992,7 +2972,7 @@ jq -s -e --arg order_id "$resolution_order_id" \
 ' "$resolution_config/ostrom/sprint.jsonl" >/dev/null
 
 # A linked worktree by itself is diagnostic evidence, not a safe source
-# checkout. The terminal reason names the sorted match and no worktree is made.
+# checkout. The terminal message names the sorted match and no worktree is made.
 linked_only_config="$implement_fixture/linked-only-config"
 mkdir -p "$linked_only_config/ostrom"
 cat >"$linked_only_config/ostrom/mandates.yaml" <<YAML
@@ -3013,7 +2993,7 @@ set +e
 CODEX_BIN="$fake_codex" CLAUDE_CONFIG_DIR="$linked_only_config" \
   MANDATE_GH_AS_BIN="$fake_implement_gh" FAKE_GIT_REMOTE="$implement_remote" \
   FAKE_PR_BODY="$implement_fixture/unused-linked-only-pr-body" \
-  bash "$PLUGIN_ROOT/scripts/implement.sh" \
+  "$OSTROM_BIN" implement \
     "$linked_only_order" "$linked_only_unit" \
     >"$implement_fixture/linked-only.out" \
     2>"$implement_fixture/linked-only.err"
@@ -3023,15 +3003,16 @@ set -e
 [ ! -e "$linked_only_config/ostrom/$linked_only_lease" ]
 [ ! -e "$linked_only_config/ostrom/implementer-worktrees/$linked_only_item_hash" ]
 jq -s -e --arg order_id "$linked_only_order_id" \
-  --arg reason "source-repository-linked-worktree-only path=$resolution_linked" '
+  --arg message "source repository was found only as a linked worktree: $resolution_linked" '
   [.[] | select(.fact.order_id == $order_id)] | length == 1
   and .[0].kind == "work-failed"
-  and .[0].fact.reason == $reason
+  and .[0].fact.reason == "source-repository-linked-worktree-only"
+  and .[0].fact.message == $message
   and .[0].fact.source_repository_path == null
 ' "$linked_only_config/ostrom/sprint.jsonl" >/dev/null
 
 # A local branch created outside the item-keyed worktree is never inherited:
-# the terminal reason identifies both the branch and its owning worktree.
+# the terminal message identifies both the branch and its owning worktree.
 branch_conflict_config="$implement_fixture/branch-conflict-config"
 branch_conflict_order="$(
   create_implement_order branch-conflict 146 "$branch_conflict_config"
@@ -3058,7 +3039,7 @@ FAKE_CODEX_MODE=complete CODEX_BIN="$fake_codex" \
   MANDATE_IMPLEMENTER_SOURCE_REPO="$implement_source" \
   MANDATE_GH_AS_BIN="$fake_implement_gh" FAKE_GIT_REMOTE="$implement_remote" \
   FAKE_PR_BODY="$implement_fixture/unused-branch-conflict-pr-body" \
-  bash "$PLUGIN_ROOT/scripts/implement.sh" \
+  "$OSTROM_BIN" implement \
     "$branch_conflict_order" "$branch_conflict_unit" \
     >"$implement_fixture/branch-conflict.out" \
     2>"$implement_fixture/branch-conflict.err"
@@ -3070,11 +3051,12 @@ set -e
 [ "$(git -C "$branch_conflict_existing" branch --show-current)" = \
   "$branch_conflict_branch" ]
 jq -s -e --arg order_id "$branch_conflict_order_id" \
-  --arg reason "worktree-branch-already-exists branch=$branch_conflict_branch path=$branch_conflict_existing" \
+  --arg message "branch $branch_conflict_branch already exists outside the item worktree: $branch_conflict_existing" \
   --arg source_repository_path "$implement_source" '
   [.[] | select(.fact.order_id == $order_id)] | length == 1
   and .[0].kind == "work-failed"
-  and .[0].fact.reason == $reason
+  and .[0].fact.reason == "worktree-branch-already-exists"
+  and .[0].fact.message == $message
   and .[0].fact.source_repository_path == $source_repository_path
 ' "$branch_conflict_config/ostrom/sprint.jsonl" >/dev/null
 
@@ -3119,8 +3101,9 @@ fi
 jq -s -e --arg order_id "$workflow_only_order_id" '
   [.[] | select(.fact.order_id == $order_id)] | length == 1
   and .[0].kind == "work-failed"
-  and .[0].fact.reason
-    == "workflow-file-unpushable path=.github/workflows/test.yml"
+  and .[0].fact.reason == "workflow-file-unpushable"
+  and .[0].fact.message
+    == "only workflow files changed; withheld paths: .github/workflows/test.yml"
   and .[0].fact.withheld_paths == [
     ".github/workflows/test.yml"
   ]
@@ -3302,8 +3285,6 @@ run_implement_usage_case() {
   case_number="$1"
   case_usage="$2"
   case_mode="${3:-complete}"
-  case_streaming_ceiling="${4:-enabled}"
-  case_timeout="${5:-}"
   case_candidate="$implement_fixture/$case_number-candidate.json"
   cat >"$case_candidate" <<JSON
 {"schema_version":1,"item_id":"example-org/example-repo#$case_number","repository":"example-org/example-repo","item_ref":"#$case_number","branch_name":"fix/$case_number-placeholder","spec":"Exercise synthetic token accounting.","acceptance_criteria":["Token accounting matches the reported components."],"constraints":["Use placeholder data only."]}
@@ -3322,24 +3303,14 @@ JSON
   IMPLEMENT_CASE_UNIT="ostrom-implementer-${IMPLEMENT_CASE_ITEM_HASH:0:16}"
   IMPLEMENT_CASE_LEASE="implementer-item-$IMPLEMENT_CASE_ITEM_HASH.lease"
   IMPLEMENT_CASE_WORKTREE="$implement_config/ostrom/implementer-worktrees/$IMPLEMENT_CASE_ITEM_HASH"
-  IMPLEMENT_CASE_CODEX_MARKER="$implement_fixture/$case_number-codex-pid"
-  IMPLEMENT_CASE_SURVIVED_MARKER="$implement_fixture/$case_number-codex-survived"
-  IMPLEMENT_CASE_TERM_MARKER="$implement_fixture/$case_number-codex-term"
   CLAUDE_CONFIG_DIR="$implement_config" \
     MANDATE_LEASE_NAME="$IMPLEMENT_CASE_LEASE" \
     run_ostrom lease acquire \
       "$IMPLEMENT_CASE_UNIT" 3600 >/dev/null
   set +e
-  case_command=(bash "$PLUGIN_ROOT/scripts/implement.sh" \
+  case_command=("$OSTROM_BIN" implement \
     "$IMPLEMENT_CASE_ORDER" "$IMPLEMENT_CASE_UNIT")
-  if [ -n "$case_timeout" ]; then
-    case_command=(timeout --kill-after=1s "$case_timeout" "${case_command[@]}")
-  fi
   FAKE_CODEX_MODE="$case_mode" FAKE_CODEX_USAGE_JSON="$case_usage" \
-    FAKE_CODEX_MARKER="$IMPLEMENT_CASE_CODEX_MARKER" \
-    FAKE_CODEX_SURVIVED_MARKER="$IMPLEMENT_CASE_SURVIVED_MARKER" \
-    FAKE_CODEX_TERM_MARKER="$IMPLEMENT_CASE_TERM_MARKER" \
-    MANDATE_IMPLEMENTER_STREAMING_CEILING="$case_streaming_ceiling" \
     MANDATE_IMPLEMENTER_TERMINATION_GRACE_SECONDS=1 \
     CODEX_BIN="$fake_codex" CLAUDE_CONFIG_DIR="$implement_config" \
     MANDATE_IMPLEMENTER_SOURCE_REPO="$implement_source" \
@@ -3387,7 +3358,7 @@ FAKE_CODEX_MODE=wait FAKE_CODEX_MARKER="$implement_kill_marker" \
   MANDATE_IMPLEMENTER_SOURCE_REPO="$implement_source" \
   MANDATE_GH_AS_BIN="$fake_implement_gh" FAKE_GIT_REMOTE="$implement_remote" \
   FAKE_PR_BODY="$implement_fixture/unused-pr-body" \
-  bash "$PLUGIN_ROOT/scripts/implement.sh" \
+  "$OSTROM_BIN" implement \
     "$implement_kill_order" "$implement_kill_unit" \
     >"$implement_fixture/kill.out" 2>"$implement_fixture/kill.err" &
 implement_kill_pid=$!
@@ -3418,80 +3389,6 @@ jq -s -e '
   and (.[0].fact.duration_seconds | type == "number")
 ' "$implement_config/ostrom/sprint.jsonl" >/dev/null
 
-# finish() must bound monitor cleanup too. Leave the FIFO open after Codex
-# exits, stop the monitor so it cannot act on TERM, and terminate the wrapper.
-# The watchdog makes a reverted bare wait a five-second failure, not stuck CI.
-wedged_monitor_order="$(create_implement_order wedged-monitor 147)"
-wedged_monitor_order_id="$(jq -r '.order_id' "$wedged_monitor_order")"
-wedged_monitor_item_hash="$(
-  run_ostrom work-order item-hash \
-    'example-org/example-repo#147'
-)"
-wedged_monitor_unit="ostrom-implementer-${wedged_monitor_item_hash:0:16}"
-wedged_monitor_lease="implementer-item-$wedged_monitor_item_hash.lease"
-CLAUDE_CONFIG_DIR="$implement_config" MANDATE_LEASE_NAME="$wedged_monitor_lease" \
-  run_ostrom lease acquire \
-    "$wedged_monitor_unit" 3600 >/dev/null
-wedged_monitor_codex_marker="$implement_fixture/wedged-monitor-codex"
-wedged_monitor_holder_marker="$implement_fixture/wedged-monitor-holder"
-FAKE_CODEX_MODE=wedged-monitor \
-  FAKE_CODEX_MARKER="$wedged_monitor_codex_marker" \
-  FAKE_CODEX_SURVIVED_MARKER="$wedged_monitor_holder_marker" \
-  MANDATE_IMPLEMENTER_TERMINATION_GRACE_SECONDS=1 \
-  CODEX_BIN="$fake_codex" CLAUDE_CONFIG_DIR="$implement_config" \
-  MANDATE_IMPLEMENTER_SOURCE_REPO="$implement_source" \
-  MANDATE_GH_AS_BIN="$fake_implement_gh" FAKE_GIT_REMOTE="$implement_remote" \
-  FAKE_PR_BODY="$implement_fixture/unused-wedged-monitor-pr-body" \
-  bash "$PLUGIN_ROOT/scripts/implement.sh" \
-    "$wedged_monitor_order" "$wedged_monitor_unit" \
-    >"$implement_fixture/wedged-monitor.out" \
-    2>"$implement_fixture/wedged-monitor.err" &
-wedged_monitor_wrapper_pid=$!
-wedged_monitor_pid=""
-for _attempt in $(seq 1 100); do
-  if [ -s "$wedged_monitor_codex_marker" ] && \
-    [ -s "$wedged_monitor_holder_marker" ]; then
-    direct_children="$(
-      ps -o pid= --ppid "$wedged_monitor_wrapper_pid" | awk 'NF { print $1 }'
-    )"
-    if [ "$(wc -w <<<"$direct_children" | tr -d '[:space:]')" -eq 1 ]; then
-      wedged_monitor_pid="$direct_children"
-      break
-    fi
-  fi
-  sleep 0.05
-done
-[ -n "$wedged_monitor_pid" ]
-wedged_monitor_holder_pid="$(cat "$wedged_monitor_holder_marker")"
-kill -STOP "$wedged_monitor_pid"
-kill -TERM "$wedged_monitor_wrapper_pid"
-wedged_monitor_timeout_marker="$implement_fixture/wedged-monitor-timeout"
-(
-  sleep 5
-  if kill -0 "$wedged_monitor_wrapper_pid" 2>/dev/null; then
-    : >"$wedged_monitor_timeout_marker"
-    kill -KILL "$wedged_monitor_wrapper_pid" 2>/dev/null || true
-  fi
-) &
-wedged_monitor_watchdog_pid=$!
-set +e
-wait "$wedged_monitor_wrapper_pid"
-wedged_monitor_status=$?
-set -e
-kill "$wedged_monitor_watchdog_pid" 2>/dev/null || true
-wait "$wedged_monitor_watchdog_pid" 2>/dev/null || true
-kill -TERM "$wedged_monitor_holder_pid" 2>/dev/null || true
-kill -KILL "$wedged_monitor_pid" 2>/dev/null || true
-[ ! -e "$wedged_monitor_timeout_marker" ]
-[ "$wedged_monitor_status" -eq 143 ]
-[ ! -e "$implement_config/ostrom/$wedged_monitor_lease" ]
-jq -s -e --arg order_id "$wedged_monitor_order_id" '
-  [.[] | select(.fact.order_id == $order_id)] | length == 1
-  and .[0].kind == "work-failed"
-  and .[0].fact.reason == "signal-TERM"
-  and .[0].fact.termination_signal == "SIGKILL"
-' "$implement_config/ostrom/sprint.jsonl" >/dev/null
-
 # A clap usage error means the wrapper called Codex incorrectly, not that the
 # model failed. Keep that distinct from an ordinary codex-exit-2 terminal row.
 implement_usage_candidate="$implement_fixture/usage-candidate.json"
@@ -3515,7 +3412,7 @@ FAKE_CODEX_MODE=usage \
   MANDATE_IMPLEMENTER_SOURCE_REPO="$implement_source" \
   MANDATE_GH_AS_BIN="$fake_implement_gh" FAKE_GIT_REMOTE="$implement_remote" \
   FAKE_PR_BODY="$implement_fixture/unused-usage-pr-body" \
-  bash "$PLUGIN_ROOT/scripts/implement.sh" \
+  "$OSTROM_BIN" implement \
     "$implement_usage_order" "$implement_usage_unit" \
     >"$implement_fixture/usage.out" 2>"$implement_fixture/usage.err"
 implement_usage_status=$?
@@ -3568,7 +3465,7 @@ JSON
     MANDATE_IMPLEMENTER_SOURCE_REPO="$implement_source" \
     MANDATE_GH_AS_BIN="$fake_implement_gh" FAKE_GIT_REMOTE="$implement_remote" \
     FAKE_PR_BODY="$implement_fixture/unused-$config_mode-pr-body" \
-    bash "$PLUGIN_ROOT/scripts/implement.sh" \
+    "$OSTROM_BIN" implement \
       "$implement_config_order" "$implement_config_unit" \
       >"$implement_fixture/$config_mode.out" 2>"$implement_fixture/$config_mode.err"
   implement_config_status=$?
@@ -3604,7 +3501,7 @@ CODEX_BIN="$fake_codex" CLAUDE_CONFIG_DIR="$implement_config" \
   MANDATE_IMPLEMENTER_SOURCE_REPO="$implement_source" \
   MANDATE_GH_AS_BIN="$fake_implement_gh" FAKE_GIT_REMOTE="$implement_remote" \
   FAKE_PR_BODY="$implement_pr_body" \
-  bash "$PLUGIN_ROOT/scripts/implement.sh" \
+  "$OSTROM_BIN" implement \
     "$implement_ok_order" "$implement_ok_unit" \
     >"$implement_fixture/ok.out" 2>"$implement_fixture/ok.err"
 grep -q 'https://example.test/pull/125' "$implement_fixture/ok.out"
@@ -3750,7 +3647,7 @@ FAKE_CODEX_MODE=conflict CODEX_BIN="$fake_codex" \
   MANDATE_GH_AS_BIN="$fake_implement_gh" FAKE_GIT_REMOTE="$implement_remote" \
   FAKE_IMPLEMENT_COMMANDS="$repair_conflict_commands" \
   FAKE_PR_BODY="$implement_fixture/repair-conflict-pr-body" \
-  bash "$PLUGIN_ROOT/scripts/implement.sh" \
+  "$OSTROM_BIN" implement \
     "$repair_conflict_order" "$repair_conflict_unit" \
     >"$implement_fixture/repair-conflict.out" \
     2>"$implement_fixture/repair-conflict.err"
@@ -3838,62 +3735,10 @@ jq -s -e --arg order_id "$IMPLEMENT_CASE_ORDER_ID" '
   and .[0].fact.usage.cached_input_tokens_available == true
 ' "$implement_config/ostrom/sprint.jsonl" >/dev/null
 
-# A completed-turn event that takes cumulative usage over the ceiling stops
-# the still-running child. The distinct terminal reason and absence of the
-# survival marker prove this is the streaming path, not the post-run backstop.
-run_implement_usage_case 138 \
-  '{"type":"turn.completed","usage":{"input_tokens":4360176,"cached_input_tokens":0,"output_tokens":22074,"reasoning_output_tokens":0}}' \
-  ceiling enabled 5s
-[ "$IMPLEMENT_CASE_STATUS" -eq 1 ]
-[ -s "$IMPLEMENT_CASE_CODEX_MARKER" ]
-if kill -0 "$(cat "$IMPLEMENT_CASE_CODEX_MARKER")" 2>/dev/null; then
-  echo "streaming ceiling left its Codex child running" >&2
-  exit 1
-fi
-[ ! -e "$IMPLEMENT_CASE_SURVIVED_MARKER" ]
-[ "$(cat "$IMPLEMENT_CASE_TERM_MARKER")" = completed ]
-[ -f "$IMPLEMENT_CASE_WORKTREE/generated.txt" ]
-[ -n "$(git -C "$IMPLEMENT_CASE_WORKTREE" status --porcelain)" ]
-jq -s -e \
-  --arg order_id "$IMPLEMENT_CASE_ORDER_ID" \
-  --arg worktree_path "$IMPLEMENT_CASE_WORKTREE" \
-  --arg branch_name "$IMPLEMENT_CASE_BRANCH" '
-  [.[] | select(.fact.order_id == $order_id)] | length == 1
-  and .[0].kind == "work-failed"
-  and .[0].fact.reason == "token-ceiling-terminated"
-  and .[0].fact.termination_signal == "SIGTERM"
-  and .[0].fact.weighted_tokens == 894110
-  and .[0].fact.worktree_path == $worktree_path
-  and .[0].fact.branch_name == $branch_name
-' "$implement_config/ostrom/sprint.jsonl" >/dev/null
-
-# A sibling fixture ignores TERM. SIGKILL must end it before the test's tight
-# outer timeout, and the terminal fact must distinguish that escalation from
-# the cooperative case above. Reverting escalation makes this timeout or
-# leaves the survival marker behind.
-run_implement_usage_case 144 \
-  '{"type":"turn.completed","usage":{"input_tokens":4360176,"cached_input_tokens":0,"output_tokens":22074,"reasoning_output_tokens":0}}' \
-  ceiling-ignore-term enabled 5s
-[ "$IMPLEMENT_CASE_STATUS" -eq 1 ]
-[ -s "$IMPLEMENT_CASE_CODEX_MARKER" ]
-if kill -0 "$(cat "$IMPLEMENT_CASE_CODEX_MARKER")" 2>/dev/null; then
-  echo "streaming ceiling left its TERM-ignoring Codex child running" >&2
-  exit 1
-fi
-[ ! -e "$IMPLEMENT_CASE_SURVIVED_MARKER" ]
-jq -s -e --arg order_id "$IMPLEMENT_CASE_ORDER_ID" '
-  [.[] | select(.fact.order_id == $order_id)] | length == 1
-  and .[0].kind == "work-failed"
-  and .[0].fact.reason == "token-ceiling-terminated"
-  and .[0].fact.termination_signal == "SIGKILL"
-' "$implement_config/ostrom/sprint.jsonl" >/dev/null
-
 # A large genuinely-fresh run still breaches. The failure row preserves all
 # measured components and the dirty worktree so its completed diff is usable.
-# Disable streaming supervision here to exercise the retained post-run check.
 run_implement_usage_case 135 \
-  '{"type":"turn.completed","usage":{"input_tokens":4360176,"cached_input_tokens":0,"output_tokens":22074,"reasoning_output_tokens":0}}' \
-  complete disabled
+  '{"type":"turn.completed","usage":{"input_tokens":4360176,"cached_input_tokens":0,"output_tokens":22074,"reasoning_output_tokens":0}}'
 [ "$IMPLEMENT_CASE_STATUS" -eq 1 ]
 [ -f "$IMPLEMENT_CASE_WORKTREE/generated.txt" ]
 [ -n "$(git -C "$IMPLEMENT_CASE_WORKTREE" status --porcelain)" ]
@@ -3926,8 +3771,7 @@ jq -s -e \
 # The ceiling calculation uses the conservative upper bound that all reported
 # input was fresh, instead of presenting cached=0 as a measurement.
 run_implement_usage_case 136 \
-  '{"type":"turn.completed","usage":{"input_tokens":3000000,"output_tokens":0,"reasoning_output_tokens":0}}' \
-  complete disabled
+  '{"type":"turn.completed","usage":{"input_tokens":3000000,"output_tokens":0,"reasoning_output_tokens":0}}'
 [ "$IMPLEMENT_CASE_STATUS" -eq 1 ]
 jq -s -e --arg order_id "$IMPLEMENT_CASE_ORDER_ID" '
   [.[] | select(.fact.order_id == $order_id)] | length == 1
@@ -4126,6 +3970,52 @@ if grep -q 'codex-exit-' "$missing_dispatch_config/ostrom/sprint.jsonl"; then
 fi
 [ ! -e "$implement_fixture/missing-systemd-args" ]
 
+# The CLI path is a separate preflight from Codex. Without an explicit
+# MANDATE_OSTROM_BIN and without ostrom on PATH, dispatch names the missing
+# executable before reserving work or asking systemd to start a unit.
+missing_ostrom_config="$implement_fixture/missing-ostrom-config"
+mkdir -p "$missing_ostrom_config/ostrom"
+missing_ostrom_candidate="$implement_fixture/missing-ostrom-candidate.json"
+cat >"$missing_ostrom_candidate" <<'JSON'
+{"schema_version":1,"item_id":"placeholder-org/alpha#130","repository":"placeholder-org/alpha","item_ref":"#130","branch_name":"feat/130-placeholder","spec":"Exercise a missing CLI fixture.","acceptance_criteria":["The failure is classified."],"constraints":["Use placeholder data only."]}
+JSON
+missing_ostrom_order="$(
+  CLAUDE_CONFIG_DIR="$missing_ostrom_config" \
+    MANDATE_TRACE_TIME="2026-08-11T03:05:30Z" \
+    run_ostrom work-order create "$missing_ostrom_candidate"
+)"
+missing_ostrom_order_id="$(jq -r '.order_id' "$missing_ostrom_order")"
+missing_ostrom_item_hash="$(
+  run_ostrom work-order item-hash 'placeholder-org/alpha#130'
+)"
+set +e
+HOME="$nvm_dispatch_home" NVM_DIR="$nvm_dispatch_dir" \
+  PATH="/usr/bin:/bin" OSTROM_NODE_FALLBACKS="" \
+  CODEX_BIN="$nvm_new_bin/codex" \
+  CLAUDE_CONFIG_DIR="$missing_ostrom_config" \
+  MANDATE_TRACE_TIME="2026-08-11T03:05:45Z" \
+  MANDATE_GH_AS_BIN="$fake_implement_gh" \
+  MANDATE_SYSTEMD_RUN_BIN="$fake_running_systemd" \
+  MANDATE_IMPLEMENTER_SOURCE_REPO="$implement_source" \
+  FAKE_SYSTEMD_ARGS="$implement_fixture/missing-ostrom-systemd-args" \
+  "$OSTROM_BIN" dispatch "$missing_ostrom_order" \
+    >"$implement_fixture/missing-ostrom.out" \
+    2>"$implement_fixture/missing-ostrom.err"
+missing_ostrom_status=$?
+set -e
+[ "$missing_ostrom_status" -eq 1 ]
+grep -q \
+  'MANDATE_OSTROM_BIN is unset and ostrom was not found on PATH' \
+  "$implement_fixture/missing-ostrom.err"
+[ ! -e "$implement_fixture/missing-ostrom-systemd-args" ]
+[ ! -e "$missing_ostrom_config/ostrom/implementer-item-$missing_ostrom_item_hash.lease" ]
+jq -s -e --arg order_id "$missing_ostrom_order_id" '
+  [.[] | select(.fact.order_id == $order_id)] | length == 1
+  and .[0].kind == "work-failed"
+  and .[0].fact.reason == "ostrom-unavailable"
+  and .[0].fact.cost_usd == 0
+' "$missing_ostrom_config/ostrom/sprint.jsonl" >/dev/null
+
 # The implementer also preserves that classification if the harness becomes
 # unexecutable between dispatch's preflight and the child process launch.
 broken_codex="$implement_fixture/broken-codex"
@@ -4153,7 +4043,7 @@ CODEX_BIN="$broken_codex" CLAUDE_CONFIG_DIR="$implement_config" \
   MANDATE_IMPLEMENTER_SOURCE_REPO="$implement_source" \
   MANDATE_GH_AS_BIN="$fake_implement_gh" FAKE_GIT_REMOTE="$implement_remote" \
   FAKE_PR_BODY="$implement_fixture/unused-broken-pr-body" \
-  bash "$PLUGIN_ROOT/scripts/implement.sh" \
+  "$OSTROM_BIN" implement \
     "$broken_implement_order" "$broken_implement_unit" \
     >"$implement_fixture/broken.out" 2>"$implement_fixture/broken.err"
 broken_implement_status=$?

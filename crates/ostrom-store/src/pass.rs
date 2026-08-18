@@ -755,6 +755,8 @@ pub(crate) fn terminate_child_process_group(child: &mut Child, grace: Duration) 
     let _ = Command::new(kill_command())
         .args(["-KILL", "--", &group])
         .status();
+    // KILL escalation is the operationally significant outcome even if one
+    // member of the process group had already stopped cooperatively on TERM.
     Some("SIGKILL".to_owned())
 }
 
