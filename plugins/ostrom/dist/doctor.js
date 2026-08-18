@@ -1,10 +1,10 @@
 // src/doctor.ts
-import { dirname as dirname2, resolve } from "node:path";
+import { dirname as dirname3, resolve as resolve2 } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // src/lib/doctor.ts
-import { existsSync as existsSync5, readFileSync as readFileSync7 } from "node:fs";
-import { join as join9 } from "node:path";
+import { existsSync as existsSync6, readFileSync as readFileSync8 } from "node:fs";
+import { join as join10 } from "node:path";
 
 // src/checks/rules.ts
 import { statSync } from "node:fs";
@@ -172,7 +172,7 @@ function inspectMarketplace(context) {
   }
   const fetch = git(marketplaceDir, ["fetch", "origin", "main"]);
   if (fetch.status !== 0) {
-    const firstLine = `${fetch.stdout}${fetch.stderr}`.split(/\r?\n/, 1)[0] ?? "";
+    const firstLine2 = `${fetch.stdout}${fetch.stderr}`.split(/\r?\n/, 1)[0] ?? "";
     const inspection2 = {
       directory: marketplaceDir,
       cloneAvailable: true,
@@ -180,7 +180,7 @@ function inspectMarketplace(context) {
       result: {
         status: "WARN",
         name: "marketplace",
-        detail: `cannot verify freshness, git fetch failed (offline?): ${firstLine}`,
+        detail: `cannot verify freshness, git fetch failed (offline?): ${firstLine2}`,
         remedy: ""
       }
     };
@@ -1310,6 +1310,256 @@ function checkPublish(context) {
   };
 }
 
+// src/checks/cli.ts
+import { spawnSync as spawnSync3 } from "node:child_process";
+import { createRequire } from "node:module";
+import {
+  accessSync as accessSync2,
+  closeSync,
+  constants as constants2,
+  existsSync as existsSync5,
+  openSync,
+  readFileSync as readFileSync7,
+  readSync,
+  realpathSync as realpathSync2,
+  statSync as statSync5
+} from "node:fs";
+import { delimiter, dirname as dirname2, join as join9, resolve } from "node:path";
+var INSTALL_COMMAND = "npm install -g @ostrom/cli";
+var UPGRADE_COMMAND = "npm update -g @ostrom/cli";
+function parseSemVer(value) {
+  const match = value.match(
+    /^(?:v)?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/
+  );
+  if (!match) return void 0;
+  return {
+    major: Number(match[1]),
+    minor: Number(match[2]),
+    patch: Number(match[3]),
+    prerelease: match[4]?.split(".") ?? []
+  };
+}
+function compareIdentifiers(left, right) {
+  const leftNumeric = /^\d+$/.test(left);
+  const rightNumeric = /^\d+$/.test(right);
+  if (leftNumeric && rightNumeric) return Number(left) - Number(right);
+  if (leftNumeric) return -1;
+  if (rightNumeric) return 1;
+  return left.localeCompare(right);
+}
+function compareSemVer(left, right) {
+  for (const key of ["major", "minor", "patch"]) {
+    const difference = left[key] - right[key];
+    if (difference !== 0) return difference;
+  }
+  if (left.prerelease.length === 0 && right.prerelease.length === 0) return 0;
+  if (left.prerelease.length === 0) return 1;
+  if (right.prerelease.length === 0) return -1;
+  const length = Math.max(left.prerelease.length, right.prerelease.length);
+  for (let index = 0; index < length; index += 1) {
+    const leftIdentifier = left.prerelease[index];
+    const rightIdentifier = right.prerelease[index];
+    if (leftIdentifier === void 0) return -1;
+    if (rightIdentifier === void 0) return 1;
+    const difference = compareIdentifiers(leftIdentifier, rightIdentifier);
+    if (difference !== 0) return difference;
+  }
+  return 0;
+}
+function executableNames(env) {
+  if (process.platform !== "win32") return ["ostrom"];
+  const extensions = (env.PATHEXT ?? ".EXE;.CMD;.BAT;.COM").split(";").filter(Boolean);
+  return ["ostrom", ...extensions.map((extension) => `ostrom${extension}`)];
+}
+function firstLine(path) {
+  const descriptor = openSync(path, "r");
+  try {
+    const buffer = Buffer.alloc(256);
+    const bytesRead = readSync(descriptor, buffer, 0, buffer.length, 0);
+    return buffer.subarray(0, bytesRead).toString("utf8").split(/\r?\n/, 1)[0] ?? "";
+  } finally {
+    closeSync(descriptor);
+  }
+}
+function resolveOnPath(context) {
+  const path = context.env.PATH ?? context.env.Path ?? context.env.path ?? "";
+  for (const directory of path.split(delimiter)) {
+    for (const name of executableNames(context.env)) {
+      const candidate = resolve(context.cwd, directory || ".", name);
+      try {
+        if (!statSync5(candidate).isFile()) continue;
+        accessSync2(candidate, constants2.X_OK);
+        return candidate;
+      } catch {
+      }
+    }
+  }
+  return void 0;
+}
+function nativeBinary(realPath) {
+  try {
+    const manifest = JSON.parse(
+      readFileSync7(join9(dirname2(realPath), "package.json"), "utf8")
+    );
+    const packageName = manifest.ostrom?.platformPackages?.[`${process.platform}-${process.arch}`];
+    if (!packageName) return void 0;
+    const require2 = createRequire(realPath);
+    const platformManifestPath = require2.resolve(`${packageName}/package.json`);
+    const platformManifest = JSON.parse(
+      readFileSync7(platformManifestPath, "utf8")
+    );
+    if (typeof platformManifest.main !== "string") return void 0;
+    const candidate = join9(dirname2(platformManifestPath), platformManifest.main);
+    accessSync2(candidate, constants2.X_OK);
+    return candidate;
+  } catch {
+    return void 0;
+  }
+}
+function probeCli(context) {
+  const resolvedPath = resolveOnPath(context);
+  if (!resolvedPath) return { nodeLauncher: false };
+  try {
+    const realPath = realpathSync2(resolvedPath);
+    const nodeLauncher = /^#!\s*\/usr\/bin\/env(?:\s+-S)?\s+node(?:\s|$)/.test(
+      firstLine(realPath)
+    );
+    const probe = {
+      resolvedPath,
+      realPath,
+      nodeLauncher
+    };
+    const nativePath = nodeLauncher ? nativeBinary(realPath) : void 0;
+    if (nativePath) probe.nativePath = nativePath;
+    return probe;
+  } catch {
+    return { resolvedPath, nodeLauncher: false };
+  }
+}
+function minimumCliVersion(context) {
+  try {
+    const manifest = JSON.parse(
+      readFileSync7(
+        join9(context.pluginRoot, ".claude-plugin", "plugin.json"),
+        "utf8"
+      )
+    );
+    return typeof manifest.minimumCliVersion === "string" ? manifest.minimumCliVersion : void 0;
+  } catch {
+    return void 0;
+  }
+}
+function reportedVersion(output) {
+  const match = output.match(
+    /(?:^|\s)(v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)(?=\s|$)/
+  )?.[1];
+  return match?.replace(/^v/, "");
+}
+function checkCliInstalled(context) {
+  const probe = probeCli(context);
+  if (!probe.resolvedPath) {
+    return {
+      status: "FAIL",
+      name: "cli-installed",
+      detail: "ostrom is not installed or is absent from PATH",
+      remedy: INSTALL_COMMAND
+    };
+  }
+  return {
+    status: "OK",
+    name: "cli-installed",
+    detail: "ostrom found on PATH",
+    remedy: ""
+  };
+}
+function checkCliVersion(context) {
+  const probe = probeCli(context);
+  if (!probe.resolvedPath) {
+    return {
+      status: "OK",
+      name: "cli-version",
+      detail: "not checked because ostrom is absent",
+      remedy: ""
+    };
+  }
+  const required = minimumCliVersion(context);
+  const requiredVersion = required ? parseSemVer(required) : void 0;
+  if (!required || !requiredVersion) {
+    return {
+      status: "FAIL",
+      name: "cli-version",
+      detail: "plugin manifest has no valid minimumCliVersion",
+      remedy: "repair the installed ostrom plugin manifest"
+    };
+  }
+  const versionExecutable = probe.nativePath ?? probe.resolvedPath;
+  const result = spawnSync3(versionExecutable, ["--version"], {
+    cwd: context.cwd,
+    env: context.env,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: 5e3
+  });
+  const installed = reportedVersion(`${result.stdout ?? ""}
+${result.stderr ?? ""}`);
+  const installedVersion = installed ? parseSemVer(installed) : void 0;
+  if (result.status !== 0 || !installed || !installedVersion) {
+    return {
+      status: "FAIL",
+      name: "cli-version",
+      detail: `ostrom resolves at ${probe.resolvedPath}, but its version could not be read`,
+      remedy: UPGRADE_COMMAND
+    };
+  }
+  if (compareSemVer(installedVersion, requiredVersion) < 0) {
+    return {
+      status: "FAIL",
+      name: "cli-version",
+      detail: `installed ostrom CLI version ${installed} is older than required ${required}`,
+      remedy: UPGRADE_COMMAND
+    };
+  }
+  return {
+    status: "OK",
+    name: "cli-version",
+    detail: `installed version ${installed} satisfies required ${required}`,
+    remedy: ""
+  };
+}
+function checkCliLauncher(context) {
+  const probe = probeCli(context);
+  if (!probe.resolvedPath) {
+    return {
+      status: "OK",
+      name: "cli-launcher",
+      detail: "not checked because ostrom is absent",
+      remedy: ""
+    };
+  }
+  if (!probe.nodeLauncher) {
+    return {
+      status: "OK",
+      name: "cli-launcher",
+      detail: "resolved executable is not a Node launcher",
+      remedy: ""
+    };
+  }
+  if (probe.nativePath && existsSync5(probe.nativePath)) {
+    return {
+      status: "WARN",
+      name: "cli-launcher",
+      detail: `ostrom resolves to the Node launcher at ${probe.resolvedPath}; native binary is ${probe.nativePath}`,
+      remedy: `configure non-interactive units to invoke ${probe.nativePath} directly`
+    };
+  }
+  return {
+    status: "WARN",
+    name: "cli-launcher",
+    detail: `ostrom resolves to the Node launcher at ${probe.resolvedPath}, but its native binary could not be resolved`,
+    remedy: `${INSTALL_COMMAND} (without --no-optional or --omit=optional)`
+  };
+}
+
 // src/lib/result.ts
 function sanitize(value) {
   return value.replace(/[\r\n]/g, " ").replaceAll("|", "/");
@@ -1328,13 +1578,13 @@ function createTraceReader(configDir2) {
   let cached;
   return () => {
     if (cached) return cached;
-    const path = join9(configDir2, "ostrom", "sprint.jsonl");
-    if (!existsSync5(path)) {
+    const path = join10(configDir2, "ostrom", "sprint.jsonl");
+    if (!existsSync6(path)) {
       cached = { exists: false };
       return cached;
     }
     try {
-      cached = { exists: true, content: readFileSync7(path, "utf8") };
+      cached = { exists: true, content: readFileSync8(path, "utf8") };
     } catch (error) {
       cached = { exists: true, error };
     }
@@ -1342,6 +1592,9 @@ function createTraceReader(configDir2) {
   };
 }
 var DOCTOR_CHECK_NAMES = [
+  "cli-installed",
+  "cli-version",
+  "cli-launcher",
   "plugin",
   "marketplace",
   "plugin-cache-drift",
@@ -1359,6 +1612,9 @@ var DOCTOR_CHECK_NAMES = [
 ];
 function checkRunners(context) {
   return {
+    "cli-installed": () => checkCliInstalled(context),
+    "cli-version": () => checkCliVersion(context),
+    "cli-launcher": () => checkCliLauncher(context),
     plugin: () => checkPlugin(context),
     marketplace: () => checkMarketplace(context),
     "plugin-cache-drift": () => checkPluginCacheDrift(context),
@@ -1401,9 +1657,9 @@ function runDoctorCheck(options2, name) {
 }
 
 // src/doctor.ts
-var pluginRoot = resolve(dirname2(fileURLToPath(import.meta.url)), "..");
+var pluginRoot = resolve2(dirname3(fileURLToPath(import.meta.url)), "..");
 var home = process.env.HOME ?? "";
-var configDir = process.env.CLAUDE_CONFIG_DIR ?? resolve(home, ".claude");
+var configDir = process.env.CLAUDE_CONFIG_DIR ?? resolve2(home, ".claude");
 var options = {
   pluginRoot,
   configDir,

@@ -18,6 +18,11 @@ import {
   checkGatekeeperPass,
 } from "../checks/builder-pass.js";
 import { checkPublish } from "../checks/publish.js";
+import {
+  checkCliInstalled,
+  checkCliLauncher,
+  checkCliVersion,
+} from "../checks/cli.js";
 import { resolveTouchConfig } from "./config.js";
 import type { DoctorContext, TraceFile } from "./context.js";
 import { formatResult, type CheckResult } from "./result.js";
@@ -52,6 +57,9 @@ function createTraceReader(configDir: string): () => TraceFile {
 }
 
 export const DOCTOR_CHECK_NAMES = [
+  "cli-installed",
+  "cli-version",
+  "cli-launcher",
   "plugin",
   "marketplace",
   "plugin-cache-drift",
@@ -74,6 +82,9 @@ function checkRunners(
   context: DoctorContext,
 ): Record<DoctorCheckName, () => CheckResult> {
   return {
+    "cli-installed": () => checkCliInstalled(context),
+    "cli-version": () => checkCliVersion(context),
+    "cli-launcher": () => checkCliLauncher(context),
     plugin: () => checkPlugin(context),
     marketplace: () => checkMarketplace(context),
     "plugin-cache-drift": () => checkPluginCacheDrift(context),
