@@ -20,14 +20,15 @@ use ostrom_core::{
 use ostrom_store::{
     AuditOptions, DispatchOutcome, DispatchRequest, ExecutableAssessmentDeriver, GateError,
     GateOptions, ImplementRequest, MigrationOutcome, OstromPaths, PassRequest, PassRole,
-    PlanOptions, PublishDestination, PublishTarget, QueueDecision, SelectAction, SelectError,
-    SelectOutcome, SelectRequest, SignalFlags, SweepError, SweepMode, SweepOptions,
+    PlanOptions, PublishDestination, PublishTarget, QueueDecision, ReplayOptions, SelectAction,
+    SelectError, SelectOutcome, SelectRequest, SignalFlags, SweepError, SweepMode, SweepOptions,
     SweepParityOptions, TraceAppend, TraceView, UnavailableAssessmentDeriver, acquire_lease,
     acquire_org_from_github, append_trace_checked, audit, branch_name, create_work_order,
     decide_queue_item, encode_org_snapshots, encode_selection, grant_excuse, item_hash,
     lease_status, lint_queue_state, list_excuses, list_queue_json, local_drift, migrate,
-    read_trace_json, release_lease, run_dispatch, run_gate, run_implement, run_pass, run_plan,
-    run_selection, run_sweep, run_sweep_parity, validate_lease_name, validate_work_order_file,
+    read_trace_json, release_lease, replay, run_dispatch, run_gate, run_implement, run_pass,
+    run_plan, run_selection, run_sweep, run_sweep_parity, validate_lease_name,
+    validate_work_order_file,
 };
 
 #[derive(Debug, Parser)]
@@ -133,6 +134,12 @@ enum Command {
     Audit {
         /// Number of days in the merged-at window.
         #[arg(long, default_value_t = 30)]
+        days: u64,
+    },
+    /// Explain selector outcomes against merged pull requests and recorded state.
+    Replay {
+        /// Number of days in the merged-at window.
+        #[arg(default_value_t = 30)]
         days: u64,
     },
     /// Grant or inspect SHA-scoped merge-gate exceptions.
@@ -567,6 +574,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 working_directory,
                 days,
                 audit_time,
+            }) {
+                Ok(output) => io::stdout().write_all(output.as_bytes())?,
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::exit(error.exit_code());
+                }
+            }
+        }
+        Command::Replay { days } => {
+            let replay_time = environment_time("MANDATE_REPLAY_TIME").unwrap_or_else(|message| {
+                eprintln!("mandate replay: {message}");
+                std::process::exit(2);
+            });
+            let working_directory = env::current_dir()?;
+            match replay(&ReplayOptions {
+                paths,
+                working_directory,
+                days,
+                replay_time,
             }) {
                 Ok(output) => io::stdout().write_all(output.as_bytes())?,
                 Err(error) => {

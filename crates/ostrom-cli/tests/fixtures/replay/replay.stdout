@@ -1,0 +1,25 @@
+mandate replay: lower bound only
+A PR that touched nothing irreversible and matched no selector may still have been a miss; this only counts what it can see.
+
+MISSES (lower bound) — merged PRs in the last 30 days that touched an irreversible surface and matched no bounce selector:
+placeholder-org/alpha#101  chore: change deployment workflow — merged 2026-07-15T00:00:00Z; workflow file: .github/workflows/deploy.yml — https://example.invalid/placeholder/pull/101
+
+PER-SELECTOR REPORT
+tier	repo	source	selector	fired	dismissed
+author-written	*	bounce_all	label:protected	0	0
+author-written	*	bounce_all	title:*credential*	1	1
+author-written	placeholder-org/alpha	delegated	scope:tooling	1	0
+author-written	placeholder-org/alpha	delegated	type:docs	0	0
+author-written	placeholder-org/alpha	excluded	label:ignored	0	0
+content-derived	placeholder-org/alpha	project bounce	path:.github/workflows/release.yml	1	1
+content-derived	placeholder-org/alpha	project bounce	ref:#42	0	0
+
+fired = open items the last sweep classified via that selector (current snapshot, not lifetime history).
+dismissed = /ostrom:desk rejections of a row that selector produced, recorded in selector-events.jsonl.
+path: only applies to PRs (sweep.sh gates it on $item.type == "pr"); for issues every prefix above is author-written and there is no content-derived gating at all.
+
+Dismissals attributed to no selector (the project default fired instead): 1
+These are not a selector's false alarms and are kept out of the table above.
+
+Unmatched irreversible-surface merges (misses, lower bound): 1
+This is a separate count from the dismissal figures above — it measures misses, not false alarms, and is not combined with them into any single score.

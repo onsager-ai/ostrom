@@ -20,7 +20,9 @@ use crate::{
     app_token::{AppTokenRequest, mint_installation_token},
     io_error,
     publish::{PublishOptions, PublishOutcome, publish},
-    read_queue, set_private_file_mode, write_queue,
+    read_queue,
+    selector::{SelectorCandidate, glob_match, selector_match},
+    set_private_file_mode, write_queue,
 };
 
 const QUERY_LIMIT: usize = 200;
@@ -1450,6 +1452,16 @@ fn classify(
             selector: format!("ref:#{number}"),
         });
     }
+    // Built once per item rather than per selector: it only borrows from
+    // `item` and is identical for every selector in every group, so rebuilding
+    // it inside the inner loop was repeated work in the sweep's hot path.
+    let candidate = SelectorCandidate {
+        item_type: &item.item_type,
+        title: &item.title,
+        labels: &item.labels,
+        refs: &item.refs,
+        files: &item.files,
+    };
     for (selectors, source, terminal) in [
         (&config.bounce_all, "bounce_all", "tripwire"),
         (&project.bounce, "project bounce", "tripwire"),
@@ -1457,7 +1469,7 @@ fn classify(
         (&project.delegated, "delegated", "delegated"),
     ] {
         for selector in selectors {
-            if selector_match(item, selector)? {
+            if selector_match(&candidate, selector) {
                 return Ok(Classification {
                     terminal: terminal.to_owned(),
                     source: source.to_owned(),
@@ -1475,28 +1487,6 @@ fn classify(
         terminal: terminal.to_owned(),
         source: "default".to_owned(),
         selector: format!("default:{terminal}"),
-    })
-}
-
-fn selector_match(item: &NormalizedItem, selector: &Selector) -> Result<bool, SweepError> {
-    let (prefix, glob) = selector
-        .as_str()
-        .split_once(':')
-        .ok_or_else(|| SweepError::Config("selector has no prefix".to_owned()))?;
-    let (item_type, scopes) = conventional(&item.title);
-    Ok(match prefix {
-        "label" => item
-            .labels
-            .iter()
-            .any(|value| glob_match(value, glob, false)),
-        "scope" => scopes.iter().any(|value| glob_match(value, glob, false)),
-        "type" => glob_match(&item_type, glob, false),
-        "path" => {
-            item.item_type == "pr" && item.files.iter().any(|value| glob_match(value, glob, true))
-        }
-        "ref" => item.refs.iter().any(|number| format!("#{number}") == glob),
-        "title" => glob_match(&item.title, glob, false),
-        _ => false,
     })
 }
 
@@ -2493,55 +2483,6 @@ fn selectors_value(selectors: &[Selector]) -> Value {
             .map(|selector| json!(selector.as_str()))
             .collect(),
     )
-}
-
-fn conventional(title: &str) -> (String, Vec<String>) {
-    let Ok(regex) = Regex::new(r"^([^(:\s]+)(?:\(([^)]*)\))?:") else {
-        return (String::new(), Vec::new());
-    };
-    let Some(captures) = regex.captures(title) else {
-        return (String::new(), Vec::new());
-    };
-    let item_type = captures
-        .get(1)
-        .map_or("", |value| value.as_str())
-        .to_owned();
-    let scopes = captures
-        .get(2)
-        .map_or("", |value| value.as_str())
-        .split(',')
-        .map(str::trim)
-        .filter(|scope| !scope.is_empty())
-        .map(str::to_owned)
-        .collect();
-    (item_type, scopes)
-}
-
-fn glob_match(value: &str, glob: &str, path: bool) -> bool {
-    let mut body = String::from("^");
-    let chars = glob.chars().collect::<Vec<_>>();
-    let mut index = 0;
-    while index < chars.len() {
-        if chars[index] == '*' {
-            if path && chars.get(index + 1) == Some(&'*') {
-                if chars.get(index + 2) == Some(&'/') {
-                    body.push_str("(?:.*/)?");
-                    index += 3;
-                } else {
-                    body.push_str(".*");
-                    index += 2;
-                }
-            } else {
-                body.push_str(if path { "[^/]*" } else { ".*" });
-                index += 1;
-            }
-        } else {
-            body.push_str(&regex::escape(&chars[index].to_string()));
-            index += 1;
-        }
-    }
-    body.push('$');
-    Regex::new(&format!("(?i:{body})")).is_ok_and(|regex| regex.is_match(value))
 }
 
 fn dependency_refs(repo: &str, body: &str) -> Result<Vec<String>, SweepError> {

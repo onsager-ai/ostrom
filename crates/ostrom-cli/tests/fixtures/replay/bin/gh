@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "$1 $2" = "auth status" ]; then
+  exit 0
+fi
+
+if [ "$1 $2" = "pr list" ]; then
+  cat <<'JSON'
+[
+  {
+    "number": 100,
+    "title": "chore: old workflow change",
+    "labels": [],
+    "url": "https://example.invalid/placeholder/pull/100",
+    "baseRefName": "main",
+    "mergedAt": "2020-01-01T00:00:00Z",
+    "closingIssuesReferences": [],
+    "files": [{"path": ".github/workflows/old.yml"}]
+  },
+  {
+    "number": 101,
+    "title": "chore: change deployment workflow",
+    "labels": [],
+    "url": "https://example.invalid/placeholder/pull/101",
+    "baseRefName": "main",
+    "mergedAt": "2026-07-15T00:00:00Z",
+    "closingIssuesReferences": [],
+    "files": [{"path": ".github/workflows/deploy.yml"}]
+  },
+  {
+    "number": 102,
+    "title": "chore: credential rotation",
+    "labels": [],
+    "url": "https://example.invalid/placeholder/pull/102",
+    "baseRefName": "main",
+    "mergedAt": "2026-07-16T00:00:00Z",
+    "closingIssuesReferences": [],
+    "files": [{"path": ".github/workflows/credentials.yml"}]
+  },
+  {
+    "number": 103,
+    "title": "chore: linked protected release",
+    "labels": [],
+    "url": "https://example.invalid/placeholder/pull/103",
+    "baseRefName": "main",
+    "mergedAt": "2026-07-17T00:00:00Z",
+    "closingIssuesReferences": [{"number": 42, "labels": [{"name": "protected"}]}],
+    "files": [{"path": ".github/workflows/release.yml"}]
+  }
+]
+JSON
+  exit 0
+fi
+
+if [ "$1 $2" = "repo view" ]; then
+  printf '%s\n' '{"defaultBranchRef":{"name":"main"}}'
+  exit 0
+fi
+
+exit 1
