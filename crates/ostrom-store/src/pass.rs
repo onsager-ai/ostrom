@@ -602,7 +602,7 @@ fn release_inner_lease(guard: &PassGuard) {
 /// did before this guard existed. So the message states what is checked rather
 /// than implying the stronger claim.
 #[cfg(unix)]
-fn is_executable_file(path: &Path) -> bool {
+pub(crate) fn is_executable_file(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
 
     path.metadata()
@@ -610,7 +610,7 @@ fn is_executable_file(path: &Path) -> bool {
 }
 
 #[cfg(not(unix))]
-fn is_executable_file(path: &Path) -> bool {
+pub(crate) fn is_executable_file(path: &Path) -> bool {
     path.is_file()
 }
 

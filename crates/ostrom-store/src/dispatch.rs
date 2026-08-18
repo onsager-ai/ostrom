@@ -1034,10 +1034,15 @@ fn resolve_ostrom(context: &DispatchContext<'_>) -> Result<PathBuf, DispatchErro
 }
 
 fn absolute_executable(candidate: &Path) -> Option<PathBuf> {
-    candidate
-        .metadata()
-        .ok()
-        .filter(|metadata| metadata.is_file())?;
+    // Being a regular file is not enough. A `MANDATE_OSTROM_BIN` pointing at a
+    // present-but-unexecutable file would otherwise pass this resolution, let
+    // dispatch reserve capacity and take the per-item lease, and only fail when
+    // `systemd-run` tried to exec it — reported as `dispatch-failed` rather than
+    // the `ostrom-unavailable` it actually is. The whole point of resolving
+    // before the lease is that an unusable binary costs nothing.
+    if !crate::pass::is_executable_file(candidate) {
+        return None;
+    }
     if candidate.is_absolute() {
         Some(candidate.to_path_buf())
     } else {
@@ -1467,7 +1472,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::has_unpublished_tree;
+    use super::{absolute_executable, has_unpublished_tree};
 
     fn git(path: &Path, arguments: &[&str]) {
         assert!(
@@ -1523,6 +1528,32 @@ mod tests {
             .as_deref(),
             Some("1"),
             "the ancestry-only guard would refuse this branch forever"
+        );
+    }
+
+    /// A present-but-unexecutable path must not resolve. Dispatch resolves the
+    /// binary *before* it reserves capacity and takes the per-item lease, so a
+    /// resolution that accepts an unusable file converts a free, named
+    /// `ostrom-unavailable` into a lease-consuming `dispatch-failed` at exec
+    /// time. This is the same defect class fixed in the pass guard in #286.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_executable_file_does_not_resolve_as_the_cli() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempdir().expect("temporary resolution fixture");
+        let candidate = root.path().join("ostrom");
+        fs::write(&candidate, "#!/usr/bin/env bash\nexit 0\n").expect("write candidate");
+
+        fs::set_permissions(&candidate, fs::Permissions::from_mode(0o644))
+            .expect("clear the executable bits");
+        assert!(absolute_executable(&candidate).is_none());
+
+        fs::set_permissions(&candidate, fs::Permissions::from_mode(0o755))
+            .expect("restore the executable bits");
+        assert_eq!(
+            absolute_executable(&candidate).as_deref(),
+            Some(candidate.as_path())
         );
     }
 }
