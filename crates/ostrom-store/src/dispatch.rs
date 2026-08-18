@@ -26,8 +26,6 @@ const DEFAULT_MAX_IMPLEMENTERS_PER_REPOSITORY: usize = 1;
 const REMOTE_BRANCH_PAGE_SIZE: usize = 100;
 const REMOTE_BRANCH_PAGE_LIMIT: usize = 100;
 const DEFAULT_IMPLEMENTER_LEASE_TTL_SECONDS: u64 = 2_592_000;
-// The production comparison window keeps rollback to one environment change.
-const DEFAULT_IMPLEMENTER_ENGINE: &str = "shell";
 
 #[derive(Debug, Clone)]
 pub struct DispatchRequest {
@@ -207,6 +205,7 @@ pub fn run_dispatch(request: &DispatchRequest) -> Result<DispatchOutcome, Dispat
 
     let resolved_codex = resolve_codex(&context)?;
     let resolved_node = resolve_node(&context, &resolved_codex)?;
+    let resolved_ostrom = resolve_ostrom(&context)?;
     let inherited_path =
         env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".to_owned());
     let node_dir = resolved_node.parent().unwrap_or_else(|| Path::new("."));
@@ -268,6 +267,7 @@ pub fn run_dispatch(request: &DispatchRequest) -> Result<DispatchOutcome, Dispat
         &context,
         config.as_ref(),
         &resolved_codex,
+        &resolved_ostrom,
         &unit_path,
         &mut lease,
     );
@@ -281,6 +281,7 @@ fn after_lease(
     context: &DispatchContext<'_>,
     config: Option<&MandateConfig>,
     resolved_codex: &Path,
+    resolved_ostrom: &Path,
     unit_path: &str,
     lease: &mut LeaseGuard,
 ) -> Result<DispatchOutcome, DispatchError> {
@@ -454,14 +455,6 @@ fn after_lease(
         ));
     }
 
-    let implementer_engine = env::var("MANDATE_IMPLEMENTER_ENGINE")
-        .unwrap_or_else(|_| DEFAULT_IMPLEMENTER_ENGINE.to_owned());
-    let (implementer, implementer_verb) = implementer_launch(
-        &context.request.plugin_root,
-        &implementer_engine,
-        env::var_os("MANDATE_IMPLEMENTER_BIN"),
-        env::var_os("MANDATE_OSTROM_BIN"),
-    )?;
     append_dispatched(context)?;
     let systemd = env::var_os("MANDATE_SYSTEMD_RUN_BIN")
         .map_or_else(|| PathBuf::from("systemd-run"), PathBuf::from);
@@ -502,10 +495,8 @@ fn after_lease(
             "--setenv",
             &format!("PATH={unit_path}"),
         ])
-        .arg(&implementer);
-    if let Some(verb) = implementer_verb {
-        launch.arg(verb);
-    }
+        .arg(resolved_ostrom)
+        .arg("implement");
     let status = launch
         .arg(&context.request.order_file)
         .arg(&context.unit_name)
@@ -529,28 +520,6 @@ fn after_lease(
     }
     lease.disarm();
     Ok(DispatchOutcome::Started(context.unit_name.clone()))
-}
-
-fn implementer_launch(
-    plugin_root: &Path,
-    engine: &str,
-    shell_override: Option<std::ffi::OsString>,
-    rust_override: Option<std::ffi::OsString>,
-) -> Result<(PathBuf, Option<&'static str>), DispatchError> {
-    match engine {
-        "shell" => Ok((
-            shell_override.map_or_else(|| plugin_root.join("scripts/implement.sh"), PathBuf::from),
-            None,
-        )),
-        "rust" => Ok((
-            rust_override.map_or_else(|| PathBuf::from("ostrom"), PathBuf::from),
-            Some("implement"),
-        )),
-        other => Err(DispatchError::new(
-            2,
-            format!("ostrom dispatch: unsupported implementer engine: {other}"),
-        )),
-    }
 }
 
 fn preflight_worktree(context: &DispatchContext<'_>) -> Result<(), DispatchError> {
@@ -1039,11 +1008,41 @@ fn resolve_node(context: &DispatchContext<'_>, codex: &Path) -> Result<PathBuf, 
     })
 }
 
+fn resolve_ostrom(context: &DispatchContext<'_>) -> Result<PathBuf, DispatchError> {
+    let override_path = env::var_os("MANDATE_OSTROM_BIN");
+    let command = override_path
+        .as_ref()
+        .map_or_else(|| PathBuf::from("ostrom"), PathBuf::from);
+    let resolved = if command.components().count() > 1 {
+        absolute_executable(&command)
+    } else {
+        find_on_path(&command)
+    };
+    resolved.ok_or_else(|| {
+        let _ = append_failure(context, "ostrom-unavailable", FailureDetail::default());
+        let message = if override_path.is_some() {
+            format!(
+                "ostrom dispatch: MANDATE_OSTROM_BIN is unavailable: {} was not found",
+                command.display()
+            )
+        } else {
+            "ostrom dispatch: MANDATE_OSTROM_BIN is unset and ostrom was not found on PATH"
+                .to_owned()
+        };
+        DispatchError::new(1, message)
+    })
+}
+
 fn absolute_executable(candidate: &Path) -> Option<PathBuf> {
-    candidate
-        .metadata()
-        .ok()
-        .filter(|metadata| metadata.is_file())?;
+    // Being a regular file is not enough. A `MANDATE_OSTROM_BIN` pointing at a
+    // present-but-unexecutable file would otherwise pass this resolution, let
+    // dispatch reserve capacity and take the per-item lease, and only fail when
+    // `systemd-run` tried to exec it — reported as `dispatch-failed` rather than
+    // the `ostrom-unavailable` it actually is. The whole point of resolving
+    // before the lease is that an unusable binary costs nothing.
+    if !crate::pass::is_executable_file(candidate) {
+        return None;
+    }
     if candidate.is_absolute() {
         Some(candidate.to_path_buf())
     } else {
@@ -1469,15 +1468,11 @@ fn render_number(number: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs,
-        path::{Path, PathBuf},
-        process::Command,
-    };
+    use std::{fs, path::Path, process::Command};
 
     use tempfile::tempdir;
 
-    use super::{DEFAULT_IMPLEMENTER_ENGINE, has_unpublished_tree, implementer_launch};
+    use super::{absolute_executable, has_unpublished_tree};
 
     fn git(path: &Path, arguments: &[&str]) {
         assert!(
@@ -1499,21 +1494,6 @@ mod tests {
         for forbidden in [["git", "push"], ["git", "branch"]] {
             assert!(!source.contains(&forbidden.join(" ")));
         }
-    }
-
-    #[test]
-    fn implementer_defaults_to_shell_and_rust_requires_explicit_selection() {
-        let root = Path::new("/placeholder/plugin");
-        assert_eq!(DEFAULT_IMPLEMENTER_ENGINE, "shell");
-        assert_eq!(
-            implementer_launch(root, DEFAULT_IMPLEMENTER_ENGINE, None, None)
-                .expect("default launch"),
-            (root.join("scripts/implement.sh"), None)
-        );
-        assert_eq!(
-            implementer_launch(root, "rust", None, None).expect("Rust launch"),
-            (PathBuf::from("ostrom"), Some("implement"))
-        );
     }
 
     #[test]
@@ -1548,6 +1528,32 @@ mod tests {
             .as_deref(),
             Some("1"),
             "the ancestry-only guard would refuse this branch forever"
+        );
+    }
+
+    /// A present-but-unexecutable path must not resolve. Dispatch resolves the
+    /// binary *before* it reserves capacity and takes the per-item lease, so a
+    /// resolution that accepts an unusable file converts a free, named
+    /// `ostrom-unavailable` into a lease-consuming `dispatch-failed` at exec
+    /// time. This is the same defect class fixed in the pass guard in #286.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_executable_file_does_not_resolve_as_the_cli() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempdir().expect("temporary resolution fixture");
+        let candidate = root.path().join("ostrom");
+        fs::write(&candidate, "#!/usr/bin/env bash\nexit 0\n").expect("write candidate");
+
+        fs::set_permissions(&candidate, fs::Permissions::from_mode(0o644))
+            .expect("clear the executable bits");
+        assert!(absolute_executable(&candidate).is_none());
+
+        fs::set_permissions(&candidate, fs::Permissions::from_mode(0o755))
+            .expect("restore the executable bits");
+        assert_eq!(
+            absolute_executable(&candidate).as_deref(),
+            Some(candidate.as_path())
         );
     }
 }

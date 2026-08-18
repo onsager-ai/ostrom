@@ -97,6 +97,7 @@ struct TerminalGuard {
     backend: String,
     started: SystemTime,
     failure_reason: String,
+    failure_message: Option<String>,
     terminal_written: bool,
     worktree: Option<PathBuf>,
     source_repository: Option<PathBuf>,
@@ -121,6 +122,9 @@ impl TerminalGuard {
             .map(read_usage)
             .unwrap_or_default();
         let weighted = usage.weighted();
+        // This is Ostrom's normalized order-cost estimate, not a provider
+        // invoice. Keeping it numeric on every terminal row lets completed
+        // work replace its in-flight reservation in the daily-cap total.
         let cost = weighted as f64 / self.order.tokens() as f64 * self.order.cost();
         // A retry can turn an expensive partial edit into a cheap completion,
         // so failed worktrees remain addressable even when the child stopped
@@ -161,6 +165,7 @@ impl TerminalGuard {
                 "reason".to_owned(),
                 reason.map_or(Value::Null, |value| json!(value)),
             ),
+            ("message".to_owned(), json!(self.failure_message)),
             (
                 "termination_signal".to_owned(),
                 json!(self.termination_signal),
@@ -202,6 +207,7 @@ impl TerminalGuard {
 
     fn fail(&mut self, error: &ImplementError) {
         self.failure_reason.clone_from(&error.reason);
+        self.failure_message = Some(error.message.clone());
     }
 
     fn finish(&mut self) -> Result<(), ImplementError> {
@@ -264,6 +270,7 @@ pub fn run_implement(request: &ImplementRequest) -> Result<String, ImplementErro
         backend: env::var("MANDATE_DISPATCH_BACKEND").unwrap_or_else(|_| "systemd".to_owned()),
         started: SystemTime::now(),
         failure_reason: "implementer-exited".to_owned(),
+        failure_message: None,
         terminal_written: false,
         worktree: None,
         source_repository: None,
@@ -538,10 +545,12 @@ fn prepare_worktree(
             &format!("refs/heads/{branch}"),
         ],
     ) {
+        let existing = branch_checkout_path(source, branch)
+            .unwrap_or_else(|| "not checked out in any worktree".to_owned());
         return Err(ImplementError::new(
             1,
             "worktree-branch-already-exists",
-            format!("branch already exists outside item worktree: {branch}"),
+            format!("branch {branch} already exists outside the item worktree: {existing}"),
         ));
     }
     let worktree_text = worktree.display().to_string();
@@ -790,7 +799,10 @@ fn withhold_workflows(
             return Err(ImplementError::new(
                 1,
                 "workflow-file-unpushable",
-                "only workflow files changed",
+                format!(
+                    "only workflow files changed; withheld paths: {}",
+                    guard.withheld_paths.join(",")
+                ),
             ));
         }
     }
@@ -988,12 +1000,38 @@ fn resolve_source_repository(
     if let Some(path) = primary.into_iter().next() {
         return Ok(path);
     }
-    let reason = if linked.is_empty() {
-        "source-repository-not-found"
-    } else {
-        "source-repository-linked-worktree-only"
-    };
-    Err(ImplementError::new(1, reason, reason))
+    if linked.is_empty() {
+        return Err(ImplementError::new(
+            1,
+            "source-repository-not-found",
+            "source repository not found",
+        ));
+    }
+    linked.sort();
+    Err(ImplementError::new(
+        1,
+        "source-repository-linked-worktree-only",
+        format!(
+            "source repository was found only as a linked worktree: {}",
+            linked[0].display()
+        ),
+    ))
+}
+
+fn branch_checkout_path(source: &Path, branch: &str) -> Option<String> {
+    let output = git_text(source, &["worktree", "list", "--porcelain"])?;
+    let reference = format!("refs/heads/{branch}");
+    let mut path = None;
+    for line in output.lines() {
+        if let Some(value) = line.strip_prefix("worktree ") {
+            path = Some(value.to_owned());
+        } else if line.strip_prefix("branch ") == Some(reference.as_str()) {
+            return path;
+        } else if line.is_empty() {
+            path = None;
+        }
+    }
+    None
 }
 
 fn collect_repositories(

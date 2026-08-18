@@ -613,7 +613,7 @@ fn release_inner_lease(guard: &PassGuard) {
 /// did before this guard existed. So the message states what is checked rather
 /// than implying the stronger claim.
 #[cfg(unix)]
-fn is_executable_file(path: &Path) -> bool {
+pub(crate) fn is_executable_file(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
 
     path.metadata()
@@ -621,7 +621,7 @@ fn is_executable_file(path: &Path) -> bool {
 }
 
 #[cfg(not(unix))]
-fn is_executable_file(path: &Path) -> bool {
+pub(crate) fn is_executable_file(path: &Path) -> bool {
     path.is_file()
 }
 
@@ -774,6 +774,8 @@ pub(crate) fn terminate_child_process_group(child: &mut Child, grace: Duration) 
     let _ = Command::new(kill_command())
         .args(["-KILL", "--", &group])
         .status();
+    // KILL escalation is the operationally significant outcome even if one
+    // member of the process group had already stopped cooperatively on TERM.
     Some("SIGKILL".to_owned())
 }
 
