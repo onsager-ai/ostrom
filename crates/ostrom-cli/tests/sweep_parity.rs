@@ -809,15 +809,14 @@ fn mandate_sweep_time_applies_to_plan_and_rejects_malformed_values() {
 }
 
 #[test]
-fn an_unmintable_organization_becomes_a_named_queue_fault() {
-    // The organization driver used to be exercised through a fake gh-as.sh on
-    // disk. Minting is native now, so the seam is the secrets file: an absent
-    // one fails credential resolution before any network call, which keeps
-    // this hermetic. The property under test is unchanged and is the one that
-    // matters — a token failure must surface as a fault row rather than as a
-    // silently short sweep.
+fn an_entirely_unmintable_roster_is_refused_without_overwriting() {
     let home = tempdir().expect("temporary OSTROM_HOME");
     fs::write(home.path().join("mandates.yaml"), PLACEHOLDER_ROSTER).expect("write roster");
+    let queue_before = br##"{"id":"placeholder-org/alpha#7","repo":"placeholder-org/alpha","ref":"#7","title":"Placeholder retained decision","kind":"decision","mandate":{"reason":"placeholder"},"state":"deferred","opened":"2026-07-01T00:00:00Z","age_days":31,"aged_out":true,"needs_judgment":true,"blocked_by":[]}
+"##;
+    let state_before = br#"{"version":2,"sweep_mode":"full","repos":{"placeholder-org/alpha":{"cursor":"2026-07-01T00:00:00Z","records":{}}}}"#;
+    fs::write(home.path().join("queue.jsonl"), queue_before).expect("write prior queue");
+    fs::write(home.path().join("state.json"), state_before).expect("write prior state");
 
     let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
         .args(["sweep", "--started-at", "2026-08-01T00:00:00Z"])
@@ -827,30 +826,22 @@ fn an_unmintable_organization_becomes_a_named_queue_fault() {
         .output()
         .expect("run organization driver");
     assert!(
-        output.status.success(),
-        "one unmintable organization must not take the sweep down: {}",
+        !output.status.success(),
+        "an entirely unmintable roster must refuse: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-
-    let rows = fs::read_to_string(home.path().join("queue.jsonl")).expect("read fault queue");
-    let rows = rows
-        .lines()
-        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("parse queue row"))
-        .collect::<Vec<_>>();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0]["id"], "placeholder-org/alpha#0");
-    let reason = rows[0]["mandate"]["reason"]
-        .as_str()
-        .expect("fault rows carry a reason");
-    assert!(
-        reason.contains("authentication"),
-        "the queue row must say the repository could not be authenticated for: {reason}"
+    assert_eq!(
+        fs::read(home.path().join("queue.jsonl")).expect("read preserved queue"),
+        queue_before
+    );
+    assert_eq!(
+        fs::read(home.path().join("state.json")).expect("read preserved state"),
+        state_before
     );
 
-    // The row names the repository, because that is the unit an operator acts
-    // on. The organization and the underlying cause reach stderr, where the
-    // three failure classes stay distinguishable.
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("refusing to overwrite queue and state"));
+    assert!(stderr.contains("acquisition succeeded for 0 of 1"));
     assert!(
         stderr.contains("for organization placeholder-org"),
         "stderr must name the organization: {stderr}"

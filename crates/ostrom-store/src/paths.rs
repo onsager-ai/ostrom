@@ -52,6 +52,11 @@ impl OstromPaths {
     }
 
     #[must_use]
+    pub fn previous_sweep_dir(&self) -> PathBuf {
+        self.state.join("previous")
+    }
+
+    #[must_use]
     pub fn selector_events_file(&self) -> PathBuf {
         self.state.join("selector-events.jsonl")
     }

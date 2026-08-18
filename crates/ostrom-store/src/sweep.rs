@@ -18,11 +18,16 @@ use thiserror::Error;
 use crate::{
     AppTokenError, OstromPaths, QueueDocument, StoreError,
     app_token::{AppTokenRequest, mint_installation_token},
-    io_error, read_queue, write_queue,
+    io_error, read_queue, set_private_file_mode, write_queue,
 };
 
 const QUERY_LIMIT: usize = 200;
 const FULL_RECONCILIATION_HOURS: i64 = 24;
+/// A partially reachable portfolio remains useful when failed repositories are
+/// retained from the previous generation. Zero acquired repositories cannot
+/// distinguish a quiet portfolio from the 2026-08-18 authentication outage,
+/// so that incident-shaped result must never reach persistence.
+const MIN_ACQUIRED_REPOSITORIES_TO_WRITE: usize = 1;
 /// Read-only scope for an acquisition token, kept identical to the set
 /// `scripts/sweep.sh` requests so both paths mint the same grant. A sweep
 /// reads; it never writes, so no write permission belongs here.
@@ -39,6 +44,15 @@ pub enum SweepError {
     State(String),
     #[error("GitHub acquisition failed: {0}")]
     Acquisition(String),
+    #[error(
+        "refusing to overwrite queue and state: repository acquisition succeeded for {acquired} of {configured} configured repositories; at least {minimum} must succeed; acquisition faults: {details}"
+    )]
+    AcquisitionRefused {
+        acquired: usize,
+        configured: usize,
+        minimum: usize,
+        details: String,
+    },
     #[error(transparent)]
     AppToken(#[from] AppTokenError),
     #[error("{0}")]
@@ -194,12 +208,42 @@ struct RepositoryEvidence<'a> {
     queued_kinds: &'a BTreeMap<String, String>,
 }
 
+struct SweepToken(String);
+
+trait InstallationTokenMinter {
+    fn mint(
+        &mut self,
+        paths: &OstromPaths,
+        request: AppTokenRequest<'_>,
+    ) -> Result<SweepToken, AppTokenError>;
+}
+
+struct GitHubInstallationTokenMinter;
+
+impl InstallationTokenMinter for GitHubInstallationTokenMinter {
+    fn mint(
+        &mut self,
+        paths: &OstromPaths,
+        request: AppTokenRequest<'_>,
+    ) -> Result<SweepToken, AppTokenError> {
+        mint_installation_token(paths, request).map(|token| SweepToken(token.expose().to_owned()))
+    }
+}
+
 pub fn run_sweep(options: &SweepOptions) -> Result<SweepOutcome, SweepError> {
     run_sweep_with_mirror(options).map(|(outcome, _mirror)| outcome)
 }
 
 pub(crate) fn run_sweep_with_mirror(
     options: &SweepOptions,
+) -> Result<(SweepOutcome, Vec<RepositorySnapshot>), SweepError> {
+    let mut minter = GitHubInstallationTokenMinter;
+    run_sweep_with_minter(options, &mut minter)
+}
+
+fn run_sweep_with_minter(
+    options: &SweepOptions,
+    minter: &mut dyn InstallationTokenMinter,
 ) -> Result<(SweepOutcome, Vec<RepositorySnapshot>), SweepError> {
     let config = load_config(&options.paths, &options.working_directory)?;
     if config.projects.is_empty() {
@@ -230,8 +274,35 @@ pub(crate) fn run_sweep_with_mirror(
         validate_fixture(&config, &fixture)?;
         (fixture.repositories, Vec::new())
     } else {
-        acquire_by_organization(options, &config, &old_state, mode)?
+        acquire_by_organization(options, &config, &old_state, mode, minter)?
     };
+    let configured_repositories = config
+        .projects
+        .iter()
+        .map(|project| project.repo.as_str().to_owned())
+        .collect::<BTreeSet<_>>();
+    let acquired_repositories = snapshots
+        .iter()
+        .map(|snapshot| snapshot.repo.as_str().to_owned())
+        .filter(|repo| configured_repositories.contains(repo.as_str()))
+        .collect::<BTreeSet<_>>();
+    if acquired_repositories.len() < MIN_ACQUIRED_REPOSITORIES_TO_WRITE {
+        let details = if faults.is_empty() {
+            "acquisition returned no configured repository snapshots".to_owned()
+        } else {
+            faults.join("; ")
+        };
+        return Err(SweepError::AcquisitionRefused {
+            acquired: acquired_repositories.len(),
+            configured: configured_repositories.len(),
+            minimum: MIN_ACQUIRED_REPOSITORIES_TO_WRITE,
+            details,
+        });
+    }
+    let unacquired_repositories = configured_repositories
+        .difference(&acquired_repositories)
+        .cloned()
+        .collect::<BTreeSet<_>>();
     let (work_orders, work_order_warnings) = load_work_orders(&options.paths)?;
     faults.extend(work_order_warnings);
 
@@ -296,11 +367,7 @@ pub(crate) fn run_sweep_with_mirror(
     if mode == SweepMode::Full {
         new_state["last_full_reconciliation"] = json!(format_time(options.started_at));
     }
-    let configured = config
-        .projects
-        .iter()
-        .map(|project| project.repo.as_str())
-        .collect::<BTreeSet<_>>();
+    let configured = configured_repositories;
     if let Some(repos) = new_state.get_mut("repos").and_then(Value::as_object_mut) {
         repos.retain(|repo, _| configured.contains(repo.as_str()));
     }
@@ -362,16 +429,24 @@ pub(crate) fn run_sweep_with_mirror(
     new_state["work_ranking"] = json!(&config.work_ranking);
     new_state["work_ranking_faults"] = json!(ranking_faults);
 
-    let final_rows = reconcile_queue(existing, generated, &active_ids, &current, &configured)?;
+    let final_rows = reconcile_queue(
+        existing,
+        generated,
+        &active_ids,
+        &current,
+        &configured,
+        &unacquired_repositories,
+    )?;
     let before = read_queue(&options.paths.queue_file())?;
     let queue_changes = symmetric_queue_changes(&before, &final_rows);
-    write_queue(&options.paths.queue_file(), &final_rows)?;
     let graph = graph_from_state(&new_state, &final_rows, &configured);
     for fault in &graph.faults {
         faults.push(format!("{}: {}", fault.name, fault.nodes.join(", ")));
     }
     new_state["dependency_graph"] =
         serde_json::to_value(graph).expect("work dependency graph serializes");
+    backup_previous_sweep(&options.paths)?;
+    write_queue(&options.paths.queue_file(), &final_rows)?;
     write_json_private(&state_path, &new_state)?;
 
     if let PublishTarget::Repository(repository) = &options.publish {
@@ -480,13 +555,14 @@ fn acquire_by_organization(
     config: &MandateConfig,
     _old_state: &Value,
     mode: SweepMode,
+    minter: &mut dyn InstallationTokenMinter,
 ) -> Result<(Vec<RepositorySnapshot>, Vec<String>), SweepError> {
     let mut snapshots = Vec::new();
     let mut faults = Vec::new();
     for (org, scope) in organization_scopes(config) {
         let repositories = scope.repositories.join(",");
         let request = organization_token_request(&scope, &repositories);
-        let token = match mint_installation_token(&options.paths, request) {
+        let token = match minter.mint(&options.paths, request) {
             Ok(token) => token,
             Err(error) => {
                 faults.push(format!(
@@ -505,8 +581,8 @@ fn acquire_by_organization(
                 "--mode",
                 mode_name(mode),
             ])
-            .env("GH_TOKEN", token.expose())
-            .env("GITHUB_TOKEN", token.expose())
+            .env("GH_TOKEN", &token.0)
+            .env("GITHUB_TOKEN", &token.0)
             .current_dir(&options.working_directory)
             .output()
             .map_err(|error| SweepError::Acquisition(error.to_string()))?;
@@ -2028,7 +2104,8 @@ fn reconcile_queue(
     generated: Vec<Value>,
     active_ids: &BTreeSet<String>,
     current: &BTreeMap<String, Value>,
-    configured: &BTreeSet<&str>,
+    configured: &BTreeSet<String>,
+    unacquired_repositories: &BTreeSet<String>,
 ) -> Result<Vec<QueueDocument>, SweepError> {
     let existing_values = existing
         .iter()
@@ -2041,6 +2118,7 @@ fn reconcile_queue(
             let repo = string_field(row, &["repo"]);
             active_ids.contains(id)
                 || string_field(row, &["state"]) == "approved"
+                || unacquired_repositories.contains(repo)
                 || (!configured.contains(repo) && string_field(row, &["kind"]) == "drift")
         })
         .cloned()
@@ -2304,6 +2382,28 @@ fn write_json_private(path: &Path, value: &Value) -> Result<(), SweepError> {
             .map_err(|error| io_error("set private sweep state mode", &temporary, error))?;
     }
     fs::rename(&temporary, path).map_err(|error| io_error("install sweep state", path, error))?;
+    Ok(())
+}
+
+fn backup_previous_sweep(paths: &OstromPaths) -> Result<(), SweepError> {
+    let previous = paths.previous_sweep_dir();
+    for (source, name) in [
+        (paths.queue_file(), "queue.jsonl"),
+        (paths.sweep_state_file(), "state.json"),
+    ] {
+        if !source.exists() {
+            continue;
+        }
+        fs::create_dir_all(&previous)
+            .map_err(|error| io_error("create previous sweep directory", &previous, error))?;
+        let destination = previous.join(name);
+        let temporary = destination.with_extension(format!("tmp.{}", std::process::id()));
+        fs::copy(&source, &temporary)
+            .map_err(|error| io_error("copy previous sweep file", &temporary, error))?;
+        set_private_file_mode(&temporary)?;
+        fs::rename(&temporary, &destination)
+            .map_err(|error| io_error("install previous sweep file", &destination, error))?;
+    }
     Ok(())
 }
 
@@ -2593,7 +2693,7 @@ fn reject_truncated_children(repo: &str, connection: &Value) -> Result<(), Sweep
 fn graph_from_state(
     state: &Value,
     queue: &[QueueDocument],
-    configured: &BTreeSet<&str>,
+    configured: &BTreeSet<String>,
 ) -> ostrom_core::WorkGraph {
     let mut inputs = state
         .get("repos")
@@ -2639,10 +2739,7 @@ fn graph_from_state(
             closes: Vec::new(),
         });
     }
-    build_work_graph(
-        &inputs,
-        &configured.iter().map(|repo| (*repo).to_owned()).collect(),
-    )
+    build_work_graph(&inputs, configured)
 }
 
 fn label_names(labels: Option<&Value>) -> Vec<String> {
@@ -2771,6 +2868,9 @@ pub fn encode_org_snapshots(repositories: Vec<RepositorySnapshot>) -> Result<Vec
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::{env, os::unix::fs::PermissionsExt, process::Output};
+
     use tempfile::tempdir;
 
     use super::*;
@@ -2861,5 +2961,279 @@ mod tests {
         let (orders, warnings) = load_work_orders(&paths).expect("read work-order snapshot");
         assert_eq!(orders.len(), 1);
         assert_eq!(warnings.len(), 1);
+    }
+
+    #[cfg(unix)]
+    const ACQUISITION_GUARD_CHILD: &str = "OSTROM_TEST_ACQUISITION_GUARD_CHILD";
+
+    #[cfg(unix)]
+    struct FixtureMinter {
+        successful_anchors: BTreeSet<String>,
+    }
+
+    #[cfg(unix)]
+    impl InstallationTokenMinter for FixtureMinter {
+        fn mint(
+            &mut self,
+            _paths: &OstromPaths,
+            request: AppTokenRequest<'_>,
+        ) -> Result<SweepToken, AppTokenError> {
+            if self.successful_anchors.contains(request.anchor_repository) {
+                Ok(SweepToken("placeholder-installation-token".to_owned()))
+            } else {
+                Err(AppTokenError::LookupHttp(403))
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn acquisition_guard_options() -> SweepOptions {
+        let paths = OstromPaths::resolve().expect("resolve scratch OSTROM_HOME");
+        SweepOptions {
+            working_directory: paths.state.clone(),
+            executable: paths.state.join("fixture-github-worker.sh"),
+            plugin_root: paths.state.clone(),
+            paths,
+            started_at: "2026-08-18T15:04:00Z"
+                .parse()
+                .expect("valid fixture timestamp"),
+            requested_mode: SweepMode::Full,
+            fixture: None,
+            publish: PublishTarget::Disabled,
+        }
+    }
+
+    #[cfg(unix)]
+    fn run_acquisition_guard_child(home: &Path, test_name: &str, scenario: &str) -> Output {
+        Command::new(env::current_exe().expect("current test executable"))
+            .args(["--exact", test_name, "--nocapture"])
+            .env("OSTROM_HOME", home)
+            .env(ACQUISITION_GUARD_CHILD, scenario)
+            .current_dir(home)
+            .output()
+            .expect("run isolated acquisition fixture")
+    }
+
+    #[cfg(unix)]
+    fn write_acquisition_guard_roster(home: &Path) {
+        fs::write(
+            home.join("mandates.yaml"),
+            concat!(
+                "cadence_hours: 1\n",
+                "stuck_after_days: 7\n",
+                "projects:\n",
+                "  - repo: placeholder-org/alpha\n",
+                "  - repo: other-placeholder-org/beta\n",
+            ),
+        )
+        .expect("write placeholder roster");
+    }
+
+    #[cfg(unix)]
+    fn write_fixture_github_worker(home: &Path) {
+        let worker = home.join("fixture-github-worker.sh");
+        fs::write(
+            &worker,
+            r#"#!/usr/bin/env bash
+set -eu
+org=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--inner-org" ]; then
+    org="$2"
+    break
+  fi
+  shift
+done
+case "$org" in
+  placeholder-org) repo=placeholder-org/alpha ;;
+  other-placeholder-org) repo=other-placeholder-org/beta ;;
+  *) exit 9 ;;
+esac
+printf '{"repositories":[{"repo":"%s","issues":[],"open_prs":[],"merged_prs":[],"default_branch":"main","branches":[],"branch_read_degraded":false,"ci_runs":[]}]}\n' "$repo"
+"#,
+        )
+        .expect("write fixture GitHub worker");
+        fs::set_permissions(&worker, fs::Permissions::from_mode(0o700))
+            .expect("make fixture GitHub worker executable");
+    }
+
+    #[cfg(unix)]
+    fn prior_queue_bytes() -> Vec<u8> {
+        concat!(
+            r##"{"id":"placeholder-org/alpha#1","repo":"placeholder-org/alpha","ref":"#1","title":"Placeholder alpha decision","kind":"decision","mandate":{"reason":"placeholder"},"state":"deferred","opened":"2026-08-01T00:00:00Z","age_days":17,"aged_out":true,"needs_judgment":true,"blocked_by":[]}"##,
+            "\n",
+            r##"{"id":"other-placeholder-org/beta#2","repo":"other-placeholder-org/beta","ref":"#2","title":"Placeholder beta decision","kind":"decision","mandate":{"reason":"placeholder"},"state":"pending","opened":"2026-08-02T00:00:00Z","age_days":16,"aged_out":true,"needs_judgment":true,"blocked_by":[]}"##,
+            "\n",
+        )
+        .as_bytes()
+        .to_vec()
+    }
+
+    #[cfg(unix)]
+    fn prior_state_bytes() -> Vec<u8> {
+        br#"{"version":2,"sweep_mode":"full","repos":{"placeholder-org/alpha":{"cursor":"2026-08-01T00:00:00Z","records":{}},"other-placeholder-org/beta":{"cursor":"2026-08-02T00:00:00Z","records":{}}}}"#
+            .to_vec()
+    }
+
+    #[cfg(unix)]
+    fn write_prior_generation(home: &Path) -> (Vec<u8>, Vec<u8>) {
+        let queue = prior_queue_bytes();
+        let state = prior_state_bytes();
+        fs::write(home.join("queue.jsonl"), &queue).expect("write prior queue");
+        fs::write(home.join("state.json"), &state).expect("write prior state");
+        (queue, state)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn every_repository_failure_exits_nonzero_and_preserves_durable_bytes() {
+        if env::var(ACQUISITION_GUARD_CHILD).as_deref() == Ok("total-failure") {
+            let mut minter = FixtureMinter {
+                successful_anchors: BTreeSet::new(),
+            };
+            let error = run_sweep_with_minter(&acquisition_guard_options(), &mut minter)
+                .expect_err("zero acquired repositories must refuse");
+            assert!(matches!(
+                &error,
+                SweepError::AcquisitionRefused {
+                    acquired: 0,
+                    configured: 2,
+                    minimum: MIN_ACQUIRED_REPOSITORIES_TO_WRITE,
+                    ..
+                }
+            ));
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+
+        let home = tempdir().expect("temporary OSTROM_HOME");
+        write_acquisition_guard_roster(home.path());
+        write_fixture_github_worker(home.path());
+        let (queue_before, state_before) = write_prior_generation(home.path());
+        let output = run_acquisition_guard_child(
+            home.path(),
+            "sweep::tests::every_repository_failure_exits_nonzero_and_preserves_durable_bytes",
+            "total-failure",
+        );
+
+        assert!(
+            !output.status.success(),
+            "total failure unexpectedly succeeded"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("refusing to overwrite queue and state"));
+        assert!(stderr.contains("acquisition succeeded for 0 of 2"));
+        assert_eq!(
+            fs::read(home.path().join("queue.jsonl")).expect("read preserved queue"),
+            queue_before
+        );
+        assert_eq!(
+            fs::read(home.path().join("state.json")).expect("read preserved state"),
+            state_before
+        );
+        assert!(!home.path().join("previous").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_acquired_repository_crosses_threshold_and_merges_failed_rows() {
+        if env::var(ACQUISITION_GUARD_CHILD).as_deref() == Ok("partial-success") {
+            let mut minter = FixtureMinter {
+                successful_anchors: BTreeSet::from(["placeholder-org/alpha".to_owned()]),
+            };
+            let outcome = run_sweep_with_minter(&acquisition_guard_options(), &mut minter)
+                .expect("one acquired repository crosses the write threshold")
+                .0;
+            assert_eq!(outcome.project_count, 2);
+            assert!(outcome.faults.iter().any(|fault| {
+                fault.contains(
+                    "repository acquisition produced no result for other-placeholder-org/beta",
+                )
+            }));
+            return;
+        }
+
+        let home = tempdir().expect("temporary OSTROM_HOME");
+        write_acquisition_guard_roster(home.path());
+        write_fixture_github_worker(home.path());
+        let (queue_before, state_before) = write_prior_generation(home.path());
+        let output = run_acquisition_guard_child(
+            home.path(),
+            "sweep::tests::one_acquired_repository_crosses_threshold_and_merges_failed_rows",
+            "partial-success",
+        );
+        assert!(
+            output.status.success(),
+            "partial sweep stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let queue = fs::read_to_string(home.path().join("queue.jsonl")).expect("read merged queue");
+        assert!(!queue.contains("placeholder-org/alpha#1"));
+        assert!(queue.contains("other-placeholder-org/beta#2"));
+        assert!(queue.contains("other-placeholder-org/beta#0"));
+        let state: Value = serde_json::from_slice(
+            &fs::read(home.path().join("state.json")).expect("read merged state"),
+        )
+        .expect("parse merged state");
+        assert_eq!(
+            state["repos"]["other-placeholder-org/beta"]["cursor"],
+            "2026-08-02T00:00:00Z"
+        );
+        assert_eq!(
+            fs::read(home.path().join("previous/queue.jsonl")).expect("read previous queue"),
+            queue_before
+        );
+        assert_eq!(
+            fs::read(home.path().join("previous/state.json")).expect("read previous state"),
+            state_before
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fully_successful_sweep_writes_normally_and_preserves_previous_generation() {
+        if env::var(ACQUISITION_GUARD_CHILD).as_deref() == Ok("full-success") {
+            let mut minter = FixtureMinter {
+                successful_anchors: BTreeSet::from([
+                    "placeholder-org/alpha".to_owned(),
+                    "other-placeholder-org/beta".to_owned(),
+                ]),
+            };
+            run_sweep_with_minter(&acquisition_guard_options(), &mut minter)
+                .expect("fully acquired sweep succeeds");
+            return;
+        }
+
+        let home = tempdir().expect("temporary OSTROM_HOME");
+        write_acquisition_guard_roster(home.path());
+        write_fixture_github_worker(home.path());
+        let (queue_before, state_before) = write_prior_generation(home.path());
+        let output = run_acquisition_guard_child(
+            home.path(),
+            "sweep::tests::fully_successful_sweep_writes_normally_and_preserves_previous_generation",
+            "full-success",
+        );
+        assert!(
+            output.status.success(),
+            "successful sweep stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_ne!(
+            fs::read(home.path().join("queue.jsonl")).expect("read new queue"),
+            queue_before
+        );
+        assert_ne!(
+            fs::read(home.path().join("state.json")).expect("read new state"),
+            state_before
+        );
+        assert_eq!(
+            fs::read(home.path().join("previous/queue.jsonl")).expect("read previous queue"),
+            queue_before
+        );
+        assert_eq!(
+            fs::read(home.path().join("previous/state.json")).expect("read previous state"),
+            state_before
+        );
     }
 }
