@@ -10,7 +10,11 @@ use ostrom_core::RepositoryName;
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 
-use crate::{OstromPaths, set_private_file_mode};
+use crate::{
+    OstromPaths,
+    app_token::{InstallationTokenMinter, ScopedAppTokenRequest, authenticated_output},
+    set_private_file_mode,
+};
 
 const READ_PERMISSIONS: &str = "metadata:read,contents:read";
 const WRITE_PERMISSIONS: &str = "metadata:read,contents:write";
@@ -79,7 +83,10 @@ struct DerivedTree {
     files: BTreeMap<PathBuf, Vec<u8>>,
 }
 
-pub(crate) fn publish(options: &PublishOptions<'_>) -> Result<PublishOutcome, PublishError> {
+pub(crate) fn publish(
+    options: &PublishOptions<'_>,
+    minter: &mut dyn InstallationTokenMinter,
+) -> Result<PublishOutcome, PublishError> {
     // The destination deliberately has no environment fallback. In
     // particular, MANDATE_PUBLISH_REMOTE inherited by a scratch OSTROM_HOME
     // cannot turn an opted-out sweep into a publishing one.
@@ -92,7 +99,7 @@ pub(crate) fn publish(options: &PublishOptions<'_>) -> Result<PublishOutcome, Pu
     let allowlist = load_allowlist(&allowlist_path)?;
     let mut tree = derive_tree(options, &allowlist)?;
     let publish_dir = options.paths.state.join("publish");
-    prepare_checkout(options, &publish_dir)?;
+    prepare_checkout(options, &publish_dir, minter)?;
     reuse_previous_time_if_unchanged(&publish_dir, &mut tree)?;
     install_tree(&publish_dir, &tree)?;
 
@@ -127,6 +134,7 @@ pub(crate) fn publish(options: &PublishOptions<'_>) -> Result<PublishOutcome, Pu
                     "HEAD:state".into(),
                 ],
                 &[0],
+                minter,
             )?;
             Ok(PublishOutcome::Published)
         }
@@ -714,7 +722,11 @@ fn schema_id(value: &Value) -> Result<String, PublishError> {
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
-fn prepare_checkout(options: &PublishOptions<'_>, directory: &Path) -> Result<(), PublishError> {
+fn prepare_checkout(
+    options: &PublishOptions<'_>,
+    directory: &Path,
+    minter: &mut dyn InstallationTokenMinter,
+) -> Result<(), PublishError> {
     let parent = directory.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).map_err(|source| path_error(parent, source))?;
     if !directory.join(".git").is_dir() {
@@ -731,6 +743,7 @@ fn prepare_checkout(options: &PublishOptions<'_>, directory: &Path) -> Result<()
                 "--no-checkout".into(),
             ],
             &[0],
+            minter,
         )?;
     }
     set_private_directory_mode(directory)?;
@@ -752,6 +765,7 @@ fn prepare_checkout(options: &PublishOptions<'_>, directory: &Path) -> Result<()
             "state".into(),
         ],
         &[0, 2],
+        minter,
     )?;
     if remote.status.code() == Some(0) {
         scoped_required(
@@ -767,6 +781,7 @@ fn prepare_checkout(options: &PublishOptions<'_>, directory: &Path) -> Result<()
                 "state".into(),
             ],
             &[0],
+            minter,
         )?;
         git_required(
             Some(directory),
@@ -901,37 +916,30 @@ fn scoped_required(
     program: &str,
     arguments: &[std::ffi::OsString],
     accepted: &[i32],
+    minter: &mut dyn InstallationTokenMinter,
 ) -> Result<Output, PublishError> {
-    let gh_as = env::var_os("MANDATE_GH_AS_BIN")
-        .filter(|value| !value.is_empty())
-        .map_or_else(
-            || options.plugin_root.join("scripts/gh-as.sh"),
-            PathBuf::from,
-        );
-    let mut command = Command::new("bash");
-    command
-        .arg(&gh_as)
-        .arg("publisher")
-        .arg(options.destination.repository().as_str())
-        .arg("--repositories")
-        .arg(options.destination.repository().as_str())
-        .arg("--permissions")
-        .arg(permissions)
-        .arg("--")
-        .arg(program)
-        .args(arguments);
     let display = format!(
-        "{} {program} {}",
-        gh_as.display(),
+        "{program} {}",
         arguments
             .iter()
             .map(|value| value.to_string_lossy())
             .collect::<Vec<_>>()
             .join(" ")
     );
-    let output = command
-        .output()
-        .map_err(|error| command_spawn_error(&display, error))?;
+    let command = std::iter::once(program.into())
+        .chain(arguments.iter().cloned())
+        .collect::<Vec<std::ffi::OsString>>();
+    let repository = options.destination.repository().as_str();
+    let output = authenticated_output(
+        options.paths,
+        ScopedAppTokenRequest::new("publisher", repository, repository, permissions),
+        &command,
+        minter,
+    )
+    .map_err(|error| PublishError::Command {
+        command: display.clone(),
+        detail: error.to_string(),
+    })?;
     require_status(&display, output, accepted)
 }
 

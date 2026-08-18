@@ -16,8 +16,12 @@ use ostrom_core::{
 use serde_json::{Map, Value, json};
 
 use crate::{
-    LeaseRecord, OstromPaths, TraceAppend, append_trace, load_config_or_defaults, read_lease,
-    read_trace,
+    LeaseRecord, OstromPaths, TraceAppend,
+    app_token::{
+        AuthenticatedCommandError, GitHubInstallationTokenMinter, InstallationTokenMinter,
+        ScopedAppTokenRequest, authenticated_output,
+    },
+    append_trace, load_config_or_defaults, read_lease, read_trace,
 };
 
 const DEFAULT_DAILY_CAP_USD: f64 = 50.0;
@@ -115,6 +119,14 @@ struct DispatchContext<'a> {
 }
 
 pub fn run_dispatch(request: &DispatchRequest) -> Result<DispatchOutcome, DispatchError> {
+    let mut minter = GitHubInstallationTokenMinter;
+    run_dispatch_with_minter(request, &mut minter)
+}
+
+fn run_dispatch_with_minter(
+    request: &DispatchRequest,
+    minter: &mut dyn InstallationTokenMinter,
+) -> Result<DispatchOutcome, DispatchError> {
     if !request.order_file.is_file() {
         return Err(DispatchError::new(
             2,
@@ -158,7 +170,7 @@ pub fn run_dispatch(request: &DispatchRequest) -> Result<DispatchOutcome, Dispat
     let config = load_config_or_defaults(&request.paths, &request.working_directory).ok();
     resolve_source_repository(&context, config.as_ref())?;
 
-    let pages = match list_remote_branches(&context) {
+    let pages = match list_remote_branches(&context, minter) {
         Ok(pages) => pages,
         Err(fault) => {
             context.listing = ListingState::from_fault(&fault);
@@ -199,9 +211,9 @@ pub fn run_dispatch(request: &DispatchRequest) -> Result<DispatchOutcome, Dispat
     })?;
     context.listing = ListingState::from_listing(&listing);
     if let Some(branch) = listing.matched.as_ref() {
-        reject_unlanded_branch(&mut context, &pages, branch)?;
+        reject_unlanded_branch(&mut context, &pages, branch, minter)?;
     }
-    reject_closing_pull_requests(&mut context)?;
+    reject_closing_pull_requests(&mut context, minter)?;
 
     let resolved_codex = resolve_codex(&context)?;
     let resolved_node = resolve_node(&context, &resolved_codex)?;
@@ -270,6 +282,7 @@ pub fn run_dispatch(request: &DispatchRequest) -> Result<DispatchOutcome, Dispat
         &resolved_ostrom,
         &unit_path,
         &mut lease,
+        minter,
     );
     if result.is_err() {
         lease.release();
@@ -284,6 +297,7 @@ fn after_lease(
     resolved_ostrom: &Path,
     unit_path: &str,
     lease: &mut LeaseGuard,
+    minter: &mut dyn InstallationTokenMinter,
 ) -> Result<DispatchOutcome, DispatchError> {
     let open_prs = gh_json(
         context,
@@ -301,6 +315,7 @@ fn after_lease(
             "--json",
             "number,title,body,url",
         ],
+        minter,
     )
     .map_err(|_| {
         DispatchError::new(
@@ -684,6 +699,7 @@ fn normalize_remote(remote: &str) -> &str {
 
 fn list_remote_branches(
     context: &DispatchContext<'_>,
+    minter: &mut dyn InstallationTokenMinter,
 ) -> Result<Vec<Vec<RemoteBranch>>, BranchListingFault> {
     let mut pages = Vec::new();
     let mut branch_count = 0;
@@ -696,11 +712,19 @@ fn list_remote_branches(
             context,
             "metadata:read,contents:read",
             &["gh", "api", &endpoint],
+            minter,
         )
         .map_err(|error| BranchListingFault {
             page_count: pages.len(),
             branch_count,
-            detail: format!("page {page_number} failed (rc=1): {error}"),
+            detail: match error {
+                AuthenticatedCommandError::Authentication(error) => {
+                    format!("page {page_number} authentication failed: {error}")
+                }
+                AuthenticatedCommandError::Transport(error) => {
+                    format!("page {page_number} transport failed: {error}")
+                }
+            },
         })?;
         if !output.status.success() {
             let code = output.status.code().unwrap_or(1);
@@ -764,6 +788,7 @@ fn reject_unlanded_branch(
     context: &mut DispatchContext<'_>,
     pages: &[Vec<RemoteBranch>],
     branch: &RemoteBranch,
+    minter: &mut dyn InstallationTokenMinter,
 ) -> Result<(), DispatchError> {
     let default = gh_text_quiet(
         context,
@@ -778,6 +803,7 @@ fn reject_unlanded_branch(
             "--jq",
             ".defaultBranchRef.name",
         ],
+        minter,
     );
     let ahead = default
         .as_deref()
@@ -801,6 +827,7 @@ fn reject_unlanded_branch(
                     "--jq",
                     ".ahead_by",
                 ],
+                minter,
             )
         })
         .and_then(|value| value.parse::<u64>().ok());
@@ -820,6 +847,7 @@ fn reject_unlanded_branch(
             "--json",
             "number,state,mergedAt",
         ],
+        minter,
     )
     .map_err(|_| {
         DispatchError::new(
@@ -861,7 +889,10 @@ fn reject_unlanded_branch(
     ))
 }
 
-fn reject_closing_pull_requests(context: &mut DispatchContext<'_>) -> Result<(), DispatchError> {
+fn reject_closing_pull_requests(
+    context: &mut DispatchContext<'_>,
+    minter: &mut dyn InstallationTokenMinter,
+) -> Result<(), DispatchError> {
     let references = gh_json(
         context,
         "metadata:read,issues:read,pull_requests:read",
@@ -875,6 +906,7 @@ fn reject_closing_pull_requests(context: &mut DispatchContext<'_>) -> Result<(),
             "--json",
             "closedByPullRequestsReferences",
         ],
+        minter,
     )
     .map_err(|_| {
         DispatchError::new(
@@ -926,6 +958,7 @@ fn reject_closing_pull_requests(context: &mut DispatchContext<'_>) -> Result<(),
                 "--json",
                 "number,state,mergedAt,url",
             ],
+            minter,
         )
         .map_err(|_| {
             DispatchError::new(
@@ -1111,34 +1144,29 @@ fn gh_output(
     context: &DispatchContext<'_>,
     permissions: &str,
     command: &[&str],
-) -> Result<Output, String> {
-    let gh_as = env::var_os("MANDATE_GH_AS_BIN").map_or_else(
-        || context.request.plugin_root.join("scripts/gh-as.sh"),
-        PathBuf::from,
-    );
-    // Execute the wrapper directly rather than through `bash`. The shipped
-    // script is mode 755 with a shebang, so the interpreter is its own
-    // business — and forcing `bash` breaks a MANDATE_GH_AS_BIN override that
-    // names a non-shell executable, which is the whole point of the override.
-    Command::new(gh_as)
-        .arg("builder")
-        .arg(&context.order.repository)
-        .arg("--repositories")
-        .arg(&context.order.repository)
-        .arg("--permissions")
-        .arg(permissions)
-        .arg("--")
-        .args(command)
-        .output()
-        .map_err(|error| error.to_string())
+    minter: &mut dyn InstallationTokenMinter,
+) -> Result<Output, AuthenticatedCommandError> {
+    authenticated_output(
+        &context.request.paths,
+        ScopedAppTokenRequest::new(
+            "builder",
+            &context.order.repository,
+            &context.order.repository,
+            permissions,
+        ),
+        command,
+        minter,
+    )
 }
 
 fn gh_json(
     context: &DispatchContext<'_>,
     permissions: &str,
     command: &[&str],
+    minter: &mut dyn InstallationTokenMinter,
 ) -> Result<Value, String> {
-    let output = gh_output(context, permissions, command)?;
+    let output =
+        gh_output(context, permissions, command, minter).map_err(|error| error.to_string())?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).into_owned());
     }
@@ -1149,8 +1177,9 @@ fn gh_text_quiet(
     context: &DispatchContext<'_>,
     permissions: &str,
     command: &[&str],
+    minter: &mut dyn InstallationTokenMinter,
 ) -> Option<String> {
-    let output = gh_output(context, permissions, command).ok()?;
+    let output = gh_output(context, permissions, command, minter).ok()?;
     output
         .status
         .success()
@@ -1493,6 +1522,21 @@ mod tests {
         assert!(source.contains("Command::new(systemd)"));
         for forbidden in [["git", "push"], ["git", "branch"]] {
             assert!(!source.contains(&forbidden.join(" ")));
+        }
+    }
+
+    #[test]
+    fn rust_credential_callers_do_not_reference_the_shell_wrapper() {
+        let wrapper = ["gh-as", ".sh"].concat();
+        for (name, source) in [
+            ("dispatch.rs", include_str!("dispatch.rs")),
+            ("implement.rs", include_str!("implement.rs")),
+            ("publish.rs", include_str!("publish.rs")),
+        ] {
+            assert!(
+                !source.contains(&wrapper),
+                "source grep found the credential wrapper in {name}"
+            );
         }
     }
 

@@ -17,7 +17,7 @@ use thiserror::Error;
 
 use crate::{
     AppTokenError, OstromPaths, PublishDestination, PublishError, QueueDocument, StoreError,
-    app_token::{AppTokenRequest, mint_installation_token},
+    app_token::{GitHubInstallationTokenMinter, InstallationTokenMinter, ScopedAppTokenRequest},
     io_error,
     publish::{PublishOptions, PublishOutcome, publish},
     read_queue, set_private_file_mode, write_queue,
@@ -210,49 +210,6 @@ struct RepositoryEvidence<'a> {
     paths: &'a OstromPaths,
     work_orders: &'a [WorkOrderEvidence],
     queued_kinds: &'a BTreeMap<String, String>,
-}
-
-/// Wraps the minted token rather than copying it out.
-///
-/// `InstallationToken` deliberately has no `Debug`, `Display` or `Clone`, so a
-/// secret cannot drift into a formatted error or a second owner. Calling
-/// `expose().to_owned()` here would hand that guarantee back for nothing — the
-/// only consumer passes it straight into a child environment. The test variant
-/// carries its own placeholder string because no real token exists to wrap.
-enum SweepToken {
-    Minted(crate::app_token::InstallationToken),
-    #[cfg(test)]
-    Placeholder(String),
-}
-
-impl SweepToken {
-    fn expose(&self) -> &str {
-        match self {
-            Self::Minted(token) => token.expose(),
-            #[cfg(test)]
-            Self::Placeholder(value) => value.as_str(),
-        }
-    }
-}
-
-trait InstallationTokenMinter {
-    fn mint(
-        &mut self,
-        paths: &OstromPaths,
-        request: AppTokenRequest<'_>,
-    ) -> Result<SweepToken, AppTokenError>;
-}
-
-struct GitHubInstallationTokenMinter;
-
-impl InstallationTokenMinter for GitHubInstallationTokenMinter {
-    fn mint(
-        &mut self,
-        paths: &OstromPaths,
-        request: AppTokenRequest<'_>,
-    ) -> Result<SweepToken, AppTokenError> {
-        mint_installation_token(paths, request).map(SweepToken::Minted)
-    }
 }
 
 pub fn run_sweep(options: &SweepOptions) -> Result<SweepOutcome, SweepError> {
@@ -478,13 +435,16 @@ fn run_sweep_with_minter(
     // refusal path, including zero acquisition, returns above the writes and
     // therefore cannot reach this edge.
     if let PublishTarget::Explicit(destination) = &options.publish {
-        match publish(&PublishOptions {
-            paths: &options.paths,
-            plugin_root: &options.plugin_root,
-            destination,
-            published_at: options.started_at,
-            cadence_hours: config.cadence_hours,
-        }) {
+        match publish(
+            &PublishOptions {
+                paths: &options.paths,
+                plugin_root: &options.plugin_root,
+                destination,
+                published_at: options.started_at,
+                cadence_hours: config.cadence_hours,
+            },
+            minter,
+        ) {
             Ok(PublishOutcome::Published) => {
                 println!(
                     "mandate publish: published {}",
@@ -582,13 +542,13 @@ fn organization_scopes(config: &MandateConfig) -> BTreeMap<String, OrganizationS
 fn organization_token_request<'a>(
     scope: &'a OrganizationScope,
     repositories: &'a str,
-) -> AppTokenRequest<'a> {
-    AppTokenRequest {
-        role: "gatekeeper",
-        anchor_repository: &scope.anchor,
-        repositories: Some(repositories),
-        permissions: Some(SWEEP_TOKEN_PERMISSIONS),
-    }
+) -> ScopedAppTokenRequest<'a> {
+    ScopedAppTokenRequest::new(
+        "gatekeeper",
+        &scope.anchor,
+        repositories,
+        SWEEP_TOKEN_PERMISSIONS,
+    )
 }
 
 fn acquire_by_organization(
@@ -2881,6 +2841,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::app_token::ScopedInstallationToken;
 
     fn roster(repositories: &[&str]) -> MandateConfig {
         let projects = repositories
@@ -2929,10 +2890,10 @@ mod tests {
             organization_scopes(&roster(&["placeholder-org/alpha", "placeholder-org/beta"]));
         let repositories = scopes["placeholder-org"].repositories.join(",");
         let request = organization_token_request(&scopes["placeholder-org"], &repositories);
-        assert_eq!(request.role, "gatekeeper");
-        assert_eq!(request.anchor_repository, "placeholder-org/alpha");
-        assert_eq!(request.repositories, Some(repositories.as_str()));
-        assert_eq!(request.permissions, Some(SWEEP_TOKEN_PERMISSIONS));
+        assert_eq!(request.role(), "gatekeeper");
+        assert_eq!(request.anchor_repository(), "placeholder-org/alpha");
+        assert_eq!(request.repositories(), repositories);
+        assert_eq!(request.permissions(), SWEEP_TOKEN_PERMISSIONS);
     }
 
     #[test]
@@ -2983,11 +2944,14 @@ mod tests {
         fn mint(
             &mut self,
             _paths: &OstromPaths,
-            request: AppTokenRequest<'_>,
-        ) -> Result<SweepToken, AppTokenError> {
-            if self.successful_anchors.contains(request.anchor_repository) {
-                Ok(SweepToken::Placeholder(
-                    "placeholder-installation-token".to_owned(),
+            request: ScopedAppTokenRequest<'_>,
+        ) -> Result<ScopedInstallationToken, AppTokenError> {
+            if self
+                .successful_anchors
+                .contains(request.anchor_repository())
+            {
+                Ok(ScopedInstallationToken::placeholder(
+                    "placeholder-installation-token",
                 ))
             } else {
                 Err(AppTokenError::LookupHttp(403))
