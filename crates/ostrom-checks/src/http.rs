@@ -70,7 +70,14 @@ struct HttpGet {
 
 impl PreparedAction for HttpGet {
     fn execute(&self) -> ActionOutcome {
-        let Ok(client) = Client::builder().timeout(self.timeout).build() else {
+        // Without a User-Agent GitHub answers 403 regardless of credentials, so an
+        // http/get check against it would report a permission fault that does not
+        // exist. See ostrom_core::USER_AGENT.
+        let Ok(client) = Client::builder()
+            .user_agent(ostrom_core::USER_AGENT)
+            .timeout(self.timeout)
+            .build()
+        else {
             return ActionOutcome::Error(ActionFault::new("http_request_error", None));
         };
         let response = match client.get(self.url.clone()).send() {

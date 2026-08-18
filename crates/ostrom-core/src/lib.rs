@@ -54,3 +54,19 @@ pub use work_graph::{
     WORK_GRAPH_VERSION, WorkEdge, WorkEdgeSource, WorkGraph, WorkGraphFault, WorkGraphNode,
     WorkNodeInput, build_work_graph,
 };
+
+/// The `User-Agent` every outbound HTTP request must carry.
+///
+/// GitHub's REST API rejects a request without one — not with 401, which would
+/// point at credentials, but with **403 and an administrative-rules message**.
+/// `reqwest` sends no default, so a client built without this fails every call
+/// while looking like a permission problem.
+///
+/// This cost a production incident on 2026-08-18. The native App minter had
+/// never authenticated successfully; its tests pass because a local fixture
+/// server accepts requests with no User-Agent, and the failure only appears
+/// against real GitHub. The sweep then wrote an 11-row queue over a 135-row one.
+///
+/// It lives in core so both the store's minter and the checks crate's HTTP
+/// action share one definition rather than each remembering.
+pub const USER_AGENT: &str = concat!("ostrom/", env!("CARGO_PKG_VERSION"));
