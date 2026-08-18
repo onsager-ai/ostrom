@@ -16,7 +16,9 @@ mod paths;
 mod plan;
 mod publish;
 mod queue;
+mod replay;
 mod selection;
+mod selector;
 mod sweep;
 mod trace;
 mod work_order;
@@ -50,6 +52,7 @@ pub use queue::{
     QueueActionError, QueueDecision, QueueDocument, decide_queue_item, lint_queue_state,
     list_queue_json, read_queue, write_queue,
 };
+pub use replay::{ReplayError, ReplayOptions, replay};
 pub use selection::{
     PlanApplication, SelectAction, SelectError, SelectOutcome, SelectRequest, encode_selection,
     run_selection,

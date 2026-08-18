@@ -1,0 +1,19 @@
+provider: file
+cadence_hours: 24
+stuck_after_days: 7
+bounce_all:
+  - title:*credential*
+  - label:protected
+projects:
+  - repo: placeholder-org/alpha
+    delegated:
+      - scope:tooling
+      - type:docs
+    excluded:
+      - label:ignored
+    reserved: []
+    default: unclassified
+    paused: false
+    bounce:
+      - path:.github/workflows/release.yml
+      - ref:#42

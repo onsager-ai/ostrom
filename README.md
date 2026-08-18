@@ -348,7 +348,7 @@ Both are measured, and neither is reduced to a single score:
 - **False alarms** accrue going forward. Rejecting an item in `/ostrom:desk` appends one
   line to `~/.claude/ostrom/selector-events.jsonl` recording which selector put
   it in front of you. Nothing extra is asked at decision time.
-- **Misses** are computed retroactively. `scripts/replay.sh` is read-only: it
+- **Misses** are computed retroactively. `ostrom replay` is read-only: it
   scans merged pull requests for changes touching an irreversible surface —
   workflow files, release tooling, credential-shaped paths — that matched no
   bounce selector. Its output is a **lower bound**, not the miss rate: a change

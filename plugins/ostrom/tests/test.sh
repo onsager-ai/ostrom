@@ -7801,7 +7801,7 @@ jq -s -e '
   )
 ' "$events_file" >/dev/null
 
-# replay.sh per-selector report: state.json already has many classified
+# Native replay per-selector report: state.json already has many classified
 # items and selector-events.jsonl already has the two rejections above (one
 # attributed to a selector, one attributed to no selector at all). Neither
 # fixture repo's static PR data carries a mergedAt, so this run exercises
@@ -7810,7 +7810,7 @@ replay_fixture_output="$(
   CLAUDE_CONFIG_DIR="$fixture/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
     PATH="$fixture/bin:$PATH" \
     MANDATE_REPLAY_TIME="2026-08-01T00:00:00Z" \
-    bash "$PLUGIN_ROOT/scripts/replay.sh" 30
+    run_ostrom replay 30
 )"
 grep -q 'lower bound' <<<"$replay_fixture_output"
 grep -q '^  none flagged$' <<<"$replay_fixture_output"
@@ -7825,7 +7825,7 @@ if grep -Eqi 'accuracy|[0-9]%' <<<"$replay_fixture_output"; then
   exit 1
 fi
 
-# replay.sh miss detection, in a dedicated repo with three merged PRs. #101
+# Native replay miss detection, in a dedicated repo with three merged PRs. #101
 # touches a workflow file and matches no bounce selector — a miss. #102
 # touches a workflow file too, but its title matches the project's bounce
 # selector, so the tripwire would have fired — not a miss. #100 would also
@@ -7850,7 +7850,7 @@ replay_miss_output="$(
   CLAUDE_CONFIG_DIR="$replay_dir/config" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
     PATH="$fixture/bin:$PATH" \
     MANDATE_REPLAY_TIME="2026-08-01T00:00:00Z" \
-    bash "$PLUGIN_ROOT/scripts/replay.sh" 30
+    run_ostrom replay 30
 )"
 grep -q 'example-org/replay-repo#101' <<<"$replay_miss_output"
 if grep -q 'example-org/replay-repo#102' <<<"$replay_miss_output"; then
