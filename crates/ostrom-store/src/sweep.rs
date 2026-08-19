@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    io::Write,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -288,6 +289,7 @@ fn run_sweep_with_minter(
         .collect::<BTreeSet<_>>();
     let (work_orders, work_order_warnings) = load_work_orders(&options.paths)?;
     faults.extend(work_order_warnings);
+    append_observed_merges(&options.paths, &snapshots, &work_orders)?;
 
     let mirror = snapshots.clone();
     let mut snapshots_by_repo = snapshots
@@ -681,7 +683,7 @@ fn acquire_repository(
         "--limit",
         "200",
         "--json",
-        "number,title,author,closingIssuesReferences,createdAt,mergedAt,headRefOid,state",
+        "number,title,author,mergedBy,closingIssuesReferences,createdAt,mergedAt,headRefName,headRefOid,state",
     ])?;
     let merged_prs = exhaustive_array(merged_prs, repo_name, "recent merged pull-request query")?;
 
@@ -1710,18 +1712,10 @@ fn analyze_merge_gate(
         let Some(number) = number_field(pull, &["number"]) else {
             continue;
         };
-        let author_login = nonempty_string(pull, &["author", "login"])
-            .or_else(|| pull.pointer("/author/login").and_then(Value::as_str))
-            .unwrap_or("");
-        let is_bot = pull
-            .pointer("/author/is_bot")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-            || pull
-                .pointer("/author/isBot")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-        let machine_authored = is_bot || author_login.ends_with("[bot]");
+        let author = pull.get("author").unwrap_or(&Value::Null);
+        let author_login = author.get("login").and_then(Value::as_str).unwrap_or("");
+        let is_bot = actor_bot_flag(author);
+        let machine_authored = actor_is_loop(author);
         // Deduplicate and order by issue *number*, not by the rendered string.
         // These references reach the fingerprint through a join, so ordering
         // them lexicographically would place #10 before #9 and re-emit the
@@ -2212,6 +2206,156 @@ fn load_work_orders(
         }
     }
     Ok((orders, warnings))
+}
+
+fn append_observed_merges(
+    paths: &OstromPaths,
+    snapshots: &[RepositorySnapshot],
+    work_orders: &[WorkOrderEvidence],
+) -> Result<(), SweepError> {
+    let path = paths.merge_file();
+    let existing = read_jsonl_values(&path)?;
+    let mut known = BTreeSet::new();
+    for record in &existing {
+        let key = merge_natural_key(record).ok_or_else(|| {
+            SweepError::State(format!(
+                "{} contains a merge row without non-empty pr and merged_at",
+                path.display()
+            ))
+        })?;
+        known.insert(key);
+    }
+
+    let mut observed = snapshots
+        .iter()
+        .flat_map(|snapshot| merge_facts(snapshot, work_orders))
+        .collect::<Vec<_>>();
+    observed.sort_by_key(merge_natural_key);
+    let mut encoded = Vec::new();
+    for record in observed {
+        let key = merge_natural_key(&record).expect("derived merge fact has a natural key");
+        if !known.insert(key) {
+            continue;
+        }
+        serde_json::to_writer(&mut encoded, &record)
+            .map_err(|error| SweepError::State(error.to_string()))?;
+        encoded.push(b'\n');
+    }
+    if encoded.is_empty() {
+        return Ok(());
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| io_error("create directory", parent, error))?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|error| io_error("open merge ledger", &path, error))?;
+    set_private_file_mode(&path)?;
+    file.write_all(&encoded)
+        .map_err(|error| io_error("append merge ledger", &path, error))?;
+    Ok(())
+}
+
+fn merge_facts(snapshot: &RepositorySnapshot, work_orders: &[WorkOrderEvidence]) -> Vec<Value> {
+    let repo = snapshot.repo.as_str();
+    snapshot
+        .merged_prs
+        .iter()
+        .filter_map(|pull| {
+            let number = number_field(pull, &["number"])?;
+            let opened_at = nonempty_string(pull, &["createdAt"])?;
+            let merged_at = nonempty_string(pull, &["mergedAt"])?;
+            let mut record = Map::from_iter([
+                ("pr".to_owned(), json!(format!("{repo}#{number}"))),
+                ("opened_at".to_owned(), json!(opened_at)),
+                ("merged_at".to_owned(), json!(merged_at)),
+                (
+                    "opened_by_class".to_owned(),
+                    json!(actor_class(pull.get("author"))),
+                ),
+                (
+                    "merged_by_class".to_owned(),
+                    json!(actor_class(pull.get("mergedBy"))),
+                ),
+            ]);
+            if let Some(order_id) = merge_order_id(repo, pull, work_orders) {
+                record.insert("order_id".to_owned(), json!(order_id));
+            }
+            if let Some(head_sha) = nonempty_string(pull, &["headRefOid"]) {
+                record.insert("head_sha".to_owned(), json!(head_sha));
+            }
+            Some(Value::Object(record))
+        })
+        .collect()
+}
+
+fn merge_order_id<'a>(
+    repo: &str,
+    pull: &Value,
+    work_orders: &'a [WorkOrderEvidence],
+) -> Option<&'a str> {
+    let head_ref = nonempty_string(pull, &["headRefName"]);
+    let branch_matches = work_orders.iter().filter(|order| {
+        order.repository == repo && head_ref.is_some_and(|head| order.branch_name == head)
+    });
+    if let Some(order_id) = one_order_id(branch_matches) {
+        return Some(order_id);
+    }
+
+    let linked = linked_issues(pull)
+        .iter()
+        .filter_map(|issue| number_field(issue, &["number"]))
+        .map(|number| format!("{repo}#{number}"))
+        .collect::<BTreeSet<_>>();
+    one_order_id(
+        work_orders
+            .iter()
+            .filter(|order| order.repository == repo && linked.contains(&order.item_id)),
+    )
+}
+
+fn one_order_id<'a>(orders: impl Iterator<Item = &'a WorkOrderEvidence>) -> Option<&'a str> {
+    let ids = orders
+        .map(|order| order.order_id.as_str())
+        .filter(|order_id| !order_id.is_empty())
+        .collect::<BTreeSet<_>>();
+    (ids.len() == 1).then(|| *ids.first().expect("one order id exists"))
+}
+
+fn merge_natural_key(record: &Value) -> Option<(String, String)> {
+    Some((
+        nonempty_string(record, &["pr"])?.to_owned(),
+        nonempty_string(record, &["merged_at"])?.to_owned(),
+    ))
+}
+
+fn actor_bot_flag(actor: &Value) -> bool {
+    actor
+        .get("is_bot")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || actor.get("isBot").and_then(Value::as_bool).unwrap_or(false)
+}
+
+fn actor_is_loop(actor: &Value) -> bool {
+    actor_bot_flag(actor)
+        || actor
+            .get("login")
+            .and_then(Value::as_str)
+            .is_some_and(|login| login.ends_with("[bot]"))
+}
+
+fn actor_class(actor: Option<&Value>) -> &'static str {
+    if actor.is_some_and(actor_is_loop) {
+        "loop"
+    } else {
+        // Missing actor data is conservative: it can never manufacture an
+        // unattended delivery.
+        "principal"
+    }
 }
 
 pub fn load_config(paths: &OstromPaths, cwd: &Path) -> Result<MandateConfig, SweepError> {
@@ -3240,5 +3384,126 @@ printf '{"repositories":[{"repo":"%s","issues":[],"open_prs":[],"merged_prs":[],
             fs::read(home.path().join("previous/state.json")).expect("read previous state"),
             state_before
         );
+    }
+
+    fn merge_snapshot(merged_prs: Vec<Value>) -> RepositorySnapshot {
+        RepositorySnapshot {
+            repo: RepositoryName::new("placeholder-org/alpha")
+                .expect("valid placeholder repository"),
+            issues: Vec::new(),
+            issue_etag: None,
+            issue_not_modified: false,
+            open_prs: Vec::new(),
+            merged_prs,
+            default_branch: None,
+            branches: Vec::new(),
+            branch_read_degraded: false,
+            ci_runs: Vec::new(),
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn merge_facts_preserve_two_sided_attribution_and_optional_order() {
+        let snapshot = merge_snapshot(vec![
+            json!({
+                "number": 1,
+                "author": {"login": "builder[bot]", "is_bot": true},
+                "mergedBy": {"login": "gatekeeper[bot]", "is_bot": true},
+                "closingIssuesReferences": [{"number": 343}],
+                "createdAt": "2026-08-01T00:00:00Z",
+                "mergedAt": "2026-08-02T00:00:00Z",
+                "headRefName": "ostrom/343-placeholder",
+                "headRefOid": "placeholder-loop-sha",
+            }),
+            json!({
+                "number": 2,
+                "author": {"login": "builder[bot]", "isBot": true},
+                "mergedBy": {"login": "placeholder-principal", "is_bot": false},
+                "createdAt": "2026-08-03T00:00:00Z",
+                "mergedAt": "2026-08-04T00:00:00Z",
+            }),
+            json!({
+                "number": 3,
+                "author": {"login": "placeholder-principal", "is_bot": false},
+                "mergedBy": {"login": "gatekeeper[bot]", "is_bot": true},
+                "createdAt": "2026-08-05T00:00:00Z",
+                "mergedAt": "2026-08-06T00:00:00Z",
+            }),
+            json!({
+                "number": 4,
+                "author": {"login": "placeholder-principal", "is_bot": false},
+                "mergedBy": {"login": "placeholder-principal", "is_bot": false},
+                "createdAt": "2026-08-07T00:00:00Z",
+                "mergedAt": "2026-08-08T00:00:00Z",
+            }),
+        ]);
+        let work_orders = vec![WorkOrderEvidence {
+            repository: "placeholder-org/alpha".to_owned(),
+            branch_name: "ostrom/343-placeholder".to_owned(),
+            item_id: "placeholder-org/alpha#343".to_owned(),
+            order_id: "placeholder-order".to_owned(),
+        }];
+
+        let facts = merge_facts(&snapshot, &work_orders);
+
+        assert_eq!(facts[0]["opened_by_class"], "loop");
+        assert_eq!(facts[0]["merged_by_class"], "loop");
+        assert_eq!(facts[0]["order_id"], "placeholder-order");
+        assert_eq!(facts[1]["opened_by_class"], "loop");
+        assert_eq!(facts[1]["merged_by_class"], "principal");
+        assert!(facts[1].get("order_id").is_none());
+        assert_eq!(facts[2]["opened_by_class"], "principal");
+        assert_eq!(facts[2]["merged_by_class"], "loop");
+        assert_ne!(facts[2]["opened_by_class"], "loop");
+        assert_eq!(facts[3]["opened_by_class"], "principal");
+        assert_eq!(facts[3]["merged_by_class"], "principal");
+        let encoded = serde_json::to_string(&facts).expect("encode merge facts");
+        assert!(!encoded.contains("builder[bot]"));
+        assert!(!encoded.contains("gatekeeper[bot]"));
+        assert!(!encoded.contains("placeholder-principal"));
+    }
+
+    #[test]
+    fn merge_ledger_is_append_only_and_idempotent_across_sweeps() {
+        let home = tempdir().expect("temporary OSTROM_HOME");
+        let paths = OstromPaths {
+            config: home.path().to_path_buf(),
+            state: home.path().to_path_buf(),
+        };
+        let first = merge_snapshot(vec![json!({
+            "number": 1,
+            "author": {"login": "builder[bot]", "is_bot": true},
+            "mergedBy": {"login": "placeholder-principal", "is_bot": false},
+            "createdAt": "2026-08-01T00:00:00Z",
+            "mergedAt": "2026-08-02T00:00:00Z",
+        })]);
+        append_observed_merges(&paths, std::slice::from_ref(&first), &[])
+            .expect("append first observation");
+        let first_bytes = fs::read(paths.merge_file()).expect("read first ledger");
+
+        append_observed_merges(&paths, std::slice::from_ref(&first), &[])
+            .expect("repeat observation");
+        assert_eq!(
+            fs::read(paths.merge_file()).expect("read repeated ledger"),
+            first_bytes
+        );
+
+        let second = merge_snapshot(vec![
+            first.merged_prs[0].clone(),
+            json!({
+                "number": 2,
+                "author": {"login": "placeholder-principal", "is_bot": false},
+                "mergedBy": {"login": "placeholder-principal", "is_bot": false},
+                "createdAt": "2026-08-03T00:00:00Z",
+                "mergedAt": "2026-08-04T00:00:00Z",
+            }),
+        ]);
+        append_observed_merges(&paths, &[second], &[]).expect("append later sweep observation");
+        let rows = read_jsonl_values(&paths.merge_file()).expect("read merge ledger");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["pr"], "placeholder-org/alpha#1");
+        assert_eq!(rows[1]["pr"], "placeholder-org/alpha#2");
+        assert!(rows.iter().all(|row| row.get("order_id").is_none()));
     }
 }

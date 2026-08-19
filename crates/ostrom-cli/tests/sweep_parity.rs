@@ -348,6 +348,9 @@ esac
     assert!(calls.contains(
         "pr list --repo example-org/example-repo --state merged --search merged:>=2026-07-02 --limit 200"
     ));
+    assert!(calls.contains(
+        "number,title,author,mergedBy,closingIssuesReferences,createdAt,mergedAt,headRefName,headRefOid,state"
+    ));
     assert!(!calls.contains("--state all --limit 200"));
     assert!(
         calls.contains("api -X GET repos/example-org/example-repo/branches?per_page=100&page=1")

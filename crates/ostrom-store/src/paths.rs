@@ -46,6 +46,12 @@ impl OstromPaths {
         self.state.join("sprint.jsonl")
     }
 
+    /// Immutable merge facts observed across every sweep generation.
+    #[must_use]
+    pub fn merge_file(&self) -> PathBuf {
+        self.state.join("merge.jsonl")
+    }
+
     #[must_use]
     pub fn sweep_state_file(&self) -> PathBuf {
         self.state.join("state.json")
