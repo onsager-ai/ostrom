@@ -88,7 +88,8 @@ fn inherited_publish_environment_cannot_enable_publication_without_the_typed_opt
 
     assert!(
         output.status.success(),
-        "stderr: {}",
+        "stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
@@ -196,6 +197,81 @@ exec "$@"
     );
 }
 
+#[test]
+fn rejected_publication_keeps_the_successful_local_generation() {
+    let root = tempdir().expect("rejected local publication remote");
+    let (home, fixture) = write_sweep_fixture(root.path(), ACQUIRED_FIXTURE);
+    let remote = root.path().join("rejecting-state.git");
+    git(None, &["init", "--bare", "--quiet", path_text(&remote)]);
+    let hooks = remote.join("hooks");
+    let git_dir = format!("--git-dir={}", remote.display());
+    git(
+        None,
+        &[&git_dir, "config", "core.hooksPath", path_text(&hooks)],
+    );
+    executable(
+        &hooks.join("pre-receive"),
+        "#!/bin/sh\nprintf 'placeholder push rejection\\n' >&2\nexit 1\n",
+    );
+
+    let bin = root.path().join("bin");
+    fs::create_dir(&bin).expect("create adapter directory");
+    executable(
+        &bin.join("gh"),
+        r#"#!/bin/sh
+set -eu
+[ "$1" = repo ]
+[ "$2" = clone ]
+exec "$OSTROM_TEST_REAL_GIT" clone --no-checkout "$OSTROM_TEST_LOCAL_REMOTE" "$4"
+"#,
+    );
+    let gh_as = bin.join("gh-as.sh");
+    executable(
+        &gh_as,
+        r#"#!/bin/sh
+set -eu
+shift 7
+exec "$@"
+"#,
+    );
+    let allowlist = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../plugins/ostrom/config/publish-allowlist.json");
+    let output = run_sweep(&home, &fixture)
+        .args(["--publish-repository", "placeholder-org/alpha"])
+        .env("PATH", path_with(&bin))
+        .env("MANDATE_GH_AS_BIN", &gh_as)
+        .env("MANDATE_PUBLISH_ALLOWLIST", &allowlist)
+        .env("OSTROM_TEST_LOCAL_REMOTE", &remote)
+        .env(
+            "OSTROM_TEST_REAL_GIT",
+            which("git").expect("find real git executable"),
+        )
+        .env("GIT_AUTHOR_NAME", "Ostrom Test")
+        .env("GIT_AUTHOR_EMAIL", "ostrom@example.test")
+        .env("GIT_COMMITTER_NAME", "Ostrom Test")
+        .env("GIT_COMMITTER_EMAIL", "ostrom@example.test")
+        .output()
+        .expect("run sweep with rejected publication");
+
+    assert!(
+        output.status.success(),
+        "publication failure must not fail reconciliation: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(home.join("queue.jsonl").is_file());
+    assert!(home.join("state.json").is_file());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("publish failed; local records remain authoritative"),
+        "stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        git_output_bare_optional(&remote, &["show-ref", "--verify", "refs/heads/state"]).is_none()
+    );
+}
+
 fn git(directory: Option<&Path>, arguments: &[&str]) -> Output {
     let mut command = Command::new("git");
     if let Some(directory) = directory {
@@ -220,6 +296,18 @@ fn git_output_bare(remote: &Path, arguments: &[&str]) -> String {
         .expect("inspect local bare repository");
     assert!(output.status.success());
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+fn git_output_bare_optional(remote: &Path, arguments: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .arg(format!("--git-dir={}", remote.display()))
+        .args(arguments)
+        .output()
+        .expect("inspect optional local bare ref");
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 fn path_text(path: &Path) -> &str {

@@ -811,7 +811,7 @@ describe("doctor golden output", () => {
 
     rmSync(manifestPath);
     expect(run(fixture)).toContain(
-      "WARN|publish|no publish has been recorded|run mandate publish.sh and confirm the state branch is reachable\n",
+      "WARN|publish|no publish has been recorded|run ostrom sweep --publish-repository <owner/repository> and confirm the state branch is reachable\n",
     );
 
     writeFileSync(
@@ -819,7 +819,7 @@ describe("doctor golden output", () => {
       '{"published_at":"2026-07-31T11:00:00Z","expected_sweep_interval_hours":12}\n',
     );
     expect(run(fixture)).toContain(
-      "WARN|publish|publish stale, last 2026-07-31T11:00:00Z (older than 12h cadence)|run mandate publish.sh and confirm the state branch is reachable\n",
+      "WARN|publish|publish stale, last 2026-07-31T11:00:00Z (older than 12h cadence)|run ostrom sweep --publish-repository <owner/repository> and confirm the state branch is reachable\n",
     );
 
     writeFileSync(

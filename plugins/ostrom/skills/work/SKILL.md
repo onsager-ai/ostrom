@@ -103,7 +103,7 @@ successful repair changed a repository and therefore invalidated even a young
 The sweep is cheap and idempotent, so run it every builder pass here.
 
 ```sh
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/sweep.sh"
+ostrom sweep
 ```
 
 Then read, in order:

@@ -95,7 +95,7 @@ enum Command {
     },
     /// Move legacy Claude-hosted data to XDG config and state roots.
     Migrate,
-    /// Compare native and legacy command output in isolated scratch homes.
+    /// Compare native output with recorded legacy evidence in scratch state.
     Parity {
         #[command(subcommand)]
         command: ParityCommand,
@@ -226,14 +226,17 @@ enum WorkOrderCommand {
 
 #[derive(Debug, Subcommand)]
 enum ParityCommand {
-    /// Compare native and legacy sweep rows by id and field.
+    /// Compare native sweep rows with recorded shell rows by id and field.
     Sweep {
-        /// One clock shared by both implementations.
+        /// The clock used when the shell evidence was recorded.
         #[arg(long)]
         started_at: Option<String>,
-        /// Recorded GitHub responses for a hermetic native-side test.
-        #[arg(long, hide = true)]
-        fixture: Option<PathBuf>,
+        /// Recorded GitHub responses matching the shell evidence.
+        #[arg(long)]
+        fixture: PathBuf,
+        /// Queue bytes recorded from the retired shell implementation.
+        #[arg(long)]
+        recorded_queue: PathBuf,
     },
 }
 
@@ -439,6 +442,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 ParityCommand::Sweep {
                     started_at,
                     fixture,
+                    recorded_queue,
                 },
         } => {
             let started_at = resolve_started_at(started_at.as_deref())?;
@@ -453,6 +457,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 plugin_root,
                 started_at,
                 fixture,
+                recorded_queue,
             )?;
             let outcome = run_sweep_parity(&options)?;
             if outcome.differences.is_empty() {

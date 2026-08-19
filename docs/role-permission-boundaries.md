@@ -102,7 +102,7 @@ process, and never falls back to ambient `GH_TOKEN` or
 scope is recorded as an `installation-token-minted` trace fact; credential and
 installation identifiers are not recorded.
 
-The shared App's installation must therefore cover **every repository in the mandate roster**, in every organisation the roster spans — not only the ones with an open pull request at any given moment. `scripts/sweep.sh` reads issues, pull requests, default-branch CI, and commit history across the whole roster on every run, and mints one token per organisation for that reason ([#106](https://github.com/onsager-ai/ostrom/issues/106)). A repository the App is not installed on is an authentication fault there, not an empty result, and the sweep must report it as one — a silently empty queue reads as a healthy, quiet portfolio.
+The shared App's installation must therefore cover **every repository in the mandate roster**, in every organisation the roster spans — not only the ones with an open pull request at any given moment. The native sweep reads issues, pull requests, default-branch CI, and commit history across the whole roster on every run, and mints one token per organisation for that reason ([#106](https://github.com/onsager-ai/ostrom/issues/106)). A repository the App is not installed on is an authentication fault there, not an empty result, and the sweep must report it as one — a silently empty queue reads as a healthy, quiet portfolio.
 
 There is no second read-only App. Every role runs on the same machine and can
 reach the same plugin cache and secrets file, so a second key would not form a

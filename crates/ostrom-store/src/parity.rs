@@ -2,12 +2,13 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs, io,
     path::{Path, PathBuf},
-    process::Command,
 };
 
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use thiserror::Error;
+
+use crate::{OstromPaths, PublishTarget, SweepMode, SweepOptions, run_sweep};
 
 #[derive(Debug, Error)]
 pub enum ParityError {
@@ -15,12 +16,10 @@ pub enum ParityError {
     ScratchHomeRequired,
     #[error("parity sweep refuses the live legacy Ostrom home at {0}")]
     LiveHome(String),
-    #[error("parity sweep comparison target is missing: {0}")]
-    MissingSweepScript(String),
+    #[error("parity sweep recorded queue is missing: {0}")]
+    MissingRecordedQueue(String),
     #[error("could not prepare parity scratch space: {0}")]
     Scratch(String),
-    #[error("shell sweep failed: {0}")]
-    Shell(String),
     #[error("native sweep failed: {0}")]
     Native(String),
     #[error("could not compare parity queue: {0}")]
@@ -34,7 +33,8 @@ pub struct SweepParityOptions {
     pub executable: PathBuf,
     pub plugin_root: PathBuf,
     pub started_at: DateTime<Utc>,
-    pub fixture: Option<PathBuf>,
+    pub fixture: PathBuf,
+    pub recorded_queue: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -49,7 +49,8 @@ impl SweepParityOptions {
         executable: PathBuf,
         plugin_root: PathBuf,
         started_at: DateTime<Utc>,
-        fixture: Option<PathBuf>,
+        fixture: PathBuf,
+        recorded_queue: PathBuf,
     ) -> Result<Self, ParityError> {
         let source_home = env::var_os("OSTROM_HOME")
             .filter(|value| !value.is_empty())
@@ -68,15 +69,15 @@ impl SweepParityOptions {
             plugin_root,
             started_at,
             fixture,
+            recorded_queue,
         })
     }
 }
 
 pub fn run_sweep_parity(options: &SweepParityOptions) -> Result<SweepParityOutcome, ParityError> {
-    let sweep_script = options.plugin_root.join("scripts/sweep.sh");
-    if !sweep_script.is_file() {
-        return Err(ParityError::MissingSweepScript(
-            sweep_script.display().to_string(),
+    if !options.recorded_queue.is_file() {
+        return Err(ParityError::MissingRecordedQueue(
+            options.recorded_queue.display().to_string(),
         ));
     }
     if !options.source_home.is_dir() {
@@ -88,75 +89,32 @@ pub fn run_sweep_parity(options: &SweepParityOptions) -> Result<SweepParityOutco
 
     let scratch = tempfile::tempdir().map_err(|error| ParityError::Scratch(error.to_string()))?;
     let native_home = scratch.path().join("native-home");
-    let shell_config = scratch.path().join("shell-config");
-    let shell_home = shell_config.join("ostrom");
     fs::create_dir_all(&native_home).map_err(scratch_error)?;
-    fs::create_dir_all(&shell_home).map_err(scratch_error)?;
     copy_contents(&options.source_home, &native_home).map_err(scratch_error)?;
-    copy_contents(&options.source_home, &shell_home).map_err(scratch_error)?;
 
-    // The legacy sweep calls its sibling publish.sh unconditionally. A private
-    // script mirror with that one edge replaced makes publication unreachable,
-    // even when inherited configuration names a real destination.
-    let parity_plugin = scratch.path().join("parity-plugin");
-    let parity_scripts = parity_plugin.join("scripts");
-    fs::create_dir_all(&parity_scripts).map_err(scratch_error)?;
-    copy_contents(&options.plugin_root.join("scripts"), &parity_scripts).map_err(scratch_error)?;
-    fs::write(
-        parity_scripts.join("publish.sh"),
-        "#!/usr/bin/env bash\nexit 3\n",
-    )
-    .map_err(scratch_error)?;
+    // Recorded evidence makes the retired implementation unnecessary. The
+    // typed target keeps this scratch run publication-free even if an
+    // operator environment names a real destination.
+    run_sweep(&SweepOptions {
+        paths: OstromPaths {
+            config: native_home.clone(),
+            state: native_home.clone(),
+        },
+        working_directory: options.working_directory.clone(),
+        executable: options.executable.clone(),
+        plugin_root: options.plugin_root.clone(),
+        started_at: options.started_at,
+        requested_mode: SweepMode::Auto,
+        fixture: Some(options.fixture.clone()),
+        publish: PublishTarget::Disabled,
+    })
+    .map_err(|error| ParityError::Native(error.to_string()))?;
 
-    let instant = options
-        .started_at
-        .to_rfc3339_opts(SecondsFormat::Secs, true);
-    let shell = Command::new("bash")
-        .arg(parity_scripts.join("sweep.sh"))
-        .current_dir(&options.working_directory)
-        .env_remove("OSTROM_HOME")
-        .env_remove("ANTHROPIC_API_KEY")
-        .env_remove("MANDATE_SEMANTIC_DERIVER")
-        .env("CLAUDE_CONFIG_DIR", &shell_config)
-        .env("CLAUDE_PLUGIN_ROOT", &options.plugin_root)
-        .env("MANDATE_SECRETS_FILE", shell_home.join("secrets.yaml"))
-        .env("MANDATE_SWEEP_MODE", "auto")
-        .env("MANDATE_SWEEP_TIME", &instant)
-        .env_remove("MANDATE_SWEEP_ORG")
-        .env_remove("MANDATE_SWEEP_WORK")
-        .env_remove("MANDATE_SWEEP_MODE_EFFECTIVE")
-        .output()
-        .map_err(|error| ParityError::Shell(error.to_string()))?;
-    if !shell.status.success() {
-        return Err(ParityError::Shell(output_detail(&shell.stderr)));
-    }
-
-    let mut native = Command::new(&options.executable);
-    native.args(["sweep", "--started-at", &instant]);
-    if let Some(fixture) = &options.fixture {
-        native.arg("--fixture").arg(fixture);
-    }
-    let native = native
-        .current_dir(&options.working_directory)
-        .env_remove("ANTHROPIC_API_KEY")
-        .env_remove("MANDATE_SEMANTIC_DERIVER")
-        .env("OSTROM_HOME", &native_home)
-        .env("OSTROM_PLUGIN_ROOT", &options.plugin_root)
-        .env("MANDATE_SECRETS_FILE", native_home.join("secrets.yaml"))
-        .output()
-        .map_err(|error| ParityError::Native(error.to_string()))?;
-    if !native.status.success() {
-        return Err(ParityError::Native(output_detail(&native.stderr)));
-    }
-
-    compare_queues(
-        &shell_home.join("queue.jsonl"),
-        &native_home.join("queue.jsonl"),
-    )
+    compare_queues(&options.recorded_queue, &native_home.join("queue.jsonl"))
 }
 
 fn compare_queues(shell: &Path, native: &Path) -> Result<SweepParityOutcome, ParityError> {
-    let shell = read_rows(shell, "shell")?;
+    let shell = read_rows(shell, "recorded shell")?;
     let native = read_rows(native, "native")?;
     let ids = shell
         .keys()
@@ -263,15 +221,6 @@ fn copy_contents(source: &Path, destination: &Path) -> io::Result<()> {
 
 fn scratch_error(error: io::Error) -> ParityError {
     ParityError::Scratch(error.to_string())
-}
-
-fn output_detail(stderr: &[u8]) -> String {
-    let detail = String::from_utf8_lossy(stderr).trim().to_owned();
-    if detail.is_empty() {
-        "process exited without an error message".to_owned()
-    } else {
-        detail
-    }
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {
