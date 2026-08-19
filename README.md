@@ -42,7 +42,7 @@ inside one plugin.
 - `plugins/ostrom/` — the unified plugin: layered rules and touch capture plus portfolio sweep, digest, private queue, and gatekeeper skills
 - `plugins/ostrom/hooks/` — both SessionStart hooks: layered constitution injection and durable mandate-digest rendering
 - `plugins/ostrom/config/` — separate shipped defaults for touch (`touch-defaults.yaml`) and mandates (`mandate-defaults.yaml`), plus reference examples
-- `plugins/ostrom/runtime/run-node.sh` — Node-resolution shim retained for the legacy sweep's optional semantic derivation path
+- `plugins/ostrom/runtime/run-node.sh` — Node-resolution shim (`--resolve-only`) retained for the legacy sweep's optional semantic derivation path; it no longer launches doctor, which runs from the binary
 - `plugins/ostrom/tools/` + `plugins/ostrom/dist/semantic-derivation-cli.js` — the legacy sweep's still-live semantic derivation source, tests, and bundle
 - `crates/ostrom-core/` — pure Rust domain types and the async, substrate-neutral store port
 - `crates/ostrom-store/` — XDG paths plus legacy-compatible JSONL/file persistence
@@ -431,8 +431,16 @@ falls back to the `file` provider and keeps appending to a local markdown
 file indefinitely, and that looks exactly like working too. Nothing errors
 — touches just never reach another machine, or a documented bootstrap
 one-liner 404s for months because nothing ever checked. `/ostrom:doctor` is the
-thing that checks: read-only, mutates nothing, and turns each of those
-silent states into an `OK` / `WARN` / `FAIL` line with a concrete remedy.
+thing that checks: read-only against your configuration and state, and turns
+each of those silent states into an `OK` / `WARN` / `FAIL` line with a
+concrete remedy.
+
+One exception, stated because the claim is otherwise not quite true: the
+marketplace check runs `git fetch origin main` in the cached marketplace clone
+to tell whether it is still fast-forwardable. That updates remote-tracking refs
+in a cache directory. It touches no working tree, no configuration and no state
+— but it is not literally nothing, and a check that overstates its own
+innocence is the kind of thing this command exists to catch.
 
 ## Touch-log config
 

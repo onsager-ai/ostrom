@@ -116,4 +116,8 @@ if [ "$resolve_only" -eq 1 ]; then
   exit 0
 fi
 
-exec "$node_path" "$PLUGIN_ROOT/dist/doctor.js" "$@"
+# The doctor bundle this used to launch was deleted when doctor moved to Rust.
+# The only surviving caller is the legacy sweep's semantic derivation, which
+# uses --resolve-only above, so there is nothing left to exec.
+echo "run-node: only --resolve-only is supported; doctor now runs from the ostrom binary" >&2
+exit 2
