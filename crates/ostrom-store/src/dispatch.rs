@@ -1762,6 +1762,49 @@ mod tests {
         assert_eq!(find_in_nvm_root(Path::new("codex"), &nvm), None);
     }
 
+    /// The alias `nvm alias default 24` records a bare major version, not a
+    /// full one, and it is what the operator's machine actually holds: the
+    /// shim this replaced resolved it to the newest matching install. The
+    /// exact-version case above exercises a different branch entirely, so
+    /// without this the code path that runs in production is the untested one.
+    #[test]
+    fn a_major_version_alias_resolves_to_the_newest_matching_install() {
+        let root = tempdir().expect("temporary nvm major alias fixture");
+        let nvm = root.path().join("nvm");
+        // Deliberately spans majors and puts a higher *minor* below a lower
+        // one lexicographically: "v24.18.0" sorts before "v24.9.0" as text,
+        // so a string comparison would pick the wrong one.
+        for version in ["v22.22.3", "v24.9.0", "v24.15.0", "v24.18.0"] {
+            executable(&nvm.join(format!("versions/node/{version}/bin/codex")));
+        }
+        fs::create_dir_all(nvm.join("alias")).expect("create nvm alias directory");
+        fs::write(nvm.join("alias/default"), "24\n").expect("write major alias");
+
+        assert_eq!(
+            find_in_nvm_root(Path::new("codex"), &nvm).as_deref(),
+            Some(nvm.join("versions/node/v24.18.0/bin/codex").as_path())
+        );
+    }
+
+    /// A newer install whose binary is absent must not shadow the newest one
+    /// that is actually runnable — otherwise a half-removed version makes the
+    /// resolver report nothing rather than falling back.
+    #[test]
+    fn a_major_alias_skips_a_version_whose_binary_is_missing() {
+        let root = tempdir().expect("temporary nvm partial install fixture");
+        let nvm = root.path().join("nvm");
+        executable(&nvm.join("versions/node/v24.15.0/bin/codex"));
+        fs::create_dir_all(nvm.join("versions/node/v24.18.0/bin"))
+            .expect("create version directory with no binary");
+        fs::create_dir_all(nvm.join("alias")).expect("create nvm alias directory");
+        fs::write(nvm.join("alias/default"), "24\n").expect("write major alias");
+
+        assert_eq!(
+            find_in_nvm_root(Path::new("codex"), &nvm).as_deref(),
+            Some(nvm.join("versions/node/v24.15.0/bin/codex").as_path())
+        );
+    }
+
     #[test]
     fn launch_boundary_is_an_explicit_command_not_an_in_process_side_effect() {
         let source = include_str!("dispatch.rs");
