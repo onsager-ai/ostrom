@@ -248,6 +248,23 @@ fn run_implement_with_minter(
     request: &ImplementRequest,
     minter: &mut dyn InstallationTokenMinter,
 ) -> Result<String, ImplementError> {
+    // Dispatch passes the exact lease name so cleanup can be armed before the
+    // work order is even readable. Without this handoff, a truncated or missing
+    // order strands the dispatch-owned lease without ever constructing an RAII
+    // guard.
+    let inherited_lease_name = env::var("MANDATE_LEASE_NAME")
+        .ok()
+        .filter(|name| !name.trim().is_empty());
+    let mut inherited_lease = inherited_lease_name
+        .as_deref()
+        .map(|lease_name| {
+            adopt_implementer_lease(
+                request,
+                lease_name,
+                &request.order_file.display().to_string(),
+            )
+        })
+        .transpose()?;
     let order_bytes = fs::read(&request.order_file).map_err(|_| {
         ImplementError::new(
             2,
@@ -265,14 +282,19 @@ fn run_implement_with_minter(
     let lease_name = format!("implementer-item-{}.lease", order.item_hash());
     // Dispatch owns this item lease until a terminal row is durable; adoption
     // prevents an independently launched implementer from spending the order.
-    let lease = OwnedLease::adopt(&request.paths.state, &lease_name, &request.unit_name).map_err(
-        |error| {
-            let reason = match error {
-                LeaseActionError::OwnerMismatch => "lease-owner-mismatch",
-                _ => "lease-missing",
-            };
-            ImplementError::new(1, reason, format!("{reason}: {}", order.item_id))
-        },
+    if inherited_lease_name
+        .as_deref()
+        .is_some_and(|inherited| inherited != lease_name)
+    {
+        return Err(ImplementError::new(
+            1,
+            "lease-name-mismatch",
+            format!("lease-name-mismatch: {}", order.item_id),
+        ));
+    }
+    let lease = inherited_lease.take().map_or_else(
+        || adopt_implementer_lease(request, &lease_name, &order.item_id),
+        Ok,
     )?;
     let mut guard = TerminalGuard {
         paths: request.paths.clone(),
@@ -306,6 +328,20 @@ fn run_implement_with_minter(
             Err(error)
         }
     }
+}
+
+fn adopt_implementer_lease(
+    request: &ImplementRequest,
+    lease_name: &str,
+    item: &str,
+) -> Result<OwnedLease, ImplementError> {
+    OwnedLease::adopt(&request.paths.state, lease_name, &request.unit_name).map_err(|error| {
+        let reason = match error {
+            LeaseActionError::OwnerMismatch => "lease-owner-mismatch",
+            _ => "lease-missing",
+        };
+        ImplementError::new(1, reason, format!("{reason}: {item}"))
+    })
 }
 
 fn implement_inner(
