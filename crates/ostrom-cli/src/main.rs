@@ -201,7 +201,9 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum CheckCommand {
-    /// Prevent shell implementation lines from growing while they are retired.
+    /// Require the shipped plugin wiring and skill protocols to agree with the CLI.
+    PluginSurface,
+    /// Prevent shell implementation files from reappearing.
     ShellRetirement,
     /// Require changed shipped plugin content to carry a plugin version bump.
     SkillVersionBump {
@@ -430,6 +432,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             Err(error) => exit_message(&format!("ostrom credential: {error}"), error.exit_code()),
         },
         Command::Doctor { check } => run_doctor_command(check)?,
+        Command::Check {
+            command: CheckCommand::PluginSurface,
+        } => {
+            let report = ostrom_checks::check_plugin_surface(&env::current_dir()?)?;
+            if !report.is_clean() {
+                eprint!("{report}");
+                std::process::exit(1);
+            }
+        }
         Command::Check {
             command: CheckCommand::ShellRetirement,
         } => {
@@ -1547,6 +1558,19 @@ mod tests {
             parsed.command,
             Command::Check {
                 command: CheckCommand::ShellRetirement
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_plugin_surface_check() {
+        let parsed = Cli::try_parse_from(["ostrom", "check", "plugin-surface"])
+            .expect("parse plugin surface check");
+
+        assert!(matches!(
+            parsed.command,
+            Command::Check {
+                command: CheckCommand::PluginSurface
             }
         ));
     }

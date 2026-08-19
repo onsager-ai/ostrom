@@ -4,10 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-// The target is 0. The remaining 8,128 lines belong to tests/test.sh and four
-// production scripts being retired by spec/263-h1-scripts-hooks and
-// fix/323-dispatch-state-root.
-const SHELL_RETIREMENT_LINE_THRESHOLD: usize = 8_128;
+const SHELL_RETIREMENT_LINE_THRESHOLD: usize = 0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShellFile {

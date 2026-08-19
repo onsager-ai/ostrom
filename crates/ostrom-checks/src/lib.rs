@@ -10,6 +10,7 @@ mod command;
 mod doctor;
 mod http;
 mod judgment;
+mod plugin_surface;
 mod process;
 mod registry;
 mod shell_retirement;
@@ -25,6 +26,7 @@ pub use judgment::{
     ClaudeHarness, HarnessRequest, JudgmentHarness, JudgmentOutcome, JudgmentRegistry,
     PreparedJudgment,
 };
+pub use plugin_surface::{PluginSurfaceReport, PluginSurfaceViolation, check_plugin_surface};
 pub use registry::{
     ActionFault, ActionOutcome, ActionProvider, ActionRegistry, PreparedAction, PreparedCheck,
 };

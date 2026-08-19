@@ -353,7 +353,7 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
     })?;
     let log = run_dir.join(format!(
         "{}-{owner}.jsonl",
-        DateTime::<Utc>::from(SystemTime::now()).format("%Y%m%dT%H%M%SZ")
+        current_time().format("%Y%m%dT%H%M%SZ")
     ));
     let output = fs::File::create(&log).map_err(|error| {
         PassError::failed(
@@ -640,14 +640,7 @@ fn daily_spend(paths: &OstromPaths, day: &str) -> f64 {
 }
 
 fn pass_day() -> String {
-    let clock = env::var("MANDATE_NOW_EPOCH")
-        .ok()
-        .and_then(|value| value.parse::<i64>().ok())
-        .and_then(|value| DateTime::<Utc>::from_timestamp(value, 0));
-    clock
-        .unwrap_or_else(|| DateTime::<Utc>::from(SystemTime::now()))
-        .format("%Y-%m-%d")
-        .to_string()
+    current_time().format("%Y-%m-%d").to_string()
 }
 
 fn daily_cap() -> f64 {
@@ -704,14 +697,15 @@ fn pass_trace_time() -> String {
             return value;
         }
     }
-    let clock = env::var("MANDATE_NOW_EPOCH")
+    current_time().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+fn current_time() -> DateTime<Utc> {
+    env::var("MANDATE_NOW_EPOCH")
         .ok()
         .and_then(|value| value.parse::<i64>().ok())
-        .and_then(|value| DateTime::<Utc>::from_timestamp(value, 0));
-    clock
+        .and_then(|value| DateTime::<Utc>::from_timestamp(value, 0))
         .unwrap_or_else(|| DateTime::<Utc>::from(SystemTime::now()))
-        .format("%Y-%m-%dT%H:%M:%SZ")
-        .to_string()
 }
 
 fn generated_role_id() -> String {
@@ -735,10 +729,15 @@ fn lease_epoch_seconds() -> u64 {
 }
 
 fn wall_epoch_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+    env::var("MANDATE_NOW_EPOCH")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        })
 }
 
 fn positive_env(name: &str) -> Option<u64> {

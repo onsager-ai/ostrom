@@ -48,11 +48,21 @@ jobs:
       MSRV_TOOLCHAIN: ${{ needs.rust-toolchain.outputs.rust-toolchain }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
       - name: Install pinned Rust toolchain
         run: rustup toolchain install "$MSRV_TOOLCHAIN" --profile minimal --component clippy --component rustfmt
       - run: cargo +"$MSRV_TOOLCHAIN" fmt --all --check
       - run: cargo +"$MSRV_TOOLCHAIN" clippy --all-targets --all-features -- -D warnings
       - run: env -u OSTROM_HOME cargo +"$MSRV_TOOLCHAIN" test --workspace --all-features
+      - run: target/debug/ostrom check plugin-surface
+      - run: target/debug/ostrom check shell-retirement
+      - name: Require a plugin version change for shipped plugin content
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: target/debug/ostrom check skill-version-bump --base "$BASE_SHA" --head "$HEAD_SHA"
 
   windows-compile:
     # The release workflow builds five platform targets; this workflow built
@@ -80,6 +90,9 @@ jobs:
       MSRV_TOOLCHAIN: ${{ needs.rust-toolchain.outputs.rust-toolchain }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: 22
       - name: Install pinned Rust toolchain
         run: rustup toolchain install "$MSRV_TOOLCHAIN" --profile minimal
       - run: cargo +"$MSRV_TOOLCHAIN" build --locked --package ostrom-cli
@@ -87,48 +100,12 @@ jobs:
         run: |
           target/debug/ostrom --version > target/debug/ostrom-version.txt
           node npm/scripts/assert-version.mjs --version-output target/debug/ostrom-version.txt
-      - name: Test offline npm distribution
-        run: bash npm/tests/test.sh
-
-  plugin-integration:
-    needs: rust-toolchain
-    runs-on: ubuntu-latest
-    env:
-      MSRV_TOOLCHAIN: ${{ needs.rust-toolchain.outputs.rust-toolchain }}
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          fetch-depth: 0
-      # The doctor bundle is gone, but `npm/scripts/*.mjs` still run under Node —
-      # the release-floor assertion among them. Pinning it rather than
-      # inheriting whatever ubuntu-latest ships is the same reason the Rust
-      # toolchain is pinned: an unpinned runtime drifts silently until it fails.
-      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
-        with:
-          node-version: 22
-      - name: Install pinned Rust toolchain
-        run: rustup toolchain install "$MSRV_TOOLCHAIN" --profile minimal
-        working-directory: .
-      - name: Build Ostrom CLI for plugin integration tests
-        run: cargo +"$MSRV_TOOLCHAIN" build --locked --package ostrom-cli
-        working-directory: .
       - name: Check the plugin CLI floor is published
-        working-directory: .
         run: |
           if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
             node npm/scripts/assert-plugin-cli-floor.mjs --allow-inconclusive
           else
             node npm/scripts/assert-plugin-cli-floor.mjs
           fi
-      - name: Require a plugin version change for shipped plugin content
-        if: github.event_name == 'pull_request'
-        working-directory: .
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: target/debug/ostrom check skill-version-bump --base "$BASE_SHA" --head "$HEAD_SHA"
-      - name: Enforce shell retirement ratchet
-        working-directory: .
-        run: target/debug/ostrom check shell-retirement
-      - name: Run plugin integration tests
-        run: bash plugins/ostrom/tests/test.sh
+      - name: Test offline npm distribution
+        run: bash npm/tests/test.sh
