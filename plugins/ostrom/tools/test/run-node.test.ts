@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { spawnSync } from "node:child_process";
 
 const pluginRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
-const shim = join(pluginRoot, "scripts", "run-node.sh");
+const shim = join(pluginRoot, "runtime", "run-node.sh");
 const roots: string[] = [];
 
 function fakeNode(path: string, label: string): void {

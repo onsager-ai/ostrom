@@ -41,34 +41,12 @@ if [[ -n "$changed_output" ]]; then
   mapfile -t changed_scripts <<<"$changed_output"
 fi
 
-# Scripts that are permanently exempt from the retirement, and therefore from
-# the freeze. `run-node.sh` resolves the operator's Node runtime across PATH,
-# nvm, fnm, volta and asdf, because plugin scripts run non-interactively and
-# cannot source an interactive profile. Rust does not dissolve that problem —
-# the `doctor` bundle is Node, so something must still find Node, and porting
-# 119 lines of shell path-searching to 119 lines of Rust path-searching moves
-# it rather than retiring it. Confirmed the hard way on 2026-08-18, when the
-# operator's systemd units could resolve neither `ostrom` nor `node` from a
-# non-interactive login shell and the same search had to be written again.
-#
-# An exempt script is a living file, not a frozen one: it stays, so it must be
-# allowed to be maintained. Freezing a file nobody may delete only guarantees
-# it rots. Decided by the principal on 2026-08-18 (see #275).
-exempt_scripts=(
-  "plugins/ostrom/scripts/run-node.sh"
-)
-
-is_exempt() {
-  local candidate="$1"
-  local exempt
-  for exempt in "${exempt_scripts[@]}"; do
-    if [[ "$candidate" == "$exempt" ]]; then
-      return 0
-    fi
-  done
-  return 1
-}
-
+# No per-path exemptions. `run-node.sh` used to be listed here; it now lives in
+# plugins/ostrom/runtime/ instead, which is outside the frozen path entirely.
+# An exemption inside the freeze meant the retirement's own target could never
+# reach zero — the goal check counted files and excluded one, so 119 lines of
+# shell could ship while the number read as done. Moving the file makes zero
+# mean zero.
 has_bugfix_label=false
 while IFS= read -r label; do
   if [[ "$label" == "bash-bugfix" ]]; then
@@ -84,13 +62,6 @@ for script_path in "${changed_scripts[@]}"; do
   delta=$((head_lines - base_lines))
 
   if ((delta <= 0)); then
-    continue
-  fi
-
-  if is_exempt "$script_path"; then
-    printf '%s\n' \
-      "shell freeze: $script_path grew by $delta lines ($base_lines -> $head_lines); permanently exempt from the retirement." \
-      >&2
     continue
   fi
 
