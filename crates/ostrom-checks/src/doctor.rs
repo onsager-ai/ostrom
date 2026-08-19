@@ -30,6 +30,7 @@ pub const DOCTOR_CHECKS: &[&str] = &[
     "provider-reachable",
     "dispatch-source-roots",
     "trace-lease",
+    "trace-completeness",
     "work-orders",
     "builder-pass",
     "gatekeeper-pass",
@@ -229,6 +230,7 @@ fn run_named_check(context: &mut DoctorContext, name: &str) -> DoctorResult {
         "provider-reachable" => check_provider_reachable(context),
         "dispatch-source-roots" => check_dispatch_source_roots(context),
         "trace-lease" => check_trace_lease(context),
+        "trace-completeness" => check_trace_completeness(context),
         "work-orders" => check_work_orders(context),
         "builder-pass" => check_role_pass(context, DeliveryRole::Builder),
         "gatekeeper-pass" => check_role_pass(context, DeliveryRole::Gatekeeper),
@@ -2156,6 +2158,96 @@ fn check_trace_lease(context: &DoctorContext) -> DoctorResult {
     )
 }
 
+fn check_trace_completeness(context: &DoctorContext) -> DoctorResult {
+    let source = match &context.trace {
+        TraceFile::Missing => {
+            return DoctorResult::new(
+                DoctorStatus::Warn,
+                "trace-completeness",
+                "no gatekeeper pass ever recorded",
+                "run /ostrom:gatekeep and confirm it records pass-ended",
+            );
+        }
+        TraceFile::Unreadable => {
+            return DoctorResult::new(
+                DoctorStatus::Warn,
+                "trace-completeness",
+                "gatekeeper pass history is unreadable",
+                "inspect sprint.jsonl and fix its permissions",
+            );
+        }
+        TraceFile::Content(source) => source,
+    };
+    let mut owner = None;
+    let mut timestamp = None;
+    let mut item_selected = 0;
+    let mut gate_verdict_consumed = 0;
+    for record in source
+        .lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+    {
+        if owner.is_none() {
+            if record.get("kind").and_then(Value::as_str) == Some("pass-ended")
+                && record
+                    .get("fact")
+                    .and_then(|fact| fact.get("owner"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|owner| owner.starts_with("gatekeeper-"))
+            {
+                owner = record
+                    .get("fact")
+                    .and_then(|fact| fact.get("owner"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                timestamp = record.get("ts").and_then(Value::as_str).map(str::to_owned);
+            }
+            continue;
+        }
+        let kind = record.get("kind").and_then(Value::as_str);
+        if kind == Some("pass-started")
+            && record
+                .get("fact")
+                .and_then(|fact| fact.get("owner"))
+                .and_then(Value::as_str)
+                == owner.as_deref()
+        {
+            let Some(timestamp) = timestamp else {
+                return DoctorResult::new(
+                    DoctorStatus::Warn,
+                    "trace-completeness",
+                    "last gatekeeper pass has an invalid timestamp",
+                    "inspect sprint.jsonl; records must be written by ostrom trace append",
+                );
+            };
+            let detail = format!(
+                "gatekeeper pass {timestamp}: item-selected={item_selected}, gate-verdict-consumed={gate_verdict_consumed}"
+            );
+            return if item_selected > 0 && item_selected > gate_verdict_consumed {
+                DoctorResult::new(
+                    DoctorStatus::Fail,
+                    "trace-completeness",
+                    detail,
+                    "restart the gatekeeper session; it may be running a plugin older than the merge-side appends",
+                )
+            } else {
+                DoctorResult::new(DoctorStatus::Ok, "trace-completeness", detail, "")
+            };
+        }
+        match kind {
+            Some("item-selected") => item_selected += 1,
+            Some("gate-verdict-consumed") => gate_verdict_consumed += 1,
+            _ => {}
+        }
+    }
+    DoctorResult::new(
+        DoctorStatus::Warn,
+        "trace-completeness",
+        "no completed gatekeeper pass ever recorded",
+        "run /ostrom:gatekeep and confirm it records matching pass-started and pass-ended rows",
+    )
+}
+
 #[derive(Clone)]
 struct DispatchFact {
     item_id: String,
@@ -2872,6 +2964,7 @@ mod tests {
                 "OK|provider-reachable|file: {home}/.claude/ostrom does not exist yet, nearest existing ancestor {home} is writable|\n",
                 "FAIL|dispatch-source-roots|search_roots is empty; dispatch cannot resolve source repositories|configure search_roots with a parent directory containing the roster checkouts\n",
                 "WARN|trace-lease|trace absent; lease idle|run /ostrom:gatekeep and confirm it creates sprint.jsonl\n",
+                "WARN|trace-completeness|no gatekeeper pass ever recorded|run /ostrom:gatekeep and confirm it records pass-ended\n",
                 "OK|work-orders|no work orders in flight|\n",
                 "WARN|builder-pass|no builder pass ever recorded|run /ostrom:work and confirm it records pass-ended\n",
                 "WARN|gatekeeper-pass|no gatekeeper pass ever recorded|run /ostrom:gatekeep and confirm it records pass-ended\n",
