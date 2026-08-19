@@ -33,8 +33,8 @@ version_at() {
   '
 }
 
-# Skills are not the only shipped surface. `scripts/`, `hooks/` and the built
-# `dist/` bundle reach an installed session through the same versioned plugin
+# Skills are not the only shipped surface. `scripts/` and `hooks/` reach an
+# installed session through the same versioned plugin
 # cache, and that cache is keyed by version: an unchanged version means the
 # cached tree is never refetched, so a fix to one of them silently never ships.
 #
@@ -46,9 +46,7 @@ mapfile -t changed_shipped < <(
   git diff --name-only --diff-filter=ACMRD "$merge_base" "$head_ref" -- \
     'plugins/*/skills/*/SKILL.md' \
     'plugins/*/scripts/*' \
-    'plugins/*/hooks/*' \
-    'plugins/*/runtime/*' \
-    'plugins/*/dist/*' |
+    'plugins/*/hooks/*' |
     LC_ALL=C sort
 )
 
@@ -57,7 +55,7 @@ declare -A head_versions=()
 status=0
 
 for shipped_path in "${changed_shipped[@]}"; do
-  if [[ ! "$shipped_path" =~ ^plugins/([^/]+)/(skills|scripts|hooks|dist)/ ]]; then
+  if [[ ! "$shipped_path" =~ ^plugins/([^/]+)/(skills|scripts|hooks)/ ]]; then
     continue
   fi
 

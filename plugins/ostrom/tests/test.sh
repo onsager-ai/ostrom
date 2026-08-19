@@ -35,9 +35,6 @@ run_ostrom() {
 export MANDATE_SWEEP_TIME="2026-08-01T00:00:00Z"
 export MANDATE_TODAY="2026-08-01"
 export MANDATE_NOW_EPOCH="1785542400"
-# Semantic tests opt in explicitly below. Ambient operator configuration must
-# never turn this otherwise hermetic suite into a model or network client.
-unset ANTHROPIC_API_KEY MANDATE_SEMANTIC_DERIVER MANDATE_SEMANTIC_MODEL
 # Operator concurrency overrides must not replace roster values in fixtures
 # that deliberately exercise the parsed per-project setting. Individual tests
 # still set either variable on their own command when testing the override.

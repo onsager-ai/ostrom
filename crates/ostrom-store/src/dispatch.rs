@@ -1,6 +1,8 @@
 use std::{
     collections::BTreeSet,
-    env, fs,
+    env,
+    ffi::{OsStr, OsString},
+    fs,
     fs::OpenOptions,
     io::Write,
     path::{Path, PathBuf},
@@ -1055,16 +1057,7 @@ fn resolve_codex(context: &DispatchContext<'_>) -> Result<PathBuf, DispatchError
 }
 
 fn resolve_node(context: &DispatchContext<'_>, codex: &Path) -> Result<PathBuf, DispatchError> {
-    let output = Command::new("bash")
-        .arg(context.request.plugin_root.join("runtime/run-node.sh"))
-        .arg("--resolve-only")
-        .output();
-    let resolved = output
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|path| PathBuf::from(path.trim_end()));
-    resolved.ok_or_else(|| {
+    NodeResolver::from_environment().resolve().ok_or_else(|| {
         let _ = append_failure(context, "codex-unavailable", FailureDetail::default());
         DispatchError::new(
             1,
@@ -1119,42 +1112,168 @@ fn absolute_executable(candidate: &Path) -> Option<PathBuf> {
 }
 
 fn find_on_path(command: &Path) -> Option<PathBuf> {
-    env::split_paths(&env::var_os("PATH")?)
-        .find_map(|directory| absolute_executable(&directory.join(command)))
+    find_on_path_in(command, env::var_os("PATH").as_deref())
+}
+
+fn find_on_path_in(command: &Path, path: Option<&OsStr>) -> Option<PathBuf> {
+    env::split_paths(path?).find_map(|directory| absolute_executable(&directory.join(command)))
 }
 
 fn find_in_nvm(command: &Path) -> Option<PathBuf> {
-    let nvm = env::var_os("NVM_DIR")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".nvm")))?;
+    let home = nonempty_env_path("HOME");
+    let nvm = env_path_or_home("NVM_DIR", home.as_deref(), ".nvm")?;
+    find_in_nvm_root(command, &nvm)
+}
+
+fn find_in_nvm_root(command: &Path, nvm: &Path) -> Option<PathBuf> {
+    let default = fs::read_to_string(nvm.join("alias/default"))
+        .ok()?
+        .lines()
+        .next()?
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    let version = default.strip_prefix('v').unwrap_or(&default);
+    let parts = version.split('.').collect::<Vec<_>>();
+    if parts.len() == 3 && parts.iter().all(|part| is_ascii_number(part)) {
+        return absolute_executable(
+            &nvm.join("versions/node")
+                .join(format!("v{version}"))
+                .join("bin")
+                .join(command),
+        );
+    }
+    if parts.len() != 1 || !is_ascii_number(version) {
+        return None;
+    }
+
+    let prefix = format!("v{version}.");
     let mut candidates = fs::read_dir(nvm.join("versions/node"))
         .ok()?
         .flatten()
-        .map(|entry| entry.path().join("bin").join(command))
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let suffix = name.to_str()?.strip_prefix(&prefix)?;
+            let (minor, patch) = suffix.split_once('.')?;
+            if patch.contains('.') || !is_ascii_number(minor) || !is_ascii_number(patch) {
+                return None;
+            }
+            Some((
+                entry.path().join("bin").join(command),
+                minor.parse::<u64>().ok()?,
+                patch.parse::<u64>().ok()?,
+            ))
+        })
         .collect::<Vec<_>>();
-    candidates.sort_by(|left, right| {
-        let left_version = node_version(left);
-        let right_version = node_version(right);
-        right_version
-            .cmp(&left_version)
-            .then_with(|| right.cmp(left))
-    });
-    candidates
-        .into_iter()
-        .find_map(|candidate| absolute_executable(&candidate))
+    candidates.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut best = None;
+    let mut best_version = None;
+    for (candidate, minor, patch) in candidates {
+        if best_version.is_none_or(|current| (minor, patch) > current) {
+            if let Some(candidate) = absolute_executable(&candidate) {
+                best = Some(candidate);
+                best_version = Some((minor, patch));
+            }
+        }
+    }
+    best
 }
 
-fn node_version(candidate: &Path) -> Vec<u64> {
-    candidate
-        .parent()
-        .and_then(Path::parent)
-        .and_then(Path::file_name)
-        .and_then(|version| version.to_str())
-        .unwrap_or_default()
-        .trim_start_matches('v')
-        .split('.')
-        .map(|part| part.parse().unwrap_or_default())
-        .collect()
+fn is_ascii_number(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn nonempty_env_path(name: &str) -> Option<PathBuf> {
+    env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn env_path_or_home(name: &str, home: Option<&Path>, home_suffix: &str) -> Option<PathBuf> {
+    nonempty_env_path(name).or_else(|| home.map(|path| path.join(home_suffix)))
+}
+
+#[derive(Debug)]
+struct NodeResolver {
+    path: Option<OsString>,
+    nvm_dir: Option<PathBuf>,
+    fnm_dirs: Vec<PathBuf>,
+    volta_home: Option<PathBuf>,
+    asdf_data_dir: Option<PathBuf>,
+    standalone: Vec<PathBuf>,
+}
+
+impl NodeResolver {
+    fn from_environment() -> Self {
+        let home = nonempty_env_path("HOME");
+        let mut fnm_dirs = Vec::new();
+        if let Some(directory) = env_path_or_home("FNM_DIR", home.as_deref(), ".local/share/fnm") {
+            fnm_dirs.push(directory);
+        }
+        if let Some(home) = &home {
+            fnm_dirs.push(home.join(".fnm"));
+        }
+
+        let standalone = env::var_os("OSTROM_NODE_FALLBACKS").map_or_else(
+            || {
+                let mut paths = vec![
+                    PathBuf::from("/usr/local/bin/node"),
+                    PathBuf::from("/opt/homebrew/bin/node"),
+                ];
+                if let Some(home) = &home {
+                    paths.push(home.join(".local/bin/node"));
+                }
+                paths
+            },
+            |paths| {
+                paths
+                    .to_string_lossy()
+                    .split_whitespace()
+                    .map(PathBuf::from)
+                    .collect()
+            },
+        );
+
+        Self {
+            path: env::var_os("PATH"),
+            nvm_dir: env_path_or_home("NVM_DIR", home.as_deref(), ".nvm"),
+            fnm_dirs,
+            volta_home: env_path_or_home("VOLTA_HOME", home.as_deref(), ".volta"),
+            asdf_data_dir: env_path_or_home("ASDF_DATA_DIR", home.as_deref(), ".asdf"),
+            standalone,
+        }
+    }
+
+    fn resolve(&self) -> Option<PathBuf> {
+        let command = Path::new("node");
+        find_on_path_in(command, self.path.as_deref())
+            .or_else(|| {
+                self.nvm_dir
+                    .as_deref()
+                    .and_then(|directory| find_in_nvm_root(command, directory))
+            })
+            .or_else(|| {
+                self.fnm_dirs.iter().find_map(|directory| {
+                    absolute_executable(&directory.join("aliases/default/bin/node"))
+                })
+            })
+            .or_else(|| {
+                self.volta_home
+                    .as_deref()
+                    .and_then(|directory| absolute_executable(&directory.join("bin/node")))
+            })
+            .or_else(|| {
+                self.asdf_data_dir
+                    .as_deref()
+                    .and_then(|directory| absolute_executable(&directory.join("shims/node")))
+            })
+            .or_else(|| {
+                self.standalone
+                    .iter()
+                    .find_map(|candidate| absolute_executable(candidate))
+            })
+    }
 }
 
 fn positive_usize_env(name: &str) -> Result<Option<usize>, DispatchError> {
@@ -1532,11 +1651,14 @@ fn render_number(number: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path, process::Command};
+    use std::{ffi::OsString, fs, path::Path, process::Command};
 
     use tempfile::tempdir;
 
-    use super::{absolute_executable, describe_unparseable_listing, has_unpublished_tree};
+    use super::{
+        NodeResolver, absolute_executable, describe_unparseable_listing, find_in_nvm_root,
+        has_unpublished_tree,
+    };
 
     fn git(path: &Path, arguments: &[&str]) {
         assert!(
@@ -1548,6 +1670,138 @@ mod tests {
                 .expect("run git")
                 .success(),
             "git {arguments:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::create_dir_all(path.parent().expect("executable parent")).expect("create parent");
+        fs::write(path, "#!/bin/sh\nexit 0\n").expect("write executable");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod executable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn node_resolution_is_first_hit_wins_across_every_supported_layout() {
+        let root = tempdir().expect("temporary node resolution fixture");
+        let path_node = root.path().join("path/node");
+        let nvm = root.path().join("nvm");
+        let older_nvm_node = nvm.join("versions/node/v20.8.9/bin/node");
+        let nvm_node = nvm.join("versions/node/v20.10.1/bin/node");
+        let fnm = root.path().join("fnm");
+        let fnm_node = fnm.join("aliases/default/bin/node");
+        let legacy_fnm = root.path().join("home/.fnm");
+        let legacy_fnm_node = legacy_fnm.join("aliases/default/bin/node");
+        let volta = root.path().join("volta");
+        let volta_node = volta.join("bin/node");
+        let asdf = root.path().join("asdf");
+        let asdf_node = asdf.join("shims/node");
+        let standalone_node = root.path().join("standalone/node");
+        let resolver = NodeResolver {
+            path: Some(OsString::from(root.path().join("path"))),
+            nvm_dir: Some(nvm.clone()),
+            fnm_dirs: vec![fnm, legacy_fnm],
+            volta_home: Some(volta),
+            asdf_data_dir: Some(asdf),
+            standalone: vec![standalone_node.clone()],
+        };
+
+        assert_eq!(resolver.resolve(), None);
+
+        executable(&standalone_node);
+        assert_eq!(
+            resolver.resolve().as_deref(),
+            Some(standalone_node.as_path())
+        );
+
+        executable(&asdf_node);
+        assert_eq!(resolver.resolve().as_deref(), Some(asdf_node.as_path()));
+
+        executable(&volta_node);
+        assert_eq!(resolver.resolve().as_deref(), Some(volta_node.as_path()));
+
+        executable(&legacy_fnm_node);
+        assert_eq!(
+            resolver.resolve().as_deref(),
+            Some(legacy_fnm_node.as_path())
+        );
+
+        executable(&fnm_node);
+        assert_eq!(resolver.resolve().as_deref(), Some(fnm_node.as_path()));
+
+        fs::create_dir_all(nvm.join("alias")).expect("create nvm alias directory");
+        fs::write(nvm.join("alias/default"), "  v20 \nignored\n").expect("write major alias");
+        executable(&older_nvm_node);
+        executable(&nvm_node);
+        assert_eq!(resolver.resolve().as_deref(), Some(nvm_node.as_path()));
+
+        executable(&path_node);
+        assert_eq!(resolver.resolve().as_deref(), Some(path_node.as_path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nvm_resolution_uses_only_the_default_alias() {
+        let root = tempdir().expect("temporary nvm resolution fixture");
+        let nvm = root.path().join("nvm");
+        let default_node = nvm.join("versions/node/v18.19.1/bin/codex");
+        let newer_node = nvm.join("versions/node/v22.1.0/bin/codex");
+        executable(&default_node);
+        executable(&newer_node);
+        fs::create_dir_all(nvm.join("alias")).expect("create nvm alias directory");
+        fs::write(nvm.join("alias/default"), " v18.19.1 \n").expect("write exact alias");
+
+        assert_eq!(
+            find_in_nvm_root(Path::new("codex"), &nvm).as_deref(),
+            Some(default_node.as_path())
+        );
+
+        fs::write(nvm.join("alias/default"), "node\n").expect("write unsupported alias");
+        assert_eq!(find_in_nvm_root(Path::new("codex"), &nvm), None);
+    }
+
+    /// The alias `nvm alias default 24` records a bare major version, not a
+    /// full one, and it is what the operator's machine actually holds: the
+    /// shim this replaced resolved it to the newest matching install. The
+    /// exact-version case above exercises a different branch entirely, so
+    /// without this the code path that runs in production is the untested one.
+    #[test]
+    fn a_major_version_alias_resolves_to_the_newest_matching_install() {
+        let root = tempdir().expect("temporary nvm major alias fixture");
+        let nvm = root.path().join("nvm");
+        // Deliberately spans majors and puts a higher *minor* below a lower
+        // one lexicographically: "v24.18.0" sorts before "v24.9.0" as text,
+        // so a string comparison would pick the wrong one.
+        for version in ["v22.22.3", "v24.9.0", "v24.15.0", "v24.18.0"] {
+            executable(&nvm.join(format!("versions/node/{version}/bin/codex")));
+        }
+        fs::create_dir_all(nvm.join("alias")).expect("create nvm alias directory");
+        fs::write(nvm.join("alias/default"), "24\n").expect("write major alias");
+
+        assert_eq!(
+            find_in_nvm_root(Path::new("codex"), &nvm).as_deref(),
+            Some(nvm.join("versions/node/v24.18.0/bin/codex").as_path())
+        );
+    }
+
+    /// A newer install whose binary is absent must not shadow the newest one
+    /// that is actually runnable — otherwise a half-removed version makes the
+    /// resolver report nothing rather than falling back.
+    #[test]
+    fn a_major_alias_skips_a_version_whose_binary_is_missing() {
+        let root = tempdir().expect("temporary nvm partial install fixture");
+        let nvm = root.path().join("nvm");
+        executable(&nvm.join("versions/node/v24.15.0/bin/codex"));
+        fs::create_dir_all(nvm.join("versions/node/v24.18.0/bin"))
+            .expect("create version directory with no binary");
+        fs::create_dir_all(nvm.join("alias")).expect("create nvm alias directory");
+        fs::write(nvm.join("alias/default"), "24\n").expect("write major alias");
+
+        assert_eq!(
+            find_in_nvm_root(Path::new("codex"), &nvm).as_deref(),
+            Some(nvm.join("versions/node/v24.15.0/bin/codex").as_path())
         );
     }
 

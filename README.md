@@ -42,10 +42,8 @@ inside one plugin.
 - `plugins/ostrom/` — the unified plugin: layered rules and touch capture plus portfolio sweep, digest, private queue, and gatekeeper skills
 - `plugins/ostrom/hooks/` — both SessionStart hooks: layered constitution injection and durable mandate-digest rendering
 - `plugins/ostrom/config/` — separate shipped defaults for touch (`touch-defaults.yaml`) and mandates (`mandate-defaults.yaml`), plus reference examples
-- `plugins/ostrom/runtime/run-node.sh` — Node-resolution shim (`--resolve-only`) retained for the legacy sweep's optional semantic derivation path; it no longer launches doctor, which runs from the binary
-- `plugins/ostrom/tools/` + `plugins/ostrom/dist/semantic-derivation-cli.js` — the legacy sweep's still-live semantic derivation source, tests, and bundle
 - `crates/ostrom-core/` — pure Rust domain types and the async, substrate-neutral store port
-- `crates/ostrom-store/` — XDG paths plus legacy-compatible JSONL/file persistence
+- `crates/ostrom-store/` — XDG paths, legacy-compatible JSONL/file persistence, and native Node runtime resolution for Codex dispatch
 - `crates/ostrom-cli/` — the additive `ostrom` binary and sweep entry point
 - `repo-pointer/settings.json` — snippet to merge into each target repo's `.claude/settings.json`
 - `bootstrap.sh` — one command to make a fresh environment ostrom-aware (user-level enroll + config provisioning)

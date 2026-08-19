@@ -18,14 +18,6 @@ MANDATE_GATE_REPO_CONFIG="./.ostrom/gate.yaml"
 MANDATE_GATE_LOG="$MANDATE_DATA_DIR/gate.jsonl"
 MANDATE_EXCEPTIONS_LOG="$MANDATE_DATA_DIR/exceptions.jsonl"
 
-# Semantic derivation is an optional port. An explicit executable is useful
-# for hermetic fixtures and alternate providers; otherwise the bundled
-# adapter is enabled only by Anthropic's standard credential. Neither value
-# is part of mandate policy, and absence preserves the mechanical sweep.
-mandate_semantic_is_configured() {
-  [ -n "${MANDATE_SEMANTIC_DERIVER:-}" ] || [ -n "${ANTHROPIC_API_KEY:-}" ]
-}
-
 # Read a delivery role's GitHub App credentials from the machine-local secrets
 # file, preferring a role block so the shared-App cutover stays reversible.
 # This intentionally remains separate from the shipped/user/repository config
