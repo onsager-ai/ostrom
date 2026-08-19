@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/inject-constitution.sh\""
+            "command": "if command -v ostrom >/dev/null 2>&1; then ostrom hook session-start; fi"
           }
         ]
       },
@@ -13,7 +13,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/render-digest.sh\""
+            "command": "if command -v ostrom >/dev/null 2>&1; then ostrom hook digest; fi"
           }
         ]
       }

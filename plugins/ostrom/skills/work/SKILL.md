@@ -69,11 +69,11 @@ Before selecting new work or reading the queue, repair the builder's stale
 published pull requests across the complete configured roster:
 
 ```sh
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/repair-prs.sh" "$lease_owner"
+ostrom repair-prs "$lease_owner"
 ```
 
 This ordering is mandatory even when dispatchable work is already waiting:
-published work outranks producing more work. `repair-prs.sh` considers only an
+published work outranks producing more work. `ostrom repair-prs` considers only an
 open pull request that is both machine-authored and marked with the exact
 `Ostrom-Role: builder` body line, reports every eligible attempt on the trace,
 and leaves human-authored pull requests alone even if they carry that marker.
@@ -214,7 +214,7 @@ ostrom credential builder "$repository" \
 places it only in the child environment — the token never enters this
 session's shell state, is never assigned to a variable here, and is never
 written to disk. The implementer boundary follows
-the same rule for `git push`, as does `repair-prs.sh` for every repair-path
+the same rule for `git push`, as does `ostrom repair-prs` for every repair-path
 GitHub read, fetch, and push: `git` does not read that token on its own, so
 `ostrom credential` supplies a credential helper scoped to that process:
 

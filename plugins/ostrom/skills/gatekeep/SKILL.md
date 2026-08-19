@@ -62,16 +62,15 @@ an invisible pass.
 ## 3. Resolve the roster once per iteration
 
 Use the existing mandate config resolution. Do not read the YAML directly or
-implement another roster parser. A headless session cannot statically permit
-`source`, since sourcing evaluates its argument as shell code, so call the
-library as a command instead of sourcing it:
+implement another roster parser. Resolve the same layered roster through the
+native CLI:
 
 ```sh
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/mandate-lib.sh" config
+ostrom config
 ```
 
-This prints the same resolved roster JSON `mandate_load_config` returns to
-every in-process caller. If mandate is not configured, config resolution
+This prints the resolved roster JSON used by every native caller. If mandate
+is not configured, config resolution
 fails, or the resolved `projects` list is empty, report that fact to the
 principal and end the pass. From the resolved JSON, take only each
 project's `repo` pointer. Every roster repository is in scope, including a

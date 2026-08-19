@@ -1251,6 +1251,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn gate_config_preserves_shipped_user_repo_layering() {
+        let fixture = tempfile::tempdir().expect("temporary gate config fixture");
+        let paths = OstromPaths {
+            config: fixture.path().join("config"),
+            state: fixture.path().join("state"),
+        };
+        let repository = fixture.path().join("repository");
+        fs::create_dir_all(&paths.config).unwrap();
+        fs::create_dir_all(repository.join(".ostrom")).unwrap();
+        fs::write(
+            paths.config.join("gate.yaml"),
+            r#"provider: file
+bounce_all: []
+projects:
+  - repo: placeholder-org/placeholder-repo
+    required_checks: [verify-*]
+    bounce: [path:protected/**]
+    reserved: [41]
+"#,
+        )
+        .unwrap();
+        fs::write(
+            repository.join(".ostrom/gate.yaml"),
+            "bounce_all: [title:*principal review*]\n",
+        )
+        .unwrap();
+        let (config, error) =
+            load_gate_config(&paths, &repository, "placeholder-org/placeholder-repo");
+        assert!(error.is_empty());
+        let config = config.expect("layered gate config");
+        assert_eq!(config.bounce_all[0].as_str(), "title:*principal review*");
+        assert_eq!(
+            config.projects[0].repo.as_str(),
+            "placeholder-org/placeholder-repo"
+        );
+        assert_eq!(config.projects[0].required_checks, ["verify-*"]);
+        assert_eq!(config.projects[0].bounce[0].as_str(), "path:protected/**");
+        assert_eq!(config.projects[0].reserved, [41]);
+    }
+
+    #[test]
     fn target_parser_is_exact() {
         assert!(parse_target("placeholder-org/alpha#1").is_ok());
         for value in [

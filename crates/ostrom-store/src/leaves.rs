@@ -343,8 +343,7 @@ fn join_merges<'a>(
             let latest = sha_records
                 .iter()
                 .copied()
-                .filter(|record| string_value(record.get("head_sha")) == merged_sha)
-                .next_back();
+                .rfind(|record| string_value(record.get("head_sha")) == merged_sha);
             let outcome = if merged_sha.is_empty() {
                 AuditOutcome::MissingMergedSha
             } else if records.is_empty() {
