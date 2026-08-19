@@ -46,6 +46,8 @@ fn shell_workflow_guard_calls_the_native_unbypassable_check() {
     let source = fs::read_to_string(path).expect("read test workflow");
 
     assert!(source.contains("target/debug/ostrom check shell-retirement"));
+    assert!(source.contains("target/debug/ostrom check plugin-surface"));
+    assert!(!source.contains("plugin-integration:"));
     assert!(!source.contains("bash-bugfix"));
     assert!(!source.contains("PULL_REQUEST_LABELS"));
 }
