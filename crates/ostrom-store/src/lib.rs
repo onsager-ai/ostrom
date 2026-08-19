@@ -17,6 +17,7 @@ mod paths;
 mod plan;
 mod publish;
 mod queue;
+mod reap;
 mod repair;
 mod replay;
 mod selection;
@@ -54,6 +55,10 @@ pub use publish::{PublishDestination, PublishError};
 pub use queue::{
     QueueActionError, QueueDecision, QueueDocument, decide_queue_item, lint_queue_state,
     list_queue_json, read_queue, write_queue,
+};
+pub use reap::{
+    ReapWorktreesError, ReapWorktreesOptions, ReapWorktreesOutcome, ReapWorktreesSummary,
+    WorktreeReapReport, run_reap_worktrees,
 };
 pub use repair::{RepairOptions, RepairOutput, run_repair_prs};
 pub use replay::{ReplayError, ReplayOptions, replay};

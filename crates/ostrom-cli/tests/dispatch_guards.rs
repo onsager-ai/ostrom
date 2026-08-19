@@ -296,13 +296,19 @@ fn source_roots_refuse_before_remote_reads_or_reservations() {
 #[test]
 fn branch_listing_finds_exact_matches_across_pages_and_classifies_pr_state() {
     let page_one = matched_page();
-    for (pulls, allowed) in [
-        ("[]", false),
-        (r#"[{"number":1,"state":"OPEN","mergedAt":null}]"#, false),
-        (r#"[{"number":1,"state":"CLOSED","mergedAt":null}]"#, false),
+    for (pulls, reason) in [
+        ("[]", "branch-in-flight"),
+        (
+            r#"[{"number":1,"state":"OPEN","mergedAt":null}]"#,
+            "branch-in-flight",
+        ),
+        (
+            r#"[{"number":1,"state":"CLOSED","mergedAt":null}]"#,
+            "branch-in-flight",
+        ),
         (
             r#"[{"number":1,"state":"MERGED","mergedAt":"2026-08-01T00:00:00Z"}]"#,
-            true,
+            "branch-merged-not-cleaned",
         ),
     ] {
         let fixture = Fixture::new();
@@ -311,17 +317,11 @@ fn branch_listing_finds_exact_matches_across_pages_and_classifies_pr_state() {
             .env("OSTROM_TEST_BRANCH_PAGE_1", &page_one)
             .env("OSTROM_TEST_BRANCH_PRS", pulls)
             .env("OSTROM_TEST_AHEAD", "4"));
-        assert_eq!(output.status.success(), allowed, "{pulls}");
-        if allowed {
-            assert!(fixture.calls.exists());
-            assert_eq!(fixture.trace()[0]["kind"], "work-dispatched");
-        } else {
-            assert_refused(&output, 3, "matched_key=branch_name");
-            let row = &fixture.trace()[0];
-            assert_eq!(row["fact"]["reason"], "branch-already-pushed");
-            assert_eq!(row["fact"]["ahead_of_default"], 4);
-            assert_eq!(row["fact"]["branch_listing"]["page_count"], 1);
-        }
+        assert_refused(&output, 3, "matched_key=branch_name");
+        let row = &fixture.trace()[0];
+        assert_eq!(row["fact"]["reason"], reason);
+        assert_eq!(row["fact"]["ahead_of_default"], 4);
+        assert_eq!(row["fact"]["branch_listing"]["page_count"], 1);
     }
 
     let fixture = Fixture::new();
@@ -425,22 +425,21 @@ fn a_numeric_branch_name_coincidence_is_not_identity_evidence() {
 
 #[test]
 fn closing_pull_requests_are_identity_keys_but_part_of_prose_is_not() {
-    for state in ["OPEN", "MERGED"] {
-        let fixture = Fixture::new();
-        let url = "https://example.invalid/pull/91";
-        let references = json!({"closedByPullRequestsReferences":[{"url":url}]}).to_string();
-        let pull = json!({"number":91,"state":state,"mergedAt":null,"url":url}).to_string();
-        let output = run(fixture
-            .command()
-            .env("OSTROM_TEST_BRANCH_PAGE_1", default_page())
-            .env("OSTROM_TEST_CLOSING_REFS", references)
-            .env("OSTROM_TEST_CLOSING_PR", pull));
-        assert_refused(&output, 3, "matched_key=closing_pull_request");
-        assert_eq!(
-            fixture.trace()[0]["fact"]["matched_key"]["type"],
-            "closing_pull_request"
-        );
-    }
+    let fixture = Fixture::new();
+    let url = "https://example.invalid/pull/91";
+    let references = json!({"closedByPullRequestsReferences":[{"url":url}]}).to_string();
+    let pull = json!({"number":91,"state":"OPEN","mergedAt":null,"url":url}).to_string();
+    let output = run(fixture
+        .command()
+        .env("OSTROM_TEST_BRANCH_PAGE_1", default_page())
+        .env("OSTROM_TEST_CLOSING_REFS", references)
+        .env("OSTROM_TEST_CLOSING_PR", pull));
+    assert_refused(&output, 3, "matched_key=closing_pull_request");
+    assert_eq!(fixture.trace()[0]["fact"]["reason"], "branch-in-flight");
+    assert_eq!(
+        fixture.trace()[0]["fact"]["matched_key"]["type"],
+        "closing_pull_request"
+    );
 
     let fixture = Fixture::new();
     let output = run(
@@ -456,6 +455,110 @@ fn closing_pull_requests_are_identity_keys_but_part_of_prose_is_not() {
         output.status.success(),
         "Part of prose must remain dispatchable: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn merged_and_remote_cleaned_branch_reclaims_local_worktree_before_dispatch() {
+    let fixture = Fixture::new();
+    let worktree = fixture
+        .state
+        .join("implementer-worktrees")
+        .join(fixture.item_hash());
+    fs::create_dir_all(worktree.parent().expect("worktree parent"))
+        .expect("create worktree parent");
+    git(
+        &fixture.source,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            BRANCH,
+            worktree.to_str().expect("UTF-8 worktree"),
+            "refs/remotes/origin/main",
+        ],
+    );
+    let url = "https://example.invalid/pull/91";
+    let output = run(fixture
+        .command()
+        .env("OSTROM_TEST_BRANCH_PAGE_1", default_page())
+        .env(
+            "OSTROM_TEST_CLOSING_REFS",
+            json!({"closedByPullRequestsReferences":[{"url":url}]}).to_string(),
+        )
+        .env(
+            "OSTROM_TEST_CLOSING_PR",
+            json!({"number":91,"state":"MERGED","mergedAt":"2026-08-01T00:00:00Z","url":url})
+                .to_string(),
+        ));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!worktree.exists());
+    assert!(fixture.calls.exists());
+    assert!(
+        !Command::new("git")
+            .arg("-C")
+            .arg(&fixture.source)
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{BRANCH}"),
+            ])
+            .status()
+            .expect("inspect branch")
+            .success()
+    );
+    let trace = fixture.trace();
+    assert_eq!(trace[0]["kind"], "worktree-reclaimed");
+    assert_eq!(trace[0]["fact"]["worktree_count"], 1);
+    assert!(trace[0]["fact"]["reclaimed_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(trace[1]["kind"], "work-dispatched");
+}
+
+#[test]
+fn merged_branch_with_dirty_local_worktree_is_named_and_preserved() {
+    let fixture = Fixture::new();
+    let worktree = fixture
+        .state
+        .join("implementer-worktrees")
+        .join(fixture.item_hash());
+    fs::create_dir_all(worktree.parent().expect("worktree parent"))
+        .expect("create worktree parent");
+    git(
+        &fixture.source,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            BRANCH,
+            worktree.to_str().expect("UTF-8 worktree"),
+            "refs/remotes/origin/main",
+        ],
+    );
+    fs::write(worktree.join("preserved.txt"), "expensive work\n").expect("write dirty work");
+    let url = "https://example.invalid/pull/91";
+    let output = run(fixture
+        .command()
+        .env("OSTROM_TEST_BRANCH_PAGE_1", default_page())
+        .env(
+            "OSTROM_TEST_CLOSING_REFS",
+            json!({"closedByPullRequestsReferences":[{"url":url}]}).to_string(),
+        )
+        .env(
+            "OSTROM_TEST_CLOSING_PR",
+            json!({"number":91,"state":"MERGED","mergedAt":"2026-08-01T00:00:00Z","url":url})
+                .to_string(),
+        ));
+    assert_refused(&output, 3, "dirty or unreadable");
+    assert!(worktree.join("preserved.txt").exists());
+    assert!(!fixture.calls.exists());
+    assert_eq!(
+        fixture.trace()[0]["fact"]["reason"],
+        "branch-merged-not-cleaned"
     );
 }
 
