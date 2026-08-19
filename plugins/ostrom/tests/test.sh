@@ -4822,9 +4822,14 @@ YAML
 }
 
 # Load-time selector lint is the regression guard for sentence matchers.
+# Asserts the *Rust* wording, not the retired shell's. `mandate-lib.sh` said
+# "unknown selector prefix" for a selector with no prefix at all, which is the
+# message for a different condition; ostrom-core distinguishes MissingPrefix
+# from UnknownPrefix and says so. The shell's phrasing is not a contract to
+# preserve — it is the thing being retired.
 assert_bad_selector sentence \
   "platform and pipeline specs — grants and toolchains" \
-  "unknown selector prefix"
+  "selector needs a qualified prefix"
 assert_bad_selector title-star "title:production deployment" \
   "title selector must contain *"
 assert_bad_selector title-run "title:*abcdefghijklmnopqrstuvwxyz*" \

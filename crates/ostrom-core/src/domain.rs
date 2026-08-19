@@ -165,7 +165,7 @@ impl<'de> Deserialize<'de> for Selector {
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum SelectorError {
-    #[error("unknown selector prefix")]
+    #[error("selector needs a qualified prefix")]
     MissingPrefix,
     #[error("unknown selector prefix: {0}")]
     UnknownPrefix(String),
