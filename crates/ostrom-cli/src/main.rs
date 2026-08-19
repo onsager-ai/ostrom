@@ -24,15 +24,16 @@ use ostrom_store::{
     AssessmentHarness, AuditOptions, DigestOptions, DispatchOutcome, DispatchRequest,
     ExecutableAssessmentDeriver, GateError, GateOptions, HarnessAssessmentDeriver,
     ImplementRequest, MigrationOutcome, OstromPaths, PassRequest, PassRole, PlanOptions,
-    PublishDestination, PublishTarget, QueueDecision, ReplayOptions, SelectAction, SelectError,
-    SelectOutcome, SelectRequest, SignalFlags, SweepError, SweepMode, SweepOptions,
-    SweepParityOptions, TraceAppend, TraceView, UnavailableAssessmentDeriver, acquire_lease,
-    acquire_org_from_github, append_trace_checked, audit, branch_name, create_work_order,
-    credential_output, decide_queue_item, encode_org_snapshots, encode_selection, grant_excuse,
-    item_hash, lease_status, lint_queue_state, list_excuses, list_queue_json, local_drift, migrate,
-    read_trace_json, release_lease, render_constitution, render_digest, replay, run_dispatch,
-    run_gate, run_implement, run_pass, run_plan, run_repair_prs, run_selection, run_sweep,
-    run_sweep_parity, validate_lease_name, validate_work_order_file,
+    PublishDestination, PublishTarget, QueueDecision, ReapWorktreesOptions, ReplayOptions,
+    SelectAction, SelectError, SelectOutcome, SelectRequest, SignalFlags, SweepError, SweepMode,
+    SweepOptions, SweepParityOptions, TraceAppend, TraceView, UnavailableAssessmentDeriver,
+    acquire_lease, acquire_org_from_github, append_trace_checked, audit, branch_name,
+    create_work_order, credential_output, decide_queue_item, encode_org_snapshots,
+    encode_selection, grant_excuse, item_hash, lease_status, lint_queue_state, list_excuses,
+    list_queue_json, local_drift, migrate, read_trace_json, release_lease, render_constitution,
+    render_digest, replay, run_dispatch, run_gate, run_implement, run_pass, run_plan,
+    run_reap_worktrees, run_repair_prs, run_selection, run_sweep, run_sweep_parity,
+    validate_lease_name, validate_work_order_file,
 };
 
 #[derive(Debug, Parser)]
@@ -87,6 +88,12 @@ enum Command {
     Implement {
         work_order_file: PathBuf,
         unit_name: String,
+    },
+    /// Report or remove worktrees whose remote work is mechanically resolved.
+    ReapWorktrees {
+        /// Remove eligible clean worktrees. Omission is a dry run.
+        #[arg(long)]
+        apply: bool,
     },
     #[command(name = "__pass-worker", hide = true)]
     PassWorker {
@@ -540,6 +547,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             work_order_file.into_os_string(),
             unit_name.into(),
         ]),
+        Command::ReapWorktrees { apply } => {
+            let outcome = run_reap_worktrees(&ReapWorktreesOptions { paths, apply })?;
+            for report in &outcome.reports {
+                serde_json::to_writer(&mut io::stdout(), report)?;
+                println!();
+            }
+            serde_json::to_writer(&mut io::stdout(), &outcome.summary)?;
+            println!();
+        }
         Command::PassWorker {
             role,
             supervisor_pid,

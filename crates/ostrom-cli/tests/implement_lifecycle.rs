@@ -823,6 +823,10 @@ fn cached_token_accounting_and_failure_preservation_use_reported_components() {
         terminal["fact"]["worktree_path"],
         failed.worktree().display().to_string()
     );
+    assert!(
+        !git_output(&failed.worktree(), &["status", "--porcelain"]).is_empty(),
+        "failed work remains dirty so a reaper cannot discard it"
+    );
 }
 
 #[test]
