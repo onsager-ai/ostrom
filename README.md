@@ -209,18 +209,19 @@ project suppresses routine work but never reserved refs, tripwires, or failing
 CI. The first sweep baselines existing work, and selector changes re-baseline
 scope rather than flooding the queue.
 
-Run the read-only sweep hourly outside Claude Code. Incremental runs ask the
+Run the sweep hourly outside Claude Code. Without an explicit
+`--publish-repository`, it writes only private queue and state. Incremental runs ask the
 issues REST change feed only for updates after the stored cursor and reuse each
 repository's ETag, so a quiet repository receives a rate-limit-free `304`.
 Open pull requests are still listed in full because check-rollup and changed-file
 data can move without advancing a PR's `updatedAt`; the PR set is small, and
 refreshing it prevents stale CI drift. The sweep automatically performs a full
 issue reconciliation every 24 hours to remove closed items and heal a missed or
-clock-skewed cursor. For example, edit the placeholder clone path and install
+clock-skewed cursor. For example, edit the placeholder state path and install
 this with `crontab -e`:
 
 ```cron
-0 * * * * cd /absolute/path/to/ostrom && CLAUDE_PLUGIN_ROOT=/absolute/path/to/ostrom/plugins/ostrom /bin/bash /absolute/path/to/ostrom/plugins/ostrom/scripts/sweep.sh
+0 * * * * OSTROM_HOME=/absolute/path/to/scratch /absolute/path/to/ostrom sweep
 ```
 
 The SessionStart hook never calls `gh`; it renders the durable files written by

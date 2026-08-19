@@ -1163,9 +1163,8 @@ fn path_error(path: &Path, source: io::Error) -> PublishError {
 fn set_private_directory_mode(path: &Path) -> Result<(), PublishError> {
     use std::os::unix::fs::PermissionsExt;
 
-    // The checkout contains only public records, but keeping its Git metadata
-    // private preserves publish.sh's umask boundary and avoids exposing remote
-    // configuration through a more permissive process umask.
+    // The checkout contains only public records, but its Git metadata includes
+    // remote configuration that a permissive process umask must not expose.
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
         .map_err(|source| path_error(path, source))
 }

@@ -30,7 +30,8 @@ export function checkPublish(context: DoctorContext): CheckResult {
       status: "WARN",
       name: "publish",
       detail: "no publish has been recorded",
-      remedy: "run mandate publish.sh and confirm the state branch is reachable",
+      remedy:
+        "run ostrom sweep --publish-repository <owner/repository> and confirm the state branch is reachable",
     };
   }
 
@@ -51,7 +52,8 @@ export function checkPublish(context: DoctorContext): CheckResult {
       status: "WARN",
       name: "publish",
       detail: "publish manifest is malformed",
-      remedy: "run mandate publish.sh to regenerate the cached record tree",
+      remedy:
+        "run ostrom sweep --publish-repository <owner/repository> to regenerate the cached record tree",
     };
   }
 
@@ -69,7 +71,8 @@ export function checkPublish(context: DoctorContext): CheckResult {
       status: "WARN",
       name: "publish",
       detail: "publish manifest has invalid cadence or timestamp",
-      remedy: "run mandate publish.sh to regenerate the cached record tree",
+      remedy:
+        "run ostrom sweep --publish-repository <owner/repository> to regenerate the cached record tree",
     };
   }
 
@@ -79,7 +82,8 @@ export function checkPublish(context: DoctorContext): CheckResult {
       status: "WARN",
       name: "publish",
       detail: `publish stale, last ${publishedAt} (older than ${cadenceHours}h cadence)`,
-      remedy: "run mandate publish.sh and confirm the state branch is reachable",
+      remedy:
+        "run ostrom sweep --publish-repository <owner/repository> and confirm the state branch is reachable",
     };
   }
 

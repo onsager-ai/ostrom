@@ -32,9 +32,8 @@ const FULL_RECONCILIATION_HOURS: i64 = 24;
 /// distinguish a quiet portfolio from the 2026-08-18 authentication outage,
 /// so that incident-shaped result must never reach persistence.
 const MIN_ACQUIRED_REPOSITORIES_TO_WRITE: usize = 1;
-/// Read-only scope for an acquisition token, kept identical to the set
-/// `scripts/sweep.sh` requests so both paths mint the same grant. A sweep
-/// reads; it never writes, so no write permission belongs here.
+/// A sweep only observes portfolio state, so acquisition credentials must not
+/// gain a write permission merely because publication can follow separately.
 const SWEEP_TOKEN_PERMISSIONS: &str = "metadata:read,issues:read,pull_requests:read,checks:read,statuses:read,actions:read,contents:read";
 const SHIPPED_DEFAULTS: &str = include_str!("../../../plugins/ostrom/config/mandate-defaults.yaml");
 
@@ -2793,6 +2792,57 @@ mod tests {
             "cadence_hours: 1\nstuck_after_days: 7\nprojects:\n{projects}"
         ))
         .expect("the fixture roster is valid")
+    }
+
+    #[test]
+    fn reclassification_preserves_a_desk_decision() {
+        let id = "placeholder-org/alpha#1";
+        let existing = vec![
+            QueueDocument::from_value(json!({
+                "id": id,
+                "repo": "placeholder-org/alpha",
+                "ref": "#1",
+                "title": "Placeholder prior classification",
+                "kind": "decision",
+                "mandate": {"reason": "placeholder prior reason"},
+                "state": "deferred",
+                "opened": "2026-07-01T00:00:00Z",
+                "age_days": 31,
+                "aged_out": true,
+                "needs_judgment": true,
+                "blocked_by": [],
+            }))
+            .expect("valid prior queue row"),
+        ];
+        let generated = vec![json!({
+            "id": id,
+            "repo": "placeholder-org/alpha",
+            "ref": "#1",
+            "title": "Placeholder current classification",
+            "kind": "moved",
+            "mandate": {"reason": "placeholder current reason"},
+            "state": "pending",
+            "opened": "2026-07-01T00:00:00Z",
+            "age_days": 31,
+            "aged_out": true,
+            "needs_judgment": false,
+            "blocked_by": [],
+        })];
+
+        let reconciled = reconcile_queue(
+            existing,
+            generated,
+            &BTreeSet::from([id.to_owned()]),
+            &BTreeMap::new(),
+            &BTreeSet::from(["placeholder-org/alpha".to_owned()]),
+            &BTreeSet::new(),
+        )
+        .expect("reconcile placeholder queue");
+
+        assert_eq!(reconciled.len(), 1);
+        assert_eq!(reconciled[0].value()["state"], "deferred");
+        assert_eq!(reconciled[0].value()["kind"], "moved");
+        assert_eq!(reconciled[0].value()["needs_judgment"], false);
     }
 
     #[test]

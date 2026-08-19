@@ -1266,7 +1266,7 @@ function checkPublish(context) {
       status: "WARN",
       name: "publish",
       detail: "no publish has been recorded",
-      remedy: "run mandate publish.sh and confirm the state branch is reachable"
+      remedy: "run ostrom sweep --publish-repository <owner/repository> and confirm the state branch is reachable"
     };
   }
   let manifest;
@@ -1285,7 +1285,7 @@ function checkPublish(context) {
       status: "WARN",
       name: "publish",
       detail: "publish manifest is malformed",
-      remedy: "run mandate publish.sh to regenerate the cached record tree"
+      remedy: "run ostrom sweep --publish-repository <owner/repository> to regenerate the cached record tree"
     };
   }
   const publishedAt = manifest.published_at;
@@ -1296,7 +1296,7 @@ function checkPublish(context) {
       status: "WARN",
       name: "publish",
       detail: "publish manifest has invalid cadence or timestamp",
-      remedy: "run mandate publish.sh to regenerate the cached record tree"
+      remedy: "run ostrom sweep --publish-repository <owner/repository> to regenerate the cached record tree"
     };
   }
   const ageSeconds = nowEpoch3(context) - Math.floor(publishedMs / 1e3);
@@ -1305,7 +1305,7 @@ function checkPublish(context) {
       status: "WARN",
       name: "publish",
       detail: `publish stale, last ${publishedAt} (older than ${cadenceHours}h cadence)`,
-      remedy: "run mandate publish.sh and confirm the state branch is reachable"
+      remedy: "run ostrom sweep --publish-repository <owner/repository> and confirm the state branch is reachable"
     };
   }
   return {

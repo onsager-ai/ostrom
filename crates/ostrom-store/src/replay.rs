@@ -445,7 +445,7 @@ fn render_report(
     writeln!(output).expect("write String");
     writeln!(output, "fired = open items the last sweep classified via that selector (current snapshot, not lifetime history).").expect("write String");
     writeln!(output, "dismissed = /ostrom:desk rejections of a row that selector produced, recorded in selector-events.jsonl.").expect("write String");
-    writeln!(output, "path: only applies to PRs (sweep.sh gates it on $item.type == \"pr\"); for issues every prefix above is author-written and there is no content-derived gating at all.").expect("write String");
+    writeln!(output, "path: only applies to PRs; for issues every prefix above is author-written and there is no content-derived gating at all.").expect("write String");
     writeln!(output).expect("write String");
     let no_selector_dismissals = rejections
         .iter()
