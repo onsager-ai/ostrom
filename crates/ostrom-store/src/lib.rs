@@ -23,7 +23,7 @@ mod sweep;
 mod trace;
 mod work_order;
 
-pub use app_token::AppTokenError;
+pub use app_token::{AppTokenError, CredentialCommandError, credential_output};
 pub use check_store::JsonlCheckStore;
 pub use dispatch::{DispatchError, DispatchOutcome, DispatchRequest, run_dispatch};
 pub use file_store::JsonlSweepStore;

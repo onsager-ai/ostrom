@@ -26,7 +26,6 @@ usage() {
 lease_owner="$1"
 [ -n "$lease_owner" ] || usage
 
-GH_AS_BIN="${MANDATE_GH_AS_BIN:-$SCRIPT_DIR/gh-as.sh}"
 REPAIR_CAP=3
 QUERY_LIMIT=1000
 attempted=0
@@ -103,7 +102,7 @@ while IFS= read -r repository; do
   [ -n "$repository" ] || continue
   repositories=$((repositories + 1))
   repo_prs="$work/prs-$(printf '%s' "$repository" | tr '/:' '__').json"
-  if bash "$GH_AS_BIN" builder "$repository" \
+  if ostrom credential builder "$repository" \
     --repositories "$repository" \
     --permissions metadata:read,pull_requests:read -- \
     gh pr list --repo "$repository" --state open --limit "$QUERY_LIMIT" \
@@ -179,7 +178,7 @@ while IFS= read -r repository; do
     # cause — the failure it was reaching for is now visible and non-fatal as
     # `check-fetch-failed`, which is the mechanism for diagnosing it properly.
     # Widening a role's grant is the principal's call, not this fix's.
-    if bash "$GH_AS_BIN" builder "$repository" \
+    if ostrom credential builder "$repository" \
       --repositories "$repository" \
       --permissions metadata:read,pull_requests:read,checks:read,statuses:read -- \
       gh pr view "$number" --repo "$repository" \
@@ -257,7 +256,7 @@ while IFS= read -r candidate; do
     "ostrom-builder@users.noreply.github.com"
 
   remote_url="https://github.com/$repository.git"
-  if bash "$GH_AS_BIN" builder "$repository" \
+  if ostrom credential builder "$repository" \
     --repositories "$repository" \
     --permissions metadata:read,contents:read -- \
     git -C "$candidate_work" fetch --no-tags "$remote_url" \
@@ -349,7 +348,7 @@ Ostrom-Role: builder"
     continue
   fi
 
-  if bash "$GH_AS_BIN" builder "$repository" \
+  if ostrom credential builder "$repository" \
     --repositories "$repository" \
     --permissions metadata:read,contents:write -- \
     git -C "$candidate_work" push "$remote_url" \

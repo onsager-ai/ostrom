@@ -83,31 +83,29 @@ builder work.
 `gatekeeper.settings.json` sets `GH_TOKEN` and `GITHUB_TOKEN` to empty, so
 there is no ambient credential here to discard or fall back to by accident.
 Never call `gh` directly, and never run a command that itself calls `gh`
-(such as `ostrom gate`) directly either. A session's Bash tool statically
-rejects command substitution before permission matching, so this step
-cannot capture `app-token.sh`'s output into a variable
-(`token="$(app-token.sh ...)"`) the way an interactive shell would — no
-allow rule can fix that rejection, because it never reaches allow-rule
-matching in the first place. Route every `gh` call for a roster repository
-through `gh-as.sh`, naming the role and the repository ahead of the command
-to run:
+(such as `ostrom gate`) directly either. A session never needs to handle the
+installation token itself. Route every `gh` call for a roster repository
+through `ostrom credential`, naming the role, repository, and complete scope
+ahead of the command to run:
 
 ```sh
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/gh-as.sh" gatekeeper "$repository" \
+ostrom credential gatekeeper "$repository" \
+  --repositories "$repository" \
+  --permissions metadata:read,pull_requests:read -- \
   gh pr list --repo "$repository" --state open --limit 100 --json number
 ```
 
-`gh-as.sh` mints a fresh installation token for that repository inside its
-own process, exports it only there, and `exec`s the given command — the
-token never enters this session's shell state, is never assigned to a
-variable here, and is never written to disk. Exit `111` means `gh-as.sh`
-itself could not authenticate and the given command never ran at all. Any
+`ostrom credential` mints a fresh installation token for that repository and
+places it only in the child environment — the token never enters this
+session's shell state, is never assigned to a variable here, and is never
+written to disk. Exit `111` means the credential boundary could not start the
+safely authenticated command, and the given command never ran at all. Any
 other exit code is the given command's own, unchanged.
 
 The required `gatekeeper` argument names the caller at the call site; it does
-not narrow the shared token. `gh-as.sh` derives the repository-local
-`metadata:read,pull_requests:read` scope from this exact `gh pr list` command;
-every pagination retry must repeat the same command shape. The gatekeeper's own role is
+not narrow the shared token. The mandatory flags make the repository-local
+`metadata:read,pull_requests:read` scope explicit; every pagination retry must
+repeat the same command shape. The gatekeeper's own role is
 recorded in its `decision-taken` trace record, not stamped onto the merge commit — see
 `/ostrom:merge` step 4 for why. An `Ostrom-Role: builder` trailer arriving on a
 commit under review was written by the builder itself, so it is self-asserted
@@ -125,7 +123,7 @@ Keep these two exit-`111` cases distinct:
   pass.
 - **Minting fails for one repository.** Any other exit `111` from a correctly
   formed roster-repository invocation is scoped to that repository. Retry the
-  exact same `gh-as.sh` invocation once immediately, still with the
+  exact same `ostrom credential` invocation once immediately, still with the
   `gatekeeper` role and that repository. If the retry also exits `111`, add the
   repository once to `skipped_repos`, report that it was skipped, discard any
   partially enumerated candidates for it, and continue to the next repository.
@@ -142,7 +140,7 @@ token would escape the App's repository blast radius.
 ## 5. Enumerate every open pull request
 
 Poll GitHub for all open pull requests in every roster repository, issuing
-every call through `gh-as.sh` as in step 4. Each invocation mints and uses
+every call through `ostrom credential` as in step 4. Each invocation mints and uses
 its own token and exits with it, so there is no persisted `GH_TOKEN` to
 unset between repositories or between pages. Paginate until there are no more results. Do not filter candidates through mandate
 selectors, the queue, prior gate verdicts, draft state, labels, or conclusions

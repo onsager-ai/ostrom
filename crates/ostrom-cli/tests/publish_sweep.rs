@@ -131,7 +131,7 @@ printf '%s\n' "$*" >>"$OSTROM_TEST_GH_LOG"
 exec "$OSTROM_TEST_REAL_GIT" clone --no-checkout "$OSTROM_TEST_LOCAL_REMOTE" "$4"
 "#,
     );
-    let gh_as = bin.join("gh-as.sh");
+    let gh_as = bin.join("credential-boundary.sh");
     executable(
         &gh_as,
         r#"#!/bin/sh
@@ -225,7 +225,7 @@ set -eu
 exec "$OSTROM_TEST_REAL_GIT" clone --no-checkout "$OSTROM_TEST_LOCAL_REMOTE" "$4"
 "#,
     );
-    let gh_as = bin.join("gh-as.sh");
+    let gh_as = bin.join("credential-boundary.sh");
     executable(
         &gh_as,
         r#"#!/bin/sh

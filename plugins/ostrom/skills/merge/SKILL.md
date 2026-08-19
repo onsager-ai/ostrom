@@ -27,30 +27,29 @@ not use an ambient GitHub credential to discover it.
 there is no ambient credential here to discard or fall back to by accident.
 Never call `gh` directly, and never run a command that itself calls `gh`
 (such as `ostrom gate`) directly either, for the rest of this protocol. A
-session's Bash tool statically rejects command substitution before
-permission matching, so this step cannot capture `app-token.sh`'s output
-into a variable (`token="$(app-token.sh ...)"`) the way an interactive shell
-would — no allow rule can fix that rejection, because it never reaches
-allow-rule matching in the first place. Route every `gh` call through
-`gh-as.sh`, naming the role and the repository ahead of the command to run.
+session never needs to handle the installation token itself. Route every `gh`
+call through `ostrom credential`, naming the role, repository, and complete
+scope ahead of the command to run.
 Confirm the locally resolved repository read-only with:
 
 ```sh
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/gh-as.sh" gatekeeper "$repository" \
+ostrom credential gatekeeper "$repository" \
+  --repositories "$repository" \
+  --permissions metadata:read -- \
   gh repo view "$repository" --json nameWithOwner --jq .nameWithOwner
 ```
 
-`gh-as.sh` mints a fresh installation token for the resolved repository
-inside its own process, exports it only there, and `exec`s the given
-command — the token never enters this session's shell state, is never
-assigned to a variable here, and is never written to disk. Exit `111` means
-`gh-as.sh` itself could not authenticate and the given command never ran at
-all; report that and stop rather than retry with an ambient credential. Any
-other exit code is the given command's own, unchanged.
+`ostrom credential` mints a fresh installation token for the resolved
+repository and places it only in the child environment — the token never
+enters this session's shell state, is never assigned to a variable here, and
+is never written to disk. Exit `111` means the credential boundary could not
+start the safely authenticated command, and the given command never ran at
+all; report that and stop rather than retry with an ambient credential.
+Any other exit code is the given command's own, unchanged.
 
 The required `gatekeeper` argument names the caller at the call site; it does
-not narrow the shared token. `gh-as.sh` derives repository and permission
-scope from each command below, and refuses commands it cannot scope. Any `Ostrom-Role:` marker reaching this protocol —
+not narrow the shared token. Every call below explicitly supplies mandatory
+repository and permission scope. Any `Ostrom-Role:` marker reaching this protocol —
 on a commit or in a pull request body — was written by the role it names, so it
 is a self-asserted advisory record, not evidence of who acted, and never an
 input to the gate.
@@ -67,18 +66,19 @@ scratch.
 ## 3. Run the artifact gate
 
 `ostrom gate` calls `gh` itself, so it needs the same per-repository token as
-every other call in this protocol, routed through `gh-as.sh` as in step 2.
+every other call in this protocol, routed through `ostrom credential` as in step 2.
 Run it once, capturing its exit code before doing anything else with it:
 
 ```sh
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/gh-as.sh" gatekeeper "$repository" \
+ostrom credential gatekeeper "$repository" \
   --repositories "$repository" \
   --permissions metadata:read,issues:read,pull_requests:read,checks:read,statuses:read \
   -- ostrom gate "<owner/repo>#<PR number>"
 gate_exit=$?
 ```
 
-`gh-as.sh` exits `111` only when it could not authenticate — in that case
+`ostrom credential` exits `111` only when its credential boundary could not
+start the safely authenticated command — in that case
 `ostrom gate` never ran at all, and `$gate_exit` is not a verdict. Treat `111`
 the same way step 2 treats an authentication failure: report it and stop,
 rather than mistake it for one of `ostrom gate`'s own exit codes (`0` pass, `1`
@@ -133,12 +133,12 @@ caller's, is always about delivery, and never converts `inconclusive` into
 ## 4. Apply exactly the verdict
 
 - **Pass (exit 0)** — perform these four steps in order, routing each `gh`
-  call through `gh-as.sh` as in step 2 so it runs with a token minted for
+  call through `ostrom credential` as in step 2 so it runs with a token minted for
   this repository rather than this session's own empty credentials:
   1. Record the verdict on the pull request as a comment, writing it to a
      temporary file first so no PR-controlled text is interpolated into a
      shell command:
-     `bash "${CLAUDE_PLUGIN_ROOT}/scripts/gh-as.sh" gatekeeper "$repository" gh pr comment <PR number> --repo <owner/repo> --body-file <file>`.
+     `ostrom credential gatekeeper "$repository" --repositories "$repository" --permissions metadata:read,issues:write,pull_requests:read -- gh pr comment <PR number> --repo <owner/repo> --body-file <file>`.
 
      **Do not approve.** `gh pr review --approve` is not part of this
      protocol and must not be added back. Every delivery role authenticates
@@ -153,7 +153,7 @@ caller's, is always about delivery, and never converts `inconclusive` into
      record below, which is machine-readable and carries a reversal pointer
      an approval never had.
   2. Then run
-     `bash "${CLAUDE_PLUGIN_ROOT}/scripts/gh-as.sh" gatekeeper "$repository" gh pr merge <PR number> --repo <owner/repo>`.
+     `ostrom credential gatekeeper "$repository" --repositories "$repository" --permissions metadata:read,contents:write,pull_requests:write -- gh pr merge <PR number> --repo <owner/repo>`.
      Do not pass `--body` here to stamp a gatekeeper role trailer. On a squash
      merge `--body` *replaces* the default commit message rather than appending
      to it, and that default is where the builder's own commits — including
@@ -183,7 +183,7 @@ caller's, is always about delivery, and never converts `inconclusive` into
      close-keyword effect. This is an observation after the merge, not another
      gate and not permission to undo the merge or close an issue. Read the
      pull request's declared closing references, then read every referenced
-     issue's current state and title, routing every read through `gh-as.sh`
+     issue's current state and title, routing every read through `ostrom credential`
      with the `gatekeeper` role:
 
      ```sh
@@ -193,7 +193,9 @@ caller's, is always about delivery, and never converts `inconclusive` into
      check_errors='[]'
 
      if closing_result="$(
-       bash "${CLAUDE_PLUGIN_ROOT}/scripts/gh-as.sh" gatekeeper "$repository" \
+       ostrom credential gatekeeper "$repository" \
+         --repositories "$repository" \
+         --permissions metadata:read,issues:read,pull_requests:read -- \
          gh pr view "$pr_number" --repo "$repository" \
            --json closingIssuesReferences
      )"; then
@@ -224,7 +226,9 @@ caller's, is always about delivery, and never converts `inconclusive` into
      if [ "$(jq 'length' <<<"$check_errors")" -eq 0 ]; then
        while IFS= read -r issue_number; do
          if issue_result="$(
-           bash "${CLAUDE_PLUGIN_ROOT}/scripts/gh-as.sh" gatekeeper "$repository" \
+           ostrom credential gatekeeper "$repository" \
+             --repositories "$repository" \
+             --permissions metadata:read,issues:read -- \
              gh issue view "$issue_number" --repo "$repository" \
                --json number,state,title
          )"; then
@@ -338,7 +342,7 @@ caller's, is always about delivery, and never converts `inconclusive` into
      stranded issue. A failure here is recorded and reported before stopping;
      it is never retried with an ambient credential.
 
-  **Every one of these calls must go through `gh-as.sh`, never the
+  **Every one of these calls must go through `ostrom credential`, never the
   principal's account.** Removing the approve step removed the place where a
   fallback to the principal's identity used to be caught early, so nothing
   now fails before the merge itself. Route every call through the wrapper. An
@@ -350,7 +354,7 @@ caller's, is always about delivery, and never converts `inconclusive` into
   `gate-verdict-consumed` trace fact.
 - **Fail (exit 1)** — if `already_judged=false`, leave the complete gate output
   as one PR comment using
-  `bash "${CLAUDE_PLUGIN_ROOT}/scripts/gh-as.sh" gatekeeper "$repository" gh pr comment <PR number> --repo <owner/repo> --body-file <file>`;
+  `ostrom credential gatekeeper "$repository" --repositories "$repository" --permissions metadata:read,issues:write,pull_requests:read -- gh pr comment <PR number> --repo <owner/repo> --body-file <file>`;
   use a temporary file so PR-controlled text is never interpolated into a
   shell command. If `already_judged=true`, do not post again. Stop in both
   cases.
@@ -397,9 +401,9 @@ new commit arrives with the thread still open. Without this, `review_threads`
 is not strict — it is unclearable, and every merge needs a principal exception.
 
 Resolving still means calling `gh`, so it is still bound by step 2: route the
-`gh api graphql` call that resolves the thread through `gh-as.sh` the same
-way, naming `gatekeeper` and this repository ahead of it. `gh-as.sh` derives
-`metadata:read,pull_requests:write` for that mutation.
+`gh api graphql` call that resolves the thread through `ostrom credential` the
+same way, naming `gatekeeper`, this repository, and the explicit
+`metadata:read,pull_requests:write` permission scope ahead of that mutation.
 
 Resolve a thread only when **all** of these hold:
 

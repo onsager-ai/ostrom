@@ -24,8 +24,8 @@ use ostrom_store::{
     SelectError, SelectOutcome, SelectRequest, SignalFlags, SweepError, SweepMode, SweepOptions,
     SweepParityOptions, TraceAppend, TraceView, UnavailableAssessmentDeriver, acquire_lease,
     acquire_org_from_github, append_trace_checked, audit, branch_name, create_work_order,
-    decide_queue_item, encode_org_snapshots, encode_selection, grant_excuse, item_hash,
-    lease_status, lint_queue_state, list_excuses, list_queue_json, local_drift, migrate,
+    credential_output, decide_queue_item, encode_org_snapshots, encode_selection, grant_excuse,
+    item_hash, lease_status, lint_queue_state, list_excuses, list_queue_json, local_drift, migrate,
     read_trace_json, release_lease, replay, run_dispatch, run_gate, run_implement, run_pass,
     run_plan, run_selection, run_sweep, run_sweep_parity, validate_lease_name,
     validate_work_order_file,
@@ -40,6 +40,20 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Run one command with a scoped GitHub App installation credential.
+    Credential {
+        role: String,
+        repository: String,
+        /// Comma-separated owner/repository scope for the installation token.
+        #[arg(long)]
+        repositories: String,
+        /// Comma-separated permission:level scope for the installation token.
+        #[arg(long)]
+        permissions: String,
+        /// Command and arguments; `--` is required before this tail.
+        #[arg(required = true, num_args = 1.., last = true)]
+        child: Vec<OsString>,
+    },
     /// Diagnose the installed plugin, CLI, and local Ostrom state.
     Doctor {
         /// Run exactly one named doctor check.
@@ -294,6 +308,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let paths = compatible_command_paths();
     match cli.command {
+        Command::Credential {
+            role,
+            repository,
+            repositories,
+            permissions,
+            child,
+        } => match credential_output(
+            &paths,
+            &role,
+            &repository,
+            &repositories,
+            &permissions,
+            &child,
+        ) {
+            Ok(output) => {
+                io::stdout().write_all(&output.stdout)?;
+                io::stderr().write_all(&output.stderr)?;
+                if !output.status.success() {
+                    std::process::exit(output.status.code().unwrap_or(1));
+                }
+            }
+            Err(error) => exit_message(&format!("ostrom credential: {error}"), error.exit_code()),
+        },
         Command::Doctor { check } => run_doctor_command(check)?,
         Command::Pass { role } => supervise(&["__pass-worker".into(), role_name(role).into()]),
         Command::Implement {
@@ -1288,4 +1325,77 @@ fn legacy_home() -> Result<PathBuf, Box<dyn std::error::Error>> {
     }
     let base = BaseDirs::new().ok_or("could not resolve the legacy home directory")?;
     Ok(base.home_dir().join(".claude/ostrom"))
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser as _;
+
+    use super::{Cli, Command};
+
+    #[test]
+    fn credential_requires_both_scope_halves_and_a_command_tail() {
+        for arguments in [
+            vec![
+                "ostrom",
+                "credential",
+                "builder",
+                "placeholder-org/alpha",
+                "--permissions",
+                "metadata:read",
+                "--",
+                "gh",
+            ],
+            vec![
+                "ostrom",
+                "credential",
+                "builder",
+                "placeholder-org/alpha",
+                "--repositories",
+                "placeholder-org/alpha",
+                "--",
+                "gh",
+            ],
+            vec![
+                "ostrom",
+                "credential",
+                "builder",
+                "placeholder-org/alpha",
+                "--repositories",
+                "placeholder-org/alpha",
+                "--permissions",
+                "metadata:read",
+            ],
+            vec![
+                "ostrom",
+                "credential",
+                "builder",
+                "placeholder-org/alpha",
+                "--repositories",
+                "placeholder-org/alpha",
+                "--permissions",
+                "metadata:read",
+                "gh",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(arguments).is_err());
+        }
+
+        let parsed = Cli::try_parse_from([
+            "ostrom",
+            "credential",
+            "builder",
+            "placeholder-org/alpha",
+            "--repositories",
+            "placeholder-org/alpha",
+            "--permissions",
+            "metadata:read",
+            "--",
+            "gh",
+            "repo",
+            "view",
+        ])
+        .expect("parse explicitly scoped credential command");
+        assert!(matches!(parsed.command, Command::Credential { .. }));
+    }
 }

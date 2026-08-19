@@ -1,6 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env, fs,
+    env,
+    ffi::OsStr,
+    fs,
     path::{Path, PathBuf},
     process::{Command, Output},
     time::{SystemTime, UNIX_EPOCH},
@@ -228,8 +230,140 @@ pub(crate) fn authenticated_output<S: AsRef<std::ffi::OsStr>>(
         .args(arguments)
         .env("GH_TOKEN", token.expose())
         .env("GITHUB_TOKEN", token.expose())
+        // Git does not read GH_TOKEN. Process-local config makes the child use
+        // the GitHub CLI bridge without persisting a helper, and clearing the
+        // inherited helper first prevents an operator credential from winning.
+        .env("GIT_CONFIG_COUNT", "2")
+        .env("GIT_CONFIG_KEY_0", "credential.helper")
+        .env("GIT_CONFIG_VALUE_0", "")
+        .env("GIT_CONFIG_KEY_1", "credential.helper")
+        .env("GIT_CONFIG_VALUE_1", "!gh auth git-credential")
         .output()
         .map_err(|error| AuthenticatedCommandError::Transport(error.to_string()))
+}
+
+#[derive(Debug, Error)]
+pub enum CredentialCommandError {
+    #[error("GitHub authentication failed: {0}")]
+    Authentication(#[source] AppTokenError),
+    #[error("could not prepare the authenticated command: {0}")]
+    Preparation(String),
+    #[error("authenticated command transport failed: {0}")]
+    Transport(String),
+}
+
+impl CredentialCommandError {
+    /// Exit 111 is reserved for failures before a safely authenticated child
+    /// can start, preserving the protocol distinction used by shipped skills.
+    #[must_use]
+    pub fn exit_code(&self) -> i32 {
+        111
+    }
+}
+
+pub fn credential_output<S: AsRef<OsStr>>(
+    paths: &OstromPaths,
+    role: &str,
+    anchor_repository: &str,
+    repositories: &str,
+    permissions: &str,
+    command: &[S],
+) -> Result<Output, CredentialCommandError> {
+    let mut minter = GitHubInstallationTokenMinter;
+    credential_output_with_minter(
+        paths,
+        role,
+        anchor_repository,
+        repositories,
+        permissions,
+        command,
+        &mut minter,
+    )
+}
+
+fn credential_output_with_minter<S: AsRef<OsStr>>(
+    paths: &OstromPaths,
+    role: &str,
+    anchor_repository: &str,
+    repositories: &str,
+    permissions: &str,
+    command: &[S],
+    minter: &mut dyn InstallationTokenMinter,
+) -> Result<Output, CredentialCommandError> {
+    require_ephemeral_git_config(command)?;
+    authenticated_output(
+        paths,
+        ScopedAppTokenRequest::new(role, anchor_repository, repositories, permissions),
+        command,
+        minter,
+    )
+    .map_err(|error| match error {
+        AuthenticatedCommandError::Authentication(error) => {
+            CredentialCommandError::Authentication(error)
+        }
+        AuthenticatedCommandError::Transport(error) => CredentialCommandError::Transport(error),
+    })
+}
+
+fn require_ephemeral_git_config<S: AsRef<OsStr>>(
+    command: &[S],
+) -> Result<(), CredentialCommandError> {
+    let Some(program) = command.first() else {
+        return Err(CredentialCommandError::Preparation(
+            "child command was empty".to_owned(),
+        ));
+    };
+    let program = program.as_ref();
+    if Path::new(program).file_name() != Some(OsStr::new("git")) {
+        return Ok(());
+    }
+
+    // Older Git silently ignores process-local config and could fall back to
+    // an operator's stored helper, so refuse it before minting a live token.
+    let output = Command::new(program)
+        .arg("--version")
+        .output()
+        .map_err(|error| {
+            CredentialCommandError::Preparation(format!(
+                "cannot enforce the ephemeral git credential helper: {} --version failed: {error}",
+                program.to_string_lossy()
+            ))
+        })?;
+    if !output.status.success() {
+        return Err(CredentialCommandError::Preparation(format!(
+            "cannot enforce the ephemeral git credential helper: {} --version failed",
+            program.to_string_lossy()
+        )));
+    }
+    let version_output = String::from_utf8_lossy(&output.stdout);
+    let version = version_output
+        .strip_prefix("git version ")
+        .and_then(|value| value.split_whitespace().next())
+        .ok_or_else(|| {
+            CredentialCommandError::Preparation(format!(
+                "cannot enforce the ephemeral git credential helper: could not parse a version from {:?}",
+                version_output.trim()
+            ))
+        })?;
+    let mut components = version.split('.');
+    let major = components
+        .next()
+        .and_then(|value| value.parse::<u64>().ok());
+    let minor = components
+        .next()
+        .and_then(|value| value.parse::<u64>().ok());
+    let Some((major, minor)) = major.zip(minor) else {
+        return Err(CredentialCommandError::Preparation(format!(
+            "cannot enforce the ephemeral git credential helper: could not parse a version from {:?}",
+            version_output.trim()
+        )));
+    };
+    if major < 2 || (major == 2 && minor < 31) {
+        return Err(CredentialCommandError::Preparation(format!(
+            "cannot enforce the ephemeral git credential helper: git {version} is older than 2.31"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -903,18 +1037,16 @@ mod tests {
     fn scoped_token_reaches_only_the_child_environment() {
         let root = tempdir().expect("temporary command boundary");
         let mut minter = RecordingMinter::default();
-        let output = authenticated_output(
+        let output = credential_output_with_minter(
             &paths(root.path()),
-            ScopedAppTokenRequest::new(
-                "builder",
-                "placeholder-org/alpha",
-                "placeholder-org/alpha",
-                "metadata:read,contents:read",
-            ),
+            "builder",
+            "placeholder-org/alpha",
+            "placeholder-org/alpha",
+            "metadata:read,contents:read",
             &[
                 "/bin/sh",
                 "-c",
-                "[ \"$GH_TOKEN\" = \"$GITHUB_TOKEN\" ] && [ \"$GH_TOKEN\" = \"placeholder-installation-token-sentinel\" ] && printf boundary-ok",
+                "[ -n \"$GH_TOKEN\" ] && [ \"$GH_TOKEN\" = \"$GITHUB_TOKEN\" ] || exit 1; command_line=$(tr '\\000' '\\n' </proc/$$/cmdline); case \"$command_line\" in *\"$GH_TOKEN\"*) exit 2;; esac; [ \"$GIT_CONFIG_COUNT\" = 2 ] && [ \"$GIT_CONFIG_KEY_0\" = credential.helper ] && [ -z \"$GIT_CONFIG_VALUE_0\" ] && [ \"$GIT_CONFIG_KEY_1\" = credential.helper ] && [ \"$GIT_CONFIG_VALUE_1\" = \"!gh auth git-credential\" ] && printf boundary-ok",
             ],
             &mut minter,
         )
@@ -940,6 +1072,83 @@ mod tests {
                 .is_none(),
             "the command boundary must not persist credentials"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_boundary_preserves_child_status_and_reserves_auth_failure() {
+        let root = tempdir().expect("temporary command status boundary");
+        let mut minter = RecordingMinter::default();
+        let output = credential_output_with_minter(
+            &paths(root.path()),
+            "gatekeeper",
+            "placeholder-org/alpha",
+            "placeholder-org/alpha",
+            "metadata:read",
+            &["/bin/sh", "-c", "exit 7"],
+            &mut minter,
+        )
+        .expect("run failing child");
+        assert_eq!(output.status.code(), Some(7));
+
+        let mut minter = RecordingMinter {
+            authentication_failure: true,
+            ..RecordingMinter::default()
+        };
+        let error = credential_output_with_minter(
+            &paths(root.path()),
+            "gatekeeper",
+            "placeholder-org/alpha",
+            "placeholder-org/alpha",
+            "metadata:read",
+            &["/placeholder/command-must-not-run"],
+            &mut minter,
+        )
+        .expect_err("authentication must stop before the child");
+        assert!(matches!(error, CredentialCommandError::Authentication(_)));
+        assert_eq!(error.exit_code(), 111);
+
+        let mut minter = RecordingMinter::default();
+        let error = credential_output_with_minter(
+            &paths(root.path()),
+            "gatekeeper",
+            "placeholder-org/alpha",
+            "placeholder-org/alpha",
+            "metadata:read",
+            &["/placeholder/missing-command"],
+            &mut minter,
+        )
+        .expect_err("transport failure must remain a boundary failure");
+        assert!(matches!(error, CredentialCommandError::Transport(_)));
+        assert_eq!(error.exit_code(), 111);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_git_is_refused_before_token_minting() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempdir().expect("temporary git boundary");
+        let git = root.path().join("git");
+        fs::write(&git, "#!/bin/sh\nprintf 'git version 2.30.2\\n'\n")
+            .expect("write placeholder git");
+        fs::set_permissions(&git, fs::Permissions::from_mode(0o755))
+            .expect("make placeholder git executable");
+        let mut minter = RecordingMinter::default();
+        let error = credential_output_with_minter(
+            &paths(root.path()),
+            "builder",
+            "placeholder-org/alpha",
+            "placeholder-org/alpha",
+            "metadata:read,contents:write",
+            &[git.as_os_str(), OsStr::new("push")],
+            &mut minter,
+        )
+        .expect_err("stale git must fail closed");
+
+        assert!(matches!(error, CredentialCommandError::Preparation(_)));
+        assert_eq!(error.exit_code(), 111);
+        assert!(minter.requests.is_empty(), "no token should be minted");
     }
 
     #[cfg(unix)]
