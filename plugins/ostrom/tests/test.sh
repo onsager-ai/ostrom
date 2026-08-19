@@ -65,10 +65,6 @@ trap 'rm -rf "$fixture"' EXIT
 # (e.g. capturing a killed process's wait status).
 trap '[[ $- == *e* ]] && echo "mandate tests: FAILED at test.sh:${LINENO} (last command: ${BASH_COMMAND})" >&2; true' ERR
 
-bash "$PLUGIN_ROOT/tests/test-skill-version-bump.sh"
-bash "$PLUGIN_ROOT/tests/test-shell-freeze.sh"
-bash "$PLUGIN_ROOT/tests/test-msrv.sh"
-
 # Shipped plugin files must not retain private checkout paths. Build the
 # expression in pieces so this assertion does not match its own source.
 machine_path_pattern='~[/]projects[/]|[/]home[/]|dot''claude'

@@ -12,7 +12,10 @@ use std::{
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use directories::BaseDirs;
-use ostrom_checks::{ActionFault, ActionRegistry, DoctorOptions, run_doctor, run_doctor_check};
+use ostrom_checks::{
+    ActionFault, ActionRegistry, DoctorOptions, check_shell_retirement, check_skill_version_bump,
+    run_doctor, run_doctor_check,
+};
 use ostrom_core::{
     Catalogue, CatalogueEnumeration, CheckContractError, CheckDocument, CheckFault, RepositoryName,
     ResolvedCheck,
@@ -59,6 +62,11 @@ enum Command {
         /// Run exactly one named doctor check.
         #[arg(long)]
         check: Option<String>,
+    },
+    /// Run repository policy checks used by continuous integration.
+    Check {
+        #[command(subcommand)]
+        command: CheckCommand,
     },
     /// Run one unattended delivery pass for a role.
     Pass { role: CliPassRole },
@@ -172,6 +180,19 @@ enum Command {
         /// Suppress network-backed pull-request classification.
         #[arg(long)]
         local_only: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CheckCommand {
+    /// Prevent shell implementation lines from growing while they are retired.
+    ShellRetirement,
+    /// Require changed shipped plugin content to carry a plugin version bump.
+    SkillVersionBump {
+        #[arg(long)]
+        base: String,
+        #[arg(long)]
+        head: String,
     },
 }
 
@@ -332,6 +353,32 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             Err(error) => exit_message(&format!("ostrom credential: {error}"), error.exit_code()),
         },
         Command::Doctor { check } => run_doctor_command(check)?,
+        Command::Check {
+            command: CheckCommand::ShellRetirement,
+        } => {
+            let report = check_shell_retirement(&env::current_dir()?)?;
+            if !report.is_clean() {
+                eprintln!("{report}");
+                std::process::exit(1);
+            }
+        }
+        Command::Check {
+            command: CheckCommand::SkillVersionBump { base, head },
+        } => {
+            let report = check_skill_version_bump(&env::current_dir()?, &base, &head)?;
+            for violation in &report.violations {
+                eprintln!(
+                    "skill version check: plugin '{}' changed shipped file '{}' without changing version in {} (still {}); the cache is keyed by version, so this change would never reach an installed session",
+                    violation.plugin,
+                    violation.shipped_path.display(),
+                    violation.manifest.display(),
+                    violation.version
+                );
+            }
+            if !report.is_clean() {
+                std::process::exit(1);
+            }
+        }
         Command::Pass { role } => supervise(&["__pass-worker".into(), role_name(role).into()]),
         Command::Implement {
             work_order_file,
@@ -1331,7 +1378,41 @@ fn legacy_home() -> Result<PathBuf, Box<dyn std::error::Error>> {
 mod tests {
     use clap::Parser as _;
 
-    use super::{Cli, Command};
+    use super::{CheckCommand, Cli, Command};
+
+    #[test]
+    fn parses_skill_version_bump_check() {
+        let parsed = Cli::try_parse_from([
+            "ostrom",
+            "check",
+            "skill-version-bump",
+            "--base",
+            "base-sha",
+            "--head",
+            "head-sha",
+        ])
+        .expect("parse skill version check");
+
+        assert!(matches!(
+            parsed.command,
+            Command::Check {
+                command: CheckCommand::SkillVersionBump { base, head }
+            } if base == "base-sha" && head == "head-sha"
+        ));
+    }
+
+    #[test]
+    fn parses_shell_retirement_check() {
+        let parsed = Cli::try_parse_from(["ostrom", "check", "shell-retirement"])
+            .expect("parse shell retirement check");
+
+        assert!(matches!(
+            parsed.command,
+            Command::Check {
+                command: CheckCommand::ShellRetirement
+            }
+        ));
+    }
 
     #[test]
     fn credential_requires_both_scope_halves_and_a_command_tail() {

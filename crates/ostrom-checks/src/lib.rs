@@ -12,6 +12,8 @@ mod http;
 mod judgment;
 mod process;
 mod registry;
+mod shell_retirement;
+mod skill_version_bump;
 
 pub use command::CommandProvider;
 pub use doctor::{
@@ -25,4 +27,8 @@ pub use judgment::{
 };
 pub use registry::{
     ActionFault, ActionOutcome, ActionProvider, ActionRegistry, PreparedAction, PreparedCheck,
+};
+pub use shell_retirement::{ShellFile, ShellRetirementReport, check_shell_retirement};
+pub use skill_version_bump::{
+    SkillVersionBumpError, SkillVersionBumpReport, VersionBumpViolation, check_skill_version_bump,
 };
