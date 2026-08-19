@@ -2393,7 +2393,7 @@ jq -s -e '
   and .[0].kind == "work-failed"
   and .[0].fact.reason == "branch-listing-degraded"
   and .[0].fact.branch_listing.outcome == "listing-degraded"
-  and .[0].fact.branch_listing.error == "page 1 response was malformed"
+  and .[0].fact.branch_listing.error == "page 1 returned JSON that is not a branch array"
 ' "$malformed_branch_config/ostrom/sprint.jsonl" >/dev/null
 
 clean_dispatch_gh_calls="$dispatch_fixture/clean-dispatch-gh-calls"

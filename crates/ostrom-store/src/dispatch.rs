@@ -697,6 +697,38 @@ fn normalize_remote(remote: &str) -> &str {
         .unwrap_or(remote)
 }
 
+/// Say what GitHub actually returned instead of calling everything malformed.
+///
+/// `gh api` prints a JSON **error object to stdout and exits zero** when
+/// credentials are rejected, so a rejected token parsed as "the response was
+/// malformed" — the listing expects an array. Three distinct causes reached the
+/// operator under that one message on 2026-08-19, each needing separate
+/// investigation: a plugin root that did not exist, a wrapper that could not
+/// resolve `ostrom`, and rejected credentials.
+///
+/// The repository already treats this distinction as load-bearing: a repository
+/// the App is not installed on is an authentication fault to the sweep, not an
+/// empty result, because a silently empty queue reads as a healthy quiet
+/// portfolio (#106). A degraded listing that is really an auth failure reads as
+/// a transient GitHub problem and gets retried forever.
+fn describe_unparseable_listing(stdout: &[u8]) -> String {
+    if let Ok(value) = serde_json::from_slice::<Value>(stdout) {
+        if let Some(message) = value.get("message").and_then(Value::as_str) {
+            // GitHub's own words are far more useful than ours.
+            return format!("was refused by GitHub: {message}");
+        }
+        return "returned JSON that is not a branch array".to_owned();
+    }
+    // Bounded, so a huge or binary body cannot flood the trace, and lossy so a
+    // non-UTF-8 body still says something rather than nothing.
+    let prefix = String::from_utf8_lossy(&stdout[..stdout.len().min(200)]);
+    let prefix = prefix.trim();
+    if prefix.is_empty() {
+        return "response was empty".to_owned();
+    }
+    format!("response was malformed; began: {prefix}")
+}
+
 fn list_remote_branches(
     context: &DispatchContext<'_>,
     minter: &mut dyn InstallationTokenMinter,
@@ -756,7 +788,10 @@ fn list_remote_branches(
             serde_json::from_slice(&output.stdout).map_err(|_| BranchListingFault {
                 page_count: pages.len(),
                 branch_count,
-                detail: format!("page {page_number} response was malformed"),
+                detail: format!(
+                    "page {page_number} {}",
+                    describe_unparseable_listing(&output.stdout)
+                ),
             })?;
         if page.len() > REMOTE_BRANCH_PAGE_SIZE || page.iter().any(|branch| !branch.valid()) {
             return Err(BranchListingFault {
@@ -1501,7 +1536,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{absolute_executable, has_unpublished_tree};
+    use super::{absolute_executable, describe_unparseable_listing, has_unpublished_tree};
 
     fn git(path: &Path, arguments: &[&str]) {
         assert!(
@@ -1580,6 +1615,39 @@ mod tests {
     /// resolution that accepts an unusable file converts a free, named
     /// `ostrom-unavailable` into a lease-consuming `dispatch-failed` at exec
     /// time. This is the same defect class fixed in the pass guard in #286.
+    /// `gh api` exits **zero** and prints a JSON error object when credentials
+    /// are rejected, so the listing parser saw an object where it wanted an
+    /// array and reported "malformed". That sent three separate causes to the
+    /// operator under one message on 2026-08-19.
+    #[test]
+    fn a_refused_listing_names_github_rather_than_blaming_the_shape() {
+        let refused = br#"{"message":"Bad credentials","status":"401"}"#;
+        assert_eq!(
+            describe_unparseable_listing(refused),
+            "was refused by GitHub: Bad credentials"
+        );
+
+        // Valid JSON, wrong shape: still not an auth problem, and says so.
+        assert_eq!(
+            describe_unparseable_listing(b"{\"unexpected\":true}"),
+            "returned JSON that is not a branch array"
+        );
+
+        // Genuinely malformed carries a bounded prefix, so the next occurrence
+        // is diagnosable from the trace alone.
+        let described = describe_unparseable_listing(b"<html>gateway timeout</html>");
+        assert!(
+            described.starts_with("response was malformed; began: <html>"),
+            "got: {described}"
+        );
+
+        assert_eq!(describe_unparseable_listing(b"   "), "response was empty");
+
+        // A huge body must not flood the trace.
+        let flood = vec![b'x'; 10_000];
+        assert!(describe_unparseable_listing(&flood).len() < 300);
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_non_executable_file_does_not_resolve_as_the_cli() {
