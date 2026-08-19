@@ -102,6 +102,85 @@ fn wait(mut child: Child) -> ExitStatus {
     child.wait().expect("wait for pass")
 }
 
+/// ostrom#99, the production path: every other test here pins `MANDATE_NOW_EPOCH`
+/// so simulated days are deterministic, and production sets it **nowhere**. A
+/// suite that pins it universally therefore never executes the branch the loop
+/// actually takes.
+///
+/// This is not a hypothetical. ostrom#323 was exactly this shape one variable
+/// over: every dispatch test set `OSTROM_HOME` or `CLAUDE_CONFIG_DIR`, the bug
+/// required neither to be set, and it took the loop down for 48 hours while CI
+/// stayed green. The bash suite guarded the clock case deliberately, with its
+/// own fixture and an explicit `env -u MANDATE_NOW_EPOCH`; that guard must not
+/// be lost in the move to Rust.
+///
+/// The claim is "the real clock, not the simulated day" — not a specific date —
+/// so both sides of a UTC midnight crossing are accepted rather than letting a
+/// midnight run flake.
+#[test]
+fn an_unpinned_clock_stamps_pass_rows_with_the_real_date() {
+    let fixture = Fixture::new("exit 0");
+
+    let before = chrono_free_utc_date();
+    let status = fixture
+        .command()
+        .env_remove("MANDATE_NOW_EPOCH")
+        .env_remove("MANDATE_TRACE_TIME")
+        .env_remove("MANDATE_TODAY")
+        .status()
+        .expect("run pass with an unpinned clock");
+    assert!(status.success());
+    let after = chrono_free_utc_date();
+
+    let trace = fixture.trace();
+    let stamps = trace
+        .iter()
+        .filter(|row| {
+            matches!(
+                row["kind"].as_str(),
+                Some("pass-started") | Some("pass-ended")
+            )
+        })
+        .map(|row| {
+            row["ts"]
+                .as_str()
+                .expect("row carries a timestamp")
+                .get(..10)
+                .expect("timestamp starts with a date")
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+
+    assert!(
+        !stamps.is_empty(),
+        "the pass wrote no pass-started/pass-ended rows"
+    );
+    for stamp in &stamps {
+        assert!(
+            stamp == &before || stamp == &after,
+            "row stamped {stamp}, which is neither {before} nor {after} — the pass \
+             is reading a simulated clock on the path production takes"
+        );
+        assert_ne!(
+            stamp, "2026-08-01",
+            "row carries the suite's pinned fixture day even though the clock was \
+             unpinned; the pinned value is leaking into the production path"
+        );
+    }
+}
+
+/// `%Y-%m-%d` for now, without taking a chrono dependency in the test crate.
+fn chrono_free_utc_date() -> String {
+    let output = Command::new("date")
+        .args(["-u", "+%Y-%m-%d"])
+        .output()
+        .expect("read the real UTC date");
+    String::from_utf8(output.stdout)
+        .expect("date is UTF-8")
+        .trim()
+        .to_owned()
+}
+
 #[test]
 fn recorded_shell_output_is_byte_identical() {
     let fixture = Fixture::new(concat!(
