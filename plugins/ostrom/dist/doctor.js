@@ -385,7 +385,13 @@ import {
   readlinkSync
 } from "node:fs";
 import { join as join4 } from "node:path";
-var shippedDirectories = ["skills", "scripts", "hooks", "rules"];
+var shippedDirectories = [
+  "skills",
+  "scripts",
+  "hooks",
+  "rules",
+  "runtime"
+];
 var marketplacePluginRoot = "plugins/ostrom";
 function blobHash(contents) {
   return createHash("sha1").update(`blob ${contents.byteLength}\0`).update(contents).digest("hex");
