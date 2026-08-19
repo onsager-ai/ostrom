@@ -10,7 +10,8 @@ use crate::sha256_hex;
 /// rejected, because GitHub sends `protected` on each branch and `url` on each
 /// commit. Dispatch reported that as `branch-listing-degraded` and refused to
 /// dispatch anything for two days — the JSON was valid and the credentials were
-/// fine; only our deserialiser disagreed.
+/// fine; only our deserialiser disagreed, and it stayed that way until someone
+/// parsed a real response with these types.
 ///
 /// A remote API we do not control will add fields. Denying unknown ones asserts
 /// that GitHub's response shape is frozen, which is not a claim we can make.
@@ -265,6 +266,33 @@ mod tests {
         assert!(branches[0].valid());
     }
 
+    /// Tolerating unknown fields must not tolerate bad data. `valid()` is what
+    /// actually guards the fields dispatch depends on, so loosening the
+    /// deserialiser is only safe while this still refuses.
+    #[test]
+    fn a_malformed_sha_is_still_rejected() {
+        let payload = br#"[{
+            "name": "placeholder/branch",
+            "commit": {"sha": "not-a-sha", "url": "https://example.invalid"},
+            "protected": false
+        }]"#;
+        let branches: Vec<RemoteBranch> =
+            serde_json::from_slice(payload).expect("shape is fine; the value is not");
+        assert_eq!(branches.len(), 1);
+        assert!(
+            !branches[0].valid(),
+            "a non-hex sha must not pass validation"
+        );
+
+        let empty_name = br#"[{
+            "name": "",
+            "commit": {"sha": "0123456789abcdef0123456789abcdef01234567"}
+        }]"#;
+        let branches: Vec<RemoteBranch> =
+            serde_json::from_slice(empty_name).expect("shape is fine; the value is not");
+        assert!(!branches[0].valid(), "an empty branch name must not pass");
+    }
+
     /// A field GitHub has not invented yet must not break dispatch either.
     #[test]
     fn an_unforeseen_field_does_not_break_the_listing() {
@@ -275,6 +303,8 @@ mod tests {
         }]"#;
         let branches: Vec<RemoteBranch> =
             serde_json::from_slice(payload).expect("unknown fields must be tolerated");
+        assert_eq!(branches.len(), 1);
+        assert_eq!(branches[0].name, "placeholder/branch");
         assert!(branches[0].valid());
     }
 
