@@ -47,6 +47,7 @@ mapfile -t changed_shipped < <(
     'plugins/*/skills/*/SKILL.md' \
     'plugins/*/scripts/*' \
     'plugins/*/hooks/*' \
+    'plugins/*/runtime/*' \
     'plugins/*/dist/*' |
     LC_ALL=C sort
 )

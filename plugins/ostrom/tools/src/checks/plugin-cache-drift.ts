@@ -15,7 +15,17 @@ import {
   resolvePluginInstallation,
 } from "./plugin.js";
 
-const shippedDirectories = ["skills", "scripts", "hooks", "rules"] as const;
+// `runtime` carries run-node.sh, which resolves the operator's Node runtime.
+// It is shipped and therefore must be watched for drift like any other shipped
+// directory — a shipped path nobody watches is how a fix reaches the repository
+// and never reaches an installed session.
+const shippedDirectories = [
+  "skills",
+  "scripts",
+  "hooks",
+  "rules",
+  "runtime",
+] as const;
 const marketplacePluginRoot = "plugins/ostrom";
 
 interface Fingerprint {
