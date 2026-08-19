@@ -5,6 +5,7 @@ mod check_store;
 mod dispatch;
 mod file_store;
 mod gate;
+mod hooks;
 mod implement;
 mod lease;
 mod leaves;
@@ -16,6 +17,7 @@ mod paths;
 mod plan;
 mod publish;
 mod queue;
+mod repair;
 mod replay;
 mod selection;
 mod selector;
@@ -28,6 +30,7 @@ pub use check_store::JsonlCheckStore;
 pub use dispatch::{DispatchError, DispatchOutcome, DispatchRequest, run_dispatch};
 pub use file_store::JsonlSweepStore;
 pub use gate::{GateError, GateOptions, GateOutput, run_gate};
+pub use hooks::{DigestOptions, HookOutput, render_constitution, render_digest};
 pub use implement::{ImplementError, ImplementRequest, run_implement};
 pub use lease::{
     LeaseActionError, LeaseRecord, OwnedLease, acquire_lease, lease_status, read_lease,
@@ -52,6 +55,7 @@ pub use queue::{
     QueueActionError, QueueDecision, QueueDocument, decide_queue_item, lint_queue_state,
     list_queue_json, read_queue, write_queue,
 };
+pub use repair::{RepairOptions, RepairOutput, run_repair_prs};
 pub use replay::{ReplayError, ReplayOptions, replay};
 pub use selection::{
     PlanApplication, SelectAction, SelectError, SelectOutcome, SelectRequest, encode_selection,

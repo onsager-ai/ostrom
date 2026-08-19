@@ -684,7 +684,7 @@ fn prune_transcripts(directory: &Path) {
             Some((modified, entry.path()))
         })
         .collect::<Vec<_>>();
-    paths.sort_by(|left, right| right.0.cmp(&left.0));
+    paths.sort_by_key(|entry| std::cmp::Reverse(entry.0));
     for (_, path) in paths.into_iter().skip(30) {
         let _ = fs::remove_file(path);
     }

@@ -21,17 +21,18 @@ use ostrom_core::{
     ResolvedCheck,
 };
 use ostrom_store::{
-    AssessmentHarness, AuditOptions, DispatchOutcome, DispatchRequest, ExecutableAssessmentDeriver,
-    GateError, GateOptions, HarnessAssessmentDeriver, ImplementRequest, MigrationOutcome,
-    OstromPaths, PassRequest, PassRole, PlanOptions, PublishDestination, PublishTarget,
-    QueueDecision, ReplayOptions, SelectAction, SelectError, SelectOutcome, SelectRequest,
-    SignalFlags, SweepError, SweepMode, SweepOptions, SweepParityOptions, TraceAppend, TraceView,
-    UnavailableAssessmentDeriver, acquire_lease, acquire_org_from_github, append_trace_checked,
-    audit, branch_name, create_work_order, credential_output, decide_queue_item,
-    encode_org_snapshots, encode_selection, grant_excuse, item_hash, lease_status,
-    lint_queue_state, list_excuses, list_queue_json, local_drift, migrate, read_trace_json,
-    release_lease, replay, run_dispatch, run_gate, run_implement, run_pass, run_plan,
-    run_selection, run_sweep, run_sweep_parity, validate_lease_name, validate_work_order_file,
+    AssessmentHarness, AuditOptions, DigestOptions, DispatchOutcome, DispatchRequest,
+    ExecutableAssessmentDeriver, GateError, GateOptions, HarnessAssessmentDeriver,
+    ImplementRequest, MigrationOutcome, OstromPaths, PassRequest, PassRole, PlanOptions,
+    PublishDestination, PublishTarget, QueueDecision, ReplayOptions, SelectAction, SelectError,
+    SelectOutcome, SelectRequest, SignalFlags, SweepError, SweepMode, SweepOptions,
+    SweepParityOptions, TraceAppend, TraceView, UnavailableAssessmentDeriver, acquire_lease,
+    acquire_org_from_github, append_trace_checked, audit, branch_name, create_work_order,
+    credential_output, decide_queue_item, encode_org_snapshots, encode_selection, grant_excuse,
+    item_hash, lease_status, lint_queue_state, list_excuses, list_queue_json, local_drift, migrate,
+    read_trace_json, release_lease, render_constitution, render_digest, replay, run_dispatch,
+    run_gate, run_implement, run_pass, run_plan, run_repair_prs, run_selection, run_sweep,
+    run_sweep_parity, validate_lease_name, validate_work_order_file,
 };
 
 #[derive(Debug, Parser)]
@@ -67,6 +68,18 @@ enum Command {
     Check {
         #[command(subcommand)]
         command: CheckCommand,
+    },
+    /// Print the resolved mandate roster as JSON.
+    Config,
+    /// Merge base branches into eligible stale builder pull requests.
+    RepairPrs {
+        #[arg(allow_hyphen_values = true)]
+        builder_lease_owner: Vec<String>,
+    },
+    /// Run a Claude Code hook entrypoint.
+    Hook {
+        #[command(subcommand)]
+        command: HookCommand,
     },
     /// Run one unattended delivery pass for a role.
     Pass { role: CliPassRole },
@@ -197,6 +210,14 @@ enum CheckCommand {
         #[arg(long)]
         head: String,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum HookCommand {
+    /// Emit the layered constitution for SessionStart.
+    SessionStart,
+    /// Render and acknowledge the durable queue digest.
+    Digest,
 }
 
 #[derive(Debug, Subcommand)]
@@ -435,6 +456,70 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(1);
             }
         }
+        Command::Config => {
+            let config = ostrom_store::load_config_or_defaults(&paths, &env::current_dir()?)
+                .unwrap_or_else(|error| exit_message(&error.to_string(), 2));
+            let mut config = serde_json::to_value(config)?;
+            if let Some(projects) = config
+                .get_mut("projects")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                for project in projects {
+                    if project
+                        .get("max_implementers_per_repository")
+                        .is_some_and(serde_json::Value::is_null)
+                    {
+                        project
+                            .as_object_mut()
+                            .expect("serialized project is an object")
+                            .remove("max_implementers_per_repository");
+                    }
+                }
+            }
+            serde_json::to_writer(io::stdout(), &config)?;
+            println!();
+        }
+        Command::RepairPrs {
+            builder_lease_owner,
+        } => {
+            if builder_lease_owner.len() != 1 || builder_lease_owner[0].is_empty() {
+                exit_message("usage: repair-prs.sh <builder-lease-owner>", 2);
+            }
+            let output = match run_repair_prs(&ostrom_store::RepairOptions {
+                paths,
+                working_directory: env::current_dir()?,
+                lease_owner: builder_lease_owner[0].clone(),
+            }) {
+                Ok(output) => output,
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::exit(error.exit_code());
+                }
+            };
+            io::stdout().write_all(output.stdout.as_bytes())?;
+            io::stderr().write_all(output.stderr.as_bytes())?;
+            if output.exit_code != 0 {
+                std::process::exit(output.exit_code);
+            }
+        }
+        Command::Hook { command } => match command {
+            HookCommand::SessionStart => {
+                let cwd = env::current_dir().unwrap_or_default();
+                let plugin_root = env::var_os("CLAUDE_PLUGIN_ROOT")
+                    .map_or_else(|| cwd.join("plugins/ostrom"), PathBuf::from);
+                let home = env::var_os("HOME").map_or_else(PathBuf::new, PathBuf::from);
+                let output = render_constitution(&plugin_root, &paths.config, &cwd, &home);
+                io::stdout().write_all(output.as_bytes())?;
+            }
+            HookCommand::Digest => {
+                let output = render_digest(&DigestOptions {
+                    paths,
+                    working_directory: env::current_dir().unwrap_or_default(),
+                });
+                io::stdout().write_all(output.stdout.as_bytes())?;
+                io::stderr().write_all(output.stderr.as_bytes())?;
+            }
+        },
         Command::Pass { role } => supervise(&["__pass-worker".into(), role_name(role).into()]),
         Command::Implement {
             work_order_file,

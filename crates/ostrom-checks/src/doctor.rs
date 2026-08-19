@@ -1399,51 +1399,71 @@ fn file_differences(
 
 #[derive(Clone, Copy)]
 struct RuleLayers {
-    hook_missing: bool,
+    hook_wiring_missing: bool,
     has_user: bool,
     has_repo: bool,
 }
 
 fn compute_rules_layers(context: &DoctorContext) -> RuleLayers {
-    let hook = context
+    let hooks = context.options.plugin_root.join("hooks/hooks.json");
+    let wired =
+        fs::read_to_string(&hooks).is_ok_and(|text| text.contains("ostrom hook session-start"));
+    let shipped = context
         .options
         .plugin_root
-        .join("hooks/inject-constitution.sh");
-    if !hook.is_file() {
+        .join("rules/frozen-rules.md")
+        .is_file();
+    if !wired || !shipped {
         return RuleLayers {
-            hook_missing: true,
+            hook_wiring_missing: true,
             has_user: false,
             has_repo: false,
         };
     }
-    let mut command = context.command("bash");
-    command
-        .arg(&hook)
-        .env("CLAUDE_PLUGIN_ROOT", &context.options.plugin_root)
-        .env("CLAUDE_CONFIG_DIR", &context.options.config_dir);
-    let stdout = command
-        .output()
-        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-        .unwrap_or_default();
     RuleLayers {
-        hook_missing: false,
-        has_user: stdout.contains("<!-- constitution layer: user "),
-        has_repo: stdout.contains("<!-- constitution layer: repo "),
+        hook_wiring_missing: false,
+        has_user: rule_layer_has_content(&context.options.config_dir.join("ostrom")),
+        has_repo: rule_layer_has_content(&context.options.cwd.join(".ostrom")),
     }
+}
+
+fn rule_layer_has_content(root: &Path) -> bool {
+    let mut files = vec![root.join("rules.md")];
+    files.extend(
+        fs::read_dir(root.join("rules.d"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "md")),
+    );
+    files.into_iter().any(|path| {
+        let Ok(mut text) = fs::read_to_string(path) else {
+            return false;
+        };
+        while let Some(start) = text.find("<!--") {
+            let Some(relative_end) = text[start + 4..].find("-->") else {
+                text.truncate(start);
+                break;
+            };
+            text.replace_range(start..start + 4 + relative_end + 3, "");
+        }
+        text.chars().any(|character| !character.is_whitespace())
+    })
 }
 
 fn check_rules_layers(context: &DoctorContext) -> DoctorResult {
     let layers = compute_rules_layers(context);
-    if layers.hook_missing {
+    if layers.hook_wiring_missing {
         return DoctorResult::new(
             DoctorStatus::Fail,
             "rules-layers",
             format!(
-                "hook not found at {}",
+                "hook wiring not found at {}",
                 context
                     .options
                     .plugin_root
-                    .join("hooks/inject-constitution.sh")
+                    .join("hooks/hooks.json")
                     .display()
             ),
             "reinstall the ostrom plugin",
@@ -2847,7 +2867,7 @@ mod tests {
                 "FAIL|plugin|no installed_plugins.json at {config}/plugins/installed_plugins.json|/plugin install ostrom@ostrom\n",
                 "FAIL|marketplace|ostrom not registered in known_marketplaces.json|/plugin marketplace add onsager-ai/ostrom\n",
                 "WARN|plugin-cache-drift|cannot compare shipped files: installed plugin registry missing at {config}/plugins/installed_plugins.json|/plugin install ostrom@ostrom\n",
-                "FAIL|rules-layers|hook not found at {plugin}/hooks/inject-constitution.sh|reinstall the ostrom plugin\n",
+                "FAIL|rules-layers|hook wiring not found at {plugin}/hooks/hooks.json|reinstall the ostrom plugin\n",
                 "WARN|touch-durability|target: file provider, {home}/.claude/ostrom/touch-log.md is NOT inside a git repo — touches logged here never reach another machine -- config: no user config.yaml present (shipped defaults only)|point file.path into a synced repo and set auto_commit: true, or switch provider\n",
                 "OK|provider-reachable|file: {home}/.claude/ostrom does not exist yet, nearest existing ancestor {home} is writable|\n",
                 "FAIL|dispatch-source-roots|search_roots is empty; dispatch cannot resolve source repositories|configure search_roots with a parent directory containing the roster checkouts\n",

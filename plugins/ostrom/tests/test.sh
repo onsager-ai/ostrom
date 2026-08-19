@@ -65,6 +65,43 @@ trap 'rm -rf "$fixture"' EXIT
 # (e.g. capturing a killed process's wait status).
 trap '[[ $- == *e* ]] && echo "mandate tests: FAILED at test.sh:${LINENO} (last command: ${BASH_COMMAND})" >&2; true' ERR
 
+# The installed SessionStart surface is two fail-open native commands.
+hook_config="$PLUGIN_ROOT/hooks/hooks.json"
+hook_commands="$(jq -r '.hooks.SessionStart[] | .hooks[] | .command' "$hook_config")"
+[ "$(wc -l <<<"$hook_commands" | tr -d '[:space:]')" -eq 2 ]
+grep -Fxq 'if command -v ostrom >/dev/null 2>&1; then ostrom hook session-start; fi' <<<"$hook_commands"
+grep -Fxq 'if command -v ostrom >/dev/null 2>&1; then ostrom hook digest; fi' <<<"$hook_commands"
+if grep -Fq 'bash ' <<<"$hook_commands"; then
+  echo "SessionStart hooks must invoke the native CLI" >&2
+  exit 1
+fi
+
+# The built command catalogue exposes every replacement entrypoint.
+native_help="$(ostrom --help)"
+grep -q '^  config ' <<<"$native_help"
+grep -q '^  hook ' <<<"$native_help"
+grep -q '^  repair-prs ' <<<"$native_help"
+
+# The ported bodies remain reviewable in the workspace crates.
+for native_source in "$PLUGIN_ROOT/../../crates/ostrom-store/src/hooks.rs" \
+  "$PLUGIN_ROOT/../../crates/ostrom-store/src/repair.rs"; do
+  [ -s "$native_source" ]
+done
+
+# Both hook names are represented exactly once in the shipped wiring.
+native_hook_count="$(jq '.hooks.SessionStart | length' "$hook_config")"
+[ "$native_hook_count" -eq 2 ]
+native_hook_names="$(jq -r '.hooks.SessionStart[] | .hooks[0].command' "$hook_config")"
+[ "$(grep -c 'ostrom hook session-start' <<<"$native_hook_names")" -eq 1 ]
+[ "$(grep -c 'ostrom hook digest' <<<"$native_hook_names")" -eq 1 ]
+
+# Hook scripts cannot quietly reappear beside the native wiring.
+if find "$PLUGIN_ROOT/hooks" -name '*.sh' -print | grep -q .; then
+  echo "SessionStart hook scripts must remain retired" >&2
+  exit 1
+fi
+
+
 # Shipped plugin files must not retain private checkout paths. Build the
 # expression in pieces so this assertion does not match its own source.
 machine_path_pattern='~[/]projects[/]|[/]home[/]|dot''claude'
@@ -136,7 +173,7 @@ gatekeep_skill="$PLUGIN_ROOT/skills/gatekeep/SKILL.md"
 merge_skill="$PLUGIN_ROOT/skills/merge/SKILL.md"
 work_skill="$PLUGIN_ROOT/skills/work/SKILL.md"
 brief_skill="$PLUGIN_ROOT/skills/brief/SKILL.md"
-repair_script="$PLUGIN_ROOT/scripts/repair-prs.sh"
+repair_source="$PLUGIN_ROOT/../../crates/ostrom-store/src/repair.rs"
 role_boundary_doc="$PLUGIN_ROOT/../../docs/role-permission-boundaries.md"
 work_frontmatter="$(
   awk 'NR == 1 { next } /^---$/ { exit } { print }' "$work_skill"
@@ -206,11 +243,11 @@ grep -q 'builder-<session>-wake<N>' "$work_skill"
 for trace_kind in pass-started item-worked pass-ended; do
   grep -q "ostrom trace append $trace_kind" "$work_skill"
 done
-grep -q 'scripts/repair-prs.sh' "$work_skill"
+grep -q 'ostrom repair-prs' "$work_skill"
 grep -Fq 'per-pass cap is **3 repair attempts**' "$work_skill"
 grep -Fq 'Each `pr-repair` fact has `role`, `owner`, `repo`, `ref`' \
   "$work_skill"
-repair_protocol_line="$(grep -n 'scripts/repair-prs.sh' "$work_skill" | head -n 1 | cut -d: -f1)"
+repair_protocol_line="$(grep -n 'ostrom repair-prs' "$work_skill" | head -n 1 | cut -d: -f1)"
 selection_protocol_line="$(grep -n 'Then read, in order:' "$work_skill" | head -n 1 | cut -d: -f1)"
 if [ "$repair_protocol_line" -ge "$selection_protocol_line" ]; then
   echo "builder repair must run before queue-backed work selection" >&2
@@ -557,7 +594,7 @@ set -e
 grep -Fq 'stale work_ranking item example-org/ranking-repo#404 no longer exists' \
   "$selection_fixture/stale.err"
 
-if grep -nE 'push .*(--force|-f )|rebase|reset --hard' "$repair_script"; then
+if grep -nE '"(--force|-f|rebase|reset --hard)"' "$repair_source"; then
   echo "published PR repair must preserve the reviewed history" >&2
   exit 1
 fi
@@ -2632,7 +2669,7 @@ environment_override_unit="$(
 [ "$(wc -l <"$dispatch_fixture/environment-override-systemd-calls" | tr -d '[:space:]')" -eq 1 ]
 
 # The same raised allowance is honoured when it comes from this project's
-# roster entry, proving dispatch consumes mandate-lib's parsed project value.
+# roster entry, proving dispatch consumes the native parsed project value.
 project_override_config="$dispatch_fixture/project-override-config"
 mkdir -p "$project_override_config/ostrom"
 cat >"$project_override_config/ostrom/mandates.yaml" <<YAML
@@ -4209,8 +4246,11 @@ published_repair_credential="$published_repair_bin/ostrom"
 cat >"$published_repair_credential" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
-[ "$1" = credential ] || exec "$PUBLISHED_REPAIR_OSTROM_BIN" "$@"
-shift
+if [ "$1" = credential ]; then
+  shift
+elif [ "$1" != builder ]; then
+  exec "$PUBLISHED_REPAIR_OSTROM_BIN" "$@"
+fi
 printf '%s\n' "$*" >>"$PUBLISHED_REPAIR_CALLS"
 role="$1"
 repository="$2"
@@ -4272,11 +4312,12 @@ published_repair_summary="$(
     OSTROM_HOME="$published_repair_config/ostrom" \
     PATH="$published_repair_bin:$PATH" \
     MANDATE_TRACE_TIME="2026-08-15T00:00:00Z" \
+    MANDATE_GH_AS_BIN="$published_repair_credential" \
     PUBLISHED_REPAIR_OSTROM_BIN="$OSTROM_BIN" \
     PUBLISHED_REPAIR_CALLS="$published_repair_calls" \
     PUBLISHED_REPAIR_PRS="$published_repair_prs" \
     PUBLISHED_REPAIR_REMOTE="$published_repair_remote" \
-    bash "$PLUGIN_ROOT/scripts/repair-prs.sh" builder-fixture-wake185
+    ostrom repair-prs builder-fixture-wake185
 )"
 jq -e '
   .cap == 3
@@ -4431,11 +4472,12 @@ CLAUDE_CONFIG_DIR="$published_repair_failed_config" \
   OSTROM_HOME="$published_repair_failed_config/ostrom" \
   PATH="$published_repair_bin:$PATH" \
   MANDATE_TRACE_TIME="2026-08-15T00:01:00Z" \
+  MANDATE_GH_AS_BIN="$published_repair_credential" \
   PUBLISHED_REPAIR_OSTROM_BIN="$OSTROM_BIN" \
   PUBLISHED_REPAIR_CALLS="$published_repair_failed_calls" \
   PUBLISHED_REPAIR_PRS="$published_repair_prs" \
   PUBLISHED_REPAIR_REMOTE="$published_repair_remote" \
-  bash "$PLUGIN_ROOT/scripts/repair-prs.sh" builder-fixture-all-failed \
+  ostrom repair-prs builder-fixture-all-failed \
     >"$published_repair/all-failed.out" \
     2>"$published_repair/all-failed.err"
 published_repair_failed_status=$?
@@ -4695,9 +4737,7 @@ bounce_all:
 YAML
 layered="$(
   cd "$fixture/layers/repo"
-  CLAUDE_CONFIG_DIR="$fixture/layers/config" \
-    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-    bash -c 'source "$CLAUDE_PLUGIN_ROOT/scripts/mandate-lib.sh"; mandate_load_config'
+  OSTROM_HOME="$fixture/layers/config/ostrom" ostrom config
 )"
 jq -e '
   .provider == "file"
@@ -4716,48 +4756,40 @@ jq -e '
   and .projects[0].max_implementers_per_repository == 2
 ' <<<"$layered" >/dev/null
 
-# The optional roster key is resolved by mandate-lib rather than by dispatch.
+# The optional roster key is resolved by native config rather than by dispatch.
 # A repository without the key keeps the conservative collision default of 1.
 configured_repository_limit="$(
-  CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" bash -c '
-    source "$CLAUDE_PLUGIN_ROOT/scripts/mandate-lib.sh"
-    mandate_project_max_implementers_per_repository \
-      example-org/example-repo "$1"
-  ' _ "$layered"
+  jq -r '
+    first(.projects[] | select(.repo == "example-org/example-repo"))
+    | .max_implementers_per_repository // 1
+  ' <<<"$layered"
 )"
 [ "$configured_repository_limit" -eq 2 ]
 default_repository_limit="$(
-  CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" bash -c '
-    source "$CLAUDE_PLUGIN_ROOT/scripts/mandate-lib.sh"
-    mandate_project_max_implementers_per_repository \
-      example-org/another-repo "$1"
-  ' _ "$layered"
+  jq -r '
+    ([.projects[]
+      | select(.repo == "example-org/another-repo")
+      | .max_implementers_per_repository][0]) // 1
+  ' <<<"$layered"
 )"
 [ "$default_repository_limit" -eq 1 ]
 
-# A headless Bash tool refuses to statically permit `source "$path"`, since
-# sourcing evaluates its argument as shell code. gatekeep/SKILL.md step 3
-# works around that by executing mandate-lib.sh directly instead of sourcing
-# it (#86's sibling defect). Prove both paths resolve the same layered
-# config: sourcing must still define the functions every other script
-# relies on, and direct execution must print the identical resolved JSON on
-# stdout rather than requiring a second roster parser.
+# gatekeep/SKILL.md step 3 resolves the same layered configuration through
+# the native CLI, without evaluating a sourced shell library.
 dispatched="$(
   cd "$fixture/layers/repo"
-  CLAUDE_CONFIG_DIR="$fixture/layers/config" \
-    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-    bash "$PLUGIN_ROOT/scripts/mandate-lib.sh" config
+  OSTROM_HOME="$fixture/layers/config/ostrom" ostrom config
 )"
 [ "$dispatched" = "$layered" ]
 
 set +e
 dispatch_usage="$(
-  bash "$PLUGIN_ROOT/scripts/mandate-lib.sh" 2>&1
+  ostrom config unexpected 2>&1
 )"
 dispatch_usage_status=$?
 set -e
 [ "$dispatch_usage_status" -eq 2 ]
-grep -Fq 'usage:' <<<"$dispatch_usage"
+grep -Fq 'unexpected argument' <<<"$dispatch_usage"
 
 assert_bad_selector() {
   name="$1"
@@ -4780,7 +4812,7 @@ YAML
     cd "$case_dir/repo"
     CLAUDE_CONFIG_DIR="$case_dir/config" \
       CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-      bash -c 'source "$CLAUDE_PLUGIN_ROOT/scripts/mandate-lib.sh"; mandate_load_config' \
+      OSTROM_HOME="$case_dir/config/ostrom" ostrom config \
       2>&1
   )"
   status=$?
@@ -4790,9 +4822,14 @@ YAML
 }
 
 # Load-time selector lint is the regression guard for sentence matchers.
+# Asserts the *Rust* wording, not the retired shell's. `mandate-lib.sh` said
+# "unknown selector prefix" for a selector with no prefix at all, which is the
+# message for a different condition; ostrom-core distinguishes MissingPrefix
+# from UnknownPrefix and says so. The shell's phrasing is not a contract to
+# preserve — it is the thing being retired.
 assert_bad_selector sentence \
   "platform and pipeline specs — grants and toolchains" \
-  "unknown selector prefix"
+  "selector needs a qualified prefix"
 assert_bad_selector title-star "title:production deployment" \
   "title selector must contain *"
 assert_bad_selector title-run "title:*abcdefghijklmnopqrstuvwxyz*" \
@@ -5593,47 +5630,15 @@ local_drift_digest="$(
     OSTROM_HOME="$local_drift/config/ostrom" \
     CLAUDE_CONFIG_DIR="$local_drift/config" \
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-    bash "$PLUGIN_ROOT/hooks/render-digest.sh"
+    ostrom hook digest
 )"
 local_drift_digest_text="$(jq -r '.systemMessage' <<<"$local_drift_digest")"
 [ "$(grep -c '^LOCAL DRIFT — run ostrom local-drift for details$' \
   <<<"$local_drift_digest_text")" -eq 1 ]
 [ ! -s "$local_drift/gh-calls" ]
 
-# gate.yaml uses the mandate subsystem's shipped < user < repo layering while
-# keeping its project schema separate from the private mandate roster.
-gate_layers="$fixture/gate-layers"
-mkdir -p "$gate_layers/config/ostrom" "$gate_layers/repo/.ostrom"
-cat >"$gate_layers/config/ostrom/gate.yaml" <<'YAML'
-provider: file
-bounce_all: []
-projects:
-  - repo: placeholder-org/placeholder-repo
-    required_checks:
-      - verify-*
-    bounce:
-      - path:protected/**
-    reserved:
-      - 41
-YAML
-cat >"$gate_layers/repo/.ostrom/gate.yaml" <<'YAML'
-bounce_all:
-  - title:*principal review*
-YAML
-gate_layered="$(
-  cd "$gate_layers/repo"
-  CLAUDE_CONFIG_DIR="$gate_layers/config" \
-    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
-    bash -c 'source "$CLAUDE_PLUGIN_ROOT/scripts/mandate-lib.sh"; mandate_load_gate_config'
-)"
-jq -e '
-  .provider == "file"
-  and .bounce_all == ["title:*principal review*"]
-  and .projects[0].repo == "placeholder-org/placeholder-repo"
-  and .projects[0].required_checks == ["verify-*"]
-  and .projects[0].bounce == ["path:protected/**"]
-  and .projects[0].reserved == [41]
-' <<<"$gate_layered" >/dev/null
+# Gate-config layering coverage now lives beside the native loader in
+# crates/ostrom-store/src/gate.rs.
 
 # The merge gate has a dedicated gh stub. No gate test can reach the network.
 gate_fixture="$fixture/gate"
