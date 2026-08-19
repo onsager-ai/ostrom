@@ -41,12 +41,8 @@ if [[ -n "$changed_output" ]]; then
   mapfile -t changed_scripts <<<"$changed_output"
 fi
 
-# No per-path exemptions. `run-node.sh` used to be listed here; it now lives in
-# plugins/ostrom/runtime/ instead, which is outside the frozen path entirely.
-# An exemption inside the freeze meant the retirement's own target could never
-# reach zero — the goal check counted files and excluded one, so 119 lines of
-# shell could ship while the number read as done. Moving the file makes zero
-# mean zero.
+# No per-path exemptions. An exemption inside the freeze would let retired
+# shell continue shipping while the migration goal read as done.
 has_bugfix_label=false
 while IFS= read -r label; do
   if [[ "$label" == "bash-bugfix" ]]; then
