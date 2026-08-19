@@ -18,12 +18,23 @@ repositories, cannot reach the publisher. A later clone, commit, or push
 failure is reported as a sweep fault and does not roll back or supersede the
 local queue and state.
 
-The publisher rebuilds every public object from
-`config/publish-allowlist.json`, records excluded fields in the manifest, keeps
+The publisher rebuilds every public object from the allowlist, records
+excluded fields in the manifest, keeps
 90 daily gate partitions, and retains complete gate history in rollups.
 Destination reads and writes mint separate repository-scoped credentials. The
 private publication checkout remains mode `0700` so its remote configuration
 is not exposed by a permissive process umask.
+
+### Where the allowlist comes from
+
+`MANDATE_PUBLISH_ALLOWLIST` if set, otherwise
+`<plugin root>/config/publish-allowlist.json` — resolved from the **plugin
+root**, not from `OSTROM_HOME`. This matters for an installed binary: run
+outside a repository checkout with neither `OSTROM_PLUGIN_ROOT` nor
+`CLAUDE_PLUGIN_ROOT` set, publication cannot find the allowlist. The operator's
+sweep wrapper passes `CLAUDE_PLUGIN_ROOT`, which is why the 2026-08-19 cutover
+published; a caller that does not is not merely missing a file it could create
+anywhere.
 
 ## Verification
 
