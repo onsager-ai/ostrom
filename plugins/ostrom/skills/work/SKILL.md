@@ -198,30 +198,30 @@ Every GitHub read or mutation in triage, and every authenticated action the
 implementer later performs, must use the shared App rather than whoever is
 running this session. Never call `gh` directly against a GitHub remote, and
 never run a command that itself calls `gh` (such as `ostrom gate`) directly
-either — that command belongs to the gatekeeper's protocol, not this one. A session's
-Bash tool statically rejects
-command substitution before permission matching, so this step cannot capture
-`app-token.sh`'s output into a variable (`token="$(app-token.sh ...)"`) the way
-an interactive shell would — no allow rule can fix that rejection, because it
-never reaches allow-rule matching in the first place. Route every triage `gh`
-call for an item's repository through `gh-as.sh`, naming the `builder` role and
-the repository ahead of the command to run:
+either — that command belongs to the gatekeeper's protocol, not this one. A
+session never needs to handle the installation token itself. Route every
+triage `gh` call for an item's repository through `ostrom credential`, naming
+the `builder` role, repository, and complete scope ahead of the command to run:
 
 ```sh
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/gh-as.sh" builder "$repository" \
+ostrom credential builder "$repository" \
+  --repositories "$repository" \
+  --permissions metadata:read,issues:read -- \
   gh issue view "$item_number" --repo "$repository" --comments
 ```
 
-`gh-as.sh` mints a fresh installation token for that repository inside its
-own process, exports it only there, and `exec`s the given command — the
-token never enters this session's shell state, is never assigned to a
-variable here, and is never written to disk. The implementer wrapper follows
+`ostrom credential` mints a fresh installation token for that repository and
+places it only in the child environment — the token never enters this
+session's shell state, is never assigned to a variable here, and is never
+written to disk. The implementer boundary follows
 the same rule for `git push`, as does `repair-prs.sh` for every repair-path
 GitHub read, fetch, and push: `git` does not read that token on its own, so
-`gh-as.sh` supplies a credential helper scoped to that process:
+`ostrom credential` supplies a credential helper scoped to that process:
 
 ```sh
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/gh-as.sh" builder "$repository" \
+ostrom credential builder "$repository" \
+  --repositories "$repository" \
+  --permissions metadata:read,contents:write -- \
   git push "https://github.com/$repository.git" "HEAD:refs/heads/$branch"
 ```
 
@@ -231,20 +231,21 @@ authenticates by SSH key — the operator's own — and a credential helper has
 no effect on an SSH remote; the explicit HTTPS URL is what puts the App
 token in the authentication path at all. `git commit` itself needs no
 token — it never leaves the checkout — so only `git push` and every `gh` call
-in the implementer protocol route through `gh-as.sh`.
+in the implementer protocol route through `ostrom credential`.
 
-Exit `111` means `gh-as.sh` itself could not authenticate and the given
-command never ran at all; report that and stop work on the item rather than
-retry with an ambient credential. Any other exit code is the given command's
-own, unchanged.
+Exit `111` means the credential boundary could not start the safely
+authenticated command, and the given command never ran at all; report that and
+stop work on the item rather than retry with an ambient credential. Any other
+exit code is the given command's own, unchanged.
 
 The `builder` argument remains required even though it normally resolves to
 the same credential as every other role. It makes the caller legible at the
-call site; it does not restrict what the resulting token can do. `gh-as.sh`
-instead derives a repository-local scope from the command: `issues:read` for
+call site; it does not restrict what the resulting token can do. Each
+`ostrom credential` call must explicitly request a repository-local scope:
+`issues:read` for
 issue triage, `issues:write` only for filing/commenting/closing/reopening an
 issue, `contents:read` for a fetch, `contents:write` for a push, and
-`pull_requests:write` only when creating a pull request. Every derived scope
+`pull_requests:write` only when creating a pull request. Every explicit scope
 also includes `metadata:read`; a command with no known derivation is refused.
 
 **A builder session that cannot mint an App token must stop working that
@@ -252,9 +253,9 @@ item, not continue as the principal.** Continuing with an ambient token
 would escape the App's repository blast radius. `builder.settings.json` is
 expected to eventually null `GH_TOKEN` and `GITHUB_TOKEN` the same way
 `gatekeeper.settings.json` already does, removing the ambient fallback
-entirely; until that lands, this protocol routes through `gh-as.sh` regardless
-of what credential happens to already be present in the session's own
-environment — a working `gh-as.sh` call never needs one.
+entirely; until that lands, this protocol routes through `ostrom credential`
+regardless of what credential happens to already be present in the session's
+own environment — a working credential call never needs one.
 
 ## 5. Triage and dispatch each item
 

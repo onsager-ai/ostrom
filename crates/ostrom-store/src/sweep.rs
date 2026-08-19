@@ -2874,9 +2874,9 @@ mod tests {
 
     #[test]
     fn the_credential_request_names_both_halves_of_the_scope() {
-        // gh-as.sh refuses an unscoped request rather than falling back to the
-        // installation's full grant, so dropping either half leaves the sweep
-        // unable to authenticate at all.
+        // The credential boundary refuses an unscoped request rather than
+        // falling back to the installation's full grant, so dropping either
+        // half leaves the sweep unable to authenticate at all.
         let scopes =
             organization_scopes(&roster(&["placeholder-org/alpha", "placeholder-org/beta"]));
         let repositories = scopes["placeholder-org"].repositories.join(",");
