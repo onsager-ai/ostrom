@@ -15,6 +15,7 @@ use ostrom_core::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tempfile::tempdir;
 use thiserror::Error;
 
 use crate::sweep::run_sweep_with_mirror;
@@ -23,8 +24,31 @@ use crate::{
     io_error, read_queue, set_private_file_mode,
 };
 
+const ASSESSMENTS_PER_PLAN: usize = 20;
+const ASSESSMENT_COST_CEILING_USD: &str = "1";
+const ASSESSMENT_TOKEN_CEILING: &str = "25000";
+const ASSESSMENT_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["goal","reading","because"],"properties":{"goal":{"type":"string"},"reading":{"enum":["on-track","at-risk","off-track","blocked"]},"because":{"type":"array","minItems":1,"items":{"type":"object","additionalProperties":false,"required":["fact","detail"],"properties":{"fact":{"type":"string"},"detail":{"type":"string","minLength":1}}}}}}"#;
+
 pub trait AssessmentDeriver {
-    fn derive(&mut self, input: &AssessmentInput) -> Result<AssessmentDraft, String>;
+    fn derive(
+        &mut self,
+        input: &AssessmentInput,
+    ) -> Result<AssessmentDraft, AssessmentDeriverError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssessmentDeriverError {
+    name: &'static str,
+    detail: String,
+}
+
+impl AssessmentDeriverError {
+    fn new(name: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            name,
+            detail: detail.into(),
+        }
+    }
 }
 
 pub struct ExecutableAssessmentDeriver {
@@ -39,41 +63,299 @@ impl ExecutableAssessmentDeriver {
 }
 
 impl AssessmentDeriver for ExecutableAssessmentDeriver {
-    fn derive(&mut self, input: &AssessmentInput) -> Result<AssessmentDraft, String> {
+    fn derive(
+        &mut self,
+        input: &AssessmentInput,
+    ) -> Result<AssessmentDraft, AssessmentDeriverError> {
         let mut child = Command::new(&self.executable)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|error| format!("could not start deriver: {error}"))?;
+            .map_err(|error| {
+                AssessmentDeriverError::new(
+                    "assessment_deriver_unavailable",
+                    format!("could not start deriver: {error}"),
+                )
+            })?;
         let bytes = serde_json::to_vec(input).expect("assessment input serializes");
         child
             .stdin
             .take()
-            .ok_or_else(|| "deriver stdin unavailable".to_owned())?
+            .ok_or_else(|| {
+                AssessmentDeriverError::new(
+                    "assessment_deriver_failed",
+                    "deriver stdin unavailable",
+                )
+            })?
             .write_all(&bytes)
-            .map_err(|error| format!("could not write deriver input: {error}"))?;
-        let output = child
-            .wait_with_output()
-            .map_err(|error| format!("could not wait for deriver: {error}"))?;
+            .map_err(|error| {
+                AssessmentDeriverError::new(
+                    "assessment_deriver_failed",
+                    format!("could not write deriver input: {error}"),
+                )
+            })?;
+        let output = child.wait_with_output().map_err(|error| {
+            AssessmentDeriverError::new(
+                "assessment_deriver_failed",
+                format!("could not wait for deriver: {error}"),
+            )
+        })?;
         if !output.status.success() {
             let detail = String::from_utf8_lossy(&output.stderr);
-            return Err(format!(
-                "deriver exited with {}; {}",
-                output.status,
-                detail.trim()
+            return Err(AssessmentDeriverError::new(
+                "assessment_deriver_failed",
+                format!("deriver exited with {}; {}", output.status, detail.trim()),
             ));
         }
-        serde_json::from_slice(&output.stdout)
-            .map_err(|error| format!("deriver output is invalid: {error}"))
+        serde_json::from_slice(&output.stdout).map_err(|error| {
+            AssessmentDeriverError::new(
+                "assessment_invalid_output",
+                format!("deriver output is invalid: {error}"),
+            )
+        })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssessmentHarness {
+    Claude,
+    Codex,
+    Copilot,
+}
+
+impl AssessmentHarness {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Copilot => "copilot",
+        }
+    }
+}
+
+pub struct HarnessAssessmentDeriver {
+    harness: AssessmentHarness,
+    executable: PathBuf,
+    attempts: usize,
+}
+
+impl HarnessAssessmentDeriver {
+    #[must_use]
+    pub fn new(harness: AssessmentHarness, executable: PathBuf) -> Self {
+        Self {
+            harness,
+            executable,
+            attempts: 0,
+        }
+    }
+
+    fn command(&self, scratch: &Path) -> Result<Command, AssessmentDeriverError> {
+        let mut command = Command::new(&self.executable);
+        command.current_dir(scratch);
+        match self.harness {
+            AssessmentHarness::Claude => {
+                command.args([
+                    "--print",
+                    "--output-format",
+                    "json",
+                    "--json-schema",
+                    ASSESSMENT_SCHEMA,
+                    "--permission-mode",
+                    "dontAsk",
+                    "--tools",
+                    "",
+                    "--disallowedTools",
+                    "mcp__*",
+                    "--max-turns",
+                    "1",
+                    "--max-budget-usd",
+                    ASSESSMENT_COST_CEILING_USD,
+                    "--no-session-persistence",
+                ]);
+                command.env("CLAUDE_CODE_MAX_OUTPUT_TOKENS", ASSESSMENT_TOKEN_CEILING);
+            }
+            AssessmentHarness::Codex => {
+                let schema = scratch.join("assessment-schema.json");
+                fs::write(&schema, ASSESSMENT_SCHEMA).map_err(|error| {
+                    AssessmentDeriverError::new(
+                        "assessment_harness_failed",
+                        format!("could not prepare Codex output schema: {error}"),
+                    )
+                })?;
+                command.args([
+                    "exec",
+                    "--disable",
+                    "shell_tool",
+                    "--disable",
+                    "unified_exec",
+                    "--disable",
+                    "shell_snapshot",
+                    "--ephemeral",
+                    "--skip-git-repo-check",
+                    "--ignore-user-config",
+                    "--ignore-rules",
+                    "--color",
+                    "never",
+                    "--sandbox",
+                    "read-only",
+                    "--config",
+                    "approval_policy=\"never\"",
+                    "--config",
+                    "web_search=\"disabled\"",
+                    "--config",
+                    "model_reasoning_effort=\"low\"",
+                    "--config",
+                    "model_context_window=25000",
+                    "--config",
+                    "model_auto_compact_token_limit=25000",
+                    "--output-schema",
+                ]);
+                command.arg(schema);
+            }
+            AssessmentHarness::Copilot => {
+                command.args([
+                    "--silent",
+                    "--no-ask-user",
+                    "--available-tools=",
+                    "--disable-builtin-mcps",
+                    "--no-custom-instructions",
+                    "--no-auto-update",
+                    "--no-remote",
+                    "--no-remote-export",
+                    "--max-ai-credits=1",
+                    "--stream=off",
+                ]);
+            }
+        }
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        Ok(command)
+    }
+}
+
+impl AssessmentDeriver for HarnessAssessmentDeriver {
+    fn derive(
+        &mut self,
+        input: &AssessmentInput,
+    ) -> Result<AssessmentDraft, AssessmentDeriverError> {
+        if self.attempts == ASSESSMENTS_PER_PLAN {
+            return Err(AssessmentDeriverError::new(
+                "assessment_budget_exhausted",
+                format!(
+                    "{} assessor reached the {ASSESSMENTS_PER_PLAN}-goal plan ceiling",
+                    self.harness.name()
+                ),
+            ));
+        }
+        self.attempts += 1;
+        let encoded = serde_json::to_string(input).expect("assessment input serializes");
+        let prompt = format!(
+            "Assess exactly one authored goal using only the supplied JSON. Do not use tools or seek other context. The only allowed readings are on-track, at-risk, off-track, and blocked. Return only an object matching this schema: {ASSESSMENT_SCHEMA}. Every because.fact must exactly name a key in input.facts, because must contain at least one citation, and because.detail must explain how that fact supports the reading. Do not invent, default, synthesize, or repair citations. Input: {encoded}"
+        );
+        let scratch = tempdir().map_err(|error| {
+            AssessmentDeriverError::new(
+                "assessment_harness_failed",
+                format!("could not create isolated assessor directory: {error}"),
+            )
+        })?;
+        let mut child = self.command(scratch.path())?.spawn().map_err(|error| {
+            AssessmentDeriverError::new(
+                "assessment_harness_unavailable",
+                format!(
+                    "{} assessor is configured but {} could not be started: {error}",
+                    self.harness.name(),
+                    self.executable.display()
+                ),
+            )
+        })?;
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| {
+                AssessmentDeriverError::new(
+                    "assessment_harness_failed",
+                    format!("{} assessor stdin is unavailable", self.harness.name()),
+                )
+            })?
+            .write_all(prompt.as_bytes())
+            .map_err(|error| {
+                AssessmentDeriverError::new(
+                    "assessment_harness_failed",
+                    format!(
+                        "could not write {} assessor input: {error}",
+                        self.harness.name()
+                    ),
+                )
+            })?;
+        let output = child.wait_with_output().map_err(|error| {
+            AssessmentDeriverError::new(
+                "assessment_harness_failed",
+                format!(
+                    "could not wait for {} assessor: {error}",
+                    self.harness.name()
+                ),
+            )
+        })?;
+        if !output.status.success() {
+            return Err(AssessmentDeriverError::new(
+                "assessment_harness_failed",
+                format!(
+                    "{} assessor exited with {}; {}",
+                    self.harness.name(),
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+            ));
+        }
+        decode_harness_output(self.harness, &output.stdout)
+    }
+}
+
+fn decode_harness_output(
+    harness: AssessmentHarness,
+    output: &[u8],
+) -> Result<AssessmentDraft, AssessmentDeriverError> {
+    if let Ok(draft) = serde_json::from_slice(output) {
+        return Ok(draft);
+    }
+    if harness == AssessmentHarness::Claude {
+        let envelope: Value = serde_json::from_slice(output).map_err(|error| {
+            AssessmentDeriverError::new(
+                "assessment_invalid_output",
+                format!("claude assessor output is invalid: {error}"),
+            )
+        })?;
+        return serde_json::from_value(envelope["structured_output"].clone()).map_err(|error| {
+            AssessmentDeriverError::new(
+                "assessment_invalid_output",
+                format!("claude assessor structured output is invalid: {error}"),
+            )
+        });
+    }
+    Err(AssessmentDeriverError::new(
+        "assessment_invalid_output",
+        format!(
+            "{} assessor output does not match the assessment contract",
+            harness.name()
+        ),
+    ))
 }
 
 pub struct UnavailableAssessmentDeriver;
 
 impl AssessmentDeriver for UnavailableAssessmentDeriver {
-    fn derive(&mut self, _input: &AssessmentInput) -> Result<AssessmentDraft, String> {
-        Err("no semantic assessment deriver is configured".to_owned())
+    fn derive(
+        &mut self,
+        _input: &AssessmentInput,
+    ) -> Result<AssessmentDraft, AssessmentDeriverError> {
+        Err(AssessmentDeriverError::new(
+            "assessment_unavailable",
+            "no semantic assessment deriver is configured",
+        ))
     }
 }
 
@@ -309,7 +591,9 @@ pub fn run_plan(
                 facts: fact_table(&facts, &queue),
             };
             match deriver.derive(&input).and_then(|draft| {
-                validate_assessment(goal, &facts, &queue, draft).map_err(|error| error.to_string())
+                validate_assessment(goal, &facts, &queue, draft).map_err(|error| {
+                    AssessmentDeriverError::new("assessment_invalid_output", error.to_string())
+                })
             }) {
                 Ok(draft) => {
                     let mut consequence = consequence(&facts, &queue);
@@ -351,12 +635,12 @@ pub fn run_plan(
                         escalation_suppressed: suppressed,
                     })
                 }
-                Err(detail) => {
+                Err(error) => {
                     faults.push(PlanFault {
                         stage: "assess".to_owned(),
                         goal: Some(goal.id.clone()),
-                        name: "assessment_unavailable".to_owned(),
-                        detail,
+                        name: error.name.to_owned(),
+                        detail: error.detail,
                     });
                     None
                 }

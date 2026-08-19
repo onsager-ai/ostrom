@@ -54,6 +54,142 @@ fn configure(home: &Path) {
     .expect("write gate evidence");
 }
 
+#[cfg(unix)]
+fn configure_assessor_case(home: &Path) -> PathBuf {
+    configure(home);
+    fs::write(
+        home.join("goals.yaml"),
+        r#"
+goals_version: 1
+goals:
+  - id: rust-cli
+    intent: ostrom runs as a product
+    state: active
+    serves: [{epic: example-org/example-repo#115}]
+    met_when: []
+actions: []
+acknowledgements: []
+"#,
+    )
+    .expect("write goals");
+    fs::write(
+        home.join("queue.jsonl"),
+        concat!(
+            r##"{"id":"example-org/example-repo#10","repo":"example-org/example-repo","ref":"#10","title":"Routine maintenance","kind":"decision","mandate":{"reason":"reserved ref:#10"},"state":"approved","opened":"2026-07-01T00:00:00Z","age_days":31,"aged_out":true,"needs_judgment":true,"blocked_by":[]}"##,
+            "\n",
+        ),
+    )
+    .expect("write approved queue state");
+    let mut fixture_value: Value =
+        serde_json::from_slice(&fs::read(fixture()).expect("read fixture")).expect("fixture JSON");
+    fixture_value["repositories"][0]["issues"][0]["epic"] = json!("example-org/example-repo#115");
+    let plan_fixture = home.join("plan-fixture.json");
+    fs::write(
+        &plan_fixture,
+        serde_json::to_vec(&fixture_value).expect("serialize fixture"),
+    )
+    .expect("write plan fixture");
+    plan_fixture
+}
+
+#[cfg(unix)]
+fn write_harness_stub(home: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let stub = home.join("placeholder-assessor");
+    fs::write(
+        &stub,
+        concat!(
+            "#!/usr/bin/env bash\n",
+            "set -eu\n",
+            "cat >\"$OSTROM_STUB_INPUT\"\n",
+            "printf '%s\\0' \"$@\" >\"$OSTROM_STUB_ARGS\"\n",
+            "printf '%s\\n' \"$OSTROM_STUB_OUTPUT\"\n",
+        ),
+    )
+    .expect("write assessor stub");
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o700)).expect("assessor stub mode");
+    stub
+}
+
+#[cfg(unix)]
+fn run_named_assessor(
+    home: &Path,
+    harness: &str,
+    executable: &Path,
+    stub_output: &str,
+    default_claude: bool,
+) -> (Value, Vec<String>, String) {
+    let plan_fixture = configure_assessor_case(home);
+    let args_file = home.join("assessor-args");
+    let input_file = home.join("assessor-input");
+    let variable = match harness {
+        "claude" => "CLAUDE_BIN",
+        "codex" => "CODEX_BIN",
+        "copilot" => "COPILOT_BIN",
+        _ => panic!("unknown fixture harness"),
+    };
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ostrom"));
+    command.arg("plan");
+    if default_claude {
+        command.arg("--assessor");
+    } else {
+        command.args(["--assessor", harness]);
+    }
+    let output = command
+        .args([
+            "--fixture",
+            plan_fixture.to_str().expect("fixture path"),
+            "--started-at",
+            "2026-08-01T00:00:00Z",
+        ])
+        .env("OSTROM_HOME", home)
+        .env_remove("OSTROM_PLAN_DERIVER")
+        .env(variable, executable)
+        .env("OSTROM_STUB_ARGS", &args_file)
+        .env("OSTROM_STUB_INPUT", &input_file)
+        .env("OSTROM_STUB_OUTPUT", stub_output)
+        .current_dir(home)
+        .output()
+        .expect("run named assessor");
+    assert!(
+        output.status.success(),
+        "plan stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document = serde_json::from_slice(&fs::read(home.join("plan.json")).expect("plan output"))
+        .expect("parse plan");
+    let arguments = fs::read(&args_file)
+        .expect("stub arguments")
+        .split(|byte| *byte == 0)
+        .filter(|argument| !argument.is_empty())
+        .map(|argument| String::from_utf8(argument.to_vec()).expect("UTF-8 stub argument"))
+        .collect();
+    let prompt = fs::read_to_string(input_file).expect("stub input");
+    (document, arguments, prompt)
+}
+
+#[cfg(unix)]
+fn assert_harness_contract(
+    document: &Value,
+    arguments: &[String],
+    prompt: &str,
+    expected_bound: &str,
+) {
+    assert_eq!(
+        document["ranking"]["computed"],
+        json!(["example-org/example-repo#10"])
+    );
+    assert!(document["faults"].as_array().is_some_and(Vec::is_empty));
+    let rendered = arguments.join("\n");
+    assert!(rendered.contains(expected_bound), "arguments: {rendered}");
+    assert!(prompt.starts_with("Assess exactly one authored goal"));
+    assert!(prompt.contains(r#""goal":"rust-cli""#));
+    assert!(prompt.contains(r#""facts":"#));
+    assert!(!prompt.contains("backlog"));
+    assert!(prompt.contains("Every because.fact must exactly name a key in input.facts"));
+}
+
 fn run(home: &Path, command: &str) -> Output {
     Command::new(env!("CARGO_BIN_EXE_ostrom"))
         .args([
@@ -197,13 +333,15 @@ acknowledgements: []
         document["ranking"]["ordered"],
         json!(["example-org/example-repo#10"])
     );
+    assert_eq!(document["ranking"]["computed"], json!([]));
     assert!(document["faults"].as_array().is_some_and(|faults| {
         faults
             .iter()
             .any(|fault| fault["name"] == "unresolved_check")
-            && faults
-                .iter()
-                .any(|fault| fault["name"] == "assessment_unavailable")
+            && faults.iter().any(|fault| {
+                fault["name"] == "assessment_unavailable"
+                    && fault["detail"] == "no semantic assessment deriver is configured"
+            })
     }));
     assert_eq!(
         document["goals"][0]["facts"]["met_when_status"][0]["state"],
@@ -451,6 +589,183 @@ acknowledgements: []
         document["ranking"]["computed"],
         json!(["example-org/example-repo#10"])
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_harness_satisfies_the_cited_contract_and_is_the_default() {
+    let home = tempdir().expect("plan home");
+    let stub = write_harness_stub(home.path());
+    let assessment = r#"{"goal":"rust-cli","reading":"off-track","because":[{"fact":"next.dispatchable","detail":"the next milestone is authorized and unselected"}]}"#;
+    let envelope = format!(r#"{{"structured_output":{assessment}}}"#);
+    let (document, arguments, prompt) =
+        run_named_assessor(home.path(), "claude", &stub, &envelope, true);
+    assert_harness_contract(&document, &arguments, &prompt, "--max-budget-usd\n1");
+    assert!(arguments.iter().any(|argument| argument == "--max-turns"));
+    assert!(arguments.iter().any(|argument| argument == "--json-schema"));
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_harness_satisfies_the_cited_contract() {
+    let home = tempdir().expect("plan home");
+    let stub = write_harness_stub(home.path());
+    let assessment = r#"{"goal":"rust-cli","reading":"off-track","because":[{"fact":"next.dispatchable","detail":"the next milestone is authorized and unselected"}]}"#;
+    let (document, arguments, prompt) =
+        run_named_assessor(home.path(), "codex", &stub, assessment, false);
+    assert_harness_contract(&document, &arguments, &prompt, "model_context_window=25000");
+    assert!(arguments.iter().any(|argument| argument == "--ephemeral"));
+    assert!(arguments.iter().any(|argument| argument == "shell_tool"));
+    assert!(arguments.iter().any(|argument| argument == "read-only"));
+}
+
+#[cfg(unix)]
+#[test]
+fn copilot_harness_satisfies_the_cited_contract() {
+    let home = tempdir().expect("plan home");
+    let stub = write_harness_stub(home.path());
+    let assessment = r#"{"goal":"rust-cli","reading":"off-track","because":[{"fact":"next.dispatchable","detail":"the next milestone is authorized and unselected"}]}"#;
+    let (document, arguments, prompt) =
+        run_named_assessor(home.path(), "copilot", &stub, assessment, false);
+    assert_harness_contract(&document, &arguments, &prompt, "--max-ai-credits=1");
+    assert!(
+        arguments
+            .iter()
+            .any(|argument| argument == "--available-tools=")
+    );
+    assert!(
+        arguments
+            .iter()
+            .any(|argument| argument == "--disable-builtin-mcps")
+    );
+}
+
+#[cfg(unix)]
+fn assert_uncited_harness_is_refused(harness: &str) {
+    let home = tempdir().expect("plan home");
+    let stub = write_harness_stub(home.path());
+    let assessment = r#"{"goal":"rust-cli","reading":"off-track","because":[]}"#;
+    let (document, _, _) = run_named_assessor(home.path(), harness, &stub, assessment, false);
+    assert_eq!(document["ranking"]["computed"], json!([]));
+    assert_eq!(
+        document["ranking"]["ordered"],
+        json!(["example-org/example-repo#10"])
+    );
+    assert!(document["goals"][0]["assessment"].is_null());
+    assert!(document["faults"].as_array().is_some_and(|faults| {
+        faults.iter().any(|fault| {
+            fault["name"] == "assessment_invalid_output"
+                && fault["detail"] == "assessment must cite at least one computed fact"
+        })
+    }));
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_harness_refuses_an_uncited_reading() {
+    assert_uncited_harness_is_refused("claude");
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_harness_refuses_an_uncited_reading() {
+    assert_uncited_harness_is_refused("codex");
+}
+
+#[cfg(unix)]
+#[test]
+fn copilot_harness_refuses_an_uncited_reading() {
+    assert_uncited_harness_is_refused("copilot");
+}
+
+#[cfg(unix)]
+#[test]
+fn configured_missing_harness_has_a_distinct_named_fault() {
+    let home = tempdir().expect("plan home");
+    let plan_fixture = configure_assessor_case(home.path());
+    let missing = home.path().join("missing-placeholder-claude");
+    let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .args([
+            "plan",
+            "--assessor",
+            "claude",
+            "--fixture",
+            plan_fixture.to_str().expect("fixture path"),
+            "--started-at",
+            "2026-08-01T00:00:00Z",
+        ])
+        .env("OSTROM_HOME", home.path())
+        .env_remove("OSTROM_PLAN_DERIVER")
+        .env("CLAUDE_BIN", &missing)
+        .current_dir(home.path())
+        .output()
+        .expect("run missing assessor");
+    assert!(output.status.success());
+    let document: Value =
+        serde_json::from_slice(&fs::read(home.path().join("plan.json")).expect("plan output"))
+            .expect("parse plan");
+    assert!(document["faults"].as_array().is_some_and(|faults| {
+        faults.iter().any(|fault| {
+            fault["name"] == "assessment_harness_unavailable"
+                && fault["detail"]
+                    .as_str()
+                    .is_some_and(|detail| detail.contains("claude assessor is configured"))
+        })
+    }));
+    assert_eq!(document["ranking"]["computed"], json!([]));
+}
+
+#[cfg(unix)]
+#[test]
+fn named_assessment_stops_at_the_plan_goal_ceiling() {
+    let home = tempdir().expect("plan home");
+    let plan_fixture = configure_assessor_case(home.path());
+    let stub = write_harness_stub(home.path());
+    let goals = (0..21)
+        .map(|index| {
+            format!(
+                "  - id: goal-{index}\n    intent: placeholder intent {index}\n    state: active\n    serves: [{{epic: example-org/example-repo#115}}]\n    met_when: []\n"
+            )
+        })
+        .collect::<String>();
+    fs::write(
+        home.path().join("goals.yaml"),
+        format!("goals_version: 1\ngoals:\n{goals}actions: []\nacknowledgements: []\n"),
+    )
+    .expect("write bounded goals");
+    let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .args([
+            "plan",
+            "--assessor",
+            "claude",
+            "--fixture",
+            plan_fixture.to_str().expect("fixture path"),
+            "--started-at",
+            "2026-08-01T00:00:00Z",
+        ])
+        .env("OSTROM_HOME", home.path())
+        .env_remove("OSTROM_PLAN_DERIVER")
+        .env("CLAUDE_BIN", &stub)
+        .env("OSTROM_STUB_ARGS", home.path().join("assessor-args"))
+        .env("OSTROM_STUB_INPUT", home.path().join("assessor-input"))
+        .env(
+            "OSTROM_STUB_OUTPUT",
+            r#"{"goal":"goal-0","reading":"off-track","because":[{"fact":"next.dispatchable","detail":"placeholder cited detail"}]}"#,
+        )
+        .current_dir(home.path())
+        .output()
+        .expect("run bounded assessor");
+    assert!(output.status.success());
+    let document: Value =
+        serde_json::from_slice(&fs::read(home.path().join("plan.json")).expect("plan output"))
+            .expect("parse plan");
+    assert!(document["faults"].as_array().is_some_and(|faults| {
+        faults.iter().any(|fault| {
+            fault["goal"] == "goal-20"
+                && fault["name"] == "assessment_budget_exhausted"
+                && fault["detail"] == "claude assessor reached the 20-goal plan ceiling"
+        })
+    }));
 }
 
 #[test]

@@ -89,12 +89,41 @@ Rust sweep.
 
 `ostrom plan` runs that same sweep first, then strictly reads `goals.yaml`,
 mirrors durable check receipts, derives goal facts, and writes private
-`plan.json` plus its acknowledgement ledger. Semantic assessment is an
-explicit executable port named by `OSTROM_PLAN_DERIVER`; when it is absent or
-returns an invalid/uncited result, the plan records a visible fault and keeps a
-mechanical authorization-preserving ranking. The builder selector consumes a
-plan only when its queue basis and principal `work_ranking` still match,
+`plan.json` plus its acknowledgement ledger. Semantic assessment can use a
+named harness with `--assessor[=claude|codex|copilot]`; a bare `--assessor`
+selects Claude. `OSTROM_PLAN_DERIVER` accepts the same three names and remains
+the arbitrary-executable escape hatch for every other value. With neither
+configured, the existing `assessment_unavailable` fault and mechanical
+authorization-preserving ranking are unchanged. The builder selector consumes
+a plan only when its queue basis and principal `work_ranking` still match,
 otherwise it visibly falls back to the existing ordering.
+
+Every named harness may conclude only `on-track`, `at-risk`, `off-track`, or
+`blocked` for the supplied goal. Claude returns its structured-output envelope,
+Codex returns output checked against the same schema, and Copilot returns its
+silent prompt response. This protocol difference is the full semantic choice:
+all three receive only the goal input and its computed fact table, never the
+backlog, and all three must cite at least one exact fact key in `because`.
+Ostrom does not repair a missing or invented citation. It records
+`assessment_invalid_output` and leaves the mechanical ranking in place.
+
+Named assessment is also bounded to 20 eligible goals per plan pass. That
+ceiling divides the existing default work-order ceilings ($20 and 500,000
+weighted tokens) into 20 deliberately small assessments: Claude gets one turn,
+a $1 API budget and a 25,000-output-token cap; Codex gets one ephemeral,
+read-only response with a 25,000-token context; Copilot gets one tool-free
+response with a one-AI-credit soft cap. The resulting pass bounds are therefore
+$20 for Claude, 500,000 context tokens for Codex, or 20 AI credits for Copilot;
+the provider-native units are kept explicit rather than pretending credits and
+subscription usage are dollars. The adapters run in an empty temporary
+directory with tools and network-backed context disabled. `CLAUDE_BIN`,
+`CODEX_BIN`, and `COPILOT_BIN` override their executable paths.
+
+A configured named harness that cannot be started records
+`assessment_harness_unavailable`, distinct from the unconfigured
+`assessment_unavailable` state. A process failure is
+`assessment_harness_failed`, while malformed, uncited, mismatched, or
+invented-fact output is `assessment_invalid_output`.
 
 `ostrom migrate` moves legacy files into the XDG roots after refusing any
 unexpired named lease. It rewrites in-tree private-key paths, preserves key

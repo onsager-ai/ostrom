@@ -21,17 +21,17 @@ use ostrom_core::{
     ResolvedCheck,
 };
 use ostrom_store::{
-    AuditOptions, DispatchOutcome, DispatchRequest, ExecutableAssessmentDeriver, GateError,
-    GateOptions, ImplementRequest, MigrationOutcome, OstromPaths, PassRequest, PassRole,
-    PlanOptions, PublishDestination, PublishTarget, QueueDecision, ReplayOptions, SelectAction,
-    SelectError, SelectOutcome, SelectRequest, SignalFlags, SweepError, SweepMode, SweepOptions,
-    SweepParityOptions, TraceAppend, TraceView, UnavailableAssessmentDeriver, acquire_lease,
-    acquire_org_from_github, append_trace_checked, audit, branch_name, create_work_order,
-    credential_output, decide_queue_item, encode_org_snapshots, encode_selection, grant_excuse,
-    item_hash, lease_status, lint_queue_state, list_excuses, list_queue_json, local_drift, migrate,
-    read_trace_json, release_lease, replay, run_dispatch, run_gate, run_implement, run_pass,
-    run_plan, run_selection, run_sweep, run_sweep_parity, validate_lease_name,
-    validate_work_order_file,
+    AssessmentHarness, AuditOptions, DispatchOutcome, DispatchRequest, ExecutableAssessmentDeriver,
+    GateError, GateOptions, HarnessAssessmentDeriver, ImplementRequest, MigrationOutcome,
+    OstromPaths, PassRequest, PassRole, PlanOptions, PublishDestination, PublishTarget,
+    QueueDecision, ReplayOptions, SelectAction, SelectError, SelectOutcome, SelectRequest,
+    SignalFlags, SweepError, SweepMode, SweepOptions, SweepParityOptions, TraceAppend, TraceView,
+    UnavailableAssessmentDeriver, acquire_lease, acquire_org_from_github, append_trace_checked,
+    audit, branch_name, create_work_order, credential_output, decide_queue_item,
+    encode_org_snapshots, encode_selection, grant_excuse, item_hash, lease_status,
+    lint_queue_state, list_excuses, list_queue_json, local_drift, migrate, read_trace_json,
+    release_lease, replay, run_dispatch, run_gate, run_implement, run_pass, run_plan,
+    run_selection, run_sweep, run_sweep_parity, validate_lease_name, validate_work_order_file,
 };
 
 #[derive(Debug, Parser)]
@@ -151,6 +151,9 @@ enum Command {
         /// Force full/incremental acquisition or select automatically.
         #[arg(long, value_enum, default_value_t = CliSweepMode::Auto)]
         mode: CliSweepMode,
+        /// Assess with a named harness; omission of the value selects claude.
+        #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "claude")]
+        assessor: Option<CliAssessmentHarness>,
         /// Recorded GitHub responses for a hermetic parity run.
         #[arg(long, hide = true)]
         fixture: Option<PathBuf>,
@@ -291,6 +294,59 @@ enum CliSweepMode {
     Auto,
     Full,
     Incremental,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliAssessmentHarness {
+    Claude,
+    Codex,
+    Copilot,
+}
+
+impl From<CliAssessmentHarness> for AssessmentHarness {
+    fn from(value: CliAssessmentHarness) -> Self {
+        match value {
+            CliAssessmentHarness::Claude => Self::Claude,
+            CliAssessmentHarness::Codex => Self::Codex,
+            CliAssessmentHarness::Copilot => Self::Copilot,
+        }
+    }
+}
+
+fn resolve_plan_deriver(
+    assessor: Option<CliAssessmentHarness>,
+) -> Box<dyn ostrom_store::AssessmentDeriver> {
+    if let Some(harness) = assessor.map(AssessmentHarness::from) {
+        return named_plan_deriver(harness);
+    }
+    let Some(configured) = env::var_os("OSTROM_PLAN_DERIVER") else {
+        return Box::new(UnavailableAssessmentDeriver);
+    };
+    let harness = match configured.to_str() {
+        Some("claude") => Some(AssessmentHarness::Claude),
+        Some("codex") => Some(AssessmentHarness::Codex),
+        Some("copilot") => Some(AssessmentHarness::Copilot),
+        _ => None,
+    };
+    harness.map_or_else(
+        || {
+            Box::new(ExecutableAssessmentDeriver::new(PathBuf::from(configured)))
+                as Box<dyn ostrom_store::AssessmentDeriver>
+        },
+        named_plan_deriver,
+    )
+}
+
+fn named_plan_deriver(harness: AssessmentHarness) -> Box<dyn ostrom_store::AssessmentDeriver> {
+    let variable = match harness {
+        AssessmentHarness::Claude => "CLAUDE_BIN",
+        AssessmentHarness::Codex => "CODEX_BIN",
+        AssessmentHarness::Copilot => "COPILOT_BIN",
+    };
+    let executable = env::var_os(variable)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(harness.name()));
+    Box::new(HarnessAssessmentDeriver::new(harness, executable))
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -619,6 +675,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Plan {
             mode,
+            assessor,
             fixture,
             started_at,
         } => {
@@ -644,12 +701,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 check_resolution_faults: check_resolutions.faults,
                 catalogue_fault: check_resolutions.catalogue_fault,
             };
-            let mut deriver: Box<dyn ostrom_store::AssessmentDeriver> =
-                if let Some(executable) = env::var_os("OSTROM_PLAN_DERIVER") {
-                    Box::new(ExecutableAssessmentDeriver::new(PathBuf::from(executable)))
-                } else {
-                    Box::new(UnavailableAssessmentDeriver)
-                };
+            let mut deriver = resolve_plan_deriver(assessor);
             let plan = run_plan(&options, deriver.as_mut())?;
             println!(
                 "ostrom plan: {} goals; {} ranked items; {} faults; wrote {}",
