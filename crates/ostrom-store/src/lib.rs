@@ -43,9 +43,9 @@ pub use pass::{PassError, PassRequest, PassRole, SignalFlags, run_pass};
 pub use pass_state::{PassState, read_pass_state, write_pass_state};
 pub use paths::OstromPaths;
 pub use plan::{
-    AssessmentDeriver, AssessmentInput, ExecutableAssessmentDeriver, GoalPlan, PlanDocument,
-    PlanError, PlanFault, PlanOptions, PlanRanking, PlanSweep, UnavailableAssessmentDeriver,
-    run_plan,
+    AssessmentDeriver, AssessmentDeriverError, AssessmentHarness, AssessmentInput,
+    ExecutableAssessmentDeriver, GoalPlan, HarnessAssessmentDeriver, PlanDocument, PlanError,
+    PlanFault, PlanOptions, PlanRanking, PlanSweep, UnavailableAssessmentDeriver, run_plan,
 };
 pub use publish::{PublishDestination, PublishError};
 pub use queue::{
