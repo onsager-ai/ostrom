@@ -102,6 +102,8 @@ jobs:
       MSRV_TOOLCHAIN: ${{ needs.rust-toolchain.outputs.rust-toolchain }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
       # The doctor bundle is gone, but `npm/scripts/*.mjs` still run under Node —
       # the release-floor assertion among them. Pinning it rather than
       # inheriting whatever ubuntu-latest ships is the same reason the Rust
@@ -109,8 +111,6 @@ jobs:
       - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
         with:
           node-version: 22
-        with:
-          fetch-depth: 0
       - name: Install pinned Rust toolchain
         run: rustup toolchain install "$MSRV_TOOLCHAIN" --profile minimal
         working-directory: .
