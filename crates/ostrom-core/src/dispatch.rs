@@ -4,15 +4,25 @@ use thiserror::Error;
 
 use crate::sha256_hex;
 
+/// Deliberately tolerant of unknown fields.
+///
+/// `deny_unknown_fields` here meant every `gh api .../branches` response was
+/// rejected, because GitHub sends `protected` on each branch and `url` on each
+/// commit. Dispatch reported that as `branch-listing-degraded` and refused to
+/// dispatch anything for two days — the JSON was valid and the credentials were
+/// fine; only our deserialiser disagreed, and it stayed that way until someone
+/// parsed a real response with these types.
+///
+/// A remote API we do not control will add fields. Denying unknown ones asserts
+/// that GitHub's response shape is frozen, which is not a claim we can make.
+/// `valid()` below is what actually guards the data we depend on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct RemoteBranch {
     pub name: String,
     pub commit: RemoteCommit,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct RemoteCommit {
     pub sha: String,
 }
@@ -234,6 +244,70 @@ fn valid_created_at(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// The exact payload GitHub returns, which `deny_unknown_fields` rejected.
+    ///
+    /// `protected` on the branch and `url` on the commit are always present in
+    /// a real `gh api .../branches` response. Rejecting them stopped dispatch
+    /// for two days while the credentials and the JSON were both fine.
+    #[test]
+    fn a_real_github_branch_payload_deserialises() {
+        let payload = br#"[{
+            "name": "placeholder/branch",
+            "commit": {
+              "sha": "0123456789abcdef0123456789abcdef01234567",
+              "url": "https://api.github.com/repos/placeholder-org/alpha/commits/0123456789abcdef0123456789abcdef01234567"
+            },
+            "protected": false
+        }]"#;
+        let branches: Vec<RemoteBranch> =
+            serde_json::from_slice(payload).expect("a real GitHub branch payload must deserialise");
+        assert_eq!(branches.len(), 1);
+        assert_eq!(branches[0].name, "placeholder/branch");
+        assert!(branches[0].valid());
+    }
+
+    /// Tolerating unknown fields must not tolerate bad data. `valid()` is what
+    /// actually guards the fields dispatch depends on, so loosening the
+    /// deserialiser is only safe while this still refuses.
+    #[test]
+    fn a_malformed_sha_is_still_rejected() {
+        let payload = br#"[{
+            "name": "placeholder/branch",
+            "commit": {"sha": "not-a-sha", "url": "https://example.invalid"},
+            "protected": false
+        }]"#;
+        let branches: Vec<RemoteBranch> =
+            serde_json::from_slice(payload).expect("shape is fine; the value is not");
+        assert_eq!(branches.len(), 1);
+        assert!(
+            !branches[0].valid(),
+            "a non-hex sha must not pass validation"
+        );
+
+        let empty_name = br#"[{
+            "name": "",
+            "commit": {"sha": "0123456789abcdef0123456789abcdef01234567"}
+        }]"#;
+        let branches: Vec<RemoteBranch> =
+            serde_json::from_slice(empty_name).expect("shape is fine; the value is not");
+        assert!(!branches[0].valid(), "an empty branch name must not pass");
+    }
+
+    /// A field GitHub has not invented yet must not break dispatch either.
+    #[test]
+    fn an_unforeseen_field_does_not_break_the_listing() {
+        let payload = br#"[{
+            "name": "placeholder/branch",
+            "commit": {"sha": "0123456789abcdef0123456789abcdef01234567"},
+            "some_field_github_adds_later": {"nested": true}
+        }]"#;
+        let branches: Vec<RemoteBranch> =
+            serde_json::from_slice(payload).expect("unknown fields must be tolerated");
+        assert_eq!(branches.len(), 1);
+        assert_eq!(branches[0].name, "placeholder/branch");
+        assert!(branches[0].valid());
+    }
+
     use super::*;
 
     fn branch(name: &str) -> RemoteBranch {
