@@ -76,7 +76,12 @@ fn write_check_run(home: &Path, catalogue: &str, observations: &[(&str, &str)]) 
         }],
         complete: true,
     };
-    let registry = ActionRegistry::core(home.join("dist/doctor.js")).expect("core registry");
+    // A plugin root, not OSTROM_HOME. These happen to be the same directory in
+    // this fixture and the test never executes a doctor check, so passing the
+    // state root worked by accident — and would break the moment a core
+    // provider read a plugin asset at construction.
+    let plugin_root = home;
+    let registry = ActionRegistry::core(plugin_root).expect("core registry");
     let completed_at = "2026-08-01T00:00:00Z";
     let receipts = observations
         .iter()

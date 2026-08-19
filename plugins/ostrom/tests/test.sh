@@ -4615,7 +4615,7 @@ doctor_config="$fixture/doctor"
 doctor_absent="$(
   cd "$fixture/repo"
   HOME="$fixture" CLAUDE_CONFIG_DIR="$doctor_config" \
-    node "$PLUGIN_ROOT/dist/doctor.js"
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" run_ostrom doctor
 )"
 grep -q '^WARN|trace-lease|trace absent; lease idle|' <<<"$doctor_absent"
 grep -q '^WARN|builder-pass|no builder pass ever recorded|' <<<"$doctor_absent"
@@ -4627,7 +4627,7 @@ MANDATE_TRACE_TIME="2026-07-30T00:00:00Z" CLAUDE_CONFIG_DIR="$doctor_config" \
 doctor_stale="$(
   cd "$fixture/repo"
   HOME="$fixture" CLAUDE_CONFIG_DIR="$doctor_config" \
-    node "$PLUGIN_ROOT/dist/doctor.js"
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" run_ostrom doctor
 )"
 grep -q '^WARN|trace-lease|trace stale, last 2026-07-30T00:00:00Z' \
   <<<"$doctor_stale"
@@ -4645,7 +4645,7 @@ MANDATE_TRACE_TIME="$MANDATE_SWEEP_TIME" CLAUDE_CONFIG_DIR="$doctor_config" \
 doctor_current="$(
   cd "$fixture/repo"
   HOME="$fixture" CLAUDE_CONFIG_DIR="$doctor_config" \
-    node "$PLUGIN_ROOT/dist/doctor.js"
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" run_ostrom doctor
 )"
 grep -q '^OK|trace-lease|trace current, last 2026-08-01T00:00:00Z; lease idle|$' \
   <<<"$doctor_current"
@@ -4659,7 +4659,7 @@ CLAUDE_CONFIG_DIR="$doctor_config" MANDATE_LEASE_NOW_EPOCH=1785538800 \
 doctor_expired_lease="$(
   cd "$fixture/repo"
   HOME="$fixture" CLAUDE_CONFIG_DIR="$doctor_config" \
-    node "$PLUGIN_ROOT/dist/doctor.js"
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" run_ostrom doctor
 )"
 grep -q '^WARN|trace-lease|.*lease stale for gatekeeper-stale' \
   <<<"$doctor_expired_lease"

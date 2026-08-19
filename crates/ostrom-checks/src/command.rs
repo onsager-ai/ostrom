@@ -84,13 +84,11 @@ impl PreparedAction for CommandAction {
     fn execute(&self) -> ActionOutcome {
         let mut command = Command::new(&self.shell);
         command.arg("-c").arg(&self.script);
-        match run_bounded(&mut command, self.timeout, false) {
-            ProcessResult::Completed(status, _) if status.success() => ActionOutcome::Pass,
-            ProcessResult::Completed(_, _) => ActionOutcome::Fail,
+        match run_bounded(&mut command, self.timeout) {
+            ProcessResult::Completed(status) if status.success() => ActionOutcome::Pass,
+            ProcessResult::Completed(_) => ActionOutcome::Fail,
             ProcessResult::TimedOut => ActionOutcome::Error(ActionFault::new("cmd_timeout", None)),
-            ProcessResult::SpawnFailed
-            | ProcessResult::WaitFailed
-            | ProcessResult::OutputMalformed => {
+            ProcessResult::SpawnFailed | ProcessResult::WaitFailed => {
                 ActionOutcome::Error(ActionFault::new("cmd_execute_error", None))
             }
         }

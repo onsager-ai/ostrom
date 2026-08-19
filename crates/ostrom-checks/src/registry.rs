@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, path::Path, time::SystemTime};
+use std::{collections::BTreeMap, time::SystemTime};
 
 use chrono::{DateTime, Utc};
 use ostrom_core::{
@@ -70,13 +70,13 @@ impl ActionRegistry {
         Self::default()
     }
 
-    /// Construct the shipped registry. The doctor script is supplied by the
-    /// host because installed plugin roots are deployment-specific.
-    pub fn core(doctor_script: impl AsRef<Path>) -> Result<Self, ActionFault> {
+    /// Construct the shipped registry. The plugin root remains host-supplied
+    /// because installed Claude plugin roots are deployment-specific.
+    pub fn core(plugin_root: impl Into<std::path::PathBuf>) -> Result<Self, ActionFault> {
         let mut registry = Self::new();
         registry.register(HttpProvider)?;
         registry.register(CommandProvider::default())?;
-        registry.register(DoctorProvider::new(doctor_script))?;
+        registry.register(DoctorProvider::from_environment(plugin_root))?;
         Ok(registry)
     }
 
