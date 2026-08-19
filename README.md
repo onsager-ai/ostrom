@@ -42,9 +42,8 @@ inside one plugin.
 - `plugins/ostrom/` — the unified plugin: layered rules and touch capture plus portfolio sweep, digest, private queue, and gatekeeper skills
 - `plugins/ostrom/hooks/` — both SessionStart hooks: layered constitution injection and durable mandate-digest rendering
 - `plugins/ostrom/config/` — separate shipped defaults for touch (`touch-defaults.yaml`) and mandates (`mandate-defaults.yaml`), plus reference examples
-- `plugins/ostrom/runtime/run-node.sh` — Node-resolution shim behind `/ostrom:doctor` (including non-interactive nvm/fnm/volta/asdf environments)
-- `plugins/ostrom/tools/` — TypeScript source, tests, and build configuration for the `/ostrom:doctor` prober
-- `plugins/ostrom/dist/doctor.js` — committed, zero-runtime-dependency `/ostrom:doctor` bundle
+- `plugins/ostrom/runtime/run-node.sh` — Node-resolution shim retained for the legacy sweep's optional semantic derivation path
+- `plugins/ostrom/tools/` + `plugins/ostrom/dist/semantic-derivation-cli.js` — the legacy sweep's still-live semantic derivation source, tests, and bundle
 - `crates/ostrom-core/` — pure Rust domain types and the async, substrate-neutral store port
 - `crates/ostrom-store/` — XDG paths plus legacy-compatible JSONL/file persistence
 - `crates/ostrom-cli/` — the additive `ostrom` binary and sweep entry point
@@ -419,12 +418,11 @@ comment — match `frozen-rules.md`'s own style).
 
 ## Doctor
 
-`/ostrom:doctor` runs `plugins/ostrom/runtime/run-node.sh`, which resolves
-Node from `PATH` or common version-manager locations and launches the
-committed TypeScript bundle. It reports on seven checks: plugin installed,
-marketplace clone still fast-forwardable, which rules layers actually
-fired, touch-log target durability, provider reachability, local vs cloud
-environment, and the supported shape of the config parser.
+`/ostrom:doctor` runs `ostrom doctor`, the native Rust prober. It reports on
+CLI installation/version/launcher safety, plugin and marketplace integrity,
+rules layering, touch durability and provider reachability, dispatch source
+roots, trace/lease/work-order health, recurring delivery passes, publish
+freshness, environment shape, and the supported config parser shape.
 
 It exists because silent degradation is the actual failure mode here, not
 a crash. The SessionStart hook injects the shipped rules and nothing else

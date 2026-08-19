@@ -14,7 +14,10 @@ mod process;
 mod registry;
 
 pub use command::CommandProvider;
-pub use doctor::{DOCTOR_CHECKS, DoctorProvider};
+pub use doctor::{
+    DOCTOR_CHECKS, DoctorOptions, DoctorProvider, DoctorResult, DoctorStatus, run_doctor,
+    run_doctor_check,
+};
 pub use http::HttpProvider;
 pub use judgment::{
     ClaudeHarness, HarnessRequest, JudgmentHarness, JudgmentOutcome, JudgmentRegistry,

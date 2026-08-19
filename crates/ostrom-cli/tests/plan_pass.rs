@@ -76,7 +76,7 @@ fn write_check_run(home: &Path, catalogue: &str, observations: &[(&str, &str)]) 
         }],
         complete: true,
     };
-    let registry = ActionRegistry::core(home.join("dist/doctor.js")).expect("core registry");
+    let registry = ActionRegistry::core(home).expect("core registry");
     let completed_at = "2026-08-01T00:00:00Z";
     let receipts = observations
         .iter()

@@ -1,28 +1,19 @@
 use std::{
-    process::{Child, Command, ExitStatus, Stdio},
+    process::{Command, ExitStatus, Stdio},
     thread,
     time::{Duration, Instant},
 };
 
 pub(crate) enum ProcessResult {
-    Completed(ExitStatus, Option<String>),
+    Completed(ExitStatus),
     SpawnFailed,
     WaitFailed,
     TimedOut,
-    OutputMalformed,
 }
 
-pub(crate) fn run_bounded(
-    command: &mut Command,
-    timeout: Duration,
-    capture_stdout: bool,
-) -> ProcessResult {
+pub(crate) fn run_bounded(command: &mut Command, timeout: Duration) -> ProcessResult {
     command.stdin(Stdio::null()).stderr(Stdio::null());
-    if capture_stdout {
-        command.stdout(Stdio::piped());
-    } else {
-        command.stdout(Stdio::null());
-    }
+    command.stdout(Stdio::null());
     let Ok(mut child) = command.spawn() else {
         return ProcessResult::SpawnFailed;
     };
@@ -33,7 +24,7 @@ pub(crate) fn run_bounded(
     };
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return completed(child, status, capture_stdout),
+            Ok(Some(status)) => return ProcessResult::Completed(status),
             Ok(None) if Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(5));
             }
@@ -48,23 +39,6 @@ pub(crate) fn run_bounded(
                 return ProcessResult::WaitFailed;
             }
         }
-    }
-}
-
-fn completed(mut child: Child, status: ExitStatus, capture_stdout: bool) -> ProcessResult {
-    if !capture_stdout {
-        return ProcessResult::Completed(status, None);
-    }
-    let Some(mut stdout) = child.stdout.take() else {
-        return ProcessResult::OutputMalformed;
-    };
-    let mut bytes = Vec::new();
-    if std::io::Read::read_to_end(&mut stdout, &mut bytes).is_err() {
-        return ProcessResult::OutputMalformed;
-    }
-    match String::from_utf8(bytes) {
-        Ok(output) => ProcessResult::Completed(status, Some(output)),
-        Err(_) => ProcessResult::OutputMalformed,
     }
 }
 

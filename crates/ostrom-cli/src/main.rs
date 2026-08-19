@@ -12,7 +12,7 @@ use std::{
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use directories::BaseDirs;
-use ostrom_checks::{ActionFault, ActionRegistry};
+use ostrom_checks::{ActionFault, ActionRegistry, DoctorOptions, run_doctor, run_doctor_check};
 use ostrom_core::{
     Catalogue, CatalogueEnumeration, CheckContractError, CheckDocument, CheckFault, RepositoryName,
     ResolvedCheck,
@@ -40,6 +40,12 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Diagnose the installed plugin, CLI, and local Ostrom state.
+    Doctor {
+        /// Run exactly one named doctor check.
+        #[arg(long)]
+        check: Option<String>,
+    },
     /// Run one unattended delivery pass for a role.
     Pass { role: CliPassRole },
     /// Execute one durable work order in its item worktree.
@@ -288,6 +294,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let paths = compatible_command_paths();
     match cli.command {
+        Command::Doctor { check } => run_doctor_command(check)?,
         Command::Pass { role } => supervise(&["__pass-worker".into(), role_name(role).into()]),
         Command::Implement {
             work_order_file,
@@ -1057,6 +1064,28 @@ fn run_select_work(arguments: Vec<String>) -> ! {
     }
 }
 
+fn run_doctor_command(check: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let plugin_root = env::var_os("OSTROM_PLUGIN_ROOT")
+        .or_else(|| env::var_os("CLAUDE_PLUGIN_ROOT"))
+        .map_or_else(|| cwd.join("plugins/ostrom"), PathBuf::from);
+    let options = DoctorOptions::from_environment(plugin_root);
+    let output = if let Some(name) = check {
+        match run_doctor_check(options, &name) {
+            Ok(output) => output,
+            Err(error) if error.name() == "doctor_unknown_check" => {
+                eprintln!("{}", error.detail().unwrap_or("unknown doctor check"));
+                std::process::exit(2);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        run_doctor(options)
+    };
+    io::stdout().write_all(output.as_bytes())?;
+    Ok(())
+}
+
 /// Resolve the state root the way the shell did, for every command.
 ///
 /// The store's own resolver deliberately refuses to fall through to an
@@ -1176,7 +1205,7 @@ fn resolve_plan_checks(
         .iter()
         .flat_map(|catalogue| catalogue.document.checks.keys().cloned())
         .collect::<BTreeSet<_>>();
-    let registry = ActionRegistry::core(plugin_root.join("dist/doctor.js"))?;
+    let registry = ActionRegistry::core(plugin_root.to_owned())?;
     let mut resolved = BTreeMap::new();
     let mut faults = BTreeMap::new();
     for id in ids {

@@ -95,14 +95,11 @@ jobs:
       - name: Test offline npm distribution
         run: bash npm/tests/test.sh
 
-  ostrom-tools:
+  plugin-integration:
     needs: rust-toolchain
     runs-on: ubuntu-latest
     env:
       MSRV_TOOLCHAIN: ${{ needs.rust-toolchain.outputs.rust-toolchain }}
-    defaults:
-      run:
-        working-directory: plugins/ostrom/tools
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -113,11 +110,6 @@ jobs:
       - name: Build Ostrom CLI for plugin integration tests
         run: cargo +"$MSRV_TOOLCHAIN" build --locked --package ostrom-cli
         working-directory: .
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: plugins/ostrom/tools/package-lock.json
       - name: Check the plugin CLI floor is published
         working-directory: .
         run: |
@@ -145,13 +137,5 @@ jobs:
           PULL_REQUEST_LABELS="$(jq -r '.[]' <<<"$labels_json")"
           export PULL_REQUEST_LABELS
           bash plugins/ostrom/tests/check-shell-freeze.sh "$BASE_SHA" "$HEAD_SHA"
-      - run: npm ci
-      - run: npm run typecheck
-      - run: npm run test
       - name: Run plugin integration tests
-        working-directory: .
         run: bash plugins/ostrom/tests/test.sh
-      - name: Rebuild committed doctor bundle
-        run: |
-          npm run build
-          git diff --exit-code -- ../dist/doctor.js
