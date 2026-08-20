@@ -22,7 +22,8 @@ use crate::{
 const REPAIR_CAP: usize = 3;
 const QUERY_LIMIT: usize = 1_000;
 const LIST_PERMISSIONS: &str = "metadata:read,pull_requests:read";
-const CHECK_PERMISSIONS: &str = "metadata:read,pull_requests:read,checks:read,statuses:read";
+const CHECK_PERMISSIONS: &str =
+    "metadata:read,pull_requests:read,checks:read,statuses:read,actions:read,contents:read";
 const FETCH_PERMISSIONS: &str = "metadata:read,contents:read";
 const PUSH_PERMISSIONS: &str = "metadata:read,contents:write";
 

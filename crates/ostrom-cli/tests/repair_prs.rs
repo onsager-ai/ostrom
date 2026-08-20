@@ -249,18 +249,21 @@ projects:
     )
     .unwrap();
     let calls = fixture.path().join("calls");
+    let check_permissions = fixture.path().join("check-permissions");
     let helper = fixture.path().join("credential-helper");
     executable(
         &helper,
         r#"#!/bin/sh
 set -eu
 printf '%s\n' "$*" >>"$REPAIR_CALLS"
+permissions="$6"
 shift 2
 while [ "$1" != "--" ]; do shift; done
 shift
 if [ "$1 $2 $3" = "gh pr list" ]; then
   cat "$REPAIR_LISTING"
 elif [ "$1 $2 $3" = "gh pr view" ]; then
+  printf '%s\n' "$permissions" >>"$REPAIR_CHECK_PERMISSIONS"
   if [ "$4" = "1" ]; then
     printf '%s\n' '{"statusCheckRollup":[{"name":"test","conclusion":"SUCCESS","status":"COMPLETED"}]}'
   else
@@ -282,6 +285,7 @@ fi
         .env("MANDATE_GH_AS_BIN", &helper)
         .env("REPAIR_LISTING", &listing)
         .env("REPAIR_CALLS", &calls)
+        .env("REPAIR_CHECK_PERMISSIONS", &check_permissions)
         .env("REPAIR_REMOTE", &remote)
         .env("MANDATE_TRACE_TIME", "2026-08-19T00:01:00Z")
         .current_dir(fixture.path())
@@ -322,6 +326,12 @@ fi
     assert!(calls.contains("gh pr view 1 "));
     assert!(calls.contains("gh pr view 3 "));
     assert!(!calls.contains("gh pr view 2 "));
+    let check_permissions = fs::read_to_string(check_permissions).unwrap();
+    assert_eq!(check_permissions.lines().count(), 2);
+    for permissions in check_permissions.lines() {
+        assert!(permissions.split(',').any(|scope| scope == "contents:read"));
+        assert!(permissions.split(',').any(|scope| scope == "actions:read"));
+    }
     let push = calls
         .lines()
         .find(|line| line.contains(" git -C ") && line.contains(" push "))
