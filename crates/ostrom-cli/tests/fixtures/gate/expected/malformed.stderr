@@ -1,1 +1,1 @@
-usage: gate.sh <owner/repo#number>
+usage: ostrom gate <owner/repo#number>

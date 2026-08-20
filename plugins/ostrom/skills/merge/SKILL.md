@@ -89,11 +89,22 @@ checks, labels and refs, and review threads directly from GitHub. Its
 review-thread query includes resolver authorship. Do not accept those inputs
 from the builder. Do not re-derive, reinterpret, or override the verdict.
 
-From the preserved verdict line, record the artifact pointer and the verdict
-consumption as two distinct trace events before taking any action. Here,
+From the complete preserved gate output, record the artifact pointer and the
+verdict consumption as two distinct trace events before taking any action. Here,
 `repository` is the resolved `owner/repo`, `pr_number` is the input pointer,
 `gate_exit` is the preserved exit code, and `head_sha`, `verdict`, and
-`already_judged` are the literal values parsed from the verdict line:
+`already_judged` are the literal values parsed from the verdict line.
+`failing_conditions` is an array parsed from the condition lines: include every
+condition whose literal result is `fail` or `inconclusive` as an object with
+`name` and `result`. For `required_checks`, that object must also contain a
+`selectors` array with the literal `selector` and `result` for every selector
+whose result is `fail` or `inconclusive`. A passing verdict therefore records an
+empty array. Keep these identifiers, results, and selectors in the fact object;
+do not replace them with narration. For example, a dead required-check selector
+is recorded as
+`{"name":"required_checks","result":"fail","selectors":[{"selector":"*-tools","result":"fail"}]}`.
+
+With those literal values parsed from the same gate output:
 
 ```sh
 ostrom trace append artifact-produced \
@@ -106,8 +117,10 @@ ostrom trace append gate-verdict-consumed \
     --arg head_sha "$head_sha" --arg verdict "$verdict" \
     --argjson exit_code "$gate_exit" \
     --argjson already_judged "$already_judged" \
+    --argjson failing_conditions "$failing_conditions" \
     '{repo: $repo, pr: $pr, head_sha: $head_sha, verdict: $verdict,
-      exit_code: $exit_code, already_judged: $already_judged}')" \
+      exit_code: $exit_code, already_judged: $already_judged,
+      failing_conditions: $failing_conditions}')" \
   '{}'
 ```
 
@@ -351,7 +364,8 @@ caller's, is always about delivery, and never converts `inconclusive` into
 
   An `excused` condition is part of a `pass`, so the merge proceeds normally.
   The exception reason already appears in the verdict output and the
-  `gate-verdict-consumed` trace fact.
+  `gate-verdict-consumed` trace fact, including its literal failing condition
+  names/results and any failing `required_checks` selector names/results.
 - **Fail (exit 1)** — if `already_judged=false`, leave the complete gate output
   as one PR comment using
   `ostrom credential gatekeeper "$repository" --repositories "$repository" --permissions metadata:read,issues:write,pull_requests:read -- gh pr comment <PR number> --repo <owner/repo> --body-file <file>`;

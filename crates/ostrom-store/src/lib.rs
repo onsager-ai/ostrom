@@ -29,7 +29,7 @@ pub use app_token::{AppTokenError, CredentialCommandError, credential_output};
 pub use check_store::JsonlCheckStore;
 pub use dispatch::{DispatchError, DispatchOutcome, DispatchRequest, run_dispatch};
 pub use file_store::JsonlSweepStore;
-pub use gate::{GateError, GateOptions, GateOutput, run_gate};
+pub use gate::{GateError, GateOptions, GateOutput, load_gate_config, run_gate};
 pub use hooks::{DigestOptions, HookOutput, render_constitution, render_digest};
 pub use implement::{ImplementError, ImplementRequest, run_implement};
 pub use lease::{

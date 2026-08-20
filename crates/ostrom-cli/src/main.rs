@@ -14,7 +14,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use directories::BaseDirs;
 use ostrom_checks::{
     ActionFault, ActionRegistry, DoctorOptions, PreparedCheck, check_shell_retirement,
-    check_skill_version_bump, run_doctor, run_doctor_check,
+    check_skill_version_bump, resolve_repository_name, run_doctor, run_doctor_check,
 };
 use ostrom_core::{
     CHECK_STORE_SCHEMA_VERSION, Catalogue, CatalogueEnumeration, CheckContractError, CheckDocument,
@@ -30,10 +30,10 @@ use ostrom_store::{
     acquire_org_from_github, append_trace_checked, audit, branch_name, clear_work_order,
     create_work_order, credential_output, decide_queue_item, encode_org_snapshots,
     encode_selection, finalize_exited_implementer, grant_excuse, item_hash, lease_status,
-    lint_queue_state, list_excuses, list_queue_json, local_drift, migrate, read_trace_json,
-    release_lease, render_constitution, render_digest, replay, run_dispatch, run_gate,
-    run_implement, run_pass, run_plan, run_repair_prs, run_selection, run_sweep, run_sweep_parity,
-    validate_lease_name, validate_work_order_file,
+    lint_queue_state, list_excuses, list_queue_json, load_gate_config, local_drift, migrate,
+    read_trace_json, release_lease, render_constitution, render_digest, replay, run_dispatch,
+    run_gate, run_implement, run_pass, run_plan, run_repair_prs, run_selection, run_sweep,
+    run_sweep_parity, validate_lease_name, validate_work_order_file,
 };
 
 #[derive(Debug, Parser)]
@@ -208,6 +208,8 @@ enum CheckCommand {
     PluginSurface,
     /// Prevent shell implementation files from reappearing.
     ShellRetirement,
+    /// Require every configured check selector to match a workflow job.
+    RequiredCheckSelectors,
     /// Require changed shipped plugin content to carry a plugin version bump.
     SkillVersionBump {
         #[arg(long)]
@@ -487,6 +489,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(1);
             }
         }
+        Command::Check {
+            command: CheckCommand::RequiredCheckSelectors,
+        } => run_required_check_selectors(&paths)?,
         Command::Check {
             command: CheckCommand::SkillVersionBump { base, head },
         } => {
@@ -1402,6 +1407,39 @@ fn run_doctor_command(check: Option<String>) -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
+fn run_required_check_selectors(paths: &OstromPaths) -> Result<(), Box<dyn std::error::Error>> {
+    let repository = env::current_dir()?;
+    let repository_name =
+        resolve_repository_name(&repository, env::var("GITHUB_REPOSITORY").ok().as_deref())?;
+    let Some(repository_name) = repository_name else {
+        println!(
+            "required check selectors: skipped: could not identify the current repository from GITHUB_REPOSITORY or the local origin URL"
+        );
+        return Ok(());
+    };
+    let (config, reason) = load_gate_config(paths, &repository, &repository_name);
+    let Some(config) = config else {
+        println!("required check selectors: skipped: {reason}");
+        return Ok(());
+    };
+    let project = config
+        .projects
+        .iter()
+        .find(|project| project.repo.as_str() == repository_name)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("gate configuration has no project entry for {repository_name}"),
+            )
+        })?;
+    let report = ostrom_checks::check_required_check_selectors(&repository, project)?;
+    if !report.is_clean() {
+        eprint!("{report}");
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 /// Resolve the state root the way the shell did, for every command.
 ///
 /// The store's own resolver deliberately refuses to fall through to an
@@ -1767,6 +1805,19 @@ mod tests {
             parsed.command,
             Command::Check {
                 command: CheckCommand::PluginSurface
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_required_check_selectors_check() {
+        let parsed = Cli::try_parse_from(["ostrom", "check", "required-check-selectors"])
+            .expect("parse required check selectors check");
+
+        assert!(matches!(
+            parsed.command,
+            Command::Check {
+                command: CheckCommand::RequiredCheckSelectors
             }
         ));
     }

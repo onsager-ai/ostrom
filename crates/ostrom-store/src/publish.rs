@@ -1252,7 +1252,7 @@ mod tests {
             .expect("parse manifest");
         assert_eq!(
             manifest["schema_id"],
-            "git:831ea4a434a43caf675f19f5566d968a8be6a088"
+            "git:a8b69ebcc7cd5746f37ec4c243b9d71496f7cde6"
         );
         assert_eq!(manifest["dropped_fields"]["queue"]["private_note"], 1);
         assert_eq!(manifest["dropped_fields"]["gate"]["conditions[].detail"], 1);
