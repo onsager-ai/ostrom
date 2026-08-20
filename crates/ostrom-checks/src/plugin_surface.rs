@@ -2,6 +2,8 @@ use std::{fmt, fs, io, path::Path};
 
 use serde_json::Value;
 
+use crate::check_modeled_role_allowlists;
+
 const HOOK_COMMANDS: [&str; 2] = [
     "if command -v ostrom >/dev/null 2>&1; then ostrom hook session-start; fi",
     "if command -v ostrom >/dev/null 2>&1; then ostrom hook digest; fi",
@@ -160,8 +162,26 @@ pub fn check_plugin_surface(repository: &Path) -> io::Result<PluginSurfaceReport
     let mut report = PluginSurfaceReport::default();
     check_hooks(&plugin, &mut report);
     check_contracts(&plugin, &mut report);
+    check_role_permissions(&plugin, &mut report);
     check_private_paths(&plugin, &plugin, &mut report)?;
     Ok(report)
+}
+
+fn check_role_permissions(plugin: &Path, report: &mut PluginSurfaceReport) {
+    for role_violation in check_modeled_role_allowlists(plugin).violations {
+        let path = role_violation.skill.as_ref().map_or_else(
+            || "plugins/ostrom/skills".to_owned(),
+            |skill| format!("plugins/ostrom/skills/{skill}/SKILL.md"),
+        );
+        violation(
+            report,
+            &path,
+            format!(
+                "role allowlist gap for {}: {}",
+                role_violation.role, role_violation.detail
+            ),
+        );
+    }
 }
 
 fn violation(report: &mut PluginSurfaceReport, path: &str, detail: impl Into<String>) {
@@ -390,5 +410,20 @@ mod tests {
         assert!(rendered.contains("two fail-open native commands"));
         assert!(rendered.contains("machine-specific path"));
         assert!(rendered.contains("retired protocol text reappeared"));
+    }
+
+    #[test]
+    fn rejects_a_skill_command_outside_its_role_allowlist() {
+        let fixture = Fixture::new();
+        let work = fixture.root().join("plugins/ostrom/skills/work/SKILL.md");
+        let mut source = fs::read_to_string(&work).expect("read work protocol");
+        source.push_str("\n```sh\nostrom newly-added\n```\n");
+        fs::write(work, source).expect("add ungranted command");
+
+        let report = check_plugin_surface(fixture.root()).expect("check changed skill");
+        assert!(!report.is_clean());
+        let rendered = report.to_string();
+        assert!(rendered.contains("role allowlist gap for builder"));
+        assert!(rendered.contains("ostrom newly-added"));
     }
 }
