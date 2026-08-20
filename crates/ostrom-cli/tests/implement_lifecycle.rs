@@ -212,6 +212,32 @@ impl Fixture {
             .collect()
     }
 
+    fn record_dispatch(&self) {
+        let order = WorkOrder::from_json(&fs::read(&self.order_file).expect("read order"))
+            .expect("valid order");
+        fs::write(
+            self.state.join("sprint.jsonl"),
+            format!(
+                "{}\n",
+                json!({
+                    "ts": "2026-08-01T00:00:00Z",
+                    "kind": "work-dispatched",
+                    "fact": {
+                        "schema_version": 1,
+                        "item_id": order.item_id,
+                        "order_id": order.order_id,
+                        "unit_name": self.unit,
+                        "backend": "systemd",
+                        "cost_ceiling_usd": order.cost_ceiling_usd,
+                        "token_ceiling": order.token_ceiling
+                    },
+                    "narration": {}
+                })
+            ),
+        )
+        .expect("record dispatch");
+    }
+
     fn worktree(&self) -> PathBuf {
         let order = WorkOrder::from_json(&fs::read(&self.order_file).expect("read order"))
             .expect("valid work order");
@@ -266,6 +292,21 @@ fn wait_for(path: &Path) {
         thread::sleep(Duration::from_millis(25));
     }
     panic!("timed out waiting for {}", path.display());
+}
+
+fn wait_for_child(pid: u32) -> u32 {
+    let children = PathBuf::from(format!("/proc/{pid}/task/{pid}/children"));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if let Some(child) = fs::read_to_string(&children)
+            .ok()
+            .and_then(|value| value.split_whitespace().next()?.parse().ok())
+        {
+            return child;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!("timed out waiting for child of {pid}");
 }
 
 fn signal(pid: u32, name: &str) {
@@ -868,4 +909,30 @@ fn terminated_run_preserves_and_reuses_worktree_without_orphans() {
             .expect("read preserved work")
             .contains("preserved")
     );
+}
+
+#[test]
+fn supervisor_terminalizes_a_dispatched_worker_killed_before_drop() {
+    let fixture = Fixture::new(100);
+    fixture.acquire();
+    fixture.record_dispatch();
+    let child = fixture.command("wait").spawn().expect("start implementer");
+    wait_for(&fixture.state.join("codex-grandchild.pid"));
+    let worker = wait_for_child(child.id());
+    signal(worker, "KILL");
+    assert_eq!(wait(child).code(), Some(1));
+
+    for pid_file in ["codex.pid", "codex-grandchild.pid"] {
+        if let Ok(pid) = fs::read_to_string(fixture.state.join(pid_file)) {
+            let _ = Command::new("kill").args(["-KILL", pid.trim()]).status();
+        }
+    }
+
+    assert!(!fixture.lease_file.exists());
+    let trace = fixture.trace();
+    assert_eq!(trace.len(), 2);
+    assert_eq!(trace[0]["kind"], "work-dispatched");
+    assert_eq!(trace[1]["kind"], "work-failed");
+    assert_eq!(trace[1]["fact"]["reason"], "unit-exit-without-terminal");
+    assert_eq!(trace[1]["fact"]["termination_signal"], "SIG9");
 }

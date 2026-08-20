@@ -14,17 +14,18 @@ use std::{
 use chrono::{DateTime, Utc};
 use ostrom_core::{
     BranchListing, BranchListingFault, BranchListingOutcome, MandateConfig, RemoteBranch,
-    WorkOrder, resolve_exact_branch, sha256_hex,
+    WorkOrder, resolve_exact_branch,
 };
 use serde_json::{Map, Value, json};
 
 use crate::{
-    LeaseRecord, OstromPaths, TraceAppend, TraceFactRecord,
+    LeaseRecord, OstromPaths, TraceAppend,
     app_token::{
         AuthenticatedCommandError, GitHubInstallationTokenMinter, InstallationTokenMinter,
         ScopedAppTokenRequest, authenticated_output,
     },
     append_trace, load_config_or_defaults, read_lease, read_trace,
+    work_order::{implementer_lease_ttl, in_flight_orders, reap_stale_work_orders},
 };
 
 const DEFAULT_DAILY_CAP_USD: f64 = 50.0;
@@ -32,15 +33,6 @@ const DEFAULT_MAX_IMPLEMENTERS: usize = 2;
 const DEFAULT_MAX_IMPLEMENTERS_PER_REPOSITORY: usize = 1;
 const REMOTE_BRANCH_PAGE_SIZE: usize = 100;
 const REMOTE_BRANCH_PAGE_LIMIT: usize = 100;
-// A weighted token includes output at full weight and input at a discount. A
-// 100-token/second floor is deliberately conservative for a local Codex run.
-const WEIGHTED_TOKENS_PER_RUNTIME_SECOND: u64 = 100;
-// $15/hour is below the order's normal model burn rate, so the cost budget is
-// converted to a conservative upper runtime bound too.
-const RUNTIME_SECONDS_PER_COST_USD: f64 = 240.0;
-// Publication, process-group termination, and scheduler observation can happen
-// after the model budget is exhausted. Keep the lease through that tail.
-const IMPLEMENTER_LEASE_MARGIN_SECONDS: u64 = 5 * 60;
 const IMPLEMENTER_STARTUP_GRACE_MILLISECONDS: u64 = 1_000;
 
 #[derive(Debug, Clone)]
@@ -251,6 +243,25 @@ fn run_dispatch_with_minter(
         ));
     }
 
+    // Reap before acquiring this item's lease. If an old order is genuinely
+    // still live, its possibly expired lease must not be replaced merely to
+    // discover the duplicate after the fact.
+    reap_stale_work_orders(&request.paths.state)
+        .map_err(|error| DispatchError::new(1, error.to_string()))?;
+    if in_flight_orders(&request.paths.trace_file())
+        .map_err(|error| DispatchError::new(1, error.to_string()))?
+        .iter()
+        .any(|order| order.item_id == context.order.item_id)
+    {
+        return Err(DispatchError::new(
+            3,
+            format!(
+                "ostrom dispatch: an earlier work-dispatched row has no terminal row for {}",
+                context.order.item_id
+            ),
+        ));
+    }
+
     let derived_lease_ttl = implementer_lease_ttl(&context.order);
     let lease_ttl = match env::var("MANDATE_IMPLEMENTER_LEASE_TTL_SECONDS") {
         Ok(value) => value
@@ -359,6 +370,8 @@ fn after_lease(
         ));
     }
 
+    reap_stale_work_orders(&context.request.paths.state)
+        .map_err(|error| DispatchError::new(1, error.to_string()))?;
     let trace = read_trace(&context.request.paths.trace_file())
         .map_err(|error| DispatchError::new(1, format!("ostrom dispatch: {error}")))?;
     let rows = trace
@@ -377,12 +390,6 @@ fn after_lease(
                 matches!(terminal.kind.as_str(), "work-completed" | "work-failed")
                     && terminal.fact.get("order_id").and_then(Value::as_str) == Some(order_id)
             })
-        })
-        .filter(|dispatch| {
-            !(lease.reclaimed
-                && dispatch.fact.get("item_id").and_then(Value::as_str)
-                    == Some(context.order.item_id.as_str()))
-                && dispatch_lease_is_live(&context.request.paths, dispatch, current_lease_time())
         })
         .collect::<Vec<_>>();
     if inflight
@@ -584,62 +591,6 @@ fn after_lease(
     }
     lease.disarm();
     Ok(DispatchOutcome::Started(context.unit_name.clone()))
-}
-
-fn implementer_lease_ttl(order: &WorkOrder) -> u64 {
-    implementer_lease_ttl_from_ceilings(order.cost(), order.tokens())
-}
-
-fn implementer_lease_ttl_from_ceilings(cost: f64, tokens: u64) -> u64 {
-    let token_seconds = tokens.div_ceil(WEIGHTED_TOKENS_PER_RUNTIME_SECOND);
-    let cost_seconds = (cost * RUNTIME_SECONDS_PER_COST_USD).ceil() as u64;
-    token_seconds
-        .max(cost_seconds)
-        .max(1)
-        .saturating_add(IMPLEMENTER_LEASE_MARGIN_SECONDS)
-}
-
-fn dispatch_lease_is_live(paths: &OstromPaths, row: &TraceFactRecord, now: u64) -> bool {
-    let Some(item_id) = row.fact.get("item_id").and_then(Value::as_str) else {
-        return false;
-    };
-    let Some(owner) = row.fact.get("unit_name").and_then(Value::as_str) else {
-        return false;
-    };
-    let cost = row
-        .fact
-        .get("cost_ceiling_usd")
-        .and_then(Value::as_f64)
-        .unwrap_or_default();
-    let tokens = row
-        .fact
-        .get("token_ceiling")
-        .and_then(Value::as_u64)
-        .unwrap_or_default();
-    if cost <= 0.0 || tokens == 0 {
-        return false;
-    }
-    let lease_path = paths.state.join(format!(
-        "implementer-item-{}.lease",
-        sha256_hex(item_id.as_bytes())
-    ));
-    if let Ok(Some(lease)) = read_lease(&lease_path) {
-        if lease.owner == owner {
-            let derived_expiry = lease
-                .started_at
-                .saturating_add(implementer_lease_ttl_from_ceilings(cost, tokens));
-            if lease.expires_at.min(derived_expiry) > now {
-                return true;
-            }
-            let _ = fs::remove_file(lease_path);
-            return false;
-        }
-    }
-    // The trace remains the conservative source of truth when its lease is
-    // absent or owned by someone else. Only a readable matching lease gives us
-    // enough evidence to cap a legacy 30-day record without freeing unrelated
-    // work.
-    true
 }
 
 fn dispatch_state_environment(paths: &OstromPaths) -> String {
@@ -1623,7 +1574,6 @@ struct LeaseGuard {
     path: PathBuf,
     owner: String,
     armed: bool,
-    reclaimed: bool,
 }
 
 impl LeaseGuard {
@@ -1652,14 +1602,12 @@ impl Drop for LeaseGuard {
 
 fn acquire_dispatch_lease(path: &Path, owner: &str, ttl: u64) -> Result<LeaseGuard, i32> {
     let now = current_lease_time();
-    let mut reclaimed = false;
     if let Ok(Some(existing)) = read_lease(path) {
         let derived_expiry = existing.started_at.saturating_add(ttl);
         if existing.expires_at.min(derived_expiry) > now {
             return Err(3);
         }
         fs::remove_file(path).map_err(|_| 3)?;
-        reclaimed = true;
     } else if path.exists() {
         return Err(3);
     }
@@ -1690,7 +1638,6 @@ fn acquire_dispatch_lease(path: &Path, owner: &str, ttl: u64) -> Result<LeaseGua
         path: path.to_path_buf(),
         owner: owner.to_owned(),
         armed: true,
-        reclaimed,
     })
 }
 
@@ -1796,12 +1743,11 @@ mod tests {
     use ostrom_core::WorkOrder;
     use serde_json::json;
 
-    use crate::{OstromPaths, TraceFactRecord};
-
     use super::{
-        NodeResolver, absolute_executable, describe_unparseable_listing, dispatch_lease_is_live,
-        find_in_nvm_root, has_unpublished_tree, implementer_lease_ttl,
+        NodeResolver, absolute_executable, describe_unparseable_listing, find_in_nvm_root,
+        has_unpublished_tree,
     };
+    use crate::work_order::implementer_lease_ttl;
 
     fn git(path: &Path, arguments: &[&str]) {
         assert!(
@@ -1982,43 +1928,6 @@ mod tests {
 
         assert_eq!(implementer_lease_ttl(&order(20, 500_000)), 5_300);
         assert_eq!(implementer_lease_ttl(&order(30, 100)), 7_500);
-    }
-
-    #[test]
-    fn legacy_lease_expiry_is_capped_by_the_derived_ttl() {
-        let fixture = tempdir().expect("temporary stale lease fixture");
-        let paths = OstromPaths {
-            config: fixture.path().to_path_buf(),
-            state: fixture.path().to_path_buf(),
-        };
-        let item_id = "placeholder-org/alpha#7";
-        let unit = "ostrom-implementer-placeholder";
-        let lease = fixture.path().join(format!(
-            "implementer-item-{}.lease",
-            ostrom_core::sha256_hex(item_id.as_bytes())
-        ));
-        fs::write(
-            &lease,
-            format!("{{\"owner\":\"{unit}\",\"started_at\":100,\"expires_at\":2592100}}\n"),
-        )
-        .expect("write legacy 30-day lease");
-        let row = TraceFactRecord {
-            ts: "1970-01-01T00:01:40Z".to_owned(),
-            kind: "work-dispatched".to_owned(),
-            fact: json!({
-                "item_id": item_id,
-                "unit_name": unit,
-                "cost_ceiling_usd": 20,
-                "token_ceiling": 500000
-            })
-            .as_object()
-            .unwrap()
-            .clone(),
-        };
-
-        assert!(dispatch_lease_is_live(&paths, &row, 5_399));
-        assert!(!dispatch_lease_is_live(&paths, &row, 5_400));
-        assert!(!lease.exists());
     }
 
     #[test]

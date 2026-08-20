@@ -2162,6 +2162,7 @@ struct DispatchFact {
     order_id: String,
     unit_name: String,
     backend: String,
+    repository_slot: String,
 }
 
 fn dispatch_fact(value: &Value) -> Option<DispatchFact> {
@@ -2169,11 +2170,14 @@ fn dispatch_fact(value: &Value) -> Option<DispatchFact> {
     if json_safe_integer(object.get("schema_version")?)? != 1 {
         return None;
     }
+    let item_id = nonempty_string(object.get("item_id")?)?;
+    let repository_slot = item_id.rsplit_once('#')?.0.to_owned();
     Some(DispatchFact {
-        item_id: nonempty_string(object.get("item_id")?)?,
+        item_id,
         order_id: nonempty_string(object.get("order_id")?)?,
         unit_name: nonempty_string(object.get("unit_name")?)?,
         backend: nonempty_string(object.get("backend")?)?,
+        repository_slot,
     })
 }
 
@@ -2290,11 +2294,11 @@ fn check_work_orders(context: &DoctorContext) -> DoctorResult {
             DoctorStatus::Fail,
             "work-orders",
             format!(
-                "{} in flight; unit exited without terminal row: {}",
+                "{} in flight; stranded-work-order (unit exited without terminal row): {}",
                 orders.len(),
                 faults.join(", ")
             ),
-            "inspect the transient unit journal and append work-failed before clearing its per-item lease",
+            "inspect the transient unit journal, then run ostrom work-order clear <order-id>",
         )
     } else if !unknown.is_empty() {
         DoctorResult::new(
@@ -2318,7 +2322,10 @@ fn check_work_orders(context: &DoctorContext) -> DoctorResult {
 }
 
 fn visible_order(order: &DispatchFact) -> String {
-    format!("{} ({})", order.item_id, order.unit_name)
+    format!(
+        "order={} item={} repository-slot={} unit={}",
+        order.order_id, order.item_id, order.repository_slot, order.unit_name
+    )
 }
 
 fn no_work_orders() -> DoctorResult {
@@ -2719,6 +2726,39 @@ mod tests {
         assert!(
             matches!(parsed.get("buckets"), Some(super::ConfigValue::List(values)) if values == &["freezable", "needs review"])
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stranded_work_order_fault_names_order_item_and_repository_slot() {
+        let fixture = Fixture::new();
+        let state = fixture.config_dir.join("ostrom");
+        fs::create_dir_all(&state).unwrap();
+        fs::write(
+            state.join("sprint.jsonl"),
+            concat!(
+                "{\"ts\":\"2026-08-01T00:00:00Z\",\"kind\":\"work-dispatched\",",
+                "\"fact\":{\"schema_version\":1,\"item_id\":\"placeholder-org/alpha#42\",",
+                "\"order_id\":\"placeholder-order-id\",\"unit_name\":\"ostrom-implementer-placeholder\",",
+                "\"backend\":\"systemd\"},\"narration\":{}}\n"
+            ),
+        )
+        .unwrap();
+        let systemctl = fixture.executable("systemctl", "#!/bin/sh\nexit 4\n");
+        let mut options = fixture.options();
+        options
+            .env
+            .insert("MANDATE_SYSTEMCTL_BIN".into(), systemctl.into_os_string());
+        let output = run_doctor_check(options, "work-orders").unwrap();
+        assert!(output.starts_with("FAIL|work-orders|"), "{output}");
+        for expected in [
+            "stranded-work-order",
+            "order=placeholder-order-id",
+            "item=placeholder-org/alpha#42",
+            "repository-slot=placeholder-org/alpha",
+        ] {
+            assert!(output.contains(expected), "missing {expected}: {output}");
+        }
     }
 
     #[cfg(unix)]

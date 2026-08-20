@@ -71,8 +71,8 @@ pub use trace::{
     append_trace, append_trace_checked, read_trace, read_trace_json,
 };
 pub use work_order::{
-    CreatedWorkOrder, WorkOrderError, branch_name, create_work_order, item_hash,
-    validate_work_order_file,
+    ClearedWorkOrder, CreatedWorkOrder, WorkOrderError, branch_name, clear_work_order,
+    create_work_order, finalize_exited_implementer, item_hash, validate_work_order_file,
 };
 
 use thiserror::Error;

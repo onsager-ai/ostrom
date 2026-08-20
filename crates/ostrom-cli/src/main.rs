@@ -27,12 +27,13 @@ use ostrom_store::{
     PublishDestination, PublishTarget, QueueDecision, ReplayOptions, SelectAction, SelectError,
     SelectOutcome, SelectRequest, SignalFlags, SweepError, SweepMode, SweepOptions,
     SweepParityOptions, TraceAppend, TraceView, UnavailableAssessmentDeriver, acquire_lease,
-    acquire_org_from_github, append_trace_checked, audit, branch_name, create_work_order,
-    credential_output, decide_queue_item, encode_org_snapshots, encode_selection, grant_excuse,
-    item_hash, lease_status, lint_queue_state, list_excuses, list_queue_json, local_drift, migrate,
-    read_trace_json, release_lease, render_constitution, render_digest, replay, run_dispatch,
-    run_gate, run_implement, run_pass, run_plan, run_repair_prs, run_selection, run_sweep,
-    run_sweep_parity, validate_lease_name, validate_work_order_file,
+    acquire_org_from_github, append_trace_checked, audit, branch_name, clear_work_order,
+    create_work_order, credential_output, decide_queue_item, encode_org_snapshots,
+    encode_selection, finalize_exited_implementer, grant_excuse, item_hash, lease_status,
+    lint_queue_state, list_excuses, list_queue_json, local_drift, migrate, read_trace_json,
+    release_lease, render_constitution, render_digest, replay, run_dispatch, run_gate,
+    run_implement, run_pass, run_plan, run_repair_prs, run_selection, run_sweep, run_sweep_parity,
+    validate_lease_name, validate_work_order_file,
 };
 
 #[derive(Debug, Parser)]
@@ -289,6 +290,8 @@ enum WorkOrderCommand {
     ItemHash { item_id: String },
     /// Derive the branch name for an exact item identifier.
     BranchName { item_id: String },
+    /// Append work-failed for one named stranded order.
+    Clear { identifier: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -531,15 +534,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 io::stderr().write_all(output.stderr.as_bytes())?;
             }
         },
-        Command::Pass { role } => supervise(&["__pass-worker".into(), role_name(role).into()]),
+        Command::Pass { role } => {
+            supervise(&["__pass-worker".into(), role_name(role).into()], None)
+        }
         Command::Implement {
             work_order_file,
             unit_name,
-        } => supervise(&[
-            "__implement-worker".into(),
-            work_order_file.into_os_string(),
-            unit_name.into(),
-        ]),
+        } => {
+            let arguments = [
+                "__implement-worker".into(),
+                work_order_file.clone().into_os_string(),
+                unit_name.clone().into(),
+            ];
+            supervise(&arguments, Some((&work_order_file, &unit_name)))
+        }
         Command::PassWorker {
             role,
             supervisor_pid,
@@ -1039,13 +1047,22 @@ fn run_work_order_command(
             }
             println!("{}", branch_name(&item_id));
         }
+        WorkOrderCommand::Clear { identifier } => {
+            if identifier.is_empty() {
+                work_order_usage();
+            }
+            match clear_work_order(&paths.state, &identifier) {
+                Ok(cleared) => println!("{} {}", cleared.order_id, cleared.item_id),
+                Err(error) => exit_message(&error.to_string(), error.exit_code()),
+            }
+        }
     }
     Ok(())
 }
 
 fn work_order_usage() -> ! {
     exit_message(
-        "usage: work-order.sh create <candidate-json-file> | validate <work-order-file> | item-hash <item-id> | branch-name <item-id>",
+        "usage: work-order.sh create <candidate-json-file> | validate <work-order-file> | item-hash <item-id> | branch-name <item-id> | clear <order-id-or-item-id>",
         2,
     )
 }
@@ -1082,7 +1099,7 @@ fn register_signals() -> io::Result<SignalFlags> {
     Ok(SignalFlags::default())
 }
 
-fn supervise(arguments: &[OsString]) -> ! {
+fn supervise(arguments: &[OsString], implementer: Option<(&Path, &str)>) -> ! {
     let signals = register_signals().unwrap_or_else(|error| {
         eprintln!("ostrom: could not install signal handlers: {error}");
         std::process::exit(1);
@@ -1101,7 +1118,22 @@ fn supervise(arguments: &[OsString]) -> ! {
         });
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => std::process::exit(status.code().unwrap_or(1)),
+            Ok(Some(status)) => {
+                if let Some((order_file, unit_name)) = implementer {
+                    let signal = exit_signal(&status);
+                    if let Err(error) = finalize_exited_implementer(
+                        &compatible_command_paths().state,
+                        order_file,
+                        unit_name,
+                        status.code(),
+                        signal,
+                    ) {
+                        eprintln!("{error}");
+                        std::process::exit(1);
+                    }
+                }
+                std::process::exit(status.code().unwrap_or(1));
+            }
             Ok(None) => {}
             Err(error) => {
                 eprintln!("ostrom: could not wait for worker: {error}");
@@ -1120,6 +1152,18 @@ fn supervise(arguments: &[OsString]) -> ! {
         }
         thread::sleep(Duration::from_millis(25));
     }
+}
+
+#[cfg(unix)]
+fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+
+    status.signal()
+}
+
+#[cfg(not(unix))]
+fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
+    None
 }
 
 fn run_pass_worker(role: CliPassRole, supervisor_pid: u32) -> ! {
