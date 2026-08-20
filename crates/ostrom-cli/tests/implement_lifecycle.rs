@@ -21,11 +21,16 @@ struct Fixture {
     lease_file: PathBuf,
     codex: PathBuf,
     gh_as: PathBuf,
+    repository_visibility: String,
     unit: String,
 }
 
 impl Fixture {
     fn new(token_ceiling: u64) -> Self {
+        Self::with_repository_visibility(token_ceiling, "public")
+    }
+
+    fn with_repository_visibility(token_ceiling: u64, repository_visibility: &str) -> Self {
         let root = tempfile::tempdir().expect("temporary implementer fixture");
         let state = root.path().join("ostrom");
         let source = root.path().join("placeholder-alpha");
@@ -142,9 +147,17 @@ impl Fixture {
         executable(
             &gh_as,
             concat!(
-                "while [ \"$#\" -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n",
+                "permissions=\n",
+                "while [ \"$#\" -gt 0 ] && [ \"$1\" != -- ]; do\n",
+                "  case \"$1\" in --permissions) permissions=$2; shift 2 ;; *) shift ;; esac\n",
+                "done\n",
                 "shift\n",
-                "if [ \"$1\" = gh ] && [ \"$2\" = repo ]; then printf '%s\\n' main; exit 0; fi\n",
+                "if [ \"$1\" = gh ] && [ \"$2\" = repo ]; then\n",
+                "  case \"${FAKE_REPOSITORY_VISIBILITY:-public}:$permissions\" in\n",
+                "    public:metadata:read|public:metadata:read,contents:read|private:metadata:read,contents:read) printf '%s\\n' main; exit 0 ;;\n",
+                "    *) exit 1 ;;\n",
+                "  esac\n",
+                "fi\n",
                 "if [ \"$1\" = gh ] && [ \"$2\" = pr ]; then printf '%s\\n' https://example.invalid/placeholder/pull/7; exit 0; fi\n",
                 "if [ \"$1\" = git ] && [ \"$2\" = -C ] && printf '%s\\n' \"$*\" | grep -q ' fetch '; then\n",
                 "  git -C \"$3\" update-ref refs/remotes/origin/main refs/heads/main; exit 0\n",
@@ -161,6 +174,7 @@ impl Fixture {
             lease_file,
             codex,
             gh_as,
+            repository_visibility: repository_visibility.to_owned(),
             unit,
         }
     }
@@ -193,6 +207,7 @@ impl Fixture {
             )
             .env("MANDATE_IMPLEMENTER_SOURCE_REPO", &self.source)
             .env("MANDATE_GH_AS_BIN", &self.gh_as)
+            .env("FAKE_REPOSITORY_VISIBILITY", &self.repository_visibility)
             .env("MANDATE_IMPLEMENTER_TERMINATION_GRACE_SECONDS", "1")
             .env("MANDATE_TRACE_TIME", "2026-08-01T00:00:00Z")
             .env("MANDATE_NOW_EPOCH", "1785542400")
@@ -337,7 +352,7 @@ fn token_ceiling_is_recorded_after_codex_completes() {
 }
 
 #[test]
-fn completed_run_uses_the_rust_cli_publication_boundary() {
+fn public_repository_reaches_codex_and_uses_the_rust_cli_publication_boundary() {
     let fixture = Fixture::new(100);
     fixture.acquire();
     let output = fixture
@@ -374,6 +389,28 @@ fn completed_run_uses_the_rust_cli_publication_boundary() {
     assert!(body.contains("workspace-write"));
     assert!(body.contains("approval policy `never`"));
     assert!(body.contains("Ostrom-Role: builder"));
+}
+
+#[test]
+fn private_repository_reaches_codex_with_contents_read_scope() {
+    let fixture = Fixture::with_repository_visibility(100, "private");
+    fixture.acquire();
+
+    let status = fixture
+        .command("complete")
+        .status()
+        .expect("run implementer");
+
+    assert!(status.success());
+    assert!(
+        fs::read_to_string(fixture.worktree().join("README.md"))
+            .expect("read implementation")
+            .contains("completed"),
+        "Codex must run after default-branch resolution"
+    );
+    let terminal = fixture.trace().pop().expect("completion trace");
+    assert_eq!(terminal["kind"], "work-completed");
+    assert_ne!(terminal["fact"]["reason"], "default-branch-query-failed");
 }
 
 #[test]

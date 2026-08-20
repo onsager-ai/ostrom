@@ -366,7 +366,10 @@ fn implement_inner(
     let default_branch = default_branch_result(gh_text(
         request,
         &guard.order.repository,
-        "metadata:read",
+        // GraphQL's repository.defaultBranchRef requires contents access for
+        // private repositories even though public repositories allow this
+        // traversal with metadata alone.
+        "metadata:read,contents:read",
         &[
             "gh",
             "repo",
