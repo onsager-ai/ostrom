@@ -76,6 +76,11 @@ impl OstromPaths {
         self.state.join("check-runs.jsonl")
     }
 
+    #[must_use]
+    pub fn event_journal_file(&self) -> PathBuf {
+        self.state.join("events.jsonl")
+    }
+
     /// Credentials stay outside layered policy configuration. The explicit
     /// override is needed by isolated runtimes that cannot place a secret in
     /// the config root, and an empty override retains the established default.

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::{StoreError, io_error, set_private_file_mode};
+use crate::{StoreError, event_store::append_trace_event, io_error, set_private_file_mode};
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TraceFactRecord {
@@ -167,6 +167,7 @@ pub fn append_trace(path: &Path, record: &TraceAppend) -> Result<Vec<u8>, StoreE
     if bytes.len() > 4096 {
         return Err(StoreError::TraceTooLarge { bytes: bytes.len() });
     }
+    append_trace_event(path, &record.ts, &record.kind, &record.fact)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| io_error("create trace directory", parent, error))?;
@@ -276,7 +277,7 @@ fn order_id_exists(directory: &Path, order_id: &str) -> bool {
 mod tests {
     use std::fs;
 
-    use serde_json::Map;
+    use serde_json::{Map, json};
     use tempfile::tempdir;
 
     use super::{TraceAppend, append_trace, read_trace};
@@ -323,5 +324,62 @@ mod tests {
                 .to_string()
                 .contains("malformed sprint trace record")
         );
+    }
+
+    #[test]
+    fn event_routing_keeps_sprint_jsonl_bytes_unchanged() {
+        let fixture = tempdir().expect("temp dir");
+        let path = fixture.path().join("sprint.jsonl");
+        let record = TraceAppend {
+            ts: "2030-01-02T03:04:05Z".to_owned(),
+            kind: "work-failed".to_owned(),
+            fact: Map::from_iter([
+                ("order_id".to_owned(), json!("synthetic-order")),
+                ("reason".to_owned(), json!("operator-facing explanation")),
+            ]),
+            narration: Map::from_iter([(
+                "detail".to_owned(),
+                json!("local narration remains local"),
+            )]),
+        };
+        let expected = concat!(
+            r#"{"ts":"2030-01-02T03:04:05Z","kind":"work-failed","fact":{"order_id":"synthetic-order","reason":"operator-facing explanation"},"narration":{"detail":"local narration remains local"}}"#,
+            "\n"
+        );
+        assert_eq!(
+            append_trace(&path, &record).expect("append routed trace"),
+            expected.as_bytes()
+        );
+        assert_eq!(
+            fs::read(&path).expect("read compatibility trace"),
+            expected.as_bytes()
+        );
+        assert_eq!(
+            fs::read(fixture.path().join("events.jsonl")).expect("read event journal"),
+            concat!(
+                r#"{"v":1,"type":"work.failed","run_id":"synthetic-order","seq":1,"ts":"2030-01-02T03:04:05Z","payload":{"order_id":"synthetic-order"}}"#,
+                "\n"
+            )
+            .as_bytes()
+        );
+    }
+
+    #[test]
+    fn local_only_trace_kinds_remain_compatible_without_expanding_the_vocabulary() {
+        let fixture = tempdir().expect("temp dir");
+        let path = fixture.path().join("sprint.jsonl");
+        let record = TraceAppend {
+            ts: "2030-01-02T03:04:05Z".to_owned(),
+            kind: "decision-taken".to_owned(),
+            fact: Map::from_iter([("owner".to_owned(), json!("synthetic-run"))]),
+            narration: Map::new(),
+        };
+        let expected = concat!(
+            r#"{"ts":"2030-01-02T03:04:05Z","kind":"decision-taken","fact":{"owner":"synthetic-run"},"narration":{}}"#,
+            "\n"
+        );
+        append_trace(&path, &record).expect("append local trace kind");
+        assert_eq!(fs::read(&path).expect("read trace"), expected.as_bytes());
+        assert!(!fixture.path().join("events.jsonl").exists());
     }
 }
