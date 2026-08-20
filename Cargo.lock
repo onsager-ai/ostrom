@@ -815,6 +815,7 @@ version = "0.7.0"
 dependencies = [
  "chrono",
  "ostrom-core",
+ "ostrom-store",
  "reqwest",
  "serde",
  "serde_json",

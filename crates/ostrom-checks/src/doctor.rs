@@ -11,6 +11,9 @@ use std::{
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use ostrom_core::ActionDefinition;
+use ostrom_store::{
+    GateConfigError, OstromPaths, load_config as load_mandate_config, load_gate_config,
+};
 use serde_json::{Map, Value, json};
 
 use crate::{
@@ -29,6 +32,7 @@ pub const DOCTOR_CHECKS: &[&str] = &[
     "touch-durability",
     "provider-reachable",
     "dispatch-source-roots",
+    "roster-gate-consistency",
     "trace-lease",
     "work-orders",
     "role-allowlists",
@@ -229,6 +233,7 @@ fn run_named_check(context: &mut DoctorContext, name: &str) -> DoctorResult {
         "touch-durability" => check_touch_durability(context),
         "provider-reachable" => check_provider_reachable(context),
         "dispatch-source-roots" => check_dispatch_source_roots(context),
+        "roster-gate-consistency" => check_roster_gate_consistency(context),
         "trace-lease" => check_trace_lease(context),
         "work-orders" => check_work_orders(context),
         "role-allowlists" => check_delivery_role_allowlists(context),
@@ -1930,6 +1935,142 @@ fn check_dispatch_source_roots(context: &DoctorContext) -> DoctorResult {
     }
 }
 
+fn check_roster_gate_consistency(context: &DoctorContext) -> DoctorResult {
+    let config_root = context.options.config_dir.join("ostrom");
+    let paths = OstromPaths {
+        config: config_root.clone(),
+        state: config_root,
+    };
+    let mandates = match load_mandate_config(&paths, &context.options.cwd) {
+        Ok(config) => config,
+        Err(error) => {
+            return DoctorResult::new(
+                DoctorStatus::Fail,
+                "roster-gate-consistency",
+                format!("mandate configuration unavailable: {error}"),
+                "repair mandates.yaml before comparing it with gate.yaml",
+            );
+        }
+    };
+    let gate = match load_gate_config(&paths, &context.options.cwd) {
+        Ok(config) => config,
+        Err(error @ GateConfigError::NotConfigured { .. }) => {
+            return DoctorResult::new(
+                DoctorStatus::Fail,
+                "roster-gate-consistency",
+                format!("gate configuration unavailable: {error}"),
+                "create gate.yaml, then follow \"if you change one, change the other\" so its projects match mandates.yaml",
+            );
+        }
+        Err(error @ GateConfigError::Invalid(_)) => {
+            return DoctorResult::new(
+                DoctorStatus::Fail,
+                "roster-gate-consistency",
+                format!("gate configuration invalid: {error}"),
+                "repair gate.yaml before comparing it with mandates.yaml",
+            );
+        }
+    };
+
+    let mandate_projects = mandates
+        .projects
+        .iter()
+        .map(|project| (project.repo.as_str(), project))
+        .collect::<BTreeMap<_, _>>();
+    let gate_projects = gate
+        .projects
+        .iter()
+        .map(|project| (project.repo.as_str(), project))
+        .collect::<BTreeMap<_, _>>();
+    let missing_from_gate = mandate_projects
+        .keys()
+        .filter(|repo| !gate_projects.contains_key(*repo))
+        .copied()
+        .collect::<Vec<_>>();
+    let missing_from_roster = gate_projects
+        .keys()
+        .filter(|repo| !mandate_projects.contains_key(*repo))
+        .copied()
+        .collect::<Vec<_>>();
+    let policy_drift = mandate_projects
+        .iter()
+        .filter_map(|(repo, mandate)| {
+            let gate = gate_projects.get(repo)?;
+            let mut keys = Vec::new();
+            let mandate_bounce = mandate
+                .bounce
+                .iter()
+                .map(|selector| selector.as_str())
+                .collect::<BTreeSet<_>>();
+            let gate_bounce = gate
+                .bounce
+                .iter()
+                .map(|selector| selector.as_str())
+                .collect::<BTreeSet<_>>();
+            if mandate_bounce != gate_bounce {
+                keys.push("bounce");
+            }
+            let mandate_reserved = mandate.reserved.iter().copied().collect::<BTreeSet<_>>();
+            let gate_reserved = gate.reserved.iter().copied().collect::<BTreeSet<_>>();
+            if mandate_reserved != gate_reserved {
+                keys.push("reserved");
+            }
+            (!keys.is_empty()).then(|| format!("{repo}: {}", keys.join(", ")))
+        })
+        .collect::<Vec<_>>();
+
+    let mut drift = Vec::new();
+    if !missing_from_gate.is_empty() {
+        drift.push(format!(
+            "mandate roster repositories missing from gate.yaml projects: {}",
+            missing_from_gate.join(", ")
+        ));
+    }
+    if !missing_from_roster.is_empty() {
+        drift.push(format!(
+            "gate.yaml projects absent from mandate roster: {}",
+            missing_from_roster.join(", ")
+        ));
+    }
+    if !policy_drift.is_empty() {
+        drift.push(format!(
+            "gate policy transcription differs for {}",
+            policy_drift.join("; ")
+        ));
+    }
+
+    if !missing_from_gate.is_empty() || !missing_from_roster.is_empty() {
+        DoctorResult::new(
+            DoctorStatus::Fail,
+            "roster-gate-consistency",
+            drift.join("; "),
+            "follow \"if you change one, change the other\": make the mandates.yaml roster and gate.yaml projects match; bounce/reserved mismatches are WARN because they may be deliberate, but should match unless documented",
+        )
+    } else if !policy_drift.is_empty() {
+        DoctorResult::new(
+            DoctorStatus::Warn,
+            "roster-gate-consistency",
+            drift.join("; "),
+            "follow \"if you change one, change the other\": make bounce and reserved match; this check treats policy mismatches as WARN because a difference may be deliberate, so document intentional differences",
+        )
+    } else {
+        let count = mandate_projects.len();
+        DoctorResult::new(
+            DoctorStatus::Ok,
+            "roster-gate-consistency",
+            format!(
+                "{count} roster {} checked against gate.yaml",
+                if count == 1 {
+                    "repository"
+                } else {
+                    "repositories"
+                }
+            ),
+            "",
+        )
+    }
+}
+
 fn now_epoch(context: &DoctorContext) -> i64 {
     if let Some(value) = context
         .env_text("MANDATE_NOW_EPOCH")
@@ -2673,7 +2814,8 @@ mod tests {
     use tempfile::{TempDir, tempdir};
 
     use super::{
-        DOCTOR_CHECKS, DoctorOptions, DoctorProvider, git_blob_hash, parse_ostrom_yaml, run_doctor,
+        DOCTOR_CHECKS, DoctorContext, DoctorOptions, DoctorProvider, DoctorStatus,
+        check_roster_gate_consistency, git_blob_hash, parse_ostrom_yaml, run_doctor,
         run_doctor_check,
     };
     use crate::ActionRegistry;
@@ -2731,6 +2873,28 @@ mod tests {
                     ),
                 ]),
             }
+        }
+
+        fn write_mandates(&self, projects: &str) {
+            let config = self.config_dir.join("ostrom");
+            fs::create_dir_all(&config).unwrap();
+            fs::write(
+                config.join("mandates.yaml"),
+                format!(
+                    "provider: file\ncadence_hours: 1\nstuck_after_days: 7\nprojects:\n{projects}"
+                ),
+            )
+            .unwrap();
+        }
+
+        fn write_gate(&self, projects: &str) {
+            let config = self.config_dir.join("ostrom");
+            fs::create_dir_all(&config).unwrap();
+            fs::write(
+                config.join("gate.yaml"),
+                format!("provider: file\nprojects:\n{projects}"),
+            )
+            .unwrap();
         }
 
         #[cfg(unix)]
@@ -2936,6 +3100,108 @@ mod tests {
     }
 
     #[test]
+    fn roster_gate_consistency_fails_for_roster_repository_missing_from_gate() {
+        let fixture = Fixture::new();
+        fixture.write_mandates(
+            "  - repo: placeholder-org/shared\n    bounce: [path:shared/**]\n    reserved: [7]\n  - repo: placeholder-org/roster-only\n",
+        );
+        fixture.write_gate(
+            "  - repo: placeholder-org/shared\n    bounce: [path:shared/**]\n    reserved: [7]\n",
+        );
+
+        let result = check_roster_gate_consistency(&DoctorContext::new(fixture.options()));
+        assert_eq!(result.status, DoctorStatus::Fail);
+        assert_eq!(
+            result.detail,
+            "mandate roster repositories missing from gate.yaml projects: placeholder-org/roster-only"
+        );
+    }
+
+    #[test]
+    fn roster_gate_consistency_fails_for_gate_repository_absent_from_roster() {
+        let fixture = Fixture::new();
+        fixture.write_mandates("  - repo: placeholder-org/shared\n");
+        fixture
+            .write_gate("  - repo: placeholder-org/shared\n  - repo: placeholder-org/gate-only\n");
+
+        let result = check_roster_gate_consistency(&DoctorContext::new(fixture.options()));
+        assert_eq!(result.status, DoctorStatus::Fail);
+        assert_eq!(
+            result.detail,
+            "gate.yaml projects absent from mandate roster: placeholder-org/gate-only"
+        );
+    }
+
+    #[test]
+    fn roster_gate_consistency_warns_and_names_differing_policy_keys() {
+        let fixture = Fixture::new();
+        fixture.write_mandates(
+            "  - repo: placeholder-org/shared\n    bounce: [path:mandate/**]\n    reserved: [7]\n",
+        );
+        fixture.write_gate(
+            "  - repo: placeholder-org/shared\n    bounce: [path:gate/**]\n    reserved: [8]\n",
+        );
+
+        let result = check_roster_gate_consistency(&DoctorContext::new(fixture.options()));
+        assert_eq!(result.status, DoctorStatus::Warn);
+        assert_eq!(
+            result.detail,
+            "gate policy transcription differs for placeholder-org/shared: bounce, reserved"
+        );
+        assert!(result.remedy.contains("mismatches as WARN"));
+        assert!(
+            result
+                .remedy
+                .contains("if you change one, change the other")
+        );
+    }
+
+    #[test]
+    fn roster_gate_consistency_passes_when_configs_agree() {
+        let fixture = Fixture::new();
+        let project =
+            "  - repo: placeholder-org/shared\n    bounce: [path:shared/**]\n    reserved: [7]\n";
+        fixture.write_mandates(project);
+        fixture.write_gate(project);
+
+        let result = check_roster_gate_consistency(&DoctorContext::new(fixture.options()));
+        assert_eq!(result.status, DoctorStatus::Ok);
+        assert_eq!(
+            result.detail,
+            "1 roster repository checked against gate.yaml"
+        );
+    }
+
+    #[test]
+    fn roster_gate_consistency_distinguishes_missing_gate_config_from_drift() {
+        let fixture = Fixture::new();
+        fixture.write_mandates("  - repo: placeholder-org/roster-only\n");
+
+        let result = check_roster_gate_consistency(&DoctorContext::new(fixture.options()));
+        assert_eq!(result.status, DoctorStatus::Fail);
+        assert!(
+            result
+                .detail
+                .starts_with("gate configuration unavailable: ")
+        );
+        assert!(result.detail.contains("no gate.yaml found at"));
+        assert!(!result.detail.contains("missing from gate.yaml projects"));
+    }
+
+    #[test]
+    fn roster_gate_consistency_distinguishes_invalid_gate_config_from_drift() {
+        let fixture = Fixture::new();
+        fixture.write_mandates("  - repo: placeholder-org/roster-only\n");
+        let config = fixture.config_dir.join("ostrom");
+        fs::write(config.join("gate.yaml"), "projects: [\n").unwrap();
+
+        let result = check_roster_gate_consistency(&DoctorContext::new(fixture.options()));
+        assert_eq!(result.status, DoctorStatus::Fail);
+        assert!(result.detail.starts_with("gate configuration invalid: "));
+        assert!(!result.detail.contains("missing from gate.yaml projects"));
+    }
+
+    #[test]
     fn warn_and_defer_remain_named_provider_errors() {
         let fixture = Fixture::new();
         let mut registry = ActionRegistry::new();
@@ -2989,6 +3255,7 @@ mod tests {
                 "WARN|touch-durability|target: file provider, {home}/.claude/ostrom/touch-log.md is NOT inside a git repo — touches logged here never reach another machine -- config: no user config.yaml present (shipped defaults only)|point file.path into a synced repo and set auto_commit: true, or switch provider\n",
                 "OK|provider-reachable|file: {home}/.claude/ostrom does not exist yet, nearest existing ancestor {home} is writable|\n",
                 "FAIL|dispatch-source-roots|search_roots is empty; dispatch cannot resolve source repositories|configure search_roots with a parent directory containing the roster checkouts\n",
+                "FAIL|roster-gate-consistency|mandate configuration unavailable: no mandates.yaml found at {config}/ostrom/mandates.yaml|repair mandates.yaml before comparing it with gate.yaml\n",
                 "WARN|trace-lease|trace absent; lease idle|run /ostrom:gatekeep and confirm it creates sprint.jsonl\n",
                 "OK|work-orders|no work orders in flight|\n",
                 "FAIL|role-allowlists|builder: role settings are missing at {config}/ostrom/roles/builder.settings.json; gatekeeper: role settings are missing at {config}/ostrom/roles/gatekeeper.settings.json|align the role allowlists under {config}/ostrom/roles with the named shipped skill commands\n",

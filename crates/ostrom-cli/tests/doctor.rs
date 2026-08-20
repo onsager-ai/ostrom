@@ -77,3 +77,41 @@ fn unknown_exact_check_exits_two() {
         "unknown doctor check: Environment\n"
     );
 }
+
+#[test]
+fn roster_gate_consistency_reports_roster_repository_missing_from_gate_end_to_end() {
+    let fixture = tempdir().expect("temporary doctor root");
+    let config = fixture.path().join("config");
+    let ostrom_config = config.join("ostrom");
+    let home = fixture.path().join("home");
+    let cwd = fixture.path().join("project");
+    for directory in [&ostrom_config, &home, &cwd] {
+        fs::create_dir_all(directory).expect("doctor fixture directory");
+    }
+    fs::write(
+        ostrom_config.join("mandates.yaml"),
+        "provider: file\ncadence_hours: 1\nstuck_after_days: 7\nprojects:\n  - repo: placeholder-org/roster-only\n",
+    )
+    .expect("write mandate fixture");
+    fs::write(
+        ostrom_config.join("gate.yaml"),
+        "provider: file\nprojects: []\n",
+    )
+    .expect("write gate fixture");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .args(["doctor", "--check", "roster-gate-consistency"])
+        .current_dir(&cwd)
+        .env_clear()
+        .env("HOME", &home)
+        .env("CLAUDE_CONFIG_DIR", &config)
+        .output()
+        .expect("run native doctor");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "FAIL|roster-gate-consistency|mandate roster repositories missing from gate.yaml projects: placeholder-org/roster-only|follow \"if you change one, change the other\": make the mandates.yaml roster and gate.yaml projects match; bounce/reserved mismatches are WARN because they may be deliberate, but should match unless documented\n"
+    );
+    assert!(output.stderr.is_empty());
+}
