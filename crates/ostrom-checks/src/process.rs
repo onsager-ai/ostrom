@@ -14,33 +14,69 @@ pub(crate) enum ProcessResult {
 pub(crate) fn run_bounded(command: &mut Command, timeout: Duration) -> ProcessResult {
     command.stdin(Stdio::null()).stderr(Stdio::null());
     command.stdout(Stdio::null());
+    set_process_group(command);
     let Ok(mut child) = command.spawn() else {
         return ProcessResult::SpawnFailed;
     };
+    let pid = child.id();
     let Some(deadline) = Instant::now().checked_add(timeout) else {
-        let _ = child.kill();
-        let _ = child.wait();
+        terminate(&mut child, pid);
         return ProcessResult::WaitFailed;
     };
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return ProcessResult::Completed(status),
+            Ok(Some(status)) => {
+                kill_process_group(pid);
+                return ProcessResult::Completed(status);
+            }
             Ok(None) if Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(5));
             }
             Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate(&mut child, pid);
                 return ProcessResult::TimedOut;
             }
             Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate(&mut child, pid);
                 return ProcessResult::WaitFailed;
             }
         }
     }
 }
+
+fn terminate(child: &mut std::process::Child, pid: u32) {
+    kill_process_group(pid);
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(unix)]
+fn set_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn set_process_group(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn kill_process_group(pid: u32) {
+    let executable = if std::path::Path::new("/bin/kill").is_file() {
+        "/bin/kill"
+    } else {
+        "kill"
+    };
+    let _ = Command::new(executable)
+        .args(["-KILL", "--", &format!("-{pid}")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_pid: u32) {}
 
 pub(crate) fn parameter_timeout(
     value: Option<&serde_json::Value>,
