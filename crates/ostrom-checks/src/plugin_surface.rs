@@ -9,7 +9,7 @@ const HOOK_COMMANDS: [&str; 2] = [
     "if command -v ostrom >/dev/null 2>&1; then ostrom hook digest; fi",
 ];
 
-const REQUIRED_CONTRACTS: [(&str, &str); 36] = [
+const REQUIRED_CONTRACTS: [(&str, &str); 53] = [
     (
         "skills/gatekeep/SKILL.md",
         "ostrom lease acquire \"$lease_owner\"",
@@ -112,9 +112,47 @@ const REQUIRED_CONTRACTS: [(&str, &str); 36] = [
         "skills/work/SKILL.md",
         "argument-hint: \"[optional queue focus, e.g. project name or item class]\"",
     ),
+    (
+        "skills/gatekeep/SKILL.md",
+        "--permissions metadata:read,pull_requests:write --",
+    ),
+    (
+        "skills/gatekeep/SKILL.md",
+        "--permissions metadata:read,contents:write,pull_requests:write --",
+    ),
+    ("skills/gatekeep/SKILL.md", "write_denials"),
+    (
+        "skills/gatekeep/SKILL.md",
+        "passing_candidates == merged_candidates",
+    ),
+    ("skills/gatekeep/SKILL.md", VERDICT_COMMENT_COMMAND),
+    ("skills/gatekeep/SKILL.md", MERGE_COMMAND),
+    (
+        "skills/merge/SKILL.md",
+        "--permissions metadata:read,pull_requests:write --",
+    ),
+    (
+        "skills/merge/SKILL.md",
+        "--permissions metadata:read,contents:write,pull_requests:write --",
+    ),
+    ("skills/merge/SKILL.md", "ostrom trace append write-denied"),
+    (
+        "skills/merge/SKILL.md",
+        "a failed comment must block the merge",
+    ),
+    ("skills/merge/SKILL.md", "requested_scope: $requested_scope"),
+    ("skills/merge/SKILL.md", "outcome: \"permission-denied\""),
+    ("skills/merge/SKILL.md", "operation: $operation"),
+    ("skills/merge/SKILL.md", "exit_code: $exit_code"),
+    ("skills/merge/SKILL.md", VERDICT_COMMENT_COMMAND),
+    ("skills/merge/SKILL.md", MERGE_COMMAND),
+    (
+        "skills/merge/SKILL.md",
+        "merge credential must not be minted or invoked",
+    ),
 ];
 
-const FORBIDDEN_CONTRACTS: [(&str, &str); 4] = [
+const FORBIDDEN_CONTRACTS: [(&str, &str); 5] = [
     ("skills/gatekeep/SKILL.md", "stop this iteration"),
     ("skills/gatekeep/SKILL.md", "failed_repo"),
     ("skills/work/SKILL.md", "$ARGUMENTS"),
@@ -122,7 +160,14 @@ const FORBIDDEN_CONTRACTS: [(&str, &str); 4] = [
         "skills/work/SKILL.md",
         "documented Claude implementer fallback",
     ),
+    (
+        "skills/merge/SKILL.md",
+        "--permissions metadata:read,issues:write,pull_requests:read",
+    ),
 ];
+
+const VERDICT_COMMENT_COMMAND: &str = "gh pr comment \"$pr_number\" --repo \"$repository\"";
+const MERGE_COMMAND: &str = "gh pr merge \"$pr_number\" --repo \"$repository\"";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginSurfaceViolation {
@@ -163,6 +208,7 @@ pub fn check_plugin_surface(repository: &Path) -> io::Result<PluginSurfaceReport
     check_hooks(&plugin, &mut report);
     check_contracts(&plugin, &mut report);
     check_role_permissions(&plugin, &mut report);
+    check_gatekeeper_write_protocol(&plugin, &mut report);
     check_private_paths(&plugin, &plugin, &mut report)?;
     Ok(report)
 }
@@ -283,6 +329,47 @@ fn check_contracts(plugin: &Path, report: &mut PluginSurfaceReport) {
     }
 }
 
+fn check_gatekeeper_write_protocol(plugin: &Path, report: &mut PluginSurfaceReport) {
+    for relative in ["skills/gatekeep/SKILL.md", "skills/merge/SKILL.md"] {
+        let path = plugin.join(relative);
+        let source = fs::read_to_string(path).unwrap_or_default();
+        let comment = source.find(VERDICT_COMMENT_COMMAND);
+        let merge = source.find(MERGE_COMMAND);
+        if !matches!((comment, merge), (Some(comment), Some(merge)) if comment < merge) {
+            violation(
+                report,
+                &display_path(relative),
+                "verdict comment must precede merge with separate explicit scope envelopes",
+            );
+        }
+    }
+
+    let relative = "skills/merge/SKILL.md";
+    let source = fs::read_to_string(plugin.join(relative)).unwrap_or_default();
+    let denial_facts = [
+        "outcome: \"permission-denied\"",
+        "operation: $operation",
+        "requested_scope: $requested_scope",
+        "exit_code: $exit_code",
+    ];
+    if !denial_facts.iter().all(|field| source.contains(field)) {
+        violation(
+            report,
+            &display_path(relative),
+            "write-denied outcome must carry operation, requested scope, and exit code",
+        );
+    }
+    if !source.contains("a failed comment must block the merge")
+        || !source.contains("merge credential must not be minted or invoked")
+    {
+        violation(
+            report,
+            &display_path(relative),
+            "verdict-comment failure must explicitly block the merge",
+        );
+    }
+}
+
 fn display_path(relative: &str) -> String {
     relative
         .strip_prefix("../../")
@@ -327,7 +414,9 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{FORBIDDEN_CONTRACTS, HOOK_COMMANDS, REQUIRED_CONTRACTS, check_plugin_surface};
+    use super::{
+        FORBIDDEN_CONTRACTS, HOOK_COMMANDS, MERGE_COMMAND, REQUIRED_CONTRACTS, check_plugin_surface,
+    };
 
     struct Fixture {
         root: TempDir,
@@ -425,5 +514,22 @@ mod tests {
         let rendered = report.to_string();
         assert!(rendered.contains("role allowlist gap for builder"));
         assert!(rendered.contains("ostrom newly-added"));
+    }
+
+    #[test]
+    fn rejects_merge_before_comment_or_implicit_comment_coupling() {
+        let fixture = Fixture::new();
+        let path = fixture.root().join("plugins/ostrom/skills/merge/SKILL.md");
+        let mut source = fs::read_to_string(&path).expect("read merge fixture");
+        source = format!("{MERGE_COMMAND}\n{source}").replace(
+            "a failed comment must block the merge",
+            "comment failure has no declared merge effect",
+        );
+        fs::write(path, source).expect("break write protocol fixture");
+
+        let report = check_plugin_surface(fixture.root()).expect("check broken fixture");
+        let rendered = report.to_string();
+        assert!(rendered.contains("verdict comment must precede merge"));
+        assert!(rendered.contains("verdict-comment failure must explicitly block"));
     }
 }

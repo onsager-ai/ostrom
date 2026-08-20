@@ -48,8 +48,10 @@ ostrom trace append pass-started \
   '{}'
 ```
 
-Immediately after that successful append, initialize `completed_candidates` to
-`0` and `skipped_repos` to `[]`; maintain both values for the rest of the pass.
+Immediately after that successful append, initialize `completed_candidates`,
+`passing_candidates`, and `merged_candidates` to `0`, and initialize
+`skipped_repos`, `write_denials`, and `delivery_failures` to `[]`; maintain all
+six values for the rest of the pass.
 
 Every trace append in this protocol supplies separate fact and narration JSON
 objects. Put identifiers, actions, and values returned by GitHub or the gate in
@@ -109,6 +111,32 @@ recorded in its `decision-taken` trace record, not stamped onto the merge commit
 `/ostrom:merge` step 4 for why. An `Ostrom-Role: builder` trailer arriving on a
 commit under review was written by the builder itself, so it is self-asserted
 advisory metadata, not evidence of who acted and never an input to the gate.
+
+The two later writes have separate, complete scope envelopes. They must never
+share one widened token:
+
+```sh
+# Record the verdict on the pull request. `gh pr comment` uses GraphQL
+# `addComment` with a pull request subject, so Pull requests write is the
+# minimum write permission; Issues is not requested.
+ostrom credential gatekeeper "$repository" \
+  --repositories "$repository" \
+  --permissions metadata:read,pull_requests:write -- \
+  gh pr comment "$pr_number" --repo "$repository" --body-file "$comment_file"
+
+# Merge only after the verdict comment succeeds. `gh pr merge` reads and
+# mutates the pull request and writes the merge result to repository contents.
+ostrom credential gatekeeper "$repository" \
+  --repositories "$repository" \
+  --permissions metadata:read,contents:write,pull_requests:write -- \
+  gh pr merge "$pr_number" --repo "$repository"
+```
+
+Those are the only write scopes for these operations: the verdict comment does
+not receive Contents or Issues, and the merge does not inherit any permission
+from the comment token. `/ostrom:merge` owns the calls and their failure
+handling; these declarations make the gatekeeper driver's required authority
+visible before it delegates a candidate.
 
 Keep these two exit-`111` cases distinct:
 
@@ -177,6 +205,14 @@ Carry no facts, conclusions, exceptions, or confidence from an earlier pull
 request in the iteration, and carry none from an earlier iteration. A result
 for one pull request must never inform another.
 
+After `/ostrom:merge` returns, increment `passing_candidates` when its consumed
+gate verdict was `pass`, and increment `merged_candidates` only when its action
+was `merged`. If it returns `permission-denied`, append the returned fact object
+to `write_denials`; that object contains `repo`, `pr`, `head_sha`, `operation`,
+`requested_scope`, and `exit_code`. If it returns `write-failed`, append the
+same-shaped fact object to `delivery_failures`. These are candidate results,
+not narration, and must survive into the terminal pass fact.
+
 For an `inconclusive` verdict, use the gate line's `already_judged` field as a
 delivery guard keyed on `(pr, head_sha)`:
 
@@ -196,11 +232,12 @@ merge.
 Emit one line per candidate containing only its `owner/repo#number` pointer,
 the verdict, and the action taken. Actions include merged, verdict commented,
 duplicate comment suppressed, escalated to principal, and repeat escalation
-suppressed. Also emit one line per skipped repository naming its `owner/repo`
-pointer and that token minting still failed after one retry. If no open pull
-requests exist in the repositories that were successfully enumerated, report
-that once; do not describe a skipped repository as having no open pull
-requests.
+suppressed. `permission-denied` and `write-failed` are named actions; each must
+name its `operation` and `requested_scope`. Also emit one line per skipped
+repository naming its `owner/repo` pointer and that token minting still failed
+after one retry. If no open pull requests exist in the repositories that were
+successfully enumerated, report that once; do not describe a skipped repository
+as having no open pull requests.
 
 Then stop. The external pass timer owns the next poll; never create, renew, or
 wait on an in-session recurring wake. Do not switch to event-driven delivery.
@@ -211,26 +248,45 @@ On every normal or error path after acquisition, append `pass-ended` before
 releasing the lease. Increment `completed_candidates` only after a selected
 candidate has returned from `/ostrom:merge` with its action recorded. Add each
 repository that exhausts the retry in step 4 to `skipped_repos` once. The
-terminal fact uses the two values maintained since step 2 to record the observed
-outcome, truthful completed-candidate count, and skipped-repository list;
-narration may explain why an incomplete pass stopped but must not replace those
-facts.
+terminal fact uses all six values maintained since step 2 to record the observed
+outcome, truthful candidate counts, skipped-repository list, and any refused or
+failed writes; narration may explain why an incomplete pass stopped but must
+not replace those facts.
 
-Use the existing outcome `completed` when the pass reaches the end without a
-skipped repository. Use outcome `partial` when the pass reaches the end after
-skipping one or more repositories, including when it successfully judged
-candidates in the other repositories; a productive pass with skips is not
-`error`. Reserve `error` for a pass-ending failure such as credentials that
-cannot be loaded at all or a trace failure. Then run, with the exact owner
-retained in step 2:
+Choose the terminal outcome in this order:
+
+1. `error` for a pass-ending failure such as credentials that cannot be loaded
+   at all, a trace failure, or an accounting contradiction.
+2. `permission-denied` when `write_denials` is non-empty. This remains the
+   outcome even if another candidate merged: a denied required write is not a
+   completed pass.
+3. `delivery-failed` when `delivery_failures` is non-empty.
+4. `partial` when one or more repositories were skipped after the bounded mint
+   retry, including when candidates from other repositories completed.
+5. `completed` only when none of the preceding conditions applies.
+
+Before selecting `completed`, enforce
+`passing_candidates == merged_candidates`. A pass that judged one or more
+passing candidates but merged none of them is therefore `permission-denied` or
+`delivery-failed` when a recorded write explains the gap; if neither list
+explains it, use `error` with narration identifying an accounting contradiction.
+It must never report bare `completed`.
+
+Then run, with the exact owner retained in step 2:
 
 ```sh
 ostrom trace append pass-ended \
   "$(jq -cn --arg outcome "$pass_outcome" \
     --argjson completed "$completed_candidates" \
+    --argjson passing "$passing_candidates" \
+    --argjson merged "$merged_candidates" \
     --argjson skipped "$skipped_repos" \
+    --argjson denials "$write_denials" \
+    --argjson failures "$delivery_failures" \
     '{outcome: $outcome, completed_candidates: $completed,
-      skipped_repos: $skipped}')" \
+      passing_candidates: $passing, merged_candidates: $merged,
+      skipped_repos: $skipped, write_denials: $denials,
+      delivery_failures: $failures}')" \
   "$pass_end_narration"
 ostrom lease release "$lease_owner"
 ```
