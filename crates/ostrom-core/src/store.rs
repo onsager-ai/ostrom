@@ -1,11 +1,13 @@
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::{Map, Value};
 use thiserror::Error;
 
 use crate::{CheckReceipt, RepositoryName, Verdict};
 
 pub const STORE_SCHEMA_VERSION: u32 = 1;
 pub const CHECK_STORE_SCHEMA_VERSION: u32 = 1;
+pub const EVENT_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -186,13 +188,190 @@ pub trait CheckStore: Send {
     async fn runs(&self) -> Result<Vec<CheckRun>, CheckStoreFault>;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EventRunId(pub String);
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[error("event type must use the domain.past_tense namespace")]
+pub struct EventTypeFault;
+
+/// An open event type using the `domain.past_tense` naming convention.
+///
+/// The type is deliberately not an enum: consumers must retain event types
+/// introduced by a newer producer even when they do not yet interpret them.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct EventType(String);
+
+impl EventType {
+    pub fn new(value: impl Into<String>) -> Result<Self, EventTypeFault> {
+        let value = value.into();
+        let mut parts = value.split('.');
+        let domain = parts.next().unwrap_or_default();
+        let past_tense = parts.next().unwrap_or_default();
+        if parts.next().is_some()
+            || !valid_event_type_part(domain)
+            || !valid_event_type_part(past_tense)
+        {
+            return Err(EventTypeFault);
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+fn valid_event_type_part(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+impl<'de> Deserialize<'de> for EventType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[error("event payload contains a narration field")]
+pub struct EventPayloadFault;
+
+/// A fact-only event payload.
+///
+/// The map is private so every construction and deserialization path enforces
+/// the same structural boundary. In particular, narration cannot be added by
+/// extending a permissive JSON object at an adapter boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct EventPayload(Map<String, Value>);
+
+impl EventPayload {
+    pub fn new(facts: Map<String, Value>) -> Result<Self, EventPayloadFault> {
+        reject_narration_fields(&Value::Object(facts.clone()))?;
+        Ok(Self(facts))
+    }
+
+    #[must_use]
+    pub fn empty() -> Self {
+        Self(Map::new())
+    }
+
+    #[must_use]
+    pub fn as_map(&self) -> &Map<String, Value> {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for EventPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let facts = Map::<String, Value>::deserialize(deserializer)?;
+        Self::new(facts).map_err(serde::de::Error::custom)
+    }
+}
+
+fn reject_narration_fields(value: &Value) -> Result<(), EventPayloadFault> {
+    const NARRATION_FIELDS: &[&str] = &[
+        "detail",
+        "dossier",
+        "error",
+        "message",
+        "narration",
+        "operator_reason",
+        "prompt",
+        "reason",
+        "tool_output",
+    ];
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                reject_narration_fields(value)?;
+            }
+        }
+        Value::Object(object) => {
+            for (key, value) in object {
+                if NARRATION_FIELDS.contains(&key.as_str()) {
+                    return Err(EventPayloadFault);
+                }
+                reject_narration_fields(value)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Producer-facing event input. Sequence, version, run identity, and time are
+/// store-owned envelope metadata and therefore have no representation here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventInput {
+    #[serde(rename = "type")]
+    pub event_type: EventType,
+    pub payload: EventPayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventEnvelope {
+    pub v: u32,
+    #[serde(rename = "type")]
+    pub event_type: EventType,
+    pub run_id: EventRunId,
+    pub seq: u64,
+    pub ts: String,
+    pub payload: EventPayload,
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum EventStoreFault {
+    #[error("event store record uses an unsupported version")]
+    UnsupportedVersion,
+    #[error("event record write failed")]
+    EventWrite,
+    #[error("event payload write failed")]
+    PayloadWrite,
+    #[error("event store read failed")]
+    Read,
+    #[error("event store contains a malformed record")]
+    MalformedRecord,
+}
+
+/// Substrate-neutral append port for ordered lifecycle facts.
+///
+/// Implementations own the envelope metadata and assign a gap-detectable
+/// sequence within each run. Replaying an identical [`EventInput`] in the
+/// same run is a no-op and returns [`WriteDisposition::Unchanged`]. Event type
+/// strings remain open so a reader retains facts it does not yet understand.
+#[async_trait]
+pub trait EventStore: Send {
+    async fn write_event(
+        &mut self,
+        event: &EventInput,
+    ) -> Result<WriteDisposition, EventStoreFault>;
+
+    async fn events(&self) -> Result<Vec<EventEnvelope>, EventStoreFault>;
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        AttemptOutcome, GateFact, PassAttempt, PassId, QueueFact, QueueKind, QueueState,
-        RepoStateFact, SweepPass,
+        AttemptOutcome, EventEnvelope, EventInput, EventPayload, EventRunId, EventType, GateFact,
+        PassAttempt, PassId, QueueFact, QueueKind, QueueState, RepoStateFact, SweepPass,
     };
     use crate::{RepositoryName, Verdict};
 
@@ -277,18 +456,84 @@ mod tests {
         // guard. This focused test makes the interface invariant visible in a
         // normal `cargo test` run as well, without relying on code review.
         let source = include_str!("store.rs");
-        let trait_source = source
-            .split_once("pub trait SweepStore")
-            .expect("store trait declaration")
-            .1
-            .split_once("\n}")
-            .expect("store trait body")
-            .0;
-        for forbidden in ["std::io", "std::path", "PathBuf", "Path", "IoSlice"] {
+        for store_trait in ["SweepStore", "CheckStore", "EventStore"] {
+            let trait_source = source
+                .split_once(&format!("pub trait {store_trait}"))
+                .expect("store trait declaration")
+                .1
+                .split_once("\n}")
+                .expect("store trait body")
+                .0;
+            for forbidden in ["std::io", "std::path", "PathBuf", "Path", "IoSlice"] {
+                assert!(
+                    !trait_source.contains(forbidden),
+                    "{store_trait} signature contains forbidden I/O type {forbidden}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn event_input_has_no_sequence_or_narration_channel() {
+        let input = EventInput {
+            event_type: EventType::new("work.completed").expect("valid type"),
+            payload: EventPayload::new(serde_json::Map::from_iter([(
+                "order_id".to_owned(),
+                json!("synthetic-order"),
+            )]))
+            .expect("fact-only payload"),
+        };
+        assert_eq!(
+            serde_json::to_value(&input).expect("input serializes"),
+            json!({"type": "work.completed", "payload": {"order_id": "synthetic-order"}})
+        );
+
+        for forbidden in [
+            "seq",
+            "detail",
+            "narration",
+            "reason",
+            "prompt",
+            "tool_output",
+        ] {
+            let mut injected = serde_json::to_value(&input).expect("input serializes");
+            if forbidden == "seq" {
+                injected[forbidden] = json!(7);
+            } else {
+                injected["payload"][forbidden] = Value::Null;
+            }
             assert!(
-                !trait_source.contains(forbidden),
-                "store trait signature contains forbidden I/O type {forbidden}"
+                serde_json::from_value::<EventInput>(injected).is_err(),
+                "producer input must reject {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn unknown_event_type_is_retained_and_required_fields_are_required() {
+        let json = json!({
+            "v": 1,
+            "type": "future.observed",
+            "run_id": "synthetic-run",
+            "seq": 8,
+            "ts": "2030-01-02T03:04:05Z",
+            "payload": {"artifact_id": "synthetic-artifact"}
+        });
+        let parsed: EventEnvelope =
+            serde_json::from_value(json.clone()).expect("unknown type remains portable");
+        assert_eq!(parsed.event_type.as_str(), "future.observed");
+        assert_eq!(
+            serde_json::to_value(parsed).expect("envelope serializes"),
+            json
+        );
+
+        let missing = json!({
+            "v": 1,
+            "type": "future.observed",
+            "run_id": EventRunId("synthetic-run".to_owned()),
+            "ts": "2030-01-02T03:04:05Z",
+            "payload": {}
+        });
+        assert!(serde_json::from_value::<EventEnvelope>(missing).is_err());
     }
 }
