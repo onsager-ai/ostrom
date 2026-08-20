@@ -225,6 +225,8 @@ pub struct QueueItem {
     pub opened: String,
     pub kind: String,
     pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_type: Option<String>,
     #[serde(default)]
     pub blocked_by: Vec<String>,
     #[serde(default = "default_true")]
@@ -237,6 +239,7 @@ impl QueueItem {
     #[must_use]
     pub fn dispatchable(&self) -> bool {
         self.graph_dispatchable
+            && self.item_type.as_deref() != Some("pull_request")
             && self.kind != "parked"
             && self.state != "deferred"
             && (matches!(self.kind.as_str(), "moved" | "stuck")
@@ -729,27 +732,32 @@ pub fn compose_ranking(
     result
 }
 
-/// Apply the mechanical precedence below a goal plan: principal ranking,
-/// unblocking power, then age as the final floor.
+/// Apply the mechanical precedence below a goal plan. An empty principal
+/// ranking retains the legacy age order. Otherwise the principal ranking is
+/// followed by unblocking power, then age as the final floor.
 #[must_use]
 pub fn mechanical_ranking(queue: &[QueueItem], principal: &[String]) -> Vec<String> {
     let mut dispatchable = queue
         .iter()
         .filter(|item| item.dispatchable())
         .collect::<Vec<_>>();
-    dispatchable.sort_by_key(|item| {
-        let rank = principal.iter().position(|id| id == &item.id);
-        match rank {
-            Some(rank) => (0, rank, 0_isize, &item.opened, &item.id),
-            None => (
-                1,
-                0,
-                -(item.unblocking_power as isize),
-                &item.opened,
-                &item.id,
-            ),
-        }
-    });
+    if principal.is_empty() {
+        dispatchable.sort_by_key(|item| (&item.opened, &item.id));
+    } else {
+        dispatchable.sort_by_key(|item| {
+            let rank = principal.iter().position(|id| id == &item.id);
+            match rank {
+                Some(rank) => (0, rank, 0_isize, &item.opened, &item.id),
+                None => (
+                    1,
+                    0,
+                    -(item.unblocking_power as isize),
+                    &item.opened,
+                    &item.id,
+                ),
+            }
+        });
+    }
     dispatchable
         .into_iter()
         .map(|item| item.id.clone())
@@ -808,6 +816,7 @@ acknowledgements: []
             opened: opened.to_owned(),
             kind: kind.to_owned(),
             state: state.to_owned(),
+            item_type: None,
             blocked_by: Vec::new(),
             graph_dispatchable: true,
             unblocking_power: 0,
@@ -1177,7 +1186,7 @@ acknowledgements: []
     }
 
     #[test]
-    fn mechanical_ranking_retains_the_pre_plan_dependency_order() {
+    fn mechanical_ranking_uses_dependencies_only_with_a_principal_ranking() {
         let mut blocker = queue(
             "example-org/example-repo#4",
             "drift",
@@ -1210,12 +1219,42 @@ acknowledgements: []
             blocker,
         ];
         assert_eq!(
+            mechanical_ranking(&items, &[]),
+            vec![
+                "example-org/example-repo#1",
+                "example-org/example-repo#2",
+                "example-org/example-repo#3",
+            ]
+        );
+        assert_eq!(
             mechanical_ranking(&items, &["example-org/example-repo#3".to_owned()]),
             vec![
                 "example-org/example-repo#3",
                 "example-org/example-repo#2",
                 "example-org/example-repo#1",
             ]
+        );
+    }
+
+    #[test]
+    fn pull_requests_are_not_dispatchable_work() {
+        let issue = queue(
+            "example-org/example-repo#1",
+            "moved",
+            "pending",
+            "2030-01-01",
+        );
+        let mut pull_request = queue(
+            "example-org/example-repo#2",
+            "stuck",
+            "pending",
+            "2030-01-02",
+        );
+        pull_request.item_type = Some("pull_request".to_owned());
+
+        assert_eq!(
+            mechanical_ranking(&[pull_request, issue], &[]),
+            vec!["example-org/example-repo#1"]
         );
     }
 

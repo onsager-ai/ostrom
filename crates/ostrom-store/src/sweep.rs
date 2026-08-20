@@ -1088,6 +1088,7 @@ fn analyze_repository(
                 json!({
                     "id": item.item.id,
                     "title": item.item.title,
+                    "item_type": queue_item_type(&item.item.item_type),
                     "closing_suffix": closing_suffix(item, &classified),
                     "age_days": item.age_days,
                     "aged_out": item.age_days >= config.stuck_after_days,
@@ -1506,6 +1507,7 @@ fn queue_row(item: &ClassifiedItem, all: &[ClassifiedItem], stuck_after_days: u6
         "repo": item.item.repo,
         "ref": item.item.reference,
         "title": item.item.title,
+        "item_type": queue_item_type(&item.item.item_type),
         "kind": kind,
         "mandate": mandate,
         "state": "pending",
@@ -1515,6 +1517,14 @@ fn queue_row(item: &ClassifiedItem, all: &[ClassifiedItem], stuck_after_days: u6
         "needs_judgment": matches!(kind, "tripwire" | "decision"),
         "blocked_by": item.item.blocked_by,
     })
+}
+
+fn queue_item_type(item_type: &str) -> &'static str {
+    if item_type == "pr" {
+        "pull_request"
+    } else {
+        "issue"
+    }
 }
 
 fn closing_suffix(item: &ClassifiedItem, all: &[ClassifiedItem]) -> String {
@@ -2136,7 +2146,7 @@ fn reconcile_queue(
     }
     for row in &mut result {
         if let Some(item) = current.get(string_field(row, &["id"])) {
-            for field in ["title", "age_days", "aged_out", "blocked_by"] {
+            for field in ["title", "item_type", "age_days", "aged_out", "blocked_by"] {
                 if let Some(value) = item.get(field) {
                     row[field] = value.clone();
                 }

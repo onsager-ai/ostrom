@@ -117,6 +117,7 @@ Then read, in order:
   every authorization and hold check; it never changes that candidate set.
 - `~/.claude/ostrom/queue.jsonl` — what the last sweep found. Rows are
   pointers, so resolve titles from GitHub rather than trusting cached text.
+  Work-item rows carry an explicit `item_type` of `issue` or `pull_request`.
 - The SessionStart digest, if it is in context.
 
 Each row's `state` is `pending`, `approved`, or `deferred`. `needs_judgment`

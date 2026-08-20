@@ -794,6 +794,10 @@ fn queue_item(
         opened: field("opened")?,
         kind: field("kind")?,
         state: field("state")?,
+        item_type: value
+            .get("item_type")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
         blocked_by: value["blocked_by"]
             .as_array()
             .into_iter()

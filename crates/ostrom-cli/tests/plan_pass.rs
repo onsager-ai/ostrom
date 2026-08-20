@@ -769,7 +769,7 @@ fn named_assessment_stops_at_the_plan_goal_ceiling() {
 }
 
 #[test]
-fn builder_uses_a_fresh_plan_order_after_the_principal_prefix() {
+fn empty_principal_ranking_ignores_a_fresh_plan_order() {
     let fixture = tempdir().expect("selector home");
     let data = fixture.path().join("ostrom");
     fs::create_dir(&data).expect("data dir");
@@ -847,14 +847,9 @@ projects:
         .expect("plan JSON"),
     )
     .expect("plan");
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("workspace root");
     let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
         .args(["select-work", "list"])
-        .env("CLAUDE_CONFIG_DIR", fixture.path())
-        .env("CLAUDE_PLUGIN_ROOT", root.join("plugins/ostrom"))
+        .env("OSTROM_HOME", &data)
         .current_dir(fixture.path())
         .output()
         .expect("run selector");
@@ -871,5 +866,5 @@ projects:
             .expect("first row"),
     )
     .expect("row JSON");
-    assert_eq!(first["id"], "example-org/example-repo#2");
+    assert_eq!(first["id"], "example-org/example-repo#1");
 }
