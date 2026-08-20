@@ -76,6 +76,7 @@ directory, which is the hermetic test and parity surface.
 ```bash
 cargo run -p ostrom-cli -- queue list --format=json
 OSTROM_HOME=/path/to/ostrom-state cargo run -p ostrom-cli -- sweep
+OSTROM_HOME=/path/to/ostrom-state cargo run -p ostrom-cli -- check run
 OSTROM_HOME=/path/to/ostrom-state cargo run -p ostrom-cli -- plan
 ```
 
@@ -87,9 +88,12 @@ a scratch `OSTROM_HOME` can therefore never inherit the production hub target.
 The checked-in Bash sweep remains the live fallback and is not invoked by the
 Rust sweep.
 
-`ostrom plan` runs that same sweep first, then strictly reads `goals.yaml`,
-mirrors durable check receipts, derives goal facts, and writes private
-`plan.json` plus its acknowledgement ledger. Semantic assessment can use a
+`ostrom plan` refreshes stale and never-run authored mechanical criteria, runs
+the same sweep, then strictly reads `goals.yaml`, mirrors durable check
+receipts, derives goal facts, and writes private `plan.json` plus its
+acknowledgement ledger. A goal is not semantically assessed while any cited
+criterion remains stale or never run; a recorded failing verdict remains a
+distinct assessable fact. Semantic assessment can use a
 named harness with `--assessor[=claude|codex|copilot]`; a bare `--assessor`
 selects Claude. `OSTROM_PLAN_DERIVER` accepts the same three names and remains
 the arbitrary-executable escape hatch for every other value. With neither

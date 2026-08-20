@@ -2,7 +2,6 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::{Command, Output},
-    time::{Duration, Instant},
 };
 
 use chrono::{DateTime, Utc};
@@ -339,8 +338,10 @@ acknowledgements: []
             .iter()
             .any(|fault| fault["name"] == "unresolved_check")
             && faults.iter().any(|fault| {
-                fault["name"] == "assessment_unavailable"
-                    && fault["detail"] == "no semantic assessment deriver is configured"
+                fault["name"] == "assessment_evidence_unavailable"
+                    && fault["detail"]
+                        .as_str()
+                        .is_some_and(|detail| detail.contains("missing-check"))
             })
     }));
     assert_eq!(
@@ -418,15 +419,15 @@ acknowledgements: []
         "passing"
     );
     assert_eq!(goal("fresh")["facts"]["basis"], "mechanical");
-    assert_eq!(goal("never")["facts"]["met"], false);
+    assert_eq!(goal("never")["facts"]["met"], true);
     assert_eq!(
         goal("never")["facts"]["met_when_status"][1]["state"],
-        "never_run"
+        "passing"
     );
-    assert_eq!(goal("stale")["facts"]["met"], false);
+    assert_eq!(goal("stale")["facts"]["met"], true);
     assert_eq!(
         goal("stale")["facts"]["met_when_status"][1]["state"],
-        "stale"
+        "passing"
     );
     assert_eq!(
         goal("unknown")["facts"]["met_when_status"][0]["fault"]["name"],
@@ -436,7 +437,7 @@ acknowledgements: []
         goal("unregistered")["facts"]["met_when_status"][0]["fault"]["name"],
         "unregistered_action"
     );
-    assert_eq!(document["sweep"]["check_runs"], 1);
+    assert_eq!(document["sweep"]["check_runs"], 2);
 }
 
 #[test]
@@ -470,15 +471,15 @@ fn unreadable_catalogue_faults_every_reference_instead_of_resolving_a_subset() {
 }
 
 #[test]
-fn plan_prepares_but_never_executes_authored_actions() {
+fn plan_executes_never_run_authored_criteria_before_assessment() {
     let home = tempdir().expect("plan home");
     configure(home.path());
     let marker = home.path().join("action-executed");
-    let script = format!("touch {}; sleep 30", marker.display());
+    let script = format!("touch {}", marker.display());
     fs::write(
         home.path().join("checks.yaml"),
         format!(
-            "checks_version: 1\nchecks:\n  out-of-band:\n    uses: cmd/run\n    with:\n      script: {}\n      timeout: 30s\n",
+            "checks_version: 1\nchecks:\n  out-of-band:\n    uses: cmd/run\n    with:\n      script: {}\n      timeout: 1s\n",
             serde_json::to_string(&script).expect("quote fixture script")
         ),
     )
@@ -489,21 +490,236 @@ fn plan_prepares_but_never_executes_authored_actions() {
     )
     .expect("write goals");
 
-    let started = Instant::now();
     let output = run(home.path(), "plan");
     assert!(output.status.success());
     assert!(
-        started.elapsed() < Duration::from_secs(10),
-        "plan waited for the 30-second action"
+        marker.exists(),
+        "plan did not execute the authored criterion"
     );
-    assert!(!marker.exists(), "plan executed the authored action");
     let document: Value =
         serde_json::from_slice(&fs::read(home.path().join("plan.json")).expect("plan output"))
             .expect("parse plan");
     assert_eq!(
         document["goals"][0]["facts"]["met_when_status"][0]["state"],
-        "never_run"
+        "passing"
     );
+    assert!(document["goals"][0]["facts"]["met"].as_bool() == Some(true));
+    assert_eq!(document["sweep"]["check_runs"], 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn plan_reruns_stale_criteria_and_the_recorded_flip_changes_the_reading() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = tempdir().expect("plan home");
+    configure(home.path());
+    let switch = home.path().join("criterion-switch");
+    fs::write(&switch, "pass").expect("write criterion switch");
+    let flip_script = format!("test \"$(cat {})\" = pass", switch.display());
+    fs::write(
+        home.path().join("checks.yaml"),
+        format!(
+            concat!(
+                "checks_version: 1\n",
+                "checks:\n",
+                "  anchor:\n",
+                "    uses: cmd/run\n",
+                "    with: {{script: \"exit 1\"}}\n",
+                "  flip:\n",
+                "    uses: cmd/run\n",
+                "    with: {{script: {}, fresh_for: 1s}}\n",
+            ),
+            serde_json::to_string(&flip_script).expect("quote flip script")
+        ),
+    )
+    .expect("write checks");
+    fs::write(
+        home.path().join("goals.yaml"),
+        r#"
+goals_version: 1
+goals:
+  - id: criteria-change
+    intent: recorded criteria determine the reading
+    state: active
+    serves: [{epic: example-org/example-repo#115}]
+    met_when: [anchor, flip]
+actions: []
+acknowledgements: []
+"#,
+    )
+    .expect("write goals");
+    fs::write(
+        home.path().join("queue.jsonl"),
+        concat!(
+            r##"{"id":"example-org/example-repo#10","repo":"example-org/example-repo","ref":"#10","title":"Routine maintenance","kind":"decision","mandate":{"reason":"reserved ref:#10"},"state":"approved","opened":"2026-07-01T00:00:00Z","age_days":31,"aged_out":true,"needs_judgment":true,"blocked_by":[]}"##,
+            "\n",
+        ),
+    )
+    .expect("write approved queue state");
+    let mut fixture_value: Value =
+        serde_json::from_slice(&fs::read(fixture()).expect("read fixture")).expect("fixture JSON");
+    fixture_value["repositories"][0]["issues"][0]["epic"] = json!("example-org/example-repo#115");
+    let plan_fixture = home.path().join("plan-fixture.json");
+    fs::write(
+        &plan_fixture,
+        serde_json::to_vec(&fixture_value).expect("serialize fixture"),
+    )
+    .expect("write plan fixture");
+    let deriver = home.path().join("criteria-deriver");
+    fs::write(
+        &deriver,
+        concat!(
+            "#!/bin/sh\n",
+            "input=$(cat)\n",
+            "case \"$input\" in\n",
+            "  *'\"met_when.flip.state\":\"pass\"'*) reading=on-track ;;\n",
+            "  *'\"met_when.flip.state\":\"fail\"'*) reading=off-track ;;\n",
+            "  *) exit 9 ;;\n",
+            "esac\n",
+            "printf '{\"goal\":\"criteria-change\",\"reading\":\"%s\",\"because\":[{\"fact\":\"met_when.flip.state\",\"detail\":\"the recorded flip verdict changed\"}]}\\n' \"$reading\"\n",
+        ),
+    )
+    .expect("write assessment deriver");
+    fs::set_permissions(&deriver, fs::Permissions::from_mode(0o700)).expect("deriver mode");
+
+    let run_plan_at = |started_at: &str| {
+        let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+            .args([
+                "plan",
+                "--fixture",
+                plan_fixture.to_str().expect("fixture path"),
+                "--started-at",
+                started_at,
+            ])
+            .env("OSTROM_HOME", home.path())
+            .env("OSTROM_PLAN_DERIVER", &deriver)
+            .current_dir(home.path())
+            .output()
+            .expect("run plan");
+        assert!(
+            output.status.success(),
+            "plan stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<Value>(
+            &fs::read(home.path().join("plan.json")).expect("plan output"),
+        )
+        .expect("parse plan")
+    };
+
+    let passing = run_plan_at("2026-08-01T00:00:00Z");
+    assert_eq!(passing["goals"][0]["assessment"]["reading"], "on-track");
+    assert_eq!(
+        passing["goals"][0]["facts"]["met_when_status"][1]["state"],
+        "passing"
+    );
+
+    fs::write(&switch, "fail").expect("flip criterion");
+    let failing = run_plan_at("2026-08-01T00:00:02Z");
+    assert_eq!(failing["goals"][0]["assessment"]["reading"], "off-track");
+    assert_eq!(
+        failing["goals"][0]["facts"]["met_when_status"][1]["state"],
+        "failing"
+    );
+
+    let runs = fs::read_to_string(home.path().join("check-runs.jsonl"))
+        .expect("read criteria journal")
+        .lines()
+        .map(|line| serde_json::from_str::<CheckRun>(line).expect("decode criteria run"))
+        .collect::<Vec<_>>();
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0].receipts.len(), 2);
+    assert_eq!(runs[1].receipts.len(), 1, "only stale criteria rerun");
+    assert_eq!(runs[1].receipts[0].check, "flip");
+    assert_eq!(runs[1].receipts[0].verdict, Some(CheckVerdict::Fail));
+}
+
+#[cfg(unix)]
+#[test]
+fn plan_refuses_to_assess_when_execution_produces_no_verdict() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = tempdir().expect("plan home");
+    let plan_fixture = configure_assessor_case(home.path());
+    fs::write(
+        home.path().join("checks.yaml"),
+        "checks_version: 1\nchecks:\n  unavailable:\n    uses: cmd/run\n    with: {script: \"sleep 1\", timeout: 10ms}\n",
+    )
+    .expect("write checks");
+    fs::write(
+        home.path().join("goals.yaml"),
+        r#"
+goals_version: 1
+goals:
+  - id: rust-cli
+    intent: ostrom runs as a product
+    state: active
+    serves: [{epic: example-org/example-repo#115}]
+    met_when: [unavailable]
+actions: []
+acknowledgements: []
+"#,
+    )
+    .expect("write goals");
+    let invoked = home.path().join("assessor-invoked");
+    let deriver = home.path().join("must-not-run-deriver");
+    fs::write(
+        &deriver,
+        format!(
+            "#!/bin/sh\ntouch {}\nprintf '%s\\n' '{{\"goal\":\"rust-cli\",\"reading\":\"off-track\",\"because\":[{{\"fact\":\"goal.met\",\"detail\":\"fixture\"}}]}}'\n",
+            invoked.display()
+        ),
+    )
+    .expect("write deriver");
+    fs::set_permissions(&deriver, fs::Permissions::from_mode(0o700)).expect("deriver mode");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .args([
+            "plan",
+            "--fixture",
+            plan_fixture.to_str().expect("fixture path"),
+            "--started-at",
+            "2026-08-01T00:00:00Z",
+        ])
+        .env("OSTROM_HOME", home.path())
+        .env("OSTROM_PLAN_DERIVER", &deriver)
+        .current_dir(home.path())
+        .output()
+        .expect("run plan");
+    assert!(
+        output.status.success(),
+        "plan stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !invoked.exists(),
+        "assessor ran without a criterion verdict"
+    );
+    let document: Value =
+        serde_json::from_slice(&fs::read(home.path().join("plan.json")).expect("plan output"))
+            .expect("parse plan");
+    let status = &document["goals"][0]["facts"]["met_when_status"][0];
+    assert_eq!(status["state"], "never_run");
+    assert_eq!(status["rendered"], "never run");
+    assert_eq!(status["fault"]["name"], "cmd_timeout");
+    assert!(document["goals"][0]["assessment"].is_null());
+    assert!(document["faults"].as_array().is_some_and(|faults| {
+        faults
+            .iter()
+            .any(|fault| fault["name"] == "assessment_evidence_unavailable")
+    }));
+
+    let run: CheckRun = serde_json::from_str(
+        fs::read_to_string(home.path().join("check-runs.jsonl"))
+            .expect("read check journal")
+            .lines()
+            .next()
+            .expect("check run"),
+    )
+    .expect("decode check run");
+    assert_eq!(run.receipts[0].verdict, None);
+    assert_eq!(run.receipts[0].error.as_deref(), Some("cmd_timeout"));
 }
 
 #[cfg(unix)]
