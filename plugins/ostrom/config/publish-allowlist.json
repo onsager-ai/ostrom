@@ -5,6 +5,7 @@
     "repo",
     "ref",
     "title",
+    "item_type",
     "kind",
     "mandate",
     "state",

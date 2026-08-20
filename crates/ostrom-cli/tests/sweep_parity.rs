@@ -68,6 +68,119 @@ fn fixture_sweep_queue_is_byte_identical_to_recorded_cross_org_output() {
 }
 
 #[test]
+fn swept_pull_requests_are_recorded_but_never_become_delegated_candidates() {
+    let home = tempdir().expect("temporary OSTROM_HOME");
+    fs::write(
+        home.path().join("mandates.yaml"),
+        r#"provider: file
+cadence_hours: 1
+stuck_after_days: 7
+search_roots: []
+hold_labels: []
+work_ranking: []
+bounce_all: []
+projects:
+  - repo: placeholder-org/alpha
+    delegated: []
+    excluded: []
+    reserved: []
+    default: delegated
+    paused: false
+    bounce: []
+"#,
+    )
+    .expect("write fixture roster");
+    let fixture = home.path().join("items.json");
+    fs::write(
+        &fixture,
+        serde_json::to_vec(&serde_json::json!({
+            "repositories": [{
+                "repo": "placeholder-org/alpha",
+                "issues": [{
+                    "number": 1,
+                    "title": "Old issue placeholder",
+                    "body": "",
+                    "labels": [],
+                    "created_at": "2026-06-01T00:00:00Z",
+                    "updated_at": "2026-07-01T00:00:00Z",
+                    "state": "open"
+                }],
+                "open_prs": [{
+                    "number": 2,
+                    "title": "fix(core): newer pull request placeholder",
+                    "body": "",
+                    "labels": [],
+                    "createdAt": "2026-07-01T00:00:00Z",
+                    "updatedAt": "2026-07-02T00:00:00Z",
+                    "isDraft": false,
+                    "reviewDecision": "",
+                    "statusCheckRollup": [],
+                    "closingIssuesReferences": [],
+                    "files": [{"path": "src/placeholder.rs"}],
+                    "state": "OPEN",
+                    "mergedAt": null,
+                    "headRefOid": "2222222222222222222222222222222222222222",
+                    "mergeable": "MERGEABLE"
+                }],
+                "merged_prs": [],
+                "default_branch": "main",
+                "branches": [],
+                "ci_runs": []
+            }]
+        }))
+        .expect("serialize item fixture"),
+    )
+    .expect("write item fixture");
+
+    for started_at in ["2026-08-01T00:00:00Z", "2026-08-10T00:00:00Z"] {
+        let sweep = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+            .args([
+                "sweep",
+                "--fixture",
+                fixture.to_str().expect("fixture path is UTF-8"),
+                "--started-at",
+                started_at,
+            ])
+            .env("OSTROM_HOME", home.path())
+            .current_dir(home.path())
+            .output()
+            .expect("run fixture sweep");
+        assert!(
+            sweep.status.success(),
+            "sweep stderr: {}",
+            String::from_utf8_lossy(&sweep.stderr)
+        );
+    }
+
+    let queue = fs::read_to_string(home.path().join("queue.jsonl")).expect("read swept queue");
+    let rows = queue
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("queue row"))
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["id"], "placeholder-org/alpha#1");
+    assert_eq!(rows[0]["item_type"], "issue");
+    assert_eq!(rows[1]["id"], "placeholder-org/alpha#2");
+    assert_eq!(rows[1]["item_type"], "pull_request");
+
+    for action in [
+        vec!["select-work", "list"],
+        vec!["select-work", "select", "builder-placeholder-wake1"],
+    ] {
+        let selected = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+            .args(action)
+            .env("OSTROM_HOME", home.path())
+            .current_dir(home.path())
+            .output()
+            .expect("run selection");
+        assert!(selected.status.success());
+        let output = String::from_utf8(selected.stdout).expect("UTF-8 selection");
+        assert!(output.contains("placeholder-org/alpha#1"));
+        assert!(!output.contains("placeholder-org/alpha#2"));
+    }
+}
+
+#[test]
 fn fixture_sweep_turns_a_stale_work_ranking_pointer_into_a_visible_fault() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let home = tempdir().expect("temporary OSTROM_HOME");

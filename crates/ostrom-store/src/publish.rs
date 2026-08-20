@@ -1218,7 +1218,7 @@ mod tests {
         fs::write(
             paths.queue_file(),
             concat!(
-                r##"{"id":"placeholder-org/alpha#1","repo":"placeholder-org/alpha","ref":"#1","title":"Placeholder","kind":"decision","mandate":{"reason":"placeholder reason"},"state":"pending","opened":"2026-07-31T00:00:00Z","age_days":1,"aged_out":false,"needs_judgment":true,"blocked_by":[],"private_note":"drop"}"##,
+                r##"{"id":"placeholder-org/alpha#1","repo":"placeholder-org/alpha","ref":"#1","title":"Placeholder","item_type":"issue","kind":"decision","mandate":{"reason":"placeholder reason"},"state":"pending","opened":"2026-07-31T00:00:00Z","age_days":1,"aged_out":false,"needs_judgment":true,"blocked_by":[],"private_note":"drop"}"##,
                 "\n",
             ),
         )
@@ -1252,7 +1252,7 @@ mod tests {
             .expect("parse manifest");
         assert_eq!(
             manifest["schema_id"],
-            "git:831ea4a434a43caf675f19f5566d968a8be6a088"
+            "git:3b76309675030f7f0515b15a5662825a6f5f4db8"
         );
         assert_eq!(manifest["dropped_fields"]["queue"]["private_note"], 1);
         assert_eq!(manifest["dropped_fields"]["gate"]["conditions[].detail"], 1);
@@ -1265,6 +1265,7 @@ mod tests {
         assert_eq!(rollup["verdicts_by_day"]["2026-04-01"]["fail"], 1);
         let queue = String::from_utf8(tree.files[Path::new("queue.jsonl")].clone())
             .expect("queue is UTF-8");
+        assert!(queue.contains(r#""item_type":"issue""#));
         assert!(!queue.contains("private_note"));
     }
 

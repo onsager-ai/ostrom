@@ -161,7 +161,9 @@ pub fn run_selection(request: &SelectRequest) -> Result<(SelectOutcome, Vec<Stri
         .iter()
         .map(|index| queue_items[*index].clone())
         .collect::<Vec<_>>();
-    let order = if plan_application == PlanApplication::Applied {
+    let order = if config.work_ranking.is_empty() {
+        mechanical_ranking(&candidate_items, &config.work_ranking)
+    } else if plan_application == PlanApplication::Applied {
         ranked_with_plan(&candidate_items, &config.work_ranking, &plan_order)
     } else {
         mechanical_ranking(&candidate_items, &config.work_ranking)
@@ -294,6 +296,10 @@ fn queue_item(
         opened: string("opened")?,
         kind: string("kind")?,
         state: string("state")?,
+        item_type: row
+            .get("item_type")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
         blocked_by: row["blocked_by"]
             .as_array()
             .into_iter()
@@ -307,7 +313,8 @@ fn queue_item(
 }
 
 fn authorized(item: &QueueItem) -> bool {
-    item.kind != "parked"
+    item.item_type.as_deref() != Some("pull_request")
+        && item.kind != "parked"
         && item.state != "deferred"
         && (matches!(item.kind.as_str(), "moved" | "stuck")
             || (item.state == "approved" && matches!(item.kind.as_str(), "tripwire" | "decision")))
