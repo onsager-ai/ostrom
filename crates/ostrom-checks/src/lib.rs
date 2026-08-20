@@ -12,6 +12,7 @@ mod http;
 mod judgment;
 mod plugin_surface;
 mod process;
+mod protocol;
 mod registry;
 mod shell_retirement;
 mod skill_version_bump;
@@ -27,6 +28,11 @@ pub use judgment::{
     PreparedJudgment,
 };
 pub use plugin_surface::{PluginSurfaceReport, PluginSurfaceViolation, check_plugin_surface};
+pub use protocol::{
+    EMBEDDED_ASSETS, EmbeddedAsset, InstallEntry, InstallReport, InstallStatus, ProtocolError,
+    VerificationEntry, VerificationReport, VerificationStatus, install as install_protocol,
+    resolve_harness_root, resolve_harness_root_from, verify as verify_protocol,
+};
 pub use registry::{
     ActionFault, ActionOutcome, ActionProvider, ActionRegistry, PreparedAction, PreparedCheck,
 };
