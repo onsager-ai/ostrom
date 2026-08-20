@@ -96,7 +96,7 @@ esac
     assert!(usage.stdout.is_empty());
     assert_eq!(
         usage.stderr,
-        b"usage: repair-prs.sh <builder-lease-owner>\n"
+        b"usage: ostrom repair-prs <builder-lease-owner>\n"
     );
 
     let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
