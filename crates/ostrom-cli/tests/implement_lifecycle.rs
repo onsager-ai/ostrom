@@ -102,6 +102,8 @@ impl Fixture {
                 "  config) printf '%s\\n' 'Error loading config.toml: placeholder configuration' >&2; exit 1 ;;\n",
                 "  config-required) printf '%s\\n' 'Error: features.placeholder is required when fixture is enabled' >&2; exit 1 ;;\n",
                 "  model-failure) exit 1 ;;\n",
+                "  quota-error) printf '%s\\n' \"{\\\"type\\\":\\\"error\\\",\\\"message\\\":\\\"You've hit your usage limit. Try again at 11:34 AM.\\\"}\"; exit 1 ;;\n",
+                "  quota-turn-failed) printf '%s\\n' \"{\\\"type\\\":\\\"turn.failed\\\",\\\"error\\\":{\\\"message\\\":\\\"You've hit your usage limit. Try again at 12:34 PM.\\\"}}\"; exit 1 ;;\n",
                 "  partial-failure)\n",
                 "    printf '%s\\n' partial >\"$worktree/partial.txt\"\n",
                 "    printf '%s\\n' \"$FAKE_CODEX_USAGE_JSON\"\n",
@@ -592,21 +594,34 @@ fn a_clean_historical_worktree_is_retargeted_to_the_order_branch() {
 
 #[test]
 fn codex_invocation_failures_are_named_and_release_the_lease() {
-    for (mode, code, reason) in [
-        ("usage", 2, "codex-invocation-invalid"),
-        ("config", 1, "codex-invocation-invalid"),
-        ("config-required", 1, "codex-invocation-invalid"),
-        ("model-failure", 1, "codex-exit-1"),
+    for (mode, code, reason, message) in [
+        ("usage", 2, "codex-invocation-invalid", None),
+        ("config", 1, "codex-invocation-invalid", None),
+        ("config-required", 1, "codex-invocation-invalid", None),
+        ("model-failure", 1, "codex-exit-1", None),
+        (
+            "quota-error",
+            1,
+            "codex-unavailable",
+            Some("You've hit your usage limit. Try again at 11:34 AM."),
+        ),
+        (
+            "quota-turn-failed",
+            1,
+            "codex-unavailable",
+            Some("You've hit your usage limit. Try again at 12:34 PM."),
+        ),
     ] {
         let fixture = Fixture::new(100);
         fixture.acquire();
         let status = fixture.command(mode).status().expect("run implementer");
         assert_eq!(status.code(), Some(code));
         assert!(!fixture.lease_file.exists());
-        assert_eq!(
-            fixture.trace().pop().expect("failure trace")["fact"]["reason"],
-            reason
-        );
+        let terminal = fixture.trace().pop().expect("failure trace");
+        assert_eq!(terminal["fact"]["reason"], reason);
+        if let Some(message) = message {
+            assert_eq!(terminal["fact"]["message"], message);
+        }
     }
 }
 

@@ -485,11 +485,9 @@ fn implement_inner(
     if !status.success() {
         let code = exit_code(status);
         let reason = codex_failure_reason(code, &events_file);
-        return Err(ImplementError::new(
-            code,
-            reason,
-            format!("Codex exited with status {code}"),
-        ));
+        let message = codex_usage_limit_message(&events_file)
+            .unwrap_or_else(|| format!("Codex exited with status {code}"));
+        return Err(ImplementError::new(code, reason, message));
     }
 
     // Codex reports usage only in its terminal event today. This deliberately
@@ -701,6 +699,9 @@ fn codex_failure_reason(code: i32, events_file: &Path) -> String {
     let events = fs::read_to_string(events_file).unwrap_or_default();
     match code {
         126 | 127 => "codex-unavailable".to_owned(),
+        1 if codex_usage_limit_message_from_events(&events).is_some() => {
+            "codex-unavailable".to_owned()
+        }
         1 if events.lines().any(|line| {
             line.starts_with("Error loading config.toml:")
                 || (line.starts_with("Error: features.")
@@ -718,6 +719,27 @@ fn codex_failure_reason(code: i32, events_file: &Path) -> String {
         }
         _ => format!("codex-exit-{code}"),
     }
+}
+
+const CODEX_USAGE_LIMIT_MESSAGE: &str = "You've hit your usage limit.";
+
+fn codex_usage_limit_message(events_file: &Path) -> Option<String> {
+    let events = fs::read_to_string(events_file).ok()?;
+    codex_usage_limit_message_from_events(&events)
+}
+
+fn codex_usage_limit_message_from_events(events: &str) -> Option<String> {
+    events.lines().find_map(|line| {
+        let event: Value = serde_json::from_str(line).ok()?;
+        let message = match event.get("type").and_then(Value::as_str)? {
+            "error" => event.get("message").and_then(Value::as_str),
+            "turn.failed" => event.pointer("/error/message").and_then(Value::as_str),
+            _ => None,
+        }?;
+        message
+            .contains(CODEX_USAGE_LIMIT_MESSAGE)
+            .then(|| message.to_owned())
+    })
 }
 
 #[cfg(unix)]
