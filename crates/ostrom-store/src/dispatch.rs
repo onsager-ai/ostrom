@@ -130,6 +130,12 @@ struct DispatchContext<'a> {
     matched_key: Option<(&'static str, String)>,
 }
 
+struct RepeatedFailure {
+    reason: String,
+    count: usize,
+    escalated: bool,
+}
+
 pub fn run_dispatch(request: &DispatchRequest) -> Result<DispatchOutcome, DispatchError> {
     let mut minter = GitHubInstallationTokenMinter;
     run_dispatch_with_minter(request, &mut minter)
@@ -177,6 +183,8 @@ fn run_dispatch_with_minter(
         listing: ListingState::empty(),
         matched_key: None,
     };
+
+    refuse_repeated_dispatch_failure(&context)?;
 
     preflight_worktree(&context)?;
     let config = load_config_or_defaults(&request.paths, &request.working_directory).ok();
@@ -1552,7 +1560,122 @@ fn append_failure(
             listing_json(&context.listing, outcome),
         );
     }
-    append_fact(context, "work-failed", fact)
+    append_fact(context, "work-failed", fact)?;
+    ensure_repeated_failure_escalated(context)
+}
+
+fn refuse_repeated_dispatch_failure(context: &DispatchContext<'_>) -> Result<(), DispatchError> {
+    let Some(failure) = repeated_failure(context)? else {
+        return Ok(());
+    };
+    if failure.count < 2 {
+        return Ok(());
+    }
+    if !failure.escalated {
+        append_failure_escalation(context, &failure.reason, failure.count)?;
+    }
+    Err(DispatchError::new(
+        3,
+        format!(
+            "ostrom dispatch: repeated failure escalated for {}: {}",
+            context.order.item_id, failure.reason
+        ),
+    ))
+}
+
+fn ensure_repeated_failure_escalated(context: &DispatchContext<'_>) -> Result<(), DispatchError> {
+    let Some(failure) = repeated_failure(context)? else {
+        return Ok(());
+    };
+    if failure.count >= 2 && !failure.escalated {
+        append_failure_escalation(context, &failure.reason, failure.count)?;
+    }
+    Ok(())
+}
+
+fn repeated_failure(
+    context: &DispatchContext<'_>,
+) -> Result<Option<RepeatedFailure>, DispatchError> {
+    let trace = read_trace(&context.request.paths.trace_file())
+        .map_err(|error| DispatchError::new(1, format!("ostrom dispatch: {error}")))?;
+    let rows = trace
+        .rows
+        .into_iter()
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    let mut reason = None::<String>;
+    let mut count = 0;
+    let mut escalated_reasons = BTreeSet::new();
+    for row in rows.iter().rev().filter(|row| {
+        row.fact.get("item_id").and_then(Value::as_str) == Some(context.order.item_id.as_str())
+    }) {
+        match row.kind.as_str() {
+            "dispatch-failure-escalated" => {
+                if let Some(value) = row.fact.get("failure_reason").and_then(Value::as_str) {
+                    escalated_reasons.insert(value.to_owned());
+                }
+            }
+            "work-completed" => break,
+            "work-failed" => {
+                let Some(value) = row.fact.get("reason").and_then(Value::as_str) else {
+                    break;
+                };
+                match &reason {
+                    None => {
+                        reason = Some(value.to_owned());
+                        count = 1;
+                    }
+                    Some(expected) if expected == value => count += 1,
+                    Some(_) => break,
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(reason.map(|reason| RepeatedFailure {
+        escalated: escalated_reasons.contains(&reason),
+        reason,
+        count,
+    }))
+}
+
+fn append_failure_escalation(
+    context: &DispatchContext<'_>,
+    reason: &str,
+    count: usize,
+) -> Result<(), DispatchError> {
+    let timestamp = env::var("MANDATE_TRACE_TIME").unwrap_or_else(|_| {
+        DateTime::<Utc>::from(SystemTime::now())
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string()
+    });
+    append_trace(
+        &context.request.paths.trace_file(),
+        &TraceAppend {
+            ts: timestamp,
+            kind: "dispatch-failure-escalated".to_owned(),
+            fact: Map::from_iter([
+                ("schema_version".to_owned(), json!(1)),
+                ("item_id".to_owned(), json!(context.order.item_id)),
+                ("order_id".to_owned(), json!(context.order.order_id)),
+                ("action".to_owned(), json!("suppress-dispatch")),
+                ("failure_reason".to_owned(), json!(reason)),
+                ("failure_count".to_owned(), json!(count)),
+            ]),
+            narration: Map::from_iter([
+                (
+                    "reason".to_owned(),
+                    json!("The same item produced the same dispatch failure twice."),
+                ),
+                (
+                    "conclusion".to_owned(),
+                    json!("Further automatic dispatch is suppressed pending operator review."),
+                ),
+            ]),
+        },
+    )
+    .map(|_| ())
+    .map_err(|error| DispatchError::new(1, format!("ostrom dispatch: {error}")))
 }
 
 fn append_dispatched(context: &DispatchContext<'_>) -> Result<(), DispatchError> {
