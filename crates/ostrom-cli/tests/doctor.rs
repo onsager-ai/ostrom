@@ -1,12 +1,85 @@
 #![cfg(unix)]
 
-use std::{fs, os::unix::fs::PermissionsExt, process::Command};
+use std::{
+    fs,
+    os::unix::fs::PermissionsExt,
+    path::Path,
+    process::{Command, Output},
+};
 
+use serde_json::json;
 use tempfile::tempdir;
 
 fn executable(path: &std::path::Path, source: &str) {
     fs::write(path, source).expect("write executable fixture");
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("make fixture executable");
+}
+
+fn run_trace_completeness(root: &Path, config: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .args(["doctor", "--check", "trace-completeness"])
+        .current_dir(root)
+        .env_clear()
+        .env("HOME", root.join("home"))
+        .env("CLAUDE_CONFIG_DIR", config)
+        .env("CLAUDE_PLUGIN_ROOT", root.join("plugin"))
+        .output()
+        .expect("run trace-completeness doctor check")
+}
+
+fn gatekeeper_trace(
+    owner: &str,
+    timestamp: &str,
+    item_selected: usize,
+    verdicts: &[&str],
+) -> String {
+    let mut records = vec![json!({
+        "ts": timestamp,
+        "kind": "pass-started",
+        "fact": {"owner": owner},
+        "narration": {}
+    })];
+    for pr in 1..=item_selected {
+        records.push(json!({
+            "ts": timestamp,
+            "kind": "item-selected",
+            "fact": {"repo": "placeholder/example", "pr": pr},
+            "narration": {}
+        }));
+    }
+    for (index, verdict) in verdicts.iter().enumerate() {
+        records.push(json!({
+            "ts": timestamp,
+            "kind": "gate-verdict-consumed",
+            "fact": {
+                "repo": "placeholder/example",
+                "pr": index + 1,
+                "head_sha": "placeholder",
+                "verdict": verdict
+            },
+            "narration": {}
+        }));
+    }
+    records.push(json!({
+        "ts": timestamp,
+        "kind": "pass-ended",
+        "fact": {"owner": owner, "outcome": "completed"},
+        "narration": {}
+    }));
+    format!(
+        "{}\n",
+        records
+            .into_iter()
+            .map(|record| serde_json::to_string(&record).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
+}
+
+fn write_trace(config: &Path, source: &str) {
+    let ostrom = config.join("ostrom");
+    fs::create_dir_all(&ostrom).expect("trace fixture directory");
+    fs::write(ostrom.join("sprint.jsonl"), source).expect("trace fixture");
 }
 
 #[test]
@@ -75,5 +148,118 @@ fn unknown_exact_check_exits_two() {
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
         "unknown doctor check: Environment\n"
+    );
+}
+
+#[test]
+fn trace_completeness_accepts_matching_counts_in_the_most_recent_pass() {
+    let fixture = tempdir().expect("temporary doctor root");
+    let config = fixture.path().join("config");
+    let older = gatekeeper_trace("gatekeeper-placeholder-old", "2026-08-18T09:00:00Z", 3, &[]);
+    let recent = gatekeeper_trace(
+        "gatekeeper-placeholder-current",
+        "2026-08-18T10:00:00Z",
+        3,
+        &["pass", "fail", "inconclusive"],
+    );
+    write_trace(&config, &format!("{older}{recent}"));
+
+    let output = run_trace_completeness(fixture.path(), &config);
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "OK|trace-completeness|gatekeeper pass 2026-08-18T10:00:00Z: item-selected=3, gate-verdict-consumed=3|\n"
+    );
+}
+
+#[test]
+fn trace_completeness_fails_when_no_selected_verdicts_were_consumed() {
+    let fixture = tempdir().expect("temporary doctor root");
+    let config = fixture.path().join("config");
+    write_trace(
+        &config,
+        &gatekeeper_trace(
+            "gatekeeper-placeholder-current",
+            "2026-08-18T10:00:00Z",
+            3,
+            &[],
+        ),
+    );
+
+    let output = run_trace_completeness(fixture.path(), &config);
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "FAIL|trace-completeness|gatekeeper pass 2026-08-18T10:00:00Z: item-selected=3, gate-verdict-consumed=0|restart the gatekeeper session; it may be running a plugin older than the merge-side appends\n"
+    );
+}
+
+#[test]
+fn trace_completeness_accepts_a_pass_with_no_selections() {
+    let fixture = tempdir().expect("temporary doctor root");
+    let config = fixture.path().join("config");
+    write_trace(
+        &config,
+        &gatekeeper_trace(
+            "gatekeeper-placeholder-current",
+            "2026-08-18T10:00:00Z",
+            0,
+            &[],
+        ),
+    );
+
+    let output = run_trace_completeness(fixture.path(), &config);
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "OK|trace-completeness|gatekeeper pass 2026-08-18T10:00:00Z: item-selected=0, gate-verdict-consumed=0|\n"
+    );
+}
+
+#[test]
+fn trace_completeness_counts_fail_and_inconclusive_verdicts_before_failing_a_shortfall() {
+    let fixture = tempdir().expect("temporary doctor root");
+    let config = fixture.path().join("config");
+    write_trace(
+        &config,
+        &gatekeeper_trace(
+            "gatekeeper-placeholder-current",
+            "2026-08-18T10:00:00Z",
+            3,
+            &["fail", "inconclusive"],
+        ),
+    );
+
+    let output = run_trace_completeness(fixture.path(), &config);
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "FAIL|trace-completeness|gatekeeper pass 2026-08-18T10:00:00Z: item-selected=3, gate-verdict-consumed=2|restart the gatekeeper session; it may be running a plugin older than the merge-side appends\n"
+    );
+}
+
+#[test]
+fn trace_completeness_warns_for_missing_and_unreadable_traces() {
+    let fixture = tempdir().expect("temporary doctor root");
+    let missing_config = fixture.path().join("missing-config");
+    let missing = run_trace_completeness(fixture.path(), &missing_config);
+    assert!(missing.status.success());
+    assert_eq!(
+        String::from_utf8(missing.stdout).unwrap(),
+        "WARN|trace-completeness|no gatekeeper pass ever recorded|run /ostrom:gatekeep and confirm it records pass-ended\n"
+    );
+
+    let unreadable_config = fixture.path().join("unreadable-config");
+    fs::create_dir_all(unreadable_config.join("ostrom/sprint.jsonl"))
+        .expect("unreadable trace fixture");
+    let unreadable = run_trace_completeness(fixture.path(), &unreadable_config);
+    assert!(unreadable.status.success());
+    assert_eq!(
+        String::from_utf8(unreadable.stdout).unwrap(),
+        "WARN|trace-completeness|gatekeeper pass history is unreadable|inspect sprint.jsonl and fix its permissions\n"
     );
 }
