@@ -422,6 +422,12 @@ fn roles_receive_their_permission_modes_and_wakes_retain_one_identity() {
 fn wrapper_outcome_follows_inner_protocol_evidence() {
     let cases = [
         ("", true, "no-op", Some("blocked")),
+        (
+            "printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"permission_denials\":[{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"ostrom sweep\"}}]}'",
+            true,
+            "permission-denied",
+            None,
+        ),
         ("exit 42", false, "failed", None),
         (
             concat!(
@@ -467,6 +473,25 @@ fn wrapper_outcome_follows_inner_protocol_evidence() {
     let terminal = gatekeeper.trace().pop().expect("gatekeeper terminal");
     assert_eq!(terminal["fact"]["outcome"], "no-op");
     assert_eq!(terminal["fact"]["reason"], "blocked");
+}
+
+#[test]
+fn permission_denial_overrides_partial_inner_protocol_evidence() {
+    let fixture = Fixture::new(concat!(
+        "printf '%s\\n' '{\"ts\":\"2026-08-01T00:00:00Z\",\"kind\":\"pass-started\",\"fact\":{\"owner\":\"builder-inner-wake1\"},\"narration\":{}}' >>\"$OSTROM_HOME/sprint.jsonl\"\n",
+        "printf '%s\\n' '{\"type\":\"result\",\"total_cost_usd\":0.5,\"permission_denials\":[{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"ostrom repair-prs owner\"}}]}'"
+    ));
+    assert!(
+        fixture
+            .command()
+            .status()
+            .expect("run denied pass")
+            .success()
+    );
+    let terminal = fixture.trace().pop().expect("denied terminal row");
+    assert_eq!(terminal["fact"]["outcome"], "permission-denied");
+    assert!(terminal["fact"].get("reason").is_none());
+    assert_eq!(terminal["fact"]["cost_usd"], 0.5);
 }
 
 #[test]

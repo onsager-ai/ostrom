@@ -392,8 +392,9 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
     })?;
     guard.child_spawned = true;
     let status = wait_for_child(request, &mut guard, &mut child)?;
-    guard.cost_usd = read_cost(&log);
-    reconcile_outcome(&mut guard, watermark, status);
+    let transcript = read_transcript(&log);
+    guard.cost_usd = transcript.cost_usd;
+    reconcile_outcome(&mut guard, watermark, status, transcript.permission_denied);
     prune_transcripts(&run_dir);
     let code = status.code().unwrap_or(1);
     guard.finish()?;
@@ -509,7 +510,17 @@ fn check_signal(
     ))
 }
 
-fn reconcile_outcome(guard: &mut PassGuard, watermark: usize, status: ExitStatus) {
+fn reconcile_outcome(
+    guard: &mut PassGuard,
+    watermark: usize,
+    status: ExitStatus,
+    permission_denied: bool,
+) {
+    if permission_denied {
+        guard.outcome = Some("permission-denied".to_owned());
+        guard.reason = None;
+        return;
+    }
     let rows = read_trace(&guard.paths.trace_file())
         .map(|trace| {
             trace
@@ -651,19 +662,32 @@ fn daily_cap() -> f64 {
         .unwrap_or(DEFAULT_DAILY_CAP_USD)
 }
 
-fn read_cost(path: &Path) -> Option<f64> {
-    fs::read_to_string(path).ok().and_then(|contents| {
-        contents
-            .lines()
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .fold(None, |cost, event| {
-                if event.get("type").and_then(Value::as_str) == Some("result") {
-                    event.get("total_cost_usd").and_then(Value::as_f64).or(cost)
-                } else {
-                    cost
-                }
-            })
-    })
+#[derive(Default)]
+struct TranscriptSummary {
+    cost_usd: Option<f64>,
+    permission_denied: bool,
+}
+
+fn read_transcript(path: &Path) -> TranscriptSummary {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return TranscriptSummary::default();
+    };
+    contents
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .fold(TranscriptSummary::default(), |mut summary, event| {
+            if event.get("type").and_then(Value::as_str) == Some("result") {
+                summary.cost_usd = event
+                    .get("total_cost_usd")
+                    .and_then(Value::as_f64)
+                    .or(summary.cost_usd);
+                summary.permission_denied |= event
+                    .get("permission_denials")
+                    .and_then(Value::as_array)
+                    .is_some_and(|denials| !denials.is_empty());
+            }
+            summary
+        })
 }
 
 fn prune_transcripts(directory: &Path) {
