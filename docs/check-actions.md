@@ -129,3 +129,12 @@ load before execution or journal writes. The shipped registry contains:
 Numeric timeouts are seconds. String timeouts accept positive integer `ms`,
 `s`, or `m` suffixes and default to 30 seconds. `fresh_for` remains the one
 universal core parameter and is accepted alongside each provider's keys.
+
+## Policy requirements
+
+A policy operation step may cite one check by its exact authored name with
+`require: check-name`. The check definition remains in the separate
+`checks.yaml` beside the policy manifest; it is not copied into or interpreted
+as part of the manifest. `ostrom validate` loads that catalogue whenever the
+manifest contains a requirement and rejects an undefined name. The field is
+singular and closed-schema validation rejects the superseded `requires:` form.

@@ -1,0 +1,34 @@
+manifest_version: 1
+operations:
+  merge-placeholder-repositories:
+    steps:
+      - uses: gh/merge-pr
+        with: {repository: placeholder-org/repository-01}
+        require: placeholder-ci-01
+      - uses: gh/merge-pr
+        with: {repository: placeholder-org/repository-02}
+        require: placeholder-ci-02
+      - uses: gh/merge-pr
+        with: {repository: placeholder-org/repository-03}
+        require: placeholder-ci-03
+      - uses: gh/merge-pr
+        with: {repository: placeholder-org/repository-04}
+        require: placeholder-ci-04
+      - uses: gh/merge-pr
+        with: {repository: placeholder-org/repository-05}
+        require: placeholder-ci-05
+      - uses: gh/merge-pr
+        with: {repository: placeholder-org/repository-06}
+        require: placeholder-ci-06
+      - uses: gh/merge-pr
+        with: {repository: placeholder-org/repository-07}
+        require: placeholder-ci-07
+      - uses: gh/merge-pr
+        with: {repository: placeholder-org/repository-08}
+        require: placeholder-ci-08
+      - uses: gh/merge-pr
+        with: {repository: placeholder-org/repository-09}
+        require: placeholder-ci-09
+      - uses: gh/merge-pr
+        with: {repository: placeholder-org/repository-10}
+        require: placeholder-ci-10

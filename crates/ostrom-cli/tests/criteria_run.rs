@@ -5,6 +5,7 @@ use std::{fs, path::PathBuf, process::Command, time::Instant};
 use ostrom_checks::ActionRegistry;
 use ostrom_core::{
     Catalogue, CatalogueEnumeration, CheckDocument, CheckRun, CheckVerdict, GateConfig,
+    PolicyManifest,
 };
 use tempfile::tempdir;
 
@@ -178,8 +179,19 @@ fn ten_legacy_gate_strings_map_to_valid_named_check_fixtures() {
         &fs::read_to_string(fixture.join("checks.yaml")).expect("checks fixture"),
     )
     .expect("checks fixture parses");
+    let manifest = PolicyManifest::from_yaml(
+        &fs::read_to_string(fixture.join("manifest.yml")).expect("manifest fixture"),
+    )
+    .expect("manifest fixture parses");
     assert_eq!(gate.projects.len(), 10);
     assert_eq!(document.checks.len(), 10);
+
+    let requirements = manifest.operations["merge-placeholder-repositories"]
+        .steps
+        .iter()
+        .map(|step| step.require.as_deref().expect("step cites a check"))
+        .collect::<Vec<_>>();
+    assert_eq!(requirements.len(), 10);
 
     let enumeration = CatalogueEnumeration {
         catalogues: vec![Catalogue { document }],
@@ -192,6 +204,7 @@ fn ten_legacy_gate_strings_map_to_valid_named_check_fixtures() {
             .first()
             .expect("one legacy required check");
         let check_id = format!("placeholder-ci-{:02}", index + 1);
+        assert_eq!(requirements[index], check_id);
         let definition = &enumeration.catalogues[0].document.checks[&check_id];
         assert_eq!(definition.with["name"], legacy_name.as_str());
         registry

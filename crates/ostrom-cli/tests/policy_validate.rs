@@ -197,3 +197,47 @@ fn unknown_selector_prefix_fails_the_cli_and_names_it() {
         "{stderr}"
     );
 }
+
+#[test]
+fn require_naming_an_undefined_check_fails_the_load() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let manifest = temporary.path().join("manifest.yml");
+    fs::write(
+        &manifest,
+        "manifest_version: 1\noperations:\n  merge-placeholder:\n    steps:\n      - uses: gh/merge-pr\n        require: missing-placeholder-check\n",
+    )
+    .expect("write manifest");
+    fs::write(
+        temporary.path().join("checks.yaml"),
+        "checks_version: 1\nchecks:\n  available-placeholder-check:\n    uses: cmd/run\n    with: {script: 'exit 0'}\n",
+    )
+    .expect("write checks");
+
+    let output = ostrom()
+        .args(["validate"])
+        .arg(manifest)
+        .output()
+        .expect("run validate");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("requires undefined check `missing-placeholder-check`"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn require_resolves_a_sibling_check_by_exact_name() {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/checks-verdict/manifest.yml");
+    let output = ostrom()
+        .args(["validate"])
+        .arg(fixture)
+        .output()
+        .expect("run validate");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
