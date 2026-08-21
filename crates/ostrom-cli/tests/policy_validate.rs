@@ -204,7 +204,7 @@ fn require_naming_an_undefined_check_fails_the_load() {
     let manifest = temporary.path().join("manifest.yml");
     fs::write(
         &manifest,
-        "manifest_version: 1\noperations:\n  merge-placeholder:\n    steps:\n      - uses: gh/merge-pr\n        require: missing-placeholder-check\n",
+        "manifest_version: 1\noperations:\n  merge-placeholder:\n    steps:\n      - uses: gh/merge-pr\n        requires: missing-placeholder-check\n",
     )
     .expect("write manifest");
     fs::write(

@@ -265,7 +265,7 @@ pub struct StepDecl {
     #[serde(default, rename = "with", skip_serializing_if = "BTreeMap::is_empty")]
     pub parameters: BTreeMap<String, Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub require: Option<String>,
+    pub requires: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1120,22 +1120,22 @@ denies:
     }
 
     #[test]
-    fn step_require_is_singular_and_closed_schema() {
+    fn step_requires_is_plural_and_closed_schema() {
         let manifest = PolicyManifest::from_yaml(
-            "manifest_version: 1\noperations:\n  merge:\n    steps:\n      - uses: gh/merge-pr\n        require: placeholder-ci\n",
+            "manifest_version: 1\noperations:\n  merge:\n    steps:\n      - uses: gh/merge-pr\n        requires: placeholder-ci\n",
         )
-        .expect("singular requirement parses");
+        .expect("plural requirement parses");
         assert_eq!(
-            manifest.operations["merge"].steps[0].require.as_deref(),
+            manifest.operations["merge"].steps[0].requires.as_deref(),
             Some("placeholder-ci")
         );
 
         let error = PolicyManifest::from_yaml(
-            "manifest_version: 1\noperations:\n  merge:\n    steps:\n      - uses: gh/merge-pr\n        requires: placeholder-ci\n",
+            "manifest_version: 1\noperations:\n  merge:\n    steps:\n      - uses: gh/merge-pr\n        require: placeholder-ci\n",
         )
-        .expect_err("plural requirement is not in the schema")
+        .expect_err("singular requirement is not in the schema")
         .to_string();
-        assert!(error.contains("requires"), "{error}");
+        assert!(error.contains("require"), "{error}");
     }
 
     #[test]

@@ -189,7 +189,7 @@ fn ten_legacy_gate_strings_map_to_valid_named_check_fixtures() {
     let requirements = manifest.operations["merge-placeholder-repositories"]
         .steps
         .iter()
-        .map(|step| step.require.as_deref().expect("step cites a check"))
+        .map(|step| step.requires.as_deref().expect("step cites a check"))
         .collect::<Vec<_>>();
     assert_eq!(requirements.len(), 10);
 

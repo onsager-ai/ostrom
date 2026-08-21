@@ -153,7 +153,7 @@ fn validate_check_requirements(
         .iter()
         .flat_map(|(operation, declaration)| {
             declaration.steps.iter().filter_map(move |step| {
-                step.require
+                step.requires
                     .as_deref()
                     .map(|check| (operation.as_str(), check))
             })
