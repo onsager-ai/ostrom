@@ -19,6 +19,7 @@ mod pass_state;
 mod paths;
 mod plan;
 mod policy;
+mod policy_signature;
 mod publish;
 mod queue;
 mod repair;
@@ -60,6 +61,7 @@ pub use plan::{
 pub use policy::{
     PolicyBundle, PolicyExplanation, RequirementExplanation, RuleExplanation, SelectorProjection,
 };
+pub use policy_signature::{PolicySignatureError, sign_policy_manifest, verify_policy_manifest};
 pub use publish::{PublishDestination, PublishError};
 pub use queue::{
     QueueActionError, QueueDecision, QueueDocument, decide_queue_item, lint_queue_state,
