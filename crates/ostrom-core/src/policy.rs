@@ -1,0 +1,1277 @@
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::DeserializeOwned};
+use serde_yaml::Value;
+use thiserror::Error;
+
+pub const POLICY_MANIFEST_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyManifest {
+    pub manifest_version: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub includes: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub inputs: BTreeMap<String, InputDecl>,
+    #[serde(default, skip_serializing_if = "ManifestDefaults::is_empty")]
+    pub defaults: ManifestDefaults,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub actors: BTreeMap<String, ActorDecl>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub operations: BTreeMap<String, OperationDecl>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub grants: BTreeMap<String, RuleDecl>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub denies: BTreeMap<String, RuleDecl>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub loops: BTreeMap<String, LoopDecl>,
+}
+
+impl PolicyManifest {
+    pub fn parse_yaml(input: &str) -> Result<Self, serde_yaml::Error> {
+        serde_yaml::from_str(input)
+    }
+
+    pub fn from_yaml(input: &str) -> Result<Self, ManifestError> {
+        let manifest = Self::parse_yaml(input).map_err(ManifestError::Yaml)?;
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    pub fn to_yaml(&self) -> Result<String, serde_yaml::Error> {
+        serde_yaml::to_string(self)
+    }
+
+    pub fn validate(&self) -> Result<(), ManifestValidationError> {
+        if self.manifest_version != POLICY_MANIFEST_VERSION {
+            return Err(ManifestValidationError::ManifestVersion(
+                self.manifest_version,
+            ));
+        }
+        for (name, declaration) in &self.inputs {
+            if declaration.secret && declaration.default.is_some() {
+                return Err(ManifestValidationError::SecretDefault(name.clone()));
+            }
+            if let Some(value) = &declaration.default {
+                declaration.validate_value(value).map_err(|message| {
+                    ManifestValidationError::InputDefault {
+                        name: name.clone(),
+                        message,
+                    }
+                })?;
+            }
+        }
+        for (kind, rules) in [("grant", &self.grants), ("deny", &self.denies)] {
+            for (id, rule) in rules {
+                for actor in rule.actors.iter() {
+                    if !self.actors.contains_key(actor) {
+                        return Err(ManifestValidationError::UnknownActor {
+                            kind,
+                            rule: id.clone(),
+                            actor: actor.clone(),
+                        });
+                    }
+                }
+                for operation in rule.operations.iter() {
+                    if !self.operations.contains_key(operation) {
+                        return Err(ManifestValidationError::UnknownOperation {
+                            kind,
+                            rule: id.clone(),
+                            operation: operation.clone(),
+                        });
+                    }
+                }
+                if let Some(selector) = rule
+                    .selectors
+                    .iter()
+                    .find(|selector| selector.references_input())
+                {
+                    return Err(ManifestValidationError::InputInSelector {
+                        kind,
+                        rule: id.clone(),
+                        selector: selector.to_string(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn resolve_inputs<F>(
+        &self,
+        mut environment: F,
+    ) -> Result<BTreeMap<String, ResolvedInput>, InputResolutionError>
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        self.inputs
+            .iter()
+            .map(|(name, declaration)| {
+                declaration
+                    .resolve(|variable| environment(variable))
+                    .map(|resolved| (name.clone(), resolved))
+                    .map_err(|source| InputResolutionError::Named {
+                        name: name.clone(),
+                        source: Box::new(source),
+                    })
+            })
+            .collect()
+    }
+
+    #[must_use]
+    pub fn decide(
+        &self,
+        actor: &str,
+        operation: &str,
+        candidate: &PolicyCandidate,
+    ) -> PolicyDecision {
+        let matching_grants = matching_rules(&self.grants, actor, operation, candidate);
+        let matching_denies = matching_rules(&self.denies, actor, operation, candidate);
+        PolicyDecision {
+            granted: !matching_grants.is_empty() && matching_denies.is_empty(),
+            matching_grants,
+            matching_denies,
+        }
+    }
+
+    #[must_use]
+    pub fn selector_findings(&self, universe: &SelectorUniverse) -> Vec<SelectorFinding> {
+        let mut findings = Vec::new();
+        for (kind, rules) in [("grant", &self.grants), ("deny", &self.denies)] {
+            for (rule, declaration) in rules {
+                let unmatched = declaration.unmatched.unwrap_or_else(|| {
+                    if kind == "grant" {
+                        self.defaults.grant.unmatched
+                    } else {
+                        self.defaults.deny.unmatched
+                    }
+                });
+                let repositories = if declaration.repositories.is_empty() {
+                    vec![None]
+                } else {
+                    declaration
+                        .repositories
+                        .iter()
+                        .map(|repository| Some(repository.as_str()))
+                        .collect()
+                };
+                for selector in declaration.selectors.iter() {
+                    for repository in &repositories {
+                        match universe.validate(selector, *repository) {
+                            Ok(Some(message)) => findings.push(SelectorFinding::Empty {
+                                kind,
+                                rule: rule.clone(),
+                                selector: selector.to_string(),
+                                repository: repository.map(str::to_owned),
+                                unmatched,
+                                message,
+                            }),
+                            Ok(None) => {}
+                            Err(error) => findings.push(SelectorFinding::Error {
+                                kind,
+                                rule: rule.clone(),
+                                selector: selector.to_string(),
+                                repository: repository.map(str::to_owned),
+                                message: error.to_string(),
+                            }),
+                        }
+                    }
+                }
+            }
+        }
+        findings
+    }
+}
+
+fn matching_rules(
+    rules: &BTreeMap<String, RuleDecl>,
+    actor: &str,
+    operation: &str,
+    candidate: &PolicyCandidate,
+) -> Vec<String> {
+    rules
+        .iter()
+        .filter(|(_, rule)| rule.matches(actor, operation, candidate))
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+#[derive(Debug, Error)]
+pub enum ManifestError {
+    #[error("could not parse policy manifest: {0}")]
+    Yaml(serde_yaml::Error),
+    #[error(transparent)]
+    Invalid(#[from] ManifestValidationError),
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum ManifestValidationError {
+    #[error("unsupported manifest_version {0}; expected 1")]
+    ManifestVersion(u32),
+    #[error("secret input `{0}` may not carry a committed default")]
+    SecretDefault(String),
+    #[error("input `{name}` has an invalid default: {message}")]
+    InputDefault { name: String, message: String },
+    #[error("{kind} `{rule}` names unknown actor `{actor}`")]
+    UnknownActor {
+        kind: &'static str,
+        rule: String,
+        actor: String,
+    },
+    #[error("{kind} `{rule}` names unknown operation `{operation}`")]
+    UnknownOperation {
+        kind: &'static str,
+        rule: String,
+        operation: String,
+    },
+    #[error("{kind} `{rule}` uses input-dependent where selector `{selector}`")]
+    InputInSelector {
+        kind: &'static str,
+        rule: String,
+        selector: String,
+    },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActorDecl {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationDecl {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, InputDecl>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<StepDecl>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StepDecl {
+    pub uses: String,
+    #[serde(default, rename = "with", skip_serializing_if = "BTreeMap::is_empty")]
+    pub parameters: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoopDecl {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    pub every: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrent: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spend_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cadence_hours: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stuck_after_days: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManifestDefaults {
+    #[serde(default, skip_serializing_if = "LoopDefaults::is_empty")]
+    pub r#loop: LoopDefaults,
+    #[serde(default, skip_serializing_if = "RuleDefaults::is_grant_default")]
+    pub grant: RuleDefaults,
+    #[serde(
+        default = "RuleDefaults::deny",
+        skip_serializing_if = "RuleDefaults::is_deny_default"
+    )]
+    pub deny: RuleDefaults,
+}
+
+impl Default for ManifestDefaults {
+    fn default() -> Self {
+        Self {
+            r#loop: LoopDefaults::default(),
+            grant: RuleDefaults::default(),
+            deny: RuleDefaults::deny(),
+        }
+    }
+}
+
+impl ManifestDefaults {
+    fn is_empty(&self) -> bool {
+        self.r#loop.is_empty() && self.grant.is_grant_default() && self.deny.is_deny_default()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoopDefaults {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrent: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spend_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<u64>,
+}
+
+impl LoopDefaults {
+    fn is_empty(&self) -> bool {
+        self.concurrent.is_none() && self.spend_usd.is_none() && self.tokens.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UnmatchedPolicy {
+    Block,
+    Warn,
+    Pass,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuleDefaults {
+    #[serde(default = "default_grant_unmatched")]
+    pub unmatched: UnmatchedPolicy,
+}
+
+impl RuleDefaults {
+    fn deny() -> Self {
+        Self {
+            unmatched: UnmatchedPolicy::Block,
+        }
+    }
+
+    fn is_grant_default(&self) -> bool {
+        self.unmatched == UnmatchedPolicy::Warn
+    }
+
+    fn is_deny_default(&self) -> bool {
+        self.unmatched == UnmatchedPolicy::Block
+    }
+}
+
+impl Default for RuleDefaults {
+    fn default() -> Self {
+        Self {
+            unmatched: default_grant_unmatched(),
+        }
+    }
+}
+
+const fn default_grant_unmatched() -> UnmatchedPolicy {
+    UnmatchedPolicy::Warn
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuleDecl {
+    #[serde(default, skip_serializing_if = "NormalizedList::is_empty")]
+    pub actors: NormalizedList<String>,
+    #[serde(default, skip_serializing_if = "NormalizedList::is_empty")]
+    pub operations: NormalizedList<String>,
+    #[serde(default, skip_serializing_if = "NormalizedList::is_empty")]
+    pub repositories: NormalizedList<String>,
+    #[serde(
+        default,
+        rename = "where",
+        skip_serializing_if = "NormalizedList::is_empty"
+    )]
+    pub selectors: NormalizedList<PolicySelector>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unmatched: Option<UnmatchedPolicy>,
+}
+
+impl RuleDecl {
+    fn matches(&self, actor: &str, operation: &str, candidate: &PolicyCandidate) -> bool {
+        dimension_matches(&self.actors, actor)
+            && dimension_matches(&self.operations, operation)
+            && dimension_matches(&self.repositories, &candidate.repository)
+            && (self.selectors.is_empty()
+                || self
+                    .selectors
+                    .iter()
+                    .any(|selector| selector.matches(candidate)))
+    }
+}
+
+fn dimension_matches(values: &NormalizedList<String>, candidate: &str) -> bool {
+    values.is_empty() || values.iter().any(|value| value == candidate)
+}
+
+/// Scalar-or-list input normalized into exactly one in-memory form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedList<T>(Vec<T>);
+
+impl<T> Default for NormalizedList<T> {
+    fn default() -> Self {
+        Self(Vec::new())
+    }
+}
+
+impl<T> NormalizedList<T> {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, T> {
+        self.0.iter()
+    }
+}
+
+impl<T> From<Vec<T>> for NormalizedList<T> {
+    fn from(values: Vec<T>) -> Self {
+        Self(values)
+    }
+}
+
+impl<T> Serialize for NormalizedList<T>
+where
+    T: Serialize,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de, T> Deserialize<'de> for NormalizedList<T>
+where
+    T: DeserializeOwned,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let values = match value {
+            Value::Sequence(values) => values
+                .into_iter()
+                .map(serde_yaml::from_value)
+                .collect::<Result<Vec<_>, _>>(),
+            scalar => serde_yaml::from_value(scalar).map(|value| vec![value]),
+        };
+        values.map(Self).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InputDecl {
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub kind: Option<InputType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<Value>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub secret: bool,
+}
+
+impl InputDecl {
+    pub fn resolve<F>(&self, mut environment: F) -> Result<ResolvedInput, InputResolutionError>
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        let value = if let Some(raw) = self.env.as_deref().and_then(&mut environment) {
+            Some(self.parse_environment(&raw)?)
+        } else {
+            self.default.clone()
+        };
+        if let Some(value) = &value {
+            self.validate_value(value)
+                .map_err(InputResolutionError::Value)?;
+        }
+        Ok(ResolvedInput {
+            value,
+            secret: self.secret,
+        })
+    }
+
+    fn parse_environment(&self, raw: &str) -> Result<Value, InputResolutionError> {
+        let parsed = match self.kind.unwrap_or(InputType::String) {
+            InputType::String => Value::String(raw.to_owned()),
+            InputType::Integer => raw
+                .parse::<i64>()
+                .map(Value::from)
+                .map_err(|_| InputResolutionError::EnvironmentType(InputType::Integer))?,
+            InputType::Number => raw
+                .parse::<f64>()
+                .map(Value::from)
+                .map_err(|_| InputResolutionError::EnvironmentType(InputType::Number))?,
+            InputType::Boolean => raw
+                .parse::<bool>()
+                .map(Value::from)
+                .map_err(|_| InputResolutionError::EnvironmentType(InputType::Boolean))?,
+            kind @ (InputType::Array | InputType::Object) => {
+                let value: Value = serde_yaml::from_str(raw)
+                    .map_err(|_| InputResolutionError::EnvironmentType(kind))?;
+                value
+            }
+        };
+        Ok(parsed)
+    }
+
+    fn validate_value(&self, value: &Value) -> Result<(), String> {
+        let Some(kind) = self.kind else {
+            return Ok(());
+        };
+        let valid = match kind {
+            InputType::String => value.is_string(),
+            InputType::Integer => value.as_i64().is_some() || value.as_u64().is_some(),
+            InputType::Number => value.is_number(),
+            InputType::Boolean => value.is_bool(),
+            InputType::Array => value.is_sequence(),
+            InputType::Object => value.is_mapping(),
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(format!("expected {kind}"))
+        }
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputType {
+    String,
+    Integer,
+    Number,
+    Boolean,
+    Array,
+    Object,
+}
+
+impl fmt::Display for InputType {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::String => "string",
+            Self::Integer => "integer",
+            Self::Number => "number",
+            Self::Boolean => "boolean",
+            Self::Array => "array",
+            Self::Object => "object",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedInput {
+    pub value: Option<Value>,
+    pub secret: bool,
+}
+
+impl ResolvedInput {
+    #[must_use]
+    pub fn masked_value(&self) -> Option<Value> {
+        self.value.as_ref().map(|value| {
+            if self.secret {
+                Value::String("<secret>".to_owned())
+            } else {
+                value.clone()
+            }
+        })
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum InputResolutionError {
+    #[error("input `{name}`: {source}")]
+    Named { name: String, source: Box<Self> },
+    #[error("environment value does not have declared type {0}")]
+    EnvironmentType(InputType),
+    #[error("resolved value is invalid: {0}")]
+    Value(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SelectorPrefix {
+    Label,
+    Path,
+    Type,
+    Actor,
+    Verb,
+}
+
+impl SelectorPrefix {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Label => "label",
+            Self::Path => "path",
+            Self::Type => "type",
+            Self::Actor => "actor",
+            Self::Verb => "verb",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PolicySelector {
+    prefix: SelectorPrefix,
+    pattern: String,
+}
+
+impl PolicySelector {
+    pub fn new(value: impl Into<String>) -> Result<Self, PolicySelectorError> {
+        let value = value.into();
+        let Some((prefix, pattern)) = value.split_once(':') else {
+            return Err(PolicySelectorError::MissingPrefix);
+        };
+        let prefix = match prefix {
+            "label" => SelectorPrefix::Label,
+            "path" => SelectorPrefix::Path,
+            "type" => SelectorPrefix::Type,
+            "actor" => SelectorPrefix::Actor,
+            "verb" => SelectorPrefix::Verb,
+            unknown => return Err(PolicySelectorError::UnknownPrefix(unknown.to_owned())),
+        };
+        if pattern.is_empty() {
+            return Err(PolicySelectorError::EmptyPattern);
+        }
+        if pattern.chars().any(char::is_control) {
+            return Err(PolicySelectorError::InvalidPattern(pattern.to_owned()));
+        }
+        Ok(Self {
+            prefix,
+            pattern: pattern.to_owned(),
+        })
+    }
+
+    #[must_use]
+    pub const fn prefix(&self) -> SelectorPrefix {
+        self.prefix
+    }
+
+    #[must_use]
+    pub fn pattern(&self) -> &str {
+        &self.pattern
+    }
+
+    fn references_input(&self) -> bool {
+        self.pattern.contains("$inputs.")
+            || self.pattern.contains("${{ inputs.")
+            || self.pattern.contains("${inputs.")
+    }
+
+    fn matches(&self, candidate: &PolicyCandidate) -> bool {
+        match self.prefix {
+            SelectorPrefix::Label => candidate
+                .labels
+                .iter()
+                .any(|label| glob_matches(label, &self.pattern, false)),
+            SelectorPrefix::Path => candidate
+                .paths
+                .iter()
+                .any(|path| glob_matches(path, &self.pattern, true)),
+            SelectorPrefix::Type => candidate
+                .commit_type
+                .as_deref()
+                .is_some_and(|kind| glob_matches(kind, &self.pattern, false)),
+            SelectorPrefix::Actor => candidate
+                .actor
+                .as_deref()
+                .is_some_and(|actor| glob_matches(actor, &self.pattern, false)),
+            SelectorPrefix::Verb => candidate
+                .verb
+                .as_deref()
+                .is_some_and(|verb| glob_matches(verb, &self.pattern, false)),
+        }
+    }
+}
+
+impl fmt::Display for PolicySelector {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}:{}", self.prefix.as_str(), self.pattern)
+    }
+}
+
+impl Serialize for PolicySelector {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for PolicySelector {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum PolicySelectorError {
+    #[error("selector needs a qualified prefix")]
+    MissingPrefix,
+    #[error("unknown selector prefix: {0}")]
+    UnknownPrefix(String),
+    #[error("selector value is empty")]
+    EmptyPattern,
+    #[error("selector pattern contains a control character: {0:?}")]
+    InvalidPattern(String),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PolicyCandidate {
+    pub repository: String,
+    pub labels: Vec<String>,
+    pub paths: Vec<String>,
+    pub commit_type: Option<String>,
+    pub actor: Option<String>,
+    pub verb: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyDecision {
+    pub granted: bool,
+    pub matching_grants: Vec<String>,
+    pub matching_denies: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SelectorUniverse {
+    pub labels: BTreeMap<String, BTreeSet<String>>,
+    pub paths: BTreeMap<String, BTreeSet<String>>,
+    pub actors: BTreeSet<String>,
+    pub verbs: BTreeSet<String>,
+}
+
+impl SelectorUniverse {
+    pub fn from_manifest(
+        manifest: &PolicyManifest,
+        verbs: impl IntoIterator<Item = String>,
+    ) -> Self {
+        Self {
+            actors: manifest.actors.keys().cloned().collect(),
+            verbs: verbs.into_iter().collect(),
+            ..Self::default()
+        }
+    }
+
+    /// An error is structurally unresolvable. `Some` is a non-blocking
+    /// empty-match finding. Missing repository snapshots are skipped offline.
+    pub fn validate(
+        &self,
+        selector: &PolicySelector,
+        repository: Option<&str>,
+    ) -> Result<Option<String>, SelectorResolutionError> {
+        match selector.prefix {
+            SelectorPrefix::Label => {
+                let Some(repository) = repository else {
+                    return Ok(None);
+                };
+                let Some(labels) = self.labels.get(repository) else {
+                    return Ok(None);
+                };
+                if labels
+                    .iter()
+                    .any(|label| glob_matches(label, &selector.pattern, false))
+                {
+                    Ok(None)
+                } else {
+                    Err(SelectorResolutionError::UnknownLabel {
+                        repository: repository.to_owned(),
+                        pattern: selector.pattern.clone(),
+                    })
+                }
+            }
+            SelectorPrefix::Path => {
+                let Some(repository) = repository else {
+                    return Ok(None);
+                };
+                let Some(paths) = self.paths.get(repository) else {
+                    return Ok(None);
+                };
+                if paths
+                    .iter()
+                    .any(|path| glob_matches(path, &selector.pattern, true))
+                {
+                    Ok(None)
+                } else {
+                    Ok(Some(format!(
+                        "path selector matches no file in `{repository}`"
+                    )))
+                }
+            }
+            SelectorPrefix::Type => {
+                if CONVENTIONAL_TYPES
+                    .iter()
+                    .any(|kind| glob_matches(kind, &selector.pattern, false))
+                {
+                    Ok(None)
+                } else {
+                    Err(SelectorResolutionError::UnknownType(
+                        selector.pattern.clone(),
+                    ))
+                }
+            }
+            SelectorPrefix::Actor => resolve_named(&self.actors, selector)
+                .map(|()| None)
+                .map_err(|()| SelectorResolutionError::UnknownActor(selector.pattern.clone())),
+            SelectorPrefix::Verb => resolve_named(&self.verbs, selector)
+                .map(|()| None)
+                .map_err(|()| SelectorResolutionError::UnknownVerb(selector.pattern.clone())),
+        }
+    }
+
+    pub fn resolve(
+        &self,
+        selector: &PolicySelector,
+        candidate: &PolicyCandidate,
+    ) -> Result<SelectorMatch, SelectorResolutionError> {
+        let _ = self.validate(selector, Some(&candidate.repository))?;
+        Ok(if selector.matches(candidate) {
+            SelectorMatch::Matched
+        } else {
+            SelectorMatch::Empty
+        })
+    }
+}
+
+fn resolve_named(names: &BTreeSet<String>, selector: &PolicySelector) -> Result<(), ()> {
+    names
+        .iter()
+        .any(|name| glob_matches(name, &selector.pattern, false))
+        .then_some(())
+        .ok_or(())
+}
+
+const CONVENTIONAL_TYPES: [&str; 13] = [
+    "build",
+    "chore",
+    "ci",
+    "docs",
+    "feat",
+    "fix",
+    "marketing",
+    "perf",
+    "refactor",
+    "release",
+    "revert",
+    "style",
+    "test",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectorMatch {
+    Matched,
+    Empty,
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum SelectorResolutionError {
+    #[error("label `{pattern}` does not exist in repository `{repository}`")]
+    UnknownLabel { repository: String, pattern: String },
+    #[error("type selector matches no conventional-commit type: {0}")]
+    UnknownType(String),
+    #[error("actor selector matches no declared actor: {0}")]
+    UnknownActor(String),
+    #[error("verb selector matches no Ostrom command: {0}")]
+    UnknownVerb(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "severity", rename_all = "lowercase")]
+pub enum SelectorFinding {
+    Error {
+        kind: &'static str,
+        rule: String,
+        selector: String,
+        repository: Option<String>,
+        message: String,
+    },
+    Empty {
+        kind: &'static str,
+        rule: String,
+        selector: String,
+        repository: Option<String>,
+        unmatched: UnmatchedPolicy,
+        message: String,
+    },
+}
+
+impl SelectorFinding {
+    #[must_use]
+    pub const fn is_error(&self) -> bool {
+        matches!(self, Self::Error { .. })
+    }
+}
+
+fn glob_matches(value: &str, pattern: &str, path: bool) -> bool {
+    let value = value.to_lowercase().chars().collect::<Vec<_>>();
+    let pattern = pattern.to_lowercase().chars().collect::<Vec<_>>();
+    let mut memo = BTreeMap::new();
+    glob_matches_at(&value, &pattern, path, 0, 0, &mut memo)
+}
+
+fn glob_matches_at(
+    value: &[char],
+    pattern: &[char],
+    path: bool,
+    value_index: usize,
+    pattern_index: usize,
+    memo: &mut BTreeMap<(usize, usize), bool>,
+) -> bool {
+    if let Some(result) = memo.get(&(value_index, pattern_index)) {
+        return *result;
+    }
+    let result = if pattern_index == pattern.len() {
+        value_index == value.len()
+    } else if pattern[pattern_index] == '*' {
+        let double = path && pattern.get(pattern_index + 1) == Some(&'*');
+        let next_pattern = pattern_index + usize::from(double) + 1;
+        let skip_pattern = if double && pattern.get(next_pattern) == Some(&'/') {
+            next_pattern + 1
+        } else {
+            next_pattern
+        };
+        glob_matches_at(value, pattern, path, value_index, skip_pattern, memo)
+            || (value_index < value.len()
+                && (double || !path || value[value_index] != '/')
+                && glob_matches_at(value, pattern, path, value_index + 1, pattern_index, memo))
+    } else {
+        value_index < value.len()
+            && pattern[pattern_index] == value[value_index]
+            && glob_matches_at(
+                value,
+                pattern,
+                path,
+                value_index + 1,
+                pattern_index + 1,
+                memo,
+            )
+    };
+    memo.insert((value_index, pattern_index), result);
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BASE: &str = r#"
+manifest_version: 1
+actors:
+  builder: {}
+  gatekeeper: {}
+operations:
+  work: {steps: []}
+  merge: {steps: []}
+grants:
+  delegated:
+    actors: builder
+    operations: [work, merge]
+    repositories: placeholder-org/alpha
+    where: label:area:schema
+denies:
+  builder-cannot-merge:
+    actors: builder
+    operations: merge
+"#;
+
+    fn candidate(labels: &[&str]) -> PolicyCandidate {
+        PolicyCandidate {
+            repository: "placeholder-org/alpha".to_owned(),
+            labels: labels.iter().map(|label| (*label).to_owned()).collect(),
+            ..PolicyCandidate::default()
+        }
+    }
+
+    #[test]
+    fn scalar_fields_normalize_and_deny_wins() {
+        let manifest = PolicyManifest::from_yaml(BASE).expect("manifest parses");
+        assert!(
+            manifest
+                .decide("builder", "work", &candidate(&["area:schema"]))
+                .granted
+        );
+        let merge = manifest.decide("builder", "merge", &candidate(&["area:schema"]));
+        assert!(!merge.granted);
+        assert_eq!(merge.matching_denies, ["builder-cannot-merge"]);
+
+        let normalized = manifest.to_yaml().expect("normalizes");
+        assert!(
+            normalized.contains("actors:\n    - builder"),
+            "{normalized}"
+        );
+        assert!(
+            normalized.contains("where:\n    - label:area:schema"),
+            "{normalized}"
+        );
+    }
+
+    #[test]
+    fn every_grant_and_deny_permutation_has_the_same_decision() {
+        let header =
+            "manifest_version: 1\nactors: {builder: {}}\noperations: {work: {steps: []}}\n";
+        let grants = [
+            "  grant-label: {actors: builder, operations: work, where: label:area:schema}\n",
+            "  grant-type: {actors: builder, operations: work, where: type:docs}\n",
+            "  grant-path: {actors: builder, operations: work, where: path:protected/**}\n",
+        ];
+        let denies = [
+            "  deny-label: {actors: builder, operations: work, where: label:area:schema}\n",
+            "  deny-type: {actors: builder, operations: work, where: type:docs}\n",
+            "  deny-path: {actors: builder, operations: work, where: path:protected/**}\n",
+        ];
+        let permutations = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        let subject = PolicyCandidate {
+            paths: vec!["protected/file.txt".to_owned()],
+            commit_type: Some("docs".to_owned()),
+            ..candidate(&["area:schema"])
+        };
+        let mut expected = None;
+        for grant_order in permutations {
+            for deny_order in permutations {
+                let yaml = format!(
+                    "{header}grants:\n{}{}{}denies:\n{}{}{}",
+                    grants[grant_order[0]],
+                    grants[grant_order[1]],
+                    grants[grant_order[2]],
+                    denies[deny_order[0]],
+                    denies[deny_order[1]],
+                    denies[deny_order[2]],
+                );
+                let decision = PolicyManifest::from_yaml(&yaml)
+                    .expect("permutation parses")
+                    .decide("builder", "work", &subject);
+                assert!(!decision.granted);
+                if let Some(expected) = &expected {
+                    assert_eq!(&decision, expected);
+                } else {
+                    expected = Some(decision);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_keys_at_nested_levels_name_the_key() {
+        let cases = [
+            ("manifest_version: 1\nextra: nope\n", "extra"),
+            (
+                "manifest_version: 1\nactors:\n  builder: {nickname: nope}\n",
+                "nickname",
+            ),
+            (
+                "manifest_version: 1\ninputs:\n  value: {type: string, override: nope}\n",
+                "override",
+            ),
+            (
+                "manifest_version: 1\noperations:\n  work:\n    steps:\n      - uses: cmd/run\n        extra: nope\n",
+                "extra",
+            ),
+            (
+                "manifest_version: 1\nactors: {builder: {}}\noperations: {work: {steps: []}}\ngrants:\n  work: {actors: builder, operations: work, extra: nope}\n",
+                "extra",
+            ),
+            (
+                "manifest_version: 1\nloops:\n  sweep: {every: hourly, extra: nope}\n",
+                "extra",
+            ),
+            (
+                "manifest_version: 1\ndefaults:\n  grant: {unmatched: warn, extra: nope}\n",
+                "extra",
+            ),
+        ];
+        for (yaml, key) in cases {
+            let error = PolicyManifest::from_yaml(yaml)
+                .expect_err("unknown key fails")
+                .to_string();
+            assert!(error.contains(key), "{error}");
+        }
+    }
+
+    #[test]
+    fn unknown_version_refuses_to_load() {
+        let error =
+            PolicyManifest::from_yaml("manifest_version: 2\n").expect_err("future version fails");
+        assert!(error.to_string().contains("manifest_version 2"));
+    }
+
+    #[test]
+    fn unmatched_defaults_warn_for_grants_and_block_for_denies() {
+        for yaml in [
+            "manifest_version: 1\n",
+            "manifest_version: 1\ndefaults: {}\n",
+        ] {
+            let manifest = PolicyManifest::from_yaml(yaml).expect("defaults parse");
+            assert_eq!(manifest.defaults.grant.unmatched, UnmatchedPolicy::Warn);
+            assert_eq!(manifest.defaults.deny.unmatched, UnmatchedPolicy::Block);
+        }
+    }
+
+    #[test]
+    fn input_env_precedes_default_and_secret_is_masked() {
+        let manifest = PolicyManifest::from_yaml(
+            "manifest_version: 1\ninputs:\n  count: {type: integer, env: COUNT, default: 2}\n  token: {type: string, env: TOKEN, secret: true}\n",
+        )
+        .expect("inputs parse");
+        let resolved = manifest
+            .resolve_inputs(|name| match name {
+                "COUNT" => Some("7".to_owned()),
+                "TOKEN" => Some("placeholder-secret".to_owned()),
+                _ => None,
+            })
+            .expect("inputs resolve");
+        assert_eq!(resolved["count"].value, Some(Value::from(7)));
+        assert_eq!(
+            resolved["token"].masked_value(),
+            Some(Value::String("<secret>".to_owned()))
+        );
+    }
+
+    #[test]
+    fn secret_default_fails_validation() {
+        let error = PolicyManifest::from_yaml(
+            "manifest_version: 1\ninputs:\n  token: {type: string, secret: true, default: placeholder}\n",
+        )
+        .expect_err("secret default fails");
+        assert!(error.to_string().contains("token"));
+        assert!(error.to_string().contains("committed default"));
+    }
+
+    #[test]
+    fn input_in_where_fails_validation() {
+        let yaml = BASE.replace("label:area:schema", "label:$inputs.area");
+        let error = PolicyManifest::from_yaml(&yaml).expect_err("input selector fails");
+        assert!(error.to_string().contains("input-dependent where"));
+        assert!(error.to_string().contains("$inputs.area"));
+    }
+
+    #[test]
+    fn selector_prefix_set_is_closed_and_names_unknown_prefix() {
+        for prefix in ["title", "scope", "check", "ref", "anything"] {
+            let error =
+                PolicySelector::new(format!("{prefix}:value")).expect_err("prefix must fail");
+            assert_eq!(error, PolicySelectorError::UnknownPrefix(prefix.to_owned()));
+            assert!(error.to_string().contains(prefix));
+        }
+    }
+
+    #[test]
+    fn label_absence_is_error_but_path_candidate_absence_is_empty() {
+        let mut universe = SelectorUniverse::default();
+        universe.labels.insert(
+            "placeholder-org/alpha".to_owned(),
+            BTreeSet::from(["area:schema".to_owned()]),
+        );
+        universe.paths.insert(
+            "placeholder-org/alpha".to_owned(),
+            BTreeSet::from(["docs/guide.md".to_owned()]),
+        );
+        let missing = PolicySelector::new("label:not-present").expect("valid syntax");
+        assert!(matches!(
+            universe.validate(&missing, Some("placeholder-org/alpha")),
+            Err(SelectorResolutionError::UnknownLabel { .. })
+        ));
+
+        let path = PolicySelector::new("path:docs/**").expect("valid syntax");
+        assert_eq!(
+            universe
+                .resolve(&path, &candidate(&[]))
+                .expect("path is resolvable"),
+            SelectorMatch::Empty
+        );
+    }
+
+    #[test]
+    fn actor_type_and_verb_resolvers_use_closed_universes() {
+        let manifest = PolicyManifest::from_yaml(BASE).expect("manifest parses");
+        let universe =
+            SelectorUniverse::from_manifest(&manifest, ["validate".to_owned(), "merge".to_owned()]);
+        for selector in ["actor:builder", "type:feat", "verb:validate"] {
+            assert_eq!(
+                universe
+                    .validate(
+                        &PolicySelector::new(selector).expect("syntax"),
+                        Some("placeholder-org/alpha")
+                    )
+                    .expect("resolves"),
+                None
+            );
+        }
+        assert!(
+            universe
+                .validate(
+                    &PolicySelector::new("verb:not-a-command").expect("syntax"),
+                    None
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn glob_path_double_star_spans_directories() {
+        assert!(glob_matches(
+            "crates/core/src/lib.rs",
+            "crates/**/lib.rs",
+            true
+        ));
+        assert!(glob_matches("docs/guide.md", "docs/**", true));
+        assert!(glob_matches(".env", "**/.env", true));
+        assert!(!glob_matches("src/docs/guide.md", "docs/*", true));
+    }
+
+    #[test]
+    fn dead_tools_selector_is_a_named_non_blocking_finding() {
+        let manifest = PolicyManifest::from_yaml(
+            "manifest_version: 1\nactors: {builder: {}}\noperations: {work: {steps: []}}\ngrants:\n  retired-tools:\n    actors: builder\n    operations: work\n    repositories: placeholder-org/alpha\n    where: path:**/*-tools*\n",
+        )
+        .expect("manifest parses");
+        let mut universe = SelectorUniverse::from_manifest(&manifest, ["validate".to_owned()]);
+        universe.paths.insert(
+            "placeholder-org/alpha".to_owned(),
+            BTreeSet::from(["src/lib.rs".to_owned()]),
+        );
+        let findings = manifest.selector_findings(&universe);
+        assert_eq!(findings.len(), 1);
+        assert!(!findings[0].is_error());
+        assert!(matches!(
+            findings[0],
+            SelectorFinding::Empty {
+                unmatched: UnmatchedPolicy::Warn,
+                ..
+            }
+        ));
+        assert!(format!("{:?}", findings[0]).contains("retired-tools"));
+        assert!(format!("{:?}", findings[0]).contains("*-tools"));
+    }
+}

@@ -15,6 +15,7 @@ mod check;
 mod dispatch;
 mod domain;
 mod plan;
+mod policy;
 mod store;
 mod work_graph;
 
@@ -44,6 +45,13 @@ pub use plan::{
     MetWhenStatus, MilestoneFact, MilestoneInput, MovementFact, PLAN_VERSION, ProgressFact,
     QueueItem, Reading, cited_fact_basis, compose_ranking, consequence, derive_goal_facts,
     fact_table, mechanical_ranking, validate_assessment,
+};
+pub use policy::{
+    ActorDecl, InputDecl, InputResolutionError, InputType, LoopDecl, ManifestDefaults,
+    ManifestError, ManifestValidationError, NormalizedList, OperationDecl, PolicyCandidate,
+    PolicyDecision, PolicyManifest, PolicySelector, PolicySelectorError, ResolvedInput, RuleDecl,
+    RuleDefaults, SelectorFinding, SelectorMatch, SelectorPrefix, SelectorResolutionError,
+    SelectorUniverse, StepDecl, UnmatchedPolicy,
 };
 pub use store::{
     AttemptOutcome, CHECK_STORE_SCHEMA_VERSION, CheckRun, CheckRunId, CheckStore, CheckStoreFault,
