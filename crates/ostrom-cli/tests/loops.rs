@@ -187,3 +187,42 @@ fn unit_names(directory: &Path) -> Vec<String> {
     names.sort();
     names
 }
+
+/// Rendering writes unit files; it must never switch one on.
+///
+/// This is the boundary `dotclaude/systemd/enabled-timers` exists to hold. Its
+/// header records why: before it, writing a unit file into that repository was
+/// "sufficient to get arbitrary code running on a schedule as this user, within
+/// 15 minutes, with nothing in between — and agents write files in this
+/// repository."
+///
+/// `sys/enable-loop` is ungrantable, so no operation can confer enabling. That
+/// covers the manifest. This covers the renderer: today it holds because the
+/// render path simply contains no activation call, and a property that holds by
+/// absence is one a later change removes without noticing.
+#[test]
+fn the_loop_renderer_never_activates_a_unit() {
+    let source = include_str!("../src/main.rs");
+    let start = source
+        .find("fn run_loops_command")
+        .expect("the loops command exists");
+    let region = &source[start..];
+    let end = region[1..]
+        .find("\nfn ")
+        .map_or(region.len(), |offset| offset + 1);
+    let body = &region[..end];
+
+    for forbidden in [
+        "systemctl",
+        "enable --now",
+        "daemon-reload",
+        "MANDATE_SYSTEMCTL_BIN",
+    ] {
+        assert!(
+            !body.contains(forbidden),
+            "the loop renderer must not reference `{forbidden}`: rendering a unit \
+             and activating one are different authorities, and only the second is \
+             the principal's"
+        );
+    }
+}
