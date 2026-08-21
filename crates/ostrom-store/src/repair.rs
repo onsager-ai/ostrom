@@ -23,6 +23,28 @@ const LIST_PERMISSIONS: &str = "metadata:read,pull_requests:read";
 const CHECK_PERMISSIONS: &str = "metadata:read,pull_requests:read,checks:read,statuses:read";
 const FETCH_PERMISSIONS: &str = "metadata:read,contents:read";
 const PUSH_PERMISSIONS: &str = "metadata:read,contents:write";
+const BASE_CHECK_QUERY: &str = r#"
+query($owner: String!, $name: String!, $qualifiedName: String!) {
+  repository(owner: $owner, name: $name) {
+    ref(qualifiedName: $qualifiedName) {
+      target {
+        ... on Commit {
+          oid
+          statusCheckRollup {
+            contexts(first: 100) {
+              nodes {
+                ... on CheckRun { conclusion status }
+                ... on StatusContext { state }
+              }
+              pageInfo { hasNextPage }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"#;
 
 #[derive(Debug, Clone)]
 pub struct RepairOptions {
@@ -68,6 +90,7 @@ struct Candidate {
     head_branch: String,
     base_branch: String,
     listed_head_sha: String,
+    listed_base_sha: String,
 }
 
 #[derive(Debug, Default)]
@@ -257,8 +280,7 @@ fn collect_candidates(
     let role_line = Regex::new(r"(^|\n)Ostrom-Role: builder(\r?\n|$)")
         .expect("builder role marker regex is valid");
     for pull_request in pull_requests {
-        if pull_request.get("mergeable").and_then(Value::as_str) != Some("CONFLICTING")
-            || !machine_authored(pull_request)
+        if !machine_authored(pull_request)
             || !pull_request
                 .get("body")
                 .and_then(Value::as_str)
@@ -270,12 +292,13 @@ fn collect_candidates(
         {
             continue;
         }
-        let candidate = Candidate {
+        let mut candidate = Candidate {
             repository: repository.to_owned(),
             number: jq_text(pull_request.get("number")),
             head_branch: jq_text(pull_request.get("headRefName")),
             base_branch: jq_text(pull_request.get("baseRefName")),
             listed_head_sha: jq_default_text(pull_request.get("headRefOid")),
+            listed_base_sha: String::new(),
         };
         let checks = context.authenticated(
             repository,
@@ -332,7 +355,195 @@ fn collect_candidates(
             continue;
         };
         if completed_green(rollup) {
-            candidates.push(candidate);
+            if pull_request.get("mergeable").and_then(Value::as_str) == Some("CONFLICTING") {
+                candidates.push(candidate);
+            } else {
+                summary.skipped += 1;
+                context.trace_candidate(
+                    &candidate,
+                    "green-head",
+                    &candidate.listed_head_sha,
+                    &candidate.listed_base_sha,
+                    &[],
+                    None,
+                    json!({"reason": "head checks are green and no conflicting base-forward repair is needed"}),
+                )?;
+            }
+            continue;
+        }
+
+        let Some((owner, name)) = repository.split_once('/') else {
+            summary.skipped += 1;
+            context.trace_candidate(
+                &candidate,
+                "check-fetch-malformed",
+                &candidate.listed_head_sha,
+                &candidate.listed_base_sha,
+                &[],
+                Some(1),
+                json!({"reason": "base branch check state was malformed"}),
+            )?;
+            continue;
+        };
+        let query = format!("query={BASE_CHECK_QUERY}");
+        let owner = format!("owner={owner}");
+        let name = format!("name={name}");
+        let qualified_name = format!("qualifiedName=refs/heads/{}", candidate.base_branch);
+        let base_checks = context.authenticated(
+            repository,
+            CHECK_PERMISSIONS,
+            &[
+                "gh",
+                "api",
+                "graphql",
+                "-f",
+                &query,
+                "-F",
+                &owner,
+                "-F",
+                &name,
+                "-F",
+                &qualified_name,
+            ],
+        );
+        if base_checks.code != 0 {
+            summary.skipped += 1;
+            context.stderr.push_str(&format!(
+                "mandate repair: failed to read base checks for {repository}#{} (rc={})\n",
+                candidate.number, base_checks.code
+            ));
+            context.trace_candidate(
+                &candidate,
+                "check-fetch-failed",
+                &candidate.listed_head_sha,
+                &candidate.listed_base_sha,
+                &[],
+                Some(base_checks.code),
+                json!({"reason": "base branch check state could not be read"}),
+            )?;
+            continue;
+        }
+        let parsed = serde_json::from_slice::<Value>(&base_checks.stdout).ok();
+        let commit = parsed
+            .as_ref()
+            .and_then(|value| value.pointer("/data/repository/ref/target"))
+            .and_then(Value::as_object);
+        let observed_oid = commit
+            .and_then(|object| object.get("oid"))
+            .and_then(Value::as_str);
+        let rollup = commit
+            .and_then(|object| object.get("statusCheckRollup"))
+            .and_then(|rollup| {
+                if rollup.is_null() {
+                    return Some(&[][..]);
+                }
+                let contexts = rollup.get("contexts")?;
+                if contexts
+                    .pointer("/pageInfo/hasNextPage")
+                    .and_then(Value::as_bool)
+                    != Some(false)
+                {
+                    return None;
+                }
+                contexts.get("nodes")?.as_array().map(Vec::as_slice)
+            });
+        let Some(rollup) = rollup.filter(|_| observed_oid.is_some_and(|oid| !oid.is_empty()))
+        else {
+            summary.skipped += 1;
+            context.stderr.push_str(&format!(
+                "mandate repair: base check state for {repository}#{} was malformed\n",
+                candidate.number
+            ));
+            context.trace_candidate(
+                &candidate,
+                "check-fetch-malformed",
+                &candidate.listed_head_sha,
+                &candidate.listed_base_sha,
+                &[],
+                Some(1),
+                json!({"reason": "base branch check state was malformed"}),
+            )?;
+            continue;
+        };
+        candidate.listed_base_sha = observed_oid.unwrap_or_default().to_owned();
+        if !completed_green(rollup) {
+            summary.skipped += 1;
+            context.trace_candidate(
+                &candidate,
+                "red-head-red-base",
+                &candidate.listed_head_sha,
+                &candidate.listed_base_sha,
+                &[],
+                None,
+                json!({"reason": "head and base branch checks are not green"}),
+            )?;
+            continue;
+        }
+
+        let comparison_endpoint = format!(
+            "repos/{repository}/compare/{}...{}",
+            candidate.listed_head_sha, candidate.listed_base_sha
+        );
+        let comparison = context.authenticated(
+            repository,
+            FETCH_PERMISSIONS,
+            &["gh", "api", &comparison_endpoint],
+        );
+        if comparison.code != 0 {
+            summary.skipped += 1;
+            context.stderr.push_str(&format!(
+                "mandate repair: failed to compare head and base for {repository}#{} (rc={})\n",
+                candidate.number, comparison.code
+            ));
+            context.trace_candidate(
+                &candidate,
+                "comparison-fetch-failed",
+                &candidate.listed_head_sha,
+                &candidate.listed_base_sha,
+                &[],
+                Some(comparison.code),
+                json!({"reason": "head and base ancestry could not be read"}),
+            )?;
+            continue;
+        }
+        let comparison_status = serde_json::from_slice::<Value>(&comparison.stdout)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            });
+        match comparison_status.as_deref() {
+            Some("ahead" | "diverged") => candidates.push(candidate),
+            Some("behind" | "identical") => {
+                summary.skipped += 1;
+                context.trace_candidate(
+                    &candidate,
+                    "not-behind-base",
+                    &candidate.listed_head_sha,
+                    &candidate.listed_base_sha,
+                    &[],
+                    None,
+                    json!({"reason": "head already contains the checked base commit"}),
+                )?;
+            }
+            _ => {
+                summary.skipped += 1;
+                context.stderr.push_str(&format!(
+                    "mandate repair: head/base comparison for {repository}#{} was malformed\n",
+                    candidate.number
+                ));
+                context.trace_candidate(
+                    &candidate,
+                    "comparison-fetch-malformed",
+                    &candidate.listed_head_sha,
+                    &candidate.listed_base_sha,
+                    &[],
+                    Some(1),
+                    json!({"reason": "head and base ancestry was malformed"}),
+                )?;
+            }
         }
     }
     Ok(())
