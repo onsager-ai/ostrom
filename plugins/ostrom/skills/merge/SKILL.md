@@ -132,13 +132,67 @@ caller's, is always about delivery, and never converts `inconclusive` into
 
 ## 4. Apply exactly the verdict
 
+Every attempted write has one operation name and one exact requested scope:
+
+- `verdict-comment` — `metadata:read,pull_requests:write`
+- `merge` — `metadata:read,contents:write,pull_requests:write`
+
+When GitHub explicitly refuses the requested authority — including `Resource
+not accessible by integration`, an `addComment` or `mergePullRequest`
+permission error, or an exit-`111` scope-refusal from the credential boundary —
+append `write-denied` before returning. Its fact object is exactly the factual
+shape below; `operation`, `requested_scope`, and the command's observed
+`exit_code` must never exist only in narration:
+
+```sh
+ostrom trace append write-denied \
+  "$(jq -cn --arg repo "$repository" --argjson pr "$pr_number" \
+    --arg head_sha "$head_sha" --arg operation "$write_operation" \
+    --arg requested_scope "$write_scope" --argjson exit_code "$write_exit" \
+    '{outcome: "permission-denied", repo: $repo, pr: $pr,
+      head_sha: $head_sha, operation: $operation,
+      requested_scope: $requested_scope, exit_code: $exit_code}')" \
+  '{}'
+```
+
+Return `permission-denied` and that fact object to `/ostrom:gatekeep`. For a
+non-permission command failure, append `write-failed` with the same fields and
+`outcome: "write-failed"`, then return `write-failed` and its fact object. If
+either failure record cannot be appended, return a pass-ending trace error
+instead; do not continue to another write after an invisible failure.
+
 - **Pass (exit 0)** — perform these four steps in order, routing each `gh`
   call through `ostrom credential` as in step 2 so it runs with a token minted for
   this repository rather than this session's own empty credentials:
   1. Record the verdict on the pull request as a comment, writing it to a
      temporary file first so no PR-controlled text is interpolated into a
-     shell command:
-     `ostrom credential gatekeeper "$repository" --repositories "$repository" --permissions metadata:read,issues:write,pull_requests:read -- gh pr comment <PR number> --repo <owner/repo> --body-file <file>`.
+     shell command. Set `write_operation="verdict-comment"` and
+     `write_scope="metadata:read,pull_requests:write"`, then run exactly:
+
+     ```sh
+     if ostrom credential gatekeeper "$repository" \
+       --repositories "$repository" \
+       --permissions metadata:read,pull_requests:write -- \
+       gh pr comment "$pr_number" --repo "$repository" \
+         --body-file "$comment_file"; then
+       write_exit=0
+     else
+       write_exit=$?
+     fi
+     ```
+
+     `gh pr comment` resolves the pull request node and invokes GraphQL
+     `addComment` against that pull request subject. GitHub assigns pull
+     request comments to the Pull requests permission, so `pull_requests:write`
+     is the single write permission this operation needs. Do not request
+     `issues:write`, `contents:write`, or any unrelated write permission.
+
+     If the comment command fails, record and return `permission-denied` or
+     `write-failed` as defined above. **The verdict comment is an audit
+     prerequisite for merge: a failed comment must block the merge, and the
+     merge credential must not be minted or invoked.** A merge without its
+     visible verdict would be an unexplained irreversible action. This coupling
+     is deliberate, not an incidental consequence of command ordering.
 
      **Do not approve.** `gh pr review --approve` is not part of this
      protocol and must not be added back. Every delivery role authenticates
@@ -152,8 +206,28 @@ caller's, is always about delivery, and never converts `inconclusive` into
      comment, which a human browsing GitHub can see, and the `decision-taken`
      record below, which is machine-readable and carries a reversal pointer
      an approval never had.
-  2. Then run
-     `ostrom credential gatekeeper "$repository" --repositories "$repository" --permissions metadata:read,contents:write,pull_requests:write -- gh pr merge <PR number> --repo <owner/repo>`.
+  2. Only after the comment succeeds, set `write_operation="merge"` and
+     `write_scope="metadata:read,contents:write,pull_requests:write"`, then run:
+
+     ```sh
+     if ostrom credential gatekeeper "$repository" \
+       --repositories "$repository" \
+       --permissions metadata:read,contents:write,pull_requests:write -- \
+       gh pr merge "$pr_number" --repo "$repository"; then
+       write_exit=0
+     else
+       write_exit=$?
+     fi
+     ```
+
+     `gh pr merge` reads the pull request and invokes GraphQL
+     `mergePullRequest`. Pull requests write authorizes the PR mutation and
+     Contents write authorizes the resulting base-branch content change; no
+     Issues permission is involved. If the merge command fails, record and
+     return `permission-denied` or `write-failed` as defined above. The verdict
+     comment remains a truthful record of the attempted delivery, but the
+     candidate action is not `merged`.
+
      Do not pass `--body` here to stamp a gatekeeper role trailer. On a squash
      merge `--body` *replaces* the default commit message rather than appending
      to it, and that default is where the builder's own commits — including
@@ -353,11 +427,11 @@ caller's, is always about delivery, and never converts `inconclusive` into
   The exception reason already appears in the verdict output and the
   `gate-verdict-consumed` trace fact.
 - **Fail (exit 1)** — if `already_judged=false`, leave the complete gate output
-  as one PR comment using
-  `ostrom credential gatekeeper "$repository" --repositories "$repository" --permissions metadata:read,issues:write,pull_requests:read -- gh pr comment <PR number> --repo <owner/repo> --body-file <file>`;
-  use a temporary file so PR-controlled text is never interpolated into a
-  shell command. If `already_judged=true`, do not post again. Stop in both
-  cases.
+  as one PR comment using the same `verdict-comment` operation and exact
+  `metadata:read,pull_requests:write` scope declared above; use a temporary file
+  so PR-controlled text is never interpolated into a shell command. Apply the
+  same `permission-denied` / `write-failed` recording rules if the comment is
+  refused. If `already_judged=true`, do not post again. Stop in both cases.
 - **Inconclusive (exit 2)** — address the principal and emit exactly this
   dossier shape, populated from the gate's unobservable condition details:
 

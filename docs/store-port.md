@@ -34,6 +34,33 @@ never run. Implementations key idempotency by `run_id`. The in-tree
 `ostrom-store::JsonlCheckStore` appends compact records to
 `check-runs.jsonl` beneath the resolved XDG state root (or `OSTROM_HOME`).
 
+The lifecycle event stream has a third `ostrom-core::EventStore` boundary.
+Producers submit an `EventInput` containing only a dot-namespaced
+`domain.past_tense` type and a fact payload. The store supplies the envelope
+metadata `{ v, type, run_id, seq, ts, payload }`; in particular, a producer has
+no representation for `seq`. Sequence numbers start at one within each run and
+are assigned only when a distinct event is stored, so a consumer can detect a
+missing event rather than silently render a hole. An identical replay in the
+same run returns `Unchanged` and writes no bytes.
+
+Event types are open strings rather than a closed enum. An implementation must
+retain a well-formed type it does not recognize, while a record missing any
+envelope field fails as `MalformedRecord`. Event payload construction and
+deserialization reject narration-shaped fields recursively. There is no
+`reason`, prompt text, tool output, free-form detail, or narration field in the
+public event shapes. The local trace adapter may continue to hold those values,
+but they never cross `EventStore`.
+
+The in-tree `ostrom-store::JsonlEventStore` is the reference adapter. It writes
+compact, newline-terminated envelopes to `events.jsonl` beneath the resolved
+XDG state root (or `OSTROM_HOME`) with private file permissions. Existing trace
+emission passes its fact projection through this adapter and still writes the
+local `sprint.jsonl` record, including narration, with exactly the established
+bytes. The nine transported trace kinds map to `pass.started`, `pass.ended`,
+`item.selected`, `work.dispatched`, `work.completed`, `work.failed`,
+`artifact.produced`, `gate-verdict.consumed`, and `pr.repair`; the adapter does
+not classify an item, select work, or compute a verdict.
+
 ## Out-of-tree implementations
 
 Consumers should pin a Git revision of this repository and depend on

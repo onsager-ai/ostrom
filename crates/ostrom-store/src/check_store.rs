@@ -52,26 +52,11 @@ impl JsonlCheckStore {
         self.read_records()
     }
 
-    fn find_record(&self, run_id: &CheckRunId) -> Result<Option<CheckRun>, CheckStoreFault> {
-        if !self.journal.exists() {
-            return Ok(None);
-        }
-        let file = fs::File::open(&self.journal).map_err(|_| CheckStoreFault::Read)?;
-        for line in BufReader::new(file).lines() {
-            let line = line.map_err(|_| CheckStoreFault::Read)?;
-            let identity: StoredRunIdentity =
-                serde_json::from_str(&line).map_err(|_| CheckStoreFault::MalformedRecord)?;
-            if &identity.run_id == run_id {
-                return Self::decode_record(&line).map(Some);
-            }
-        }
-        Ok(None)
-    }
-}
-
-#[async_trait]
-impl CheckStore for JsonlCheckStore {
-    async fn write_run(&mut self, run: &CheckRun) -> Result<WriteDisposition, CheckStoreFault> {
+    /// Append one complete executor pass from synchronous command surfaces.
+    ///
+    /// The async store port delegates to this same implementation, so the CLI
+    /// producer and substrate conformance tests share one transaction path.
+    pub fn append_run(&mut self, run: &CheckRun) -> Result<WriteDisposition, CheckStoreFault> {
         if run.schema_version != CHECK_STORE_SCHEMA_VERSION {
             return Err(CheckStoreFault::UnsupportedSchema);
         }
@@ -95,6 +80,29 @@ impl CheckStore for JsonlCheckStore {
         file.write_all(&bytes)
             .map_err(|_| CheckStoreFault::PayloadWrite)?;
         Ok(WriteDisposition::Written)
+    }
+
+    fn find_record(&self, run_id: &CheckRunId) -> Result<Option<CheckRun>, CheckStoreFault> {
+        if !self.journal.exists() {
+            return Ok(None);
+        }
+        let file = fs::File::open(&self.journal).map_err(|_| CheckStoreFault::Read)?;
+        for line in BufReader::new(file).lines() {
+            let line = line.map_err(|_| CheckStoreFault::Read)?;
+            let identity: StoredRunIdentity =
+                serde_json::from_str(&line).map_err(|_| CheckStoreFault::MalformedRecord)?;
+            if &identity.run_id == run_id {
+                return Self::decode_record(&line).map(Some);
+            }
+        }
+        Ok(None)
+    }
+}
+
+#[async_trait]
+impl CheckStore for JsonlCheckStore {
+    async fn write_run(&mut self, run: &CheckRun) -> Result<WriteDisposition, CheckStoreFault> {
+        self.append_run(run)
     }
 
     async fn runs(&self) -> Result<Vec<CheckRun>, CheckStoreFault> {

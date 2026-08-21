@@ -1,0 +1,5 @@
+grant: dev-skills-builder
+actors: builder
+operations: work
+repositories: onsager-ai/dev-skills
+where: label:bug

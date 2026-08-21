@@ -1,0 +1,3 @@
+actor: builder
+name: Builder
+description: Implements delegated work.

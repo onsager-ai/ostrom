@@ -422,6 +422,12 @@ fn roles_receive_their_permission_modes_and_wakes_retain_one_identity() {
 fn wrapper_outcome_follows_inner_protocol_evidence() {
     let cases = [
         ("", true, "no-op", Some("blocked")),
+        (
+            "printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"permission_denials\":[{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"ostrom sweep\"}}]}'",
+            true,
+            "permission-denied",
+            None,
+        ),
         ("exit 42", false, "failed", None),
         (
             concat!(
@@ -467,6 +473,25 @@ fn wrapper_outcome_follows_inner_protocol_evidence() {
     let terminal = gatekeeper.trace().pop().expect("gatekeeper terminal");
     assert_eq!(terminal["fact"]["outcome"], "no-op");
     assert_eq!(terminal["fact"]["reason"], "blocked");
+}
+
+#[test]
+fn permission_denial_overrides_partial_inner_protocol_evidence() {
+    let fixture = Fixture::new(concat!(
+        "printf '%s\\n' '{\"ts\":\"2026-08-01T00:00:00Z\",\"kind\":\"pass-started\",\"fact\":{\"owner\":\"builder-inner-wake1\"},\"narration\":{}}' >>\"$OSTROM_HOME/sprint.jsonl\"\n",
+        "printf '%s\\n' '{\"type\":\"result\",\"total_cost_usd\":0.5,\"permission_denials\":[{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"ostrom repair-prs owner\"}}]}'"
+    ));
+    assert!(
+        fixture
+            .command()
+            .status()
+            .expect("run denied pass")
+            .success()
+    );
+    let terminal = fixture.trace().pop().expect("denied terminal row");
+    assert_eq!(terminal["fact"]["outcome"], "permission-denied");
+    assert!(terminal["fact"].get("reason").is_none());
+    assert_eq!(terminal["fact"]["cost_usd"], 0.5);
 }
 
 #[test]
@@ -542,6 +567,66 @@ fn daily_cap_uses_only_valid_costs_on_the_pinned_day() {
 
 const HOSTILE_ENV_CHILD: &str = "OSTROM_TEST_HOSTILE_ENV_CHILD";
 
+fn normalize_libtest_durations(output: &[u8]) -> Vec<u8> {
+    const SUMMARY_PREFIX: &[u8] = b"test result: ";
+    const DURATION_PREFIX: &[u8] = b"; finished in ";
+
+    let mut normalized = Vec::with_capacity(output.len());
+    for line in output.split_inclusive(|byte| *byte == b'\n') {
+        if !line.starts_with(SUMMARY_PREFIX) {
+            normalized.extend_from_slice(line);
+            continue;
+        }
+
+        let Some(prefix_offset) = line
+            .windows(DURATION_PREFIX.len())
+            .position(|window| window == DURATION_PREFIX)
+        else {
+            normalized.extend_from_slice(line);
+            continue;
+        };
+        let duration_start = prefix_offset + DURATION_PREFIX.len();
+        let Some(seconds_offset) = line[duration_start..].iter().position(|byte| *byte == b's')
+        else {
+            normalized.extend_from_slice(line);
+            continue;
+        };
+        let duration_end = duration_start + seconds_offset;
+        let duration = &line[duration_start..duration_end];
+        if duration.is_empty()
+            || !duration
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || *byte == b'.')
+        {
+            normalized.extend_from_slice(line);
+            continue;
+        }
+
+        normalized.extend_from_slice(&line[..duration_start]);
+        normalized.extend_from_slice(b"<duration>");
+        normalized.extend_from_slice(&line[duration_end..]);
+    }
+    normalized
+}
+
+#[test]
+fn libtest_duration_normalization_is_narrow() {
+    let output = b"test result: ok. 1 passed; 0 failed; finished in 0.14s\n\
+operator result: finished in 0.14s\n";
+    assert_eq!(
+        normalize_libtest_durations(output),
+        b"test result: ok. 1 passed; 0 failed; finished in <duration>s\n\
+operator result: finished in 0.14s\n"
+    );
+
+    let changed_result = b"test result: FAILED. 0 passed; 1 failed; finished in 0.20s\n\
+operator result: finished in 0.14s\n";
+    assert_ne!(
+        normalize_libtest_durations(output),
+        normalize_libtest_durations(changed_result)
+    );
+}
+
 #[test]
 fn polluted_operator_environment_cannot_change_a_pass_result() {
     if env::var_os(HOSTILE_ENV_CHILD).is_some() {
@@ -591,6 +676,12 @@ fn polluted_operator_environment_cannot_change_a_pass_result() {
     let polluted = run(true);
     assert!(clean.status.success());
     assert!(polluted.status.success());
-    assert_eq!(clean.stdout, polluted.stdout);
-    assert_eq!(clean.stderr, polluted.stderr);
+    assert_eq!(
+        normalize_libtest_durations(&clean.stdout),
+        normalize_libtest_durations(&polluted.stdout)
+    );
+    assert_eq!(
+        normalize_libtest_durations(&clean.stderr),
+        normalize_libtest_durations(&polluted.stderr)
+    );
 }

@@ -13,6 +13,7 @@ mod judgment;
 mod plugin_surface;
 mod process;
 mod registry;
+mod role_allowlists;
 mod shell_retirement;
 mod skill_version_bump;
 
@@ -29,6 +30,10 @@ pub use judgment::{
 pub use plugin_surface::{PluginSurfaceReport, PluginSurfaceViolation, check_plugin_surface};
 pub use registry::{
     ActionFault, ActionOutcome, ActionProvider, ActionRegistry, PreparedAction, PreparedCheck,
+};
+pub use role_allowlists::{
+    RoleAllowlistReport, RoleAllowlistViolation, check_modeled_role_allowlists,
+    check_role_allowlists,
 };
 pub use shell_retirement::{ShellFile, ShellRetirementReport, check_shell_retirement};
 pub use skill_version_bump::{

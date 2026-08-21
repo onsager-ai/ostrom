@@ -1,0 +1,5 @@
+grant: chreode-builder
+actors: builder
+operations: work
+repositories: onsager-ai/chreode
+where: label:area:platform

@@ -544,6 +544,63 @@ fn duplicate_and_concurrency_guards_release_the_new_item_lease() {
 }
 
 #[test]
+fn repository_capacity_reaps_only_stale_non_live_orders() {
+    let stale_trace = |order: &str| {
+        format!(
+            "{{\"ts\":\"2026-07-31T00:00:00Z\",\"kind\":\"work-dispatched\",\"fact\":{{\"schema_version\":1,\"item_id\":\"example-org/example-repo#9\",\"order_id\":{order:?},\"unit_name\":\"ostrom-implementer-prior\",\"backend\":\"systemd\",\"cost_ceiling_usd\":1,\"token_ceiling\":1000}},\"narration\":{{}}}}\n"
+        )
+    };
+
+    let missing = Fixture::new();
+    fs::write(
+        missing.state.join("sprint.jsonl"),
+        stale_trace("placeholder-stale-order"),
+    )
+    .expect("write stale trace");
+    let systemctl = missing.root.path().join("systemctl-stub");
+    executable(
+        &systemctl,
+        "if [ \"${2:-}\" = show ]; then exit 4; fi\nexit 0",
+    );
+    let output = run(missing
+        .command()
+        .env("OSTROM_TEST_BRANCH_PAGE_1", default_page())
+        .env("MANDATE_SYSTEMCTL_BIN", &systemctl)
+        .env("MANDATE_IMPLEMENTER_STARTUP_GRACE_MILLISECONDS", "0"));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let trace = missing.trace();
+    assert!(trace.iter().any(|row| {
+        row["kind"] == "work-failed"
+            && row["fact"]["order_id"] == "placeholder-stale-order"
+            && row["fact"]["reason"] == "stale-order-reaped"
+    }));
+    assert!(trace.iter().any(|row| row["kind"] == "work-dispatched"));
+
+    let live = Fixture::new();
+    fs::write(
+        live.state.join("sprint.jsonl"),
+        stale_trace("placeholder-live-order"),
+    )
+    .expect("write live trace");
+    let systemctl = live.root.path().join("systemctl-stub");
+    executable(
+        &systemctl,
+        "printf '%s\\n' 'ActiveState=active' 'ExecMainCode=' 'ExecMainStatus=0'",
+    );
+    let output = run(live
+        .command()
+        .env("OSTROM_TEST_BRANCH_PAGE_1", default_page())
+        .env("MANDATE_SYSTEMCTL_BIN", &systemctl));
+    assert_refused(&output, 3, "per-repository concurrency limit reached");
+    assert_eq!(live.trace().len(), 1);
+    assert!(!live.calls.exists());
+}
+
+#[test]
 fn a_live_item_lease_refuses_without_replacing_or_releasing_it() {
     let fixture = Fixture::new();
     let lease = fixture.lease();

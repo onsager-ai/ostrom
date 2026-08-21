@@ -13,27 +13,30 @@ use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use directories::BaseDirs;
 use ostrom_checks::{
-    ActionFault, ActionRegistry, DoctorOptions, check_shell_retirement, check_skill_version_bump,
-    run_doctor, run_doctor_check,
+    ActionFault, ActionRegistry, DoctorOptions, PreparedCheck, check_shell_retirement,
+    check_skill_version_bump, run_doctor, run_doctor_check,
 };
 use ostrom_core::{
-    Catalogue, CatalogueEnumeration, CheckContractError, CheckDocument, CheckFault, RepositoryName,
-    ResolvedCheck,
+    CHECK_STORE_SCHEMA_VERSION, Catalogue, CatalogueEnumeration, CheckContractError, CheckDocument,
+    CheckFault, CheckRun, CheckRunId, CheckState, CheckVerdict, RepositoryName, ResolvedCheck,
 };
 use ostrom_store::{
     AssessmentHarness, AuditOptions, DigestOptions, DispatchOutcome, DispatchRequest,
     ExecutableAssessmentDeriver, GateError, GateOptions, HarnessAssessmentDeriver,
-    ImplementRequest, MigrationOutcome, OstromPaths, PassRequest, PassRole, PlanOptions,
-    PublishDestination, PublishTarget, QueueDecision, ReplayOptions, SelectAction, SelectError,
-    SelectOutcome, SelectRequest, SignalFlags, SweepError, SweepMode, SweepOptions,
+    ImplementRequest, JsonlCheckStore, MigrationOutcome, OstromPaths, PassRequest, PassRole,
+    PlanOptions, PublishDestination, PublishTarget, QueueDecision, ReplayOptions, SelectAction,
+    SelectError, SelectOutcome, SelectRequest, SignalFlags, SweepError, SweepMode, SweepOptions,
     SweepParityOptions, TraceAppend, TraceView, UnavailableAssessmentDeriver, acquire_lease,
-    acquire_org_from_github, append_trace_checked, audit, branch_name, create_work_order,
-    credential_output, decide_queue_item, encode_org_snapshots, encode_selection, grant_excuse,
-    item_hash, lease_status, lint_queue_state, list_excuses, list_queue_json, local_drift, migrate,
-    read_trace_json, release_lease, render_constitution, render_digest, replay, run_dispatch,
-    run_gate, run_implement, run_pass, run_plan, run_repair_prs, run_selection, run_sweep,
-    run_sweep_parity, validate_lease_name, validate_work_order_file,
+    acquire_org_from_github, append_trace_checked, audit, branch_name, clear_work_order,
+    create_work_order, credential_output, decide_queue_item, encode_org_snapshots,
+    encode_selection, finalize_exited_implementer, grant_excuse, item_hash, lease_status,
+    lint_queue_state, list_excuses, list_queue_json, local_drift, migrate, read_trace_json,
+    release_lease, render_constitution, render_digest, replay, run_dispatch, run_gate,
+    run_implement, run_pass, run_plan, run_repair_prs, run_selection, run_sweep, run_sweep_parity,
+    validate_lease_name, validate_work_order_file,
 };
+
+mod policy_manifest;
 
 #[derive(Debug, Parser)]
 #[command(name = "ostrom", version, about = "Ostrom workflow commons CLI")]
@@ -44,6 +47,13 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Parse and validate an Ostrom policy manifest.
+    Validate {
+        /// Print the fully composed scalar/list-normalized manifest.
+        #[arg(long)]
+        normalized: bool,
+        manifest: PathBuf,
+    },
     /// Run one command with a scoped GitHub App installation credential.
     Credential {
         role: String,
@@ -201,6 +211,8 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum CheckCommand {
+    /// Execute authored criteria and append their receipts to the check journal.
+    Run,
     /// Require the shipped plugin wiring and skill protocols to agree with the CLI.
     PluginSurface,
     /// Prevent shell implementation files from reappearing.
@@ -289,6 +301,8 @@ enum WorkOrderCommand {
     ItemHash { item_id: String },
     /// Derive the branch name for an exact item identifier.
     BranchName { item_id: String },
+    /// Append work-failed for one named stranded order.
+    Clear { identifier: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -408,6 +422,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let paths = compatible_command_paths();
     match cli.command {
+        Command::Validate {
+            normalized,
+            manifest,
+        } => policy_manifest::run_validate(&manifest, normalized)?,
         Command::Credential {
             role,
             repository,
@@ -432,6 +450,38 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             Err(error) => exit_message(&format!("ostrom credential: {error}"), error.exit_code()),
         },
         Command::Doctor { check } => run_doctor_command(check)?,
+        Command::Check {
+            command: CheckCommand::Run,
+        } => {
+            let cwd = env::current_dir()?;
+            let plugin_root = env::var_os("OSTROM_PLUGIN_ROOT")
+                .or_else(|| env::var_os("CLAUDE_PLUGIN_ROOT"))
+                .map_or_else(|| cwd.join("plugins/ostrom"), PathBuf::from);
+            let resolutions = resolve_plan_checks(&paths, &cwd, &plugin_root)?;
+            if let Some(fault) = &resolutions.catalogue_fault {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("ostrom check run: {}", fault.name),
+                )
+                .into());
+            }
+            let outcome = execute_prepared_checks(
+                &paths,
+                &resolutions,
+                CriteriaSelection::All,
+                DateTime::<Utc>::from(SystemTime::now()),
+            )?;
+            println!(
+                "ostrom check run: {} passed; {} failed; {} faulted; wrote {}",
+                outcome.passed,
+                outcome.failed,
+                outcome.faulted,
+                paths.check_journal_file().display()
+            );
+            if outcome.failed != 0 || outcome.faulted != 0 {
+                std::process::exit(1);
+            }
+        }
         Command::Check {
             command: CheckCommand::PluginSurface,
         } => {
@@ -531,15 +581,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 io::stderr().write_all(output.stderr.as_bytes())?;
             }
         },
-        Command::Pass { role } => supervise(&["__pass-worker".into(), role_name(role).into()]),
+        Command::Pass { role } => {
+            supervise(&["__pass-worker".into(), role_name(role).into()], None)
+        }
         Command::Implement {
             work_order_file,
             unit_name,
-        } => supervise(&[
-            "__implement-worker".into(),
-            work_order_file.into_os_string(),
-            unit_name.into(),
-        ]),
+        } => {
+            let arguments = [
+                "__implement-worker".into(),
+                work_order_file.clone().into_os_string(),
+                unit_name.clone().into(),
+            ];
+            supervise(&arguments, Some((&work_order_file, &unit_name)))
+        }
         Command::PassWorker {
             role,
             supervisor_pid,
@@ -782,6 +837,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .or_else(|| env::var_os("CLAUDE_PLUGIN_ROOT"))
                 .map_or_else(|| cwd.join("plugins/ostrom"), PathBuf::from);
             let check_resolutions = resolve_plan_checks(&paths, &cwd, &plugin_root)?;
+            execute_prepared_checks(
+                &paths,
+                &check_resolutions,
+                CriteriaSelection::StaleOrNever,
+                started_at,
+            )?;
             let options = PlanOptions {
                 sweep: SweepOptions {
                     paths: paths.clone(),
@@ -1039,13 +1100,22 @@ fn run_work_order_command(
             }
             println!("{}", branch_name(&item_id));
         }
+        WorkOrderCommand::Clear { identifier } => {
+            if identifier.is_empty() {
+                work_order_usage();
+            }
+            match clear_work_order(&paths.state, &identifier) {
+                Ok(cleared) => println!("{} {}", cleared.order_id, cleared.item_id),
+                Err(error) => exit_message(&error.to_string(), error.exit_code()),
+            }
+        }
     }
     Ok(())
 }
 
 fn work_order_usage() -> ! {
     exit_message(
-        "usage: work-order.sh create <candidate-json-file> | validate <work-order-file> | item-hash <item-id> | branch-name <item-id>",
+        "usage: work-order.sh create <candidate-json-file> | validate <work-order-file> | item-hash <item-id> | branch-name <item-id> | clear <order-id-or-item-id>",
         2,
     )
 }
@@ -1082,7 +1152,7 @@ fn register_signals() -> io::Result<SignalFlags> {
     Ok(SignalFlags::default())
 }
 
-fn supervise(arguments: &[OsString]) -> ! {
+fn supervise(arguments: &[OsString], implementer: Option<(&Path, &str)>) -> ! {
     let signals = register_signals().unwrap_or_else(|error| {
         eprintln!("ostrom: could not install signal handlers: {error}");
         std::process::exit(1);
@@ -1101,7 +1171,22 @@ fn supervise(arguments: &[OsString]) -> ! {
         });
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => std::process::exit(status.code().unwrap_or(1)),
+            Ok(Some(status)) => {
+                if let Some((order_file, unit_name)) = implementer {
+                    let signal = exit_signal(&status);
+                    if let Err(error) = finalize_exited_implementer(
+                        &compatible_command_paths().state,
+                        order_file,
+                        unit_name,
+                        status.code(),
+                        signal,
+                    ) {
+                        eprintln!("{error}");
+                        std::process::exit(1);
+                    }
+                }
+                std::process::exit(status.code().unwrap_or(1));
+            }
             Ok(None) => {}
             Err(error) => {
                 eprintln!("ostrom: could not wait for worker: {error}");
@@ -1120,6 +1205,18 @@ fn supervise(arguments: &[OsString]) -> ! {
         }
         thread::sleep(Duration::from_millis(25));
     }
+}
+
+#[cfg(unix)]
+fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+
+    status.signal()
+}
+
+#[cfg(not(unix))]
+fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
+    None
 }
 
 fn run_pass_worker(role: CliPassRole, supervisor_pid: u32) -> ! {
@@ -1389,8 +1486,103 @@ fn resolved_or_exit() -> OstromPaths {
 
 struct PlanCheckResolutions {
     resolved: BTreeMap<String, ResolvedCheck>,
+    prepared: BTreeMap<String, PreparedCheck>,
     faults: BTreeMap<String, CheckFault>,
     catalogue_fault: Option<CheckFault>,
+}
+
+#[derive(Clone, Copy)]
+enum CriteriaSelection {
+    All,
+    StaleOrNever,
+}
+
+struct CriteriaRunOutcome {
+    passed: usize,
+    failed: usize,
+    faulted: usize,
+}
+
+fn execute_prepared_checks(
+    paths: &OstromPaths,
+    resolutions: &PlanCheckResolutions,
+    selection: CriteriaSelection,
+    observed_at: DateTime<Utc>,
+) -> Result<CriteriaRunOutcome, ostrom_core::CheckStoreFault> {
+    let mut store = JsonlCheckStore::new(paths);
+    let previous_runs = store.snapshot()?;
+    let previous_receipts = previous_runs
+        .iter()
+        .flat_map(|run| &run.receipts)
+        .cloned()
+        .collect::<Vec<_>>();
+    let run_id = new_check_run_id();
+    let receipts = resolutions
+        .prepared
+        .iter()
+        .filter(|(_, prepared)| match selection {
+            CriteriaSelection::All => true,
+            CriteriaSelection::StaleOrNever => matches!(
+                prepared
+                    .resolved()
+                    .evaluate(&previous_receipts, observed_at)
+                    .state,
+                CheckState::NeverRun | CheckState::Stale
+            ),
+        })
+        .enumerate()
+        .map(|(index, (id, prepared))| {
+            prepared.execute_at(&format!("{}:{index}:{id}", run_id.0), observed_at)
+        })
+        .collect::<Vec<_>>();
+
+    let passed = receipts
+        .iter()
+        .filter(|receipt| receipt.verdict == Some(CheckVerdict::Pass))
+        .count();
+    let failed = receipts
+        .iter()
+        .filter(|receipt| receipt.verdict == Some(CheckVerdict::Fail))
+        .count();
+    let execution_faults = receipts
+        .iter()
+        .filter(|receipt| receipt.error.is_some())
+        .count();
+    let faulted = execution_faults + resolutions.faults.len();
+
+    // A manual pass is recorded even when the catalogue selects nothing. An
+    // automatic plan refresh stays quiet when every receipt is already fresh.
+    if !receipts.is_empty() || matches!(selection, CriteriaSelection::All) {
+        let completed_at = receipts
+            .iter()
+            .map(|receipt| receipt.completed_at)
+            .max()
+            .unwrap_or(observed_at);
+        store.append_run(&CheckRun {
+            schema_version: CHECK_STORE_SCHEMA_VERSION,
+            run_id,
+            completed_at: completed_at.to_rfc3339(),
+            receipts,
+        })?;
+    }
+
+    Ok(CriteriaRunOutcome {
+        passed,
+        failed,
+        faulted,
+    })
+}
+
+fn new_check_run_id() -> CheckRunId {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    CheckRunId(format!(
+        "criteria-{}-{:09}-{}",
+        elapsed.as_secs(),
+        elapsed.subsec_nanos(),
+        std::process::id()
+    ))
 }
 
 fn resolve_plan_checks(
@@ -1427,6 +1619,7 @@ fn resolve_plan_checks(
     if catalogue_fault.is_some() {
         return Ok(PlanCheckResolutions {
             resolved: BTreeMap::new(),
+            prepared: BTreeMap::new(),
             faults: BTreeMap::new(),
             catalogue_fault,
         });
@@ -1439,11 +1632,13 @@ fn resolve_plan_checks(
         .collect::<BTreeSet<_>>();
     let registry = ActionRegistry::core(plugin_root.to_owned())?;
     let mut resolved = BTreeMap::new();
+    let mut prepared_checks = BTreeMap::new();
     let mut faults = BTreeMap::new();
     for id in ids {
         match registry.prepare(&id, &enumeration) {
             Ok(prepared) => {
-                resolved.insert(id, prepared.resolved().clone());
+                resolved.insert(id.clone(), prepared.resolved().clone());
+                prepared_checks.insert(id, prepared);
             }
             Err(error) => {
                 faults.insert(id, action_fault(&error));
@@ -1452,6 +1647,7 @@ fn resolve_plan_checks(
     }
     Ok(PlanCheckResolutions {
         resolved,
+        prepared: prepared_checks,
         faults,
         catalogue_fault,
     })
@@ -1527,6 +1723,19 @@ mod tests {
     use clap::Parser as _;
 
     use super::{CheckCommand, Cli, Command};
+
+    #[test]
+    fn parses_criteria_run_check() {
+        let parsed =
+            Cli::try_parse_from(["ostrom", "check", "run"]).expect("parse criteria run check");
+
+        assert!(matches!(
+            parsed.command,
+            Command::Check {
+                command: CheckCommand::Run
+            }
+        ));
+    }
 
     #[test]
     fn parses_skill_version_bump_check() {

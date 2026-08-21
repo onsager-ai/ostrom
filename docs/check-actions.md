@@ -11,6 +11,37 @@ Registration has no basis or judgment field. The reserved `agent` domain is
 rejected with `judged_domain_registration`, leaving `ostrom-core`'s domain
 derivation as the only source of basis truth.
 
+## Execution and scheduling
+
+`ostrom check run` executes every resolvable mechanical criterion from the
+user and repository `checks.yaml` catalogues and appends one complete run to
+`check-runs.jsonl`. Every executed criterion gets its own receipt. Passes,
+ordinary non-zero failures, and execution faults are distinct; a timeout or
+failure does not prevent later criteria from running. The command exits
+non-zero after recording the complete pass when any criterion fails, faults,
+or cannot be resolved.
+
+`ostrom plan` is also a producer: before assessment it executes criteria whose
+latest verdict is stale or absent. Fresh passing and fresh failing verdicts
+are reused. If execution still leaves a cited criterion stale or never run,
+the goal receives `assessment_evidence_unavailable` and is not sent to the
+assessor. This preserves the difference between no verdict and a recorded
+failure throughout the plan document and assessor boundary.
+
+The invocable command is the scheduling seam. An operator can install it in
+the scheduler appropriate to the machine; no scheduler is installed by the
+repository. For example, after replacing both paths with absolute paths, a
+cron entry can run every five minutes:
+
+```cron
+*/5 * * * * OSTROM_HOME=/absolute/path/to/ostrom-state /absolute/path/to/ostrom check run
+```
+
+The equivalent systemd timer should invoke the same command from a oneshot
+service and set `OnUnitActiveSec=5m`. The remaining operator step is to install
+and enable that cron entry or service/timer with the desired state root and
+binary path.
+
 ## Judged checks
 
 `agent` is resolved separately through `JudgmentRegistry`; it is not an action

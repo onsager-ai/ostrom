@@ -150,8 +150,23 @@ impl PreparedCheck {
     #[must_use]
     pub fn execute(&self, attempt_id: &str) -> CheckReceipt {
         let observed_at = DateTime::<Utc>::from(SystemTime::now());
+        self.execute_at(attempt_id, observed_at)
+    }
+
+    /// Execute against an explicit observation clock.
+    ///
+    /// Plan passes use their shared clock so a hermetic `--started-at` run
+    /// does not make a receipt appear to come from outside the pass. Elapsed
+    /// execution time is still measured from the real clock and reflected in
+    /// `completed_at`.
+    #[must_use]
+    pub fn execute_at(&self, attempt_id: &str, observed_at: DateTime<Utc>) -> CheckReceipt {
+        let started = std::time::Instant::now();
         let outcome = self.action.execute();
-        let completed_at = DateTime::<Utc>::from(SystemTime::now());
+        let elapsed = chrono::Duration::from_std(started.elapsed()).unwrap_or_default();
+        let completed_at = observed_at
+            .checked_add_signed(elapsed)
+            .unwrap_or(observed_at);
         let stamp = RunnerStamp {
             resolved: &self.resolved,
             attempt_id,

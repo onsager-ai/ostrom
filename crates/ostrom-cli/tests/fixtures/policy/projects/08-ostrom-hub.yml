@@ -1,0 +1,5 @@
+grant: ostrom-hub-builder
+actors: builder
+operations: work
+repositories: onsager-ai/ostrom-hub
+where: label:area:data

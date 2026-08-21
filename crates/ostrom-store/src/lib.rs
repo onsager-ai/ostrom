@@ -3,6 +3,7 @@
 mod app_token;
 mod check_store;
 mod dispatch;
+mod event_store;
 mod file_store;
 mod gate;
 mod hooks;
@@ -28,6 +29,7 @@ mod work_order;
 pub use app_token::{AppTokenError, CredentialCommandError, credential_output};
 pub use check_store::JsonlCheckStore;
 pub use dispatch::{DispatchError, DispatchOutcome, DispatchRequest, run_dispatch};
+pub use event_store::JsonlEventStore;
 pub use file_store::JsonlSweepStore;
 pub use gate::{GateError, GateOptions, GateOutput, run_gate};
 pub use hooks::{DigestOptions, HookOutput, render_constitution, render_digest};
@@ -71,8 +73,8 @@ pub use trace::{
     append_trace, append_trace_checked, read_trace, read_trace_json,
 };
 pub use work_order::{
-    CreatedWorkOrder, WorkOrderError, branch_name, create_work_order, item_hash,
-    validate_work_order_file,
+    ClearedWorkOrder, CreatedWorkOrder, WorkOrderError, branch_name, clear_work_order,
+    create_work_order, finalize_exited_implementer, item_hash, validate_work_order_file,
 };
 
 use thiserror::Error;
@@ -98,6 +100,8 @@ pub enum StoreError {
     MalformedPassState { role: String, message: String },
     #[error("trace record is {bytes} bytes; maximum is 4096")]
     TraceTooLarge { bytes: usize },
+    #[error("event store: {0}")]
+    Event(#[from] ostrom_core::EventStoreFault),
     #[error("migration refused: held lease {name} owned by {owner}")]
     LeaseHeld { name: String, owner: String },
     #[error("migration source and destination overlap: {0}")]

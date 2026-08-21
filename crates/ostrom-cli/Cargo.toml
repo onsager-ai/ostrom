@@ -19,7 +19,10 @@ directories.workspace = true
 ostrom-core = { path = "../ostrom-core" }
 ostrom-checks = { path = "../ostrom-checks" }
 ostrom-store = { path = "../ostrom-store" }
+serde.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

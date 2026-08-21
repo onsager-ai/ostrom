@@ -1,0 +1,5 @@
+grant: duhem-site-builder
+actors: builder
+operations: work
+repositories: onsager-ai/duhem-site
+where: type:feat

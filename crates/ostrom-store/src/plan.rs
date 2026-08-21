@@ -8,10 +8,11 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use ostrom_core::{
-    Acknowledgement, Assessment, AssessmentDraft, CheckFault, CheckStoreFault, EvaluatedCheck,
-    GoalActionVerb, GoalFacts, GoalState, GoalsDocument, GoalsError, MilestoneInput, PLAN_VERSION,
-    QueueItem, ResolvedCheck, WorkGraph, WorkGraphNode, cited_fact_basis, compose_ranking,
-    consequence, derive_goal_facts, fact_table, mechanical_ranking, validate_assessment,
+    Acknowledgement, Assessment, AssessmentDraft, CheckFault, CheckState, CheckStoreFault,
+    EvaluatedCheck, GoalActionVerb, GoalFacts, GoalState, GoalsDocument, GoalsError,
+    MilestoneInput, PLAN_VERSION, QueueItem, ResolvedCheck, WorkGraph, WorkGraphNode,
+    cited_fact_basis, compose_ranking, consequence, derive_goal_facts, fact_table,
+    mechanical_ranking, validate_assessment,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -582,7 +583,24 @@ pub fn run_plan(
                 demoted.insert(next.clone());
             }
         }
+        let unavailable_evidence = facts
+            .met_when_status
+            .iter()
+            .filter(|status| matches!(status.state, CheckState::NeverRun | CheckState::Stale))
+            .map(|status| format!("{} ({})", status.check, status.rendered))
+            .collect::<Vec<_>>();
         let assessment = if facts.met || paused {
+            None
+        } else if !unavailable_evidence.is_empty() {
+            faults.push(PlanFault {
+                stage: "assess".to_owned(),
+                goal: Some(goal.id.clone()),
+                name: "assessment_evidence_unavailable".to_owned(),
+                detail: format!(
+                    "criterion evidence is unavailable: {}",
+                    unavailable_evidence.join(", ")
+                ),
+            });
             None
         } else {
             let input = AssessmentInput {

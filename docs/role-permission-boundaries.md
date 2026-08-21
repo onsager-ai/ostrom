@@ -354,3 +354,28 @@ That deny was never load-bearing anyway: it matches only the literal word
 `mutation` in the command string, so `--input`, `-F query=@file` and a
 whitespace change all pass it. It is kept for the builder as the same kind of
 visible-refusal defence as the rest of the list, and for no stronger reason.
+
+## Recommendation for protocol ownership (#310)
+
+Role settings should belong with the protocol as a canonical, reviewed
+definition, while each activated copy should remain machine-local. A skill and
+the command permissions needed to run it are one compatibility surface: when
+they live in separately maintained sources, a command migration can ship while
+the unattended role is unable to execute its first command. Co-locating the
+canonical definition makes that change atomic and lets repository checks reject
+a skill/permission gap before publication.
+
+This is a recommendation, not a settings move. The current
+`~/.claude/ostrom/roles/*.settings.json` files remain where they are, and this
+change does not alter either role's grants or how a grant is proposed or
+issued. Those authority and mechanism questions are deliberately left to
+#370.
+
+The compatibility guard lives in `ostrom check plugin-surface` because role
+commands are part of the same shipped skill/CLI surface that check already
+protects, and CI already runs it. Doctor and CI share one extractor: it reads
+executable `ostrom` calls from shell fences in the role's shipped skills, so
+the expected set follows protocol changes while prohibitions mentioned only in
+prose do not become accidental grants. A nested command below `ostrom
+credential --` is executed by that already-authorized wrapper and is not a
+second harness permission request.

@@ -14,7 +14,7 @@ use ostrom_core::ActionDefinition;
 use serde_json::{Map, Value, json};
 
 use crate::{
-    ActionFault, ActionOutcome, ActionProvider, PreparedAction,
+    ActionFault, ActionOutcome, ActionProvider, PreparedAction, check_role_allowlists,
     process::{exact_keys, invalid_parameters, parameter_timeout},
 };
 
@@ -30,7 +30,9 @@ pub const DOCTOR_CHECKS: &[&str] = &[
     "provider-reachable",
     "dispatch-source-roots",
     "trace-lease",
+    "trace-completeness",
     "work-orders",
+    "role-allowlists",
     "builder-pass",
     "gatekeeper-pass",
     "publish",
@@ -229,7 +231,9 @@ fn run_named_check(context: &mut DoctorContext, name: &str) -> DoctorResult {
         "provider-reachable" => check_provider_reachable(context),
         "dispatch-source-roots" => check_dispatch_source_roots(context),
         "trace-lease" => check_trace_lease(context),
+        "trace-completeness" => check_trace_completeness(context),
         "work-orders" => check_work_orders(context),
+        "role-allowlists" => check_delivery_role_allowlists(context),
         "builder-pass" => check_role_pass(context, DeliveryRole::Builder),
         "gatekeeper-pass" => check_role_pass(context, DeliveryRole::Gatekeeper),
         "publish" => check_publish(context),
@@ -2156,12 +2160,103 @@ fn check_trace_lease(context: &DoctorContext) -> DoctorResult {
     )
 }
 
+fn check_trace_completeness(context: &DoctorContext) -> DoctorResult {
+    let source = match &context.trace {
+        TraceFile::Missing => {
+            return DoctorResult::new(
+                DoctorStatus::Warn,
+                "trace-completeness",
+                "no gatekeeper pass ever recorded",
+                "run /ostrom:gatekeep and confirm it records pass-ended",
+            );
+        }
+        TraceFile::Unreadable => {
+            return DoctorResult::new(
+                DoctorStatus::Warn,
+                "trace-completeness",
+                "gatekeeper pass history is unreadable",
+                "inspect sprint.jsonl and fix its permissions",
+            );
+        }
+        TraceFile::Content(source) => source,
+    };
+    let mut owner = None;
+    let mut timestamp = None;
+    let mut item_selected = 0;
+    let mut gate_verdict_consumed = 0;
+    for record in source
+        .lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+    {
+        if owner.is_none() {
+            if record.get("kind").and_then(Value::as_str) == Some("pass-ended")
+                && record
+                    .get("fact")
+                    .and_then(|fact| fact.get("owner"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|owner| owner.starts_with("gatekeeper-"))
+            {
+                owner = record
+                    .get("fact")
+                    .and_then(|fact| fact.get("owner"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                timestamp = record.get("ts").and_then(Value::as_str).map(str::to_owned);
+            }
+            continue;
+        }
+        let kind = record.get("kind").and_then(Value::as_str);
+        if kind == Some("pass-started")
+            && record
+                .get("fact")
+                .and_then(|fact| fact.get("owner"))
+                .and_then(Value::as_str)
+                == owner.as_deref()
+        {
+            let Some(timestamp) = timestamp else {
+                return DoctorResult::new(
+                    DoctorStatus::Warn,
+                    "trace-completeness",
+                    "last gatekeeper pass has an invalid timestamp",
+                    "inspect sprint.jsonl; records must be written by ostrom trace append",
+                );
+            };
+            let detail = format!(
+                "gatekeeper pass {timestamp}: item-selected={item_selected}, gate-verdict-consumed={gate_verdict_consumed}"
+            );
+            return if item_selected > 0 && item_selected > gate_verdict_consumed {
+                DoctorResult::new(
+                    DoctorStatus::Fail,
+                    "trace-completeness",
+                    detail,
+                    "restart the gatekeeper session; it may be running a plugin older than the merge-side appends",
+                )
+            } else {
+                DoctorResult::new(DoctorStatus::Ok, "trace-completeness", detail, "")
+            };
+        }
+        match kind {
+            Some("item-selected") => item_selected += 1,
+            Some("gate-verdict-consumed") => gate_verdict_consumed += 1,
+            _ => {}
+        }
+    }
+    DoctorResult::new(
+        DoctorStatus::Warn,
+        "trace-completeness",
+        "no completed gatekeeper pass ever recorded",
+        "run /ostrom:gatekeep and confirm it records matching pass-started and pass-ended rows",
+    )
+}
+
 #[derive(Clone)]
 struct DispatchFact {
     item_id: String,
     order_id: String,
     unit_name: String,
     backend: String,
+    repository_slot: String,
 }
 
 fn dispatch_fact(value: &Value) -> Option<DispatchFact> {
@@ -2169,11 +2264,14 @@ fn dispatch_fact(value: &Value) -> Option<DispatchFact> {
     if json_safe_integer(object.get("schema_version")?)? != 1 {
         return None;
     }
+    let item_id = nonempty_string(object.get("item_id")?)?;
+    let repository_slot = item_id.rsplit_once('#')?.0.to_owned();
     Some(DispatchFact {
-        item_id: nonempty_string(object.get("item_id")?)?,
+        item_id,
         order_id: nonempty_string(object.get("order_id")?)?,
         unit_name: nonempty_string(object.get("unit_name")?)?,
         backend: nonempty_string(object.get("backend")?)?,
+        repository_slot,
     })
 }
 
@@ -2290,11 +2388,11 @@ fn check_work_orders(context: &DoctorContext) -> DoctorResult {
             DoctorStatus::Fail,
             "work-orders",
             format!(
-                "{} in flight; unit exited without terminal row: {}",
+                "{} in flight; stranded-work-order (unit exited without terminal row): {}",
                 orders.len(),
                 faults.join(", ")
             ),
-            "inspect the transient unit journal and append work-failed before clearing its per-item lease",
+            "inspect the transient unit journal, then run ostrom work-order clear <order-id>",
         )
     } else if !unknown.is_empty() {
         DoctorResult::new(
@@ -2318,7 +2416,10 @@ fn check_work_orders(context: &DoctorContext) -> DoctorResult {
 }
 
 fn visible_order(order: &DispatchFact) -> String {
-    format!("{} ({})", order.item_id, order.unit_name)
+    format!(
+        "order={} item={} repository-slot={} unit={}",
+        order.order_id, order.item_id, order.repository_slot, order.unit_name
+    )
 }
 
 fn no_work_orders() -> DoctorResult {
@@ -2327,6 +2428,43 @@ fn no_work_orders() -> DoctorResult {
         "work-orders",
         "no work orders in flight",
         "",
+    )
+}
+
+fn check_delivery_role_allowlists(context: &DoctorContext) -> DoctorResult {
+    let settings = context.options.config_dir.join("ostrom/roles");
+    let report = check_role_allowlists(&context.options.plugin_root, &settings);
+    if report.is_clean() {
+        return DoctorResult::new(
+            DoctorStatus::Ok,
+            "role-allowlists",
+            "builder and gatekeeper allow every ostrom subcommand invoked by their shipped skills",
+            "",
+        );
+    }
+
+    let detail = report
+        .violations
+        .iter()
+        .map(
+            |violation| match (&violation.skill, &violation.subcommand) {
+                (Some(skill), Some(subcommand)) => format!(
+                    "{} cannot execute ostrom {} invoked by skill {}",
+                    violation.role, subcommand, skill
+                ),
+                _ => format!("{}: {}", violation.role, violation.detail),
+            },
+        )
+        .collect::<Vec<_>>()
+        .join("; ");
+    DoctorResult::new(
+        DoctorStatus::Fail,
+        "role-allowlists",
+        detail,
+        format!(
+            "align the role allowlists under {} with the named shipped skill commands",
+            settings.display()
+        ),
     )
 }
 
@@ -2438,6 +2576,14 @@ fn check_role_pass(context: &DoctorContext, role: DeliveryRole) -> DoctorResult 
     let timestamp = timestamp.unwrap();
     let age_seconds = now_epoch(context) - timestamp_epoch;
     let age = format_age(age_seconds);
+    if pass_outcome(record) == Some("permission-denied") {
+        return DoctorResult::new(
+            DoctorStatus::Fail,
+            check_name,
+            format!("last {role_name} pass was denied permission, {timestamp} (age {age})"),
+            "run ostrom doctor --check role-allowlists and align the named role/subcommand gap",
+        );
+    }
     // One no-op can be a contended lease or a disarmed mid-window wake. Three
     // consecutive no-ops mean the timer is alive but the protocol has stopped
     // taking ownership, the production failure that the age check cannot see.
@@ -2723,6 +2869,39 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn stranded_work_order_fault_names_order_item_and_repository_slot() {
+        let fixture = Fixture::new();
+        let state = fixture.config_dir.join("ostrom");
+        fs::create_dir_all(&state).unwrap();
+        fs::write(
+            state.join("sprint.jsonl"),
+            concat!(
+                "{\"ts\":\"2026-08-01T00:00:00Z\",\"kind\":\"work-dispatched\",",
+                "\"fact\":{\"schema_version\":1,\"item_id\":\"placeholder-org/alpha#42\",",
+                "\"order_id\":\"placeholder-order-id\",\"unit_name\":\"ostrom-implementer-placeholder\",",
+                "\"backend\":\"systemd\"},\"narration\":{}}\n"
+            ),
+        )
+        .unwrap();
+        let systemctl = fixture.executable("systemctl", "#!/bin/sh\nexit 4\n");
+        let mut options = fixture.options();
+        options
+            .env
+            .insert("MANDATE_SYSTEMCTL_BIN".into(), systemctl.into_os_string());
+        let output = run_doctor_check(options, "work-orders").unwrap();
+        assert!(output.starts_with("FAIL|work-orders|"), "{output}");
+        for expected in [
+            "stranded-work-order",
+            "order=placeholder-order-id",
+            "item=placeholder-org/alpha#42",
+            "repository-slot=placeholder-org/alpha",
+        ] {
+            assert!(output.contains(expected), "missing {expected}: {output}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn missing_cli_reports_the_remedy_without_running_npm() {
         let fixture = Fixture::new();
         let marker = fixture.root.path().join("npm-was-run");
@@ -2732,6 +2911,37 @@ mod tests {
             "FAIL|cli-installed|ostrom is not installed or is absent from PATH|npm install -g @ostrom/cli\n"
         );
         assert!(!marker.exists(), "doctor remedies must never be executed");
+    }
+
+    #[test]
+    fn role_allowlist_check_names_the_role_skill_and_missing_subcommand() {
+        let fixture = Fixture::new();
+        for (skill, source) in [
+            ("work", "```sh\nostrom trace read\nostrom sweep\n```\n"),
+            ("gatekeep", "```sh\nostrom trace read\n```\n"),
+            ("merge", "# no direct commands\n"),
+        ] {
+            let directory = fixture.plugin_root.join("skills").join(skill);
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("SKILL.md"), source).unwrap();
+        }
+        let roles = fixture.config_dir.join("ostrom/roles");
+        fs::create_dir_all(&roles).unwrap();
+        for role in ["builder", "gatekeeper"] {
+            fs::write(
+                roles.join(format!("{role}.settings.json")),
+                r#"{"permissions":{"allow":["Bash(ostrom trace *)"]}}"#,
+            )
+            .unwrap();
+        }
+
+        let output = run_doctor_check(fixture.options(), "role-allowlists").unwrap();
+        assert!(output.starts_with("FAIL|role-allowlists|"), "{output}");
+        assert!(
+            output.contains("builder cannot execute ostrom sweep invoked by skill work"),
+            "{output}"
+        );
+        assert!(!output.contains("gatekeeper cannot execute"), "{output}");
     }
 
     #[cfg(unix)]
@@ -2872,7 +3082,9 @@ mod tests {
                 "OK|provider-reachable|file: {home}/.claude/ostrom does not exist yet, nearest existing ancestor {home} is writable|\n",
                 "FAIL|dispatch-source-roots|search_roots is empty; dispatch cannot resolve source repositories|configure search_roots with a parent directory containing the roster checkouts\n",
                 "WARN|trace-lease|trace absent; lease idle|run /ostrom:gatekeep and confirm it creates sprint.jsonl\n",
+                "WARN|trace-completeness|no gatekeeper pass ever recorded|run /ostrom:gatekeep and confirm it records pass-ended\n",
                 "OK|work-orders|no work orders in flight|\n",
+                "FAIL|role-allowlists|builder: role settings are missing at {config}/ostrom/roles/builder.settings.json; gatekeeper: role settings are missing at {config}/ostrom/roles/gatekeeper.settings.json|align the role allowlists under {config}/ostrom/roles with the named shipped skill commands\n",
                 "WARN|builder-pass|no builder pass ever recorded|run /ostrom:work and confirm it records pass-ended\n",
                 "WARN|gatekeeper-pass|no gatekeeper pass ever recorded|run /ostrom:gatekeep and confirm it records pass-ended\n",
                 "WARN|publish|no publish has been recorded|run mandate publish.sh and confirm the state branch is reachable\n",
