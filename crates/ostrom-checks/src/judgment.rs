@@ -450,9 +450,14 @@ checks:
       fresh_for: 1d
 "#
         );
+        let judged = format!("agent/{harness}");
         CatalogueEnumeration {
             catalogues: vec![Catalogue {
-                document: CheckDocument::from_yaml(&source).expect("fixture catalogue"),
+                document: CheckDocument::from_yaml_with_actions(
+                    &source,
+                    &["fixture/observe", &judged],
+                )
+                .expect("fixture catalogue"),
             }],
             complete: true,
         }

@@ -1,8 +1,11 @@
 #![cfg(unix)]
 
-use std::{fs, process::Command, time::Instant};
+use std::{fs, path::PathBuf, process::Command, time::Instant};
 
-use ostrom_core::{CheckRun, CheckVerdict};
+use ostrom_checks::ActionRegistry;
+use ostrom_core::{
+    Catalogue, CatalogueEnumeration, CheckDocument, CheckRun, CheckVerdict, GateConfig,
+};
 use tempfile::tempdir;
 
 #[test]
@@ -141,4 +144,58 @@ fn check_run_is_a_reachable_successful_cli_surface() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(home.path().join("check-runs.jsonl").is_file());
+}
+
+#[test]
+fn unknown_action_fails_the_catalogue_load_and_writes_no_run() {
+    let home = tempdir().expect("criteria home");
+    fs::write(
+        home.path().join("checks.yaml"),
+        "checks_version: 1\nchecks:\n  unknown:\n    uses: missing/observe\n    with: {}\n",
+    )
+    .expect("write checks");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .args(["check", "run"])
+        .env("OSTROM_HOME", home.path())
+        .current_dir(home.path())
+        .output()
+        .expect("execute criteria");
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unknown_action"));
+    assert!(!home.path().join("check-runs.jsonl").exists());
+}
+
+#[test]
+fn ten_legacy_gate_strings_map_to_valid_named_check_fixtures() {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/checks-verdict");
+    let gate = GateConfig::from_yaml(
+        &fs::read_to_string(fixture.join("gate.before.yaml")).expect("legacy gate fixture"),
+    )
+    .expect("legacy gate parses");
+    let document = CheckDocument::from_yaml(
+        &fs::read_to_string(fixture.join("checks.yaml")).expect("checks fixture"),
+    )
+    .expect("checks fixture parses");
+    assert_eq!(gate.projects.len(), 10);
+    assert_eq!(document.checks.len(), 10);
+
+    let enumeration = CatalogueEnumeration {
+        catalogues: vec![Catalogue { document }],
+        complete: true,
+    };
+    let registry = ActionRegistry::core(&fixture, &fixture).expect("core registry");
+    for (index, project) in gate.projects.iter().enumerate() {
+        let legacy_name = project
+            .required_checks
+            .first()
+            .expect("one legacy required check");
+        let check_id = format!("placeholder-ci-{:02}", index + 1);
+        let definition = &enumeration.catalogues[0].document.checks[&check_id];
+        assert_eq!(definition.with["name"], legacy_name.as_str());
+        registry
+            .prepare(&check_id, &enumeration)
+            .unwrap_or_else(|error| panic!("{check_id} did not validate: {error}"));
+    }
 }

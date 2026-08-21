@@ -352,7 +352,7 @@ acknowledgements: []
 }
 
 #[test]
-fn catalogue_checks_drive_met_state_and_keep_resolution_faults_named() {
+fn catalogue_checks_drive_met_state_and_keep_unknown_references_named() {
     let home = tempdir().expect("plan home");
     configure(home.path());
     let catalogue = r#"
@@ -367,9 +367,6 @@ checks:
   stale-pass:
     uses: cmd/run
     with: {script: "exit 0"}
-  absent-provider:
-    uses: missing/observe
-    with: {}
 "#;
     fs::write(home.path().join("checks.yaml"), catalogue).expect("write checks");
     fs::write(
@@ -381,7 +378,6 @@ goals:
   - {id: never, intent: absent evidence fails closed, state: active, met_when: [fresh-pass, never-observed]}
   - {id: stale, intent: expired evidence fails closed, state: active, met_when: [fresh-pass, stale-pass]}
   - {id: unknown, intent: unknown names fail closed, state: active, met_when: [not-authored]}
-  - {id: unregistered, intent: absent providers fail closed, state: active, met_when: [absent-provider]}
 actions: []
 acknowledgements: []
 "#,
@@ -432,10 +428,6 @@ acknowledgements: []
     assert_eq!(
         goal("unknown")["facts"]["met_when_status"][0]["fault"]["name"],
         "unresolved_check"
-    );
-    assert_eq!(
-        goal("unregistered")["facts"]["met_when_status"][0]["fault"]["name"],
-        "unregistered_action"
     );
     assert_eq!(document["sweep"]["check_runs"], 2);
 }

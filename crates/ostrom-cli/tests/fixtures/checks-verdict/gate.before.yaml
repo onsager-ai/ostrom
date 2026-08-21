@@ -1,0 +1,23 @@
+provider: file
+bounce_all: []
+projects:
+  - repo: placeholder-org/repository-01
+    required_checks: [placeholder-job-01]
+  - repo: placeholder-org/repository-02
+    required_checks: [placeholder-job-02]
+  - repo: placeholder-org/repository-03
+    required_checks: [placeholder-job-03]
+  - repo: placeholder-org/repository-04
+    required_checks: [placeholder-job-04]
+  - repo: placeholder-org/repository-05
+    required_checks: [placeholder-job-05]
+  - repo: placeholder-org/repository-06
+    required_checks: [placeholder-job-06]
+  - repo: placeholder-org/repository-07
+    required_checks: [placeholder-job-07]
+  - repo: placeholder-org/repository-08
+    required_checks: [placeholder-job-08]
+  - repo: placeholder-org/repository-09
+    required_checks: [placeholder-job-09]
+  - repo: placeholder-org/repository-10
+    required_checks: [placeholder-job-10]

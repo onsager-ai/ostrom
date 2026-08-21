@@ -266,7 +266,8 @@ mod tests {
         );
         CatalogueEnumeration {
             catalogues: vec![Catalogue {
-                document: CheckDocument::from_yaml(&source).expect("fixture catalogue"),
+                document: CheckDocument::from_yaml_with_actions(&source, &[uses])
+                    .expect("fixture catalogue"),
             }],
             complete: true,
         }

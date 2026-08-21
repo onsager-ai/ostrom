@@ -16,14 +16,15 @@ derivation as the only source of basis truth.
 `ostrom check run` executes every resolvable mechanical criterion from the
 user and repository `checks.yaml` catalogues and appends one complete run to
 `check-runs.jsonl`. Every executed criterion gets its own receipt. Passes,
-ordinary non-zero failures, and execution faults are distinct; a timeout or
-failure does not prevent later criteria from running. The command exits
-non-zero after recording the complete pass when any criterion fails, faults,
-or cannot be resolved.
+failures, and inconclusive observations are distinct; a timeout or failure
+does not prevent later criteria from running. The command exits non-zero after
+recording the complete pass when any criterion fails, is inconclusive under
+`block`, faults, or cannot be resolved.
 
 `ostrom plan` is also a producer: before assessment it executes criteria whose
-latest verdict is stale or absent. Fresh passing and fresh failing verdicts
-are reused. If execution still leaves a cited criterion stale or never run,
+latest verdict is stale or absent. Fresh pass, fail, and inconclusive verdicts
+are reused. If execution still leaves a cited criterion stale, never run, or
+blocked as inconclusive,
 the goal receives `assessment_evidence_unavailable` and is not sent to the
 assessor. This preserves the difference between no verdict and a recorded
 failure throughout the plan document and assessor boundary.
@@ -84,16 +85,24 @@ also stamped into the judged receipt, so source staleness composes directly.
 A successful harness response has `verdict` and a non-empty `because` array;
 each clause has `evidence` (one supplied name) and non-empty `detail`. A name
 outside the bundle returns `evidence_incomplete` and no receipt is accepted.
-An error response is recorded as an error-only receipt, so inability to
-determine a verdict is never converted to `fail`. The executor stamps harness,
-model, and version and records the exact evidence digests.
+An error response records `inconclusive`, so inability to determine a verdict
+is never converted to `fail`. The executor stamps harness, model, and version
+and records the exact evidence digests.
 
 Rendered judged states are always qualified (`judged pass`, `judged fail`,
-`judged stale`, or `judged never run`). Goal facts carry `basis: mechanical`
-unless a contributing `met_when` check is judged, in which case they carry
-`basis: includes_judgment`.
+`judged inconclusive`, `judged stale`, or `judged never run`). Goal facts
+carry `basis: mechanical` unless a contributing `met_when` check is judged,
+in which case they carry `basis: includes_judgment`.
 
-The shipped registry contains:
+Check results are three-valued: `pass`, `fail`, or `inconclusive`. A suite may
+set `inconclusive_policy`, which defaults to `block`; each check may override
+it with `block`, `warn`, or `pass`. `block` makes the CLI run non-zero. `warn`
+and `pass` let it proceed, and Ostrom emits a warning naming every softened
+check even for explicit `pass`, so an undecided observation is never silent.
+Raw receipts remain `inconclusive`; policy is applied only when consumed.
+
+The action catalogue is closed. An unknown `uses:` value fails the catalogue
+load before execution or journal writes. The shipped registry contains:
 
 - `http/get`: `url` and `expect` are required; `timeout` is optional.
   Expectations are deliberately limited to `status <op> integer` and
@@ -102,12 +111,20 @@ The shipped registry contains:
   There is no general jq, arithmetic, boolean composition, filtering, or
   arbitrary value comparison; those expressions return `unsupported_expect`.
 - `cmd/run`: `script` is required and is passed to `sh -c`; `timeout` is
-  optional. Exit zero passes, ordinary non-zero exits fail, and an inability
-  to spawn or locate the command is `cmd_execute_error`.
+  optional. Exit zero passes and an explicit ordinary non-zero predicate exit
+  fails. Timeouts, missing commands, signals, and syntax crashes are
+  inconclusive.
 - `doctor/check`: `check` selects one exact doctor check name and `timeout` is
   optional. The adapter runs `node doctor.js --check <name>` and accepts one
-  text-protocol line. `OK` passes, `FAIL` fails, `WARN` is `doctor_warn`, and
-  `DEFER` is `doctor_defer`.
+  text-protocol line. `OK` passes, `FAIL` fails, and `WARN` or `DEFER` is
+  inconclusive.
+- `gh/check-run`: `name` must exactly match a job id or job name enumerated
+  from `.github/workflows/*.yml` or `*.yaml`. It reads the exact job through
+  `gh pr checks`; pending or unavailable observations are inconclusive.
+- `gh/token-scope`: `scopes` is a non-empty list of exact GitHub repository
+  permission names and `read`/`write` levels. It compares those requirements
+  with the active credential's enumerable scopes; an unobservable credential
+  is inconclusive.
 
 Numeric timeouts are seconds. String timeouts accept positive integer `ms`,
 `s`, or `m` suffixes and default to 30 seconds. `fresh_for` remains the one

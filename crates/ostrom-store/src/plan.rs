@@ -1006,8 +1006,9 @@ mod tests {
                 .expect("fixture JSON"),
         )
         .expect("sweep fixture");
-        let document = CheckDocument::from_yaml(
+        let document = CheckDocument::from_yaml_with_actions(
             "checks_version: 1\nchecks:\n  sweep-parity:\n    uses: fixture/observe\n    with: {}\n",
+            &["fixture/observe"],
         )
         .expect("check document");
         let resolved = resolve_check(

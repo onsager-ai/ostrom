@@ -7,6 +7,14 @@ use thiserror::Error;
 
 pub const CHECKS_VERSION: u32 = 1;
 pub const RESULT_VERSION: u32 = 1;
+pub const CHECK_ACTIONS: &[&str] = &[
+    "agent/claude",
+    "cmd/run",
+    "doctor/check",
+    "gh/check-run",
+    "gh/token-scope",
+    "http/get",
+];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -19,6 +27,13 @@ pub struct CheckDocument {
 
 impl CheckDocument {
     pub fn from_yaml(input: &str) -> Result<Self, CheckContractError> {
+        Self::from_yaml_with_actions(input, CHECK_ACTIONS)
+    }
+
+    pub fn from_yaml_with_actions(
+        input: &str,
+        actions: &[&str],
+    ) -> Result<Self, CheckContractError> {
         let document: Self = serde_yaml::from_str(input).map_err(CheckContractError::Yaml)?;
         if document.checks_version != CHECKS_VERSION {
             return Err(CheckContractError::UnsupportedCheckVersion);
@@ -28,6 +43,9 @@ impl CheckDocument {
         }
         for definition in document.checks.values() {
             definition.validate_uses()?;
+            if !actions.contains(&definition.uses.as_str()) {
+                return Err(CheckContractError::UnknownAction);
+            }
             definition.validate_agent_parameters()?;
         }
         validate_local_evidence_graph(&document)?;
@@ -470,6 +488,8 @@ pub enum CheckContractError {
     EmptyCheckId,
     #[error("uses must have the exact shape domain/verb")]
     InvalidActionName,
+    #[error("unknown_action")]
+    UnknownAction,
     #[error("check_catalog_truncated")]
     CheckCatalogTruncated,
     #[error("unresolved_check")]
@@ -501,6 +521,7 @@ impl CheckContractError {
     pub fn fault_name(&self) -> Option<&'static str> {
         match self {
             Self::UnsupportedCheckVersion => Some("unsupported_check_version"),
+            Self::UnknownAction => Some("unknown_action"),
             Self::CheckCatalogTruncated => Some("check_catalog_truncated"),
             Self::UnresolvedCheck => Some("unresolved_check"),
             Self::AmbiguousCheck => Some("ambiguous_check"),
@@ -1097,7 +1118,7 @@ mod tests {
 checks_version: 1
 checks:
   hub-serves-current-records:
-    uses: fixture/observe
+    uses: cmd/run
     with:
       target: example-org/example-repo
       fresh_for: 1h
@@ -1105,7 +1126,7 @@ checks:
 
     fn action() -> ActionDefinition {
         ActionDefinition {
-            uses: "fixture/observe".to_owned(),
+            uses: "cmd/run".to_owned(),
             producer: "test-fixture".to_owned(),
             default_fresh_for_seconds: 300,
             definition: json!({"fixture": "observation"}),
@@ -1166,6 +1187,13 @@ checks:
         }
         let unknown_document = format!("{DOCUMENT}\nunknown: true\n");
         assert!(CheckDocument::from_yaml(&unknown_document).is_err());
+    }
+
+    #[test]
+    fn unknown_action_is_a_parse_failure() {
+        let error = CheckDocument::from_yaml(&DOCUMENT.replace("cmd/run", "missing/observe"))
+            .expect_err("the action catalogue is closed");
+        assert_eq!(error.fault_name(), Some("unknown_action"));
     }
 
     #[test]
@@ -1265,8 +1293,8 @@ checks:
         assert_ne!(blocked.definition_digest, warned.definition_digest);
 
         let overridden = CheckDocument::from_yaml(&DOCUMENT.replace(
-            "    uses: fixture/observe",
-            "    uses: fixture/observe\n    inconclusive_policy: pass",
+            "    uses: cmd/run",
+            "    uses: cmd/run\n    inconclusive_policy: pass",
         ))
         .expect("per-check policy parses");
         let passed = resolve_check(
@@ -1371,10 +1399,10 @@ checks:
 checks_version: 1
 checks:
   source:
-    uses: fixture/observe
+    uses: cmd/run
     with: {}
   hub-serves-current-records:
-    uses: agent/inspect
+    uses: agent/claude
     with:
       prompt: inspect the bounded source
       evidence: [{from: source}]
@@ -1382,7 +1410,7 @@ checks:
         )
         .expect("agent fixture parses");
         let mut action = action();
-        action.uses = "agent/inspect".to_owned();
+        action.uses = "agent/claude".to_owned();
         assert_eq!(
             resolve_check(
                 "hub-serves-current-records",
