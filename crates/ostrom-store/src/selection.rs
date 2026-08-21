@@ -151,10 +151,12 @@ pub fn run_selection(request: &SelectRequest) -> Result<(SelectOutcome, Vec<Stri
     let (plan_application, plan_order, rejection_clause) =
         evaluate_plan(&plan_path, &config, &queue_items, &candidates)?;
     if plan_application == PlanApplication::Rejected {
-        diagnostics.push(
-            "mandate selection: stale or invalid plan.json ignored; using mechanical ranking"
-                .to_owned(),
-        );
+        let clause = rejection_clause
+            .as_deref()
+            .expect("rejected plans name a rejection clause");
+        diagnostics.push(format!(
+            "mandate selection: plan.json rejected ({clause}); using mechanical ranking"
+        ));
     }
 
     let candidate_items = candidates
@@ -177,6 +179,15 @@ pub fn run_selection(request: &SelectRequest) -> Result<(SelectOutcome, Vec<Stri
 
     match &request.action {
         SelectAction::List => {
+            let mut fact = Map::new();
+            fact.insert("action".to_owned(), json!("list"));
+            append_plan_selection_trace(
+                &request.paths.trace_file(),
+                &selection_trace_timestamp(),
+                fact,
+                plan_application,
+                rejection_clause.as_deref(),
+            )?;
             let outcome = if ordered.is_empty() {
                 SelectOutcome::Empty
             } else {
@@ -189,6 +200,17 @@ pub fn run_selection(request: &SelectRequest) -> Result<(SelectOutcome, Vec<Stri
                 .iter()
                 .find(|row| row["id"].as_str().is_some_and(|id| !attempted.contains(id)))
             else {
+                let mut fact = Map::new();
+                fact.insert("owner".to_owned(), json!(owner));
+                fact.insert("action".to_owned(), json!("select"));
+                fact.insert("outcome".to_owned(), json!("empty"));
+                append_plan_selection_trace(
+                    &request.paths.trace_file(),
+                    &selection_trace_timestamp(),
+                    fact,
+                    plan_application,
+                    rejection_clause.as_deref(),
+                )?;
                 return Ok((SelectOutcome::Empty, diagnostics));
             };
             append_selection_traces(
@@ -416,11 +438,7 @@ fn append_selection_traces(
     rejection_clause: Option<&str>,
 ) -> Result<(), SelectError> {
     let trace_path = request.paths.trace_file();
-    let timestamp = std::env::var("MANDATE_TRACE_TIME").unwrap_or_else(|_| {
-        chrono::DateTime::<Utc>::from(SystemTime::now())
-            .format("%Y-%m-%dT%H:%M:%SZ")
-            .to_string()
-    });
+    let timestamp = selection_trace_timestamp();
     let selected_id = selected["id"].as_str().ok_or(SelectError::InvalidGraph)?;
     let graph_by_id = graph
         .nodes
@@ -491,29 +509,48 @@ fn append_selection_traces(
         append_fact(&trace_path, &timestamp, "work-ranked", Value::Object(fact))?;
     }
 
-    let status = match plan_application {
-        PlanApplication::Absent => "absent",
-        PlanApplication::Applied => "applied",
-        PlanApplication::Rejected => "rejected",
-    };
     let mut fact = Map::new();
     fact.insert("owner".to_owned(), json!(owner));
     fact.insert("repo".to_owned(), selected["repo"].clone());
     fact.insert("ref".to_owned(), selected["ref"].clone());
     fact.insert("action".to_owned(), json!("delegated-selection"));
     fact.insert("selected".to_owned(), json!(selected_id));
+    append_plan_selection_trace(
+        &trace_path,
+        &timestamp,
+        fact,
+        plan_application,
+        rejection_clause,
+    )?;
+    let _ = (raw_queue, ordered);
+    Ok(())
+}
+
+fn selection_trace_timestamp() -> String {
+    std::env::var("MANDATE_TRACE_TIME").unwrap_or_else(|_| {
+        chrono::DateTime::<Utc>::from(SystemTime::now())
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string()
+    })
+}
+
+fn append_plan_selection_trace(
+    path: &Path,
+    timestamp: &str,
+    mut fact: Map<String, Value>,
+    plan_application: PlanApplication,
+    rejection_clause: Option<&str>,
+) -> Result<(), SelectError> {
+    let status = match plan_application {
+        PlanApplication::Absent => "absent",
+        PlanApplication::Applied => "applied",
+        PlanApplication::Rejected => "rejected",
+    };
     fact.insert("plan_status".to_owned(), json!(status));
     if let Some(clause) = rejection_clause {
         fact.insert("plan_rejection_clause".to_owned(), json!(clause));
     }
-    append_fact(
-        &trace_path,
-        &timestamp,
-        "plan-selection",
-        Value::Object(fact),
-    )?;
-    let _ = (raw_queue, ordered);
-    Ok(())
+    append_fact(path, timestamp, "plan-selection", Value::Object(fact))
 }
 
 fn append_fact(path: &Path, timestamp: &str, kind: &str, fact: Value) -> Result<(), SelectError> {

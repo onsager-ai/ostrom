@@ -1,6 +1,6 @@
 use std::{fs, process::Command};
 
-use serde_json::json;
+use serde_json::{Value, json};
 use tempfile::tempdir;
 
 fn write_selection_fixture(root: &std::path::Path, padding: usize) {
@@ -56,6 +56,34 @@ projects:
         serde_json::to_vec(&state).expect("state JSON"),
     )
     .expect("write state");
+}
+
+fn write_valid_selection_plan(root: &std::path::Path) {
+    fs::write(
+        root.join("plan.json"),
+        serde_json::to_vec(&json!({
+            "plan_version": 1,
+            "queue_basis": [
+                {"id":"placeholder-org/alpha#1","opened":"2026-01-01T00:00:00Z","kind":"moved","state":"pending","blocked_by":[],"graph_dispatchable":true,"unblocking_power":1},
+                {"id":"placeholder-org/alpha#2","opened":"2026-02-01T00:00:00Z","kind":"stuck","state":"pending","blocked_by":[],"graph_dispatchable":true,"unblocking_power":0},
+                {"id":"placeholder-org/alpha#3","opened":"2025-12-01T00:00:00Z","kind":"moved","state":"pending","blocked_by":["placeholder-org/alpha#1"],"graph_dispatchable":false,"unblocking_power":0}
+            ],
+            "ranking": {
+                "work_ranking": ["placeholder-org/alpha#2"],
+                "ordered": ["placeholder-org/alpha#1", "placeholder-org/alpha#2"]
+            }
+        }))
+        .expect("plan JSON"),
+    )
+    .expect("write plan");
+}
+
+fn read_trace(root: &std::path::Path) -> Vec<Value> {
+    fs::read_to_string(root.join("sprint.jsonl"))
+        .expect("read trace")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("trace row JSON"))
+        .collect()
 }
 
 #[test]
@@ -161,7 +189,7 @@ fn selection_io_fault_is_named_and_nonzero() {
 }
 
 #[test]
-fn known_empty_selection_is_successful_and_has_no_rows() {
+fn known_empty_selection_is_successful_and_has_no_output_rows() {
     let fixture = tempdir().expect("fixture");
     write_selection_fixture(fixture.path(), 0);
     fs::write(fixture.path().join("queue.jsonl"), "").expect("empty queue");
@@ -201,6 +229,102 @@ projects:
     assert!(output.status.success());
     assert!(output.stdout.is_empty());
     assert!(output.stderr.is_empty());
+    let rows = read_trace(fixture.path());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["kind"], "plan-selection");
+    assert_eq!(rows[0]["fact"]["action"], "list");
+    assert_eq!(rows[0]["fact"]["plan_status"], "absent");
+    for field in ["selected", "repo", "ref"] {
+        assert!(rows[0]["fact"].get(field).is_none(), "unexpected {field}");
+    }
+}
+
+#[test]
+fn rejected_plan_diagnostic_and_trace_name_the_clause() {
+    for (clause, plan) in [
+        (
+            "queue_basis",
+            serde_json::to_vec(&json!({
+                "plan_version": 1,
+                "queue_basis": []
+            }))
+            .expect("queue-basis plan JSON"),
+        ),
+        ("malformed_json", b"{malformed".to_vec()),
+    ] {
+        let fixture = tempdir().expect("fixture");
+        write_selection_fixture(fixture.path(), 0);
+        fs::write(fixture.path().join("plan.json"), plan).expect("write rejected plan");
+
+        let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+            .args(["select-work", "list"])
+            .env("OSTROM_HOME", fixture.path())
+            .env("MANDATE_TRACE_TIME", "2026-08-21T00:00:00Z")
+            .current_dir(fixture.path())
+            .output()
+            .expect("list with rejected plan");
+
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stderr).expect("UTF-8 diagnostic"),
+            format!("mandate selection: plan.json rejected ({clause}); using mechanical ranking\n")
+        );
+        let rows = read_trace(fixture.path());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["kind"], "plan-selection");
+        assert_eq!(rows[0]["fact"]["action"], "list");
+        assert_eq!(rows[0]["fact"]["plan_status"], "rejected");
+        assert_eq!(rows[0]["fact"]["plan_rejection_clause"], clause);
+    }
+}
+
+#[test]
+fn list_and_empty_select_record_plan_application_without_a_selected_item() {
+    let fixture = tempdir().expect("fixture");
+    write_selection_fixture(fixture.path(), 0);
+    write_valid_selection_plan(fixture.path());
+    let binary = env!("CARGO_BIN_EXE_ostrom");
+
+    let list = Command::new(binary)
+        .args(["select-work", "list"])
+        .env("OSTROM_HOME", fixture.path())
+        .env("MANDATE_TRACE_TIME", "2026-08-21T00:00:00Z")
+        .current_dir(fixture.path())
+        .output()
+        .expect("list selection");
+    assert!(list.status.success());
+    assert!(list.stderr.is_empty());
+
+    let empty = Command::new(binary)
+        .args([
+            "select-work",
+            "select",
+            "builder-placeholder-wake1",
+            "placeholder-org/alpha#1",
+            "placeholder-org/alpha#2",
+        ])
+        .env("OSTROM_HOME", fixture.path())
+        .env("MANDATE_TRACE_TIME", "2026-08-21T00:00:01Z")
+        .current_dir(fixture.path())
+        .output()
+        .expect("empty selection");
+    assert_eq!(empty.status.code(), Some(3));
+    assert!(empty.stdout.is_empty());
+    assert!(empty.stderr.is_empty());
+
+    let rows = read_trace(fixture.path());
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["kind"], "plan-selection");
+    assert_eq!(rows[0]["fact"]["action"], "list");
+    assert_eq!(rows[0]["fact"]["plan_status"], "applied");
+    assert_eq!(rows[1]["kind"], "plan-selection");
+    assert_eq!(rows[1]["fact"]["owner"], "builder-placeholder-wake1");
+    assert_eq!(rows[1]["fact"]["action"], "select");
+    assert_eq!(rows[1]["fact"]["outcome"], "empty");
+    assert_eq!(rows[1]["fact"]["plan_status"], "applied");
+    for field in ["selected", "repo", "ref"] {
+        assert!(rows[1]["fact"].get(field).is_none(), "unexpected {field}");
+    }
 }
 
 #[test]
