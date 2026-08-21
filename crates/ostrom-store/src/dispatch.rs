@@ -8,10 +8,9 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Output},
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
-use chrono::{DateTime, Utc};
 use ostrom_core::{
     BranchListing, BranchListingFault, BranchListingOutcome, MandateConfig, RemoteBranch,
     WorkOrder, resolve_exact_branch,
@@ -19,12 +18,12 @@ use ostrom_core::{
 use serde_json::{Map, Value, json};
 
 use crate::{
-    LeaseRecord, OstromPaths, TraceAppend,
+    Clock, LeaseRecord, OstromPaths, TraceAppend,
     app_token::{
         AuthenticatedCommandError, GitHubInstallationTokenMinter, InstallationTokenMinter,
         ScopedAppTokenRequest, authenticated_output,
     },
-    append_trace, load_config_or_defaults, read_lease, read_trace,
+    append_trace, environment, load_config_or_defaults, read_lease, read_trace,
     work_order::{implementer_lease_ttl, in_flight_orders, reap_stale_work_orders},
 };
 
@@ -41,6 +40,7 @@ pub struct DispatchRequest {
     pub working_directory: PathBuf,
     pub plugin_root: PathBuf,
     pub order_file: PathBuf,
+    pub clock: Clock,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,7 +165,9 @@ fn run_dispatch_with_minter(
         order,
         item_hash,
         unit_name,
-        backend: env::var("MANDATE_DISPATCH_BACKEND").unwrap_or_else(|_| "systemd".to_owned()),
+        backend: environment::MANDATE_DISPATCH_BACKEND
+            .value()
+            .unwrap_or_else(|| "systemd".to_owned()),
         listing: ListingState::empty(),
         matched_key: None,
     };
@@ -222,8 +224,9 @@ fn run_dispatch_with_minter(
     let resolved_codex = resolve_codex(&context)?;
     let resolved_node = resolve_node(&context, &resolved_codex)?;
     let resolved_ostrom = resolve_ostrom(&context)?;
-    let inherited_path =
-        env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".to_owned());
+    let inherited_path = environment::PATH
+        .value()
+        .unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".to_owned());
     let node_dir = resolved_node.parent().unwrap_or_else(|| Path::new("."));
     let unit_path = format!("{}:{inherited_path}", node_dir.display());
     let executable = Command::new(&resolved_codex)
@@ -246,7 +249,7 @@ fn run_dispatch_with_minter(
     // Reap before acquiring this item's lease. If an old order is genuinely
     // still live, its possibly expired lease must not be replaced merely to
     // discover the duplicate after the fact.
-    reap_stale_work_orders(&request.paths.state)
+    reap_stale_work_orders(&request.paths.state, &request.clock)
         .map_err(|error| DispatchError::new(1, error.to_string()))?;
     if in_flight_orders(&request.paths.trace_file())
         .map_err(|error| DispatchError::new(1, error.to_string()))?
@@ -263,8 +266,8 @@ fn run_dispatch_with_minter(
     }
 
     let derived_lease_ttl = implementer_lease_ttl(&context.order);
-    let lease_ttl = match env::var("MANDATE_IMPLEMENTER_LEASE_TTL_SECONDS") {
-        Ok(value) => value
+    let lease_ttl = match environment::MANDATE_IMPLEMENTER_LEASE_TTL_SECONDS.value() {
+        Some(value) => value
             .parse::<u64>()
             .ok()
             .filter(|value| *value > 0)
@@ -277,27 +280,28 @@ fn run_dispatch_with_minter(
                     ),
                 )
             })?,
-        Err(_) => derived_lease_ttl,
+        None => derived_lease_ttl,
     };
     let lease_path = request
         .paths
         .state
         .join(format!("implementer-item-{}.lease", context.item_hash));
     let mut lease =
-        acquire_dispatch_lease(&lease_path, &context.unit_name, lease_ttl).map_err(|code| {
-            let message = if code == 3 {
-                format!(
-                    "ostrom dispatch: item already has a live implementer lease: {}",
-                    context.order.item_id
-                )
-            } else {
-                format!(
-                    "ostrom dispatch: could not acquire implementer lease for {} (rc={code})",
-                    context.order.item_id
-                )
-            };
-            DispatchError::new(code, message)
-        })?;
+        acquire_dispatch_lease(&lease_path, &context.unit_name, lease_ttl, &request.clock)
+            .map_err(|code| {
+                let message = if code == 3 {
+                    format!(
+                        "ostrom dispatch: item already has a live implementer lease: {}",
+                        context.order.item_id
+                    )
+                } else {
+                    format!(
+                        "ostrom dispatch: could not acquire implementer lease for {} (rc={code})",
+                        context.order.item_id
+                    )
+                };
+                DispatchError::new(code, message)
+            })?;
 
     let result = after_lease(
         &context,
@@ -370,7 +374,7 @@ fn after_lease(
         ));
     }
 
-    reap_stale_work_orders(&context.request.paths.state)
+    reap_stale_work_orders(&context.request.paths.state, &context.request.clock)
         .map_err(|error| DispatchError::new(1, error.to_string()))?;
     let trace = read_trace(&context.request.paths.trace_file())
         .map_err(|error| DispatchError::new(1, format!("ostrom dispatch: {error}")))?;
@@ -405,8 +409,8 @@ fn after_lease(
         ));
     }
 
-    let max_implementers =
-        positive_usize_env("MANDATE_MAX_IMPLEMENTERS")?.unwrap_or(DEFAULT_MAX_IMPLEMENTERS);
+    let max_implementers = positive_usize_env(environment::MANDATE_MAX_IMPLEMENTERS)?
+        .unwrap_or(DEFAULT_MAX_IMPLEMENTERS);
     let project_default = config
         .into_iter()
         .flat_map(|config| &config.projects)
@@ -415,7 +419,8 @@ fn after_lease(
         .and_then(|value| usize::try_from(value).ok())
         .unwrap_or(DEFAULT_MAX_IMPLEMENTERS_PER_REPOSITORY);
     let max_per_repository =
-        positive_usize_env("MANDATE_MAX_IMPLEMENTERS_PER_REPOSITORY")?.unwrap_or(project_default);
+        positive_usize_env(environment::MANDATE_MAX_IMPLEMENTERS_PER_REPOSITORY)?
+            .unwrap_or(project_default);
     if inflight.len() >= max_implementers {
         return Err(DispatchError::new(
             3,
@@ -445,24 +450,12 @@ fn after_lease(
         ));
     }
 
-    let daily_cap = env::var("MANDATE_DAILY_CAP_USD")
-        .ok()
+    let daily_cap = environment::MANDATE_DAILY_CAP_USD
+        .value()
         .and_then(|value| value.parse::<f64>().ok())
         .filter(|value| *value > 0.0)
         .unwrap_or(DEFAULT_DAILY_CAP_USD);
-    let now = env::var("MANDATE_NOW_EPOCH")
-        .ok()
-        .and_then(|value| value.parse::<i64>().ok())
-        .unwrap_or_else(|| {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64
-        });
-    let day = DateTime::<Utc>::from_timestamp(now, 0)
-        .unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
-        .format("%Y-%m-%d")
-        .to_string();
+    let day = context.request.clock.date();
     let actual = rows
         .iter()
         .filter(|row| row.ts.starts_with(&day))
@@ -496,7 +489,8 @@ fn after_lease(
         ));
     }
 
-    let systemd = env::var_os("MANDATE_SYSTEMD_RUN_BIN")
+    let systemd = environment::MANDATE_SYSTEMD_RUN_BIN
+        .value_os()
         .map_or_else(|| PathBuf::from("systemd-run"), PathBuf::from);
     let state_environment = dispatch_state_environment(&context.request.paths);
     let lease_name = format!("implementer-item-{}.lease", context.item_hash);
@@ -504,8 +498,8 @@ fn after_lease(
     // stubs either do not create units or run the child to completion, so only
     // the real backend (or a fixture with an explicit systemctl seam) can be
     // checked for post-launch liveness.
-    let verify_startup = env::var_os("MANDATE_SYSTEMD_RUN_BIN").is_none()
-        || env::var_os("MANDATE_SYSTEMCTL_BIN").is_some();
+    let verify_startup = environment::MANDATE_SYSTEMD_RUN_BIN.value_os().is_none()
+        || environment::MANDATE_SYSTEMCTL_BIN.value_os().is_some();
     if !verify_startup {
         append_dispatched(context)?;
     }
@@ -594,7 +588,8 @@ fn after_lease(
 }
 
 fn dispatch_state_environment(paths: &OstromPaths) -> String {
-    env::var_os("CLAUDE_CONFIG_DIR")
+    environment::CLAUDE_CONFIG_DIR
+        .value_os()
         .filter(|value| !value.to_string_lossy().trim().is_empty())
         .map_or_else(
             || format!("OSTROM_HOME={}", paths.state.display()),
@@ -603,14 +598,15 @@ fn dispatch_state_environment(paths: &OstromPaths) -> String {
 }
 
 fn implementer_unit_is_alive(unit_name: &str) -> bool {
-    let grace_milliseconds = env::var("MANDATE_IMPLEMENTER_STARTUP_GRACE_MILLISECONDS")
-        .ok()
+    let grace_milliseconds = environment::MANDATE_IMPLEMENTER_STARTUP_GRACE_MILLISECONDS
+        .value()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(IMPLEMENTER_STARTUP_GRACE_MILLISECONDS);
     if grace_milliseconds > 0 {
         thread::sleep(Duration::from_millis(grace_milliseconds));
     }
-    let systemctl = env::var_os("MANDATE_SYSTEMCTL_BIN")
+    let systemctl = environment::MANDATE_SYSTEMCTL_BIN
+        .value_os()
         .map_or_else(|| PathBuf::from("systemctl"), PathBuf::from);
     Command::new(systemctl)
         .args(["--user", "is-active", "--quiet", unit_name])
@@ -689,7 +685,7 @@ fn resolve_source_repository(
     context: &DispatchContext<'_>,
     config: Option<&MandateConfig>,
 ) -> Result<PathBuf, DispatchError> {
-    let result = if let Some(source) = env::var_os("MANDATE_IMPLEMENTER_SOURCE_REPO") {
+    let result = if let Some(source) = environment::MANDATE_IMPLEMENTER_SOURCE_REPO.value_os() {
         let source = PathBuf::from(source);
         if source.is_dir() {
             Ok(source)
@@ -1117,7 +1113,9 @@ fn reject_closing_pull_requests(
 }
 
 fn resolve_codex(context: &DispatchContext<'_>) -> Result<PathBuf, DispatchError> {
-    let command = env::var_os("CODEX_BIN").map_or_else(|| "codex".into(), PathBuf::from);
+    let command = environment::CODEX_BIN
+        .value_os()
+        .map_or_else(|| "codex".into(), PathBuf::from);
     let resolved = if command.components().count() > 1 {
         absolute_executable(&command)
     } else {
@@ -1149,7 +1147,7 @@ fn resolve_node(context: &DispatchContext<'_>, codex: &Path) -> Result<PathBuf, 
 }
 
 fn resolve_ostrom(context: &DispatchContext<'_>) -> Result<PathBuf, DispatchError> {
-    let override_path = env::var_os("MANDATE_OSTROM_BIN");
+    let override_path = environment::MANDATE_OSTROM_BIN.value_os();
     let command = override_path
         .as_ref()
         .map_or_else(|| PathBuf::from("ostrom"), PathBuf::from);
@@ -1191,7 +1189,7 @@ fn absolute_executable(candidate: &Path) -> Option<PathBuf> {
 }
 
 fn find_on_path(command: &Path) -> Option<PathBuf> {
-    find_on_path_in(command, env::var_os("PATH").as_deref())
+    find_on_path_in(command, environment::PATH.value_os().as_deref())
 }
 
 fn find_on_path_in(command: &Path, path: Option<&OsStr>) -> Option<PathBuf> {
@@ -1199,8 +1197,8 @@ fn find_on_path_in(command: &Path, path: Option<&OsStr>) -> Option<PathBuf> {
 }
 
 fn find_in_nvm(command: &Path) -> Option<PathBuf> {
-    let home = nonempty_env_path("HOME");
-    let nvm = env_path_or_home("NVM_DIR", home.as_deref(), ".nvm")?;
+    let home = nonempty_env_path(environment::HOME);
+    let nvm = env_path_or_home(environment::NVM_DIR, home.as_deref(), ".nvm")?;
     find_in_nvm_root(command, &nvm)
 }
 
@@ -1263,14 +1261,19 @@ fn is_ascii_number(value: &str) -> bool {
     !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
-fn nonempty_env_path(name: &str) -> Option<PathBuf> {
-    env::var_os(name)
+fn nonempty_env_path(variable: environment::EnvironmentVariable) -> Option<PathBuf> {
+    variable
+        .value_os()
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
 }
 
-fn env_path_or_home(name: &str, home: Option<&Path>, home_suffix: &str) -> Option<PathBuf> {
-    nonempty_env_path(name).or_else(|| home.map(|path| path.join(home_suffix)))
+fn env_path_or_home(
+    variable: environment::EnvironmentVariable,
+    home: Option<&Path>,
+    home_suffix: &str,
+) -> Option<PathBuf> {
+    nonempty_env_path(variable).or_else(|| home.map(|path| path.join(home_suffix)))
 }
 
 #[derive(Debug)]
@@ -1285,16 +1288,18 @@ struct NodeResolver {
 
 impl NodeResolver {
     fn from_environment() -> Self {
-        let home = nonempty_env_path("HOME");
+        let home = nonempty_env_path(environment::HOME);
         let mut fnm_dirs = Vec::new();
-        if let Some(directory) = env_path_or_home("FNM_DIR", home.as_deref(), ".local/share/fnm") {
+        if let Some(directory) =
+            env_path_or_home(environment::FNM_DIR, home.as_deref(), ".local/share/fnm")
+        {
             fnm_dirs.push(directory);
         }
         if let Some(home) = &home {
             fnm_dirs.push(home.join(".fnm"));
         }
 
-        let standalone = env::var_os("OSTROM_NODE_FALLBACKS").map_or_else(
+        let standalone = environment::OSTROM_NODE_FALLBACKS.value_os().map_or_else(
             || {
                 let mut paths = vec![
                     PathBuf::from("/usr/local/bin/node"),
@@ -1315,11 +1320,11 @@ impl NodeResolver {
         );
 
         Self {
-            path: env::var_os("PATH"),
-            nvm_dir: env_path_or_home("NVM_DIR", home.as_deref(), ".nvm"),
+            path: environment::PATH.value_os(),
+            nvm_dir: env_path_or_home(environment::NVM_DIR, home.as_deref(), ".nvm"),
             fnm_dirs,
-            volta_home: env_path_or_home("VOLTA_HOME", home.as_deref(), ".volta"),
-            asdf_data_dir: env_path_or_home("ASDF_DATA_DIR", home.as_deref(), ".asdf"),
+            volta_home: env_path_or_home(environment::VOLTA_HOME, home.as_deref(), ".volta"),
+            asdf_data_dir: env_path_or_home(environment::ASDF_DATA_DIR, home.as_deref(), ".asdf"),
             standalone,
         }
     }
@@ -1355,8 +1360,10 @@ impl NodeResolver {
     }
 }
 
-fn positive_usize_env(name: &str) -> Result<Option<usize>, DispatchError> {
-    let Some(value) = env::var_os(name) else {
+fn positive_usize_env(
+    variable: environment::EnvironmentVariable,
+) -> Result<Option<usize>, DispatchError> {
+    let Some(value) = variable.value_os() else {
         return Ok(None);
     };
     let parsed = value
@@ -1367,7 +1374,10 @@ fn positive_usize_env(name: &str) -> Result<Option<usize>, DispatchError> {
         .ok_or_else(|| {
             DispatchError::new(
                 2,
-                format!("ostrom dispatch: {name} must be a positive integer"),
+                format!(
+                    "ostrom dispatch: {} must be a positive integer",
+                    variable.name
+                ),
             )
         })?;
     Ok(Some(parsed))
@@ -1552,15 +1562,10 @@ fn append_fact(
     kind: &str,
     fact: Map<String, Value>,
 ) -> Result<(), DispatchError> {
-    let timestamp = env::var("MANDATE_TRACE_TIME").unwrap_or_else(|_| {
-        DateTime::<Utc>::from(SystemTime::now())
-            .format("%Y-%m-%dT%H:%M:%SZ")
-            .to_string()
-    });
     append_trace(
         &context.request.paths.trace_file(),
         &TraceAppend {
-            ts: timestamp,
+            ts: context.request.clock.timestamp(),
             kind: kind.to_owned(),
             fact,
             narration: Map::new(),
@@ -1600,8 +1605,13 @@ impl Drop for LeaseGuard {
     }
 }
 
-fn acquire_dispatch_lease(path: &Path, owner: &str, ttl: u64) -> Result<LeaseGuard, i32> {
-    let now = current_lease_time();
+fn acquire_dispatch_lease(
+    path: &Path,
+    owner: &str,
+    ttl: u64,
+    clock: &Clock,
+) -> Result<LeaseGuard, i32> {
+    let now = clock.epoch_seconds();
     if let Ok(Some(existing)) = read_lease(path) {
         let derived_expiry = existing.started_at.saturating_add(ttl);
         if existing.expires_at.min(derived_expiry) > now {
@@ -1639,19 +1649,6 @@ fn acquire_dispatch_lease(path: &Path, owner: &str, ttl: u64) -> Result<LeaseGua
         owner: owner.to_owned(),
         armed: true,
     })
-}
-
-fn current_lease_time() -> u64 {
-    env::var("MANDATE_LEASE_NOW_EPOCH")
-        .or_else(|_| env::var("MANDATE_NOW_EPOCH"))
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or_else(|| {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs()
-        })
 }
 
 fn closing_reference(text: &str, item_ref: &str) -> bool {

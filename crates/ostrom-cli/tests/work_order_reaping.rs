@@ -12,8 +12,6 @@ use tempfile::TempDir;
 
 const ITEM_ID: &str = "placeholder-org/alpha#42";
 const DISPATCH_TIME: &str = "2026-08-01T00:00:00Z";
-const DISPATCH_EPOCH: &str = "1785542400";
-const STALE_EPOCH: &str = "1785548000";
 const UNIT: &str = "ostrom-implementer-placeholder";
 
 struct Fixture {
@@ -50,8 +48,6 @@ impl Fixture {
         let systemctl = root.path().join("systemctl-stub");
         executable(&systemctl, systemctl_source);
         let create = command(&root, &state, &systemctl)
-            .env("MANDATE_TRACE_TIME", DISPATCH_TIME)
-            .env("MANDATE_NOW_EPOCH", DISPATCH_EPOCH)
             .args(["work-order", "create", candidate.to_str().unwrap()])
             .output()
             .expect("create initial order");
@@ -141,8 +137,6 @@ fn stale_missing_order_is_reaped_before_replacement_without_rewriting_trace() {
     let old_order_id = fixture.order_id();
     let output = fixture
         .command()
-        .env("MANDATE_NOW_EPOCH", STALE_EPOCH)
-        .env("MANDATE_TRACE_TIME", "2026-08-01T01:33:20Z")
         .args(["work-order", "create", fixture.candidate.to_str().unwrap()])
         .output()
         .expect("replace stale order");
@@ -164,7 +158,6 @@ fn old_but_live_order_is_not_reaped_or_replaced() {
     let original = fs::read(fixture.state.join("sprint.jsonl")).expect("original trace");
     let output = fixture
         .command()
-        .env("MANDATE_NOW_EPOCH", STALE_EPOCH)
         .args(["work-order", "create", fixture.candidate.to_str().unwrap()])
         .output()
         .expect("refuse live replacement");
@@ -181,7 +174,6 @@ fn stale_bound_reaps_when_unit_state_cannot_be_resolved() {
     let fixture = Fixture::new("exit 1");
     let output = fixture
         .command()
-        .env("MANDATE_NOW_EPOCH", STALE_EPOCH)
         .args(["work-order", "create", fixture.candidate.to_str().unwrap()])
         .output()
         .expect("replace order after derived TTL");
@@ -197,7 +189,6 @@ fn clear_names_one_stranded_order_and_refuses_a_live_one() {
     let order_id = missing.order_id();
     let output = missing
         .command()
-        .env("MANDATE_NOW_EPOCH", DISPATCH_EPOCH)
         .args(["work-order", "clear", &order_id])
         .output()
         .expect("clear missing unit");
@@ -212,7 +203,6 @@ fn clear_names_one_stranded_order_and_refuses_a_live_one() {
         Fixture::new("printf '%s\\n' 'ActiveState=active' 'ExecMainCode=' 'ExecMainStatus=0'");
     let output = live
         .command()
-        .env("MANDATE_NOW_EPOCH", STALE_EPOCH)
         .args(["work-order", "clear", ITEM_ID])
         .output()
         .expect("refuse live clear");

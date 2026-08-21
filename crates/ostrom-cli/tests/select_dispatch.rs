@@ -116,7 +116,6 @@ fn selection_matches_recorded_shell_bytes() {
             "placeholder-org/alpha#2",
         ])
         .env("OSTROM_HOME", fixture.path())
-        .env("MANDATE_TRACE_TIME", "2026-08-17T00:00:00Z")
         .current_dir(fixture.path())
         .output()
         .expect("select one");

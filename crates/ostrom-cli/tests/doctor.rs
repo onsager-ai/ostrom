@@ -152,6 +152,29 @@ fn unknown_exact_check_exits_two() {
 }
 
 #[test]
+fn full_doctor_names_every_registered_environment_variable() {
+    let fixture = tempdir().expect("temporary doctor root");
+    let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .arg("doctor")
+        .current_dir(fixture.path())
+        .env_clear()
+        .env("HOME", fixture.path())
+        .output()
+        .expect("run full native doctor");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("doctor UTF-8 output");
+    for variable in ostrom_store::ENVIRONMENT_VARIABLES {
+        let prefix = format!("ENV|{}|class={}|set=", variable.name, variable.class);
+        assert!(
+            stdout.lines().any(|line| line.starts_with(&prefix)),
+            "doctor omitted {}",
+            variable.name
+        );
+    }
+    assert!(stdout.contains("ENV|HOME|class=identity|set=yes|resolved="));
+}
+
+#[test]
 fn trace_completeness_accepts_matching_counts_in_the_most_recent_pass() {
     let fixture = tempdir().expect("temporary doctor root");
     let config = fixture.path().join("config");

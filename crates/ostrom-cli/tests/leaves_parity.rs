@@ -1,12 +1,14 @@
 #![cfg(unix)]
 
 use std::{
-    fs,
+    env, fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Command, Output},
 };
 
+use chrono::{DateTime, Utc};
+use ostrom_store::{AuditOptions, OstromPaths, audit, grant_excuse, list_excuses};
 use serde_json::Value;
 use tempfile::{TempDir, tempdir};
 
@@ -29,58 +31,86 @@ fn audit_matches_recorded_shell_output_byte_for_byte() {
     )
     .expect("copy gate log");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
-        .args(["audit", "--days", "30"])
-        .current_dir(&fixture.working_directory)
-        .env("OSTROM_HOME", fixture.home.path())
-        .env("MANDATE_AUDIT_TIME", "2026-08-01T00:00:00Z")
-        .env("OSTROM_TEST_MERGED_PRS", fixture_path("merged-prs.json"))
-        .env("PATH", fixture.path())
-        .output()
-        .expect("run Rust audit");
-    assert_success(&output);
+    let output = run_injected_leaf(&fixture, "audit");
     assert_eq!(
-        output.stdout,
+        output,
         fs::read(fixture_path("audit.expected.txt")).unwrap()
     );
-    assert!(output.stderr.is_empty());
 }
 
 #[test]
 fn excuse_grant_and_list_match_recorded_shell_output_byte_for_byte() {
     let fixture = leaf_fixture();
-    let grant = Command::new(env!("CARGO_BIN_EXE_ostrom"))
-        .args([
-            "excuse",
-            "grant",
-            "placeholder-org/alpha#7",
-            "review_threads",
-            "placeholder exception reason",
-        ])
-        .env("OSTROM_HOME", fixture.home.path())
-        .env("MANDATE_EXCUSE_TIME", "2026-08-01T12:00:00Z")
-        .env("PATH", fixture.path())
-        .output()
-        .expect("run Rust excuse grant");
-    assert_success(&grant);
+    let grant = run_injected_leaf(&fixture, "grant");
     let expected_grant = fs::read(fixture_path("excuse-grant.expected.jsonl")).unwrap();
-    assert_eq!(grant.stdout, expected_grant);
+    assert_eq!(grant, expected_grant);
     assert_eq!(
         fs::read(fixture.home.path().join("exceptions.jsonl")).unwrap(),
         expected_grant
     );
 
-    let list = Command::new(env!("CARGO_BIN_EXE_ostrom"))
-        .args(["excuse", "list", "placeholder-org/alpha#7"])
-        .env("OSTROM_HOME", fixture.home.path())
-        .env("PATH", fixture.path())
-        .output()
-        .expect("run Rust excuse list");
-    assert_success(&list);
+    let list = run_injected_leaf(&fixture, "list");
     assert_eq!(
-        list.stdout,
+        list,
         fs::read(fixture_path("excuse-list.expected.txt")).unwrap()
     );
+}
+
+fn run_injected_leaf(fixture: &LeafFixture, action: &str) -> Vec<u8> {
+    let output_path = fixture.home.path().join(format!("{action}.output"));
+    let output = Command::new(env::current_exe().expect("current integration test executable"))
+        .args(["--exact", "injected_clock_leaf_child"])
+        .env("OSTROM_TEST_LEAF_ACTION", action)
+        .env("OSTROM_TEST_LEAF_HOME", fixture.home.path())
+        .env("OSTROM_TEST_LEAF_CWD", &fixture.working_directory)
+        .env("OSTROM_TEST_LEAF_OUTPUT", &output_path)
+        .env("OSTROM_TEST_MERGED_PRS", fixture_path("merged-prs.json"))
+        .env("PATH", fixture.path())
+        .output()
+        .expect("run injected-clock leaf child");
+    assert_success(&output);
+    fs::read(output_path).expect("read injected-clock leaf output")
+}
+
+#[test]
+fn injected_clock_leaf_child() {
+    let Ok(action) = env::var("OSTROM_TEST_LEAF_ACTION") else {
+        return;
+    };
+    let home = PathBuf::from(env::var_os("OSTROM_TEST_LEAF_HOME").expect("leaf home"));
+    let working_directory = PathBuf::from(env::var_os("OSTROM_TEST_LEAF_CWD").expect("leaf cwd"));
+    let output_path = PathBuf::from(env::var_os("OSTROM_TEST_LEAF_OUTPUT").expect("leaf output"));
+    let paths = OstromPaths {
+        config: home.clone(),
+        state: home,
+    };
+    let fixed = |value: &str| {
+        DateTime::parse_from_rfc3339(value)
+            .expect("fixed leaf timestamp")
+            .with_timezone(&Utc)
+    };
+    let output = match action.as_str() {
+        "audit" => audit(&AuditOptions {
+            paths,
+            working_directory,
+            days: 30,
+            audit_time: fixed("2026-08-01T00:00:00Z"),
+        })
+        .expect("run fixed-clock audit"),
+        "grant" => grant_excuse(
+            &paths,
+            "placeholder-org/alpha#7",
+            "review_threads",
+            &["placeholder exception reason".to_owned()],
+            Some(fixed("2026-08-01T12:00:00Z")),
+        )
+        .expect("run fixed-clock excuse grant"),
+        "list" => {
+            list_excuses(&paths, Some("placeholder-org/alpha#7")).expect("run excuse listing")
+        }
+        _ => panic!("unknown leaf child action {action}"),
+    };
+    fs::write(output_path, output).expect("write injected-clock leaf output");
 }
 
 #[test]
@@ -270,7 +300,6 @@ fn granted_record_is_consumed_by_the_existing_sweep_join() {
             "placeholder merge explanation",
         ])
         .env("OSTROM_HOME", fixture.home.path())
-        .env("MANDATE_EXCUSE_TIME", "2026-07-03T01:00:00Z")
         .env("PATH", fixture.path())
         .output()
         .expect("grant merge protocol exception");

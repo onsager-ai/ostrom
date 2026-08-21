@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::{OstromPaths, PublishTarget, SweepMode, SweepOptions, run_sweep};
+use crate::{OstromPaths, PublishTarget, SweepMode, SweepOptions, environment, run_sweep};
 
 #[derive(Debug, Error)]
 pub enum ParityError {
@@ -52,11 +52,12 @@ impl SweepParityOptions {
         fixture: PathBuf,
         recorded_queue: PathBuf,
     ) -> Result<Self, ParityError> {
-        let source_home = env::var_os("OSTROM_HOME")
+        let source_home = environment::OSTROM_HOME
+            .value_os()
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .ok_or(ParityError::ScratchHomeRequired)?;
-        if let Some(home) = env::var_os("HOME") {
+        if let Some(home) = environment::HOME.value_os() {
             let live = PathBuf::from(home).join(".claude/ostrom");
             if same_path(&source_home, &live) {
                 return Err(ParityError::LiveHome(source_home.display().to_string()));

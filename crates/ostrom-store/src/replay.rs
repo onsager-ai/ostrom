@@ -12,7 +12,7 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 
 use crate::{
-    OstromPaths,
+    OstromPaths, environment,
     selector::{SelectorCandidate, glob_match, selector_match},
     sweep::load_config,
 };
@@ -123,7 +123,9 @@ pub fn replay(options: &ReplayOptions) -> Result<String, ReplayError> {
     if config.projects.is_empty() {
         return Err(ReplayError::EmptyRoster);
     }
-    let host = env::var("GH_HOST").unwrap_or_else(|_| "github.com".to_owned());
+    let host = environment::GH_HOST
+        .value()
+        .unwrap_or_else(|| "github.com".to_owned());
     if !Command::new("gh")
         .args(["auth", "status", "--hostname", &host])
         .output()
@@ -591,7 +593,7 @@ fn nonempty_string(value: Option<&Value>) -> Option<&str> {
 /// appeared in this codebase (#286 in the pass guard, #289 in dispatch
 /// resolution), so it reuses the one helper rather than writing a third test.
 fn command_exists(name: &str) -> bool {
-    env::var_os("PATH").is_some_and(|path| {
+    environment::PATH.value_os().is_some_and(|path| {
         env::split_paths(&path)
             .map(|directory| directory.join(name))
             .any(|candidate| crate::pass::is_executable_file(&candidate))

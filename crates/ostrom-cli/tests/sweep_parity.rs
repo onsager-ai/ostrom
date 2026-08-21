@@ -1,5 +1,6 @@
-use std::{fs, path::Path, process::Command};
+use std::{fs, path::Path, process::Command, time::SystemTime};
 
+use chrono::{DateTime, Utc};
 use tempfile::tempdir;
 
 const ROSTER: &str = r#"
@@ -700,7 +701,7 @@ esac
 }
 
 #[test]
-fn mandate_sweep_time_pins_sweep_and_cli_time_takes_precedence() {
+fn realtime_clock_drives_sweep_and_cli_time_takes_precedence() {
     let home = tempdir().expect("temporary OSTROM_HOME");
     let mut repository = placeholder_repository();
     repository["branches"] = serde_json::json!([
@@ -708,17 +709,23 @@ fn mandate_sweep_time_pins_sweep_and_cli_time_takes_precedence() {
     ]);
     let fixture = write_placeholder_fixture(home.path(), repository);
 
-    let pinned = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+    let before = DateTime::<Utc>::from(SystemTime::now());
+    let realtime = Command::new(env!("CARGO_BIN_EXE_ostrom"))
         .args(["sweep", "--fixture"])
         .arg(&fixture)
         .env("OSTROM_HOME", home.path())
-        .env("MANDATE_SWEEP_TIME", "2026-08-02T03:04:05Z")
         .current_dir(home.path())
         .output()
-        .expect("run environment-pinned sweep");
-    assert!(pinned.status.success());
-    let queue = fs::read_to_string(home.path().join("queue.jsonl")).expect("read pinned queue");
-    assert!(queue.contains(r#""opened":"2026-08-02T03:04:05Z""#));
+        .expect("run realtime sweep");
+    let after = DateTime::<Utc>::from(SystemTime::now());
+    assert!(realtime.status.success());
+    let queue = fs::read_to_string(home.path().join("queue.jsonl")).expect("read realtime queue");
+    let row: serde_json::Value =
+        serde_json::from_str(queue.lines().next().expect("queue row")).expect("parse queue row");
+    let opened = DateTime::parse_from_rfc3339(row["opened"].as_str().expect("opened timestamp"))
+        .expect("parse opened timestamp")
+        .with_timezone(&Utc);
+    assert!(opened.timestamp() >= before.timestamp() && opened.timestamp() <= after.timestamp());
 
     let overridden = Command::new(env!("CARGO_BIN_EXE_ostrom"))
         .args([
@@ -729,7 +736,6 @@ fn mandate_sweep_time_pins_sweep_and_cli_time_takes_precedence() {
             "2026-08-03T04:05:06Z",
         ])
         .env("OSTROM_HOME", home.path())
-        .env("MANDATE_SWEEP_TIME", "malformed")
         .current_dir(home.path())
         .output()
         .expect("run CLI-overridden sweep");
@@ -739,44 +745,40 @@ fn mandate_sweep_time_pins_sweep_and_cli_time_takes_precedence() {
     )
     .expect("parse overridden state");
     assert_eq!(state["last_full_reconciliation"], "2026-08-03T04:05:06Z");
-
-    let malformed = Command::new(env!("CARGO_BIN_EXE_ostrom"))
-        .args(["sweep", "--fixture"])
-        .arg(&fixture)
-        .env("OSTROM_HOME", home.path())
-        .env("MANDATE_SWEEP_TIME", "malformed")
-        .current_dir(home.path())
-        .output()
-        .expect("run malformed environment clock sweep");
-    assert!(!malformed.status.success());
-    assert!(
-        String::from_utf8_lossy(&malformed.stderr)
-            .contains("MANDATE_SWEEP_TIME is not a valid RFC3339 instant")
-    );
 }
 
 #[test]
-fn mandate_sweep_time_applies_to_plan_and_rejects_malformed_values() {
+fn realtime_clock_drives_plan_and_cli_time_takes_precedence() {
     let home = tempdir().expect("temporary OSTROM_HOME");
     let fixture = write_placeholder_fixture(home.path(), placeholder_repository());
-    let pinned = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+    let before = DateTime::<Utc>::from(SystemTime::now());
+    let realtime = Command::new(env!("CARGO_BIN_EXE_ostrom"))
         .args(["plan", "--fixture"])
         .arg(&fixture)
         .env("OSTROM_HOME", home.path())
-        .env("MANDATE_SWEEP_TIME", "2026-08-04T05:06:07Z")
         .current_dir(home.path())
         .output()
-        .expect("run environment-pinned plan");
+        .expect("run realtime plan");
+    let after = DateTime::<Utc>::from(SystemTime::now());
     assert!(
-        pinned.status.success(),
+        realtime.status.success(),
         "plan stderr: {}",
-        String::from_utf8_lossy(&pinned.stderr)
+        String::from_utf8_lossy(&realtime.stderr)
     );
     let state: serde_json::Value = serde_json::from_slice(
         &fs::read(home.path().join("state.json")).expect("read plan sweep state"),
     )
     .expect("parse plan sweep state");
-    assert_eq!(state["last_full_reconciliation"], "2026-08-04T05:06:07Z");
+    let reconciled = DateTime::parse_from_rfc3339(
+        state["last_full_reconciliation"]
+            .as_str()
+            .expect("reconciliation timestamp"),
+    )
+    .expect("parse reconciliation timestamp")
+    .with_timezone(&Utc);
+    assert!(
+        reconciled.timestamp() >= before.timestamp() && reconciled.timestamp() <= after.timestamp()
+    );
 
     let overridden = Command::new(env!("CARGO_BIN_EXE_ostrom"))
         .args([
@@ -787,25 +789,10 @@ fn mandate_sweep_time_applies_to_plan_and_rejects_malformed_values() {
             "2026-08-05T06:07:08Z",
         ])
         .env("OSTROM_HOME", home.path())
-        .env("MANDATE_SWEEP_TIME", "malformed")
         .current_dir(home.path())
         .output()
         .expect("run CLI-overridden plan");
     assert!(overridden.status.success());
-
-    let malformed = Command::new(env!("CARGO_BIN_EXE_ostrom"))
-        .args(["plan", "--fixture"])
-        .arg(&fixture)
-        .env("OSTROM_HOME", home.path())
-        .env("MANDATE_SWEEP_TIME", "malformed")
-        .current_dir(home.path())
-        .output()
-        .expect("run malformed environment clock plan");
-    assert!(!malformed.status.success());
-    assert!(
-        String::from_utf8_lossy(&malformed.stderr)
-            .contains("MANDATE_SWEEP_TIME is not a valid RFC3339 instant")
-    );
 }
 
 #[test]

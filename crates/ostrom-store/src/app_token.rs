@@ -1,6 +1,5 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env,
     ffi::OsStr,
     fs,
     path::{Path, PathBuf},
@@ -27,7 +26,7 @@ use serde_json::{Map, Value, json};
 use sha2::Sha256;
 use thiserror::Error;
 
-use crate::{OstromPaths, TraceAppend, append_trace};
+use crate::{OstromPaths, TraceAppend, append_trace, environment};
 
 const GITHUB_API: &str = "https://api.github.com";
 const API_VERSION: &str = "2022-11-28";
@@ -207,7 +206,10 @@ pub(crate) fn authenticated_output<S: AsRef<std::ffi::OsStr>>(
     // take this branch, fail at `Command::new("")`, and mask native minting
     // entirely — the defect class #266 fixed for MANDATE_SECRETS_FILE and #286
     // for CLAUDE_CONFIG_DIR.
-    if let Some(executable) = env::var_os("MANDATE_GH_AS_BIN").filter(|value| !value.is_empty()) {
+    if let Some(executable) = environment::MANDATE_GH_AS_BIN
+        .value_os()
+        .filter(|value| !value.is_empty())
+    {
         return Command::new(executable)
             .arg(request.role)
             .arg(request.anchor_repository)
@@ -715,7 +717,12 @@ fn validate_request(request: AppTokenRequest<'_>) -> Result<ValidatedRequest, Ap
 }
 
 fn resolve_secrets_path() -> Result<PathBuf, AppTokenError> {
-    resolve_secrets_path_with(|name| env::var_os(name))
+    resolve_secrets_path_with(|name| match name {
+        "MANDATE_SECRETS_FILE" => environment::MANDATE_SECRETS_FILE.value_os(),
+        "CLAUDE_CONFIG_DIR" => environment::CLAUDE_CONFIG_DIR.value_os(),
+        "HOME" => environment::HOME.value_os(),
+        _ => None,
+    })
 }
 
 fn resolve_secrets_path_with(
@@ -792,7 +799,8 @@ fn load_role_credentials(path: &Path, role: &str) -> Result<Credentials, AppToke
 
 fn expand_tilde(path: &str) -> Result<PathBuf, AppTokenError> {
     expand_tilde_with(path, || {
-        env::var_os("HOME")
+        environment::HOME
+            .value_os()
             .map(PathBuf::from)
             .or_else(|| BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()))
     })

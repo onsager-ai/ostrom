@@ -1,8 +1,8 @@
-use std::{env, path::PathBuf};
+use std::path::PathBuf;
 
 use directories::ProjectDirs;
 
-use crate::StoreError;
+use crate::{StoreError, environment};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OstromPaths {
@@ -15,8 +15,9 @@ impl OstromPaths {
     /// roots to one explicit directory: test processes cannot accidentally
     /// fall through to an operator's home if their fixture is incomplete.
     pub fn resolve() -> Result<Self, StoreError> {
-        if let Some(home) =
-            env::var_os("OSTROM_HOME").filter(|home| !home.to_string_lossy().trim().is_empty())
+        if let Some(home) = environment::OSTROM_HOME
+            .value_os()
+            .filter(|home| !home.to_string_lossy().trim().is_empty())
         {
             let home = PathBuf::from(home);
             return Ok(Self {
@@ -86,7 +87,7 @@ impl OstromPaths {
     /// the config root, and an empty override retains the established default.
     #[must_use]
     pub fn secrets_file(&self) -> PathBuf {
-        resolve_secrets_file(&self.config, env::var_os("MANDATE_SECRETS_FILE"))
+        resolve_secrets_file(&self.config, environment::MANDATE_SECRETS_FILE.value_os())
     }
 }
 

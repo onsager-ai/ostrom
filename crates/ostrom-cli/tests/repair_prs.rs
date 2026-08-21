@@ -104,7 +104,6 @@ esac
         .env("OSTROM_HOME", fixture.path())
         .env("MANDATE_GH_AS_BIN", &helper)
         .env("REPAIR_TRUNCATED", &truncated)
-        .env("MANDATE_TRACE_TIME", "2026-08-19T00:00:00Z")
         .current_dir(fixture.path())
         .output()
         .expect("run failed repair scan");
@@ -283,7 +282,6 @@ fi
         .env("REPAIR_LISTING", &listing)
         .env("REPAIR_CALLS", &calls)
         .env("REPAIR_REMOTE", &remote)
-        .env("MANDATE_TRACE_TIME", "2026-08-19T00:01:00Z")
         .current_dir(fixture.path())
         .output()
         .expect("repair eligible published pull request");

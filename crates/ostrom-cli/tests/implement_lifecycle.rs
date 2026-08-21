@@ -194,10 +194,6 @@ impl Fixture {
             .env("MANDATE_IMPLEMENTER_SOURCE_REPO", &self.source)
             .env("MANDATE_GH_AS_BIN", &self.gh_as)
             .env("MANDATE_IMPLEMENTER_TERMINATION_GRACE_SECONDS", "1")
-            .env("MANDATE_TRACE_TIME", "2026-08-01T00:00:00Z")
-            .env("MANDATE_NOW_EPOCH", "1785542400")
-            .env("MANDATE_TODAY", "2026-08-01")
-            .env("MANDATE_SWEEP_TIME", "2026-08-01T00:00:00Z")
             .env("CODEX_BIN", &self.codex)
             .env("FAKE_CODEX_MODE", mode)
             .stdout(Stdio::null());

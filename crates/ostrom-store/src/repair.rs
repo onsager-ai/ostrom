@@ -2,21 +2,19 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::{Command, Output},
-    time::SystemTime,
 };
 
-use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 
 use crate::{
-    OstromPaths, TraceAppend,
+    Clock, OstromPaths, TraceAppend,
     app_token::{
         AuthenticatedCommandError, GitHubInstallationTokenMinter, InstallationTokenMinter,
         ScopedAppTokenRequest, authenticated_output,
     },
-    append_trace, load_config_or_defaults,
+    append_trace, environment, load_config_or_defaults,
 };
 
 const REPAIR_CAP: usize = 3;
@@ -31,6 +29,7 @@ pub struct RepairOptions {
     pub paths: OstromPaths,
     pub working_directory: PathBuf,
     pub lease_owner: String,
+    pub clock: Clock,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -702,7 +701,7 @@ impl RepairContext<'_> {
         append_trace(
             &self.options.paths.trace_file(),
             &TraceAppend {
-                ts: trace_time(),
+                ts: self.options.clock.timestamp(),
                 kind: "pr-repair".to_owned(),
                 fact,
                 narration: narration.as_object().cloned().unwrap_or_default(),
@@ -839,23 +838,12 @@ fn conflict_paths(cwd: &Path) -> Vec<String> {
 }
 
 fn command_exists(name: &str) -> bool {
-    env::var_os("PATH").is_some_and(|path| {
+    environment::PATH.value_os().is_some_and(|path| {
         env::split_paths(&path).any(|directory| {
             let candidate = directory.join(name);
             candidate.is_file()
         })
     })
-}
-
-fn trace_time() -> String {
-    env::var("MANDATE_TRACE_TIME")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| {
-            DateTime::<Utc>::from(SystemTime::now())
-                .format("%Y-%m-%dT%H:%M:%SZ")
-                .to_string()
-        })
 }
 
 fn exit_code(output: &Output) -> i32 {

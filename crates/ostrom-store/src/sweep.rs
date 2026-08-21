@@ -18,7 +18,7 @@ use thiserror::Error;
 use crate::{
     AppTokenError, OstromPaths, PublishDestination, PublishError, QueueDocument, StoreError,
     app_token::{GitHubInstallationTokenMinter, InstallationTokenMinter, ScopedAppTokenRequest},
-    io_error,
+    environment, io_error,
     publish::{PublishOptions, PublishOutcome, publish},
     read_queue,
     selector::{SelectorCandidate, glob_match, selector_match},
@@ -480,7 +480,9 @@ pub fn acquire_org_from_github(
     let config = load_config(paths, working_directory)?;
     let state = read_state(&paths.state.join("state.json"))?;
     let mut repositories = Vec::new();
-    let gh_host = std::env::var("GH_HOST").unwrap_or_else(|_| "github.com".to_owned());
+    let gh_host = environment::GH_HOST
+        .value()
+        .unwrap_or_else(|| "github.com".to_owned());
     gh(&["auth", "status", "--hostname", &gh_host])?;
     for project in config
         .projects

@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env, fs, io,
+    fs, io,
     path::{Path, PathBuf},
     process::{Command, Output},
 };
@@ -13,7 +13,7 @@ use thiserror::Error;
 use crate::{
     OstromPaths,
     app_token::{InstallationTokenMinter, ScopedAppTokenRequest, authenticated_output},
-    set_private_file_mode,
+    environment, set_private_file_mode,
 };
 
 const READ_PERMISSIONS: &str = "metadata:read,contents:read";
@@ -90,7 +90,8 @@ pub(crate) fn publish(
     // The destination deliberately has no environment fallback. In
     // particular, MANDATE_PUBLISH_REMOTE inherited by a scratch OSTROM_HOME
     // cannot turn an opted-out sweep into a publishing one.
-    let allowlist_path = env::var_os("MANDATE_PUBLISH_ALLOWLIST")
+    let allowlist_path = environment::MANDATE_PUBLISH_ALLOWLIST
+        .value_os()
         .filter(|value| !value.is_empty())
         .map_or_else(
             || options.plugin_root.join("config/publish-allowlist.json"),

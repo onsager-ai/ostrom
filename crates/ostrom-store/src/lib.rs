@@ -2,7 +2,9 @@
 
 mod app_token;
 mod check_store;
+mod clock;
 mod dispatch;
+pub mod environment;
 mod event_store;
 mod file_store;
 mod gate;
@@ -28,7 +30,9 @@ mod work_order;
 
 pub use app_token::{AppTokenError, CredentialCommandError, credential_output};
 pub use check_store::JsonlCheckStore;
+pub use clock::Clock;
 pub use dispatch::{DispatchError, DispatchOutcome, DispatchRequest, run_dispatch};
+pub use environment::{ENVIRONMENT_VARIABLES, EnvironmentClass, EnvironmentVariable};
 pub use event_store::JsonlEventStore;
 pub use file_store::JsonlSweepStore;
 pub use gate::{GateError, GateOptions, GateOutput, run_gate};
