@@ -34,7 +34,7 @@ fn check_run_records_verdicts_and_isolates_a_timeout() {
                 "    with: {{script: {}}}\n",
             ),
             serde_json::to_string("exit 0").expect("quote pass"),
-            serde_json::to_string("exit 7").expect("quote fail"),
+            serde_json::to_string("exit 1").expect("quote fail"),
             serde_json::to_string("sleep 1").expect("quote timeout"),
             serde_json::to_string(&continue_script).expect("quote continuation"),
         ),

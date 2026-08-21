@@ -46,9 +46,9 @@ impl ActionProvider for CommandProvider {
             definition: json!({
                 "parameters": ["script", "timeout"],
                 "timeout_default": "30s",
-                "exit": "zero passes; non-zero fails"
+                "exit": "zero passes; one fails; any other status is inconclusive"
             }),
-            source_revision: "cmd-run-v1".to_owned(),
+            source_revision: "cmd-run-v2".to_owned(),
         })
     }
 
@@ -88,8 +88,8 @@ impl PreparedAction for CommandAction {
             ProcessResult::Completed { status, .. } if status.success() => ActionOutcome::Pass,
             ProcessResult::Completed { status, stderr, .. }
                 if status.code().is_none()
-                    || matches!(status.code(), Some(126 | 127))
-                    || String::from_utf8_lossy(&stderr).contains("SyntaxError") =>
+                    || status.code() != Some(1)
+                    || interpreter_crashed(&stderr) =>
             {
                 ActionOutcome::Inconclusive(ActionFault::new("cmd_harness_error", None))
             }
@@ -102,6 +102,11 @@ impl PreparedAction for CommandAction {
             }
         }
     }
+}
+
+fn interpreter_crashed(stderr: &[u8]) -> bool {
+    let stderr = String::from_utf8_lossy(stderr);
+    stderr.contains("SyntaxError") || stderr.contains("Traceback (most recent call last):")
 }
 
 #[cfg(test)]
@@ -133,15 +138,32 @@ mod tests {
     }
 
     #[test]
-    fn an_explicit_nonzero_claim_is_a_fail() {
-        let receipt = execute("exit 7", CommandProvider::default());
+    fn an_explicit_false_claim_is_a_fail() {
+        let receipt = execute("exit 1", CommandProvider::default());
         assert_eq!(receipt.verdict, Some(CheckVerdict::Fail));
+        assert_eq!(receipt.error, None);
+    }
+
+    #[test]
+    fn a_non_predicate_exit_is_inconclusive() {
+        let receipt = execute("exit 7", CommandProvider::default());
+        assert_eq!(receipt.verdict, Some(CheckVerdict::Inconclusive));
         assert_eq!(receipt.error, None);
     }
 
     #[test]
     fn the_loop_not_burning_syntax_error_is_inconclusive() {
         let receipt = execute("python3 -c 'if'", CommandProvider::default());
+        assert_eq!(receipt.verdict, Some(CheckVerdict::Inconclusive));
+        assert_eq!(receipt.error, None);
+    }
+
+    #[test]
+    fn a_python_runtime_crash_is_inconclusive() {
+        let receipt = execute(
+            "python3 -c 'raise RuntimeError(\"placeholder crash\")'",
+            CommandProvider::default(),
+        );
         assert_eq!(receipt.verdict, Some(CheckVerdict::Inconclusive));
         assert_eq!(receipt.error, None);
     }

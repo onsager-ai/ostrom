@@ -111,9 +111,9 @@ load before execution or journal writes. The shipped registry contains:
   There is no general jq, arithmetic, boolean composition, filtering, or
   arbitrary value comparison; those expressions return `unsupported_expect`.
 - `cmd/run`: `script` is required and is passed to `sh -c`; `timeout` is
-  optional. Exit zero passes and an explicit ordinary non-zero predicate exit
-  fails. Timeouts, missing commands, signals, and syntax crashes are
-  inconclusive.
+  optional. Exit zero passes, exit one means the predicate is false, and other
+  statuses are inconclusive. Timeouts, missing commands, signals, and detected
+  interpreter syntax/runtime crashes are also inconclusive.
 - `doctor/check`: `check` selects one exact doctor check name and `timeout` is
   optional. The adapter runs `node doctor.js --check <name>` and accepts one
   text-protocol line. `OK` passes, `FAIL` fails, and `WARN` or `DEFER` is
