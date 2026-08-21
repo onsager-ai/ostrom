@@ -153,17 +153,26 @@ struct PassGuard {
     clock: Clock,
 }
 
+/// The outcome a pass is recorded with when its guard finishes.
+///
+/// Extracted from `PassGuard::finish` so the unwinding branch can be tested
+/// without a seam. It was previously reachable only by making production code
+/// panic on an environment variable, which is a test hook living in `src`.
+fn terminal_outcome(explicit: Option<String>, panicking: bool) -> String {
+    explicit.unwrap_or_else(|| {
+        if panicking {
+            "failed".to_owned()
+        } else {
+            "completed".to_owned()
+        }
+    })
+}
+
 impl PassGuard {
     fn finish(&mut self) -> Result<(), PassError> {
         let mut failure = None;
         if self.started {
-            let outcome = self.outcome.clone().unwrap_or_else(|| {
-                if thread::panicking() {
-                    "failed".to_owned()
-                } else {
-                    "completed".to_owned()
-                }
-            });
+            let outcome = terminal_outcome(self.outcome.clone(), thread::panicking());
             let now = self.clock.epoch_seconds();
             let mut fact = Map::new();
             fact.insert("owner".to_owned(), json!(self.owner));
@@ -804,5 +813,29 @@ mod executable_tests {
     fn a_directory_is_not_an_executable_file() {
         let fixture = tempdir().expect("temporary directory");
         assert!(!is_executable_file(fixture.path()));
+    }
+}
+
+#[cfg(test)]
+mod terminal_outcome_tests {
+    use super::terminal_outcome;
+
+    #[test]
+    fn an_unwinding_pass_is_recorded_as_failed() {
+        assert_eq!(terminal_outcome(None, true), "failed");
+    }
+
+    #[test]
+    fn a_clean_pass_is_recorded_as_completed() {
+        assert_eq!(terminal_outcome(None, false), "completed");
+    }
+
+    #[test]
+    fn an_explicit_outcome_survives_an_unwind() {
+        assert_eq!(
+            terminal_outcome(Some("refused".to_owned()), true),
+            "refused",
+            "a pass that already decided its outcome keeps it"
+        );
     }
 }

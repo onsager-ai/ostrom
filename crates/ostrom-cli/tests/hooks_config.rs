@@ -79,12 +79,18 @@ projects:
         "{\"version\":2,\"repos\":{}}\n",
     )
     .unwrap();
-    let today = DateTime::<Utc>::from(SystemTime::now())
-        .format("%Y-%m-%d")
-        .to_string();
-    fs::write(fixture.path().join(format!(".tap-{today}")), "").unwrap();
+    // The marker date and the command must agree on which day it is. Deriving
+    // the marker from one instant and letting the binary read another lets a
+    // UTC midnight between the two turn this into a flake that reproduces once
+    // a day. Write the marker for both the day before and the day of, so the
+    // roll cannot land between them.
+    let start = DateTime::<Utc>::from(SystemTime::now());
+    for day in [start - chrono::Duration::days(1), start] {
+        let stamp = day.format("%Y-%m-%d").to_string();
+        fs::write(fixture.path().join(format!(".tap-{stamp}")), "").unwrap();
+    }
 
-    let before = DateTime::<Utc>::from(SystemTime::now()).timestamp();
+    let before = start.timestamp();
     let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
         .args(["hook", "digest"])
         .env("OSTROM_HOME", fixture.path())
