@@ -1,0 +1,63 @@
+manifest_version: 1
+defaults:
+  loop:
+    concurrent: 6
+    spend_usd: 50
+    tokens: 200000
+actors:
+  builder: {}
+  gatekeeper: {}
+  sweeper: {}
+  triage: {}
+operations:
+  build-pass: {steps: []}
+  gate-pass: {steps: []}
+  portfolio-sweep: {steps: []}
+  queue-triage: {steps: []}
+grants:
+  builder-pass:
+    actors: builder
+    operations: build-pass
+    repositories: placeholder-org/portfolio
+  gatekeeper-pass:
+    actors: gatekeeper
+    operations: gate-pass
+    repositories: placeholder-org/portfolio
+  sweep:
+    actors: sweeper
+    operations: portfolio-sweep
+    repositories: placeholder-org/portfolio
+  triage:
+    actors: triage
+    operations: queue-triage
+    repositories: placeholder-org/portfolio
+loops:
+  builder-day:
+    actor: builder
+    operation: build-pass
+    target: placeholder-org/portfolio
+    every: 08:15..21:15
+  builder-night:
+    actor: builder
+    operation: build-pass
+    target: placeholder-org/portfolio
+    every: ["23:15", "02:15", "05:15"]
+    concurrent: 2
+  gatekeeper:
+    actor: gatekeeper
+    operation: gate-pass
+    target: placeholder-org/portfolio
+    every: hourly
+  sweep:
+    actor: sweeper
+    operation: portfolio-sweep
+    target: placeholder-org/portfolio
+    every: "*:45"
+    publish: placeholder-org/public-mirror
+    cadence_hours: 24
+    stuck_after_days: 7
+  unattended-triage:
+    actor: triage
+    operation: queue-triage
+    target: placeholder-org/portfolio
+    every: hourly
