@@ -12,6 +12,8 @@ pub const RESULT_VERSION: u32 = 1;
 #[serde(deny_unknown_fields)]
 pub struct CheckDocument {
     pub checks_version: u32,
+    #[serde(default)]
+    pub inconclusive_policy: InconclusivePolicy,
     pub checks: BTreeMap<String, CheckDefinition>,
 }
 
@@ -37,6 +39,8 @@ impl CheckDocument {
 #[serde(deny_unknown_fields)]
 pub struct CheckDefinition {
     pub uses: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inconclusive_policy: Option<InconclusivePolicy>,
     pub with: BTreeMap<String, Value>,
 }
 
@@ -268,6 +272,7 @@ pub struct ResolvedCheck {
     pub basis: CheckBasis,
     pub producer: String,
     pub fresh_for_seconds: u64,
+    pub inconclusive_policy: InconclusivePolicy,
 }
 
 #[derive(Serialize)]
@@ -280,6 +285,7 @@ struct DigestMaterial<'a> {
 struct CatalogueDigestMaterial<'a> {
     id: &'a str,
     definition: &'a CheckDefinition,
+    inconclusive_policy: InconclusivePolicy,
 }
 
 pub fn resolve_check(
@@ -287,20 +293,25 @@ pub fn resolve_check(
     enumeration: &CatalogueEnumeration,
     action: &ActionDefinition,
 ) -> Result<ResolvedCheck, CheckContractError> {
-    let definition = select_check(id, enumeration)?;
+    let (definition, suite_policy) = select_check_with_policy(id, enumeration)?;
     if action.uses != definition.uses {
         return Err(CheckContractError::UnresolvedAction);
     }
     validate_action(action)?;
 
     let fresh_for_seconds = resolve_fresh_for(&definition.with, action.default_fresh_for_seconds)?;
+    let inconclusive_policy = definition.inconclusive_policy.unwrap_or(suite_policy);
     let basis = if definition.uses.split_once('/').map(|part| part.0) == Some("agent") {
         CheckBasis::Judged
     } else {
         CheckBasis::Mechanical
     };
     let material = DigestMaterial {
-        catalogue_entry: CatalogueDigestMaterial { id, definition },
+        catalogue_entry: CatalogueDigestMaterial {
+            id,
+            definition,
+            inconclusive_policy,
+        },
         resolved_action: action,
     };
     let mut canonical = serde_json::to_value(&material).expect("digest material is serializable");
@@ -314,6 +325,7 @@ pub fn resolve_check(
         basis,
         producer: action.producer.clone(),
         fresh_for_seconds,
+        inconclusive_policy,
     })
 }
 
@@ -323,6 +335,13 @@ pub fn select_check<'a>(
     id: &str,
     enumeration: &'a CatalogueEnumeration,
 ) -> Result<&'a CheckDefinition, CheckContractError> {
+    select_check_with_policy(id, enumeration).map(|(definition, _)| definition)
+}
+
+fn select_check_with_policy<'a>(
+    id: &str,
+    enumeration: &'a CatalogueEnumeration,
+) -> Result<(&'a CheckDefinition, InconclusivePolicy), CheckContractError> {
     if !enumeration.complete {
         return Err(CheckContractError::CheckCatalogTruncated);
     }
@@ -345,15 +364,15 @@ pub fn select_check<'a>(
             .document
             .checks
             .get(id)
-            .map(|definition| (catalogue, definition))
+            .map(|definition| (definition, catalogue.document.inconclusive_policy))
     });
-    let Some((_catalogue, definition)) = matches.next() else {
+    let Some((definition, policy)) = matches.next() else {
         return Err(CheckContractError::UnresolvedCheck);
     };
     if matches.next().is_some() {
         return Err(CheckContractError::AmbiguousCheck);
     }
-    Ok(definition)
+    Ok((definition, policy))
 }
 
 fn canonicalize_json(value: &mut Value) {
@@ -375,6 +394,7 @@ fn canonicalize_json(value: &mut Value) {
 fn validate_action(action: &ActionDefinition) -> Result<(), CheckContractError> {
     let definition = CheckDefinition {
         uses: action.uses.clone(),
+        inconclusive_policy: None,
         with: BTreeMap::new(),
     };
     definition.validate_uses()?;
@@ -501,6 +521,7 @@ impl CheckContractError {
 pub enum CheckVerdict {
     Pass,
     Fail,
+    Inconclusive,
 }
 
 impl CheckVerdict {
@@ -509,10 +530,21 @@ impl CheckVerdict {
         match (basis, self) {
             (CheckBasis::Judged, Self::Pass) => "judged pass",
             (CheckBasis::Judged, Self::Fail) => "judged fail",
+            (CheckBasis::Judged, Self::Inconclusive) => "judged inconclusive",
             (CheckBasis::Mechanical, Self::Pass) => "pass",
             (CheckBasis::Mechanical, Self::Fail) => "fail",
+            (CheckBasis::Mechanical, Self::Inconclusive) => "inconclusive",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InconclusivePolicy {
+    #[default]
+    Block,
+    Warn,
+    Pass,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -635,8 +667,10 @@ impl CheckReceipt {
             }
             CheckBasis::Judged => {
                 if self.judged_by.is_none()
-                    || (self.verdict.is_some()
+                    || (matches!(self.verdict, Some(CheckVerdict::Pass | CheckVerdict::Fail))
                         && (self.evidence.is_empty() || self.because.is_empty()))
+                    || (self.verdict == Some(CheckVerdict::Inconclusive)
+                        && !self.because.is_empty())
                     || (self.error.is_some()
                         && (!self.evidence.is_empty() || !self.because.is_empty()))
                 {
@@ -789,6 +823,27 @@ impl JudgmentRunnerStamp<'_> {
         Ok(receipt)
     }
 
+    pub fn inconclusive(self) -> Result<CheckReceipt, CheckContractError> {
+        let receipt = CheckReceipt {
+            result_version: RESULT_VERSION,
+            check: self.resolved.id.clone(),
+            definition_digest: self.resolved.definition_digest.clone(),
+            attempt_id: self.attempt_id.to_owned(),
+            observed_at: self.observed_at,
+            completed_at: self.completed_at,
+            basis: self.resolved.basis,
+            producer: self.resolved.producer.clone(),
+            verdict: Some(CheckVerdict::Inconclusive),
+            evidence: self.evidence,
+            because: Vec::new(),
+            judged_by: Some(self.judge),
+            error: None,
+            detail: None,
+        };
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
     #[must_use]
     pub fn fault(self, name: impl Into<String>, detail: Option<String>) -> CheckReceipt {
         CheckReceipt {
@@ -817,6 +872,7 @@ pub enum CheckState {
     Stale,
     Passing,
     Failing,
+    Inconclusive,
 }
 
 impl CheckState {
@@ -825,10 +881,12 @@ impl CheckState {
         match (basis, self) {
             (CheckBasis::Judged, Self::Passing) => "judged pass",
             (CheckBasis::Judged, Self::Failing) => "judged fail",
+            (CheckBasis::Judged, Self::Inconclusive) => "judged inconclusive",
             (CheckBasis::Judged, Self::Stale) => "judged stale",
             (CheckBasis::Judged, Self::NeverRun) => "judged never run",
             (CheckBasis::Mechanical, Self::Passing) => "pass",
             (CheckBasis::Mechanical, Self::Failing) => "fail",
+            (CheckBasis::Mechanical, Self::Inconclusive) => "inconclusive",
             (CheckBasis::Mechanical, Self::Stale) => "stale",
             (CheckBasis::Mechanical, Self::NeverRun) => "never run",
         }
@@ -903,10 +961,18 @@ impl ResolvedCheck {
                 });
             if expires_at.is_some_and(|expires_at| expires_at < evaluated_at) || evidence_stale {
                 CheckState::Stale
-            } else if receipt.verdict == Some(CheckVerdict::Pass) {
-                CheckState::Passing
             } else {
-                CheckState::Failing
+                match receipt.verdict {
+                    Some(CheckVerdict::Pass) => CheckState::Passing,
+                    Some(CheckVerdict::Fail) => CheckState::Failing,
+                    Some(CheckVerdict::Inconclusive)
+                        if self.inconclusive_policy == InconclusivePolicy::Block =>
+                    {
+                        CheckState::Inconclusive
+                    }
+                    Some(CheckVerdict::Inconclusive) => CheckState::Passing,
+                    None => CheckState::NeverRun,
+                }
             }
         });
         CheckEvaluation { state, fault }
@@ -1168,6 +1234,55 @@ checks:
                 .expect("valid verdict receipt");
             assert_eq!(resolved.evaluate(&[receipt], at(0)).state, expected);
         }
+    }
+
+    #[test]
+    fn inconclusive_policy_defaults_to_block_and_can_be_defaulted_or_overridden() {
+        let blocked = resolved();
+        assert_eq!(blocked.inconclusive_policy, InconclusivePolicy::Block);
+        let receipt = stamp(&blocked, "fixture-inconclusive", 0)
+            .stamp(json!({"result_version": 1, "verdict": "inconclusive"}))
+            .expect("valid inconclusive receipt");
+        assert_eq!(
+            blocked
+                .evaluate(std::slice::from_ref(&receipt), at(0))
+                .state,
+            CheckState::Inconclusive
+        );
+
+        let suite_warn = CheckDocument::from_yaml(&DOCUMENT.replace(
+            "checks_version: 1",
+            "checks_version: 1\ninconclusive_policy: warn",
+        ))
+        .expect("suite default parses");
+        let warned = resolve_check(
+            "hub-serves-current-records",
+            &enumeration(suite_warn),
+            &action(),
+        )
+        .expect("suite policy resolves");
+        assert_eq!(warned.inconclusive_policy, InconclusivePolicy::Warn);
+        assert_ne!(blocked.definition_digest, warned.definition_digest);
+
+        let overridden = CheckDocument::from_yaml(&DOCUMENT.replace(
+            "    uses: fixture/observe",
+            "    uses: fixture/observe\n    inconclusive_policy: pass",
+        ))
+        .expect("per-check policy parses");
+        let passed = resolve_check(
+            "hub-serves-current-records",
+            &enumeration(overridden),
+            &action(),
+        )
+        .expect("per-check policy resolves");
+        assert_eq!(passed.inconclusive_policy, InconclusivePolicy::Pass);
+        let receipt = stamp(&passed, "fixture-inconclusive", 0)
+            .stamp(json!({"result_version": 1, "verdict": "inconclusive"}))
+            .expect("valid inconclusive receipt");
+        assert_eq!(
+            passed.evaluate(&[receipt], at(0)).state,
+            CheckState::Passing
+        );
     }
 
     #[test]

@@ -997,6 +997,7 @@ acknowledgements: []
             (CheckState::Stale, "judged stale"),
             (CheckState::Passing, "judged pass"),
             (CheckState::Failing, "judged fail"),
+            (CheckState::Inconclusive, "judged inconclusive"),
         ] {
             assert_eq!(state.render(CheckBasis::Judged), rendered);
             assert!(state.render(CheckBasis::Judged).starts_with("judged "));

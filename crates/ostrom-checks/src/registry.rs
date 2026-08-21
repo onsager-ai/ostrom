@@ -8,7 +8,7 @@ use ostrom_core::{
 use serde_json::{Value, json};
 use thiserror::Error;
 
-use crate::{CommandProvider, DoctorProvider, HttpProvider};
+use crate::{CommandProvider, DoctorProvider, GitHubProvider, HttpProvider};
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("{name}")]
@@ -38,7 +38,7 @@ impl ActionFault {
 pub enum ActionOutcome {
     Pass,
     Fail,
-    Error(ActionFault),
+    Inconclusive(ActionFault),
 }
 
 pub trait PreparedAction: Send {
@@ -72,11 +72,15 @@ impl ActionRegistry {
 
     /// Construct the shipped registry. The plugin root remains host-supplied
     /// because installed Claude plugin roots are deployment-specific.
-    pub fn core(plugin_root: impl Into<std::path::PathBuf>) -> Result<Self, ActionFault> {
+    pub fn core(
+        plugin_root: impl Into<std::path::PathBuf>,
+        working_directory: impl Into<std::path::PathBuf>,
+    ) -> Result<Self, ActionFault> {
         let mut registry = Self::new();
         registry.register(HttpProvider)?;
         registry.register(CommandProvider::default())?;
         registry.register(DoctorProvider::from_environment(plugin_root))?;
+        registry.register(GitHubProvider::new(working_directory))?;
         Ok(registry)
     }
 
@@ -180,7 +184,9 @@ impl PreparedCheck {
             ActionOutcome::Fail => stamp
                 .stamp(json!({"result_version": 1, "verdict": "fail"}))
                 .expect("built-in fail result is a valid receipt"),
-            ActionOutcome::Error(fault) => stamp.fault(fault.name, fault.detail),
+            ActionOutcome::Inconclusive(_fault) => stamp
+                .stamp(json!({"result_version": 1, "verdict": "inconclusive"}))
+                .expect("built-in inconclusive result is a valid receipt"),
         }
     }
 }

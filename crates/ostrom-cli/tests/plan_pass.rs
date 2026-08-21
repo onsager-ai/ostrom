@@ -216,7 +216,7 @@ fn write_check_run(home: &Path, catalogue: &str, observations: &[(&str, &str)]) 
     // state root worked by accident — and would break the moment a core
     // provider read a plugin asset at construction.
     let plugin_root = home;
-    let registry = ActionRegistry::core(plugin_root).expect("core registry");
+    let registry = ActionRegistry::core(plugin_root, home).expect("core registry");
     let completed_at = "2026-08-01T00:00:00Z";
     let receipts = observations
         .iter()
@@ -700,9 +700,9 @@ acknowledgements: []
         serde_json::from_slice(&fs::read(home.path().join("plan.json")).expect("plan output"))
             .expect("parse plan");
     let status = &document["goals"][0]["facts"]["met_when_status"][0];
-    assert_eq!(status["state"], "never_run");
-    assert_eq!(status["rendered"], "never run");
-    assert_eq!(status["fault"]["name"], "cmd_timeout");
+    assert_eq!(status["state"], "inconclusive");
+    assert_eq!(status["rendered"], "inconclusive");
+    assert!(status["fault"].is_null());
     assert!(document["goals"][0]["assessment"].is_null());
     assert!(document["faults"].as_array().is_some_and(|faults| {
         faults
@@ -718,8 +718,8 @@ acknowledgements: []
             .expect("check run"),
     )
     .expect("decode check run");
-    assert_eq!(run.receipts[0].verdict, None);
-    assert_eq!(run.receipts[0].error.as_deref(), Some("cmd_timeout"));
+    assert_eq!(run.receipts[0].verdict, Some(CheckVerdict::Inconclusive));
+    assert_eq!(run.receipts[0].error, None);
 }
 
 #[cfg(unix)]

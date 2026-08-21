@@ -586,7 +586,12 @@ pub fn run_plan(
         let unavailable_evidence = facts
             .met_when_status
             .iter()
-            .filter(|status| matches!(status.state, CheckState::NeverRun | CheckState::Stale))
+            .filter(|status| {
+                matches!(
+                    status.state,
+                    CheckState::NeverRun | CheckState::Stale | CheckState::Inconclusive
+                )
+            })
             .map(|status| format!("{} ({})", status.check, status.rendered))
             .collect::<Vec<_>>();
         let assessment = if facts.met || paused {

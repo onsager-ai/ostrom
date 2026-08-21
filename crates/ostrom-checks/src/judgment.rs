@@ -357,7 +357,10 @@ impl PreparedJudgment {
                 })
             }
             JudgmentOutcome::Error(fault) => {
-                Ok(stamp.fault(fault.name(), fault.detail().map(str::to_owned)))
+                let _ = fault;
+                stamp.inconclusive().map_err(|error| {
+                    ActionFault::new(error.fault_name().unwrap_or("malformed_receipt"), None)
+                })
             }
         }
     }
@@ -691,7 +694,7 @@ checks:
     }
 
     #[test]
-    fn cannot_determine_is_an_error_not_a_fail() {
+    fn cannot_determine_is_inconclusive_not_a_fail() {
         let enumeration = catalogue("claude");
         let source = mechanical(&enumeration);
         let source_receipt = observed_receipt(&source, "observed-1", 0);
@@ -708,8 +711,8 @@ checks:
         let receipt = prepare(&registry, &enumeration, &[source_receipt])
             .execute_at("judged-1", at(0), at(0))
             .expect("error receipt is recorded");
-        assert_eq!(receipt.verdict, None);
-        assert_eq!(receipt.error.as_deref(), Some("cannot_determine"));
+        assert_eq!(receipt.verdict, Some(CheckVerdict::Inconclusive));
+        assert_eq!(receipt.error, None);
         assert_eq!(receipt.basis, CheckBasis::Judged);
         assert_eq!(
             receipt.judged_by.expect("judge stamp").model,

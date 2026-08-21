@@ -26,9 +26,9 @@ pub use check::{
     ActionDefinition, AgentParameters, CHECKS_VERSION, Catalogue, CatalogueEnumeration, CheckBasis,
     CheckContractError, CheckDefinition, CheckDocument, CheckEvaluation, CheckFault, CheckReceipt,
     CheckState, CheckVerdict, DefinitionDigest, Evidence, EvidenceBundleItem, EvidenceReference,
-    FreshnessError, JudgeStamp, JudgmentClause, JudgmentInput, JudgmentRunnerStamp, RESULT_VERSION,
-    RecordedOutput, ResolvedCheck, RunnerStamp, agent_parameters, receipt_digest, resolve_check,
-    resolve_fresh_for, select_check, sha256_hex,
+    FreshnessError, InconclusivePolicy, JudgeStamp, JudgmentClause, JudgmentInput,
+    JudgmentRunnerStamp, RESULT_VERSION, RecordedOutput, ResolvedCheck, RunnerStamp,
+    agent_parameters, receipt_digest, resolve_check, resolve_fresh_for, select_check, sha256_hex,
 };
 pub use dispatch::{
     BranchListing, BranchListingFault, BranchListingOutcome, RemoteBranch, WorkOrder,
