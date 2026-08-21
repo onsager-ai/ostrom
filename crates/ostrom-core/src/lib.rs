@@ -53,10 +53,11 @@ pub use plan::{
     fact_table, mechanical_ranking, validate_assessment,
 };
 pub use policy::{
-    ActorDecl, InputDecl, InputResolutionError, InputType, LoopDecl, ManifestDefaults,
-    ManifestError, ManifestValidationError, NormalizedList, OperationDecl, OperationParamDecl,
-    OperationParamType, PolicyCandidate, PolicyDecision, PolicyManifest, PolicySelector,
-    PolicySelectorError, ResolvedInput, RuleDecl, RuleDefaults, SelectorFinding, SelectorMatch,
+    ActorDecl, InputDecl, InputResolutionError, InputType, LoopCadence, LoopDecl,
+    LoopResolutionError, LoopTime, ManifestDefaults, ManifestError, ManifestValidationError,
+    NormalizedList, OperationDecl, OperationParamDecl, OperationParamType, PolicyCandidate,
+    PolicyDecision, PolicyManifest, PolicySelector, PolicySelectorError, ResolvedInput,
+    ResolvedLoop, ResolvedLoopCeilings, RuleDecl, RuleDefaults, SelectorFinding, SelectorMatch,
     SelectorPrefix, SelectorResolutionError, SelectorUniverse, StepDecl, UnmatchedPolicy,
 };
 pub use store::{
