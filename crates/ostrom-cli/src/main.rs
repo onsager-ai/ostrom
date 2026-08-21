@@ -1018,13 +1018,14 @@ fn run_operation_command(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let manifest = policy_manifest::load(&manifest_path(&paths.config))?;
     let invocation = parse_invocation(&manifest, arguments)?;
-    let actor = env::var("OSTROM_ACTOR")
-        .ok()
+    let actor = ostrom_store::environment::OSTROM_ACTOR
+        .value()
         .filter(|actor| !actor.trim().is_empty())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "OSTROM_ACTOR is required"))?;
     let working_directory = env::current_dir()?;
-    let plugin_root = env::var_os("OSTROM_PLUGIN_ROOT")
-        .or_else(|| env::var_os("CLAUDE_PLUGIN_ROOT"))
+    let plugin_root = ostrom_store::environment::OSTROM_PLUGIN_ROOT
+        .value_os()
+        .or_else(|| ostrom_store::environment::CLAUDE_PLUGIN_ROOT.value_os())
         .map_or_else(|| working_directory.join("plugins/ostrom"), PathBuf::from);
     let selector_prefixes = operation_selector_prefixes(&manifest, &actor, &invocation.name);
     let mut runtime = CliOperationRuntime {
@@ -1219,7 +1220,7 @@ fn execute_operation_requirement(
     store
         .append_run(&CheckRun {
             schema_version: CHECK_STORE_SCHEMA_VERSION,
-            run_id: new_check_run_id(),
+            run_id: new_check_run_id(receipt.completed_at),
             completed_at: receipt.completed_at.to_rfc3339(),
             receipts: vec![receipt],
         })

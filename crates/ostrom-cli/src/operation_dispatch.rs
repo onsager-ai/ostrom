@@ -272,7 +272,8 @@ pub(crate) fn resolve_repository_target(
 }
 
 pub(crate) fn manifest_path(config: &Path) -> PathBuf {
-    std::env::var_os("OSTROM_POLICY_MANIFEST")
+    ostrom_store::environment::OSTROM_POLICY_MANIFEST
+        .value_os()
         .filter(|path| !path.is_empty())
         .map_or_else(|| config.join("policy.yaml"), PathBuf::from)
 }

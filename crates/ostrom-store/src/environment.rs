@@ -217,6 +217,16 @@ pub const OSTROM_PLAN_DERIVER: EnvironmentVariable = variable(
     EnvironmentClass::Switch,
     "unavailable unless selected explicitly",
 );
+pub const OSTROM_ACTOR: EnvironmentVariable = variable(
+    "OSTROM_ACTOR",
+    EnvironmentClass::Identity,
+    "no actor; operation dispatch refuses",
+);
+pub const OSTROM_POLICY_MANIFEST: EnvironmentVariable = variable(
+    "OSTROM_POLICY_MANIFEST",
+    EnvironmentClass::Location,
+    "<config>/policy.yaml",
+);
 pub const OSTROM_PLUGIN_ROOT: EnvironmentVariable = variable(
     "OSTROM_PLUGIN_ROOT",
     EnvironmentClass::Location,
@@ -259,11 +269,13 @@ pub const ENVIRONMENT_VARIABLES: &[EnvironmentVariable] = &[
     MANDATE_SYSTEMCTL_BIN,
     MANDATE_SYSTEMD_RUN_BIN,
     NVM_DIR,
+    OSTROM_ACTOR,
     OSTROM_HOME,
     OSTROM_LEGACY_HOME,
     OSTROM_NODE_FALLBACKS,
     OSTROM_PLAN_DERIVER,
     OSTROM_PLUGIN_ROOT,
+    OSTROM_POLICY_MANIFEST,
     PATH,
     VOLTA_HOME,
 ];
