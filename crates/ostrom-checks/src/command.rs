@@ -46,9 +46,9 @@ impl ActionProvider for CommandProvider {
             definition: json!({
                 "parameters": ["script", "timeout"],
                 "timeout_default": "30s",
-                "exit": "zero passes; non-zero fails"
+                "exit": "zero passes; one fails; any other status is inconclusive"
             }),
-            source_revision: "cmd-run-v1".to_owned(),
+            source_revision: "cmd-run-v2".to_owned(),
         })
     }
 
@@ -85,14 +85,28 @@ impl PreparedAction for CommandAction {
         let mut command = Command::new(&self.shell);
         command.arg("-c").arg(&self.script);
         match run_bounded(&mut command, self.timeout) {
-            ProcessResult::Completed(status) if status.success() => ActionOutcome::Pass,
-            ProcessResult::Completed(_) => ActionOutcome::Fail,
-            ProcessResult::TimedOut => ActionOutcome::Error(ActionFault::new("cmd_timeout", None)),
+            ProcessResult::Completed { status, .. } if status.success() => ActionOutcome::Pass,
+            ProcessResult::Completed { status, stderr, .. }
+                if status.code().is_none()
+                    || status.code() != Some(1)
+                    || interpreter_crashed(&stderr) =>
+            {
+                ActionOutcome::Inconclusive(ActionFault::new("cmd_harness_error", None))
+            }
+            ProcessResult::Completed { .. } => ActionOutcome::Fail,
+            ProcessResult::TimedOut => {
+                ActionOutcome::Inconclusive(ActionFault::new("cmd_timeout", None))
+            }
             ProcessResult::SpawnFailed | ProcessResult::WaitFailed => {
-                ActionOutcome::Error(ActionFault::new("cmd_execute_error", None))
+                ActionOutcome::Inconclusive(ActionFault::new("cmd_execute_error", None))
             }
         }
     }
+}
+
+fn interpreter_crashed(stderr: &[u8]) -> bool {
+    let stderr = String::from_utf8_lossy(stderr);
+    stderr.contains("SyntaxError") || stderr.contains("Traceback (most recent call last):")
 }
 
 #[cfg(test)]
@@ -124,12 +138,41 @@ mod tests {
     }
 
     #[test]
-    fn nonzero_exit_is_a_fail() {
-        for script in ["exit 7", "missing-fixture-command"] {
-            let receipt = execute(script, CommandProvider::default());
-            assert_eq!(receipt.verdict, Some(CheckVerdict::Fail));
-            assert_eq!(receipt.error, None);
-        }
+    fn an_explicit_false_claim_is_a_fail() {
+        let receipt = execute("exit 1", CommandProvider::default());
+        assert_eq!(receipt.verdict, Some(CheckVerdict::Fail));
+        assert_eq!(receipt.error, None);
+    }
+
+    #[test]
+    fn a_non_predicate_exit_is_inconclusive() {
+        let receipt = execute("exit 7", CommandProvider::default());
+        assert_eq!(receipt.verdict, Some(CheckVerdict::Inconclusive));
+        assert_eq!(receipt.error, None);
+    }
+
+    #[test]
+    fn the_loop_not_burning_syntax_error_is_inconclusive() {
+        let receipt = execute("python3 -c 'if'", CommandProvider::default());
+        assert_eq!(receipt.verdict, Some(CheckVerdict::Inconclusive));
+        assert_eq!(receipt.error, None);
+    }
+
+    #[test]
+    fn a_python_runtime_crash_is_inconclusive() {
+        let receipt = execute(
+            "python3 -c 'raise RuntimeError(\"placeholder crash\")'",
+            CommandProvider::default(),
+        );
+        assert_eq!(receipt.verdict, Some(CheckVerdict::Inconclusive));
+        assert_eq!(receipt.error, None);
+    }
+
+    #[test]
+    fn a_missing_script_command_is_inconclusive() {
+        let receipt = execute("missing-fixture-command", CommandProvider::default());
+        assert_eq!(receipt.verdict, Some(CheckVerdict::Inconclusive));
+        assert_eq!(receipt.error, None);
     }
 
     #[test]
@@ -137,8 +180,8 @@ mod tests {
         let fixture = tempdir().expect("fixture directory");
         let absent_shell = PathBuf::from(fixture.path()).join("absent-shell");
         let receipt = execute("exit 0", CommandProvider::with_shell(absent_shell));
-        assert_eq!(receipt.verdict, None);
-        assert_eq!(receipt.error.as_deref(), Some("cmd_execute_error"));
+        assert_eq!(receipt.verdict, Some(CheckVerdict::Inconclusive));
+        assert_eq!(receipt.error, None);
     }
 
     #[test]
@@ -158,6 +201,7 @@ mod tests {
             .prepare("command", &enumeration)
             .expect("prepared command")
             .execute("timeout-attempt");
-        assert_eq!(receipt.error.as_deref(), Some("cmd_timeout"));
+        assert_eq!(receipt.verdict, Some(CheckVerdict::Inconclusive));
+        assert_eq!(receipt.error, None);
     }
 }

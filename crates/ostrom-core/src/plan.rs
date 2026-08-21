@@ -831,7 +831,13 @@ acknowledgements: []
         } else {
             format!("checks_version: 1\nchecks:\n  {id}:\n    uses: {uses}\n    with: {{}}\n")
         };
-        let document = CheckDocument::from_yaml(&yaml).expect("check document");
+        let actions = if uses.starts_with("agent/") {
+            vec!["fixture/observe", uses]
+        } else {
+            vec![uses]
+        };
+        let document =
+            CheckDocument::from_yaml_with_actions(&yaml, &actions).expect("check document");
         let action = ActionDefinition {
             uses: uses.to_owned(),
             producer: "fixture".to_owned(),
@@ -997,6 +1003,7 @@ acknowledgements: []
             (CheckState::Stale, "judged stale"),
             (CheckState::Passing, "judged pass"),
             (CheckState::Failing, "judged fail"),
+            (CheckState::Inconclusive, "judged inconclusive"),
         ] {
             assert_eq!(state.render(CheckBasis::Judged), rendered);
             assert!(state.render(CheckBasis::Judged).starts_with("judged "));

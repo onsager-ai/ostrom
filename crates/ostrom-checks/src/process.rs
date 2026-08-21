@@ -1,23 +1,47 @@
 use std::{
+    io::Read,
     process::{Command, ExitStatus, Stdio},
     thread,
     time::{Duration, Instant},
 };
 
 pub(crate) enum ProcessResult {
-    Completed(ExitStatus),
+    Completed {
+        status: ExitStatus,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    },
     SpawnFailed,
     WaitFailed,
     TimedOut,
 }
 
 pub(crate) fn run_bounded(command: &mut Command, timeout: Duration) -> ProcessResult {
-    command.stdin(Stdio::null()).stderr(Stdio::null());
-    command.stdout(Stdio::null());
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     set_process_group(command);
     let Ok(mut child) = command.spawn() else {
         return ProcessResult::SpawnFailed;
     };
+    let capture = |mut stream: Box<dyn Read + Send>| {
+        thread::spawn(move || {
+            const DIAGNOSTIC_LIMIT: usize = 8 * 1024;
+            let mut diagnostic = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while let Ok(read) = stream.read(&mut buffer) {
+                if read == 0 {
+                    break;
+                }
+                let remaining = DIAGNOSTIC_LIMIT.saturating_sub(diagnostic.len());
+                diagnostic.extend_from_slice(&buffer[..read.min(remaining)]);
+            }
+            diagnostic
+        })
+    };
+    let stdout = child.stdout.take().map(|stdout| capture(Box::new(stdout)));
+    let stderr = child.stderr.take().map(|stderr| capture(Box::new(stderr)));
     let pid = child.id();
     let Some(deadline) = Instant::now().checked_add(timeout) else {
         terminate(&mut child, pid);
@@ -27,7 +51,17 @@ pub(crate) fn run_bounded(command: &mut Command, timeout: Duration) -> ProcessRe
         match child.try_wait() {
             Ok(Some(status)) => {
                 kill_process_group(pid);
-                return ProcessResult::Completed(status);
+                let stdout = stdout
+                    .and_then(|reader| reader.join().ok())
+                    .unwrap_or_default();
+                let stderr = stderr
+                    .and_then(|reader| reader.join().ok())
+                    .unwrap_or_default();
+                return ProcessResult::Completed {
+                    status,
+                    stdout,
+                    stderr,
+                };
             }
             Ok(None) if Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(5));

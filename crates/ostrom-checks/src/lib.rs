@@ -8,6 +8,7 @@
 
 mod command;
 mod doctor;
+mod github;
 mod http;
 mod judgment;
 mod plugin_surface;
@@ -22,6 +23,7 @@ pub use doctor::{
     DOCTOR_CHECKS, DoctorOptions, DoctorProvider, DoctorResult, DoctorStatus, run_doctor,
     run_doctor_check,
 };
+pub use github::GitHubProvider;
 pub use http::HttpProvider;
 pub use judgment::{
     ClaudeHarness, HarnessRequest, JudgmentHarness, JudgmentOutcome, JudgmentRegistry,
