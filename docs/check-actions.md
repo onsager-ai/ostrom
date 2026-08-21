@@ -137,4 +137,4 @@ A policy operation step may cite one check by its exact authored name with
 `checks.yaml` beside the policy manifest; it is not copied into or interpreted
 as part of the manifest. `ostrom validate` loads that catalogue whenever the
 manifest contains a requirement and rejects an undefined name. The field is
-singular and closed-schema validation rejects the superseded `requires:` form.
+spelled `requires` everywhere; closed-schema validation rejects `require:`.

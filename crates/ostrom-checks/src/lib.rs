@@ -11,6 +11,7 @@ mod doctor;
 mod github;
 mod http;
 mod judgment;
+mod operation_settings;
 mod plugin_surface;
 mod process;
 mod registry;
@@ -28,6 +29,10 @@ pub use http::HttpProvider;
 pub use judgment::{
     ClaudeHarness, HarnessRequest, JudgmentHarness, JudgmentOutcome, JudgmentRegistry,
     PreparedJudgment,
+};
+pub use operation_settings::{
+    OperationSettingsDrift, OperationSettingsError, RoleSkillOperations, SkillOperationViolation,
+    check_operation_settings_drift, check_skill_operation_grants, generate_operation_settings,
 };
 pub use plugin_surface::{PluginSurfaceReport, PluginSurfaceViolation, check_plugin_surface};
 pub use registry::{

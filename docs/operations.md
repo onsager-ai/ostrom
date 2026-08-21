@@ -1,0 +1,67 @@
+# Policy operations
+
+Operations are the only policy-authored capability an agent can invoke. The
+active manifest is `${OSTROM_POLICY_MANIFEST}` when set and otherwise
+`<Ostrom config>/policy.yaml`. The harness sets `OSTROM_ACTOR`; the positional
+target is resolved before the manifest grant/deny decision.
+
+```yaml
+manifest_version: 1
+actors:
+  gatekeeper: {}
+operations:
+  merge:
+    name: Merge
+    params:
+      note: {type: markdown}
+    steps:
+      - uses: gh/post-verdict
+        with: {note: $params.note}
+      - uses: gh/merge-pr
+        with: {method: squash}
+        requires: ready-to-merge
+grants:
+  gatekeeper-merge:
+    actors: gatekeeper
+    operations: merge
+```
+
+Invoke it as one indivisible sequence:
+
+```sh
+ostrom merge placeholder-org/repository#7 --note @verdict.md
+```
+
+`markdown` values may flow only to content sinks. `semver` and a declared
+`enum` may flow to command arguments. References are whole YAML values in the
+form `$params.name`; interpolation is not supported. A `cmd/run` script must be
+literal policy content and can never reference a caller parameter.
+
+The closed operation action catalogue is:
+
+| action | boundary | scope | guard |
+|---|---|---|---|
+| `gh/post-verdict` | mediated | `pull_requests:write` | optional |
+| `gh/merge-pr` | mediated | `contents:write,pull_requests:write` | required |
+| `git/tag` | mediated | `contents:write` | required |
+| `cmd/run` | local | none | optional |
+| `sys/enable-loop` | ungrantable | none | unavailable |
+
+A mediated action mints its own scoped installation token and exposes it only
+to that action's child process. A local action removes `GH_TOKEN` and
+`GITHUB_TOKEN` from its child environment. The ungrantable catalogue entry has
+no dispatcher and makes any operation containing it invalid.
+
+`ostrom operations` lists declarations. `ostrom operations --actor builder`
+lists the operations with at least one builder grant. The settings preview and
+drift check are non-installing commands:
+
+```sh
+ostrom operations --settings builder
+ostrom operations --actor builder --check-settings /path/to/builder.settings.json
+```
+
+Generated settings use `defaultMode: deny`, set `OSTROM_ACTOR`, contain one
+`Bash(ostrom <operation> *)` allow per grant, and contain no deny list. These
+commands do not write the operator's role settings. Existing skills remain on
+their direct command paths until each migration is separately approved.

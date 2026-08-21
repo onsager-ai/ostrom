@@ -1,0 +1,5 @@
+checks_version: 1
+checks:
+  ready-to-merge:
+    uses: cmd/run
+    with: {script: "exit 0"}
