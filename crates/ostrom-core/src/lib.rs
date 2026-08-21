@@ -14,6 +14,7 @@
 mod check;
 mod dispatch;
 mod domain;
+mod operation;
 mod plan;
 mod policy;
 mod store;
@@ -39,6 +40,10 @@ pub use domain::{
     ConfigError, DefaultDisposition, GateConfig, GateProject, GateSelector, Mandate, MandateConfig,
     ProjectMandate, RepositoryName, Role, Selector, SelectorError, Verdict,
 };
+pub use operation::{
+    ActionBoundary, ActionParameter, ActionScope, OperationAction, OperationActionError,
+    ParameterSink, operation_action, operation_actions, validate_operation,
+};
 pub use plan::{
     Acknowledgement, AcknowledgementResponse, Assessment, AssessmentDraft, AssessmentError,
     Because, Consequence, EvaluatedCheck, GOALS_VERSION, Goal, GoalAction, GoalActionVerb,
@@ -49,10 +54,10 @@ pub use plan::{
 };
 pub use policy::{
     ActorDecl, InputDecl, InputResolutionError, InputType, LoopDecl, ManifestDefaults,
-    ManifestError, ManifestValidationError, NormalizedList, OperationDecl, PolicyCandidate,
-    PolicyDecision, PolicyManifest, PolicySelector, PolicySelectorError, ResolvedInput, RuleDecl,
-    RuleDefaults, SelectorFinding, SelectorMatch, SelectorPrefix, SelectorResolutionError,
-    SelectorUniverse, StepDecl, UnmatchedPolicy,
+    ManifestError, ManifestValidationError, NormalizedList, OperationDecl, OperationParamDecl,
+    OperationParamType, PolicyCandidate, PolicyDecision, PolicyManifest, PolicySelector,
+    PolicySelectorError, ResolvedInput, RuleDecl, RuleDefaults, SelectorFinding, SelectorMatch,
+    SelectorPrefix, SelectorResolutionError, SelectorUniverse, StepDecl, UnmatchedPolicy,
 };
 pub use store::{
     AttemptOutcome, CHECK_STORE_SCHEMA_VERSION, CheckRun, CheckRunId, CheckStore, CheckStoreFault,
