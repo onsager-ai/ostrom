@@ -118,6 +118,13 @@ pub fn render_digest(options: &DigestOptions) -> HookOutput {
             push_line(&mut body, &decision);
         }
     }
+    let failure_escalations = read_failure_escalations(&options.paths.trace_file(), &since);
+    if !failure_escalations.is_empty() {
+        push_line(&mut body, "DISPATCH FAILURES ESCALATED");
+        for escalation in failure_escalations {
+            push_line(&mut body, &escalation);
+        }
+    }
 
     render_section(
         &mut body,
@@ -425,6 +432,32 @@ fn read_decisions(path: &Path, since: &str) -> Vec<String> {
         .collect::<Vec<_>>();
     decisions.sort_by(|left, right| right.0.cmp(&left.0));
     decisions.into_iter().map(|(_, row)| row).collect()
+}
+
+fn read_failure_escalations(path: &Path, since: &str) -> Vec<String> {
+    let mut escalations = fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|row| row.get("kind").and_then(Value::as_str) == Some("dispatch-failure-escalated"))
+        .filter_map(|row| {
+            let ts = row.get("ts")?.as_str()?.to_owned();
+            let item = row.pointer("/fact/item_id")?.as_str()?;
+            let reason = row.pointer("/fact/failure_reason")?.as_str()?;
+            let count = row
+                .pointer("/fact/failure_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(2);
+            (ts.as_str() > since).then(|| {
+                (
+                    ts,
+                    format!("{item} — {reason} ({count} identical failures; dispatch suppressed)"),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    escalations.sort_by(|left, right| right.0.cmp(&left.0));
+    escalations.into_iter().map(|(_, row)| row).collect()
 }
 
 fn unresolvable_repositories(state: Option<&Value>) -> BTreeSet<String> {

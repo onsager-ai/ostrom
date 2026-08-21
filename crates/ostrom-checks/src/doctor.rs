@@ -2361,7 +2361,8 @@ fn check_work_orders(context: &DoctorContext) -> DoctorResult {
         return no_work_orders();
     };
     let orders = in_flight(source);
-    if orders.is_empty() {
+    let escalations = active_dispatch_failure_escalations(source);
+    if orders.is_empty() && escalations.is_empty() {
         return no_work_orders();
     }
     let mut faults = Vec::new();
@@ -2405,6 +2406,17 @@ fn check_work_orders(context: &DoctorContext) -> DoctorResult {
             ),
             "confirm the user systemd manager is reachable and inspect the transient unit",
         )
+    } else if !escalations.is_empty() {
+        DoctorResult::new(
+            DoctorStatus::Warn,
+            "work-orders",
+            format!(
+                "{} in flight; repeated dispatch failures escalated: {}",
+                orders.len(),
+                escalations.join(", ")
+            ),
+            "inspect the named failure and resolve it before dispatching the item again",
+        )
     } else {
         DoctorResult::new(
             DoctorStatus::Ok,
@@ -2413,6 +2425,35 @@ fn check_work_orders(context: &DoctorContext) -> DoctorResult {
             "",
         )
     }
+}
+
+fn active_dispatch_failure_escalations(source: &str) -> Vec<String> {
+    let mut active = BTreeMap::<String, String>::new();
+    for line in source.lines().filter(|line| !line.is_empty()) {
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(item_id) = record.pointer("/fact/item_id").and_then(Value::as_str) else {
+            continue;
+        };
+        match record.get("kind").and_then(Value::as_str) {
+            Some("dispatch-failure-escalated") => {
+                let reason = record
+                    .pointer("/fact/failure_reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("reason unavailable");
+                active.insert(item_id.to_owned(), reason.to_owned());
+            }
+            Some("work-completed" | "queue-item-dropped") => {
+                active.remove(item_id);
+            }
+            _ => {}
+        }
+    }
+    active
+        .into_iter()
+        .map(|(item, reason)| format!("{item} ({reason})"))
+        .collect()
 }
 
 fn visible_order(order: &DispatchFact) -> String {
@@ -3020,6 +3061,29 @@ mod tests {
                 "{check} did not execute"
             );
         }
+    }
+
+    #[test]
+    fn work_orders_warns_about_repeated_dispatch_failure_escalations() {
+        let fixture = Fixture::new();
+        let state = fixture.config_dir.join("ostrom");
+        fs::create_dir(&state).expect("create ostrom state");
+        fs::write(
+            state.join("sprint.jsonl"),
+            concat!(
+                r#"{"ts":"2026-08-19T01:00:00Z","kind":"dispatch-failure-escalated","fact":{"schema_version":1,"item_id":"placeholder-org/alpha#7","order_id":"placeholder-order","action":"suppress-dispatch","failure_reason":"branch-already-pushed","failure_count":2},"narration":{"reason":"Repeated failure.","conclusion":"Dispatch suppressed."}}"#,
+                "\n",
+            ),
+        )
+        .expect("write escalation trace");
+
+        assert_eq!(
+            run_doctor_check(fixture.options(), "work-orders").unwrap(),
+            concat!(
+                "WARN|work-orders|0 in flight; repeated dispatch failures escalated: placeholder-org/alpha#7 (branch-already-pushed)|",
+                "inspect the named failure and resolve it before dispatching the item again\n",
+            )
+        );
     }
 
     #[test]

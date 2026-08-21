@@ -1,0 +1,15 @@
+{
+  "repositories": [
+    {
+      "repo": "placeholder-org/alpha",
+      "issues": [],
+      "issue_not_modified": true,
+      "open_prs": [],
+      "merged_prs": [],
+      "default_branch": "main",
+      "branches": [],
+      "branch_read_degraded": false,
+      "ci_runs": []
+    }
+  ]
+}

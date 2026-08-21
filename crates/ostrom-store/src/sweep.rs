@@ -17,8 +17,9 @@ use thiserror::Error;
 
 use crate::{
     AppTokenError, OstromPaths, PublishDestination, PublishError, QueueDocument, StoreError,
+    TraceAppend,
     app_token::{GitHubInstallationTokenMinter, InstallationTokenMinter, ScopedAppTokenRequest},
-    environment, io_error,
+    append_trace, environment, io_error,
     publish::{PublishOptions, PublishOutcome, publish},
     read_queue,
     selector::{SelectorCandidate, glob_match, selector_match},
@@ -117,6 +118,8 @@ pub struct SweepFixture {
 #[serde(deny_unknown_fields)]
 pub struct RepositorySnapshot {
     pub repo: RepositoryName,
+    /// The exhaustive current-open issue set plus any closed entries observed
+    /// in the bounded change feed used for cursor movement.
     #[serde(default)]
     pub issues: Vec<Value>,
     #[serde(default)]
@@ -195,6 +198,7 @@ struct ClassifiedItem {
 struct RepoAnalysis {
     generated: Vec<Value>,
     active_ids: BTreeSet<String>,
+    closed_ids: BTreeSet<String>,
     current: BTreeMap<String, Value>,
     state: Value,
 }
@@ -296,6 +300,7 @@ fn run_sweep_with_minter(
         .collect::<BTreeMap<_, _>>();
     let mut generated = Vec::new();
     let mut active_ids = BTreeSet::new();
+    let mut closed_ids = BTreeSet::new();
     let mut current = BTreeMap::new();
     let mut verified_repositories = BTreeSet::new();
     let mut new_state = old_state.clone();
@@ -341,6 +346,7 @@ fn run_sweep_with_minter(
         )?;
         generated.extend(analysis.generated);
         active_ids.extend(analysis.active_ids);
+        closed_ids.extend(analysis.closed_ids);
         current.extend(analysis.current);
         new_state["repos"][repo] = analysis.state;
     }
@@ -357,6 +363,9 @@ fn run_sweep_with_minter(
 
     let mut ranking_faults = Vec::new();
     for item in &config.work_ranking {
+        if closed_ids.contains(item) {
+            continue;
+        }
         let Some((repo, reference)) = item.rsplit_once('#') else {
             continue;
         };
@@ -412,10 +421,18 @@ fn run_sweep_with_minter(
     new_state["work_ranking"] = json!(&config.work_ranking);
     new_state["work_ranking_faults"] = json!(ranking_faults);
 
+    let dropped_closed = existing
+        .iter()
+        .filter_map(|row| {
+            let id = string_field(row.value(), &["id"]);
+            closed_ids.contains(id).then(|| id.to_owned())
+        })
+        .collect::<BTreeSet<_>>();
     let final_rows = reconcile_queue(
         existing,
         generated,
         &active_ids,
+        &closed_ids,
         &current,
         &configured,
         &unacquired_repositories,
@@ -431,6 +448,24 @@ fn run_sweep_with_minter(
     backup_previous_sweep(&options.paths)?;
     write_queue(&options.paths.queue_file(), &final_rows)?;
     write_json_private(&state_path, &new_state)?;
+    for item_id in dropped_closed {
+        append_trace(
+            &options.paths.trace_file(),
+            &TraceAppend {
+                ts: format_time(options.started_at),
+                kind: "queue-item-dropped".to_owned(),
+                fact: Map::from_iter([
+                    ("item_id".to_owned(), json!(item_id)),
+                    ("action".to_owned(), json!("drop-from-queue")),
+                    ("reason".to_owned(), json!("subject-closed")),
+                ]),
+                narration: Map::from_iter([(
+                    "conclusion".to_owned(),
+                    json!("The queue item was removed because its GitHub issue is closed."),
+                )]),
+            },
+        )?;
+    }
 
     // Publication observes only a durable successful generation. Every
     // refusal path, including zero acquisition, returns above the writes and
@@ -620,18 +655,19 @@ fn acquire_repository(
     previous: &Value,
     config: &MandateConfig,
     started_at: DateTime<Utc>,
-    mode: SweepMode,
+    _mode: SweepMode,
 ) -> Result<RepositorySnapshot, SweepError> {
     let repo_name = repo.as_str();
     let previous_cursor = previous.get("cursor").and_then(Value::as_str).unwrap_or("");
     let previous_etag = previous.get("etag").and_then(Value::as_str).unwrap_or("");
-    let issue_since = if mode == SweepMode::Incremental {
-        previous_cursor
+    let (delta, issue_etag, issue_not_modified) = if previous_cursor.is_empty() {
+        (Vec::new(), None, false)
     } else {
-        ""
+        fetch_issues(repo_name, previous_cursor, previous_etag)?
     };
-    let closed_delta = if mode == SweepMode::Full && !previous_cursor.is_empty() {
-        let (delta, _, _) = fetch_issues(repo_name, previous_cursor, "")?;
+    let closed_delta = if previous_cursor.is_empty() {
+        Vec::new()
+    } else {
         delta
             .into_iter()
             .filter(|issue| {
@@ -639,11 +675,13 @@ fn acquire_repository(
                     && string_field(issue, &["state"]).eq_ignore_ascii_case("closed")
             })
             .collect()
-    } else {
-        Vec::new()
     };
-    let (mut issues, issue_etag, issue_not_modified) =
-        fetch_issues(repo_name, issue_since, previous_etag)?;
+    // The bounded change feed is useful for cursor movement, but it is not a
+    // safe source of truth for closure eviction: a busy window can omit the
+    // newest changes and a later cursor can make that omission permanent.
+    // Carry a complete current-open set on every snapshot so analysis can
+    // reconcile old records even when their closure is absent from `delta`.
+    let mut issues = fetch_open_issues(repo_name)?;
     issues.extend(closed_delta);
     enrich_issue_relationships(repo_name, &mut issues)?;
 
@@ -763,6 +801,28 @@ fn acquire_repository(
         ci_runs,
         warnings,
     })
+}
+
+fn fetch_open_issues(repo: &str) -> Result<Vec<Value>, SweepError> {
+    let mut issues = Vec::new();
+    let mut page = 1_u64;
+    loop {
+        let endpoint = format!(
+            "repos/{repo}/issues?state=open&sort=updated&direction=asc&per_page=100&page={page}"
+        );
+        let values = gh_json(&["api", "-X", "GET", &endpoint])?;
+        let values = values.as_array().cloned().ok_or_else(|| {
+            SweepError::Acquisition(format!(
+                "current open issues query for {repo} returned a non-array body"
+            ))
+        })?;
+        let count = values.len();
+        issues.extend(values);
+        if count < 100 {
+            return Ok(issues);
+        }
+        page = page.saturating_add(1);
+    }
 }
 
 fn fetch_branches(repo: &str) -> Result<Vec<Value>, SweepError> {
@@ -954,7 +1014,7 @@ fn analyze_repository(
     let repo = project.repo.as_str();
     let previous_cursor = previous.get("cursor").and_then(Value::as_str);
     let initial = previous_cursor.is_none();
-    let closed_ids = snapshot
+    let mut closed_ids = snapshot
         .issues
         .iter()
         .filter(|issue| issue.get("pull_request").is_none())
@@ -962,6 +1022,24 @@ fn analyze_repository(
         .filter_map(|issue| number_field(issue, &["number"]))
         .map(|number| format!("{repo}#{number}"))
         .collect::<BTreeSet<_>>();
+    let open_ids = snapshot
+        .issues
+        .iter()
+        .filter(|issue| issue.get("pull_request").is_none())
+        .filter(|issue| !string_field(issue, &["state"]).eq_ignore_ascii_case("closed"))
+        .filter_map(|issue| number_field(issue, &["number"]))
+        .map(|number| format!("{repo}#{number}"))
+        .collect::<BTreeSet<_>>();
+    closed_ids.extend(
+        previous
+            .get("records")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flat_map(|records| records.values())
+            .filter_map(|value| serde_json::from_value::<NormalizedItem>(value.clone()).ok())
+            .filter(|item| item.item_type == "issue" && !open_ids.contains(&item.id))
+            .map(|item| item.id),
+    );
 
     let mut fresh = snapshot
         .issues
@@ -1207,6 +1285,7 @@ fn analyze_repository(
     Ok(RepoAnalysis {
         generated,
         active_ids,
+        closed_ids,
         current,
         state,
     })
@@ -2095,6 +2174,7 @@ fn reconcile_queue(
     existing: Vec<QueueDocument>,
     generated: Vec<Value>,
     active_ids: &BTreeSet<String>,
+    closed_ids: &BTreeSet<String>,
     current: &BTreeMap<String, Value>,
     configured: &BTreeSet<String>,
     unacquired_repositories: &BTreeSet<String>,
@@ -2108,10 +2188,11 @@ fn reconcile_queue(
         .filter(|row| {
             let id = string_field(row, &["id"]);
             let repo = string_field(row, &["repo"]);
-            active_ids.contains(id)
-                || string_field(row, &["state"]) == "approved"
-                || unacquired_repositories.contains(repo)
-                || (!configured.contains(repo) && string_field(row, &["kind"]) == "drift")
+            !closed_ids.contains(id)
+                && (active_ids.contains(id)
+                    || string_field(row, &["state"]) == "approved"
+                    || unacquired_repositories.contains(repo)
+                    || (!configured.contains(repo) && string_field(row, &["kind"]) == "drift"))
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -2835,6 +2916,7 @@ mod tests {
             existing,
             generated,
             &BTreeSet::from([id.to_owned()]),
+            &BTreeSet::new(),
             &BTreeMap::new(),
             &BTreeSet::from(["placeholder-org/alpha".to_owned()]),
             &BTreeSet::new(),

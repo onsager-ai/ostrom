@@ -363,6 +363,47 @@ fn branch_listing_finds_exact_matches_across_pages_and_classifies_pr_state() {
 }
 
 #[test]
+fn a_second_identical_dispatch_failure_escalates_and_suppresses_a_third_attempt() {
+    let fixture = Fixture::new();
+    for _ in 0..2 {
+        let output = run(fixture
+            .command()
+            .env("OSTROM_TEST_BRANCH_PAGE_1", matched_page()));
+        assert_refused(&output, 3, "matched_key=branch_name");
+    }
+    let trace = fixture.trace();
+    assert_eq!(
+        trace
+            .iter()
+            .filter(|row| row["kind"] == "work-failed")
+            .count(),
+        2
+    );
+    let escalation = trace
+        .iter()
+        .find(|row| row["kind"] == "dispatch-failure-escalated")
+        .expect("second failure escalation");
+    assert_eq!(escalation["fact"]["item_id"], ITEM_ID);
+    assert_eq!(
+        escalation["fact"]["failure_reason"],
+        "branch-already-pushed"
+    );
+    assert_eq!(escalation["fact"]["failure_count"], 2);
+    assert_eq!(escalation["fact"]["action"], "suppress-dispatch");
+
+    let third = run(fixture
+        .command()
+        .env("OSTROM_TEST_BRANCH_PAGE_1", default_page()));
+    assert_refused(&third, 3, "repeated failure escalated");
+    assert!(!fixture.calls.exists(), "a third dispatch reached systemd");
+    assert_eq!(
+        fixture.trace(),
+        trace,
+        "third attempt appended duplicate trace rows"
+    );
+}
+
+#[test]
 fn degraded_branch_evidence_fails_closed_with_a_named_trace() {
     for (variable, value, detail) in [
         ("OSTROM_TEST_BRANCH_FAIL_PAGE", "1", "page 1 failed"),
