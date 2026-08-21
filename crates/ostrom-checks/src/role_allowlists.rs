@@ -244,7 +244,7 @@ fn bash_rule_allows(rule: &str, subcommand: &str) -> bool {
 /// commands. Within a shell fence, a nested child after `--` is likewise not a
 /// separate harness invocation; the outer `ostrom credential` call is the
 /// command whose Bash permission Claude requests.
-fn invoked_subcommands(markdown: &str) -> BTreeSet<String> {
+pub(crate) fn invoked_subcommands(markdown: &str) -> BTreeSet<String> {
     let mut commands = BTreeSet::new();
     let mut shell_fence = false;
     for line in markdown.lines() {

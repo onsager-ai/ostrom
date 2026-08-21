@@ -140,8 +140,29 @@ pub(crate) fn load(path: &Path) -> Result<PolicyManifest, PolicyLoadError> {
     manifest
         .validate()
         .map_err(|error| PolicyLoadError::Validation(error.to_string()))?;
+    validate_operation_names(&manifest)?;
     validate_check_requirements(&manifest, parent)?;
     Ok(manifest)
+}
+
+fn validate_operation_names(manifest: &PolicyManifest) -> Result<(), PolicyLoadError> {
+    for name in manifest.operations.keys() {
+        let valid = !name.is_empty()
+            && name.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+            });
+        if !valid {
+            return Err(PolicyLoadError::Validation(format!(
+                "operation name `{name}` must contain only lowercase letters, digits, `-`, or `_`"
+            )));
+        }
+        if command_verbs().any(|verb| verb == name) || name == "operations" {
+            return Err(PolicyLoadError::Validation(format!(
+                "operation name `{name}` conflicts with a built-in ostrom command"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_check_requirements(

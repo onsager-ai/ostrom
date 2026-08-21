@@ -241,3 +241,27 @@ fn require_resolves_a_sibling_check_by_exact_name() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn operation_names_cannot_shadow_builtins_or_actions() {
+    for name in ["operations", "credential", "gh/merge-pr"] {
+        let temporary = TempDir::new().expect("temporary directory");
+        let manifest = temporary.path().join("manifest.yml");
+        fs::write(
+            &manifest,
+            format!("manifest_version: 1\noperations:\n  {name}: {{steps: []}}\n"),
+        )
+        .expect("write manifest");
+        let output = ostrom()
+            .args(["validate"])
+            .arg(manifest)
+            .output()
+            .expect("run validate");
+        assert!(!output.status.success(), "{name} must fail");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("operation name") && stderr.contains(name),
+            "{stderr}"
+        );
+    }
+}

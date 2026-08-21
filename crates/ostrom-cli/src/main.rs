@@ -5,6 +5,7 @@ use std::{
     fs,
     io::{self, Write},
     path::{Path, PathBuf},
+    process::{Command as ProcessCommand, Stdio},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -14,12 +15,12 @@ use clap::{Parser, Subcommand, ValueEnum};
 use directories::BaseDirs;
 use ostrom_checks::{
     ActionFault, ActionRegistry, DoctorOptions, PreparedCheck, check_shell_retirement,
-    check_skill_version_bump, run_doctor, run_doctor_check,
+    check_skill_version_bump, generate_operation_settings, run_doctor, run_doctor_check,
 };
 use ostrom_core::{
     CHECK_STORE_SCHEMA_VERSION, Catalogue, CatalogueEnumeration, CheckContractError, CheckDocument,
-    CheckFault, CheckRun, CheckRunId, CheckState, CheckVerdict, InconclusivePolicy, RepositoryName,
-    ResolvedCheck,
+    CheckFault, CheckRun, CheckRunId, CheckState, CheckVerdict, InconclusivePolicy,
+    OperationAction, RepositoryName, ResolvedCheck, SelectorPrefix,
 };
 use ostrom_store::{
     AssessmentHarness, AuditOptions, DigestOptions, DispatchOutcome, DispatchRequest,
@@ -37,7 +38,13 @@ use ostrom_store::{
     validate_lease_name, validate_work_order_file,
 };
 
+mod operation_dispatch;
 mod policy_manifest;
+
+use operation_dispatch::{
+    OperationDispatchError, OperationRuntime, ResolvedOperationTarget, dispatch_operation,
+    manifest_path, parse_invocation, resolve_repository_target,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "ostrom", version, about = "Ostrom workflow commons CLI")]
@@ -54,6 +61,18 @@ enum Command {
         #[arg(long)]
         normalized: bool,
         manifest: PathBuf,
+    },
+    /// List the operations declared by the active policy manifest.
+    Operations {
+        /// Restrict the list to operations granted somewhere to this actor.
+        #[arg(long)]
+        actor: Option<String>,
+        /// Render the generated settings profile for this actor.
+        #[arg(long, conflicts_with = "check_settings")]
+        settings: Option<String>,
+        /// Refuse when this settings file differs from the derived profile.
+        #[arg(long, requires = "actor", conflicts_with = "settings")]
+        check_settings: Option<PathBuf>,
     },
     /// Run one command with a scoped GitHub App installation credential.
     Credential {
@@ -208,6 +227,9 @@ enum Command {
         #[arg(long)]
         local_only: bool,
     },
+    /// Invoke one policy operation. Actions are never direct CLI commands.
+    #[command(external_subcommand)]
+    Operation(Vec<OsString>),
 }
 
 #[derive(Debug, Subcommand)]
@@ -427,6 +449,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             normalized,
             manifest,
         } => policy_manifest::run_validate(&manifest, normalized)?,
+        Command::Operations {
+            actor,
+            settings,
+            check_settings,
+        } => run_operations_command(
+            &paths,
+            actor.as_deref(),
+            settings.as_deref(),
+            check_settings.as_deref(),
+        )?,
         Command::Credential {
             role,
             repository,
@@ -948,8 +980,472 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        Command::Operation(arguments) => run_operation_command(&paths, &arguments)?,
     }
     Ok(())
+}
+
+fn run_operations_command(
+    paths: &OstromPaths,
+    actor: Option<&str>,
+    settings_actor: Option<&str>,
+    check_settings: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let manifest = policy_manifest::load(&manifest_path(&paths.config))?;
+    if let Some(settings_actor) = settings_actor {
+        print!(
+            "{}",
+            generate_operation_settings(&manifest, settings_actor)?
+        );
+        return Ok(());
+    }
+    if let Some(path) = check_settings {
+        let actor = actor.expect("clap requires actor with check-settings");
+        if let Some(drift) = ostrom_checks::check_operation_settings_drift(&manifest, actor, path)?
+        {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, drift.detail).into());
+        }
+        println!("valid: {}", path.display());
+        return Ok(());
+    }
+    if let Some(actor) = actor
+        && !manifest.actors.contains_key(actor)
+    {
+        return Err(OperationDispatchError::UnknownActor(actor.to_owned()).into());
+    }
+    for (name, operation) in &manifest.operations {
+        let visible = actor.is_none_or(|actor| {
+            manifest.grants.values().any(|grant| {
+                (grant.actors.is_empty() || grant.actors.iter().any(|value| value == actor))
+                    && (grant.operations.is_empty()
+                        || grant.operations.iter().any(|value| value == name))
+            })
+        });
+        if visible {
+            println!(
+                "{name}\t{}",
+                operation.name.as_deref().unwrap_or(name.as_str())
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run_operation_command(
+    paths: &OstromPaths,
+    arguments: &[OsString],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let manifest = policy_manifest::load(&manifest_path(&paths.config))?;
+    let invocation = parse_invocation(&manifest, arguments)?;
+    let actor = env::var("OSTROM_ACTOR")
+        .ok()
+        .filter(|actor| !actor.trim().is_empty())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "OSTROM_ACTOR is required"))?;
+    let working_directory = env::current_dir()?;
+    let plugin_root = env::var_os("OSTROM_PLUGIN_ROOT")
+        .or_else(|| env::var_os("CLAUDE_PLUGIN_ROOT"))
+        .map_or_else(|| working_directory.join("plugins/ostrom"), PathBuf::from);
+    let selector_prefixes = operation_selector_prefixes(&manifest, &actor, &invocation.name);
+    let mut runtime = CliOperationRuntime {
+        paths,
+        actor: &actor,
+        working_directory: &working_directory,
+        plugin_root: &plugin_root,
+        selector_prefixes,
+    };
+    dispatch_operation(&manifest, &actor, &invocation, &mut runtime)?;
+    Ok(())
+}
+
+struct CliOperationRuntime<'a> {
+    paths: &'a OstromPaths,
+    actor: &'a str,
+    working_directory: &'a Path,
+    plugin_root: &'a Path,
+    selector_prefixes: BTreeSet<SelectorPrefix>,
+}
+
+impl OperationRuntime for CliOperationRuntime<'_> {
+    fn resolve_target(
+        &mut self,
+        raw: &str,
+        actor: &str,
+        operation: &str,
+    ) -> Result<ResolvedOperationTarget, OperationDispatchError> {
+        let mut target = resolve_repository_target(raw, actor, operation)?;
+        if self.selector_prefixes.iter().any(|prefix| {
+            matches!(
+                prefix,
+                SelectorPrefix::Label | SelectorPrefix::Path | SelectorPrefix::Type
+            )
+        }) {
+            resolve_target_metadata(self.paths, actor, &mut target)?;
+        }
+        Ok(target)
+    }
+
+    fn require(
+        &mut self,
+        check: &str,
+        _target: &ResolvedOperationTarget,
+    ) -> Result<(), OperationDispatchError> {
+        execute_operation_requirement(self.paths, self.working_directory, self.plugin_root, check)
+    }
+
+    fn execute(
+        &mut self,
+        action: &'static OperationAction,
+        target: &ResolvedOperationTarget,
+        parameters: &BTreeMap<String, serde_yaml::Value>,
+    ) -> Result<(), OperationDispatchError> {
+        execute_operation_action(self.paths, self.actor, action, target, parameters)
+    }
+}
+
+fn operation_selector_prefixes(
+    manifest: &ostrom_core::PolicyManifest,
+    actor: &str,
+    operation: &str,
+) -> BTreeSet<SelectorPrefix> {
+    manifest
+        .grants
+        .values()
+        .chain(manifest.denies.values())
+        .filter(|rule| {
+            (rule.actors.is_empty() || rule.actors.iter().any(|candidate| candidate == actor))
+                && (rule.operations.is_empty()
+                    || rule
+                        .operations
+                        .iter()
+                        .any(|candidate| candidate == operation))
+        })
+        .flat_map(|rule| {
+            rule.selectors
+                .iter()
+                .map(ostrom_core::PolicySelector::prefix)
+        })
+        .collect()
+}
+
+fn resolve_target_metadata(
+    paths: &OstromPaths,
+    actor: &str,
+    target: &mut ResolvedOperationTarget,
+) -> Result<(), OperationDispatchError> {
+    if !target.raw.contains('#') {
+        return Err(OperationDispatchError::TargetResolutionFailed {
+            target: target.raw.clone(),
+            message: "selector-constrained operations require a pull request target".to_owned(),
+        });
+    }
+    let command = [
+        "gh",
+        "pr",
+        "view",
+        target.raw.as_str(),
+        "--json",
+        "labels,files,title",
+    ];
+    let output = credential_output(
+        paths,
+        actor,
+        &target.repository,
+        &target.repository,
+        "contents:read,pull_requests:read",
+        &command,
+    )
+    .map_err(|error| OperationDispatchError::TargetResolutionFailed {
+        target: target.raw.clone(),
+        message: error.to_string(),
+    })?;
+    if !output.status.success() {
+        return Err(OperationDispatchError::TargetResolutionFailed {
+            target: target.raw.clone(),
+            message: format!("gh pr view exited with {}", output.status),
+        });
+    }
+    let document = serde_json::from_slice::<serde_json::Value>(&output.stdout).map_err(|_| {
+        OperationDispatchError::TargetResolutionFailed {
+            target: target.raw.clone(),
+            message: "gh pr view returned malformed JSON".to_owned(),
+        }
+    })?;
+    target.candidate.labels = document
+        .get("labels")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|label| label.get("name").and_then(serde_json::Value::as_str))
+        .map(str::to_owned)
+        .collect();
+    target.candidate.paths = document
+        .get("files")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|file| file.get("path").and_then(serde_json::Value::as_str))
+        .map(str::to_owned)
+        .collect();
+    target.candidate.commit_type = document
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .and_then(commit_type);
+    Ok(())
+}
+
+fn commit_type(title: &str) -> Option<String> {
+    let prefix = title.split_once(':')?.0.trim_end_matches('!');
+    let kind = prefix.split_once('(').map_or(prefix, |(kind, _)| kind);
+    (!kind.is_empty()
+        && kind
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')))
+    .then(|| kind.to_ascii_lowercase())
+}
+
+fn execute_operation_requirement(
+    paths: &OstromPaths,
+    working_directory: &Path,
+    plugin_root: &Path,
+    check: &str,
+) -> Result<(), OperationDispatchError> {
+    let resolutions =
+        resolve_plan_checks(paths, working_directory, plugin_root).map_err(|error| {
+            OperationDispatchError::RequirementFailed(format!("{check}: {}", error.name()))
+        })?;
+    if let Some(fault) = resolutions.catalogue_fault {
+        return Err(OperationDispatchError::RequirementFailed(format!(
+            "{check}: {}",
+            fault.name
+        )));
+    }
+    if let Some(fault) = resolutions.faults.get(check) {
+        return Err(OperationDispatchError::RequirementFailed(format!(
+            "{check}: {}",
+            fault.name
+        )));
+    }
+    let prepared = resolutions
+        .prepared
+        .get(check)
+        .ok_or_else(|| OperationDispatchError::RequirementFailed(check.to_owned()))?;
+    // Operation guards are observations made immediately before their action.
+    // Production intentionally owns this real clock; hermetic dispatcher tests
+    // use a fake runtime rather than pinning a path production leaves unpinned.
+    let receipt = prepared.execute(&format!("operation:{check}"));
+    let passed = receipt.verdict == Some(CheckVerdict::Pass) && receipt.error.is_none();
+    let mut store = JsonlCheckStore::new(paths);
+    store
+        .append_run(&CheckRun {
+            schema_version: CHECK_STORE_SCHEMA_VERSION,
+            run_id: new_check_run_id(),
+            completed_at: receipt.completed_at.to_rfc3339(),
+            receipts: vec![receipt],
+        })
+        .map_err(|error| OperationDispatchError::RequirementFailed(format!("{check}: {error}")))?;
+    if passed {
+        Ok(())
+    } else {
+        Err(OperationDispatchError::RequirementFailed(check.to_owned()))
+    }
+}
+
+fn execute_operation_action(
+    paths: &OstromPaths,
+    actor: &str,
+    action: &'static OperationAction,
+    target: &ResolvedOperationTarget,
+    parameters: &BTreeMap<String, serde_yaml::Value>,
+) -> Result<(), OperationDispatchError> {
+    match action.uses {
+        "gh/post-verdict" => {
+            let note = operation_string(parameters, "note", action.uses)?;
+            run_mediated(
+                paths,
+                actor,
+                action,
+                target,
+                &["gh", "pr", "comment", &target.raw, "--body", note],
+            )
+        }
+        "gh/merge-pr" => {
+            let method = parameters
+                .get("method")
+                .and_then(serde_yaml::Value::as_str)
+                .unwrap_or("squash");
+            if !matches!(method, "merge" | "rebase" | "squash") {
+                return Err(action_failed(
+                    action.uses,
+                    "method must be merge, rebase, or squash",
+                ));
+            }
+            let method_flag = format!("--{method}");
+            run_mediated(
+                paths,
+                actor,
+                action,
+                target,
+                &["gh", "pr", "merge", &target.raw, &method_flag],
+            )
+        }
+        "git/tag" => {
+            let name = operation_string(parameters, "name", action.uses)?;
+            let mut tag = ProcessCommand::new("git");
+            if let Some(message) = parameters
+                .get("message")
+                .and_then(serde_yaml::Value::as_str)
+            {
+                tag.args(["tag", "-a", name, "-m", message]);
+            } else {
+                tag.args(["tag", name]);
+            }
+            let status = tag
+                .status()
+                .map_err(|error| action_failed(action.uses, error))?;
+            if !status.success() {
+                return Err(action_failed(action.uses, "git tag rejected the tag"));
+            }
+            let reference = format!("refs/tags/{name}");
+            run_mediated(
+                paths,
+                actor,
+                action,
+                target,
+                &["git", "push", "origin", &reference],
+            )
+        }
+        "cmd/run" => run_local_command(action, parameters),
+        _ => Err(OperationDispatchError::UnknownAction(
+            action.uses.to_owned(),
+        )),
+    }
+}
+
+fn run_mediated(
+    paths: &OstromPaths,
+    actor: &str,
+    action: &'static OperationAction,
+    target: &ResolvedOperationTarget,
+    command: &[&str],
+) -> Result<(), OperationDispatchError> {
+    let permissions = action
+        .scopes
+        .iter()
+        .map(|scope| format!("{}:{}", scope.permission, scope.level))
+        .collect::<Vec<_>>()
+        .join(",");
+    let output = credential_output(
+        paths,
+        actor,
+        &target.repository,
+        &target.repository,
+        &permissions,
+        command,
+    )
+    .map_err(|error| action_failed(action.uses, error))?;
+    io::stdout()
+        .write_all(&output.stdout)
+        .map_err(|error| action_failed(action.uses, error))?;
+    io::stderr()
+        .write_all(&output.stderr)
+        .map_err(|error| action_failed(action.uses, error))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(action_failed(
+            action.uses,
+            format!("child exited with {}", output.status),
+        ))
+    }
+}
+
+fn run_local_command(
+    action: &'static OperationAction,
+    parameters: &BTreeMap<String, serde_yaml::Value>,
+) -> Result<(), OperationDispatchError> {
+    let script = operation_string(parameters, "script", action.uses)?;
+    let timeout = operation_timeout(parameters.get("timeout"), action.uses)?;
+    let mut child = ProcessCommand::new("sh")
+        .args(["-c", script])
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|error| action_failed(action.uses, error))?;
+    let started = std::time::Instant::now();
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| action_failed(action.uses, error))?
+        {
+            return if status.success() {
+                Ok(())
+            } else {
+                Err(action_failed(
+                    action.uses,
+                    format!("child exited with {status}"),
+                ))
+            };
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(action_failed(action.uses, "child timed out"));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn operation_timeout(
+    value: Option<&serde_yaml::Value>,
+    action: &str,
+) -> Result<Duration, OperationDispatchError> {
+    let Some(value) = value else {
+        return Ok(Duration::from_secs(30));
+    };
+    if let Some(seconds) = value.as_u64().filter(|seconds| *seconds > 0) {
+        return Ok(Duration::from_secs(seconds));
+    }
+    let Some(value) = value.as_str() else {
+        return Err(action_failed(action, "timeout must be a positive duration"));
+    };
+    let (number, factor) = if let Some(number) = value.strip_suffix("ms") {
+        (number, 1_u64)
+    } else if let Some(number) = value.strip_suffix('s') {
+        (number, 1_000)
+    } else if let Some(number) = value.strip_suffix('m') {
+        (number, 60_000)
+    } else {
+        return Err(action_failed(action, "timeout must end in ms, s, or m"));
+    };
+    let milliseconds = number
+        .parse::<u64>()
+        .ok()
+        .filter(|number| *number > 0)
+        .and_then(|number| number.checked_mul(factor))
+        .ok_or_else(|| action_failed(action, "timeout must be a positive duration"))?;
+    Ok(Duration::from_millis(milliseconds))
+}
+
+fn operation_string<'a>(
+    parameters: &'a BTreeMap<String, serde_yaml::Value>,
+    name: &str,
+    action: &str,
+) -> Result<&'a str, OperationDispatchError> {
+    parameters
+        .get(name)
+        .and_then(serde_yaml::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| action_failed(action, format!("parameter `{name}` must be a string")))
+}
+
+fn action_failed(action: &str, message: impl std::fmt::Display) -> OperationDispatchError {
+    OperationDispatchError::ActionFailed {
+        action: action.to_owned(),
+        message: message.to_string(),
+    }
 }
 
 fn run_queue_decision(
