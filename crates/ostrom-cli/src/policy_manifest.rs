@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env, fs, io,
+    fs, io,
     path::{Component, Path, PathBuf},
 };
 
