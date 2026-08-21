@@ -396,7 +396,8 @@ fn executable_names(_context: &DoctorContext) -> Vec<OsString> {
     #[cfg(windows)]
     {
         let extensions = _context
-            .env_text("PATHEXT")
+            .env("PATHEXT")
+            .and_then(|value| value.to_str())
             .unwrap_or(".EXE;.CMD;.BAT;.COM");
         let mut names = vec![OsString::from("ostrom")];
         names.extend(

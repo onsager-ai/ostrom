@@ -525,7 +525,6 @@ fn append_selection_traces(
     Ok(())
 }
 
-
 fn append_plan_selection_trace(
     path: &Path,
     timestamp: &str,
