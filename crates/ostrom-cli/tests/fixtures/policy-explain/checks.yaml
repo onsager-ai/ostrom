@@ -1,0 +1,5 @@
+checks_version: 1
+checks:
+  rust-green:
+    uses: gh/check-run
+    with: {name: placeholder-ci}

@@ -1,0 +1,38 @@
+{
+  "repositories": [
+    {
+      "repo": "onsager-ai/ostrom",
+      "open_prs": [
+        {
+          "number": 344,
+          "title": "chore: placeholder plugin change one",
+          "labels": [],
+          "files": [{"path": ".claude-plugin/plugin.json"}],
+          "statusCheckRollup": []
+        },
+        {
+          "number": 351,
+          "title": "chore: placeholder plugin change two",
+          "labels": [],
+          "files": [{"path": "nested/.claude-plugin/plugin.json"}],
+          "statusCheckRollup": []
+        },
+        {
+          "number": 352,
+          "title": "feat: placeholder delegated change",
+          "labels": [{"name": "delegated-placeholder"}],
+          "files": [{"path": "src/placeholder.rs"}],
+          "statusCheckRollup": [{"name": "placeholder-ci", "conclusion": "SUCCESS"}]
+        },
+        {
+          "number": 353,
+          "state": "CLOSED",
+          "title": "chore: placeholder unmatched change",
+          "labels": [],
+          "files": [{"path": "README.md"}],
+          "statusCheckRollup": []
+        }
+      ]
+    }
+  ]
+}
