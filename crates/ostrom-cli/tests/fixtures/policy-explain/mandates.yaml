@@ -1,0 +1,6 @@
+provider: file
+cadence_hours: 1
+stuck_after_days: 7
+projects:
+  - repo: onsager-ai/ostrom
+    default: unclassified

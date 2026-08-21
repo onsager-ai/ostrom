@@ -879,6 +879,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .value_os()
                 .or_else(|| environment::CLAUDE_PLUGIN_ROOT.value_os())
                 .map_or_else(|| cwd.join("plugins/ostrom"), PathBuf::from);
+            let policy = policy_manifest::load_optional_bundle(&paths, &cwd)?;
             let outcome = run_sweep(&SweepOptions {
                 paths,
                 working_directory: cwd,
@@ -888,6 +889,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 requested_mode: mode.into(),
                 fixture,
                 publish,
+                policy,
             })?;
             println!(
                 "mandate sweep: {} projects; {} queue changes",
@@ -910,6 +912,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .value_os()
                 .or_else(|| environment::CLAUDE_PLUGIN_ROOT.value_os())
                 .map_or_else(|| cwd.join("plugins/ostrom"), PathBuf::from);
+            let policy = policy_manifest::load_optional_bundle(&paths, &cwd)?;
             let check_resolutions = resolve_plan_checks(&paths, &cwd, &plugin_root)?;
             execute_prepared_checks(
                 &paths,
@@ -927,6 +930,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     requested_mode: mode.into(),
                     fixture,
                     publish: PublishTarget::Disabled,
+                    policy,
                 },
                 resolved_checks: check_resolutions.resolved,
                 check_resolution_faults: check_resolutions.faults,

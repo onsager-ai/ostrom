@@ -16,7 +16,8 @@ use serde_json::{Map, Value, json};
 use thiserror::Error;
 
 use crate::{
-    AppTokenError, OstromPaths, PublishDestination, PublishError, QueueDocument, StoreError,
+    AppTokenError, OstromPaths, PolicyBundle, PublishDestination, PublishError, QueueDocument,
+    StoreError,
     app_token::{GitHubInstallationTokenMinter, InstallationTokenMinter, ScopedAppTokenRequest},
     environment, io_error,
     publish::{PublishOptions, PublishOutcome, publish},
@@ -96,6 +97,7 @@ pub struct SweepOptions {
     pub requested_mode: SweepMode,
     pub fixture: Option<PathBuf>,
     pub publish: PublishTarget,
+    pub policy: Option<PolicyBundle>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -343,6 +345,20 @@ fn run_sweep_with_minter(
         active_ids.extend(analysis.active_ids);
         current.extend(analysis.current);
         new_state["repos"][repo] = analysis.state;
+    }
+
+    if let Some(policy) = &options.policy {
+        update_policy_holds(
+            &mut new_state,
+            &old_state,
+            policy,
+            &mirror,
+            &acquired_repositories,
+            options.started_at,
+        );
+    } else if let Some(object) = new_state.as_object_mut() {
+        object.remove("policy_holds");
+        object.remove("stalled_holds");
     }
 
     new_state["version"] = json!(2);
@@ -2360,6 +2376,117 @@ fn ensure_state_shape(state: &mut Value) {
     }
 }
 
+fn update_policy_holds(
+    state: &mut Value,
+    previous: &Value,
+    policy: &PolicyBundle,
+    snapshots: &[RepositorySnapshot],
+    acquired_repositories: &BTreeSet<String>,
+    started_at: DateTime<Utc>,
+) {
+    let previous_holds = previous.get("policy_holds").and_then(Value::as_object);
+    let mut holds = Map::new();
+
+    for snapshot in snapshots {
+        let repository = snapshot.repo.as_str();
+        if !acquired_repositories.contains(repository) {
+            continue;
+        }
+        for pull_request in snapshot.open_prs.iter().filter(|pull_request| {
+            string_field(pull_request, &["state"]).is_empty()
+                || string_field(pull_request, &["state"]).eq_ignore_ascii_case("open")
+        }) {
+            let Some(number) = number_field(pull_request, &["number"]) else {
+                continue;
+            };
+            let id = format!("{repository}#{number}");
+            let explanation =
+                policy.explain_pull_request(repository, pull_request, "builder", "work");
+            if explanation.granted {
+                continue;
+            }
+            let first_held = previous_holds
+                .and_then(|previous| previous.get(&id))
+                .and_then(|record| record.get("first_held"))
+                .and_then(Value::as_str)
+                .and_then(parse_time)
+                .unwrap_or(started_at);
+            holds.insert(
+                id.clone(),
+                policy_hold_record(
+                    &id,
+                    repository,
+                    number,
+                    string_field(pull_request, &["title"]),
+                    first_held,
+                    started_at,
+                    &explanation,
+                ),
+            );
+        }
+    }
+
+    if let Some(previous_holds) = previous_holds {
+        for (id, record) in previous_holds {
+            let repository = record
+                .get("repo")
+                .and_then(Value::as_str)
+                .or_else(|| id.rsplit_once('#').map(|(repository, _)| repository))
+                .unwrap_or_default();
+            if !acquired_repositories.contains(repository) {
+                holds.entry(id.clone()).or_insert_with(|| record.clone());
+            }
+        }
+    }
+
+    let mut stalled = holds
+        .values()
+        .filter(|record| record.get("stalled").and_then(Value::as_bool) == Some(true))
+        .cloned()
+        .collect::<Vec<_>>();
+    stalled.sort_by(|left, right| string_field(left, &["id"]).cmp(string_field(right, &["id"])));
+    state["policy_holds"] = Value::Object(holds);
+    state["stalled_holds"] = Value::Array(stalled);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn policy_hold_record(
+    id: &str,
+    repository: &str,
+    number: u64,
+    title: &str,
+    first_held: DateTime<Utc>,
+    observed_at: DateTime<Utc>,
+    explanation: &crate::PolicyExplanation,
+) -> Value {
+    let held_seconds = observed_at
+        .signed_duration_since(first_held)
+        .num_seconds()
+        .max(0) as u64;
+    let stalled = held_seconds >= explanation.stalls_after.as_seconds();
+    let rule = explanation.hold_rule.as_deref().unwrap_or("floor");
+    json!({
+        "id": id,
+        "repo": repository,
+        "ref": format!("#{number}"),
+        "title": if title.is_empty() { "(title unavailable)" } else { title },
+        "first_held": format_time(first_held),
+        "held_days": held_seconds / 86_400,
+        "stalls_after": explanation.stalls_after.to_string(),
+        "stalls_after_seconds": explanation.stalls_after.as_seconds(),
+        "stalls_source": explanation.stalls_source,
+        "rule": rule,
+        "decision_source": explanation.decision_source,
+        "verdict": "HOLD",
+        "stalled": stalled,
+        "finding": if stalled {
+            format!("this has been held {} days; decide, or change rule {rule}", held_seconds / 86_400)
+        } else {
+            String::new()
+        },
+    })
+}
+
 fn write_json_private(path: &Path, value: &Value) -> Result<(), SweepError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).map_err(|error| io_error("create directory", parent, error))?;
@@ -2796,6 +2923,92 @@ mod tests {
         .expect("the fixture roster is valid")
     }
 
+    fn hold_policy() -> PolicyBundle {
+        PolicyBundle {
+            manifest: ostrom_core::PolicyManifest::from_yaml(
+                r#"
+manifest_version: 1
+defaults: {stalls_after: 7d}
+actors: {builder: {}}
+operations: {work: {steps: []}}
+denies:
+  R-plugin-manifest:
+    actors: builder
+    operations: work
+    repositories: onsager-ai/ostrom
+    where: path:**/.claude-plugin/plugin.json
+"#,
+            )
+            .expect("hold policy"),
+            checks: None,
+        }
+    }
+
+    fn hold_snapshots(numbers: &[u64]) -> Vec<RepositorySnapshot> {
+        serde_json::from_value::<SweepFixture>(json!({
+            "repositories": [{
+                "repo": "onsager-ai/ostrom",
+                "open_prs": numbers.iter().map(|number| json!({
+                    "number": number,
+                    "title": format!("chore: placeholder pull request {number}"),
+                    "files": [{"path": ".claude-plugin/plugin.json"}],
+                    "labels": [],
+                    "statusCheckRollup": [],
+                })).collect::<Vec<_>>()
+            }]
+        }))
+        .expect("hold snapshots")
+        .repositories
+    }
+
+    #[test]
+    fn policy_holds_cross_the_threshold_once_without_changing_the_verdict() {
+        let policy = hold_policy();
+        let acquired = BTreeSet::from(["onsager-ai/ostrom".to_owned()]);
+        let first_time = "2026-08-01T00:00:00Z".parse().expect("first time");
+        let later = "2026-08-09T00:00:00Z".parse().expect("later time");
+        let first_snapshots = hold_snapshots(&[344]);
+        let mut first_state = json!({"version": 2, "repos": {}});
+        update_policy_holds(
+            &mut first_state,
+            &json!({}),
+            &policy,
+            &first_snapshots,
+            &acquired,
+            first_time,
+        );
+        assert_eq!(first_state["stalled_holds"], json!([]));
+        assert_eq!(
+            first_state["policy_holds"]["onsager-ai/ostrom#344"]["verdict"],
+            "HOLD"
+        );
+
+        let second_snapshots = hold_snapshots(&[344, 351]);
+        let mut second_state = first_state.clone();
+        update_policy_holds(
+            &mut second_state,
+            &first_state,
+            &policy,
+            &second_snapshots,
+            &acquired,
+            later,
+        );
+        let findings = second_state["stalled_holds"]
+            .as_array()
+            .expect("stalled findings");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0]["id"], "onsager-ai/ostrom#344");
+        assert_eq!(findings[0]["held_days"], 8);
+        assert_eq!(
+            second_state["policy_holds"]["onsager-ai/ostrom#344"]["verdict"], "HOLD",
+            "a stalled finding must not lower the verdict"
+        );
+        assert_eq!(
+            second_state["policy_holds"]["onsager-ai/ostrom#351"]["stalled"], false,
+            "a newly held pull request is younger than stalls_after"
+        );
+    }
+
     #[test]
     fn reclassification_preserves_a_desk_decision() {
         let id = "placeholder-org/alpha#1";
@@ -2966,6 +3179,7 @@ mod tests {
             requested_mode: SweepMode::Full,
             fixture: None,
             publish: PublishTarget::Disabled,
+            policy: None,
         }
     }
 

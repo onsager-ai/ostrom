@@ -108,6 +108,7 @@ pub fn run_sweep_parity(options: &SweepParityOptions) -> Result<SweepParityOutco
         requested_mode: SweepMode::Auto,
         fixture: Some(options.fixture.clone()),
         publish: PublishTarget::Disabled,
+        policy: None,
     })
     .map_err(|error| ParityError::Native(error.to_string()))?;
 

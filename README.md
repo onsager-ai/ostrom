@@ -365,6 +365,21 @@ is the intended price of keeping merge authority out of the builder, not a
 defect or a hidden background service. Claude Code's `/loop` is session-scoped,
 so closing the gatekeeper session stops the polling.
 
+### Explain policy and stalled holds
+
+`ostrom explain owner/repository#123` evaluates the pull request against every
+authored grant and deny, separates subject matching from the actor/operation
+projection, names any `requires:` check and its result, and prints the aggregate
+verdict with its manifest ladder source. It reads `.ostrom/manifest.yml` first,
+then the user `manifest.yml` in Ostrom's config root; `--manifest` selects an
+explicit file.
+
+The policy `defaults` map accepts `stalls_after: 7d`, which is also the default.
+An individual grant or deny may override it. Sweep records the first time each
+pull request resolves to the principal floor, a matching deny, or a blocked
+grant requirement. Crossing the threshold adds a `STALLED HOLDS` digest
+finding; it never changes `HOLD` into permission or merges the pull request.
+
 ### Selector accuracy
 
 `/ostrom:desk lint` reports selectors that matched nothing, which is config hygiene,

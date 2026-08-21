@@ -125,6 +125,7 @@ pub fn render_digest(options: &DigestOptions) -> HookOutput {
         &["tripwire", "decision"],
         &active,
     );
+    render_stalled_holds(&mut body, state.as_ref());
     render_section(
         &mut body,
         &format!("MOVED SINCE {cursor}"),
@@ -181,6 +182,7 @@ pub fn render_digest(options: &DigestOptions) -> HookOutput {
             )
         })
         .filter_map(|row| row.get("repo").and_then(Value::as_str))
+        .chain(stalled_hold_repositories(state.as_ref()))
         .chain(unresolvable.iter().map(String::as_str))
         .collect::<BTreeSet<_>>()
         .len();
@@ -505,6 +507,50 @@ fn render_state_rollups(body: &mut String, state: Option<&Value>) {
             );
         }
     }
+}
+
+fn render_stalled_holds(body: &mut String, state: Option<&Value>) {
+    let findings = state
+        .and_then(|state| state.get("stalled_holds"))
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    if findings.is_empty() {
+        return;
+    }
+    push_line(body, "STALLED HOLDS — DECIDE OR CHANGE THE RULE");
+    for finding in findings {
+        let id = finding
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("(pull request unavailable)");
+        let title = finding
+            .get("title")
+            .and_then(Value::as_str)
+            .filter(|title| !title.is_empty())
+            .unwrap_or("(title unavailable)");
+        let held_days = finding
+            .get("held_days")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let rule = finding
+            .get("rule")
+            .and_then(Value::as_str)
+            .unwrap_or("floor");
+        push_line(
+            body,
+            &format!("{id}  {title} — held {held_days} days; decide, or change rule {rule}"),
+        );
+    }
+}
+
+fn stalled_hold_repositories(state: Option<&Value>) -> impl Iterator<Item = &str> {
+    state
+        .and_then(|state| state.get("stalled_holds"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|finding| finding.get("repo").and_then(Value::as_str))
 }
 
 fn mark_notices_reported(path: &Path, mut state: Option<Value>, original: &[u8]) {
