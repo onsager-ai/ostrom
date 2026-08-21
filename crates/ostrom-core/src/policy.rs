@@ -536,7 +536,11 @@ impl InputDecl {
         };
         let valid = match kind {
             InputType::String => value.is_string(),
-            InputType::Integer => value.as_i64().is_some() || value.as_u64().is_some(),
+            // Must agree with the environment path below, which parses i64.
+            // Accepting u64 here let a committed default validate and then
+            // fail to resolve when the same value arrived from the process
+            // environment.
+            InputType::Integer => value.as_i64().is_some(),
             InputType::Number => value.is_number(),
             InputType::Boolean => value.is_bool(),
             InputType::Array => value.is_sequence(),
@@ -673,9 +677,12 @@ impl PolicySelector {
     }
 
     fn references_input(&self) -> bool {
-        self.pattern.contains("$inputs.")
-            || self.pattern.contains("${{ inputs.")
-            || self.pattern.contains("${inputs.")
+        // Not a list of spellings. Enumerating `$inputs.`, `${inputs.`,
+        // `${{ inputs.` and so on is heuristic matching, and it missed
+        // `${{inputs.` — the exact class this codebase refuses elsewhere.
+        // A selector pattern has no legitimate use for `$`, so the sigil
+        // itself is the rule: exact, and with nothing left to miss.
+        self.pattern.contains('$')
     }
 
     fn matches(&self, candidate: &PolicyCandidate) -> bool {
@@ -928,8 +935,18 @@ impl SelectorFinding {
 }
 
 fn glob_matches(value: &str, pattern: &str, path: bool) -> bool {
-    let value = value.to_lowercase().chars().collect::<Vec<_>>();
-    let pattern = pattern.to_lowercase().chars().collect::<Vec<_>>();
+    // Paths are case-sensitive because the filesystems this runs against are.
+    // `path:docs/adr/**` must not match `docs/ADR/`, and `path:**/.env` must
+    // not be satisfied by a file named `.ENV`. Labels, commit types, actors
+    // and verbs are matched case-insensitively: they are identifiers a person
+    // types, and the forge treats them that way.
+    let (value, pattern) = if path {
+        (value.to_owned(), pattern.to_owned())
+    } else {
+        (value.to_lowercase(), pattern.to_lowercase())
+    };
+    let value = value.chars().collect::<Vec<_>>();
+    let pattern = pattern.chars().collect::<Vec<_>>();
     let mut memo = BTreeMap::new();
     glob_matches_at(&value, &pattern, path, 0, 0, &mut memo)
 }
@@ -1248,6 +1265,42 @@ denies:
         assert!(glob_matches("docs/guide.md", "docs/**", true));
         assert!(glob_matches(".env", "**/.env", true));
         assert!(!glob_matches("src/docs/guide.md", "docs/*", true));
+    }
+
+    #[test]
+    fn path_selectors_are_case_sensitive_and_labels_are_not() {
+        assert!(glob_matches("docs/adr/one.md", "docs/adr/**", true));
+        assert!(
+            !glob_matches("docs/ADR/one.md", "docs/adr/**", true),
+            "a path selector must not match a directory differing only by case"
+        );
+        assert!(
+            !glob_matches("service/.ENV", "**/.env", true),
+            "a secret path guard must not be satisfied by a differently-cased file"
+        );
+        assert!(
+            glob_matches("Area:Schema", "area:schema", false),
+            "labels are identifiers a person types and match case-insensitively"
+        );
+    }
+
+    #[test]
+    fn a_selector_may_not_carry_an_input_sigil_in_any_spelling() {
+        for pattern in [
+            "$inputs.root",
+            "${inputs.root}",
+            "${{ inputs.root }}",
+            "${{inputs.root}}",
+            "prefix-$inputs.root",
+        ] {
+            let manifest = PolicyManifest::from_yaml(&format!(
+                "manifest_version: 1\ngrants:\n  g:\n    where: path:{pattern}\n"
+            ));
+            assert!(
+                manifest.is_err(),
+                "an input reference must be refused in a selector: {pattern}"
+            );
+        }
     }
 
     #[test]
