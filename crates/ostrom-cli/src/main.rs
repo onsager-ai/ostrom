@@ -14,7 +14,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use directories::BaseDirs;
 use ostrom_checks::{
     ActionFault, ActionRegistry, DoctorOptions, PreparedCheck, check_shell_retirement,
-    check_skill_version_bump, run_doctor, run_doctor_check,
+    check_skill_version_bump, install_protocol, resolve_harness_root, run_doctor, run_doctor_check,
+    verify_protocol,
 };
 use ostrom_core::{
     CHECK_STORE_SCHEMA_VERSION, Catalogue, CatalogueEnumeration, CheckContractError, CheckDocument,
@@ -74,6 +75,15 @@ enum Command {
         /// Run exactly one named doctor check.
         #[arg(long)]
         check: Option<String>,
+    },
+    /// Install the protocol carried by this binary into Claude Code.
+    Install {
+        /// Explicit Claude Code harness root (defaults to CLAUDE_CONFIG_DIR or ~/.claude).
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Report installed protocol status without changing files.
+        #[arg(long)]
+        verify: bool,
     },
     /// Run repository policy checks used by continuous integration.
     Check {
@@ -453,6 +463,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             Err(error) => exit_message(&format!("ostrom credential: {error}"), error.exit_code()),
         },
         Command::Doctor { check } => run_doctor_command(check, &clock)?,
+        Command::Install { root, verify } => {
+            let root = root.unwrap_or_else(resolve_harness_root);
+            if verify {
+                let report = verify_protocol(&root)?;
+                for entry in &report.entries {
+                    println!("{} {}", entry.status.as_str(), entry.path);
+                }
+                if !report.is_clean() {
+                    std::process::exit(1);
+                }
+            } else {
+                let report = install_protocol(&root)?;
+                for entry in &report.entries {
+                    println!("{} {}", entry.status.as_str(), entry.path);
+                }
+                println!(
+                    "installed protocol at {}: {} changed, {} left alone",
+                    root.display(),
+                    report.changed_count(),
+                    report.entries.len() - report.changed_count()
+                );
+            }
+        }
         Command::Check {
             command: CheckCommand::Run,
         } => {

@@ -15,8 +15,10 @@ use ostrom_store::environment;
 use serde_json::{Map, Value, json};
 
 use crate::{
-    ActionFault, ActionOutcome, ActionProvider, PreparedAction, check_role_allowlists,
+    ActionFault, ActionOutcome, ActionProvider, PreparedAction, VerificationStatus,
+    check_role_allowlists,
     process::{exact_keys, invalid_parameters, parameter_timeout},
+    resolve_harness_root_from, verify_protocol,
 };
 
 pub const DOCTOR_CHECKS: &[&str] = &[
@@ -26,6 +28,7 @@ pub const DOCTOR_CHECKS: &[&str] = &[
     "plugin",
     "marketplace",
     "plugin-cache-drift",
+    "protocol-assets",
     "rules-layers",
     "touch-durability",
     "provider-reachable",
@@ -68,18 +71,15 @@ impl DoctorOptions {
         let home = environment_snapshot
             .get(OsStr::new(environment::HOME.name))
             .map_or_else(PathBuf::new, PathBuf::from);
-        let config_dir = environment_snapshot
-            .get(OsStr::new(environment::CLAUDE_CONFIG_DIR.name))
-            .map_or_else(
-                || {
-                    if home.is_absolute() {
-                        home.join(".claude")
-                    } else {
-                        cwd.join(&home).join(".claude")
-                    }
-                },
-                PathBuf::from,
-            );
+        let config_dir = resolve_harness_root_from(
+            environment_snapshot
+                .get(OsStr::new(environment::CLAUDE_CONFIG_DIR.name))
+                .cloned(),
+            environment_snapshot
+                .get(OsStr::new(environment::HOME.name))
+                .cloned(),
+            &cwd,
+        );
         Self {
             plugin_root: plugin_root.into(),
             config_dir,
@@ -239,6 +239,7 @@ fn run_named_check(context: &mut DoctorContext, name: &str) -> DoctorResult {
         "plugin" => check_plugin(context),
         "marketplace" => inspect_marketplace(context).result,
         "plugin-cache-drift" => check_plugin_cache_drift(context),
+        "protocol-assets" => check_protocol_assets(context),
         "rules-layers" => check_rules_layers(context),
         "touch-durability" => check_touch_durability(context),
         "provider-reachable" => check_provider_reachable(context),
@@ -1390,6 +1391,52 @@ fn check_plugin_cache_drift(context: &mut DoctorContext) -> DoctorResult {
             "update and reinstall ostrom@ostrom, then restart the session",
         )
     }
+}
+
+fn check_protocol_assets(context: &DoctorContext) -> DoctorResult {
+    let report = match verify_protocol(&context.options.config_dir) {
+        Ok(report) => report,
+        Err(error) => {
+            return DoctorResult::new(
+                DoctorStatus::Fail,
+                "protocol-assets",
+                format!("cannot verify installed protocol assets: {error}"),
+                "run ostrom install",
+            );
+        }
+    };
+    let drift = report
+        .entries
+        .iter()
+        .filter(|entry| entry.status != VerificationStatus::Match)
+        .map(|entry| format!("{}: {}", entry.status.as_str(), entry.path))
+        .collect::<Vec<_>>();
+    if drift.is_empty() {
+        return DoctorResult::new(
+            DoctorStatus::Ok,
+            "protocol-assets",
+            format!("{} embedded protocol assets match", report.entries.len()),
+            "",
+        );
+    }
+    let status = if report.entries.iter().any(|entry| {
+        matches!(
+            entry.status,
+            VerificationStatus::Modified | VerificationStatus::Missing
+        )
+    }) {
+        DoctorStatus::Fail
+    } else {
+        DoctorStatus::Warn
+    };
+    let shown = drift.iter().take(8).cloned().collect::<Vec<_>>();
+    let remaining = drift.len() - shown.len();
+    let detail = if remaining == 0 {
+        shown.join("; ")
+    } else {
+        format!("{}; plus {remaining} more", shown.join("; "))
+    };
+    DoctorResult::new(status, "protocol-assets", detail, "run ostrom install")
 }
 
 fn file_differences(
@@ -3062,6 +3109,21 @@ mod tests {
     }
 
     #[test]
+    fn protocol_check_names_the_modified_installed_asset() {
+        let fixture = Fixture::new();
+        crate::install_protocol(&fixture.config_dir).expect("install embedded protocol fixture");
+        fs::write(
+            fixture.config_dir.join("skills/brief/SKILL.md"),
+            "operator edit\n",
+        )
+        .unwrap();
+        assert_eq!(
+            run_doctor_check(fixture.options(), "protocol-assets").unwrap(),
+            "FAIL|protocol-assets|modified: skills/brief/SKILL.md|run ostrom install\n"
+        );
+    }
+
+    #[test]
     fn isolated_machine_report_is_byte_exact() {
         let fixture = Fixture::new();
         let report = run_doctor(fixture.options());
@@ -3073,6 +3135,7 @@ mod tests {
                 "FAIL|plugin|no installed_plugins.json at {config}/plugins/installed_plugins.json|/plugin install ostrom@ostrom\n",
                 "FAIL|marketplace|ostrom not registered in known_marketplaces.json|/plugin marketplace add onsager-ai/ostrom\n",
                 "WARN|plugin-cache-drift|cannot compare shipped files: installed plugin registry missing at {config}/plugins/installed_plugins.json|/plugin install ostrom@ostrom\n",
+                "FAIL|protocol-assets|missing: hooks/hooks.json; missing: rules/frozen-rules.md; missing: skills/brief/SKILL.md; missing: skills/desk/SKILL.md; missing: skills/doctor/SKILL.md; missing: skills/gatekeep/SKILL.md; missing: skills/merge/SKILL.md; missing: skills/touch/SKILL.md; plus 1 more|run ostrom install\n",
                 "FAIL|rules-layers|hook wiring not found at {plugin}/hooks/hooks.json|reinstall the ostrom plugin\n",
                 "WARN|touch-durability|target: file provider, {home}/.claude/ostrom/touch-log.md is NOT inside a git repo — touches logged here never reach another machine -- config: no user config.yaml present (shipped defaults only)|point file.path into a synced repo and set auto_commit: true, or switch provider\n",
                 "OK|provider-reachable|file: {home}/.claude/ostrom does not exist yet, nearest existing ancestor {home} is writable|\n",
