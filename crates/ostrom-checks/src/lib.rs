@@ -11,6 +11,7 @@ mod doctor;
 mod github;
 mod http;
 mod judgment;
+mod loop_units;
 mod operation_settings;
 mod plugin_surface;
 mod process;
@@ -29,6 +30,10 @@ pub use http::HttpProvider;
 pub use judgment::{
     ClaudeHarness, HarnessRequest, JudgmentHarness, JudgmentOutcome, JudgmentRegistry,
     PreparedJudgment,
+};
+pub use loop_units::{
+    LoopUnit, LoopUnitDrift, LoopUnitError, check_loop_units_drift, generate_loop_units,
+    loop_execstart_is_not_shell, render_loop_units,
 };
 pub use operation_settings::{
     OperationSettingsDrift, OperationSettingsError, RoleSkillOperations, SkillOperationViolation,
