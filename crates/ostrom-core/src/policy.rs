@@ -7,6 +7,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de::DeserializeOwn
 use serde_yaml::Value;
 use thiserror::Error;
 
+use crate::operation::{OperationActionError, validate_operation};
+
 pub const POLICY_MANIFEST_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -64,6 +66,9 @@ impl PolicyManifest {
                     }
                 })?;
             }
+        }
+        for (name, operation) in &self.operations {
+            validate_operation(name, operation)?;
         }
         for (kind, rules) in [("grant", &self.grants), ("deny", &self.denies)] {
             for (id, rule) in rules {
@@ -234,6 +239,8 @@ pub enum ManifestValidationError {
         rule: String,
         selector: String,
     },
+    #[error(transparent)]
+    Operation(#[from] OperationActionError),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -253,9 +260,113 @@ pub struct OperationDecl {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub params: BTreeMap<String, InputDecl>,
+    pub params: BTreeMap<String, OperationParamDecl>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub steps: Vec<StepDecl>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationParamDecl {
+    #[serde(rename = "type")]
+    pub kind: OperationParamType,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<Value>,
+}
+
+impl OperationParamDecl {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        match self.kind {
+            OperationParamType::Markdown | OperationParamType::Semver
+                if !self.values.is_empty() =>
+            {
+                return Err("`values` is only valid for type enum".to_owned());
+            }
+            OperationParamType::Enum if self.values.is_empty() => {
+                return Err("type enum requires a non-empty `values` list".to_owned());
+            }
+            OperationParamType::Enum => {
+                let unique = self.values.iter().collect::<BTreeSet<_>>();
+                if unique.len() != self.values.len() || self.values.iter().any(String::is_empty) {
+                    return Err("enum values must be non-empty and unique".to_owned());
+                }
+            }
+            OperationParamType::Markdown | OperationParamType::Semver => {}
+        }
+        if let Some(default) = &self.default {
+            self.validate_value(default)?;
+        }
+        Ok(())
+    }
+
+    pub fn validate_value(&self, value: &Value) -> Result<(), String> {
+        let Some(value) = value.as_str() else {
+            return Err(format!("expected {} string", self.kind));
+        };
+        match self.kind {
+            OperationParamType::Markdown => Ok(()),
+            OperationParamType::Semver if valid_semver(value) => Ok(()),
+            OperationParamType::Semver => Err("expected semantic version".to_owned()),
+            OperationParamType::Enum if self.values.iter().any(|candidate| candidate == value) => {
+                Ok(())
+            }
+            OperationParamType::Enum => Err("value is outside the declared enum".to_owned()),
+        }
+    }
+}
+
+fn valid_semver(value: &str) -> bool {
+    let (without_build, build) = value
+        .split_once('+')
+        .map_or((value, None), |(value, build)| (value, Some(build)));
+    let (core, prerelease) = without_build
+        .split_once('-')
+        .map_or((without_build, None), |(core, prerelease)| {
+            (core, Some(prerelease))
+        });
+    let components = core.split('.').collect::<Vec<_>>();
+    components.len() == 3
+        && components.iter().all(|component| {
+            !component.is_empty()
+                && component.bytes().all(|byte| byte.is_ascii_digit())
+                && (component == &"0" || !component.starts_with('0'))
+        })
+        && prerelease.is_none_or(|value| valid_semver_identifiers(value, true))
+        && build.is_none_or(|value| valid_semver_identifiers(value, false))
+}
+
+fn valid_semver_identifiers(value: &str, numeric_leading_zero_forbidden: bool) -> bool {
+    !value.is_empty()
+        && value.split('.').all(|identifier| {
+            !identifier.is_empty()
+                && identifier
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && (!numeric_leading_zero_forbidden
+                    || !identifier.bytes().all(|byte| byte.is_ascii_digit())
+                    || identifier == "0"
+                    || !identifier.starts_with('0'))
+        })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationParamType {
+    Markdown,
+    Semver,
+    Enum,
+}
+
+impl fmt::Display for OperationParamType {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Markdown => "markdown",
+            Self::Semver => "semver",
+            Self::Enum => "enum",
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

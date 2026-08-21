@@ -1,0 +1,211 @@
+use std::{fs, path::Path, process::Command};
+
+use tempfile::TempDir;
+
+const LOCAL_POLICY: &str = "manifest_version: 1\nactors: {builder: {}, gatekeeper: {}}\noperations:\n  local-proof:\n    name: Local proof\n    steps:\n      - uses: cmd/run\n        with:\n          script: 'test -z \"$GH_TOKEN\" && test -z \"$GITHUB_TOKEN\" && printf local-ok'\ngrants:\n  builder-local: {actors: builder, operations: local-proof, repositories: placeholder-org/repo}\n";
+
+fn ostrom(home: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ostrom"));
+    command
+        .env("OSTROM_HOME", home)
+        .env("OSTROM_POLICY_MANIFEST", home.join("policy.yaml"))
+        .env("OSTROM_ACTOR", "builder");
+    command
+}
+
+fn fixture(policy: &str) -> TempDir {
+    let root = TempDir::new().expect("operation fixture");
+    fs::write(root.path().join("policy.yaml"), policy).expect("write policy");
+    root
+}
+
+#[test]
+fn local_operation_runs_without_inherited_forge_credentials() {
+    let root = fixture(LOCAL_POLICY);
+    let output = ostrom(root.path())
+        .env("GH_TOKEN", "placeholder-token")
+        .env("GITHUB_TOKEN", "placeholder-token")
+        .args(["local-proof", "placeholder-org/repo"])
+        .output()
+        .expect("run operation");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"local-ok");
+}
+
+#[test]
+fn action_names_are_not_a_direct_cli_surface() {
+    let root = fixture(LOCAL_POLICY);
+    let output = ostrom(root.path())
+        .args(["cmd/run", "placeholder-org/repo"])
+        .output()
+        .expect("run operation");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unknown operation `cmd/run`"));
+}
+
+#[test]
+fn operations_list_and_settings_follow_grants() {
+    let root = fixture(LOCAL_POLICY);
+    let listing = ostrom(root.path())
+        .args(["operations", "--actor", "builder"])
+        .output()
+        .expect("list operations");
+    assert!(listing.status.success());
+    assert_eq!(listing.stdout, b"local-proof\tLocal proof\n");
+
+    let settings = ostrom(root.path())
+        .args(["operations", "--settings", "builder"])
+        .output()
+        .expect("generate settings");
+    assert!(settings.status.success());
+    let settings = String::from_utf8(settings.stdout).expect("settings are UTF-8");
+    assert!(settings.contains("\"defaultMode\": \"deny\""));
+    assert!(settings.contains("Bash(ostrom local-proof *)"));
+    assert!(!settings.contains("gatekeeper"));
+}
+
+#[test]
+fn settings_check_detects_a_hand_edit() {
+    let root = fixture(LOCAL_POLICY);
+    let generated = ostrom(root.path())
+        .args(["operations", "--settings", "builder"])
+        .output()
+        .expect("generate settings");
+    let settings = root.path().join("builder.settings.json");
+    fs::write(
+        &settings,
+        String::from_utf8(generated.stdout)
+            .expect("settings")
+            .replace("local-proof", "hand-edit"),
+    )
+    .expect("write changed settings");
+    let checked = ostrom(root.path())
+        .arg("operations")
+        .args(["--actor", "builder", "--check-settings"])
+        .arg(settings)
+        .output()
+        .expect("check settings");
+    assert!(!checked.status.success());
+    assert!(String::from_utf8_lossy(&checked.stderr).contains("differs from settings derived"));
+}
+
+#[cfg(unix)]
+#[test]
+fn mediated_action_receives_only_its_catalogued_scope() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let policy = "manifest_version: 1\nactors: {builder: {}}\noperations:\n  comment:\n    steps:\n      - uses: gh/post-verdict\n        with: {note: 'placeholder verdict'}\ngrants:\n  builder-comment: {actors: builder, operations: comment, repositories: placeholder-org/repo}\n";
+    let root = fixture(policy);
+    let capture = root.path().join("arguments.txt");
+    let wrapper = root.path().join("credential-wrapper.sh");
+    fs::write(
+        &wrapper,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$OSTROM_CAPTURE\"\n",
+    )
+    .expect("write wrapper");
+    let mut permissions = fs::metadata(&wrapper)
+        .expect("wrapper metadata")
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&wrapper, permissions).expect("make wrapper executable");
+
+    let output = ostrom(root.path())
+        .env("MANDATE_GH_AS_BIN", wrapper)
+        .env("OSTROM_CAPTURE", &capture)
+        .args(["comment", "placeholder-org/repo#7"])
+        .output()
+        .expect("run mediated operation");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let arguments = fs::read_to_string(capture).expect("captured arguments");
+    assert_eq!(
+        arguments,
+        "builder\nplaceholder-org/repo\n--repositories\nplaceholder-org/repo\n--permissions\npull_requests:write\n--\ngh\npr\ncomment\nplaceholder-org/repo#7\n--body\nplaceholder verdict\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_guard_stops_before_the_mediated_action() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let policy = "manifest_version: 1\nactors: {gatekeeper: {}}\noperations:\n  merge:\n    steps:\n      - uses: gh/merge-pr\n        requires: ready\ngrants:\n  gatekeeper-merge: {actors: gatekeeper, operations: merge, repositories: placeholder-org/repo}\n";
+    let root = fixture(policy);
+    fs::write(
+        root.path().join("checks.yaml"),
+        "checks_version: 1\nchecks:\n  ready:\n    uses: cmd/run\n    with: {script: 'exit 1'}\n",
+    )
+    .expect("write checks");
+    let capture = root.path().join("action-ran.txt");
+    let wrapper = root.path().join("credential-wrapper.sh");
+    fs::write(
+        &wrapper,
+        "#!/bin/sh\nprintf action-ran > \"$OSTROM_CAPTURE\"\n",
+    )
+    .expect("write wrapper");
+    let mut permissions = fs::metadata(&wrapper)
+        .expect("wrapper metadata")
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&wrapper, permissions).expect("make wrapper executable");
+
+    let output = ostrom(root.path())
+        .env("OSTROM_ACTOR", "gatekeeper")
+        .env("MANDATE_GH_AS_BIN", wrapper)
+        .env("OSTROM_CAPTURE", &capture)
+        .args(["merge", "placeholder-org/repo#7"])
+        .output()
+        .expect("run guarded operation");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("required check `ready` did not pass")
+    );
+    assert!(
+        !capture.exists(),
+        "guard must stop before token mint/action"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn selector_metadata_is_resolved_before_authorization() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let policy = "manifest_version: 1\nactors: {builder: {}}\noperations:\n  comment:\n    steps:\n      - uses: gh/post-verdict\n        with: {note: 'placeholder verdict'}\ngrants:\n  approved-comment:\n    actors: builder\n    operations: comment\n    repositories: placeholder-org/repo\n    where: label:approved\n";
+    let root = fixture(policy);
+    let capture = root.path().join("action-ran.txt");
+    let wrapper = root.path().join("credential-wrapper.sh");
+    fs::write(
+        &wrapper,
+        "#!/bin/sh\ncase \" $* \" in\n  *\" pr view \"*) printf '%s' '{\"labels\":[{\"name\":\"approved\"}],\"files\":[{\"path\":\"src/lib.rs\"}],\"title\":\"feat: placeholder\"}' ;;\n  *) printf action-ran > \"$OSTROM_CAPTURE\" ;;\nesac\n",
+    )
+    .expect("write wrapper");
+    let mut permissions = fs::metadata(&wrapper)
+        .expect("wrapper metadata")
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&wrapper, permissions).expect("make wrapper executable");
+
+    let output = ostrom(root.path())
+        .env("MANDATE_GH_AS_BIN", wrapper)
+        .env("OSTROM_CAPTURE", &capture)
+        .args(["comment", "placeholder-org/repo#7"])
+        .output()
+        .expect("run selector-constrained operation");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(capture).expect("action capture"),
+        "action-ran"
+    );
+}
