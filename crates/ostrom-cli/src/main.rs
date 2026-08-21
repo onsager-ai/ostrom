@@ -18,7 +18,8 @@ use ostrom_checks::{
 };
 use ostrom_core::{
     CHECK_STORE_SCHEMA_VERSION, Catalogue, CatalogueEnumeration, CheckContractError, CheckDocument,
-    CheckFault, CheckRun, CheckRunId, CheckState, CheckVerdict, RepositoryName, ResolvedCheck,
+    CheckFault, CheckRun, CheckRunId, CheckState, CheckVerdict, InconclusivePolicy, RepositoryName,
+    ResolvedCheck,
 };
 use ostrom_store::{
     AssessmentHarness, AuditOptions, DigestOptions, DispatchOutcome, DispatchRequest,
@@ -472,13 +473,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 DateTime::<Utc>::from(SystemTime::now()),
             )?;
             println!(
-                "ostrom check run: {} passed; {} failed; {} faulted; wrote {}",
+                "ostrom check run: {} passed; {} failed; {} inconclusive; {} faulted; wrote {}",
                 outcome.passed,
                 outcome.failed,
+                outcome.inconclusive,
                 outcome.faulted,
                 paths.check_journal_file().display()
             );
-            if outcome.failed != 0 || outcome.faulted != 0 {
+            for warning in &outcome.warnings {
+                eprintln!("warning: {warning}");
+            }
+            if outcome.failed != 0 || outcome.blocked != 0 || outcome.faulted != 0 {
                 std::process::exit(1);
             }
         }
@@ -1500,7 +1505,10 @@ enum CriteriaSelection {
 struct CriteriaRunOutcome {
     passed: usize,
     failed: usize,
+    inconclusive: usize,
+    blocked: usize,
     faulted: usize,
+    warnings: Vec<String>,
 }
 
 fn execute_prepared_checks(
@@ -1544,6 +1552,40 @@ fn execute_prepared_checks(
         .iter()
         .filter(|receipt| receipt.verdict == Some(CheckVerdict::Fail))
         .count();
+    let inconclusive_receipts = receipts
+        .iter()
+        .filter(|receipt| receipt.verdict == Some(CheckVerdict::Inconclusive))
+        .collect::<Vec<_>>();
+    let inconclusive = inconclusive_receipts.len();
+    let blocked = inconclusive_receipts
+        .iter()
+        .filter(|receipt| {
+            resolutions
+                .resolved
+                .get(&receipt.check)
+                .is_some_and(|check| check.inconclusive_policy == InconclusivePolicy::Block)
+        })
+        .count();
+    let warnings = inconclusive_receipts
+        .iter()
+        .filter_map(|receipt| {
+            let policy = resolutions
+                .resolved
+                .get(&receipt.check)?
+                .inconclusive_policy;
+            (policy != InconclusivePolicy::Block).then(|| {
+                format!(
+                    "check {} was inconclusive and allowed by inconclusive_policy: {}",
+                    receipt.check,
+                    match policy {
+                        InconclusivePolicy::Block => "block",
+                        InconclusivePolicy::Warn => "warn",
+                        InconclusivePolicy::Pass => "pass",
+                    }
+                )
+            })
+        })
+        .collect();
     let execution_faults = receipts
         .iter()
         .filter(|receipt| receipt.error.is_some())
@@ -1569,7 +1611,10 @@ fn execute_prepared_checks(
     Ok(CriteriaRunOutcome {
         passed,
         failed,
+        inconclusive,
+        blocked,
         faulted,
+        warnings,
     })
 }
 
@@ -1630,7 +1675,7 @@ fn resolve_plan_checks(
         .iter()
         .flat_map(|catalogue| catalogue.document.checks.keys().cloned())
         .collect::<BTreeSet<_>>();
-    let registry = ActionRegistry::core(plugin_root.to_owned())?;
+    let registry = ActionRegistry::core(plugin_root.to_owned(), cwd.to_owned())?;
     let mut resolved = BTreeMap::new();
     let mut prepared_checks = BTreeMap::new();
     let mut faults = BTreeMap::new();

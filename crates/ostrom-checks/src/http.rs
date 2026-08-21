@@ -78,22 +78,22 @@ impl PreparedAction for HttpGet {
             .timeout(self.timeout)
             .build()
         else {
-            return ActionOutcome::Error(ActionFault::new("http_request_error", None));
+            return ActionOutcome::Inconclusive(ActionFault::new("http_request_error", None));
         };
         let response = match client.get(self.url.clone()).send() {
             Ok(response) => response,
             Err(error) if error.is_timeout() => {
-                return ActionOutcome::Error(ActionFault::new("http_timeout", None));
+                return ActionOutcome::Inconclusive(ActionFault::new("http_timeout", None));
             }
             Err(_) => {
-                return ActionOutcome::Error(ActionFault::new("http_request_error", None));
+                return ActionOutcome::Inconclusive(ActionFault::new("http_request_error", None));
             }
         };
         let status = response.status().as_u16();
         match self.expect.evaluate(status, response) {
             Ok(true) => ActionOutcome::Pass,
             Ok(false) => ActionOutcome::Fail,
-            Err(fault) => ActionOutcome::Error(fault),
+            Err(fault) => ActionOutcome::Inconclusive(fault),
         }
     }
 }
@@ -286,13 +286,13 @@ mod tests {
     }
 
     #[test]
-    fn unreachable_host_is_an_error_not_a_fail() {
+    fn unreachable_host_is_inconclusive_not_a_fail() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("reserve port");
         let address = listener.local_addr().expect("fixture address");
         drop(listener);
         let receipt = execute(&format!("http://{address}/absent"), "status == 200");
-        assert_eq!(receipt.verdict, None);
-        assert_eq!(receipt.error.as_deref(), Some("http_request_error"));
+        assert_eq!(receipt.verdict, Some(CheckVerdict::Inconclusive));
+        assert_eq!(receipt.error, None);
     }
 
     #[test]
@@ -310,14 +310,14 @@ mod tests {
     }
 
     #[test]
-    fn invalid_json_is_a_malformed_response_error() {
+    fn invalid_json_is_inconclusive() {
         let receipt = execute(&serve_once("not-json"), "records|length > 0");
-        assert_eq!(receipt.verdict, None);
-        assert_eq!(receipt.error.as_deref(), Some("http_malformed_response"));
+        assert_eq!(receipt.verdict, Some(CheckVerdict::Inconclusive));
+        assert_eq!(receipt.error, None);
     }
 
     #[test]
-    fn request_timeout_is_an_error() {
+    fn request_timeout_is_inconclusive() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("loopback fixture");
         let address = listener.local_addr().expect("fixture address");
         thread::spawn(move || {
@@ -340,7 +340,7 @@ mod tests {
             .prepare("request", &catalogue)
             .expect("prepared request")
             .execute("timeout-attempt");
-        assert_eq!(receipt.verdict, None);
-        assert_eq!(receipt.error.as_deref(), Some("http_timeout"));
+        assert_eq!(receipt.verdict, Some(CheckVerdict::Inconclusive));
+        assert_eq!(receipt.error, None);
     }
 }

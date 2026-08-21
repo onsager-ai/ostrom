@@ -586,7 +586,12 @@ pub fn run_plan(
         let unavailable_evidence = facts
             .met_when_status
             .iter()
-            .filter(|status| matches!(status.state, CheckState::NeverRun | CheckState::Stale))
+            .filter(|status| {
+                matches!(
+                    status.state,
+                    CheckState::NeverRun | CheckState::Stale | CheckState::Inconclusive
+                )
+            })
             .map(|status| format!("{} ({})", status.check, status.rendered))
             .collect::<Vec<_>>();
         let assessment = if facts.met || paused {
@@ -1001,8 +1006,9 @@ mod tests {
                 .expect("fixture JSON"),
         )
         .expect("sweep fixture");
-        let document = CheckDocument::from_yaml(
+        let document = CheckDocument::from_yaml_with_actions(
             "checks_version: 1\nchecks:\n  sweep-parity:\n    uses: fixture/observe\n    with: {}\n",
+            &["fixture/observe"],
         )
         .expect("check document");
         let resolved = resolve_check(

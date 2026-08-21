@@ -1,0 +1,33 @@
+checks_version: 1
+inconclusive_policy: block
+checks:
+  placeholder-ci-01:
+    uses: gh/check-run
+    with: {name: placeholder-job-01}
+  placeholder-ci-02:
+    uses: gh/check-run
+    with: {name: placeholder-job-02}
+  placeholder-ci-03:
+    uses: gh/check-run
+    with: {name: placeholder-job-03}
+  placeholder-ci-04:
+    uses: gh/check-run
+    with: {name: placeholder-job-04}
+  placeholder-ci-05:
+    uses: gh/check-run
+    with: {name: placeholder-job-05}
+  placeholder-ci-06:
+    uses: gh/check-run
+    with: {name: placeholder-job-06}
+  placeholder-ci-07:
+    uses: gh/check-run
+    with: {name: placeholder-job-07}
+  placeholder-ci-08:
+    uses: gh/check-run
+    with: {name: placeholder-job-08}
+  placeholder-ci-09:
+    uses: gh/check-run
+    with: {name: placeholder-job-09}
+  placeholder-ci-10:
+    uses: gh/check-run
+    with: {name: placeholder-job-10}

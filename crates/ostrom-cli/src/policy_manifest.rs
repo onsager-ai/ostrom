@@ -5,7 +5,8 @@ use std::{
 };
 
 use ostrom_core::{
-    ActorDecl, LoopDecl, OperationDecl, PolicyManifest, RuleDecl, SelectorFinding, SelectorUniverse,
+    ActorDecl, CheckContractError, CheckDocument, LoopDecl, OperationDecl, PolicyManifest,
+    RuleDecl, SelectorFinding, SelectorUniverse,
 };
 use serde::Deserialize;
 use serde_yaml::{Mapping, Value};
@@ -139,7 +140,46 @@ pub(crate) fn load(path: &Path) -> Result<PolicyManifest, PolicyLoadError> {
     manifest
         .validate()
         .map_err(|error| PolicyLoadError::Validation(error.to_string()))?;
+    validate_check_requirements(&manifest, parent)?;
     Ok(manifest)
+}
+
+fn validate_check_requirements(
+    manifest: &PolicyManifest,
+    manifest_directory: &Path,
+) -> Result<(), PolicyLoadError> {
+    let requirements = manifest
+        .operations
+        .iter()
+        .flat_map(|(operation, declaration)| {
+            declaration.steps.iter().filter_map(move |step| {
+                step.requires
+                    .as_deref()
+                    .map(|check| (operation.as_str(), check))
+            })
+        })
+        .collect::<Vec<_>>();
+    if requirements.is_empty() {
+        return Ok(());
+    }
+
+    let path = manifest_directory.join("checks.yaml");
+    let source = read(&path)?;
+    let document =
+        CheckDocument::from_yaml(&source).map_err(|source| PolicyLoadError::CheckCatalogue {
+            path: path.clone(),
+            source,
+        })?;
+    for (operation, check) in requirements {
+        if !document.checks.contains_key(check) {
+            return Err(PolicyLoadError::UnknownCheck {
+                operation: operation.to_owned(),
+                check: check.to_owned(),
+                path,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn read(path: &Path) -> Result<String, PolicyLoadError> {
@@ -472,6 +512,21 @@ pub(crate) enum PolicyLoadError {
         path: PathBuf,
         #[source]
         source: serde_yaml::Error,
+    },
+    #[error("could not load check catalogue `{}`: {source}", path.display())]
+    CheckCatalogue {
+        path: PathBuf,
+        #[source]
+        source: CheckContractError,
+    },
+    #[error(
+        "operation `{operation}` requires undefined check `{check}` from `{}`",
+        path.display()
+    )]
+    UnknownCheck {
+        operation: String,
+        check: String,
+        path: PathBuf,
     },
     #[error("invalid policy manifest: {0}")]
     Validation(String),

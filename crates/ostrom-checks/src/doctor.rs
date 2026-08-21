@@ -322,17 +322,21 @@ impl PreparedAction for DoctorCheck {
         let status = match receiver.recv_timeout(self.timeout) {
             Ok(status) => status,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                return ActionOutcome::Error(ActionFault::new("doctor_timeout", None));
+                return ActionOutcome::Inconclusive(ActionFault::new("doctor_timeout", None));
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return ActionOutcome::Error(ActionFault::new("doctor_execute_error", None));
+                return ActionOutcome::Inconclusive(ActionFault::new("doctor_execute_error", None));
             }
         };
         match status {
             DoctorStatus::Ok => ActionOutcome::Pass,
             DoctorStatus::Fail => ActionOutcome::Fail,
-            DoctorStatus::Warn => ActionOutcome::Error(ActionFault::new("doctor_warn", None)),
-            DoctorStatus::Defer => ActionOutcome::Error(ActionFault::new("doctor_defer", None)),
+            DoctorStatus::Warn => {
+                ActionOutcome::Inconclusive(ActionFault::new("doctor_warn", None))
+            }
+            DoctorStatus::Defer => {
+                ActionOutcome::Inconclusive(ActionFault::new("doctor_defer", None))
+            }
         }
     }
 }
@@ -3028,7 +3032,7 @@ mod tests {
     }
 
     #[test]
-    fn warn_and_defer_remain_named_provider_errors() {
+    fn warn_and_defer_are_inconclusive() {
         let fixture = Fixture::new();
         let mut registry = ActionRegistry::new();
         registry
@@ -3038,8 +3042,8 @@ mod tests {
             .prepare("doctor-fixture", &catalogue("publish"))
             .unwrap()
             .execute("warn-attempt");
-        assert_eq!(warn.verdict, None);
-        assert_eq!(warn.error.as_deref(), Some("doctor_warn"));
+        assert_eq!(warn.verdict, Some(CheckVerdict::Inconclusive));
+        assert_eq!(warn.error, None);
 
         fs::create_dir_all(fixture.config_dir.join("ostrom")).unwrap();
         fs::write(
@@ -3051,7 +3055,8 @@ mod tests {
             .prepare("doctor-fixture", &catalogue("provider-reachable"))
             .unwrap()
             .execute("defer-attempt");
-        assert_eq!(defer.error.as_deref(), Some("doctor_defer"));
+        assert_eq!(defer.verdict, Some(CheckVerdict::Inconclusive));
+        assert_eq!(defer.error, None);
     }
 
     #[test]

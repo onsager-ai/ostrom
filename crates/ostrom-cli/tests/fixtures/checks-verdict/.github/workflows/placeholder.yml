@@ -1,0 +1,13 @@
+name: Placeholder checks
+on: [pull_request]
+jobs:
+  placeholder-job-01: {runs-on: ubuntu-latest, steps: []}
+  placeholder-job-02: {runs-on: ubuntu-latest, steps: []}
+  placeholder-job-03: {runs-on: ubuntu-latest, steps: []}
+  placeholder-job-04: {runs-on: ubuntu-latest, steps: []}
+  placeholder-job-05: {runs-on: ubuntu-latest, steps: []}
+  placeholder-job-06: {runs-on: ubuntu-latest, steps: []}
+  placeholder-job-07: {runs-on: ubuntu-latest, steps: []}
+  placeholder-job-08: {runs-on: ubuntu-latest, steps: []}
+  placeholder-job-09: {runs-on: ubuntu-latest, steps: []}
+  placeholder-job-10: {runs-on: ubuntu-latest, steps: []}
