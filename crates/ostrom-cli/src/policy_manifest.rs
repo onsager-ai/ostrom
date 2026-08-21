@@ -18,7 +18,7 @@ pub(crate) fn run_validate(path: &Path, normalized: bool) -> Result<(), PolicyLo
     // catches a present environment value with the wrong declared type while
     // never placing its raw value in diagnostics.
     loaded
-        .resolve_inputs(|variable| env::var(variable).ok())
+        .resolve_inputs(ostrom_store::environment::declared_input)
         .map_err(|error| PolicyLoadError::Validation(error.to_string()))?;
 
     let verbs = command_verbs()

@@ -50,6 +50,23 @@ impl EnvironmentVariable {
     }
 }
 
+/// Read a variable whose name a signed manifest declares, not this source.
+///
+/// The typed registry below covers every name the binary itself knows. A
+/// manifest's `inputs:` block names variables the binary cannot know at compile
+/// time, so its resolver cannot appear in a static registry — but it is not a
+/// bypass either. It reads only names a manifest declared, with a declared type
+/// and a declared resolution ladder, which is the discipline the registry
+/// exists to enforce, expressed in data rather than in code.
+///
+/// Routing it here keeps `production_source_cannot_bypass_the_registry`
+/// meaningful: a raw `env::var` in production source is still a defect, and a
+/// declared input is still declared.
+#[must_use]
+pub fn declared_input(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
 const fn variable(
     name: &'static str,
     class: EnvironmentClass,
