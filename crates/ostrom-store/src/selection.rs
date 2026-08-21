@@ -182,7 +182,7 @@ pub fn run_selection(request: &SelectRequest) -> Result<(SelectOutcome, Vec<Stri
             fact.insert("action".to_owned(), json!("list"));
             append_plan_selection_trace(
                 &request.paths.trace_file(),
-                &selection_trace_timestamp(),
+                &request.clock.timestamp(),
                 fact,
                 plan_application,
                 rejection_clause.as_deref(),
@@ -205,7 +205,7 @@ pub fn run_selection(request: &SelectRequest) -> Result<(SelectOutcome, Vec<Stri
                 fact.insert("outcome".to_owned(), json!("empty"));
                 append_plan_selection_trace(
                     &request.paths.trace_file(),
-                    &selection_trace_timestamp(),
+                    &request.clock.timestamp(),
                     fact,
                     plan_application,
                     rejection_clause.as_deref(),
@@ -525,13 +525,6 @@ fn append_selection_traces(
     Ok(())
 }
 
-fn selection_trace_timestamp() -> String {
-    std::env::var("MANDATE_TRACE_TIME").unwrap_or_else(|_| {
-        chrono::DateTime::<Utc>::from(SystemTime::now())
-            .format("%Y-%m-%dT%H:%M:%SZ")
-            .to_string()
-    })
-}
 
 fn append_plan_selection_trace(
     path: &Path,
