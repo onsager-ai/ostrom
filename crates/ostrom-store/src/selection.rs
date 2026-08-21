@@ -4,13 +4,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use ostrom_core::{MandateConfig, QueueItem, WorkEdgeSource, WorkGraph, mechanical_ranking};
+use ostrom_core::{MandateConfig, QueueItem, WorkEdgeSource, WorkGraph};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 
 use crate::{
     Clock, OstromPaths, StoreError, SweepError, TraceAppend, append_trace, load_config_or_defaults,
-    read_queue,
+    read_queue, sweep::PR_REPAIR_CONFLICT_REASON_PREFIX,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,7 +127,7 @@ pub fn run_selection(request: &SelectRequest) -> Result<(SelectOutcome, Vec<Stri
     let authorized = queue_items
         .iter()
         .enumerate()
-        .filter(|(_, item)| authorized(item))
+        .filter(|(index, item)| authorized(item, &queue[*index]))
         .collect::<Vec<_>>();
     let candidates = authorized
         .iter()
@@ -165,7 +165,7 @@ pub fn run_selection(request: &SelectRequest) -> Result<(SelectOutcome, Vec<Stri
     let order = if plan_application == PlanApplication::Applied {
         ranked_with_plan(&candidate_items, &config.work_ranking, &plan_order)
     } else {
-        mechanical_ranking(&candidate_items, &config.work_ranking)
+        mechanical_selection_ranking(&candidate_items, &config.work_ranking)
     };
     let by_id = queue
         .iter()
@@ -327,11 +327,20 @@ fn queue_item(
     })
 }
 
-fn authorized(item: &QueueItem) -> bool {
+fn authorized(item: &QueueItem, row: &Value) -> bool {
     item.kind != "parked"
         && item.state != "deferred"
         && (matches!(item.kind.as_str(), "moved" | "stuck")
+            || is_pr_repair_conflict_drift(row)
             || (item.state == "approved" && matches!(item.kind.as_str(), "tripwire" | "decision")))
+}
+
+fn is_pr_repair_conflict_drift(row: &Value) -> bool {
+    row.get("kind").and_then(Value::as_str) == Some("drift")
+        && row
+            .pointer("/mandate/reason")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| reason.starts_with(PR_REPAIR_CONFLICT_REASON_PREFIX))
 }
 
 fn evaluate_plan(
@@ -402,9 +411,31 @@ fn evaluate_plan(
 fn ranked_with_plan(queue: &[QueueItem], principal: &[String], plan: &[String]) -> Vec<String> {
     let mut items = queue.iter().collect::<Vec<_>>();
     items.sort_by_key(|item| {
-        if let Some(rank) = principal.iter().position(|id| id == &item.id) {
-            (0, rank, 0_isize, &item.opened, &item.id)
+        if item.kind == "drift" {
+            (0, 0, 0_isize, &item.opened, &item.id)
+        } else if let Some(rank) = principal.iter().position(|id| id == &item.id) {
+            (1, rank, 0_isize, &item.opened, &item.id)
         } else if let Some(rank) = plan.iter().position(|id| id == &item.id) {
+            (2, rank, 0, &item.opened, &item.id)
+        } else {
+            (
+                3,
+                0,
+                -(item.unblocking_power as isize),
+                &item.opened,
+                &item.id,
+            )
+        }
+    });
+    items.into_iter().map(|item| item.id.clone()).collect()
+}
+
+fn mechanical_selection_ranking(queue: &[QueueItem], principal: &[String]) -> Vec<String> {
+    let mut items = queue.iter().collect::<Vec<_>>();
+    items.sort_by_key(|item| {
+        if item.kind == "drift" {
+            (0, 0, 0_isize, &item.opened, &item.id)
+        } else if let Some(rank) = principal.iter().position(|id| id == &item.id) {
             (1, rank, 0, &item.opened, &item.id)
         } else {
             (
@@ -481,19 +512,20 @@ fn append_selection_traces(
         .filter(|item| !attempted.contains(&item.id))
         .min_by_key(|item| (&item.opened, &item.id));
     if let Some(displaced) = oldest_candidate.filter(|item| item.id != selected_id) {
-        let (ranking, position) =
-            if let Some(rank) = principal.iter().position(|id| id == selected_id) {
-                ("work_ranking", Some(rank + 1))
-            } else if plan_application == PlanApplication::Applied {
-                plan_order
-                    .iter()
-                    .position(|id| id == selected_id)
-                    .map_or(("dependency-unblocks", None), |rank| {
-                        ("goal-plan", Some(rank + 1))
-                    })
-            } else {
-                ("dependency-unblocks", None)
-            };
+        let (ranking, position) = if selected.get("kind").and_then(Value::as_str) == Some("drift") {
+            ("ci-drift", None)
+        } else if let Some(rank) = principal.iter().position(|id| id == selected_id) {
+            ("work_ranking", Some(rank + 1))
+        } else if plan_application == PlanApplication::Applied {
+            plan_order
+                .iter()
+                .position(|id| id == selected_id)
+                .map_or(("dependency-unblocks", None), |rank| {
+                    ("goal-plan", Some(rank + 1))
+                })
+        } else {
+            ("dependency-unblocks", None)
+        };
         let mut fact = Map::new();
         fact.insert("owner".to_owned(), json!(owner));
         fact.insert("repo".to_owned(), selected["repo"].clone());

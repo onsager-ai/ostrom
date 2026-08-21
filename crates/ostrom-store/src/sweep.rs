@@ -21,7 +21,7 @@ use crate::{
     app_token::{GitHubInstallationTokenMinter, InstallationTokenMinter, ScopedAppTokenRequest},
     environment, io_error,
     publish::{PublishOptions, PublishOutcome, publish},
-    read_queue,
+    read_queue, read_trace,
     selector::{SelectorCandidate, glob_match, selector_match},
     set_private_file_mode, write_queue,
 };
@@ -33,6 +33,8 @@ const FULL_RECONCILIATION_HOURS: i64 = 24;
 /// distinguish a quiet portfolio from the 2026-08-18 authentication outage,
 /// so that incident-shaped result must never reach persistence.
 const MIN_ACQUIRED_REPOSITORIES_TO_WRITE: usize = 1;
+pub(crate) const PR_REPAIR_CONFLICT_REASON_PREFIX: &str =
+    "repair scan aborted on a content conflict";
 /// A sweep only observes portfolio state, so acquisition credentials must not
 /// gain a write permission merely because publication can follow separately.
 const SWEEP_TOKEN_PERMISSIONS: &str = "metadata:read,issues:read,pull_requests:read,checks:read,statuses:read,actions:read,contents:read";
@@ -170,6 +172,8 @@ struct NormalizedItem {
     opened: String,
     updated: String,
     ci: String,
+    #[serde(default)]
+    mergeable: String,
     ready: bool,
     review: String,
     fingerprint: String,
@@ -209,10 +213,18 @@ struct WorkOrderEvidence {
     order_id: String,
 }
 
+#[derive(Debug, Clone)]
+struct PrRepairEvidence {
+    outcome: String,
+    conflicted_paths: Vec<String>,
+}
+
 struct RepositoryEvidence<'a> {
     paths: &'a OstromPaths,
     work_orders: &'a [WorkOrderEvidence],
     queued_kinds: &'a BTreeMap<String, String>,
+    queued_repair_opened: &'a BTreeMap<String, String>,
+    latest_pr_repairs: &'a BTreeMap<String, PrRepairEvidence>,
 }
 
 pub fn run_sweep(options: &SweepOptions) -> Result<SweepOutcome, SweepError> {
@@ -238,11 +250,20 @@ fn run_sweep_with_minter(
     }
     let existing = read_queue(&options.paths.queue_file())?;
     let mut queued_kinds = BTreeMap::new();
+    let mut queued_repair_opened = BTreeMap::new();
     for row in &existing {
+        let value = row.value();
         queued_kinds
-            .entry(string_field(row.value(), &["id"]).to_owned())
-            .or_insert_with(|| string_field(row.value(), &["kind"]).to_owned());
+            .entry(string_field(value, &["id"]).to_owned())
+            .or_insert_with(|| string_field(value, &["kind"]).to_owned());
+        if is_pr_repair_conflict_row(value) {
+            queued_repair_opened.insert(
+                string_field(value, &["id"]).to_owned(),
+                string_field(value, &["opened"]).to_owned(),
+            );
+        }
     }
+    let latest_pr_repairs = latest_pr_repairs(&options.paths.trace_file())?;
     let state_path = options.paths.state.join("state.json");
     let old_state = read_state(&state_path)?;
     let mode = effective_mode(
@@ -331,6 +352,8 @@ fn run_sweep_with_minter(
             paths: &options.paths,
             work_orders: &work_orders,
             queued_kinds: &queued_kinds,
+            queued_repair_opened: &queued_repair_opened,
+            latest_pr_repairs: &latest_pr_repairs,
         };
         let analysis = analyze_repository(
             &config,
@@ -1039,12 +1062,14 @@ fn analyze_repository(
     let active_items = classified
         .iter()
         .filter(|item| {
-            is_safety(item)
-                || item.hold_glob.is_some()
-                || (!initial
-                    && !policy_changed
-                    && !project.paused
-                    && item.classification.terminal == "delegated")
+            !repair_conflict_cleared(item, evidence)
+                && (repair_conflict(item, evidence).is_some()
+                    || is_safety(item)
+                    || item.hold_glob.is_some()
+                    || (!initial
+                        && !policy_changed
+                        && !project.paused
+                        && item.classification.terminal == "delegated"))
         })
         .collect::<Vec<_>>();
     let shadowed = classified
@@ -1061,6 +1086,7 @@ fn analyze_repository(
 
     let mut generated = Vec::new();
     for item in &classified {
+        let repair_conflict = repair_conflict(item, evidence);
         let event = item.old.is_none()
             || item
                 .old
@@ -1076,7 +1102,11 @@ fn analyze_repository(
                     .and_then(|old| old.get("stuck"))
                     .and_then(Value::as_bool)
                     .unwrap_or(false));
-        let eligible = if initial || policy_changed {
+        let eligible = if repair_conflict_cleared(item, evidence) {
+            false
+        } else if repair_conflict.is_some() {
+            true
+        } else if initial || policy_changed {
             is_safety(item) || item.hold_glob.is_some()
         } else {
             event
@@ -1089,7 +1119,17 @@ fn analyze_repository(
                         )))
         };
         if eligible && !shadowed.contains(item.item.id.as_str()) {
-            generated.push(queue_row(item, &classified, config.stuck_after_days));
+            generated.push(queue_row(
+                item,
+                &classified,
+                config.stuck_after_days,
+                repair_conflict,
+                evidence
+                    .queued_repair_opened
+                    .get(item.item.id.as_str())
+                    .map(String::as_str),
+                started_at,
+            ));
         }
     }
 
@@ -1101,14 +1141,24 @@ fn analyze_repository(
     let mut current = classified
         .iter()
         .map(|item| {
+            let repair_age = repair_conflict(item, evidence)
+                .filter(|_| repair_conflict_is_drift(item))
+                .and_then(|_| evidence.queued_repair_opened.get(item.item.id.as_str()))
+                .map_or(0, |opened| days_since(started_at, opened));
+            let (age_days, aged_out) =
+                if repair_conflict(item, evidence).is_some() && repair_conflict_is_drift(item) {
+                    (repair_age, repair_age >= config.stuck_after_days)
+                } else {
+                    (item.age_days, item.age_days >= config.stuck_after_days)
+                };
             (
                 item.item.id.clone(),
                 json!({
                     "id": item.item.id,
                     "title": item.item.title,
                     "closing_suffix": closing_suffix(item, &classified),
-                    "age_days": item.age_days,
-                    "aged_out": item.age_days >= config.stuck_after_days,
+                    "age_days": age_days,
+                    "aged_out": aged_out,
                     "blocked_by": item.item.blocked_by,
                 }),
             )
@@ -1226,6 +1276,32 @@ fn analyze_repository(
         current,
         state,
     })
+}
+
+fn repair_conflict<'a>(
+    item: &ClassifiedItem,
+    evidence: &'a RepositoryEvidence<'_>,
+) -> Option<&'a PrRepairEvidence> {
+    (item.item.item_type == "pr" && item.item.mergeable != "MERGEABLE")
+        .then(|| evidence.latest_pr_repairs.get(item.item.id.as_str()))
+        .flatten()
+        .filter(|repair| repair.outcome == "conflicted")
+}
+
+fn repair_conflict_cleared(item: &ClassifiedItem, evidence: &RepositoryEvidence<'_>) -> bool {
+    item.item.item_type == "pr"
+        && item.item.mergeable == "MERGEABLE"
+        && evidence
+            .latest_pr_repairs
+            .get(item.item.id.as_str())
+            .is_some_and(|repair| repair.outcome == "conflicted")
+}
+
+fn repair_conflict_is_drift(item: &ClassifiedItem) -> bool {
+    !matches!(
+        item.classification.terminal.as_str(),
+        "reserved" | "tripwire"
+    )
 }
 
 fn normalize_item(
@@ -1348,6 +1424,7 @@ fn normalize_item(
         opened: string_field(source, &["createdAt", "created_at"]).to_owned(),
         updated: string_field(source, &["updatedAt", "updated_at"]).to_owned(),
         ci,
+        mergeable: mergeable.to_owned(),
         ready,
         review,
         fingerprint,
@@ -1467,7 +1544,14 @@ fn classify(
     })
 }
 
-fn queue_row(item: &ClassifiedItem, all: &[ClassifiedItem], stuck_after_days: u64) -> Value {
+fn queue_row(
+    item: &ClassifiedItem,
+    all: &[ClassifiedItem],
+    stuck_after_days: u64,
+    repair_conflict: Option<&PrRepairEvidence>,
+    prior_repair_opened: Option<&str>,
+    started_at: DateTime<Utc>,
+) -> Value {
     let match_reason = if item.classification.source == "default" {
         item.classification.selector.clone()
     } else {
@@ -1483,6 +1567,16 @@ fn queue_row(item: &ClassifiedItem, all: &[ClassifiedItem], stuck_after_days: u6
         )
     } else if item.classification.terminal == "tripwire" {
         ("tripwire", format!("tripwire: {match_reason}"))
+    } else if let Some(repair) = repair_conflict {
+        let paths = if repair.conflicted_paths.is_empty() {
+            "conflicted paths were not recorded".to_owned()
+        } else {
+            format!("conflicted paths: {}", repair.conflicted_paths.join(", "))
+        };
+        (
+            "drift",
+            format!("{PR_REPAIR_CONFLICT_REASON_PREFIX}; {paths}"),
+        )
     } else if item.classification.terminal == "unclassified" {
         (
             "decision",
@@ -1519,6 +1613,12 @@ fn queue_row(item: &ClassifiedItem, all: &[ClassifiedItem], stuck_after_days: u6
     } else {
         json!({"reason": reason})
     };
+    let repair_opened = (kind == "drift" && repair_conflict.is_some())
+        .then(|| prior_repair_opened.map_or_else(|| format_time(started_at), str::to_owned));
+    let opened = repair_opened.as_deref().unwrap_or(&item.item.opened);
+    let age_days = repair_opened
+        .as_deref()
+        .map_or(item.age_days, |opened| days_since(started_at, opened));
     json!({
         "id": item.item.id,
         "repo": item.item.repo,
@@ -1527,9 +1627,9 @@ fn queue_row(item: &ClassifiedItem, all: &[ClassifiedItem], stuck_after_days: u6
         "kind": kind,
         "mandate": mandate,
         "state": "pending",
-        "opened": item.item.opened,
-        "age_days": item.age_days,
-        "aged_out": item.age_days >= stuck_after_days,
+        "opened": opened,
+        "age_days": age_days,
+        "aged_out": age_days >= stuck_after_days,
         "needs_judgment": matches!(kind, "tripwire" | "decision"),
         "blocked_by": item.item.blocked_by,
     })
@@ -2864,6 +2964,65 @@ fn format_time(value: DateTime<Utc>) -> String {
     value.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
+fn latest_pr_repairs(path: &Path) -> Result<BTreeMap<String, PrRepairEvidence>, SweepError> {
+    let mut latest = BTreeMap::new();
+    for row in read_trace(path)?.rows.into_iter().filter_map(Result::ok) {
+        if row.kind != "pr-repair"
+            || row.fact.get("role").and_then(Value::as_str) != Some("builder")
+        {
+            continue;
+        }
+        let Some(repo) = row
+            .fact
+            .get("repo")
+            .and_then(Value::as_str)
+            .filter(|repo| !repo.is_empty())
+        else {
+            continue;
+        };
+        let Some(reference) = row
+            .fact
+            .get("ref")
+            .and_then(Value::as_str)
+            .filter(|reference| {
+                reference.strip_prefix('#').is_some_and(|number| {
+                    !number.is_empty() && number.chars().all(|character| character.is_ascii_digit())
+                })
+            })
+        else {
+            continue;
+        };
+        let Some(outcome) = row.fact.get("outcome").and_then(Value::as_str) else {
+            continue;
+        };
+        let conflicted_paths = row
+            .fact
+            .get("conflicted_paths")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect();
+        latest.insert(
+            format!("{repo}{reference}"),
+            PrRepairEvidence {
+                outcome: outcome.to_owned(),
+                conflicted_paths,
+            },
+        );
+    }
+    Ok(latest)
+}
+
+fn is_pr_repair_conflict_row(row: &Value) -> bool {
+    string_field(row, &["kind"]) == "drift"
+        && row
+            .pointer("/mandate/reason")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| reason.starts_with(PR_REPAIR_CONFLICT_REASON_PREFIX))
+}
+
 fn days_since(now: DateTime<Utc>, opened: &str) -> u64 {
     parse_time(opened)
         .map(|opened| now.signed_duration_since(opened).num_days().max(0))
@@ -2910,7 +3069,373 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::app_token::ScopedInstallationToken;
+    use crate::{
+        Clock, SelectAction, SelectOutcome, SelectRequest, TraceAppend,
+        app_token::ScopedInstallationToken, append_trace, run_selection,
+    };
+
+    const REPAIR_TEST_REPO: &str = "placeholder-org/alpha";
+
+    fn repair_test_paths(home: &Path) -> OstromPaths {
+        OstromPaths {
+            config: home.to_path_buf(),
+            state: home.to_path_buf(),
+        }
+    }
+
+    fn write_repair_test_config(home: &Path, bounce_plugin_manifest: bool) {
+        let bounce = if bounce_plugin_manifest {
+            "    bounce:\n      - path:plugins/ostrom/.claude-plugin/plugin.json\n"
+        } else {
+            "    bounce: []\n"
+        };
+        fs::write(
+            home.join("mandates.yaml"),
+            format!(
+                concat!(
+                    "provider: file\n",
+                    "cadence_hours: 1\n",
+                    "stuck_after_days: 7\n",
+                    "bounce_all: []\n",
+                    "projects:\n",
+                    "  - repo: placeholder-org/alpha\n",
+                    "    delegated: []\n",
+                    "    excluded: []\n",
+                    "    reserved: [376]\n",
+                    "    default: delegated\n",
+                    "    paused: false\n",
+                    "{bounce}",
+                ),
+                bounce = bounce,
+            ),
+        )
+        .expect("write repair sweep config");
+    }
+
+    fn repair_test_pr(number: u64, mergeable: &str, files: &[&str]) -> Value {
+        json!({
+            "number": number,
+            "title": format!("fix: placeholder pull request {number}"),
+            "state": "OPEN",
+            "body": "Ostrom-Role: builder",
+            "files": files.iter().map(|path| json!({"path": path})).collect::<Vec<_>>(),
+            "labels": [],
+            "createdAt": "2026-07-01T00:00:00Z",
+            "updatedAt": "2026-08-20T00:00:00Z",
+            "mergeable": mergeable,
+            "statusCheckRollup": [{"conclusion": "SUCCESS"}],
+        })
+    }
+
+    fn repair_test_issue(number: u64) -> Value {
+        json!({
+            "number": number,
+            "title": format!("fix: delegated placeholder issue {number}"),
+            "state": "OPEN",
+            "body": "",
+            "labels": [],
+            "createdAt": "2026-06-01T00:00:00Z",
+            "updatedAt": "2026-08-21T00:30:00Z",
+        })
+    }
+
+    fn append_repair_test_trace(
+        home: &Path,
+        number: u64,
+        outcome: &str,
+        conflicted_paths: &[&str],
+        timestamp: &str,
+    ) {
+        let fact = json!({
+            "role": "builder",
+            "owner": "builder-placeholder-wake1",
+            "repo": REPAIR_TEST_REPO,
+            "ref": format!("#{number}"),
+            "action": "merge-base-forward",
+            "outcome": outcome,
+            "head_branch": format!("ostrom/{number}-placeholder"),
+            "base_branch": "main",
+            "head_sha": "1111111111111111111111111111111111111111",
+            "base_sha": "2222222222222222222222222222222222222222",
+            "conflicted_paths": conflicted_paths,
+            "cap": 3,
+        });
+        append_trace(
+            &repair_test_paths(home).trace_file(),
+            &TraceAppend {
+                ts: timestamp.to_owned(),
+                kind: "pr-repair".to_owned(),
+                fact: fact.as_object().expect("repair fact object").clone(),
+                narration: Map::new(),
+            },
+        )
+        .expect("append synthetic repair trace");
+    }
+
+    fn run_repair_test_sweep(
+        home: &Path,
+        pull_requests: Vec<Value>,
+        issues: Vec<Value>,
+        started_at: &str,
+    ) {
+        let fixture_path = home.join("sweep-fixture.json");
+        fs::write(
+            &fixture_path,
+            serde_json::to_vec(&json!({
+                "repositories": [{
+                    "repo": REPAIR_TEST_REPO,
+                    "issues": issues,
+                    "open_prs": pull_requests,
+                }]
+            }))
+            .expect("serialize repair sweep fixture"),
+        )
+        .expect("write repair sweep fixture");
+        let paths = repair_test_paths(home);
+        run_sweep(&SweepOptions {
+            working_directory: home.to_path_buf(),
+            executable: home.join("unused-ostrom"),
+            plugin_root: home.to_path_buf(),
+            paths,
+            started_at: started_at.parse().expect("valid sweep time"),
+            requested_mode: SweepMode::Full,
+            fixture: Some(fixture_path),
+            publish: PublishTarget::Disabled,
+            policy: None,
+        })
+        .expect("repair fixture sweep succeeds");
+    }
+
+    fn repair_test_queue(home: &Path) -> Vec<Value> {
+        read_queue(&repair_test_paths(home).queue_file())
+            .expect("read repair test queue")
+            .into_iter()
+            .map(|row| row.value().clone())
+            .collect()
+    }
+
+    fn repair_test_row(queue: &[Value], number: u64) -> Option<&Value> {
+        let id = format!("{REPAIR_TEST_REPO}#{number}");
+        queue
+            .iter()
+            .find(|row| row.get("id").and_then(Value::as_str) == Some(id.as_str()))
+    }
+
+    #[test]
+    fn green_conflicted_repair_is_selected_before_delegated_work() {
+        let home = tempdir().expect("temporary repair sweep home");
+        write_repair_test_config(home.path(), false);
+        append_repair_test_trace(
+            home.path(),
+            355,
+            "conflicted",
+            &["crates/ostrom-store/src/doctor.rs", "src/main.rs"],
+            "2026-08-21T00:00:00Z",
+        );
+        run_repair_test_sweep(
+            home.path(),
+            vec![repair_test_pr(355, "CONFLICTING", &[])],
+            vec![],
+            "2026-08-21T00:00:00Z",
+        );
+        run_repair_test_sweep(
+            home.path(),
+            vec![repair_test_pr(355, "CONFLICTING", &[])],
+            vec![repair_test_issue(399)],
+            "2026-08-21T01:00:00Z",
+        );
+
+        let queue = repair_test_queue(home.path());
+        let conflict = repair_test_row(&queue, 355).expect("conflicted repair queue row");
+        assert_eq!(conflict["kind"], "drift");
+        let reason = conflict["mandate"]["reason"]
+            .as_str()
+            .expect("repair conflict reason");
+        assert!(reason.starts_with(PR_REPAIR_CONFLICT_REASON_PREFIX));
+        assert!(reason.contains("crates/ostrom-store/src/doctor.rs"));
+        assert!(reason.contains("src/main.rs"));
+        assert_eq!(
+            repair_test_row(&queue, 399).expect("delegated queue row")["kind"],
+            "moved"
+        );
+
+        let paths = repair_test_paths(home.path());
+        let (selected, diagnostics) = run_selection(&SelectRequest {
+            working_directory: home.path().to_path_buf(),
+            paths,
+            action: SelectAction::Select {
+                owner: "builder-placeholder-wake1".to_owned(),
+                attempted: BTreeSet::new(),
+            },
+            clock: Clock::fixed(
+                "2026-08-21T01:01:00Z"
+                    .parse()
+                    .expect("valid selection time"),
+            ),
+        })
+        .expect("select repair conflict");
+        assert!(diagnostics.is_empty());
+        let SelectOutcome::Selected(selected) = selected else {
+            panic!("repair conflict should be selected");
+        };
+        assert_eq!(selected["id"], "placeholder-org/alpha#355");
+        let selection_trace =
+            read_trace(&repair_test_paths(home.path()).trace_file()).expect("read selection trace");
+        assert!(
+            selection_trace
+                .rows
+                .into_iter()
+                .filter_map(Result::ok)
+                .any(|row| row.kind == "work-ranked"
+                    && row.fact.get("ranking").and_then(Value::as_str) == Some("ci-drift"))
+        );
+    }
+
+    #[test]
+    fn tripwire_and_reserved_classification_win_over_repair_conflict_drift() {
+        let home = tempdir().expect("temporary repair sweep home");
+        write_repair_test_config(home.path(), true);
+        for number in [375, 376] {
+            append_repair_test_trace(
+                home.path(),
+                number,
+                "conflicted",
+                &["plugins/ostrom/.claude-plugin/plugin.json"],
+                "2026-08-21T00:00:00Z",
+            );
+        }
+        run_repair_test_sweep(
+            home.path(),
+            vec![
+                repair_test_pr(
+                    375,
+                    "CONFLICTING",
+                    &["plugins/ostrom/.claude-plugin/plugin.json"],
+                ),
+                repair_test_pr(376, "CONFLICTING", &[]),
+            ],
+            vec![],
+            "2026-08-21T00:00:00Z",
+        );
+
+        let queue = repair_test_queue(home.path());
+        let tripwire = repair_test_row(&queue, 375).expect("tripwire row");
+        assert_eq!(tripwire["kind"], "tripwire");
+        assert_eq!(tripwire["needs_judgment"], true);
+        assert!(
+            tripwire["mandate"]["reason"]
+                .as_str()
+                .expect("tripwire reason")
+                .starts_with("tripwire:")
+        );
+        let reserved = repair_test_row(&queue, 376).expect("reserved row");
+        assert_eq!(reserved["kind"], "decision");
+        assert_eq!(reserved["needs_judgment"], true);
+    }
+
+    #[test]
+    fn latest_successful_repair_clears_an_earlier_conflict() {
+        let home = tempdir().expect("temporary repair sweep home");
+        write_repair_test_config(home.path(), false);
+        append_repair_test_trace(
+            home.path(),
+            355,
+            "conflicted",
+            &["src/main.rs"],
+            "2026-08-21T00:00:00Z",
+        );
+        append_repair_test_trace(home.path(), 355, "repaired", &[], "2026-08-21T00:01:00Z");
+        run_repair_test_sweep(
+            home.path(),
+            vec![repair_test_pr(355, "CONFLICTING", &[])],
+            vec![],
+            "2026-08-21T01:00:00Z",
+        );
+
+        assert!(repair_test_row(&repair_test_queue(home.path()), 355).is_none());
+    }
+
+    #[test]
+    fn repair_conflict_rows_clear_when_pull_requests_merge_or_become_mergeable() {
+        let home = tempdir().expect("temporary repair sweep home");
+        write_repair_test_config(home.path(), false);
+        for number in [355, 356] {
+            append_repair_test_trace(
+                home.path(),
+                number,
+                "conflicted",
+                &["src/main.rs"],
+                "2026-08-21T00:00:00Z",
+            );
+        }
+        run_repair_test_sweep(
+            home.path(),
+            vec![
+                repair_test_pr(355, "CONFLICTING", &[]),
+                repair_test_pr(356, "CONFLICTING", &[]),
+            ],
+            vec![],
+            "2026-08-21T00:00:00Z",
+        );
+        assert!(repair_test_row(&repair_test_queue(home.path()), 355).is_some());
+        assert!(repair_test_row(&repair_test_queue(home.path()), 356).is_some());
+
+        run_repair_test_sweep(
+            home.path(),
+            vec![repair_test_pr(355, "MERGEABLE", &[])],
+            vec![],
+            "2026-08-21T01:00:00Z",
+        );
+        let queue = repair_test_queue(home.path());
+        assert!(repair_test_row(&queue, 355).is_none());
+        assert!(repair_test_row(&queue, 356).is_none());
+    }
+
+    #[test]
+    fn skipped_cap_is_not_treated_as_a_repair_conflict() {
+        let home = tempdir().expect("temporary repair sweep home");
+        write_repair_test_config(home.path(), false);
+        append_repair_test_trace(home.path(), 355, "skipped-cap", &[], "2026-08-21T00:00:00Z");
+        run_repair_test_sweep(
+            home.path(),
+            vec![repair_test_pr(355, "CONFLICTING", &[])],
+            vec![],
+            "2026-08-21T01:00:00Z",
+        );
+
+        assert!(repair_test_row(&repair_test_queue(home.path()), 355).is_none());
+    }
+
+    #[test]
+    fn unchanged_repair_conflict_preserves_its_original_queue_opened_time() {
+        let home = tempdir().expect("temporary repair sweep home");
+        write_repair_test_config(home.path(), false);
+        append_repair_test_trace(
+            home.path(),
+            355,
+            "conflicted",
+            &["src/main.rs"],
+            "2026-08-21T00:00:00Z",
+        );
+        let pull_requests = vec![repair_test_pr(355, "CONFLICTING", &[])];
+        run_repair_test_sweep(
+            home.path(),
+            pull_requests.clone(),
+            vec![],
+            "2026-08-21T00:00:00Z",
+        );
+        let first = repair_test_queue(home.path());
+        assert_eq!(
+            repair_test_row(&first, 355).expect("first conflict row")["opened"],
+            "2026-08-21T00:00:00Z"
+        );
+
+        run_repair_test_sweep(home.path(), pull_requests, vec![], "2026-08-23T00:00:00Z");
+        let second = repair_test_queue(home.path());
+        let row = repair_test_row(&second, 355).expect("second conflict row");
+        assert_eq!(row["opened"], "2026-08-21T00:00:00Z");
+        assert_eq!(row["age_days"], 2);
+    }
 
     fn roster(repositories: &[&str]) -> MandateConfig {
         let projects = repositories
