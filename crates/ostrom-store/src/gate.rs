@@ -1165,9 +1165,9 @@ fn aggregate(conditions: &[Value]) -> &'static str {
     }
 }
 
-fn already_judged(path: &Path, target: &str, head_sha: &str) -> bool {
+fn latest_judgment(path: &Path, target: &str, head_sha: &str) -> Option<Value> {
     if head_sha.is_empty() {
-        return false;
+        return None;
     }
     fs::read_to_string(path)
         .ok()
@@ -1177,12 +1177,24 @@ fn already_judged(path: &Path, target: &str, head_sha: &str) -> bool {
                 .collect::<Result<Vec<_>, _>>()
                 .ok()
         })
-        .is_some_and(|records| {
-            records.iter().any(|record| {
+        .and_then(|records| {
+            records.into_iter().rev().find(|record| {
                 record["pr"].as_str() == Some(target)
                     && record["head_sha"].as_str() == Some(head_sha)
             })
         })
+}
+
+pub(crate) fn latest_verdict(path: &Path, target: &str, head_sha: &str) -> Option<String> {
+    latest_judgment(path, target, head_sha).and_then(|record| {
+        record["verdict"]
+            .as_str()
+            .map(std::borrow::ToOwned::to_owned)
+    })
+}
+
+fn already_judged(path: &Path, target: &str, head_sha: &str) -> bool {
+    latest_judgment(path, target, head_sha).is_some()
 }
 
 fn append_record(path: &Path, record: &Value) -> io::Result<()> {
@@ -1303,6 +1315,38 @@ projects:
         ] {
             assert!(parse_target(value).is_err(), "accepted {value}");
         }
+    }
+
+    #[test]
+    fn exact_sha_judgment_and_latest_verdict_share_one_reader() {
+        let fixture = tempfile::tempdir().expect("temporary gate journal fixture");
+        let path = fixture.path().join("gate.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"pr\":\"placeholder-org/alpha#7\",\"head_sha\":\"old\",\"verdict\":\"pass\"}\n",
+                "{\"pr\":\"placeholder-org/alpha#7\",\"head_sha\":\"judged-without-verdict\"}\n",
+                "{\"pr\":\"placeholder-org/alpha#7\",\"head_sha\":\"current\",\"verdict\":\"pass\"}\n",
+                "{\"pr\":\"placeholder-org/alpha#7\",\"head_sha\":\"current\",\"verdict\":\"fail\"}\n",
+            ),
+        )
+        .expect("write gate journal");
+
+        assert!(already_judged(&path, "placeholder-org/alpha#7", "current"));
+        assert_eq!(
+            latest_verdict(&path, "placeholder-org/alpha#7", "current").as_deref(),
+            Some("fail")
+        );
+        assert!(already_judged(
+            &path,
+            "placeholder-org/alpha#7",
+            "judged-without-verdict"
+        ));
+        assert_eq!(
+            latest_verdict(&path, "placeholder-org/alpha#7", "judged-without-verdict"),
+            None
+        );
+        assert!(!already_judged(&path, "placeholder-org/alpha#7", "missing"));
     }
 
     #[test]

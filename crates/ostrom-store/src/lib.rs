@@ -10,6 +10,7 @@ mod hooks;
 mod implement;
 mod lease;
 mod leaves;
+mod merge;
 mod migration;
 mod parity;
 mod pass;
@@ -41,6 +42,10 @@ pub use lease::{
 pub use leaves::{
     AuditError, AuditOptions, ExcuseError, LocalDriftError, audit, grant_excuse, list_excuses,
     local_drift,
+};
+pub use merge::{
+    MERGE_ATTEMPT_FAILED_EXIT_CODE, MERGE_REFUSED_EXIT_CODE, MergeError, MergeOptions, MergeOutput,
+    run_merge,
 };
 pub use migration::{MigrationOutcome, migrate};
 pub use parity::{ParityError, SweepParityOptions, SweepParityOutcome, run_sweep_parity};
