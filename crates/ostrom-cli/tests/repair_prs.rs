@@ -141,7 +141,7 @@ esac
 }
 
 #[test]
-fn repair_only_pushes_the_builders_own_green_pr_with_an_ordinary_refspec() {
+fn repair_reads_rest_checks_safely_and_continues_after_an_unreadable_candidate() {
     let fixture = tempdir().expect("temporary published repair fixture");
     let home = fixture.path().join("home");
     let source = fixture.path().join("source");
@@ -242,6 +242,46 @@ projects:
                 "baseRefName": "main",
                 "headRefOid": "3333333333333333333333333333333333333333",
                 "isCrossRepository": false
+            },
+            {
+                "number": 4,
+                "body": "Synthetic fixture.\n\nOstrom-Role: builder\n",
+                "author": {"login": "ostrom-builder[bot]", "is_bot": true},
+                "mergeable": "CONFLICTING",
+                "headRefName": "incomplete-head",
+                "baseRefName": "main",
+                "headRefOid": "4444444444444444444444444444444444444444",
+                "isCrossRepository": false
+            },
+            {
+                "number": 5,
+                "body": "Synthetic fixture.\n\nOstrom-Role: builder\n",
+                "author": {"login": "ostrom-builder[bot]", "is_bot": true},
+                "mergeable": "CONFLICTING",
+                "headRefName": "unreadable-head",
+                "baseRefName": "main",
+                "headRefOid": "5555555555555555555555555555555555555555",
+                "isCrossRepository": false
+            },
+            {
+                "number": 6,
+                "body": "Synthetic fixture.\n\nOstrom-Role: builder\n",
+                "author": {"login": "ostrom-builder[bot]", "is_bot": true},
+                "mergeable": "CONFLICTING",
+                "headRefName": "empty-checks-head",
+                "baseRefName": "main",
+                "headRefOid": "6666666666666666666666666666666666666666",
+                "isCrossRepository": false
+            },
+            {
+                "number": 7,
+                "body": "Synthetic fixture.\n\nOstrom-Role: builder\n",
+                "author": {"login": "ostrom-builder[bot]", "is_bot": true},
+                "mergeable": "CONFLICTING",
+                "headRefName": "legacy-failure-head",
+                "baseRefName": "main",
+                "headRefOid": "7777777777777777777777777777777777777777",
+                "isCrossRepository": false
             }
         ]))
         .unwrap(),
@@ -259,11 +299,27 @@ while [ "$1" != "--" ]; do shift; done
 shift
 if [ "$1 $2 $3" = "gh pr list" ]; then
   cat "$REPAIR_LISTING"
-elif [ "$1 $2 $3" = "gh pr view" ]; then
-  if [ "$4" = "1" ]; then
-    printf '%s\n' '{"statusCheckRollup":[{"name":"test","conclusion":"SUCCESS","status":"COMPLETED"}]}'
+elif [ "$1 $2" = "gh api" ]; then
+  if [ "$3" = "repos/placeholder-org/repair-repo/commits/$REPAIR_GREEN_SHA/check-runs" ]; then
+    printf '%s\n' '{"total_count":1,"check_runs":[{"name":"test","conclusion":"success","status":"completed"}]}'
+  elif [ "$3" = "repos/placeholder-org/repair-repo/commits/3333333333333333333333333333333333333333/check-runs" ]; then
+    printf '%s\n' '{"total_count":1,"check_runs":[{"name":"test","conclusion":"failure","status":"completed"}]}'
+  elif [ "$3" = "repos/placeholder-org/repair-repo/commits/4444444444444444444444444444444444444444/check-runs" ]; then
+    printf '%s\n' '{"total_count":1,"check_runs":[{"name":"test","conclusion":null,"status":"in_progress"}]}'
+  elif [ "$3" = "repos/placeholder-org/repair-repo/commits/5555555555555555555555555555555555555555/check-runs" ]; then
+    printf '%s\n' 'GraphQL: Resource not accessible by integration' >&2
+    exit 17
+  elif [ "$3" = "repos/placeholder-org/repair-repo/commits/6666666666666666666666666666666666666666/check-runs" ]; then
+    printf '%s\n' '{"total_count":0,"check_runs":[]}'
+  elif [ "$3" = "repos/placeholder-org/repair-repo/commits/7777777777777777777777777777777777777777/check-runs" ]; then
+    printf '%s\n' '{"total_count":1,"check_runs":[{"name":"test","conclusion":"success","status":"completed"}]}'
+  elif [ "$3" = "repos/placeholder-org/repair-repo/commits/7777777777777777777777777777777777777777/status" ]; then
+    printf '%s\n' '{"total_count":1,"state":"failure"}'
   else
-    printf '%s\n' '{"statusCheckRollup":[{"name":"test","conclusion":"FAILURE","status":"COMPLETED"}]}'
+    case "$3" in
+      */status) printf '%s\n' '{"total_count":0,"state":"pending"}' ;;
+      *) exit 95 ;;
+    esac
   fi
 elif [ "$1 $2 $4" = "git -C fetch" ]; then
   exec git -C "$3" fetch --no-tags "$REPAIR_REMOTE" "$7" "$8"
@@ -281,6 +337,7 @@ fi
         .env("MANDATE_GH_AS_BIN", &helper)
         .env("REPAIR_LISTING", &listing)
         .env("REPAIR_CALLS", &calls)
+        .env("REPAIR_GREEN_SHA", &builder_head)
         .env("REPAIR_REMOTE", &remote)
         .current_dir(fixture.path())
         .output()
@@ -293,6 +350,7 @@ fi
     let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(summary["attempted"], 1);
     assert_eq!(summary["repaired"], 1);
+    assert_eq!(summary["skipped"], 1);
     assert_eq!(summary["failed"], 0);
     let repaired_head = String::from_utf8(
         Command::new("git")
@@ -317,9 +375,27 @@ fi
     assert_eq!(parents[1], builder_head);
     assert_eq!(parents[2], base_head);
     let calls = fs::read_to_string(calls).unwrap();
-    assert!(calls.contains("gh pr view 1 "));
-    assert!(calls.contains("gh pr view 3 "));
-    assert!(!calls.contains("gh pr view 2 "));
+    let green_checks =
+        format!("gh api repos/placeholder-org/repair-repo/commits/{builder_head}/check-runs");
+    assert!(calls.contains(&green_checks));
+    assert!(calls.contains(
+        "gh api repos/placeholder-org/repair-repo/commits/3333333333333333333333333333333333333333/check-runs"
+    ));
+    assert!(calls.contains(
+        "gh api repos/placeholder-org/repair-repo/commits/4444444444444444444444444444444444444444/check-runs"
+    ));
+    assert!(calls.contains(
+        "gh api repos/placeholder-org/repair-repo/commits/5555555555555555555555555555555555555555/check-runs"
+    ));
+    assert!(calls.contains(
+        "gh api repos/placeholder-org/repair-repo/commits/6666666666666666666666666666666666666666/check-runs"
+    ));
+    assert!(!calls.contains("gh pr view"));
+    assert!(!calls.contains("statusCheckRollup"));
+    for line in calls.lines().filter(|line| line.contains(" gh api ")) {
+        assert!(line.contains("metadata:read,checks:read,statuses:read"));
+        assert!(!line.contains("pull_requests:read"));
+    }
     let push = calls
         .lines()
         .find(|line| line.contains(" git -C ") && line.contains(" push "))
@@ -327,12 +403,21 @@ fi
     assert!(push.contains("HEAD:refs/heads/builder-head"));
     assert!(!push.contains("--force"));
     assert!(!push.contains(" -f "));
-    let trace: Value = serde_json::from_str(
-        fs::read_to_string(home.join("sprint.jsonl"))
-            .unwrap()
-            .trim(),
-    )
-    .unwrap();
-    assert_eq!(trace["fact"]["outcome"], "repaired");
-    assert_eq!(trace["fact"]["owner"], "builder-placeholder-wake2");
+    let traces = fs::read_to_string(home.join("sprint.jsonl")).unwrap();
+    let traces = traces
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let failed_read = traces
+        .iter()
+        .find(|trace| trace["fact"]["outcome"] == "check-fetch-failed")
+        .unwrap();
+    assert_eq!(failed_read["fact"]["ref"], "#5");
+    assert_eq!(failed_read["fact"]["exit_code"], 17);
+    let repaired = traces
+        .iter()
+        .find(|trace| trace["fact"]["outcome"] == "repaired")
+        .unwrap();
+    assert_eq!(repaired["fact"]["ref"], "#1");
+    assert_eq!(repaired["fact"]["owner"], "builder-placeholder-wake2");
 }

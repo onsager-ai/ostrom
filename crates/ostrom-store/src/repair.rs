@@ -20,7 +20,7 @@ use crate::{
 const REPAIR_CAP: usize = 3;
 const QUERY_LIMIT: usize = 1_000;
 const LIST_PERMISSIONS: &str = "metadata:read,pull_requests:read";
-const CHECK_PERMISSIONS: &str = "metadata:read,pull_requests:read,checks:read,statuses:read";
+const CHECK_PERMISSIONS: &str = "metadata:read,checks:read,statuses:read";
 const FETCH_PERMISSIONS: &str = "metadata:read,contents:read";
 const PUSH_PERMISSIONS: &str = "metadata:read,contents:write";
 
@@ -277,65 +277,112 @@ fn collect_candidates(
             base_branch: jq_text(pull_request.get("baseRefName")),
             listed_head_sha: jq_default_text(pull_request.get("headRefOid")),
         };
+        let check_runs_endpoint = format!(
+            "repos/{repository}/commits/{}/check-runs",
+            candidate.listed_head_sha
+        );
         let checks = context.authenticated(
             repository,
             CHECK_PERMISSIONS,
-            &[
-                "gh",
-                "pr",
-                "view",
-                &candidate.number,
-                "--repo",
-                repository,
-                "--json",
-                "statusCheckRollup",
-            ],
+            &["gh", "api", &check_runs_endpoint],
         );
         if checks.code != 0 {
-            summary.skipped += 1;
-            context.stderr.push_str(&format!(
-                "mandate repair: failed to read checks for {repository}#{} (rc={})\n",
-                candidate.number, checks.code
-            ));
-            context.trace_candidate(
-                &candidate,
-                "check-fetch-failed",
-                &candidate.listed_head_sha,
-                "",
-                &[],
-                Some(checks.code),
-                json!({"reason": "candidate check state could not be read"}),
-            )?;
+            check_fetch_failed(context, summary, &candidate, checks.code)?;
             continue;
         }
         let parsed = serde_json::from_slice::<Value>(&checks.stdout).ok();
-        let rollup = parsed
+        let check_runs = parsed
             .as_ref()
             .and_then(Value::as_object)
-            .and_then(|object| object.get("statusCheckRollup"))
+            .filter(|object| object.get("total_count").and_then(Value::as_u64).is_some())
+            .and_then(|object| object.get("check_runs"))
             .and_then(Value::as_array);
-        let Some(rollup) = rollup else {
-            summary.skipped += 1;
-            context.stderr.push_str(&format!(
-                "mandate repair: check state for {repository}#{} was malformed\n",
-                candidate.number
-            ));
-            context.trace_candidate(
-                &candidate,
-                "check-fetch-malformed",
-                &candidate.listed_head_sha,
-                "",
-                &[],
-                Some(1),
-                json!({"reason": "candidate check state was malformed"}),
-            )?;
+        let Some(check_runs) = check_runs else {
+            check_fetch_malformed(context, summary, &candidate)?;
             continue;
         };
-        if completed_green(rollup) {
+
+        let status_endpoint = format!(
+            "repos/{repository}/commits/{}/status",
+            candidate.listed_head_sha
+        );
+        let statuses = context.authenticated(
+            repository,
+            CHECK_PERMISSIONS,
+            &["gh", "api", &status_endpoint],
+        );
+        if statuses.code != 0 {
+            check_fetch_failed(context, summary, &candidate, statuses.code)?;
+            continue;
+        }
+        let parsed_statuses = serde_json::from_slice::<Value>(&statuses.stdout).ok();
+        let status_count = parsed_statuses
+            .as_ref()
+            .and_then(Value::as_object)
+            .and_then(|object| object.get("total_count"))
+            .and_then(Value::as_u64);
+        let Some(status_count) = status_count else {
+            check_fetch_malformed(context, summary, &candidate)?;
+            continue;
+        };
+        let status_state = parsed_statuses
+            .as_ref()
+            .and_then(Value::as_object)
+            .and_then(|object| object.get("state"))
+            .and_then(Value::as_str);
+        if status_count > 0 && status_state.is_none() {
+            check_fetch_malformed(context, summary, &candidate)?;
+            continue;
+        }
+
+        if candidate_checks_green(check_runs, status_count, status_state) {
             candidates.push(candidate);
         }
     }
     Ok(())
+}
+
+fn check_fetch_failed(
+    context: &mut RepairContext<'_>,
+    summary: &mut Summary,
+    candidate: &Candidate,
+    code: i32,
+) -> Result<(), RepairError> {
+    summary.skipped += 1;
+    context.stderr.push_str(&format!(
+        "mandate repair: failed to read checks for {}#{} (rc={code})\n",
+        candidate.repository, candidate.number
+    ));
+    context.trace_candidate(
+        candidate,
+        "check-fetch-failed",
+        &candidate.listed_head_sha,
+        "",
+        &[],
+        Some(code),
+        json!({"reason": "candidate check state could not be read"}),
+    )
+}
+
+fn check_fetch_malformed(
+    context: &mut RepairContext<'_>,
+    summary: &mut Summary,
+    candidate: &Candidate,
+) -> Result<(), RepairError> {
+    summary.skipped += 1;
+    context.stderr.push_str(&format!(
+        "mandate repair: check state for {}#{} was malformed\n",
+        candidate.repository, candidate.number
+    ));
+    context.trace_candidate(
+        candidate,
+        "check-fetch-malformed",
+        &candidate.listed_head_sha,
+        "",
+        &[],
+        Some(1),
+        json!({"reason": "candidate check state was malformed"}),
+    )
 }
 
 fn repair_candidate(
@@ -781,6 +828,9 @@ fn listing_row_is_filterable(pull_request: &Value) -> bool {
 fn completed_green(checks: &[Value]) -> bool {
     !checks.is_empty()
         && checks.iter().all(|check| {
+            if check.get("status").and_then(Value::as_str) != Some("completed") {
+                return false;
+            }
             let conclusion = check.get("conclusion");
             let state = match conclusion {
                 Some(Value::Null | Value::Bool(false)) | None => check.get("state"),
@@ -792,6 +842,19 @@ fn completed_green(checks: &[Value]) -> bool {
                 .to_ascii_uppercase();
             matches!(state.as_str(), "SUCCESS" | "NEUTRAL" | "SKIPPED")
         })
+}
+
+fn candidate_checks_green(
+    check_runs: &[Value],
+    status_count: u64,
+    status_state: Option<&str>,
+) -> bool {
+    let has_check_runs = !check_runs.is_empty();
+    let has_statuses = status_count > 0;
+    let check_runs_green = !has_check_runs || completed_green(check_runs);
+    let statuses_green = !has_statuses || status_state == Some("success");
+
+    (has_check_runs || has_statuses) && check_runs_green && statuses_green
 }
 
 fn jq_text(value: Option<&Value>) -> String {
