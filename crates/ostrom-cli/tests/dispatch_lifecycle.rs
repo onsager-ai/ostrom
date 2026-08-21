@@ -116,9 +116,6 @@ impl DispatchFixture {
             .env("MANDATE_GH_AS_BIN", &self.gh_as)
             .env("MANDATE_SYSTEMD_RUN_BIN", &self.systemd_run)
             .env("MANDATE_OSTROM_BIN", env!("CARGO_BIN_EXE_ostrom"))
-            .env("MANDATE_NOW_EPOCH", "1785538800")
-            .env("MANDATE_LEASE_NOW_EPOCH", "1785538800")
-            .env("MANDATE_TRACE_TIME", "2026-08-01T00:00:00Z")
             .env("CODEX_BIN", &self.codex)
             .env("FAKE_SYSTEMD_ARGS", &self.systemd_args);
         if explicit_config {

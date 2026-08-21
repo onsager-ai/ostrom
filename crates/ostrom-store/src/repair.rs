@@ -2,16 +2,14 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::{Command, Output},
-    time::SystemTime,
 };
 
-use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 
 use crate::{
-    OstromPaths, TraceAppend,
+    Clock, OstromPaths, TraceAppend,
     app_token::{
         AuthenticatedCommandError, GitHubInstallationTokenMinter, InstallationTokenMinter,
         ScopedAppTokenRequest, authenticated_output,
@@ -31,6 +29,7 @@ pub struct RepairOptions {
     pub paths: OstromPaths,
     pub working_directory: PathBuf,
     pub lease_owner: String,
+    pub clock: Clock,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -702,7 +701,7 @@ impl RepairContext<'_> {
         append_trace(
             &self.options.paths.trace_file(),
             &TraceAppend {
-                ts: trace_time(),
+                ts: self.options.clock.timestamp(),
                 kind: "pr-repair".to_owned(),
                 fact,
                 narration: narration.as_object().cloned().unwrap_or_default(),
@@ -845,17 +844,6 @@ fn command_exists(name: &str) -> bool {
             candidate.is_file()
         })
     })
-}
-
-fn trace_time() -> String {
-    env::var("MANDATE_TRACE_TIME")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| {
-            DateTime::<Utc>::from(SystemTime::now())
-                .format("%Y-%m-%dT%H:%M:%SZ")
-                .to_string()
-        })
 }
 
 fn exit_code(output: &Output) -> i32 {

@@ -28,16 +28,23 @@ fn queue_verbs_match_recorded_shell_bytes_and_unknown_ids_refuse() {
         if matches!(verb, "approve" | "reject" | "defer") {
             command.arg("placeholder-org/alpha#11");
         }
-        if verb == "reject" {
-            command.env("MANDATE_EVENT_TIME", "2026-08-17T00:00:00Z");
-        }
         let output = command.output().expect("run queue verb");
         assert_success(&output);
-        assert_eq!(output.stdout, fixture(expected));
+        if verb == "reject" {
+            assert_eq!(
+                normalize_timestamp(&output.stdout, "2026-08-17T00:00:00Z"),
+                fixture(expected)
+            );
+        } else {
+            assert_eq!(output.stdout, fixture(expected));
+        }
         assert!(output.stderr.is_empty());
         if verb == "reject" {
             assert_eq!(
-                fs::read(home.path().join("selector-events.jsonl")).unwrap(),
+                normalize_timestamp(
+                    &fs::read(home.path().join("selector-events.jsonl")).unwrap(),
+                    "2026-08-17T00:00:00Z",
+                ),
                 fixture("queue.reject-event.expected.jsonl")
             );
         }
@@ -61,7 +68,6 @@ fn queue_verbs_match_recorded_shell_bytes_and_unknown_ids_refuse() {
 fn trace_verbs_match_shell_records_and_keep_narration_separate() {
     let home = tempdir().expect("trace home");
     let append = ostrom(home.path())
-        .env("MANDATE_TRACE_TIME", "2026-08-17T01:02:03Z")
         .args([
             "trace",
             "append",
@@ -73,9 +79,15 @@ fn trace_verbs_match_shell_records_and_keep_narration_separate() {
         .expect("append trace");
     assert_success(&append);
     let expected = fixture("trace.append.expected.jsonl");
-    assert_eq!(append.stdout, expected);
     assert_eq!(
-        fs::read(home.path().join("sprint.jsonl")).unwrap(),
+        normalize_timestamp(&append.stdout, "2026-08-17T01:02:03Z"),
+        expected
+    );
+    assert_eq!(
+        normalize_timestamp(
+            &fs::read(home.path().join("sprint.jsonl")).unwrap(),
+            "2026-08-17T01:02:03Z",
+        ),
         expected
     );
 
@@ -84,7 +96,10 @@ fn trace_verbs_match_shell_records_and_keep_narration_separate() {
         .output()
         .expect("read facts");
     assert_success(&facts);
-    assert_eq!(facts.stdout, fixture("trace.read.expected.jsonl"));
+    assert_eq!(
+        normalize_timestamp(&facts.stdout, "2026-08-17T01:02:03Z"),
+        fixture("trace.read.expected.jsonl")
+    );
     assert!(!String::from_utf8_lossy(&facts.stdout).contains("narration"));
 
     let narration = ostrom(home.path())
@@ -93,7 +108,7 @@ fn trace_verbs_match_shell_records_and_keep_narration_separate() {
         .expect("read narration");
     assert_success(&narration);
     assert_eq!(
-        narration.stdout,
+        normalize_timestamp(&narration.stdout, "2026-08-17T01:02:03Z"),
         fixture("trace.read-narration.expected.jsonl")
     );
     assert!(!String::from_utf8_lossy(&narration.stdout).contains("\"fact\""));
@@ -137,7 +152,6 @@ fn exactly_one_real_process_acquires_a_named_lease() {
         children.push(
             ostrom(home.path())
                 .env("MANDATE_LEASE_NAME", "builder.lease")
-                .env("MANDATE_LEASE_NOW_EPOCH", "100")
                 .args([
                     "lease",
                     "acquire",
@@ -172,23 +186,27 @@ fn lease_verbs_match_shell_and_release_is_role_isolated() {
     let home = tempdir().expect("lease home");
     let acquire = ostrom(home.path())
         .env("MANDATE_LEASE_NAME", "builder.lease")
-        .env("MANDATE_LEASE_NOW_EPOCH", "100")
         .args(["lease", "acquire", "placeholder-owner", "60"])
         .output()
         .expect("acquire lease");
     assert_success(&acquire);
-    assert_eq!(acquire.stdout, fixture("lease.acquire.expected.jsonl"));
+    assert_eq!(
+        normalize_lease(&acquire.stdout),
+        fixture("lease.acquire.expected.jsonl")
+    );
     let status = ostrom(home.path())
         .env("MANDATE_LEASE_NAME", "builder.lease")
         .args(["lease", "status"])
         .output()
         .expect("lease status");
     assert_success(&status);
-    assert_eq!(status.stdout, fixture("lease.status.expected.jsonl"));
+    assert_eq!(
+        normalize_lease(&status.stdout),
+        fixture("lease.status.expected.jsonl")
+    );
 
     let held = ostrom(home.path())
         .env("MANDATE_LEASE_NAME", "builder.lease")
-        .env("MANDATE_LEASE_NOW_EPOCH", "120")
         .args(["lease", "acquire", "other-placeholder-owner", "60"])
         .output()
         .expect("held lease refuses another owner");
@@ -208,7 +226,6 @@ fn lease_verbs_match_shell_and_release_is_role_isolated() {
 
     let gatekeeper = ostrom(home.path())
         .env("MANDATE_LEASE_NAME", "gatekeeper.lease")
-        .env("MANDATE_LEASE_NOW_EPOCH", "100")
         .args(["lease", "acquire", "placeholder-gatekeeper", "60"])
         .output()
         .expect("acquire other role");
@@ -252,7 +269,6 @@ fn work_order_verbs_match_shell_fixtures_and_validate_bash_era_orders() {
     assert!(validate.stdout.is_empty() && validate.stderr.is_empty());
 
     let create = ostrom(home.path())
-        .env("MANDATE_TRACE_TIME", "2026-08-17T01:02:03Z")
         .env("MANDATE_ORDER_COST_CEILING_USD", "12.5")
         .env("MANDATE_ORDER_TOKEN_CEILING", "12345")
         .args([
@@ -322,6 +338,29 @@ fn fixture(name: &str) -> Vec<u8> {
 
 fn fixture_path(name: &str) -> PathBuf {
     Path::new(FIXTURES).join(name)
+}
+
+fn normalize_timestamp(bytes: &[u8], timestamp: &str) -> Vec<u8> {
+    let mut value: serde_json::Value = serde_json::from_slice(bytes).expect("parse JSONL row");
+    if let Some(slot) = value.get_mut("ts") {
+        *slot = serde_json::Value::String(timestamp.to_owned());
+    }
+    serde_json::to_vec(&value)
+        .expect("serialize normalized JSONL row")
+        .into_iter()
+        .chain([b'\n'])
+        .collect()
+}
+
+fn normalize_lease(bytes: &[u8]) -> Vec<u8> {
+    let mut value: serde_json::Value = serde_json::from_slice(bytes).expect("parse lease row");
+    value["started_at"] = 100.into();
+    value["expires_at"] = 160.into();
+    serde_json::to_vec(&value)
+        .expect("serialize normalized lease row")
+        .into_iter()
+        .chain([b'\n'])
+        .collect()
 }
 
 fn assert_success(output: &Output) {

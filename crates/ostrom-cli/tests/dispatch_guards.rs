@@ -5,15 +5,16 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Command, Output},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
+use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
 const ITEM_ID: &str = "example-org/example-repo#123";
 const BRANCH: &str = "ostrom/123-placeholder";
 const ORDER_ID: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-const NOW: &str = "1785542400";
 
 struct Fixture {
     root: TempDir,
@@ -25,6 +26,7 @@ struct Fixture {
     codex: PathBuf,
     node: PathBuf,
     calls: PathBuf,
+    now: u64,
 }
 
 impl Fixture {
@@ -143,6 +145,10 @@ exit 97
             codex,
             node,
             calls: PathBuf::new(),
+            now: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("current epoch")
+                .as_secs(),
         }
         .with_calls()
     }
@@ -176,13 +182,19 @@ exit 97
             .env("MANDATE_SYSTEMD_RUN_BIN", &self.systemd)
             .env("MANDATE_OSTROM_BIN", env!("CARGO_BIN_EXE_ostrom"))
             .env("CODEX_BIN", &self.codex)
-            .env("MANDATE_NOW_EPOCH", NOW)
-            .env("MANDATE_TODAY", "2026-08-01")
-            .env("MANDATE_SWEEP_TIME", "2026-08-01T00:00:00Z")
-            .env("MANDATE_LEASE_NOW_EPOCH", NOW)
-            .env("MANDATE_TRACE_TIME", "2026-08-01T00:00:00Z")
             .env("OSTROM_TEST_SYSTEMD_CALLS", &self.calls);
         command
+    }
+
+    fn timestamp(&self) -> String {
+        DateTime::<Utc>::from_timestamp(i64::try_from(self.now).expect("epoch fits i64"), 0)
+            .expect("valid current epoch")
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string()
+    }
+
+    fn today(&self) -> String {
+        self.timestamp()[..10].to_owned()
     }
 
     fn trace(&self) -> Vec<Value> {
@@ -489,33 +501,40 @@ fn closing_pull_request_query_failures_fail_closed_before_reservation() {
 
 #[test]
 fn duplicate_and_concurrency_guards_release_the_new_item_lease() {
-    let base_trace = |item: &str, order: &str| {
+    let base_trace = |timestamp: &str, item: &str, order: &str| {
         format!(
-            "{{\"ts\":\"2026-08-01T00:00:00Z\",\"kind\":\"work-dispatched\",\"fact\":{{\"item_id\":{item:?},\"order_id\":{order:?},\"unit_name\":\"ostrom-implementer-placeholder\",\"cost_ceiling_usd\":20,\"token_ceiling\":500000}},\"narration\":{{}}}}\n"
+            "{{\"ts\":{timestamp:?},\"kind\":\"work-dispatched\",\"fact\":{{\"item_id\":{item:?},\"order_id\":{order:?},\"unit_name\":\"ostrom-implementer-placeholder\",\"cost_ceiling_usd\":20,\"token_ceiling\":500000}},\"narration\":{{}}}}\n"
         )
     };
-    for (trace, extra, code, message) in [
+    for (items, extra, code, message) in [
         (
-            base_trace(ITEM_ID, "older-order"),
+            vec![(ITEM_ID, "older-order")],
             None,
             3,
             "earlier work-dispatched row",
         ),
         (
-            base_trace("example-org/other-repo#1", "other-one")
-                + &base_trace("example-org/other-repo#2", "other-two"),
+            vec![
+                ("example-org/other-repo#1", "other-one"),
+                ("example-org/other-repo#2", "other-two"),
+            ],
             None,
             3,
             "concurrency limit reached (2/2)",
         ),
         (
-            base_trace("example-org/example-repo#9", "same-repo"),
+            vec![("example-org/example-repo#9", "same-repo")],
             Some(("MANDATE_MAX_IMPLEMENTERS", "6")),
             3,
             "per-repository concurrency limit reached",
         ),
     ] {
         let fixture = Fixture::new();
+        let timestamp = fixture.timestamp();
+        let trace = items
+            .into_iter()
+            .map(|(item, order)| base_trace(&timestamp, item, order))
+            .collect::<String>();
         fs::write(fixture.state.join("sprint.jsonl"), trace).expect("write in-flight trace");
         let mut command = fixture.command();
         command.env("OSTROM_TEST_BRANCH_PAGE_1", default_page());
@@ -605,8 +624,9 @@ fn a_live_item_lease_refuses_without_replacing_or_releasing_it() {
     let fixture = Fixture::new();
     let lease = fixture.lease();
     let contents = format!(
-        "{{\"owner\":\"placeholder-holder\",\"started_at\":{},\"expires_at\":1785546000}}\n",
-        NOW
+        "{{\"owner\":\"placeholder-holder\",\"started_at\":{},\"expires_at\":{}}}\n",
+        fixture.now,
+        fixture.now + 3_600,
     );
     fs::write(&lease, &contents).expect("write live item lease");
     let output = run(fixture
@@ -628,7 +648,8 @@ fn repository_concurrency_overrides_and_other_repositories_leave_room() {
         fs::write(
             fixture.state.join("sprint.jsonl"),
             format!(
-                "{{\"ts\":\"2026-08-01T00:00:00Z\",\"kind\":\"work-dispatched\",\"fact\":{{\"item_id\":{item:?},\"order_id\":\"prior\",\"unit_name\":\"ostrom-implementer-prior\",\"cost_ceiling_usd\":1,\"token_ceiling\":1000}},\"narration\":{{}}}}\n"
+                "{{\"ts\":{:?},\"kind\":\"work-dispatched\",\"fact\":{{\"item_id\":{item:?},\"order_id\":\"prior\",\"unit_name\":\"ostrom-implementer-prior\",\"cost_ceiling_usd\":1,\"token_ceiling\":1000}},\"narration\":{{}}}}\n",
+                fixture.timestamp(),
             ),
         )
         .expect("write concurrency trace");
@@ -665,7 +686,10 @@ fn projected_daily_spend_refuses_before_launch_and_releases_the_lease() {
     let fixture = Fixture::new();
     fs::write(
         fixture.state.join("sprint.jsonl"),
-        "{\"ts\":\"2026-08-01T00:00:00Z\",\"kind\":\"pass-ended\",\"fact\":{\"cost_usd\":31},\"narration\":{}}\n",
+        format!(
+            "{{\"ts\":\"{}T00:00:00Z\",\"kind\":\"pass-ended\",\"fact\":{{\"cost_usd\":31}},\"narration\":{{}}}}\n",
+            fixture.today()
+        ),
     )
     .expect("write spend trace");
     let output = run(fixture

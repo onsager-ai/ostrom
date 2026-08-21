@@ -7,16 +7,16 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
-use chrono::{DateTime, Utc};
+use chrono::DateTime;
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 
 use crate::{
-    LeaseActionError, OstromPaths, OwnedLease, PassState, TraceAppend, append_trace, read_lease,
-    read_pass_state, read_trace, write_pass_state,
+    Clock, LeaseActionError, OstromPaths, OwnedLease, PassState, TraceAppend, append_trace,
+    read_lease, read_pass_state, read_trace, write_pass_state,
 };
 
 const MAX_TURNS: &str = "200";
@@ -67,6 +67,7 @@ pub struct PassRequest {
     pub claude_bin: PathBuf,
     pub signals: SignalFlags,
     pub supervisor_pid: Option<u32>,
+    pub clock: Clock,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -149,6 +150,7 @@ struct PassGuard {
     outcome: Option<String>,
     reason: Option<String>,
     cost_usd: Option<f64>,
+    clock: Clock,
 }
 
 impl PassGuard {
@@ -162,7 +164,7 @@ impl PassGuard {
                     "completed".to_owned()
                 }
             });
-            let now = wall_epoch_seconds();
+            let now = self.clock.epoch_seconds();
             let mut fact = Map::new();
             fact.insert("owner".to_owned(), json!(self.owner));
             fact.insert("outcome".to_owned(), json!(outcome));
@@ -170,16 +172,11 @@ impl PassGuard {
                 "cost_usd".to_owned(),
                 self.cost_usd.map_or(Value::Null, |cost| json!(cost)),
             );
-            // A pinned trace clock pins the duration too. `MANDATE_TRACE_TIME`
-            // exists so a run's recorded output is reproducible, and a wall-clock
-            // duration defeats that: the recorded-parity fixture compares the
-            // trace byte for byte, so the same pass emitted 0 on an idle machine
-            // and 1 under CI load, failing intermittently and for no real reason.
-            // Under a pinned clock no time passes, which is the honest reading of
-            // "the clock is fixed" rather than a special case for tests.
+            // A fixed injected clock pins the duration too. Production passes use
+            // a realtime clock; deterministic callers can inject a fixed instant.
             fact.insert(
                 "duration_seconds".to_owned(),
-                json!(if pinned_trace_time().is_some() {
+                json!(if self.clock.is_fixed() {
                     0
                 } else {
                     now.saturating_sub(self.started_epoch)
@@ -234,15 +231,15 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
             1,
         )
     })?;
-    let lease_now = lease_epoch_seconds();
-    let started_epoch = wall_epoch_seconds();
+    let lease_now = request.clock.epoch_seconds();
+    let started_epoch = request.clock.epoch_seconds();
     let lease_name = format!("{}-pass.lease", request.role.name());
     let ttl = positive_env("MANDATE_LEASE_TTL_SECONDS").unwrap_or(DEFAULT_LEASE_TTL_SECONDS);
 
     let prior = read_pass_state(&request.paths.state, request.role.name())
         .map_err(|error| PassError::failed(request.role, error.to_string(), 1))?;
     let mut state = prior.unwrap_or_else(|| PassState {
-        role_id: generated_role_id(),
+        role_id: generated_role_id(&request.clock),
         wake: 0,
     });
     let next_wake = state.wake.saturating_add(1);
@@ -271,7 +268,7 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
     write_pass_state(&request.paths.state, request.role.name(), &state)
         .map_err(|error| PassError::failed(request.role, error.to_string(), 1))?;
 
-    let trace_time = pass_trace_time();
+    let trace_time = request.clock.timestamp();
     let mut guard = PassGuard {
         role: request.role,
         paths: request.paths.clone(),
@@ -284,6 +281,7 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
         outcome: None,
         reason: None,
         cost_usd: None,
+        clock: request.clock.clone(),
     };
     append_trace(
         &request.paths.trace_file(),
@@ -332,7 +330,7 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
             1,
         ));
     }
-    if daily_spend(&request.paths, &pass_day()) >= daily_cap() {
+    if daily_spend(&request.paths, &request.clock.date()) >= daily_cap() {
         guard.outcome = Some("no-op".to_owned());
         guard.reason = Some("daily-cap".to_owned());
         guard.finish()?;
@@ -353,7 +351,7 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
     })?;
     let log = run_dir.join(format!(
         "{}-{owner}.jsonl",
-        current_time().format("%Y%m%dT%H%M%SZ")
+        request.clock.now().format("%Y%m%dT%H%M%SZ")
     ));
     let output = fs::File::create(&log).map_err(|error| {
         PassError::failed(
@@ -429,7 +427,7 @@ fn validate_arm(request: &PassRequest) -> Result<(), PassError> {
     }
     let expiry = DateTime::parse_from_rfc3339(value)
         .map_err(|_| PassError::Disarmed(request.role.name()))?;
-    if expiry.timestamp() <= wall_epoch_seconds() as i64 {
+    if expiry.timestamp() <= request.clock.epoch_seconds() as i64 {
         return Err(PassError::Disarmed(request.role.name()));
     }
     Ok(())
@@ -650,10 +648,6 @@ fn daily_spend(paths: &OstromPaths, day: &str) -> f64 {
         .unwrap_or_default()
 }
 
-fn pass_day() -> String {
-    current_time().format("%Y-%m-%d").to_string()
-}
-
 fn daily_cap() -> f64 {
     env::var("MANDATE_DAILY_CAP_USD")
         .ok()
@@ -707,61 +701,9 @@ fn prune_transcripts(directory: &Path) {
     }
 }
 
-/// The pinned trace instant, if one is set. Empty means unset, matching the
-/// shell's `${VAR:-default}` semantics used everywhere else in this crate.
-fn pinned_trace_time() -> Option<String> {
-    env::var("MANDATE_TRACE_TIME")
-        .ok()
-        .filter(|value| !value.is_empty())
-}
-
-fn pass_trace_time() -> String {
-    if let Ok(value) = env::var("MANDATE_TRACE_TIME") {
-        if !value.is_empty() {
-            return value;
-        }
-    }
-    current_time().format("%Y-%m-%dT%H:%M:%SZ").to_string()
-}
-
-fn current_time() -> DateTime<Utc> {
-    env::var("MANDATE_NOW_EPOCH")
-        .ok()
-        .and_then(|value| value.parse::<i64>().ok())
-        .and_then(|value| DateTime::<Utc>::from_timestamp(value, 0))
-        .unwrap_or_else(|| DateTime::<Utc>::from(SystemTime::now()))
-}
-
-fn generated_role_id() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos();
+fn generated_role_id(clock: &Clock) -> String {
+    let nanos = clock.now().timestamp_subsec_nanos();
     format!("{:08x}", nanos ^ std::process::id())
-}
-
-fn lease_epoch_seconds() -> u64 {
-    env::var("MANDATE_LEASE_NOW_EPOCH")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or_else(|| {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs()
-        })
-}
-
-fn wall_epoch_seconds() -> u64 {
-    env::var("MANDATE_NOW_EPOCH")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or_else(|| {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs()
-        })
 }
 
 fn positive_env(name: &str) -> Option<u64> {

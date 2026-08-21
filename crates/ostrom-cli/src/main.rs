@@ -6,7 +6,7 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use chrono::{DateTime, Utc};
@@ -22,7 +22,7 @@ use ostrom_core::{
     ResolvedCheck,
 };
 use ostrom_store::{
-    AssessmentHarness, AuditOptions, DigestOptions, DispatchOutcome, DispatchRequest,
+    AssessmentHarness, AuditOptions, Clock, DigestOptions, DispatchOutcome, DispatchRequest,
     ExecutableAssessmentDeriver, GateError, GateOptions, HarnessAssessmentDeriver,
     ImplementRequest, JsonlCheckStore, MigrationOutcome, OstromPaths, PassRequest, PassRole,
     PlanOptions, PublishDestination, PublishTarget, QueueDecision, ReplayOptions, SelectAction,
@@ -421,6 +421,7 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    let clock = Clock::realtime();
     let paths = compatible_command_paths();
     match cli.command {
         Command::Validate {
@@ -450,7 +451,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             Err(error) => exit_message(&format!("ostrom credential: {error}"), error.exit_code()),
         },
-        Command::Doctor { check } => run_doctor_command(check)?,
+        Command::Doctor { check } => run_doctor_command(check, &clock)?,
         Command::Check {
             command: CheckCommand::Run,
         } => {
@@ -466,12 +467,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .into());
             }
-            let outcome = execute_prepared_checks(
-                &paths,
-                &resolutions,
-                CriteriaSelection::All,
-                DateTime::<Utc>::from(SystemTime::now()),
-            )?;
+            let outcome =
+                execute_prepared_checks(&paths, &resolutions, CriteriaSelection::All, clock.now())?;
             println!(
                 "ostrom check run: {} passed; {} failed; {} inconclusive; {} faulted; wrote {}",
                 outcome.passed,
@@ -555,6 +552,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 paths,
                 working_directory: env::current_dir()?,
                 lease_owner: builder_lease_owner[0].clone(),
+                clock: clock.clone(),
             }) {
                 Ok(output) => output,
                 Err(error) => {
@@ -581,14 +579,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let output = render_digest(&DigestOptions {
                     paths,
                     working_directory: env::current_dir().unwrap_or_default(),
+                    clock: clock.clone(),
                 });
                 io::stdout().write_all(output.stdout.as_bytes())?;
                 io::stderr().write_all(output.stderr.as_bytes())?;
             }
         },
-        Command::Pass { role } => {
-            supervise(&["__pass-worker".into(), role_name(role).into()], None)
-        }
+        Command::Pass { role } => supervise(
+            &["__pass-worker".into(), role_name(role).into()],
+            None,
+            &clock,
+        ),
         Command::Implement {
             work_order_file,
             unit_name,
@@ -598,22 +599,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 work_order_file.clone().into_os_string(),
                 unit_name.clone().into(),
             ];
-            supervise(&arguments, Some((&work_order_file, &unit_name)))
+            supervise(&arguments, Some((&work_order_file, &unit_name)), &clock)
         }
         Command::PassWorker {
             role,
             supervisor_pid,
-        } => run_pass_worker(role, supervisor_pid),
+        } => run_pass_worker(role, supervisor_pid, clock),
         Command::ImplementWorker {
             work_order_file,
             unit_name,
             supervisor_pid,
-        } => run_implement_worker(work_order_file, unit_name, supervisor_pid),
+        } => run_implement_worker(work_order_file, unit_name, supervisor_pid, clock),
         Command::Dispatch { arguments } => {
-            run_dispatch_command(arguments);
+            run_dispatch_command(arguments, clock);
         }
         Command::SelectWork { arguments } => {
-            run_select_work(arguments);
+            run_select_work(arguments, clock);
         }
         Command::Gate { target } => {
             if target.len() != 1 {
@@ -621,19 +622,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("{error}");
                 std::process::exit(error.exit_code());
             }
-            let timestamp = env::var("MANDATE_GATE_TIME")
-                .ok()
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| {
-                    DateTime::<Utc>::from(SystemTime::now())
-                        .format("%Y-%m-%dT%H:%M:%SZ")
-                        .to_string()
-                });
             let output = match run_gate(&GateOptions {
                 paths,
                 working_directory: env::current_dir()?,
                 target: target[0].clone(),
-                timestamp,
+                timestamp: clock.timestamp(),
             }) {
                 Ok(output) => output,
                 Err(error) => {
@@ -670,10 +663,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 Err(error) => exit_message(&error.to_string(), error.exit_code()),
             },
             QueueCommand::Approve { id } => {
-                run_queue_decision(&paths, &id, QueueDecision::Approve)?
+                run_queue_decision(&paths, &id, QueueDecision::Approve, &clock)?
             }
-            QueueCommand::Reject { id } => run_queue_decision(&paths, &id, QueueDecision::Reject)?,
-            QueueCommand::Defer { id } => run_queue_decision(&paths, &id, QueueDecision::Defer)?,
+            QueueCommand::Reject { id } => {
+                run_queue_decision(&paths, &id, QueueDecision::Reject, &clock)?
+            }
+            QueueCommand::Defer { id } => {
+                run_queue_decision(&paths, &id, QueueDecision::Defer, &clock)?
+            }
         },
         Command::Trace { command } => match command {
             TraceCommand::Append {
@@ -690,16 +687,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let narration = parse_json_object(&narration_json).unwrap_or_else(|| {
                     exit_message("mandate trace: narration-json must be a JSON object", 2)
                 });
-                let timestamp = env::var("MANDATE_TRACE_TIME")
-                    .ok()
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or_else(|| {
-                        DateTime::<Utc>::from(SystemTime::now())
-                            .format("%Y-%m-%dT%H:%M:%SZ")
-                            .to_string()
-                    });
                 let record = TraceAppend {
-                    ts: timestamp,
+                    ts: clock.timestamp(),
                     kind,
                     fact,
                     narration,
@@ -720,12 +709,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         },
-        Command::Lease { command } => run_lease_command(&paths, command)?,
-        Command::WorkOrder { command } => run_work_order_command(&paths, command)?,
+        Command::Lease { command } => run_lease_command(&paths, command, &clock)?,
+        Command::WorkOrder { command } => run_work_order_command(&paths, command, &clock)?,
         Command::Migrate => {
             let legacy = legacy_home()?;
-            let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-            match migrate(&legacy, &paths, now)? {
+            match migrate(&legacy, &paths, clock.epoch_seconds())? {
                 MigrationOutcome::Migrated => println!(
                     "migrated Ostrom config to {} and state to {}; legacy pointer retained at {}",
                     paths.config.display(),
@@ -748,7 +736,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     recorded_queue,
                 },
         } => {
-            let started_at = resolve_started_at(started_at.as_deref())?;
+            let started_at = resolve_started_at(started_at.as_deref(), &clock)?;
             let cwd = env::current_dir()?;
             let executable = env::current_exe()?;
             let plugin_root = env::var_os("OSTROM_PLUGIN_ROOT")
@@ -786,7 +774,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             inner_org,
             started_at,
         } => {
-            let started_at = resolve_started_at(started_at.as_deref())?;
+            let started_at = resolve_started_at(started_at.as_deref(), &clock)?;
             if let Some(org) = inner_org {
                 let cwd = env::current_dir()?;
                 let snapshots =
@@ -835,7 +823,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             fixture,
             started_at,
         } => {
-            let started_at = resolve_started_at(started_at.as_deref())?;
+            let started_at = resolve_started_at(started_at.as_deref(), &clock)?;
             let cwd = env::current_dir()?;
             let executable = env::current_exe()?;
             let plugin_root = env::var_os("OSTROM_PLUGIN_ROOT")
@@ -874,16 +862,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         Command::Audit { days } => {
-            let audit_time = environment_time("MANDATE_AUDIT_TIME").unwrap_or_else(|message| {
-                eprintln!("mandate audit: {message}");
-                std::process::exit(2);
-            });
             let working_directory = env::current_dir()?;
             match audit(&AuditOptions {
                 paths,
                 working_directory,
                 days,
-                audit_time,
+                audit_time: clock.now(),
             }) {
                 Ok(output) => io::stdout().write_all(output.as_bytes())?,
                 Err(error) => {
@@ -893,16 +877,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Command::Replay { days } => {
-            let replay_time = environment_time("MANDATE_REPLAY_TIME").unwrap_or_else(|message| {
-                eprintln!("mandate replay: {message}");
-                std::process::exit(2);
-            });
             let working_directory = env::current_dir()?;
             match replay(&ReplayOptions {
                 paths,
                 working_directory,
                 days,
-                replay_time,
+                replay_time: clock.now(),
             }) {
                 Ok(output) => io::stdout().write_all(output.as_bytes())?,
                 Err(error) => {
@@ -916,20 +896,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 target,
                 condition,
                 reason,
-            } => {
-                let timestamp =
-                    optional_environment_time("MANDATE_EXCUSE_TIME").unwrap_or_else(|message| {
-                        eprintln!("mandate excuse: {message}");
-                        std::process::exit(3);
-                    });
-                match grant_excuse(&paths, &target, &condition, &reason, timestamp) {
-                    Ok(output) => io::stdout().write_all(output.as_bytes())?,
-                    Err(error) => {
-                        eprintln!("{error}");
-                        std::process::exit(error.exit_code());
-                    }
+            } => match grant_excuse(&paths, &target, &condition, &reason, Some(clock.now())) {
+                Ok(output) => io::stdout().write_all(output.as_bytes())?,
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::exit(error.exit_code());
                 }
-            }
+            },
             ExcuseCommand::List { target } => match list_excuses(&paths, target.as_deref()) {
                 Ok(output) => io::stdout().write_all(output.as_bytes())?,
                 Err(error) => {
@@ -956,17 +929,16 @@ fn run_queue_decision(
     paths: &OstromPaths,
     id: &str,
     decision: QueueDecision,
+    clock: &Clock,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let event_time = env::var("MANDATE_EVENT_TIME")
-        .ok()
-        .filter(|value| !value.is_empty());
+    let event_time = clock.timestamp();
     match decide_queue_item(
         &paths.queue_file(),
         &paths.sweep_state_file(),
         &paths.selector_events_file(),
         id,
         decision,
-        event_time.as_deref(),
+        Some(&event_time),
     ) {
         Ok(output) => io::stdout().write_all(&output)?,
         Err(error) => exit_message(&error.to_string(), error.exit_code()),
@@ -984,6 +956,7 @@ fn parse_json_object(text: &str) -> Option<serde_json::Map<String, serde_json::V
 fn run_lease_command(
     paths: &OstromPaths,
     command: LeaseCommand,
+    clock: &Clock,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let name = env::var("MANDATE_LEASE_NAME")
         .ok()
@@ -1009,19 +982,7 @@ fn run_lease_command(
                 .unwrap_or_else(|| {
                     exit_message("mandate lease: ttl-seconds must be a positive integer", 2)
                 });
-            let now_text = env::var("MANDATE_LEASE_NOW_EPOCH")
-                .ok()
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| {
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map_or(0, |duration| duration.as_secs())
-                        .to_string()
-                });
-            let now = parse_decimal_u64(&now_text).unwrap_or_else(|| {
-                exit_message("mandate lease: current time must be Unix seconds", 2)
-            });
-            match acquire_lease(&paths.state, &name, &owner, now, ttl) {
+            match acquire_lease(&paths.state, &name, &owner, clock.epoch_seconds(), ttl) {
                 Ok(output) => io::stdout().write_all(&output)?,
                 Err(error) => exit_message(&error.to_string(), error.exit_code()),
             }
@@ -1058,14 +1019,12 @@ fn lease_usage() -> ! {
 fn run_work_order_command(
     paths: &OstromPaths,
     command: WorkOrderCommand,
+    clock: &Clock,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         WorkOrderCommand::Create {
             candidate_json_file,
         } => {
-            let created_at = env::var("MANDATE_TRACE_TIME")
-                .ok()
-                .filter(|value| !value.is_empty());
             let cost = env::var("MANDATE_ORDER_COST_CEILING_USD")
                 .ok()
                 .filter(|value| !value.is_empty());
@@ -1075,7 +1034,7 @@ fn run_work_order_command(
             match create_work_order(
                 &paths.state,
                 &candidate_json_file,
-                created_at.as_deref(),
+                clock,
                 cost.as_deref(),
                 tokens.as_deref(),
             ) {
@@ -1109,7 +1068,7 @@ fn run_work_order_command(
             if identifier.is_empty() {
                 work_order_usage();
             }
-            match clear_work_order(&paths.state, &identifier) {
+            match clear_work_order(&paths.state, &identifier, clock) {
                 Ok(cleared) => println!("{} {}", cleared.order_id, cleared.item_id),
                 Err(error) => exit_message(&error.to_string(), error.exit_code()),
             }
@@ -1157,7 +1116,7 @@ fn register_signals() -> io::Result<SignalFlags> {
     Ok(SignalFlags::default())
 }
 
-fn supervise(arguments: &[OsString], implementer: Option<(&Path, &str)>) -> ! {
+fn supervise(arguments: &[OsString], implementer: Option<(&Path, &str)>, clock: &Clock) -> ! {
     let signals = register_signals().unwrap_or_else(|error| {
         eprintln!("ostrom: could not install signal handlers: {error}");
         std::process::exit(1);
@@ -1185,6 +1144,7 @@ fn supervise(arguments: &[OsString], implementer: Option<(&Path, &str)>) -> ! {
                         unit_name,
                         status.code(),
                         signal,
+                        clock,
                     ) {
                         eprintln!("{error}");
                         std::process::exit(1);
@@ -1224,7 +1184,7 @@ fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
     None
 }
 
-fn run_pass_worker(role: CliPassRole, supervisor_pid: u32) -> ! {
+fn run_pass_worker(role: CliPassRole, supervisor_pid: u32, clock: Clock) -> ! {
     let signals = register_signals().unwrap_or_else(|error| {
         eprintln!("ostrom: could not install signal handlers: {error}");
         std::process::exit(1);
@@ -1244,6 +1204,7 @@ fn run_pass_worker(role: CliPassRole, supervisor_pid: u32) -> ! {
         claude_bin,
         signals,
         supervisor_pid: Some(supervisor_pid),
+        clock,
     };
     match run_pass(&request) {
         Ok(()) => std::process::exit(0),
@@ -1256,7 +1217,12 @@ fn run_pass_worker(role: CliPassRole, supervisor_pid: u32) -> ! {
     }
 }
 
-fn run_implement_worker(work_order_file: PathBuf, unit_name: String, supervisor_pid: u32) -> ! {
+fn run_implement_worker(
+    work_order_file: PathBuf,
+    unit_name: String,
+    supervisor_pid: u32,
+    clock: Clock,
+) -> ! {
     let signals = register_signals().unwrap_or_else(|error| {
         eprintln!("ostrom: could not install signal handlers: {error}");
         std::process::exit(1);
@@ -1276,6 +1242,7 @@ fn run_implement_worker(work_order_file: PathBuf, unit_name: String, supervisor_
         unit_name,
         signals,
         supervisor_pid: Some(supervisor_pid),
+        clock,
     };
     match run_implement(&request) {
         Ok(url) => {
@@ -1289,24 +1256,7 @@ fn run_implement_worker(work_order_file: PathBuf, unit_name: String, supervisor_
     }
 }
 
-fn environment_time(name: &str) -> Result<DateTime<Utc>, String> {
-    optional_environment_time(name)
-        .map(|value| value.unwrap_or_else(|| DateTime::<Utc>::from(SystemTime::now())))
-}
-
-fn optional_environment_time(name: &str) -> Result<Option<DateTime<Utc>>, String> {
-    env::var(name)
-        .ok()
-        .filter(|value| !value.is_empty())
-        .map(|value| {
-            DateTime::parse_from_rfc3339(&value)
-                .map(|parsed| parsed.with_timezone(&Utc))
-                .map_err(|_| format!("{name} must be an RFC 3339 timestamp"))
-        })
-        .transpose()
-}
-
-fn run_dispatch_command(arguments: Vec<String>) -> ! {
+fn run_dispatch_command(arguments: Vec<String>, clock: Clock) -> ! {
     let [order_file] = arguments.as_slice() else {
         eprintln!("usage: dispatch.sh <work-order-file>");
         std::process::exit(2);
@@ -1323,6 +1273,7 @@ fn run_dispatch_command(arguments: Vec<String>) -> ! {
         working_directory,
         plugin_root,
         order_file: PathBuf::from(order_file),
+        clock,
     };
     match run_dispatch(&request) {
         Ok(DispatchOutcome::Started(unit)) => {
@@ -1336,7 +1287,7 @@ fn run_dispatch_command(arguments: Vec<String>) -> ! {
     }
 }
 
-fn run_select_work(arguments: Vec<String>) -> ! {
+fn run_select_work(arguments: Vec<String>, clock: Clock) -> ! {
     let usage = || {
         eprintln!("usage: select-work.sh list | select <owner> [already-attempted-id ...]");
         std::process::exit(2);
@@ -1363,6 +1314,7 @@ fn run_select_work(arguments: Vec<String>) -> ! {
             std::process::exit(1);
         }),
         action,
+        clock,
     };
     match run_selection(&request) {
         Ok((outcome, diagnostics)) => {
@@ -1398,12 +1350,15 @@ fn run_select_work(arguments: Vec<String>) -> ! {
     }
 }
 
-fn run_doctor_command(check: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+fn run_doctor_command(
+    check: Option<String>,
+    clock: &Clock,
+) -> Result<(), Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let plugin_root = env::var_os("OSTROM_PLUGIN_ROOT")
         .or_else(|| env::var_os("CLAUDE_PLUGIN_ROOT"))
         .map_or_else(|| cwd.join("plugins/ostrom"), PathBuf::from);
-    let options = DoctorOptions::from_environment(plugin_root);
+    let options = DoctorOptions::from_environment_at(plugin_root, clock.epoch_seconds());
     let output = if let Some(name) = check {
         match run_doctor_check(options, &name) {
             Ok(output) => output,
@@ -1524,7 +1479,7 @@ fn execute_prepared_checks(
         .flat_map(|run| &run.receipts)
         .cloned()
         .collect::<Vec<_>>();
-    let run_id = new_check_run_id();
+    let run_id = new_check_run_id(observed_at);
     let receipts = resolutions
         .prepared
         .iter()
@@ -1618,14 +1573,11 @@ fn execute_prepared_checks(
     })
 }
 
-fn new_check_run_id() -> CheckRunId {
-    let elapsed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
+fn new_check_run_id(observed_at: DateTime<Utc>) -> CheckRunId {
     CheckRunId(format!(
         "criteria-{}-{:09}-{}",
-        elapsed.as_secs(),
-        elapsed.subsec_nanos(),
+        observed_at.timestamp(),
+        observed_at.timestamp_subsec_nanos(),
         std::process::id()
     ))
 }
@@ -1722,23 +1674,11 @@ fn action_fault(error: &ActionFault) -> CheckFault {
     }
 }
 
-fn resolve_started_at(value: Option<&str>) -> Result<DateTime<Utc>, io::Error> {
+fn resolve_started_at(value: Option<&str>, clock: &Clock) -> Result<DateTime<Utc>, io::Error> {
     if let Some(value) = value {
         return parse_started_at(value, "--started-at");
     }
-    match env::var("MANDATE_SWEEP_TIME") {
-        // The shell reads this as `${MANDATE_SWEEP_TIME:-<now>}`, so an empty
-        // value means absent rather than malformed. A non-empty value that
-        // will not parse is an error: a parity harness that silently un-pins
-        // its clock produces a confident wrong answer.
-        Ok(value) if value.is_empty() => Ok(DateTime::<Utc>::from(SystemTime::now())),
-        Ok(value) => parse_started_at(&value, "MANDATE_SWEEP_TIME"),
-        Err(env::VarError::NotPresent) => Ok(DateTime::<Utc>::from(SystemTime::now())),
-        Err(env::VarError::NotUnicode(_)) => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "MANDATE_SWEEP_TIME must be a valid Unicode RFC3339 instant",
-        )),
-    }
+    Ok(clock.now())
 }
 
 fn parse_started_at(value: &str, source: &str) -> Result<DateTime<Utc>, io::Error> {

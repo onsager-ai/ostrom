@@ -12,10 +12,10 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::Command,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
-use chrono::{DateTime, Utc};
+use chrono::DateTime;
 use ostrom_core::WorkOrder;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -23,11 +23,13 @@ use tempfile::NamedTempFile;
 use thiserror::Error;
 
 use crate::{
-    TraceAppend, TraceFactRecord, append_trace, read_lease, read_trace, set_private_file_mode,
+    Clock, TraceAppend, TraceFactRecord, append_trace, read_lease, read_trace,
+    set_private_file_mode,
 };
 
 const DEFAULT_COST_CEILING_USD: &str = "20";
 const DEFAULT_TOKEN_CEILING: &str = "500000";
+static ORDER_NONCE: AtomicU64 = AtomicU64::new(0);
 // These are the dispatcher's existing runtime ceilings. Keeping the lease and
 // order staleness calculations here gives both users one source of truth.
 const WEIGHTED_TOKENS_PER_RUNTIME_SECOND: u64 = 100;
@@ -182,7 +184,7 @@ pub fn validate_work_order_file(path: &Path) -> Result<(), WorkOrderError> {
 pub fn create_work_order(
     state_root: &Path,
     candidate_path: &Path,
-    created_at: Option<&str>,
+    clock: &Clock,
     cost_ceiling: Option<&str>,
     token_ceiling: Option<&str>,
 ) -> Result<CreatedWorkOrder, WorkOrderError> {
@@ -215,17 +217,8 @@ pub fn create_work_order(
             "ostrom work order: overwriting candidate branch_name '{supplied_branch}' with item-derived '{deterministic_branch}'"
         )
     });
-    let timestamp = created_at.map_or_else(
-        || {
-            chrono::DateTime::<Utc>::from(SystemTime::now())
-                .format("%Y-%m-%dT%H:%M:%SZ")
-                .to_string()
-        },
-        str::to_owned,
-    );
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos());
+    let timestamp = clock.timestamp();
+    let nonce = ORDER_NONCE.fetch_add(1, Ordering::Relaxed);
     let order_id = format!(
         "{:x}",
         Sha256::digest(format!(
@@ -240,7 +233,7 @@ pub fn create_work_order(
     if target.is_file() {
         let prior_order_id = read_order(&target).map(|order| order.order_id);
         if let Some(order_id) = prior_order_id.as_deref() {
-            reap_stale_work_orders_matching(state_root, Some(order_id))?;
+            reap_stale_work_orders_matching(state_root, Some(order_id), clock)?;
         }
         if prior_order_is_in_flight(&target, &state_root.join("sprint.jsonl")) {
             return Err(WorkOrderError::InFlight(target.display().to_string()));
@@ -248,7 +241,7 @@ pub fn create_work_order(
     }
     remove_expired_lease(
         &state_root.join(format!("implementer-item-{hash}.lease")),
-        current_epoch(),
+        clock.epoch_seconds(),
     );
     if state_root
         .join(format!("implementer-item-{hash}.lease"))
@@ -478,16 +471,18 @@ pub(crate) fn in_flight_orders(trace_path: &Path) -> Result<Vec<InFlightOrder>, 
 
 pub(crate) fn reap_stale_work_orders(
     state_root: &Path,
+    clock: &Clock,
 ) -> Result<Vec<ClearedWorkOrder>, WorkOrderError> {
-    reap_stale_work_orders_matching(state_root, None)
+    reap_stale_work_orders_matching(state_root, None, clock)
 }
 
 fn reap_stale_work_orders_matching(
     state_root: &Path,
     order_id: Option<&str>,
+    clock: &Clock,
 ) -> Result<Vec<ClearedWorkOrder>, WorkOrderError> {
     let trace_path = state_root.join("sprint.jsonl");
-    let now = current_epoch();
+    let now = clock.epoch_seconds();
     let mut reaped = Vec::new();
     for order in in_flight_orders(&trace_path)? {
         if order_id.is_some_and(|expected| order.order_id != expected)
@@ -507,6 +502,7 @@ fn reap_stale_work_orders_matching(
             observation.exit_code,
             None,
             true,
+            clock,
         )? {
             reaped.push(ClearedWorkOrder {
                 order_id: order.order_id,
@@ -520,6 +516,7 @@ fn reap_stale_work_orders_matching(
 pub fn clear_work_order(
     state_root: &Path,
     identifier: &str,
+    clock: &Clock,
 ) -> Result<ClearedWorkOrder, WorkOrderError> {
     let trace_path = state_root.join("sprint.jsonl");
     let mut matches = in_flight_orders(&trace_path)?
@@ -538,7 +535,7 @@ pub fn clear_work_order(
         UnitLiveness::Live => {
             return Err(WorkOrderError::StillRunning(order.order_id));
         }
-        UnitLiveness::Unknown if !order_is_stale(&order, current_epoch()) => {
+        UnitLiveness::Unknown if !order_is_stale(&order, clock.epoch_seconds()) => {
             return Err(WorkOrderError::UnitStateUnknown(order.order_id));
         }
         UnitLiveness::NotLive | UnitLiveness::Unknown => {}
@@ -551,6 +548,7 @@ pub fn clear_work_order(
         observation.exit_code,
         None,
         true,
+        clock,
     )?;
     Ok(ClearedWorkOrder {
         order_id: order.order_id,
@@ -564,6 +562,7 @@ pub fn finalize_exited_implementer(
     unit_name: &str,
     exit_code: Option<i32>,
     signal: Option<i32>,
+    clock: &Clock,
 ) -> Result<bool, WorkOrderError> {
     let order_id = read_order(order_path).map(|order| order.order_id);
     let trace_path = state_root.join("sprint.jsonl");
@@ -588,6 +587,7 @@ pub fn finalize_exited_implementer(
         exit_code,
         signal,
         false,
+        clock,
     )
 }
 
@@ -690,6 +690,7 @@ fn append_terminal_failure(
     exit_code: Option<i32>,
     signal: Option<i32>,
     reaped: bool,
+    clock: &Clock,
 ) -> Result<bool, WorkOrderError> {
     let trace_path = state_root.join("sprint.jsonl");
     if !in_flight_orders(&trace_path)?
@@ -699,7 +700,7 @@ fn append_terminal_failure(
         release_matching_lease(state_root, order)?;
         return Ok(false);
     }
-    let now = current_epoch();
+    let now = clock.epoch_seconds();
     let dispatched_at = DateTime::parse_from_rfc3339(&order.ts)
         .ok()
         .and_then(|time| u64::try_from(time.timestamp()).ok())
@@ -757,7 +758,7 @@ fn append_terminal_failure(
     append_trace(
         &trace_path,
         &TraceAppend {
-            ts: trace_time(),
+            ts: clock.timestamp(),
             kind: "work-failed".to_owned(),
             fact,
             narration: Map::new(),
@@ -791,27 +792,6 @@ fn remove_expired_lease(path: &Path, now: u64) {
     {
         let _ = fs::remove_file(path);
     }
-}
-
-fn current_epoch() -> u64 {
-    env::var("MANDATE_LEASE_NOW_EPOCH")
-        .or_else(|_| env::var("MANDATE_NOW_EPOCH"))
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or_else(|| {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs()
-        })
-}
-
-fn trace_time() -> String {
-    env::var("MANDATE_TRACE_TIME").unwrap_or_else(|_| {
-        DateTime::<Utc>::from(SystemTime::now())
-            .format("%Y-%m-%dT%H:%M:%SZ")
-            .to_string()
-    })
 }
 
 #[cfg(test)]

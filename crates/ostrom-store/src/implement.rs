@@ -11,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Output, Stdio},
     thread,
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 
 use chrono::{DateTime, Utc};
@@ -20,7 +20,7 @@ use serde_json::{Map, Value, json};
 use thiserror::Error;
 
 use crate::{
-    LeaseActionError, OstromPaths, OwnedLease, SignalFlags, TraceAppend,
+    Clock, LeaseActionError, OstromPaths, OwnedLease, SignalFlags, TraceAppend,
     app_token::{
         AuthenticatedCommandError, GitHubInstallationTokenMinter, InstallationTokenMinter,
         ScopedAppTokenRequest, authenticated_output,
@@ -37,6 +37,7 @@ pub struct ImplementRequest {
     pub unit_name: String,
     pub signals: SignalFlags,
     pub supervisor_pid: Option<u32>,
+    pub clock: Clock,
 }
 
 #[derive(Debug, Error)]
@@ -99,7 +100,8 @@ struct TerminalGuard {
     order: WorkOrder,
     unit_name: String,
     backend: String,
-    started: SystemTime,
+    started: DateTime<Utc>,
+    clock: Clock,
     failure_reason: String,
     failure_message: Option<String>,
     terminal_written: bool,
@@ -116,10 +118,12 @@ struct TerminalGuard {
 
 impl TerminalGuard {
     fn append_terminal(&mut self, kind: &str, reason: Option<&str>) -> Result<(), ImplementError> {
-        let duration = SystemTime::now()
-            .duration_since(self.started)
-            .unwrap_or_default()
-            .as_secs();
+        let duration = self
+            .clock
+            .now()
+            .signed_duration_since(self.started)
+            .num_seconds()
+            .max(0);
         let usage = self
             .events_file
             .as_deref()
@@ -192,7 +196,7 @@ impl TerminalGuard {
         append_trace(
             &self.paths.trace_file(),
             &TraceAppend {
-                ts: trace_time(),
+                ts: self.clock.timestamp(),
                 kind: kind.to_owned(),
                 fact,
                 narration: Map::new(),
@@ -302,7 +306,8 @@ fn run_implement_with_minter(
         order,
         unit_name: request.unit_name.clone(),
         backend: env::var("MANDATE_DISPATCH_BACKEND").unwrap_or_else(|_| "systemd".to_owned()),
-        started: SystemTime::now(),
+        started: request.clock.now(),
+        clock: request.clock.clone(),
         failure_reason: "implementer-exited".to_owned(),
         failure_message: None,
         terminal_written: false,
@@ -1268,17 +1273,6 @@ fn git_success(directory: &Path, arguments: &[&str]) -> bool {
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
-}
-
-fn trace_time() -> String {
-    env::var("MANDATE_TRACE_TIME")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| {
-            DateTime::<Utc>::from(SystemTime::now())
-                .format("%Y-%m-%dT%H:%M:%SZ")
-                .to_string()
-        })
 }
 
 #[cfg(unix)]

@@ -2,6 +2,7 @@
 
 mod app_token;
 mod check_store;
+mod clock;
 mod dispatch;
 mod event_store;
 mod file_store;
@@ -28,6 +29,7 @@ mod work_order;
 
 pub use app_token::{AppTokenError, CredentialCommandError, credential_output};
 pub use check_store::JsonlCheckStore;
+pub use clock::Clock;
 pub use dispatch::{DispatchError, DispatchOutcome, DispatchRequest, run_dispatch};
 pub use event_store::JsonlEventStore;
 pub use file_store::JsonlSweepStore;

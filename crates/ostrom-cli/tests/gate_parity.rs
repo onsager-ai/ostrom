@@ -5,6 +5,7 @@ use std::{
     process::Command,
 };
 
+use chrono::{Duration, SecondsFormat};
 use serde_json::Value;
 use tempfile::tempdir;
 
@@ -80,7 +81,7 @@ fn fixture_path() -> OsString {
 }
 
 #[test]
-fn rust_gate_is_byte_identical_to_recorded_shell_corpus() {
+fn rust_gate_matches_recorded_shell_corpus_apart_from_the_injected_clock() {
     let fixture = fixture_root();
     for case in CASES {
         let root = tempdir().expect("temporary gate fixture");
@@ -105,7 +106,6 @@ fn rust_gate_is_byte_identical_to_recorded_shell_corpus() {
             .env("GATE_FIXTURE_MODE", case.mode)
             .env("GATE_FIXTURE_HEAD", case.head)
             .env("GATE_COMMAND_LOG", &command_log)
-            .env("MANDATE_GATE_TIME", "2026-08-04T12:00:00Z")
             .current_dir(&repo)
             .output()
             .expect("run Rust gate");
@@ -134,13 +134,18 @@ fn rust_gate_is_byte_identical_to_recorded_shell_corpus() {
             "{} stderr",
             case.name
         );
-        assert_eq!(
-            fs::read(home.join("gate.jsonl")).expect("read Rust verdict log"),
-            fs::read(expected.join(format!("{}.gate.jsonl", case.name)))
-                .expect("read recorded shell verdict"),
-            "{} gate log",
-            case.name
-        );
+        let mut actual_record: Value = serde_json::from_slice(
+            &fs::read(home.join("gate.jsonl")).expect("read Rust verdict log"),
+        )
+        .expect("parse Rust verdict");
+        let expected_bytes = fs::read(expected.join(format!("{}.gate.jsonl", case.name)))
+            .expect("read recorded shell verdict");
+        let expected_record: Value =
+            serde_json::from_slice(&expected_bytes).expect("parse recorded shell verdict");
+        actual_record["ts"] = expected_record["ts"].clone();
+        let mut normalized = serde_json::to_vec(&actual_record).expect("serialize verdict");
+        normalized.push(b'\n');
+        assert_eq!(normalized, expected_bytes, "{} gate log", case.name);
         if let Some(condition_name) = match case.name {
             "conflicting" => Some("mergeable"),
             "draft" => Some("draft"),
@@ -207,7 +212,6 @@ fn unresolved_head_is_not_written_as_a_verdict() {
         .env("OSTROM_HOME", root.path())
         .env("GATE_FIXTURE_MODE", "unresolvable")
         .env("GATE_COMMAND_LOG", &command_log)
-        .env("MANDATE_GATE_TIME", "2026-08-04T12:00:00Z")
         .current_dir(root.path())
         .output()
         .expect("run unresolved gate input");
@@ -239,7 +243,6 @@ projects:
         .env("OSTROM_HOME", root.path())
         .env("GATE_FIXTURE_MODE", "bounce")
         .env("GATE_FIXTURE_HEAD", "aaaaaaaaaaaaaaaa")
-        .env("MANDATE_GATE_TIME", "2026-08-04T12:00:00Z")
         .current_dir(root.path())
         .output()
         .expect("run gate with exception-shaped config");
@@ -281,16 +284,43 @@ projects:
         .env("OSTROM_HOME", root.path())
         .env("GATE_FIXTURE_MODE", "pass")
         .env("GATE_FIXTURE_HEAD", "aaaaaaaaaaaaaaaa")
-        .env("MANDATE_GATE_TIME", "2026-08-04T12:00:00Z")
         .current_dir(root.path())
         .output()
         .expect("record gate verdict");
     assert!(gate.status.success());
 
+    let gate_record: Value = serde_json::from_slice(
+        &fs::read(root.path().join("gate.jsonl")).expect("read gate-produced evidence"),
+    )
+    .expect("parse gate-produced evidence");
+    let gate_time =
+        chrono::DateTime::parse_from_rfc3339(gate_record["ts"].as_str().expect("gate timestamp"))
+            .expect("valid gate timestamp");
+    let merged_at = (gate_time + Duration::hours(1)).to_rfc3339_opts(SecondsFormat::Secs, true);
+    let first_sweep = (gate_time + Duration::hours(2)).to_rfc3339_opts(SecondsFormat::Secs, true);
+    let second_sweep = (gate_time + Duration::hours(3)).to_rfc3339_opts(SecondsFormat::Secs, true);
     let sweep_fixture = root.path().join("sweep.json");
     fs::write(
         &sweep_fixture,
-        r#"{"repositories":[{"repo":"placeholder-org/alpha","issues":[],"open_prs":[],"merged_prs":[{"number":7,"title":"fix(core): safe placeholder change","author":{"login":"placeholder-builder","isBot":false},"createdAt":"2026-08-04T10:00:00Z","mergedAt":"2026-08-04T13:00:00Z","headRefOid":"aaaaaaaaaaaaaaaa","closingIssuesReferences":[{"number":42}]}],"branches":[],"ci_runs":[]}]}"#,
+        serde_json::json!({
+            "repositories": [{
+                "repo": "placeholder-org/alpha",
+                "issues": [],
+                "open_prs": [],
+                "merged_prs": [{
+                    "number": 7,
+                    "title": "fix(core): safe placeholder change",
+                    "author": {"login": "placeholder-builder", "isBot": false},
+                    "createdAt": gate_time.to_rfc3339_opts(SecondsFormat::Secs, true),
+                    "mergedAt": merged_at,
+                    "headRefOid": "aaaaaaaaaaaaaaaa",
+                    "closingIssuesReferences": [{"number": 42}]
+                }],
+                "branches": [],
+                "ci_runs": []
+            }]
+        })
+        .to_string(),
     )
     .expect("write synthetic sweep acquisition");
     let sweep = Command::new(env!("CARGO_BIN_EXE_ostrom"))
@@ -299,7 +329,7 @@ projects:
             "--fixture",
             sweep_fixture.to_str().expect("fixture path is UTF-8"),
             "--started-at",
-            "2026-08-04T14:00:00Z",
+            &first_sweep,
         ])
         .env("OSTROM_HOME", root.path())
         .current_dir(root.path())
@@ -329,7 +359,7 @@ projects:
             "--fixture",
             sweep_fixture.to_str().expect("fixture path is UTF-8"),
             "--started-at",
-            "2026-08-04T15:00:00Z",
+            &second_sweep,
         ])
         .env("OSTROM_HOME", root.path())
         .current_dir(root.path())

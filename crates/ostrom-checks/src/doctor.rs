@@ -47,11 +47,21 @@ pub struct DoctorOptions {
     pub cwd: PathBuf,
     pub home: PathBuf,
     pub env: BTreeMap<OsString, OsString>,
+    pub now_epoch: u64,
 }
 
 impl DoctorOptions {
     #[must_use]
     pub fn from_environment(plugin_root: impl Into<PathBuf>) -> Self {
+        let now_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        Self::from_environment_at(plugin_root, now_epoch)
+    }
+
+    #[must_use]
+    pub fn from_environment_at(plugin_root: impl Into<PathBuf>, now_epoch: u64) -> Self {
         let cwd = env::current_dir().unwrap_or_default();
         let home = env::var_os("HOME").map_or_else(PathBuf::new, PathBuf::from);
         let config_dir = env::var_os("CLAUDE_CONFIG_DIR").map_or_else(
@@ -70,6 +80,7 @@ impl DoctorOptions {
             cwd,
             home,
             env: env::vars_os().collect(),
+            now_epoch,
         }
     }
 }
@@ -1937,25 +1948,7 @@ fn check_dispatch_source_roots(context: &DoctorContext) -> DoctorResult {
 }
 
 fn now_epoch(context: &DoctorContext) -> i64 {
-    if let Some(value) = context
-        .env_text("MANDATE_NOW_EPOCH")
-        .filter(|value| value.bytes().all(|byte| byte.is_ascii_digit()))
-        .and_then(|value| value.parse().ok())
-    {
-        return value;
-    }
-    if let Some(value) = context
-        .env_text("MANDATE_SWEEP_TIME")
-        .and_then(parse_timestamp)
-    {
-        return value;
-    }
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .try_into()
-        .unwrap_or(i64::MAX)
+    context.options.now_epoch.try_into().unwrap_or(i64::MAX)
 }
 
 fn parse_timestamp(value: &str) -> Option<i64> {
@@ -2819,13 +2812,8 @@ mod tests {
                 config_dir: self.config_dir.clone(),
                 cwd: self.cwd.clone(),
                 home: self.home.clone(),
-                env: BTreeMap::from([
-                    (OsString::from("PATH"), self.bin.clone().into_os_string()),
-                    (
-                        OsString::from("MANDATE_NOW_EPOCH"),
-                        OsString::from("1785542400"),
-                    ),
-                ]),
+                env: BTreeMap::from([(OsString::from("PATH"), self.bin.clone().into_os_string())]),
+                now_epoch: 1_785_542_400,
             }
         }
 

@@ -2,16 +2,14 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
-    time::SystemTime,
 };
 
-use chrono::Utc;
 use ostrom_core::{MandateConfig, QueueItem, WorkEdgeSource, WorkGraph, mechanical_ranking};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 
 use crate::{
-    OstromPaths, StoreError, SweepError, TraceAppend, append_trace, load_config_or_defaults,
+    Clock, OstromPaths, StoreError, SweepError, TraceAppend, append_trace, load_config_or_defaults,
     read_queue,
 };
 
@@ -29,6 +27,7 @@ pub struct SelectRequest {
     pub paths: OstromPaths,
     pub working_directory: PathBuf,
     pub action: SelectAction,
+    pub clock: Clock,
 }
 
 /// Empty is a successful, known result. Every inability to establish that
@@ -438,7 +437,7 @@ fn append_selection_traces(
     rejection_clause: Option<&str>,
 ) -> Result<(), SelectError> {
     let trace_path = request.paths.trace_file();
-    let timestamp = selection_trace_timestamp();
+    let timestamp = request.clock.timestamp();
     let selected_id = selected["id"].as_str().ok_or(SelectError::InvalidGraph)?;
     let graph_by_id = graph
         .nodes

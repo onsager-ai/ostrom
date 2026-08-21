@@ -8,10 +8,9 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Output},
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
-use chrono::{DateTime, Utc};
 use ostrom_core::{
     BranchListing, BranchListingFault, BranchListingOutcome, MandateConfig, RemoteBranch,
     WorkOrder, resolve_exact_branch,
@@ -19,7 +18,7 @@ use ostrom_core::{
 use serde_json::{Map, Value, json};
 
 use crate::{
-    LeaseRecord, OstromPaths, TraceAppend,
+    Clock, LeaseRecord, OstromPaths, TraceAppend,
     app_token::{
         AuthenticatedCommandError, GitHubInstallationTokenMinter, InstallationTokenMinter,
         ScopedAppTokenRequest, authenticated_output,
@@ -41,6 +40,7 @@ pub struct DispatchRequest {
     pub working_directory: PathBuf,
     pub plugin_root: PathBuf,
     pub order_file: PathBuf,
+    pub clock: Clock,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -246,7 +246,7 @@ fn run_dispatch_with_minter(
     // Reap before acquiring this item's lease. If an old order is genuinely
     // still live, its possibly expired lease must not be replaced merely to
     // discover the duplicate after the fact.
-    reap_stale_work_orders(&request.paths.state)
+    reap_stale_work_orders(&request.paths.state, &request.clock)
         .map_err(|error| DispatchError::new(1, error.to_string()))?;
     if in_flight_orders(&request.paths.trace_file())
         .map_err(|error| DispatchError::new(1, error.to_string()))?
@@ -284,20 +284,21 @@ fn run_dispatch_with_minter(
         .state
         .join(format!("implementer-item-{}.lease", context.item_hash));
     let mut lease =
-        acquire_dispatch_lease(&lease_path, &context.unit_name, lease_ttl).map_err(|code| {
-            let message = if code == 3 {
-                format!(
-                    "ostrom dispatch: item already has a live implementer lease: {}",
-                    context.order.item_id
-                )
-            } else {
-                format!(
-                    "ostrom dispatch: could not acquire implementer lease for {} (rc={code})",
-                    context.order.item_id
-                )
-            };
-            DispatchError::new(code, message)
-        })?;
+        acquire_dispatch_lease(&lease_path, &context.unit_name, lease_ttl, &request.clock)
+            .map_err(|code| {
+                let message = if code == 3 {
+                    format!(
+                        "ostrom dispatch: item already has a live implementer lease: {}",
+                        context.order.item_id
+                    )
+                } else {
+                    format!(
+                        "ostrom dispatch: could not acquire implementer lease for {} (rc={code})",
+                        context.order.item_id
+                    )
+                };
+                DispatchError::new(code, message)
+            })?;
 
     let result = after_lease(
         &context,
@@ -370,7 +371,7 @@ fn after_lease(
         ));
     }
 
-    reap_stale_work_orders(&context.request.paths.state)
+    reap_stale_work_orders(&context.request.paths.state, &context.request.clock)
         .map_err(|error| DispatchError::new(1, error.to_string()))?;
     let trace = read_trace(&context.request.paths.trace_file())
         .map_err(|error| DispatchError::new(1, format!("ostrom dispatch: {error}")))?;
@@ -450,19 +451,7 @@ fn after_lease(
         .and_then(|value| value.parse::<f64>().ok())
         .filter(|value| *value > 0.0)
         .unwrap_or(DEFAULT_DAILY_CAP_USD);
-    let now = env::var("MANDATE_NOW_EPOCH")
-        .ok()
-        .and_then(|value| value.parse::<i64>().ok())
-        .unwrap_or_else(|| {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64
-        });
-    let day = DateTime::<Utc>::from_timestamp(now, 0)
-        .unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
-        .format("%Y-%m-%d")
-        .to_string();
+    let day = context.request.clock.date();
     let actual = rows
         .iter()
         .filter(|row| row.ts.starts_with(&day))
@@ -1552,15 +1541,10 @@ fn append_fact(
     kind: &str,
     fact: Map<String, Value>,
 ) -> Result<(), DispatchError> {
-    let timestamp = env::var("MANDATE_TRACE_TIME").unwrap_or_else(|_| {
-        DateTime::<Utc>::from(SystemTime::now())
-            .format("%Y-%m-%dT%H:%M:%SZ")
-            .to_string()
-    });
     append_trace(
         &context.request.paths.trace_file(),
         &TraceAppend {
-            ts: timestamp,
+            ts: context.request.clock.timestamp(),
             kind: kind.to_owned(),
             fact,
             narration: Map::new(),
@@ -1600,8 +1584,13 @@ impl Drop for LeaseGuard {
     }
 }
 
-fn acquire_dispatch_lease(path: &Path, owner: &str, ttl: u64) -> Result<LeaseGuard, i32> {
-    let now = current_lease_time();
+fn acquire_dispatch_lease(
+    path: &Path,
+    owner: &str,
+    ttl: u64,
+    clock: &Clock,
+) -> Result<LeaseGuard, i32> {
+    let now = clock.epoch_seconds();
     if let Ok(Some(existing)) = read_lease(path) {
         let derived_expiry = existing.started_at.saturating_add(ttl);
         if existing.expires_at.min(derived_expiry) > now {
@@ -1639,19 +1628,6 @@ fn acquire_dispatch_lease(path: &Path, owner: &str, ttl: u64) -> Result<LeaseGua
         owner: owner.to_owned(),
         armed: true,
     })
-}
-
-fn current_lease_time() -> u64 {
-    env::var("MANDATE_LEASE_NOW_EPOCH")
-        .or_else(|_| env::var("MANDATE_NOW_EPOCH"))
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or_else(|| {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs()
-        })
 }
 
 fn closing_reference(text: &str, item_ref: &str) -> bool {

@@ -50,12 +50,7 @@ impl Fixture {
             .env("CLAUDE_CONFIG_DIR", self.root.path())
             .env("HOME", self.root.path())
             .env("PATH", env::var_os("PATH").unwrap_or_default())
-            .env("CLAUDE_BIN", &self.claude)
-            .env("MANDATE_TRACE_TIME", "2026-08-01T00:00:00Z")
-            .env("MANDATE_SWEEP_TIME", "2026-08-01T00:00:00Z")
-            .env("MANDATE_TODAY", "2026-08-01")
-            .env("MANDATE_NOW_EPOCH", "1785542400")
-            .env("MANDATE_LEASE_NOW_EPOCH", "1785542400");
+            .env("CLAUDE_BIN", &self.claude);
         command
     }
 
@@ -102,19 +97,17 @@ fn wait(mut child: Child) -> ExitStatus {
     child.wait().expect("wait for pass")
 }
 
-/// ostrom#99, the production path: other tests pin one or more of the ambient
-/// clock seams so simulated days are deterministic, and production sets them
-/// **nowhere**. A suite that pins them universally therefore never executes the
-/// branch the loop actually takes.
+/// ostrom#99, the production path: this test must exercise the realtime clock
+/// that the binary constructs, not a deterministic library clock.
 ///
 /// This is not a hypothetical. ostrom#323 was exactly this shape one variable
 /// over: every dispatch test set `OSTROM_HOME` or `CLAUDE_CONFIG_DIR`, the bug
 /// required neither to be set, and it took the loop down for 48 hours while CI
 /// stayed green. The bash suite guarded the clock case deliberately, with its
-/// own fixture and an explicit `env -u MANDATE_NOW_EPOCH`; that guard must not
-/// be lost in the move to Rust. Remove every clock seam here, including the
-/// helper-mediated audit, replay, and excuse clocks, so adding a fixture clock
-/// elsewhere cannot silently weaken this production-path test.
+/// own fixture and an explicit unset clock. That guard must not be lost in the
+/// move to Rust. Remove every retired clock name here, including the
+/// helper-mediated audit, replay, and excuse clocks, so reintroducing an
+/// ambient fixture clock elsewhere cannot silently weaken this test.
 ///
 /// The claim is "the real clock, not the simulated day" — not a specific date —
 /// so both sides of a UTC midnight crossing are accepted rather than letting a
@@ -140,9 +133,7 @@ fn an_unpinned_clock_stamps_pass_rows_with_the_real_date() {
     ] {
         command.env_remove(name);
     }
-    let status = command
-        .status()
-        .expect("run pass with an unpinned clock");
+    let status = command.status().expect("run pass with an unpinned clock");
     assert!(status.success());
     let after = chrono_free_utc_date();
 
@@ -196,7 +187,7 @@ fn chrono_free_utc_date() -> String {
 }
 
 #[test]
-fn recorded_shell_output_is_byte_identical() {
+fn recorded_shell_output_matches_apart_from_the_injected_clock() {
     let fixture = Fixture::new(concat!(
         "printf '%s\\n' '{\"ts\":\"2026-08-01T00:00:00Z\",\"kind\":\"pass-started\",\"fact\":{\"owner\":\"builder-placeholder-session-wake7\"},\"narration\":{}}' >>\"$OSTROM_HOME/sprint.jsonl\"\n",
         "printf '%s\\n' '{\"type\":\"result\",\"total_cost_usd\":1.25}'"
@@ -212,7 +203,9 @@ fn recorded_shell_output_is_byte_identical() {
         include_bytes!("fixtures/pass/builder-stderr.expected.txt")
     );
     assert_eq!(
-        fs::read(fixture.state.join("sprint.jsonl")).expect("read native trace"),
+        normalize_pass_trace(
+            &fs::read(fixture.state.join("sprint.jsonl")).expect("read native trace")
+        ),
         include_bytes!("fixtures/pass/builder-trace.expected.jsonl")
     );
     fixture.assert_released();
@@ -223,7 +216,7 @@ fn recorded_shell_output_is_byte_identical() {
 /// the same pass emitted `duration_seconds` 0 on an idle machine and 1 under
 /// load. Forcing the pass to take over a second must not change a single byte.
 #[test]
-fn a_slow_pass_records_the_same_bytes_under_a_pinned_clock() {
+fn a_slow_pass_changes_only_realtime_duration_and_timestamps() {
     let fixture = Fixture::new(concat!(
         "sleep 2\n",
         "printf '%s\\n' '{\"ts\":\"2026-08-01T00:00:00Z\",\"kind\":\"pass-started\",\"fact\":{\"owner\":\"builder-placeholder-session-wake7\"},\"narration\":{}}' >>\"$OSTROM_HOME/sprint.jsonl\"\n",
@@ -232,10 +225,29 @@ fn a_slow_pass_records_the_same_bytes_under_a_pinned_clock() {
     let output = fixture.command().output().expect("run pass");
     assert!(output.status.success());
     assert_eq!(
-        fs::read(fixture.state.join("sprint.jsonl")).expect("read native trace"),
+        normalize_pass_trace(
+            &fs::read(fixture.state.join("sprint.jsonl")).expect("read native trace")
+        ),
         include_bytes!("fixtures/pass/builder-trace.expected.jsonl")
     );
     fixture.assert_released();
+}
+
+fn normalize_pass_trace(bytes: &[u8]) -> Vec<u8> {
+    let mut normalized = Vec::new();
+    for line in bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let mut row: Value = serde_json::from_slice(line).expect("trace JSON");
+        row["ts"] = Value::String("2026-08-01T00:00:00Z".to_owned());
+        if row["kind"] == "pass-ended" {
+            row["fact"]["duration_seconds"] = Value::from(0);
+        }
+        serde_json::to_writer(&mut normalized, &row).expect("serialize normalized trace");
+        normalized.push(b'\n');
+    }
+    normalized
 }
 
 #[test]
@@ -364,7 +376,10 @@ fn disarmed_and_outer_lease_held_passes_do_not_spawn_or_trace() {
     let marker = held.root.path().join("spawned");
     fs::write(
         held.state.join("builder-pass.lease"),
-        "{\"owner\":\"fixture-holder\",\"started_at\":1785542300,\"expires_at\":1785546000}\n",
+        format!(
+            "{{\"owner\":\"fixture-holder\",\"started_at\":1,\"expires_at\":{}}}\n",
+            u64::MAX
+        ),
     )
     .expect("write held outer lease");
     let output = held
@@ -511,7 +526,7 @@ fn permission_denial_overrides_partial_inner_protocol_evidence() {
 #[test]
 fn inner_lease_cleanup_distinguishes_child_and_preexisting_owners() {
     let acquired = Fixture::new(concat!(
-        "printf '{\"owner\":\"builder-child\",\"started_at\":%s,\"expires_at\":9999999999}\\n' \"$MANDATE_NOW_EPOCH\" >\"$OSTROM_HOME/builder.lease\"\n",
+        "printf '{\"owner\":\"builder-child\",\"started_at\":%s,\"expires_at\":9999999999}\\n' \"$(date +%s)\" >\"$OSTROM_HOME/builder.lease\"\n",
         "printf '%s\\n' '{\"ts\":\"2026-08-01T00:00:00Z\",\"kind\":\"pass-started\",\"fact\":{\"owner\":\"builder-inner-wake1\"},\"narration\":{}}' >>\"$OSTROM_HOME/sprint.jsonl\""
     ));
     assert!(
@@ -543,13 +558,7 @@ fn inner_lease_cleanup_distinguishes_child_and_preexisting_owners() {
 }
 
 #[test]
-fn daily_cap_uses_only_valid_costs_on_the_pinned_day() {
-    let trace = concat!(
-        "{\"ts\":\"2026-07-31T23:59:59Z\",\"kind\":\"pass-ended\",\"fact\":{\"cost_usd\":999},\"narration\":{}}\n",
-        "{\"ts\":\"2026-08-01T00:00:00Z\",\"kind\":\"pass-ended\",\"fact\":{\"cost_usd\":7},\"narration\":{}}\n",
-        "{\"ts\":\"2026-08-01T00:00:01Z\",\"kind\":\"pass-ended\",\"fact\":{\"cost_usd\":\"bad\"},\"narration\":{}}\n",
-        "{\"ts\":\"2026-08-01T00:00:02Z\",\"kind\":\"pass-ended\",\"fact\":{},\"narration\":{}}\n"
-    );
+fn daily_cap_uses_only_valid_costs_on_the_current_day() {
     for (cap, spawned, outcome, reason) in [
         ("8", true, "completed", None),
         ("7", false, "no-op", Some("daily-cap")),
@@ -559,6 +568,36 @@ fn daily_cap_uses_only_valid_costs_on_the_pinned_day() {
             "touch \"$OSTROM_TEST_MARKER\"\n",
             "printf '%s\\n' '{\"ts\":\"2026-08-01T00:00:00Z\",\"kind\":\"pass-started\",\"fact\":{\"owner\":\"builder-inner-wake1\"},\"narration\":{}}' >>\"$OSTROM_HOME/sprint.jsonl\""
         ));
+        let today = chrono_free_utc_date();
+        let trace = [
+            serde_json::json!({
+                "ts": "1900-01-01T23:59:59Z",
+                "kind": "pass-ended",
+                "fact": {"cost_usd": 999},
+                "narration": {}
+            }),
+            serde_json::json!({
+                "ts": format!("{today}T00:00:00Z"),
+                "kind": "pass-ended",
+                "fact": {"cost_usd": 7},
+                "narration": {}
+            }),
+            serde_json::json!({
+                "ts": format!("{today}T00:00:01Z"),
+                "kind": "pass-ended",
+                "fact": {"cost_usd": "bad"},
+                "narration": {}
+            }),
+            serde_json::json!({
+                "ts": format!("{today}T00:00:02Z"),
+                "kind": "pass-ended",
+                "fact": {},
+                "narration": {}
+            }),
+        ]
+        .into_iter()
+        .map(|row| format!("{row}\n"))
+        .collect::<String>();
         fs::write(fixture.state.join("sprint.jsonl"), trace).expect("write spend trace");
         let marker = fixture.root.path().join("spawned");
         assert!(
@@ -574,8 +613,16 @@ fn daily_cap_uses_only_valid_costs_on_the_pinned_day() {
         let terminal = fixture.trace().pop().expect("spend terminal");
         assert_eq!(terminal["fact"]["outcome"], outcome, "cap {cap}");
         assert_eq!(terminal["fact"]["reason"].as_str(), reason, "cap {cap}");
-        assert_eq!(terminal["ts"], "2026-08-01T00:00:00Z");
-        assert_eq!(terminal["fact"]["duration_seconds"], 0);
+        assert!(
+            terminal["ts"]
+                .as_str()
+                .is_some_and(|timestamp| timestamp.starts_with(&today))
+        );
+        assert!(
+            terminal["fact"]["duration_seconds"]
+                .as_u64()
+                .is_some_and(|duration| duration <= 5)
+        );
     }
 }
 
@@ -674,8 +721,6 @@ fn polluted_operator_environment_cannot_change_a_pass_result() {
                 "MANDATE_SEMANTIC_MODEL",
                 "MANDATE_DAILY_CAP_USD",
                 "MANDATE_LEASE_NAME",
-                "MANDATE_TRACE_TIME",
-                "MANDATE_NOW_EPOCH",
                 "MANDATE_MAX_IMPLEMENTERS",
                 "MANDATE_IMPLEMENTER_SOURCE_REPO",
                 "MANDATE_GH_AS_BIN",

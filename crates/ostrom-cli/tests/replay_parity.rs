@@ -1,5 +1,7 @@
 use std::{env, fs, path::PathBuf, process::Command};
 
+use chrono::{DateTime, Utc};
+use ostrom_store::{OstromPaths, ReplayOptions, replay};
 use tempfile::tempdir;
 
 fn fixture_root() -> PathBuf {
@@ -23,12 +25,13 @@ fn rust_replay_is_byte_identical_to_recorded_shell_corpus() {
     paths.extend(env::split_paths(&env::var_os("PATH").unwrap_or_default()));
     let path = env::join_paths(paths).expect("join fixture PATH");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
-        .args(["replay", "30"])
+    let output_path = root.path().join("replay.output");
+    let output = Command::new(env::current_exe().expect("current integration test executable"))
+        .args(["--exact", "injected_clock_replay_child"])
         .env("PATH", path)
-        .env("OSTROM_HOME", &home)
-        .env("MANDATE_REPLAY_TIME", "2026-08-01T00:00:00Z")
-        .current_dir(repo)
+        .env("OSTROM_TEST_REPLAY_HOME", &home)
+        .env("OSTROM_TEST_REPLAY_CWD", &repo)
+        .env("OSTROM_TEST_REPLAY_OUTPUT", &output_path)
         .output()
         .expect("run Rust replay");
 
@@ -38,10 +41,36 @@ fn rust_replay_is_byte_identical_to_recorded_shell_corpus() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(
-        output.stdout,
+        fs::read(output_path).expect("read injected-clock replay output"),
         fs::read(fixture.join("replay.stdout")).expect("read shell-recorded output")
     );
     assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn injected_clock_replay_child() {
+    let Some(home) = env::var_os("OSTROM_TEST_REPLAY_HOME") else {
+        return;
+    };
+    let working_directory =
+        PathBuf::from(env::var_os("OSTROM_TEST_REPLAY_CWD").expect("replay cwd"));
+    let output_path =
+        PathBuf::from(env::var_os("OSTROM_TEST_REPLAY_OUTPUT").expect("replay output"));
+    let replay_time = DateTime::parse_from_rfc3339("2026-08-01T00:00:00Z")
+        .expect("fixed replay timestamp")
+        .with_timezone(&Utc);
+    let home = PathBuf::from(home);
+    let output = replay(&ReplayOptions {
+        paths: OstromPaths {
+            config: home.clone(),
+            state: home,
+        },
+        working_directory,
+        days: 30,
+        replay_time,
+    })
+    .expect("run fixed-clock replay");
+    fs::write(output_path, output).expect("write injected-clock replay output");
 }
 
 #[test]
@@ -62,7 +91,6 @@ fn malformed_recorded_state_is_a_named_error() {
         .args(["replay", "30"])
         .env("PATH", env::join_paths(paths).expect("join fixture PATH"))
         .env("OSTROM_HOME", root.path())
-        .env("MANDATE_REPLAY_TIME", "2026-08-01T00:00:00Z")
         .current_dir(root.path())
         .output()
         .expect("run Rust replay");

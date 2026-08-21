@@ -1,21 +1,22 @@
 use std::{
     collections::BTreeSet,
-    env, fs,
+    fs,
     fs::{File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::UNIX_EPOCH,
 };
 
 use regex::Regex;
 use serde_json::{Map, Value, json};
 
-use crate::{OstromPaths, load_config, local_drift, read_queue};
+use crate::{Clock, OstromPaths, load_config, local_drift, read_queue};
 
 #[derive(Debug, Clone)]
 pub struct DigestOptions {
     pub paths: OstromPaths,
     pub working_directory: PathBuf,
+    pub clock: Clock,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -70,7 +71,7 @@ pub fn render_digest(options: &DigestOptions) -> HookOutput {
         Ok(config) => config,
         Err(_) => return HookOutput::default(),
     };
-    let now = environment_u64("MANDATE_NOW_EPOCH").unwrap_or_else(epoch_now);
+    let now = options.clock.epoch_seconds();
     let state_path = options.paths.sweep_state_file();
     let state_modified = fs::metadata(&state_path)
         .and_then(|metadata| metadata.modified())
@@ -107,10 +108,7 @@ pub fn render_digest(options: &DigestOptions) -> HookOutput {
 
     let watermark_path = options.paths.state.join(".digest-decisions-read");
     let since = read_watermark(&watermark_path);
-    let digest_time = env::var("MANDATE_DIGEST_TIME")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(utc_now);
+    let digest_time = options.clock.timestamp();
     let decisions = read_decisions(&options.paths.trace_file(), &since);
     if decisions.is_empty() {
         push_line(&mut body, "DECISIONS TAKEN: nothing since your last read");
@@ -200,10 +198,7 @@ pub fn render_digest(options: &DigestOptions) -> HookOutput {
     }
     push_line(&mut body, &format!("{nominal} projects nominal"));
 
-    let today = env::var("MANDATE_TODAY")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(utc_date);
+    let today = options.clock.date();
     let date_pattern = Regex::new(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$").expect("date regex is valid");
     if date_pattern.is_match(&today) {
         let tap = options.paths.state.join(format!(".tap-{today}"));
@@ -601,26 +596,4 @@ fn jq_render(value: &Value) -> String {
 fn push_line(output: &mut String, line: &str) {
     output.push_str(line);
     output.push('\n');
-}
-
-fn environment_u64(name: &str) -> Option<u64> {
-    env::var(name).ok()?.parse().ok()
-}
-
-fn epoch_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs())
-}
-
-fn utc_now() -> String {
-    chrono::DateTime::<chrono::Utc>::from(SystemTime::now())
-        .format("%Y-%m-%dT%H:%M:%SZ")
-        .to_string()
-}
-
-fn utc_date() -> String {
-    chrono::DateTime::<chrono::Utc>::from(SystemTime::now())
-        .format("%Y-%m-%d")
-        .to_string()
 }

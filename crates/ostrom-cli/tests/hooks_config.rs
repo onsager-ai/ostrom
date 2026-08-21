@@ -1,5 +1,6 @@
-use std::{fs, path::Path, process::Command};
+use std::{fs, path::Path, process::Command, time::SystemTime};
 
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use tempfile::tempdir;
 
@@ -78,16 +79,19 @@ projects:
         "{\"version\":2,\"repos\":{}}\n",
     )
     .unwrap();
+    let today = DateTime::<Utc>::from(SystemTime::now())
+        .format("%Y-%m-%d")
+        .to_string();
+    fs::write(fixture.path().join(format!(".tap-{today}")), "").unwrap();
 
+    let before = DateTime::<Utc>::from(SystemTime::now()).timestamp();
     let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
         .args(["hook", "digest"])
         .env("OSTROM_HOME", fixture.path())
-        .env("MANDATE_NOW_EPOCH", "0")
-        .env("MANDATE_TODAY", "not-a-date")
-        .env("MANDATE_DIGEST_TIME", "2026-08-19T00:00:00Z")
         .current_dir(fixture.path())
         .output()
         .expect("render digest");
+    let after = DateTime::<Utc>::from(SystemTime::now()).timestamp();
     assert!(output.status.success());
     assert_eq!(
         output.stdout,
@@ -103,9 +107,13 @@ projects:
         .as_bytes()
     );
     assert!(output.stderr.is_empty());
-    assert_eq!(
-        fs::read_to_string(fixture.path().join(".digest-decisions-read")).unwrap(),
-        "2026-08-19T00:00:00Z\n"
+    let watermark = fs::read_to_string(fixture.path().join(".digest-decisions-read")).unwrap();
+    let observed = DateTime::parse_from_rfc3339(watermark.trim())
+        .expect("digest watermark timestamp")
+        .timestamp();
+    assert!(
+        (before..=after).contains(&observed),
+        "digest watermark {observed} is outside {before}..={after}"
     );
 }
 
