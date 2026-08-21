@@ -57,7 +57,8 @@ pub use policy::{
     ManifestError, ManifestValidationError, NormalizedList, OperationDecl, OperationParamDecl,
     OperationParamType, PolicyCandidate, PolicyDecision, PolicyManifest, PolicySelector,
     PolicySelectorError, ResolvedInput, RuleDecl, RuleDefaults, SelectorFinding, SelectorMatch,
-    SelectorPrefix, SelectorResolutionError, SelectorUniverse, StepDecl, UnmatchedPolicy,
+    SelectorPrefix, SelectorResolutionError, SelectorUniverse, StallDuration, StallDurationError,
+    StepDecl, UnmatchedPolicy,
 };
 pub use store::{
     AttemptOutcome, CHECK_STORE_SCHEMA_VERSION, CheckRun, CheckRunId, CheckStore, CheckStoreFault,

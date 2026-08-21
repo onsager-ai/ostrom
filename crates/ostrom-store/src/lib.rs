@@ -18,6 +18,7 @@ mod pass;
 mod pass_state;
 mod paths;
 mod plan;
+mod policy;
 mod publish;
 mod queue;
 mod repair;
@@ -55,6 +56,9 @@ pub use plan::{
     AssessmentDeriver, AssessmentDeriverError, AssessmentHarness, AssessmentInput,
     ExecutableAssessmentDeriver, GoalPlan, HarnessAssessmentDeriver, PlanDocument, PlanError,
     PlanFault, PlanOptions, PlanRanking, PlanSweep, UnavailableAssessmentDeriver, run_plan,
+};
+pub use policy::{
+    PolicyBundle, PolicyExplanation, RequirementExplanation, RuleExplanation, SelectorProjection,
 };
 pub use publish::{PublishDestination, PublishError};
 pub use queue::{

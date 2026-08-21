@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
+    str::FromStr,
 };
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::DeserializeOwned};
@@ -402,6 +403,11 @@ pub struct LoopDecl {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManifestDefaults {
+    #[serde(
+        default = "default_stalls_after",
+        skip_serializing_if = "is_default_stalls_after"
+    )]
+    pub stalls_after: StallDuration,
     #[serde(default, skip_serializing_if = "LoopDefaults::is_empty")]
     pub r#loop: LoopDefaults,
     #[serde(default, skip_serializing_if = "RuleDefaults::is_grant_default")]
@@ -416,6 +422,7 @@ pub struct ManifestDefaults {
 impl Default for ManifestDefaults {
     fn default() -> Self {
         Self {
+            stalls_after: default_stalls_after(),
             r#loop: LoopDefaults::default(),
             grant: RuleDefaults::default(),
             deny: RuleDefaults::deny(),
@@ -425,8 +432,99 @@ impl Default for ManifestDefaults {
 
 impl ManifestDefaults {
     fn is_empty(&self) -> bool {
-        self.r#loop.is_empty() && self.grant.is_grant_default() && self.deny.is_deny_default()
+        is_default_stalls_after(&self.stalls_after)
+            && self.r#loop.is_empty()
+            && self.grant.is_grant_default()
+            && self.deny.is_deny_default()
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StallDuration {
+    value: String,
+    seconds: u64,
+}
+
+impl StallDuration {
+    #[must_use]
+    pub const fn as_seconds(&self) -> u64 {
+        self.seconds
+    }
+}
+
+impl Default for StallDuration {
+    fn default() -> Self {
+        default_stalls_after()
+    }
+}
+
+impl fmt::Display for StallDuration {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.value)
+    }
+}
+
+impl FromStr for StallDuration {
+    type Err = StallDurationError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let split = value
+            .find(|character: char| !character.is_ascii_digit())
+            .ok_or(StallDurationError)?;
+        let (amount, unit) = value.split_at(split);
+        let amount = amount.parse::<u64>().map_err(|_| StallDurationError)?;
+        let multiplier = match unit {
+            "s" => 1,
+            "m" => 60,
+            "h" => 3_600,
+            "d" => 86_400,
+            "w" => 604_800,
+            _ => return Err(StallDurationError),
+        };
+        let seconds = amount
+            .checked_mul(multiplier)
+            .filter(|seconds| *seconds > 0)
+            .ok_or(StallDurationError)?;
+        Ok(Self {
+            value: value.to_owned(),
+            seconds,
+        })
+    }
+}
+
+impl Serialize for StallDuration {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.value)
+    }
+}
+
+impl<'de> Deserialize<'de> for StallDuration {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+#[error("stalls_after must be a positive duration such as 7d")]
+pub struct StallDurationError;
+
+fn default_stalls_after() -> StallDuration {
+    StallDuration {
+        value: "7d".to_owned(),
+        seconds: 7 * 86_400,
+    }
+}
+
+fn is_default_stalls_after(value: &StallDuration) -> bool {
+    value == &default_stalls_after()
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -506,10 +604,15 @@ pub struct RuleDecl {
     pub selectors: NormalizedList<PolicySelector>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unmatched: Option<UnmatchedPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stalls_after: Option<StallDuration>,
 }
 
 impl RuleDecl {
-    fn matches(&self, actor: &str, operation: &str, candidate: &PolicyCandidate) -> bool {
+    #[must_use]
+    pub fn matches(&self, actor: &str, operation: &str, candidate: &PolicyCandidate) -> bool {
         dimension_matches(&self.actors, actor)
             && dimension_matches(&self.operations, operation)
             && dimension_matches(&self.repositories, &candidate.repository)
@@ -789,7 +892,8 @@ impl PolicySelector {
             || self.pattern.contains("${inputs.")
     }
 
-    fn matches(&self, candidate: &PolicyCandidate) -> bool {
+    #[must_use]
+    pub fn matches(&self, candidate: &PolicyCandidate) -> bool {
         match self.prefix {
             SelectorPrefix::Label => candidate
                 .labels
@@ -1265,7 +1369,50 @@ denies:
             let manifest = PolicyManifest::from_yaml(yaml).expect("defaults parse");
             assert_eq!(manifest.defaults.grant.unmatched, UnmatchedPolicy::Warn);
             assert_eq!(manifest.defaults.deny.unmatched, UnmatchedPolicy::Block);
+            assert_eq!(manifest.defaults.stalls_after.to_string(), "7d");
+            assert_eq!(manifest.defaults.stalls_after.as_seconds(), 604_800);
         }
+    }
+
+    #[test]
+    fn stalls_after_defaults_to_seven_days_and_rules_override_it() {
+        let manifest = PolicyManifest::from_yaml(
+            "manifest_version: 1\ndefaults: {stalls_after: 9d}\ngrants:\n  held-placeholder:\n    requires: placeholder-check\n    stalls_after: 12h\n",
+        )
+        .expect("stalls_after durations parse");
+        assert_eq!(manifest.defaults.stalls_after.to_string(), "9d");
+        assert_eq!(
+            manifest.grants["held-placeholder"]
+                .stalls_after
+                .as_ref()
+                .map(StallDuration::as_seconds),
+            Some(43_200)
+        );
+        assert_eq!(
+            manifest.grants["held-placeholder"].requires.as_deref(),
+            Some("placeholder-check")
+        );
+
+        for value in ["0d", "7", "-1d", "1day", "18446744073709551615w"] {
+            let error = PolicyManifest::from_yaml(&format!(
+                "manifest_version: 1\ndefaults: {{stalls_after: {value}}}\n"
+            ))
+            .expect_err("invalid stalls_after must fail");
+            assert!(error.to_string().contains("stalls_after"), "{error}");
+        }
+    }
+
+    #[test]
+    fn grant_requires_is_plural_and_closed_schema() {
+        PolicyManifest::from_yaml(
+            "manifest_version: 1\ngrants:\n  placeholder:\n    requires: placeholder-check\n",
+        )
+        .expect("plural grant requirement parses");
+        let error = PolicyManifest::from_yaml(
+            "manifest_version: 1\ngrants:\n  placeholder:\n    require: placeholder-check\n",
+        )
+        .expect_err("singular grant requirement is not in the schema");
+        assert!(error.to_string().contains("require"), "{error}");
     }
 
     #[test]

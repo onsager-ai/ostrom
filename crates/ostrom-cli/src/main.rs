@@ -74,6 +74,25 @@ enum Command {
         #[arg(long, requires = "actor", conflicts_with = "settings")]
         check_settings: Option<PathBuf>,
     },
+    /// Explain how authored policy resolves for one pull request.
+    Explain {
+        target: String,
+        /// Policy manifest; defaults to repository then user configuration.
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+        /// Actor projection to explain.
+        #[arg(long, default_value = "builder")]
+        actor: String,
+        /// Operation projection to explain.
+        #[arg(long, default_value = "work")]
+        operation: String,
+        /// Recorded sweep responses for a hermetic explanation.
+        #[arg(long, hide = true)]
+        fixture: Option<PathBuf>,
+        /// Observation clock for hermetic replay.
+        #[arg(long, hide = true)]
+        started_at: Option<String>,
+    },
     /// Run one command with a scoped GitHub App installation credential.
     Credential {
         role: String,
@@ -461,6 +480,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             settings.as_deref(),
             check_settings.as_deref(),
         )?,
+        Command::Explain {
+            target,
+            manifest,
+            actor,
+            operation,
+            fixture,
+            started_at,
+        } => {
+            let observed_at = resolve_started_at(started_at.as_deref(), &clock)?;
+            let cwd = env::current_dir()?;
+            let output = policy_manifest::run_explain(&policy_manifest::ExplainOptions {
+                paths: &paths,
+                working_directory: &cwd,
+                target: &target,
+                manifest: manifest.as_deref(),
+                fixture: fixture.as_deref(),
+                observed_at,
+                actor: &actor,
+                operation: &operation,
+            })?;
+            io::stdout().write_all(output.as_bytes())?;
+        }
         Command::Credential {
             role,
             repository,
@@ -838,6 +879,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .value_os()
                 .or_else(|| environment::CLAUDE_PLUGIN_ROOT.value_os())
                 .map_or_else(|| cwd.join("plugins/ostrom"), PathBuf::from);
+            let policy = policy_manifest::load_optional_bundle(&paths, &cwd)?;
             let outcome = run_sweep(&SweepOptions {
                 paths,
                 working_directory: cwd,
@@ -847,6 +889,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 requested_mode: mode.into(),
                 fixture,
                 publish,
+                policy,
             })?;
             println!(
                 "mandate sweep: {} projects; {} queue changes",
@@ -869,6 +912,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .value_os()
                 .or_else(|| environment::CLAUDE_PLUGIN_ROOT.value_os())
                 .map_or_else(|| cwd.join("plugins/ostrom"), PathBuf::from);
+            let policy = policy_manifest::load_optional_bundle(&paths, &cwd)?;
             let check_resolutions = resolve_plan_checks(&paths, &cwd, &plugin_root)?;
             execute_prepared_checks(
                 &paths,
@@ -886,6 +930,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     requested_mode: mode.into(),
                     fixture,
                     publish: PublishTarget::Disabled,
+                    policy,
                 },
                 resolved_checks: check_resolutions.resolved,
                 check_resolution_faults: check_resolutions.faults,

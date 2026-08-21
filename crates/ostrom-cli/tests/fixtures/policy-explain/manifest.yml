@@ -1,0 +1,21 @@
+manifest_version: 1
+defaults:
+  stalls_after: 7d
+actors:
+  builder: {}
+operations:
+  work: {steps: []}
+grants:
+  R-rust-green:
+    actors: builder
+    operations: work
+    repositories: onsager-ai/ostrom
+    where: label:delegated-placeholder
+    requires: rust-green
+denies:
+  R-plugin-manifest:
+    actors: builder
+    operations: work
+    repositories: onsager-ai/ostrom
+    where: path:**/.claude-plugin/plugin.json
+    stalls_after: 7d

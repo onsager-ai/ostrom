@@ -1054,6 +1054,7 @@ mod tests {
                 requested_mode: crate::SweepMode::Full,
                 fixture: Some(sweep_fixture),
                 publish: crate::PublishTarget::Disabled,
+                policy: None,
             },
             resolved_checks: BTreeMap::from([("sweep-parity".to_owned(), resolved)]),
             check_resolution_faults: BTreeMap::new(),

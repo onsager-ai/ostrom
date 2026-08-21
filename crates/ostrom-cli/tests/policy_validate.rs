@@ -265,3 +265,32 @@ fn operation_names_cannot_shadow_builtins_or_actions() {
         );
     }
 }
+
+#[test]
+fn grant_requires_naming_an_undefined_check_fails_the_load() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let manifest = temporary.path().join("manifest.yml");
+    fs::write(
+        &manifest,
+        "manifest_version: 1\ngrants:\n  placeholder-grant:\n    requires: missing-placeholder-check\n",
+    )
+    .expect("write manifest");
+    fs::write(
+        temporary.path().join("checks.yaml"),
+        "checks_version: 1\nchecks:\n  available-placeholder-check:\n    uses: cmd/run\n    with: {script: 'exit 0'}\n",
+    )
+    .expect("write checks");
+
+    let output = ostrom()
+        .args(["validate"])
+        .arg(manifest)
+        .output()
+        .expect("run validate");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("grant `placeholder-grant`"), "{stderr}");
+    assert!(
+        stderr.contains("requires undefined check `missing-placeholder-check`"),
+        "{stderr}"
+    );
+}
