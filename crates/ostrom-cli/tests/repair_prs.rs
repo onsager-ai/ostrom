@@ -31,6 +31,19 @@ fn executable(path: &Path, source: &str) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+fn publish_fixture_branch(source: &Path, branch: &str, start: &str, file: &str) -> String {
+    git(source, &["switch", "-c", branch, start]);
+    fs::write(source.join(file), format!("{branch}\n")).unwrap();
+    git(source, &["add", file]);
+    git(source, &["commit", "-m", &format!("fixture {branch}")]);
+    let head = String::from_utf8(git(source, &["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    git(source, &["push", "origin", branch]);
+    head
+}
+
 #[test]
 fn repair_usage_and_repository_failures_match_the_shell_contract() {
     let fixture = tempdir().expect("temporary repair fixture");
@@ -141,7 +154,7 @@ esac
 }
 
 #[test]
-fn repair_only_pushes_the_builders_own_green_pr_with_an_ordinary_refspec() {
+fn repair_admits_red_heads_only_for_green_bases_and_preserves_scope_and_cap() {
     let fixture = tempdir().expect("temporary published repair fixture");
     let home = fixture.path().join("home");
     let source = fixture.path().join("source");
@@ -190,15 +203,6 @@ projects:
         &["remote", "add", "origin", remote.to_str().unwrap()],
     );
     git(&source, &["push", "-u", "origin", "main"]);
-    git(&source, &["switch", "-c", "builder-head", &initial]);
-    fs::write(source.join("builder.txt"), "builder\n").unwrap();
-    git(&source, &["add", "builder.txt"]);
-    git(&source, &["commit", "-m", "fixture builder"]);
-    let builder_head = String::from_utf8(git(&source, &["rev-parse", "HEAD"]).stdout)
-        .unwrap()
-        .trim()
-        .to_owned();
-    git(&source, &["push", "origin", "builder-head"]);
     git(&source, &["switch", "main"]);
     fs::write(source.join("base.txt"), "base\n").unwrap();
     git(&source, &["add", "base.txt"]);
@@ -208,6 +212,19 @@ projects:
         .trim()
         .to_owned();
     git(&source, &["push", "origin", "main"]);
+    let red_base_head = publish_fixture_branch(&source, "red-base", &initial, "red-base.txt");
+    let green_conflicting_head = publish_fixture_branch(
+        &source,
+        "green-conflicting-head",
+        &initial,
+        "green-conflicting.txt",
+    );
+    let red_mergeable_head =
+        publish_fixture_branch(&source, "red-mergeable-head", &initial, "red-mergeable.txt");
+    let green_cap_head =
+        publish_fixture_branch(&source, "green-cap-head", &initial, "green-cap.txt");
+    let skipped_cap_head =
+        publish_fixture_branch(&source, "skipped-cap-head", &initial, "skipped-cap.txt");
 
     let listing = fixture.path().join("prs.json");
     fs::write(
@@ -218,9 +235,9 @@ projects:
                 "body": "Synthetic fixture.\n\nOstrom-Role: builder\n",
                 "author": {"login": "ostrom-builder[bot]", "is_bot": true},
                 "mergeable": "CONFLICTING",
-                "headRefName": "builder-head",
+                "headRefName": "green-conflicting-head",
                 "baseRefName": "main",
-                "headRefOid": builder_head,
+                "headRefOid": green_conflicting_head,
                 "isCrossRepository": false
             },
             {
@@ -238,9 +255,79 @@ projects:
                 "body": "Synthetic fixture.\n\nOstrom-Role: builder\n",
                 "author": {"login": "ostrom-builder[bot]", "is_bot": true},
                 "mergeable": "CONFLICTING",
-                "headRefName": "failing-head",
-                "baseRefName": "main",
+                "headRefName": "red-red-head",
+                "baseRefName": "red-base",
                 "headRefOid": "3333333333333333333333333333333333333333",
+                "isCrossRepository": false
+            },
+            {
+                "number": 4,
+                "body": "Synthetic fixture.\n\nOstrom-Role: builder\n",
+                "author": {"login": "ostrom-builder[bot]", "is_bot": true},
+                "mergeable": "MERGEABLE",
+                "headRefName": "red-mergeable-head",
+                "baseRefName": "main",
+                "headRefOid": red_mergeable_head,
+                "isCrossRepository": false
+            },
+            {
+                "number": 5,
+                "body": "Synthetic fixture.\n\nOstrom-Role: builder\n",
+                "author": {"login": "ostrom-builder[bot]", "is_bot": true},
+                "mergeable": "MERGEABLE",
+                "headRefName": "green-current-head",
+                "baseRefName": "main",
+                "headRefOid": "5555555555555555555555555555555555555555",
+                "isCrossRepository": false
+            },
+            {
+                "number": 6,
+                "body": "Synthetic fixture without a role marker.\n",
+                "author": {"login": "ostrom-builder[bot]", "is_bot": true},
+                "mergeable": "CONFLICTING",
+                "headRefName": "missing-role-head",
+                "baseRefName": "main",
+                "headRefOid": "6666666666666666666666666666666666666666",
+                "isCrossRepository": false
+            },
+            {
+                "number": 7,
+                "body": "Synthetic fixture.\n\nOstrom-Role: builder\n",
+                "author": {"login": "ostrom-builder[bot]", "is_bot": true},
+                "mergeable": "CONFLICTING",
+                "headRefName": "fork-head",
+                "baseRefName": "main",
+                "headRefOid": "7777777777777777777777777777777777777777",
+                "isCrossRepository": true
+            },
+            {
+                "number": 8,
+                "body": "Synthetic fixture.\n\nOstrom-Role: builder\n",
+                "author": {"login": "ostrom-builder[bot]", "is_bot": true},
+                "mergeable": "CONFLICTING",
+                "headRefName": "green-cap-head",
+                "baseRefName": "main",
+                "headRefOid": green_cap_head,
+                "isCrossRepository": false
+            },
+            {
+                "number": 9,
+                "body": "Synthetic fixture.\n\nOstrom-Role: builder\n",
+                "author": {"login": "ostrom-builder[bot]", "is_bot": true},
+                "mergeable": "CONFLICTING",
+                "headRefName": "skipped-cap-head",
+                "baseRefName": "main",
+                "headRefOid": skipped_cap_head,
+                "isCrossRepository": false
+            },
+            {
+                "number": 10,
+                "body": "Synthetic fixture.\n\nOstrom-Role: builder\n",
+                "author": {"login": "ostrom-builder[bot]", "is_bot": true},
+                "mergeable": "MERGEABLE",
+                "headRefName": "red-current-head",
+                "baseRefName": "main",
+                "headRefOid": base_head,
                 "isCrossRepository": false
             }
         ]))
@@ -260,11 +347,30 @@ shift
 if [ "$1 $2 $3" = "gh pr list" ]; then
   cat "$REPAIR_LISTING"
 elif [ "$1 $2 $3" = "gh pr view" ]; then
-  if [ "$4" = "1" ]; then
-    printf '%s\n' '{"statusCheckRollup":[{"name":"test","conclusion":"SUCCESS","status":"COMPLETED"}]}'
-  else
+  if [ "$4" = "3" ] || [ "$4" = "4" ] || [ "$4" = "10" ]; then
     printf '%s\n' '{"statusCheckRollup":[{"name":"test","conclusion":"FAILURE","status":"COMPLETED"}]}'
+  else
+    printf '%s\n' '{"statusCheckRollup":[{"name":"test","conclusion":"SUCCESS","status":"COMPLETED"}]}'
   fi
+elif [ "$1 $2 $3" = "gh api graphql" ]; then
+  qualified_name=
+  for argument in "$@"; do
+    case "$argument" in qualifiedName=*) qualified_name=${argument#qualifiedName=} ;; esac
+  done
+  if [ "$qualified_name" = "refs/heads/red-base" ]; then
+    oid=$REPAIR_RED_BASE
+    conclusion=FAILURE
+  else
+    oid=$REPAIR_GREEN_BASE
+    conclusion=SUCCESS
+  fi
+  printf '%s\n' "{\"data\":{\"repository\":{\"ref\":{\"target\":{\"oid\":\"$oid\",\"statusCheckRollup\":{\"contexts\":{\"nodes\":[{\"conclusion\":\"$conclusion\",\"status\":\"COMPLETED\"}],\"pageInfo\":{\"hasNextPage\":false}}}}}}}}"
+elif [ "$1 $2" = "gh api" ]; then
+  case "$3" in
+    *"$REPAIR_GREEN_BASE...$REPAIR_GREEN_BASE"*) status=identical ;;
+    *) status=ahead ;;
+  esac
+  printf '%s\n' "{\"status\":\"$status\"}"
 elif [ "$1 $2 $4" = "git -C fetch" ]; then
   exec git -C "$3" fetch --no-tags "$REPAIR_REMOTE" "$7" "$8"
 elif [ "$1 $2 $4" = "git -C push" ]; then
@@ -282,6 +388,8 @@ fi
         .env("REPAIR_LISTING", &listing)
         .env("REPAIR_CALLS", &calls)
         .env("REPAIR_REMOTE", &remote)
+        .env("REPAIR_RED_BASE", &red_base_head)
+        .env("REPAIR_GREEN_BASE", &base_head)
         .current_dir(fixture.path())
         .output()
         .expect("repair eligible published pull request");
@@ -291,48 +399,149 @@ fi
         String::from_utf8_lossy(&output.stderr)
     );
     let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(summary["attempted"], 1);
-    assert_eq!(summary["repaired"], 1);
+    assert_eq!(summary["attempted"], 3);
+    assert_eq!(summary["repaired"], 3);
+    assert_eq!(summary["skipped"], 4);
     assert_eq!(summary["failed"], 0);
     let repaired_head = String::from_utf8(
         Command::new("git")
             .arg(format!("--git-dir={}", remote.display()))
-            .args(["rev-parse", "builder-head"])
+            .args(["rev-parse", "green-conflicting-head"])
             .output()
             .unwrap()
             .stdout,
     )
     .unwrap();
-    assert_ne!(repaired_head.trim(), builder_head);
+    assert_ne!(repaired_head.trim(), green_conflicting_head);
     let parents = String::from_utf8(
         Command::new("git")
             .arg(format!("--git-dir={}", remote.display()))
-            .args(["rev-list", "--parents", "-n", "1", "builder-head"])
+            .args(["rev-list", "--parents", "-n", "1", "green-conflicting-head"])
             .output()
             .unwrap()
             .stdout,
     )
     .unwrap();
     let parents = parents.split_whitespace().collect::<Vec<_>>();
-    assert_eq!(parents[1], builder_head);
+    assert_eq!(parents[1], green_conflicting_head);
     assert_eq!(parents[2], base_head);
     let calls = fs::read_to_string(calls).unwrap();
     assert!(calls.contains("gh pr view 1 "));
     assert!(calls.contains("gh pr view 3 "));
+    assert!(calls.contains("gh pr view 4 "));
+    assert!(calls.contains("gh pr view 5 "));
+    assert!(calls.contains("gh pr view 8 "));
+    assert!(calls.contains("gh pr view 9 "));
+    assert!(calls.contains("gh pr view 10 "));
     assert!(!calls.contains("gh pr view 2 "));
-    let push = calls
+    assert!(!calls.contains("gh pr view 6 "));
+    assert!(!calls.contains("gh pr view 7 "));
+    assert_eq!(calls.matches("gh api graphql").count(), 3);
+    assert_eq!(calls.matches(" gh api repos/").count(), 2);
+    assert!(calls.contains(
+        "--permissions metadata:read,pull_requests:read,checks:read,statuses:read -- gh api graphql"
+    ));
+    assert!(calls.contains(
+        "--permissions metadata:read,contents:read -- gh api repos/placeholder-org/repair-repo/compare/"
+    ));
+    let pushes = calls
         .lines()
-        .find(|line| line.contains(" git -C ") && line.contains(" push "))
-        .unwrap();
-    assert!(push.contains("HEAD:refs/heads/builder-head"));
-    assert!(!push.contains("--force"));
-    assert!(!push.contains(" -f "));
-    let trace: Value = serde_json::from_str(
-        fs::read_to_string(home.join("sprint.jsonl"))
-            .unwrap()
-            .trim(),
-    )
-    .unwrap();
-    assert_eq!(trace["fact"]["outcome"], "repaired");
-    assert_eq!(trace["fact"]["owner"], "builder-placeholder-wake2");
+        .filter(|line| line.contains(" git -C ") && line.contains(" push "))
+        .collect::<Vec<_>>();
+    assert_eq!(pushes.len(), 3);
+    assert!(
+        pushes
+            .iter()
+            .any(|push| push.contains("HEAD:refs/heads/red-mergeable-head"))
+    );
+    assert!(pushes.iter().all(|push| !push.contains("--force")));
+    assert!(pushes.iter().all(|push| !push.contains(" -f ")));
+
+    let traces = fs::read_to_string(home.join("sprint.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let traces_for = |number: u64| {
+        traces
+            .iter()
+            .filter(|trace| trace["fact"]["ref"] == format!("#{number}"))
+            .collect::<Vec<_>>()
+    };
+
+    let green_conflicting = traces_for(1);
+    assert_eq!(green_conflicting.len(), 1);
+    assert_eq!(
+        green_conflicting[0]["fact"],
+        json!({
+            "role": "builder",
+            "owner": "builder-placeholder-wake2",
+            "repo": "placeholder-org/repair-repo",
+            "ref": "#1",
+            "action": "merge-base-forward",
+            "outcome": "repaired",
+            "head_branch": "green-conflicting-head",
+            "base_branch": "main",
+            "head_sha": green_conflicting_head,
+            "base_sha": base_head,
+            "conflicted_paths": [],
+            "cap": 3,
+            "exit_code": 0
+        })
+    );
+    assert_eq!(green_conflicting[0]["narration"], json!({}));
+
+    let red_base = traces_for(3);
+    assert_eq!(red_base.len(), 1);
+    assert_eq!(red_base[0]["fact"]["outcome"], "red-head-red-base");
+    assert_eq!(red_base[0]["fact"]["base_sha"], red_base_head);
+    assert_eq!(
+        red_base[0]["narration"]["reason"],
+        "head and base branch checks are not green"
+    );
+
+    let red_mergeable = traces_for(4);
+    assert_eq!(red_mergeable.len(), 1);
+    assert_eq!(red_mergeable[0]["fact"]["outcome"], "repaired");
+    assert_eq!(red_mergeable[0]["fact"]["head_sha"], red_mergeable_head);
+
+    let not_behind = traces_for(5);
+    assert_eq!(not_behind.len(), 1);
+    assert_eq!(not_behind[0]["fact"]["outcome"], "green-head");
+
+    assert!(traces_for(2).is_empty());
+    assert!(traces_for(6).is_empty());
+    assert!(traces_for(7).is_empty());
+
+    let not_behind = traces_for(10);
+    assert_eq!(not_behind.len(), 1);
+    assert_eq!(not_behind[0]["fact"]["outcome"], "not-behind-base");
+    assert_eq!(
+        not_behind[0]["narration"]["reason"],
+        "head already contains the checked base commit"
+    );
+
+    let skipped_cap = traces_for(9);
+    assert_eq!(skipped_cap.len(), 1);
+    assert_eq!(
+        skipped_cap[0]["fact"],
+        json!({
+            "role": "builder",
+            "owner": "builder-placeholder-wake2",
+            "repo": "placeholder-org/repair-repo",
+            "ref": "#9",
+            "action": "merge-base-forward",
+            "outcome": "skipped-cap",
+            "head_branch": "skipped-cap-head",
+            "base_branch": "main",
+            "head_sha": skipped_cap_head,
+            "base_sha": null,
+            "conflicted_paths": [],
+            "cap": 3
+        })
+    );
+    assert_eq!(
+        skipped_cap[0]["narration"]["reason"],
+        "per-pass repair cap reached"
+    );
 }
