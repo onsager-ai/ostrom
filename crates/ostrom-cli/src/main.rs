@@ -989,10 +989,10 @@ fn run_operations_command(
         println!("valid: {}", path.display());
         return Ok(());
     }
-    if let Some(actor) = actor
-        && !manifest.actors.contains_key(actor)
-    {
-        return Err(OperationDispatchError::UnknownActor(actor.to_owned()).into());
+    if let Some(actor) = actor {
+        if !manifest.actors.contains_key(actor) {
+            return Err(OperationDispatchError::UnknownActor(actor.to_owned()).into());
+        }
     }
     for (name, operation) in &manifest.operations {
         let visible = actor.is_none_or(|actor| {
