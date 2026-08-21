@@ -17,7 +17,8 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::{
-    OstromPaths, set_private_file_mode, sweep::load_config, sweep::load_config_or_defaults,
+    OstromPaths, environment, set_private_file_mode, sweep::load_config,
+    sweep::load_config_or_defaults,
 };
 
 const QUERY_LIMIT: usize = 200;
@@ -184,7 +185,9 @@ pub fn audit(options: &AuditOptions) -> Result<String, AuditError> {
     if config.projects.is_empty() {
         return Err(AuditError::EmptyRoster);
     }
-    let host = env::var("GH_HOST").unwrap_or_else(|_| "github.com".to_owned());
+    let host = environment::GH_HOST
+        .value()
+        .unwrap_or_else(|| "github.com".to_owned());
     if !command_output(Command::new("gh").args(["auth", "status", "--hostname", &host]))
         .is_ok_and(|output| output.status.success())
     {
@@ -1119,7 +1122,7 @@ fn command_output(command: &mut Command) -> std::io::Result<Output> {
 }
 
 fn command_exists(name: &str) -> bool {
-    let Some(path) = env::var_os("PATH") else {
+    let Some(path) = environment::PATH.value_os() else {
         return false;
     };
     env::split_paths(&path).any(|directory| directory.join(name).is_file())

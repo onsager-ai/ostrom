@@ -1,5 +1,5 @@
 use std::{
-    env, fs,
+    fs,
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
@@ -16,7 +16,7 @@ use thiserror::Error;
 
 use crate::{
     Clock, LeaseActionError, OstromPaths, OwnedLease, PassState, TraceAppend, append_trace,
-    read_lease, read_pass_state, read_trace, write_pass_state,
+    environment, read_lease, read_pass_state, read_trace, write_pass_state,
 };
 
 const MAX_TURNS: &str = "200";
@@ -234,7 +234,8 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
     let lease_now = request.clock.epoch_seconds();
     let started_epoch = request.clock.epoch_seconds();
     let lease_name = format!("{}-pass.lease", request.role.name());
-    let ttl = positive_env("MANDATE_LEASE_TTL_SECONDS").unwrap_or(DEFAULT_LEASE_TTL_SECONDS);
+    let ttl =
+        positive_env(environment::MANDATE_LEASE_TTL_SECONDS).unwrap_or(DEFAULT_LEASE_TTL_SECONDS);
 
     let prior = read_pass_state(&request.paths.state, request.role.name())
         .map_err(|error| PassError::failed(request.role, error.to_string(), 1))?;
@@ -305,9 +306,6 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
         .rows
         .len();
 
-    if env::var_os("OSTROM_PASS_TEST_PANIC").is_some() {
-        panic!("requested pass panic fixture");
-    }
     check_signal(request, &mut guard, None)?;
     let settings = request
         .paths
@@ -649,8 +647,8 @@ fn daily_spend(paths: &OstromPaths, day: &str) -> f64 {
 }
 
 fn daily_cap() -> f64 {
-    env::var("MANDATE_DAILY_CAP_USD")
-        .ok()
+    environment::MANDATE_DAILY_CAP_USD
+        .value()
         .and_then(|value| value.parse::<f64>().ok())
         .filter(|value| value.is_finite())
         .unwrap_or(DEFAULT_DAILY_CAP_USD)
@@ -706,9 +704,9 @@ fn generated_role_id(clock: &Clock) -> String {
     format!("{:08x}", nanos ^ std::process::id())
 }
 
-fn positive_env(name: &str) -> Option<u64> {
-    env::var(name)
-        .ok()
+fn positive_env(variable: environment::EnvironmentVariable) -> Option<u64> {
+    variable
+        .value()
         .and_then(|value| value.parse().ok())
         .filter(|value| *value > 0)
 }

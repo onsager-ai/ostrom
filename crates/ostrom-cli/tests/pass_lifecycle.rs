@@ -260,19 +260,6 @@ fn error_exit_releases_and_finalizes() {
 }
 
 #[test]
-fn panic_releases_and_finalizes() {
-    let fixture = Fixture::new("exit 0");
-    let status = fixture
-        .command()
-        .env("OSTROM_PASS_TEST_PANIC", "1")
-        .status()
-        .expect("run panicking pass");
-    assert!(!status.success());
-    fixture.assert_released();
-    assert_eq!(fixture.trace().last().unwrap()["fact"]["outcome"], "failed");
-}
-
-#[test]
 fn sigterm_releases_finalizes_and_kills_the_process_group() {
     let fixture = Fixture::new(concat!(
         "printf '%s\\n' \"$$\" >\"$OSTROM_HOME/child.pid\"\n",

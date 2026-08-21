@@ -30,11 +30,11 @@ use ostrom_store::{
     SweepParityOptions, TraceAppend, TraceView, UnavailableAssessmentDeriver, acquire_lease,
     acquire_org_from_github, append_trace_checked, audit, branch_name, clear_work_order,
     create_work_order, credential_output, decide_queue_item, encode_org_snapshots,
-    encode_selection, finalize_exited_implementer, grant_excuse, item_hash, lease_status,
-    lint_queue_state, list_excuses, list_queue_json, local_drift, migrate, read_trace_json,
-    release_lease, render_constitution, render_digest, replay, run_dispatch, run_gate,
-    run_implement, run_pass, run_plan, run_repair_prs, run_selection, run_sweep, run_sweep_parity,
-    validate_lease_name, validate_work_order_file,
+    encode_selection, environment, finalize_exited_implementer, grant_excuse, item_hash,
+    lease_status, lint_queue_state, list_excuses, list_queue_json, local_drift, migrate,
+    read_trace_json, release_lease, render_constitution, render_digest, replay, run_dispatch,
+    run_gate, run_implement, run_pass, run_plan, run_repair_prs, run_selection, run_sweep,
+    run_sweep_parity, validate_lease_name, validate_work_order_file,
 };
 
 mod policy_manifest;
@@ -357,7 +357,7 @@ fn resolve_plan_deriver(
     if let Some(harness) = assessor.map(AssessmentHarness::from) {
         return named_plan_deriver(harness);
     }
-    let Some(configured) = env::var_os("OSTROM_PLAN_DERIVER") else {
+    let Some(configured) = environment::OSTROM_PLAN_DERIVER.value_os() else {
         return Box::new(UnavailableAssessmentDeriver);
     };
     let harness = match configured.to_str() {
@@ -377,11 +377,12 @@ fn resolve_plan_deriver(
 
 fn named_plan_deriver(harness: AssessmentHarness) -> Box<dyn ostrom_store::AssessmentDeriver> {
     let variable = match harness {
-        AssessmentHarness::Claude => "CLAUDE_BIN",
-        AssessmentHarness::Codex => "CODEX_BIN",
-        AssessmentHarness::Copilot => "COPILOT_BIN",
+        AssessmentHarness::Claude => environment::CLAUDE_BIN,
+        AssessmentHarness::Codex => environment::CODEX_BIN,
+        AssessmentHarness::Copilot => environment::COPILOT_BIN,
     };
-    let executable = env::var_os(variable)
+    let executable = variable
+        .value_os()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(harness.name()));
     Box::new(HarnessAssessmentDeriver::new(harness, executable))
@@ -456,8 +457,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             command: CheckCommand::Run,
         } => {
             let cwd = env::current_dir()?;
-            let plugin_root = env::var_os("OSTROM_PLUGIN_ROOT")
-                .or_else(|| env::var_os("CLAUDE_PLUGIN_ROOT"))
+            let plugin_root = environment::OSTROM_PLUGIN_ROOT
+                .value_os()
+                .or_else(|| environment::CLAUDE_PLUGIN_ROOT.value_os())
                 .map_or_else(|| cwd.join("plugins/ostrom"), PathBuf::from);
             let resolutions = resolve_plan_checks(&paths, &cwd, &plugin_root)?;
             if let Some(fault) = &resolutions.catalogue_fault {
@@ -569,9 +571,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Hook { command } => match command {
             HookCommand::SessionStart => {
                 let cwd = env::current_dir().unwrap_or_default();
-                let plugin_root = env::var_os("CLAUDE_PLUGIN_ROOT")
+                let plugin_root = environment::CLAUDE_PLUGIN_ROOT
+                    .value_os()
                     .map_or_else(|| cwd.join("plugins/ostrom"), PathBuf::from);
-                let home = env::var_os("HOME").map_or_else(PathBuf::new, PathBuf::from);
+                let home = environment::HOME
+                    .value_os()
+                    .map_or_else(PathBuf::new, PathBuf::from);
                 let output = render_constitution(&plugin_root, &paths.config, &cwd, &home);
                 io::stdout().write_all(output.as_bytes())?;
             }
@@ -739,8 +744,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let started_at = resolve_started_at(started_at.as_deref(), &clock)?;
             let cwd = env::current_dir()?;
             let executable = env::current_exe()?;
-            let plugin_root = env::var_os("OSTROM_PLUGIN_ROOT")
-                .or_else(|| env::var_os("CLAUDE_PLUGIN_ROOT"))
+            let plugin_root = environment::OSTROM_PLUGIN_ROOT
+                .value_os()
+                .or_else(|| environment::CLAUDE_PLUGIN_ROOT.value_os())
                 .map_or_else(|| cwd.join("plugins/ostrom"), PathBuf::from);
             let options = SweepParityOptions::from_environment(
                 cwd,
@@ -796,8 +802,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             })?;
             let cwd = env::current_dir()?;
             let executable = env::current_exe()?;
-            let plugin_root = env::var_os("OSTROM_PLUGIN_ROOT")
-                .or_else(|| env::var_os("CLAUDE_PLUGIN_ROOT"))
+            let plugin_root = environment::OSTROM_PLUGIN_ROOT
+                .value_os()
+                .or_else(|| environment::CLAUDE_PLUGIN_ROOT.value_os())
                 .map_or_else(|| cwd.join("plugins/ostrom"), PathBuf::from);
             let outcome = run_sweep(&SweepOptions {
                 paths,
@@ -826,8 +833,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let started_at = resolve_started_at(started_at.as_deref(), &clock)?;
             let cwd = env::current_dir()?;
             let executable = env::current_exe()?;
-            let plugin_root = env::var_os("OSTROM_PLUGIN_ROOT")
-                .or_else(|| env::var_os("CLAUDE_PLUGIN_ROOT"))
+            let plugin_root = environment::OSTROM_PLUGIN_ROOT
+                .value_os()
+                .or_else(|| environment::CLAUDE_PLUGIN_ROOT.value_os())
                 .map_or_else(|| cwd.join("plugins/ostrom"), PathBuf::from);
             let check_resolutions = resolve_plan_checks(&paths, &cwd, &plugin_root)?;
             execute_prepared_checks(
@@ -958,8 +966,8 @@ fn run_lease_command(
     command: LeaseCommand,
     clock: &Clock,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let name = env::var("MANDATE_LEASE_NAME")
-        .ok()
+    let name = environment::MANDATE_LEASE_NAME
+        .value()
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "sprint.lease".to_owned());
     if let Err(error) = validate_lease_name(&name) {
@@ -972,8 +980,8 @@ fn run_lease_command(
             }
             let ttl = ttl_seconds
                 .or_else(|| {
-                    env::var("MANDATE_LEASE_TTL_SECONDS")
-                        .ok()
+                    environment::MANDATE_LEASE_TTL_SECONDS
+                        .value()
                         .filter(|value| !value.is_empty())
                 })
                 .unwrap_or_else(|| "3600".to_owned());
@@ -1025,11 +1033,11 @@ fn run_work_order_command(
         WorkOrderCommand::Create {
             candidate_json_file,
         } => {
-            let cost = env::var("MANDATE_ORDER_COST_CEILING_USD")
-                .ok()
+            let cost = environment::MANDATE_ORDER_COST_CEILING_USD
+                .value()
                 .filter(|value| !value.is_empty());
-            let tokens = env::var("MANDATE_ORDER_TOKEN_CEILING")
-                .ok()
+            let tokens = environment::MANDATE_ORDER_TOKEN_CEILING
+                .value()
                 .filter(|value| !value.is_empty());
             match create_work_order(
                 &paths.state,
@@ -1189,7 +1197,7 @@ fn run_pass_worker(role: CliPassRole, supervisor_pid: u32, clock: Clock) -> ! {
         eprintln!("ostrom: could not install signal handlers: {error}");
         std::process::exit(1);
     });
-    let claude_bin = env::var_os("CLAUDE_BIN").map_or_else(
+    let claude_bin = environment::CLAUDE_BIN.value_os().map_or_else(
         || {
             BaseDirs::new().map_or_else(
                 || PathBuf::from("claude"),
@@ -1231,8 +1239,9 @@ fn run_implement_worker(
         eprintln!("ostrom implementer: could not resolve working directory: {error}");
         std::process::exit(1);
     });
-    let plugin_root = env::var_os("OSTROM_PLUGIN_ROOT")
-        .or_else(|| env::var_os("CLAUDE_PLUGIN_ROOT"))
+    let plugin_root = environment::OSTROM_PLUGIN_ROOT
+        .value_os()
+        .or_else(|| environment::CLAUDE_PLUGIN_ROOT.value_os())
         .map_or_else(|| working_directory.join("plugins/ostrom"), PathBuf::from);
     let request = ImplementRequest {
         paths: compatible_command_paths(),
@@ -1265,8 +1274,9 @@ fn run_dispatch_command(arguments: Vec<String>, clock: Clock) -> ! {
         eprintln!("ostrom dispatch: could not resolve working directory: {error}");
         std::process::exit(1);
     });
-    let plugin_root = env::var_os("OSTROM_PLUGIN_ROOT")
-        .or_else(|| env::var_os("CLAUDE_PLUGIN_ROOT"))
+    let plugin_root = environment::OSTROM_PLUGIN_ROOT
+        .value_os()
+        .or_else(|| environment::CLAUDE_PLUGIN_ROOT.value_os())
         .map_or_else(|| working_directory.join("plugins/ostrom"), PathBuf::from);
     let request = DispatchRequest {
         paths: compatible_command_paths(),
@@ -1354,9 +1364,11 @@ fn run_doctor_command(
     check: Option<String>,
     clock: &Clock,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let render_environment = check.is_none();
     let cwd = env::current_dir()?;
-    let plugin_root = env::var_os("OSTROM_PLUGIN_ROOT")
-        .or_else(|| env::var_os("CLAUDE_PLUGIN_ROOT"))
+    let plugin_root = environment::OSTROM_PLUGIN_ROOT
+        .value_os()
+        .or_else(|| environment::CLAUDE_PLUGIN_ROOT.value_os())
         .map_or_else(|| cwd.join("plugins/ostrom"), PathBuf::from);
     let options = DoctorOptions::from_environment_at(plugin_root, clock.epoch_seconds());
     let output = if let Some(name) = check {
@@ -1372,6 +1384,18 @@ fn run_doctor_command(
         run_doctor(options)
     };
     io::stdout().write_all(output.as_bytes())?;
+    if render_environment {
+        for variable in ostrom_store::ENVIRONMENT_VARIABLES {
+            let (is_set, resolved) = variable.rendered_value();
+            writeln!(
+                io::stdout(),
+                "ENV|{}|class={}|set={}|resolved={resolved}",
+                variable.name,
+                variable.class,
+                if is_set { "yes" } else { "no" }
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -1389,7 +1413,10 @@ fn run_doctor_command(
 /// `$HOME/.claude/ostrom` fallback applies only when that directory exists, so
 /// a fresh install still lands on XDG.
 fn compatible_command_paths() -> OstromPaths {
-    if env::var_os("OSTROM_HOME").is_some_and(|home| !home.to_string_lossy().trim().is_empty()) {
+    if environment::OSTROM_HOME
+        .value_os()
+        .is_some_and(|home| !home.to_string_lossy().trim().is_empty())
+    {
         return resolved_or_exit();
     }
     // Empty means unset, matching the shell's `${CLAUDE_CONFIG_DIR:-...}`.
@@ -1399,8 +1426,9 @@ fn compatible_command_paths() -> OstromPaths {
     // non-empty value is honoured even if the directory does not exist yet,
     // because it is an instruction rather than a guess; the caller then gets a
     // named refusal that quotes it back.
-    if let Some(config) =
-        env::var_os("CLAUDE_CONFIG_DIR").filter(|value| !value.to_string_lossy().trim().is_empty())
+    if let Some(config) = environment::CLAUDE_CONFIG_DIR
+        .value_os()
+        .filter(|value| !value.to_string_lossy().trim().is_empty())
     {
         return collapsed_root(PathBuf::from(config).join("ostrom"));
     }
@@ -1696,7 +1724,7 @@ fn legacy_home() -> Result<PathBuf, Box<dyn std::error::Error>> {
     // The override exists for hermetic operator rehearsals. Tests call the
     // migration library with explicit temporary paths and never resolve this
     // default, which is the live directory the task forbids the suite to read.
-    if let Some(path) = env::var_os("OSTROM_LEGACY_HOME") {
+    if let Some(path) = environment::OSTROM_LEGACY_HOME.value_os() {
         return Ok(PathBuf::from(path));
     }
     let base = BaseDirs::new().ok_or("could not resolve the legacy home directory")?;

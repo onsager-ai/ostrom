@@ -14,7 +14,7 @@ use crate::{
         AuthenticatedCommandError, GitHubInstallationTokenMinter, InstallationTokenMinter,
         ScopedAppTokenRequest, authenticated_output,
     },
-    append_trace, load_config_or_defaults,
+    append_trace, environment, load_config_or_defaults,
 };
 
 const REPAIR_CAP: usize = 3;
@@ -838,7 +838,7 @@ fn conflict_paths(cwd: &Path) -> Vec<String> {
 }
 
 fn command_exists(name: &str) -> bool {
-    env::var_os("PATH").is_some_and(|path| {
+    environment::PATH.value_os().is_some_and(|path| {
         env::split_paths(&path).any(|directory| {
             let candidate = directory.join(name);
             candidate.is_file()

@@ -25,7 +25,7 @@ use crate::{
         AuthenticatedCommandError, GitHubInstallationTokenMinter, InstallationTokenMinter,
         ScopedAppTokenRequest, authenticated_output,
     },
-    append_trace, load_config_or_defaults,
+    append_trace, environment, load_config_or_defaults,
 };
 
 #[derive(Debug, Clone)]
@@ -256,8 +256,8 @@ fn run_implement_with_minter(
     // work order is even readable. Without this handoff, a truncated or missing
     // order strands the dispatch-owned lease without ever constructing an RAII
     // guard.
-    let inherited_lease_name = env::var("MANDATE_LEASE_NAME")
-        .ok()
+    let inherited_lease_name = environment::MANDATE_LEASE_NAME
+        .value()
         .filter(|name| !name.trim().is_empty());
     let mut inherited_lease = inherited_lease_name
         .as_deref()
@@ -305,7 +305,9 @@ fn run_implement_with_minter(
         lease,
         order,
         unit_name: request.unit_name.clone(),
-        backend: env::var("MANDATE_DISPATCH_BACKEND").unwrap_or_else(|_| "systemd".to_owned()),
+        backend: environment::MANDATE_DISPATCH_BACKEND
+            .value()
+            .unwrap_or_else(|| "systemd".to_owned()),
         started: request.clock.now(),
         clock: request.clock.clone(),
         failure_reason: "implementer-exited".to_owned(),
@@ -360,7 +362,9 @@ fn implement_inner(
     let source = resolve_source_repository(&guard.order.repository, config.as_ref())?;
     guard.source_repository = Some(source.clone());
 
-    let codex = env::var_os("CODEX_BIN").map_or_else(|| PathBuf::from("codex"), PathBuf::from);
+    let codex = environment::CODEX_BIN
+        .value_os()
+        .map_or_else(|| PathBuf::from("codex"), PathBuf::from);
     if !command_available(&codex) {
         return Err(ImplementError::new(
             1,
@@ -685,8 +689,8 @@ fn check_interrupt(
 }
 
 fn termination_grace() -> Result<Duration, ImplementError> {
-    match env::var("MANDATE_IMPLEMENTER_TERMINATION_GRACE_SECONDS") {
-        Ok(value) => value
+    match environment::MANDATE_IMPLEMENTER_TERMINATION_GRACE_SECONDS.value() {
+        Some(value) => value
             .parse::<u64>()
             .ok()
             .filter(|seconds| *seconds > 0)
@@ -698,7 +702,7 @@ fn termination_grace() -> Result<Duration, ImplementError> {
                     "termination grace must be a positive integer",
                 )
             }),
-        Err(_) => Ok(Duration::from_secs(5)),
+        None => Ok(Duration::from_secs(5)),
     }
 }
 
@@ -1024,7 +1028,7 @@ fn resolve_source_repository(
     repository: &str,
     config: Option<&MandateConfig>,
 ) -> Result<PathBuf, ImplementError> {
-    if let Some(source) = env::var_os("MANDATE_IMPLEMENTER_SOURCE_REPO") {
+    if let Some(source) = environment::MANDATE_IMPLEMENTER_SOURCE_REPO.value_os() {
         let source = PathBuf::from(source);
         return source.is_dir().then_some(source).ok_or_else(|| {
             ImplementError::new(
@@ -1233,7 +1237,7 @@ fn command_available(command: &Path) -> bool {
     if command.components().count() > 1 {
         return command.is_file();
     }
-    env::var_os("PATH").is_some_and(|path| {
+    environment::PATH.value_os().is_some_and(|path| {
         env::split_paths(&path).any(|directory| directory.join(command).is_file())
     })
 }

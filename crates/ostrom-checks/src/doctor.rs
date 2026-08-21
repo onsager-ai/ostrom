@@ -11,6 +11,7 @@ use std::{
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use ostrom_core::ActionDefinition;
+use ostrom_store::environment;
 use serde_json::{Map, Value, json};
 
 use crate::{
@@ -63,23 +64,28 @@ impl DoctorOptions {
     #[must_use]
     pub fn from_environment_at(plugin_root: impl Into<PathBuf>, now_epoch: u64) -> Self {
         let cwd = env::current_dir().unwrap_or_default();
-        let home = env::var_os("HOME").map_or_else(PathBuf::new, PathBuf::from);
-        let config_dir = env::var_os("CLAUDE_CONFIG_DIR").map_or_else(
-            || {
-                if home.is_absolute() {
-                    home.join(".claude")
-                } else {
-                    cwd.join(&home).join(".claude")
-                }
-            },
-            PathBuf::from,
-        );
+        let environment_snapshot = env::vars_os().collect::<BTreeMap<_, _>>();
+        let home = environment_snapshot
+            .get(OsStr::new(environment::HOME.name))
+            .map_or_else(PathBuf::new, PathBuf::from);
+        let config_dir = environment_snapshot
+            .get(OsStr::new(environment::CLAUDE_CONFIG_DIR.name))
+            .map_or_else(
+                || {
+                    if home.is_absolute() {
+                        home.join(".claude")
+                    } else {
+                        cwd.join(&home).join(".claude")
+                    }
+                },
+                PathBuf::from,
+            );
         Self {
             plugin_root: plugin_root.into(),
             config_dir,
             cwd,
             home,
-            env: env::vars_os().collect(),
+            env: environment_snapshot,
             now_epoch,
         }
     }
@@ -179,10 +185,6 @@ impl DoctorContext {
             .env
             .get(OsStr::new(name))
             .map(OsString::as_os_str)
-    }
-
-    fn env_text(&self, name: &str) -> Option<&str> {
-        self.env(name).and_then(OsStr::to_str)
     }
 
     fn command(&self, executable: impl AsRef<OsStr>) -> Command {

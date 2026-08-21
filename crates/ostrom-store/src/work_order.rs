@@ -8,7 +8,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
-    env, fs,
+    fs,
     io::Write,
     path::{Path, PathBuf},
     process::Command,
@@ -23,7 +23,7 @@ use tempfile::NamedTempFile;
 use thiserror::Error;
 
 use crate::{
-    Clock, TraceAppend, TraceFactRecord, append_trace, read_lease, read_trace,
+    Clock, TraceAppend, TraceFactRecord, append_trace, environment, read_lease, read_trace,
     set_private_file_mode,
 };
 
@@ -612,7 +612,8 @@ fn observe_unit(order: &InFlightOrder) -> UnitObservation {
             detail: format!("cannot inspect unsupported backend {}", order.backend),
         };
     }
-    let executable = env::var_os("MANDATE_SYSTEMCTL_BIN")
+    let executable = environment::MANDATE_SYSTEMCTL_BIN
+        .value_os()
         .map_or_else(|| PathBuf::from("systemctl"), PathBuf::from);
     let service = if order.unit_name.ends_with(".service") {
         order.unit_name.clone()
