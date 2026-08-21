@@ -178,7 +178,7 @@ fn fixture_sweep_refuses_a_query_at_the_exhaustiveness_cap() {
 }
 
 #[test]
-fn incremental_fixture_retains_unchanged_issue_records_and_queue_bytes() {
+fn incremental_fixture_retains_issues_in_the_current_open_set_and_queue_bytes() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let home = tempdir().expect("temporary OSTROM_HOME");
     fs::write(home.path().join("mandates.yaml"), ROSTER).expect("write fixture roster");
@@ -209,7 +209,6 @@ fn incremental_fixture_retains_unchanged_issue_records_and_queue_bytes() {
     let mut fixture: serde_json::Value =
         serde_json::from_slice(&fs::read(&fixture_path).expect("read fixture"))
             .expect("parse fixture");
-    fixture["repositories"][0]["issues"] = serde_json::json!([]);
     fixture["repositories"][0]["issue_not_modified"] = serde_json::json!(true);
     let incremental_fixture = home.path().join("incremental.json");
     fs::write(
@@ -294,6 +293,7 @@ case "$1 $2" in
   "api -X")
     case "$*" in
       *"/branches?"*) printf '%s\n' '[]'; exit 0 ;;
+      *"issues?state=open"*) printf '%s\n' '[]'; exit 0 ;;
     esac
     printf 'HTTP/2 304 Not Modified\r\netag: fixture-etag\r\n\r\n'
     exit 1
@@ -344,6 +344,9 @@ esac
     let calls = fs::read_to_string(log).expect("read gh call log");
     assert!(calls.contains("If-None-Match: fixture-etag"));
     assert!(calls.contains("since=2026-07-31T00:00:00Z"));
+    assert!(calls.contains(
+        "api -X GET repos/example-org/example-repo/issues?state=open&sort=updated&direction=asc&per_page=100&page=1"
+    ));
     assert!(calls.contains("api graphql -f query=query OstromDependencyGraph"));
     assert!(calls.contains("pr list --repo example-org/example-repo --state open --limit 200"));
     assert!(calls.contains(
@@ -408,6 +411,103 @@ fn placeholder_repository() -> serde_json::Value {
         "branch_read_degraded": false,
         "ci_runs": [],
     })
+}
+
+#[test]
+fn incremental_sweep_drops_a_stuck_row_when_closure_is_absent_from_the_delta() {
+    let home = tempdir().expect("temporary OSTROM_HOME");
+    fs::write(home.path().join("mandates.yaml"), PLACEHOLDER_ROSTER)
+        .expect("write placeholder roster");
+    let record = serde_json::json!({
+        "id": "placeholder-org/alpha#7",
+        "repo": "placeholder-org/alpha",
+        "number": 7,
+        "ref": "#7",
+        "type": "issue",
+        "title": "Closed placeholder work",
+        "blocked_by": [],
+        "parent": null,
+        "children": [],
+        "closes": [],
+        "labels": [],
+        "refs": [7],
+        "closing_refs": [],
+        "files": [],
+        "opened": "2026-07-01T00:00:00Z",
+        "updated": "2026-07-15T00:00:00Z",
+        "ci": "none",
+        "ready": false,
+        "review": "",
+        "fingerprint": "placeholder-closed-fingerprint"
+    });
+    fs::write(
+        home.path().join("state.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "version": 2,
+            "sweep_mode": "incremental",
+            "repos": {
+                "placeholder-org/alpha": {
+                    "cursor": "2026-08-01T00:00:00Z",
+                    "records": {"placeholder-org/alpha#7": record}
+                }
+            }
+        }))
+        .expect("serialize prior state"),
+    )
+    .expect("write prior state");
+    fs::write(
+        home.path().join("queue.jsonl"),
+        concat!(
+            r##"{"id":"placeholder-org/alpha#7","repo":"placeholder-org/alpha","ref":"#7","title":"Closed placeholder work","kind":"stuck","mandate":{"reason":"placeholder stuck reason"},"state":"pending","opened":"2026-07-01T00:00:00Z","age_days":31,"aged_out":true,"needs_judgment":false,"blocked_by":[]}"##,
+            "\n",
+        ),
+    )
+    .expect("write stuck queue row");
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/sweep-closed-stuck-incremental.json");
+
+    let output = run_placeholder_sweep(
+        home.path(),
+        &fixture,
+        &[
+            "--mode",
+            "incremental",
+            "--started-at",
+            "2026-08-02T00:00:00Z",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "sweep stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(home.path().join("queue.jsonl")).expect("read generated queue"),
+        ""
+    );
+    let state: serde_json::Value = serde_json::from_slice(
+        &fs::read(home.path().join("state.json")).expect("read generated state"),
+    )
+    .expect("parse generated state");
+    assert_eq!(state["sweep_mode"], "incremental");
+    assert!(
+        state["repos"]["placeholder-org/alpha"]["records"]
+            .get("placeholder-org/alpha#7")
+            .is_none(),
+        "closed record survived an already-advanced cursor"
+    );
+    let trace = fs::read_to_string(home.path().join("sprint.jsonl")).expect("read drop trace");
+    let rows = trace
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("trace row"))
+        .collect::<Vec<_>>();
+    let dropped = rows
+        .iter()
+        .find(|row| row["kind"] == "queue-item-dropped")
+        .expect("closed-item drop trace");
+    assert_eq!(dropped["fact"]["item_id"], "placeholder-org/alpha#7");
+    assert_eq!(dropped["fact"]["reason"], "subject-closed");
+    assert_eq!(dropped["fact"]["action"], "drop-from-queue");
 }
 
 #[test]
@@ -656,6 +756,7 @@ case "$1 $2" in
   "auth status") exit 0 ;;
   "api -X")
     case "$*" in
+      *"issues?state=open"*) printf '%s\n' '[]' ;;
       *"/issues?"*) printf 'HTTP/2 200 OK\r\netag: placeholder-etag\r\n\r\n[]' ;;
       *"/branches?"*) branch_page ;;
       *) exit 9 ;;
