@@ -2,13 +2,17 @@ use std::{fs, path::Path, process::Command};
 
 use tempfile::TempDir;
 
+mod support;
+
 const LOCAL_POLICY: &str = "manifest_version: 1\nactors: {builder: {}, gatekeeper: {}}\noperations:\n  local-proof:\n    name: Local proof\n    steps:\n      - uses: cmd/run\n        with:\n          script: 'test -z \"$GH_TOKEN\" && test -z \"$GITHUB_TOKEN\" && printf local-ok'\ngrants:\n  builder-local: {actors: builder, operations: local-proof, repositories: placeholder-org/repo}\n";
 
 fn ostrom(home: &Path) -> Command {
+    let trusted_keys = support::sign_manifest(&home.join("policy.yaml"));
     let mut command = Command::new(env!("CARGO_BIN_EXE_ostrom"));
     command
         .env("OSTROM_HOME", home)
         .env("OSTROM_POLICY_MANIFEST", home.join("policy.yaml"))
+        .env("OSTROM_POLICY_TRUSTED_KEYS", trusted_keys)
         .env("OSTROM_ACTOR", "builder");
     command
 }

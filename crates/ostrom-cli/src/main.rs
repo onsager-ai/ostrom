@@ -55,6 +55,16 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Sign a fully composed Ostrom policy manifest.
+    Sign {
+        /// Stable principal ID; its public key is installed as <KEY_ID>.pem.
+        #[arg(long)]
+        key_id: String,
+        /// RSA private key in PKCS#8 or PKCS#1 PEM form.
+        #[arg(long)]
+        key: PathBuf,
+        manifest: PathBuf,
+    },
     /// Parse and validate an Ostrom policy manifest.
     Validate {
         /// Print the fully composed scalar/list-normalized manifest.
@@ -466,6 +476,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let clock = Clock::realtime();
     let paths = compatible_command_paths();
     match cli.command {
+        Command::Sign {
+            key_id,
+            key,
+            manifest,
+        } => policy_manifest::run_sign(&manifest, &key_id, &key)?,
         Command::Validate {
             normalized,
             manifest,

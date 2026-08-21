@@ -3,7 +3,8 @@
 Operations are the only policy-authored capability an agent can invoke. The
 active manifest is `${OSTROM_POLICY_MANIFEST}` when set and otherwise
 `<Ostrom config>/policy.yaml`. The harness sets `OSTROM_ACTOR`; the positional
-target is resolved before the manifest grant/deny decision.
+target is resolved before the manifest grant/deny decision. Every load is
+signature-gated as described in [Policy manifest signing](policy-signing.md).
 
 ```yaml
 manifest_version: 1
