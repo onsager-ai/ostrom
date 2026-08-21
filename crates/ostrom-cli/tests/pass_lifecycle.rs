@@ -102,17 +102,19 @@ fn wait(mut child: Child) -> ExitStatus {
     child.wait().expect("wait for pass")
 }
 
-/// ostrom#99, the production path: every other test here pins `MANDATE_NOW_EPOCH`
-/// so simulated days are deterministic, and production sets it **nowhere**. A
-/// suite that pins it universally therefore never executes the branch the loop
-/// actually takes.
+/// ostrom#99, the production path: other tests pin one or more of the ambient
+/// clock seams so simulated days are deterministic, and production sets them
+/// **nowhere**. A suite that pins them universally therefore never executes the
+/// branch the loop actually takes.
 ///
 /// This is not a hypothetical. ostrom#323 was exactly this shape one variable
 /// over: every dispatch test set `OSTROM_HOME` or `CLAUDE_CONFIG_DIR`, the bug
 /// required neither to be set, and it took the loop down for 48 hours while CI
 /// stayed green. The bash suite guarded the clock case deliberately, with its
 /// own fixture and an explicit `env -u MANDATE_NOW_EPOCH`; that guard must not
-/// be lost in the move to Rust.
+/// be lost in the move to Rust. Remove every clock seam here, including the
+/// helper-mediated audit, replay, and excuse clocks, so adding a fixture clock
+/// elsewhere cannot silently weaken this production-path test.
 ///
 /// The claim is "the real clock, not the simulated day" — not a specific date —
 /// so both sides of a UTC midnight crossing are accepted rather than letting a
@@ -122,11 +124,23 @@ fn an_unpinned_clock_stamps_pass_rows_with_the_real_date() {
     let fixture = Fixture::new("exit 0");
 
     let before = chrono_free_utc_date();
-    let status = fixture
-        .command()
-        .env_remove("MANDATE_NOW_EPOCH")
-        .env_remove("MANDATE_TRACE_TIME")
-        .env_remove("MANDATE_TODAY")
+    let mut command = fixture.command();
+    for name in [
+        "MANDATE_NOW_EPOCH",
+        "MANDATE_TRACE_TIME",
+        "MANDATE_TODAY",
+        "MANDATE_GATE_TIME",
+        "MANDATE_SWEEP_TIME",
+        "MANDATE_EVENT_TIME",
+        "MANDATE_DIGEST_TIME",
+        "MANDATE_LEASE_NOW_EPOCH",
+        "MANDATE_AUDIT_TIME",
+        "MANDATE_REPLAY_TIME",
+        "MANDATE_EXCUSE_TIME",
+    ] {
+        command.env_remove(name);
+    }
+    let status = command
         .status()
         .expect("run pass with an unpinned clock");
     assert!(status.success());
