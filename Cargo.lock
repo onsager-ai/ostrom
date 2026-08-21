@@ -832,9 +832,12 @@ dependencies = [
  "ostrom-checks",
  "ostrom-core",
  "ostrom-store",
+ "serde",
  "serde_json",
+ "serde_yaml",
  "signal-hook",
  "tempfile",
+ "thiserror",
 ]
 
 [[package]]

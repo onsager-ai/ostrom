@@ -1,0 +1,5 @@
+grant: kirzner-builder
+actors: builder
+operations: work
+repositories: onsager-ai/kirzner
+where: label:area:ux

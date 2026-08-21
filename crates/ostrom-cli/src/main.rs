@@ -36,6 +36,8 @@ use ostrom_store::{
     validate_lease_name, validate_work_order_file,
 };
 
+mod policy_manifest;
+
 #[derive(Debug, Parser)]
 #[command(name = "ostrom", version, about = "Ostrom workflow commons CLI")]
 struct Cli {
@@ -45,6 +47,13 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Parse and validate an Ostrom policy manifest.
+    Validate {
+        /// Print the fully composed scalar/list-normalized manifest.
+        #[arg(long)]
+        normalized: bool,
+        manifest: PathBuf,
+    },
     /// Run one command with a scoped GitHub App installation credential.
     Credential {
         role: String,
@@ -413,6 +422,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let paths = compatible_command_paths();
     match cli.command {
+        Command::Validate {
+            normalized,
+            manifest,
+        } => policy_manifest::run_validate(&manifest, normalized)?,
         Command::Credential {
             role,
             repository,

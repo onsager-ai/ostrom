@@ -1,0 +1,5 @@
+grant: crawlab-pro-builder
+actors: builder
+operations: work
+repositories: crawlab-team/crawlab-pro
+where: label:ui

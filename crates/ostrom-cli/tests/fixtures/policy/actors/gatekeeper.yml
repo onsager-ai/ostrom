@@ -1,0 +1,3 @@
+actor: gatekeeper
+name: Gatekeeper
+description: Applies the merge gate.
