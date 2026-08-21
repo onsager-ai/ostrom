@@ -26,8 +26,8 @@ infer scope from the role or default to the App's ceiling.
 ## What these denies are, and are not
 
 **They are defence against inattention, not against intent.** They match command
-strings, and a command string has many equivalent spellings. `gh pr merge` is
-denied; the same merge through `gh api --method PUT repos/{owner}/{repo}/pulls/{n}/merge`,
+strings, and a command string has many equivalent spellings. Raw `gh pr merge`
+forms are denied; the same merge through `gh api --method PUT repos/{owner}/{repo}/pulls/{n}/merge`,
 through `gh api graphql` with `mergePullRequest`, through `curl`, or through the
 web interface is a different string. The lists below block the mutating `gh api`
 forms as well, which narrows the gap without closing it — enumerating every REST
@@ -125,6 +125,15 @@ included — onto the default branch. Stamping the merge would delete more
 attribution than it adds. The gatekeeper's role is recorded in its
 `decision-taken` trace record, which is durable and machine-readable, and is
 where an audit should look.
+
+The merge protocol invokes `ostrom merge <owner/repo> <pr-number>`. That
+wrapper resolves the pull request's current head with a repository-scoped
+gatekeeper credential, requires the most recent `pass` verdict for exactly
+that head SHA in `gate.jsonl`, and only then invokes `gh pr merge` through a
+second repository-scoped gatekeeper credential. An earlier head's pass does
+not authorize a later head. Exit 3 means the wrapper refused because the
+current head had no pass verdict; exit 4 means the GitHub merge was attempted
+and failed. Credential and head-resolution faults use other non-zero exits.
 
 ## Builder profile
 
@@ -234,6 +243,24 @@ claude --settings ~/.claude/ostrom/roles/gatekeeper.settings.json
       "Bash(gh issue close *)",
       "Bash(gh issue reopen *)",
       "Bash(gh pr reopen *)",
+      "Bash(gh pr merge)",
+      "Bash(gh pr merge *)",
+      "Bash(gh --repo * pr merge)",
+      "Bash(gh --repo * pr merge *)",
+      "Bash(gh --repo=* pr merge)",
+      "Bash(gh --repo=* pr merge *)",
+      "Bash(gh -R * pr merge)",
+      "Bash(gh -R * pr merge *)",
+      "Bash(gh -R* pr merge)",
+      "Bash(gh -R* pr merge *)",
+      "Bash(gh pr --repo * merge)",
+      "Bash(gh pr --repo * merge *)",
+      "Bash(gh pr --repo=* merge)",
+      "Bash(gh pr --repo=* merge *)",
+      "Bash(gh pr -R * merge)",
+      "Bash(gh pr -R * merge *)",
+      "Bash(gh pr -R* merge)",
+      "Bash(gh pr -R* merge *)",
       "Bash(gh api *--method PUT*)",
       "Bash(gh api *--method POST*)",
       "Bash(gh api *--method PATCH*)",
@@ -250,6 +277,7 @@ claude --settings ~/.claude/ostrom/roles/gatekeeper.settings.json
       "Bash(gh api *-XPOST*)",
       "Bash(gh api *-XPATCH*)",
       "Bash(gh api *-XDELETE*)",
+      "Bash(gh api graphql *mergePullRequest*)",
       "Bash(git tag *)",
       "Bash(gh release create *)",
       "Bash(gh release edit *)",
@@ -272,12 +300,15 @@ claude --settings ~/.claude/ostrom/roles/gatekeeper.settings.json
 }
 ```
 
-The gatekeeper can read artifacts, request an approval, and run `gh pr merge`.
-It cannot write code, stage or commit changes, push, open PRs, rebase or
-resolve code conflicts, edit the mandate roster or gate conditions, or create
-tags and releases through the named ordinary commands. GitHub actor-based
-checks still see the same App as the builder; the profile, not the actor name,
-is the role boundary.
+The gatekeeper can read artifacts, request an approval, and run the verdict-bound
+`ostrom merge` wrapper. It cannot run the raw `gh pr merge` verb (including
+the no-argument current-branch form and the `--repo`, `--repo=`, spaced `-R`,
+and joined `-R` flag spellings before either `pr` or `merge`),
+or name the GraphQL `mergePullRequest` mutation. It also cannot write code,
+stage or commit changes, push, open PRs, rebase or resolve code conflicts,
+edit the mandate roster or gate conditions, or create tags and releases
+through the named ordinary commands. GitHub actor-based checks still see the
+same App as the builder; the profile, not the actor name, is the role boundary.
 
 ## Principal
 
@@ -319,7 +350,7 @@ the gatekeeper acts on the resulting pass and merges.
 
 ## Shared-actor limitations that remain
 
-There is deliberately no `Bash(gh api graphql *)` deny in either profile.
+There is deliberately no blanket `Bash(gh api graphql *)` deny in either profile.
 GitHub has no `gh` porcelain command for resolving a review thread. Reading a
 thread and calling the `resolveReviewThread` mutation both use `gh api
 graphql`. A payload-text deny is not a boundary: `--input`, `-F query=@file`,
@@ -343,11 +374,13 @@ changed or explicitly excepted before an end-to-end shared-App pass can prove
 the cutover. This is an operational precondition, not evidence for retaining
 per-role Apps.
 
-**The gatekeeper profile therefore carries no graphql-mutation deny, and the
-builder's stays.** Resolving a review thread is the `resolveReviewThread`
-mutation — there is no porcelain for it — so that deny would forbid the
-gatekeeper the write its protocol assigns it without fixing the shared-actor
-conflict. Before adding a deny to the gatekeeper, check what `ostrom gate` and
+**The gatekeeper profile therefore carries no general graphql-mutation deny,
+and the builder's stays.** Its narrow `mergePullRequest` deny records the one
+mutation now owned by `ostrom merge`; it does not match `resolveReviewThread`.
+Resolving a review thread is the `resolveReviewThread` mutation — there is no
+porcelain for it — so a general mutation deny would forbid the gatekeeper the
+write its protocol assigns it without fixing the shared-actor conflict.
+Before adding another deny to the gatekeeper, check what `ostrom gate` and
 `/ostrom:merge` actually call and settle the actor-independent thread rule.
 
 That deny was never load-bearing anyway: it matches only the literal word

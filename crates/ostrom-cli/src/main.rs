@@ -23,17 +23,17 @@ use ostrom_core::{
 use ostrom_store::{
     AssessmentHarness, AuditOptions, DigestOptions, DispatchOutcome, DispatchRequest,
     ExecutableAssessmentDeriver, GateError, GateOptions, HarnessAssessmentDeriver,
-    ImplementRequest, JsonlCheckStore, MigrationOutcome, OstromPaths, PassRequest, PassRole,
-    PlanOptions, PublishDestination, PublishTarget, QueueDecision, ReplayOptions, SelectAction,
-    SelectError, SelectOutcome, SelectRequest, SignalFlags, SweepError, SweepMode, SweepOptions,
-    SweepParityOptions, TraceAppend, TraceView, UnavailableAssessmentDeriver, acquire_lease,
-    acquire_org_from_github, append_trace_checked, audit, branch_name, clear_work_order,
-    create_work_order, credential_output, decide_queue_item, encode_org_snapshots,
-    encode_selection, finalize_exited_implementer, grant_excuse, item_hash, lease_status,
-    lint_queue_state, list_excuses, list_queue_json, local_drift, migrate, read_trace_json,
-    release_lease, render_constitution, render_digest, replay, run_dispatch, run_gate,
-    run_implement, run_pass, run_plan, run_repair_prs, run_selection, run_sweep, run_sweep_parity,
-    validate_lease_name, validate_work_order_file,
+    ImplementRequest, JsonlCheckStore, MergeError, MergeOptions, MigrationOutcome, OstromPaths,
+    PassRequest, PassRole, PlanOptions, PublishDestination, PublishTarget, QueueDecision,
+    ReplayOptions, SelectAction, SelectError, SelectOutcome, SelectRequest, SignalFlags,
+    SweepError, SweepMode, SweepOptions, SweepParityOptions, TraceAppend, TraceView,
+    UnavailableAssessmentDeriver, acquire_lease, acquire_org_from_github, append_trace_checked,
+    audit, branch_name, clear_work_order, create_work_order, credential_output, decide_queue_item,
+    encode_org_snapshots, encode_selection, finalize_exited_implementer, grant_excuse, item_hash,
+    lease_status, lint_queue_state, list_excuses, list_queue_json, local_drift, migrate,
+    read_trace_json, release_lease, render_constitution, render_digest, replay, run_dispatch,
+    run_gate, run_implement, run_merge, run_pass, run_plan, run_repair_prs, run_selection,
+    run_sweep, run_sweep_parity, validate_lease_name, validate_work_order_file,
 };
 
 #[derive(Debug, Parser)]
@@ -114,6 +114,14 @@ enum Command {
     Gate {
         #[arg(num_args = 0.., allow_hyphen_values = true)]
         target: Vec<String>,
+    },
+    /// Merge a pull request only when its current head has a pass verdict.
+    #[command(
+        after_help = "Exit codes:\n  3  Merge refused by the recorded verdict\n  4  Merge attempted at GitHub and failed"
+    )]
+    Merge {
+        #[arg(num_args = 0.., allow_hyphen_values = true)]
+        arguments: Vec<String>,
     },
     /// Inspect the private queue.
     Queue {
@@ -616,6 +624,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 working_directory: env::current_dir()?,
                 target: target[0].clone(),
                 timestamp,
+            }) {
+                Ok(output) => output,
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::exit(error.exit_code());
+                }
+            };
+            io::stdout().write_all(output.stdout.as_bytes())?;
+            io::stderr().write_all(output.stderr.as_bytes())?;
+            if output.exit_code != 0 {
+                std::process::exit(output.exit_code);
+            }
+        }
+        Command::Merge { arguments } => {
+            if arguments.len() != 2 {
+                let error = MergeError::InvalidArguments;
+                eprintln!("{error}");
+                std::process::exit(error.exit_code());
+            }
+            let output = match run_merge(&MergeOptions {
+                paths,
+                repository: arguments[0].clone(),
+                pr_number: arguments[1].clone(),
             }) {
                 Ok(output) => output,
                 Err(error) => {

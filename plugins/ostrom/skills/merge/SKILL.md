@@ -152,8 +152,7 @@ caller's, is always about delivery, and never converts `inconclusive` into
      comment, which a human browsing GitHub can see, and the `decision-taken`
      record below, which is machine-readable and carries a reversal pointer
      an approval never had.
-  2. Then run
-     `ostrom credential gatekeeper "$repository" --repositories "$repository" --permissions metadata:read,contents:write,pull_requests:write -- gh pr merge <PR number> --repo <owner/repo>`.
+  2. Then run `ostrom merge <owner/repo> <PR number>`.
      Do not pass `--body` here to stamp a gatekeeper role trailer. On a squash
      merge `--body` *replaces* the default commit message rather than appending
      to it, and that default is where the builder's own commits — including
