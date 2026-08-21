@@ -33,7 +33,7 @@ pub struct GateOutput {
 
 #[derive(Debug, Error)]
 pub enum GateError {
-    #[error("usage: gate.sh <owner/repo#number>")]
+    #[error("usage: ostrom gate <owner/repo#number>")]
     InvalidTarget,
     #[error("mandate gate: could not serialize verdict")]
     Serialize,
@@ -476,7 +476,14 @@ fn error_text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(&flattened).into_owned()
 }
 
-fn load_gate_config(paths: &OstromPaths, cwd: &Path, repo: &str) -> (Option<GateConfig>, String) {
+/// Load the gate policy using the same shipped, user, and repository layering
+/// used by [`run_gate`], then require exactly one project for `repo`.
+#[must_use]
+pub fn load_gate_config(
+    paths: &OstromPaths,
+    cwd: &Path,
+    repo: &str,
+) -> (Option<GateConfig>, String) {
     let user_path = paths.config.join("gate.yaml");
     let repo_path = cwd.join(".ostrom/gate.yaml");
     if !user_path.exists() && !repo_path.exists() {
@@ -642,12 +649,16 @@ fn evaluate_checks(project: &GateProject, acquisition: &Acquisition) -> Value {
         .cloned()
         .unwrap_or_default();
     let mut selected = Vec::new();
+    let mut dead_selectors = Vec::new();
     for selector in &project.required_checks {
         let matches = checks
             .iter()
             .filter(|check| glob_match(check_name(check), selector, false))
             .map(|check| json!({"name": check_name(check), "state": check_state(check)}))
             .collect::<Vec<_>>();
+        if matches.is_empty() {
+            dead_selectors.push(selector);
+        }
         let result = if matches.is_empty()
             || matches
                 .iter()
@@ -679,12 +690,11 @@ fn evaluate_checks(project: &GateProject, acquisition: &Acquisition) -> Value {
     } else {
         vec!["content-derived"]
     };
-    condition(
-        "required_checks",
-        result,
-        &tier,
-        json!({"selectors": selected}),
-    )
+    let mut detail = json!({"selectors": selected});
+    if !dead_selectors.is_empty() {
+        detail["dead_selectors"] = json!(dead_selectors);
+    }
+    condition("required_checks", result, &tier, detail)
 }
 
 fn check_name(check: &Value) -> &str {
@@ -1302,6 +1312,75 @@ projects:
             "placeholder-org//alpha#1",
         ] {
             assert!(parse_target(value).is_err(), "accepted {value}");
+        }
+    }
+
+    #[test]
+    fn required_check_with_no_matches_fails_and_is_reported_dead() {
+        let project = gate_project(&["verify-*", "removed-*"]);
+        let acquisition = acquisition_with_checks(json!([{
+            "name": "verify-linux",
+            "status": "COMPLETED",
+            "conclusion": "SUCCESS"
+        }]));
+
+        let condition = evaluate_checks(&project, &acquisition);
+
+        assert_eq!(condition["result"], "fail");
+        assert_eq!(condition["detail"]["dead_selectors"], json!(["removed-*"]));
+        assert_eq!(condition["detail"]["selectors"][1]["result"], "fail");
+        assert_eq!(condition["detail"]["selectors"][1]["matches"], json!([]));
+    }
+
+    #[test]
+    fn red_required_check_fails_without_being_reported_dead() {
+        let project = gate_project(&["verify-*"]);
+        let acquisition = acquisition_with_checks(json!([{
+            "name": "verify-linux",
+            "status": "COMPLETED",
+            "conclusion": "FAILURE"
+        }]));
+
+        let condition = evaluate_checks(&project, &acquisition);
+
+        assert_eq!(condition["result"], "fail");
+        assert!(condition["detail"].get("dead_selectors").is_none());
+        assert_eq!(condition["detail"]["selectors"][0]["result"], "fail");
+        assert_eq!(
+            condition["detail"]["selectors"][0]["matches"],
+            json!([{"name": "verify-linux", "state": "FAILURE"}])
+        );
+    }
+
+    fn gate_project(required_checks: &[&str]) -> GateProject {
+        GateProject {
+            repo: ostrom_core::RepositoryName::new("placeholder-org/alpha")
+                .expect("valid fixture repository"),
+            required_checks: required_checks
+                .iter()
+                .map(|selector| (*selector).to_owned())
+                .collect(),
+            bounce: Vec::new(),
+            reserved: Vec::new(),
+        }
+    }
+
+    fn acquisition_with_checks(checks: Value) -> Acquisition {
+        Acquisition {
+            metadata_ready: true,
+            metadata: json!({"statusCheckRollup": checks}),
+            metadata_error: String::new(),
+            head_sha: String::new(),
+            diff_ready: true,
+            paths: Vec::new(),
+            diff_error: String::new(),
+            diff_content_ready: true,
+            diff_content: String::new(),
+            diff_content_error: String::new(),
+            threads_ready: true,
+            threads: Vec::new(),
+            threads_error: String::new(),
+            thread_author: String::new(),
         }
     }
 

@@ -9,7 +9,7 @@ const HOOK_COMMANDS: [&str; 2] = [
     "if command -v ostrom >/dev/null 2>&1; then ostrom hook digest; fi",
 ];
 
-const REQUIRED_CONTRACTS: [(&str, &str); 36] = [
+const REQUIRED_CONTRACTS: [(&str, &str); 37] = [
     (
         "skills/gatekeep/SKILL.md",
         "ostrom lease acquire \"$lease_owner\"",
@@ -63,6 +63,7 @@ const REQUIRED_CONTRACTS: [(&str, &str); 36] = [
         "skills/merge/SKILL.md",
         "ostrom trace append gate-verdict-consumed",
     ),
+    ("skills/merge/SKILL.md", "failing_conditions"),
     ("skills/merge/SKILL.md", "**Do not approve.**"),
     ("skills/merge/SKILL.md", "Do not pass `--body` here"),
     (
