@@ -1,0 +1,44 @@
+manifest_version: 1
+includes:
+  - actors/*.yml
+  - projects/*.yml
+inputs:
+  cadence_hours:
+    type: integer
+    env: OSTROM_FIXTURE_CADENCE
+    default: 24
+  signing_token:
+    type: string
+    env: OSTROM_FIXTURE_TOKEN
+    secret: true
+defaults:
+  loop:
+    concurrent: 1
+    spend_usd: 10.0
+    tokens: 100000
+  grant:
+    unmatched: warn
+  deny:
+    unmatched: block
+operations:
+  merge:
+    name: Merge
+    steps:
+      - uses: gh/merge-pr
+        with: {method: squash}
+  work:
+    name: Work
+    steps: []
+grants:
+  gatekeeper-merge:
+    actors: gatekeeper
+    operations: merge
+denies:
+  builder-cannot-merge:
+    actors: builder
+    operations: merge
+loops:
+  sweep:
+    every: hourly
+    cadence_hours: 24
+    stuck_after_days: 7

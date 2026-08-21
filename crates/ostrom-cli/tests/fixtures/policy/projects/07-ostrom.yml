@@ -1,0 +1,5 @@
+grant: ostrom-builder
+actors: builder
+operations: work
+repositories: onsager-ai/ostrom
+where: type:docs

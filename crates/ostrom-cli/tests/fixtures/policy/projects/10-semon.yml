@@ -1,0 +1,4 @@
+grant: semon-builder
+actors: builder
+operations: work
+repositories: onsager-ai/semon
