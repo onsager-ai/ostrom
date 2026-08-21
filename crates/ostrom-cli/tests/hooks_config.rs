@@ -110,6 +110,59 @@ projects:
 }
 
 #[test]
+fn digest_surfaces_repeated_dispatch_failure_escalations() {
+    let fixture = tempdir().expect("temporary digest fixture");
+    fs::write(
+        fixture.path().join("mandates.yaml"),
+        r#"provider: file
+cadence_hours: 24
+stuck_after_days: 7
+search_roots: []
+bounce_all: []
+projects:
+  - repo: placeholder-org/alpha
+    delegated: []
+    excluded: []
+    reserved: []
+    default: delegated
+    paused: false
+    bounce: []
+"#,
+    )
+    .unwrap();
+    fs::write(fixture.path().join("queue.jsonl"), "").unwrap();
+    fs::write(
+        fixture.path().join("state.json"),
+        "{\"version\":2,\"repos\":{}}\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.path().join("sprint.jsonl"),
+        concat!(
+            r#"{"ts":"2026-08-19T01:00:00Z","kind":"dispatch-failure-escalated","fact":{"schema_version":1,"item_id":"placeholder-org/alpha#7","order_id":"placeholder-order","action":"suppress-dispatch","failure_reason":"branch-already-pushed","failure_count":2},"narration":{"reason":"Repeated failure.","conclusion":"Dispatch suppressed."}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .args(["hook", "digest"])
+        .env("OSTROM_HOME", fixture.path())
+        .env("MANDATE_NOW_EPOCH", "0")
+        .env("MANDATE_TODAY", "not-a-date")
+        .env("MANDATE_DIGEST_TIME", "2026-08-19T02:00:00Z")
+        .current_dir(fixture.path())
+        .output()
+        .expect("render digest");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 digest");
+    assert!(stdout.contains("DISPATCH FAILURES ESCALATED"));
+    assert!(stdout.contains(
+        "placeholder-org/alpha#7 — branch-already-pushed (2 identical failures; dispatch suppressed)"
+    ));
+}
+
+#[test]
 fn config_prints_the_same_compact_layered_roster_as_mandate_lib() {
     let fixture = tempdir().expect("temporary config fixture");
     let repository = fixture.path().join("repository");
