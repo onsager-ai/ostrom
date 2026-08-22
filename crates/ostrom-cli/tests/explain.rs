@@ -2,14 +2,16 @@ use std::{fs, path::PathBuf, process::Command};
 
 use tempfile::TempDir;
 
-fn fixture(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/policy-explain")
-        .join(name)
+mod support;
+
+fn fixture_source() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/policy-explain")
 }
 
 struct ExplainFixture {
     home: TempDir,
+    policy: TempDir,
+    trusted_keys: PathBuf,
 }
 
 impl ExplainFixture {
@@ -28,21 +30,34 @@ impl ExplainFixture {
 }"#,
         )
         .expect("write held-state fixture");
-        Self { home }
+        let policy = support::copy_fixture_directory(&fixture_source());
+        let trusted_keys = support::sign_manifest(&policy.path().join("manifest.yml"));
+        Self {
+            home,
+            policy,
+            trusted_keys,
+        }
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.policy.path().join(name)
     }
 
     fn explain(&self, target: &str) -> std::process::Output {
         Command::new(env!("CARGO_BIN_EXE_ostrom"))
             .env("OSTROM_HOME", self.home.path())
+            .env("OSTROM_POLICY_TRUSTED_KEYS", &self.trusted_keys)
             .args([
                 "explain",
                 target,
                 "--manifest",
-                fixture("manifest.yml")
+                self.path("manifest.yml")
                     .to_str()
                     .expect("UTF-8 fixture path"),
                 "--fixture",
-                fixture("github.json").to_str().expect("UTF-8 fixture path"),
+                self.path("github.json")
+                    .to_str()
+                    .expect("UTF-8 fixture path"),
                 "--started-at",
                 "2026-08-20T00:00:00Z",
             ])

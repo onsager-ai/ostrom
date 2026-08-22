@@ -64,6 +64,17 @@ pub(crate) fn run_validate(path: &Path, normalized: bool) -> Result<(), PolicyLo
     Ok(())
 }
 
+pub(crate) fn run_sign(
+    path: &Path,
+    key_id: &str,
+    private_key: &Path,
+) -> Result<(), PolicyLoadError> {
+    let manifest = load_unverified(path)?;
+    let signature = ostrom_store::sign_policy_manifest(&manifest, path, key_id, private_key)?;
+    println!("signed: {}", signature.display());
+    Ok(())
+}
+
 pub(crate) fn load_bundle(path: &Path) -> Result<PolicyBundle, PolicyLoadError> {
     let manifest = load(path)?;
     let needs_checks = manifest
@@ -415,6 +426,7 @@ fn command_verbs() -> impl Iterator<Item = &'static str> {
         "repair-prs",
         "replay",
         "select-work",
+        "sign",
         "sweep",
         "trace",
         "validate",
@@ -424,6 +436,17 @@ fn command_verbs() -> impl Iterator<Item = &'static str> {
 }
 
 pub(crate) fn load(path: &Path) -> Result<PolicyManifest, PolicyLoadError> {
+    let manifest = load_unverified(path)?;
+    let trusted_keys = ostrom_store::environment::OSTROM_POLICY_TRUSTED_KEYS
+        .value_os()
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .ok_or(PolicyLoadError::TrustedKeysUnset)?;
+    ostrom_store::verify_policy_manifest(&manifest, path, &trusted_keys)?;
+    Ok(manifest)
+}
+
+fn load_unverified(path: &Path) -> Result<PolicyManifest, PolicyLoadError> {
     let source = read(path)?;
     let mut manifest =
         PolicyManifest::parse_yaml(&source).map_err(|source| PolicyLoadError::Yaml {
@@ -887,6 +910,10 @@ pub(crate) enum PolicyLoadError {
     Validation(String),
     #[error("invalid selector: {0}")]
     Selector(String),
+    #[error("OSTROM_POLICY_TRUSTED_KEYS is required to load a policy manifest")]
+    TrustedKeysUnset,
+    #[error(transparent)]
+    Signature(#[from] ostrom_store::PolicySignatureError),
     #[error("unsafe include path `{0}`")]
     UnsafeInclude(String),
     #[error("include `{pattern}` from `{}` matched no files", manifest.display())]

@@ -3,8 +3,13 @@ use std::{fs, path::PathBuf, process::Command};
 use ostrom_core::{PolicyCandidate, PolicyManifest};
 use tempfile::TempDir;
 
-fn fixture() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/policy/manifest.yml")
+mod support;
+
+fn fixture() -> (TempDir, PathBuf) {
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/policy");
+    let root = support::copy_fixture_directory(&source);
+    let manifest = root.path().join("manifest.yml");
+    (root, manifest)
 }
 
 fn ostrom() -> Command {
@@ -14,11 +19,21 @@ fn ostrom() -> Command {
     command
 }
 
+fn signed_ostrom(manifest: &std::path::Path) -> Command {
+    let mut command = ostrom();
+    command.env(
+        "OSTROM_POLICY_TRUSTED_KEYS",
+        support::sign_manifest(manifest),
+    );
+    command
+}
+
 #[test]
 fn validate_and_normalized_accept_the_composed_fixture() {
-    let plain = ostrom()
+    let (_root, manifest) = fixture();
+    let plain = signed_ostrom(&manifest)
         .args(["validate"])
-        .arg(fixture())
+        .arg(&manifest)
         .output()
         .expect("run validate");
     assert!(
@@ -28,9 +43,9 @@ fn validate_and_normalized_accept_the_composed_fixture() {
     );
     assert!(String::from_utf8_lossy(&plain.stdout).starts_with("valid: "));
 
-    let normalized = ostrom()
+    let normalized = signed_ostrom(&manifest)
         .args(["validate", "--normalized"])
-        .arg(fixture())
+        .arg(&manifest)
         .output()
         .expect("run normalized validate");
     assert!(
@@ -46,9 +61,10 @@ fn validate_and_normalized_accept_the_composed_fixture() {
 
 #[test]
 fn fixture_reproduces_builder_decisions_for_all_eleven_repositories() {
-    let output = ostrom()
+    let (_root, manifest) = fixture();
+    let output = signed_ostrom(&manifest)
         .args(["validate", "--normalized"])
-        .arg(fixture())
+        .arg(manifest)
         .output()
         .expect("run normalized validate");
     assert!(output.status.success());
@@ -86,9 +102,10 @@ fn fixture_reproduces_builder_decisions_for_all_eleven_repositories() {
 
 #[test]
 fn duhem_area_schema_replay_resolves_to_builder() {
-    let output = ostrom()
+    let (_root, manifest) = fixture();
+    let output = signed_ostrom(&manifest)
         .args(["validate", "--normalized"])
-        .arg(fixture())
+        .arg(manifest)
         .output()
         .expect("run normalized validate");
     let manifest = PolicyManifest::from_yaml(
@@ -158,7 +175,7 @@ fn deny_beats_grant_in_either_include_order() {
             ),
         )
         .expect("write root");
-        let output = ostrom()
+        let output = signed_ostrom(&path)
             .args(["validate", "--normalized"])
             .arg(path)
             .output()
@@ -228,9 +245,10 @@ fn require_naming_an_undefined_check_fails_the_load() {
 
 #[test]
 fn require_resolves_a_sibling_check_by_exact_name() {
-    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/checks-verdict/manifest.yml");
-    let output = ostrom()
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/checks-verdict");
+    let root = support::copy_fixture_directory(&source);
+    let fixture = root.path().join("manifest.yml");
+    let output = signed_ostrom(&fixture)
         .args(["validate"])
         .arg(fixture)
         .output()
@@ -292,5 +310,110 @@ fn grant_requires_naming_an_undefined_check_fails_the_load() {
     assert!(
         stderr.contains("requires undefined check `missing-placeholder-check`"),
         "{stderr}"
+    );
+}
+
+#[test]
+fn unsigned_manifest_is_refused() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let manifest = temporary.path().join("manifest.yml");
+    let trusted = temporary.path().join("trusted");
+    fs::create_dir(&trusted).expect("create empty trusted key directory");
+    fs::write(&manifest, "manifest_version: 1\nloops: {}\n").expect("write manifest");
+
+    let output = ostrom()
+        .env("OSTROM_POLICY_TRUSTED_KEYS", trusted)
+        .args(["validate"])
+        .arg(manifest)
+        .output()
+        .expect("validate unsigned manifest");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("policy signature is missing"));
+}
+
+#[test]
+fn changing_the_root_after_signing_is_refused() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let manifest = temporary.path().join("manifest.yml");
+    fs::write(
+        &manifest,
+        "manifest_version: 1\nactors: {builder: {name: Placeholder builder}}\n",
+    )
+    .expect("write manifest");
+    let trusted = support::sign_manifest(&manifest);
+    fs::write(
+        &manifest,
+        "manifest_version: 1\nactors: {builder: {name: Changed placeholder}}\n",
+    )
+    .expect("change manifest after signing");
+
+    let output = ostrom()
+        .env("OSTROM_POLICY_TRUSTED_KEYS", trusted)
+        .args(["validate"])
+        .arg(manifest)
+        .output()
+        .expect("validate changed manifest");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("verification failed"));
+}
+
+#[test]
+fn signature_from_an_untrusted_key_is_refused() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let manifest = temporary.path().join("manifest.yml");
+    fs::write(&manifest, "manifest_version: 1\n").expect("write manifest");
+    support::sign_manifest(&manifest);
+    let unrelated_trust_set = temporary.path().join("unrelated-trusted-keys");
+    fs::create_dir(&unrelated_trust_set).expect("create unrelated trust set");
+
+    let output = ostrom()
+        .env("OSTROM_POLICY_TRUSTED_KEYS", unrelated_trust_set)
+        .args(["validate"])
+        .arg(manifest)
+        .output()
+        .expect("validate with unrelated trust set");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("untrusted key"));
+}
+
+#[test]
+fn changing_an_included_leaf_after_signing_is_refused() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let manifest = temporary.path().join("manifest.yml");
+    let leaf = temporary.path().join("builder.yml");
+    fs::write(&manifest, "manifest_version: 1\nincludes: [builder.yml]\n")
+        .expect("write root manifest");
+    fs::write(&leaf, "actor: builder\nname: Placeholder builder\n").expect("write actor leaf");
+    let trusted = support::sign_manifest(&manifest);
+    fs::write(&leaf, "actor: builder\nname: Changed placeholder\n")
+        .expect("change included leaf after signing");
+
+    let output = ostrom()
+        .env("OSTROM_POLICY_TRUSTED_KEYS", trusted)
+        .args(["validate"])
+        .arg(manifest)
+        .output()
+        .expect("validate changed included leaf");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("verification failed"));
+}
+
+#[test]
+fn loop_substrate_receives_no_private_signing_key() {
+    let temporary = TempDir::new().expect("temporary loop substrate");
+    let manifest = temporary.path().join("manifest.yml");
+    fs::write(&manifest, "manifest_version: 1\nloops: {}\n").expect("write manifest");
+    let trusted = support::sign_manifest(&manifest);
+
+    let substrate_files = fs::read_dir(temporary.path())
+        .expect("read loop substrate")
+        .map(|entry| entry.expect("read substrate entry").file_name())
+        .collect::<Vec<_>>();
+    assert!(manifest.with_extension("yml.sig").is_file());
+    assert!(trusted.join("placeholder-principal.pem").is_file());
+    assert!(
+        substrate_files
+            .iter()
+            .all(|name| !name.to_string_lossy().contains("private"))
     );
 }

@@ -227,6 +227,11 @@ pub const OSTROM_POLICY_MANIFEST: EnvironmentVariable = variable(
     EnvironmentClass::Location,
     "<config>/policy.yaml",
 );
+pub const OSTROM_POLICY_TRUSTED_KEYS: EnvironmentVariable = variable(
+    "OSTROM_POLICY_TRUSTED_KEYS",
+    EnvironmentClass::Location,
+    "policy loading refused",
+);
 pub const OSTROM_PLUGIN_ROOT: EnvironmentVariable = variable(
     "OSTROM_PLUGIN_ROOT",
     EnvironmentClass::Location,
@@ -276,6 +281,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvironmentVariable] = &[
     OSTROM_PLAN_DERIVER,
     OSTROM_PLUGIN_ROOT,
     OSTROM_POLICY_MANIFEST,
+    OSTROM_POLICY_TRUSTED_KEYS,
     PATH,
     VOLTA_HOME,
 ];
