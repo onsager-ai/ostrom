@@ -1,5 +1,5 @@
 {
-  "_comment": "state.notice.text is intentionally excluded because it is narration-shaped; publish only notice.kind and notice.reported.",
+  "_comment": "state.notice.text is intentionally excluded because it is narration-shaped; merge facts publish attribution classes and never actor logins.",
   "queue": [
     "id",
     "repo",
@@ -76,6 +76,15 @@
   "gate.detail.required_checks.match": [
     "name",
     "state"
+  ],
+  "merge": [
+    "pr",
+    "order_id",
+    "opened_at",
+    "merged_at",
+    "opened_by_class",
+    "merged_by_class",
+    "head_sha"
   ],
   "state": [
     "version",

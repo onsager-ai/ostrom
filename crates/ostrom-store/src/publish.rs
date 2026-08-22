@@ -154,9 +154,15 @@ fn derive_tree(
         }
     }
     let gate_path = options.paths.state.join("gate.jsonl");
+    let merge_path = options.paths.merge_file();
     let queue_source = read_jsonl(&queue_path)?;
     let gate_source = if gate_path.is_file() {
         read_jsonl(&gate_path)?
+    } else {
+        Vec::new()
+    };
+    let merge_source = if merge_path.is_file() {
+        read_jsonl(&merge_path)?
     } else {
         Vec::new()
     };
@@ -172,6 +178,12 @@ fn derive_tree(
         .iter()
         .map(|record| filter_gate(record, allowlist, &mut gate_drops))
         .collect::<Result<Vec<_>, _>>()?;
+    let mut merge_drops = BTreeMap::new();
+    let merge = merge_source
+        .iter()
+        .map(|record| filter_merge(record, allowlist, &mut merge_drops))
+        .collect::<Result<Vec<_>, _>>()?;
+    let merge = deduplicate_merges(merge)?;
     let mut state_drops = BTreeMap::new();
     let state = filter_state(&state_source, allowlist, &mut state_drops)?;
 
@@ -199,16 +211,18 @@ fn derive_tree(
         "schema_id": format!("git:{schema_id}"),
         "published_at": options.published_at.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
         "expected_sweep_interval_hours": options.cadence_hours,
-        "retention": {"gate_days": RETAINED_GATE_DAYS, "rollup": "forever"},
+        "retention": {"gate_days": RETAINED_GATE_DAYS, "merge": "forever", "rollup": "forever"},
         "record_counts": {
             "queue": queue.len(),
             "gate": gate.len(),
+            "merge": merge.len(),
             "state_repos": state.get("repos").and_then(Value::as_object).map_or(0, Map::len),
             "gate_partitions": partitions.len(),
         },
         "dropped_fields": {
             "queue": queue_drops,
             "gate": gate_drops,
+            "merge": merge_drops,
             "state": state_drops,
         },
     });
@@ -216,6 +230,7 @@ fn derive_tree(
     let mut files = BTreeMap::new();
     files.insert("manifest.json".into(), pretty_json(&manifest));
     files.insert("queue.jsonl".into(), jsonl(&queue));
+    files.insert("merge.jsonl".into(), jsonl(&merge));
     files.insert("state.json".into(), pretty_json(&state));
     files.insert("rollup.json".into(), pretty_json(&rollup));
     for (day, records) in partitions {
@@ -277,6 +292,7 @@ fn load_allowlist(path: &Path) -> Result<Allowlist, PublishError> {
         "queue.mandate.dossier",
         "gate",
         "gate.condition",
+        "merge",
         "state",
         "state.dead_selector",
         "state.repo",
@@ -375,6 +391,55 @@ fn filter_gate(
     let mut output = filtered_object(allowlist, "gate", source)?;
     output.insert("conditions".to_owned(), Value::Array(conditions));
     Ok(Value::Object(output))
+}
+
+fn filter_merge(
+    source: &Value,
+    allowlist: &Allowlist,
+    drops: &mut BTreeMap<String, u64>,
+) -> Result<Value, PublishError> {
+    require_object(source, "merge row")?;
+    record_unknown(allowlist, "merge", source, "", drops)?;
+    let output = Value::Object(filtered_object(allowlist, "merge", source)?);
+    for field in ["pr", "opened_at", "merged_at"] {
+        required_merge_string(&output, field)?;
+    }
+    for field in ["opened_by_class", "merged_by_class"] {
+        let class = required_merge_string(&output, field)?;
+        if !matches!(class, "loop" | "principal") {
+            return Err(invalid_record(
+                "merge.jsonl",
+                format!("{field} must be loop or principal"),
+            ));
+        }
+    }
+    Ok(output)
+}
+
+fn deduplicate_merges(records: Vec<Value>) -> Result<Vec<Value>, PublishError> {
+    let mut keys = BTreeSet::new();
+    let mut unique = Vec::new();
+    for record in records {
+        let pr = required_merge_string(&record, "pr")?;
+        let merged_at = required_merge_string(&record, "merged_at")?;
+        if keys.insert((pr.to_owned(), merged_at.to_owned())) {
+            unique.push(record);
+        }
+    }
+    Ok(unique)
+}
+
+fn required_merge_string<'a>(record: &'a Value, field: &str) -> Result<&'a str, PublishError> {
+    required_string(record, field, "merge.jsonl").and_then(|value| {
+        if value.is_empty() {
+            Err(invalid_record(
+                "merge.jsonl",
+                format!("{field} must not be empty"),
+            ))
+        } else {
+            Ok(value)
+        }
+    })
 }
 
 fn filter_condition(
@@ -878,6 +943,7 @@ fn install_tree(checkout: &Path, tree: &DerivedTree) -> Result<(), PublishError>
             "queue.jsonl",
             "state.json",
             "rollup.json",
+            "merge.jsonl",
             "gate",
         ],
         &[0],
@@ -904,6 +970,7 @@ fn install_tree(checkout: &Path, tree: &DerivedTree) -> Result<(), PublishError>
             "queue.jsonl",
             "state.json",
             "rollup.json",
+            "merge.jsonl",
             "gate",
         ],
         &[0],
@@ -1235,6 +1302,16 @@ mod tests {
         )
         .expect("write gate");
         fs::write(
+            paths.merge_file(),
+            concat!(
+                r#"{"pr":"placeholder-org/alpha#4","order_id":"placeholder-order","opened_at":"2026-03-01T00:00:00Z","merged_at":"2026-04-01T00:00:00Z","opened_by_class":"loop","merged_by_class":"principal","head_sha":"placeholder-merge-sha","actor_login":"placeholder-operator"}"#,
+                "\n",
+                r#"{"pr":"placeholder-org/alpha#4","order_id":"placeholder-order","opened_at":"2026-03-01T00:00:00Z","merged_at":"2026-04-01T00:00:00Z","opened_by_class":"loop","merged_by_class":"principal","head_sha":"placeholder-merge-sha","actor_login":"placeholder-operator"}"#,
+                "\n",
+            ),
+        )
+        .expect("write merge facts");
+        fs::write(
             paths.sweep_state_file(),
             r#"{"version":2,"sweep_mode":"full","repos":{"placeholder-org/alpha":{"items":{"placeholder-org/alpha#1":{"classification":"unclassified","fingerprint":"placeholder","first_seen":"2026-07-31T00:00:00Z","updated":"2026-08-01T00:00:00Z","matched_selector":"default:unclassified","stuck":false}},"policy":{},"scope_changes":{},"notice":{"kind":"baseline","reported":false,"text":"drop"}}}}"#,
         )
@@ -1253,10 +1330,13 @@ mod tests {
             .expect("parse manifest");
         assert_eq!(
             manifest["schema_id"],
-            "git:831ea4a434a43caf675f19f5566d968a8be6a088"
+            "git:b51c9bd1bc47dfa28bd6e168a8573b764bff0d58"
         );
+        assert_eq!(manifest["record_counts"]["merge"], 1);
+        assert_eq!(manifest["retention"]["merge"], "forever");
         assert_eq!(manifest["dropped_fields"]["queue"]["private_note"], 1);
         assert_eq!(manifest["dropped_fields"]["gate"]["conditions[].detail"], 1);
+        assert_eq!(manifest["dropped_fields"]["merge"]["actor_login"], 2);
         assert_eq!(
             manifest["dropped_fields"]["state"]["repos.*.notice.text"],
             1
@@ -1264,9 +1344,15 @@ mod tests {
         let rollup: Value =
             serde_json::from_slice(&tree.files[Path::new("rollup.json")]).expect("parse rollup");
         assert_eq!(rollup["verdicts_by_day"]["2026-04-01"]["fail"], 1);
+        assert!(rollup.get("velocity_by_day").is_none());
         let queue = String::from_utf8(tree.files[Path::new("queue.jsonl")].clone())
             .expect("queue is UTF-8");
         assert!(!queue.contains("private_note"));
+        let merge = String::from_utf8(tree.files[Path::new("merge.jsonl")].clone())
+            .expect("merge facts are UTF-8");
+        assert_eq!(merge.lines().count(), 1);
+        assert!(!merge.contains("login"));
+        assert!(!merge.contains("placeholder-operator"));
     }
 
     #[test]

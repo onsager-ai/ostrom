@@ -25,6 +25,41 @@ Destination reads and writes mint separate repository-scoped credentials. The
 private publication checkout remains mode `0700` so its remote configuration
 is not exposed by a permissive process umask.
 
+## Published record contracts
+
+`queue.jsonl` is the current actionable queue and `state.json` is the current
+sweep snapshot. Both may be rebuilt by a later sweep. Gate verdicts are local
+rows in `gate.jsonl`; publication exposes their most recent 90 days as
+`gate/<YYYY-MM-DD>.jsonl` and uses the full local verdict history for
+`rollup.json`.
+
+`merge.jsonl` is different: it is an append-only, all-history ledger of
+immutable merge facts, not sweep snapshot state and not a rollup. Its natural
+key is (`pr`, `merged_at`), so observing the same landing in later sweeps or
+publishing it again produces one row. Every row has:
+
+- `pr`: `owner/repo#number`;
+- optional `order_id` when the observed pull request can be matched to one
+  local work order;
+- `opened_at` and `merged_at` RFC 3339 timestamps;
+- `opened_by_class` and `merged_by_class`, each either `loop` or `principal`;
+- optional `head_sha` when GitHub supplies it with the merged-PR observation.
+
+The two attribution fields encode both sides independently. `loop` to `loop`
+is unattended delivery, `loop` to `principal` is loop-produced work landed by
+a human, and any `principal` opener remains attended regardless of the merger
+class. Missing actor data is classified conservatively as `principal`. The
+allowlist publishes classes only; actor logins have no field in this contract.
+The manifest declares merge retention as `forever`, and `rollup.json` contains
+no merge-velocity aggregate; consumers aggregate the fact rows for their own
+window, repository, and attribution filters.
+
+The sweep is the observation point because it sees both loop and human merges.
+A gatekeeper-time emitter would know more about merges it performs, but it
+cannot see the human landings needed to distinguish unattended from attended
+delivery. The first upgraded sweep records only facts returned by the existing
+recent-merge query; no rows are synthesized for periods when the loop was dark.
+
 ### Where the allowlist comes from
 
 `MANDATE_PUBLISH_ALLOWLIST` if set, otherwise
@@ -43,8 +78,8 @@ pre-production verification. No test or parity run should name a production
 repository. For an enabled production run, verify:
 
 - only the destination's `state` branch advanced;
-- the branch contains `manifest.json`, `queue.jsonl`, `state.json`,
-  `rollup.json`, and the expected `gate/` partitions;
+- the branch contains `manifest.json`, `queue.jsonl`, `merge.jsonl`,
+  `state.json`, `rollup.json`, and the expected `gate/` partitions;
 - `manifest.json` has the expected schema, counts, retention, and dropped-field
   accounting;
 - a second run with unchanged public content reports `mandate publish:
