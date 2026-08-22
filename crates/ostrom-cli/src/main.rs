@@ -2008,6 +2008,10 @@ fn run_pass_worker(role: CliPassRole, supervisor_pid: u32, clock: Clock) -> ! {
     );
     let request = PassRequest {
         paths: compatible_command_paths(),
+        working_directory: env::current_dir().unwrap_or_else(|error| {
+            eprintln!("ostrom: could not resolve working directory: {error}");
+            std::process::exit(1);
+        }),
         role: role.into(),
         claude_bin,
         signals,
