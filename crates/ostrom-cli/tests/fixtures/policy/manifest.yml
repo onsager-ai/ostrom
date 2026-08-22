@@ -1,6 +1,7 @@
 manifest_version: 1
 includes:
   - actors/*.yml
+  - checks.yaml
   - projects/*.yml
 inputs:
   cadence_hours:

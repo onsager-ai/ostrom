@@ -8,7 +8,10 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de::DeserializeOwn
 use serde_yaml::Value;
 use thiserror::Error;
 
-use crate::operation::{OperationActionError, validate_operation};
+use crate::{
+    check::{CHECK_ACTIONS, CheckDefinition, InconclusivePolicy, validate_check_definitions},
+    operation::{OperationActionError, validate_operation},
+};
 
 pub const POLICY_MANIFEST_VERSION: u32 = 1;
 
@@ -24,6 +27,8 @@ pub struct PolicyManifest {
     pub defaults: ManifestDefaults,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub actors: BTreeMap<String, ActorDecl>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub checks: BTreeMap<String, CheckDefinition>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub operations: BTreeMap<String, OperationDecl>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -79,6 +84,8 @@ impl PolicyManifest {
             "tokens",
             self.defaults.r#loop.tokens.map(|value| value as f64),
         )?;
+        validate_check_definitions(&self.checks, CHECK_ACTIONS)
+            .map_err(|error| ManifestValidationError::InvalidChecks(error.to_string()))?;
         for (name, operation) in &self.operations {
             validate_operation(name, operation)?;
         }
@@ -400,6 +407,8 @@ pub enum ManifestValidationError {
     UnknownLoopOperation { name: String, operation: String },
     #[error("loop `{name}` is invalid: {message}")]
     InvalidLoop { name: String, message: String },
+    #[error("checks are invalid: {0}")]
+    InvalidChecks(String),
     #[error(transparent)]
     Operation(#[from] OperationActionError),
 }
@@ -780,6 +789,8 @@ pub struct ManifestDefaults {
     pub stalls_after: StallDuration,
     #[serde(default, skip_serializing_if = "LoopDefaults::is_empty")]
     pub r#loop: LoopDefaults,
+    #[serde(default, skip_serializing_if = "CheckDefaults::is_empty")]
+    pub check: CheckDefaults,
     #[serde(default, skip_serializing_if = "RuleDefaults::is_grant_default")]
     pub grant: RuleDefaults,
     #[serde(
@@ -794,6 +805,7 @@ impl Default for ManifestDefaults {
         Self {
             stalls_after: default_stalls_after(),
             r#loop: LoopDefaults::default(),
+            check: CheckDefaults::default(),
             grant: RuleDefaults::default(),
             deny: RuleDefaults::deny(),
         }
@@ -804,9 +816,27 @@ impl ManifestDefaults {
     fn is_empty(&self) -> bool {
         is_default_stalls_after(&self.stalls_after)
             && self.r#loop.is_empty()
+            && self.check.is_empty()
             && self.grant.is_grant_default()
             && self.deny.is_deny_default()
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckDefaults {
+    #[serde(default, skip_serializing_if = "is_block_inconclusive_policy")]
+    pub inconclusive_policy: InconclusivePolicy,
+}
+
+impl CheckDefaults {
+    fn is_empty(&self) -> bool {
+        is_block_inconclusive_policy(&self.inconclusive_policy)
+    }
+}
+
+fn is_block_inconclusive_policy(policy: &InconclusivePolicy) -> bool {
+    *policy == InconclusivePolicy::Block
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1695,6 +1725,10 @@ denies:
                 "manifest_version: 1\ndefaults:\n  grant: {unmatched: warn, extra: nope}\n",
                 "extra",
             ),
+            (
+                "manifest_version: 1\ndefaults:\n  check: {inconclusive_policy: block, extra: nope}\n",
+                "extra",
+            ),
         ];
         for (yaml, key) in cases {
             let error = PolicyManifest::from_yaml(yaml)
@@ -1779,9 +1813,22 @@ denies:
             let manifest = PolicyManifest::from_yaml(yaml).expect("defaults parse");
             assert_eq!(manifest.defaults.grant.unmatched, UnmatchedPolicy::Warn);
             assert_eq!(manifest.defaults.deny.unmatched, UnmatchedPolicy::Block);
+            assert_eq!(
+                manifest.defaults.check.inconclusive_policy,
+                InconclusivePolicy::Block
+            );
             assert_eq!(manifest.defaults.stalls_after.to_string(), "7d");
             assert_eq!(manifest.defaults.stalls_after.as_seconds(), 604_800);
         }
+
+        let manifest = PolicyManifest::from_yaml(
+            "manifest_version: 1\ndefaults: {check: {inconclusive_policy: warn}}\n",
+        )
+        .expect("check default parses");
+        assert_eq!(
+            manifest.defaults.check.inconclusive_policy,
+            InconclusivePolicy::Warn
+        );
     }
 
     #[test]

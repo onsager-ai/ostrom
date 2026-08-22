@@ -3465,7 +3465,6 @@ denies:
 "#,
             )
             .expect("hold policy"),
-            checks: None,
         }
     }
 
