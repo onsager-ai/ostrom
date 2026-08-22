@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     fs, io,
     path::{Component, Path, PathBuf},
@@ -69,8 +70,9 @@ pub(crate) fn run_sign(
     key_id: &str,
     private_key: &Path,
 ) -> Result<(), PolicyLoadError> {
-    let manifest = load_unverified(path)?;
-    let signature = ostrom_store::sign_policy_manifest(&manifest, path, key_id, private_key)?;
+    let path = normalize_manifest_path(path);
+    let manifest = load_unverified(&path)?;
+    let signature = ostrom_store::sign_policy_manifest(&manifest, &path, key_id, private_key)?;
     println!("signed: {}", signature.display());
     Ok(())
 }
@@ -413,14 +415,26 @@ fn command_verbs() -> impl Iterator<Item = &'static str> {
 }
 
 pub(crate) fn load(path: &Path) -> Result<PolicyManifest, PolicyLoadError> {
-    let manifest = load_unverified(path)?;
+    let path = normalize_manifest_path(path);
+    let manifest = load_unverified(&path)?;
     let trusted_keys = ostrom_store::environment::OSTROM_POLICY_TRUSTED_KEYS
         .value_os()
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
         .ok_or(PolicyLoadError::TrustedKeysUnset)?;
-    ostrom_store::verify_policy_manifest(&manifest, path, &trusted_keys)?;
+    ostrom_store::verify_policy_manifest(&manifest, &path, &trusted_keys)?;
     Ok(manifest)
+}
+
+fn normalize_manifest_path(path: &Path) -> Cow<'_, Path> {
+    if path
+        .parent()
+        .is_some_and(|parent| parent.as_os_str().is_empty())
+    {
+        Cow::Owned(Path::new(".").join(path))
+    } else {
+        Cow::Borrowed(path)
+    }
 }
 
 fn load_unverified(path: &Path) -> Result<PolicyManifest, PolicyLoadError> {
@@ -435,13 +449,16 @@ fn load_unverified(path: &Path) -> Result<PolicyManifest, PolicyLoadError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
 
     for pattern in includes {
-        let matches = expand_include(parent, &pattern)?;
-        if matches.is_empty() {
-            return Err(PolicyLoadError::NoIncludeMatch {
-                manifest: path.to_path_buf(),
-                pattern,
-            });
-        }
+        let matches = match expand_include(parent, &pattern)? {
+            IncludeExpansion::MissingBase => continue,
+            IncludeExpansion::Matches(matches) if matches.is_empty() => {
+                return Err(PolicyLoadError::NoIncludeMatch {
+                    manifest: path.to_path_buf(),
+                    pattern,
+                });
+            }
+            IncludeExpansion::Matches(matches) => matches,
+        };
         for include in matches {
             merge_include(&mut manifest, &mut origins, &include)?;
         }
@@ -754,7 +771,12 @@ impl Origins {
     }
 }
 
-fn expand_include(parent: &Path, pattern: &str) -> Result<Vec<PathBuf>, PolicyLoadError> {
+enum IncludeExpansion {
+    MissingBase,
+    Matches(Vec<PathBuf>),
+}
+
+fn expand_include(parent: &Path, pattern: &str) -> Result<IncludeExpansion, PolicyLoadError> {
     let pattern_path = Path::new(pattern);
     if pattern_path.is_absolute()
         || pattern_path
@@ -764,13 +786,13 @@ fn expand_include(parent: &Path, pattern: &str) -> Result<Vec<PathBuf>, PolicyLo
         return Err(PolicyLoadError::UnsafeInclude(pattern.to_owned()));
     }
     if !pattern.contains(['*', '?']) {
-        return Ok(vec![parent.join(pattern)]);
+        return Ok(IncludeExpansion::Matches(vec![parent.join(pattern)]));
     }
     let wildcard = pattern.find(['*', '?']).expect("glob contains a wildcard");
     let prefix = Path::new(&pattern[..wildcard]);
     let base = parent.join(prefix.parent().unwrap_or_else(|| Path::new(".")));
     if !base.exists() {
-        return Ok(Vec::new());
+        return Ok(IncludeExpansion::MissingBase);
     }
     let mut files = Vec::new();
     collect_files(&base, &mut files)?;
@@ -781,7 +803,7 @@ fn expand_include(parent: &Path, pattern: &str) -> Result<Vec<PathBuf>, PolicyLo
             .is_some_and(|relative| include_glob(relative, pattern))
     });
     files.sort();
-    Ok(files)
+    Ok(IncludeExpansion::Matches(files))
 }
 
 fn collect_files(directory: &Path, files: &mut Vec<PathBuf>) -> Result<(), PolicyLoadError> {
