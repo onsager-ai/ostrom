@@ -251,13 +251,10 @@ pub(crate) fn resolve_repository_target(
     if !valid {
         return Err(OperationDispatchError::InvalidTarget(raw.to_owned()));
     }
-    // Not a let-chain: `let_chains` stabilised in Rust 1.88 and this workspace
-    // declares 1.86, so CI's declared-MSRV build rejects the sugar even though a
-    // newer local toolchain accepts it.
-    if let Some((_, number)) = raw.split_once('#') {
-        if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(OperationDispatchError::InvalidTarget(raw.to_owned()));
-        }
+    if let Some((_, number)) = raw.split_once('#')
+        && (number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return Err(OperationDispatchError::InvalidTarget(raw.to_owned()));
     }
     Ok(ResolvedOperationTarget {
         raw: raw.to_owned(),
