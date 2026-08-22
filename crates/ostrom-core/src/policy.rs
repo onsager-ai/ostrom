@@ -68,8 +68,22 @@ impl PolicyManifest {
                 })?;
             }
         }
+        validate_positive_ceiling(
+            "defaults.loop",
+            "concurrent",
+            self.defaults.r#loop.concurrent.map(|value| value as f64),
+        )?;
+        validate_positive_ceiling("defaults.loop", "spend_usd", self.defaults.r#loop.spend_usd)?;
+        validate_positive_ceiling(
+            "defaults.loop",
+            "tokens",
+            self.defaults.r#loop.tokens.map(|value| value as f64),
+        )?;
         for (name, operation) in &self.operations {
             validate_operation(name, operation)?;
+        }
+        for (name, declaration) in &self.loops {
+            self.validate_loop(name, declaration)?;
         }
         for (kind, rules) in [("grant", &self.grants), ("deny", &self.denies)] {
             for (id, rule) in rules {
@@ -105,6 +119,146 @@ impl PolicyManifest {
             }
         }
         Ok(())
+    }
+
+    fn validate_loop(
+        &self,
+        name: &str,
+        declaration: &LoopDecl,
+    ) -> Result<(), ManifestValidationError> {
+        if !valid_policy_id(name) {
+            return Err(ManifestValidationError::InvalidLoop {
+                name: name.to_owned(),
+                message: "name must contain only lowercase letters, digits, or `-`".to_owned(),
+            });
+        }
+        if !self.actors.contains_key(&declaration.actor) {
+            return Err(ManifestValidationError::UnknownLoopActor {
+                name: name.to_owned(),
+                actor: declaration.actor.clone(),
+            });
+        }
+        if !valid_actor_id(&declaration.actor) {
+            return Err(ManifestValidationError::InvalidLoop {
+                name: name.to_owned(),
+                message: "actor id must contain only lowercase letters, digits, `-`, or `_`"
+                    .to_owned(),
+            });
+        }
+        let operation = self.operations.get(&declaration.operation).ok_or_else(|| {
+            ManifestValidationError::UnknownLoopOperation {
+                name: name.to_owned(),
+                operation: declaration.operation.clone(),
+            }
+        })?;
+        let possibly_granted = self.grants.values().any(|grant| {
+            (grant.actors.is_empty()
+                || grant.actors.iter().any(|actor| actor == &declaration.actor))
+                && (grant.operations.is_empty()
+                    || grant
+                        .operations
+                        .iter()
+                        .any(|operation| operation == &declaration.operation))
+        });
+        if !possibly_granted {
+            return Err(ManifestValidationError::InvalidLoop {
+                name: name.to_owned(),
+                message: format!(
+                    "actor `{}` has no grant that can invoke operation `{}`",
+                    declaration.actor, declaration.operation
+                ),
+            });
+        }
+        for parameter in declaration.parameters.keys() {
+            if !operation.params.contains_key(parameter) {
+                return Err(ManifestValidationError::InvalidLoop {
+                    name: name.to_owned(),
+                    message: format!(
+                        "parameter `{parameter}` is not declared by operation `{}`",
+                        declaration.operation
+                    ),
+                });
+            }
+        }
+        for (parameter, parameter_decl) in &operation.params {
+            let value = declaration
+                .parameters
+                .get(parameter)
+                .or(parameter_decl.default.as_ref());
+            let Some(value) = value else {
+                return Err(ManifestValidationError::InvalidLoop {
+                    name: name.to_owned(),
+                    message: format!("required operation parameter `{parameter}` is missing"),
+                });
+            };
+            parameter_decl.validate_value(value).map_err(|message| {
+                ManifestValidationError::InvalidLoop {
+                    name: name.to_owned(),
+                    message: format!("operation parameter `{parameter}` is invalid: {message}"),
+                }
+            })?;
+        }
+        validate_positive_ceiling(name, "concurrent", declaration.concurrent.map(|v| v as f64))?;
+        validate_positive_ceiling(name, "spend_usd", declaration.spend_usd)?;
+        validate_positive_ceiling(name, "tokens", declaration.tokens.map(|v| v as f64))?;
+        for (field, value) in [
+            ("cadence_hours", declaration.cadence_hours),
+            ("stuck_after_days", declaration.stuck_after_days),
+        ] {
+            if value == Some(0) {
+                return Err(ManifestValidationError::InvalidLoop {
+                    name: name.to_owned(),
+                    message: format!("`{field}` must be positive"),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve one loop together with its inherited ceilings and operation defaults.
+    pub fn resolve_loop(&self, name: &str) -> Result<ResolvedLoop, LoopResolutionError> {
+        let declaration = self
+            .loops
+            .get(name)
+            .ok_or_else(|| LoopResolutionError::Unknown(name.to_owned()))?;
+        let operation = self.operations.get(&declaration.operation).ok_or_else(|| {
+            LoopResolutionError::Invalid {
+                name: name.to_owned(),
+                message: format!("unknown operation `{}`", declaration.operation),
+            }
+        })?;
+        let parameters = operation
+            .params
+            .iter()
+            .map(|(parameter, parameter_decl)| {
+                declaration
+                    .parameters
+                    .get(parameter)
+                    .or(parameter_decl.default.as_ref())
+                    .cloned()
+                    .map(|value| (parameter.clone(), value))
+                    .ok_or_else(|| LoopResolutionError::Invalid {
+                        name: name.to_owned(),
+                        message: format!("required operation parameter `{parameter}` is missing"),
+                    })
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        Ok(ResolvedLoop {
+            name: name.to_owned(),
+            actor: declaration.actor.clone(),
+            operation: declaration.operation.clone(),
+            target: declaration.target.clone(),
+            parameters,
+            every: declaration.every.clone(),
+            ceilings: ResolvedLoopCeilings {
+                concurrent: declaration.concurrent.or(self.defaults.r#loop.concurrent),
+                spend_usd: declaration.spend_usd.or(self.defaults.r#loop.spend_usd),
+                tokens: declaration.tokens.or(self.defaults.r#loop.tokens),
+            },
+            publish: declaration.publish.clone(),
+            cadence_hours: declaration.cadence_hours,
+            stuck_after_days: declaration.stuck_after_days,
+        })
     }
 
     pub fn resolve_inputs<F>(
@@ -240,6 +394,12 @@ pub enum ManifestValidationError {
         rule: String,
         selector: String,
     },
+    #[error("loop `{name}` names unknown actor `{actor}`")]
+    UnknownLoopActor { name: String, actor: String },
+    #[error("loop `{name}` names unknown operation `{operation}`")]
+    UnknownLoopOperation { name: String, operation: String },
+    #[error("loop `{name}` is invalid: {message}")]
+    InvalidLoop { name: String, message: String },
     #[error(transparent)]
     Operation(#[from] OperationActionError),
 }
@@ -383,9 +543,12 @@ pub struct StepDecl {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoopDecl {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub role: Option<String>,
-    pub every: Value,
+    pub actor: String,
+    pub operation: String,
+    pub target: String,
+    pub every: LoopCadence,
+    #[serde(default, rename = "with", skip_serializing_if = "BTreeMap::is_empty")]
+    pub parameters: BTreeMap<String, Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrent: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -398,6 +561,213 @@ pub struct LoopDecl {
     pub cadence_hours: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stuck_after_days: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoopCadence {
+    Hourly,
+    Minute(u8),
+    Times(Vec<LoopTime>),
+    Range { start: LoopTime, end: LoopTime },
+}
+
+impl LoopCadence {
+    #[must_use]
+    pub fn on_calendars(&self) -> Vec<String> {
+        match self {
+            Self::Hourly => vec!["hourly".to_owned()],
+            Self::Minute(minute) => vec![format!("*-*-* *:{minute:02}:00")],
+            Self::Times(times) => {
+                if times.iter().all(|time| time.minute == times[0].minute) {
+                    let hours = times
+                        .iter()
+                        .map(|time| format!("{:02}", time.hour))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    vec![format!("*-*-* {hours}:{:02}:00", times[0].minute)]
+                } else {
+                    times
+                        .iter()
+                        .map(|time| format!("*-*-* {time}:00"))
+                        .collect()
+                }
+            }
+            Self::Range { start, end } => vec![format!(
+                "*-*-* {:02}..{:02}:{:02}:00",
+                start.hour, end.hour, start.minute
+            )],
+        }
+    }
+}
+
+impl Serialize for LoopCadence {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Hourly => serializer.serialize_str("hourly"),
+            Self::Minute(minute) => serializer.serialize_str(&format!("*:{minute:02}")),
+            Self::Times(times) => times
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .serialize(serializer),
+            Self::Range { start, end } => serializer.serialize_str(&format!("{start}..{end}")),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for LoopCadence {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        parse_loop_cadence(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LoopTime {
+    hour: u8,
+    minute: u8,
+}
+
+impl fmt::Display for LoopTime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{:02}:{:02}", self.hour, self.minute)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedLoop {
+    pub name: String,
+    pub actor: String,
+    pub operation: String,
+    pub target: String,
+    pub parameters: BTreeMap<String, Value>,
+    pub every: LoopCadence,
+    pub ceilings: ResolvedLoopCeilings,
+    pub publish: Option<String>,
+    pub cadence_hours: Option<u64>,
+    pub stuck_after_days: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ResolvedLoopCeilings {
+    pub concurrent: Option<u64>,
+    pub spend_usd: Option<f64>,
+    pub tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum LoopResolutionError {
+    #[error("unknown loop `{0}`")]
+    Unknown(String),
+    #[error("loop `{name}` is invalid: {message}")]
+    Invalid { name: String, message: String },
+}
+
+fn parse_loop_cadence(value: Value) -> Result<LoopCadence, String> {
+    match value {
+        Value::String(value) if value == "hourly" => Ok(LoopCadence::Hourly),
+        Value::String(value) => parse_cadence_string(&value),
+        Value::Sequence(values) if !values.is_empty() => {
+            let times = values
+                .into_iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .ok_or_else(|| "time lists may contain only HH:MM strings".to_owned())
+                        .and_then(parse_loop_time)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let unique = times.iter().collect::<BTreeSet<_>>();
+            if unique.len() != times.len() {
+                return Err("time lists may not contain duplicates".to_owned());
+            }
+            Ok(LoopCadence::Times(times))
+        }
+        _ => Err(
+            "expected `hourly`, `*:MM`, `HH:MM..HH:MM`, or a non-empty list of HH:MM times"
+                .to_owned(),
+        ),
+    }
+}
+
+fn parse_cadence_string(value: &str) -> Result<LoopCadence, String> {
+    if let Some(minute) = value.strip_prefix("*:") {
+        return parse_minute(minute).map(LoopCadence::Minute);
+    }
+    if let Some((start, end)) = value.split_once("..") {
+        let start = parse_loop_time(start)?;
+        let end = parse_loop_time(end)?;
+        if start.hour > end.hour || start.minute != end.minute {
+            return Err("a time range must advance in hours at one fixed minute".to_owned());
+        }
+        return Ok(LoopCadence::Range { start, end });
+    }
+    Err(format!(
+        "unsupported named cadence or time expression `{value}`"
+    ))
+}
+
+fn parse_loop_time(value: &str) -> Result<LoopTime, String> {
+    let Some((hour, minute)) = value.split_once(':') else {
+        return Err(format!("invalid loop time `{value}`; expected HH:MM"));
+    };
+    if hour.len() != 2 || minute.len() != 2 {
+        return Err(format!("invalid loop time `{value}`; expected HH:MM"));
+    }
+    let hour = hour
+        .parse::<u8>()
+        .ok()
+        .filter(|hour| *hour < 24)
+        .ok_or_else(|| format!("invalid loop hour in `{value}`"))?;
+    let minute = parse_minute(minute)?;
+    Ok(LoopTime { hour, minute })
+}
+
+fn parse_minute(value: &str) -> Result<u8, String> {
+    if value.len() != 2 {
+        return Err(format!(
+            "invalid loop minute `{value}`; expected two digits"
+        ));
+    }
+    value
+        .parse::<u8>()
+        .ok()
+        .filter(|minute| *minute < 60)
+        .ok_or_else(|| format!("invalid loop minute `{value}`"))
+}
+
+fn valid_policy_id(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn valid_actor_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
+}
+
+fn validate_positive_ceiling(
+    name: &str,
+    field: &str,
+    value: Option<f64>,
+) -> Result<(), ManifestValidationError> {
+    if value.is_some_and(|value| !value.is_finite() || value <= 0.0) {
+        return Err(ManifestValidationError::InvalidLoop {
+            name: name.to_owned(),
+            message: format!("`{field}` must be finite and positive"),
+        });
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1318,7 +1688,7 @@ denies:
                 "extra",
             ),
             (
-                "manifest_version: 1\nloops:\n  sweep: {every: hourly, extra: nope}\n",
+                "manifest_version: 1\nloops:\n  sweep: {actor: sweeper, operation: sweep, target: placeholder-org/repo, every: hourly, extra: nope}\n",
                 "extra",
             ),
             (
@@ -1332,6 +1702,46 @@ denies:
                 .to_string();
             assert!(error.contains(key), "{error}");
         }
+    }
+
+    #[test]
+    fn loop_cadence_grammar_is_closed_and_renders_systemd_calendar_values() {
+        let prefix = "manifest_version: 1\nactors: {builder: {}}\noperations: {work: {steps: []}}\ngrants:\n  work: {actors: builder, operations: work, repositories: placeholder-org/repo}\nloops:\n  cadence:\n    actor: builder\n    operation: work\n    target: placeholder-org/repo\n    every: ";
+        for (value, expected) in [
+            ("hourly\n", "hourly"),
+            ("'*:45'\n", "*-*-* *:45:00"),
+            ("08:15..21:15\n", "*-*-* 08..21:15:00"),
+            ("['23:15', '02:15', '05:15']\n", "*-*-* 23,02,05:15:00"),
+        ] {
+            let manifest = PolicyManifest::from_yaml(&format!("{prefix}{value}"))
+                .expect("closed cadence value parses");
+            assert_eq!(manifest.loops["cadence"].every.on_calendars(), [expected]);
+        }
+        for value in ["'*/15 * * * *'\n", "daily\n", "'24:00..25:00'\n", "[]\n"] {
+            let error = PolicyManifest::from_yaml(&format!("{prefix}{value}"))
+                .expect_err("outside cadence grammar fails")
+                .to_string();
+            assert!(
+                error.contains("cadence") || error.contains("loop"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn loop_ceilings_inherit_independently_and_can_override_one_value() {
+        let manifest = PolicyManifest::from_yaml(
+            "manifest_version: 1\ndefaults:\n  loop: {concurrent: 6, spend_usd: 50, tokens: 200000}\nactors: {builder: {}}\noperations: {work: {steps: []}}\ngrants:\n  work: {actors: builder, operations: work, repositories: placeholder-org/repo}\nloops:\n  day: {actor: builder, operation: work, target: placeholder-org/repo, every: hourly}\n  night: {actor: builder, operation: work, target: placeholder-org/repo, every: hourly, concurrent: 2}\n",
+        )
+        .expect("loop manifest");
+        let day = manifest.resolve_loop("day").expect("day loop");
+        let night = manifest.resolve_loop("night").expect("night loop");
+        assert_eq!(day.ceilings.concurrent, Some(6));
+        assert_eq!(day.ceilings.spend_usd, Some(50.0));
+        assert_eq!(day.ceilings.tokens, Some(200_000));
+        assert_eq!(night.ceilings.concurrent, Some(2));
+        assert_eq!(night.ceilings.spend_usd, day.ceilings.spend_usd);
+        assert_eq!(night.ceilings.tokens, day.ceilings.tokens);
     }
 
     #[test]

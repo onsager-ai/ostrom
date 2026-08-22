@@ -418,6 +418,8 @@ fn command_verbs() -> impl Iterator<Item = &'static str> {
         "implement",
         "lease",
         "local-drift",
+        "loop",
+        "loops",
         "migrate",
         "parity",
         "pass",

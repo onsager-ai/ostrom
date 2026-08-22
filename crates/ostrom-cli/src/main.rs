@@ -15,12 +15,13 @@ use clap::{Parser, Subcommand, ValueEnum};
 use directories::BaseDirs;
 use ostrom_checks::{
     ActionFault, ActionRegistry, DoctorOptions, PreparedCheck, check_shell_retirement,
-    check_skill_version_bump, generate_operation_settings, run_doctor, run_doctor_check,
+    check_skill_version_bump, generate_operation_settings, render_loop_units, run_doctor,
+    run_doctor_check,
 };
 use ostrom_core::{
     CHECK_STORE_SCHEMA_VERSION, Catalogue, CatalogueEnumeration, CheckContractError, CheckDocument,
     CheckFault, CheckRun, CheckRunId, CheckState, CheckVerdict, InconclusivePolicy,
-    OperationAction, RepositoryName, ResolvedCheck, SelectorPrefix,
+    OperationAction, RepositoryName, ResolvedCheck, ResolvedLoopCeilings, SelectorPrefix,
 };
 use ostrom_store::{
     AssessmentHarness, AuditOptions, Clock, DigestOptions, DispatchOutcome, DispatchRequest,
@@ -102,6 +103,16 @@ enum Command {
         /// Observation clock for hermetic replay.
         #[arg(long, hide = true)]
         started_at: Option<String>,
+    },
+    /// Run one declared policy loop.
+    Loop {
+        #[command(subcommand)]
+        command: LoopCommand,
+    },
+    /// Render or check the systemd artifacts for declared loops.
+    Loops {
+        #[command(subcommand)]
+        command: LoopsCommand,
     },
     /// Run one command with a scoped GitHub App installation credential.
     Credential {
@@ -276,6 +287,24 @@ enum CheckCommand {
         #[arg(long)]
         head: String,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum LoopCommand {
+    /// Dispatch the operation bound to one named loop.
+    Run { name: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum LoopsCommand {
+    /// Write generated units without enabling, starting, or reloading them.
+    Render {
+        /// Artifact directory; defaults to the Ostrom config root's `systemd` directory.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// Refuse when installed units differ from the generated artifacts.
+    Check { installed: PathBuf },
 }
 
 #[derive(Debug, Subcommand)]
@@ -517,6 +546,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             })?;
             io::stdout().write_all(output.as_bytes())?;
         }
+        Command::Loop { command } => match command {
+            LoopCommand::Run { name } => run_loop_command(&paths, &name)?,
+        },
+        Command::Loops { command } => run_loops_command(&paths, command)?,
         Command::Credential {
             role,
             repository,
@@ -1072,6 +1105,63 @@ fn run_operations_command(
     Ok(())
 }
 
+fn run_loops_command(
+    paths: &OstromPaths,
+    command: LoopsCommand,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let manifest = policy_manifest::load(&manifest_path(&paths.config))?;
+    match command {
+        LoopsCommand::Render { output } => {
+            let output = output.unwrap_or_else(|| paths.config.join("systemd"));
+            for path in render_loop_units(&manifest, &output)? {
+                println!("{}", path.display());
+            }
+        }
+        LoopsCommand::Check { installed } => {
+            let drift = ostrom_checks::check_loop_units_drift(&manifest, &installed)?;
+            if !drift.is_clean() {
+                return Err(LoopCommandError::Drift {
+                    installed,
+                    missing: drift.missing,
+                    changed: drift.changed,
+                    unexpected: drift.unexpected,
+                }
+                .into());
+            }
+            println!("valid: {}", installed.display());
+        }
+    }
+    Ok(())
+}
+
+fn run_loop_command(paths: &OstromPaths, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let manifest = policy_manifest::load(&manifest_path(&paths.config))?;
+    let resolved = manifest.resolve_loop(name)?;
+    assert_loop_environment(&resolved.actor, resolved.ceilings)?;
+    let invocation = operation_dispatch::OperationInvocation {
+        name: resolved.operation.clone(),
+        target: resolved.target,
+        parameters: resolved.parameters,
+    };
+    let working_directory = env::current_dir()?;
+    let plugin_root = environment::OSTROM_PLUGIN_ROOT
+        .value_os()
+        .or_else(|| environment::CLAUDE_PLUGIN_ROOT.value_os())
+        .map_or_else(|| working_directory.join("plugins/ostrom"), PathBuf::from);
+    let selector_prefixes =
+        operation_selector_prefixes(&manifest, &resolved.actor, &invocation.name);
+    let mut runtime = CliOperationRuntime {
+        paths,
+        actor: &resolved.actor,
+        working_directory: &working_directory,
+        plugin_root: &plugin_root,
+        selector_prefixes,
+        ceilings: Some(resolved.ceilings),
+    };
+    dispatch_operation(&manifest, &resolved.actor, &invocation, &mut runtime)?;
+    Ok(())
+}
+
 fn run_operation_command(
     paths: &OstromPaths,
     arguments: &[OsString],
@@ -1094,6 +1184,7 @@ fn run_operation_command(
         working_directory: &working_directory,
         plugin_root: &plugin_root,
         selector_prefixes,
+        ceilings: None,
     };
     dispatch_operation(&manifest, &actor, &invocation, &mut runtime)?;
     Ok(())
@@ -1105,6 +1196,7 @@ struct CliOperationRuntime<'a> {
     working_directory: &'a Path,
     plugin_root: &'a Path,
     selector_prefixes: BTreeSet<SelectorPrefix>,
+    ceilings: Option<ResolvedLoopCeilings>,
 }
 
 impl OperationRuntime for CliOperationRuntime<'_> {
@@ -1140,7 +1232,14 @@ impl OperationRuntime for CliOperationRuntime<'_> {
         target: &ResolvedOperationTarget,
         parameters: &BTreeMap<String, serde_yaml::Value>,
     ) -> Result<(), OperationDispatchError> {
-        execute_operation_action(self.paths, self.actor, action, target, parameters)
+        execute_operation_action(
+            self.paths,
+            self.actor,
+            action,
+            target,
+            parameters,
+            self.ceilings,
+        )
     }
 }
 
@@ -1298,6 +1397,7 @@ fn execute_operation_action(
     action: &'static OperationAction,
     target: &ResolvedOperationTarget,
     parameters: &BTreeMap<String, serde_yaml::Value>,
+    ceilings: Option<ResolvedLoopCeilings>,
 ) -> Result<(), OperationDispatchError> {
     match action.uses {
         "gh/post-verdict" => {
@@ -1356,7 +1456,7 @@ fn execute_operation_action(
                 &["git", "push", "origin", &reference],
             )
         }
-        "cmd/run" => run_local_command(action, parameters),
+        "cmd/run" => run_local_command(action, parameters, ceilings),
         _ => Err(OperationDispatchError::UnknownAction(
             action.uses.to_owned(),
         )),
@@ -1404,16 +1504,22 @@ fn run_mediated(
 fn run_local_command(
     action: &'static OperationAction,
     parameters: &BTreeMap<String, serde_yaml::Value>,
+    ceilings: Option<ResolvedLoopCeilings>,
 ) -> Result<(), OperationDispatchError> {
     let script = operation_string(parameters, "script", action.uses)?;
     let timeout = operation_timeout(parameters.get("timeout"), action.uses)?;
-    let mut child = ProcessCommand::new("sh")
+    let mut command = ProcessCommand::new("sh");
+    command
         .args(["-c", script])
         .env_remove("GH_TOKEN")
         .env_remove("GITHUB_TOKEN")
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    if let Some(ceilings) = ceilings {
+        apply_loop_ceilings(&mut command, ceilings);
+    }
+    let mut child = command
         .spawn()
         .map_err(|error| action_failed(action.uses, error))?;
     let started = std::time::Instant::now();
@@ -1437,6 +1543,143 @@ fn run_local_command(
             return Err(action_failed(action.uses, "child timed out"));
         }
         thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn apply_loop_ceilings(command: &mut ProcessCommand, ceilings: ResolvedLoopCeilings) {
+    if let Some(value) = ceilings.spend_usd {
+        command.env("MANDATE_DAILY_CAP_USD", render_ceiling_number(value));
+    }
+    if let Some(value) = ceilings.concurrent {
+        command.env("MANDATE_MAX_IMPLEMENTERS", value.to_string());
+    }
+    if let Some(value) = ceilings.tokens {
+        command.env("MANDATE_ORDER_TOKEN_CEILING", value.to_string());
+    }
+}
+
+fn assert_loop_environment(
+    actor: &str,
+    ceilings: ResolvedLoopCeilings,
+) -> Result<(), LoopCommandError> {
+    if let Some(enforced) =
+        nonempty_env(environment::OSTROM_ACTOR).filter(|enforced| enforced.as_str() != actor)
+    {
+        return Err(LoopCommandError::ActorMismatch {
+            declared: actor.to_owned(),
+            enforced,
+        });
+    }
+    assert_u64_ceiling(
+        environment::MANDATE_MAX_IMPLEMENTERS,
+        "concurrent",
+        ceilings.concurrent,
+    )?;
+    assert_f64_ceiling(
+        environment::MANDATE_DAILY_CAP_USD,
+        "spend_usd",
+        ceilings.spend_usd,
+    )?;
+    assert_u64_ceiling(
+        environment::MANDATE_ORDER_TOKEN_CEILING,
+        "tokens",
+        ceilings.tokens,
+    )
+}
+
+fn assert_u64_ceiling(
+    variable: environment::EnvironmentVariable,
+    field: &'static str,
+    declared: Option<u64>,
+) -> Result<(), LoopCommandError> {
+    let Some(enforced) = nonempty_env(variable) else {
+        return Ok(());
+    };
+    let matches = enforced.parse::<u64>().ok() == declared;
+    if matches {
+        Ok(())
+    } else {
+        Err(LoopCommandError::CeilingMismatch {
+            field,
+            variable: variable.name,
+            declared: declared.map_or_else(|| "unset".to_owned(), |value| value.to_string()),
+            enforced,
+        })
+    }
+}
+
+fn assert_f64_ceiling(
+    variable: environment::EnvironmentVariable,
+    field: &'static str,
+    declared: Option<f64>,
+) -> Result<(), LoopCommandError> {
+    let Some(enforced) = nonempty_env(variable) else {
+        return Ok(());
+    };
+    let matches = enforced
+        .parse::<f64>()
+        .ok()
+        .zip(declared)
+        .is_some_and(|(enforced, declared)| enforced == declared);
+    if matches {
+        Ok(())
+    } else {
+        Err(LoopCommandError::CeilingMismatch {
+            field,
+            variable: variable.name,
+            declared: declared.map_or_else(|| "unset".to_owned(), render_ceiling_number),
+            enforced,
+        })
+    }
+}
+
+fn nonempty_env(variable: environment::EnvironmentVariable) -> Option<String> {
+    variable.value().filter(|value| !value.trim().is_empty())
+}
+
+fn render_ceiling_number(value: f64) -> String {
+    if value.fract() == 0.0 {
+        format!("{value:.0}")
+    } else {
+        value.to_string()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum LoopCommandError {
+    #[error(
+        "loop actor mismatch: manifest declares `{declared}` but OSTROM_ACTOR enforces `{enforced}`"
+    )]
+    ActorMismatch { declared: String, enforced: String },
+    #[error(
+        "loop ceiling mismatch for `{field}`: manifest declares `{declared}` but {variable} enforces `{enforced}`"
+    )]
+    CeilingMismatch {
+        field: &'static str,
+        variable: &'static str,
+        declared: String,
+        enforced: String,
+    },
+    #[error(
+        "loop units at `{}` drift (missing: {}; changed: {}; unexpected: {})",
+        installed.display(),
+        format_names(missing),
+        format_names(changed),
+        format_names(unexpected)
+    )]
+    Drift {
+        installed: PathBuf,
+        missing: Vec<String>,
+        changed: Vec<String>,
+        unexpected: Vec<String>,
+    },
+}
+
+fn format_names(names: &[String]) -> String {
+    if names.is_empty() {
+        "none".to_owned()
+    } else {
+        names.join(", ")
     }
 }
 
