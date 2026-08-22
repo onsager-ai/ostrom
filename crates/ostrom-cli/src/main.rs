@@ -30,13 +30,13 @@ use ostrom_store::{
     PlanOptions, PublishDestination, PublishTarget, QueueDecision, ReplayOptions, SelectAction,
     SelectError, SelectOutcome, SelectRequest, SignalFlags, SweepError, SweepMode, SweepOptions,
     SweepParityOptions, TraceAppend, TraceView, UnavailableAssessmentDeriver, acquire_lease,
-    acquire_org_from_github, append_trace_checked, audit, branch_name, clear_work_order,
-    create_work_order, credential_output, decide_queue_item, encode_org_snapshots,
-    encode_selection, environment, finalize_exited_implementer, grant_excuse, item_hash,
-    lease_status, lint_queue_state, list_excuses, list_queue_json, local_drift, migrate,
-    read_trace_json, release_lease, render_constitution, render_digest, replay, run_dispatch,
-    run_gate, run_implement, run_pass, run_plan, run_repair_prs, run_selection, run_sweep,
-    run_sweep_parity, validate_lease_name, validate_work_order_file,
+    acquire_org_from_github_with_faults, append_trace_checked, audit, branch_name,
+    clear_work_order, create_work_order, credential_output, decide_queue_item,
+    encode_org_snapshots_with_faults, encode_selection, environment, finalize_exited_implementer,
+    grant_excuse, item_hash, lease_status, lint_queue_state, list_excuses, list_queue_json,
+    local_drift, migrate, read_trace_json, release_lease, render_constitution, render_digest,
+    replay, run_dispatch, run_gate, run_implement, run_pass, run_plan, run_repair_prs,
+    run_selection, run_sweep, run_sweep_parity, validate_lease_name, validate_work_order_file,
 };
 
 mod operation_dispatch;
@@ -904,16 +904,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let started_at = resolve_started_at(started_at.as_deref(), &clock)?;
             if let Some(org) = inner_org {
                 let cwd = env::current_dir()?;
-                let snapshots =
-                    match acquire_org_from_github(&paths, &cwd, &org, started_at, mode.into()) {
-                        Ok(snapshots) => snapshots,
-                        Err(error @ SweepError::BranchListingTruncated(_)) => {
-                            eprintln!("{error}");
-                            std::process::exit(6);
-                        }
-                        Err(error) => return Err(error.into()),
-                    };
-                io::stdout().write_all(&encode_org_snapshots(snapshots)?)?;
+                let (snapshots, faults) = match acquire_org_from_github_with_faults(
+                    &paths,
+                    &cwd,
+                    &org,
+                    started_at,
+                    mode.into(),
+                ) {
+                    Ok(result) => result,
+                    Err(error @ SweepError::BranchListingTruncated(_)) => {
+                        eprintln!("{error}");
+                        std::process::exit(6);
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                io::stdout().write_all(&encode_org_snapshots_with_faults(snapshots, faults)?)?;
                 return Ok(());
             }
             let publish = publish_repository.map_or(Ok(PublishTarget::Disabled), |repository| {

@@ -294,12 +294,20 @@ case "$1 $2" in
   "api -X")
     case "$*" in
       *"/branches?"*) printf '%s\n' '[]'; exit 0 ;;
+      *"search/issues"*) printf '%s\n' '{"total_count":1,"incomplete_results":false,"items":[{"node_id":"PR_placeholder"}]}'; exit 0 ;;
     esac
     printf 'HTTP/2 304 Not Modified\r\netag: fixture-etag\r\n\r\n'
     exit 1
     ;;
   "api graphql")
-    printf '%s\n' '{"data":{"repository":{"issues":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}'
+    case "$*" in
+      *"OstromMergedPullRequestNodes"*)
+        printf '%s\n' '{"data":{"nodes":[{"number":17,"title":"Placeholder merged pull request","author":{"login":"placeholder-bot[bot]","__typename":"Bot"},"closingIssuesReferences":{"nodes":[]},"createdAt":"2026-07-31T00:00:00Z","mergedAt":"2026-08-01T00:00:00Z","headRefOid":"placeholder-merged-sha","state":"MERGED"}]}}'
+        ;;
+      *)
+        printf '%s\n' '{"data":{"repository":{"issues":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}'
+        ;;
+    esac
     ;;
   "pr list") printf '%s\n' '[]' ;;
   "repo view") printf '%s\n' '{"defaultBranchRef":{"name":"main"}}' ;;
@@ -341,14 +349,23 @@ esac
     let snapshots: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("parse worker snapshots");
     assert_eq!(snapshots["repositories"][0]["issue_not_modified"], true);
+    assert_eq!(
+        snapshots["repositories"][0]["merged_prs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
     let calls = fs::read_to_string(log).expect("read gh call log");
     assert!(calls.contains("If-None-Match: fixture-etag"));
     assert!(calls.contains("since=2026-07-31T00:00:00Z"));
     assert!(calls.contains("api graphql -f query=query OstromDependencyGraph"));
     assert!(calls.contains("pr list --repo example-org/example-repo --state open --limit 200"));
     assert!(calls.contains(
-        "pr list --repo example-org/example-repo --state merged --search merged:>=2026-07-02 --limit 200"
+        "api -X GET search/issues -f q=repo:example-org/example-repo is:pr is:merged merged:>=2026-07-02 -F per_page=100 -F page=1"
     ));
+    assert!(calls.contains("api graphql -f query=query OstromMergedPullRequestNodes"));
+    assert!(calls.contains("-F ids[]=PR_placeholder"));
     assert!(!calls.contains("--state all --limit 200"));
     assert!(
         calls.contains("api -X GET repos/example-org/example-repo/branches?per_page=100&page=1")
@@ -629,7 +646,7 @@ fn fixture_refuses_a_full_second_branch_page() {
 
 #[cfg(unix)]
 #[test]
-fn github_worker_refuses_a_full_second_branch_page() {
+fn github_worker_reports_a_full_second_branch_page_as_a_repository_fault() {
     use std::{env, os::unix::fs::PermissionsExt};
 
     let home = tempdir().expect("temporary OSTROM_HOME");
@@ -658,11 +675,19 @@ case "$1 $2" in
     case "$*" in
       *"/issues?"*) printf 'HTTP/2 200 OK\r\netag: placeholder-etag\r\n\r\n[]' ;;
       *"/branches?"*) branch_page ;;
+      *"search/issues"*) printf '%s\n' '{"total_count":0,"items":[]}' ;;
       *) exit 9 ;;
     esac
     ;;
   "api graphql")
-    printf '%s\n' '{"data":{"repository":{"issues":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}'
+    case "$*" in
+      *"OstromMergedPullRequests"*)
+        printf '%s\n' '{"data":{"search":{"issueCount":0,"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}'
+        ;;
+      *)
+        printf '%s\n' '{"data":{"repository":{"issues":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}'
+        ;;
+    esac
     ;;
   "pr list") printf '%s\n' '[]' ;;
   "repo view") printf '%s\n' '{"defaultBranchRef":{"name":"main"}}' ;;
@@ -694,10 +719,20 @@ esac
         .current_dir(home.path())
         .output()
         .expect("run GitHub worker");
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains(
-        "branch query for placeholder-org/alpha reached query_limit 200; refusing a truncated sweep"
-    ));
+    assert!(
+        output.status.success(),
+        "worker stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse repository fault response");
+    assert_eq!(result["repositories"], serde_json::json!([]));
+    assert!(result["faults"][0]
+        .as_str()
+        .expect("repository fault")
+        .contains(
+            "branch query for placeholder-org/alpha reached query_limit 200; refusing a truncated sweep"
+        ));
 }
 
 #[test]
