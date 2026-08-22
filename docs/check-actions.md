@@ -132,9 +132,11 @@ universal core parameter and is accepted alongside each provider's keys.
 
 ## Policy requirements
 
-A policy grant or operation step may cite one check by its exact authored name
-with `requires: check-name`. The check definition remains in the separate
-`checks.yaml` beside the policy manifest; it is not copied into or interpreted
-as part of the manifest. `ostrom validate` loads that catalogue whenever the
-manifest contains a requirement and rejects an undefined name. The field is
+A policy grant, deny, or operation step may cite one check by its exact
+authored name with `requires: check-name`. Policy checks are part of the
+composed, signed manifest. They may be written inline under `checks:` or in a
+separate file named by `includes:`; a check leaf identifies itself with
+`check: check-name`. The manifest-wide inconclusive default lives at
+`defaults.check.inconclusive_policy`, and a check may override it. Validation
+rejects an undefined name and suggests including its file. The field is
 spelled `requires` everywhere; closed-schema validation rejects `require:`.

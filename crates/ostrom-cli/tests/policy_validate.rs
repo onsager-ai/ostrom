@@ -226,7 +226,7 @@ fn require_naming_an_undefined_check_fails_the_load() {
     .expect("write manifest");
     fs::write(
         temporary.path().join("checks.yaml"),
-        "checks_version: 1\nchecks:\n  available-placeholder-check:\n    uses: cmd/run\n    with: {script: 'exit 0'}\n",
+        "check: available-placeholder-check\nuses: cmd/run\nwith: {script: 'exit 0'}\n",
     )
     .expect("write checks");
 
@@ -241,6 +241,7 @@ fn require_naming_an_undefined_check_fails_the_load() {
         stderr.contains("requires undefined check `missing-placeholder-check`"),
         "{stderr}"
     );
+    assert!(stderr.contains("add its file to `includes:`"), "{stderr}");
 }
 
 #[test]
@@ -295,7 +296,7 @@ fn grant_requires_naming_an_undefined_check_fails_the_load() {
     .expect("write manifest");
     fs::write(
         temporary.path().join("checks.yaml"),
-        "checks_version: 1\nchecks:\n  available-placeholder-check:\n    uses: cmd/run\n    with: {script: 'exit 0'}\n",
+        "check: available-placeholder-check\nuses: cmd/run\nwith: {script: 'exit 0'}\n",
     )
     .expect("write checks");
 
@@ -396,6 +397,157 @@ fn changing_an_included_leaf_after_signing_is_refused() {
         .expect("validate changed included leaf");
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("verification failed"));
+}
+
+#[test]
+fn changing_an_included_check_script_after_signing_is_refused() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let manifest = temporary.path().join("manifest.yml");
+    let checks = temporary.path().join("checks.yaml");
+    fs::write(
+        &manifest,
+        "manifest_version: 1\nincludes: [checks.yaml]\noperations:\n  merge:\n    steps:\n      - uses: gh/merge-pr\n        requires: ready-to-merge\n",
+    )
+    .expect("write root manifest");
+    fs::write(
+        &checks,
+        "check: ready-to-merge\nuses: cmd/run\nwith: {script: 'exit 0'}\n",
+    )
+    .expect("write check leaf");
+    let trusted = support::sign_manifest(&manifest);
+    fs::write(
+        &checks,
+        "check: ready-to-merge\nuses: cmd/run\nwith: {script: 'exit 1'}\n",
+    )
+    .expect("change check script after signing");
+
+    let output = ostrom()
+        .env("OSTROM_POLICY_TRUSTED_KEYS", trusted)
+        .args(["validate"])
+        .arg(manifest)
+        .output()
+        .expect("validate changed check leaf");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("verification failed"));
+}
+
+#[test]
+fn changing_an_inline_check_action_after_signing_is_refused() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let manifest = temporary.path().join("manifest.yml");
+    fs::write(
+        &manifest,
+        "manifest_version: 1\nchecks:\n  ready-to-merge:\n    uses: cmd/run\n    with: {script: 'exit 0'}\n",
+    )
+    .expect("write inline check");
+    let trusted = support::sign_manifest(&manifest);
+    fs::write(
+        &manifest,
+        "manifest_version: 1\nchecks:\n  ready-to-merge:\n    uses: gh/check-run\n    with: {name: rust}\n",
+    )
+    .expect("change check action after signing");
+
+    let output = ostrom()
+        .env("OSTROM_POLICY_TRUSTED_KEYS", trusted)
+        .args(["validate"])
+        .arg(manifest)
+        .output()
+        .expect("validate changed inline check");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("verification failed"));
+}
+
+#[test]
+fn inline_and_leaf_checks_compose_and_sign_identically() {
+    let inline_root = TempDir::new().expect("temporary inline directory");
+    let inline_manifest = inline_root.path().join("manifest.yml");
+    fs::write(
+        &inline_manifest,
+        "manifest_version: 1\ndefaults:\n  check: {inconclusive_policy: warn}\nchecks:\n  ready-to-merge:\n    uses: gh/check-run\n    with: {required: [rust]}\n    inconclusive_policy: block\n",
+    )
+    .expect("write inline manifest");
+
+    let leaf_root = TempDir::new().expect("temporary leaf directory");
+    let leaf_manifest = leaf_root.path().join("manifest.yml");
+    fs::write(
+        &leaf_manifest,
+        "manifest_version: 1\nincludes: [checks.yaml]\ndefaults:\n  check: {inconclusive_policy: warn}\n",
+    )
+    .expect("write leaf manifest");
+    fs::write(
+        leaf_root.path().join("checks.yaml"),
+        "check: ready-to-merge\nuses: gh/check-run\nwith: {required: [rust]}\ninconclusive_policy: block\n",
+    )
+    .expect("write check leaf");
+
+    let inline_trusted = support::sign_manifest(&inline_manifest);
+    let leaf_trusted = support::sign_manifest(&leaf_manifest);
+    let inline_normalized = ostrom()
+        .env("OSTROM_POLICY_TRUSTED_KEYS", inline_trusted)
+        .args(["validate", "--normalized"])
+        .arg(&inline_manifest)
+        .output()
+        .expect("normalize inline manifest");
+    let leaf_normalized = ostrom()
+        .env("OSTROM_POLICY_TRUSTED_KEYS", leaf_trusted)
+        .args(["validate", "--normalized"])
+        .arg(&leaf_manifest)
+        .output()
+        .expect("normalize leaf manifest");
+    assert!(inline_normalized.status.success());
+    assert!(leaf_normalized.status.success());
+    assert_eq!(inline_normalized.stdout, leaf_normalized.stdout);
+    assert_eq!(
+        fs::read(inline_manifest.with_extension("yml.sig")).expect("read inline signature"),
+        fs::read(leaf_manifest.with_extension("yml.sig")).expect("read leaf signature")
+    );
+}
+
+#[test]
+fn a_check_leaf_with_another_identity_key_is_refused() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let manifest = temporary.path().join("manifest.yml");
+    fs::write(&manifest, "manifest_version: 1\nincludes: [checks.yaml]\n")
+        .expect("write root manifest");
+    fs::write(
+        temporary.path().join("checks.yaml"),
+        "check: ready-to-merge\nactor: builder\nuses: cmd/run\nwith: {script: 'exit 0'}\n",
+    )
+    .expect("write ambiguous leaf");
+
+    let output = ostrom()
+        .args(["validate"])
+        .arg(manifest)
+        .output()
+        .expect("validate ambiguous leaf");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("multiple identity keys")
+            && stderr.contains("actor")
+            && stderr.contains("check"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_manifest_without_checks_still_signs_and_verifies() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let manifest = temporary.path().join("manifest.yml");
+    fs::write(&manifest, "manifest_version: 1\nactors: {builder: {}}\n").expect("write manifest");
+    let trusted = support::sign_manifest(&manifest);
+
+    let output = ostrom()
+        .env("OSTROM_POLICY_TRUSTED_KEYS", trusted)
+        .args(["validate"])
+        .arg(manifest)
+        .output()
+        .expect("validate manifest without checks");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

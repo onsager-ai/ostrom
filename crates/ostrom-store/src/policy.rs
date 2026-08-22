@@ -1,13 +1,13 @@
 use ostrom_core::{
-    CheckDocument, InconclusivePolicy, PolicyCandidate, PolicyManifest, RuleDecl, SelectorPrefix,
+    CheckDefinition, InconclusivePolicy, PolicyCandidate, PolicyManifest, RuleDecl, SelectorPrefix,
     StallDuration, UnmatchedPolicy,
 };
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone)]
 pub struct PolicyBundle {
     pub manifest: PolicyManifest,
-    pub checks: Option<CheckDocument>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,7 +89,8 @@ impl PolicyBundle {
                     &candidate,
                     actor,
                     operation,
-                    self.checks.as_ref(),
+                    &self.manifest.checks,
+                    self.manifest.defaults.check.inconclusive_policy,
                     checks,
                     unmatched,
                 ));
@@ -199,7 +200,8 @@ fn explain_rule(
     candidate: &PolicyCandidate,
     actor: &str,
     operation: &str,
-    document: Option<&CheckDocument>,
+    definitions: &BTreeMap<String, CheckDefinition>,
+    default_inconclusive_policy: InconclusivePolicy,
     checks: &[Value],
     unmatched: UnmatchedPolicy,
 ) -> RuleExplanation {
@@ -248,7 +250,7 @@ fn explain_rule(
     let requirement = declaration
         .requires
         .as_deref()
-        .map(|check| explain_requirement(check, document, checks));
+        .map(|check| explain_requirement(check, definitions, default_inconclusive_policy, checks));
     RuleExplanation {
         kind,
         id: id.to_owned(),
@@ -264,28 +266,21 @@ fn explain_rule(
 
 fn explain_requirement(
     check: &str,
-    document: Option<&CheckDocument>,
+    definitions: &BTreeMap<String, CheckDefinition>,
+    default_inconclusive_policy: InconclusivePolicy,
     checks: &[Value],
 ) -> RequirementExplanation {
-    let Some(document) = document else {
+    let Some(definition) = definitions.get(check) else {
         return RequirementExplanation {
             check: check.to_owned(),
             status: "INCONCLUSIVE",
             allows: false,
-            source: "checks.yaml unavailable".to_owned(),
-        };
-    };
-    let Some(definition) = document.checks.get(check) else {
-        return RequirementExplanation {
-            check: check.to_owned(),
-            status: "INCONCLUSIVE",
-            allows: false,
-            source: "checks.yaml: undefined check".to_owned(),
+            source: format!("checks.{check}: undefined check"),
         };
     };
     let policy = definition
         .inconclusive_policy
-        .unwrap_or(document.inconclusive_policy);
+        .unwrap_or(default_inconclusive_policy);
     let status = if definition.uses == "gh/check-run" {
         let expected = definition
             .with
@@ -306,7 +301,7 @@ fn explain_requirement(
     };
     let source = if definition.uses == "gh/check-run" {
         format!(
-            "checks.yaml: gh/check-run name={}",
+            "checks.{check}: gh/check-run name={}",
             definition
                 .with
                 .get("name")
@@ -314,7 +309,7 @@ fn explain_requirement(
                 .unwrap_or("(missing)")
         )
     } else {
-        format!("checks.yaml: {}", definition.uses)
+        format!("checks.{check}: {}", definition.uses)
     };
     RequirementExplanation {
         check: check.to_owned(),
@@ -418,7 +413,7 @@ fn commit_type(title: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use ostrom_core::{CheckDocument, PolicyManifest};
+    use ostrom_core::{InconclusivePolicy, PolicyManifest};
     use serde_json::json;
 
     use super::PolicyBundle;
@@ -431,6 +426,10 @@ manifest_version: 1
 defaults: {stalls_after: 7d}
 actors: {builder: {}}
 operations: {work: {steps: []}}
+checks:
+  rust-green:
+    uses: gh/check-run
+    with: {name: placeholder-ci}
 grants:
   R-rust-green:
     actors: builder
@@ -448,18 +447,6 @@ denies:
 "#,
             )
             .expect("manifest"),
-            checks: Some(
-                CheckDocument::from_yaml(
-                    r#"
-checks_version: 1
-checks:
-  rust-green:
-    uses: gh/check-run
-    with: {name: placeholder-ci}
-"#,
-                )
-                .expect("checks"),
-            ),
         }
     }
 
@@ -492,7 +479,7 @@ checks:
                 .requirement
                 .as_ref()
                 .map(|value| value.source.as_str()),
-            Some("checks.yaml: gh/check-run name=placeholder-ci")
+            Some("checks.rust-green: gh/check-run name=placeholder-ci")
         );
     }
 
@@ -540,8 +527,7 @@ checks:
     #[test]
     fn an_allowed_inconclusive_requirement_proceeds_but_stays_visible() {
         let mut bundle = bundle();
-        bundle.checks.as_mut().expect("checks").inconclusive_policy =
-            ostrom_core::InconclusivePolicy::Pass;
+        bundle.manifest.defaults.check.inconclusive_policy = InconclusivePolicy::Pass;
         let explanation = bundle.explain_pull_request(
             "placeholder-org/repository",
             &json!({

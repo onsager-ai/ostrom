@@ -83,7 +83,7 @@ fn explain_names_the_verdict_rule_requirement_and_ladder_source() {
         "grants.R-rust-green",
         "requires     rust-green",
         "PASS",
-        "checks.yaml: gh/check-run name=placeholder-ci",
+        "checks.rust-green: gh/check-run name=placeholder-ci",
         "verdict      MERGE",
     ] {
         assert!(stdout.contains(expected), "missing {expected:?}:\n{stdout}");

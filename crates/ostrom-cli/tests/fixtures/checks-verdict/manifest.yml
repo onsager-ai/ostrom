@@ -1,4 +1,5 @@
 manifest_version: 1
+includes: [checks.yaml]
 operations:
   merge-placeholder-repositories:
     steps:

@@ -7,8 +7,8 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use ostrom_core::{
-    ActorDecl, CheckContractError, CheckDocument, LoopDecl, OperationDecl, PolicyManifest,
-    RuleDecl, SelectorFinding, SelectorUniverse,
+    ActorDecl, CheckDefinition, LoopDecl, OperationDecl, PolicyManifest, RuleDecl, SelectorFinding,
+    SelectorUniverse,
 };
 use ostrom_store::{OstromPaths, PolicyBundle, PolicyExplanation, SweepFixture};
 use serde::Deserialize;
@@ -77,32 +77,7 @@ pub(crate) fn run_sign(
 
 pub(crate) fn load_bundle(path: &Path) -> Result<PolicyBundle, PolicyLoadError> {
     let manifest = load(path)?;
-    let needs_checks = manifest
-        .grants
-        .values()
-        .chain(manifest.denies.values())
-        .any(|rule| rule.requires.is_some())
-        || manifest
-            .operations
-            .values()
-            .flat_map(|operation| &operation.steps)
-            .any(|step| step.requires.is_some());
-    let checks = if needs_checks {
-        let checks_path = path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join("checks.yaml");
-        let source = read(&checks_path)?;
-        Some(CheckDocument::from_yaml(&source).map_err(|source| {
-            PolicyLoadError::CheckCatalogue {
-                path: checks_path,
-                source,
-            }
-        })?)
-    } else {
-        None
-    };
-    Ok(PolicyBundle { manifest, checks })
+    Ok(PolicyBundle { manifest })
 }
 
 pub(crate) fn default_manifest_path(paths: &OstromPaths, cwd: &Path) -> Option<PathBuf> {
@@ -475,7 +450,7 @@ fn load_unverified(path: &Path) -> Result<PolicyManifest, PolicyLoadError> {
         .validate()
         .map_err(|error| PolicyLoadError::Validation(error.to_string()))?;
     validate_operation_names(&manifest)?;
-    validate_check_requirements(&manifest, parent)?;
+    validate_check_requirements(&manifest)?;
     Ok(manifest)
 }
 
@@ -499,10 +474,7 @@ fn validate_operation_names(manifest: &PolicyManifest) -> Result<(), PolicyLoadE
     Ok(())
 }
 
-fn validate_check_requirements(
-    manifest: &PolicyManifest,
-    manifest_directory: &Path,
-) -> Result<(), PolicyLoadError> {
+fn validate_check_requirements(manifest: &PolicyManifest) -> Result<(), PolicyLoadError> {
     let mut requirements = manifest
         .operations
         .iter()
@@ -520,24 +492,18 @@ fn validate_check_requirements(
             .as_deref()
             .map(|check| ("grant", grant.as_str(), check))
     }));
-    if requirements.is_empty() {
-        return Ok(());
-    }
-
-    let path = manifest_directory.join("checks.yaml");
-    let source = read(&path)?;
-    let document =
-        CheckDocument::from_yaml(&source).map_err(|source| PolicyLoadError::CheckCatalogue {
-            path: path.clone(),
-            source,
-        })?;
+    requirements.extend(manifest.denies.iter().filter_map(|(deny, declaration)| {
+        declaration
+            .requires
+            .as_deref()
+            .map(|check| ("deny", deny.as_str(), check))
+    }));
     for (kind, owner, check) in requirements {
-        if !document.checks.contains_key(check) {
+        if !manifest.checks.contains_key(check) {
             return Err(PolicyLoadError::UnknownCheck {
                 kind,
                 owner: owner.to_owned(),
                 check: check.to_owned(),
-                path,
             });
         }
     }
@@ -567,7 +533,7 @@ fn merge_include(
             path: path.to_path_buf(),
             message: "included document must be a map".to_owned(),
         })?;
-    let markers = ["actor", "operation", "grant", "deny", "loop"]
+    let markers = ["actor", "check", "operation", "grant", "deny", "loop"]
         .into_iter()
         .filter(|marker| mapping.contains_key(Value::String((*marker).to_owned())))
         .collect::<Vec<_>>();
@@ -591,6 +557,13 @@ fn merge_include(
             "actor",
             path,
             &mut origins.actors,
+        )?;
+        merge_map(
+            &mut manifest.checks,
+            fragment.checks,
+            "check",
+            path,
+            &mut origins.checks,
         )?;
         merge_map(
             &mut manifest.operations,
@@ -646,6 +619,14 @@ fn merge_leaf(
             id,
             parse_leaf(body, path)?,
             "actor",
+            path,
+        ),
+        "check" => insert_leaf(
+            &mut manifest.checks,
+            &mut origins.checks,
+            id,
+            parse_leaf(body, path)?,
+            "check",
             path,
         ),
         "operation" => insert_leaf(
@@ -734,6 +715,8 @@ struct IncludeFragment {
     #[serde(default)]
     actors: BTreeMap<String, ActorDecl>,
     #[serde(default)]
+    checks: BTreeMap<String, CheckDefinition>,
+    #[serde(default)]
     operations: BTreeMap<String, OperationDecl>,
     #[serde(default)]
     grants: BTreeMap<String, RuleDecl>,
@@ -746,6 +729,7 @@ struct IncludeFragment {
 #[derive(Debug, Default)]
 struct Origins {
     actors: BTreeMap<String, PathBuf>,
+    checks: BTreeMap<String, PathBuf>,
     operations: BTreeMap<String, PathBuf>,
     grants: BTreeMap<String, PathBuf>,
     denies: BTreeMap<String, PathBuf>,
@@ -761,6 +745,7 @@ impl Origins {
         };
         Self {
             actors: origins(manifest.actors.keys().cloned().collect()),
+            checks: origins(manifest.checks.keys().cloned().collect()),
             operations: origins(manifest.operations.keys().cloned().collect()),
             grants: origins(manifest.grants.keys().cloned().collect()),
             denies: origins(manifest.denies.keys().cloned().collect()),
@@ -895,18 +880,13 @@ pub(crate) enum PolicyLoadError {
         #[source]
         source: serde_yaml::Error,
     },
-    #[error("could not load check catalogue `{}`: {source}", path.display())]
-    CheckCatalogue {
-        path: PathBuf,
-        #[source]
-        source: CheckContractError,
-    },
-    #[error("{kind} `{owner}` requires undefined check `{check}` from `{}`", path.display())]
+    #[error(
+        "{kind} `{owner}` requires undefined check `{check}`; define it under `checks:` or add its file to `includes:`"
+    )]
     UnknownCheck {
         kind: &'static str,
         owner: String,
         check: String,
-        path: PathBuf,
     },
     #[error("invalid policy manifest: {0}")]
     Validation(String),

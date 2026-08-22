@@ -175,10 +175,9 @@ fn ten_legacy_gate_strings_map_to_valid_named_check_fixtures() {
         &fs::read_to_string(fixture.join("gate.before.yaml")).expect("legacy gate fixture"),
     )
     .expect("legacy gate parses");
-    let document = CheckDocument::from_yaml(
-        &fs::read_to_string(fixture.join("checks.yaml")).expect("checks fixture"),
-    )
-    .expect("checks fixture parses");
+    let checks = fs::read_to_string(fixture.join("checks.yaml")).expect("checks fixture");
+    let document = CheckDocument::from_yaml(&format!("checks_version: 1\n{checks}"))
+        .expect("checks fixture parses");
     let manifest = PolicyManifest::from_yaml(
         &fs::read_to_string(fixture.join("manifest.yml")).expect("manifest fixture"),
     )

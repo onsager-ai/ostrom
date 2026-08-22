@@ -19,9 +19,10 @@ use ostrom_checks::{
     run_doctor_check,
 };
 use ostrom_core::{
-    CHECK_STORE_SCHEMA_VERSION, Catalogue, CatalogueEnumeration, CheckContractError, CheckDocument,
-    CheckFault, CheckRun, CheckRunId, CheckState, CheckVerdict, InconclusivePolicy,
-    OperationAction, RepositoryName, ResolvedCheck, ResolvedLoopCeilings, SelectorPrefix,
+    CHECK_STORE_SCHEMA_VERSION, CHECKS_VERSION, Catalogue, CatalogueEnumeration,
+    CheckContractError, CheckDefinition, CheckDocument, CheckFault, CheckRun, CheckRunId,
+    CheckState, CheckVerdict, InconclusivePolicy, OperationAction, RepositoryName, ResolvedCheck,
+    ResolvedLoopCeilings, SelectorPrefix,
 };
 use ostrom_store::{
     AssessmentHarness, AuditOptions, Clock, DigestOptions, DispatchOutcome, DispatchRequest,
@@ -1155,6 +1156,8 @@ fn run_loop_command(paths: &OstromPaths, name: &str) -> Result<(), Box<dyn std::
         actor: &resolved.actor,
         working_directory: &working_directory,
         plugin_root: &plugin_root,
+        checks: &manifest.checks,
+        default_inconclusive_policy: manifest.defaults.check.inconclusive_policy,
         selector_prefixes,
         ceilings: Some(resolved.ceilings),
     };
@@ -1183,6 +1186,8 @@ fn run_operation_command(
         actor: &actor,
         working_directory: &working_directory,
         plugin_root: &plugin_root,
+        checks: &manifest.checks,
+        default_inconclusive_policy: manifest.defaults.check.inconclusive_policy,
         selector_prefixes,
         ceilings: None,
     };
@@ -1195,6 +1200,8 @@ struct CliOperationRuntime<'a> {
     actor: &'a str,
     working_directory: &'a Path,
     plugin_root: &'a Path,
+    checks: &'a BTreeMap<String, CheckDefinition>,
+    default_inconclusive_policy: InconclusivePolicy,
     selector_prefixes: BTreeSet<SelectorPrefix>,
     ceilings: Option<ResolvedLoopCeilings>,
 }
@@ -1223,7 +1230,14 @@ impl OperationRuntime for CliOperationRuntime<'_> {
         check: &str,
         _target: &ResolvedOperationTarget,
     ) -> Result<(), OperationDispatchError> {
-        execute_operation_requirement(self.paths, self.working_directory, self.plugin_root, check)
+        execute_operation_requirement(
+            self.paths,
+            self.working_directory,
+            self.plugin_root,
+            self.checks,
+            self.default_inconclusive_policy,
+            check,
+        )
     }
 
     fn execute(
@@ -1348,28 +1362,27 @@ fn execute_operation_requirement(
     paths: &OstromPaths,
     working_directory: &Path,
     plugin_root: &Path,
+    checks: &BTreeMap<String, CheckDefinition>,
+    default_inconclusive_policy: InconclusivePolicy,
     check: &str,
 ) -> Result<(), OperationDispatchError> {
-    let resolutions =
-        resolve_plan_checks(paths, working_directory, plugin_root).map_err(|error| {
+    let enumeration = CatalogueEnumeration {
+        catalogues: vec![Catalogue {
+            document: CheckDocument {
+                checks_version: CHECKS_VERSION,
+                inconclusive_policy: default_inconclusive_policy,
+                checks: checks.clone(),
+            },
+        }],
+        complete: true,
+    };
+    let registry = ActionRegistry::core(plugin_root.to_owned(), working_directory.to_owned())
+        .map_err(|error| {
             OperationDispatchError::RequirementFailed(format!("{check}: {}", error.name()))
         })?;
-    if let Some(fault) = resolutions.catalogue_fault {
-        return Err(OperationDispatchError::RequirementFailed(format!(
-            "{check}: {}",
-            fault.name
-        )));
-    }
-    if let Some(fault) = resolutions.faults.get(check) {
-        return Err(OperationDispatchError::RequirementFailed(format!(
-            "{check}: {}",
-            fault.name
-        )));
-    }
-    let prepared = resolutions
-        .prepared
-        .get(check)
-        .ok_or_else(|| OperationDispatchError::RequirementFailed(check.to_owned()))?;
+    let prepared = registry.prepare(check, &enumeration).map_err(|error| {
+        OperationDispatchError::RequirementFailed(format!("{check}: {}", error.name()))
+    })?;
     // Operation guards are observations made immediately before their action.
     // Production intentionally owns this real clock; hermetic dispatcher tests
     // use a fake runtime rather than pinning a path production leaves unpinned.
