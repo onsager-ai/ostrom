@@ -7,29 +7,9 @@ mod support;
 
 fn fixture() -> (TempDir, PathBuf) {
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/policy");
-    let root = copy_fixture_directory(&source);
+    let root = support::copy_fixture_directory(&source);
     let manifest = root.path().join("manifest.yml");
     (root, manifest)
-}
-
-fn copy_fixture_directory(source: &std::path::Path) -> TempDir {
-    fn copy_contents(source: &std::path::Path, destination: &std::path::Path) {
-        for entry in fs::read_dir(source).expect("read policy fixture directory") {
-            let entry = entry.expect("read policy fixture entry");
-            let source_path = entry.path();
-            let destination_path = destination.join(entry.file_name());
-            if entry.file_type().expect("read fixture file type").is_dir() {
-                fs::create_dir(&destination_path).expect("create copied fixture directory");
-                copy_contents(&source_path, &destination_path);
-            } else {
-                fs::copy(&source_path, &destination_path).expect("copy policy fixture file");
-            }
-        }
-    }
-
-    let destination = TempDir::new().expect("temporary policy fixture directory");
-    copy_contents(source, destination.path());
-    destination
 }
 
 fn ostrom() -> Command {
@@ -266,7 +246,7 @@ fn require_naming_an_undefined_check_fails_the_load() {
 #[test]
 fn require_resolves_a_sibling_check_by_exact_name() {
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/checks-verdict");
-    let root = copy_fixture_directory(&source);
+    let root = support::copy_fixture_directory(&source);
     let fixture = root.path().join("manifest.yml");
     let output = signed_ostrom(&fixture)
         .args(["validate"])

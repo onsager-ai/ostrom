@@ -2,6 +2,8 @@ use std::{fs, path::PathBuf, process::Command};
 
 use tempfile::TempDir;
 
+mod support;
+
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/policy-explain")
@@ -14,9 +16,11 @@ fn replaying_344_and_351_produces_two_stalled_hold_findings_in_the_digest() {
     for name in ["manifest.yml", "checks.yaml", "mandates.yaml"] {
         fs::copy(fixture(name), home.path().join(name)).expect("copy policy fixture");
     }
+    let trusted_keys = support::sign_manifest(&home.path().join("manifest.yml"));
     for started_at in ["2026-08-01T00:00:00Z", "2026-08-09T00:00:00Z"] {
         let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
             .env("OSTROM_HOME", home.path())
+            .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
             .args([
                 "sweep",
                 "--fixture",
@@ -47,6 +51,7 @@ fn replaying_344_and_351_produces_two_stalled_hold_findings_in_the_digest() {
 
     let digest = Command::new(env!("CARGO_BIN_EXE_ostrom"))
         .env("OSTROM_HOME", home.path())
+        .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
         .env("MANDATE_NOW_EPOCH", "0")
         .env("MANDATE_DIGEST_TIME", "2026-08-09T00:00:00Z")
         .env("MANDATE_TODAY", "2026-08-09")

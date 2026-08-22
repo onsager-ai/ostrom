@@ -1,3 +1,6 @@
+// Each integration test binary includes this module and uses a subset of it.
+#![allow(dead_code)]
+
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -59,4 +62,26 @@ fn key_pair() -> &'static (String, String) {
             .expect("encode test-only public key");
         (private_pem, public_pem)
     })
+}
+
+/// Copy a checked-in fixture tree into a temporary directory so signing may
+/// write the detached signature beside it without dirtying the repository.
+pub fn copy_fixture_directory(source: &Path) -> TempDir {
+    fn copy_contents(source: &Path, destination: &Path) {
+        for entry in fs::read_dir(source).expect("read fixture directory") {
+            let entry = entry.expect("read fixture entry");
+            let source_path = entry.path();
+            let destination_path = destination.join(entry.file_name());
+            if entry.file_type().expect("read fixture file type").is_dir() {
+                fs::create_dir(&destination_path).expect("create copied fixture directory");
+                copy_contents(&source_path, &destination_path);
+            } else {
+                fs::copy(&source_path, &destination_path).expect("copy fixture file");
+            }
+        }
+    }
+
+    let destination = TempDir::new().expect("temporary fixture directory");
+    copy_contents(source, destination.path());
+    destination
 }
