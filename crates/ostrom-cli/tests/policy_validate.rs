@@ -63,20 +63,32 @@ fn glob_includes_compose_identically_for_all_manifest_path_forms() {
 }
 
 #[test]
-fn a_glob_with_a_missing_base_directory_is_optional() {
-    let temporary = TempDir::new().expect("temporary directory");
-    let manifest = temporary.path().join("manifest.yml");
-    fs::write(
-        &manifest,
-        "manifest_version: 1\nincludes: [optional/leaves/*.yml]\nactors: {builder: {}}\n",
-    )
-    .expect("write manifest");
-    let trusted_keys = support::sign_manifest(&manifest);
+fn a_glob_whose_directory_is_missing_is_refused_like_any_other_empty_glob() {
+    // Depth must not decide this. `gone/*.yml` and `gone/deeper/*.yml` describe
+    // the same missing directory, and both are far more likely to be a typo than
+    // an intentionally absent tree — a manifest that silently composes zero
+    // includes is a manifest with no governance in it.
+    for pattern in ["gone/*.yml", "gone/deeper/*.yml"] {
+        let temporary = TempDir::new().expect("temporary directory");
+        fs::write(
+            temporary.path().join("manifest.yml"),
+            format!("manifest_version: 1\nincludes: [{pattern}]\nactors: {{builder: {{}}}}\n"),
+        )
+        .expect("write manifest");
 
-    let normalized =
-        normalized_manifest(temporary.path(), Path::new("manifest.yml"), &trusted_keys);
-    let normalized = String::from_utf8(normalized).expect("normalized YAML is UTF-8");
-    assert!(normalized.contains("builder"), "{normalized}");
+        let output = ostrom()
+            .current_dir(temporary.path())
+            .args(["sign", "--key-id", "unused", "--key", "unused.pem"])
+            .arg("manifest.yml")
+            .output()
+            .expect("run policy signer");
+        assert!(!output.status.success(), "{pattern} must not load");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("matched no files"),
+            "{pattern}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 #[test]

@@ -449,16 +449,13 @@ fn load_unverified(path: &Path) -> Result<PolicyManifest, PolicyLoadError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
 
     for pattern in includes {
-        let matches = match expand_include(parent, &pattern)? {
-            IncludeExpansion::MissingBase => continue,
-            IncludeExpansion::Matches(matches) if matches.is_empty() => {
-                return Err(PolicyLoadError::NoIncludeMatch {
-                    manifest: path.to_path_buf(),
-                    pattern,
-                });
-            }
-            IncludeExpansion::Matches(matches) => matches,
-        };
+        let matches = expand_include(parent, &pattern)?;
+        if matches.is_empty() {
+            return Err(PolicyLoadError::NoIncludeMatch {
+                manifest: path.to_path_buf(),
+                pattern,
+            });
+        }
         for include in matches {
             merge_include(&mut manifest, &mut origins, &include)?;
         }
@@ -771,12 +768,7 @@ impl Origins {
     }
 }
 
-enum IncludeExpansion {
-    MissingBase,
-    Matches(Vec<PathBuf>),
-}
-
-fn expand_include(parent: &Path, pattern: &str) -> Result<IncludeExpansion, PolicyLoadError> {
+fn expand_include(parent: &Path, pattern: &str) -> Result<Vec<PathBuf>, PolicyLoadError> {
     let pattern_path = Path::new(pattern);
     if pattern_path.is_absolute()
         || pattern_path
@@ -786,13 +778,13 @@ fn expand_include(parent: &Path, pattern: &str) -> Result<IncludeExpansion, Poli
         return Err(PolicyLoadError::UnsafeInclude(pattern.to_owned()));
     }
     if !pattern.contains(['*', '?']) {
-        return Ok(IncludeExpansion::Matches(vec![parent.join(pattern)]));
+        return Ok(vec![parent.join(pattern)]);
     }
     let wildcard = pattern.find(['*', '?']).expect("glob contains a wildcard");
     let prefix = Path::new(&pattern[..wildcard]);
     let base = parent.join(prefix.parent().unwrap_or_else(|| Path::new(".")));
     if !base.exists() {
-        return Ok(IncludeExpansion::MissingBase);
+        return Ok(Vec::new());
     }
     let mut files = Vec::new();
     collect_files(&base, &mut files)?;
@@ -803,7 +795,7 @@ fn expand_include(parent: &Path, pattern: &str) -> Result<IncludeExpansion, Poli
             .is_some_and(|relative| include_glob(relative, pattern))
     });
     files.sort();
-    Ok(IncludeExpansion::Matches(files))
+    Ok(files)
 }
 
 fn collect_files(directory: &Path, files: &mut Vec<PathBuf>) -> Result<(), PolicyLoadError> {
