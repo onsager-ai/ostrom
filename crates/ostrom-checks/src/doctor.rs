@@ -2661,7 +2661,7 @@ fn check_publish(context: &DoctorContext) -> DoctorResult {
                 DoctorStatus::Warn,
                 "publish",
                 "no publish has been recorded",
-                "run mandate publish.sh and confirm the state branch is reachable",
+                "run ostrom sweep --publish-repository <owner/repo> and confirm the state branch is reachable",
             );
         }
         Err(_) => {
@@ -2686,7 +2686,7 @@ fn check_publish(context: &DoctorContext) -> DoctorResult {
             DoctorStatus::Warn,
             "publish",
             "publish manifest is malformed",
-            "run mandate publish.sh to regenerate the cached record tree",
+            "run ostrom sweep --publish-repository <owner/repo> to regenerate the cached record tree",
         );
     };
     let published_at = object.get("published_at").and_then(Value::as_str);
@@ -2702,7 +2702,7 @@ fn check_publish(context: &DoctorContext) -> DoctorResult {
             DoctorStatus::Warn,
             "publish",
             "publish manifest has invalid cadence or timestamp",
-            "run mandate publish.sh to regenerate the cached record tree",
+            "run ostrom sweep --publish-repository <owner/repo> to regenerate the cached record tree",
         );
     };
     if now_epoch(context) - published_epoch > cadence * 60 * 60 {
@@ -2710,7 +2710,7 @@ fn check_publish(context: &DoctorContext) -> DoctorResult {
             DoctorStatus::Warn,
             "publish",
             format!("publish stale, last {published_at} (older than {cadence}h cadence)"),
-            "run mandate publish.sh and confirm the state branch is reachable",
+            "run ostrom sweep --publish-repository <owner/repo> and confirm the state branch is reachable",
         )
     } else {
         DoctorResult::new(
@@ -3083,7 +3083,7 @@ mod tests {
                 "FAIL|role-allowlists|builder: role settings are missing at {config}/ostrom/roles/builder.settings.json; gatekeeper: role settings are missing at {config}/ostrom/roles/gatekeeper.settings.json|align the role allowlists under {config}/ostrom/roles with the named shipped skill commands\n",
                 "WARN|builder-pass|no builder pass ever recorded|run /ostrom:work and confirm it records pass-ended\n",
                 "WARN|gatekeeper-pass|no gatekeeper pass ever recorded|run /ostrom:gatekeep and confirm it records pass-ended\n",
-                "WARN|publish|no publish has been recorded|run mandate publish.sh and confirm the state branch is reachable\n",
+                "WARN|publish|no publish has been recorded|run ostrom sweep --publish-repository <owner/repo> and confirm the state branch is reachable\n",
                 "OK|environment|local|\n",
                 "OK|config-parser|used the built-in ostrom-shape parser (top-level scalars, one level of nesting, inline lists, and comments; the values behind touch-durability/provider-reachable are authoritative for this supported config shape; a DEFER line is still resolved by the caller)|\n"
             ),

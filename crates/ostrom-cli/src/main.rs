@@ -669,7 +669,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             builder_lease_owner,
         } => {
             if builder_lease_owner.len() != 1 || builder_lease_owner[0].is_empty() {
-                exit_message("usage: repair-prs.sh <builder-lease-owner>", 2);
+                exit_message("usage: ostrom repair-prs <builder-lease-owner>", 2);
             }
             let output = match run_repair_prs(&ostrom_store::RepairOptions {
                 paths,
@@ -2071,7 +2071,7 @@ fn run_implement_worker(
 
 fn run_dispatch_command(arguments: Vec<String>, clock: Clock) -> ! {
     let [order_file] = arguments.as_slice() else {
-        eprintln!("usage: dispatch.sh <work-order-file>");
+        eprintln!("usage: ostrom dispatch <work-order-file>");
         std::process::exit(2);
     };
     let working_directory = env::current_dir().unwrap_or_else(|error| {
@@ -2103,7 +2103,7 @@ fn run_dispatch_command(arguments: Vec<String>, clock: Clock) -> ! {
 
 fn run_select_work(arguments: Vec<String>, clock: Clock) -> ! {
     let usage = || {
-        eprintln!("usage: select-work.sh list | select <owner> [already-attempted-id ...]");
+        eprintln!("usage: ostrom select-work list | select <owner> [already-attempted-id ...]");
         std::process::exit(2);
     };
     let action = match arguments.as_slice() {

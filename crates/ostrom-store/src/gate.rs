@@ -33,7 +33,7 @@ pub struct GateOutput {
 
 #[derive(Debug, Error)]
 pub enum GateError {
-    #[error("usage: gate.sh <owner/repo#number>")]
+    #[error("usage: ostrom gate <owner/repo#number>")]
     InvalidTarget,
     #[error("mandate gate: could not serialize verdict")]
     Serialize,

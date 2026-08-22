@@ -128,6 +128,21 @@ fn selection_matches_recorded_shell_bytes() {
 }
 
 #[test]
+fn selection_usage_matches_the_accepted_argument_shapes() {
+    let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .args(["select-work", "list", "placeholder-owner"])
+        .output()
+        .expect("invalid list selection");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        output.stderr,
+        b"usage: ostrom select-work list | select <owner> [already-attempted-id ...]\n"
+    );
+}
+
+#[test]
 fn production_scale_state_is_read_from_file_and_selects_work() {
     let fixture = tempdir().expect("fixture");
     write_selection_fixture(fixture.path(), 700 * 1024);
