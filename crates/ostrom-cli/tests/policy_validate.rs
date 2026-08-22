@@ -245,7 +245,7 @@ fn require_naming_an_undefined_check_fails_the_load() {
 }
 
 #[test]
-fn require_resolves_a_sibling_check_by_exact_name() {
+fn require_resolves_an_included_check_by_exact_name() {
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/checks-verdict");
     let root = support::copy_fixture_directory(&source);
     let fixture = root.path().join("manifest.yml");
