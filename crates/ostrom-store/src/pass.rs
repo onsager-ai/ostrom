@@ -16,7 +16,8 @@ use thiserror::Error;
 
 use crate::{
     Clock, LeaseActionError, OstromPaths, OwnedLease, PassState, TraceAppend, append_trace,
-    environment, read_lease, read_pass_state, read_trace, write_pass_state,
+    environment, read_lease, read_pass_state, read_trace, selection::dispatchability_snapshot,
+    write_pass_state,
 };
 
 const MAX_TURNS: &str = "200";
@@ -63,6 +64,7 @@ impl PassRole {
 #[derive(Debug, Clone)]
 pub struct PassRequest {
     pub paths: OstromPaths,
+    pub working_directory: PathBuf,
     pub role: PassRole,
     pub claude_bin: PathBuf,
     pub signals: SignalFlags,
@@ -151,6 +153,9 @@ struct PassGuard {
     reason: Option<String>,
     cost_usd: Option<f64>,
     clock: Clock,
+    dispatchability_hash: Option<String>,
+    queue_count: Option<usize>,
+    dispatchable_count: Option<usize>,
 }
 
 /// The outcome a pass is recorded with when its guard finishes.
@@ -193,6 +198,15 @@ impl PassGuard {
             );
             if let Some(reason) = &self.reason {
                 fact.insert("reason".to_owned(), json!(reason));
+            }
+            if let Some(hash) = &self.dispatchability_hash {
+                fact.insert("dispatchability_hash".to_owned(), json!(hash));
+            }
+            if let Some(count) = self.queue_count {
+                fact.insert("queue_count".to_owned(), json!(count));
+            }
+            if let Some(count) = self.dispatchable_count {
+                fact.insert("dispatchable_count".to_owned(), json!(count));
             }
             if let Err(error) = append_trace(
                 &self.paths.trace_file(),
@@ -251,6 +265,7 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
     let mut state = prior.unwrap_or_else(|| PassState {
         role_id: generated_role_id(&request.clock),
         wake: 0,
+        dispatchability_hash: None,
     });
     let next_wake = state.wake.saturating_add(1);
     let owner = format!("{}-{}-wake{next_wake}", request.role.name(), state.role_id);
@@ -292,6 +307,9 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
         reason: None,
         cost_usd: None,
         clock: request.clock.clone(),
+        dispatchability_hash: None,
+        queue_count: None,
+        dispatchable_count: None,
     };
     append_trace(
         &request.paths.trace_file(),
@@ -342,6 +360,23 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
         guard.reason = Some("daily-cap".to_owned());
         guard.finish()?;
         return Ok(());
+    }
+    if request.role == PassRole::Builder {
+        let previous_hash = state.dispatchability_hash.clone();
+        if let Ok(snapshot) = dispatchability_snapshot(&request.paths, &request.working_directory) {
+            guard.dispatchability_hash = Some(snapshot.hash.clone());
+            guard.queue_count = Some(snapshot.queue_count);
+            guard.dispatchable_count = Some(snapshot.dispatchable_count);
+            if snapshot.dispatchable_count == 0
+                && previous_hash.as_deref() == Some(snapshot.hash.as_str())
+            {
+                guard.outcome = Some("no-op".to_owned());
+                guard.reason = Some("no-dispatchable-work-unchanged".to_owned());
+                guard.cost_usd = Some(0.0);
+                guard.finish()?;
+                return Ok(());
+            }
+        }
     }
 
     let run_dir = request
@@ -400,6 +435,21 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
     let transcript = read_transcript(&log);
     guard.cost_usd = transcript.cost_usd;
     reconcile_outcome(&mut guard, watermark, status, transcript.permission_denied);
+    if status.success()
+        && !matches!(
+            guard.outcome.as_deref(),
+            Some("failed" | "permission-denied")
+        )
+    {
+        if let Some(hash) = &guard.dispatchability_hash {
+            state.dispatchability_hash = Some(hash.clone());
+            if let Err(error) = write_pass_state(&request.paths.state, request.role.name(), &state)
+            {
+                guard.outcome = Some("failed".to_owned());
+                return Err(PassError::failed(request.role, error.to_string(), 1));
+            }
+        }
+    }
     prune_transcripts(&run_dir);
     let code = status.code().unwrap_or(1);
     guard.finish()?;

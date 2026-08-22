@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use ostrom_core::{MandateConfig, QueueItem, WorkEdgeSource, WorkGraph};
+use ostrom_core::{MandateConfig, QueueItem, WorkEdgeSource, WorkGraph, sha256_hex};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 
@@ -28,6 +28,13 @@ pub struct SelectRequest {
     pub working_directory: PathBuf,
     pub action: SelectAction,
     pub clock: Clock,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DispatchabilitySnapshot {
+    pub hash: String,
+    pub queue_count: usize,
+    pub dispatchable_count: usize,
 }
 
 /// Empty is a successful, known result. Every inability to establish that
@@ -95,35 +102,13 @@ pub enum SelectError {
 }
 
 pub fn run_selection(request: &SelectRequest) -> Result<(SelectOutcome, Vec<String>), SelectError> {
-    let config = load_config_or_defaults(&request.paths, &request.working_directory)?;
-    let documents = read_queue(&request.paths.queue_file())?;
-    let queue = documents
-        .iter()
-        .map(|document| document.value().clone())
-        .collect::<Vec<_>>();
-    let state_path = request.paths.state.join("state.json");
-    if !state_path.exists() || fs::metadata(&state_path).is_ok_and(|metadata| metadata.len() == 0) {
-        return Err(SelectError::MissingState);
-    }
-    let state: Value =
-        serde_json::from_slice(&fs::read(&state_path).map_err(|_| SelectError::StateRead {
-            path: state_path.display().to_string(),
-        })?)
-        .map_err(|_| SelectError::StateRead {
-            path: state_path.display().to_string(),
-        })?;
-    let graph = validate_graph(&state, &config, &queue)?;
-    validate_ranking(&state, &config)?;
-
-    let graph_by_id = graph
-        .nodes
-        .iter()
-        .map(|node| (node.id.as_str(), node))
-        .collect::<BTreeMap<_, _>>();
-    let queue_items = queue
-        .iter()
-        .map(|row| queue_item(row, &graph_by_id))
-        .collect::<Result<Vec<_>, _>>()?;
+    let SelectionBasis {
+        config,
+        queue,
+        graph,
+        queue_items,
+        ..
+    } = load_selection_basis(&request.paths, &request.working_directory)?;
     let authorized = queue_items
         .iter()
         .enumerate()
@@ -231,6 +216,137 @@ pub fn run_selection(request: &SelectRequest) -> Result<(SelectOutcome, Vec<Stri
             Ok((SelectOutcome::Selected(selected.clone()), diagnostics))
         }
     }
+}
+
+struct SelectionBasis {
+    config: MandateConfig,
+    queue: Vec<Value>,
+    state: Value,
+    graph: WorkGraph,
+    queue_items: Vec<QueueItem>,
+}
+
+fn load_selection_basis(
+    paths: &OstromPaths,
+    working_directory: &Path,
+) -> Result<SelectionBasis, SelectError> {
+    let config = load_config_or_defaults(paths, working_directory)?;
+    let documents = read_queue(&paths.queue_file())?;
+    let queue = documents
+        .iter()
+        .map(|document| document.value().clone())
+        .collect::<Vec<_>>();
+    let state_path = paths.state.join("state.json");
+    if !state_path.exists() || fs::metadata(&state_path).is_ok_and(|metadata| metadata.len() == 0) {
+        return Err(SelectError::MissingState);
+    }
+    let state: Value =
+        serde_json::from_slice(&fs::read(&state_path).map_err(|_| SelectError::StateRead {
+            path: state_path.display().to_string(),
+        })?)
+        .map_err(|_| SelectError::StateRead {
+            path: state_path.display().to_string(),
+        })?;
+    let graph = validate_graph(&state, &config, &queue)?;
+    validate_ranking(&state, &config)?;
+    let graph_by_id = graph
+        .nodes
+        .iter()
+        .map(|node| (node.id.as_str(), node))
+        .collect::<BTreeMap<_, _>>();
+    let queue_items = queue
+        .iter()
+        .map(|row| queue_item(row, &graph_by_id))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(SelectionBasis {
+        config,
+        queue,
+        state,
+        graph,
+        queue_items,
+    })
+}
+
+/// Return the durable, agent-free inputs that can change the builder's
+/// dispatchable set. The projection intentionally includes graph structure
+/// and failing default-branch workflow details in addition to the final
+/// predicate: an extra full pass is cheaper than overlooking a transition.
+pub(crate) fn dispatchability_snapshot(
+    paths: &OstromPaths,
+    working_directory: &Path,
+) -> Result<DispatchabilitySnapshot, SelectError> {
+    let basis = load_selection_basis(paths, working_directory)?;
+    let graph_by_id = basis
+        .graph
+        .nodes
+        .iter()
+        .map(|node| (node.id.as_str(), node))
+        .collect::<BTreeMap<_, _>>();
+    let mut queue = BTreeMap::new();
+    for (index, item) in basis.queue_items.iter().enumerate() {
+        let row = &basis.queue[index];
+        let node = graph_by_id
+            .get(item.id.as_str())
+            .expect("validated queue item has a graph node");
+        let mut blocked_by = item.blocked_by.clone();
+        blocked_by.sort();
+        let mut dependencies = node.dependencies.clone();
+        dependencies.sort();
+        let mut unsatisfied = node.unsatisfied.clone();
+        unsatisfied.sort();
+        let mut children = node.children.clone();
+        children.sort();
+        queue.insert(
+            item.id.clone(),
+            json!({
+                "kind": item.kind,
+                "state": item.state,
+                "blocked_by": blocked_by,
+                "held": item.kind == "parked",
+                "awaiting_principal": item.state == "pending"
+                    && matches!(item.kind.as_str(), "tripwire" | "decision"),
+                "graph": {
+                    "open": node.open,
+                    "dependencies": dependencies,
+                    "unsatisfied": unsatisfied,
+                    "children": children,
+                    "dispatchable": node.dispatchable,
+                },
+                "dispatchable": authorized(item, row) && item.graph_dispatchable,
+            }),
+        );
+    }
+
+    let repositories = basis
+        .config
+        .projects
+        .iter()
+        .map(|project| {
+            let ci = basis
+                .state
+                .get("repos")
+                .and_then(|repos| repos.get(project.repo.as_str()))
+                .and_then(|repo| repo.get("ci_drift"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            (project.repo.as_str().to_owned(), ci)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let input = json!({
+        "queue": queue,
+        "default_branch_ci": repositories,
+    });
+    let encoded = serde_json::to_vec(&input).expect("dispatchability inputs serialize");
+    Ok(DispatchabilitySnapshot {
+        hash: sha256_hex(&encoded),
+        queue_count: basis.queue_items.len(),
+        dispatchable_count: basis
+            .queue_items
+            .iter()
+            .zip(&basis.queue)
+            .filter(|(item, row)| authorized(item, row) && item.graph_dispatchable)
+            .count(),
+    })
 }
 
 fn validate_graph(

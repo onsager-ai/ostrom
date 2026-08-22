@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use tempfile::TempDir;
 
 struct Fixture {
@@ -52,6 +52,71 @@ impl Fixture {
             .env("PATH", env::var_os("PATH").unwrap_or_default())
             .env("CLAUDE_BIN", &self.claude);
         command
+    }
+
+    fn write_blocked_dispatchability_state(&self) {
+        fs::write(
+            self.state.join("mandates.yaml"),
+            r#"provider: file
+cadence_hours: 1
+stuck_after_days: 7
+bounce_all: []
+projects:
+  - repo: placeholder-org/alpha
+    delegated: []
+    excluded: []
+    reserved: []
+    default: delegated
+    paused: false
+    bounce: []
+"#,
+        )
+        .expect("write mandate fixture");
+        fs::write(
+            self.state.join("queue.jsonl"),
+            concat!(
+                "{\"id\":\"placeholder-org/alpha#1\",\"repo\":\"placeholder-org/alpha\",",
+                "\"ref\":\"#1\",\"title\":\"Placeholder decision\",\"kind\":\"decision\",",
+                "\"mandate\":{\"reason\":\"placeholder\"},\"state\":\"pending\",",
+                "\"opened\":\"2026-01-01T00:00:00Z\",\"needs_judgment\":true,\"blocked_by\":[]}\n"
+            ),
+        )
+        .expect("write blocked queue");
+        let state = json!({
+            "version": 2,
+            "work_ranking": [],
+            "work_ranking_faults": [],
+            "repos": {
+                "placeholder-org/alpha": {"ci_drift": {}}
+            },
+            "dependency_graph": {
+                "graph_version": 1,
+                "configured_repositories": ["placeholder-org/alpha"],
+                "nodes": [{
+                    "id": "placeholder-org/alpha#1",
+                    "open": true,
+                    "dependencies": [],
+                    "unsatisfied": [],
+                    "children": [],
+                    "dispatchable": true,
+                    "unblocking_power": 0
+                }],
+                "edges": [],
+                "faults": []
+            }
+        });
+        fs::write(
+            self.state.join("state.json"),
+            serde_json::to_vec(&state).expect("serialize sweep state"),
+        )
+        .expect("write sweep state");
+    }
+
+    fn approve_blocked_decision(&self) {
+        let queue = fs::read_to_string(self.state.join("queue.jsonl"))
+            .expect("read blocked queue")
+            .replace("\"state\":\"pending\"", "\"state\":\"approved\"");
+        fs::write(self.state.join("queue.jsonl"), queue).expect("approve decision");
     }
 
     fn trace(&self) -> Vec<Value> {
@@ -377,6 +442,184 @@ fn disarmed_and_outer_lease_held_passes_do_not_spawn_or_trace() {
     assert!(output.status.success());
     assert!(!marker.exists());
     assert!(!held.state.join("sprint.jsonl").exists());
+}
+
+#[test]
+fn an_unchanged_fully_blocked_backlog_ends_before_spawning_and_records_zero_cost() {
+    let fixture = Fixture::new(concat!(
+        "printf '%s\\n' spawned >>\"$OSTROM_TEST_MARKER\"\n",
+        "printf '%s\\n' '{\"type\":\"result\",\"total_cost_usd\":1.25}'"
+    ));
+    fixture.write_blocked_dispatchability_state();
+    let marker = fixture.root.path().join("spawned");
+
+    for _ in 0..2 {
+        assert!(
+            fixture
+                .command()
+                .env("OSTROM_TEST_MARKER", &marker)
+                .status()
+                .expect("run blocked pass")
+                .success()
+        );
+    }
+
+    assert_eq!(
+        fs::read_to_string(&marker)
+            .expect("read spawn marker")
+            .lines()
+            .count(),
+        1,
+        "the unchanged second pass spawned the agent"
+    );
+    let ended = fixture
+        .trace()
+        .into_iter()
+        .filter(|row| row["kind"] == "pass-ended")
+        .collect::<Vec<_>>();
+    assert_eq!(ended.len(), 2);
+    assert_eq!(ended[0]["fact"]["cost_usd"], 1.25);
+    assert_eq!(ended[0]["fact"]["dispatchable_count"], 0);
+    assert_eq!(ended[1]["fact"]["outcome"], "no-op");
+    assert_eq!(ended[1]["fact"]["reason"], "no-dispatchable-work-unchanged");
+    assert_eq!(ended[1]["fact"]["cost_usd"], 0.0);
+    assert_eq!(ended[1]["fact"]["queue_count"], 1);
+    assert_eq!(ended[1]["fact"]["dispatchable_count"], 0);
+    let hash = ended[1]["fact"]["dispatchability_hash"]
+        .as_str()
+        .expect("terminal trace carries the snapshot hash");
+    assert_eq!(hash.len(), 64);
+    assert_eq!(
+        fs::read_to_string(fixture.state.join("builder-dispatchability-hash"))
+            .expect("read durable snapshot hash")
+            .trim_end(),
+        hash
+    );
+    fixture.assert_released();
+}
+
+#[test]
+fn a_dispatchability_input_change_defeats_the_short_circuit_on_the_next_pass() {
+    let fixture = Fixture::new("printf '%s\\n' spawned >>\"$OSTROM_TEST_MARKER\"");
+    fixture.write_blocked_dispatchability_state();
+    let marker = fixture.root.path().join("spawned");
+
+    assert!(
+        fixture
+            .command()
+            .env("OSTROM_TEST_MARKER", &marker)
+            .status()
+            .expect("establish blocked snapshot")
+            .success()
+    );
+    fixture.approve_blocked_decision();
+    assert!(
+        fixture
+            .command()
+            .env("OSTROM_TEST_MARKER", &marker)
+            .status()
+            .expect("run immediately after approval")
+            .success()
+    );
+
+    assert_eq!(
+        fs::read_to_string(&marker)
+            .expect("read spawn marker")
+            .lines()
+            .count(),
+        2,
+        "the approved decision did not spawn on the very next pass"
+    );
+    let terminal = fixture.trace().pop().expect("changed terminal row");
+    assert_eq!(terminal["fact"]["dispatchable_count"], 1);
+    assert_ne!(terminal["fact"]["reason"], "no-dispatchable-work-unchanged");
+    fixture.assert_released();
+}
+
+#[test]
+fn a_failed_agent_pass_does_not_establish_a_blocked_snapshot() {
+    let fixture = Fixture::new("exit 42");
+    fixture.write_blocked_dispatchability_state();
+    assert_eq!(
+        fixture
+            .command()
+            .status()
+            .expect("run failed blocked pass")
+            .code(),
+        Some(42)
+    );
+    assert!(!fixture.state.join("builder-dispatchability-hash").exists());
+
+    fs::write(
+        &fixture.claude,
+        "#!/usr/bin/env bash\nprintf '%s\\n' spawned >\"$OSTROM_TEST_MARKER\"\n",
+    )
+    .expect("replace failed agent stub");
+    let marker = fixture.root.path().join("retried");
+    assert!(
+        fixture
+            .command()
+            .env("OSTROM_TEST_MARKER", &marker)
+            .status()
+            .expect("retry blocked pass")
+            .success()
+    );
+    assert!(marker.exists(), "the failed pass suppressed its retry");
+    fixture.assert_released();
+}
+
+#[test]
+fn default_branch_turning_green_defeats_the_short_circuit_without_a_candidate() {
+    let fixture = Fixture::new("printf '%s\\n' spawned >>\"$OSTROM_TEST_MARKER\"");
+    fixture.write_blocked_dispatchability_state();
+    let state_path = fixture.state.join("state.json");
+    let mut state: Value =
+        serde_json::from_slice(&fs::read(&state_path).expect("read state")).expect("parse state");
+    state["repos"]["placeholder-org/alpha"]["ci_drift"] = json!({
+        "17": {"run_id": 41, "red_since": "2026-07-31T00:00:00Z"}
+    });
+    fs::write(
+        &state_path,
+        serde_json::to_vec(&state).expect("serialize red state"),
+    )
+    .expect("write red state");
+    let marker = fixture.root.path().join("spawned");
+    assert!(
+        fixture
+            .command()
+            .env("OSTROM_TEST_MARKER", &marker)
+            .status()
+            .expect("establish red snapshot")
+            .success()
+    );
+
+    state["repos"]["placeholder-org/alpha"]["ci_drift"] = json!({});
+    fs::write(
+        &state_path,
+        serde_json::to_vec(&state).expect("serialize green state"),
+    )
+    .expect("write green state");
+    assert!(
+        fixture
+            .command()
+            .env("OSTROM_TEST_MARKER", &marker)
+            .status()
+            .expect("run first green pass")
+            .success()
+    );
+
+    assert_eq!(
+        fs::read_to_string(&marker)
+            .expect("read spawn marker")
+            .lines()
+            .count(),
+        2,
+        "the default-branch transition did not wake the agent immediately"
+    );
+    let terminal = fixture.trace().pop().expect("green terminal row");
+    assert_eq!(terminal["fact"]["dispatchable_count"], 0);
+    assert_ne!(terminal["fact"]["reason"], "no-dispatchable-work-unchanged");
+    fixture.assert_released();
 }
 
 #[test]

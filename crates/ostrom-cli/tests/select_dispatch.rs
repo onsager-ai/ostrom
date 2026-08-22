@@ -327,6 +327,40 @@ fn list_and_empty_select_record_plan_application_without_a_selected_item() {
 }
 
 #[test]
+fn principal_state_transition_changes_the_selection_candidate_immediately() {
+    let fixture = tempdir().expect("fixture");
+    write_selection_fixture(fixture.path(), 0);
+    let queue_path = fixture.path().join("queue.jsonl");
+    let pending = fs::read_to_string(&queue_path)
+        .expect("read queue")
+        .replace(
+            "\"kind\":\"moved\",\"mandate\":{\"reason\":\"placeholder\"},\"state\":\"pending\"",
+            "\"kind\":\"decision\",\"mandate\":{\"reason\":\"placeholder\"},\"state\":\"pending\"",
+        );
+    fs::write(&queue_path, pending).expect("make first item await principal");
+
+    let run_list = || {
+        Command::new(env!("CARGO_BIN_EXE_ostrom"))
+            .args(["select-work", "list"])
+            .env("OSTROM_HOME", fixture.path())
+            .current_dir(fixture.path())
+            .output()
+            .expect("list selection")
+    };
+    let before = run_list();
+    assert!(before.status.success());
+    assert!(!String::from_utf8_lossy(&before.stdout).contains("placeholder-org/alpha#1"));
+
+    let approved = fs::read_to_string(&queue_path)
+        .expect("read pending queue")
+        .replace("\"state\":\"pending\"", "\"state\":\"approved\"");
+    fs::write(&queue_path, approved).expect("approve first item");
+    let after = run_list();
+    assert!(after.status.success());
+    assert!(String::from_utf8_lossy(&after.stdout).contains("placeholder-org/alpha#1"));
+}
+
+#[test]
 fn dispatch_usage_and_invalid_order_match_recorded_shell_corpus() {
     let binary = env!("CARGO_BIN_EXE_ostrom");
     let usage = Command::new(binary)
