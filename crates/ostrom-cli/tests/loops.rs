@@ -4,7 +4,9 @@ use std::{
     process::Command,
 };
 
-use tempfile::tempdir;
+use tempfile::{TempDir, tempdir};
+
+mod support;
 
 fn ostrom() -> Command {
     Command::new(env!("CARGO_BIN_EXE_ostrom"))
@@ -14,14 +16,45 @@ fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/loops")
 }
 
+/// A signed copy of the loop fixture. `ostrom` refuses an unsigned manifest,
+/// and the signature must not be written beside the checked-in fixture, so the
+/// tree is copied into a temporary directory and signed there.
+struct SignedFixture {
+    _root: TempDir,
+    manifest: PathBuf,
+    trusted_keys: PathBuf,
+}
+
+impl SignedFixture {
+    fn new() -> Self {
+        let root = support::copy_fixture_directory(&fixture());
+        let manifest = root.path().join("policy.yaml");
+        let trusted_keys = support::sign_manifest(&manifest);
+        Self {
+            _root: root,
+            manifest,
+            trusted_keys,
+        }
+    }
+
+    fn ostrom(&self) -> Command {
+        let mut command = ostrom();
+        command
+            .env("OSTROM_POLICY_MANIFEST", &self.manifest)
+            .env("OSTROM_POLICY_TRUSTED_KEYS", &self.trusted_keys);
+        command
+    }
+}
+
 #[test]
 fn rendered_units_match_the_committed_fixture_and_check_clean() {
     let root = tempdir().expect("temporary render fixture");
-    let output = ostrom()
+    let policy = SignedFixture::new();
+    let output = policy
+        .ostrom()
         .args(["loops", "render", "--output"])
         .arg(root.path())
         .env("OSTROM_HOME", root.path())
-        .env("OSTROM_POLICY_MANIFEST", fixture().join("policy.yaml"))
         .output()
         .expect("render loop units");
     assert!(
@@ -41,11 +74,11 @@ fn rendered_units_match_the_committed_fixture_and_check_clean() {
         );
     }
 
-    let checked = ostrom()
+    let checked = policy
+        .ostrom()
         .args(["loops", "check"])
         .arg(root.path())
         .env("OSTROM_HOME", root.path())
-        .env("OSTROM_POLICY_MANIFEST", fixture().join("policy.yaml"))
         .output()
         .expect("check rendered units");
     assert!(
@@ -58,10 +91,11 @@ fn rendered_units_match_the_committed_fixture_and_check_clean() {
 #[test]
 fn unattended_triage_has_its_own_actor_settings_profile() {
     let root = tempdir().expect("temporary settings fixture");
-    let output = ostrom()
+    let policy = SignedFixture::new();
+    let output = policy
+        .ostrom()
         .args(["operations", "--settings", "triage"])
         .env("OSTROM_HOME", root.path())
-        .env("OSTROM_POLICY_MANIFEST", fixture().join("policy.yaml"))
         .output()
         .expect("render triage settings");
     assert!(
@@ -82,11 +116,12 @@ fn drift_check_refuses_a_hand_edit_without_touching_it() {
     let unit = root.path().join("ostrom-loop-builder-day.timer");
     fs::write(&unit, "placeholder hand edit\n").expect("write hand edit");
     let before = fs::read(&unit).expect("read before");
-    let output = ostrom()
+    let policy = SignedFixture::new();
+    let output = policy
+        .ostrom()
         .args(["loops", "check"])
         .arg(root.path())
         .env("OSTROM_HOME", root.path())
-        .env("OSTROM_POLICY_MANIFEST", fixture().join("policy.yaml"))
         .output()
         .expect("check drift");
     assert!(!output.status.success());
@@ -130,8 +165,9 @@ loops:
 "#,
     )
     .expect("write policy fixture");
+    let trusted_keys = support::sign_manifest(&manifest);
 
-    let output = loop_run(root.path(), &manifest, &marker)
+    let output = loop_run(root.path(), &manifest, &trusted_keys, &marker)
         .output()
         .expect("run loop");
     assert!(
@@ -145,7 +181,7 @@ loops:
     );
 
     fs::remove_file(&marker).expect("remove marker");
-    let mismatch = loop_run(root.path(), &manifest, &marker)
+    let mismatch = loop_run(root.path(), &manifest, &trusted_keys, &marker)
         .env("MANDATE_MAX_IMPLEMENTERS", "9")
         .output()
         .expect("run mismatched loop");
@@ -158,12 +194,13 @@ loops:
     assert!(!marker.exists(), "dispatch must stop before its operation");
 }
 
-fn loop_run(root: &Path, manifest: &Path, marker: &Path) -> Command {
+fn loop_run(root: &Path, manifest: &Path, trusted_keys: &Path, marker: &Path) -> Command {
     let mut command = ostrom();
     command
         .args(["loop", "run", "builder-night"])
         .env("OSTROM_HOME", root)
         .env("OSTROM_POLICY_MANIFEST", manifest)
+        .env("OSTROM_POLICY_TRUSTED_KEYS", trusted_keys)
         .env("OSTROM_LOOP_MARKER", marker)
         .env_remove("OSTROM_ACTOR")
         .env_remove("MANDATE_DAILY_CAP_USD")
