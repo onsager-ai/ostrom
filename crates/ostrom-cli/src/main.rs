@@ -1144,8 +1144,9 @@ fn run_loop_command(paths: &OstromPaths, name: &str) -> Result<(), Box<dyn std::
         parameters: resolved.parameters,
     };
     let working_directory = env::current_dir()?;
-    let plugin_root = env::var_os("OSTROM_PLUGIN_ROOT")
-        .or_else(|| env::var_os("CLAUDE_PLUGIN_ROOT"))
+    let plugin_root = environment::OSTROM_PLUGIN_ROOT
+        .value_os()
+        .or_else(|| environment::CLAUDE_PLUGIN_ROOT.value_os())
         .map_or_else(|| working_directory.join("plugins/ostrom"), PathBuf::from);
     let selector_prefixes =
         operation_selector_prefixes(&manifest, &resolved.actor, &invocation.name);
@@ -1561,8 +1562,8 @@ fn assert_loop_environment(
     actor: &str,
     ceilings: ResolvedLoopCeilings,
 ) -> Result<(), LoopCommandError> {
-    if let Some(enforced) = nonempty_env("OSTROM_ACTOR")
-        && enforced != actor
+    if let Some(enforced) =
+        nonempty_env(environment::OSTROM_ACTOR).filter(|enforced| enforced.as_str() != actor)
     {
         return Err(LoopCommandError::ActorMismatch {
             declared: actor.to_owned(),
@@ -1570,16 +1571,24 @@ fn assert_loop_environment(
         });
     }
     assert_u64_ceiling(
-        "MANDATE_MAX_IMPLEMENTERS",
+        environment::MANDATE_MAX_IMPLEMENTERS,
         "concurrent",
         ceilings.concurrent,
     )?;
-    assert_f64_ceiling("MANDATE_DAILY_CAP_USD", "spend_usd", ceilings.spend_usd)?;
-    assert_u64_ceiling("MANDATE_ORDER_TOKEN_CEILING", "tokens", ceilings.tokens)
+    assert_f64_ceiling(
+        environment::MANDATE_DAILY_CAP_USD,
+        "spend_usd",
+        ceilings.spend_usd,
+    )?;
+    assert_u64_ceiling(
+        environment::MANDATE_ORDER_TOKEN_CEILING,
+        "tokens",
+        ceilings.tokens,
+    )
 }
 
 fn assert_u64_ceiling(
-    variable: &'static str,
+    variable: environment::EnvironmentVariable,
     field: &'static str,
     declared: Option<u64>,
 ) -> Result<(), LoopCommandError> {
@@ -1592,7 +1601,7 @@ fn assert_u64_ceiling(
     } else {
         Err(LoopCommandError::CeilingMismatch {
             field,
-            variable,
+            variable: variable.name,
             declared: declared.map_or_else(|| "unset".to_owned(), |value| value.to_string()),
             enforced,
         })
@@ -1600,7 +1609,7 @@ fn assert_u64_ceiling(
 }
 
 fn assert_f64_ceiling(
-    variable: &'static str,
+    variable: environment::EnvironmentVariable,
     field: &'static str,
     declared: Option<f64>,
 ) -> Result<(), LoopCommandError> {
@@ -1617,15 +1626,15 @@ fn assert_f64_ceiling(
     } else {
         Err(LoopCommandError::CeilingMismatch {
             field,
-            variable,
+            variable: variable.name,
             declared: declared.map_or_else(|| "unset".to_owned(), render_ceiling_number),
             enforced,
         })
     }
 }
 
-fn nonempty_env(name: &str) -> Option<String> {
-    env::var(name).ok().filter(|value| !value.trim().is_empty())
+fn nonempty_env(variable: environment::EnvironmentVariable) -> Option<String> {
+    variable.value().filter(|value| !value.trim().is_empty())
 }
 
 fn render_ceiling_number(value: f64) -> String {
