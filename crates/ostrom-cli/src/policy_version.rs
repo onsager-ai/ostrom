@@ -24,6 +24,12 @@ pub(crate) struct RollbackOutcome {
     pub to: String,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct CurrentPolicyVersion {
+    pub digest: String,
+    pub manifest: PolicyManifest,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ConfigVerifyOutcome {
     Pass { digest: String },
@@ -99,6 +105,19 @@ pub(crate) enum PolicyVersionError {
     CurrentMissing { path: PathBuf },
 }
 
+#[derive(Debug, Error)]
+pub(crate) enum CurrentPolicyError {
+    #[error("current policy refused: {cause} path={}", path.display())]
+    Inconclusive { cause: &'static str, path: PathBuf },
+    #[error(
+        "current policy refused: current_drift drift={}",
+        drifted.iter().map(|path| path.display().to_string()).collect::<Vec<_>>().join(",")
+    )]
+    Drift { drifted: Vec<PathBuf> },
+    #[error("current policy refused: current_manifest_invalid path={}", path.display())]
+    InvalidManifest { path: PathBuf },
+}
+
 pub(crate) fn run_compose(
     paths: &OstromPaths,
     manifest_path: &Path,
@@ -158,6 +177,63 @@ pub(crate) fn verify_current(paths: &OstromPaths) -> ConfigVerifyOutcome {
         }
     };
     inspect_version(&pointer.directory, &pointer.digest)
+}
+
+pub(crate) fn load_current(
+    paths: &OstromPaths,
+) -> Result<CurrentPolicyVersion, CurrentPolicyError> {
+    let current = paths.current_policy_version();
+    let pointer = read_pointer(paths, &current).map_err(|error| match error {
+        PointerReadError::Missing => CurrentPolicyError::Inconclusive {
+            cause: "current_missing",
+            path: current.clone(),
+        },
+        PointerReadError::Unreadable(_) => CurrentPolicyError::Inconclusive {
+            cause: "current_unreadable",
+            path: current.clone(),
+        },
+        PointerReadError::Invalid => CurrentPolicyError::Inconclusive {
+            cause: "current_target_invalid",
+            path: current.clone(),
+        },
+        PointerReadError::VersionMissing(path) => CurrentPolicyError::Inconclusive {
+            cause: "version_missing",
+            path,
+        },
+        PointerReadError::VersionNotDirectory(path) => CurrentPolicyError::Inconclusive {
+            cause: "version_not_directory",
+            path,
+        },
+        PointerReadError::VersionUnreadable(path) => CurrentPolicyError::Inconclusive {
+            cause: "version_unreadable",
+            path,
+        },
+    })?;
+    match inspect_version(&pointer.directory, &pointer.digest) {
+        ConfigVerifyOutcome::Pass { .. } => {}
+        ConfigVerifyOutcome::Fail { drifted } => {
+            return Err(CurrentPolicyError::Drift { drifted });
+        }
+        ConfigVerifyOutcome::Inconclusive { cause, path } => {
+            return Err(CurrentPolicyError::Inconclusive { cause, path });
+        }
+    }
+    let path = pointer.directory.join(MATERIALIZED_MANIFEST);
+    let source = fs::read_to_string(&path).map_err(|error| CurrentPolicyError::Inconclusive {
+        cause: if error.kind() == io::ErrorKind::NotFound {
+            "manifest_missing"
+        } else {
+            "manifest_unreadable"
+        },
+        path: path.clone(),
+    })?;
+    let manifest = PolicyManifest::parse_yaml(&source)
+        .ok()
+        .ok_or(CurrentPolicyError::InvalidManifest { path })?;
+    Ok(CurrentPolicyVersion {
+        digest: pointer.digest,
+        manifest,
+    })
 }
 
 pub(crate) fn rollback(paths: &OstromPaths) -> Result<RollbackOutcome, PolicyVersionError> {

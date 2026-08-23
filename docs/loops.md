@@ -48,6 +48,25 @@ the resolved values, and `ostrom loop run` refuses if a caller supplies a
 different enforced value. A local `cmd/run` action receives the resolved
 values in its child environment.
 
+The current composed policy version can instead own loop lifecycle directly:
+
+```sh
+ostrom up
+ostrom ps
+ostrom logs builder-day
+```
+
+`ostrom up` is a one-shot reconciler. It verifies `<state>/current`, finds each
+loop's most recent local civil-time cadence slot, records process state under
+`<state>/loop-runs`, and exits. A second invocation in the same version and
+cadence slot is a no-op; the next slot is a new activation. Slots more than two
+hours old are recorded as `stale:slot_age_exceeded` and are not replayed. It
+neither reads an uncomposed working-tree manifest nor calls systemd. The worker
+receives the resolved ceilings from the manifest, and measured consumption is
+checked before the operation begins. `ps` and `logs` read the persisted state
+and log files; an unavailable measurement is printed as `unknown:<cause>`,
+never as zero.
+
 Render and verify artifacts with:
 
 ```sh
@@ -55,10 +74,12 @@ ostrom loops render --output /path/to/fixture-or-unit-source
 ostrom loops check /path/to/installed-units
 ```
 
-Rendering only writes `ostrom-loop-*.service` and `.timer` files. It never
-calls systemctl and never enables, starts, or reloads a unit. `sys/enable-loop`
-remains an ungrantable action. Enabling a rendered timer is therefore a
-separate principal-controlled installation step.
+Rendering writes the inspectable `ostrom-loop-*.service` and `.timer` files,
+the `ostrom-up.service` oneshot unit, and an `ostrom-up.timer` that requests a
+reconciliation every five minutes. It never calls systemctl and never enables,
+starts, or reloads a unit. `sys/enable-loop` remains an ungrantable action.
+Installing and enabling the rendered reconciler timer is therefore a separate
+principal-controlled step.
 
 Each unattended agent is a distinct actor with its own derived operation
 settings profile. In particular, queue triage is modeled as a separate actor

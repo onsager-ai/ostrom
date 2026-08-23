@@ -3,3 +3,17 @@ disallowed-types = [
     "std::path::PathBuf",
     "std::io::Error",
 ]
+
+# `chrono`'s `clock` feature is enabled because the loop supervisor must match
+# systemd's `OnCalendar=`, which is local time. That feature also exposes
+# `Utc::now()` and `Local::now()`, which until now were unreachable by
+# construction — the workspace pinned `default-features = false` without
+# `clock`, so no wall-clock read could compile. #385 established one injected
+# clock and a registry for every production read; keep that guarantee here now
+# that the compiler no longer provides it. Production time comes from
+# `ostrom_store::clock`, and `clock.rs` itself reads `SystemTime::now`, which
+# is deliberately not on this list.
+disallowed-methods = [
+    { path = "chrono::Utc::now", reason = "read time through ostrom_store::clock::Clock" },
+    { path = "chrono::Local::now", reason = "read time through ostrom_store::clock::Clock" },
+]
