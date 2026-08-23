@@ -124,17 +124,37 @@ pub(crate) fn load_bundle(
     build_bundle(paths, repository_path, repository)
 }
 
+pub(crate) fn load_unsigned_bundle(
+    paths: &OstromPaths,
+    path: &Path,
+) -> Result<PolicyBundle, PolicyLoadError> {
+    let repository_path = normalize_manifest_path(path).into_owned();
+    let repository = load_composed(&repository_path)?;
+    build_bundle_with(paths, repository_path, repository, false)
+}
+
 fn build_bundle(
     paths: &OstromPaths,
     repository_path: PathBuf,
     repository: LoadedManifest,
+) -> Result<PolicyBundle, PolicyLoadError> {
+    build_bundle_with(paths, repository_path, repository, true)
+}
+
+fn build_bundle_with(
+    paths: &OstromPaths,
+    repository_path: PathBuf,
+    repository: LoadedManifest,
+    verify_operator: bool,
 ) -> Result<PolicyBundle, PolicyLoadError> {
     let operator_path = operator_manifest_path(paths)?;
     let operator = operator_path
         .filter(|operator_path| operator_path != &repository_path)
         .map(|operator_path| {
             let loaded = load_composed(&operator_path)?;
-            verify(&loaded.manifest, &operator_path)?;
+            if verify_operator {
+                verify(&loaded.manifest, &operator_path)?;
+            }
             Ok::<_, PolicyLoadError>((operator_path, loaded))
         })
         .transpose()?;

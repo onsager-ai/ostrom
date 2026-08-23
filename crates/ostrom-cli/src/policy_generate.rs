@@ -8,13 +8,24 @@ use ostrom_core::{
     CheckDefinition, DefaultDisposition, GateConfig, MandateConfig, NormalizedList,
     PolicyCandidate, PolicyManifest, PolicySelector, RuleDecl, glob_matches,
 };
-use ostrom_store::{OstromPaths, load_central_config, load_central_gate_config};
+use ostrom_store::{OstromPaths, PolicyBundle, load_central_config, load_central_gate_config};
 use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::policy_manifest;
 
-type CommentMap = BTreeMap<(Option<String>, String), Vec<String>>;
+#[derive(Debug, Default)]
+struct SourceComments {
+    fields: BTreeMap<(Option<String>, String), Vec<String>>,
+    selectors: BTreeMap<(Option<String>, String, String), Vec<String>>,
+    projects: BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Default)]
+struct DenyGroup {
+    selectors: BTreeSet<String>,
+    descriptions: BTreeSet<String>,
+}
 
 pub(crate) fn run(paths: &OstromPaths, verify: bool) -> Result<(), GenerateError> {
     let mandates_path = paths.config.join("mandates.yaml");
@@ -27,7 +38,8 @@ pub(crate) fn run(paths: &OstromPaths, verify: bool) -> Result<(), GenerateError
         path: gate_path.clone(),
         message,
     })?;
-    let comments = merge_comments([read_comments(&mandates_path)?, read_comments(&gate_path)?]);
+    let mandate_comments = read_comments(&mandates_path)?;
+    let gate_comments = read_comments(&gate_path)?;
     let repositories = repository_paths(&mandates)?;
 
     if verify {
@@ -47,9 +59,16 @@ pub(crate) fn run(paths: &OstromPaths, verify: bool) -> Result<(), GenerateError
                     path: output.clone(),
                     message: error.to_string(),
                 })?;
+            let bundle =
+                policy_manifest::load_unsigned_bundle(paths, &output).map_err(|error| {
+                    GenerateError::Resolution {
+                        path: output.clone(),
+                        message: error.to_string(),
+                    }
+                })?;
             report_portability_lints(&manifest, &output);
             let items = open_items(&state, repository)?;
-            verify_repository(&mandates, &gate, project, &manifest, &items)?;
+            verify_repository(&mandates, &gate, project, &bundle, &manifest, &items)?;
             println!("verified: {repository} ({} open items)", items.len());
         }
         return Ok(());
@@ -57,7 +76,7 @@ pub(crate) fn run(paths: &OstromPaths, verify: bool) -> Result<(), GenerateError
 
     for project in &mandates.projects {
         let repository = project.repo.as_str();
-        let manifest = generate_manifest(&mandates, &gate, project, &comments)?;
+        let manifest = generate_manifest(&gate, project, &mandate_comments, &gate_comments)?;
         let output = repositories
             .get(repository)
             .expect("every roster entry has a resolved path")
@@ -88,10 +107,10 @@ fn report_portability_lints(manifest: &PolicyManifest, path: &Path) {
 }
 
 fn generate_manifest(
-    mandates: &MandateConfig,
     gate: &GateConfig,
     project: &ostrom_core::ProjectMandate,
-    comments: &CommentMap,
+    mandate_comments: &SourceComments,
+    gate_comments: &SourceComments,
 ) -> Result<PolicyManifest, GenerateError> {
     let repository = project.repo.as_str();
     let mut manifest = PolicyManifest::from_yaml("manifest_version: 1\n")
@@ -108,19 +127,28 @@ fn generate_manifest(
             .insert("remaining-changes".to_owned(), rule(None, Vec::new()));
     }
 
-    let mut review = mandates
-        .bounce_all
-        .iter()
-        .map(|selector| selector.as_str())
-        .chain(project.bounce.iter().map(|selector| selector.as_str()))
-        .chain(gate.bounce_all.iter().map(|selector| selector.as_str()))
-        .collect::<Vec<_>>();
+    let mut denies = BTreeMap::<String, DenyGroup>::new();
+    add_deny_groups(
+        &mut denies,
+        repository,
+        "bounce",
+        "needs-review",
+        project.bounce.iter().map(|selector| selector.as_str()),
+        mandate_comments,
+    );
     if let Some(gate_project) = gate
         .projects
         .iter()
         .find(|candidate| candidate.repo.as_str() == repository)
     {
-        review.extend(gate_project.bounce.iter().map(|selector| selector.as_str()));
+        add_deny_groups(
+            &mut denies,
+            repository,
+            "bounce",
+            "needs-review",
+            gate_project.bounce.iter().map(|selector| selector.as_str()),
+            gate_comments,
+        );
         let mut used = BTreeSet::new();
         for pattern in &gate_project.required_checks {
             let id = unique_check_id(pattern, &mut used);
@@ -134,32 +162,20 @@ fn generate_manifest(
             );
         }
     }
-    review.sort_unstable();
-    review.dedup();
-    if !review.is_empty() {
-        let rationale = comments_for(
-            comments,
-            repository,
-            "bounce",
-            "These changes require operator review before work proceeds.",
-        );
+    add_deny_groups(
+        &mut denies,
+        repository,
+        "excluded",
+        "excluded",
+        project.excluded.iter().map(|selector| selector.as_str()),
+        mandate_comments,
+    );
+    for (id, group) in denies {
         manifest.denies.insert(
-            "operator-review".to_owned(),
-            rule(Some(rationale), selectors(review)?),
-        );
-    }
-    if !project.excluded.is_empty() {
-        let rationale = comments_for(
-            comments,
-            repository,
-            "excluded",
-            "These changes are intentionally outside delegated repository work.",
-        );
-        manifest.denies.insert(
-            "excluded-changes".to_owned(),
+            id,
             rule(
-                Some(rationale),
-                selectors(project.excluded.iter().map(|selector| selector.as_str()))?,
+                choose_description(&group.descriptions),
+                selectors(group.selectors.iter().map(String::as_str))?,
             ),
         );
     }
@@ -170,6 +186,75 @@ fn generate_manifest(
             message: error.to_string(),
         })?;
     Ok(manifest)
+}
+
+fn add_deny_groups<'a>(
+    groups: &mut BTreeMap<String, DenyGroup>,
+    repository: &str,
+    field: &str,
+    suffix: &str,
+    values: impl IntoIterator<Item = &'a str>,
+    comments: &SourceComments,
+) {
+    let mut by_subject = BTreeMap::<String, Vec<&str>>::new();
+    for selector in values {
+        by_subject
+            .entry(selector_subject(selector))
+            .or_default()
+            .push(selector);
+    }
+    let one_subject = by_subject.len() == 1;
+    let mut concerns = BTreeMap::<(bool, String), (Vec<String>, DenyGroup)>::new();
+    for (subject, selectors) in by_subject {
+        let descriptions = comments
+            .descriptions_for(repository, field, &subject, &selectors, one_subject)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let description = choose_description(&descriptions);
+        let key = description
+            .as_ref()
+            .map_or_else(|| (false, subject.clone()), |reason| (true, reason.clone()));
+        let (subjects, concern) = concerns.entry(key).or_default();
+        subjects.push(subject);
+        concern
+            .selectors
+            .extend(selectors.iter().map(|selector| (*selector).to_owned()));
+        concern.descriptions.extend(description);
+    }
+    for (_, (subjects, concern)) in concerns {
+        let id = format!("{}-{suffix}", subjects.join("-and-"));
+        let group = groups.entry(id).or_default();
+        group.selectors.extend(concern.selectors);
+        group.descriptions.extend(concern.descriptions);
+    }
+}
+
+fn selector_subject(selector: &str) -> String {
+    let (prefix, value) = selector.split_once(':').unwrap_or(("rule", selector));
+    let value = match prefix {
+        "label" => value
+            .strip_prefix("area:")
+            .or_else(|| value.strip_prefix("risk:"))
+            .unwrap_or(value),
+        _ => value,
+    };
+    let segment = if prefix == "path" {
+        value
+            .split('/')
+            .rev()
+            .find(|segment| segment.chars().any(char::is_alphanumeric))
+            .unwrap_or(value)
+    } else {
+        value
+    };
+    let subject = slug(segment);
+    if subject.is_empty() {
+        prefix.to_owned()
+    } else if prefix == "ref" && subject.chars().all(|character| character.is_ascii_digit()) {
+        format!("ref-{subject}")
+    } else {
+        subject
+    }
 }
 
 fn rule(description: Option<String>, selectors: Vec<PolicySelector>) -> RuleDecl {
@@ -281,7 +366,7 @@ fn collect_repository_paths(directory: &Path, repositories: &mut Vec<PathBuf>) {
     }
 }
 
-fn read_comments(path: &Path) -> Result<CommentMap, GenerateError> {
+fn read_comments(path: &Path) -> Result<SourceComments, GenerateError> {
     let source = fs::read_to_string(path).map_err(|source| GenerateError::Io {
         path: path.to_path_buf(),
         source,
@@ -289,8 +374,8 @@ fn read_comments(path: &Path) -> Result<CommentMap, GenerateError> {
     Ok(extract_comments(&source))
 }
 
-fn extract_comments(source: &str) -> CommentMap {
-    let mut comments = CommentMap::new();
+fn extract_comments(source: &str) -> SourceComments {
+    let mut comments = SourceComments::default();
     let mut pending = Vec::new();
     let mut repository = None::<String>;
     let mut field = None::<String>;
@@ -316,9 +401,15 @@ fn extract_comments(source: &str) -> CommentMap {
         if indent == 2
             && let Some(name) = trimmed.strip_prefix("- repo:").map(str::trim)
         {
+            if let Some(comment) = take_comment(&mut pending) {
+                comments
+                    .projects
+                    .entry(name.to_owned())
+                    .or_default()
+                    .push(comment);
+            }
             repository = Some(name.to_owned());
             field = None;
-            pending.clear();
             continue;
         }
         let field_name = trimmed
@@ -337,12 +428,16 @@ fn extract_comments(source: &str) -> CommentMap {
             } else {
                 repository.clone()
             };
-            comments
-                .entry((owner.clone(), name.clone()))
-                .or_default()
-                .append(&mut pending);
+            if let Some(comment) = take_comment(&mut pending) {
+                comments
+                    .fields
+                    .entry((owner.clone(), name.clone()))
+                    .or_default()
+                    .push(comment);
+            }
             if let Some(comment) = inline_comment.filter(|comment| !comment.is_empty()) {
                 comments
+                    .fields
                     .entry((owner.clone(), name.clone()))
                     .or_default()
                     .push(comment.to_owned());
@@ -357,15 +452,20 @@ fn extract_comments(source: &str) -> CommentMap {
                 } else {
                     repository.clone()
                 };
-                comments
-                    .entry((owner.clone(), name.clone()))
-                    .or_default()
-                    .append(&mut pending);
+                let selector = trimmed.strip_prefix('-').map(str::trim).unwrap_or_default();
+                let mut attached = Vec::new();
+                if let Some(comment) = take_comment(&mut pending) {
+                    attached.push(comment);
+                }
                 if let Some(comment) = inline_comment.filter(|comment| !comment.is_empty()) {
+                    attached.push(comment.to_owned());
+                }
+                if !selector.is_empty() && !attached.is_empty() {
                     comments
-                        .entry((owner, name.clone()))
+                        .selectors
+                        .entry((owner, name.clone(), unquote(selector).to_owned()))
                         .or_default()
-                        .push(comment.to_owned());
+                        .extend(attached);
                 }
             }
         } else {
@@ -376,42 +476,156 @@ fn extract_comments(source: &str) -> CommentMap {
     comments
 }
 
-fn merge_comments(maps: impl IntoIterator<Item = CommentMap>) -> CommentMap {
-    let mut merged = CommentMap::new();
-    for map in maps {
-        for (key, values) in map {
-            merged.entry(key).or_default().extend(values);
-        }
+fn take_comment(lines: &mut Vec<String>) -> Option<String> {
+    if lines.is_empty() {
+        None
+    } else {
+        Some(std::mem::take(lines).join(" "))
     }
-    for values in merged.values_mut() {
-        values.sort();
-        values.dedup();
-    }
-    merged
 }
 
-fn comments_for(comments: &CommentMap, repository: &str, field: &str, base: &str) -> String {
-    let global = (field == "bounce")
-        .then(|| comments.get(&(None, "bounce_all".to_owned())))
-        .flatten();
-    let mut values = global
-        .into_iter()
-        .flatten()
-        .chain(
-            comments
-                .get(&(Some(repository.to_owned()), field.to_owned()))
+fn unquote(value: &str) -> &str {
+    value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .or_else(|| {
+            value
+                .strip_prefix('\'')
+                .and_then(|value| value.strip_suffix('\''))
+        })
+        .unwrap_or(value)
+}
+
+impl SourceComments {
+    fn descriptions_for(
+        &self,
+        repository: &str,
+        field: &str,
+        subject: &str,
+        selectors: &[&str],
+        one_subject: bool,
+    ) -> Vec<String> {
+        let owner = Some(repository.to_owned());
+        let field_comments = self
+            .fields
+            .get(&(owner.clone(), field.to_owned()))
+            .into_iter()
+            .flatten();
+        let selector_comments = selectors.iter().flat_map(|selector| {
+            self.selectors
+                .get(&(owner.clone(), field.to_owned(), (*selector).to_owned()))
                 .into_iter()
-                .flatten(),
-        )
-        .cloned()
-        .collect::<Vec<_>>();
-    values.sort();
-    values.dedup();
-    if values.is_empty() {
-        base.to_owned()
-    } else {
-        format!("{base} {}", values.join(" "))
+                .flatten()
+        });
+        let scoped = field_comments
+            .chain(selector_comments)
+            .flat_map(|comment| comment_sentences(comment))
+            .filter(|sentence| {
+                purpose_sentence(sentence)
+                    && (one_subject || sentence_names_subject(sentence, subject))
+            });
+        let project = self
+            .projects
+            .get(repository)
+            .into_iter()
+            .flatten()
+            .flat_map(|comment| comment_sentences(comment))
+            .filter(|sentence| {
+                purpose_sentence(sentence) && sentence_names_subject(sentence, subject)
+            });
+        scoped.chain(project).collect()
     }
+}
+
+fn comment_sentences(comment: &str) -> Vec<String> {
+    let mut sentences = Vec::new();
+    let mut start = 0;
+    let mut characters = comment.char_indices().peekable();
+    while let Some((index, character)) = characters.next() {
+        if matches!(character, '.' | '!' | '?')
+            && characters
+                .peek()
+                .is_none_or(|(_, next)| next.is_whitespace())
+        {
+            let end = index + character.len_utf8();
+            let sentence = comment[start..end].trim();
+            if !sentence.is_empty() {
+                sentences.push(sentence.to_owned());
+            }
+            start = end;
+        }
+    }
+    let remainder = comment[start..].trim();
+    if !remainder.is_empty() {
+        sentences.push(remainder.to_owned());
+    }
+    sentences
+}
+
+fn purpose_sentence(sentence: &str) -> bool {
+    description_score(sentence) > 0
+}
+
+fn sentence_names_subject(sentence: &str, subject: &str) -> bool {
+    let sentence = slug(sentence);
+    subject
+        .split('-')
+        .filter(|part| part.len() > 2)
+        .all(|part| {
+            sentence
+                .split('-')
+                .any(|word| word == part || word.strip_suffix('s') == Some(part))
+        })
+}
+
+fn choose_description(descriptions: &BTreeSet<String>) -> Option<String> {
+    descriptions
+        .iter()
+        .max_by(|left, right| {
+            description_score(left)
+                .cmp(&description_score(right))
+                .then_with(|| right.cmp(left))
+        })
+        .cloned()
+}
+
+fn description_score(sentence: &str) -> i32 {
+    let sentence = sentence.to_ascii_lowercase();
+    let purpose = [
+        (" because ", 4),
+        (" require", 4),
+        (" review", 4),
+        (" gate", 2),
+        (" protect", 3),
+        (" principal", 4),
+        (" human", 4),
+        (" irreversible", 3),
+        (" outside delegat", 4),
+        (" not delegat", 4),
+        (" stay gated", 3),
+    ]
+    .iter()
+    .filter(|(marker, _)| sentence.contains(marker))
+    .map(|(_, score)| score)
+    .sum::<i32>();
+    let historical = [
+        "added ",
+        "discovered ",
+        " incident",
+        "landed ",
+        "previously ",
+        "removed ",
+        "retired ",
+        "shipped ",
+        "used to ",
+    ]
+    .iter()
+    .filter(|marker| sentence.contains(*marker))
+    .count() as i32;
+    let dated = sentence
+        .split(|character: char| !character.is_ascii_digit())
+        .any(|part| part.len() == 4 && part.starts_with("20"));
+    purpose - (historical * 8) - i32::from(dated) * 8
 }
 
 fn read_json(path: &Path) -> Result<Value, GenerateError> {
@@ -442,6 +656,7 @@ fn verify_repository(
     mandates: &MandateConfig,
     gate: &GateConfig,
     project: &ostrom_core::ProjectMandate,
+    bundle: &PolicyBundle,
     manifest: &PolicyManifest,
     items: &[Value],
 ) -> Result<(), GenerateError> {
@@ -455,7 +670,7 @@ fn verify_repository(
         let id = item_id(item);
         let candidate = policy_candidate(repository, item);
         let central = central_granted(mandates, gate, project, gate_project, &candidate)?;
-        let generated = manifest.decide("", "", &candidate).granted;
+        let generated = bundle.decide("", "", &candidate).granted;
         if central != generated {
             differences.push(format!(
                 "{id}: authority central={} generated={}",
@@ -463,7 +678,10 @@ fn verify_repository(
                 verdict(generated)
             ));
         }
-        if item.get("type").and_then(Value::as_str) == Some("pr") {
+        let has_required_checks = gate_project
+            .is_some_and(|project| !project.required_checks.is_empty())
+            || !manifest.checks.is_empty();
+        if item.get("type").and_then(Value::as_str) == Some("pr") && has_required_checks {
             let observed = item
                 .get("checks")
                 .and_then(Value::as_array)
@@ -687,6 +905,8 @@ pub(crate) enum GenerateError {
     },
     #[error("could not load generated manifest `{}`: {message}", path.display())]
     Manifest { path: PathBuf, message: String },
+    #[error("could not resolve generated manifest `{}`: {message}", path.display())]
+    Resolution { path: PathBuf, message: String },
     #[error("legacy selector `{selector}` cannot be represented: {message}")]
     Selector { selector: String, message: String },
     #[error("repository `{repository}` was not found beneath search_roots {roots:?}")]
@@ -721,7 +941,9 @@ impl From<ostrom_core::PolicySelectorError> for GenerateError {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_comments;
+    use std::collections::BTreeSet;
+
+    use super::{choose_description, extract_comments, selector_subject};
 
     #[test]
     fn source_comments_are_attached_to_their_repository_field() {
@@ -729,8 +951,32 @@ mod tests {
             "projects:\n  - repo: placeholder-org/repo\n    # Copy changes need a human because wording is irreversible.\n    bounce:\n      - label:copy\n",
         );
         assert_eq!(
-            comments[&(Some("placeholder-org/repo".to_owned()), "bounce".to_owned())],
+            comments.fields[&(Some("placeholder-org/repo".to_owned()), "bounce".to_owned())],
             ["Copy changes need a human because wording is irreversible."]
+        );
+    }
+
+    #[test]
+    fn rule_subjects_group_equivalent_selector_vocabulary() {
+        assert_eq!(selector_subject("type:release"), "release");
+        assert_eq!(selector_subject("label:risk:release"), "release");
+        assert_eq!(
+            selector_subject("path:.github/workflows/release*"),
+            "release"
+        );
+        assert_eq!(selector_subject("label:area:copy"), "copy");
+        assert_eq!(selector_subject("path:infra/**"), "infra");
+    }
+
+    #[test]
+    fn descriptions_prefer_a_purpose_over_an_incident() {
+        let descriptions = BTreeSet::from([
+            "Added 2026-08-01 because an earlier release escaped review.".to_owned(),
+            "Releases require review because publication is irreversible.".to_owned(),
+        ]);
+        assert_eq!(
+            choose_description(&descriptions).as_deref(),
+            Some("Releases require review because publication is irreversible.")
         );
     }
 }

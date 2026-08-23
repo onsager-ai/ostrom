@@ -1,6 +1,6 @@
 use std::{fs, path::Path, process::Command};
 
-use ostrom_core::PolicyManifest;
+use ostrom_core::{PolicyCandidate, PolicyManifest};
 use serde_json::json;
 use tempfile::{TempDir, tempdir};
 
@@ -22,8 +22,9 @@ impl Fixture {
 cadence_hours: 1
 stuck_after_days: 7
 search_roots: [{}]
-bounce_all: []
+bounce_all: [label:risk:shared]
 projects:
+  # Content and copy require human review because the words are locked.
   - repo: placeholder-org/repository
     delegated: [label:delegated]
     excluded: [label:excluded]
@@ -31,16 +32,28 @@ projects:
     default: unclassified
     paused: true
     # Releases are reviewed because publication is irreversible.
-    bounce: [title:*release*]
+    bounce:
+      - title:*release*
+      - label:area:content
+      - label:area:copy
 "#,
                 search_root.display()
             ),
         )
         .expect("central mandates");
         fs::write(
+            home.path().join("ostrom.yaml"),
+            r#"manifest_version: 1
+denies:
+  shared-tripwires:
+    where: [label:risk:shared]
+"#,
+        )
+        .expect("operator manifest");
+        fs::write(
             home.path().join("gate.yaml"),
             r#"provider: file
-bounce_all: []
+bounce_all: [label:risk:shared]
 projects:
   - repo: placeholder-org/repository
     required_checks: [ci-*]
@@ -60,6 +73,7 @@ projects:
                         "placeholder-org/repository#4": item(4, "pr", "fix: infrastructure", [], ["infra/main.tf"], [("ci-rust", "SUCCESS")]),
                         "placeholder-org/repository#5": item(5, "issue", "fix: unmatched", [], [], []),
                         "placeholder-org/repository#6": item(6, "pr", "fix: delegated pr", ["delegated"], ["src/lib.rs"], [("ci-rust", "FAILURE")]),
+                        "placeholder-org/repository#7": item(7, "issue", "fix: shared tripwire", ["delegated", "risk:shared"], [], []),
                     }
                 }
             }
@@ -113,7 +127,7 @@ fn load(path: &Path) -> (String, PolicyManifest) {
 }
 
 #[test]
-fn generates_portable_equivalent_manifests_without_operator_state() {
+fn generates_repository_concerns_and_resolves_operator_tripwires() {
     let fixture = Fixture::new();
     let generated = fixture.command(&["policy", "generate"]);
     assert!(
@@ -138,10 +152,13 @@ fn generates_portable_equivalent_manifests_without_operator_state() {
     assert!(!source.contains("paused"), "{source}");
     assert!(!source.contains("builder"), "{source}");
     assert!(source.contains("delegated-changes"), "{source}");
-    assert!(source.contains("excluded-changes"), "{source}");
-    assert!(source.contains("operator-review"), "{source}");
+    assert!(source.contains("excluded-excluded"), "{source}");
+    assert!(source.contains("content-and-copy-needs-review"), "{source}");
+    assert!(source.contains("release-needs-review"), "{source}");
+    assert!(source.contains("infra-needs-review"), "{source}");
+    assert!(!source.contains("operator-review"), "{source}");
+    assert!(!source.contains("label:risk:shared"), "{source}");
     assert!(source.contains("ci-green"), "{source}");
-    assert!(source.contains("description:"), "{source}");
     assert!(
         source.contains("Infrastructure changes need a human because they alter deployment."),
         "{source}"
@@ -149,6 +166,31 @@ fn generates_portable_equivalent_manifests_without_operator_state() {
     assert!(
         source.contains("Releases are reviewed because publication is irreversible."),
         "{source}"
+    );
+    assert_eq!(
+        manifest.denies["content-and-copy-needs-review"]
+            .description
+            .as_deref(),
+        Some("Content and copy require human review because the words are locked.")
+    );
+    assert_eq!(
+        manifest.denies["release-needs-review"]
+            .description
+            .as_deref(),
+        Some("Releases are reviewed because publication is irreversible.")
+    );
+    assert_eq!(
+        manifest.denies["infra-needs-review"].description.as_deref(),
+        Some("Infrastructure changes need a human because they alter deployment.")
+    );
+    let shared_tripwire = PolicyCandidate {
+        repository: "placeholder-org/repository".to_owned(),
+        labels: vec!["delegated".to_owned(), "risk:shared".to_owned()],
+        ..PolicyCandidate::default()
+    };
+    assert!(
+        manifest.decide("", "", &shared_tripwire).granted,
+        "the repository manifest must leave the shared tripwire to the operator"
     );
 
     let verified = fixture.command(&["policy", "generate", "--verify"]);
@@ -158,7 +200,7 @@ fn generates_portable_equivalent_manifests_without_operator_state() {
         String::from_utf8_lossy(&verified.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&verified.stdout).contains("6 open items"),
+        String::from_utf8_lossy(&verified.stdout).contains("7 open items"),
         "{}",
         String::from_utf8_lossy(&verified.stdout)
     );
