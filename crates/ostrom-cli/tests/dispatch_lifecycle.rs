@@ -194,6 +194,37 @@ fn dispatch_child_resolves_explicit_claude_config_state() {
 }
 
 #[test]
+fn dispatch_reports_each_orphan_worktree_removal() {
+    let fixture = DispatchFixture::new(false);
+    let orphan = fixture
+        .state
+        .join("implementer-worktrees/orphan-placeholder");
+    fs::create_dir_all(&orphan).expect("create orphan worktree");
+    fs::write(orphan.join("artifact"), "placeholder").expect("write orphan artifact");
+
+    let output = fixture
+        .dispatch(false)
+        .output()
+        .expect("dispatch with orphan worktree");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8(output.stderr).expect("dispatch stderr is UTF-8");
+    assert!(
+        stderr.contains("removed orphan implementer worktree"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(orphan.to_str().expect("UTF-8 orphan path")),
+        "{stderr}"
+    );
+    assert!(!orphan.exists());
+}
+
+#[test]
 fn immediately_dead_unit_is_not_recorded_as_dispatched() {
     let fixture = DispatchFixture::new(false);
     let systemctl = fixture.root.path().join("systemctl-stub");
