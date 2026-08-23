@@ -1,0 +1,14 @@
+{
+  "repositories": [
+    {
+      "repo": "placeholder-org/delegated-repository",
+      "issues": [],
+      "open_prs": [],
+      "merged_prs": [],
+      "default_branch": "main",
+      "branches": [],
+      "branch_read_degraded": false,
+      "ci_runs": []
+    }
+  ]
+}

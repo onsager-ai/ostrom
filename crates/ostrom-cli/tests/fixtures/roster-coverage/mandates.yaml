@@ -1,0 +1,12 @@
+provider: file
+cadence_hours: 24
+stuck_after_days: 7
+projects:
+  - repo: placeholder-org/delegated-repository
+    delegated:
+      - label:placeholder-delegated
+    excluded: []
+    reserved: []
+    default: excluded
+    paused: false
+    bounce: []

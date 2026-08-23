@@ -79,7 +79,7 @@ struct Acquisition {
 pub fn run_gate(options: &GateOptions) -> Result<GateOutput, GateError> {
     let target = parse_target(&options.target)?;
     let (config, config_error) =
-        load_gate_config(&options.paths, &options.working_directory, target.repo);
+        load_gate_config_for_repo(&options.paths, &options.working_directory, target.repo);
 
     let metadata_output = match gh(&[
         "pr",
@@ -476,7 +476,39 @@ fn error_text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(&flattened).into_owned()
 }
 
-fn load_gate_config(paths: &OstromPaths, cwd: &Path, repo: &str) -> (Option<GateConfig>, String) {
+pub(crate) fn load_gate_config(paths: &OstromPaths, cwd: &Path) -> Result<GateConfig, String> {
+    let user_path = paths.config.join("gate.yaml");
+    let repo_path = cwd.join(".ostrom/gate.yaml");
+    let mut merged = match serde_yaml::from_str::<serde_yaml::Value>(SHIPPED_DEFAULTS) {
+        Ok(value) => value,
+        Err(error) => return Err(error.to_string()),
+    };
+    for path in [&user_path, &repo_path] {
+        if path.exists() {
+            let overlay = fs::read_to_string(path)
+                .map_err(|error| error.to_string())
+                .and_then(|text| {
+                    serde_yaml::from_str::<serde_yaml::Value>(&text)
+                        .map_err(|error| error.to_string())
+                });
+            match overlay {
+                Ok(overlay) => merge_yaml(&mut merged, overlay),
+                Err(error) => return Err(truncate_error(&error)),
+            }
+        }
+    }
+    let serialized = match serde_yaml::to_string(&merged) {
+        Ok(value) => value,
+        Err(error) => return Err(error.to_string()),
+    };
+    GateConfig::from_yaml(&serialized).map_err(|error| truncate_error(&error.to_string()))
+}
+
+fn load_gate_config_for_repo(
+    paths: &OstromPaths,
+    cwd: &Path,
+    repo: &str,
+) -> (Option<GateConfig>, String) {
     let user_path = paths.config.join("gate.yaml");
     let repo_path = cwd.join(".ostrom/gate.yaml");
     if !user_path.exists() && !repo_path.exists() {
@@ -489,31 +521,9 @@ fn load_gate_config(paths: &OstromPaths, cwd: &Path, repo: &str) -> (Option<Gate
             ),
         );
     }
-    let mut merged = match serde_yaml::from_str::<serde_yaml::Value>(SHIPPED_DEFAULTS) {
-        Ok(value) => value,
-        Err(error) => return (None, error.to_string()),
-    };
-    for path in [&user_path, &repo_path] {
-        if path.exists() {
-            let overlay = fs::read_to_string(path)
-                .map_err(|error| error.to_string())
-                .and_then(|text| {
-                    serde_yaml::from_str::<serde_yaml::Value>(&text)
-                        .map_err(|error| error.to_string())
-                });
-            match overlay {
-                Ok(overlay) => merge_yaml(&mut merged, overlay),
-                Err(error) => return (None, truncate_error(&error)),
-            }
-        }
-    }
-    let serialized = match serde_yaml::to_string(&merged) {
-        Ok(value) => value,
-        Err(error) => return (None, error.to_string()),
-    };
-    let config = match GateConfig::from_yaml(&serialized) {
+    let config = match load_gate_config(paths, cwd) {
         Ok(config) => config,
-        Err(error) => return (None, truncate_error(&error.to_string())),
+        Err(error) => return (None, error),
     };
     if config
         .projects
@@ -1278,7 +1288,7 @@ projects:
         )
         .unwrap();
         let (config, error) =
-            load_gate_config(&paths, &repository, "placeholder-org/placeholder-repo");
+            load_gate_config_for_repo(&paths, &repository, "placeholder-org/placeholder-repo");
         assert!(error.is_empty());
         let config = config.expect("layered gate config");
         assert_eq!(config.bounce_all[0].as_str(), "title:*principal review*");
