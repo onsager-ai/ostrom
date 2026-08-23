@@ -60,8 +60,8 @@ pub use plan::{
     PlanFault, PlanOptions, PlanRanking, PlanSweep, UnavailableAssessmentDeriver, run_plan,
 };
 pub use policy::{
-    ConsultedScope, InertDeclaration, PolicyBundle, PolicyExplanation, PolicyLayer, PolicyOrigins,
-    RequirementExplanation, RuleExplanation, SelectorProjection,
+    ActorPortabilityFinding, ConsultedScope, InertDeclaration, PolicyBundle, PolicyExplanation,
+    PolicyLayer, PolicyOrigins, RequirementExplanation, RuleExplanation, SelectorProjection,
 };
 pub use policy_signature::{PolicySignatureError, sign_policy_manifest, verify_policy_manifest};
 pub use publish::{PublishDestination, PublishError};

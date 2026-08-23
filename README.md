@@ -382,6 +382,18 @@ win absolutely, a grant from either scope suffices when no deny matches, and an
 unmatched request is denied. Repository `loops:` and `operations:` declarations
 are reported but inert; only declarations in the operator manifest are adopted.
 If both filename extensions exist for one document, loading refuses both.
+Repository actor declarations are reported under `ACTOR PORTABILITY`, with one
+non-failing finding per actor and the file that declared it. Actor declarations
+in the operator manifest are expected and produce no finding.
+
+`ostrom generate owner/repository --output /path/to/ostrom.yaml` projects the
+currently resolved, signed operator policy into a portable repository manifest.
+Omitting `--output` (or using `--output -`) writes YAML to stdout. The
+projection keeps applicable grants, denies, checks, selectors, operations, and
+repository-targeted loops,
+removes the already-selected repository dimension from rules, and declares no
+actors. Generation does not sign or adopt the output; review and sign it before
+placing it at a repository policy entrypoint.
 
 The policy `defaults` map accepts `stalls_after: 7d`, which is also the default.
 An individual grant or deny may override it. Sweep records the first time each

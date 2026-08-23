@@ -31,6 +31,23 @@ export OSTROM_POLICY_TRUSTED_KEYS=/run/ostrom/trusted-policy-keys
 ostrom validate /policy/ostrom.yaml
 ```
 
+`ostrom validate` reports repository actor declarations as portability
+findings, naming each actor's source file, while still exiting successfully.
+The operator manifest is the roster-owning layer, so actor declarations there
+are not findings. `ostrom explain` renders the same repository findings under
+its separate `ACTOR PORTABILITY` heading.
+
+To derive policy for one repository from the adopting operator manifest:
+
+```sh
+ostrom generate owner/repository --output /repository/ostrom.yaml
+```
+
+Omit `--output` or use `--output -` to write the generated YAML to stdout. The
+output is unsigned, declares no actors, and carries no repository restriction
+in its projected rules. Signing and placing it at the repository entrypoint are
+separate, intentional adoption steps.
+
 `OSTROM_POLICY_TRUSTED_KEYS` must be provisioned by the host or worker and is
 not configurable from the manifest. Loading refuses an unset trust directory,
 a missing or malformed sidecar, an unknown key ID, a malformed or undersized

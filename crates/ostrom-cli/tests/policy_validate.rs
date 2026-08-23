@@ -49,6 +49,75 @@ fn normalized_manifest(working_directory: &Path, manifest: &Path, trusted_keys: 
 }
 
 #[test]
+fn repository_actor_portability_lint_reports_every_actor_origin_and_exits_zero() {
+    let temporary = TempDir::new().expect("temporary repository");
+    fs::create_dir(temporary.path().join(".git")).expect("repository boundary");
+    let manifest = temporary.path().join("ostrom.yaml");
+    let included = temporary.path().join("included-actor.yaml");
+    fs::write(
+        &manifest,
+        "manifest_version: 1\nincludes: [included-actor.yaml]\nactors: {builder: {}}\n",
+    )
+    .expect("write repository manifest");
+    fs::write(&included, "actor: gatekeeper\n").expect("write included actor");
+    let trusted_keys = support::sign_manifest(&manifest);
+
+    let output = ostrom()
+        .env("OSTROM_HOME", temporary.path().join("operator-home"))
+        .env("OSTROM_POLICY_TRUSTED_KEYS", trusted_keys)
+        .args(["validate"])
+        .arg(&manifest)
+        .output()
+        .expect("validate repository manifest");
+
+    assert!(
+        output.status.success(),
+        "lint must report without refusing: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 findings");
+    assert!(stderr.contains("repository actor `builder`"), "{stderr}");
+    assert!(
+        stderr.contains(manifest.to_str().expect("UTF-8 path")),
+        "{stderr}"
+    );
+    assert!(stderr.contains("repository actor `gatekeeper`"), "{stderr}");
+    assert!(
+        stderr.contains(included.to_str().expect("UTF-8 path")),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn operator_actor_declarations_have_no_portability_findings() {
+    let home = TempDir::new().expect("temporary operator home");
+    let manifest = home.path().join("ostrom.yaml");
+    fs::write(
+        &manifest,
+        "manifest_version: 1\nactors: {builder: {}, gatekeeper: {}}\n",
+    )
+    .expect("write operator manifest");
+    let trusted_keys = support::sign_manifest(&manifest);
+
+    let output = ostrom()
+        .env("OSTROM_HOME", home.path())
+        .env("OSTROM_POLICY_TRUSTED_KEYS", trusted_keys)
+        .args(["validate"])
+        .arg(&manifest)
+        .output()
+        .expect("validate operator manifest");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 diagnostics");
+    assert!(!stderr.contains("non-portable"), "{stderr}");
+    assert!(!stderr.contains("repository actor"), "{stderr}");
+}
+
+#[test]
 fn glob_includes_compose_identically_for_all_manifest_path_forms() {
     let (root, manifest) = fixture();
     let trusted_keys =

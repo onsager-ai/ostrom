@@ -9,42 +9,50 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use ostrom_core::{
-    ActorDecl, CheckDefinition, LoopDecl, OperationDecl, PolicyManifest, RuleDecl, SelectorFinding,
-    SelectorUniverse,
+    ActorDecl, CheckDefinition, LoopDecl, OperationDecl, PolicyManifest, RepositoryName, RuleDecl,
+    SelectorFinding, SelectorUniverse,
 };
-use ostrom_store::{OstromPaths, PolicyBundle, PolicyExplanation, PolicyOrigins, SweepFixture};
+use ostrom_store::{
+    ActorPortabilityFinding, OstromPaths, PolicyBundle, PolicyExplanation, PolicyOrigins,
+    SweepFixture,
+};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use serde_yaml::{Mapping, Value};
 use thiserror::Error;
 
-pub(crate) fn run_validate(path: &Path, normalized: bool) -> Result<(), PolicyLoadError> {
-    let loaded = load(path)?;
+pub(crate) fn run_validate(
+    paths: &OstromPaths,
+    path: &Path,
+    normalized: bool,
+) -> Result<(), PolicyLoadError> {
     let normalized_path = normalize_manifest_path(path);
-    if normalized_path
-        .file_name()
-        .is_some_and(|name| name == "ostrom.yaml" || name == "ostrom.yml")
-        && normalized_path.parent().and_then(repository_root).is_some()
+    let loaded = load_composed(&normalized_path)?;
+    validate_manifest(&loaded.manifest)?;
+    verify(&loaded.manifest, &normalized_path)?;
+    let operator_path = operator_manifest_path(paths)?;
+    let bundle = if operator_path
+        .as_deref()
+        .is_some_and(|operator| same_file(operator, &normalized_path))
     {
-        for actor in loaded.actors.keys() {
-            eprintln!(
-                "lint: repository actor `{actor}` declared in `{}` is non-portable across operator rosters",
-                normalized_path.display()
-            );
-        }
-    }
+        PolicyBundle::operator(loaded.manifest.clone(), loaded.origins)
+    } else {
+        PolicyBundle::repository_with_origins(loaded.manifest.clone(), loaded.origins)
+    };
+    report_actor_portability_findings(bundle.actor_portability_findings());
     // Resolve the ladder even when normalized output was not requested. This
     // catches a present environment value with the wrong declared type while
     // never placing its raw value in diagnostics.
     loaded
+        .manifest
         .resolve_inputs(ostrom_store::environment::declared_input)
         .map_err(|error| PolicyLoadError::Validation(error.to_string()))?;
 
     let verbs = command_verbs()
         .map(str::to_owned)
-        .chain(loaded.operations.keys().cloned());
-    let universe = SelectorUniverse::from_manifest(&loaded, verbs);
-    let findings = loaded.selector_findings(&universe);
+        .chain(loaded.manifest.operations.keys().cloned());
+    let universe = SelectorUniverse::from_manifest(&loaded.manifest, verbs);
+    let findings = loaded.manifest.selector_findings(&universe);
     for finding in &findings {
         if let SelectorFinding::Empty {
             rule,
@@ -71,6 +79,7 @@ pub(crate) fn run_validate(path: &Path, normalized: bool) -> Result<(), PolicyLo
         print!(
             "{}",
             loaded
+                .manifest
                 .to_yaml()
                 .map_err(|error| PolicyLoadError::Validation(error.to_string()))?
         );
@@ -78,6 +87,13 @@ pub(crate) fn run_validate(path: &Path, normalized: bool) -> Result<(), PolicyLo
         println!("valid: {}", path.display());
     }
     Ok(())
+}
+
+fn same_file(left: &Path, right: &Path) -> bool {
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
 }
 
 fn validate_adjacent_legacy_policy(path: &Path) -> Result<(), PolicyLoadError> {
@@ -112,6 +128,54 @@ pub(crate) fn run_sign(
     let signature = ostrom_store::sign_policy_manifest(&manifest, &path, key_id, private_key)?;
     println!("signed: {}", signature.display());
     Ok(())
+}
+
+pub(crate) fn run_generate(
+    paths: &OstromPaths,
+    repository: &str,
+    output: Option<&Path>,
+) -> Result<(), PolicyLoadError> {
+    let repository = RepositoryName::new(repository)
+        .map_err(|_| PolicyLoadError::InvalidRepository(repository.to_owned()))?;
+    let operator_path = adopting_manifest_path(paths)?;
+    let operator = load(&operator_path)?;
+    let generated = project_repository_manifest(operator, repository.as_str());
+    let yaml = generated
+        .to_yaml()
+        .map_err(|error| PolicyLoadError::Validation(error.to_string()))?;
+    if let Some(path) = output.filter(|path| *path != Path::new("-")) {
+        fs::write(path, yaml).map_err(|source| PolicyLoadError::Write {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    } else {
+        print!("{yaml}");
+    }
+    Ok(())
+}
+
+fn project_repository_manifest(mut manifest: PolicyManifest, repository: &str) -> PolicyManifest {
+    manifest.includes.clear();
+    manifest.actors.clear();
+    project_rules(&mut manifest.grants, repository);
+    project_rules(&mut manifest.denies, repository);
+    manifest
+        .loops
+        .retain(|_, declaration| declaration.target == repository);
+    manifest
+}
+
+fn project_rules(rules: &mut BTreeMap<String, RuleDecl>, repository: &str) {
+    rules.retain(|_, declaration| {
+        declaration.repositories.is_empty()
+            || declaration
+                .repositories
+                .iter()
+                .any(|candidate| candidate == repository)
+    });
+    for declaration in rules.values_mut() {
+        declaration.repositories = Default::default();
+    }
 }
 
 pub(crate) fn load_bundle(
@@ -154,7 +218,6 @@ fn build_bundle(
     if let Some((_, operator)) = &operator {
         validate_scoped_manifest(&operator.manifest, Some(&repository.manifest))?;
     }
-    report_repository_actor_lints(&repository);
     let manifest = compose_scopes(
         repository.manifest.clone(),
         operator.as_ref().map(|(_, loaded)| &loaded.manifest),
@@ -428,16 +491,12 @@ fn validate_scoped_manifest(
     validate_manifest(&validation)
 }
 
-fn report_repository_actor_lints(repository: &LoadedManifest) {
-    for actor in repository.manifest.actors.keys() {
-        let source = repository
-            .origins
-            .actors
-            .get(actor)
-            .unwrap_or(&repository.origins.root);
+fn report_actor_portability_findings(findings: &[ActorPortabilityFinding]) {
+    for finding in findings {
         eprintln!(
-            "lint: repository actor `{actor}` declared in `{}` is non-portable across operator rosters",
-            source.display()
+            "lint: repository actor `{}` declared in `{}` is non-portable across operator rosters",
+            finding.actor,
+            finding.source.display()
         );
     }
 }
@@ -680,6 +739,17 @@ fn render_explanation(
                 declaration.kind,
                 declaration.id,
                 declaration.source.display()
+            ));
+        }
+    }
+    if !explanation.actor_portability_findings.is_empty() {
+        output.push_str("\nACTOR PORTABILITY\n");
+        for finding in &explanation.actor_portability_findings {
+            output.push_str(&format!(
+                "  {:10} actor     {:24} NON-PORTABLE  source: {}\n",
+                finding.layer.name(),
+                finding.actor,
+                finding.source.display()
             ));
         }
     }
@@ -1271,6 +1341,8 @@ pub(crate) enum PolicyLoadError {
     },
     #[error("pull request must have the shape owner/repository#N")]
     InvalidTarget,
+    #[error("repository must have the shape owner/name: {0}")]
+    InvalidRepository(String),
     #[error("pull request `{0}` was not present in the fixture")]
     PullRequestNotFound(String),
     #[error("could not run gh: {0}")]
@@ -1291,6 +1363,12 @@ pub(crate) enum PolicyLoadError {
     },
     #[error("could not read `{}`: {source}", path.display())]
     Io {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("could not write generated policy manifest `{}`: {source}", path.display())]
+    Write {
         path: PathBuf,
         #[source]
         source: io::Error,
@@ -1338,12 +1416,16 @@ pub(crate) enum PolicyLoadError {
 
 #[cfg(test)]
 mod tests {
-    use std::{env, fs, process::Command};
+    use std::{env, fs, path::Path, process::Command};
 
+    use ostrom_core::{PolicyCandidate, PolicyManifest};
     use tempfile::tempdir;
 
-    use super::default_manifest_path;
-    use ostrom_store::OstromPaths;
+    use super::{
+        compose_scopes, default_manifest_path, project_repository_manifest,
+        validate_scoped_manifest,
+    };
+    use ostrom_store::{OstromPaths, PolicyBundle, PolicyOrigins};
 
     const LEGACY_NOTICE_CHILD: &str = "OSTROM_TEST_LEGACY_NOTICE_CHILD";
 
@@ -1388,5 +1470,111 @@ mod tests {
         let stderr = String::from_utf8(output.stderr).expect("UTF-8 warning");
         assert_eq!(stderr.matches("deprecated").count(), 1, "{stderr}");
         assert!(stderr.contains("ostrom.yaml"), "{stderr}");
+    }
+
+    #[test]
+    fn generated_repository_policy_round_trips_is_portable_and_preserves_verdicts() {
+        let operator = PolicyManifest::from_yaml(
+            r#"
+manifest_version: 1
+actors: {builder: {}}
+checks:
+  placeholder-green:
+    uses: gh/check-run
+    with: {name: placeholder-ci}
+operations: {work: {steps: []}}
+grants:
+  target-grant:
+    actors: builder
+    operations: work
+    repositories: placeholder-org/target
+    where: label:delegated
+  global-grant:
+    actors: builder
+    operations: work
+    where: type:docs
+  other-grant:
+    actors: builder
+    operations: work
+    repositories: placeholder-org/other
+denies:
+  target-deny:
+    actors: builder
+    operations: work
+    repositories: placeholder-org/target
+    where: path:protected/**
+loops:
+  target-loop: {actor: builder, operation: work, target: placeholder-org/target, every: hourly}
+  other-loop: {actor: builder, operation: work, target: placeholder-org/other, every: hourly}
+"#,
+        )
+        .expect("operator policy");
+        let generated = project_repository_manifest(operator.clone(), "placeholder-org/target");
+        let yaml = generated.to_yaml().expect("generated YAML");
+        let round_tripped = PolicyManifest::parse_yaml(&yaml).expect("generated manifest loads");
+
+        assert!(round_tripped.actors.is_empty());
+        assert!(!yaml.lines().any(|line| line == "actors:"), "{yaml}");
+        assert!(round_tripped.grants.contains_key("target-grant"));
+        assert!(round_tripped.grants.contains_key("global-grant"));
+        assert!(!round_tripped.grants.contains_key("other-grant"));
+        assert!(round_tripped.denies.contains_key("target-deny"));
+        assert!(
+            round_tripped
+                .grants
+                .values()
+                .chain(round_tripped.denies.values())
+                .all(|rule| rule.repositories.is_empty())
+        );
+        assert!(round_tripped.checks.contains_key("placeholder-green"));
+        assert!(round_tripped.operations.contains_key("work"));
+        assert!(round_tripped.loops.contains_key("target-loop"));
+        assert!(!round_tripped.loops.contains_key("other-loop"));
+        validate_scoped_manifest(&round_tripped, Some(&operator))
+            .expect("generated repository layer loads with operator policy");
+
+        let repository_origins =
+            PolicyOrigins::from_root(&round_tripped, Path::new("generated/ostrom.yaml"));
+        let generated_only = PolicyBundle::repository_with_origins(
+            round_tripped.clone(),
+            repository_origins.clone(),
+        );
+        assert!(generated_only.actor_portability_findings().is_empty());
+
+        let operator_origins =
+            PolicyOrigins::from_root(&operator, Path::new("operator/ostrom.yaml"));
+        let operator_bundle = PolicyBundle::operator(operator.clone(), operator_origins.clone());
+        let resolved = compose_scopes(round_tripped.clone(), Some(&operator));
+        let layered_bundle = PolicyBundle::scoped(
+            resolved,
+            round_tripped,
+            repository_origins,
+            Some((operator, operator_origins)),
+        );
+        let cases = [
+            PolicyCandidate {
+                repository: "placeholder-org/target".to_owned(),
+                labels: vec!["delegated".to_owned()],
+                ..PolicyCandidate::default()
+            },
+            PolicyCandidate {
+                repository: "placeholder-org/target".to_owned(),
+                paths: vec!["protected/authority.txt".to_owned()],
+                labels: vec!["delegated".to_owned()],
+                ..PolicyCandidate::default()
+            },
+        ];
+        assert!(operator_bundle.decide("builder", "work", &cases[0]).granted);
+        assert!(!operator_bundle.decide("builder", "work", &cases[1]).granted);
+        for candidate in &cases {
+            assert_eq!(
+                generated_only.decide("builder", "work", candidate).granted,
+                operator_bundle.decide("builder", "work", candidate).granted
+            );
+            assert_eq!(
+                layered_bundle.decide("builder", "work", candidate).granted,
+                operator_bundle.decide("builder", "work", candidate).granted
+            );
+        }
     }
 }
