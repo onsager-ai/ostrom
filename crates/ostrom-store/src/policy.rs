@@ -110,17 +110,31 @@ pub struct InertDeclaration {
     pub source: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActorPortabilityFinding {
+    pub actor: String,
+    pub layer: PolicyLayer,
+    pub source: PathBuf,
+}
+
 #[derive(Debug, Clone)]
 pub struct PolicyBundle {
     pub manifest: PolicyManifest,
     documents: Vec<PolicyDocument>,
     inert_declarations: Vec<InertDeclaration>,
+    actor_portability_findings: Vec<ActorPortabilityFinding>,
 }
 
 impl PolicyBundle {
     #[must_use]
     pub fn repository(manifest: PolicyManifest) -> Self {
         let origins = PolicyOrigins::from_root(&manifest, Path::new("<repository>"));
+        Self::repository_with_origins(manifest, origins)
+    }
+
+    #[must_use]
+    pub fn repository_with_origins(manifest: PolicyManifest, origins: PolicyOrigins) -> Self {
+        let actor_portability_findings = actor_portability_findings(&manifest, &origins);
         Self {
             manifest: manifest.clone(),
             documents: vec![PolicyDocument {
@@ -129,6 +143,7 @@ impl PolicyBundle {
                 origins,
             }],
             inert_declarations: Vec::new(),
+            actor_portability_findings,
         }
     }
 
@@ -172,6 +187,8 @@ impl PolicyBundle {
                 declaration.source.clone(),
             )
         });
+        let actor_portability_findings =
+            actor_portability_findings(&repository, &repository_origins);
 
         let mut documents = vec![PolicyDocument {
             layer: PolicyLayer::Repository,
@@ -189,6 +206,7 @@ impl PolicyBundle {
             manifest,
             documents,
             inert_declarations,
+            actor_portability_findings,
         }
     }
 
@@ -202,7 +220,13 @@ impl PolicyBundle {
                 origins,
             }],
             inert_declarations: Vec::new(),
+            actor_portability_findings: Vec::new(),
         }
+    }
+
+    #[must_use]
+    pub fn actor_portability_findings(&self) -> &[ActorPortabilityFinding] {
+        &self.actor_portability_findings
     }
 
     #[must_use]
@@ -264,6 +288,7 @@ pub struct PolicyExplanation {
     pub rules: Vec<RuleExplanation>,
     pub consulted_scopes: Vec<ConsultedScope>,
     pub inert_declarations: Vec<InertDeclaration>,
+    pub actor_portability_findings: Vec<ActorPortabilityFinding>,
     pub matching_grants: Vec<String>,
     pub effective_grants: Vec<String>,
     pub matching_denies: Vec<String>,
@@ -429,6 +454,7 @@ impl PolicyBundle {
             rules,
             consulted_scopes,
             inert_declarations: self.inert_declarations.clone(),
+            actor_portability_findings: self.actor_portability_findings.clone(),
             matching_grants,
             effective_grants,
             matching_denies,
@@ -440,6 +466,25 @@ impl PolicyBundle {
             stalls_source,
         }
     }
+}
+
+fn actor_portability_findings(
+    manifest: &PolicyManifest,
+    origins: &PolicyOrigins,
+) -> Vec<ActorPortabilityFinding> {
+    manifest
+        .actors
+        .keys()
+        .map(|actor| ActorPortabilityFinding {
+            actor: actor.clone(),
+            layer: PolicyLayer::Repository,
+            source: origins
+                .actors
+                .get(actor)
+                .cloned()
+                .unwrap_or_else(|| origins.root.clone()),
+        })
+        .collect()
 }
 
 fn rule_ids(
@@ -681,8 +726,9 @@ fn commit_type(title: &str) -> Option<String> {
 mod tests {
     use ostrom_core::{InconclusivePolicy, PolicyManifest};
     use serde_json::json;
+    use std::path::{Path, PathBuf};
 
-    use super::PolicyBundle;
+    use super::{PolicyBundle, PolicyOrigins};
 
     fn bundle() -> PolicyBundle {
         PolicyBundle::repository(
@@ -820,5 +866,33 @@ denies:
             .expect("requirement");
         assert_eq!(requirement.status, "INCONCLUSIVE");
         assert!(requirement.allows);
+    }
+
+    #[test]
+    fn repository_actors_are_portability_findings_with_their_own_origins() {
+        let manifest = PolicyManifest::from_yaml(
+            "manifest_version: 1\nactors: {builder: {}, gatekeeper: {}}\n",
+        )
+        .expect("manifest");
+        let mut origins = PolicyOrigins::from_root(&manifest, Path::new("ostrom.yaml"));
+        origins
+            .actors
+            .insert("gatekeeper".to_owned(), PathBuf::from("policy/actors.yaml"));
+
+        let bundle = PolicyBundle::repository_with_origins(manifest.clone(), origins.clone());
+        assert_eq!(bundle.actor_portability_findings().len(), 2);
+        assert_eq!(bundle.actor_portability_findings()[0].actor, "builder");
+        assert_eq!(
+            bundle.actor_portability_findings()[0].source,
+            PathBuf::from("ostrom.yaml")
+        );
+        assert_eq!(bundle.actor_portability_findings()[1].actor, "gatekeeper");
+        assert_eq!(
+            bundle.actor_portability_findings()[1].source,
+            PathBuf::from("policy/actors.yaml")
+        );
+
+        let operator = PolicyBundle::operator(manifest, origins);
+        assert!(operator.actor_portability_findings().is_empty());
     }
 }

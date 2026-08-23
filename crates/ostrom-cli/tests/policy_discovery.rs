@@ -80,7 +80,7 @@ fn discovers_ostrom_yaml_from_a_nested_working_directory() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 explanation");
-    let stderr = String::from_utf8(output.stderr).expect("UTF-8 lint");
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 diagnostics");
     assert!(stdout.contains("repository-grant"), "{stdout}");
     assert!(
         stdout.contains(
@@ -94,7 +94,51 @@ fn discovers_ostrom_yaml_from_a_nested_working_directory() {
         "{stdout}"
     );
     assert!(stdout.contains("verdict      MERGE"), "{stdout}");
-    assert!(stderr.contains("non-portable"), "{stderr}");
+    assert!(stdout.contains("ACTOR PORTABILITY"), "{stdout}");
+    assert!(stdout.contains("builder"), "{stdout}");
+    assert!(stdout.contains("NON-PORTABLE"), "{stdout}");
+    assert!(
+        stdout.contains(
+            fixture
+                .repository
+                .path()
+                .join("ostrom.yaml")
+                .to_str()
+                .expect("UTF-8 path")
+        ),
+        "{stdout}"
+    );
+    assert!(!stderr.contains("non-portable"), "{stderr}");
+}
+
+#[test]
+fn explain_attributes_actor_portability_to_the_included_source() {
+    let fixture = RepositoryFixture::new("");
+    let included = fixture.repository.path().join("included-actor.yaml");
+    fs::write(&included, "actor: gatekeeper\n").expect("write included actor");
+    fs::write(
+        fixture.repository.path().join("ostrom.yaml"),
+        policy("includes: [included-actor.yaml]\n"),
+    )
+    .expect("write including manifest");
+    support::sign_manifest(&fixture.repository.path().join("ostrom.yaml"));
+
+    let output = fixture.explain_from(fixture.repository.path(), &[]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 explanation");
+    let portability = stdout
+        .split_once("ACTOR PORTABILITY")
+        .map(|(_, section)| section)
+        .expect("actor portability section");
+    assert!(portability.contains("gatekeeper"), "{portability}");
+    assert!(
+        portability.contains(included.to_str().expect("UTF-8 path")),
+        "{portability}"
+    );
 }
 
 #[test]

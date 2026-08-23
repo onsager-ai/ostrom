@@ -74,6 +74,14 @@ enum Command {
         normalized: bool,
         manifest: PathBuf,
     },
+    /// Generate portable repository policy from the adopting operator manifest.
+    Generate {
+        /// Repository whose governing rules should be projected.
+        repository: String,
+        /// Output path; omit or use `-` to write the manifest to stdout.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
     /// List the operations declared by the active policy manifest.
     Operations {
         /// Restrict the list to operations granted somewhere to this actor.
@@ -514,7 +522,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Validate {
             normalized,
             manifest,
-        } => policy_manifest::run_validate(&manifest, normalized)?,
+        } => policy_manifest::run_validate(&paths, &manifest, normalized)?,
+        Command::Generate { repository, output } => {
+            policy_manifest::run_generate(&paths, &repository, output.as_deref())?
+        }
         Command::Operations {
             actor,
             settings,
