@@ -1210,10 +1210,6 @@ pub enum InputResolutionError {
 pub enum SelectorPrefix {
     Label,
     Path,
-    Ref,
-    Scope,
-    Substance,
-    Title,
     Type,
     Actor,
     Verb,
@@ -1225,10 +1221,6 @@ impl SelectorPrefix {
         match self {
             Self::Label => "label",
             Self::Path => "path",
-            Self::Ref => "ref",
-            Self::Scope => "scope",
-            Self::Substance => "substance",
-            Self::Title => "title",
             Self::Type => "type",
             Self::Actor => "actor",
             Self::Verb => "verb",
@@ -1251,10 +1243,6 @@ impl PolicySelector {
         let prefix = match prefix {
             "label" => SelectorPrefix::Label,
             "path" => SelectorPrefix::Path,
-            "ref" => SelectorPrefix::Ref,
-            "scope" => SelectorPrefix::Scope,
-            "substance" => SelectorPrefix::Substance,
-            "title" => SelectorPrefix::Title,
             "type" => SelectorPrefix::Type,
             "actor" => SelectorPrefix::Actor,
             "verb" => SelectorPrefix::Verb,
@@ -1299,22 +1287,6 @@ impl PolicySelector {
                 .paths
                 .iter()
                 .any(|path| glob_matches(path, &self.pattern, true)),
-            SelectorPrefix::Ref => candidate
-                .refs
-                .iter()
-                .any(|reference| glob_matches(reference, &self.pattern, false)),
-            SelectorPrefix::Scope => candidate
-                .scopes
-                .iter()
-                .any(|scope| glob_matches(scope, &self.pattern, false)),
-            SelectorPrefix::Substance => candidate
-                .substances
-                .iter()
-                .any(|substance| glob_matches(substance, &self.pattern, false)),
-            SelectorPrefix::Title => candidate
-                .title
-                .as_deref()
-                .is_some_and(|title| glob_matches(title, &self.pattern, false)),
             SelectorPrefix::Type => candidate
                 .commit_type
                 .as_deref()
@@ -1372,10 +1344,6 @@ pub struct PolicyCandidate {
     pub repository: String,
     pub labels: Vec<String>,
     pub paths: Vec<String>,
-    pub refs: Vec<String>,
-    pub scopes: Vec<String>,
-    pub substances: Vec<String>,
-    pub title: Option<String>,
     pub commit_type: Option<String>,
     pub actor: Option<String>,
     pub verb: Option<String>,
@@ -1466,10 +1434,6 @@ impl SelectorUniverse {
                     ))
                 }
             }
-            SelectorPrefix::Ref
-            | SelectorPrefix::Scope
-            | SelectorPrefix::Substance
-            | SelectorPrefix::Title => Ok(None),
             SelectorPrefix::Actor => resolve_named(&self.actors, selector)
                 .map(|()| None)
                 .map_err(|()| SelectorResolutionError::UnknownActor(selector.pattern.clone())),
@@ -1562,8 +1526,6 @@ impl SelectorFinding {
     }
 }
 
-/// Match Ostrom's case-insensitive single-star glob vocabulary.
-#[must_use]
 pub fn glob_matches(value: &str, pattern: &str, path: bool) -> bool {
     let value = value.to_lowercase().chars().collect::<Vec<_>>();
     let pattern = pattern.to_lowercase().chars().collect::<Vec<_>>();
@@ -1934,38 +1896,11 @@ denies:
 
     #[test]
     fn selector_prefix_set_is_closed_and_names_unknown_prefix() {
-        for prefix in ["check", "anything"] {
+        for prefix in ["title", "scope", "check", "ref", "anything"] {
             let error =
                 PolicySelector::new(format!("{prefix}:value")).expect_err("prefix must fail");
             assert_eq!(error, PolicySelectorError::UnknownPrefix(prefix.to_owned()));
             assert!(error.to_string().contains(prefix));
-        }
-    }
-
-    #[test]
-    fn repository_rules_retain_every_legacy_subject_selector() {
-        let candidate = PolicyCandidate {
-            repository: "placeholder-org/alpha".to_owned(),
-            refs: vec!["#42".to_owned()],
-            scopes: vec!["tooling".to_owned()],
-            substances: vec!["fly-spend".to_owned()],
-            title: Some("feat(tooling): public release".to_owned()),
-            commit_type: Some("feat".to_owned()),
-            ..PolicyCandidate::default()
-        };
-        for selector in [
-            "ref:#42",
-            "scope:tool*",
-            "substance:fly-spend",
-            "title:*release",
-            "type:feat",
-        ] {
-            assert!(
-                PolicySelector::new(selector)
-                    .expect("legacy selector remains representable")
-                    .matches(&candidate),
-                "{selector}"
-            );
         }
     }
 

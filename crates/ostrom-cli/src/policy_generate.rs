@@ -755,18 +755,7 @@ fn policy_candidate(repository: &str, item: &Value) -> PolicyCandidate {
         repository: repository.to_owned(),
         labels: strings(item.get("labels")),
         paths: strings(item.get("files")),
-        refs: item
-            .get("refs")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_u64)
-            .map(|number| format!("#{number}"))
-            .collect(),
-        scopes: title.as_deref().map_or_else(Vec::new, conventional_scopes),
-        substances: strings(item.get("substances")),
         commit_type: title.as_deref().and_then(conventional_type),
-        title,
         actor: None,
         verb: None,
     }
@@ -788,23 +777,6 @@ fn conventional_type(title: &str) -> Option<String> {
         .map(|(prefix, _)| prefix.split_once('(').map_or(prefix, |(kind, _)| kind))
         .filter(|kind| !kind.is_empty())
         .map(str::to_owned)
-}
-
-fn conventional_scopes(title: &str) -> Vec<String> {
-    let Some(prefix) = title.split_once(':').map(|(prefix, _)| prefix) else {
-        return Vec::new();
-    };
-    let Some((_, scopes)) = prefix.split_once('(') else {
-        return Vec::new();
-    };
-    scopes
-        .strip_suffix(')')
-        .unwrap_or_default()
-        .split(',')
-        .map(str::trim)
-        .filter(|scope| !scope.is_empty())
-        .map(str::to_owned)
-        .collect()
 }
 
 fn central_granted(

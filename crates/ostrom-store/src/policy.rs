@@ -490,13 +490,7 @@ fn explain_rule(
         .map(|selector| SelectorProjection {
             selector: selector.to_string(),
             projection: match selector.prefix() {
-                SelectorPrefix::Label
-                | SelectorPrefix::Path
-                | SelectorPrefix::Ref
-                | SelectorPrefix::Scope
-                | SelectorPrefix::Substance
-                | SelectorPrefix::Title
-                | SelectorPrefix::Type => "subject",
+                SelectorPrefix::Label | SelectorPrefix::Path | SelectorPrefix::Type => "subject",
                 SelectorPrefix::Actor | SelectorPrefix::Verb => "actor",
             },
             matched: selector.matches(candidate),
@@ -677,31 +671,10 @@ fn pull_request_candidate(
         repository: repository.to_owned(),
         labels: names(pull_request.get("labels"), "name"),
         paths: names(pull_request.get("files"), "path"),
-        refs,
-        scopes: title.as_deref().map_or_else(Vec::new, conventional_scopes),
-        substances: names(pull_request.get("substances"), "name"),
         commit_type: title.as_deref().and_then(commit_type),
-        title,
         actor: Some(actor.to_owned()),
         verb: Some(operation.to_owned()),
     }
-}
-
-fn conventional_scopes(title: &str) -> Vec<String> {
-    let Some(prefix) = title.split_once(':').map(|(prefix, _)| prefix) else {
-        return Vec::new();
-    };
-    let Some((_, scopes)) = prefix.split_once('(') else {
-        return Vec::new();
-    };
-    scopes
-        .strip_suffix(')')
-        .unwrap_or_default()
-        .split(',')
-        .map(str::trim)
-        .filter(|scope| !scope.is_empty())
-        .map(str::to_owned)
-        .collect()
 }
 
 fn names(value: Option<&Value>, key: &str) -> Vec<String> {

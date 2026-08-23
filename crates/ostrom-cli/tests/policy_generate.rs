@@ -33,7 +33,7 @@ projects:
     paused: true
     # Releases are reviewed because publication is irreversible.
     bounce:
-      - title:*release*
+      - label:risk:release
       - label:area:content
       - label:area:copy
 "#,
