@@ -158,8 +158,14 @@ pub(crate) fn load_optional_bundle(
     paths: &OstromPaths,
     cwd: &Path,
 ) -> Result<Option<PolicyBundle>, PolicyLoadError> {
-    let path = default_manifest_path(paths, cwd)
-        .ok_or_else(|| PolicyLoadError::UngovernedRepository(repository_name(cwd)))?;
+    // Absence is not an error here. Until the cutover in #364 the retired
+    // surfaces are still the running system, and `sweep` and the check planner
+    // must keep working in a repository that has no manifest yet. Discovery is
+    // still strict — it never falls through to the operator's own policy — so
+    // `None` means ungoverned, not "somebody else's rules".
+    let Some(path) = default_manifest_path(paths, cwd) else {
+        return Ok(None);
+    };
     load_bundle(paths, &path).map(Some)
 }
 
