@@ -109,6 +109,7 @@ pub fn run_gate(options: &GateOptions) -> Result<GateOutput, GateError> {
     } else {
         unavailable_conditions(&config_error)
     };
+    apply_shipped_manifest_bounce(&mut conditions, &acquisition);
 
     let mut stderr = String::new();
     apply_exceptions(
@@ -501,7 +502,20 @@ pub(crate) fn load_gate_config(paths: &OstromPaths, cwd: &Path) -> Result<GateCo
         Ok(value) => value,
         Err(error) => return Err(error.to_string()),
     };
-    GateConfig::from_yaml(&serialized).map_err(|error| truncate_error(&error.to_string()))
+    let mut config =
+        GateConfig::from_yaml(&serialized).map_err(|error| truncate_error(&error.to_string()))?;
+    for path in ["path:ostrom.yaml", "path:ostrom.yml"] {
+        if !config
+            .bounce_all
+            .iter()
+            .any(|selector| selector.as_str() == path)
+        {
+            config
+                .bounce_all
+                .push(GateSelector::new(path).map_err(|error| truncate_error(&error.to_string()))?);
+        }
+    }
+    Ok(config)
 }
 
 fn load_gate_config_for_repo(
@@ -569,6 +583,37 @@ fn unavailable_conditions(reason: &str) -> Vec<Value> {
         condition("bounce_selectors", "inconclusive", &[], plain()),
         condition("reserved_refs", "inconclusive", &[], plain()),
     ]
+}
+
+fn apply_shipped_manifest_bounce(conditions: &mut [Value], acquisition: &Acquisition) {
+    if !acquisition.diff_ready {
+        return;
+    }
+    let matches = acquisition
+        .paths
+        .iter()
+        .filter(|path| matches!(path.as_str(), "ostrom.yaml" | "ostrom.yml"))
+        .map(|path| {
+            json!({
+                "selector": format!("path:{path}"),
+                "tier": "content-derived",
+            })
+        })
+        .collect::<Vec<_>>();
+    if matches.is_empty() {
+        return;
+    }
+    if let Some(slot) = conditions
+        .iter_mut()
+        .find(|condition| condition["name"] == "bounce_selectors")
+    {
+        *slot = condition(
+            "bounce_selectors",
+            "fail",
+            &["content-derived"],
+            json!({"matches": matches, "unobservable": []}),
+        );
+    }
 }
 
 fn evaluate_conditions(

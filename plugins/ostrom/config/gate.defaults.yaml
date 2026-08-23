@@ -8,5 +8,5 @@
 # defaults only; the principal supplies every repository-specific condition.
 
 provider: file
-bounce_all: []
+bounce_all: [path:ostrom.yaml, path:ostrom.yml]
 projects: []

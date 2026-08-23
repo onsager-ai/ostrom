@@ -60,7 +60,7 @@ if [ "$1 $2" = "pr view" ]; then
 fi
 if [ "$1 $2" = "pr diff" ]; then
   if printf '%s\n' "$*" | grep -q -- '--name-only'; then
-    case "$mode" in fly-*|diff-error) printf '%s\n' deploy/fly.toml ;; *) printf '%s\n' src/placeholder.rs ;; esac
+    case "$mode" in fly-*|diff-error) printf '%s\n' deploy/fly.toml ;; policy-path) printf '%s\n' ostrom.yaml ;; *) printf '%s\n' src/placeholder.rs ;; esac
     exit 0
   fi
   case "$mode" in
@@ -144,6 +144,17 @@ fn unknown_missing_and_malformed_mergeability_are_inconclusive() {
             "{mode}: {text}"
         );
     }
+}
+
+#[test]
+fn shipped_defaults_bounce_the_repository_manifest_even_when_user_config_omits_it() {
+    let fixture = Fixture::new();
+    fs::remove_file(fixture.home.join("gate.yaml")).expect("remove user gate config");
+    let output = fixture.run("policy-path", 6, "6666666666666666");
+    assert_eq!(output.status.code(), Some(1));
+    let text = output_text(&output);
+    assert!(text.contains("condition bounce_selectors: fail"), "{text}");
+    assert!(text.contains("path:ostrom.yaml"), "{text}");
 }
 
 #[test]
