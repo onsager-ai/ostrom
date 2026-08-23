@@ -73,6 +73,21 @@ impl OstromPaths {
     }
 
     #[must_use]
+    pub fn loop_runs_dir(&self) -> PathBuf {
+        self.state.join("loop-runs")
+    }
+
+    #[must_use]
+    pub fn loop_run_state_file(&self, name: &str) -> PathBuf {
+        self.loop_runs_dir().join(format!("{name}.json"))
+    }
+
+    #[must_use]
+    pub fn loop_run_log_file(&self, name: &str) -> PathBuf {
+        self.loop_runs_dir().join(format!("{name}.log"))
+    }
+
+    #[must_use]
     pub fn selector_events_file(&self) -> PathBuf {
         self.state.join("selector-events.jsonl")
     }

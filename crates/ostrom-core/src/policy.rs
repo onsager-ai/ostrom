@@ -589,6 +589,35 @@ impl LoopCadence {
             )],
         }
     }
+
+    /// Return the stable identity of the cadence slot containing `now`.
+    ///
+    /// The caller supplies the timezone because authored loop times are civil
+    /// times. The reconciler passes the host's local time, matching the
+    /// existing systemd `OnCalendar` behavior, while tests can inject any
+    /// explicit timezone without consulting the wall clock.
+    #[must_use]
+    pub fn activation_slot<Tz>(&self, now: &chrono::DateTime<Tz>) -> Option<String>
+    where
+        Tz: chrono::TimeZone,
+        Tz::Offset: std::fmt::Display,
+    {
+        use chrono::Timelike as _;
+
+        let hour = u8::try_from(now.hour()).expect("chrono hours fit in u8");
+        let minute = u8::try_from(now.minute()).expect("chrono minutes fit in u8");
+        let due = match self {
+            Self::Hourly => minute == 0,
+            Self::Minute(expected) => minute == *expected,
+            Self::Times(times) => times
+                .iter()
+                .any(|time| time.hour == hour && time.minute == minute),
+            Self::Range { start, end } => {
+                minute == start.minute && (start.hour..=end.hour).contains(&hour)
+            }
+        };
+        due.then(|| now.format("%Y-%m-%dT%H:%M%:z").to_string())
+    }
 }
 
 impl Serialize for LoopCadence {
@@ -1742,6 +1771,25 @@ denies:
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn loop_cadence_identifies_only_the_current_civil_time_slot() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-24T08:15:00+08:00")
+            .expect("fixed civil time");
+        let due = PolicyManifest::from_yaml(
+            "manifest_version: 1\nactors: {builder: {}}\noperations: {work: {steps: []}}\ngrants:\n  work: {actors: builder, operations: work, repositories: placeholder-org/repo}\nloops:\n  due: {actor: builder, operation: work, target: placeholder-org/repo, every: '08:15..21:15'}\n",
+        )
+        .expect("loop manifest")
+        .resolve_loop("due")
+        .expect("resolved loop");
+
+        assert_eq!(
+            due.every.activation_slot(&now).as_deref(),
+            Some("2026-08-24T08:15+08:00")
+        );
+        let not_due = now + chrono::Duration::minutes(1);
+        assert_eq!(due.every.activation_slot(&not_due), None);
     }
 
     #[test]

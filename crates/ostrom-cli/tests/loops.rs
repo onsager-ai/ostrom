@@ -166,6 +166,22 @@ loops:
     )
     .expect("write policy fixture");
     let trusted_keys = support::sign_manifest(&manifest);
+    let operator = root.path().join("ostrom.yaml");
+    fs::copy(&manifest, &operator).expect("install operator policy fixture");
+    support::sign_manifest(&operator);
+    let composed = ostrom()
+        .arg("compose")
+        .arg(&manifest)
+        .env("OSTROM_HOME", root.path())
+        .env("OSTROM_POLICY_MANIFEST", &operator)
+        .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
+        .output()
+        .expect("compose loop policy");
+    assert!(
+        composed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&composed.stderr)
+    );
 
     let output = loop_run(root.path(), &manifest, &trusted_keys, &marker)
         .output()

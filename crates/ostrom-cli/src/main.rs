@@ -40,6 +40,7 @@ use ostrom_store::{
     run_selection, run_sweep, run_sweep_parity, validate_lease_name, validate_work_order_file,
 };
 
+mod loop_supervisor;
 mod operation_dispatch;
 mod policy_manifest;
 mod policy_version;
@@ -161,6 +162,12 @@ enum Command {
     },
     /// Atomically restore the previous composed policy version.
     Rollback,
+    /// Reconcile due loop processes with the signed current policy version.
+    Up,
+    /// Report declared loops and their persisted runtime state.
+    Ps,
+    /// Print the persisted log for one declared loop.
+    Logs { name: String },
     /// Merge base branches into eligible stale builder pull requests.
     RepairPrs {
         #[arg(allow_hyphen_values = true)]
@@ -188,6 +195,12 @@ enum Command {
         work_order_file: PathBuf,
         unit_name: String,
         supervisor_pid: u32,
+    },
+    #[command(name = "__loop-worker", hide = true)]
+    LoopWorker {
+        name: String,
+        version: String,
+        schedule_slot: String,
     },
     /// Turn a durable work order into a running implementer.
     Dispatch {
@@ -595,6 +608,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             LoopCommand::Run { name } => run_loop_command(&paths, &name)?,
         },
         Command::Loops { command } => run_loops_command(&paths, command)?,
+        Command::Up => {
+            let executable = env::current_exe()?;
+            let outcome = loop_supervisor::reconcile(&paths, &clock, &executable)?;
+            println!(
+                "reconciled started={} stopped={} unchanged={} not-due={}",
+                outcome.started, outcome.stopped, outcome.unchanged, outcome.not_due
+            );
+        }
+        Command::Ps => {
+            io::stdout().write_all(loop_supervisor::render_ps(&paths, &clock)?.as_bytes())?
+        }
+        Command::Logs { name } => {
+            io::stdout().write_all(&loop_supervisor::read_logs(&paths, &name)?)?;
+        }
+        Command::LoopWorker {
+            name,
+            version,
+            schedule_slot,
+        } => run_loop_worker(&paths, &clock, &name, &version, &schedule_slot)?,
         Command::Credential {
             role,
             repository,
@@ -1199,9 +1231,40 @@ fn run_loops_command(
 }
 
 fn run_loop_command(paths: &OstromPaths, name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let manifest = policy_manifest::load(&policy_manifest::adopting_manifest_path(paths)?)?;
+    let manifest = policy_version::load_current(paths)?.manifest;
     let resolved = manifest.resolve_loop(name)?;
     assert_loop_environment(&resolved.actor, resolved.ceilings)?;
+    dispatch_resolved_loop(paths, &manifest, resolved)
+}
+
+fn run_loop_worker(
+    paths: &OstromPaths,
+    clock: &Clock,
+    name: &str,
+    version: &str,
+    schedule_slot: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let manifest = match loop_supervisor::worker_started(paths, name, version, schedule_slot, clock)
+    {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            let reason = error.to_string();
+            let _ = loop_supervisor::worker_finished(paths, name, false, Some(reason), clock);
+            return Err(error.into());
+        }
+    };
+    let resolved = manifest.resolve_loop(name)?;
+    let result = dispatch_resolved_loop(paths, &manifest, resolved);
+    let reason = result.as_ref().err().map(ToString::to_string);
+    loop_supervisor::worker_finished(paths, name, result.is_ok(), reason, clock)?;
+    result
+}
+
+fn dispatch_resolved_loop(
+    paths: &OstromPaths,
+    manifest: &ostrom_core::PolicyManifest,
+    resolved: ostrom_core::ResolvedLoop,
+) -> Result<(), Box<dyn std::error::Error>> {
     let invocation = operation_dispatch::OperationInvocation {
         name: resolved.operation.clone(),
         target: resolved.target,
@@ -1213,7 +1276,7 @@ fn run_loop_command(paths: &OstromPaths, name: &str) -> Result<(), Box<dyn std::
         .or_else(|| environment::CLAUDE_PLUGIN_ROOT.value_os())
         .map_or_else(|| working_directory.join("plugins/ostrom"), PathBuf::from);
     let selector_prefixes =
-        operation_selector_prefixes(&manifest, &resolved.actor, &invocation.name);
+        operation_selector_prefixes(manifest, &resolved.actor, &invocation.name);
     let mut runtime = CliOperationRuntime {
         paths,
         actor: &resolved.actor,
@@ -1224,7 +1287,7 @@ fn run_loop_command(paths: &OstromPaths, name: &str) -> Result<(), Box<dyn std::
         selector_prefixes,
         ceilings: Some(resolved.ceilings),
     };
-    dispatch_operation(&manifest, &resolved.actor, &invocation, &mut runtime)?;
+    dispatch_operation(manifest, &resolved.actor, &invocation, &mut runtime)?;
     Ok(())
 }
 
@@ -1582,7 +1645,7 @@ fn execute_operation_action(
                 &["git", "push", "origin", &reference],
             )
         }
-        "cmd/run" => run_local_command(action, parameters, ceilings),
+        "cmd/run" => run_local_command(action, parameters, actor, ceilings),
         _ => Err(OperationDispatchError::UnknownAction(
             action.uses.to_owned(),
         )),
@@ -1630,6 +1693,7 @@ fn run_mediated(
 fn run_local_command(
     action: &'static OperationAction,
     parameters: &BTreeMap<String, serde_yaml::Value>,
+    actor: &str,
     ceilings: Option<ResolvedLoopCeilings>,
 ) -> Result<(), OperationDispatchError> {
     let script = operation_string(parameters, "script", action.uses)?;
@@ -1643,7 +1707,7 @@ fn run_local_command(
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     if let Some(ceilings) = ceilings {
-        apply_loop_ceilings(&mut command, ceilings);
+        apply_loop_environment(&mut command, actor, ceilings);
     }
     let mut child = command
         .spawn()
@@ -1672,7 +1736,12 @@ fn run_local_command(
     }
 }
 
-fn apply_loop_ceilings(command: &mut ProcessCommand, ceilings: ResolvedLoopCeilings) {
+fn apply_loop_environment(
+    command: &mut ProcessCommand,
+    actor: &str,
+    ceilings: ResolvedLoopCeilings,
+) {
+    command.env("OSTROM_ACTOR", actor);
     if let Some(value) = ceilings.spend_usd {
         command.env("MANDATE_DAILY_CAP_USD", render_ceiling_number(value));
     }

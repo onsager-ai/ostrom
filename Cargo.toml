@@ -16,7 +16,7 @@ rust-version = "1.88"
 
 [workspace.dependencies]
 async-trait = "0.1.89"
-chrono = { version = "=0.4.44", default-features = false, features = ["std", "serde"] }
+chrono = { version = "=0.4.44", default-features = false, features = ["std", "serde", "clock"] }
 clap = { version = "4.5.45", features = ["derive"] }
 base64 = "=0.22.1"
 directories = "6.0.0"

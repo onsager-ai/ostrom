@@ -48,6 +48,23 @@ the resolved values, and `ostrom loop run` refuses if a caller supplies a
 different enforced value. A local `cmd/run` action receives the resolved
 values in its child environment.
 
+The current composed policy version can instead own loop lifecycle directly:
+
+```sh
+ostrom up
+ostrom ps
+ostrom logs builder-day
+```
+
+`ostrom up` is a one-shot reconciler. It verifies `<state>/current`, starts only
+the loops due in the current local-time cadence slot, records their process
+state under `<state>/loop-runs`, and exits. A second invocation in the same
+version and cadence slot is a no-op. It neither reads an uncomposed working-tree
+manifest nor calls systemd. The worker receives the resolved ceilings from the
+manifest, and measured consumption is checked before the operation begins.
+`ps` and `logs` read the persisted state and log files; an unavailable
+measurement is printed as `unknown:<cause>`, never as zero.
+
 Render and verify artifacts with:
 
 ```sh
@@ -55,7 +72,8 @@ ostrom loops render --output /path/to/fixture-or-unit-source
 ostrom loops check /path/to/installed-units
 ```
 
-Rendering only writes `ostrom-loop-*.service` and `.timer` files. It never
+Rendering writes the inspectable `ostrom-loop-*.service` and `.timer` files and
+the single `ostrom-up.service` oneshot boot unit. It never
 calls systemctl and never enables, starts, or reloads a unit. `sys/enable-loop`
 remains an ungrantable action. Enabling a rendered timer is therefore a
 separate principal-controlled installation step.
