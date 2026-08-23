@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     fs, io,
     path::{Component, Path, PathBuf},
@@ -69,8 +70,9 @@ pub(crate) fn run_sign(
     key_id: &str,
     private_key: &Path,
 ) -> Result<(), PolicyLoadError> {
-    let manifest = load_unverified(path)?;
-    let signature = ostrom_store::sign_policy_manifest(&manifest, path, key_id, private_key)?;
+    let path = normalize_manifest_path(path);
+    let manifest = load_unverified(&path)?;
+    let signature = ostrom_store::sign_policy_manifest(&manifest, &path, key_id, private_key)?;
     println!("signed: {}", signature.display());
     Ok(())
 }
@@ -413,14 +415,26 @@ fn command_verbs() -> impl Iterator<Item = &'static str> {
 }
 
 pub(crate) fn load(path: &Path) -> Result<PolicyManifest, PolicyLoadError> {
-    let manifest = load_unverified(path)?;
+    let path = normalize_manifest_path(path);
+    let manifest = load_unverified(&path)?;
     let trusted_keys = ostrom_store::environment::OSTROM_POLICY_TRUSTED_KEYS
         .value_os()
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
         .ok_or(PolicyLoadError::TrustedKeysUnset)?;
-    ostrom_store::verify_policy_manifest(&manifest, path, &trusted_keys)?;
+    ostrom_store::verify_policy_manifest(&manifest, &path, &trusted_keys)?;
     Ok(manifest)
+}
+
+fn normalize_manifest_path(path: &Path) -> Cow<'_, Path> {
+    if path
+        .parent()
+        .is_some_and(|parent| parent.as_os_str().is_empty())
+    {
+        Cow::Owned(Path::new(".").join(path))
+    } else {
+        Cow::Borrowed(path)
+    }
 }
 
 fn load_unverified(path: &Path) -> Result<PolicyManifest, PolicyLoadError> {

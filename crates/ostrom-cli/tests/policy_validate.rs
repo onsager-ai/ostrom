@@ -1,4 +1,8 @@
-use std::{fs, path::PathBuf, process::Command};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use ostrom_core::{PolicyCandidate, PolicyManifest};
 use tempfile::TempDir;
@@ -26,6 +30,110 @@ fn signed_ostrom(manifest: &std::path::Path) -> Command {
         support::sign_manifest(manifest),
     );
     command
+}
+
+fn normalized_manifest(working_directory: &Path, manifest: &Path, trusted_keys: &Path) -> Vec<u8> {
+    let output = ostrom()
+        .env("OSTROM_POLICY_TRUSTED_KEYS", trusted_keys)
+        .current_dir(working_directory)
+        .args(["validate", "--normalized"])
+        .arg(manifest)
+        .output()
+        .expect("run normalized validate");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
+#[test]
+fn glob_includes_compose_identically_for_all_manifest_path_forms() {
+    let (root, manifest) = fixture();
+    let trusted_keys =
+        support::sign_manifest_from(&manifest, Path::new("manifest.yml"), root.path());
+
+    let bare = normalized_manifest(root.path(), Path::new("manifest.yml"), &trusted_keys);
+    let explicit = normalized_manifest(root.path(), Path::new("./manifest.yml"), &trusted_keys);
+    let absolute = normalized_manifest(root.path(), &manifest, &trusted_keys);
+
+    assert_eq!(bare, explicit);
+    assert_eq!(bare, absolute);
+}
+
+#[test]
+fn a_glob_whose_directory_is_missing_is_refused_like_any_other_empty_glob() {
+    // Depth must not decide this. `gone/*.yml` and `gone/deeper/*.yml` describe
+    // the same missing directory, and both are far more likely to be a typo than
+    // an intentionally absent tree — a manifest that silently composes zero
+    // includes is a manifest with no governance in it.
+    for pattern in ["gone/*.yml", "gone/deeper/*.yml"] {
+        let temporary = TempDir::new().expect("temporary directory");
+        fs::write(
+            temporary.path().join("manifest.yml"),
+            format!("manifest_version: 1\nincludes: [{pattern}]\nactors: {{builder: {{}}}}\n"),
+        )
+        .expect("write manifest");
+
+        let output = ostrom()
+            .current_dir(temporary.path())
+            .args(["sign", "--key-id", "unused", "--key", "unused.pem"])
+            .arg("manifest.yml")
+            .output()
+            .expect("run policy signer");
+        assert!(!output.status.success(), "{pattern} must not load");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("matched no files"),
+            "{pattern}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn a_glob_with_an_existing_base_and_no_matches_is_refused() {
+    let temporary = TempDir::new().expect("temporary directory");
+    fs::create_dir(temporary.path().join("optional")).expect("create optional directory");
+    fs::write(
+        temporary.path().join("manifest.yml"),
+        "manifest_version: 1\nincludes: [optional/*.yml]\n",
+    )
+    .expect("write manifest");
+
+    let output = ostrom()
+        .current_dir(temporary.path())
+        .args(["sign", "--key-id", "unused", "--key", "unused.pem"])
+        .arg("manifest.yml")
+        .output()
+        .expect("run policy signer");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("matched no files"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn non_glob_includes_compose_identically_for_all_manifest_path_forms() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let manifest = temporary.path().join("manifest.yml");
+    fs::write(&manifest, "manifest_version: 1\nincludes: [builder.yml]\n").expect("write manifest");
+    fs::write(
+        temporary.path().join("builder.yml"),
+        "actor: builder\nname: Placeholder builder\n",
+    )
+    .expect("write included actor");
+    let trusted_keys = support::sign_manifest(&manifest);
+
+    let bare = normalized_manifest(temporary.path(), Path::new("manifest.yml"), &trusted_keys);
+    let explicit =
+        normalized_manifest(temporary.path(), Path::new("./manifest.yml"), &trusted_keys);
+    let absolute = normalized_manifest(temporary.path(), &manifest, &trusted_keys);
+
+    assert_eq!(bare, explicit);
+    assert_eq!(bare, absolute);
 }
 
 #[test]
@@ -61,10 +169,11 @@ fn validate_and_normalized_accept_the_composed_fixture() {
 
 #[test]
 fn fixture_reproduces_builder_decisions_for_all_eleven_repositories() {
-    let (_root, manifest) = fixture();
+    let (root, manifest) = fixture();
     let output = signed_ostrom(&manifest)
+        .current_dir(root.path())
         .args(["validate", "--normalized"])
-        .arg(manifest)
+        .arg("manifest.yml")
         .output()
         .expect("run normalized validate");
     assert!(output.status.success());
