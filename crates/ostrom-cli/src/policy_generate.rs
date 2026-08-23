@@ -279,6 +279,11 @@ fn selectors<'a>(
 ) -> Result<Vec<PolicySelector>, GenerateError> {
     values
         .into_iter()
+        // `ref:` names one specific item. That is the operator's queue, not a
+        // property of the repository — the same reason `reserved:` does not
+        // travel into a repository manifest. #358 excluded the prefix from the
+        // manifest vocabulary deliberately, and its closed-set test asserts it.
+        .filter(|selector| !selector.starts_with("ref:"))
         .map(|selector| {
             PolicySelector::new(selector).map_err(|error| GenerateError::Selector {
                 selector: selector.to_owned(),
@@ -677,6 +682,21 @@ fn verify_repository(
     let mut differences = Vec::new();
     for item in items {
         let id = item_id(item);
+        // A reservation holds one specific item. It is operator state — a queue
+        // decision that outlives any policy file — so it is deliberately not
+        // carried into a repository manifest, and comparing a central policy
+        // that applies it against a generated one that cannot is comparing two
+        // different questions. The hold still applies; it simply is not policy.
+        if item
+            .get("refs")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_u64)
+            .any(|number| project.reserved.contains(&number))
+        {
+            continue;
+        }
         let candidate = policy_candidate(repository, item);
         let central = central_granted(mandates, gate, project, gate_project, &candidate)?;
         let generated = bundle.decide("", "", &candidate).granted;

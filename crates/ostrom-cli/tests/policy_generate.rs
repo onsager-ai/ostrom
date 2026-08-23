@@ -319,3 +319,27 @@ fn a_pull_request_with_no_check_runs_is_verified_rather_than_refused() {
     assert!(verified.status.success(), "{stderr}");
     assert!(!stderr.contains("full sweep"), "{stderr}");
 }
+
+#[test]
+fn a_reserved_item_is_state_and_does_not_diverge() {
+    // `reserved` holds one specific item. It is the operator's queue, not a
+    // property of the repository, so it never travels into a repository
+    // manifest — and comparing a central policy that applies it against a
+    // generated one that cannot is comparing two different questions.
+    let fixture = Fixture::new();
+    assert!(
+        fixture.command(&["policy", "generate"]).status.success(),
+        "generate must succeed"
+    );
+    let manifest = fs::read_to_string(fixture.manifest_path()).expect("generated manifest");
+    assert!(
+        !manifest.contains("ref:"),
+        "a reservation must not become a selector: {manifest}"
+    );
+    let verified = fixture.command(&["policy", "generate", "--verify"]);
+    assert!(
+        verified.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verified.stderr)
+    );
+}
