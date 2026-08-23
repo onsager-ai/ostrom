@@ -72,10 +72,17 @@ Run it once, capturing its exit code before doing anything else with it:
 ```sh
 ostrom credential gatekeeper "$repository" \
   --repositories "$repository" \
-  --permissions metadata:read,issues:read,pull_requests:read,checks:read,statuses:read \
+  --permissions metadata:read,issues:read,pull_requests:read,checks:read,statuses:read,contents:read \
   -- ostrom gate "<owner/repo>#<PR number>"
 gate_exit=$?
 ```
+
+`contents:read` is what makes the pull request's diff readable. Without it the
+diff endpoint answers `403`, every `path:` selector in `bounce_selectors` is
+unobservable, and the condition reports `inconclusive` rather than the tripwire
+it would have matched. The sweep's token has carried this scope all along; the
+gate's did not, so the gate has been blind to path tripwires it was configured
+to enforce.
 
 `ostrom credential` exits `111` only when its credential boundary could not
 start the safely authenticated command — in that case
