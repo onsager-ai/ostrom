@@ -85,8 +85,17 @@ pub(crate) fn run_sign(
 pub(crate) fn load_bundle(
     paths: &OstromPaths,
     path: &Path,
+    provenance: ManifestProvenance,
 ) -> Result<PolicyBundle, PolicyLoadError> {
     let mut manifest = load(path)?;
+    if provenance == ManifestProvenance::Repository
+        && let Some(name) = manifest.loops.keys().next()
+    {
+        return Err(PolicyLoadError::RepositoryLoop {
+            path: path.to_path_buf(),
+            name: name.clone(),
+        });
+    }
     let overlay_path = paths.private_config_file();
     if !overlay_path.is_file() || overlay_path == path {
         return Ok(PolicyBundle::repository(manifest));
@@ -112,8 +121,23 @@ pub(crate) fn load_bundle(
     Ok(PolicyBundle::layered(manifest, overlay_denies))
 }
 
-pub(crate) fn default_manifest_path(paths: &OstromPaths, cwd: &Path) -> Option<PathBuf> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ManifestProvenance {
+    Repository,
+    Operator,
+    Explicit,
+}
+
+pub(crate) fn default_manifest_path(
+    paths: &OstromPaths,
+    cwd: &Path,
+) -> Option<(PathBuf, ManifestProvenance)> {
     let repository = repository_root(cwd);
+    let discovered_provenance = if repository.is_some() {
+        ManifestProvenance::Repository
+    } else {
+        ManifestProvenance::Operator
+    };
     let directories = repository.as_ref().map_or_else(
         || cwd.ancestors().map(Path::to_path_buf).collect::<Vec<_>>(),
         |root| {
@@ -133,7 +157,7 @@ pub(crate) fn default_manifest_path(paths: &OstromPaths, cwd: &Path) -> Option<P
         .map(|directory| directory.join("ostrom.yaml"))
         .find(|path| path.is_file())
     {
-        return Some(path);
+        return Some((path, discovered_provenance));
     }
     if let Some(path) = directories
         .iter()
@@ -141,14 +165,14 @@ pub(crate) fn default_manifest_path(paths: &OstromPaths, cwd: &Path) -> Option<P
         .find(|path| path.is_file())
     {
         warn_legacy_manifest(&path);
-        return Some(path);
+        return Some((path, discovered_provenance));
     }
 
     if repository.is_none() {
         let path = paths.config.join("manifest.yml");
         if path.is_file() {
             warn_legacy_manifest(&path);
-            return Some(path);
+            return Some((path, ManifestProvenance::Operator));
         }
     }
     None
@@ -163,10 +187,10 @@ pub(crate) fn load_optional_bundle(
     // must keep working in a repository that has no manifest yet. Discovery is
     // still strict — it never falls through to the operator's own policy — so
     // `None` means ungoverned, not "somebody else's rules".
-    let Some(path) = default_manifest_path(paths, cwd) else {
+    let Some((path, provenance)) = default_manifest_path(paths, cwd) else {
         return Ok(None);
     };
-    load_bundle(paths, &path).map(Some)
+    load_bundle(paths, &path, provenance).map(Some)
 }
 
 fn repository_root(cwd: &Path) -> Option<PathBuf> {
@@ -246,14 +270,14 @@ pub(crate) struct ExplainOptions<'a> {
 }
 
 pub(crate) fn run_explain(options: &ExplainOptions<'_>) -> Result<String, PolicyLoadError> {
-    let manifest_path = options
+    let (manifest_path, provenance) = options
         .manifest
-        .map(Path::to_path_buf)
+        .map(|path| (path.to_path_buf(), ManifestProvenance::Explicit))
         .or_else(|| default_manifest_path(options.paths, options.working_directory))
         .ok_or_else(|| {
             PolicyLoadError::UngovernedRepository(repository_name(options.working_directory))
         })?;
-    let bundle = load_bundle(options.paths, &manifest_path)?;
+    let bundle = load_bundle(options.paths, &manifest_path, provenance)?;
     let target = ExplainTarget::parse(options.target)?;
     let pull_request = if let Some(fixture) = options.fixture {
         fixture_pull_request(fixture, &target)?
@@ -1021,6 +1045,11 @@ pub(crate) enum PolicyLoadError {
         path.display()
     )]
     OverlayGrant { path: PathBuf, rule: String },
+    #[error(
+        "repository manifest `{}` may grant authority but may not declare loops; offending loop `loops.{name}`",
+        path.display()
+    )]
+    RepositoryLoop { path: PathBuf, name: String },
     #[error(
         "private overlay `{}` has manifest_version {version}; expected {expected}",
         path.display()

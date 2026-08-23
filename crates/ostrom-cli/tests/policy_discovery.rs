@@ -188,6 +188,113 @@ fn overlay_grant_is_refused_and_names_the_rule() {
 }
 
 #[test]
+fn repository_loop_is_refused_and_names_the_loop() {
+    let fixture = RepositoryFixture::new(
+        "grants:\n  loop-work: {actors: builder, operations: work}\nloops:\n  forbidden-loop: {actor: builder, operation: work, target: placeholder-org/repository, every: hourly}\n",
+    );
+
+    let output = fixture.explain_from(fixture.repository.path(), &[]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 error");
+    assert!(stderr.contains("may not declare loops"), "{stderr}");
+    assert!(stderr.contains("loops.forbidden-loop"), "{stderr}");
+    assert!(
+        stderr.contains(
+            fixture
+                .repository
+                .path()
+                .join("ostrom.yaml")
+                .to_str()
+                .expect("UTF-8 path")
+        ),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn legacy_repository_loop_is_refused_and_names_the_loop() {
+    let fixture = RepositoryFixture::new(
+        "grants:\n  loop-work: {actors: builder, operations: work}\nloops:\n  legacy-loop: {actor: builder, operation: work, target: placeholder-org/repository, every: hourly}\n",
+    );
+    let legacy_directory = fixture.repository.path().join(".ostrom");
+    fs::create_dir(&legacy_directory).expect("legacy manifest directory");
+    fs::rename(
+        fixture.repository.path().join("ostrom.yaml"),
+        legacy_directory.join("manifest.yml"),
+    )
+    .expect("move manifest to legacy path");
+    fs::rename(
+        fixture.repository.path().join("ostrom.yaml.sig"),
+        legacy_directory.join("manifest.yml.sig"),
+    )
+    .expect("move manifest signature to legacy path");
+
+    let output = fixture.explain_from(fixture.repository.path(), &[]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 error");
+    assert!(stderr.contains("may not declare loops"), "{stderr}");
+    assert!(stderr.contains("loops.legacy-loop"), "{stderr}");
+    assert!(
+        stderr.contains(
+            legacy_directory
+                .join("manifest.yml")
+                .to_str()
+                .expect("UTF-8 path")
+        ),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn operator_loop_resolves_while_a_repository_manifest_is_present() {
+    let fixture = RepositoryFixture::new("");
+    let operator_manifest = fixture.home.path().join("config.yaml");
+    fs::write(
+        &operator_manifest,
+        policy(
+            "grants:\n  loop-work: {actors: builder, operations: work}\nloops:\n  operator-loop: {actor: builder, operation: work, target: placeholder-org/repository, every: hourly}\n",
+        ),
+    )
+    .expect("write operator manifest");
+    support::sign_manifest(&operator_manifest);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .current_dir(fixture.repository.path())
+        .env("OSTROM_HOME", fixture.home.path())
+        .env("OSTROM_POLICY_MANIFEST", &operator_manifest)
+        .env("OSTROM_POLICY_TRUSTED_KEYS", &fixture.trusted_keys)
+        .env_remove("OSTROM_ACTOR")
+        .env_remove("MANDATE_DAILY_CAP_USD")
+        .env_remove("MANDATE_MAX_IMPLEMENTERS")
+        .env_remove("MANDATE_ORDER_TOKEN_CEILING")
+        .args(["loop", "run", "operator-loop"])
+        .output()
+        .expect("run operator loop");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn repository_manifest_without_loops_is_unaffected() {
+    let fixture = RepositoryFixture::new(
+        "grants:\n  repository-grant: {actors: builder, operations: work}\n",
+    );
+
+    let output = fixture.explain_from(fixture.repository.path(), &[]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 explanation");
+    assert!(stdout.contains("repository-grant"), "{stdout}");
+    assert!(stdout.contains("verdict      MERGE"), "{stdout}");
+}
+
+#[test]
 fn overlay_deny_applies_and_explain_attributes_the_layer() {
     let fixture = RepositoryFixture::new("");
     fixture.write_overlay("denies:\n  operator-veto: {actors: builder, operations: work}\n");
