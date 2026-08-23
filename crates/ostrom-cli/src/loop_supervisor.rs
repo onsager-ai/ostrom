@@ -16,6 +16,11 @@ use thiserror::Error;
 use crate::policy_version::{self, CurrentPolicyVersion};
 
 const STATE_SCHEMA_VERSION: u64 = 1;
+// The five-minute reconciler timer should normally observe a slot almost
+// immediately. Two hours tolerates login delay, suspend/resume, and several
+// missed timer firings, while refusing to replay daily work after a long host
+// outage (the failure a limitless "latest slot" lookup would introduce).
+const SLOT_STALE_AFTER_SECONDS: i64 = 2 * 60 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -25,6 +30,7 @@ enum LoopStatus {
     Completed,
     Failed,
     Stopped,
+    Stale,
     Inconclusive,
 }
 
@@ -36,6 +42,7 @@ impl LoopStatus {
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Stopped => "stopped",
+            Self::Stale => "stale:slot_age_exceeded",
             Self::Inconclusive => "inconclusive",
         }
     }
@@ -96,6 +103,7 @@ pub(crate) struct UpSummary {
     pub stopped: usize,
     pub unchanged: usize,
     pub not_due: usize,
+    pub stale: usize,
 }
 
 #[derive(Debug, Error)]
@@ -172,14 +180,36 @@ pub(crate) fn reconcile(
         };
         if let Some(existing) = read_state(paths, name)?
             && existing.version == current.digest
-            && existing.schedule_slot == slot
+            && existing.schedule_slot == slot.identity
             && existing.status != LoopStatus::Inconclusive
         {
             summary.unchanged += 1;
             continue;
         }
+        if slot.age.num_seconds() > SLOT_STALE_AFTER_SECONDS {
+            let reason = format!(
+                "slot_age_exceeded age_seconds={} bound_seconds={SLOT_STALE_AFTER_SECONDS}",
+                slot.age.num_seconds()
+            );
+            let mut state = LoopRunState::starting(name, &current.digest, &slot.identity, clock);
+            state.status = LoopStatus::Stale;
+            state.finished_at = Some(clock.timestamp());
+            state.reason = Some(reason.clone());
+            write_state(paths, &state)?;
+            append_log(
+                paths,
+                name,
+                &format!(
+                    "{} stale slot={} {reason}\n",
+                    clock.timestamp(),
+                    slot.identity
+                ),
+            )?;
+            summary.stale += 1;
+            continue;
+        }
         if let Some(reason) = exceeded_reason(consumption, resolved.ceilings, name)? {
-            let mut state = LoopRunState::starting(name, &current.digest, &slot, clock);
+            let mut state = LoopRunState::starting(name, &current.digest, &slot.identity, clock);
             state.status = LoopStatus::Stopped;
             state.finished_at = Some(clock.timestamp());
             state.reason = Some(reason.clone());
@@ -192,7 +222,14 @@ pub(crate) fn reconcile(
             summary.stopped += 1;
             continue;
         }
-        launch_worker(paths, clock, executable, name, &current.digest, &slot)?;
+        launch_worker(
+            paths,
+            clock,
+            executable,
+            name,
+            &current.digest,
+            &slot.identity,
+        )?;
         summary.started += 1;
     }
     Ok(summary)

@@ -6,10 +6,10 @@ use std::{
     path::PathBuf,
     process::{Command, Output},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
-use chrono::Local;
+use chrono::{DateTime, Local, Utc};
 use tempfile::TempDir;
 
 mod support;
@@ -25,13 +25,16 @@ struct Fixture {
 
 impl Fixture {
     fn new(spend_usd: f64) -> Self {
+        Self::with_cadence(spend_usd, "hourly")
+    }
+
+    fn with_cadence(spend_usd: f64, cadence: &str) -> Self {
         let root = TempDir::new().expect("temporary loop supervisor fixture");
         let home = root.path().join("home");
         let repository = root.path().join("repository");
         let marker = root.path().join("operation-ran");
         fs::create_dir_all(&home).expect("create home");
         fs::create_dir_all(repository.join(".git")).expect("create repository boundary");
-        let minute = Local::now().format("%M");
         let operator = format!(
             r#"manifest_version: 1
 defaults:
@@ -42,13 +45,13 @@ operations:
     steps:
       - uses: cmd/run
         with:
-          script: 'printf "%s|%s|%s|%s\n" "$OSTROM_ACTOR" "$MANDATE_DAILY_CAP_USD" "$MANDATE_MAX_IMPLEMENTERS" "$MANDATE_ORDER_TOKEN_CEILING" > "$OSTROM_LOOP_MARKER"; printf "worker-log\n"'
+          script: 'printf "%s|%s|%s|%s\n" "$OSTROM_ACTOR" "$MANDATE_DAILY_CAP_USD" "$MANDATE_MAX_IMPLEMENTERS" "$MANDATE_ORDER_TOKEN_CEILING" >> "$OSTROM_LOOP_MARKER"; printf "worker-log\n"'
 loops:
   builder-day:
     actor: builder
     operation: scheduled-work
     target: placeholder-org/repository
-    every: "*:{minute}"
+    every: {cadence}
 "#
         );
         fs::write(home.join("ostrom.yaml"), operator).expect("write operator manifest");
@@ -116,6 +119,20 @@ loops:
         assert!(self.marker.exists(), "loop operation did not run");
     }
 
+    fn wait_for_completed_state(&self) {
+        let state = self.home.join("loop-runs/builder-day.json");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if fs::read_to_string(&state)
+                .is_ok_and(|source| source.contains("\"status\":\"completed\""))
+            {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("loop worker did not record completed state");
+    }
+
     fn make_version_writable(&self, digest: &str) {
         let directory = self.home.join("versions").join(digest);
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o755))
@@ -155,6 +172,7 @@ fn up_twice_launches_one_activation_and_applies_manifest_ceilings() {
     );
     assert!(String::from_utf8_lossy(&first.stdout).contains("started=1"));
     fixture.wait_for_marker();
+    fixture.wait_for_completed_state();
 
     let second = fixture.up();
     assert!(
@@ -180,10 +198,79 @@ fn up_twice_launches_one_activation_and_applies_manifest_ceilings() {
 }
 
 #[test]
+fn a_new_schedule_slot_launches_again() {
+    let fixture = Fixture::new(50.0);
+    fixture.compose();
+    let first = fixture.up();
+    assert!(first.status.success());
+    fixture.wait_for_marker();
+    fixture.wait_for_completed_state();
+
+    let state_path = fixture.home.join("loop-runs/builder-day.json");
+    let mut state = serde_json::from_slice::<serde_json::Value>(
+        &fs::read(&state_path).expect("read first slot state"),
+    )
+    .expect("parse first slot state");
+    state["schedule_slot"] = serde_json::Value::String("prior-slot".to_owned());
+    fs::write(
+        &state_path,
+        serde_json::to_vec(&state).expect("serialize prior slot state"),
+    )
+    .expect("persist prior slot state");
+
+    let next = fixture.up();
+    assert!(
+        next.status.success(),
+        "{}",
+        String::from_utf8_lossy(&next.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&next.stdout).contains("started=1"),
+        "{}",
+        String::from_utf8_lossy(&next.stdout)
+    );
+    fixture.wait_for_completed_state();
+    assert_eq!(
+        fs::read_to_string(&fixture.marker)
+            .expect("read marker")
+            .lines()
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn a_stale_slot_is_recorded_and_not_launched() {
+    let local_now = DateTime::<Utc>::from(SystemTime::now()).with_timezone(&Local);
+    let stale_time = local_now - chrono::Duration::hours(3);
+    let cadence = format!("[\"{}\"]", stale_time.format("%H:%M"));
+    let fixture = Fixture::with_cadence(50.0, &cadence);
+    fixture.compose();
+
+    let output = fixture.up();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("stale=1"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(!fixture.marker.exists(), "stale loop operation ran");
+    let ps = fixture.command().arg("ps").output().expect("read stale ps");
+    assert!(ps.status.success());
+    let ps = String::from_utf8(ps.stdout).expect("UTF-8 ps");
+    assert!(ps.contains("builder-day  stale:slot_age_exceeded"), "{ps}");
+}
+
+#[test]
 fn an_exceeded_ceiling_stops_before_the_operation() {
     let fixture = Fixture::new(10.0);
     fixture.compose();
-    let day = chrono::Utc::now().format("%Y-%m-%d");
+    let day = DateTime::<Utc>::from(SystemTime::now()).format("%Y-%m-%d");
     fs::write(
         fixture.home.join("sprint.jsonl"),
         format!(
@@ -278,7 +365,7 @@ fn ps_distinguishes_zero_spend_from_unmeasured_spend() {
     let zero = String::from_utf8(zero.stdout).expect("UTF-8 ps");
     assert!(zero.contains("$0.00/$50"), "{zero}");
 
-    let day = chrono::Utc::now().format("%Y-%m-%d");
+    let day = DateTime::<Utc>::from(SystemTime::now()).format("%Y-%m-%d");
     fs::write(
         fixture.home.join("sprint.jsonl"),
         format!(
@@ -302,7 +389,7 @@ fn ps_distinguishes_zero_spend_from_unmeasured_spend() {
 }
 
 #[test]
-fn loops_render_writes_the_boot_unit_without_installing_or_activating_it() {
+fn loops_render_writes_the_boot_units_without_installing_or_activating_them() {
     let fixture = Fixture::new(50.0);
     let output = fixture.home.join("rendered-units");
 
@@ -322,5 +409,9 @@ fn loops_render_writes_the_boot_unit_without_installing_or_activating_it() {
     assert!(boot.contains("Type=oneshot\n"));
     assert!(boot.contains("ExecStart=ostrom up\n"));
     assert!(!boot.contains("systemctl"));
+    let timer = fs::read_to_string(output.join("ostrom-up.timer")).expect("read boot timer");
+    assert!(timer.contains("OnUnitActiveSec=5min\n"));
+    assert!(timer.contains("Unit=ostrom-up.service\n"));
+    assert!(!timer.contains("systemctl"));
     assert!(!fixture.home.join("loop-runs").exists());
 }

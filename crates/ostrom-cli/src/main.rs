@@ -612,8 +612,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let executable = env::current_exe()?;
             let outcome = loop_supervisor::reconcile(&paths, &clock, &executable)?;
             println!(
-                "reconciled started={} stopped={} unchanged={} not-due={}",
-                outcome.started, outcome.stopped, outcome.unchanged, outcome.not_due
+                "reconciled started={} stopped={} unchanged={} stale={} not-due={}",
+                outcome.started, outcome.stopped, outcome.unchanged, outcome.stale, outcome.not_due
             );
         }
         Command::Ps => {

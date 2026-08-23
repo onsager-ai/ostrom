@@ -38,3 +38,4 @@ unsafe_code = "forbid"
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
 disallowed_types = "allow"
+disallowed_methods = "deny"

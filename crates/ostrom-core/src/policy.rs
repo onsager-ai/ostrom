@@ -562,6 +562,12 @@ pub enum LoopCadence {
     Range { start: LoopTime, end: LoopTime },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoopActivationSlot {
+    pub identity: String,
+    pub age: chrono::Duration,
+}
+
 impl LoopCadence {
     #[must_use]
     pub fn on_calendars(&self) -> Vec<String> {
@@ -590,33 +596,70 @@ impl LoopCadence {
         }
     }
 
-    /// Return the stable identity of the cadence slot containing `now`.
+    /// Return the most recent scheduled occurrence at or before `now`.
     ///
     /// The caller supplies the timezone because authored loop times are civil
     /// times. The reconciler passes the host's local time, matching the
     /// existing systemd `OnCalendar` behavior, while tests can inject any
     /// explicit timezone without consulting the wall clock.
     #[must_use]
-    pub fn activation_slot<Tz>(&self, now: &chrono::DateTime<Tz>) -> Option<String>
+    pub fn activation_slot<Tz>(&self, now: &chrono::DateTime<Tz>) -> Option<LoopActivationSlot>
     where
         Tz: chrono::TimeZone,
         Tz::Offset: std::fmt::Display,
     {
-        use chrono::Timelike as _;
+        use chrono::LocalResult;
 
-        let hour = u8::try_from(now.hour()).expect("chrono hours fit in u8");
-        let minute = u8::try_from(now.minute()).expect("chrono minutes fit in u8");
-        let due = match self {
-            Self::Hourly => minute == 0,
-            Self::Minute(expected) => minute == *expected,
-            Self::Times(times) => times
-                .iter()
-                .any(|time| time.hour == hour && time.minute == minute),
-            Self::Range { start, end } => {
-                minute == start.minute && (start.hour..=end.hour).contains(&hour)
+        let today = now.date_naive();
+        let yesterday = today.pred_opt();
+        let mut latest = None;
+        for date in [Some(today), yesterday].into_iter().flatten() {
+            for time in self.scheduled_times() {
+                let Some(local) = date.and_hms_opt(u32::from(time.hour), u32::from(time.minute), 0)
+                else {
+                    continue;
+                };
+                let candidates = match now.timezone().from_local_datetime(&local) {
+                    LocalResult::Single(candidate) => vec![candidate],
+                    LocalResult::Ambiguous(earlier, later) => vec![earlier, later],
+                    LocalResult::None => Vec::new(),
+                };
+                for candidate in candidates {
+                    if candidate.timestamp_millis() <= now.timestamp_millis()
+                        && latest
+                            .as_ref()
+                            .is_none_or(|current: &chrono::DateTime<Tz>| {
+                                candidate.timestamp_millis() > current.timestamp_millis()
+                            })
+                    {
+                        latest = Some(candidate);
+                    }
+                }
             }
-        };
-        due.then(|| now.format("%Y-%m-%dT%H:%M%:z").to_string())
+        }
+        latest.map(|scheduled| LoopActivationSlot {
+            identity: scheduled.format("%Y-%m-%dT%H:%M%:z").to_string(),
+            age: now.naive_utc().signed_duration_since(scheduled.naive_utc()),
+        })
+    }
+
+    fn scheduled_times(&self) -> Vec<LoopTime> {
+        match self {
+            Self::Hourly => (0..24).map(|hour| LoopTime { hour, minute: 0 }).collect(),
+            Self::Minute(minute) => (0..24)
+                .map(|hour| LoopTime {
+                    hour,
+                    minute: *minute,
+                })
+                .collect(),
+            Self::Times(times) => times.clone(),
+            Self::Range { start, end } => (start.hour..=end.hour)
+                .map(|hour| LoopTime {
+                    hour,
+                    minute: start.minute,
+                })
+                .collect(),
+        }
     }
 }
 
@@ -1774,8 +1817,8 @@ denies:
     }
 
     #[test]
-    fn loop_cadence_identifies_only_the_current_civil_time_slot() {
-        let now = chrono::DateTime::parse_from_rfc3339("2026-08-24T08:15:00+08:00")
+    fn loop_cadence_identifies_the_most_recent_civil_time_slot() {
+        let declared = chrono::DateTime::parse_from_rfc3339("2026-08-24T08:16:00+08:00")
             .expect("fixed civil time");
         let due = PolicyManifest::from_yaml(
             "manifest_version: 1\nactors: {builder: {}}\noperations: {work: {steps: []}}\ngrants:\n  work: {actors: builder, operations: work, repositories: placeholder-org/repo}\nloops:\n  due: {actor: builder, operation: work, target: placeholder-org/repo, every: '08:15..21:15'}\n",
@@ -1784,12 +1827,30 @@ denies:
         .resolve_loop("due")
         .expect("resolved loop");
 
+        let after_declared = due
+            .every
+            .activation_slot(&declared)
+            .expect("the earlier declared minute is the current slot");
+        assert_eq!(after_declared.identity, "2026-08-24T08:15+08:00");
+        assert_eq!(after_declared.age, chrono::Duration::minutes(1));
+
+        let same_slot = declared + chrono::Duration::minutes(43);
         assert_eq!(
-            due.every.activation_slot(&now).as_deref(),
-            Some("2026-08-24T08:15+08:00")
+            due.every
+                .activation_slot(&same_slot)
+                .expect("same slot")
+                .identity,
+            after_declared.identity
         );
-        let not_due = now + chrono::Duration::minutes(1);
-        assert_eq!(due.every.activation_slot(&not_due), None);
+
+        let next_slot = declared + chrono::Duration::minutes(59);
+        assert_eq!(
+            due.every
+                .activation_slot(&next_slot)
+                .expect("next slot")
+                .identity,
+            "2026-08-24T09:15+08:00"
+        );
     }
 
     #[test]
