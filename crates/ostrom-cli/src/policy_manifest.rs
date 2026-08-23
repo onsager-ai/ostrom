@@ -188,6 +188,17 @@ pub(crate) fn load_bundle(
     build_bundle(paths, repository_path, repository)
 }
 
+/// Compose repository policy with the adopting operator scope, validating and
+/// verifying every signed input before returning the effective manifest.
+pub(crate) fn compose_manifest(
+    paths: &OstromPaths,
+    path: &Path,
+) -> Result<PolicyManifest, PolicyLoadError> {
+    let bundle = load_bundle(paths, path)?;
+    validate_manifest(&bundle.manifest)?;
+    Ok(bundle.manifest)
+}
+
 fn build_bundle(
     paths: &OstromPaths,
     repository_path: PathBuf,
@@ -844,6 +855,7 @@ fn command_verbs() -> impl Iterator<Item = &'static str> {
     [
         "audit",
         "check",
+        "compose",
         "config",
         "credential",
         "dispatch",
@@ -864,6 +876,7 @@ fn command_verbs() -> impl Iterator<Item = &'static str> {
         "queue",
         "repair-prs",
         "replay",
+        "rollback",
         "select-work",
         "sign",
         "sweep",

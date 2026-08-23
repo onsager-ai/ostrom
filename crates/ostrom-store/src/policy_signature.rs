@@ -16,7 +16,7 @@ use rsa::{
 };
 use serde::{Deserialize, Serialize};
 use serde_yaml::{Number, Value};
-use sha2::Sha256;
+use sha2::{Digest as _, Sha256};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
@@ -235,6 +235,16 @@ fn signature_path(manifest_path: &Path) -> PathBuf {
     let mut path = manifest_path.as_os_str().to_os_string();
     path.push(".sig");
     PathBuf::from(path)
+}
+
+/// Derive the stable content identity of a fully composed policy manifest.
+///
+/// This deliberately hashes the same canonical representation used by policy
+/// signatures. It contains no authored version field, source path, map
+/// iteration order, or observation time.
+pub fn policy_manifest_digest(manifest: &PolicyManifest) -> Result<String, PolicySignatureError> {
+    let digest = Sha256::digest(canonical_manifest(manifest)?);
+    Ok(format!("{digest:x}"))
 }
 
 fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), PolicySignatureError> {
