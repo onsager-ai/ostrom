@@ -52,6 +52,7 @@ pub(crate) fn run_validate(path: &Path, normalized: bool) -> Result<(), PolicyLo
     if let Some(finding) = findings.iter().find(|finding| finding.is_error()) {
         return Err(PolicyLoadError::Selector(format_finding(finding)));
     }
+    validate_adjacent_legacy_policy(path)?;
 
     if normalized {
         print!(
@@ -64,6 +65,28 @@ pub(crate) fn run_validate(path: &Path, normalized: bool) -> Result<(), PolicyLo
         println!("valid: {}", path.display());
     }
     Ok(())
+}
+
+fn validate_adjacent_legacy_policy(path: &Path) -> Result<(), PolicyLoadError> {
+    let path = normalize_manifest_path(path);
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    let legacy_policy_present = [
+        directory.join("mandates.yaml"),
+        directory.join("gate.yaml"),
+        directory.join(".ostrom/mandates.yaml"),
+        directory.join(".ostrom/gate.yaml"),
+    ]
+    .iter()
+    .any(|candidate| candidate.is_file());
+    if !legacy_policy_present {
+        return Ok(());
+    }
+    let paths = OstromPaths {
+        config: directory.to_path_buf(),
+        state: directory.to_path_buf(),
+    };
+    ostrom_store::validate_roster_coverage(&paths, directory)
+        .map_err(|error| PolicyLoadError::Validation(error.to_string()))
 }
 
 pub(crate) fn run_sign(

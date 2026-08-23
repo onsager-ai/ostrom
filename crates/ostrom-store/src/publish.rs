@@ -279,6 +279,7 @@ fn load_allowlist(path: &Path) -> Result<Allowlist, PublishError> {
         "gate.condition",
         "state",
         "state.dead_selector",
+        "state.roster_coverage",
         "state.repo",
         "state.item",
         "state.policy",
@@ -533,6 +534,15 @@ fn filter_state(
             drops,
         )?;
     }
+    for finding in object_array(source.get("roster_coverage")) {
+        record_unknown(
+            allowlist,
+            "state.roster_coverage",
+            finding,
+            "roster_coverage[].",
+            drops,
+        )?;
+    }
     if let Some(repos) = source.get("repos").and_then(Value::as_object) {
         for repo in repos.values().filter(|value| value.is_object()) {
             record_unknown(allowlist, "state.repo", repo, "repos.*.", drops)?;
@@ -579,6 +589,11 @@ fn filter_state(
         .map(|value| filtered_object(allowlist, "state.dead_selector", value).map(Value::Object))
         .collect::<Result<Vec<_>, _>>()?;
     output.insert("dead_selectors".to_owned(), Value::Array(dead));
+    let roster_coverage = object_array(source.get("roster_coverage"))
+        .into_iter()
+        .map(|value| filtered_object(allowlist, "state.roster_coverage", value).map(Value::Object))
+        .collect::<Result<Vec<_>, _>>()?;
+    output.insert("roster_coverage".to_owned(), Value::Array(roster_coverage));
     let mut repos_output = Map::new();
     if let Some(repos) = source.get("repos").and_then(Value::as_object) {
         for (name, repo) in repos {
@@ -1236,7 +1251,7 @@ mod tests {
         .expect("write gate");
         fs::write(
             paths.sweep_state_file(),
-            r#"{"version":2,"sweep_mode":"full","repos":{"placeholder-org/alpha":{"items":{"placeholder-org/alpha#1":{"classification":"unclassified","fingerprint":"placeholder","first_seen":"2026-07-31T00:00:00Z","updated":"2026-08-01T00:00:00Z","matched_selector":"default:unclassified","stuck":false}},"policy":{},"scope_changes":{},"notice":{"kind":"baseline","reported":false,"text":"drop"}}}}"#,
+            r#"{"version":2,"sweep_mode":"full","roster_coverage":[{"repo":"placeholder-org/alpha","finding":"delegated_without_merge_gate","missing_document":"gate.yaml"}],"repos":{"placeholder-org/alpha":{"items":{"placeholder-org/alpha#1":{"classification":"unclassified","fingerprint":"placeholder","first_seen":"2026-07-31T00:00:00Z","updated":"2026-08-01T00:00:00Z","matched_selector":"default:unclassified","stuck":false}},"policy":{},"scope_changes":{},"notice":{"kind":"baseline","reported":false,"text":"drop"}}}}"#,
         )
         .expect("write state");
         let destination = PublishDestination::explicit(
@@ -1253,7 +1268,7 @@ mod tests {
             .expect("parse manifest");
         assert_eq!(
             manifest["schema_id"],
-            "git:831ea4a434a43caf675f19f5566d968a8be6a088"
+            "git:296d3796f35a38a8c13447c8b443e95c4ac2a2f8"
         );
         assert_eq!(manifest["dropped_fields"]["queue"]["private_note"], 1);
         assert_eq!(manifest["dropped_fields"]["gate"]["conditions[].detail"], 1);
@@ -1267,6 +1282,16 @@ mod tests {
         let queue = String::from_utf8(tree.files[Path::new("queue.jsonl")].clone())
             .expect("queue is UTF-8");
         assert!(!queue.contains("private_note"));
+        let state: Value = serde_json::from_slice(&tree.files[Path::new("state.json")])
+            .expect("parse published state");
+        assert_eq!(
+            state["roster_coverage"],
+            json!([{
+                "repo": "placeholder-org/alpha",
+                "finding": "delegated_without_merge_gate",
+                "missing_document": "gate.yaml",
+            }])
+        );
     }
 
     #[test]

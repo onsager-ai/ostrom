@@ -7,8 +7,8 @@ use std::{
 
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use ostrom_core::{
-    DefaultDisposition, MandateConfig, ProjectMandate, RepositoryName, Selector, WorkNodeInput,
-    build_work_graph,
+    DefaultDisposition, GateConfig, MandateConfig, ProjectMandate, RepositoryName, Selector,
+    WorkNodeInput, build_work_graph,
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -19,7 +19,9 @@ use crate::{
     AppTokenError, OstromPaths, PolicyBundle, PublishDestination, PublishError, QueueDocument,
     StoreError,
     app_token::{GitHubInstallationTokenMinter, InstallationTokenMinter, ScopedAppTokenRequest},
-    environment, io_error,
+    environment,
+    gate::load_gate_config,
+    io_error,
     publish::{PublishOptions, PublishOutcome, publish},
     read_queue, read_trace,
     selector::{SelectorCandidate, glob_match, selector_match},
@@ -43,6 +45,8 @@ pub(crate) const PR_REPAIR_CONFLICT_REASON_PREFIX: &str =
 /// gain a write permission merely because publication can follow separately.
 const SWEEP_TOKEN_PERMISSIONS: &str = "metadata:read,issues:read,pull_requests:read,checks:read,statuses:read,actions:read,contents:read";
 const SHIPPED_DEFAULTS: &str = include_str!("../../../plugins/ostrom/config/mandate-defaults.yaml");
+const COVERAGE_FINDING: &str = "missing_policy_document_entry";
+const DELEGATED_WITHOUT_MERGE_GATE_FINDING: &str = "delegated_without_merge_gate";
 
 #[derive(Debug, Error)]
 pub enum SweepError {
@@ -71,6 +75,13 @@ pub enum SweepError {
     Fixture(String),
     #[error("could not read local work orders: {0}")]
     WorkOrders(String),
+    #[error(
+        "policy validation: repository {repository} has delegated selectors but {missing_document} has no project entry for it"
+    )]
+    DelegatedWithoutMergeGate {
+        repository: String,
+        missing_document: String,
+    },
     #[error(transparent)]
     Publish(#[from] PublishError),
     #[error(transparent)]
@@ -112,6 +123,13 @@ pub struct SweepOutcome {
     pub queue_changes: usize,
     pub mode: SweepMode,
     pub faults: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RosterCoverageFinding {
+    pub repo: String,
+    pub finding: String,
+    pub missing_document: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -249,6 +267,9 @@ fn run_sweep_with_minter(
     minter: &mut dyn InstallationTokenMinter,
 ) -> Result<(SweepOutcome, Vec<RepositorySnapshot>), SweepError> {
     let config = load_config(&options.paths, &options.working_directory)?;
+    let gate_config = load_gate_config(&options.paths, &options.working_directory)
+        .map_err(|error| SweepError::Config(format!("gate.yaml: {error}")))?;
+    let roster_coverage = roster_coverage_findings(&config, &gate_config);
     if config.projects.is_empty() {
         return Err(SweepError::Config(
             "mandates.yaml contains no projects".to_owned(),
@@ -392,6 +413,8 @@ fn run_sweep_with_minter(
 
     new_state["version"] = json!(2);
     new_state["sweep_mode"] = json!(mode_name(mode));
+    new_state["roster_coverage"] =
+        serde_json::to_value(roster_coverage).expect("roster coverage findings serialize");
     if mode == SweepMode::Full {
         new_state["last_full_reconciliation"] = json!(format_time(options.started_at));
     }
@@ -2519,6 +2542,82 @@ fn load_work_orders(
     Ok((orders, warnings))
 }
 
+fn roster_coverage_findings(
+    mandates: &MandateConfig,
+    gate: &GateConfig,
+) -> Vec<RosterCoverageFinding> {
+    let mandate_repositories = mandates
+        .projects
+        .iter()
+        .map(|project| project.repo.as_str())
+        .collect::<BTreeSet<_>>();
+    let gate_repositories = gate
+        .projects
+        .iter()
+        .map(|project| project.repo.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut findings = Vec::new();
+
+    for project in &mandates.projects {
+        let repo = project.repo.as_str();
+        if gate_repositories.contains(repo) {
+            continue;
+        }
+        findings.push(RosterCoverageFinding {
+            repo: repo.to_owned(),
+            finding: if project.delegated.is_empty() {
+                COVERAGE_FINDING
+            } else {
+                DELEGATED_WITHOUT_MERGE_GATE_FINDING
+            }
+            .to_owned(),
+            missing_document: "gate.yaml".to_owned(),
+        });
+    }
+    for project in &gate.projects {
+        let repo = project.repo.as_str();
+        if mandate_repositories.contains(repo) {
+            continue;
+        }
+        findings.push(RosterCoverageFinding {
+            repo: repo.to_owned(),
+            finding: COVERAGE_FINDING.to_owned(),
+            missing_document: "mandates.yaml".to_owned(),
+        });
+    }
+    findings.sort_by(|left, right| {
+        (&left.repo, &left.missing_document).cmp(&(&right.repo, &right.missing_document))
+    });
+    findings
+}
+
+/// Validate the severe half of legacy two-file policy coverage.
+///
+/// Generic one-sided coverage remains a sweep finding. Dispatching delegated
+/// work without any merge-gate entry is rejected when the policy is explicitly
+/// validated, while an entirely absent legacy policy remains ungoverned rather
+/// than becoming an implicit configuration error.
+pub fn validate_roster_coverage(paths: &OstromPaths, cwd: &Path) -> Result<(), SweepError> {
+    let user_path = paths.config.join("mandates.yaml");
+    let repo_path = cwd.join(".ostrom/mandates.yaml");
+    if !user_path.exists() && !repo_path.exists() {
+        return Ok(());
+    }
+    let mandates = load_config(paths, cwd)?;
+    let gate = load_gate_config(paths, cwd)
+        .map_err(|error| SweepError::Config(format!("gate.yaml: {error}")))?;
+    if let Some(finding) = roster_coverage_findings(&mandates, &gate)
+        .into_iter()
+        .find(|finding| finding.finding == DELEGATED_WITHOUT_MERGE_GATE_FINDING)
+    {
+        return Err(SweepError::DelegatedWithoutMergeGate {
+            repository: finding.repo,
+            missing_document: finding.missing_document,
+        });
+    }
+    Ok(())
+}
+
 pub fn load_config(paths: &OstromPaths, cwd: &Path) -> Result<MandateConfig, SweepError> {
     let user_path = paths.config.join("mandates.yaml");
     let repo_path = cwd.join(".ostrom/mandates.yaml");
@@ -3639,6 +3738,60 @@ mod tests {
             "cadence_hours: 1\nstuck_after_days: 7\nprojects:\n{projects}"
         ))
         .expect("the fixture roster is valid")
+    }
+
+    #[test]
+    fn roster_coverage_names_each_missing_document_and_ignores_absent_or_matched_repositories() {
+        let mandates = MandateConfig::from_yaml(
+            r#"
+cadence_hours: 1
+stuck_after_days: 7
+projects:
+  - repo: placeholder-org/delegated-only
+    delegated: [label:placeholder]
+  - repo: placeholder-org/mandate-only
+  - repo: placeholder-org/matched
+"#,
+        )
+        .expect("placeholder mandates");
+        let gate = GateConfig::from_yaml(
+            r#"
+projects:
+  - repo: placeholder-org/matched
+  - repo: other-placeholder-org/gate-only
+"#,
+        )
+        .expect("placeholder gate");
+
+        assert_eq!(
+            roster_coverage_findings(&mandates, &gate),
+            vec![
+                RosterCoverageFinding {
+                    repo: "other-placeholder-org/gate-only".to_owned(),
+                    finding: COVERAGE_FINDING.to_owned(),
+                    missing_document: "mandates.yaml".to_owned(),
+                },
+                RosterCoverageFinding {
+                    repo: "placeholder-org/delegated-only".to_owned(),
+                    finding: DELEGATED_WITHOUT_MERGE_GATE_FINDING.to_owned(),
+                    missing_document: "gate.yaml".to_owned(),
+                },
+                RosterCoverageFinding {
+                    repo: "placeholder-org/mandate-only".to_owned(),
+                    finding: COVERAGE_FINDING.to_owned(),
+                    missing_document: "gate.yaml".to_owned(),
+                },
+            ]
+        );
+        assert!(
+            roster_coverage_findings(
+                &MandateConfig::from_yaml("cadence_hours: 1\nstuck_after_days: 7\nprojects: []\n")
+                    .expect("empty mandates"),
+                &GateConfig::from_yaml("projects: []\n").expect("empty gate")
+            )
+            .is_empty(),
+            "a repository absent from both documents is not a one-sided coverage defect"
+        );
     }
 
     fn hold_policy() -> PolicyBundle {

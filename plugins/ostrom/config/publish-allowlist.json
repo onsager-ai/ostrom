@@ -82,6 +82,7 @@
     "sweep_mode",
     "last_full_reconciliation",
     "dead_selectors",
+    "roster_coverage",
     "unresolvable_repositories",
     "repos"
   ],
@@ -89,6 +90,11 @@
     "repo",
     "selector",
     "source"
+  ],
+  "state.roster_coverage": [
+    "repo",
+    "finding",
+    "missing_document"
   ],
   "state.repo": [
     "cursor",
