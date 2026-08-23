@@ -219,6 +219,58 @@ fn operator_yaml_and_yml_resolve_alone_but_both_are_ambiguous() {
 }
 
 #[test]
+fn legacy_operator_manifest_yml_is_still_discovered() {
+    let fixture = RepositoryFixture::new("");
+    fixture.write_overlay(
+        "actors: {builder: {}}\noperations: {work: {steps: []}}\ngrants:\n  legacy-operator-grant: {actors: builder, operations: work}\n",
+    );
+    fs::rename(
+        fixture.home.path().join("ostrom.yaml"),
+        fixture.home.path().join("manifest.yml"),
+    )
+    .expect("move operator manifest to legacy path");
+    fs::rename(
+        fixture.home.path().join("ostrom.yaml.sig"),
+        fixture.home.path().join("manifest.yml.sig"),
+    )
+    .expect("move operator signature to legacy path");
+
+    let output = fixture.explain_from(fixture.repository.path(), &[]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 explanation");
+    assert!(stdout.contains("legacy-operator-grant"), "{stdout}");
+    assert!(stdout.contains("verdict      MERGE"), "{stdout}");
+}
+
+#[test]
+fn operator_touch_log_config_is_ignored_by_policy_discovery() {
+    let fixture = RepositoryFixture::new(
+        "grants:\n  repository-grant: {actors: builder, operations: work}\n",
+    );
+    fs::write(
+        fixture.home.path().join("config.yaml"),
+        "provider: notion\nbuckets: [review]\nnotion:\n  data_source: placeholder\n",
+    )
+    .expect("write touch-log configuration");
+
+    let output = fixture.explain_from(fixture.repository.path(), &[]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 explanation");
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 diagnostics");
+    assert!(stdout.contains("repository-grant"), "{stdout}");
+    assert!(!stderr.contains("config.yaml"), "{stderr}");
+    assert!(!stderr.contains("deprecated"), "{stderr}");
+}
+
+#[test]
 fn explain_preserves_the_included_file_as_the_rule_origin() {
     let fixture = RepositoryFixture::new("");
     let included = fixture

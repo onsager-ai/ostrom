@@ -328,12 +328,10 @@ pub(crate) fn operator_manifest_path(
     if let Some(path) = named_manifest_path(&paths.config)? {
         return Ok(Some(path));
     }
-    for legacy in ["policy.yaml", "config.yaml"] {
-        let path = paths.config.join(legacy);
-        if path.is_file() {
-            warn_legacy_operator_manifest(&path);
-            return Ok(Some(path));
-        }
+    let legacy = paths.config.join("manifest.yml");
+    if legacy.is_file() {
+        warn_legacy_operator_manifest(&legacy);
+        return Ok(Some(legacy));
     }
     Ok(None)
 }

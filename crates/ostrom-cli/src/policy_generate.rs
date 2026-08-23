@@ -94,6 +94,15 @@ pub(crate) fn run(paths: &OstromPaths, verify: bool) -> Result<(), GenerateError
         })?;
         println!("generated: {}", output.display());
     }
+    let count = mandates.projects.len();
+    let noun = if count == 1 { "manifest" } else { "manifests" };
+    println!("\nWARNING: generated {count} unsigned policy {noun}.");
+    println!(concat!(
+        "These manifests are not yet in effect. Sign every generated `ostrom.yaml` with ",
+        "`ostrom sign --key-id <key-id> --key <private-key.pem> <manifest>` and configure ",
+        "`OSTROM_POLICY_TRUSTED_KEYS` with the matching public keys before running ",
+        "`ostrom sweep`; until then, commands that discover these files will refuse to load them."
+    ));
     Ok(())
 }
 

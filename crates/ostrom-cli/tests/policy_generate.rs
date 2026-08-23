@@ -207,6 +207,65 @@ fn generates_repository_concerns_and_resolves_operator_tripwires() {
 }
 
 #[test]
+fn generation_reports_that_unsigned_manifests_require_operator_action() {
+    let fixture = Fixture::new();
+    let generated = fixture.command(&["policy", "generate"]);
+    assert!(
+        generated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    let stdout = String::from_utf8(generated.stdout).expect("UTF-8 generation summary");
+    assert!(
+        stdout.contains("WARNING: generated 1 unsigned policy manifest."),
+        "{stdout}"
+    );
+    assert!(stdout.contains("not yet in effect"), "{stdout}");
+    assert!(stdout.contains("ostrom sign"), "{stdout}");
+    assert!(stdout.contains("OSTROM_POLICY_TRUSTED_KEYS"), "{stdout}");
+    assert!(stdout.contains("before running `ostrom sweep`"), "{stdout}");
+    assert!(
+        stdout.rfind("WARNING:") > stdout.rfind("generated:"),
+        "the unsigned warning must be the closing summary: {stdout}"
+    );
+}
+
+#[test]
+fn verify_ignores_touch_log_config_in_the_operator_directory() {
+    let fixture = Fixture::new();
+    fs::remove_file(fixture.home.path().join("ostrom.yaml"))
+        .expect("remove operator policy manifest");
+    fs::write(
+        fixture.home.path().join("config.yaml"),
+        "provider: notion\nbuckets: [review]\nnotion:\n  data_source: placeholder\n",
+    )
+    .expect("write touch-log configuration");
+    for central in ["mandates.yaml", "gate.yaml"] {
+        let path = fixture.home.path().join(central);
+        let source = fs::read_to_string(&path)
+            .expect("read central policy")
+            .replace("bounce_all: [label:risk:shared]\n", "");
+        fs::write(path, source).expect("remove operator-only tripwire");
+    }
+
+    let generated = fixture.command(&["policy", "generate"]);
+    assert!(
+        generated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    let verified = fixture.command(&["policy", "generate", "--verify"]);
+    assert!(
+        verified.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verified.stderr)
+    );
+    let stderr = String::from_utf8(verified.stderr).expect("UTF-8 verification diagnostics");
+    assert!(!stderr.contains("config.yaml"), "{stderr}");
+    assert!(!stderr.contains("deprecated"), "{stderr}");
+}
+
+#[test]
 fn verify_detects_a_seeded_divergence_and_names_the_item() {
     let fixture = Fixture::new();
     assert!(fixture.command(&["policy", "generate"]).status.success());
