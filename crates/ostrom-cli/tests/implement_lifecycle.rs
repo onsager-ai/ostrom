@@ -43,6 +43,7 @@ impl Fixture {
         );
         git(&source, &["config", "user.name", "Fixture"]);
         fs::write(source.join("README.md"), "placeholder\n").expect("write source");
+        fs::write(source.join(".gitignore"), "target/\n").expect("write gitignore");
         fs::create_dir_all(source.join(".github/workflows")).expect("create workflow fixture");
         fs::write(
             source.join(".github/workflows/existing.yml"),
@@ -51,7 +52,12 @@ impl Fixture {
         .expect("write baseline workflow");
         git(
             &source,
-            &["add", "README.md", ".github/workflows/existing.yml"],
+            &[
+                "add",
+                "README.md",
+                ".gitignore",
+                ".github/workflows/existing.yml",
+            ],
         );
         git(&source, &["commit", "-m", "base"]);
         git(
@@ -137,6 +143,8 @@ impl Fixture {
                 "    trap 'exit 143' TERM\n",
                 "    while :; do sleep 1; done ;;\n",
                 "  *)\n",
+                "    mkdir -p \"$worktree/target\"\n",
+                "    printf '%s\\n' artifact >\"$worktree/target/placeholder\"\n",
                 "    printf '%s\\n' completed >>\"$worktree/README.md\"\n",
                 "    printf '%s\\n' done >\"$result\"\n",
                 "    usage=${FAKE_CODEX_USAGE_JSON:-}\n",
@@ -371,6 +379,10 @@ fn public_repository_reaches_codex_and_uses_the_rust_cli_publication_boundary() 
         fs::read_to_string(worktree.join("README.md"))
             .expect("read implementation")
             .contains("completed")
+    );
+    assert!(
+        !worktree.join("target").exists(),
+        "terminal work orders must not retain build artifacts"
     );
     let terminal = fixture.trace().pop().expect("completion trace");
     assert_eq!(terminal["kind"], "work-completed");

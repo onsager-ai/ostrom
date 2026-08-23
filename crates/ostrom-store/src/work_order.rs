@@ -756,6 +756,9 @@ fn append_terminal_failure(
             }),
         ),
     ]);
+    if let Err(error) = crate::reap_build_cache(state_root, &order.item_id) {
+        eprintln!("ostrom work order: could not reap build cache: {error}");
+    }
     append_trace(
         &trace_path,
         &TraceAppend {

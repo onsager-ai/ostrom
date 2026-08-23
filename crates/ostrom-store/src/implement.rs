@@ -193,6 +193,9 @@ impl TerminalGuard {
             ("withheld_paths".to_owned(), json!(self.withheld_paths)),
             ("usage".to_owned(), usage.json()),
         ]);
+        if let Err(error) = crate::reap_build_cache(&self.paths.state, &self.order.item_id) {
+            eprintln!("ostrom implementer: could not reap build cache: {error}");
+        }
         append_trace(
             &self.paths.trace_file(),
             &TraceAppend {

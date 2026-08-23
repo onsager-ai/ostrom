@@ -195,6 +195,16 @@ pub const MANDATE_SYSTEMD_RUN_BIN: EnvironmentVariable = variable(
     EnvironmentClass::Binary,
     "systemd-run",
 );
+pub const MANDATE_WORKTREE_CEILING_BYTES: EnvironmentVariable = variable(
+    "MANDATE_WORKTREE_CEILING_BYTES",
+    EnvironmentClass::Ceiling,
+    "built-in worktree footprint ceiling",
+);
+pub const MANDATE_WORKTREE_RETENTION_DAYS: EnvironmentVariable = variable(
+    "MANDATE_WORKTREE_RETENTION_DAYS",
+    EnvironmentClass::Ceiling,
+    "built-in worktree retention window",
+);
 pub const NVM_DIR: EnvironmentVariable =
     variable("NVM_DIR", EnvironmentClass::Location, "$HOME/.nvm");
 pub const OSTROM_HOME: EnvironmentVariable = variable(
@@ -273,6 +283,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvironmentVariable] = &[
     MANDATE_SECRETS_FILE,
     MANDATE_SYSTEMCTL_BIN,
     MANDATE_SYSTEMD_RUN_BIN,
+    MANDATE_WORKTREE_CEILING_BYTES,
+    MANDATE_WORKTREE_RETENTION_DAYS,
     NVM_DIR,
     OSTROM_ACTOR,
     OSTROM_HOME,

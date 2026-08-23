@@ -29,6 +29,7 @@ mod selector;
 mod sweep;
 mod trace;
 mod work_order;
+mod worktree;
 
 pub use app_token::{AppTokenError, CredentialCommandError, credential_output};
 pub use check_store::JsonlCheckStore;
@@ -86,6 +87,12 @@ pub use trace::{
 pub use work_order::{
     ClearedWorkOrder, CreatedWorkOrder, WorkOrderError, branch_name, clear_work_order,
     create_work_order, finalize_exited_implementer, item_hash, validate_work_order_file,
+};
+pub use worktree::{
+    DEFAULT_WORKTREE_CEILING_BYTES, DEFAULT_WORKTREE_RETENTION_DAYS, WorktreeError,
+    WorktreeFootprint, WorktreeRemoval, WorktreeRemovalReason, WorktreeSweep,
+    configured_ceiling_bytes, configured_retention_days, reap_build_cache, sweep_worktrees,
+    worktree_footprint, worktree_root,
 };
 
 use thiserror::Error;

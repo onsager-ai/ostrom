@@ -33,6 +33,7 @@ pub const DOCTOR_CHECKS: &[&str] = &[
     "trace-lease",
     "trace-completeness",
     "work-orders",
+    "worktrees",
     "role-allowlists",
     "builder-pass",
     "gatekeeper-pass",
@@ -246,6 +247,7 @@ fn run_named_check(context: &mut DoctorContext, name: &str) -> DoctorResult {
         "trace-lease" => check_trace_lease(context),
         "trace-completeness" => check_trace_completeness(context),
         "work-orders" => check_work_orders(context),
+        "worktrees" => check_worktrees(context),
         "role-allowlists" => check_delivery_role_allowlists(context),
         "builder-pass" => check_role_pass(context, DeliveryRole::Builder),
         "gatekeeper-pass" => check_role_pass(context, DeliveryRole::Gatekeeper),
@@ -2431,6 +2433,59 @@ fn no_work_orders() -> DoctorResult {
     )
 }
 
+fn check_worktrees(context: &DoctorContext) -> DoctorResult {
+    let ceiling = match context
+        .env(environment::MANDATE_WORKTREE_CEILING_BYTES.name)
+        .and_then(OsStr::to_str)
+    {
+        Some(value) => match value.parse::<u64>().ok().filter(|value| *value > 0) {
+            Some(value) => value,
+            None => {
+                return DoctorResult::new(
+                    DoctorStatus::Warn,
+                    "worktrees",
+                    format!(
+                        "{} must be a positive integer",
+                        environment::MANDATE_WORKTREE_CEILING_BYTES.name
+                    ),
+                    "set a positive byte ceiling or unset it to use the built-in 20 GB ceiling",
+                );
+            }
+        },
+        None => ostrom_store::DEFAULT_WORKTREE_CEILING_BYTES,
+    };
+    let state_root = context
+        .env(environment::OSTROM_HOME.name)
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| context.options.config_dir.join("ostrom"), PathBuf::from);
+    let root = ostrom_store::worktree_root(&state_root);
+    let footprint = match ostrom_store::worktree_footprint(&root) {
+        Ok(footprint) => footprint,
+        Err(error) => {
+            return DoctorResult::new(
+                DoctorStatus::Warn,
+                "worktrees",
+                format!("worktree footprint is unreadable: {error}"),
+                format!("inspect permissions under {}", root.display()),
+            );
+        }
+    };
+    let detail = format!(
+        "count={} total_bytes={} ceiling_bytes={ceiling}",
+        footprint.count, footprint.bytes
+    );
+    if footprint.bytes > ceiling {
+        DoctorResult::new(
+            DoctorStatus::Warn,
+            "worktrees",
+            format!("worktree-footprint-exceeded: {detail}"),
+            "run the next builder dispatch to reconcile retained and orphaned worktrees",
+        )
+    } else {
+        DoctorResult::new(DoctorStatus::Ok, "worktrees", detail, "")
+    }
+}
+
 fn check_delivery_role_allowlists(context: &DoctorContext) -> DoctorResult {
     let settings = context.options.config_dir.join("ostrom/roles");
     let report = check_role_allowlists(&context.options.plugin_root, &settings);
@@ -3080,6 +3135,7 @@ mod tests {
                 "WARN|trace-lease|trace absent; lease idle|run /ostrom:gatekeep and confirm it creates sprint.jsonl\n",
                 "WARN|trace-completeness|no gatekeeper pass ever recorded|run /ostrom:gatekeep and confirm it records pass-ended\n",
                 "OK|work-orders|no work orders in flight|\n",
+                "OK|worktrees|count=0 total_bytes=0 ceiling_bytes=21474836480|\n",
                 "FAIL|role-allowlists|builder: role settings are missing at {config}/ostrom/roles/builder.settings.json; gatekeeper: role settings are missing at {config}/ostrom/roles/gatekeeper.settings.json|align the role allowlists under {config}/ostrom/roles with the named shipped skill commands\n",
                 "WARN|builder-pass|no builder pass ever recorded|run /ostrom:work and confirm it records pass-ended\n",
                 "WARN|gatekeeper-pass|no gatekeeper pass ever recorded|run /ostrom:gatekeep and confirm it records pass-ended\n",
@@ -3092,6 +3148,31 @@ mod tests {
             home = fixture.home.display(),
         );
         assert_eq!(report, expected);
+    }
+
+    #[test]
+    fn worktree_footprint_finding_fires_over_the_configured_ceiling() {
+        let fixture = Fixture::new();
+        let worktree = fixture
+            .config_dir
+            .join("ostrom/implementer-worktrees/placeholder");
+        fs::create_dir_all(&worktree).expect("create worktree fixture");
+        fs::write(worktree.join("artifact"), b"over ceiling").expect("write worktree artifact");
+        let mut options = fixture.options();
+        options.env.insert(
+            ostrom_store::environment::MANDATE_WORKTREE_CEILING_BYTES
+                .name
+                .into(),
+            "1".into(),
+        );
+
+        let output = run_doctor_check(options, "worktrees").expect("run worktree doctor check");
+
+        assert!(
+            output.starts_with("WARN|worktrees|worktree-footprint-exceeded: count=1 total_bytes="),
+            "{output}"
+        );
+        assert!(output.contains(" ceiling_bytes=1|"), "{output}");
     }
 
     #[test]
