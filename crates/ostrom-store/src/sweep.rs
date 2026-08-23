@@ -2007,7 +2007,8 @@ fn analyze_merge_gate(
     let recorded_floor = gate_records
         .iter()
         .filter(|record| {
-            string_field(record, &["pr"]).starts_with(&format!("{repo}#"))
+            crate::gate::is_merge_evidence(record)
+                && string_field(record, &["pr"]).starts_with(&format!("{repo}#"))
                 && matches!(
                     string_field(record, &["verdict"]),
                     "pass" | "fail" | "inconclusive"
@@ -2084,7 +2085,9 @@ fn analyze_merge_gate(
         gate_records
             .iter()
             .fold(BTreeMap::<String, Vec<&Value>>::new(), |mut map, record| {
-                if let Some(sha) = nonempty_string(record, &["head_sha"]) {
+                if crate::gate::is_merge_evidence(record)
+                    && let Some(sha) = nonempty_string(record, &["head_sha"])
+                {
                     map.entry(sha.to_owned()).or_default().push(record);
                 }
                 map

@@ -214,18 +214,21 @@ same-shaped fact object to `delivery_failures`. These are candidate results,
 not narration, and must survive into the terminal pass fact.
 
 For an `inconclusive` verdict, use the gate line's `already_judged` field as a
-delivery guard keyed on `(pr, head_sha)`:
+delivery guard keyed on the gate's judgment identity:
 
-- `already_judged=false` — deliver the `/ostrom:merge` escalation dossier to the
+- `already_judged=not-judged` — deliver the `/ostrom:merge` escalation dossier to the
   principal once.
-- `already_judged=true` — keep the unchanged inconclusive verdict and do not
+- `already_judged=judged` — keep the unchanged inconclusive verdict and do not
   deliver the dossier again.
+- `already_judged=cannot-tell` — do not deliver or write to GitHub; report the
+  named judgment-history error to the principal.
 
-A new head SHA is a new artifact and may escalate once again. Repetition never
-converts `inconclusive` to `pass`; an unchanged inconclusive result remains
-inconclusive however many times the loop observes it. This guard suppresses
-only a repeat escalation. It does not reinterpret the verdict or permit a
-merge.
+A new head SHA or a changed verdict or condition set may escalate once again.
+When the SHA is unavailable, an unchanged digest is still suppressed.
+Repetition never converts `inconclusive` to `pass`; an unchanged inconclusive
+result remains inconclusive however many times the loop observes it. This guard
+suppresses only a repeat escalation. It does not reinterpret the verdict or
+permit a merge.
 
 ## 7. Report the iteration
 

@@ -44,7 +44,7 @@ fn fixture_sweep_queue_is_byte_identical_to_recorded_cross_org_output() {
     fs::write(
         home.path().join("gate.jsonl"),
         concat!(
-            r#"{"ts":"2026-07-10T00:00:00Z","pr":"example-org/example-repo#1","head_sha":"0000000000000000000000000000000000000000","verdict":"pass"}"#,
+            r#"{"ts":"2026-07-10T00:00:00Z","pr":"example-org/example-repo#1","head_sha":"0000000000000000000000000000000000000000","evidence":true,"verdict":"pass"}"#,
             "\n",
         ),
     )
@@ -199,7 +199,7 @@ fn incremental_fixture_retains_unchanged_issue_records_and_queue_bytes() {
     fs::write(
         home.path().join("gate.jsonl"),
         concat!(
-            r#"{"ts":"2026-07-10T00:00:00Z","pr":"example-org/example-repo#1","head_sha":"0000000000000000000000000000000000000000","verdict":"pass"}"#,
+            r#"{"ts":"2026-07-10T00:00:00Z","pr":"example-org/example-repo#1","head_sha":"0000000000000000000000000000000000000000","evidence":true,"verdict":"pass"}"#,
             "\n",
         ),
     )
@@ -492,7 +492,7 @@ fn unexplained_merges_and_reserved_branches_share_the_alarm_kind() {
     fs::write(
         home.path().join("gate.jsonl"),
         concat!(
-            r#"{"ts":"2026-07-01T00:00:00Z","pr":"placeholder-org/alpha#90","head_sha":"floor-sha","verdict":"pass"}"#,
+            r#"{"ts":"2026-07-01T00:00:00Z","pr":"placeholder-org/alpha#90","head_sha":"floor-sha","evidence":true,"verdict":"pass"}"#,
             "\n",
         ),
     )

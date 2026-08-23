@@ -96,6 +96,8 @@ pub enum ExcuseError {
     EmptyReason,
     #[error("{detail}mandate excuse: could not resolve {target}")]
     Resolve { target: String, detail: String },
+    #[error("{detail}mandate excuse: cannot grant for {target}: head SHA is unavailable")]
+    HeadUnavailable { target: String, detail: String },
     #[error("{detail}mandate excuse: {target} did not return a full 40-character head SHA")]
     InvalidHead { target: String, detail: String },
     #[error("mandate excuse: cannot write {0}")]
@@ -113,6 +115,7 @@ impl ExcuseError {
             Self::GhRequired => 1,
             Self::Usage | Self::Condition | Self::EmptyReason => 2,
             Self::Resolve { .. }
+            | Self::HeadUnavailable { .. }
             | Self::InvalidHead { .. }
             | Self::Write(_)
             | Self::Read(_)
@@ -341,7 +344,7 @@ fn join_merges<'a>(
             let sha_records = records
                 .iter()
                 .copied()
-                .filter(|record| !string_value(record.get("head_sha")).is_empty())
+                .filter(|record| crate::gate::is_merge_evidence(record))
                 .collect::<Vec<_>>();
             let latest = sha_records
                 .iter()
@@ -774,6 +777,12 @@ fn resolve_head(target: &str, repo: &str, pr: u64) -> Result<String, ExcuseError
             detail: detail.clone(),
         })?;
     let head = string_value(value.get("headRefOid"));
+    if head.is_empty() {
+        return Err(ExcuseError::HeadUnavailable {
+            target: target.to_owned(),
+            detail,
+        });
+    }
     let pattern = Regex::new(r"^[0-9a-fA-F]{40}$").expect("SHA regex is valid");
     if !pattern.is_match(head) {
         return Err(ExcuseError::InvalidHead {

@@ -105,7 +105,7 @@ ostrom trace append gate-verdict-consumed \
   "$(jq -cn --arg repo "$repository" --argjson pr "$pr_number" \
     --arg head_sha "$head_sha" --arg verdict "$verdict" \
     --argjson exit_code "$gate_exit" \
-    --argjson already_judged "$already_judged" \
+    --arg already_judged "$already_judged" \
     '{repo: $repo, pr: $pr, head_sha: $head_sha, verdict: $verdict,
       exit_code: $exit_code, already_judged: $already_judged}')" \
   '{}'
@@ -119,10 +119,12 @@ a risk assessment or reinterpretation to narration. If either append fails,
 take no GitHub action; return control to `/ostrom:gatekeep`, which ends the pass
 and releases its lease.
 
-The verdict line includes `already_judged=true|false`, keyed on the PR and its
-current head SHA. This marker controls **delivery only** — whether a report
-already sent for this exact artifact is sent again. It never changes the
-verdict, the action taken, or how the verdict is recorded.
+The verdict line includes
+`already_judged=judged|not-judged|cannot-tell`. With a head SHA, the state is
+keyed on the PR, SHA, verdict, and condition set. Without a head SHA, it is
+keyed on a stable digest of the PR, verdict, and condition set. This marker
+controls **delivery only** — whether an identical report was already sent. It
+never changes the verdict, the action taken, or how the verdict is recorded.
 
 A caller running this protocol on a schedule may therefore suppress a repeated
 delivery for an unchanged head SHA; `/ostrom:gatekeep` does exactly that, so an
@@ -426,12 +428,14 @@ instead; do not continue to another write after an invisible failure.
   An `excused` condition is part of a `pass`, so the merge proceeds normally.
   The exception reason already appears in the verdict output and the
   `gate-verdict-consumed` trace fact.
-- **Fail (exit 1)** — if `already_judged=false`, leave the complete gate output
+- **Fail (exit 1)** — if `already_judged=not-judged`, leave the complete gate output
   as one PR comment using the same `verdict-comment` operation and exact
   `metadata:read,pull_requests:write` scope declared above; use a temporary file
   so PR-controlled text is never interpolated into a shell command. Apply the
   same `permission-denied` / `write-failed` recording rules if the comment is
-  refused. If `already_judged=true`, do not post again. Stop in both cases.
+  refused. If `already_judged=judged`, do not post again. If it is
+  `cannot-tell`, make no GitHub write and report the gate's named judgment-history
+  error to the principal. Stop in all three cases.
 - **Inconclusive (exit 2)** — address the principal and emit exactly this
   dossier shape, populated from the gate's unobservable condition details:
 
