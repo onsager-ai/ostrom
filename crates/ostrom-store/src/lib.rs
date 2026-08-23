@@ -59,7 +59,8 @@ pub use plan::{
     PlanFault, PlanOptions, PlanRanking, PlanSweep, UnavailableAssessmentDeriver, run_plan,
 };
 pub use policy::{
-    PolicyBundle, PolicyExplanation, RequirementExplanation, RuleExplanation, SelectorProjection,
+    PolicyBundle, PolicyExplanation, PolicyLayer, RequirementExplanation, RuleExplanation,
+    SelectorProjection,
 };
 pub use policy_signature::{PolicySignatureError, sign_policy_manifest, verify_policy_manifest};
 pub use publish::{PublishDestination, PublishError};

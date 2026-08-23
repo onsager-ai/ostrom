@@ -13,6 +13,8 @@ use ostrom_core::{
 use serde_json::{Value, json};
 use tempfile::tempdir;
 
+mod support;
+
 const ROSTER: &str = r#"
 provider: file
 cadence_hours: 1
@@ -42,6 +44,8 @@ fn fixture() -> PathBuf {
 }
 
 fn configure(home: &Path) {
+    fs::write(home.join("ostrom.yaml"), "manifest_version: 1\n").expect("write repository policy");
+    support::sign_manifest(&home.join("ostrom.yaml"));
     fs::write(home.join("mandates.yaml"), ROSTER).expect("write mandates");
     fs::write(
         home.join("gate.jsonl"),
@@ -143,6 +147,10 @@ fn run_named_assessor(
             "2026-08-01T00:00:00Z",
         ])
         .env("OSTROM_HOME", home)
+        .env(
+            "OSTROM_POLICY_TRUSTED_KEYS",
+            home.join("trusted-policy-keys"),
+        )
         .env_remove("OSTROM_PLAN_DERIVER")
         .env(variable, executable)
         .env("OSTROM_STUB_ARGS", &args_file)
@@ -199,6 +207,10 @@ fn run(home: &Path, command: &str) -> Output {
             "2026-08-01T00:00:00Z",
         ])
         .env("OSTROM_HOME", home)
+        .env(
+            "OSTROM_POLICY_TRUSTED_KEYS",
+            home.join("trusted-policy-keys"),
+        )
         .current_dir(home)
         .output()
         .expect("run ostrom")
@@ -585,6 +597,10 @@ acknowledgements: []
                 started_at,
             ])
             .env("OSTROM_HOME", home.path())
+            .env(
+                "OSTROM_POLICY_TRUSTED_KEYS",
+                home.path().join("trusted-policy-keys"),
+            )
             .env("OSTROM_PLAN_DERIVER", &deriver)
             .current_dir(home.path())
             .output()
@@ -675,6 +691,10 @@ acknowledgements: []
             "2026-08-01T00:00:00Z",
         ])
         .env("OSTROM_HOME", home.path())
+        .env(
+            "OSTROM_POLICY_TRUSTED_KEYS",
+            home.path().join("trusted-policy-keys"),
+        )
         .env("OSTROM_PLAN_DERIVER", &deriver)
         .current_dir(home.path())
         .output()
@@ -777,6 +797,10 @@ acknowledgements: []
             "2026-08-01T00:00:00Z",
         ])
         .env("OSTROM_HOME", home.path())
+        .env(
+            "OSTROM_POLICY_TRUSTED_KEYS",
+            home.path().join("trusted-policy-keys"),
+        )
         .env("OSTROM_PLAN_DERIVER", &deriver)
         .current_dir(home.path())
         .output()
@@ -903,6 +927,10 @@ fn configured_missing_harness_has_a_distinct_named_fault() {
             "2026-08-01T00:00:00Z",
         ])
         .env("OSTROM_HOME", home.path())
+        .env(
+            "OSTROM_POLICY_TRUSTED_KEYS",
+            home.path().join("trusted-policy-keys"),
+        )
         .env_remove("OSTROM_PLAN_DERIVER")
         .env("CLAUDE_BIN", &missing)
         .current_dir(home.path())
@@ -952,6 +980,10 @@ fn named_assessment_stops_at_the_plan_goal_ceiling() {
             "2026-08-01T00:00:00Z",
         ])
         .env("OSTROM_HOME", home.path())
+        .env(
+            "OSTROM_POLICY_TRUSTED_KEYS",
+            home.path().join("trusted-policy-keys"),
+        )
         .env_remove("OSTROM_PLAN_DERIVER")
         .env("CLAUDE_BIN", &stub)
         .env("OSTROM_STUB_ARGS", home.path().join("assessor-args"))

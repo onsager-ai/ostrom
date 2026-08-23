@@ -13,12 +13,16 @@ fn fixture(name: &str) -> PathBuf {
 #[test]
 fn replaying_344_and_351_produces_two_stalled_hold_findings_in_the_digest() {
     let home = TempDir::new().expect("temporary OSTROM_HOME");
-    for name in ["manifest.yml", "checks.yaml", "mandates.yaml"] {
+    fs::create_dir(home.path().join(".git")).expect("repository boundary");
+    for name in ["checks.yaml", "mandates.yaml"] {
         fs::copy(fixture(name), home.path().join(name)).expect("copy policy fixture");
     }
-    let trusted_keys = support::sign_manifest(&home.path().join("manifest.yml"));
+    fs::copy(fixture("manifest.yml"), home.path().join("ostrom.yaml"))
+        .expect("copy policy manifest");
+    let trusted_keys = support::sign_manifest(&home.path().join("ostrom.yaml"));
     for started_at in ["2026-08-01T00:00:00Z", "2026-08-09T00:00:00Z"] {
         let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+            .current_dir(home.path())
             .env("OSTROM_HOME", home.path())
             .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
             .args([

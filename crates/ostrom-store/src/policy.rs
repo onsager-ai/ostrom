@@ -3,11 +3,56 @@ use ostrom_core::{
     StallDuration, UnmatchedPolicy,
 };
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PolicyLayer {
+    Repository,
+    Overlay,
+    Default,
+}
+
+impl PolicyLayer {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Repository => "repository",
+            Self::Overlay => "overlay",
+            Self::Default => "default",
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct PolicyBundle {
     pub manifest: PolicyManifest,
+    overlay_denies: BTreeSet<String>,
+}
+
+impl PolicyBundle {
+    #[must_use]
+    pub fn repository(manifest: PolicyManifest) -> Self {
+        Self {
+            manifest,
+            overlay_denies: BTreeSet::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn layered(manifest: PolicyManifest, overlay_denies: BTreeSet<String>) -> Self {
+        Self {
+            manifest,
+            overlay_denies,
+        }
+    }
+
+    fn rule_layer(&self, kind: &str, id: &str) -> PolicyLayer {
+        if kind == "deny" && self.overlay_denies.contains(id) {
+            PolicyLayer::Overlay
+        } else {
+            PolicyLayer::Repository
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +74,7 @@ pub struct RequirementExplanation {
 pub struct RuleExplanation {
     pub kind: &'static str,
     pub id: String,
+    pub layer: PolicyLayer,
     pub subject_matched: bool,
     pub actor_matched: bool,
     pub matched: bool,
@@ -85,6 +131,7 @@ impl PolicyBundle {
                 rules.push(explain_rule(
                     kind,
                     id,
+                    self.rule_layer(kind, id),
                     declaration,
                     &candidate,
                     actor,
@@ -97,26 +144,41 @@ impl PolicyBundle {
             }
         }
 
+        rules.sort_by_key(|rule| (rule.layer, rule.kind, rule.id.clone()));
+
         let matching_grants = rule_ids(&rules, "grant", |rule| rule.matched);
+        let matching_denies = rule_ids(&rules, "deny", |rule| rule.matched);
+        let deciding_layer = [PolicyLayer::Repository, PolicyLayer::Overlay]
+            .into_iter()
+            .find(|layer| {
+                rules
+                    .iter()
+                    .any(|rule| rule.layer == *layer && rule.matched)
+            })
+            .unwrap_or(PolicyLayer::Default);
         let effective_grants = rule_ids(&rules, "grant", |rule| {
-            rule.matched
+            rule.layer == deciding_layer
+                && rule.matched
                 && rule
                     .requirement
                     .as_ref()
                     .is_none_or(|requirement| requirement.allows)
         });
-        let matching_denies = rule_ids(&rules, "deny", |rule| rule.matched);
-        let granted = !effective_grants.is_empty() && matching_denies.is_empty();
-        let floor = matching_grants.is_empty() && matching_denies.is_empty();
+        let deciding_denies = rule_ids(&rules, "deny", |rule| {
+            rule.layer == deciding_layer && rule.matched
+        });
+        let granted = !effective_grants.is_empty() && deciding_denies.is_empty();
+        let floor = deciding_layer == PolicyLayer::Default;
 
         let hold_rule = if granted {
             None
         } else {
-            matching_denies.first().cloned().or_else(|| {
+            deciding_denies.first().cloned().or_else(|| {
                 rules
                     .iter()
                     .find(|rule| {
-                        rule.kind == "grant"
+                        rule.layer == deciding_layer
+                            && rule.kind == "grant"
                             && rule.matched
                             && rule
                                 .requirement
@@ -150,17 +212,18 @@ impl PolicyBundle {
             })
             .unwrap_or_else(|| "defaults.stalls_after".to_owned());
         let decision_source = if granted {
-            effective_grants
-                .first()
-                .map_or_else(|| "floor".to_owned(), |id| format!("grants.{id}"))
+            effective_grants.first().map_or_else(
+                || "default floor".to_owned(),
+                |id| format!("{} grants.{id}", deciding_layer.name()),
+            )
         } else if let Some(id) = &hold_rule {
             if self.manifest.denies.contains_key(id) {
-                format!("denies.{id}")
+                format!("{} denies.{id}", deciding_layer.name())
             } else {
-                format!("grants.{id}.requires")
+                format!("{} grants.{id}.requires", deciding_layer.name())
             }
         } else {
-            "floor (no grant matched)".to_owned()
+            "default floor (no grant matched)".to_owned()
         };
 
         PolicyExplanation {
@@ -196,6 +259,7 @@ fn rule_ids(
 fn explain_rule(
     kind: &'static str,
     id: &str,
+    layer: PolicyLayer,
     declaration: &RuleDecl,
     candidate: &PolicyCandidate,
     actor: &str,
@@ -254,6 +318,7 @@ fn explain_rule(
     RuleExplanation {
         kind,
         id: id.to_owned(),
+        layer,
         subject_matched,
         actor_matched,
         matched,
@@ -419,8 +484,8 @@ mod tests {
     use super::PolicyBundle;
 
     fn bundle() -> PolicyBundle {
-        PolicyBundle {
-            manifest: PolicyManifest::from_yaml(
+        PolicyBundle::repository(
+            PolicyManifest::from_yaml(
                 r#"
 manifest_version: 1
 defaults: {stalls_after: 7d}
@@ -447,7 +512,7 @@ denies:
 "#,
             )
             .expect("manifest"),
-        }
+        )
     }
 
     #[test]
@@ -464,7 +529,10 @@ denies:
             "work",
         );
         assert!(explanation.granted);
-        assert_eq!(explanation.decision_source, "grants.R-rust-green");
+        assert_eq!(
+            explanation.decision_source,
+            "repository grants.R-rust-green"
+        );
         let grant = explanation
             .rules
             .iter()
@@ -520,7 +588,10 @@ denies:
         );
         assert!(!explanation.granted);
         assert!(explanation.floor);
-        assert_eq!(explanation.decision_source, "floor (no grant matched)");
+        assert_eq!(
+            explanation.decision_source,
+            "default floor (no grant matched)"
+        );
         assert_eq!(explanation.stalls_after.to_string(), "7d");
     }
 
