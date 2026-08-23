@@ -50,7 +50,7 @@ fn configure(home: &Path) {
     fs::write(
         home.join("gate.jsonl"),
         concat!(
-            r#"{"ts":"2026-07-10T00:00:00Z","pr":"example-org/example-repo#1","head_sha":"0000000000000000000000000000000000000000","verdict":"pass"}"#,
+            r#"{"ts":"2026-07-10T00:00:00Z","pr":"example-org/example-repo#1","head_sha":"0000000000000000000000000000000000000000","evidence":true,"verdict":"pass"}"#,
             "\n",
         ),
     )

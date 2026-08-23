@@ -49,10 +49,22 @@ if [ "$1 $2" = "pr view" ]; then
     bounce) title='feat(core): protected placeholder change' ;;
     unknown-check) check=UNRECOGNIZED ;;
   esac
+  if printf '%s\n' "$*" | grep -q -- '--json statusCheckRollup'; then
+    if [ "$mode" = "rollup-403" ]; then
+      printf '%s\n' 'GraphQL: Resource not accessible by integration (repository.pullRequest.statusCheckRollup.nodes.0)' >&2
+      exit 1
+    fi
+    jq -cn --arg check "$check" \
+      '{statusCheckRollup:[{name:"verify-linux",status:"COMPLETED",conclusion:$check}]}'
+    exit 0
+  fi
+  if [ "$mode" = "metadata-403" ]; then
+    printf '%s\n' 'GraphQL: Resource not accessible by integration (repository.pullRequest)' >&2
+    exit 1
+  fi
   jq -cn --argjson number "$3" --arg head "${OSTROM_TEST_GATE_HEAD:-aaaaaaaaaaaaaaaa}" \
     --arg mergeable "$mergeable" --argjson draft "$draft" --arg title "$title" --arg check "$check" '
     {number:$number,title:$title,author:{login:"builder-login"},headRefOid:$head,labels:[],
-     statusCheckRollup:[{name:"verify-linux",status:"COMPLETED",conclusion:$check}],
      closingIssuesReferences:[],mergeable:$mergeable,isDraft:$draft}
     | if env.OSTROM_TEST_GATE_MODE == "missing-mergeable" then del(.mergeable)
       elif env.OSTROM_TEST_GATE_MODE == "malformed-mergeable" then .mergeable=7 else . end'
@@ -247,21 +259,111 @@ fn already_judged_is_keyed_by_pull_request_and_head_sha() {
             .lines()
             .next()
             .unwrap()
-            .ends_with("already_judged=false")
+            .ends_with("already_judged=not-judged")
     );
     assert!(
         repeated
             .lines()
             .next()
             .unwrap()
-            .ends_with("already_judged=true")
+            .ends_with("already_judged=judged")
     );
     assert!(
         advanced
             .lines()
             .next()
             .unwrap()
-            .ends_with("already_judged=false")
+            .ends_with("already_judged=not-judged")
+    );
+}
+
+#[test]
+fn unreadable_rollup_only_makes_required_checks_inconclusive() {
+    let fixture = Fixture::new();
+    let output = fixture.run("rollup-403", 20, "2020202020202020");
+    assert_eq!(output.status.code(), Some(2));
+    let text = output_text(&output);
+    assert!(text.contains("head_sha=2020202020202020"), "{text}");
+    assert!(text.contains("condition mergeable: pass"), "{text}");
+    assert!(text.contains("condition draft: pass"), "{text}");
+    assert!(
+        text.contains("condition required_checks: inconclusive"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Resource not accessible by integration"),
+        "{text}"
+    );
+    for name in [
+        "mergeable",
+        "draft",
+        "review_threads",
+        "bounce_selectors",
+        "reserved_refs",
+    ] {
+        assert!(
+            !text.contains(&format!("condition {name}: inconclusive")),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn sha_less_judgments_are_durable_delivery_memory_but_not_evidence() {
+    let fixture = Fixture::new();
+    let first = output_text(&fixture.run("metadata-403", 21, "ignored"));
+    let repeated = output_text(&fixture.run("metadata-403", 21, "ignored"));
+    assert!(
+        first
+            .lines()
+            .next()
+            .unwrap()
+            .ends_with("already_judged=not-judged")
+    );
+    assert!(
+        repeated
+            .lines()
+            .next()
+            .unwrap()
+            .ends_with("already_judged=judged")
+    );
+
+    let records = fs::read_to_string(fixture.home.join("gate.jsonl")).unwrap();
+    let records = records
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 2);
+    assert!(records.iter().all(|record| record["head_sha"].is_null()));
+    assert!(records.iter().all(|record| record["evidence"] == false));
+}
+
+#[test]
+fn changed_judgment_on_the_same_head_is_not_suppressed() {
+    let fixture = Fixture::new();
+    let first = output_text(&fixture.run("pass", 22, "2222222222222222"));
+    let changed = output_text(&fixture.run("draft", 22, "2222222222222222"));
+    let repeated = output_text(&fixture.run("draft", 22, "2222222222222222"));
+    assert!(
+        first
+            .lines()
+            .next()
+            .unwrap()
+            .ends_with("already_judged=not-judged")
+    );
+    assert!(
+        changed
+            .lines()
+            .next()
+            .unwrap()
+            .ends_with("already_judged=not-judged")
+    );
+    assert!(
+        repeated
+            .lines()
+            .next()
+            .unwrap()
+            .ends_with("already_judged=judged")
     );
 }
 

@@ -1,4 +1,4 @@
-verdict: pass pr=placeholder-org/alpha#7 head_sha=aaaaaaaaaaaaaaaa already_judged=false
+verdict: pass pr=placeholder-org/alpha#7 head_sha=aaaaaaaaaaaaaaaa already_judged=not-judged
 condition mergeable: pass tier=content-derived detail={"mergeable":"MERGEABLE"}
 condition draft: pass tier=content-derived detail={"isDraft":false}
 condition required_checks: pass tier=content-derived detail={"selectors":[{"selector":"verify-*","result":"pass","matches":[{"name":"verify-linux","state":"SUCCESS"}]}]}

@@ -28,6 +28,8 @@
     "ts",
     "pr",
     "head_sha",
+    "evidence",
+    "judgment_digest",
     "verdict",
     "already_judged",
     "conditions"

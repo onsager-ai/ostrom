@@ -21,6 +21,16 @@ if [ "$1 $2" = "pr view" ]; then
     draft) is_draft=true ;;
     bounce) title='feat(core): protected placeholder change' ;;
   esac
+  if [[ " $* " == *" --json statusCheckRollup "* ]]; then
+    jq -cn --arg check_conclusion "$check_conclusion" '
+      {statusCheckRollup: [{
+        name: "verify-linux",
+        status: "COMPLETED",
+        conclusion: $check_conclusion
+      }]}
+    '
+    exit 0
+  fi
   jq -cn \
     --argjson number "$3" \
     --arg head "${GATE_FIXTURE_HEAD:-aaaaaaaaaaaaaaaa}" \
@@ -34,11 +44,6 @@ if [ "$1 $2" = "pr view" ]; then
         author: {login: "placeholder-builder"},
         headRefOid: $head,
         labels: [],
-        statusCheckRollup: [{
-          name: "verify-linux",
-          status: "COMPLETED",
-          conclusion: $check_conclusion
-        }],
         closingIssuesReferences: [],
         mergeable: $mergeable,
         isDraft: $is_draft

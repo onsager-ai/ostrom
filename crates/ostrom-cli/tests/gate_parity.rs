@@ -145,9 +145,16 @@ fn rust_gate_matches_recorded_shell_corpus_apart_from_the_injected_clock() {
         let expected_record: Value =
             serde_json::from_slice(&expected_bytes).expect("parse recorded shell verdict");
         actual_record["ts"] = expected_record["ts"].clone();
-        let mut normalized = serde_json::to_vec(&actual_record).expect("serialize verdict");
-        normalized.push(b'\n');
-        assert_eq!(normalized, expected_bytes, "{} gate log", case.name);
+        actual_record
+            .as_object_mut()
+            .expect("gate record is an object")
+            .remove("evidence");
+        actual_record
+            .as_object_mut()
+            .expect("gate record is an object")
+            .remove("judgment_digest");
+        actual_record["already_judged"] = Value::Bool(false);
+        assert_eq!(actual_record, expected_record, "{} gate log", case.name);
         if let Some(condition_name) = match case.name {
             "conflicting" => Some("mergeable"),
             "draft" => Some("draft"),
@@ -199,7 +206,7 @@ fn malformed_target_is_named_usage_error_and_writes_nothing() {
 }
 
 #[test]
-fn unresolved_head_is_not_written_as_a_verdict() {
+fn unresolved_head_is_written_as_non_evidence_delivery_memory() {
     let fixture = fixture_root();
     let root = tempdir().expect("temporary gate fixture");
     fs::copy(
@@ -219,7 +226,12 @@ fn unresolved_head_is_not_written_as_a_verdict() {
         .expect("run unresolved gate input");
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stdout).starts_with("verdict: inconclusive "));
-    assert!(!root.path().join("gate.jsonl").exists());
+    let record: Value = serde_json::from_slice(
+        &fs::read(root.path().join("gate.jsonl")).expect("read SHA-less judgment"),
+    )
+    .expect("parse SHA-less judgment");
+    assert!(record["head_sha"].is_null());
+    assert_eq!(record["evidence"], false);
 }
 
 #[test]
@@ -357,8 +369,13 @@ projects:
     let mut record: Value =
         serde_json::from_slice(&fs::read(&gate_path).expect("read gate-produced evidence"))
             .expect("parse gate-produced evidence");
-    record["head_sha"] = Value::String("bbbbbbbbbbbbbbbb".to_owned());
-    fs::write(&gate_path, format!("{record}\n")).expect("write mismatched synthetic evidence");
+    record["evidence"] = Value::Bool(false);
+    let mut floor = record.clone();
+    floor["pr"] = Value::String("placeholder-org/alpha#6".to_owned());
+    floor["head_sha"] = Value::String("bbbbbbbbbbbbbbbb".to_owned());
+    floor["evidence"] = Value::Bool(true);
+    fs::write(&gate_path, format!("{floor}\n{record}\n"))
+        .expect("write explicitly non-evidence synthetic judgment");
     let mismatch = Command::new(env!("CARGO_BIN_EXE_ostrom"))
         .args([
             "sweep",
@@ -371,10 +388,10 @@ projects:
         .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
         .current_dir(root.path())
         .output()
-        .expect("run mismatched end-to-end sweep");
+        .expect("run non-evidence end-to-end sweep");
     assert!(mismatch.status.success());
     let queue = fs::read_to_string(root.path().join("queue.jsonl"))
-        .expect("read mismatched merge-gate queue");
+        .expect("read non-evidence merge-gate queue");
     assert!(queue.lines().any(|line| {
         serde_json::from_str::<Value>(line).is_ok_and(|row| row["kind"] == "merge-gate-fault")
     }));

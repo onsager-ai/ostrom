@@ -6,7 +6,7 @@ use std::{
     process::{Command, Output},
 };
 
-use ostrom_core::{GateConfig, GateProject, GateSelector};
+use ostrom_core::{GateConfig, GateProject, GateSelector, sha256_hex};
 use regex::{Regex, RegexBuilder};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -64,6 +64,9 @@ struct Acquisition {
     metadata: Value,
     metadata_error: String,
     head_sha: String,
+    checks_ready: bool,
+    checks: Vec<Value>,
+    checks_error: String,
     diff_ready: bool,
     paths: Vec<String>,
     diff_error: String,
@@ -74,6 +77,23 @@ struct Acquisition {
     threads: Vec<Value>,
     threads_error: String,
     thread_author: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum JudgmentState {
+    Judged,
+    NotJudged,
+    CannotTell(String),
+}
+
+impl JudgmentState {
+    const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Judged => "judged",
+            Self::NotJudged => "not-judged",
+            Self::CannotTell(_) => "cannot-tell",
+        }
+    }
 }
 
 pub fn run_gate(options: &GateOptions) -> Result<GateOutput, GateError> {
@@ -88,7 +108,7 @@ pub fn run_gate(options: &GateOptions) -> Result<GateOutput, GateError> {
         "--repo",
         target.repo,
         "--json",
-        "number,title,author,headRefOid,labels,statusCheckRollup,closingIssuesReferences,mergeable,isDraft",
+        "number,title,author,headRefOid,labels,closingIssuesReferences,mergeable,isDraft",
     ]) {
         Ok(output) => output,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -97,7 +117,21 @@ pub fn run_gate(options: &GateOptions) -> Result<GateOutput, GateError> {
         Err(error) => synthetic_output(error.to_string()),
     };
 
+    let checks_output = match gh(&[
+        "pr",
+        "view",
+        &target.number.to_string(),
+        "--repo",
+        target.repo,
+        "--json",
+        "statusCheckRollup",
+    ]) {
+        Ok(output) => output,
+        Err(error) => synthetic_output(error.to_string()),
+    };
+
     let mut acquisition = acquire_metadata(metadata_output, target.number);
+    acquire_checks(&mut acquisition, checks_output);
     acquire_paths(&mut acquisition, &target);
     if config.as_ref().is_some_and(config_needs_diff_content) {
         acquire_diff_content(&mut acquisition, &target);
@@ -121,7 +155,16 @@ pub fn run_gate(options: &GateOptions) -> Result<GateOutput, GateError> {
     );
     let verdict = aggregate(&conditions);
     let gate_path = options.paths.state.join("gate.jsonl");
-    let already_judged = already_judged(&gate_path, target.full, &acquisition.head_sha);
+    let judgment_digest = judgment_digest(target.full, verdict, &conditions)?;
+    let already_judged = already_judged(
+        &gate_path,
+        target.full,
+        &acquisition.head_sha,
+        &judgment_digest,
+    );
+    if let JudgmentState::CannotTell(reason) = &already_judged {
+        stderr.push_str(&format!("mandate gate: {reason}\n"));
+    }
     let record = json!({
         "ts": options.timestamp,
         "pr": target.full,
@@ -130,20 +173,34 @@ pub fn run_gate(options: &GateOptions) -> Result<GateOutput, GateError> {
         } else {
             Value::String(acquisition.head_sha.clone())
         },
+        "evidence": !acquisition.head_sha.is_empty(),
+        "judgment_digest": judgment_digest,
         "verdict": verdict,
-        "already_judged": already_judged,
+        "already_judged": already_judged.as_str(),
         "conditions": conditions,
     });
 
-    // A null-SHA row claims a judgment exists without identifying the artifact
-    // that was judged. Sweep joins evidence by SHA, so such a row can only
-    // corrupt the audit surface; the inconclusive result remains visible to
-    // the caller but is not recorded as merge evidence.
-    if !acquisition.head_sha.is_empty() && append_record(&gate_path, &record).is_err() {
+    // A null-SHA row cannot identify the artifact that was judged, so it is
+    // durable delivery memory but never merge evidence. Every evidence reader
+    // filters the marker explicitly before joining by SHA.
+    if append_record(&gate_path, &record).is_err() {
+        let reported_state = match already_judged {
+            JudgmentState::NotJudged => JudgmentState::CannotTell(format!(
+                "could not append judgment history at {}",
+                gate_path.display()
+            )),
+            state => state,
+        };
         return Ok(GateOutput {
             stdout: format!(
-                "verdict: inconclusive pr={} head_sha={} already_judged={already_judged}\n",
-                target.full, acquisition.head_sha
+                "verdict: inconclusive pr={} head_sha={} already_judged={}\n",
+                target.full,
+                if acquisition.head_sha.is_empty() {
+                    "unknown"
+                } else {
+                    &acquisition.head_sha
+                },
+                reported_state.as_str(),
             ),
             stderr: format!(
                 "{stderr}mandate gate: could not append {}\n",
@@ -190,7 +247,7 @@ fn parse_target(value: &str) -> Result<Target<'_>, GateError> {
 fn requirement_failure(target: &Target<'_>, command: &str) -> GateOutput {
     GateOutput {
         stdout: format!(
-            "verdict: inconclusive pr={} head_sha=unknown already_judged=false\n",
+            "verdict: inconclusive pr={} head_sha=unknown already_judged=cannot-tell\n",
             target.full
         ),
         stderr: format!("mandate gate: {command} is required\n"),
@@ -241,12 +298,15 @@ fn acquire_metadata(output: Output, expected_number: u64) -> Acquisition {
     Acquisition {
         metadata_ready,
         metadata: if metadata_ready {
-            parsed.unwrap_or_else(|| json!({}))
+            parsed.expect("ready metadata was parsed")
         } else {
             json!({})
         },
         metadata_error,
         head_sha,
+        checks_ready: false,
+        checks: Vec::new(),
+        checks_error: String::new(),
         diff_ready: false,
         paths: Vec::new(),
         diff_error: String::new(),
@@ -274,15 +334,30 @@ fn valid_metadata(value: &Value, expected_number: u64) -> bool {
             .is_some_and(|sha| !sha.is_empty())
         && value.get("labels").and_then(Value::as_array).is_some()
         && value
-            .get("statusCheckRollup")
-            .and_then(Value::as_array)
-            .is_some()
-        && value
             .get("closingIssuesReferences")
             .and_then(Value::as_array)
             .is_some()
         && value.get("mergeable").and_then(Value::as_str).is_some()
         && value.get("isDraft").and_then(Value::as_bool).is_some()
+}
+
+fn acquire_checks(acquisition: &mut Acquisition, output: Output) {
+    let parsed = serde_json::from_slice::<Value>(&output.stdout).ok();
+    let checks = parsed
+        .as_ref()
+        .and_then(|value| value.get("statusCheckRollup"))
+        .and_then(Value::as_array);
+    if output.status.success()
+        && let Some(checks) = checks
+    {
+        acquisition.checks_ready = true;
+        acquisition.checks = checks.clone();
+        acquisition.checks_error.clear();
+    } else if output.status.success() {
+        acquisition.checks_error = "required-check response was incomplete".to_owned();
+    } else {
+        acquisition.checks_error = error_text(&output.stderr);
+    }
 }
 
 fn acquire_paths(acquisition: &mut Acquisition, target: &Target<'_>) {
@@ -475,6 +550,27 @@ fn error_text(bytes: &[u8]) -> String {
         .take(500)
         .collect::<Vec<_>>();
     String::from_utf8_lossy(&flattened).into_owned()
+}
+
+/// Whether a gate journal row may be joined as merge evidence.
+///
+/// New rows carry `evidence`, written as `!head_sha.is_empty()`. Rows written
+/// before that field existed carry no marker, and for those the head SHA *is*
+/// the marker — it was recorded exactly when the judgment identified an
+/// artifact. Reading a missing field as "not evidence" would silently retire
+/// the entire journal: the live host holds 4,519 rows, none of them marked,
+/// and 4,422 of them carrying a SHA. The merge-gate-fault check derives its
+/// epoch floor from these rows and skips every merge when the floor is absent,
+/// so it would go dark rather than loud — the same class of defect this change
+/// exists to fix.
+pub(crate) fn is_merge_evidence(record: &Value) -> bool {
+    match record.get("evidence") {
+        Some(marker) => marker.as_bool() == Some(true),
+        None => record
+            .get("head_sha")
+            .and_then(Value::as_str)
+            .is_some_and(|sha| !sha.is_empty()),
+    }
 }
 
 pub(crate) fn load_gate_config(paths: &OstromPaths, cwd: &Path) -> Result<GateConfig, String> {
@@ -684,21 +780,18 @@ fn evaluate_draft(acquisition: &Acquisition) -> Value {
 }
 
 fn evaluate_checks(project: &GateProject, acquisition: &Acquisition) -> Value {
-    if !acquisition.metadata_ready {
+    if !acquisition.checks_ready {
         return condition(
             "required_checks",
             "inconclusive",
             &["content-derived"],
-            json!({"reason": acquisition.metadata_error}),
+            json!({"reason": acquisition.checks_error}),
         );
     }
-    let checks = acquisition.metadata["statusCheckRollup"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
     let mut selected = Vec::new();
     for selector in &project.required_checks {
-        let matches = checks
+        let matches = acquisition
+            .checks
             .iter()
             .filter(|check| glob_match(check_name(check), selector, false))
             .map(|check| json!({"name": check_name(check), "state": check_state(check)}))
@@ -1220,24 +1313,69 @@ fn aggregate(conditions: &[Value]) -> &'static str {
     }
 }
 
-fn already_judged(path: &Path, target: &str, head_sha: &str) -> bool {
-    if head_sha.is_empty() {
-        return false;
+fn judgment_digest(target: &str, verdict: &str, conditions: &[Value]) -> Result<String, GateError> {
+    let mut conditions = conditions.to_vec();
+    conditions.sort_by(|left, right| {
+        left["name"]
+            .as_str()
+            .expect("conditions have names")
+            .cmp(right["name"].as_str().expect("conditions have names"))
+    });
+    let material = serde_json::to_vec(&json!({
+        "pr": target,
+        "verdict": verdict,
+        "conditions": conditions,
+    }))
+    .map_err(|_| GateError::Serialize)?;
+    Ok(format!("sha256:{}", sha256_hex(&material)))
+}
+
+fn already_judged(path: &Path, target: &str, head_sha: &str, digest: &str) -> JudgmentState {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return JudgmentState::NotJudged;
+        }
+        Err(error) => {
+            return JudgmentState::CannotTell(format!(
+                "could not read judgment history at {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    let records = match serde_json::Deserializer::from_str(&text)
+        .into_iter::<Value>()
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(records) => records,
+        Err(error) => {
+            return JudgmentState::CannotTell(format!(
+                "judgment history at {} is malformed: {error}",
+                path.display()
+            ));
+        }
+    };
+    let evidence = !head_sha.is_empty();
+    let previous = records.iter().rev().find(|record| {
+        record["pr"].as_str() == Some(target)
+            && record["evidence"].as_bool() == Some(evidence)
+            && if evidence {
+                record["head_sha"].as_str() == Some(head_sha)
+            } else {
+                record["head_sha"].is_null()
+            }
+    });
+    let Some(previous) = previous else {
+        return JudgmentState::NotJudged;
+    };
+    match previous["judgment_digest"].as_str() {
+        Some(previous) if previous == digest => JudgmentState::Judged,
+        Some(_) => JudgmentState::NotJudged,
+        None => JudgmentState::CannotTell(format!(
+            "matching judgment in {} has no judgment_digest",
+            path.display()
+        )),
     }
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|text| {
-            serde_json::Deserializer::from_str(&text)
-                .into_iter::<Value>()
-                .collect::<Result<Vec<_>, _>>()
-                .ok()
-        })
-        .is_some_and(|records| {
-            records.iter().any(|record| {
-                record["pr"].as_str() == Some(target)
-                    && record["head_sha"].as_str() == Some(head_sha)
-            })
-        })
 }
 
 fn append_record(path: &Path, record: &Value) -> io::Result<()> {
@@ -1257,7 +1395,9 @@ fn render_record(record: &Value) -> Result<String, GateError> {
         record["verdict"].as_str().unwrap_or_default(),
         record["pr"].as_str().unwrap_or_default(),
         record["head_sha"].as_str().unwrap_or("unknown"),
-        record["already_judged"].as_bool().unwrap_or(false),
+        record["already_judged"]
+            .as_str()
+            .ok_or(GateError::Serialize)?,
     );
     for condition in record["conditions"]
         .as_array()
@@ -1361,6 +1501,33 @@ projects:
     }
 
     #[test]
+    fn malformed_judgment_history_is_cannot_tell() {
+        let fixture = tempfile::tempdir().expect("temporary judgment fixture");
+        let path = fixture.path().join("gate.jsonl");
+        fs::write(&path, "{malformed}\n").expect("write malformed judgment history");
+        let state = already_judged(
+            &path,
+            "placeholder-org/alpha#7",
+            "aaaaaaaaaaaaaaaa",
+            "sha256:placeholder",
+        );
+        assert!(matches!(state, JudgmentState::CannotTell(reason) if reason.contains("malformed")));
+    }
+
+    #[test]
+    fn judgment_digest_treats_conditions_as_a_set() {
+        let first = vec![
+            condition("draft", "pass", &[], json!({"isDraft": false})),
+            condition("mergeable", "pass", &[], json!({"mergeable": "MERGEABLE"})),
+        ];
+        let second = first.iter().rev().cloned().collect::<Vec<_>>();
+        assert_eq!(
+            judgment_digest("placeholder-org/alpha#7", "pass", &first).unwrap(),
+            judgment_digest("placeholder-org/alpha#7", "pass", &second).unwrap()
+        );
+    }
+
+    #[test]
     fn exception_requires_every_key_and_a_nonempty_reason() {
         let fixture = tempfile::tempdir().expect("temporary exception fixture");
         let path = fixture.path().join("exceptions.jsonl");
@@ -1400,5 +1567,33 @@ projects:
             conditions[0]["exception_reason"],
             "principal accepted placeholder conflict"
         );
+    }
+
+    /// The live journal holds 4,519 rows written before the `evidence` marker
+    /// existed, 4,422 of them carrying a head SHA. Reading a missing marker as
+    /// "not evidence" retires all of them at once, and because the merge-gate
+    /// check skips every merge when its epoch floor is absent, it would go
+    /// silent rather than loud — the exact failure this module exists to stop.
+    #[test]
+    fn a_row_written_before_the_evidence_marker_is_evidence_when_it_names_a_sha() {
+        let legacy_with_sha = json!({"pr": "placeholder-org/alpha#1", "head_sha": "a".repeat(40)});
+        let legacy_without_sha = json!({"pr": "placeholder-org/alpha#2", "head_sha": Value::Null});
+        let marked =
+            json!({"pr": "placeholder-org/alpha#3", "head_sha": "b".repeat(40), "evidence": true});
+        let unmarked =
+            json!({"pr": "placeholder-org/alpha#4", "head_sha": Value::Null, "evidence": false});
+
+        assert!(is_merge_evidence(&legacy_with_sha));
+        assert!(!is_merge_evidence(&legacy_without_sha));
+        assert!(is_merge_evidence(&marked));
+        assert!(!is_merge_evidence(&unmarked));
+    }
+
+    /// An explicit marker always wins, so a row can never be promoted back into
+    /// evidence by the SHA it happens to carry.
+    #[test]
+    fn an_explicit_evidence_marker_overrides_the_head_sha() {
+        let contradictory = json!({"head_sha": "c".repeat(40), "evidence": false});
+        assert!(!is_merge_evidence(&contradictory));
     }
 }

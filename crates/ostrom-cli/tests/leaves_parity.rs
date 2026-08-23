@@ -159,6 +159,31 @@ fn malformed_leaf_input_has_the_shell_exit_status_and_never_panics() {
 }
 
 #[test]
+fn excuse_grant_refuses_when_the_head_sha_is_unavailable() {
+    let fixture = leaf_fixture();
+    write_executable(
+        &fixture.root.path().join("gh"),
+        "#!/bin/sh\nif [ \"$1 $2\" = \"pr view\" ]; then printf '{\"headRefOid\":null}\\n'; exit 0; fi\nexit 1\n",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .args([
+            "excuse",
+            "grant",
+            "placeholder-org/alpha#7",
+            "review_threads",
+            "placeholder reason",
+        ])
+        .env("OSTROM_HOME", fixture.home.path())
+        .env("PATH", fixture.path())
+        .output()
+        .expect("run excuse grant without a resolvable head");
+    assert_eq!(output.status.code(), Some(3));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("head SHA is unavailable"), "{stderr}");
+    assert!(!fixture.home.path().join("exceptions.jsonl").exists());
+}
+
+#[test]
 fn local_drift_invokes_only_read_operations_and_preserves_repository_state() {
     let fixture = tempdir().expect("temporary local drift fixture");
     let home = fixture.path().join("home");
@@ -275,7 +300,7 @@ fn granted_record_is_consumed_by_the_existing_sweep_join() {
     .expect("copy mandates");
     fs::write(
         fixture.home.path().join("gate.jsonl"),
-        "{\"ts\":\"2026-07-01T00:00:00Z\",\"pr\":\"placeholder-org/alpha#1\",\"head_sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"verdict\":\"pass\",\"conditions\":[]}\n",
+        "{\"ts\":\"2026-07-01T00:00:00Z\",\"pr\":\"placeholder-org/alpha#1\",\"head_sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"evidence\":true,\"verdict\":\"pass\",\"conditions\":[]}\n",
     )
     .unwrap();
     let sweep_fixture = fixture.home.path().join("sweep.json");
