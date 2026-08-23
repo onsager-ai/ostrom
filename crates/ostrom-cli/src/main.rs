@@ -89,7 +89,7 @@ enum Command {
     /// Explain how authored policy resolves for one pull request.
     Explain {
         target: String,
-        /// Policy manifest; defaults to repository then user configuration.
+        /// Policy manifest; defaults to repository discovery.
         #[arg(long)]
         manifest: Option<PathBuf>,
         /// Actor projection to explain.

@@ -3642,8 +3642,8 @@ mod tests {
     }
 
     fn hold_policy() -> PolicyBundle {
-        PolicyBundle {
-            manifest: ostrom_core::PolicyManifest::from_yaml(
+        PolicyBundle::repository(
+            ostrom_core::PolicyManifest::from_yaml(
                 r#"
 manifest_version: 1
 defaults: {stalls_after: 7d}
@@ -3658,7 +3658,7 @@ denies:
 "#,
             )
             .expect("hold policy"),
-        }
+        )
     }
 
     fn hold_snapshots(numbers: &[u64]) -> Vec<RepositorySnapshot> {

@@ -89,6 +89,12 @@ impl OstromPaths {
     pub fn secrets_file(&self) -> PathBuf {
         resolve_secrets_file(&self.config, environment::MANDATE_SECRETS_FILE.value_os())
     }
+
+    /// The operator-private policy overlay.
+    #[must_use]
+    pub fn private_config_file(&self) -> PathBuf {
+        self.config.join("config.yaml")
+    }
 }
 
 fn resolve_secrets_file(

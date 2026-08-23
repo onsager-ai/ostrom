@@ -3,6 +3,8 @@ use std::{fs, path::Path, process::Command, time::SystemTime};
 use chrono::{DateTime, Utc};
 use tempfile::tempdir;
 
+mod support;
+
 const ROSTER: &str = r#"
 provider: file
 cadence_hours: 1
@@ -28,10 +30,16 @@ projects:
     bounce: []
 "#;
 
+fn install_repository_policy(home: &Path) -> std::path::PathBuf {
+    fs::write(home.join("ostrom.yaml"), "manifest_version: 1\n").expect("write repository policy");
+    support::sign_manifest(&home.join("ostrom.yaml"))
+}
+
 #[test]
 fn fixture_sweep_queue_is_byte_identical_to_recorded_cross_org_output() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let home = tempdir().expect("temporary OSTROM_HOME");
+    let trusted_keys = install_repository_policy(home.path());
     fs::write(home.path().join("mandates.yaml"), ROSTER).expect("write fixture roster");
     fs::write(
         home.path().join("gate.jsonl"),
@@ -53,6 +61,7 @@ fn fixture_sweep_queue_is_byte_identical_to_recorded_cross_org_output() {
             "2026-08-01T00:00:00Z",
         ])
         .env("OSTROM_HOME", home.path())
+        .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
         .current_dir(home.path())
         .output()
         .expect("run Rust fixture sweep");
@@ -72,6 +81,7 @@ fn fixture_sweep_queue_is_byte_identical_to_recorded_cross_org_output() {
 fn fixture_sweep_turns_a_stale_work_ranking_pointer_into_a_visible_fault() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let home = tempdir().expect("temporary OSTROM_HOME");
+    let trusted_keys = install_repository_policy(home.path());
     let ranked_roster = ROSTER.replace(
         "hold_labels: []\n",
         concat!(
@@ -94,6 +104,7 @@ fn fixture_sweep_turns_a_stale_work_ranking_pointer_into_a_visible_fault() {
             "2026-08-01T00:00:00Z",
         ])
         .env("OSTROM_HOME", home.path())
+        .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
         .current_dir(home.path())
         .output()
         .expect("run ranked fixture sweep");
@@ -138,6 +149,7 @@ fn fixture_sweep_turns_a_stale_work_ranking_pointer_into_a_visible_fault() {
 fn fixture_sweep_refuses_a_query_at_the_exhaustiveness_cap() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let home = tempdir().expect("temporary OSTROM_HOME");
+    let trusted_keys = install_repository_policy(home.path());
     fs::write(home.path().join("mandates.yaml"), ROSTER).expect("write fixture roster");
     let fixture: serde_json::Value = serde_json::from_slice(
         &fs::read(root.join("tests/fixtures/sweep-cross-org.json")).expect("read fixture"),
@@ -162,6 +174,7 @@ fn fixture_sweep_refuses_a_query_at_the_exhaustiveness_cap() {
             "2026-08-01T00:00:00Z",
         ])
         .env("OSTROM_HOME", home.path())
+        .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
         .current_dir(home.path())
         .output()
         .expect("run truncated fixture sweep");
@@ -181,6 +194,7 @@ fn fixture_sweep_refuses_a_query_at_the_exhaustiveness_cap() {
 fn incremental_fixture_retains_unchanged_issue_records_and_queue_bytes() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let home = tempdir().expect("temporary OSTROM_HOME");
+    let trusted_keys = install_repository_policy(home.path());
     fs::write(home.path().join("mandates.yaml"), ROSTER).expect("write fixture roster");
     fs::write(
         home.path().join("gate.jsonl"),
@@ -200,6 +214,7 @@ fn incremental_fixture_retains_unchanged_issue_records_and_queue_bytes() {
             "2026-08-01T00:00:00Z",
         ])
         .env("OSTROM_HOME", home.path())
+        .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
         .current_dir(home.path())
         .output()
         .expect("run full fixture sweep");
@@ -228,6 +243,7 @@ fn incremental_fixture_retains_unchanged_issue_records_and_queue_bytes() {
             "2026-08-01T01:00:00Z",
         ])
         .env("OSTROM_HOME", home.path())
+        .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
         .current_dir(home.path())
         .output()
         .expect("run incremental fixture sweep");
@@ -392,6 +408,7 @@ projects:
 
 fn write_placeholder_fixture(home: &Path, repository: serde_json::Value) -> std::path::PathBuf {
     fs::write(home.join("mandates.yaml"), PLACEHOLDER_ROSTER).expect("write placeholder roster");
+    install_repository_policy(home);
     let fixture = home.join("fixture.json");
     fs::write(
         &fixture,
@@ -409,6 +426,10 @@ fn run_placeholder_sweep(home: &Path, fixture: &Path, extra: &[&str]) -> std::pr
     command.args(extra);
     command
         .env("OSTROM_HOME", home)
+        .env(
+            "OSTROM_POLICY_TRUSTED_KEYS",
+            home.join("trusted-policy-keys"),
+        )
         .current_dir(home)
         .output()
         .expect("run placeholder sweep")
@@ -749,6 +770,10 @@ fn realtime_clock_drives_sweep_and_cli_time_takes_precedence() {
         .args(["sweep", "--fixture"])
         .arg(&fixture)
         .env("OSTROM_HOME", home.path())
+        .env(
+            "OSTROM_POLICY_TRUSTED_KEYS",
+            home.path().join("trusted-policy-keys"),
+        )
         .current_dir(home.path())
         .output()
         .expect("run realtime sweep");
@@ -771,6 +796,10 @@ fn realtime_clock_drives_sweep_and_cli_time_takes_precedence() {
             "2026-08-03T04:05:06Z",
         ])
         .env("OSTROM_HOME", home.path())
+        .env(
+            "OSTROM_POLICY_TRUSTED_KEYS",
+            home.path().join("trusted-policy-keys"),
+        )
         .current_dir(home.path())
         .output()
         .expect("run CLI-overridden sweep");
@@ -791,6 +820,10 @@ fn realtime_clock_drives_plan_and_cli_time_takes_precedence() {
         .args(["plan", "--fixture"])
         .arg(&fixture)
         .env("OSTROM_HOME", home.path())
+        .env(
+            "OSTROM_POLICY_TRUSTED_KEYS",
+            home.path().join("trusted-policy-keys"),
+        )
         .current_dir(home.path())
         .output()
         .expect("run realtime plan");
@@ -824,6 +857,10 @@ fn realtime_clock_drives_plan_and_cli_time_takes_precedence() {
             "2026-08-05T06:07:08Z",
         ])
         .env("OSTROM_HOME", home.path())
+        .env(
+            "OSTROM_POLICY_TRUSTED_KEYS",
+            home.path().join("trusted-policy-keys"),
+        )
         .current_dir(home.path())
         .output()
         .expect("run CLI-overridden plan");
@@ -834,6 +871,9 @@ fn realtime_clock_drives_plan_and_cli_time_takes_precedence() {
 fn an_entirely_unmintable_roster_is_refused_without_overwriting() {
     let home = tempdir().expect("temporary OSTROM_HOME");
     fs::write(home.path().join("mandates.yaml"), PLACEHOLDER_ROSTER).expect("write roster");
+    fs::write(home.path().join("ostrom.yaml"), "manifest_version: 1\n")
+        .expect("write repository policy");
+    support::sign_manifest(&home.path().join("ostrom.yaml"));
     let queue_before = br##"{"id":"placeholder-org/alpha#7","repo":"placeholder-org/alpha","ref":"#7","title":"Placeholder retained decision","kind":"decision","mandate":{"reason":"placeholder"},"state":"deferred","opened":"2026-07-01T00:00:00Z","age_days":31,"aged_out":true,"needs_judgment":true,"blocked_by":[]}
 "##;
     let state_before = br#"{"version":2,"sweep_mode":"full","repos":{"placeholder-org/alpha":{"cursor":"2026-07-01T00:00:00Z","records":{}}}}"#;
@@ -843,6 +883,10 @@ fn an_entirely_unmintable_roster_is_refused_without_overwriting() {
     let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
         .args(["sweep", "--started-at", "2026-08-01T00:00:00Z"])
         .env("OSTROM_HOME", home.path())
+        .env(
+            "OSTROM_POLICY_TRUSTED_KEYS",
+            home.path().join("trusted-policy-keys"),
+        )
         .env("MANDATE_SECRETS_FILE", home.path().join("absent.yaml"))
         .current_dir(home.path())
         .output()

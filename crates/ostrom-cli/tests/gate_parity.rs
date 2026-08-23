@@ -9,6 +9,8 @@ use chrono::{Duration, SecondsFormat};
 use serde_json::Value;
 use tempfile::tempdir;
 
+mod support;
+
 struct Case {
     name: &'static str,
     mode: &'static str,
@@ -278,6 +280,9 @@ projects:
 "#,
     )
     .expect("write synthetic roster");
+    fs::write(root.path().join("ostrom.yaml"), "manifest_version: 1\n")
+        .expect("write repository policy");
+    let trusted_keys = support::sign_manifest(&root.path().join("ostrom.yaml"));
     let gate = Command::new(env!("CARGO_BIN_EXE_ostrom"))
         .args(["gate", "placeholder-org/alpha#7"])
         .env("PATH", fixture_path())
@@ -332,6 +337,7 @@ projects:
             &first_sweep,
         ])
         .env("OSTROM_HOME", root.path())
+        .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
         .current_dir(root.path())
         .output()
         .expect("run end-to-end sweep");
@@ -362,6 +368,7 @@ projects:
             &second_sweep,
         ])
         .env("OSTROM_HOME", root.path())
+        .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
         .current_dir(root.path())
         .output()
         .expect("run mismatched end-to-end sweep");
