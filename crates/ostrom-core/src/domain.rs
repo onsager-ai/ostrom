@@ -392,6 +392,33 @@ pub struct Mandate {
 
 #[cfg(test)]
 mod tests {
+    use super::{Selector, SelectorError};
+
+    /// The legacy selector vocabulary is closed, and this is the invariant that
+    /// makes `_ => false` safe in the gate and sweep matchers: both take a
+    /// validated `Selector`, so an unrecognised prefix cannot reach them and be
+    /// read as "evaluated, did not match". Without this test that safety is an
+    /// assumption rather than a guarantee.
+    #[test]
+    fn the_legacy_selector_prefix_set_is_closed_and_names_the_unknown_prefix() {
+        for prefix in ["check", "actor", "verb", "substance", "area", "anything"] {
+            let error = Selector::new(format!("{prefix}:value"))
+                .expect_err("an unknown prefix must be refused");
+            assert_eq!(error, SelectorError::UnknownPrefix(prefix.to_owned()));
+        }
+        for accepted in [
+            "label:a",
+            "scope:a",
+            "type:a",
+            "path:a",
+            "ref:#1",
+            "title:*a*",
+        ] {
+            Selector::new(accepted).unwrap_or_else(|error| {
+                panic!("`{accepted}` is part of the retired vocabulary: {error:?}")
+            });
+        }
+    }
     use super::{GateConfig, MandateConfig};
 
     const ROSTER: &str = r#"
