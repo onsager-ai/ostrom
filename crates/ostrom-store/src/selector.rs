@@ -1,7 +1,7 @@
 use ostrom_core::Selector;
 use regex::Regex;
 
-pub(crate) struct SelectorCandidate<'a> {
+pub struct SelectorCandidate<'a> {
     pub item_type: &'a str,
     pub title: &'a str,
     pub labels: &'a [String],
@@ -9,8 +9,28 @@ pub(crate) struct SelectorCandidate<'a> {
     pub files: &'a [String],
 }
 
-pub(crate) fn selector_match(candidate: &SelectorCandidate<'_>, selector: &Selector) -> bool {
-    let Some((prefix, glob)) = selector.as_str().split_once(':') else {
+/// The retired selector vocabulary, as understood by the central format.
+/// Anything outside it is not a selector this matcher can evaluate — callers
+/// that depend on the answer being correct must check with
+/// [`legacy_prefix_is_known`] rather than reading `false` as "did not match".
+pub const LEGACY_SELECTOR_PREFIXES: &[&str] = &["label", "scope", "type", "path", "ref", "title"];
+
+/// Whether a selector uses a prefix this matcher evaluates. `selector_match`
+/// answers `false` both for "evaluated, did not match" and for "cannot
+/// evaluate"; where that distinction matters, ask this first.
+#[must_use]
+pub fn legacy_prefix_is_known(selector: &str) -> bool {
+    selector
+        .split_once(':')
+        .is_some_and(|(prefix, _)| LEGACY_SELECTOR_PREFIXES.contains(&prefix))
+}
+
+pub fn selector_match(candidate: &SelectorCandidate<'_>, selector: &Selector) -> bool {
+    selector_match_str(candidate, selector.as_str())
+}
+
+pub fn selector_match_str(candidate: &SelectorCandidate<'_>, selector: &str) -> bool {
+    let Some((prefix, glob)) = selector.split_once(':') else {
         return false;
     };
     let (item_type, scopes) = conventional(candidate.title);

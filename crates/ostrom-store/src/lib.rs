@@ -75,6 +75,10 @@ pub use selection::{
     PlanApplication, SelectAction, SelectError, SelectOutcome, SelectRequest, encode_selection,
     run_selection,
 };
+pub use selector::{
+    LEGACY_SELECTOR_PREFIXES, SelectorCandidate, legacy_prefix_is_known, selector_match,
+    selector_match_str,
+};
 pub use sweep::{
     PublishTarget, RepositorySnapshot, RosterCoverageFinding, SweepError, SweepFixture, SweepMode,
     SweepOptions, SweepOutcome, acquire_org_from_github, acquire_org_from_github_with_faults,

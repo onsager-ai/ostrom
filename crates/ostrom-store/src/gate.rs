@@ -901,13 +901,23 @@ fn evaluate_bounce(
             .split_once(':')
             .expect("gate selectors are validated");
         let tier = selector_tier(prefix);
-        let observable = match prefix {
-            "path" => acquisition.diff_ready,
-            "substance" => pattern == "fly-spend" && acquisition.diff_content_ready,
-            _ => acquisition.metadata_ready,
-        };
+        // A prefix `selector_matches` cannot evaluate must not read as "did not
+        // match" — that is a tripwire that silently never fires, which is the
+        // `*-tools` failure inverted. Route it through `unobservable`, which the
+        // verdict below already turns into `inconclusive` rather than `pass`.
+        let known = matches!(
+            prefix,
+            "label" | "scope" | "type" | "path" | "ref" | "title" | "substance"
+        );
+        let observable = known
+            && match prefix {
+                "path" => acquisition.diff_ready,
+                "substance" => pattern == "fly-spend" && acquisition.diff_content_ready,
+                _ => acquisition.metadata_ready,
+            };
         if !observable {
             let error = match prefix {
+                _ if !known => format!("unknown selector prefix: {prefix}"),
                 "path" => acquisition.diff_error.clone(),
                 "substance" if pattern != "fly-spend" => {
                     format!("unknown substance predicate: {pattern}")

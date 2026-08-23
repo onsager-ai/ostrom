@@ -698,7 +698,7 @@ fn verify_repository(
             continue;
         }
         let candidate = policy_candidate(repository, item);
-        let central = central_granted(mandates, gate, project, gate_project, &candidate)?;
+        let central = central_granted(mandates, gate, project, gate_project, item)?;
         let generated = bundle.decide("", "", &candidate).granted;
         if central != generated {
             differences.push(format!(
@@ -804,9 +804,32 @@ fn central_granted(
     gate: &GateConfig,
     project: &ostrom_core::ProjectMandate,
     gate_project: Option<&ostrom_core::GateProject>,
-    candidate: &PolicyCandidate,
+    item: &Value,
 ) -> Result<bool, GenerateError> {
-    let denied = mandates
+    // The central files are the retired format, so they are matched with the
+    // retired vocabulary — `title:`, `scope:` and `ref:` included. Asking the
+    // manifest's `PolicySelector` to parse them is what forced the closed
+    // prefix set open; the two formats need two matchers, not one widened one.
+    let labels = strings(item.get("labels"));
+    let files = strings(item.get("files"));
+    let refs = item
+        .get("refs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_u64)
+        .collect::<Vec<_>>();
+    let legacy = ostrom_store::SelectorCandidate {
+        item_type: item.get("type").and_then(Value::as_str).unwrap_or_default(),
+        title: item
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        labels: &labels,
+        refs: &refs,
+        files: &files,
+    };
+    let denying = mandates
         .bounce_all
         .iter()
         .map(|selector| selector.as_str())
@@ -819,20 +842,37 @@ fn central_granted(
                 .flat_map(|project| &project.bounce)
                 .map(|selector| selector.as_str()),
         )
-        .map(PolicySelector::new)
-        .collect::<Result<Vec<_>, _>>()?
-        .iter()
-        .any(|selector| selector.matches(candidate));
-    if denied {
-        return Ok(false);
-    }
-    let delegated = project
+        .collect::<Vec<_>>();
+    let delegating = project
         .delegated
         .iter()
-        .map(|selector| PolicySelector::new(selector.as_str()))
-        .collect::<Result<Vec<_>, _>>()?
+        .map(|selector| selector.as_str())
+        .collect::<Vec<_>>();
+
+    // `selector_match` answers `false` both for "evaluated, did not match" and
+    // for "cannot evaluate this prefix". Reading the second as the first would
+    // silently corrupt the reference answer this whole comparison rests on.
+    for selector in denying.iter().chain(delegating.iter()) {
+        if !ostrom_store::legacy_prefix_is_known(selector) {
+            return Err(GenerateError::Selector {
+                selector: (*selector).to_owned(),
+                message: format!(
+                    "not a selector the retired vocabulary evaluates; known prefixes are {}",
+                    ostrom_store::LEGACY_SELECTOR_PREFIXES.join(", ")
+                ),
+            });
+        }
+    }
+
+    if denying
         .iter()
-        .any(|selector| selector.matches(candidate));
+        .any(|selector| ostrom_store::selector_match_str(&legacy, selector))
+    {
+        return Ok(false);
+    }
+    let delegated = delegating
+        .iter()
+        .any(|selector| ostrom_store::selector_match_str(&legacy, selector));
     Ok(delegated || project.default == DefaultDisposition::Delegated)
 }
 

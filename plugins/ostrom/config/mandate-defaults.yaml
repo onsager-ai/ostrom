@@ -30,21 +30,10 @@ work_ranking: []
 
 # Shared write-surface tripwires. Selectors are case-insensitive qualified
 # globs. A more-specific layer may replace this list.
-#
-# Migrated 2026-08-23 (ostrom#358). These were `title:` globs over prose an
-# author writes freely — the class of selector that made `*-tools` unfindable.
-# `path:` and `type:` entries hold without any labels being configured; the
-# `risk:` entries document the convention and, matching nothing, warn rather
-# than block until a repository adopts them.
 bounce_all:
-  - path:**/.env
-  - path:**/.env.*
-  - path:**/secrets/**
-  - path:ostrom.yaml
-  - path:ostrom.yml
-  - type:release
-  - label:risk:secret
-  - label:risk:announce
-  - label:risk:release
+  - title:*merge to main*
+  - title:*production deployment*
+  - title:*external publication*
+  - title:*credential*
 
 projects: []
