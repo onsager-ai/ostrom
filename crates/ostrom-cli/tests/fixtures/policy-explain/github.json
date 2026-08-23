@@ -8,21 +8,21 @@
           "title": "chore: placeholder plugin change one",
           "labels": [],
           "files": [{"path": ".claude-plugin/plugin.json"}],
-          "statusCheckRollup": []
+          "checks": []
         },
         {
           "number": 351,
           "title": "chore: placeholder plugin change two",
           "labels": [],
           "files": [{"path": "nested/.claude-plugin/plugin.json"}],
-          "statusCheckRollup": []
+          "checks": []
         },
         {
           "number": 352,
           "title": "feat: placeholder delegated change",
           "labels": [{"name": "delegated-placeholder"}],
           "files": [{"path": "src/placeholder.rs"}],
-          "statusCheckRollup": [{"name": "placeholder-ci", "conclusion": "SUCCESS"}]
+          "checks": [{"name": "placeholder-ci", "conclusion": "SUCCESS"}]
         },
         {
           "number": 353,
@@ -30,7 +30,7 @@
           "title": "chore: placeholder unmatched change",
           "labels": [],
           "files": [{"path": "README.md"}],
-          "statusCheckRollup": []
+          "checks": []
         }
       ]
     }

@@ -11,7 +11,7 @@ use regex::{Regex, RegexBuilder};
 use serde_json::{Value, json};
 use thiserror::Error;
 
-use crate::{OstromPaths, set_private_file_mode, sweep::merge_yaml};
+use crate::{OstromPaths, read_commit_checks, set_private_file_mode, sweep::merge_yaml};
 
 const SHIPPED_DEFAULTS: &str = include_str!("../../../plugins/ostrom/config/gate.defaults.yaml");
 const REVIEW_QUERY: &str = "query($owner:String!, $repo:String!, $number:Int!, $cursor:String) {\n  repository(owner:$owner, name:$repo) {\n    pullRequest(number:$number) {\n      author { login }\n      reviewThreads(first:100, after:$cursor) {\n        nodes {\n          id\n          isResolved\n          resolvedBy { login }\n          comments(last:1) { nodes { author { login } } }\n        }\n        pageInfo { hasNextPage endCursor }\n      }\n    }\n  }\n}";
@@ -67,6 +67,7 @@ struct Acquisition {
     checks_ready: bool,
     checks: Vec<Value>,
     checks_error: String,
+    checks_partial_error: String,
     diff_ready: bool,
     paths: Vec<String>,
     diff_error: String,
@@ -117,21 +118,8 @@ pub fn run_gate(options: &GateOptions) -> Result<GateOutput, GateError> {
         Err(error) => synthetic_output(error.to_string()),
     };
 
-    let checks_output = match gh(&[
-        "pr",
-        "view",
-        &target.number.to_string(),
-        "--repo",
-        target.repo,
-        "--json",
-        "statusCheckRollup",
-    ]) {
-        Ok(output) => output,
-        Err(error) => synthetic_output(error.to_string()),
-    };
-
     let mut acquisition = acquire_metadata(metadata_output, target.number);
-    acquire_checks(&mut acquisition, checks_output);
+    acquire_checks(&mut acquisition, &target);
     acquire_paths(&mut acquisition, &target);
     if config.as_ref().is_some_and(config_needs_diff_content) {
         acquire_diff_content(&mut acquisition, &target);
@@ -307,6 +295,7 @@ fn acquire_metadata(output: Output, expected_number: u64) -> Acquisition {
         checks_ready: false,
         checks: Vec::new(),
         checks_error: String::new(),
+        checks_partial_error: String::new(),
         diff_ready: false,
         paths: Vec::new(),
         diff_error: String::new(),
@@ -341,22 +330,29 @@ fn valid_metadata(value: &Value, expected_number: u64) -> bool {
         && value.get("isDraft").and_then(Value::as_bool).is_some()
 }
 
-fn acquire_checks(acquisition: &mut Acquisition, output: Output) {
-    let parsed = serde_json::from_slice::<Value>(&output.stdout).ok();
-    let checks = parsed
-        .as_ref()
-        .and_then(|value| value.get("statusCheckRollup"))
-        .and_then(Value::as_array);
-    if output.status.success()
-        && let Some(checks) = checks
-    {
-        acquisition.checks_ready = true;
-        acquisition.checks = checks.clone();
-        acquisition.checks_error.clear();
-    } else if output.status.success() {
-        acquisition.checks_error = "required-check response was incomplete".to_owned();
-    } else {
-        acquisition.checks_error = error_text(&output.stderr);
+fn acquire_checks(acquisition: &mut Acquisition, target: &Target<'_>) {
+    if acquisition.head_sha.is_empty() {
+        acquisition.checks_error = "pull request head SHA was unavailable".to_owned();
+        return;
+    }
+    let result = read_commit_checks(target.repo, &acquisition.head_sha, |endpoint| {
+        let output = gh(&["api", endpoint]).map_err(|error| error.to_string())?;
+        if output.status.success() {
+            Ok(output.stdout)
+        } else {
+            Err(error_text(&output.stderr))
+        }
+    });
+    match result {
+        Ok(result) => {
+            acquisition.checks_ready = true;
+            acquisition.checks = result.checks;
+            acquisition.checks_error.clear();
+            acquisition.checks_partial_error = result
+                .statuses_error
+                .map_or_else(String::new, |error| error.to_string());
+        }
+        Err(error) => acquisition.checks_error = error.to_string(),
     }
 }
 
@@ -799,12 +795,17 @@ fn evaluate_checks(project: &GateProject, acquisition: &Acquisition) -> Value {
         let result = if matches.is_empty()
             || matches
                 .iter()
-                .any(|check| known_not_green(check["state"].as_str().unwrap_or_default()))
+                .any(|check| known_failure(check["state"].as_str().unwrap_or_default()))
         {
             "fail"
+        } else if matches
+            .iter()
+            .any(|check| pending(check["state"].as_str().unwrap_or_default()))
+        {
+            "pending"
         } else if matches.iter().any(|check| {
             let state = check["state"].as_str().unwrap_or_default();
-            !green(state) && !known_not_green(state)
+            !green(state) && !known_failure(state) && !pending(state)
         }) {
             "inconclusive"
         } else {
@@ -816,7 +817,7 @@ fn evaluate_checks(project: &GateProject, acquisition: &Acquisition) -> Value {
         "fail"
     } else if selected
         .iter()
-        .any(|value| value["result"] == "inconclusive")
+        .any(|value| matches!(value["result"].as_str(), Some("pending" | "inconclusive")))
     {
         "inconclusive"
     } else {
@@ -827,12 +828,11 @@ fn evaluate_checks(project: &GateProject, acquisition: &Acquisition) -> Value {
     } else {
         vec!["content-derived"]
     };
-    condition(
-        "required_checks",
-        result,
-        &tier,
-        json!({"selectors": selected}),
-    )
+    let mut detail = json!({"selectors": selected});
+    if !acquisition.checks_partial_error.is_empty() {
+        detail["partial_read"] = json!({"statuses": acquisition.checks_partial_error});
+    }
+    condition("required_checks", result, &tier, detail)
 }
 
 fn check_name(check: &Value) -> &str {
@@ -846,6 +846,7 @@ fn check_name(check: &Value) -> &str {
 fn check_state(check: &Value) -> String {
     check
         .get("conclusion")
+        .filter(|value| !value.is_null())
         .or_else(|| check.get("state"))
         .or_else(|| check.get("status"))
         .and_then(Value::as_str)
@@ -857,21 +858,17 @@ fn green(state: &str) -> bool {
     matches!(state, "SUCCESS" | "NEUTRAL" | "SKIPPED")
 }
 
-fn known_not_green(state: &str) -> bool {
+fn known_failure(state: &str) -> bool {
     matches!(
         state,
-        "FAILURE"
-            | "ERROR"
-            | "CANCELLED"
-            | "TIMED_OUT"
-            | "ACTION_REQUIRED"
-            | "STALE"
-            | "PENDING"
-            | "EXPECTED"
-            | "QUEUED"
-            | "IN_PROGRESS"
-            | "WAITING"
-            | "REQUESTED"
+        "FAILURE" | "ERROR" | "CANCELLED" | "TIMED_OUT" | "ACTION_REQUIRED" | "STALE"
+    )
+}
+
+fn pending(state: &str) -> bool {
+    matches!(
+        state,
+        "PENDING" | "EXPECTED" | "QUEUED" | "IN_PROGRESS" | "WAITING" | "REQUESTED"
     )
 }
 

@@ -311,7 +311,7 @@ impl PolicyBundle {
     ) -> PolicyExplanation {
         let candidate = pull_request_candidate(repository, pull_request, actor, operation);
         let checks = pull_request
-            .get("statusCheckRollup")
+            .get("checks")
             .and_then(Value::as_array)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
@@ -770,7 +770,7 @@ denies:
                 "title": "feat: placeholder",
                 "labels": [{"name": "delegated"}],
                 "files": [{"path": "src/lib.rs"}],
-                "statusCheckRollup": [{"name": "placeholder-ci", "conclusion": "SUCCESS"}],
+                "checks": [{"name": "placeholder-ci", "conclusion": "SUCCESS"}],
             }),
             "builder",
             "work",
@@ -806,7 +806,7 @@ denies:
                 "title": "chore: placeholder",
                 "labels": [],
                 "files": [{"path": ".claude-plugin/plugin.json"}],
-                "statusCheckRollup": [],
+                "checks": [],
             }),
             "builder",
             "work",
@@ -828,7 +828,7 @@ denies:
                 "title": "chore: placeholder",
                 "labels": [],
                 "files": [{"path": "README.md"}],
-                "statusCheckRollup": [],
+                "checks": [],
             }),
             "builder",
             "work",
@@ -852,7 +852,7 @@ denies:
                 "title": "feat: placeholder",
                 "labels": [{"name": "delegated"}],
                 "files": [{"path": "src/lib.rs"}],
-                "statusCheckRollup": [{"name": "placeholder-ci", "status": "IN_PROGRESS"}],
+                "checks": [{"name": "placeholder-ci", "status": "IN_PROGRESS"}],
             }),
             "builder",
             "work",

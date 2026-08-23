@@ -12,7 +12,7 @@ const FIXTURE: &str = r#"{
       "title": "feat: layered policy",
       "labels": [],
       "files": [{"path": "src/lib.rs"}],
-      "statusCheckRollup": []
+      "checks": []
     }]
   }]
 }"#;

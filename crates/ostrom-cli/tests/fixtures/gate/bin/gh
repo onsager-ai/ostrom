@@ -6,31 +6,21 @@ if [ -n "${GATE_COMMAND_LOG:-}" ]; then
 fi
 
 mode="${GATE_FIXTURE_MODE:-pass}"
+check_conclusion=success
+if [ "$mode" = "check-failure" ]; then check_conclusion=failure; fi
 if [ "$1 $2" = "pr view" ]; then
   if [ "$mode" = "unresolvable" ]; then
     printf '%s\n' 'placeholder pull request could not be resolved' >&2
     exit 1
   fi
-  check_conclusion=SUCCESS
   mergeable=MERGEABLE
   is_draft=false
   title='fix(core): safe placeholder change'
   case "$mode" in
-    check-failure) check_conclusion=FAILURE ;;
     conflicting) mergeable=CONFLICTING ;;
     draft) is_draft=true ;;
     bounce) title='feat(core): protected placeholder change' ;;
   esac
-  if [[ " $* " == *" --json statusCheckRollup "* ]]; then
-    jq -cn --arg check_conclusion "$check_conclusion" '
-      {statusCheckRollup: [{
-        name: "verify-linux",
-        status: "COMPLETED",
-        conclusion: $check_conclusion
-      }]}
-    '
-    exit 0
-  fi
   jq -cn \
     --argjson number "$3" \
     --arg head "${GATE_FIXTURE_HEAD:-aaaaaaaaaaaaaaaa}" \
@@ -49,6 +39,23 @@ if [ "$1 $2" = "pr view" ]; then
         isDraft: $is_draft
       }
     '
+  exit 0
+fi
+
+if [ "$1" = "api" ] && [[ "$2" == repos/placeholder-org/alpha/commits/*/check-runs\?* ]]; then
+  jq -cn --arg check_conclusion "$check_conclusion" '
+    {total_count: 1, check_runs: [{
+      name: "verify-linux",
+      status: "completed",
+      conclusion: $check_conclusion,
+      app: {slug: "github-actions"}
+    }]}
+  '
+  exit 0
+fi
+
+if [ "$1" = "api" ] && [[ "$2" == repos/placeholder-org/alpha/commits/*/status\?* ]]; then
+  printf '%s\n' '{"total_count":0,"statuses":[]}'
   exit 0
 fi
 

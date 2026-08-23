@@ -14,37 +14,15 @@ use crate::{
         AuthenticatedCommandError, GitHubInstallationTokenMinter, InstallationTokenMinter,
         ScopedAppTokenRequest, authenticated_output,
     },
-    append_trace, environment, load_config_or_defaults,
+    append_trace, environment, load_config_or_defaults, read_commit_checks,
 };
 
 const REPAIR_CAP: usize = 3;
 const QUERY_LIMIT: usize = 1_000;
 const LIST_PERMISSIONS: &str = "metadata:read,pull_requests:read";
-const CHECK_PERMISSIONS: &str = "metadata:read,pull_requests:read,checks:read,statuses:read";
+const CHECK_PERMISSIONS: &str = "metadata:read,checks:read,statuses:read";
 const FETCH_PERMISSIONS: &str = "metadata:read,contents:read";
 const PUSH_PERMISSIONS: &str = "metadata:read,contents:write";
-const BASE_CHECK_QUERY: &str = r#"
-query($owner: String!, $name: String!, $qualifiedName: String!) {
-  repository(owner: $owner, name: $name) {
-    ref(qualifiedName: $qualifiedName) {
-      target {
-        ... on Commit {
-          oid
-          statusCheckRollup {
-            contexts(first: 100) {
-              nodes {
-                ... on CheckRun { conclusion status }
-                ... on StatusContext { state }
-              }
-              pageInfo { hasNextPage }
-            }
-          }
-        }
-      }
-    }
-  }
-}
-"#;
 
 #[derive(Debug, Clone)]
 pub struct RepairOptions {
@@ -91,6 +69,7 @@ struct Candidate {
     base_branch: String,
     listed_head_sha: String,
     listed_base_sha: String,
+    base_ref_sha: String,
 }
 
 #[derive(Debug, Default)]
@@ -160,7 +139,7 @@ fn run_repair_prs_with_minter(
                 "--limit",
                 &QUERY_LIMIT.to_string(),
                 "--json",
-                "number,body,author,mergeable,headRefName,baseRefName,headRefOid,isCrossRepository",
+                "number,body,author,mergeable,headRefName,baseRefName,headRefOid,baseRefOid,isCrossRepository",
             ],
         );
         if listing.code != 0 {
@@ -299,62 +278,36 @@ fn collect_candidates(
             base_branch: jq_text(pull_request.get("baseRefName")),
             listed_head_sha: jq_default_text(pull_request.get("headRefOid")),
             listed_base_sha: String::new(),
+            base_ref_sha: jq_default_text(pull_request.get("baseRefOid")),
         };
-        let checks = context.authenticated(
-            repository,
-            CHECK_PERMISSIONS,
-            &[
-                "gh",
-                "pr",
-                "view",
-                &candidate.number,
-                "--repo",
-                repository,
-                "--json",
-                "statusCheckRollup",
-            ],
-        );
-        if checks.code != 0 {
-            summary.skipped += 1;
+        let checks = read_candidate_checks(context, repository, &candidate.listed_head_sha);
+        let checks = match checks {
+            Ok(checks) => checks,
+            Err((error, exit_code)) => {
+                summary.skipped += 1;
+                context.stderr.push_str(&format!(
+                    "mandate repair: failed to read checks for {repository}#{} ({error})\n",
+                    candidate.number
+                ));
+                context.trace_candidate(
+                    &candidate,
+                    "check-fetch-failed",
+                    &candidate.listed_head_sha,
+                    "",
+                    &[],
+                    Some(exit_code),
+                    json!({"reason": "candidate check state could not be read"}),
+                )?;
+                continue;
+            }
+        };
+        if let Some(error) = checks.statuses_error {
             context.stderr.push_str(&format!(
-                "mandate repair: failed to read checks for {repository}#{} (rc={})\n",
-                candidate.number, checks.code
-            ));
-            context.trace_candidate(
-                &candidate,
-                "check-fetch-failed",
-                &candidate.listed_head_sha,
-                "",
-                &[],
-                Some(checks.code),
-                json!({"reason": "candidate check state could not be read"}),
-            )?;
-            continue;
-        }
-        let parsed = serde_json::from_slice::<Value>(&checks.stdout).ok();
-        let rollup = parsed
-            .as_ref()
-            .and_then(Value::as_object)
-            .and_then(|object| object.get("statusCheckRollup"))
-            .and_then(Value::as_array);
-        let Some(rollup) = rollup else {
-            summary.skipped += 1;
-            context.stderr.push_str(&format!(
-                "mandate repair: check state for {repository}#{} was malformed\n",
+                "mandate repair: commit statuses for {repository}#{} were not observed ({error})\n",
                 candidate.number
             ));
-            context.trace_candidate(
-                &candidate,
-                "check-fetch-malformed",
-                &candidate.listed_head_sha,
-                "",
-                &[],
-                Some(1),
-                json!({"reason": "candidate check state was malformed"}),
-            )?;
-            continue;
-        };
-        let check_state = classify_checks(rollup);
+        }
+        let check_state = classify_checks(&checks.checks);
         let conflicting =
             pull_request.get("mergeable").and_then(Value::as_str) == Some("CONFLICTING");
         if check_state == CheckState::Green {
@@ -472,7 +425,7 @@ fn collect_candidates(
             continue;
         }
 
-        let Some((owner, name)) = repository.split_once('/') else {
+        if candidate.base_ref_sha.is_empty() {
             summary.skipped += 1;
             context.trace_candidate(
                 &candidate,
@@ -482,91 +435,40 @@ fn collect_candidates(
                 &[],
                 Some(1),
                 json!({"reason": "base branch check state was malformed"}),
-            )?;
-            continue;
-        };
-        let query = format!("query={BASE_CHECK_QUERY}");
-        let owner = format!("owner={owner}");
-        let name = format!("name={name}");
-        let qualified_name = format!("qualifiedName=refs/heads/{}", candidate.base_branch);
-        let base_checks = context.authenticated(
-            repository,
-            CHECK_PERMISSIONS,
-            &[
-                "gh",
-                "api",
-                "graphql",
-                "-f",
-                &query,
-                "-F",
-                &owner,
-                "-F",
-                &name,
-                "-F",
-                &qualified_name,
-            ],
-        );
-        if base_checks.code != 0 {
-            summary.skipped += 1;
-            context.stderr.push_str(&format!(
-                "mandate repair: failed to read base checks for {repository}#{} (rc={})\n",
-                candidate.number, base_checks.code
-            ));
-            context.trace_candidate(
-                &candidate,
-                "check-fetch-failed",
-                &candidate.listed_head_sha,
-                &candidate.listed_base_sha,
-                &[],
-                Some(base_checks.code),
-                json!({"reason": "base branch check state could not be read"}),
             )?;
             continue;
         }
-        let parsed = serde_json::from_slice::<Value>(&base_checks.stdout).ok();
-        let commit = parsed
-            .as_ref()
-            .and_then(|value| value.pointer("/data/repository/ref/target"))
-            .and_then(Value::as_object);
-        let observed_oid = commit
-            .and_then(|object| object.get("oid"))
-            .and_then(Value::as_str);
-        let rollup = commit
-            .and_then(|object| object.get("statusCheckRollup"))
-            .and_then(|rollup| {
-                if rollup.is_null() {
-                    return Some(&[][..]);
-                }
-                let contexts = rollup.get("contexts")?;
-                if contexts
-                    .pointer("/pageInfo/hasNextPage")
-                    .and_then(Value::as_bool)
-                    != Some(false)
-                {
-                    return None;
-                }
-                contexts.get("nodes")?.as_array().map(Vec::as_slice)
-            });
-        let Some(rollup) = rollup.filter(|_| observed_oid.is_some_and(|oid| !oid.is_empty()))
-        else {
-            summary.skipped += 1;
+        candidate
+            .listed_base_sha
+            .clone_from(&candidate.base_ref_sha);
+        let base_checks = read_candidate_checks(context, repository, &candidate.listed_base_sha);
+        let base_checks = match base_checks {
+            Ok(checks) => checks,
+            Err((error, exit_code)) => {
+                summary.skipped += 1;
+                context.stderr.push_str(&format!(
+                    "mandate repair: failed to read base checks for {repository}#{} ({error})\n",
+                    candidate.number
+                ));
+                context.trace_candidate(
+                    &candidate,
+                    "check-fetch-failed",
+                    &candidate.listed_head_sha,
+                    &candidate.listed_base_sha,
+                    &[],
+                    Some(exit_code),
+                    json!({"reason": "base branch check state could not be read"}),
+                )?;
+                continue;
+            }
+        };
+        if let Some(error) = base_checks.statuses_error {
             context.stderr.push_str(&format!(
-                "mandate repair: base check state for {repository}#{} was malformed\n",
+                "mandate repair: base commit statuses for {repository}#{} were not observed ({error})\n",
                 candidate.number
             ));
-            context.trace_candidate(
-                &candidate,
-                "check-fetch-malformed",
-                &candidate.listed_head_sha,
-                &candidate.listed_base_sha,
-                &[],
-                Some(1),
-                json!({"reason": "base branch check state was malformed"}),
-            )?;
-            continue;
-        };
-        candidate.listed_base_sha = observed_oid.unwrap_or_default().to_owned();
-        if !completed_green(rollup) {
+        }
+        if !completed_green(&base_checks.checks) {
             summary.skipped += 1;
             context.trace_candidate(
                 &candidate,
@@ -647,6 +549,24 @@ fn collect_candidates(
         }
     }
     Ok(())
+}
+
+fn read_candidate_checks(
+    context: &mut RepairContext<'_>,
+    repository: &str,
+    sha: &str,
+) -> Result<crate::CommitChecks, (crate::CheckReadError, i32)> {
+    let mut exit_code = None;
+    let result = read_commit_checks(repository, sha, |endpoint| {
+        let run = context.authenticated(repository, CHECK_PERMISSIONS, &["gh", "api", endpoint]);
+        if run.code == 0 {
+            Ok(run.stdout)
+        } else {
+            exit_code = Some(run.code);
+            Err(format!("request failed with exit code {}", run.code))
+        }
+    });
+    result.map_err(|error| (error, exit_code.unwrap_or(1)))
 }
 
 fn repair_candidate(
@@ -1122,12 +1042,13 @@ fn classify_checks(checks: &[Value]) -> CheckState {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_ascii_uppercase();
-        if matches!(state.as_str(), "PENDING" | "EXPECTED")
-            || matches!(
-                status.as_str(),
-                "PENDING" | "EXPECTED" | "QUEUED" | "REQUESTED" | "WAITING" | "IN_PROGRESS"
-            )
-        {
+        if matches!(
+            state.as_str(),
+            "PENDING" | "EXPECTED" | "QUEUED" | "REQUESTED" | "WAITING" | "IN_PROGRESS"
+        ) || matches!(
+            status.as_str(),
+            "PENDING" | "EXPECTED" | "QUEUED" | "REQUESTED" | "WAITING" | "IN_PROGRESS"
+        ) {
             pending = true;
         } else {
             failed = true;

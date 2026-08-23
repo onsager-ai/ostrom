@@ -3,6 +3,7 @@
 mod app_token;
 mod check_store;
 mod clock;
+mod commit_checks;
 mod dispatch;
 pub mod environment;
 mod event_store;
@@ -34,6 +35,7 @@ mod worktree;
 pub use app_token::{AppTokenError, CredentialCommandError, credential_output};
 pub use check_store::JsonlCheckStore;
 pub use clock::Clock;
+pub use commit_checks::{CheckReadError, CommitChecks, read_commit_checks};
 pub use dispatch::{DispatchError, DispatchOutcome, DispatchRequest, run_dispatch};
 pub use environment::{ENVIRONMENT_VARIABLES, EnvironmentClass, EnvironmentVariable};
 pub use event_store::JsonlEventStore;

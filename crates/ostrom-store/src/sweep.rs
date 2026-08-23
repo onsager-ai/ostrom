@@ -19,6 +19,7 @@ use crate::{
     AppTokenError, OstromPaths, PolicyBundle, PublishDestination, PublishError, QueueDocument,
     StoreError,
     app_token::{GitHubInstallationTokenMinter, InstallationTokenMinter, ScopedAppTokenRequest},
+    commit_checks::read_commit_checks,
     environment,
     gate::load_gate_config,
     io_error,
@@ -747,9 +748,54 @@ fn acquire_repository(
         "--limit",
         "200",
         "--json",
-        "number,title,body,labels,createdAt,updatedAt,url,isDraft,reviewDecision,statusCheckRollup,closingIssuesReferences,files,state,mergedAt,headRefOid,mergeable",
+        "number,title,body,labels,createdAt,updatedAt,url,isDraft,reviewDecision,closingIssuesReferences,files,state,mergedAt,headRefOid,mergeable",
     ])?;
-    let open_prs = exhaustive_array(open_prs, repo_name, "open pull-request query")?;
+    let mut open_prs = exhaustive_array(open_prs, repo_name, "open pull-request query")?;
+    let mut warnings = Vec::new();
+    // One pull request whose checks cannot be read must not end the pass for the
+    // whole repository. That is #296, and reading checks per pull request rather
+    // than once per repository multiplies the chances of hitting it. An
+    // unreadable pull request is marked unobserved and the sweep continues.
+    for pull_request in &mut open_prs {
+        let number = number_field(pull_request, &["number"])
+            .map_or_else(|| "?".to_owned(), |number| number.to_string());
+        let Some(row) = pull_request.as_object_mut() else {
+            warnings.push(format!(
+                "open pull-request query for {repo_name} returned a non-object row"
+            ));
+            continue;
+        };
+        let sha = row
+            .get("headRefOid")
+            .and_then(Value::as_str)
+            .filter(|sha| !sha.is_empty())
+            .map(str::to_owned);
+        let Some(sha) = sha else {
+            warnings.push(format!(
+                "checks for {repo_name}#{number} were not observed: the row carried no head SHA"
+            ));
+            row.insert("checks_unobserved".to_owned(), Value::Bool(true));
+            continue;
+        };
+        match read_commit_checks(repo_name, &sha, |endpoint| {
+            gh_raw(&["api", endpoint]).map_err(|error| error.to_string())
+        }) {
+            Ok(checks) => {
+                if let Some(error) = checks.statuses_error {
+                    warnings.push(format!(
+                        "commit statuses for {repo_name}@{sha} were not observed: {error}"
+                    ));
+                }
+                row.insert("checks".to_owned(), Value::Array(checks.checks));
+            }
+            Err(error) => {
+                warnings.push(format!(
+                    "checks for {repo_name}@{sha} could not be read: {error}"
+                ));
+                row.insert("checks_unobserved".to_owned(), Value::Bool(true));
+            }
+        }
+    }
 
     let lookback_days = i64::try_from(
         30_u64
@@ -763,7 +809,6 @@ fn acquire_repository(
     let search = format!("merged:>={cutoff}");
     let merged_prs = fetch_merged_pull_requests(repo_name, &search)?;
 
-    let mut warnings = Vec::new();
     let (default_branch, branches, branch_read_degraded, ci_runs) = match gh_json(&[
         "repo",
         "view",
@@ -3181,8 +3226,18 @@ fn label_names(labels: Option<&Value>) -> Vec<String> {
 }
 
 fn pr_ci_state(source: &Value) -> String {
+    // "nothing has run yet" and "the checks could not be read" are different
+    // facts and must not share one word. Neither is `passing`, so neither can
+    // make a pull request ready.
+    if source
+        .get("checks_unobserved")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return "unknown".to_owned();
+    }
     let checks = source
-        .get("statusCheckRollup")
+        .get("checks")
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or(&[]);
@@ -3418,7 +3473,7 @@ mod tests {
             "createdAt": "2026-07-01T00:00:00Z",
             "updatedAt": "2026-08-20T00:00:00Z",
             "mergeable": mergeable,
-            "statusCheckRollup": [{"conclusion": "SUCCESS"}],
+            "checks": [{"conclusion": "SUCCESS"}],
         })
     }
 
@@ -3826,7 +3881,7 @@ denies:
                     "title": format!("chore: placeholder pull request {number}"),
                     "files": [{"path": ".claude-plugin/plugin.json"}],
                     "labels": [],
-                    "statusCheckRollup": [],
+                    "checks": [],
                 })).collect::<Vec<_>>()
             }]
         }))
@@ -4476,6 +4531,38 @@ printf '{"repositories":[{"repo":"%s","issues":[],"open_prs":[],"merged_prs":[],
         assert_eq!(
             fs::read(home.path().join("previous/state.json")).expect("read previous state"),
             state_before
+        );
+    }
+
+    /// Reading checks per pull request instead of once per repository multiplies
+    /// the chance of an unreadable response, so the degradation must be per row.
+    /// #296 was one repository's unreadable rollup ending every builder pass;
+    /// aborting the repository because one pull request could not be read is the
+    /// same defect at finer grain.
+    #[test]
+    fn an_unreadable_pull_request_is_unknown_rather_than_pending_or_passing() {
+        let unobserved = json!({"number": 1, "checks_unobserved": true});
+        let not_started = json!({"number": 2, "checks": []});
+        let green = json!({"number": 3, "checks": [{"conclusion": "SUCCESS"}]});
+        let red = json!({"number": 4, "checks": [{"conclusion": "FAILURE"}]});
+
+        assert_eq!(pr_ci_state(&unobserved), "unknown");
+        assert_eq!(pr_ci_state(&not_started), "pending");
+        assert_eq!(pr_ci_state(&green), "passing");
+        assert_eq!(pr_ci_state(&red), "failing");
+    }
+
+    /// `ready` is gated on `ci == "passing"`, so neither unknown nor pending may
+    /// ever satisfy it. This is what keeps an unreadable check from reading as a
+    /// green one.
+    #[test]
+    fn an_unobserved_check_state_can_never_be_passing() {
+        for state in ["unknown", "pending", "failing"] {
+            assert_ne!(state, "passing");
+        }
+        assert_eq!(
+            pr_ci_state(&json!({"number": 5, "checks_unobserved": true})),
+            "unknown"
         );
     }
 }

@@ -14,7 +14,7 @@ use ostrom_core::{
 };
 use ostrom_store::{
     ActorPortabilityFinding, OstromPaths, PolicyBundle, PolicyExplanation, PolicyOrigins,
-    SweepFixture,
+    SweepFixture, read_commit_checks,
 };
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
@@ -646,7 +646,7 @@ fn acquire_pull_request(
             "--repo",
             &target.repository,
             "--json",
-            "number,title,labels,files,statusCheckRollup,state,baseRefOid",
+            "number,title,labels,files,state,baseRefOid,headRefOid",
         ])
         .output()
         .map_err(PolicyLoadError::GitHub)?;
@@ -659,10 +659,50 @@ fn acquire_pull_request(
                 .collect(),
         ));
     }
-    serde_json::from_slice(&output.stdout).map_err(|source| PolicyLoadError::Fixture {
-        path: PathBuf::from("gh pr view"),
-        source,
+    let mut pull_request: JsonValue =
+        serde_json::from_slice(&output.stdout).map_err(|source| PolicyLoadError::Fixture {
+            path: PathBuf::from("gh pr view"),
+            source,
+        })?;
+    let head_sha = pull_request
+        .get("headRefOid")
+        .and_then(JsonValue::as_str)
+        .filter(|sha| !sha.is_empty())
+        .ok_or_else(|| {
+            PolicyLoadError::GitHubResponse("pull request response had no head SHA".to_owned())
+        })?;
+    let checks = read_commit_checks(&target.repository, head_sha, |endpoint| {
+        let output = Command::new("gh")
+            .current_dir(working_directory)
+            .args(["api", endpoint])
+            .output()
+            .map_err(|error| error.to_string())?;
+        if output.status.success() {
+            Ok(output.stdout)
+        } else {
+            let error = String::from_utf8_lossy(&output.stderr)
+                .trim()
+                .chars()
+                .take(500)
+                .collect::<String>();
+            Err(if error.is_empty() {
+                "gh api failed without error detail".to_owned()
+            } else {
+                error
+            })
+        }
     })
+    .map_err(|error| PolicyLoadError::GitHubResponse(error.to_string()))?;
+    if let Some(error) = checks.statuses_error {
+        eprintln!("ostrom explain: partial check read: {error}");
+    }
+    pull_request
+        .as_object_mut()
+        .ok_or_else(|| {
+            PolicyLoadError::GitHubResponse("pull request response was not an object".to_owned())
+        })?
+        .insert("checks".to_owned(), JsonValue::Array(checks.checks));
+    Ok(pull_request)
 }
 
 fn read_first_held(paths: &OstromPaths, id: &str) -> Option<DateTime<Utc>> {
