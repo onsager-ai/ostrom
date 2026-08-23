@@ -45,7 +45,7 @@ mod policy_manifest;
 
 use operation_dispatch::{
     OperationDispatchError, OperationRuntime, ResolvedOperationTarget, dispatch_operation,
-    manifest_path, parse_invocation, resolve_repository_target,
+    parse_invocation, resolve_repository_target,
 };
 
 #[derive(Debug, Parser)]
@@ -1071,7 +1071,7 @@ fn run_operations_command(
     settings_actor: Option<&str>,
     check_settings: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let manifest = policy_manifest::load(&manifest_path(&paths.config))?;
+    let manifest = policy_manifest::load(&policy_manifest::adopting_manifest_path(paths)?)?;
     if let Some(settings_actor) = settings_actor {
         print!(
             "{}",
@@ -1115,7 +1115,7 @@ fn run_loops_command(
     paths: &OstromPaths,
     command: LoopsCommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let manifest = policy_manifest::load(&manifest_path(&paths.config))?;
+    let manifest = policy_manifest::load(&policy_manifest::adopting_manifest_path(paths)?)?;
     match command {
         LoopsCommand::Render { output } => {
             let output = output.unwrap_or_else(|| paths.config.join("systemd"));
@@ -1141,7 +1141,7 @@ fn run_loops_command(
 }
 
 fn run_loop_command(paths: &OstromPaths, name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let manifest = policy_manifest::load(&manifest_path(&paths.config))?;
+    let manifest = policy_manifest::load(&policy_manifest::adopting_manifest_path(paths)?)?;
     let resolved = manifest.resolve_loop(name)?;
     assert_loop_environment(&resolved.actor, resolved.ceilings)?;
     let invocation = operation_dispatch::OperationInvocation {
@@ -1174,7 +1174,7 @@ fn run_operation_command(
     paths: &OstromPaths,
     arguments: &[OsString],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let manifest = policy_manifest::load(&manifest_path(&paths.config))?;
+    let manifest = policy_manifest::load(&policy_manifest::adopting_manifest_path(paths)?)?;
     let invocation = parse_invocation(&manifest, arguments)?;
     let actor = ostrom_store::environment::OSTROM_ACTOR
         .value()
@@ -1219,15 +1219,60 @@ impl OperationRuntime for CliOperationRuntime<'_> {
         operation: &str,
     ) -> Result<ResolvedOperationTarget, OperationDispatchError> {
         let mut target = resolve_repository_target(raw, actor, operation)?;
-        if self.selector_prefixes.iter().any(|prefix| {
-            matches!(
-                prefix,
-                SelectorPrefix::Label | SelectorPrefix::Path | SelectorPrefix::Type
-            )
-        }) {
+        let local_repository_policy = raw.contains('#')
+            && policy_manifest::default_manifest_path(self.paths, self.working_directory)
+                .ok()
+                .flatten()
+                .is_some();
+        if local_repository_policy
+            || self.selector_prefixes.iter().any(|prefix| {
+                matches!(
+                    prefix,
+                    SelectorPrefix::Label | SelectorPrefix::Path | SelectorPrefix::Type
+                )
+            })
+        {
             resolve_target_metadata(self.paths, actor, &mut target)?;
         }
         Ok(target)
+    }
+
+    fn authorize(
+        &mut self,
+        manifest: &ostrom_core::PolicyManifest,
+        actor: &str,
+        operation: &str,
+        target: &ResolvedOperationTarget,
+    ) -> Result<bool, OperationDispatchError> {
+        let repository_path =
+            policy_manifest::default_manifest_path(self.paths, self.working_directory).map_err(
+                |error| OperationDispatchError::TargetResolutionFailed {
+                    target: target.raw.clone(),
+                    message: error.to_string(),
+                },
+            )?;
+        let Some(repository_path) = repository_path else {
+            return Ok(manifest.decide(actor, operation, &target.candidate).granted);
+        };
+        let bundle = target
+            .base_sha
+            .as_deref()
+            .map_or_else(
+                || policy_manifest::load_bundle(self.paths, &repository_path),
+                |base_sha| {
+                    policy_manifest::load_bundle_at_base(
+                        self.paths,
+                        &repository_path,
+                        self.working_directory,
+                        base_sha,
+                    )
+                },
+            )
+            .map_err(|error| OperationDispatchError::TargetResolutionFailed {
+                target: target.raw.clone(),
+                message: error.to_string(),
+            })?;
+        Ok(bundle.decide(actor, operation, &target.candidate).granted)
     }
 
     fn require(
@@ -1304,7 +1349,7 @@ fn resolve_target_metadata(
         "view",
         target.raw.as_str(),
         "--json",
-        "labels,files,title",
+        "labels,files,title,baseRefOid",
     ];
     let output = credential_output(
         paths,
@@ -1350,6 +1395,11 @@ fn resolve_target_metadata(
         .get("title")
         .and_then(serde_json::Value::as_str)
         .and_then(commit_type);
+    target.base_sha = document
+        .get("baseRefOid")
+        .and_then(serde_json::Value::as_str)
+        .filter(|sha| !sha.is_empty())
+        .map(str::to_owned);
     Ok(())
 }
 

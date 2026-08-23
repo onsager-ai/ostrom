@@ -96,7 +96,10 @@ fn explain_reports_the_principal_floor_when_no_rule_matches() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 explain output");
     assert!(stdout.contains("decide       principal"), "{stdout}");
-    assert!(stdout.contains("floor (no grant matched)"), "{stdout}");
+    assert!(
+        stdout.contains("default deny (no grant matched"),
+        "{stdout}"
+    );
     assert!(
         stdout.contains("no rule granted this pull request; principal is the floor"),
         "{stdout}"

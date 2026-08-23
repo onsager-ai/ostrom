@@ -235,7 +235,7 @@ pub const OSTROM_ACTOR: EnvironmentVariable = variable(
 pub const OSTROM_POLICY_MANIFEST: EnvironmentVariable = variable(
     "OSTROM_POLICY_MANIFEST",
     EnvironmentClass::Location,
-    "<config>/policy.yaml",
+    "<config>/ostrom.yaml",
 );
 pub const OSTROM_POLICY_TRUSTED_KEYS: EnvironmentVariable = variable(
     "OSTROM_POLICY_TRUSTED_KEYS",

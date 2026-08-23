@@ -41,6 +41,126 @@ fn local_operation_runs_without_inherited_forge_credentials() {
 }
 
 #[test]
+fn repository_operation_redefinition_is_not_adopted_for_execution() {
+    let repository = TempDir::new().expect("repository fixture");
+    let home = TempDir::new().expect("operator fixture");
+    fs::create_dir(repository.path().join(".git")).expect("repository boundary");
+    let repository_manifest = repository.path().join("ostrom.yaml");
+    fs::write(
+        &repository_manifest,
+        "manifest_version: 1\nactors: {builder: {}}\noperations:\n  local-proof:\n    steps:\n      - uses: cmd/run\n        with: {script: 'printf repository'}\ngrants:\n  repository-grant: {actors: builder, operations: local-proof, repositories: placeholder-org/repo}\n",
+    )
+    .expect("write repository declaration");
+    let operator_manifest = home.path().join("ostrom.yaml");
+    fs::write(
+        &operator_manifest,
+        "manifest_version: 1\nactors: {builder: {}}\noperations:\n  local-proof:\n    steps:\n      - uses: cmd/run\n        with: {script: 'printf operator'}\n",
+    )
+    .expect("write adopted operation");
+    let trusted_keys = support::sign_manifest(&repository_manifest);
+    support::sign_manifest(&operator_manifest);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .current_dir(repository.path())
+        .env("OSTROM_HOME", home.path())
+        .env("OSTROM_POLICY_TRUSTED_KEYS", trusted_keys)
+        .env("OSTROM_ACTOR", "builder")
+        .args(["local-proof", "placeholder-org/repo"])
+        .output()
+        .expect("run adopted operation");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"operator");
+}
+
+#[cfg(unix)]
+#[test]
+fn pull_request_authority_is_loaded_from_the_base_commit() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let repository = TempDir::new().expect("repository fixture");
+    let home = TempDir::new().expect("operator fixture");
+    let git = |arguments: &[&str]| {
+        let output = Command::new("git")
+            .current_dir(repository.path())
+            .args(arguments)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "placeholder@example.com"]);
+    git(&["config", "user.name", "Placeholder"]);
+    let repository_manifest = repository.path().join("ostrom.yaml");
+    fs::write(repository.path().join("README.md"), "base\n").expect("write base repository");
+    git(&["add", "README.md"]);
+    git(&["commit", "-qm", "base without policy"]);
+    let base_sha = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout)
+        .expect("base SHA UTF-8")
+        .trim()
+        .to_owned();
+
+    fs::write(
+        &repository_manifest,
+        "manifest_version: 1\ngrants:\n  head-only-grant: {actors: builder, operations: local-proof, repositories: placeholder-org/repo}\n",
+    )
+    .expect("write head grant");
+    let trusted_keys = support::sign_manifest(&repository_manifest);
+    git(&["add", "ostrom.yaml", "ostrom.yaml.sig"]);
+    git(&["commit", "-qm", "add head grant"]);
+
+    let marker = repository.path().join("head-ran");
+    let operator_manifest = home.path().join("ostrom.yaml");
+    fs::write(
+        &operator_manifest,
+        format!(
+            "manifest_version: 1\nactors: {{builder: {{}}}}\noperations:\n  local-proof:\n    steps:\n      - uses: cmd/run\n        with: {{script: 'printf ran > {}'}}\n",
+            marker.display()
+        ),
+    )
+    .expect("write adopted operation");
+    support::sign_manifest(&operator_manifest);
+    let wrapper = home.path().join("credential-wrapper.sh");
+    fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nprintf '%s' '{{\"labels\":[],\"files\":[{{\"path\":\"ostrom.yaml\"}}],\"title\":\"feat: grant\",\"baseRefOid\":\"{base_sha}\"}}'\n"
+        ),
+    )
+    .expect("write metadata wrapper");
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700))
+        .expect("make wrapper executable");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .current_dir(repository.path())
+        .env("OSTROM_HOME", home.path())
+        .env("OSTROM_POLICY_TRUSTED_KEYS", trusted_keys)
+        .env("OSTROM_ACTOR", "builder")
+        .env("MANDATE_GH_AS_BIN", wrapper)
+        .args(["local-proof", "placeholder-org/repo#7"])
+        .output()
+        .expect("authorize operation from PR base");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("not authorized"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !marker.exists(),
+        "head-only grant must not govern its own pull request"
+    );
+}
+
+#[test]
 fn action_names_are_not_a_direct_cli_surface() {
     let root = fixture(LOCAL_POLICY);
     let output = ostrom(root.path())

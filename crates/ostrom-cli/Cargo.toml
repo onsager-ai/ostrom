@@ -22,11 +22,11 @@ ostrom-store = { path = "../ostrom-store" }
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 rsa.workspace = true
-tempfile.workspace = true
 
 [lints]
 workspace = true

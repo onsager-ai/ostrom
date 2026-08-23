@@ -12,11 +12,12 @@ includes:
 ostrom sign \
   --key-id policy-principal \
   --key /principal-only/policy-private.pem \
-  /policy/policy.yaml
+  /policy/ostrom.yaml
 ```
 
-The command validates and resolves includes before signing, then atomically
-writes `/policy/policy.yaml.sig`. The signature uses RSA PKCS#1 v1.5 with
+The command parses and resolves includes before signing, then atomically
+writes `/policy/ostrom.yaml.sig`. Cross-scope references are validated when the
+signed repository and operator documents are composed. The signature uses RSA PKCS#1 v1.5 with
 SHA-256 over a deterministic encoding of the fully composed manifest. YAML
 formatting and mapping order are not trusted data; changing any semantic value
 in the root or an included leaf invalidates the signature.
@@ -27,7 +28,7 @@ trusted-key directory:
 
 ```sh
 export OSTROM_POLICY_TRUSTED_KEYS=/run/ostrom/trusted-policy-keys
-ostrom validate /policy/policy.yaml
+ostrom validate /policy/ostrom.yaml
 ```
 
 `OSTROM_POLICY_TRUSTED_KEYS` must be provisioned by the host or worker and is
