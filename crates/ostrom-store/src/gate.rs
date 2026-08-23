@@ -518,6 +518,35 @@ pub(crate) fn load_gate_config(paths: &OstromPaths, cwd: &Path) -> Result<GateCo
     Ok(config)
 }
 
+/// Load the legacy central merge gate without a repository-local overlay.
+pub fn load_central_gate_config(paths: &OstromPaths) -> Result<GateConfig, String> {
+    let user_path = paths.config.join("gate.yaml");
+    if !user_path.exists() {
+        return Err(format!("no gate.yaml found at {}", user_path.display()));
+    }
+    let mut merged = serde_yaml::from_str::<serde_yaml::Value>(SHIPPED_DEFAULTS)
+        .map_err(|error| error.to_string())?;
+    let text = fs::read_to_string(&user_path).map_err(|error| error.to_string())?;
+    let overlay =
+        serde_yaml::from_str::<serde_yaml::Value>(&text).map_err(|error| error.to_string())?;
+    merge_yaml(&mut merged, overlay);
+    let serialized = serde_yaml::to_string(&merged).map_err(|error| error.to_string())?;
+    let mut config =
+        GateConfig::from_yaml(&serialized).map_err(|error| truncate_error(&error.to_string()))?;
+    for path in ["path:ostrom.yaml", "path:ostrom.yml"] {
+        if !config
+            .bounce_all
+            .iter()
+            .any(|selector| selector.as_str() == path)
+        {
+            config
+                .bounce_all
+                .push(GateSelector::new(path).map_err(|error| truncate_error(&error.to_string()))?);
+        }
+    }
+    Ok(config)
+}
+
 fn load_gate_config_for_repo(
     paths: &OstromPaths,
     cwd: &Path,

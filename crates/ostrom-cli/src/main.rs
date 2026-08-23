@@ -41,6 +41,7 @@ use ostrom_store::{
 };
 
 mod operation_dispatch;
+mod policy_generate;
 mod policy_manifest;
 
 use operation_dispatch::{
@@ -73,6 +74,11 @@ enum Command {
         #[arg(long)]
         normalized: bool,
         manifest: PathBuf,
+    },
+    /// Generate or verify repository policy manifests from the legacy central policy.
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommand,
     },
     /// List the operations declared by the active policy manifest.
     Operations {
@@ -287,6 +293,16 @@ enum CheckCommand {
         base: String,
         #[arg(long)]
         head: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PolicyCommand {
+    /// Write one ostrom.yaml per repository, or verify existing files without writing.
+    Generate {
+        /// Compare existing manifests with central policy across stored open items.
+        #[arg(long)]
+        verify: bool,
     },
 }
 
@@ -515,6 +531,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             normalized,
             manifest,
         } => policy_manifest::run_validate(&manifest, normalized)?,
+        Command::Policy {
+            command: PolicyCommand::Generate { verify },
+        } => policy_generate::run(&paths, verify)?,
         Command::Operations {
             actor,
             settings,

@@ -59,7 +59,7 @@ pub use policy::{
     PolicyDecision, PolicyManifest, PolicySelector, PolicySelectorError, ResolvedInput,
     ResolvedLoop, ResolvedLoopCeilings, RuleDecl, RuleDefaults, SelectorFinding, SelectorMatch,
     SelectorPrefix, SelectorResolutionError, SelectorUniverse, StallDuration, StallDurationError,
-    StepDecl, UnmatchedPolicy,
+    StepDecl, UnmatchedPolicy, glob_matches,
 };
 pub use store::{
     AttemptOutcome, CHECK_STORE_SCHEMA_VERSION, CheckRun, CheckRunId, CheckStore, CheckStoreFault,

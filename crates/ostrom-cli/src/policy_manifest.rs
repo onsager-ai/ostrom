@@ -26,9 +26,9 @@ pub(crate) fn run_validate(path: &Path, normalized: bool) -> Result<(), PolicyLo
         .is_some_and(|name| name == "ostrom.yaml" || name == "ostrom.yml")
         && normalized_path.parent().and_then(repository_root).is_some()
     {
-        for actor in loaded.actors.keys() {
+        for actor in repository_actor_names(&loaded) {
             eprintln!(
-                "lint: repository actor `{actor}` declared in `{}` is non-portable across operator rosters",
+                "lint: repository actor `{actor}` named in `{}` is non-portable across operator rosters",
                 normalized_path.display()
             );
         }
@@ -429,17 +429,98 @@ fn validate_scoped_manifest(
 }
 
 fn report_repository_actor_lints(repository: &LoadedManifest) {
-    for actor in repository.manifest.actors.keys() {
-        let source = repository
-            .origins
-            .actors
-            .get(actor)
-            .unwrap_or(&repository.origins.root);
+    let findings = repository
+        .manifest
+        .actors
+        .keys()
+        .map(|actor| {
+            (
+                actor.clone(),
+                repository
+                    .origins
+                    .actors
+                    .get(actor)
+                    .unwrap_or(&repository.origins.root)
+                    .clone(),
+            )
+        })
+        .chain(
+            repository
+                .manifest
+                .grants
+                .iter()
+                .flat_map(|(rule, declaration)| {
+                    declaration.actors.iter().map(move |actor| {
+                        (
+                            actor.clone(),
+                            repository
+                                .origins
+                                .grants
+                                .get(rule)
+                                .unwrap_or(&repository.origins.root)
+                                .clone(),
+                        )
+                    })
+                }),
+        )
+        .chain(
+            repository
+                .manifest
+                .denies
+                .iter()
+                .flat_map(|(rule, declaration)| {
+                    declaration.actors.iter().map(move |actor| {
+                        (
+                            actor.clone(),
+                            repository
+                                .origins
+                                .denies
+                                .get(rule)
+                                .unwrap_or(&repository.origins.root)
+                                .clone(),
+                        )
+                    })
+                }),
+        )
+        .chain(repository.manifest.loops.iter().map(|(name, declaration)| {
+            (
+                declaration.actor.clone(),
+                repository
+                    .origins
+                    .loops
+                    .get(name)
+                    .unwrap_or(&repository.origins.root)
+                    .clone(),
+            )
+        }))
+        .collect::<BTreeSet<_>>();
+    for (actor, source) in &findings {
         eprintln!(
-            "lint: repository actor `{actor}` declared in `{}` is non-portable across operator rosters",
+            "lint: repository actor `{actor}` named in `{}` is non-portable across operator rosters",
             source.display()
         );
     }
+}
+
+pub(crate) fn repository_actor_names(manifest: &PolicyManifest) -> BTreeSet<String> {
+    manifest
+        .actors
+        .keys()
+        .cloned()
+        .chain(
+            manifest
+                .grants
+                .values()
+                .chain(manifest.denies.values())
+                .flat_map(|rule| rule.actors.iter().cloned()),
+        )
+        .chain(
+            manifest
+                .loops
+                .values()
+                .map(|declaration| declaration.actor.clone()),
+        )
+        .collect()
 }
 
 fn merge_fallback<T>(target: &mut BTreeMap<String, T>, fallback: BTreeMap<String, T>) {
@@ -791,6 +872,7 @@ fn command_verbs() -> impl Iterator<Item = &'static str> {
         "parity",
         "pass",
         "plan",
+        "policy",
         "queue",
         "repair-prs",
         "replay",

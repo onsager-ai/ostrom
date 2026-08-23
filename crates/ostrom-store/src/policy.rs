@@ -1,6 +1,6 @@
 use ostrom_core::{
     CheckDefinition, InconclusivePolicy, PolicyCandidate, PolicyManifest, RuleDecl, SelectorPrefix,
-    StallDuration, UnmatchedPolicy,
+    StallDuration, UnmatchedPolicy, glob_matches,
 };
 use serde_json::Value;
 use std::{
@@ -490,7 +490,13 @@ fn explain_rule(
         .map(|selector| SelectorProjection {
             selector: selector.to_string(),
             projection: match selector.prefix() {
-                SelectorPrefix::Label | SelectorPrefix::Path | SelectorPrefix::Type => "subject",
+                SelectorPrefix::Label
+                | SelectorPrefix::Path
+                | SelectorPrefix::Ref
+                | SelectorPrefix::Scope
+                | SelectorPrefix::Substance
+                | SelectorPrefix::Title
+                | SelectorPrefix::Type => "subject",
                 SelectorPrefix::Actor | SelectorPrefix::Verb => "actor",
             },
             matched: selector.matches(candidate),
@@ -553,10 +559,20 @@ fn explain_requirement(
             .get("name")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        checks
+        let selected = checks
             .iter()
-            .find(|candidate| check_name(candidate) == expected)
-            .map_or("FAIL", check_status)
+            .filter(|candidate| glob_matches(check_name(candidate), expected, false))
+            .collect::<Vec<_>>();
+        if selected.is_empty() || selected.iter().any(|check| check_status(check) == "FAIL") {
+            "FAIL"
+        } else if selected
+            .iter()
+            .any(|check| check_status(check) == "INCONCLUSIVE")
+        {
+            "INCONCLUSIVE"
+        } else {
+            "PASS"
+        }
     } else {
         "INCONCLUSIVE"
     };
@@ -637,17 +653,55 @@ fn pull_request_candidate(
     actor: &str,
     operation: &str,
 ) -> PolicyCandidate {
+    let title = pull_request
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let mut refs = pull_request
+        .get("number")
+        .and_then(Value::as_u64)
+        .into_iter()
+        .chain(
+            pull_request
+                .pointer("/closingIssuesReferences/nodes")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|issue| issue.get("number").and_then(Value::as_u64)),
+        )
+        .map(|number| format!("#{number}"))
+        .collect::<Vec<_>>();
+    refs.sort();
+    refs.dedup();
     PolicyCandidate {
         repository: repository.to_owned(),
         labels: names(pull_request.get("labels"), "name"),
         paths: names(pull_request.get("files"), "path"),
-        commit_type: pull_request
-            .get("title")
-            .and_then(Value::as_str)
-            .and_then(commit_type),
+        refs,
+        scopes: title.as_deref().map_or_else(Vec::new, conventional_scopes),
+        substances: names(pull_request.get("substances"), "name"),
+        commit_type: title.as_deref().and_then(commit_type),
+        title,
         actor: Some(actor.to_owned()),
         verb: Some(operation.to_owned()),
     }
+}
+
+fn conventional_scopes(title: &str) -> Vec<String> {
+    let Some(prefix) = title.split_once(':').map(|(prefix, _)| prefix) else {
+        return Vec::new();
+    };
+    let Some((_, scopes)) = prefix.split_once('(') else {
+        return Vec::new();
+    };
+    scopes
+        .strip_suffix(')')
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|scope| !scope.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 fn names(value: Option<&Value>, key: &str) -> Vec<String> {

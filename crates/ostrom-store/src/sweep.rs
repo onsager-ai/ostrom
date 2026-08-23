@@ -193,6 +193,8 @@ struct NormalizedItem {
     refs: Vec<u64>,
     closing_refs: Vec<u64>,
     files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    checks: Vec<Value>,
     opened: String,
     updated: String,
     ci: String,
@@ -1593,6 +1595,23 @@ fn normalize_item(
     } else {
         "none".to_owned()
     };
+    let mut checks = if item_type == "pr" {
+        source
+            .get("statusCheckRollup")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|check| {
+                let name = nonempty_string(check, &["name", "context"])?;
+                let state = nonempty_string(check, &["conclusion", "state", "status", "bucket"])
+                    .unwrap_or_default();
+                Some(json!({"name": name, "state": state}))
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    checks.sort_by(|left, right| string_field(left, &["name"]).cmp(string_field(right, &["name"])));
     let mergeable = string_field(source, &["mergeable"]);
     let ready = item_type == "pr"
         && !source
@@ -1610,6 +1629,11 @@ fn normalize_item(
             .collect::<Vec<_>>()
             .join(","),
         files.join(","),
+        checks
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
         ci.clone(),
         mergeable.to_owned(),
         ready.to_string(),
@@ -1631,6 +1655,7 @@ fn normalize_item(
         refs,
         closing_refs,
         files,
+        checks,
         opened: string_field(source, &["createdAt", "created_at"]).to_owned(),
         updated: string_field(source, &["updatedAt", "updated_at"]).to_owned(),
         ci,
@@ -2635,6 +2660,24 @@ pub fn load_config(paths: &OstromPaths, cwd: &Path) -> Result<MandateConfig, Swe
             merge_yaml(&mut merged, overlay);
         }
     }
+    let serialized =
+        serde_yaml::to_string(&merged).map_err(|error| SweepError::Config(error.to_string()))?;
+    MandateConfig::from_yaml(&serialized).map_err(|error| SweepError::Config(error.to_string()))
+}
+
+/// Load the legacy operator roster without applying a repository-local overlay.
+pub fn load_central_config(paths: &OstromPaths) -> Result<MandateConfig, SweepError> {
+    let user_path = paths.config.join("mandates.yaml");
+    if !user_path.exists() {
+        return Err(SweepError::NotConfigured(user_path.display().to_string()));
+    }
+    let mut merged: serde_yaml::Value = serde_yaml::from_str(SHIPPED_DEFAULTS)
+        .map_err(|error| SweepError::Config(error.to_string()))?;
+    let text = fs::read_to_string(&user_path)
+        .map_err(|error| SweepError::Config(format!("{}: {error}", user_path.display())))?;
+    let overlay = serde_yaml::from_str(&text)
+        .map_err(|error| SweepError::Config(format!("{}: {error}", user_path.display())))?;
+    merge_yaml(&mut merged, overlay);
     let serialized =
         serde_yaml::to_string(&merged).map_err(|error| SweepError::Config(error.to_string()))?;
     MandateConfig::from_yaml(&serialized).map_err(|error| SweepError::Config(error.to_string()))

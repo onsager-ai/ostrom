@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use ostrom_core::ActionDefinition;
+use ostrom_core::{ActionDefinition, glob_matches};
 use serde_json::{Value, json};
 
 use crate::{
@@ -101,7 +101,7 @@ impl ActionProvider for GitHubProvider {
                     .filter(|name| !name.is_empty())
                     .ok_or_else(invalid_parameters)?;
                 let jobs = workflow_job_names(&self.working_directory)?;
-                if !jobs.contains(name) {
+                if !jobs.iter().any(|job| glob_matches(job, name, false)) {
                     return Err(ActionFault::new("gh_unknown_check_run", None));
                 }
                 Ok(Box::new(CheckRunAction {
@@ -155,22 +155,45 @@ impl PreparedAction for CheckRunAction {
                 let Ok(checks) = serde_json::from_slice::<Vec<Value>>(&stdout) else {
                     return inconclusive("gh_check_run_response");
                 };
-                let Some(check) = checks
+                let selected = checks
                     .iter()
-                    .find(|check| check.get("name").and_then(Value::as_str) == Some(&self.name))
-                else {
+                    .filter(|check| {
+                        check
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .is_some_and(|name| glob_matches(name, &self.name, false))
+                    })
+                    .collect::<Vec<_>>();
+                if selected.is_empty() {
                     return ActionOutcome::Fail;
-                };
-                match check
-                    .get("bucket")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_ascii_lowercase()
-                    .as_str()
-                {
-                    "pass" | "skipping" => ActionOutcome::Pass,
-                    "fail" | "cancel" => ActionOutcome::Fail,
-                    _ => inconclusive("gh_check_run_pending"),
+                }
+                if selected.iter().any(|check| {
+                    matches!(
+                        check
+                            .get("bucket")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_ascii_lowercase()
+                            .as_str(),
+                        "fail" | "cancel" | "pending"
+                    )
+                }) {
+                    return ActionOutcome::Fail;
+                }
+                if selected.iter().all(|check| {
+                    matches!(
+                        check
+                            .get("bucket")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_ascii_lowercase()
+                            .as_str(),
+                        "pass" | "skipping"
+                    )
+                }) {
+                    ActionOutcome::Pass
+                } else {
+                    inconclusive("gh_check_run_pending")
                 }
             }
             ProcessResult::TimedOut => inconclusive("gh_timeout"),
@@ -361,6 +384,20 @@ mod tests {
             .expect("defined job")
             .execute("gh-check-run");
         assert_eq!(receipt.verdict, Some(CheckVerdict::Pass));
+    }
+
+    #[test]
+    fn check_run_glob_requires_every_matching_job_to_be_green() {
+        let (_root, provider) = fixture(
+            "#!/bin/sh\nprintf '%s\\n' '[{\"name\":\"Rust workspace\",\"bucket\":\"pass\"},{\"name\":\"rust\",\"bucket\":\"fail\"}]'\n",
+        );
+        let mut registry = ActionRegistry::new();
+        registry.register(provider).expect("GitHub provider");
+        let receipt = registry
+            .prepare("github", &catalogue("gh/check-run", "{name: 'rust*'}"))
+            .expect("glob matches workflow jobs")
+            .execute("gh-check-run-glob");
+        assert_eq!(receipt.verdict, Some(CheckVerdict::Fail));
     }
 
     #[test]

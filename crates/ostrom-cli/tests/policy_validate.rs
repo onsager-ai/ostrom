@@ -308,7 +308,7 @@ fn unknown_selector_prefix_fails_the_cli_and_names_it() {
     let manifest = temporary.path().join("manifest.yml");
     fs::write(
         &manifest,
-        "manifest_version: 1\nactors: {builder: {}}\noperations: {work: {steps: []}}\ngrants:\n  bad: {actors: builder, operations: work, where: 'title:*free prose*'}\n",
+        "manifest_version: 1\nactors: {builder: {}}\noperations: {work: {steps: []}}\ngrants:\n  bad: {actors: builder, operations: work, where: 'narration:*free prose*'}\n",
     )
     .expect("write manifest");
     let output = ostrom()
@@ -319,7 +319,7 @@ fn unknown_selector_prefix_fails_the_cli_and_names_it() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("unknown selector prefix: title"),
+        stderr.contains("unknown selector prefix: narration"),
         "{stderr}"
     );
 }
