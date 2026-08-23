@@ -691,10 +691,16 @@ fn verify_repository(
             .is_some_and(|project| !project.required_checks.is_empty())
             || !manifest.checks.is_empty();
         if item.get("type").and_then(Value::as_str) == Some("pr") && has_required_checks {
+            // A pull request with no check runs is an ordinary state, not absent
+            // evidence: a release pull request often has no CI, and a repository
+            // may have none at all. Both sides observe the same empty list and
+            // therefore agree. Evidence genuinely never gathered is a different
+            // condition, reported per repository by `VerificationEvidence`.
+            const NO_CHECK_RUNS: &Vec<Value> = &Vec::new();
             let observed = item
                 .get("checks")
                 .and_then(Value::as_array)
-                .ok_or_else(|| GenerateError::CheckEvidence { item: id.clone() })?;
+                .unwrap_or(NO_CHECK_RUNS);
             let central_checks = gate_project
                 .into_iter()
                 .flat_map(|project| &project.required_checks)
@@ -930,8 +936,6 @@ pub(crate) enum GenerateError {
     },
     #[error("sweep evidence contains no open-item records for `{0}`; run a full sweep first")]
     VerificationEvidence(String),
-    #[error("sweep evidence for `{item}` has no named check runs; run a full sweep first")]
-    CheckEvidence { item: String },
     #[error("generated manifest for `{repository}` diverges:\n{differences}")]
     Divergence {
         repository: String,

@@ -283,3 +283,39 @@ fn verify_detects_a_seeded_divergence_and_names_the_item() {
     assert!(stderr.contains("central=granted"), "{stderr}");
     assert!(stderr.contains("generated=denied"), "{stderr}");
 }
+
+#[test]
+fn a_pull_request_with_no_check_runs_is_verified_rather_than_refused() {
+    // `crawlab-team/crawlab-pro#155` is a real release pull request carrying zero
+    // check runs. Refusing it as absent evidence sent an operator to run a full
+    // sweep twice for a condition no sweep can change.
+    let fixture = Fixture::new();
+    let state_path = fixture.home.path().join("state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&fs::read(&state_path).expect("read state")).expect("parse state");
+    state["repos"]["placeholder-org/repository"]["records"]["placeholder-org/repository#155"] = json!({
+        "id": "placeholder-org/repository#155",
+        "repo": "placeholder-org/repository",
+        "ref": "#155",
+        "type": "pr",
+        "title": "chore(main): release 0.8.0",
+        "labels": [],
+        "refs": [155],
+        "files": [],
+        // No `checks` key at all — the shape a pull request with no CI produces.
+    });
+    fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&state).expect("state JSON"),
+    )
+    .expect("write state");
+
+    assert!(
+        fixture.command(&["policy", "generate"]).status.success(),
+        "generate must succeed"
+    );
+    let verified = fixture.command(&["policy", "generate", "--verify"]);
+    let stderr = String::from_utf8_lossy(&verified.stderr);
+    assert!(verified.status.success(), "{stderr}");
+    assert!(!stderr.contains("full sweep"), "{stderr}");
+}
