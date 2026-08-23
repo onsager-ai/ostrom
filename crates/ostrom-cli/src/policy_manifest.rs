@@ -3,7 +3,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs, io,
     path::{Component, Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::Once,
 };
 
@@ -12,7 +12,7 @@ use ostrom_core::{
     ActorDecl, CheckDefinition, LoopDecl, OperationDecl, PolicyManifest, RuleDecl, SelectorFinding,
     SelectorUniverse,
 };
-use ostrom_store::{OstromPaths, PolicyBundle, PolicyExplanation, SweepFixture};
+use ostrom_store::{OstromPaths, PolicyBundle, PolicyExplanation, PolicyOrigins, SweepFixture};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use serde_yaml::{Mapping, Value};
@@ -20,6 +20,19 @@ use thiserror::Error;
 
 pub(crate) fn run_validate(path: &Path, normalized: bool) -> Result<(), PolicyLoadError> {
     let loaded = load(path)?;
+    let normalized_path = normalize_manifest_path(path);
+    if normalized_path
+        .file_name()
+        .is_some_and(|name| name == "ostrom.yaml" || name == "ostrom.yml")
+        && normalized_path.parent().and_then(repository_root).is_some()
+    {
+        for actor in loaded.actors.keys() {
+            eprintln!(
+                "lint: repository actor `{actor}` declared in `{}` is non-portable across operator rosters",
+                normalized_path.display()
+            );
+        }
+    }
     // Resolve the ladder even when normalized output was not requested. This
     // catches a present environment value with the wrong declared type while
     // never placing its raw value in diagnostics.
@@ -95,11 +108,7 @@ pub(crate) fn run_sign(
     private_key: &Path,
 ) -> Result<(), PolicyLoadError> {
     let path = normalize_manifest_path(path);
-    let manifest = if path.file_name().is_some_and(|name| name == "config.yaml") {
-        load_composed(&path)?
-    } else {
-        load_unverified(&path)?
-    };
+    let manifest = load_composed(&path)?.manifest;
     let signature = ostrom_store::sign_policy_manifest(&manifest, &path, key_id, private_key)?;
     println!("signed: {}", signature.display());
     Ok(())
@@ -109,33 +118,134 @@ pub(crate) fn load_bundle(
     paths: &OstromPaths,
     path: &Path,
 ) -> Result<PolicyBundle, PolicyLoadError> {
-    let mut manifest = load(path)?;
-    let overlay_path = paths.private_config_file();
-    if !overlay_path.is_file() || overlay_path == path {
-        return Ok(PolicyBundle::repository(manifest));
-    }
-
-    let overlay = load_composed(&overlay_path)?;
-    verify(&overlay, &overlay_path)?;
-    if overlay.manifest_version != manifest.manifest_version {
-        return Err(PolicyLoadError::OverlayVersion {
-            path: overlay_path,
-            version: overlay.manifest_version,
-            expected: manifest.manifest_version,
-        });
-    }
-    if let Some(rule) = overlay.grants.keys().next() {
-        return Err(PolicyLoadError::OverlayGrant {
-            path: overlay_path,
-            rule: rule.clone(),
-        });
-    }
-    let overlay_denies = merge_overlay(&mut manifest, overlay);
-    validate_manifest(&manifest)?;
-    Ok(PolicyBundle::layered(manifest, overlay_denies))
+    let repository_path = normalize_manifest_path(path).into_owned();
+    let repository = load_composed(&repository_path)?;
+    verify(&repository.manifest, &repository_path)?;
+    build_bundle(paths, repository_path, repository)
 }
 
-pub(crate) fn default_manifest_path(paths: &OstromPaths, cwd: &Path) -> Option<PathBuf> {
+fn build_bundle(
+    paths: &OstromPaths,
+    repository_path: PathBuf,
+    repository: LoadedManifest,
+) -> Result<PolicyBundle, PolicyLoadError> {
+    let operator_path = operator_manifest_path(paths)?;
+    let operator = operator_path
+        .filter(|operator_path| operator_path != &repository_path)
+        .map(|operator_path| {
+            let loaded = load_composed(&operator_path)?;
+            verify(&loaded.manifest, &operator_path)?;
+            Ok::<_, PolicyLoadError>((operator_path, loaded))
+        })
+        .transpose()?;
+    if let Some((operator_path, operator)) = &operator
+        && operator.manifest.manifest_version != repository.manifest.manifest_version
+    {
+        return Err(PolicyLoadError::OperatorVersion {
+            path: operator_path.clone(),
+            version: operator.manifest.manifest_version,
+            expected: repository.manifest.manifest_version,
+        });
+    }
+    validate_scoped_manifest(
+        &repository.manifest,
+        operator.as_ref().map(|(_, loaded)| &loaded.manifest),
+    )?;
+    if let Some((_, operator)) = &operator {
+        validate_scoped_manifest(&operator.manifest, Some(&repository.manifest))?;
+    }
+    report_repository_actor_lints(&repository);
+    let manifest = compose_scopes(
+        repository.manifest.clone(),
+        operator.as_ref().map(|(_, loaded)| &loaded.manifest),
+    );
+    Ok(PolicyBundle::scoped(
+        manifest,
+        repository.manifest,
+        repository.origins,
+        operator.map(|(_, loaded)| (loaded.manifest, loaded.origins)),
+    ))
+}
+
+pub(crate) fn load_bundle_at_base(
+    paths: &OstromPaths,
+    path: &Path,
+    working_directory: &Path,
+    base_sha: &str,
+) -> Result<PolicyBundle, PolicyLoadError> {
+    let Some(root) = repository_root(working_directory) else {
+        return load_bundle(paths, path);
+    };
+    let path = normalize_manifest_path(path).into_owned();
+    let Ok(relative) = path.strip_prefix(&root) else {
+        return load_bundle(paths, &path);
+    };
+    let snapshot = tempfile::tempdir().map_err(PolicyLoadError::Snapshot)?;
+    let archive = Command::new("git")
+        .current_dir(&root)
+        .args(["archive", "--format=tar", base_sha])
+        .output()
+        .map_err(PolicyLoadError::GitSnapshot)?;
+    if !archive.status.success() {
+        return Err(PolicyLoadError::GitSnapshotResponse(
+            String::from_utf8_lossy(&archive.stderr)
+                .trim()
+                .chars()
+                .take(500)
+                .collect(),
+        ));
+    }
+    let mut tar = Command::new("tar")
+        .args(["-xf", "-", "-C"])
+        .arg(snapshot.path())
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(PolicyLoadError::GitSnapshot)?;
+    use std::io::Write as _;
+    tar.stdin
+        .take()
+        .ok_or_else(|| {
+            PolicyLoadError::GitSnapshotResponse("tar stdin was unavailable".to_owned())
+        })?
+        .write_all(&archive.stdout)
+        .map_err(PolicyLoadError::GitSnapshot)?;
+    let status = tar.wait().map_err(PolicyLoadError::GitSnapshot)?;
+    if !status.success() {
+        return Err(PolicyLoadError::GitSnapshotResponse(format!(
+            "tar exited with {status}"
+        )));
+    }
+    let snapshot_path = snapshot.path().join(relative);
+    let snapshot_directory = snapshot_path.parent().unwrap_or_else(|| snapshot.path());
+    let Some(snapshot_manifest) = named_manifest_path(snapshot_directory)? else {
+        let manifest = PolicyManifest::parse_yaml("manifest_version: 1\n").map_err(|source| {
+            PolicyLoadError::Yaml {
+                path: path.clone(),
+                source,
+            }
+        })?;
+        return build_bundle(
+            paths,
+            path.clone(),
+            LoadedManifest {
+                origins: PolicyOrigins::from_root(&manifest, &path),
+                manifest,
+            },
+        );
+    };
+    let repository_path = snapshot_manifest
+        .strip_prefix(snapshot.path())
+        .map_or_else(|_| path.clone(), |relative| root.join(relative));
+    let mut repository = load_composed(&snapshot_manifest)?;
+    verify(&repository.manifest, &snapshot_manifest)?;
+    repository.origins.rebase(snapshot.path(), &root);
+    build_bundle(paths, repository_path, repository)
+}
+
+pub(crate) fn default_manifest_path(
+    paths: &OstromPaths,
+    cwd: &Path,
+) -> Result<Option<PathBuf>, PolicyLoadError> {
     let repository = repository_root(cwd);
     let directories = repository.as_ref().map_or_else(
         || cwd.ancestors().map(Path::to_path_buf).collect::<Vec<_>>(),
@@ -151,12 +261,10 @@ pub(crate) fn default_manifest_path(paths: &OstromPaths, cwd: &Path) -> Option<P
         },
     );
 
-    if let Some(path) = directories
-        .iter()
-        .map(|directory| directory.join("ostrom.yaml"))
-        .find(|path| path.is_file())
-    {
-        return Some(path);
+    for directory in &directories {
+        if let Some(path) = named_manifest_path(directory)? {
+            return Ok(Some(path));
+        }
     }
     if let Some(path) = directories
         .iter()
@@ -164,17 +272,57 @@ pub(crate) fn default_manifest_path(paths: &OstromPaths, cwd: &Path) -> Option<P
         .find(|path| path.is_file())
     {
         warn_legacy_manifest(&path);
-        return Some(path);
+        return Ok(Some(path));
     }
 
     if repository.is_none() {
         let path = paths.config.join("manifest.yml");
         if path.is_file() {
             warn_legacy_manifest(&path);
-            return Some(path);
+            return Ok(Some(path));
         }
     }
-    None
+    Ok(None)
+}
+
+fn named_manifest_path(directory: &Path) -> Result<Option<PathBuf>, PolicyLoadError> {
+    let yaml = directory.join("ostrom.yaml");
+    let yml = directory.join("ostrom.yml");
+    match (yaml.is_file(), yml.is_file()) {
+        (true, true) => Err(PolicyLoadError::AmbiguousManifest { yaml, yml }),
+        (true, false) => Ok(Some(yaml)),
+        (false, true) => Ok(Some(yml)),
+        (false, false) => Ok(None),
+    }
+}
+
+pub(crate) fn operator_manifest_path(
+    paths: &OstromPaths,
+) -> Result<Option<PathBuf>, PolicyLoadError> {
+    if let Some(path) = ostrom_store::environment::OSTROM_POLICY_MANIFEST
+        .value_os()
+        .filter(|path| !path.is_empty())
+    {
+        return Ok(Some(PathBuf::from(path)));
+    }
+    if let Some(path) = named_manifest_path(&paths.config)? {
+        return Ok(Some(path));
+    }
+    for legacy in ["policy.yaml", "config.yaml"] {
+        let path = paths.config.join(legacy);
+        if path.is_file() {
+            warn_legacy_operator_manifest(&path);
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+
+pub(crate) fn adopting_manifest_path(paths: &OstromPaths) -> Result<PathBuf, PolicyLoadError> {
+    operator_manifest_path(paths)?.ok_or_else(|| PolicyLoadError::AdoptingManifestNotFound {
+        yaml: paths.config.join("ostrom.yaml"),
+        yml: paths.config.join("ostrom.yml"),
+    })
 }
 
 pub(crate) fn load_optional_bundle(
@@ -186,7 +334,7 @@ pub(crate) fn load_optional_bundle(
     // must keep working in a repository that has no manifest yet. Discovery is
     // still strict — it never falls through to the operator's own policy — so
     // `None` means ungoverned, not "somebody else's rules".
-    let Some(path) = default_manifest_path(paths, cwd) else {
+    let Some(path) = default_manifest_path(paths, cwd)? else {
         return Ok(None);
     };
     load_bundle(paths, &path).map(Some)
@@ -212,43 +360,86 @@ fn warn_legacy_manifest(path: &Path) {
     });
 }
 
-fn merge_overlay(repository: &mut PolicyManifest, overlay: PolicyManifest) -> BTreeSet<String> {
+fn warn_legacy_operator_manifest(path: &Path) {
+    static NOTICE: Once = Once::new();
+    NOTICE.call_once(|| {
+        eprintln!(
+            "warning: legacy operator policy manifest `{}` is deprecated; move it to `ostrom.yaml`",
+            path.display()
+        );
+    });
+}
+
+fn compose_scopes(
+    mut repository: PolicyManifest,
+    operator: Option<&PolicyManifest>,
+) -> PolicyManifest {
+    let Some(operator) = operator else {
+        repository.operations.clear();
+        repository.loops.clear();
+        return repository;
+    };
     let shipped = ostrom_core::ManifestDefaults::default();
     if repository.defaults.stalls_after == shipped.stalls_after {
-        repository.defaults.stalls_after = overlay.defaults.stalls_after;
+        repository.defaults.stalls_after = operator.defaults.stalls_after.clone();
     }
     if repository.defaults.check == shipped.check {
-        repository.defaults.check = overlay.defaults.check;
+        repository.defaults.check = operator.defaults.check;
     }
     if repository.defaults.grant == shipped.grant {
-        repository.defaults.grant = overlay.defaults.grant;
+        repository.defaults.grant = operator.defaults.grant;
     }
     if repository.defaults.deny == shipped.deny {
-        repository.defaults.deny = overlay.defaults.deny;
+        repository.defaults.deny = operator.defaults.deny;
     }
     if repository.defaults.r#loop.concurrent.is_none() {
-        repository.defaults.r#loop.concurrent = overlay.defaults.r#loop.concurrent;
+        repository.defaults.r#loop.concurrent = operator.defaults.r#loop.concurrent;
     }
     if repository.defaults.r#loop.spend_usd.is_none() {
-        repository.defaults.r#loop.spend_usd = overlay.defaults.r#loop.spend_usd;
+        repository.defaults.r#loop.spend_usd = operator.defaults.r#loop.spend_usd;
     }
     if repository.defaults.r#loop.tokens.is_none() {
-        repository.defaults.r#loop.tokens = overlay.defaults.r#loop.tokens;
+        repository.defaults.r#loop.tokens = operator.defaults.r#loop.tokens;
     }
 
-    merge_fallback(&mut repository.inputs, overlay.inputs);
-    merge_fallback(&mut repository.actors, overlay.actors);
-    merge_fallback(&mut repository.checks, overlay.checks);
-    merge_fallback(&mut repository.operations, overlay.operations);
-    merge_fallback(&mut repository.loops, overlay.loops);
-    let mut overlay_denies = BTreeSet::new();
-    for (id, declaration) in overlay.denies {
-        if let std::collections::btree_map::Entry::Vacant(entry) = repository.denies.entry(id) {
-            overlay_denies.insert(entry.key().clone());
-            entry.insert(declaration);
-        }
+    merge_fallback(&mut repository.inputs, operator.inputs.clone());
+    merge_fallback(&mut repository.actors, operator.actors.clone());
+    merge_fallback(&mut repository.checks, operator.checks.clone());
+    merge_fallback(&mut repository.grants, operator.grants.clone());
+    merge_fallback(&mut repository.denies, operator.denies.clone());
+    repository.operations.clone_from(&operator.operations);
+    repository.loops.clone_from(&operator.loops);
+    repository
+}
+
+fn validate_scoped_manifest(
+    manifest: &PolicyManifest,
+    fallback: Option<&PolicyManifest>,
+) -> Result<(), PolicyLoadError> {
+    let mut validation = manifest.clone();
+    if let Some(fallback) = fallback {
+        merge_fallback(&mut validation.inputs, fallback.inputs.clone());
+        merge_fallback(&mut validation.actors, fallback.actors.clone());
+        merge_fallback(&mut validation.checks, fallback.checks.clone());
+        merge_fallback(&mut validation.operations, fallback.operations.clone());
+        merge_fallback(&mut validation.grants, fallback.grants.clone());
+        merge_fallback(&mut validation.denies, fallback.denies.clone());
     }
-    overlay_denies
+    validate_manifest(&validation)
+}
+
+fn report_repository_actor_lints(repository: &LoadedManifest) {
+    for actor in repository.manifest.actors.keys() {
+        let source = repository
+            .origins
+            .actors
+            .get(actor)
+            .unwrap_or(&repository.origins.root);
+        eprintln!(
+            "lint: repository actor `{actor}` declared in `{}` is non-portable across operator rosters",
+            source.display()
+        );
+    }
 }
 
 fn merge_fallback<T>(target: &mut BTreeMap<String, T>, fallback: BTreeMap<String, T>) {
@@ -269,19 +460,38 @@ pub(crate) struct ExplainOptions<'a> {
 }
 
 pub(crate) fn run_explain(options: &ExplainOptions<'_>) -> Result<String, PolicyLoadError> {
-    let manifest_path = options
-        .manifest
-        .map(Path::to_path_buf)
-        .or_else(|| default_manifest_path(options.paths, options.working_directory))
-        .ok_or_else(|| {
+    let discovered = options.manifest.is_none();
+    let manifest_path = if let Some(manifest) = options.manifest {
+        manifest.to_path_buf()
+    } else {
+        default_manifest_path(options.paths, options.working_directory)?.ok_or_else(|| {
             PolicyLoadError::UngovernedRepository(repository_name(options.working_directory))
-        })?;
-    let bundle = load_bundle(options.paths, &manifest_path)?;
+        })?
+    };
     let target = ExplainTarget::parse(options.target)?;
     let pull_request = if let Some(fixture) = options.fixture {
         fixture_pull_request(fixture, &target)?
     } else {
         acquire_pull_request(&target, options.working_directory)?
+    };
+    let bundle = if discovered {
+        pull_request
+            .get("baseRefOid")
+            .and_then(JsonValue::as_str)
+            .filter(|sha| !sha.is_empty())
+            .map_or_else(
+                || load_bundle(options.paths, &manifest_path),
+                |base_sha| {
+                    load_bundle_at_base(
+                        options.paths,
+                        &manifest_path,
+                        options.working_directory,
+                        base_sha,
+                    )
+                },
+            )?
+    } else {
+        load_bundle(options.paths, &manifest_path)?
     };
     let explanation = bundle.explain_pull_request(
         &target.repository,
@@ -366,7 +576,7 @@ fn acquire_pull_request(
             "--repo",
             &target.repository,
             "--json",
-            "number,title,labels,files,statusCheckRollup,state",
+            "number,title,labels,files,statusCheckRollup,state,baseRefOid",
         ])
         .output()
         .map_err(PolicyLoadError::GitHub)?;
@@ -407,7 +617,15 @@ fn render_explanation(
     first_held: Option<DateTime<Utc>>,
     observed_at: DateTime<Utc>,
 ) -> String {
-    let mut output = format!("{}\n\nSUBJECT RULES\n", target.full);
+    let mut output = format!("{}\n\nSCOPES CONSULTED\n", target.full);
+    for scope in &explanation.consulted_scopes {
+        output.push_str(&format!(
+            "  {:10} {}\n",
+            scope.layer.name(),
+            scope.path.display()
+        ));
+    }
+    output.push_str("\nSUBJECT RULES\n");
     for rule in &explanation.rules {
         let selectors = rule
             .selectors
@@ -421,7 +639,7 @@ fn render_explanation(
             selectors.join(", ")
         };
         output.push_str(&format!(
-            "  {:10} {:5} {:24} {:38} {}{}\n",
+            "  {:10} {:5} {:24} {:38} {}{}  source: {}\n",
             rule.layer.name(),
             rule.kind,
             rule.id,
@@ -431,7 +649,8 @@ fn render_explanation(
                 String::new()
             } else {
                 format!("  unmatched: {}", unmatched_name(rule.unmatched))
-            }
+            },
+            rule.source.display()
         ));
     }
     output.push_str(&format!(
@@ -440,7 +659,7 @@ fn render_explanation(
     ));
     for rule in &explanation.rules {
         output.push_str(&format!(
-            "  {:10} {:5} {:24} {:38} {}\n",
+            "  {:10} {:5} {:24} {:38} {}  source: {}\n",
             rule.layer.name(),
             rule.kind,
             rule.id,
@@ -448,8 +667,21 @@ fn render_explanation(
                 "actor={} operation={}",
                 explanation.actor, explanation.operation
             ),
-            match_word(rule.actor_matched)
+            match_word(rule.actor_matched),
+            rule.source.display()
         ));
+    }
+    if !explanation.inert_declarations.is_empty() {
+        output.push_str("\nEXECUTABLE DECLARATIONS\n");
+        for declaration in &explanation.inert_declarations {
+            output.push_str(&format!(
+                "  {:10} {:9} {:24} DECLARED BUT NOT ADOPTED  source: {}\n",
+                declaration.layer.name(),
+                declaration.kind,
+                declaration.id,
+                declaration.source.display()
+            ));
+        }
     }
     output.push_str("\nAGGREGATE\n");
     output.push_str(&format!(
@@ -601,12 +833,17 @@ fn normalize_manifest_path(path: &Path) -> Cow<'_, Path> {
 }
 
 fn load_unverified(path: &Path) -> Result<PolicyManifest, PolicyLoadError> {
-    let manifest = load_composed(path)?;
-    validate_manifest(&manifest)?;
-    Ok(manifest)
+    let loaded = load_composed(path)?;
+    validate_manifest(&loaded.manifest)?;
+    Ok(loaded.manifest)
 }
 
-fn load_composed(path: &Path) -> Result<PolicyManifest, PolicyLoadError> {
+struct LoadedManifest {
+    manifest: PolicyManifest,
+    origins: PolicyOrigins,
+}
+
+fn load_composed(path: &Path) -> Result<LoadedManifest, PolicyLoadError> {
     let source = read(path)?;
     let mut manifest =
         PolicyManifest::parse_yaml(&source).map_err(|source| PolicyLoadError::Yaml {
@@ -614,7 +851,7 @@ fn load_composed(path: &Path) -> Result<PolicyManifest, PolicyLoadError> {
             source,
         })?;
     let includes = std::mem::take(&mut manifest.includes);
-    let mut origins = Origins::from_root(&manifest, path);
+    let mut origins = PolicyOrigins::from_root(&manifest, path);
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
 
     for pattern in includes {
@@ -629,7 +866,7 @@ fn load_composed(path: &Path) -> Result<PolicyManifest, PolicyLoadError> {
             merge_include(&mut manifest, &mut origins, &include)?;
         }
     }
-    Ok(manifest)
+    Ok(LoadedManifest { manifest, origins })
 }
 
 fn validate_manifest(manifest: &PolicyManifest) -> Result<(), PolicyLoadError> {
@@ -705,7 +942,7 @@ fn read(path: &Path) -> Result<String, PolicyLoadError> {
 
 fn merge_include(
     manifest: &mut PolicyManifest,
-    origins: &mut Origins,
+    origins: &mut PolicyOrigins,
     path: &Path,
 ) -> Result<(), PolicyLoadError> {
     let source = read(path)?;
@@ -784,7 +1021,7 @@ fn merge_include(
 
 fn merge_leaf(
     manifest: &mut PolicyManifest,
-    origins: &mut Origins,
+    origins: &mut PolicyOrigins,
     path: &Path,
     mut mapping: Mapping,
     marker: &str,
@@ -912,34 +1149,6 @@ struct IncludeFragment {
     loops: BTreeMap<String, LoopDecl>,
 }
 
-#[derive(Debug, Default)]
-struct Origins {
-    actors: BTreeMap<String, PathBuf>,
-    checks: BTreeMap<String, PathBuf>,
-    operations: BTreeMap<String, PathBuf>,
-    grants: BTreeMap<String, PathBuf>,
-    denies: BTreeMap<String, PathBuf>,
-    loops: BTreeMap<String, PathBuf>,
-}
-
-impl Origins {
-    fn from_root(manifest: &PolicyManifest, path: &Path) -> Self {
-        let origins = |keys: Vec<String>| {
-            keys.into_iter()
-                .map(|key| (key, path.to_path_buf()))
-                .collect()
-        };
-        Self {
-            actors: origins(manifest.actors.keys().cloned().collect()),
-            checks: origins(manifest.checks.keys().cloned().collect()),
-            operations: origins(manifest.operations.keys().cloned().collect()),
-            grants: origins(manifest.grants.keys().cloned().collect()),
-            denies: origins(manifest.denies.keys().cloned().collect()),
-            loops: origins(manifest.loops.keys().cloned().collect()),
-        }
-    }
-}
-
 fn expand_include(parent: &Path, pattern: &str) -> Result<Vec<PathBuf>, PolicyLoadError> {
     let pattern_path = Path::new(pattern);
     if pattern_path.is_absolute()
@@ -1035,20 +1244,27 @@ fn include_glob(value: &str, pattern: &str) -> bool {
 #[derive(Debug, Error)]
 pub(crate) enum PolicyLoadError {
     #[error(
-        "repository `{}` is ungoverned: no `ostrom.yaml` was found at or below its `.git` boundary",
+        "repository `{}` is ungoverned: no `ostrom.yaml` or `ostrom.yml` was found at or below its `.git` boundary",
         .0.display()
     )]
     UngovernedRepository(PathBuf),
     #[error(
-        "private overlay `{}` may deny authority but may not grant it; offending rule `grants.{rule}`",
-        path.display()
+        "both policy manifest paths exist for the same document: `{}` and `{}`",
+        yaml.display(),
+        yml.display()
     )]
-    OverlayGrant { path: PathBuf, rule: String },
+    AmbiguousManifest { yaml: PathBuf, yml: PathBuf },
     #[error(
-        "private overlay `{}` has manifest_version {version}; expected {expected}",
+        "no adopting operator manifest found at `{}` or `{}`",
+        yaml.display(),
+        yml.display()
+    )]
+    AdoptingManifestNotFound { yaml: PathBuf, yml: PathBuf },
+    #[error(
+        "operator manifest `{}` has manifest_version {version}; expected {expected}",
         path.display()
     )]
-    OverlayVersion {
+    OperatorVersion {
         path: PathBuf,
         version: u32,
         expected: u32,
@@ -1061,6 +1277,12 @@ pub(crate) enum PolicyLoadError {
     GitHub(io::Error),
     #[error("gh could not read the pull request: {0}")]
     GitHubResponse(String),
+    #[error("could not create a policy snapshot: {0}")]
+    Snapshot(io::Error),
+    #[error("could not run the policy snapshot command: {0}")]
+    GitSnapshot(io::Error),
+    #[error("could not read policy from the pull request base: {0}")]
+    GitSnapshotResponse(String),
     #[error("could not parse pull-request fixture `{}`: {source}", path.display())]
     Fixture {
         path: PathBuf,
@@ -1140,8 +1362,16 @@ mod tests {
                 config: root.path().join("config"),
                 state: root.path().join("state"),
             };
-            assert!(default_manifest_path(&paths, root.path()).is_some());
-            assert!(default_manifest_path(&paths, root.path()).is_some());
+            assert!(
+                default_manifest_path(&paths, root.path())
+                    .expect("manifest discovery")
+                    .is_some()
+            );
+            assert!(
+                default_manifest_path(&paths, root.path())
+                    .expect("manifest discovery")
+                    .is_some()
+            );
             return;
         }
 

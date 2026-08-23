@@ -3,12 +3,15 @@ use ostrom_core::{
     StallDuration, UnmatchedPolicy,
 };
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PolicyLayer {
     Repository,
-    Overlay,
+    Operator,
     Default,
 }
 
@@ -17,40 +20,209 @@ impl PolicyLayer {
     pub const fn name(self) -> &'static str {
         match self {
             Self::Repository => "repository",
-            Self::Overlay => "overlay",
+            Self::Operator => "operator",
             Self::Default => "default",
         }
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PolicyOrigins {
+    pub root: PathBuf,
+    pub actors: BTreeMap<String, PathBuf>,
+    pub checks: BTreeMap<String, PathBuf>,
+    pub operations: BTreeMap<String, PathBuf>,
+    pub grants: BTreeMap<String, PathBuf>,
+    pub denies: BTreeMap<String, PathBuf>,
+    pub loops: BTreeMap<String, PathBuf>,
+}
+
+impl PolicyOrigins {
+    #[must_use]
+    pub fn from_root(manifest: &PolicyManifest, path: &Path) -> Self {
+        let origins = |keys: Vec<String>| {
+            keys.into_iter()
+                .map(|key| (key, path.to_path_buf()))
+                .collect()
+        };
+        Self {
+            root: path.to_path_buf(),
+            actors: origins(manifest.actors.keys().cloned().collect()),
+            checks: origins(manifest.checks.keys().cloned().collect()),
+            operations: origins(manifest.operations.keys().cloned().collect()),
+            grants: origins(manifest.grants.keys().cloned().collect()),
+            denies: origins(manifest.denies.keys().cloned().collect()),
+            loops: origins(manifest.loops.keys().cloned().collect()),
+        }
+    }
+
+    pub fn rebase(&mut self, from: &Path, to: &Path) {
+        let rebase = |path: &PathBuf| {
+            path.strip_prefix(from)
+                .map_or_else(|_| path.clone(), |relative| to.join(relative))
+        };
+        self.root = rebase(&self.root);
+        for origins in [
+            &mut self.actors,
+            &mut self.checks,
+            &mut self.operations,
+            &mut self.grants,
+            &mut self.denies,
+            &mut self.loops,
+        ] {
+            for path in origins.values_mut() {
+                *path = rebase(path);
+            }
+        }
+    }
+
+    fn rule(&self, kind: &str, id: &str) -> PathBuf {
+        let origins = if kind == "grant" {
+            &self.grants
+        } else {
+            &self.denies
+        };
+        origins
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| self.root.clone())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PolicyDocument {
+    layer: PolicyLayer,
+    manifest: PolicyManifest,
+    origins: PolicyOrigins,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsultedScope {
+    pub layer: PolicyLayer,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InertDeclaration {
+    pub kind: &'static str,
+    pub id: String,
+    pub layer: PolicyLayer,
+    pub source: PathBuf,
+}
+
 #[derive(Debug, Clone)]
 pub struct PolicyBundle {
     pub manifest: PolicyManifest,
-    overlay_denies: BTreeSet<String>,
+    documents: Vec<PolicyDocument>,
+    inert_declarations: Vec<InertDeclaration>,
 }
 
 impl PolicyBundle {
     #[must_use]
     pub fn repository(manifest: PolicyManifest) -> Self {
+        let origins = PolicyOrigins::from_root(&manifest, Path::new("<repository>"));
         Self {
-            manifest,
-            overlay_denies: BTreeSet::new(),
+            manifest: manifest.clone(),
+            documents: vec![PolicyDocument {
+                layer: PolicyLayer::Repository,
+                manifest,
+                origins,
+            }],
+            inert_declarations: Vec::new(),
         }
     }
 
     #[must_use]
-    pub fn layered(manifest: PolicyManifest, overlay_denies: BTreeSet<String>) -> Self {
+    pub fn scoped(
+        manifest: PolicyManifest,
+        repository: PolicyManifest,
+        repository_origins: PolicyOrigins,
+        operator: Option<(PolicyManifest, PolicyOrigins)>,
+    ) -> Self {
+        let mut inert_declarations = repository
+            .operations
+            .keys()
+            .map(|id| InertDeclaration {
+                kind: "operation",
+                id: id.clone(),
+                layer: PolicyLayer::Repository,
+                source: repository_origins
+                    .operations
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(|| repository_origins.root.clone()),
+            })
+            .chain(repository.loops.keys().map(|id| {
+                InertDeclaration {
+                    kind: "loop",
+                    id: id.clone(),
+                    layer: PolicyLayer::Repository,
+                    source: repository_origins
+                        .loops
+                        .get(id)
+                        .cloned()
+                        .unwrap_or_else(|| repository_origins.root.clone()),
+                }
+            }))
+            .collect::<Vec<_>>();
+        inert_declarations.sort_by_key(|declaration| {
+            (
+                declaration.kind,
+                declaration.id.clone(),
+                declaration.source.clone(),
+            )
+        });
+
+        let mut documents = vec![PolicyDocument {
+            layer: PolicyLayer::Repository,
+            manifest: repository,
+            origins: repository_origins,
+        }];
+        if let Some((operator, origins)) = operator {
+            documents.push(PolicyDocument {
+                layer: PolicyLayer::Operator,
+                manifest: operator,
+                origins,
+            });
+        }
         Self {
             manifest,
-            overlay_denies,
+            documents,
+            inert_declarations,
         }
     }
 
-    fn rule_layer(&self, kind: &str, id: &str) -> PolicyLayer {
-        if kind == "deny" && self.overlay_denies.contains(id) {
-            PolicyLayer::Overlay
-        } else {
-            PolicyLayer::Repository
+    #[must_use]
+    pub fn operator(manifest: PolicyManifest, origins: PolicyOrigins) -> Self {
+        Self {
+            manifest: manifest.clone(),
+            documents: vec![PolicyDocument {
+                layer: PolicyLayer::Operator,
+                manifest,
+                origins,
+            }],
+            inert_declarations: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn decide(
+        &self,
+        actor: &str,
+        operation: &str,
+        candidate: &PolicyCandidate,
+    ) -> ostrom_core::PolicyDecision {
+        let mut matching_grants = Vec::new();
+        let mut matching_denies = Vec::new();
+        for document in &self.documents {
+            let decision = document.manifest.decide(actor, operation, candidate);
+            matching_grants.extend(decision.matching_grants);
+            matching_denies.extend(decision.matching_denies);
+        }
+        ostrom_core::PolicyDecision {
+            granted: !matching_grants.is_empty() && matching_denies.is_empty(),
+            matching_grants,
+            matching_denies,
         }
     }
 }
@@ -75,6 +247,7 @@ pub struct RuleExplanation {
     pub kind: &'static str,
     pub id: String,
     pub layer: PolicyLayer,
+    pub source: PathBuf,
     pub subject_matched: bool,
     pub actor_matched: bool,
     pub matched: bool,
@@ -89,6 +262,8 @@ pub struct PolicyExplanation {
     pub actor: String,
     pub operation: String,
     pub rules: Vec<RuleExplanation>,
+    pub consulted_scopes: Vec<ConsultedScope>,
+    pub inert_declarations: Vec<InertDeclaration>,
     pub matching_grants: Vec<String>,
     pub effective_grants: Vec<String>,
     pub matching_denies: Vec<String>,
@@ -116,120 +291,144 @@ impl PolicyBundle {
             .map(Vec::as_slice)
             .unwrap_or(&[]);
         let mut rules = Vec::new();
-        for (kind, declarations) in [
-            ("grant", &self.manifest.grants),
-            ("deny", &self.manifest.denies),
-        ] {
-            for (id, declaration) in declarations {
-                let unmatched = declaration.unmatched.unwrap_or_else(|| {
-                    if kind == "grant" {
-                        self.manifest.defaults.grant.unmatched
-                    } else {
-                        self.manifest.defaults.deny.unmatched
-                    }
-                });
-                rules.push(explain_rule(
-                    kind,
-                    id,
-                    self.rule_layer(kind, id),
-                    declaration,
-                    &candidate,
-                    actor,
-                    operation,
-                    &self.manifest.checks,
-                    self.manifest.defaults.check.inconclusive_policy,
-                    checks,
-                    unmatched,
-                ));
+        for document in &self.documents {
+            for (kind, declarations) in [
+                ("grant", &document.manifest.grants),
+                ("deny", &document.manifest.denies),
+            ] {
+                for (id, declaration) in declarations {
+                    let unmatched = declaration.unmatched.unwrap_or_else(|| {
+                        if kind == "grant" {
+                            document.manifest.defaults.grant.unmatched
+                        } else {
+                            document.manifest.defaults.deny.unmatched
+                        }
+                    });
+                    rules.push(explain_rule(
+                        kind,
+                        id,
+                        document.layer,
+                        document.origins.rule(kind, id),
+                        declaration,
+                        &candidate,
+                        actor,
+                        operation,
+                        &self.manifest.checks,
+                        self.manifest.defaults.check.inconclusive_policy,
+                        checks,
+                        unmatched,
+                    ));
+                }
             }
         }
 
-        rules.sort_by_key(|rule| (rule.layer, rule.kind, rule.id.clone()));
+        rules.sort_by_key(|rule| (rule.layer, rule.kind, rule.id.clone(), rule.source.clone()));
 
         let matching_grants = rule_ids(&rules, "grant", |rule| rule.matched);
         let matching_denies = rule_ids(&rules, "deny", |rule| rule.matched);
-        let deciding_layer = [PolicyLayer::Repository, PolicyLayer::Overlay]
-            .into_iter()
-            .find(|layer| {
-                rules
-                    .iter()
-                    .any(|rule| rule.layer == *layer && rule.matched)
-            })
-            .unwrap_or(PolicyLayer::Default);
         let effective_grants = rule_ids(&rules, "grant", |rule| {
-            rule.layer == deciding_layer
-                && rule.matched
+            rule.matched
                 && rule
                     .requirement
                     .as_ref()
                     .is_none_or(|requirement| requirement.allows)
         });
-        let deciding_denies = rule_ids(&rules, "deny", |rule| {
-            rule.layer == deciding_layer && rule.matched
-        });
-        let granted = !effective_grants.is_empty() && deciding_denies.is_empty();
-        let floor = deciding_layer == PolicyLayer::Default;
+        let granted = !effective_grants.is_empty() && matching_denies.is_empty();
+        let floor = matching_grants.is_empty() && matching_denies.is_empty();
 
-        let hold_rule = if granted {
-            None
+        let deciding_rule = if granted {
+            rules.iter().find(|rule| {
+                rule.kind == "grant"
+                    && rule.matched
+                    && rule
+                        .requirement
+                        .as_ref()
+                        .is_none_or(|requirement| requirement.allows)
+            })
         } else {
-            deciding_denies.first().cloned().or_else(|| {
-                rules
-                    .iter()
-                    .find(|rule| {
-                        rule.layer == deciding_layer
-                            && rule.kind == "grant"
+            rules
+                .iter()
+                .find(|rule| rule.kind == "deny" && rule.matched)
+                .or_else(|| {
+                    rules.iter().find(|rule| {
+                        rule.kind == "grant"
                             && rule.matched
                             && rule
                                 .requirement
                                 .as_ref()
                                 .is_some_and(|requirement| !requirement.allows)
                     })
-                    .map(|rule| rule.id.clone())
-            })
+                })
         };
-        let hold_declaration = hold_rule.as_ref().and_then(|id| {
-            self.manifest
-                .denies
-                .get(id)
-                .or_else(|| self.manifest.grants.get(id))
-        });
-        let stalls_after = hold_declaration
+        let hold_rule = (!granted)
+            .then(|| deciding_rule.map(|rule| rule.id.clone()))
+            .flatten();
+        let stalls_after = deciding_rule
             .and_then(|rule| rule.stalls_after.clone())
             .unwrap_or_else(|| self.manifest.defaults.stalls_after.clone());
-        let stalls_source = hold_rule
-            .as_ref()
-            .and_then(|id| {
-                hold_declaration
-                    .and_then(|rule| rule.stalls_after.as_ref())
-                    .map(|_| {
-                        if self.manifest.denies.contains_key(id) {
-                            format!("denies.{id}.stalls_after")
-                        } else {
-                            format!("grants.{id}.stalls_after")
-                        }
-                    })
+        let stalls_source = deciding_rule
+            .filter(|rule| rule.stalls_after.is_some())
+            .map_or_else(
+                || "defaults.stalls_after".to_owned(),
+                |rule| {
+                    let section = if rule.kind == "deny" {
+                        "denies"
+                    } else {
+                        "grants"
+                    };
+                    format!(
+                        "{section}.{}.stalls_after in {}",
+                        rule.id,
+                        rule.source.display()
+                    )
+                },
+            );
+        let consulted_scopes = self
+            .documents
+            .iter()
+            .map(|document| ConsultedScope {
+                layer: document.layer,
+                path: document.origins.root.clone(),
             })
-            .unwrap_or_else(|| "defaults.stalls_after".to_owned());
-        let decision_source = if granted {
-            effective_grants.first().map_or_else(
-                || "default floor".to_owned(),
-                |id| format!("{} grants.{id}", deciding_layer.name()),
-            )
-        } else if let Some(id) = &hold_rule {
-            if self.manifest.denies.contains_key(id) {
-                format!("{} denies.{id}", deciding_layer.name())
-            } else {
-                format!("{} grants.{id}.requires", deciding_layer.name())
-            }
-        } else {
-            "default floor (no grant matched)".to_owned()
-        };
+            .collect::<Vec<_>>();
+        let decision_source = deciding_rule.map_or_else(
+            || {
+                let consulted = consulted_scopes
+                    .iter()
+                    .map(|scope| format!("{} {}", scope.layer.name(), scope.path.display()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("default deny (no grant matched; consulted {consulted})")
+            },
+            |rule| {
+                let section = if rule.kind == "deny" {
+                    "denies"
+                } else {
+                    "grants"
+                };
+                let requirement = if rule.kind == "grant"
+                    && rule.requirement.as_ref().is_some_and(|value| !value.allows)
+                {
+                    ".requires"
+                } else {
+                    ""
+                };
+                format!(
+                    "{} {section}.{}{} in {}",
+                    rule.layer.name(),
+                    rule.id,
+                    requirement,
+                    rule.source.display()
+                )
+            },
+        );
 
         PolicyExplanation {
             actor: actor.to_owned(),
             operation: operation.to_owned(),
             rules,
+            consulted_scopes,
+            inert_declarations: self.inert_declarations.clone(),
             matching_grants,
             effective_grants,
             matching_denies,
@@ -260,6 +459,7 @@ fn explain_rule(
     kind: &'static str,
     id: &str,
     layer: PolicyLayer,
+    source: PathBuf,
     declaration: &RuleDecl,
     candidate: &PolicyCandidate,
     actor: &str,
@@ -319,6 +519,7 @@ fn explain_rule(
         kind,
         id: id.to_owned(),
         layer,
+        source,
         subject_matched,
         actor_matched,
         matched,
@@ -531,7 +732,7 @@ denies:
         assert!(explanation.granted);
         assert_eq!(
             explanation.decision_source,
-            "repository grants.R-rust-green"
+            "repository grants.R-rust-green in <repository>"
         );
         let grant = explanation
             .rules
@@ -569,7 +770,7 @@ denies:
         assert_eq!(explanation.stalls_after.to_string(), "12d");
         assert_eq!(
             explanation.stalls_source,
-            "denies.R-plugin-manifest.stalls_after"
+            "denies.R-plugin-manifest.stalls_after in <repository>"
         );
     }
 
@@ -590,7 +791,7 @@ denies:
         assert!(explanation.floor);
         assert_eq!(
             explanation.decision_source,
-            "default floor (no grant matched)"
+            "default deny (no grant matched; consulted repository <repository>)"
         );
         assert_eq!(explanation.stalls_after.to_string(), "7d");
     }

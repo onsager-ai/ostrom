@@ -370,13 +370,18 @@ so closing the gatekeeper session stops the polling.
 `ostrom explain owner/repository#123` evaluates the pull request against every
 authored grant and deny, separates subject matching from the actor/operation
 projection, names any `requires:` check and its result, and prints the aggregate
-verdict with its manifest ladder source and layer. It discovers `ostrom.yaml`
-from the working directory up to the repository's `.git` boundary;
+verdict with the deciding rule, scope, and source file. It discovers
+`ostrom.yaml` or `ostrom.yml` from the working directory up to the repository's
+`.git` boundary;
 `--manifest` selects an explicit file. The deprecated `.ostrom/manifest.yml`
 and user-config `manifest.yml` locations remain available during migration, but
 a repository without either repository manifest is reported as ungoverned and
-never inherits the operator manifest. A signed private `config.yaml` in the
-Ostrom config root may add vetoes, but any `grants:` entry is refused.
+never falls through to the operator manifest. The separately signed operator
+manifest is `<Ostrom config>/ostrom.yaml` (or `.yml`). Denies from either scope
+win absolutely, a grant from either scope suffices when no deny matches, and an
+unmatched request is denied. Repository `loops:` and `operations:` declarations
+are reported but inert; only declarations in the operator manifest are adopted.
+If both filename extensions exist for one document, loading refuses both.
 
 The policy `defaults` map accepts `stalls_after: 7d`, which is also the default.
 An individual grant or deny may override it. Sweep records the first time each

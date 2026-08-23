@@ -1,9 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    ffi::OsString,
-    fs,
-    path::{Path, PathBuf},
-};
+use std::{collections::BTreeMap, ffi::OsString, fs, path::PathBuf};
 
 use ostrom_core::{
     OperationAction, OperationDecl, OperationParamType, PolicyCandidate, PolicyManifest,
@@ -23,6 +18,7 @@ pub(crate) struct ResolvedOperationTarget {
     pub(crate) raw: String,
     pub(crate) repository: String,
     pub(crate) candidate: PolicyCandidate,
+    pub(crate) base_sha: Option<String>,
 }
 
 pub(crate) trait OperationRuntime {
@@ -38,6 +34,16 @@ pub(crate) trait OperationRuntime {
         check: &str,
         target: &ResolvedOperationTarget,
     ) -> Result<(), OperationDispatchError>;
+
+    fn authorize(
+        &mut self,
+        manifest: &PolicyManifest,
+        actor: &str,
+        operation: &str,
+        target: &ResolvedOperationTarget,
+    ) -> Result<bool, OperationDispatchError> {
+        Ok(manifest.decide(actor, operation, &target.candidate).granted)
+    }
 
     fn execute(
         &mut self,
@@ -165,8 +171,7 @@ pub(crate) fn dispatch_operation(
     // A later step receives this immutable value and has no target parameter
     // through which it could widen the grant.
     let target = runtime.resolve_target(&invocation.target, actor, &invocation.name)?;
-    let decision = manifest.decide(actor, &invocation.name, &target.candidate);
-    if !decision.granted {
+    if !runtime.authorize(manifest, actor, &invocation.name, &target)? {
         return Err(OperationDispatchError::NotAuthorized {
             actor: actor.to_owned(),
             operation: invocation.name.clone(),
@@ -265,14 +270,8 @@ pub(crate) fn resolve_repository_target(
             verb: Some(operation.to_owned()),
             ..PolicyCandidate::default()
         },
+        base_sha: None,
     })
-}
-
-pub(crate) fn manifest_path(config: &Path) -> PathBuf {
-    ostrom_store::environment::OSTROM_POLICY_MANIFEST
-        .value_os()
-        .filter(|path| !path.is_empty())
-        .map_or_else(|| config.join("policy.yaml"), PathBuf::from)
 }
 
 #[derive(Debug, Error)]

@@ -2,8 +2,10 @@
 
 Operations are the only policy-authored capability an agent can invoke. The
 active manifest is `${OSTROM_POLICY_MANIFEST}` when set and otherwise
-`<Ostrom config>/policy.yaml`. The harness sets `OSTROM_ACTOR`; the positional
-target is resolved before the manifest grant/deny decision. Every load is
+`<Ostrom config>/ostrom.yaml` (with `ostrom.yml` accepted on read). The harness
+sets `OSTROM_ACTOR`; the positional target is resolved before the scope-blind
+grant/deny decision. Operations and loops execute only from this adopting
+operator manifest; same-named repository declarations are inert. Every load is
 signature-gated as described in [Policy manifest signing](policy-signing.md).
 
 ```yaml

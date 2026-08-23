@@ -158,24 +158,6 @@ impl PolicyManifest {
                 operation: declaration.operation.clone(),
             }
         })?;
-        let possibly_granted = self.grants.values().any(|grant| {
-            (grant.actors.is_empty()
-                || grant.actors.iter().any(|actor| actor == &declaration.actor))
-                && (grant.operations.is_empty()
-                    || grant
-                        .operations
-                        .iter()
-                        .any(|operation| operation == &declaration.operation))
-        });
-        if !possibly_granted {
-            return Err(ManifestValidationError::InvalidLoop {
-                name: name.to_owned(),
-                message: format!(
-                    "actor `{}` has no grant that can invoke operation `{}`",
-                    declaration.actor, declaration.operation
-                ),
-            });
-        }
         for parameter in declaration.parameters.keys() {
             if !operation.params.contains_key(parameter) {
                 return Err(ManifestValidationError::InvalidLoop {
