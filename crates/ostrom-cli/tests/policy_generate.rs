@@ -109,7 +109,7 @@ fn generate_writes_a_loadable_portable_repository_manifest_to_path_or_stdout() {
       "title": "feat: placeholder",
       "labels": [{"name": "delegated"}],
       "files": [{"path": "src/lib.rs"}],
-      "statusCheckRollup": [{"name": "placeholder-ci", "conclusion": "SUCCESS"}]
+      "checks": [{"name": "placeholder-ci", "conclusion": "SUCCESS"}]
     }]
   }]
 }"#,

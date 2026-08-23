@@ -238,6 +238,7 @@ projects:
                 "headRefName": "green-conflicting-head",
                 "baseRefName": "main",
                 "headRefOid": green_conflicting_head,
+                "baseRefOid": base_head,
                 "isCrossRepository": false
             },
             {
@@ -248,6 +249,7 @@ projects:
                 "headRefName": "human-head",
                 "baseRefName": "main",
                 "headRefOid": "2222222222222222222222222222222222222222",
+                "baseRefOid": base_head,
                 "isCrossRepository": false
             },
             {
@@ -258,6 +260,7 @@ projects:
                 "headRefName": "red-red-head",
                 "baseRefName": "red-base",
                 "headRefOid": "3333333333333333333333333333333333333333",
+                "baseRefOid": red_base_head,
                 "isCrossRepository": false
             },
             {
@@ -268,6 +271,7 @@ projects:
                 "headRefName": "red-mergeable-head",
                 "baseRefName": "main",
                 "headRefOid": red_mergeable_head,
+                "baseRefOid": base_head,
                 "isCrossRepository": false
             },
             {
@@ -278,6 +282,7 @@ projects:
                 "headRefName": "green-current-head",
                 "baseRefName": "main",
                 "headRefOid": "5555555555555555555555555555555555555555",
+                "baseRefOid": base_head,
                 "isCrossRepository": false
             },
             {
@@ -288,6 +293,7 @@ projects:
                 "headRefName": "missing-role-head",
                 "baseRefName": "main",
                 "headRefOid": "6666666666666666666666666666666666666666",
+                "baseRefOid": base_head,
                 "isCrossRepository": false
             },
             {
@@ -298,6 +304,7 @@ projects:
                 "headRefName": "fork-head",
                 "baseRefName": "main",
                 "headRefOid": "7777777777777777777777777777777777777777",
+                "baseRefOid": base_head,
                 "isCrossRepository": true
             },
             {
@@ -308,6 +315,7 @@ projects:
                 "headRefName": "green-cap-head",
                 "baseRefName": "main",
                 "headRefOid": green_cap_head,
+                "baseRefOid": base_head,
                 "isCrossRepository": false
             },
             {
@@ -318,6 +326,7 @@ projects:
                 "headRefName": "skipped-cap-head",
                 "baseRefName": "main",
                 "headRefOid": skipped_cap_head,
+                "baseRefOid": base_head,
                 "isCrossRepository": false
             },
             {
@@ -327,7 +336,8 @@ projects:
                 "mergeable": "MERGEABLE",
                 "headRefName": "red-current-head",
                 "baseRefName": "main",
-                "headRefOid": base_head,
+                "headRefOid": "1010101010101010101010101010101010101010",
+                "baseRefOid": base_head,
                 "isCrossRepository": false
             }
         ]))
@@ -346,31 +356,18 @@ while [ "$1" != "--" ]; do shift; done
 shift
 if [ "$1 $2 $3" = "gh pr list" ]; then
   cat "$REPAIR_LISTING"
-elif [ "$1 $2 $3" = "gh pr view" ]; then
-  if [ "$4" = "3" ] || [ "$4" = "4" ] || [ "$4" = "10" ]; then
-    printf '%s\n' '{"statusCheckRollup":[{"name":"test","conclusion":"FAILURE","status":"COMPLETED"}]}'
-  else
-    printf '%s\n' '{"statusCheckRollup":[{"name":"test","conclusion":"SUCCESS","status":"COMPLETED"}]}'
-  fi
-elif [ "$1 $2 $3" = "gh api graphql" ]; then
-  qualified_name=
-  for argument in "$@"; do
-    case "$argument" in qualifiedName=*) qualified_name=${argument#qualifiedName=} ;; esac
-  done
-  if [ "$qualified_name" = "refs/heads/red-base" ]; then
-    oid=$REPAIR_RED_BASE
-    conclusion=FAILURE
-  else
-    oid=$REPAIR_GREEN_BASE
-    conclusion=SUCCESS
-  fi
-  printf '%s\n' "{\"data\":{\"repository\":{\"ref\":{\"target\":{\"oid\":\"$oid\",\"statusCheckRollup\":{\"contexts\":{\"nodes\":[{\"conclusion\":\"$conclusion\",\"status\":\"COMPLETED\"}],\"pageInfo\":{\"hasNextPage\":false}}}}}}}}"
 elif [ "$1 $2" = "gh api" ]; then
   case "$3" in
-    *"$REPAIR_GREEN_BASE...$REPAIR_GREEN_BASE"*) status=identical ;;
-    *) status=ahead ;;
+    *check-runs*)
+      case "$3" in
+        *3333333333333333333333333333333333333333*|*1010101010101010101010101010101010101010*|*"$REPAIR_RED_MERGEABLE"*|*"$REPAIR_RED_BASE"*) conclusion=failure ;;
+        *) conclusion=success ;;
+      esac
+      printf '%s\n' "{\"total_count\":1,\"check_runs\":[{\"name\":\"test\",\"conclusion\":\"$conclusion\",\"status\":\"completed\",\"app\":{\"slug\":\"github-actions\"}}]}" ;;
+    *\/status\?*) printf '%s\n' '{"total_count":0,"statuses":[]}' ;;
+    *1010101010101010101010101010101010101010...*) printf '%s\n' '{"status":"identical"}' ;;
+    *) printf '%s\n' '{"status":"ahead"}' ;;
   esac
-  printf '%s\n' "{\"status\":\"$status\"}"
 elif [ "$1 $2 $4" = "git -C fetch" ]; then
   exec git -C "$3" fetch --no-tags "$REPAIR_REMOTE" "$7" "$8"
 elif [ "$1 $2 $4" = "git -C push" ]; then
@@ -389,6 +386,7 @@ fi
         .env("REPAIR_CALLS", &calls)
         .env("REPAIR_REMOTE", &remote)
         .env("REPAIR_RED_BASE", &red_base_head)
+        .env("REPAIR_RED_MERGEABLE", &red_mergeable_head)
         .env("REPAIR_GREEN_BASE", &base_head)
         .current_dir(fixture.path())
         .output()
@@ -426,20 +424,12 @@ fi
     assert_eq!(parents[1], green_conflicting_head);
     assert_eq!(parents[2], base_head);
     let calls = fs::read_to_string(calls).unwrap();
-    assert!(calls.contains("gh pr view 1 "));
-    assert!(calls.contains("gh pr view 3 "));
-    assert!(calls.contains("gh pr view 4 "));
-    assert!(calls.contains("gh pr view 5 "));
-    assert!(calls.contains("gh pr view 8 "));
-    assert!(calls.contains("gh pr view 9 "));
-    assert!(calls.contains("gh pr view 10 "));
-    assert!(!calls.contains("gh pr view 2 "));
-    assert!(!calls.contains("gh pr view 6 "));
-    assert!(!calls.contains("gh pr view 7 "));
-    assert_eq!(calls.matches("gh api graphql").count(), 2);
-    assert_eq!(calls.matches(" gh api repos/").count(), 2);
+    assert!(!calls.contains("gh pr view"));
+    assert!(!calls.contains("gh api graphql"));
+    assert!(calls.contains("/check-runs?per_page=100&page=1"));
+    assert!(calls.contains("/status?per_page=100&page=1"));
     assert!(calls.contains(
-        "--permissions metadata:read,pull_requests:read,checks:read,statuses:read -- gh api graphql"
+        "--permissions metadata:read,checks:read,statuses:read -- gh api repos/placeholder-org/repair-repo/commits/"
     ));
     assert!(calls.contains(
         "--permissions metadata:read,contents:read -- gh api repos/placeholder-org/repair-repo/compare/"
@@ -624,6 +614,7 @@ projects:
             "headRefName": head_branch,
             "baseRefName": "main",
             "headRefOid": head_sha,
+            "baseRefOid": base_head,
             "isCrossRepository": false
         })
     };
@@ -652,12 +643,13 @@ while [ "$1" != "--" ]; do shift; done
 shift
 if [ "$1 $2 $3" = "gh pr list" ]; then
   cat "$REPAIR_LISTING"
-elif [ "$1 $2 $3" = "gh pr view" ]; then
-  case "$4" in
-    11|12) printf '%s\n' '{"statusCheckRollup":[]}' ;;
-    13) printf '%s\n' '{"statusCheckRollup":[{"name":"test","conclusion":null,"status":"IN_PROGRESS"}]}' ;;
-    14) printf '%s\n' '{"statusCheckRollup":[{"name":"test","conclusion":"FAILURE","status":"COMPLETED"}]}' ;;
-    15) printf '%s\n' '{"statusCheckRollup":[{"name":"test","conclusion":"SUCCESS","status":"COMPLETED"}]}' ;;
+elif [ "$1 $2" = "gh api" ]; then
+  case "$3" in
+    *\/status\?*) printf '%s\n' '{"total_count":0,"statuses":[]}' ;;
+    *"$REPAIR_BORN"*|*"$REPAIR_MERGE_REF"*) printf '%s\n' '{"total_count":0,"check_runs":[]}' ;;
+    *"$REPAIR_PENDING"*) printf '%s\n' '{"total_count":1,"check_runs":[{"name":"test","conclusion":null,"status":"in_progress","app":{"slug":"github-actions"}}]}' ;;
+    *"$REPAIR_FAILED"*) printf '%s\n' '{"total_count":1,"check_runs":[{"name":"test","conclusion":"failure","status":"completed","app":{"slug":"github-actions"}}]}' ;;
+    *"$REPAIR_GREEN"*) printf '%s\n' '{"total_count":1,"check_runs":[{"name":"test","conclusion":"success","status":"completed","app":{"slug":"github-actions"}}]}' ;;
     *) exit 95 ;;
   esac
 elif [ "$1 $2" = "git ls-remote" ]; then
@@ -682,6 +674,11 @@ fi
         .env("REPAIR_CALLS", &calls)
         .env("REPAIR_REMOTE", &remote)
         .env("REPAIR_BASE", &base_head)
+        .env("REPAIR_BORN", &born_head)
+        .env("REPAIR_MERGE_REF", &merge_ref_head)
+        .env("REPAIR_PENDING", &pending_head)
+        .env("REPAIR_FAILED", &failed_head)
+        .env("REPAIR_GREEN", &green_head)
         .current_dir(fixture.path())
         .output()
         .expect("repair pull requests across check states");

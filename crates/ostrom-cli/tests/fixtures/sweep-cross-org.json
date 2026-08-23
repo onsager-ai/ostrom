@@ -64,7 +64,7 @@
           "updatedAt": "2026-07-21T00:00:00Z",
           "isDraft": false,
           "reviewDecision": "",
-          "statusCheckRollup": [{"conclusion": "FAILURE", "state": "COMPLETED"}],
+          "checks": [{"conclusion": "FAILURE", "state": "COMPLETED"}],
           "closingIssuesReferences": [],
           "files": [{"path": "src/parser.rs"}],
           "state": "OPEN",

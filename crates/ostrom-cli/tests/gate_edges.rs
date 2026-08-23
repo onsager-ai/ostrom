@@ -38,26 +38,21 @@ projects:
             &bin.join("gh"),
             r#"
 mode=${OSTROM_TEST_GATE_MODE:-pass}
+check=success
+case "$mode" in
+  check-failure) check=failure ;;
+  check-running) check='' ;;
+  unknown-check) check=unrecognized ;;
+esac
 if [ "$1 $2" = "pr view" ]; then
   mergeable=MERGEABLE
   draft=false
   title='fix(core): safe placeholder change'
-  check=SUCCESS
   case "$mode" in
     unknown-mergeable) mergeable=UNKNOWN ;;
     draft) draft=true ;;
     bounce) title='feat(core): protected placeholder change' ;;
-    unknown-check) check=UNRECOGNIZED ;;
   esac
-  if printf '%s\n' "$*" | grep -q -- '--json statusCheckRollup'; then
-    if [ "$mode" = "rollup-403" ]; then
-      printf '%s\n' 'GraphQL: Resource not accessible by integration (repository.pullRequest.statusCheckRollup.nodes.0)' >&2
-      exit 1
-    fi
-    jq -cn --arg check "$check" \
-      '{statusCheckRollup:[{name:"verify-linux",status:"COMPLETED",conclusion:$check}]}'
-    exit 0
-  fi
   if [ "$mode" = "metadata-403" ]; then
     printf '%s\n' 'GraphQL: Resource not accessible by integration (repository.pullRequest)' >&2
     exit 1
@@ -68,6 +63,35 @@ if [ "$1 $2" = "pr view" ]; then
      closingIssuesReferences:[],mergeable:$mergeable,isDraft:$draft}
     | if env.OSTROM_TEST_GATE_MODE == "missing-mergeable" then del(.mergeable)
       elif env.OSTROM_TEST_GATE_MODE == "malformed-mergeable" then .mergeable=7 else . end'
+  exit 0
+fi
+if [ "$1" = "api" ] && [[ "$2" == repos/example-org/example-repo/commits/*/check-runs\?* ]]; then
+  if [ "$mode" = "check-runs-403" ]; then
+    printf '%s\n' 'HTTP 403: Resource not accessible by integration' >&2
+    exit 1
+  fi
+  if [ "$mode" = "no-check-runs" ] || [ "$mode" = "status-check" ]; then
+    printf '%s\n' '{"total_count":0,"check_runs":[]}'
+    exit 0
+  fi
+  if [ "$mode" = "check-running" ]; then
+    printf '%s\n' '{"total_count":1,"check_runs":[{"name":"verify-linux","status":"in_progress","conclusion":null,"app":{"slug":"github-actions"}}]}'
+    exit 0
+  fi
+  jq -cn --arg check "$check" \
+    '{total_count:1,check_runs:[{name:"verify-linux",status:"completed",conclusion:$check,app:{slug:"github-actions"}}]}'
+  exit 0
+fi
+if [ "$1" = "api" ] && [[ "$2" == repos/example-org/example-repo/commits/*/status\?* ]]; then
+  if [ "$mode" = "status-403" ]; then
+    printf '%s\n' 'HTTP 403: Resource not accessible by integration' >&2
+    exit 1
+  fi
+  if [ "$mode" = "status-check" ]; then
+    printf '%s\n' '{"total_count":1,"statuses":[{"context":"verify-linux","state":"success"}]}'
+    exit 0
+  fi
+  printf '%s\n' '{"total_count":0,"statuses":[]}'
   exit 0
 fi
 if [ "$1 $2" = "pr diff" ]; then
@@ -278,9 +302,9 @@ fn already_judged_is_keyed_by_pull_request_and_head_sha() {
 }
 
 #[test]
-fn unreadable_rollup_only_makes_required_checks_inconclusive() {
+fn unreadable_check_runs_only_make_required_checks_inconclusive() {
     let fixture = Fixture::new();
-    let output = fixture.run("rollup-403", 20, "2020202020202020");
+    let output = fixture.run("check-runs-403", 20, "2020202020202020");
     assert_eq!(output.status.code(), Some(2));
     let text = output_text(&output);
     assert!(text.contains("head_sha=2020202020202020"), "{text}");
@@ -306,6 +330,54 @@ fn unreadable_rollup_only_makes_required_checks_inconclusive() {
             "{text}"
         );
     }
+}
+
+#[test]
+fn rest_check_runs_distinguish_pass_failure_pending_and_absence() {
+    for (mode, code, result, detail) in [
+        ("pass", 0, "pass", "\"state\":\"SUCCESS\""),
+        ("check-failure", 1, "fail", "verify-linux"),
+        ("check-running", 2, "inconclusive", "\"result\":\"pending\""),
+        ("no-check-runs", 1, "fail", "\"matches\":[]"),
+    ] {
+        let fixture = Fixture::new();
+        let output = fixture.run(mode, 23, "2323232323232323");
+        assert_eq!(output.status.code(), Some(code), "{mode}");
+        let text = output_text(&output);
+        assert!(
+            text.contains(&format!("condition required_checks: {result}")),
+            "{mode}: {text}"
+        );
+        assert!(text.contains(detail), "{mode}: {text}");
+        if mode == "check-running" {
+            assert!(text.contains("verify-linux"), "{text}");
+            assert!(!text.contains("condition required_checks: fail"), "{text}");
+            assert!(!text.contains("condition required_checks: pass"), "{text}");
+        }
+    }
+}
+
+#[test]
+fn unreadable_statuses_are_recorded_without_discarding_check_runs() {
+    let fixture = Fixture::new();
+    let output = fixture.run("status-403", 24, "2424242424242424");
+    assert!(output.status.success());
+    let text = output_text(&output);
+    assert!(text.contains("condition required_checks: pass"), "{text}");
+    assert!(text.contains("\"partial_read\""), "{text}");
+    assert!(text.contains("commit status"), "{text}");
+    assert!(text.contains("403"), "{text}");
+}
+
+#[test]
+fn commit_status_contexts_share_the_required_check_evaluator() {
+    let fixture = Fixture::new();
+    let output = fixture.run("status-check", 25, "2525252525252525");
+    assert!(output.status.success());
+    let text = output_text(&output);
+    assert!(text.contains("condition required_checks: pass"), "{text}");
+    assert!(text.contains("verify-linux"), "{text}");
+    assert!(text.contains("\"state\":\"SUCCESS\""), "{text}");
 }
 
 #[test]

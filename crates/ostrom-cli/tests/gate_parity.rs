@@ -176,11 +176,9 @@ fn rust_gate_matches_recorded_shell_corpus_apart_from_the_injected_clock() {
         }
 
         let commands = fs::read_to_string(command_log).expect("read GitHub boundary log");
-        assert!(
-            commands
-                .lines()
-                .all(|line| matches!(line, "pr view" | "pr diff" | "api graphql"))
-        );
+        assert!(commands.lines().all(|line| {
+            matches!(line, "pr view" | "pr diff" | "api graphql") || line.starts_with("api repos/")
+        }));
     }
 }
 
