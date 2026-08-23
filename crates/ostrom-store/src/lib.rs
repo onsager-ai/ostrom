@@ -63,7 +63,9 @@ pub use policy::{
     ActorPortabilityFinding, ConsultedScope, InertDeclaration, PolicyBundle, PolicyExplanation,
     PolicyLayer, PolicyOrigins, RequirementExplanation, RuleExplanation, SelectorProjection,
 };
-pub use policy_signature::{PolicySignatureError, sign_policy_manifest, verify_policy_manifest};
+pub use policy_signature::{
+    PolicySignatureError, policy_manifest_digest, sign_policy_manifest, verify_policy_manifest,
+};
 pub use publish::{PublishDestination, PublishError};
 pub use queue::{
     QueueActionError, QueueDecision, QueueDocument, decide_queue_item, lint_queue_state,

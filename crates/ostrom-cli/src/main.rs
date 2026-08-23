@@ -42,6 +42,7 @@ use ostrom_store::{
 
 mod operation_dispatch;
 mod policy_manifest;
+mod policy_version;
 
 use operation_dispatch::{
     OperationDispatchError, OperationRuntime, ResolvedOperationTarget, dispatch_operation,
@@ -57,6 +58,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Compose signed policy into an immutable content-addressed version.
+    Compose {
+        /// Repository policy manifest; defaults to repository discovery.
+        manifest: Option<PathBuf>,
+    },
     /// Sign a fully composed Ostrom policy manifest.
     Sign {
         /// Stable principal ID; its public key is installed as <KEY_ID>.pem.
@@ -148,8 +154,13 @@ enum Command {
         #[command(subcommand)]
         command: CheckCommand,
     },
-    /// Print the resolved mandate roster as JSON.
-    Config,
+    /// Print resolved configuration or verify the active policy version.
+    Config {
+        #[command(subcommand)]
+        command: Option<ConfigCommand>,
+    },
+    /// Atomically restore the previous composed policy version.
+    Rollback,
     /// Merge base branches into eligible stale builder pull requests.
     RepairPrs {
         #[arg(allow_hyphen_values = true)]
@@ -296,6 +307,12 @@ enum CheckCommand {
         #[arg(long)]
         head: String,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    /// Compare the active materialized policy with its content digest.
+    Verify,
 }
 
 #[derive(Debug, Subcommand)]
@@ -514,6 +531,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let clock = Clock::realtime();
     let paths = compatible_command_paths();
     match cli.command {
+        Command::Compose { manifest } => {
+            let cwd = env::current_dir()?;
+            let manifest = if let Some(manifest) = manifest {
+                manifest
+            } else {
+                policy_manifest::default_manifest_path(&paths, &cwd)?.ok_or_else(|| {
+                    policy_manifest::PolicyLoadError::UngovernedRepository(cwd.clone())
+                })?
+            };
+            let outcome = policy_version::run_compose(&paths, &manifest)?;
+            println!(
+                "composed digest={} path={}",
+                outcome.digest,
+                outcome.path.display()
+            );
+        }
         Command::Sign {
             key_id,
             key,
@@ -654,7 +687,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(1);
             }
         }
-        Command::Config => {
+        Command::Config { command: None } => {
             let config = ostrom_store::load_config_or_defaults(&paths, &env::current_dir()?)
                 .unwrap_or_else(|error| exit_message(&error.to_string(), 2));
             let mut config = serde_json::to_value(config)?;
@@ -676,6 +709,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             serde_json::to_writer(io::stdout(), &config)?;
             println!();
+        }
+        Command::Config {
+            command: Some(ConfigCommand::Verify),
+        } => {
+            let outcome = policy_version::verify_current(&paths);
+            println!("{}", outcome.render());
+            let exit_code = outcome.exit_code();
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+        }
+        Command::Rollback => {
+            let outcome = policy_version::rollback(&paths)?;
+            println!("rollback from={} to={}", outcome.from, outcome.to);
         }
         Command::RepairPrs {
             builder_lease_owner,

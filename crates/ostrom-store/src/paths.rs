@@ -58,6 +58,21 @@ impl OstromPaths {
     }
 
     #[must_use]
+    pub fn policy_versions_dir(&self) -> PathBuf {
+        self.state.join("versions")
+    }
+
+    #[must_use]
+    pub fn current_policy_version(&self) -> PathBuf {
+        self.state.join("current")
+    }
+
+    #[must_use]
+    pub fn previous_policy_version(&self) -> PathBuf {
+        self.state.join("previous-version")
+    }
+
+    #[must_use]
     pub fn selector_events_file(&self) -> PathBuf {
         self.state.join("selector-events.jsonl")
     }
