@@ -2,11 +2,13 @@
 
 use std::{
     env, fs,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{PermissionsExt, symlink},
     path::{Path, PathBuf},
     process::{Command, Output},
 };
 
+use ostrom_core::PolicyManifest;
+use ostrom_store::policy_manifest_digest;
 use tempfile::TempDir;
 
 struct Fixture {
@@ -152,6 +154,24 @@ exit 97
     fn write_config(&self, source: &str) {
         fs::write(self.home.join("gate.yaml"), source).expect("replace gate config");
     }
+
+    fn materialize_current(&self, source: &str) -> String {
+        let manifest = PolicyManifest::from_yaml(source).expect("current manifest");
+        let digest = policy_manifest_digest(&manifest).expect("current manifest digest");
+        let version = self.home.join("versions").join(&digest);
+        fs::create_dir_all(&version).expect("create current version");
+        fs::write(
+            version.join("ostrom.yaml"),
+            manifest.to_yaml().expect("canonical current manifest"),
+        )
+        .expect("write current manifest");
+        symlink(
+            Path::new("versions").join(&digest),
+            self.home.join("current"),
+        )
+        .expect("point current manifest");
+        digest
+    }
 }
 
 fn executable(path: &Path, body: &str) {
@@ -180,6 +200,49 @@ fn unknown_missing_and_malformed_mergeability_are_inconclusive() {
             "{mode}: {text}"
         );
     }
+}
+
+#[test]
+fn current_manifest_source_is_reported_without_changing_a_passing_verdict() {
+    let fixture = Fixture::new();
+    let digest = fixture.materialize_current(
+        r#"
+manifest_version: 1
+checks:
+  verify: {uses: gh/check-run, with: {name: verify-linux}}
+grants:
+  merge:
+    repositories: example-org/example-repo
+    requires: verify
+"#,
+    );
+    let output = fixture.run("pass", 7, "aaaaaaaaaaaaaaaa");
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output_text(&output).starts_with("verdict: pass"));
+    assert_eq!(
+        String::from_utf8(output.stderr).expect("gate stderr"),
+        format!("mandate gate: policy source=manifest digest={digest}\n")
+    );
+}
+
+#[test]
+fn repository_absent_from_current_manifest_is_named_by_run_gate() {
+    let fixture = Fixture::new();
+    let digest = fixture.materialize_current(
+        "manifest_version: 1\ngrants:\n  other: {repositories: example-org/other}\n",
+    );
+    let output = fixture.run("pass", 7, "aaaaaaaaaaaaaaaa");
+    assert_eq!(output.status.code(), Some(2));
+    let stdout = output_text(&output);
+    assert!(stdout.starts_with("verdict: inconclusive"), "{stdout}");
+    assert!(
+        stdout.contains("composed manifest has no project entry for example-org/example-repo"),
+        "{stdout}"
+    );
+    assert_eq!(
+        String::from_utf8(output.stderr).expect("gate stderr"),
+        format!("mandate gate: policy source=manifest digest={digest}\n")
+    );
 }
 
 #[test]

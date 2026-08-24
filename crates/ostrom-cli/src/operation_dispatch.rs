@@ -183,7 +183,7 @@ pub(crate) fn dispatch_operation(
         let action = ostrom_core::operation_action(&step.uses)
             .ok_or_else(|| OperationDispatchError::UnknownAction(step.uses.clone()))?;
         let parameters = resolve_parameters(&step.parameters, &invocation.parameters)?;
-        if let Some(check) = &step.requires {
+        for check in step.requires.iter() {
             runtime.require(check, &target)?;
         }
         runtime.execute(action, &target, &parameters)?;
@@ -266,6 +266,9 @@ pub(crate) fn resolve_repository_target(
         repository: repository.to_owned(),
         candidate: PolicyCandidate {
             repository: repository.to_owned(),
+            reference: raw
+                .split_once('#')
+                .and_then(|(_, number)| number.parse::<u64>().ok()),
             actor: Some(actor.to_owned()),
             verb: Some(operation.to_owned()),
             ..PolicyCandidate::default()
@@ -332,7 +335,7 @@ mod tests {
         parse_invocation, resolve_repository_target,
     };
 
-    const MANIFEST: &str = "manifest_version: 1\nactors: {builder: {}}\noperations:\n  deliver:\n    params:\n      version: {type: semver}\n    steps:\n      - uses: cmd/run\n        with: {script: 'first'}\n      - uses: git/tag\n        with: {name: '$params.version'}\n        requires: ready\ngrants:\n  builder-deliver: {actors: builder, operations: deliver, repositories: placeholder-org/repo}\n";
+    const MANIFEST: &str = "manifest_version: 1\nactors: {builder: {}}\noperations:\n  deliver:\n    params:\n      version: {type: semver}\n    steps:\n      - uses: cmd/run\n        with: {script: 'first'}\n      - uses: git/tag\n        with: {name: '$params.version'}\n        requires: [ready, signed]\ngrants:\n  builder-deliver: {actors: builder, operations: deliver, repositories: placeholder-org/repo}\n";
 
     #[derive(Default)]
     struct RecordingRuntime {
@@ -396,6 +399,7 @@ mod tests {
                 "resolve:placeholder-org/repo#7",
                 "execute:cmd/run:first",
                 "require:ready",
+                "require:signed",
                 "execute:git/tag:1.2.3",
             ]
         );
