@@ -191,18 +191,18 @@ fn read_rows(path: &Path, implementation: &str) -> Result<BTreeMap<String, Value
 }
 
 fn flatten_fields(prefix: &str, value: &Value, fields: &mut BTreeMap<String, Value>) {
-    if let Value::Object(object) = value {
-        if !object.is_empty() {
-            for (name, child) in object {
-                let path = if prefix.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{prefix}.{name}")
-                };
-                flatten_fields(&path, child, fields);
-            }
-            return;
+    if let Value::Object(object) = value
+        && !object.is_empty()
+    {
+        for (name, child) in object {
+            let path = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}.{name}")
+            };
+            flatten_fields(&path, child, fields);
         }
+        return;
     }
     fields.insert(prefix.to_owned(), value.clone());
 }

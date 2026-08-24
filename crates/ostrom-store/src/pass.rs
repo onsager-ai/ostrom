@@ -440,14 +440,12 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
             guard.outcome.as_deref(),
             Some("failed" | "permission-denied")
         )
+        && let Some(hash) = &guard.dispatchability_hash
     {
-        if let Some(hash) = &guard.dispatchability_hash {
-            state.dispatchability_hash = Some(hash.clone());
-            if let Err(error) = write_pass_state(&request.paths.state, request.role.name(), &state)
-            {
-                guard.outcome = Some("failed".to_owned());
-                return Err(PassError::failed(request.role, error.to_string(), 1));
-            }
+        state.dispatchability_hash = Some(hash.clone());
+        if let Err(error) = write_pass_state(&request.paths.state, request.role.name(), &state) {
+            guard.outcome = Some("failed".to_owned());
+            return Err(PassError::failed(request.role, error.to_string(), 1));
         }
     }
     prune_transcripts(&run_dir);

@@ -191,15 +191,15 @@ pub fn append_trace_checked(
     if record.kind.is_empty() {
         return Err(TraceActionError::EmptyKind);
     }
-    if record.kind == "item-worked" {
-        if let Some(order_id) = record.fact.get("order_id") {
-            let order_id = order_id
-                .as_str()
-                .filter(|value| !value.is_empty())
-                .ok_or(TraceActionError::InvalidOrderId)?;
-            if !order_id_exists(work_orders, order_id) {
-                return Err(TraceActionError::UnknownOrderId(order_id.to_owned()));
-            }
+    if record.kind == "item-worked"
+        && let Some(order_id) = record.fact.get("order_id")
+    {
+        let order_id = order_id
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or(TraceActionError::InvalidOrderId)?;
+        if !order_id_exists(work_orders, order_id) {
+            return Err(TraceActionError::UnknownOrderId(order_id.to_owned()));
         }
     }
     append_trace(path, record).map_err(|error| match error {

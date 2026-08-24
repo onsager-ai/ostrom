@@ -620,23 +620,21 @@ pub fn run_plan(
             }) {
                 Ok(draft) => {
                     let mut consequence = consequence(&facts, &queue);
-                    if action.is_some_and(|action| action.verb == GoalActionVerb::Promote) {
-                        if let Some(next) = &facts.next {
-                            if queue
-                                .iter()
-                                .find(|item| &item.id == next)
-                                .is_some_and(QueueItem::dispatchable)
-                                && !consequence.promote.contains(next)
-                            {
-                                consequence.promote.push(next.clone());
-                            }
-                        }
+                    if action.is_some_and(|action| action.verb == GoalActionVerb::Promote)
+                        && let Some(next) = &facts.next
+                        && queue
+                            .iter()
+                            .find(|item| &item.id == next)
+                            .is_some_and(QueueItem::dispatchable)
+                        && !consequence.promote.contains(next)
+                    {
+                        consequence.promote.push(next.clone());
                     }
-                    if action.is_some_and(|action| action.verb == GoalActionVerb::Demote) {
-                        if let Some(next) = &facts.next {
-                            demoted.insert(next.clone());
-                            consequence.promote.retain(|item| item != next);
-                        }
+                    if action.is_some_and(|action| action.verb == GoalActionVerb::Demote)
+                        && let Some(next) = &facts.next
+                    {
+                        demoted.insert(next.clone());
+                        consequence.promote.retain(|item| item != next);
                     }
                     let basis = cited_fact_basis(&draft, &facts, &queue);
                     let suppressed = matching_acknowledgement(
