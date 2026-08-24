@@ -382,12 +382,17 @@ pub(crate) fn operator_manifest_path(
     if let Some(path) = named_manifest_path(&paths.config)? {
         return Ok(Some(path));
     }
-    for legacy in ["policy.yaml", "config.yaml"] {
-        let path = paths.config.join(legacy);
-        if path.is_file() {
-            warn_legacy_operator_manifest(&path);
-            return Ok(Some(path));
-        }
+    // `config.yaml` is not on this list. `~/.claude/ostrom/config.yaml` and
+    // `./.ostrom/config.yaml` are the touch log's user and repository layers,
+    // documented in `skills/touch/SKILL.md`, and claiming them here made
+    // `ostrom operations` fail on this operator's machine with
+    // `unknown field `provider``. The deprecation notice compounded it by
+    // advising a move to `ostrom.yaml`, which would have destroyed the touch
+    // configuration or produced an invalid policy.
+    let legacy = paths.config.join("policy.yaml");
+    if legacy.is_file() {
+        warn_legacy_operator_manifest(&legacy);
+        return Ok(Some(legacy));
     }
     Ok(None)
 }

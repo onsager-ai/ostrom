@@ -485,3 +485,43 @@ fn sweep_still_runs_in_a_repository_that_has_no_manifest_yet() {
         "an absent manifest must not fall through to operator policy: {stderr}"
     );
 }
+
+/// `~/.claude/ostrom/config.yaml` and `./.ostrom/config.yaml` are the touch
+/// log's user and repository layers, documented in `skills/touch/SKILL.md`.
+/// Claiming `config.yaml` as a legacy policy manifest made `ostrom operations`
+/// fail on a real operator's machine with `unknown field `provider``, and the
+/// deprecation notice advised moving the file to `ostrom.yaml`, which would
+/// have destroyed the touch configuration. The policy loader must not read
+/// another subsystem's file.
+#[test]
+fn a_touch_log_config_is_not_claimed_as_an_operator_policy_manifest() {
+    let home = tempdir().expect("temporary OSTROM_HOME");
+    let repository = tempdir().expect("temporary repository");
+    fs::create_dir(repository.path().join(".git")).expect("repository boundary");
+    fs::write(
+        home.path().join("config.yaml"),
+        "# ostrom \u{2014} touch-log config (user layer)\nprovider: notion\nnotion:\n  data_source: placeholder\n",
+    )
+    .expect("write touch log config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .current_dir(repository.path())
+        .env("OSTROM_HOME", home.path())
+        .arg("operations")
+        .output()
+        .expect("run operations without an operator manifest");
+
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 error");
+    assert!(
+        !stderr.contains("config.yaml"),
+        "the touch log config must not be named as a policy manifest: {stderr}"
+    );
+    assert!(
+        !stderr.contains("unknown field `provider`"),
+        "the touch log config must not be parsed as policy: {stderr}"
+    );
+    assert!(
+        stderr.contains("no adopting operator manifest found"),
+        "an absent operator manifest must be named as absent: {stderr}"
+    );
+}
