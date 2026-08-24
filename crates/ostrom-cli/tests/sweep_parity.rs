@@ -381,6 +381,7 @@ esac
         "api -X GET search/issues -f q=repo:example-org/example-repo is:pr is:merged merged:>=2026-07-02 -F per_page=100 -F page=1"
     ));
     assert!(calls.contains("api graphql -f query=query OstromMergedPullRequestNodes"));
+    assert!(calls.contains("headRefOid headRefName state"));
     assert!(calls.contains("-F ids[]=PR_placeholder"));
     assert!(!calls.contains("--state all --limit 200"));
     assert!(

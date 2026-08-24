@@ -16,6 +16,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use ostrom_core::{MandateConfig, WorkOrder};
+use regex::Regex;
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 
@@ -969,11 +970,19 @@ fn create_pull_request(
     minter: &mut dyn InstallationTokenMinter,
 ) -> Result<String, ImplementError> {
     let body = runs.join("pr-body.md");
-    fs::write(
-        &body,
-        pull_request_body(&guard.order, &guard.withheld_paths),
-    )
-    .map_err(|error| ImplementError::new(1, "pr-body-write-failed", error.to_string()))?;
+    let contents = pull_request_body(&guard.order, &guard.withheld_paths);
+    if !closing_keyword_binds_item(&contents, &guard.order.item_id) {
+        return Err(ImplementError::new(
+            1,
+            "pr-body-lint-failed",
+            format!(
+                "machine-authored pull-request body has no closing keyword bound to {}",
+                guard.order.item_id
+            ),
+        ));
+    }
+    fs::write(&body, contents)
+        .map_err(|error| ImplementError::new(1, "pr-body-write-failed", error.to_string()))?;
     gh_text(
         request,
         &guard.order.repository,
@@ -1050,6 +1059,14 @@ fn pull_request_body(order: &WorkOrder, withheld: &[String]) -> String {
         order.cost(),
         order.tokens()
     )
+}
+
+fn closing_keyword_binds_item(body: &str, item_id: &str) -> bool {
+    let pattern = format!(
+        r"(?i)(?:^|[^[:alnum:]_])(?:close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)[[:space:]]+{}\b",
+        regex::escape(item_id)
+    );
+    Regex::new(&pattern).is_ok_and(|regex| regex.is_match(body))
 }
 
 fn resolve_source_repository(
@@ -1323,7 +1340,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        GitHubOperationError, default_branch_result, has_unpublished_tree, prepare_worktree,
+        GitHubOperationError, closing_keyword_binds_item, default_branch_result,
+        has_unpublished_tree, prepare_worktree,
     };
     use crate::{AppTokenError, app_token::AuthenticatedCommandError};
 
@@ -1355,6 +1373,31 @@ mod tests {
 
         let empty = default_branch_result(Ok(String::new())).expect_err("empty branch must fail");
         assert_eq!(empty.reason, "default-branch-missing");
+    }
+
+    #[test]
+    fn pull_request_body_lint_requires_a_closing_keyword_bound_to_the_item() {
+        let item = "placeholder-org/alpha#427";
+        assert!(closing_keyword_binds_item(
+            "Closes placeholder-org/alpha#427\n\nOstrom-Role: builder\n",
+            item
+        ));
+        assert!(closing_keyword_binds_item(
+            "This fixes placeholder-org/alpha#427.",
+            item
+        ));
+        assert!(!closing_keyword_binds_item(
+            "Implements placeholder-org/alpha#427, the settled design.",
+            item
+        ));
+        assert!(!closing_keyword_binds_item(
+            "Work item: placeholder-org/alpha#427",
+            item
+        ));
+        assert!(!closing_keyword_binds_item(
+            "Closes placeholder-org/alpha#428",
+            item
+        ));
     }
 
     #[test]

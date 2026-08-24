@@ -962,7 +962,7 @@ fn fetch_merged_pull_requests(repo: &str, search: &str) -> Result<Vec<Value>, Sw
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let query = r#"query OstromMergedPullRequestNodes($ids:[ID!]!){nodes(ids:$ids){... on PullRequest{number title author{login __typename} closingIssuesReferences(first:100){nodes{number}} createdAt mergedAt headRefOid state}}}"#;
+        let query = r#"query OstromMergedPullRequestNodes($ids:[ID!]!){nodes(ids:$ids){... on PullRequest{number title author{login __typename} closingIssuesReferences(first:100){nodes{number}} createdAt mergedAt headRefOid headRefName state}}}"#;
         let query_field = format!("query={query}");
         let mut args = vec![
             "api".to_owned(),
@@ -1453,6 +1453,19 @@ fn analyze_repository(
     active_ids.extend(gate.active_ids);
     current.extend(gate.current);
 
+    let item_closure = analyze_item_closure(
+        repo,
+        &items,
+        &snapshot.merged_prs,
+        previous,
+        evidence,
+        started_at,
+        config.stuck_after_days,
+    );
+    generated.extend(item_closure.generated);
+    active_ids.extend(item_closure.active_ids);
+    current.extend(item_closure.current);
+
     let branch_writes = analyze_branch_writes(
         repo,
         snapshot,
@@ -1527,6 +1540,9 @@ fn analyze_repository(
         "merge_gate_floor": gate.extra_state["floor"],
         "merge_gate_faults": gate.extra_state["faults"],
         "merge_gate_fault_count": gate.extra_state["fault_count"],
+        "item_implementation_merges": item_closure.extra_state["implementations"],
+        "item_closure_faults": item_closure.extra_state["faults"],
+        "item_closure_fault_count": item_closure.extra_state["fault_count"],
         "unexplained_branch_writes": branch_writes.extra_state["writes"],
         "unexplained_write_count": gate.extra_state["anomaly_count"].as_u64().unwrap_or_default()
             + branch_writes.extra_state["count"].as_u64().unwrap_or_default(),
@@ -2356,6 +2372,213 @@ fn analyze_merge_gate(
             "anomaly_count": anomaly_count,
         }),
     }
+}
+
+/// Report an open item whose deterministic implementation branch has already
+/// merged. A sweep remains observation-only: the fault is durable evidence for
+/// the builder/gatekeeper instead of a new GitHub write performed by a reader.
+///
+/// A superseding implementation can itself have been dispatched against the
+/// first pull request. `work-completed` retains that pull request -> item link,
+/// so a merged `ostrom/<pr>-<hash>` branch can still be carried back to the
+/// original item without parsing either pull-request body.
+fn analyze_item_closure(
+    repo: &str,
+    items: &[NormalizedItem],
+    merged: &[Value],
+    previous: &Value,
+    evidence: &RepositoryEvidence<'_>,
+    started_at: DateTime<Utc>,
+    stuck_after_days: u64,
+) -> SupplementalAnalysis {
+    let completed_items = completed_items_by_pull(evidence.paths, repo);
+    let mut implementations = previous
+        .get("item_implementation_merges")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+
+    for pull in merged {
+        let Some(pull_number) = number_field(pull, &["number"]) else {
+            continue;
+        };
+        let Some(head_branch) = nonempty_string(pull, &["headRefName", "head_ref_name"]) else {
+            continue;
+        };
+        let Some(branch_item_id) = item_from_implementation_branch(repo, head_branch) else {
+            continue;
+        };
+        let branch_item_number = item_number(repo, &branch_item_id)
+            .expect("a derived implementation item has a numeric item id");
+        let item_id = completed_items
+            .get(&branch_item_number)
+            .cloned()
+            .unwrap_or_else(|| branch_item_id.clone());
+        let merged_at = string_field(pull, &["mergedAt", "merged_at"]);
+        if merged_at.is_empty() {
+            continue;
+        }
+        let evidence = json!({
+            "item_id": item_id,
+            "pull_request": format!("{repo}#{pull_number}"),
+            "pull_request_number": pull_number,
+            "title": nonempty_string(pull, &["title"]).unwrap_or("(title unavailable)"),
+            "head_branch": head_branch,
+            "branch_item_id": branch_item_id,
+            "merged_at": merged_at,
+        });
+        let replace = implementations
+            .get(&item_id)
+            .map(|old| string_field(old, &["merged_at"]) <= merged_at)
+            .unwrap_or(true);
+        if replace {
+            implementations.insert(item_id, evidence);
+        }
+    }
+
+    let open_items = items
+        .iter()
+        .filter(|item| item.item_type == "issue")
+        .map(|item| item.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let old_faults = previous
+        .get("item_closure_faults")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let mut generated = Vec::new();
+    let mut active_ids = BTreeSet::new();
+    let mut current = BTreeMap::new();
+    let mut faults = Map::new();
+
+    for (item_id, implementation) in &implementations {
+        if !open_items.contains(item_id.as_str()) {
+            continue;
+        }
+        let pull_request = string_field(implementation, &["pull_request"]);
+        let pull_number =
+            number_field(implementation, &["pull_request_number"]).unwrap_or_default();
+        let head_branch = string_field(implementation, &["head_branch"]);
+        let merged_at = string_field(implementation, &["merged_at"]);
+        let branch_item_id = string_field(implementation, &["branch_item_id"]);
+        let fingerprint = format!(
+            "item-closure-v1|{item_id}|{pull_request}|{head_branch}|{merged_at}|{branch_item_id}"
+        );
+        let age_days = days_since(started_at, merged_at);
+        let title = format!("Open item has merged implementation {pull_request}");
+        active_ids.insert(item_id.clone());
+        current.insert(
+            item_id.clone(),
+            json!({
+                "id": item_id,
+                "title": title,
+                "age_days": age_days,
+                "aged_out": age_days >= stuck_after_days,
+                "blocked_by": [],
+            }),
+        );
+        if old_faults
+            .get(item_id)
+            .and_then(|fault| fault.get("fingerprint"))
+            .and_then(Value::as_str)
+            != Some(fingerprint.as_str())
+            || evidence.queued_kinds.get(item_id).map(String::as_str) != Some("merge-gate-fault")
+        {
+            generated.push(json!({
+                "id": item_id,
+                "repo": repo,
+                "ref": format!("#{}", item_number(repo, item_id).unwrap_or_default()),
+                "title": title,
+                "kind": "merge-gate-fault",
+                "mandate": {
+                    "reason": format!("item closure fault: open item {item_id} has merged implementation {pull_request} from derived branch {head_branch}"),
+                    "scope_evidence": {
+                        "item_id": item_id,
+                        "pull_request": pull_request,
+                        "head_branch": head_branch,
+                        "branch_item_id": branch_item_id,
+                        "carried_forward": branch_item_id != item_id,
+                    },
+                },
+                "state": "pending",
+                "opened": merged_at,
+                "age_days": age_days,
+                "aged_out": age_days >= stuck_after_days,
+                "needs_judgment": false,
+                "blocked_by": [],
+            }));
+        }
+        faults.insert(
+            item_id.clone(),
+            json!({
+                "pull_request": pull_request,
+                "pull_request_number": pull_number,
+                "head_branch": head_branch,
+                "branch_item_id": branch_item_id,
+                "merged_at": merged_at,
+                "fingerprint": fingerprint,
+            }),
+        );
+    }
+
+    SupplementalAnalysis {
+        generated,
+        active_ids,
+        current,
+        extra_state: json!({
+            "implementations": implementations,
+            "fault_count": faults.len(),
+            "faults": faults,
+        }),
+    }
+}
+
+fn completed_items_by_pull(paths: &OstromPaths, repo: &str) -> BTreeMap<u64, String> {
+    read_jsonl_values(&paths.trace_file())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|row| string_field(row, &["kind"]) == "work-completed")
+        .filter_map(|row| {
+            let item_id = row
+                .pointer("/fact/item_id")
+                .and_then(Value::as_str)
+                .filter(|item_id| !item_id.is_empty())?;
+            item_number(repo, item_id)?;
+            let pull_url = row
+                .pointer("/fact/pr_url")
+                .and_then(Value::as_str)
+                .filter(|pull_url| !pull_url.is_empty())?;
+            pull_number_from_url(repo, pull_url).map(|number| (number, item_id.to_owned()))
+        })
+        .collect()
+}
+
+fn pull_number_from_url(repo: &str, url: &str) -> Option<u64> {
+    let (owner, name) = repo.split_once('/')?;
+    let mut segments = url.trim_end_matches('/').rsplit('/');
+    let number = segments.next()?.parse::<u64>().ok()?;
+    (number > 0
+        && segments.next() == Some("pull")
+        && segments.next() == Some(name)
+        && segments.next() == Some(owner))
+    .then_some(number)
+}
+
+fn item_from_implementation_branch(repo: &str, branch: &str) -> Option<String> {
+    let item_number = branch.strip_prefix("ostrom/")?.split_once('-')?.0;
+    if item_number.starts_with('0') || !item_number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let item_id = format!("{repo}#{item_number}");
+    (crate::work_order::branch_name(&item_id) == branch).then_some(item_id)
+}
+
+fn item_number(repo: &str, item_id: &str) -> Option<u64> {
+    let number = item_id.strip_prefix(&format!("{repo}#"))?;
+    if number.starts_with('0') || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    number.parse::<u64>().ok().filter(|number| *number > 0)
 }
 
 fn analyze_branch_writes(
