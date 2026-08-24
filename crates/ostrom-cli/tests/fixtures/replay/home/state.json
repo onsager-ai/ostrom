@@ -4,13 +4,13 @@
     "placeholder-org/alpha": {
       "items": {
         "placeholder-org/alpha#1": {
-          "matched_selector": "scope:tooling"
+          "matched_selector": "label:area:tooling"
         },
         "placeholder-org/alpha#2": {
           "matched_selector": "path:.github/workflows/release.yml"
         },
         "placeholder-org/alpha#3": {
-          "matched_selector": "title:*credential*"
+          "matched_selector": "label:risk:secret"
         },
         "placeholder-org/alpha#4": {
           "matched_selector": "default:unclassified"

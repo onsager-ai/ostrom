@@ -4,7 +4,6 @@ use std::{
     fs, io,
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
-    sync::Once,
 };
 
 use chrono::{DateTime, Utc};
@@ -316,10 +315,7 @@ pub(crate) fn load_bundle_at_base(
     build_bundle(paths, repository_path, repository)
 }
 
-pub(crate) fn default_manifest_path(
-    paths: &OstromPaths,
-    cwd: &Path,
-) -> Result<Option<PathBuf>, PolicyLoadError> {
+pub(crate) fn default_manifest_path(cwd: &Path) -> Result<Option<PathBuf>, PolicyLoadError> {
     let repository = repository_root(cwd);
     let directories = repository.as_ref().map_or_else(
         || cwd.ancestors().map(Path::to_path_buf).collect::<Vec<_>>(),
@@ -337,22 +333,6 @@ pub(crate) fn default_manifest_path(
 
     for directory in &directories {
         if let Some(path) = named_manifest_path(directory)? {
-            return Ok(Some(path));
-        }
-    }
-    if let Some(path) = directories
-        .iter()
-        .map(|directory| directory.join(".ostrom/manifest.yml"))
-        .find(|path| path.is_file())
-    {
-        warn_legacy_manifest(&path);
-        return Ok(Some(path));
-    }
-
-    if repository.is_none() {
-        let path = paths.config.join("manifest.yml");
-        if path.is_file() {
-            warn_legacy_manifest(&path);
             return Ok(Some(path));
         }
     }
@@ -382,18 +362,13 @@ pub(crate) fn operator_manifest_path(
     if let Some(path) = named_manifest_path(&paths.config)? {
         return Ok(Some(path));
     }
-    // `config.yaml` is not on this list. `~/.claude/ostrom/config.yaml` and
-    // `./.ostrom/config.yaml` are the touch log's user and repository layers,
-    // documented in `skills/touch/SKILL.md`, and claiming them here made
-    // `ostrom operations` fail on this operator's machine with
-    // `unknown field `provider``. The deprecation notice compounded it by
-    // advising a move to `ostrom.yaml`, which would have destroyed the touch
-    // configuration or produced an invalid policy.
-    let legacy = paths.config.join("policy.yaml");
-    if legacy.is_file() {
-        warn_legacy_operator_manifest(&legacy);
-        return Ok(Some(legacy));
-    }
+    // No legacy fallback. `policy.yaml` and `config.yaml` were both read here
+    // once; `config.yaml` is the touch log's own file (`skills/touch/SKILL.md`),
+    // and claiming it made `ostrom operations` fail with
+    // `unknown field `provider`` while advising a move that would have
+    // destroyed the touch configuration. The entrypoint is `ostrom.yaml`, and
+    // an operator without one is told so rather than handed another
+    // subsystem's document.
     Ok(None)
 }
 
@@ -413,7 +388,7 @@ pub(crate) fn load_optional_bundle(
     // must keep working in a repository that has no manifest yet. Discovery is
     // still strict — it never falls through to the operator's own policy — so
     // `None` means ungoverned, not "somebody else's rules".
-    let Some(path) = default_manifest_path(paths, cwd)? else {
+    let Some(path) = default_manifest_path(cwd)? else {
         return Ok(None);
     };
     load_bundle(paths, &path).map(Some)
@@ -427,26 +402,6 @@ fn repository_root(cwd: &Path) -> Option<PathBuf> {
 
 fn repository_name(cwd: &Path) -> PathBuf {
     repository_root(cwd).unwrap_or_else(|| cwd.to_path_buf())
-}
-
-fn warn_legacy_manifest(path: &Path) {
-    static NOTICE: Once = Once::new();
-    NOTICE.call_once(|| {
-        eprintln!(
-            "warning: legacy policy manifest `{}` is deprecated; move repository policy to `ostrom.yaml`",
-            path.display()
-        );
-    });
-}
-
-fn warn_legacy_operator_manifest(path: &Path) {
-    static NOTICE: Once = Once::new();
-    NOTICE.call_once(|| {
-        eprintln!(
-            "warning: legacy operator policy manifest `{}` is deprecated; move it to `ostrom.yaml`",
-            path.display()
-        );
-    });
 }
 
 fn compose_scopes(
@@ -539,7 +494,7 @@ pub(crate) fn run_explain(options: &ExplainOptions<'_>) -> Result<String, Policy
     let manifest_path = if let Some(manifest) = options.manifest {
         manifest.to_path_buf()
     } else {
-        default_manifest_path(options.paths, options.working_directory)?.ok_or_else(|| {
+        default_manifest_path(options.working_directory)?.ok_or_else(|| {
             PolicyLoadError::UngovernedRepository(repository_name(options.working_directory))
         })?
     };
@@ -1474,60 +1429,36 @@ pub(crate) enum PolicyLoadError {
 
 #[cfg(test)]
 mod tests {
-    use std::{env, fs, path::Path, process::Command};
+    use std::path::Path;
 
     use ostrom_core::{PolicyCandidate, PolicyManifest};
-    use tempfile::tempdir;
 
     use super::{
         compose_scopes, default_manifest_path, project_repository_manifest,
         validate_scoped_manifest,
     };
-    use ostrom_store::{OstromPaths, PolicyBundle, PolicyOrigins};
+    use ostrom_store::{PolicyBundle, PolicyOrigins};
 
-    const LEGACY_NOTICE_CHILD: &str = "OSTROM_TEST_LEGACY_NOTICE_CHILD";
-
+    /// Repository policy is `ostrom.yaml` and nothing else. `.ostrom/manifest.yml`
+    /// and `manifest.yml` were once read here with a deprecation notice; a
+    /// migration path that keeps loading the old shape is a second schema, and
+    /// this asserts there is only one.
     #[test]
-    fn legacy_notice_is_emitted_once_for_repeated_lookup() {
-        if env::var_os(LEGACY_NOTICE_CHILD).is_some() {
-            let root = tempdir().expect("temporary repository");
-            fs::create_dir(root.path().join(".git")).expect("repository boundary");
-            fs::create_dir(root.path().join(".ostrom")).expect("legacy directory");
-            fs::write(
-                root.path().join(".ostrom/manifest.yml"),
-                "manifest_version: 1\n",
-            )
-            .expect("legacy manifest");
-            let paths = OstromPaths {
-                config: root.path().join("config"),
-                state: root.path().join("state"),
-            };
-            assert!(
-                default_manifest_path(&paths, root.path())
-                    .expect("manifest discovery")
-                    .is_some()
-            );
-            assert!(
-                default_manifest_path(&paths, root.path())
-                    .expect("manifest discovery")
-                    .is_some()
-            );
-            return;
-        }
+    fn a_legacy_repository_manifest_is_not_loaded() {
+        let root = tempfile::tempdir().expect("temporary repository");
+        std::fs::create_dir(root.path().join(".git")).expect("repository boundary");
+        std::fs::create_dir(root.path().join(".ostrom")).expect("legacy directory");
+        std::fs::write(
+            root.path().join(".ostrom/manifest.yml"),
+            "manifest_version: 1\n",
+        )
+        .expect("legacy manifest");
 
-        let output = Command::new(env::current_exe().expect("current test executable"))
-            .env(LEGACY_NOTICE_CHILD, "1")
-            .args([
-                "--exact",
-                "policy_manifest::tests::legacy_notice_is_emitted_once_for_repeated_lookup",
-                "--nocapture",
-            ])
-            .output()
-            .expect("run repeated lookup child");
-        assert!(output.status.success());
-        let stderr = String::from_utf8(output.stderr).expect("UTF-8 warning");
-        assert_eq!(stderr.matches("deprecated").count(), 1, "{stderr}");
-        assert!(stderr.contains("ostrom.yaml"), "{stderr}");
+        assert_eq!(
+            default_manifest_path(root.path()).expect("lookup succeeds"),
+            None,
+            "a legacy manifest must not stand in for `ostrom.yaml`"
+        );
     }
 
     #[test]

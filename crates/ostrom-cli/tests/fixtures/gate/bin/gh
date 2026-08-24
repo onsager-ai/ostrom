@@ -27,13 +27,14 @@ if [ "$1 $2" = "pr view" ]; then
     --arg check_conclusion "$check_conclusion" \
     --arg mergeable "$mergeable" \
     --argjson is_draft "$is_draft" \
+    --arg mode "$mode" \
     --arg title "$title" '
       {
         number: $number,
         title: $title,
         author: {login: "placeholder-builder"},
         headRefOid: $head,
-        labels: [],
+        labels: (if $mode == "bounce" then [{name: "risk:protected-surface"}] else [] end),
         closingIssuesReferences: [],
         mergeable: $mergeable,
         isDraft: $is_draft

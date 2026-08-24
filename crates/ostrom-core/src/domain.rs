@@ -98,10 +98,10 @@ impl Selector {
         let Some((prefix, pattern)) = value.split_once(':') else {
             return Err(SelectorError::MissingPrefix);
         };
-        if !matches!(
-            prefix,
-            "label" | "scope" | "type" | "path" | "ref" | "title"
-        ) {
+        // `scope:` and `title:` were retired in #358: a selector may only draw
+        // from a universe that can be listed, and `title:` globbed over prose a
+        // pull-request author writes freely. Neither appears in any live policy.
+        if !matches!(prefix, "label" | "type" | "path" | "ref") {
             return Err(SelectorError::UnknownPrefix(prefix.to_owned()));
         }
         if pattern.is_empty() {
@@ -115,17 +115,6 @@ impl Selector {
                 && !pattern[1..].starts_with('0'))
         {
             return Err(SelectorError::InvalidRef);
-        }
-        if prefix == "title" {
-            if !pattern.contains('*') {
-                return Err(SelectorError::TitleNeedsWildcard);
-            }
-            if pattern
-                .split('*')
-                .any(|literal| literal.chars().count() > 24)
-            {
-                return Err(SelectorError::TitleLiteralTooLong);
-            }
         }
         Ok(Self(value))
     }
@@ -203,10 +192,6 @@ pub enum SelectorError {
     EmptyPattern,
     #[error("ref selector must be ref:#N")]
     InvalidRef,
-    #[error("title selector must contain *")]
-    TitleNeedsWildcard,
-    #[error("title selector literal run exceeds 24 characters")]
-    TitleLiteralTooLong,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -562,19 +547,25 @@ mod tests {
     /// assumption rather than a guarantee.
     #[test]
     fn the_legacy_selector_prefix_set_is_closed_and_names_the_unknown_prefix() {
-        for prefix in ["check", "actor", "verb", "substance", "area", "anything"] {
+        // `scope:` and `title:` are on this list because #358 retired them and
+        // nothing may quietly resurrect them: `title:` globbed over prose an
+        // author writes freely, which is exactly the fuzzy matching this
+        // codebase refuses.
+        for prefix in [
+            "scope",
+            "title",
+            "check",
+            "actor",
+            "verb",
+            "substance",
+            "area",
+            "anything",
+        ] {
             let error = Selector::new(format!("{prefix}:value"))
                 .expect_err("an unknown prefix must be refused");
             assert_eq!(error, SelectorError::UnknownPrefix(prefix.to_owned()));
         }
-        for accepted in [
-            "label:a",
-            "scope:a",
-            "type:a",
-            "path:a",
-            "ref:#1",
-            "title:*a*",
-        ] {
+        for accepted in ["label:a", "type:a", "path:a", "ref:#1"] {
             Selector::new(accepted).unwrap_or_else(|error| {
                 panic!("`{accepted}` is part of the retired vocabulary: {error:?}")
             });
@@ -589,7 +580,7 @@ search_roots:
 work_ranking:
   - example-org/example-repo#42
 bounce_all:
-  - title:*credential*
+  - label:risk:secret
 projects:
   - repo: example-org/example-repo
     delegated: [label:maintenance]
@@ -606,7 +597,7 @@ bounce_all: []
 projects:
   - repo: example-org/example-repo
     required_checks: [verify-*]
-    bounce: [title:*breaking API*]
+    bounce: [label:risk:contract]
     reserved: [42]
 "#;
 

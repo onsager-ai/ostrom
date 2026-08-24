@@ -120,7 +120,11 @@ mod tests {
 
     #[test]
     fn selector_preconditions_share_conventional_and_glob_semantics() {
-        let labels = vec!["Needs Review".to_owned()];
+        let labels = vec![
+            "Needs Review".to_owned(),
+            "area:cli".to_owned(),
+            "risk:placeholder".to_owned(),
+        ];
         let files = vec!["crates/store/src/lib.rs".to_owned()];
         let candidate = SelectorCandidate {
             item_type: "pr",
@@ -132,11 +136,11 @@ mod tests {
 
         for selector in [
             "label:needs*",
-            "scope:CLI",
+            "label:area:CLI",
             "type:FEAT",
             "path:crates/**/lib.rs",
             "ref:#42",
-            "title:*PLACEHOLDER",
+            "label:risk:PLACEHOLDER",
         ] {
             let selector = Selector::new(selector).expect("valid selector");
             assert!(selector_match(&candidate, &selector), "{selector:?}");

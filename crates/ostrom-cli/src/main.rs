@@ -568,7 +568,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let manifest = if let Some(manifest) = manifest {
                 manifest
             } else {
-                policy_manifest::default_manifest_path(&paths, &cwd)?.ok_or_else(|| {
+                policy_manifest::default_manifest_path(&cwd)?.ok_or_else(|| {
                     policy_manifest::PolicyLoadError::UngovernedRepository(cwd.clone())
                 })?
             };
@@ -1395,7 +1395,7 @@ impl OperationRuntime for CliOperationRuntime<'_> {
     ) -> Result<ResolvedOperationTarget, OperationDispatchError> {
         let mut target = resolve_repository_target(raw, actor, operation)?;
         let local_repository_policy = raw.contains('#')
-            && policy_manifest::default_manifest_path(self.paths, self.working_directory)
+            && policy_manifest::default_manifest_path(self.working_directory)
                 .ok()
                 .flatten()
                 .is_some();
@@ -1422,13 +1422,11 @@ impl OperationRuntime for CliOperationRuntime<'_> {
         operation: &str,
         target: &ResolvedOperationTarget,
     ) -> Result<bool, OperationDispatchError> {
-        let repository_path =
-            policy_manifest::default_manifest_path(self.paths, self.working_directory).map_err(
-                |error| OperationDispatchError::TargetResolutionFailed {
-                    target: target.raw.clone(),
-                    message: error.to_string(),
-                },
-            )?;
+        let repository_path = policy_manifest::default_manifest_path(self.working_directory)
+            .map_err(|error| OperationDispatchError::TargetResolutionFailed {
+                target: target.raw.clone(),
+                message: error.to_string(),
+            })?;
         let Some(repository_path) = repository_path else {
             return Ok(manifest.decide(actor, operation, &target.candidate).granted);
         };

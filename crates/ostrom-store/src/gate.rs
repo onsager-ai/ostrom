@@ -1801,7 +1801,7 @@ projects:
         .unwrap();
         fs::write(
             repository.join(".ostrom/gate.yaml"),
-            "bounce_all: [title:*principal review*]\n",
+            "bounce_all: [label:risk:principal-review]\n",
         )
         .unwrap();
         let (config, error, source) =
@@ -1809,7 +1809,7 @@ projects:
         assert!(error.is_empty());
         assert!(source.is_none());
         let config = config.expect("layered gate config");
-        assert_eq!(config.bounce_all[0].as_str(), "title:*principal review*");
+        assert_eq!(config.bounce_all[0].as_str(), "label:risk:principal-review");
         assert_eq!(
             config.projects[0].repo.as_str(),
             "placeholder-org/placeholder-repo"

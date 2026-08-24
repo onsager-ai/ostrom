@@ -29,11 +29,16 @@ hold_labels: []
 work_ranking: []
 
 # Shared write-surface tripwires. Selectors are case-insensitive qualified
-# globs. A more-specific layer may replace this list.
+# globs. Risk labels name why a change needs judgment; content paths cover
+# mechanically observable secret surfaces. A more-specific layer may replace
+# this list.
 bounce_all:
-  - title:*merge to main*
-  - title:*production deployment*
-  - title:*external publication*
-  - title:*credential*
+  - label:risk:secret
+  - label:risk:announce
+  - label:risk:hosting
+  - path:**/.env
+  - path:**/.env.local
+  - path:**/.env.production
+  - path:**/secrets/**
 
 projects: []

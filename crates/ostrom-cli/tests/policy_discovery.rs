@@ -357,8 +357,12 @@ fn explicit_manifest_overrides_discovery() {
     assert!(stdout.contains("verdict      MERGE"), "{stdout}");
 }
 
+/// A repository whose only policy sits at the retired `.ostrom/manifest.yml`
+/// is ungoverned, not governed by the old shape. A deprecation notice is still
+/// a loading path: it keeps a second schema alive and keeps its grants in
+/// force. The entrypoint is `ostrom.yaml`.
 #[test]
-fn legacy_repository_manifest_resolves_with_one_deprecation_notice() {
+fn a_legacy_repository_manifest_does_not_govern() {
     let fixture =
         RepositoryFixture::new("grants:\n  legacy-grant: {actors: builder, operations: work}\n");
     let legacy_directory = fixture.repository.path().join(".ostrom");
@@ -375,12 +379,22 @@ fn legacy_repository_manifest_resolves_with_one_deprecation_notice() {
     .expect("move manifest signature to legacy path");
 
     let output = fixture.explain_from(fixture.repository.path(), &[]);
-    assert!(output.status.success());
+
+    assert!(
+        !output.status.success(),
+        "a legacy manifest must not resolve"
+    );
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 explanation");
-    let stderr = String::from_utf8(output.stderr).expect("UTF-8 warning");
-    assert!(stdout.contains("legacy-grant"), "{stdout}");
-    assert_eq!(stderr.matches("deprecated").count(), 1, "{stderr}");
-    assert!(stderr.contains("ostrom.yaml"), "{stderr}");
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 error");
+    assert!(
+        !stdout.contains("legacy-grant"),
+        "a retired manifest must not carry authority: {stdout}"
+    );
+    assert!(
+        !stderr.contains("deprecated"),
+        "there is no deprecation path left to announce: {stderr}"
+    );
+    assert!(stderr.contains("ungoverned"), "{stderr}");
 }
 
 #[test]

@@ -7,8 +7,8 @@ placeholder-org/alpha#101  chore: change deployment workflow — merged 2026-07-
 PER-SELECTOR REPORT
 tier	repo	source	selector	fired	dismissed
 author-written	*	bounce_all	label:protected	0	0
-author-written	*	bounce_all	title:*credential*	1	1
-author-written	placeholder-org/alpha	delegated	scope:tooling	1	0
+author-written	*	bounce_all	label:risk:secret	1	1
+author-written	placeholder-org/alpha	delegated	label:area:tooling	1	0
 author-written	placeholder-org/alpha	delegated	type:docs	0	0
 author-written	placeholder-org/alpha	excluded	label:ignored	0	0
 content-derived	placeholder-org/alpha	project bounce	path:.github/workflows/release.yml	1	1

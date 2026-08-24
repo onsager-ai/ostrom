@@ -4,10 +4,10 @@
 # Layers resolve shipped defaults < user file < ./.ostrom/gate.yaml.
 # Lists in a more-specific layer replace the corresponding earlier list.
 #
-# Bounce selectors use the mandate vocabulary exactly: label, scope, type,
-# path, ref, and title. Matching is case-insensitive; * is a wildcard and
-# path ** spans depth. path: and ref: are content-derived. title:, type:,
-# scope:, and label: are author-written and therefore best-effort gates.
+# Bounce selectors use the mandate vocabulary exactly: label, type, path, and
+# ref. Matching is case-insensitive; * is a wildcard and path ** spans depth.
+# path: and ref: are content-derived. type: and label: are author-written and
+# therefore best-effort gates.
 
 provider: file
 
@@ -21,7 +21,7 @@ projects:
       - <check-name-glob>
     bounce:
       - path:<content-path-glob>
-      - title:*<title-fragment>*
+      - label:risk:<why-this-needs-judgment>
     # Reserved refs are exact PR or closing-issue numbers.
     reserved:
       - <positive-integer>

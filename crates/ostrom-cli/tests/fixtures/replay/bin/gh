@@ -31,7 +31,7 @@ if [ "$1 $2" = "pr list" ]; then
   {
     "number": 102,
     "title": "chore: credential rotation",
-    "labels": [],
+    "labels": [{"name": "risk:secret"}],
     "url": "https://example.invalid/placeholder/pull/102",
     "baseRefName": "main",
     "mergedAt": "2026-07-16T00:00:00Z",
