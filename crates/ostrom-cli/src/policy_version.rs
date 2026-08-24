@@ -236,6 +236,38 @@ pub(crate) fn load_current(
     })
 }
 
+pub(crate) fn load_explicit_version(
+    directory: &Path,
+) -> Result<PolicyManifest, CurrentPolicyError> {
+    let expected_digest = directory
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| CurrentPolicyError::Inconclusive {
+            cause: "version_digest_missing",
+            path: directory.to_path_buf(),
+        })?;
+    match inspect_version(directory, expected_digest) {
+        ConfigVerifyOutcome::Pass { .. } => {}
+        ConfigVerifyOutcome::Fail { drifted } => {
+            return Err(CurrentPolicyError::Drift { drifted });
+        }
+        ConfigVerifyOutcome::Inconclusive { cause, path } => {
+            return Err(CurrentPolicyError::Inconclusive { cause, path });
+        }
+    }
+    let path = directory.join(MATERIALIZED_MANIFEST);
+    let source = fs::read_to_string(&path).map_err(|error| CurrentPolicyError::Inconclusive {
+        cause: if error.kind() == io::ErrorKind::NotFound {
+            "manifest_missing"
+        } else {
+            "manifest_unreadable"
+        },
+        path: path.clone(),
+    })?;
+    PolicyManifest::parse_yaml(&source).map_err(|_| CurrentPolicyError::InvalidManifest { path })
+}
+
 pub(crate) fn rollback(paths: &OstromPaths) -> Result<RollbackOutcome, PolicyVersionError> {
     let current_path = paths.current_policy_version();
     let current = read_pointer(paths, &current_path).map_err(|error| match error {
