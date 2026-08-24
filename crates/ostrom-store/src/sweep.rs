@@ -1419,6 +1419,7 @@ fn analyze_repository(
                 item.item.id.clone(),
                 json!({
                     "id": item.item.id,
+                    "item_type": queue_item_type(&item.item),
                     "title": item.item.title,
                     "closing_suffix": closing_suffix(item, &classified),
                     "age_days": age_days,
@@ -1904,6 +1905,7 @@ fn queue_row(
         "repo": item.item.repo,
         "ref": item.item.reference,
         "title": item.item.title,
+        "item_type": queue_item_type(&item.item),
         "kind": kind,
         "mandate": mandate,
         "state": "pending",
@@ -1913,6 +1915,14 @@ fn queue_row(
         "needs_judgment": matches!(kind, "tripwire" | "decision"),
         "blocked_by": item.item.blocked_by,
     })
+}
+
+fn queue_item_type(item: &NormalizedItem) -> &'static str {
+    if item.item_type == "pr" {
+        "pull_request"
+    } else {
+        "issue"
+    }
 }
 
 fn closing_suffix(item: &ClassifiedItem, all: &[ClassifiedItem]) -> String {
@@ -2309,7 +2319,7 @@ fn analyze_merge_gate(
         active_ids.insert(id.clone());
         current.insert(
             id.clone(),
-            json!({"id": id, "title": merge["title"], "age_days": age_days, "aged_out": age_days >= stuck_after_days}),
+            json!({"id": id, "item_type": "pull_request", "title": merge["title"], "age_days": age_days, "aged_out": age_days >= stuck_after_days}),
         );
         if old_faults
             .get(&id)
@@ -2330,6 +2340,7 @@ fn analyze_merge_gate(
                 "repo": repo,
                 "ref": format!("#{merge_number}"),
                 "title": merge["title"],
+                "item_type": "pull_request",
                 "kind": kind,
                 "mandate": {
                     "reason": reason,
@@ -2744,7 +2755,7 @@ fn reconcile_queue(
     }
     for row in &mut result {
         if let Some(item) = current.get(string_field(row, &["id"])) {
-            for field in ["title", "age_days", "aged_out", "blocked_by"] {
+            for field in ["item_type", "title", "age_days", "aged_out", "blocked_by"] {
                 if let Some(value) = item.get(field) {
                     row[field] = value.clone();
                 }
@@ -3804,9 +3815,11 @@ mod tests {
     }
 
     #[test]
-    fn green_conflicted_repair_is_selected_before_delegated_work() {
+    fn pull_requests_are_excluded_from_selection_including_repair_conflicts() {
         let home = tempdir().expect("temporary repair sweep home");
         write_repair_test_config(home.path(), false);
+        let mut dispatchable_pull_request = repair_test_pr(398, "MERGEABLE", &[]);
+        dispatchable_pull_request["checks"] = json!([]);
         append_repair_test_trace(
             home.path(),
             355,
@@ -3822,7 +3835,10 @@ mod tests {
         );
         run_repair_test_sweep(
             home.path(),
-            vec![repair_test_pr(355, "CONFLICTING", &[])],
+            vec![
+                repair_test_pr(355, "CONFLICTING", &[]),
+                dispatchable_pull_request,
+            ],
             vec![repair_test_issue(399)],
             "2026-08-21T01:00:00Z",
         );
@@ -3830,18 +3846,44 @@ mod tests {
         let queue = repair_test_queue(home.path());
         let conflict = repair_test_row(&queue, 355).expect("conflicted repair queue row");
         assert_eq!(conflict["kind"], "drift");
+        assert_eq!(conflict["item_type"], "pull_request");
         let reason = conflict["mandate"]["reason"]
             .as_str()
             .expect("repair conflict reason");
         assert!(reason.starts_with(PR_REPAIR_CONFLICT_REASON_PREFIX));
         assert!(reason.contains("crates/ostrom-store/src/doctor.rs"));
         assert!(reason.contains("src/main.rs"));
+        let pull_request = repair_test_row(&queue, 398).expect("delegated pull-request row");
+        assert_eq!(pull_request["kind"], "moved");
+        assert_eq!(pull_request["item_type"], "pull_request");
         assert_eq!(
             repair_test_row(&queue, 399).expect("delegated queue row")["kind"],
             "moved"
         );
+        assert_eq!(
+            repair_test_row(&queue, 399).expect("delegated queue row")["item_type"],
+            "issue"
+        );
 
         let paths = repair_test_paths(home.path());
+        let (listed, diagnostics) = run_selection(&SelectRequest {
+            working_directory: home.path().to_path_buf(),
+            paths: paths.clone(),
+            action: SelectAction::List,
+            clock: Clock::fixed(
+                "2026-08-21T01:00:30Z"
+                    .parse()
+                    .expect("valid selection time"),
+            ),
+        })
+        .expect("list dispatchable work");
+        assert!(diagnostics.is_empty());
+        let SelectOutcome::Items(listed) = listed else {
+            panic!("issue should be listed");
+        };
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["id"], "placeholder-org/alpha#399");
+
         let (selected, diagnostics) = run_selection(&SelectRequest {
             working_directory: home.path().to_path_buf(),
             paths,
@@ -3855,22 +3897,12 @@ mod tests {
                     .expect("valid selection time"),
             ),
         })
-        .expect("select repair conflict");
+        .expect("select dispatchable issue");
         assert!(diagnostics.is_empty());
         let SelectOutcome::Selected(selected) = selected else {
-            panic!("repair conflict should be selected");
+            panic!("issue should be selected");
         };
-        assert_eq!(selected["id"], "placeholder-org/alpha#355");
-        let selection_trace =
-            read_trace(&repair_test_paths(home.path()).trace_file()).expect("read selection trace");
-        assert!(
-            selection_trace
-                .rows
-                .into_iter()
-                .filter_map(Result::ok)
-                .any(|row| row.kind == "work-ranked"
-                    && row.fact.get("ranking").and_then(Value::as_str) == Some("ci-drift"))
-        );
+        assert_eq!(selected["id"], "placeholder-org/alpha#399");
     }
 
     #[test]
