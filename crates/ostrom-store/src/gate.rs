@@ -8,6 +8,7 @@ use std::{
 
 use ostrom_core::{GateConfig, GateProject, GateSelector, PolicyManifest, sha256_hex};
 use regex::{Regex, RegexBuilder};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
@@ -61,8 +62,9 @@ struct Target<'a> {
     number: u64,
 }
 
-#[derive(Debug)]
-struct Acquisition {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GateReplaySnapshot {
     metadata_ready: bool,
     metadata: Value,
     metadata_error: String,
@@ -82,6 +84,8 @@ struct Acquisition {
     threads_error: String,
     thread_author: String,
 }
+
+type Acquisition = GateReplaySnapshot;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum JudgmentState {
@@ -124,7 +128,7 @@ pub fn run_gate(options: &GateOptions) -> Result<GateOutput, GateError> {
     let mut acquisition = acquire_metadata(metadata_output, target.number);
     acquire_checks(&mut acquisition, &target);
     acquire_paths(&mut acquisition, &target);
-    if config.as_ref().is_some_and(config_needs_diff_content) {
+    if config.as_ref().is_some_and(gate_config_needs_diff_content) {
         acquire_diff_content(&mut acquisition, &target);
     }
     acquire_threads(&mut acquisition, &target);
@@ -311,6 +315,154 @@ fn acquire_metadata(output: Output, expected_number: u64) -> Acquisition {
         threads: Vec::new(),
         threads_error: String::new(),
         thread_author: String::new(),
+    }
+}
+
+/// Complete the gate-only portion of a cutover snapshot from the pull-request
+/// row already acquired by the sweep. Metadata, checks and changed paths are
+/// never fetched a second time; only review threads and, when configured, the
+/// full diff are added to the frozen row.
+pub fn acquire_gate_replay_snapshot(
+    target: &str,
+    metadata: Value,
+    needs_diff_content: bool,
+) -> Result<GateReplaySnapshot, GateError> {
+    let target = parse_target(target)?;
+    let metadata_ready = valid_metadata(&metadata, target.number);
+    let head_sha = metadata
+        .get("headRefOid")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let checks = metadata
+        .get("checks")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let checks_ready = metadata.get("checks").is_some_and(Value::is_array)
+        && metadata.get("checks_unobserved") != Some(&Value::Bool(true));
+    let paths = metadata
+        .get("files")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|file| {
+            file.as_str()
+                .or_else(|| file.get("path").and_then(Value::as_str))
+                .map(str::to_owned)
+        })
+        .collect::<Vec<_>>();
+    let diff_ready = metadata.get("files").is_some_and(Value::is_array);
+    let mut acquisition = GateReplaySnapshot {
+        metadata_ready,
+        metadata,
+        metadata_error: if metadata_ready {
+            String::new()
+        } else {
+            "pull request metadata was incomplete in the sweep snapshot".to_owned()
+        },
+        head_sha,
+        checks_ready,
+        checks,
+        checks_error: if checks_ready {
+            String::new()
+        } else {
+            "checks were not observed in the sweep snapshot".to_owned()
+        },
+        checks_partial_error: String::new(),
+        diff_ready,
+        paths,
+        diff_error: if diff_ready {
+            String::new()
+        } else {
+            "changed paths were not observed in the sweep snapshot".to_owned()
+        },
+        diff_content_ready: false,
+        diff_content: String::new(),
+        diff_content_error: "diff content was not requested".to_owned(),
+        threads_ready: false,
+        threads: Vec::new(),
+        threads_error: String::new(),
+        thread_author: String::new(),
+    };
+    if needs_diff_content {
+        acquire_diff_content(&mut acquisition, &target);
+    }
+    acquire_threads(&mut acquisition, &target);
+    Ok(acquisition)
+}
+
+impl GateReplaySnapshot {
+    /// Name every incomplete acquisition dimension. Replay treats these as a
+    /// coverage gap, never as an unchanged or inconclusive verdict.
+    #[must_use]
+    pub fn gaps(&self, needs_diff_content: bool) -> Vec<String> {
+        let mut gaps = Vec::new();
+        if !self.metadata_ready {
+            gaps.push(format!("metadata: {}", self.metadata_error));
+        }
+        if !self.checks_ready {
+            gaps.push(format!("checks: {}", self.checks_error));
+        }
+        if !self.diff_ready {
+            gaps.push(format!("changed paths: {}", self.diff_error));
+        }
+        if needs_diff_content && !self.diff_content_ready {
+            gaps.push(format!("diff content: {}", self.diff_content_error));
+        }
+        if !self.threads_ready {
+            gaps.push(format!("review threads: {}", self.threads_error));
+        } else if self
+            .metadata
+            .pointer("/author/login")
+            .and_then(Value::as_str)
+            != Some(self.thread_author.as_str())
+        {
+            gaps.push("review threads: pull-request author does not match metadata".to_owned());
+        }
+        gaps
+    }
+
+    #[must_use]
+    pub fn metadata(&self) -> &Value {
+        &self.metadata
+    }
+
+    /// The snapshot format repeats the sweep row so a gate acquisition is
+    /// independently replayable. Refuse if those copies disagree on anything
+    /// either resolver reads; otherwise a hand-edited fixture could recreate
+    /// the same live-vs-live race the frozen snapshot exists to remove.
+    #[must_use]
+    pub fn matches_sweep_row(&self, row: &Value) -> bool {
+        let fields = [
+            "number",
+            "title",
+            "author",
+            "headRefOid",
+            "labels",
+            "closingIssuesReferences",
+            "mergeable",
+            "isDraft",
+            "files",
+            "checks",
+        ];
+        fields
+            .iter()
+            .all(|field| self.metadata.get(field) == row.get(field))
+            && self.metadata.get("checks") == Some(&Value::Array(self.checks.clone()))
+            && self.paths
+                == self
+                    .metadata
+                    .get("files")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|file| {
+                        file.as_str()
+                            .or_else(|| file.get("path").and_then(Value::as_str))
+                            .map(str::to_owned)
+                    })
+                    .collect::<Vec<_>>()
     }
 }
 
@@ -574,7 +726,7 @@ pub(crate) fn is_merge_evidence(record: &Value) -> bool {
     }
 }
 
-pub(crate) fn load_gate_config(paths: &OstromPaths, cwd: &Path) -> Result<GateConfig, String> {
+pub fn load_gate_config(paths: &OstromPaths, cwd: &Path) -> Result<GateConfig, String> {
     load_gate_config_with_source(paths, cwd).map(|(config, _)| config)
 }
 
@@ -777,12 +929,48 @@ fn truncate_error(error: &str) -> String {
     error.replace('\n', " ").chars().take(500).collect()
 }
 
-fn config_needs_diff_content(config: &GateConfig) -> bool {
+#[must_use]
+pub fn gate_config_needs_diff_content(config: &GateConfig) -> bool {
     config
         .bounce_all
         .iter()
         .chain(config.projects.iter().flat_map(|project| &project.bounce))
         .any(|selector| selector.as_str().starts_with("substance:"))
+}
+
+/// Evaluate the legacy merge-gate policy without exceptions, journaling, or
+/// any live reads. The supplied acquisition is the sole evidence source.
+pub fn evaluate_gate_replay(
+    config: &GateConfig,
+    target: &str,
+    acquisition: &GateReplaySnapshot,
+) -> Result<&'static str, GateError> {
+    let target = parse_target(target)?;
+    if config
+        .projects
+        .iter()
+        .filter(|project| project.repo.as_str() == target.repo)
+        .count()
+        != 1
+    {
+        return Ok("inconclusive");
+    }
+    let mut conditions = evaluate_conditions(config, acquisition, &target);
+    apply_shipped_manifest_bounce(&mut conditions, acquisition);
+    Ok(aggregate(&conditions))
+}
+
+/// Conditions that are policy-independent in the current gate implementation.
+/// A manifest verdict is combined with this value so draft, mergeability and
+/// review-thread protections remain part of both sides of the replay.
+#[must_use]
+pub fn gate_replay_invariant_verdict(acquisition: &GateReplaySnapshot) -> &'static str {
+    let conditions = [
+        evaluate_mergeable(acquisition),
+        evaluate_draft(acquisition),
+        evaluate_threads(acquisition),
+    ];
+    aggregate(&conditions)
 }
 
 fn unavailable_conditions(reason: &str) -> Vec<Value> {

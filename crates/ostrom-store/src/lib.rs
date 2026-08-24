@@ -40,7 +40,11 @@ pub use dispatch::{DispatchError, DispatchOutcome, DispatchRequest, run_dispatch
 pub use environment::{ENVIRONMENT_VARIABLES, EnvironmentClass, EnvironmentVariable};
 pub use event_store::JsonlEventStore;
 pub use file_store::JsonlSweepStore;
-pub use gate::{GateError, GateOptions, GateOutput, run_gate};
+pub use gate::{
+    GateError, GateOptions, GateOutput, GateReplaySnapshot, acquire_gate_replay_snapshot,
+    evaluate_gate_replay, gate_config_needs_diff_content, gate_replay_invariant_verdict,
+    load_gate_config, run_gate,
+};
 pub use hooks::{DigestOptions, HookOutput, render_constitution, render_digest};
 pub use implement::{ImplementError, ImplementRequest, run_implement};
 pub use lease::{
@@ -83,7 +87,7 @@ pub use sweep::{
     PublishTarget, RepositorySnapshot, RosterCoverageFinding, SweepError, SweepFixture, SweepMode,
     SweepOptions, SweepOutcome, acquire_org_from_github, acquire_org_from_github_with_faults,
     encode_org_snapshots, encode_org_snapshots_with_faults, load_config, load_config_or_defaults,
-    run_sweep, validate_roster_coverage,
+    run_sweep, run_sweep_with_mirror, validate_roster_coverage,
 };
 pub use trace::{
     MalformedTraceRow, TraceActionError, TraceAppend, TraceFactRecord, TraceRead, TraceView,

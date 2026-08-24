@@ -40,6 +40,7 @@ use ostrom_store::{
     run_selection, run_sweep, run_sweep_parity, validate_lease_name, validate_work_order_file,
 };
 
+mod cutover_replay;
 mod loop_supervisor;
 mod operation_dispatch;
 mod policy_manifest;
@@ -438,6 +439,24 @@ enum ParityCommand {
         /// Queue bytes recorded from the retired shell implementation.
         #[arg(long)]
         recorded_queue: PathBuf,
+    },
+    /// Produce all three empty-diff gates for the one-step policy cutover.
+    Cutover {
+        /// Directory containing the legacy policy and loop surfaces.
+        #[arg(long)]
+        legacy: PathBuf,
+        /// Explicit composed manifest to compare with the legacy surfaces.
+        #[arg(long)]
+        manifest: PathBuf,
+        /// Previously frozen acquisition to replay without live GitHub reads.
+        #[arg(long, conflicts_with = "snapshot_output")]
+        snapshot: Option<PathBuf>,
+        /// Capture one live acquisition here before evaluating either policy.
+        #[arg(long, conflicts_with = "snapshot")]
+        snapshot_output: Option<PathBuf>,
+        /// Observation clock shared by acquisition and both evaluations.
+        #[arg(long)]
+        started_at: Option<String>,
     },
 }
 
@@ -983,6 +1002,41 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
                 std::process::exit(1);
+            }
+        }
+        Command::Parity {
+            command:
+                ParityCommand::Cutover {
+                    legacy,
+                    manifest,
+                    snapshot,
+                    snapshot_output,
+                    started_at,
+                },
+        } => {
+            let started_at = resolve_started_at(started_at.as_deref(), &clock)?;
+            let cwd = env::current_dir()?;
+            let plugin_root = environment::OSTROM_PLUGIN_ROOT
+                .value_os()
+                .or_else(|| environment::CLAUDE_PLUGIN_ROOT.value_os())
+                .map_or_else(|| cwd.join("plugins/ostrom"), PathBuf::from);
+            let options = cutover_replay::CutoverReplayOptions {
+                scratch_root: cutover_replay::scratch_home_from_environment()?,
+                legacy,
+                manifest,
+                snapshot,
+                snapshot_output,
+                executable: env::current_exe()?,
+                plugin_root,
+                started_at,
+            };
+            match cutover_replay::run(&options) {
+                Ok(output) => io::stdout().write_all(output.as_bytes())?,
+                Err(cutover_replay::CutoverReplayError::NonEmpty(output)) => {
+                    io::stdout().write_all(output.as_bytes())?;
+                    std::process::exit(1);
+                }
+                Err(error) => return Err(error.into()),
             }
         }
         Command::Sweep {

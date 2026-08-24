@@ -256,7 +256,7 @@ pub fn run_sweep(options: &SweepOptions) -> Result<SweepOutcome, SweepError> {
     run_sweep_with_mirror(options).map(|(outcome, _mirror)| outcome)
 }
 
-pub(crate) fn run_sweep_with_mirror(
+pub fn run_sweep_with_mirror(
     options: &SweepOptions,
 ) -> Result<(SweepOutcome, Vec<RepositorySnapshot>), SweepError> {
     let mut minter = GitHubInstallationTokenMinter;
@@ -665,7 +665,8 @@ fn acquire_by_organization(
                 continue;
             }
         };
-        let output = Command::new(&options.executable)
+        let mut command = Command::new(&options.executable);
+        command
             .args([
                 "sweep",
                 "--inner-org",
@@ -677,7 +678,15 @@ fn acquire_by_organization(
             ])
             .env("GH_TOKEN", token.expose())
             .env("GITHUB_TOKEN", token.expose())
-            .current_dir(&options.working_directory)
+            .current_dir(&options.working_directory);
+        // A caller such as cutover replay can deliberately supply a collapsed
+        // scratch home without changing the parent process environment. Keep
+        // the inner acquisition on that same scratch policy/state root. Normal
+        // XDG operation has distinct roots and continues to inherit discovery.
+        if options.paths.config == options.paths.state {
+            command.env("OSTROM_HOME", &options.paths.config);
+        }
+        let output = command
             .output()
             .map_err(|error| SweepError::Acquisition(error.to_string()))?;
         if !output.status.success() {
@@ -748,7 +757,7 @@ fn acquire_repository(
         "--limit",
         "200",
         "--json",
-        "number,title,body,labels,createdAt,updatedAt,url,isDraft,reviewDecision,closingIssuesReferences,files,state,mergedAt,headRefOid,mergeable",
+        "number,title,body,author,labels,createdAt,updatedAt,url,isDraft,reviewDecision,closingIssuesReferences,files,state,mergedAt,headRefOid,mergeable",
     ])?;
     let mut open_prs = exhaustive_array(open_prs, repo_name, "open pull-request query")?;
     let mut warnings = Vec::new();
