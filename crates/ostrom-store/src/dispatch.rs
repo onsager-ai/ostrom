@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeSet,
     env,
-    ffi::{OsStr, OsString},
+    ffi::OsStr,
     fs,
     fs::OpenOptions,
     io::Write,
@@ -18,7 +18,8 @@ use ostrom_core::{
 use serde_json::{Map, Value, json};
 
 use crate::{
-    Clock, LeaseRecord, OstromPaths, TraceAppend,
+    AgentRegistry, Clock, CodexHarness, DEFAULT_IMPLEMENTER_RUNNER, LeaseRecord, OstromPaths,
+    RunnerLaunch, TraceAppend,
     app_token::{
         AuthenticatedCommandError, GitHubInstallationTokenMinter, InstallationTokenMinter,
         ScopedAppTokenRequest, authenticated_output,
@@ -128,8 +129,28 @@ pub fn run_dispatch(request: &DispatchRequest) -> Result<DispatchOutcome, Dispat
     run_dispatch_with_minter(request, &mut minter)
 }
 
+pub fn run_dispatch_with_registry(
+    request: &DispatchRequest,
+    registry: &AgentRegistry,
+    runner_name: &str,
+) -> Result<DispatchOutcome, DispatchError> {
+    let mut minter = GitHubInstallationTokenMinter;
+    run_dispatch_with_registry_and_minter(request, registry, runner_name, &mut minter)
+}
+
 fn run_dispatch_with_minter(
     request: &DispatchRequest,
+    minter: &mut dyn InstallationTokenMinter,
+) -> Result<DispatchOutcome, DispatchError> {
+    let registry = AgentRegistry::core(CodexHarness::from_environment())
+        .expect("the shipped Codex harness registration is valid");
+    run_dispatch_with_registry_and_minter(request, &registry, DEFAULT_IMPLEMENTER_RUNNER, minter)
+}
+
+fn run_dispatch_with_registry_and_minter(
+    request: &DispatchRequest,
+    registry: &AgentRegistry,
+    runner_name: &str,
     minter: &mut dyn InstallationTokenMinter,
 ) -> Result<DispatchOutcome, DispatchError> {
     if !request.order_file.is_file() {
@@ -230,30 +251,28 @@ fn run_dispatch_with_minter(
     }
     reject_closing_pull_requests(&mut context, minter)?;
 
-    let resolved_codex = resolve_codex(&context)?;
-    let resolved_node = resolve_node(&context, &resolved_codex)?;
-    let resolved_ostrom = resolve_ostrom(&context)?;
-    let inherited_path = environment::PATH
-        .value()
-        .unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".to_owned());
-    let node_dir = resolved_node.parent().unwrap_or_else(|| Path::new("."));
-    let unit_path = format!("{}:{inherited_path}", node_dir.display());
-    let executable = Command::new(&resolved_codex)
-        .arg("--version")
-        .env("PATH", &unit_path)
-        .output()
-        .is_ok_and(|output| output.status.success());
-    if !executable {
-        let _ = append_failure(&context, "codex-unavailable", FailureDetail::default());
-        return Err(DispatchError::new(
+    let runner_launch = registry.prepare(runner_name).map_err(|fault| {
+        let reason = if runner_name == DEFAULT_IMPLEMENTER_RUNNER {
+            "codex-unavailable"
+        } else {
+            "implementer-harness-unavailable"
+        };
+        let _ = append_failure(&context, reason, FailureDetail::default());
+        DispatchError::new(
             1,
             format!(
-                "ostrom dispatch: Codex is unavailable: {} cannot execute with resolved Node {}",
-                resolved_codex.display(),
-                resolved_node.display()
+                "ostrom dispatch: {}",
+                fault
+                    .detail()
+                    .unwrap_or(if fault.name() == "unregistered_harness" {
+                        "implementer harness is not registered"
+                    } else {
+                        "implementer harness is unavailable"
+                    })
             ),
-        ));
-    }
+        )
+    })?;
+    let resolved_ostrom = resolve_ostrom(&context)?;
 
     // Reap before acquiring this item's lease. If an old order is genuinely
     // still live, its possibly expired lease must not be replaced merely to
@@ -315,9 +334,9 @@ fn run_dispatch_with_minter(
     let result = after_lease(
         &context,
         config.as_ref(),
-        &resolved_codex,
+        runner_name,
+        &runner_launch,
         &resolved_ostrom,
-        &unit_path,
         &mut lease,
         minter,
     );
@@ -330,9 +349,9 @@ fn run_dispatch_with_minter(
 fn after_lease(
     context: &DispatchContext<'_>,
     config: Option<&MandateConfig>,
-    resolved_codex: &Path,
+    runner_name: &str,
+    runner_launch: &RunnerLaunch,
     resolved_ostrom: &Path,
-    unit_path: &str,
     lease: &mut LeaseGuard,
     minter: &mut dyn InstallationTokenMinter,
 ) -> Result<DispatchOutcome, DispatchError> {
@@ -514,46 +533,48 @@ fn after_lease(
     }
     let started = Instant::now();
     let mut launch = Command::new(systemd);
-    launch
-        .args([
-            "--user",
-            "--unit",
-            &context.unit_name,
-            "--description",
-            &format!("Ostrom implementer {}", context.order.item_id),
-            "--collect",
-            "--no-block",
-            "--property",
-            "RuntimeMaxSec=infinity",
-            "--property",
-            "KillMode=control-group",
-            "--setenv",
-            &state_environment,
-            "--setenv",
-            &format!(
-                "CLAUDE_PLUGIN_ROOT={}",
-                context.request.plugin_root.display()
-            ),
-            "--setenv",
-            &format!("MANDATE_DAILY_CAP_USD={}", render_number(daily_cap)),
-            "--setenv",
-            &format!("MANDATE_MAX_IMPLEMENTERS={max_implementers}"),
-            "--setenv",
-            &format!("MANDATE_MAX_IMPLEMENTERS_PER_REPOSITORY={max_per_repository}"),
-            "--setenv",
-            &format!("MANDATE_DISPATCH_BACKEND={}", context.backend),
-            "--setenv",
-            &format!("MANDATE_LEASE_NAME={lease_name}"),
-            "--setenv",
-            &format!("CODEX_BIN={}", resolved_codex.display()),
-            "--setenv",
-            &format!("PATH={unit_path}"),
-        ])
-        .arg(resolved_ostrom)
-        .arg("implement");
+    launch.args([
+        "--user",
+        "--unit",
+        &context.unit_name,
+        "--description",
+        &format!("Ostrom implementer {}", context.order.item_id),
+        "--collect",
+        "--no-block",
+        "--property",
+        "RuntimeMaxSec=infinity",
+        "--property",
+        "KillMode=control-group",
+        "--setenv",
+        &state_environment,
+        "--setenv",
+        &format!(
+            "CLAUDE_PLUGIN_ROOT={}",
+            context.request.plugin_root.display()
+        ),
+        "--setenv",
+        &format!("MANDATE_DAILY_CAP_USD={}", render_number(daily_cap)),
+        "--setenv",
+        &format!("MANDATE_MAX_IMPLEMENTERS={max_implementers}"),
+        "--setenv",
+        &format!("MANDATE_MAX_IMPLEMENTERS_PER_REPOSITORY={max_per_repository}"),
+        "--setenv",
+        &format!("MANDATE_DISPATCH_BACKEND={}", context.backend),
+        "--setenv",
+        &format!("MANDATE_LEASE_NAME={lease_name}"),
+    ]);
+    for (name, value) in runner_launch.environment() {
+        launch.arg("--setenv").arg(format!(
+            "{}={}",
+            name.to_string_lossy(),
+            value.to_string_lossy()
+        ));
+    }
+    launch.arg(resolved_ostrom).arg("implement");
     let status = launch
         .arg(&context.request.order_file)
         .arg(&context.unit_name)
+        .arg(runner_name)
         .status();
     if !status.is_ok_and(|status| status.success()) {
         let _ = append_failure(
@@ -1121,40 +1142,6 @@ fn reject_closing_pull_requests(
     Ok(())
 }
 
-fn resolve_codex(context: &DispatchContext<'_>) -> Result<PathBuf, DispatchError> {
-    let command = environment::CODEX_BIN
-        .value_os()
-        .map_or_else(|| "codex".into(), PathBuf::from);
-    let resolved = if command.components().count() > 1 {
-        absolute_executable(&command)
-    } else {
-        find_on_path(&command).or_else(|| find_in_nvm(&command))
-    };
-    resolved.ok_or_else(|| {
-        let _ = append_failure(context, "codex-unavailable", FailureDetail::default());
-        DispatchError::new(
-            1,
-            format!(
-                "ostrom dispatch: Codex is unavailable: {} was not found",
-                command.display()
-            ),
-        )
-    })
-}
-
-fn resolve_node(context: &DispatchContext<'_>, codex: &Path) -> Result<PathBuf, DispatchError> {
-    NodeResolver::from_environment().resolve().ok_or_else(|| {
-        let _ = append_failure(context, "codex-unavailable", FailureDetail::default());
-        DispatchError::new(
-            1,
-            format!(
-                "ostrom dispatch: Codex is unavailable: Node.js could not be resolved for {}",
-                codex.display()
-            ),
-        )
-    })
-}
-
 fn resolve_ostrom(context: &DispatchContext<'_>) -> Result<PathBuf, DispatchError> {
     let override_path = environment::MANDATE_OSTROM_BIN.value_os();
     let command = override_path
@@ -1203,170 +1190,6 @@ fn find_on_path(command: &Path) -> Option<PathBuf> {
 
 fn find_on_path_in(command: &Path, path: Option<&OsStr>) -> Option<PathBuf> {
     env::split_paths(path?).find_map(|directory| absolute_executable(&directory.join(command)))
-}
-
-fn find_in_nvm(command: &Path) -> Option<PathBuf> {
-    let home = nonempty_env_path(environment::HOME);
-    let nvm = env_path_or_home(environment::NVM_DIR, home.as_deref(), ".nvm")?;
-    find_in_nvm_root(command, &nvm)
-}
-
-fn find_in_nvm_root(command: &Path, nvm: &Path) -> Option<PathBuf> {
-    let default = fs::read_to_string(nvm.join("alias/default"))
-        .ok()?
-        .lines()
-        .next()?
-        .chars()
-        .filter(|character| !character.is_whitespace())
-        .collect::<String>();
-    let version = default.strip_prefix('v').unwrap_or(&default);
-    let parts = version.split('.').collect::<Vec<_>>();
-    if parts.len() == 3 && parts.iter().all(|part| is_ascii_number(part)) {
-        return absolute_executable(
-            &nvm.join("versions/node")
-                .join(format!("v{version}"))
-                .join("bin")
-                .join(command),
-        );
-    }
-    if parts.len() != 1 || !is_ascii_number(version) {
-        return None;
-    }
-
-    let prefix = format!("v{version}.");
-    let mut candidates = fs::read_dir(nvm.join("versions/node"))
-        .ok()?
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name();
-            let suffix = name.to_str()?.strip_prefix(&prefix)?;
-            let (minor, patch) = suffix.split_once('.')?;
-            if patch.contains('.') || !is_ascii_number(minor) || !is_ascii_number(patch) {
-                return None;
-            }
-            Some((
-                entry.path().join("bin").join(command),
-                minor.parse::<u64>().ok()?,
-                patch.parse::<u64>().ok()?,
-            ))
-        })
-        .collect::<Vec<_>>();
-    candidates.sort_by(|left, right| left.0.cmp(&right.0));
-
-    let mut best = None;
-    let mut best_version = None;
-    for (candidate, minor, patch) in candidates {
-        if best_version.is_none_or(|current| (minor, patch) > current)
-            && let Some(candidate) = absolute_executable(&candidate)
-        {
-            best = Some(candidate);
-            best_version = Some((minor, patch));
-        }
-    }
-    best
-}
-
-fn is_ascii_number(value: &str) -> bool {
-    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
-}
-
-fn nonempty_env_path(variable: environment::EnvironmentVariable) -> Option<PathBuf> {
-    variable
-        .value_os()
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-}
-
-fn env_path_or_home(
-    variable: environment::EnvironmentVariable,
-    home: Option<&Path>,
-    home_suffix: &str,
-) -> Option<PathBuf> {
-    nonempty_env_path(variable).or_else(|| home.map(|path| path.join(home_suffix)))
-}
-
-#[derive(Debug)]
-struct NodeResolver {
-    path: Option<OsString>,
-    nvm_dir: Option<PathBuf>,
-    fnm_dirs: Vec<PathBuf>,
-    volta_home: Option<PathBuf>,
-    asdf_data_dir: Option<PathBuf>,
-    standalone: Vec<PathBuf>,
-}
-
-impl NodeResolver {
-    fn from_environment() -> Self {
-        let home = nonempty_env_path(environment::HOME);
-        let mut fnm_dirs = Vec::new();
-        if let Some(directory) =
-            env_path_or_home(environment::FNM_DIR, home.as_deref(), ".local/share/fnm")
-        {
-            fnm_dirs.push(directory);
-        }
-        if let Some(home) = &home {
-            fnm_dirs.push(home.join(".fnm"));
-        }
-
-        let standalone = environment::OSTROM_NODE_FALLBACKS.value_os().map_or_else(
-            || {
-                let mut paths = vec![
-                    PathBuf::from("/usr/local/bin/node"),
-                    PathBuf::from("/opt/homebrew/bin/node"),
-                ];
-                if let Some(home) = &home {
-                    paths.push(home.join(".local/bin/node"));
-                }
-                paths
-            },
-            |paths| {
-                paths
-                    .to_string_lossy()
-                    .split_whitespace()
-                    .map(PathBuf::from)
-                    .collect()
-            },
-        );
-
-        Self {
-            path: environment::PATH.value_os(),
-            nvm_dir: env_path_or_home(environment::NVM_DIR, home.as_deref(), ".nvm"),
-            fnm_dirs,
-            volta_home: env_path_or_home(environment::VOLTA_HOME, home.as_deref(), ".volta"),
-            asdf_data_dir: env_path_or_home(environment::ASDF_DATA_DIR, home.as_deref(), ".asdf"),
-            standalone,
-        }
-    }
-
-    fn resolve(&self) -> Option<PathBuf> {
-        let command = Path::new("node");
-        find_on_path_in(command, self.path.as_deref())
-            .or_else(|| {
-                self.nvm_dir
-                    .as_deref()
-                    .and_then(|directory| find_in_nvm_root(command, directory))
-            })
-            .or_else(|| {
-                self.fnm_dirs.iter().find_map(|directory| {
-                    absolute_executable(&directory.join("aliases/default/bin/node"))
-                })
-            })
-            .or_else(|| {
-                self.volta_home
-                    .as_deref()
-                    .and_then(|directory| absolute_executable(&directory.join("bin/node")))
-            })
-            .or_else(|| {
-                self.asdf_data_dir
-                    .as_deref()
-                    .and_then(|directory| absolute_executable(&directory.join("shims/node")))
-            })
-            .or_else(|| {
-                self.standalone
-                    .iter()
-                    .find_map(|candidate| absolute_executable(candidate))
-            })
-    }
 }
 
 fn positive_usize_env(
@@ -1754,10 +1577,8 @@ mod tests {
     use ostrom_core::WorkOrder;
     use serde_json::json;
 
-    use super::{
-        NodeResolver, absolute_executable, describe_unparseable_listing, find_in_nvm_root,
-        has_unpublished_tree,
-    };
+    use super::{absolute_executable, describe_unparseable_listing, has_unpublished_tree};
+    use crate::agent::{NodeResolver, find_in_nvm_root};
     use crate::work_order::implementer_lease_ttl;
 
     fn git(path: &Path, arguments: &[&str]) {

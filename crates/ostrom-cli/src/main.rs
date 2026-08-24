@@ -14,9 +14,9 @@ use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use directories::BaseDirs;
 use ostrom_checks::{
-    ActionFault, ActionRegistry, DoctorOptions, PreparedCheck, check_shell_retirement,
-    check_skill_version_bump, generate_operation_settings, render_loop_units, run_doctor,
-    run_doctor_check,
+    ActionFault, ActionRegistry, ClaudeHarness, DoctorOptions, PreparedCheck,
+    check_shell_retirement, check_skill_version_bump, generate_operation_settings,
+    render_loop_units, run_doctor, run_doctor_check,
 };
 use ostrom_core::{
     CHECK_STORE_SCHEMA_VERSION, CHECKS_VERSION, Catalogue, CatalogueEnumeration,
@@ -25,19 +25,20 @@ use ostrom_core::{
     ResolvedLoopCeilings, SelectorPrefix,
 };
 use ostrom_store::{
-    AssessmentHarness, AuditOptions, Clock, DigestOptions, DispatchOutcome, DispatchRequest,
-    ExecutableAssessmentDeriver, GateError, GateOptions, HarnessAssessmentDeriver,
-    ImplementRequest, JsonlCheckStore, MigrationOutcome, OstromPaths, PassRequest, PassRole,
-    PlanOptions, PublishDestination, PublishTarget, QueueDecision, ReplayOptions, SelectAction,
-    SelectError, SelectOutcome, SelectRequest, SignalFlags, SweepError, SweepMode, SweepOptions,
-    SweepParityOptions, TraceAppend, TraceView, UnavailableAssessmentDeriver, acquire_lease,
-    acquire_org_from_github_with_faults, append_trace_checked, audit, branch_name,
-    clear_work_order, create_work_order, credential_output, decide_queue_item,
-    encode_org_snapshots_with_faults, encode_selection, environment, finalize_exited_implementer,
-    grant_excuse, item_hash, lease_status, lint_queue_state, list_excuses, list_queue_json,
-    local_drift, migrate, read_trace_json, release_lease, render_constitution, render_digest,
-    replay, run_dispatch, run_gate, run_implement, run_pass, run_plan, run_repair_prs,
-    run_selection, run_sweep, run_sweep_parity, validate_lease_name, validate_work_order_file,
+    AgentRegistry, AssessmentHarness, AuditOptions, Clock, CodexHarness, DigestOptions,
+    DispatchOutcome, DispatchRequest, ExecutableAssessmentDeriver, GateError, GateOptions,
+    HarnessAssessmentDeriver, ImplementRequest, JsonlCheckStore, MigrationOutcome, OstromPaths,
+    PassRequest, PassRole, PlanOptions, PublishDestination, PublishTarget, QueueDecision,
+    ReplayOptions, SelectAction, SelectError, SelectOutcome, SelectRequest, SignalFlags,
+    SweepError, SweepMode, SweepOptions, SweepParityOptions, TraceAppend, TraceView,
+    UnavailableAssessmentDeriver, acquire_lease, acquire_org_from_github_with_faults,
+    append_trace_checked, audit, branch_name, clear_work_order, create_work_order,
+    credential_output, decide_queue_item, encode_org_snapshots_with_faults, encode_selection,
+    environment, finalize_exited_implementer, grant_excuse, item_hash, lease_status,
+    lint_queue_state, list_excuses, list_queue_json, local_drift, migrate, read_trace_json,
+    release_lease, render_constitution, render_digest, replay, run_dispatch_with_registry,
+    run_gate, run_implement_with_registry, run_pass, run_plan, run_repair_prs, run_selection,
+    run_sweep, run_sweep_parity, validate_lease_name, validate_work_order_file,
 };
 
 mod cutover_replay;
@@ -185,6 +186,8 @@ enum Command {
     Implement {
         work_order_file: PathBuf,
         unit_name: String,
+        #[arg(default_value = ostrom_store::DEFAULT_IMPLEMENTER_RUNNER)]
+        runner_name: String,
     },
     #[command(name = "__pass-worker", hide = true)]
     PassWorker {
@@ -195,6 +198,7 @@ enum Command {
     ImplementWorker {
         work_order_file: PathBuf,
         unit_name: String,
+        runner_name: String,
         supervisor_pid: u32,
     },
     #[command(name = "__loop-worker", hide = true)]
@@ -829,11 +833,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Implement {
             work_order_file,
             unit_name,
+            runner_name,
         } => {
             let arguments = [
                 "__implement-worker".into(),
                 work_order_file.clone().into_os_string(),
                 unit_name.clone().into(),
+                runner_name.into(),
             ];
             supervise(&arguments, Some((&work_order_file, &unit_name)), &clock)
         }
@@ -844,8 +850,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::ImplementWorker {
             work_order_file,
             unit_name,
+            runner_name,
             supervisor_pid,
-        } => run_implement_worker(work_order_file, unit_name, supervisor_pid, clock),
+        } => run_implement_worker(
+            work_order_file,
+            unit_name,
+            runner_name,
+            supervisor_pid,
+            clock,
+        ),
         Command::Dispatch { arguments } => {
             run_dispatch_command(arguments, clock);
         }
@@ -2249,15 +2262,7 @@ fn run_pass_worker(role: CliPassRole, supervisor_pid: u32, clock: Clock) -> ! {
         eprintln!("ostrom: could not install signal handlers: {error}");
         std::process::exit(1);
     });
-    let claude_bin = environment::CLAUDE_BIN.value_os().map_or_else(
-        || {
-            BaseDirs::new().map_or_else(
-                || PathBuf::from("claude"),
-                |dirs| dirs.home_dir().join(".local/bin/claude"),
-            )
-        },
-        PathBuf::from,
-    );
+    let claude_bin = default_claude_bin();
     let request = PassRequest {
         paths: compatible_command_paths(),
         working_directory: env::current_dir().unwrap_or_else(|error| {
@@ -2281,9 +2286,35 @@ fn run_pass_worker(role: CliPassRole, supervisor_pid: u32, clock: Clock) -> ! {
     }
 }
 
+fn default_claude_bin() -> PathBuf {
+    environment::CLAUDE_BIN.value_os().map_or_else(
+        || {
+            BaseDirs::new().map_or_else(
+                || PathBuf::from("claude"),
+                |dirs| dirs.home_dir().join(".local/bin/claude"),
+            )
+        },
+        PathBuf::from,
+    )
+}
+
+fn core_agent_registry() -> AgentRegistry {
+    let mut registry = AgentRegistry::core(ClaudeHarness::new(
+        default_claude_bin(),
+        "claude-cli",
+        "default",
+    ))
+    .expect("the shipped Claude harness registration is valid");
+    registry
+        .register(CodexHarness::from_environment())
+        .expect("the shipped Codex harness registration is valid");
+    registry
+}
+
 fn run_implement_worker(
     work_order_file: PathBuf,
     unit_name: String,
+    runner_name: String,
     supervisor_pid: u32,
     clock: Clock,
 ) -> ! {
@@ -2309,7 +2340,8 @@ fn run_implement_worker(
         supervisor_pid: Some(supervisor_pid),
         clock,
     };
-    match run_implement(&request) {
+    let registry = core_agent_registry();
+    match run_implement_with_registry(&request, &registry, &runner_name) {
         Ok(url) => {
             println!("{url}");
             std::process::exit(0);
@@ -2341,7 +2373,12 @@ fn run_dispatch_command(arguments: Vec<String>, clock: Clock) -> ! {
         order_file: PathBuf::from(order_file),
         clock,
     };
-    match run_dispatch(&request) {
+    let registry = core_agent_registry();
+    match run_dispatch_with_registry(
+        &request,
+        &registry,
+        ostrom_store::DEFAULT_IMPLEMENTER_RUNNER,
+    ) {
         Ok(DispatchOutcome::Started(unit)) => {
             println!("{unit}");
             std::process::exit(0);

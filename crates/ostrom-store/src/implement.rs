@@ -6,11 +6,10 @@
 //! remain outside its sandbox.
 
 use std::{
-    env, fs,
+    fs,
     fs::File,
     path::{Path, PathBuf},
-    process::{Child, Command, ExitStatus, Output, Stdio},
-    thread,
+    process::{Command, ExitStatus, Output, Stdio},
     time::Duration,
 };
 
@@ -21,13 +20,16 @@ use serde_json::{Map, Value, json};
 use thiserror::Error;
 
 use crate::{
-    Clock, LeaseActionError, OstromPaths, OwnedLease, SignalFlags, TraceAppend,
+    AgentRegistry, Clock, CodexHarness, ImplementerRunRequest, LeaseActionError, OstromPaths,
+    OwnedLease, RunOutcome, RunRequest, SignalFlags, TraceAppend,
     app_token::{
         AuthenticatedCommandError, GitHubInstallationTokenMinter, InstallationTokenMinter,
         ScopedAppTokenRequest, authenticated_output,
     },
     append_trace, environment, load_config_or_defaults,
 };
+
+pub const DEFAULT_IMPLEMENTER_RUNNER: &str = "agent/codex";
 
 #[derive(Debug, Clone)]
 pub struct ImplementRequest {
@@ -252,8 +254,28 @@ pub fn run_implement(request: &ImplementRequest) -> Result<String, ImplementErro
     run_implement_with_minter(request, &mut minter)
 }
 
+pub fn run_implement_with_registry(
+    request: &ImplementRequest,
+    registry: &AgentRegistry,
+    runner_name: &str,
+) -> Result<String, ImplementError> {
+    let mut minter = GitHubInstallationTokenMinter;
+    run_implement_with_registry_and_minter(request, registry, runner_name, &mut minter)
+}
+
 fn run_implement_with_minter(
     request: &ImplementRequest,
+    minter: &mut dyn InstallationTokenMinter,
+) -> Result<String, ImplementError> {
+    let registry = AgentRegistry::core(CodexHarness::from_environment())
+        .expect("the shipped Codex harness registration is valid");
+    run_implement_with_registry_and_minter(request, &registry, DEFAULT_IMPLEMENTER_RUNNER, minter)
+}
+
+fn run_implement_with_registry_and_minter(
+    request: &ImplementRequest,
+    registry: &AgentRegistry,
+    runner_name: &str,
     minter: &mut dyn InstallationTokenMinter,
 ) -> Result<String, ImplementError> {
     // Dispatch passes the exact lease name so cleanup can be armed before the
@@ -327,7 +349,7 @@ fn run_implement_with_minter(
         conflicted_paths: Vec::new(),
         withheld_paths: Vec::new(),
     };
-    match implement_inner(request, &mut guard, minter) {
+    match implement_inner(request, &mut guard, registry, runner_name, minter) {
         Ok(url) => {
             guard.pr_url = Some(url.clone());
             guard.append_terminal("work-completed", None)?;
@@ -358,22 +380,21 @@ fn adopt_implementer_lease(
 fn implement_inner(
     request: &ImplementRequest,
     guard: &mut TerminalGuard,
+    registry: &AgentRegistry,
+    runner_name: &str,
     minter: &mut dyn InstallationTokenMinter,
 ) -> Result<String, ImplementError> {
-    let _ = termination_grace()?;
-    check_interrupt(request, guard, None)?;
+    let termination_grace = termination_grace()?;
+    check_interrupt_before_spawn(request, guard)?;
     let config = load_config_or_defaults(&request.paths, &request.working_directory).ok();
     let source = resolve_source_repository(&guard.order.repository, config.as_ref())?;
     guard.source_repository = Some(source.clone());
 
-    let codex = environment::CODEX_BIN
-        .value_os()
-        .map_or_else(|| PathBuf::from("codex"), PathBuf::from);
-    if !command_available(&codex) {
+    if registry.get(runner_name).is_none() {
         return Err(ImplementError::new(
             1,
-            "codex-unavailable",
-            format!("Codex is unavailable: {}", codex.display()),
+            "implementer-harness-unavailable",
+            format!("implementer harness is not registered: {runner_name}"),
         ));
     }
     let default_branch = default_branch_result(gh_text(
@@ -434,7 +455,7 @@ fn implement_inner(
         &default_branch,
     )?;
     guard.worktree = Some(worktree.clone());
-    check_interrupt(request, guard, None)?;
+    check_interrupt_before_spawn(request, guard)?;
     let preexisting_commits = git_text(
         &worktree,
         &[
@@ -460,44 +481,64 @@ fn implement_inner(
         .map_err(|error| ImplementError::new(1, "prompt-write-failed", error.to_string()))?;
     let events = File::create(&events_file)
         .map_err(|error| ImplementError::new(1, "event-stream-create-failed", error.to_string()))?;
-    let errors = events
+    let _errors = events
         .try_clone()
         .map_err(|error| ImplementError::new(1, "event-stream-create-failed", error.to_string()))?;
     guard.events_file = Some(events_file.clone());
-    let input = File::open(&prompt_file)
+    let _input = File::open(&prompt_file)
         .map_err(|error| ImplementError::new(1, "prompt-read-failed", error.to_string()))?;
-    let mut command = Command::new(&codex);
-    // Never-approve plus workspace-write permits the requested diff without
-    // giving the model either network access or authenticated publication.
-    command
-        .args([
-            "exec",
-            "--json",
-            "-C",
-            &worktree.display().to_string(),
-            "-s",
-            "workspace-write",
-            "-c",
-            "approval_policy=\"never\"",
-            "-c",
-            "sandbox_workspace_write.network_access=false",
-            "-c",
-            "web_search=\"disabled\"",
-            "-o",
-            &result_file.display().to_string(),
-        ])
-        .stdin(Stdio::from(input))
-        .stdout(Stdio::from(events))
-        .stderr(Stdio::from(errors));
-    set_process_group(&mut command);
-    let mut child = command.spawn().map_err(|error| {
-        ImplementError::new(
-            1,
-            "codex-unavailable",
-            format!("could not start Codex: {error}"),
-        )
-    })?;
-    let status = wait_for_codex(request, guard, &mut child)?;
+    drop(events);
+    let status = match registry.run(
+        runner_name,
+        &RunRequest::Implementer(ImplementerRunRequest {
+            prompt: prompt_file,
+            worktree: worktree.clone(),
+            result: result_file,
+            transcript: events_file.clone(),
+            token_ceiling: guard.order.tokens(),
+            offline: true,
+            signals: request.signals.clone(),
+            supervisor_pid: request.supervisor_pid,
+            termination_grace,
+        }),
+    ) {
+        RunOutcome::Exited(status) => status,
+        RunOutcome::Terminated(termination) => {
+            guard.termination_signal = termination.termination_signal;
+            let code = match termination.signal {
+                "HUP" => 129,
+                "INT" => 130,
+                _ => 143,
+            };
+            return Err(ImplementError::new(
+                code,
+                format!("signal-{}", termination.signal),
+                format!("received SIG{}", termination.signal),
+            ));
+        }
+        RunOutcome::Error(fault) => {
+            let reason = if fault.name() == "runner_unavailable" {
+                if runner_name == DEFAULT_IMPLEMENTER_RUNNER {
+                    "codex-unavailable"
+                } else {
+                    "implementer-harness-unavailable"
+                }
+            } else if fault.name() == "runner_io" {
+                if runner_name == DEFAULT_IMPLEMENTER_RUNNER {
+                    "codex-wait-failed"
+                } else {
+                    "implementer-harness-failed"
+                }
+            } else {
+                fault.name()
+            };
+            return Err(ImplementError::new(
+                1,
+                reason,
+                fault.detail().unwrap_or("implementer harness failed"),
+            ));
+        }
+    };
     if !status.success() {
         let code = exit_code(status);
         let reason = codex_failure_reason(code, &events_file);
@@ -636,31 +677,9 @@ fn working_tree_dirty(worktree: &Path) -> bool {
     git_text(worktree, &["status", "--porcelain"]).is_none_or(|value| !value.is_empty())
 }
 
-fn wait_for_codex(
+fn check_interrupt_before_spawn(
     request: &ImplementRequest,
     guard: &mut TerminalGuard,
-    child: &mut Child,
-) -> Result<ExitStatus, ImplementError> {
-    loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|error| ImplementError::new(1, "codex-wait-failed", error.to_string()))?
-        {
-            crate::pass::kill_remaining_process_group(child.id());
-            return Ok(status);
-        }
-        if let Err(error) = check_interrupt(request, guard, Some(child)) {
-            let _ = child.wait();
-            return Err(error);
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-}
-
-fn check_interrupt(
-    request: &ImplementRequest,
-    guard: &mut TerminalGuard,
-    child: Option<&mut Child>,
 ) -> Result<(), ImplementError> {
     let signal = request.signals.take_pending();
     // Parent death is treated as termination so a killed transient-unit
@@ -672,15 +691,7 @@ fn check_interrupt(
         return Ok(());
     }
     let name = signal.unwrap_or("TERM");
-    if let Some(child) = child {
-        // Five seconds lets Codex flush terminal output and run ordinary
-        // cleanup without retaining the item lease indefinitely. Tests may
-        // shorten the grace period through the established environment knob.
-        let grace = termination_grace()?;
-        guard.termination_signal = crate::pass::terminate_child_process_group(child, grace);
-    } else {
-        guard.termination_signal = Some(format!("SIG{name}"));
-    }
+    guard.termination_signal = Some(format!("SIG{name}"));
     let code = match name {
         "HUP" => 129,
         "INT" => 130,
@@ -1278,15 +1289,6 @@ fn default_branch_result(
     }
 }
 
-fn command_available(command: &Path) -> bool {
-    if command.components().count() > 1 {
-        return command.is_file();
-    }
-    environment::PATH.value_os().is_some_and(|path| {
-        env::split_paths(&path).any(|directory| directory.join(command).is_file())
-    })
-}
-
 fn git_required(
     directory: &Path,
     arguments: &[&str],
@@ -1323,15 +1325,6 @@ fn git_success(directory: &Path, arguments: &[&str]) -> bool {
         .status()
         .is_ok_and(|status| status.success())
 }
-
-#[cfg(unix)]
-fn set_process_group(command: &mut Command) {
-    use std::os::unix::process::CommandExt;
-    command.process_group(0);
-}
-
-#[cfg(not(unix))]
-fn set_process_group(_command: &mut Command) {}
 
 #[cfg(test)]
 mod tests {

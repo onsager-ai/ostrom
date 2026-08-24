@@ -86,3 +86,9 @@ settings profile. In particular, queue triage is modeled as a separate actor
 and operation rather than sharing or widening the builder profile. A rendered
 service invokes only `ostrom loop run <name>`; there is no inline shell
 ExecStart.
+
+The builder loop actor is a coordinator, not the implementation engine. It
+selects work, writes durable work orders, and dispatches each order to a named
+implementer harness. The shipped default is `agent/codex`; changing the
+implementer is a runner registration and named handoff, while the builder's
+coordination path remains unchanged.
