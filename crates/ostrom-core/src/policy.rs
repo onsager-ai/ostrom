@@ -409,8 +409,8 @@ pub struct ActorDecl {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionMode {
-    Auto,
     #[default]
+    Auto,
     Manual,
 }
 
@@ -1730,7 +1730,7 @@ denies:
     }
 
     #[test]
-    fn actor_permission_mode_round_trips_and_defaults_to_manual() {
+    fn actor_permission_mode_round_trips_and_defaults_to_auto() {
         let manifest = PolicyManifest::from_yaml(
             "manifest_version: 1\nactors:\n  gatekeeper:\n    permission_mode: manual\n",
         )
@@ -1751,7 +1751,7 @@ denies:
                 .expect("missing permission mode defaults");
         assert_eq!(
             defaulted.actors["gatekeeper"].permission_mode,
-            PermissionMode::Manual
+            PermissionMode::Auto
         );
 
         let error = PolicyManifest::parse_yaml(
