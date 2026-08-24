@@ -28,8 +28,8 @@ pub use doctor::{
 pub use github::GitHubProvider;
 pub use http::HttpProvider;
 pub use judgment::{
-    ClaudeHarness, HarnessRequest, JudgmentHarness, JudgmentOutcome, JudgmentRegistry,
-    PreparedJudgment,
+    AgentRegistry, AgentRunner, ClaudeHarness, Harness, HarnessRequest, JudgmentHarness,
+    JudgmentOutcome, JudgmentRegistry, PreparedJudgment, RunOutcome, RunRequest,
 };
 pub use loop_units::{
     LoopUnit, LoopUnitDrift, LoopUnitError, check_loop_units_drift, generate_loop_units,

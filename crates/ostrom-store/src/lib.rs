@@ -56,7 +56,9 @@ pub use leaves::{
 };
 pub use migration::{MigrationOutcome, migrate};
 pub use parity::{ParityError, SweepParityOptions, SweepParityOutcome, run_sweep_parity};
-pub use pass::{PassError, PassRequest, PassRole, SignalFlags, run_pass};
+pub use pass::{
+    MAX_TURNS as PASS_MAX_TURNS, PassError, PassRequest, PassRole, SignalFlags, run_pass,
+};
 pub use pass_state::{PassState, read_pass_state, write_pass_state};
 pub use paths::OstromPaths;
 pub use plan::{
