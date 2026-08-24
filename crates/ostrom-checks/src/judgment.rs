@@ -1,8 +1,9 @@
 use std::{
     collections::BTreeMap,
+    fs,
     io::Write,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Command, ExitStatus, Stdio},
     sync::Arc,
     time::SystemTime,
 };
@@ -11,8 +12,10 @@ use chrono::{DateTime, Duration, Utc};
 use ostrom_core::{
     ActionDefinition, CatalogueEnumeration, CheckReceipt, CheckState, CheckVerdict, Evidence,
     EvidenceBundleItem, JudgeStamp, JudgmentClause, JudgmentInput, JudgmentRunnerStamp,
-    RecordedOutput, ResolvedCheck, agent_parameters, receipt_digest, resolve_check, select_check,
+    RecordedOutput, ResolvedCheck, ResolvedLoopCeilings, agent_parameters, receipt_digest,
+    resolve_check, select_check,
 };
+use ostrom_store::PASS_MAX_TURNS;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -35,11 +38,44 @@ pub struct HarnessRequest<'a> {
     pub input: &'a JudgmentInput,
 }
 
-pub trait JudgmentHarness: Send + Sync {
+pub trait Harness: Send + Sync {
     fn name(&self) -> &'static str;
     fn version(&self) -> &str;
     fn default_model(&self) -> &str;
+}
+
+pub trait JudgmentHarness: Harness {
     fn judge(&self, request: &HarnessRequest<'_>) -> JudgmentOutcome;
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunRequest {
+    pub prompt: String,
+    pub model: String,
+    pub profile: PathBuf,
+    pub permission_mode: String,
+    pub ceilings: ResolvedLoopCeilings,
+    pub transcript: PathBuf,
+}
+
+#[derive(Debug)]
+pub enum RunOutcome {
+    Exited(ExitStatus),
+    Error(ActionFault),
+}
+
+impl RunOutcome {
+    #[must_use]
+    pub fn status(&self) -> Option<ExitStatus> {
+        match self {
+            Self::Exited(status) => Some(*status),
+            Self::Error(_) => None,
+        }
+    }
+}
+
+pub trait AgentRunner: Harness {
+    fn run(&self, request: &RunRequest) -> RunOutcome;
 }
 
 /// JSON-stdio adapter for the registered `agent/claude` harness. The child is
@@ -79,7 +115,7 @@ struct HarnessResponse {
     detail: Option<String>,
 }
 
-impl JudgmentHarness for ClaudeHarness {
+impl Harness for ClaudeHarness {
     fn name(&self) -> &'static str {
         "claude"
     }
@@ -91,7 +127,9 @@ impl JudgmentHarness for ClaudeHarness {
     fn default_model(&self) -> &str {
         &self.default_model
     }
+}
 
+impl JudgmentHarness for ClaudeHarness {
     fn judge(&self, request: &HarnessRequest<'_>) -> JudgmentOutcome {
         let mut child = match Command::new(&self.executable)
             .env_clear()
@@ -154,6 +192,91 @@ impl JudgmentHarness for ClaudeHarness {
             }
             _ => JudgmentOutcome::Error(ActionFault::new("harness_protocol", None)),
         }
+    }
+}
+
+impl AgentRunner for ClaudeHarness {
+    fn run(&self, request: &RunRequest) -> RunOutcome {
+        let output = match fs::File::create(&request.transcript) {
+            Ok(output) => output,
+            Err(error) => {
+                return RunOutcome::Error(ActionFault::new("runner_io", Some(error.to_string())));
+            }
+        };
+        let error_output = match output.try_clone() {
+            Ok(error_output) => error_output,
+            Err(error) => {
+                return RunOutcome::Error(ActionFault::new("runner_io", Some(error.to_string())));
+            }
+        };
+        let mut command = Command::new(&self.executable);
+        command
+            .args([
+                "--print",
+                "--settings",
+                &request.profile.display().to_string(),
+                "--permission-mode",
+                &request.permission_mode,
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--max-turns",
+                PASS_MAX_TURNS,
+                &request.prompt,
+            ])
+            .stdout(Stdio::from(output))
+            .stderr(Stdio::from(error_output));
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                return RunOutcome::Error(ActionFault::new(
+                    "runner_unavailable",
+                    Some(error.to_string()),
+                ));
+            }
+        };
+        match child.wait() {
+            Ok(status) => RunOutcome::Exited(status),
+            Err(error) => RunOutcome::Error(ActionFault::new("runner_io", Some(error.to_string()))),
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct AgentRegistry {
+    runners: BTreeMap<&'static str, Arc<dyn AgentRunner>>,
+}
+
+impl AgentRegistry {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn core(claude: ClaudeHarness) -> Result<Self, ActionFault> {
+        let mut registry = Self::new();
+        registry.register(claude)?;
+        Ok(registry)
+    }
+
+    pub fn register(&mut self, runner: impl AgentRunner + 'static) -> Result<(), ActionFault> {
+        let name = runner.name();
+        if !valid_component(name)
+            || runner.version().is_empty()
+            || runner.default_model().is_empty()
+        {
+            return Err(ActionFault::new("invalid_harness_registration", None));
+        }
+        if self.runners.contains_key(name) {
+            return Err(ActionFault::new("ambiguous_harness", None));
+        }
+        self.runners.insert(name, Arc::new(runner));
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<Arc<dyn AgentRunner>> {
+        self.runners.get(name).cloned()
     }
 }
 
@@ -409,7 +532,7 @@ mod tests {
         outcome: JudgmentOutcome,
     }
 
-    impl JudgmentHarness for FixtureHarness {
+    impl Harness for FixtureHarness {
         fn name(&self) -> &'static str {
             self.name
         }
@@ -421,7 +544,9 @@ mod tests {
         fn default_model(&self) -> &str {
             "fixture-model"
         }
+    }
 
+    impl JudgmentHarness for FixtureHarness {
         fn judge(&self, _request: &HarnessRequest<'_>) -> JudgmentOutcome {
             self.outcome.clone()
         }
@@ -764,5 +889,102 @@ checks:
             receipt.judged_by.expect("judge stamp").version,
             "claude-fixture-v1"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_agent_runner_preserves_the_pass_argv_contract() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+
+        let fixture = tempfile::tempdir().expect("fixture directory");
+        let executable = fixture.path().join("claude-fixture");
+        fs::write(
+            &executable,
+            concat!("#!/bin/sh\n", "printf '%s\\n' \"$@\" > \"$0.args\"\n"),
+        )
+        .expect("write fixture runner");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
+            .expect("fixture runner mode");
+        let profile = fixture.path().join("roles/builder.settings.json");
+        let transcript = fixture.path().join("transcript.jsonl");
+        let request = RunRequest {
+            prompt: "/ostrom:work".to_owned(),
+            model: "fixture-model".to_owned(),
+            profile: profile.clone(),
+            permission_mode: "auto".to_owned(),
+            ceilings: ResolvedLoopCeilings::default(),
+            transcript,
+        };
+
+        let outcome =
+            ClaudeHarness::new(&executable, "claude-fixture-v1", "fixture-model").run(&request);
+        assert!(outcome.status().is_some_and(|status| status.success()));
+        let observed = fs::read_to_string(executable.with_extension("args"))
+            .expect("read observed runner arguments")
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            observed,
+            vec![
+                "--print".to_owned(),
+                "--settings".to_owned(),
+                profile.display().to_string(),
+                "--permission-mode".to_owned(),
+                "auto".to_owned(),
+                "--output-format".to_owned(),
+                "stream-json".to_owned(),
+                "--verbose".to_owned(),
+                "--max-turns".to_owned(),
+                PASS_MAX_TURNS.to_owned(),
+                "/ostrom:work".to_owned(),
+            ]
+        );
+    }
+
+    struct FixtureRunner {
+        name: &'static str,
+    }
+
+    impl Harness for FixtureRunner {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn version(&self) -> &str {
+            "fixture-v1"
+        }
+
+        fn default_model(&self) -> &str {
+            "fixture-model"
+        }
+    }
+
+    impl AgentRunner for FixtureRunner {
+        fn run(&self, _request: &RunRequest) -> RunOutcome {
+            unreachable!("registry fixture is not executed")
+        }
+    }
+
+    #[test]
+    fn agent_registry_resolves_named_runners_and_rejects_duplicates() {
+        let mut registry = AgentRegistry::core(ClaudeHarness::new(
+            "claude",
+            "claude-fixture-v1",
+            "fixture-model",
+        ))
+        .expect("core agent registry");
+        registry
+            .register(FixtureRunner { name: "codex" })
+            .expect("register second runner");
+
+        assert_eq!(
+            registry.get("codex").expect("resolve codex runner").name(),
+            "codex"
+        );
+        let error = registry
+            .register(FixtureRunner { name: "codex" })
+            .expect_err("duplicate runner must be rejected");
+        assert_eq!(error.name(), "ambiguous_harness");
     }
 }

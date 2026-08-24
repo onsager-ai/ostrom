@@ -20,7 +20,7 @@ use crate::{
     write_pass_state,
 };
 
-const MAX_TURNS: &str = "200";
+pub const MAX_TURNS: &str = "200";
 const DEFAULT_DAILY_CAP_USD: f64 = 50.0;
 const DEFAULT_LEASE_TTL_SECONDS: u64 = 3_600;
 
