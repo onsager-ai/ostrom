@@ -2740,15 +2740,13 @@ fn reconcile_queue(
                 .and_then(|mandate| mandate.get("reason"))
                 .and_then(Value::as_str)
                 .is_some_and(|reason| reason.starts_with("work_ranking item no longer exists: "));
-        if !ranking_fault {
-            if let Some(old) = existing_values
+        if !ranking_fault
+            && let Some(old) = existing_values
                 .iter()
                 .find(|candidate| string_field(candidate, &["id"]) == id)
-            {
-                if let Some(state) = old.get("state") {
-                    row["state"] = state.clone();
-                }
-            }
+            && let Some(state) = old.get("state")
+        {
+            row["state"] = state.clone();
         }
         result.retain(|candidate| string_field(candidate, &["id"]) != id);
         result.push(row);

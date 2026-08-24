@@ -406,10 +406,10 @@ fn validate_ranking(state: &Value, config: &MandateConfig) -> Result<(), SelectE
     if state.get("work_ranking") != Some(&json!(config.work_ranking)) {
         return Err(SelectError::RankingMismatch);
     }
-    if let Some(faults) = state.get("work_ranking_faults").and_then(Value::as_array) {
-        if let Some(item) = faults.first().and_then(Value::as_str) {
-            return Err(SelectError::StaleRanking(item.to_owned()));
-        }
+    if let Some(faults) = state.get("work_ranking_faults").and_then(Value::as_array)
+        && let Some(item) = faults.first().and_then(Value::as_str)
+    {
+        return Err(SelectError::StaleRanking(item.to_owned()));
     }
     Ok(())
 }

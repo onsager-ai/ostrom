@@ -1256,11 +1256,11 @@ fn find_in_nvm_root(command: &Path, nvm: &Path) -> Option<PathBuf> {
     let mut best = None;
     let mut best_version = None;
     for (candidate, minor, patch) in candidates {
-        if best_version.is_none_or(|current| (minor, patch) > current) {
-            if let Some(candidate) = absolute_executable(&candidate) {
-                best = Some(candidate);
-                best_version = Some((minor, patch));
-            }
+        if best_version.is_none_or(|current| (minor, patch) > current)
+            && let Some(candidate) = absolute_executable(&candidate)
+        {
+            best = Some(candidate);
+            best_version = Some((minor, patch));
         }
     }
     best
