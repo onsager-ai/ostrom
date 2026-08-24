@@ -17,6 +17,7 @@ const ALLOWED: &[&str] = &[
     "blocked_by",
     "classification",
     "id",
+    "item_type",
     "kind",
     "mandate",
     "matched_selector",
@@ -375,6 +376,12 @@ fn validate_queue(value: &Value) -> Result<(), String> {
     }
     require_string(object, "id")?;
     require_string(object, "repo")?;
+    if object
+        .get("item_type")
+        .is_some_and(|value| !matches!(value.as_str(), Some("issue" | "pull_request")))
+    {
+        return Err("item_type is not recognized".to_owned());
+    }
     let reference = require_string(object, "ref")?;
     let kind = require_string(object, "kind")?;
     let issue_reference = reference.strip_prefix('#').is_some_and(|digits| {

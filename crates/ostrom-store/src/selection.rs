@@ -444,11 +444,19 @@ fn queue_item(
 }
 
 fn authorized(item: &QueueItem, row: &Value) -> bool {
-    item.kind != "parked"
+    dispatchable_item_type(row)
+        && item.kind != "parked"
         && item.state != "deferred"
         && (matches!(item.kind.as_str(), "moved" | "stuck")
             || is_pr_repair_conflict_drift(row)
             || (item.state == "approved" && matches!(item.kind.as_str(), "tripwire" | "decision")))
+}
+
+fn dispatchable_item_type(row: &Value) -> bool {
+    // Legacy queue rows predate `item_type`. Treat a missing field as an issue
+    // so an upgrade does not silently drop queued work before a sweep rewrites
+    // the row with durable GitHub item-type evidence.
+    row.get("item_type").and_then(Value::as_str) != Some("pull_request")
 }
 
 fn is_pr_repair_conflict_drift(row: &Value) -> bool {
@@ -707,4 +715,47 @@ fn append_fact(path: &Path, timestamp: &str, kind: &str, fact: Value) -> Result<
     )
     .map(|_| ())
     .map_err(SelectError::Trace)
+}
+
+#[cfg(test)]
+mod tests {
+    use ostrom_core::QueueItem;
+    use serde_json::json;
+
+    use super::{authorized, dispatchable_item_type};
+    use crate::sweep::PR_REPAIR_CONFLICT_REASON_PREFIX;
+
+    fn item(kind: &str) -> QueueItem {
+        QueueItem {
+            id: "placeholder-org/alpha#1".to_owned(),
+            opened: "2026-08-01T00:00:00Z".to_owned(),
+            kind: kind.to_owned(),
+            state: "pending".to_owned(),
+            blocked_by: Vec::new(),
+            graph_dispatchable: true,
+            unblocking_power: 0,
+        }
+    }
+
+    #[test]
+    fn explicit_pull_request_type_is_never_authorized() {
+        let moved = json!({"kind": "moved", "item_type": "pull_request"});
+        assert!(!authorized(&item("moved"), &moved));
+
+        let repair_conflict = json!({
+            "kind": "drift",
+            "item_type": "pull_request",
+            "mandate": {
+                "reason": format!("{PR_REPAIR_CONFLICT_REASON_PREFIX}; placeholder conflict")
+            }
+        });
+        assert!(!authorized(&item("drift"), &repair_conflict));
+    }
+
+    #[test]
+    fn legacy_row_without_item_type_remains_dispatchable() {
+        let legacy = json!({"kind": "moved"});
+        assert!(dispatchable_item_type(&legacy));
+        assert!(authorized(&item("moved"), &legacy));
+    }
 }
