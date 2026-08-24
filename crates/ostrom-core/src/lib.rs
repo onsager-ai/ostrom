@@ -42,8 +42,9 @@ pub use domain::{
     SelectorError, Verdict,
 };
 pub use operation::{
-    ActionBoundary, ActionParameter, ActionScope, OperationAction, OperationActionError,
-    ParameterSink, operation_action, operation_actions, validate_operation,
+    ActionBoundary, ActionParameter, ActionScope, AgentRunParameters, AgentRunParametersError,
+    OperationAction, OperationActionError, ParameterSink, agent_run_parameters, operation_action,
+    operation_actions, validate_operation,
 };
 pub use plan::{
     Acknowledgement, AcknowledgementResponse, Assessment, AssessmentDraft, AssessmentError,
@@ -57,10 +58,10 @@ pub use policy::{
     ActorDecl, CheckDefaults, InputDecl, InputResolutionError, InputType, LoopActivationSlot,
     LoopCadence, LoopDecl, LoopResolutionError, LoopTime, ManifestDefaults, ManifestError,
     ManifestValidationError, NormalizedList, OperationDecl, OperationParamDecl, OperationParamType,
-    PolicyCandidate, PolicyDecision, PolicyManifest, PolicySelector, PolicySelectorError,
-    ResolvedInput, ResolvedLoop, ResolvedLoopCeilings, RuleDecl, RuleDefaults, SelectorFinding,
-    SelectorMatch, SelectorPrefix, SelectorResolutionError, SelectorUniverse, StallDuration,
-    StallDurationError, StepDecl, UnmatchedPolicy,
+    PermissionMode, PolicyCandidate, PolicyDecision, PolicyManifest, PolicySelector,
+    PolicySelectorError, ResolvedInput, ResolvedLoop, ResolvedLoopCeilings, RuleDecl, RuleDefaults,
+    SelectorFinding, SelectorMatch, SelectorPrefix, SelectorResolutionError, SelectorUniverse,
+    StallDuration, StallDurationError, StepDecl, UnmatchedPolicy,
 };
 pub use store::{
     AttemptOutcome, CHECK_STORE_SCHEMA_VERSION, CheckRun, CheckRunId, CheckStore, CheckStoreFault,

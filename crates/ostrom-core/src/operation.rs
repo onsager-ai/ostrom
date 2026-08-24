@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use serde_yaml::Value;
 use thiserror::Error;
 
-use crate::{OperationDecl, OperationParamType};
+use crate::{OperationDecl, OperationParamType, StepDecl, check::agent_parameter_prelude};
 
 /// The credential boundary used to execute one operation action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,8 +106,30 @@ const COMMAND_PARAMETERS: &[ActionParameter] = &[
         caller_supplied: true,
     },
 ];
+const AGENT_RUN_PARAMETERS: &[ActionParameter] = &[
+    ActionParameter {
+        name: "prompt",
+        required: true,
+        sink: ParameterSink::Content,
+        caller_supplied: true,
+    },
+    ActionParameter {
+        name: "model",
+        required: false,
+        sink: ParameterSink::Data,
+        caller_supplied: true,
+    },
+];
 
 const OPERATION_ACTIONS: &[OperationAction] = &[
+    OperationAction {
+        uses: "agent/claude",
+        boundary: ActionBoundary::Local,
+        scopes: &[],
+        ungrantable: false,
+        guarded: false,
+        parameters: AGENT_RUN_PARAMETERS,
+    },
     OperationAction {
         uses: "gh/post-verdict",
         boundary: ActionBoundary::Mediated,
@@ -162,6 +184,34 @@ pub fn operation_action(uses: &str) -> Option<&'static OperationAction> {
     OPERATION_ACTIONS.iter().find(|action| action.uses == uses)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRunParameters {
+    pub prompt: String,
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("invalid_agent_run_parameters")]
+pub struct AgentRunParametersError;
+
+/// Decode the core-owned operation-side `agent/*` parameters. Unlike a judged
+/// check, an operation agent receives no evidence or freshness references.
+pub fn agent_run_parameters(
+    step: &StepDecl,
+) -> Result<AgentRunParameters, AgentRunParametersError> {
+    let prelude = agent_parameter_prelude(
+        &step.uses,
+        &step.parameters,
+        &["model", "prompt"],
+        Value::as_str,
+    )
+    .map_err(|()| AgentRunParametersError)?;
+    Ok(AgentRunParameters {
+        prompt: prelude.prompt,
+        model: prelude.model,
+    })
+}
+
 pub fn validate_operation(
     name: &str,
     operation: &OperationDecl,
@@ -209,6 +259,14 @@ pub fn validate_operation(
             });
         }
         validate_parameters(name, index, operation, action, &step.parameters)?;
+        if action.uses == "agent/claude" {
+            agent_run_parameters(step).map_err(|_| {
+                OperationActionError::InvalidAgentRunParameters {
+                    operation: name.to_owned(),
+                    step: index,
+                }
+            })?;
+        }
     }
     Ok(())
 }
@@ -388,11 +446,20 @@ pub enum OperationActionError {
         uses: String,
         parameter: String,
     },
+    #[error("operation `{operation}` step {step} has invalid `agent/claude` parameters")]
+    InvalidAgentRunParameters { operation: String, step: usize },
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{ActionBoundary, PolicyManifest, operation_action};
+    use crate::{
+        ActionBoundary, ParameterSink, PolicyManifest, agent_run_parameters, operation_action,
+    };
+
+    fn agent_step(parameters: &str) -> crate::StepDecl {
+        serde_yaml::from_str(&format!("uses: agent/claude\nwith:\n{parameters}"))
+            .expect("agent step fixture")
+    }
 
     #[test]
     fn ungrantable_action_fails_at_every_position() {
@@ -464,6 +531,29 @@ mod tests {
 
     #[test]
     fn catalogue_declares_boundary_scopes_and_guards() {
+        let agent = operation_action("agent/claude").expect("agent action");
+        assert_eq!(agent.boundary, ActionBoundary::Local);
+        assert!(agent.scopes.is_empty());
+        assert!(!agent.ungrantable);
+        assert!(!agent.guarded);
+        assert_eq!(
+            agent
+                .parameters
+                .iter()
+                .map(|parameter| {
+                    (
+                        parameter.name,
+                        parameter.required,
+                        parameter.sink,
+                        parameter.caller_supplied,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            [
+                ("prompt", true, ParameterSink::Content, true),
+                ("model", false, ParameterSink::Data, true),
+            ]
+        );
         let merge = operation_action("gh/merge-pr").expect("merge action");
         assert_eq!(merge.boundary, ActionBoundary::Mediated);
         assert!(merge.guarded);
@@ -478,5 +568,55 @@ mod tests {
         let command = operation_action("cmd/run").expect("command action");
         assert_eq!(command.boundary, ActionBoundary::Local);
         assert!(command.scopes.is_empty());
+    }
+
+    #[test]
+    fn agent_run_parameters_are_bounded_to_prompt_and_model() {
+        let parameters = agent_run_parameters(&agent_step(
+            "  prompt: inspect the repository\n  model: opus\n",
+        ))
+        .expect("bounded agent parameters");
+        assert_eq!(parameters.prompt, "inspect the repository");
+        assert_eq!(parameters.model.as_deref(), Some("opus"));
+
+        for parameters in [
+            "  model: opus\n",
+            "  prompt: ''\n",
+            "  prompt: 42\n",
+            "  prompt: inspect\n  model: ''\n",
+            "  prompt: inspect\n  model: 42\n",
+            "  prompt: inspect\n  evidence: []\n",
+            "  prompt: inspect\n  fresh_for: 1h\n",
+            "  prompt: inspect\n  provider_payload: nope\n",
+        ] {
+            assert!(
+                agent_run_parameters(&agent_step(parameters)).is_err(),
+                "accepted {parameters}"
+            );
+        }
+
+        let non_agent = serde_yaml::from_str("uses: cmd/run\nwith: {prompt: inspect}\n")
+            .expect("non-agent step fixture");
+        assert!(agent_run_parameters(&non_agent).is_err());
+    }
+
+    #[test]
+    fn agent_operation_accepts_its_bounded_shape_and_refuses_unknown_keys() {
+        let valid = "manifest_version: 1\noperations:\n  inspect:\n    steps:\n      - uses: agent/claude\n        with: {prompt: inspect, model: opus}\n";
+        PolicyManifest::from_yaml(valid).expect("agent operation is valid");
+
+        for key in ["evidence", "fresh_for", "provider_payload"] {
+            let invalid = valid.replace(
+                "with: {prompt: inspect, model: opus}",
+                &format!("with: {{prompt: inspect, model: opus, {key}: nope}}"),
+            );
+            let error = PolicyManifest::from_yaml(&invalid).expect_err("unknown key fails");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("unknown parameter `{key}`")),
+                "{error}"
+            );
+        }
     }
 }

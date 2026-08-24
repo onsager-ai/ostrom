@@ -402,6 +402,16 @@ pub struct ActorDecl {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(default)]
+    pub permission_mode: PermissionMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionMode {
+    Auto,
+    #[default]
+    Manual,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1717,6 +1727,38 @@ denies:
             normalized.contains("where:\n    - label:area:schema"),
             "{normalized}"
         );
+    }
+
+    #[test]
+    fn actor_permission_mode_round_trips_and_defaults_to_manual() {
+        let manifest = PolicyManifest::from_yaml(
+            "manifest_version: 1\nactors:\n  gatekeeper:\n    permission_mode: manual\n",
+        )
+        .expect("manual permission mode parses");
+        assert_eq!(
+            manifest.actors["gatekeeper"].permission_mode,
+            PermissionMode::Manual
+        );
+        let rendered = manifest.to_yaml().expect("permission mode serializes");
+        assert!(rendered.contains("permission_mode: manual"), "{rendered}");
+        assert_eq!(
+            PolicyManifest::from_yaml(&rendered).expect("serialized manifest parses"),
+            manifest
+        );
+
+        let defaulted =
+            PolicyManifest::from_yaml("manifest_version: 1\nactors:\n  gatekeeper: {}\n")
+                .expect("missing permission mode defaults");
+        assert_eq!(
+            defaulted.actors["gatekeeper"].permission_mode,
+            PermissionMode::Manual
+        );
+
+        let error = PolicyManifest::parse_yaml(
+            "manifest_version: 1\nactors:\n  gatekeeper:\n    permission_mode: autonomous\n",
+        )
+        .expect_err("unknown permission mode fails");
+        assert!(error.to_string().contains("unknown variant `autonomous`"));
     }
 
     #[test]

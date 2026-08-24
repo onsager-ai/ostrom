@@ -13,7 +13,7 @@ mod support;
 
 const OPERATOR: &str = concat!(
     "manifest_version: 1\n",
-    "actors: {builder: {}}\n",
+    "actors: {builder: {permission_mode: manual}}\n",
     "operations: {work: {steps: []}}\n",
 );
 
@@ -87,6 +87,18 @@ impl Fixture {
         fs::write(&self.manifest, Self::repository_policy(rule))
             .expect("replace repository manifest");
         support::sign_manifest(&self.manifest);
+    }
+
+    fn write_operator_permission_mode(&self, permission_mode: &str) {
+        let manifest = self.home.join("ostrom.yaml");
+        fs::write(
+            &manifest,
+            format!(
+                "manifest_version: 1\nactors: {{builder: {{permission_mode: {permission_mode}}}}}\noperations: {{work: {{steps: []}}}}\n"
+            ),
+        )
+        .expect("replace operator permission mode");
+        support::sign_manifest(&manifest);
     }
 
     fn current_target(&self) -> PathBuf {
@@ -298,6 +310,38 @@ fn rollback_restores_previous_and_reports_both_digests() {
     assert!(stdout.contains(&format!("from={second}")), "{stdout}");
     assert!(stdout.contains(&format!("to={first}")), "{stdout}");
     assert_eq!(fixture.current_target(), Path::new("versions").join(first));
+}
+
+#[test]
+fn signed_actor_permission_toggle_activates_and_rolls_back_one_pointer() {
+    let fixture = Fixture::new();
+    let manual = fixture.compose_digest();
+    assert_eq!(
+        fixture.current_target(),
+        Path::new("versions").join(&manual)
+    );
+
+    fixture.write_operator_permission_mode("auto");
+    let auto = fixture.compose_digest();
+
+    assert_ne!(manual, auto);
+    assert_eq!(fixture.current_target(), Path::new("versions").join(&auto));
+    assert_eq!(
+        fs::read_link(fixture.home.join("previous-version")).expect("read rollback pointer"),
+        Path::new("versions").join(&manual)
+    );
+
+    let output = fixture
+        .command()
+        .arg("rollback")
+        .output()
+        .expect("roll back permission mode");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fixture.current_target(), Path::new("versions").join(manual));
 }
 
 #[test]

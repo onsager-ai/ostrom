@@ -104,29 +104,51 @@ pub struct AgentParameters {
     pub model: Option<String>,
 }
 
+pub(crate) struct AgentParameterPrelude {
+    pub(crate) prompt: String,
+    pub(crate) model: Option<String>,
+}
+
+pub(crate) fn agent_parameter_prelude<V>(
+    uses: &str,
+    parameters: &BTreeMap<String, V>,
+    allowed: &[&str],
+    as_str: impl for<'a> Fn(&'a V) -> Option<&'a str>,
+) -> Result<AgentParameterPrelude, ()> {
+    if uses.split_once('/').map(|part| part.0) != Some("agent")
+        || parameters
+            .keys()
+            .any(|key| !allowed.contains(&key.as_str()))
+    {
+        return Err(());
+    }
+    let prompt = parameters
+        .get("prompt")
+        .and_then(&as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(())?
+        .to_owned();
+    let model = parameters
+        .get("model")
+        .map(|value| {
+            as_str(value)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+                .ok_or(())
+        })
+        .transpose()?;
+    Ok(AgentParameterPrelude { prompt, model })
+}
+
 /// Decode the core-owned `agent/*` parameters. Harnesses receive this bounded
 /// input and cannot add provider-specific context keys.
 pub fn agent_parameters(
     definition: &CheckDefinition,
 ) -> Result<AgentParameters, CheckContractError> {
-    if definition.uses.split_once('/').map(|part| part.0) != Some("agent") {
-        return Err(CheckContractError::InvalidAgentParameters);
-    }
     let allowed = ["evidence", "fresh_for", "model", "prompt"];
-    if definition
-        .with
-        .keys()
-        .any(|key| !allowed.contains(&key.as_str()))
-    {
-        return Err(CheckContractError::InvalidAgentParameters);
-    }
-    let prompt = definition
-        .with
-        .get("prompt")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or(CheckContractError::InvalidAgentParameters)?
-        .to_owned();
+    let prelude =
+        agent_parameter_prelude(&definition.uses, &definition.with, &allowed, Value::as_str)
+            .map_err(|()| CheckContractError::InvalidAgentParameters)?;
     let evidence = definition
         .with
         .get("evidence")
@@ -146,21 +168,10 @@ pub fn agent_parameters(
     {
         return Err(CheckContractError::InvalidAgentParameters);
     }
-    let model = definition
-        .with
-        .get("model")
-        .map(|value| {
-            value
-                .as_str()
-                .filter(|value| !value.trim().is_empty())
-                .map(str::to_owned)
-                .ok_or(CheckContractError::InvalidAgentParameters)
-        })
-        .transpose()?;
     Ok(AgentParameters {
-        prompt,
+        prompt: prelude.prompt,
         evidence,
-        model,
+        model: prelude.model,
     })
 }
 
