@@ -38,19 +38,27 @@ impl CheckDocument {
         if document.checks_version != CHECKS_VERSION {
             return Err(CheckContractError::UnsupportedCheckVersion);
         }
-        if document.checks.keys().any(String::is_empty) {
-            return Err(CheckContractError::EmptyCheckId);
-        }
-        for definition in document.checks.values() {
-            definition.validate_uses()?;
-            if !actions.contains(&definition.uses.as_str()) {
-                return Err(CheckContractError::UnknownAction);
-            }
-            definition.validate_agent_parameters()?;
-        }
-        validate_local_evidence_graph(&document)?;
+        validate_check_definitions(&document.checks, actions)?;
         Ok(document)
     }
+}
+
+/// Validate one composed map of check definitions against an action catalogue.
+pub fn validate_check_definitions(
+    checks: &BTreeMap<String, CheckDefinition>,
+    actions: &[&str],
+) -> Result<(), CheckContractError> {
+    if checks.keys().any(String::is_empty) {
+        return Err(CheckContractError::EmptyCheckId);
+    }
+    for definition in checks.values() {
+        definition.validate_uses()?;
+        if !actions.contains(&definition.uses.as_str()) {
+            return Err(CheckContractError::UnknownAction);
+        }
+        definition.validate_agent_parameters()?;
+    }
+    validate_local_evidence_graph(checks)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -168,8 +176,10 @@ pub struct CatalogueEnumeration {
     pub complete: bool,
 }
 
-fn validate_local_evidence_graph(document: &CheckDocument) -> Result<(), CheckContractError> {
-    validate_evidence_cycles(&document.checks, false)
+fn validate_local_evidence_graph(
+    checks: &BTreeMap<String, CheckDefinition>,
+) -> Result<(), CheckContractError> {
+    validate_evidence_cycles(checks, false)
 }
 
 fn validate_catalogue_evidence_graph(

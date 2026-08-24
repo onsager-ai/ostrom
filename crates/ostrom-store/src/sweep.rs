@@ -27,6 +27,10 @@ use crate::{
 };
 
 const QUERY_LIMIT: usize = 200;
+/// GitHub's search API exposes at most 1,000 results even when every available
+/// page is requested. Crossing that platform cap remains a refusal because an
+/// exhaustive merge-gate population cannot be proven.
+const GITHUB_SEARCH_RESULT_LIMIT: usize = 1_000;
 const FULL_RECONCILIATION_HOURS: i64 = 24;
 /// A partially reachable portfolio remains useful when failed repositories are
 /// retained from the previous generation. Zero acquired repositories cannot
@@ -146,6 +150,8 @@ pub struct RepositorySnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OrgSnapshots {
     repositories: Vec<RepositorySnapshot>,
+    #[serde(default)]
+    faults: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -516,32 +522,53 @@ pub fn acquire_org_from_github(
     started_at: DateTime<Utc>,
     mode: SweepMode,
 ) -> Result<Vec<RepositorySnapshot>, SweepError> {
+    acquire_org_from_github_with_faults(paths, working_directory, org, started_at, mode)
+        .map(|(repositories, _faults)| repositories)
+}
+
+pub fn acquire_org_from_github_with_faults(
+    paths: &OstromPaths,
+    working_directory: &Path,
+    org: &str,
+    started_at: DateTime<Utc>,
+    mode: SweepMode,
+) -> Result<(Vec<RepositorySnapshot>, Vec<String>), SweepError> {
     let config = load_config(paths, working_directory)?;
     let state = read_state(&paths.state.join("state.json"))?;
-    let mut repositories = Vec::new();
     let gh_host = environment::GH_HOST
         .value()
         .unwrap_or_else(|| "github.com".to_owned());
     gh(&["auth", "status", "--hostname", &gh_host])?;
-    for project in config
+    let repositories = config
         .projects
         .iter()
         .filter(|project| owner(project.repo.as_str()) == org)
-    {
+        .map(|project| project.repo.clone())
+        .collect::<Vec<_>>();
+    Ok(acquire_repositories_independently(repositories, |repo| {
         let previous = state
             .get("repos")
-            .and_then(|repos| repos.get(project.repo.as_str()))
+            .and_then(|repos| repos.get(repo.as_str()))
             .cloned()
             .unwrap_or_else(|| json!({}));
-        repositories.push(acquire_repository(
-            project.repo.clone(),
-            &previous,
-            &config,
-            started_at,
-            mode,
-        )?);
+        acquire_repository(repo, &previous, &config, started_at, mode)
+    }))
+}
+
+fn acquire_repositories_independently(
+    repositories: Vec<RepositoryName>,
+    mut acquire: impl FnMut(RepositoryName) -> Result<RepositorySnapshot, SweepError>,
+) -> (Vec<RepositorySnapshot>, Vec<String>) {
+    let mut snapshots = Vec::new();
+    let mut faults = Vec::new();
+    for repo in repositories {
+        let name = repo.as_str().to_owned();
+        match acquire(repo) {
+            Ok(snapshot) => snapshots.push(snapshot),
+            Err(error) => faults.push(format!("repository acquisition failed for {name}: {error}")),
+        }
     }
-    Ok(repositories)
+    (snapshots, faults)
 }
 
 /// The credential request for one organization's acquisition worker.
@@ -650,6 +677,7 @@ fn acquire_by_organization(
             ))
         })?;
         snapshots.extend(result.repositories);
+        faults.extend(result.faults);
     }
     Ok((snapshots, faults))
 }
@@ -710,21 +738,7 @@ fn acquire_repository(
         .format("%Y-%m-%d")
         .to_string();
     let search = format!("merged:>={cutoff}");
-    let merged_prs = gh_json(&[
-        "pr",
-        "list",
-        "--repo",
-        repo_name,
-        "--state",
-        "merged",
-        "--search",
-        &search,
-        "--limit",
-        "200",
-        "--json",
-        "number,title,author,closingIssuesReferences,createdAt,mergedAt,headRefOid,state",
-    ])?;
-    let merged_prs = exhaustive_array(merged_prs, repo_name, "recent merged pull-request query")?;
+    let merged_prs = fetch_merged_pull_requests(repo_name, &search)?;
 
     let mut warnings = Vec::new();
     let (default_branch, branches, branch_read_degraded, ci_runs) = match gh_json(&[
@@ -802,6 +816,179 @@ fn acquire_repository(
         ci_runs,
         warnings,
     })
+}
+
+fn fetch_merged_pull_requests(repo: &str, search: &str) -> Result<Vec<Value>, SweepError> {
+    // Search supplies the recency filter and stable 100-result pages. Hydrate
+    // each page through GraphQL because the merge-gate join also needs the
+    // merged head SHA and closing-issue relationships omitted by REST search.
+    fetch_merged_pull_requests_with(repo, search, |search, page| {
+        let query_value = format!("q=repo:{repo} is:pr is:merged {search}");
+        let page_value = format!("page={page}");
+        let search_result = gh_json(&[
+            "api",
+            "-X",
+            "GET",
+            "search/issues",
+            "-f",
+            &query_value,
+            "-F",
+            "per_page=100",
+            "-F",
+            &page_value,
+            "-f",
+            "sort=updated",
+            "-f",
+            "order=desc",
+        ])?;
+        let total_count = search_result
+            .get("total_count")
+            .and_then(Value::as_u64)
+            .and_then(|count| usize::try_from(count).ok())
+            .ok_or_else(|| {
+                SweepError::Acquisition(format!(
+                    "recent merged pull-request query for {repo} returned no result count"
+                ))
+            })?;
+        let incomplete = search_result
+            .get("incomplete_results")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let items = search_result
+            .get("items")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                SweepError::Acquisition(format!(
+                    "recent merged pull-request query for {repo} returned a non-array page"
+                ))
+            })?;
+        let result_count = items.len();
+        if items.is_empty() {
+            return Ok(MergedPullRequestPage {
+                total_count,
+                incomplete,
+                result_count,
+                pulls: Vec::new(),
+            });
+        }
+
+        let ids = items
+            .iter()
+            .map(|item| {
+                item.get("node_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        SweepError::Acquisition(format!(
+                            "recent merged pull-request query for {repo} returned a result with no node id"
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let query = r#"query OstromMergedPullRequestNodes($ids:[ID!]!){nodes(ids:$ids){... on PullRequest{number title author{login __typename} closingIssuesReferences(first:100){nodes{number}} createdAt mergedAt headRefOid state}}}"#;
+        let query_field = format!("query={query}");
+        let mut args = vec![
+            "api".to_owned(),
+            "graphql".to_owned(),
+            "-f".to_owned(),
+            query_field,
+        ];
+        for id in ids {
+            args.extend(["-F".to_owned(), format!("ids[]={id}")]);
+        }
+        let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+        let details = gh_json(&refs)?;
+        let pulls = details
+            .pointer("/data/nodes")
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(|| {
+                SweepError::Acquisition(format!(
+                    "recent merged pull-request query for {repo} returned no pull-request details"
+                ))
+            })?;
+        Ok(MergedPullRequestPage {
+            total_count,
+            incomplete,
+            result_count,
+            pulls,
+        })
+    })
+}
+
+struct MergedPullRequestPage {
+    total_count: usize,
+    incomplete: bool,
+    result_count: usize,
+    pulls: Vec<Value>,
+}
+
+fn fetch_merged_pull_requests_with(
+    repo: &str,
+    search: &str,
+    mut fetch_page: impl FnMut(&str, usize) -> Result<MergedPullRequestPage, SweepError>,
+) -> Result<Vec<Value>, SweepError> {
+    let mut merged = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut expected_count = None::<usize>;
+    for page in 1.. {
+        let page = fetch_page(search, page)?;
+        let expected = *expected_count.get_or_insert(page.total_count);
+        if expected > GITHUB_SEARCH_RESULT_LIMIT {
+            return Err(SweepError::Acquisition(format!(
+                "recent merged pull-request query for {repo} has {expected} results, exceeding GitHub's exhaustive search limit {GITHUB_SEARCH_RESULT_LIMIT}; refusing a truncated sweep"
+            )));
+        }
+        if page.incomplete {
+            return Err(SweepError::Acquisition(format!(
+                "recent merged pull-request query for {repo} reported incomplete results; refusing a truncated sweep"
+            )));
+        }
+        if page.total_count != expected {
+            return Err(SweepError::Acquisition(format!(
+                "recent merged pull-request query for {repo} changed result count while paging; refusing a potentially incomplete sweep"
+            )));
+        }
+        if page.pulls.len() != page.result_count {
+            return Err(SweepError::Acquisition(format!(
+                "recent merged pull-request query for {repo} returned {} details for {} search results; refusing a truncated sweep",
+                page.pulls.len(),
+                page.result_count
+            )));
+        }
+        for node in page.pulls {
+            let mut pull = node.as_object().cloned().ok_or_else(|| {
+                SweepError::Acquisition(format!(
+                    "recent merged pull-request query for {repo} returned a non-object result"
+                ))
+            })?;
+            let number = pull.get("number").and_then(Value::as_u64).ok_or_else(|| {
+                SweepError::Acquisition(format!(
+                    "recent merged pull-request query for {repo} returned a result with no number"
+                ))
+            })?;
+            if !seen.insert(number) {
+                return Err(SweepError::Acquisition(format!(
+                    "recent merged pull-request query for {repo} returned duplicate pull request #{number}; refusing a potentially incomplete sweep"
+                )));
+            }
+            if let Some(author) = pull.get_mut("author").and_then(Value::as_object_mut) {
+                let is_bot = author.get("__typename").and_then(Value::as_str) == Some("Bot");
+                author.insert("isBot".to_owned(), json!(is_bot));
+            }
+            merged.push(Value::Object(pull));
+        }
+        if merged.len() == expected {
+            return Ok(merged);
+        }
+        if merged.len() > expected || page.result_count < 100 {
+            return Err(SweepError::Acquisition(format!(
+                "recent merged pull-request query for {repo} returned {} of {expected} results; refusing a truncated sweep",
+                merged.len()
+            )));
+        }
+    }
+    unreachable!("unbounded page iterator only exits by return")
 }
 
 fn fetch_branches(repo: &str) -> Result<Vec<Value>, SweepError> {
@@ -2435,10 +2622,6 @@ fn validate_fixture(config: &MandateConfig, fixture: &SweepFixture) -> Result<()
     for snapshot in &fixture.repositories {
         for (name, count) in [
             ("open pull-request query", snapshot.open_prs.len()),
-            (
-                "recent merged pull-request query",
-                snapshot.merged_prs.len(),
-            ),
             ("issues change feed", snapshot.issues.len()),
             ("default-branch CI query", snapshot.ci_runs.len()),
             ("branch query", snapshot.branches.len()),
@@ -3057,8 +3240,18 @@ fn read_jsonl_values(path: &Path) -> Result<Vec<Value>, SweepError> {
 }
 
 pub fn encode_org_snapshots(repositories: Vec<RepositorySnapshot>) -> Result<Vec<u8>, SweepError> {
-    serde_json::to_vec(&OrgSnapshots { repositories })
-        .map_err(|error| SweepError::Acquisition(error.to_string()))
+    encode_org_snapshots_with_faults(repositories, Vec::new())
+}
+
+pub fn encode_org_snapshots_with_faults(
+    repositories: Vec<RepositorySnapshot>,
+    faults: Vec<String>,
+) -> Result<Vec<u8>, SweepError> {
+    serde_json::to_vec(&OrgSnapshots {
+        repositories,
+        faults,
+    })
+    .map_err(|error| SweepError::Acquisition(error.to_string()))
 }
 
 #[cfg(test)]
@@ -3449,8 +3642,8 @@ mod tests {
     }
 
     fn hold_policy() -> PolicyBundle {
-        PolicyBundle {
-            manifest: ostrom_core::PolicyManifest::from_yaml(
+        PolicyBundle::repository(
+            ostrom_core::PolicyManifest::from_yaml(
                 r#"
 manifest_version: 1
 defaults: {stalls_after: 7d}
@@ -3465,8 +3658,7 @@ denies:
 "#,
             )
             .expect("hold policy"),
-            checks: None,
-        }
+        )
     }
 
     fn hold_snapshots(numbers: &[u64]) -> Vec<RepositorySnapshot> {
@@ -3638,6 +3830,92 @@ denies:
     }
 
     #[test]
+    fn merged_pull_request_query_paginates_past_query_limit() {
+        let total = QUERY_LIMIT + 1;
+        let mut calls = Vec::new();
+        let pulls = fetch_merged_pull_requests_with(
+            "placeholder-org/alpha",
+            "merged:>=2026-07-23",
+            |search, page| {
+                calls.push((search.to_owned(), page));
+                let start = match page {
+                    1 => 0,
+                    2 => 100,
+                    3 => 200,
+                    other => panic!("unexpected page {other}"),
+                };
+                let end = (start + 100).min(total);
+                let pulls = (start..end)
+                    .map(|index| {
+                        json!({
+                            "number": index + 1,
+                            "title": format!("Placeholder merged pull request {}", index + 1),
+                            "author": {"login": "placeholder-bot[bot]", "__typename": "Bot"},
+                            "closingIssuesReferences": {"nodes": []},
+                            "createdAt": "2026-08-01T00:00:00Z",
+                            "mergedAt": "2026-08-02T00:00:00Z",
+                            "headRefOid": format!("placeholder-sha-{index}"),
+                            "state": "MERGED",
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                Ok(MergedPullRequestPage {
+                    total_count: total,
+                    incomplete: false,
+                    result_count: pulls.len(),
+                    pulls,
+                })
+            },
+        )
+        .expect("all merged pull-request pages are acquired");
+
+        assert_eq!(pulls.len(), total);
+        assert_eq!(calls.len(), 3);
+        assert!(
+            calls
+                .iter()
+                .all(|(search, _)| search == "merged:>=2026-07-23")
+        );
+        assert_eq!(calls[0].1, 1);
+        assert_eq!(calls[1].1, 2);
+        assert_eq!(calls[2].1, 3);
+        assert_eq!(pulls[200]["number"], 201);
+        assert_eq!(pulls[0]["author"]["isBot"], true);
+    }
+
+    #[test]
+    fn repository_acquisition_failure_is_isolated_within_organization() {
+        let repositories = vec![
+            RepositoryName::new("placeholder-org/alpha").expect("valid alpha repository"),
+            RepositoryName::new("placeholder-org/beta").expect("valid beta repository"),
+        ];
+        let (snapshots, faults) = acquire_repositories_independently(repositories, |repo| {
+            if repo.as_str().ends_with("/alpha") {
+                return Err(SweepError::Acquisition(
+                    "placeholder repository query failed".to_owned(),
+                ));
+            }
+            serde_json::from_value(json!({
+                "repo": repo.as_str(),
+                "issues": [],
+                "open_prs": [],
+                "merged_prs": [],
+                "default_branch": "main",
+                "branches": [],
+                "branch_read_degraded": false,
+                "ci_runs": [],
+            }))
+            .map_err(|error| SweepError::Fixture(error.to_string()))
+        });
+
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].repo.as_str(), "placeholder-org/beta");
+        assert_eq!(faults.len(), 1);
+        assert!(faults[0].contains("placeholder-org/alpha"));
+        assert!(faults[0].contains("placeholder repository query failed"));
+    }
+
+    #[test]
     fn local_work_order_snapshot_tolerates_absence_and_malformed_files() {
         let home = tempdir().expect("temporary Ostrom paths");
         let paths = OstromPaths {
@@ -3757,6 +4035,21 @@ denies:
     }
 
     #[cfg(unix)]
+    fn write_same_org_acquisition_guard_roster(home: &Path) {
+        fs::write(
+            home.join("mandates.yaml"),
+            concat!(
+                "cadence_hours: 1\n",
+                "stuck_after_days: 7\n",
+                "projects:\n",
+                "  - repo: placeholder-org/alpha\n",
+                "  - repo: placeholder-org/beta\n",
+            ),
+        )
+        .expect("write same-organization placeholder roster");
+    }
+
+    #[cfg(unix)]
     fn write_fixture_github_worker(home: &Path) {
         let worker = home.join("fixture-github-worker.sh");
         fs::write(
@@ -3771,6 +4064,10 @@ while [ "$#" -gt 0 ]; do
   fi
   shift
 done
+if [ "${OSTROM_TEST_ACQUISITION_GUARD_CHILD:-}" = "same-org-partial" ]; then
+  printf '%s\n' '{"repositories":[{"repo":"placeholder-org/alpha","issues":[],"open_prs":[],"merged_prs":[],"default_branch":"main","branches":[],"branch_read_degraded":false,"ci_runs":[]}],"faults":["repository acquisition failed for placeholder-org/beta: GitHub acquisition failed: placeholder query failed"]}'
+  exit 0
+fi
 case "$org" in
   placeholder-org) repo=placeholder-org/alpha ;;
   other-placeholder-org) repo=other-placeholder-org/beta ;;
@@ -3934,6 +4231,49 @@ printf '{"repositories":[{"repo":"%s","issues":[],"open_prs":[],"merged_prs":[],
             fs::read(home.path().join("previous/state.json")).expect("read previous state"),
             state_before
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_repository_failure_keeps_same_organization_siblings_and_adds_drift() {
+        if env::var(ACQUISITION_GUARD_CHILD).as_deref() == Ok("same-org-partial") {
+            let mut minter = FixtureMinter {
+                successful_anchors: BTreeSet::from(["placeholder-org/alpha".to_owned()]),
+            };
+            let (outcome, mirror) =
+                run_sweep_with_minter(&acquisition_guard_options(), &mut minter)
+                    .expect("the successful sibling keeps the sweep usable");
+            assert_eq!(mirror.len(), 1);
+            assert_eq!(mirror[0].repo.as_str(), "placeholder-org/alpha");
+            assert!(outcome.faults.iter().any(|fault| {
+                fault.contains("repository acquisition failed for placeholder-org/beta")
+            }));
+            return;
+        }
+
+        let home = tempdir().expect("temporary OSTROM_HOME");
+        write_same_org_acquisition_guard_roster(home.path());
+        write_fixture_github_worker(home.path());
+        let output = run_acquisition_guard_child(
+            home.path(),
+            "sweep::tests::one_repository_failure_keeps_same_organization_siblings_and_adds_drift",
+            "same-org-partial",
+        );
+        assert!(
+            output.status.success(),
+            "partial same-organization sweep stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let queue = read_queue(&home.path().join("queue.jsonl"))
+            .expect("read partial same-organization queue");
+        let drift = queue
+            .iter()
+            .map(QueueDocument::value)
+            .find(|row| row["id"] == "placeholder-org/beta#0")
+            .expect("failed repository drift row");
+        assert_eq!(drift["title"], "Sweep fault: portfolio data is incomplete");
+        assert_eq!(drift["kind"], "drift");
     }
 
     #[cfg(unix)]

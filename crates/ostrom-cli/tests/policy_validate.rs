@@ -1,4 +1,8 @@
-use std::{fs, path::PathBuf, process::Command};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use ostrom_core::{PolicyCandidate, PolicyManifest};
 use tempfile::TempDir;
@@ -26,6 +30,110 @@ fn signed_ostrom(manifest: &std::path::Path) -> Command {
         support::sign_manifest(manifest),
     );
     command
+}
+
+fn normalized_manifest(working_directory: &Path, manifest: &Path, trusted_keys: &Path) -> Vec<u8> {
+    let output = ostrom()
+        .env("OSTROM_POLICY_TRUSTED_KEYS", trusted_keys)
+        .current_dir(working_directory)
+        .args(["validate", "--normalized"])
+        .arg(manifest)
+        .output()
+        .expect("run normalized validate");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
+#[test]
+fn glob_includes_compose_identically_for_all_manifest_path_forms() {
+    let (root, manifest) = fixture();
+    let trusted_keys =
+        support::sign_manifest_from(&manifest, Path::new("manifest.yml"), root.path());
+
+    let bare = normalized_manifest(root.path(), Path::new("manifest.yml"), &trusted_keys);
+    let explicit = normalized_manifest(root.path(), Path::new("./manifest.yml"), &trusted_keys);
+    let absolute = normalized_manifest(root.path(), &manifest, &trusted_keys);
+
+    assert_eq!(bare, explicit);
+    assert_eq!(bare, absolute);
+}
+
+#[test]
+fn a_glob_whose_directory_is_missing_is_refused_like_any_other_empty_glob() {
+    // Depth must not decide this. `gone/*.yml` and `gone/deeper/*.yml` describe
+    // the same missing directory, and both are far more likely to be a typo than
+    // an intentionally absent tree — a manifest that silently composes zero
+    // includes is a manifest with no governance in it.
+    for pattern in ["gone/*.yml", "gone/deeper/*.yml"] {
+        let temporary = TempDir::new().expect("temporary directory");
+        fs::write(
+            temporary.path().join("manifest.yml"),
+            format!("manifest_version: 1\nincludes: [{pattern}]\nactors: {{builder: {{}}}}\n"),
+        )
+        .expect("write manifest");
+
+        let output = ostrom()
+            .current_dir(temporary.path())
+            .args(["sign", "--key-id", "unused", "--key", "unused.pem"])
+            .arg("manifest.yml")
+            .output()
+            .expect("run policy signer");
+        assert!(!output.status.success(), "{pattern} must not load");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("matched no files"),
+            "{pattern}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn a_glob_with_an_existing_base_and_no_matches_is_refused() {
+    let temporary = TempDir::new().expect("temporary directory");
+    fs::create_dir(temporary.path().join("optional")).expect("create optional directory");
+    fs::write(
+        temporary.path().join("manifest.yml"),
+        "manifest_version: 1\nincludes: [optional/*.yml]\n",
+    )
+    .expect("write manifest");
+
+    let output = ostrom()
+        .current_dir(temporary.path())
+        .args(["sign", "--key-id", "unused", "--key", "unused.pem"])
+        .arg("manifest.yml")
+        .output()
+        .expect("run policy signer");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("matched no files"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn non_glob_includes_compose_identically_for_all_manifest_path_forms() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let manifest = temporary.path().join("manifest.yml");
+    fs::write(&manifest, "manifest_version: 1\nincludes: [builder.yml]\n").expect("write manifest");
+    fs::write(
+        temporary.path().join("builder.yml"),
+        "actor: builder\nname: Placeholder builder\n",
+    )
+    .expect("write included actor");
+    let trusted_keys = support::sign_manifest(&manifest);
+
+    let bare = normalized_manifest(temporary.path(), Path::new("manifest.yml"), &trusted_keys);
+    let explicit =
+        normalized_manifest(temporary.path(), Path::new("./manifest.yml"), &trusted_keys);
+    let absolute = normalized_manifest(temporary.path(), &manifest, &trusted_keys);
+
+    assert_eq!(bare, explicit);
+    assert_eq!(bare, absolute);
 }
 
 #[test]
@@ -61,10 +169,11 @@ fn validate_and_normalized_accept_the_composed_fixture() {
 
 #[test]
 fn fixture_reproduces_builder_decisions_for_all_eleven_repositories() {
-    let (_root, manifest) = fixture();
+    let (root, manifest) = fixture();
     let output = signed_ostrom(&manifest)
+        .current_dir(root.path())
         .args(["validate", "--normalized"])
-        .arg(manifest)
+        .arg("manifest.yml")
         .output()
         .expect("run normalized validate");
     assert!(output.status.success());
@@ -226,7 +335,7 @@ fn require_naming_an_undefined_check_fails_the_load() {
     .expect("write manifest");
     fs::write(
         temporary.path().join("checks.yaml"),
-        "checks_version: 1\nchecks:\n  available-placeholder-check:\n    uses: cmd/run\n    with: {script: 'exit 0'}\n",
+        "check: available-placeholder-check\nuses: cmd/run\nwith: {script: 'exit 0'}\n",
     )
     .expect("write checks");
 
@@ -241,10 +350,11 @@ fn require_naming_an_undefined_check_fails_the_load() {
         stderr.contains("requires undefined check `missing-placeholder-check`"),
         "{stderr}"
     );
+    assert!(stderr.contains("add its file to `includes:`"), "{stderr}");
 }
 
 #[test]
-fn require_resolves_a_sibling_check_by_exact_name() {
+fn require_resolves_an_included_check_by_exact_name() {
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/checks-verdict");
     let root = support::copy_fixture_directory(&source);
     let fixture = root.path().join("manifest.yml");
@@ -295,7 +405,7 @@ fn grant_requires_naming_an_undefined_check_fails_the_load() {
     .expect("write manifest");
     fs::write(
         temporary.path().join("checks.yaml"),
-        "checks_version: 1\nchecks:\n  available-placeholder-check:\n    uses: cmd/run\n    with: {script: 'exit 0'}\n",
+        "check: available-placeholder-check\nuses: cmd/run\nwith: {script: 'exit 0'}\n",
     )
     .expect("write checks");
 
@@ -396,6 +506,157 @@ fn changing_an_included_leaf_after_signing_is_refused() {
         .expect("validate changed included leaf");
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("verification failed"));
+}
+
+#[test]
+fn changing_an_included_check_script_after_signing_is_refused() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let manifest = temporary.path().join("manifest.yml");
+    let checks = temporary.path().join("checks.yaml");
+    fs::write(
+        &manifest,
+        "manifest_version: 1\nincludes: [checks.yaml]\noperations:\n  merge:\n    steps:\n      - uses: gh/merge-pr\n        requires: ready-to-merge\n",
+    )
+    .expect("write root manifest");
+    fs::write(
+        &checks,
+        "check: ready-to-merge\nuses: cmd/run\nwith: {script: 'exit 0'}\n",
+    )
+    .expect("write check leaf");
+    let trusted = support::sign_manifest(&manifest);
+    fs::write(
+        &checks,
+        "check: ready-to-merge\nuses: cmd/run\nwith: {script: 'exit 1'}\n",
+    )
+    .expect("change check script after signing");
+
+    let output = ostrom()
+        .env("OSTROM_POLICY_TRUSTED_KEYS", trusted)
+        .args(["validate"])
+        .arg(manifest)
+        .output()
+        .expect("validate changed check leaf");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("verification failed"));
+}
+
+#[test]
+fn changing_an_inline_check_action_after_signing_is_refused() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let manifest = temporary.path().join("manifest.yml");
+    fs::write(
+        &manifest,
+        "manifest_version: 1\nchecks:\n  ready-to-merge:\n    uses: cmd/run\n    with: {script: 'exit 0'}\n",
+    )
+    .expect("write inline check");
+    let trusted = support::sign_manifest(&manifest);
+    fs::write(
+        &manifest,
+        "manifest_version: 1\nchecks:\n  ready-to-merge:\n    uses: gh/check-run\n    with: {name: rust}\n",
+    )
+    .expect("change check action after signing");
+
+    let output = ostrom()
+        .env("OSTROM_POLICY_TRUSTED_KEYS", trusted)
+        .args(["validate"])
+        .arg(manifest)
+        .output()
+        .expect("validate changed inline check");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("verification failed"));
+}
+
+#[test]
+fn inline_and_leaf_checks_compose_and_sign_identically() {
+    let inline_root = TempDir::new().expect("temporary inline directory");
+    let inline_manifest = inline_root.path().join("manifest.yml");
+    fs::write(
+        &inline_manifest,
+        "manifest_version: 1\ndefaults:\n  check: {inconclusive_policy: warn}\nchecks:\n  ready-to-merge:\n    uses: gh/check-run\n    with: {required: [rust]}\n    inconclusive_policy: block\n",
+    )
+    .expect("write inline manifest");
+
+    let leaf_root = TempDir::new().expect("temporary leaf directory");
+    let leaf_manifest = leaf_root.path().join("manifest.yml");
+    fs::write(
+        &leaf_manifest,
+        "manifest_version: 1\nincludes: [checks.yaml]\ndefaults:\n  check: {inconclusive_policy: warn}\n",
+    )
+    .expect("write leaf manifest");
+    fs::write(
+        leaf_root.path().join("checks.yaml"),
+        "check: ready-to-merge\nuses: gh/check-run\nwith: {required: [rust]}\ninconclusive_policy: block\n",
+    )
+    .expect("write check leaf");
+
+    let inline_trusted = support::sign_manifest(&inline_manifest);
+    let leaf_trusted = support::sign_manifest(&leaf_manifest);
+    let inline_normalized = ostrom()
+        .env("OSTROM_POLICY_TRUSTED_KEYS", inline_trusted)
+        .args(["validate", "--normalized"])
+        .arg(&inline_manifest)
+        .output()
+        .expect("normalize inline manifest");
+    let leaf_normalized = ostrom()
+        .env("OSTROM_POLICY_TRUSTED_KEYS", leaf_trusted)
+        .args(["validate", "--normalized"])
+        .arg(&leaf_manifest)
+        .output()
+        .expect("normalize leaf manifest");
+    assert!(inline_normalized.status.success());
+    assert!(leaf_normalized.status.success());
+    assert_eq!(inline_normalized.stdout, leaf_normalized.stdout);
+    assert_eq!(
+        fs::read(inline_manifest.with_extension("yml.sig")).expect("read inline signature"),
+        fs::read(leaf_manifest.with_extension("yml.sig")).expect("read leaf signature")
+    );
+}
+
+#[test]
+fn a_check_leaf_with_another_identity_key_is_refused() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let manifest = temporary.path().join("manifest.yml");
+    fs::write(&manifest, "manifest_version: 1\nincludes: [checks.yaml]\n")
+        .expect("write root manifest");
+    fs::write(
+        temporary.path().join("checks.yaml"),
+        "check: ready-to-merge\nactor: builder\nuses: cmd/run\nwith: {script: 'exit 0'}\n",
+    )
+    .expect("write ambiguous leaf");
+
+    let output = ostrom()
+        .args(["validate"])
+        .arg(manifest)
+        .output()
+        .expect("validate ambiguous leaf");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("multiple identity keys")
+            && stderr.contains("actor")
+            && stderr.contains("check"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_manifest_without_checks_still_signs_and_verifies() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let manifest = temporary.path().join("manifest.yml");
+    fs::write(&manifest, "manifest_version: 1\nactors: {builder: {}}\n").expect("write manifest");
+    let trusted = support::sign_manifest(&manifest);
+
+    let output = ostrom()
+        .env("OSTROM_POLICY_TRUSTED_KEYS", trusted)
+        .args(["validate"])
+        .arg(manifest)
+        .output()
+        .expect("validate manifest without checks");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

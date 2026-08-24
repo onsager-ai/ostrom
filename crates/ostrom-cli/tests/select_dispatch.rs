@@ -128,6 +128,21 @@ fn selection_matches_recorded_shell_bytes() {
 }
 
 #[test]
+fn selection_usage_matches_the_accepted_argument_shapes() {
+    let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .args(["select-work", "list", "placeholder-owner"])
+        .output()
+        .expect("invalid list selection");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        output.stderr,
+        b"usage: ostrom select-work list | select <owner> [already-attempted-id ...]\n"
+    );
+}
+
+#[test]
 fn production_scale_state_is_read_from_file_and_selects_work() {
     let fixture = tempdir().expect("fixture");
     write_selection_fixture(fixture.path(), 700 * 1024);
@@ -324,6 +339,40 @@ fn list_and_empty_select_record_plan_application_without_a_selected_item() {
     for field in ["selected", "repo", "ref"] {
         assert!(rows[1]["fact"].get(field).is_none(), "unexpected {field}");
     }
+}
+
+#[test]
+fn principal_state_transition_changes_the_selection_candidate_immediately() {
+    let fixture = tempdir().expect("fixture");
+    write_selection_fixture(fixture.path(), 0);
+    let queue_path = fixture.path().join("queue.jsonl");
+    let pending = fs::read_to_string(&queue_path)
+        .expect("read queue")
+        .replace(
+            "\"kind\":\"moved\",\"mandate\":{\"reason\":\"placeholder\"},\"state\":\"pending\"",
+            "\"kind\":\"decision\",\"mandate\":{\"reason\":\"placeholder\"},\"state\":\"pending\"",
+        );
+    fs::write(&queue_path, pending).expect("make first item await principal");
+
+    let run_list = || {
+        Command::new(env!("CARGO_BIN_EXE_ostrom"))
+            .args(["select-work", "list"])
+            .env("OSTROM_HOME", fixture.path())
+            .current_dir(fixture.path())
+            .output()
+            .expect("list selection")
+    };
+    let before = run_list();
+    assert!(before.status.success());
+    assert!(!String::from_utf8_lossy(&before.stdout).contains("placeholder-org/alpha#1"));
+
+    let approved = fs::read_to_string(&queue_path)
+        .expect("read pending queue")
+        .replace("\"state\":\"pending\"", "\"state\":\"approved\"");
+    fs::write(&queue_path, approved).expect("approve first item");
+    let after = run_list();
+    assert!(after.status.success());
+    assert!(String::from_utf8_lossy(&after.stdout).contains("placeholder-org/alpha#1"));
 }
 
 #[test]

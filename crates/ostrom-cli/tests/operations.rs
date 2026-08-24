@@ -140,11 +140,11 @@ fn mediated_action_receives_only_its_catalogued_scope() {
 fn failed_guard_stops_before_the_mediated_action() {
     use std::os::unix::fs::PermissionsExt as _;
 
-    let policy = "manifest_version: 1\nactors: {gatekeeper: {}}\noperations:\n  merge:\n    steps:\n      - uses: gh/merge-pr\n        requires: ready\ngrants:\n  gatekeeper-merge: {actors: gatekeeper, operations: merge, repositories: placeholder-org/repo}\n";
+    let policy = "manifest_version: 1\nincludes: [checks.yaml]\nactors: {gatekeeper: {}}\noperations:\n  merge:\n    steps:\n      - uses: gh/merge-pr\n        requires: ready\ngrants:\n  gatekeeper-merge: {actors: gatekeeper, operations: merge, repositories: placeholder-org/repo}\n";
     let root = fixture(policy);
     fs::write(
         root.path().join("checks.yaml"),
-        "checks_version: 1\nchecks:\n  ready:\n    uses: cmd/run\n    with: {script: 'exit 1'}\n",
+        "check: ready\nuses: cmd/run\nwith: {script: 'exit 1'}\n",
     )
     .expect("write checks");
     let capture = root.path().join("action-ran.txt");

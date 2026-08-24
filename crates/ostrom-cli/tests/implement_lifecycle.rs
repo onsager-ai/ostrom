@@ -43,6 +43,7 @@ impl Fixture {
         );
         git(&source, &["config", "user.name", "Fixture"]);
         fs::write(source.join("README.md"), "placeholder\n").expect("write source");
+        fs::write(source.join(".gitignore"), "target/\n").expect("write gitignore");
         fs::create_dir_all(source.join(".github/workflows")).expect("create workflow fixture");
         fs::write(
             source.join(".github/workflows/existing.yml"),
@@ -51,7 +52,12 @@ impl Fixture {
         .expect("write baseline workflow");
         git(
             &source,
-            &["add", "README.md", ".github/workflows/existing.yml"],
+            &[
+                "add",
+                "README.md",
+                ".gitignore",
+                ".github/workflows/existing.yml",
+            ],
         );
         git(&source, &["commit", "-m", "base"]);
         git(
@@ -107,6 +113,8 @@ impl Fixture {
                 "  config) printf '%s\\n' 'Error loading config.toml: placeholder configuration' >&2; exit 1 ;;\n",
                 "  config-required) printf '%s\\n' 'Error: features.placeholder is required when fixture is enabled' >&2; exit 1 ;;\n",
                 "  model-failure) exit 1 ;;\n",
+                "  quota-error) printf '%s\\n' \"{\\\"type\\\":\\\"error\\\",\\\"message\\\":\\\"You've hit your usage limit. Try again at 11:34 AM.\\\"}\"; exit 1 ;;\n",
+                "  quota-turn-failed) printf '%s\\n' \"{\\\"type\\\":\\\"turn.failed\\\",\\\"error\\\":{\\\"message\\\":\\\"You've hit your usage limit. Try again at 12:34 PM.\\\"}}\"; exit 1 ;;\n",
                 "  partial-failure)\n",
                 "    printf '%s\\n' partial >\"$worktree/partial.txt\"\n",
                 "    printf '%s\\n' \"$FAKE_CODEX_USAGE_JSON\"\n",
@@ -135,6 +143,8 @@ impl Fixture {
                 "    trap 'exit 143' TERM\n",
                 "    while :; do sleep 1; done ;;\n",
                 "  *)\n",
+                "    mkdir -p \"$worktree/target\"\n",
+                "    printf '%s\\n' artifact >\"$worktree/target/placeholder\"\n",
                 "    printf '%s\\n' completed >>\"$worktree/README.md\"\n",
                 "    printf '%s\\n' done >\"$result\"\n",
                 "    usage=${FAKE_CODEX_USAGE_JSON:-}\n",
@@ -369,6 +379,10 @@ fn public_repository_reaches_codex_and_uses_the_rust_cli_publication_boundary() 
         fs::read_to_string(worktree.join("README.md"))
             .expect("read implementation")
             .contains("completed")
+    );
+    assert!(
+        !worktree.join("target").exists(),
+        "terminal work orders must not retain build artifacts"
     );
     let terminal = fixture.trace().pop().expect("completion trace");
     assert_eq!(terminal["kind"], "work-completed");
@@ -625,21 +639,34 @@ fn a_clean_historical_worktree_is_retargeted_to_the_order_branch() {
 
 #[test]
 fn codex_invocation_failures_are_named_and_release_the_lease() {
-    for (mode, code, reason) in [
-        ("usage", 2, "codex-invocation-invalid"),
-        ("config", 1, "codex-invocation-invalid"),
-        ("config-required", 1, "codex-invocation-invalid"),
-        ("model-failure", 1, "codex-exit-1"),
+    for (mode, code, reason, message) in [
+        ("usage", 2, "codex-invocation-invalid", None),
+        ("config", 1, "codex-invocation-invalid", None),
+        ("config-required", 1, "codex-invocation-invalid", None),
+        ("model-failure", 1, "codex-exit-1", None),
+        (
+            "quota-error",
+            1,
+            "codex-unavailable",
+            Some("You've hit your usage limit. Try again at 11:34 AM."),
+        ),
+        (
+            "quota-turn-failed",
+            1,
+            "codex-unavailable",
+            Some("You've hit your usage limit. Try again at 12:34 PM."),
+        ),
     ] {
         let fixture = Fixture::new(100);
         fixture.acquire();
         let status = fixture.command(mode).status().expect("run implementer");
         assert_eq!(status.code(), Some(code));
         assert!(!fixture.lease_file.exists());
-        assert_eq!(
-            fixture.trace().pop().expect("failure trace")["fact"]["reason"],
-            reason
-        );
+        let terminal = fixture.trace().pop().expect("failure trace");
+        assert_eq!(terminal["fact"]["reason"], reason);
+        if let Some(message) = message {
+            assert_eq!(terminal["fact"]["message"], message);
+        }
     }
 }
 

@@ -3,6 +3,8 @@ use std::{fs, path::Path, process::Command, time::SystemTime};
 use chrono::{DateTime, Utc};
 use tempfile::tempdir;
 
+mod support;
+
 const ROSTER: &str = r#"
 provider: file
 cadence_hours: 1
@@ -28,10 +30,16 @@ projects:
     bounce: []
 "#;
 
+fn install_repository_policy(home: &Path) -> std::path::PathBuf {
+    fs::write(home.join("ostrom.yaml"), "manifest_version: 1\n").expect("write repository policy");
+    support::sign_manifest(&home.join("ostrom.yaml"))
+}
+
 #[test]
 fn fixture_sweep_queue_is_byte_identical_to_recorded_cross_org_output() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let home = tempdir().expect("temporary OSTROM_HOME");
+    let trusted_keys = install_repository_policy(home.path());
     fs::write(home.path().join("mandates.yaml"), ROSTER).expect("write fixture roster");
     fs::write(
         home.path().join("gate.jsonl"),
@@ -53,6 +61,7 @@ fn fixture_sweep_queue_is_byte_identical_to_recorded_cross_org_output() {
             "2026-08-01T00:00:00Z",
         ])
         .env("OSTROM_HOME", home.path())
+        .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
         .current_dir(home.path())
         .output()
         .expect("run Rust fixture sweep");
@@ -72,6 +81,7 @@ fn fixture_sweep_queue_is_byte_identical_to_recorded_cross_org_output() {
 fn fixture_sweep_turns_a_stale_work_ranking_pointer_into_a_visible_fault() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let home = tempdir().expect("temporary OSTROM_HOME");
+    let trusted_keys = install_repository_policy(home.path());
     let ranked_roster = ROSTER.replace(
         "hold_labels: []\n",
         concat!(
@@ -94,6 +104,7 @@ fn fixture_sweep_turns_a_stale_work_ranking_pointer_into_a_visible_fault() {
             "2026-08-01T00:00:00Z",
         ])
         .env("OSTROM_HOME", home.path())
+        .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
         .current_dir(home.path())
         .output()
         .expect("run ranked fixture sweep");
@@ -138,6 +149,7 @@ fn fixture_sweep_turns_a_stale_work_ranking_pointer_into_a_visible_fault() {
 fn fixture_sweep_refuses_a_query_at_the_exhaustiveness_cap() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let home = tempdir().expect("temporary OSTROM_HOME");
+    let trusted_keys = install_repository_policy(home.path());
     fs::write(home.path().join("mandates.yaml"), ROSTER).expect("write fixture roster");
     let fixture: serde_json::Value = serde_json::from_slice(
         &fs::read(root.join("tests/fixtures/sweep-cross-org.json")).expect("read fixture"),
@@ -162,6 +174,7 @@ fn fixture_sweep_refuses_a_query_at_the_exhaustiveness_cap() {
             "2026-08-01T00:00:00Z",
         ])
         .env("OSTROM_HOME", home.path())
+        .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
         .current_dir(home.path())
         .output()
         .expect("run truncated fixture sweep");
@@ -181,6 +194,7 @@ fn fixture_sweep_refuses_a_query_at_the_exhaustiveness_cap() {
 fn incremental_fixture_retains_unchanged_issue_records_and_queue_bytes() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let home = tempdir().expect("temporary OSTROM_HOME");
+    let trusted_keys = install_repository_policy(home.path());
     fs::write(home.path().join("mandates.yaml"), ROSTER).expect("write fixture roster");
     fs::write(
         home.path().join("gate.jsonl"),
@@ -200,6 +214,7 @@ fn incremental_fixture_retains_unchanged_issue_records_and_queue_bytes() {
             "2026-08-01T00:00:00Z",
         ])
         .env("OSTROM_HOME", home.path())
+        .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
         .current_dir(home.path())
         .output()
         .expect("run full fixture sweep");
@@ -228,6 +243,7 @@ fn incremental_fixture_retains_unchanged_issue_records_and_queue_bytes() {
             "2026-08-01T01:00:00Z",
         ])
         .env("OSTROM_HOME", home.path())
+        .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
         .current_dir(home.path())
         .output()
         .expect("run incremental fixture sweep");
@@ -294,12 +310,20 @@ case "$1 $2" in
   "api -X")
     case "$*" in
       *"/branches?"*) printf '%s\n' '[]'; exit 0 ;;
+      *"search/issues"*) printf '%s\n' '{"total_count":1,"incomplete_results":false,"items":[{"node_id":"PR_placeholder"}]}'; exit 0 ;;
     esac
     printf 'HTTP/2 304 Not Modified\r\netag: fixture-etag\r\n\r\n'
     exit 1
     ;;
   "api graphql")
-    printf '%s\n' '{"data":{"repository":{"issues":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}'
+    case "$*" in
+      *"OstromMergedPullRequestNodes"*)
+        printf '%s\n' '{"data":{"nodes":[{"number":17,"title":"Placeholder merged pull request","author":{"login":"placeholder-bot[bot]","__typename":"Bot"},"closingIssuesReferences":{"nodes":[]},"createdAt":"2026-07-31T00:00:00Z","mergedAt":"2026-08-01T00:00:00Z","headRefOid":"placeholder-merged-sha","state":"MERGED"}]}}'
+        ;;
+      *)
+        printf '%s\n' '{"data":{"repository":{"issues":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}'
+        ;;
+    esac
     ;;
   "pr list") printf '%s\n' '[]' ;;
   "repo view") printf '%s\n' '{"defaultBranchRef":{"name":"main"}}' ;;
@@ -341,14 +365,23 @@ esac
     let snapshots: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("parse worker snapshots");
     assert_eq!(snapshots["repositories"][0]["issue_not_modified"], true);
+    assert_eq!(
+        snapshots["repositories"][0]["merged_prs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
     let calls = fs::read_to_string(log).expect("read gh call log");
     assert!(calls.contains("If-None-Match: fixture-etag"));
     assert!(calls.contains("since=2026-07-31T00:00:00Z"));
     assert!(calls.contains("api graphql -f query=query OstromDependencyGraph"));
     assert!(calls.contains("pr list --repo example-org/example-repo --state open --limit 200"));
     assert!(calls.contains(
-        "pr list --repo example-org/example-repo --state merged --search merged:>=2026-07-02 --limit 200"
+        "api -X GET search/issues -f q=repo:example-org/example-repo is:pr is:merged merged:>=2026-07-02 -F per_page=100 -F page=1"
     ));
+    assert!(calls.contains("api graphql -f query=query OstromMergedPullRequestNodes"));
+    assert!(calls.contains("-F ids[]=PR_placeholder"));
     assert!(!calls.contains("--state all --limit 200"));
     assert!(
         calls.contains("api -X GET repos/example-org/example-repo/branches?per_page=100&page=1")
@@ -375,6 +408,7 @@ projects:
 
 fn write_placeholder_fixture(home: &Path, repository: serde_json::Value) -> std::path::PathBuf {
     fs::write(home.join("mandates.yaml"), PLACEHOLDER_ROSTER).expect("write placeholder roster");
+    install_repository_policy(home);
     let fixture = home.join("fixture.json");
     fs::write(
         &fixture,
@@ -392,6 +426,10 @@ fn run_placeholder_sweep(home: &Path, fixture: &Path, extra: &[&str]) -> std::pr
     command.args(extra);
     command
         .env("OSTROM_HOME", home)
+        .env(
+            "OSTROM_POLICY_TRUSTED_KEYS",
+            home.join("trusted-policy-keys"),
+        )
         .current_dir(home)
         .output()
         .expect("run placeholder sweep")
@@ -629,7 +667,7 @@ fn fixture_refuses_a_full_second_branch_page() {
 
 #[cfg(unix)]
 #[test]
-fn github_worker_refuses_a_full_second_branch_page() {
+fn github_worker_reports_a_full_second_branch_page_as_a_repository_fault() {
     use std::{env, os::unix::fs::PermissionsExt};
 
     let home = tempdir().expect("temporary OSTROM_HOME");
@@ -658,11 +696,19 @@ case "$1 $2" in
     case "$*" in
       *"/issues?"*) printf 'HTTP/2 200 OK\r\netag: placeholder-etag\r\n\r\n[]' ;;
       *"/branches?"*) branch_page ;;
+      *"search/issues"*) printf '%s\n' '{"total_count":0,"items":[]}' ;;
       *) exit 9 ;;
     esac
     ;;
   "api graphql")
-    printf '%s\n' '{"data":{"repository":{"issues":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}'
+    case "$*" in
+      *"OstromMergedPullRequests"*)
+        printf '%s\n' '{"data":{"search":{"issueCount":0,"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}'
+        ;;
+      *)
+        printf '%s\n' '{"data":{"repository":{"issues":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}'
+        ;;
+    esac
     ;;
   "pr list") printf '%s\n' '[]' ;;
   "repo view") printf '%s\n' '{"defaultBranchRef":{"name":"main"}}' ;;
@@ -694,10 +740,20 @@ esac
         .current_dir(home.path())
         .output()
         .expect("run GitHub worker");
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains(
-        "branch query for placeholder-org/alpha reached query_limit 200; refusing a truncated sweep"
-    ));
+    assert!(
+        output.status.success(),
+        "worker stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse repository fault response");
+    assert_eq!(result["repositories"], serde_json::json!([]));
+    assert!(result["faults"][0]
+        .as_str()
+        .expect("repository fault")
+        .contains(
+            "branch query for placeholder-org/alpha reached query_limit 200; refusing a truncated sweep"
+        ));
 }
 
 #[test]
@@ -714,6 +770,10 @@ fn realtime_clock_drives_sweep_and_cli_time_takes_precedence() {
         .args(["sweep", "--fixture"])
         .arg(&fixture)
         .env("OSTROM_HOME", home.path())
+        .env(
+            "OSTROM_POLICY_TRUSTED_KEYS",
+            home.path().join("trusted-policy-keys"),
+        )
         .current_dir(home.path())
         .output()
         .expect("run realtime sweep");
@@ -736,6 +796,10 @@ fn realtime_clock_drives_sweep_and_cli_time_takes_precedence() {
             "2026-08-03T04:05:06Z",
         ])
         .env("OSTROM_HOME", home.path())
+        .env(
+            "OSTROM_POLICY_TRUSTED_KEYS",
+            home.path().join("trusted-policy-keys"),
+        )
         .current_dir(home.path())
         .output()
         .expect("run CLI-overridden sweep");
@@ -756,6 +820,10 @@ fn realtime_clock_drives_plan_and_cli_time_takes_precedence() {
         .args(["plan", "--fixture"])
         .arg(&fixture)
         .env("OSTROM_HOME", home.path())
+        .env(
+            "OSTROM_POLICY_TRUSTED_KEYS",
+            home.path().join("trusted-policy-keys"),
+        )
         .current_dir(home.path())
         .output()
         .expect("run realtime plan");
@@ -789,6 +857,10 @@ fn realtime_clock_drives_plan_and_cli_time_takes_precedence() {
             "2026-08-05T06:07:08Z",
         ])
         .env("OSTROM_HOME", home.path())
+        .env(
+            "OSTROM_POLICY_TRUSTED_KEYS",
+            home.path().join("trusted-policy-keys"),
+        )
         .current_dir(home.path())
         .output()
         .expect("run CLI-overridden plan");
@@ -799,6 +871,9 @@ fn realtime_clock_drives_plan_and_cli_time_takes_precedence() {
 fn an_entirely_unmintable_roster_is_refused_without_overwriting() {
     let home = tempdir().expect("temporary OSTROM_HOME");
     fs::write(home.path().join("mandates.yaml"), PLACEHOLDER_ROSTER).expect("write roster");
+    fs::write(home.path().join("ostrom.yaml"), "manifest_version: 1\n")
+        .expect("write repository policy");
+    support::sign_manifest(&home.path().join("ostrom.yaml"));
     let queue_before = br##"{"id":"placeholder-org/alpha#7","repo":"placeholder-org/alpha","ref":"#7","title":"Placeholder retained decision","kind":"decision","mandate":{"reason":"placeholder"},"state":"deferred","opened":"2026-07-01T00:00:00Z","age_days":31,"aged_out":true,"needs_judgment":true,"blocked_by":[]}
 "##;
     let state_before = br#"{"version":2,"sweep_mode":"full","repos":{"placeholder-org/alpha":{"cursor":"2026-07-01T00:00:00Z","records":{}}}}"#;
@@ -808,6 +883,10 @@ fn an_entirely_unmintable_roster_is_refused_without_overwriting() {
     let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
         .args(["sweep", "--started-at", "2026-08-01T00:00:00Z"])
         .env("OSTROM_HOME", home.path())
+        .env(
+            "OSTROM_POLICY_TRUSTED_KEYS",
+            home.path().join("trusted-policy-keys"),
+        )
         .env("MANDATE_SECRETS_FILE", home.path().join("absent.yaml"))
         .current_dir(home.path())
         .output()

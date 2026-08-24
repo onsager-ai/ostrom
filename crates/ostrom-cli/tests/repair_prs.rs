@@ -109,7 +109,7 @@ esac
     assert!(usage.stdout.is_empty());
     assert_eq!(
         usage.stderr,
-        b"usage: repair-prs.sh <builder-lease-owner>\n"
+        b"usage: ostrom repair-prs <builder-lease-owner>\n"
     );
 
     let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
@@ -436,7 +436,7 @@ fi
     assert!(!calls.contains("gh pr view 2 "));
     assert!(!calls.contains("gh pr view 6 "));
     assert!(!calls.contains("gh pr view 7 "));
-    assert_eq!(calls.matches("gh api graphql").count(), 3);
+    assert_eq!(calls.matches("gh api graphql").count(), 2);
     assert_eq!(calls.matches(" gh api repos/").count(), 2);
     assert!(calls.contains(
         "--permissions metadata:read,pull_requests:read,checks:read,statuses:read -- gh api graphql"
@@ -491,13 +491,13 @@ fi
     );
     assert_eq!(green_conflicting[0]["narration"], json!({}));
 
-    let red_base = traces_for(3);
-    assert_eq!(red_base.len(), 1);
-    assert_eq!(red_base[0]["fact"]["outcome"], "red-head-red-base");
-    assert_eq!(red_base[0]["fact"]["base_sha"], red_base_head);
+    let red_conflicting = traces_for(3);
+    assert_eq!(red_conflicting.len(), 1);
+    assert_eq!(red_conflicting[0]["fact"]["outcome"], "checks-failed");
+    assert_eq!(red_conflicting[0]["fact"]["base_sha"], Value::Null);
     assert_eq!(
-        red_base[0]["narration"]["reason"],
-        "head and base branch checks are not green"
+        red_conflicting[0]["narration"]["reason"],
+        "completed head checks are not green"
     );
 
     let red_mergeable = traces_for(4);
@@ -544,4 +544,219 @@ fi
         skipped_cap[0]["narration"]["reason"],
         "per-pass repair cap reached"
     );
+}
+
+#[test]
+fn repair_distinguishes_absent_pending_failed_and_green_checks() {
+    let fixture = tempdir().expect("temporary check-state repair fixture");
+    let home = fixture.path().join("home");
+    let source = fixture.path().join("source");
+    let remote = fixture.path().join("origin.git");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&source).unwrap();
+    fs::write(
+        home.join("mandates.yaml"),
+        r#"provider: file
+cadence_hours: 24
+stuck_after_days: 7
+search_roots: []
+bounce_all: []
+projects:
+  - repo: placeholder-org/check-state-repo
+    delegated: []
+    excluded: []
+    reserved: []
+    default: delegated
+    paused: false
+    bounce: []
+"#,
+    )
+    .unwrap();
+
+    git(&source, &["init", "-b", "main"]);
+    git(&source, &["config", "user.name", "Placeholder Test"]);
+    git(
+        &source,
+        &["config", "user.email", "placeholder@example.invalid"],
+    );
+    fs::write(source.join("initial.txt"), "initial\n").unwrap();
+    git(&source, &["add", "initial.txt"]);
+    git(&source, &["commit", "-m", "fixture initial"]);
+    let initial = String::from_utf8(git(&source, &["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    let init_remote = Command::new("git")
+        .args(["init", "--bare"])
+        .arg(&remote)
+        .output()
+        .unwrap();
+    assert!(init_remote.status.success());
+    git(
+        &source,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    git(&source, &["push", "-u", "origin", "main"]);
+    git(&source, &["switch", "main"]);
+    fs::write(source.join("base.txt"), "base\n").unwrap();
+    git(&source, &["add", "base.txt"]);
+    git(&source, &["commit", "-m", "fixture base"]);
+    let base_head = String::from_utf8(git(&source, &["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    git(&source, &["push", "origin", "main"]);
+
+    let born_head = publish_fixture_branch(&source, "born-head", &initial, "born.txt");
+    let merge_ref_head =
+        publish_fixture_branch(&source, "merge-ref-head", &initial, "merge-ref.txt");
+    let pending_head = publish_fixture_branch(&source, "pending-head", &initial, "pending.txt");
+    let failed_head = publish_fixture_branch(&source, "failed-head", &initial, "failed.txt");
+    let green_head = publish_fixture_branch(&source, "green-head", &initial, "green.txt");
+
+    let listing = fixture.path().join("prs.json");
+    let pull_request = |number: u64, head_branch: &str, head_sha: &str| {
+        json!({
+            "number": number,
+            "body": "Synthetic fixture.\n\nOstrom-Role: builder\n",
+            "author": {"login": "ostrom-builder[bot]", "is_bot": true},
+            "mergeable": "CONFLICTING",
+            "headRefName": head_branch,
+            "baseRefName": "main",
+            "headRefOid": head_sha,
+            "isCrossRepository": false
+        })
+    };
+    fs::write(
+        &listing,
+        serde_json::to_vec(&json!([
+            pull_request(11, "born-head", &born_head),
+            pull_request(12, "merge-ref-head", &merge_ref_head),
+            pull_request(13, "pending-head", &pending_head),
+            pull_request(14, "failed-head", &failed_head),
+            pull_request(15, "green-head", &green_head),
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let calls = fixture.path().join("calls");
+    let helper = fixture.path().join("credential-helper");
+    executable(
+        &helper,
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >>"$REPAIR_CALLS"
+shift 2
+while [ "$1" != "--" ]; do shift; done
+shift
+if [ "$1 $2 $3" = "gh pr list" ]; then
+  cat "$REPAIR_LISTING"
+elif [ "$1 $2 $3" = "gh pr view" ]; then
+  case "$4" in
+    11|12) printf '%s\n' '{"statusCheckRollup":[]}' ;;
+    13) printf '%s\n' '{"statusCheckRollup":[{"name":"test","conclusion":null,"status":"IN_PROGRESS"}]}' ;;
+    14) printf '%s\n' '{"statusCheckRollup":[{"name":"test","conclusion":"FAILURE","status":"COMPLETED"}]}' ;;
+    15) printf '%s\n' '{"statusCheckRollup":[{"name":"test","conclusion":"SUCCESS","status":"COMPLETED"}]}' ;;
+    *) exit 95 ;;
+  esac
+elif [ "$1 $2" = "git ls-remote" ]; then
+  if [ "$4" = "refs/pull/12/merge" ]; then
+    printf '%s\t%s\n' "$REPAIR_BASE" "$4"
+  fi
+elif [ "$1 $2 $4" = "git -C fetch" ]; then
+  exec git -C "$3" fetch --no-tags "$REPAIR_REMOTE" "$7" "$8"
+elif [ "$1 $2 $4" = "git -C push" ]; then
+  exec git -C "$3" push "$REPAIR_REMOTE" "$6"
+else
+  exit 96
+fi
+"#,
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .args(["repair-prs", "builder-placeholder-wake3"])
+        .env("OSTROM_HOME", &home)
+        .env("MANDATE_GH_AS_BIN", &helper)
+        .env("REPAIR_LISTING", &listing)
+        .env("REPAIR_CALLS", &calls)
+        .env("REPAIR_REMOTE", &remote)
+        .env("REPAIR_BASE", &base_head)
+        .current_dir(fixture.path())
+        .output()
+        .expect("repair pull requests across check states");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(summary["attempted"], 2);
+    assert_eq!(summary["repaired"], 2);
+    assert_eq!(summary["skipped"], 3);
+    assert_eq!(summary["failed"], 0);
+
+    let calls = fs::read_to_string(calls).unwrap();
+    assert_eq!(calls.matches(" git ls-remote ").count(), 2);
+    assert!(calls.contains(
+        "--permissions metadata:read,contents:read -- git ls-remote https://github.com/placeholder-org/check-state-repo.git refs/pull/11/merge"
+    ));
+    assert!(calls.contains(
+        "--permissions metadata:read,contents:read -- git ls-remote https://github.com/placeholder-org/check-state-repo.git refs/pull/12/merge"
+    ));
+    assert!(!calls.contains("refs/pull/13/merge"));
+    assert!(!calls.contains("refs/pull/14/merge"));
+    assert!(!calls.contains("refs/pull/15/merge"));
+    let pushes = calls
+        .lines()
+        .filter(|line| line.contains(" git -C ") && line.contains(" push "))
+        .collect::<Vec<_>>();
+    assert_eq!(pushes.len(), 2);
+    assert!(
+        pushes
+            .iter()
+            .any(|push| push.contains("HEAD:refs/heads/born-head"))
+    );
+    assert!(
+        pushes
+            .iter()
+            .any(|push| push.contains("HEAD:refs/heads/green-head"))
+    );
+
+    let traces = fs::read_to_string(home.join("sprint.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let outcomes_for = |number: u64| {
+        traces
+            .iter()
+            .filter(|trace| trace["fact"]["ref"] == format!("#{number}"))
+            .map(|trace| trace["fact"]["outcome"].as_str().unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(outcomes_for(11), vec!["born-conflicting", "repaired"]);
+    assert_eq!(outcomes_for(12), vec!["checks-absent-merge-ref-present"]);
+    assert_eq!(outcomes_for(13), vec!["checks-pending"]);
+    assert_eq!(outcomes_for(14), vec!["checks-failed"]);
+    assert_eq!(outcomes_for(15), vec!["repaired"]);
+    for trace in traces {
+        assert_eq!(trace["kind"], "pr-repair");
+        for field in [
+            "role",
+            "owner",
+            "repo",
+            "ref",
+            "action",
+            "outcome",
+            "head_branch",
+            "base_branch",
+            "head_sha",
+            "base_sha",
+            "conflicted_paths",
+            "cap",
+        ] {
+            assert!(trace["fact"].get(field).is_some(), "missing {field}");
+        }
+    }
 }

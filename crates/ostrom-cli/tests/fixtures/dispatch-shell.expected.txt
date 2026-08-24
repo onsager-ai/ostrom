@@ -1,4 +1,4 @@
 usage status=2
-usage stderr=usage: dispatch.sh <work-order-file>
+usage stderr=usage: ostrom dispatch <work-order-file>
 invalid status=2
 invalid stderr=ostrom work order: invalid schema_version 1 work order at /tmp/ostrom-dispatch-parity-invalid.json

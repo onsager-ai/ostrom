@@ -23,7 +23,8 @@ use crate::{
         AuthenticatedCommandError, GitHubInstallationTokenMinter, InstallationTokenMinter,
         ScopedAppTokenRequest, authenticated_output,
     },
-    append_trace, environment, load_config_or_defaults, read_lease, read_trace,
+    append_trace, configured_retention_days, environment, load_config_or_defaults, read_lease,
+    read_trace, sweep_worktrees,
     work_order::{implementer_lease_ttl, in_flight_orders, reap_stale_work_orders},
 };
 
@@ -171,6 +172,14 @@ fn run_dispatch_with_minter(
         listing: ListingState::empty(),
         matched_key: None,
     };
+
+    let retention_days = configured_retention_days()
+        .map_err(|error| DispatchError::new(2, format!("ostrom dispatch: {error}")))?;
+    let sweep = sweep_worktrees(&request.paths.state, &request.clock, retention_days)
+        .map_err(|error| DispatchError::new(1, format!("ostrom dispatch: {error}")))?;
+    for removal in sweep.removals {
+        eprintln!("ostrom dispatch: {removal}");
+    }
 
     preflight_worktree(&context)?;
     let config = load_config_or_defaults(&request.paths, &request.working_directory).ok();
@@ -1512,6 +1521,11 @@ fn append_failure(
             "branch_listing".to_owned(),
             listing_json(&context.listing, outcome),
         );
+    }
+    if let Err(error) =
+        crate::reap_build_cache(&context.request.paths.state, &context.order.item_id)
+    {
+        eprintln!("ostrom dispatch: could not reap build cache: {error}");
     }
     append_fact(context, "work-failed", fact)
 }

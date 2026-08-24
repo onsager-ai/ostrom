@@ -19,9 +19,10 @@ use ostrom_checks::{
     run_doctor_check,
 };
 use ostrom_core::{
-    CHECK_STORE_SCHEMA_VERSION, Catalogue, CatalogueEnumeration, CheckContractError, CheckDocument,
-    CheckFault, CheckRun, CheckRunId, CheckState, CheckVerdict, InconclusivePolicy,
-    OperationAction, RepositoryName, ResolvedCheck, ResolvedLoopCeilings, SelectorPrefix,
+    CHECK_STORE_SCHEMA_VERSION, CHECKS_VERSION, Catalogue, CatalogueEnumeration,
+    CheckContractError, CheckDefinition, CheckDocument, CheckFault, CheckRun, CheckRunId,
+    CheckState, CheckVerdict, InconclusivePolicy, OperationAction, RepositoryName, ResolvedCheck,
+    ResolvedLoopCeilings, SelectorPrefix,
 };
 use ostrom_store::{
     AssessmentHarness, AuditOptions, Clock, DigestOptions, DispatchOutcome, DispatchRequest,
@@ -30,13 +31,13 @@ use ostrom_store::{
     PlanOptions, PublishDestination, PublishTarget, QueueDecision, ReplayOptions, SelectAction,
     SelectError, SelectOutcome, SelectRequest, SignalFlags, SweepError, SweepMode, SweepOptions,
     SweepParityOptions, TraceAppend, TraceView, UnavailableAssessmentDeriver, acquire_lease,
-    acquire_org_from_github, append_trace_checked, audit, branch_name, clear_work_order,
-    create_work_order, credential_output, decide_queue_item, encode_org_snapshots,
-    encode_selection, environment, finalize_exited_implementer, grant_excuse, item_hash,
-    lease_status, lint_queue_state, list_excuses, list_queue_json, local_drift, migrate,
-    read_trace_json, release_lease, render_constitution, render_digest, replay, run_dispatch,
-    run_gate, run_implement, run_pass, run_plan, run_repair_prs, run_selection, run_sweep,
-    run_sweep_parity, validate_lease_name, validate_work_order_file,
+    acquire_org_from_github_with_faults, append_trace_checked, audit, branch_name,
+    clear_work_order, create_work_order, credential_output, decide_queue_item,
+    encode_org_snapshots_with_faults, encode_selection, environment, finalize_exited_implementer,
+    grant_excuse, item_hash, lease_status, lint_queue_state, list_excuses, list_queue_json,
+    local_drift, migrate, read_trace_json, release_lease, render_constitution, render_digest,
+    replay, run_dispatch, run_gate, run_implement, run_pass, run_plan, run_repair_prs,
+    run_selection, run_sweep, run_sweep_parity, validate_lease_name, validate_work_order_file,
 };
 
 mod operation_dispatch;
@@ -88,7 +89,7 @@ enum Command {
     /// Explain how authored policy resolves for one pull request.
     Explain {
         target: String,
-        /// Policy manifest; defaults to repository then user configuration.
+        /// Policy manifest; defaults to repository discovery.
         #[arg(long)]
         manifest: Option<PathBuf>,
         /// Actor projection to explain.
@@ -669,7 +670,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             builder_lease_owner,
         } => {
             if builder_lease_owner.len() != 1 || builder_lease_owner[0].is_empty() {
-                exit_message("usage: repair-prs.sh <builder-lease-owner>", 2);
+                exit_message("usage: ostrom repair-prs <builder-lease-owner>", 2);
             }
             let output = match run_repair_prs(&ostrom_store::RepairOptions {
                 paths,
@@ -904,16 +905,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let started_at = resolve_started_at(started_at.as_deref(), &clock)?;
             if let Some(org) = inner_org {
                 let cwd = env::current_dir()?;
-                let snapshots =
-                    match acquire_org_from_github(&paths, &cwd, &org, started_at, mode.into()) {
-                        Ok(snapshots) => snapshots,
-                        Err(error @ SweepError::BranchListingTruncated(_)) => {
-                            eprintln!("{error}");
-                            std::process::exit(6);
-                        }
-                        Err(error) => return Err(error.into()),
-                    };
-                io::stdout().write_all(&encode_org_snapshots(snapshots)?)?;
+                let (snapshots, faults) = match acquire_org_from_github_with_faults(
+                    &paths,
+                    &cwd,
+                    &org,
+                    started_at,
+                    mode.into(),
+                ) {
+                    Ok(result) => result,
+                    Err(error @ SweepError::BranchListingTruncated(_)) => {
+                        eprintln!("{error}");
+                        std::process::exit(6);
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                io::stdout().write_all(&encode_org_snapshots_with_faults(snapshots, faults)?)?;
                 return Ok(());
             }
             let publish = publish_repository.map_or(Ok(PublishTarget::Disabled), |repository| {
@@ -1155,6 +1161,8 @@ fn run_loop_command(paths: &OstromPaths, name: &str) -> Result<(), Box<dyn std::
         actor: &resolved.actor,
         working_directory: &working_directory,
         plugin_root: &plugin_root,
+        checks: &manifest.checks,
+        default_inconclusive_policy: manifest.defaults.check.inconclusive_policy,
         selector_prefixes,
         ceilings: Some(resolved.ceilings),
     };
@@ -1183,6 +1191,8 @@ fn run_operation_command(
         actor: &actor,
         working_directory: &working_directory,
         plugin_root: &plugin_root,
+        checks: &manifest.checks,
+        default_inconclusive_policy: manifest.defaults.check.inconclusive_policy,
         selector_prefixes,
         ceilings: None,
     };
@@ -1195,6 +1205,8 @@ struct CliOperationRuntime<'a> {
     actor: &'a str,
     working_directory: &'a Path,
     plugin_root: &'a Path,
+    checks: &'a BTreeMap<String, CheckDefinition>,
+    default_inconclusive_policy: InconclusivePolicy,
     selector_prefixes: BTreeSet<SelectorPrefix>,
     ceilings: Option<ResolvedLoopCeilings>,
 }
@@ -1223,7 +1235,14 @@ impl OperationRuntime for CliOperationRuntime<'_> {
         check: &str,
         _target: &ResolvedOperationTarget,
     ) -> Result<(), OperationDispatchError> {
-        execute_operation_requirement(self.paths, self.working_directory, self.plugin_root, check)
+        execute_operation_requirement(
+            self.paths,
+            self.working_directory,
+            self.plugin_root,
+            self.checks,
+            self.default_inconclusive_policy,
+            check,
+        )
     }
 
     fn execute(
@@ -1348,28 +1367,27 @@ fn execute_operation_requirement(
     paths: &OstromPaths,
     working_directory: &Path,
     plugin_root: &Path,
+    checks: &BTreeMap<String, CheckDefinition>,
+    default_inconclusive_policy: InconclusivePolicy,
     check: &str,
 ) -> Result<(), OperationDispatchError> {
-    let resolutions =
-        resolve_plan_checks(paths, working_directory, plugin_root).map_err(|error| {
+    let enumeration = CatalogueEnumeration {
+        catalogues: vec![Catalogue {
+            document: CheckDocument {
+                checks_version: CHECKS_VERSION,
+                inconclusive_policy: default_inconclusive_policy,
+                checks: checks.clone(),
+            },
+        }],
+        complete: true,
+    };
+    let registry = ActionRegistry::core(plugin_root.to_owned(), working_directory.to_owned())
+        .map_err(|error| {
             OperationDispatchError::RequirementFailed(format!("{check}: {}", error.name()))
         })?;
-    if let Some(fault) = resolutions.catalogue_fault {
-        return Err(OperationDispatchError::RequirementFailed(format!(
-            "{check}: {}",
-            fault.name
-        )));
-    }
-    if let Some(fault) = resolutions.faults.get(check) {
-        return Err(OperationDispatchError::RequirementFailed(format!(
-            "{check}: {}",
-            fault.name
-        )));
-    }
-    let prepared = resolutions
-        .prepared
-        .get(check)
-        .ok_or_else(|| OperationDispatchError::RequirementFailed(check.to_owned()))?;
+    let prepared = registry.prepare(check, &enumeration).map_err(|error| {
+        OperationDispatchError::RequirementFailed(format!("{check}: {}", error.name()))
+    })?;
     // Operation guards are observations made immediately before their action.
     // Production intentionally owns this real clock; hermetic dispatcher tests
     // use a fake runtime rather than pinning a path production leaves unpinned.
@@ -2008,6 +2026,10 @@ fn run_pass_worker(role: CliPassRole, supervisor_pid: u32, clock: Clock) -> ! {
     );
     let request = PassRequest {
         paths: compatible_command_paths(),
+        working_directory: env::current_dir().unwrap_or_else(|error| {
+            eprintln!("ostrom: could not resolve working directory: {error}");
+            std::process::exit(1);
+        }),
         role: role.into(),
         claude_bin,
         signals,
@@ -2067,7 +2089,7 @@ fn run_implement_worker(
 
 fn run_dispatch_command(arguments: Vec<String>, clock: Clock) -> ! {
     let [order_file] = arguments.as_slice() else {
-        eprintln!("usage: dispatch.sh <work-order-file>");
+        eprintln!("usage: ostrom dispatch <work-order-file>");
         std::process::exit(2);
     };
     let working_directory = env::current_dir().unwrap_or_else(|error| {
@@ -2099,7 +2121,7 @@ fn run_dispatch_command(arguments: Vec<String>, clock: Clock) -> ! {
 
 fn run_select_work(arguments: Vec<String>, clock: Clock) -> ! {
     let usage = || {
-        eprintln!("usage: select-work.sh list | select <owner> [already-attempted-id ...]");
+        eprintln!("usage: ostrom select-work list | select <owner> [already-attempted-id ...]");
         std::process::exit(2);
     };
     let action = match arguments.as_slice() {

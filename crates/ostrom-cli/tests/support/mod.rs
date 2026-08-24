@@ -18,6 +18,14 @@ use tempfile::TempDir;
 const KEY_ID: &str = "placeholder-principal";
 
 pub fn sign_manifest(manifest: &Path) -> PathBuf {
+    sign_manifest_as(manifest, manifest, None)
+}
+
+pub fn sign_manifest_from(manifest: &Path, argument: &Path, working_directory: &Path) -> PathBuf {
+    sign_manifest_as(manifest, argument, Some(working_directory))
+}
+
+fn sign_manifest_as(manifest: &Path, argument: &Path, working_directory: Option<&Path>) -> PathBuf {
     let substrate = manifest.parent().expect("manifest directory");
     let trusted_keys = substrate.join("trusted-policy-keys");
     fs::create_dir_all(&trusted_keys).expect("create trusted policy key directory");
@@ -27,13 +35,16 @@ pub fn sign_manifest(manifest: &Path) -> PathBuf {
     let principal = TempDir::new().expect("temporary signing principal directory");
     let private_key = principal.path().join("private.pem");
     fs::write(&private_key, &key_pair().0).expect("write generated test-only private key");
-    let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ostrom"));
+    command
         .arg("sign")
         .args(["--key-id", KEY_ID, "--key"])
         .arg(&private_key)
-        .arg(manifest)
-        .output()
-        .expect("run policy signer");
+        .arg(argument);
+    if let Some(working_directory) = working_directory {
+        command.current_dir(working_directory);
+    }
+    let output = command.output().expect("run policy signer");
     assert!(
         output.status.success(),
         "{}",

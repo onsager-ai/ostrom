@@ -1,14 +1,16 @@
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     fs, io,
     path::{Component, Path, PathBuf},
     process::Command,
+    sync::Once,
 };
 
 use chrono::{DateTime, Utc};
 use ostrom_core::{
-    ActorDecl, CheckContractError, CheckDocument, LoopDecl, OperationDecl, PolicyManifest,
-    RuleDecl, SelectorFinding, SelectorUniverse,
+    ActorDecl, CheckDefinition, LoopDecl, OperationDecl, PolicyManifest, RuleDecl, SelectorFinding,
+    SelectorUniverse,
 };
 use ostrom_store::{OstromPaths, PolicyBundle, PolicyExplanation, SweepFixture};
 use serde::Deserialize;
@@ -69,58 +71,167 @@ pub(crate) fn run_sign(
     key_id: &str,
     private_key: &Path,
 ) -> Result<(), PolicyLoadError> {
-    let manifest = load_unverified(path)?;
-    let signature = ostrom_store::sign_policy_manifest(&manifest, path, key_id, private_key)?;
+    let path = normalize_manifest_path(path);
+    let manifest = if path.file_name().is_some_and(|name| name == "config.yaml") {
+        load_composed(&path)?
+    } else {
+        load_unverified(&path)?
+    };
+    let signature = ostrom_store::sign_policy_manifest(&manifest, &path, key_id, private_key)?;
     println!("signed: {}", signature.display());
     Ok(())
 }
 
-pub(crate) fn load_bundle(path: &Path) -> Result<PolicyBundle, PolicyLoadError> {
-    let manifest = load(path)?;
-    let needs_checks = manifest
-        .grants
-        .values()
-        .chain(manifest.denies.values())
-        .any(|rule| rule.requires.is_some())
-        || manifest
-            .operations
-            .values()
-            .flat_map(|operation| &operation.steps)
-            .any(|step| step.requires.is_some());
-    let checks = if needs_checks {
-        let checks_path = path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join("checks.yaml");
-        let source = read(&checks_path)?;
-        Some(CheckDocument::from_yaml(&source).map_err(|source| {
-            PolicyLoadError::CheckCatalogue {
-                path: checks_path,
-                source,
-            }
-        })?)
-    } else {
-        None
-    };
-    Ok(PolicyBundle { manifest, checks })
+pub(crate) fn load_bundle(
+    paths: &OstromPaths,
+    path: &Path,
+) -> Result<PolicyBundle, PolicyLoadError> {
+    let mut manifest = load(path)?;
+    let overlay_path = paths.private_config_file();
+    if !overlay_path.is_file() || overlay_path == path {
+        return Ok(PolicyBundle::repository(manifest));
+    }
+
+    let overlay = load_composed(&overlay_path)?;
+    verify(&overlay, &overlay_path)?;
+    if overlay.manifest_version != manifest.manifest_version {
+        return Err(PolicyLoadError::OverlayVersion {
+            path: overlay_path,
+            version: overlay.manifest_version,
+            expected: manifest.manifest_version,
+        });
+    }
+    if let Some(rule) = overlay.grants.keys().next() {
+        return Err(PolicyLoadError::OverlayGrant {
+            path: overlay_path,
+            rule: rule.clone(),
+        });
+    }
+    let overlay_denies = merge_overlay(&mut manifest, overlay);
+    validate_manifest(&manifest)?;
+    Ok(PolicyBundle::layered(manifest, overlay_denies))
 }
 
 pub(crate) fn default_manifest_path(paths: &OstromPaths, cwd: &Path) -> Option<PathBuf> {
-    [
-        cwd.join(".ostrom/manifest.yml"),
-        paths.config.join("manifest.yml"),
-    ]
-    .into_iter()
-    .find(|path| path.is_file())
+    let repository = repository_root(cwd);
+    let directories = repository.as_ref().map_or_else(
+        || cwd.ancestors().map(Path::to_path_buf).collect::<Vec<_>>(),
+        |root| {
+            let mut directories = Vec::new();
+            for directory in cwd.ancestors() {
+                directories.push(directory.to_path_buf());
+                if directory == root {
+                    break;
+                }
+            }
+            directories
+        },
+    );
+
+    if let Some(path) = directories
+        .iter()
+        .map(|directory| directory.join("ostrom.yaml"))
+        .find(|path| path.is_file())
+    {
+        return Some(path);
+    }
+    if let Some(path) = directories
+        .iter()
+        .map(|directory| directory.join(".ostrom/manifest.yml"))
+        .find(|path| path.is_file())
+    {
+        warn_legacy_manifest(&path);
+        return Some(path);
+    }
+
+    if repository.is_none() {
+        let path = paths.config.join("manifest.yml");
+        if path.is_file() {
+            warn_legacy_manifest(&path);
+            return Some(path);
+        }
+    }
+    None
 }
 
 pub(crate) fn load_optional_bundle(
     paths: &OstromPaths,
     cwd: &Path,
 ) -> Result<Option<PolicyBundle>, PolicyLoadError> {
-    default_manifest_path(paths, cwd)
-        .map(|path| load_bundle(&path))
-        .transpose()
+    // Absence is not an error here. Until the cutover in #364 the retired
+    // surfaces are still the running system, and `sweep` and the check planner
+    // must keep working in a repository that has no manifest yet. Discovery is
+    // still strict — it never falls through to the operator's own policy — so
+    // `None` means ungoverned, not "somebody else's rules".
+    let Some(path) = default_manifest_path(paths, cwd) else {
+        return Ok(None);
+    };
+    load_bundle(paths, &path).map(Some)
+}
+
+fn repository_root(cwd: &Path) -> Option<PathBuf> {
+    cwd.ancestors()
+        .find(|directory| directory.join(".git").exists())
+        .map(Path::to_path_buf)
+}
+
+fn repository_name(cwd: &Path) -> PathBuf {
+    repository_root(cwd).unwrap_or_else(|| cwd.to_path_buf())
+}
+
+fn warn_legacy_manifest(path: &Path) {
+    static NOTICE: Once = Once::new();
+    NOTICE.call_once(|| {
+        eprintln!(
+            "warning: legacy policy manifest `{}` is deprecated; move repository policy to `ostrom.yaml`",
+            path.display()
+        );
+    });
+}
+
+fn merge_overlay(repository: &mut PolicyManifest, overlay: PolicyManifest) -> BTreeSet<String> {
+    let shipped = ostrom_core::ManifestDefaults::default();
+    if repository.defaults.stalls_after == shipped.stalls_after {
+        repository.defaults.stalls_after = overlay.defaults.stalls_after;
+    }
+    if repository.defaults.check == shipped.check {
+        repository.defaults.check = overlay.defaults.check;
+    }
+    if repository.defaults.grant == shipped.grant {
+        repository.defaults.grant = overlay.defaults.grant;
+    }
+    if repository.defaults.deny == shipped.deny {
+        repository.defaults.deny = overlay.defaults.deny;
+    }
+    if repository.defaults.r#loop.concurrent.is_none() {
+        repository.defaults.r#loop.concurrent = overlay.defaults.r#loop.concurrent;
+    }
+    if repository.defaults.r#loop.spend_usd.is_none() {
+        repository.defaults.r#loop.spend_usd = overlay.defaults.r#loop.spend_usd;
+    }
+    if repository.defaults.r#loop.tokens.is_none() {
+        repository.defaults.r#loop.tokens = overlay.defaults.r#loop.tokens;
+    }
+
+    merge_fallback(&mut repository.inputs, overlay.inputs);
+    merge_fallback(&mut repository.actors, overlay.actors);
+    merge_fallback(&mut repository.checks, overlay.checks);
+    merge_fallback(&mut repository.operations, overlay.operations);
+    merge_fallback(&mut repository.loops, overlay.loops);
+    let mut overlay_denies = BTreeSet::new();
+    for (id, declaration) in overlay.denies {
+        if let std::collections::btree_map::Entry::Vacant(entry) = repository.denies.entry(id) {
+            overlay_denies.insert(entry.key().clone());
+            entry.insert(declaration);
+        }
+    }
+    overlay_denies
+}
+
+fn merge_fallback<T>(target: &mut BTreeMap<String, T>, fallback: BTreeMap<String, T>) {
+    for (id, value) in fallback {
+        target.entry(id).or_insert(value);
+    }
 }
 
 pub(crate) struct ExplainOptions<'a> {
@@ -139,11 +250,10 @@ pub(crate) fn run_explain(options: &ExplainOptions<'_>) -> Result<String, Policy
         .manifest
         .map(Path::to_path_buf)
         .or_else(|| default_manifest_path(options.paths, options.working_directory))
-        .ok_or_else(|| PolicyLoadError::ManifestNotFound {
-            repository: options.working_directory.join(".ostrom/manifest.yml"),
-            user: options.paths.config.join("manifest.yml"),
+        .ok_or_else(|| {
+            PolicyLoadError::UngovernedRepository(repository_name(options.working_directory))
         })?;
-    let bundle = load_bundle(&manifest_path)?;
+    let bundle = load_bundle(options.paths, &manifest_path)?;
     let target = ExplainTarget::parse(options.target)?;
     let pull_request = if let Some(fixture) = options.fixture {
         fixture_pull_request(fixture, &target)?
@@ -288,7 +398,8 @@ fn render_explanation(
             selectors.join(", ")
         };
         output.push_str(&format!(
-            "  {:5} {:24} {:38} {}{}\n",
+            "  {:10} {:5} {:24} {:38} {}{}\n",
+            rule.layer.name(),
             rule.kind,
             rule.id,
             predicate,
@@ -306,7 +417,8 @@ fn render_explanation(
     ));
     for rule in &explanation.rules {
         output.push_str(&format!(
-            "  {:5} {:24} {:38} {}\n",
+            "  {:10} {:5} {:24} {:38} {}\n",
+            rule.layer.name(),
             rule.kind,
             rule.id,
             format!(
@@ -438,17 +550,40 @@ fn command_verbs() -> impl Iterator<Item = &'static str> {
 }
 
 pub(crate) fn load(path: &Path) -> Result<PolicyManifest, PolicyLoadError> {
-    let manifest = load_unverified(path)?;
+    let path = normalize_manifest_path(path);
+    let manifest = load_unverified(&path)?;
+    verify(&manifest, &path)?;
+    Ok(manifest)
+}
+
+fn verify(manifest: &PolicyManifest, path: &Path) -> Result<(), PolicyLoadError> {
     let trusted_keys = ostrom_store::environment::OSTROM_POLICY_TRUSTED_KEYS
         .value_os()
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
         .ok_or(PolicyLoadError::TrustedKeysUnset)?;
-    ostrom_store::verify_policy_manifest(&manifest, path, &trusted_keys)?;
-    Ok(manifest)
+    ostrom_store::verify_policy_manifest(manifest, path, &trusted_keys)?;
+    Ok(())
+}
+
+fn normalize_manifest_path(path: &Path) -> Cow<'_, Path> {
+    if path
+        .parent()
+        .is_some_and(|parent| parent.as_os_str().is_empty())
+    {
+        Cow::Owned(Path::new(".").join(path))
+    } else {
+        Cow::Borrowed(path)
+    }
 }
 
 fn load_unverified(path: &Path) -> Result<PolicyManifest, PolicyLoadError> {
+    let manifest = load_composed(path)?;
+    validate_manifest(&manifest)?;
+    Ok(manifest)
+}
+
+fn load_composed(path: &Path) -> Result<PolicyManifest, PolicyLoadError> {
     let source = read(path)?;
     let mut manifest =
         PolicyManifest::parse_yaml(&source).map_err(|source| PolicyLoadError::Yaml {
@@ -471,12 +606,15 @@ fn load_unverified(path: &Path) -> Result<PolicyManifest, PolicyLoadError> {
             merge_include(&mut manifest, &mut origins, &include)?;
         }
     }
+    Ok(manifest)
+}
+
+fn validate_manifest(manifest: &PolicyManifest) -> Result<(), PolicyLoadError> {
     manifest
         .validate()
         .map_err(|error| PolicyLoadError::Validation(error.to_string()))?;
-    validate_operation_names(&manifest)?;
-    validate_check_requirements(&manifest, parent)?;
-    Ok(manifest)
+    validate_operation_names(manifest)?;
+    validate_check_requirements(manifest)
 }
 
 fn validate_operation_names(manifest: &PolicyManifest) -> Result<(), PolicyLoadError> {
@@ -499,10 +637,7 @@ fn validate_operation_names(manifest: &PolicyManifest) -> Result<(), PolicyLoadE
     Ok(())
 }
 
-fn validate_check_requirements(
-    manifest: &PolicyManifest,
-    manifest_directory: &Path,
-) -> Result<(), PolicyLoadError> {
+fn validate_check_requirements(manifest: &PolicyManifest) -> Result<(), PolicyLoadError> {
     let mut requirements = manifest
         .operations
         .iter()
@@ -520,24 +655,18 @@ fn validate_check_requirements(
             .as_deref()
             .map(|check| ("grant", grant.as_str(), check))
     }));
-    if requirements.is_empty() {
-        return Ok(());
-    }
-
-    let path = manifest_directory.join("checks.yaml");
-    let source = read(&path)?;
-    let document =
-        CheckDocument::from_yaml(&source).map_err(|source| PolicyLoadError::CheckCatalogue {
-            path: path.clone(),
-            source,
-        })?;
+    requirements.extend(manifest.denies.iter().filter_map(|(deny, declaration)| {
+        declaration
+            .requires
+            .as_deref()
+            .map(|check| ("deny", deny.as_str(), check))
+    }));
     for (kind, owner, check) in requirements {
-        if !document.checks.contains_key(check) {
+        if !manifest.checks.contains_key(check) {
             return Err(PolicyLoadError::UnknownCheck {
                 kind,
                 owner: owner.to_owned(),
                 check: check.to_owned(),
-                path,
             });
         }
     }
@@ -567,7 +696,7 @@ fn merge_include(
             path: path.to_path_buf(),
             message: "included document must be a map".to_owned(),
         })?;
-    let markers = ["actor", "operation", "grant", "deny", "loop"]
+    let markers = ["actor", "check", "operation", "grant", "deny", "loop"]
         .into_iter()
         .filter(|marker| mapping.contains_key(Value::String((*marker).to_owned())))
         .collect::<Vec<_>>();
@@ -591,6 +720,13 @@ fn merge_include(
             "actor",
             path,
             &mut origins.actors,
+        )?;
+        merge_map(
+            &mut manifest.checks,
+            fragment.checks,
+            "check",
+            path,
+            &mut origins.checks,
         )?;
         merge_map(
             &mut manifest.operations,
@@ -646,6 +782,14 @@ fn merge_leaf(
             id,
             parse_leaf(body, path)?,
             "actor",
+            path,
+        ),
+        "check" => insert_leaf(
+            &mut manifest.checks,
+            &mut origins.checks,
+            id,
+            parse_leaf(body, path)?,
+            "check",
             path,
         ),
         "operation" => insert_leaf(
@@ -734,6 +878,8 @@ struct IncludeFragment {
     #[serde(default)]
     actors: BTreeMap<String, ActorDecl>,
     #[serde(default)]
+    checks: BTreeMap<String, CheckDefinition>,
+    #[serde(default)]
     operations: BTreeMap<String, OperationDecl>,
     #[serde(default)]
     grants: BTreeMap<String, RuleDecl>,
@@ -746,6 +892,7 @@ struct IncludeFragment {
 #[derive(Debug, Default)]
 struct Origins {
     actors: BTreeMap<String, PathBuf>,
+    checks: BTreeMap<String, PathBuf>,
     operations: BTreeMap<String, PathBuf>,
     grants: BTreeMap<String, PathBuf>,
     denies: BTreeMap<String, PathBuf>,
@@ -761,6 +908,7 @@ impl Origins {
         };
         Self {
             actors: origins(manifest.actors.keys().cloned().collect()),
+            checks: origins(manifest.checks.keys().cloned().collect()),
             operations: origins(manifest.operations.keys().cloned().collect()),
             grants: origins(manifest.grants.keys().cloned().collect()),
             denies: origins(manifest.denies.keys().cloned().collect()),
@@ -864,11 +1012,24 @@ fn include_glob(value: &str, pattern: &str) -> bool {
 #[derive(Debug, Error)]
 pub(crate) enum PolicyLoadError {
     #[error(
-        "no policy manifest found at `{}` or `{}`",
-        repository.display(),
-        user.display()
+        "repository `{}` is ungoverned: no `ostrom.yaml` was found at or below its `.git` boundary",
+        .0.display()
     )]
-    ManifestNotFound { repository: PathBuf, user: PathBuf },
+    UngovernedRepository(PathBuf),
+    #[error(
+        "private overlay `{}` may deny authority but may not grant it; offending rule `grants.{rule}`",
+        path.display()
+    )]
+    OverlayGrant { path: PathBuf, rule: String },
+    #[error(
+        "private overlay `{}` has manifest_version {version}; expected {expected}",
+        path.display()
+    )]
+    OverlayVersion {
+        path: PathBuf,
+        version: u32,
+        expected: u32,
+    },
     #[error("pull request must have the shape owner/repository#N")]
     InvalidTarget,
     #[error("pull request `{0}` was not present in the fixture")]
@@ -895,18 +1056,13 @@ pub(crate) enum PolicyLoadError {
         #[source]
         source: serde_yaml::Error,
     },
-    #[error("could not load check catalogue `{}`: {source}", path.display())]
-    CheckCatalogue {
-        path: PathBuf,
-        #[source]
-        source: CheckContractError,
-    },
-    #[error("{kind} `{owner}` requires undefined check `{check}` from `{}`", path.display())]
+    #[error(
+        "{kind} `{owner}` requires undefined check `{check}`; define it under `checks:` or add its file to `includes:`"
+    )]
     UnknownCheck {
         kind: &'static str,
         owner: String,
         check: String,
-        path: PathBuf,
     },
     #[error("invalid policy manifest: {0}")]
     Validation(String),
@@ -933,4 +1089,51 @@ pub(crate) enum PolicyLoadError {
         first: PathBuf,
         second: PathBuf,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{env, fs, process::Command};
+
+    use tempfile::tempdir;
+
+    use super::default_manifest_path;
+    use ostrom_store::OstromPaths;
+
+    const LEGACY_NOTICE_CHILD: &str = "OSTROM_TEST_LEGACY_NOTICE_CHILD";
+
+    #[test]
+    fn legacy_notice_is_emitted_once_for_repeated_lookup() {
+        if env::var_os(LEGACY_NOTICE_CHILD).is_some() {
+            let root = tempdir().expect("temporary repository");
+            fs::create_dir(root.path().join(".git")).expect("repository boundary");
+            fs::create_dir(root.path().join(".ostrom")).expect("legacy directory");
+            fs::write(
+                root.path().join(".ostrom/manifest.yml"),
+                "manifest_version: 1\n",
+            )
+            .expect("legacy manifest");
+            let paths = OstromPaths {
+                config: root.path().join("config"),
+                state: root.path().join("state"),
+            };
+            assert!(default_manifest_path(&paths, root.path()).is_some());
+            assert!(default_manifest_path(&paths, root.path()).is_some());
+            return;
+        }
+
+        let output = Command::new(env::current_exe().expect("current test executable"))
+            .env(LEGACY_NOTICE_CHILD, "1")
+            .args([
+                "--exact",
+                "policy_manifest::tests::legacy_notice_is_emitted_once_for_repeated_lookup",
+                "--nocapture",
+            ])
+            .output()
+            .expect("run repeated lookup child");
+        assert!(output.status.success());
+        let stderr = String::from_utf8(output.stderr).expect("UTF-8 warning");
+        assert_eq!(stderr.matches("deprecated").count(), 1, "{stderr}");
+        assert!(stderr.contains("ostrom.yaml"), "{stderr}");
+    }
 }

@@ -9,6 +9,8 @@ use std::{
 
 use tempfile::tempdir;
 
+mod support;
+
 const STARTED_AT: &str = "2026-08-01T00:05:00Z";
 const ROSTER: &str = r#"provider: file
 cadence_hours: 24
@@ -27,6 +29,8 @@ const ACQUIRED_FIXTURE: &str = r#"{"repositories":[{"repo":"placeholder-org/alph
 fn write_sweep_fixture(root: &Path, body: &str) -> (PathBuf, PathBuf) {
     let home = root.join("ostrom-home");
     fs::create_dir(&home).expect("create scratch OSTROM_HOME");
+    fs::write(home.join("ostrom.yaml"), "manifest_version: 1\n").expect("write repository policy");
+    support::sign_manifest(&home.join("ostrom.yaml"));
     fs::write(home.join("mandates.yaml"), ROSTER).expect("write placeholder roster");
     let fixture = root.join("fixture.json");
     fs::write(&fixture, body).expect("write sweep fixture");
@@ -70,6 +74,10 @@ fn run_sweep(home: &Path, fixture: &Path) -> Command {
         ])
         .arg(fixture)
         .env("OSTROM_HOME", home)
+        .env(
+            "OSTROM_POLICY_TRUSTED_KEYS",
+            home.join("trusted-policy-keys"),
+        )
         .current_dir(home);
     command
 }

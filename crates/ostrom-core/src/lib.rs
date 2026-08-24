@@ -30,7 +30,7 @@ pub use check::{
     Evidence, EvidenceBundleItem, EvidenceReference, FreshnessError, InconclusivePolicy,
     JudgeStamp, JudgmentClause, JudgmentInput, JudgmentRunnerStamp, RESULT_VERSION, RecordedOutput,
     ResolvedCheck, RunnerStamp, agent_parameters, receipt_digest, resolve_check, resolve_fresh_for,
-    select_check, sha256_hex,
+    select_check, sha256_hex, validate_check_definitions,
 };
 pub use dispatch::{
     BranchListing, BranchListingFault, BranchListingOutcome, RemoteBranch, WorkOrder,
@@ -53,7 +53,7 @@ pub use plan::{
     fact_table, mechanical_ranking, validate_assessment,
 };
 pub use policy::{
-    ActorDecl, InputDecl, InputResolutionError, InputType, LoopCadence, LoopDecl,
+    ActorDecl, CheckDefaults, InputDecl, InputResolutionError, InputType, LoopCadence, LoopDecl,
     LoopResolutionError, LoopTime, ManifestDefaults, ManifestError, ManifestValidationError,
     NormalizedList, OperationDecl, OperationParamDecl, OperationParamType, PolicyCandidate,
     PolicyDecision, PolicyManifest, PolicySelector, PolicySelectorError, ResolvedInput,

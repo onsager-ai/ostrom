@@ -12,6 +12,8 @@ use ostrom_store::{AuditOptions, OstromPaths, audit, grant_excuse, list_excuses}
 use serde_json::Value;
 use tempfile::{TempDir, tempdir};
 
+mod support;
+
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/leaves");
 
 // These expected bytes were captured by running the production scripts before
@@ -260,6 +262,12 @@ fn local_drift_invokes_only_read_operations_and_preserves_repository_state() {
 #[test]
 fn granted_record_is_consumed_by_the_existing_sweep_join() {
     let fixture = leaf_fixture();
+    fs::write(
+        fixture.working_directory.join("ostrom.yaml"),
+        "manifest_version: 1\n",
+    )
+    .expect("write repository policy");
+    support::sign_manifest(&fixture.working_directory.join("ostrom.yaml"));
     fs::copy(
         fixture_path("mandates.yaml"),
         fixture.home.path().join("mandates.yaml"),
@@ -330,6 +338,10 @@ fn run_fixture_sweep(home: &Path, working_directory: &Path, fixture: &Path) -> O
         ])
         .current_dir(working_directory)
         .env("OSTROM_HOME", home)
+        .env(
+            "OSTROM_POLICY_TRUSTED_KEYS",
+            working_directory.join("trusted-policy-keys"),
+        )
         .output()
         .expect("run fixture sweep")
 }

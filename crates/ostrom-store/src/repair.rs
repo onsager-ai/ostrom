@@ -354,8 +354,11 @@ fn collect_candidates(
             )?;
             continue;
         };
-        if completed_green(rollup) {
-            if pull_request.get("mergeable").and_then(Value::as_str) == Some("CONFLICTING") {
+        let check_state = classify_checks(rollup);
+        let conflicting =
+            pull_request.get("mergeable").and_then(Value::as_str) == Some("CONFLICTING");
+        if check_state == CheckState::Green {
+            if conflicting {
                 candidates.push(candidate);
             } else {
                 summary.skipped += 1;
@@ -369,6 +372,103 @@ fn collect_candidates(
                     json!({"reason": "head checks are green and no conflicting base-forward repair is needed"}),
                 )?;
             }
+            continue;
+        }
+
+        if check_state == CheckState::Absent {
+            if !conflicting {
+                summary.skipped += 1;
+                context.trace_candidate(
+                    &candidate,
+                    "checks-absent-not-conflicting",
+                    &candidate.listed_head_sha,
+                    &candidate.listed_base_sha,
+                    &[],
+                    None,
+                    json!({"reason": "head has no checks but is not conflicting"}),
+                )?;
+                continue;
+            }
+
+            let remote_url = format!("https://github.com/{repository}.git");
+            let merge_ref = format!("refs/pull/{}/merge", candidate.number);
+            let merge_ref_read = context.authenticated(
+                repository,
+                FETCH_PERMISSIONS,
+                &["git", "ls-remote", &remote_url, &merge_ref],
+            );
+            if merge_ref_read.code != 0 {
+                summary.skipped += 1;
+                context.stderr.push_str(&format!(
+                    "mandate repair: failed to read merge ref for {repository}#{} (rc={})\n",
+                    candidate.number, merge_ref_read.code
+                ));
+                context.trace_candidate(
+                    &candidate,
+                    "merge-ref-fetch-failed",
+                    &candidate.listed_head_sha,
+                    &candidate.listed_base_sha,
+                    &[],
+                    Some(merge_ref_read.code),
+                    json!({"reason": "candidate merge ref could not be read"}),
+                )?;
+                continue;
+            }
+            if !String::from_utf8_lossy(&merge_ref_read.stdout)
+                .trim()
+                .is_empty()
+            {
+                summary.skipped += 1;
+                context.trace_candidate(
+                    &candidate,
+                    "checks-absent-merge-ref-present",
+                    &candidate.listed_head_sha,
+                    &candidate.listed_base_sha,
+                    &[],
+                    Some(0),
+                    json!({"reason": "head has no checks but a pull-request merge ref exists"}),
+                )?;
+                continue;
+            }
+
+            context.trace_candidate(
+                &candidate,
+                "born-conflicting",
+                &candidate.listed_head_sha,
+                &candidate.listed_base_sha,
+                &[],
+                Some(0),
+                json!({"reason": "head has no checks and no pull-request merge ref"}),
+            )?;
+            candidates.push(candidate);
+            continue;
+        }
+
+        if check_state == CheckState::Pending {
+            summary.skipped += 1;
+            context.trace_candidate(
+                &candidate,
+                "checks-pending",
+                &candidate.listed_head_sha,
+                &candidate.listed_base_sha,
+                &[],
+                None,
+                json!({"reason": "head checks are still running"}),
+            )?;
+            continue;
+        }
+
+        if conflicting {
+            summary.skipped += 1;
+            context.trace_candidate(
+                &candidate,
+                "checks-failed",
+                &candidate.listed_head_sha,
+                &candidate.listed_base_sha,
+                &[],
+                None,
+                json!({"reason": "completed head checks are not green"}),
+            )?;
             continue;
         }
 
@@ -989,20 +1089,62 @@ fn listing_row_is_filterable(pull_request: &Value) -> bool {
         .is_none_or(|login| login.is_null() || login == &Value::Bool(false) || login.is_string())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckState {
+    Absent,
+    Pending,
+    Failed,
+    Green,
+}
+
+fn classify_checks(checks: &[Value]) -> CheckState {
+    if checks.is_empty() {
+        return CheckState::Absent;
+    }
+
+    let mut pending = false;
+    let mut failed = false;
+    for check in checks {
+        let conclusion = check
+            .get("conclusion")
+            .filter(|value| !value.is_null() && value != &&Value::Bool(false))
+            .and_then(Value::as_str);
+        let state = conclusion
+            .or_else(|| check.get("state").and_then(Value::as_str))
+            .unwrap_or_default()
+            .to_ascii_uppercase();
+        if matches!(state.as_str(), "SUCCESS" | "NEUTRAL" | "SKIPPED") {
+            continue;
+        }
+
+        let status = check
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_uppercase();
+        if matches!(state.as_str(), "PENDING" | "EXPECTED")
+            || matches!(
+                status.as_str(),
+                "PENDING" | "EXPECTED" | "QUEUED" | "REQUESTED" | "WAITING" | "IN_PROGRESS"
+            )
+        {
+            pending = true;
+        } else {
+            failed = true;
+        }
+    }
+
+    if pending {
+        CheckState::Pending
+    } else if failed {
+        CheckState::Failed
+    } else {
+        CheckState::Green
+    }
+}
+
 fn completed_green(checks: &[Value]) -> bool {
-    !checks.is_empty()
-        && checks.iter().all(|check| {
-            let conclusion = check.get("conclusion");
-            let state = match conclusion {
-                Some(Value::Null | Value::Bool(false)) | None => check.get("state"),
-                value => value,
-            };
-            let state = state
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_ascii_uppercase();
-            matches!(state.as_str(), "SUCCESS" | "NEUTRAL" | "SKIPPED")
-        })
+    classify_checks(checks) == CheckState::Green
 }
 
 fn jq_text(value: Option<&Value>) -> String {

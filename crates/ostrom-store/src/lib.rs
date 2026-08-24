@@ -29,6 +29,7 @@ mod selector;
 mod sweep;
 mod trace;
 mod work_order;
+mod worktree;
 
 pub use app_token::{AppTokenError, CredentialCommandError, credential_output};
 pub use check_store::JsonlCheckStore;
@@ -59,7 +60,8 @@ pub use plan::{
     PlanFault, PlanOptions, PlanRanking, PlanSweep, UnavailableAssessmentDeriver, run_plan,
 };
 pub use policy::{
-    PolicyBundle, PolicyExplanation, RequirementExplanation, RuleExplanation, SelectorProjection,
+    PolicyBundle, PolicyExplanation, PolicyLayer, RequirementExplanation, RuleExplanation,
+    SelectorProjection,
 };
 pub use policy_signature::{PolicySignatureError, sign_policy_manifest, verify_policy_manifest};
 pub use publish::{PublishDestination, PublishError};
@@ -75,8 +77,9 @@ pub use selection::{
 };
 pub use sweep::{
     PublishTarget, RepositorySnapshot, SweepError, SweepFixture, SweepMode, SweepOptions,
-    SweepOutcome, acquire_org_from_github, encode_org_snapshots, load_config,
-    load_config_or_defaults, run_sweep,
+    SweepOutcome, acquire_org_from_github, acquire_org_from_github_with_faults,
+    encode_org_snapshots, encode_org_snapshots_with_faults, load_config, load_config_or_defaults,
+    run_sweep,
 };
 pub use trace::{
     MalformedTraceRow, TraceActionError, TraceAppend, TraceFactRecord, TraceRead, TraceView,
@@ -85,6 +88,12 @@ pub use trace::{
 pub use work_order::{
     ClearedWorkOrder, CreatedWorkOrder, WorkOrderError, branch_name, clear_work_order,
     create_work_order, finalize_exited_implementer, item_hash, validate_work_order_file,
+};
+pub use worktree::{
+    DEFAULT_WORKTREE_CEILING_BYTES, DEFAULT_WORKTREE_RETENTION_DAYS, WorktreeError,
+    WorktreeFootprint, WorktreeRemoval, WorktreeRemovalReason, WorktreeSweep,
+    configured_ceiling_bytes, configured_retention_days, reap_build_cache, sweep_worktrees,
+    worktree_footprint, worktree_root,
 };
 
 use thiserror::Error;
