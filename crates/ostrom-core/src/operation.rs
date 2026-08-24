@@ -201,7 +201,7 @@ pub fn validate_operation(
                 uses: step.uses.clone(),
             });
         }
-        if action.guarded && step.requires.is_none() {
+        if action.guarded && step.requires.is_empty() {
             return Err(OperationActionError::MissingGuard {
                 operation: name.to_owned(),
                 step: index,

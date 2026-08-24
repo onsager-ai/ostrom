@@ -527,8 +527,8 @@ pub struct StepDecl {
     pub uses: String,
     #[serde(default, rename = "with", skip_serializing_if = "BTreeMap::is_empty")]
     pub parameters: BTreeMap<String, Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub requires: Option<String>,
+    #[serde(default, skip_serializing_if = "NormalizedList::is_empty")]
+    pub requires: NormalizedList<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1058,8 +1058,8 @@ pub struct RuleDecl {
     pub selectors: NormalizedList<PolicySelector>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unmatched: Option<UnmatchedPolicy>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub requires: Option<String>,
+    #[serde(default, skip_serializing_if = "NormalizedList::is_empty")]
+    pub requires: NormalizedList<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stalls_after: Option<StallDuration>,
 }
@@ -1280,6 +1280,7 @@ pub enum InputResolutionError {
 pub enum SelectorPrefix {
     Label,
     Path,
+    Ref,
     Type,
     Actor,
     Verb,
@@ -1291,6 +1292,7 @@ impl SelectorPrefix {
         match self {
             Self::Label => "label",
             Self::Path => "path",
+            Self::Ref => "ref",
             Self::Type => "type",
             Self::Actor => "actor",
             Self::Verb => "verb",
@@ -1313,6 +1315,7 @@ impl PolicySelector {
         let prefix = match prefix {
             "label" => SelectorPrefix::Label,
             "path" => SelectorPrefix::Path,
+            "ref" => SelectorPrefix::Ref,
             "type" => SelectorPrefix::Type,
             "actor" => SelectorPrefix::Actor,
             "verb" => SelectorPrefix::Verb,
@@ -1324,10 +1327,20 @@ impl PolicySelector {
         if pattern.chars().any(char::is_control) {
             return Err(PolicySelectorError::InvalidPattern(pattern.to_owned()));
         }
-        Ok(Self {
-            prefix,
-            pattern: pattern.to_owned(),
-        })
+        let pattern = if prefix == SelectorPrefix::Ref {
+            let number = pattern.strip_prefix('#').unwrap_or(pattern);
+            if number.is_empty()
+                || !number.bytes().all(|byte| byte.is_ascii_digit())
+                || number.starts_with('0')
+                || number.parse::<u64>().is_err()
+            {
+                return Err(PolicySelectorError::InvalidRef(pattern.to_owned()));
+            }
+            format!("#{number}")
+        } else {
+            pattern.to_owned()
+        };
+        Ok(Self { prefix, pattern })
     }
 
     #[must_use]
@@ -1357,6 +1370,9 @@ impl PolicySelector {
                 .paths
                 .iter()
                 .any(|path| glob_matches(path, &self.pattern, true)),
+            SelectorPrefix::Ref => candidate
+                .reference
+                .is_some_and(|reference| self.pattern == format!("#{reference}")),
             SelectorPrefix::Type => candidate
                 .commit_type
                 .as_deref()
@@ -1407,11 +1423,14 @@ pub enum PolicySelectorError {
     EmptyPattern,
     #[error("selector pattern contains a control character: {0:?}")]
     InvalidPattern(String),
+    #[error("ref selector must name one positive integer without globbing: {0}")]
+    InvalidRef(String),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PolicyCandidate {
     pub repository: String,
+    pub reference: Option<u64>,
     pub labels: Vec<String>,
     pub paths: Vec<String>,
     pub commit_type: Option<String>,
@@ -1492,6 +1511,7 @@ impl SelectorUniverse {
                     )))
                 }
             }
+            SelectorPrefix::Ref => Ok(None),
             SelectorPrefix::Type => {
                 if CONVENTIONAL_TYPES
                     .iter()
@@ -1872,12 +1892,24 @@ denies:
     #[test]
     fn step_requires_is_plural_and_closed_schema() {
         let manifest = PolicyManifest::from_yaml(
-            "manifest_version: 1\noperations:\n  merge:\n    steps:\n      - uses: gh/merge-pr\n        requires: placeholder-ci\n",
+            "manifest_version: 1\noperations:\n  merge:\n    steps:\n      - uses: gh/merge-pr\n        requires: placeholder-ci\n      - uses: gh/merge-pr\n        requires: [first-ci, second-ci]\n",
         )
         .expect("plural requirement parses");
         assert_eq!(
-            manifest.operations["merge"].steps[0].requires.as_deref(),
-            Some("placeholder-ci")
+            manifest.operations["merge"].steps[0]
+                .requires
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["placeholder-ci"]
+        );
+        assert_eq!(
+            manifest.operations["merge"].steps[1]
+                .requires
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["first-ci", "second-ci"]
         );
 
         let error = PolicyManifest::from_yaml(
@@ -1937,8 +1969,12 @@ denies:
             Some(43_200)
         );
         assert_eq!(
-            manifest.grants["held-placeholder"].requires.as_deref(),
-            Some("placeholder-check")
+            manifest.grants["held-placeholder"]
+                .requires
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["placeholder-check"]
         );
 
         for value in ["0d", "7", "-1d", "1day", "18446744073709551615w"] {
@@ -1952,10 +1988,26 @@ denies:
 
     #[test]
     fn grant_requires_is_plural_and_closed_schema() {
-        PolicyManifest::from_yaml(
-            "manifest_version: 1\ngrants:\n  placeholder:\n    requires: placeholder-check\n",
+        let manifest = PolicyManifest::from_yaml(
+            "manifest_version: 1\ngrants:\n  scalar:\n    requires: placeholder-check\n  sequence:\n    requires: [first-check, second-check]\n",
         )
         .expect("plural grant requirement parses");
+        assert_eq!(
+            manifest.grants["scalar"]
+                .requires
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["placeholder-check"]
+        );
+        assert_eq!(
+            manifest.grants["sequence"]
+                .requires
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["first-check", "second-check"]
+        );
         let error = PolicyManifest::from_yaml(
             "manifest_version: 1\ngrants:\n  placeholder:\n    require: placeholder-check\n",
         )
@@ -2003,11 +2055,38 @@ denies:
 
     #[test]
     fn selector_prefix_set_is_closed_and_names_unknown_prefix() {
-        for prefix in ["title", "scope", "check", "ref", "anything"] {
+        for prefix in ["title", "scope", "check", "anything"] {
             let error =
                 PolicySelector::new(format!("{prefix}:value")).expect_err("prefix must fail");
             assert_eq!(error, PolicySelectorError::UnknownPrefix(prefix.to_owned()));
             assert!(error.to_string().contains(prefix));
+        }
+    }
+
+    #[test]
+    fn ref_selectors_are_exact_positive_integers_in_hash_form() {
+        let hash = PolicySelector::new("ref:#199").expect("hash form");
+        let bare = PolicySelector::new("ref:199").expect("bare form");
+        assert_eq!(hash, bare);
+        assert_eq!(hash.to_string(), "ref:#199");
+        assert_eq!(
+            SelectorUniverse::default()
+                .validate(&hash, None)
+                .expect("ref validation is offline-safe"),
+            None
+        );
+        assert!(hash.matches(&PolicyCandidate {
+            reference: Some(199),
+            ..PolicyCandidate::default()
+        }));
+        assert!(!hash.matches(&PolicyCandidate {
+            reference: Some(19),
+            ..PolicyCandidate::default()
+        }));
+        for invalid in ["ref:*", "ref:19*", "ref:0", "ref:#0"] {
+            let error = PolicySelector::new(invalid).expect_err("fuzzy ref must fail");
+            assert!(matches!(error, PolicySelectorError::InvalidRef(_)));
+            assert!(error.to_string().contains("without globbing"), "{error}");
         }
     }
 

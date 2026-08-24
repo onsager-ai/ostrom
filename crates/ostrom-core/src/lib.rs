@@ -37,8 +37,9 @@ pub use dispatch::{
     WorkOrderError, resolve_exact_branch,
 };
 pub use domain::{
-    ConfigError, DefaultDisposition, GateConfig, GateProject, GateSelector, Mandate, MandateConfig,
-    ProjectMandate, RepositoryName, Role, Selector, SelectorError, Verdict,
+    ConfigError, DefaultDisposition, GateConfig, GateConfigDerivationError, GateProject,
+    GateSelector, Mandate, MandateConfig, ProjectMandate, RepositoryName, Role, Selector,
+    SelectorError, Verdict,
 };
 pub use operation::{
     ActionBoundary, ActionParameter, ActionScope, OperationAction, OperationActionError,

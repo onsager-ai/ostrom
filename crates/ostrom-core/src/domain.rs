@@ -1,7 +1,9 @@
-use std::{fmt, str::FromStr};
+use std::{collections::BTreeMap, fmt, str::FromStr};
 
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
+
+use crate::policy::{PolicyManifest, SelectorPrefix};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
@@ -56,6 +58,34 @@ pub enum ConfigError {
     Yaml(#[from] serde_yaml::Error),
     #[error("invalid Ostrom config: {0}")]
     Invalid(&'static str),
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum GateConfigDerivationError {
+    #[error("gate manifest rule `{rule}` names invalid repository `{repository}`: {source}")]
+    InvalidRepository {
+        rule: String,
+        repository: String,
+        source: DomainError,
+    },
+    #[error("gate manifest rule `{rule}` has unsupported selector `{selector}`: {source}")]
+    UnsupportedSelector {
+        rule: String,
+        selector: String,
+        source: SelectorError,
+    },
+    #[error("gate manifest grant `{rule}` requires undefined check `{check}`")]
+    UndefinedRequiredCheck { rule: String, check: String },
+    #[error(
+        "gate manifest grant `{rule}` requires check `{check}` using `{uses}`, expected `gh/check-run`"
+    )]
+    UnsupportedRequiredCheck {
+        rule: String,
+        check: String,
+        uses: String,
+    },
+    #[error("gate manifest grant `{rule}` requires check `{check}` without a nonempty `with.name`")]
+    InvalidRequiredCheckName { rule: String, check: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
@@ -339,6 +369,116 @@ impl GateConfig {
         serde_yaml::to_string(self)
     }
 
+    pub fn from_manifest(manifest: &PolicyManifest) -> Result<Self, GateConfigDerivationError> {
+        let mut repository_rules = BTreeMap::<String, String>::new();
+        for (rule, declaration) in manifest.grants.iter().chain(&manifest.denies) {
+            for repository in declaration.repositories.iter() {
+                RepositoryName::new(repository.clone()).map_err(|source| {
+                    GateConfigDerivationError::InvalidRepository {
+                        rule: rule.clone(),
+                        repository: repository.clone(),
+                        source,
+                    }
+                })?;
+                repository_rules
+                    .entry(repository.clone())
+                    .or_insert_with(|| rule.clone());
+            }
+        }
+
+        let mut projects = repository_rules
+            .keys()
+            .map(|repository| {
+                (
+                    repository.clone(),
+                    GateProject {
+                        repo: RepositoryName::new(repository.clone())
+                            .expect("repository names were validated"),
+                        required_checks: Vec::new(),
+                        bounce: Vec::new(),
+                        reserved: Vec::new(),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut bounce_all = Vec::new();
+
+        for (rule, declaration) in &manifest.denies {
+            if declaration.repositories.is_empty() {
+                for selector in declaration.selectors.iter() {
+                    push_gate_selector(&mut bounce_all, rule, selector)?;
+                }
+                continue;
+            }
+            for repository in declaration.repositories.iter() {
+                let project = projects
+                    .get_mut(repository)
+                    .expect("every named repository has a gate project");
+                for selector in declaration.selectors.iter() {
+                    if selector.prefix() == SelectorPrefix::Ref {
+                        let number = selector
+                            .pattern()
+                            .strip_prefix('#')
+                            .expect("ref selectors have canonical patterns")
+                            .parse::<u64>()
+                            .expect("ref selectors contain validated integers");
+                        if !project.reserved.contains(&number) {
+                            project.reserved.push(number);
+                        }
+                    } else {
+                        push_gate_selector(&mut project.bounce, rule, selector)?;
+                    }
+                }
+            }
+        }
+
+        for (rule, declaration) in &manifest.grants {
+            let mut names = Vec::new();
+            for check in declaration.requires.iter() {
+                let definition = manifest.checks.get(check).ok_or_else(|| {
+                    GateConfigDerivationError::UndefinedRequiredCheck {
+                        rule: rule.clone(),
+                        check: check.clone(),
+                    }
+                })?;
+                if definition.uses != "gh/check-run" {
+                    return Err(GateConfigDerivationError::UnsupportedRequiredCheck {
+                        rule: rule.clone(),
+                        check: check.clone(),
+                        uses: definition.uses.clone(),
+                    });
+                }
+                let name = definition
+                    .with
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| GateConfigDerivationError::InvalidRequiredCheckName {
+                        rule: rule.clone(),
+                        check: check.clone(),
+                    })?;
+                names.push(name.to_owned());
+            }
+            for repository in declaration.repositories.iter() {
+                let required_checks = &mut projects
+                    .get_mut(repository)
+                    .expect("every named repository has a gate project")
+                    .required_checks;
+                for name in &names {
+                    if !required_checks.contains(name) {
+                        required_checks.push(name.clone());
+                    }
+                }
+            }
+        }
+
+        Ok(Self {
+            provider: default_provider(),
+            bounce_all,
+            projects: projects.into_values().collect(),
+        })
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
         if self.provider != "file" {
             return Err(ConfigError::Invalid("provider must be file"));
@@ -361,6 +501,25 @@ impl GateConfig {
         }
         Ok(())
     }
+}
+
+fn push_gate_selector(
+    destination: &mut Vec<GateSelector>,
+    rule: &str,
+    selector: &crate::policy::PolicySelector,
+) -> Result<(), GateConfigDerivationError> {
+    let rendered = selector.to_string();
+    let gate_selector = GateSelector::new(rendered.clone()).map_err(|source| {
+        GateConfigDerivationError::UnsupportedSelector {
+            rule: rule.to_owned(),
+            selector: rendered,
+            source,
+        }
+    })?;
+    if !destination.contains(&gate_selector) {
+        destination.push(gate_selector);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -392,7 +551,9 @@ pub struct Mandate {
 
 #[cfg(test)]
 mod tests {
-    use super::{Selector, SelectorError};
+    use crate::PolicyManifest;
+
+    use super::{GateConfig, GateConfigDerivationError, MandateConfig, Selector, SelectorError};
 
     /// The legacy selector vocabulary is closed, and this is the invariant that
     /// makes `_ => false` safe in the gate and sweep matchers: both take a
@@ -419,8 +580,6 @@ mod tests {
             });
         }
     }
-    use super::{GateConfig, MandateConfig};
-
     const ROSTER: &str = r#"
 provider: file
 cadence_hours: 1
@@ -487,5 +646,128 @@ projects:
             parsed,
             GateConfig::from_yaml(&emitted).expect("emitted gate should parse")
         );
+    }
+
+    #[test]
+    fn translated_manifest_gate_configs_equal_their_legacy_sources() {
+        let cases = [
+            (
+                "checks-reservations-and-global-bounce",
+                r#"
+provider: file
+bounce_all: [label:blocked]
+projects:
+  - repo: placeholder-org/alpha
+    required_checks: [Rust workspace, Windows compile]
+    bounce: [path:protected/**]
+    reserved: [41, 43]
+  - repo: placeholder-org/beta
+    bounce: [type:docs]
+"#,
+                r#"
+manifest_version: 1
+checks:
+  rust: {uses: gh/check-run, with: {name: Rust workspace}}
+  windows: {uses: gh/check-run, with: {name: Windows compile}}
+grants:
+  alpha-green:
+    repositories: placeholder-org/alpha
+    requires: [rust, windows]
+  beta-without-ci:
+    repositories: placeholder-org/beta
+denies:
+  all-blocked: {where: label:blocked}
+  alpha-bounce:
+    repositories: placeholder-org/alpha
+    where: [path:protected/**, ref:#41, ref:43]
+  beta-bounce:
+    repositories: placeholder-org/beta
+    where: type:docs
+"#,
+            ),
+            (
+                "repository-without-checks-or-reservations",
+                r#"
+provider: file
+projects:
+  - repo: placeholder-org/empty
+"#,
+                r#"
+manifest_version: 1
+denies:
+  name-empty-repository:
+    repositories: placeholder-org/empty
+"#,
+            ),
+            (
+                "global-bounces-without-projects",
+                r#"
+provider: file
+bounce_all: [path:ostrom.yaml, type:release]
+projects: []
+"#,
+                r#"
+manifest_version: 1
+denies:
+  manifest-change: {where: path:ostrom.yaml}
+  release-change: {where: type:release}
+"#,
+            ),
+        ];
+
+        for (name, gate_yaml, manifest_yaml) in cases {
+            let legacy = GateConfig::from_yaml(gate_yaml)
+                .unwrap_or_else(|error| panic!("{name}: legacy gate parses: {error}"));
+            let manifest = PolicyManifest::from_yaml(manifest_yaml)
+                .unwrap_or_else(|error| panic!("{name}: translated manifest parses: {error}"));
+            let derived = GateConfig::from_manifest(&manifest)
+                .unwrap_or_else(|error| panic!("{name}: gate derives: {error}"));
+            assert_eq!(derived, legacy, "{name}");
+        }
+    }
+
+    #[test]
+    fn manifest_gate_derivation_names_unsafe_check_resolution() {
+        let undefined = PolicyManifest::from_yaml(
+            "manifest_version: 1\ngrants:\n  merge:\n    repositories: placeholder-org/repo\n    requires: absent\n",
+        )
+        .expect("manifest syntax");
+        assert!(matches!(
+            GateConfig::from_manifest(&undefined),
+            Err(GateConfigDerivationError::UndefinedRequiredCheck { rule, check })
+                if rule == "merge" && check == "absent"
+        ));
+
+        let wrong_action = PolicyManifest::from_yaml(
+            "manifest_version: 1\nchecks:\n  local: {uses: cmd/run, with: {script: 'true'}}\ngrants:\n  merge:\n    repositories: placeholder-org/repo\n    requires: local\n",
+        )
+        .expect("manifest syntax");
+        assert!(matches!(
+            GateConfig::from_manifest(&wrong_action),
+            Err(GateConfigDerivationError::UnsupportedRequiredCheck { rule, check, uses })
+                if rule == "merge" && check == "local" && uses == "cmd/run"
+        ));
+
+        let unsupported_selector = PolicyManifest::from_yaml(
+            "manifest_version: 1\ndenies:\n  actor-only: {where: actor:builder}\n",
+        )
+        .expect("manifest syntax");
+        assert!(matches!(
+            GateConfig::from_manifest(&unsupported_selector),
+            Err(GateConfigDerivationError::UnsupportedSelector { rule, selector, .. })
+                if rule == "actor-only" && selector == "actor:builder"
+        ));
+    }
+
+    #[test]
+    fn ref_deny_reserves_only_its_exact_number() {
+        let manifest = PolicyManifest::from_yaml(
+            "manifest_version: 1\ndenies:\n  reservation: {repositories: placeholder-org/repo, where: 'ref:199'}\n",
+        )
+        .expect("reservation manifest");
+        let gate = GateConfig::from_manifest(&manifest).expect("gate config");
+        assert_eq!(gate.projects[0].reserved, [199]);
+        assert!(!gate.projects[0].reserved.contains(&19));
+        assert!(gate.projects[0].bounce.is_empty());
     }
 }

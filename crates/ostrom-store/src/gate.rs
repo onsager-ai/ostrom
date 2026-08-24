@@ -2,16 +2,19 @@ use std::{
     collections::BTreeSet,
     fs::{self, OpenOptions},
     io::{self, Write},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::{Command, Output},
 };
 
-use ostrom_core::{GateConfig, GateProject, GateSelector, sha256_hex};
+use ostrom_core::{GateConfig, GateProject, GateSelector, PolicyManifest, sha256_hex};
 use regex::{Regex, RegexBuilder};
 use serde_json::{Value, json};
 use thiserror::Error;
 
-use crate::{OstromPaths, read_commit_checks, set_private_file_mode, sweep::merge_yaml};
+use crate::{
+    OstromPaths, policy_manifest_digest, read_commit_checks, set_private_file_mode,
+    sweep::merge_yaml,
+};
 
 const SHIPPED_DEFAULTS: &str = include_str!("../../../plugins/ostrom/config/gate.defaults.yaml");
 const REVIEW_QUERY: &str = "query($owner:String!, $repo:String!, $number:Int!, $cursor:String) {\n  repository(owner:$owner, name:$repo) {\n    pullRequest(number:$number) {\n      author { login }\n      reviewThreads(first:100, after:$cursor) {\n        nodes {\n          id\n          isResolved\n          resolvedBy { login }\n          comments(last:1) { nodes { author { login } } }\n        }\n        pageInfo { hasNextPage endCursor }\n      }\n    }\n  }\n}";
@@ -99,7 +102,7 @@ impl JudgmentState {
 
 pub fn run_gate(options: &GateOptions) -> Result<GateOutput, GateError> {
     let target = parse_target(&options.target)?;
-    let (config, config_error) =
+    let (config, config_error, config_source) =
         load_gate_config_for_repo(&options.paths, &options.working_directory, target.repo);
 
     let metadata_output = match gh(&[
@@ -133,7 +136,9 @@ pub fn run_gate(options: &GateOptions) -> Result<GateOutput, GateError> {
     };
     apply_shipped_manifest_bounce(&mut conditions, &acquisition);
 
-    let mut stderr = String::new();
+    let mut stderr = config_source.map_or_else(String::new, |source| {
+        format!("mandate gate: policy source={source}\n")
+    });
     apply_exceptions(
         &mut conditions,
         &options.paths.state.join("exceptions.jsonl"),
@@ -570,6 +575,19 @@ pub(crate) fn is_merge_evidence(record: &Value) -> bool {
 }
 
 pub(crate) fn load_gate_config(paths: &OstromPaths, cwd: &Path) -> Result<GateConfig, String> {
+    load_gate_config_with_source(paths, cwd).map(|(config, _)| config)
+}
+
+fn load_gate_config_with_source(
+    paths: &OstromPaths,
+    cwd: &Path,
+) -> Result<(GateConfig, Option<String>), String> {
+    if let Some((manifest, digest)) = load_current_manifest(paths)? {
+        let config = GateConfig::from_manifest(&manifest)
+            .map_err(|error| truncate_error(&error.to_string()))?;
+        return Ok((config, Some(format!("manifest digest={digest}"))));
+    }
+
     let user_path = paths.config.join("gate.yaml");
     let repo_path = cwd.join(".ostrom/gate.yaml");
     let mut merged = match serde_yaml::from_str::<serde_yaml::Value>(SHIPPED_DEFAULTS) {
@@ -607,17 +625,119 @@ pub(crate) fn load_gate_config(paths: &OstromPaths, cwd: &Path) -> Result<GateCo
                 .push(GateSelector::new(path).map_err(|error| truncate_error(&error.to_string()))?);
         }
     }
-    Ok(config)
+    Ok((config, None))
+}
+
+fn load_current_manifest(paths: &OstromPaths) -> Result<Option<(PolicyManifest, String)>, String> {
+    const MATERIALIZED_MANIFEST: &str = "ostrom.yaml";
+
+    let current = paths.current_policy_version();
+    let target = match fs::read_link(&current) {
+        Ok(target) => target,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
+            return Err(format!(
+                "current policy refused: current_target_invalid path={}",
+                current.display()
+            ));
+        }
+        Err(_) => {
+            return Err(format!(
+                "current policy refused: current_unreadable path={}",
+                current.display()
+            ));
+        }
+    };
+    let mut components = target.components();
+    let valid_root =
+        matches!(components.next(), Some(Component::Normal(part)) if part == "versions");
+    let digest = match components.next() {
+        Some(Component::Normal(digest)) => digest.to_str().map(str::to_owned),
+        _ => None,
+    };
+    let digest = digest.filter(|digest| valid_policy_digest(digest));
+    if !valid_root || components.next().is_some() || digest.is_none() || target.is_absolute() {
+        return Err(format!(
+            "current policy refused: current_target_invalid path={}",
+            current.display()
+        ));
+    }
+    let digest = digest.expect("validated current policy digest is present");
+    let directory = paths.state.join(&target);
+    match fs::metadata(&directory) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(format!(
+                "current policy refused: version_not_directory path={}",
+                directory.display()
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(format!(
+                "current policy refused: version_missing path={}",
+                directory.display()
+            ));
+        }
+        Err(_) => {
+            return Err(format!(
+                "current policy refused: version_unreadable path={}",
+                directory.display()
+            ));
+        }
+    }
+    let path = directory.join(MATERIALIZED_MANIFEST);
+    let bytes = fs::read(&path).map_err(|error| {
+        format!(
+            "current policy refused: {} path={}",
+            if error.kind() == io::ErrorKind::NotFound {
+                "manifest_missing"
+            } else {
+                "manifest_unreadable"
+            },
+            path.display()
+        )
+    })?;
+    let manifest = std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(|source| PolicyManifest::parse_yaml(source).ok())
+        .ok_or_else(|| "current policy refused: current_drift drift=ostrom.yaml".to_owned())?;
+    let observed_digest = policy_manifest_digest(&manifest).map_err(|_| {
+        format!(
+            "current policy refused: digest_unavailable path={}",
+            path.display()
+        )
+    })?;
+    let canonical = manifest.to_yaml().map_err(|_| {
+        format!(
+            "current policy refused: canonical_form_unavailable path={}",
+            path.display()
+        )
+    })?;
+    if observed_digest != digest || bytes != canonical.as_bytes() {
+        return Err("current policy refused: current_drift drift=ostrom.yaml".to_owned());
+    }
+    Ok(Some((manifest, digest)))
+}
+
+fn valid_policy_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn load_gate_config_for_repo(
     paths: &OstromPaths,
     cwd: &Path,
     repo: &str,
-) -> (Option<GateConfig>, String) {
+) -> (Option<GateConfig>, String, Option<String>) {
     let user_path = paths.config.join("gate.yaml");
     let repo_path = cwd.join(".ostrom/gate.yaml");
-    if !user_path.exists() && !repo_path.exists() {
+    let current_present = match fs::symlink_metadata(paths.current_policy_version()) {
+        Ok(_) => true,
+        Err(error) => error.kind() != io::ErrorKind::NotFound,
+    };
+    if !current_present && !user_path.exists() && !repo_path.exists() {
         return (
             None,
             format!(
@@ -625,11 +745,12 @@ fn load_gate_config_for_repo(
                 user_path.display(),
                 repo_path.display()
             ),
+            None,
         );
     }
-    let config = match load_gate_config(paths, cwd) {
+    let (config, source) = match load_gate_config_with_source(paths, cwd) {
         Ok(config) => config,
-        Err(error) => return (None, error),
+        Err(error) => return (None, error, None),
     };
     if config
         .projects
@@ -638,9 +759,18 @@ fn load_gate_config_for_repo(
         .count()
         != 1
     {
-        return (None, format!("gate.yaml has no project entry for {repo}"));
+        let source_name = if source.is_some() {
+            "composed manifest"
+        } else {
+            "gate.yaml"
+        };
+        return (
+            None,
+            format!("{source_name} has no project entry for {repo}"),
+            source,
+        );
     }
-    (Some(config), String::new())
+    (Some(config), String::new(), source)
 }
 
 fn truncate_error(error: &str) -> String {
@@ -1442,6 +1572,35 @@ const fn verdict_exit(verdict: &str) -> i32 {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn point_current(paths: &OstromPaths, digest: &str) {
+        std::os::unix::fs::symlink(
+            Path::new("versions").join(digest),
+            paths.current_policy_version(),
+        )
+        .expect("point current policy");
+    }
+
+    #[cfg(windows)]
+    fn point_current(paths: &OstromPaths, digest: &str) {
+        std::os::windows::fs::symlink_dir(
+            Path::new("versions").join(digest),
+            paths.current_policy_version(),
+        )
+        .expect("point current policy");
+    }
+
+    fn materialize_current(paths: &OstromPaths, manifest: &PolicyManifest, digest: &str) {
+        let version = paths.policy_versions_dir().join(digest);
+        fs::create_dir_all(&version).expect("create policy version");
+        fs::write(
+            version.join("ostrom.yaml"),
+            manifest.to_yaml().expect("canonical manifest"),
+        )
+        .expect("write policy version");
+        point_current(paths, digest);
+    }
+
     #[test]
     fn gate_config_preserves_shipped_user_repo_layering() {
         let fixture = tempfile::tempdir().expect("temporary gate config fixture");
@@ -1469,9 +1628,10 @@ projects:
             "bounce_all: [title:*principal review*]\n",
         )
         .unwrap();
-        let (config, error) =
+        let (config, error, source) =
             load_gate_config_for_repo(&paths, &repository, "placeholder-org/placeholder-repo");
         assert!(error.is_empty());
+        assert!(source.is_none());
         let config = config.expect("layered gate config");
         assert_eq!(config.bounce_all[0].as_str(), "title:*principal review*");
         assert_eq!(
@@ -1481,6 +1641,79 @@ projects:
         assert_eq!(config.projects[0].required_checks, ["verify-*"]);
         assert_eq!(config.projects[0].bounce[0].as_str(), "path:protected/**");
         assert_eq!(config.projects[0].reserved, [41]);
+    }
+
+    #[test]
+    fn current_manifest_precedes_legacy_gate_config() {
+        let fixture = tempfile::tempdir().expect("temporary gate config fixture");
+        let paths = OstromPaths {
+            config: fixture.path().to_path_buf(),
+            state: fixture.path().to_path_buf(),
+        };
+        fs::write(
+            paths.config.join("gate.yaml"),
+            "provider: file\nprojects:\n  - repo: placeholder-org/legacy\n",
+        )
+        .expect("legacy fallback");
+        let manifest = PolicyManifest::from_yaml(
+            "manifest_version: 1\ngrants:\n  current: {repositories: placeholder-org/current}\n",
+        )
+        .expect("current manifest");
+        let digest = policy_manifest_digest(&manifest).expect("manifest digest");
+        materialize_current(&paths, &manifest, &digest);
+
+        let (config, source) = load_gate_config_with_source(&paths, fixture.path())
+            .expect("current manifest gate config");
+        assert_eq!(config.projects.len(), 1);
+        assert_eq!(config.projects[0].repo.as_str(), "placeholder-org/current");
+        assert_eq!(source, Some(format!("manifest digest={digest}")));
+    }
+
+    #[test]
+    fn drifted_current_manifest_is_named_and_never_falls_back() {
+        let fixture = tempfile::tempdir().expect("temporary gate config fixture");
+        let paths = OstromPaths {
+            config: fixture.path().to_path_buf(),
+            state: fixture.path().to_path_buf(),
+        };
+        fs::write(
+            paths.config.join("gate.yaml"),
+            "provider: file\nprojects:\n  - repo: placeholder-org/legacy\n",
+        )
+        .expect("legacy fallback");
+        let manifest = PolicyManifest::from_yaml(
+            "manifest_version: 1\ngrants:\n  current: {repositories: placeholder-org/current}\n",
+        )
+        .expect("current manifest");
+        materialize_current(&paths, &manifest, &"0".repeat(64));
+
+        let error = load_gate_config(&paths, fixture.path())
+            .expect_err("digest drift must not read gate.yaml");
+        assert!(error.contains("current_drift"), "{error}");
+    }
+
+    #[test]
+    fn repository_absent_from_current_manifest_is_a_named_gate_failure() {
+        let fixture = tempfile::tempdir().expect("temporary gate config fixture");
+        let paths = OstromPaths {
+            config: fixture.path().to_path_buf(),
+            state: fixture.path().to_path_buf(),
+        };
+        let manifest = PolicyManifest::from_yaml(
+            "manifest_version: 1\ngrants:\n  current: {repositories: placeholder-org/current}\n",
+        )
+        .expect("current manifest");
+        let digest = policy_manifest_digest(&manifest).expect("manifest digest");
+        materialize_current(&paths, &manifest, &digest);
+
+        let (config, error, source) =
+            load_gate_config_for_repo(&paths, fixture.path(), "placeholder-org/absent");
+        assert!(config.is_none());
+        assert_eq!(
+            error,
+            "composed manifest has no project entry for placeholder-org/absent"
+        );
+        assert_eq!(source, Some(format!("manifest digest={digest}")));
     }
 
     #[test]

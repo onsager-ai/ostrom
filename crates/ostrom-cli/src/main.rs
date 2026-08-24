@@ -1349,7 +1349,10 @@ impl OperationRuntime for CliOperationRuntime<'_> {
             || self.selector_prefixes.iter().any(|prefix| {
                 matches!(
                     prefix,
-                    SelectorPrefix::Label | SelectorPrefix::Path | SelectorPrefix::Type
+                    SelectorPrefix::Label
+                        | SelectorPrefix::Path
+                        | SelectorPrefix::Ref
+                        | SelectorPrefix::Type
                 )
             })
         {

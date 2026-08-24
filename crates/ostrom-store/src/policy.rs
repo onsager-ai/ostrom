@@ -535,7 +535,10 @@ fn explain_rule(
         .map(|selector| SelectorProjection {
             selector: selector.to_string(),
             projection: match selector.prefix() {
-                SelectorPrefix::Label | SelectorPrefix::Path | SelectorPrefix::Type => "subject",
+                SelectorPrefix::Label
+                | SelectorPrefix::Path
+                | SelectorPrefix::Ref
+                | SelectorPrefix::Type => "subject",
                 SelectorPrefix::Actor | SelectorPrefix::Verb => "actor",
             },
             matched: selector.matches(candidate),
@@ -558,8 +561,20 @@ fn explain_rule(
     let matched = declaration.matches(actor, operation, candidate);
     let requirement = declaration
         .requires
-        .as_deref()
-        .map(|check| explain_requirement(check, definitions, default_inconclusive_policy, checks));
+        .iter()
+        .map(|check| explain_requirement(check, definitions, default_inconclusive_policy, checks))
+        .reduce(|left, right| RequirementExplanation {
+            check: format!("{}, {}", left.check, right.check),
+            status: if left.status == "FAIL" || right.status == "FAIL" {
+                "FAIL"
+            } else if left.status == "PASS" && right.status == "PASS" {
+                "PASS"
+            } else {
+                "INCONCLUSIVE"
+            },
+            allows: left.allows && right.allows,
+            source: format!("{}; {}", left.source, right.source),
+        });
     RuleExplanation {
         kind,
         id: id.to_owned(),
@@ -684,6 +699,7 @@ fn pull_request_candidate(
 ) -> PolicyCandidate {
     PolicyCandidate {
         repository: repository.to_owned(),
+        reference: pull_request.get("number").and_then(Value::as_u64),
         labels: names(pull_request.get("labels"), "name"),
         paths: names(pull_request.get("files"), "path"),
         commit_type: pull_request
@@ -725,7 +741,7 @@ fn commit_type(title: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use ostrom_core::{InconclusivePolicy, PolicyManifest};
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::path::{Path, PathBuf};
 
     use super::{PolicyBundle, PolicyOrigins};
@@ -796,6 +812,63 @@ denies:
                 .map(|value| value.source.as_str()),
             Some("checks.rust-green: gh/check-run name=placeholder-ci")
         );
+    }
+
+    #[test]
+    fn every_grant_requirement_must_pass_and_absent_jobs_fail() {
+        let bundle = PolicyBundle::repository(
+            PolicyManifest::from_yaml(
+                r#"
+manifest_version: 1
+actors: {builder: {}}
+operations: {work: {steps: []}}
+checks:
+  first: {uses: gh/check-run, with: {name: First CI}}
+  second: {uses: gh/check-run, with: {name: Second CI}}
+grants:
+  all-green:
+    actors: builder
+    operations: work
+    repositories: placeholder-org/repository
+    requires: [first, second]
+"#,
+            )
+            .expect("manifest"),
+        );
+        let explain = |checks: Value| {
+            bundle.explain_pull_request(
+                "placeholder-org/repository",
+                &json!({"title": "feat: placeholder", "checks": checks}),
+                "builder",
+                "work",
+            )
+        };
+
+        let passing = explain(json!([
+            {"name": "First CI", "conclusion": "SUCCESS"},
+            {"name": "Second CI", "conclusion": "SUCCESS"}
+        ]));
+        assert!(passing.granted);
+        assert_eq!(
+            passing.rules[0].requirement.as_ref().unwrap().status,
+            "PASS"
+        );
+
+        let failing = explain(json!([
+            {"name": "First CI", "conclusion": "SUCCESS"},
+            {"name": "Second CI", "conclusion": "FAILURE"}
+        ]));
+        assert!(!failing.granted);
+        assert_eq!(
+            failing.rules[0].requirement.as_ref().unwrap().status,
+            "FAIL"
+        );
+
+        let absent = explain(json!([{"name": "First CI", "conclusion": "SUCCESS"}]));
+        assert!(!absent.granted);
+        let requirement = absent.rules[0].requirement.as_ref().unwrap();
+        assert_eq!(requirement.status, "FAIL");
+        assert!(!requirement.allows);
     }
 
     #[test]

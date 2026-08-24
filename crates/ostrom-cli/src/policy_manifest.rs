@@ -1025,24 +1025,24 @@ fn validate_check_requirements(manifest: &PolicyManifest) -> Result<(), PolicyLo
         .operations
         .iter()
         .flat_map(|(operation, declaration)| {
-            declaration.steps.iter().filter_map(move |step| {
+            declaration.steps.iter().flat_map(move |step| {
                 step.requires
-                    .as_deref()
-                    .map(|check| ("operation", operation.as_str(), check))
+                    .iter()
+                    .map(|check| ("operation", operation.as_str(), check.as_str()))
             })
         })
         .collect::<Vec<_>>();
-    requirements.extend(manifest.grants.iter().filter_map(|(grant, declaration)| {
+    requirements.extend(manifest.grants.iter().flat_map(|(grant, declaration)| {
         declaration
             .requires
-            .as_deref()
-            .map(|check| ("grant", grant.as_str(), check))
+            .iter()
+            .map(|check| ("grant", grant.as_str(), check.as_str()))
     }));
-    requirements.extend(manifest.denies.iter().filter_map(|(deny, declaration)| {
+    requirements.extend(manifest.denies.iter().flat_map(|(deny, declaration)| {
         declaration
             .requires
-            .as_deref()
-            .map(|check| ("deny", deny.as_str(), check))
+            .iter()
+            .map(|check| ("deny", deny.as_str(), check.as_str()))
     }));
     for (kind, owner, check) in requirements {
         if !manifest.checks.contains_key(check) {
