@@ -9,8 +9,7 @@ use ostrom_core::{GateConfig, PolicyCandidate, PolicyManifest, ResolvedLoopCeili
 use ostrom_store::{
     GateReplaySnapshot, OstromPaths, PolicyBundle, PublishTarget, RepositorySnapshot, SweepFixture,
     SweepMode, SweepOptions, acquire_gate_replay_snapshot, evaluate_gate_replay,
-    gate_config_needs_diff_content, gate_replay_invariant_verdict, load_config, load_gate_config,
-    run_sweep_with_mirror,
+    gate_config_needs_diff_content, load_config, load_gate_config, run_sweep_with_mirror,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -22,7 +21,6 @@ use crate::{policy_manifest, policy_version};
 const BUILDER: &str = "builder";
 const WORK: &str = "work";
 const GATEKEEPER: &str = "gatekeeper";
-const MERGE: &str = "merge";
 
 #[derive(Debug, Clone)]
 pub(crate) struct CutoverReplayOptions {
@@ -162,6 +160,7 @@ pub(crate) fn run(options: &CutoverReplayOptions) -> Result<String, CutoverRepla
         (Some(_), None) | (None, Some(_)) => {}
     }
     let manifest = load_manifest(&options.manifest)?;
+    let manifest_gate = GateConfig::from_manifest(&manifest).map_err(|error| error.to_string());
     let bundle = PolicyBundle::repository(manifest.clone());
     let scratch = Builder::new()
         .prefix("cutover-replay-")
@@ -203,7 +202,13 @@ pub(crate) fn run(options: &CutoverReplayOptions) -> Result<String, CutoverRepla
     let snapshot = if let Some(path) = &options.snapshot {
         read_snapshot(path)?
     } else {
-        let snapshot = acquire_snapshot(options, &paths, &legacy_home, &gate)?;
+        let snapshot = acquire_snapshot(
+            options,
+            &paths,
+            &legacy_home,
+            &gate,
+            manifest_gate.as_ref().ok(),
+        )?;
         let path = options
             .snapshot_output
             .as_ref()
@@ -241,7 +246,7 @@ pub(crate) fn run(options: &CutoverReplayOptions) -> Result<String, CutoverRepla
 
     let state = read_json(&paths.sweep_state_file())?;
     let classification = classification_evidence(&roster, &state, &bundle, &manifest);
-    let gate_verdict = gate_evidence(&roster, &gate, &snapshot, &bundle, &manifest)?;
+    let gate_verdict = gate_evidence(&roster, &gate, &manifest_gate, &snapshot)?;
     let loops = loop_evidence(&roster, &options.legacy, &manifest)?;
     let evidence = [classification, gate_verdict, loops];
     let output = evidence
@@ -259,7 +264,8 @@ fn acquire_snapshot(
     options: &CutoverReplayOptions,
     paths: &OstromPaths,
     legacy_home: &Path,
-    gate: &GateConfig,
+    legacy_gate: &GateConfig,
+    manifest_gate: Option<&GateConfig>,
 ) -> Result<CutoverSnapshot, CutoverReplayError> {
     let (outcome, repositories) = run_sweep_with_mirror(&SweepOptions {
         paths: paths.clone(),
@@ -279,7 +285,8 @@ fn acquire_snapshot(
             outcome.faults.join("; ")
         )));
     }
-    let needs_diff_content = gate_config_needs_diff_content(gate);
+    let needs_diff_content = gate_config_needs_diff_content(legacy_gate)
+        || manifest_gate.is_some_and(gate_config_needs_diff_content);
     let mut gates = BTreeMap::new();
     for repository in &repositories {
         for pull_request in &repository.open_prs {
@@ -401,11 +408,10 @@ fn classification_evidence(
 fn gate_evidence(
     roster: &BTreeSet<String>,
     legacy: &GateConfig,
+    manifest: &Result<GateConfig, String>,
     snapshot: &CutoverSnapshot,
-    bundle: &PolicyBundle,
-    manifest: &PolicyManifest,
 ) -> Result<GateEvidence, CutoverReplayError> {
-    let mut gaps = policy_coverage_gaps(roster, manifest, GATEKEEPER, MERGE, "manifest");
+    let mut gaps = Vec::new();
     let legacy_repositories = legacy
         .projects
         .iter()
@@ -415,6 +421,24 @@ fn gate_evidence(
         gaps.push(format!(
             "legacy gate.yaml omitted roster repository {repository}"
         ));
+    }
+    let manifest_repositories = match manifest {
+        Ok(config) => config
+            .projects
+            .iter()
+            .map(|project| project.repo.as_str().to_owned())
+            .collect::<BTreeSet<_>>(),
+        Err(error) => {
+            gaps.push(format!("manifest gate derivation failed: {error}"));
+            BTreeSet::new()
+        }
+    };
+    if manifest.is_ok() {
+        for repository in roster.difference(&manifest_repositories) {
+            gaps.push(format!(
+                "manifest-derived gate config omitted roster repository {repository}"
+            ));
+        }
     }
     let snapshot_repositories = snapshot
         .repositories
@@ -426,7 +450,8 @@ fn gate_evidence(
             "GitHub snapshot omitted roster repository {repository}"
         ));
     }
-    let needs_diff_content = gate_config_needs_diff_content(legacy);
+    let needs_diff_content = gate_config_needs_diff_content(legacy)
+        || manifest.as_ref().is_ok_and(gate_config_needs_diff_content);
     let mut differences = Vec::new();
     let mut item_count = 0;
     for repository in &snapshot.repositories {
@@ -457,14 +482,16 @@ fn gate_evidence(
             }
             let legacy_verdict = evaluate_gate_replay(legacy, &target, acquisition)
                 .map_err(|error| CutoverReplayError::Acquisition(error.to_string()))?;
-            let manifest_verdict =
-                manifest_gate_verdict(bundle, repository.repo.as_str(), acquisition);
-            if legacy_verdict != manifest_verdict {
-                differences.push(Difference {
-                    item: target,
-                    legacy: legacy_verdict.to_owned(),
-                    manifest: manifest_verdict.to_owned(),
-                });
+            if let Ok(manifest) = manifest {
+                let manifest_verdict = evaluate_gate_replay(manifest, &target, acquisition)
+                    .map_err(|error| CutoverReplayError::Acquisition(error.to_string()))?;
+                if legacy_verdict != manifest_verdict {
+                    differences.push(Difference {
+                        item: target,
+                        legacy: legacy_verdict.to_owned(),
+                        manifest: manifest_verdict.to_owned(),
+                    });
+                }
             }
         }
     }
@@ -475,44 +502,6 @@ fn gate_evidence(
         coverage_gaps: gaps,
         differences,
     })
-}
-
-fn manifest_gate_verdict(
-    bundle: &PolicyBundle,
-    repository: &str,
-    acquisition: &GateReplaySnapshot,
-) -> &'static str {
-    let explanation =
-        bundle.explain_pull_request(repository, acquisition.metadata(), GATEKEEPER, MERGE);
-    let policy = if explanation.granted {
-        "pass"
-    } else {
-        let requirements = explanation
-            .rules
-            .iter()
-            .filter(|rule| rule.kind == "grant" && rule.matched)
-            .filter_map(|rule| rule.requirement.as_ref())
-            .collect::<Vec<_>>();
-        if requirements
-            .iter()
-            .any(|requirement| requirement.status == "INCONCLUSIVE")
-        {
-            "inconclusive"
-        } else {
-            "fail"
-        }
-    };
-    combine_verdicts(gate_replay_invariant_verdict(acquisition), policy)
-}
-
-fn combine_verdicts(left: &'static str, right: &'static str) -> &'static str {
-    if left == "fail" || right == "fail" {
-        "fail"
-    } else if left == "inconclusive" || right == "inconclusive" {
-        "inconclusive"
-    } else {
-        "pass"
-    }
 }
 
 fn loop_evidence(
@@ -877,6 +866,7 @@ fn load_manifest(path: &Path) -> Result<PolicyManifest, CutoverReplayError> {
 fn candidate(repository: &str, record: &Value) -> PolicyCandidate {
     PolicyCandidate {
         repository: repository.to_owned(),
+        reference: record.get("number").and_then(Value::as_u64),
         labels: strings(record.get("labels")),
         paths: strings(record.get("files")),
         commit_type: record
@@ -1032,6 +1022,32 @@ mod tests {
     }
 
     #[test]
+    fn manifest_ref_deny_preserves_a_legacy_reservation() {
+        let manifest = policy(
+            "grants:\n  work: {actors: builder, operations: work, repositories: placeholder-org/alpha}\ndenies:\n  reserved: {repositories: placeholder-org/alpha, where: 'ref:#41'}\n",
+        );
+        let state = serde_json::json!({
+            "repos": {"placeholder-org/alpha": {
+                "items": {"placeholder-org/alpha#41": {"classification": "reserved"}},
+                "records": {"placeholder-org/alpha#41": {
+                    "number": 41,
+                    "title": "fix: reserved placeholder",
+                    "labels": [],
+                    "files": []
+                }}
+            }}
+        });
+        let roster = BTreeSet::from(["placeholder-org/alpha".to_owned()]);
+        let gate = classification_evidence(
+            &roster,
+            &state,
+            &PolicyBundle::repository(manifest.clone()),
+            &manifest,
+        );
+        assert!(gate.is_empty(), "{}", gate.render());
+    }
+
+    #[test]
     fn seeded_gate_verdict_disagreement_fails_and_names_both_verdicts() {
         let legacy = GateConfig::from_yaml(
             "provider: file\nprojects:\n  - repo: placeholder-org/alpha\n    required_checks: [verify-linux]\n",
@@ -1090,18 +1106,53 @@ mod tests {
             gates: BTreeMap::from([("placeholder-org/alpha#12".to_owned(), acquisition)]),
         };
         let roster = BTreeSet::from(["placeholder-org/alpha".to_owned()]);
-        let gate = gate_evidence(
-            &roster,
-            &legacy,
-            &snapshot,
-            &PolicyBundle::repository(manifest.clone()),
-            &manifest,
-        )
-        .expect("compare gate");
+        let manifest_gate = GateConfig::from_manifest(&manifest).expect("derive manifest gate");
+        let gate =
+            gate_evidence(&roster, &legacy, &Ok(manifest_gate), &snapshot).expect("compare gate");
         assert!(!gate.is_empty());
         let output = gate.render();
         assert!(output.contains("placeholder-org/alpha#12"), "{output}");
         assert!(output.contains("legacy=pass manifest=fail"), "{output}");
+    }
+
+    #[test]
+    fn manifest_gate_derivation_failure_is_named_as_gate_two_coverage() {
+        let legacy =
+            GateConfig::from_yaml("provider: file\nprojects:\n  - repo: placeholder-org/alpha\n")
+                .expect("legacy gate");
+        let roster = BTreeSet::from(["placeholder-org/alpha".to_owned()]);
+        let snapshot = CutoverSnapshot {
+            repositories: vec![RepositorySnapshot {
+                repo: ostrom_core::RepositoryName::new("placeholder-org/alpha")
+                    .expect("repository"),
+                issues: Vec::new(),
+                issue_etag: None,
+                issue_not_modified: false,
+                open_prs: Vec::new(),
+                merged_prs: Vec::new(),
+                default_branch: None,
+                branches: Vec::new(),
+                branch_read_degraded: false,
+                ci_runs: Vec::new(),
+                warnings: Vec::new(),
+            }],
+            gates: BTreeMap::new(),
+        };
+        let manifest =
+            policy("grants:\n  merge: {repositories: placeholder-org/alpha, requires: missing}\n");
+        let derivation = GateConfig::from_manifest(&manifest).map_err(|error| error.to_string());
+        let gate = gate_evidence(&roster, &legacy, &derivation, &snapshot).expect("gate evidence");
+        let output = gate.render();
+        assert!(!gate.is_empty());
+        assert!(
+            output.contains("manifest gate derivation failed"),
+            "{output}"
+        );
+        assert!(
+            output.contains("requires undefined check `missing`"),
+            "{output}"
+        );
+        assert!(!output.contains("diff: empty"), "{output}");
     }
 
     #[test]

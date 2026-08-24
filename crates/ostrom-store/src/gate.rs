@@ -938,8 +938,9 @@ pub fn gate_config_needs_diff_content(config: &GateConfig) -> bool {
         .any(|selector| selector.as_str().starts_with("substance:"))
 }
 
-/// Evaluate the legacy merge-gate policy without exceptions, journaling, or
-/// any live reads. The supplied acquisition is the sole evidence source.
+/// Evaluate a parsed or manifest-derived merge-gate config without exceptions,
+/// journaling, or live reads. The supplied acquisition is the sole evidence
+/// source, and both cutover sides enter through this function.
 pub fn evaluate_gate_replay(
     config: &GateConfig,
     target: &str,
@@ -958,19 +959,6 @@ pub fn evaluate_gate_replay(
     let mut conditions = evaluate_conditions(config, acquisition, &target);
     apply_shipped_manifest_bounce(&mut conditions, acquisition);
     Ok(aggregate(&conditions))
-}
-
-/// Conditions that are policy-independent in the current gate implementation.
-/// A manifest verdict is combined with this value so draft, mergeability and
-/// review-thread protections remain part of both sides of the replay.
-#[must_use]
-pub fn gate_replay_invariant_verdict(acquisition: &GateReplaySnapshot) -> &'static str {
-    let conditions = [
-        evaluate_mergeable(acquisition),
-        evaluate_draft(acquisition),
-        evaluate_threads(acquisition),
-    ];
-    aggregate(&conditions)
 }
 
 fn unavailable_conditions(reason: &str) -> Vec<Value> {

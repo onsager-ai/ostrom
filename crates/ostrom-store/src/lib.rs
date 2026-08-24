@@ -42,8 +42,7 @@ pub use event_store::JsonlEventStore;
 pub use file_store::JsonlSweepStore;
 pub use gate::{
     GateError, GateOptions, GateOutput, GateReplaySnapshot, acquire_gate_replay_snapshot,
-    evaluate_gate_replay, gate_config_needs_diff_content, gate_replay_invariant_verdict,
-    load_gate_config, run_gate,
+    evaluate_gate_replay, gate_config_needs_diff_content, load_gate_config, run_gate,
 };
 pub use hooks::{DigestOptions, HookOutput, render_constitution, render_digest};
 pub use implement::{ImplementError, ImplementRequest, run_implement};
