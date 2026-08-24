@@ -729,6 +729,54 @@ fn a_manifest_without_checks_still_signs_and_verifies() {
 }
 
 #[test]
+fn an_agent_operation_signs_and_validates() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let manifest = temporary.path().join("ostrom.yaml");
+    fs::write(
+        &manifest,
+        "manifest_version: 1\noperations:\n  inspect:\n    steps:\n      - uses: agent/claude\n        with: {prompt: inspect the repository, model: opus}\n",
+    )
+    .expect("write agent operation manifest");
+    let trusted = support::sign_manifest(&manifest);
+
+    let output = ostrom()
+        .env("OSTROM_HOME", temporary.path())
+        .env("OSTROM_POLICY_TRUSTED_KEYS", trusted)
+        .args(["validate"])
+        .arg(&manifest)
+        .output()
+        .expect("validate signed agent operation");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn an_agent_operation_refuses_unknown_with_keys() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let manifest = temporary.path().join("ostrom.yaml");
+    fs::write(
+        &manifest,
+        "manifest_version: 1\noperations:\n  inspect:\n    steps:\n      - uses: agent/claude\n        with: {prompt: inspect the repository, evidence: []}\n",
+    )
+    .expect("write invalid agent operation manifest");
+    let trusted = support::sign_manifest(&manifest);
+
+    let output = ostrom()
+        .env("OSTROM_HOME", temporary.path())
+        .env("OSTROM_POLICY_TRUSTED_KEYS", trusted)
+        .args(["validate"])
+        .arg(&manifest)
+        .output()
+        .expect("validate invalid agent operation");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unknown parameter `evidence`"), "{stderr}");
+}
+
+#[test]
 fn loop_substrate_receives_no_private_signing_key() {
     let temporary = TempDir::new().expect("temporary loop substrate");
     let manifest = temporary.path().join("manifest.yml");
