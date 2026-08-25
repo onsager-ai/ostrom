@@ -83,7 +83,7 @@ fn fixture_path() -> OsString {
 }
 
 #[test]
-fn rust_gate_matches_recorded_shell_corpus_apart_from_the_injected_clock() {
+fn rust_gate_matches_recorded_behavior_corpus_apart_from_the_injected_clock() {
     let fixture = fixture_root();
     for case in CASES {
         let root = tempdir().expect("temporary gate fixture");
@@ -143,7 +143,7 @@ fn rust_gate_matches_recorded_shell_corpus_apart_from_the_injected_clock() {
         let expected_bytes = fs::read(expected.join(format!("{}.gate.jsonl", case.name)))
             .expect("read recorded shell verdict");
         let expected_record: Value =
-            serde_json::from_slice(&expected_bytes).expect("parse recorded shell verdict");
+            serde_json::from_slice(&expected_bytes).expect("parse recorded verdict");
         actual_record["ts"] = expected_record["ts"].clone();
         actual_record
             .as_object_mut()
@@ -154,6 +154,11 @@ fn rust_gate_matches_recorded_shell_corpus_apart_from_the_injected_clock() {
             .expect("gate record is an object")
             .remove("judgment_digest");
         actual_record["already_judged"] = Value::Bool(false);
+        let expected_record: Value = serde_json::from_slice(
+            &fs::read(expected.join(format!("{}.gate.jsonl", case.name)))
+                .expect("read recorded verdict"),
+        )
+        .expect("parse recorded verdict");
         assert_eq!(actual_record, expected_record, "{} gate log", case.name);
         if let Some(condition_name) = match case.name {
             "conflicting" => Some("mergeable"),
@@ -242,7 +247,7 @@ bounce_all: []
 projects:
   - repo: placeholder-org/alpha
     required_checks: []
-    bounce: [title:*protected*]
+    bounce: [label:risk:protected-surface]
     reserved: []
     exceptions:
       bounce_selectors: principal accepted placeholder surface

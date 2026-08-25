@@ -31,7 +31,7 @@ bounce_all: []
 projects:
   - repo: example-org/example-repo
     required_checks: [verify-*]
-    bounce: [title:*protected*, substance:fly-spend]
+    bounce: [label:risk:protected-surface, substance:fly-spend]
     reserved: []
 "#,
         )
@@ -61,7 +61,8 @@ if [ "$1 $2" = "pr view" ]; then
   fi
   jq -cn --argjson number "$3" --arg head "${OSTROM_TEST_GATE_HEAD:-aaaaaaaaaaaaaaaa}" \
     --arg mergeable "$mergeable" --argjson draft "$draft" --arg title "$title" --arg check "$check" '
-    {number:$number,title:$title,author:{login:"builder-login"},headRefOid:$head,labels:[],
+    {number:$number,title:$title,author:{login:"builder-login"},headRefOid:$head,
+     labels:(if env.OSTROM_TEST_GATE_MODE == "bounce" then [{name:"risk:protected-surface"}] else [] end),
      closingIssuesReferences:[],mergeable:$mergeable,isDraft:$draft}
     | if env.OSTROM_TEST_GATE_MODE == "missing-mergeable" then del(.mergeable)
       elif env.OSTROM_TEST_GATE_MODE == "malformed-mergeable" then .mergeable=7 else . end'
@@ -506,7 +507,7 @@ fn changed_judgment_on_the_same_head_is_not_suppressed() {
 fn exceptions_are_condition_and_sha_scoped_for_failures_and_inconclusive_results() {
     let fixture = Fixture::new();
     fixture.write_config(
-        "provider: file\nbounce_all: []\nprojects:\n  - repo: example-org/example-repo\n    required_checks: []\n    bounce: [title:*protected*]\n    reserved: []\n",
+        "provider: file\nbounce_all: []\nprojects:\n  - repo: example-org/example-repo\n    required_checks: []\n    bounce: [label:risk:protected-surface]\n    reserved: []\n",
     );
     fs::write(
         fixture.home.join("exceptions.jsonl"),

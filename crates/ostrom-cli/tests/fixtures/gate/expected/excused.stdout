@@ -3,5 +3,5 @@ condition mergeable: pass tier=content-derived detail={"mergeable":"MERGEABLE"}
 condition draft: pass tier=content-derived detail={"isDraft":false}
 condition required_checks: pass tier=content-derived detail={"selectors":[{"selector":"verify-*","result":"pass","matches":[{"name":"verify-linux","state":"SUCCESS"}]}]}
 condition review_threads: pass tier=content-derived detail={"unresolved":0,"answered":0,"unanswered":0,"resolved_by_pr_author":0,"resolved_with_missing_resolver":0}
-condition bounce_selectors: excused tier=author-written exception_reason="principal accepted placeholder surface" detail={"matches":[{"selector":"title:*protected*","tier":"author-written"}],"unobservable":[]}
+condition bounce_selectors: excused tier=author-written exception_reason="principal accepted placeholder surface" detail={"matches":[{"selector":"label:risk:protected-surface","tier":"author-written"}],"unobservable":[]}
 condition reserved_refs: pass tier=none detail={"matches":[]}

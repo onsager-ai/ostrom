@@ -23,21 +23,21 @@ hold_labels:
 work_ranking: []
 
 bounce_all:
-  - title:*merge to main*
-  - title:*production deployment*
-  - title:*external publication*
-  - title:*credential*
+  - label:risk:secret
+  - label:risk:announce
+  - label:risk:hosting
+  - path:**/secrets/**
 
 projects:
   - repo: example-org/example-repo
     # This prevents branch collisions within this repository; omit it for 1.
     # Global shared-compute capacity is configured separately by dispatch.
     max_implementers_per_repository: 1
-    # Selectors are case-insensitive. Supported prefixes are label, scope,
-    # type, path, ref, and title. Only * is a wildcard; path ** spans depth.
+    # Selectors are case-insensitive. Supported prefixes are label, type, path,
+    # and ref. Only * is a wildcard; path ** spans depth.
     delegated:
       - label:maintenance
-      - scope:tooling
+      - label:area:tooling
       - path:docs/**
     excluded:
       - label:wontfix
@@ -49,11 +49,11 @@ projects:
     paused: false
     bounce:
       - label:public-release
-      - title:*breaking API*
+      - label:risk:contract
   - repo: example-org/another-repo
     delegated:
       - type:ci
-      - scope:release
+      - label:area:release
     excluded: []
     reserved: []
     default: excluded

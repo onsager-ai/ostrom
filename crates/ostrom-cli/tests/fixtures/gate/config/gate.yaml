@@ -5,6 +5,6 @@ projects:
     required_checks:
       - verify-*
     bounce:
-      - title:*protected*
+      - label:risk:protected-surface
     reserved:
       - 99

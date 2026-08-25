@@ -12,7 +12,7 @@ stuck_after_days: 7
 search_roots: []
 hold_labels: []
 bounce_all:
-  - title:*credential*
+  - label:risk:secret
 projects:
   - repo: example-org/example-repo
     delegated: []

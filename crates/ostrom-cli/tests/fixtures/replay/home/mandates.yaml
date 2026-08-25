@@ -2,12 +2,12 @@ provider: file
 cadence_hours: 24
 stuck_after_days: 7
 bounce_all:
-  - title:*credential*
+  - label:risk:secret
   - label:protected
 projects:
   - repo: placeholder-org/alpha
     delegated:
-      - scope:tooling
+      - label:area:tooling
       - type:docs
     excluded:
       - label:ignored

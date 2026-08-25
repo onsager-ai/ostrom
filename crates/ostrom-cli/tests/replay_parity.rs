@@ -9,7 +9,7 @@ fn fixture_root() -> PathBuf {
 }
 
 #[test]
-fn rust_replay_is_byte_identical_to_recorded_shell_corpus() {
+fn rust_replay_matches_recorded_behavior_corpus() {
     let fixture = fixture_root();
     let root = tempdir().expect("temporary replay fixture");
     let home = root.path().join("home");
@@ -40,9 +40,16 @@ fn rust_replay_is_byte_identical_to_recorded_shell_corpus() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    if env::var_os("OSTROM_BLESS_REPLAY").is_some() {
+        fs::write(
+            fixture.join("replay.stdout"),
+            fs::read(&output_path).unwrap(),
+        )
+        .expect("record migrated replay output");
+    }
     assert_eq!(
         fs::read(output_path).expect("read injected-clock replay output"),
-        fs::read(fixture.join("replay.stdout")).expect("read shell-recorded output")
+        fs::read(fixture.join("replay.stdout")).expect("read recorded output")
     );
     assert!(output.stderr.is_empty());
 }
