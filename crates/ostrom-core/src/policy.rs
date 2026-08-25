@@ -30,6 +30,8 @@ pub struct PolicyManifest {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub checks: BTreeMap<String, CheckDefinition>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub prompts: BTreeMap<String, PromptValue>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub operations: BTreeMap<String, OperationDecl>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub grants: BTreeMap<String, RuleDecl>,
@@ -52,6 +54,48 @@ impl PolicyManifest {
 
     pub fn to_yaml(&self) -> Result<String, serde_yaml::Error> {
         serde_yaml::to_string(self)
+    }
+
+    /// Resolve one authored prompt after filesystem references have been
+    /// materialized by the manifest loader.
+    pub fn resolve_prompt(&self, prompt: &PromptValue) -> Result<String, PromptResolutionError> {
+        match prompt {
+            PromptValue::Inline(text) => Ok(text.clone()),
+            PromptValue::Named(reference) => self
+                .prompts
+                .get(reference.name())
+                .ok_or_else(|| PromptResolutionError::UnknownNamed(reference.name().to_owned()))
+                .and_then(|prompt| self.resolve_prompt(prompt)),
+            PromptValue::File(reference) => Err(PromptResolutionError::UnmaterializedFile(
+                reference.from.clone(),
+            )),
+        }
+    }
+
+    /// Resolve the single agent prompt declared by an operation.
+    pub fn resolve_operation_prompt(
+        &self,
+        operation: &str,
+    ) -> Result<String, PromptResolutionError> {
+        let declaration = self
+            .operations
+            .get(operation)
+            .ok_or_else(|| PromptResolutionError::UnknownOperation(operation.to_owned()))?;
+        let prompts = declaration
+            .steps
+            .iter()
+            .filter(|step| step.uses.starts_with("agent/"))
+            .map(|step| {
+                crate::operation::agent_run_parameters(step)
+                    .map_err(|_| PromptResolutionError::InvalidOperation(operation.to_owned()))
+                    .and_then(|parameters| self.resolve_prompt(&parameters.prompt))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        match prompts.as_slice() {
+            [prompt] => Ok(prompt.clone()),
+            [] => Err(PromptResolutionError::Missing(operation.to_owned())),
+            _ => Err(PromptResolutionError::Ambiguous(operation.to_owned())),
+        }
     }
 
     pub fn validate(&self) -> Result<(), ManifestValidationError> {
@@ -86,8 +130,39 @@ impl PolicyManifest {
         )?;
         validate_check_definitions(&self.checks, CHECK_ACTIONS)
             .map_err(|error| ManifestValidationError::InvalidChecks(error.to_string()))?;
+        for (name, prompt) in &self.prompts {
+            if !valid_policy_id(name) {
+                return Err(ManifestValidationError::InvalidPrompt {
+                    name: name.clone(),
+                    message: "name must contain only lowercase letters, digits, or `-`".to_owned(),
+                });
+            }
+            if matches!(prompt, PromptValue::Named(_)) {
+                return Err(ManifestValidationError::InvalidPrompt {
+                    name: name.clone(),
+                    message: "declared prompts must be inline text or a `{from: path}` reference"
+                        .to_owned(),
+                });
+            }
+        }
         for (name, operation) in &self.operations {
             validate_operation(name, operation)?;
+            for (step, declaration) in operation.steps.iter().enumerate() {
+                if !declaration.uses.starts_with("agent/") {
+                    continue;
+                }
+                let parameters = crate::operation::agent_run_parameters(declaration)
+                    .expect("operation validation decoded agent parameters");
+                if let PromptValue::Named(prompt) = &parameters.prompt
+                    && !self.prompts.contains_key(prompt.name())
+                {
+                    return Err(ManifestValidationError::UnknownPrompt {
+                        operation: name.clone(),
+                        step,
+                        prompt: prompt.name().to_owned(),
+                    });
+                }
+            }
         }
         for (name, declaration) in &self.loops {
             self.validate_loop(name, declaration)?;
@@ -357,6 +432,22 @@ pub enum ManifestError {
     Invalid(#[from] ManifestValidationError),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum PromptResolutionError {
+    #[error("unknown operation `{0}`")]
+    UnknownOperation(String),
+    #[error("operation `{0}` has no agent prompt")]
+    Missing(String),
+    #[error("operation `{0}` has multiple agent prompts")]
+    Ambiguous(String),
+    #[error("operation `{0}` has invalid agent prompt parameters")]
+    InvalidOperation(String),
+    #[error("unknown prompt `prompts.{0}`")]
+    UnknownNamed(String),
+    #[error("prompt file `{0}` was not materialized while loading policy")]
+    UnmaterializedFile(String),
+}
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ManifestValidationError {
     #[error("unsupported manifest_version {0}; expected 1")]
@@ -391,6 +482,14 @@ pub enum ManifestValidationError {
     InvalidLoop { name: String, message: String },
     #[error("checks are invalid: {0}")]
     InvalidChecks(String),
+    #[error("prompt `{name}` is invalid: {message}")]
+    InvalidPrompt { name: String, message: String },
+    #[error("operation `{operation}` step {step} references unknown prompt `prompts.{prompt}`")]
+    UnknownPrompt {
+        operation: String,
+        step: usize,
+        prompt: String,
+    },
     #[error(transparent)]
     Operation(#[from] OperationActionError),
 }
@@ -412,6 +511,102 @@ pub enum PermissionMode {
     #[default]
     Auto,
     Manual,
+}
+
+/// Authored prompt content or a reference to content owned by policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromptValue {
+    Inline(String),
+    File(PromptFileReference),
+    Named(PromptNamedReference),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PromptFileReference {
+    pub from: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct PromptNamedReference(String);
+
+impl PromptNamedReference {
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for PromptValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        match value {
+            Value::String(text) => {
+                if let Some(name) = text.strip_prefix("prompts.") {
+                    if name.is_empty() {
+                        return Err(serde::de::Error::custom(
+                            "named prompt reference must have the form `prompts.<name>`",
+                        ));
+                    }
+                    Ok(Self::Named(PromptNamedReference(name.to_owned())))
+                } else if text.trim().is_empty() {
+                    Err(serde::de::Error::custom("prompt text must not be empty"))
+                } else {
+                    Ok(Self::Inline(text))
+                }
+            }
+            Value::Mapping(_) => {
+                let reference = serde_yaml::from_value::<PromptFileReference>(value)
+                    .map_err(serde::de::Error::custom)?;
+                if reference.from.trim().is_empty() {
+                    return Err(serde::de::Error::custom(
+                        "prompt file path must not be empty",
+                    ));
+                }
+                Ok(Self::File(reference))
+            }
+            _ => Err(serde::de::Error::custom(
+                "prompt must be inline text, `{from: path}`, or `prompts.<name>`",
+            )),
+        }
+    }
+}
+
+impl Serialize for PromptValue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Inline(text) => serializer.serialize_str(text),
+            Self::File(reference) => reference.serialize(serializer),
+            Self::Named(reference) => {
+                serializer.serialize_str(&format!("prompts.{}", reference.name()))
+            }
+        }
+    }
+}
+
+impl PromptValue {
+    #[must_use]
+    pub fn file(&self) -> Option<&str> {
+        match self {
+            Self::File(reference) => Some(&reference.from),
+            Self::Inline(_) | Self::Named(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn named(&self) -> Option<&str> {
+        match self {
+            Self::Named(reference) => Some(reference.name()),
+            Self::Inline(_) | Self::File(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

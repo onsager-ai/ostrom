@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use serde_yaml::Value;
 use thiserror::Error;
 
-use crate::{OperationDecl, OperationParamType, StepDecl, check::agent_parameter_prelude};
+use crate::{OperationDecl, OperationParamType, PromptValue, StepDecl};
 
 /// The credential boundary used to execute one operation action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,7 +186,7 @@ pub fn operation_action(uses: &str) -> Option<&'static OperationAction> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRunParameters {
-    pub prompt: String,
+    pub prompt: PromptValue,
     pub model: Option<String>,
 }
 
@@ -199,17 +199,32 @@ pub struct AgentRunParametersError;
 pub fn agent_run_parameters(
     step: &StepDecl,
 ) -> Result<AgentRunParameters, AgentRunParametersError> {
-    let prelude = agent_parameter_prelude(
-        &step.uses,
-        &step.parameters,
-        &["model", "prompt"],
-        Value::as_str,
-    )
-    .map_err(|()| AgentRunParametersError)?;
-    Ok(AgentRunParameters {
-        prompt: prelude.prompt,
-        model: prelude.model,
-    })
+    if step.uses.split_once('/').map(|part| part.0) != Some("agent")
+        || step
+            .parameters
+            .keys()
+            .any(|key| !["model", "prompt"].contains(&key.as_str()))
+    {
+        return Err(AgentRunParametersError);
+    }
+    let prompt = step
+        .parameters
+        .get("prompt")
+        .cloned()
+        .ok_or(AgentRunParametersError)
+        .and_then(|value| serde_yaml::from_value(value).map_err(|_| AgentRunParametersError))?;
+    let model = step
+        .parameters
+        .get("model")
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+                .ok_or(AgentRunParametersError)
+        })
+        .transpose()?;
+    Ok(AgentRunParameters { prompt, model })
 }
 
 pub fn validate_operation(
@@ -576,13 +591,19 @@ mod tests {
             "  prompt: inspect the repository\n  model: opus\n",
         ))
         .expect("bounded agent parameters");
-        assert_eq!(parameters.prompt, "inspect the repository");
+        assert_eq!(
+            parameters.prompt,
+            crate::PromptValue::Inline("inspect the repository".to_owned())
+        );
         assert_eq!(parameters.model.as_deref(), Some("opus"));
 
         for parameters in [
             "  model: opus\n",
             "  prompt: ''\n",
             "  prompt: 42\n",
+            "  prompt: {from: ''}\n",
+            "  prompt: {from: prompt.md, extra: nope}\n",
+            "  prompt: prompts.\n",
             "  prompt: inspect\n  model: ''\n",
             "  prompt: inspect\n  model: 42\n",
             "  prompt: inspect\n  evidence: []\n",
@@ -598,6 +619,17 @@ mod tests {
         let non_agent = serde_yaml::from_str("uses: cmd/run\nwith: {prompt: inspect}\n")
             .expect("non-agent step fixture");
         assert!(agent_run_parameters(&non_agent).is_err());
+    }
+
+    #[test]
+    fn agent_run_parameters_accept_file_and_named_prompts() {
+        let file = agent_run_parameters(&agent_step("  prompt: {from: ./prompt.md}\n"))
+            .expect("file prompt");
+        assert_eq!(file.prompt.file(), Some("./prompt.md"));
+
+        let named = agent_run_parameters(&agent_step("  prompt: prompts.builder-work\n"))
+            .expect("named prompt");
+        assert_eq!(named.prompt.named(), Some("builder-work"));
     }
 
     #[test]
@@ -618,5 +650,43 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn agent_operation_refuses_unknown_named_prompt() {
+        let error = PolicyManifest::from_yaml(
+            "manifest_version: 1\noperations:\n  inspect:\n    steps:\n      - uses: agent/claude\n        with: {prompt: prompts.missing}\n",
+        )
+        .expect_err("unknown named prompt");
+        assert!(
+            error
+                .to_string()
+                .contains("unknown prompt `prompts.missing`")
+        );
+    }
+
+    #[test]
+    fn manifest_resolver_materializes_inline_and_named_prompt_text() {
+        let manifest = PolicyManifest::from_yaml(
+            "manifest_version: 1\nprompts: {shared: 'named text'}\noperations:\n  inline:\n    steps:\n      - uses: agent/claude\n        with: {prompt: 'inline text'}\n  named:\n    steps:\n      - uses: agent/claude\n        with: {prompt: prompts.shared}\n",
+        )
+        .expect("prompt manifest");
+        assert_eq!(
+            manifest
+                .resolve_operation_prompt("inline")
+                .expect("inline prompt"),
+            "inline text"
+        );
+        assert_eq!(
+            manifest
+                .resolve_operation_prompt("named")
+                .expect("named prompt"),
+            "named text"
+        );
+        let round_trip = manifest.to_yaml().expect("render prompt manifest");
+        assert!(
+            round_trip.contains("prompt: prompts.shared"),
+            "{round_trip}"
+        );
     }
 }

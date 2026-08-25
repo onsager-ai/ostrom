@@ -41,8 +41,12 @@ impl PassRole {
 
     const fn prompt(self) -> &'static str {
         match self {
-            Self::Builder => "/ostrom:work",
-            Self::Gatekeeper => "/ostrom:gatekeep",
+            Self::Builder => {
+                include_str!("../../../plugins/ostrom/skills/work/SKILL.md")
+            }
+            Self::Gatekeeper => {
+                include_str!("../../../plugins/ostrom/skills/gatekeep/SKILL.md")
+            }
         }
     }
 

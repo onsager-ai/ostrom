@@ -6,6 +6,7 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
+    sync::atomic::{AtomicU64, Ordering},
     thread,
     time::Duration,
 };
@@ -21,24 +22,25 @@ use ostrom_checks::{
 use ostrom_core::{
     CHECK_STORE_SCHEMA_VERSION, CHECKS_VERSION, Catalogue, CatalogueEnumeration,
     CheckContractError, CheckDefinition, CheckDocument, CheckFault, CheckRun, CheckRunId,
-    CheckState, CheckVerdict, InconclusivePolicy, OperationAction, RepositoryName, ResolvedCheck,
-    ResolvedLoopCeilings, SelectorPrefix,
+    CheckState, CheckVerdict, InconclusivePolicy, OperationAction, PermissionMode, PolicyManifest,
+    RepositoryName, ResolvedCheck, ResolvedLoopCeilings, SelectorPrefix, agent_run_parameters,
 };
 use ostrom_store::{
     AgentRegistry, AssessmentHarness, AuditOptions, Clock, CodexHarness, DigestOptions,
     DispatchOutcome, DispatchRequest, ExecutableAssessmentDeriver, GateError, GateOptions,
-    HarnessAssessmentDeriver, ImplementRequest, JsonlCheckStore, MigrationOutcome, OstromPaths,
-    PassRequest, PassRole, PlanOptions, PublishDestination, PublishTarget, QueueDecision,
-    ReplayOptions, SelectAction, SelectError, SelectOutcome, SelectRequest, SignalFlags,
-    SweepError, SweepMode, SweepOptions, SweepParityOptions, TraceAppend, TraceView,
-    UnavailableAssessmentDeriver, acquire_lease, acquire_org_from_github_with_faults,
-    append_trace_checked, audit, branch_name, clear_work_order, create_work_order,
-    credential_output, decide_queue_item, encode_org_snapshots_with_faults, encode_selection,
-    environment, finalize_exited_implementer, grant_excuse, item_hash, lease_status,
-    lint_queue_state, list_excuses, list_queue_json, local_drift, migrate, read_trace_json,
-    release_lease, render_constitution, render_digest, replay, run_dispatch_with_registry,
-    run_gate, run_implement_with_registry, run_pass, run_plan, run_repair_prs, run_selection,
-    run_sweep, run_sweep_parity, validate_lease_name, validate_work_order_file,
+    HarnessAssessmentDeriver, ImplementRequest, JsonlCheckStore, MigrationOutcome,
+    OrchestratorRunRequest, OstromPaths, PassRequest, PassRole, PlanOptions, PublishDestination,
+    PublishTarget, QueueDecision, ReplayOptions, RunOutcome, RunRequest, SelectAction, SelectError,
+    SelectOutcome, SelectRequest, SignalFlags, SweepError, SweepMode, SweepOptions,
+    SweepParityOptions, TraceAppend, TraceView, UnavailableAssessmentDeriver, acquire_lease,
+    acquire_org_from_github_with_faults, append_trace_checked, audit, branch_name,
+    clear_work_order, create_work_order, credential_output, decide_queue_item,
+    encode_org_snapshots_with_faults, encode_selection, environment, finalize_exited_implementer,
+    grant_excuse, item_hash, lease_status, lint_queue_state, list_excuses, list_queue_json,
+    local_drift, migrate, read_trace_json, release_lease, render_constitution, render_digest,
+    replay, run_dispatch_with_registry, run_gate, run_implement_with_registry, run_pass, run_plan,
+    run_repair_prs, run_selection, run_sweep, run_sweep_parity, validate_lease_name,
+    validate_work_order_file,
 };
 
 mod cutover_replay;
@@ -51,6 +53,8 @@ use operation_dispatch::{
     OperationDispatchError, OperationRuntime, ResolvedOperationTarget, dispatch_operation,
     parse_invocation, resolve_repository_target,
 };
+
+static AGENT_RUN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Parser)]
 #[command(name = "ostrom", version, about = "Ostrom workflow commons CLI")]
@@ -102,6 +106,13 @@ enum Command {
         /// Refuse when this settings file differs from the derived profile.
         #[arg(long, requires = "actor", conflicts_with = "settings")]
         check_settings: Option<PathBuf>,
+        /// Print the resolved prompt for an actor, operation, or loop.
+        #[arg(
+            long,
+            value_name = "ACTOR_OR_OPERATION",
+            conflicts_with_all = ["actor", "settings", "check_settings"]
+        )]
+        prompt: Option<String>,
     },
     /// Explain how authored policy resolves for one pull request.
     Explain {
@@ -599,11 +610,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             actor,
             settings,
             check_settings,
+            prompt,
         } => run_operations_command(
             &paths,
             actor.as_deref(),
             settings.as_deref(),
             check_settings.as_deref(),
+            prompt.as_deref(),
         )?,
         Command::Explain {
             target,
@@ -1227,8 +1240,13 @@ fn run_operations_command(
     actor: Option<&str>,
     settings_actor: Option<&str>,
     check_settings: Option<&Path>,
+    prompt_target: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let manifest = policy_manifest::load(&policy_manifest::adopting_manifest_path(paths)?)?;
+    if let Some(target) = prompt_target {
+        print!("{}", resolve_inspection_prompt(&manifest, target)?);
+        return Ok(());
+    }
     if let Some(settings_actor) = settings_actor {
         print!(
             "{}",
@@ -1266,6 +1284,67 @@ fn run_operations_command(
         }
     }
     Ok(())
+}
+
+fn resolve_inspection_prompt(
+    manifest: &PolicyManifest,
+    target: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if manifest.operations.contains_key(target) {
+        return operation_prompt(manifest, target).map_err(Into::into);
+    }
+    if let Some(declaration) = manifest.loops.get(target) {
+        return operation_prompt(manifest, &declaration.operation).map_err(Into::into);
+    }
+    if !manifest.actors.contains_key(target) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("unknown actor, operation, or loop `{target}`"),
+        )
+        .into());
+    }
+
+    let mut operations = manifest
+        .loops
+        .values()
+        .filter(|declaration| declaration.actor == target)
+        .map(|declaration| declaration.operation.clone())
+        .collect::<BTreeSet<_>>();
+    for grant in manifest
+        .grants
+        .values()
+        .filter(|grant| grant.actors.is_empty() || grant.actors.iter().any(|actor| actor == target))
+    {
+        if grant.operations.is_empty() {
+            operations.extend(manifest.operations.keys().cloned());
+        } else {
+            operations.extend(grant.operations.iter().cloned());
+        }
+    }
+    operations.retain(|operation| operation_prompt(manifest, operation).is_ok());
+    match operations.len() {
+        1 => operation_prompt(manifest, operations.first().expect("one operation remains"))
+            .map_err(Into::into),
+        0 => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("actor `{target}` is not bound to an operation with a prompt"),
+        )
+        .into()),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "actor `{target}` has multiple prompted operations: {}; name an operation or loop",
+                operations.into_iter().collect::<Vec<_>>().join(", ")
+            ),
+        )
+        .into()),
+    }
+}
+
+fn operation_prompt(manifest: &PolicyManifest, operation: &str) -> io::Result<String> {
+    manifest
+        .resolve_operation_prompt(operation)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 fn run_loops_command(
@@ -1347,10 +1426,9 @@ fn dispatch_resolved_loop(
     let mut runtime = CliOperationRuntime {
         paths,
         actor: &resolved.actor,
+        manifest,
         working_directory: &working_directory,
         plugin_root: &plugin_root,
-        checks: &manifest.checks,
-        default_inconclusive_policy: manifest.defaults.check.inconclusive_policy,
         selector_prefixes,
         ceilings: Some(resolved.ceilings),
     };
@@ -1377,10 +1455,9 @@ fn run_operation_command(
     let mut runtime = CliOperationRuntime {
         paths,
         actor: &actor,
+        manifest: &manifest,
         working_directory: &working_directory,
         plugin_root: &plugin_root,
-        checks: &manifest.checks,
-        default_inconclusive_policy: manifest.defaults.check.inconclusive_policy,
         selector_prefixes,
         ceilings: None,
     };
@@ -1391,10 +1468,9 @@ fn run_operation_command(
 struct CliOperationRuntime<'a> {
     paths: &'a OstromPaths,
     actor: &'a str,
+    manifest: &'a PolicyManifest,
     working_directory: &'a Path,
     plugin_root: &'a Path,
-    checks: &'a BTreeMap<String, CheckDefinition>,
-    default_inconclusive_policy: InconclusivePolicy,
     selector_prefixes: BTreeSet<SelectorPrefix>,
     ceilings: Option<ResolvedLoopCeilings>,
 }
@@ -1475,8 +1551,8 @@ impl OperationRuntime for CliOperationRuntime<'_> {
             self.paths,
             self.working_directory,
             self.plugin_root,
-            self.checks,
-            self.default_inconclusive_policy,
+            &self.manifest.checks,
+            self.manifest.defaults.check.inconclusive_policy,
             check,
         )
     }
@@ -1494,6 +1570,7 @@ impl OperationRuntime for CliOperationRuntime<'_> {
             target,
             parameters,
             self.ceilings,
+            self.manifest,
         )
     }
 }
@@ -1657,6 +1734,7 @@ fn execute_operation_action(
     target: &ResolvedOperationTarget,
     parameters: &BTreeMap<String, serde_yaml::Value>,
     ceilings: Option<ResolvedLoopCeilings>,
+    manifest: &PolicyManifest,
 ) -> Result<(), OperationDispatchError> {
     match action.uses {
         "gh/post-verdict" => {
@@ -1716,8 +1794,90 @@ fn execute_operation_action(
             )
         }
         "cmd/run" => run_local_command(action, parameters, actor, ceilings),
+        "agent/claude" => run_agent_operation(
+            paths,
+            actor,
+            action,
+            parameters,
+            ceilings.unwrap_or_default(),
+            manifest,
+        ),
         _ => Err(OperationDispatchError::UnknownAction(
             action.uses.to_owned(),
+        )),
+    }
+}
+
+fn run_agent_operation(
+    paths: &OstromPaths,
+    actor: &str,
+    action: &'static OperationAction,
+    parameters: &BTreeMap<String, serde_yaml::Value>,
+    ceilings: ResolvedLoopCeilings,
+    manifest: &PolicyManifest,
+) -> Result<(), OperationDispatchError> {
+    let step = ostrom_core::StepDecl {
+        uses: action.uses.to_owned(),
+        parameters: parameters.clone(),
+        requires: Default::default(),
+    };
+    let parameters = agent_run_parameters(&step)
+        .map_err(|error| action_failed(action.uses, error.to_string()))?;
+    let prompt = manifest
+        .resolve_prompt(&parameters.prompt)
+        .map_err(|error| action_failed(action.uses, error))?;
+    let actor_decl = manifest
+        .actors
+        .get(actor)
+        .ok_or_else(|| action_failed(action.uses, format!("unknown actor `{actor}`")))?;
+    let permission_mode = match actor_decl.permission_mode {
+        PermissionMode::Auto => "auto",
+        PermissionMode::Manual => "manual",
+    };
+    let run_directory = paths.state.join("agent-runs").join(actor);
+    fs::create_dir_all(&run_directory).map_err(|error| action_failed(action.uses, error))?;
+    let identity = format!(
+        "{}-{}-{}",
+        std::process::id(),
+        AGENT_RUN_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        action.uses.replace('/', "-")
+    );
+    let profile = run_directory.join(format!("{identity}.settings.json"));
+    fs::write(
+        &profile,
+        generate_operation_settings(manifest, actor)
+            .map_err(|error| action_failed(action.uses, error))?,
+    )
+    .map_err(|error| action_failed(action.uses, error))?;
+    let transcript = run_directory.join(format!("{identity}.jsonl"));
+    let registry = core_agent_registry();
+    let runner = registry
+        .get(action.uses)
+        .ok_or_else(|| action_failed(action.uses, "runner is not registered"))?;
+    let model = parameters
+        .model
+        .unwrap_or_else(|| runner.default_model().to_owned());
+    let request = RunRequest::Orchestrator(OrchestratorRunRequest {
+        prompt,
+        model,
+        profile,
+        permission_mode: permission_mode.to_owned(),
+        ceilings,
+        transcript,
+    });
+    match registry.run(action.uses, &request) {
+        RunOutcome::Exited(status) if status.success() => Ok(()),
+        RunOutcome::Exited(status) => Err(action_failed(
+            action.uses,
+            format!("runner exited with {status}"),
+        )),
+        RunOutcome::Terminated(termination) => Err(action_failed(
+            action.uses,
+            format!("runner terminated by SIG{}", termination.signal),
+        )),
+        RunOutcome::Error(fault) => Err(action_failed(
+            action.uses,
+            fault.detail().unwrap_or_else(|| fault.name()),
         )),
     }
 }

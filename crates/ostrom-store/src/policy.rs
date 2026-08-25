@@ -31,6 +31,7 @@ pub struct PolicyOrigins {
     pub root: PathBuf,
     pub actors: BTreeMap<String, PathBuf>,
     pub checks: BTreeMap<String, PathBuf>,
+    pub prompts: BTreeMap<String, PathBuf>,
     pub operations: BTreeMap<String, PathBuf>,
     pub grants: BTreeMap<String, PathBuf>,
     pub denies: BTreeMap<String, PathBuf>,
@@ -49,6 +50,7 @@ impl PolicyOrigins {
             root: path.to_path_buf(),
             actors: origins(manifest.actors.keys().cloned().collect()),
             checks: origins(manifest.checks.keys().cloned().collect()),
+            prompts: origins(manifest.prompts.keys().cloned().collect()),
             operations: origins(manifest.operations.keys().cloned().collect()),
             grants: origins(manifest.grants.keys().cloned().collect()),
             denies: origins(manifest.denies.keys().cloned().collect()),
@@ -65,6 +67,7 @@ impl PolicyOrigins {
         for origins in [
             &mut self.actors,
             &mut self.checks,
+            &mut self.prompts,
             &mut self.operations,
             &mut self.grants,
             &mut self.denies,

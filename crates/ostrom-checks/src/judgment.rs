@@ -835,8 +835,9 @@ checks:
             .expect("fixture runner mode");
         let profile = fixture.path().join("roles/builder.settings.json");
         let transcript = fixture.path().join("transcript.jsonl");
+        let prompt = "Resolve the declared operation prompt.";
         let request = RunRequest::Orchestrator(ostrom_store::OrchestratorRunRequest {
-            prompt: "/ostrom:work".to_owned(),
+            prompt: prompt.to_owned(),
             model: "fixture-model".to_owned(),
             profile: profile.clone(),
             permission_mode: "auto".to_owned(),
@@ -865,7 +866,7 @@ checks:
                 "--verbose".to_owned(),
                 "--max-turns".to_owned(),
                 PASS_MAX_TURNS.to_owned(),
-                "/ostrom:work".to_owned(),
+                prompt.to_owned(),
             ]
         );
     }

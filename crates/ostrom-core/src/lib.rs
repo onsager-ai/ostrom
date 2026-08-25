@@ -59,7 +59,8 @@ pub use policy::{
     LoopCadence, LoopDecl, LoopResolutionError, LoopTime, ManifestDefaults, ManifestError,
     ManifestValidationError, NormalizedList, OperationDecl, OperationParamDecl, OperationParamType,
     PermissionMode, PolicyCandidate, PolicyDecision, PolicyManifest, PolicySelector,
-    PolicySelectorError, ResolvedInput, ResolvedLoop, ResolvedLoopCeilings, RuleDecl, RuleDefaults,
+    PolicySelectorError, PromptFileReference, PromptNamedReference, PromptResolutionError,
+    PromptValue, ResolvedInput, ResolvedLoop, ResolvedLoopCeilings, RuleDecl, RuleDefaults,
     SelectorFinding, SelectorMatch, SelectorPrefix, SelectorResolutionError, SelectorUniverse,
     StallDuration, StallDurationError, StepDecl, UnmatchedPolicy,
 };

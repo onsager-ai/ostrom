@@ -641,6 +641,8 @@ fn roles_receive_their_permission_modes_and_wakes_retain_one_identity() {
     let args = fs::read_to_string(&arguments).expect("read builder arguments");
     assert!(args.contains("--permission-mode\nauto\n"));
     assert!(args.contains("--max-turns\n200\n"));
+    assert!(args.contains("# Mandate Work\n"));
+    assert!(!args.lines().any(|line| line == "/ostrom:work"));
     assert!(!args.lines().any(|line| line == "default" || line == "40"));
     let trace = fixture.trace();
     let wrapper_owners = trace
@@ -674,6 +676,8 @@ fn roles_receive_their_permission_modes_and_wakes_retain_one_identity() {
     );
     let args = fs::read_to_string(gatekeeper_arguments).expect("read gatekeeper arguments");
     assert!(args.contains("--permission-mode\nmanual\n"));
+    assert!(args.contains("# Mandate Gatekeep\n"));
+    assert!(!args.lines().any(|line| line == "/ostrom:gatekeep"));
     assert!(!args.lines().any(|line| line == "default"));
 }
 
