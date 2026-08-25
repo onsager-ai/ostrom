@@ -1755,6 +1755,7 @@ fn execute_operation_requirement(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_operation_action(
     paths: &OstromPaths,
     actor: &str,
@@ -1844,6 +1845,7 @@ fn execute_operation_action(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_agent_operation(
     paths: &OstromPaths,
     actor: &str,
