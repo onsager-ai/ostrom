@@ -28,6 +28,7 @@ use ostrom_core::{
 use ostrom_store::{
     AgentRegistry, AssessmentHarness, AuditOptions, Clock, CodexHarness, DigestOptions,
     DispatchOutcome, DispatchRequest, ExecutableAssessmentDeriver, GateError, GateOptions,
+    dispatchability_snapshot,
     HarnessAssessmentDeriver, ImplementRequest, JsonlCheckStore, MigrationOutcome,
     OrchestratorRunRequest, OstromPaths, PassDispatch, PassRequest, PlanOptions, PublishDestination,
     PublishTarget, QueueDecision, ReplayOptions, RunOutcome, RunRequest, SelectAction, SelectError,
@@ -2463,25 +2464,35 @@ fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
     None
 }
 
-fn run_pass_worker(role: CliPassRole, supervisor_pid: u32, clock: Clock) -> ! {
+fn run_pass_worker(
+    actor: String,
+    operation: Option<String>,
+    supervisor_pid: u32,
+    clock: Clock,
+) -> ! {
     let signals = register_signals().unwrap_or_else(|error| {
         eprintln!("ostrom: could not install signal handlers: {error}");
         std::process::exit(1);
     });
-    let claude_bin = default_claude_bin();
+    let paths = compatible_command_paths();
     let request = PassRequest {
-        paths: compatible_command_paths(),
-        working_directory: env::current_dir().unwrap_or_else(|error| {
-            eprintln!("ostrom: could not resolve working directory: {error}");
-            std::process::exit(1);
-        }),
-        role: role.into(),
-        claude_bin,
-        signals,
+        paths: paths.clone(),
+        actor: actor.clone(),
+        signals: signals.clone(),
         supervisor_pid: Some(supervisor_pid),
-        clock,
+        clock: clock.clone(),
     };
-    match run_pass(&request) {
+    let result = run_pass(&request, |prior_signature| {
+        pass_dispatch(
+            &paths,
+            &actor,
+            operation.as_deref(),
+            prior_signature,
+            &signals,
+            supervisor_pid,
+        )
+    });
+    match result {
         Ok(()) => std::process::exit(0),
         Err(error) => {
             if error.exit_code() != 0 {
@@ -2489,6 +2500,85 @@ fn run_pass_worker(role: CliPassRole, supervisor_pid: u32, clock: Clock) -> ! {
             }
             std::process::exit(error.exit_code());
         }
+    }
+}
+
+/// Resolve `<actor> [<operation>]` against the current manifest and run it
+/// through the same dispatch path as `ostrom up`'s worker. An undeclared actor
+/// or operation fails loud (non-zero exit + a `pass-ended` fault via run_pass),
+/// never a silent no-op. If the resolved loop declares a run signature, the
+/// dispatchability no-op is computed and applied here — actor-agnostic, gated on
+/// the declaration rather than a hardcoded role.
+fn pass_dispatch(
+    paths: &OstromPaths,
+    actor: &str,
+    operation: Option<&str>,
+    prior_signature: Option<&str>,
+    signals: &SignalFlags,
+    supervisor_pid: u32,
+) -> PassDispatch {
+    let failure = |message: String| PassDispatch {
+        transcript: None,
+        exit_code: 1,
+        error: Some(message),
+        run_signature: None,
+        queue_count: None,
+        dispatchable_count: None,
+        skipped_unchanged: false,
+    };
+    let manifest = match policy_version::load_current(paths) {
+        Ok(current) => current.manifest,
+        Err(error) => return failure(format!("could not load current policy: {error}")),
+    };
+    let resolved = match manifest.resolve_pass(actor, operation) {
+        Ok(resolved) => resolved,
+        Err(error) => return failure(error.to_string()),
+    };
+    let mut run_signature = None;
+    let mut queue_count = None;
+    let mut dispatchable_count = None;
+    if resolved.run_signature == Some(ostrom_core::RunSignatureDecl::Dispatchability) {
+        let working_directory = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        match dispatchability_snapshot(paths, &working_directory) {
+            Ok(snapshot) => {
+                queue_count = Some(snapshot.queue_count);
+                dispatchable_count = Some(snapshot.dispatchable_count);
+                if prior_signature == Some(snapshot.hash.as_str()) {
+                    return PassDispatch {
+                        transcript: None,
+                        exit_code: 0,
+                        error: None,
+                        run_signature: Some(snapshot.hash),
+                        queue_count,
+                        dispatchable_count,
+                        skipped_unchanged: true,
+                    };
+                }
+                run_signature = Some(snapshot.hash);
+            }
+            Err(error) => return failure(format!("could not compute run signature: {error}")),
+        }
+    }
+    match dispatch_resolved_loop(paths, &manifest, resolved, signals.clone(), Some(supervisor_pid))
+    {
+        Ok(dispatch) => {
+            let error = dispatch.result.err().map(|error| error.to_string());
+            let exit_code = if error.is_some() && dispatch.exit_code == 0 {
+                1
+            } else {
+                dispatch.exit_code
+            };
+            PassDispatch {
+                transcript: dispatch.transcript,
+                exit_code,
+                error,
+                run_signature,
+                queue_count,
+                dispatchable_count,
+                skipped_unchanged: false,
+            }
+        }
+        Err(error) => failure(error.to_string()),
     }
 }
 
