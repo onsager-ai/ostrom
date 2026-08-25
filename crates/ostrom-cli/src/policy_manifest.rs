@@ -9,8 +9,8 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use ostrom_core::{
-    ActorDecl, CheckDefinition, LoopDecl, OperationDecl, PolicyManifest, RepositoryName, RuleDecl,
-    SelectorFinding, SelectorUniverse,
+    ActorDecl, CheckDefinition, LoopDecl, OperationDecl, PolicyManifest, PromptValue,
+    RepositoryName, RuleDecl, SelectorFinding, SelectorUniverse,
 };
 use ostrom_store::{
     ActorPortabilityFinding, OstromPaths, PolicyBundle, PolicyExplanation, PolicyOrigins,
@@ -157,6 +157,7 @@ pub(crate) fn run_generate(
 fn project_repository_manifest(mut manifest: PolicyManifest, repository: &str) -> PolicyManifest {
     manifest.includes.clear();
     manifest.actors.clear();
+    manifest.prompts.clear();
     project_rules(&mut manifest.grants, repository);
     project_rules(&mut manifest.denies, repository);
     manifest
@@ -450,6 +451,7 @@ fn compose_scopes(
 ) -> PolicyManifest {
     let Some(operator) = operator else {
         repository.operations.clear();
+        repository.prompts.clear();
         repository.loops.clear();
         return repository;
     };
@@ -482,6 +484,7 @@ fn compose_scopes(
     merge_fallback(&mut repository.grants, operator.grants.clone());
     merge_fallback(&mut repository.denies, operator.denies.clone());
     repository.operations.clone_from(&operator.operations);
+    repository.prompts.clone_from(&operator.prompts);
     repository.loops.clone_from(&operator.loops);
     repository
 }
@@ -495,6 +498,7 @@ fn validate_scoped_manifest(
         merge_fallback(&mut validation.inputs, fallback.inputs.clone());
         merge_fallback(&mut validation.actors, fallback.actors.clone());
         merge_fallback(&mut validation.checks, fallback.checks.clone());
+        merge_fallback(&mut validation.prompts, fallback.prompts.clone());
         merge_fallback(&mut validation.operations, fallback.operations.clone());
         merge_fallback(&mut validation.grants, fallback.grants.clone());
         merge_fallback(&mut validation.denies, fallback.denies.clone());
@@ -961,6 +965,7 @@ fn load_unverified(path: &Path) -> Result<PolicyManifest, PolicyLoadError> {
     Ok(loaded.manifest)
 }
 
+#[derive(Debug)]
 struct LoadedManifest {
     manifest: PolicyManifest,
     origins: PolicyOrigins,
@@ -989,7 +994,67 @@ fn load_composed(path: &Path) -> Result<LoadedManifest, PolicyLoadError> {
             merge_include(&mut manifest, &mut origins, &include)?;
         }
     }
+    materialize_prompt_files(&mut manifest, &origins)?;
     Ok(LoadedManifest { manifest, origins })
+}
+
+fn materialize_prompt_files(
+    manifest: &mut PolicyManifest,
+    origins: &PolicyOrigins,
+) -> Result<(), PolicyLoadError> {
+    let declared = manifest
+        .prompts
+        .iter()
+        .filter_map(|(name, prompt)| prompt.file().map(|path| (name.clone(), path.to_owned())))
+        .collect::<Vec<_>>();
+    for (name, reference) in declared {
+        let origin = origins.prompts.get(&name).unwrap_or(&origins.root).clone();
+        let text = read_prompt_file(&origin, &reference)?;
+        manifest.prompts.insert(name, PromptValue::Inline(text));
+    }
+
+    for (operation, declaration) in &mut manifest.operations {
+        let origin = origins
+            .operations
+            .get(operation)
+            .unwrap_or(&origins.root)
+            .clone();
+        for step in &mut declaration.steps {
+            if !step.uses.starts_with("agent/") {
+                continue;
+            }
+            let Some(value) = step.parameters.get("prompt").cloned() else {
+                continue;
+            };
+            let prompt: PromptValue =
+                serde_yaml::from_value(value).map_err(|source| PolicyLoadError::Yaml {
+                    path: origin.clone(),
+                    source,
+                })?;
+            let Some(reference) = prompt.file() else {
+                continue;
+            };
+            let text = read_prompt_file(&origin, reference)?;
+            step.parameters.insert(
+                "prompt".to_owned(),
+                serde_yaml::to_value(PromptValue::Inline(text)).expect("prompt serializes"),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn read_prompt_file(origin: &Path, reference: &str) -> Result<String, PolicyLoadError> {
+    let path = Path::new(reference);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|component| component == Component::ParentDir)
+    {
+        return Err(PolicyLoadError::UnsafePrompt(reference.to_owned()));
+    }
+    let parent = origin.parent().unwrap_or_else(|| Path::new("."));
+    read(&parent.join(path))
 }
 
 fn validate_manifest(manifest: &PolicyManifest) -> Result<(), PolicyLoadError> {
@@ -1079,10 +1144,18 @@ fn merge_include(
             path: path.to_path_buf(),
             message: "included document must be a map".to_owned(),
         })?;
-    let markers = ["actor", "check", "operation", "grant", "deny", "loop"]
-        .into_iter()
-        .filter(|marker| mapping.contains_key(Value::String((*marker).to_owned())))
-        .collect::<Vec<_>>();
+    let markers = [
+        "actor",
+        "check",
+        "prompt",
+        "operation",
+        "grant",
+        "deny",
+        "loop",
+    ]
+    .into_iter()
+    .filter(|marker| mapping.contains_key(Value::String((*marker).to_owned())))
+    .collect::<Vec<_>>();
     if markers.len() > 1 {
         return Err(PolicyLoadError::LeafShape {
             path: path.to_path_buf(),
@@ -1110,6 +1183,13 @@ fn merge_include(
             "check",
             path,
             &mut origins.checks,
+        )?;
+        merge_map(
+            &mut manifest.prompts,
+            fragment.prompts,
+            "prompt",
+            path,
+            &mut origins.prompts,
         )?;
         merge_map(
             &mut manifest.operations,
@@ -1173,6 +1253,14 @@ fn merge_leaf(
             id,
             parse_leaf(body, path)?,
             "check",
+            path,
+        ),
+        "prompt" => insert_leaf(
+            &mut manifest.prompts,
+            &mut origins.prompts,
+            id,
+            parse_leaf(body, path)?,
+            "prompt",
             path,
         ),
         "operation" => insert_leaf(
@@ -1262,6 +1350,8 @@ struct IncludeFragment {
     actors: BTreeMap<String, ActorDecl>,
     #[serde(default)]
     checks: BTreeMap<String, CheckDefinition>,
+    #[serde(default)]
+    prompts: BTreeMap<String, PromptValue>,
     #[serde(default)]
     operations: BTreeMap<String, OperationDecl>,
     #[serde(default)]
@@ -1450,6 +1540,8 @@ pub(crate) enum PolicyLoadError {
     Signature(#[from] ostrom_store::PolicySignatureError),
     #[error("unsafe include path `{0}`")]
     UnsafeInclude(String),
+    #[error("unsafe prompt file path `{0}`")]
+    UnsafePrompt(String),
     #[error("include `{pattern}` from `{}` matched no files", manifest.display())]
     NoIncludeMatch { manifest: PathBuf, pattern: String },
     #[error("invalid included leaf `{}`: {message}", path.display())]
@@ -1475,9 +1567,33 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        compose_scopes, default_manifest_path, project_repository_manifest,
-        validate_scoped_manifest,
+        PolicyLoadError, compose_scopes, default_manifest_path, load_composed,
+        project_repository_manifest, validate_scoped_manifest,
     };
+
+    #[test]
+    fn missing_and_unsafe_prompt_files_are_refused() {
+        let root = tempdir().expect("prompt fixture");
+        let manifest = root.path().join("ostrom.yaml");
+        for (reference, expected) in [
+            ("prompts/missing.md", "could not read"),
+            ("../outside.md", "unsafe prompt file path"),
+        ] {
+            fs::write(
+                &manifest,
+                format!(
+                    "manifest_version: 1\noperations:\n  inspect:\n    steps:\n      - uses: agent/claude\n        with: {{prompt: {{from: {reference}}}}}\n"
+                ),
+            )
+            .expect("write manifest");
+            let error = load_composed(&manifest).expect_err("prompt reference must fail");
+            assert!(error.to_string().contains(expected), "{error}");
+            assert!(matches!(
+                error,
+                PolicyLoadError::Io { .. } | PolicyLoadError::UnsafePrompt(_)
+            ));
+        }
+    }
     use ostrom_store::{OstromPaths, PolicyBundle, PolicyOrigins};
 
     const LEGACY_NOTICE_CHILD: &str = "OSTROM_TEST_LEGACY_NOTICE_CHILD";

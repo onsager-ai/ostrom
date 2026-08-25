@@ -23,6 +23,12 @@ fn fixture(policy: &str) -> TempDir {
     root
 }
 
+fn prompt_policy(prompt: &str, declarations: &str) -> String {
+    format!(
+        "manifest_version: 1\nactors: {{builder: {{}}}}\n{declarations}operations:\n  inspect:\n    steps:\n      - uses: agent/claude\n        with:\n          prompt: {prompt}\ngrants:\n  builder-inspect: {{actors: builder, operations: inspect, repositories: placeholder-org/repo}}\nloops:\n  inspection-loop:\n    actor: builder\n    operation: inspect\n    target: placeholder-org/repo\n    every: hourly\n"
+    )
+}
+
 #[test]
 fn local_operation_runs_without_inherited_forge_credentials() {
     let root = fixture(LOCAL_POLICY);
@@ -190,6 +196,105 @@ fn operations_list_and_settings_follow_grants() {
     assert!(settings.contains("\"defaultMode\": \"deny\""));
     assert!(settings.contains("Bash(ostrom local-proof *)"));
     assert!(!settings.contains("gatekeeper"));
+}
+
+#[test]
+fn operations_prompt_resolves_inline_file_named_actor_and_loop_forms() {
+    let cases = [
+        ("'inline instructions'", "", "inline instructions"),
+        ("{from: ./prompts/inspect.md}", "", "file instructions\n"),
+        (
+            "prompts.shared-inspection",
+            "prompts:\n  shared-inspection: named instructions\n",
+            "named instructions",
+        ),
+    ];
+    for (prompt, declarations, expected) in cases {
+        let root = fixture(&prompt_policy(prompt, declarations));
+        if prompt.contains("from:") {
+            fs::create_dir(root.path().join("prompts")).expect("create prompt directory");
+            fs::write(root.path().join("prompts/inspect.md"), expected).expect("write prompt file");
+        }
+        for target in ["inspect", "builder", "inspection-loop"] {
+            let output = ostrom(root.path())
+                .args(["operations", "--prompt", target])
+                .output()
+                .expect("inspect resolved prompt");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(output.stdout, expected.as_bytes());
+        }
+    }
+}
+
+#[test]
+fn tampered_prompt_file_fails_signature_verification() {
+    let root = fixture(&prompt_policy("{from: prompts/inspect.md}", ""));
+    fs::create_dir(root.path().join("prompts")).expect("create prompt directory");
+    let prompt = root.path().join("prompts/inspect.md");
+    fs::write(&prompt, "signed instructions\n").expect("write signed prompt");
+    let manifest = root.path().join("policy.yaml");
+    let trusted_keys = support::sign_manifest(&manifest);
+    fs::write(&prompt, "tampered instructions\n").expect("tamper with prompt");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .env("OSTROM_HOME", root.path())
+        .env("OSTROM_POLICY_MANIFEST", &manifest)
+        .env("OSTROM_POLICY_TRUSTED_KEYS", trusted_keys)
+        .args(["operations", "--prompt", "inspect"])
+        .output()
+        .expect("inspect tampered prompt");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("signature verification failed"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn agent_runner_receives_resolved_prompt_text() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = fixture(&prompt_policy(
+        "prompts.shared-inspection",
+        "prompts:\n  shared-inspection: {from: prompts/inspect.md}\n",
+    ));
+    fs::create_dir(root.path().join("prompts")).expect("create prompt directory");
+    fs::write(
+        root.path().join("prompts/inspect.md"),
+        "portable agent instructions\n",
+    )
+    .expect("write prompt");
+    let capture = root.path().join("received-prompt");
+    let runner = root.path().join("claude-stub");
+    fs::write(
+        &runner,
+        "#!/bin/sh\nfor argument do last=$argument; done\nprintf '%s' \"$last\" >\"$OSTROM_CAPTURE\"\n",
+    )
+    .expect("write Claude stub");
+    fs::set_permissions(&runner, fs::Permissions::from_mode(0o700))
+        .expect("make Claude stub executable");
+
+    let output = ostrom(root.path())
+        .env("CLAUDE_BIN", runner)
+        .env("OSTROM_CAPTURE", &capture)
+        .args(["inspect", "placeholder-org/repo"])
+        .output()
+        .expect("run agent operation");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(capture).expect("read captured prompt"),
+        "portable agent instructions\n"
+    );
 }
 
 #[test]
