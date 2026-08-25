@@ -1,0 +1,158 @@
+# ================================================================
+# ostrom.yaml — the single governing manifest for onsager-ai/ostrom
+#
+# Discovered by convention (working dir → the repository's .git boundary).
+# Trusted for being SIGNED, not for where it sits: the signature covers this
+# whole file, checks included. A private ~/.claude/ostrom/config.yaml may
+# overlay additional DENIES only — never a grant.
+#
+#   Validate:  OSTROM_POLICY_TRUSTED_KEYS=<dir> ostrom validate ostrom.yaml
+#   Sign:      ostrom sign --key-id <principal> --key <private.pem> ostrom.yaml
+#   Explain:   ostrom explain onsager-ai/ostrom#123
+# ================================================================
+manifest_version: 1
+
+# ---- Declared inputs -------------------------------------------
+# Every environment read the manifest depends on, named and typed once.
+# Secrets are flagged and live in machine-local secrets.yaml, never here.
+inputs:
+  gh_host:
+    type: string
+    env: GH_HOST
+    default: github.com
+    secret: false
+
+# ---- Defaults --------------------------------------------------
+# Resolved into any rule / loop / check that does not override them.
+defaults:
+  stalls_after: 7d                 # a held item stalls to the principal after this
+  check:
+    inconclusive_policy: block     # a crash/timeout is NOT a pass  (block | warn | pass)
+  loop:
+    concurrent: 6
+    spend_usd: 50
+    tokens: 200000
+  deny:
+    unmatched: block               # a deny whose selector set matches nothing blocks
+
+# ---- Actors ----------------------------------------------------
+# Who may act. `{}` = the actor exists with no extra metadata. (Declaring
+# actors in a repo manifest draws a "non-portable across operator rosters"
+# lint — informational; in the operator manifest they are fully at home.)
+actors:
+  builder:
+    description: Opens and revises delegated implementation PRs.
+  gatekeeper:
+    description: Merges via the artifact-only gate; never edits code.
+  sweeper:
+    description: Reconciles the GitHub roster into the private queue.
+
+# ---- Checks ----------------------------------------------------
+# In the manifest so the signature covers them (closes reach-by-location).
+# `uses:` draws from the closed check-action catalogue:
+#   agent/claude  cmd/run  doctor/check  gh/check-run  gh/token-scope  http/get
+checks:
+  rust-green:
+    uses: gh/check-run
+    inconclusive_policy: block
+    with:
+      contexts: [test]
+  doctor-clean:
+    uses: doctor/check
+    with:
+      names: [work-orders, worktrees, role-allowlists]
+
+# ---- Operations ------------------------------------------------
+# Duhem-style flows: params + steps. `requires:` sits on the step, next to the
+# act it guards. Param references are the whole-string form `$params.<name>`.
+# A `markdown` param may only reach a content sink, never a command.
+# Step `uses:` draws from the operation-action catalogue:
+#   gh/post-verdict  gh/merge-pr  git/tag  cmd/run  sys/enable-loop
+operations:
+  work:
+    description: Produce or revise a delegated implementation branch.
+    steps: []                      # dispatch-only; the implementer harness does the work
+  gate-pass:
+    description: Judge one PR and merge it if the gate is satisfied.
+    params:
+      note:
+        type: markdown             # the verdict prose — content sink only
+    steps:
+      - uses: gh/post-verdict
+        with:
+          note: $params.note
+        requires: rust-green
+      - uses: gh/merge-pr
+        requires: [rust-green, doctor-clean]
+  release:
+    description: Cut a signed tag from a green main.
+    params:
+      version:
+        type: semver
+      notes:
+        type: markdown
+    steps:
+      - uses: git/tag
+        with:
+          name: $params.version    # semver → command sink (the v-prefix lives in the value)
+          message: $params.notes   # markdown → content sink
+        requires: rust-green
+
+# ---- Grants ----------------------------------------------------
+# Who may do what. Monotone: order never matters. A PR matching no grant is
+# the principal's, because nothing granted it away.
+grants:
+  builder-may-work:
+    actors: builder
+    operations: work
+    repositories: onsager-ai/ostrom
+    where: label:delegated
+    requires: rust-green
+  gatekeeper-may-merge:
+    actors: gatekeeper
+    operations: gate-pass
+    repositories: onsager-ai/ostrom
+
+# ---- Denies ----------------------------------------------------
+# Forbidden surfaces. Deny always wins over any grant above.
+denies:
+  hold-plugin-manifest:
+    operations: work
+    repositories: onsager-ai/ostrom
+    where: path:**/.claude-plugin/plugin.json
+    stalls_after: 7d
+  hold-release-risk:
+    operations: work
+    repositories: onsager-ai/ostrom
+    where: label:risk:release
+  bounce-shared-write-surface:
+    repositories: onsager-ai/ostrom
+    where:
+      - path:ostrom.yaml
+      - path:**/Cargo.toml
+      - type:release
+
+# ---- Loops -----------------------------------------------------
+# Scheduled unattended runs (replaces the systemd units). A loop binds one
+# actor + one operation to a cadence and is dispatched through the SAME
+# grant/deny/check boundaries as an interactive operation — it cannot name an
+# action directly. `every` is closed:  hourly | *:MM | HH:MM..HH:MM | [HH:MM,…]
+loops:
+  builder-day:
+    actor: builder
+    operation: work
+    target: onsager-ai/ostrom
+    every: 08:15..21:15
+  builder-night:
+    actor: builder
+    operation: work
+    target: onsager-ai/ostrom
+    every: ["23:15", "02:15", "05:15"]
+    concurrent: 2
+  gatekeeper:
+    actor: gatekeeper
+    operation: gate-pass
+    target: onsager-ai/ostrom
+    every: hourly
+    with:
+      note: "Automated gatekeeper verdict."   # loops supply an operation's required params
