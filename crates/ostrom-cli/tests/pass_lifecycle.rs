@@ -12,14 +12,22 @@ use std::{
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
+mod support;
+
 struct Fixture {
     root: TempDir,
     state: PathBuf,
     claude: PathBuf,
+    manifest: PathBuf,
+    trusted_keys: PathBuf,
 }
 
 impl Fixture {
     fn new(script: &str) -> Self {
+        Self::with_options(script, false)
+    }
+
+    fn with_options(script: &str, run_signature: bool) -> Self {
         let root = tempfile::tempdir().expect("temporary pass fixture");
         let state = root.path().join("ostrom");
         fs::create_dir_all(state.join("roles")).expect("create role settings");
@@ -30,11 +38,21 @@ impl Fixture {
         let claude = root.path().join("claude-stub");
         fs::write(&claude, format!("#!/usr/bin/env bash\n{script}\n")).expect("write stub");
         fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).expect("chmod stub");
+        let manifest = root.path().join("ostrom.yaml");
+        let trusted_keys = compose_current(&manifest, &state, run_signature);
         Self {
             root,
             state,
             claude,
+            manifest,
+            trusted_keys,
         }
+    }
+
+    /// Recompose `current` with the dispatchability run signature enabled, for
+    /// the no-op tests that also populate the queue/state it hashes.
+    fn enable_run_signature(&self) {
+        compose_current(&self.manifest, &self.state, true);
     }
 
     fn command(&self) -> Command {
@@ -50,7 +68,8 @@ impl Fixture {
             .env("CLAUDE_CONFIG_DIR", self.root.path())
             .env("HOME", self.root.path())
             .env("PATH", env::var_os("PATH").unwrap_or_default())
-            .env("CLAUDE_BIN", &self.claude);
+            .env("CLAUDE_BIN", &self.claude)
+            .env("OSTROM_POLICY_TRUSTED_KEYS", &self.trusted_keys);
         command
     }
 
@@ -135,6 +154,54 @@ projects:
             Some("pass-ended")
         );
     }
+}
+
+fn compose_current(manifest: &Path, state: &Path, run_signature: bool) -> PathBuf {
+    let signature_line = if run_signature {
+        "\n    run_signature: dispatchability"
+    } else {
+        ""
+    };
+    let manifest_yaml = format!(
+        r#"manifest_version: 1
+actors: {{builder: {{permission_mode: auto}}}}
+operations:
+  work:
+    steps:
+      - uses: agent/claude
+        with: {{prompt: "run the pass"}}
+grants:
+  work: {{actors: builder, operations: work, repositories: placeholder-org/repository}}
+loops:
+  builder-pass:
+    actor: builder
+    operation: work
+    target: placeholder-org/repository
+    every: hourly{signature_line}
+"#
+    );
+    // A repository manifest and a distinct signed operator copy: compose merges
+    // the operator's operations/loops in. One file used as both is treated as
+    // repository-only and its operations are cleared.
+    let repo = manifest.with_file_name("policy.yaml");
+    fs::write(&repo, &manifest_yaml).expect("write repository policy");
+    let trusted_keys = support::sign_manifest(&repo);
+    fs::write(manifest, &manifest_yaml).expect("write operator policy");
+    support::sign_manifest(manifest);
+    let composed = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .arg("compose")
+        .arg(&repo)
+        .env("OSTROM_HOME", state)
+        .env("OSTROM_POLICY_MANIFEST", manifest)
+        .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
+        .output()
+        .expect("compose pass policy");
+    assert!(
+        composed.status.success(),
+        "compose failed: {}",
+        String::from_utf8_lossy(&composed.stderr)
+    );
+    trusted_keys
 }
 
 fn wait_for(path: &Path) {
