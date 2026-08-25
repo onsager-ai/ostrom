@@ -264,6 +264,20 @@ claim not checked is not a finding. This applies equally to previous-session
 notes, implementer reports, and recollection. If a claim is wrong, say so
 plainly and correct the record.
 
+A verification read names the published ref explicitly. Use a form that takes
+the ref as an argument and cannot silently read a stale tree, such as
+`git grep <pattern> origin/main -- <path>` or `git show origin/main:<file>`. A
+bare working-tree `grep -rn` can be correct only by luck and is not a
+verification. A fetched ref does not make the working tree current: quoting a
+SHA read via `git log origin/main` while grepping the checkout is the specific
+error that most resembles diligence.
+
+A negative finding — a symbol is absent or a string does not appear — must
+carry the ref it was checked against. With no ref, it is not reportable. A
+quoted command transcript must be the actual output of a command that actually
+ran. Reconstructing plausible output and presenting it in a fenced block is a
+fabricated verification even when the underlying claim turns out to be true.
+
 **Respect the boundary.** A tripwire, reserved ref, or anything outside a
 project's `delegated` selectors is the owner's call. Produce an escalation
 dossier — question, options ruled out, recommended action, blast radius — and
