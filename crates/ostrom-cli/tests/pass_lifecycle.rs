@@ -129,6 +129,7 @@ projects:
             serde_json::to_vec(&state).expect("serialize sweep state"),
         )
         .expect("write sweep state");
+        self.enable_run_signature();
     }
 
     fn approve_blocked_decision(&self) {
@@ -548,16 +549,16 @@ fn an_unchanged_fully_blocked_backlog_ends_before_spawning_and_records_zero_cost
     assert_eq!(ended[0]["fact"]["cost_usd"], 1.25);
     assert_eq!(ended[0]["fact"]["dispatchable_count"], 0);
     assert_eq!(ended[1]["fact"]["outcome"], "no-op");
-    assert_eq!(ended[1]["fact"]["reason"], "no-dispatchable-work-unchanged");
+    assert_eq!(ended[1]["fact"]["reason"], "run-signature-unchanged");
     assert_eq!(ended[1]["fact"]["cost_usd"], 0.0);
     assert_eq!(ended[1]["fact"]["queue_count"], 1);
     assert_eq!(ended[1]["fact"]["dispatchable_count"], 0);
-    let hash = ended[1]["fact"]["dispatchability_hash"]
+    let hash = ended[1]["fact"]["run_signature"]
         .as_str()
         .expect("terminal trace carries the snapshot hash");
     assert_eq!(hash.len(), 64);
     assert_eq!(
-        fs::read_to_string(fixture.state.join("builder-dispatchability-hash"))
+        fs::read_to_string(fixture.state.join("builder-run-signature"))
             .expect("read durable snapshot hash")
             .trim_end(),
         hash
@@ -599,7 +600,7 @@ fn a_dispatchability_input_change_defeats_the_short_circuit_on_the_next_pass() {
     );
     let terminal = fixture.trace().pop().expect("changed terminal row");
     assert_eq!(terminal["fact"]["dispatchable_count"], 1);
-    assert_ne!(terminal["fact"]["reason"], "no-dispatchable-work-unchanged");
+    assert_ne!(terminal["fact"]["reason"], "run-signature-unchanged");
     fixture.assert_released();
 }
 
@@ -615,7 +616,7 @@ fn a_failed_agent_pass_does_not_establish_a_blocked_snapshot() {
             .code(),
         Some(42)
     );
-    assert!(!fixture.state.join("builder-dispatchability-hash").exists());
+    assert!(!fixture.state.join("builder-run-signature").exists());
 
     fs::write(
         &fixture.claude,
@@ -685,7 +686,7 @@ fn default_branch_turning_green_defeats_the_short_circuit_without_a_candidate() 
     );
     let terminal = fixture.trace().pop().expect("green terminal row");
     assert_eq!(terminal["fact"]["dispatchable_count"], 0);
-    assert_ne!(terminal["fact"]["reason"], "no-dispatchable-work-unchanged");
+    assert_ne!(terminal["fact"]["reason"], "run-signature-unchanged");
     fixture.assert_released();
 }
 
