@@ -326,6 +326,51 @@ impl PolicyManifest {
         })
     }
 
+    /// Resolve `ostrom pass <actor> [<operation>]` to a dispatchable loop.
+    /// The actor must be declared; the operation is the given one, or the single
+    /// operation shared by the actor's loops. Actor-agnostic — no name is
+    /// special-cased, and an undeclared actor (or operation) is a hard error so
+    /// the caller can fail loud rather than silently no-op.
+    pub fn resolve_pass(
+        &self,
+        actor: &str,
+        operation: Option<&str>,
+    ) -> Result<ResolvedLoop, PassResolutionError> {
+        if !self.actors.contains_key(actor) {
+            return Err(PassResolutionError::UnknownActor(actor.to_owned()));
+        }
+        if operation.is_none() {
+            let operations = self
+                .loops
+                .values()
+                .filter(|declaration| declaration.actor == actor)
+                .map(|declaration| declaration.operation.as_str())
+                .collect::<BTreeSet<_>>();
+            if operations.len() > 1 {
+                return Err(PassResolutionError::AmbiguousOperation {
+                    actor: actor.to_owned(),
+                    operations: operations.into_iter().map(str::to_owned).collect(),
+                });
+            }
+        }
+        let name = self
+            .loops
+            .iter()
+            .find(|(_, declaration)| {
+                declaration.actor == actor
+                    && operation.is_none_or(|op| declaration.operation == op)
+            })
+            .map(|(name, _)| name.clone())
+            .ok_or_else(|| match operation {
+                Some(op) => PassResolutionError::UnknownOperation {
+                    actor: actor.to_owned(),
+                    operation: op.to_owned(),
+                },
+                None => PassResolutionError::NoOperation(actor.to_owned()),
+            })?;
+        self.resolve_loop(&name).map_err(PassResolutionError::Loop)
+    }
+
     pub fn resolve_inputs<F>(
         &self,
         mut environment: F,
@@ -939,6 +984,20 @@ pub struct ResolvedLoopCeilings {
     pub concurrent: Option<u64>,
     pub spend_usd: Option<f64>,
     pub tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum PassResolutionError {
+    #[error("unknown actor `{0}`")]
+    UnknownActor(String),
+    #[error("actor `{0}` has no loop declaring an operation to run")]
+    NoOperation(String),
+    #[error("actor `{actor}` has no loop for operation `{operation}`")]
+    UnknownOperation { actor: String, operation: String },
+    #[error("actor `{actor}` runs multiple operations {operations:?}; name one with `ostrom pass {actor} <operation>`")]
+    AmbiguousOperation { actor: String, operations: Vec<String> },
+    #[error(transparent)]
+    Loop(LoopResolutionError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
