@@ -315,7 +315,8 @@ queue, and read cursors, they never belong in this repository.
 
 ### After implementation: the gatekeeper loop
 
-The builder implements work, opens a pull request, and **stops**. It never
+The builder coordinates work by dispatching a durable order to an implementer
+harness, which opens a pull request, and then the builder **stops**. It never
 merges its own delivery. In a separate session, the gatekeeper polls every
 repository in the mandate roster, evaluates each open pull request from its
 current GitHub artifacts through `/ostrom:merge`, and takes only the action the

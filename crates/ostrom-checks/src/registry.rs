@@ -1,38 +1,12 @@
 use std::{collections::BTreeMap, time::SystemTime};
 
+use crate::{ActionFault, CommandProvider, DoctorProvider, GitHubProvider, HttpProvider};
 use chrono::{DateTime, Utc};
 use ostrom_core::{
     ActionDefinition, CatalogueEnumeration, CheckContractError, CheckReceipt, ResolvedCheck,
     RunnerStamp, resolve_check, select_check,
 };
 use serde_json::{Value, json};
-use thiserror::Error;
-
-use crate::{CommandProvider, DoctorProvider, GitHubProvider, HttpProvider};
-
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-#[error("{name}")]
-pub struct ActionFault {
-    name: &'static str,
-    detail: Option<String>,
-}
-
-impl ActionFault {
-    #[must_use]
-    pub fn new(name: &'static str, detail: Option<String>) -> Self {
-        Self { name, detail }
-    }
-
-    #[must_use]
-    pub fn name(&self) -> &'static str {
-        self.name
-    }
-
-    #[must_use]
-    pub fn detail(&self) -> Option<&str> {
-        self.detail.as_deref()
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionOutcome {

@@ -1,5 +1,6 @@
 //! Filesystem implementation and compatibility readers.
 
+mod agent;
 mod app_token;
 mod check_store;
 mod clock;
@@ -32,11 +33,17 @@ mod trace;
 mod work_order;
 mod worktree;
 
+pub use agent::{
+    ActionFault, AgentRegistry, AgentRunner, CodexHarness, Harness, ImplementerRunRequest,
+    OrchestratorRunRequest, RunOutcome, RunRequest, RunTermination, RunnerLaunch,
+};
 pub use app_token::{AppTokenError, CredentialCommandError, credential_output};
 pub use check_store::JsonlCheckStore;
 pub use clock::Clock;
 pub use commit_checks::{CheckReadError, CommitChecks, read_commit_checks};
-pub use dispatch::{DispatchError, DispatchOutcome, DispatchRequest, run_dispatch};
+pub use dispatch::{
+    DispatchError, DispatchOutcome, DispatchRequest, run_dispatch, run_dispatch_with_registry,
+};
 pub use environment::{ENVIRONMENT_VARIABLES, EnvironmentClass, EnvironmentVariable};
 pub use event_store::JsonlEventStore;
 pub use file_store::JsonlSweepStore;
@@ -45,7 +52,10 @@ pub use gate::{
     evaluate_gate_replay, gate_config_needs_diff_content, load_gate_config, run_gate,
 };
 pub use hooks::{DigestOptions, HookOutput, render_constitution, render_digest};
-pub use implement::{ImplementError, ImplementRequest, run_implement};
+pub use implement::{
+    DEFAULT_IMPLEMENTER_RUNNER, ImplementError, ImplementRequest, run_implement,
+    run_implement_with_registry,
+};
 pub use lease::{
     LeaseActionError, LeaseRecord, OwnedLease, acquire_lease, lease_status, read_lease,
     release_lease, validate_lease_name, write_lease,

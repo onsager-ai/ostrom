@@ -3,7 +3,7 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
-    process::{Command, ExitStatus, Stdio},
+    process::{Command, Stdio},
     sync::Arc,
     time::SystemTime,
 };
@@ -12,10 +12,9 @@ use chrono::{DateTime, Duration, Utc};
 use ostrom_core::{
     ActionDefinition, CatalogueEnumeration, CheckReceipt, CheckState, CheckVerdict, Evidence,
     EvidenceBundleItem, JudgeStamp, JudgmentClause, JudgmentInput, JudgmentRunnerStamp,
-    RecordedOutput, ResolvedCheck, ResolvedLoopCeilings, agent_parameters, receipt_digest,
-    resolve_check, select_check,
+    RecordedOutput, ResolvedCheck, agent_parameters, receipt_digest, resolve_check, select_check,
 };
-use ostrom_store::PASS_MAX_TURNS;
+use ostrom_store::{AgentRunner, Harness, PASS_MAX_TURNS, RunOutcome, RunRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -38,44 +37,8 @@ pub struct HarnessRequest<'a> {
     pub input: &'a JudgmentInput,
 }
 
-pub trait Harness: Send + Sync {
-    fn name(&self) -> &'static str;
-    fn version(&self) -> &str;
-    fn default_model(&self) -> &str;
-}
-
 pub trait JudgmentHarness: Harness {
     fn judge(&self, request: &HarnessRequest<'_>) -> JudgmentOutcome;
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct RunRequest {
-    pub prompt: String,
-    pub model: String,
-    pub profile: PathBuf,
-    pub permission_mode: String,
-    pub ceilings: ResolvedLoopCeilings,
-    pub transcript: PathBuf,
-}
-
-#[derive(Debug)]
-pub enum RunOutcome {
-    Exited(ExitStatus),
-    Error(ActionFault),
-}
-
-impl RunOutcome {
-    #[must_use]
-    pub fn status(&self) -> Option<ExitStatus> {
-        match self {
-            Self::Exited(status) => Some(*status),
-            Self::Error(_) => None,
-        }
-    }
-}
-
-pub trait AgentRunner: Harness {
-    fn run(&self, request: &RunRequest) -> RunOutcome;
 }
 
 /// JSON-stdio adapter for the registered `agent/claude` harness. The child is
@@ -197,6 +160,9 @@ impl JudgmentHarness for ClaudeHarness {
 
 impl AgentRunner for ClaudeHarness {
     fn run(&self, request: &RunRequest) -> RunOutcome {
+        let RunRequest::Orchestrator(request) = request else {
+            return RunOutcome::Error(ActionFault::new("runner_kind_mismatch", None));
+        };
         let output = match fs::File::create(&request.transcript) {
             Ok(output) => output,
             Err(error) => {
@@ -239,44 +205,6 @@ impl AgentRunner for ClaudeHarness {
             Ok(status) => RunOutcome::Exited(status),
             Err(error) => RunOutcome::Error(ActionFault::new("runner_io", Some(error.to_string()))),
         }
-    }
-}
-
-#[derive(Default)]
-pub struct AgentRegistry {
-    runners: BTreeMap<&'static str, Arc<dyn AgentRunner>>,
-}
-
-impl AgentRegistry {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn core(claude: ClaudeHarness) -> Result<Self, ActionFault> {
-        let mut registry = Self::new();
-        registry.register(claude)?;
-        Ok(registry)
-    }
-
-    pub fn register(&mut self, runner: impl AgentRunner + 'static) -> Result<(), ActionFault> {
-        let name = runner.name();
-        if !valid_component(name)
-            || runner.version().is_empty()
-            || runner.default_model().is_empty()
-        {
-            return Err(ActionFault::new("invalid_harness_registration", None));
-        }
-        if self.runners.contains_key(name) {
-            return Err(ActionFault::new("ambiguous_harness", None));
-        }
-        self.runners.insert(name, Arc::new(runner));
-        Ok(())
-    }
-
-    #[must_use]
-    pub fn get(&self, name: &str) -> Option<Arc<dyn AgentRunner>> {
-        self.runners.get(name).cloned()
     }
 }
 
@@ -907,14 +835,14 @@ checks:
             .expect("fixture runner mode");
         let profile = fixture.path().join("roles/builder.settings.json");
         let transcript = fixture.path().join("transcript.jsonl");
-        let request = RunRequest {
+        let request = RunRequest::Orchestrator(ostrom_store::OrchestratorRunRequest {
             prompt: "/ostrom:work".to_owned(),
             model: "fixture-model".to_owned(),
             profile: profile.clone(),
             permission_mode: "auto".to_owned(),
-            ceilings: ResolvedLoopCeilings::default(),
+            ceilings: ostrom_core::ResolvedLoopCeilings::default(),
             transcript,
-        };
+        });
 
         let outcome =
             ClaudeHarness::new(&executable, "claude-fixture-v1", "fixture-model").run(&request);
@@ -968,7 +896,7 @@ checks:
 
     #[test]
     fn agent_registry_resolves_named_runners_and_rejects_duplicates() {
-        let mut registry = AgentRegistry::core(ClaudeHarness::new(
+        let mut registry = ostrom_store::AgentRegistry::core(ClaudeHarness::new(
             "claude",
             "claude-fixture-v1",
             "fixture-model",
@@ -979,7 +907,17 @@ checks:
             .expect("register second runner");
 
         assert_eq!(
-            registry.get("codex").expect("resolve codex runner").name(),
+            registry
+                .get("agent/claude")
+                .expect("resolve Claude runner")
+                .name(),
+            "claude"
+        );
+        assert_eq!(
+            registry
+                .get("agent/codex")
+                .expect("resolve codex runner")
+                .name(),
             "codex"
         );
         let error = registry

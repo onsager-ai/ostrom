@@ -4,15 +4,17 @@
 transient user unit:
 
 ```text
-ostrom implement <work-order-file> <unit-name>
+ostrom implement <work-order-file> <unit-name> [implementer-runner]
 ```
 
-There is one implementation engine and no fallback. Dispatch resolves the
-`ostrom` executable before reserving work or invoking `systemd-run`. Set
+The builder coordinator hands the order to the named runner in the agent
+registry. `agent/codex` is the shipped default and there is no fallback.
+Dispatch resolves the `ostrom` executable before reserving work or invoking
+`systemd-run`. Set
 `MANDATE_OSTROM_BIN` to an absolute executable path when the interactive
-`PATH` does not represent the transient unit environment. This is especially
-important for npm launchers whose `#!/usr/bin/env node` shebang also requires
-the resolved Node directory on the unit's `PATH`.
+`PATH` does not represent the transient unit environment. The selected runner
+supplies its transient-unit environment; for Codex, this includes the resolved
+Node directory required by an npm launcher's `#!/usr/bin/env node` shebang.
 
 For a failed launch, start with the dispatch error and the terminal row in
 `$OSTROM_HOME/sprint.jsonl`. `ostrom-unavailable` means

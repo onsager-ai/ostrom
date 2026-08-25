@@ -28,8 +28,8 @@ pub use doctor::{
 pub use github::GitHubProvider;
 pub use http::HttpProvider;
 pub use judgment::{
-    AgentRegistry, AgentRunner, ClaudeHarness, Harness, HarnessRequest, JudgmentHarness,
-    JudgmentOutcome, JudgmentRegistry, PreparedJudgment, RunOutcome, RunRequest,
+    ClaudeHarness, HarnessRequest, JudgmentHarness, JudgmentOutcome, JudgmentRegistry,
+    PreparedJudgment,
 };
 pub use loop_units::{
     LoopUnit, LoopUnitDrift, LoopUnitError, check_loop_units_drift, generate_loop_units,
@@ -39,10 +39,12 @@ pub use operation_settings::{
     OperationSettingsDrift, OperationSettingsError, RoleSkillOperations, SkillOperationViolation,
     check_operation_settings_drift, check_skill_operation_grants, generate_operation_settings,
 };
-pub use plugin_surface::{PluginSurfaceReport, PluginSurfaceViolation, check_plugin_surface};
-pub use registry::{
-    ActionFault, ActionOutcome, ActionProvider, ActionRegistry, PreparedAction, PreparedCheck,
+pub use ostrom_store::{
+    ActionFault, AgentRegistry, AgentRunner, CodexHarness, Harness, ImplementerRunRequest,
+    OrchestratorRunRequest, RunOutcome, RunRequest, RunTermination, RunnerLaunch,
 };
+pub use plugin_surface::{PluginSurfaceReport, PluginSurfaceViolation, check_plugin_surface};
+pub use registry::{ActionOutcome, ActionProvider, ActionRegistry, PreparedAction, PreparedCheck};
 pub use role_allowlists::{
     RoleAllowlistReport, RoleAllowlistViolation, check_modeled_role_allowlists,
     check_role_allowlists,
