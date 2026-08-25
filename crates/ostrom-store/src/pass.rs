@@ -113,6 +113,7 @@ impl PassError {
 
 struct PassGuard {
     actor: String,
+    owner: String,
     paths: OstromPaths,
     lease: OwnedLease,
     started_epoch: u64,
@@ -265,6 +266,7 @@ pub fn run_pass(
     let trace_time = request.clock.timestamp();
     let mut guard = PassGuard {
         actor: request.actor.clone(),
+        owner: owner.clone(),
         paths: request.paths.clone(),
         lease,
         started_epoch,
