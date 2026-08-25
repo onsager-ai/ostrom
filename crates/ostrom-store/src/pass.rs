@@ -1,7 +1,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::{Child, Command, ExitStatus, Stdio},
+    process::{Child, Command, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -16,64 +16,31 @@ use thiserror::Error;
 
 use crate::{
     Clock, LeaseActionError, OstromPaths, OwnedLease, PassState, TraceAppend, append_trace,
-    environment, read_lease, read_pass_state, read_trace, selection::dispatchability_snapshot,
-    write_pass_state,
+    environment, read_pass_state, read_trace, write_pass_state,
 };
 
 pub const MAX_TURNS: &str = "200";
 const DEFAULT_DAILY_CAP_USD: f64 = 50.0;
 const DEFAULT_LEASE_TTL_SECONDS: u64 = 3_600;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PassRole {
-    Builder,
-    Gatekeeper,
-}
-
-impl PassRole {
-    #[must_use]
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Builder => "builder",
-            Self::Gatekeeper => "gatekeeper",
-        }
-    }
-
-    const fn prompt(self) -> &'static str {
-        match self {
-            Self::Builder => {
-                include_str!("../../../plugins/ostrom/skills/work/SKILL.md")
-            }
-            Self::Gatekeeper => {
-                include_str!("../../../plugins/ostrom/skills/gatekeep/SKILL.md")
-            }
-        }
-    }
-
-    const fn permission_mode(self) -> &'static str {
-        match self {
-            Self::Builder => "auto",
-            Self::Gatekeeper => "manual",
-        }
-    }
-
-    const fn inner_lease(self) -> &'static str {
-        match self {
-            Self::Builder => "builder.lease",
-            Self::Gatekeeper => "sprint.lease",
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct PassRequest {
     pub paths: OstromPaths,
-    pub working_directory: PathBuf,
-    pub role: PassRole,
-    pub claude_bin: PathBuf,
+    pub actor: String,
     pub signals: SignalFlags,
     pub supervisor_pid: Option<u32>,
     pub clock: Clock,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PassDispatch {
+    pub transcript: Option<PathBuf>,
+    pub exit_code: i32,
+    pub error: Option<String>,
+    pub run_signature: Option<String>,
+    pub queue_count: Option<usize>,
+    pub dispatchable_count: Option<usize>,
+    pub skipped_unchanged: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -116,14 +83,14 @@ impl SignalFlags {
 pub enum PassError {
     #[error("ostrom {role} pass: {message}")]
     Failed {
-        role: &'static str,
+        role: String,
         message: String,
         code: i32,
     },
     #[error("ostrom {0} pass: another pass already holds {0}-pass.lease; skipping")]
-    Held(&'static str),
+    Held(String),
     #[error("ostrom {0} pass: loop is disarmed")]
-    Disarmed(&'static str),
+    Disarmed(String),
 }
 
 impl PassError {
@@ -135,9 +102,9 @@ impl PassError {
         }
     }
 
-    fn failed(role: PassRole, message: impl Into<String>, code: i32) -> Self {
+    fn failed(role: &str, message: impl Into<String>, code: i32) -> Self {
         Self::Failed {
-            role: role.name(),
+            role: role.to_owned(),
             message: message.into(),
             code,
         }
@@ -145,19 +112,17 @@ impl PassError {
 }
 
 struct PassGuard {
-    role: PassRole,
+    actor: String,
     paths: OstromPaths,
     lease: OwnedLease,
-    owner: String,
     started_epoch: u64,
     trace_time: String,
     started: bool,
-    child_spawned: bool,
     outcome: Option<String>,
     reason: Option<String>,
     cost_usd: Option<f64>,
     clock: Clock,
-    dispatchability_hash: Option<String>,
+    run_signature: Option<String>,
     queue_count: Option<usize>,
     dispatchable_count: Option<usize>,
 }
@@ -203,8 +168,8 @@ impl PassGuard {
             if let Some(reason) = &self.reason {
                 fact.insert("reason".to_owned(), json!(reason));
             }
-            if let Some(hash) = &self.dispatchability_hash {
-                fact.insert("dispatchability_hash".to_owned(), json!(hash));
+            if let Some(signature) = &self.run_signature {
+                fact.insert("run_signature".to_owned(), json!(signature));
             }
             if let Some(count) = self.queue_count {
                 fact.insert("queue_count".to_owned(), json!(count));
@@ -222,19 +187,16 @@ impl PassGuard {
                 },
             ) {
                 failure = Some(PassError::failed(
-                    self.role,
+                    &self.actor,
                     format!("could not append pass-ended: {error}"),
                     1,
                 ));
             }
             self.started = false;
         }
-        if self.child_spawned {
-            release_inner_lease(self);
-        }
         if self.lease.release().is_err() && failure.is_none() {
             failure = Some(PassError::failed(
-                self.role,
+                &self.actor,
                 "could not release pass lease",
                 1,
             ));
@@ -249,30 +211,33 @@ impl Drop for PassGuard {
     }
 }
 
-pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
+pub fn run_pass(
+    request: &PassRequest,
+    dispatch: impl FnOnce(Option<&str>) -> PassDispatch,
+) -> Result<(), PassError> {
     validate_arm(request)?;
     fs::create_dir_all(&request.paths.state).map_err(|error| {
         PassError::failed(
-            request.role,
+            &request.actor,
             format!("could not create state directory: {error}"),
             1,
         )
     })?;
     let lease_now = request.clock.epoch_seconds();
     let started_epoch = request.clock.epoch_seconds();
-    let lease_name = format!("{}-pass.lease", request.role.name());
+    let lease_name = format!("{}-pass.lease", request.actor);
     let ttl =
         positive_env(environment::MANDATE_LEASE_TTL_SECONDS).unwrap_or(DEFAULT_LEASE_TTL_SECONDS);
 
-    let prior = read_pass_state(&request.paths.state, request.role.name())
-        .map_err(|error| PassError::failed(request.role, error.to_string(), 1))?;
+    let prior = read_pass_state(&request.paths.state, &request.actor)
+        .map_err(|error| PassError::failed(&request.actor, error.to_string(), 1))?;
     let mut state = prior.unwrap_or_else(|| PassState {
         role_id: generated_role_id(&request.clock),
         wake: 0,
-        dispatchability_hash: None,
+        run_signature: None,
     });
     let next_wake = state.wake.saturating_add(1);
-    let owner = format!("{}-{}-wake{next_wake}", request.role.name(), state.role_id);
+    let owner = format!("{}-{}-wake{next_wake}", request.actor, state.role_id);
     let lease = match OwnedLease::acquire(&request.paths.state, &lease_name, &owner, lease_now, ttl)
     {
         Ok(lease) => lease,
@@ -283,35 +248,33 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
             | LeaseActionError::ChangedDuringReclamation
             | LeaseActionError::AcquiredConcurrently,
         ) => {
-            return Err(PassError::Held(request.role.name()));
+            return Err(PassError::Held(request.actor.clone()));
         }
         Err(error) => {
             return Err(PassError::failed(
-                request.role,
+                &request.actor,
                 format!("could not acquire {lease_name}: {error:?}"),
                 1,
             ));
         }
     };
     state.wake = next_wake;
-    write_pass_state(&request.paths.state, request.role.name(), &state)
-        .map_err(|error| PassError::failed(request.role, error.to_string(), 1))?;
+    write_pass_state(&request.paths.state, &request.actor, &state)
+        .map_err(|error| PassError::failed(&request.actor, error.to_string(), 1))?;
 
     let trace_time = request.clock.timestamp();
     let mut guard = PassGuard {
-        role: request.role,
+        actor: request.actor.clone(),
         paths: request.paths.clone(),
         lease,
-        owner: owner.clone(),
         started_epoch,
         trace_time,
         started: false,
-        child_spawned: false,
         outcome: None,
         reason: None,
         cost_usd: None,
         clock: request.clock.clone(),
-        dispatchability_hash: None,
+        run_signature: None,
         queue_count: None,
         dispatchable_count: None,
     };
@@ -326,145 +289,62 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
     )
     .map_err(|error| {
         PassError::failed(
-            request.role,
+            &request.actor,
             format!("could not append pass-started: {error}"),
             1,
         )
     })?;
     guard.started = true;
-    let watermark = read_trace(&request.paths.trace_file())
-        .map_err(|error| PassError::failed(request.role, error.to_string(), 1))?
-        .rows
-        .len();
-
-    check_signal(request, &mut guard, None)?;
-    let settings = request
-        .paths
-        .state
-        .join("roles")
-        .join(format!("{}.settings.json", request.role.name()));
-    if !settings.is_file() {
-        guard.outcome = Some("failed".to_owned());
-        return Err(PassError::failed(
-            request.role,
-            format!("{} missing", settings.display()),
-            1,
-        ));
-    }
-    if !is_executable_file(&request.claude_bin) {
-        guard.outcome = Some("failed".to_owned());
-        return Err(PassError::failed(
-            request.role,
-            format!("{} is not marked executable", request.claude_bin.display()),
-            1,
-        ));
-    }
+    check_signal(request, &mut guard)?;
     if daily_spend(&request.paths, &request.clock.date()) >= daily_cap() {
         guard.outcome = Some("no-op".to_owned());
         guard.reason = Some("daily-cap".to_owned());
         guard.finish()?;
         return Ok(());
     }
-    if request.role == PassRole::Builder {
-        let previous_hash = state.dispatchability_hash.clone();
-        if let Ok(snapshot) = dispatchability_snapshot(&request.paths, &request.working_directory) {
-            guard.dispatchability_hash = Some(snapshot.hash.clone());
-            guard.queue_count = Some(snapshot.queue_count);
-            guard.dispatchable_count = Some(snapshot.dispatchable_count);
-            if snapshot.dispatchable_count == 0
-                && previous_hash.as_deref() == Some(snapshot.hash.as_str())
-            {
-                guard.outcome = Some("no-op".to_owned());
-                guard.reason = Some("no-dispatchable-work-unchanged".to_owned());
-                guard.cost_usd = Some(0.0);
-                guard.finish()?;
-                return Ok(());
-            }
-        }
+    let result = dispatch(state.run_signature.as_deref());
+    guard.run_signature.clone_from(&result.run_signature);
+    guard.queue_count = result.queue_count;
+    guard.dispatchable_count = result.dispatchable_count;
+    if result.skipped_unchanged {
+        guard.outcome = Some("no-op".to_owned());
+        guard.reason = Some("run-signature-unchanged".to_owned());
+        guard.cost_usd = Some(0.0);
+    } else if let Some(transcript) = result.transcript.as_deref() {
+        let summary = read_transcript(transcript);
+        guard.cost_usd = summary.cost_usd;
+        guard.outcome = Some(if summary.permission_denied {
+            "permission-denied".to_owned()
+        } else if result.exit_code == 0 {
+            "completed".to_owned()
+        } else {
+            "failed".to_owned()
+        });
+    } else {
+        guard.outcome = Some(if result.exit_code == 0 {
+            "completed".to_owned()
+        } else {
+            "fault".to_owned()
+        });
     }
-
-    let run_dir = request
-        .paths
-        .state
-        .join("pass-runs")
-        .join(request.role.name());
-    fs::create_dir_all(&run_dir).map_err(|error| {
-        PassError::failed(
-            request.role,
-            format!("could not create run directory: {error}"),
-            1,
-        )
-    })?;
-    let log = run_dir.join(format!(
-        "{}-{owner}.jsonl",
-        request.clock.now().format("%Y%m%dT%H%M%SZ")
-    ));
-    let output = fs::File::create(&log).map_err(|error| {
-        PassError::failed(
-            request.role,
-            format!("could not create transcript: {error}"),
-            1,
-        )
-    })?;
-    let error_output = output.try_clone().map_err(|error| {
-        PassError::failed(
-            request.role,
-            format!("could not clone transcript: {error}"),
-            1,
-        )
-    })?;
-    let mut command = Command::new(&request.claude_bin);
-    command
-        .args([
-            "--print",
-            "--settings",
-            &settings.display().to_string(),
-            "--permission-mode",
-            request.role.permission_mode(),
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            "--max-turns",
-            MAX_TURNS,
-            request.role.prompt(),
-        ])
-        .stdout(Stdio::from(output))
-        .stderr(Stdio::from(error_output));
-    set_process_group(&mut command);
-    let mut child = command.spawn().map_err(|error| {
-        PassError::failed(request.role, format!("could not start Claude: {error}"), 1)
-    })?;
-    guard.child_spawned = true;
-    let status = wait_for_child(request, &mut guard, &mut child)?;
-    let transcript = read_transcript(&log);
-    guard.cost_usd = transcript.cost_usd;
-    reconcile_outcome(&mut guard, watermark, status, transcript.permission_denied);
-    if status.success()
-        && !matches!(
-            guard.outcome.as_deref(),
-            Some("failed" | "permission-denied")
-        )
-        && let Some(hash) = &guard.dispatchability_hash
+    if result.exit_code == 0
+        && !matches!(guard.outcome.as_deref(), Some("failed" | "permission-denied" | "fault"))
+        && let Some(signature) = &result.run_signature
     {
-        state.dispatchability_hash = Some(hash.clone());
-        if let Err(error) = write_pass_state(&request.paths.state, request.role.name(), &state) {
+        state.run_signature = Some(signature.clone());
+        if let Err(error) = write_pass_state(&request.paths.state, &request.actor, &state) {
             guard.outcome = Some("failed".to_owned());
-            return Err(PassError::failed(request.role, error.to_string(), 1));
+            return Err(PassError::failed(&request.actor, error.to_string(), 1));
         }
     }
-    prune_transcripts(&run_dir);
-    let code = status.code().unwrap_or(1);
     guard.finish()?;
-    if status.success() {
+    if result.exit_code == 0 {
         Ok(())
     } else {
         Err(PassError::failed(
-            request.role,
-            format!(
-                "Claude run failed (rc={code}); transcript at {}",
-                log.display()
-            ),
-            code,
+            &request.actor,
+            result.error.unwrap_or_else(|| "dispatch failed".to_owned()),
+            result.exit_code,
         ))
     }
 }
@@ -472,22 +352,22 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
 fn validate_arm(request: &PassRequest) -> Result<(), PassError> {
     let path = request.paths.state.join("loop-armed");
     let Ok(contents) = fs::read_to_string(&path) else {
-        return Err(PassError::Disarmed(request.role.name()));
+        return Err(PassError::Disarmed(request.actor.clone()));
     };
     if contents.is_empty() {
         return Ok(());
     }
     let value = contents.strip_suffix('\n').unwrap_or(&contents);
     if value.contains('\n') {
-        return Err(PassError::Disarmed(request.role.name()));
+        return Err(PassError::Disarmed(request.actor.clone()));
     }
     if !valid_arm_expiry(value) {
-        return Err(PassError::Disarmed(request.role.name()));
+        return Err(PassError::Disarmed(request.actor.clone()));
     }
     let expiry = DateTime::parse_from_rfc3339(value)
-        .map_err(|_| PassError::Disarmed(request.role.name()))?;
+        .map_err(|_| PassError::Disarmed(request.actor.clone()))?;
     if expiry.timestamp() <= request.clock.epoch_seconds() as i64 {
-        return Err(PassError::Disarmed(request.role.name()));
+        return Err(PassError::Disarmed(request.actor.clone()));
     }
     Ok(())
 }
@@ -508,34 +388,9 @@ fn valid_arm_expiry(value: &str) -> bool {
         })
 }
 
-fn wait_for_child(
-    request: &PassRequest,
-    guard: &mut PassGuard,
-    child: &mut Child,
-) -> Result<ExitStatus, PassError> {
-    loop {
-        if let Some(status) = child.try_wait().map_err(|error| {
-            PassError::failed(
-                request.role,
-                format!("could not wait for Claude: {error}"),
-                1,
-            )
-        })? {
-            kill_remaining_process_group(child.id());
-            return Ok(status);
-        }
-        if let Err(error) = check_signal(request, guard, Some(child)) {
-            let _ = child.wait();
-            return Err(error);
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-}
-
 fn check_signal(
     request: &PassRequest,
     guard: &mut PassGuard,
-    child: Option<&mut Child>,
 ) -> Result<(), PassError> {
     let signal = request.signals.take_pending();
     // A killed supervisor cannot write the signal handoff. Watching the
@@ -545,9 +400,6 @@ fn check_signal(
         .is_some_and(|pid| !process_alive(pid));
     if signal.is_none() && !orphaned {
         return Ok(());
-    }
-    if let Some(child) = child {
-        terminate_child_process_group(child, Duration::from_secs(5));
     }
     let name = signal.unwrap_or("TERM");
     guard.outcome = Some(if name == "TERM" {
@@ -561,109 +413,10 @@ fn check_signal(
         _ => 143,
     };
     Err(PassError::failed(
-        request.role,
+        &request.actor,
         format!("received SIG{name}"),
         code,
     ))
-}
-
-fn reconcile_outcome(
-    guard: &mut PassGuard,
-    watermark: usize,
-    status: ExitStatus,
-    permission_denied: bool,
-) {
-    if permission_denied {
-        guard.outcome = Some("permission-denied".to_owned());
-        guard.reason = None;
-        return;
-    }
-    let rows = read_trace(&guard.paths.trace_file())
-        .map(|trace| {
-            trace
-                .rows
-                .into_iter()
-                .skip(watermark)
-                .filter_map(Result::ok)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let prefix = format!("{}-", guard.role.name());
-    let inner_start = rows.iter().enumerate().rev().find_map(|(index, row)| {
-        (row.kind == "pass-started")
-            .then(|| row.fact.get("owner").and_then(Value::as_str))
-            .flatten()
-            .filter(|owner| owner.starts_with(&prefix) && *owner != guard.owner)
-            .map(|owner| (index, owner.to_owned()))
-    });
-    if let Some((inner_index, inner_owner)) = inner_start {
-        guard.outcome = if status.success() {
-            rows.iter()
-                .skip(inner_index + 1)
-                .rev()
-                .find(|row| {
-                    row.kind == "pass-ended"
-                        && row
-                            .fact
-                            .get("owner")
-                            .and_then(Value::as_str)
-                            .is_none_or(|owner| owner == inner_owner)
-                })
-                .and_then(|row| row.fact.get("outcome").and_then(Value::as_str))
-                .map(str::to_owned)
-                .or_else(|| Some("completed".to_owned()))
-        } else {
-            Some("failed".to_owned())
-        };
-    } else if status.success() {
-        guard.outcome = Some("no-op".to_owned());
-        guard.reason = Some(inner_lease_reason(guard));
-    } else {
-        guard.outcome = Some("failed".to_owned());
-    }
-}
-
-fn inner_lease_reason(guard: &PassGuard) -> String {
-    let path = guard.paths.state.join(guard.role.inner_lease());
-    if read_lease(&path)
-        .ok()
-        .flatten()
-        .is_some_and(|lease| lease.started_at < guard.started_epoch)
-    {
-        "lease-held".to_owned()
-    } else {
-        "blocked".to_owned()
-    }
-}
-
-fn release_inner_lease(guard: &PassGuard) {
-    let path = guard.paths.state.join(guard.role.inner_lease());
-    let Ok(Some(record)) = read_lease(&path) else {
-        return;
-    };
-    if record.started_at < guard.started_epoch {
-        eprintln!(
-            "ostrom {} pass: inner lease {} started at {}, before this pass's own start at {}; leaving it to its own owner",
-            guard.role.name(),
-            guard.role.inner_lease(),
-            record.started_at,
-            guard.started_epoch
-        );
-        return;
-    }
-    eprintln!(
-        "ostrom {} pass: releasing inner lease {} held by {} (started_at={}, pass start={})",
-        guard.role.name(),
-        guard.role.inner_lease(),
-        record.owner,
-        record.started_at,
-        guard.started_epoch
-    );
-    if let Ok(mut lease) =
-        OwnedLease::adopt(&guard.paths.state, guard.role.inner_lease(), &record.owner)
-    {
-        let _ = lease.release();
-    }
 }
 
 /// Whether the file is *marked* executable, which is what the message says.
@@ -743,23 +496,6 @@ fn read_transcript(path: &Path) -> TranscriptSummary {
         })
 }
 
-fn prune_transcripts(directory: &Path) {
-    let Ok(entries) = fs::read_dir(directory) else {
-        return;
-    };
-    let mut paths = entries
-        .flatten()
-        .filter_map(|entry| {
-            let modified = entry.metadata().ok()?.modified().ok()?;
-            Some((modified, entry.path()))
-        })
-        .collect::<Vec<_>>();
-    paths.sort_by_key(|entry| std::cmp::Reverse(entry.0));
-    for (_, path) in paths.into_iter().skip(30) {
-        let _ = fs::remove_file(path);
-    }
-}
-
 fn generated_role_id(clock: &Clock) -> String {
     let nanos = clock.now().timestamp_subsec_nanos();
     format!("{:08x}", nanos ^ std::process::id())
@@ -771,15 +507,6 @@ fn positive_env(variable: environment::EnvironmentVariable) -> Option<u64> {
         .and_then(|value| value.parse().ok())
         .filter(|value| *value > 0)
 }
-
-#[cfg(unix)]
-fn set_process_group(command: &mut Command) {
-    use std::os::unix::process::CommandExt;
-    command.process_group(0);
-}
-
-#[cfg(not(unix))]
-fn set_process_group(_command: &mut Command) {}
 
 pub(crate) fn terminate_child_process_group(child: &mut Child, grace: Duration) -> Option<String> {
     let pid = child.id();

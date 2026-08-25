@@ -47,7 +47,7 @@ pub trait Harness: Send + Sync {
     fn default_model(&self) -> &str;
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct OrchestratorRunRequest {
     pub prompt: String,
     pub model: String,
@@ -55,6 +55,9 @@ pub struct OrchestratorRunRequest {
     pub permission_mode: String,
     pub ceilings: ResolvedLoopCeilings,
     pub transcript: PathBuf,
+    pub signals: SignalFlags,
+    pub supervisor_pid: Option<u32>,
+    pub termination_grace: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -340,7 +343,7 @@ impl AgentRunner for CodexHarness {
             .stdin(Stdio::from(input))
             .stdout(Stdio::from(events))
             .stderr(Stdio::from(errors));
-        set_process_group(&mut command);
+        configure_agent_process_group(&mut command);
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
@@ -350,38 +353,12 @@ impl AgentRunner for CodexHarness {
                 ));
             }
         };
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    crate::pass::kill_remaining_process_group(child.id());
-                    return RunOutcome::Exited(status);
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    return RunOutcome::Error(ActionFault::new(
-                        "runner_io",
-                        Some(error.to_string()),
-                    ));
-                }
-            }
-            let signal = request.signals.take_pending();
-            let orphaned = request
-                .supervisor_pid
-                .is_some_and(|pid| !crate::pass::process_alive(pid));
-            if signal.is_some() || orphaned {
-                let signal = signal.unwrap_or("TERM");
-                let termination_signal = crate::pass::terminate_child_process_group(
-                    &mut child,
-                    request.termination_grace,
-                );
-                let _ = child.wait();
-                return RunOutcome::Terminated(RunTermination {
-                    signal,
-                    termination_signal,
-                });
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
+        wait_for_agent_child(
+            &mut child,
+            &request.signals,
+            request.supervisor_pid,
+            request.termination_grace,
+        )
     }
 }
 
@@ -577,13 +554,50 @@ impl NodeResolver {
 }
 
 #[cfg(unix)]
-fn set_process_group(command: &mut Command) {
+pub fn configure_agent_process_group(command: &mut Command) {
     use std::os::unix::process::CommandExt;
     command.process_group(0);
 }
 
 #[cfg(not(unix))]
-fn set_process_group(_command: &mut Command) {}
+pub fn configure_agent_process_group(_command: &mut Command) {}
+
+/// Wait for an agent subprocess with the transcript-safe TERM/grace/KILL policy.
+pub fn wait_for_agent_child(
+    child: &mut std::process::Child,
+    signals: &SignalFlags,
+    supervisor_pid: Option<u32>,
+    termination_grace: Duration,
+) -> RunOutcome {
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                crate::pass::kill_remaining_process_group(child.id());
+                return RunOutcome::Exited(status);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return RunOutcome::Error(ActionFault::new(
+                    "runner_io",
+                    Some(error.to_string()),
+                ));
+            }
+        }
+        let signal = signals.take_pending();
+        let orphaned = supervisor_pid.is_some_and(|pid| !crate::pass::process_alive(pid));
+        if signal.is_some() || orphaned {
+            let signal = signal.unwrap_or("TERM");
+            let termination_signal =
+                crate::pass::terminate_child_process_group(child, termination_grace);
+            let _ = child.wait();
+            return RunOutcome::Terminated(RunTermination {
+                signal,
+                termination_signal,
+            });
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
 
 #[cfg(test)]
 mod tests {

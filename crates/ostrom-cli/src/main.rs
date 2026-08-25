@@ -29,7 +29,7 @@ use ostrom_store::{
     AgentRegistry, AssessmentHarness, AuditOptions, Clock, CodexHarness, DigestOptions,
     DispatchOutcome, DispatchRequest, ExecutableAssessmentDeriver, GateError, GateOptions,
     HarnessAssessmentDeriver, ImplementRequest, JsonlCheckStore, MigrationOutcome,
-    OrchestratorRunRequest, OstromPaths, PassRequest, PassRole, PlanOptions, PublishDestination,
+    OrchestratorRunRequest, OstromPaths, PassDispatch, PassRequest, PlanOptions, PublishDestination,
     PublishTarget, QueueDecision, ReplayOptions, RunOutcome, RunRequest, SelectAction, SelectError,
     SelectOutcome, SelectRequest, SignalFlags, SweepError, SweepMode, SweepOptions,
     SweepParityOptions, TraceAppend, TraceView, UnavailableAssessmentDeriver, acquire_lease,
@@ -191,8 +191,11 @@ enum Command {
         #[command(subcommand)]
         command: HookCommand,
     },
-    /// Run one unattended delivery pass for a role.
-    Pass { role: CliPassRole },
+    /// Run one declared actor operation once.
+    Pass {
+        actor: String,
+        operation: Option<String>,
+    },
     /// Execute one durable work order in its item worktree.
     Implement {
         work_order_file: PathBuf,
@@ -202,7 +205,9 @@ enum Command {
     },
     #[command(name = "__pass-worker", hide = true)]
     PassWorker {
-        role: CliPassRole,
+        actor: String,
+        #[arg(long)]
+        operation: Option<String>,
         supervisor_pid: u32,
     },
     #[command(name = "__implement-worker", hide = true)]
@@ -541,21 +546,6 @@ fn named_plan_deriver(harness: AssessmentHarness) -> Box<dyn ostrom_store::Asses
     Box::new(HarnessAssessmentDeriver::new(harness, executable))
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum CliPassRole {
-    Builder,
-    Gatekeeper,
-}
-
-impl From<CliPassRole> for PassRole {
-    fn from(value: CliPassRole) -> Self {
-        match value {
-            CliPassRole::Builder => Self::Builder,
-            CliPassRole::Gatekeeper => Self::Gatekeeper,
-        }
-    }
-}
-
 impl From<CliSweepMode> for SweepMode {
     fn from(value: CliSweepMode) -> Self {
         match value {
@@ -838,11 +828,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 io::stderr().write_all(output.stderr.as_bytes())?;
             }
         },
-        Command::Pass { role } => supervise(
-            &["__pass-worker".into(), role_name(role).into()],
-            None,
-            &clock,
-        ),
+        Command::Pass { actor, operation } => {
+            let mut arguments = vec!["__pass-worker".into(), actor.into()];
+            if let Some(operation) = operation {
+                arguments.push("--operation".into());
+                arguments.push(operation.into());
+            }
+            supervise(&arguments, None, &clock)
+        }
         Command::Implement {
             work_order_file,
             unit_name,
@@ -857,9 +850,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             supervise(&arguments, Some((&work_order_file, &unit_name)), &clock)
         }
         Command::PassWorker {
-            role,
+            actor,
+            operation,
             supervisor_pid,
-        } => run_pass_worker(role, supervisor_pid, clock),
+        } => run_pass_worker(actor, operation, supervisor_pid, clock),
         Command::ImplementWorker {
             work_order_file,
             unit_name,
@@ -1380,7 +1374,9 @@ fn run_loop_command(paths: &OstromPaths, name: &str) -> Result<(), Box<dyn std::
     let manifest = policy_version::load_current(paths)?.manifest;
     let resolved = manifest.resolve_loop(name)?;
     assert_loop_environment(&resolved.actor, resolved.ceilings)?;
-    dispatch_resolved_loop(paths, &manifest, resolved)
+    let signals = register_signals()?;
+    dispatch_resolved_loop(paths, &manifest, resolved, signals, None)?.result?;
+    Ok(())
 }
 
 fn run_loop_worker(
@@ -1400,17 +1396,27 @@ fn run_loop_worker(
         }
     };
     let resolved = manifest.resolve_loop(name)?;
-    let result = dispatch_resolved_loop(paths, &manifest, resolved);
+    let signals = register_signals()?;
+    let result = dispatch_resolved_loop(paths, &manifest, resolved, signals, None)
+        .and_then(|dispatch| dispatch.result.map_err(Into::into));
     let reason = result.as_ref().err().map(ToString::to_string);
     loop_supervisor::worker_finished(paths, name, result.is_ok(), reason, clock)?;
     result
+}
+
+struct ResolvedLoopDispatch {
+    result: Result<(), OperationDispatchError>,
+    transcript: Option<PathBuf>,
+    exit_code: i32,
 }
 
 fn dispatch_resolved_loop(
     paths: &OstromPaths,
     manifest: &ostrom_core::PolicyManifest,
     resolved: ostrom_core::ResolvedLoop,
-) -> Result<(), Box<dyn std::error::Error>> {
+    signals: SignalFlags,
+    supervisor_pid: Option<u32>,
+) -> Result<ResolvedLoopDispatch, Box<dyn std::error::Error>> {
     let invocation = operation_dispatch::OperationInvocation {
         name: resolved.operation.clone(),
         target: resolved.target,
@@ -1431,9 +1437,17 @@ fn dispatch_resolved_loop(
         plugin_root: &plugin_root,
         selector_prefixes,
         ceilings: Some(resolved.ceilings),
+        signals,
+        supervisor_pid,
+        agent_transcript: None,
+        agent_exit_code: 0,
     };
-    dispatch_operation(manifest, &resolved.actor, &invocation, &mut runtime)?;
-    Ok(())
+    let result = dispatch_operation(manifest, &resolved.actor, &invocation, &mut runtime);
+    Ok(ResolvedLoopDispatch {
+        result,
+        transcript: runtime.agent_transcript,
+        exit_code: runtime.agent_exit_code,
+    })
 }
 
 fn run_operation_command(
@@ -1452,6 +1466,7 @@ fn run_operation_command(
         .or_else(|| ostrom_store::environment::CLAUDE_PLUGIN_ROOT.value_os())
         .map_or_else(|| working_directory.join("plugins/ostrom"), PathBuf::from);
     let selector_prefixes = operation_selector_prefixes(&manifest, &actor, &invocation.name);
+    let signals = register_signals()?;
     let mut runtime = CliOperationRuntime {
         paths,
         actor: &actor,
@@ -1460,6 +1475,10 @@ fn run_operation_command(
         plugin_root: &plugin_root,
         selector_prefixes,
         ceilings: None,
+        signals,
+        supervisor_pid: None,
+        agent_transcript: None,
+        agent_exit_code: 0,
     };
     dispatch_operation(&manifest, &actor, &invocation, &mut runtime)?;
     Ok(())
@@ -1473,6 +1492,10 @@ struct CliOperationRuntime<'a> {
     plugin_root: &'a Path,
     selector_prefixes: BTreeSet<SelectorPrefix>,
     ceilings: Option<ResolvedLoopCeilings>,
+    signals: SignalFlags,
+    supervisor_pid: Option<u32>,
+    agent_transcript: Option<PathBuf>,
+    agent_exit_code: i32,
 }
 
 impl OperationRuntime for CliOperationRuntime<'_> {
@@ -1571,6 +1594,10 @@ impl OperationRuntime for CliOperationRuntime<'_> {
             parameters,
             self.ceilings,
             self.manifest,
+            &self.signals,
+            self.supervisor_pid,
+            &mut self.agent_transcript,
+            &mut self.agent_exit_code,
         )
     }
 }
@@ -1735,6 +1762,10 @@ fn execute_operation_action(
     parameters: &BTreeMap<String, serde_yaml::Value>,
     ceilings: Option<ResolvedLoopCeilings>,
     manifest: &PolicyManifest,
+    signals: &SignalFlags,
+    supervisor_pid: Option<u32>,
+    agent_transcript: &mut Option<PathBuf>,
+    agent_exit_code: &mut i32,
 ) -> Result<(), OperationDispatchError> {
     match action.uses {
         "gh/post-verdict" => {
@@ -1801,6 +1832,10 @@ fn execute_operation_action(
             parameters,
             ceilings.unwrap_or_default(),
             manifest,
+            signals,
+            supervisor_pid,
+            agent_transcript,
+            agent_exit_code,
         ),
         _ => Err(OperationDispatchError::UnknownAction(
             action.uses.to_owned(),
@@ -1815,6 +1850,10 @@ fn run_agent_operation(
     parameters: &BTreeMap<String, serde_yaml::Value>,
     ceilings: ResolvedLoopCeilings,
     manifest: &PolicyManifest,
+    signals: &SignalFlags,
+    supervisor_pid: Option<u32>,
+    agent_transcript: &mut Option<PathBuf>,
+    agent_exit_code: &mut i32,
 ) -> Result<(), OperationDispatchError> {
     let step = ostrom_core::StepDecl {
         uses: action.uses.to_owned(),
@@ -1850,6 +1889,7 @@ fn run_agent_operation(
     )
     .map_err(|error| action_failed(action.uses, error))?;
     let transcript = run_directory.join(format!("{identity}.jsonl"));
+    agent_transcript.clone_from(&Some(transcript.clone()));
     let registry = core_agent_registry();
     let runner = registry
         .get(action.uses)
@@ -1864,17 +1904,30 @@ fn run_agent_operation(
         permission_mode: permission_mode.to_owned(),
         ceilings,
         transcript,
+        signals: signals.clone(),
+        supervisor_pid,
+        termination_grace: Duration::from_secs(5),
     });
     match registry.run(action.uses, &request) {
         RunOutcome::Exited(status) if status.success() => Ok(()),
-        RunOutcome::Exited(status) => Err(action_failed(
-            action.uses,
-            format!("runner exited with {status}"),
-        )),
-        RunOutcome::Terminated(termination) => Err(action_failed(
-            action.uses,
-            format!("runner terminated by SIG{}", termination.signal),
-        )),
+        RunOutcome::Exited(status) => {
+            *agent_exit_code = status.code().unwrap_or(1);
+            Err(action_failed(
+                action.uses,
+                format!("runner exited with {status}"),
+            ))
+        }
+        RunOutcome::Terminated(termination) => {
+            *agent_exit_code = match termination.signal {
+                "HUP" => 129,
+                "INT" => 130,
+                _ => 143,
+            };
+            Err(action_failed(
+                action.uses,
+                format!("runner terminated by SIG{}", termination.signal),
+            ))
+        }
         RunOutcome::Error(fault) => Err(action_failed(
             action.uses,
             fault.detail().unwrap_or_else(|| fault.name()),
@@ -2320,13 +2373,6 @@ fn work_order_usage() -> ! {
 fn exit_message(message: &str, code: i32) -> ! {
     eprintln!("{message}");
     std::process::exit(code);
-}
-
-fn role_name(role: CliPassRole) -> &'static str {
-    match role {
-        CliPassRole::Builder => "builder",
-        CliPassRole::Gatekeeper => "gatekeeper",
-    }
 }
 
 // SIGHUP and SIGTERM do not exist on Windows, and signal-hook configures them

@@ -31,7 +31,7 @@ pub struct SelectRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DispatchabilitySnapshot {
+pub struct DispatchabilitySnapshot {
     pub hash: String,
     pub queue_count: usize,
     pub dispatchable_count: usize,
@@ -271,7 +271,7 @@ fn load_selection_basis(
 /// dispatchable set. The projection intentionally includes graph structure
 /// and failing default-branch workflow details in addition to the final
 /// predicate: an extra full pass is cheaper than overlooking a transition.
-pub(crate) fn dispatchability_snapshot(
+pub fn dispatchability_snapshot(
     paths: &OstromPaths,
     working_directory: &Path,
 ) -> Result<DispatchabilitySnapshot, SelectError> {

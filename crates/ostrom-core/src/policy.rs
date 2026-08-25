@@ -319,6 +319,7 @@ impl PolicyManifest {
                 spend_usd: declaration.spend_usd.or(self.defaults.r#loop.spend_usd),
                 tokens: declaration.tokens.or(self.defaults.r#loop.tokens),
             },
+            run_signature: declaration.run_signature,
             publish: declaration.publish.clone(),
             cadence_hours: declaration.cadence_hours,
             stuck_after_days: declaration.stuck_after_days,
@@ -752,11 +753,21 @@ pub struct LoopDecl {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_signature: Option<RunSignatureDecl>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publish: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cadence_hours: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stuck_after_days: Option<u64>,
+}
+
+/// A declared, actor-independent computation used to suppress repeated loop runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RunSignatureDecl {
+    /// Hash the durable queue and dependency inputs used by work selection.
+    Dispatchability,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -917,6 +928,7 @@ pub struct ResolvedLoop {
     pub parameters: BTreeMap<String, Value>,
     pub every: LoopCadence,
     pub ceilings: ResolvedLoopCeilings,
+    pub run_signature: Option<RunSignatureDecl>,
     pub publish: Option<String>,
     pub cadence_hours: Option<u64>,
     pub stuck_after_days: Option<u64>,

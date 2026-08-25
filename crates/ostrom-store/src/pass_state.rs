@@ -6,7 +6,7 @@ use crate::{StoreError, io_error, set_private_file_mode};
 pub struct PassState {
     pub role_id: String,
     pub wake: u64,
-    pub dispatchability_hash: Option<String>,
+    pub run_signature: Option<String>,
 }
 
 pub fn read_pass_state(root: &Path, role: &str) -> Result<Option<PassState>, StoreError> {
@@ -39,8 +39,14 @@ pub fn read_pass_state(root: &Path, role: &str) -> Result<Option<PassState>, Sto
             role: role.to_owned(),
             message: "wake counter must be an unsigned integer".to_owned(),
         })?;
-    let hash_path = root.join(format!("{role}-dispatchability-hash"));
-    let dispatchability_hash = if hash_path.exists() {
+    let signature_path = root.join(format!("{role}-run-signature"));
+    let legacy_path = root.join(format!("{role}-dispatchability-hash"));
+    let hash_path = if signature_path.exists() {
+        signature_path
+    } else {
+        legacy_path
+    };
+    let run_signature = if hash_path.exists() {
         let hash = fs::read_to_string(&hash_path)
             .map_err(|error| io_error("read dispatchability hash", &hash_path, error))?
             .trim_end()
@@ -52,7 +58,7 @@ pub fn read_pass_state(root: &Path, role: &str) -> Result<Option<PassState>, Sto
         {
             return Err(StoreError::MalformedPassState {
                 role: role.to_owned(),
-                message: "dispatchability hash must be a lowercase SHA-256 digest".to_owned(),
+                message: "run signature must be a lowercase SHA-256 digest".to_owned(),
             });
         }
         Some(hash)
@@ -62,7 +68,7 @@ pub fn read_pass_state(root: &Path, role: &str) -> Result<Option<PassState>, Sto
     Ok(Some(PassState {
         role_id,
         wake,
-        dispatchability_hash,
+        run_signature,
     }))
 }
 
@@ -79,8 +85,8 @@ pub fn write_pass_state(root: &Path, role: &str, state: &PassState) -> Result<()
             message: "role id must be eight lowercase hexadecimal characters".to_owned(),
         });
     }
-    if let Some(hash) = &state.dispatchability_hash {
-        validate_dispatchability_hash(role, hash)?;
+    if let Some(hash) = &state.run_signature {
+        validate_run_signature(role, hash)?;
     }
     fs::create_dir_all(root).map_err(|error| io_error("create state directory", root, error))?;
     atomic_text(
@@ -91,16 +97,16 @@ pub fn write_pass_state(root: &Path, role: &str, state: &PassState) -> Result<()
         &root.join(format!("{role}-wake-counter")),
         &format!("{}\n", state.wake),
     )?;
-    if let Some(hash) = &state.dispatchability_hash {
+    if let Some(hash) = &state.run_signature {
         atomic_text(
-            &root.join(format!("{role}-dispatchability-hash")),
+            &root.join(format!("{role}-run-signature")),
             &format!("{hash}\n"),
         )?;
     }
     Ok(())
 }
 
-fn validate_dispatchability_hash(role: &str, hash: &str) -> Result<(), StoreError> {
+fn validate_run_signature(role: &str, hash: &str) -> Result<(), StoreError> {
     if hash.len() == 64
         && hash
             .chars()
@@ -110,7 +116,7 @@ fn validate_dispatchability_hash(role: &str, hash: &str) -> Result<(), StoreErro
     } else {
         Err(StoreError::MalformedPassState {
             role: role.to_owned(),
-            message: "dispatchability hash must be a lowercase SHA-256 digest".to_owned(),
+            message: "run signature must be a lowercase SHA-256 digest".to_owned(),
         })
     }
 }
@@ -151,7 +157,7 @@ mod tests {
         let expected = PassState {
             role_id: "0123abcd".to_owned(),
             wake: 9,
-            dispatchability_hash: Some(
+            run_signature: Some(
                 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
             ),
         };
@@ -172,7 +178,7 @@ mod tests {
             Some(PassState {
                 role_id: "0123abcd".to_owned(),
                 wake: 9,
-                dispatchability_hash: None,
+                run_signature: None,
             })
         );
     }

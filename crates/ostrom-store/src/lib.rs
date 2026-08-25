@@ -36,6 +36,7 @@ mod worktree;
 pub use agent::{
     ActionFault, AgentRegistry, AgentRunner, CodexHarness, Harness, ImplementerRunRequest,
     OrchestratorRunRequest, RunOutcome, RunRequest, RunTermination, RunnerLaunch,
+    configure_agent_process_group, wait_for_agent_child,
 };
 pub use app_token::{AppTokenError, CredentialCommandError, credential_output};
 pub use check_store::JsonlCheckStore;
@@ -67,7 +68,7 @@ pub use leaves::{
 pub use migration::{MigrationOutcome, migrate};
 pub use parity::{ParityError, SweepParityOptions, SweepParityOutcome, run_sweep_parity};
 pub use pass::{
-    MAX_TURNS as PASS_MAX_TURNS, PassError, PassRequest, PassRole, SignalFlags, run_pass,
+    MAX_TURNS as PASS_MAX_TURNS, PassDispatch, PassError, PassRequest, SignalFlags, run_pass,
 };
 pub use pass_state::{PassState, read_pass_state, write_pass_state};
 pub use paths::OstromPaths;
@@ -91,8 +92,8 @@ pub use queue::{
 pub use repair::{RepairOptions, RepairOutput, run_repair_prs};
 pub use replay::{ReplayError, ReplayOptions, replay};
 pub use selection::{
-    PlanApplication, SelectAction, SelectError, SelectOutcome, SelectRequest, encode_selection,
-    run_selection,
+    DispatchabilitySnapshot, PlanApplication, SelectAction, SelectError, SelectOutcome,
+    SelectRequest, dispatchability_snapshot, encode_selection, run_selection,
 };
 pub use sweep::{
     PublishTarget, RepositorySnapshot, RosterCoverageFinding, SweepError, SweepFixture, SweepMode,

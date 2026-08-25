@@ -14,7 +14,10 @@ use ostrom_core::{
     EvidenceBundleItem, JudgeStamp, JudgmentClause, JudgmentInput, JudgmentRunnerStamp,
     RecordedOutput, ResolvedCheck, agent_parameters, receipt_digest, resolve_check, select_check,
 };
-use ostrom_store::{AgentRunner, Harness, PASS_MAX_TURNS, RunOutcome, RunRequest};
+use ostrom_store::{
+    AgentRunner, Harness, PASS_MAX_TURNS, RunOutcome, RunRequest,
+    configure_agent_process_group, wait_for_agent_child,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -192,6 +195,7 @@ impl AgentRunner for ClaudeHarness {
             ])
             .stdout(Stdio::from(output))
             .stderr(Stdio::from(error_output));
+        configure_agent_process_group(&mut command);
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
@@ -201,10 +205,12 @@ impl AgentRunner for ClaudeHarness {
                 ));
             }
         };
-        match child.wait() {
-            Ok(status) => RunOutcome::Exited(status),
-            Err(error) => RunOutcome::Error(ActionFault::new("runner_io", Some(error.to_string()))),
-        }
+        wait_for_agent_child(
+            &mut child,
+            &request.signals,
+            request.supervisor_pid,
+            request.termination_grace,
+        )
     }
 }
 
@@ -843,6 +849,9 @@ checks:
             permission_mode: "auto".to_owned(),
             ceilings: ostrom_core::ResolvedLoopCeilings::default(),
             transcript,
+            signals: ostrom_store::SignalFlags::default(),
+            supervisor_pid: None,
+            termination_grace: std::time::Duration::from_secs(1),
         });
 
         let outcome =

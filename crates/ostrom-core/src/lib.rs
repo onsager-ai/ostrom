@@ -61,6 +61,7 @@ pub use policy::{
     PermissionMode, PolicyCandidate, PolicyDecision, PolicyManifest, PolicySelector,
     PolicySelectorError, PromptFileReference, PromptNamedReference, PromptResolutionError,
     PromptValue, ResolvedInput, ResolvedLoop, ResolvedLoopCeilings, RuleDecl, RuleDefaults,
+    RunSignatureDecl,
     SelectorFinding, SelectorMatch, SelectorPrefix, SelectorResolutionError, SelectorUniverse,
     StallDuration, StallDurationError, StepDecl, UnmatchedPolicy,
 };
