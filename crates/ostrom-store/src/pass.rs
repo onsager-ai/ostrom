@@ -44,9 +44,14 @@ impl PassRole {
             Self::Builder => {
                 include_str!("../assets/prompts/work.md")
             }
-            Self::Gatekeeper => {
-                include_str!("../assets/prompts/gatekeep.md")
-            }
+            // The gatekeeper drives the merge protocol once per candidate, so
+            // both halves are one prompt. They were two files only because
+            // Claude Code packaged them as two invocable skills.
+            Self::Gatekeeper => concat!(
+                include_str!("../assets/prompts/gatekeep.md"),
+                "\n\n",
+                include_str!("../assets/prompts/merge.md"),
+            ),
         }
     }
 }
