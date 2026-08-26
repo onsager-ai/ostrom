@@ -1050,3 +1050,59 @@ fn a_declared_actor_owns_the_pass_prompt_and_permission_mode() {
         "{derived}"
     );
 }
+
+#[test]
+fn init_produces_a_manifest_whose_edited_prompt_reaches_the_harness() {
+    // The point of `ostrom init` is that the prompt stops being a thing only a
+    // release can change. It writes what the binary ships as an editable file,
+    // and an edit signed into policy is what the next pass runs.
+    //
+    // Order matters: prompts are materialized into the manifest at signing
+    // time, so an edit made after signing is not covered by policy identity
+    // and would not take effect. init, edit, sign, run.
+    let fixture = Fixture::new("printf '%s\\n' \"$@\" >\"$OSTROM_TEST_ARGS\"");
+
+    let init = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .arg("init")
+        .env_clear()
+        .env("OSTROM_HOME", &fixture.state)
+        .env("PATH", env::var_os("PATH").unwrap_or_default())
+        .status()
+        .expect("run ostrom init");
+    assert!(init.success());
+
+    let manifest = fixture.state.join("ostrom.yaml");
+    let prompt = fixture.state.join("prompts/work.md");
+    assert!(manifest.is_file(), "init wrote no manifest");
+    assert!(
+        fs::read_to_string(&prompt)
+            .expect("read shipped prompt")
+            .contains("# Mandate Work"),
+        "init should write the prompt the binary ships"
+    );
+
+    fs::write(
+        &prompt,
+        "# Edited By The Operator\n\nDo the edited thing.\n",
+    )
+    .expect("edit the builder prompt");
+    let trusted_keys = support::sign_manifest(&manifest);
+
+    let arguments = fixture.root.path().join("init-arguments");
+    assert!(
+        fixture
+            .command()
+            .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
+            .env("OSTROM_TEST_ARGS", &arguments)
+            .status()
+            .expect("run builder pass")
+            .success()
+    );
+
+    let args = fs::read_to_string(&arguments).expect("read arguments");
+    assert!(args.contains("# Edited By The Operator"), "{args}");
+    assert!(!args.contains("# Mandate Work"), "{args}");
+    // The actor declares `auto`, which is also the builder's shipped default;
+    // asserting it confirms the actor was read rather than merely defaulted.
+    assert!(args.contains("--permission-mode\nauto\n"), "{args}");
+}

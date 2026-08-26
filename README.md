@@ -154,6 +154,28 @@ packages cover Linux x64/arm64, macOS x64/arm64, and Windows x64.
 
 For a source checkout, `cargo install --path crates/ostrom-cli` is the fallback.
 
+### Adopting policy
+
+The binary ships the delivery prompts and permission modes it needs, so a
+fresh install runs without a manifest. `ostrom init` turns those defaults into
+authored policy:
+
+```sh
+ostrom init            # writes ~/.claude/ostrom/{ostrom.yaml,prompts/*.md}
+# edit prompts/work.md, then:
+ostrom sign --key-id <id> --key <private.pem> ~/.claude/ostrom/ostrom.yaml
+export OSTROM_POLICY_TRUSTED_KEYS=<directory holding <id>.pem>
+```
+
+It writes what the binary already ships, so adopting it changes nothing until
+you edit something. After that, `ostrom pass builder` and `ostrom pass
+gatekeeper` take their prompt, permission mode, and harness profile from the
+actor and grants declared there. Prompts are materialized into the manifest at
+signing time, so edit first, then sign.
+
+`ostrom init` refuses to overwrite an existing manifest or prompt; pass
+`--force` to replace one.
+
 ### Migration from the Claude Code plugin
 
 The `ostrom@ostrom` plugin and its marketplace are retired; the CLI is the only

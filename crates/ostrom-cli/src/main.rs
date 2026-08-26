@@ -252,6 +252,12 @@ enum Command {
         #[command(subcommand)]
         command: WorkOrderCommand,
     },
+    /// Write a starting operator policy manifest and its delivery prompts.
+    Init {
+        /// Overwrite an existing manifest and prompts.
+        #[arg(long)]
+        force: bool,
+    },
     /// Move legacy Claude-hosted data to XDG config and state roots.
     Migrate,
     /// Compare native output with recorded legacy evidence in scratch state.
@@ -927,6 +933,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         },
         Command::Lease { command } => run_lease_command(&paths, command, &clock)?,
         Command::WorkOrder { command } => run_work_order_command(&paths, command, &clock)?,
+        Command::Init { force } => {
+            run_init(&paths, force)?;
+        }
         Command::Migrate => {
             let legacy = legacy_home()?;
             match migrate(&legacy, &paths, clock.epoch_seconds())? {
@@ -2483,6 +2492,106 @@ fn resolve_pass_policy(
         }
     };
     (prompt, permission_mode, derived_settings)
+}
+
+/// The operator manifest `ostrom init` writes.
+///
+/// It declares what the binary would otherwise decide on its own: the two
+/// delivery actors, the operation each one runs, and the prompt that operation
+/// passes to a harness. Writing the prompts out as files rather than inlining
+/// them is the point — an operator edits `prompts/work.md`, re-signs, and the
+/// next builder pass runs the edited text, with the change carried by policy
+/// identity instead of a release.
+const DEFAULT_MANIFEST: &str = r#"# Operator policy for the delivery roles.
+#
+# `ostrom pass builder` and `ostrom pass gatekeeper` resolve their prompt and
+# permission mode from the actor declared here. Until this manifest is signed
+# and trusted, both fall back to what the binary ships -- which is exactly the
+# text in ./prompts, so adopting this file changes nothing until you edit it.
+#
+# Sign it with:
+#   ostrom sign --key-id <id> --key <private.pem> ostrom.yaml
+manifest_version: 1
+
+actors:
+  builder:
+    description: Writes work orders and dispatches implementers, unattended.
+    permission_mode: auto
+  gatekeeper:
+    description: Judges finished work. Acts only on confirmation.
+    permission_mode: manual
+
+operations:
+  build-pass:
+    description: One builder pass over the portfolio queue.
+    steps:
+      - uses: agent/claude
+        with:
+          prompt: {from: ./prompts/work.md}
+  gate-pass:
+    description: One gatekeeper pass over open pull requests.
+    steps:
+      - uses: agent/claude
+        with:
+          prompt: {from: ./prompts/gatekeep.md}
+
+# A grant binds an actor to an operation. The profile each pass hands its
+# harness is derived from these, so widening a role is an edit here.
+grants:
+  builder-build:
+    actors: builder
+    operations: build-pass
+  gatekeeper-gate:
+    actors: gatekeeper
+    operations: gate-pass
+"#;
+
+/// Write a starting operator manifest and the prompts it references.
+fn run_init(paths: &OstromPaths, force: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let manifest = paths.config.join("ostrom.yaml");
+    let prompts = paths.config.join("prompts");
+    let files: [(PathBuf, &str); 3] = [
+        (manifest.clone(), DEFAULT_MANIFEST),
+        (prompts.join("work.md"), PassRole::Builder.default_prompt()),
+        (
+            prompts.join("gatekeep.md"),
+            PassRole::Gatekeeper.default_prompt(),
+        ),
+    ];
+
+    // Refuse rather than overwrite: this file is the operator's authored
+    // policy once they have touched it, and a silent clobber of a signed
+    // manifest is not something a convenience command should be able to do.
+    if !force {
+        let existing = files
+            .iter()
+            .filter(|(path, _)| path.exists())
+            .map(|(path, _)| path.display().to_string())
+            .collect::<Vec<_>>();
+        if !existing.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "refusing to overwrite {}; pass --force to replace",
+                    existing.join(", ")
+                ),
+            )
+            .into());
+        }
+    }
+
+    fs::create_dir_all(&prompts)?;
+    for (path, contents) in &files {
+        fs::write(path, contents)?;
+        println!("wrote {}", path.display());
+    }
+    println!();
+    println!("Next: sign it, then point OSTROM_POLICY_TRUSTED_KEYS at the public key.");
+    println!(
+        "  ostrom sign --key-id <id> --key <private.pem> {}",
+        manifest.display()
+    );
+    Ok(())
 }
 
 fn default_claude_bin() -> PathBuf {
