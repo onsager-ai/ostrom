@@ -52,12 +52,12 @@ text as the agent prompt. They are compiled into the binary with `include_str!`,
 so a prompt change ships with the release that carries it — there is no separate
 cache key to keep in step, and no installed plugin for a session to fall behind.
 
-### Shell implementation freeze
+### Shell implementation retired
 
-The retired shell implementation must not return: new behaviour
-belongs in `crates/`, while deletions from the shell are always welcome. A
-small defect fix that must grow a shell file needs the `bash-bugfix` pull
-request label. Issue #263 tracks removing the shell implementation entirely.
+The shell implementation is gone, and with it the `check shell-retirement`
+guard that counted what was left of it. New behaviour belongs in `crates/`.
+The three `.sh` files that remain are npm packaging and test fixtures, not
+implementation.
 
 ### Rust CLI (phase 2)
 
@@ -442,28 +442,28 @@ repo rules sees output byte-identical to the shipped file alone. Each layer
 that fires is preceded by an HTML-comment provenance marker naming the file
 it came from.
 
-Unlike the touch config, there is **no org `extends:` hop for rules yet** —
-rules have no fetch story, so a shared org constitution isn't a thing this
-repo ships. The same secret-vs-shareable split still applies: your actual
-rules are yours, not shippable, and belong in `~/.claude/ostrom/rules.md` (or
-a private repo layer) — **outside this repo**, same as the touch config's
-`secrets.yaml`. See the rules format below for the
-format (a `##` rule heading, body, then a `Source:`/`Preconditions:` HTML
-comment — match `frozen-rules.md`'s own style).
+There is **no org `extends:` hop for rules** — rules have no fetch story, so a
+shared org constitution isn't a thing this repo ships. Your actual rules are
+yours, not shippable, and belong in `~/.claude/ostrom/rules.md` (or a private
+repo layer) — **outside this repo**. Match `frozen-rules.md`'s own style: a
+`##` rule heading, body, then a `Source:`/`Preconditions:` HTML comment.
+
+The shipped layer is compiled into the binary, so the base constitution is
+present under any harness and on a machine that installed no plugin.
+`OSTROM_PLUGIN_ROOT` still overrides it, for a fixture or a fork.
 
 ## Doctor
 
-`ostrom doctor` is the native Rust prober. It reports on
-CLI installation/version/launcher safety,
-rules layering, touch durability and provider reachability, dispatch source
-roots, trace/lease/work-order health, recurring delivery passes, publish
-freshness, environment shape, and the supported config parser shape.
+`ostrom doctor` is the native Rust prober. It reports on CLI
+installation/version/launcher safety, dispatch source roots,
+trace/lease/work-order health, recurring delivery passes, publish freshness,
+environment shape, and the supported config parser shape.
 
 It exists because silent degradation is the actual failure mode here, not
 a crash. The SessionStart hook injects the shipped rules and nothing else
-when no user layer is present, and looks exactly like it's working. Nothing errors
-— touches just never reach another machine, or a documented bootstrap
-one-liner 404s for months because nothing ever checked. `ostrom doctor` is the
+when no user layer is present, and looks exactly like it's working. Nothing
+errors — a documented bootstrap one-liner 404s for months because nothing
+ever checked. `ostrom doctor` is the
 thing that checks: read-only against your configuration and state, and turns
 each of those silent states into an `OK` / `WARN` / `FAIL` line with a
 concrete remedy.

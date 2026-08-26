@@ -549,7 +549,7 @@ fn after_lease(
         &state_environment,
         "--setenv",
         &format!(
-            "CLAUDE_PLUGIN_ROOT={}",
+            "OSTROM_PLUGIN_ROOT={}",
             context.request.plugin_root.display()
         ),
         "--setenv",

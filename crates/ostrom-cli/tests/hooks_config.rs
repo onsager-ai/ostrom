@@ -21,7 +21,7 @@ fn session_start_constitution_matches_the_retired_shell_bytes() {
     let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
         .args(["hook", "session-start"])
         .env("OSTROM_HOME", &user)
-        .env("CLAUDE_PLUGIN_ROOT", &plugin)
+        .env("OSTROM_PLUGIN_ROOT", &plugin)
         .env("HOME", &home)
         .current_dir(&repository)
         .output()

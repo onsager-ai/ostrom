@@ -16,8 +16,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use directories::BaseDirs;
 use ostrom_checks::{
     ActionFault, ActionRegistry, ClaudeHarness, DoctorOptions, PreparedCheck,
-    check_shell_retirement, generate_operation_settings, render_loop_units, run_doctor,
-    run_doctor_check,
+    generate_operation_settings, render_loop_units, run_doctor, run_doctor_check,
 };
 use ostrom_core::{
     CHECK_STORE_SCHEMA_VERSION, CHECKS_VERSION, Catalogue, CatalogueEnumeration,
@@ -325,8 +324,6 @@ enum Command {
 enum CheckCommand {
     /// Execute authored criteria and append their receipts to the check journal.
     Run,
-    /// Prevent shell implementation files from reappearing.
-    ShellRetirement,
 }
 
 #[derive(Debug, Subcommand)]
@@ -684,7 +681,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let cwd = env::current_dir()?;
             let plugin_root = environment::OSTROM_PLUGIN_ROOT
                 .value_os()
-                .or_else(|| environment::CLAUDE_PLUGIN_ROOT.value_os())
                 .map_or_else(|| cwd.join("plugins/ostrom"), PathBuf::from);
             let resolutions = resolve_plan_checks(&paths, &cwd, &plugin_root)?;
             if let Some(fault) = &resolutions.catalogue_fault {
@@ -708,15 +704,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("warning: {warning}");
             }
             if outcome.failed != 0 || outcome.blocked != 0 || outcome.faulted != 0 {
-                std::process::exit(1);
-            }
-        }
-        Command::Check {
-            command: CheckCommand::ShellRetirement,
-        } => {
-            let report = check_shell_retirement(&env::current_dir()?)?;
-            if !report.is_clean() {
-                eprintln!("{report}");
                 std::process::exit(1);
             }
         }
@@ -784,9 +771,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Hook { command } => match command {
             HookCommand::SessionStart => {
                 let cwd = env::current_dir().unwrap_or_default();
-                let plugin_root = environment::CLAUDE_PLUGIN_ROOT
+                // An override only; with none, the shipped rules compiled
+                // into the binary are the base layer.
+                let plugin_root = environment::OSTROM_PLUGIN_ROOT
                     .value_os()
-                    .map_or_else(|| cwd.join("plugins/ostrom"), PathBuf::from);
+                    .map_or_else(PathBuf::new, PathBuf::from);
                 let home = environment::HOME
                     .value_os()
                     .map_or_else(PathBuf::new, PathBuf::from);
@@ -968,7 +957,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let executable = env::current_exe()?;
             let plugin_root = environment::OSTROM_PLUGIN_ROOT
                 .value_os()
-                .or_else(|| environment::CLAUDE_PLUGIN_ROOT.value_os())
                 .map_or_else(|| cwd.join("plugins/ostrom"), PathBuf::from);
             let options = SweepParityOptions::from_environment(
                 cwd,
@@ -1009,7 +997,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let cwd = env::current_dir()?;
             let plugin_root = environment::OSTROM_PLUGIN_ROOT
                 .value_os()
-                .or_else(|| environment::CLAUDE_PLUGIN_ROOT.value_os())
                 .map_or_else(|| cwd.join("plugins/ostrom"), PathBuf::from);
             let options = cutover_replay::CutoverReplayOptions {
                 scratch_root: cutover_replay::scratch_home_from_environment()?,
@@ -1066,7 +1053,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let executable = env::current_exe()?;
             let plugin_root = environment::OSTROM_PLUGIN_ROOT
                 .value_os()
-                .or_else(|| environment::CLAUDE_PLUGIN_ROOT.value_os())
                 .map_or_else(|| cwd.join("plugins/ostrom"), PathBuf::from);
             let policy = policy_manifest::load_optional_bundle(&paths, &cwd)?;
             let outcome = run_sweep(&SweepOptions {
@@ -1099,7 +1085,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let executable = env::current_exe()?;
             let plugin_root = environment::OSTROM_PLUGIN_ROOT
                 .value_os()
-                .or_else(|| environment::CLAUDE_PLUGIN_ROOT.value_os())
                 .map_or_else(|| cwd.join("plugins/ostrom"), PathBuf::from);
             let policy = policy_manifest::load_optional_bundle(&paths, &cwd)?;
             let check_resolutions = resolve_plan_checks(&paths, &cwd, &plugin_root)?;
@@ -1384,7 +1369,6 @@ fn dispatch_resolved_loop(
     let working_directory = env::current_dir()?;
     let plugin_root = environment::OSTROM_PLUGIN_ROOT
         .value_os()
-        .or_else(|| environment::CLAUDE_PLUGIN_ROOT.value_os())
         .map_or_else(|| working_directory.join("plugins/ostrom"), PathBuf::from);
     let selector_prefixes =
         operation_selector_prefixes(manifest, &resolved.actor, &invocation.name);
@@ -1414,7 +1398,6 @@ fn run_operation_command(
     let working_directory = env::current_dir()?;
     let plugin_root = ostrom_store::environment::OSTROM_PLUGIN_ROOT
         .value_os()
-        .or_else(|| ostrom_store::environment::CLAUDE_PLUGIN_ROOT.value_os())
         .map_or_else(|| working_directory.join("plugins/ostrom"), PathBuf::from);
     let selector_prefixes = operation_selector_prefixes(&manifest, &actor, &invocation.name);
     let mut runtime = CliOperationRuntime {
@@ -2540,7 +2523,6 @@ fn run_implement_worker(
     });
     let plugin_root = environment::OSTROM_PLUGIN_ROOT
         .value_os()
-        .or_else(|| environment::CLAUDE_PLUGIN_ROOT.value_os())
         .map_or_else(|| working_directory.join("plugins/ostrom"), PathBuf::from);
     let request = ImplementRequest {
         paths: compatible_command_paths(),
@@ -2576,7 +2558,6 @@ fn run_dispatch_command(arguments: Vec<String>, clock: Clock) -> ! {
     });
     let plugin_root = environment::OSTROM_PLUGIN_ROOT
         .value_os()
-        .or_else(|| environment::CLAUDE_PLUGIN_ROOT.value_os())
         .map_or_else(|| working_directory.join("plugins/ostrom"), PathBuf::from);
     let request = DispatchRequest {
         paths: compatible_command_paths(),
@@ -2673,7 +2654,6 @@ fn run_doctor_command(
     let cwd = env::current_dir()?;
     let plugin_root = environment::OSTROM_PLUGIN_ROOT
         .value_os()
-        .or_else(|| environment::CLAUDE_PLUGIN_ROOT.value_os())
         .map_or_else(|| cwd.join("plugins/ostrom"), PathBuf::from);
     let options = DoctorOptions::from_environment_at(plugin_root, clock.epoch_seconds());
     let output = if let Some(name) = check {
@@ -3051,19 +3031,6 @@ mod tests {
             parsed.command,
             Command::Check {
                 command: CheckCommand::Run
-            }
-        ));
-    }
-
-    #[test]
-    fn parses_shell_retirement_check() {
-        let parsed = Cli::try_parse_from(["ostrom", "check", "shell-retirement"])
-            .expect("parse shell retirement check");
-
-        assert!(matches!(
-            parsed.command,
-            Command::Check {
-                command: CheckCommand::ShellRetirement
             }
         ));
     }

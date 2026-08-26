@@ -212,7 +212,7 @@ impl Fixture {
             .env("HOME", self.root.path())
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env(
-                "CLAUDE_PLUGIN_ROOT",
+                "OSTROM_PLUGIN_ROOT",
                 env!("CARGO_MANIFEST_DIR")
                     .replace("crates/ostrom-cli", "crates/ostrom-store/assets"),
             )

@@ -111,7 +111,7 @@ impl DispatchFixture {
             .env_remove("OSTROM_HOME")
             .env_remove("CLAUDE_CONFIG_DIR")
             .env("HOME", &self.home)
-            .env("CLAUDE_PLUGIN_ROOT", plugin_root())
+            .env("OSTROM_PLUGIN_ROOT", plugin_root())
             .env("MANDATE_IMPLEMENTER_SOURCE_REPO", &self.source)
             .env("MANDATE_GH_AS_BIN", &self.gh_as)
             .env("MANDATE_SYSTEMD_RUN_BIN", &self.systemd_run)

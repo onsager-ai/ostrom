@@ -23,12 +23,6 @@ pub const DOCTOR_CHECKS: &[&str] = &[
     "cli-installed",
     "cli-version",
     "cli-launcher",
-    "plugin",
-    "marketplace",
-    "plugin-cache-drift",
-    "rules-layers",
-    "touch-durability",
-    "provider-reachable",
     "dispatch-source-roots",
     "trace-lease",
     "trace-completeness",
@@ -152,7 +146,6 @@ fn sanitize(value: &str) -> String {
 struct DoctorContext {
     options: DoctorOptions,
     trace: TraceFile,
-    marketplace: Option<MarketplaceInspection>,
 }
 
 #[derive(Clone)]
@@ -173,11 +166,7 @@ impl DoctorContext {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => TraceFile::Missing,
             Err(_) => TraceFile::Unreadable,
         };
-        Self {
-            options,
-            trace,
-            marketplace: None,
-        }
+        Self { options, trace }
     }
 
     fn env(&self, name: &str) -> Option<&OsStr> {
@@ -197,12 +186,6 @@ impl DoctorContext {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         command
-    }
-
-    fn git(&self, cwd: &Path, arguments: &[&str]) -> Option<Output> {
-        let mut command = self.command("git");
-        command.arg("-C").arg(cwd).args(arguments);
-        command.output().ok()
     }
 }
 
@@ -236,12 +219,6 @@ fn run_named_check(context: &mut DoctorContext, name: &str) -> DoctorResult {
         "cli-installed" => check_cli_installed(context),
         "cli-version" => check_cli_version(context),
         "cli-launcher" => check_cli_launcher(context),
-        "plugin" => check_plugin(context),
-        "marketplace" => inspect_marketplace(context).result,
-        "plugin-cache-drift" => check_plugin_cache_drift(context),
-        "rules-layers" => check_rules_layers(context),
-        "touch-durability" => check_touch_durability(context),
-        "provider-reachable" => check_provider_reachable(context),
         "dispatch-source-roots" => check_dispatch_source_roots(context),
         "trace-lease" => check_trace_lease(context),
         "trace-completeness" => check_trace_completeness(context),
@@ -591,47 +568,6 @@ fn valid_numeric_identifier(value: &str) -> bool {
         && (value == "0" || !value.starts_with('0'))
 }
 
-fn compare_semver(left: &SemVer, right: &SemVer) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    let core = (left.major, left.minor, left.patch).cmp(&(right.major, right.minor, right.patch));
-    if core != Ordering::Equal {
-        return core;
-    }
-    match (left.prerelease.is_empty(), right.prerelease.is_empty()) {
-        (true, true) => return Ordering::Equal,
-        (true, false) => return Ordering::Greater,
-        (false, true) => return Ordering::Less,
-        (false, false) => {}
-    }
-    for (left_part, right_part) in left.prerelease.iter().zip(&right.prerelease) {
-        let order = match (left_part.parse::<u64>(), right_part.parse::<u64>()) {
-            (Ok(left_number), Ok(right_number)) => left_number.cmp(&right_number),
-            (Ok(_), Err(_)) => Ordering::Less,
-            (Err(_), Ok(_)) => Ordering::Greater,
-            (Err(_), Err(_)) => left_part.cmp(right_part),
-        };
-        if order != Ordering::Equal {
-            return order;
-        }
-    }
-    left.prerelease.len().cmp(&right.prerelease.len())
-}
-
-fn minimum_cli_version(context: &DoctorContext) -> Option<String> {
-    let source = fs::read_to_string(
-        context
-            .options
-            .plugin_root
-            .join(".claude-plugin/plugin.json"),
-    )
-    .ok()?;
-    serde_json::from_str::<Value>(&source)
-        .ok()?
-        .get("minimumCliVersion")?
-        .as_str()
-        .map(str::to_owned)
-}
-
 fn reported_version(output: &str) -> Option<String> {
     output.split_ascii_whitespace().find_map(|word| {
         let candidate = word.strip_prefix('v').unwrap_or(word);
@@ -647,22 +583,6 @@ fn check_cli_version(context: &DoctorContext) -> DoctorResult {
             "cli-version",
             "not checked because ostrom is absent",
             "",
-        );
-    };
-    let Some(required) = minimum_cli_version(context) else {
-        return DoctorResult::new(
-            DoctorStatus::Fail,
-            "cli-version",
-            "plugin manifest has no valid minimumCliVersion",
-            "repair the installed ostrom plugin manifest",
-        );
-    };
-    let Some(required_version) = parse_semver(&required) else {
-        return DoctorResult::new(
-            DoctorStatus::Fail,
-            "cli-version",
-            "plugin manifest has no valid minimumCliVersion",
-            "repair the installed ostrom plugin manifest",
         );
     };
     let executable = probe.native_path.as_ref().unwrap_or(resolved_path);
@@ -695,7 +615,13 @@ fn check_cli_version(context: &DoctorContext) -> DoctorResult {
             UPGRADE_COMMAND,
         );
     };
-    let Some(installed_version) = parse_semver(&installed) else {
+    // There is no version floor to test against any more: the plugin manifest
+    // that declared `minimumCliVersion` is retired, and the binary now carries
+    // its own prompts and defaults, so there is no second artifact that can be
+    // older than it. What remains worth probing is that the launcher runs at
+    // all and reports a version — the non-interactive failure that repeatedly
+    // broke systemd units.
+    if parse_semver(&installed).is_none() {
         return DoctorResult::new(
             DoctorStatus::Fail,
             "cli-version",
@@ -705,22 +631,13 @@ fn check_cli_version(context: &DoctorContext) -> DoctorResult {
             ),
             UPGRADE_COMMAND,
         );
-    };
-    if compare_semver(&installed_version, &required_version).is_lt() {
-        DoctorResult::new(
-            DoctorStatus::Fail,
-            "cli-version",
-            format!("installed ostrom CLI version {installed} is older than required {required}"),
-            UPGRADE_COMMAND,
-        )
-    } else {
-        DoctorResult::new(
-            DoctorStatus::Ok,
-            "cli-version",
-            format!("installed version {installed} satisfies required {required}"),
-            "",
-        )
     }
+    DoctorResult::new(
+        DoctorStatus::Ok,
+        "cli-version",
+        format!("installed version {installed}"),
+        "",
+    )
 }
 
 fn output_with_timeout(mut command: Command, timeout: std::time::Duration) -> Option<Output> {
@@ -786,669 +703,6 @@ fn check_cli_launcher(context: &DoctorContext) -> DoctorResult {
     )
 }
 
-fn plugin_json_field(source: &str, name: &str) -> String {
-    let marker = format!("\"{name}\"");
-    let Some(after_name) = source
-        .find(&marker)
-        .map(|index| &source[index + marker.len()..])
-    else {
-        return String::new();
-    };
-    let Some(after_colon) = after_name
-        .find(':')
-        .map(|index| after_name[index + 1..].trim_start())
-    else {
-        return String::new();
-    };
-    let Some(quoted) = after_colon.strip_prefix('"') else {
-        return String::new();
-    };
-    quoted
-        .find('"')
-        .map(|end| quoted[..end].to_owned())
-        .unwrap_or_default()
-}
-
-fn plugin_version_at(plugin_root: &Path) -> String {
-    fs::read_to_string(plugin_root.join(".claude-plugin/plugin.json"))
-        .map(|source| plugin_json_field(&source, "version"))
-        .unwrap_or_default()
-}
-
-#[derive(Clone)]
-struct PluginInstallation {
-    install_path: PathBuf,
-    loaded_version: String,
-    install_path_version: String,
-    registry_version: String,
-}
-
-enum PluginResolution {
-    MissingRegistry(PathBuf),
-    PluginAbsent,
-    Found(PluginInstallation),
-}
-
-fn resolve_plugin_installation(context: &DoctorContext) -> PluginResolution {
-    let installed_json = context
-        .options
-        .config_dir
-        .join("plugins/installed_plugins.json");
-    if !installed_json.is_file() {
-        return PluginResolution::MissingRegistry(installed_json);
-    }
-    let source = fs::read_to_string(&installed_json).unwrap_or_default();
-    let Some(marker) = source.find("\"ostrom@ostrom\"") else {
-        return PluginResolution::PluginAbsent;
-    };
-    // This deliberately preserves the old marker scanner: registry files have
-    // changed shape across Claude releases, while the entry-local fields have
-    // stayed stable.
-    let block = &source[marker..];
-    let install_path = PathBuf::from(plugin_json_field(block, "installPath"));
-    let recorded_version = plugin_json_field(block, "version");
-    let loaded_version = plugin_version_at(&context.options.plugin_root);
-    let install_path_version = plugin_version_at(&install_path);
-    let registry_version = if install_path_version.is_empty() {
-        recorded_version
-    } else {
-        install_path_version.clone()
-    };
-    PluginResolution::Found(PluginInstallation {
-        install_path,
-        loaded_version,
-        install_path_version,
-        registry_version,
-    })
-}
-
-fn check_plugin(context: &DoctorContext) -> DoctorResult {
-    let installation = match resolve_plugin_installation(context) {
-        PluginResolution::MissingRegistry(path) => {
-            return DoctorResult::new(
-                DoctorStatus::Fail,
-                "plugin",
-                format!("no installed_plugins.json at {}", path.display()),
-                "/plugin install ostrom@ostrom",
-            );
-        }
-        PluginResolution::PluginAbsent => {
-            return DoctorResult::new(
-                DoctorStatus::Fail,
-                "plugin",
-                "ostrom@ostrom not present in installed_plugins.json",
-                "/plugin install ostrom@ostrom",
-            );
-        }
-        PluginResolution::Found(installation) => installation,
-    };
-    match (
-        installation.loaded_version.as_str(),
-        installation.registry_version.as_str(),
-    ) {
-        (loaded, registry) if !loaded.is_empty() && !registry.is_empty() => {
-            if loaded == registry {
-                DoctorResult::new(
-                    DoctorStatus::Ok,
-                    "plugin",
-                    format!("installed, loaded version {loaded}"),
-                    "",
-                )
-            } else {
-                DoctorResult::new(
-                    DoctorStatus::Warn,
-                    "plugin",
-                    format!("installed, loaded version {loaded}, registry version {registry}"),
-                    "restart the session to reconcile the loaded plugin with the registry",
-                )
-            }
-        }
-        ("", registry) if !registry.is_empty() => {
-            let source = if installation.install_path_version.is_empty() {
-                "registry-recorded version"
-            } else {
-                "registry version"
-            };
-            DoctorResult::new(
-                DoctorStatus::Ok,
-                "plugin",
-                format!(
-                    "installed, version {registry} (loaded plugin.json not readable, using {source})"
-                ),
-                "",
-            )
-        }
-        (loaded, "") if !loaded.is_empty() => DoctorResult::new(
-            DoctorStatus::Warn,
-            "plugin",
-            format!("installed, loaded version {loaded}, registry version not readable"),
-            "restart the session to reconcile the loaded plugin with the registry",
-        ),
-        _ => DoctorResult::new(
-            DoctorStatus::Fail,
-            "plugin",
-            "ostrom@ostrom entry found but no version could be determined",
-            "/plugin install ostrom@ostrom",
-        ),
-    }
-}
-
-#[derive(Clone)]
-struct MarketplaceInspection {
-    directory: PathBuf,
-    clone_available: bool,
-    fetch_available: bool,
-    result: DoctorResult,
-}
-
-fn inspect_marketplace(context: &mut DoctorContext) -> MarketplaceInspection {
-    if let Some(inspection) = &context.marketplace {
-        return inspection.clone();
-    }
-    let known_json = context
-        .options
-        .config_dir
-        .join("plugins/known_marketplaces.json");
-    let marketplace_dir = context
-        .options
-        .config_dir
-        .join("plugins/marketplaces/ostrom");
-    let known_source = fs::read_to_string(&known_json).unwrap_or_default();
-    let inspection = if !known_json.is_file() || !json_key_present(&known_source, "ostrom") {
-        MarketplaceInspection {
-            directory: marketplace_dir,
-            clone_available: false,
-            fetch_available: false,
-            result: DoctorResult::new(
-                DoctorStatus::Fail,
-                "marketplace",
-                "ostrom not registered in known_marketplaces.json",
-                "/plugin marketplace add onsager-ai/ostrom",
-            ),
-        }
-    } else if !marketplace_dir.join(".git").is_dir() {
-        MarketplaceInspection {
-            directory: marketplace_dir.clone(),
-            clone_available: false,
-            fetch_available: false,
-            result: DoctorResult::new(
-                DoctorStatus::Fail,
-                "marketplace",
-                format!(
-                    "registered, but no cached clone at {}",
-                    marketplace_dir.display()
-                ),
-                "/plugin marketplace add onsager-ai/ostrom",
-            ),
-        }
-    } else {
-        inspect_marketplace_git(context, marketplace_dir)
-    };
-    context.marketplace = Some(inspection.clone());
-    inspection
-}
-
-fn json_key_present(source: &str, name: &str) -> bool {
-    let marker = format!("\"{name}\"");
-    source
-        .find(&marker)
-        .is_some_and(|index| source[index + marker.len()..].trim_start().starts_with(':'))
-}
-
-fn inspect_marketplace_git(context: &DoctorContext, directory: PathBuf) -> MarketplaceInspection {
-    let Some(fetch) = context.git(&directory, &["fetch", "origin", "main"]) else {
-        return marketplace_fetch_failed(directory, "failed to run git");
-    };
-    if !fetch.status.success() {
-        let text = format!(
-            "{}{}",
-            String::from_utf8_lossy(&fetch.stdout),
-            String::from_utf8_lossy(&fetch.stderr)
-        );
-        return marketplace_fetch_failed(directory, text.lines().next().unwrap_or_default());
-    }
-    if !git_success(
-        context,
-        &directory,
-        &["rev-parse", "--verify", "origin/main"],
-    ) {
-        return MarketplaceInspection {
-            directory,
-            clone_available: true,
-            fetch_available: true,
-            result: DoctorResult::new(
-                DoctorStatus::Warn,
-                "marketplace",
-                "fetched, but origin/main not found (default branch may differ)",
-                "",
-            ),
-        };
-    }
-    if git_success(
-        context,
-        &directory,
-        &["merge-base", "--is-ancestor", "HEAD", "origin/main"],
-    ) {
-        return MarketplaceInspection {
-            directory,
-            clone_available: true,
-            fetch_available: true,
-            result: DoctorResult::new(
-                DoctorStatus::Ok,
-                "marketplace",
-                "cached clone can fast-forward to origin/main",
-                "",
-            ),
-        };
-    }
-    if git_success(context, &directory, &["merge-base", "HEAD", "origin/main"]) {
-        return MarketplaceInspection {
-            directory,
-            clone_available: true,
-            fetch_available: true,
-            result: DoctorResult::new(
-                DoctorStatus::Warn,
-                "marketplace",
-                "cached clone has diverged from origin/main (shared history, not fast-forwardable)",
-                "/plugin marketplace update ostrom",
-            ),
-        };
-    }
-    MarketplaceInspection {
-        directory,
-        clone_available: true,
-        fetch_available: true,
-        result: DoctorResult::new(
-            DoctorStatus::Fail,
-            "marketplace",
-            "cached clone and origin/main have unrelated histories (marketplace was republished from a fresh history)",
-            "/plugin marketplace remove ostrom && /plugin marketplace add onsager-ai/ostrom",
-        ),
-    }
-}
-
-fn marketplace_fetch_failed(directory: PathBuf, detail: &str) -> MarketplaceInspection {
-    MarketplaceInspection {
-        directory,
-        clone_available: true,
-        fetch_available: false,
-        result: DoctorResult::new(
-            DoctorStatus::Warn,
-            "marketplace",
-            format!("cannot verify freshness, git fetch failed (offline?): {detail}"),
-            "",
-        ),
-    }
-}
-
-fn git_success(context: &DoctorContext, cwd: &Path, arguments: &[&str]) -> bool {
-    context
-        .git(cwd, arguments)
-        .is_some_and(|output| output.status.success())
-}
-
-const SHIPPED_DIRECTORIES: &[&str] = &["skills", "scripts", "hooks", "rules"];
-const MARKETPLACE_PLUGIN_ROOT: &str = "plugins/ostrom";
-
-#[derive(Clone, Eq, PartialEq)]
-struct Fingerprint {
-    mode: String,
-    object: String,
-}
-
-fn installed_files(plugin_root: &Path) -> std::io::Result<BTreeMap<String, Fingerprint>> {
-    let mut files = BTreeMap::new();
-    for directory in SHIPPED_DIRECTORIES {
-        let path = plugin_root.join(directory);
-        match fs::symlink_metadata(&path) {
-            Ok(_) => walk_installed(&path, directory, &mut files)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(files)
-}
-
-fn walk_installed(
-    path: &Path,
-    relative: &str,
-    files: &mut BTreeMap<String, Fingerprint>,
-) -> std::io::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.is_dir() {
-        if relative.split('/').any(|part| part == "node_modules") {
-            return Ok(());
-        }
-        for entry in fs::read_dir(path)? {
-            let entry = entry?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            walk_installed(&entry.path(), &format!("{relative}/{name}"), files)?;
-        }
-        return Ok(());
-    }
-    if !metadata.is_file() && !metadata.file_type().is_symlink() {
-        return Ok(());
-    }
-    let (mode, contents) = if metadata.file_type().is_symlink() {
-        (
-            "120000",
-            fs::read_link(path)?
-                .to_string_lossy()
-                .into_owned()
-                .into_bytes(),
-        )
-    } else {
-        (file_mode(&metadata), fs::read(path)?)
-    };
-    files.insert(
-        relative.to_owned(),
-        Fingerprint {
-            mode: mode.to_owned(),
-            object: git_blob_hash(&contents),
-        },
-    );
-    Ok(())
-}
-
-fn file_mode(metadata: &fs::Metadata) -> &'static str {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o111 != 0 {
-            "100755"
-        } else {
-            "100644"
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        "100644"
-    }
-}
-
-fn git_blob_hash(contents: &[u8]) -> String {
-    let mut source = format!("blob {}\0", contents.len()).into_bytes();
-    source.extend_from_slice(contents);
-    let digest = sha1(&source);
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn sha1(source: &[u8]) -> [u8; 20] {
-    let mut message = source.to_vec();
-    let bit_len = (message.len() as u64).wrapping_mul(8);
-    message.push(0x80);
-    while message.len() % 64 != 56 {
-        message.push(0);
-    }
-    message.extend_from_slice(&bit_len.to_be_bytes());
-    let mut state = [
-        0x6745_2301_u32,
-        0xefcd_ab89,
-        0x98ba_dcfe,
-        0x1032_5476,
-        0xc3d2_e1f0,
-    ];
-    for chunk in message.chunks_exact(64) {
-        let mut words = [0_u32; 80];
-        for (index, word) in words.iter_mut().take(16).enumerate() {
-            *word = u32::from_be_bytes(chunk[index * 4..index * 4 + 4].try_into().unwrap());
-        }
-        for index in 16..80 {
-            words[index] =
-                (words[index - 3] ^ words[index - 8] ^ words[index - 14] ^ words[index - 16])
-                    .rotate_left(1);
-        }
-        let [mut a, mut b, mut c, mut d, mut e] = state;
-        for (index, word) in words.iter().enumerate() {
-            let (function, constant) = match index {
-                0..=19 => ((b & c) | ((!b) & d), 0x5a82_7999),
-                20..=39 => (b ^ c ^ d, 0x6ed9_eba1),
-                40..=59 => ((b & c) | (b & d) | (c & d), 0x8f1b_bcdc),
-                _ => (b ^ c ^ d, 0xca62_c1d6),
-            };
-            let next = a
-                .rotate_left(5)
-                .wrapping_add(function)
-                .wrapping_add(e)
-                .wrapping_add(constant)
-                .wrapping_add(*word);
-            e = d;
-            d = c;
-            c = b.rotate_left(30);
-            b = a;
-            a = next;
-        }
-        for (slot, value) in state.iter_mut().zip([a, b, c, d, e]) {
-            *slot = slot.wrapping_add(value);
-        }
-    }
-    let mut digest = [0_u8; 20];
-    for (index, value) in state.iter().enumerate() {
-        digest[index * 4..index * 4 + 4].copy_from_slice(&value.to_be_bytes());
-    }
-    digest
-}
-
-fn marketplace_files(
-    context: &DoctorContext,
-    marketplace_dir: &Path,
-) -> Option<BTreeMap<String, Fingerprint>> {
-    let arguments = [
-        "ls-tree",
-        "-r",
-        "-z",
-        "HEAD",
-        "--",
-        "plugins/ostrom/skills",
-        "plugins/ostrom/scripts",
-        "plugins/ostrom/hooks",
-        "plugins/ostrom/rules",
-    ];
-    let output = context.git(marketplace_dir, &arguments)?;
-    if !output.status.success() {
-        return None;
-    }
-    let mut files = BTreeMap::new();
-    for record in output.stdout.split(|byte| *byte == 0) {
-        if record.is_empty() {
-            continue;
-        }
-        let source = String::from_utf8_lossy(record);
-        let Some((left, path)) = source.split_once('\t') else {
-            continue;
-        };
-        let fields = left.split_ascii_whitespace().collect::<Vec<_>>();
-        if fields.len() != 3 || fields[1] != "blob" {
-            continue;
-        }
-        let Some(relative) = path.strip_prefix(&format!("{MARKETPLACE_PLUGIN_ROOT}/")) else {
-            continue;
-        };
-        if relative.split('/').any(|part| part == "node_modules") {
-            continue;
-        }
-        files.insert(
-            relative.to_owned(),
-            Fingerprint {
-                mode: fields[0].to_owned(),
-                object: fields[2].to_owned(),
-            },
-        );
-    }
-    Some(files)
-}
-
-fn marketplace_version(context: &DoctorContext, marketplace_dir: &Path) -> String {
-    let Some(output) = context.git(
-        marketplace_dir,
-        &["show", "HEAD:plugins/ostrom/.claude-plugin/plugin.json"],
-    ) else {
-        return String::new();
-    };
-    if !output.status.success() {
-        return String::new();
-    }
-    plugin_json_field(&String::from_utf8_lossy(&output.stdout), "version")
-}
-
-fn check_plugin_cache_drift(context: &mut DoctorContext) -> DoctorResult {
-    let installation = match resolve_plugin_installation(context) {
-        PluginResolution::MissingRegistry(path) => {
-            return DoctorResult::new(
-                DoctorStatus::Warn,
-                "plugin-cache-drift",
-                format!(
-                    "cannot compare shipped files: installed plugin registry missing at {}",
-                    path.display()
-                ),
-                "/plugin install ostrom@ostrom",
-            );
-        }
-        PluginResolution::PluginAbsent => {
-            return DoctorResult::new(
-                DoctorStatus::Warn,
-                "plugin-cache-drift",
-                "cannot compare shipped files: ostrom@ostrom not present in installed plugin registry",
-                "/plugin install ostrom@ostrom",
-            );
-        }
-        PluginResolution::Found(installation) => installation,
-    };
-    let marketplace = inspect_marketplace(context);
-    if !marketplace.clone_available || !marketplace.fetch_available {
-        return DoctorResult::new(
-            DoctorStatus::Warn,
-            "plugin-cache-drift",
-            format!(
-                "cannot compare shipped files: {}",
-                marketplace.result.detail
-            ),
-            marketplace.result.remedy,
-        );
-    }
-    let installed_version = installation.registry_version;
-    let checkout_version = marketplace_version(context, &marketplace.directory);
-    if installed_version.is_empty() || checkout_version.is_empty() {
-        return DoctorResult::new(
-            DoctorStatus::Warn,
-            "plugin-cache-drift",
-            "cannot compare shipped files: installed or marketplace version is unreadable",
-            "reinstall ostrom@ostrom, then restart the session",
-        );
-    }
-    if installed_version != checkout_version {
-        return DoctorResult::new(
-            DoctorStatus::Warn,
-            "plugin-cache-drift",
-            format!(
-                "versions differ: installed cache {installed_version}, marketplace checkout {checkout_version}"
-            ),
-            "update and reinstall ostrom@ostrom, then restart the session",
-        );
-    }
-    let installed = match installed_files(&installation.install_path) {
-        Ok(files) => files,
-        Err(error) => {
-            return DoctorResult::new(
-                DoctorStatus::Warn,
-                "plugin-cache-drift",
-                format!("cannot read installed shipped files: {error}"),
-                "reinstall ostrom@ostrom, then restart the session",
-            );
-        }
-    };
-    let Some(checkout) = marketplace_files(context, &marketplace.directory) else {
-        return DoctorResult::new(
-            DoctorStatus::Warn,
-            "plugin-cache-drift",
-            "cannot read shipped files from the marketplace checkout's current commit",
-            "/plugin marketplace update ostrom",
-        );
-    };
-    let drift = file_differences(&installed, &checkout);
-    if drift.is_empty() {
-        DoctorResult::new(
-            DoctorStatus::Ok,
-            "plugin-cache-drift",
-            format!(
-                "version {installed_version} and shipped files agree with the marketplace checkout"
-            ),
-            "",
-        )
-    } else {
-        let shown = drift.iter().take(8).cloned().collect::<Vec<_>>();
-        let remaining = drift.len() - shown.len();
-        let summary = if remaining == 0 {
-            shown.join("; ")
-        } else {
-            format!("{}; plus {remaining} more", shown.join("; "))
-        };
-        DoctorResult::new(
-            DoctorStatus::Fail,
-            "plugin-cache-drift",
-            format!("version {installed_version} agrees but shipped files drift: {summary}"),
-            "update and reinstall ostrom@ostrom, then restart the session",
-        )
-    }
-}
-
-fn file_differences(
-    installed: &BTreeMap<String, Fingerprint>,
-    marketplace: &BTreeMap<String, Fingerprint>,
-) -> Vec<String> {
-    let paths = installed
-        .keys()
-        .chain(marketplace.keys())
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    paths
-        .into_iter()
-        .filter_map(
-            |path| match (installed.get(&path), marketplace.get(&path)) {
-                (None, Some(_)) => Some(format!("missing from installed cache: {path}")),
-                (Some(_), None) => Some(format!("only in installed cache: {path}")),
-                (Some(left), Some(right)) if left.object != right.object => {
-                    Some(format!("content differs: {path}"))
-                }
-                (Some(left), Some(right)) if left.mode != right.mode => {
-                    Some(format!("mode differs: {path}"))
-                }
-                _ => None,
-            },
-        )
-        .collect()
-}
-
-#[derive(Clone, Copy)]
-struct RuleLayers {
-    hook_wiring_missing: bool,
-    has_user: bool,
-    has_repo: bool,
-}
-
-fn compute_rules_layers(context: &DoctorContext) -> RuleLayers {
-    let hooks = context.options.plugin_root.join("hooks/hooks.json");
-    let wired =
-        fs::read_to_string(&hooks).is_ok_and(|text| text.contains("ostrom hook session-start"));
-    let shipped = context
-        .options
-        .plugin_root
-        .join("rules/frozen-rules.md")
-        .is_file();
-    if !wired || !shipped {
-        return RuleLayers {
-            hook_wiring_missing: true,
-            has_user: false,
-            has_repo: false,
-        };
-    }
-    RuleLayers {
-        hook_wiring_missing: false,
-        has_user: rule_layer_has_content(&context.options.config_dir.join("ostrom")),
-        has_repo: rule_layer_has_content(&context.options.cwd.join(".ostrom")),
-    }
-}
-
 fn rule_layer_has_content(root: &Path) -> bool {
     let mut files = vec![root.join("rules.md")];
     files.extend(
@@ -1472,54 +726,6 @@ fn rule_layer_has_content(root: &Path) -> bool {
         }
         text.chars().any(|character| !character.is_whitespace())
     })
-}
-
-fn check_rules_layers(context: &DoctorContext) -> DoctorResult {
-    let layers = compute_rules_layers(context);
-    if layers.hook_wiring_missing {
-        return DoctorResult::new(
-            DoctorStatus::Fail,
-            "rules-layers",
-            format!(
-                "hook wiring not found at {}",
-                context
-                    .options
-                    .plugin_root
-                    .join("hooks/hooks.json")
-                    .display()
-            ),
-            "reinstall the ostrom plugin",
-        );
-    }
-    let mut fired = vec!["shipped"];
-    if layers.has_user {
-        fired.push("user");
-    }
-    if layers.has_repo {
-        fired.push("repo");
-    }
-    let summary = if fired.len() == 1 {
-        "shipped only".to_owned()
-    } else {
-        fired.join(" + ")
-    };
-    let mut notes = Vec::new();
-    if context.options.config_dir.join("ostrom/rules.md").is_file() && !layers.has_user {
-        notes.push("user layer present but carries no rules yet (by design)");
-    }
-    if context.options.cwd.join(".ostrom/rules.md").is_file() && !layers.has_repo {
-        notes.push("repo layer present but carries no rules yet (by design)");
-    }
-    DoctorResult::new(
-        DoctorStatus::Ok,
-        "rules-layers",
-        if notes.is_empty() {
-            summary
-        } else {
-            format!("{summary} ({})", notes.join("; "))
-        },
-        "",
-    )
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1700,10 +906,6 @@ fn resolved_config(context: &DoctorContext, filename: &str) -> Config {
     [
         context
             .options
-            .plugin_root
-            .join(format!("config/{filename}")),
-        context
-            .options
             .config_dir
             .join(format!("ostrom/{filename}")),
         context.options.cwd.join(format!(".ostrom/{filename}")),
@@ -1712,216 +914,6 @@ fn resolved_config(context: &DoctorContext, filename: &str) -> Config {
     .fold(Config::new(), |config, path| {
         merge_config(config, load_config(path))
     })
-}
-
-struct TouchConfig {
-    provider: String,
-    path: String,
-    auto_commit: String,
-}
-
-fn resolve_touch_config(context: &DoctorContext) -> TouchConfig {
-    let config = resolved_config(context, "config.yaml");
-    let provider = config
-        .get("provider")
-        .map(scalar_string)
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "file".to_owned());
-    let file = match config.get("file") {
-        Some(ConfigValue::Mapping(file)) => file,
-        _ => &BTreeMap::new(),
-    };
-    let path = file
-        .get("path")
-        .map(scalar_string)
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "~/.claude/ostrom/touch-log.md".to_owned());
-    let auto_commit = file
-        .get("auto_commit")
-        .map(scalar_string)
-        .unwrap_or_else(|| "False".to_owned());
-    TouchConfig {
-        provider,
-        path,
-        auto_commit,
-    }
-}
-
-fn expand_tilde(path: &str, home: &Path) -> PathBuf {
-    if path == "~" {
-        home.to_owned()
-    } else if let Some(rest) = path.strip_prefix("~/") {
-        home.join(rest)
-    } else {
-        PathBuf::from(path)
-    }
-}
-
-fn inside_git(context: &DoctorContext, path: &Path) -> bool {
-    git_success(context, path, &["rev-parse", "--is-inside-work-tree"])
-}
-
-fn check_touch_durability(context: &DoctorContext) -> DoctorResult {
-    let config = resolve_touch_config(context);
-    let expanded_path = expand_tilde(&config.path, &context.options.home);
-    let (target_status, target_detail, target_remedy) = match config.provider.as_str() {
-        "notion" => (
-            DoctorStatus::Ok,
-            "provider notion (target is inherently shared)".to_owned(),
-            String::new(),
-        ),
-        "file" => {
-            let directory = parent_directory(&expanded_path);
-            if inside_git(context, directory) {
-                (
-                    DoctorStatus::Ok,
-                    format!(
-                        "file provider, {} is inside a git repo (auto_commit={})",
-                        expanded_path.display(),
-                        config.auto_commit
-                    ),
-                    String::new(),
-                )
-            } else {
-                (
-                    DoctorStatus::Warn,
-                    format!(
-                        "file provider, {} is NOT inside a git repo — touches logged here never reach another machine",
-                        expanded_path.display()
-                    ),
-                    "point file.path into a synced repo and set auto_commit: true, or switch provider".to_owned(),
-                )
-            }
-        }
-        provider => (
-            DoctorStatus::Warn,
-            format!("unknown provider '{provider}' (durability undetermined)"),
-            "check the resolved touch config's provider value".to_owned(),
-        ),
-    };
-    let user_config = context.options.config_dir.join("ostrom/config.yaml");
-    let (config_status, config_detail, config_remedy) = if fs::symlink_metadata(&user_config)
-        .is_ok_and(|metadata| metadata.file_type().is_symlink())
-    {
-        // A broken symlink is intentionally diagnosed as not versioned.
-        let target = fs::canonicalize(&user_config).unwrap_or_default();
-        if !target.as_os_str().is_empty() && inside_git(context, parent_directory(&target)) {
-            (
-                DoctorStatus::Ok,
-                "config.yaml is a symlink into a git repo (versioned, syncs across machines)"
-                    .to_owned(),
-                String::new(),
-            )
-        } else {
-            (
-                DoctorStatus::Warn,
-                "config.yaml is a symlink, but its target is not inside a git repo".to_owned(),
-                "version the symlink target in a private config repo".to_owned(),
-            )
-        }
-    } else if user_config.is_file() {
-        (
-            DoctorStatus::Warn,
-            "config.yaml is a plain machine-local file (will not sync across machines)".to_owned(),
-            format!(
-                "version it: move it into a private config repo and symlink it back to {}",
-                user_config.display()
-            ),
-        )
-    } else {
-        (
-            DoctorStatus::Ok,
-            "no user config.yaml present (shipped defaults only)".to_owned(),
-            String::new(),
-        )
-    };
-    let status = if target_status == DoctorStatus::Warn || config_status == DoctorStatus::Warn {
-        DoctorStatus::Warn
-    } else {
-        DoctorStatus::Ok
-    };
-    DoctorResult::new(
-        status,
-        "touch-durability",
-        format!("target: {target_detail} -- config: {config_detail}"),
-        [target_remedy, config_remedy]
-            .into_iter()
-            .filter(|value| !value.is_empty())
-            .collect::<Vec<_>>()
-            .join("; "),
-    )
-}
-
-fn check_provider_reachable(context: &DoctorContext) -> DoctorResult {
-    let config = resolve_touch_config(context);
-    let expanded_path = expand_tilde(&config.path, &context.options.home);
-    if config.provider == "notion" {
-        return DoctorResult::new(
-            DoctorStatus::Defer,
-            "provider-reachable",
-            "notion: MCP availability is a session property, not visible to a shell",
-            "",
-        );
-    }
-    if config.provider != "file" {
-        return DoctorResult::new(
-            DoctorStatus::Warn,
-            "provider-reachable",
-            format!("unknown provider '{}' (undetermined)", config.provider),
-            "",
-        );
-    }
-    let directory = parent_directory(&expanded_path).to_owned();
-    let mut existing = directory.clone();
-    while !existing.exists() && existing.parent().is_some() {
-        existing = existing.parent().unwrap().to_owned();
-    }
-    if writable(&existing) {
-        let detail = if existing == directory {
-            format!("file: {} is writable", directory.display())
-        } else {
-            format!(
-                "file: {} does not exist yet, nearest existing ancestor {} is writable",
-                directory.display(),
-                existing.display()
-            )
-        };
-        DoctorResult::new(DoctorStatus::Ok, "provider-reachable", detail, "")
-    } else {
-        DoctorResult::new(
-            DoctorStatus::Fail,
-            "provider-reachable",
-            format!(
-                "file: {} is not writable — /ostrom:touch cannot write its log",
-                existing.display()
-            ),
-            format!(
-                "fix permissions on {}, or point file.path elsewhere",
-                existing.display()
-            ),
-        )
-    }
-}
-
-fn parent_directory(path: &Path) -> &Path {
-    path.parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or(Path::new("."))
-}
-
-fn writable(path: &Path) -> bool {
-    let Ok(metadata) = fs::metadata(path) else {
-        return false;
-    };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o222 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        !metadata.permissions().readonly()
-    }
 }
 
 fn check_dispatch_source_roots(context: &DoctorContext) -> DoctorResult {
@@ -1972,7 +964,7 @@ fn trace_health(trace: &TraceFile, now: i64) -> Health {
             return Health {
                 status: DoctorStatus::Warn,
                 detail: "trace absent".to_owned(),
-                remedy: "run /ostrom:gatekeep and confirm it creates sprint.jsonl".to_owned(),
+                remedy: "run ostrom pass gatekeeper and confirm it creates sprint.jsonl".to_owned(),
             };
         }
         TraceFile::Unreadable => {
@@ -1996,7 +988,7 @@ fn trace_health(trace: &TraceFile, now: i64) -> Health {
         return Health {
             status: DoctorStatus::Warn,
             detail: "trace present but empty".to_owned(),
-            remedy: "run /ostrom:gatekeep and confirm it appends a complete pass".to_owned(),
+            remedy: "run ostrom pass gatekeeper and confirm it appends a complete pass".to_owned(),
         };
     }
     let line = source.rsplit_once('\n').map_or(source, |(_, line)| line);
@@ -2040,7 +1032,8 @@ fn trace_health(trace: &TraceFile, now: i64) -> Health {
         Health {
             status: DoctorStatus::Warn,
             detail: format!("trace stale, last {timestamp} (older than 24h)"),
-            remedy: "run /ostrom:gatekeep and confirm the recurring loop is active".to_owned(),
+            remedy: "run ostrom pass gatekeeper and confirm the recurring loop is active"
+                .to_owned(),
         }
     } else {
         Health {
@@ -2167,7 +1160,7 @@ fn check_trace_completeness(context: &DoctorContext) -> DoctorResult {
                 DoctorStatus::Warn,
                 "trace-completeness",
                 "no gatekeeper pass ever recorded",
-                "run /ostrom:gatekeep and confirm it records pass-ended",
+                "run ostrom pass gatekeeper and confirm it records pass-ended",
             );
         }
         TraceFile::Unreadable => {
@@ -2246,7 +1239,7 @@ fn check_trace_completeness(context: &DoctorContext) -> DoctorResult {
         DoctorStatus::Warn,
         "trace-completeness",
         "no completed gatekeeper pass ever recorded",
-        "run /ostrom:gatekeep and confirm it records matching pass-started and pass-ended rows",
+        "run ostrom pass gatekeeper and confirm it records matching pass-started and pass-ended rows",
     )
 }
 
@@ -2507,8 +1500,8 @@ impl DeliveryRole {
 
     fn skill(self) -> &'static str {
         match self {
-            Self::Builder => "/ostrom:work",
-            Self::Gatekeeper => "/ostrom:gatekeep",
+            Self::Builder => "ostrom pass builder",
+            Self::Gatekeeper => "ostrom pass gatekeeper",
         }
     }
 }
@@ -2741,7 +1734,7 @@ fn check_publish(context: &DoctorContext) -> DoctorResult {
 fn check_environment(context: &DoctorContext) -> DoctorResult {
     if context.env("CLAUDE_CODE_REMOTE").is_none() {
         DoctorResult::new(DoctorStatus::Ok, "environment", "local", "")
-    } else if compute_rules_layers(context).has_user {
+    } else if rule_layer_has_content(&context.options.config_dir.join("ostrom")) {
         DoctorResult::new(
             DoctorStatus::Ok,
             "environment",
@@ -2762,7 +1755,7 @@ fn check_config_parser() -> DoctorResult {
     DoctorResult::new(
         DoctorStatus::Ok,
         "config-parser",
-        "used the built-in ostrom-shape parser (top-level scalars, one level of nesting, inline lists, and comments; the values behind touch-durability/provider-reachable are authoritative for this supported config shape; a DEFER line is still resolved by the caller)",
+        "used the built-in ostrom-shape parser (top-level scalars, one level of nesting, inline lists, and comments; a DEFER line is still resolved by the caller)",
         "",
     )
 }
@@ -2781,7 +1774,7 @@ mod tests {
     use tempfile::{TempDir, tempdir};
 
     use super::{
-        DOCTOR_CHECKS, DoctorOptions, DoctorProvider, git_blob_hash, parse_ostrom_yaml, run_doctor,
+        DOCTOR_CHECKS, DoctorOptions, DoctorProvider, parse_ostrom_yaml, run_doctor,
         run_doctor_check,
     };
     use crate::ActionRegistry;
@@ -2858,14 +1851,6 @@ mod tests {
     }
 
     #[test]
-    fn git_blob_hash_matches_the_git_object_format() {
-        assert_eq!(
-            git_blob_hash(b"test content\n"),
-            "d670460b4b4aece5915caf5c68d12f560a9fe3e4"
-        );
-    }
-
-    #[test]
     fn supported_yaml_shape_preserves_python_style_booleans() {
         let parsed = parse_ostrom_yaml(
             "provider: file # note\nbuckets: [freezable, \"needs review\"]\nfile:\n  path: \"~/touch # literal.md\" # note\n  auto_commit: true\n",
@@ -2926,12 +1911,12 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn semantic_versions_compare_numerically() {
+    fn a_readable_version_passes_without_a_floor_to_compare_against() {
         let fixture = Fixture::new();
         fixture.executable("ostrom", "#!/bin/sh\nprintf 'ostrom 0.10.0\\n'\n");
         assert_eq!(
             run_doctor_check(fixture.options(), "cli-version").unwrap(),
-            "OK|cli-version|installed version 0.10.0 satisfies required 0.9.0|\n"
+            "OK|cli-version|installed version 0.10.0|\n"
         );
     }
 
@@ -3008,7 +1993,10 @@ mod tests {
     }
 
     #[test]
-    fn warn_and_defer_are_inconclusive() {
+    // No shipped check defers now that the touch provider probe is gone. The
+    // `Defer` mapping stays part of the status contract for a check that needs
+    // it, but nothing exercises it end to end.
+    fn warn_is_inconclusive() {
         let fixture = Fixture::new();
         let mut registry = ActionRegistry::new();
         registry
@@ -3020,19 +2008,6 @@ mod tests {
             .execute("warn-attempt");
         assert_eq!(warn.verdict, Some(CheckVerdict::Inconclusive));
         assert_eq!(warn.error, None);
-
-        fs::create_dir_all(fixture.config_dir.join("ostrom")).unwrap();
-        fs::write(
-            fixture.config_dir.join("ostrom/config.yaml"),
-            "provider: notion\n",
-        )
-        .unwrap();
-        let defer = registry
-            .prepare("doctor-fixture", &catalogue("provider-reachable"))
-            .unwrap()
-            .execute("defer-attempt");
-        assert_eq!(defer.verdict, Some(CheckVerdict::Inconclusive));
-        assert_eq!(defer.error, None);
     }
 
     #[test]
@@ -3050,31 +2025,20 @@ mod tests {
     fn isolated_machine_report_is_byte_exact() {
         let fixture = Fixture::new();
         let report = run_doctor(fixture.options());
-        let expected = format!(
-            concat!(
-                "FAIL|cli-installed|ostrom is not installed or is absent from PATH|npm install -g @ostrom/cli\n",
-                "OK|cli-version|not checked because ostrom is absent|\n",
-                "OK|cli-launcher|not checked because ostrom is absent|\n",
-                "FAIL|plugin|no installed_plugins.json at {config}/plugins/installed_plugins.json|/plugin install ostrom@ostrom\n",
-                "FAIL|marketplace|ostrom not registered in known_marketplaces.json|/plugin marketplace add onsager-ai/ostrom\n",
-                "WARN|plugin-cache-drift|cannot compare shipped files: installed plugin registry missing at {config}/plugins/installed_plugins.json|/plugin install ostrom@ostrom\n",
-                "FAIL|rules-layers|hook wiring not found at {plugin}/hooks/hooks.json|reinstall the ostrom plugin\n",
-                "WARN|touch-durability|target: file provider, {home}/.claude/ostrom/touch-log.md is NOT inside a git repo — touches logged here never reach another machine -- config: no user config.yaml present (shipped defaults only)|point file.path into a synced repo and set auto_commit: true, or switch provider\n",
-                "OK|provider-reachable|file: {home}/.claude/ostrom does not exist yet, nearest existing ancestor {home} is writable|\n",
-                "FAIL|dispatch-source-roots|search_roots is empty; dispatch cannot resolve source repositories|configure search_roots with a parent directory containing the roster checkouts\n",
-                "WARN|trace-lease|trace absent; lease idle|run /ostrom:gatekeep and confirm it creates sprint.jsonl\n",
-                "WARN|trace-completeness|no gatekeeper pass ever recorded|run /ostrom:gatekeep and confirm it records pass-ended\n",
-                "OK|work-orders|no work orders in flight|\n",
-                "OK|worktrees|count=0 total_bytes=0 ceiling_bytes=21474836480|\n",
-                "WARN|builder-pass|no builder pass ever recorded|run /ostrom:work and confirm it records pass-ended\n",
-                "WARN|gatekeeper-pass|no gatekeeper pass ever recorded|run /ostrom:gatekeep and confirm it records pass-ended\n",
-                "WARN|publish|no publish has been recorded|run ostrom sweep --publish-repository <owner/repo> and confirm the state branch is reachable\n",
-                "OK|environment|local|\n",
-                "OK|config-parser|used the built-in ostrom-shape parser (top-level scalars, one level of nesting, inline lists, and comments; the values behind touch-durability/provider-reachable are authoritative for this supported config shape; a DEFER line is still resolved by the caller)|\n"
-            ),
-            config = fixture.config_dir.display(),
-            plugin = fixture.plugin_root.display(),
-            home = fixture.home.display(),
+        let expected = concat!(
+            "FAIL|cli-installed|ostrom is not installed or is absent from PATH|npm install -g @ostrom/cli\n",
+            "OK|cli-version|not checked because ostrom is absent|\n",
+            "OK|cli-launcher|not checked because ostrom is absent|\n",
+            "FAIL|dispatch-source-roots|search_roots is empty; dispatch cannot resolve source repositories|configure search_roots with a parent directory containing the roster checkouts\n",
+            "WARN|trace-lease|trace absent; lease idle|run ostrom pass gatekeeper and confirm it creates sprint.jsonl\n",
+            "WARN|trace-completeness|no gatekeeper pass ever recorded|run ostrom pass gatekeeper and confirm it records pass-ended\n",
+            "OK|work-orders|no work orders in flight|\n",
+            "OK|worktrees|count=0 total_bytes=0 ceiling_bytes=21474836480|\n",
+            "WARN|builder-pass|no builder pass ever recorded|run ostrom pass builder and confirm it records pass-ended\n",
+            "WARN|gatekeeper-pass|no gatekeeper pass ever recorded|run ostrom pass gatekeeper and confirm it records pass-ended\n",
+            "WARN|publish|no publish has been recorded|run ostrom sweep --publish-repository <owner/repo> and confirm the state branch is reachable\n",
+            "OK|environment|local|\n",
+            "OK|config-parser|used the built-in ostrom-shape parser (top-level scalars, one level of nesting, inline lists, and comments; a DEFER line is still resolved by the caller)|\n"
         );
         assert_eq!(report, expected);
     }

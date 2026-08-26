@@ -45,7 +45,7 @@ fn shell_workflow_guard_calls_the_native_unbypassable_check() {
     let path = workspace_root().join(".github/workflows/test.yml");
     let source = fs::read_to_string(path).expect("read test workflow");
 
-    assert!(source.contains("target/debug/ostrom check shell-retirement"));
+    assert!(!source.contains("check shell-retirement"));
     // The plugin-surface check went out with the Claude Code plugin; the guard
     // now asserts CI does not resurrect it alongside the other retired jobs.
     assert!(!source.contains("check plugin-surface"));

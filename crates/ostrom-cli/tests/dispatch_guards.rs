@@ -174,7 +174,7 @@ exit 97
             .env("OSTROM_HOME", &self.state)
             .env("CLAUDE_CONFIG_DIR", &self.state)
             .env(
-                "CLAUDE_PLUGIN_ROOT",
+                "OSTROM_PLUGIN_ROOT",
                 workspace_root().join("crates/ostrom-store/assets"),
             )
             .env("MANDATE_IMPLEMENTER_SOURCE_REPO", &self.source)

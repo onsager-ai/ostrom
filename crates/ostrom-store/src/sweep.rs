@@ -1887,7 +1887,7 @@ fn queue_row(
             "dossier": {
                 "question": format!("May {}{} cross the matched mandate tripwire?", item.item.repo, item.item.reference),
                 "options_ruled_out": ["Auto-proceed — a tripwire requires human judgment."],
-                "recommended_action": format!("Review {}{}, then approve, reject, or defer it in /ostrom:desk.", item.item.repo, item.item.reference),
+                "recommended_action": format!("Review {}{}, then approve, reject, or defer it with `ostrom queue`.", item.item.repo, item.item.reference),
                 "blast_radius": format!("{}{} only.", item.item.repo, item.item.reference),
             }
         })

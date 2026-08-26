@@ -15,7 +15,6 @@ mod loop_units;
 mod operation_settings;
 mod process;
 mod registry;
-mod shell_retirement;
 
 pub use command::CommandProvider;
 pub use doctor::{
@@ -33,12 +32,11 @@ pub use loop_units::{
     loop_execstart_is_not_shell, render_loop_units,
 };
 pub use operation_settings::{
-    OperationSettingsDrift, OperationSettingsError, RoleSkillOperations, SkillOperationViolation,
-    check_operation_settings_drift, check_skill_operation_grants, generate_operation_settings,
+    OperationSettingsDrift, OperationSettingsError, check_operation_settings_drift,
+    generate_operation_settings,
 };
 pub use ostrom_store::{
     ActionFault, AgentRegistry, AgentRunner, CodexHarness, Harness, ImplementerRunRequest,
     OrchestratorRunRequest, RunOutcome, RunRequest, RunTermination, RunnerLaunch,
 };
 pub use registry::{ActionOutcome, ActionProvider, ActionRegistry, PreparedAction, PreparedCheck};
-pub use shell_retirement::{ShellFile, ShellRetirementReport, check_shell_retirement};
