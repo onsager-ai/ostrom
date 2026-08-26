@@ -1,12 +1,8 @@
----
-name: work
-description: Triage the portfolio queue one pass by verifying, writing durable
-  work orders, dispatching implementers, and reporting; this loop is the
-  builder's and must run in a builder session.
-argument-hint: "[optional queue focus, e.g. project name or item class]"
----
-
 # Mandate Work
+
+Triage the portfolio queue one pass by verifying, writing durable work orders,
+dispatching implementers, and reporting. This loop is the builder's and must run
+in a builder session.
 
 Triage the portfolio queue for one pass. Recurrence belongs to the external
 pass timer; never create or renew an in-session recurring wake. This pass ends
@@ -23,7 +19,7 @@ writes durable work orders, and dispatches implementers. It does not implement,
 review returned diffs, create implementation worktrees, or open pull requests
 in this pass. The one author-side maintenance exception is step 3's bounded
 repair of already-published builder pull requests. The implementer owns new
-work and `/ostrom:gatekeep` independently judges what it produces.
+work and the gatekeeper pass independently judges what it produces.
 
 When an implementer branch has diverged or conflicts, merge the published head
 forward and push ordinarily; never rebase or force-push, because the published
@@ -142,7 +138,7 @@ re-escalate it — re-raising a deferred item is noise, not diligence. Only a
 request. Report them as operational faults, but never select or dispatch them
 as new implementation work and never ask the principal to approve them.
 
-If the `/ostrom:work` invocation includes an optional focus, use that direct
+If this pass was started with an optional focus, use that direct
 invocation input as a natural-language filter over the queue, such as `one
 repository only` or `just tripwires`. Otherwise take items in this order:
 **pending tripwires and reserved refs → CI drift → open review threads on

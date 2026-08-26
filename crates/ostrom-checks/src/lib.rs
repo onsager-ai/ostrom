@@ -13,12 +13,8 @@ mod http;
 mod judgment;
 mod loop_units;
 mod operation_settings;
-mod plugin_surface;
 mod process;
 mod registry;
-mod role_allowlists;
-mod shell_retirement;
-mod skill_version_bump;
 
 pub use command::CommandProvider;
 pub use doctor::{
@@ -36,20 +32,11 @@ pub use loop_units::{
     loop_execstart_is_not_shell, render_loop_units,
 };
 pub use operation_settings::{
-    OperationSettingsDrift, OperationSettingsError, RoleSkillOperations, SkillOperationViolation,
-    check_operation_settings_drift, check_skill_operation_grants, generate_operation_settings,
+    OperationSettingsDrift, OperationSettingsError, check_operation_settings_drift,
+    generate_operation_settings,
 };
 pub use ostrom_store::{
     ActionFault, AgentRegistry, AgentRunner, CodexHarness, Harness, ImplementerRunRequest,
     OrchestratorRunRequest, RunOutcome, RunRequest, RunTermination, RunnerLaunch,
 };
-pub use plugin_surface::{PluginSurfaceReport, PluginSurfaceViolation, check_plugin_surface};
 pub use registry::{ActionOutcome, ActionProvider, ActionRegistry, PreparedAction, PreparedCheck};
-pub use role_allowlists::{
-    RoleAllowlistReport, RoleAllowlistViolation, check_modeled_role_allowlists,
-    check_role_allowlists,
-};
-pub use shell_retirement::{ShellFile, ShellRetirementReport, check_shell_retirement};
-pub use skill_version_bump::{
-    SkillVersionBumpError, SkillVersionBumpReport, VersionBumpViolation, check_skill_version_bump,
-};

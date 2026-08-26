@@ -11,6 +11,7 @@ use std::{
 };
 
 use chrono::DateTime;
+use ostrom_core::PermissionMode;
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 
@@ -23,6 +24,17 @@ use crate::{
 pub const MAX_TURNS: &str = "200";
 const DEFAULT_DAILY_CAP_USD: f64 = 50.0;
 const DEFAULT_LEASE_TTL_SECONDS: u64 = 3_600;
+
+/// Render a permission mode as the flag value the Claude harness expects.
+///
+/// The mapping lives here rather than on the policy type because it is one
+/// harness's spelling of the concept, not the concept itself.
+const fn permission_mode_flag(mode: PermissionMode) -> &'static str {
+    match mode {
+        PermissionMode::Auto => "auto",
+        PermissionMode::Manual => "manual",
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PassRole {
@@ -39,21 +51,42 @@ impl PassRole {
         }
     }
 
-    const fn prompt(self) -> &'static str {
+    /// The prompt this build ships for the role.
+    ///
+    /// This is the floor, not the source of truth: a repository or operator
+    /// manifest that declares the role's operation supplies the prompt
+    /// instead, so changing what an agent is told is a policy edit rather
+    /// than a release. The embedded copy is what runs when nothing is
+    /// declared, which keeps an ungoverned repository working.
+    #[must_use]
+    pub const fn default_prompt(self) -> &'static str {
         match self {
             Self::Builder => {
-                include_str!("../../../plugins/ostrom/skills/work/SKILL.md")
+                include_str!("../assets/prompts/work.md")
             }
-            Self::Gatekeeper => {
-                include_str!("../../../plugins/ostrom/skills/gatekeep/SKILL.md")
-            }
+            // The gatekeeper drives the merge protocol once per candidate, so
+            // both halves are one prompt. They are two files only because the
+            // protocol is long enough to be worth reading on its own.
+            Self::Gatekeeper => concat!(
+                include_str!("../assets/prompts/gatekeep.md"),
+                "\n\n",
+                include_str!("../assets/prompts/merge.md"),
+            ),
         }
     }
+}
 
-    const fn permission_mode(self) -> &'static str {
+impl PassRole {
+    /// The permission mode this build ships for the role.
+    ///
+    /// Like the prompt, this is the floor: an actor declaration in policy
+    /// overrides it. The builder writes unattended; the gatekeeper judges and
+    /// must not act without confirmation.
+    #[must_use]
+    pub const fn default_permission_mode(self) -> PermissionMode {
         match self {
-            Self::Builder => "auto",
-            Self::Gatekeeper => "manual",
+            Self::Builder => PermissionMode::Auto,
+            Self::Gatekeeper => PermissionMode::Manual,
         }
     }
 
@@ -70,6 +103,16 @@ pub struct PassRequest {
     pub paths: OstromPaths,
     pub working_directory: PathBuf,
     pub role: PassRole,
+    /// The resolved prompt for this pass: policy-declared when the manifest
+    /// binds the role's operation, otherwise [`PassRole::default_prompt`].
+    pub prompt: String,
+    /// The resolved permission mode: the actor declaration when policy
+    /// supplies one, otherwise [`PassRole::default_permission_mode`].
+    pub permission_mode: PermissionMode,
+    /// The harness profile derived from the actor's policy grants, when policy
+    /// declares the actor. `None` falls back to the operator's hand-written
+    /// `roles/<role>.settings.json`.
+    pub derived_settings: Option<String>,
     pub claude_bin: PathBuf,
     pub signals: SignalFlags,
     pub supervisor_pid: Option<u32>,
@@ -338,19 +381,38 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
         .len();
 
     check_signal(request, &mut guard, None)?;
-    let settings = request
-        .paths
-        .state
-        .join("roles")
-        .join(format!("{}.settings.json", request.role.name()));
-    if !settings.is_file() {
-        guard.outcome = Some("failed".to_owned());
-        return Err(PassError::failed(
-            request.role,
-            format!("{} missing", settings.display()),
-            1,
-        ));
-    }
+    // A profile derived from the actor's policy grants wins over a
+    // hand-maintained file: the grant is the authorization, and a settings file
+    // beside it is a copy that can drift out of agreement with the policy it is
+    // supposed to express. The hand-written file remains the path for an
+    // operator who has adopted no policy.
+    let roles = request.paths.state.join("roles");
+    let settings = if let Some(derived) = &request.derived_settings {
+        let path = roles.join(format!("{}.derived.settings.json", request.role.name()));
+        if let Err(error) = fs::create_dir_all(&roles).and_then(|()| fs::write(&path, derived)) {
+            guard.outcome = Some("failed".to_owned());
+            return Err(PassError::failed(
+                request.role,
+                format!(
+                    "could not write derived role settings to {}: {error}",
+                    path.display()
+                ),
+                1,
+            ));
+        }
+        path
+    } else {
+        let path = roles.join(format!("{}.settings.json", request.role.name()));
+        if !path.is_file() {
+            guard.outcome = Some("failed".to_owned());
+            return Err(PassError::failed(
+                request.role,
+                format!("{} missing", path.display()),
+                1,
+            ));
+        }
+        path
+    };
     if !is_executable_file(&request.claude_bin) {
         guard.outcome = Some("failed".to_owned());
         return Err(PassError::failed(
@@ -420,13 +482,13 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
             "--settings",
             &settings.display().to_string(),
             "--permission-mode",
-            request.role.permission_mode(),
+            permission_mode_flag(request.permission_mode),
             "--output-format",
             "stream-json",
             "--verbose",
             "--max-turns",
             MAX_TURNS,
-            request.role.prompt(),
+            &request.prompt,
         ])
         .stdout(Stdio::from(output))
         .stderr(Stdio::from(error_output));

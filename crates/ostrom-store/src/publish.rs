@@ -1224,7 +1224,7 @@ mod tests {
         fs::create_dir_all(plugin.join("config")).expect("create plugin config");
         fs::write(
             plugin.join("config/publish-allowlist.json"),
-            include_str!("../../../plugins/ostrom/config/publish-allowlist.json"),
+            include_str!("../assets/publish-allowlist.json"),
         )
         .expect("write allowlist");
         let paths = OstromPaths {

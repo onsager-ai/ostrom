@@ -4,8 +4,6 @@ use ostrom_core::PolicyManifest;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::role_allowlists::invoked_subcommands;
-
 const SETTINGS_SCHEMA: &str = "https://json.schemastore.org/claude-code-settings.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,63 +131,6 @@ fn actor_has_grant(manifest: &PolicyManifest, actor: &str, operation: &str) -> b
     })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RoleSkillOperations {
-    pub actor: String,
-    pub skills: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SkillOperationViolation {
-    pub actor: String,
-    pub skill: String,
-    pub operation: String,
-    pub detail: String,
-}
-
-/// Validate only protocols explicitly enrolled in operation dispatch.
-///
-/// Existing skills remain on the legacy check until their human-approved
-/// migration; callers pass a binding here at the same step that ports a skill.
-#[must_use]
-pub fn check_skill_operation_grants(
-    plugin_root: &Path,
-    manifest: &PolicyManifest,
-    protocols: &[RoleSkillOperations],
-) -> Vec<SkillOperationViolation> {
-    let mut violations = Vec::new();
-    for protocol in protocols {
-        for skill in &protocol.skills {
-            let path = plugin_root.join("skills").join(skill).join("SKILL.md");
-            let Ok(source) = fs::read_to_string(&path) else {
-                violations.push(SkillOperationViolation {
-                    actor: protocol.actor.clone(),
-                    skill: skill.clone(),
-                    operation: String::new(),
-                    detail: format!("could not read migrated skill {}", path.display()),
-                });
-                continue;
-            };
-            for operation in invoked_subcommands(&source) {
-                if !manifest.operations.contains_key(&operation)
-                    || !actor_has_grant(manifest, &protocol.actor, &operation)
-                {
-                    violations.push(SkillOperationViolation {
-                        actor: protocol.actor.clone(),
-                        skill: skill.clone(),
-                        operation: operation.clone(),
-                        detail: format!(
-                            "skill {skill} invokes `ostrom {operation}` without a grant for actor `{}`",
-                            protocol.actor
-                        ),
-                    });
-                }
-            }
-        }
-    }
-    violations
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -197,10 +138,7 @@ mod tests {
     use ostrom_core::PolicyManifest;
     use tempfile::tempdir;
 
-    use super::{
-        RoleSkillOperations, check_operation_settings_drift, check_skill_operation_grants,
-        generate_operation_settings,
-    };
+    use super::{check_operation_settings_drift, generate_operation_settings};
 
     const POLICY: &str = "manifest_version: 1\nactors: {builder: {}, gatekeeper: {}}\noperations:\n  comment:\n    steps:\n      - uses: gh/post-verdict\n        with: {note: placeholder}\n  merge:\n    steps:\n      - uses: gh/merge-pr\n        requires: ready\ngrants:\n  builder-comment: {actors: builder, operations: comment}\n  gatekeeper-merge: {actors: gatekeeper, operations: merge}\n";
 
@@ -251,29 +189,5 @@ mod tests {
             check_operation_settings_drift(&manifest, "builder", &path).is_err(),
             "unknown fields are drift, not ignored"
         );
-    }
-
-    #[test]
-    fn migrated_skill_verb_without_an_authorising_grant_fails() {
-        let manifest = PolicyManifest::from_yaml(POLICY).expect("manifest");
-        let root = tempdir().expect("fixture");
-        let skill = root.path().join("skills/work");
-        fs::create_dir_all(&skill).expect("skill directory");
-        fs::write(
-            skill.join("SKILL.md"),
-            "```sh\nostrom merge placeholder\n```\n",
-        )
-        .expect("skill fixture");
-        let violations = check_skill_operation_grants(
-            root.path(),
-            &manifest,
-            &[RoleSkillOperations {
-                actor: "builder".to_owned(),
-                skills: vec!["work".to_owned()],
-            }],
-        );
-        assert_eq!(violations.len(), 1);
-        assert_eq!(violations[0].operation, "merge");
-        assert!(violations[0].detail.contains("without a grant"));
     }
 }

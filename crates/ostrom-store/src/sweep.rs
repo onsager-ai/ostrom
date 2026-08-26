@@ -45,7 +45,7 @@ pub(crate) const PR_REPAIR_CONFLICT_REASON_PREFIX: &str =
 /// A sweep only observes portfolio state, so acquisition credentials must not
 /// gain a write permission merely because publication can follow separately.
 const SWEEP_TOKEN_PERMISSIONS: &str = "metadata:read,issues:read,pull_requests:read,checks:read,statuses:read,actions:read,contents:read";
-const SHIPPED_DEFAULTS: &str = include_str!("../../../plugins/ostrom/config/mandate-defaults.yaml");
+const SHIPPED_DEFAULTS: &str = include_str!("../assets/mandate-defaults.yaml");
 const COVERAGE_FINDING: &str = "missing_policy_document_entry";
 const DELEGATED_WITHOUT_MERGE_GATE_FINDING: &str = "delegated_without_merge_gate";
 
@@ -1887,7 +1887,7 @@ fn queue_row(
             "dossier": {
                 "question": format!("May {}{} cross the matched mandate tripwire?", item.item.repo, item.item.reference),
                 "options_ruled_out": ["Auto-proceed — a tripwire requires human judgment."],
-                "recommended_action": format!("Review {}{}, then approve, reject, or defer it in /ostrom:desk.", item.item.repo, item.item.reference),
+                "recommended_action": format!("Review {}{}, then approve, reject, or defer it with `ostrom queue`.", item.item.repo, item.item.reference),
                 "blast_radius": format!("{}{} only.", item.item.repo, item.item.reference),
             }
         })
@@ -4614,7 +4614,7 @@ printf '{"repositories":[{"repo":"%s","issues":[],"open_prs":[],"merged_prs":[],
         fs::create_dir(home.path().join("config")).expect("create publisher config directory");
         fs::write(
             home.path().join("config/publish-allowlist.json"),
-            include_str!("../../../plugins/ostrom/config/publish-allowlist.json"),
+            include_str!("../assets/publish-allowlist.json"),
         )
         .expect("write publisher allowlist");
         let (queue_before, state_before) = write_prior_generation(home.path());

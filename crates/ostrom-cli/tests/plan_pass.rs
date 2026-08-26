@@ -1094,7 +1094,7 @@ projects:
     let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
         .args(["select-work", "list"])
         .env("CLAUDE_CONFIG_DIR", fixture.path())
-        .env("CLAUDE_PLUGIN_ROOT", root.join("plugins/ostrom"))
+        .env("OSTROM_PLUGIN_ROOT", root.join("plugins/ostrom"))
         .current_dir(fixture.path())
         .output()
         .expect("run selector");

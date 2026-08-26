@@ -159,8 +159,8 @@ shift 7
 exec "$@"
 "#,
     );
-    let allowlist = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../plugins/ostrom/config/publish-allowlist.json");
+    let allowlist =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../ostrom-store/assets/publish-allowlist.json");
     let output = run_sweep(&home, &fixture)
         .args(["--publish-repository", "placeholder-org/alpha"])
         .env("PATH", path_with(&bin))
@@ -242,8 +242,8 @@ shift 7
 exec "$@"
 "#,
     );
-    let allowlist = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../plugins/ostrom/config/publish-allowlist.json");
+    let allowlist =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../ostrom-store/assets/publish-allowlist.json");
     let output = run_sweep(&home, &fixture)
         .args(["--publish-repository", "placeholder-org/alpha"])
         .env("PATH", path_with(&bin))

@@ -1,10 +1,18 @@
 # Harness and App boundaries for delivery roles
 
-These are installation instructions for the principal. They are proposals,
-not repository-enforced policy, and nothing in this repository installs them.
-The principal creates the two role profiles below and launches each delivery
-role with its matching `--settings` file. The principal does not use either
-profile.
+`ostrom pass` no longer needs these instructions. A pass whose actor is
+declared in the operator manifest derives its own profile from that actor's
+grants and hands it to the harness, so the profiles below are a reference for
+what that derivation produces, and the hand-authored path for a role the
+manifest does not declare. The principal does not use either profile.
+
+**Deriving the profile is not the same as enforcing it.** The grant is now the
+single authored source, so a settings file can no longer drift out of agreement
+with the policy it expresses — but the resulting deny list is still evaluated by
+the harness, exactly as described below. Grants do reach binary-enforced
+territory elsewhere: `GateConfig::from_manifest` derives the merge gate's
+repository rules and required checks from the same grants and denies, and the
+gate refuses on them.
 
 The security model is deliberately split:
 
@@ -128,12 +136,10 @@ where an audit should look.
 
 ## Builder profile
 
-The principal puts this JSON at
-`~/.claude/ostrom/roles/builder.settings.json` and launches the builder with:
-
-```sh
-claude --settings ~/.claude/ostrom/roles/builder.settings.json
-```
+A declared actor gets this derived and written for it. To install it by hand
+for an undeclared role, put this JSON at
+`~/.claude/ostrom/roles/builder.settings.json`; `ostrom pass builder` reads
+that path when the manifest declares no `builder` actor.
 
 ```json
 {
@@ -354,28 +360,15 @@ That deny was never load-bearing anyway: it matches only the literal word
 `mutation` in the command string, so `--input`, `-F query=@file` and a
 whitespace change all pass it. It is kept for the builder as the same kind of
 visible-refusal defence as the rest of the list, and for no stronger reason.
+## Protocol ownership (#310, resolved)
 
-## Recommendation for protocol ownership (#310)
+This section used to recommend co-locating role settings with the protocol,
+because a command migration could otherwise ship while the unattended role was
+still unable to execute its first command — two separately maintained sources
+for one compatibility surface.
 
-Role settings should belong with the protocol as a canonical, reviewed
-definition, while each activated copy should remain machine-local. A skill and
-the command permissions needed to run it are one compatibility surface: when
-they live in separately maintained sources, a command migration can ship while
-the unattended role is unable to execute its first command. Co-locating the
-canonical definition makes that change atomic and lets repository checks reject
-a skill/permission gap before publication.
-
-This is a recommendation, not a settings move. The current
-`~/.claude/ostrom/roles/*.settings.json` files remain where they are, and this
-change does not alter either role's grants or how a grant is proposed or
-issued. Those authority and mechanism questions are deliberately left to
-#370.
-
-The compatibility guard lives in `ostrom check plugin-surface` because role
-commands are part of the same shipped skill/CLI surface that check already
-protects, and CI already runs it. Doctor and CI share one extractor: it reads
-executable `ostrom` calls from shell fences in the role's shipped skills, so
-the expected set follows protocol changes while prohibitions mentioned only in
-prose do not become accidental grants. A nested command below `ostrom
-credential --` is executed by that already-authorized wrapper and is not a
-second harness permission request.
+Grants resolve it. The grant is the canonical definition and the profile is
+derived from it, so the two cannot disagree and there is no gap for a check to
+police. The guard that did police it, `ostrom check plugin-surface`, read
+executable `ostrom` calls out of shell fences in the role's shipped skills;
+both it and those skills are gone.

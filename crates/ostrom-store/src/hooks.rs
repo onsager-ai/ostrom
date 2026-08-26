@@ -25,6 +25,10 @@ pub struct HookOutput {
     pub stderr: String,
 }
 
+/// The frozen rules this build ships, compiled in so the base constitution
+/// layer does not depend on an installed plugin tree.
+const SHIPPED_RULES: &str = include_str!("../assets/rules/frozen-rules.md");
+
 #[must_use]
 pub fn render_constitution(
     plugin_root: &Path,
@@ -36,8 +40,12 @@ pub fn render_constitution(
     collect_layer(&mut layers, "user", user_rules_root);
     collect_layer(&mut layers, "repo", &working_directory.join(".ostrom"));
 
-    let mut output =
-        fs::read_to_string(plugin_root.join("rules/frozen-rules.md")).unwrap_or_default();
+    // The shipped layer is compiled in. It used to be read out of an installed
+    // plugin tree, which meant the constitution silently lost its base layer on
+    // any machine that had not installed the plugin — including every non-Claude
+    // harness. An explicit override still wins, for a fixture or a fork.
+    let mut output = fs::read_to_string(plugin_root.join("rules/frozen-rules.md"))
+        .unwrap_or_else(|_| SHIPPED_RULES.to_owned());
     if !layers.is_empty() {
         output.push('\n');
         output.push_str(
@@ -85,7 +93,7 @@ pub fn render_digest(options: &DigestOptions) -> HookOutput {
             return HookOutput {
                 stdout: String::new(),
                 stderr: format!(
-                    "mandate digest: queue is malformed; run /ostrom:desk after repairing {}\n",
+                    "mandate digest: queue is malformed; run `ostrom queue list` after repairing {}\n",
                     options.paths.queue_file().display()
                 ),
             };
@@ -214,7 +222,7 @@ pub fn render_digest(options: &DigestOptions) -> HookOutput {
             push_line(&mut body, "BRIEF");
             push_line(
                 &mut body,
-                "Produce today's /ostrom:brief now. Separate blocked on you from blocked on no one; propose only. /ostrom:desk remains the sole decision surface.",
+                "Produce today's brief now. Separate blocked on you from blocked on no one; propose only. `ostrom queue` remains the sole decision surface.",
             );
         }
     }
@@ -473,7 +481,7 @@ fn render_state_rollups(body: &mut String, state: Option<&Value>) {
         if unclassified > 0 {
             push_line(
                 body,
-                &format!("{repository}: {unclassified} unclassified — /ostrom:desk triage"),
+                &format!("{repository}: {unclassified} unclassified — ostrom queue triage"),
             );
         }
         let unexplained = value
@@ -503,7 +511,7 @@ fn render_state_rollups(body: &mut String, state: Option<&Value>) {
             };
             push_line(
                 body,
-                &format!("{repository}: {gate_faults} {noun} — /ostrom:desk triage"),
+                &format!("{repository}: {gate_faults} {noun} — ostrom queue triage"),
             );
         }
     }

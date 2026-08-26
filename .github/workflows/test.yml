@@ -55,14 +55,6 @@ jobs:
       - run: cargo +"$MSRV_TOOLCHAIN" fmt --all --check
       - run: cargo +"$MSRV_TOOLCHAIN" clippy --all-targets --all-features -- -D warnings
       - run: env -u OSTROM_HOME cargo +"$MSRV_TOOLCHAIN" test --workspace --all-features
-      - run: target/debug/ostrom check plugin-surface
-      - run: target/debug/ostrom check shell-retirement
-      - name: Require a plugin version change for shipped plugin content
-        if: github.event_name == 'pull_request'
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: target/debug/ostrom check skill-version-bump --base "$BASE_SHA" --head "$HEAD_SHA"
 
   windows-compile:
     # The release workflow builds five platform targets; this workflow built
@@ -100,12 +92,5 @@ jobs:
         run: |
           target/debug/ostrom --version > target/debug/ostrom-version.txt
           node npm/scripts/assert-version.mjs --version-output target/debug/ostrom-version.txt
-      - name: Check the plugin CLI floor is published
-        run: |
-          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
-            node npm/scripts/assert-plugin-cli-floor.mjs --allow-inconclusive
-          else
-            node npm/scripts/assert-plugin-cli-floor.mjs
-          fi
       - name: Test offline npm distribution
         run: bash npm/tests/test.sh

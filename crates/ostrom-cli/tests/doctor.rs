@@ -22,7 +22,7 @@ fn run_trace_completeness(root: &Path, config: &Path) -> Output {
         .env_clear()
         .env("HOME", root.join("home"))
         .env("CLAUDE_CONFIG_DIR", config)
-        .env("CLAUDE_PLUGIN_ROOT", root.join("plugin"))
+        .env("OSTROM_PLUGIN_ROOT", root.join("plugin"))
         .output()
         .expect("run trace-completeness doctor check")
 }
@@ -117,7 +117,7 @@ fn doctor_subcommand_reports_without_launching_node_or_npm() {
         .env_clear()
         .env("HOME", &home)
         .env("CLAUDE_CONFIG_DIR", &config)
-        .env("CLAUDE_PLUGIN_ROOT", &plugin)
+        .env("OSTROM_PLUGIN_ROOT", &plugin)
         .env("PATH", &bin)
         .output()
         .expect("run native doctor");
@@ -141,7 +141,7 @@ fn unknown_exact_check_exits_two() {
         .env_clear()
         .env("HOME", fixture.path())
         .env("CLAUDE_CONFIG_DIR", fixture.path().join("config"))
-        .env("CLAUDE_PLUGIN_ROOT", fixture.path().join("plugin"))
+        .env("OSTROM_PLUGIN_ROOT", fixture.path().join("plugin"))
         .output()
         .expect("run native doctor");
     assert_eq!(output.status.code(), Some(2));
@@ -273,7 +273,7 @@ fn trace_completeness_warns_for_missing_and_unreadable_traces() {
     assert!(missing.status.success());
     assert_eq!(
         String::from_utf8(missing.stdout).unwrap(),
-        "WARN|trace-completeness|no gatekeeper pass ever recorded|run /ostrom:gatekeep and confirm it records pass-ended\n"
+        "WARN|trace-completeness|no gatekeeper pass ever recorded|run ostrom pass gatekeeper and confirm it records pass-ended\n"
     );
 
     let unreadable_config = fixture.path().join("unreadable-config");

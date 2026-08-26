@@ -88,11 +88,6 @@ pub const CLAUDE_CONFIG_DIR: EnvironmentVariable = variable(
     EnvironmentClass::Location,
     "$HOME/.claude",
 );
-pub const CLAUDE_PLUGIN_ROOT: EnvironmentVariable = variable(
-    "CLAUDE_PLUGIN_ROOT",
-    EnvironmentClass::Location,
-    "derived plugin root",
-);
 pub const CODEX_BIN: EnvironmentVariable = variable("CODEX_BIN", EnvironmentClass::Binary, "codex");
 pub const COPILOT_BIN: EnvironmentVariable =
     variable("COPILOT_BIN", EnvironmentClass::Binary, "copilot");
@@ -259,7 +254,6 @@ pub const ENVIRONMENT_VARIABLES: &[EnvironmentVariable] = &[
     ASDF_DATA_DIR,
     CLAUDE_BIN,
     CLAUDE_CONFIG_DIR,
-    CLAUDE_PLUGIN_ROOT,
     CODEX_BIN,
     COPILOT_BIN,
     FNM_DIR,

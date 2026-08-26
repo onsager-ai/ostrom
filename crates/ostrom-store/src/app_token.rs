@@ -256,7 +256,7 @@ pub enum CredentialCommandError {
 
 impl CredentialCommandError {
     /// Exit 111 is reserved for failures before a safely authenticated child
-    /// can start, preserving the protocol distinction used by shipped skills.
+    /// can start, preserving the protocol distinction used by the delivery roles.
     #[must_use]
     pub fn exit_code(&self) -> i32 {
         111

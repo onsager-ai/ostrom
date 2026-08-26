@@ -31,17 +31,6 @@ jobs:
       - id: meta
         name: Read npm release configuration
         run: node npm/scripts/release-meta.mjs
-      - name: Assert the plugin CLI floor is satisfiable
-        env:
-          IS_RELEASE: ${{ steps.meta.outputs.is-release }}
-          RELEASE_VERSION: ${{ steps.meta.outputs.version }}
-        run: |
-          if [[ "$IS_RELEASE" == "true" ]]; then
-            node npm/scripts/assert-plugin-cli-floor.mjs \
-              --release-version "$RELEASE_VERSION"
-          else
-            node npm/scripts/assert-plugin-cli-floor.mjs
-          fi
 
   build:
     name: Build ${{ matrix.platform }}

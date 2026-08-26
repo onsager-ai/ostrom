@@ -1,14 +1,12 @@
----
-name: gatekeep
-description: Poll every repository in the mandate roster for open pull
-  requests and drive the artifact-only /ostrom:merge protocol over each one. This
-  loop may be started only by the principal in a separate gatekeeper session.
----
-
 # Mandate Gatekeep
 
-Run the stateless after-implementation loop. This skill is a thin driver over
-`../merge/SKILL.md`; it discovers candidates but does not create another gate.
+Poll every repository in the mandate roster for open pull requests and drive the
+artifact-only Merge Protocol over each one. This loop may be started only by the
+principal in a separate gatekeeper session. The Merge Protocol is the second half
+of this document.
+
+Run the stateless after-implementation loop. This prompt is a thin driver over
+the Merge Protocol below; it discovers candidates but does not create another gate.
 
 ## 1. Enforce who starts the loop
 
@@ -36,7 +34,7 @@ ostrom lease acquire "$lease_owner"
 
 Only exit 0 owns the pass. Exit 3 means another pass owns it: report that this
 wake backed off and stop without reading a stale answer, enumerating pull
-requests, calling `/ostrom:merge`, or appending to the trace. Any other nonzero
+requests, running the Merge Protocol, or appending to the trace. Any other nonzero
 exit is a lease failure; report it and stop. Never infer concurrency or lease
 ownership from `sprint.jsonl`, `gate.jsonl`, prior output, or wake timing.
 
@@ -108,7 +106,7 @@ not narrow the shared token. The mandatory flags make the repository-local
 `metadata:read,pull_requests:read` scope explicit; every pagination retry must
 repeat the same command shape. The gatekeeper's own role is
 recorded in its `decision-taken` trace record, not stamped onto the merge commit — see
-`/ostrom:merge` step 4 for why. An `Ostrom-Role: builder` trailer arriving on a
+Merge Protocol step 4 for why. An `Ostrom-Role: builder` trailer arriving on a
 commit under review was written by the builder itself, so it is self-asserted
 advisory metadata, not evidence of who acted and never an input to the gate.
 
@@ -134,7 +132,7 @@ ostrom credential gatekeeper "$repository" \
 
 Those are the only write scopes for these operations: the verdict comment does
 not receive Contents or Issues, and the merge does not inherit any permission
-from the comment token. `/ostrom:merge` owns the calls and their failure
+from the comment token. The Merge Protocol owns the calls and their failure
 handling; these declarations make the gatekeeper driver's required authority
 visible before it delegates a candidate.
 
@@ -184,14 +182,14 @@ Do not accept a candidate list from the builder. Judge every candidate gathered
 from successfully enumerated repositories even when `skipped_repos` is not
 empty.
 
-## 6. Drive `/ostrom:merge` independently for each candidate
+## 6. Drive the Merge Protocol independently for each candidate
 
 For each candidate, establish its `repo` as the `GH_REPO` environment context
-used by `gh repo view`, then follow `../merge/SKILL.md` exactly with the PR
+used by `gh repo view`, then follow the Merge Protocol exactly with the PR
 number as its one and only input. Do not copy or restate its gate conditions,
 derive a verdict, override an action, or add a review step here.
 
-Immediately before invoking `/ostrom:merge`, record the selected pointer:
+Immediately before running the Merge Protocol, record the selected pointer:
 
 ```sh
 ostrom trace append item-selected \
@@ -205,7 +203,7 @@ Carry no facts, conclusions, exceptions, or confidence from an earlier pull
 request in the iteration, and carry none from an earlier iteration. A result
 for one pull request must never inform another.
 
-After `/ostrom:merge` returns, increment `passing_candidates` when its consumed
+After the Merge Protocol returns, increment `passing_candidates` when its consumed
 gate verdict was `pass`, and increment `merged_candidates` only when its action
 was `merged`. If it returns `permission-denied`, append the returned fact object
 to `write_denials`; that object contains `repo`, `pr`, `head_sha`, `operation`,
@@ -216,7 +214,7 @@ not narration, and must survive into the terminal pass fact.
 For an `inconclusive` verdict, use the gate line's `already_judged` field as a
 delivery guard keyed on the gate's judgment identity:
 
-- `already_judged=not-judged` — deliver the `/ostrom:merge` escalation dossier to the
+- `already_judged=not-judged` — deliver the Merge Protocol escalation dossier to the
   principal once.
 - `already_judged=judged` — keep the unchanged inconclusive verdict and do not
   deliver the dossier again.
@@ -249,7 +247,7 @@ wait on an in-session recurring wake. Do not switch to event-driven delivery.
 
 On every normal or error path after acquisition, append `pass-ended` before
 releasing the lease. Increment `completed_candidates` only after a selected
-candidate has returned from `/ostrom:merge` with its action recorded. Add each
+candidate has returned from the Merge Protocol with its action recorded. Add each
 repository that exhausts the retry in step 4 to `skipped_repos` once. The
 terminal fact uses all six values maintained since step 2 to record the observed
 outcome, truthful candidate counts, skipped-repository list, and any refused or
@@ -304,11 +302,11 @@ lease expires and the next pass can reclaim it.
 The gatekeeper never writes code, never suggests a fix, and never reviews for
 quality. It never edits the mandate roster or gate conditions, rebases or
 resolves conflicts, dismisses review threads, or debates the builder. It is a
-judge, not a second author. When `/ostrom:merge` stops, this driver records
+judge, not a second author. When the Merge Protocol stops, this driver records
 the permitted action and moves to the next independent candidate.
 
 It may **resolve** a review thread, under the conditions in
-`../merge/SKILL.md`: only after confirming in the artifact that the change is
+the Merge Protocol: only after confirming in the artifact that the change is
 present at the current head SHA, and only while naming that commit in the
 resolving comment. Judging a thread addressed is judge work; dismissing one
 is not, and remains the principal's alone.

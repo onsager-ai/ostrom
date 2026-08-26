@@ -10,6 +10,8 @@ use std::{
 };
 
 use serde_json::{Value, json};
+
+mod support;
 use tempfile::TempDir;
 
 struct Fixture {
@@ -642,7 +644,7 @@ fn roles_receive_their_permission_modes_and_wakes_retain_one_identity() {
     assert!(args.contains("--permission-mode\nauto\n"));
     assert!(args.contains("--max-turns\n200\n"));
     assert!(args.contains("# Mandate Work\n"));
-    assert!(!args.lines().any(|line| line == "/ostrom:work"));
+    assert!(!args.lines().any(|line| line == "ostrom pass builder"));
     assert!(!args.lines().any(|line| line == "default" || line == "40"));
     let trace = fixture.trace();
     let wrapper_owners = trace
@@ -677,7 +679,7 @@ fn roles_receive_their_permission_modes_and_wakes_retain_one_identity() {
     let args = fs::read_to_string(gatekeeper_arguments).expect("read gatekeeper arguments");
     assert!(args.contains("--permission-mode\nmanual\n"));
     assert!(args.contains("# Mandate Gatekeep\n"));
-    assert!(!args.lines().any(|line| line == "/ostrom:gatekeep"));
+    assert!(!args.lines().any(|line| line == "ostrom pass gatekeeper"));
     assert!(!args.lines().any(|line| line == "default"));
 }
 
@@ -977,4 +979,130 @@ fn polluted_operator_environment_cannot_change_a_pass_result() {
         normalize_libtest_durations(&clean.stderr),
         normalize_libtest_durations(&polluted.stderr)
     );
+}
+
+#[test]
+fn a_declared_actor_owns_the_pass_prompt_and_permission_mode() {
+    // The builder ships `auto` and the Mandate Work prompt. An operator
+    // manifest that declares the actor overrides both, which is the point of
+    // resolving them from policy: changing what an agent is told, and what it
+    // may do unattended, becomes an authored, signed decision rather than a
+    // binary release.
+    //
+    // The declaration is the operator's, not a visited repository's. A pass
+    // travels between repositories, so a repository able to declare the
+    // operation could rewrite the instructions the builder arrives with.
+    let fixture = Fixture::new("printf '%s\\n' \"$@\" >\"$OSTROM_TEST_ARGS\"");
+    let manifest = fixture.state.join("ostrom.yaml");
+    fs::write(
+        &manifest,
+        concat!(
+            "manifest_version: 1\n",
+            "actors:\n",
+            "  builder:\n",
+            "    permission_mode: manual\n",
+            "operations:\n",
+            "  build-pass:\n",
+            "    steps:\n",
+            "      - uses: agent/claude\n",
+            "        with:\n",
+            "          prompt: declared by policy, not compiled in\n",
+            "grants:\n",
+            "  builder-build:\n",
+            "    actors: builder\n",
+            "    operations: build-pass\n",
+            "    repositories: placeholder-org/repo\n",
+        ),
+    )
+    .expect("write operator manifest");
+    let trusted_keys = support::sign_manifest(&manifest);
+
+    let arguments = fixture.root.path().join("declared-arguments");
+    assert!(
+        fixture
+            .command()
+            .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
+            .env("OSTROM_TEST_ARGS", &arguments)
+            .status()
+            .expect("run governed builder pass")
+            .success()
+    );
+
+    let args = fs::read_to_string(&arguments).expect("read arguments");
+    assert!(
+        args.contains("declared by policy, not compiled in"),
+        "{args}"
+    );
+    assert!(!args.contains("# Mandate Work"), "{args}");
+    assert!(args.contains("--permission-mode\nmanual\n"), "{args}");
+
+    // The fixture writes a hand-maintained roles/builder.settings.json. The
+    // grant outranks it: the profile the harness receives is derived from
+    // policy, so it cannot drift from the authorization it expresses.
+    assert!(
+        args.contains("builder.derived.settings.json"),
+        "grants should derive the profile, not the hand-written file: {args}"
+    );
+    let derived = fs::read_to_string(fixture.state.join("roles/builder.derived.settings.json"))
+        .expect("read derived role settings");
+    assert!(
+        derived.contains("\"OSTROM_ACTOR\": \"builder\""),
+        "{derived}"
+    );
+}
+
+#[test]
+fn init_produces_a_manifest_whose_edited_prompt_reaches_the_harness() {
+    // The point of `ostrom init` is that the prompt stops being a thing only a
+    // release can change. It writes what the binary ships as an editable file,
+    // and an edit signed into policy is what the next pass runs.
+    //
+    // Order matters: prompts are materialized into the manifest at signing
+    // time, so an edit made after signing is not covered by policy identity
+    // and would not take effect. init, edit, sign, run.
+    let fixture = Fixture::new("printf '%s\\n' \"$@\" >\"$OSTROM_TEST_ARGS\"");
+
+    let init = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .arg("init")
+        .env_clear()
+        .env("OSTROM_HOME", &fixture.state)
+        .env("PATH", env::var_os("PATH").unwrap_or_default())
+        .status()
+        .expect("run ostrom init");
+    assert!(init.success());
+
+    let manifest = fixture.state.join("ostrom.yaml");
+    let prompt = fixture.state.join("prompts/work.md");
+    assert!(manifest.is_file(), "init wrote no manifest");
+    assert!(
+        fs::read_to_string(&prompt)
+            .expect("read shipped prompt")
+            .contains("# Mandate Work"),
+        "init should write the prompt the binary ships"
+    );
+
+    fs::write(
+        &prompt,
+        "# Edited By The Operator\n\nDo the edited thing.\n",
+    )
+    .expect("edit the builder prompt");
+    let trusted_keys = support::sign_manifest(&manifest);
+
+    let arguments = fixture.root.path().join("init-arguments");
+    assert!(
+        fixture
+            .command()
+            .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
+            .env("OSTROM_TEST_ARGS", &arguments)
+            .status()
+            .expect("run builder pass")
+            .success()
+    );
+
+    let args = fs::read_to_string(&arguments).expect("read arguments");
+    assert!(args.contains("# Edited By The Operator"), "{args}");
+    assert!(!args.contains("# Mandate Work"), "{args}");
+    // The actor declares `auto`, which is also the builder's shipped default;
+    // asserting it confirms the actor was read rather than merely defaulted.
+    assert!(args.contains("--permission-mode\nauto\n"), "{args}");
 }

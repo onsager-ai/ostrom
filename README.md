@@ -1,8 +1,7 @@
 # ostrom
 
-A Claude Code plugin marketplace shipping small mechanisms for
-governing agent-workflow conventions and steering a portfolio of
-projects.
+A harness-agnostic CLI shipping small mechanisms for governing
+agent-workflow conventions and steering a portfolio of projects.
 
 The spine is Elinor Ostrom's work on governing a commons: rules carry
 provenance (`Source:`) and falsifiable `Preconditions:`, a human
@@ -13,18 +12,16 @@ personal constitution.
 
 ## What it ships
 
-- **`ostrom` — one plugin with two cooperating subsystems** — layered SessionStart
-  constitution injection: shipped rules, then user rules, then repo rules
-  (most-specific wins).
+- **`ostrom` — one binary with two cooperating subsystems** — layered
+  constitution injection via `ostrom hook session-start`: shipped rules, then
+  user rules, then repo rules (most-specific wins).
 - **The rule-capitalization trigger** — the agent proposes freezing a
   rule after the same class of correction recurs; it never
   self-installs one.
-- **Agent-push `/ostrom:touch` intervention capture** — with pluggable log
-  providers (file/Notion) and layered YAML config.
 - **Mandate portfolio steering** — an hourly sweep and SessionStart digest that reads
   open GitHub issues, PRs, and CI through `gh`; keeps a private,
   file-backed queue of pointers; and routes approve/reject/defer decisions
-  through `/ostrom:desk`. Tripwires reuse constitution's escalation-dossier
+  through `ostrom queue`. Tripwires reuse constitution's escalation-dossier
   protocol and never auto-proceed.
 
 ### One-way dependency convention
@@ -38,32 +35,29 @@ inside one plugin.
 
 ## Layout
 
-- `.claude-plugin/marketplace.json` — marketplace catalog (this repo is the marketplace)
-- `plugins/ostrom/` — the unified plugin: layered rules and touch capture plus portfolio sweep, digest, private queue, and gatekeeper skills
-- `plugins/ostrom/hooks/` — both SessionStart hooks: layered constitution injection and durable mandate-digest rendering
-- `plugins/ostrom/config/` — separate shipped defaults for touch (`touch-defaults.yaml`) and mandates (`mandate-defaults.yaml`), plus reference examples
+- `crates/ostrom-store/assets/prompts/` — the delivery-role prompts (`work.md`, `gatekeep.md`, `merge.md`) compiled into the binary
+- `crates/ostrom-store/assets/` — shipped defaults for gate (`gate.defaults.yaml`) and mandates (`mandate-defaults.yaml`), plus the publish allowlist
+- `docs/examples/` — reference config examples (`mandates.example.yaml`, `gate.example.yaml`)
 - `crates/ostrom-core/` — pure Rust domain types and the async, substrate-neutral store port
 - `crates/ostrom-store/` — XDG paths, legacy-compatible JSONL/file persistence, and native Node runtime resolution for Codex dispatch
 - `crates/ostrom-cli/` — the additive `ostrom` binary and sweep entry point
 - `repo-pointer/settings.json` — snippet to merge into each target repo's `.claude/settings.json`
-- `bootstrap.sh` — one command to make a fresh environment ostrom-aware (user-level enroll + config provisioning)
 - `LICENSE` — MIT
 
-### Changing shipped skills
+### Changing shipped prompts
 
-Files matching `plugins/*/skills/*/SKILL.md` are shipped behaviour, not
-documentation: builder, gatekeeper, and desk sessions execute that text from
-the installed plugin cache. Changing a skill body requires changing the
-`version` field in that same plugin's `.claude-plugin/plugin.json`. CI enforces
-this requirement per plugin so a protocol change cannot remain hidden behind
-an unchanged cache key.
+Files under `crates/ostrom-store/assets/prompts/` are shipped behaviour, not
+documentation: `ostrom pass builder` and `ostrom pass gatekeeper` execute that
+text as the agent prompt. They are compiled into the binary with `include_str!`,
+so a prompt change ships with the release that carries it — there is no separate
+cache key to keep in step, and no installed plugin for a session to fall behind.
 
-### Shell implementation freeze
+### Shell implementation retired
 
-The implementation under `plugins/ostrom/scripts/` is frozen: new behaviour
-belongs in `crates/`, while deletions from the shell are always welcome. A
-small defect fix that must grow a shell file needs the `bash-bugfix` pull
-request label. Issue #263 tracks removing the shell implementation entirely.
+The shell implementation is gone, and with it the `check shell-retirement`
+guard that counted what was left of it. New behaviour belongs in `crates/`.
+The three `.sh` files that remain are npm packaging and test fixtures, not
+implementation.
 
 ### Rust CLI (phase 2)
 
@@ -160,47 +154,47 @@ packages cover Linux x64/arm64, macOS x64/arm64, and Windows x64.
 
 For a source checkout, `cargo install --path crates/ostrom-cli` is the fallback.
 
-### Claude Code plugin
+### Adopting policy
 
-```
-/plugin marketplace add onsager-ai/ostrom
-/plugin install ostrom@ostrom
-```
+The binary ships the delivery prompts and permission modes it needs, so a
+fresh install runs without a manifest. `ostrom init` turns those defaults into
+authored policy:
 
-Or the scripted path, from a clone of this repo:
-
-```
-./bootstrap.sh                 # user-level enroll (~/.claude/settings.json)
-# then, once inside Claude Code:
-/plugin install ostrom@ostrom
+```sh
+ostrom init            # writes ~/.claude/ostrom/{ostrom.yaml,prompts/*.md}
+# edit prompts/work.md, then:
+ostrom sign --key-id <id> --key <private.pem> ~/.claude/ostrom/ostrom.yaml
+export OSTROM_POLICY_TRUSTED_KEYS=<directory holding <id>.pem>
 ```
 
-`bootstrap.sh` enrolls at the **user level**, so every repo in that
-environment picks up ostrom — no per-repo pointer needed for your own
-sessions. It's idempotent and backs up an existing `settings.json`. It
-also drops a **zero-secret default `/ostrom:touch` config** at
-`~/.claude/ostrom/config.yaml` (file provider), so logging works
-immediately with no Notion account — see [Touch-log config](#touch-log-config).
+It writes what the binary already ships, so adopting it changes nothing until
+you edit something. After that, `ostrom pass builder` and `ostrom pass
+gatekeeper` take their prompt, permission mode, and harness profile from the
+actor and grants declared there. Prompts are materialized into the manifest at
+signing time, so edit first, then sign.
 
-Known caveat: a project's settings.json pointer registers the
-marketplace but external-source plugins still need the one-time
-install command per environment (claude-code issue #32606).
+`ostrom init` refuses to overwrite an existing manifest or prompt; pass
+`--force` to replace one.
 
-### Migration from the two-plugin install
+### Migration from the Claude Code plugin
 
-The separate `constitution@ostrom` and `mandate@ostrom` installs are replaced
-by the single `ostrom@ostrom` install. Commands now share the plugin namespace:
-`/mandate:brief` → `/ostrom:brief`, `/mandate:desk` → `/ostrom:desk`,
-`/constitution:touch` → `/ostrom:touch`, `/constitution:doctor` →
-`/ostrom:doctor`, `/mandate:merge` → `/ostrom:merge`, and
-`/mandate:gatekeep` → `/ostrom:gatekeep`. Machine-local config and state under
+The `ostrom@ostrom` plugin and its marketplace are retired; the CLI is the only
+distribution. The slash-command surfaces are replaced by their binary
+equivalents: `/ostrom:brief` → `ostrom brief`, `/ostrom:desk` → `ostrom queue`,
+`/ostrom:doctor` → `ostrom doctor`, `/ostrom:gatekeep` → `ostrom pass
+gatekeeper`, and `/ostrom:work` → `ostrom pass builder`. `/ostrom:touch` is
+withdrawn with no replacement. Machine-local config and state under
 `~/.claude/ostrom/` keep their existing filenames and need no migration.
+
+Remove the retired entries from `~/.claude/settings.json`: the `ostrom` entry
+under `enabledPlugins`, and the `ostrom` marketplace under
+`extraKnownMarketplaces`.
 
 ## Mandate
 
 `mandate` resolves its small YAML schema in three layers: shipped defaults
 → `~/.claude/ostrom/mandates.yaml` → `./.ostrom/mandates.yaml`.
-Copy `plugins/ostrom/config/mandates.example.yaml` to the user path and
+Copy `docs/examples/mandates.example.yaml` to the user path and
 replace its placeholder roster. The real roster, queue, read cursors, and gate
 exceptions remain machine-local at `~/.claude/ostrom/mandates.yaml`,
 `~/.claude/ostrom/queue.jsonl`, `~/.claude/ostrom/state.json`, and
@@ -233,7 +227,7 @@ and state fault rather than silently dropping it.
 
 Classification precedence is reserved → shared/project bounce → excluded →
 delegated → `default`. The default is `unclassified`, which produces one
-per-repo `/ostrom:desk` triage line rather than one queue row per item; projects may
+per-repo `ostrom queue` triage line rather than one queue row per item; projects may
 explicitly choose `default: delegated` or `default: excluded`. Pausing a
 project suppresses routine work but never reserved refs, tripwires, or failing
 CI. The first sweep baselines existing work, and selector changes re-baseline
@@ -271,7 +265,7 @@ and PR query reads up to 200 open items; reaching that cap is a loud fault and
 the sweep refuses to write truncated state. v1 implements the `file` provider only; the
 provider seam remains explicit for a later addition.
 
-Run `/ostrom:desk lint` explicitly to inspect selectors that matched no open item in
+Run `ostrom queue lint` explicitly to inspect selectors that matched no open item in
 the last sweep; unmatched selectors never add daily digest lines.
 Baseline and mandate-change summaries render once, then are acknowledged in
 the private state so they do not become permanent session noise.
@@ -319,7 +313,7 @@ The builder coordinates work by dispatching a durable order to an implementer
 harness, which opens a pull request, and then the builder **stops**. It never
 merges its own delivery. In a separate session, the gatekeeper polls every
 repository in the mandate roster, evaluates each open pull request from its
-current GitHub artifacts through `/ostrom:merge`, and takes only the action the
+current GitHub artifacts through the shipped `merge` prompt, and takes only the action the
 gate permits: approve as the App and merge a pass, report a fail, or escalate an
 inconclusive result to the principal. The gatekeeper does not write code,
 suggest fixes, or review for quality. The builder's only response is a new
@@ -336,7 +330,7 @@ dedicated gatekeeper session with the same recurring wake mechanism as the
 sprint loop:
 
 ```sh
-claude --settings ~/.claude/ostrom/roles/gatekeeper.settings.json "/loop 30m /ostrom:gatekeep"
+ostrom pass gatekeeper
 ```
 
 The `--settings` flag is not decoration. It applies the gatekeeper profile from
@@ -404,7 +398,7 @@ finding; it never changes `HOLD` into permission or merges the pull request.
 
 ### Selector accuracy
 
-`/ostrom:desk lint` reports selectors that matched nothing, which is config hygiene,
+`ostrom queue lint` reports selectors that matched nothing, which is config hygiene,
 not accuracy. Two different errors matter and they are not symmetric. A **miss**
 is a safety failure — something crossed a boundary unreviewed. A **false alarm**
 costs an interruption. Prefer recall wherever an irreversible action is in
@@ -413,7 +407,7 @@ because an interruption budget spent on noise is unavailable when it matters.
 
 Both are measured, and neither is reduced to a single score:
 
-- **False alarms** accrue going forward. Rejecting an item in `/ostrom:desk` appends one
+- **False alarms** accrue going forward. Rejecting an item with `ostrom queue reject` appends one
   line to `~/.claude/ostrom/selector-events.jsonl` recording which selector put
   it in front of you. Nothing extra is asked at decision time.
 - **Misses** are computed retroactively. `ostrom replay` is read-only: it
@@ -444,24 +438,19 @@ split, which is why the report does not produce one.
 
 ## Cloud / CI
 
-No token, no credential setup — the marketplace is public, so the
-`git clone` `/plugin marketplace add` does under the hood needs no
-auth. Run `bootstrap.sh` in the environment setup script, then, once
-per persistent environment, inside Claude Code:
+No token, no credential setup — the npm package is public. Install the CLI in
+the environment setup script:
 
-```
-/plugin install ostrom@ostrom
+```sh
+npm install --global @ostrom/cli
 ```
 
-A **private fork** of this marketplace would need git credentials for
-the clone (`/plugin marketplace add` fetches a private source with
-`git clone`, not the API) — the only remaining reason anyone would
-care about that path.
+The binary carries its prompts and shipped defaults inside itself, so a fresh
+container needs nothing else fetched or enrolled.
 
 ## Per-repo enrollment
 
-Only needed for **teammates or shared repos** — your own sessions are
-covered by the user-level `bootstrap.sh` enrollment above. To make a
+Only needed for **teammates or shared repos**. To make a
 repo self-register for anyone who opens it, merge
 `repo-pointer/settings.json` into its `.claude/settings.json` and commit.
 
@@ -475,68 +464,42 @@ repo rules sees output byte-identical to the shipped file alone. Each layer
 that fires is preceded by an HTML-comment provenance marker naming the file
 it came from.
 
-Unlike the touch config, there is **no org `extends:` hop for rules yet** —
-rules have no fetch story, so a shared org constitution isn't a thing this
-repo ships. The same secret-vs-shareable split still applies: your actual
-rules are yours, not shippable, and belong in `~/.claude/ostrom/rules.md` (or
-a private repo layer) — **outside this repo**, same as the touch config's
-`secrets.yaml`. See `plugins/ostrom/config/rules.example.md` for the
-format (a `##` rule heading, body, then a `Source:`/`Preconditions:` HTML
-comment — match `frozen-rules.md`'s own style).
+There is **no org `extends:` hop for rules** — rules have no fetch story, so a
+shared org constitution isn't a thing this repo ships. Your actual rules are
+yours, not shippable, and belong in `~/.claude/ostrom/rules.md` (or a private
+repo layer) — **outside this repo**. Match `frozen-rules.md`'s own style: a
+`##` rule heading, body, then a `Source:`/`Preconditions:` HTML comment.
+
+The shipped layer is compiled into the binary, so the base constitution is
+present under any harness and on a machine that installed no plugin.
+`OSTROM_PLUGIN_ROOT` still overrides it, for a fixture or a fork.
 
 ## Doctor
 
-`/ostrom:doctor` runs `ostrom doctor`, the native Rust prober. It reports on
-CLI installation/version/launcher safety, plugin and marketplace integrity,
-rules layering, touch durability and provider reachability, dispatch source
-roots, trace/lease/work-order health, recurring delivery passes, publish
-freshness, environment shape, and the supported config parser shape.
+`ostrom doctor` is the native Rust prober. It reports on CLI
+installation/version/launcher safety, dispatch source roots,
+trace/lease/work-order health, recurring delivery passes, publish freshness,
+environment shape, and the supported config parser shape.
 
 It exists because silent degradation is the actual failure mode here, not
 a crash. The SessionStart hook injects the shipped rules and nothing else
-when no user layer is present, and looks exactly like it's working. `/ostrom:touch`
-falls back to the `file` provider and keeps appending to a local markdown
-file indefinitely, and that looks exactly like working too. Nothing errors
-— touches just never reach another machine, or a documented bootstrap
-one-liner 404s for months because nothing ever checked. `/ostrom:doctor` is the
+when no user layer is present, and looks exactly like it's working. Nothing
+errors — a documented bootstrap one-liner 404s for months because nothing
+ever checked. `ostrom doctor` is the
 thing that checks: read-only against your configuration and state, and turns
 each of those silent states into an `OK` / `WARN` / `FAIL` line with a
 concrete remedy.
 
-One exception, stated because the claim is otherwise not quite true: the
-marketplace check runs `git fetch origin main` in the cached marketplace clone
-to tell whether it is still fast-forwardable. That updates remote-tracking refs
-in a cache directory. It touches no working tree, no configuration and no state
-— but it is not literally nothing, and a check that overstates its own
-innocence is the kind of thing this command exists to catch.
-
-## Touch-log config
-
-`/ostrom:touch` logs to a **pluggable provider**, chosen by layered YAML config
-(most-specific wins): shipped defaults → `~/.claude/ostrom/config.yaml`
-(user) → `./.ostrom/config.yaml` (repo) → an org config via `extends:`.
-The split is **secret vs shareable**, not in-repo vs out: provider choice,
-target, and bucket vocabulary are shareable; tokens live only in
-`~/.claude/ostrom/secrets.yaml` (machine-local, never committed).
-
-- **`file` (default)** — appends to `~/.claude/ostrom/touch-log.md`. Zero
-  account, offline. Point it at a path inside a git repo (and set
-  `auto_commit: true`) to get a versioned commons for free.
-- **`notion`** — set `provider: notion` and fill the `notion:` block.
-
-See `plugins/ostrom/config/config.example.yaml` for both, and
-`touch-defaults.yaml` for what ships. `bootstrap.sh` provisions the `file`
-default automatically.
 
 ## Amend (修宪)
 
-Edit the plugin here — `frozen-rules.md`, `skills/touch/SKILL.md`, or
-`config/touch-defaults.yaml` — bump the version in `plugin.json`, push.
-Environments pick it up via `/plugin marketplace update ostrom`.
+Edit the shipped assets here — `crates/ostrom-store/assets/rules/frozen-rules.md`
+or a prompt under `crates/ostrom-store/assets/prompts/` — and cut a release.
+Environments pick it up via `npm install --global @ostrom/cli`.
 
 ## Rollback
 
-Pin the plugin entry in `marketplace.json` to a commit SHA and push.
+Install the prior version: `npm install --global @ostrom/cli@<version>`.
 
 ## License
 
