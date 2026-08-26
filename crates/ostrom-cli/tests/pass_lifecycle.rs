@@ -10,6 +10,8 @@ use std::{
 };
 
 use serde_json::{Value, json};
+
+mod support;
 use tempfile::TempDir;
 
 struct Fixture {
@@ -977,4 +979,60 @@ fn polluted_operator_environment_cannot_change_a_pass_result() {
         normalize_libtest_durations(&clean.stderr),
         normalize_libtest_durations(&polluted.stderr)
     );
+}
+
+#[test]
+fn a_declared_actor_owns_the_pass_prompt_and_permission_mode() {
+    // The builder ships `auto` and the Mandate Work prompt. An operator
+    // manifest that declares the actor overrides both, which is the point of
+    // resolving them from policy: changing what an agent is told, and what it
+    // may do unattended, becomes an authored, signed decision rather than a
+    // binary release.
+    //
+    // The declaration is the operator's, not a visited repository's. A pass
+    // travels between repositories, so a repository able to declare the
+    // operation could rewrite the instructions the builder arrives with.
+    let fixture = Fixture::new("printf '%s\\n' \"$@\" >\"$OSTROM_TEST_ARGS\"");
+    let manifest = fixture.state.join("ostrom.yaml");
+    fs::write(
+        &manifest,
+        concat!(
+            "manifest_version: 1\n",
+            "actors:\n",
+            "  builder:\n",
+            "    permission_mode: manual\n",
+            "operations:\n",
+            "  build-pass:\n",
+            "    steps:\n",
+            "      - uses: agent/claude\n",
+            "        with:\n",
+            "          prompt: declared by policy, not compiled in\n",
+            "grants:\n",
+            "  builder-build:\n",
+            "    actors: builder\n",
+            "    operations: build-pass\n",
+            "    repositories: placeholder-org/repo\n",
+        ),
+    )
+    .expect("write operator manifest");
+    let trusted_keys = support::sign_manifest(&manifest);
+
+    let arguments = fixture.root.path().join("declared-arguments");
+    assert!(
+        fixture
+            .command()
+            .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
+            .env("OSTROM_TEST_ARGS", &arguments)
+            .status()
+            .expect("run governed builder pass")
+            .success()
+    );
+
+    let args = fs::read_to_string(&arguments).expect("read arguments");
+    assert!(
+        args.contains("declared by policy, not compiled in"),
+        "{args}"
+    );
+    assert!(!args.contains("# Mandate Work"), "{args}");
+    assert!(args.contains("--permission-mode\nmanual\n"), "{args}");
 }

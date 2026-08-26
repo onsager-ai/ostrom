@@ -2388,13 +2388,19 @@ fn run_pass_worker(role: CliPassRole, supervisor_pid: u32, clock: Clock) -> ! {
         std::process::exit(1);
     });
     let claude_bin = default_claude_bin();
+    let paths = compatible_command_paths();
+    let working_directory = env::current_dir().unwrap_or_else(|error| {
+        eprintln!("ostrom: could not resolve working directory: {error}");
+        std::process::exit(1);
+    });
+    let role: PassRole = role.into();
+    let (prompt, permission_mode) = resolve_pass_policy(&paths, role);
     let request = PassRequest {
-        paths: compatible_command_paths(),
-        working_directory: env::current_dir().unwrap_or_else(|error| {
-            eprintln!("ostrom: could not resolve working directory: {error}");
-            std::process::exit(1);
-        }),
-        role: role.into(),
+        prompt,
+        permission_mode,
+        paths,
+        working_directory,
+        role,
         claude_bin,
         signals,
         supervisor_pid: Some(supervisor_pid),
@@ -2409,6 +2415,69 @@ fn run_pass_worker(role: CliPassRole, supervisor_pid: u32, clock: Clock) -> ! {
             std::process::exit(error.exit_code());
         }
     }
+}
+
+/// Resolve a delivery role's prompt and permission mode, preferring policy.
+///
+/// The role name is the actor name: an operator manifest binding actor
+/// `builder` or `gatekeeper` to a prompted operation owns that pass's
+/// instructions, and policy identity then covers what the agent was told.
+///
+/// This reads the **operator** manifest, never the repository's. A pass visits
+/// repositories, so letting a visited repository declare the operation would
+/// let any repository rewrite the instructions the builder arrives with. The
+/// policy layering already refuses this — repository-layer `operations` and
+/// `loops` are recorded inert — and resolving from the operator manifest keeps
+/// the pass on the same side of that boundary rather than relying on it.
+///
+/// With no operator manifest, the prompt compiled into this binary runs, so an
+/// operator who has adopted no policy is not broken by this.
+fn resolve_pass_policy(paths: &OstromPaths, role: PassRole) -> (String, PermissionMode) {
+    let shipped = || {
+        (
+            role.default_prompt().to_owned(),
+            role.default_permission_mode(),
+        )
+    };
+    // No operator manifest is the ordinary case and stays silent. One that
+    // exists but will not load is not: falling back without a word is how a
+    // pass runs for weeks under instructions its author believes were replaced.
+    let manifest = match policy_manifest::operator_manifest_path(paths) {
+        Ok(None) => return shipped(),
+        Ok(Some(path)) => match policy_manifest::load(&path) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                eprintln!(
+                    "warning: {} pass could not load operator policy ({error}); using the prompt compiled into this binary",
+                    role.name()
+                );
+                return shipped();
+            }
+        },
+        Err(error) => {
+            eprintln!(
+                "warning: {} pass could not resolve operator policy ({error}); using the prompt compiled into this binary",
+                role.name()
+            );
+            return shipped();
+        }
+    };
+
+    let prompt = match resolve_inspection_prompt(&manifest, role.name()) {
+        Ok(prompt) => prompt,
+        Err(error) => {
+            eprintln!(
+                "warning: {} pass is not bound to a prompted operation ({error}); using the prompt compiled into this binary",
+                role.name()
+            );
+            role.default_prompt().to_owned()
+        }
+    };
+    let permission_mode = manifest.actors.get(role.name()).map_or_else(
+        || role.default_permission_mode(),
+        |actor| actor.permission_mode,
+    );
+    (prompt, permission_mode)
 }
 
 fn default_claude_bin() -> PathBuf {
