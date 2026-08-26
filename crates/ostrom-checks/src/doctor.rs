@@ -15,7 +15,7 @@ use ostrom_store::environment;
 use serde_json::{Map, Value, json};
 
 use crate::{
-    ActionFault, ActionOutcome, ActionProvider, PreparedAction, check_role_allowlists,
+    ActionFault, ActionOutcome, ActionProvider, PreparedAction,
     process::{exact_keys, invalid_parameters, parameter_timeout},
 };
 
@@ -34,7 +34,6 @@ pub const DOCTOR_CHECKS: &[&str] = &[
     "trace-completeness",
     "work-orders",
     "worktrees",
-    "role-allowlists",
     "builder-pass",
     "gatekeeper-pass",
     "publish",
@@ -248,7 +247,6 @@ fn run_named_check(context: &mut DoctorContext, name: &str) -> DoctorResult {
         "trace-completeness" => check_trace_completeness(context),
         "work-orders" => check_work_orders(context),
         "worktrees" => check_worktrees(context),
-        "role-allowlists" => check_delivery_role_allowlists(context),
         "builder-pass" => check_role_pass(context, DeliveryRole::Builder),
         "gatekeeper-pass" => check_role_pass(context, DeliveryRole::Gatekeeper),
         "publish" => check_publish(context),
@@ -2486,43 +2484,6 @@ fn check_worktrees(context: &DoctorContext) -> DoctorResult {
     }
 }
 
-fn check_delivery_role_allowlists(context: &DoctorContext) -> DoctorResult {
-    let settings = context.options.config_dir.join("ostrom/roles");
-    let report = check_role_allowlists(&settings);
-    if report.is_clean() {
-        return DoctorResult::new(
-            DoctorStatus::Ok,
-            "role-allowlists",
-            "builder and gatekeeper allow every ostrom subcommand invoked by their shipped skills",
-            "",
-        );
-    }
-
-    let detail = report
-        .violations
-        .iter()
-        .map(
-            |violation| match (&violation.skill, &violation.subcommand) {
-                (Some(skill), Some(subcommand)) => format!(
-                    "{} cannot execute ostrom {} invoked by skill {}",
-                    violation.role, subcommand, skill
-                ),
-                _ => format!("{}: {}", violation.role, violation.detail),
-            },
-        )
-        .collect::<Vec<_>>()
-        .join("; ");
-    DoctorResult::new(
-        DoctorStatus::Fail,
-        "role-allowlists",
-        detail,
-        format!(
-            "align the role allowlists under {} with the named shipped skill commands",
-            settings.display()
-        ),
-    )
-}
-
 #[derive(Clone, Copy)]
 enum DeliveryRole {
     Builder,
@@ -2636,7 +2597,7 @@ fn check_role_pass(context: &DoctorContext, role: DeliveryRole) -> DoctorResult 
             DoctorStatus::Fail,
             check_name,
             format!("last {role_name} pass was denied permission, {timestamp} (age {age})"),
-            "run ostrom doctor --check role-allowlists and align the named role/subcommand gap",
+            "run ostrom operations --settings <actor> and install the derived profile for that role",
         );
     }
     // One no-op can be a contended lease or a disarmed mid-window wake. Three
@@ -2963,35 +2924,6 @@ mod tests {
         assert!(!marker.exists(), "doctor remedies must never be executed");
     }
 
-    #[test]
-    fn role_allowlist_check_names_the_role_skill_and_missing_subcommand() {
-        // The role prompts are compiled into the binary, so this check reads
-        // what the build ships and judges it against the operator's role
-        // settings. A role granted every subcommand is silent; a role pinned to
-        // one subcommand is named for each command its shipped prompts invoke.
-        let fixture = Fixture::new();
-        let roles = fixture.config_dir.join("ostrom/roles");
-        fs::create_dir_all(&roles).unwrap();
-        fs::write(
-            roles.join("builder.settings.json"),
-            r#"{"permissions":{"allow":["Bash(ostrom *)"]}}"#,
-        )
-        .unwrap();
-        fs::write(
-            roles.join("gatekeeper.settings.json"),
-            r#"{"permissions":{"allow":["Bash(ostrom trace *)"]}}"#,
-        )
-        .unwrap();
-
-        let output = run_doctor_check(fixture.options(), "role-allowlists").unwrap();
-        assert!(output.starts_with("FAIL|role-allowlists|"), "{output}");
-        assert!(
-            output.contains("gatekeeper cannot execute ostrom "),
-            "{output}"
-        );
-        assert!(!output.contains("builder cannot execute"), "{output}");
-    }
-
     #[cfg(unix)]
     #[test]
     fn semantic_versions_compare_numerically() {
@@ -3134,7 +3066,6 @@ mod tests {
                 "WARN|trace-completeness|no gatekeeper pass ever recorded|run /ostrom:gatekeep and confirm it records pass-ended\n",
                 "OK|work-orders|no work orders in flight|\n",
                 "OK|worktrees|count=0 total_bytes=0 ceiling_bytes=21474836480|\n",
-                "FAIL|role-allowlists|builder: role settings are missing at {config}/ostrom/roles/builder.settings.json; gatekeeper: role settings are missing at {config}/ostrom/roles/gatekeeper.settings.json|align the role allowlists under {config}/ostrom/roles with the named shipped skill commands\n",
                 "WARN|builder-pass|no builder pass ever recorded|run /ostrom:work and confirm it records pass-ended\n",
                 "WARN|gatekeeper-pass|no gatekeeper pass ever recorded|run /ostrom:gatekeep and confirm it records pass-ended\n",
                 "WARN|publish|no publish has been recorded|run ostrom sweep --publish-repository <owner/repo> and confirm the state branch is reachable\n",

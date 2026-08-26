@@ -15,7 +15,6 @@ mod loop_units;
 mod operation_settings;
 mod process;
 mod registry;
-mod role_allowlists;
 mod shell_retirement;
 
 pub use command::CommandProvider;
@@ -42,8 +41,4 @@ pub use ostrom_store::{
     OrchestratorRunRequest, RunOutcome, RunRequest, RunTermination, RunnerLaunch,
 };
 pub use registry::{ActionOutcome, ActionProvider, ActionRegistry, PreparedAction, PreparedCheck};
-pub use role_allowlists::{
-    RoleAllowlistReport, RoleAllowlistViolation, check_modeled_role_allowlists,
-    check_role_allowlists,
-};
 pub use shell_retirement::{ShellFile, ShellRetirementReport, check_shell_retirement};

@@ -124,6 +124,10 @@ pub struct PassRequest {
     /// The resolved permission mode: the actor declaration when policy
     /// supplies one, otherwise [`PassRole::default_permission_mode`].
     pub permission_mode: PermissionMode,
+    /// The harness profile derived from the actor's policy grants, when policy
+    /// declares the actor. `None` falls back to the operator's hand-written
+    /// `roles/<role>.settings.json`.
+    pub derived_settings: Option<String>,
     pub claude_bin: PathBuf,
     pub signals: SignalFlags,
     pub supervisor_pid: Option<u32>,
@@ -392,19 +396,38 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
         .len();
 
     check_signal(request, &mut guard, None)?;
-    let settings = request
-        .paths
-        .state
-        .join("roles")
-        .join(format!("{}.settings.json", request.role.name()));
-    if !settings.is_file() {
-        guard.outcome = Some("failed".to_owned());
-        return Err(PassError::failed(
-            request.role,
-            format!("{} missing", settings.display()),
-            1,
-        ));
-    }
+    // A profile derived from the actor's policy grants wins over a
+    // hand-maintained file: the grant is the authorization, and a settings file
+    // beside it is a copy that can drift out of agreement with the policy it is
+    // supposed to express. The hand-written file remains the path for an
+    // operator who has adopted no policy.
+    let roles = request.paths.state.join("roles");
+    let settings = if let Some(derived) = &request.derived_settings {
+        let path = roles.join(format!("{}.derived.settings.json", request.role.name()));
+        if let Err(error) = fs::create_dir_all(&roles).and_then(|()| fs::write(&path, derived)) {
+            guard.outcome = Some("failed".to_owned());
+            return Err(PassError::failed(
+                request.role,
+                format!(
+                    "could not write derived role settings to {}: {error}",
+                    path.display()
+                ),
+                1,
+            ));
+        }
+        path
+    } else {
+        let path = roles.join(format!("{}.settings.json", request.role.name()));
+        if !path.is_file() {
+            guard.outcome = Some("failed".to_owned());
+            return Err(PassError::failed(
+                request.role,
+                format!("{} missing", path.display()),
+                1,
+            ));
+        }
+        path
+    };
     if !is_executable_file(&request.claude_bin) {
         guard.outcome = Some("failed".to_owned());
         return Err(PassError::failed(

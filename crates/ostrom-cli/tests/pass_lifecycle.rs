@@ -1035,4 +1035,18 @@ fn a_declared_actor_owns_the_pass_prompt_and_permission_mode() {
     );
     assert!(!args.contains("# Mandate Work"), "{args}");
     assert!(args.contains("--permission-mode\nmanual\n"), "{args}");
+
+    // The fixture writes a hand-maintained roles/builder.settings.json. The
+    // grant outranks it: the profile the harness receives is derived from
+    // policy, so it cannot drift from the authorization it expresses.
+    assert!(
+        args.contains("builder.derived.settings.json"),
+        "grants should derive the profile, not the hand-written file: {args}"
+    );
+    let derived = fs::read_to_string(fixture.state.join("roles/builder.derived.settings.json"))
+        .expect("read derived role settings");
+    assert!(
+        derived.contains("\"OSTROM_ACTOR\": \"builder\""),
+        "{derived}"
+    );
 }

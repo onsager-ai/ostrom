@@ -2394,10 +2394,11 @@ fn run_pass_worker(role: CliPassRole, supervisor_pid: u32, clock: Clock) -> ! {
         std::process::exit(1);
     });
     let role: PassRole = role.into();
-    let (prompt, permission_mode) = resolve_pass_policy(&paths, role);
+    let (prompt, permission_mode, derived_settings) = resolve_pass_policy(&paths, role);
     let request = PassRequest {
         prompt,
         permission_mode,
+        derived_settings,
         paths,
         working_directory,
         role,
@@ -2432,11 +2433,15 @@ fn run_pass_worker(role: CliPassRole, supervisor_pid: u32, clock: Clock) -> ! {
 ///
 /// With no operator manifest, the prompt compiled into this binary runs, so an
 /// operator who has adopted no policy is not broken by this.
-fn resolve_pass_policy(paths: &OstromPaths, role: PassRole) -> (String, PermissionMode) {
+fn resolve_pass_policy(
+    paths: &OstromPaths,
+    role: PassRole,
+) -> (String, PermissionMode, Option<String>) {
     let shipped = || {
         (
             role.default_prompt().to_owned(),
             role.default_permission_mode(),
+            None,
         )
     };
     // No operator manifest is the ordinary case and stays silent. One that
@@ -2477,7 +2482,20 @@ fn resolve_pass_policy(paths: &OstromPaths, role: PassRole) -> (String, Permissi
         || role.default_permission_mode(),
         |actor| actor.permission_mode,
     );
-    (prompt, permission_mode)
+    // The grant is the authorization; the profile is only its rendering for a
+    // harness. Deriving it here means the role cannot be granted less, or more,
+    // than policy says by editing a file beside the manifest.
+    let derived_settings = match generate_operation_settings(&manifest, role.name()) {
+        Ok(settings) => Some(settings),
+        Err(error) => {
+            eprintln!(
+                "warning: {} pass could not derive a settings profile from its grants ({error}); using the operator's role settings file",
+                role.name()
+            );
+            None
+        }
+    };
+    (prompt, permission_mode, derived_settings)
 }
 
 fn default_claude_bin() -> PathBuf {
