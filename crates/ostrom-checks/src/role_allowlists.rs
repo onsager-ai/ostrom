@@ -1,8 +1,4 @@
-use std::{
-    collections::BTreeSet,
-    fs,
-    path::{Path, PathBuf},
-};
+use std::{collections::BTreeSet, fs, path::Path};
 
 use serde::Deserialize;
 
@@ -86,8 +82,8 @@ impl RoleAllowlistReport {
 /// `settings_directory` is explicit so doctor can inspect its resolved fixture
 /// or runtime root without any build-time dependency on an operator's home.
 #[must_use]
-pub fn check_role_allowlists(plugin_root: &Path, settings_directory: &Path) -> RoleAllowlistReport {
-    check_role_allowlists_with(plugin_root, |protocol| {
+pub fn check_role_allowlists(settings_directory: &Path) -> RoleAllowlistReport {
+    check_role_allowlists_with(shipped_prompt, |protocol| {
         let path = settings_directory.join(format!("{}.settings.json", protocol.role));
         fs::read_to_string(&path).map_err(|error| settings_read_error(&path, &error))
     })
@@ -97,10 +93,16 @@ pub fn check_role_allowlists(plugin_root: &Path, settings_directory: &Path) -> R
 /// operator-managed grants. The model is validation input only: it neither
 /// installs settings nor grants a role any capability.
 #[must_use]
-pub fn check_modeled_role_allowlists(plugin_root: &Path) -> RoleAllowlistReport {
-    check_role_allowlists_with(plugin_root, |protocol| {
+pub fn check_modeled_role_allowlists() -> RoleAllowlistReport {
+    check_role_allowlists_with(shipped_prompt, |protocol| {
         Ok(protocol.modeled_settings.to_owned())
     })
+}
+
+/// Resolve a delivery-role skill's prompt from the assets compiled into the
+/// binary. Returns `None` for a skill the build does not ship.
+fn shipped_prompt(skill: &str) -> Option<String> {
+    ostrom_store::role_skill_prompt(skill).map(str::to_owned)
 }
 
 fn settings_read_error(path: &Path, error: &std::io::Error) -> String {
@@ -115,7 +117,7 @@ fn settings_read_error(path: &Path, error: &std::io::Error) -> String {
 }
 
 fn check_role_allowlists_with(
-    plugin_root: &Path,
+    prompt_source: impl Fn(&str) -> Option<String>,
     settings_source: impl Fn(&RoleProtocol) -> Result<String, String>,
 ) -> RoleAllowlistReport {
     let mut report = RoleAllowlistReport::default();
@@ -144,7 +146,7 @@ fn check_role_allowlists_with(
                 continue;
             }
         };
-        let expected = expected_subcommands(plugin_root, protocol, &mut report);
+        let expected = expected_subcommands(&prompt_source, protocol, &mut report);
         for (skill, subcommand) in expected {
             if !settings.permissions.allows(&subcommand) {
                 report.violations.push(RoleAllowlistViolation {
@@ -162,34 +164,29 @@ fn check_role_allowlists_with(
 }
 
 fn expected_subcommands(
-    plugin_root: &Path,
+    prompt_source: &impl Fn(&str) -> Option<String>,
     protocol: &RoleProtocol,
     report: &mut RoleAllowlistReport,
 ) -> BTreeSet<(String, String)> {
     let mut expected = BTreeSet::new();
     for skill in protocol.skills {
-        let path = skill_path(plugin_root, skill);
-        match fs::read_to_string(&path) {
-            Ok(source) => {
+        match prompt_source(skill) {
+            Some(source) => {
                 expected.extend(
                     invoked_subcommands(&source)
                         .into_iter()
                         .map(|subcommand| ((*skill).to_owned(), subcommand)),
                 );
             }
-            Err(error) => report.violations.push(RoleAllowlistViolation {
+            None => report.violations.push(RoleAllowlistViolation {
                 role: protocol.role.to_owned(),
                 skill: Some((*skill).to_owned()),
                 subcommand: None,
-                detail: format!("could not read shipped skill {}: {error}", path.display()),
+                detail: format!("the build ships no prompt for role skill {skill}"),
             }),
         }
     }
     expected
-}
-
-fn skill_path(plugin_root: &Path, skill: &str) -> PathBuf {
-    plugin_root.join("skills").join(skill).join("SKILL.md")
 }
 
 impl RolePermissions {
@@ -332,7 +329,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        bash_rule_allows, check_modeled_role_allowlists, check_role_allowlists, invoked_subcommands,
+        ROLE_PROTOCOLS, bash_rule_allows, check_modeled_role_allowlists,
+        check_role_allowlists_with, invoked_subcommands, settings_read_error,
     };
 
     #[test]
@@ -373,32 +371,34 @@ echo ostrom ignored
 
     #[test]
     fn modeled_allowlists_cover_the_current_shipped_role_skills() {
-        let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .expect("workspace root")
-            .to_owned();
-        let report = check_modeled_role_allowlists(&repository.join("plugins/ostrom"));
+        let report = check_modeled_role_allowlists();
         assert!(report.is_clean(), "{:#?}", report.violations);
+    }
+
+    #[test]
+    fn every_role_skill_has_a_prompt_compiled_into_the_binary() {
+        for protocol in ROLE_PROTOCOLS {
+            for skill in protocol.skills {
+                assert!(
+                    ostrom_store::role_skill_prompt(skill).is_some(),
+                    "role {} names skill {skill}, which the build does not ship",
+                    protocol.role
+                );
+            }
+        }
     }
 
     #[test]
     fn a_new_skill_command_fails_when_its_role_settings_do_not_allow_it() {
         let root = tempdir().expect("role allowlist fixture");
-        let plugin = root.path().join("plugin");
         let roles = root.path().join("roles");
-        for skill in ["work", "gatekeep", "merge"] {
-            fs::create_dir_all(plugin.join("skills").join(skill)).unwrap();
-            fs::write(
-                plugin.join("skills").join(skill).join("SKILL.md"),
-                if skill == "work" {
-                    "```sh\nostrom newly-added\n```\n"
-                } else {
-                    "# no commands\n"
-                },
-            )
-            .unwrap();
-        }
+        let prompts = |skill: &str| {
+            Some(if skill == "work" {
+                "```sh\nostrom newly-added\n```\n".to_owned()
+            } else {
+                "# no commands\n".to_owned()
+            })
+        };
         fs::create_dir_all(&roles).unwrap();
         for role in ["builder", "gatekeeper"] {
             fs::write(
@@ -408,7 +408,10 @@ echo ostrom ignored
             .unwrap();
         }
 
-        let report = check_role_allowlists(&plugin, &roles);
+        let report = check_role_allowlists_with(prompts, |protocol| {
+            let path = roles.join(format!("{}.settings.json", protocol.role));
+            fs::read_to_string(&path).map_err(|error| settings_read_error(&path, &error))
+        });
         let gap = report
             .violations
             .iter()
@@ -418,6 +421,4 @@ echo ostrom ignored
         assert_eq!(gap.skill.as_deref(), Some("work"));
         assert!(gap.detail.contains("ostrom newly-added"));
     }
-
-    use std::path::{Path, PathBuf};
 }

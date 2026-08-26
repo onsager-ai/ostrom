@@ -213,7 +213,8 @@ impl Fixture {
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env(
                 "CLAUDE_PLUGIN_ROOT",
-                env!("CARGO_MANIFEST_DIR").replace("crates/ostrom-cli", "plugins/ostrom"),
+                env!("CARGO_MANIFEST_DIR")
+                    .replace("crates/ostrom-cli", "crates/ostrom-store/assets"),
             )
             .env("MANDATE_IMPLEMENTER_SOURCE_REPO", &self.source)
             .env("MANDATE_GH_AS_BIN", &self.gh_as)

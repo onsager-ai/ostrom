@@ -1,7 +1,6 @@
-use std::{fs, path::Path, process::Command, time::SystemTime};
+use std::{fs, process::Command, time::SystemTime};
 
 use chrono::{DateTime, Utc};
-use serde_json::Value;
 use tempfile::tempdir;
 
 #[test]
@@ -164,26 +163,4 @@ projects:
 "#
     );
     assert!(output.stderr.is_empty());
-}
-
-#[test]
-fn shipped_hook_commands_are_silent_when_ostrom_is_absent() {
-    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let document: Value = serde_json::from_slice(
-        &fs::read(repository.join("plugins/ostrom/hooks/hooks.json")).unwrap(),
-    )
-    .unwrap();
-    let empty_path = tempdir().unwrap();
-    for hook in document["hooks"]["SessionStart"].as_array().unwrap() {
-        let command = hook["hooks"][0]["command"].as_str().unwrap();
-        let output = Command::new("/bin/sh")
-            .args(["-c", command])
-            .env_clear()
-            .env("PATH", empty_path.path())
-            .output()
-            .expect("run hook command without CLI");
-        assert!(output.status.success());
-        assert!(output.stdout.is_empty());
-        assert!(output.stderr.is_empty());
-    }
 }

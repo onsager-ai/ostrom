@@ -2488,7 +2488,7 @@ fn check_worktrees(context: &DoctorContext) -> DoctorResult {
 
 fn check_delivery_role_allowlists(context: &DoctorContext) -> DoctorResult {
     let settings = context.options.config_dir.join("ostrom/roles");
-    let report = check_role_allowlists(&context.options.plugin_root, &settings);
+    let report = check_role_allowlists(&settings);
     if report.is_clean() {
         return DoctorResult::new(
             DoctorStatus::Ok,
@@ -2965,33 +2965,31 @@ mod tests {
 
     #[test]
     fn role_allowlist_check_names_the_role_skill_and_missing_subcommand() {
+        // The role prompts are compiled into the binary, so this check reads
+        // what the build ships and judges it against the operator's role
+        // settings. A role granted every subcommand is silent; a role pinned to
+        // one subcommand is named for each command its shipped prompts invoke.
         let fixture = Fixture::new();
-        for (skill, source) in [
-            ("work", "```sh\nostrom trace read\nostrom sweep\n```\n"),
-            ("gatekeep", "```sh\nostrom trace read\n```\n"),
-            ("merge", "# no direct commands\n"),
-        ] {
-            let directory = fixture.plugin_root.join("skills").join(skill);
-            fs::create_dir_all(&directory).unwrap();
-            fs::write(directory.join("SKILL.md"), source).unwrap();
-        }
         let roles = fixture.config_dir.join("ostrom/roles");
         fs::create_dir_all(&roles).unwrap();
-        for role in ["builder", "gatekeeper"] {
-            fs::write(
-                roles.join(format!("{role}.settings.json")),
-                r#"{"permissions":{"allow":["Bash(ostrom trace *)"]}}"#,
-            )
-            .unwrap();
-        }
+        fs::write(
+            roles.join("builder.settings.json"),
+            r#"{"permissions":{"allow":["Bash(ostrom *)"]}}"#,
+        )
+        .unwrap();
+        fs::write(
+            roles.join("gatekeeper.settings.json"),
+            r#"{"permissions":{"allow":["Bash(ostrom trace *)"]}}"#,
+        )
+        .unwrap();
 
         let output = run_doctor_check(fixture.options(), "role-allowlists").unwrap();
         assert!(output.starts_with("FAIL|role-allowlists|"), "{output}");
         assert!(
-            output.contains("builder cannot execute ostrom sweep invoked by skill work"),
+            output.contains("gatekeeper cannot execute ostrom "),
             "{output}"
         );
-        assert!(!output.contains("gatekeeper cannot execute"), "{output}");
+        assert!(!output.contains("builder cannot execute"), "{output}");
     }
 
     #[cfg(unix)]

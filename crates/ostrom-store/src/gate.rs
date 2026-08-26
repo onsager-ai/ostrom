@@ -17,7 +17,7 @@ use crate::{
     sweep::merge_yaml,
 };
 
-const SHIPPED_DEFAULTS: &str = include_str!("../../../plugins/ostrom/config/gate.defaults.yaml");
+const SHIPPED_DEFAULTS: &str = include_str!("../assets/gate.defaults.yaml");
 const REVIEW_QUERY: &str = "query($owner:String!, $repo:String!, $number:Int!, $cursor:String) {\n  repository(owner:$owner, name:$repo) {\n    pullRequest(number:$number) {\n      author { login }\n      reviewThreads(first:100, after:$cursor) {\n        nodes {\n          id\n          isResolved\n          resolvedBy { login }\n          comments(last:1) { nodes { author { login } } }\n        }\n        pageInfo { hasNextPage endCursor }\n      }\n    }\n  }\n}";
 
 #[derive(Debug, Clone)]

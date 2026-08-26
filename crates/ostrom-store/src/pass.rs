@@ -42,14 +42,31 @@ impl PassRole {
     const fn prompt(self) -> &'static str {
         match self {
             Self::Builder => {
-                include_str!("../../../plugins/ostrom/skills/work/SKILL.md")
+                include_str!("../assets/prompts/work.md")
             }
             Self::Gatekeeper => {
-                include_str!("../../../plugins/ostrom/skills/gatekeep/SKILL.md")
+                include_str!("../assets/prompts/gatekeep.md")
             }
         }
     }
+}
 
+/// Shipped prompt text for a delivery-role skill, compiled into the binary.
+///
+/// The delivery roles carry their prompts as embedded assets rather than
+/// reading an installed plugin tree, so a pass renders identically under any
+/// harness and on a machine that never installed a Claude Code plugin.
+#[must_use]
+pub fn role_skill_prompt(skill: &str) -> Option<&'static str> {
+    match skill {
+        "work" => Some(include_str!("../assets/prompts/work.md")),
+        "gatekeep" => Some(include_str!("../assets/prompts/gatekeep.md")),
+        "merge" => Some(include_str!("../assets/prompts/merge.md")),
+        _ => None,
+    }
+}
+
+impl PassRole {
     const fn permission_mode(self) -> &'static str {
         match self {
             Self::Builder => "auto",

@@ -301,7 +301,7 @@ fn captured_environment(path: &Path) -> BTreeMap<String, String> {
 
 fn plugin_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../plugins/ostrom")
+        .join("../ostrom-store/assets")
         .canonicalize()
         .expect("plugin root")
 }

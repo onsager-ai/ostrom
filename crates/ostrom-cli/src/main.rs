@@ -16,8 +16,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use directories::BaseDirs;
 use ostrom_checks::{
     ActionFault, ActionRegistry, ClaudeHarness, DoctorOptions, PreparedCheck,
-    check_shell_retirement, check_skill_version_bump, generate_operation_settings,
-    render_loop_units, run_doctor, run_doctor_check,
+    check_shell_retirement, generate_operation_settings, render_loop_units, run_doctor,
+    run_doctor_check,
 };
 use ostrom_core::{
     CHECK_STORE_SCHEMA_VERSION, CHECKS_VERSION, Catalogue, CatalogueEnumeration,
@@ -325,17 +325,8 @@ enum Command {
 enum CheckCommand {
     /// Execute authored criteria and append their receipts to the check journal.
     Run,
-    /// Require the shipped plugin wiring and skill protocols to agree with the CLI.
-    PluginSurface,
     /// Prevent shell implementation files from reappearing.
     ShellRetirement,
-    /// Require changed shipped plugin content to carry a plugin version bump.
-    SkillVersionBump {
-        #[arg(long)]
-        base: String,
-        #[arg(long)]
-        head: String,
-    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -721,37 +712,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Command::Check {
-            command: CheckCommand::PluginSurface,
-        } => {
-            let report = ostrom_checks::check_plugin_surface(&env::current_dir()?)?;
-            if !report.is_clean() {
-                eprint!("{report}");
-                std::process::exit(1);
-            }
-        }
-        Command::Check {
             command: CheckCommand::ShellRetirement,
         } => {
             let report = check_shell_retirement(&env::current_dir()?)?;
             if !report.is_clean() {
                 eprintln!("{report}");
-                std::process::exit(1);
-            }
-        }
-        Command::Check {
-            command: CheckCommand::SkillVersionBump { base, head },
-        } => {
-            let report = check_skill_version_bump(&env::current_dir()?, &base, &head)?;
-            for violation in &report.violations {
-                eprintln!(
-                    "skill version check: plugin '{}' changed shipped file '{}' without changing version in {} (still {}); the cache is keyed by version, so this change would never reach an installed session",
-                    violation.plugin,
-                    violation.shipped_path.display(),
-                    violation.manifest.display(),
-                    violation.version
-                );
-            }
-            if !report.is_clean() {
                 std::process::exit(1);
             }
         }
@@ -3004,27 +2969,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_skill_version_bump_check() {
-        let parsed = Cli::try_parse_from([
-            "ostrom",
-            "check",
-            "skill-version-bump",
-            "--base",
-            "base-sha",
-            "--head",
-            "head-sha",
-        ])
-        .expect("parse skill version check");
-
-        assert!(matches!(
-            parsed.command,
-            Command::Check {
-                command: CheckCommand::SkillVersionBump { base, head }
-            } if base == "base-sha" && head == "head-sha"
-        ));
-    }
-
-    #[test]
     fn parses_shell_retirement_check() {
         let parsed = Cli::try_parse_from(["ostrom", "check", "shell-retirement"])
             .expect("parse shell retirement check");
@@ -3033,19 +2977,6 @@ mod tests {
             parsed.command,
             Command::Check {
                 command: CheckCommand::ShellRetirement
-            }
-        ));
-    }
-
-    #[test]
-    fn parses_plugin_surface_check() {
-        let parsed = Cli::try_parse_from(["ostrom", "check", "plugin-surface"])
-            .expect("parse plugin surface check");
-
-        assert!(matches!(
-            parsed.command,
-            Command::Check {
-                command: CheckCommand::PluginSurface
             }
         ));
     }
