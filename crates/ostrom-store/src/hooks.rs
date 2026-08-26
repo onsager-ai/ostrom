@@ -30,7 +30,6 @@ pub struct HookOutput {
 const SHIPPED_RULES: &str = include_str!("../assets/rules/frozen-rules.md");
 
 #[must_use]
-
 pub fn render_constitution(
     plugin_root: &Path,
     user_rules_root: &Path,

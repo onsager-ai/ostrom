@@ -1802,12 +1802,6 @@ mod tests {
             for path in [&plugin_root, &config_dir, &cwd, &home, &bin] {
                 fs::create_dir_all(path).expect("fixture directory");
             }
-            fs::create_dir_all(plugin_root.join(".claude-plugin")).unwrap();
-            fs::write(
-                plugin_root.join(".claude-plugin/plugin.json"),
-                r#"{"version":"1.30.15","minimumCliVersion":"0.9.0"}"#,
-            )
-            .unwrap();
             Self {
                 root,
                 plugin_root,

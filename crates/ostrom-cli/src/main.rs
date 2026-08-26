@@ -681,7 +681,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let cwd = env::current_dir()?;
             let plugin_root = environment::OSTROM_PLUGIN_ROOT
                 .value_os()
-                .map_or_else(|| cwd.join("plugins/ostrom"), PathBuf::from);
+                .map_or_else(|| cwd.join("crates/ostrom-store/assets"), PathBuf::from);
             let resolutions = resolve_plan_checks(&paths, &cwd, &plugin_root)?;
             if let Some(fault) = &resolutions.catalogue_fault {
                 return Err(io::Error::new(
@@ -957,7 +957,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let executable = env::current_exe()?;
             let plugin_root = environment::OSTROM_PLUGIN_ROOT
                 .value_os()
-                .map_or_else(|| cwd.join("plugins/ostrom"), PathBuf::from);
+                .map_or_else(|| cwd.join("crates/ostrom-store/assets"), PathBuf::from);
             let options = SweepParityOptions::from_environment(
                 cwd,
                 executable,
@@ -997,7 +997,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let cwd = env::current_dir()?;
             let plugin_root = environment::OSTROM_PLUGIN_ROOT
                 .value_os()
-                .map_or_else(|| cwd.join("plugins/ostrom"), PathBuf::from);
+                .map_or_else(|| cwd.join("crates/ostrom-store/assets"), PathBuf::from);
             let options = cutover_replay::CutoverReplayOptions {
                 scratch_root: cutover_replay::scratch_home_from_environment()?,
                 legacy,
@@ -1053,7 +1053,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let executable = env::current_exe()?;
             let plugin_root = environment::OSTROM_PLUGIN_ROOT
                 .value_os()
-                .map_or_else(|| cwd.join("plugins/ostrom"), PathBuf::from);
+                .map_or_else(|| cwd.join("crates/ostrom-store/assets"), PathBuf::from);
             let policy = policy_manifest::load_optional_bundle(&paths, &cwd)?;
             let outcome = run_sweep(&SweepOptions {
                 paths,
@@ -1085,7 +1085,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let executable = env::current_exe()?;
             let plugin_root = environment::OSTROM_PLUGIN_ROOT
                 .value_os()
-                .map_or_else(|| cwd.join("plugins/ostrom"), PathBuf::from);
+                .map_or_else(|| cwd.join("crates/ostrom-store/assets"), PathBuf::from);
             let policy = policy_manifest::load_optional_bundle(&paths, &cwd)?;
             let check_resolutions = resolve_plan_checks(&paths, &cwd, &plugin_root)?;
             execute_prepared_checks(
@@ -1367,9 +1367,10 @@ fn dispatch_resolved_loop(
         parameters: resolved.parameters,
     };
     let working_directory = env::current_dir()?;
-    let plugin_root = environment::OSTROM_PLUGIN_ROOT
-        .value_os()
-        .map_or_else(|| working_directory.join("plugins/ostrom"), PathBuf::from);
+    let plugin_root = environment::OSTROM_PLUGIN_ROOT.value_os().map_or_else(
+        || working_directory.join("crates/ostrom-store/assets"),
+        PathBuf::from,
+    );
     let selector_prefixes =
         operation_selector_prefixes(manifest, &resolved.actor, &invocation.name);
     let mut runtime = CliOperationRuntime {
@@ -1398,7 +1399,10 @@ fn run_operation_command(
     let working_directory = env::current_dir()?;
     let plugin_root = ostrom_store::environment::OSTROM_PLUGIN_ROOT
         .value_os()
-        .map_or_else(|| working_directory.join("plugins/ostrom"), PathBuf::from);
+        .map_or_else(
+            || working_directory.join("crates/ostrom-store/assets"),
+            PathBuf::from,
+        );
     let selector_prefixes = operation_selector_prefixes(&manifest, &actor, &invocation.name);
     let mut runtime = CliOperationRuntime {
         paths,
@@ -2521,9 +2525,10 @@ fn run_implement_worker(
         eprintln!("ostrom implementer: could not resolve working directory: {error}");
         std::process::exit(1);
     });
-    let plugin_root = environment::OSTROM_PLUGIN_ROOT
-        .value_os()
-        .map_or_else(|| working_directory.join("plugins/ostrom"), PathBuf::from);
+    let plugin_root = environment::OSTROM_PLUGIN_ROOT.value_os().map_or_else(
+        || working_directory.join("crates/ostrom-store/assets"),
+        PathBuf::from,
+    );
     let request = ImplementRequest {
         paths: compatible_command_paths(),
         working_directory,
@@ -2556,9 +2561,10 @@ fn run_dispatch_command(arguments: Vec<String>, clock: Clock) -> ! {
         eprintln!("ostrom dispatch: could not resolve working directory: {error}");
         std::process::exit(1);
     });
-    let plugin_root = environment::OSTROM_PLUGIN_ROOT
-        .value_os()
-        .map_or_else(|| working_directory.join("plugins/ostrom"), PathBuf::from);
+    let plugin_root = environment::OSTROM_PLUGIN_ROOT.value_os().map_or_else(
+        || working_directory.join("crates/ostrom-store/assets"),
+        PathBuf::from,
+    );
     let request = DispatchRequest {
         paths: compatible_command_paths(),
         working_directory,
@@ -2654,7 +2660,7 @@ fn run_doctor_command(
     let cwd = env::current_dir()?;
     let plugin_root = environment::OSTROM_PLUGIN_ROOT
         .value_os()
-        .map_or_else(|| cwd.join("plugins/ostrom"), PathBuf::from);
+        .map_or_else(|| cwd.join("crates/ostrom-store/assets"), PathBuf::from);
     let options = DoctorOptions::from_environment_at(plugin_root, clock.epoch_seconds());
     let output = if let Some(name) = check {
         match run_doctor_check(options, &name) {
