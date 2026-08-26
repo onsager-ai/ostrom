@@ -1223,7 +1223,7 @@ fn check_trace_completeness(context: &DoctorContext) -> DoctorResult {
                     DoctorStatus::Fail,
                     "trace-completeness",
                     detail,
-                    "restart the gatekeeper session; it may be running a plugin older than the merge-side appends",
+                    "restart the gatekeeper session; it may be running a CLI older than the merge-side appends",
                 )
             } else {
                 DoctorResult::new(DoctorStatus::Ok, "trace-completeness", detail, "")
