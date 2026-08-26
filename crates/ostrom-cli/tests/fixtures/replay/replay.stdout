@@ -15,7 +15,7 @@ content-derived	placeholder-org/alpha	project bounce	path:.github/workflows/rele
 content-derived	placeholder-org/alpha	project bounce	ref:#42	0	0
 
 fired = open items the last sweep classified via that selector (current snapshot, not lifetime history).
-dismissed = /ostrom:desk rejections of a row that selector produced, recorded in selector-events.jsonl.
+dismissed = rejections recorded by `ostrom queue reject` of a row that selector produced, in selector-events.jsonl.
 path: only applies to PRs; for issues every prefix above is author-written and there is no content-derived gating at all.
 
 Dismissals attributed to no selector (the project default fired instead): 1
