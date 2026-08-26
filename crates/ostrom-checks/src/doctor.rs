@@ -1498,7 +1498,7 @@ impl DeliveryRole {
         }
     }
 
-    fn skill(self) -> &'static str {
+    fn command(self) -> &'static str {
         match self {
             Self::Builder => "ostrom pass builder",
             Self::Gatekeeper => "ostrom pass gatekeeper",
@@ -1551,7 +1551,7 @@ fn check_role_pass(context: &DoctorContext, role: DeliveryRole) -> DoctorResult 
                 DoctorStatus::Warn,
                 check_name,
                 format!("no {role_name} pass ever recorded"),
-                format!("run {} and confirm it records pass-ended", role.skill()),
+                format!("run {} and confirm it records pass-ended", role.command()),
             );
         }
         TraceFile::Unreadable => {
@@ -1570,7 +1570,7 @@ fn check_role_pass(context: &DoctorContext, role: DeliveryRole) -> DoctorResult 
             DoctorStatus::Warn,
             check_name,
             format!("no {role_name} pass ever recorded"),
-            format!("run {} and confirm it records pass-ended", role.skill()),
+            format!("run {} and confirm it records pass-ended", role.command()),
         );
     };
     let timestamp = record.get("ts").and_then(Value::as_str);

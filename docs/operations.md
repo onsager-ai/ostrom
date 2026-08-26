@@ -71,5 +71,5 @@ ostrom operations --actor builder --check-settings /path/to/builder.settings.jso
 
 Generated settings use `defaultMode: deny`, set `OSTROM_ACTOR`, contain one
 `Bash(ostrom <operation> *)` allow per grant, and contain no deny list. These
-commands do not write the operator's role settings. Existing skills remain on
-their direct command paths until each migration is separately approved.
+commands print a profile; `ostrom pass` derives and installs its own from the
+same grants when the manifest declares its actor.

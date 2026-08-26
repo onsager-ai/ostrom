@@ -65,29 +65,14 @@ impl PassRole {
                 include_str!("../assets/prompts/work.md")
             }
             // The gatekeeper drives the merge protocol once per candidate, so
-            // both halves are one prompt. They were two files only because
-            // Claude Code packaged them as two invocable skills.
+            // both halves are one prompt. They are two files only because the
+            // protocol is long enough to be worth reading on its own.
             Self::Gatekeeper => concat!(
                 include_str!("../assets/prompts/gatekeep.md"),
                 "\n\n",
                 include_str!("../assets/prompts/merge.md"),
             ),
         }
-    }
-}
-
-/// Shipped prompt text for a delivery-role skill, compiled into the binary.
-///
-/// The delivery roles carry their prompts as embedded assets rather than
-/// reading an installed plugin tree, so a pass renders identically under any
-/// harness and on a machine that never installed a Claude Code plugin.
-#[must_use]
-pub fn role_skill_prompt(skill: &str) -> Option<&'static str> {
-    match skill {
-        "work" => Some(include_str!("../assets/prompts/work.md")),
-        "gatekeep" => Some(include_str!("../assets/prompts/gatekeep.md")),
-        "merge" => Some(include_str!("../assets/prompts/merge.md")),
-        _ => None,
     }
 }
 

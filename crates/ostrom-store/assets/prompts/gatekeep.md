@@ -5,7 +5,7 @@ artifact-only Merge Protocol over each one. This loop may be started only by the
 principal in a separate gatekeeper session. The Merge Protocol is the second half
 of this document.
 
-Run the stateless after-implementation loop. This skill is a thin driver over
+Run the stateless after-implementation loop. This prompt is a thin driver over
 the Merge Protocol below; it discovers candidates but does not create another gate.
 
 ## 1. Enforce who starts the loop
