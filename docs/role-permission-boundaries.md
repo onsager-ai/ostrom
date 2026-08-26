@@ -353,8 +353,8 @@ per-role Apps.
 builder's stays.** Resolving a review thread is the `resolveReviewThread`
 mutation — there is no porcelain for it — so that deny would forbid the
 gatekeeper the write its protocol assigns it without fixing the shared-actor
-conflict. Before adding a deny to the gatekeeper, check what `ostrom gate` and
-`/ostrom:merge` actually call and settle the actor-independent thread rule.
+conflict. Before adding a deny to the gatekeeper, check what `ostrom gate` and the
+merge protocol actually call and settle the actor-independent thread rule.
 
 That deny was never load-bearing anyway: it matches only the literal word
 `mutation` in the command string, so `--input`, `-F query=@file` and a
