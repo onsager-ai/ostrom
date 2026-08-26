@@ -93,12 +93,6 @@ fn doctor_subcommand_reports_without_launching_node_or_npm() {
     for directory in [&plugin, &config, &home, &cwd, &bin] {
         fs::create_dir_all(directory).expect("doctor fixture directory");
     }
-    fs::create_dir_all(plugin.join(".claude-plugin")).unwrap();
-    fs::write(
-        plugin.join(".claude-plugin/plugin.json"),
-        r#"{"version":"1.30.15","minimumCliVersion":"0.4.0"}"#,
-    )
-    .unwrap();
 
     let node_marker = fixture.path().join("node-was-run");
     let npm_marker = fixture.path().join("npm-was-run");
@@ -215,7 +209,7 @@ fn trace_completeness_fails_when_no_selected_verdicts_were_consumed() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "FAIL|trace-completeness|gatekeeper pass 2026-08-18T10:00:00Z: item-selected=3, gate-verdict-consumed=0|restart the gatekeeper session; it may be running a plugin older than the merge-side appends\n"
+        "FAIL|trace-completeness|gatekeeper pass 2026-08-18T10:00:00Z: item-selected=3, gate-verdict-consumed=0|restart the gatekeeper session; it may be running a CLI older than the merge-side appends\n"
     );
 }
 
@@ -261,7 +255,7 @@ fn trace_completeness_counts_fail_and_inconclusive_verdicts_before_failing_a_sho
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "FAIL|trace-completeness|gatekeeper pass 2026-08-18T10:00:00Z: item-selected=3, gate-verdict-consumed=2|restart the gatekeeper session; it may be running a plugin older than the merge-side appends\n"
+        "FAIL|trace-completeness|gatekeeper pass 2026-08-18T10:00:00Z: item-selected=3, gate-verdict-consumed=2|restart the gatekeeper session; it may be running a CLI older than the merge-side appends\n"
     );
 }
 
