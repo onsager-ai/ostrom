@@ -756,7 +756,12 @@ fn prepare_checkout(
 ) -> Result<(), PublishError> {
     let parent = directory.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).map_err(|source| path_error(parent, source))?;
-    if !directory.join(".git").is_dir() {
+    if directory.exists() && !is_git_checkout(directory) {
+        quarantine_invalid_checkout(directory)?;
+    }
+    // An existing path survived the check above only if Git identified it as
+    // a worktree. This also accepts linked worktrees whose `.git` is a file.
+    if !directory.exists() {
         scoped_required(
             options,
             READ_PERMISSIONS,
@@ -810,27 +815,59 @@ fn prepare_checkout(
             &[0],
             minter,
         )?;
+        // The checkout is a cache, while the source records beside it are the
+        // durable publication input. A prior commit or push failure may have
+        // left both the index and worktree dirty, so restore the fetched state
+        // before installing the freshly derived tree.
+        git_required(Some(directory), &["reset", "--hard", "FETCH_HEAD"], &[0])?;
+        git_required(Some(directory), &["clean", "-fdx"], &[0])?;
         git_required(
             Some(directory),
             &["checkout", "-B", "state", "FETCH_HEAD"],
             &[0],
         )?;
     } else {
-        let orphan = git_required(
+        // There is no remote state branch to reset to. Clear residue against
+        // the local HEAD when one exists; status 128 is the expected unborn
+        // branch case for a first publication.
+        git_required(Some(directory), &["reset", "--hard"], &[0, 128])?;
+        git_required(Some(directory), &["clean", "-fdx"], &[0])?;
+        // Point HEAD at an unborn state branch directly. This also repairs a
+        // failed first publication whose earlier orphan checkout created the
+        // branch name without creating a commit.
+        git_required(
             Some(directory),
-            &["checkout", "--orphan", "state"],
-            &[0, 128],
+            &["symbolic-ref", "HEAD", "refs/heads/state"],
+            &[0],
         )?;
-        if orphan.status.success() {
-            // A no-checkout clone still seeds the index from the default
-            // branch. Clearing it prevents unrelated remote content from
-            // entering the first public snapshot.
-            git_required(Some(directory), &["read-tree", "--empty"], &[0])?;
-        } else {
-            git_required(Some(directory), &["checkout", "state"], &[0])?;
-        }
+        // A no-checkout clone can seed the index from the default branch.
+        // Clearing it prevents unrelated remote content from entering the
+        // first public snapshot.
+        git_required(Some(directory), &["read-tree", "--empty"], &[0])?;
     }
     Ok(())
+}
+
+fn is_git_checkout(directory: &Path) -> bool {
+    git_required(
+        Some(directory),
+        &["rev-parse", "--is-inside-work-tree"],
+        &[0],
+    )
+    .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).trim() == "true")
+}
+
+fn quarantine_invalid_checkout(directory: &Path) -> Result<(), PublishError> {
+    let parent = directory.parent().unwrap_or_else(|| Path::new("."));
+    let name = directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("publish");
+    let quarantine = (1_u64..)
+        .map(|suffix| parent.join(format!("{name}.invalid-{suffix}")))
+        .find(|candidate| !candidate.exists())
+        .expect("the quarantine suffix space is non-empty");
+    fs::rename(directory, &quarantine).map_err(|source| path_error(directory, source))
 }
 
 fn reuse_previous_time_if_unchanged(
