@@ -27,14 +27,9 @@ is not exposed by a permissive process umask.
 
 ### Where the allowlist comes from
 
-`MANDATE_PUBLISH_ALLOWLIST` if set, otherwise
-`<plugin root>/config/publish-allowlist.json` — resolved from the **plugin
-root**, not from `OSTROM_HOME`. This matters for an installed binary: run
-outside a repository checkout with neither `OSTROM_PLUGIN_ROOT` nor
-`CLAUDE_PLUGIN_ROOT` set, publication cannot find the allowlist. The operator's
-sweep wrapper passes `CLAUDE_PLUGIN_ROOT`, which is why the 2026-08-19 cutover
-published; a caller that does not is not merely missing a file it could create
-anywhere.
+`MANDATE_PUBLISH_ALLOWLIST` if set, otherwise the allowlist compiled into the
+binary. An operator override is read strictly: a missing or malformed override
+fails publication instead of falling back to the shipped allowlist.
 
 ## Verification
 

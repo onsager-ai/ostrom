@@ -159,13 +159,10 @@ shift 7
 exec "$@"
 "#,
     );
-    let allowlist =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../ostrom-store/assets/publish-allowlist.json");
     let output = run_sweep(&home, &fixture)
         .args(["--publish-repository", "placeholder-org/alpha"])
         .env("PATH", path_with(&bin))
         .env("MANDATE_GH_AS_BIN", &gh_as)
-        .env("MANDATE_PUBLISH_ALLOWLIST", &allowlist)
         .env("OSTROM_TEST_GH_LOG", &gh_log)
         .env("OSTROM_TEST_SCOPE_LOG", &scope_log)
         .env("OSTROM_TEST_LOCAL_REMOTE", &remote)
@@ -202,6 +199,39 @@ exec "$@"
             "repo clone placeholder-org/alpha {} -- --no-checkout",
             home.join("publish").display()
         )
+    );
+}
+
+#[test]
+fn malformed_publish_allowlist_override_fails_before_destination_access() {
+    let root = tempdir().expect("malformed publication allowlist");
+    let (home, fixture) = write_sweep_fixture(root.path(), ACQUIRED_FIXTURE);
+    let allowlist = root.path().join("malformed-allowlist.json");
+    fs::write(&allowlist, "not json\n").expect("write malformed allowlist");
+    let (spy_bin, command_log) = command_spies(root.path());
+
+    let output = run_sweep(&home, &fixture)
+        .args(["--publish-repository", "placeholder-org/alpha"])
+        .env("PATH", path_with(&spy_bin))
+        .env("OSTROM_TEST_COMMAND_LOG", &command_log)
+        .env("MANDATE_PUBLISH_ALLOWLIST", &allowlist)
+        .output()
+        .expect("run publication with malformed override");
+
+    assert!(
+        output.status.success(),
+        "publication failure must not fail reconciliation: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("publish failed; local records remain authoritative")
+            && stderr.contains("invalid publication allowlist"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !command_log.exists(),
+        "a malformed override fell back and reached the destination"
     );
 }
 

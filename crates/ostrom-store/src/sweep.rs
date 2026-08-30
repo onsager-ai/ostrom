@@ -508,7 +508,6 @@ fn run_sweep_with_minter(
         match publish(
             &PublishOptions {
                 paths: &options.paths,
-                plugin_root: &options.plugin_root,
                 destination,
                 published_at: options.started_at,
                 cadence_hours: config.cadence_hours,

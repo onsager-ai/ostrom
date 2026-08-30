@@ -19,6 +19,8 @@ use crate::{
 const READ_PERMISSIONS: &str = "metadata:read,contents:read";
 const WRITE_PERMISSIONS: &str = "metadata:read,contents:write";
 const RETAINED_GATE_DAYS: i64 = 90;
+const SHIPPED_ALLOWLIST: &str = include_str!("../assets/publish-allowlist.json");
+const SHIPPED_ALLOWLIST_PATH: &str = "shipped publish-allowlist.json";
 
 #[derive(Debug, Error)]
 pub enum PublishError {
@@ -67,7 +69,6 @@ pub(crate) enum PublishOutcome {
 
 pub(crate) struct PublishOptions<'a> {
     pub paths: &'a OstromPaths,
-    pub plugin_root: &'a Path,
     pub destination: &'a PublishDestination,
     pub published_at: DateTime<Utc>,
     pub cadence_hours: u64,
@@ -90,14 +91,20 @@ pub(crate) fn publish(
     // The destination deliberately has no environment fallback. In
     // particular, MANDATE_PUBLISH_REMOTE inherited by a scratch OSTROM_HOME
     // cannot turn an opted-out sweep into a publishing one.
-    let allowlist_path = environment::MANDATE_PUBLISH_ALLOWLIST
+    let allowlist = if let Some(path) = environment::MANDATE_PUBLISH_ALLOWLIST
         .value_os()
         .filter(|value| !value.is_empty())
-        .map_or_else(
-            || options.plugin_root.join("config/publish-allowlist.json"),
-            PathBuf::from,
-        );
-    let allowlist = load_allowlist(&allowlist_path)?;
+        .map(PathBuf::from)
+    {
+        load_allowlist(&path)?
+    } else {
+        parse_allowlist(
+            serde_json::from_str(SHIPPED_ALLOWLIST).map_err(|error| {
+                invalid_allowlist(Path::new(SHIPPED_ALLOWLIST_PATH), error.to_string())
+            })?,
+            Path::new(SHIPPED_ALLOWLIST_PATH),
+        )?
+    };
     let mut tree = derive_tree(options, &allowlist)?;
     let publish_dir = options.paths.state.join("publish");
     prepare_checkout(options, &publish_dir, minter)?;
@@ -232,6 +239,10 @@ fn load_allowlist(path: &Path) -> Result<Allowlist, PublishError> {
         },
         other => other,
     })?;
+    parse_allowlist(value, path)
+}
+
+fn parse_allowlist(value: Value, path: &Path) -> Result<Allowlist, PublishError> {
     let object = value
         .as_object()
         .ok_or_else(|| invalid_allowlist(path, "top level must be an object"))?;
@@ -1205,12 +1216,10 @@ mod tests {
 
     fn fixture_options<'a>(
         paths: &'a OstromPaths,
-        plugin_root: &'a Path,
         destination: &'a PublishDestination,
     ) -> PublishOptions<'a> {
         PublishOptions {
             paths,
-            plugin_root,
             destination,
             published_at: "2026-08-01T00:05:00Z".parse().expect("fixture time"),
             cadence_hours: 24,
@@ -1257,7 +1266,7 @@ mod tests {
         let destination = PublishDestination::explicit(
             RepositoryName::new("placeholder-org/alpha").expect("placeholder repository"),
         );
-        let options = fixture_options(&paths, &plugin, &destination);
+        let options = fixture_options(&paths, &destination);
         let allowlist = load_allowlist(&plugin.join("config/publish-allowlist.json"))
             .expect("load fixture allowlist");
         let tree = derive_tree(&options, &allowlist).expect("derive public tree");
