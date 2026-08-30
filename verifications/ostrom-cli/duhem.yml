@@ -1,0 +1,233 @@
+# Black-box, page-free verification of the real Ostrom CLI. No LLM participates
+# in execution or judgment. Completed process exit codes are observations and
+# are asserted explicitly; no non-zero product exit is swallowed as an action
+# error.
+verification: Ostrom CLI seam contract
+spec_ref: https://github.com/onsager-ai/ostrom/issues/469
+
+inputs:
+  ostrom_bin:
+    type: string
+    default: target/debug/ostrom
+  repo_dir:
+    type: string
+    default: .
+
+criteria:
+  - id: AC-1
+    description: |
+      The operator policy written by `ostrom init` survives sign, validate,
+      and compose without an edit between commands.
+    checks:
+      - id: AC-1.1
+        description: Exercise the complete operator sequence against one real initialized home.
+        steps:
+          - id: prepare
+            uses: cli/invoke
+            with:
+              command: [sh, verifications/ostrom-cli/fixtures/prepare-home.sh, target/duhem-ostrom-cli, default-flow]
+              cwd: $inputs.repo_dir
+              timeout: 30s
+          - id: init
+            uses: cli/invoke
+            with:
+              command: [$inputs.ostrom_bin, init]
+              cwd: $inputs.repo_dir
+              env: { OSTROM_HOME: target/duhem-ostrom-cli/default-flow }
+              timeout: 30s
+          - id: sign
+            uses: cli/invoke
+            with:
+              command: [$inputs.ostrom_bin, sign, --key-id, vd-principal, --key, target/duhem-ostrom-cli/default-flow/private.pem, target/duhem-ostrom-cli/default-flow/ostrom.yaml]
+              cwd: $inputs.repo_dir
+              timeout: 30s
+          - id: validate
+            uses: cli/invoke
+            with:
+              command: [$inputs.ostrom_bin, validate, target/duhem-ostrom-cli/default-flow/ostrom.yaml]
+              cwd: $inputs.repo_dir
+              env: { OSTROM_POLICY_TRUSTED_KEYS: target/duhem-ostrom-cli/default-flow/trusted }
+              timeout: 30s
+          - id: compose
+            uses: cli/invoke
+            with:
+              command: [$inputs.ostrom_bin, compose, target/duhem-ostrom-cli/default-flow/ostrom.yaml]
+              cwd: $inputs.repo_dir
+              env:
+                OSTROM_HOME: target/duhem-ostrom-cli/default-flow
+                OSTROM_POLICY_TRUSTED_KEYS: target/duhem-ostrom-cli/default-flow/trusted
+              timeout: 30s
+        assertions:
+          - $steps.prepare.outputs.exit_code == 0
+          - $steps.init.outputs.exit_code == 0
+          - $steps.sign.outputs.exit_code == 0
+          - $steps.validate.outputs.exit_code == 0
+          - $steps.compose.outputs.exit_code == 0
+          - matches:
+              value: $steps.compose.outputs.stdout
+              pattern: 'composed digest=[0-9a-f]+'
+
+  - id: AC-2
+    description: |
+      Validation and composition agree on the shipped signed default policy.
+    checks:
+      - id: AC-2.1
+        description: The same bytes accepted by validate are accepted by compose.
+        steps:
+          - id: prepare
+            uses: cli/invoke
+            with:
+              command: [sh, verifications/ostrom-cli/fixtures/prepare-signed-default.sh, $inputs.ostrom_bin, target/duhem-ostrom-cli, agreement]
+              cwd: $inputs.repo_dir
+              timeout: 60s
+          - id: validate
+            uses: cli/invoke
+            with:
+              command: [$inputs.ostrom_bin, validate, target/duhem-ostrom-cli/agreement/ostrom.yaml]
+              cwd: $inputs.repo_dir
+              env: { OSTROM_POLICY_TRUSTED_KEYS: target/duhem-ostrom-cli/agreement/trusted }
+              timeout: 30s
+          - id: compose
+            uses: cli/invoke
+            with:
+              command: [$inputs.ostrom_bin, compose, target/duhem-ostrom-cli/agreement/ostrom.yaml]
+              cwd: $inputs.repo_dir
+              env:
+                OSTROM_HOME: target/duhem-ostrom-cli/agreement
+                OSTROM_POLICY_TRUSTED_KEYS: target/duhem-ostrom-cli/agreement/trusted
+              timeout: 30s
+        assertions:
+          - $steps.prepare.outputs.exit_code == 0
+          - $steps.validate.outputs.exit_code == 0
+          - $steps.compose.outputs.exit_code == 0
+
+  - id: AC-3
+    description: Changing signed manifest or referenced prompt content invalidates policy identity.
+    checks:
+      - id: AC-3.1
+        description: A semantic edit to the root manifest is refused.
+        steps:
+          - id: prepare
+            uses: cli/invoke
+            with:
+              command: [sh, verifications/ostrom-cli/fixtures/prepare-signed-default.sh, $inputs.ostrom_bin, target/duhem-ostrom-cli, changed-manifest]
+              cwd: $inputs.repo_dir
+              timeout: 60s
+          - id: edit
+            uses: cli/invoke
+            with:
+              command: [sh, verifications/ostrom-cli/fixtures/edit-fixture.sh, target/duhem-ostrom-cli/changed-manifest/ostrom.yaml, manifest]
+              cwd: $inputs.repo_dir
+          - id: validate
+            uses: cli/invoke
+            with:
+              command: [$inputs.ostrom_bin, validate, target/duhem-ostrom-cli/changed-manifest/ostrom.yaml]
+              cwd: $inputs.repo_dir
+              env: { OSTROM_POLICY_TRUSTED_KEYS: target/duhem-ostrom-cli/changed-manifest/trusted }
+              timeout: 30s
+        assertions:
+          - $steps.prepare.outputs.exit_code == 0
+          - $steps.edit.outputs.exit_code == 0
+          - $steps.validate.outputs.exit_code != 0
+          - matches: { value: $steps.validate.outputs.stderr, pattern: 'verification failed' }
+      - id: AC-3.2
+        description: An edit to a referenced prompt is refused.
+        steps:
+          - id: prepare
+            uses: cli/invoke
+            with:
+              command: [sh, verifications/ostrom-cli/fixtures/prepare-signed-default.sh, $inputs.ostrom_bin, target/duhem-ostrom-cli, changed-prompt]
+              cwd: $inputs.repo_dir
+              timeout: 60s
+          - id: edit
+            uses: cli/invoke
+            with:
+              command: [sh, verifications/ostrom-cli/fixtures/edit-fixture.sh, target/duhem-ostrom-cli/changed-prompt/prompts/work.md, prompt]
+              cwd: $inputs.repo_dir
+          - id: validate
+            uses: cli/invoke
+            with:
+              command: [$inputs.ostrom_bin, validate, target/duhem-ostrom-cli/changed-prompt/ostrom.yaml]
+              cwd: $inputs.repo_dir
+              env: { OSTROM_POLICY_TRUSTED_KEYS: target/duhem-ostrom-cli/changed-prompt/trusted }
+              timeout: 30s
+        assertions:
+          - $steps.prepare.outputs.exit_code == 0
+          - $steps.edit.outputs.exit_code == 0
+          - $steps.validate.outputs.exit_code != 0
+          - matches: { value: $steps.validate.outputs.stderr, pattern: 'verification failed' }
+
+  - id: AC-4
+    description: Unsigned, wrongly signed, and trust-unset manifests are refused.
+    checks:
+      - id: AC-4.1
+        description: An unsigned initialized manifest is refused by an explicit empty trust set.
+        steps:
+          - id: prepare
+            uses: cli/invoke
+            with:
+              command: [sh, verifications/ostrom-cli/fixtures/prepare-unsigned-default.sh, $inputs.ostrom_bin, target/duhem-ostrom-cli, unsigned]
+              cwd: $inputs.repo_dir
+              timeout: 30s
+          - id: validate
+            uses: cli/invoke
+            with:
+              command: [$inputs.ostrom_bin, validate, target/duhem-ostrom-cli/unsigned/ostrom.yaml]
+              cwd: $inputs.repo_dir
+              env: { OSTROM_POLICY_TRUSTED_KEYS: target/duhem-ostrom-cli/unsigned/trusted }
+        assertions:
+          - $steps.prepare.outputs.exit_code == 0
+          - $steps.validate.outputs.exit_code != 0
+          - matches: { value: $steps.validate.outputs.stderr, pattern: 'signature is missing' }
+      - id: AC-4.2
+        description: A signature whose public key is absent from the selected trust set is refused.
+        steps:
+          - id: prepare
+            uses: cli/invoke
+            with:
+              command: [sh, verifications/ostrom-cli/fixtures/prepare-signed-default.sh, $inputs.ostrom_bin, target/duhem-ostrom-cli, wrong-trust]
+              cwd: $inputs.repo_dir
+              timeout: 60s
+          - id: validate
+            uses: cli/invoke
+            with:
+              command: [$inputs.ostrom_bin, validate, target/duhem-ostrom-cli/wrong-trust/ostrom.yaml]
+              cwd: $inputs.repo_dir
+              env: { OSTROM_POLICY_TRUSTED_KEYS: target/duhem-ostrom-cli/wrong-trust/empty-trust }
+        assertions:
+          - $steps.prepare.outputs.exit_code == 0
+          - $steps.validate.outputs.exit_code != 0
+          - matches: { value: $steps.validate.outputs.stderr, pattern: 'untrusted key' }
+      - id: AC-4.3
+        description: No configured trust directory means refusal, not fallback.
+        steps:
+          - id: prepare
+            uses: cli/invoke
+            with:
+              command: [sh, verifications/ostrom-cli/fixtures/prepare-signed-default.sh, $inputs.ostrom_bin, target/duhem-ostrom-cli, trust-unset]
+              cwd: $inputs.repo_dir
+              timeout: 60s
+          - id: validate
+            uses: cli/invoke
+            with:
+              command: [$inputs.ostrom_bin, validate, target/duhem-ostrom-cli/trust-unset/ostrom.yaml]
+              cwd: $inputs.repo_dir
+        assertions:
+          - $steps.prepare.outputs.exit_code == 0
+          - $steps.validate.outputs.exit_code != 0
+          - matches: { value: $steps.validate.outputs.stderr, pattern: 'OSTROM_POLICY_TRUSTED_KEYS' }
+
+  - id: AC-5
+    description: At an exact release tag, the binary version matches that tag.
+    checks:
+      - id: AC-5.1
+        description: Compare the real binary's semver with Git's exact tag mechanically.
+        steps:
+          - id: version_matches_tag
+            uses: cli/invoke
+            with:
+              command: [sh, verifications/ostrom-cli/fixtures/version-matches-tag.sh, $inputs.ostrom_bin]
+              cwd: $inputs.repo_dir
+              timeout: 30s
+        assertions:
+          - $steps.version_matches_tag.outputs.exit_code == 0
