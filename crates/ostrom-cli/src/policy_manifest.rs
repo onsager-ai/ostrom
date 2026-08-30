@@ -189,8 +189,9 @@ pub(crate) fn load_bundle(
     build_bundle(paths, repository_path, repository)
 }
 
-/// Compose repository policy with the adopting operator scope, validating and
-/// verifying every signed input before returning the effective manifest.
+/// Compose policy into its effective manifest, retaining an operator root as
+/// operator policy or layering a repository root with the adopting operator.
+/// Every signed input is verified before the effective manifest is returned.
 pub(crate) fn compose_manifest(
     paths: &OstromPaths,
     path: &Path,
@@ -206,8 +207,17 @@ fn build_bundle(
     repository: LoadedManifest,
 ) -> Result<PolicyBundle, PolicyLoadError> {
     let operator_path = operator_manifest_path(paths)?;
+    if operator_path
+        .as_deref()
+        .is_some_and(|operator_path| same_file(operator_path, &repository_path))
+    {
+        validate_scoped_manifest(&repository.manifest, None)?;
+        return Ok(PolicyBundle::operator(
+            repository.manifest,
+            repository.origins,
+        ));
+    }
     let operator = operator_path
-        .filter(|operator_path| operator_path != &repository_path)
         .map(|operator_path| {
             let loaded = load_composed(&operator_path)?;
             verify(&loaded.manifest, &operator_path)?;

@@ -9,6 +9,8 @@ use std::{
 
 use tempfile::TempDir;
 
+use ostrom_core::PolicyManifest;
+
 mod support;
 
 const OPERATOR: &str = concat!(
@@ -431,5 +433,76 @@ fn composing_does_not_disturb_the_sweep_backup_directory() {
     assert_eq!(
         fs::read_link(fixture.home.join("previous-version")).expect("read rollback pointer"),
         Path::new("versions").join(first)
+    );
+}
+
+#[test]
+fn init_manifest_validates_and_composes_as_operator_policy() {
+    let root = TempDir::new().expect("temporary init fixture");
+    let home = root.path().join("home");
+    fs::create_dir(&home).expect("create operator home");
+
+    let init = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .env("OSTROM_HOME", &home)
+        .arg("init")
+        .output()
+        .expect("run ostrom init");
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    let manifest = home.join("ostrom.yaml");
+    let trusted_keys = support::sign_manifest(&manifest);
+    let validate = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .env("OSTROM_HOME", &home)
+        .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
+        .args(["validate"])
+        .arg(&manifest)
+        .output()
+        .expect("validate init manifest");
+    assert!(
+        validate.status.success(),
+        "validate rejected the init manifest: {}",
+        String::from_utf8_lossy(&validate.stderr)
+    );
+
+    let compose = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .current_dir(&home)
+        .env("OSTROM_HOME", &home)
+        .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
+        .arg("compose")
+        .output()
+        .expect("compose init manifest");
+    assert!(
+        compose.status.success(),
+        "compose disagreed with validate: {}",
+        String::from_utf8_lossy(&compose.stderr)
+    );
+
+    let current = fs::read_link(home.join("current")).expect("read current policy pointer");
+    let composed = fs::read_to_string(home.join(current).join("ostrom.yaml"))
+        .expect("read composed operator policy");
+    let composed = PolicyManifest::from_yaml(&composed).expect("parse composed operator policy");
+    assert!(composed.operations.contains_key("build-pass"));
+    assert!(composed.operations.contains_key("gate-pass"));
+    assert!(
+        composed
+            .grants
+            .get("builder-build")
+            .expect("builder grant retained")
+            .operations
+            .iter()
+            .any(|operation| operation == "build-pass")
+    );
+    assert!(
+        composed
+            .grants
+            .get("gatekeeper-gate")
+            .expect("gatekeeper grant retained")
+            .operations
+            .iter()
+            .any(|operation| operation == "gate-pass")
     );
 }

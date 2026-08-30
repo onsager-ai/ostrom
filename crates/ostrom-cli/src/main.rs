@@ -66,7 +66,7 @@ struct Cli {
 enum Command {
     /// Compose signed policy into an immutable content-addressed version.
     Compose {
-        /// Repository policy manifest; defaults to repository discovery.
+        /// Operator or repository policy manifest; defaults to repository discovery.
         manifest: Option<PathBuf>,
     },
     /// Sign a fully composed Ostrom policy manifest.
