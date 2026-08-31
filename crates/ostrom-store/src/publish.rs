@@ -82,6 +82,19 @@ struct Allowlist {
 #[derive(Clone)]
 struct DerivedTree {
     files: BTreeMap<PathBuf, Vec<u8>>,
+    gate_publication: GatePublication,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GatePublication {
+    Authoritative,
+    PreservePublished,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CheckoutBase {
+    PublishedState,
+    Empty,
 }
 
 pub(crate) fn publish(
@@ -107,7 +120,8 @@ pub(crate) fn publish(
     };
     let mut tree = derive_tree(options, &allowlist)?;
     let publish_dir = options.paths.state.join("publish");
-    prepare_checkout(options, &publish_dir, minter)?;
+    let checkout_base = prepare_checkout(options, &publish_dir, minter)?;
+    reconcile_preserved_gate(&publish_dir, checkout_base, &mut tree)?;
     reuse_previous_time_if_unchanged(&publish_dir, &mut tree)?;
     install_tree(&publish_dir, &tree)?;
 
@@ -160,12 +174,16 @@ fn derive_tree(
             return Err(PublishError::SourceMissing(source.display().to_string()));
         }
     }
-    let gate_path = options.paths.state.join("gate.jsonl");
     let queue_source = read_jsonl(&queue_path)?;
-    let gate_source = if gate_path.is_file() {
-        read_jsonl(&gate_path)?
-    } else {
-        Vec::new()
+    let gate_path = options.paths.state.join("gate.jsonl");
+    // Presence is the gate authority assertion. Only NotFound means that this
+    // publisher must leave the branch's gate-owned artifacts alone.
+    let (gate_source, gate_publication) = match fs::metadata(&gate_path) {
+        Ok(_) => (read_jsonl(&gate_path)?, GatePublication::Authoritative),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            (Vec::new(), GatePublication::PreservePublished)
+        }
+        Err(source) => return Err(path_error(&gate_path, source)),
     };
     let state_source = read_json(&state_path)?;
 
@@ -209,7 +227,7 @@ fn derive_tree(
         "retention": {"gate_days": RETAINED_GATE_DAYS, "rollup": "forever"},
         "record_counts": {
             "queue": queue.len(),
-            "gate": gate.len(),
+            "gate": partitions.values().map(Vec::len).sum::<usize>(),
             "state_repos": state.get("repos").and_then(Value::as_object).map_or(0, Map::len),
             "gate_partitions": partitions.len(),
         },
@@ -228,7 +246,10 @@ fn derive_tree(
     for (day, records) in partitions {
         files.insert(PathBuf::from(format!("gate/{day}.jsonl")), jsonl(&records));
     }
-    Ok(DerivedTree { files })
+    Ok(DerivedTree {
+        files,
+        gate_publication,
+    })
 }
 
 fn load_allowlist(path: &Path) -> Result<Allowlist, PublishError> {
@@ -753,7 +774,7 @@ fn prepare_checkout(
     options: &PublishOptions<'_>,
     directory: &Path,
     minter: &mut dyn InstallationTokenMinter,
-) -> Result<(), PublishError> {
+) -> Result<CheckoutBase, PublishError> {
     let parent = directory.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).map_err(|source| path_error(parent, source))?;
     if directory.exists() && !is_git_checkout(directory) {
@@ -826,6 +847,7 @@ fn prepare_checkout(
             &["checkout", "-B", "state", "FETCH_HEAD"],
             &[0],
         )?;
+        Ok(CheckoutBase::PublishedState)
     } else {
         // There is no remote state branch to reset to. Clear residue against
         // the local HEAD when one exists; status 128 is the expected unborn
@@ -844,8 +866,8 @@ fn prepare_checkout(
         // Clearing it prevents unrelated remote content from entering the
         // first public snapshot.
         git_required(Some(directory), &["read-tree", "--empty"], &[0])?;
+        Ok(CheckoutBase::Empty)
     }
-    Ok(())
 }
 
 fn is_git_checkout(directory: &Path) -> bool {
@@ -870,6 +892,85 @@ fn quarantine_invalid_checkout(directory: &Path) -> Result<(), PublishError> {
     fs::rename(directory, &quarantine).map_err(|source| path_error(directory, source))
 }
 
+fn reconcile_preserved_gate(
+    checkout: &Path,
+    checkout_base: CheckoutBase,
+    tree: &mut DerivedTree,
+) -> Result<(), PublishError> {
+    if tree.gate_publication == GatePublication::Authoritative {
+        return Ok(());
+    }
+
+    if checkout_base == CheckoutBase::Empty {
+        return Ok(());
+    }
+
+    let (gate_records, gate_partitions) = published_gate_counts(checkout)?;
+    let previous_rollup_path = checkout.join("rollup.json");
+    if previous_rollup_path.is_file() {
+        let previous_rollup = read_json(&previous_rollup_path)?;
+        let verdicts = previous_rollup
+            .get("verdicts_by_day")
+            .filter(|value| value.is_object())
+            .ok_or_else(|| {
+                invalid_record(
+                    previous_rollup_path.display().to_string(),
+                    "verdicts_by_day must be an object",
+                )
+            })?
+            .clone();
+        let bytes = tree
+            .files
+            .get(Path::new("rollup.json"))
+            .expect("derived trees contain rollup.json");
+        let mut rollup: Value = serde_json::from_slice(bytes)
+            .map_err(|error| invalid_record("derived rollup", error.to_string()))?;
+        rollup["verdicts_by_day"] = verdicts;
+        tree.files
+            .insert("rollup.json".into(), pretty_json(&rollup));
+    } else if gate_records != 0 || gate_partitions != 0 {
+        return Err(PublishError::SourceMissing(
+            previous_rollup_path.display().to_string(),
+        ));
+    }
+
+    let bytes = tree
+        .files
+        .get(Path::new("manifest.json"))
+        .expect("derived trees contain manifest.json");
+    let mut manifest: Value = serde_json::from_slice(bytes)
+        .map_err(|error| invalid_record("derived manifest", error.to_string()))?;
+    manifest["record_counts"]["gate"] = json!(gate_records);
+    manifest["record_counts"]["gate_partitions"] = json!(gate_partitions);
+    tree.files
+        .insert("manifest.json".into(), pretty_json(&manifest));
+    Ok(())
+}
+
+fn published_gate_counts(checkout: &Path) -> Result<(usize, usize), PublishError> {
+    let gate_directory = checkout.join("gate");
+    if !gate_directory.is_dir() {
+        return Ok((0, 0));
+    }
+    let entries =
+        fs::read_dir(&gate_directory).map_err(|source| path_error(&gate_directory, source))?;
+    let mut records = 0;
+    let mut partitions = 0;
+    for entry in entries {
+        let entry = entry.map_err(|source| path_error(&gate_directory, source))?;
+        let path = entry.path();
+        if path.is_file()
+            && path
+                .extension()
+                .is_some_and(|extension| extension == "jsonl")
+        {
+            records += read_jsonl(&path)?.len();
+            partitions += 1;
+        }
+    }
+    Ok((records, partitions))
+}
+
 fn reuse_previous_time_if_unchanged(
     checkout: &Path,
     tree: &mut DerivedTree,
@@ -891,29 +992,31 @@ fn reuse_previous_time_if_unchanged(
         .map_err(|error| invalid_record("derived manifest", error.to_string()))?;
     candidate["published_at"] = json!(previous_time);
     let candidate_bytes = pretty_json(&candidate);
-    let current_gate = tree
-        .files
-        .keys()
-        .filter(|path| path.starts_with("gate"))
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let previous_gate = if checkout.join("gate").is_dir() {
-        fs::read_dir(checkout.join("gate"))
-            .map_err(|source| path_error(&checkout.join("gate"), source))?
-            .filter_map(Result::ok)
-            .filter(|entry| {
-                entry
-                    .path()
-                    .extension()
-                    .is_some_and(|extension| extension == "jsonl")
-            })
-            .map(|entry| PathBuf::from("gate").join(entry.file_name()))
-            .collect::<BTreeSet<_>>()
-    } else {
-        BTreeSet::new()
-    };
-    if current_gate != previous_gate {
-        return Ok(());
+    if tree.gate_publication == GatePublication::Authoritative {
+        let current_gate = tree
+            .files
+            .keys()
+            .filter(|path| path.starts_with("gate"))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let previous_gate = if checkout.join("gate").is_dir() {
+            fs::read_dir(checkout.join("gate"))
+                .map_err(|source| path_error(&checkout.join("gate"), source))?
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension == "jsonl")
+                })
+                .map(|entry| PathBuf::from("gate").join(entry.file_name()))
+                .collect::<BTreeSet<_>>()
+        } else {
+            BTreeSet::new()
+        };
+        if current_gate != previous_gate {
+            return Ok(());
+        }
     }
     for (path, expected) in &tree.files {
         let expected = if path == Path::new("manifest.json") {
@@ -930,24 +1033,27 @@ fn reuse_previous_time_if_unchanged(
 }
 
 fn install_tree(checkout: &Path, tree: &DerivedTree) -> Result<(), PublishError> {
+    let mut replaced_paths = vec!["manifest.json", "queue.jsonl", "state.json", "rollup.json"];
+    if tree.gate_publication == GatePublication::Authoritative {
+        replaced_paths.push("gate");
+    }
+    // A preserving publication deliberately omits gate from git rm and has no
+    // derived gate files to write, so the fetched partition blobs stay intact.
     git_required(
         Some(checkout),
-        &[
-            "rm",
-            "-r",
-            "--quiet",
-            "--ignore-unmatch",
-            "manifest.json",
-            "queue.jsonl",
-            "state.json",
-            "rollup.json",
-            "gate",
-        ],
+        &std::iter::once("rm")
+            .chain(["-r", "--quiet", "--ignore-unmatch"])
+            .chain(replaced_paths.iter().copied())
+            .collect::<Vec<_>>(),
         &[0],
     )?;
-    fs::create_dir_all(checkout.join("gate"))
-        .map_err(|source| path_error(&checkout.join("gate"), source))?;
-    set_private_directory_mode(&checkout.join("gate"))?;
+    if tree.gate_publication == GatePublication::Authoritative
+        && tree.files.keys().any(|path| path.starts_with("gate/"))
+    {
+        fs::create_dir_all(checkout.join("gate"))
+            .map_err(|source| path_error(&checkout.join("gate"), source))?;
+        set_private_directory_mode(&checkout.join("gate"))?;
+    }
     for (relative, bytes) in &tree.files {
         let path = checkout.join(relative);
         if let Some(parent) = path.parent() {
@@ -959,16 +1065,17 @@ fn install_tree(checkout: &Path, tree: &DerivedTree) -> Result<(), PublishError>
             message: error.to_string(),
         })?;
     }
+    let mut added_paths = vec!["manifest.json", "queue.jsonl", "state.json", "rollup.json"];
+    if tree.gate_publication == GatePublication::Authoritative
+        && tree.files.keys().any(|path| path.starts_with("gate/"))
+    {
+        added_paths.push("gate");
+    }
     git_required(
         Some(checkout),
-        &[
-            "add",
-            "manifest.json",
-            "queue.jsonl",
-            "state.json",
-            "rollup.json",
-            "gate",
-        ],
+        &std::iter::once("add")
+            .chain(added_paths)
+            .collect::<Vec<_>>(),
         &[0],
     )?;
     Ok(())
@@ -1366,6 +1473,7 @@ mod tests {
                 ),
                 (PathBuf::from("queue.jsonl"), Vec::new()),
             ]),
+            gate_publication: GatePublication::Authoritative,
         };
 
         reuse_previous_time_if_unchanged(root.path(), &mut tree)
