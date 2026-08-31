@@ -25,6 +25,14 @@ projects:
     bounce: []
 "#;
 const ACQUIRED_FIXTURE: &str = r#"{"repositories":[{"repo":"placeholder-org/alpha","issues":[],"open_prs":[],"merged_prs":[],"default_branch":"main","branches":[],"branch_read_degraded":false,"ci_runs":[]}]}"#;
+const PUBLISHED_GATE_FIXTURE: &str = concat!(
+    r#"{"ts":"2026-04-01T00:00:00Z","pr":"placeholder-org/alpha#1","head_sha":"old-placeholder","verdict":"fail","already_judged":false,"conditions":[]}"#,
+    "\n",
+    r#"{"ts":"2026-07-30T00:00:00Z","pr":"placeholder-org/alpha#2","head_sha":"recent-placeholder","verdict":"pass","already_judged":false,"conditions":[]}"#,
+    "\n",
+    r#"{"ts":"2026-08-01T00:00:00Z","pr":"placeholder-org/alpha#3","head_sha":"latest-placeholder","verdict":"inconclusive","already_judged":false,"conditions":[]}"#,
+    "\n",
+);
 
 fn write_sweep_fixture(root: &Path, body: &str) -> (PathBuf, PathBuf) {
     let home = root.join("ostrom-home");
@@ -439,6 +447,108 @@ fn publication_recovers_dirty_and_invalid_checkouts_without_losing_local_records
     );
 }
 
+#[test]
+fn absent_gate_source_preserves_published_partitions_rollup_and_counts() {
+    let root = tempdir().expect("gate preservation publication fixture");
+    let (home, fixture) = write_sweep_fixture(root.path(), ACQUIRED_FIXTURE);
+    fs::write(home.join("gate.jsonl"), PUBLISHED_GATE_FIXTURE)
+        .expect("write authoritative gate fixture");
+    let publisher = local_publisher(root.path());
+
+    run_local_publication(&home, &fixture, &publisher);
+
+    let first_gate_tree = git_output_bare(&publisher.remote, &["ls-tree", "-r", "state", "gate"]);
+    assert!(first_gate_tree.contains("gate/2026-07-30.jsonl"));
+    assert!(first_gate_tree.contains("gate/2026-08-01.jsonl"));
+    assert!(!first_gate_tree.contains("gate/2026-04-01.jsonl"));
+    let first_rollup = git_json_bare(&publisher.remote, "state:rollup.json");
+    assert_eq!(first_rollup["verdicts_by_day"]["2026-04-01"]["fail"], 1);
+    let first_manifest = git_json_bare(&publisher.remote, "state:manifest.json");
+    assert_eq!(first_manifest["record_counts"]["gate"], 2);
+    assert_eq!(first_manifest["record_counts"]["gate_partitions"], 2);
+
+    fs::remove_file(home.join("gate.jsonl")).expect("remove gate source from publishing host");
+    fs::write(
+        home.join("mandates.yaml"),
+        ROSTER.replace("cadence_hours: 24", "cadence_hours: 12"),
+    )
+    .expect("change a non-gate publication input");
+    run_local_publication(&home, &fixture, &publisher);
+
+    assert_eq!(
+        git_output_bare(&publisher.remote, &["rev-list", "--count", "state"]),
+        "2",
+        "the second run must publish while gate is absent"
+    );
+    assert_eq!(
+        git_output_bare(&publisher.remote, &["ls-tree", "-r", "state^", "gate"]),
+        git_output_bare(&publisher.remote, &["ls-tree", "-r", "state", "gate"]),
+        "preserved gate partitions were rewritten or removed"
+    );
+    let second_rollup = git_json_bare(&publisher.remote, "state:rollup.json");
+    assert_eq!(
+        second_rollup["verdicts_by_day"], first_rollup["verdicts_by_day"],
+        "the forever-retained gate rollup was not preserved"
+    );
+    let second_manifest = git_json_bare(&publisher.remote, "state:manifest.json");
+    assert_eq!(second_manifest["record_counts"]["gate"], 2);
+    assert_eq!(second_manifest["record_counts"]["gate_partitions"], 2);
+}
+
+#[test]
+fn present_empty_gate_source_authoritatively_clears_published_gate() {
+    let root = tempdir().expect("authoritative empty gate publication fixture");
+    let (home, fixture) = write_sweep_fixture(root.path(), ACQUIRED_FIXTURE);
+    fs::write(home.join("gate.jsonl"), PUBLISHED_GATE_FIXTURE)
+        .expect("write authoritative gate fixture");
+    let publisher = local_publisher(root.path());
+
+    run_local_publication(&home, &fixture, &publisher);
+    assert!(!git_output_bare(&publisher.remote, &["ls-tree", "-r", "state", "gate"]).is_empty());
+
+    fs::write(home.join("gate.jsonl"), "").expect("write present empty gate source");
+    fs::write(
+        home.join("mandates.yaml"),
+        ROSTER.replace("cadence_hours: 24", "cadence_hours: 12"),
+    )
+    .expect("change a non-gate publication input");
+    run_local_publication(&home, &fixture, &publisher);
+
+    assert_eq!(
+        git_output_bare(&publisher.remote, &["rev-list", "--count", "state"]),
+        "2"
+    );
+    assert!(
+        git_output_bare(&publisher.remote, &["ls-tree", "-r", "state", "gate"]).is_empty(),
+        "a present empty authoritative source did not clear gate partitions"
+    );
+    let rollup = git_json_bare(&publisher.remote, "state:rollup.json");
+    assert_eq!(rollup["verdicts_by_day"], serde_json::json!({}));
+    let manifest = git_json_bare(&publisher.remote, "state:manifest.json");
+    assert_eq!(manifest["record_counts"]["gate"], 0);
+    assert_eq!(manifest["record_counts"]["gate_partitions"], 0);
+}
+
+fn run_local_publication(home: &Path, fixture: &Path, publisher: &LocalPublisher) {
+    let mut command = run_sweep(home, fixture);
+    publisher.apply(&mut command);
+    let output = command
+        .args(["--publish-repository", "placeholder-org/alpha"])
+        .env("GIT_AUTHOR_NAME", "Ostrom Test")
+        .env("GIT_AUTHOR_EMAIL", "ostrom@example.test")
+        .env("GIT_COMMITTER_NAME", "Ostrom Test")
+        .env("GIT_COMMITTER_EMAIL", "ostrom@example.test")
+        .output()
+        .expect("run local publication");
+    assert!(
+        output.status.success()
+            && !String::from_utf8_lossy(&output.stderr).contains("publish failed"),
+        "stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn run_recovery_sweep(home: &Path, fixture: &Path, publisher: &LocalPublisher) {
     let mut command = run_sweep(home, fixture);
     publisher.apply(&mut command);
@@ -495,6 +605,11 @@ fn git_output_bare_optional(remote: &Path, arguments: &[&str]) -> Option<String>
         .status
         .success()
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn git_json_bare(remote: &Path, revision: &str) -> serde_json::Value {
+    serde_json::from_str(&git_output_bare(remote, &["show", revision]))
+        .expect("published file is valid JSON")
 }
 
 fn path_text(path: &Path) -> &str {
