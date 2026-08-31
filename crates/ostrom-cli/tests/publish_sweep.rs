@@ -61,6 +61,54 @@ fn command_spies(root: &Path) -> (PathBuf, PathBuf) {
     (bin, log)
 }
 
+struct LocalPublisher {
+    remote: PathBuf,
+    bin: PathBuf,
+    gh_as: PathBuf,
+    real_git: PathBuf,
+}
+
+impl LocalPublisher {
+    fn apply(&self, command: &mut Command) {
+        command
+            .env("PATH", path_with(&self.bin))
+            .env("MANDATE_GH_AS_BIN", &self.gh_as)
+            .env("OSTROM_TEST_LOCAL_REMOTE", &self.remote)
+            .env("OSTROM_TEST_REAL_GIT", &self.real_git);
+    }
+}
+
+fn local_publisher(root: &Path) -> LocalPublisher {
+    let remote = root.join("state.git");
+    git(None, &["init", "--bare", "--quiet", path_text(&remote)]);
+    let bin = root.join("publisher-bin");
+    fs::create_dir(&bin).expect("create publisher adapter directory");
+    executable(
+        &bin.join("gh"),
+        r#"#!/bin/sh
+set -eu
+[ "$1" = repo ]
+[ "$2" = clone ]
+exec "$OSTROM_TEST_REAL_GIT" clone --no-checkout "$OSTROM_TEST_LOCAL_REMOTE" "$4"
+"#,
+    );
+    let gh_as = bin.join("credential-boundary.sh");
+    executable(
+        &gh_as,
+        r#"#!/bin/sh
+set -eu
+shift 7
+exec "$@"
+"#,
+    );
+    LocalPublisher {
+        remote,
+        bin,
+        gh_as,
+        real_git: which("git").expect("find real git executable"),
+    }
+}
+
 fn run_sweep(home: &Path, fixture: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ostrom"));
     command
@@ -307,6 +355,107 @@ exec "$@"
     );
     assert!(
         git_output_bare_optional(&remote, &["show-ref", "--verify", "refs/heads/state"]).is_none()
+    );
+}
+
+#[test]
+fn publication_recovers_dirty_and_invalid_checkouts_without_losing_local_records() {
+    let root = tempdir().expect("recoverable publication fixture");
+    let (home, fixture) = write_sweep_fixture(root.path(), ACQUIRED_FIXTURE);
+    let unpublished_gate = concat!(
+        r#"{"ts":"2026-08-01T00:00:00Z","pr":"placeholder-org/alpha#475","head_sha":"unpublished-placeholder","verdict":"pass","already_judged":false,"conditions":[]}"#,
+        "\n",
+    );
+    fs::write(home.join("gate.jsonl"), unpublished_gate)
+        .expect("write authoritative unpublished record");
+    let publisher = local_publisher(root.path());
+    let empty_git_config = root.path().join("empty-gitconfig");
+    fs::write(&empty_git_config, "").expect("write empty git config");
+
+    let mut first = run_sweep(&home, &fixture);
+    publisher.apply(&mut first);
+    let first_output = first
+        .args(["--publish-repository", "placeholder-org/alpha"])
+        .env("GIT_CONFIG_GLOBAL", &empty_git_config)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_AUTHOR_NAME")
+        .env_remove("GIT_AUTHOR_EMAIL")
+        .env_remove("GIT_COMMITTER_NAME")
+        .env_remove("GIT_COMMITTER_EMAIL")
+        .output()
+        .expect("run publication whose commit fails");
+    assert!(first_output.status.success());
+    assert!(
+        String::from_utf8_lossy(&first_output.stderr).contains("publish failed"),
+        "stderr: {}",
+        String::from_utf8_lossy(&first_output.stderr)
+    );
+    assert_eq!(
+        Command::new("git")
+            .arg("-C")
+            .arg(home.join("publish"))
+            .args(["diff", "--cached", "--quiet"])
+            .status()
+            .expect("inspect staged residue")
+            .code(),
+        Some(1),
+        "the fixture must reproduce staged residue"
+    );
+
+    run_recovery_sweep(&home, &fixture, &publisher);
+    assert_eq!(
+        git_output_bare(&publisher.remote, &["rev-list", "--count", "state"]),
+        "1"
+    );
+    assert_eq!(
+        git_output_bare(&publisher.remote, &["show", "state:gate/2026-08-01.jsonl"]),
+        unpublished_gate.trim(),
+        "checkout recovery discarded a record authoritative on the volume"
+    );
+
+    fs::write(home.join("publish/manifest.json"), "staged residue\n")
+        .expect("write staged residue");
+    git(Some(&home.join("publish")), &["add", "manifest.json"]);
+    run_recovery_sweep(&home, &fixture, &publisher);
+
+    fs::write(home.join("publish/unrelated.tmp"), "untracked residue\n")
+        .expect("write untracked residue");
+    run_recovery_sweep(&home, &fixture, &publisher);
+    assert!(!home.join("publish/unrelated.tmp").exists());
+
+    fs::remove_dir_all(home.join("publish")).expect("replace fixture checkout");
+    fs::create_dir(home.join("publish")).expect("create invalid checkout");
+    fs::write(home.join("publish/unknown-record"), "preserve me\n")
+        .expect("write unknown volume content");
+    run_recovery_sweep(&home, &fixture, &publisher);
+    assert_eq!(
+        fs::read_to_string(home.join("publish.invalid-1/unknown-record"))
+            .expect("read quarantined volume content"),
+        "preserve me\n"
+    );
+    assert_eq!(
+        git_output_bare(&publisher.remote, &["show", "state:gate/2026-08-01.jsonl"]),
+        unpublished_gate.trim()
+    );
+}
+
+fn run_recovery_sweep(home: &Path, fixture: &Path, publisher: &LocalPublisher) {
+    let mut command = run_sweep(home, fixture);
+    publisher.apply(&mut command);
+    let output = command
+        .args(["--publish-repository", "placeholder-org/alpha"])
+        .env("GIT_AUTHOR_NAME", "Ostrom Test")
+        .env("GIT_AUTHOR_EMAIL", "ostrom@example.test")
+        .env("GIT_COMMITTER_NAME", "Ostrom Test")
+        .env("GIT_COMMITTER_EMAIL", "ostrom@example.test")
+        .output()
+        .expect("run recovered publication");
+    assert!(
+        output.status.success()
+            && !String::from_utf8_lossy(&output.stderr).contains("publish failed"),
+        "stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

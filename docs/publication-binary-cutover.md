@@ -53,6 +53,9 @@ Remove `--publish-repository` from the service command, reload the unit, and
 run one sweep. Omission is the complete publication kill switch and does not
 depend on environment cleanup.
 
-Do not delete the private publication checkout during incident response. It is
-safe to retain, makes the failed attempt auditable, and can be reused by a
-known-good binary after the destination and credentials have been verified.
+Do not delete the private publication checkout during incident response. Each
+publish restores a valid checkout to the fetched `state` branch before
+rebuilding it from the authoritative local queue, state, and gate records. A
+path that is not a Git checkout is moved aside as `publish.invalid-N` before a
+fresh clone, preserving its contents for inspection rather than deleting
+unknown volume data.
