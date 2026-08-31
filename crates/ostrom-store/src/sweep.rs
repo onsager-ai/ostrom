@@ -124,6 +124,7 @@ pub struct SweepOutcome {
     pub queue_changes: usize,
     pub mode: SweepMode,
     pub faults: Vec<String>,
+    pub publication_failure: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -504,6 +505,7 @@ fn run_sweep_with_minter(
     // Publication observes only a durable successful generation. Every
     // refusal path, including zero acquisition, returns above the writes and
     // therefore cannot reach this edge.
+    let mut publication_failure = None;
     if let PublishTarget::Explicit(destination) = &options.publish {
         match publish(
             &PublishOptions {
@@ -521,9 +523,11 @@ fn run_sweep_with_minter(
                 );
             }
             Ok(PublishOutcome::Unchanged) => println!("mandate publish: unchanged"),
-            Err(error) => faults.push(format!(
-                "publish failed; local records remain authoritative: {error}"
-            )),
+            Err(error) => {
+                publication_failure = Some(format!(
+                    "publish failed; local records remain authoritative: {error}"
+                ));
+            }
         }
     }
 
@@ -533,6 +537,7 @@ fn run_sweep_with_minter(
             queue_changes,
             mode,
             faults,
+            publication_failure,
         },
         mirror,
     ))
