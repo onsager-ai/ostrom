@@ -1082,6 +1082,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             for fault in &outcome.faults {
                 eprintln!("mandate sweep: {fault}");
             }
+            if let Some(failure) = &outcome.publication_failure {
+                exit_message(&format!("mandate sweep: {failure}"), 1);
+            }
         }
         Command::Plan {
             mode,

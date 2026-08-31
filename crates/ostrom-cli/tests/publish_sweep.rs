@@ -33,6 +33,8 @@ const PUBLISHED_GATE_FIXTURE: &str = concat!(
     r#"{"ts":"2026-08-01T00:00:00Z","pr":"placeholder-org/alpha#3","head_sha":"latest-placeholder","verdict":"inconclusive","already_judged":false,"conditions":[]}"#,
     "\n",
 );
+const ACQUIRED_RECORD_FIXTURE: &str = r#"{"repositories":[{"repo":"placeholder-org/alpha","issues":[{"number":478,"title":"Preserve the authoritative sweep record","body":"","labels":[],"created_at":"2026-07-31T00:00:00Z","updated_at":"2026-08-01T00:00:00Z","state":"open"}],"open_prs":[],"merged_prs":[],"default_branch":"main","branches":[],"branch_read_degraded":false,"ci_runs":[]}]}"#;
+const ACQUISITION_FAULT_FIXTURE: &str = r#"{"repositories":[{"repo":"placeholder-org/alpha","issues":[],"open_prs":[],"merged_prs":[],"default_branch":"main","branches":[],"branch_read_degraded":false,"ci_runs":[],"warnings":["default-branch CI query failed: placeholder acquisition fault"]}]}"#;
 
 fn write_sweep_fixture(root: &Path, body: &str) -> (PathBuf, PathBuf) {
     let home = root.join("ostrom-home");
@@ -164,6 +166,28 @@ fn inherited_publish_environment_cannot_enable_publication_without_the_typed_opt
 }
 
 #[test]
+fn acquisition_fault_alone_exits_zero() {
+    let root = tempdir().expect("partial acquisition fixture");
+    let (home, fixture) = write_sweep_fixture(root.path(), ACQUISITION_FAULT_FIXTURE);
+    let output = run_sweep(&home, &fixture)
+        .output()
+        .expect("run sweep with an acquisition fault");
+
+    assert!(
+        output.status.success(),
+        "stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("placeholder acquisition fault"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!home.join("publish").exists());
+}
+
+#[test]
 fn explicit_destination_publishes_only_to_a_local_remote() {
     let root = tempdir().expect("local publication remote");
     let (home, fixture) = write_sweep_fixture(root.path(), ACQUIRED_FIXTURE);
@@ -274,9 +298,10 @@ fn malformed_publish_allowlist_override_fails_before_destination_access() {
         .output()
         .expect("run publication with malformed override");
 
-    assert!(
-        output.status.success(),
-        "publication failure must not fail reconciliation: {}",
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -294,7 +319,7 @@ fn malformed_publish_allowlist_override_fails_before_destination_access() {
 #[test]
 fn rejected_publication_keeps_the_successful_local_generation() {
     let root = tempdir().expect("rejected local publication remote");
-    let (home, fixture) = write_sweep_fixture(root.path(), ACQUIRED_FIXTURE);
+    let (home, fixture) = write_sweep_fixture(root.path(), ACQUIRED_RECORD_FIXTURE);
     let remote = root.path().join("rejecting-state.git");
     git(None, &["init", "--bare", "--quiet", path_text(&remote)]);
     let hooks = remote.join("hooks");
@@ -347,13 +372,22 @@ exec "$@"
         .output()
         .expect("run sweep with rejected publication");
 
-    assert!(
-        output.status.success(),
-        "publication failure must not fail reconciliation: {}",
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(home.join("queue.jsonl").is_file());
     assert!(home.join("state.json").is_file());
+    let state: serde_json::Value = serde_json::from_slice(
+        &fs::read(home.join("state.json")).expect("read authoritative sweep state"),
+    )
+    .expect("parse authoritative sweep state");
+    let record = &state["repos"]["placeholder-org/alpha"]["records"]["placeholder-org/alpha#478"];
+    assert_eq!(record["id"], "placeholder-org/alpha#478");
+    assert_eq!(record["title"], "Preserve the authoritative sweep record");
+    assert_eq!(record["updated"], "2026-08-01T00:00:00Z");
     assert!(
         String::from_utf8_lossy(&output.stderr)
             .contains("publish failed; local records remain authoritative"),
@@ -392,7 +426,7 @@ fn publication_recovers_dirty_and_invalid_checkouts_without_losing_local_records
         .env_remove("GIT_COMMITTER_EMAIL")
         .output()
         .expect("run publication whose commit fails");
-    assert!(first_output.status.success());
+    assert_eq!(first_output.status.code(), Some(1));
     assert!(
         String::from_utf8_lossy(&first_output.stderr).contains("publish failed"),
         "stderr: {}",
