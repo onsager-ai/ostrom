@@ -244,7 +244,7 @@ mod tests {
 
     use ostrom_core::{
         EventInput, EventPayload, EventRunId, EventStore, EventStoreFault, EventType,
-        WriteDisposition,
+        WriteDisposition, conformance::check_event_store,
     };
     use serde_json::{Map, json};
     use tempfile::tempdir;
@@ -300,6 +300,15 @@ mod tests {
             [1, 2]
         );
         assert_eq!(events[0].run_id.0, "synthetic-run");
+    }
+
+    #[tokio::test]
+    async fn file_store_passes_shared_event_conformance_battery() {
+        let (_fixture, paths) = fixture();
+        let mut store = JsonlEventStore::new(&paths, EventRunId("conformance-run".to_owned()));
+        check_event_store(&mut store)
+            .await
+            .expect("file event store should conform");
     }
 
     #[tokio::test]

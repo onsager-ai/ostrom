@@ -1,16 +1,17 @@
 //! Store conformance battery for in-tree and out-of-tree implementations.
 //!
-//! Enable the `conformance` feature and call [`check_store`] or
-//! [`check_check_store`] with a fresh, disposable implementation instance.
-//! Returning a structured failure instead of panicking lets consumers
-//! integrate the same batteries into their preferred test framework. They use
-//! only the public ports and assume no filesystem, process-local runtime, or
-//! other particular substrate.
+//! Enable the `conformance` feature and call [`check_store`],
+//! [`check_check_store`], or [`check_event_store`] with a fresh, disposable
+//! implementation instance. Returning a structured failure instead of
+//! panicking lets consumers integrate the same batteries into their preferred
+//! test framework. They use only the public ports and assume no filesystem,
+//! process-local runtime, or other particular substrate.
 
 use thiserror::Error;
 
 use crate::{
     AttemptOutcome, CHECK_STORE_SCHEMA_VERSION, CheckRun, CheckRunId, CheckStore, CheckStoreFault,
+    EVENT_VERSION, EventEnvelope, EventInput, EventPayload, EventStore, EventStoreFault, EventType,
     PassAttempt, PassId, QueueFact, QueueKind, QueueState, RepositoryName, StoreFault, SweepPass,
     SweepStore, WriteDisposition, store::STORE_SCHEMA_VERSION,
 };
@@ -35,6 +36,44 @@ pub enum ConformanceFailure {
     FailedAttempt,
     #[error("attempt-observability invariant failed: an empty failed pass looked like no pass")]
     EmptyFailedAttempt,
+    #[error("event fixture invariant failed: the battery could not construct a valid event")]
+    EventFixture,
+    #[error("event initial-read invariant failed: {0}")]
+    EventInitialRead(EventStoreFault),
+    #[error("event initial-read invariant failed: a fresh store was not empty")]
+    EventInitialState,
+    #[error("event write invariant failed: conforming store rejected a valid event: {0}")]
+    EventInitialWrite(EventStoreFault),
+    #[error("event write-disposition invariant failed: a new event was not reported as written")]
+    EventInitialWriteDisposition,
+    #[error("event read-back invariant failed: {0}")]
+    EventReadBack(EventStoreFault),
+    #[error("event read-back invariant failed: committed event differs from its input")]
+    EventContent,
+    #[error("event version invariant failed: a record did not use EVENT_VERSION")]
+    EventVersion,
+    #[error("event run-identity invariant failed: one store instance wrote more than one run")]
+    EventRunIdentity,
+    #[error("event idempotency invariant failed: replay was rejected: {0}")]
+    EventIdempotencyWrite(EventStoreFault),
+    #[error("event idempotency invariant failed: replay was not reported as unchanged")]
+    EventIdempotency,
+    #[error("event idempotency invariant failed: replay stored the event more than once")]
+    EventDuplicateRecord,
+    #[error("event append invariant failed: a distinct event was rejected: {0}")]
+    EventDistinctWrite(EventStoreFault),
+    #[error("event append invariant failed: a distinct event was not reported as written")]
+    EventDistinctWriteDisposition,
+    #[error("event ordering invariant failed: records were not returned in append order")]
+    EventOrdering,
+    #[error("event sequence invariant failed: sequence numbers were not strictly increasing")]
+    EventSequence,
+    #[error("empty-event invariant failed: a valid empty event was rejected: {0}")]
+    EventEmptyWrite(EventStoreFault),
+    #[error("empty-event invariant failed: a valid empty event was not reported as written")]
+    EventEmptyWriteDisposition,
+    #[error("empty-event observability invariant failed: an empty event looked like no event")]
+    EventEmptyEvent,
 }
 
 fn pass(id: &str, outcome: AttemptOutcome, with_payload: bool) -> SweepPass {
@@ -128,6 +167,150 @@ pub async fn check_store<S: SweepStore>(store: &mut S) -> Result<(), Conformance
     Ok(())
 }
 
+fn event(event_type: &str, item_id: Option<&str>) -> Result<EventInput, ConformanceFailure> {
+    let event_type = EventType::new(event_type).map_err(|_| ConformanceFailure::EventFixture)?;
+    let payload = match item_id {
+        Some(item_id) => EventPayload::new(serde_json::Map::from_iter([(
+            "item_id".to_owned(),
+            serde_json::Value::String(item_id.to_owned()),
+        )]))
+        .map_err(|_| ConformanceFailure::EventFixture)?,
+        None => EventPayload::empty(),
+    };
+    Ok(EventInput {
+        event_type,
+        payload,
+    })
+}
+
+fn envelope_matches(envelope: &EventEnvelope, input: &EventInput) -> bool {
+    envelope.event_type == input.event_type && envelope.payload == input.payload
+}
+
+fn check_event_snapshot(
+    events: &[EventEnvelope],
+    expected: &[&EventInput],
+) -> Result<(), ConformanceFailure> {
+    if events.len() != expected.len()
+        || expected.iter().any(|input| {
+            events
+                .iter()
+                .filter(|envelope| envelope_matches(envelope, input))
+                .count()
+                != 1
+        })
+    {
+        return Err(ConformanceFailure::EventContent);
+    }
+    if events.iter().any(|event| event.v != EVENT_VERSION) {
+        return Err(ConformanceFailure::EventVersion);
+    }
+    let Some(first) = events.first() else {
+        return if expected.is_empty() {
+            Ok(())
+        } else {
+            Err(ConformanceFailure::EventContent)
+        };
+    };
+    if events.iter().any(|event| event.run_id != first.run_id) {
+        return Err(ConformanceFailure::EventRunIdentity);
+    }
+    if events
+        .iter()
+        .zip(expected)
+        .any(|(envelope, input)| !envelope_matches(envelope, input))
+    {
+        return Err(ConformanceFailure::EventOrdering);
+    }
+    if events.windows(2).any(|pair| pair[0].seq >= pair[1].seq) {
+        return Err(ConformanceFailure::EventSequence);
+    }
+    Ok(())
+}
+
+/// Exercise the empty-store, append, read-back, idempotency, ordering,
+/// envelope-version, and empty-event invariants of any [`EventStore`]
+/// implementation.
+pub async fn check_event_store<S: EventStore>(store: &mut S) -> Result<(), ConformanceFailure> {
+    let before = store
+        .events()
+        .await
+        .map_err(ConformanceFailure::EventInitialRead)?;
+    if !before.is_empty() {
+        return Err(ConformanceFailure::EventInitialState);
+    }
+
+    let completed = event("work.completed", Some("synthetic-org/project#42"))?;
+    if store
+        .write_event(&completed)
+        .await
+        .map_err(ConformanceFailure::EventInitialWrite)?
+        != WriteDisposition::Written
+    {
+        return Err(ConformanceFailure::EventInitialWriteDisposition);
+    }
+    let events = store
+        .events()
+        .await
+        .map_err(ConformanceFailure::EventReadBack)?;
+    check_event_snapshot(&events, &[&completed])?;
+
+    if store
+        .write_event(&completed)
+        .await
+        .map_err(ConformanceFailure::EventIdempotencyWrite)?
+        != WriteDisposition::Unchanged
+    {
+        return Err(ConformanceFailure::EventIdempotency);
+    }
+    let events = store
+        .events()
+        .await
+        .map_err(ConformanceFailure::EventReadBack)?;
+    if events.len() > 1 {
+        return Err(ConformanceFailure::EventDuplicateRecord);
+    }
+    check_event_snapshot(&events, &[&completed])?;
+
+    // EventInput has no caller-provided identifier. Under the public contract,
+    // changed payload under the same open event type is a distinct fact, not an
+    // identifier conflict, and must append without replacing the first fact.
+    let changed = event("work.completed", Some("synthetic-org/project#43"))?;
+    if store
+        .write_event(&changed)
+        .await
+        .map_err(ConformanceFailure::EventDistinctWrite)?
+        != WriteDisposition::Written
+    {
+        return Err(ConformanceFailure::EventDistinctWriteDisposition);
+    }
+    let events = store
+        .events()
+        .await
+        .map_err(ConformanceFailure::EventReadBack)?;
+    check_event_snapshot(&events, &[&completed, &changed])?;
+
+    // A valid event may have no facts. It must remain distinguishable from an
+    // event that was never written.
+    let empty = event("pass.ended", None)?;
+    if store
+        .write_event(&empty)
+        .await
+        .map_err(ConformanceFailure::EventEmptyWrite)?
+        != WriteDisposition::Written
+    {
+        return Err(ConformanceFailure::EventEmptyWriteDisposition);
+    }
+    let events = store
+        .events()
+        .await
+        .map_err(ConformanceFailure::EventReadBack)?;
+    if events.len() != 3 || !events.iter().any(|stored| envelope_matches(stored, &empty)) {
+        return Err(ConformanceFailure::EventEmptyEvent);
+    }
+    check_event_snapshot(&events, &[&completed, &changed, &empty])
+}
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum CheckStoreConformanceFailure {
     #[error("initial empty-run write failed: {0}")]
@@ -186,10 +369,15 @@ pub async fn check_check_store<S: CheckStore>(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use async_trait::async_trait;
 
-    use super::{ConformanceFailure, check_store};
-    use crate::{StoreFault, SweepPass, SweepStore, WriteDisposition};
+    use super::{ConformanceFailure, check_event_store, check_store, event};
+    use crate::{
+        EVENT_VERSION, EventEnvelope, EventInput, EventRunId, EventStore, EventStoreFault,
+        EventType, StoreFault, SweepPass, SweepStore, WriteDisposition,
+    };
 
     #[derive(Default)]
     struct MemoryStore {
@@ -295,5 +483,263 @@ mod tests {
             failure,
             ConformanceFailure::InitialWrite(StoreFault::PayloadWrite)
         );
+    }
+
+    #[derive(Default)]
+    struct MemoryEventStore {
+        events: Vec<EventEnvelope>,
+    }
+
+    fn envelope(input: &EventInput, seq: u64) -> EventEnvelope {
+        EventEnvelope {
+            v: EVENT_VERSION,
+            event_type: input.event_type.clone(),
+            run_id: EventRunId("conformance-run".to_owned()),
+            seq,
+            ts: format!("2030-01-02T03:04:{seq:02}Z"),
+            payload: input.payload.clone(),
+        }
+    }
+
+    #[async_trait]
+    impl EventStore for MemoryEventStore {
+        async fn write_event(
+            &mut self,
+            input: &EventInput,
+        ) -> Result<WriteDisposition, EventStoreFault> {
+            if self.events.iter().any(|stored| {
+                stored.event_type == input.event_type && stored.payload == input.payload
+            }) {
+                return Ok(WriteDisposition::Unchanged);
+            }
+            let seq = u64::try_from(self.events.len())
+                .map_err(|_| EventStoreFault::EventWrite)?
+                .checked_add(1)
+                .ok_or(EventStoreFault::EventWrite)?;
+            self.events.push(envelope(input, seq));
+            Ok(WriteDisposition::Written)
+        }
+
+        async fn events(&self) -> Result<Vec<EventEnvelope>, EventStoreFault> {
+            Ok(self.events.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn in_memory_event_store_passes_without_a_substrate() {
+        check_event_store(&mut MemoryEventStore::default())
+            .await
+            .expect("memory event store should conform");
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum BrokenEventInvariant {
+        InitialRead,
+        InitialState,
+        InitialWrite,
+        InitialDisposition,
+        ReadBack,
+        Content,
+        Version,
+        RunIdentity,
+        IdempotencyWrite,
+        IdempotencyDisposition,
+        Duplicate,
+        DistinctWrite,
+        DistinctDisposition,
+        Ordering,
+        Sequence,
+        EmptyWrite,
+        EmptyDisposition,
+        EmptyObservability,
+    }
+
+    struct BrokenEventStore {
+        inner: MemoryEventStore,
+        invariant: BrokenEventInvariant,
+        reads: AtomicUsize,
+        writes: usize,
+    }
+
+    impl BrokenEventStore {
+        fn new(invariant: BrokenEventInvariant) -> Self {
+            let mut inner = MemoryEventStore::default();
+            if matches!(invariant, BrokenEventInvariant::InitialState) {
+                let input = event("work.started", None).expect("valid test event");
+                inner.events.push(envelope(&input, 1));
+            }
+            Self {
+                inner,
+                invariant,
+                reads: AtomicUsize::new(0),
+                writes: 0,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl EventStore for BrokenEventStore {
+        async fn write_event(
+            &mut self,
+            input: &EventInput,
+        ) -> Result<WriteDisposition, EventStoreFault> {
+            self.writes += 1;
+            match (self.invariant, self.writes) {
+                (BrokenEventInvariant::InitialWrite, 1) => {
+                    return Err(EventStoreFault::EventWrite);
+                }
+                (BrokenEventInvariant::IdempotencyWrite, 2) => {
+                    return Err(EventStoreFault::PayloadWrite);
+                }
+                (BrokenEventInvariant::DistinctWrite, 3) => {
+                    return Err(EventStoreFault::EventWrite);
+                }
+                (BrokenEventInvariant::EmptyWrite, 4) => {
+                    return Err(EventStoreFault::PayloadWrite);
+                }
+                (BrokenEventInvariant::EmptyObservability, 4) => {
+                    return Ok(WriteDisposition::Written);
+                }
+                _ => {}
+            }
+
+            let disposition = self.inner.write_event(input).await?;
+            match (self.invariant, self.writes) {
+                (BrokenEventInvariant::InitialDisposition, 1) => Ok(WriteDisposition::Unchanged),
+                (BrokenEventInvariant::IdempotencyDisposition, 2) => Ok(WriteDisposition::Written),
+                (BrokenEventInvariant::Duplicate, 2) => {
+                    let seq = u64::try_from(self.inner.events.len())
+                        .map_err(|_| EventStoreFault::EventWrite)?
+                        .checked_add(1)
+                        .ok_or(EventStoreFault::EventWrite)?;
+                    self.inner.events.push(envelope(input, seq));
+                    Ok(WriteDisposition::Unchanged)
+                }
+                (BrokenEventInvariant::DistinctDisposition, 3)
+                | (BrokenEventInvariant::EmptyDisposition, 4) => Ok(WriteDisposition::Unchanged),
+                _ => Ok(disposition),
+            }
+        }
+
+        async fn events(&self) -> Result<Vec<EventEnvelope>, EventStoreFault> {
+            let read = self.reads.fetch_add(1, Ordering::Relaxed);
+            if matches!(self.invariant, BrokenEventInvariant::InitialRead) && read == 0 {
+                return Err(EventStoreFault::Read);
+            }
+            if matches!(self.invariant, BrokenEventInvariant::ReadBack)
+                && !self.inner.events.is_empty()
+            {
+                return Err(EventStoreFault::Read);
+            }
+
+            let mut events = self.inner.events.clone();
+            if let Some(first) = events.first_mut() {
+                match self.invariant {
+                    BrokenEventInvariant::Content => {
+                        first.event_type =
+                            EventType::new("work.failed").expect("valid test event type");
+                    }
+                    BrokenEventInvariant::Version => first.v = EVENT_VERSION + 1,
+                    _ => {}
+                }
+            }
+            if events.len() >= 2 {
+                match self.invariant {
+                    BrokenEventInvariant::RunIdentity => {
+                        events[1].run_id = EventRunId("another-run".to_owned());
+                    }
+                    BrokenEventInvariant::Ordering => events.reverse(),
+                    BrokenEventInvariant::Sequence => events[1].seq = events[0].seq,
+                    _ => {}
+                }
+            }
+            Ok(events)
+        }
+    }
+
+    #[tokio::test]
+    async fn broken_event_stores_name_each_invariant() {
+        let cases = [
+            (
+                BrokenEventInvariant::InitialRead,
+                ConformanceFailure::EventInitialRead(EventStoreFault::Read),
+            ),
+            (
+                BrokenEventInvariant::InitialState,
+                ConformanceFailure::EventInitialState,
+            ),
+            (
+                BrokenEventInvariant::InitialWrite,
+                ConformanceFailure::EventInitialWrite(EventStoreFault::EventWrite),
+            ),
+            (
+                BrokenEventInvariant::InitialDisposition,
+                ConformanceFailure::EventInitialWriteDisposition,
+            ),
+            (
+                BrokenEventInvariant::ReadBack,
+                ConformanceFailure::EventReadBack(EventStoreFault::Read),
+            ),
+            (
+                BrokenEventInvariant::Content,
+                ConformanceFailure::EventContent,
+            ),
+            (
+                BrokenEventInvariant::Version,
+                ConformanceFailure::EventVersion,
+            ),
+            (
+                BrokenEventInvariant::RunIdentity,
+                ConformanceFailure::EventRunIdentity,
+            ),
+            (
+                BrokenEventInvariant::IdempotencyWrite,
+                ConformanceFailure::EventIdempotencyWrite(EventStoreFault::PayloadWrite),
+            ),
+            (
+                BrokenEventInvariant::IdempotencyDisposition,
+                ConformanceFailure::EventIdempotency,
+            ),
+            (
+                BrokenEventInvariant::Duplicate,
+                ConformanceFailure::EventDuplicateRecord,
+            ),
+            (
+                BrokenEventInvariant::DistinctWrite,
+                ConformanceFailure::EventDistinctWrite(EventStoreFault::EventWrite),
+            ),
+            (
+                BrokenEventInvariant::DistinctDisposition,
+                ConformanceFailure::EventDistinctWriteDisposition,
+            ),
+            (
+                BrokenEventInvariant::Ordering,
+                ConformanceFailure::EventOrdering,
+            ),
+            (
+                BrokenEventInvariant::Sequence,
+                ConformanceFailure::EventSequence,
+            ),
+            (
+                BrokenEventInvariant::EmptyWrite,
+                ConformanceFailure::EventEmptyWrite(EventStoreFault::PayloadWrite),
+            ),
+            (
+                BrokenEventInvariant::EmptyDisposition,
+                ConformanceFailure::EventEmptyWriteDisposition,
+            ),
+            (
+                BrokenEventInvariant::EmptyObservability,
+                ConformanceFailure::EventEmptyEvent,
+            ),
+        ];
+
+        for (invariant, expected) in cases {
+            let failure = check_event_store(&mut BrokenEventStore::new(invariant))
+                .await
+                .expect_err("broken event store must fail conformance");
+            assert_eq!(failure, expected, "wrong failure for {invariant:?}");
+            assert!(failure.to_string().contains("invariant"));
+        }
     }
 }
