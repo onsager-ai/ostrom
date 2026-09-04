@@ -365,6 +365,62 @@ pub trait EventStore: Send {
     async fn events(&self) -> Result<Vec<EventEnvelope>, EventStoreFault>;
 }
 
+/// Gate records supplied for publication, including the source's ownership
+/// assertion for that record kind.
+///
+/// `Authoritative(Vec::new())` means the source owns gate publication and has
+/// observed no gate records. [`Self::NotAuthoritative`] means the source does
+/// not own gate publication, so consumers must not infer anything from the
+/// absence of records. Keeping the assertion and records in one enum prevents
+/// an empty authoritative collection from being represented as a missing
+/// optional value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GatePublicationRecords {
+    Authoritative(Vec<Value>),
+    NotAuthoritative,
+}
+
+/// One substrate-neutral input snapshot for publication.
+///
+/// Queue and state are required publication inputs. Gate records carry an
+/// explicit ownership assertion because a publisher that does not own that
+/// record kind must preserve already-published gate history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicationSnapshot {
+    pub queue: Vec<Value>,
+    pub gate: GatePublicationRecords,
+    pub state: Value,
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum PublicationSourceFault {
+    #[error("publication source record is missing: {0}")]
+    QueueMissing(String),
+    #[error("could not prepare publication path {0}")]
+    QueueRead(String),
+    #[error("invalid publication record at {0}")]
+    QueueMalformed(String),
+    #[error("could not prepare publication path {0}")]
+    GateRead(String),
+    #[error("invalid publication record at {0}")]
+    GateMalformed(String),
+    #[error("publication source record is missing: {0}")]
+    StateMissing(String),
+    #[error("could not prepare publication path {0}")]
+    StateRead(String),
+    #[error("invalid publication record at {0}")]
+    StateMalformed(String),
+}
+
+/// Substrate-neutral read port for the records consumed by publication.
+///
+/// Implementations return values rather than paths, handles, or byte streams.
+/// In particular, the gate ownership assertion is part of every successful
+/// snapshot and cannot be inferred by the consumer from an empty collection.
+pub trait PublicationSource: Send {
+    fn snapshot(&self) -> Result<PublicationSnapshot, PublicationSourceFault>;
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
@@ -456,7 +512,12 @@ mod tests {
         // guard. This focused test makes the interface invariant visible in a
         // normal `cargo test` run as well, without relying on code review.
         let source = include_str!("store.rs");
-        for store_trait in ["SweepStore", "CheckStore", "EventStore"] {
+        for store_trait in [
+            "SweepStore",
+            "CheckStore",
+            "EventStore",
+            "PublicationSource",
+        ] {
             let trait_source = source
                 .split_once(&format!("pub trait {store_trait}"))
                 .expect("store trait declaration")
