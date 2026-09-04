@@ -67,9 +67,10 @@ pub use policy::{
 pub use store::{
     AttemptOutcome, CHECK_STORE_SCHEMA_VERSION, CheckRun, CheckRunId, CheckStore, CheckStoreFault,
     EVENT_VERSION, EventEnvelope, EventInput, EventPayload, EventPayloadFault, EventRunId,
-    EventStore, EventStoreFault, EventType, EventTypeFault, GateFact, PassAttempt, PassId,
-    QueueFact, QueueKind, QueueState, RepoStateFact, STORE_SCHEMA_VERSION, StoreFault, SweepPass,
-    SweepStore, WriteDisposition,
+    EventStore, EventStoreFault, EventType, EventTypeFault, GateFact, GatePublicationRecords,
+    PassAttempt, PassId, PublicationSnapshot, PublicationSource, PublicationSourceFault, QueueFact,
+    QueueKind, QueueState, RepoStateFact, STORE_SCHEMA_VERSION, StoreFault, SweepPass, SweepStore,
+    WriteDisposition,
 };
 pub use work_graph::{
     WORK_GRAPH_VERSION, WorkEdge, WorkEdgeSource, WorkGraph, WorkGraphFault, WorkGraphNode,

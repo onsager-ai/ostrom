@@ -83,7 +83,7 @@ pub use policy::{
 pub use policy_signature::{
     PolicySignatureError, policy_manifest_digest, sign_policy_manifest, verify_policy_manifest,
 };
-pub use publish::{PublishDestination, PublishError};
+pub use publish::{JsonlPublicationSource, PublishDestination, PublishError};
 pub use queue::{
     QueueActionError, QueueDecision, QueueDocument, decide_queue_item, lint_queue_state,
     list_queue_json, read_queue, write_queue,
@@ -98,7 +98,7 @@ pub use sweep::{
     PublishTarget, RepositorySnapshot, RosterCoverageFinding, SweepError, SweepFixture, SweepMode,
     SweepOptions, SweepOutcome, acquire_org_from_github, acquire_org_from_github_with_faults,
     encode_org_snapshots, encode_org_snapshots_with_faults, load_config, load_config_or_defaults,
-    run_sweep, run_sweep_with_mirror, validate_roster_coverage,
+    run_sweep, run_sweep_with_mirror, run_sweep_with_publication_source, validate_roster_coverage,
 };
 pub use trace::{
     MalformedTraceRow, TraceActionError, TraceAppend, TraceFactRecord, TraceRead, TraceView,

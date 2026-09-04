@@ -27,19 +27,19 @@ use ostrom_core::{
 use ostrom_store::{
     AgentRegistry, AssessmentHarness, AuditOptions, Clock, CodexHarness, DigestOptions,
     DispatchOutcome, DispatchRequest, ExecutableAssessmentDeriver, GateError, GateOptions,
-    HarnessAssessmentDeriver, ImplementRequest, JsonlCheckStore, MigrationOutcome,
-    OrchestratorRunRequest, OstromPaths, PassRequest, PassRole, PlanOptions, PublishDestination,
-    PublishTarget, QueueDecision, ReplayOptions, RunOutcome, RunRequest, SelectAction, SelectError,
-    SelectOutcome, SelectRequest, SignalFlags, SweepError, SweepMode, SweepOptions,
-    SweepParityOptions, TraceAppend, TraceView, UnavailableAssessmentDeriver, acquire_lease,
-    acquire_org_from_github_with_faults, append_trace_checked, audit, branch_name,
+    HarnessAssessmentDeriver, ImplementRequest, JsonlCheckStore, JsonlPublicationSource,
+    MigrationOutcome, OrchestratorRunRequest, OstromPaths, PassRequest, PassRole, PlanOptions,
+    PublishDestination, PublishTarget, QueueDecision, ReplayOptions, RunOutcome, RunRequest,
+    SelectAction, SelectError, SelectOutcome, SelectRequest, SignalFlags, SweepError, SweepMode,
+    SweepOptions, SweepParityOptions, TraceAppend, TraceView, UnavailableAssessmentDeriver,
+    acquire_lease, acquire_org_from_github_with_faults, append_trace_checked, audit, branch_name,
     clear_work_order, create_work_order, credential_output, decide_queue_item,
     encode_org_snapshots_with_faults, encode_selection, environment, finalize_exited_implementer,
     grant_excuse, item_hash, lease_status, lint_queue_state, list_excuses, list_queue_json,
     local_drift, migrate, read_trace_json, release_lease, render_constitution, render_digest,
     replay, run_dispatch_with_registry, run_gate, run_implement_with_registry, run_pass, run_plan,
-    run_repair_prs, run_selection, run_sweep, run_sweep_parity, validate_lease_name,
-    validate_work_order_file,
+    run_repair_prs, run_selection, run_sweep_parity, run_sweep_with_publication_source,
+    validate_lease_name, validate_work_order_file,
 };
 
 mod cutover_replay;
@@ -1064,17 +1064,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .value_os()
                 .map_or_else(|| cwd.join("crates/ostrom-store/assets"), PathBuf::from);
             let policy = policy_manifest::load_optional_bundle(&paths, &cwd)?;
-            let outcome = run_sweep(&SweepOptions {
-                paths,
-                working_directory: cwd,
-                executable,
-                plugin_root,
-                started_at,
-                requested_mode: mode.into(),
-                fixture,
-                publish,
-                policy,
-            })?;
+            let publication_source = JsonlPublicationSource::new(&paths);
+            let outcome = run_sweep_with_publication_source(
+                &SweepOptions {
+                    paths,
+                    working_directory: cwd,
+                    executable,
+                    plugin_root,
+                    started_at,
+                    requested_mode: mode.into(),
+                    fixture,
+                    publish,
+                    policy,
+                },
+                &publication_source,
+            )?;
             println!(
                 "mandate sweep: {} projects; {} queue changes",
                 outcome.project_count, outcome.queue_changes

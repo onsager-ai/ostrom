@@ -6,7 +6,10 @@ use std::{
 };
 
 use chrono::{DateTime, Duration, Utc};
-use ostrom_core::RepositoryName;
+use ostrom_core::{
+    GatePublicationRecords, PublicationSnapshot, PublicationSource, PublicationSourceFault,
+    RepositoryName,
+};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 
@@ -24,6 +27,8 @@ const SHIPPED_ALLOWLIST_PATH: &str = "shipped publish-allowlist.json";
 
 #[derive(Debug, Error)]
 pub enum PublishError {
+    #[error(transparent)]
+    Source(#[from] PublicationSourceFault),
     #[error("publication source record is missing: {0}")]
     SourceMissing(String),
     #[error("invalid publication allowlist at {path}: {message}")]
@@ -69,9 +74,55 @@ pub(crate) enum PublishOutcome {
 
 pub(crate) struct PublishOptions<'a> {
     pub paths: &'a OstromPaths,
+    pub source: &'a dyn PublicationSource,
     pub destination: &'a PublishDestination,
     pub published_at: DateTime<Utc>,
     pub cadence_hours: u64,
+}
+
+/// Filesystem compatibility adapter for the solo-operator CLI.
+///
+/// A present `gate.jsonl`, including an empty file, asserts authority for gate
+/// records. An absent `gate.jsonl` is represented as non-authoritative. The
+/// publication consumer never has to infer either state from a path.
+#[derive(Debug, Clone)]
+pub struct JsonlPublicationSource {
+    queue_path: PathBuf,
+    gate_path: PathBuf,
+    state_path: PathBuf,
+}
+
+impl JsonlPublicationSource {
+    #[must_use]
+    pub fn new(paths: &OstromPaths) -> Self {
+        Self {
+            queue_path: paths.queue_file(),
+            gate_path: paths.state.join("gate.jsonl"),
+            state_path: paths.sweep_state_file(),
+        }
+    }
+}
+
+impl PublicationSource for JsonlPublicationSource {
+    fn snapshot(&self) -> Result<PublicationSnapshot, PublicationSourceFault> {
+        let queue = read_publication_jsonl(
+            &self.queue_path,
+            PublicationSourceFault::QueueMissing,
+            PublicationSourceFault::QueueRead,
+            PublicationSourceFault::QueueMalformed,
+        )?;
+        let gate = match read_optional_gate_jsonl(&self.gate_path)? {
+            Some(records) => GatePublicationRecords::Authoritative(records),
+            None => GatePublicationRecords::NotAuthoritative,
+        };
+        let state = read_publication_json(
+            &self.state_path,
+            PublicationSourceFault::StateMissing,
+            PublicationSourceFault::StateRead,
+            PublicationSourceFault::StateMalformed,
+        )?;
+        Ok(PublicationSnapshot { queue, gate, state })
+    }
 }
 
 struct Allowlist {
@@ -167,25 +218,17 @@ fn derive_tree(
     options: &PublishOptions<'_>,
     allowlist: &Allowlist,
 ) -> Result<DerivedTree, PublishError> {
-    let queue_path = options.paths.queue_file();
-    let state_path = options.paths.sweep_state_file();
-    for source in [&queue_path, &state_path] {
-        if !source.is_file() {
-            return Err(PublishError::SourceMissing(source.display().to_string()));
-        }
-    }
-    let queue_source = read_jsonl(&queue_path)?;
-    let gate_path = options.paths.state.join("gate.jsonl");
-    // Presence is the gate authority assertion. Only NotFound means that this
-    // publisher must leave the branch's gate-owned artifacts alone.
-    let (gate_source, gate_publication) = match fs::metadata(&gate_path) {
-        Ok(_) => (read_jsonl(&gate_path)?, GatePublication::Authoritative),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+    let PublicationSnapshot {
+        queue: queue_source,
+        gate,
+        state: state_source,
+    } = options.source.snapshot()?;
+    let (gate_source, gate_publication) = match gate {
+        GatePublicationRecords::Authoritative(records) => (records, GatePublication::Authoritative),
+        GatePublicationRecords::NotAuthoritative => {
             (Vec::new(), GatePublication::PreservePublished)
         }
-        Err(source) => return Err(path_error(&gate_path, source)),
     };
-    let state_source = read_json(&state_path)?;
 
     let mut queue_drops = BTreeMap::new();
     let queue = queue_source
@@ -1155,6 +1198,72 @@ fn require_status(command: &str, output: Output, accepted: &[i32]) -> Result<Out
     }
 }
 
+fn read_publication_jsonl(
+    path: &Path,
+    missing: fn(String) -> PublicationSourceFault,
+    read_fault: fn(String) -> PublicationSourceFault,
+    malformed: fn(String) -> PublicationSourceFault,
+) -> Result<Vec<Value>, PublicationSourceFault> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(missing(path.display().to_string()));
+        }
+        Err(error) => return Err(read_fault(format!("{}: {error}", path.display()))),
+    };
+    text.lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(|(index, line)| {
+            serde_json::from_str(line).map_err(|error| {
+                malformed(format!("{}: row {}: {error}", path.display(), index + 1))
+            })
+        })
+        .collect()
+}
+
+fn read_optional_gate_jsonl(path: &Path) -> Result<Option<Vec<Value>>, PublicationSourceFault> {
+    match fs::read_to_string(path) {
+        Ok(text) => text
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| !line.trim().is_empty())
+            .map(|(index, line)| {
+                serde_json::from_str(line).map_err(|error| {
+                    PublicationSourceFault::GateMalformed(format!(
+                        "{}: row {}: {error}",
+                        path.display(),
+                        index + 1
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(PublicationSourceFault::GateRead(format!(
+            "{}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn read_publication_json(
+    path: &Path,
+    missing: fn(String) -> PublicationSourceFault,
+    read_fault: fn(String) -> PublicationSourceFault,
+    malformed: fn(String) -> PublicationSourceFault,
+) -> Result<Value, PublicationSourceFault> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(missing(path.display().to_string()));
+        }
+        Err(error) => return Err(read_fault(format!("{}: {error}", path.display()))),
+    };
+    serde_json::from_slice(&bytes)
+        .map_err(|error| malformed(format!("{}: {error}", path.display())))
+}
+
 fn read_json(path: &Path) -> Result<Value, PublishError> {
     let bytes = fs::read(path).map_err(|source| path_error(path, source))?;
     serde_json::from_slice(&bytes)
@@ -1354,16 +1463,21 @@ fn command_spawn_error(command: &str, error: io::Error) -> PublishError {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
+    use ostrom_core::conformance::check_publication_source;
     use tempfile::tempdir;
 
     use super::*;
 
     fn fixture_options<'a>(
         paths: &'a OstromPaths,
+        source: &'a dyn PublicationSource,
         destination: &'a PublishDestination,
     ) -> PublishOptions<'a> {
         PublishOptions {
             paths,
+            source,
             destination,
             published_at: "2026-08-01T00:05:00Z".parse().expect("fixture time"),
             cadence_hours: 24,
@@ -1410,7 +1524,8 @@ mod tests {
         let destination = PublishDestination::explicit(
             RepositoryName::new("placeholder-org/alpha").expect("placeholder repository"),
         );
-        let options = fixture_options(&paths, &destination);
+        let source = JsonlPublicationSource::new(&paths);
+        let options = fixture_options(&paths, &source, &destination);
         let allowlist = load_allowlist(&plugin.join("config/publish-allowlist.json"))
             .expect("load fixture allowlist");
         let tree = derive_tree(&options, &allowlist).expect("derive public tree");
@@ -1482,5 +1597,40 @@ mod tests {
         let manifest: Value = serde_json::from_slice(&tree.files[Path::new("manifest.json")])
             .expect("parse reused manifest");
         assert_eq!(manifest["published_at"], "2026-07-31T00:05:00Z");
+    }
+
+    fn write_publication_jsonl(path: &Path, records: &[Value]) -> Result<(), io::Error> {
+        let mut bytes = Vec::new();
+        for record in records {
+            serde_json::to_writer(&mut bytes, record).map_err(io::Error::other)?;
+            bytes.push(b'\n');
+        }
+        fs::write(path, bytes)
+    }
+
+    #[test]
+    fn jsonl_publication_source_passes_shared_conformance_battery() {
+        let fixture = tempdir().expect("publication source conformance fixture");
+        let sequence = Cell::new(0_u8);
+
+        check_publication_source(|snapshot| {
+            let index = sequence.get();
+            sequence.set(index + 1);
+            let root = fixture.path().join(format!("source-{index}"));
+            fs::create_dir(&root)?;
+            write_publication_jsonl(&root.join("queue.jsonl"), &snapshot.queue)?;
+            fs::write(
+                root.join("state.json"),
+                serde_json::to_vec(&snapshot.state).map_err(io::Error::other)?,
+            )?;
+            if let GatePublicationRecords::Authoritative(records) = &snapshot.gate {
+                write_publication_jsonl(&root.join("gate.jsonl"), records)?;
+            }
+            Ok::<_, io::Error>(JsonlPublicationSource::new(&OstromPaths {
+                config: root.clone(),
+                state: root,
+            }))
+        })
+        .expect("JSONL publication source should conform");
     }
 }

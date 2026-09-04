@@ -1,19 +1,21 @@
 //! Store conformance battery for in-tree and out-of-tree implementations.
 //!
 //! Enable the `conformance` feature and call [`check_store`],
-//! [`check_check_store`], or [`check_event_store`] with a fresh, disposable
-//! implementation instance. Returning a structured failure instead of
-//! panicking lets consumers integrate the same batteries into their preferred
-//! test framework. They use only the public ports and assume no filesystem,
-//! process-local runtime, or other particular substrate.
+//! [`check_check_store`], [`check_event_store`], or
+//! [`check_publication_source`] with fresh, disposable implementation
+//! instances. Returning a structured failure instead of panicking lets
+//! consumers integrate the same batteries into their preferred test framework.
+//! They use only the public ports and assume no filesystem, process-local
+//! runtime, or other particular substrate.
 
 use thiserror::Error;
 
 use crate::{
     AttemptOutcome, CHECK_STORE_SCHEMA_VERSION, CheckRun, CheckRunId, CheckStore, CheckStoreFault,
     EVENT_VERSION, EventEnvelope, EventInput, EventPayload, EventStore, EventStoreFault, EventType,
-    PassAttempt, PassId, QueueFact, QueueKind, QueueState, RepositoryName, StoreFault, SweepPass,
-    SweepStore, WriteDisposition, store::STORE_SCHEMA_VERSION,
+    GatePublicationRecords, PassAttempt, PassId, PublicationSnapshot, PublicationSource,
+    PublicationSourceFault, QueueFact, QueueKind, QueueState, RepositoryName, StoreFault,
+    SweepPass, SweepStore, WriteDisposition, store::STORE_SCHEMA_VERSION,
 };
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -367,17 +369,176 @@ pub async fn check_check_store<S: CheckStore>(
     Ok(())
 }
 
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum PublicationSourceConformanceFailure {
+    #[error("publication fixture setup failed: {0}")]
+    FixtureSetup(String),
+    #[error("populated publication read invariant failed: {0}")]
+    PopulatedRead(PublicationSourceFault),
+    #[error("publication queue content invariant failed")]
+    QueueContent,
+    #[error("publication state content invariant failed")]
+    StateContent,
+    #[error("populated authoritative-gate invariant failed")]
+    PopulatedGate,
+    #[error("authoritative-empty gate read invariant failed: {0}")]
+    AuthoritativeEmptyRead(PublicationSourceFault),
+    #[error("authoritative-empty gate invariant failed")]
+    AuthoritativeEmptyGate,
+    #[error("non-authoritative gate read invariant failed: {0}")]
+    NonAuthoritativeRead(PublicationSourceFault),
+    #[error("non-authoritative gate invariant failed")]
+    NonAuthoritativeGate,
+}
+
+fn publication_snapshot(gate: GatePublicationRecords) -> PublicationSnapshot {
+    PublicationSnapshot {
+        queue: vec![serde_json::json!({
+            "id": "synthetic-org/project#42",
+            "kind": "decision",
+        })],
+        gate,
+        state: serde_json::json!({
+            "version": 2,
+            "repos": {"synthetic-org/project": {}},
+        }),
+    }
+}
+
+fn check_publication_content(
+    actual: &PublicationSnapshot,
+    expected: &PublicationSnapshot,
+) -> Result<(), PublicationSourceConformanceFailure> {
+    if actual.queue != expected.queue {
+        return Err(PublicationSourceConformanceFailure::QueueContent);
+    }
+    if actual.state != expected.state {
+        return Err(PublicationSourceConformanceFailure::StateContent);
+    }
+    Ok(())
+}
+
+/// Exercise exact record read-back and the distinction between an
+/// authoritative empty gate collection and a source that is not authoritative
+/// for gate records.
+///
+/// The factory receives each desired snapshot and must return a fresh source
+/// configured to expose it. This keeps fixture setup substrate-specific while
+/// the battery itself observes only [`PublicationSource`].
+pub fn check_publication_source<S, F, E>(
+    mut source_from: F,
+) -> Result<(), PublicationSourceConformanceFailure>
+where
+    S: PublicationSource,
+    F: FnMut(&PublicationSnapshot) -> Result<S, E>,
+    E: std::fmt::Display,
+{
+    let populated = publication_snapshot(GatePublicationRecords::Authoritative(vec![
+        serde_json::json!({
+            "ts": "2030-01-02T03:04:05Z",
+            "pr": "synthetic-org/project#43",
+            "verdict": "pass",
+        }),
+    ]));
+    let source = source_from(&populated)
+        .map_err(|error| PublicationSourceConformanceFailure::FixtureSetup(error.to_string()))?;
+    let actual = source
+        .snapshot()
+        .map_err(PublicationSourceConformanceFailure::PopulatedRead)?;
+    check_publication_content(&actual, &populated)?;
+    if actual.gate != populated.gate {
+        return Err(PublicationSourceConformanceFailure::PopulatedGate);
+    }
+
+    let authoritative_empty =
+        publication_snapshot(GatePublicationRecords::Authoritative(Vec::new()));
+    let source = source_from(&authoritative_empty)
+        .map_err(|error| PublicationSourceConformanceFailure::FixtureSetup(error.to_string()))?;
+    let actual = source
+        .snapshot()
+        .map_err(PublicationSourceConformanceFailure::AuthoritativeEmptyRead)?;
+    check_publication_content(&actual, &authoritative_empty)?;
+    if actual.gate != GatePublicationRecords::Authoritative(Vec::new()) {
+        return Err(PublicationSourceConformanceFailure::AuthoritativeEmptyGate);
+    }
+
+    let non_authoritative = publication_snapshot(GatePublicationRecords::NotAuthoritative);
+    let source = source_from(&non_authoritative)
+        .map_err(|error| PublicationSourceConformanceFailure::FixtureSetup(error.to_string()))?;
+    let actual = source
+        .snapshot()
+        .map_err(PublicationSourceConformanceFailure::NonAuthoritativeRead)?;
+    check_publication_content(&actual, &non_authoritative)?;
+    if actual.gate != GatePublicationRecords::NotAuthoritative {
+        return Err(PublicationSourceConformanceFailure::NonAuthoritativeGate);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{
+        convert::Infallible,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     use async_trait::async_trait;
 
-    use super::{ConformanceFailure, check_event_store, check_store, event};
+    use super::{
+        ConformanceFailure, PublicationSourceConformanceFailure, check_event_store,
+        check_publication_source, check_store, event,
+    };
     use crate::{
         EVENT_VERSION, EventEnvelope, EventInput, EventRunId, EventStore, EventStoreFault,
-        EventType, StoreFault, SweepPass, SweepStore, WriteDisposition,
+        EventType, GatePublicationRecords, PublicationSnapshot, PublicationSource,
+        PublicationSourceFault, StoreFault, SweepPass, SweepStore, WriteDisposition,
     };
+
+    #[derive(Clone)]
+    struct MemoryPublicationSource(PublicationSnapshot);
+
+    impl PublicationSource for MemoryPublicationSource {
+        fn snapshot(&self) -> Result<PublicationSnapshot, PublicationSourceFault> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn in_memory_publication_source_passes_without_a_substrate() {
+        check_publication_source(|snapshot| {
+            Ok::<_, Infallible>(MemoryPublicationSource(snapshot.clone()))
+        })
+        .expect("memory publication source should conform");
+    }
+
+    struct CollapsingPublicationSource(PublicationSnapshot);
+
+    impl PublicationSource for CollapsingPublicationSource {
+        fn snapshot(&self) -> Result<PublicationSnapshot, PublicationSourceFault> {
+            let mut snapshot = self.0.clone();
+            if snapshot.gate == GatePublicationRecords::Authoritative(Vec::new()) {
+                snapshot.gate = GatePublicationRecords::NotAuthoritative;
+            }
+            Ok(snapshot)
+        }
+    }
+
+    #[test]
+    fn collapsing_authoritative_empty_gate_names_the_invariant() {
+        let failure = check_publication_source(|snapshot| {
+            Ok::<_, Infallible>(CollapsingPublicationSource(snapshot.clone()))
+        })
+        .expect_err("a source that collapses gate authority must fail conformance");
+        assert_eq!(
+            failure,
+            PublicationSourceConformanceFailure::AuthoritativeEmptyGate
+        );
+        assert!(
+            failure
+                .to_string()
+                .contains("authoritative-empty gate invariant")
+        );
+    }
 
     #[derive(Default)]
     struct MemoryStore {

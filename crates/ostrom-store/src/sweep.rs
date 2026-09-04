@@ -7,8 +7,8 @@ use std::{
 
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use ostrom_core::{
-    DefaultDisposition, GateConfig, MandateConfig, ProjectMandate, RepositoryName, Selector,
-    WorkNodeInput, build_work_graph,
+    DefaultDisposition, GateConfig, MandateConfig, ProjectMandate, PublicationSource,
+    RepositoryName, Selector, WorkNodeInput, build_work_graph,
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -23,7 +23,7 @@ use crate::{
     environment,
     gate::load_gate_config,
     io_error,
-    publish::{PublishOptions, PublishOutcome, publish},
+    publish::{JsonlPublicationSource, PublishOptions, PublishOutcome, publish},
     read_queue, read_trace,
     selector::{SelectorCandidate, glob_match, selector_match},
     set_private_file_mode, write_queue,
@@ -254,18 +254,39 @@ struct RepositoryEvidence<'a> {
 }
 
 pub fn run_sweep(options: &SweepOptions) -> Result<SweepOutcome, SweepError> {
-    run_sweep_with_mirror(options).map(|(outcome, _mirror)| outcome)
+    let source = JsonlPublicationSource::new(&options.paths);
+    run_sweep_with_publication_source(options, &source)
+}
+
+pub fn run_sweep_with_publication_source(
+    options: &SweepOptions,
+    source: &dyn PublicationSource,
+) -> Result<SweepOutcome, SweepError> {
+    let mut minter = GitHubInstallationTokenMinter;
+    run_sweep_with_minter_and_publication_source(options, source, &mut minter)
+        .map(|(outcome, _mirror)| outcome)
 }
 
 pub fn run_sweep_with_mirror(
     options: &SweepOptions,
 ) -> Result<(SweepOutcome, Vec<RepositorySnapshot>), SweepError> {
+    let source = JsonlPublicationSource::new(&options.paths);
     let mut minter = GitHubInstallationTokenMinter;
-    run_sweep_with_minter(options, &mut minter)
+    run_sweep_with_minter_and_publication_source(options, &source, &mut minter)
 }
 
+#[cfg(test)]
 fn run_sweep_with_minter(
     options: &SweepOptions,
+    minter: &mut dyn InstallationTokenMinter,
+) -> Result<(SweepOutcome, Vec<RepositorySnapshot>), SweepError> {
+    let source = JsonlPublicationSource::new(&options.paths);
+    run_sweep_with_minter_and_publication_source(options, &source, minter)
+}
+
+fn run_sweep_with_minter_and_publication_source(
+    options: &SweepOptions,
+    source: &dyn PublicationSource,
     minter: &mut dyn InstallationTokenMinter,
 ) -> Result<(SweepOutcome, Vec<RepositorySnapshot>), SweepError> {
     let config = load_config(&options.paths, &options.working_directory)?;
@@ -510,6 +531,7 @@ fn run_sweep_with_minter(
         match publish(
             &PublishOptions {
                 paths: &options.paths,
+                source,
                 destination,
                 published_at: options.started_at,
                 cadence_hours: config.cadence_hours,
