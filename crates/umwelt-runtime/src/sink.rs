@@ -339,12 +339,13 @@ fn io_fault(error: io::Error) -> SinkFault {
 /// shipper, or `--events-fd`—must call this function rather than reproduce the
 /// encoding.
 ///
-/// Every UTF-8 byte outside `[A-Za-z0-9._-]` becomes `%XX`, using uppercase
+/// Every UTF-8 byte outside `[A-Za-z0-9_-]` becomes `%XX`, using uppercase
 /// hexadecimal digits. The empty run ID becomes `%`. Run IDs are arbitrary wire
-/// strings, so this encoding makes every ID one non-traversing path component;
-/// for example, `../outside` cannot escape the sink root. The encoding is
-/// injective: two distinct run IDs never share a directory (`%` within an ID is
-/// itself encoded as `%25`, so it cannot collide with the empty-ID sentinel).
+/// strings, so no run ID can produce `.`, `..`, or a name containing a path
+/// separator. Every run ID is therefore exactly one directory beneath the sink
+/// root. The encoding is injective: two distinct run IDs never share a directory
+/// (`%` within an ID is itself encoded as `%25`, so it cannot collide with the
+/// empty-ID sentinel).
 pub fn run_directory_name(run: &str) -> String {
     if run.is_empty() {
         return "%".to_owned();
@@ -352,7 +353,7 @@ pub fn run_directory_name(run: &str) -> String {
 
     let mut encoded = String::with_capacity(run.len());
     for byte in run.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.') {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') {
             encoded.push(char::from(byte));
         } else {
             use std::fmt::Write as _;
@@ -855,7 +856,7 @@ mod tests {
     }
 
     #[test]
-    fn run_ids_cannot_escape_the_sink_root() {
+    fn run_ids_cannot_escape_the_sink_root_via_a_separator() {
         let root = tempdir().expect("sink directory");
         let sink = FileSink::new(root.path());
         sink.append("../outside/run", draft("test.safe"))
@@ -863,7 +864,7 @@ mod tests {
 
         assert!(
             root.path()
-                .join("..%2Foutside%2Frun")
+                .join("%2E%2E%2Foutside%2Frun")
                 .join(EVENTS_FILE)
                 .is_file()
         );
@@ -878,7 +879,37 @@ mod tests {
     }
 
     #[test]
-    fn empty_nul_and_percent_run_ids_use_distinct_directories() {
+    fn run_ids_cannot_escape_the_sink_root_via_dot_segments() {
+        let parent = tempdir().expect("parent directory");
+        let root = parent.path().join("sinkroot");
+        let sink = FileSink::new(&root);
+        sink.append("..", draft("test.dot-segment"))
+            .expect("append dot-segment run ID safely");
+
+        let directory = run_directory_name("..");
+        assert!(root.join(directory).join(EVENTS_FILE).is_file());
+        assert!(!root.join(EVENTS_FILE).exists());
+        assert!(!parent.path().join(EVENTS_FILE).exists());
+    }
+
+    #[test]
+    fn dot_bearing_run_ids_are_distinct_safe_components() {
+        let runs = [".", "..", "...", "..%2F", "a.b"];
+        let mut directories = runs.map(run_directory_name).to_vec();
+
+        for directory in &directories {
+            assert_ne!(directory, ".");
+            assert_ne!(directory, "..");
+            assert!(!directory.contains('/'));
+            assert!(!directory.contains('\\'));
+        }
+        directories.sort();
+        directories.dedup();
+        assert_eq!(directories.len(), runs.len());
+    }
+
+    #[test]
+    fn empty_nul_percent_and_dot_run_ids_use_distinct_directories() {
         let root = tempdir().expect("sink directory");
         let sink = FileSink::new(root.path());
         sink.append("", draft("test.empty"))
@@ -887,14 +918,22 @@ mod tests {
             .expect("append NUL run ID");
         sink.append("%", draft("test.percent"))
             .expect("append percent run ID");
+        sink.append(".", draft("test.dot"))
+            .expect("append dot run ID");
+        sink.append("..", draft("test.dot-dot"))
+            .expect("append dot-dot run ID");
 
         assert_eq!(run_directory_name("%"), "%25");
         assert!(root.path().join("%").join(EVENTS_FILE).is_file());
         assert!(root.path().join("%00").join(EVENTS_FILE).is_file());
         assert!(root.path().join("%25").join(EVENTS_FILE).is_file());
+        assert!(root.path().join("%2E").join(EVENTS_FILE).is_file());
+        assert!(root.path().join("%2E%2E").join(EVENTS_FILE).is_file());
         assert_eq!(sink.last_seq("").expect("empty run sequence"), 1);
         assert_eq!(sink.last_seq("\0").expect("NUL run sequence"), 1);
         assert_eq!(sink.last_seq("%").expect("percent run sequence"), 1);
+        assert_eq!(sink.last_seq(".").expect("dot run sequence"), 1);
+        assert_eq!(sink.last_seq("..").expect("dot-dot run sequence"), 1);
     }
 
     #[cfg(unix)]
