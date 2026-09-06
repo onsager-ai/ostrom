@@ -12,7 +12,7 @@ use std::sync::{Mutex, MutexGuard};
 use chrono::{SecondsFormat, Utc};
 use ethogram::{Event, EventDraft, StampFields, parse_event, serialise_event, stamp};
 
-// This moves to ethogram's vocabulary when ethogram #5 lands.
+// Ethogram #5 landed, but it exports no event-type name constant; this stays until it does.
 const RUN_FINISHED: &str = "run.finished";
 const EVENTS_FILE: &str = "events.jsonl";
 
@@ -663,6 +663,17 @@ mod tests {
             payload: json!({ "opaque": true }),
             captured_at: None,
         }
+    }
+
+    #[test]
+    fn run_finished_constant_still_names_a_type_ethogram_validates() {
+        let wire = format!(
+            r#"{{"v":1,"type":"{RUN_FINISHED}","runId":"run","seq":1,"ts":"2026-09-07T00:00:00.000Z","payload":{{"outcome":12345}}}}"#
+        );
+
+        // Ethogram validates payloads only for recognised event types. If this
+        // malformed payload parses, the local copy has drifted from its vocabulary.
+        assert!(parse_event(&wire).is_err());
     }
 
     fn stored_event_bytes(root: &Path, run: &str) -> Vec<Vec<u8>> {
