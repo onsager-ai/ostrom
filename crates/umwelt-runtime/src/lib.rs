@@ -30,5 +30,5 @@ pub use operation_settings::{
 };
 pub use pass_state::{PassState, PassStateError, read_pass_state, write_pass_state};
 pub use registry::{CheckAction, CheckReceipt, execute_check_action};
-pub use sink::{FileSink, Sink, SinkFault};
+pub use sink::{FileSink, Sink, SinkFault, run_directory_name};
 pub use trace::{TraceAppend, TraceAppendError, TraceFactRecord, append_trace};

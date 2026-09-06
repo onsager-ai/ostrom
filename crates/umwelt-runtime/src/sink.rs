@@ -332,9 +332,20 @@ fn io_fault(error: io::Error) -> SinkFault {
     SinkFault::Io(error.to_string())
 }
 
-// Keep ordinary run IDs readable while making every wire-valid string a single,
-// non-traversing directory component. `%` is escaped too, so this is injective.
-fn run_directory_name(run: &str) -> String {
+/// Return the directory name for a run under a [`FileSink`] root.
+///
+/// This function is the on-disk contract for locating a run's directory. Any
+/// consumer that needs to find its `events.jsonl`—including `ostrom logs`, a
+/// shipper, or `--events-fd`—must call this function rather than reproduce the
+/// encoding.
+///
+/// Every UTF-8 byte outside `[A-Za-z0-9._-]` becomes `%XX`, using uppercase
+/// hexadecimal digits. The empty run ID becomes `%`. Run IDs are arbitrary wire
+/// strings, so this encoding makes every ID one non-traversing path component;
+/// for example, `../outside` cannot escape the sink root. The encoding is
+/// injective: two distinct run IDs never share a directory (`%` within an ID is
+/// itself encoded as `%25`, so it cannot collide with the empty-ID sentinel).
+pub fn run_directory_name(run: &str) -> String {
     if run.is_empty() {
         return "%".to_owned();
     }
@@ -867,18 +878,23 @@ mod tests {
     }
 
     #[test]
-    fn empty_and_nul_run_ids_use_distinct_directories() {
+    fn empty_nul_and_percent_run_ids_use_distinct_directories() {
         let root = tempdir().expect("sink directory");
         let sink = FileSink::new(root.path());
         sink.append("", draft("test.empty"))
             .expect("append empty run ID");
         sink.append("\0", draft("test.nul"))
             .expect("append NUL run ID");
+        sink.append("%", draft("test.percent"))
+            .expect("append percent run ID");
 
+        assert_eq!(run_directory_name("%"), "%25");
         assert!(root.path().join("%").join(EVENTS_FILE).is_file());
         assert!(root.path().join("%00").join(EVENTS_FILE).is_file());
+        assert!(root.path().join("%25").join(EVENTS_FILE).is_file());
         assert_eq!(sink.last_seq("").expect("empty run sequence"), 1);
         assert_eq!(sink.last_seq("\0").expect("NUL run sequence"), 1);
+        assert_eq!(sink.last_seq("%").expect("percent run sequence"), 1);
     }
 
     #[cfg(unix)]
