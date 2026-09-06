@@ -29,15 +29,13 @@ use thiserror::Error;
 
 use crate::{
     agent::RunCaps,
+    event_types::{
+        AGENT_COMPLETED, AGENT_TOOL_RESULT, AGENT_TOOL_USE, AGENT_WARNING, RUN_FINISHED,
+    },
     process_control,
     sink::{Sink, SinkFault},
 };
 
-const AGENT_COMPLETED: &str = "agent.completed";
-const AGENT_TOOL_USE: &str = "agent.tool_use";
-const AGENT_TOOL_RESULT: &str = "agent.tool_result";
-const AGENT_WARNING: &str = "agent.warning";
-const RUN_FINISHED: &str = "run.finished";
 const MICRODOLLARS_PER_DOLLAR: f64 = 1_000_000.0;
 
 /// A monotonic clock used by cap state machines.
