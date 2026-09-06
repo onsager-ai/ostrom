@@ -4,7 +4,9 @@ use std::{
     process::{Command, Stdio},
 };
 
-use super::{ActionFault, AgentRunner, Harness, PASS_MAX_TURNS, RunOutcome, RunRequest};
+use super::{
+    ActionFault, AgentRunner, CapSupport, Harness, PASS_MAX_TURNS, ProcessOutcome, RunRequest,
+};
 
 /// Spawn adapter for the `agent/claude` harness.
 pub struct ClaudeHarness {
@@ -40,23 +42,44 @@ impl Harness for ClaudeHarness {
     fn default_model(&self) -> &str {
         &self.default_model
     }
+
+    fn enforceable_caps(&self) -> CapSupport {
+        // Wall time comes from the runtime's monotonic clock. Claude's verified
+        // `stream-json` output exposes assistant turn boundaries, tool use and
+        // matching tool results, and per-message token usage, so wall, idle,
+        // turns, and tokens have observable enforcement points. Total cost is
+        // reported only by the terminal result; that makes cost enforcement
+        // end-only, but still truthful.
+        CapSupport::none()
+            .with_wall()
+            .with_idle()
+            .with_turns()
+            .with_tokens()
+            .with_cost()
+    }
 }
 
 impl AgentRunner for ClaudeHarness {
-    fn run(&self, request: &RunRequest) -> RunOutcome {
+    fn run(&self, request: &RunRequest) -> ProcessOutcome {
         let RunRequest::Orchestrator(request) = request else {
-            return RunOutcome::Error(ActionFault::new("runner_kind_mismatch", None));
+            return ProcessOutcome::Error(ActionFault::new("runner_kind_mismatch", None));
         };
         let output = match fs::File::create(&request.transcript) {
             Ok(output) => output,
             Err(error) => {
-                return RunOutcome::Error(ActionFault::new("runner_io", Some(error.to_string())));
+                return ProcessOutcome::Error(ActionFault::new(
+                    "runner_io",
+                    Some(error.to_string()),
+                ));
             }
         };
         let error_output = match output.try_clone() {
             Ok(error_output) => error_output,
             Err(error) => {
-                return RunOutcome::Error(ActionFault::new("runner_io", Some(error.to_string())));
+                return ProcessOutcome::Error(ActionFault::new(
+                    "runner_io",
+                    Some(error.to_string()),
+                ));
             }
         };
         let mut command = Command::new(&self.executable);
@@ -79,15 +102,17 @@ impl AgentRunner for ClaudeHarness {
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
-                return RunOutcome::Error(ActionFault::new(
+                return ProcessOutcome::Error(ActionFault::new(
                     "runner_unavailable",
                     Some(error.to_string()),
                 ));
             }
         };
         match child.wait() {
-            Ok(status) => RunOutcome::Exited(status),
-            Err(error) => RunOutcome::Error(ActionFault::new("runner_io", Some(error.to_string()))),
+            Ok(status) => ProcessOutcome::Exited(status),
+            Err(error) => {
+                ProcessOutcome::Error(ActionFault::new("runner_io", Some(error.to_string())))
+            }
         }
     }
 }
@@ -126,13 +151,17 @@ mod tests {
         fn default_model(&self) -> &str {
             "fixture-model"
         }
+
+        fn enforceable_caps(&self) -> CapSupport {
+            CapSupport::none().with_wall()
+        }
     }
 
     impl AgentRunner for FixtureRunner {
-        fn run(&self, request: &RunRequest) -> RunOutcome {
+        fn run(&self, request: &RunRequest) -> ProcessOutcome {
             assert!(matches!(request, RunRequest::Implementer(_)));
             self.ran.store(true, Ordering::SeqCst);
-            RunOutcome::Error(ActionFault::new("fixture-finished", None))
+            ProcessOutcome::Error(ActionFault::new("fixture-finished", None))
         }
     }
 
@@ -164,6 +193,23 @@ mod tests {
                 profile.display(),
                 PASS_MAX_TURNS,
             )
+        );
+    }
+
+    #[test]
+    fn claude_declares_all_stream_observable_cap_support() {
+        let claude = ClaudeHarness::new("claude", "fixture-v1", "fixture-model");
+
+        // Verified `stream-json` emits the tool, turn, and usage boundaries
+        // required by the stream-derived caps; wall uses the runtime clock.
+        assert_eq!(
+            claude.enforceable_caps(),
+            CapSupport::none()
+                .with_wall()
+                .with_idle()
+                .with_turns()
+                .with_tokens()
+                .with_cost()
         );
     }
 
@@ -222,7 +268,7 @@ mod tests {
         let outcome = ClaudeHarness::new("missing", "fixture-v1", "fixture-model").run(&request);
         assert!(matches!(
             outcome,
-            RunOutcome::Error(ref fault) if fault.name() == "runner_kind_mismatch"
+            ProcessOutcome::Error(ref fault) if fault.name() == "runner_kind_mismatch"
         ));
     }
 }

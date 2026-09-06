@@ -80,6 +80,87 @@ impl RunCaps {
     }
 }
 
+/// Per-cap enforcement support declared by a harness.
+///
+/// There is deliberately no [`Default`] implementation: every harness must
+/// opt in to each claim rather than accidentally advertising a cap it ignores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapSupport {
+    wall: bool,
+    idle: bool,
+    turns: bool,
+    tokens: bool,
+    cost: bool,
+}
+
+impl CapSupport {
+    #[must_use]
+    pub const fn none() -> Self {
+        Self {
+            wall: false,
+            idle: false,
+            turns: false,
+            tokens: false,
+            cost: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_wall(mut self) -> Self {
+        self.wall = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_idle(mut self) -> Self {
+        self.idle = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_turns(mut self) -> Self {
+        self.turns = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_tokens(mut self) -> Self {
+        self.tokens = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_cost(mut self) -> Self {
+        self.cost = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn wall(self) -> bool {
+        self.wall
+    }
+
+    #[must_use]
+    pub const fn idle(self) -> bool {
+        self.idle
+    }
+
+    #[must_use]
+    pub const fn turns(self) -> bool {
+        self.turns
+    }
+
+    #[must_use]
+    pub const fn tokens(self) -> bool {
+        self.tokens
+    }
+
+    #[must_use]
+    pub const fn cost(self) -> bool {
+        self.cost
+    }
+}
+
 /// Signals observed by a running harness process.
 #[derive(Debug, Clone, Default)]
 pub struct SignalFlags {
@@ -148,6 +229,7 @@ pub trait Harness: Send + Sync {
     fn name(&self) -> &'static str;
     fn version(&self) -> &str;
     fn default_model(&self) -> &str;
+    fn enforceable_caps(&self) -> CapSupport;
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -203,13 +285,13 @@ pub struct RunTermination {
 }
 
 #[derive(Debug)]
-pub enum RunOutcome {
+pub enum ProcessOutcome {
     Exited(ExitStatus),
     Terminated(RunTermination),
     Error(ActionFault),
 }
 
-impl RunOutcome {
+impl ProcessOutcome {
     #[must_use]
     pub fn status(&self) -> Option<ExitStatus> {
         match self {
@@ -220,11 +302,12 @@ impl RunOutcome {
 }
 
 pub trait AgentRunner: Harness {
-    fn prepare(&self) -> Result<RunnerLaunch, ActionFault> {
+    fn prepare(&self, caps: &RunCaps) -> Result<RunnerLaunch, ActionFault> {
+        refuse_unenforceable_caps(self.name(), self.enforceable_caps(), caps)?;
         Ok(RunnerLaunch::new(Vec::new()))
     }
 
-    fn run(&self, request: &RunRequest) -> RunOutcome;
+    fn run(&self, request: &RunRequest) -> ProcessOutcome;
 }
 
 #[derive(Default)]
@@ -265,16 +348,16 @@ impl AgentRegistry {
         self.runners.get(name).cloned()
     }
 
-    pub fn prepare(&self, name: &str) -> Result<RunnerLaunch, ActionFault> {
+    pub fn prepare(&self, name: &str, caps: &RunCaps) -> Result<RunnerLaunch, ActionFault> {
         self.get(name)
             .ok_or_else(|| ActionFault::new("unregistered_harness", None))?
-            .prepare()
+            .prepare(caps)
     }
 
     #[must_use]
-    pub fn run(&self, name: &str, request: &RunRequest) -> RunOutcome {
+    pub fn run(&self, name: &str, request: &RunRequest) -> ProcessOutcome {
         self.get(name).map_or_else(
-            || RunOutcome::Error(ActionFault::new("unregistered_harness", None)),
+            || ProcessOutcome::Error(ActionFault::new("unregistered_harness", None)),
             |runner| runner.run(request),
         )
     }
@@ -371,10 +454,21 @@ impl Harness for CodexHarness {
     fn default_model(&self) -> &str {
         &self.default_model
     }
+
+    fn enforceable_caps(&self) -> CapSupport {
+        // Wall time is measured from the runtime's own monotonic clock, so it
+        // never depends on a harness event. The codex `exec --json` schema is
+        // otherwise unverified: chreode's normaliser and fixture explicitly
+        // guess its tool, turn, and usage events. Until a real capture proves
+        // those boundaries, Codex cannot honestly claim idle, turns, tokens,
+        // or cost support.
+        CapSupport::none().with_wall()
+    }
 }
 
 impl AgentRunner for CodexHarness {
-    fn prepare(&self) -> Result<RunnerLaunch, ActionFault> {
+    fn prepare(&self, caps: &RunCaps) -> Result<RunnerLaunch, ActionFault> {
+        refuse_unenforceable_caps(self.name(), self.enforceable_caps(), caps)?;
         let (executable, node, path) = self.resolved()?;
         if !Command::new(&executable)
             .arg("--version")
@@ -397,33 +491,42 @@ impl AgentRunner for CodexHarness {
         ]))
     }
 
-    fn run(&self, request: &RunRequest) -> RunOutcome {
+    fn run(&self, request: &RunRequest) -> ProcessOutcome {
         let RunRequest::Implementer(request) = request else {
-            return RunOutcome::Error(ActionFault::new("runner_kind_mismatch", None));
+            return ProcessOutcome::Error(ActionFault::new("runner_kind_mismatch", None));
         };
         if !request.offline || request.token_ceiling == 0 {
-            return RunOutcome::Error(ActionFault::new("runner_policy", None));
+            return ProcessOutcome::Error(ActionFault::new("runner_policy", None));
         }
         let (executable, _, path) = match self.resolved() {
             Ok(resolved) => resolved,
-            Err(error) => return RunOutcome::Error(error),
+            Err(error) => return ProcessOutcome::Error(error),
         };
         let events = match fs::File::create(&request.transcript) {
             Ok(events) => events,
             Err(error) => {
-                return RunOutcome::Error(ActionFault::new("runner_io", Some(error.to_string())));
+                return ProcessOutcome::Error(ActionFault::new(
+                    "runner_io",
+                    Some(error.to_string()),
+                ));
             }
         };
         let errors = match events.try_clone() {
             Ok(errors) => errors,
             Err(error) => {
-                return RunOutcome::Error(ActionFault::new("runner_io", Some(error.to_string())));
+                return ProcessOutcome::Error(ActionFault::new(
+                    "runner_io",
+                    Some(error.to_string()),
+                ));
             }
         };
         let input = match fs::File::open(&request.prompt) {
             Ok(input) => input,
             Err(error) => {
-                return RunOutcome::Error(ActionFault::new("runner_io", Some(error.to_string())));
+                return ProcessOutcome::Error(ActionFault::new(
+                    "runner_io",
+                    Some(error.to_string()),
+                ));
             }
         };
         let mut command = Command::new(executable);
@@ -453,7 +556,7 @@ impl AgentRunner for CodexHarness {
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
-                return RunOutcome::Error(ActionFault::new(
+                return ProcessOutcome::Error(ActionFault::new(
                     "runner_unavailable",
                     Some(format!("could not start Codex: {error}")),
                 ));
@@ -463,11 +566,11 @@ impl AgentRunner for CodexHarness {
             match child.try_wait() {
                 Ok(Some(status)) => {
                     process_control::kill_remaining_process_group(child.id());
-                    return RunOutcome::Exited(status);
+                    return ProcessOutcome::Exited(status);
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    return RunOutcome::Error(ActionFault::new(
+                    return ProcessOutcome::Error(ActionFault::new(
                         "runner_io",
                         Some(error.to_string()),
                     ));
@@ -484,13 +587,47 @@ impl AgentRunner for CodexHarness {
                     request.termination_grace,
                 );
                 let _ = child.wait();
-                return RunOutcome::Terminated(RunTermination {
+                return ProcessOutcome::Terminated(RunTermination {
                     signal,
                     termination_signal,
                 });
             }
             thread::sleep(Duration::from_millis(50));
         }
+    }
+}
+
+fn refuse_unenforceable_caps(
+    harness: &str,
+    support: CapSupport,
+    caps: &RunCaps,
+) -> Result<(), ActionFault> {
+    let mut unsupported = Vec::new();
+    if caps.wall_ms.is_some() && !support.wall() {
+        unsupported.push("wall");
+    }
+    if caps.idle_ms.is_some() && !support.idle() {
+        unsupported.push("idle");
+    }
+    if caps.turns.is_some() && !support.turns() {
+        unsupported.push("turns");
+    }
+    if caps.tokens.is_some() && !support.tokens() {
+        unsupported.push("tokens");
+    }
+    if caps.cost_usd.is_some() && !support.cost() {
+        unsupported.push("cost");
+    }
+    if unsupported.is_empty() {
+        Ok(())
+    } else {
+        Err(ActionFault::new(
+            "unsupported_run_caps",
+            Some(format!(
+                "{harness} cannot enforce requested caps: {}",
+                unsupported.join(", ")
+            )),
+        ))
     }
 }
 
@@ -793,13 +930,17 @@ mod tests {
         fn default_model(&self) -> &str {
             "fixture-model"
         }
+
+        fn enforceable_caps(&self) -> CapSupport {
+            CapSupport::none().with_wall().with_tokens()
+        }
     }
 
     impl AgentRunner for FixtureRunner {
-        fn run(&self, request: &RunRequest) -> RunOutcome {
+        fn run(&self, request: &RunRequest) -> ProcessOutcome {
             assert!(matches!(request, RunRequest::Implementer(_)));
             self.ran.store(true, Ordering::SeqCst);
-            RunOutcome::Error(ActionFault::new("fixture-finished", None))
+            ProcessOutcome::Error(ActionFault::new("fixture-finished", None))
         }
     }
 
@@ -836,6 +977,80 @@ mod tests {
     }
 
     #[test]
+    fn harness_refuses_every_requested_cap_it_cannot_enforce() {
+        let runner = FixtureRunner {
+            name: "fixture",
+            ran: Arc::new(AtomicBool::new(false)),
+        };
+        let caps = RunCaps {
+            idle_ms: Some(1_000),
+            turns: Some(2),
+            cost_usd: Some(0.5),
+            ..RunCaps::default()
+        };
+
+        let error = runner
+            .prepare(&caps)
+            .expect_err("unsupported caps must be refused");
+
+        assert_eq!(error.name(), "unsupported_run_caps");
+        assert_eq!(
+            error.detail(),
+            Some("fixture cannot enforce requested caps: idle, turns, cost")
+        );
+    }
+
+    #[test]
+    fn harness_without_idle_support_refuses_an_idle_cap() {
+        let runner = FixtureRunner {
+            name: "fixture",
+            ran: Arc::new(AtomicBool::new(false)),
+        };
+        let caps = RunCaps {
+            idle_ms: Some(1_000),
+            ..RunCaps::default()
+        };
+
+        let error = runner
+            .prepare(&caps)
+            .expect_err("idle cap must require idle support");
+
+        assert_eq!(error.name(), "unsupported_run_caps");
+        assert_eq!(
+            error.detail(),
+            Some("fixture cannot enforce requested caps: idle")
+        );
+    }
+
+    #[test]
+    fn harness_accepts_caps_it_can_enforce() {
+        let runner = FixtureRunner {
+            name: "fixture",
+            ran: Arc::new(AtomicBool::new(false)),
+        };
+        let caps = RunCaps {
+            wall_ms: Some(1_000),
+            tokens: Some(2_000),
+            ..RunCaps::default()
+        };
+
+        let launch = runner
+            .prepare(&caps)
+            .expect("supported caps must be accepted");
+
+        assert!(launch.environment().is_empty());
+    }
+
+    #[test]
+    fn codex_declares_only_runtime_clock_cap_support() {
+        let codex = CodexHarness::new("codex", "fixture-v1", "fixture-model", Vec::new());
+
+        // The `exec --json` schema is unverified, so any claim beyond the
+        // runtime's own wall clock would be a guess.
+        assert_eq!(codex.enforceable_caps(), CapSupport::none().with_wall());
+    }
+
+    #[test]
     fn named_handoff_runs_a_second_registered_implementer() {
         let ran = Arc::new(AtomicBool::new(false));
         let mut registry = AgentRegistry::core(FixtureRunner {
@@ -854,7 +1069,7 @@ mod tests {
         let outcome = registry.run("agent/fixture", &implementer_request(root.path()));
 
         assert!(
-            matches!(outcome, RunOutcome::Error(ref fault) if fault.name() == "fixture-finished")
+            matches!(outcome, ProcessOutcome::Error(ref fault) if fault.name() == "fixture-finished")
         );
         assert!(ran.load(Ordering::SeqCst));
     }
