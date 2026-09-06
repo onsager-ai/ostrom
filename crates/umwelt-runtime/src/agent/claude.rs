@@ -106,7 +106,7 @@ mod tests {
 
     use super::*;
     use crate::agent::{
-        AgentRegistry, ImplementerRunRequest, OrchestratorRunRequest, RunCeilings, SignalFlags,
+        AgentRegistry, ImplementerRunRequest, LoopCeilings, OrchestratorRunRequest, SignalFlags,
     };
 
     struct FixtureRunner {
@@ -148,7 +148,7 @@ mod tests {
             model: "fixture-model".to_owned(),
             profile: profile.clone(),
             permission_mode: "auto".to_owned(),
-            ceilings: RunCeilings::default(),
+            ceilings: LoopCeilings::default(),
             transcript,
         });
 

@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, fs, path::Path};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::RunCeilings;
+use crate::LoopCeilings;
 
 const SETTINGS_SCHEMA: &str = "https://json.schemastore.org/claude-code-settings.json";
 
@@ -21,7 +21,7 @@ pub struct ResolvedOperationSettings {
     pub prompt: String,
     pub permission_mode: String,
     pub profile: HarnessProfile,
-    pub ceilings: RunCeilings,
+    pub ceilings: LoopCeilings,
 }
 
 #[derive(Serialize)]
@@ -136,7 +136,7 @@ mod tests {
         HarnessProfile, ResolvedOperationSettings, check_operation_settings_drift,
         generate_operation_settings,
     };
-    use crate::RunCeilings;
+    use crate::LoopCeilings;
 
     fn settings() -> ResolvedOperationSettings {
         ResolvedOperationSettings {
@@ -147,7 +147,7 @@ mod tests {
                 default_mode: "deny".to_owned(),
                 allow: vec!["Bash(ostrom comment *)".to_owned()],
             },
-            ceilings: RunCeilings {
+            ceilings: LoopCeilings {
                 concurrent: Some(2),
                 spend_usd: Some(50.0),
                 tokens: Some(200_000),
