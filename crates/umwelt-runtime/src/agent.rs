@@ -80,6 +80,57 @@ impl RunCaps {
     }
 }
 
+/// Per-cap enforcement support declared by a harness.
+///
+/// There is deliberately no [`Default`] implementation: every harness must
+/// opt in to each claim rather than accidentally advertising a cap it ignores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapSupport {
+    wall: bool,
+    idle: bool,
+    turns: bool,
+    tokens: bool,
+    cost: bool,
+}
+
+impl CapSupport {
+    #[must_use]
+    pub const fn new(wall: bool, idle: bool, turns: bool, tokens: bool, cost: bool) -> Self {
+        Self {
+            wall,
+            idle,
+            turns,
+            tokens,
+            cost,
+        }
+    }
+
+    #[must_use]
+    pub const fn wall(self) -> bool {
+        self.wall
+    }
+
+    #[must_use]
+    pub const fn idle(self) -> bool {
+        self.idle
+    }
+
+    #[must_use]
+    pub const fn turns(self) -> bool {
+        self.turns
+    }
+
+    #[must_use]
+    pub const fn tokens(self) -> bool {
+        self.tokens
+    }
+
+    #[must_use]
+    pub const fn cost(self) -> bool {
+        self.cost
+    }
+}
+
 /// Signals observed by a running harness process.
 #[derive(Debug, Clone, Default)]
 pub struct SignalFlags {
@@ -148,6 +199,7 @@ pub trait Harness: Send + Sync {
     fn name(&self) -> &'static str;
     fn version(&self) -> &str;
     fn default_model(&self) -> &str;
+    fn enforceable_caps(&self) -> CapSupport;
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -220,7 +272,8 @@ impl ProcessOutcome {
 }
 
 pub trait AgentRunner: Harness {
-    fn prepare(&self) -> Result<RunnerLaunch, ActionFault> {
+    fn prepare(&self, caps: &RunCaps) -> Result<RunnerLaunch, ActionFault> {
+        refuse_unenforceable_caps(self.name(), self.enforceable_caps(), caps)?;
         Ok(RunnerLaunch::new(Vec::new()))
     }
 
@@ -265,10 +318,10 @@ impl AgentRegistry {
         self.runners.get(name).cloned()
     }
 
-    pub fn prepare(&self, name: &str) -> Result<RunnerLaunch, ActionFault> {
+    pub fn prepare(&self, name: &str, caps: &RunCaps) -> Result<RunnerLaunch, ActionFault> {
         self.get(name)
             .ok_or_else(|| ActionFault::new("unregistered_harness", None))?
-            .prepare()
+            .prepare(caps)
     }
 
     #[must_use]
@@ -371,10 +424,21 @@ impl Harness for CodexHarness {
     fn default_model(&self) -> &str {
         &self.default_model
     }
+
+    fn enforceable_caps(&self) -> CapSupport {
+        // Wall time is measured from the runtime's own monotonic clock, so it
+        // never depends on a harness event. The codex `exec --json` schema is
+        // otherwise unverified: chreode's normaliser and fixture explicitly
+        // guess its tool, turn, and usage events. Until a real capture proves
+        // those boundaries, Codex cannot honestly claim idle, turns, tokens,
+        // or cost support.
+        CapSupport::new(true, false, false, false, false)
+    }
 }
 
 impl AgentRunner for CodexHarness {
-    fn prepare(&self) -> Result<RunnerLaunch, ActionFault> {
+    fn prepare(&self, caps: &RunCaps) -> Result<RunnerLaunch, ActionFault> {
+        refuse_unenforceable_caps(self.name(), self.enforceable_caps(), caps)?;
         let (executable, node, path) = self.resolved()?;
         if !Command::new(&executable)
             .arg("--version")
@@ -500,6 +564,40 @@ impl AgentRunner for CodexHarness {
             }
             thread::sleep(Duration::from_millis(50));
         }
+    }
+}
+
+fn refuse_unenforceable_caps(
+    harness: &str,
+    support: CapSupport,
+    caps: &RunCaps,
+) -> Result<(), ActionFault> {
+    let mut unsupported = Vec::new();
+    if caps.wall_ms.is_some() && !support.wall() {
+        unsupported.push("wall");
+    }
+    if caps.idle_ms.is_some() && !support.idle() {
+        unsupported.push("idle");
+    }
+    if caps.turns.is_some() && !support.turns() {
+        unsupported.push("turns");
+    }
+    if caps.tokens.is_some() && !support.tokens() {
+        unsupported.push("tokens");
+    }
+    if caps.cost_usd.is_some() && !support.cost() {
+        unsupported.push("cost");
+    }
+    if unsupported.is_empty() {
+        Ok(())
+    } else {
+        Err(ActionFault::new(
+            "unsupported_run_caps",
+            Some(format!(
+                "{harness} cannot enforce requested caps: {}",
+                unsupported.join(", ")
+            )),
+        ))
     }
 }
 
@@ -802,6 +900,10 @@ mod tests {
         fn default_model(&self) -> &str {
             "fixture-model"
         }
+
+        fn enforceable_caps(&self) -> CapSupport {
+            CapSupport::new(true, false, false, true, false)
+        }
     }
 
     impl AgentRunner for FixtureRunner {
@@ -842,6 +944,80 @@ mod tests {
                 .name(),
             "codex"
         );
+    }
+
+    #[test]
+    fn harness_refuses_every_requested_cap_it_cannot_enforce() {
+        let runner = FixtureRunner {
+            name: "fixture",
+            ran: Arc::new(AtomicBool::new(false)),
+        };
+        let caps = RunCaps {
+            idle_ms: Some(1_000),
+            turns: Some(2),
+            cost_usd: Some(0.5),
+            ..RunCaps::default()
+        };
+
+        let error = runner
+            .prepare(&caps)
+            .expect_err("unsupported caps must be refused");
+
+        assert_eq!(error.name(), "unsupported_run_caps");
+        assert_eq!(
+            error.detail(),
+            Some("fixture cannot enforce requested caps: idle, turns, cost")
+        );
+    }
+
+    #[test]
+    fn harness_without_idle_support_refuses_an_idle_cap() {
+        let runner = FixtureRunner {
+            name: "fixture",
+            ran: Arc::new(AtomicBool::new(false)),
+        };
+        let caps = RunCaps {
+            idle_ms: Some(1_000),
+            ..RunCaps::default()
+        };
+
+        let error = runner
+            .prepare(&caps)
+            .expect_err("idle cap must require idle support");
+
+        assert_eq!(error.name(), "unsupported_run_caps");
+        assert_eq!(
+            error.detail(),
+            Some("fixture cannot enforce requested caps: idle")
+        );
+    }
+
+    #[test]
+    fn harness_accepts_caps_it_can_enforce() {
+        let runner = FixtureRunner {
+            name: "fixture",
+            ran: Arc::new(AtomicBool::new(false)),
+        };
+        let caps = RunCaps {
+            wall_ms: Some(1_000),
+            tokens: Some(2_000),
+            ..RunCaps::default()
+        };
+
+        let launch = runner
+            .prepare(&caps)
+            .expect("supported caps must be accepted");
+
+        assert!(launch.environment().is_empty());
+    }
+
+    #[test]
+    fn shipped_harnesses_declare_idle_support_deliberately() {
+        let claude = claude::ClaudeHarness::new("claude", "fixture-v1", "fixture-model");
+        let codex = CodexHarness::new("codex", "fixture-v1", "fixture-model", Vec::new());
+
+        assert!(claude.enforceable_caps().idle());
+        assert!(!codex.enforceable_caps().idle());
     }
 
     #[test]

@@ -4,7 +4,9 @@ use std::{
     process::{Command, Stdio},
 };
 
-use super::{ActionFault, AgentRunner, Harness, PASS_MAX_TURNS, ProcessOutcome, RunRequest};
+use super::{
+    ActionFault, AgentRunner, CapSupport, Harness, PASS_MAX_TURNS, ProcessOutcome, RunRequest,
+};
 
 /// Spawn adapter for the `agent/claude` harness.
 pub struct ClaudeHarness {
@@ -39,6 +41,16 @@ impl Harness for ClaudeHarness {
 
     fn default_model(&self) -> &str {
         &self.default_model
+    }
+
+    fn enforceable_caps(&self) -> CapSupport {
+        // Wall time comes from the runtime's monotonic clock. Claude's verified
+        // `stream-json` output exposes assistant turn boundaries, tool use and
+        // matching tool results, and per-message token usage, so wall, idle,
+        // turns, and tokens have observable enforcement points. Total cost is
+        // reported only by the terminal result; that makes cost enforcement
+        // end-only, but still truthful.
+        CapSupport::new(true, true, true, true, true)
     }
 }
 
@@ -133,6 +145,10 @@ mod tests {
 
         fn default_model(&self) -> &str {
             "fixture-model"
+        }
+
+        fn enforceable_caps(&self) -> CapSupport {
+            CapSupport::new(true, false, false, false, false)
         }
     }
 
