@@ -1,10 +1,10 @@
-use std::{fs, io::Write, path::Path};
+use std::{fs, path::Path};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::{StoreError, event_store::append_trace_event, io_error, set_private_file_mode};
+use crate::{StoreError, TraceAppend, append_trace, io_error};
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TraceFactRecord {
@@ -32,14 +32,6 @@ impl std::fmt::Display for MalformedTraceRow {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TraceRead {
     pub rows: Vec<Result<TraceFactRecord, MalformedTraceRow>>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct TraceAppend {
-    pub ts: String,
-    pub kind: String,
-    pub fact: serde_json::Map<String, Value>,
-    pub narration: serde_json::Map<String, Value>,
 }
 
 /// Facts and narration remain separate read paths because narration is
@@ -146,41 +138,6 @@ fn parse_trace_line(line_number: usize, line: &str) -> Result<TraceFactRecord, M
                 .to_owned(),
         }),
     }
-}
-
-pub fn append_trace(path: &Path, record: &TraceAppend) -> Result<Vec<u8>, StoreError> {
-    if record.ts.is_empty() || record.kind.is_empty() {
-        return Err(StoreError::MalformedTrace {
-            message: "trace ts and kind must not be empty".to_owned(),
-        });
-    }
-    let mut value = serde_json::Map::new();
-    value.insert("ts".to_owned(), Value::String(record.ts.clone()));
-    value.insert("kind".to_owned(), Value::String(record.kind.clone()));
-    value.insert("fact".to_owned(), Value::Object(record.fact.clone()));
-    value.insert(
-        "narration".to_owned(),
-        Value::Object(record.narration.clone()),
-    );
-    let mut bytes = serde_json::to_vec(&Value::Object(value)).expect("JSON value serializes");
-    bytes.push(b'\n');
-    if bytes.len() > 4096 {
-        return Err(StoreError::TraceTooLarge { bytes: bytes.len() });
-    }
-    append_trace_event(path, &record.ts, &record.kind, &record.fact)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| io_error("create trace directory", parent, error))?;
-    }
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|error| io_error("open trace", path, error))?;
-    set_private_file_mode(path)?;
-    file.write_all(&bytes)
-        .map_err(|error| io_error("append trace", path, error))?;
-    Ok(bytes)
 }
 
 pub fn append_trace_checked(

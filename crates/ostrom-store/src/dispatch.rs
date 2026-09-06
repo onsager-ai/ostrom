@@ -142,8 +142,10 @@ fn run_dispatch_with_minter(
     request: &DispatchRequest,
     minter: &mut dyn InstallationTokenMinter,
 ) -> Result<DispatchOutcome, DispatchError> {
-    let registry = AgentRegistry::core(CodexHarness::from_environment())
-        .expect("the shipped Codex harness registration is valid");
+    let registry = AgentRegistry::core(CodexHarness::from_environment(
+        crate::umwelt_edge::node_fallbacks(),
+    ))
+    .expect("the shipped Codex harness registration is valid");
     run_dispatch_with_registry_and_minter(request, &registry, DEFAULT_IMPLEMENTER_RUNNER, minter)
 }
 
@@ -1570,7 +1572,7 @@ fn render_number(number: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::OsString, fs, path::Path, process::Command};
+    use std::{fs, path::Path, process::Command};
 
     use tempfile::tempdir;
 
@@ -1578,7 +1580,6 @@ mod tests {
     use serde_json::json;
 
     use super::{absolute_executable, describe_unparseable_listing, has_unpublished_tree};
-    use crate::agent::{NodeResolver, find_in_nvm_root};
     use crate::work_order::implementer_lease_ttl;
 
     fn git(path: &Path, arguments: &[&str]) {
@@ -1591,138 +1592,6 @@ mod tests {
                 .expect("run git")
                 .success(),
             "git {arguments:?}"
-        );
-    }
-
-    #[cfg(unix)]
-    fn executable(path: &Path) {
-        use std::os::unix::fs::PermissionsExt;
-
-        fs::create_dir_all(path.parent().expect("executable parent")).expect("create parent");
-        fs::write(path, "#!/bin/sh\nexit 0\n").expect("write executable");
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod executable");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn node_resolution_is_first_hit_wins_across_every_supported_layout() {
-        let root = tempdir().expect("temporary node resolution fixture");
-        let path_node = root.path().join("path/node");
-        let nvm = root.path().join("nvm");
-        let older_nvm_node = nvm.join("versions/node/v20.8.9/bin/node");
-        let nvm_node = nvm.join("versions/node/v20.10.1/bin/node");
-        let fnm = root.path().join("fnm");
-        let fnm_node = fnm.join("aliases/default/bin/node");
-        let legacy_fnm = root.path().join("home/.fnm");
-        let legacy_fnm_node = legacy_fnm.join("aliases/default/bin/node");
-        let volta = root.path().join("volta");
-        let volta_node = volta.join("bin/node");
-        let asdf = root.path().join("asdf");
-        let asdf_node = asdf.join("shims/node");
-        let standalone_node = root.path().join("standalone/node");
-        let resolver = NodeResolver {
-            path: Some(OsString::from(root.path().join("path"))),
-            nvm_dir: Some(nvm.clone()),
-            fnm_dirs: vec![fnm, legacy_fnm],
-            volta_home: Some(volta),
-            asdf_data_dir: Some(asdf),
-            standalone: vec![standalone_node.clone()],
-        };
-
-        assert_eq!(resolver.resolve(), None);
-
-        executable(&standalone_node);
-        assert_eq!(
-            resolver.resolve().as_deref(),
-            Some(standalone_node.as_path())
-        );
-
-        executable(&asdf_node);
-        assert_eq!(resolver.resolve().as_deref(), Some(asdf_node.as_path()));
-
-        executable(&volta_node);
-        assert_eq!(resolver.resolve().as_deref(), Some(volta_node.as_path()));
-
-        executable(&legacy_fnm_node);
-        assert_eq!(
-            resolver.resolve().as_deref(),
-            Some(legacy_fnm_node.as_path())
-        );
-
-        executable(&fnm_node);
-        assert_eq!(resolver.resolve().as_deref(), Some(fnm_node.as_path()));
-
-        fs::create_dir_all(nvm.join("alias")).expect("create nvm alias directory");
-        fs::write(nvm.join("alias/default"), "  v20 \nignored\n").expect("write major alias");
-        executable(&older_nvm_node);
-        executable(&nvm_node);
-        assert_eq!(resolver.resolve().as_deref(), Some(nvm_node.as_path()));
-
-        executable(&path_node);
-        assert_eq!(resolver.resolve().as_deref(), Some(path_node.as_path()));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn nvm_resolution_uses_only_the_default_alias() {
-        let root = tempdir().expect("temporary nvm resolution fixture");
-        let nvm = root.path().join("nvm");
-        let default_node = nvm.join("versions/node/v18.19.1/bin/codex");
-        let newer_node = nvm.join("versions/node/v22.1.0/bin/codex");
-        executable(&default_node);
-        executable(&newer_node);
-        fs::create_dir_all(nvm.join("alias")).expect("create nvm alias directory");
-        fs::write(nvm.join("alias/default"), " v18.19.1 \n").expect("write exact alias");
-
-        assert_eq!(
-            find_in_nvm_root(Path::new("codex"), &nvm).as_deref(),
-            Some(default_node.as_path())
-        );
-
-        fs::write(nvm.join("alias/default"), "node\n").expect("write unsupported alias");
-        assert_eq!(find_in_nvm_root(Path::new("codex"), &nvm), None);
-    }
-
-    /// The alias `nvm alias default 24` records a bare major version, not a
-    /// full one, and it is what the operator's machine actually holds: the
-    /// shim this replaced resolved it to the newest matching install. The
-    /// exact-version case above exercises a different branch entirely, so
-    /// without this the code path that runs in production is the untested one.
-    #[test]
-    fn a_major_version_alias_resolves_to_the_newest_matching_install() {
-        let root = tempdir().expect("temporary nvm major alias fixture");
-        let nvm = root.path().join("nvm");
-        // Deliberately spans majors and puts a higher *minor* below a lower
-        // one lexicographically: "v24.18.0" sorts before "v24.9.0" as text,
-        // so a string comparison would pick the wrong one.
-        for version in ["v22.22.3", "v24.9.0", "v24.15.0", "v24.18.0"] {
-            executable(&nvm.join(format!("versions/node/{version}/bin/codex")));
-        }
-        fs::create_dir_all(nvm.join("alias")).expect("create nvm alias directory");
-        fs::write(nvm.join("alias/default"), "24\n").expect("write major alias");
-
-        assert_eq!(
-            find_in_nvm_root(Path::new("codex"), &nvm).as_deref(),
-            Some(nvm.join("versions/node/v24.18.0/bin/codex").as_path())
-        );
-    }
-
-    /// A newer install whose binary is absent must not shadow the newest one
-    /// that is actually runnable — otherwise a half-removed version makes the
-    /// resolver report nothing rather than falling back.
-    #[test]
-    fn a_major_alias_skips_a_version_whose_binary_is_missing() {
-        let root = tempdir().expect("temporary nvm partial install fixture");
-        let nvm = root.path().join("nvm");
-        executable(&nvm.join("versions/node/v24.15.0/bin/codex"));
-        fs::create_dir_all(nvm.join("versions/node/v24.18.0/bin"))
-            .expect("create version directory with no binary");
-        fs::create_dir_all(nvm.join("alias")).expect("create nvm alias directory");
-        fs::write(nvm.join("alias/default"), "24\n").expect("write major alias");
-
-        assert_eq!(
-            find_in_nvm_root(Path::new("codex"), &nvm).as_deref(),
-            Some(nvm.join("versions/node/v24.15.0/bin/codex").as_path())
         );
     }
 

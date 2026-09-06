@@ -1830,7 +1830,7 @@ fn run_agent_operation(
         model,
         profile,
         permission_mode: permission_mode.to_owned(),
-        ceilings,
+        ceilings: ostrom_store::umwelt_edge::run_ceilings(ceilings),
         transcript,
     });
     match registry.run(action.uses, &request) {
@@ -2621,7 +2621,9 @@ fn core_agent_registry() -> AgentRegistry {
     ))
     .expect("the shipped Claude harness registration is valid");
     registry
-        .register(CodexHarness::from_environment())
+        .register(CodexHarness::from_environment(
+            ostrom_store::umwelt_edge::node_fallbacks(),
+        ))
         .expect("the shipped Codex harness registration is valid");
     registry
 }

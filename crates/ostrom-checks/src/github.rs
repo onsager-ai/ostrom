@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 
 use crate::{
     ActionFault, ActionOutcome, ActionProvider, PreparedAction,
-    process::{ProcessResult, exact_keys, invalid_parameters, run_bounded},
+    umwelt_edge::{ProcessResult, exact_keys, invalid_parameters, run_bounded},
 };
 
 const GH_TIMEOUT: Duration = Duration::from_secs(30);
