@@ -1,0 +1,25 @@
+[workspace]
+members = ["crates/umwelt-runtime"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/onsager-ai/umwelt"
+rust-version = "1.88"
+
+[workspace.dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std", "serde", "clock"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tempfile = "3"
+thiserror = "2"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+disallowed_types = "allow"
+disallowed_methods = "deny"
