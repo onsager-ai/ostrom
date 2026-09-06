@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/umwelt-runtime"]
+members = ["crates/umwelt-capture", "crates/umwelt-runtime"]
 resolver = "2"
 
 [workspace.package]

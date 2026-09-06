@@ -393,6 +393,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "umwelt-capture"
+version = "0.1.0"
+dependencies = [
+ "ethogram",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "umwelt-runtime"
 version = "0.1.0"
 dependencies = [
