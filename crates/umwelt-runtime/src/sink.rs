@@ -1,5 +1,6 @@
 //! Append-only event storage.
 
+use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
@@ -65,10 +66,14 @@ pub trait Sink: Send + Sync {
 }
 
 /// A file-backed sink with one `events.jsonl` log per run.
+///
+/// Operations are serialised only within one `FileSink` instance. Concurrent
+/// writers to the same run directory from separate instances or processes are
+/// not supported; a cross-process sink must provide its own locking.
 #[derive(Debug)]
 pub struct FileSink {
     root: PathBuf,
-    operation: Mutex<()>,
+    operation: Mutex<HashMap<String, RunState>>,
 }
 
 impl FileSink {
@@ -76,11 +81,11 @@ impl FileSink {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
-            operation: Mutex::new(()),
+            operation: Mutex::new(HashMap::new()),
         }
     }
 
-    fn lock(&self) -> Result<MutexGuard<'_, ()>, SinkFault> {
+    fn lock(&self) -> Result<MutexGuard<'_, HashMap<String, RunState>>, SinkFault> {
         self.operation
             .lock()
             .map_err(|_| SinkFault::Io("sink operation lock was poisoned".to_owned()))
@@ -90,11 +95,25 @@ impl FileSink {
         self.root.join(run_directory_name(run)).join(EVENTS_FILE)
     }
 
-    fn state(&self, run: &str) -> Result<RunState, SinkFault> {
-        read_state(&self.event_path(run), run)
+    fn state(
+        &self,
+        states: &mut HashMap<String, RunState>,
+        run: &str,
+    ) -> Result<RunState, SinkFault> {
+        let path = self.event_path(run);
+        if let Some(state) = states.get(run).copied() {
+            if durable_len(&path)? == state.durable_len {
+                return Ok(state);
+            }
+            states.remove(run);
+        }
+
+        let state = read_state(&path, run)?;
+        states.insert(run.to_owned(), state);
+        Ok(state)
     }
 
-    fn store(&self, run: &str, event: &Event) -> Result<(), SinkFault> {
+    fn store(&self, run: &str, event: &Event) -> Result<u64, SinkFault> {
         let serialised = serialise_event(event)
             .map_err(|error| SinkFault::Io(format!("cannot serialise event: {error}")))?;
         let run_directory = self.root.join(run_directory_name(run));
@@ -105,8 +124,8 @@ impl FileSink {
 
 impl Sink for FileSink {
     fn append(&self, run: &str, draft: EventDraft) -> Result<Event, SinkFault> {
-        let _operation = self.lock()?;
-        let state = self.state(run)?;
+        let mut states = self.lock()?;
+        let state = self.state(&mut states, run)?;
         if state.finished {
             return Err(SinkFault::Finished);
         }
@@ -123,13 +142,23 @@ impl Sink for FileSink {
                 ts: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
             },
         );
-        self.store(run, &event)?;
-        Ok(event)
+        match self.store(run, &event) {
+            Ok(durable_len) => {
+                // The cache follows durable state; it never predicts it.
+                states.insert(run.to_owned(), RunState::after(&event, durable_len));
+                Ok(event)
+            }
+            Err(fault) => {
+                // Even after rollback, reconstruct from disk before reusing `seq`.
+                states.remove(run);
+                Err(fault)
+            }
+        }
     }
 
     fn forward(&self, event: Event) -> Result<(), SinkFault> {
-        let _operation = self.lock()?;
-        let state = self.state(&event.run_id)?;
+        let mut states = self.lock()?;
+        let state = self.state(&mut states, &event.run_id)?;
         if state.finished {
             return Err(SinkFault::Finished);
         }
@@ -149,12 +178,23 @@ impl Sink for FileSink {
         }
 
         let run = event.run_id.clone();
-        self.store(&run, &event)
+        match self.store(&run, &event) {
+            Ok(durable_len) => {
+                // Preserve the same durable-before-cached invariant as `append`.
+                states.insert(run, RunState::after(&event, durable_len));
+                Ok(())
+            }
+            Err(fault) => {
+                // A failed write makes the durable log the only source of truth.
+                states.remove(&run);
+                Err(fault)
+            }
+        }
     }
 
     fn last_seq(&self, run: &str) -> Result<u64, SinkFault> {
-        let _operation = self.lock()?;
-        Ok(self.state(run)?.last_seq)
+        let mut states = self.lock()?;
+        Ok(self.state(&mut states, run)?.last_seq)
     }
 }
 
@@ -162,6 +202,17 @@ impl Sink for FileSink {
 struct RunState {
     last_seq: u64,
     finished: bool,
+    durable_len: u64,
+}
+
+impl RunState {
+    fn after(event: &Event, durable_len: u64) -> Self {
+        Self {
+            last_seq: event.seq,
+            finished: event.event_type == RUN_FINISHED,
+            durable_len,
+        }
+    }
 }
 
 fn read_state(path: &Path, run: &str) -> Result<RunState, SinkFault> {
@@ -170,6 +221,7 @@ fn read_state(path: &Path, run: &str) -> Result<RunState, SinkFault> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(RunState::default()),
         Err(error) => return Err(io_fault(error)),
     };
+    let file_len = file.metadata().map_err(io_fault)?.len();
     let mut reader = BufReader::new(file);
     let mut bytes = Vec::new();
     let mut state = RunState::default();
@@ -233,16 +285,31 @@ fn read_state(path: &Path, run: &str) -> Result<RunState, SinkFault> {
         state.finished = event.event_type == RUN_FINISHED;
     }
 
+    state.durable_len = file_len;
     Ok(state)
 }
 
-fn append_durably(path: &Path, event: &[u8]) -> Result<(), SinkFault> {
+fn durable_len(path: &Path) -> Result<u64, SinkFault> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.len()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(io_fault(error)),
+    }
+}
+
+fn append_durably(path: &Path, event: &[u8]) -> Result<u64, SinkFault> {
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .map_err(io_fault)?;
     let original_len = file.metadata().map_err(io_fault)?.len();
+    let event_len = u64::try_from(event.len())
+        .map_err(|_| SinkFault::Io("serialised event length exceeds u64".to_owned()))?;
+    let durable_len = original_len
+        .checked_add(event_len)
+        .and_then(|length| length.checked_add(1))
+        .ok_or_else(|| SinkFault::Io("event log length is exhausted".to_owned()))?;
 
     let write_result = file
         .write_all(event)
@@ -258,7 +325,7 @@ fn append_durably(path: &Path, event: &[u8]) -> Result<(), SinkFault> {
         };
     }
 
-    Ok(())
+    Ok(durable_len)
 }
 
 fn io_fault(error: io::Error) -> SinkFault {
@@ -269,7 +336,7 @@ fn io_fault(error: io::Error) -> SinkFault {
 // non-traversing directory component. `%` is escaped too, so this is injective.
 fn run_directory_name(run: &str) -> String {
     if run.is_empty() {
-        return "%00".to_owned();
+        return "%".to_owned();
     }
 
     let mut encoded = String::with_capacity(run.len());
@@ -551,6 +618,7 @@ pub mod conformance {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::time::{Duration, Instant};
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -595,6 +663,34 @@ mod tests {
     }
 
     #[test]
+    fn cached_state_keeps_append_scaling_linear() {
+        let root = tempdir().expect("scaling directory");
+        let sink = FileSink::new(root.path());
+        let small = timed_appends(&sink, "small", 500);
+        let large = timed_appends(&sink, "large", 2_000);
+        let generous_linear_bound = small.saturating_mul(8);
+
+        println!(
+            "FileSink append scaling: n=500 {}ms, n=2000 {}ms",
+            small.as_millis(),
+            large.as_millis()
+        );
+        assert!(
+            large <= generous_linear_bound,
+            "2,000 appends took {large:?}, more than eight times the {small:?} for 500 appends"
+        );
+    }
+
+    fn timed_appends(sink: &FileSink, run: &str, count: usize) -> Duration {
+        let started = Instant::now();
+        for _ in 0..count {
+            sink.append(run, draft("test.scaling"))
+                .expect("timed append");
+        }
+        started.elapsed()
+    }
+
+    #[test]
     #[cfg(unix)]
     fn refused_append_does_not_consume_sequence() {
         if running_as_root() {
@@ -619,6 +715,44 @@ mod tests {
 
         assert_eq!(first.seq, 1);
         assert_eq!(second.seq, 2);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn failed_write_evicts_cache_without_advancing_sequence() {
+        if running_as_root() {
+            return;
+        }
+        let root = tempdir().expect("sink directory");
+        let sink = FileSink::new(root.path());
+        sink.append("run", draft("test.first"))
+            .expect("prime cache");
+        let path = root.path().join("run").join(EVENTS_FILE);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).expect("make read-only");
+
+        assert!(matches!(
+            sink.append("run", draft("test.failed")),
+            Err(SinkFault::Io(_))
+        ));
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("make writable");
+        let recovered = sink
+            .append("run", draft("test.recovered"))
+            .expect("append after cache eviction");
+        let sequences = stored_event_bytes(root.path(), "run")
+            .iter()
+            .map(|bytes| {
+                parse_event(std::str::from_utf8(bytes).expect("stored UTF-8"))
+                    .expect("stored event")
+                    .seq
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(recovered.seq, 2);
+        assert_eq!(sequences, vec![1, 2]);
+        assert_eq!(
+            sequences.iter().filter(|sequence| **sequence == 2).count(),
+            1
+        );
     }
 
     #[test]
@@ -730,6 +864,21 @@ mod tests {
                 .join("outside")
                 .exists()
         );
+    }
+
+    #[test]
+    fn empty_and_nul_run_ids_use_distinct_directories() {
+        let root = tempdir().expect("sink directory");
+        let sink = FileSink::new(root.path());
+        sink.append("", draft("test.empty"))
+            .expect("append empty run ID");
+        sink.append("\0", draft("test.nul"))
+            .expect("append NUL run ID");
+
+        assert!(root.path().join("%").join(EVENTS_FILE).is_file());
+        assert!(root.path().join("%00").join(EVENTS_FILE).is_file());
+        assert_eq!(sink.last_seq("").expect("empty run sequence"), 1);
+        assert_eq!(sink.last_seq("\0").expect("NUL run sequence"), 1);
     }
 
     #[cfg(unix)]
