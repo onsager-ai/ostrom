@@ -5,6 +5,8 @@ use std::fmt::{self, Display, Formatter};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+#[cfg(any(test, feature = "conformance"))]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use chrono::{SecondsFormat, Utc};
@@ -74,6 +76,8 @@ pub trait Sink: Send + Sync {
 pub struct FileSink {
     root: PathBuf,
     operation: Mutex<HashMap<String, RunState>>,
+    #[cfg(any(test, feature = "conformance"))]
+    durable_reads: AtomicU64,
 }
 
 impl FileSink {
@@ -82,7 +86,15 @@ impl FileSink {
         Self {
             root: root.into(),
             operation: Mutex::new(HashMap::new()),
+            #[cfg(any(test, feature = "conformance"))]
+            durable_reads: AtomicU64::new(0),
         }
+    }
+
+    /// Return the number of cache misses that read the durable event log.
+    #[cfg(any(test, feature = "conformance"))]
+    pub fn durable_read_count(&self) -> u64 {
+        self.durable_reads.load(Ordering::Relaxed)
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, HashMap<String, RunState>>, SinkFault> {
@@ -108,6 +120,8 @@ impl FileSink {
             states.remove(run);
         }
 
+        #[cfg(any(test, feature = "conformance"))]
+        self.durable_reads.fetch_add(1, Ordering::Relaxed);
         let state = read_state(&path, run)?;
         states.insert(run.to_owned(), state);
         Ok(state)
@@ -630,7 +644,6 @@ pub mod conformance {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::time::{Duration, Instant};
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -675,31 +688,16 @@ mod tests {
     }
 
     #[test]
-    fn cached_state_keeps_append_scaling_linear() {
-        let root = tempdir().expect("scaling directory");
+    fn cached_state_reads_the_durable_log_once_per_run() {
+        let root = tempdir().expect("sink directory");
         let sink = FileSink::new(root.path());
-        let small = timed_appends(&sink, "small", 500);
-        let large = timed_appends(&sink, "large", 2_000);
-        let generous_linear_bound = small.saturating_mul(8);
 
-        println!(
-            "FileSink append scaling: n=500 {}ms, n=2000 {}ms",
-            small.as_millis(),
-            large.as_millis()
-        );
-        assert!(
-            large <= generous_linear_bound,
-            "2,000 appends took {large:?}, more than eight times the {small:?} for 500 appends"
-        );
-    }
-
-    fn timed_appends(sink: &FileSink, run: &str, count: usize) -> Duration {
-        let started = Instant::now();
-        for _ in 0..count {
-            sink.append(run, draft("test.scaling"))
-                .expect("timed append");
+        for _ in 0..2_000 {
+            sink.append("run", draft("test.cached"))
+                .expect("cached append");
         }
-        started.elapsed()
+
+        assert_eq!(sink.durable_read_count(), 1);
     }
 
     #[test]
@@ -742,14 +740,17 @@ mod tests {
         let path = root.path().join("run").join(EVENTS_FILE);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).expect("make read-only");
 
+        assert_eq!(sink.durable_read_count(), 1);
         assert!(matches!(
             sink.append("run", draft("test.failed")),
             Err(SinkFault::Io(_))
         ));
+        assert_eq!(sink.durable_read_count(), 1);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("make writable");
         let recovered = sink
             .append("run", draft("test.recovered"))
             .expect("append after cache eviction");
+        assert_eq!(sink.durable_read_count(), 2);
         let sequences = stored_event_bytes(root.path(), "run")
             .iter()
             .map(|bytes| {
