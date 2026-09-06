@@ -715,15 +715,19 @@ mod tests {
     #[test]
     fn kill_grace_is_permanently_absent_from_wire() {
         let caps = RunCaps {
+            wall_ms: Some(101),
+            tokens: Some(202),
+            cost_usd: Some(3.5),
             kill_grace_ms: 42_123,
             ..RunCaps::default()
         };
         let value = serde_json::to_value(caps.to_wire()).expect("serialise wire ceilings");
-        let keys = value.as_object().expect("wire ceilings object").keys();
+        let object = value.as_object().expect("wire ceilings object");
 
         // This absence is permanent: kill grace is an enforcement detail, not
         // a wire cap awaiting upstream support.
-        assert!(keys.into_iter().all(|key| {
+        assert!(!object.is_empty());
+        assert!(object.keys().all(|key| {
             let key = key.to_ascii_lowercase();
             !key.contains("kill") && !key.contains("grace")
         }));
@@ -732,8 +736,11 @@ mod tests {
     #[test]
     fn idle_and_turns_are_absent_only_until_ethogram_can_carry_them() {
         let caps = RunCaps {
+            wall_ms: Some(123),
             idle_ms: Some(456),
             turns: Some(789),
+            tokens: Some(234),
+            cost_usd: Some(1.25),
             ..RunCaps::default()
         };
         let value = serde_json::to_value(caps.to_wire()).expect("serialise wire ceilings");
@@ -741,6 +748,7 @@ mod tests {
 
         // This assertion is expected to change when ethogram adds idleMs and
         // turns; unlike kill grace, these are absent only because of today's wire.
+        assert!(!object.is_empty());
         assert!(!object.contains_key("idleMs"));
         assert!(!object.contains_key("turns"));
     }
