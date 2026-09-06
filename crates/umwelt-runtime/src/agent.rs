@@ -31,6 +31,55 @@ pub struct LoopCeilings {
     pub tokens: Option<u64>,
 }
 
+/// Resource caps applied to one harness run.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RunCaps {
+    /// Maximum elapsed wall-clock time for the run, in milliseconds.
+    pub wall_ms: Option<u64>,
+    /// Maximum idle time, in milliseconds; idle timing is suspended while a tool call is in flight.
+    pub idle_ms: Option<u64>,
+    /// Maximum number of agent turns completed by the run.
+    pub turns: Option<u64>,
+    /// Maximum cumulative token usage reported for the run.
+    pub tokens: Option<u64>,
+    /// Maximum cumulative cost reported for the run, in US dollars.
+    pub cost_usd: Option<f64>,
+    /// Grace period, in milliseconds, before cap enforcement force-kills the process group.
+    pub kill_grace_ms: u64,
+}
+
+impl Default for RunCaps {
+    fn default() -> Self {
+        Self {
+            wall_ms: None,
+            idle_ms: None,
+            turns: None,
+            tokens: None,
+            cost_usd: None,
+            kill_grace_ms: 10_000,
+        }
+    }
+}
+
+impl RunCaps {
+    /// Return the subset of per-run caps that the current ethogram wire can carry.
+    #[must_use]
+    pub fn to_wire(&self) -> ethogram::RunCeilings {
+        // Kill grace is permanently excluded: it is a local enforcement detail,
+        // not information that any wire consumer needs.
+        //
+        // Idle and turn caps are omitted for now only because this ethogram pin
+        // cannot carry them. This exhaustive literal must fail to compile when
+        // ethogram adds those fields so their mappings are added deliberately.
+        ethogram::RunCeilings {
+            cost_usd: self.cost_usd,
+            tokens: self.tokens,
+            wall_ms: self.wall_ms,
+            extra: serde_json::Map::new(),
+        }
+    }
+}
+
 /// Signals observed by a running harness process.
 #[derive(Debug, Clone, Default)]
 pub struct SignalFlags {
@@ -635,6 +684,89 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn run_caps_wire_round_trips_carried_fields() {
+        let caps = RunCaps {
+            wall_ms: Some(567),
+            idle_ms: None,
+            turns: None,
+            tokens: Some(234),
+            cost_usd: Some(1.25),
+            kill_grace_ms: 10_000,
+        };
+        let wire = caps.to_wire();
+        let json = serde_json::to_string(&wire).expect("serialise wire ceilings");
+        let round_tripped =
+            serde_json::from_str::<ethogram::RunCeilings>(&json).expect("parse wire ceilings");
+
+        assert_eq!(round_tripped, wire);
+        assert_eq!(
+            round_tripped,
+            ethogram::RunCeilings {
+                cost_usd: Some(1.25),
+                tokens: Some(234),
+                wall_ms: Some(567),
+                extra: serde_json::Map::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn kill_grace_is_permanently_absent_from_wire() {
+        let caps = RunCaps {
+            kill_grace_ms: 42_123,
+            ..RunCaps::default()
+        };
+        let value = serde_json::to_value(caps.to_wire()).expect("serialise wire ceilings");
+        let keys = value.as_object().expect("wire ceilings object").keys();
+
+        // This absence is permanent: kill grace is an enforcement detail, not
+        // a wire cap awaiting upstream support.
+        assert!(keys.into_iter().all(|key| {
+            let key = key.to_ascii_lowercase();
+            !key.contains("kill") && !key.contains("grace")
+        }));
+    }
+
+    #[test]
+    fn idle_and_turns_are_absent_only_until_ethogram_can_carry_them() {
+        let caps = RunCaps {
+            idle_ms: Some(456),
+            turns: Some(789),
+            ..RunCaps::default()
+        };
+        let value = serde_json::to_value(caps.to_wire()).expect("serialise wire ceilings");
+        let object = value.as_object().expect("wire ceilings object");
+
+        // This assertion is expected to change when ethogram adds idleMs and
+        // turns; unlike kill grace, these are absent only because of today's wire.
+        assert!(!object.contains_key("idleMs"));
+        assert!(!object.contains_key("turns"));
+    }
+
+    #[test]
+    fn none_caps_are_omitted_from_wire_instead_of_sent_as_null() {
+        let json =
+            serde_json::to_string(&RunCaps::default().to_wire()).expect("serialise wire ceilings");
+
+        assert_eq!(json, "{}");
+    }
+
+    #[test]
+    fn run_caps_default_is_ten_seconds_of_grace_and_no_caps() {
+        assert_eq!(
+            RunCaps::default(),
+            RunCaps {
+                wall_ms: None,
+                idle_ms: None,
+                turns: None,
+                tokens: None,
+                cost_usd: None,
+                kill_grace_ms: 10_000,
+            }
+        );
+    }
 
     struct FixtureRunner {
         name: &'static str,

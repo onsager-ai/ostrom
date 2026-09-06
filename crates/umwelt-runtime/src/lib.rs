@@ -15,8 +15,8 @@ pub mod trace;
 pub use agent::claude::ClaudeHarness;
 pub use agent::{
     ActionFault, AgentRegistry, AgentRunner, CodexHarness, Harness, ImplementerRunRequest,
-    LoopCeilings, OrchestratorRunRequest, RunOutcome, RunRequest, RunTermination, RunnerLaunch,
-    SignalFlags,
+    LoopCeilings, OrchestratorRunRequest, RunCaps, RunOutcome, RunRequest, RunTermination,
+    RunnerLaunch, SignalFlags,
 };
 pub use command::CommandProvider;
 pub use loop_units::{
