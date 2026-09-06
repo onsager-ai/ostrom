@@ -302,6 +302,12 @@ impl ProcessOutcome {
 }
 
 pub trait AgentRunner: Harness {
+    /// Prepare a harness to enforce the requested caps.
+    ///
+    /// Refusal and the watchdog's run-start warning answer different problems.
+    /// This refuses a cap the harness cannot enforce at all. An enforceable idle
+    /// cap is accepted, but [`crate::watchdog::CapsWatchdog::start`] warns when
+    /// no wall cap bounds the tool-hang case that idle intentionally suspends.
     fn prepare(&self, caps: &RunCaps) -> Result<RunnerLaunch, ActionFault> {
         refuse_unenforceable_caps(self.name(), self.enforceable_caps(), caps)?;
         Ok(RunnerLaunch::new(Vec::new()))

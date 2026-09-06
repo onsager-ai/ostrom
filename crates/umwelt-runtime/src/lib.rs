@@ -3,6 +3,7 @@
 pub mod agent;
 pub mod command;
 mod environment;
+mod event_types;
 pub mod loop_units;
 pub mod operation_settings;
 pub mod pass_state;
@@ -11,6 +12,7 @@ mod process_control;
 pub mod registry;
 pub mod sink;
 pub mod trace;
+pub mod watchdog;
 
 pub use agent::claude::ClaudeHarness;
 pub use agent::{
@@ -32,3 +34,6 @@ pub use pass_state::{PassState, PassStateError, read_pass_state, write_pass_stat
 pub use registry::{CheckAction, CheckReceipt, execute_check_action};
 pub use sink::{FileSink, Sink, SinkFault, run_directory_name};
 pub use trace::{TraceAppend, TraceAppendError, TraceFactRecord, append_trace};
+pub use watchdog::{
+    Cap, CapMeasurement, CapTrip, CapsWatchdog, Clock, StartError, SystemClock, WatchdogError,
+};
