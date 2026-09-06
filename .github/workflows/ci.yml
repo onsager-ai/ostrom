@@ -1,0 +1,56 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The repository is a scaffold until the umwelt#2 extraction PR creates the
+      # Cargo workspace. Until then there is nothing for cargo to do, so the steps
+      # below are skipped rather than failed.
+      #
+      # This makes the job a vacuous pass, which CLAUDE.md is right to distrust: a
+      # guard you have never seen fail is not a guard. It is removed by the same PR
+      # that creates Cargo.toml, and until then the reviewer of that PR is the
+      # backstop -- confirm the cargo steps below actually ran, and did not skip.
+      - name: Detect workspace
+        id: workspace
+        run: |
+          if [ -f Cargo.toml ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=No workspace yet::No Cargo.toml at the repository root; fmt, clippy and test were skipped. Reviewer of the umwelt#2 extraction PR: confirm these steps ran on that PR rather than skipping."
+          fi
+
+      - name: Toolchain
+        if: steps.workspace.outputs.present == 'true'
+        run: |
+          rustup component add rustfmt clippy
+          rustc --version && cargo --version && cargo clippy --version
+
+      - name: cargo fmt
+        if: steps.workspace.outputs.present == 'true'
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        if: steps.workspace.outputs.present == 'true'
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: cargo test
+        if: steps.workspace.outputs.present == 'true'
+        run: cargo test --workspace --all-features
