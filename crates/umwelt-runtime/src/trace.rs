@@ -1,5 +1,6 @@
 use std::io::{self, Write};
 
+use indexmap::IndexMap;
 use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
@@ -8,15 +9,31 @@ use thiserror::Error;
 pub struct TraceFactRecord {
     pub ts: String,
     pub kind: String,
-    pub fact: serde_json::Map<String, Value>,
+    pub fact: IndexMap<String, Value>,
 }
 
+/// One trace record to append.
+///
+/// Producers must deserialize `fact` and `narration` directly into `IndexMap`.
+/// Deserializing into [`serde_json::Value`] first silently loses the operator's
+/// top-level key order because JSON objects are sorted without
+/// `serde_json/preserve_order`. This guarantee covers only the top level:
+/// nested objects remain `Value::Object` maps and therefore serialize with
+/// sorted keys.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TraceAppend {
     pub ts: String,
     pub kind: String,
-    pub fact: serde_json::Map<String, Value>,
-    pub narration: serde_json::Map<String, Value>,
+    pub fact: IndexMap<String, Value>,
+    pub narration: IndexMap<String, Value>,
+}
+
+#[derive(Serialize)]
+struct SerializedTraceAppend<'a> {
+    ts: &'a str,
+    kind: &'a str,
+    fact: &'a IndexMap<String, Value>,
+    narration: &'a IndexMap<String, Value>,
 }
 
 #[derive(Debug, Error)]
@@ -37,15 +54,13 @@ pub fn append_trace(
     if record.ts.is_empty() || record.kind.is_empty() {
         return Err(TraceAppendError::Malformed);
     }
-    let mut value = serde_json::Map::new();
-    value.insert("ts".to_owned(), Value::String(record.ts.clone()));
-    value.insert("kind".to_owned(), Value::String(record.kind.clone()));
-    value.insert("fact".to_owned(), Value::Object(record.fact.clone()));
-    value.insert(
-        "narration".to_owned(),
-        Value::Object(record.narration.clone()),
-    );
-    let mut bytes = serde_json::to_vec(&Value::Object(value)).expect("JSON value serializes");
+    let serialized = SerializedTraceAppend {
+        ts: &record.ts,
+        kind: &record.kind,
+        fact: &record.fact,
+        narration: &record.narration,
+    };
+    let mut bytes = serde_json::to_vec(&serialized).expect("trace record serializes");
     bytes.push(b'\n');
     if bytes.len() > 4096 {
         return Err(TraceAppendError::TooLarge { bytes: bytes.len() });
@@ -56,7 +71,8 @@ pub fn append_trace(
 
 #[cfg(test)]
 mod tests {
-    use serde_json::{Map, json};
+    use indexmap::IndexMap as Map;
+    use serde_json::{Value, json};
 
     use super::{TraceAppend, TraceAppendError, append_trace};
 
@@ -121,6 +137,28 @@ mod tests {
             String::from_utf8(output)
                 .expect("trace UTF-8")
                 .contains("decision-taken")
+        );
+    }
+
+    #[test]
+    fn append_preserves_top_level_operator_order_but_sorts_nested_object_keys() {
+        let record = TraceAppend {
+            ts: "2030-01-02T03:04:05Z".to_owned(),
+            kind: "nested-order-limit".to_owned(),
+            fact: serde_json::from_str::<Map<String, Value>>(
+                r#"{"zebra":{"zebra":1,"alpha":2},"alpha":3}"#,
+            )
+            .expect("deserialize fact directly into an ordered map"),
+            narration: Map::new(),
+        };
+        let expected = concat!(
+            r#"{"ts":"2030-01-02T03:04:05Z","kind":"nested-order-limit","fact":{"zebra":{"alpha":2,"zebra":1},"alpha":3},"narration":{}}"#,
+            "\n"
+        );
+
+        assert_eq!(
+            append_trace(&mut Vec::new(), &record).expect("append nested trace"),
+            expected.as_bytes()
         );
     }
 }
