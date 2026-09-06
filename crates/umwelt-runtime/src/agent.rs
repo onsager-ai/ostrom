@@ -25,7 +25,7 @@ pub mod claude;
 /// Resource ceilings already resolved by an Umwelt consumer.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct RunCeilings {
+pub struct LoopCeilings {
     pub concurrent: Option<u64>,
     pub spend_usd: Option<f64>,
     pub tokens: Option<u64>,
@@ -107,7 +107,7 @@ pub struct OrchestratorRunRequest {
     pub model: String,
     pub profile: PathBuf,
     pub permission_mode: String,
-    pub ceilings: RunCeilings,
+    pub ceilings: LoopCeilings,
     pub transcript: PathBuf,
 }
 

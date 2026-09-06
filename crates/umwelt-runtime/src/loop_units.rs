@@ -6,7 +6,7 @@ use std::{
 
 use thiserror::Error;
 
-use crate::RunCeilings;
+use crate::LoopCeilings;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoopUnit {
@@ -42,7 +42,7 @@ pub struct LoopUnitDeclaration {
     pub on_calendars: Vec<String>,
     pub environment: BTreeMap<String, String>,
     pub ceiling_environment: CeilingEnvironmentNames,
-    pub ceilings: RunCeilings,
+    pub ceilings: LoopCeilings,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -369,7 +369,7 @@ fn render_service(config: &LoopUnitGeneratorConfig, declaration: &LoopUnitDeclar
     source
 }
 
-fn render_ceilings(source: &mut String, names: &CeilingEnvironmentNames, ceilings: RunCeilings) {
+fn render_ceilings(source: &mut String, names: &CeilingEnvironmentNames, ceilings: LoopCeilings) {
     if let (Some(name), Some(value)) = (&names.spend_usd, ceilings.spend_usd) {
         source.push_str(&format!("Environment={name}={}\n", render_number(value)));
     }
@@ -445,7 +445,7 @@ mod tests {
                     spend_usd: Some("EXAMPLE_DAILY_CAP_USD".to_owned()),
                     tokens: Some("EXAMPLE_TOKEN_CEILING".to_owned()),
                 },
-                ceilings: RunCeilings {
+                ceilings: LoopCeilings {
                     concurrent: Some(6),
                     spend_usd: Some(50.0),
                     tokens: Some(200_000),
@@ -466,7 +466,7 @@ mod tests {
                     spend_usd: Some("EXAMPLE_DAILY_CAP_USD".to_owned()),
                     tokens: Some("EXAMPLE_TOKEN_CEILING".to_owned()),
                 },
-                ceilings: RunCeilings {
+                ceilings: LoopCeilings {
                     concurrent: Some(2),
                     spend_usd: Some(50.0),
                     tokens: Some(200_000),
