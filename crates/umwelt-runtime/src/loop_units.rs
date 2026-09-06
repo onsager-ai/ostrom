@@ -8,9 +8,6 @@ use thiserror::Error;
 
 use crate::RunCeilings;
 
-const RECONCILER_SERVICE: &str = "ostrom-up.service";
-const RECONCILER_TIMER: &str = "ostrom-up.timer";
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoopUnit {
     pub name: String,
@@ -22,6 +19,10 @@ pub struct LoopUnit {
 pub struct LoopUnitGeneratorConfig {
     pub generated_header: String,
     pub unit_prefix: String,
+    /// Names Umwelt must decline to have an opinion about. It never generates
+    /// or compares their contents and cannot know whether their absence is
+    /// drift, so they are reported neither missing nor unexpected.
+    pub externally_managed: Vec<String>,
 }
 
 /// Environment-variable names used to pass each resolved ceiling to a loop process.
@@ -36,6 +37,7 @@ pub struct CeilingEnvironmentNames {
 #[derive(Debug, Clone, PartialEq)]
 pub struct LoopUnitDeclaration {
     pub name: String,
+    pub description: String,
     pub argv: Vec<String>,
     pub on_calendars: Vec<String>,
     pub environment: BTreeMap<String, String>,
@@ -93,17 +95,7 @@ pub fn generate_loop_units(
 ) -> Result<Vec<LoopUnit>, LoopUnitError> {
     validate_config(config)?;
     let mut seen = BTreeSet::new();
-    let mut units = Vec::with_capacity(declarations.len() * 2 + 2);
-    if !declarations.is_empty() {
-        units.push(LoopUnit {
-            name: RECONCILER_SERVICE.to_owned(),
-            contents: render_reconciler_service(config),
-        });
-        units.push(LoopUnit {
-            name: RECONCILER_TIMER.to_owned(),
-            contents: render_reconciler_timer(config),
-        });
-    }
+    let mut units = Vec::with_capacity(declarations.len() * 2);
     for declaration in declarations {
         validate_declaration(declaration)?;
         if !seen.insert(&declaration.name) {
@@ -112,12 +104,22 @@ pub fn generate_loop_units(
                 message: "name must be unique".to_owned(),
             });
         }
+        let service_name = format!("{}{}.service", config.unit_prefix, declaration.name);
+        let timer_name = format!("{}{}.timer", config.unit_prefix, declaration.name);
+        if externally_managed_name(config, &service_name)
+            || externally_managed_name(config, &timer_name)
+        {
+            return Err(LoopUnitError::InvalidDeclaration {
+                name: declaration.name.clone(),
+                message: "generated names must not also be externally managed".to_owned(),
+            });
+        }
         units.push(LoopUnit {
-            name: format!("{}{}.service", config.unit_prefix, declaration.name),
+            name: service_name,
             contents: render_service(config, declaration),
         });
         units.push(LoopUnit {
-            name: format!("{}{}.timer", config.unit_prefix, declaration.name),
+            name: timer_name,
             contents: render_timer(config, declaration),
         });
     }
@@ -171,7 +173,12 @@ pub fn check_loop_units_drift(
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        if !managed_unit_name(config, &name) {
+        if externally_managed_name(config, &name) {
+            continue;
+        }
+        if !name.starts_with(&config.unit_prefix)
+            || !(name.ends_with(".service") || name.ends_with(".timer"))
+        {
             continue;
         }
         actual_names.insert(name.clone());
@@ -184,7 +191,11 @@ pub fn check_loop_units_drift(
             }
         }
     }
-    let expected_names = expected.keys().cloned().collect::<BTreeSet<_>>();
+    let expected_names = expected
+        .keys()
+        .filter(|name| !externally_managed_name(config, name))
+        .cloned()
+        .collect::<BTreeSet<_>>();
     Ok(LoopUnitDrift {
         missing: expected_names.difference(&actual_names).cloned().collect(),
         changed,
@@ -231,6 +242,16 @@ fn validate_config(config: &LoopUnitGeneratorConfig) -> Result<(), LoopUnitError
             message: "generated header must not contain NUL".to_owned(),
         });
     }
+    if config.externally_managed.iter().any(|name| {
+        name.is_empty()
+            || name.contains(['/', '\0', '\n', '\r'])
+            || !(name.ends_with(".service") || name.ends_with(".timer"))
+    }) {
+        return Err(LoopUnitError::InvalidDeclaration {
+            name: config.unit_prefix.clone(),
+            message: "externally managed names must be safe service or timer filenames".to_owned(),
+        });
+    }
     Ok(())
 }
 
@@ -242,6 +263,9 @@ fn validate_declaration(declaration: &LoopUnitDeclaration) -> Result<(), LoopUni
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
     if invalid_name {
         return invalid(declaration, "name must be a safe unit component");
+    }
+    if declaration.description.is_empty() || declaration.description.contains(['\n', '\r']) {
+        return invalid(declaration, "description must be a non-empty single line");
     }
     if declaration.argv.is_empty()
         || declaration
@@ -309,32 +333,18 @@ fn valid_environment_name(name: &str) -> bool {
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
-fn managed_unit_name(config: &LoopUnitGeneratorConfig, name: &str) -> bool {
-    name == RECONCILER_SERVICE
-        || name == RECONCILER_TIMER
-        || (name.starts_with(&config.unit_prefix)
-            && (name.ends_with(".service") || name.ends_with(".timer")))
-}
-
-fn render_reconciler_service(config: &LoopUnitGeneratorConfig) -> String {
-    format!(
-        "{}[Unit]\nDescription=Reconcile Ostrom loops from the current policy version\nWants=network-online.target\nAfter=network-online.target\n\n[Service]\nType=oneshot\nExecStart=ostrom up\n\n[Install]\nWantedBy=default.target\n",
-        config.generated_header
-    )
-}
-
-fn render_reconciler_timer(config: &LoopUnitGeneratorConfig) -> String {
-    format!(
-        "{}[Unit]\nDescription=Periodically reconcile Ostrom loops from the current policy version\n\n[Timer]\nOnBootSec=1min\nOnUnitActiveSec=5min\nAccuracySec=1min\nUnit={RECONCILER_SERVICE}\n\n[Install]\nWantedBy=timers.target\n",
-        config.generated_header
-    )
+fn externally_managed_name(config: &LoopUnitGeneratorConfig, name: &str) -> bool {
+    config
+        .externally_managed
+        .iter()
+        .any(|external| external == name)
 }
 
 fn render_service(config: &LoopUnitGeneratorConfig, declaration: &LoopUnitDeclaration) -> String {
     let mut source = String::new();
     source.push_str(&config.generated_header);
     source.push_str("[Unit]\n");
-    source.push_str(&format!("Description=Ostrom loop {}\n", declaration.name));
+    source.push_str(&format!("Description={}\n", declaration.description));
     source.push_str("Wants=network-online.target\nAfter=network-online.target\n\n");
     source.push_str("[Service]\nType=oneshot\n");
     for (name, value) in &declaration.environment {
@@ -378,8 +388,8 @@ fn render_timer(config: &LoopUnitGeneratorConfig, declaration: &LoopUnitDeclarat
         .map(|calendar| format!("OnCalendar={calendar}\n"))
         .collect::<String>();
     format!(
-        "{}[Unit]\nDescription=Ostrom loop {} schedule\n\n[Timer]\n{calendars}Persistent=true\nUnit={}{}.service\n\n[Install]\nWantedBy=timers.target\n",
-        config.generated_header, declaration.name, config.unit_prefix, declaration.name
+        "{}[Unit]\nDescription={} schedule\n\n[Timer]\n{calendars}Persistent=true\nUnit={}{}.service\n\n[Install]\nWantedBy=timers.target\n",
+        config.generated_header, declaration.description, config.unit_prefix, declaration.name
     )
 }
 
@@ -412,43 +422,28 @@ mod tests {
 
     fn generator_config() -> LoopUnitGeneratorConfig {
         LoopUnitGeneratorConfig {
-            generated_header: "# Generated by `ostrom loops render`; do not edit.\n".to_owned(),
-            unit_prefix: "ostrom-loop-".to_owned(),
+            generated_header: "# Generated by `example render`; do not edit.\n".to_owned(),
+            unit_prefix: "example-loop-".to_owned(),
+            externally_managed: Vec::new(),
         }
-    }
-
-    fn actor_environment_name() -> String {
-        "OSTROM_ACTOR".to_owned()
-    }
-
-    fn concurrent_environment_name() -> String {
-        "MANDATE_MAX_IMPLEMENTERS".to_owned()
-    }
-
-    fn spend_environment_name() -> String {
-        "MANDATE_DAILY_CAP_USD".to_owned()
-    }
-
-    fn token_environment_name() -> String {
-        "MANDATE_ORDER_TOKEN_CEILING".to_owned()
     }
 
     fn declarations() -> Vec<LoopUnitDeclaration> {
         vec![
             LoopUnitDeclaration {
-                name: "builder-day".to_owned(),
+                name: "daytime".to_owned(),
+                description: "Example loop daytime".to_owned(),
                 argv: vec![
-                    "ostrom".to_owned(),
-                    "loop".to_owned(),
+                    "example-tool".to_owned(),
                     "run".to_owned(),
-                    "builder-day".to_owned(),
+                    "daytime".to_owned(),
                 ],
                 on_calendars: vec!["*-*-* 08..21:15:00".to_owned()],
-                environment: BTreeMap::from([(actor_environment_name(), "builder".to_owned())]),
+                environment: BTreeMap::from([("EXAMPLE_ACTOR".to_owned(), "builder".to_owned())]),
                 ceiling_environment: CeilingEnvironmentNames {
-                    concurrent: Some(concurrent_environment_name()),
-                    spend_usd: Some(spend_environment_name()),
-                    tokens: Some(token_environment_name()),
+                    concurrent: Some("EXAMPLE_MAX_WORKERS".to_owned()),
+                    spend_usd: Some("EXAMPLE_DAILY_CAP_USD".to_owned()),
+                    tokens: Some("EXAMPLE_TOKEN_CEILING".to_owned()),
                 },
                 ceilings: RunCeilings {
                     concurrent: Some(6),
@@ -457,19 +452,19 @@ mod tests {
                 },
             },
             LoopUnitDeclaration {
-                name: "builder-night".to_owned(),
+                name: "nightly".to_owned(),
+                description: "Example loop nightly".to_owned(),
                 argv: vec![
-                    "ostrom".to_owned(),
-                    "loop".to_owned(),
+                    "example-tool".to_owned(),
                     "run".to_owned(),
-                    "builder-night".to_owned(),
+                    "nightly".to_owned(),
                 ],
                 on_calendars: vec!["*-*-* 23,02,05:15:00".to_owned()],
-                environment: BTreeMap::from([(actor_environment_name(), "builder".to_owned())]),
+                environment: BTreeMap::from([("EXAMPLE_ACTOR".to_owned(), "builder".to_owned())]),
                 ceiling_environment: CeilingEnvironmentNames {
-                    concurrent: Some(concurrent_environment_name()),
-                    spend_usd: Some(spend_environment_name()),
-                    tokens: Some(token_environment_name()),
+                    concurrent: Some("EXAMPLE_MAX_WORKERS".to_owned()),
+                    spend_usd: Some("EXAMPLE_DAILY_CAP_USD".to_owned()),
+                    tokens: Some("EXAMPLE_TOKEN_CEILING".to_owned()),
                 },
                 ceilings: RunCeilings {
                     concurrent: Some(2),
@@ -480,102 +475,178 @@ mod tests {
         ]
     }
 
-    #[test]
-    fn renders_exact_cadence_lines_and_never_a_shell_execstart() {
-        let config = generator_config();
-        let units = generate_loop_units(&config, &declarations()).expect("units");
-        let day = &units
-            .iter()
-            .find(|unit| unit.name == format!("{}builder-day.timer", config.unit_prefix))
-            .expect("day timer")
-            .contents;
-        let night = &units
-            .iter()
-            .find(|unit| unit.name == format!("{}builder-night.timer", config.unit_prefix))
-            .expect("night timer")
-            .contents;
-        assert!(day.contains("OnCalendar=*-*-* 08..21:15:00\n"));
-        assert!(night.contains("OnCalendar=*-*-* 23,02,05:15:00\n"));
-        assert!(loop_execstart_is_not_shell(&config, &units));
-        let service = &units
-            .iter()
-            .find(|unit| unit.name == format!("{}builder-day.service", config.unit_prefix))
-            .expect("day service")
-            .contents;
-        assert!(service.contains("ExecStart=ostrom loop run builder-day\n"));
-        assert!(service.contains(&format!("Environment={}=50\n", spend_environment_name())));
-        assert!(!service.contains("systemctl"));
-        let reconciler = units
-            .iter()
-            .find(|unit| unit.name == RECONCILER_SERVICE)
-            .expect("reconciler boot unit");
-        assert!(reconciler.contents.contains("ExecStart=ostrom up\n"));
-        assert!(!reconciler.contents.contains("systemctl"));
-        let timer = units
-            .iter()
-            .find(|unit| unit.name == RECONCILER_TIMER)
-            .expect("reconciler timer");
-        assert!(timer.contents.contains("OnUnitActiveSec=5min\n"));
-        assert!(timer.contents.contains("Unit=ostrom-up.service\n"));
-        assert!(!timer.contents.contains("systemctl"));
+    fn externally_managed_config() -> LoopUnitGeneratorConfig {
+        let mut config = generator_config();
+        config.externally_managed = vec![
+            "example-reconcile.service".to_owned(),
+            "example-reconcile.timer".to_owned(),
+        ];
+        config
     }
 
     #[test]
-    fn drift_names_missing_changed_and_unexpected_managed_units() {
+    fn a_generated_name_declared_externally_managed_is_refused() {
+        // The two meanings contradict: umwelt generates these contents and must
+        // compare them, and has also been told to have no opinion about them.
+        // Resolving that silently would let umwelt go quiet about a real change
+        // to a unit it really generates, so the collision is refused instead.
+        let mut config = generator_config();
+        let declarations = declarations();
+        config.externally_managed = vec![format!(
+            "{}{}.service",
+            config.unit_prefix, declarations[0].name
+        )];
+
+        let error = generate_loop_units(&config, &declarations)
+            .expect_err("a generated name that is also externally managed must be refused");
+
+        assert!(
+            matches!(
+                error,
+                LoopUnitError::InvalidDeclaration { ref message, .. }
+                    if message.contains("externally managed")
+            ),
+            "expected a loud refusal naming the collision, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_generated_timer_name_declared_externally_managed_is_refused() {
+        let mut config = generator_config();
+        let declarations = declarations();
+        config.externally_managed = vec![format!(
+            "{}{}.timer",
+            config.unit_prefix, declarations[0].name
+        )];
+
+        generate_loop_units(&config, &declarations)
+            .expect_err("the timer half of the collision must be refused too");
+    }
+
+    #[test]
+    fn renders_declared_units_from_caller_supplied_values_without_a_shell() {
+        let config = generator_config();
+        let units = generate_loop_units(&config, &declarations()).expect("units");
+
+        assert_eq!(units.len(), 4, "one service and timer per declaration");
+        assert!(
+            units
+                .iter()
+                .all(|unit| unit.name.starts_with("example-loop-"))
+        );
+        assert!(units.iter().all(|unit| {
+            unit.contents
+                .starts_with("# Generated by `example render`; do not edit.\n")
+        }));
+
+        let daytime_service = &units
+            .iter()
+            .find(|unit| unit.name == "example-loop-daytime.service")
+            .expect("daytime service")
+            .contents;
+        assert!(daytime_service.contains("Description=Example loop daytime\n"));
+        assert!(daytime_service.contains("ExecStart=example-tool run daytime\n"));
+        assert!(daytime_service.contains("Environment=EXAMPLE_ACTOR=builder\n"));
+        assert!(daytime_service.contains("Environment=EXAMPLE_DAILY_CAP_USD=50\n"));
+        assert!(daytime_service.contains("Environment=EXAMPLE_MAX_WORKERS=6\n"));
+        assert!(daytime_service.contains("Environment=EXAMPLE_TOKEN_CEILING=200000\n"));
+
+        let daytime_timer = &units
+            .iter()
+            .find(|unit| unit.name == "example-loop-daytime.timer")
+            .expect("daytime timer")
+            .contents;
+        assert!(daytime_timer.contains("Description=Example loop daytime schedule\n"));
+        assert!(daytime_timer.contains("OnCalendar=*-*-* 08..21:15:00\n"));
+        assert!(daytime_timer.contains("Unit=example-loop-daytime.service\n"));
+
+        let nightly_timer = &units
+            .iter()
+            .find(|unit| unit.name == "example-loop-nightly.timer")
+            .expect("nightly timer")
+            .contents;
+        assert!(nightly_timer.contains("OnCalendar=*-*-* 23,02,05:15:00\n"));
+        assert!(loop_execstart_is_not_shell(&config, &units));
+    }
+
+    #[test]
+    fn drift_names_generated_missing_changed_and_unexpected_units() {
         let config = generator_config();
         let declarations = declarations();
         let root = tempdir().expect("fixture");
         let written = render_loop_units(&config, &declarations, root.path()).expect("render");
         fs::write(&written[0], "hand edit\n").expect("edit fixture");
         fs::remove_file(&written[1]).expect("remove fixture");
-        let stale = format!("{}stale.timer", config.unit_prefix);
-        fs::write(root.path().join(&stale), "stale\n").expect("write stale fixture");
+        fs::write(root.path().join("example-loop-stale.timer"), "stale\n")
+            .expect("write stale fixture");
         fs::write(root.path().join("unrelated.service"), "unmanaged\n")
             .expect("write unmanaged fixture");
 
         let drift =
             check_loop_units_drift(&config, &declarations, root.path()).expect("drift check");
-        assert_eq!(
-            drift.changed,
-            [format!("{}builder-day.service", config.unit_prefix)]
-        );
-        assert_eq!(
-            drift.missing,
-            [format!("{}builder-day.timer", config.unit_prefix)]
-        );
-        assert_eq!(drift.unexpected, [stale]);
+        assert_eq!(drift.changed, ["example-loop-daytime.service"]);
+        assert_eq!(drift.missing, ["example-loop-daytime.timer"]);
+        assert_eq!(drift.unexpected, ["example-loop-stale.timer"]);
     }
 
     #[test]
-    fn caller_supplied_legacy_naming_preserves_rendered_bytes() {
-        let config = generator_config();
-        let units = generate_loop_units(&config, &declarations()).expect("units");
-        let service = units
-            .iter()
-            .find(|unit| unit.name == format!("{}builder-day.service", config.unit_prefix))
-            .expect("day service");
-        let expected = concat!(
-            "# Generated by `ostrom loops",
-            " render`; do not edit.\n",
-            "[Unit]\n",
-            "Description=Ostrom loop builder-day\n",
-            "Wants=network-online.target\n",
-            "After=network-online.target\n\n",
-            "[Service]\n",
-            "Type=oneshot\n",
-            "Environment=OSTROM",
-            "_ACTOR=builder\n",
-            "Environment=MANDATE",
-            "_DAILY_CAP_USD=50\n",
-            "Environment=MANDATE",
-            "_MAX_IMPLEMENTERS=6\n",
-            "Environment=MANDATE",
-            "_ORDER_TOKEN_CEILING=200000\n",
-            "ExecStart=ostrom loop run builder-day\n",
-            "TimeoutStartSec=1800\n",
-            "KillMode=control-group\n",
-        );
+    fn absent_externally_managed_name_is_not_missing() {
+        let config = externally_managed_config();
+        let declarations = declarations();
+        let root = tempdir().expect("fixture");
+        render_loop_units(&config, &declarations, root.path()).expect("render loops");
 
-        assert_eq!(service.contents, expected);
+        let drift =
+            check_loop_units_drift(&config, &declarations, root.path()).expect("drift check");
+
+        assert!(
+            !drift
+                .missing
+                .contains(&"example-reconcile.service".to_owned())
+        );
+    }
+
+    #[test]
+    fn present_externally_managed_name_is_not_unexpected() {
+        let config = externally_managed_config();
+        let declarations = declarations();
+        let root = tempdir().expect("fixture");
+        render_loop_units(&config, &declarations, root.path()).expect("render loops");
+        fs::write(
+            root.path().join("example-reconcile.service"),
+            "caller owned\n",
+        )
+        .expect("write external service");
+
+        let drift =
+            check_loop_units_drift(&config, &declarations, root.path()).expect("drift check");
+
+        assert!(
+            !drift
+                .unexpected
+                .contains(&"example-reconcile.service".to_owned())
+        );
+    }
+
+    #[test]
+    fn externally_managed_contents_are_never_compared() {
+        let config = externally_managed_config();
+        let declarations = declarations();
+        let root = tempdir().expect("fixture");
+        render_loop_units(&config, &declarations, root.path()).expect("render loops");
+        fs::write(
+            root.path().join("example-reconcile.service"),
+            "arbitrary external contents\n",
+        )
+        .expect("write external service");
+
+        let drift =
+            check_loop_units_drift(&config, &declarations, root.path()).expect("drift check");
+
+        assert!(
+            !drift
+                .changed
+                .contains(&"example-reconcile.service".to_owned())
+        );
     }
 }
