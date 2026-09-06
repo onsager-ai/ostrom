@@ -30,6 +30,7 @@ mod selection;
 mod selector;
 mod sweep;
 mod trace;
+pub mod umwelt_edge;
 mod work_order;
 mod worktree;
 

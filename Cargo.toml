@@ -31,6 +31,7 @@ serde_yaml = "0.9.34"
 tempfile = "3.20.0"
 thiserror = "2.0.16"
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }
+umwelt-runtime = { git = "https://github.com/onsager-ai/umwelt.git", rev = "194a9bb934ba88a2f41f50549309479224fe2a7d" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
