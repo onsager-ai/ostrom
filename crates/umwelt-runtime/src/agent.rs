@@ -95,14 +95,44 @@ pub struct CapSupport {
 
 impl CapSupport {
     #[must_use]
-    pub const fn new(wall: bool, idle: bool, turns: bool, tokens: bool, cost: bool) -> Self {
+    pub const fn none() -> Self {
         Self {
-            wall,
-            idle,
-            turns,
-            tokens,
-            cost,
+            wall: false,
+            idle: false,
+            turns: false,
+            tokens: false,
+            cost: false,
         }
+    }
+
+    #[must_use]
+    pub const fn with_wall(mut self) -> Self {
+        self.wall = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_idle(mut self) -> Self {
+        self.idle = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_turns(mut self) -> Self {
+        self.turns = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_tokens(mut self) -> Self {
+        self.tokens = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_cost(mut self) -> Self {
+        self.cost = true;
+        self
     }
 
     #[must_use]
@@ -432,7 +462,7 @@ impl Harness for CodexHarness {
         // guess its tool, turn, and usage events. Until a real capture proves
         // those boundaries, Codex cannot honestly claim idle, turns, tokens,
         // or cost support.
-        CapSupport::new(true, false, false, false, false)
+        CapSupport::none().with_wall()
     }
 }
 
@@ -902,7 +932,7 @@ mod tests {
         }
 
         fn enforceable_caps(&self) -> CapSupport {
-            CapSupport::new(true, false, false, true, false)
+            CapSupport::none().with_wall().with_tokens()
         }
     }
 
@@ -1012,12 +1042,12 @@ mod tests {
     }
 
     #[test]
-    fn shipped_harnesses_declare_idle_support_deliberately() {
-        let claude = claude::ClaudeHarness::new("claude", "fixture-v1", "fixture-model");
+    fn codex_declares_only_runtime_clock_cap_support() {
         let codex = CodexHarness::new("codex", "fixture-v1", "fixture-model", Vec::new());
 
-        assert!(claude.enforceable_caps().idle());
-        assert!(!codex.enforceable_caps().idle());
+        // The `exec --json` schema is unverified, so any claim beyond the
+        // runtime's own wall clock would be a guess.
+        assert_eq!(codex.enforceable_caps(), CapSupport::none().with_wall());
     }
 
     #[test]

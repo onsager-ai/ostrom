@@ -50,7 +50,12 @@ impl Harness for ClaudeHarness {
         // turns, and tokens have observable enforcement points. Total cost is
         // reported only by the terminal result; that makes cost enforcement
         // end-only, but still truthful.
-        CapSupport::new(true, true, true, true, true)
+        CapSupport::none()
+            .with_wall()
+            .with_idle()
+            .with_turns()
+            .with_tokens()
+            .with_cost()
     }
 }
 
@@ -148,7 +153,7 @@ mod tests {
         }
 
         fn enforceable_caps(&self) -> CapSupport {
-            CapSupport::new(true, false, false, false, false)
+            CapSupport::none().with_wall()
         }
     }
 
@@ -188,6 +193,23 @@ mod tests {
                 profile.display(),
                 PASS_MAX_TURNS,
             )
+        );
+    }
+
+    #[test]
+    fn claude_declares_all_stream_observable_cap_support() {
+        let claude = ClaudeHarness::new("claude", "fixture-v1", "fixture-model");
+
+        // Verified `stream-json` emits the tool, turn, and usage boundaries
+        // required by the stream-derived caps; wall uses the runtime clock.
+        assert_eq!(
+            claude.enforceable_caps(),
+            CapSupport::none()
+                .with_wall()
+                .with_idle()
+                .with_turns()
+                .with_tokens()
+                .with_cost()
         );
     }
 
