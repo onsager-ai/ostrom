@@ -1,6 +1,5 @@
 //! Filesystem implementation and compatibility readers.
 
-mod agent;
 mod app_token;
 mod check_store;
 mod clock;
@@ -17,7 +16,6 @@ mod leaves;
 mod migration;
 mod parity;
 mod pass;
-mod pass_state;
 mod paths;
 mod plan;
 mod policy;
@@ -30,13 +28,10 @@ mod selection;
 mod selector;
 mod sweep;
 mod trace;
+pub mod umwelt_edge;
 mod work_order;
 mod worktree;
 
-pub use agent::{
-    ActionFault, AgentRegistry, AgentRunner, CodexHarness, Harness, ImplementerRunRequest,
-    OrchestratorRunRequest, RunOutcome, RunRequest, RunTermination, RunnerLaunch,
-};
 pub use app_token::{AppTokenError, CredentialCommandError, credential_output};
 pub use check_store::JsonlCheckStore;
 pub use clock::Clock;
@@ -66,10 +61,7 @@ pub use leaves::{
 };
 pub use migration::{MigrationOutcome, migrate};
 pub use parity::{ParityError, SweepParityOptions, SweepParityOutcome, run_sweep_parity};
-pub use pass::{
-    MAX_TURNS as PASS_MAX_TURNS, PassError, PassRequest, PassRole, SignalFlags, run_pass,
-};
-pub use pass_state::{PassState, read_pass_state, write_pass_state};
+pub use pass::{MAX_TURNS as PASS_MAX_TURNS, PassError, PassRequest, PassRole, run_pass};
 pub use paths::OstromPaths;
 pub use plan::{
     AssessmentDeriver, AssessmentDeriverError, AssessmentHarness, AssessmentInput,
@@ -101,8 +93,17 @@ pub use sweep::{
     run_sweep, run_sweep_with_mirror, run_sweep_with_publication_source, validate_roster_coverage,
 };
 pub use trace::{
-    MalformedTraceRow, TraceActionError, TraceAppend, TraceFactRecord, TraceRead, TraceView,
-    append_trace, append_trace_checked, read_trace, read_trace_json,
+    MalformedTraceRow, TraceActionError, TraceFactRecord, TraceRead, TraceView,
+    append_trace_checked, read_trace, read_trace_json,
+};
+pub use umwelt_edge::append_trace;
+pub use umwelt_edge::{read_pass_state, write_pass_state};
+pub use umwelt_runtime::PassState;
+pub use umwelt_runtime::TraceAppend;
+pub use umwelt_runtime::{
+    ActionFault, AgentRegistry, AgentRunner, CodexHarness, Harness, ImplementerRunRequest,
+    OrchestratorRunRequest, RunCeilings, RunOutcome, RunRequest, RunTermination, RunnerLaunch,
+    SignalFlags,
 };
 pub use work_order::{
     ClearedWorkOrder, CreatedWorkOrder, WorkOrderError, branch_name, clear_work_order,

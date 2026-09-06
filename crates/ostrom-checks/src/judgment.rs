@@ -1,12 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    fs,
-    io::Write,
-    path::{Path, PathBuf},
-    process::{Command, Stdio},
-    sync::Arc,
-    time::SystemTime,
-};
+use std::{collections::BTreeMap, sync::Arc, time::SystemTime};
 
 use chrono::{DateTime, Duration, Utc};
 use ostrom_core::{
@@ -14,11 +6,11 @@ use ostrom_core::{
     EvidenceBundleItem, JudgeStamp, JudgmentClause, JudgmentInput, JudgmentRunnerStamp,
     RecordedOutput, ResolvedCheck, agent_parameters, receipt_digest, resolve_check, select_check,
 };
-use ostrom_store::{AgentRunner, Harness, PASS_MAX_TURNS, RunOutcome, RunRequest};
-use serde::{Deserialize, Serialize};
+use ostrom_store::Harness;
+use serde::Serialize;
 use serde_json::json;
 
-use crate::ActionFault;
+use crate::{ActionFault, umwelt_edge::ClaudeJudgmentHarness};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JudgmentOutcome {
@@ -41,173 +33,6 @@ pub trait JudgmentHarness: Harness {
     fn judge(&self, request: &HarnessRequest<'_>) -> JudgmentOutcome;
 }
 
-/// JSON-stdio adapter for the registered `agent/claude` harness. The child is
-/// given only the selected model, authored prompt, and bounded evidence bundle
-/// on stdin; its environment is cleared before invocation.
-pub struct ClaudeHarness {
-    executable: PathBuf,
-    version: String,
-    default_model: String,
-}
-
-impl ClaudeHarness {
-    #[must_use]
-    pub fn new(
-        executable: impl Into<PathBuf>,
-        version: impl Into<String>,
-        default_model: impl Into<String>,
-    ) -> Self {
-        Self {
-            executable: executable.into(),
-            version: version.into(),
-            default_model: default_model.into(),
-        }
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct HarnessResponse {
-    #[serde(default)]
-    verdict: Option<CheckVerdict>,
-    #[serde(default)]
-    because: Vec<JudgmentClause>,
-    #[serde(default)]
-    error: Option<String>,
-    #[serde(default)]
-    detail: Option<String>,
-}
-
-impl Harness for ClaudeHarness {
-    fn name(&self) -> &'static str {
-        "claude"
-    }
-
-    fn version(&self) -> &str {
-        &self.version
-    }
-
-    fn default_model(&self) -> &str {
-        &self.default_model
-    }
-}
-
-impl JudgmentHarness for ClaudeHarness {
-    fn judge(&self, request: &HarnessRequest<'_>) -> JudgmentOutcome {
-        let mut child = match Command::new(&self.executable)
-            .env_clear()
-            .current_dir(self.executable.parent().unwrap_or_else(|| Path::new("/")))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(error) => {
-                return JudgmentOutcome::Error(ActionFault::new(
-                    "harness_unavailable",
-                    Some(error.to_string()),
-                ));
-            }
-        };
-        let bytes = serde_json::to_vec(request).expect("harness request serializes");
-        if child
-            .stdin
-            .take()
-            .is_none_or(|mut input| input.write_all(&bytes).is_err())
-        {
-            return JudgmentOutcome::Error(ActionFault::new("harness_io", None));
-        }
-        let output = match child.wait_with_output() {
-            Ok(output) => output,
-            Err(error) => {
-                return JudgmentOutcome::Error(ActionFault::new(
-                    "harness_io",
-                    Some(error.to_string()),
-                ));
-            }
-        };
-        if !output.status.success() {
-            return JudgmentOutcome::Error(ActionFault::new(
-                "harness_error",
-                Some(String::from_utf8_lossy(&output.stderr).trim().to_owned()),
-            ));
-        }
-        let response: HarnessResponse = match serde_json::from_slice(&output.stdout) {
-            Ok(response) => response,
-            Err(error) => {
-                return JudgmentOutcome::Error(ActionFault::new(
-                    "harness_protocol",
-                    Some(error.to_string()),
-                ));
-            }
-        };
-        match (response.verdict, response.error) {
-            (Some(verdict), None) if response.detail.is_none() => JudgmentOutcome::Verdict {
-                verdict,
-                because: response.because,
-            },
-            (None, Some(error)) if response.because.is_empty() && !error.is_empty() => {
-                JudgmentOutcome::Error(ActionFault::new(
-                    "cannot_determine",
-                    response.detail.or(Some(error)),
-                ))
-            }
-            _ => JudgmentOutcome::Error(ActionFault::new("harness_protocol", None)),
-        }
-    }
-}
-
-impl AgentRunner for ClaudeHarness {
-    fn run(&self, request: &RunRequest) -> RunOutcome {
-        let RunRequest::Orchestrator(request) = request else {
-            return RunOutcome::Error(ActionFault::new("runner_kind_mismatch", None));
-        };
-        let output = match fs::File::create(&request.transcript) {
-            Ok(output) => output,
-            Err(error) => {
-                return RunOutcome::Error(ActionFault::new("runner_io", Some(error.to_string())));
-            }
-        };
-        let error_output = match output.try_clone() {
-            Ok(error_output) => error_output,
-            Err(error) => {
-                return RunOutcome::Error(ActionFault::new("runner_io", Some(error.to_string())));
-            }
-        };
-        let mut command = Command::new(&self.executable);
-        command
-            .args([
-                "--print",
-                "--settings",
-                &request.profile.display().to_string(),
-                "--permission-mode",
-                &request.permission_mode,
-                "--output-format",
-                "stream-json",
-                "--verbose",
-                "--max-turns",
-                PASS_MAX_TURNS,
-                &request.prompt,
-            ])
-            .stdout(Stdio::from(output))
-            .stderr(Stdio::from(error_output));
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(error) => {
-                return RunOutcome::Error(ActionFault::new(
-                    "runner_unavailable",
-                    Some(error.to_string()),
-                ));
-            }
-        };
-        match child.wait() {
-            Ok(status) => RunOutcome::Exited(status),
-            Err(error) => RunOutcome::Error(ActionFault::new("runner_io", Some(error.to_string()))),
-        }
-    }
-}
-
 #[derive(Default)]
 pub struct JudgmentRegistry {
     harnesses: BTreeMap<&'static str, Arc<dyn JudgmentHarness>>,
@@ -219,7 +44,7 @@ impl JudgmentRegistry {
         Self::default()
     }
 
-    pub fn core(claude: ClaudeHarness) -> Result<Self, ActionFault> {
+    pub fn core(claude: ClaudeJudgmentHarness) -> Result<Self, ActionFault> {
         let mut registry = Self::new();
         registry.register(claude)?;
         Ok(registry)
@@ -451,6 +276,7 @@ mod tests {
         RunnerStamp, resolve_check,
     };
     use serde_json::json;
+    use umwelt_runtime::{AgentRunner, ClaudeHarness, RunOutcome, RunRequest};
 
     use super::*;
 
@@ -802,7 +628,7 @@ checks:
         let enumeration = catalogue("claude");
         let source = mechanical(&enumeration);
         let source_receipt = observed_receipt(&source, "observed-1", 0);
-        let registry = JudgmentRegistry::core(ClaudeHarness::new(
+        let registry = JudgmentRegistry::core(ClaudeJudgmentHarness::new(
             &executable,
             "claude-fixture-v1",
             "fixture-default",
@@ -841,7 +667,7 @@ checks:
             model: "fixture-model".to_owned(),
             profile: profile.clone(),
             permission_mode: "auto".to_owned(),
-            ceilings: ostrom_core::ResolvedLoopCeilings::default(),
+            ceilings: umwelt_runtime::RunCeilings::default(),
             transcript,
         });
 
@@ -865,7 +691,7 @@ checks:
                 "stream-json".to_owned(),
                 "--verbose".to_owned(),
                 "--max-turns".to_owned(),
-                PASS_MAX_TURNS.to_owned(),
+                umwelt_runtime::agent::PASS_MAX_TURNS.to_owned(),
                 prompt.to_owned(),
             ]
         );

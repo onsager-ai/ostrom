@@ -2,10 +2,6 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
     thread,
     time::Duration,
 };
@@ -16,9 +12,9 @@ use serde_json::{Map, Value, json};
 use thiserror::Error;
 
 use crate::{
-    Clock, LeaseActionError, OstromPaths, OwnedLease, PassState, TraceAppend, append_trace,
-    environment, read_lease, read_pass_state, read_trace, selection::dispatchability_snapshot,
-    write_pass_state,
+    Clock, LeaseActionError, OstromPaths, OwnedLease, PassState, SignalFlags, TraceAppend,
+    append_trace, environment, read_lease, read_pass_state, read_trace,
+    selection::dispatchability_snapshot, write_pass_state,
 };
 
 pub const MAX_TURNS: &str = "200";
@@ -117,42 +113,6 @@ pub struct PassRequest {
     pub signals: SignalFlags,
     pub supervisor_pid: Option<u32>,
     pub clock: Clock,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct SignalFlags {
-    hup: Arc<AtomicBool>,
-    int: Arc<AtomicBool>,
-    term: Arc<AtomicBool>,
-}
-
-impl SignalFlags {
-    #[must_use]
-    pub fn hup_flag(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.hup)
-    }
-
-    #[must_use]
-    pub fn int_flag(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.int)
-    }
-
-    #[must_use]
-    pub fn term_flag(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.term)
-    }
-
-    pub fn take_pending(&self) -> Option<&'static str> {
-        if self.term.swap(false, Ordering::SeqCst) {
-            Some("TERM")
-        } else if self.int.swap(false, Ordering::SeqCst) {
-            Some("INT")
-        } else if self.hup.swap(false, Ordering::SeqCst) {
-            Some("HUP")
-        } else {
-            None
-        }
-    }
 }
 
 #[derive(Debug, Error)]

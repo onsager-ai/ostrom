@@ -6,17 +6,12 @@
 //! Judged execution uses the separate [`JudgmentRegistry`], preserving that
 //! reservation while resolving `agent/*` verbs as harness names.
 
-mod command;
 mod doctor;
 mod github;
 mod http;
 mod judgment;
-mod loop_units;
-mod operation_settings;
-mod process;
-mod registry;
+pub mod umwelt_edge;
 
-pub use command::CommandProvider;
 pub use doctor::{
     DOCTOR_CHECKS, DoctorOptions, DoctorProvider, DoctorResult, DoctorStatus, run_doctor,
     run_doctor_check,
@@ -24,19 +19,18 @@ pub use doctor::{
 pub use github::GitHubProvider;
 pub use http::HttpProvider;
 pub use judgment::{
-    ClaudeHarness, HarnessRequest, JudgmentHarness, JudgmentOutcome, JudgmentRegistry,
-    PreparedJudgment,
+    HarnessRequest, JudgmentHarness, JudgmentOutcome, JudgmentRegistry, PreparedJudgment,
 };
-pub use loop_units::{
-    LoopUnit, LoopUnitDrift, LoopUnitError, check_loop_units_drift, generate_loop_units,
-    loop_execstart_is_not_shell, render_loop_units,
+pub use umwelt_edge::{
+    ActionOutcome, ActionProvider, ActionRegistry, ClaudeJudgmentHarness, LoopUnitError,
+    OperationSettingsError, PreparedAction, PreparedCheck, check_loop_units_drift,
+    check_operation_settings_drift, generate_loop_units, generate_operation_settings,
+    loop_execstart_is_not_shell, render_loop_units, resolved_operation_settings,
 };
-pub use operation_settings::{
-    OperationSettingsDrift, OperationSettingsError, check_operation_settings_drift,
-    generate_operation_settings,
+pub use umwelt_runtime::{
+    ActionFault, AgentRegistry, AgentRunner, CeilingEnvironmentNames, CheckAction, CheckReceipt,
+    ClaudeHarness, CodexHarness, CommandProvider, Harness, HarnessProfile, ImplementerRunRequest,
+    LoopUnit, LoopUnitDeclaration, LoopUnitDrift, LoopUnitGeneratorConfig, OperationSettingsDrift,
+    OrchestratorRunRequest, ResolvedOperationSettings, RunCeilings, RunOutcome, RunRequest,
+    RunTermination, RunnerLaunch,
 };
-pub use ostrom_store::{
-    ActionFault, AgentRegistry, AgentRunner, CodexHarness, Harness, ImplementerRunRequest,
-    OrchestratorRunRequest, RunOutcome, RunRequest, RunTermination, RunnerLaunch,
-};
-pub use registry::{ActionOutcome, ActionProvider, ActionRegistry, PreparedAction, PreparedCheck};

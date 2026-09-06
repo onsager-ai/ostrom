@@ -267,8 +267,10 @@ fn run_implement_with_minter(
     request: &ImplementRequest,
     minter: &mut dyn InstallationTokenMinter,
 ) -> Result<String, ImplementError> {
-    let registry = AgentRegistry::core(CodexHarness::from_environment())
-        .expect("the shipped Codex harness registration is valid");
+    let registry = AgentRegistry::core(CodexHarness::from_environment(
+        crate::umwelt_edge::node_fallbacks(),
+    ))
+    .expect("the shipped Codex harness registration is valid");
     run_implement_with_registry_and_minter(request, &registry, DEFAULT_IMPLEMENTER_RUNNER, minter)
 }
 

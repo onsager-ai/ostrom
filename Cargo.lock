@@ -863,6 +863,7 @@ dependencies = [
  "serde_yaml",
  "tempfile",
  "thiserror",
+ "umwelt-runtime",
 ]
 
 [[package]]
@@ -916,6 +917,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "umwelt-runtime",
 ]
 
 [[package]]
@@ -1677,6 +1679,17 @@ name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
+
+[[package]]
+name = "umwelt-runtime"
+version = "0.1.0"
+source = "git+https://github.com/onsager-ai/umwelt.git?rev=194a9bb934ba88a2f41f50549309479224fe2a7d#194a9bb934ba88a2f41f50549309479224fe2a7d"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
 
 [[package]]
 name = "unicode-ident"
