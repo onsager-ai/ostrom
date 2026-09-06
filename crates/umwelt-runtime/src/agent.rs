@@ -203,13 +203,13 @@ pub struct RunTermination {
 }
 
 #[derive(Debug)]
-pub enum RunOutcome {
+pub enum ProcessOutcome {
     Exited(ExitStatus),
     Terminated(RunTermination),
     Error(ActionFault),
 }
 
-impl RunOutcome {
+impl ProcessOutcome {
     #[must_use]
     pub fn status(&self) -> Option<ExitStatus> {
         match self {
@@ -224,7 +224,7 @@ pub trait AgentRunner: Harness {
         Ok(RunnerLaunch::new(Vec::new()))
     }
 
-    fn run(&self, request: &RunRequest) -> RunOutcome;
+    fn run(&self, request: &RunRequest) -> ProcessOutcome;
 }
 
 #[derive(Default)]
@@ -272,9 +272,9 @@ impl AgentRegistry {
     }
 
     #[must_use]
-    pub fn run(&self, name: &str, request: &RunRequest) -> RunOutcome {
+    pub fn run(&self, name: &str, request: &RunRequest) -> ProcessOutcome {
         self.get(name).map_or_else(
-            || RunOutcome::Error(ActionFault::new("unregistered_harness", None)),
+            || ProcessOutcome::Error(ActionFault::new("unregistered_harness", None)),
             |runner| runner.run(request),
         )
     }
@@ -397,33 +397,42 @@ impl AgentRunner for CodexHarness {
         ]))
     }
 
-    fn run(&self, request: &RunRequest) -> RunOutcome {
+    fn run(&self, request: &RunRequest) -> ProcessOutcome {
         let RunRequest::Implementer(request) = request else {
-            return RunOutcome::Error(ActionFault::new("runner_kind_mismatch", None));
+            return ProcessOutcome::Error(ActionFault::new("runner_kind_mismatch", None));
         };
         if !request.offline || request.token_ceiling == 0 {
-            return RunOutcome::Error(ActionFault::new("runner_policy", None));
+            return ProcessOutcome::Error(ActionFault::new("runner_policy", None));
         }
         let (executable, _, path) = match self.resolved() {
             Ok(resolved) => resolved,
-            Err(error) => return RunOutcome::Error(error),
+            Err(error) => return ProcessOutcome::Error(error),
         };
         let events = match fs::File::create(&request.transcript) {
             Ok(events) => events,
             Err(error) => {
-                return RunOutcome::Error(ActionFault::new("runner_io", Some(error.to_string())));
+                return ProcessOutcome::Error(ActionFault::new(
+                    "runner_io",
+                    Some(error.to_string()),
+                ));
             }
         };
         let errors = match events.try_clone() {
             Ok(errors) => errors,
             Err(error) => {
-                return RunOutcome::Error(ActionFault::new("runner_io", Some(error.to_string())));
+                return ProcessOutcome::Error(ActionFault::new(
+                    "runner_io",
+                    Some(error.to_string()),
+                ));
             }
         };
         let input = match fs::File::open(&request.prompt) {
             Ok(input) => input,
             Err(error) => {
-                return RunOutcome::Error(ActionFault::new("runner_io", Some(error.to_string())));
+                return ProcessOutcome::Error(ActionFault::new(
+                    "runner_io",
+                    Some(error.to_string()),
+                ));
             }
         };
         let mut command = Command::new(executable);
@@ -453,7 +462,7 @@ impl AgentRunner for CodexHarness {
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
-                return RunOutcome::Error(ActionFault::new(
+                return ProcessOutcome::Error(ActionFault::new(
                     "runner_unavailable",
                     Some(format!("could not start Codex: {error}")),
                 ));
@@ -463,11 +472,11 @@ impl AgentRunner for CodexHarness {
             match child.try_wait() {
                 Ok(Some(status)) => {
                     process_control::kill_remaining_process_group(child.id());
-                    return RunOutcome::Exited(status);
+                    return ProcessOutcome::Exited(status);
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    return RunOutcome::Error(ActionFault::new(
+                    return ProcessOutcome::Error(ActionFault::new(
                         "runner_io",
                         Some(error.to_string()),
                     ));
@@ -484,7 +493,7 @@ impl AgentRunner for CodexHarness {
                     request.termination_grace,
                 );
                 let _ = child.wait();
-                return RunOutcome::Terminated(RunTermination {
+                return ProcessOutcome::Terminated(RunTermination {
                     signal,
                     termination_signal,
                 });
@@ -796,10 +805,10 @@ mod tests {
     }
 
     impl AgentRunner for FixtureRunner {
-        fn run(&self, request: &RunRequest) -> RunOutcome {
+        fn run(&self, request: &RunRequest) -> ProcessOutcome {
             assert!(matches!(request, RunRequest::Implementer(_)));
             self.ran.store(true, Ordering::SeqCst);
-            RunOutcome::Error(ActionFault::new("fixture-finished", None))
+            ProcessOutcome::Error(ActionFault::new("fixture-finished", None))
         }
     }
 
@@ -854,7 +863,7 @@ mod tests {
         let outcome = registry.run("agent/fixture", &implementer_request(root.path()));
 
         assert!(
-            matches!(outcome, RunOutcome::Error(ref fault) if fault.name() == "fixture-finished")
+            matches!(outcome, ProcessOutcome::Error(ref fault) if fault.name() == "fixture-finished")
         );
         assert!(ran.load(Ordering::SeqCst));
     }

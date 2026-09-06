@@ -4,7 +4,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-use super::{ActionFault, AgentRunner, Harness, PASS_MAX_TURNS, RunOutcome, RunRequest};
+use super::{ActionFault, AgentRunner, Harness, PASS_MAX_TURNS, ProcessOutcome, RunRequest};
 
 /// Spawn adapter for the `agent/claude` harness.
 pub struct ClaudeHarness {
@@ -43,20 +43,26 @@ impl Harness for ClaudeHarness {
 }
 
 impl AgentRunner for ClaudeHarness {
-    fn run(&self, request: &RunRequest) -> RunOutcome {
+    fn run(&self, request: &RunRequest) -> ProcessOutcome {
         let RunRequest::Orchestrator(request) = request else {
-            return RunOutcome::Error(ActionFault::new("runner_kind_mismatch", None));
+            return ProcessOutcome::Error(ActionFault::new("runner_kind_mismatch", None));
         };
         let output = match fs::File::create(&request.transcript) {
             Ok(output) => output,
             Err(error) => {
-                return RunOutcome::Error(ActionFault::new("runner_io", Some(error.to_string())));
+                return ProcessOutcome::Error(ActionFault::new(
+                    "runner_io",
+                    Some(error.to_string()),
+                ));
             }
         };
         let error_output = match output.try_clone() {
             Ok(error_output) => error_output,
             Err(error) => {
-                return RunOutcome::Error(ActionFault::new("runner_io", Some(error.to_string())));
+                return ProcessOutcome::Error(ActionFault::new(
+                    "runner_io",
+                    Some(error.to_string()),
+                ));
             }
         };
         let mut command = Command::new(&self.executable);
@@ -79,15 +85,17 @@ impl AgentRunner for ClaudeHarness {
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
-                return RunOutcome::Error(ActionFault::new(
+                return ProcessOutcome::Error(ActionFault::new(
                     "runner_unavailable",
                     Some(error.to_string()),
                 ));
             }
         };
         match child.wait() {
-            Ok(status) => RunOutcome::Exited(status),
-            Err(error) => RunOutcome::Error(ActionFault::new("runner_io", Some(error.to_string()))),
+            Ok(status) => ProcessOutcome::Exited(status),
+            Err(error) => {
+                ProcessOutcome::Error(ActionFault::new("runner_io", Some(error.to_string())))
+            }
         }
     }
 }
@@ -129,10 +137,10 @@ mod tests {
     }
 
     impl AgentRunner for FixtureRunner {
-        fn run(&self, request: &RunRequest) -> RunOutcome {
+        fn run(&self, request: &RunRequest) -> ProcessOutcome {
             assert!(matches!(request, RunRequest::Implementer(_)));
             self.ran.store(true, Ordering::SeqCst);
-            RunOutcome::Error(ActionFault::new("fixture-finished", None))
+            ProcessOutcome::Error(ActionFault::new("fixture-finished", None))
         }
     }
 
@@ -222,7 +230,7 @@ mod tests {
         let outcome = ClaudeHarness::new("missing", "fixture-v1", "fixture-model").run(&request);
         assert!(matches!(
             outcome,
-            RunOutcome::Error(ref fault) if fault.name() == "runner_kind_mismatch"
+            ProcessOutcome::Error(ref fault) if fault.name() == "runner_kind_mismatch"
         ));
     }
 }
