@@ -4,6 +4,7 @@ pub mod agent;
 pub mod command;
 mod environment;
 mod event_types;
+pub mod follower;
 pub mod loop_units;
 pub mod operation_settings;
 pub mod pass_state;
@@ -21,6 +22,10 @@ pub use agent::{
     RunRequest, RunTermination, RunnerLaunch, SignalFlags,
 };
 pub use command::CommandProvider;
+pub use follower::{
+    FollowExit, FollowPoll, FollowState, FollowStatus, LIFETIME_CAP as FOLLOW_LIFETIME_CAP,
+    POLL_INTERVAL as FOLLOW_POLL_INTERVAL, follow,
+};
 pub use loop_units::{
     CeilingEnvironmentNames, LoopUnit, LoopUnitDeclaration, LoopUnitDrift, LoopUnitError,
     LoopUnitGeneratorConfig, check_loop_units_drift, generate_loop_units,
@@ -32,7 +37,7 @@ pub use operation_settings::{
 };
 pub use pass_state::{PassState, PassStateError, read_pass_state, write_pass_state};
 pub use registry::{CheckAction, CheckReceipt, execute_check_action};
-pub use sink::{FileSink, Sink, SinkFault, run_directory_name};
+pub use sink::{FileSink, Sink, SinkFault, Source, SourceFault, run_directory_name};
 pub use trace::{TraceAppend, TraceAppendError, TraceFactRecord, append_trace};
 pub use watchdog::{
     Cap, CapMeasurement, CapTrip, CapsWatchdog, Clock, StartError, SystemClock, WatchdogError,
