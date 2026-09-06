@@ -12,7 +12,7 @@ use std::sync::{Mutex, MutexGuard};
 use chrono::{SecondsFormat, Utc};
 use ethogram::{Event, EventDraft, StampFields, parse_event, serialise_event, stamp};
 
-// This moves to ethogram's vocabulary when ethogram #5 lands.
+// Ethogram #5 landed, but it exports no event-type name constant; this stays until it does.
 const RUN_FINISHED: &str = "run.finished";
 const EVENTS_FILE: &str = "events.jsonl";
 
