@@ -894,6 +894,18 @@ fn facts_only_withholds_agent_events_only_from_the_live_descriptor() {
             .iter()
             .any(|event| event["type"] == "agent.tool_use")
     );
+
+    let malformed = CLAUDE_STREAM_JSON.replacen('\n', "\nnot a stream-json frame\n", 1);
+    let gap_fixture = Fixture::new(&stream_script(&malformed));
+    let gap_output = gap_fixture
+        .command()
+        .args(["--events-fd", "1", "--facts-only"])
+        .output()
+        .expect("run facts-only pass with capture gap");
+    assert!(gap_output.status.success());
+    let gap_live = String::from_utf8(gap_output.stdout).expect("live gap events UTF-8");
+    assert!(gap_live.contains("\"type\":\"capture.refused\""));
+    assert!(!gap_live.contains("\"type\":\"agent."));
 }
 
 #[test]

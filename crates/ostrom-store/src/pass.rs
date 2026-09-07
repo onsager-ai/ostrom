@@ -33,6 +33,9 @@ use crate::{
 };
 
 pub const MAX_TURNS: &str = "200";
+/// The pass supervisor waits for its worker, whose own TERM path cleans up the
+/// agent process group. Halve Umwelt's generic grace so the scheduler remains
+/// bounded while still allowing cooperative shutdown before KILL escalation.
 pub const PASS_KILL_GRACE_MS: u64 = 5_000;
 // EX_CONFIG: the pass invocation is valid, but the local arm configuration
 // explicitly refuses to execute it.

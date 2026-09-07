@@ -14,9 +14,9 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use ethogram::{
-    ControlRequestedPayload, DecisionDossier, DecisionKind, DecisionRequestedPayload, Event,
-    EventDraft, PayloadExtension, RunFinishedPayload, RunKind, RunOutcome, RunStartedPayload,
-    RunUsage,
+    CAPTURE_REFUSED, ControlRequestedPayload, DecisionDossier, DecisionKind,
+    DecisionRequestedPayload, Event, EventDraft, PayloadExtension, RunFinishedPayload, RunKind,
+    RunOutcome, RunStartedPayload, RunUsage,
 };
 use ostrom_core::{DecisionOption, Dossier, WriteDisposition};
 use serde::Serialize;
@@ -438,8 +438,13 @@ impl RunEventSink {
     }
 
     fn mirror(&self, event: &Event) {
+        // `run.*` and `control.*` report lifecycle; `capture.refused` reports a
+        // gap in capture. None carries what the agent said, so facts-only live
+        // consumers must receive all three.
         if self.facts_only
-            && !(event.event_type.starts_with("run.") || event.event_type.starts_with("control."))
+            && !(event.event_type.starts_with("run.")
+                || event.event_type.starts_with("control.")
+                || event.event_type == CAPTURE_REFUSED)
         {
             return;
         }
