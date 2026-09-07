@@ -2,6 +2,7 @@
 
 pub mod agent;
 pub mod command;
+pub mod control;
 mod environment;
 pub mod follower;
 pub mod loop_units;
@@ -21,6 +22,10 @@ pub use agent::{
     RunRequest, RunTermination, RunnerLaunch, SignalFlags,
 };
 pub use command::CommandProvider;
+pub use control::{
+    ClaudeSessionResumer, ControlError, ProcessExit, ResumeError, ResumedSession, RunControl,
+    SessionResumer,
+};
 pub use follower::{
     FollowExit, FollowPoll, FollowState, FollowStatus, LIFETIME_CAP as FOLLOW_LIFETIME_CAP,
     POLL_INTERVAL as FOLLOW_POLL_INTERVAL, follow,

@@ -809,13 +809,13 @@ impl NodeResolver {
 }
 
 #[cfg(unix)]
-fn set_process_group(command: &mut Command) {
+pub(crate) fn set_process_group(command: &mut Command) {
     use std::os::unix::process::CommandExt;
     command.process_group(0);
 }
 
 #[cfg(not(unix))]
-fn set_process_group(_command: &mut Command) {}
+pub(crate) fn set_process_group(_command: &mut Command) {}
 
 #[cfg(test)]
 mod tests {
