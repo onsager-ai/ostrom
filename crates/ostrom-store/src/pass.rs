@@ -33,9 +33,17 @@ use crate::{
 };
 
 pub const MAX_TURNS: &str = "200";
-/// The pass supervisor waits for its worker, whose own TERM path cleans up the
-/// agent process group. Halve Umwelt's generic grace so the scheduler remains
-/// bounded while still allowing cooperative shutdown before KILL escalation.
+/// Umwelt's `RunCaps::default()` uses ten seconds; this is five. The divergence
+/// is inherited rather than argued: five seconds was already ostrom's TERM-to-KILL
+/// grace in `terminate_child_process_group`, and #494 promoted that literal to
+/// this constant so one value drives both ostrom's own termination path (through
+/// `PASS_TERMINATION_GRACE`) and the cap grace handed to Umwelt, rather than
+/// letting the two drift apart.
+///
+/// Whether five seconds is right for a *cap* grace has therefore never been
+/// decided on its own terms. Recorded as a shared value with one history, not as
+/// a considered halving of Umwelt's default, so the next reader does not mistake
+/// an inheritance for a judgement.
 pub const PASS_KILL_GRACE_MS: u64 = 5_000;
 // EX_CONFIG: the pass invocation is valid, but the local arm configuration
 // explicitly refuses to execute it.
