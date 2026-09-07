@@ -730,6 +730,107 @@ fn projected_daily_spend_refuses_before_launch_and_releases_the_lease() {
     assert_refused(&output, 3, "daily spend cap would be exceeded");
     assert!(!fixture.calls.exists());
     assert!(!fixture.lease().exists());
+    let events = fs::read_to_string(fixture.state.join("runs/dispatch/events.jsonl"))
+        .expect("read dispatch decision events")
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("event JSON"))
+        .collect::<Vec<_>>();
+    let decisions = events
+        .iter()
+        .filter(|event| event["type"] == "decision.requested")
+        .collect::<Vec<_>>();
+    assert_eq!(decisions.len(), 1);
+    let payload = &decisions[0]["payload"];
+    ethogram::validate("decision.requested", payload).expect("valid budget decision");
+    assert_eq!(payload["kind"], "budget");
+    assert!(payload.get("onTimeout").is_none());
+    assert!(payload.get("on_timeout").is_none());
+    assert_eq!(
+        payload["subject"],
+        format!("account:{}", fixture.state.display())
+    );
+    let question = payload["dossier"]["question"]
+        .as_str()
+        .expect("budget question");
+    assert!(question.contains(&fixture.state.display().to_string()));
+    assert!(question.contains("daily ceiling of 50 USD"));
+    assert!(question.contains("51 USD projected with this order"));
+    assert_eq!(
+        payload["dossier"]["optionsRuledOut"],
+        json!(["Proceeding under the current spend ceiling"])
+    );
+    assert_eq!(
+        payload["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|option| option["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["raise", "wait"]
+    );
+    assert!(
+        payload["options"][0]["label"]
+            .as_str()
+            .unwrap()
+            .contains(&fixture.state.join("current").display().to_string())
+    );
+    let facts = fixture
+        .trace()
+        .into_iter()
+        .filter(|row| row["kind"] == "decision-requested")
+        .collect::<Vec<_>>();
+    assert_eq!(facts.len(), 1);
+    assert_eq!(
+        facts[0]["fact"],
+        json!({
+            "decision_id": payload["decisionId"],
+            "kind": "budget",
+            "subject": payload["subject"],
+        })
+    );
+    ostrom_core::EventPayload::new(facts[0]["fact"].as_object().unwrap().clone())
+        .expect("budget fact has no narration");
+}
+
+#[test]
+fn a_budget_emission_fault_still_refuses_dispatch_with_exit_three() {
+    let fixture = Fixture::new();
+    fs::write(fixture.state.join("runs"), "not a directory").expect("block the event sink");
+    let output = run(fixture
+        .command()
+        .env("OSTROM_TEST_BRANCH_PAGE_1", default_page())
+        .env("MANDATE_DAILY_CAP_USD", "1"));
+    assert_refused(&output, 3, "could not emit budget decision");
+    assert!(!fixture.calls.exists());
+    assert!(!fixture.lease().exists());
+    assert!(
+        fixture
+            .trace()
+            .iter()
+            .all(|row| row["kind"] != "decision-requested")
+    );
+}
+
+#[test]
+fn a_dispatch_within_the_daily_budget_emits_no_budget_decision() {
+    let fixture = Fixture::new();
+    let output = run(fixture
+        .command()
+        .env("OSTROM_TEST_BRANCH_PAGE_1", default_page())
+        .env("MANDATE_DAILY_CAP_USD", "20"));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(fixture.calls.exists());
+    assert!(!fixture.state.join("runs/dispatch").exists());
+    assert!(
+        fixture
+            .trace()
+            .iter()
+            .all(|row| row["kind"] != "decision-requested")
+    );
 }
 
 #[test]

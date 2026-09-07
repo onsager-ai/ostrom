@@ -517,15 +517,23 @@ mod tests {
         ]);
         assert!(EventPayload::new(requested.clone()).is_ok());
         assert!(EventPayload::new(answered).is_ok());
-        let mut narrated_decision = requested;
-        narrated_decision.insert(
-            "dossier".to_owned(),
-            json!({"question": "narration must stay at the ethogram edge"}),
-        );
-        assert!(
-            EventPayload::new(narrated_decision).is_err(),
-            "a decision dossier must never enter the fact ledger"
-        );
+        for (kind, subject) in [
+            ("tripwire", "synthetic-org/project#42"),
+            ("budget", "account:/synthetic/ostrom"),
+        ] {
+            let mut narrated_decision = requested.clone();
+            narrated_decision.insert("kind".to_owned(), json!(kind));
+            narrated_decision.insert("subject".to_owned(), json!(subject));
+            assert!(EventPayload::new(narrated_decision.clone()).is_ok());
+            narrated_decision.insert(
+                "dossier".to_owned(),
+                json!({"question": "narration must stay at the ethogram edge"}),
+            );
+            assert!(
+                EventPayload::new(narrated_decision).is_err(),
+                "a decision dossier must never enter the fact ledger"
+            );
+        }
     }
 
     #[test]

@@ -1185,10 +1185,34 @@ fn inner_lease_cleanup_distinguishes_child_and_preexisting_owners() {
 }
 
 #[test]
+fn a_daily_budget_hold_reaches_the_live_event_descriptor() {
+    let fixture = Fixture::new("exit 99");
+    let output = fixture
+        .command()
+        .env("MANDATE_DAILY_CAP_USD", "0")
+        .args(["--events-fd", "1"])
+        .output()
+        .expect("run budget hold with live events");
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, fixture.run_event_bytes());
+    assert_eq!(
+        fixture
+            .run_events()
+            .iter()
+            .map(|event| event["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["run.started", "decision.requested", "run.finished"]
+    );
+    assert!(!fixture.state.join("current").exists());
+    assert!(!fixture.state.join("versions").exists());
+    fixture.assert_released();
+}
+
+#[test]
 fn daily_cap_uses_only_valid_costs_on_the_current_day() {
     for (cap, spawned, outcome, reason) in [
         ("8", true, "completed", None),
-        ("7", false, "no-op", Some("daily-cap")),
+        ("7", false, "held", Some("daily-cap")),
         ("not-a-number", true, "completed", None),
     ] {
         let fixture = Fixture::new(concat!(
@@ -1240,6 +1264,98 @@ fn daily_cap_uses_only_valid_costs_on_the_current_day() {
         let terminal = fixture.trace().pop().expect("spend terminal");
         assert_eq!(terminal["fact"]["outcome"], outcome, "cap {cap}");
         assert_eq!(terminal["fact"]["reason"].as_str(), reason, "cap {cap}");
+        let events = fixture.run_events();
+        let finished = events
+            .iter()
+            .filter(|event| event["type"] == "run.finished")
+            .collect::<Vec<_>>();
+        assert_eq!(finished.len(), 1);
+        assert_eq!(
+            finished[0]["payload"]["outcome"],
+            if spawned { "completed" } else { "blocked" }
+        );
+        assert_eq!(
+            finished[0]["payload"]["reason"].as_str(),
+            if spawned { None } else { Some("budget") }
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event["payload"]["outcome"] != "held")
+        );
+        assert!(
+            fixture
+                .trace()
+                .iter()
+                .all(|row| row["fact"]["outcome"] != "blocked")
+        );
+        let decisions = events
+            .iter()
+            .filter(|event| {
+                event["type"] == "decision.requested" && event["payload"]["kind"] == "budget"
+            })
+            .collect::<Vec<_>>();
+        let decision_facts = fixture
+            .trace()
+            .into_iter()
+            .filter(|row| row["kind"] == "decision-requested" && row["fact"]["kind"] == "budget")
+            .collect::<Vec<_>>();
+        assert_eq!(decisions.len(), usize::from(!spawned));
+        assert_eq!(decision_facts.len(), usize::from(!spawned));
+        if !spawned {
+            let payload = &decisions[0]["payload"];
+            ethogram::validate("decision.requested", payload).expect("valid budget decision");
+            assert!(payload.get("onTimeout").is_none());
+            assert!(payload.get("on_timeout").is_none());
+            assert_eq!(
+                payload["subject"],
+                format!("account:{}", fixture.state.display())
+            );
+            let question = payload["dossier"]["question"]
+                .as_str()
+                .expect("budget question");
+            assert!(question.contains(&fixture.state.display().to_string()));
+            assert!(question.contains("daily ceiling of 7 USD"));
+            assert!(question.contains("7 USD spent"));
+            assert_eq!(
+                payload["dossier"]["optionsRuledOut"],
+                json!(["Proceeding under the current spend ceiling"])
+            );
+            assert_eq!(
+                payload["options"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|option| option["id"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                ["raise", "wait"]
+            );
+            assert!(
+                payload["options"][0]["label"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&fixture.state.join("current").display().to_string())
+            );
+            assert_eq!(
+                decision_facts[0]["fact"],
+                json!({
+                    "decision_id": payload["decisionId"],
+                    "kind": "budget",
+                    "subject": payload["subject"],
+                })
+            );
+            ostrom_core::EventPayload::new(decision_facts[0]["fact"].as_object().unwrap().clone())
+                .expect("budget fact has no narration");
+            assert_eq!(
+                terminal["fact"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                ["owner", "outcome", "cost_usd", "duration_seconds", "reason"]
+            );
+        }
         assert!(
             terminal["ts"]
                 .as_str()

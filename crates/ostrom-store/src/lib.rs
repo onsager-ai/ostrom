@@ -1,6 +1,7 @@
 //! Filesystem implementation and compatibility readers.
 
 mod app_token;
+mod budget;
 mod check_store;
 mod clock;
 mod commit_checks;
