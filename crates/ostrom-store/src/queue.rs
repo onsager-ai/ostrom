@@ -195,13 +195,40 @@ pub fn decide_queue_item(
     decision: QueueDecision,
     event_time: Option<&str>,
 ) -> Result<Vec<u8>, QueueActionError> {
+    decide_queue_item_with_prior(
+        queue_path,
+        state_path,
+        events_path,
+        id,
+        decision,
+        event_time,
+        None,
+    )
+}
+
+pub(crate) fn decide_queue_item_with_prior(
+    queue_path: &Path,
+    state_path: &Path,
+    events_path: &Path,
+    id: &str,
+    decision: QueueDecision,
+    event_time: Option<&str>,
+    prior: Option<&QueueDocument>,
+) -> Result<Vec<u8>, QueueActionError> {
     let mut rows = read_queue(queue_path).map_err(|_| QueueActionError::CannotRead {
         path: queue_path.display().to_string(),
     })?;
+    if !rows.iter().any(|row| row.string("id") == Some(id))
+        && let Some(prior) = prior.filter(|row| row.string("id") == Some(id))
+    {
+        rows.push(prior.clone());
+    }
     let index = rows
         .iter()
         .position(|row| {
-            row.string("id") == Some(id) && matches!(row.state(), Some("pending" | "deferred"))
+            row.string("id") == Some(id)
+                && (matches!(row.state(), Some("pending" | "deferred"))
+                    || (prior.is_some() && row.state() == Some("approved")))
         })
         .ok_or_else(|| QueueActionError::UnknownItem(id.to_owned()))?;
     let original = rows[index].value().clone();

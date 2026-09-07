@@ -315,6 +315,55 @@ the runtime reaches its reconnect boundary.
 The lease and trace are machine-local runtime state. Like the real roster,
 queue, and read cursors, they never belong in this repository.
 
+### Answering a decision
+
+`ostrom queue approve <item>`, `reject` and `defer` keep their existing behavior.
+Add both `--decision <decision-id>` and `--option <option-id>` to settle a recorded
+request. For example:
+
+```sh
+ostrom queue approve example-org/example-repo#19 --decision <decision-id> --option approve
+ostrom queue approve example-org/example-repo#19 --decision <decision-id> --option excuse:required_checks
+ostrom queue approve example-org/example-repo#19 --decision <decision-id> --option revoke:required_checks
+```
+
+The command applies the option and emits `decision.answered` on its own run of
+kind `judgment`, even when the requesting run has finished. Correlation is by
+`decisionId`. `by` is the authenticated forge user's numeric identity,
+`github:user:<id>`. These human answers have no timeout marker. The fact ledger
+records only `decision_id`, `option`, `by` and `reversal`; the dossier stays in
+the request event. An unoffered option is refused before delivery. A recorded
+`revoke:<condition>` is also accepted on the decision whose grant it undoes.
+
+Tripwire options must agree with the queue verb. Approve reverses to reject;
+reject and defer reverse to approve. A private queue document retained under
+`decision-queue/` lets a correction restore a rejected item. Excuse grants and
+revocations share the standalone `ostrom excuse` path and use the head SHA from
+the recorded gate judgment. The current remote head cannot replace it. Both
+standalone excuse verbs also accept `--head-sha <sha>` before the reason.
+A subsequent gate respects the latest grant or revocation for that exact head
+and condition. A `raise` answer only records the choice: the principal still
+has to author and sign a policy version. It never changes a manifest or grants
+additional budget. Its reversal is `wait`.
+
+For a human checkbox decision, the reversal names the previous choice, or
+another offered choice for the initial answer (`yes` and `no` reverse each
+other). A request with no corrective alternative is refused. Repeating the
+latest answer is refused without delivering it again. Answers serialize through
+`decision-answer.lock`; after a crashed command, remove that stale lock only
+once the command is no longer running.
+
+**New outward-facing capability:** answering `human_decides` now edits an issue
+body under the operator's forge identity. Ostrom has never written issue bodies
+before this capability. It changes one matching unchecked checkbox from `[ ]`
+to `[x]`, preserving every other byte, including whitespace and line endings.
+It re-reads immediately before writing and refuses a body that changed between
+reads, or a missing, already checked, or ambiguous row. GitHub does not provide
+an atomic conditional issue-body update; an edit after that final read remains
+outside this check. The answer fact and event are recorded before the checkbox
+delivery. If delivery fails, the command exits nonzero and prints the issue
+reference on stderr for a manual tick; it does not retry or duplicate the answer.
+
 ### After implementation: the gatekeeper loop
 
 The builder coordinates work by dispatching a durable order to an implementer

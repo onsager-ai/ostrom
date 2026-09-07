@@ -2391,13 +2391,14 @@ fn analyze_merge_gate(
         };
         let id = string_field(merge, &["id"]).to_owned();
         let merge_number = number_field(merge, &["number"]).unwrap_or_default();
-        let excused = exception_records.iter().any(|exception| {
-            string_field(exception, &["repo"]) == repo
-                && number_field(exception, &["pr"]) == Some(merge_number)
-                && string_field(exception, &["head_sha"]) == sha
-                && string_field(exception, &["condition"]) == "merge_protocol"
-                && nonempty_string(exception, &["reason"]).is_some()
-        });
+        let excused = crate::leaves::active_exception_reason(
+            &exception_records,
+            repo,
+            merge_number,
+            sha,
+            "merge_protocol",
+        )
+        .is_some();
         if excused {
             continue;
         }
@@ -3450,6 +3451,17 @@ fn human_decision_sections(lines: &[&str]) -> Vec<(usize, usize)> {
 }
 
 fn human_decision_section_rows(lines: &[&str], start: usize, end: usize) -> Vec<HumanDecisionRow> {
+    human_decision_section_rows_with_lines(lines, start, end)
+        .into_iter()
+        .map(|(_, row)| row)
+        .collect()
+}
+
+fn human_decision_section_rows_with_lines(
+    lines: &[&str],
+    start: usize,
+    end: usize,
+) -> Vec<(usize, HumanDecisionRow)> {
     let mut tasks = Vec::new();
     let mut fence = None;
     for (line_number, line) in lines.iter().enumerate().take(end).skip(start) {
@@ -3507,12 +3519,46 @@ fn human_decision_section_rows(lines: &[&str], start: usize, end: usize) -> Vec<
             .map(|option| normalize_row_text(option.text))
             .filter(|label| !label.is_empty())
             .collect::<Vec<_>>();
-        decisions.push(HumanDecisionRow {
-            question,
-            options: decision_options(labels),
-        });
+        decisions.push((
+            task.line,
+            HumanDecisionRow {
+                question,
+                options: decision_options(labels),
+            },
+        ));
     }
     decisions
+}
+
+/// Locate the source row using the same normalized text identity as the sweep.
+/// Only its checkbox byte is changed; the body itself is never normalized.
+pub(crate) fn tick_human_decision(
+    body: &str,
+    subject: &str,
+    decision_id: &str,
+) -> Result<String, String> {
+    let lines = body.lines().collect::<Vec<_>>();
+    let matches = human_decision_sections(&lines)
+        .into_iter()
+        .flat_map(|(start, end)| human_decision_section_rows_with_lines(&lines, start, end))
+        .filter(|(_, row)| human_decision_request(subject, row.clone()).decision_id == decision_id)
+        .map(|(line, _)| line)
+        .collect::<Vec<_>>();
+    let [line] = matches.as_slice() else {
+        return Err("expected exactly one matching unticked Human decides row (missing, already ticked, or ambiguous)".to_owned());
+    };
+    let offset = body
+        .split_inclusive('\n')
+        .take(*line)
+        .map(str::len)
+        .sum::<usize>()
+        + lines[*line]
+            .find("- [ ]")
+            .expect("parser found an unticked checkbox")
+        + 3;
+    let mut updated = body.to_owned();
+    updated.replace_range(offset..offset + 1, "x");
+    Ok(updated)
 }
 
 fn markdown_fence(line: &str) -> Option<char> {

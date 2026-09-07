@@ -5,6 +5,7 @@ mod budget;
 mod check_store;
 mod clock;
 mod commit_checks;
+mod decision_answers;
 mod dispatch;
 pub mod environment;
 mod event_store;
@@ -38,6 +39,7 @@ pub use app_token::{AppTokenError, CredentialCommandError, credential_output};
 pub use check_store::JsonlCheckStore;
 pub use clock::Clock;
 pub use commit_checks::{CheckReadError, CommitChecks, read_commit_checks};
+pub use decision_answers::{DecisionAnswerError, answer_queue_decision};
 pub use dispatch::{
     DispatchError, DispatchOutcome, DispatchRequest, run_dispatch, run_dispatch_with_registry,
 };
@@ -58,8 +60,8 @@ pub use lease::{
     release_lease, validate_lease_name, write_lease,
 };
 pub use leaves::{
-    AuditError, AuditOptions, ExcuseError, LocalDriftError, audit, grant_excuse, list_excuses,
-    local_drift,
+    AuditError, AuditOptions, ExcuseError, LocalDriftError, audit, grant_excuse,
+    grant_excuse_at_head, list_excuses, local_drift, revoke_excuse,
 };
 pub use migration::{MigrationOutcome, migrate};
 pub use parity::{ParityError, SweepParityOptions, SweepParityOutcome, run_sweep_parity};

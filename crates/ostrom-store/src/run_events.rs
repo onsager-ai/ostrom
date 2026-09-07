@@ -63,8 +63,8 @@ pub(crate) struct DecisionRequest {
     pub subject: String,
 }
 
-/// Sweep, gate and dispatch decisions use stable relay runs that remain open so a later
-/// queue command can apply an answer on the run that owns the request.
+/// Sweep, gate and dispatch use stable relay runs to deduplicate requests.
+/// Answers are applied and emitted by a separate judgment run, correlated by decisionId.
 pub(crate) struct DecisionEmitter {
     sink: RunEventSink,
     run_id: String,
