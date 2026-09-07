@@ -34,6 +34,22 @@ The same reason ethogram is. A runtime that only one hub can link is a moat pret
 
 <!-- Source: principal, 2026-09-06, from the Run Tree design. Preconditions: assumes ethogram stays wire-only and ostrom-core never depends on this crate. Invalid if either changes, which is a spec on the repository that changed. -->
 
+## What a consumer needs to know
+
+**Run directories are percent-encoded, and the encoding is a contract.** A run id is an arbitrary wire string, so every byte outside `[A-Za-z0-9_-]` becomes `%XX` and the empty run id becomes `%`; a run id of `..` therefore cannot escape the sink root. `umwelt_runtime::run_directory_name` is public because anything locating a run's `events.jsonl` — `ostrom logs`, a shipper, `--events-fd` — must call it rather than reproduce it. Dotted run ids are unreadable on disk as a consequence: `run.1` is the directory `run%2E1`. That is deliberate.
+
+**`FileSink` writes with ethogram's `serialise_event`, never `serde_json::to_string`.** The canonical form — declared envelope key order, payload objects sorted recursively by UTF-8 bytes, ECMAScript number notation — is what makes `events.jsonl` comparable across languages.
+
+**Two ceiling types, and only one reaches the wire.** `LoopCeilings` is loop scheduling: how many workers a scheduled loop may run. `RunCaps` is per-run enforcement — wall, idle, turns, tokens, cost — plus `kill_grace_ms`, which is an enforcement detail no consumer needs and never leaves the process. `RunCaps::to_wire()` produces ethogram's `RunCeilings`.
+
+**A harness declares the caps it can honestly enforce, and `prepare` refuses the rest.** A cap accepted and not applied is worse than one refused, because the operator believes they are protected. Codex claims only wall today: its `exec --json` schema is unverified, and a claim resting on an unverified schema is a guess wearing a guarantee.
+
+**Idle suspension trusts the harness.** Idle does not advance while a tool call is in flight, so a tool call that hangs and never reports a result suspends the idle cap indefinitely — such a run is bounded by the wall cap, not the idle cap. A run declaring idle without wall is accepted and warned about at start, so the operator learns it from the run rather than from an incident.
+
+**Golden fixtures live here, normalised events live in ethogram.** A case is `crates/umwelt-capture/tests/fixtures/<harness>/<case>/` holding `raw.ndjson`, `expected.jsonl` and a `meta.toml` recording the CLI version and capture date — because a fixture without provenance cannot later be told apart from a guess. Goldens are compared as canonical bytes, and every case runs through both a file source and an in-memory source, which is how spawn and attach are proved equal rather than tested twice.
+
+**The companion, on an operator's machine:** what the agent said and did leaves, bounded and with machine paths rewritten; transcripts and files do not. Scrubbing happens at capture, so the local `events.jsonl` and the shipped stream hold the same bytes and there is no second, more permissive path.
+
 ## Layout
 
 ```
@@ -41,6 +57,8 @@ crates/umwelt-runtime/    spawn, process group, caps watchdog, sink trait, file 
 crates/umwelt-capture/    normalisers: claude-code stream-json, codex exec --json → ethogram drafts
 crates/umwelt-companion/  the operator-machine daemon: attach adapters, hooks bridge, dial-out
 ```
+
+Raw captures live in `crates/umwelt-capture/tests/fixtures/`; ethogram holds only the normalised events.
 
 The bare name `umwelt` is taken on crates.io and npm by unrelated projects; crates publish under these prefixed names and the repository keeps the short one.
 
