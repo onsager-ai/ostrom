@@ -11,7 +11,7 @@ use std::{
 use ethogram::{
     CONTROL_APPLIED, CONTROL_REQUESTED, ControlAppliedPayload, ControlKind,
     ControlRequestedPayload, EventDraft, MAX_EXCERPT_SCALARS, PayloadExtension, RUN_FINISHED,
-    RunFinishedPayload, excerpt,
+    RunFinishedPayload, excerpt, validate,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -140,6 +140,9 @@ pub enum ProcessExit {
 /// A malformed request or failure to record its events.
 #[derive(Debug, Error)]
 pub enum ControlError {
+    /// The request is not valid for this runtime.
+    #[error("invalid control request: {0}")]
+    InvalidRequest(String),
     #[error("expected a {expected} control request")]
     WrongKind { expected: &'static str },
     #[error("a live process handle is required to interrupt a live run")]
@@ -164,6 +167,7 @@ pub struct RunControl<R> {
     kill_grace: Duration,
     resumer: R,
     live: bool,
+    terminal_emitted: bool,
     pending_steers: VecDeque<QueuedSteer>,
     resumed_child: Option<Child>,
 }
@@ -182,6 +186,7 @@ impl<R: SessionResumer> RunControl<R> {
             kill_grace: Duration::from_millis(caps.kill_grace_ms),
             resumer,
             live: true,
+            terminal_emitted: false,
             pending_steers: VecDeque::new(),
             resumed_child: None,
         }
@@ -229,6 +234,7 @@ impl<R: SessionResumer> RunControl<R> {
         C: Clock,
         F: FnOnce(Duration) -> Result<(), ControlError>,
     {
+        validate_request(&request)?;
         if request.kind != ControlKind::Interrupt {
             return Err(ControlError::WrongKind {
                 expected: "interrupt",
@@ -254,7 +260,9 @@ impl<R: SessionResumer> RunControl<R> {
                 watchdog.most_recent_open_tool_call(),
             ),
         )?;
+        self.reject_pending_steers(sink)?;
         sink.append(&self.run_id, finished_draft(watchdog.interrupted_payload()))?;
+        self.terminal_emitted = true;
         Ok(())
     }
 
@@ -264,6 +272,7 @@ impl<R: SessionResumer> RunControl<R> {
         request: ControlRequestedPayload,
         sink: &impl Sink,
     ) -> Result<(), ControlError> {
+        validate_request(&request)?;
         if request.kind != ControlKind::Steer {
             return Err(ControlError::WrongKind { expected: "steer" });
         }
@@ -290,9 +299,14 @@ impl<R: SessionResumer> RunControl<R> {
         finished: RunFinishedPayload,
         sink: &impl Sink,
     ) -> Result<(), ControlError> {
+        if self.terminal_emitted {
+            return Ok(());
+        }
+
         self.live = false;
         let Some(steer) = self.pending_steers.pop_front() else {
             sink.append(&self.run_id, finished_draft(finished))?;
+            self.terminal_emitted = true;
             return Ok(());
         };
 
@@ -333,15 +347,35 @@ impl<R: SessionResumer> RunControl<R> {
             )?;
         }
 
+        self.reject_pending_steers(sink)?;
+        sink.append(&self.run_id, finished_draft(finished))?;
+        self.terminal_emitted = true;
+        Ok(())
+    }
+
+    fn reject_pending_steers(&mut self, sink: &impl Sink) -> Result<(), ControlError> {
         while let Some(queued) = self.pending_steers.pop_front() {
             sink.append(
                 &self.run_id,
                 applied_draft(&queued.control_id, false, Some("not-live"), None),
             )?;
         }
-        sink.append(&self.run_id, finished_draft(finished))?;
         Ok(())
     }
+}
+
+fn validate_request(request: &ControlRequestedPayload) -> Result<(), ControlError> {
+    // `text` is optional at the schema level because another harness may be
+    // able to steer without it, but this runtime cannot act on an empty steer.
+    // Keep this runtime-specific guard separate from ethogram's validation.
+    if request.kind == ControlKind::Steer && request.text.as_deref().is_none_or(str::is_empty) {
+        return Err(ControlError::InvalidRequest(
+            "steer text must be present and nonempty".to_owned(),
+        ));
+    }
+
+    validate(CONTROL_REQUESTED, request)
+        .map_err(|error| ControlError::InvalidRequest(error.to_string()))
 }
 
 fn requested_draft(payload: ControlRequestedPayload) -> EventDraft {
@@ -599,6 +633,87 @@ mod tests {
     }
 
     #[test]
+    fn process_exit_after_interrupt_does_not_emit_a_second_terminal() {
+        let sink = MemorySink::default();
+        let watchdog = watchdog();
+        let mut control = RunControl::new(
+            "run-1",
+            Some("session-1".to_owned()),
+            RunCaps::default(),
+            RecordingResumer::succeeding(),
+        );
+
+        control
+            .interrupt_with(
+                request("control-1", ControlKind::Interrupt, None),
+                &watchdog,
+                &sink,
+                |_| Ok(()),
+            )
+            .expect("interrupt");
+        control
+            .process_exited(ProcessExit::Abnormal, finished(RunOutcome::Failed), &sink)
+            .expect("observe interrupted child exit");
+
+        assert_eq!(
+            sink.events()
+                .iter()
+                .filter(|event| event.event_type == RUN_FINISHED)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn interrupt_rejects_queued_steers_before_finishing() {
+        let sink = MemorySink::default();
+        let watchdog = watchdog();
+        let mut control = RunControl::new(
+            "run-1",
+            Some("session-1".to_owned()),
+            RunCaps::default(),
+            RecordingResumer::succeeding(),
+        );
+        control
+            .steer(
+                request("steer-1", ControlKind::Steer, Some("next text")),
+                &sink,
+            )
+            .expect("queue steer");
+
+        control
+            .interrupt_with(
+                request("interrupt-1", ControlKind::Interrupt, None),
+                &watchdog,
+                &sink,
+                |_| Ok(()),
+            )
+            .expect("interrupt");
+
+        let events = sink.events();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            [
+                CONTROL_REQUESTED,
+                CONTROL_REQUESTED,
+                CONTROL_APPLIED,
+                CONTROL_APPLIED,
+                RUN_FINISHED,
+            ]
+        );
+        let interrupt_applied: ControlAppliedPayload = payload(&events[2]);
+        assert_eq!(interrupt_applied.control_id, "interrupt-1");
+        assert!(interrupt_applied.ok);
+        let steer_applied: ControlAppliedPayload = payload(&events[3]);
+        assert_eq!(steer_applied.control_id, "steer-1");
+        assert!(!steer_applied.ok);
+        assert_eq!(steer_applied.reason.as_deref(), Some("not-live"));
+    }
+
+    #[test]
     fn interrupt_lands_in_most_recent_still_open_tool_call() {
         let sink = MemorySink::default();
         let mut watchdog = watchdog();
@@ -709,6 +824,70 @@ mod tests {
                 .collect::<Vec<_>>(),
             [CONTROL_REQUESTED]
         );
+    }
+
+    #[test]
+    fn unknown_control_kind_is_rejected_without_appending() {
+        let sink = MemorySink::default();
+        let mut control = RunControl::new(
+            "run-1",
+            Some("session-1".to_owned()),
+            RunCaps::default(),
+            RecordingResumer::succeeding(),
+        );
+
+        let error = control
+            .steer(
+                request(
+                    "control-1",
+                    ControlKind::Unknown("teleport".to_owned()),
+                    None,
+                ),
+                &sink,
+            )
+            .expect_err("unknown kind must be rejected");
+
+        let ControlError::InvalidRequest(message) = error else {
+            panic!("expected request validation error");
+        };
+        assert!(message.contains("unknown value: teleport"));
+        assert!(sink.events().is_empty());
+    }
+
+    #[test]
+    fn steer_without_text_is_rejected_without_appending() {
+        let sink = MemorySink::default();
+        let mut control = RunControl::new(
+            "run-1",
+            Some("session-1".to_owned()),
+            RunCaps::default(),
+            RecordingResumer::succeeding(),
+        );
+
+        let error = control
+            .steer(request("control-1", ControlKind::Steer, None), &sink)
+            .expect_err("textless steer must be rejected");
+
+        assert!(matches!(error, ControlError::InvalidRequest(_)));
+        assert!(sink.events().is_empty());
+    }
+
+    #[test]
+    fn steer_with_empty_text_is_rejected_without_appending() {
+        let sink = MemorySink::default();
+        let mut control = RunControl::new(
+            "run-1",
+            Some("session-1".to_owned()),
+            RunCaps::default(),
+            RecordingResumer::succeeding(),
+        );
+
+        let error = control
+            .steer(request("control-1", ControlKind::Steer, Some("")), &sink)
+            .expect_err("empty steer must be rejected");
+
+        assert!(matches!(error, ControlError::InvalidRequest(_)));
+        assert!(sink.events().is_empty());
     }
 
     #[test]
