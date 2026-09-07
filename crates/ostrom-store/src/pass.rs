@@ -311,6 +311,8 @@ fn event_outcome(outcome: &str) -> EventRunOutcome {
     match outcome {
         "completed" => EventRunOutcome::Completed,
         "no-op" => EventRunOutcome::NoOp,
+        // The fact ledger calls a spend refusal held; ethogram calls it blocked.
+        "held" => EventRunOutcome::Blocked,
         "timed-out" => EventRunOutcome::TimedOut,
         "capped" => EventRunOutcome::Capped,
         "permission-denied" => EventRunOutcome::PermissionDenied,
@@ -321,6 +323,9 @@ fn event_outcome(outcome: &str) -> EventRunOutcome {
 }
 
 fn event_reason(outcome: EventRunOutcome, reason: Option<String>) -> Option<String> {
+    if outcome == EventRunOutcome::Blocked && reason.as_deref() == Some("daily-cap") {
+        return Some("budget".to_owned());
+    }
     reason.or_else(|| matches!(outcome, EventRunOutcome::Failed).then(|| "pass-failed".to_owned()))
 }
 
@@ -538,9 +543,27 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
             1,
         ));
     }
-    if daily_spend(&request.paths, &request.clock.date()) >= daily_cap() {
-        guard.outcome = Some("no-op".to_owned());
+    let spent = daily_spend(&request.paths, &request.clock.date());
+    let cap = daily_cap();
+    if spent >= cap {
+        guard.outcome = Some("held".to_owned());
         guard.reason = Some("daily-cap".to_owned());
+        let decision = crate::budget::decision_request(
+            &request.paths,
+            &request.clock,
+            cap,
+            &format!("{spent} USD spent"),
+        );
+        guard
+            .events
+            .request_decision(&request.paths, &guard.trace_time, &decision)
+            .map_err(|error| {
+                PassError::failed(
+                    request.role,
+                    format!("could not emit budget decision: {error}"),
+                    1,
+                )
+            })?;
         guard.finish()?;
         return Ok(());
     }

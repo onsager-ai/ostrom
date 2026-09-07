@@ -25,7 +25,9 @@ use crate::{
         ScopedAppTokenRequest, authenticated_output,
     },
     append_trace, configured_retention_days, environment, load_config_or_defaults, read_lease,
-    read_trace, sweep_worktrees,
+    read_trace,
+    run_events::{DISPATCH_RUN_ID, emit_decision_requests},
+    sweep_worktrees,
     work_order::{implementer_lease_ttl, in_flight_orders, reap_stale_work_orders},
 };
 
@@ -505,6 +507,24 @@ fn after_lease(
         .sum::<f64>();
     let projected = actual + reserved + context.order.cost();
     if projected > daily_cap {
+        let decision = crate::budget::decision_request(
+            &context.request.paths,
+            &context.request.clock,
+            daily_cap,
+            &format!("{} USD projected with this order", render_number(projected)),
+        );
+        emit_decision_requests(
+            &context.request.paths,
+            &context.request.clock.timestamp(),
+            DISPATCH_RUN_ID,
+            &[decision],
+        )
+        .map_err(|error| {
+            DispatchError::new(
+                3,
+                format!("ostrom dispatch: daily spend cap would be exceeded; could not emit budget decision: {error}"),
+            )
+        })?;
         return Err(DispatchError::new(
             3,
             format!(

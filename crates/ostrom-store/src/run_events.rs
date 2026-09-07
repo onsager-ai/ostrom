@@ -52,6 +52,7 @@ pub enum RunEventError {
 
 pub(crate) const SWEEP_RUN_ID: &str = "sweep";
 pub(crate) const GATE_RUN_ID: &str = "gate";
+pub(crate) const DISPATCH_RUN_ID: &str = "dispatch";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DecisionRequest {
@@ -62,7 +63,7 @@ pub(crate) struct DecisionRequest {
     pub subject: String,
 }
 
-/// Sweep and gate decisions use stable relay runs that remain open so a later
+/// Sweep, gate and dispatch decisions use stable relay runs that remain open so a later
 /// queue command can apply an answer on the run that owns the request.
 pub(crate) struct DecisionEmitter {
     sink: RunEventSink,
@@ -159,22 +160,31 @@ pub(crate) fn emit_decision_requests(
             continue;
         }
         emitter.request(request)?;
-        append_trace(
-            &paths.trace_file(),
-            &TraceAppend {
-                ts: timestamp.to_owned(),
-                kind: "decision-requested".to_owned(),
-                fact: Map::from_iter([
-                    ("decision_id".to_owned(), json!(&request.decision_id)),
-                    ("kind".to_owned(), json!(request.kind.as_str())),
-                    ("subject".to_owned(), json!(&request.subject)),
-                ]),
-                narration: Map::new(),
-            },
-        )?;
+        append_decision_fact(paths, timestamp, request)?;
         facts.insert(request.decision_id.clone(), signature);
     }
     Ok(())
+}
+
+fn append_decision_fact(
+    paths: &OstromPaths,
+    timestamp: &str,
+    request: &DecisionRequest,
+) -> Result<(), StoreError> {
+    append_trace(
+        &paths.trace_file(),
+        &TraceAppend {
+            ts: timestamp.to_owned(),
+            kind: "decision-requested".to_owned(),
+            fact: Map::from_iter([
+                ("decision_id".to_owned(), json!(&request.decision_id)),
+                ("kind".to_owned(), json!(request.kind.as_str())),
+                ("subject".to_owned(), json!(&request.subject)),
+            ]),
+            narration: Map::new(),
+        },
+    )
+    .map(|_| ())
 }
 
 #[derive(Debug)]
@@ -255,6 +265,17 @@ impl RunEventGuard {
 
     pub(crate) fn append(&self, draft: EventDraft) -> Result<Event, RunEventError> {
         self.sink.append(&self.run_id, draft).map_err(Into::into)
+    }
+
+    pub(crate) fn request_decision(
+        &self,
+        paths: &OstromPaths,
+        timestamp: &str,
+        request: &DecisionRequest,
+    ) -> Result<(), RunEventError> {
+        self.append(decision_request_draft(request)?)?;
+        append_decision_fact(paths, timestamp, request)?;
+        Ok(())
     }
 
     #[must_use]
