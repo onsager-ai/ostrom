@@ -1,0 +1,7 @@
+{"v":1,"type":"agent.started","runId":"capture-control-interrupt-fixture","seq":1,"ts":"2026-09-07T13:30:25.001Z","payload":{"model":"claude-haiku-4-5-20251001","sessionId":"9ea5c9f1-b23f-45f0-8824-4d8d9248c8cf"}}
+{"v":1,"type":"agent.tool_use","runId":"capture-control-interrupt-fixture","seq":2,"ts":"2026-09-07T13:30:28.682Z","payload":{"inputExcerpt":"{\"command\":\"sleep 300\",\"description\":\"Sleep for 5 minutes\"}","tool":"Bash","toolUseId":"toolu_01BG5x9iuSVKzZhYg7qmM5PJ","truncated":false}}
+{"v":1,"type":"control.requested","runId":"capture-control-interrupt-fixture","seq":3,"ts":"2026-09-07T13:30:28.683Z","payload":{"by":"capture-driver","controlId":"capture-steer-1","kind":"steer","text":"Continue with a short summary on the next turn.","truncated":false}}
+{"v":1,"type":"control.requested","runId":"capture-control-interrupt-fixture","seq":4,"ts":"2026-09-07T13:30:28.684Z","payload":{"by":"capture-driver","controlId":"capture-interrupt-1","kind":"interrupt"}}
+{"v":1,"type":"control.applied","runId":"capture-control-interrupt-fixture","seq":5,"ts":"2026-09-07T13:30:29.249Z","payload":{"controlId":"capture-interrupt-1","landedIn":"toolu_01BG5x9iuSVKzZhYg7qmM5PJ","ok":true}}
+{"v":1,"type":"control.applied","runId":"capture-control-interrupt-fixture","seq":6,"ts":"2026-09-07T13:30:29.252Z","payload":{"controlId":"capture-steer-1","ok":false,"reason":"not-live"}}
+{"v":1,"type":"run.finished","runId":"capture-control-interrupt-fixture","seq":7,"ts":"2026-09-07T13:30:29.253Z","payload":{"durationMs":7260,"estimated":true,"outcome":"interrupted"}}

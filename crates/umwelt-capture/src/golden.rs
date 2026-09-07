@@ -1,8 +1,12 @@
 //! Golden fixtures for normalisers.
 //!
-//! A case directory contains `raw.ndjson`, `expected.jsonl`, and `meta.toml`.
+//! A golden case directory contains `raw.ndjson`, `expected.jsonl`, and
+//! `meta.toml`.
 //! [`run_case`] always drives a fresh normaliser through both a slice source
 //! and a file source, then requires their canonical event bytes to agree.
+//! End-to-end capture directories instead contain `events.jsonl`; the corpus
+//! walker leaves those to their dedicated runtime-path tests because their
+//! event logs may include controls and deliberately end before the raw stream.
 //! Metadata supplies non-empty `harness`, `cli_version`, and `captured_at`
 //! strings plus a non-empty `exercises` string array. Other keys and sections
 //! are retained for human provenance and ignored by this secondary consumer.
@@ -26,6 +30,7 @@ pub const FIXED_TS: &str = "2000-01-01T00:00:00.000Z";
 
 const RAW_FILE: &str = "raw.ndjson";
 const EXPECTED_FILE: &str = "expected.jsonl";
+const CAPTURE_EVENTS_FILE: &str = "events.jsonl";
 const META_FILE: &str = "meta.toml";
 const REFUSES_DIRECTORY: &str = "refuses";
 
@@ -185,6 +190,10 @@ where
             .is_some_and(|name| name == REFUSES_DIRECTORY)
         {
             report.refusals += run_refusals(&path, &mut normaliser_factory)?;
+            continue;
+        }
+        if path.join(CAPTURE_EVENTS_FILE).is_file() && !path.join(EXPECTED_FILE).exists() {
+            read_metadata(path.join(META_FILE))?;
             continue;
         }
         run_case_with_factory(&path, &mut normaliser_factory)?;
