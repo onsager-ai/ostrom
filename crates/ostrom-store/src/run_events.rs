@@ -1,11 +1,14 @@
 //! Ethogram lifecycle emission through Umwelt's durable sink.
 
 use std::{
-    fs::{File, OpenOptions},
+    fs::File,
     io::Write,
     path::Path,
     sync::atomic::{AtomicU64, Ordering},
 };
+
+#[cfg(unix)]
+use std::fs::OpenOptions;
 
 use chrono::{DateTime, Utc};
 use ethogram::{
@@ -232,10 +235,8 @@ fn draft(payload_type: &str, payload: impl Serialize) -> Result<EventDraft, serd
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-
     #[cfg(unix)]
-    use std::{fs::OpenOptions, os::fd::AsRawFd};
+    use std::{fs, fs::OpenOptions, os::fd::AsRawFd};
 
     use chrono::{TimeZone, Utc};
     use ethogram::{RunFinishedPayload, RunKind, RunOutcome, RunStartedPayload};
