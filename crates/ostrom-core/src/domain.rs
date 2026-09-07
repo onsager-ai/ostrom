@@ -252,6 +252,8 @@ pub struct MandateConfig {
     pub provider: String,
     pub cadence_hours: u64,
     pub stuck_after_days: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_inbox_url: Option<String>,
     #[serde(default)]
     pub search_roots: Vec<String>,
     #[serde(default)]
