@@ -1,0 +1,38 @@
+{
+  "metadata": {
+    "number": 7,
+    "title": "Fixture repository change",
+    "author": { "login": "fixture-author" },
+    "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "labels": [],
+    "closingIssuesReferences": [],
+    "mergeable": "UNKNOWN",
+    "isDraft": false
+  },
+  "checks": {
+    "total_count": 1,
+    "check_runs": [
+      {
+        "name": "fixture-check",
+        "status": "completed",
+        "conclusion": "unrecognized",
+        "app": { "slug": "fixture-checks" }
+      }
+    ]
+  },
+  "status": { "total_count": 0, "statuses": [] },
+  "threads": {
+    "data": {
+      "repository": {
+        "pullRequest": {
+          "author": { "login": "fixture-author" },
+          "reviewThreads": {
+            "nodes": [],
+            "pageInfo": { "hasNextPage": false, "endCursor": null }
+          }
+        }
+      }
+    }
+  },
+  "identity": { "id": 42, "login": "fixture-principal" }
+}
