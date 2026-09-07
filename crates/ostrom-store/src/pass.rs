@@ -22,13 +22,13 @@ use umwelt_capture::{
 };
 use umwelt_runtime::{
     CapTrip, CapsWatchdog, ProcessExit, ResumeError, ResumedSession, RunCaps, RunControl,
-    SessionResumer, SystemClock,
+    SessionResumer, SinkFault, SystemClock,
 };
 
 use crate::{
-    Clock, LeaseActionError, OstromPaths, OwnedLease, PassState, RunEventGuard, RunEventStart,
-    SignalFlags, TraceAppend, append_trace, environment, generated_run_id, read_lease,
-    read_pass_state, read_trace, selection::dispatchability_snapshot, write_pass_state,
+    Clock, LeaseActionError, OstromPaths, OwnedLease, PassState, RunEventError, RunEventGuard,
+    RunEventStart, SignalFlags, TraceAppend, append_trace, environment, generated_run_id,
+    read_lease, read_pass_state, read_trace, selection::dispatchability_snapshot, write_pass_state,
 };
 
 pub const MAX_TURNS: &str = "200";
@@ -871,12 +871,20 @@ fn append_observed(
     drafts: Vec<EventDraft>,
 ) -> Result<Option<CapTrip>, PassError> {
     for draft in drafts {
-        let event = guard.events.append(draft).map_err(|error| {
-            PassError::failed(
-                guard.role,
-                format!("could not append captured agent event: {error}"),
-                1,
-            )
+        let source_type = draft.event_type.clone();
+        let event = guard.events.append(draft).or_else(|error| {
+            let refusal =
+                sink_refused_draft(guard.role, guard.events.run_id(), source_type, error)?;
+            // Validation refused before writing or consuming a sequence. Record
+            // the loss on this run and keep observing the remaining drafts.
+            // A failure to store the refusal still follows the existing error path.
+            guard.events.append(refusal).map_err(|error| {
+                PassError::failed(
+                    guard.role,
+                    format!("could not append captured agent event: {error}"),
+                    1,
+                )
+            })
         })?;
         if let Some(trip) = watchdog.observe(&event).map_err(|error| {
             PassError::failed(
@@ -889,6 +897,59 @@ fn append_observed(
         }
     }
     Ok(None)
+}
+
+fn sink_refused_draft(
+    role: PassRole,
+    run_id: &str,
+    source_type: String,
+    error: RunEventError,
+) -> Result<EventDraft, PassError> {
+    let mut payload = CaptureRefusedPayload {
+        cause: CaptureRefusalCause::Malformed,
+        source_run_id: run_id.to_owned(),
+        source_seq: None,
+        source_type: Some(source_type),
+        field: None,
+        count: None,
+        max: None,
+        detail: None,
+        truncated: None,
+        extra: PayloadExtension::new(),
+    };
+    match error {
+        RunEventError::Sink(SinkFault::OverBound {
+            path,
+            count,
+            max,
+            unit,
+        }) => {
+            payload.cause = CaptureRefusalCause::OverBound;
+            payload.field = path;
+            payload.count = Some(count as u64);
+            payload.max = Some(max as u64);
+            // Ethogram's extension preserves the sink's scalar/byte distinction.
+            payload.extra.insert("unit".to_owned(), json!(unit));
+        }
+        RunEventError::Sink(SinkFault::Invalid { path, detail }) => {
+            let detail = excerpt(&detail, MAX_EXCERPT_SCALARS);
+            payload.field = Some(path);
+            payload.detail = Some(detail.text);
+            payload.truncated = Some(detail.truncated);
+        }
+        error => {
+            return Err(PassError::failed(
+                role,
+                format!("could not append captured agent event: {error}"),
+                1,
+            ));
+        }
+    }
+    Ok(EventDraft {
+        event_type: CAPTURE_REFUSED.to_owned(),
+        payload: serde_json::to_value(payload).expect("capture.refused payload serialises"),
+        captured_at: None,
+    })
 }
 
 fn capture_refused_draft(run_id: &str, fault: &CaptureFault) -> EventDraft {
@@ -1295,6 +1356,215 @@ mod executable_tests {
     fn a_directory_is_not_an_executable_file() {
         let fixture = tempdir().expect("temporary directory");
         assert!(!is_executable_file(fixture.path()));
+    }
+}
+
+#[cfg(test)]
+mod sink_refusal_tests {
+    use ethogram::{
+        AGENT_TEXT, CAPTURE_REFUSED, EventDraft, MAX_EXCERPT_SCALARS, MAX_PAYLOAD_BYTES,
+        MAX_TEXT_SCALARS,
+    };
+    use serde_json::{Value, json};
+    use umwelt_runtime::{CapsWatchdog, FileSink, RunCaps, SinkFault, Source, SystemClock};
+
+    use super::{
+        Clock, OstromPaths, OwnedLease, PassError, PassGuard, PassRole, ProcessExit, RunEventError,
+        RunEventGuard, RunEventStart, RunKind, append_observed, read_trace, sink_refused_draft,
+    };
+
+    fn assert_refused_pass_finishes(payload: Value) -> Value {
+        let root = tempfile::tempdir().expect("temporary pass");
+        let paths = OstromPaths {
+            config: root.path().to_path_buf(),
+            state: root.path().to_path_buf(),
+        };
+        let clock = Clock::default();
+        let run_id = "sink-refusal-pass";
+        let events = RunEventGuard::start(
+            &paths,
+            None,
+            false,
+            clock.clone(),
+            RunEventStart {
+                run_id: run_id.to_owned(),
+                kind: RunKind::Loop,
+                actor: "builder".to_owned(),
+                harness: "claude".to_owned(),
+                model: None,
+                schedule: None,
+                repository: None,
+                work_order: None,
+                ceilings: None,
+            },
+        )
+        .expect("start real sink");
+        let mut watchdog = CapsWatchdog::start(
+            RunCaps::default(),
+            SystemClock::default(),
+            events.sink(),
+            run_id,
+        )
+        .expect("start watchdog");
+        let lease = OwnedLease::acquire(
+            &paths.state,
+            "builder-pass.lease",
+            run_id,
+            clock.epoch_seconds(),
+            60,
+        )
+        .expect("acquire pass lease");
+        let mut guard = PassGuard {
+            role: PassRole::Builder,
+            paths: paths.clone(),
+            lease,
+            owner: run_id.to_owned(),
+            started_epoch: clock.epoch_seconds(),
+            trace_time: clock.timestamp(),
+            started: true,
+            child_spawned: false,
+            outcome: None,
+            reason: None,
+            cost_usd: None,
+            clock,
+            dispatchability_hash: None,
+            queue_count: None,
+            dispatchable_count: None,
+            events,
+            control: None,
+            process_exit: ProcessExit::Normal,
+        };
+        let drafts = [payload, json!({"text": "still working"})]
+            .map(|payload| EventDraft {
+                event_type: AGENT_TEXT.to_owned(),
+                payload,
+                captured_at: None,
+            })
+            .to_vec();
+
+        // No synthetic SinkFault: the real FileSink must refuse the first
+        // draft, and append_observed must still process the next in the batch.
+        assert!(
+            append_observed(&guard, &mut watchdog, drafts)
+                .expect("observe drafts")
+                .is_none()
+        );
+        guard.finish().expect("pass finishes successfully");
+        let events = FileSink::new(paths.runs_dir())
+            .read_from(run_id, 0)
+            .expect("read durable events");
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            ["run.started", CAPTURE_REFUSED, AGENT_TEXT, "run.finished"]
+        );
+        assert_eq!(
+            events.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            [1, 2, 3, 4]
+        );
+        assert!(events.iter().all(|event| event.run_id == run_id));
+        assert_eq!(events[2].payload["text"], "still working");
+        assert_eq!(events[3].payload["outcome"], "completed");
+        let refusal = &events[1].payload;
+        assert_eq!(refusal["sourceRunId"], run_id);
+        assert_eq!(refusal["sourceType"], AGENT_TEXT);
+        assert!(refusal.get("sourceSeq").is_none());
+        let trace = read_trace(&paths.trace_file()).expect("read pass trace");
+        assert_eq!(trace.rows.len(), 1);
+        let ended = trace.rows[0].as_ref().expect("valid pass-ended fact");
+        assert_eq!(ended.kind, "pass-ended");
+        assert_eq!(ended.fact["outcome"], "completed");
+        assert!(!paths.state.join("builder-pass.lease").exists());
+        refusal.clone()
+    }
+
+    #[test]
+    fn over_bound_agent_text_is_refused_by_the_real_sink_and_the_pass_finishes() {
+        let count = MAX_TEXT_SCALARS + 1;
+        let refusal = assert_refused_pass_finishes(json!({"text": "🦀".repeat(count)}));
+        assert_eq!(refusal["cause"], "over_bound");
+        assert_eq!(refusal["field"], "payload.text");
+        assert_eq!(refusal["count"], count);
+        assert_eq!(refusal["max"], MAX_TEXT_SCALARS);
+        assert_eq!(refusal["unit"], "scalars");
+    }
+
+    #[test]
+    fn over_bound_payload_bytes_keep_their_unit_and_the_pass_finishes() {
+        let payload = json!({
+            "text": "within the scalar bound",
+            "chunks": vec!["x".repeat(MAX_TEXT_SCALARS); MAX_PAYLOAD_BYTES / MAX_TEXT_SCALARS + 1],
+        });
+        let bytes = serde_json::to_vec(&payload).expect("payload bytes").len();
+        assert!(bytes > MAX_PAYLOAD_BYTES);
+        let refusal = assert_refused_pass_finishes(payload);
+        assert_eq!(refusal["cause"], "over_bound");
+        assert!(refusal.get("field").is_none());
+        assert_eq!(refusal["count"], bytes);
+        assert_eq!(refusal["max"], MAX_PAYLOAD_BYTES);
+        assert_eq!(refusal["unit"], "bytes");
+    }
+
+    #[test]
+    fn invalid_agent_text_is_refused_by_the_real_sink_and_the_pass_finishes() {
+        let refusal = assert_refused_pass_finishes(json!({"text": false}));
+        assert_eq!(refusal["cause"], "malformed");
+        assert!(
+            refusal["detail"]
+                .as_str()
+                .expect("validation detail")
+                .contains("expected a string")
+        );
+        assert_eq!(refusal["truncated"], false);
+        assert!(refusal.get("count").is_none());
+        assert!(refusal.get("max").is_none());
+    }
+
+    #[test]
+    fn invalid_draft_detail_is_bounded_so_the_refusal_can_be_stored() {
+        let refusal = assert_refused_pass_finishes(json!({
+            "text": "valid text",
+            "truncated": "🦀".repeat(MAX_EXCERPT_SCALARS + 1),
+        }));
+        assert_eq!(refusal["cause"], "malformed");
+        assert_eq!(refusal["truncated"], true);
+        assert_eq!(
+            refusal["detail"]
+                .as_str()
+                .expect("bounded detail")
+                .chars()
+                .count(),
+            MAX_EXCERPT_SCALARS
+        );
+    }
+
+    #[test]
+    fn existing_sink_faults_still_fail_the_pass_with_the_original_diagnostic() {
+        for fault in [
+            SinkFault::Gap {
+                expected: 2,
+                got: 3,
+            },
+            SinkFault::Duplicate(1),
+            SinkFault::Finished,
+            SinkFault::Io("disk full".to_owned()),
+            SinkFault::Malformed {
+                line: 2,
+                message: "torn line".to_owned(),
+            },
+        ] {
+            let error = RunEventError::Sink(fault);
+            let expected = format!("could not append captured agent event: {error}");
+            let error =
+                sink_refused_draft(PassRole::Gatekeeper, "pass", AGENT_TEXT.to_owned(), error)
+                    .expect_err("existing fault remains fatal");
+            assert_eq!(error.exit_code(), 1);
+            assert!(
+                matches!(error, PassError::Failed { role: "gatekeeper", message, code: 1 } if message == expected)
+            );
+        }
     }
 }
 

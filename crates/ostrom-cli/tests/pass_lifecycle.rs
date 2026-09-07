@@ -26,6 +26,19 @@ fn stream_script(stream: &str) -> String {
     format!("printf '%s' '{stream}'")
 }
 
+fn stream_script_with_work(stream: &str) -> String {
+    let started = json!({
+        "ts": "2026-08-01T00:00:00Z",
+        "kind": "pass-started",
+        "fact": {"owner": "builder-inner-wake1"},
+        "narration": {},
+    });
+    format!(
+        "printf '%s\\n' '{started}' >>\"$OSTROM_HOME/sprint.jsonl\"\n{}",
+        stream_script(stream)
+    )
+}
+
 struct Fixture {
     root: TempDir,
     state: PathBuf,
@@ -305,6 +318,124 @@ fn malformed_capture_line_is_refused_without_failing_the_pass() {
             .filter(|event| event["type"] == "run.finished")
             .count(),
         1
+    );
+}
+
+#[test]
+fn over_bound_agent_text_draft_is_refused_without_failing_the_pass() {
+    // The normaliser bounds text but preserves parentToolUseId. This produces
+    // an agent.text draft that only the real sink's validation will refuse.
+    let count = ethogram::MAX_TEXT_SCALARS + 1;
+    let frame = json!({
+        "type": "assistant",
+        "parent_tool_use_id": "🦀".repeat(count),
+        "message": {"content": [{"type": "text", "text": "observed message"}]},
+    });
+    let stream = CLAUDE_STREAM_JSON.replacen('\n', &format!("\n{frame}\n"), 1);
+    let fixture = Fixture::new(&stream_script_with_work(&stream));
+    let output = fixture.command().output().expect("run over-bound capture");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fixture.transcript_bytes(), stream.as_bytes());
+    let events = fixture.run_events();
+    let refusals = events
+        .iter()
+        .filter(|event| event["type"] == "capture.refused")
+        .collect::<Vec<_>>();
+    assert_eq!(refusals.len(), 1);
+    let refusal = &refusals[0]["payload"];
+    assert_eq!(refusal["cause"], "over_bound");
+    assert_eq!(refusal["sourceRunId"], events[0]["runId"]);
+    assert_eq!(refusal["sourceType"], "agent.text");
+    assert_eq!(refusal["field"], "payload.parentToolUseId");
+    assert_eq!(refusal["count"], count);
+    assert_eq!(refusal["max"], ethogram::MAX_TEXT_SCALARS);
+    assert_eq!(refusal["unit"], "scalars");
+    assert!(!events.iter().any(|event| event["type"] == "agent.text"));
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == "agent.completed")
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "run.finished")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events.last().expect("terminal event")["payload"]["outcome"],
+        "completed"
+    );
+    fixture.assert_released();
+    assert_eq!(
+        fixture.trace().last().expect("pass-ended")["fact"]["outcome"],
+        "completed"
+    );
+}
+
+#[test]
+fn invalid_normalised_draft_is_refused_without_failing_the_pass() {
+    // A u64 is accepted by the normaliser, but this exceeds ethogram's wire
+    // safe-integer bound and must be rejected by the sink as Invalid.
+    let valid_result = CLAUDE_STREAM_JSON.lines().last().expect("result frame");
+    let invalid_result =
+        valid_result.replace("\"num_turns\":1", &format!("\"num_turns\":{}", u64::MAX));
+    let stream =
+        CLAUDE_STREAM_JSON.replace(valid_result, &format!("{invalid_result}\n{valid_result}"));
+    let fixture = Fixture::new(&stream_script_with_work(&stream));
+    let output = fixture
+        .command()
+        .output()
+        .expect("run invalid draft capture");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events = fixture.run_events();
+    let refusals = events
+        .iter()
+        .filter(|event| event["type"] == "capture.refused")
+        .collect::<Vec<_>>();
+    assert_eq!(refusals.len(), 1);
+    let refusal = &refusals[0]["payload"];
+    assert_eq!(refusal["cause"], "malformed");
+    assert_eq!(refusal["sourceRunId"], events[0]["runId"]);
+    assert_eq!(refusal["sourceType"], "agent.completed");
+    assert_eq!(refusal["field"], "payload.turns");
+    assert!(
+        refusal["detail"]
+            .as_str()
+            .expect("validation detail")
+            .contains("safe integer bound")
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "agent.completed")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "run.finished")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events.last().expect("terminal event")["payload"]["outcome"],
+        "completed"
+    );
+    fixture.assert_released();
+    assert_eq!(
+        fixture.trace().last().expect("pass-ended")["fact"]["outcome"],
+        "completed"
     );
 }
 
