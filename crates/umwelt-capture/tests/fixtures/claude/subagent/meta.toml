@@ -1,63 +1,14 @@
-harness = "claude-code"
+harness = "claude"
 cli_version = "2.1.263"
-captured_at = "2026-09-07"
-model = "claude-haiku-4-5-20251001"
-command = "claude -p --output-format stream-json --verbose --model haiku --allowedTools Task Bash"
-prompt_source = "stdin"
-events = 37
+capture_date = "2026-09-07"
+exercises = "init and repeated result frames, text, three paired tool calls, and parentToolUseId on sub-agent drafts"
 
-exercises = [
-  "system/init, assistant text, tool_use/tool_result pairs with matching ids",
-  "a sub-agent: 4 events carry a non-null parent_tool_use_id",
-  "a result frame with usage, cost, turns and duration",
-]
-
-[scrub]
-narration = "replaced, exact length preserved (text and thinking blocks)"
-ids = "real (session_id, toolu_*, parent_tool_use_id)"
-paths = "absolute paths rewritten under /workspace; socket paths neutralised"
-
-[notes]
-spawning_tool = "named `Agent`, not `Task`, in 2.1.263. Correlation is via parent_tool_use_id either way."
-repeated_terminal = "This ONE session emitted TWO result frames and TWO system/init frames under one session_id. Both results carry the IDENTICAL total_cost_usd (0.09765190000000001) but different num_turns (3 vs 1) and duration_ms (12357 vs 1664); the two inits advertise different tool counts (136 vs 181). The cost is a session-level total repeated per frame, so a consumer that SUMS reports twice the money — see onsager-ai/chreode#475."
-open_question = "Which frame's num_turns and duration_ms describe the run. The capture does not settle it and it has deliberately not been guessed."
-unknown_system_subtypes = "thinking_tokens, background_tasks_changed, task_started, task_progress, task_updated, task_notification, plus a top-level rate_limit_event. chreode drops unknown system subtypes silently."
-
-[chreode_output]
-file = "chreode-output.jsonl"
-what = "Output of chreode's claude normaliser over raw.ndjson. Kept for DIFFING against umwelt's normaliser. It is NOT an expectation and must not be adopted as expected.jsonl."
-correct_for_this_harness = true  # unlike the codex case, chreode's claude normaliser is not known-broken
-
-# READ THIS BEFORE SUMMING ANYTHING IN THAT FILE.
-caveat = """
-It contains TWO agent.started and TWO agent.completed for this one session,
-because the harness emitted two init frames and two result frames. The events
-are not wrong. But the two completions are NOT additive:
-
-  costUsd=0.09765190000000001  turns=3  durationMs=12357  sessionId=<absent>
-  costUsd=0.09765190000000001  turns=1  durationMs=1664   sessionId=<absent>
-
-Under the accumulation semantics ethogram ruled on 2026-09-07 (ethogram#6),
-costUsd and usage on agent.completed are CUMULATIVE for the session named by
-sessionId; a consumer takes the MAXIMUM across agent.completed events sharing a
-sessionId and sums only across DISTINCT sessionIds. turns and durationMs are
-per-invocation.
-
-So the run's cost here is 0.09765190000000001, not the sum 0.1953038.
-
-Note sessionId is ABSENT from these payloads, and NOT merely because chreode
-fails to emit it. As of ethogram main 2ac51cd, AgentCompletedPayload is
-stage/turns/costUsd/model/usage/durationMs/estimated/extra -- there is no
-session field to emit, while AgentStartedPayload does have one. The ruling in
-ethogram#6's comments adopted it; nothing has shipped it, and there are no open
-PRs. So a reader who sets out to "fix" a producer will find nowhere in the
-ethogram vocabulary to put it.
-
-chreode is a partial exception worth stating precisely: it has NOT adopted
-ethogram's package yet (that is chreode#470, parked), so its own agent.completed
-payload is chreode's to extend additively, and chreode#475 can be fixed properly
-rather than by inference. A consumer of ethogram's types cannot do the same
-until the field ships there.
-
-Either way, a reader who sums what this file shows lands exactly in chreode#475.
-"""
+# Model: claude-haiku-4-5-20251001.
+# Command: claude -p --output-format stream-json --verbose --model haiku
+#          --allowedTools Task Bash; prompt supplied on stdin; 37 raw frames.
+# Narration and thinking were replaced at exact length. IDs and correlations
+# are real; absolute paths were rewritten under /workspace.
+# The Agent tool launches the sub-agent in 2.1.263. One session emitted two
+# init and two result frames. Both results repeat the same session-cumulative
+# cost, while turns and durations are per invocation. chreode-output.jsonl is
+# prior art for diffing only, not the expectation.

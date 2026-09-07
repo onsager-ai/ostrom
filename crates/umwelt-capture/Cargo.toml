@@ -8,10 +8,13 @@ rust-version.workspace = true
 
 [dependencies]
 ethogram.workspace = true
+indexmap.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+ethogram-corpus.workspace = true
 tempfile.workspace = true
 
 [lints]

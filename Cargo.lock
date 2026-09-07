@@ -82,9 +82,18 @@ dependencies = [
 [[package]]
 name = "ethogram"
 version = "0.1.0"
-source = "git+https://github.com/onsager-ai/ethogram?rev=00b31a787b8dfc1113f1117d15b4cac43443affb#00b31a787b8dfc1113f1117d15b4cac43443affb"
+source = "git+https://github.com/onsager-ai/ethogram?rev=26152cebeff4b71c33f855c4de548244f11c21fe#26152cebeff4b71c33f855c4de548244f11c21fe"
 dependencies = [
  "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "ethogram-corpus"
+version = "0.1.0"
+source = "git+https://github.com/onsager-ai/ethogram?rev=26152cebeff4b71c33f855c4de548244f11c21fe#26152cebeff4b71c33f855c4de548244f11c21fe"
+dependencies = [
+ "ethogram",
  "serde_json",
 ]
 
@@ -397,6 +406,9 @@ name = "umwelt-capture"
 version = "0.1.0"
 dependencies = [
  "ethogram",
+ "ethogram-corpus",
+ "indexmap",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",

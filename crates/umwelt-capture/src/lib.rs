@@ -3,6 +3,7 @@
 //! This crate translates streams; it does not classify, score, or judge what
 //! their contents mean.
 
+pub mod claude;
 mod fault;
 pub mod golden;
 mod source;
