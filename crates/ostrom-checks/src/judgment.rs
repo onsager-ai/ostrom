@@ -276,7 +276,9 @@ mod tests {
         RunnerStamp, resolve_check,
     };
     use serde_json::json;
-    use umwelt_runtime::{AgentRunner, ClaudeHarness, RunOutcome, RunRequest};
+    use umwelt_runtime::{
+        AgentRunner, CapSupport, ClaudeHarness, ProcessOutcome as RunOutcome, RunRequest,
+    };
 
     use super::*;
 
@@ -297,6 +299,10 @@ mod tests {
 
         fn default_model(&self) -> &str {
             "fixture-model"
+        }
+
+        fn enforceable_caps(&self) -> CapSupport {
+            CapSupport::none()
         }
     }
 
@@ -667,7 +673,7 @@ checks:
             model: "fixture-model".to_owned(),
             profile: profile.clone(),
             permission_mode: "auto".to_owned(),
-            ceilings: umwelt_runtime::RunCeilings::default(),
+            ceilings: umwelt_runtime::LoopCeilings::default(),
             transcript,
         });
 
@@ -712,6 +718,10 @@ checks:
 
         fn default_model(&self) -> &str {
             "fixture-model"
+        }
+
+        fn enforceable_caps(&self) -> CapSupport {
+            CapSupport::none()
         }
     }
 

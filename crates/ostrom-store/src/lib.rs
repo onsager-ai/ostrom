@@ -96,14 +96,12 @@ pub use trace::{
     MalformedTraceRow, TraceActionError, TraceFactRecord, TraceRead, TraceView,
     append_trace_checked, read_trace, read_trace_json,
 };
-pub use umwelt_edge::append_trace;
-pub use umwelt_edge::{read_pass_state, write_pass_state};
+pub use umwelt_edge::{TraceAppend, append_trace, read_pass_state, write_pass_state};
 pub use umwelt_runtime::PassState;
-pub use umwelt_runtime::TraceAppend;
 pub use umwelt_runtime::{
-    ActionFault, AgentRegistry, AgentRunner, CodexHarness, Harness, ImplementerRunRequest,
-    OrchestratorRunRequest, RunCeilings, RunOutcome, RunRequest, RunTermination, RunnerLaunch,
-    SignalFlags,
+    ActionFault, AgentRegistry, AgentRunner, CapSupport, CodexHarness, Harness,
+    ImplementerRunRequest, LoopCeilings as RunCeilings, OrchestratorRunRequest,
+    ProcessOutcome as RunOutcome, RunCaps, RunRequest, RunTermination, RunnerLaunch, SignalFlags,
 };
 pub use work_order::{
     ClearedWorkOrder, CreatedWorkOrder, WorkOrderError, branch_name, clear_work_order,
