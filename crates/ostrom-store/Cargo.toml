@@ -14,6 +14,7 @@ base64.workspace = true
 chrono.workspace = true
 directories.workspace = true
 ethogram.workspace = true
+ethogram-decisions.workspace = true
 indexmap.workspace = true
 ostrom-core = { path = "../ostrom-core" }
 reqwest.workspace = true

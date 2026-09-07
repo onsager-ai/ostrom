@@ -343,6 +343,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ethogram"
+version = "0.1.0"
+source = "git+https://github.com/onsager-ai/ethogram?rev=b18787085a017b239fbfb65fbcdc70f7a406598a#b18787085a017b239fbfb65fbcdc70f7a406598a"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -884,7 +893,7 @@ dependencies = [
  "chrono",
  "clap",
  "directories",
- "ethogram",
+ "ethogram 0.1.0 (git+https://github.com/onsager-ai/ethogram?rev=a6160280a17cb80d96f3b9c5daf01655c9a56af0)",
  "ostrom-checks",
  "ostrom-core",
  "ostrom-store",
@@ -919,7 +928,8 @@ dependencies = [
  "base64",
  "chrono",
  "directories",
- "ethogram",
+ "ethogram 0.1.0 (git+https://github.com/onsager-ai/ethogram?rev=a6160280a17cb80d96f3b9c5daf01655c9a56af0)",
+ "ethogram 0.1.0 (git+https://github.com/onsager-ai/ethogram?rev=b18787085a017b239fbfb65fbcdc70f7a406598a)",
  "indexmap",
  "ostrom-core",
  "regex",
@@ -1749,7 +1759,7 @@ name = "umwelt-capture"
 version = "0.1.0"
 source = "git+https://github.com/onsager-ai/umwelt.git?rev=4a86181#4a8618184aadd9b1574e84aa04a051c69eb60127"
 dependencies = [
- "ethogram",
+ "ethogram 0.1.0 (git+https://github.com/onsager-ai/ethogram?rev=a6160280a17cb80d96f3b9c5daf01655c9a56af0)",
  "indexmap",
  "serde",
  "serde_json",
@@ -1763,7 +1773,7 @@ version = "0.1.0"
 source = "git+https://github.com/onsager-ai/umwelt.git?rev=4a86181#4a8618184aadd9b1574e84aa04a051c69eb60127"
 dependencies = [
  "chrono",
- "ethogram",
+ "ethogram 0.1.0 (git+https://github.com/onsager-ai/ethogram?rev=a6160280a17cb80d96f3b9c5daf01655c9a56af0)",
  "indexmap",
  "serde",
  "serde_json",

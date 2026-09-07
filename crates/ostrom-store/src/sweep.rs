@@ -6,9 +6,10 @@ use std::{
 };
 
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
+use ethogram_decisions::DecisionKind;
 use ostrom_core::{
-    DefaultDisposition, GateConfig, MandateConfig, ProjectMandate, PublicationSource,
-    RepositoryName, Selector, WorkNodeInput, build_work_graph,
+    DecisionOption, DefaultDisposition, Dossier, GateConfig, MandateConfig, ProjectMandate,
+    PublicationSource, RepositoryName, Selector, WorkNodeInput, build_work_graph, sha256_hex,
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -25,6 +26,7 @@ use crate::{
     io_error,
     publish::{JsonlPublicationSource, PublishOptions, PublishOutcome, publish},
     read_queue, read_trace,
+    run_events::{DecisionRequest, RunEventError, SweepDecisionEmitter},
     selector::{SelectorCandidate, glob_match, selector_match},
     set_private_file_mode, write_queue,
 };
@@ -87,6 +89,8 @@ pub enum SweepError {
     Publish(#[from] PublishError),
     #[error(transparent)]
     Store(#[from] StoreError),
+    #[error(transparent)]
+    RunEvent(#[from] RunEventError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -519,6 +523,12 @@ fn run_sweep_with_minter_and_publication_source(
     }
     new_state["dependency_graph"] =
         serde_json::to_value(graph).expect("work dependency graph serializes");
+    let decision_requests = final_rows
+        .iter()
+        .filter(|row| string_field(row.value(), &["state"]) == "pending")
+        .filter_map(|row| queue_decision_request(row.value()))
+        .collect::<Vec<_>>();
+    emit_decision_requests(&options.paths, &decision_requests)?;
     backup_previous_sweep(&options.paths)?;
     write_queue(&options.paths.queue_file(), &final_rows)?;
     write_json_private(&state_path, &new_state)?;
@@ -1910,12 +1920,7 @@ fn queue_row(
     let mandate = if kind == "tripwire" {
         json!({
             "reason": reason,
-            "dossier": {
-                "question": format!("May {}{} cross the matched mandate tripwire?", item.item.repo, item.item.reference),
-                "options_ruled_out": ["Auto-proceed — a tripwire requires human judgment."],
-                "recommended_action": format!("Review {}{}, then approve, reject, or defer it with `ostrom queue`.", item.item.repo, item.item.reference),
-                "blast_radius": format!("{}{} only.", item.item.repo, item.item.reference),
-            }
+            "dossier": tripwire_dossier(&item.item.id),
         })
     } else {
         json!({"reason": reason})
@@ -1941,6 +1946,76 @@ fn queue_row(
         "needs_judgment": matches!(kind, "tripwire" | "decision"),
         "blocked_by": item.item.blocked_by,
     })
+}
+
+fn tripwire_dossier(subject: &str) -> Dossier {
+    Dossier {
+        question: format!("May {subject} cross the matched mandate tripwire?"),
+        options_ruled_out: vec!["Auto-proceed — a tripwire requires human judgment.".to_owned()],
+        recommended_action: format!(
+            "Review {subject}, then approve, reject, or defer it with `ostrom queue`."
+        ),
+        blast_radius: format!("{subject} only."),
+    }
+}
+
+fn queue_decision_request(row: &Value) -> Option<DecisionRequest> {
+    let queue_kind = string_field(row, &["kind"]);
+    if matches!(queue_kind, "stuck" | "drift") {
+        return None;
+    }
+    if row.get("needs_judgment").and_then(Value::as_bool) != Some(true)
+        && !matches!(queue_kind, "unexplained-write" | "merge-gate-fault")
+    {
+        return None;
+    }
+    let subject = nonempty_string(row, &["id"])?;
+    let reason = row
+        .pointer("/mandate/reason")
+        .and_then(Value::as_str)
+        .unwrap_or("human judgment is required");
+    let dossier = if queue_kind == "tripwire" {
+        tripwire_dossier(subject)
+    } else {
+        Dossier {
+            question: format!("May {subject} proceed past this {queue_kind}?"),
+            options_ruled_out: vec![format!(
+                "Auto-proceed — {queue_kind} requires human judgment."
+            )],
+            recommended_action: format!(
+                "Review {subject}, then approve, reject, or defer it with `ostrom queue`."
+            ),
+            blast_radius: format!("{subject} only."),
+        }
+    };
+    let identity = format!("tripwire\0{subject}\0{queue_kind}\0{reason}");
+    Some(DecisionRequest {
+        decision_id: format!("tripwire-{}", sha256_hex(identity.as_bytes())),
+        kind: DecisionKind::Tripwire,
+        dossier,
+        options: ["approve", "reject", "defer"]
+            .into_iter()
+            .map(|value| DecisionOption {
+                id: value.to_owned(),
+                label: value.to_owned(),
+            })
+            .collect(),
+        subject: subject.to_owned(),
+    })
+}
+
+fn emit_decision_requests(
+    paths: &OstromPaths,
+    requests: &[DecisionRequest],
+) -> Result<(), RunEventError> {
+    if requests.is_empty() {
+        return Ok(());
+    }
+    let emitter = SweepDecisionEmitter::new(paths)?;
+    for request in requests {
+        emitter.request(request)?;
+    }
+    Ok(())
 }
 
 fn queue_item_type(item: &NormalizedItem) -> &'static str {
@@ -3684,6 +3759,7 @@ mod tests {
     use std::{env, os::unix::fs::PermissionsExt, process::Output};
 
     use tempfile::tempdir;
+    use umwelt_runtime::Source;
 
     use super::*;
     use crate::{
@@ -3836,6 +3912,146 @@ mod tests {
         queue
             .iter()
             .find(|row| row.get("id").and_then(Value::as_str) == Some(id.as_str()))
+    }
+
+    #[test]
+    fn decision_fixture_roster_emits_only_the_three_permission_boundaries() {
+        let home = tempdir().expect("temporary decision fixture home");
+        let paths = repair_test_paths(home.path());
+        let mandates = include_str!("../tests/fixtures/decision-events/mandates.yaml");
+        fs::write(home.path().join("mandates.yaml"), mandates)
+            .expect("write decision fixture mandates");
+        let config = MandateConfig::from_yaml(mandates).expect("parse decision fixture mandates");
+        let project = config.projects.first().expect("one fixture project");
+        let selector_hash = selector_hash(&config, project).expect("fixture selector hash");
+        fs::write(
+            home.path().join("state.json"),
+            serde_json::to_vec(&json!({
+                "version": 2,
+                "repos": {
+                    "fixture-org/decisions": {
+                        "cursor": "2026-09-06T00:00:00Z",
+                        "selector_hash": selector_hash,
+                        "items": {
+                            "fixture-org/decisions#3": {
+                                "first_seen": "2026-08-01T00:00:00Z",
+                                "stuck": false
+                            }
+                        },
+                        "records": {}
+                    }
+                }
+            }))
+            .expect("serialize fixture state"),
+        )
+        .expect("write decision fixture state");
+        let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/decision-events/roster.json");
+
+        run_sweep(&SweepOptions {
+            working_directory: home.path().to_path_buf(),
+            executable: home.path().join("unused-ostrom"),
+            plugin_root: home.path().to_path_buf(),
+            paths: paths.clone(),
+            started_at: "2026-09-07T12:00:00Z"
+                .parse()
+                .expect("valid fixture sweep time"),
+            requested_mode: SweepMode::Full,
+            fixture: Some(fixture_path),
+            publish: PublishTarget::Disabled,
+            policy: None,
+        })
+        .expect("decision fixture sweep succeeds");
+
+        let queue = read_queue(&paths.queue_file()).expect("read decision fixture queue");
+        assert_eq!(
+            queue
+                .iter()
+                .filter(|row| string_field(row.value(), &["kind"]) == "stuck")
+                .count(),
+            1,
+            "the fixture must exercise the negative admission case"
+        );
+        let decisions = umwelt_runtime::FileSink::new(paths.runs_dir())
+            .read_from(crate::run_events::SWEEP_RUN_ID, 0)
+            .expect("read emitted decision events")
+            .into_iter()
+            .filter(|event| event.event_type == ethogram_decisions::DECISION_REQUESTED)
+            .collect::<Vec<_>>();
+        assert_eq!(decisions.len(), 3);
+        assert_eq!(
+            decisions
+                .iter()
+                .filter_map(|event| event.payload.get("subject").and_then(Value::as_str))
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "fixture-org/decisions#1",
+                "fixture-org/decisions#2",
+                "fixture-org/decisions@refs/heads/ostrom/unexplained-fixture",
+            ])
+        );
+        assert!(decisions.iter().all(|event| {
+            !event.payload.as_object().unwrap().contains_key("onTimeout")
+                && ethogram_decisions::validate(&event.event_type, &event.payload).is_ok()
+        }));
+        assert!(decisions.iter().all(|event| {
+            event.payload.get("subject").and_then(Value::as_str) != Some("fixture-org/decisions#3")
+        }));
+        for event in &decisions {
+            let subject = event.payload["subject"].as_str().expect("fixture subject");
+            let expected = match subject {
+                "fixture-org/decisions#1" => {
+                    include_str!("../tests/fixtures/decision-events/expected/tripwire.json")
+                }
+                "fixture-org/decisions#2" => {
+                    include_str!("../tests/fixtures/decision-events/expected/unclassified.json")
+                }
+                "fixture-org/decisions@refs/heads/ostrom/unexplained-fixture" => include_str!(
+                    "../tests/fixtures/decision-events/expected/unexplained-write.json"
+                ),
+                other => panic!("unexpected decision fixture subject {other}"),
+            };
+            let mut emitted = serde_json::to_value(event).expect("serialize emitted fixture");
+            emitted["ts"] = json!("2030-01-02T03:04:05.000Z");
+            assert_eq!(
+                serde_json::to_string(&emitted).expect("encode normalized fixture"),
+                expected.trim()
+            );
+            let parsed = ethogram_decisions::parse_event(expected.trim())
+                .expect("fixture parses against the current SDK");
+            ethogram_decisions::validate(&parsed.event_type, &parsed.payload)
+                .expect("fixture validates against the current SDK");
+        }
+    }
+
+    #[test]
+    fn decision_admission_is_authority_not_general_attention() {
+        let row = |kind: &str, needs_judgment: bool| {
+            json!({
+                "id": format!("fixture-org/decisions@{kind}"),
+                "kind": kind,
+                "needs_judgment": needs_judgment,
+                "mandate": {"reason": format!("fixture {kind}")},
+            })
+        };
+        for (kind, needs_judgment) in [
+            ("tripwire", true),
+            ("decision", true),
+            ("unexplained-write", false),
+            ("merge-gate-fault", false),
+        ] {
+            let request = queue_decision_request(&row(kind, needs_judgment))
+                .unwrap_or_else(|| panic!("{kind} must cross the authority boundary"));
+            assert_eq!(request.kind, DecisionKind::Tripwire);
+        }
+        for kind in ["stuck", "drift"] {
+            for needs_judgment in [false, true] {
+                assert!(
+                    queue_decision_request(&row(kind, needs_judgment)).is_none(),
+                    "{kind} is always a fact, even if a legacy row says it needs judgment"
+                );
+            }
+        }
     }
 
     #[test]

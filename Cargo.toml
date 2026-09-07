@@ -21,6 +21,7 @@ clap = { version = "4.5.45", features = ["derive"] }
 base64 = "=0.22.1"
 directories = "6.0.0"
 ethogram = { git = "https://github.com/onsager-ai/ethogram", rev = "a6160280a17cb80d96f3b9c5daf01655c9a56af0" }
+ethogram-decisions = { package = "ethogram", git = "https://github.com/onsager-ai/ethogram", rev = "b18787085a017b239fbfb65fbcdc70f7a406598a" }
 indexmap = "2"
 regex = "=1.12.3"
 rsa = { version = "=0.9.8", features = ["sha2"] }
