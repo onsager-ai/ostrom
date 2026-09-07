@@ -232,6 +232,11 @@ pub const OSTROM_EVENTS_FD: EnvironmentVariable = variable(
     EnvironmentClass::Location,
     "no live event descriptor",
 );
+pub const OSTROM_CONTROL_FD: EnvironmentVariable = variable(
+    "OSTROM_CONTROL_FD",
+    EnvironmentClass::Location,
+    "no inbound control descriptor",
+);
 pub const OSTROM_FACTS_ONLY: EnvironmentVariable = variable(
     "OSTROM_FACTS_ONLY",
     EnvironmentClass::Switch,
@@ -291,6 +296,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvironmentVariable] = &[
     MANDATE_WORKTREE_RETENTION_DAYS,
     NVM_DIR,
     OSTROM_ACTOR,
+    OSTROM_CONTROL_FD,
     OSTROM_EVENTS_FD,
     OSTROM_FACTS_ONLY,
     OSTROM_HOME,

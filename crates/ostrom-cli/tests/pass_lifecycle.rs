@@ -2,9 +2,10 @@
 
 use std::{
     env, fs,
+    io::Write,
     os::unix::fs::{PermissionsExt, symlink},
     path::{Path, PathBuf},
-    process::{Child, Command, ExitStatus},
+    process::{Child, Command, ExitStatus, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -233,6 +234,433 @@ fn events_fd_environment_streams_the_durable_bytes() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(output.stdout, fixture.run_event_bytes());
+}
+
+fn control_request(kind: &str, by: &str) -> Value {
+    let mut payload = json!({"controlId": "supervisor-control", "kind": kind, "by": by});
+    if kind == "steer" {
+        payload["text"] = "Please use the next turn for this instruction".into();
+    }
+    json!({"type": "control.requested", "payload": payload})
+}
+
+fn wait_for_run_event(fixture: &Fixture, event_type: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if let Ok(directories) = fs::read_dir(fixture.state.join("runs")) {
+            for directory in directories.flatten() {
+                if let Ok(bytes) = fs::read_to_string(directory.path().join("events.jsonl")) {
+                    for event in bytes
+                        .lines()
+                        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                    {
+                        if event["type"] == event_type {
+                            return event;
+                        }
+                    }
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!("timed out waiting for {event_type}");
+}
+
+fn finish_control_pass(child: Child) -> std::process::Output {
+    // A timeout fails the test and cleans up the supervised process group.
+    let mut child = child;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while child.try_wait().expect("probe pass").is_none() {
+        if Instant::now() >= deadline {
+            signal(child.id(), "TERM");
+            let _ = child.wait();
+            panic!("control pass did not finish");
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    child.wait_with_output().expect("collect control pass")
+}
+
+fn assert_one_terminal(events: &[Value], outcome: &str) {
+    let finished = events
+        .iter()
+        .filter(|event| event["type"] == "run.finished")
+        .collect::<Vec<_>>();
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0]["payload"]["outcome"], outcome);
+    assert_eq!(events.last().expect("last event")["type"], "run.finished");
+}
+
+#[test]
+fn control_fd_interrupt_lands_in_the_open_call_and_the_flag_wins() {
+    let stream = CLAUDE_STREAM_JSON
+        .lines()
+        .take(2)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let fixture = Fixture::new(&format!("{}\nexec sleep 30", stream_script(&stream)));
+    let mut child = fixture
+        .command()
+        .args(["--control-fd", "0", "--events-fd", "1"])
+        .env("OSTROM_CONTROL_FD", "not-a-descriptor")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start controlled pass");
+    let mut input = child.stdin.take().expect("control pipe");
+    wait_for_run_event(&fixture, "agent.tool_use");
+    let by = "unfamiliar supervisor / 任意 identity";
+    writeln!(input, "{}", control_request("interrupt", by)).expect("send interrupt");
+    let output = finish_control_pass(child);
+    assert_eq!(output.status.code(), Some(130));
+    assert_eq!(output.stdout, fixture.run_event_bytes());
+    let events = fixture.run_events();
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "run.started",
+            "agent.started",
+            "agent.tool_use",
+            "control.requested",
+            "control.applied",
+            "run.finished"
+        ]
+    );
+    assert_eq!(events[3]["payload"]["by"], by);
+    assert_eq!(events[4]["payload"]["by"], by);
+    assert_eq!(events[4]["payload"]["controlId"], "supervisor-control");
+    assert_eq!(events[4]["payload"]["ok"], true);
+    assert_eq!(events[4]["payload"]["landedIn"], "tool-fixture");
+    assert_eq!(events[5]["payload"]["by"], by);
+    assert_one_terminal(&events, "interrupted");
+    fixture.assert_released();
+    assert_eq!(
+        fixture.trace().last().unwrap()["fact"]["outcome"],
+        "interrupted"
+    );
+}
+
+#[test]
+fn a_control_descriptor_above_stderr_is_inherited_through_the_supervisor() {
+    let fixture = Fixture::new("exec sleep 30");
+    let pass = fixture.command();
+    let mut child = Command::new("bash")
+        .args(["-c", "exec 7<&0; exec \"$@\" --control-fd 7", "supervisor"])
+        .arg(pass.get_program())
+        .args(pass.get_args())
+        .env_clear()
+        .envs(
+            pass.get_envs()
+                .filter_map(|(key, value)| value.map(|value| (key, value))),
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("inherit descriptor seven");
+    writeln!(
+        child.stdin.as_mut().unwrap(),
+        "{}",
+        control_request("interrupt", "fd-seven")
+    )
+    .expect("write inherited descriptor");
+    let output = finish_control_pass(child);
+    assert_eq!(output.status.code(), Some(130));
+    let events = fixture.run_events();
+    assert_eq!(events[1]["payload"]["by"], "fd-seven");
+    assert_one_terminal(&events, "interrupted");
+}
+
+#[test]
+fn an_invalid_control_fd_environment_value_is_a_configuration_error() {
+    let fixture = Fixture::new("exit 0");
+    let output = fixture
+        .command()
+        .env("OSTROM_CONTROL_FD", "not-a-descriptor")
+        .output()
+        .expect("refuse invalid descriptor configuration");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("OSTROM_CONTROL_FD must be an unsigned integer")
+    );
+    assert!(!fixture.state.join("runs").exists());
+}
+
+#[test]
+fn control_fd_environment_refuses_steer_immediately_and_preserves_any_by() {
+    for by in ["unknown:supervisor", "", "a different principal"] {
+        let fixture = Fixture::new(&format!(
+            "for i in {{1..200}}; do test -f \"$OSTROM_HOME/continue\" && break; sleep 0.05; done\n{}",
+            stream_script_with_work(CLAUDE_STREAM_JSON)
+        ));
+        let mut child = fixture
+            .command()
+            .env("OSTROM_CONTROL_FD", "0")
+            .args(["--events-fd", "1"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start controlled pass from environment");
+        let mut input = child.stdin.take().expect("control pipe");
+        writeln!(input, "{}", control_request("steer", by)).expect("send steer");
+        let applied = wait_for_run_event(&fixture, "control.applied");
+        assert_eq!(applied["payload"]["ok"], false);
+        assert_eq!(applied["payload"]["reason"], "unsupported");
+        assert_eq!(applied["payload"]["by"], by);
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "refusal must precede normal exit"
+        );
+        fs::write(fixture.state.join("continue"), "go").expect("release normal exit");
+        // Keep the writer open: the pass must not wait for control EOF to finish.
+        let output = finish_control_pass(child);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, fixture.run_event_bytes());
+        assert_eq!(fixture.transcript_bytes(), CLAUDE_STREAM_JSON.as_bytes());
+        let events = fixture.run_events();
+        assert_eq!(events[1]["type"], "control.requested");
+        assert_eq!(
+            events[1]["payload"],
+            control_request("steer", by)["payload"]
+        );
+        assert_one_terminal(&events, "completed");
+    }
+}
+
+#[test]
+fn malformed_control_lines_are_refused_and_the_reader_continues() {
+    let fixture = Fixture::new(&format!(
+        "for i in {{1..200}}; do test -f \"$OSTROM_HOME/continue\" && break; sleep 0.05; done\n{}",
+        stream_script_with_work(CLAUDE_STREAM_JSON)
+    ));
+    let mut child = fixture
+        .command()
+        .args(["--control-fd", "0", "--events-fd", "1"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start pass for malformed controls");
+    let mut input = child.stdin.take().expect("control pipe");
+    let malformed = [
+        b"not json\n".to_vec(),
+        b"\xff\n".to_vec(),
+        b"\n".to_vec(),
+        b"{\"type\":\"control.requested\",\"payload\":{}}\n".to_vec(),
+        b"{\"type\":\"agent.text\",\"payload\":{\"text\":\"wrong type\"}}\n".to_vec(),
+        format!("{}\n", control_request("teleport", "arbitrary")).into_bytes(),
+        b"{\"type\":\"control.requested\",\"payload\":{\"controlId\":\"empty\",\"kind\":\"steer\",\"by\":\"any\"}}\n".to_vec(),
+        format!("{}\n", json!({"type":"control.requested", "payload":{
+            "controlId":"oversized", "kind":"steer", "by":"any", "text":"x".repeat(ethogram::MAX_EXCERPT_SCALARS + 1)
+        }})).into_bytes(),
+        format!("{}\n", json!({"v":1,"runId":"not-an-inbound-envelope","seq":1,"ts":"2026-08-01T00:00:00Z",
+            "type":"control.requested","payload":control_request("interrupt", "any")["payload"]})).into_bytes(),
+    ];
+    for line in &malformed {
+        input.write_all(line).expect("send malformed line");
+    }
+    writeln!(input, "{}", control_request("steer", "still reading")).expect("send valid line");
+    wait_for_run_event(&fixture, "control.applied");
+    fs::write(fixture.state.join("continue"), "go").unwrap();
+    let output = finish_control_pass(child);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, fixture.run_event_bytes());
+    let events = fixture.run_events();
+    let refusals = events
+        .iter()
+        .filter(|event| event["type"] == "capture.refused")
+        .collect::<Vec<_>>();
+    assert_eq!(refusals.len(), malformed.len());
+    for refusal in refusals {
+        assert_eq!(refusal["payload"]["cause"], "malformed");
+        assert_eq!(refusal["payload"]["sourceType"], "control.requested");
+        assert!(!refusal["payload"]["detail"].as_str().unwrap().is_empty());
+    }
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "control.requested")
+            .count(),
+        1
+    );
+    assert_eq!(fixture.transcript_bytes(), CLAUDE_STREAM_JSON.as_bytes());
+    assert_one_terminal(&events, "completed");
+}
+
+#[test]
+fn closed_and_unreadable_control_descriptors_do_not_fail_the_pass() {
+    for unreadable in [false, true] {
+        let fixture = Fixture::new(&stream_script_with_work(CLAUDE_STREAM_JSON));
+        let mut command = fixture.command();
+        if unreadable {
+            // A directory can be opened through the inherited fd, but reading it fails.
+            command
+                .args(["--control-fd", "0"])
+                .stdin(fs::File::open(fixture.root.path()).expect("directory descriptor"));
+        } else {
+            command.args(["--control-fd", "4294967295"]);
+        }
+        let output = command
+            .args(["--events-fd", "1"])
+            .output()
+            .expect("run with broken input");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, fixture.run_event_bytes());
+        let events = fixture.run_events();
+        let refusals = events
+            .iter()
+            .filter(|event| event["type"] == "capture.refused")
+            .collect::<Vec<_>>();
+        assert_eq!(refusals.len(), 1);
+        let detail = refusals[0]["payload"]["detail"].as_str().unwrap();
+        assert!(detail.contains(if unreadable {
+            "could not read control descriptor"
+        } else {
+            "could not open control fd"
+        }));
+        assert_one_terminal(&events, "completed");
+        fixture.assert_released();
+    }
+}
+
+#[test]
+fn control_eof_and_an_idle_writer_do_not_delay_normal_exit() {
+    for close_writer in [false, true] {
+        let fixture = Fixture::new(&stream_script_with_work(CLAUDE_STREAM_JSON));
+        let mut child = fixture
+            .command()
+            .args(["--control-fd", "0"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start idle control pass");
+        let mut input = child.stdin.take();
+        if close_writer {
+            drop(input.take());
+        }
+        let output = finish_control_pass(child);
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+        let events = fixture.run_events();
+        assert!(!events.iter().any(
+            |event| event["type"].as_str().unwrap().starts_with("control.")
+                || event["type"] == "capture.refused"
+        ));
+        assert_one_terminal(&events, "completed");
+    }
+}
+
+#[test]
+fn controls_after_interrupt_terminal_emit_nothing() {
+    let fixture = Fixture::new("exec sleep 30");
+    let mut child = fixture
+        .command()
+        .args(["--control-fd", "0", "--events-fd", "1"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start interrupt race");
+    let mut input = child.stdin.take().unwrap();
+    writeln!(
+        input,
+        "{}\n{}\n{}\nmalformed",
+        control_request("interrupt", "first"),
+        control_request("interrupt", "second"),
+        control_request("steer", "third")
+    )
+    .unwrap();
+    let output = finish_control_pass(child);
+    assert_eq!(output.status.code(), Some(130));
+    assert_eq!(output.stdout, fixture.run_event_bytes());
+    let events = fixture.run_events();
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "run.started",
+            "control.requested",
+            "control.applied",
+            "run.finished"
+        ]
+    );
+    assert_eq!(events[1]["payload"]["by"], "first");
+    assert_one_terminal(&events, "interrupted");
+}
+
+#[test]
+fn without_a_control_descriptor_stdin_is_ignored_and_existing_bytes_are_preserved() {
+    let fixture = Fixture::new(&stream_script(CLAUDE_STREAM_JSON));
+    let mut child = fixture
+        .command()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start pass without control descriptor");
+    writeln!(
+        child.stdin.as_mut().unwrap(),
+        "{}\nmalformed",
+        control_request("interrupt", "ignored")
+    )
+    .unwrap();
+    let output = finish_control_pass(child);
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"");
+    assert_eq!(output.stderr, b"");
+    assert_eq!(fixture.transcript_bytes(), CLAUDE_STREAM_JSON.as_bytes());
+    assert_eq!(
+        fs::read(fixture.state.join("builder-pass-id")).unwrap(),
+        b"a1b2c3d4\n"
+    );
+    assert_eq!(
+        fs::read(fixture.state.join("builder-wake-counter")).unwrap(),
+        b"7\n"
+    );
+    assert_eq!(normalize_pass_trace(&fs::read(fixture.state.join("sprint.jsonl")).unwrap()),
+        concat!(
+            "{\"ts\":\"2026-08-01T00:00:00Z\",\"kind\":\"pass-started\",\"fact\":{\"owner\":\"builder-a1b2c3d4-wake7\"},\"narration\":{}}\n",
+            "{\"ts\":\"2026-08-01T00:00:00Z\",\"kind\":\"pass-ended\",\"fact\":{\"owner\":\"builder-a1b2c3d4-wake7\",\"outcome\":\"no-op\",\"cost_usd\":1.25,\"duration_seconds\":0,\"reason\":\"blocked\"},\"narration\":{}}\n"
+        ).as_bytes());
+    let events = fixture.run_events();
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "run.started",
+            "agent.started",
+            "agent.tool_use",
+            "agent.tool_result",
+            "agent.completed",
+            "run.finished"
+        ]
+    );
+    assert_one_terminal(&events, "no-op");
 }
 
 #[test]
