@@ -285,19 +285,75 @@ fn absent_tool_result_is_error_stays_absent() {
 
 #[test]
 fn every_seeded_ethogram_corpus_fixture_matches_our_mapped_fields() {
-    const CORRESPONDING_EVENTS: [(&str, &str, usize); 12] = [
-        ("agent-completed-max-turns.json", "error-shapes", 5),
-        ("agent-completed-repeated-terminal.json", "subagent", 14),
-        ("agent-completed.json", "subagent", 13),
-        ("agent-started.json", "subagent", 1),
-        ("agent-text-truncated.json", "overbound", 2),
-        ("agent-text.json", "subagent", 4),
-        ("agent-tool-result-error.json", "error-shapes", 4),
-        ("agent-tool-result-subagent.json", "subagent", 9),
-        ("agent-tool-result.json", "subagent", 6),
-        ("agent-tool-use-subagent.json", "subagent", 8),
-        ("agent-tool-use.json", "subagent", 5),
-        ("agent-warning.json", "error-shapes", 6),
+    // Normaliser-derived cases carry expected.jsonl; the control case carries
+    // events.jsonl because its events come from the runtime, not any raw line.
+    const CORRESPONDING_EVENTS: [(&str, &str, &str, usize); 16] = [
+        (
+            "agent-completed-max-turns.json",
+            "error-shapes",
+            "expected.jsonl",
+            5,
+        ),
+        (
+            "agent-completed-repeated-terminal.json",
+            "subagent",
+            "expected.jsonl",
+            14,
+        ),
+        ("agent-completed.json", "subagent", "expected.jsonl", 13),
+        ("agent-started.json", "subagent", "expected.jsonl", 1),
+        (
+            "agent-text-truncated.json",
+            "overbound",
+            "expected.jsonl",
+            2,
+        ),
+        ("agent-text.json", "subagent", "expected.jsonl", 4),
+        (
+            "agent-tool-result-error.json",
+            "error-shapes",
+            "expected.jsonl",
+            4,
+        ),
+        (
+            "agent-tool-result-subagent.json",
+            "subagent",
+            "expected.jsonl",
+            9,
+        ),
+        ("agent-tool-result.json", "subagent", "expected.jsonl", 6),
+        (
+            "agent-tool-use-subagent.json",
+            "subagent",
+            "expected.jsonl",
+            8,
+        ),
+        ("agent-tool-use.json", "subagent", "expected.jsonl", 5),
+        ("agent-warning.json", "error-shapes", "expected.jsonl", 6),
+        (
+            "control-requested-steer.json",
+            "control-interrupt",
+            "events.jsonl",
+            3,
+        ),
+        (
+            "control-requested-interrupt.json",
+            "control-interrupt",
+            "events.jsonl",
+            4,
+        ),
+        (
+            "control-applied-interrupt.json",
+            "control-interrupt",
+            "events.jsonl",
+            5,
+        ),
+        (
+            "control-applied-not-live.json",
+            "control-interrupt",
+            "events.jsonl",
+            6,
+        ),
     ];
 
     let fixtures = ethogram_corpus::v1_fixtures();
@@ -309,11 +365,11 @@ fn every_seeded_ethogram_corpus_fixture_matches_our_mapped_fields() {
 
     let mut compared = 0;
     for fixture in fixtures {
-        let (_, case, line_number) = CORRESPONDING_EVENTS
+        let (_, case, source_file, line_number) = CORRESPONDING_EVENTS
             .iter()
-            .find(|(name, _, _)| *name == fixture.name)
+            .find(|(name, _, _, _)| *name == fixture.name)
             .unwrap_or_else(|| panic!("unmapped ethogram fixture {:?}", fixture.name));
-        let expected = fs::read_to_string(Path::new(FIXTURES).join(case).join("expected.jsonl"))
+        let expected = fs::read_to_string(Path::new(FIXTURES).join(case).join(source_file))
             .expect("read corresponding umwelt fixture");
         let ours = parse_event(
             expected
