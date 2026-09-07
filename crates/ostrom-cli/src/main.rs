@@ -180,8 +180,10 @@ enum Command {
     Up,
     /// Report declared loops and their persisted runtime state.
     Ps,
+    /// Print the persisted log for one declared loop.
+    Logs { name: String },
     /// Print stored ethogram events for one run.
-    Logs {
+    Events {
         name: String,
         /// Replay events after this sequence, then follow the run.
         #[arg(long)]
@@ -668,7 +670,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Ps => {
             io::stdout().write_all(loop_supervisor::render_ps(&paths, &clock)?.as_bytes())?
         }
-        Command::Logs { name, after } => run_logs(&paths, &name, after)?,
+        Command::Logs { name } => {
+            io::stdout().write_all(&loop_supervisor::read_logs(&paths, &name)?)?;
+        }
+        Command::Events { name, after } => run_events(&paths, &name, after)?,
         Command::LoopWorker {
             name,
             version,
@@ -2325,7 +2330,7 @@ fn role_name(role: CliPassRole) -> &'static str {
     }
 }
 
-fn run_logs(
+fn run_events(
     paths: &OstromPaths,
     name: &str,
     after: Option<u64>,

@@ -304,6 +304,14 @@ Each trace record, including its newline, is limited to 4096 bytes and is
 appended by one shell `printf`, matching the queue JSONL discipline. Oversized
 records are rejected instead of risking an interleaved append.
 
+### Run events
+
+Every pass and implementer run records canonical ethogram JSONL under the
+Ostrom state directory. `ostrom events <run-id>` prints the events currently
+stored for one run and exits. `ostrom events <run-id> --after <seq>` replays
+events strictly after that sequence, then follows until the run finishes or
+the runtime reaches its reconnect boundary.
+
 The lease and trace are machine-local runtime state. Like the real roster,
 queue, and read cursors, they never belong in this repository.
 
