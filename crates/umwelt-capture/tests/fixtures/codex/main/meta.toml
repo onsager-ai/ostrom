@@ -39,8 +39,12 @@ item_started = "EXISTS for command_execution and file_change, and shares item.id
 chreode_normaliser = "produces ZERO agent.text from this capture: it matches assistant_message/message, codex emits agent_message. See onsager-ai/chreode#474. chreode's normalised output is NOT a golden output for this capture."
 
 [chreode_output]
-file = "BROKEN-do-not-ship.chreode-output.jsonl"
-what = "chreode's codex normaliser output over this capture. Named to be unmistakable: it is NOT shipped, NOT an expectation, and NOT correct."
+# There is deliberately NO chreode-output file for the codex case, unlike the
+# two claude cases. This section records WHY one is absent, so its absence
+# reads as a decision rather than an oversight. Nothing here names a file in
+# this directory -- do not go looking for one.
+present = false
+withheld_because = "chreode's codex normaliser is known broken; its output over this capture is wrong in four separate ways and must not enter a conformance corpus."
 why_broken = """
 It asserts synthesised toolUseIds (codex-cmd-1, codex-cmd-2, codex-cmd-4,
 codex-edit-3) where the real ids in this very capture are item_1, item_3,

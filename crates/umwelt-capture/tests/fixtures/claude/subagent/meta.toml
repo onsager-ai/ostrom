@@ -25,7 +25,7 @@ unknown_system_subtypes = "thinking_tokens, background_tasks_changed, task_start
 
 [chreode_output]
 file = "chreode-output.jsonl"
-what = "Output of chreode's claude normaliser over raw.scrubbed.ndjson. Kept for DIFFING against umwelt's normaliser. It is NOT an expectation and must not be adopted as expected.jsonl."
+what = "Output of chreode's claude normaliser over raw.ndjson. Kept for DIFFING against umwelt's normaliser. It is NOT an expectation and must not be adopted as expected.jsonl."
 correct_for_this_harness = true  # unlike the codex case, chreode's claude normaliser is not known-broken
 
 # READ THIS BEFORE SUMMING ANYTHING IN THAT FILE.

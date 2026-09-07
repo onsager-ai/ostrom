@@ -24,7 +24,7 @@ assertion = "excerpt() on this text (chreode#472, merged): kept=16384, truncated
 
 [chreode_output]
 file = "chreode-output.jsonl"
-what = "Output of chreode's claude normaliser over raw.scrubbed.ndjson. Kept for DIFFING against umwelt's normaliser. NOT an expectation."
+what = "Output of chreode's claude normaliser over raw.ndjson. Kept for DIFFING against umwelt's normaliser. NOT an expectation."
 correct_for_this_harness = true
 contents = "2 drafts: agent.started, and one agent.text with truncated=true (16384 chars kept from a 190,253-char source)."
 caveat = "This capture has no result frame, so there is no agent.completed and no cost or usage to fold. See incomplete_reason above."
