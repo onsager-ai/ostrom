@@ -18,8 +18,9 @@ use thiserror::Error;
 
 use crate::{
     AppTokenError, OstromPaths, PolicyBundle, PublishDestination, PublishError, QueueDocument,
-    StoreError,
+    StoreError, TraceAppend,
     app_token::{GitHubInstallationTokenMinter, InstallationTokenMinter, ScopedAppTokenRequest},
+    append_trace,
     commit_checks::read_commit_checks,
     environment,
     gate::load_gate_config,
@@ -91,6 +92,8 @@ pub enum SweepError {
     Store(#[from] StoreError),
     #[error(transparent)]
     RunEvent(#[from] RunEventError),
+    #[error("decision fact {0} was reused with different content")]
+    DecisionFactConflict(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -533,7 +536,7 @@ fn run_sweep_with_minter_and_publication_source(
             .filter(|row| string_field(row.value(), &["state"]) == "pending")
             .filter_map(|row| queue_decision_request(row.value())),
     );
-    emit_decision_requests(&options.paths, &decision_requests)?;
+    emit_decision_requests(&options.paths, options.started_at, &decision_requests)?;
     backup_previous_sweep(&options.paths)?;
     write_queue(&options.paths.queue_file(), &final_rows)?;
     write_json_private(&state_path, &new_state)?;
@@ -2048,14 +2051,57 @@ fn queue_decision_request(row: &Value) -> Option<DecisionRequest> {
 
 fn emit_decision_requests(
     paths: &OstromPaths,
+    started_at: DateTime<Utc>,
     requests: &[DecisionRequest],
-) -> Result<(), RunEventError> {
+) -> Result<(), SweepError> {
     if requests.is_empty() {
         return Ok(());
     }
+    let mut facts = read_trace(&paths.trace_file())?
+        .rows
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|row| row.kind == "decision-requested")
+        .filter_map(|row| {
+            let decision_id = row.fact.get("decision_id")?.as_str()?.to_owned();
+            let kind = row.fact.get("kind")?.as_str()?.to_owned();
+            let subject = row.fact.get("subject")?.as_str()?.to_owned();
+            Some((decision_id, (kind, subject)))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for request in requests {
+        let signature = (request.kind.as_str().to_owned(), request.subject.clone());
+        if facts
+            .get(&request.decision_id)
+            .is_some_and(|stored| stored != &signature)
+        {
+            return Err(SweepError::DecisionFactConflict(
+                request.decision_id.clone(),
+            ));
+        }
+    }
     let emitter = SweepDecisionEmitter::new(paths)?;
     for request in requests {
+        let signature = (request.kind.as_str().to_owned(), request.subject.clone());
+        if facts.contains_key(&request.decision_id) {
+            emitter.request(request)?;
+            continue;
+        }
         emitter.request(request)?;
+        append_trace(
+            &paths.trace_file(),
+            &TraceAppend {
+                ts: format_time(started_at),
+                kind: "decision-requested".to_owned(),
+                fact: Map::from_iter([
+                    ("decision_id".to_owned(), json!(&request.decision_id)),
+                    ("kind".to_owned(), json!(request.kind.as_str())),
+                    ("subject".to_owned(), json!(&request.subject)),
+                ]),
+                narration: Map::new(),
+            },
+        )?;
+        facts.insert(request.decision_id.clone(), signature);
     }
     Ok(())
 }
@@ -4254,6 +4300,19 @@ mod tests {
         assert!(decisions.iter().all(|event| {
             event.payload.get("subject").and_then(Value::as_str) != Some("fixture-org/decisions#3")
         }));
+        let decision_facts = read_trace(&paths.trace_file())
+            .expect("read decision facts")
+            .rows
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|row| row.kind == "decision-requested")
+            .collect::<Vec<_>>();
+        assert_eq!(decision_facts.len(), 3);
+        assert!(decision_facts.iter().all(|row| {
+            row.fact.keys().map(String::as_str).collect::<Vec<_>>()
+                == ["decision_id", "kind", "subject"]
+                && !row.fact.contains_key("dossier")
+        }));
         for event in &decisions {
             let subject = event.payload["subject"].as_str().expect("fixture subject");
             let expected = match subject {
@@ -4309,6 +4368,43 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_conflicting_decision_fact_stops_before_event_emission() {
+        let home = tempdir().expect("temporary decision conflict home");
+        let paths = repair_test_paths(home.path());
+        let request = queue_decision_request(&json!({
+            "id": "fixture-org/decisions#42",
+            "kind": "tripwire",
+            "needs_judgment": true,
+            "mandate": {"reason": "fixture tripwire"},
+        }))
+        .expect("fixture decision request");
+        append_trace(
+            &paths.trace_file(),
+            &TraceAppend {
+                ts: "2026-09-07T12:00:00Z".to_owned(),
+                kind: "decision-requested".to_owned(),
+                fact: Map::from_iter([
+                    ("decision_id".to_owned(), json!(&request.decision_id)),
+                    ("kind".to_owned(), json!("human_decides")),
+                    ("subject".to_owned(), json!(&request.subject)),
+                ]),
+                narration: Map::new(),
+            },
+        )
+        .expect("seed conflicting decision fact");
+
+        assert!(matches!(
+            emit_decision_requests(
+                &paths,
+                "2026-09-07T13:00:00Z".parse().expect("fixture time"),
+                &[request],
+            ),
+            Err(SweepError::DecisionFactConflict(_))
+        ));
+        assert!(!paths.runs_dir().exists());
     }
 
     #[test]
@@ -4446,11 +4542,27 @@ mod tests {
             ethogram_decisions::validate(&parsed.event_type, &parsed.payload)
                 .expect("human fixture validates against the current SDK");
         }
+        let first_trace = fs::read(paths.trace_file()).expect("read first decision facts");
+        assert_eq!(
+            read_trace(&paths.trace_file())
+                .expect("parse first decision facts")
+                .rows
+                .into_iter()
+                .filter_map(Result::ok)
+                .filter(|row| row.kind == "decision-requested")
+                .count(),
+            2
+        );
 
         sweep("2026-09-07T13:00:00Z");
         let second = read_decisions();
         assert_eq!(second.len(), first.len());
         assert_eq!(second, first, "an unchanged body must emit nothing new");
+        assert_eq!(
+            fs::read(paths.trace_file()).expect("read second decision facts"),
+            first_trace,
+            "an unchanged body must append no duplicate fact"
+        );
     }
 
     #[test]

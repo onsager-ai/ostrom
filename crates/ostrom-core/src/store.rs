@@ -504,6 +504,28 @@ mod tests {
             serde_json::from_value::<SweepPass>(injected).is_err(),
             "core records must reject narration fields rather than discard them"
         );
+
+        let requested = serde_json::Map::from_iter([
+            ("decision_id".to_owned(), json!("decision-1")),
+            ("kind".to_owned(), json!("tripwire")),
+            ("subject".to_owned(), json!("synthetic-org/project#42")),
+        ]);
+        let answered = serde_json::Map::from_iter([
+            ("decision_id".to_owned(), json!("decision-1")),
+            ("option".to_owned(), json!("approve")),
+            ("by".to_owned(), json!("principal-id")),
+        ]);
+        assert!(EventPayload::new(requested.clone()).is_ok());
+        assert!(EventPayload::new(answered).is_ok());
+        let mut narrated_decision = requested;
+        narrated_decision.insert(
+            "dossier".to_owned(),
+            json!({"question": "narration must stay at the ethogram edge"}),
+        );
+        assert!(
+            EventPayload::new(narrated_decision).is_err(),
+            "a decision dossier must never enter the fact ledger"
+        );
     }
 
     #[test]
