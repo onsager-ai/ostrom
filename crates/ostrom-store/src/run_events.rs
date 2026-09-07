@@ -117,7 +117,7 @@ impl RunEventGuard {
             .num_milliseconds()
             .max(0);
         let payload = RunFinishedPayload {
-            outcome: self.outcome,
+            outcome: self.outcome.clone(),
             reason: self.reason.clone(),
             truncated: None,
             cost_usd: self.cost_usd,

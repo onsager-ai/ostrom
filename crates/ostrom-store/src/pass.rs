@@ -240,7 +240,7 @@ impl PassGuard {
             self.started = false;
         }
         let event_outcome = event_outcome(&outcome);
-        let event_reason = event_reason(event_outcome, self.reason.clone());
+        let event_reason = event_reason(event_outcome.clone(), self.reason.clone());
         if let Err(error) = self
             .events
             .finish(event_outcome, event_reason, self.cost_usd, None)
