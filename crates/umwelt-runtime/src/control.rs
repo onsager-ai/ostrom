@@ -365,15 +365,6 @@ impl<R: SessionResumer> RunControl<R> {
 }
 
 fn validate_request(request: &ControlRequestedPayload) -> Result<(), ControlError> {
-    // `text` is optional at the schema level because another harness may be
-    // able to steer without it, but this runtime cannot act on an empty steer.
-    // Keep this runtime-specific guard separate from ethogram's validation.
-    if request.kind == ControlKind::Steer && request.text.as_deref().is_none_or(str::is_empty) {
-        return Err(ControlError::InvalidRequest(
-            "steer text must be present and nonempty".to_owned(),
-        ));
-    }
-
     validate(CONTROL_REQUESTED, request)
         .map_err(|error| ControlError::InvalidRequest(error.to_string()))
 }
