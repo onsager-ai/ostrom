@@ -130,16 +130,20 @@ projects:
     }
 
     fn run_events(&self) -> Vec<Value> {
+        String::from_utf8(self.run_event_bytes())
+            .expect("event stream UTF-8")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("event JSON"))
+            .collect()
+    }
+
+    fn run_event_bytes(&self) -> Vec<u8> {
         let run_directories = fs::read_dir(self.state.join("runs"))
             .expect("read run directories")
             .collect::<Result<Vec<_>, _>>()
             .expect("read run directory entries");
         assert_eq!(run_directories.len(), 1, "expected exactly one pass run");
-        fs::read_to_string(run_directories[0].path().join("events.jsonl"))
-            .expect("read pass events")
-            .lines()
-            .map(|line| serde_json::from_str(line).expect("event JSON"))
-            .collect()
+        fs::read(run_directories[0].path().join("events.jsonl")).expect("read pass events")
     }
 
     fn assert_released(&self) {
@@ -150,6 +154,62 @@ projects:
             Some("pass-ended")
         );
     }
+}
+
+#[test]
+fn events_fd_bytes_match_the_durable_stream_and_the_flag_wins() {
+    let fixture = Fixture::new("exit 0");
+    let output = fixture
+        .command()
+        .args(["--events-fd", "1"])
+        .env("OSTROM_EVENTS_FD", "not-a-descriptor")
+        .output()
+        .expect("run pass with an event descriptor");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, fixture.run_event_bytes());
+}
+
+#[test]
+fn events_fd_environment_streams_the_durable_bytes() {
+    let fixture = Fixture::new("exit 0");
+    let output = fixture
+        .command()
+        .env("OSTROM_EVENTS_FD", "1")
+        .output()
+        .expect("run pass with the event descriptor environment variable");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, fixture.run_event_bytes());
+}
+
+#[test]
+fn an_unwritable_events_fd_does_not_kill_the_pass() {
+    let fixture = Fixture::new("exit 0");
+    let output = fixture
+        .command()
+        .args(["--events-fd", "4294967295"])
+        .output()
+        .expect("run pass with an unwritable event descriptor");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("ostrom observability: could not open events fd 4294967295")
+    );
+    assert_eq!(fixture.run_events().len(), 2);
 }
 
 fn wait_for(path: &Path) {

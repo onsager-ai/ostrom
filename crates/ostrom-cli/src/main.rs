@@ -191,17 +191,27 @@ enum Command {
         command: HookCommand,
     },
     /// Run one unattended delivery pass for a role.
-    Pass { role: CliPassRole },
+    Pass {
+        role: CliPassRole,
+        /// Also stream stamped ethogram events to this open file descriptor.
+        #[arg(long)]
+        events_fd: Option<u32>,
+    },
     /// Execute one durable work order in its item worktree.
     Implement {
         work_order_file: PathBuf,
         unit_name: String,
         #[arg(default_value = ostrom_store::DEFAULT_IMPLEMENTER_RUNNER)]
         runner_name: String,
+        /// Also stream stamped ethogram events to this open file descriptor.
+        #[arg(long)]
+        events_fd: Option<u32>,
     },
     #[command(name = "__pass-worker", hide = true)]
     PassWorker {
         role: CliPassRole,
+        #[arg(long)]
+        events_fd: Option<u32>,
         supervisor_pid: u32,
     },
     #[command(name = "__implement-worker", hide = true)]
@@ -209,6 +219,8 @@ enum Command {
         work_order_file: PathBuf,
         unit_name: String,
         runner_name: String,
+        #[arg(long)]
+        events_fd: Option<u32>,
         supervisor_pid: u32,
     },
     #[command(name = "__loop-worker", hide = true)]
@@ -798,38 +810,49 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 io::stderr().write_all(output.stderr.as_bytes())?;
             }
         },
-        Command::Pass { role } => supervise(
-            &["__pass-worker".into(), role_name(role).into()],
-            None,
-            &clock,
-        ),
+        Command::Pass { role, events_fd } => {
+            let events_fd = resolve_events_fd(events_fd)?;
+            let mut arguments = vec!["__pass-worker".into(), role_name(role).into()];
+            if let Some(fd) = events_fd {
+                arguments.extend(["--events-fd".into(), fd.to_string().into()]);
+            }
+            supervise(&arguments, None, &clock)
+        }
         Command::Implement {
             work_order_file,
             unit_name,
             runner_name,
+            events_fd,
         } => {
-            let arguments = [
+            let events_fd = resolve_events_fd(events_fd)?;
+            let mut arguments = vec![
                 "__implement-worker".into(),
                 work_order_file.clone().into_os_string(),
                 unit_name.clone().into(),
                 runner_name.into(),
             ];
+            if let Some(fd) = events_fd {
+                arguments.extend(["--events-fd".into(), fd.to_string().into()]);
+            }
             supervise(&arguments, Some((&work_order_file, &unit_name)), &clock)
         }
         Command::PassWorker {
             role,
+            events_fd,
             supervisor_pid,
-        } => run_pass_worker(role, supervisor_pid, clock),
+        } => run_pass_worker(role, supervisor_pid, resolve_events_fd(events_fd)?, clock),
         Command::ImplementWorker {
             work_order_file,
             unit_name,
             runner_name,
+            events_fd,
             supervisor_pid,
         } => run_implement_worker(
             work_order_file,
             unit_name,
             runner_name,
             supervisor_pid,
+            resolve_events_fd(events_fd)?,
             clock,
         ),
         Command::Dispatch { arguments } => {
@@ -2297,6 +2320,21 @@ fn role_name(role: CliPassRole) -> &'static str {
     }
 }
 
+fn resolve_events_fd(explicit: Option<u32>) -> io::Result<Option<u32>> {
+    let Some(value) = explicit.map_or_else(
+        || environment::OSTROM_EVENTS_FD.value(),
+        |fd| Some(fd.to_string()),
+    ) else {
+        return Ok(None);
+    };
+    value.parse::<u32>().map(Some).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("OSTROM_EVENTS_FD must be an unsigned integer, got {value:?}"),
+        )
+    })
+}
+
 // SIGHUP and SIGTERM do not exist on Windows, and signal-hook configures them
 // out rather than stubbing them. The pass supervisor is a POSIX job-control
 // mechanism; on Windows the flags stay unset and the supervisor simply waits
@@ -2385,7 +2423,12 @@ fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
     None
 }
 
-fn run_pass_worker(role: CliPassRole, supervisor_pid: u32, clock: Clock) -> ! {
+fn run_pass_worker(
+    role: CliPassRole,
+    supervisor_pid: u32,
+    events_fd: Option<u32>,
+    clock: Clock,
+) -> ! {
     let signals = register_signals().unwrap_or_else(|error| {
         eprintln!("ostrom: could not install signal handlers: {error}");
         std::process::exit(1);
@@ -2408,6 +2451,7 @@ fn run_pass_worker(role: CliPassRole, supervisor_pid: u32, clock: Clock) -> ! {
         claude_bin,
         signals,
         supervisor_pid: Some(supervisor_pid),
+        events_fd,
         clock,
     };
     match run_pass(&request) {
@@ -2633,6 +2677,7 @@ fn run_implement_worker(
     unit_name: String,
     runner_name: String,
     supervisor_pid: u32,
+    events_fd: Option<u32>,
     clock: Clock,
 ) -> ! {
     let signals = register_signals().unwrap_or_else(|error| {
@@ -2655,6 +2700,7 @@ fn run_implement_worker(
         unit_name,
         signals,
         supervisor_pid: Some(supervisor_pid),
+        events_fd,
         clock,
     };
     let registry = core_agent_registry();

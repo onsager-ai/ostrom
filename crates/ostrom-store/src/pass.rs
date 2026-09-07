@@ -113,6 +113,7 @@ pub struct PassRequest {
     pub claude_bin: PathBuf,
     pub signals: SignalFlags,
     pub supervisor_pid: Option<u32>,
+    pub events_fd: Option<u32>,
     pub clock: Clock,
 }
 
@@ -286,6 +287,7 @@ impl Drop for PassGuard {
 pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
     let mut events = RunEventGuard::start(
         &request.paths,
+        request.events_fd,
         request.clock.clone(),
         RunEventStart {
             run_id: generated_run_id(request.role.name(), &request.clock),

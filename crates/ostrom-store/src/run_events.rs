@@ -1,6 +1,11 @@
 //! Ethogram lifecycle emission through Umwelt's durable sink.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    fs::{File, OpenOptions},
+    io::Write,
+    path::Path,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use chrono::{DateTime, Utc};
 use ethogram::{
@@ -38,7 +43,7 @@ pub struct RunEventStart {
 
 /// A started run which writes exactly one terminal event, including on unwind.
 pub struct RunEventGuard {
-    sink: FileSink,
+    sink: RunEventSink,
     run_id: String,
     started_at: DateTime<Utc>,
     clock: Clock,
@@ -52,10 +57,11 @@ pub struct RunEventGuard {
 impl RunEventGuard {
     pub fn start(
         paths: &OstromPaths,
+        events_fd: Option<u32>,
         clock: Clock,
         start: RunEventStart,
     ) -> Result<Self, RunEventError> {
-        let sink = FileSink::new(paths.runs_dir());
+        let mut sink = RunEventSink::new(&paths.runs_dir(), events_fd);
         let payload = RunStartedPayload {
             kind: start.kind,
             actor: start.actor,
@@ -124,6 +130,77 @@ impl RunEventGuard {
     }
 }
 
+struct RunEventSink {
+    durable: FileSink,
+    live: Option<File>,
+    live_fd: Option<u32>,
+    live_fault: Option<String>,
+}
+
+impl RunEventSink {
+    fn new(root: &Path, live_fd: Option<u32>) -> Self {
+        let mut sink = Self {
+            durable: FileSink::new(root),
+            live: None,
+            live_fd,
+            live_fault: None,
+        };
+        if let Some(fd) = live_fd {
+            match open_fd(fd) {
+                Ok(file) => sink.live = Some(file),
+                Err(error) => {
+                    sink.record_live_fault(format!("could not open events fd {fd}: {error}"))
+                }
+            }
+        }
+        sink
+    }
+
+    fn append(&mut self, run: &str, draft: EventDraft) -> Result<(), RunEventError> {
+        let event = self.durable.append(run, draft)?;
+        if let Some(live) = &mut self.live {
+            let result = ethogram::serialise_event(&event)
+                .map_err(std::io::Error::other)
+                .and_then(|serialised| live.write_all(serialised.as_bytes()))
+                .and_then(|()| live.write_all(b"\n"))
+                .and_then(|()| live.flush());
+            if let Err(error) = result {
+                let fd = self.live_fd.unwrap_or_default();
+                self.live = None;
+                self.record_live_fault(format!("could not write events fd {fd}: {error}"));
+            }
+        }
+        Ok(())
+    }
+
+    fn record_live_fault(&mut self, message: String) {
+        eprintln!("ostrom observability: {message}");
+        self.live_fault = Some(message);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn open_fd(fd: u32) -> std::io::Result<File> {
+    OpenOptions::new()
+        .append(true)
+        .open(format!("/proc/self/fd/{fd}"))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn open_fd(fd: u32) -> std::io::Result<File> {
+    OpenOptions::new()
+        .append(true)
+        .open(format!("/dev/fd/{fd}"))
+}
+
+#[cfg(not(unix))]
+fn open_fd(_fd: u32) -> std::io::Result<File> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "file descriptors are unsupported on this platform",
+    ))
+}
+
 impl Drop for RunEventGuard {
     fn drop(&mut self) {
         if let Err(error) = self.write_terminal() {
@@ -155,6 +232,11 @@ fn draft(payload_type: &str, payload: impl Serialize) -> Result<EventDraft, serd
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
+    #[cfg(unix)]
+    use std::{fs::OpenOptions, os::fd::AsRawFd};
+
     use chrono::{TimeZone, Utc};
     use ethogram::{RunFinishedPayload, RunKind, RunOutcome, RunStartedPayload};
     use tempfile::tempdir;
@@ -182,6 +264,7 @@ mod tests {
         let (_root, paths, clock) = fixture();
         let mut run = RunEventGuard::start(
             &paths,
+            None,
             clock,
             RunEventStart {
                 run_id: "builder-fixture".to_owned(),
@@ -220,6 +303,7 @@ mod tests {
         drop(
             RunEventGuard::start(
                 &paths,
+                None,
                 clock,
                 RunEventStart {
                     run_id: "abandoned-fixture".to_owned(),
@@ -244,5 +328,86 @@ mod tests {
             serde_json::from_value(events[1].payload.clone()).expect("typed finished payload");
         assert_eq!(finished.outcome, RunOutcome::Failed);
         assert_eq!(finished.reason.as_deref(), Some("run-failed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_descriptor_bytes_are_identical_to_durable_bytes() {
+        let (root, paths, clock) = fixture();
+        let live_path = root.path().join("live.jsonl");
+        let live = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&live_path)
+            .expect("open live event target");
+        let mut run = RunEventGuard::start(
+            &paths,
+            Some(u32::try_from(live.as_raw_fd()).expect("non-negative event descriptor")),
+            clock,
+            RunEventStart {
+                run_id: "mirrored-fixture".to_owned(),
+                kind: RunKind::Loop,
+                actor: "builder".to_owned(),
+                harness: "claude".to_owned(),
+                model: None,
+                schedule: None,
+                repository: None,
+                work_order: None,
+                ceilings: None,
+            },
+        )
+        .expect("start mirrored lifecycle");
+        run.finish(RunOutcome::Completed, None, None, None)
+            .expect("finish mirrored lifecycle");
+        drop(run);
+        drop(live);
+
+        let durable_path = paths
+            .runs_dir()
+            .join(umwelt_runtime::run_directory_name("mirrored-fixture"))
+            .join("events.jsonl");
+        let durable = fs::read(durable_path).expect("read durable events");
+        let mirrored = fs::read(live_path).expect("read mirrored events");
+        assert_eq!(mirrored, durable);
+        assert_eq!(durable.iter().filter(|byte| **byte == b'\n').count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_closed_live_descriptor_does_not_stop_the_durable_run() {
+        let (root, paths, clock) = fixture();
+        let closed = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(root.path().join("closed.jsonl"))
+            .expect("open descriptor to close");
+        let fd = u32::try_from(closed.as_raw_fd()).expect("non-negative event descriptor");
+        drop(closed);
+
+        let mut run = RunEventGuard::start(
+            &paths,
+            Some(fd),
+            clock,
+            RunEventStart {
+                run_id: "closed-fd-fixture".to_owned(),
+                kind: RunKind::Loop,
+                actor: "builder".to_owned(),
+                harness: "claude".to_owned(),
+                model: None,
+                schedule: None,
+                repository: None,
+                work_order: None,
+                ceilings: None,
+            },
+        )
+        .expect("a closed live descriptor cannot prevent run.started");
+        assert!(run.sink.live_fault.is_some());
+        run.finish(RunOutcome::Completed, None, None, None)
+            .expect("a closed live descriptor cannot prevent run.finished");
+
+        let events = FileSink::new(paths.runs_dir())
+            .read_from("closed-fd-fixture", 0)
+            .expect("read durable lifecycle");
+        assert_eq!(events.len(), 2);
     }
 }

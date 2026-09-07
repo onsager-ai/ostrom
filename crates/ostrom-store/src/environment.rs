@@ -227,6 +227,11 @@ pub const OSTROM_ACTOR: EnvironmentVariable = variable(
     EnvironmentClass::Identity,
     "no actor; operation dispatch refuses",
 );
+pub const OSTROM_EVENTS_FD: EnvironmentVariable = variable(
+    "OSTROM_EVENTS_FD",
+    EnvironmentClass::Location,
+    "no live event descriptor",
+);
 pub const OSTROM_POLICY_MANIFEST: EnvironmentVariable = variable(
     "OSTROM_POLICY_MANIFEST",
     EnvironmentClass::Location,
@@ -281,6 +286,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvironmentVariable] = &[
     MANDATE_WORKTREE_RETENTION_DAYS,
     NVM_DIR,
     OSTROM_ACTOR,
+    OSTROM_EVENTS_FD,
     OSTROM_HOME,
     OSTROM_LEGACY_HOME,
     OSTROM_NODE_FALLBACKS,

@@ -235,6 +235,14 @@ impl Fixture {
     }
 
     fn run_events(&self) -> Vec<Value> {
+        String::from_utf8(self.run_event_bytes())
+            .expect("event stream UTF-8")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("event JSON"))
+            .collect()
+    }
+
+    fn run_event_bytes(&self) -> Vec<u8> {
         let run_directories = fs::read_dir(self.state.join("runs"))
             .expect("read run directories")
             .collect::<Result<Vec<_>, _>>()
@@ -244,11 +252,7 @@ impl Fixture {
             1,
             "expected exactly one implementer run"
         );
-        fs::read_to_string(run_directories[0].path().join("events.jsonl"))
-            .expect("read implementer events")
-            .lines()
-            .map(|line| serde_json::from_str(line).expect("event JSON"))
-            .collect()
+        fs::read(run_directories[0].path().join("events.jsonl")).expect("read implementer events")
     }
 
     fn record_dispatch(&self) {
@@ -379,6 +383,25 @@ fn token_ceiling_is_recorded_after_codex_completes() {
     assert_eq!(events[1]["type"], "run.finished");
     assert_eq!(events[1]["payload"]["outcome"], "failed");
     assert_eq!(events[1]["payload"]["reason"], "token-ceiling-exceeded");
+}
+
+#[test]
+fn implementer_events_fd_bytes_match_the_durable_stream() {
+    let fixture = Fixture::new(100);
+    fixture.acquire();
+    let output = fixture
+        .command("complete")
+        .args(["--events-fd", "2"])
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run implementer with an event descriptor");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stderr, fixture.run_event_bytes());
 }
 
 #[test]

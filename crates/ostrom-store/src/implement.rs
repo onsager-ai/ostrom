@@ -44,6 +44,7 @@ pub struct ImplementRequest {
     pub unit_name: String,
     pub signals: SignalFlags,
     pub supervisor_pid: Option<u32>,
+    pub events_fd: Option<u32>,
     pub clock: Clock,
 }
 
@@ -330,6 +331,7 @@ fn run_implement_with_registry_and_minter(
     let runner = registry.get(runner_name);
     let run_events = RunEventGuard::start(
         &request.paths,
+        request.events_fd,
         request.clock.clone(),
         RunEventStart {
             run_id: generated_run_id(&request.unit_name, &request.clock),
