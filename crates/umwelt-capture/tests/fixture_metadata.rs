@@ -13,7 +13,7 @@ fn every_committed_fixture_metadata_document_parses() {
 
     assert_eq!(
         metadata_paths.len(),
-        3,
+        4,
         "the committed fixture inventory changed; review every new metadata document"
     );
     for path in metadata_paths {
