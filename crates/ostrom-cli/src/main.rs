@@ -29,18 +29,19 @@ use ostrom_store::{
     AgentRegistry, AssessmentHarness, AuditOptions, Clock, CodexHarness, DigestOptions,
     DispatchOutcome, DispatchRequest, ExecutableAssessmentDeriver, GateError, GateOptions,
     HarnessAssessmentDeriver, ImplementRequest, JsonlCheckStore, JsonlPublicationSource,
-    MigrationOutcome, OrchestratorRunRequest, OstromPaths, PassRequest, PassRole, PlanOptions,
-    PublishDestination, PublishTarget, QueueDecision, ReplayOptions, RunOutcome, RunRequest,
-    SelectAction, SelectError, SelectOutcome, SelectRequest, SignalFlags, SweepError, SweepMode,
-    SweepOptions, SweepParityOptions, TraceAppend, TraceView, UnavailableAssessmentDeriver,
-    acquire_lease, acquire_org_from_github_with_faults, append_trace_checked, audit, branch_name,
-    clear_work_order, create_work_order, credential_output, decide_queue_item,
-    encode_org_snapshots_with_faults, encode_selection, environment, finalize_exited_implementer,
-    grant_excuse, item_hash, lease_status, lint_queue_state, list_excuses, list_queue_json,
-    local_drift, migrate, read_trace_json, release_lease, render_constitution, render_digest,
-    replay, run_dispatch_with_registry, run_gate, run_implement_with_registry, run_pass, run_plan,
-    run_repair_prs, run_selection, run_sweep_parity, run_sweep_with_publication_source,
-    validate_lease_name, validate_work_order_file,
+    MigrationOutcome, OrchestratorRunRequest, OstromPaths, PASS_KILL_GRACE_MS, PassRequest,
+    PassRole, PlanOptions, PublishDestination, PublishTarget, QueueDecision, ReplayOptions,
+    RunOutcome, RunRequest, SelectAction, SelectError, SelectOutcome, SelectRequest, SignalFlags,
+    SweepError, SweepMode, SweepOptions, SweepParityOptions, TraceAppend, TraceView,
+    UnavailableAssessmentDeriver, acquire_lease, acquire_org_from_github_with_faults,
+    append_trace_checked, audit, branch_name, clear_work_order, create_work_order,
+    credential_output, decide_queue_item, encode_org_snapshots_with_faults, encode_selection,
+    environment, finalize_exited_implementer, grant_excuse, item_hash, lease_status,
+    lint_queue_state, list_excuses, list_queue_json, local_drift, migrate, read_trace_json,
+    release_lease, render_constitution, render_digest, replay, run_dispatch_with_registry,
+    run_gate, run_implement_with_registry, run_pass, run_plan, run_repair_prs, run_selection,
+    run_sweep_parity, run_sweep_with_publication_source, validate_lease_name,
+    validate_work_order_file,
 };
 
 mod cutover_replay;
@@ -205,6 +206,9 @@ enum Command {
         /// Also stream stamped ethogram events to this open file descriptor.
         #[arg(long)]
         events_fd: Option<u32>,
+        /// Withhold agent content from the live event descriptor.
+        #[arg(long)]
+        facts_only: bool,
     },
     /// Execute one durable work order in its item worktree.
     Implement {
@@ -221,6 +225,8 @@ enum Command {
         role: CliPassRole,
         #[arg(long)]
         events_fd: Option<u32>,
+        #[arg(long)]
+        facts_only: bool,
         supervisor_pid: u32,
     },
     #[command(name = "__implement-worker", hide = true)]
@@ -820,11 +826,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 io::stderr().write_all(output.stderr.as_bytes())?;
             }
         },
-        Command::Pass { role, events_fd } => {
+        Command::Pass {
+            role,
+            events_fd,
+            facts_only,
+        } => {
             let events_fd = resolve_events_fd(events_fd)?;
+            let facts_only = resolve_facts_only(facts_only)?;
             let mut arguments = vec!["__pass-worker".into(), role_name(role).into()];
             if let Some(fd) = events_fd {
                 arguments.extend(["--events-fd".into(), fd.to_string().into()]);
+            }
+            if facts_only {
+                arguments.push("--facts-only".into());
             }
             supervise(&arguments, None, &clock)
         }
@@ -849,8 +863,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::PassWorker {
             role,
             events_fd,
+            facts_only,
             supervisor_pid,
-        } => run_pass_worker(role, supervisor_pid, resolve_events_fd(events_fd)?, clock),
+        } => run_pass_worker(
+            role,
+            supervisor_pid,
+            resolve_events_fd(events_fd)?,
+            facts_only,
+            clock,
+        ),
         Command::ImplementWorker {
             work_order_file,
             unit_name,
@@ -2378,6 +2399,23 @@ fn resolve_events_fd(explicit: Option<u32>) -> io::Result<Option<u32>> {
     })
 }
 
+fn resolve_facts_only(explicit: bool) -> io::Result<bool> {
+    if explicit {
+        return Ok(true);
+    }
+    let Some(value) = environment::OSTROM_FACTS_ONLY.value() else {
+        return Ok(false);
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("OSTROM_FACTS_ONLY must be a boolean, got {value:?}"),
+        )),
+    }
+}
+
 // SIGHUP and SIGTERM do not exist on Windows, and signal-hook configures them
 // out rather than stubbing them. The pass supervisor is a POSIX job-control
 // mechanism; on Windows the flags stay unset and the supervisor simply waits
@@ -2470,6 +2508,7 @@ fn run_pass_worker(
     role: CliPassRole,
     supervisor_pid: u32,
     events_fd: Option<u32>,
+    facts_only: bool,
     clock: Clock,
 ) -> ! {
     let signals = register_signals().unwrap_or_else(|error| {
@@ -2483,7 +2522,7 @@ fn run_pass_worker(
         std::process::exit(1);
     });
     let role: PassRole = role.into();
-    let (prompt, permission_mode, derived_settings) = resolve_pass_policy(&paths, role);
+    let (prompt, permission_mode, derived_settings, caps) = resolve_pass_policy(&paths, role);
     let request = PassRequest {
         prompt,
         permission_mode,
@@ -2495,6 +2534,8 @@ fn run_pass_worker(
         signals,
         supervisor_pid: Some(supervisor_pid),
         events_fd,
+        facts_only,
+        caps,
         clock,
     };
     match run_pass(&request) {
@@ -2526,12 +2567,21 @@ fn run_pass_worker(
 fn resolve_pass_policy(
     paths: &OstromPaths,
     role: PassRole,
-) -> (String, PermissionMode, Option<String>) {
+) -> (
+    String,
+    PermissionMode,
+    Option<String>,
+    umwelt_runtime::RunCaps,
+) {
     let shipped = || {
         (
             role.default_prompt().to_owned(),
             role.default_permission_mode(),
             None,
+            umwelt_runtime::RunCaps {
+                kill_grace_ms: PASS_KILL_GRACE_MS,
+                ..umwelt_runtime::RunCaps::default()
+            },
         )
     };
     // No operator manifest is the ordinary case and stays silent. One that
@@ -2585,7 +2635,13 @@ fn resolve_pass_policy(
             None
         }
     };
-    (prompt, permission_mode, derived_settings)
+    let caps = umwelt_runtime::RunCaps {
+        tokens: manifest.defaults.r#loop.tokens,
+        cost_usd: manifest.defaults.r#loop.spend_usd,
+        kill_grace_ms: PASS_KILL_GRACE_MS,
+        ..umwelt_runtime::RunCaps::default()
+    };
+    (prompt, permission_mode, derived_settings, caps)
 }
 
 /// The operator manifest `ostrom init` writes.
