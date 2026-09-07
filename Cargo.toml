@@ -33,8 +33,8 @@ serde_yaml = "0.9.34"
 tempfile = "3.20.0"
 thiserror = "2.0.16"
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }
-umwelt-capture = { git = "https://github.com/onsager-ai/umwelt.git", rev = "4d7d409b8bdd5ae261be3b03f3b7471f97285888" }
-umwelt-runtime = { git = "https://github.com/onsager-ai/umwelt.git", rev = "4d7d409b8bdd5ae261be3b03f3b7471f97285888" }
+umwelt-capture = { git = "https://github.com/onsager-ai/umwelt.git", rev = "fdfc928a3a80001b5c98d748349fcfcb48aace80" }
+umwelt-runtime = { git = "https://github.com/onsager-ai/umwelt.git", rev = "fdfc928a3a80001b5c98d748349fcfcb48aace80" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
