@@ -1933,6 +1933,53 @@ projects:
         );
     }
 
+    fn decision_conditions() -> Vec<Value> {
+        vec![
+            condition(
+                "required_checks",
+                "inconclusive",
+                &["content-derived"],
+                json!({
+                    "missing": ["verify-linux"],
+                    "reason": "required check results are unavailable",
+                }),
+            ),
+            condition(
+                "review_threads",
+                "inconclusive",
+                &["content-derived"],
+                json!({"reason": "review thread query failed", "unresolved": null}),
+            ),
+            json!({
+                "name": "bounce_selectors",
+                "result": "excused",
+                "tier": ["content-derived", "author-written"],
+                "detail": {
+                    "matches": [{"selector": "path:deploy/*", "tier": "content-derived"}],
+                    "unobservable": [],
+                },
+                "exception_reason": "Principal approved this artifact.",
+            }),
+            condition(
+                "draft",
+                "pass",
+                &["content-derived"],
+                json!({"isDraft": false}),
+            ),
+        ]
+    }
+
+    #[test]
+    fn judgment_digest_preserves_stored_bytes() {
+        // Captured before adding the typed decision boundary. Keep the raw
+        // condition and nested detail key order: this digest is stored history.
+        let conditions = decision_conditions();
+        assert_eq!(
+            judgment_digest("placeholder-org/alpha#7", "inconclusive", &conditions).unwrap(),
+            "sha256:723707dca3141809259adbe78428edc876a9f418ec4c31ada4f3816cb3162fcd"
+        );
+    }
+
     #[test]
     fn exception_requires_every_key_and_a_nonempty_reason() {
         let fixture = tempfile::tempdir().expect("temporary exception fixture");
