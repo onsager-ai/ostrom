@@ -55,6 +55,39 @@ impl Display for SinkFault {
 
 impl std::error::Error for SinkFault {}
 
+/// A failure to replay stored events.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SourceFault {
+    /// The durable log skips or repeats a sequence number.
+    Gap { expected: u64, got: u64 },
+    /// A complete durable line cannot be read as an event.
+    Malformed { line: u64, message: String },
+    /// An I/O operation failed.
+    Io(String),
+}
+
+impl Display for SourceFault {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Gap { expected, got } => {
+                write!(
+                    formatter,
+                    "event sequence must be {expected}; received {got}"
+                )
+            }
+            Self::Malformed { line, message } => {
+                write!(
+                    formatter,
+                    "malformed stored event at line {line}: {message}"
+                )
+            }
+            Self::Io(message) => write!(formatter, "source I/O failed: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for SourceFault {}
+
 /// Append-only storage for stamped ethogram events.
 pub trait Sink: Send + Sync {
     /// Append one draft to a run, assigning its next `seq` and the sink's `ts`.
@@ -67,11 +100,28 @@ pub trait Sink: Send + Sync {
     fn last_seq(&self, run: &str) -> Result<u64, SinkFault>;
 }
 
+/// Replay access to stamped ethogram events.
+///
+/// This is deliberately separate from [`Sink`]: a forwarding-only sink has no
+/// durable history to replay, so consumers that require replay must ask for a
+/// `Source` and get a compile-time guarantee that it is available.
+pub trait Source {
+    /// Return events for `run` whose `seq` is strictly greater than `after`.
+    ///
+    /// Passing zero reads from the beginning because event sequences start at
+    /// one. Returned events retain their stored stamps exactly.
+    fn read_from(&self, run: &str, after: u64) -> Result<Vec<Event>, SourceFault>;
+}
+
 /// A file-backed sink with one `events.jsonl` log per run.
 ///
 /// Operations are serialised only within one `FileSink` instance. Concurrent
 /// writers to the same run directory from separate instances or processes are
 /// not supported; a cross-process sink must provide its own locking.
+///
+/// `FileSink` also implements [`Source`]. A read-only user constructs it with
+/// [`FileSink::new`] and simply never calls [`Sink::append`] or
+/// [`Sink::forward`]; no separate file reader type is needed.
 #[derive(Debug)]
 pub struct FileSink {
     root: PathBuf,
@@ -212,6 +262,14 @@ impl Sink for FileSink {
     }
 }
 
+impl Source for FileSink {
+    fn read_from(&self, run: &str, after: u64) -> Result<Vec<Event>, SourceFault> {
+        // Source reads intentionally bypass the append-side state cache. A
+        // follower must observe the durable file as it changes underneath it.
+        read_events(&self.event_path(run), run, after)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct RunState {
     last_seq: u64,
@@ -303,6 +361,84 @@ fn read_state(path: &Path, run: &str) -> Result<RunState, SinkFault> {
     Ok(state)
 }
 
+fn read_events(path: &Path, run: &str, after: u64) -> Result<Vec<Event>, SourceFault> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(source_io_fault(error)),
+    };
+    let mut reader = BufReader::new(file);
+    let mut bytes = Vec::new();
+    let mut events = Vec::new();
+    let mut last_seq = 0_u64;
+    let mut finished = false;
+    let mut line = 0_u64;
+
+    loop {
+        bytes.clear();
+        let read = reader
+            .read_until(b'\n', &mut bytes)
+            .map_err(source_io_fault)?;
+        if read == 0 {
+            break;
+        }
+        line = line
+            .checked_add(1)
+            .ok_or_else(|| SourceFault::Io("event line count is exhausted".to_owned()))?;
+        if bytes.last() != Some(&b'\n') {
+            // This may be a writer between its event write and newline write.
+            // Only the caller can decide later that a tail which never grows
+            // belonged to a dead writer, so a live source ignores it for now.
+            break;
+        }
+        bytes.pop();
+        let source = std::str::from_utf8(&bytes).map_err(|error| SourceFault::Malformed {
+            line,
+            message: format!("invalid UTF-8: {error}"),
+        })?;
+        let event = parse_event(source).map_err(|error| SourceFault::Malformed {
+            line,
+            message: error.to_string(),
+        })?;
+        let expected = last_seq
+            .checked_add(1)
+            .ok_or_else(|| SourceFault::Malformed {
+                line,
+                message: "event sequence is exhausted".to_owned(),
+            })?;
+
+        if event.run_id != run {
+            return Err(SourceFault::Malformed {
+                line,
+                message: format!(
+                    "event belongs to run {:?}, not directory run {run:?}",
+                    event.run_id
+                ),
+            });
+        }
+        if event.seq != expected {
+            return Err(SourceFault::Gap {
+                expected,
+                got: event.seq,
+            });
+        }
+        if finished {
+            return Err(SourceFault::Malformed {
+                line,
+                message: format!("event follows {RUN_FINISHED}"),
+            });
+        }
+
+        last_seq = event.seq;
+        finished = event.event_type == RUN_FINISHED;
+        if event.seq > after {
+            events.push(event);
+        }
+    }
+
+    Ok(events)
+}
+
 fn durable_len(path: &Path) -> Result<u64, SinkFault> {
     match fs::metadata(path) {
         Ok(metadata) => Ok(metadata.len()),
@@ -344,6 +480,10 @@ fn append_durably(path: &Path, event: &[u8]) -> Result<u64, SinkFault> {
 
 fn io_fault(error: io::Error) -> SinkFault {
     SinkFault::Io(error.to_string())
+}
+
+fn source_io_fault(error: io::Error) -> SourceFault {
+    SourceFault::Io(error.to_string())
 }
 
 /// Return the directory name for a run under a [`FileSink`] root.
@@ -388,7 +528,7 @@ pub mod conformance {
     use ethogram::{EVENT_SCHEMA_VERSION, Event, EventDraft, parse_event, serialise_event};
     use serde_json::json;
 
-    use super::{RUN_FINISHED, Sink, SinkFault};
+    use super::{RUN_FINISHED, Sink, SinkFault, Source, SourceFault};
 
     static BATTERY_NUMBER: AtomicU64 = AtomicU64::new(0);
 
@@ -418,6 +558,25 @@ pub mod conformance {
         );
         unknown_run_has_sequence_zero(&new_sink, &run(&namespace, "unknown"));
         runs_are_independent(&new_sink, &namespace);
+    }
+
+    /// Run the source conformance battery.
+    ///
+    /// `new_source` must create a source containing exactly the supplied
+    /// already-stamped events. The factory must also admit the deliberate gap
+    /// fixture: conformance needs to verify the read side reports corruption
+    /// rather than silently stepping over it. Each call receives events for a
+    /// fresh run ID, so a factory may safely use one shared test store.
+    pub fn run_source_battery<S, F>(new_source: F)
+    where
+        S: Source,
+        F: Fn(Vec<Event>) -> S,
+    {
+        let namespace = namespace();
+        source_replays_exclusively(&new_source, &run(&namespace, "source-replay"));
+        source_preserves_stamps(&new_source, &run(&namespace, "source-stamps"));
+        source_reports_gap_before_cursor(&new_source, &run(&namespace, "source-gap"));
+        source_does_not_invent_terminal(&new_source, &run(&namespace, "source-live"));
     }
 
     fn namespace() -> String {
@@ -627,6 +786,89 @@ pub mod conformance {
         assert_eq!(sink.last_seq(&second).expect("last b"), 1);
     }
 
+    fn source_replays_exclusively<S, F>(new_source: &F, run: &str)
+    where
+        S: Source,
+        F: Fn(Vec<Event>) -> S,
+    {
+        let events = vec![
+            event(run, 1, "test.first", "1985-10-26T01:21:00.000Z"),
+            event(run, 2, "test.second", "2015-10-21T16:29:00.000Z"),
+        ];
+        let source = new_source(events.clone());
+
+        assert_eq!(
+            source.read_from(run, 0).expect("replay from beginning"),
+            events
+        );
+        assert_eq!(
+            source.read_from(run, 1).expect("exclusive resume"),
+            vec![events[1].clone()]
+        );
+        assert!(
+            source
+                .read_from(run, 2)
+                .expect("resume after last")
+                .is_empty()
+        );
+    }
+
+    fn source_preserves_stamps<S, F>(new_source: &F, run: &str)
+    where
+        S: Source,
+        F: Fn(Vec<Event>) -> S,
+    {
+        let stored = event(run, 1, "test.stamped", "1985-10-26T01:21:00.123Z");
+        let expected = serialise_event(&stored).expect("serialise stored fixture");
+        let source = new_source(vec![stored]);
+        let returned = source
+            .read_from(run, 0)
+            .expect("read stored fixture")
+            .pop()
+            .expect("one stored fixture");
+
+        assert_eq!(
+            serialise_event(&returned).expect("serialise returned fixture"),
+            expected
+        );
+    }
+
+    fn source_reports_gap_before_cursor<S, F>(new_source: &F, run: &str)
+    where
+        S: Source,
+        F: Fn(Vec<Event>) -> S,
+    {
+        let source = new_source(vec![
+            event(run, 1, "test.first", "2026-09-06T00:00:01.000Z"),
+            event(run, 3, "test.gap", "2026-09-06T00:00:03.000Z"),
+        ]);
+
+        assert_eq!(
+            source.read_from(run, 3),
+            Err(SourceFault::Gap {
+                expected: 2,
+                got: 3
+            })
+        );
+    }
+
+    fn source_does_not_invent_terminal<S, F>(new_source: &F, run: &str)
+    where
+        S: Source,
+        F: Fn(Vec<Event>) -> S,
+    {
+        let source = new_source(vec![event(
+            run,
+            1,
+            "test.nonterminal",
+            "2026-09-06T00:00:01.000Z",
+        )]);
+        let events = source.read_from(run, 0).expect("read live run");
+
+        assert_eq!(events.len(), 1);
+        assert!(events.iter().all(|event| event.event_type != RUN_FINISHED));
+    }
+
     fn stored_sequences<O>(stored: &O, run: &str) -> Vec<u64>
     where
         O: Fn(&str) -> Vec<Vec<u8>>,
@@ -654,7 +896,7 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
-    use super::conformance::run_battery;
+    use super::conformance::{run_battery, run_source_battery};
     use super::*;
 
     fn draft(event_type: &str) -> EventDraft {
@@ -684,6 +926,143 @@ mod tests {
         run_battery(
             || FileSink::new(root.path()),
             |run| stored_event_bytes(root.path(), run),
+        );
+    }
+
+    #[test]
+    fn file_sink_passes_source_conformance_battery() {
+        let root = tempdir().expect("battery directory");
+        run_source_battery(|events| {
+            let run = events.first().expect("source fixture event").run_id.clone();
+            let directory = root.path().join(run_directory_name(&run));
+            fs::create_dir_all(&directory).expect("create source fixture directory");
+            let mut bytes = Vec::new();
+            for event in events {
+                bytes.extend_from_slice(
+                    serialise_event(&event)
+                        .expect("serialise source fixture")
+                        .as_bytes(),
+                );
+                bytes.push(b'\n');
+            }
+            fs::write(directory.join(EVENTS_FILE), bytes).expect("write source fixture");
+            FileSink::new(root.path())
+        });
+    }
+
+    #[test]
+    fn source_ignores_an_unterminated_tail_then_returns_it_exactly_once() {
+        let root = tempdir().expect("source directory");
+        let sink = FileSink::new(root.path());
+        let first = sink
+            .append("run", draft("test.first"))
+            .expect("first append");
+        let mut second = first.clone();
+        second.seq = 2;
+        second.event_type = "test.second".to_owned();
+        second.ts = "1985-10-26T01:21:00.123Z".to_owned();
+        second.payload = json!({ "stored": "exactly" });
+        second.captured_at = Some("1985-10-26T01:20:59.999Z".to_owned());
+        let line = serialise_event(&second).expect("serialise second event");
+        let path = root.path().join("run").join(EVENTS_FILE);
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open event log");
+        file.write_all(line.as_bytes())
+            .expect("write in-flight line");
+        file.flush().expect("flush in-flight line");
+
+        assert_eq!(
+            sink.read_from("run", 0)
+                .expect("in-flight tail is not corrupt"),
+            vec![first]
+        );
+
+        file.write_all(b"\n").expect("complete in-flight line");
+        file.flush().expect("flush completed line");
+        assert_eq!(
+            sink.read_from("run", 1).expect("read completed line"),
+            vec![second]
+        );
+        assert!(
+            sink.read_from("run", 2)
+                .expect("completed line is not duplicated")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn source_gap_fault_names_expected_and_received_sequences() {
+        let root = tempdir().expect("source directory");
+        let sink = FileSink::new(root.path());
+        let first = sink
+            .append("run", draft("test.first"))
+            .expect("first append");
+        let mut third = first;
+        third.seq = 3;
+        third.event_type = "test.third".to_owned();
+        let line = serialise_event(&third).expect("serialise gap event");
+        let path = root.path().join("run").join(EVENTS_FILE);
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(path)
+            .expect("open event log");
+        file.write_all(line.as_bytes()).expect("write gap event");
+        file.write_all(b"\n").expect("terminate gap event");
+        file.flush().expect("flush gap event");
+
+        assert_eq!(
+            sink.read_from("run", 0),
+            Err(SourceFault::Gap {
+                expected: 2,
+                got: 3
+            })
+        );
+    }
+
+    #[test]
+    fn source_rejects_a_malformed_complete_line() {
+        let root = tempdir().expect("source directory");
+        let directory = root.path().join("run");
+        fs::create_dir(&directory).expect("create run directory");
+        fs::write(directory.join(EVENTS_FILE), b"not an event\n").expect("write malformed event");
+
+        assert!(matches!(
+            FileSink::new(root.path()).read_from("run", 0),
+            Err(SourceFault::Malformed { line: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn reads_do_not_disturb_gapless_appends() {
+        let root = tempdir().expect("source directory");
+        let sink = FileSink::new(root.path());
+        let first = sink
+            .append("run", draft("test.first"))
+            .expect("first append");
+        assert_eq!(sink.read_from("run", 0).expect("first read"), vec![first]);
+
+        let second = FileSink::new(root.path())
+            .append("run", draft("test.second"))
+            .expect("append through another instance");
+        assert_eq!(second.seq, 2);
+        assert_eq!(
+            sink.read_from("run", 1).expect("read external append"),
+            vec![second]
+        );
+
+        let third = sink
+            .append("run", draft("test.third"))
+            .expect("append after reads");
+        assert_eq!(third.seq, 3);
+        assert_eq!(
+            sink.read_from("run", 0)
+                .expect("read gapless result")
+                .into_iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
         );
     }
 
