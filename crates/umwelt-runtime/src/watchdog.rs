@@ -1,10 +1,10 @@
 //! Cap enforcement over normalised harness events and a monotonic clock.
 //!
 //! Idle time means time since the last observed event, but it does not advance
-//! while a tool call is in flight. Suspension is reference-counted rather than
-//! boolean: every `agent.tool_use` increments the count, every
-//! `agent.tool_result` decrements it, and idle timing resumes only after all
-//! concurrent calls have closed. The decrement saturates at zero so an
+//! while a tool call is in flight. Suspension follows tool-call identities:
+//! every `agent.tool_use` appends its `toolUseId`, every `agent.tool_result`
+//! removes its matching id, and idle timing resumes only after all concurrent
+//! calls have closed. Removing an id that was never opened is a no-op, so an
 //! unpaired result cannot cancel a later, genuine suspension. Every event
 //! resets idle, including a sub-agent event observed while its parent's tool
 //! call is open, because that event is evidence of activity.
@@ -40,8 +40,9 @@ use std::{
 
 use ethogram::{
     AGENT_COMPLETED, AGENT_STARTED, AGENT_TOOL_RESULT, AGENT_TOOL_USE, AGENT_WARNING,
-    AgentCompletedPayload, AgentStartedPayload, AgentWarningPayload, Event, EventDraft,
-    PayloadExtension, RUN_FINISHED, RunFinishedPayload, RunOutcome, RunUsage,
+    AgentCompletedPayload, AgentStartedPayload, AgentToolResultPayload, AgentToolUsePayload,
+    AgentWarningPayload, Event, EventDraft, PayloadExtension, RUN_FINISHED, RunFinishedPayload,
+    RunOutcome, RunUsage,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -188,7 +189,7 @@ pub struct CapsWatchdog<C> {
     clock: C,
     started_at: Duration,
     last_observed_at: Duration,
-    open_tool_calls: u64,
+    open_tool_calls: Vec<Option<String>>,
     turns: u64,
     last_started_session_id: Option<String>,
     session_costs: HashMap<SessionKey, Option<u64>>,
@@ -206,7 +207,7 @@ impl<C: Clock> CapsWatchdog<C> {
             clock,
             started_at: now,
             last_observed_at: now,
-            open_tool_calls: 0,
+            open_tool_calls: Vec::new(),
             turns: 0,
             last_started_session_id: None,
             session_costs: HashMap::new(),
@@ -245,12 +246,8 @@ impl<C: Clock> CapsWatchdog<C> {
 
         self.last_observed_at = self.clock.now();
         match event.event_type.as_str() {
-            AGENT_TOOL_USE => {
-                self.open_tool_calls = self.open_tool_calls.saturating_add(1);
-            }
-            AGENT_TOOL_RESULT => {
-                self.open_tool_calls = self.open_tool_calls.saturating_sub(1);
-            }
+            AGENT_TOOL_USE => self.observe_tool_use(event)?,
+            AGENT_TOOL_RESULT => self.observe_tool_result(event)?,
             AGENT_STARTED => self.observe_started(event)?,
             AGENT_COMPLETED => self.observe_completed(event)?,
             _ => {}
@@ -261,6 +258,55 @@ impl<C: Clock> CapsWatchdog<C> {
     /// Evaluate clock-derived caps without observing a new event.
     pub fn check(&mut self) -> Option<CapTrip> {
         self.evaluate()
+    }
+
+    /// Return the most recently opened tool call that is still open.
+    #[must_use]
+    pub fn most_recent_open_tool_call(&self) -> Option<&str> {
+        self.open_tool_calls.last().and_then(Option::as_deref)
+    }
+
+    /// Build the terminal payload for an operator interruption.
+    #[must_use]
+    pub fn interrupted_payload(&self) -> RunFinishedPayload {
+        let duration_ms = duration_ms(self.clock.now().saturating_sub(self.started_at));
+        let totals = self.observed_totals();
+        RunFinishedPayload {
+            outcome: RunOutcome::Interrupted,
+            reason: None,
+            truncated: None,
+            cost_usd: totals.cost_microusd.map(micros_to_dollars),
+            usage: totals.usage.to_wire(),
+            duration_ms,
+            estimated: Some(true),
+            extra: PayloadExtension::new(),
+        }
+    }
+
+    fn observe_tool_use(&mut self, event: &Event) -> Result<(), WatchdogError> {
+        let tool_use = serde_json::from_value::<AgentToolUsePayload>(event.payload.clone())
+            .map_err(|source| WatchdogError::InvalidObservation {
+                event_type: event.event_type.clone(),
+                source,
+            })?;
+        self.open_tool_calls.push(tool_use.tool_use_id);
+        Ok(())
+    }
+
+    fn observe_tool_result(&mut self, event: &Event) -> Result<(), WatchdogError> {
+        let tool_result = serde_json::from_value::<AgentToolResultPayload>(event.payload.clone())
+            .map_err(|source| WatchdogError::InvalidObservation {
+            event_type: event.event_type.clone(),
+            source,
+        })?;
+        if let Some(position) = self
+            .open_tool_calls
+            .iter()
+            .rposition(|open_id| open_id == &tool_result.tool_use_id)
+        {
+            self.open_tool_calls.remove(position);
+        }
+        Ok(())
     }
 
     fn observe_started(&mut self, event: &Event) -> Result<(), WatchdogError> {
@@ -316,7 +362,9 @@ impl<C: Clock> CapsWatchdog<C> {
 
         let now = self.clock.now();
         let wall_ms = duration_ms(now.saturating_sub(self.started_at));
-        let idle_ms = (self.open_tool_calls == 0)
+        let idle_ms = self
+            .open_tool_calls
+            .is_empty()
             .then(|| duration_ms(now.saturating_sub(self.last_observed_at)));
         let totals = self.observed_totals();
         let tokens = totals.usage.total_tokens();
@@ -645,6 +693,39 @@ mod tests {
 
     fn ordinary_event(run: &str, event_type: &str) -> Event {
         event(run, event_type, json!({ "fixture": true }))
+    }
+
+    fn tool_use(tool_use_id: &str) -> Event {
+        event(
+            "run",
+            AGENT_TOOL_USE,
+            typed_payload(AgentToolUsePayload {
+                stage: Some("act".to_owned()),
+                tool: "fixture".to_owned(),
+                input_excerpt: None,
+                truncated: None,
+                tool_use_id: Some(tool_use_id.to_owned()),
+                parent_tool_use_id: None,
+                extra: PayloadExtension::new(),
+            }),
+        )
+    }
+
+    fn tool_result(tool_use_id: &str) -> Event {
+        event(
+            "run",
+            AGENT_TOOL_RESULT,
+            typed_payload(AgentToolResultPayload {
+                stage: Some("act".to_owned()),
+                tool: "fixture".to_owned(),
+                is_error: Some(false),
+                result_excerpt: None,
+                truncated: None,
+                tool_use_id: Some(tool_use_id.to_owned()),
+                parent_tool_use_id: None,
+                extra: PayloadExtension::new(),
+            }),
+        )
     }
 
     fn completed(turns: Option<u64>, tokens: Option<u64>, cost_usd: Option<f64>) -> Event {
@@ -1199,13 +1280,46 @@ mod tests {
             clock.clone(),
         )
         .expect("watchdog");
-        watchdog
-            .observe(&ordinary_event("run", AGENT_TOOL_USE))
-            .expect("tool use");
+        watchdog.observe(&tool_use("tool-1")).expect("tool use");
 
         clock.advance(100);
 
         assert!(watchdog.check().is_none());
+    }
+
+    #[test]
+    fn idless_tool_events_preserve_the_existing_idle_suspension() {
+        let clock = ManualClock::default();
+        let mut watchdog = CapsWatchdog::new(
+            RunCaps {
+                idle_ms: Some(10),
+                ..caps()
+            },
+            clock.clone(),
+        )
+        .expect("watchdog");
+        let mut use_payload = tool_use("placeholder");
+        use_payload
+            .payload
+            .as_object_mut()
+            .expect("tool use payload")
+            .remove("toolUseId");
+        watchdog.observe(&use_payload).expect("idless tool use");
+        clock.advance(100);
+        assert!(watchdog.check().is_none());
+
+        let mut result_payload = tool_result("placeholder");
+        result_payload
+            .payload
+            .as_object_mut()
+            .expect("tool result payload")
+            .remove("toolUseId");
+        watchdog
+            .observe(&result_payload)
+            .expect("idless tool result");
+        clock.advance(10);
+
+        assert_eq!(watchdog.check().expect("idle resumed").cap(), Cap::Idle);
     }
 
     #[test]
@@ -1220,20 +1334,20 @@ mod tests {
         )
         .expect("watchdog");
         watchdog
-            .observe(&ordinary_event("run", AGENT_TOOL_USE))
+            .observe(&tool_use("tool-1"))
             .expect("first tool use");
         watchdog
-            .observe(&ordinary_event("run", AGENT_TOOL_USE))
+            .observe(&tool_use("tool-2"))
             .expect("second tool use");
         clock.advance(100);
         watchdog
-            .observe(&ordinary_event("run", AGENT_TOOL_RESULT))
+            .observe(&tool_result("tool-1"))
             .expect("first tool result");
         clock.advance(100);
         assert!(watchdog.check().is_none());
 
         watchdog
-            .observe(&ordinary_event("run", AGENT_TOOL_RESULT))
+            .observe(&tool_result("tool-2"))
             .expect("second tool result");
         clock.advance(10);
 
@@ -1252,10 +1366,10 @@ mod tests {
         )
         .expect("watchdog");
         watchdog
-            .observe(&ordinary_event("run", AGENT_TOOL_RESULT))
+            .observe(&tool_result("never-opened"))
             .expect("unpaired result");
         watchdog
-            .observe(&ordinary_event("run", AGENT_TOOL_USE))
+            .observe(&tool_use("genuine"))
             .expect("genuine tool use");
 
         clock.advance(100);
@@ -1275,7 +1389,7 @@ mod tests {
         )
         .expect("watchdog");
         watchdog
-            .observe(&ordinary_event("parent", AGENT_TOOL_USE))
+            .observe(&tool_use("parent-tool"))
             .expect("parent tool use");
         clock.advance(7);
 
@@ -1284,7 +1398,7 @@ mod tests {
             .expect("subagent activity");
 
         assert_eq!(watchdog.last_observed_at, Duration::from_millis(7));
-        assert_eq!(watchdog.open_tool_calls, 1);
+        assert_eq!(watchdog.open_tool_calls, [Some("parent-tool".to_owned())]);
     }
 
     #[test]
