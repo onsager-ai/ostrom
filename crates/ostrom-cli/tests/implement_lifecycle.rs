@@ -386,6 +386,40 @@ fn token_ceiling_is_recorded_after_codex_completes() {
 }
 
 #[test]
+fn inherited_lease_refusal_still_emits_a_terminal_run() {
+    let fixture = Fixture::new(100);
+    fs::write(
+        &fixture.lease_file,
+        "{\"owner\":\"another-unit\",\"started_at\":1,\"expires_at\":9999999999}\n",
+    )
+    .expect("write mismatched dispatch lease");
+    let lease_name = fixture
+        .lease_file
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("UTF-8 lease name");
+    let output = fixture
+        .command("complete")
+        .env("MANDATE_LEASE_NAME", lease_name)
+        .output()
+        .expect("run refused implementer");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("lease-owner-mismatch"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(fixture.lease_file.exists());
+    let events = fixture.run_events();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["type"], "run.started");
+    assert_eq!(events[1]["type"], "run.finished");
+    assert_eq!(events[1]["payload"]["outcome"], "failed");
+    assert_eq!(events[1]["payload"]["reason"], "lease-owner-mismatch");
+}
+
+#[test]
 fn implementer_events_fd_bytes_match_the_durable_stream() {
     let fixture = Fixture::new(100);
     fixture.acquire();

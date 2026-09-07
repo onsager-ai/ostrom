@@ -315,7 +315,7 @@ fn run_implement_with_registry_and_minter(
     let inherited_lease_name = environment::MANDATE_LEASE_NAME
         .value()
         .filter(|name| !name.trim().is_empty());
-    let mut inherited_lease = inherited_lease_name
+    let inherited_lease = inherited_lease_name
         .as_deref()
         .map(|lease_name| {
             adopt_implementer_lease(
@@ -324,12 +324,12 @@ fn run_implement_with_registry_and_minter(
                 &request.order_file.display().to_string(),
             )
         })
-        .transpose()?;
+        .transpose();
     let order = fs::read(&request.order_file)
         .map_err(|_| ())
         .and_then(|bytes| WorkOrder::from_json(&bytes).map_err(|_| ()));
     let runner = registry.get(runner_name);
-    let run_events = RunEventGuard::start(
+    let mut run_events = RunEventGuard::start(
         &request.paths,
         request.events_fd,
         request.clock.clone(),
@@ -367,13 +367,25 @@ fn run_implement_with_registry_and_minter(
             format!("could not append run.started: {error}"),
         )
     })?;
-    let order = order.map_err(|()| {
-        ImplementError::new(
-            2,
-            "work-order-invalid",
-            "invalid schema_version 1 work order",
-        )
-    })?;
+    let mut inherited_lease = match inherited_lease {
+        Ok(lease) => lease,
+        Err(error) => {
+            finish_preflight_run(&mut run_events, &error)?;
+            return Err(error);
+        }
+    };
+    let order = match order {
+        Ok(order) => order,
+        Err(()) => {
+            let error = ImplementError::new(
+                2,
+                "work-order-invalid",
+                "invalid schema_version 1 work order",
+            );
+            finish_preflight_run(&mut run_events, &error)?;
+            return Err(error);
+        }
+    };
     let lease_name = format!("implementer-item-{}.lease", order.item_hash());
     // Dispatch owns this item lease until a terminal row is durable; adoption
     // prevents an independently launched implementer from spending the order.
@@ -381,16 +393,24 @@ fn run_implement_with_registry_and_minter(
         .as_deref()
         .is_some_and(|inherited| inherited != lease_name)
     {
-        return Err(ImplementError::new(
+        let error = ImplementError::new(
             1,
             "lease-name-mismatch",
             format!("lease-name-mismatch: {}", order.item_id),
-        ));
+        );
+        finish_preflight_run(&mut run_events, &error)?;
+        return Err(error);
     }
-    let lease = inherited_lease.take().map_or_else(
+    let lease = match inherited_lease.take().map_or_else(
         || adopt_implementer_lease(request, &lease_name, &order.item_id),
         Ok,
-    )?;
+    ) {
+        Ok(lease) => lease,
+        Err(error) => {
+            finish_preflight_run(&mut run_events, &error)?;
+            return Err(error);
+        }
+    };
     let mut guard = TerminalGuard {
         paths: request.paths.clone(),
         lease,
@@ -427,6 +447,26 @@ fn run_implement_with_registry_and_minter(
             Err(error)
         }
     }
+}
+
+fn finish_preflight_run(
+    run_events: &mut RunEventGuard,
+    error: &ImplementError,
+) -> Result<(), ImplementError> {
+    run_events
+        .finish(
+            EventRunOutcome::Failed,
+            Some(error.reason.clone()),
+            None,
+            None,
+        )
+        .map_err(|event_error| {
+            ImplementError::new(
+                1,
+                "run-event-finish-failed",
+                format!("could not append run.finished: {event_error}"),
+            )
+        })
 }
 
 fn adopt_implementer_lease(
