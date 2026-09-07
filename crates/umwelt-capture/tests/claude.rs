@@ -1,19 +1,69 @@
 use std::fs;
 use std::path::Path;
 
-use ethogram::{AGENT_COMPLETED, AGENT_TEXT, MAX_EXCERPT_SCALARS, MAX_TEXT_SCALARS, parse_event};
+use ethogram::{
+    AGENT_COMPLETED, AGENT_TEXT, AGENT_TOOL_RESULT, AGENT_WARNING, MAX_EXCERPT_SCALARS,
+    MAX_TEXT_SCALARS, parse_event,
+};
 use serde_json::json;
-use umwelt_capture::Normaliser;
 use umwelt_capture::claude::ClaudeNormaliser;
 use umwelt_capture::golden::walk_corpus;
+use umwelt_capture::{CaptureFault, Normaliser};
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/claude");
 
 #[test]
 fn corpus_matches_for_file_and_in_memory_sources_and_refuses_unknown_types() {
     let report = walk_corpus(ClaudeNormaliser::new, FIXTURES).expect("Claude corpus must match");
-    assert_eq!(report.cases, 2);
+    assert_eq!(report.cases, 3);
     assert_eq!(report.refusals, 1);
+}
+
+#[test]
+fn captured_error_max_turns_emits_completion_totals_then_pinned_warning() {
+    assert_non_success_result(
+        "error_max_turns",
+        "claude result subtype \"error_max_turns\"",
+    );
+}
+
+#[test]
+fn uncaptured_error_during_execution_is_mapped_without_an_allowlist() {
+    assert_non_success_result(
+        "error_during_execution",
+        "claude result subtype \"error_during_execution\"",
+    );
+}
+
+#[test]
+fn non_success_result_missing_a_total_is_refused_with_the_field_name() {
+    let mut normaliser = initialised_normaliser();
+    let fault = normaliser
+        .line(
+            &json!({
+                "type": "result",
+                "subtype": "error_during_execution",
+                "session_id": "result-session",
+                "total_cost_usd": 0.0223935,
+                "usage": {
+                    "input_tokens": 9,
+                    "output_tokens": 193,
+                    "cache_read_input_tokens": 13615,
+                    "cache_creation_input_tokens": 9517
+                },
+                "num_turns": 2
+            })
+            .to_string(),
+        )
+        .expect_err("a missing duration total must be refused");
+
+    assert_eq!(
+        fault,
+        CaptureFault::MalformedLine {
+            line: 2,
+            reason: "missing required field result.duration_ms".to_owned(),
+        }
+    );
 }
 
 #[test]
@@ -107,14 +157,7 @@ fn every_narration_route_is_bounded() {
 
 #[test]
 fn subagent_cost_survives_json_parsing_and_golden_serialisation() {
-    let raw = fs::read_to_string(Path::new(FIXTURES).join("subagent/raw.ndjson"))
-        .expect("read subagent capture");
-    let mut normaliser = ClaudeNormaliser::new();
-    let mut drafts = Vec::new();
-    for line in raw.lines() {
-        drafts.extend(normaliser.line(line).expect("normalise subagent frame"));
-    }
-    drafts.extend(normaliser.finish().expect("finish subagent capture"));
+    let drafts = normalise_fixture("subagent");
 
     let costs: Vec<f64> = drafts
         .iter()
@@ -145,17 +188,49 @@ fn subagent_cost_survives_json_parsing_and_golden_serialisation() {
 }
 
 #[test]
+fn tool_result_is_error_true_is_preserved() {
+    let drafts = normalise_fixture("error-shapes");
+    let result = tool_result(&drafts, "toolu_01VL7aVtfw8YsTXwszEqRDbW");
+    assert_eq!(result.payload.get("isError"), Some(&json!(true)));
+}
+
+#[test]
+fn tool_result_is_error_false_is_preserved() {
+    let drafts = normalise_fixture("subagent");
+    let result = tool_result(&drafts, "toolu_01GvYvaZZx61VzJyHo1mkUpk");
+    assert_eq!(result.payload.get("isError"), Some(&json!(false)));
+}
+
+#[test]
+fn absent_tool_result_is_error_stays_absent() {
+    let drafts = normalise_fixture("subagent");
+    for tool_use_id in [
+        "toolu_01XCdbg7LeoBKasN9qNFddKa",
+        "toolu_01N4UBnESypVtuFSMQMNGTG8",
+    ] {
+        let result = tool_result(&drafts, tool_use_id);
+        assert!(
+            result.payload.get("isError").is_none(),
+            "absent is_error must not become false for {tool_use_id}"
+        );
+    }
+}
+
+#[test]
 fn every_seeded_ethogram_corpus_fixture_matches_our_mapped_fields() {
-    const CORRESPONDING_EVENTS: [(&str, &str, usize); 9] = [
+    const CORRESPONDING_EVENTS: [(&str, &str, usize); 12] = [
+        ("agent-completed-max-turns.json", "error-shapes", 5),
         ("agent-completed-repeated-terminal.json", "subagent", 14),
         ("agent-completed.json", "subagent", 13),
         ("agent-started.json", "subagent", 1),
         ("agent-text-truncated.json", "overbound", 2),
         ("agent-text.json", "subagent", 4),
+        ("agent-tool-result-error.json", "error-shapes", 4),
         ("agent-tool-result-subagent.json", "subagent", 9),
         ("agent-tool-result.json", "subagent", 6),
         ("agent-tool-use-subagent.json", "subagent", 8),
         ("agent-tool-use.json", "subagent", 5),
+        ("agent-warning.json", "error-shapes", 6),
     ];
 
     let fixtures = ethogram_corpus::v1_fixtures();
@@ -165,6 +240,7 @@ fn every_seeded_ethogram_corpus_fixture_matches_our_mapped_fields() {
         "the ethogram corpus inventory changed; map and review every new fixture"
     );
 
+    let mut compared = 0;
     for fixture in fixtures {
         let (_, case, line_number) = CORRESPONDING_EVENTS
             .iter()
@@ -202,7 +278,100 @@ fn every_seeded_ethogram_corpus_fixture_matches_our_mapped_fields() {
                 fixture.name
             );
         }
+        compared += 1;
     }
+    assert!(compared > 0, "the corpus cross-check must compare fixtures");
+    assert_eq!(compared, CORRESPONDING_EVENTS.len());
+}
+
+fn initialised_normaliser() -> ClaudeNormaliser {
+    let mut normaliser = ClaudeNormaliser::new();
+    normaliser
+        .line(
+            &json!({
+                "type": "system",
+                "subtype": "init",
+                "session_id": "result-session",
+                "model": "claude-test"
+            })
+            .to_string(),
+        )
+        .expect("normalise init");
+    normaliser
+}
+
+fn assert_non_success_result(subtype: &str, warning: &str) {
+    let mut normaliser = initialised_normaliser();
+    let drafts = normaliser
+        .line(
+            &json!({
+                "type": "result",
+                "subtype": subtype,
+                "session_id": "result-session",
+                "total_cost_usd": 0.0223935,
+                "usage": {
+                    "input_tokens": 9,
+                    "output_tokens": 193,
+                    "cache_read_input_tokens": 13615,
+                    "cache_creation_input_tokens": 9517
+                },
+                "num_turns": 2,
+                "duration_ms": 3380
+            })
+            .to_string(),
+        )
+        .expect("non-success result with totals must map");
+
+    assert_eq!(drafts.len(), 2);
+    assert_eq!(drafts[0].event_type, AGENT_COMPLETED);
+    assert_eq!(drafts[0].payload["costUsd"], json!(0.0223935));
+    assert_eq!(drafts[0].payload["turns"], 2);
+    assert_eq!(drafts[0].payload["durationMs"], 3380);
+    assert_eq!(drafts[0].payload["sessionId"], "result-session");
+    assert_eq!(
+        drafts[0].payload["usage"],
+        json!({
+            "inputTokens": 9,
+            "outputTokens": 193,
+            "cacheReadTokens": 13615,
+            "cacheCreationTokens": 9517
+        })
+    );
+    assert_eq!(drafts[1].event_type, AGENT_WARNING);
+    assert_eq!(drafts[1].payload["message"], warning);
+}
+
+fn normalise_fixture(case: &str) -> Vec<ethogram::EventDraft> {
+    let raw = fs::read_to_string(Path::new(FIXTURES).join(case).join("raw.ndjson"))
+        .unwrap_or_else(|error| panic!("read {case} capture: {error}"));
+    let mut normaliser = ClaudeNormaliser::new();
+    let mut drafts = Vec::new();
+    for line in raw.lines() {
+        drafts.extend(
+            normaliser
+                .line(line)
+                .unwrap_or_else(|error| panic!("normalise {case} frame: {error}")),
+        );
+    }
+    drafts.extend(
+        normaliser
+            .finish()
+            .unwrap_or_else(|error| panic!("finish {case} capture: {error}")),
+    );
+    drafts
+}
+
+fn tool_result<'a>(
+    drafts: &'a [ethogram::EventDraft],
+    tool_use_id: &str,
+) -> &'a ethogram::EventDraft {
+    drafts
+        .iter()
+        .find(|draft| {
+            draft.event_type == AGENT_TOOL_RESULT
+                && draft.payload["toolUseId"].as_str() == Some(tool_use_id)
+        })
+        .unwrap_or_else(|| panic!("missing agent.tool_result for {tool_use_id}"))
 }
 
 fn assert_bounded(payload: &serde_json::Value, field: &str, bound: usize) {

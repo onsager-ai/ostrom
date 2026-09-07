@@ -3,10 +3,10 @@
 use std::collections::HashMap;
 
 use ethogram::{
-    AGENT_COMPLETED, AGENT_STARTED, AGENT_TEXT, AGENT_TOOL_RESULT, AGENT_TOOL_USE,
+    AGENT_COMPLETED, AGENT_STARTED, AGENT_TEXT, AGENT_TOOL_RESULT, AGENT_TOOL_USE, AGENT_WARNING,
     AgentCompletedPayload, AgentStartedPayload, AgentTextPayload, AgentToolResultPayload,
-    AgentToolUsePayload, EventDraft, MAX_EXCERPT_SCALARS, MAX_TEXT_SCALARS, PayloadExtension,
-    RunUsage, excerpt,
+    AgentToolUsePayload, AgentWarningPayload, EventDraft, MAX_EXCERPT_SCALARS, MAX_TEXT_SCALARS,
+    PayloadExtension, RunUsage, excerpt,
 };
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -161,7 +161,7 @@ impl ClaudeNormaliser {
                 AgentToolResultPayload {
                     stage: None,
                     tool,
-                    is_error: None,
+                    is_error: block.is_error,
                     result_excerpt: Some(excerpt.text),
                     truncated: Some(excerpt.truncated),
                     tool_use_id: Some(tool_use_id),
@@ -176,12 +176,6 @@ impl ClaudeNormaliser {
 
     fn handle_result(&self, frame: RawFrame) -> Result<Vec<EventDraft>, CaptureFault> {
         let subtype = required(frame.subtype, self.line, "result.subtype")?;
-        if subtype != "success" {
-            return Err(rejected(format!(
-                "unknown Claude result subtype {subtype:?} at line {}",
-                self.line
-            )));
-        }
 
         let session_id = self.session_id.clone().ok_or_else(|| {
             rejected(format!(
@@ -197,18 +191,23 @@ impl ClaudeNormaliser {
             )));
         }
 
+        // A capped or errored invocation still spent real money, tokens, turns,
+        // and time. Production does not retain the raw stream, so refusing an
+        // unfamiliar subtype would discard exactly the usage that ceilings are
+        // meant to bound. The four totals are the guard against guessing: when
+        // present they are facts we can report, while the subtype is only a
+        // label carried through verbatim and never interpreted here.
+        let cost_usd = required(frame.total_cost_usd, self.line, "result.total_cost_usd")?;
         let usage = required(frame.usage, self.line, "result.usage")?;
-        Ok(vec![draft(
+        let turns = required(frame.num_turns, self.line, "result.num_turns")?;
+        let duration_ms = required(frame.duration_ms, self.line, "result.duration_ms")?;
+        let mut drafts = vec![draft(
             AGENT_COMPLETED,
             AgentCompletedPayload {
                 stage: None,
-                turns: Some(required(frame.num_turns, self.line, "result.num_turns")?),
+                turns: Some(turns),
                 session_id: Some(session_id),
-                cost_usd: Some(required(
-                    frame.total_cost_usd,
-                    self.line,
-                    "result.total_cost_usd",
-                )?),
+                cost_usd: Some(cost_usd),
                 model: None,
                 usage: Some(RunUsage {
                     input_tokens: Some(required(
@@ -235,15 +234,24 @@ impl ClaudeNormaliser {
                     unit: None,
                     extra: PayloadExtension::new(),
                 }),
-                duration_ms: Some(required(
-                    frame.duration_ms,
-                    self.line,
-                    "result.duration_ms",
-                )?),
+                duration_ms: Some(duration_ms),
                 estimated: None,
                 extra: PayloadExtension::new(),
             },
-        )])
+        )];
+
+        if subtype != "success" {
+            drafts.push(draft(
+                AGENT_WARNING,
+                AgentWarningPayload {
+                    stage: None,
+                    message: format!("claude result subtype \"{subtype}\""),
+                    extra: PayloadExtension::new(),
+                },
+            ));
+        }
+
+        Ok(drafts)
     }
 }
 
@@ -325,6 +333,8 @@ struct RawContentBlock {
     tool_use_id: Option<String>,
     #[serde(default)]
     content: Option<OrderedValue>,
+    #[serde(default)]
+    is_error: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
