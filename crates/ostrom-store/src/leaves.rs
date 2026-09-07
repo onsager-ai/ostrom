@@ -22,7 +22,9 @@ use crate::{
 };
 
 const QUERY_LIMIT: usize = 200;
-const EXCUSE_CONDITIONS: [&str; 5] = [
+const EXCUSE_CONDITIONS: [&str; 7] = [
+    "draft",
+    "mergeable",
     "required_checks",
     "review_threads",
     "bounce_selectors",
@@ -89,7 +91,7 @@ pub enum ExcuseError {
     )]
     Usage,
     #[error(
-        "mandate excuse: condition must be one of required_checks, review_threads, bounce_selectors, reserved_refs, merge_protocol"
+        "mandate excuse: condition must be one of draft, mergeable, required_checks, review_threads, bounce_selectors, reserved_refs, merge_protocol"
     )]
     Condition,
     #[error("mandate excuse: reason must not be empty")]
@@ -627,6 +629,8 @@ struct ExceptionRecord {
     head_sha: String,
     condition: String,
     reason: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    revoked: bool,
 }
 
 pub fn grant_excuse(
@@ -635,6 +639,57 @@ pub fn grant_excuse(
     condition: &str,
     reason_parts: &[String],
     timestamp: Option<DateTime<Utc>>,
+) -> Result<String, ExcuseError> {
+    grant_excuse_at_head(paths, target, condition, reason_parts, timestamp, None)
+}
+
+/// Shares the standalone grant path, with an optional artifact recorded by a decision.
+pub fn grant_excuse_at_head(
+    paths: &OstromPaths,
+    target: &str,
+    condition: &str,
+    reason_parts: &[String],
+    timestamp: Option<DateTime<Utc>>,
+    head_sha: Option<&str>,
+) -> Result<String, ExcuseError> {
+    append_excuse(
+        paths,
+        target,
+        condition,
+        reason_parts,
+        timestamp,
+        head_sha,
+        false,
+    )
+}
+
+pub fn revoke_excuse(
+    paths: &OstromPaths,
+    target: &str,
+    condition: &str,
+    reason_parts: &[String],
+    timestamp: Option<DateTime<Utc>>,
+    head_sha: Option<&str>,
+) -> Result<String, ExcuseError> {
+    append_excuse(
+        paths,
+        target,
+        condition,
+        reason_parts,
+        timestamp,
+        head_sha,
+        true,
+    )
+}
+
+fn append_excuse(
+    paths: &OstromPaths,
+    target: &str,
+    condition: &str,
+    reason_parts: &[String],
+    timestamp: Option<DateTime<Utc>>,
+    recorded_head: Option<&str>,
+    revoked: bool,
 ) -> Result<String, ExcuseError> {
     require_gh()?;
     let (repo, pr) = parse_target(target)?;
@@ -645,7 +700,18 @@ pub fn grant_excuse(
     if reason.is_empty() {
         return Err(ExcuseError::EmptyReason);
     }
-    let head_sha = resolve_head(target, repo, pr)?;
+    let head_sha = match recorded_head {
+        Some(head) => {
+            if head.len() != 40 || !head.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(ExcuseError::InvalidHead {
+                    target: target.to_owned(),
+                    detail: String::new(),
+                });
+            }
+            head.to_owned()
+        }
+        None => resolve_head(target, repo, pr)?,
+    };
     let timestamp = timestamp.map_or_else(current_time, Ok)?;
     let record = ExceptionRecord {
         ts: timestamp.to_rfc3339_opts(SecondsFormat::Secs, true),
@@ -654,6 +720,7 @@ pub fn grant_excuse(
         head_sha,
         condition: condition.to_owned(),
         reason,
+        revoked,
     };
     let encoded = serde_json::to_string(&record).map_err(|_| {
         ExcuseError::Write(paths.state.join("exceptions.jsonl").display().to_string())
@@ -669,6 +736,30 @@ pub fn grant_excuse(
     file.write_all(format!("{encoded}\n").as_bytes())
         .map_err(|_| ExcuseError::Write(path.display().to_string()))?;
     Ok(format!("{encoded}\n"))
+}
+
+/// The gate and sweep share the same append-only grant/revocation interpretation.
+pub(crate) fn active_exception_reason<'a>(
+    records: &'a [Value],
+    repo: &str,
+    pr: u64,
+    head_sha: &str,
+    condition: &str,
+) -> Option<&'a str> {
+    records
+        .iter()
+        .rev()
+        .find(|record| {
+            record["repo"].as_str() == Some(repo)
+                && record["pr"].as_u64() == Some(pr)
+                && record["head_sha"].as_str() == Some(head_sha)
+                && record["condition"].as_str() == Some(condition)
+                && record["reason"]
+                    .as_str()
+                    .is_some_and(|reason| !reason.is_empty())
+        })
+        .filter(|record| record["revoked"] != true)
+        .and_then(|record| record["reason"].as_str())
 }
 
 pub fn list_excuses(paths: &OstromPaths, filter: Option<&str>) -> Result<String, ExcuseError> {
@@ -713,7 +804,9 @@ pub fn list_excuses(paths: &OstromPaths, filter: Option<&str>) -> Result<String,
         }
         let recorded_head = string_value(record.get("head_sha"));
         let current = heads.get(&target).map_or("", String::as_str);
-        let state = if current.is_empty() {
+        let state = if record["revoked"] == true {
+            "revoked"
+        } else if current.is_empty() {
             "unknown"
         } else if current == recorded_head {
             "current"
@@ -740,7 +833,7 @@ fn require_gh() -> Result<(), ExcuseError> {
         .ok_or(ExcuseError::GhRequired)
 }
 
-fn parse_target(target: &str) -> Result<(&str, u64), ExcuseError> {
+pub(crate) fn parse_target(target: &str) -> Result<(&str, u64), ExcuseError> {
     let pattern = Regex::new(r"^[^/\s#]+/[^/\s#]+#[1-9][0-9]*$").expect("target regex is valid");
     if !pattern.is_match(target) {
         return Err(ExcuseError::Usage);
@@ -1152,4 +1245,38 @@ fn push_count(text: &mut String, label: &str, count: usize) {
 fn push_line(text: &mut String, line: &str) {
     text.push_str(line);
     text.push('\n');
+}
+
+#[cfg(test)]
+mod exception_tests {
+    use super::active_exception_reason;
+    use serde_json::json;
+
+    #[test]
+    fn only_the_latest_event_for_the_exact_artifact_and_condition_applies() {
+        let grant = json!({"repo":"example/repo", "pr":19, "head_sha":"a", "condition":"merge_protocol", "reason":"accepted"});
+        let mut revoked = grant.clone();
+        revoked["revoked"] = json!(true);
+        let active = |records: &[serde_json::Value]| {
+            active_exception_reason(records, "example/repo", 19, "a", "merge_protocol").is_some()
+        };
+        assert!(active(std::slice::from_ref(&grant)));
+        assert!(!active(&[grant.clone(), revoked.clone()]));
+        assert!(active(&[grant.clone(), revoked.clone(), grant.clone()]));
+        for (field, value) in [
+            ("repo", json!("other/repo")),
+            ("pr", json!(20)),
+            ("head_sha", json!("b")),
+            ("condition", json!("required_checks")),
+            ("reason", json!("")),
+        ] {
+            let mut unrelated = revoked.clone();
+            unrelated[field] = value;
+            assert!(
+                active(&[grant.clone(), unrelated]),
+                "unrelated {field} cannot revoke this grant"
+            );
+        }
+        assert!(!active(&[]));
+    }
 }

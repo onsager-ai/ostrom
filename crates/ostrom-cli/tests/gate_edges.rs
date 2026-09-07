@@ -39,6 +39,10 @@ projects:
         executable(
             &bin.join("gh"),
             r#"
+if [ "$1 $2" = "api user" ]; then
+  printf '%s\n' '{"id":42,"login":"fixture-principal"}'
+  exit 0
+fi
 mode=${OSTROM_TEST_GATE_MODE:-pass}
 check=success
 case "$mode" in
@@ -631,4 +635,78 @@ fn gate_cli_reports_decision_delivery_failure_and_retries_after_repair() {
     assert_eq!(output.status.code(), Some(2), "{output:?}");
     assert!(fixture.home.join("gate.jsonl").exists());
     assert!(fixture.home.join("sprint.jsonl").exists());
+}
+
+#[test]
+fn answering_a_gate_excuses_its_recorded_head_and_revoking_restores_the_condition() {
+    use umwelt_runtime::{FileSink, Source};
+    let fixture = Fixture::new();
+    let head = "a".repeat(40);
+    for (mode, condition) in [
+        ("unknown-check", "required_checks"),
+        ("unknown-mergeable", "mergeable"),
+    ] {
+        let number = if condition == "required_checks" {
+            19
+        } else {
+            20
+        };
+        assert_eq!(fixture.run(mode, number, &head).status.code(), Some(2));
+        let target = format!("example-org/example-repo#{number}");
+        let events = FileSink::new(fixture.home.join("runs"))
+            .read_from("gate", 0)
+            .unwrap();
+        let request = events
+            .iter()
+            .rev()
+            .find(|event| {
+                event.event_type == ethogram::DECISION_REQUESTED
+                    && event.payload["subject"] == target
+            })
+            .unwrap();
+        let decision_id = request.payload["decisionId"].as_str().unwrap();
+        let answer = |option: &str| {
+            Command::new(env!("CARGO_BIN_EXE_ostrom"))
+                .args([
+                    "queue",
+                    "approve",
+                    &target,
+                    "--decision",
+                    decision_id,
+                    "--option",
+                    option,
+                ])
+                .env_clear()
+                .env("HOME", fixture.root.path())
+                .env(
+                    "PATH",
+                    env::join_paths([
+                        fixture.bin.clone(),
+                        PathBuf::from("/usr/bin"),
+                        PathBuf::from("/bin"),
+                    ])
+                    .unwrap(),
+                )
+                .env("OSTROM_HOME", &fixture.home)
+                // The current remote head differs; the answer must use the recorded one.
+                .env("OSTROM_TEST_GATE_HEAD", "b".repeat(40))
+                .current_dir(fixture.root.path())
+                .output()
+                .unwrap()
+        };
+        let output = answer(&format!("excuse:{condition}"));
+        assert!(output.status.success(), "{output:?}");
+        let output = fixture.run(mode, number, &head);
+        assert!(output.status.success(), "{output:?}");
+        assert!(output_text(&output).contains(&format!("condition {condition}: excused")));
+        // A new commit never inherits the old exception.
+        let output = fixture.run(mode, number, &"b".repeat(40));
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(output_text(&output).contains(&format!("condition {condition}: inconclusive")));
+        let output = answer(&format!("revoke:{condition}"));
+        assert!(output.status.success(), "{output:?}");
+        let output = fixture.run(mode, number, &head);
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(output_text(&output).contains(&format!("condition {condition}: inconclusive")));
+    }
 }

@@ -514,9 +514,16 @@ mod tests {
             ("decision_id".to_owned(), json!("decision-1")),
             ("option".to_owned(), json!("approve")),
             ("by".to_owned(), json!("principal-id")),
+            ("reversal".to_owned(), json!("reject")),
         ]);
         assert!(EventPayload::new(requested.clone()).is_ok());
-        assert!(EventPayload::new(answered).is_ok());
+        assert!(EventPayload::new(answered.clone()).is_ok());
+        let mut narrated_answer = answered;
+        narrated_answer.insert(
+            "dossier".to_owned(),
+            json!({"question": "private narration"}),
+        );
+        assert!(EventPayload::new(narrated_answer).is_err());
         for (kind, subject) in [
             ("tripwire", "synthetic-org/project#42"),
             ("budget", "account:/synthetic/ostrom"),

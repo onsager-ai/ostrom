@@ -1594,15 +1594,13 @@ fn apply_exceptions(
             continue;
         }
         let name = condition["name"].as_str().unwrap_or_default();
-        let reason = records.iter().rev().find_map(|record| {
-            (record["repo"].as_str() == Some(target.repo)
-                && record["pr"].as_u64() == Some(target.number)
-                && record["head_sha"].as_str() == Some(head_sha)
-                && record["condition"].as_str() == Some(name))
-            .then(|| record["reason"].as_str())
-            .flatten()
-            .filter(|reason| !reason.is_empty())
-        });
+        let reason = crate::leaves::active_exception_reason(
+            &records,
+            target.repo,
+            target.number,
+            head_sha,
+            name,
+        );
         if let Some(reason) = reason {
             condition["result"] = Value::String("excused".to_owned());
             condition
