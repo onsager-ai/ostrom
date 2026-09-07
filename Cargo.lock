@@ -82,7 +82,7 @@ dependencies = [
 [[package]]
 name = "ethogram"
 version = "0.1.0"
-source = "git+https://github.com/onsager-ai/ethogram?rev=6a224d9b3d97cf7317d933a3c86f3f0c377994d4#6a224d9b3d97cf7317d933a3c86f3f0c377994d4"
+source = "git+https://github.com/onsager-ai/ethogram?rev=00b31a787b8dfc1113f1117d15b4cac43443affb#00b31a787b8dfc1113f1117d15b4cac43443affb"
 dependencies = [
  "serde",
  "serde_json",

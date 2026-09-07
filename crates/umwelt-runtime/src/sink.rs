@@ -10,9 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use chrono::{SecondsFormat, Utc};
-use ethogram::{Event, EventDraft, StampFields, parse_event, serialise_event, stamp};
-
-use crate::event_types::RUN_FINISHED;
+use ethogram::{Event, EventDraft, RUN_FINISHED, StampFields, parse_event, serialise_event, stamp};
 
 const EVENTS_FILE: &str = "events.jsonl";
 

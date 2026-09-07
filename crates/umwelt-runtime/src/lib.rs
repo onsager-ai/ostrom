@@ -3,7 +3,6 @@
 pub mod agent;
 pub mod command;
 mod environment;
-mod event_types;
 pub mod follower;
 pub mod loop_units;
 pub mod operation_settings;

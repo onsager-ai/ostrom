@@ -21,17 +21,15 @@ use std::{
 };
 
 use ethogram::{
-    AgentCompletedPayload, AgentWarningPayload, Event, EventDraft, PayloadExtension,
-    RunFinishedPayload, RunOutcome, RunUsage,
+    AGENT_COMPLETED, AGENT_TOOL_RESULT, AGENT_TOOL_USE, AGENT_WARNING, AgentCompletedPayload,
+    AgentWarningPayload, Event, EventDraft, PayloadExtension, RUN_FINISHED, RunFinishedPayload,
+    RunOutcome, RunUsage,
 };
 use serde_json::Value;
 use thiserror::Error;
 
 use crate::{
     agent::RunCaps,
-    event_types::{
-        AGENT_COMPLETED, AGENT_TOOL_RESULT, AGENT_TOOL_USE, AGENT_WARNING, RUN_FINISHED,
-    },
     process_control,
     sink::{Sink, SinkFault},
 };
@@ -356,10 +354,10 @@ impl<C: Clock> CapsWatchdog<C> {
         duration_ms: u64,
     ) -> RunFinishedPayload {
         RunFinishedPayload {
-            // Provisional until ethogram::RunOutcome gains `Capped`: wall and
-            // idle are true timeouts, while turns, tokens, and cost temporarily
-            // use TimedOut with a reason that names the non-time cap.
-            outcome: RunOutcome::TimedOut,
+            outcome: match cap {
+                Cap::Wall | Cap::Idle => RunOutcome::TimedOut,
+                Cap::Turns | Cap::Tokens | Cap::Cost => RunOutcome::Capped,
+            },
             reason: Some(reason(cap, measured, limit)),
             truncated: Some(false),
             cost_usd: self
@@ -591,6 +589,7 @@ mod tests {
             typed_payload(AgentCompletedPayload {
                 stage: Some("finish".to_owned()),
                 turns,
+                session_id: None,
                 cost_usd,
                 model: None,
                 usage: tokens.map(|input_tokens| RunUsage {
@@ -684,7 +683,7 @@ mod tests {
 
         assert_named(&trip, Cap::Turns);
         assert_eq!(trip.measured(), CapMeasurement::Count(2));
-        assert_eq!(trip.finished().outcome, RunOutcome::TimedOut);
+        assert_eq!(trip.finished().outcome, RunOutcome::Capped);
         assert_eq!(trip.into_finished_draft().event_type, RUN_FINISHED);
     }
 
@@ -707,7 +706,7 @@ mod tests {
 
         assert_named(&trip, Cap::Tokens);
         assert_eq!(trip.measured(), CapMeasurement::Count(30));
-        assert_eq!(trip.finished().outcome, RunOutcome::TimedOut);
+        assert_eq!(trip.finished().outcome, RunOutcome::Capped);
         assert_eq!(trip.into_finished_draft().event_type, RUN_FINISHED);
     }
 
@@ -736,7 +735,7 @@ mod tests {
 
         assert_named(&trip, Cap::Cost);
         assert_eq!(trip.measured(), CapMeasurement::Microdollars(300_000));
-        assert_eq!(trip.finished().outcome, RunOutcome::TimedOut);
+        assert_eq!(trip.finished().outcome, RunOutcome::Capped);
         assert_eq!(trip.into_finished_draft().event_type, RUN_FINISHED);
     }
 
@@ -926,12 +925,5 @@ mod tests {
         .expect("watchdog start");
 
         assert!(sink.events().is_empty());
-    }
-
-    #[test]
-    fn capped_outcome_guard_fails_when_ethogram_adds_the_variant() {
-        // This failure is the signal to map turn, token, and cost trips to the
-        // new Capped variant instead of the provisional TimedOut mapping.
-        assert!(serde_json::from_str::<RunOutcome>("\"capped\"").is_err());
     }
 }

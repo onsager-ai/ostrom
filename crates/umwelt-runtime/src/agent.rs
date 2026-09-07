@@ -62,19 +62,19 @@ impl Default for RunCaps {
 }
 
 impl RunCaps {
-    /// Return the subset of per-run caps that the current ethogram wire can carry.
+    /// Return the per-run caps that the ethogram wire can carry.
     #[must_use]
     pub fn to_wire(&self) -> ethogram::RunCeilings {
         // Kill grace is permanently excluded: it is a local enforcement detail,
         // not information that any wire consumer needs.
-        //
-        // Idle and turn caps are omitted for now only because this ethogram pin
-        // cannot carry them. This exhaustive literal must fail to compile when
-        // ethogram adds those fields so their mappings are added deliberately.
+        // Keep this literal exhaustive so a future ethogram field is a compile
+        // error that requires a deliberate mapping decision.
         ethogram::RunCeilings {
             cost_usd: self.cost_usd,
             tokens: self.tokens,
             wall_ms: self.wall_ms,
+            idle_ms: self.idle_ms,
+            turns: self.turns,
             extra: serde_json::Map::new(),
         }
     }
@@ -832,8 +832,8 @@ mod tests {
     fn run_caps_wire_round_trips_carried_fields() {
         let caps = RunCaps {
             wall_ms: Some(567),
-            idle_ms: None,
-            turns: None,
+            idle_ms: Some(678),
+            turns: Some(12),
             tokens: Some(234),
             cost_usd: Some(1.25),
             kill_grace_ms: 10_000,
@@ -850,6 +850,8 @@ mod tests {
                 cost_usd: Some(1.25),
                 tokens: Some(234),
                 wall_ms: Some(567),
+                idle_ms: Some(678),
+                turns: Some(12),
                 extra: serde_json::Map::new(),
             }
         );
@@ -877,7 +879,7 @@ mod tests {
     }
 
     #[test]
-    fn idle_and_turns_are_absent_only_until_ethogram_can_carry_them() {
+    fn idle_and_turns_are_carried_on_wire() {
         let caps = RunCaps {
             wall_ms: Some(123),
             idle_ms: Some(456),
@@ -889,11 +891,8 @@ mod tests {
         let value = serde_json::to_value(caps.to_wire()).expect("serialise wire ceilings");
         let object = value.as_object().expect("wire ceilings object");
 
-        // This assertion is expected to change when ethogram adds idleMs and
-        // turns; unlike kill grace, these are absent only because of today's wire.
-        assert!(!object.is_empty());
-        assert!(!object.contains_key("idleMs"));
-        assert!(!object.contains_key("turns"));
+        assert_eq!(object.get("idleMs"), Some(&serde_json::json!(456)));
+        assert_eq!(object.get("turns"), Some(&serde_json::json!(789)));
     }
 
     #[test]
