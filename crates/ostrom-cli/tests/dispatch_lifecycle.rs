@@ -283,6 +283,20 @@ fn invalid_order_after_lease_adoption_releases_the_lease() {
         .expect("run implementer with invalid order");
     assert_eq!(output.status.code(), Some(2));
     assert!(!state.join(lease_name).exists());
+    let run_directories = fs::read_dir(state.join("runs"))
+        .expect("read failed implementer runs")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read failed implementer run entries");
+    assert_eq!(run_directories.len(), 1);
+    let events = fs::read_to_string(run_directories[0].path().join("events.jsonl"))
+        .expect("read failed implementer events")
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("event JSON"))
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["type"], "run.started");
+    assert_eq!(events[1]["type"], "run.finished");
+    assert_eq!(events[1]["payload"]["outcome"], "failed");
 }
 
 fn captured_environment(path: &Path) -> BTreeMap<String, String> {

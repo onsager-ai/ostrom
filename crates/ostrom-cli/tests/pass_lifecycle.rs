@@ -56,6 +56,16 @@ impl Fixture {
         command
     }
 
+    fn events_command(&self, run: &str) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ostrom"));
+        command
+            .args(["events", run])
+            .env_clear()
+            .env("OSTROM_HOME", &self.state)
+            .env("HOME", self.root.path());
+        command
+    }
+
     fn write_blocked_dispatchability_state(&self) {
         fs::write(
             self.state.join("mandates.yaml"),
@@ -129,6 +139,23 @@ projects:
             .collect()
     }
 
+    fn run_events(&self) -> Vec<Value> {
+        String::from_utf8(self.run_event_bytes())
+            .expect("event stream UTF-8")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("event JSON"))
+            .collect()
+    }
+
+    fn run_event_bytes(&self) -> Vec<u8> {
+        let run_directories = fs::read_dir(self.state.join("runs"))
+            .expect("read run directories")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read run directory entries");
+        assert_eq!(run_directories.len(), 1, "expected exactly one pass run");
+        fs::read(run_directories[0].path().join("events.jsonl")).expect("read pass events")
+    }
+
     fn assert_released(&self) {
         assert!(!self.state.join("builder-pass.lease").exists());
         let trace = self.trace();
@@ -137,6 +164,101 @@ projects:
             Some("pass-ended")
         );
     }
+}
+
+#[test]
+fn events_fd_bytes_match_the_durable_stream_and_the_flag_wins() {
+    let fixture = Fixture::new("exit 0");
+    let output = fixture
+        .command()
+        .args(["--events-fd", "1"])
+        .env("OSTROM_EVENTS_FD", "not-a-descriptor")
+        .output()
+        .expect("run pass with an event descriptor");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, fixture.run_event_bytes());
+}
+
+#[test]
+fn events_fd_environment_streams_the_durable_bytes() {
+    let fixture = Fixture::new("exit 0");
+    let output = fixture
+        .command()
+        .env("OSTROM_EVENTS_FD", "1")
+        .output()
+        .expect("run pass with the event descriptor environment variable");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, fixture.run_event_bytes());
+}
+
+#[test]
+fn an_unwritable_events_fd_does_not_kill_the_pass() {
+    let fixture = Fixture::new("exit 0");
+    let output = fixture
+        .command()
+        .args(["--events-fd", "4294967295"])
+        .output()
+        .expect("run pass with an unwritable event descriptor");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("ostrom observability: could not open events fd 4294967295")
+    );
+    assert_eq!(fixture.run_events().len(), 2);
+}
+
+#[test]
+fn events_prints_canonical_jsonl_and_after_replays_then_follows() {
+    let fixture = Fixture::new("exit 0");
+    let status = fixture.command().status().expect("run pass");
+    assert!(status.success());
+    let durable = fixture.run_event_bytes();
+    let run_id = fixture.run_events()[0]["runId"]
+        .as_str()
+        .expect("event run ID")
+        .to_owned();
+
+    let snapshot = fixture
+        .events_command(&run_id)
+        .output()
+        .expect("read the run snapshot");
+    assert!(
+        snapshot.status.success(),
+        "{}",
+        String::from_utf8_lossy(&snapshot.stderr)
+    );
+    assert_eq!(snapshot.stdout, durable);
+
+    let followed = fixture
+        .events_command(&run_id)
+        .args(["--after", "1"])
+        .output()
+        .expect("replay and follow the terminal event");
+    assert!(
+        followed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&followed.stderr)
+    );
+    let terminal = durable
+        .split_inclusive(|byte| *byte == b'\n')
+        .nth(1)
+        .expect("terminal event line");
+    assert_eq!(followed.stdout, terminal);
 }
 
 fn wait_for(path: &Path) {
@@ -324,6 +446,31 @@ fn error_exit_releases_and_finalizes() {
     assert_eq!(status.code(), Some(42));
     fixture.assert_released();
     assert_eq!(fixture.trace().last().unwrap()["fact"]["outcome"], "failed");
+    let events = fixture.run_events();
+    assert_eq!(events[0]["type"], "run.started");
+    assert_eq!(events[0]["payload"]["kind"], "loop");
+    assert_eq!(events[1]["type"], "run.finished");
+    assert_eq!(events[1]["payload"]["outcome"], "failed");
+    assert_eq!(events[1]["payload"]["reason"], "pass-failed");
+}
+
+#[test]
+fn successful_pass_emits_a_completed_lifecycle() {
+    let fixture = Fixture::new(concat!(
+        "printf '%s\\n' '{\"ts\":\"2026-08-01T00:00:00Z\",\"kind\":\"pass-started\",\"fact\":{\"owner\":\"builder-inner-wake1\"},\"narration\":{}}' >>\"$OSTROM_HOME/sprint.jsonl\"\n",
+        "printf '%s\\n' '{\"ts\":\"2026-08-01T00:00:01Z\",\"kind\":\"pass-ended\",\"fact\":{\"owner\":\"builder-inner-wake1\",\"outcome\":\"completed\"},\"narration\":{}}' >>\"$OSTROM_HOME/sprint.jsonl\""
+    ));
+
+    assert!(fixture.command().status().expect("run pass").success());
+
+    let events = fixture.run_events();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["type"], "run.started");
+    assert_eq!(events[0]["payload"]["actor"], "builder");
+    assert_eq!(events[0]["payload"]["harness"], "claude");
+    assert_eq!(events[1]["type"], "run.finished");
+    assert_eq!(events[1]["payload"]["outcome"], "completed");
+    assert!(events[1]["payload"]["durationMs"].is_u64());
 }
 
 #[test]
@@ -422,9 +569,18 @@ fn disarmed_and_outer_lease_held_passes_do_not_spawn_or_trace() {
         .env("OSTROM_TEST_MARKER", &marker)
         .output()
         .expect("run disarmed pass");
-    assert!(output.status.success());
+    assert_eq!(output.status.code(), Some(78));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("loop is disarmed"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(!marker.exists());
     assert!(!disarmed.state.join("sprint.jsonl").exists());
+    let events = disarmed.run_events();
+    assert_eq!(events[1]["type"], "run.finished");
+    assert_eq!(events[1]["payload"]["outcome"], "no-op");
+    assert_eq!(events[1]["payload"]["reason"], "disarmed");
 
     let held = Fixture::new("touch \"$OSTROM_TEST_MARKER\"");
     let marker = held.root.path().join("spawned");
@@ -444,6 +600,10 @@ fn disarmed_and_outer_lease_held_passes_do_not_spawn_or_trace() {
     assert!(output.status.success());
     assert!(!marker.exists());
     assert!(!held.state.join("sprint.jsonl").exists());
+    let events = held.run_events();
+    assert_eq!(events[1]["type"], "run.finished");
+    assert_eq!(events[1]["payload"]["outcome"], "no-op");
+    assert_eq!(events[1]["payload"]["reason"], "lease-held");
 }
 
 #[test]

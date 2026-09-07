@@ -80,6 +80,10 @@ impl umwelt_runtime::Harness for ClaudeJudgmentHarness {
     fn default_model(&self) -> &str {
         &self.default_model
     }
+
+    fn enforceable_caps(&self) -> umwelt_runtime::CapSupport {
+        umwelt_runtime::CapSupport::none()
+    }
 }
 
 impl JudgmentHarness for ClaudeJudgmentHarness {

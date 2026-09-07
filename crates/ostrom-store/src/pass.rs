@@ -7,17 +7,21 @@ use std::{
 };
 
 use chrono::DateTime;
+use ethogram::{RunKind, RunOutcome as EventRunOutcome};
 use ostrom_core::PermissionMode;
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 
 use crate::{
-    Clock, LeaseActionError, OstromPaths, OwnedLease, PassState, SignalFlags, TraceAppend,
-    append_trace, environment, read_lease, read_pass_state, read_trace,
-    selection::dispatchability_snapshot, write_pass_state,
+    Clock, LeaseActionError, OstromPaths, OwnedLease, PassState, RunEventGuard, RunEventStart,
+    SignalFlags, TraceAppend, append_trace, environment, generated_run_id, read_lease,
+    read_pass_state, read_trace, selection::dispatchability_snapshot, write_pass_state,
 };
 
 pub const MAX_TURNS: &str = "200";
+// EX_CONFIG: the pass invocation is valid, but the local arm configuration
+// explicitly refuses to execute it.
+const DISARMED_EXIT_CODE: i32 = 78;
 const DEFAULT_DAILY_CAP_USD: f64 = 50.0;
 const DEFAULT_LEASE_TTL_SECONDS: u64 = 3_600;
 
@@ -112,6 +116,7 @@ pub struct PassRequest {
     pub claude_bin: PathBuf,
     pub signals: SignalFlags,
     pub supervisor_pid: Option<u32>,
+    pub events_fd: Option<u32>,
     pub clock: Clock,
 }
 
@@ -134,7 +139,8 @@ impl PassError {
     pub const fn exit_code(&self) -> i32 {
         match self {
             Self::Failed { code, .. } => *code,
-            Self::Held(_) | Self::Disarmed(_) => 0,
+            Self::Held(_) => 0,
+            Self::Disarmed(_) => DISARMED_EXIT_CODE,
         }
     }
 
@@ -163,6 +169,7 @@ struct PassGuard {
     dispatchability_hash: Option<String>,
     queue_count: Option<usize>,
     dispatchable_count: Option<usize>,
+    events: RunEventGuard,
 }
 
 /// The outcome a pass is recorded with when its guard finishes.
@@ -183,8 +190,8 @@ fn terminal_outcome(explicit: Option<String>, panicking: bool) -> String {
 impl PassGuard {
     fn finish(&mut self) -> Result<(), PassError> {
         let mut failure = None;
+        let outcome = terminal_outcome(self.outcome.clone(), thread::panicking());
         if self.started {
-            let outcome = terminal_outcome(self.outcome.clone(), thread::panicking());
             let now = self.clock.epoch_seconds();
             let mut fact = Map::new();
             fact.insert("owner".to_owned(), json!(self.owner));
@@ -232,6 +239,19 @@ impl PassGuard {
             }
             self.started = false;
         }
+        let event_outcome = event_outcome(&outcome);
+        let event_reason = event_reason(event_outcome, self.reason.clone());
+        if let Err(error) = self
+            .events
+            .finish(event_outcome, event_reason, self.cost_usd, None)
+            && failure.is_none()
+        {
+            failure = Some(PassError::failed(
+                self.role,
+                format!("could not append run.finished: {error}"),
+                1,
+            ));
+        }
         if self.child_spawned {
             release_inner_lease(self);
         }
@@ -246,6 +266,22 @@ impl PassGuard {
     }
 }
 
+fn event_outcome(outcome: &str) -> EventRunOutcome {
+    match outcome {
+        "completed" => EventRunOutcome::Completed,
+        "no-op" => EventRunOutcome::NoOp,
+        "timed-out" => EventRunOutcome::TimedOut,
+        "permission-denied" => EventRunOutcome::PermissionDenied,
+        "interrupted" => EventRunOutcome::Interrupted,
+        "canceled" => EventRunOutcome::Canceled,
+        _ => EventRunOutcome::Failed,
+    }
+}
+
+fn event_reason(outcome: EventRunOutcome, reason: Option<String>) -> Option<String> {
+    reason.or_else(|| matches!(outcome, EventRunOutcome::Failed).then(|| "pass-failed".to_owned()))
+}
+
 impl Drop for PassGuard {
     fn drop(&mut self) {
         let _ = self.finish();
@@ -253,7 +289,46 @@ impl Drop for PassGuard {
 }
 
 pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
-    validate_arm(request)?;
+    let mut events = RunEventGuard::start(
+        &request.paths,
+        request.events_fd,
+        request.clock.clone(),
+        RunEventStart {
+            run_id: generated_run_id(request.role.name(), &request.clock),
+            kind: RunKind::Loop,
+            actor: request.role.name().to_owned(),
+            harness: "claude".to_owned(),
+            model: None,
+            schedule: None,
+            repository: None,
+            work_order: None,
+            ceilings: None,
+        },
+    )
+    .map_err(|error| {
+        PassError::failed(
+            request.role,
+            format!("could not append run.started: {error}"),
+            1,
+        )
+    })?;
+    if let Err(error) = validate_arm(request) {
+        events
+            .finish(
+                EventRunOutcome::NoOp,
+                Some("disarmed".to_owned()),
+                Some(0.0),
+                None,
+            )
+            .map_err(|event_error| {
+                PassError::failed(
+                    request.role,
+                    format!("could not append run.finished: {event_error}"),
+                    1,
+                )
+            })?;
+        return Err(error);
+    }
     fs::create_dir_all(&request.paths.state).map_err(|error| {
         PassError::failed(
             request.role,
@@ -286,6 +361,20 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
             | LeaseActionError::ChangedDuringReclamation
             | LeaseActionError::AcquiredConcurrently,
         ) => {
+            events
+                .finish(
+                    EventRunOutcome::NoOp,
+                    Some("lease-held".to_owned()),
+                    Some(0.0),
+                    None,
+                )
+                .map_err(|error| {
+                    PassError::failed(
+                        request.role,
+                        format!("could not append run.finished: {error}"),
+                        1,
+                    )
+                })?;
             return Err(PassError::Held(request.role.name()));
         }
         Err(error) => {
@@ -317,6 +406,7 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
         dispatchability_hash: None,
         queue_count: None,
         dispatchable_count: None,
+        events,
     };
     append_trace(
         &request.paths.trace_file(),
@@ -911,5 +1001,20 @@ mod terminal_outcome_tests {
             "refused",
             "a pass that already decided its outcome keeps it"
         );
+    }
+}
+
+#[cfg(test)]
+mod exit_code_tests {
+    use super::{DISARMED_EXIT_CODE, PassError};
+
+    #[test]
+    fn disarmed_is_a_distinct_refusal_and_lease_held_remains_successful() {
+        assert_eq!(DISARMED_EXIT_CODE, 78);
+        assert_eq!(
+            PassError::Disarmed("builder").exit_code(),
+            DISARMED_EXIT_CODE
+        );
+        assert_eq!(PassError::Held("builder").exit_code(), 0);
     }
 }

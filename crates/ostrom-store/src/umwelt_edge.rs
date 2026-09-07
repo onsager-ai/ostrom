@@ -6,17 +6,32 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use indexmap::IndexMap;
 use ostrom_core::ResolvedLoopCeilings;
-use umwelt_runtime::{PassState, TraceAppend};
+use serde_json::{Map, Value};
+use umwelt_runtime::PassState;
 
 use crate::{
     StoreError, environment, event_store::append_trace_event, io_error, set_private_file_mode,
 };
 
+/// An Ostrom trace append before conversion to Umwelt's ordered edge type.
+///
+/// Ostrom deliberately retains `serde_json::Map` because its workspace enables
+/// `preserve_order`. The boundary below converts by iteration so the operator's
+/// authored top-level key order survives without reparsing through `Value`.
+#[derive(Debug, Clone)]
+pub struct TraceAppend {
+    pub ts: String,
+    pub kind: String,
+    pub fact: Map<String, Value>,
+    pub narration: Map<String, Value>,
+}
+
 /// Convert Ostrom's resolved policy ceilings into harness runtime ceilings.
 #[must_use]
-pub const fn run_ceilings(ceilings: ResolvedLoopCeilings) -> umwelt_runtime::RunCeilings {
-    umwelt_runtime::RunCeilings {
+pub const fn run_ceilings(ceilings: ResolvedLoopCeilings) -> umwelt_runtime::LoopCeilings {
+    umwelt_runtime::LoopCeilings {
         concurrent: ceilings.concurrent,
         spend_usd: ceilings.spend_usd,
         tokens: ceilings.tokens,
@@ -53,7 +68,13 @@ pub fn node_fallbacks() -> Vec<PathBuf> {
 /// Append through Umwelt while retaining Ostrom's fact-ledger side effect.
 pub fn append_trace(path: &Path, record: &TraceAppend) -> Result<Vec<u8>, StoreError> {
     let mut bytes = Vec::new();
-    umwelt_runtime::append_trace(&mut bytes, record).map_err(trace_error)?;
+    let runtime_record = umwelt_runtime::TraceAppend {
+        ts: record.ts.clone(),
+        kind: record.kind.clone(),
+        fact: IndexMap::from_iter(record.fact.clone()),
+        narration: IndexMap::from_iter(record.narration.clone()),
+    };
+    umwelt_runtime::append_trace(&mut bytes, &runtime_record).map_err(trace_error)?;
     append_trace_event(path, &record.ts, &record.kind, &record.fact)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -119,12 +140,12 @@ mod tests {
 
     use serde_json::{Map, json};
     use tempfile::tempdir;
-    use umwelt_runtime::{AgentRunner, CodexHarness};
+    use umwelt_runtime::{AgentRunner, CodexHarness, RunCaps};
 
     use ostrom_core::ResolvedLoopCeilings;
 
-    use super::{append_trace, read_pass_state, run_ceilings, write_pass_state};
-    use crate::{PassState, TraceAppend};
+    use super::{TraceAppend, append_trace, read_pass_state, run_ceilings, write_pass_state};
+    use crate::PassState;
 
     #[test]
     fn trace_append_bytes_agree_with_umwelt() {
@@ -145,7 +166,13 @@ mod tests {
 
         let ostrom_bytes = append_trace(&path, &record).expect("append through ostrom");
         let mut umwelt_output = Vec::new();
-        let umwelt_bytes = umwelt_runtime::append_trace(&mut umwelt_output, &record)
+        let runtime_record = umwelt_runtime::TraceAppend {
+            ts: record.ts.clone(),
+            kind: record.kind.clone(),
+            fact: record.fact.clone().into_iter().collect(),
+            narration: record.narration.clone().into_iter().collect(),
+        };
+        let umwelt_bytes = umwelt_runtime::append_trace(&mut umwelt_output, &runtime_record)
             .expect("append through umwelt");
 
         assert_eq!(ostrom_bytes, umwelt_bytes);
@@ -172,6 +199,34 @@ mod tests {
                 "\n"
             )
         );
+    }
+
+    #[test]
+    fn trace_append_operator_key_order_survives_map_conversion() {
+        let directory = tempdir().expect("temp dir");
+        let path = directory.path().join("sprint.jsonl");
+        let record = TraceAppend {
+            ts: "2030-01-02T03:04:05Z".to_owned(),
+            kind: "operator-order".to_owned(),
+            fact: Map::from_iter([
+                ("zebra".to_owned(), json!(1)),
+                ("alpha".to_owned(), json!(2)),
+                ("middle".to_owned(), json!(3)),
+            ]),
+            narration: Map::new(),
+        };
+
+        append_trace(&path, &record).expect("append ordered trace");
+
+        let emitted = fs::read_to_string(path).expect("read ordered trace");
+        assert_eq!(
+            emitted,
+            concat!(
+                r#"{"ts":"2030-01-02T03:04:05Z","kind":"operator-order","fact":{"zebra":1,"alpha":2,"middle":3},"narration":{}}"#,
+                "\n"
+            )
+        );
+        assert!(!emitted.contains(r#""alpha":2,"middle":3,"zebra":1"#));
     }
 
     #[test]
@@ -249,7 +304,7 @@ mod tests {
             .map(|value| env::split_paths(&value).collect())
             .unwrap_or_default();
         let harness = CodexHarness::new(codex, "fixture-v1", "fixture-model", fallbacks);
-        let Some(launch) = harness.prepare().ok() else {
+        let Some(launch) = harness.prepare(&RunCaps::default()).ok() else {
             println!("NODE_PARENT=NONE");
             return;
         };

@@ -28,9 +28,10 @@ pub use umwelt_edge::{
     loop_execstart_is_not_shell, render_loop_units, resolved_operation_settings,
 };
 pub use umwelt_runtime::{
-    ActionFault, AgentRegistry, AgentRunner, CeilingEnvironmentNames, CheckAction, CheckReceipt,
-    ClaudeHarness, CodexHarness, CommandProvider, Harness, HarnessProfile, ImplementerRunRequest,
-    LoopUnit, LoopUnitDeclaration, LoopUnitDrift, LoopUnitGeneratorConfig, OperationSettingsDrift,
-    OrchestratorRunRequest, ResolvedOperationSettings, RunCeilings, RunOutcome, RunRequest,
-    RunTermination, RunnerLaunch,
+    ActionFault, AgentRegistry, AgentRunner, CapSupport, CeilingEnvironmentNames, CheckAction,
+    CheckReceipt, ClaudeHarness, CodexHarness, CommandProvider, Harness, HarnessProfile,
+    ImplementerRunRequest, LoopCeilings as RunCeilings, LoopUnit, LoopUnitDeclaration,
+    LoopUnitDrift, LoopUnitGeneratorConfig, OperationSettingsDrift, OrchestratorRunRequest,
+    ProcessOutcome as RunOutcome, ResolvedOperationSettings, RunCaps, RunRequest, RunTermination,
+    RunnerLaunch,
 };

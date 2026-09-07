@@ -14,6 +14,10 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
+use ethogram::{
+    PayloadExtension, RunCeilings as EventRunCeilings, RunKind, RunOutcome as EventRunOutcome,
+    RunUsage,
+};
 use ostrom_core::{MandateConfig, WorkOrder};
 use regex::Regex;
 use serde_json::{Map, Value, json};
@@ -21,12 +25,12 @@ use thiserror::Error;
 
 use crate::{
     AgentRegistry, Clock, CodexHarness, ImplementerRunRequest, LeaseActionError, OstromPaths,
-    OwnedLease, RunOutcome, RunRequest, SignalFlags, TraceAppend,
+    OwnedLease, RunEventGuard, RunEventStart, RunOutcome, RunRequest, SignalFlags, TraceAppend,
     app_token::{
         AuthenticatedCommandError, GitHubInstallationTokenMinter, InstallationTokenMinter,
         ScopedAppTokenRequest, authenticated_output,
     },
-    append_trace, environment, load_config_or_defaults,
+    append_trace, environment, generated_run_id, load_config_or_defaults,
 };
 
 pub const DEFAULT_IMPLEMENTER_RUNNER: &str = "agent/codex";
@@ -40,6 +44,7 @@ pub struct ImplementRequest {
     pub unit_name: String,
     pub signals: SignalFlags,
     pub supervisor_pid: Option<u32>,
+    pub events_fd: Option<u32>,
     pub clock: Clock,
 }
 
@@ -117,6 +122,7 @@ struct TerminalGuard {
     remote_head_sha: Option<String>,
     conflicted_paths: Vec<String>,
     withheld_paths: Vec<String>,
+    run_events: RunEventGuard,
 }
 
 impl TerminalGuard {
@@ -127,11 +133,8 @@ impl TerminalGuard {
             .signed_duration_since(self.started)
             .num_seconds()
             .max(0);
-        let usage = self
-            .events_file
-            .as_deref()
-            .map(read_usage)
-            .unwrap_or_default();
+        let observed_usage = self.events_file.as_deref().map(read_usage);
+        let usage = observed_usage.clone().unwrap_or_default();
         let weighted = usage.weighted();
         // This is Ostrom's normalized order-cost estimate, not a provider
         // invoice. Keeping it numeric on every terminal row lets completed
@@ -199,7 +202,7 @@ impl TerminalGuard {
         if let Err(error) = crate::reap_build_cache(&self.paths.state, &self.order.item_id) {
             eprintln!("ostrom implementer: could not reap build cache: {error}");
         }
-        append_trace(
+        let trace_result = append_trace(
             &self.paths.trace_file(),
             &TraceAppend {
                 ts: self.clock.timestamp(),
@@ -207,12 +210,37 @@ impl TerminalGuard {
                 fact,
                 narration: Map::new(),
             },
-        )
-        .map_err(|error| {
+        );
+        let event_usage = observed_usage.map(|usage| RunUsage {
+            input_tokens: Some(weighted.saturating_sub(usage.output_tokens)),
+            output_tokens: Some(usage.output_tokens),
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            unit: Some("codex-weighted-tokens".to_owned()),
+            extra: PayloadExtension::new(),
+        });
+        let event_result = self.run_events.finish(
+            if kind == "work-completed" {
+                EventRunOutcome::Completed
+            } else {
+                EventRunOutcome::Failed
+            },
+            reason.map(str::to_owned),
+            Some(cost),
+            event_usage,
+        );
+        trace_result.map_err(|error| {
             ImplementError::new(
                 1,
                 "terminal-trace-failed",
                 format!("could not append {kind}: {error}"),
+            )
+        })?;
+        event_result.map_err(|error| {
+            ImplementError::new(
+                1,
+                "run-event-finish-failed",
+                format!("could not append run.finished: {error}"),
             )
         })?;
         self.terminal_written = true;
@@ -287,7 +315,7 @@ fn run_implement_with_registry_and_minter(
     let inherited_lease_name = environment::MANDATE_LEASE_NAME
         .value()
         .filter(|name| !name.trim().is_empty());
-    let mut inherited_lease = inherited_lease_name
+    let inherited_lease = inherited_lease_name
         .as_deref()
         .map(|lease_name| {
             adopt_implementer_lease(
@@ -296,21 +324,68 @@ fn run_implement_with_registry_and_minter(
                 &request.order_file.display().to_string(),
             )
         })
-        .transpose()?;
-    let order_bytes = fs::read(&request.order_file).map_err(|_| {
+        .transpose();
+    let order = fs::read(&request.order_file)
+        .map_err(|_| ())
+        .and_then(|bytes| WorkOrder::from_json(&bytes).map_err(|_| ()));
+    let runner = registry.get(runner_name);
+    let mut run_events = RunEventGuard::start(
+        &request.paths,
+        request.events_fd,
+        request.clock.clone(),
+        RunEventStart {
+            run_id: generated_run_id(&request.unit_name, &request.clock),
+            kind: RunKind::Handoff,
+            actor: "builder".to_owned(),
+            harness: runner.as_ref().map_or_else(
+                || {
+                    runner_name
+                        .strip_prefix("agent/")
+                        .unwrap_or(runner_name)
+                        .to_owned()
+                },
+                |runner| runner.name().to_owned(),
+            ),
+            model: runner
+                .as_ref()
+                .map(|runner| runner.default_model().to_owned()),
+            schedule: None,
+            repository: order.as_ref().ok().map(|order| order.repository.clone()),
+            work_order: order.as_ref().ok().map(|order| order.order_id.clone()),
+            ceilings: order.as_ref().ok().map(|order| EventRunCeilings {
+                cost_usd: Some(order.cost()),
+                tokens: Some(order.tokens()),
+                wall_ms: None,
+                extra: PayloadExtension::new(),
+            }),
+        },
+    )
+    .map_err(|error| {
         ImplementError::new(
-            2,
-            "work-order-invalid",
-            "invalid schema_version 1 work order",
+            1,
+            "run-event-start-failed",
+            format!("could not append run.started: {error}"),
         )
     })?;
-    let order = WorkOrder::from_json(&order_bytes).map_err(|_| {
-        ImplementError::new(
-            2,
-            "work-order-invalid",
-            "invalid schema_version 1 work order",
-        )
-    })?;
+    let mut inherited_lease = match inherited_lease {
+        Ok(lease) => lease,
+        Err(error) => {
+            finish_preflight_run(&mut run_events, &error)?;
+            return Err(error);
+        }
+    };
+    let order = match order {
+        Ok(order) => order,
+        Err(()) => {
+            let error = ImplementError::new(
+                2,
+                "work-order-invalid",
+                "invalid schema_version 1 work order",
+            );
+            finish_preflight_run(&mut run_events, &error)?;
+            return Err(error);
+        }
+    };
     let lease_name = format!("implementer-item-{}.lease", order.item_hash());
     // Dispatch owns this item lease until a terminal row is durable; adoption
     // prevents an independently launched implementer from spending the order.
@@ -318,16 +393,24 @@ fn run_implement_with_registry_and_minter(
         .as_deref()
         .is_some_and(|inherited| inherited != lease_name)
     {
-        return Err(ImplementError::new(
+        let error = ImplementError::new(
             1,
             "lease-name-mismatch",
             format!("lease-name-mismatch: {}", order.item_id),
-        ));
+        );
+        finish_preflight_run(&mut run_events, &error)?;
+        return Err(error);
     }
-    let lease = inherited_lease.take().map_or_else(
+    let lease = match inherited_lease.take().map_or_else(
         || adopt_implementer_lease(request, &lease_name, &order.item_id),
         Ok,
-    )?;
+    ) {
+        Ok(lease) => lease,
+        Err(error) => {
+            finish_preflight_run(&mut run_events, &error)?;
+            return Err(error);
+        }
+    };
     let mut guard = TerminalGuard {
         paths: request.paths.clone(),
         lease,
@@ -350,6 +433,7 @@ fn run_implement_with_registry_and_minter(
         remote_head_sha: None,
         conflicted_paths: Vec::new(),
         withheld_paths: Vec::new(),
+        run_events,
     };
     match implement_inner(request, &mut guard, registry, runner_name, minter) {
         Ok(url) => {
@@ -363,6 +447,26 @@ fn run_implement_with_registry_and_minter(
             Err(error)
         }
     }
+}
+
+fn finish_preflight_run(
+    run_events: &mut RunEventGuard,
+    error: &ImplementError,
+) -> Result<(), ImplementError> {
+    run_events
+        .finish(
+            EventRunOutcome::Failed,
+            Some(error.reason.clone()),
+            None,
+            None,
+        )
+        .map_err(|event_error| {
+            ImplementError::new(
+                1,
+                "run-event-finish-failed",
+                format!("could not append run.finished: {event_error}"),
+            )
+        })
 }
 
 fn adopt_implementer_lease(

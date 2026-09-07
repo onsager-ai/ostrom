@@ -253,27 +253,29 @@ fn run_dispatch_with_registry_and_minter(
     }
     reject_closing_pull_requests(&mut context, minter)?;
 
-    let runner_launch = registry.prepare(runner_name).map_err(|fault| {
-        let reason = if runner_name == DEFAULT_IMPLEMENTER_RUNNER {
-            "codex-unavailable"
-        } else {
-            "implementer-harness-unavailable"
-        };
-        let _ = append_failure(&context, reason, FailureDetail::default());
-        DispatchError::new(
-            1,
-            format!(
-                "ostrom dispatch: {}",
-                fault
-                    .detail()
-                    .unwrap_or(if fault.name() == "unregistered_harness" {
-                        "implementer harness is not registered"
-                    } else {
-                        "implementer harness is unavailable"
-                    })
-            ),
-        )
-    })?;
+    let runner_launch = registry
+        .prepare(runner_name, &crate::RunCaps::default())
+        .map_err(|fault| {
+            let reason = if runner_name == DEFAULT_IMPLEMENTER_RUNNER {
+                "codex-unavailable"
+            } else {
+                "implementer-harness-unavailable"
+            };
+            let _ = append_failure(&context, reason, FailureDetail::default());
+            DispatchError::new(
+                1,
+                format!(
+                    "ostrom dispatch: {}",
+                    fault
+                        .detail()
+                        .unwrap_or(if fault.name() == "unregistered_harness" {
+                            "implementer harness is not registered"
+                        } else {
+                            "implementer harness is unavailable"
+                        })
+                ),
+            )
+        })?;
     let resolved_ostrom = resolve_ostrom(&context)?;
 
     // Reap before acquiring this item's lease. If an old order is genuinely
