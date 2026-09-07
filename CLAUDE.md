@@ -61,6 +61,12 @@ Three tests decide which side a change belongs on:
 
 Inherited from ostrom-hub, because the same defects will happen here: a guard you have never seen fail is not a guard. Every cap has a test that trips it. Every normaliser has a raw line it refuses. The "no dependency on ostrom-core" property is a test over `Cargo.toml`, not a comment.
 
+**A control must travel the same path as the case it controls.** *"It works over here"* is evidence only when over-here and over-there differ in exactly one thing. Check that before reporting which component is at fault — three defects in this work were reported against the wrong component because the probe was never checked:
+
+- A cost value survived `serde_json::to_string` but not ethogram's canonical path, reported here as a serialiser defect. The control parsed a Rust literal through rustc while the failing path parsed through serde_json: two parsers, two different doubles. The defect was in parsing.
+- ethogram's exponent sweep compared `10.powi(e)` against `Math.pow(10, e)` and reported 150 serialiser divergences. The two produce different doubles, so it was comparing serialisations of different numbers. Regenerating from decimal literals, which both languages parse identically, gave zero.
+- A determinism check diffed generated files against the commit rather than against the previous run, guaranteeing a diff and briefly reading as non-determinism.
+
 ## Alignment boundary
 
 Reserved to the principal: publishing a crate, adding a harness, and anything that changes what leaves an operator's machine. Everything else is an "AI implements" item — state the call, do not ask.
