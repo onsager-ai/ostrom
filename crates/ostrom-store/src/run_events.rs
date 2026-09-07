@@ -4,7 +4,11 @@ use std::{
     fs::File,
     io::Write,
     path::Path,
-    sync::atomic::{AtomicU64, Ordering},
+    process::Child,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 #[cfg(unix)]
@@ -12,12 +16,15 @@ use std::fs::OpenOptions;
 
 use chrono::{DateTime, Utc};
 use ethogram::{
-    EventDraft, PayloadExtension, RunFinishedPayload, RunKind, RunOutcome, RunStartedPayload,
-    RunUsage,
+    ControlRequestedPayload, Event, EventDraft, PayloadExtension, RunFinishedPayload, RunKind,
+    RunOutcome, RunStartedPayload, RunUsage,
 };
 use serde::Serialize;
 use thiserror::Error;
-use umwelt_runtime::{FileSink, Sink, SinkFault};
+use umwelt_runtime::{
+    CapTrip, CapsWatchdog, ControlError, FileSink, ProcessExit, RunControl, SessionResumer, Sink,
+    SinkFault, watchdog::Clock as WatchdogClock,
+};
 
 use crate::{Clock, OstromPaths};
 
@@ -61,10 +68,11 @@ impl RunEventGuard {
     pub fn start(
         paths: &OstromPaths,
         events_fd: Option<u32>,
+        facts_only: bool,
         clock: Clock,
         start: RunEventStart,
     ) -> Result<Self, RunEventError> {
-        let mut sink = RunEventSink::new(&paths.runs_dir(), events_fd);
+        let sink = RunEventSink::new(&paths.runs_dir(), events_fd, facts_only);
         let payload = RunStartedPayload {
             kind: start.kind,
             actor: start.actor,
@@ -106,18 +114,83 @@ impl RunEventGuard {
         self.write_terminal()
     }
 
+    pub(crate) fn append(&self, draft: EventDraft) -> Result<Event, RunEventError> {
+        self.sink.append(&self.run_id, draft).map_err(Into::into)
+    }
+
+    #[must_use]
+    pub(crate) fn sink(&self) -> &RunEventSink {
+        &self.sink
+    }
+
+    #[must_use]
+    pub(crate) fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    pub(crate) fn process_exited<R: SessionResumer>(
+        &mut self,
+        control: &mut RunControl<R>,
+        exit: ProcessExit,
+        outcome: RunOutcome,
+        reason: Option<String>,
+        cost_usd: Option<f64>,
+        usage: Option<RunUsage>,
+    ) -> Result<(), ControlError> {
+        if self.finished {
+            return Ok(());
+        }
+        self.outcome = outcome;
+        self.reason = reason;
+        self.cost_usd = cost_usd;
+        self.usage = usage;
+        control.process_exited(exit, self.finished_payload(), &self.sink)?;
+        self.finished = true;
+        Ok(())
+    }
+
+    pub(crate) fn interrupt<R: SessionResumer, C: WatchdogClock>(
+        &mut self,
+        control: &mut RunControl<R>,
+        request: ControlRequestedPayload,
+        child: Option<&mut Child>,
+        watchdog: &CapsWatchdog<C>,
+    ) -> Result<(), ControlError> {
+        control.interrupt(request, child, watchdog, &self.sink)?;
+        self.finished = true;
+        Ok(())
+    }
+
+    pub(crate) fn terminate_cap(
+        &mut self,
+        trip: CapTrip,
+        child: &mut Child,
+    ) -> Result<Event, SinkFault> {
+        let event = trip.terminate_and_report(child, &self.sink, &self.run_id)?;
+        self.finished = true;
+        Ok(event)
+    }
+
     fn write_terminal(&mut self) -> Result<(), RunEventError> {
         if self.finished {
             return Ok(());
         }
+        let payload = self.finished_payload();
+        self.sink
+            .append(&self.run_id, draft("run.finished", payload)?)?;
+        self.finished = true;
+        Ok(())
+    }
+
+    fn finished_payload(&self) -> RunFinishedPayload {
         let elapsed = self
             .clock
             .now()
             .signed_duration_since(self.started_at)
             .num_milliseconds()
             .max(0);
-        let payload = RunFinishedPayload {
-            outcome: self.outcome,
+        RunFinishedPayload {
+            outcome: self.outcome.clone(),
             reason: self.reason.clone(),
             truncated: None,
             cost_usd: self.cost_usd,
@@ -125,60 +198,91 @@ impl RunEventGuard {
             duration_ms: u64::try_from(elapsed).unwrap_or(u64::MAX),
             estimated: None,
             extra: PayloadExtension::new(),
-        };
-        self.sink
-            .append(&self.run_id, draft("run.finished", payload)?)?;
-        self.finished = true;
-        Ok(())
+        }
     }
 }
 
-struct RunEventSink {
+pub(crate) struct RunEventSink {
     durable: FileSink,
+    facts_only: bool,
+    live: Mutex<LiveEventSink>,
+}
+
+struct LiveEventSink {
     live: Option<File>,
     live_fd: Option<u32>,
     live_fault: Option<String>,
 }
 
 impl RunEventSink {
-    fn new(root: &Path, live_fd: Option<u32>) -> Self {
-        let mut sink = Self {
-            durable: FileSink::new(root),
+    fn new(root: &Path, live_fd: Option<u32>, facts_only: bool) -> Self {
+        let mut live = LiveEventSink {
             live: None,
             live_fd,
             live_fault: None,
         };
         if let Some(fd) = live_fd {
             match open_fd(fd) {
-                Ok(file) => sink.live = Some(file),
+                Ok(file) => live.live = Some(file),
                 Err(error) => {
-                    sink.record_live_fault(format!("could not open events fd {fd}: {error}"))
+                    live.record_fault(format!("could not open events fd {fd}: {error}"));
                 }
             }
         }
-        sink
+        Self {
+            durable: FileSink::new(root),
+            facts_only,
+            live: Mutex::new(live),
+        }
     }
 
-    fn append(&mut self, run: &str, draft: EventDraft) -> Result<(), RunEventError> {
-        let event = self.durable.append(run, draft)?;
-        if let Some(live) = &mut self.live {
-            let result = ethogram::serialise_event(&event)
+    fn mirror(&self, event: &Event) {
+        if self.facts_only
+            && !(event.event_type.starts_with("run.") || event.event_type.starts_with("control."))
+        {
+            return;
+        }
+        let Ok(mut state) = self.live.lock() else {
+            eprintln!("ostrom observability: events fd lock was poisoned");
+            return;
+        };
+        if let Some(live) = &mut state.live {
+            let result = ethogram::serialise_event(event)
                 .map_err(std::io::Error::other)
                 .and_then(|serialised| live.write_all(serialised.as_bytes()))
                 .and_then(|()| live.write_all(b"\n"))
                 .and_then(|()| live.flush());
             if let Err(error) = result {
-                let fd = self.live_fd.unwrap_or_default();
-                self.live = None;
-                self.record_live_fault(format!("could not write events fd {fd}: {error}"));
+                let fd = state.live_fd.unwrap_or_default();
+                state.live = None;
+                state.record_fault(format!("could not write events fd {fd}: {error}"));
             }
         }
+    }
+}
+
+impl LiveEventSink {
+    fn record_fault(&mut self, message: String) {
+        eprintln!("ostrom observability: {message}");
+        self.live_fault = Some(message);
+    }
+}
+
+impl Sink for RunEventSink {
+    fn append(&self, run: &str, draft: EventDraft) -> Result<Event, SinkFault> {
+        let event = self.durable.append(run, draft)?;
+        self.mirror(&event);
+        Ok(event)
+    }
+
+    fn forward(&self, event: Event) -> Result<(), SinkFault> {
+        self.durable.forward(event.clone())?;
+        self.mirror(&event);
         Ok(())
     }
 
-    fn record_live_fault(&mut self, message: String) {
-        eprintln!("ostrom observability: {message}");
-        self.live_fault = Some(message);
+    fn last_seq(&self, run: &str) -> Result<u64, SinkFault> {
+        self.durable.last_seq(run)
     }
 }
 
@@ -266,6 +370,7 @@ mod tests {
         let mut run = RunEventGuard::start(
             &paths,
             None,
+            false,
             clock,
             RunEventStart {
                 run_id: "builder-fixture".to_owned(),
@@ -305,6 +410,7 @@ mod tests {
             RunEventGuard::start(
                 &paths,
                 None,
+                false,
                 clock,
                 RunEventStart {
                     run_id: "abandoned-fixture".to_owned(),
@@ -344,6 +450,7 @@ mod tests {
         let mut run = RunEventGuard::start(
             &paths,
             Some(u32::try_from(live.as_raw_fd()).expect("non-negative event descriptor")),
+            false,
             clock,
             RunEventStart {
                 run_id: "mirrored-fixture".to_owned(),
@@ -388,6 +495,7 @@ mod tests {
         let mut run = RunEventGuard::start(
             &paths,
             Some(fd),
+            false,
             clock,
             RunEventStart {
                 run_id: "closed-fd-fixture".to_owned(),
@@ -402,7 +510,14 @@ mod tests {
             },
         )
         .expect("a closed live descriptor cannot prevent run.started");
-        assert!(run.sink.live_fault.is_some());
+        assert!(
+            run.sink
+                .live
+                .lock()
+                .expect("live event sink lock")
+                .live_fault
+                .is_some()
+        );
         run.finish(RunOutcome::Completed, None, None, None)
             .expect("a closed live descriptor cannot prevent run.finished");
 

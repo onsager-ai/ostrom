@@ -232,6 +232,11 @@ pub const OSTROM_EVENTS_FD: EnvironmentVariable = variable(
     EnvironmentClass::Location,
     "no live event descriptor",
 );
+pub const OSTROM_FACTS_ONLY: EnvironmentVariable = variable(
+    "OSTROM_FACTS_ONLY",
+    EnvironmentClass::Switch,
+    "false; agent events are included in live event streams",
+);
 pub const OSTROM_POLICY_MANIFEST: EnvironmentVariable = variable(
     "OSTROM_POLICY_MANIFEST",
     EnvironmentClass::Location,
@@ -287,6 +292,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvironmentVariable] = &[
     NVM_DIR,
     OSTROM_ACTOR,
     OSTROM_EVENTS_FD,
+    OSTROM_FACTS_ONLY,
     OSTROM_HOME,
     OSTROM_LEGACY_HOME,
     OSTROM_NODE_FALLBACKS,

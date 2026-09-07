@@ -332,6 +332,7 @@ fn run_implement_with_registry_and_minter(
     let mut run_events = RunEventGuard::start(
         &request.paths,
         request.events_fd,
+        false,
         request.clock.clone(),
         RunEventStart {
             run_id: generated_run_id(&request.unit_name, &request.clock),
@@ -356,6 +357,8 @@ fn run_implement_with_registry_and_minter(
                 cost_usd: Some(order.cost()),
                 tokens: Some(order.tokens()),
                 wall_ms: None,
+                idle_ms: None,
+                turns: None,
                 extra: PayloadExtension::new(),
             }),
         },

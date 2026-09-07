@@ -1,16 +1,29 @@
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
+    sync::mpsc::{self, Receiver, RecvTimeoutError},
     thread,
     time::Duration,
 };
 
 use chrono::DateTime;
-use ethogram::{RunKind, RunOutcome as EventRunOutcome};
+use ethogram::{
+    CAPTURE_REFUSED, CaptureRefusalCause, CaptureRefusedPayload, ControlKind,
+    ControlRequestedPayload, EventDraft, MAX_EXCERPT_SCALARS, PayloadExtension, RunKind,
+    RunOutcome as EventRunOutcome, excerpt,
+};
 use ostrom_core::PermissionMode;
 use serde_json::{Map, Value, json};
 use thiserror::Error;
+use umwelt_capture::{
+    CaptureFault, ChildStdoutSource, LineSource, Normaliser, claude::ClaudeNormaliser,
+};
+use umwelt_runtime::{
+    CapTrip, CapsWatchdog, ProcessExit, ResumeError, ResumedSession, RunCaps, RunControl,
+    SessionResumer, SystemClock,
+};
 
 use crate::{
     Clock, LeaseActionError, OstromPaths, OwnedLease, PassState, RunEventGuard, RunEventStart,
@@ -19,11 +32,13 @@ use crate::{
 };
 
 pub const MAX_TURNS: &str = "200";
+pub const PASS_KILL_GRACE_MS: u64 = 5_000;
 // EX_CONFIG: the pass invocation is valid, but the local arm configuration
 // explicitly refuses to execute it.
 const DISARMED_EXIT_CODE: i32 = 78;
 const DEFAULT_DAILY_CAP_USD: f64 = 50.0;
 const DEFAULT_LEASE_TTL_SECONDS: u64 = 3_600;
+const PASS_TERMINATION_GRACE: Duration = Duration::from_millis(PASS_KILL_GRACE_MS);
 
 /// Render a permission mode as the flag value the Claude harness expects.
 ///
@@ -117,6 +132,8 @@ pub struct PassRequest {
     pub signals: SignalFlags,
     pub supervisor_pid: Option<u32>,
     pub events_fd: Option<u32>,
+    pub facts_only: bool,
+    pub caps: RunCaps,
     pub clock: Clock,
 }
 
@@ -170,6 +187,16 @@ struct PassGuard {
     queue_count: Option<usize>,
     dispatchable_count: Option<usize>,
     events: RunEventGuard,
+    control: Option<RunControl<NoSteer>>,
+    process_exit: ProcessExit,
+}
+
+struct NoSteer;
+
+impl SessionResumer for NoSteer {
+    fn resume(&self, _session_id: &str, _text: &str) -> Result<ResumedSession, ResumeError> {
+        Err(ResumeError::Unsupported)
+    }
 }
 
 /// The outcome a pass is recorded with when its guard finishes.
@@ -240,10 +267,24 @@ impl PassGuard {
             self.started = false;
         }
         let event_outcome = event_outcome(&outcome);
-        let event_reason = event_reason(event_outcome, self.reason.clone());
-        if let Err(error) = self
-            .events
-            .finish(event_outcome, event_reason, self.cost_usd, None)
+        let event_reason = event_reason(event_outcome.clone(), self.reason.clone());
+        let event_result = if let Some(control) = &mut self.control {
+            self.events
+                .process_exited(
+                    control,
+                    self.process_exit,
+                    event_outcome,
+                    event_reason,
+                    self.cost_usd,
+                    None,
+                )
+                .map_err(|error| error.to_string())
+        } else {
+            self.events
+                .finish(event_outcome, event_reason, self.cost_usd, None)
+                .map_err(|error| error.to_string())
+        };
+        if let Err(error) = event_result
             && failure.is_none()
         {
             failure = Some(PassError::failed(
@@ -271,6 +312,7 @@ fn event_outcome(outcome: &str) -> EventRunOutcome {
         "completed" => EventRunOutcome::Completed,
         "no-op" => EventRunOutcome::NoOp,
         "timed-out" => EventRunOutcome::TimedOut,
+        "capped" => EventRunOutcome::Capped,
         "permission-denied" => EventRunOutcome::PermissionDenied,
         "interrupted" => EventRunOutcome::Interrupted,
         "canceled" => EventRunOutcome::Canceled,
@@ -280,6 +322,15 @@ fn event_outcome(outcome: &str) -> EventRunOutcome {
 
 fn event_reason(outcome: EventRunOutcome, reason: Option<String>) -> Option<String> {
     reason.or_else(|| matches!(outcome, EventRunOutcome::Failed).then(|| "pass-failed".to_owned()))
+}
+
+fn wire_ceilings(caps: RunCaps) -> Option<ethogram::RunCeilings> {
+    (caps.wall_ms.is_some()
+        || caps.idle_ms.is_some()
+        || caps.turns.is_some()
+        || caps.tokens.is_some()
+        || caps.cost_usd.is_some())
+    .then(|| caps.to_wire())
 }
 
 impl Drop for PassGuard {
@@ -292,6 +343,7 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
     let mut events = RunEventGuard::start(
         &request.paths,
         request.events_fd,
+        request.facts_only,
         request.clock.clone(),
         RunEventStart {
             run_id: generated_run_id(request.role.name(), &request.clock),
@@ -302,13 +354,26 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
             schedule: None,
             repository: None,
             work_order: None,
-            ceilings: None,
+            ceilings: wire_ceilings(request.caps),
         },
     )
     .map_err(|error| {
         PassError::failed(
             request.role,
             format!("could not append run.started: {error}"),
+            1,
+        )
+    })?;
+    let mut watchdog = CapsWatchdog::start(
+        request.caps,
+        SystemClock::default(),
+        events.sink(),
+        events.run_id(),
+    )
+    .map_err(|error| {
+        PassError::failed(
+            request.role,
+            format!("could not start run watchdog: {error}"),
             1,
         )
     })?;
@@ -407,6 +472,8 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
         queue_count: None,
         dispatchable_count: None,
         events,
+        control: None,
+        process_exit: ProcessExit::Abnormal,
     };
     append_trace(
         &request.paths.trace_file(),
@@ -430,7 +497,7 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
         .rows
         .len();
 
-    check_signal(request, &mut guard, None)?;
+    check_signal(request, &mut guard, None, &watchdog)?;
     // A profile derived from the actor's policy grants wins over a
     // hand-maintained file: the grant is the authorization, and a settings file
     // beside it is a copy that can drift out of agreement with the policy it is
@@ -540,14 +607,45 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
             MAX_TURNS,
             &request.prompt,
         ])
-        .stdout(Stdio::from(output))
+        .stdout(Stdio::piped())
         .stderr(Stdio::from(error_output));
     set_process_group(&mut command);
     let mut child = command.spawn().map_err(|error| {
         PassError::failed(request.role, format!("could not start Claude: {error}"), 1)
     })?;
     guard.child_spawned = true;
-    let status = wait_for_child(request, &mut guard, &mut child)?;
+    guard.control = Some(RunControl::new(
+        guard.events.run_id(),
+        None,
+        request.caps,
+        NoSteer,
+    ));
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| PassError::failed(request.role, "Claude stdout pipe was unavailable", 1))?;
+    let (capture, capture_thread) = capture_stdout(stdout, output);
+    let wait_result = wait_for_child(request, &mut guard, &mut child, &mut watchdog, &capture);
+    if wait_result.is_err() && child.try_wait().ok().flatten().is_none() {
+        terminate_child_process_group(&mut child, PASS_TERMINATION_GRACE);
+        let _ = child.wait();
+    }
+    let capture_result = capture_thread
+        .join()
+        .map_err(|_| PassError::failed(request.role, "Claude transcript capture panicked", 1))?;
+    capture_result.map_err(|error| {
+        PassError::failed(
+            request.role,
+            format!("could not write Claude transcript: {error}"),
+            1,
+        )
+    })?;
+    let status = wait_result?;
+    guard.process_exit = if status.success() {
+        ProcessExit::Normal
+    } else {
+        ProcessExit::Abnormal
+    };
     let transcript = read_transcript(&log);
     guard.cost_usd = transcript.cost_usd;
     reconcile_outcome(&mut guard, watermark, status, transcript.permission_denied);
@@ -624,30 +722,200 @@ fn wait_for_child(
     request: &PassRequest,
     guard: &mut PassGuard,
     child: &mut Child,
+    watchdog: &mut CapsWatchdog<SystemClock>,
+    capture: &Receiver<Result<String, CaptureFault>>,
 ) -> Result<ExitStatus, PassError> {
+    let mut normaliser = ClaudeNormaliser::new();
+    let mut capture_open = true;
+    let mut normaliser_finished = false;
+    let mut status = None;
+
     loop {
-        if let Some(status) = child.try_wait().map_err(|error| {
+        if capture_open {
+            match capture.recv_timeout(Duration::from_millis(50)) {
+                Ok(Ok(raw)) => {
+                    let drafts = match normaliser.line(&raw) {
+                        Ok(drafts) => drafts,
+                        Err(fault) => vec![capture_refused_draft(guard.events.run_id(), &fault)],
+                    };
+                    if let Some(trip) = append_observed(guard, watchdog, drafts)? {
+                        return Err(apply_cap_trip(request, guard, child, trip));
+                    }
+                }
+                Ok(Err(fault)) => {
+                    if let Some(trip) = append_observed(
+                        guard,
+                        watchdog,
+                        vec![capture_refused_draft(guard.events.run_id(), &fault)],
+                    )? {
+                        return Err(apply_cap_trip(request, guard, child, trip));
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => capture_open = false,
+            }
+        } else {
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        if !capture_open && !normaliser_finished {
+            let drafts = match normaliser.finish() {
+                Ok(drafts) => drafts,
+                Err(fault) => vec![capture_refused_draft(guard.events.run_id(), &fault)],
+            };
+            normaliser_finished = true;
+            if let Some(trip) = append_observed(guard, watchdog, drafts)? {
+                return Err(apply_cap_trip(request, guard, child, trip));
+            }
+        }
+
+        if status.is_none() {
+            status = child.try_wait().map_err(|error| {
+                PassError::failed(
+                    request.role,
+                    format!("could not wait for Claude: {error}"),
+                    1,
+                )
+            })?;
+            if status.is_some() {
+                kill_remaining_process_group(child.id());
+            }
+        }
+
+        if status.is_none() {
+            check_signal(request, guard, Some(child), watchdog)?;
+        }
+
+        if let Some(trip) = watchdog.check() {
+            return Err(apply_cap_trip(request, guard, child, trip));
+        }
+
+        if !capture_open && let Some(status) = status {
+            return Ok(status);
+        }
+    }
+}
+
+fn capture_stdout(
+    stdout: std::process::ChildStdout,
+    transcript: fs::File,
+) -> (
+    Receiver<Result<String, CaptureFault>>,
+    thread::JoinHandle<std::io::Result<()>>,
+) {
+    let (sender, receiver) = mpsc::channel();
+    let thread = thread::spawn(move || {
+        copy_capture_lines(ChildStdoutSource::new(stdout), transcript, |line| {
+            let _ = sender.send(line);
+        })
+    });
+    (receiver, thread)
+}
+
+fn copy_capture_lines(
+    source: impl LineSource,
+    mut transcript: impl Write,
+    mut send: impl FnMut(Result<String, CaptureFault>),
+) -> std::io::Result<()> {
+    let mut write_fault = None;
+    for line in source {
+        if let Ok(raw) = &line
+            && write_fault.is_none()
+            && let Err(error) = transcript
+                .write_all(raw.as_bytes())
+                .and_then(|()| transcript.write_all(b"\n"))
+        {
+            write_fault = Some(error);
+        }
+        send(line);
+    }
+    if let Some(error) = write_fault {
+        Err(error)
+    } else {
+        transcript.flush()
+    }
+}
+
+fn append_observed(
+    guard: &PassGuard,
+    watchdog: &mut CapsWatchdog<SystemClock>,
+    drafts: Vec<EventDraft>,
+) -> Result<Option<CapTrip>, PassError> {
+    for draft in drafts {
+        let event = guard.events.append(draft).map_err(|error| {
             PassError::failed(
-                request.role,
-                format!("could not wait for Claude: {error}"),
+                guard.role,
+                format!("could not append captured agent event: {error}"),
+                1,
+            )
+        })?;
+        if let Some(trip) = watchdog.observe(&event).map_err(|error| {
+            PassError::failed(
+                guard.role,
+                format!("could not observe captured agent event: {error}"),
                 1,
             )
         })? {
-            kill_remaining_process_group(child.id());
-            return Ok(status);
+            return Ok(Some(trip));
         }
-        if let Err(error) = check_signal(request, guard, Some(child)) {
-            let _ = child.wait();
-            return Err(error);
-        }
-        thread::sleep(Duration::from_millis(50));
     }
+    Ok(None)
+}
+
+fn capture_refused_draft(run_id: &str, fault: &CaptureFault) -> EventDraft {
+    let detail = excerpt(&fault.to_string(), MAX_EXCERPT_SCALARS);
+    EventDraft {
+        event_type: CAPTURE_REFUSED.to_owned(),
+        payload: serde_json::to_value(CaptureRefusedPayload {
+            cause: CaptureRefusalCause::Malformed,
+            source_run_id: run_id.to_owned(),
+            source_seq: None,
+            source_type: Some("claude.stream-json".to_owned()),
+            field: None,
+            count: None,
+            max: None,
+            detail: Some(detail.text),
+            truncated: Some(detail.truncated),
+            extra: PayloadExtension::new(),
+        })
+        .expect("capture.refused payload serialises"),
+        captured_at: None,
+    }
+}
+
+fn apply_cap_trip(
+    request: &PassRequest,
+    guard: &mut PassGuard,
+    child: &mut Child,
+    trip: CapTrip,
+) -> PassError {
+    let cap = trip.cap();
+    let finished = trip.finished().clone();
+    if let Err(error) = guard.events.terminate_cap(trip, child) {
+        return PassError::failed(
+            request.role,
+            format!(
+                "could not append {0} cap terminal event: {error}",
+                cap.name()
+            ),
+            1,
+        );
+    }
+    guard.outcome = Some(finished.outcome.as_str().to_owned());
+    guard.reason = finished.reason;
+    guard.cost_usd = finished.cost_usd;
+    PassError::failed(
+        request.role,
+        format!("Claude run reached its {} cap", cap.name()),
+        1,
+    )
 }
 
 fn check_signal(
     request: &PassRequest,
     guard: &mut PassGuard,
     child: Option<&mut Child>,
+    watchdog: &CapsWatchdog<SystemClock>,
 ) -> Result<(), PassError> {
     let signal = request.signals.take_pending();
     // A killed supervisor cannot write the signal handoff. Watching the
@@ -657,9 +925,6 @@ fn check_signal(
         .is_some_and(|pid| !process_alive(pid));
     if signal.is_none() && !orphaned {
         return Ok(());
-    }
-    if let Some(child) = child {
-        terminate_child_process_group(child, Duration::from_secs(5));
     }
     let name = signal.unwrap_or("TERM");
     guard.outcome = Some(if name == "TERM" {
@@ -672,6 +937,30 @@ fn check_signal(
         "INT" => 130,
         _ => 143,
     };
+    if let (Some(child), Some(control)) = (child, &mut guard.control) {
+        let request = ControlRequestedPayload {
+            control_id: format!(
+                "scheduler-sig{}-{}",
+                name.to_ascii_lowercase(),
+                request.clock.epoch_seconds()
+            ),
+            kind: ControlKind::Interrupt,
+            text: None,
+            truncated: None,
+            by: "scheduler".to_owned(),
+            extra: PayloadExtension::new(),
+        };
+        guard
+            .events
+            .interrupt(control, request, Some(child), watchdog)
+            .map_err(|error| {
+                PassError::failed(
+                    guard.role,
+                    format!("could not apply scheduler interrupt: {error}"),
+                    1,
+                )
+            })?;
+    }
     Err(PassError::failed(
         request.role,
         format!("received SIG{name}"),
