@@ -440,21 +440,16 @@ instead; do not continue to another write after an invisible failure.
   refused. If `already_judged=judged`, do not post again. If it is
   `cannot-tell`, make no GitHub write and report the gate's named judgment-history
   error to the principal. Stop in all three cases.
-- **Inconclusive (exit 2)** — address the principal and emit exactly this
-  dossier shape, populated from the gate's unobservable condition details:
-
-  ```text
-  Question: Should the principal wait for an observable gate result or decide this pull request outside the gate?
-  Options ruled out: The gatekeeper inferring missing facts; treating inconclusive as pass or fail; asking the builder to argue the existing artifact.
-  Recommended action: The principal chooses whether to wait and re-run or use the one-PR exception path by running `ostrom excuse grant <owner/repo>#<PR number> <condition> <reason...>`, then re-run the gate.
-  Blast radius: This pull request only; no standing permission and no change to gate conditions.
-  ```
-
-  Do not comment on the PR and do not merge.
+- **Inconclusive (exit 2)** — the gate has already raised a
+  `decision.requested` with kind `gate_inconclusive`, its condition dossier,
+  and the `excuse:<condition>`, `wait`, and `fail` options. Stop and leave that
+  decision for the principal. Do not write a second dossier in your reply or
+  post one as a PR comment. Do not merge. If the gate reports a persistence
+  error, report that named error to the principal and stop.
 
 Any other exit code is a gate execution failure. Treat it as inconclusive,
-include the observed exit code in the Question field, address the same dossier
-to the principal, and stop.
+include the observed exit code in the Question field of an escalation dossier,
+address it to the principal, and stop.
 
 **Never merge on `fail`, `inconclusive`, or any other exit code**, and never
 post a verdict comment that reads as a pass. On a non-pass verdict the

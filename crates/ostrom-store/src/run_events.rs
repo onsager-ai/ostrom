@@ -1,6 +1,7 @@
 //! Ethogram lifecycle emission through Umwelt's durable sink.
 
 use std::{
+    collections::BTreeMap,
     fs::File,
     io::Write,
     path::Path,
@@ -22,13 +23,14 @@ use ethogram::{
 };
 use ostrom_core::{DecisionOption, Dossier, WriteDisposition};
 use serde::Serialize;
+use serde_json::{Map, json};
 use thiserror::Error;
 use umwelt_runtime::{
     CapTrip, CapsWatchdog, ControlError, FileSink, ProcessExit, RunControl, SessionResumer, Sink,
     SinkFault, Source as _, SourceFault, watchdog::Clock as WatchdogClock,
 };
 
-use crate::{Clock, OstromPaths};
+use crate::{Clock, OstromPaths, StoreError, TraceAppend, append_trace, read_trace};
 
 static RUN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -42,9 +44,14 @@ pub enum RunEventError {
     Payload(#[from] serde_json::Error),
     #[error("decision id {0} was reused with different content")]
     DecisionConflict(String),
+    #[error("decision fact {0} was reused with different content")]
+    DecisionFactConflict(String),
+    #[error(transparent)]
+    Store(#[from] StoreError),
 }
 
 pub(crate) const SWEEP_RUN_ID: &str = "sweep";
+pub(crate) const GATE_RUN_ID: &str = "gate";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DecisionRequest {
@@ -55,20 +62,20 @@ pub(crate) struct DecisionRequest {
     pub subject: String,
 }
 
-/// The sweep is a durable relay rather than a child process. Its stable run
-/// remains open so a later queue command can apply an answer on the run that
-/// owns the request.
-pub(crate) struct SweepDecisionEmitter {
+/// Sweep and gate decisions use stable relay runs that remain open so a later
+/// queue command can apply an answer on the run that owns the request.
+pub(crate) struct DecisionEmitter {
     sink: RunEventSink,
+    run_id: String,
 }
 
-impl SweepDecisionEmitter {
-    pub(crate) fn new(paths: &OstromPaths) -> Result<Self, RunEventError> {
+impl DecisionEmitter {
+    pub(crate) fn new(paths: &OstromPaths, run_id: &str) -> Result<Self, RunEventError> {
         let sink = RunEventSink::new(&paths.runs_dir(), None, false);
-        if sink.last_seq(SWEEP_RUN_ID)? == 0 {
+        if sink.last_seq(run_id)? == 0 {
             let payload = RunStartedPayload {
                 kind: RunKind::Relay,
-                actor: "sweep".to_owned(),
+                actor: run_id.to_owned(),
                 harness: "ostrom".to_owned(),
                 model: None,
                 parent_run_id: None,
@@ -79,9 +86,12 @@ impl SweepDecisionEmitter {
                 ceilings: None,
                 extra: PayloadExtension::new(),
             };
-            sink.append(SWEEP_RUN_ID, draft("run.started", payload)?)?;
+            sink.append(run_id, draft("run.started", payload)?)?;
         }
-        Ok(Self { sink })
+        Ok(Self {
+            sink,
+            run_id: run_id.to_owned(),
+        })
     }
 
     pub(crate) fn request(
@@ -89,7 +99,7 @@ impl SweepDecisionEmitter {
         request: &DecisionRequest,
     ) -> Result<WriteDisposition, RunEventError> {
         let draft = decision_request_draft(request)?;
-        for event in self.sink.durable.read_from(SWEEP_RUN_ID, 0)? {
+        for event in self.sink.durable.read_from(&self.run_id, 0)? {
             if event.event_type != ethogram::DECISION_REQUESTED
                 || event
                     .payload
@@ -104,9 +114,67 @@ impl SweepDecisionEmitter {
             }
             return Err(RunEventError::DecisionConflict(request.decision_id.clone()));
         }
-        self.sink.append(SWEEP_RUN_ID, draft)?;
+        self.sink.append(&self.run_id, draft)?;
         Ok(WriteDisposition::Written)
     }
+}
+
+pub(crate) fn emit_decision_requests(
+    paths: &OstromPaths,
+    timestamp: &str,
+    run_id: &str,
+    requests: &[DecisionRequest],
+) -> Result<(), RunEventError> {
+    if requests.is_empty() {
+        return Ok(());
+    }
+    let mut facts = read_trace(&paths.trace_file())?
+        .rows
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|row| row.kind == "decision-requested")
+        .filter_map(|row| {
+            let decision_id = row.fact.get("decision_id")?.as_str()?.to_owned();
+            let kind = row.fact.get("kind")?.as_str()?.to_owned();
+            let subject = row.fact.get("subject")?.as_str()?.to_owned();
+            Some((decision_id, (kind, subject)))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for request in requests {
+        let signature = (request.kind.as_str().to_owned(), request.subject.clone());
+        if facts
+            .get(&request.decision_id)
+            .is_some_and(|stored| stored != &signature)
+        {
+            return Err(RunEventError::DecisionFactConflict(
+                request.decision_id.clone(),
+            ));
+        }
+    }
+    let emitter = DecisionEmitter::new(paths, run_id)?;
+    for request in requests {
+        let signature = (request.kind.as_str().to_owned(), request.subject.clone());
+        if facts.contains_key(&request.decision_id) {
+            emitter.request(request)?;
+            continue;
+        }
+        emitter.request(request)?;
+        append_trace(
+            &paths.trace_file(),
+            &TraceAppend {
+                ts: timestamp.to_owned(),
+                kind: "decision-requested".to_owned(),
+                fact: Map::from_iter([
+                    ("decision_id".to_owned(), json!(&request.decision_id)),
+                    ("kind".to_owned(), json!(request.kind.as_str())),
+                    ("subject".to_owned(), json!(&request.subject)),
+                ]),
+                narration: Map::new(),
+            },
+        )?;
+        facts.insert(request.decision_id.clone(), signature);
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -471,8 +539,7 @@ mod tests {
     use umwelt_runtime::{FileSink, Source};
 
     use super::{
-        DecisionRequest, RunEventError, RunEventGuard, RunEventStart, SWEEP_RUN_ID,
-        SweepDecisionEmitter,
+        DecisionEmitter, DecisionRequest, RunEventError, RunEventGuard, RunEventStart, SWEEP_RUN_ID,
     };
     use crate::{Clock, OstromPaths};
 
@@ -514,7 +581,8 @@ mod tests {
     #[test]
     fn sweep_decisions_cross_the_typed_edge_without_a_timeout() {
         let (_root, paths, _clock) = fixture();
-        let emitter = SweepDecisionEmitter::new(&paths).expect("open sweep decision emitter");
+        let emitter =
+            DecisionEmitter::new(&paths, SWEEP_RUN_ID).expect("open sweep decision emitter");
         assert_eq!(
             emitter
                 .request(&decision_request(
@@ -559,7 +627,8 @@ mod tests {
     #[test]
     fn sweep_decision_identity_is_idempotent_and_conflicts_are_loud() {
         let (_root, paths, _clock) = fixture();
-        let emitter = SweepDecisionEmitter::new(&paths).expect("open sweep decision emitter");
+        let emitter =
+            DecisionEmitter::new(&paths, SWEEP_RUN_ID).expect("open sweep decision emitter");
         let request = decision_request("stable-decision", "synthetic/project#42");
         assert_eq!(
             emitter.request(&request).expect("first request"),

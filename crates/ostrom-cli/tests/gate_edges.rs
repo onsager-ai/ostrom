@@ -44,14 +44,14 @@ check=success
 case "$mode" in
   check-failure) check=failure ;;
   check-running) check='' ;;
-  unknown-check) check=unrecognized ;;
+  unknown-check|two-inconclusive) check=unrecognized ;;
 esac
 if [ "$1 $2" = "pr view" ]; then
   mergeable=MERGEABLE
   draft=false
   title='fix(core): safe placeholder change'
   case "$mode" in
-    unknown-mergeable) mergeable=UNKNOWN ;;
+    unknown-mergeable|two-inconclusive) mergeable=UNKNOWN ;;
     draft) draft=true ;;
     bounce) title='feat(core): protected placeholder change' ;;
   esac
@@ -552,4 +552,83 @@ fn exceptions_are_condition_and_sha_scoped_for_failures_and_inconclusive_results
     let output = fixture.run("unknown-mergeable", 19, "dddddddddddddddd");
     assert!(output.status.success());
     assert!(output_text(&output).contains("condition mergeable: excused"));
+}
+
+#[test]
+fn gate_cli_raises_one_decision_for_two_inconclusive_conditions_and_stays_quiet_on_retry() {
+    use umwelt_runtime::{FileSink, Source};
+
+    let fixture = Fixture::new();
+    for expected_state in ["not-judged", "judged"] {
+        let output = fixture.run("two-inconclusive", 19, "aaaaaaaaaaaaaaaa");
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        let text = output_text(&output);
+        assert!(text.contains("condition mergeable: inconclusive"));
+        assert!(text.contains("condition required_checks: inconclusive"));
+        assert!(text.contains(&format!("already_judged={expected_state}")));
+    }
+    let events = FileSink::new(fixture.home.join("runs"))
+        .read_from("gate", 0)
+        .unwrap();
+    let decisions = events
+        .iter()
+        .filter(|event| event.event_type == ethogram::DECISION_REQUESTED)
+        .collect::<Vec<_>>();
+    assert_eq!(decisions.len(), 1);
+    let event = decisions[0];
+    ethogram::validate(&event.event_type, &event.payload).unwrap();
+    let payload: ethogram::DecisionRequestedPayload =
+        serde_json::from_value(event.payload.clone()).unwrap();
+    assert_eq!(payload.kind, ethogram::DecisionKind::GateInconclusive);
+    assert_eq!(
+        payload.subject.as_deref(),
+        Some("example-org/example-repo#19")
+    );
+    assert_eq!(
+        payload
+            .options
+            .iter()
+            .map(|option| option.id.as_str())
+            .collect::<Vec<_>>(),
+        ["excuse:mergeable", "excuse:required_checks", "wait", "fail"]
+    );
+    assert!(event.payload.get("onTimeout").is_none());
+    assert!(
+        !event
+            .payload
+            .to_string()
+            .contains("safe placeholder change")
+    );
+
+    let facts = ostrom_store::read_trace(&fixture.home.join("sprint.jsonl")).unwrap();
+    assert_eq!(facts.rows.len(), 1);
+    assert_eq!(facts.rows[0].as_ref().unwrap().kind, "decision-requested");
+}
+
+#[test]
+fn gate_cli_pass_and_fail_raise_no_decisions() {
+    for (mode, exit_code) in [("pass", 0), ("check-failure", 1)] {
+        let fixture = Fixture::new();
+        let output = fixture.run(mode, 19, "aaaaaaaaaaaaaaaa");
+        assert_eq!(output.status.code(), Some(exit_code), "{output:?}");
+        assert!(!fixture.home.join("runs").exists());
+        assert!(!fixture.home.join("sprint.jsonl").exists());
+    }
+}
+
+#[test]
+fn gate_cli_reports_decision_delivery_failure_and_retries_after_repair() {
+    let fixture = Fixture::new();
+    let runs = fixture.home.join("runs");
+    fs::write(&runs, "blocked sink").unwrap();
+    let output = fixture.run("two-inconclusive", 19, "aaaaaaaaaaaaaaaa");
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("could not raise decision"));
+    assert!(!fixture.home.join("gate.jsonl").exists());
+
+    fs::remove_file(runs).unwrap();
+    let output = fixture.run("two-inconclusive", 19, "aaaaaaaaaaaaaaaa");
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(fixture.home.join("gate.jsonl").exists());
+    assert!(fixture.home.join("sprint.jsonl").exists());
 }

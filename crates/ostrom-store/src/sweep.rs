@@ -18,16 +18,15 @@ use thiserror::Error;
 
 use crate::{
     AppTokenError, OstromPaths, PolicyBundle, PublishDestination, PublishError, QueueDocument,
-    StoreError, TraceAppend,
+    StoreError,
     app_token::{GitHubInstallationTokenMinter, InstallationTokenMinter, ScopedAppTokenRequest},
-    append_trace,
     commit_checks::read_commit_checks,
     environment,
     gate::load_gate_config,
     io_error,
     publish::{JsonlPublicationSource, PublishOptions, PublishOutcome, publish},
     read_queue, read_trace,
-    run_events::{DecisionRequest, RunEventError, SweepDecisionEmitter},
+    run_events::{DecisionRequest, RunEventError, SWEEP_RUN_ID},
     selector::{SelectorCandidate, glob_match, selector_match},
     set_private_file_mode, write_queue,
 };
@@ -2054,56 +2053,17 @@ fn emit_decision_requests(
     started_at: DateTime<Utc>,
     requests: &[DecisionRequest],
 ) -> Result<(), SweepError> {
-    if requests.is_empty() {
-        return Ok(());
-    }
-    let mut facts = read_trace(&paths.trace_file())?
-        .rows
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|row| row.kind == "decision-requested")
-        .filter_map(|row| {
-            let decision_id = row.fact.get("decision_id")?.as_str()?.to_owned();
-            let kind = row.fact.get("kind")?.as_str()?.to_owned();
-            let subject = row.fact.get("subject")?.as_str()?.to_owned();
-            Some((decision_id, (kind, subject)))
-        })
-        .collect::<BTreeMap<_, _>>();
-    for request in requests {
-        let signature = (request.kind.as_str().to_owned(), request.subject.clone());
-        if facts
-            .get(&request.decision_id)
-            .is_some_and(|stored| stored != &signature)
-        {
-            return Err(SweepError::DecisionFactConflict(
-                request.decision_id.clone(),
-            ));
-        }
-    }
-    let emitter = SweepDecisionEmitter::new(paths)?;
-    for request in requests {
-        let signature = (request.kind.as_str().to_owned(), request.subject.clone());
-        if facts.contains_key(&request.decision_id) {
-            emitter.request(request)?;
-            continue;
-        }
-        emitter.request(request)?;
-        append_trace(
-            &paths.trace_file(),
-            &TraceAppend {
-                ts: format_time(started_at),
-                kind: "decision-requested".to_owned(),
-                fact: Map::from_iter([
-                    ("decision_id".to_owned(), json!(&request.decision_id)),
-                    ("kind".to_owned(), json!(request.kind.as_str())),
-                    ("subject".to_owned(), json!(&request.subject)),
-                ]),
-                narration: Map::new(),
-            },
-        )?;
-        facts.insert(request.decision_id.clone(), signature);
-    }
-    Ok(())
+    crate::run_events::emit_decision_requests(
+        paths,
+        &format_time(started_at),
+        SWEEP_RUN_ID,
+        requests,
+    )
+    .map_err(|error| match error {
+        RunEventError::DecisionFactConflict(id) => SweepError::DecisionFactConflict(id),
+        RunEventError::Store(error) => SweepError::Store(error),
+        error => SweepError::RunEvent(error),
+    })
 }
 
 fn queue_item_type(item: &NormalizedItem) -> &'static str {
