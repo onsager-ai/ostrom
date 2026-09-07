@@ -23,6 +23,17 @@ pub enum SinkFault {
     Gap { expected: u64, got: u64 },
     /// A forwarded event repeats a sequence number already held.
     Duplicate(u64),
+    /// The payload exceeds an ethogram capture bound.
+    OverBound {
+        path: Option<String>,
+        count: usize,
+        max: usize,
+        /// Counts measure either Unicode scalars or payload bytes; without a
+        /// unit, the number and its maximum are not interpretable.
+        unit: &'static str,
+    },
+    /// The payload fails ethogram validation, retaining its path and diagnostic.
+    Invalid { path: String, detail: String },
     /// The durable log contains a torn or unparsable line.
     Malformed { line: u64, message: String },
     /// An I/O operation failed.
@@ -40,6 +51,17 @@ impl Display for SinkFault {
                 )
             }
             Self::Duplicate(seq) => write!(formatter, "event sequence {seq} is already stored"),
+            Self::OverBound {
+                path,
+                count,
+                max,
+                unit,
+            } => write!(
+                formatter,
+                "{} has {count} {unit}; maximum is {max}",
+                path.as_deref().unwrap_or("payload")
+            ),
+            Self::Invalid { path, detail } => write!(formatter, "invalid {path}: {detail}"),
             Self::Malformed { line, message } => {
                 write!(
                     formatter,
@@ -52,6 +74,32 @@ impl Display for SinkFault {
 }
 
 impl std::error::Error for SinkFault {}
+
+impl From<ethogram::ValidationError> for SinkFault {
+    fn from(error: ethogram::ValidationError) -> Self {
+        use ethogram::ValidationErrorKind;
+
+        let detail = error.to_string();
+        match error.kind {
+            ValidationErrorKind::OverBound { path, count, max } => Self::OverBound {
+                path: Some(path),
+                count,
+                max,
+                unit: "scalars",
+            },
+            ValidationErrorKind::PayloadTooLarge { bytes, max } => Self::OverBound {
+                path: None,
+                count: bytes,
+                max,
+                unit: "bytes",
+            },
+            ValidationErrorKind::UnknownMember { path, .. }
+            | ValidationErrorKind::MissingField { path }
+            | ValidationErrorKind::Policy { path, .. }
+            | ValidationErrorKind::Malformed { path, .. } => Self::Invalid { path, detail },
+        }
+    }
+}
 
 /// A failure to replay stored events.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -89,9 +137,20 @@ impl std::error::Error for SourceFault {}
 /// Append-only storage for stamped ethogram events.
 pub trait Sink: Send + Sync {
     /// Append one draft to a run, assigning its next `seq` and the sink's `ts`.
+    ///
+    /// Validate with ethogram before stamping; a rejected draft consumes no
+    /// sequence number and writes nothing. Return a fault without emitting
+    /// `capture.refused`: the caller owns the meaning of a refusal. For a
+    /// normaliser draft, the pass runner records it on its own run.
     fn append(&self, run: &str, draft: EventDraft) -> Result<Event, SinkFault>;
 
     /// Forward an already-stamped event, preserving `seq` and `ts` exactly.
+    ///
+    /// Validate with ethogram before checking sequence numbers, so malformed
+    /// payloads cannot produce gap or duplicate diagnoses. A refusal changes
+    /// no stored sequence and writes nothing. The sink never emits
+    /// `capture.refused`; the relay records it on its own run, naming
+    /// `sourceRunId` and `sourceSeq`, rather than writing to the source's run.
     fn forward(&self, event: Event) -> Result<(), SinkFault>;
 
     /// Return the last `seq` held for `run`, or zero when nothing is held.
@@ -192,6 +251,8 @@ impl Sink for FileSink {
             return Err(SinkFault::Finished);
         }
 
+        ethogram::validate(&draft.event_type, &draft.payload).map_err(SinkFault::from)?;
+
         let seq = state
             .last_seq
             .checked_add(1)
@@ -224,6 +285,8 @@ impl Sink for FileSink {
         if state.finished {
             return Err(SinkFault::Finished);
         }
+
+        ethogram::validate(&event.event_type, &event.payload).map_err(SinkFault::from)?;
 
         let expected = state
             .last_seq
@@ -546,6 +609,26 @@ pub mod conformance {
         O: Fn(&str) -> Vec<Vec<u8>>,
     {
         let namespace = namespace();
+        append_rejects_over_bound(
+            &new_sink,
+            &stored_event_bytes,
+            &run(&namespace, "over-bound"),
+        );
+        append_rejects_payload_too_large(
+            &new_sink,
+            &stored_event_bytes,
+            &run(&namespace, "append-large"),
+        );
+        forward_rejects_unknown_kind(
+            &new_sink,
+            &stored_event_bytes,
+            &run(&namespace, "unknown-kind"),
+        );
+        forward_rejects_payload_too_large(
+            &new_sink,
+            &stored_event_bytes,
+            &run(&namespace, "forward-large"),
+        );
         gapless_across_reopen(&new_sink, &stored_event_bytes, &run(&namespace, "reopen"));
         forward_is_byte_identical(&new_sink, &stored_event_bytes, &run(&namespace, "bytes"));
         forward_rejects_gap_and_duplicate(&new_sink, &run(&namespace, "sequence-errors"));
@@ -599,7 +682,11 @@ pub mod conformance {
     fn draft(event_type: &str) -> EventDraft {
         EventDraft {
             event_type: event_type.to_owned(),
-            payload: json!({ "z": 1, "a": { "two": 2, "one": 1 } }),
+            payload: if event_type == RUN_FINISHED {
+                json!({ "outcome": "completed", "durationMs": 0 })
+            } else {
+                json!({ "z": 1, "a": { "two": 2, "one": 1 } })
+            },
             captured_at: None,
         }
     }
@@ -611,9 +698,149 @@ pub mod conformance {
             run_id: run_id.to_owned(),
             seq,
             ts: ts.to_owned(),
-            payload: json!({ "z": 1, "a": { "two": 2, "one": 1 } }),
+            payload: if event_type == RUN_FINISHED {
+                json!({ "outcome": "completed", "durationMs": 0 })
+            } else {
+                json!({ "z": 1, "a": { "two": 2, "one": 1 } })
+            },
             captured_at: Some("2026-09-06T00:00:00.000Z".to_owned()),
         }
+    }
+
+    pub(crate) fn append_rejects_over_bound<S, F, O>(new_sink: &F, stored: &O, run: &str)
+    where
+        S: Sink,
+        F: Fn() -> S,
+        O: Fn(&str) -> Vec<Vec<u8>>,
+    {
+        let sink = new_sink();
+        sink.append(run, draft("test.seed")).expect("seed run");
+        let before = stored(run);
+        let count = ethogram::MAX_TEXT_SCALARS + 1;
+        let mut rejected = draft(ethogram::AGENT_TEXT);
+        rejected.payload = json!({ "text": "😀".repeat(count) });
+        let fault = sink
+            .append(run, rejected)
+            .expect_err("refuse over-bound agent.text");
+        assert_eq!(
+            fault,
+            SinkFault::OverBound {
+                path: Some("payload.text".to_owned()),
+                count,
+                max: ethogram::MAX_TEXT_SCALARS,
+                unit: "scalars",
+            }
+        );
+        assert!(fault.to_string().contains("scalars"));
+        assert_eq!(stored(run), before, "refusal must not write any event");
+        assert_eq!(sink.last_seq(run).expect("unchanged seq"), 1);
+        assert_eq!(
+            sink.append(run, draft("test.next"))
+                .expect("next append")
+                .seq,
+            2
+        );
+    }
+
+    fn oversized_draft() -> (EventDraft, SinkFault) {
+        // Many individually bounded leaves isolate the total byte bound.
+        // A JSON array of zeroes has 2*n+1 bytes: exactly one above the cap.
+        let mut rejected = draft("test.large");
+        rejected.payload = json!(vec![0; ethogram::MAX_PAYLOAD_BYTES / 2]);
+        let bytes = serde_json::to_vec(&rejected.payload)
+            .expect("payload bytes")
+            .len();
+        assert_eq!(bytes, ethogram::MAX_PAYLOAD_BYTES + 1);
+        (
+            rejected,
+            SinkFault::OverBound {
+                path: None,
+                count: bytes,
+                max: ethogram::MAX_PAYLOAD_BYTES,
+                unit: "bytes",
+            },
+        )
+    }
+
+    pub(crate) fn append_rejects_payload_too_large<S, F, O>(new_sink: &F, stored: &O, run: &str)
+    where
+        S: Sink,
+        F: Fn() -> S,
+        O: Fn(&str) -> Vec<Vec<u8>>,
+    {
+        let sink = new_sink();
+        sink.append(run, draft("test.seed")).expect("seed run");
+        let before = stored(run);
+        let (rejected, expected) = oversized_draft();
+        let fault = sink
+            .append(run, rejected)
+            .expect_err("refuse oversized append payload");
+        assert_eq!(fault, expected);
+        assert_eq!(
+            fault.to_string(),
+            format!(
+                "payload has {} bytes; maximum is {}",
+                ethogram::MAX_PAYLOAD_BYTES + 1,
+                ethogram::MAX_PAYLOAD_BYTES
+            )
+        );
+        assert_eq!(stored(run), before);
+        assert_eq!(
+            sink.append(run, draft("test.next"))
+                .expect("next append")
+                .seq,
+            2
+        );
+    }
+
+    pub(crate) fn forward_rejects_unknown_kind<S, F, O>(new_sink: &F, stored: &O, run: &str)
+    where
+        S: Sink,
+        F: Fn() -> S,
+        O: Fn(&str) -> Vec<Vec<u8>>,
+    {
+        let sink = new_sink();
+        sink.forward(event(run, 1, "test.seed", "2026-09-06T00:00:00.000Z"))
+            .expect("seed run");
+        let before = stored(run);
+        // Exercise the next, duplicate and gap sequences: validation must win
+        // over sequence diagnosis, and none may advance the stored sequence.
+        for seq in [2, 1, 3] {
+            let mut rejected = event(run, seq, CONTROL_REQUESTED, "2026-09-06T00:00:01.000Z");
+            rejected.payload = json!({ "controlId": "control", "kind": "unknown", "by": "test" });
+            assert_eq!(
+                sink.forward(rejected),
+                Err(SinkFault::Invalid {
+                    path: "payload.kind".to_owned(),
+                    detail: "ControlRequestedPayload.kind has unknown value: unknown".to_owned(),
+                })
+            );
+            assert_eq!(sink.last_seq(run).expect("unchanged seq"), 1);
+            assert_eq!(stored(run), before);
+        }
+        sink.forward(event(run, 2, "test.next", "2026-09-06T00:00:02.000Z"))
+            .expect("next seq after refusal");
+        assert_eq!(stored_sequences(stored, run), vec![1, 2]);
+    }
+
+    pub(crate) fn forward_rejects_payload_too_large<S, F, O>(new_sink: &F, stored: &O, run: &str)
+    where
+        S: Sink,
+        F: Fn() -> S,
+        O: Fn(&str) -> Vec<Vec<u8>>,
+    {
+        let sink = new_sink();
+        sink.forward(event(run, 1, "test.seed", "2026-09-06T00:00:00.000Z"))
+            .expect("seed run");
+        let before = stored(run);
+        let (draft, expected) = oversized_draft();
+        let mut rejected = event(run, 2, &draft.event_type, "2026-09-06T00:00:01.000Z");
+        rejected.payload = draft.payload;
+        assert_eq!(sink.forward(rejected), Err(expected));
+        assert_eq!(stored(run), before);
+        sink.forward(event(run, 2, "test.next", "2026-09-06T00:00:02.000Z"))
+            .expect("next seq after refusal");
+        assert_eq!(stored_sequences(stored, run), vec![1, 2]);
     }
 
     fn gapless_across_reopen<S, F, O>(new_sink: &F, stored: &O, run: &str)
@@ -936,6 +1163,92 @@ mod tests {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
             Err(error) => panic!("read stored events: {error}"),
         }
+    }
+
+    #[test]
+    fn battery_append_rejects_over_bound() {
+        let root = tempdir().expect("battery directory");
+        conformance::append_rejects_over_bound(
+            &|| FileSink::new(root.path()),
+            &|run| stored_event_bytes(root.path(), run),
+            "run",
+        );
+    }
+
+    #[test]
+    fn battery_append_rejects_payload_too_large() {
+        let root = tempdir().expect("battery directory");
+        conformance::append_rejects_payload_too_large(
+            &|| FileSink::new(root.path()),
+            &|run| stored_event_bytes(root.path(), run),
+            "run",
+        );
+    }
+
+    #[test]
+    fn battery_forward_rejects_unknown_kind() {
+        let root = tempdir().expect("battery directory");
+        conformance::forward_rejects_unknown_kind(
+            &|| FileSink::new(root.path()),
+            &|run| stored_event_bytes(root.path(), run),
+            "run",
+        );
+    }
+
+    #[test]
+    fn battery_forward_rejects_payload_too_large() {
+        let root = tempdir().expect("battery directory");
+        conformance::forward_rejects_payload_too_large(
+            &|| FileSink::new(root.path()),
+            &|run| stored_event_bytes(root.path(), run),
+            "run",
+        );
+    }
+
+    #[test]
+    fn over_bound_append_leaves_run_directory_unchanged() {
+        let root = tempdir().expect("sink directory");
+        let sink = FileSink::new(root.path());
+        let mut rejected = draft(ethogram::AGENT_TEXT);
+        rejected.payload = json!({ "text": "x".repeat(ethogram::MAX_TEXT_SCALARS + 1) });
+        assert!(matches!(
+            sink.append("new", rejected.clone()),
+            Err(SinkFault::OverBound { .. })
+        ));
+        assert_eq!(fs::read_dir(root.path()).expect("root entries").count(), 0);
+
+        sink.append("run", draft("test.seed")).expect("seed run");
+        let directory = root.path().join("run");
+        let snapshot = || {
+            let mut entries: Vec<_> = fs::read_dir(&directory)
+                .expect("run entries")
+                .map(|entry| {
+                    let entry = entry.expect("directory entry");
+                    (
+                        entry.file_name(),
+                        fs::read(entry.path()).expect("file bytes"),
+                    )
+                })
+                .collect();
+            entries.sort();
+            entries
+        };
+        let before = snapshot();
+        assert!(matches!(
+            sink.append("run", rejected),
+            Err(SinkFault::OverBound { .. })
+        ));
+        assert_eq!(
+            snapshot(),
+            before,
+            "every filename and byte must be unchanged"
+        );
+        assert_eq!(
+            sink.append("run", draft("test.next"))
+                .expect("next append")
+                .seq,
+            2
+        );
     }
 
     #[test]
