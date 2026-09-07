@@ -332,6 +332,7 @@ fn run_implement_with_registry_and_minter(
     let mut run_events = RunEventGuard::start(
         &request.paths,
         request.events_fd,
+        false,
         request.clock.clone(),
         RunEventStart {
             run_id: generated_run_id(&request.unit_name, &request.clock),

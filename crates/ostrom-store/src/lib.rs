@@ -62,7 +62,9 @@ pub use leaves::{
 };
 pub use migration::{MigrationOutcome, migrate};
 pub use parity::{ParityError, SweepParityOptions, SweepParityOutcome, run_sweep_parity};
-pub use pass::{MAX_TURNS as PASS_MAX_TURNS, PassError, PassRequest, PassRole, run_pass};
+pub use pass::{
+    MAX_TURNS as PASS_MAX_TURNS, PASS_KILL_GRACE_MS, PassError, PassRequest, PassRole, run_pass,
+};
 pub use paths::OstromPaths;
 pub use plan::{
     AssessmentDeriver, AssessmentDeriverError, AssessmentHarness, AssessmentInput,
