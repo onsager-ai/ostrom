@@ -14,16 +14,33 @@
 //! indefinitely; only a wall cap bounds that run. An operator who configures
 //! an idle cap without a wall cap is therefore less protected than the idle
 //! cap's name may suggest.
+//!
+//! `costUsd` and `usage` on `agent.completed` are cumulative for the session
+//! named by `sessionId`, as the harness reports them at that moment; they are
+//! not per-frame increments. A consumer takes the maximum cost and the maximum
+//! of each usage field across completions sharing a session, then sums those
+//! maxima across distinct sessions. `turns` and `durationMs` are instead
+//! per-invocation values, so turns continue to be summed across completions.
+//!
+//! A completion is attributed first to its own `sessionId`, or otherwise to
+//! the `sessionId` on the most recent preceding `agent.started`. The field is
+//! optional, so this fallback is permanent. If neither event supplies an id,
+//! that completion is its own session and is summed with the others. Folding
+//! an unattributable completion into another session would silently discard a
+//! cost, so summing is the only safe attribution rule without an identity,
+//! even though over-counting can kill work that was inside its budget — the
+//! failure that known-session folding prevents.
 
 use std::{
+    collections::HashMap,
     process::Child,
     time::{Duration, Instant},
 };
 
 use ethogram::{
-    AGENT_COMPLETED, AGENT_TOOL_RESULT, AGENT_TOOL_USE, AGENT_WARNING, AgentCompletedPayload,
-    AgentWarningPayload, Event, EventDraft, PayloadExtension, RUN_FINISHED, RunFinishedPayload,
-    RunOutcome, RunUsage,
+    AGENT_COMPLETED, AGENT_STARTED, AGENT_TOOL_RESULT, AGENT_TOOL_USE, AGENT_WARNING,
+    AgentCompletedPayload, AgentStartedPayload, AgentWarningPayload, Event, EventDraft,
+    PayloadExtension, RUN_FINISHED, RunFinishedPayload, RunOutcome, RunUsage,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -172,9 +189,9 @@ pub struct CapsWatchdog<C> {
     last_observed_at: Duration,
     open_tool_calls: u64,
     turns: u64,
-    cost_microusd: u64,
-    cost_observed: bool,
-    usage: UsageLowerBound,
+    last_started_session_id: Option<String>,
+    sessions: HashMap<SessionKey, SessionObservation>,
+    usage_unit: Option<String>,
     tripped: bool,
 }
 
@@ -190,9 +207,9 @@ impl<C: Clock> CapsWatchdog<C> {
             last_observed_at: now,
             open_tool_calls: 0,
             turns: 0,
-            cost_microusd: 0,
-            cost_observed: false,
-            usage: UsageLowerBound::default(),
+            last_started_session_id: None,
+            sessions: HashMap::new(),
+            usage_unit: None,
             tripped: false,
         })
     }
@@ -233,6 +250,7 @@ impl<C: Clock> CapsWatchdog<C> {
             AGENT_TOOL_RESULT => {
                 self.open_tool_calls = self.open_tool_calls.saturating_sub(1);
             }
+            AGENT_STARTED => self.observe_started(event)?,
             AGENT_COMPLETED => self.observe_completed(event)?,
             _ => {}
         }
@@ -244,6 +262,16 @@ impl<C: Clock> CapsWatchdog<C> {
         self.evaluate()
     }
 
+    fn observe_started(&mut self, event: &Event) -> Result<(), WatchdogError> {
+        let started = serde_json::from_value::<AgentStartedPayload>(event.payload.clone())
+            .map_err(|source| WatchdogError::InvalidObservation {
+                event_type: event.event_type.clone(),
+                source,
+            })?;
+        self.last_started_session_id = started.session_id;
+        Ok(())
+    }
+
     fn observe_completed(&mut self, event: &Event) -> Result<(), WatchdogError> {
         let completed = serde_json::from_value::<AgentCompletedPayload>(event.payload.clone())
             .map_err(|source| WatchdogError::InvalidObservation {
@@ -251,16 +279,51 @@ impl<C: Clock> CapsWatchdog<C> {
                 source,
             })?;
         self.turns = self.turns.saturating_add(completed.turns.unwrap_or(0));
-        if let Some(cost_usd) = completed.cost_usd {
-            self.cost_observed = true;
-            self.cost_microusd = self
-                .cost_microusd
-                .saturating_add(dollars_to_microusd(cost_usd)?);
+        let cost_microusd = completed.cost_usd.map(dollars_to_microusd).transpose()?;
+        let session_key = completed
+            .session_id
+            .or_else(|| self.last_started_session_id.clone())
+            .map_or_else(
+                || SessionKey::Unattributed(self.sessions.len()),
+                SessionKey::Named,
+            );
+        if let Some(unit) = completed
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.unit.as_ref())
+        {
+            self.usage_unit = Some(unit.clone());
         }
+        let session = self.sessions.entry(session_key).or_default();
+        max_optional(&mut session.cost_microusd, cost_microusd);
         if let Some(usage) = completed.usage {
-            self.usage.add(usage);
+            session.usage.add(usage);
         }
         Ok(())
+    }
+
+    fn observed_totals(&self) -> ObservedTotals {
+        let mut totals = ObservedTotals {
+            usage: UsageLowerBound {
+                unit: self.usage_unit.clone(),
+                ..UsageLowerBound::default()
+            },
+            ..ObservedTotals::default()
+        };
+        for session in self.sessions.values() {
+            sum_optional(&mut totals.cost_microusd, session.cost_microusd);
+            sum_optional(&mut totals.usage.input_tokens, session.usage.input_tokens);
+            sum_optional(&mut totals.usage.output_tokens, session.usage.output_tokens);
+            sum_optional(
+                &mut totals.usage.cache_read_tokens,
+                session.usage.cache_read_tokens,
+            );
+            sum_optional(
+                &mut totals.usage.cache_creation_tokens,
+                session.usage.cache_creation_tokens,
+            );
+        }
+        totals
     }
 
     fn evaluate(&mut self) -> Option<CapTrip> {
@@ -272,7 +335,9 @@ impl<C: Clock> CapsWatchdog<C> {
         let wall_ms = duration_ms(now.saturating_sub(self.started_at));
         let idle_ms = (self.open_tool_calls == 0)
             .then(|| duration_ms(now.saturating_sub(self.last_observed_at)));
-        let tokens = self.usage.total_tokens();
+        let totals = self.observed_totals();
+        let tokens = totals.usage.total_tokens();
+        let cost_microusd = totals.cost_microusd.unwrap_or(0);
 
         // When several caps reach their limit at the same observation, this
         // order is the contract: wall, idle, turns, tokens, then cost.
@@ -324,11 +389,11 @@ impl<C: Clock> CapsWatchdog<C> {
             })
             .or_else(|| {
                 self.cost_cap_microusd
-                    .filter(|limit| self.cost_microusd >= *limit)
+                    .filter(|limit| cost_microusd >= *limit)
                     .map(|limit| {
                         (
                             Cap::Cost,
-                            CapMeasurement::Microdollars(self.cost_microusd),
+                            CapMeasurement::Microdollars(cost_microusd),
                             CapMeasurement::Microdollars(limit),
                         )
                     })
@@ -353,6 +418,7 @@ impl<C: Clock> CapsWatchdog<C> {
         limit: CapMeasurement,
         duration_ms: u64,
     ) -> RunFinishedPayload {
+        let totals = self.observed_totals();
         RunFinishedPayload {
             outcome: match cap {
                 Cap::Wall | Cap::Idle => RunOutcome::TimedOut,
@@ -360,15 +426,31 @@ impl<C: Clock> CapsWatchdog<C> {
             },
             reason: Some(reason(cap, measured, limit)),
             truncated: Some(false),
-            cost_usd: self
-                .cost_observed
-                .then(|| micros_to_dollars(self.cost_microusd)),
-            usage: self.usage.to_wire(),
+            cost_usd: totals.cost_microusd.map(micros_to_dollars),
+            usage: totals.usage.to_wire(),
             duration_ms,
             estimated: Some(true),
             extra: PayloadExtension::new(),
         }
     }
+}
+
+#[derive(Debug, Hash, PartialEq, Eq)]
+enum SessionKey {
+    Named(String),
+    Unattributed(usize),
+}
+
+#[derive(Default)]
+struct SessionObservation {
+    cost_microusd: Option<u64>,
+    usage: UsageLowerBound,
+}
+
+#[derive(Default)]
+struct ObservedTotals {
+    cost_microusd: Option<u64>,
+    usage: UsageLowerBound,
 }
 
 #[derive(Debug, Error)]
@@ -390,10 +472,10 @@ struct UsageLowerBound {
 
 impl UsageLowerBound {
     fn add(&mut self, usage: RunUsage) {
-        add_optional(&mut self.input_tokens, usage.input_tokens);
-        add_optional(&mut self.output_tokens, usage.output_tokens);
-        add_optional(&mut self.cache_read_tokens, usage.cache_read_tokens);
-        add_optional(&mut self.cache_creation_tokens, usage.cache_creation_tokens);
+        max_optional(&mut self.input_tokens, usage.input_tokens);
+        max_optional(&mut self.output_tokens, usage.output_tokens);
+        max_optional(&mut self.cache_read_tokens, usage.cache_read_tokens);
+        max_optional(&mut self.cache_creation_tokens, usage.cache_creation_tokens);
         if usage.unit.is_some() {
             self.unit = usage.unit;
         }
@@ -427,9 +509,15 @@ impl UsageLowerBound {
     }
 }
 
-fn add_optional(total: &mut Option<u64>, increment: Option<u64>) {
-    if let Some(increment) = increment {
-        *total = Some(total.unwrap_or(0).saturating_add(increment));
+fn max_optional(maximum: &mut Option<u64>, observation: Option<u64>) {
+    if let Some(observation) = observation {
+        *maximum = Some(maximum.unwrap_or(0).max(observation));
+    }
+}
+
+fn sum_optional(total: &mut Option<u64>, value: Option<u64>) {
+    if let Some(value) = value {
+        *total = Some(total.unwrap_or(0).saturating_add(value));
     }
 }
 
@@ -583,28 +671,74 @@ mod tests {
     }
 
     fn completed(turns: Option<u64>, tokens: Option<u64>, cost_usd: Option<f64>) -> Event {
+        completed_for_session(
+            None,
+            turns,
+            cost_usd,
+            tokens.map(|input_tokens| RunUsage {
+                input_tokens: Some(input_tokens),
+                output_tokens: None,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+                unit: None,
+                extra: PayloadExtension::new(),
+            }),
+            None,
+        )
+    }
+
+    fn completed_for_session(
+        session_id: Option<&str>,
+        turns: Option<u64>,
+        cost_usd: Option<f64>,
+        usage: Option<RunUsage>,
+        duration_ms: Option<u64>,
+    ) -> Event {
         event(
             "run",
             AGENT_COMPLETED,
             typed_payload(AgentCompletedPayload {
                 stage: Some("finish".to_owned()),
                 turns,
-                session_id: None,
+                session_id: session_id.map(str::to_owned),
                 cost_usd,
                 model: None,
-                usage: tokens.map(|input_tokens| RunUsage {
-                    input_tokens: Some(input_tokens),
-                    output_tokens: None,
-                    cache_read_tokens: None,
-                    cache_creation_tokens: None,
-                    unit: None,
-                    extra: PayloadExtension::new(),
-                }),
-                duration_ms: None,
+                usage,
+                duration_ms,
                 estimated: None,
                 extra: PayloadExtension::new(),
             }),
         )
+    }
+
+    fn started(session_id: Option<&str>) -> Event {
+        event(
+            "run",
+            AGENT_STARTED,
+            typed_payload(AgentStartedPayload {
+                stage: Some("start".to_owned()),
+                model: None,
+                session_id: session_id.map(str::to_owned),
+                pid: None,
+                extra: PayloadExtension::new(),
+            }),
+        )
+    }
+
+    fn usage(
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        cache_read_tokens: Option<u64>,
+        cache_creation_tokens: Option<u64>,
+    ) -> RunUsage {
+        RunUsage {
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_creation_tokens,
+            unit: Some("tokens".to_owned()),
+            extra: PayloadExtension::new(),
+        }
     }
 
     fn finished(trip: CapTrip) -> RunFinishedPayload {
@@ -737,6 +871,289 @@ mod tests {
         assert_eq!(trip.measured(), CapMeasurement::Microdollars(300_000));
         assert_eq!(trip.finished().outcome, RunOutcome::Capped);
         assert_eq!(trip.into_finished_draft().event_type, RUN_FINISHED);
+    }
+
+    #[test]
+    fn repeated_session_total_does_not_trip_cost_cap() {
+        let clock = ManualClock::default();
+        let mut watchdog = CapsWatchdog::new(
+            RunCaps {
+                cost_usd: Some(0.15),
+                ..caps()
+            },
+            clock,
+        )
+        .expect("watchdog");
+        let session_id = "1a425592-726e-4137-9dee-13ec62709123";
+        let first = event(
+            "run",
+            AGENT_COMPLETED,
+            typed_payload(AgentCompletedPayload {
+                stage: Some("finish".to_owned()),
+                turns: Some(3),
+                session_id: Some(session_id.to_owned()),
+                cost_usd: Some(0.097_651_900_000_000_01),
+                model: None,
+                usage: None,
+                duration_ms: Some(12_357),
+                estimated: None,
+                extra: PayloadExtension::new(),
+            }),
+        );
+        let second = event(
+            "run",
+            AGENT_COMPLETED,
+            typed_payload(AgentCompletedPayload {
+                stage: Some("finish".to_owned()),
+                turns: Some(1),
+                session_id: Some(session_id.to_owned()),
+                cost_usd: Some(0.097_651_900_000_000_01),
+                model: None,
+                usage: None,
+                duration_ms: Some(1_664),
+                estimated: None,
+                extra: PayloadExtension::new(),
+            }),
+        );
+
+        assert!(
+            watchdog
+                .observe(&first)
+                .expect("first completion")
+                .is_none()
+        );
+        assert!(
+            watchdog
+                .observe(&second)
+                .expect("second completion")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn repeated_session_cost_is_folded_to_the_maximum() {
+        let clock = ManualClock::default();
+        let mut watchdog = CapsWatchdog::new(
+            RunCaps {
+                wall_ms: Some(1),
+                ..caps()
+            },
+            clock.clone(),
+        )
+        .expect("watchdog");
+
+        watchdog
+            .observe(&completed_for_session(
+                Some("session"),
+                None,
+                Some(0.097_651_900_000_000_01),
+                None,
+                None,
+            ))
+            .expect("first completion");
+        watchdog
+            .observe(&completed_for_session(
+                Some("session"),
+                None,
+                Some(0.097_651_900_000_000_01),
+                None,
+                None,
+            ))
+            .expect("second completion");
+        clock.advance(1);
+
+        let payload = finished(watchdog.check().expect("wall cap trip"));
+        assert_eq!(
+            dollars_to_microusd(payload.cost_usd.expect("observed cost")).expect("valid cost"),
+            97_652
+        );
+    }
+
+    #[test]
+    fn completion_falls_back_to_most_recent_started_session() {
+        let clock = ManualClock::default();
+        let mut watchdog = CapsWatchdog::new(
+            RunCaps {
+                wall_ms: Some(1),
+                ..caps()
+            },
+            clock.clone(),
+        )
+        .expect("watchdog");
+        watchdog
+            .observe(&started(Some("session")))
+            .expect("session start");
+
+        for (turns, duration_ms) in [(3, 12_357), (1, 1_664)] {
+            watchdog
+                .observe(&completed_for_session(
+                    None,
+                    Some(turns),
+                    Some(0.097_651_900_000_000_01),
+                    None,
+                    Some(duration_ms),
+                ))
+                .expect("completion");
+        }
+        clock.advance(1);
+
+        let payload = finished(watchdog.check().expect("wall cap trip"));
+        assert_eq!(
+            dollars_to_microusd(payload.cost_usd.expect("observed cost")).expect("valid cost"),
+            97_652
+        );
+    }
+
+    #[test]
+    fn distinct_session_costs_are_summed() {
+        let mut watchdog = CapsWatchdog::new(
+            RunCaps {
+                cost_usd: Some(0.15),
+                ..caps()
+            },
+            ManualClock::default(),
+        )
+        .expect("watchdog");
+        watchdog
+            .observe(&started(Some("session-a")))
+            .expect("session start");
+        watchdog
+            .observe(&completed_for_session(
+                Some("session-a"),
+                None,
+                Some(0.097_651_900_000_000_01),
+                None,
+                None,
+            ))
+            .expect("first session");
+
+        let trip = watchdog
+            .observe(&completed_for_session(
+                Some("session-b"),
+                None,
+                Some(0.097_651_900_000_000_01),
+                None,
+                None,
+            ))
+            .expect("second session")
+            .expect("cost cap trip");
+
+        assert_eq!(trip.measured(), CapMeasurement::Microdollars(195_304));
+        assert_eq!(
+            dollars_to_microusd(trip.finished().cost_usd.expect("observed cost"))
+                .expect("valid cost"),
+            195_304
+        );
+    }
+
+    #[test]
+    fn unattributable_completion_is_its_own_summed_session() {
+        let mut watchdog = CapsWatchdog::new(
+            RunCaps {
+                cost_usd: Some(0.15),
+                ..caps()
+            },
+            ManualClock::default(),
+        )
+        .expect("watchdog");
+        watchdog
+            .observe(&completed_for_session(
+                Some("known-session"),
+                None,
+                Some(0.1),
+                None,
+                None,
+            ))
+            .expect("known session");
+
+        let trip = watchdog
+            .observe(&completed_for_session(None, None, Some(0.05), None, None))
+            .expect("unattributable completion")
+            .expect("cost cap trip");
+
+        assert_eq!(trip.measured(), CapMeasurement::Microdollars(150_000));
+    }
+
+    #[test]
+    fn turns_remain_summed_within_a_session() {
+        let mut watchdog = CapsWatchdog::new(
+            RunCaps {
+                turns: Some(4),
+                ..caps()
+            },
+            ManualClock::default(),
+        )
+        .expect("watchdog");
+        watchdog
+            .observe(&completed_for_session(
+                Some("session"),
+                Some(3),
+                None,
+                None,
+                None,
+            ))
+            .expect("first invocation");
+
+        let trip = watchdog
+            .observe(&completed_for_session(
+                Some("session"),
+                Some(1),
+                None,
+                None,
+                None,
+            ))
+            .expect("second invocation")
+            .expect("turn cap trip");
+
+        assert_eq!(trip.measured(), CapMeasurement::Count(4));
+    }
+
+    #[test]
+    fn usage_takes_field_maxima_within_sessions_and_sums_across_them() {
+        let mut watchdog = CapsWatchdog::new(
+            RunCaps {
+                tokens: Some(33),
+                ..caps()
+            },
+            ManualClock::default(),
+        )
+        .expect("watchdog");
+        watchdog
+            .observe(&completed_for_session(
+                Some("session-a"),
+                None,
+                None,
+                Some(usage(Some(10), Some(5), Some(7), Some(1))),
+                None,
+            ))
+            .expect("first session total");
+        watchdog
+            .observe(&completed_for_session(
+                Some("session-a"),
+                None,
+                None,
+                Some(usage(Some(8), Some(6), None, Some(2))),
+                None,
+            ))
+            .expect("updated session total");
+
+        let trip = watchdog
+            .observe(&completed_for_session(
+                Some("session-b"),
+                None,
+                None,
+                Some(usage(Some(4), Some(3), Some(1), None)),
+                None,
+            ))
+            .expect("second session total")
+            .expect("token cap trip");
+
+        assert_eq!(trip.measured(), CapMeasurement::Count(33));
+        let folded = trip.finished().usage.as_ref().expect("observed usage");
+        assert_eq!(folded.input_tokens, Some(14));
+        assert_eq!(folded.output_tokens, Some(9));
+        assert_eq!(folded.cache_read_tokens, Some(8));
+        assert_eq!(folded.cache_creation_tokens, Some(2));
     }
 
     #[test]
