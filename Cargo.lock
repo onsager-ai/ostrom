@@ -336,7 +336,7 @@ dependencies = [
 [[package]]
 name = "ethogram"
 version = "0.1.0"
-source = "git+https://github.com/onsager-ai/ethogram?rev=e2774df825c82f69f9efd7630c1ef3201e9d5b7e#e2774df825c82f69f9efd7630c1ef3201e9d5b7e"
+source = "git+https://github.com/onsager-ai/ethogram?rev=ba892e843db9df7cbc74bd52e2933799fa8cd3d9#ba892e843db9df7cbc74bd52e2933799fa8cd3d9"
 dependencies = [
  "serde",
  "serde_json",
@@ -1747,7 +1747,7 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 [[package]]
 name = "umwelt-capture"
 version = "0.1.0"
-source = "git+https://github.com/onsager-ai/umwelt.git?rev=fe9e8803c41bf79238eb5c9f5097853976176ac7#fe9e8803c41bf79238eb5c9f5097853976176ac7"
+source = "git+https://github.com/onsager-ai/umwelt.git?rev=4d7d409b8bdd5ae261be3b03f3b7471f97285888#4d7d409b8bdd5ae261be3b03f3b7471f97285888"
 dependencies = [
  "ethogram",
  "indexmap",
@@ -1760,7 +1760,7 @@ dependencies = [
 [[package]]
 name = "umwelt-runtime"
 version = "0.1.0"
-source = "git+https://github.com/onsager-ai/umwelt.git?rev=fe9e8803c41bf79238eb5c9f5097853976176ac7#fe9e8803c41bf79238eb5c9f5097853976176ac7"
+source = "git+https://github.com/onsager-ai/umwelt.git?rev=4d7d409b8bdd5ae261be3b03f3b7471f97285888#4d7d409b8bdd5ae261be3b03f3b7471f97285888"
 dependencies = [
  "chrono",
  "ethogram",
