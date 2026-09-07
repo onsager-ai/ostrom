@@ -16,14 +16,16 @@ use std::fs::OpenOptions;
 
 use chrono::{DateTime, Utc};
 use ethogram::{
-    ControlRequestedPayload, Event, EventDraft, PayloadExtension, RunFinishedPayload, RunKind,
-    RunOutcome, RunStartedPayload, RunUsage,
+    ControlRequestedPayload, DecisionDossier, DecisionKind, DecisionRequestedPayload, Event,
+    EventDraft, PayloadExtension, RunFinishedPayload, RunKind, RunOutcome, RunStartedPayload,
+    RunUsage,
 };
+use ostrom_core::{DecisionOption, Dossier, WriteDisposition};
 use serde::Serialize;
 use thiserror::Error;
 use umwelt_runtime::{
     CapTrip, CapsWatchdog, ControlError, FileSink, ProcessExit, RunControl, SessionResumer, Sink,
-    SinkFault, watchdog::Clock as WatchdogClock,
+    SinkFault, Source as _, SourceFault, watchdog::Clock as WatchdogClock,
 };
 
 use crate::{Clock, OstromPaths};
@@ -34,8 +36,77 @@ static RUN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub enum RunEventError {
     #[error("run event sink: {0}")]
     Sink(#[from] SinkFault),
+    #[error("run event source: {0}")]
+    Source(#[from] SourceFault),
     #[error("run event payload: {0}")]
     Payload(#[from] serde_json::Error),
+    #[error("decision id {0} was reused with different content")]
+    DecisionConflict(String),
+}
+
+pub(crate) const SWEEP_RUN_ID: &str = "sweep";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DecisionRequest {
+    pub decision_id: String,
+    pub kind: DecisionKind,
+    pub dossier: Dossier,
+    pub options: Vec<DecisionOption>,
+    pub subject: String,
+}
+
+/// The sweep is a durable relay rather than a child process. Its stable run
+/// remains open so a later queue command can apply an answer on the run that
+/// owns the request.
+pub(crate) struct SweepDecisionEmitter {
+    sink: RunEventSink,
+}
+
+impl SweepDecisionEmitter {
+    pub(crate) fn new(paths: &OstromPaths) -> Result<Self, RunEventError> {
+        let sink = RunEventSink::new(&paths.runs_dir(), None, false);
+        if sink.last_seq(SWEEP_RUN_ID)? == 0 {
+            let payload = RunStartedPayload {
+                kind: RunKind::Relay,
+                actor: "sweep".to_owned(),
+                harness: "ostrom".to_owned(),
+                model: None,
+                parent_run_id: None,
+                parent_tool_use_id: None,
+                schedule: None,
+                repository: None,
+                work_order: None,
+                ceilings: None,
+                extra: PayloadExtension::new(),
+            };
+            sink.append(SWEEP_RUN_ID, draft("run.started", payload)?)?;
+        }
+        Ok(Self { sink })
+    }
+
+    pub(crate) fn request(
+        &self,
+        request: &DecisionRequest,
+    ) -> Result<WriteDisposition, RunEventError> {
+        let draft = decision_request_draft(request)?;
+        for event in self.sink.durable.read_from(SWEEP_RUN_ID, 0)? {
+            if event.event_type != ethogram::DECISION_REQUESTED
+                || event
+                    .payload
+                    .get("decisionId")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(request.decision_id.as_str())
+            {
+                continue;
+            }
+            if event.payload == draft.payload {
+                return Ok(WriteDisposition::Unchanged);
+            }
+            return Err(RunEventError::DecisionConflict(request.decision_id.clone()));
+        }
+        self.sink.append(SWEEP_RUN_ID, draft)?;
+        Ok(WriteDisposition::Written)
+    }
 }
 
 #[derive(Debug)]
@@ -329,6 +400,56 @@ pub fn generated_run_id(prefix: &str, clock: &Clock) -> String {
     )
 }
 
+fn decision_request_draft(request: &DecisionRequest) -> Result<EventDraft, serde_json::Error> {
+    let mut truncated = false;
+    let mut bounded = |value: &str| {
+        let excerpt = ethogram::excerpt(value, ethogram::MAX_EXCERPT_SCALARS);
+        truncated |= excerpt.truncated;
+        excerpt.text
+    };
+    let question = bounded(&request.dossier.question);
+    let options_ruled_out = request
+        .dossier
+        .options_ruled_out
+        .iter()
+        .map(|value| bounded(value))
+        .collect();
+    let recommended_action = bounded(&request.dossier.recommended_action);
+    let blast_radius = bounded(&request.dossier.blast_radius);
+    let options = request
+        .options
+        .iter()
+        .map(|option| ethogram::DecisionOption {
+            id: option.id.clone(),
+            label: bounded(&option.label),
+            extra: PayloadExtension::new(),
+        })
+        .collect();
+    let payload = serde_json::to_value(DecisionRequestedPayload {
+        decision_id: request.decision_id.clone(),
+        kind: request.kind.clone(),
+        dossier: DecisionDossier {
+            question,
+            options_ruled_out,
+            recommended_action,
+            blast_radius,
+            truncated: truncated.then_some(true),
+            extra: PayloadExtension::new(),
+        },
+        options,
+        subject: Some(request.subject.clone()),
+        expires_at: None,
+        on_timeout: None,
+        extra: PayloadExtension::new(),
+    })?;
+    ethogram::validate(ethogram::DECISION_REQUESTED, &payload)?;
+    Ok(EventDraft {
+        event_type: ethogram::DECISION_REQUESTED.to_owned(),
+        payload,
+        captured_at: None,
+    })
+}
+
 fn draft(payload_type: &str, payload: impl Serialize) -> Result<EventDraft, serde_json::Error> {
     Ok(EventDraft {
         event_type: payload_type.to_owned(),
@@ -343,11 +464,16 @@ mod tests {
     use std::{fs, fs::OpenOptions, os::fd::AsRawFd};
 
     use chrono::{TimeZone, Utc};
+    use ethogram::{DecisionKind, DecisionRequestedPayload};
     use ethogram::{RunFinishedPayload, RunKind, RunOutcome, RunStartedPayload};
+    use ostrom_core::{DecisionOption, Dossier, WriteDisposition};
     use tempfile::tempdir;
     use umwelt_runtime::{FileSink, Source};
 
-    use super::{RunEventGuard, RunEventStart};
+    use super::{
+        DecisionRequest, RunEventError, RunEventGuard, RunEventStart, SWEEP_RUN_ID,
+        SweepDecisionEmitter,
+    };
     use crate::{Clock, OstromPaths};
 
     fn fixture() -> (tempfile::TempDir, OstromPaths, Clock) {
@@ -362,6 +488,100 @@ mod tests {
                 .expect("fixture time"),
         );
         (root, paths, clock)
+    }
+
+    fn decision_request(decision_id: &str, subject: &str) -> DecisionRequest {
+        DecisionRequest {
+            decision_id: decision_id.to_owned(),
+            kind: DecisionKind::Tripwire,
+            dossier: Dossier {
+                question: format!("May {subject} proceed?"),
+                options_ruled_out: vec!["automatic progress".to_owned()],
+                recommended_action: "review the evidence".to_owned(),
+                blast_radius: format!("{subject} only"),
+            },
+            options: ["approve", "reject", "defer"]
+                .into_iter()
+                .map(|option| DecisionOption {
+                    id: option.to_owned(),
+                    label: option.to_owned(),
+                })
+                .collect(),
+            subject: subject.to_owned(),
+        }
+    }
+
+    #[test]
+    fn sweep_decisions_cross_the_typed_edge_without_a_timeout() {
+        let (_root, paths, _clock) = fixture();
+        let emitter = SweepDecisionEmitter::new(&paths).expect("open sweep decision emitter");
+        assert_eq!(
+            emitter
+                .request(&decision_request(
+                    "decision-fixture",
+                    "synthetic/project#42"
+                ))
+                .expect("append decision request"),
+            WriteDisposition::Written
+        );
+
+        let events = FileSink::new(paths.runs_dir())
+            .read_from(SWEEP_RUN_ID, 0)
+            .expect("read sweep events");
+        let decision = events
+            .iter()
+            .find(|event| event.event_type == ethogram::DECISION_REQUESTED)
+            .expect("decision event");
+        ethogram::validate(&decision.event_type, &decision.payload)
+            .expect("emitted decision validates against the current SDK");
+        let payload: DecisionRequestedPayload =
+            serde_json::from_value(decision.payload.clone()).expect("typed decision payload");
+        assert_eq!(payload.kind, DecisionKind::Tripwire);
+        assert_eq!(payload.subject.as_deref(), Some("synthetic/project#42"));
+        assert_eq!(
+            payload
+                .options
+                .iter()
+                .map(|option| option.id.as_str())
+                .collect::<Vec<_>>(),
+            ["approve", "reject", "defer"]
+        );
+        assert!(payload.on_timeout.is_none());
+        assert!(
+            !decision
+                .payload
+                .as_object()
+                .unwrap()
+                .contains_key("onTimeout")
+        );
+    }
+
+    #[test]
+    fn sweep_decision_identity_is_idempotent_and_conflicts_are_loud() {
+        let (_root, paths, _clock) = fixture();
+        let emitter = SweepDecisionEmitter::new(&paths).expect("open sweep decision emitter");
+        let request = decision_request("stable-decision", "synthetic/project#42");
+        assert_eq!(
+            emitter.request(&request).expect("first request"),
+            WriteDisposition::Written
+        );
+        assert_eq!(
+            emitter.request(&request).expect("identical retry"),
+            WriteDisposition::Unchanged
+        );
+
+        let conflicting = decision_request("stable-decision", "synthetic/project#43");
+        assert!(matches!(
+            emitter.request(&conflicting),
+            Err(RunEventError::DecisionConflict(id)) if id == "stable-decision"
+        ));
+        let decisions = FileSink::new(paths.runs_dir())
+            .read_from(SWEEP_RUN_ID, 0)
+            .expect("read sweep events")
+            .into_iter()
+            .filter(|event| event.event_type == ethogram::DECISION_REQUESTED)
+            .count();
+        assert_eq!(decisions, 1);
     }
 
     #[test]

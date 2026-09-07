@@ -1,0 +1,51 @@
+{
+  "repositories": [
+    {
+      "repo": "fixture-org/decisions",
+      "issues": [
+        {
+          "number": 1,
+          "title": "Tripwire fixture",
+          "body": "",
+          "labels": [{"name": "tripwire"}],
+          "createdAt": "2026-08-01T00:00:00Z",
+          "updatedAt": "2026-09-06T12:00:00Z",
+          "state": "OPEN"
+        },
+        {
+          "number": 2,
+          "title": "Unclassified fixture",
+          "body": "",
+          "labels": [],
+          "createdAt": "2026-08-01T00:00:00Z",
+          "updatedAt": "2026-09-06T12:00:00Z",
+          "state": "OPEN"
+        },
+        {
+          "number": 3,
+          "title": "Stuck fixture",
+          "body": "",
+          "labels": [{"name": "delegated"}],
+          "createdAt": "2026-08-01T00:00:00Z",
+          "updatedAt": "2026-08-01T00:00:00Z",
+          "state": "OPEN"
+        }
+      ],
+      "issue_etag": "fixture-decision-etag",
+      "open_prs": [],
+      "merged_prs": [],
+      "default_branch": "main",
+      "branches": [
+        {
+          "name": "main",
+          "commit": {"sha": "1111111111111111111111111111111111111111"}
+        },
+        {
+          "name": "ostrom/unexplained-fixture",
+          "commit": {"sha": "2222222222222222222222222222222222222222"}
+        }
+      ],
+      "ci_runs": []
+    }
+  ]
+}

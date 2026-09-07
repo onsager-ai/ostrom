@@ -1,0 +1,29 @@
+{
+  "repositories": [
+    {
+      "repo": "fixture-org/decisions",
+      "issues": [
+        {
+          "number": 4,
+          "title": "Human decision fixture",
+          "body": "### Human decides\n\n- [ ] Which release window should be used?\n  - [ ] Weekday\n  - [ ] Weekend\n- [x] This choice is already settled.\n- [ ] Whether to proceed with the reversible implementation.\n\n### AI implements\n\n- [ ] Should the implementation use algorithm A or B?\n",
+          "labels": [{"name": "delegated"}],
+          "createdAt": "2026-09-01T00:00:00Z",
+          "updatedAt": "2026-09-06T12:00:00Z",
+          "state": "OPEN"
+        }
+      ],
+      "issue_etag": "fixture-human-decides-etag",
+      "open_prs": [],
+      "merged_prs": [],
+      "default_branch": "main",
+      "branches": [
+        {
+          "name": "main",
+          "commit": {"sha": "1111111111111111111111111111111111111111"}
+        }
+      ],
+      "ci_runs": []
+    }
+  ]
+}

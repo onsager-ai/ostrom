@@ -167,6 +167,8 @@ fn trace_event_type(kind: &str) -> Option<EventType> {
         "artifact-produced" => "artifact.produced",
         "gate-verdict-consumed" => "gate-verdict.consumed",
         "pr-repair" => "pr.repair",
+        "decision-requested" => "decision.requested",
+        "decision-answered" => "decision.answered",
         _ => return None,
     };
     Some(EventType::new(canonical).expect("settled event types are valid"))
@@ -425,6 +427,22 @@ mod tests {
         assert_eq!(
             events.iter().map(|event| event.seq).collect::<Vec<_>>(),
             (1..=9).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn decision_facts_have_namespaced_event_types() {
+        assert_eq!(
+            trace_event_type("decision-requested")
+                .expect("decision request is transported")
+                .as_str(),
+            "decision.requested"
+        );
+        assert_eq!(
+            trace_event_type("decision-answered")
+                .expect("decision answer is transported")
+                .as_str(),
+            "decision.answered"
         );
     }
 

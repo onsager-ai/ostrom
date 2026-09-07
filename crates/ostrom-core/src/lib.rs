@@ -12,6 +12,7 @@
 //! version bump and migration notes.
 
 mod check;
+mod decision;
 mod dispatch;
 mod domain;
 mod operation;
@@ -32,6 +33,7 @@ pub use check::{
     ResolvedCheck, RunnerStamp, agent_parameters, receipt_digest, resolve_check, resolve_fresh_for,
     select_check, sha256_hex, validate_check_definitions,
 };
+pub use decision::{DecisionOption, Dossier, GateCondition};
 pub use dispatch::{
     BranchListing, BranchListingFault, BranchListingOutcome, RemoteBranch, WorkOrder,
     WorkOrderError, resolve_exact_branch,
