@@ -11,7 +11,7 @@ rust-version = "1.88"
 
 [workspace.dependencies]
 chrono = { version = "0.4", default-features = false, features = ["std", "serde", "clock"] }
-ethogram = { git = "https://github.com/onsager-ai/ethogram", rev = "6a224d9b3d97cf7317d933a3c86f3f0c377994d4" }
+ethogram = { git = "https://github.com/onsager-ai/ethogram", rev = "00b31a787b8dfc1113f1117d15b4cac43443affb" }
 indexmap = { version = "2", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

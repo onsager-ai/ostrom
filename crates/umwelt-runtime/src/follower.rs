@@ -3,9 +3,8 @@
 use std::thread;
 use std::time::Duration;
 
-use ethogram::Event;
+use ethogram::{Event, RUN_FINISHED};
 
-use crate::event_types::RUN_FINISHED;
 use crate::sink::{Source, SourceFault};
 use crate::watchdog::Clock;
 
