@@ -21,7 +21,7 @@ pub fn run_bounded(command: &mut Command, timeout: Duration) -> ProcessResult {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    set_process_group(command);
+    crate::process_control::set_process_group(command);
     let Ok(mut child) = command.spawn() else {
         return ProcessResult::SpawnFailed;
     };
@@ -83,16 +83,6 @@ fn terminate(child: &mut std::process::Child, pid: u32) {
     let _ = child.kill();
     let _ = child.wait();
 }
-
-#[cfg(unix)]
-fn set_process_group(command: &mut Command) {
-    use std::os::unix::process::CommandExt;
-
-    command.process_group(0);
-}
-
-#[cfg(not(unix))]
-fn set_process_group(_command: &mut Command) {}
 
 #[cfg(unix)]
 fn kill_process_group(pid: u32) {

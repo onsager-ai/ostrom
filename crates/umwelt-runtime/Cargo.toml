@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[[example]]
+name = "capture_interrupt"
+test = true
+
 [features]
 conformance = []
 
@@ -19,6 +23,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+umwelt-capture = { path = "../umwelt-capture" }
 
 [lints]
 workspace = true

@@ -9,7 +9,7 @@ pub mod loop_units;
 pub mod operation_settings;
 pub mod pass_state;
 pub mod process;
-mod process_control;
+pub mod process_control;
 pub mod registry;
 pub mod sink;
 pub mod trace;

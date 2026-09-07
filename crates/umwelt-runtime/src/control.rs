@@ -17,7 +17,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::{
-    agent::{PASS_MAX_TURNS, RunCaps, set_process_group},
+    agent::{PASS_MAX_TURNS, RunCaps},
     process_control,
     sink::{Sink, SinkFault},
     watchdog::{CapsWatchdog, Clock},
@@ -117,7 +117,7 @@ impl SessionResumer for ClaudeSessionResumer {
             .args(self.arguments(session_id, text))
             .stdout(Stdio::from(output))
             .stderr(Stdio::from(error_output));
-        set_process_group(&mut command);
+        process_control::set_process_group(&mut command);
 
         // Never resume while the process is live and never add
         // `--fork-session`: `claude --resume <id>` starts a copy when the

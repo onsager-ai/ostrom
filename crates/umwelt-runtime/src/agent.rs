@@ -558,7 +558,7 @@ impl AgentRunner for CodexHarness {
             .stdin(Stdio::from(input))
             .stdout(Stdio::from(events))
             .stderr(Stdio::from(errors));
-        set_process_group(&mut command);
+        process_control::set_process_group(&mut command);
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
@@ -807,15 +807,6 @@ impl NodeResolver {
             })
     }
 }
-
-#[cfg(unix)]
-pub(crate) fn set_process_group(command: &mut Command) {
-    use std::os::unix::process::CommandExt;
-    command.process_group(0);
-}
-
-#[cfg(not(unix))]
-pub(crate) fn set_process_group(_command: &mut Command) {}
 
 #[cfg(test)]
 mod tests {
