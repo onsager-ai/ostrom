@@ -129,6 +129,19 @@ projects:
             .collect()
     }
 
+    fn run_events(&self) -> Vec<Value> {
+        let run_directories = fs::read_dir(self.state.join("runs"))
+            .expect("read run directories")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read run directory entries");
+        assert_eq!(run_directories.len(), 1, "expected exactly one pass run");
+        fs::read_to_string(run_directories[0].path().join("events.jsonl"))
+            .expect("read pass events")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("event JSON"))
+            .collect()
+    }
+
     fn assert_released(&self) {
         assert!(!self.state.join("builder-pass.lease").exists());
         let trace = self.trace();
@@ -324,6 +337,31 @@ fn error_exit_releases_and_finalizes() {
     assert_eq!(status.code(), Some(42));
     fixture.assert_released();
     assert_eq!(fixture.trace().last().unwrap()["fact"]["outcome"], "failed");
+    let events = fixture.run_events();
+    assert_eq!(events[0]["type"], "run.started");
+    assert_eq!(events[0]["payload"]["kind"], "loop");
+    assert_eq!(events[1]["type"], "run.finished");
+    assert_eq!(events[1]["payload"]["outcome"], "failed");
+    assert_eq!(events[1]["payload"]["reason"], "pass-failed");
+}
+
+#[test]
+fn successful_pass_emits_a_completed_lifecycle() {
+    let fixture = Fixture::new(concat!(
+        "printf '%s\\n' '{\"ts\":\"2026-08-01T00:00:00Z\",\"kind\":\"pass-started\",\"fact\":{\"owner\":\"builder-inner-wake1\"},\"narration\":{}}' >>\"$OSTROM_HOME/sprint.jsonl\"\n",
+        "printf '%s\\n' '{\"ts\":\"2026-08-01T00:00:01Z\",\"kind\":\"pass-ended\",\"fact\":{\"owner\":\"builder-inner-wake1\",\"outcome\":\"completed\"},\"narration\":{}}' >>\"$OSTROM_HOME/sprint.jsonl\""
+    ));
+
+    assert!(fixture.command().status().expect("run pass").success());
+
+    let events = fixture.run_events();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["type"], "run.started");
+    assert_eq!(events[0]["payload"]["actor"], "builder");
+    assert_eq!(events[0]["payload"]["harness"], "claude");
+    assert_eq!(events[1]["type"], "run.finished");
+    assert_eq!(events[1]["payload"]["outcome"], "completed");
+    assert!(events[1]["payload"]["durationMs"].is_u64());
 }
 
 #[test]
@@ -425,6 +463,10 @@ fn disarmed_and_outer_lease_held_passes_do_not_spawn_or_trace() {
     assert!(output.status.success());
     assert!(!marker.exists());
     assert!(!disarmed.state.join("sprint.jsonl").exists());
+    let events = disarmed.run_events();
+    assert_eq!(events[1]["type"], "run.finished");
+    assert_eq!(events[1]["payload"]["outcome"], "no-op");
+    assert_eq!(events[1]["payload"]["reason"], "disarmed");
 
     let held = Fixture::new("touch \"$OSTROM_TEST_MARKER\"");
     let marker = held.root.path().join("spawned");
@@ -444,6 +486,10 @@ fn disarmed_and_outer_lease_held_passes_do_not_spawn_or_trace() {
     assert!(output.status.success());
     assert!(!marker.exists());
     assert!(!held.state.join("sprint.jsonl").exists());
+    let events = held.run_events();
+    assert_eq!(events[1]["type"], "run.finished");
+    assert_eq!(events[1]["payload"]["outcome"], "no-op");
+    assert_eq!(events[1]["payload"]["reason"], "lease-held");
 }
 
 #[test]

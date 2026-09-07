@@ -234,6 +234,23 @@ impl Fixture {
             .collect()
     }
 
+    fn run_events(&self) -> Vec<Value> {
+        let run_directories = fs::read_dir(self.state.join("runs"))
+            .expect("read run directories")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read run directory entries");
+        assert_eq!(
+            run_directories.len(),
+            1,
+            "expected exactly one implementer run"
+        );
+        fs::read_to_string(run_directories[0].path().join("events.jsonl"))
+            .expect("read implementer events")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("event JSON"))
+            .collect()
+    }
+
     fn record_dispatch(&self) {
         let order = WorkOrder::from_json(&fs::read(&self.order_file).expect("read order"))
             .expect("valid order");
@@ -356,6 +373,12 @@ fn token_ceiling_is_recorded_after_codex_completes() {
     assert_eq!(terminal["kind"], "work-failed");
     assert_eq!(terminal["fact"]["reason"], "token-ceiling-exceeded");
     assert_eq!(terminal["fact"]["weighted_tokens"], 101);
+    let events = fixture.run_events();
+    assert_eq!(events[0]["type"], "run.started");
+    assert_eq!(events[0]["payload"]["kind"], "handoff");
+    assert_eq!(events[1]["type"], "run.finished");
+    assert_eq!(events[1]["payload"]["outcome"], "failed");
+    assert_eq!(events[1]["payload"]["reason"], "token-ceiling-exceeded");
 }
 
 #[test]
@@ -390,6 +413,23 @@ fn public_repository_reaches_codex_and_uses_the_rust_cli_publication_boundary() 
     assert_eq!(
         terminal["fact"]["pr_url"],
         "https://example.invalid/placeholder/pull/7"
+    );
+    let events = fixture.run_events();
+    assert_eq!(events[0]["type"], "run.started");
+    assert_eq!(events[0]["payload"]["actor"], "builder");
+    assert_eq!(events[0]["payload"]["harness"], "codex");
+    assert_eq!(
+        events[0]["payload"]["workOrder"],
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    );
+    assert_eq!(events[0]["payload"]["repository"], "placeholder-org/alpha");
+    assert_eq!(events[0]["payload"]["ceilings"]["costUsd"], 10);
+    assert_eq!(events[0]["payload"]["ceilings"]["tokens"], 100);
+    assert_eq!(events[1]["type"], "run.finished");
+    assert_eq!(events[1]["payload"]["outcome"], "completed");
+    assert_eq!(
+        events[1]["payload"]["usage"]["unit"],
+        "codex-weighted-tokens"
     );
     let body = fixture
         .state

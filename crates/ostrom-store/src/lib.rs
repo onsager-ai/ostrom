@@ -24,6 +24,7 @@ mod publish;
 mod queue;
 mod repair;
 mod replay;
+mod run_events;
 mod selection;
 mod selector;
 mod sweep;
@@ -82,6 +83,7 @@ pub use queue::{
 };
 pub use repair::{RepairOptions, RepairOutput, run_repair_prs};
 pub use replay::{ReplayError, ReplayOptions, replay};
+pub use run_events::{RunEventError, RunEventGuard, RunEventStart, generated_run_id};
 pub use selection::{
     PlanApplication, SelectAction, SelectError, SelectOutcome, SelectRequest, encode_selection,
     run_selection,

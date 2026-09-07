@@ -78,6 +78,11 @@ impl OstromPaths {
     }
 
     #[must_use]
+    pub fn runs_dir(&self) -> PathBuf {
+        self.state.join("runs")
+    }
+
+    #[must_use]
     pub fn loop_run_state_file(&self, name: &str) -> PathBuf {
         self.loop_runs_dir().join(format!("{name}.json"))
     }

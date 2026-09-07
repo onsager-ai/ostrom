@@ -917,6 +917,7 @@ dependencies = [
  "base64",
  "chrono",
  "directories",
+ "ethogram",
  "indexmap",
  "ostrom-core",
  "regex",
