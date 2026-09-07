@@ -9,8 +9,8 @@ use std::{
     ffi::OsString,
     fmt::{self, Display, Formatter},
     fs::{self, File, OpenOptions},
-    io,
-    path::PathBuf,
+    io::{self, Write},
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::mpsc::{self, Receiver, RecvTimeoutError},
     thread::{self, JoinHandle},
@@ -170,68 +170,18 @@ fn run() -> Result<(), CaptureError> {
     })?;
 
     let mut control = RunControl::new(run_id.clone(), Some(session_id.clone()), caps, NoResume);
-    control
-        .steer(
-            control_request(
-                "capture-steer-1",
-                ControlKind::Steer,
-                Some("Continue with a short summary on the next turn."),
-            ),
-            &sink,
-        )
-        .map_err(|error| CaptureError::new(format!("could not queue steer: {error}")))?;
-    control
-        .interrupt(
-            control_request("capture-interrupt-1", ControlKind::Interrupt, None),
-            child.child_mut(),
-            &watchdog,
-            &sink,
-        )
-        .map_err(|error| CaptureError::new(format!("could not interrupt live run: {error}")))?;
-    child.mark_reaped();
-
-    // Once the terminal is durable, its log is closed. The late requester must
-    // record this synchronous refusal in its own durable place.
-    let late_error = match control.interrupt(
-        control_request("capture-interrupt-2", ControlKind::Interrupt, None),
-        None,
+    let live_child = child
+        .child_mut()
+        .ok_or_else(|| CaptureError::new("claude child handle is unavailable"))?;
+    let post_interrupt_raw_lines = finish_interrupted_capture(
+        &mut control,
+        live_child,
         &watchdog,
         &sink,
-    ) {
-        Ok(()) => {
-            return Err(CaptureError::new(
-                "late interrupt was accepted after run.finished; expected a synchronous not-live refusal",
-            ));
-        }
-        Err(error) => error,
-    };
-    if !matches!(late_error, ControlError::NotLive) {
-        return Err(CaptureError::new(format!(
-            "late interrupt returned {late_error}; expected a synchronous not-live refusal"
-        )));
-    }
-
-    let mut observed_session_id = Some(session_id.clone());
-    drain_stdout(
         &receiver,
         &mut raw_lines,
-        &mut normaliser,
-        &run_id,
-        &sink,
-        &mut watchdog,
-        &mut trigger,
-        &mut observed_session_id,
     )?;
-    append_and_observe(
-        normaliser
-            .finish()
-            .map_err(|error| CaptureError::new(format!("Claude finalisation failed: {error}")))?,
-        &run_id,
-        &sink,
-        &mut watchdog,
-        &mut trigger,
-        &mut observed_session_id,
-    )?;
+    child.mark_reaped();
     raw.sync_all()
         .map_err(|error| CaptureError::new(format!("cannot durably write raw.ndjson: {error}")))?;
 
@@ -244,6 +194,11 @@ fn run() -> Result<(), CaptureError> {
         .map(|event| event.event_type.as_str())
         .collect::<Vec<_>>();
     let landed_in = interrupt_landed_in(&events)?;
+    write_metadata(
+        &staged_run_path.join("meta.toml"),
+        events.len(),
+        post_interrupt_raw_lines,
+    )?;
 
     drop(raw);
     fs::rename(&staged_run_path, &final_run_path).map_err(|error| {
@@ -257,6 +212,7 @@ fn run() -> Result<(), CaptureError> {
     println!("run id: {run_id}");
     println!("session id: {session_id}");
     println!("raw lines: {raw_lines}");
+    println!("raw lines after interrupt: {post_interrupt_raw_lines}");
     println!("event types: {}", event_types.join(" -> "));
     println!("landedIn populated: {}", landed_in.is_some());
     if let Some(tool_use_id) = landed_in {
@@ -307,7 +263,7 @@ fn stdout_reader(
 fn append_and_observe<C: Clock>(
     drafts: Vec<EventDraft>,
     run_id: &str,
-    sink: &FileSink,
+    sink: &impl Sink,
     watchdog: &mut CapsWatchdog<C>,
     trigger: &mut MidToolCallTrigger,
     session_id: &mut Option<String>,
@@ -352,35 +308,84 @@ fn remember_session_id(event: &Event, session_id: &mut Option<String>) -> Result
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn drain_stdout<C: Clock>(
+fn finish_interrupted_capture<C, R, S>(
+    control: &mut RunControl<R>,
+    child: &mut Child,
+    watchdog: &CapsWatchdog<C>,
+    sink: &S,
     receiver: &Receiver<RawLine>,
     raw_lines: &mut u64,
-    normaliser: &mut ClaudeNormaliser,
-    run_id: &str,
-    sink: &FileSink,
-    watchdog: &mut CapsWatchdog<C>,
-    trigger: &mut MidToolCallTrigger,
-    session_id: &mut Option<String>,
-) -> Result<(), CaptureError> {
+) -> Result<u64, CaptureError>
+where
+    C: Clock,
+    R: SessionResumer,
+    S: Sink,
+{
+    control
+        .steer(
+            control_request(
+                "capture-steer-1",
+                ControlKind::Steer,
+                Some("Continue with a short summary on the next turn."),
+            ),
+            sink,
+        )
+        .map_err(|error| CaptureError::new(format!("could not queue steer: {error}")))?;
+    control
+        .interrupt(
+            control_request("capture-interrupt-1", ControlKind::Interrupt, None),
+            Some(child),
+            watchdog,
+            sink,
+        )
+        .map_err(|error| CaptureError::new(format!("could not interrupt live run: {error}")))?;
+
+    // run.finished is now durable and every consumer stops there. Continue
+    // draining for process hygiene and the verbatim raw capture, but never
+    // normalise or append this tail into the closed event stream.
+    let drained = drain_stdout(receiver, raw_lines)?;
+
+    // The requesting system records this synchronous refusal in its own
+    // durable place. The closed run receives no late control event.
+    let late_error = match control.interrupt(
+        control_request("capture-interrupt-2", ControlKind::Interrupt, None),
+        None,
+        watchdog,
+        sink,
+    ) {
+        Ok(()) => {
+            return Err(CaptureError::new(
+                "late interrupt was accepted after run.finished; expected a synchronous not-live refusal",
+            ));
+        }
+        Err(error) => error,
+    };
+    if !matches!(late_error, ControlError::NotLive) {
+        return Err(CaptureError::new(format!(
+            "late interrupt returned {late_error}; expected a synchronous not-live refusal"
+        )));
+    }
+
+    Ok(drained)
+}
+
+fn drain_stdout(receiver: &Receiver<RawLine>, raw_lines: &mut u64) -> Result<u64, CaptureError> {
     let deadline = Instant::now() + READER_SHUTDOWN_TIMEOUT;
+    let mut drained = 0_u64;
     loop {
         match receiver.recv_timeout(CHANNEL_POLL) {
             Ok(line) => {
-                let line = line.map_err(|error| {
+                line.map_err(|error| {
                     CaptureError::new(format!("could not finish reading claude stdout: {error}"))
                 })?;
                 *raw_lines = raw_lines
                     .checked_add(1)
                     .ok_or_else(|| CaptureError::new("raw line count overflowed u64"))?;
-                let drafts = normaliser.line(&line).map_err(|error| {
-                    CaptureError::new(format!(
-                        "Claude normalisation failed after interrupt: {error}"
-                    ))
-                })?;
-                append_and_observe(drafts, run_id, sink, watchdog, trigger, session_id)?;
+                drained = drained
+                    .checked_add(1)
+                    .ok_or_else(|| CaptureError::new("post-interrupt line count overflowed u64"))?;
             }
-            Err(RecvTimeoutError::Disconnected) => return Ok(()),
+            Err(RecvTimeoutError::Disconnected) => return Ok(drained),
             Err(RecvTimeoutError::Timeout) if Instant::now() >= deadline => {
                 return Err(CaptureError::new(
                     "claude stdout did not close after process-group termination",
@@ -389,6 +394,48 @@ fn drain_stdout<C: Clock>(
             Err(RecvTimeoutError::Timeout) => {}
         }
     }
+}
+
+fn write_metadata(
+    path: &Path,
+    events: usize,
+    post_interrupt_raw_lines: u64,
+) -> Result<(), CaptureError> {
+    let metadata = capture_metadata(events, post_interrupt_raw_lines);
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| CaptureError::new(format!("cannot create meta.toml: {error}")))?;
+    file.write_all(metadata.as_bytes())
+        .and_then(|()| file.flush())
+        .and_then(|()| file.sync_all())
+        .map_err(|error| CaptureError::new(format!("cannot durably write meta.toml: {error}")))
+}
+
+fn capture_metadata(events: usize, post_interrupt_raw_lines: u64) -> String {
+    let captured_at = chrono::Utc::now().format("%Y-%m-%d");
+    format!(
+        r#"harness = "claude-code"
+cli_version = "reported by system/init in raw.ndjson"
+captured_at = "{captured_at}"
+model = "haiku"
+command = "claude -p --allowedTools Bash --output-format stream-json --verbose --model haiku <prompt>"
+prompt_source = "command-line argument, or the driver's default"
+events = {events}
+raw_lines_after_interrupt = {post_interrupt_raw_lines}
+
+exercises = [
+  "interrupt while a tool call is open, with control.applied.landedIn",
+  "a queued steer answered not-live before run.finished",
+  "a late interrupt refused synchronously after run.finished",
+]
+
+[not_exercised]
+post_interrupt_events = "Raw lines after the interrupt deliberately produce no events because the run's terminal has already been emitted. raw.ndjson remains the complete harness record."
+resumed_run = "No resume is started; the queued steer is answered not-live by the interrupt."
+"#
+    )
 }
 
 fn control_request(
@@ -674,7 +721,10 @@ impl Error for CaptureError {}
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, sync::Arc};
+    use std::{
+        cell::Cell,
+        sync::{Arc, Mutex},
+    };
 
     use ethogram::{
         AGENT_TEXT, AGENT_TOOL_RESULT, AGENT_TOOL_USE, AgentTextPayload, AgentToolResultPayload,
@@ -692,13 +742,17 @@ mod tests {
         }
     }
 
+    fn draft(event_type: &str, payload: impl serde::Serialize) -> EventDraft {
+        EventDraft {
+            event_type: event_type.to_owned(),
+            payload: serde_json::to_value(payload).expect("serialise fixture payload"),
+            captured_at: None,
+        }
+    }
+
     fn event(event_type: &str, payload: impl serde::Serialize) -> Event {
         stamp(
-            EventDraft {
-                event_type: event_type.to_owned(),
-                payload: serde_json::to_value(payload).expect("serialise fixture payload"),
-                captured_at: None,
-            },
+            draft(event_type, payload),
             StampFields {
                 run_id: "run-1".to_owned(),
                 seq: 1,
@@ -794,5 +848,178 @@ mod tests {
             .expect("observe tool use");
         assert!(trigger.poll(&watchdog));
         assert!(!trigger.poll(&watchdog));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn full_interrupt_sequence_discards_event_producing_raw_tail_after_terminal() {
+        let sink = TrackingSink::default();
+        let mut watchdog =
+            CapsWatchdog::new(RunCaps::default(), ManualClock::default()).expect("watchdog");
+        let mut trigger = MidToolCallTrigger::default();
+        let mut session_id = None;
+        let should_interrupt = append_and_observe(
+            vec![
+                draft(
+                    AGENT_STARTED,
+                    AgentStartedPayload {
+                        stage: None,
+                        model: Some("claude-haiku-fixture".to_owned()),
+                        session_id: Some("session-1".to_owned()),
+                        pid: None,
+                        extra: PayloadExtension::new(),
+                    },
+                ),
+                draft(
+                    AGENT_TOOL_USE,
+                    AgentToolUsePayload {
+                        stage: None,
+                        tool: "Bash".to_owned(),
+                        input_excerpt: Some("sleep 30".to_owned()),
+                        truncated: Some(false),
+                        tool_use_id: Some("tool-1".to_owned()),
+                        parent_tool_use_id: None,
+                        extra: PayloadExtension::new(),
+                    },
+                ),
+            ],
+            "run-1",
+            &sink,
+            &mut watchdog,
+            &mut trigger,
+            &mut session_id,
+        )
+        .expect("observe synthetic pre-interrupt events");
+        assert!(should_interrupt);
+
+        let raw_tail =
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"late output"}]}}"#;
+        assert!(
+            !ClaudeNormaliser::new()
+                .line(raw_tail)
+                .expect("tail is an event-producing Claude frame")
+                .is_empty()
+        );
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(Ok(raw_tail.to_owned()))
+            .expect("queue synthetic raw tail");
+        drop(sender);
+
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        process_control::set_process_group(&mut command);
+        let mut child = command.spawn().expect("spawn synthetic live process");
+        let mut control = RunControl::new("run-1", session_id, RunCaps::default(), NoResume);
+        let mut raw_lines = 2;
+
+        let drained = finish_interrupted_capture(
+            &mut control,
+            &mut child,
+            &watchdog,
+            &sink,
+            &receiver,
+            &mut raw_lines,
+        )
+        .expect("complete synthetic capture");
+
+        assert_eq!(drained, 1);
+        assert_eq!(raw_lines, 3);
+        assert_eq!(sink.post_terminal_attempts(), 0);
+        let events = sink.events();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            [
+                AGENT_STARTED,
+                AGENT_TOOL_USE,
+                ethogram::CONTROL_REQUESTED,
+                ethogram::CONTROL_REQUESTED,
+                CONTROL_APPLIED,
+                CONTROL_APPLIED,
+                RUN_FINISHED,
+            ]
+        );
+        let steer_applied: ControlAppliedPayload =
+            serde_json::from_value(events[5].payload.clone()).expect("steer applied payload");
+        assert!(!steer_applied.ok);
+        assert_eq!(steer_applied.reason.as_deref(), Some("not-live"));
+
+        let metadata: toml::Value =
+            toml::from_str(&capture_metadata(events.len(), drained)).expect("valid meta.toml");
+        assert_eq!(metadata["raw_lines_after_interrupt"].as_integer(), Some(1));
+        assert!(
+            metadata["not_exercised"]["post_interrupt_events"]
+                .as_str()
+                .is_some_and(|note| note.contains("deliberately produce no events"))
+        );
+    }
+
+    #[derive(Default)]
+    struct TrackingSink(Mutex<TrackingState>);
+
+    #[derive(Default)]
+    struct TrackingState {
+        events: Vec<Event>,
+        finished: bool,
+        post_terminal_attempts: usize,
+    }
+
+    impl TrackingSink {
+        fn events(&self) -> Vec<Event> {
+            self.0.lock().expect("tracking sink lock").events.clone()
+        }
+
+        fn post_terminal_attempts(&self) -> usize {
+            self.0
+                .lock()
+                .expect("tracking sink lock")
+                .post_terminal_attempts
+        }
+    }
+
+    impl Sink for TrackingSink {
+        fn append(&self, run: &str, draft: EventDraft) -> Result<Event, umwelt_runtime::SinkFault> {
+            let mut state = self.0.lock().expect("tracking sink lock");
+            if state.finished {
+                state.post_terminal_attempts += 1;
+                return Err(umwelt_runtime::SinkFault::Finished);
+            }
+            let event = stamp(
+                draft,
+                StampFields {
+                    run_id: run.to_owned(),
+                    seq: u64::try_from(state.events.len()).expect("fixture sequence") + 1,
+                    ts: "2030-01-02T03:04:05.000Z".to_owned(),
+                },
+            );
+            state.finished = event.event_type == RUN_FINISHED;
+            state.events.push(event.clone());
+            Ok(event)
+        }
+
+        fn forward(&self, event: Event) -> Result<(), umwelt_runtime::SinkFault> {
+            let mut state = self.0.lock().expect("tracking sink lock");
+            if state.finished {
+                state.post_terminal_attempts += 1;
+                return Err(umwelt_runtime::SinkFault::Finished);
+            }
+            state.finished = event.event_type == RUN_FINISHED;
+            state.events.push(event);
+            Ok(())
+        }
+
+        fn last_seq(&self, _run: &str) -> Result<u64, umwelt_runtime::SinkFault> {
+            Ok(
+                u64::try_from(self.0.lock().expect("tracking sink lock").events.len())
+                    .expect("fixture sequence"),
+            )
+        }
     }
 }

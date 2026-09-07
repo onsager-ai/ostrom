@@ -23,6 +23,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+toml.workspace = true
 umwelt-capture = { path = "../umwelt-capture" }
 
 [lints]
