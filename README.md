@@ -317,6 +317,19 @@ queue, and read cursors, they never belong in this repository.
 
 ### Answering a decision
 
+The SessionStart digest's `DECISIONS WAITING` section groups open decisions by
+kind. A request stays visible until a matching `decision-answered` fact exists,
+including across terminal sessions. Each entry shows the subject, the full
+locally recorded dossier, the offered options, and local answer commands.
+`stuck` and `drift` remain in their own sections.
+
+To also show an address where decisions can be answered, set the optional
+`decision_inbox_url` scalar in `mandates.yaml`. It follows the usual user and
+repository layering; `null` clears an inherited value. Ostrom displays the
+operator's value without contacting it. The dossier and local commands remain
+visible when an address is configured. With the setting omitted, the section
+shows no inbox address.
+
 `ostrom queue approve <item>`, `reject` and `defer` keep their existing behavior.
 Add both `--decision <decision-id>` and `--option <option-id>` to settle a recorded
 request. For example:

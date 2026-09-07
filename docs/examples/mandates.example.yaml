@@ -8,6 +8,10 @@ provider: file
 cadence_hours: 1
 stuck_after_days: 7
 
+# Optional address where decisions can be answered. The digest always keeps
+# the local dossier and answer commands. Set null to clear an inherited value.
+# decision_inbox_url: http://127.0.0.1:8080/decisions
+
 # Directories to search recursively for local Git repositories. Every linked
 # worktree belonging to a discovered repository is scanned too.
 search_roots:

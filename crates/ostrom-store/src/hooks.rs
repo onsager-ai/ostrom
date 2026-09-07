@@ -1,16 +1,21 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     fs::{File, OpenOptions},
-    io::Write,
+    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     time::UNIX_EPOCH,
 };
 
+use ethogram::{DecisionKind, DecisionRequestedPayload};
 use regex::Regex;
 use serde_json::{Map, Value, json};
+use umwelt_runtime::{FileSink, Source};
 
-use crate::{Clock, OstromPaths, load_config, local_drift, read_queue};
+use crate::{
+    Clock, OstromPaths, SweepError, load_config, load_config_or_defaults, local_drift, read_queue,
+    read_trace,
+};
 
 #[derive(Debug, Clone)]
 pub struct DigestOptions {
@@ -75,8 +80,18 @@ pub fn render_constitution(
 }
 
 pub fn render_digest(options: &DigestOptions) -> HookOutput {
+    let waiting = read_waiting_decisions(&options.paths);
     let config = match load_config(&options.paths, &options.working_directory) {
         Ok(config) => config,
+        // Pass and dispatch can raise decisions without a mandate roster.
+        Err(SweepError::NotConfigured(_))
+            if waiting.as_ref().is_ok_and(|waiting| !waiting.is_empty()) =>
+        {
+            match load_config_or_defaults(&options.paths, &options.working_directory) {
+                Ok(config) => config,
+                Err(_) => return HookOutput::default(),
+            }
+        }
         Err(_) => return HookOutput::default(),
     };
     let now = options.clock.epoch_seconds();
@@ -127,11 +142,11 @@ pub fn render_digest(options: &DigestOptions) -> HookOutput {
         }
     }
 
-    render_section(
+    let waiting_repositories = render_waiting_decisions(
         &mut body,
-        "DECISIONS WAITING",
-        &["tripwire", "decision"],
-        &active,
+        &options.paths,
+        waiting,
+        config.decision_inbox_url.as_deref(),
     );
     render_stalled_holds(&mut body, state.as_ref());
     render_section(
@@ -179,17 +194,11 @@ pub fn render_digest(options: &DigestOptions) -> HookOutput {
         .filter(|row| {
             matches!(
                 row.get("kind").and_then(Value::as_str),
-                Some(
-                    "tripwire"
-                        | "decision"
-                        | "drift"
-                        | "stuck"
-                        | "merge-gate-fault"
-                        | "unexplained-write"
-                )
+                Some("drift" | "stuck" | "merge-gate-fault" | "unexplained-write")
             )
         })
         .filter_map(|row| row.get("repo").and_then(Value::as_str))
+        .chain(waiting_repositories.iter().map(String::as_str))
         .chain(stalled_hold_repositories(state.as_ref()))
         .chain(unresolvable.iter().map(String::as_str))
         .collect::<BTreeSet<_>>()
@@ -370,6 +379,233 @@ fn render_section(body: &mut String, heading: &str, kinds: &[&str], rows: &[&Val
         for row in rendered {
             push_line(body, &row);
         }
+    }
+}
+
+struct WaitingDecision {
+    id: String,
+    kind: String,
+    subject: String,
+}
+
+fn read_waiting_decisions(paths: &OstromPaths) -> Result<Vec<WaitingDecision>, String> {
+    let mut requested = BTreeMap::new();
+    let mut answered = BTreeSet::new();
+    // Membership comes only from facts, independently of the digest read watermark.
+    for row in read_trace(&paths.trace_file())
+        .map_err(|error| error.to_string())?
+        .rows
+    {
+        let row = row.map_err(|error| error.to_string())?;
+        if !matches!(
+            row.kind.as_str(),
+            "decision-requested" | "decision-answered"
+        ) {
+            continue;
+        }
+        let field = |key: &str| {
+            row.fact
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| format!("{} fact is missing {key}", row.kind))
+        };
+        let id = field("decision_id")?.to_owned();
+        if row.kind == "decision-answered" {
+            answered.insert(id);
+        } else {
+            let kind = field("kind")?.to_owned();
+            let subject = field("subject")?.to_owned();
+            // These facts describe adaptation, not a change in authority.
+            if !matches!(kind.as_str(), "stuck" | "drift") {
+                requested.insert(id.clone(), WaitingDecision { id, kind, subject });
+            }
+        }
+    }
+    let mut waiting = requested
+        .into_values()
+        .filter(|decision| !answered.contains(&decision.id))
+        .collect::<Vec<_>>();
+    waiting.sort_by(|left, right| {
+        (&left.kind, &left.subject, &left.id).cmp(&(&right.kind, &right.subject, &right.id))
+    });
+    Ok(waiting)
+}
+
+fn read_decision_dossiers(
+    paths: &OstromPaths,
+    waiting: &[WaitingDecision],
+) -> Result<BTreeMap<String, DecisionRequestedPayload>, String> {
+    let mut requests = BTreeMap::new();
+    let entries = match fs::read_dir(paths.runs_dir()) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(requests),
+        Err(error) => return Err(error.to_string()),
+    };
+    let source = FileSink::new(paths.runs_dir());
+    for entry in entries {
+        let path = entry
+            .map_err(|error| error.to_string())?
+            .path()
+            .join("events.jsonl");
+        let file = match File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("{}: {error}", path.display())),
+        };
+        let mut first = String::new();
+        BufReader::new(file)
+            .read_line(&mut first)
+            .map_err(|error| error.to_string())?;
+        if !first.ends_with('\n') {
+            continue;
+        }
+        let first = ethogram::parse_event(&first)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        for event in source
+            .read_from(&first.run_id, 0)
+            .map_err(|error| format!("{}: {error}", path.display()))?
+        {
+            if event.event_type != ethogram::DECISION_REQUESTED {
+                continue;
+            }
+            let Some(decision) = waiting
+                .iter()
+                .find(|decision| event.payload["decisionId"] == decision.id)
+            else {
+                continue;
+            };
+            let request: DecisionRequestedPayload =
+                serde_json::from_value(event.payload).map_err(|error| error.to_string())?;
+            if request.kind.as_str() != decision.kind
+                || request.subject.as_deref() != Some(&decision.subject)
+            {
+                return Err(format!(
+                    "request does not match the fact for {}",
+                    decision.id
+                ));
+            }
+            if requests
+                .get(&decision.id)
+                .is_some_and(|prior| prior != &request)
+            {
+                return Err(format!("conflicting requests for {}", decision.id));
+            }
+            requests.insert(decision.id.clone(), request);
+        }
+    }
+    Ok(requests)
+}
+
+fn render_waiting_decisions(
+    body: &mut String,
+    paths: &OstromPaths,
+    waiting: Result<Vec<WaitingDecision>, String>,
+    inbox_url: Option<&str>,
+) -> BTreeSet<String> {
+    let waiting = match waiting {
+        Ok(waiting) if waiting.is_empty() => return BTreeSet::new(),
+        Ok(waiting) => waiting,
+        Err(error) => {
+            push_line(body, "DECISIONS WAITING");
+            push_line(body, &format!("Unable to read decision facts: {error}"));
+            return BTreeSet::new();
+        }
+    };
+    push_line(body, "DECISIONS WAITING");
+    if let Some(url) = inbox_url.filter(|url| !url.trim().is_empty()) {
+        push_line(body, &format!("Answer decisions: {url}"));
+    }
+    let requests = read_decision_dossiers(paths, &waiting).unwrap_or_else(|error| {
+        push_line(body, &format!("Unable to read decision dossiers: {error}"));
+        BTreeMap::new()
+    });
+    let mut kind = "";
+    for decision in &waiting {
+        if kind != decision.kind {
+            kind = &decision.kind;
+            push_line(body, &format!("  {kind}"));
+        }
+        push_line(
+            body,
+            &format!("    {} [decision: {}]", decision.subject, decision.id),
+        );
+        let Some(request) = requests.get(&decision.id) else {
+            push_line(
+                body,
+                "      Dossier unavailable — restore the local decision.requested event before answering.",
+            );
+            continue;
+        };
+        let dossier = &request.dossier;
+        push_line(body, &format!("      Question: {}", dossier.question));
+        push_line(body, "      Options ruled out:");
+        if dossier.options_ruled_out.is_empty() {
+            push_line(body, "        (none)");
+        }
+        for option in &dossier.options_ruled_out {
+            push_line(body, &format!("        - {option}"));
+        }
+        push_line(
+            body,
+            &format!("      Recommended action: {}", dossier.recommended_action),
+        );
+        push_line(
+            body,
+            &format!("      Blast radius: {}", dossier.blast_radius),
+        );
+        if dossier.truncated == Some(true) {
+            push_line(
+                body,
+                "      Dossier was truncated by the requesting process.",
+            );
+        }
+        push_line(body, "      Options:");
+        for option in &request.options {
+            push_line(body, &format!("        {}: {}", option.id, option.label));
+            let verb = match request.kind {
+                DecisionKind::Tripwire => option.id.as_str(),
+                DecisionKind::GateInconclusive
+                | DecisionKind::HumanDecides
+                | DecisionKind::Budget => "approve",
+                DecisionKind::Permission | DecisionKind::Unknown(_) => {
+                    push_line(body, "          Answer through the requesting process.");
+                    continue;
+                }
+            };
+            push_line(
+                body,
+                &format!(
+                    "          ostrom queue {} {} --decision {} --option {}",
+                    quote_argument(verb),
+                    quote_argument(&decision.subject),
+                    quote_argument(&decision.id),
+                    quote_argument(&option.id)
+                ),
+            );
+        }
+    }
+    waiting
+        .iter()
+        .filter_map(|decision| {
+            decision
+                .subject
+                .split_once('#')
+                .map(|(repo, _)| repo.to_owned())
+        })
+        .collect()
+}
+
+fn quote_argument(value: &str) -> String {
+    if !value.is_empty()
+        && !value.starts_with('#')
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "_./:#-".contains(character))
+    {
+        value.to_owned()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
     }
 }
 
@@ -650,4 +886,481 @@ fn jq_render(value: &Value) -> String {
 fn push_line(output: &mut String, line: &str) {
     output.push_str(line);
     output.push('\n');
+}
+
+#[cfg(test)]
+mod tests {
+    use ostrom_core::{DecisionOption, Dossier};
+    use tempfile::TempDir;
+    use umwelt_runtime::Sink;
+
+    use super::*;
+    use crate::run_events::{DecisionRequest, emit_decision_requests};
+    use crate::{QueueDocument, TraceAppend, append_trace, write_queue};
+
+    struct Fixture {
+        root: TempDir,
+        options: DigestOptions,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let paths = OstromPaths {
+                config: root.path().to_owned(),
+                state: root.path().to_owned(),
+            };
+            fs::write(
+                paths.config.join("mandates.yaml"),
+                "projects:\n  - repo: example-org/project\n",
+            )
+            .unwrap();
+            fs::write(paths.sweep_state_file(), "{\"repos\":{}}").unwrap();
+            fs::write(paths.state.join(".tap-2026-09-08"), "").unwrap();
+            let options = DigestOptions {
+                paths,
+                working_directory: root.path().to_owned(),
+                clock: Clock::fixed("2026-09-08T00:00:00Z".parse().unwrap()),
+            };
+            Self { root, options }
+        }
+
+        fn request(&self, run: &str, id: &str, kind: DecisionKind, subject: &str) {
+            let options = match kind {
+                DecisionKind::Tripwire => vec!["approve", "reject", "defer"],
+                DecisionKind::GateInconclusive => vec!["excuse:required_checks", "wait", "fail"],
+                DecisionKind::Budget => vec!["raise", "wait"],
+                _ => vec!["yes", "no"],
+            };
+            emit_decision_requests(
+                &self.options.paths,
+                &self.options.clock.timestamp(),
+                run,
+                &[DecisionRequest {
+                    decision_id: id.to_owned(),
+                    kind,
+                    subject: subject.to_owned(),
+                    dossier: Dossier {
+                        question: format!("May {id} proceed?"),
+                        options_ruled_out: vec![
+                            "Proceed without permission".to_owned(),
+                            "Silently bypass the hold".to_owned(),
+                        ],
+                        recommended_action: "Review the evidence first".to_owned(),
+                        blast_radius: "Only the named subject".to_owned(),
+                    },
+                    options: options
+                        .into_iter()
+                        .map(|id| DecisionOption {
+                            id: id.to_owned(),
+                            label: format!("Choose {id}"),
+                        })
+                        .collect(),
+                }],
+            )
+            .unwrap();
+        }
+
+        fn fact(&self, kind: &str, fact: Value) {
+            append_trace(
+                &self.options.paths.trace_file(),
+                &TraceAppend {
+                    ts: self.options.clock.timestamp(),
+                    kind: kind.to_owned(),
+                    fact: fact.as_object().unwrap().clone(),
+                    narration: Map::new(),
+                },
+            )
+            .unwrap();
+        }
+
+        fn message(&self) -> String {
+            let output = render_digest(&self.options);
+            assert!(output.stderr.is_empty(), "{}", output.stderr);
+            let envelope: Value = serde_json::from_str(&output.stdout).unwrap();
+            assert_eq!(
+                envelope["systemMessage"],
+                envelope["hookSpecificOutput"]["additionalContext"]
+            );
+            envelope["systemMessage"].as_str().unwrap().to_owned()
+        }
+
+        fn queue(&self, kinds: &[&str]) {
+            let rows = kinds
+                .iter()
+                .enumerate()
+                .map(|(index, kind)| {
+                    QueueDocument::from_value(json!({
+                        "id":format!("example-org/project#{}", index + 20),
+                        "repo":"example-org/project", "ref":format!("#{}", index + 20),
+                        "kind":kind, "title":format!("{kind} queue title"),
+                        "state":"pending", "opened":"2026-09-08T00:00:00Z",
+                        "mandate":{"reason":format!("{kind} queue reason")}, "needs_judgment":true
+                    }))
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            write_queue(&self.options.paths.queue_file(), &rows).unwrap();
+        }
+    }
+
+    fn assert_dossier(message: &str, id: &str) {
+        for expected in [
+            format!("Question: May {id} proceed?"),
+            "Options ruled out:".to_owned(),
+            "- Proceed without permission".to_owned(),
+            "- Silently bypass the hold".to_owned(),
+            "Recommended action: Review the evidence first".to_owned(),
+            "Blast radius: Only the named subject".to_owned(),
+        ] {
+            assert!(message.contains(&expected), "missing {expected}: {message}");
+        }
+    }
+
+    #[test]
+    fn open_decision_is_local_and_persists_across_reads_while_answered_is_absent() {
+        let fixture = Fixture::new();
+        fixture.request(
+            "sweep",
+            "open",
+            DecisionKind::Tripwire,
+            "example-org/project#19",
+        );
+        fixture.request(
+            "sweep",
+            "answered",
+            DecisionKind::Tripwire,
+            "example-org/project#20",
+        );
+        fixture.fact("decision-answered", json!({"decision_id":"answered", "option":"approve", "by":"fixture-principal", "reversal":"reject"}));
+        fixture.fact(
+            "decision-requested",
+            json!({"decision_id":"answered", "kind":"tripwire", "subject":"example-org/project#20"}),
+        );
+        fixture.queue(&["tripwire"]);
+        fs::write(
+            fixture.options.paths.state.join(".digest-decisions-read"),
+            "2026-09-09T00:00:00Z\n",
+        )
+        .unwrap();
+        for _ in 0..2 {
+            let message = fixture.message();
+            assert!(
+                message.contains(
+                    "DECISIONS WAITING\n  tripwire\n    example-org/project#19 [decision: open]"
+                ),
+                "{message}"
+            );
+            assert_dossier(&message, "open");
+            for option in ["approve", "reject", "defer"] {
+                assert!(
+                    message.contains(&format!("{option}: Choose {option}")),
+                    "{message}"
+                );
+                assert!(message.contains(&format!("ostrom queue {option} example-org/project#19 --decision open --option {option}")), "{message}");
+            }
+            assert!(!message.contains("answered"), "{message}");
+            assert!(!message.contains("example-org/project#20"), "{message}");
+            assert!(!message.contains("://"), "{message}");
+            assert!(!message.contains("Answer decisions:"), "{message}");
+            assert!(message.ends_with("0 projects nominal"), "{message}");
+        }
+    }
+
+    #[test]
+    fn inbox_setting_layers_and_clears_without_removing_the_local_dossier() {
+        let fixture = Fixture::new();
+        fixture.request(
+            "sweep",
+            "open",
+            DecisionKind::Tripwire,
+            "example-org/project#19",
+        );
+        fs::write(
+            fixture.options.paths.config.join("mandates.yaml"),
+            "decision_inbox_url: http://127.0.0.1:8080/decisions?view=waiting\n",
+        )
+        .unwrap();
+        let repository = fixture.root.path().join(".ostrom");
+        fs::create_dir(&repository).unwrap();
+        for (overlay, expected) in [
+            ("", Some("http://127.0.0.1:8080/decisions?view=waiting")),
+            (
+                "decision_inbox_url: http://127.0.0.1:9090/answer\n",
+                Some("http://127.0.0.1:9090/answer"),
+            ),
+            ("decision_inbox_url: null\n", None),
+            ("decision_inbox_url: '  '\n", None),
+        ] {
+            fs::write(
+                repository.join("mandates.yaml"),
+                if overlay.is_empty() { "{}" } else { overlay },
+            )
+            .unwrap();
+            let message = fixture.message();
+            assert_dossier(&message, "open");
+            assert!(message.contains(
+                "ostrom queue approve example-org/project#19 --decision open --option approve"
+            ));
+            if let Some(url) = expected {
+                assert!(
+                    message.contains(&format!("Answer decisions: {url}")),
+                    "{message}"
+                );
+            } else {
+                assert!(!message.contains("://"), "{message}");
+            }
+        }
+    }
+
+    #[test]
+    fn decisions_are_grouped_across_runs_with_commands_for_each_offered_option() {
+        let fixture = Fixture::new();
+        fixture.request(
+            "sweep",
+            "tripwire-a",
+            DecisionKind::Tripwire,
+            "example-org/project#19",
+        );
+        fixture.request(
+            "gate",
+            "gate",
+            DecisionKind::GateInconclusive,
+            "example-org/project#19",
+        );
+        fixture.request(
+            "pass",
+            "budget",
+            DecisionKind::Budget,
+            "account:/tmp/operator's state",
+        );
+        fixture.request(
+            "sweep",
+            "human",
+            DecisionKind::HumanDecides,
+            "example-org/project#19",
+        );
+        fixture.request(
+            "dispatch",
+            "tripwire-b",
+            DecisionKind::Tripwire,
+            "example-org/project#21",
+        );
+        let message = fixture.message();
+        let mut previous = 0;
+        for kind in ["budget", "gate_inconclusive", "human_decides", "tripwire"] {
+            let heading = format!("\n  {kind}\n");
+            assert_eq!(message.matches(&heading).count(), 1, "{message}");
+            let position = message.find(&heading).unwrap();
+            assert!(position > previous);
+            previous = position;
+        }
+        assert_eq!(message.matches("[decision:").count(), 5, "{message}");
+        for command in [
+            "ostrom queue approve example-org/project#19 --decision gate --option excuse:required_checks",
+            "ostrom queue approve example-org/project#19 --decision human --option yes",
+            "ostrom queue approve 'account:/tmp/operator'\\''s state' --decision budget --option raise",
+        ] {
+            assert!(message.contains(command), "{message}");
+        }
+    }
+
+    #[test]
+    fn queue_rows_do_not_admit_decisions_and_stuck_and_drift_keep_their_sections() {
+        let fixture = Fixture::new();
+        fixture.queue(&["stuck", "drift", "tripwire", "decision"]);
+        for kind in ["stuck", "drift"] {
+            fixture.fact(
+                "decision-requested",
+                json!({"decision_id":kind,"kind":kind,"subject":"example-org/project#99"}),
+            );
+        }
+        assert!(!fixture.message().contains("DECISIONS WAITING"));
+        fixture.request(
+            "sweep",
+            "open",
+            DecisionKind::Tripwire,
+            "example-org/project#19",
+        );
+        let message = fixture.message();
+        let waiting = message
+            .split("DECISIONS WAITING\n")
+            .nth(1)
+            .unwrap()
+            .split("STUCK\n")
+            .next()
+            .unwrap();
+        assert!(
+            !waiting.contains("stuck") && !waiting.contains("drift"),
+            "{message}"
+        );
+        assert!(
+            message.contains("STUCK\nexample-org/project#20  stuck queue title"),
+            "{message}"
+        );
+        assert!(
+            message.contains("DRIFT\nexample-org/project#21  drift queue title"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("tripwire queue title") && !message.contains("decision queue title"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn event_without_fact_is_not_open_and_missing_dossier_does_not_hide_a_fact() {
+        let fixture = Fixture::new();
+        fixture.request(
+            "sweep",
+            "event-only",
+            DecisionKind::Tripwire,
+            "example-org/project#19",
+        );
+        fs::remove_file(fixture.options.paths.trace_file()).unwrap();
+        assert!(!fixture.message().contains("DECISIONS WAITING"));
+        fixture.fact(
+            "decision-requested",
+            json!({"decision_id":"fact-only","kind":"tripwire","subject":"example-org/project#20"}),
+        );
+        let message = fixture.message();
+        assert!(
+            message.contains("example-org/project#20 [decision: fact-only]"),
+            "{message}"
+        );
+        assert!(message.contains("Dossier unavailable"), "{message}");
+        assert!(!message.contains("event-only"), "{message}");
+    }
+
+    #[test]
+    fn unreadable_decision_facts_are_visible_in_the_digest() {
+        let fixture = Fixture::new();
+        for text in [
+            "broken\n",
+            "{\"ts\":\"2026-09-08T00:00:00Z\",\"kind\":\"decision-requested\",\"fact\":{},\"narration\":{}}\n",
+        ] {
+            fs::write(fixture.options.paths.trace_file(), text).unwrap();
+            assert!(
+                fixture
+                    .message()
+                    .contains("DECISIONS WAITING\nUnable to read decision facts:")
+            );
+        }
+    }
+
+    #[test]
+    fn budget_decision_is_visible_without_a_mandate_roster() {
+        let fixture = Fixture::new();
+        fs::remove_file(fixture.options.paths.config.join("mandates.yaml")).unwrap();
+        assert_eq!(render_digest(&fixture.options), HookOutput::default());
+        fixture.request(
+            "pass",
+            "budget",
+            DecisionKind::Budget,
+            "account:/tmp/operator",
+        );
+        let message = fixture.message();
+        assert!(
+            message.contains("DECISIONS WAITING\n  budget\n    account:/tmp/operator"),
+            "{message}"
+        );
+        assert_dossier(&message, "budget");
+        assert!(
+            message.contains(
+                "ostrom queue approve account:/tmp/operator --decision budget --option wait"
+            ),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn permission_dossier_is_local_without_advertising_an_unsupported_queue_answer() {
+        let fixture = Fixture::new();
+        fixture.request(
+            "companion",
+            "permission",
+            DecisionKind::Permission,
+            "tool:write",
+        );
+        let message = fixture.message();
+        assert_dossier(&message, "permission");
+        assert!(message.contains("yes: Choose yes"), "{message}");
+        assert!(
+            message.contains("Answer through the requesting process."),
+            "{message}"
+        );
+        assert!(!message.contains("ostrom queue"), "{message}");
+    }
+
+    #[test]
+    fn local_answer_arguments_round_trip_through_the_shell() {
+        for argument in [
+            "",
+            "#19",
+            "account:/tmp/operator's state",
+            "$(printf substituted); echo unexpected",
+            "two\nlines",
+        ] {
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "set -- {}; printf '%s\\n' \"$#\"; printf '%s' \"$1\"",
+                    quote_argument(argument)
+                ))
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap(),
+                format!("1\n{argument}")
+            );
+        }
+    }
+
+    #[test]
+    fn conflicting_or_mismatched_dossiers_are_visible_without_hiding_the_open_subject() {
+        for mismatch in [false, true] {
+            let fixture = Fixture::new();
+            fixture.request(
+                "sweep",
+                "open",
+                DecisionKind::Tripwire,
+                "example-org/project#19",
+            );
+            let source = FileSink::new(fixture.options.paths.runs_dir());
+            let mut payload = source.read_from("sweep", 0).unwrap().pop().unwrap().payload;
+            if mismatch {
+                payload["subject"] = json!("example-org/project#20");
+            } else {
+                payload["dossier"]["question"] = json!("A conflicting question");
+            }
+            source
+                .append(
+                    "sweep",
+                    ethogram::EventDraft {
+                        event_type: ethogram::DECISION_REQUESTED.to_owned(),
+                        payload,
+                        captured_at: None,
+                    },
+                )
+                .unwrap();
+            let message = fixture.message();
+            assert!(
+                message.contains("Unable to read decision dossiers:"),
+                "{message}"
+            );
+            assert!(
+                message.contains(if mismatch {
+                    "request does not match the fact"
+                } else {
+                    "conflicting requests"
+                }),
+                "{message}"
+            );
+            assert!(
+                message.contains("example-org/project#19 [decision: open]"),
+                "{message}"
+            );
+        }
+    }
 }
