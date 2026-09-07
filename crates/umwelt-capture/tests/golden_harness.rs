@@ -205,8 +205,8 @@ fn write_case(case: &Path, raw: &str, expected: &str, with_metadata: bool) {
             concat!(
                 "harness = \"stub\"\n",
                 "cli_version = \"1.0.0\"\n",
-                "capture_date = \"2026-09-07\"\n",
-                "exercises = \"the golden harness\"\n",
+                "captured_at = \"2026-09-07\"\n",
+                "exercises = [\"the golden harness\"]\n",
             ),
         )
         .expect("write metadata fixture");

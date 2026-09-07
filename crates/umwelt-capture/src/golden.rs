@@ -3,16 +3,18 @@
 //! A case directory contains `raw.ndjson`, `expected.jsonl`, and `meta.toml`.
 //! [`run_case`] always drives a fresh normaliser through both a slice source
 //! and a file source, then requires their canonical event bytes to agree.
-//! Metadata uses four non-empty TOML basic strings: `harness`, `cli_version`,
-//! `capture_date`, and `exercises`. Under a harness directory, each line of
-//! every regular file in `refuses/` is tested in isolation and must make the
-//! normaliser return a [`CaptureFault`].
+//! Metadata supplies non-empty `harness`, `cli_version`, and `captured_at`
+//! strings plus a non-empty `exercises` string array. Other keys and sections
+//! are retained for human provenance and ignored by this secondary consumer.
+//! Under a harness directory, each line of every regular file in `refuses/`
+//! is tested in isolation and must make the normaliser return a
+//! [`CaptureFault`].
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use ethogram::{StampFields, serialise_event, stamp};
+use serde::Deserialize;
 use thiserror::Error;
 
 use crate::{CaptureFault, FileLineSource, LineSource, Normaliser, SliceLineSource};
@@ -28,16 +30,16 @@ const META_FILE: &str = "meta.toml";
 const REFUSES_DIRECTORY: &str = "refuses";
 
 /// Recorded provenance for one golden case.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct CaseMetadata {
     /// Harness whose output was captured.
     pub harness: String,
     /// Exact harness CLI version used for the capture.
     pub cli_version: String,
     /// Date on which the capture was taken.
-    pub capture_date: String,
-    /// Behaviour exercised by the case.
-    pub exercises: String,
+    pub captured_at: String,
+    /// Behaviours exercised by the case.
+    pub exercises: Vec<String>,
 }
 
 /// Result of successfully checking one case.
@@ -199,7 +201,7 @@ where
     N: Normaliser,
     F: FnMut() -> N,
 {
-    let metadata = read_metadata(&case_directory.join(META_FILE))?;
+    let metadata = read_metadata(case_directory.join(META_FILE))?;
     let raw_path = case_directory.join(RAW_FILE);
     let raw = read_utf8(&raw_path)?;
     let raw_lines: Vec<String> = raw.lines().map(str::to_owned).collect();
@@ -320,7 +322,12 @@ where
     Ok(refusals)
 }
 
-fn read_metadata(path: &Path) -> Result<CaseMetadata, GoldenError> {
+/// Parse the provenance metadata for one committed or candidate golden case.
+///
+/// The harness borrows four fields from a document primarily written for
+/// future human readers. All other valid TOML keys and sections are ignored.
+pub fn read_metadata(path: impl AsRef<Path>) -> Result<CaseMetadata, GoldenError> {
+    let path = path.as_ref();
     if !path.exists() {
         return Err(GoldenError::MetadataMissing {
             path: path.to_owned(),
@@ -334,70 +341,29 @@ fn read_metadata(path: &Path) -> Result<CaseMetadata, GoldenError> {
 }
 
 fn parse_metadata(input: &str) -> Result<CaseMetadata, String> {
-    let mut fields = BTreeMap::new();
-    for (index, raw_line) in input.lines().enumerate() {
-        let line = strip_comment(raw_line)?.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let (key, value) = line
-            .split_once('=')
-            .ok_or_else(|| format!("line {} is not a key/value assignment", index + 1))?;
-        let key = key.trim();
-        if !matches!(
-            key,
-            "harness" | "cli_version" | "capture_date" | "exercises"
-        ) {
-            return Err(format!("line {} has unknown key {key:?}", index + 1));
-        }
-        let value = serde_json::from_str::<String>(value.trim()).map_err(|error| {
-            format!(
-                "line {} value must be a TOML basic string: {error}",
-                index + 1
-            )
-        })?;
-        if value.is_empty() {
-            return Err(format!("line {} value must not be empty", index + 1));
-        }
-        if fields.insert(key.to_owned(), value).is_some() {
-            return Err(format!("line {} repeats key {key:?}", index + 1));
+    let metadata: CaseMetadata = toml::from_str(input).map_err(|error| error.to_string())?;
+    require_non_empty("harness", &metadata.harness)?;
+    require_non_empty("cli_version", &metadata.cli_version)?;
+    require_non_empty("captured_at", &metadata.captured_at)?;
+    if metadata.exercises.is_empty() {
+        return Err("required key \"exercises\" must contain at least one string".to_owned());
+    }
+    for (index, exercise) in metadata.exercises.iter().enumerate() {
+        if exercise.is_empty() {
+            return Err(format!(
+                "required key \"exercises\" contains an empty string at index {index}"
+            ));
         }
     }
-
-    Ok(CaseMetadata {
-        harness: take_field(&mut fields, "harness")?,
-        cli_version: take_field(&mut fields, "cli_version")?,
-        capture_date: take_field(&mut fields, "capture_date")?,
-        exercises: take_field(&mut fields, "exercises")?,
-    })
+    Ok(metadata)
 }
 
-fn strip_comment(line: &str) -> Result<&str, String> {
-    let mut quoted = false;
-    let mut escaped = false;
-    for (index, byte) in line.bytes().enumerate() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if quoted && byte == b'\\' {
-            escaped = true;
-        } else if byte == b'"' {
-            quoted = !quoted;
-        } else if !quoted && byte == b'#' {
-            return Ok(&line[..index]);
-        }
+fn require_non_empty(key: &str, value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        Err(format!("required key {key:?} must not be empty"))
+    } else {
+        Ok(())
     }
-    if quoted || escaped {
-        return Err("unterminated string in metadata".to_owned());
-    }
-    Ok(line)
-}
-
-fn take_field(fields: &mut BTreeMap<String, String>, key: &str) -> Result<String, String> {
-    fields
-        .remove(key)
-        .ok_or_else(|| format!("missing required key {key:?}"))
 }
 
 fn jsonl_lines(path: &Path) -> Result<Vec<Vec<u8>>, GoldenError> {
