@@ -20,8 +20,7 @@ chrono = { version = "=0.4.44", default-features = false, features = ["std", "se
 clap = { version = "4.5.45", features = ["derive"] }
 base64 = "=0.22.1"
 directories = "6.0.0"
-ethogram = { git = "https://github.com/onsager-ai/ethogram", rev = "a6160280a17cb80d96f3b9c5daf01655c9a56af0" }
-ethogram-decisions = { package = "ethogram", git = "https://github.com/onsager-ai/ethogram", rev = "b18787085a017b239fbfb65fbcdc70f7a406598a" }
+ethogram = { git = "https://github.com/onsager-ai/ethogram", rev = "e2774df825c82f69f9efd7630c1ef3201e9d5b7e" }
 indexmap = "2"
 regex = "=1.12.3"
 rsa = { version = "=0.9.8", features = ["sha2"] }
@@ -34,8 +33,8 @@ serde_yaml = "0.9.34"
 tempfile = "3.20.0"
 thiserror = "2.0.16"
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }
-umwelt-capture = { git = "https://github.com/onsager-ai/umwelt.git", rev = "4a86181" }
-umwelt-runtime = { git = "https://github.com/onsager-ai/umwelt.git", rev = "4a86181" }
+umwelt-capture = { git = "https://github.com/onsager-ai/umwelt.git", rev = "fe9e8803c41bf79238eb5c9f5097853976176ac7" }
+umwelt-runtime = { git = "https://github.com/onsager-ai/umwelt.git", rev = "fe9e8803c41bf79238eb5c9f5097853976176ac7" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

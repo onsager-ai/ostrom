@@ -16,12 +16,9 @@ use std::fs::OpenOptions;
 
 use chrono::{DateTime, Utc};
 use ethogram::{
-    ControlRequestedPayload, Event, EventDraft, PayloadExtension, RunFinishedPayload, RunKind,
-    RunOutcome, RunStartedPayload, RunUsage,
-};
-use ethogram_decisions::{
-    DecisionDossier, DecisionKind, DecisionRequestedPayload,
-    PayloadExtension as DecisionPayloadExtension,
+    ControlRequestedPayload, DecisionDossier, DecisionKind, DecisionRequestedPayload, Event,
+    EventDraft, PayloadExtension, RunFinishedPayload, RunKind, RunOutcome, RunStartedPayload,
+    RunUsage,
 };
 use ostrom_core::{DecisionOption, Dossier, WriteDisposition};
 use serde::Serialize;
@@ -93,7 +90,7 @@ impl SweepDecisionEmitter {
     ) -> Result<WriteDisposition, RunEventError> {
         let draft = decision_request_draft(request)?;
         for event in self.sink.durable.read_from(SWEEP_RUN_ID, 0)? {
-            if event.event_type != ethogram_decisions::DECISION_REQUESTED
+            if event.event_type != ethogram::DECISION_REQUESTED
                 || event
                     .payload
                     .get("decisionId")
@@ -406,7 +403,7 @@ pub fn generated_run_id(prefix: &str, clock: &Clock) -> String {
 fn decision_request_draft(request: &DecisionRequest) -> Result<EventDraft, serde_json::Error> {
     let mut truncated = false;
     let mut bounded = |value: &str| {
-        let excerpt = ethogram_decisions::excerpt(value, ethogram_decisions::MAX_EXCERPT_SCALARS);
+        let excerpt = ethogram::excerpt(value, ethogram::MAX_EXCERPT_SCALARS);
         truncated |= excerpt.truncated;
         excerpt.text
     };
@@ -422,10 +419,10 @@ fn decision_request_draft(request: &DecisionRequest) -> Result<EventDraft, serde
     let options = request
         .options
         .iter()
-        .map(|option| ethogram_decisions::DecisionOption {
+        .map(|option| ethogram::DecisionOption {
             id: option.id.clone(),
             label: bounded(&option.label),
-            extra: DecisionPayloadExtension::new(),
+            extra: PayloadExtension::new(),
         })
         .collect();
     let payload = serde_json::to_value(DecisionRequestedPayload {
@@ -437,17 +434,17 @@ fn decision_request_draft(request: &DecisionRequest) -> Result<EventDraft, serde
             recommended_action,
             blast_radius,
             truncated: truncated.then_some(true),
-            extra: DecisionPayloadExtension::new(),
+            extra: PayloadExtension::new(),
         },
         options,
         subject: Some(request.subject.clone()),
         expires_at: None,
         on_timeout: None,
-        extra: DecisionPayloadExtension::new(),
+        extra: PayloadExtension::new(),
     })?;
-    ethogram_decisions::validate(ethogram_decisions::DECISION_REQUESTED, &payload)?;
+    ethogram::validate(ethogram::DECISION_REQUESTED, &payload)?;
     Ok(EventDraft {
-        event_type: ethogram_decisions::DECISION_REQUESTED.to_owned(),
+        event_type: ethogram::DECISION_REQUESTED.to_owned(),
         payload,
         captured_at: None,
     })
@@ -467,8 +464,8 @@ mod tests {
     use std::{fs, fs::OpenOptions, os::fd::AsRawFd};
 
     use chrono::{TimeZone, Utc};
+    use ethogram::{DecisionKind, DecisionRequestedPayload};
     use ethogram::{RunFinishedPayload, RunKind, RunOutcome, RunStartedPayload};
-    use ethogram_decisions::{DecisionKind, DecisionRequestedPayload};
     use ostrom_core::{DecisionOption, Dossier, WriteDisposition};
     use tempfile::tempdir;
     use umwelt_runtime::{FileSink, Source};
@@ -533,9 +530,9 @@ mod tests {
             .expect("read sweep events");
         let decision = events
             .iter()
-            .find(|event| event.event_type == ethogram_decisions::DECISION_REQUESTED)
+            .find(|event| event.event_type == ethogram::DECISION_REQUESTED)
             .expect("decision event");
-        ethogram_decisions::validate(&decision.event_type, &decision.payload)
+        ethogram::validate(&decision.event_type, &decision.payload)
             .expect("emitted decision validates against the current SDK");
         let payload: DecisionRequestedPayload =
             serde_json::from_value(decision.payload.clone()).expect("typed decision payload");
@@ -582,7 +579,7 @@ mod tests {
             .read_from(SWEEP_RUN_ID, 0)
             .expect("read sweep events")
             .into_iter()
-            .filter(|event| event.event_type == ethogram_decisions::DECISION_REQUESTED)
+            .filter(|event| event.event_type == ethogram::DECISION_REQUESTED)
             .count();
         assert_eq!(decisions, 1);
     }

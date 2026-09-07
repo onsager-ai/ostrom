@@ -6,7 +6,7 @@ use std::{
 };
 
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
-use ethogram_decisions::DecisionKind;
+use ethogram::DecisionKind;
 use ostrom_core::{
     DecisionOption, DefaultDisposition, Dossier, GateConfig, MandateConfig, ProjectMandate,
     PublicationSource, RepositoryName, Selector, WorkNodeInput, build_work_graph, sha256_hex,
@@ -4279,7 +4279,7 @@ mod tests {
             .read_from(crate::run_events::SWEEP_RUN_ID, 0)
             .expect("read emitted decision events")
             .into_iter()
-            .filter(|event| event.event_type == ethogram_decisions::DECISION_REQUESTED)
+            .filter(|event| event.event_type == ethogram::DECISION_REQUESTED)
             .collect::<Vec<_>>();
         assert_eq!(decisions.len(), 3);
         assert_eq!(
@@ -4295,7 +4295,7 @@ mod tests {
         );
         assert!(decisions.iter().all(|event| {
             !event.payload.as_object().unwrap().contains_key("onTimeout")
-                && ethogram_decisions::validate(&event.event_type, &event.payload).is_ok()
+                && ethogram::validate(&event.event_type, &event.payload).is_ok()
         }));
         assert!(decisions.iter().all(|event| {
             event.payload.get("subject").and_then(Value::as_str) != Some("fixture-org/decisions#3")
@@ -4333,9 +4333,9 @@ mod tests {
                 serde_json::to_string(&emitted).expect("encode normalized fixture"),
                 expected.trim()
             );
-            let parsed = ethogram_decisions::parse_event(expected.trim())
+            let parsed = ethogram::parse_event(expected.trim())
                 .expect("fixture parses against the current SDK");
-            ethogram_decisions::validate(&parsed.event_type, &parsed.payload)
+            ethogram::validate(&parsed.event_type, &parsed.payload)
                 .expect("fixture validates against the current SDK");
         }
     }
@@ -4491,7 +4491,7 @@ mod tests {
                 .read_from(crate::run_events::SWEEP_RUN_ID, 0)
                 .expect("read human-decides events")
                 .into_iter()
-                .filter(|event| event.event_type == ethogram_decisions::DECISION_REQUESTED)
+                .filter(|event| event.event_type == ethogram::DECISION_REQUESTED)
                 .collect::<Vec<_>>()
         };
 
@@ -4502,7 +4502,7 @@ mod tests {
             event.payload["kind"] == "human_decides"
                 && event.payload["subject"] == "fixture-org/decisions#4"
                 && !event.payload.as_object().unwrap().contains_key("onTimeout")
-                && ethogram_decisions::validate(&event.event_type, &event.payload).is_ok()
+                && ethogram::validate(&event.event_type, &event.payload).is_ok()
         }));
         assert_eq!(
             first[0].payload["options"],
@@ -4537,9 +4537,9 @@ mod tests {
                 serde_json::to_string(&emitted).expect("encode normalized human fixture"),
                 expected.trim()
             );
-            let parsed = ethogram_decisions::parse_event(expected.trim())
+            let parsed = ethogram::parse_event(expected.trim())
                 .expect("human fixture parses against the current SDK");
-            ethogram_decisions::validate(&parsed.event_type, &parsed.payload)
+            ethogram::validate(&parsed.event_type, &parsed.payload)
                 .expect("human fixture validates against the current SDK");
         }
         let first_trace = fs::read(paths.trace_file()).expect("read first decision facts");
