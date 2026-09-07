@@ -14,6 +14,18 @@ use serde_json::{Value, json};
 mod support;
 use tempfile::TempDir;
 
+const CLAUDE_STREAM_JSON: &str = concat!(
+    "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"session-fixture\",\"model\":\"claude-fixture\"}\n",
+    "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"tool-fixture\",\"name\":\"Bash\",\"input\":{\"command\":\"true\"}}]}}\n",
+    "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"tool-fixture\",\"content\":\"ok\",\"is_error\":false}]}}\n",
+    "{\"type\":\"result\",\"subtype\":\"success\",\"session_id\":\"session-fixture\",\"duration_ms\":125,\"num_turns\":1,\"total_cost_usd\":1.25,\"usage\":{\"input_tokens\":10,\"output_tokens\":5,\"cache_read_input_tokens\":2,\"cache_creation_input_tokens\":3}}\n",
+);
+
+fn stream_script(stream: &str) -> String {
+    assert!(!stream.contains('\''));
+    format!("printf '%s' '{stream}'")
+}
+
 struct Fixture {
     root: TempDir,
     state: PathBuf,
@@ -156,6 +168,15 @@ projects:
         fs::read(run_directories[0].path().join("events.jsonl")).expect("read pass events")
     }
 
+    fn transcript_bytes(&self) -> Vec<u8> {
+        let transcripts = fs::read_dir(self.state.join("pass-runs/builder"))
+            .expect("read transcript directory")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read transcript entries");
+        assert_eq!(transcripts.len(), 1, "expected exactly one transcript");
+        fs::read(transcripts[0].path()).expect("read transcript")
+    }
+
     fn assert_released(&self) {
         assert!(!self.state.join("builder-pass.lease").exists());
         let trace = self.trace();
@@ -199,6 +220,193 @@ fn events_fd_environment_streams_the_durable_bytes() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(output.stdout, fixture.run_event_bytes());
+}
+
+#[test]
+fn stream_json_is_teed_byte_for_byte_and_emits_the_agent_roster() {
+    let fixture = Fixture::new(&stream_script(CLAUDE_STREAM_JSON));
+    let output = fixture.command().output().expect("run captured pass");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(fixture.transcript_bytes(), CLAUDE_STREAM_JSON.as_bytes());
+    let events = fixture.run_events();
+    let event_types = events
+        .iter()
+        .filter_map(|event| event["type"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        event_types,
+        [
+            "run.started",
+            "agent.started",
+            "agent.tool_use",
+            "agent.tool_result",
+            "agent.completed",
+            "run.finished",
+        ]
+    );
+    assert_eq!(
+        event_types
+            .iter()
+            .filter(|event_type| **event_type == "run.finished")
+            .count(),
+        1
+    );
+
+    let agent_cost = events
+        .iter()
+        .find(|event| event["type"] == "agent.completed")
+        .and_then(|event| event["payload"]["costUsd"].as_f64());
+    let pass_cost = fixture
+        .trace()
+        .into_iter()
+        .rev()
+        .find(|row| row["kind"] == "pass-ended")
+        .and_then(|row| row["fact"]["cost_usd"].as_f64());
+    assert_eq!(agent_cost, pass_cost);
+    assert_eq!(agent_cost, Some(1.25));
+}
+
+#[test]
+fn malformed_capture_line_is_refused_without_failing_the_pass() {
+    let stream = CLAUDE_STREAM_JSON.replacen('\n', "\nthis is not a stream-json frame\n", 1);
+    let fixture = Fixture::new(&stream_script(&stream));
+    let output = fixture.command().output().expect("run malformed capture");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(fixture.transcript_bytes(), stream.as_bytes());
+    let events = fixture.run_events();
+    let refusal = events
+        .iter()
+        .find(|event| event["type"] == "capture.refused")
+        .expect("capture refusal event");
+    assert_eq!(refusal["payload"]["cause"], "malformed");
+    assert!(
+        refusal["payload"]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("malformed raw line 2"))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == "agent.completed")
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "run.finished")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn facts_only_withholds_agent_events_only_from_the_live_descriptor() {
+    let fixture = Fixture::new(&stream_script(CLAUDE_STREAM_JSON));
+    let output = fixture
+        .command()
+        .args(["--events-fd", "1", "--facts-only"])
+        .output()
+        .expect("run facts-only pass");
+    assert!(output.status.success());
+
+    let live = String::from_utf8(output.stdout)
+        .expect("live events UTF-8")
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("live event JSON"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        live.iter()
+            .filter_map(|event| event["type"].as_str())
+            .collect::<Vec<_>>(),
+        ["run.started", "run.finished"]
+    );
+    assert!(
+        fixture
+            .run_events()
+            .iter()
+            .any(|event| event["type"] == "agent.tool_use")
+    );
+}
+
+#[test]
+fn agent_events_flow_to_the_live_descriptor_by_default_and_env_can_withhold_them() {
+    let default_fixture = Fixture::new(&stream_script(CLAUDE_STREAM_JSON));
+    let default = default_fixture
+        .command()
+        .args(["--events-fd", "1"])
+        .output()
+        .expect("run default live pass");
+    assert!(default.status.success());
+    assert_eq!(default.stdout, default_fixture.run_event_bytes());
+    assert!(String::from_utf8_lossy(&default.stdout).contains("\"type\":\"agent.tool_result\""));
+
+    let facts_fixture = Fixture::new(&stream_script(CLAUDE_STREAM_JSON));
+    let facts = facts_fixture
+        .command()
+        .args(["--events-fd", "1"])
+        .env("OSTROM_FACTS_ONLY", "true")
+        .output()
+        .expect("run environment facts-only pass");
+    assert!(facts.status.success());
+    assert!(!String::from_utf8_lossy(&facts.stdout).contains("\"type\":\"agent."));
+    assert!(
+        facts_fixture
+            .run_events()
+            .iter()
+            .any(|event| event["type"] == "agent.completed")
+    );
+}
+
+#[test]
+fn a_cost_cap_trip_emits_one_terminal_event() {
+    let stream = CLAUDE_STREAM_JSON.replace("1.25", "0.5");
+    let fixture = Fixture::new(&format!("{}\nsleep 30", stream_script(&stream)));
+    let manifest = fixture.state.join("ostrom.yaml");
+    fs::write(
+        &manifest,
+        concat!(
+            "manifest_version: 1\n",
+            "defaults:\n",
+            "  loop:\n",
+            "    spend_usd: 0.5\n",
+        ),
+    )
+    .expect("write capped operator manifest");
+    let trusted_keys = support::sign_manifest(&manifest);
+
+    let output = fixture
+        .command()
+        .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
+        .output()
+        .expect("run capped pass");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("reached its cost cap"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let events = fixture.run_events();
+    let finished = events
+        .iter()
+        .filter(|event| event["type"] == "run.finished")
+        .collect::<Vec<_>>();
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0]["payload"]["outcome"], "capped");
+    assert!(
+        finished[0]["payload"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("cost cap tripped"))
+    );
 }
 
 #[test]
@@ -491,6 +699,29 @@ fn sigterm_releases_finalizes_and_kills_the_process_group() {
     assert_eq!(
         fixture.trace().last().unwrap()["fact"]["outcome"],
         "timed-out"
+    );
+    let events = fixture.run_events();
+    let event_types = events
+        .iter()
+        .filter_map(|event| event["type"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        event_types,
+        [
+            "run.started",
+            "control.requested",
+            "control.applied",
+            "run.finished",
+        ]
+    );
+    assert_eq!(events[2]["payload"]["ok"], true);
+    assert_eq!(events[3]["payload"]["outcome"], "interrupted");
+    assert_eq!(
+        event_types
+            .iter()
+            .filter(|event_type| **event_type == "run.finished")
+            .count(),
+        1
     );
     let grandchild =
         fs::read_to_string(fixture.state.join("grandchild.pid")).expect("read grandchild pid");
