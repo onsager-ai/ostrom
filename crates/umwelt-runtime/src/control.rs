@@ -137,7 +137,7 @@ pub enum ProcessExit {
     Abnormal,
 }
 
-/// A malformed request or failure to record its events.
+/// A refused or malformed request, or a failure to record its events.
 #[derive(Debug, Error)]
 pub enum ControlError {
     /// The request is not valid for this runtime.
@@ -147,6 +147,9 @@ pub enum ControlError {
     WrongKind { expected: &'static str },
     #[error("a live process handle is required to interrupt a live run")]
     MissingLiveProcess,
+    /// The run has already emitted its terminal event, so its log is closed.
+    #[error("run has already emitted its terminal event")]
+    NotLive,
     #[error(transparent)]
     Sink(#[from] SinkFault),
 }
@@ -234,6 +237,12 @@ impl<R: SessionResumer> RunControl<R> {
         C: Clock,
         F: FnOnce(Duration) -> Result<(), ControlError>,
     {
+        // A non-live run may still have an open log and can carry a not-live
+        // event answer. Once terminal has been emitted, every consumer has
+        // stopped at it, so the refusal is synchronous and appends nothing.
+        if self.terminal_emitted {
+            return Err(ControlError::NotLive);
+        }
         validate_request(&request)?;
         if request.kind != ControlKind::Interrupt {
             return Err(ControlError::WrongKind {
@@ -272,6 +281,11 @@ impl<R: SessionResumer> RunControl<R> {
         request: ControlRequestedPayload,
         sink: &impl Sink,
     ) -> Result<(), ControlError> {
+        // Do not conflate process liveness with log liveness: pre-terminal
+        // not-live answers belong in the log, post-terminal refusals do not.
+        if self.terminal_emitted {
+            return Err(ControlError::NotLive);
+        }
         validate_request(&request)?;
         if request.kind != ControlKind::Steer {
             return Err(ControlError::WrongKind { expected: "steer" });
@@ -921,7 +935,7 @@ mod tests {
     }
 
     #[test]
-    fn steer_after_finished_is_not_live() {
+    fn controls_after_finished_return_not_live_without_appending() {
         let sink = MemorySink::default();
         let resumer = RecordingResumer::succeeding();
         let calls = resumer.clone();
@@ -934,20 +948,30 @@ mod tests {
         control
             .process_exited(ProcessExit::Normal, finished(RunOutcome::Completed), &sink)
             .expect("finish run");
+        let event_count = sink.events().len();
 
-        control
-            .steer(
-                request("control-1", ControlKind::Steer, Some("too late")),
+        let interrupt_error = control
+            .interrupt(
+                request("interrupt-1", ControlKind::Interrupt, None),
+                None,
+                &watchdog(),
                 &sink,
             )
-            .expect("not-live reply");
+            .expect_err("terminal interrupt must be refused synchronously");
+        let steer_error = control
+            .steer(
+                request("steer-1", ControlKind::Steer, Some("too late")),
+                &sink,
+            )
+            .expect_err("terminal steer must be refused synchronously");
 
+        assert!(matches!(interrupt_error, ControlError::NotLive));
+        assert!(matches!(steer_error, ControlError::NotLive));
         assert_eq!(calls.calls(), []);
         let events = sink.events();
+        assert_eq!(events.len(), event_count);
+        assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, RUN_FINISHED);
-        let applied: ControlAppliedPayload = payload(&events[2]);
-        assert!(!applied.ok);
-        assert_eq!(applied.reason.as_deref(), Some("not-live"));
     }
 
     #[test]

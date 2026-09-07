@@ -24,7 +24,7 @@ use ethogram::{
 };
 use umwelt_capture::{ChildStdoutSource, Normaliser, claude::ClaudeNormaliser};
 use umwelt_runtime::{
-    CapsWatchdog, Clock, FileSink, ResumeError, ResumedSession, RunCaps, RunControl,
+    CapsWatchdog, Clock, ControlError, FileSink, ResumeError, ResumedSession, RunCaps, RunControl,
     SessionResumer, Sink, Source, SystemClock, process_control, run_directory_name,
 };
 
@@ -190,16 +190,26 @@ fn run() -> Result<(), CaptureError> {
         .map_err(|error| CaptureError::new(format!("could not interrupt live run: {error}")))?;
     child.mark_reaped();
 
-    // A late request is still recorded and receives an explicit answer. It
-    // cannot produce a second run.finished event.
-    control
-        .interrupt(
-            control_request("capture-interrupt-2", ControlKind::Interrupt, None),
-            None,
-            &watchdog,
-            &sink,
-        )
-        .map_err(|error| CaptureError::new(format!("could not record late interrupt: {error}")))?;
+    // Once the terminal is durable, its log is closed. The late requester must
+    // record this synchronous refusal in its own durable place.
+    let late_error = match control.interrupt(
+        control_request("capture-interrupt-2", ControlKind::Interrupt, None),
+        None,
+        &watchdog,
+        &sink,
+    ) {
+        Ok(()) => {
+            return Err(CaptureError::new(
+                "late interrupt was accepted after run.finished; expected a synchronous not-live refusal",
+            ));
+        }
+        Err(error) => error,
+    };
+    if !matches!(late_error, ControlError::NotLive) {
+        return Err(CaptureError::new(format!(
+            "late interrupt returned {late_error}; expected a synchronous not-live refusal"
+        )));
+    }
 
     let mut observed_session_id = Some(session_id.clone());
     drain_stdout(
@@ -254,6 +264,7 @@ fn run() -> Result<(), CaptureError> {
     }
     println!("capture: {}", final_run_path.display());
     println!("queued steer: answered not-live at interrupt time; no resume was started");
+    println!("late interrupt: refused synchronously as not-live; no event was emitted");
     Ok(())
 }
 
@@ -424,12 +435,6 @@ fn verify_capture(events: &[Event]) -> Result<(), CaptureError> {
             "the live interrupt did not populate landedIn; refusing a capture without a proven mid-tool-call landing",
         ));
     }
-    let late = control_applied(events, "capture-interrupt-2")?;
-    if late.ok || late.reason.as_deref() != Some("not-live") {
-        return Err(CaptureError::new(
-            "the second interrupt did not produce control.applied { ok: false, reason: \"not-live\" }",
-        ));
-    }
     let steer = control_applied(events, "capture-steer-1")?;
     if steer.ok || steer.reason.as_deref() != Some("not-live") {
         return Err(CaptureError::new(
@@ -443,13 +448,16 @@ fn verify_capture(events: &[Event]) -> Result<(), CaptureError> {
         control_applied_index(events, "capture-interrupt-1")?,
         control_applied_index(events, "capture-steer-1")?,
         terminal_index,
-        control_requested_index(events, "capture-interrupt-2")?,
-        control_applied_index(events, "capture-interrupt-2")?,
     ];
     if !order.windows(2).all(|pair| pair[0] < pair[1]) {
         return Err(CaptureError::new(format!(
             "control events were not emitted in the required order: {order:?}"
         )));
+    }
+    if terminal_index + 1 != events.len() {
+        return Err(CaptureError::new(
+            "run.finished was not the final event in the capture",
+        ));
     }
     Ok(())
 }
@@ -670,7 +678,7 @@ mod tests {
 
     use ethogram::{
         AGENT_TEXT, AGENT_TOOL_RESULT, AGENT_TOOL_USE, AgentTextPayload, AgentToolResultPayload,
-        AgentToolUsePayload, RunFinishedPayload, RunOutcome, StampFields, stamp,
+        AgentToolUsePayload, StampFields, stamp,
     };
 
     use super::*;
@@ -743,19 +751,6 @@ mod tests {
         )
     }
 
-    fn finished() -> RunFinishedPayload {
-        RunFinishedPayload {
-            outcome: RunOutcome::Completed,
-            reason: None,
-            truncated: None,
-            cost_usd: None,
-            usage: None,
-            duration_ms: 1,
-            estimated: None,
-            extra: PayloadExtension::new(),
-        }
-    }
-
     #[test]
     fn argument_builder_uses_one_fresh_haiku_stream_session() {
         let arguments = claude_arguments("fixture prompt");
@@ -799,53 +794,5 @@ mod tests {
             .expect("observe tool use");
         assert!(trigger.poll(&watchdog));
         assert!(!trigger.poll(&watchdog));
-    }
-
-    #[test]
-    fn interrupt_after_terminal_is_answered_not_live() {
-        let root = tempfile::tempdir().expect("sink root");
-        let sink = FileSink::new(root.path());
-        let watchdog =
-            CapsWatchdog::new(RunCaps::default(), ManualClock::default()).expect("watchdog");
-        let mut control = RunControl::new("run-1", None, RunCaps::default(), NoResume);
-
-        control
-            .process_exited(umwelt_runtime::ProcessExit::Normal, finished(), &sink)
-            .expect("finish run");
-        control
-            .interrupt(
-                control_request("late-interrupt", ControlKind::Interrupt, None),
-                None,
-                &watchdog,
-                &sink,
-            )
-            .expect("answer late interrupt");
-
-        let events = sink.read_from("run-1", 0).expect("read capture events");
-        assert_eq!(
-            events
-                .iter()
-                .map(|event| event.event_type.as_str())
-                .collect::<Vec<_>>(),
-            [RUN_FINISHED, ethogram::CONTROL_REQUESTED, CONTROL_APPLIED]
-        );
-        let applied: ControlAppliedPayload =
-            serde_json::from_value(events[2].payload.clone()).expect("control.applied payload");
-        assert!(!applied.ok);
-        assert_eq!(applied.reason.as_deref(), Some("not-live"));
-
-        let reopened = FileSink::new(root.path());
-        assert_eq!(reopened.last_seq("run-1").expect("reopened sequence"), 3);
-        assert!(matches!(
-            reopened.append(
-                "run-1",
-                EventDraft {
-                    event_type: "test.late".to_owned(),
-                    payload: serde_json::json!({}),
-                    captured_at: None,
-                }
-            ),
-            Err(umwelt_runtime::SinkFault::Finished)
-        ));
     }
 }

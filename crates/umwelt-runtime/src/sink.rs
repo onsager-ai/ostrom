@@ -10,18 +10,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use chrono::{SecondsFormat, Utc};
-use ethogram::{
-    CONTROL_APPLIED, CONTROL_REQUESTED, Event, EventDraft, RUN_FINISHED, StampFields, parse_event,
-    serialise_event, stamp,
-};
+use ethogram::{Event, EventDraft, RUN_FINISHED, StampFields, parse_event, serialise_event, stamp};
 
 const EVENTS_FILE: &str = "events.jsonl";
 
 /// A failure to store or forward an event.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SinkFault {
-    /// The run has already emitted `run.finished` and this is not a local
-    /// post-terminal control event.
+    /// The run has already emitted `run.finished`.
     Finished,
     /// A forwarded event skips a sequence number.
     Gap { expected: u64, got: u64 },
@@ -93,10 +89,6 @@ impl std::error::Error for SourceFault {}
 /// Append-only storage for stamped ethogram events.
 pub trait Sink: Send + Sync {
     /// Append one draft to a run, assigning its next `seq` and the sink's `ts`.
-    ///
-    /// After `run.finished`, only locally produced `control.requested` and
-    /// `control.applied` events may be appended. This lets a late control
-    /// receive its required `not-live` answer without reopening the run.
     fn append(&self, run: &str, draft: EventDraft) -> Result<Event, SinkFault>;
 
     /// Forward an already-stamped event, preserving `seq` and `ts` exactly.
@@ -196,7 +188,7 @@ impl Sink for FileSink {
     fn append(&self, run: &str, draft: EventDraft) -> Result<Event, SinkFault> {
         let mut states = self.lock()?;
         let state = self.state(&mut states, run)?;
-        if state.finished && !is_post_terminal_control(&draft.event_type) {
+        if state.finished {
             return Err(SinkFault::Finished);
         }
 
@@ -293,10 +285,6 @@ impl RunState {
     }
 }
 
-fn is_post_terminal_control(event_type: &str) -> bool {
-    matches!(event_type, CONTROL_REQUESTED | CONTROL_APPLIED)
-}
-
 fn read_state(path: &Path, run: &str) -> Result<RunState, SinkFault> {
     let file = match File::open(path) {
         Ok(file) => file,
@@ -356,7 +344,7 @@ fn read_state(path: &Path, run: &str) -> Result<RunState, SinkFault> {
                 message: format!("event sequence must be {expected}; received {}", event.seq),
             });
         }
-        if state.finished && !is_post_terminal_control(&event.event_type) {
+        if state.finished {
             return Err(SinkFault::Malformed {
                 line,
                 message: format!("event follows {RUN_FINISHED}"),
@@ -432,7 +420,7 @@ fn read_events(path: &Path, run: &str, after: u64) -> Result<Vec<Event>, SourceF
                 got: event.seq,
             });
         }
-        if finished && !is_post_terminal_control(&event.event_type) {
+        if finished {
             return Err(SourceFault::Malformed {
                 line,
                 message: format!("event follows {RUN_FINISHED}"),
@@ -536,8 +524,7 @@ pub mod conformance {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use ethogram::{
-        CONTROL_APPLIED, CONTROL_REQUESTED, EVENT_SCHEMA_VERSION, Event, EventDraft, parse_event,
-        serialise_event,
+        CONTROL_REQUESTED, EVENT_SCHEMA_VERSION, Event, EventDraft, parse_event, serialise_event,
     };
     use serde_json::json;
 
@@ -563,9 +550,9 @@ pub mod conformance {
         forward_is_byte_identical(&new_sink, &stored_event_bytes, &run(&namespace, "bytes"));
         forward_rejects_gap_and_duplicate(&new_sink, &run(&namespace, "sequence-errors"));
         append_rejects_finished(&new_sink, &run(&namespace, "append-finished"));
-        append_answers_post_terminal_control(
+        append_rejects_control_after_finished(
             &new_sink,
-            &run(&namespace, "append-post-terminal-control"),
+            &run(&namespace, "append-finished-control"),
         );
         forward_rejects_finished(&new_sink, &run(&namespace, "forward-finished"));
         append_and_forward_do_not_race(
@@ -706,7 +693,7 @@ pub mod conformance {
         assert_eq!(sink.last_seq(run).expect("finished sequence"), 1);
     }
 
-    fn append_answers_post_terminal_control<S, F>(new_sink: &F, run: &str)
+    fn append_rejects_control_after_finished<S, F>(new_sink: &F, run: &str)
     where
         S: Sink,
         F: Fn() -> S,
@@ -714,22 +701,10 @@ pub mod conformance {
         let sink = new_sink();
         sink.append(run, draft(RUN_FINISHED)).expect("finish run");
         assert_eq!(
-            sink.append(run, draft(CONTROL_REQUESTED))
-                .expect("append late request")
-                .seq,
-            2
-        );
-        assert_eq!(
-            sink.append(run, draft(CONTROL_APPLIED))
-                .expect("append not-live answer")
-                .seq,
-            3
-        );
-        assert_eq!(
-            sink.append(run, draft("test.still-late")),
+            sink.append(run, draft(CONTROL_REQUESTED)),
             Err(SinkFault::Finished)
         );
-        assert_eq!(sink.last_seq(run).expect("post-control sequence"), 3);
+        assert_eq!(sink.last_seq(run).expect("finished sequence"), 1);
     }
 
     fn forward_rejects_finished<S, F>(new_sink: &F, run: &str)
