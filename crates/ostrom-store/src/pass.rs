@@ -36,6 +36,9 @@ pub const PASS_KILL_GRACE_MS: u64 = 5_000;
 // EX_CONFIG: the pass invocation is valid, but the local arm configuration
 // explicitly refuses to execute it.
 const DISARMED_EXIT_CODE: i32 = 78;
+// EX_TEMPFAIL: the pass is held at its daily spend cap and can run once
+// the ceiling resets or is raised.
+const BUDGET_HELD_EXIT_CODE: i32 = 75;
 const DEFAULT_DAILY_CAP_USD: f64 = 50.0;
 const DEFAULT_LEASE_TTL_SECONDS: u64 = 3_600;
 const PASS_TERMINATION_GRACE: Duration = Duration::from_millis(PASS_KILL_GRACE_MS);
@@ -146,9 +149,11 @@ pub enum PassError {
         code: i32,
     },
     #[error("ostrom {0} pass: another pass already holds {0}-pass.lease; skipping")]
-    Held(&'static str),
+    LeaseHeld(&'static str),
     #[error("ostrom {0} pass: loop is disarmed")]
     Disarmed(&'static str),
+    #[error("ostrom {0} pass: daily spend cap reached; held until the ceiling resets or is raised")]
+    BudgetHeld(&'static str),
 }
 
 impl PassError {
@@ -156,8 +161,9 @@ impl PassError {
     pub const fn exit_code(&self) -> i32 {
         match self {
             Self::Failed { code, .. } => *code,
-            Self::Held(_) => 0,
+            Self::LeaseHeld(_) => 0,
             Self::Disarmed(_) => DISARMED_EXIT_CODE,
+            Self::BudgetHeld(_) => BUDGET_HELD_EXIT_CODE,
         }
     }
 
@@ -445,7 +451,7 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
                         1,
                     )
                 })?;
-            return Err(PassError::Held(request.role.name()));
+            return Err(PassError::LeaseHeld(request.role.name()));
         }
         Err(error) => {
             return Err(PassError::failed(
@@ -565,7 +571,7 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
                 )
             })?;
         guard.finish()?;
-        return Ok(());
+        return Err(PassError::BudgetHeld(request.role.name()));
     }
     if request.role == PassRole::Builder {
         let previous_hash = state.dispatchability_hash.clone();
@@ -1318,15 +1324,20 @@ mod terminal_outcome_tests {
 
 #[cfg(test)]
 mod exit_code_tests {
-    use super::{DISARMED_EXIT_CODE, PassError};
+    use super::{BUDGET_HELD_EXIT_CODE, DISARMED_EXIT_CODE, PassError};
 
     #[test]
-    fn disarmed_is_a_distinct_refusal_and_lease_held_remains_successful() {
+    fn budget_held_disarmed_and_lease_held_have_distinct_exit_codes() {
+        assert_eq!(BUDGET_HELD_EXIT_CODE, 75);
         assert_eq!(DISARMED_EXIT_CODE, 78);
+        assert_eq!(
+            PassError::BudgetHeld("builder").exit_code(),
+            BUDGET_HELD_EXIT_CODE
+        );
         assert_eq!(
             PassError::Disarmed("builder").exit_code(),
             DISARMED_EXIT_CODE
         );
-        assert_eq!(PassError::Held("builder").exit_code(), 0);
+        assert_eq!(PassError::LeaseHeld("builder").exit_code(), 0);
     }
 }

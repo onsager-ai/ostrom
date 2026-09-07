@@ -1193,7 +1193,7 @@ fn a_daily_budget_hold_reaches_the_live_event_descriptor() {
         .args(["--events-fd", "1"])
         .output()
         .expect("run budget hold with live events");
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.status.code(), Some(75));
     assert_eq!(output.stdout, fixture.run_event_bytes());
     assert_eq!(
         fixture
@@ -1210,10 +1210,10 @@ fn a_daily_budget_hold_reaches_the_live_event_descriptor() {
 
 #[test]
 fn daily_cap_uses_only_valid_costs_on_the_current_day() {
-    for (cap, spawned, outcome, reason) in [
-        ("8", true, "completed", None),
-        ("7", false, "held", Some("daily-cap")),
-        ("not-a-number", true, "completed", None),
+    for (cap, code, spawned, outcome, reason) in [
+        ("8", 0, true, "completed", None),
+        ("7", 75, false, "held", Some("daily-cap")),
+        ("not-a-number", 0, true, "completed", None),
     ] {
         let fixture = Fixture::new(concat!(
             "touch \"$OSTROM_TEST_MARKER\"\n",
@@ -1251,14 +1251,16 @@ fn daily_cap_uses_only_valid_costs_on_the_current_day() {
         .collect::<String>();
         fs::write(fixture.state.join("sprint.jsonl"), trace).expect("write spend trace");
         let marker = fixture.root.path().join("spawned");
-        assert!(
+        assert_eq!(
             fixture
                 .command()
                 .env("MANDATE_DAILY_CAP_USD", cap)
                 .env("OSTROM_TEST_MARKER", &marker)
                 .status()
                 .expect("run spend case")
-                .success()
+                .code(),
+            Some(code),
+            "cap {cap}"
         );
         assert_eq!(marker.exists(), spawned, "cap {cap}");
         let terminal = fixture.trace().pop().expect("spend terminal");
@@ -1270,6 +1272,18 @@ fn daily_cap_uses_only_valid_costs_on_the_current_day() {
             .filter(|event| event["type"] == "run.finished")
             .collect::<Vec<_>>();
         assert_eq!(finished.len(), 1);
+        // FileSink stores without payload validation at this pin, so assert
+        // ethogram validation as well as sink acceptance below. The outcome
+        // string alone would miss an incompatible pin.
+        ethogram::validate("run.finished", &finished[0]["payload"])
+            .expect("terminal event must pass ethogram payload validation");
+        let sink = umwelt_runtime::FileSink::new(fixture.root.path().join("validated-runs"));
+        for event in &events {
+            let event: ethogram::Event =
+                serde_json::from_value(event.clone()).expect("valid event envelope");
+            umwelt_runtime::Sink::forward(&sink, event)
+                .expect("emitted event must be accepted by the production sink");
+        }
         assert_eq!(
             finished[0]["payload"]["outcome"],
             if spawned { "completed" } else { "blocked" }
@@ -1277,6 +1291,17 @@ fn daily_cap_uses_only_valid_costs_on_the_current_day() {
         assert_eq!(
             finished[0]["payload"]["reason"].as_str(),
             if spawned { None } else { Some("budget") }
+        );
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            if spawned {
+                vec!["run.started", "run.finished"]
+            } else {
+                vec!["run.started", "decision.requested", "run.finished"]
+            }
         );
         assert!(
             events
