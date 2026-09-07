@@ -1,0 +1,16 @@
+{"type":"thread.started","thread_id":"01a07a65-16cd-76e1-9357-9e7116699e90"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"the agent reported a short step of routine progre"}}
+{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc 'sleep 3 && echo slept-ok'","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc 'sleep 3 && echo slept-ok'","aggregated_output":"slept-ok\n","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"the agent reported a short step of routine progress and then continue"}}
+{"type":"item.started","item":{"id":"item_3","type":"command_execution","command":"/bin/zsh -lc 'cat /nonexistent-file-xyz'","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_3","type":"command_execution","command":"/bin/zsh -lc 'cat /nonexistent-file-xyz'","aggregated_output":"cat: /nonexistent-file-xyz: No such file or directory\n","exit_code":1,"status":"failed"}}
+{"type":"item.completed","item":{"id":"item_4","type":"agent_message","text":"the agent reported a short step of routine progress and then co"}}
+{"type":"item.started","item":{"id":"item_5","type":"file_change","changes":[{"path":"/workspace/codex-main/ws/notes.txt","kind":"add"}],"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_5","type":"file_change","changes":[{"path":"/workspace/codex-main/ws/notes.txt","kind":"add"}],"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_6","type":"agent_message","text":"the agent reported a short step of routine progress and "}}
+{"type":"item.started","item":{"id":"item_7","type":"command_execution","command":"/bin/zsh -lc \"printf 'done\\\\n'\"","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_7","type":"command_execution","command":"/bin/zsh -lc \"printf 'done\\\\n'\"","aggregated_output":"done\n","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_8","type":"agent_message","text":"the agent reporte"}}
+{"type":"turn.completed","usage":{"input_tokens":78281,"cached_input_tokens":68736,"cache_write_input_tokens":0,"output_tokens":460,"reasoning_output_tokens":0}}

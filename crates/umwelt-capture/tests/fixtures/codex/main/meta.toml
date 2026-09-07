@@ -1,0 +1,77 @@
+# Capture provenance. The module header of a normaliser is the authority for
+# what it was verified against; this file is the authority for what this
+# capture IS. Recorded per onsager-ai/umwelt#20.
+
+harness = "codex"
+cli_version = "codex-cli 0.149.1"
+captured_at = "2026-09-07"
+model = "codex default (not pinned; -m was deliberately NOT passed)"
+command = "codex exec --json -C <ws> -s workspace-write -o last-message.txt -"
+prompt_source = "stdin"
+events = 16
+
+exercises = [
+  "agent_message (5, each item.completed with NO item.started)",
+  "command_execution succeeding (exit_code 0, status completed)",
+  "command_execution failing (exit_code 1, status failed)",
+  "command_execution long enough to separate start from completion (sleep 3)",
+  "file_change (status completed, exit_code null)",
+  "turn.started / turn.completed with a five-field usage block",
+]
+
+not_exercised = [
+  "the top-level `error` event shape",
+  "--output-schema",
+  "any sub-agent concept (codex appears to have none; absence is itself an answer)",
+  "multiple turns (one turn.completed only)",
+]
+
+[scrub]
+# ethogram #6: narration replaced by placeholder of the SAME length, structure
+# and ids real. Verified: text lengths byte-identical before and after.
+narration = "replaced, exact length preserved"
+ids = "real (thread_id, item_N)"
+paths = "absolute workspace paths rewritten under /workspace"
+
+[notes]
+# The headline finding this capture was run to settle.
+item_started = "EXISTS for command_execution and file_change, and shares item.id with its item.completed. It does NOT exist for agent_message. So the in-flight window is real for tool-shaped items only."
+chreode_normaliser = "produces ZERO agent.text from this capture: it matches assistant_message/message, codex emits agent_message. See onsager-ai/chreode#474. chreode's normalised output is NOT a golden output for this capture."
+
+[chreode_output]
+# There is deliberately NO chreode-output file for the codex case, unlike the
+# two claude cases. This section records WHY one is absent, so its absence
+# reads as a decision rather than an oversight. Nothing here names a file in
+# this directory -- do not go looking for one.
+present = false
+withheld_because = "chreode's codex normaliser is known broken; its output over this capture is wrong in four separate ways and must not enter a conformance corpus."
+why_broken = """
+It asserts synthesised toolUseIds (codex-cmd-1, codex-cmd-2, codex-cmd-4,
+codex-edit-3) where the real ids in this very capture are item_1, item_3,
+item_5, item_7. It carries two spurious agent.warning frames for turn.started.
+It manufactures four tool_use/tool_result pairs from completed items alone,
+discarding the real item.started events. And it emits ZERO agent.text, because
+chreode matches assistant_message/message while codex emits agent_message.
+
+Adopting it would bake into a conformance corpus exactly the guesses this
+capture was run to retire. Per ethogram#4, a fixture that guesses is withdrawn
+rather than corrected. Blocked on chreode#474.
+"""
+
+[notes.accumulation]
+# Flagged by umwelt-bd: the `not_exercised` list above turned out to be
+# load-bearing rather than bookkeeping.
+why_multiple_turns_matters = """
+ethogram's accumulation ruling (#6, 2026-09-07) states its own precondition:
+it assumes every harness reports SESSION-CUMULATIVE cost on its result frames,
+and is "invalid for a harness that reports per-frame increments, whose
+normaliser must accumulate before emitting so the wire stays cumulative."
+
+This capture contains exactly ONE turn.started and ONE turn.completed. With a
+single turn, a cumulative total and a per-turn increment are numerically
+identical, so this capture CANNOT distinguish them. A codex normaliser
+therefore cannot yet know whether it must accumulate before emitting.
+
+Settling it needs a capture with at least two turns. Recorded as a known gap
+rather than resolved by assumption.
+"""
