@@ -6,14 +6,20 @@ use std::{
     process::{Command, Output},
 };
 
-use ostrom_core::{GateConfig, GateProject, GateSelector, PolicyManifest, sha256_hex};
+use ethogram::DecisionKind;
+use ostrom_core::{
+    DecisionOption, Dossier, GateCondition, GateConfig, GateProject, GateSelector, PolicyManifest,
+    sha256_hex,
+};
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::{
-    OstromPaths, policy_manifest_digest, read_commit_checks, set_private_file_mode,
+    OstromPaths, policy_manifest_digest, read_commit_checks,
+    run_events::{DecisionRequest, GATE_RUN_ID, RunEventError, emit_decision_requests},
+    set_private_file_mode,
     sweep::merge_yaml,
 };
 
@@ -41,6 +47,8 @@ pub enum GateError {
     InvalidTarget,
     #[error("mandate gate: could not serialize verdict")]
     Serialize,
+    #[error("mandate gate: could not raise decision: {0}")]
+    Decision(#[from] RunEventError),
 }
 
 impl GateError {
@@ -49,6 +57,7 @@ impl GateError {
         match self {
             Self::InvalidTarget => 64,
             Self::Serialize => 2,
+            Self::Decision(_) => 3,
         }
     }
 }
@@ -153,6 +162,13 @@ pub fn run_gate(options: &GateOptions) -> Result<GateOutput, GateError> {
     let verdict = aggregate(&conditions);
     let gate_path = options.paths.state.join("gate.jsonl");
     let judgment_digest = judgment_digest(target.full, verdict, &conditions)?;
+    emit_gate_decision(
+        options,
+        verdict,
+        &acquisition.head_sha,
+        &judgment_digest,
+        &conditions,
+    )?;
     let already_judged = already_judged(
         &gate_path,
         target.full,
@@ -1616,6 +1632,96 @@ fn aggregate(conditions: &[Value]) -> &'static str {
     }
 }
 
+fn emit_gate_decision(
+    options: &GateOptions,
+    verdict: &str,
+    head_sha: &str,
+    digest: &str,
+    conditions: &[Value],
+) -> Result<(), GateError> {
+    if verdict != "inconclusive" {
+        return Ok(());
+    }
+    // Convert only at the decision boundary. Reserializing typed conditions for
+    // gate.jsonl or judgment_digest would change the stored JSON key order.
+    let conditions: Vec<GateCondition> =
+        serde_json::from_value(Value::Array(conditions.to_vec())).map_err(RunEventError::from)?;
+    let request = gate_decision_request(&options.target, head_sha, digest, &conditions);
+    emit_decision_requests(&options.paths, &options.timestamp, GATE_RUN_ID, &[request])?;
+    Ok(())
+}
+
+fn gate_decision_request(
+    target: &str,
+    head_sha: &str,
+    digest: &str,
+    conditions: &[GateCondition],
+) -> DecisionRequest {
+    let mut inconclusive = conditions
+        .iter()
+        .filter(|condition| condition.result == "inconclusive")
+        .collect::<Vec<_>>();
+    // The judgment digest treats conditions as a set; its decision must too.
+    inconclusive.sort_by(|left, right| left.name.cmp(&right.name));
+    let names = inconclusive
+        .iter()
+        .map(|condition| condition.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut options = inconclusive
+        .iter()
+        .map(|condition| DecisionOption {
+            id: format!("excuse:{}", condition.name),
+            label: format!("Excuse {} for this PR head", condition.name),
+        })
+        .collect::<Vec<_>>();
+    options.extend([
+        DecisionOption {
+            id: "wait".to_owned(),
+            label: "Wait for observable evidence and rerun the gate".to_owned(),
+        },
+        DecisionOption {
+            id: "fail".to_owned(),
+            label: "Fail this gate judgment".to_owned(),
+        },
+    ]);
+    let identity = format!("gate_inconclusive\0{target}\0{head_sha}\0{digest}");
+    DecisionRequest {
+        decision_id: format!("gate_inconclusive-{}", sha256_hex(identity.as_bytes())),
+        kind: DecisionKind::GateInconclusive,
+        dossier: Dossier {
+            question: format!(
+                "May {target} proceed with these inconclusive gate conditions: {names}?"
+            ),
+            // Keep one entry per condition so a large detail cannot hide the
+            // next condition. The shared wire edge excerpts each entry, marks
+            // truncation, and validates before the sink accepts the event.
+            options_ruled_out: inconclusive
+                .iter()
+                .map(|condition| {
+                    format!(
+                        "Treat {} as observed despite its inconclusive evidence: {}",
+                        condition.name, condition.detail
+                    )
+                })
+                .collect(),
+            recommended_action: format!(
+                "Wait for observable evidence for {names} and rerun the gate, or explicitly choose a condition to excuse or fail."
+            ),
+            blast_radius: format!(
+                "{target}, head {} only; no standing permission or change to gate conditions.",
+                if head_sha.is_empty() {
+                    "unknown"
+                } else {
+                    head_sha
+                }
+            ),
+        },
+        options,
+        subject: target.to_owned(),
+    }
+}
+
 fn judgment_digest(target: &str, verdict: &str, conditions: &[Value]) -> Result<String, GateError> {
     let mut conditions = conditions.to_vec();
     conditions.sort_by(|left, right| {
@@ -1746,6 +1852,9 @@ const fn verdict_exit(verdict: &str) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    use ethogram::DecisionRequestedPayload;
+    use umwelt_runtime::{FileSink, Source};
+
     use super::*;
 
     #[cfg(unix)]
@@ -1978,6 +2087,235 @@ projects:
             judgment_digest("placeholder-org/alpha#7", "inconclusive", &conditions).unwrap(),
             "sha256:723707dca3141809259adbe78428edc876a9f418ec4c31ada4f3816cb3162fcd"
         );
+    }
+
+    fn decision_fixture() -> (tempfile::TempDir, GateOptions) {
+        let root = tempfile::tempdir().expect("gate decision fixture");
+        let options = GateOptions {
+            paths: OstromPaths {
+                config: root.path().to_path_buf(),
+                state: root.path().to_path_buf(),
+            },
+            working_directory: root.path().to_path_buf(),
+            target: "placeholder-org/alpha#7".to_owned(),
+            timestamp: "2030-01-02T03:04:05Z".to_owned(),
+        };
+        (root, options)
+    }
+
+    fn emit_fixture_decision(options: &GateOptions, head: &str, conditions: &[Value]) {
+        let verdict = aggregate(conditions);
+        let digest = judgment_digest(&options.target, verdict, conditions).unwrap();
+        emit_gate_decision(options, verdict, head, &digest, conditions).unwrap();
+    }
+
+    fn gate_decisions(paths: &OstromPaths) -> Vec<ethogram::Event> {
+        FileSink::new(paths.runs_dir())
+            .read_from(GATE_RUN_ID, 0)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.event_type == ethogram::DECISION_REQUESTED)
+            .collect()
+    }
+
+    #[test]
+    fn inconclusive_gate_emits_one_typed_decision_and_one_fact() {
+        let (_root, options) = decision_fixture();
+        let conditions = decision_conditions();
+        let stored_bytes = serde_json::to_vec(&conditions).unwrap();
+        emit_fixture_decision(&options, "aaaaaaaaaaaaaaaa", &conditions);
+
+        let events = gate_decisions(&options.paths);
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        ethogram::validate(&event.event_type, &event.payload).unwrap();
+        let payload: DecisionRequestedPayload =
+            serde_json::from_value(event.payload.clone()).unwrap();
+        assert_eq!(payload.kind, DecisionKind::GateInconclusive);
+        assert_eq!(payload.subject.as_deref(), Some(options.target.as_str()));
+        assert_eq!(
+            payload
+                .options
+                .iter()
+                .map(|option| option.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "excuse:required_checks",
+                "excuse:review_threads",
+                "wait",
+                "fail"
+            ]
+        );
+        assert!(
+            payload
+                .dossier
+                .question
+                .contains("required_checks, review_threads")
+        );
+        assert!(
+            payload.dossier.options_ruled_out[0].contains("required check results are unavailable")
+        );
+        assert!(payload.dossier.options_ruled_out[1].contains("review thread query failed"));
+        assert_eq!(payload.dossier.options_ruled_out.len(), 2);
+        assert!(
+            !event
+                .payload
+                .to_string()
+                .contains("Principal approved this artifact.")
+        );
+        assert!(payload.on_timeout.is_none());
+        assert!(event.payload.get("onTimeout").is_none());
+        assert!(event.payload.get("expiresAt").is_none());
+        assert!(event.payload["dossier"].get("truncated").is_none());
+
+        let facts = crate::read_trace(&options.paths.trace_file()).unwrap().rows;
+        assert_eq!(facts.len(), 1);
+        let fact = facts[0].as_ref().unwrap();
+        assert_eq!(fact.kind, "decision-requested");
+        assert_eq!(
+            Value::Object(fact.fact.clone()),
+            json!({
+                "decision_id": payload.decision_id,
+                "kind": "gate_inconclusive",
+                "subject": options.target,
+            })
+        );
+        ostrom_core::EventPayload::new(fact.fact.clone()).unwrap();
+        let trace: Value =
+            serde_json::from_str(&fs::read_to_string(options.paths.trace_file()).unwrap()).unwrap();
+        assert_eq!(trace["narration"], json!({}));
+        assert_eq!(serde_json::to_vec(&conditions).unwrap(), stored_bytes);
+        assert_eq!(
+            judgment_digest(&options.target, "inconclusive", &conditions).unwrap(),
+            "sha256:723707dca3141809259adbe78428edc876a9f418ec4c31ada4f3816cb3162fcd"
+        );
+    }
+
+    #[test]
+    fn gate_decision_retries_repair_a_missing_fact_without_duplicate_events() {
+        let (_root, options) = decision_fixture();
+        let mut conditions = decision_conditions();
+        emit_fixture_decision(&options, "aaaaaaaaaaaaaaaa", &conditions);
+        fs::remove_file(options.paths.trace_file()).unwrap();
+        conditions.reverse();
+        emit_fixture_decision(&options, "aaaaaaaaaaaaaaaa", &conditions);
+        emit_fixture_decision(&options, "aaaaaaaaaaaaaaaa", &conditions);
+        assert_eq!(gate_decisions(&options.paths).len(), 1);
+        assert_eq!(
+            crate::read_trace(&options.paths.trace_file())
+                .unwrap()
+                .rows
+                .len(),
+            1
+        );
+
+        emit_fixture_decision(&options, "bbbbbbbbbbbbbbbb", &conditions);
+        conditions
+            .iter_mut()
+            .find(|c| c["name"] == "required_checks")
+            .unwrap()["detail"] = json!({"reason": "check results changed"});
+        emit_fixture_decision(&options, "bbbbbbbbbbbbbbbb", &conditions);
+        let ids = gate_decisions(&options.paths)
+            .into_iter()
+            .map(|event| event.payload["decisionId"].as_str().unwrap().to_owned())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(ids.len(), 3);
+    }
+
+    #[test]
+    fn pass_and_fail_gates_emit_no_decision_even_with_an_inconclusive_condition() {
+        for failing in [false, true] {
+            let (_root, options) = decision_fixture();
+            let mut conditions = decision_conditions();
+            if failing {
+                conditions[3]["result"] = json!("fail");
+                assert_eq!(aggregate(&conditions), "fail");
+            } else {
+                conditions.retain(|c| c["result"] != "inconclusive");
+                assert_eq!(aggregate(&conditions), "pass");
+            }
+            emit_fixture_decision(&options, "aaaaaaaaaaaaaaaa", &conditions);
+            assert!(!options.paths.runs_dir().exists());
+            assert!(!options.paths.trace_file().exists());
+        }
+    }
+
+    #[test]
+    fn all_gate_conditions_with_oversized_details_fit_ethogram_capture_bounds() {
+        // Exercise both four-byte scalars and characters that JSON must escape.
+        // All six conditions must survive capture, including their option IDs.
+        for character in ["😀", "\u{0000}"] {
+            let (_root, options) = decision_fixture();
+            let conditions =
+                unavailable_conditions(&character.repeat(ethogram::MAX_TEXT_SCALARS + 1));
+            emit_fixture_decision(&options, "", &conditions);
+            let events = gate_decisions(&options.paths);
+            assert_eq!(events.len(), 1);
+            let event = &events[0];
+            ethogram::validate(&event.event_type, &event.payload).unwrap();
+            assert!(
+                serde_json::to_vec(&event.payload).unwrap().len() <= ethogram::MAX_PAYLOAD_BYTES
+            );
+            let payload: DecisionRequestedPayload =
+                serde_json::from_value(event.payload.clone()).unwrap();
+            assert_eq!(payload.dossier.truncated, Some(true));
+            assert_eq!(payload.dossier.options_ruled_out.len(), 6);
+            assert_eq!(payload.options.len(), 8);
+            for detail in &payload.dossier.options_ruled_out {
+                assert!(detail.chars().count() <= ethogram::MAX_EXCERPT_SCALARS);
+            }
+            assert!(event.payload.get("onTimeout").is_none());
+        }
+    }
+
+    #[test]
+    fn invalid_typed_conditions_and_sink_refusals_are_execution_failures() {
+        let (_root, options) = decision_fixture();
+        let mut conditions = decision_conditions();
+        conditions[0].as_object_mut().unwrap().remove("tier");
+        let error =
+            emit_gate_decision(&options, "inconclusive", "", "digest", &conditions).unwrap_err();
+        assert!(matches!(
+            error,
+            GateError::Decision(RunEventError::Payload(_))
+        ));
+        assert_eq!(error.exit_code(), 3);
+        assert!(!options.paths.runs_dir().exists());
+
+        fs::write(options.paths.runs_dir(), "blocked sink").unwrap();
+        let error = emit_gate_decision(
+            &options,
+            "inconclusive",
+            "",
+            "digest",
+            &decision_conditions(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, GateError::Decision(RunEventError::Sink(_))));
+        assert_eq!(error.exit_code(), 3);
+        assert!(!options.paths.trace_file().exists());
+    }
+
+    #[test]
+    fn merge_prompt_stops_after_the_gate_raises_its_decision() {
+        let prompt = include_str!("../assets/prompts/merge.md");
+        let block = prompt
+            .split("- **Inconclusive (exit 2)**")
+            .nth(1)
+            .unwrap()
+            .split("Any other exit code")
+            .next()
+            .unwrap();
+        assert!(block.contains("the gate has already raised"));
+        assert!(block.contains("gate_inconclusive"));
+        assert!(block.contains("Stop and leave that"));
+        assert!(block.contains("Do not write a second dossier in your reply or"));
+        assert!(block.contains("post one as a PR comment. Do not merge."));
+        assert!(!block.contains("```text"));
+        assert!(
+            !prompt.contains("Question: Should the principal wait for an observable gate result")
+        );
+        assert!(!prompt.contains("Options ruled out: The gatekeeper inferring missing facts"));
     }
 
     #[test]
