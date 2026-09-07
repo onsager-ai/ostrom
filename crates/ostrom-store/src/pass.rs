@@ -28,7 +28,8 @@ use umwelt_runtime::{
 use crate::{
     Clock, LeaseActionError, OstromPaths, OwnedLease, PassState, RunEventError, RunEventGuard,
     RunEventStart, SignalFlags, TraceAppend, append_trace, environment, generated_run_id,
-    read_lease, read_pass_state, read_trace, selection::dispatchability_snapshot, write_pass_state,
+    pass_control, read_lease, read_pass_state, read_trace, selection::dispatchability_snapshot,
+    write_pass_state,
 };
 
 pub const MAX_TURNS: &str = "200";
@@ -135,6 +136,7 @@ pub struct PassRequest {
     pub signals: SignalFlags,
     pub supervisor_pid: Option<u32>,
     pub events_fd: Option<u32>,
+    pub control_fd: Option<u32>,
     pub facts_only: bool,
     pub caps: RunCaps,
     pub clock: Clock,
@@ -758,6 +760,7 @@ fn wait_for_child(
     let mut capture_open = true;
     let mut normaliser_finished = false;
     let mut status = None;
+    let control_input = request.control_fd.map(pass_control::read_control);
 
     loop {
         if capture_open {
@@ -795,6 +798,58 @@ fn wait_for_child(
             normaliser_finished = true;
             if let Some(trip) = append_observed(guard, watchdog, drafts)? {
                 return Err(apply_cap_trip(request, guard, child, trip));
+            }
+        }
+
+        if let Some(input) = &control_input
+            && let Ok(input) = input.try_recv()
+        {
+            match input {
+                Ok(input) if input.kind == ControlKind::Interrupt => {
+                    let control = guard.control.as_mut().expect("spawned pass has RunControl");
+                    guard
+                        .events
+                        .interrupt_from_descriptor(control, input, child, watchdog)
+                        .map_err(|error| {
+                            PassError::failed(
+                                guard.role,
+                                format!("could not apply descriptor interrupt: {error}"),
+                                1,
+                            )
+                        })?;
+                    guard.outcome = Some("interrupted".to_owned());
+                    return Err(PassError::failed(
+                        guard.role,
+                        "interrupted by control descriptor",
+                        130,
+                    ));
+                }
+                Ok(input) => {
+                    // NoSteer cannot resume this pass. Refuse immediately; the
+                    // runtime's steer method would queue until process exit.
+                    for draft in pass_control::unsupported(&input) {
+                        guard.events.append(draft).map_err(|error| {
+                            PassError::failed(
+                                guard.role,
+                                format!("could not record control refusal: {error}"),
+                                1,
+                            )
+                        })?;
+                    }
+                }
+                Err(detail) => {
+                    eprintln!("ostrom control: {detail}");
+                    guard
+                        .events
+                        .append(pass_control::refuse_input(guard.events.run_id(), &detail))
+                        .map_err(|error| {
+                            PassError::failed(
+                                guard.role,
+                                format!("could not record control refusal: {error}"),
+                                1,
+                            )
+                        })?;
+                }
             }
         }
 

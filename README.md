@@ -312,6 +312,12 @@ stored for one run and exits. `ostrom events <run-id> --after <seq>` replays
 events strictly after that sequence, then follows until the run finishes or
 the runtime reaches its reconnect boundary.
 
+A spawning supervisor can send interrupt requests to a pass on an inherited
+`--control-fd` / `OSTROM_CONTROL_FD` descriptor and read replies on the events
+stream. Steering is explicitly refused as unsupported. The descriptor is not a
+socket or network endpoint; see [the pass control contract](docs/pass-control.md)
+for the wire format, ordering, and supervisor-owned authorisation.
+
 The lease and trace are machine-local runtime state. Like the real roster,
 queue, and read cursors, they never belong in this repository.
 

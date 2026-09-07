@@ -18,6 +18,7 @@ mod leaves;
 mod migration;
 mod parity;
 mod pass;
+mod pass_control;
 mod paths;
 mod plan;
 mod policy;

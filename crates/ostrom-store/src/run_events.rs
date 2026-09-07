@@ -2,7 +2,7 @@
 
 use std::{
     collections::BTreeMap,
-    fs::File,
+    fs::{File, OpenOptions},
     io::Write,
     path::Path,
     process::Child,
@@ -11,9 +11,6 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
-
-#[cfg(unix)]
-use std::fs::OpenOptions;
 
 use chrono::{DateTime, Utc};
 use ethogram::{
@@ -331,6 +328,23 @@ impl RunEventGuard {
         Ok(event)
     }
 
+    pub(crate) fn interrupt_from_descriptor<R: SessionResumer, C: WatchdogClock>(
+        &mut self,
+        control: &mut RunControl<R>,
+        request: ControlRequestedPayload,
+        child: &mut Child,
+        watchdog: &CapsWatchdog<C>,
+    ) -> Result<(), ControlError> {
+        let by = request.by.clone();
+        let sink = ControlResponseSink {
+            sink: &self.sink,
+            by: &by,
+        };
+        control.interrupt(request, Some(child), watchdog, &sink)?;
+        self.finished = true;
+        Ok(())
+    }
+
     fn write_terminal(&mut self) -> Result<(), RunEventError> {
         if self.finished {
             return Ok(());
@@ -368,6 +382,33 @@ pub(crate) struct RunEventSink {
     live: Mutex<LiveEventSink>,
 }
 
+/// Preserve the supervisor's attribution on runtime-generated responses.
+/// Signal-only passes use the existing sink and retain their exact wire bytes.
+struct ControlResponseSink<'a> {
+    sink: &'a RunEventSink,
+    by: &'a str,
+}
+
+impl Sink for ControlResponseSink<'_> {
+    fn append(&self, run: &str, mut draft: EventDraft) -> Result<Event, SinkFault> {
+        if matches!(
+            draft.event_type.as_str(),
+            ethogram::CONTROL_APPLIED | ethogram::RUN_FINISHED
+        ) {
+            draft.payload["by"] = self.by.into();
+        }
+        self.sink.append(run, draft)
+    }
+
+    fn forward(&self, event: Event) -> Result<(), SinkFault> {
+        self.sink.forward(event)
+    }
+
+    fn last_seq(&self, run: &str) -> Result<u64, SinkFault> {
+        self.sink.last_seq(run)
+    }
+}
+
 struct LiveEventSink {
     live: Option<File>,
     live_fd: Option<u32>,
@@ -382,7 +423,7 @@ impl RunEventSink {
             live_fault: None,
         };
         if let Some(fd) = live_fd {
-            match open_fd(fd) {
+            match open_fd(fd, OpenOptions::new().append(true)) {
                 Ok(file) => live.live = Some(file),
                 Err(error) => {
                     live.record_fault(format!("could not open events fd {fd}: {error}"));
@@ -447,21 +488,17 @@ impl Sink for RunEventSink {
 }
 
 #[cfg(target_os = "linux")]
-fn open_fd(fd: u32) -> std::io::Result<File> {
-    OpenOptions::new()
-        .append(true)
-        .open(format!("/proc/self/fd/{fd}"))
+pub(crate) fn open_fd(fd: u32, options: &OpenOptions) -> std::io::Result<File> {
+    options.open(format!("/proc/self/fd/{fd}"))
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-fn open_fd(fd: u32) -> std::io::Result<File> {
-    OpenOptions::new()
-        .append(true)
-        .open(format!("/dev/fd/{fd}"))
+pub(crate) fn open_fd(fd: u32, options: &OpenOptions) -> std::io::Result<File> {
+    options.open(format!("/dev/fd/{fd}"))
 }
 
 #[cfg(not(unix))]
-fn open_fd(_fd: u32) -> std::io::Result<File> {
+pub(crate) fn open_fd(_fd: u32, _options: &OpenOptions) -> std::io::Result<File> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "file descriptors are unsupported on this platform",

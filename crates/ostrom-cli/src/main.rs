@@ -206,6 +206,9 @@ enum Command {
         /// Also stream stamped ethogram events to this open file descriptor.
         #[arg(long)]
         events_fd: Option<u32>,
+        /// Read control.requested drafts from this inherited file descriptor.
+        #[arg(long)]
+        control_fd: Option<u32>,
         /// Withhold agent content from the live event descriptor.
         #[arg(long)]
         facts_only: bool,
@@ -225,6 +228,8 @@ enum Command {
         role: CliPassRole,
         #[arg(long)]
         events_fd: Option<u32>,
+        #[arg(long)]
+        control_fd: Option<u32>,
         #[arg(long)]
         facts_only: bool,
         supervisor_pid: u32,
@@ -852,13 +857,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Pass {
             role,
             events_fd,
+            control_fd,
             facts_only,
         } => {
             let events_fd = resolve_events_fd(events_fd)?;
+            let control_fd = resolve_control_fd(control_fd)?;
             let facts_only = resolve_facts_only(facts_only)?;
             let mut arguments = vec!["__pass-worker".into(), role_name(role).into()];
             if let Some(fd) = events_fd {
                 arguments.extend(["--events-fd".into(), fd.to_string().into()]);
+            }
+            if let Some(fd) = control_fd {
+                arguments.extend(["--control-fd".into(), fd.to_string().into()]);
             }
             if facts_only {
                 arguments.push("--facts-only".into());
@@ -886,12 +896,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::PassWorker {
             role,
             events_fd,
+            control_fd,
             facts_only,
             supervisor_pid,
         } => run_pass_worker(
             role,
             supervisor_pid,
             resolve_events_fd(events_fd)?,
+            resolve_control_fd(control_fd)?,
             facts_only,
             clock,
         ),
@@ -2460,6 +2472,21 @@ fn resolve_events_fd(explicit: Option<u32>) -> io::Result<Option<u32>> {
     })
 }
 
+fn resolve_control_fd(explicit: Option<u32>) -> io::Result<Option<u32>> {
+    let Some(value) = explicit.map_or_else(
+        || environment::OSTROM_CONTROL_FD.value(),
+        |fd| Some(fd.to_string()),
+    ) else {
+        return Ok(None);
+    };
+    value.parse::<u32>().map(Some).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("OSTROM_CONTROL_FD must be an unsigned integer, got {value:?}"),
+        )
+    })
+}
+
 fn resolve_facts_only(explicit: bool) -> io::Result<bool> {
     if explicit {
         return Ok(true);
@@ -2569,6 +2596,7 @@ fn run_pass_worker(
     role: CliPassRole,
     supervisor_pid: u32,
     events_fd: Option<u32>,
+    control_fd: Option<u32>,
     facts_only: bool,
     clock: Clock,
 ) -> ! {
@@ -2595,6 +2623,7 @@ fn run_pass_worker(
         signals,
         supervisor_pid: Some(supervisor_pid),
         events_fd,
+        control_fd,
         facts_only,
         caps,
         clock,
