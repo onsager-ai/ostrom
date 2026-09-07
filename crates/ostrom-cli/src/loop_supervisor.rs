@@ -137,15 +137,6 @@ pub(crate) enum LoopSupervisorError {
     Inconclusive { name: String, cause: &'static str },
     #[error("unknown loop `{0}` in the current policy version")]
     UnknownLoop(String),
-    #[error("loop `{name}` has no log at `{}`", path.display())]
-    LogMissing { name: String, path: PathBuf },
-    #[error("loop `{name}` log at `{}` is unreadable: {source}", path.display())]
-    LogUnreadable {
-        name: String,
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
 }
 
 pub(crate) fn reconcile(
@@ -257,25 +248,6 @@ pub(crate) fn render_ps(paths: &OstromPaths, clock: &Clock) -> Result<String, Lo
         ));
     }
     Ok(output)
-}
-
-pub(crate) fn read_logs(paths: &OstromPaths, name: &str) -> Result<Vec<u8>, LoopSupervisorError> {
-    let current = policy_version::load_current(paths)?;
-    if !current.manifest.loops.contains_key(name) {
-        return Err(LoopSupervisorError::UnknownLoop(name.to_owned()));
-    }
-    let path = paths.loop_run_log_file(name);
-    fs::read(&path).map_err(|source| match source.kind() {
-        io::ErrorKind::NotFound => LoopSupervisorError::LogMissing {
-            name: name.to_owned(),
-            path,
-        },
-        _ => LoopSupervisorError::LogUnreadable {
-            name: name.to_owned(),
-            path,
-            source,
-        },
-    })
 }
 
 pub(crate) fn worker_started(

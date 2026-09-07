@@ -14,6 +14,7 @@ use std::{
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use directories::BaseDirs;
+use ethogram::{Event, serialise_event};
 use ostrom_checks::{
     ActionFault, ActionRegistry, ClaudeHarness, DoctorOptions, PreparedCheck,
     generate_operation_settings, render_loop_units, run_doctor, run_doctor_check,
@@ -52,6 +53,7 @@ use operation_dispatch::{
     OperationDispatchError, OperationRuntime, ResolvedOperationTarget, dispatch_operation,
     parse_invocation, resolve_repository_target,
 };
+use umwelt_runtime::{FileSink, Source, SystemClock, follow};
 
 static AGENT_RUN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -178,8 +180,13 @@ enum Command {
     Up,
     /// Report declared loops and their persisted runtime state.
     Ps,
-    /// Print the persisted log for one declared loop.
-    Logs { name: String },
+    /// Print stored ethogram events for one run.
+    Logs {
+        name: String,
+        /// Replay events after this sequence, then follow the run.
+        #[arg(long)]
+        after: Option<u64>,
+    },
     /// Merge base branches into eligible stale builder pull requests.
     RepairPrs {
         #[arg(allow_hyphen_values = true)]
@@ -661,9 +668,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Ps => {
             io::stdout().write_all(loop_supervisor::render_ps(&paths, &clock)?.as_bytes())?
         }
-        Command::Logs { name } => {
-            io::stdout().write_all(&loop_supervisor::read_logs(&paths, &name)?)?;
-        }
+        Command::Logs { name, after } => run_logs(&paths, &name, after)?,
         Command::LoopWorker {
             name,
             version,
@@ -2318,6 +2323,39 @@ fn role_name(role: CliPassRole) -> &'static str {
         CliPassRole::Builder => "builder",
         CliPassRole::Gatekeeper => "gatekeeper",
     }
+}
+
+fn run_logs(
+    paths: &OstromPaths,
+    name: &str,
+    after: Option<u64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let source = FileSink::new(paths.runs_dir());
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    if let Some(after) = after {
+        let mut output_fault = None;
+        follow(&source, name, after, SystemClock::default(), |event| {
+            if output_fault.is_none() {
+                output_fault = write_event(&mut output, &event).err();
+            }
+        })?;
+        if let Some(error) = output_fault {
+            return Err(error.into());
+        }
+    } else {
+        for event in source.read_from(name, 0)? {
+            write_event(&mut output, &event)?;
+        }
+    }
+    Ok(())
+}
+
+fn write_event(output: &mut impl Write, event: &Event) -> io::Result<()> {
+    let serialised = serialise_event(event).map_err(io::Error::other)?;
+    output.write_all(serialised.as_bytes())?;
+    output.write_all(b"\n")?;
+    output.flush()
 }
 
 fn resolve_events_fd(explicit: Option<u32>) -> io::Result<Option<u32>> {

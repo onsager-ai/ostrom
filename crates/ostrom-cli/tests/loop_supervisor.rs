@@ -188,13 +188,9 @@ fn up_twice_launches_one_activation_and_applies_manifest_ceilings() {
         "builder|50|6|200000\n"
     );
 
-    let logs = fixture
-        .command()
-        .args(["logs", "builder-day"])
-        .output()
-        .expect("read loop logs");
-    assert!(logs.status.success());
-    assert!(String::from_utf8_lossy(&logs.stdout).contains("worker-log"));
+    let loop_output = fs::read_to_string(fixture.home.join("loop-runs/builder-day.log"))
+        .expect("read loop worker output");
+    assert!(loop_output.contains("worker-log"));
 }
 
 #[test]

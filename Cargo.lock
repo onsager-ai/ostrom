@@ -884,6 +884,7 @@ dependencies = [
  "chrono",
  "clap",
  "directories",
+ "ethogram",
  "ostrom-checks",
  "ostrom-core",
  "ostrom-store",
@@ -894,6 +895,7 @@ dependencies = [
  "signal-hook",
  "tempfile",
  "thiserror",
+ "umwelt-runtime",
 ]
 
 [[package]]

@@ -56,6 +56,16 @@ impl Fixture {
         command
     }
 
+    fn logs_command(&self, run: &str) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ostrom"));
+        command
+            .args(["logs", run])
+            .env_clear()
+            .env("OSTROM_HOME", &self.state)
+            .env("HOME", self.root.path());
+        command
+    }
+
     fn write_blocked_dispatchability_state(&self) {
         fs::write(
             self.state.join("mandates.yaml"),
@@ -210,6 +220,45 @@ fn an_unwritable_events_fd_does_not_kill_the_pass() {
             .contains("ostrom observability: could not open events fd 4294967295")
     );
     assert_eq!(fixture.run_events().len(), 2);
+}
+
+#[test]
+fn logs_prints_canonical_jsonl_and_after_replays_then_follows() {
+    let fixture = Fixture::new("exit 0");
+    let status = fixture.command().status().expect("run pass");
+    assert!(status.success());
+    let durable = fixture.run_event_bytes();
+    let run_id = fixture.run_events()[0]["runId"]
+        .as_str()
+        .expect("event run ID")
+        .to_owned();
+
+    let snapshot = fixture
+        .logs_command(&run_id)
+        .output()
+        .expect("read the run snapshot");
+    assert!(
+        snapshot.status.success(),
+        "{}",
+        String::from_utf8_lossy(&snapshot.stderr)
+    );
+    assert_eq!(snapshot.stdout, durable);
+
+    let followed = fixture
+        .logs_command(&run_id)
+        .args(["--after", "1"])
+        .output()
+        .expect("replay and follow the terminal event");
+    assert!(
+        followed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&followed.stderr)
+    );
+    let terminal = durable
+        .split_inclusive(|byte| *byte == b'\n')
+        .nth(1)
+        .expect("terminal event line");
+    assert_eq!(followed.stdout, terminal);
 }
 
 fn wait_for(path: &Path) {
