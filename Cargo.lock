@@ -474,6 +474,8 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "toml",
+ "umwelt-capture",
 ]
 
 [[package]]

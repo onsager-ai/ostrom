@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Lines};
+use std::io::{self, BufRead, BufReader, Lines, Write};
 use std::path::Path;
 use std::process::ChildStdout;
 use std::slice;
@@ -12,7 +12,8 @@ pub trait LineSource: Iterator<Item = Result<String, CaptureFault>> {}
 /// Lines read from a spawned child process's standard output.
 #[derive(Debug)]
 pub struct ChildStdoutSource {
-    lines: Lines<BufReader<ChildStdout>>,
+    reader: BufReader<ChildStdout>,
+    raw_capture: Option<File>,
 }
 
 impl ChildStdoutSource {
@@ -20,7 +21,20 @@ impl ChildStdoutSource {
     #[must_use]
     pub fn new(stdout: ChildStdout) -> Self {
         Self {
-            lines: BufReader::new(stdout).lines(),
+            reader: BufReader::new(stdout),
+            raw_capture: None,
+        }
+    }
+
+    /// Wrap piped child stdout and copy every byte read to `raw_capture`.
+    ///
+    /// The iterator still yields lines without their terminators, while the
+    /// capture retains the original line endings verbatim.
+    #[must_use]
+    pub fn with_raw_capture(stdout: ChildStdout, raw_capture: File) -> Self {
+        Self {
+            reader: BufReader::new(stdout),
+            raw_capture: Some(raw_capture),
         }
     }
 }
@@ -29,9 +43,25 @@ impl Iterator for ChildStdoutSource {
     type Item = Result<String, CaptureFault>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.lines
-            .next()
-            .map(|line| line.map_err(|error| unreadable("child stdout", error)))
+        let mut line = String::new();
+        match self.reader.read_line(&mut line) {
+            Ok(0) => None,
+            Ok(_) => {
+                if let Some(raw_capture) = &mut self.raw_capture
+                    && let Err(error) = raw_capture.write_all(line.as_bytes())
+                {
+                    return Some(Err(unreadable("raw stdout capture", error)));
+                }
+                if line.ends_with('\n') {
+                    line.pop();
+                    if line.ends_with('\r') {
+                        line.pop();
+                    }
+                }
+                Some(Ok(line))
+            }
+            Err(error) => Some(Err(unreadable("child stdout", error))),
+        }
     }
 }
 

@@ -5,6 +5,22 @@ use std::{
     time::Duration,
 };
 
+/// Configure `command` so its child leads a new process group.
+///
+/// Group leadership lets every termination path stop the harness and any
+/// subprocesses it has started with one grace-aware operation.
+#[cfg(unix)]
+pub fn set_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    command.process_group(0);
+}
+
+/// Leave process-group configuration unchanged on platforms without Unix
+/// process groups.
+#[cfg(not(unix))]
+pub fn set_process_group(_command: &mut Command) {}
+
 #[cfg(unix)]
 pub(crate) fn is_executable_file(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -18,7 +34,12 @@ pub(crate) fn is_executable_file(path: &Path) -> bool {
     path.is_file()
 }
 
-pub(crate) fn terminate_child_process_group(child: &mut Child, grace: Duration) -> Option<String> {
+/// Terminate a child-led process group with `SIGTERM`, escalating to `SIGKILL`
+/// when it remains alive after `grace`.
+///
+/// The child must have been configured with [`set_process_group`] before it
+/// was spawned. The returned string names the last signal sent.
+pub fn terminate_child_process_group(child: &mut Child, grace: Duration) -> Option<String> {
     let pid = child.id();
     let group = format!("-{pid}");
     let _ = Command::new(kill_command())

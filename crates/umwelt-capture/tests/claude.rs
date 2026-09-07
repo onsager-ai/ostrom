@@ -2,12 +2,14 @@ use std::fs;
 use std::path::Path;
 
 use ethogram::{
-    AGENT_COMPLETED, AGENT_TEXT, AGENT_TOOL_RESULT, AGENT_WARNING, MAX_EXCERPT_SCALARS,
-    MAX_TEXT_SCALARS, parse_event,
+    AGENT_COMPLETED, AGENT_STARTED, AGENT_TEXT, AGENT_TOOL_RESULT, AGENT_TOOL_USE, AGENT_WARNING,
+    CONTROL_APPLIED, CONTROL_REQUESTED, ControlAppliedPayload, ControlKind,
+    ControlRequestedPayload, MAX_EXCERPT_SCALARS, MAX_TEXT_SCALARS, RUN_FINISHED,
+    RunFinishedPayload, RunOutcome, parse_event,
 };
 use serde_json::json;
 use umwelt_capture::claude::ClaudeNormaliser;
-use umwelt_capture::golden::walk_corpus;
+use umwelt_capture::golden::{read_metadata, walk_corpus};
 use umwelt_capture::{CaptureFault, Normaliser};
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/claude");
@@ -17,6 +19,71 @@ fn corpus_matches_for_file_and_in_memory_sources_and_refuses_unknown_types() {
     let report = walk_corpus(ClaudeNormaliser::new, FIXTURES).expect("Claude corpus must match");
     assert_eq!(report.cases, 3);
     assert_eq!(report.refusals, 1);
+}
+
+#[test]
+fn captured_interrupt_pins_control_answers_before_the_terminal() {
+    const RUN_ID: &str = "capture-control-interrupt-fixture";
+    const TOOL_USE_ID: &str = "toolu_01BG5x9iuSVKzZhYg7qmM5PJ";
+
+    let case = Path::new(FIXTURES).join("control-interrupt");
+    let metadata = read_metadata(case.join("meta.toml")).expect("read control capture metadata");
+    assert_eq!(metadata.cli_version, "2.1.263");
+    let raw = fs::read_to_string(case.join("raw.ndjson")).expect("read control raw capture");
+    assert_eq!(raw.lines().count(), 8, "the complete raw tee must be kept");
+    let events = fs::read_to_string(case.join("events.jsonl"))
+        .expect("read control event capture")
+        .lines()
+        .map(|line| parse_event(line).expect("parse control capture event"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(events.len(), 7);
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect::<Vec<_>>(),
+        [
+            AGENT_STARTED,
+            AGENT_TOOL_USE,
+            CONTROL_REQUESTED,
+            CONTROL_REQUESTED,
+            CONTROL_APPLIED,
+            CONTROL_APPLIED,
+            RUN_FINISHED,
+        ]
+    );
+    for (index, event) in events.iter().enumerate() {
+        assert_eq!(event.run_id, RUN_ID);
+        assert_eq!(event.seq, u64::try_from(index).expect("fixture index") + 1);
+    }
+    assert_eq!(events[1].payload["toolUseId"], TOOL_USE_ID);
+
+    let steer_request: ControlRequestedPayload =
+        serde_json::from_value(events[2].payload.clone()).expect("steer request payload");
+    assert_eq!(steer_request.control_id, "capture-steer-1");
+    assert_eq!(steer_request.kind, ControlKind::Steer);
+
+    let interrupt_request: ControlRequestedPayload =
+        serde_json::from_value(events[3].payload.clone()).expect("interrupt request payload");
+    assert_eq!(interrupt_request.control_id, "capture-interrupt-1");
+    assert_eq!(interrupt_request.kind, ControlKind::Interrupt);
+
+    let interrupt_applied: ControlAppliedPayload =
+        serde_json::from_value(events[4].payload.clone()).expect("interrupt answer payload");
+    assert_eq!(interrupt_applied.control_id, "capture-interrupt-1");
+    assert!(interrupt_applied.ok);
+    assert_eq!(interrupt_applied.landed_in.as_deref(), Some(TOOL_USE_ID));
+
+    let steer_applied: ControlAppliedPayload =
+        serde_json::from_value(events[5].payload.clone()).expect("steer answer payload");
+    assert_eq!(steer_applied.control_id, "capture-steer-1");
+    assert!(!steer_applied.ok);
+    assert_eq!(steer_applied.reason.as_deref(), Some("not-live"));
+
+    let finished: RunFinishedPayload =
+        serde_json::from_value(events[6].payload.clone()).expect("terminal payload");
+    assert_eq!(finished.outcome, RunOutcome::Interrupted);
 }
 
 #[test]

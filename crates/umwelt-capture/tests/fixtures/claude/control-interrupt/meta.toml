@@ -1,0 +1,33 @@
+harness = "claude-code"
+cli_version = "2.1.263"
+captured_at = "2026-09-07"
+model = "claude-haiku-4-5-20251001"
+command = "cargo run -p umwelt-runtime --example capture_interrupt -- /workspace/capture-control"
+prompt_source = "capture_interrupt default"
+events = 7
+raw_lines = 8
+raw_lines_after_interrupt = 1
+
+exercises = [
+  "interrupt while one real Bash tool call is open",
+  "control.applied for the interrupt carries the open tool call's real landedIn id",
+  "a queued steer is answered not-live before run.finished",
+  "run.finished records outcome interrupted and closes the event stream",
+]
+
+[scrub]
+narration = "unchanged; the capture contains no operator-identifying narration"
+ids = "real (session_id, toolu_*, message/request/frame UUIDs, and control ids)"
+run_id = "process-shaped capture id replaced consistently with capture-control-interrupt-fixture"
+paths = "worktree rewritten to /workspace; home and username rewritten to /home/operator and operator"
+socket = "original socket path and its process id rewritten to /run/user/1000/socket/0.sock"
+command_path = "the captured output directory argument is represented by its scrubbed /workspace/capture-control path"
+
+[notes]
+post_interrupt_raw = "One raw line after the interrupt deliberately produces no event because run.finished has already been emitted. raw.ndjson remains the complete harness record."
+late_interrupt = "A second interrupt was refused synchronously after run.finished and is absent from events.jsonl by design."
+
+[not_exercised]
+resumed_steer = "No resumed steer: exercising it requires a second paid invocation, which was not authorised."
+interrupt_errors = "Only an error-free interrupt is captured."
+multiple_open_calls = "Exactly one tool call was open at kill time, so landedIn selection among multiple open calls is unexercised."

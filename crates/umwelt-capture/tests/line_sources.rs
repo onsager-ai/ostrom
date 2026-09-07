@@ -39,3 +39,28 @@ fn child_stdout_source_yields_process_lines() {
     assert!(status.success());
     assert_eq!(lines, ["first", "second"]);
 }
+
+#[test]
+fn child_stdout_source_keeps_raw_bytes_and_line_endings() {
+    let directory = tempdir().expect("create raw capture directory");
+    let raw_path = directory.path().join("raw.ndjson");
+    let raw = fs::File::create(&raw_path).expect("create raw capture");
+    let mut child = Command::new("sh")
+        .args(["-c", "printf 'first\r\nsecond'"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn source process");
+    let stdout = child.stdout.take().expect("piped child stdout");
+
+    let lines = ChildStdoutSource::with_raw_capture(stdout, raw)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read and capture child stdout lines");
+    let status = child.wait().expect("wait for source process");
+
+    assert!(status.success());
+    assert_eq!(lines, ["first", "second"]);
+    assert_eq!(
+        fs::read(raw_path).expect("read raw capture"),
+        b"first\r\nsecond"
+    );
+}

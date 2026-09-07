@@ -6,8 +6,8 @@ use std::{
 
 use super::{
     ActionFault, AgentRunner, CapSupport, Harness, PASS_MAX_TURNS, ProcessOutcome, RunRequest,
-    set_process_group,
 };
+use crate::process_control;
 
 /// Spawn adapter for the `agent/claude` harness.
 pub struct ClaudeHarness {
@@ -100,7 +100,7 @@ impl AgentRunner for ClaudeHarness {
             ])
             .stdout(Stdio::from(output))
             .stderr(Stdio::from(error_output));
-        set_process_group(&mut command);
+        process_control::set_process_group(&mut command);
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {

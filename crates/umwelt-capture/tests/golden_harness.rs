@@ -175,6 +175,30 @@ fn empty_corpus_succeeds_and_reports_zero_cases() {
     assert_eq!(report.refusals, 0);
 }
 
+#[test]
+fn end_to_end_capture_is_not_treated_as_a_normaliser_golden() {
+    let fixture = Fixture::new();
+    let case = fixture.case("runtime-capture");
+    fs::create_dir_all(&case).expect("create capture fixture directory");
+    fs::write(case.join("raw.ndjson"), "value\n").expect("write raw capture");
+    fs::write(case.join("events.jsonl"), "runtime-owned events\n").expect("write event capture");
+    fs::write(
+        case.join("meta.toml"),
+        concat!(
+            "harness = \"stub\"\n",
+            "cli_version = \"1.0.0\"\n",
+            "captured_at = \"2026-09-07\"\n",
+            "exercises = [\"the runtime path\"]\n",
+        ),
+    )
+    .expect("write capture metadata");
+
+    let report = walk_corpus(|| StubNormaliser::accepting("stub.event"), fixture.root())
+        .expect("capture-only fixture should be left to its dedicated test");
+    assert_eq!(report.cases, 0);
+    assert_eq!(report.refusals, 0);
+}
+
 struct Fixture {
     directory: TempDir,
 }
