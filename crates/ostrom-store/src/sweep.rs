@@ -366,6 +366,10 @@ fn run_sweep_with_minter_and_publication_source(
     let (work_orders, work_order_warnings) = load_work_orders(&options.paths)?;
     faults.extend(work_order_warnings);
 
+    let mut decision_requests = snapshots
+        .iter()
+        .flat_map(human_decision_requests)
+        .collect::<Vec<_>>();
     let mirror = snapshots.clone();
     let mut snapshots_by_repo = snapshots
         .into_iter()
@@ -523,11 +527,12 @@ fn run_sweep_with_minter_and_publication_source(
     }
     new_state["dependency_graph"] =
         serde_json::to_value(graph).expect("work dependency graph serializes");
-    let decision_requests = final_rows
-        .iter()
-        .filter(|row| string_field(row.value(), &["state"]) == "pending")
-        .filter_map(|row| queue_decision_request(row.value()))
-        .collect::<Vec<_>>();
+    decision_requests.extend(
+        final_rows
+            .iter()
+            .filter(|row| string_field(row.value(), &["state"]) == "pending")
+            .filter_map(|row| queue_decision_request(row.value())),
+    );
     emit_decision_requests(&options.paths, &decision_requests)?;
     backup_previous_sweep(&options.paths)?;
     write_queue(&options.paths.queue_file(), &final_rows)?;
@@ -1959,6 +1964,43 @@ fn tripwire_dossier(subject: &str) -> Dossier {
     }
 }
 
+fn human_decision_requests(snapshot: &RepositorySnapshot) -> Vec<DecisionRequest> {
+    snapshot
+        .issues
+        .iter()
+        .filter(|issue| issue.get("pull_request").is_none())
+        .filter(|issue| !string_field(issue, &["state"]).eq_ignore_ascii_case("closed"))
+        .filter_map(|issue| {
+            let number = number_field(issue, &["number"])?;
+            Some((
+                format!("{}#{number}", snapshot.repo),
+                string_field(issue, &["body"]),
+            ))
+        })
+        .flat_map(|(subject, body)| {
+            human_decision_rows(body)
+                .into_iter()
+                .map(move |row| human_decision_request(&subject, row))
+        })
+        .collect()
+}
+
+fn human_decision_request(subject: &str, row: HumanDecisionRow) -> DecisionRequest {
+    let identity = format!("human_decides\0{subject}\0{}", row.question);
+    DecisionRequest {
+        decision_id: format!("human-decides-{}", sha256_hex(identity.as_bytes())),
+        kind: DecisionKind::HumanDecides,
+        dossier: Dossier {
+            question: row.question,
+            options_ruled_out: vec!["Proceeding without the human's answer.".to_owned()],
+            recommended_action: "Choose one of the listed options.".to_owned(),
+            blast_radius: format!("{subject} only."),
+        },
+        options: row.options,
+        subject: subject.to_owned(),
+    }
+}
+
 fn queue_decision_request(row: &Value) -> Option<DecisionRequest> {
     let queue_kind = string_field(row, &["kind"]);
     if matches!(queue_kind, "stuck" | "drift") {
@@ -3345,6 +3387,221 @@ fn selectors_value(selectors: &[Selector]) -> Value {
     )
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HumanDecisionRow {
+    question: String,
+    options: Vec<DecisionOption>,
+}
+
+#[derive(Debug)]
+struct MarkdownTaskRow<'a> {
+    line: usize,
+    indent: usize,
+    checked: bool,
+    text: &'a str,
+}
+
+fn human_decision_rows(body: &str) -> Vec<HumanDecisionRow> {
+    let lines = body.lines().collect::<Vec<_>>();
+    human_decision_sections(&lines)
+        .into_iter()
+        .flat_map(|(start, end)| human_decision_section_rows(&lines, start, end))
+        .collect()
+}
+
+fn human_decision_sections(lines: &[&str]) -> Vec<(usize, usize)> {
+    let mut sections = Vec::new();
+    let mut section_start = None;
+    let mut fence = None;
+    for (index, line) in lines.iter().enumerate() {
+        if let Some(marker) = markdown_fence(line) {
+            if fence == Some(marker) {
+                fence = None;
+            } else if fence.is_none() {
+                fence = Some(marker);
+            }
+            continue;
+        }
+        if fence.is_some() {
+            continue;
+        }
+        let Some((level, heading)) = markdown_heading(line) else {
+            continue;
+        };
+        if level <= 3
+            && let Some(start) = section_start.take()
+        {
+            sections.push((start, index));
+        }
+        if level == 3 && heading.eq_ignore_ascii_case("Human decides") {
+            section_start = Some(index + 1);
+        }
+    }
+    if let Some(start) = section_start {
+        sections.push((start, lines.len()));
+    }
+    sections
+}
+
+fn human_decision_section_rows(lines: &[&str], start: usize, end: usize) -> Vec<HumanDecisionRow> {
+    let mut tasks = Vec::new();
+    let mut fence = None;
+    for (line_number, line) in lines.iter().enumerate().take(end).skip(start) {
+        if let Some(marker) = markdown_fence(line) {
+            if fence == Some(marker) {
+                fence = None;
+            } else if fence.is_none() {
+                fence = Some(marker);
+            }
+            continue;
+        }
+        if fence.is_none()
+            && let Some((indent, checked, text)) = markdown_task_row(line)
+        {
+            tasks.push(MarkdownTaskRow {
+                line: line_number,
+                indent,
+                checked,
+                text,
+            });
+        }
+    }
+    let Some(parent_indent) = tasks.iter().map(|task| task.indent).min() else {
+        return Vec::new();
+    };
+    let mut decisions = Vec::new();
+    for (position, task) in tasks.iter().enumerate() {
+        if task.indent != parent_indent || task.checked {
+            continue;
+        }
+        let next_parent = tasks[position + 1..]
+            .iter()
+            .position(|candidate| candidate.indent <= parent_indent)
+            .map_or(tasks.len(), |offset| position + 1 + offset);
+        let next_task_line = tasks
+            .get(position + 1)
+            .map_or(end, |candidate| candidate.line);
+        let mut question_parts = vec![task.text];
+        for continuation in &lines[task.line + 1..next_task_line] {
+            if continuation.trim().is_empty()
+                || leading_indent(continuation) <= parent_indent
+                || markdown_heading(continuation).is_some()
+            {
+                break;
+            }
+            question_parts.push(continuation.trim());
+        }
+        let question = normalize_row_text(&question_parts.join(" "));
+        if question.is_empty() {
+            continue;
+        }
+        let labels = tasks[position + 1..next_parent]
+            .iter()
+            .filter(|option| option.indent > parent_indent)
+            .map(|option| normalize_row_text(option.text))
+            .filter(|label| !label.is_empty())
+            .collect::<Vec<_>>();
+        decisions.push(HumanDecisionRow {
+            question,
+            options: decision_options(labels),
+        });
+    }
+    decisions
+}
+
+fn markdown_fence(line: &str) -> Option<char> {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("```") {
+        Some('`')
+    } else if trimmed.starts_with("~~~") {
+        Some('~')
+    } else {
+        None
+    }
+}
+
+fn markdown_heading(line: &str) -> Option<(usize, &str)> {
+    let trimmed = line.trim_start();
+    let level = trimmed.bytes().take_while(|byte| *byte == b'#').count();
+    if !(1..=6).contains(&level) || !trimmed[level..].starts_with(char::is_whitespace) {
+        return None;
+    }
+    let heading = trimmed[level..].trim().trim_end_matches('#').trim_end();
+    Some((level, heading))
+}
+
+fn markdown_task_row(line: &str) -> Option<(usize, bool, &str)> {
+    let byte_offset = line
+        .char_indices()
+        .find_map(|(index, character)| (!matches!(character, ' ' | '\t')).then_some(index))
+        .unwrap_or(line.len());
+    let indent = leading_indent(line);
+    let rest = line[byte_offset..].strip_prefix("- [")?;
+    let (checked, rest) = match rest.as_bytes() {
+        [b' ', b']', tail @ ..] => (false, tail),
+        [b'x' | b'X', b']', tail @ ..] => (true, tail),
+        _ => return None,
+    };
+    let text = std::str::from_utf8(rest).ok()?.trim();
+    (!text.is_empty()).then_some((indent, checked, text))
+}
+
+fn leading_indent(line: &str) -> usize {
+    line.chars()
+        .take_while(|character| matches!(character, ' ' | '\t'))
+        .map(|character| if character == '\t' { 4 } else { 1 })
+        .sum()
+}
+
+fn normalize_row_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn decision_options(labels: Vec<String>) -> Vec<DecisionOption> {
+    let labels = if labels.is_empty() {
+        vec!["yes".to_owned(), "no".to_owned()]
+    } else {
+        labels
+    };
+    let mut used = BTreeSet::new();
+    labels
+        .into_iter()
+        .enumerate()
+        .map(|(index, label)| {
+            let base = option_id(&label, index);
+            let mut id = base.clone();
+            let mut suffix = 2;
+            while !used.insert(id.clone()) {
+                id = format!("{base}-{suffix}");
+                suffix += 1;
+            }
+            DecisionOption { id, label }
+        })
+        .collect()
+}
+
+fn option_id(label: &str, index: usize) -> String {
+    let mut id = String::new();
+    let mut separated = false;
+    for character in label.chars() {
+        if character.is_ascii_alphanumeric() {
+            id.push(character.to_ascii_lowercase());
+            separated = false;
+        } else if !id.is_empty() && !separated {
+            id.push('-');
+            separated = true;
+        }
+    }
+    while id.ends_with('-') {
+        id.pop();
+    }
+    if id.is_empty() {
+        format!("option-{}", index + 1)
+    } else {
+        id
+    }
+}
+
 fn dependency_refs(repo: &str, body: &str) -> Result<Vec<String>, SweepError> {
     let regex = Regex::new(
         r"(?i)(?:depends\s+on|blocked\s+by|gate\s+for)\s+((?:[[:alnum:]_.-]+/[[:alnum:]_.-]+)?#[1-9][0-9]*)",
@@ -4052,6 +4309,148 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn human_decides_parser_uses_open_top_level_rows_and_their_own_options() {
+        let body = r#"
+### Human decides
+
+- [ ] Which release window should be used?
+  - [ ] Weekday
+  - [ ] Weekend
+- [x] This choice is already settled.
+- [ ] Whether to proceed with the reversible implementation.
+  This continuation is part of the row text.
+
+### AI implements
+
+- [ ] Should the implementation use algorithm A or B?
+"#;
+
+        assert_eq!(
+            human_decision_rows(body),
+            vec![
+                HumanDecisionRow {
+                    question: "Which release window should be used?".to_owned(),
+                    options: vec![
+                        DecisionOption {
+                            id: "weekday".to_owned(),
+                            label: "Weekday".to_owned(),
+                        },
+                        DecisionOption {
+                            id: "weekend".to_owned(),
+                            label: "Weekend".to_owned(),
+                        },
+                    ],
+                },
+                HumanDecisionRow {
+                    question: concat!(
+                        "Whether to proceed with the reversible implementation. ",
+                        "This continuation is part of the row text."
+                    )
+                    .to_owned(),
+                    options: vec![
+                        DecisionOption {
+                            id: "yes".to_owned(),
+                            label: "yes".to_owned(),
+                        },
+                        DecisionOption {
+                            id: "no".to_owned(),
+                            label: "no".to_owned(),
+                        },
+                    ],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn human_decides_rows_emit_once_across_unchanged_sweeps() {
+        let home = tempdir().expect("temporary human-decides fixture home");
+        let paths = repair_test_paths(home.path());
+        fs::write(
+            home.path().join("mandates.yaml"),
+            include_str!("../tests/fixtures/decision-events/mandates.yaml"),
+        )
+        .expect("write human-decides fixture mandates");
+        let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/decision-events/human-decides-roster.json");
+        let sweep = |started_at: &str| {
+            run_sweep(&SweepOptions {
+                working_directory: home.path().to_path_buf(),
+                executable: home.path().join("unused-ostrom"),
+                plugin_root: home.path().to_path_buf(),
+                paths: paths.clone(),
+                started_at: started_at.parse().expect("valid fixture sweep time"),
+                requested_mode: SweepMode::Full,
+                fixture: Some(fixture_path.clone()),
+                publish: PublishTarget::Disabled,
+                policy: None,
+            })
+            .expect("human-decides fixture sweep succeeds");
+        };
+        let read_decisions = || {
+            umwelt_runtime::FileSink::new(paths.runs_dir())
+                .read_from(crate::run_events::SWEEP_RUN_ID, 0)
+                .expect("read human-decides events")
+                .into_iter()
+                .filter(|event| event.event_type == ethogram_decisions::DECISION_REQUESTED)
+                .collect::<Vec<_>>()
+        };
+
+        sweep("2026-09-07T12:00:00Z");
+        let first = read_decisions();
+        assert_eq!(first.len(), 2);
+        assert!(first.iter().all(|event| {
+            event.payload["kind"] == "human_decides"
+                && event.payload["subject"] == "fixture-org/decisions#4"
+                && !event.payload.as_object().unwrap().contains_key("onTimeout")
+                && ethogram_decisions::validate(&event.event_type, &event.payload).is_ok()
+        }));
+        assert_eq!(
+            first[0].payload["options"],
+            json!([
+                {"id": "weekday", "label": "Weekday"},
+                {"id": "weekend", "label": "Weekend"},
+            ])
+        );
+        assert_eq!(
+            first[1].payload["options"],
+            json!([
+                {"id": "yes", "label": "yes"},
+                {"id": "no", "label": "no"},
+            ])
+        );
+        for event in &first {
+            let expected = match event.payload["dossier"]["question"]
+                .as_str()
+                .expect("human fixture question")
+            {
+                "Which release window should be used?" => include_str!(
+                    "../tests/fixtures/decision-events/expected/human-decides-options.json"
+                ),
+                "Whether to proceed with the reversible implementation." => include_str!(
+                    "../tests/fixtures/decision-events/expected/human-decides-defaults.json"
+                ),
+                other => panic!("unexpected human decision fixture question {other}"),
+            };
+            let mut emitted = serde_json::to_value(event).expect("serialize human fixture");
+            emitted["ts"] = json!("2030-01-02T03:04:05.000Z");
+            assert_eq!(
+                serde_json::to_string(&emitted).expect("encode normalized human fixture"),
+                expected.trim()
+            );
+            let parsed = ethogram_decisions::parse_event(expected.trim())
+                .expect("human fixture parses against the current SDK");
+            ethogram_decisions::validate(&parsed.event_type, &parsed.payload)
+                .expect("human fixture validates against the current SDK");
+        }
+
+        sweep("2026-09-07T13:00:00Z");
+        let second = read_decisions();
+        assert_eq!(second.len(), first.len());
+        assert_eq!(second, first, "an unchanged body must emit nothing new");
     }
 
     #[test]

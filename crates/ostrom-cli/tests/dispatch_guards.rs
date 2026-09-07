@@ -472,6 +472,37 @@ fn closing_pull_requests_are_identity_keys_but_part_of_prose_is_not() {
 }
 
 #[test]
+fn an_ambiguous_work_order_question_remains_dispatchable_and_is_not_a_decision() {
+    let fixture = Fixture::new();
+    let mut order: Value =
+        serde_json::from_slice(&fs::read(&fixture.order).expect("read fixture work order"))
+            .expect("parse fixture work order");
+    order["spec"] =
+        json!("Should the role use algorithm A or algorithm B for the reversible implementation?");
+    fs::write(
+        &fixture.order,
+        format!(
+            "{}\n",
+            serde_json::to_string(&order).expect("encode work order")
+        ),
+    )
+    .expect("write ambiguous work order");
+
+    let output = run(fixture
+        .command()
+        .env("OSTROM_TEST_BRANCH_PAGE_1", default_page()));
+    assert!(
+        output.status.success(),
+        "a D2 implementation question is the role's problem: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(fixture.calls.exists(), "the work order must dispatch");
+    let trace = fixture.trace();
+    assert!(trace.iter().any(|row| row["kind"] == "work-dispatched"));
+    assert!(trace.iter().all(|row| row["kind"] != "decision-requested"));
+}
+
+#[test]
 fn closing_pull_request_query_failures_fail_closed_before_reservation() {
     for (name, value, message) in [
         (
