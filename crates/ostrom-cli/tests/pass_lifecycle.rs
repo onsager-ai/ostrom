@@ -569,7 +569,12 @@ fn disarmed_and_outer_lease_held_passes_do_not_spawn_or_trace() {
         .env("OSTROM_TEST_MARKER", &marker)
         .output()
         .expect("run disarmed pass");
-    assert!(output.status.success());
+    assert_eq!(output.status.code(), Some(78));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("loop is disarmed"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(!marker.exists());
     assert!(!disarmed.state.join("sprint.jsonl").exists());
     let events = disarmed.run_events();

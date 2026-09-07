@@ -19,6 +19,9 @@ use crate::{
 };
 
 pub const MAX_TURNS: &str = "200";
+// EX_CONFIG: the pass invocation is valid, but the local arm configuration
+// explicitly refuses to execute it.
+const DISARMED_EXIT_CODE: i32 = 78;
 const DEFAULT_DAILY_CAP_USD: f64 = 50.0;
 const DEFAULT_LEASE_TTL_SECONDS: u64 = 3_600;
 
@@ -136,7 +139,8 @@ impl PassError {
     pub const fn exit_code(&self) -> i32 {
         match self {
             Self::Failed { code, .. } => *code,
-            Self::Held(_) | Self::Disarmed(_) => 0,
+            Self::Held(_) => 0,
+            Self::Disarmed(_) => DISARMED_EXIT_CODE,
         }
     }
 
@@ -997,5 +1001,20 @@ mod terminal_outcome_tests {
             "refused",
             "a pass that already decided its outcome keeps it"
         );
+    }
+}
+
+#[cfg(test)]
+mod exit_code_tests {
+    use super::{DISARMED_EXIT_CODE, PassError};
+
+    #[test]
+    fn disarmed_is_a_distinct_refusal_and_lease_held_remains_successful() {
+        assert_eq!(DISARMED_EXIT_CODE, 78);
+        assert_eq!(
+            PassError::Disarmed("builder").exit_code(),
+            DISARMED_EXIT_CODE
+        );
+        assert_eq!(PassError::Held("builder").exit_code(), 0);
     }
 }
