@@ -890,12 +890,20 @@ fn strict_isolated_acceptance_checks_effective_operation_scope() {
         "{}",
         String::from_utf8_lossy(&default.stderr)
     );
+    // The file declares actors and operations itself, so the isolation
+    // assumption is load-bearing even though nothing is unresolved: the
+    // default context line says so.
     assert_eq!(
         String::from_utf8(default.stdout).expect("UTF-8 output"),
-        format!("valid: {} (isolated)\n", fixture.manifest.display())
+        format!(
+            "valid: {} (isolated; evaluated as repository policy)\n",
+            fixture.manifest.display()
+        )
     );
     // Repository operations are not adopted, even when their declarations are
     // well formed. Strict acceptance must check composition's effective scope.
+    // The refusal must name the assumption it was evaluated under, not just
+    // state the symptom (ostrom CLAUDE.md principle 5).
     for args in [vec!["validate", "--strict"], vec!["compose"]] {
         let output = fixture
             .command()
@@ -904,12 +912,62 @@ fn strict_isolated_acceptance_checks_effective_operation_scope() {
             .output()
             .expect("check effective acceptance");
         assert_eq!(output.status.code(), Some(1));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("unknown operation `work`"), "{stderr}");
         assert!(
-            String::from_utf8_lossy(&output.stderr).contains("unknown operation `work`"),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
+            stderr.contains("as repository policy: "),
+            "refusal must name the assumption it evaluated under: {stderr}"
+        );
+        assert!(
+            stderr.find("as repository policy: ").unwrap()
+                < stderr.find("unknown operation `work`").unwrap(),
+            "the assumption must prefix the reason, not follow it: {stderr}"
         );
     }
+}
+
+#[test]
+fn default_isolation_context_names_the_assumption_only_when_load_bearing() {
+    // A bare manifest declares neither actors nor operations, so the
+    // repository-policy assumption changes nothing about its verdict: the
+    // plain `(isolated)` line stays, with no added words.
+    let bare = Fixture::new();
+    fs::remove_file(bare.home.join("ostrom.yaml")).expect("remove context");
+    fs::write(&bare.manifest, "manifest_version: 1\n").expect("bare manifest");
+    support::sign_manifest(&bare.manifest);
+    let bare_output = bare
+        .command()
+        .arg("validate")
+        .arg(&bare.manifest)
+        .output()
+        .expect("validate bare manifest");
+    assert_eq!(bare_output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(bare_output.stdout).expect("UTF-8 output"),
+        format!("valid: {} (isolated)\n", bare.manifest.display())
+    );
+
+    // A manifest that declares actors or operations is judged as repository
+    // policy the moment there is no operator to adopt it, even when every
+    // reference in it resolves. Say so.
+    let declaring = Fixture::new();
+    fs::remove_file(declaring.home.join("ostrom.yaml")).expect("remove context");
+    fs::write(&declaring.manifest, OPERATOR).expect("self-contained declarations");
+    support::sign_manifest(&declaring.manifest);
+    let declaring_output = declaring
+        .command()
+        .arg("validate")
+        .arg(&declaring.manifest)
+        .output()
+        .expect("validate declaring manifest");
+    assert_eq!(declaring_output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(declaring_output.stdout).expect("UTF-8 output"),
+        format!(
+            "valid: {} (isolated; evaluated as repository policy)\n",
+            declaring.manifest.display()
+        )
+    );
 }
 
 #[test]

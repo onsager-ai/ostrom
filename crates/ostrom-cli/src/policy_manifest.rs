@@ -66,7 +66,7 @@ pub(crate) fn run_validate(
         if strict && unresolved.is_empty() {
             let bundle =
                 build_bundle_with_operator(normalized_path.into_owned(), loaded.clone(), None)?;
-            validate_manifest(&bundle.manifest)?;
+            validate_manifest(&bundle.manifest).map_err(as_repository_policy_refusal)?;
             bundle
         } else {
             PolicyBundle::repository_with_origins(loaded.manifest.clone(), loaded.origins.clone())
@@ -75,8 +75,18 @@ pub(crate) fn run_validate(
     report_actor_portability_findings(bundle.actor_portability_findings());
     validate_command_manifest(path, &bundle.manifest)?;
 
+    // Isolation with no unresolved references still evaluates the file under
+    // an assumption: with no operator to adopt it, it is judged as repository
+    // policy, so its own actors or operations are declarations about a scope
+    // this run does not enter. Say so only when that assumption is
+    // load-bearing for the verdict — a bare manifest gets no extra words.
+    let evaluated_as_repository_policy =
+        !loaded.manifest.actors.is_empty() || !loaded.manifest.operations.is_empty();
     let context = match operator_path {
         Some(operator) => format!("resolved against operator {}", operator.display()),
+        None if unresolved.is_empty() && evaluated_as_repository_policy => {
+            "isolated; evaluated as repository policy".to_owned()
+        }
         None if unresolved.is_empty() => "isolated".to_owned(),
         None => format!("isolated; {} unresolved", unresolved.len()),
     };
@@ -277,10 +287,40 @@ pub(crate) fn compose_manifest(
     path: &Path,
     unsigned: bool,
 ) -> Result<PolicyManifest, PolicyLoadError> {
-    let bundle = load_bundle_inner(paths, path, unsigned)?;
-    validate_manifest(&bundle.manifest)?;
+    // Resolved here, once, rather than through `load_bundle_inner` /
+    // `build_bundle`, so a refusal below can say whether an operator adopted
+    // this file. Calling `operator_manifest_path` a second time to recover
+    // that fact after the fact would repeat its legacy-path warning.
+    let repository_path = normalize_manifest_path(path).into_owned();
+    let repository = load_composed(&repository_path)?;
+    if !unsigned {
+        verify(&repository.manifest, &repository_path)?;
+    }
+    let operator_path = operator_manifest_path(paths)?;
+    let as_repository_policy = operator_path.is_none();
+    let bundle = build_bundle_with_operator(repository_path, repository, operator_path)?;
+    validate_manifest(&bundle.manifest).map_err(|error| {
+        if as_repository_policy {
+            as_repository_policy_refusal(error)
+        } else {
+            error
+        }
+    })?;
     validate_command_manifest(path, &bundle.manifest)?;
     Ok(bundle.manifest)
+}
+
+/// Names the assumption a refusal was evaluated under: with no operator in
+/// scope, isolation judges the file as repository policy rather than as
+/// something adopted, and a refusal that only holds under that assumption
+/// must say so (ostrom CLAUDE.md principle 5 — a refusal is distinguishable
+/// and explicable, not just present).
+fn as_repository_policy_refusal(error: PolicyLoadError) -> PolicyLoadError {
+    let reason = match error {
+        PolicyLoadError::Validation(reason) => reason,
+        other => other.to_string(),
+    };
+    PolicyLoadError::AsRepositoryPolicy(reason)
 }
 
 fn build_bundle(
@@ -1678,6 +1718,8 @@ pub(crate) enum PolicyLoadError {
     },
     #[error("invalid policy manifest: {0}")]
     Validation(String),
+    #[error("as repository policy: {0}")]
+    AsRepositoryPolicy(String),
     #[error("invalid selector: {0}")]
     Selector(String),
     #[error("OSTROM_POLICY_TRUSTED_KEYS is required to load a policy manifest")]
