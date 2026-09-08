@@ -18,9 +18,9 @@ use std::{
 };
 
 use ethogram::{
-    AGENT_STARTED, AgentStartedPayload, CONTROL_APPLIED, ControlAppliedPayload, ControlKind,
-    ControlRequestedPayload, Event, EventDraft, PayloadExtension, RUN_FINISHED, RunFinishedPayload,
-    RunOutcome,
+    AGENT_STARTED, AgentStartedPayload, CONTROL_APPLIED, ControlAppliedPayload,
+    ControlAppliedReason, ControlKind, ControlRequestedPayload, Event, EventDraft,
+    PayloadExtension, RUN_FINISHED, RunFinishedPayload, RunOutcome,
 };
 use umwelt_capture::{ChildStdoutSource, Normaliser, claude::ClaudeNormaliser};
 use umwelt_runtime::{
@@ -446,6 +446,8 @@ fn control_request(
     ControlRequestedPayload {
         control_id: control_id.to_owned(),
         kind,
+        decision_id: None,
+        option_id: None,
         text: text.map(str::to_owned),
         truncated: text.map(|_| false),
         by: "capture-driver".to_owned(),
@@ -483,7 +485,7 @@ fn verify_capture(events: &[Event]) -> Result<(), CaptureError> {
         ));
     }
     let steer = control_applied(events, "capture-steer-1")?;
-    if steer.ok || steer.reason.as_deref() != Some("not-live") {
+    if steer.ok || steer.reason != Some(ControlAppliedReason::NotLive) {
         return Err(CaptureError::new(
             "the queued steer did not receive not-live at interrupt time",
         ));
@@ -949,7 +951,7 @@ mod tests {
         let steer_applied: ControlAppliedPayload =
             serde_json::from_value(events[5].payload.clone()).expect("steer applied payload");
         assert!(!steer_applied.ok);
-        assert_eq!(steer_applied.reason.as_deref(), Some("not-live"));
+        assert_eq!(steer_applied.reason, Some(ControlAppliedReason::NotLive));
 
         let metadata: toml::Value =
             toml::from_str(&capture_metadata(events.len(), drained)).expect("valid meta.toml");

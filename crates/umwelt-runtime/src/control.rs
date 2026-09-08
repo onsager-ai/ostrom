@@ -9,7 +9,7 @@ use std::{
 };
 
 use ethogram::{
-    CONTROL_APPLIED, CONTROL_REQUESTED, ControlAppliedPayload, ControlKind,
+    CONTROL_APPLIED, CONTROL_REQUESTED, ControlAppliedPayload, ControlAppliedReason, ControlKind,
     ControlRequestedPayload, EventDraft, MAX_EXCERPT_SCALARS, PayloadExtension, RUN_FINISHED,
     RunFinishedPayload, excerpt, validate,
 };
@@ -253,7 +253,12 @@ impl<R: SessionResumer> RunControl<R> {
         if !self.live {
             sink.append(
                 &self.run_id,
-                applied_draft(&request.control_id, false, Some("not-live"), None),
+                applied_draft(
+                    &request.control_id,
+                    false,
+                    Some(ControlAppliedReason::NotLive),
+                    None,
+                ),
             )?;
             return Ok(());
         }
@@ -294,7 +299,12 @@ impl<R: SessionResumer> RunControl<R> {
         if !self.live {
             sink.append(
                 &self.run_id,
-                applied_draft(&request.control_id, false, Some("not-live"), None),
+                applied_draft(
+                    &request.control_id,
+                    false,
+                    Some(ControlAppliedReason::NotLive),
+                    None,
+                ),
             )?;
             return Ok(());
         }
@@ -344,20 +354,35 @@ impl<R: SessionResumer> RunControl<R> {
                 Err(ResumeError::Unsupported) => {
                     sink.append(
                         &self.run_id,
-                        applied_draft(&steer.control_id, false, Some("unsupported"), None),
+                        applied_draft(
+                            &steer.control_id,
+                            false,
+                            Some(ControlAppliedReason::Unsupported),
+                            None,
+                        ),
                     )?;
                 }
                 Err(ResumeError::Harness(reason)) => {
                     sink.append(
                         &self.run_id,
-                        applied_draft(&steer.control_id, false, Some(&reason), None),
+                        applied_draft(
+                            &steer.control_id,
+                            false,
+                            Some(ControlAppliedReason::Unknown(reason)),
+                            None,
+                        ),
                     )?;
                 }
             }
         } else {
             sink.append(
                 &self.run_id,
-                applied_draft(&steer.control_id, false, Some("not-live"), None),
+                applied_draft(
+                    &steer.control_id,
+                    false,
+                    Some(ControlAppliedReason::NotLive),
+                    None,
+                ),
             )?;
         }
 
@@ -371,7 +396,12 @@ impl<R: SessionResumer> RunControl<R> {
         while let Some(queued) = self.pending_steers.pop_front() {
             sink.append(
                 &self.run_id,
-                applied_draft(&queued.control_id, false, Some("not-live"), None),
+                applied_draft(
+                    &queued.control_id,
+                    false,
+                    Some(ControlAppliedReason::NotLive),
+                    None,
+                ),
             )?;
         }
         Ok(())
@@ -387,22 +417,34 @@ fn requested_draft(payload: ControlRequestedPayload) -> EventDraft {
     draft(CONTROL_REQUESTED, payload)
 }
 
+/// Record a reason, bounding a harness's own diagnostic words as the unfamiliar
+/// string case. `Unknown` is the open union's sanctioned slot for bounded producer
+/// prose, not a place to smuggle a value that has a typed member. Under principle 2,
+/// excerpt once here at the producer; the sink's `validate` is the second line of
+/// defence. Typed reasons carry no free text and never carry a truncation flag.
 fn applied_draft(
     control_id: &str,
     ok: bool,
-    reason: Option<&str>,
+    reason: Option<ControlAppliedReason>,
     landed_in: Option<&str>,
 ) -> EventDraft {
-    let reason = reason.map(|reason| excerpt(reason, MAX_EXCERPT_SCALARS));
+    let (reason, truncated) = match reason {
+        Some(ControlAppliedReason::Unknown(diagnostic)) => {
+            let bounded = excerpt(&diagnostic, MAX_EXCERPT_SCALARS);
+            (
+                Some(ControlAppliedReason::Unknown(bounded.text)),
+                bounded.truncated.then_some(true),
+            )
+        }
+        reason => (reason, None),
+    };
     draft(
         CONTROL_APPLIED,
         ControlAppliedPayload {
             control_id: control_id.to_owned(),
             ok,
-            reason: reason.as_ref().map(|excerpt| excerpt.text.clone()),
-            truncated: reason
-                .as_ref()
-                .and_then(|excerpt| excerpt.truncated.then_some(true)),
+            reason,
+            truncated,
             landed_in: landed_in.map(str::to_owned),
             extra: PayloadExtension::new(),
         },
@@ -527,6 +569,8 @@ mod tests {
         ControlRequestedPayload {
             control_id: control_id.to_owned(),
             kind,
+            decision_id: None,
+            option_id: None,
             text: text.map(str::to_owned),
             truncated: text.map(|_| false),
             by: "operator".to_owned(),
@@ -715,7 +759,7 @@ mod tests {
         let steer_applied: ControlAppliedPayload = payload(&events[3]);
         assert_eq!(steer_applied.control_id, "steer-1");
         assert!(!steer_applied.ok);
-        assert_eq!(steer_applied.reason.as_deref(), Some("not-live"));
+        assert_eq!(steer_applied.reason, Some(ControlAppliedReason::NotLive));
     }
 
     #[test]
@@ -798,7 +842,7 @@ mod tests {
         assert!(!events.iter().any(|event| event.event_type == RUN_FINISHED));
         let applied: ControlAppliedPayload = payload(&events[1]);
         assert!(!applied.ok);
-        assert_eq!(applied.reason.as_deref(), Some("not-live"));
+        assert_eq!(applied.reason, Some(ControlAppliedReason::NotLive));
     }
 
     #[test]
@@ -1005,7 +1049,103 @@ mod tests {
         );
         let applied: ControlAppliedPayload = payload(&events[1]);
         assert!(!applied.ok);
-        assert_eq!(applied.reason.as_deref(), Some("unsupported"));
+        assert_eq!(applied.reason, Some(ControlAppliedReason::Unsupported));
+        assert!(!control.is_live());
+    }
+
+    #[test]
+    fn harness_resume_failure_reports_excerpted_diagnostic_with_truncation() {
+        let sink = MemorySink::default();
+        let diagnostic = "harness refused to resume:".repeat(1_000);
+        assert_eq!(diagnostic.len(), 26_000);
+        let resumer = RecordingResumer {
+            error: Some(ResumeError::Harness(diagnostic.clone())),
+            ..RecordingResumer::succeeding()
+        };
+        let error = resumer
+            .resume("session-1", "next text")
+            .expect_err("resume fails");
+        assert_eq!(error, ResumeError::Harness(diagnostic.clone()));
+        let mut control = RunControl::new(
+            "run-1",
+            Some("session-1".to_owned()),
+            RunCaps::default(),
+            resumer,
+        );
+        control
+            .steer(
+                request("control-1", ControlKind::Steer, Some("next text")),
+                &sink,
+            )
+            .expect("queue steer");
+
+        control
+            .process_exited(ProcessExit::Normal, finished(RunOutcome::Completed), &sink)
+            .expect("harness failure reply");
+
+        let events = sink.events();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            [CONTROL_REQUESTED, CONTROL_APPLIED, RUN_FINISHED]
+        );
+        let applied: ControlAppliedPayload = payload(&events[1]);
+        assert!(!applied.ok);
+        let Some(ControlAppliedReason::Unknown(retained)) = &applied.reason else {
+            panic!("expected the harness diagnostic as an unknown reason");
+        };
+        assert_eq!(retained.chars().count(), MAX_EXCERPT_SCALARS);
+        assert_eq!(
+            retained,
+            &diagnostic
+                .chars()
+                .take(MAX_EXCERPT_SCALARS)
+                .collect::<String>()
+        );
+        assert_eq!(applied.truncated, Some(true));
+        assert!(applied.extra.is_empty());
+        validate(CONTROL_APPLIED, &applied).expect("valid bounded harness diagnostic");
+        assert_eq!(error, ResumeError::Harness(diagnostic));
+        assert!(!control.is_live());
+    }
+
+    #[test]
+    fn harness_resume_failure_reports_short_diagnostic_without_truncation() {
+        let sink = MemorySink::default();
+        let diagnostic = "harness could not open the session";
+        assert!(diagnostic.chars().count() < MAX_EXCERPT_SCALARS);
+        let resumer = RecordingResumer {
+            error: Some(ResumeError::Harness(diagnostic.to_owned())),
+            ..RecordingResumer::succeeding()
+        };
+        let mut control = RunControl::new(
+            "run-1",
+            Some("session-1".to_owned()),
+            RunCaps::default(),
+            resumer,
+        );
+        control
+            .steer(
+                request("control-1", ControlKind::Steer, Some("next text")),
+                &sink,
+            )
+            .expect("queue steer");
+        control
+            .process_exited(ProcessExit::Normal, finished(RunOutcome::Completed), &sink)
+            .expect("harness failure reply");
+
+        let events = sink.events();
+        let applied: ControlAppliedPayload = payload(&events[1]);
+        assert!(!applied.ok);
+        assert_eq!(
+            applied.reason,
+            Some(ControlAppliedReason::Unknown(diagnostic.to_owned()))
+        );
+        assert_eq!(applied.truncated, None);
+        assert!(events[1].payload.get("truncated").is_none());
+        validate(CONTROL_APPLIED, &applied).expect("valid short harness diagnostic");
         assert!(!control.is_live());
     }
 
@@ -1033,7 +1173,7 @@ mod tests {
 
         assert_eq!(calls.calls(), []);
         let applied: ControlAppliedPayload = payload(&sink.events()[1]);
-        assert_eq!(applied.reason.as_deref(), Some("not-live"));
+        assert_eq!(applied.reason, Some(ControlAppliedReason::NotLive));
     }
 
     #[test]

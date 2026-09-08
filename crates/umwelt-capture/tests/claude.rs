@@ -3,9 +3,9 @@ use std::path::Path;
 
 use ethogram::{
     AGENT_COMPLETED, AGENT_STARTED, AGENT_TEXT, AGENT_TOOL_RESULT, AGENT_TOOL_USE, AGENT_WARNING,
-    CONTROL_APPLIED, CONTROL_REQUESTED, ControlAppliedPayload, ControlKind,
+    CONTROL_APPLIED, CONTROL_REQUESTED, ControlAppliedPayload, ControlAppliedReason, ControlKind,
     ControlRequestedPayload, MAX_EXCERPT_SCALARS, MAX_TEXT_SCALARS, RUN_FINISHED,
-    RunFinishedPayload, RunOutcome, parse_event,
+    RunFinishedPayload, RunOutcome, parse_event, validate,
 };
 use serde_json::json;
 use umwelt_capture::claude::ClaudeNormaliser;
@@ -79,7 +79,7 @@ fn captured_interrupt_pins_control_answers_before_the_terminal() {
         serde_json::from_value(events[5].payload.clone()).expect("steer answer payload");
     assert_eq!(steer_applied.control_id, "capture-steer-1");
     assert!(!steer_applied.ok);
-    assert_eq!(steer_applied.reason.as_deref(), Some("not-live"));
+    assert_eq!(steer_applied.reason, Some(ControlAppliedReason::NotLive));
 
     let finished: RunFinishedPayload =
         serde_json::from_value(events[6].payload.clone()).expect("terminal payload");
@@ -356,15 +356,48 @@ fn every_seeded_ethogram_corpus_fixture_matches_our_mapped_fields() {
         ),
     ];
 
+    // CLAUDE.md principle 1: nothing here decides. These decision events belong
+    // to the governor, now and later: dossier, blastRadius, optionsRuledOut,
+    // recommendedAction, and budget/gate_inconclusive/tripwire kinds express
+    // classifications, gates or verdicts that umwelt must never produce.
+    const NOT_PRODUCED_HERE: [&str; 8] = [
+        "decision-answered-excuse.json",
+        "decision-requested-budget.json",
+        "decision-requested-gate-inconclusive.json",
+        "decision-requested-human-decides-options.json",
+        "decision-requested-human-decides.json",
+        "decision-requested-tripwire.json",
+        "decision-requested-unclassified.json",
+        "decision-requested-unexplained-write.json",
+    ];
+
     let fixtures = ethogram_corpus::v1_fixtures();
     assert_eq!(
         fixtures.len(),
-        CORRESPONDING_EVENTS.len(),
+        CORRESPONDING_EVENTS.len() + NOT_PRODUCED_HERE.len(),
         "the ethogram corpus inventory changed; map and review every new fixture"
     );
 
+    for name in NOT_PRODUCED_HERE {
+        let fixture = fixtures
+            .iter()
+            .find(|fixture| fixture.name == name)
+            .unwrap_or_else(|| panic!("missing exempted ethogram fixture {name:?}"));
+        let event = fixture.parse().expect("parse exempted ethogram fixture");
+        // A future agent.* or control.* fixture cannot be parked in this list
+        // just to make the inventory assertion pass.
+        assert!(
+            event.event_type.starts_with("decision."),
+            "exempted fixture {name:?} must have a decision. event type, got {:?}",
+            event.event_type
+        );
+    }
+
     let mut compared = 0;
     for fixture in fixtures {
+        if NOT_PRODUCED_HERE.contains(&fixture.name) {
+            continue;
+        }
         let (_, case, source_file, line_number) = CORRESPONDING_EVENTS
             .iter()
             .find(|(name, _, _, _)| *name == fixture.name)
@@ -380,6 +413,8 @@ fn every_seeded_ethogram_corpus_fixture_matches_our_mapped_fields() {
         .expect("parse corresponding umwelt event");
         let upstream = fixture.parse().expect("parse ethogram fixture");
 
+        validate(&ours.event_type, &ours.payload).expect("validate umwelt fixture");
+        validate(&upstream.event_type, &upstream.payload).expect("validate ethogram fixture");
         assert_eq!(ours.event_type, upstream.event_type, "{}", fixture.name);
         let ours = ours.payload.as_object().expect("umwelt payload object");
         let upstream = upstream
