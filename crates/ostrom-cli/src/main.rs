@@ -70,6 +70,9 @@ struct Cli {
 enum Command {
     /// Compose signed policy into an immutable content-addressed version.
     Compose {
+        /// Skip the candidate's signature verification and write nothing.
+        #[arg(long)]
+        unsigned: bool,
         /// Operator or repository policy manifest; defaults to repository discovery.
         manifest: Option<PathBuf>,
     },
@@ -91,6 +94,9 @@ enum Command {
         /// Define acceptance by exit status: unresolved references are invalid.
         #[arg(long)]
         strict: bool,
+        /// Skip the candidate's signature verification and write nothing.
+        #[arg(long)]
+        unsigned: bool,
         /// Resolve references against this operator manifest instead of discovery.
         #[arg(long, value_name = "FILE")]
         operator: Option<PathBuf>,
@@ -640,7 +646,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let clock = Clock::realtime();
     let paths = compatible_command_paths();
     match cli.command {
-        Command::Compose { manifest } => {
+        Command::Compose { manifest, unsigned } => {
             let cwd = env::current_dir()?;
             let manifest = if let Some(manifest) = manifest {
                 manifest
@@ -649,7 +655,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     policy_manifest::PolicyLoadError::UngovernedRepository(cwd.clone())
                 })?
             };
-            let outcome = policy_version::run_compose(&paths, &manifest)?;
+            let outcome = policy_version::run_compose(&paths, &manifest, unsigned)?;
             println!(
                 "composed digest={} path={}",
                 outcome.digest,
@@ -664,6 +670,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Validate {
             normalized,
             strict,
+            unsigned,
             operator,
             manifest,
         } => policy_manifest::run_validate(
@@ -671,6 +678,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             &manifest,
             normalized,
             strict,
+            unsigned,
             operator.as_deref(),
         )?,
         Command::Generate { repository, output } => {
@@ -3403,6 +3411,26 @@ mod tests {
     use clap::Parser as _;
 
     use super::{CheckCommand, Cli, Command};
+
+    #[test]
+    fn unsigned_requires_an_explicit_argument_on_compose_or_validate() {
+        for verb in ["compose", "validate"] {
+            for explicit in [false, true] {
+                let mut args = vec!["ostrom", verb, "ostrom.yaml"];
+                if explicit {
+                    args.push("--unsigned");
+                }
+                let parsed = Cli::try_parse_from(args).expect("policy command");
+                let (Command::Compose { unsigned, .. } | Command::Validate { unsigned, .. }) =
+                    parsed.command
+                else {
+                    panic!("unexpected command");
+                };
+                assert_eq!(unsigned, explicit);
+            }
+        }
+        assert!(Cli::try_parse_from(["ostrom", "--unsigned", "compose", "ostrom.yaml"]).is_err());
+    }
 
     #[test]
     fn parses_criteria_run_check() {

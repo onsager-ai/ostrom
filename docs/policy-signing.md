@@ -31,6 +31,38 @@ export OSTROM_POLICY_TRUSTED_KEYS=/run/ostrom/trusted-policy-keys
 ostrom validate /policy/ostrom.yaml
 ```
 
+## Unsigned drafts
+
+To compose or validate a candidate without a signing key at hand, explicitly
+pass `--unsigned`:
+
+```sh
+ostrom compose --unsigned /policy/ostrom.yaml
+ostrom validate --unsigned --strict /policy/ostrom.yaml
+```
+
+Unsigned mode writes nothing. It never creates `versions/<digest>`, moves
+`current`, or changes any other file under `OSTROM_HOME`. It uses the same
+composition and validation checks as the signed commands, skipping only the
+candidate's signature verification. The composed manifest and digest are
+identical for the same authored files, even if a signature is already present.
+A separately loaded operator context still requires a valid signature.
+
+The flag is argv-only: no environment variable, manifest field, configuration
+file, or default enables it. Unsetting or emptying `OSTROM_POLICY_TRUSTED_KEYS`
+without the flag still refuses to load policy. Other commands and snapshot
+loads continue to require signatures.
+
+Compose keeps its existing stdout line, `composed digest=<digest> path=<path>`.
+In unsigned mode that path names where the version would be installed; nothing
+is written there. A separate stderr line states that composition was performed
+without verifying the candidate's signature and that nothing was written.
+Validation keeps its resolution-context output and honours `--strict` and
+`--normalized` as usual.
+
+Trust still follows the signature, not the filesystem. An unsigned draft does
+not become trusted policy; sign it and use signed composition to adopt it.
+
 ## Resolution context
 
 `ostrom validate` resolves a manifest's references in a context. With one — the
