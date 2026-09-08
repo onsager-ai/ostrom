@@ -48,6 +48,39 @@ A valid steer is recorded as `control.requested`, immediately followed by
 `control.applied` with `ok: false`, `reason: "unsupported"`, and the same `by`.
 Nothing is queued, and the pass continues to its normal terminal event.
 
+## Answers are not delivered to a running pass
+
+A pass does not accept an answer to a decision through this descriptor. A
+control verb other than `interrupt` — including an `answer` verb a supervisor
+might try to send — is recorded as `control.requested` and immediately
+answered with `control.applied`, `ok: false`, `reason: "unsupported"`, and the
+same `by`, exactly as steering is above. This is the same path, not a special
+case carved out for answers.
+
+The reason is structural, not a missing feature. The harness is spawned
+headless, with `--print` and `stdout` piped for capture; it has no writable
+stdin, so there is no channel on which a running pass could be handed an
+answer even if ostrom wanted to send one. The session's `RunControl` is built
+with `NoSteer`, which cannot resume the harness session either. This is the
+same limitation that makes steering unsupported above, not a second one.
+
+ostrom itself never raises a permission decision. Where a permission decision
+raised elsewhere is rendered for a principal, ostrom's hook output directs the
+reader to "Answer through the requesting process" rather than offering a
+command, because there is no `ostrom queue` verb for it. A decision ostrom
+does raise — a tripwire, a gate inconclusive, a budget decision, or one put
+to a human — is answered out of band, by a separate `ostrom
+queue` invocation that emits its own `decision.answered` on its own run; the
+pass that raised the decision has usually already finished by the time that
+answer lands.
+
+A supervisor should treat `reason: "unsupported"` on an attempted answer as a
+definite negative acknowledgement, not as a reason to wait for a timeout, and
+should deliver the actual answer through the out-of-band `ostrom queue` path
+instead. ostrom issue #528 tracks a permission bridge that would let a
+running pass be answered directly; until that lands, the descriptor behaves
+as described here.
+
 Malformed JSON, invalid drafts, and other event types produce
 `capture.refused` with `cause: "malformed"` and a bounded explanation. The reader
 continues with the next line, including after invalid UTF-8. An unavailable or
@@ -66,5 +99,5 @@ finish. Nothing is emitted after `run.finished`.
 Without a control descriptor, there is no reader and stdin is not interpreted
 as control input. Existing pass output, capture bytes, signal handling, identity
 files, and the `pass-ended` fact are unchanged. The only argv addition is the
-optional descriptor flag. Dependency revisions remain ethogram `ba892e84` and
-umwelt `fdfc928a`.
+optional descriptor flag. Dependency revisions remain ethogram `9e3cd370` and
+umwelt `1c2c1f60`.
