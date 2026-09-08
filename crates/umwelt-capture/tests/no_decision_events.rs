@@ -10,9 +10,23 @@ fn source_trees_do_not_author_decision_events() {
     let crates = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("crates directory");
-    for name in ["umwelt-runtime", "umwelt-capture"] {
-        scan_source_tree(&crates.join(name).join("src"));
+    // Every crate in the workspace, discovered rather than listed. A hardcoded
+    // pair would silently stop covering umwelt-companion the day it is added,
+    // and the companion is the crate closest to the line: its permission bridge
+    // transports a human's decision, and a rule or a remembered answer living
+    // there would be the governor on a laptop that principle 1 forbids.
+    let mut scanned = 0;
+    for entry in fs::read_dir(crates).expect("read crates directory") {
+        let source_tree = entry.expect("crates entry").path().join("src");
+        if source_tree.is_dir() {
+            scan_source_tree(&source_tree);
+            scanned += 1;
+        }
     }
+    assert!(
+        scanned >= 2,
+        "expected to scan every crate's src tree, scanned {scanned}"
+    );
 }
 
 fn scan_source_tree(directory: &Path) {
