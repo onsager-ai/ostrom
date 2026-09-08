@@ -25,34 +25,92 @@ pub(crate) fn run_validate(
     paths: &OstromPaths,
     path: &Path,
     normalized: bool,
+    strict: bool,
+    operator: Option<&Path>,
 ) -> Result<(), PolicyLoadError> {
     let normalized_path = normalize_manifest_path(path);
     let loaded = load_composed(&normalized_path)?;
-    validate_manifest(&loaded.manifest)?;
-    verify(&loaded.manifest, &normalized_path)?;
-    let operator_path = operator_manifest_path(paths)?;
-    let bundle = if operator_path
-        .as_deref()
-        .is_some_and(|operator| same_file(operator, &normalized_path))
-    {
-        PolicyBundle::operator(loaded.manifest.clone(), loaded.origins)
+    let operator_path = match operator {
+        Some(path) => Some(normalize_manifest_path(path).into_owned()),
+        None => operator_manifest_path(paths)?,
+    };
+    let mut unresolved = Vec::new();
+    let bundle = if operator_path.is_some() {
+        verify(&loaded.manifest, &normalized_path)?;
+        let bundle = build_bundle_with_operator(
+            normalized_path.into_owned(),
+            loaded.clone(),
+            operator_path.clone(),
+        )?;
+        validate_manifest(&bundle.manifest)?;
+        bundle
     } else {
-        PolicyBundle::repository_with_origins(loaded.manifest.clone(), loaded.origins)
+        unresolved = loaded
+            .manifest
+            .validate_in_context(None)
+            .map_err(|error| PolicyLoadError::Validation(error.to_string()))?;
+        validate_operation_names(&loaded.manifest)?;
+        validate_check_requirements(&loaded.manifest)?;
+        verify(&loaded.manifest, &normalized_path)?;
+        unresolved.sort_by_key(|reference| {
+            loaded
+                .reference_order
+                .iter()
+                .position(|path| path == &reference.path)
+        });
+        if strict && unresolved.is_empty() {
+            let bundle =
+                build_bundle_with_operator(normalized_path.into_owned(), loaded.clone(), None)?;
+            validate_manifest(&bundle.manifest)?;
+            bundle
+        } else {
+            PolicyBundle::repository_with_origins(loaded.manifest.clone(), loaded.origins.clone())
+        }
     };
     report_actor_portability_findings(bundle.actor_portability_findings());
-    // Resolve the ladder even when normalized output was not requested. This
-    // catches a present environment value with the wrong declared type while
-    // never placing its raw value in diagnostics.
-    loaded
-        .manifest
+    validate_command_manifest(path, &bundle.manifest)?;
+
+    let context = match operator_path {
+        Some(operator) => format!("resolved against operator {}", operator.display()),
+        None if unresolved.is_empty() => "isolated".to_owned(),
+        None => format!("isolated; {} unresolved", unresolved.len()),
+    };
+    println!("valid: {} ({context})", path.display());
+    for reference in &unresolved {
+        println!("unresolved: {} -> {}", reference.path, reference.name);
+    }
+    if strict && !unresolved.is_empty() {
+        return Err(PolicyLoadError::Validation(format!(
+            "{} unresolved reference(s) in isolation",
+            unresolved.len()
+        )));
+    }
+    if normalized {
+        print!(
+            "{}",
+            loaded
+                .manifest
+                .to_yaml()
+                .map_err(|error| PolicyLoadError::Validation(error.to_string()))?
+        );
+    }
+    Ok(())
+}
+
+// Validation and composition use the same input, selector, and adjacent-policy
+// checks as well as the same scope resolver to define acceptance.
+fn validate_command_manifest(
+    path: &Path,
+    manifest: &PolicyManifest,
+) -> Result<(), PolicyLoadError> {
+    manifest
         .resolve_inputs(ostrom_store::environment::declared_input)
         .map_err(|error| PolicyLoadError::Validation(error.to_string()))?;
-
     let verbs = command_verbs()
         .map(str::to_owned)
-        .chain(loaded.manifest.operations.keys().cloned());
-    let universe = SelectorUniverse::from_manifest(&loaded.manifest, verbs);
-    let findings = loaded.manifest.selector_findings(&universe);
+        .chain(manifest.operations.keys().cloned());
+    let universe = SelectorUniverse::from_manifest(manifest, verbs);
+    let findings = manifest.selector_findings(&universe);
     for finding in &findings {
         if let SelectorFinding::Empty {
             rule,
@@ -73,20 +131,7 @@ pub(crate) fn run_validate(
     if let Some(finding) = findings.iter().find(|finding| finding.is_error()) {
         return Err(PolicyLoadError::Selector(format_finding(finding)));
     }
-    validate_adjacent_legacy_policy(path)?;
-
-    if normalized {
-        print!(
-            "{}",
-            loaded
-                .manifest
-                .to_yaml()
-                .map_err(|error| PolicyLoadError::Validation(error.to_string()))?
-        );
-    } else {
-        println!("valid: {}", path.display());
-    }
-    Ok(())
+    validate_adjacent_legacy_policy(path)
 }
 
 fn same_file(left: &Path, right: &Path) -> bool {
@@ -198,6 +243,7 @@ pub(crate) fn compose_manifest(
 ) -> Result<PolicyManifest, PolicyLoadError> {
     let bundle = load_bundle(paths, path)?;
     validate_manifest(&bundle.manifest)?;
+    validate_command_manifest(path, &bundle.manifest)?;
     Ok(bundle.manifest)
 }
 
@@ -206,7 +252,14 @@ fn build_bundle(
     repository_path: PathBuf,
     repository: LoadedManifest,
 ) -> Result<PolicyBundle, PolicyLoadError> {
-    let operator_path = operator_manifest_path(paths)?;
+    build_bundle_with_operator(repository_path, repository, operator_manifest_path(paths)?)
+}
+
+fn build_bundle_with_operator(
+    repository_path: PathBuf,
+    repository: LoadedManifest,
+    operator_path: Option<PathBuf>,
+) -> Result<PolicyBundle, PolicyLoadError> {
     if operator_path
         .as_deref()
         .is_some_and(|operator_path| same_file(operator_path, &repository_path))
@@ -315,6 +368,7 @@ pub(crate) fn load_bundle_at_base(
             LoadedManifest {
                 origins: PolicyOrigins::from_root(&manifest, &path),
                 manifest,
+                reference_order: Vec::new(),
             },
         );
     };
@@ -975,10 +1029,11 @@ fn load_unverified(path: &Path) -> Result<PolicyManifest, PolicyLoadError> {
     Ok(loaded.manifest)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct LoadedManifest {
     manifest: PolicyManifest,
     origins: PolicyOrigins,
+    reference_order: Vec<String>,
 }
 
 fn load_composed(path: &Path) -> Result<LoadedManifest, PolicyLoadError> {
@@ -988,6 +1043,15 @@ fn load_composed(path: &Path) -> Result<LoadedManifest, PolicyLoadError> {
             path: path.to_path_buf(),
             source,
         })?;
+    let mut reference_order = Vec::new();
+    collect_reference_order(
+        &serde_yaml::from_str::<JsonValue>(&source).map_err(|source| PolicyLoadError::Yaml {
+            path: path.to_path_buf(),
+            source,
+        })?,
+        "",
+        &mut reference_order,
+    );
     let includes = std::mem::take(&mut manifest.includes);
     let mut origins = PolicyOrigins::from_root(&manifest, path);
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
@@ -1001,11 +1065,33 @@ fn load_composed(path: &Path) -> Result<LoadedManifest, PolicyLoadError> {
             });
         }
         for include in matches {
-            merge_include(&mut manifest, &mut origins, &include)?;
+            merge_include(&mut manifest, &mut origins, &include, &mut reference_order)?;
         }
     }
     materialize_prompt_files(&mut manifest, &origins)?;
-    Ok(LoadedManifest { manifest, origins })
+    Ok(LoadedManifest {
+        manifest,
+        origins,
+        reference_order,
+    })
+}
+
+// Keep source order separately from the domain's sorted maps. Includes follow
+// root declarations, in include expansion order, with leaf identities mapped to
+// their dotted locations in the composed manifest. The order-preserving JSON map
+// decodes root keys as strings just like PolicyManifest, including numeric IDs.
+fn collect_reference_order(value: &JsonValue, prefix: &str, order: &mut Vec<String>) {
+    if let Some(mapping) = value.as_object() {
+        for (key, value) in mapping {
+            let path = if prefix.is_empty() {
+                key.to_owned()
+            } else {
+                format!("{prefix}.{key}")
+            };
+            order.push(path.clone());
+            collect_reference_order(value, &path, order);
+        }
+    }
 }
 
 fn materialize_prompt_files(
@@ -1142,6 +1228,7 @@ fn merge_include(
     manifest: &mut PolicyManifest,
     origins: &mut PolicyOrigins,
     path: &Path,
+    reference_order: &mut Vec<String>,
 ) -> Result<(), PolicyLoadError> {
     let source = read(path)?;
     let value: Value = serde_yaml::from_str(&source).map_err(|source| PolicyLoadError::Yaml {
@@ -1173,8 +1260,21 @@ fn merge_include(
         });
     }
     if let Some(marker) = markers.first() {
+        if let Some(id) = mapping.get(*marker).and_then(Value::as_str) {
+            let section = if *marker == "deny" {
+                "denies".to_owned()
+            } else {
+                format!("{marker}s")
+            };
+            let ordered = serde_json::to_value(&value)
+                .map_err(|error| PolicyLoadError::Validation(error.to_string()))?;
+            collect_reference_order(&ordered, &format!("{section}.{id}"), reference_order);
+        }
         merge_leaf(manifest, origins, path, mapping.clone(), marker)
     } else {
+        let ordered = serde_json::to_value(&value)
+            .map_err(|error| PolicyLoadError::Validation(error.to_string()))?;
+        collect_reference_order(&ordered, "", reference_order);
         let fragment: IncludeFragment =
             serde_yaml::from_value(value).map_err(|source| PolicyLoadError::Yaml {
                 path: path.to_path_buf(),

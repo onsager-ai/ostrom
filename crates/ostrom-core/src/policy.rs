@@ -99,6 +99,37 @@ impl PolicyManifest {
     }
 
     pub fn validate(&self) -> Result<(), ManifestValidationError> {
+        self.validate_references(None, &mut Err)
+    }
+
+    /// Validate with an optional manifest supplying actor and operation declarations.
+    /// In isolation, collect references that may resolve elsewhere; with a context,
+    /// every reference must resolve. All other validation errors remain fatal.
+    pub fn validate_in_context(
+        &self,
+        context: Option<&Self>,
+    ) -> Result<Vec<UnresolvedReference>, ManifestValidationError> {
+        let mut unresolved = Vec::new();
+        self.validate_references(context, &mut |error| {
+            if context.is_some() {
+                return Err(error);
+            }
+            match error.unresolved_reference() {
+                Some(reference) => {
+                    unresolved.push(reference);
+                    Ok(())
+                }
+                None => Err(error),
+            }
+        })?;
+        Ok(unresolved)
+    }
+
+    fn validate_references(
+        &self,
+        context: Option<&Self>,
+        reference_error: &mut impl FnMut(ManifestValidationError) -> Result<(), ManifestValidationError>,
+    ) -> Result<(), ManifestValidationError> {
         if self.manifest_version != POLICY_MANIFEST_VERSION {
             return Err(ManifestValidationError::ManifestVersion(
                 self.manifest_version,
@@ -165,26 +196,31 @@ impl PolicyManifest {
             }
         }
         for (name, declaration) in &self.loops {
-            self.validate_loop(name, declaration)?;
+            self.validate_loop(name, declaration, context, reference_error)?;
         }
         for (kind, rules) in [("grant", &self.grants), ("deny", &self.denies)] {
             for (id, rule) in rules {
                 for actor in rule.actors.iter() {
-                    if !self.actors.contains_key(actor) {
-                        return Err(ManifestValidationError::UnknownActor {
+                    if !self.actors.contains_key(actor)
+                        && !context.is_some_and(|manifest| manifest.actors.contains_key(actor))
+                    {
+                        reference_error(ManifestValidationError::UnknownActor {
                             kind,
                             rule: id.clone(),
                             actor: actor.clone(),
-                        });
+                        })?;
                     }
                 }
                 for operation in rule.operations.iter() {
-                    if !self.operations.contains_key(operation) {
-                        return Err(ManifestValidationError::UnknownOperation {
+                    if !self.operations.contains_key(operation)
+                        && !context
+                            .is_some_and(|manifest| manifest.operations.contains_key(operation))
+                    {
+                        reference_error(ManifestValidationError::UnknownOperation {
                             kind,
                             rule: id.clone(),
                             operation: operation.clone(),
-                        });
+                        })?;
                     }
                 }
                 if let Some(selector) = rule
@@ -207,6 +243,8 @@ impl PolicyManifest {
         &self,
         name: &str,
         declaration: &LoopDecl,
+        context: Option<&Self>,
+        reference_error: &mut impl FnMut(ManifestValidationError) -> Result<(), ManifestValidationError>,
     ) -> Result<(), ManifestValidationError> {
         if !valid_policy_id(name) {
             return Err(ManifestValidationError::InvalidLoop {
@@ -214,11 +252,13 @@ impl PolicyManifest {
                 message: "name must contain only lowercase letters, digits, or `-`".to_owned(),
             });
         }
-        if !self.actors.contains_key(&declaration.actor) {
-            return Err(ManifestValidationError::UnknownLoopActor {
+        if !self.actors.contains_key(&declaration.actor)
+            && !context.is_some_and(|manifest| manifest.actors.contains_key(&declaration.actor))
+        {
+            reference_error(ManifestValidationError::UnknownLoopActor {
                 name: name.to_owned(),
                 actor: declaration.actor.clone(),
-            });
+            })?;
         }
         if !valid_actor_id(&declaration.actor) {
             return Err(ManifestValidationError::InvalidLoop {
@@ -227,39 +267,43 @@ impl PolicyManifest {
                     .to_owned(),
             });
         }
-        let operation = self.operations.get(&declaration.operation).ok_or_else(|| {
-            ManifestValidationError::UnknownLoopOperation {
+        let operation = self.operations.get(&declaration.operation).or_else(|| {
+            context.and_then(|manifest| manifest.operations.get(&declaration.operation))
+        });
+        if let Some(operation) = operation {
+            for parameter in declaration.parameters.keys() {
+                if !operation.params.contains_key(parameter) {
+                    return Err(ManifestValidationError::InvalidLoop {
+                        name: name.to_owned(),
+                        message: format!(
+                            "parameter `{parameter}` is not declared by operation `{}`",
+                            declaration.operation
+                        ),
+                    });
+                }
+            }
+            for (parameter, parameter_decl) in &operation.params {
+                let value = declaration
+                    .parameters
+                    .get(parameter)
+                    .or(parameter_decl.default.as_ref());
+                let Some(value) = value else {
+                    return Err(ManifestValidationError::InvalidLoop {
+                        name: name.to_owned(),
+                        message: format!("required operation parameter `{parameter}` is missing"),
+                    });
+                };
+                parameter_decl.validate_value(value).map_err(|message| {
+                    ManifestValidationError::InvalidLoop {
+                        name: name.to_owned(),
+                        message: format!("operation parameter `{parameter}` is invalid: {message}"),
+                    }
+                })?;
+            }
+        } else {
+            reference_error(ManifestValidationError::UnknownLoopOperation {
                 name: name.to_owned(),
                 operation: declaration.operation.clone(),
-            }
-        })?;
-        for parameter in declaration.parameters.keys() {
-            if !operation.params.contains_key(parameter) {
-                return Err(ManifestValidationError::InvalidLoop {
-                    name: name.to_owned(),
-                    message: format!(
-                        "parameter `{parameter}` is not declared by operation `{}`",
-                        declaration.operation
-                    ),
-                });
-            }
-        }
-        for (parameter, parameter_decl) in &operation.params {
-            let value = declaration
-                .parameters
-                .get(parameter)
-                .or(parameter_decl.default.as_ref());
-            let Some(value) = value else {
-                return Err(ManifestValidationError::InvalidLoop {
-                    name: name.to_owned(),
-                    message: format!("required operation parameter `{parameter}` is missing"),
-                });
-            };
-            parameter_decl.validate_value(value).map_err(|message| {
-                ManifestValidationError::InvalidLoop {
-                    name: name.to_owned(),
-                    message: format!("operation parameter `{parameter}` is invalid: {message}"),
-                }
             })?;
         }
         validate_positive_ceiling(name, "concurrent", declaration.concurrent.map(|v| v as f64))?;
@@ -492,6 +536,41 @@ pub enum ManifestValidationError {
     },
     #[error(transparent)]
     Operation(#[from] OperationActionError),
+}
+
+/// A cross-manifest reference that cannot be resolved in isolation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedReference {
+    pub path: String,
+    pub name: String,
+}
+
+impl ManifestValidationError {
+    fn unresolved_reference(&self) -> Option<UnresolvedReference> {
+        let (path, name) = match self {
+            Self::UnknownActor { kind, rule, actor } => {
+                let section = if *kind == "deny" { "denies" } else { "grants" };
+                (format!("{section}.{rule}.actors"), actor)
+            }
+            Self::UnknownOperation {
+                kind,
+                rule,
+                operation,
+            } => {
+                let section = if *kind == "deny" { "denies" } else { "grants" };
+                (format!("{section}.{rule}.operations"), operation)
+            }
+            Self::UnknownLoopActor { name, actor } => (format!("loops.{name}.actor"), actor),
+            Self::UnknownLoopOperation { name, operation } => {
+                (format!("loops.{name}.operation"), operation)
+            }
+            _ => return None,
+        };
+        Some(UnresolvedReference {
+            path,
+            name: name.clone(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1898,6 +1977,197 @@ denies:
             repository: "placeholder-org/alpha".to_owned(),
             labels: labels.iter().map(|label| (*label).to_owned()).collect(),
             ..PolicyCandidate::default()
+        }
+    }
+
+    #[test]
+    fn contextual_validation_collects_only_cross_manifest_references() {
+        let source = concat!(
+            "manifest_version: 1\n",
+            "grants: {delegated: {actors: builder, operations: work}}\n",
+            "denies: {protected: {actors: builder, operations: work}}\n",
+            "loops: {daily: {actor: builder, operation: work, target: example/repo, every: hourly}}\n",
+        );
+        let manifest = PolicyManifest::parse_yaml(source).expect("parse references");
+        let unresolved = manifest
+            .validate_in_context(None)
+            .expect("well formed in isolation");
+        assert_eq!(
+            unresolved,
+            [
+                ("loops.daily.actor", "builder"),
+                ("loops.daily.operation", "work"),
+                ("grants.delegated.actors", "builder"),
+                ("grants.delegated.operations", "work"),
+                ("denies.protected.actors", "builder"),
+                ("denies.protected.operations", "work"),
+            ]
+            .map(|(path, name)| UnresolvedReference {
+                path: path.to_owned(),
+                name: name.to_owned()
+            })
+        );
+        let first_error = ManifestValidationError::UnknownLoopActor {
+            name: "daily".to_owned(),
+            actor: "builder".to_owned(),
+        };
+        assert_eq!(manifest.validate(), Err(first_error.clone()));
+        assert!(
+            matches!(PolicyManifest::from_yaml(source), Err(ManifestError::Invalid(error)) if error == first_error)
+        );
+        let context = PolicyManifest::from_yaml(
+            "manifest_version: 1\nactors: {builder: {}}\noperations: {work: {steps: []}}\n",
+        )
+        .expect("context");
+        assert!(
+            manifest
+                .validate_in_context(Some(&context))
+                .expect("resolved references")
+                .is_empty()
+        );
+        for source in [
+            "manifest_version: 1\n",
+            "manifest_version: 1\nactors: {builder: {}}\n",
+        ] {
+            let context = PolicyManifest::from_yaml(source).expect("incomplete context");
+            assert!(manifest.validate_in_context(Some(&context)).is_err());
+        }
+        for source in [
+            "manifest_version: 1\ngrants: {delegated: {actors: builder}}\n",
+            "manifest_version: 1\ndenies: {protected: {operations: work}}\n",
+        ] {
+            let manifest = PolicyManifest::parse_yaml(source).expect("rule reference");
+            let context =
+                PolicyManifest::from_yaml("manifest_version: 1\n").expect("empty context");
+            assert!(manifest.validate_in_context(Some(&context)).is_err());
+        }
+    }
+
+    #[test]
+    fn unresolved_references_do_not_hide_hard_validation_errors() {
+        let cases = [
+            (
+                "version",
+                "manifest_version: 2\n",
+                "unsupported manifest_version",
+            ),
+            (
+                "secret",
+                "inputs: {token: {type: string, secret: true, default: value}}\n",
+                "secret input",
+            ),
+            (
+                "input",
+                "inputs: {count: {type: integer, default: wrong}}\n",
+                "invalid default",
+            ),
+            (
+                "selector",
+                "grants: {bad: {actors: absent, where: 'label:$inputs.area'}}\n",
+                "input-dependent",
+            ),
+            (
+                "checks",
+                "checks: {bad: {uses: absent/action, with: {}}}\n",
+                "checks are invalid",
+            ),
+            (
+                "prompt name",
+                "prompts: {BAD: text}\n",
+                "prompt `BAD` is invalid",
+            ),
+            (
+                "prompt alias",
+                "prompts: {bad: prompts.absent}\n",
+                "declared prompts must be inline",
+            ),
+            (
+                "prompt reference",
+                "operations: {work: {steps: [{uses: agent/claude, with: {prompt: prompts.absent}}]}}\n",
+                "unknown prompt",
+            ),
+            (
+                "operation",
+                "operations: {work: {steps: [{uses: absent/action}]}}\n",
+                "unknown action",
+            ),
+        ];
+        for (name, body, message) in cases {
+            let source = if name == "version" {
+                body.to_owned()
+            } else {
+                format!("manifest_version: 1\n{body}")
+            };
+            let manifest = PolicyManifest::parse_yaml(&source).expect("parse malformed semantics");
+            let context = PolicyManifest::from_yaml("manifest_version: 1\nactors: {absent: {}}\n")
+                .expect("actor context");
+            for context in [None, Some(&context)] {
+                let error = manifest.validate_in_context(context).expect_err(name);
+                assert!(error.to_string().contains(message), "{name}: {error}");
+            }
+        }
+        for (name, body, message) in [
+            (
+                "BAD",
+                "actor: absent, operation: absent",
+                "name must contain",
+            ),
+            (
+                "daily",
+                "actor: BAD, operation: absent",
+                "actor id must contain",
+            ),
+            (
+                "daily",
+                "actor: absent, operation: absent, concurrent: 0",
+                "`concurrent` must be finite and positive",
+            ),
+            (
+                "daily",
+                "actor: absent, operation: absent, spend_usd: -1",
+                "`spend_usd` must be finite and positive",
+            ),
+            (
+                "daily",
+                "actor: absent, operation: absent, tokens: 0",
+                "`tokens` must be finite and positive",
+            ),
+            (
+                "daily",
+                "actor: absent, operation: absent, cadence_hours: 0",
+                "`cadence_hours` must be positive",
+            ),
+            (
+                "daily",
+                "actor: absent, operation: absent, stuck_after_days: 0",
+                "`stuck_after_days` must be positive",
+            ),
+            (
+                "daily",
+                "actor: absent, operation: work, with: {extra: value}",
+                "not declared by operation",
+            ),
+            (
+                "daily",
+                "actor: absent, operation: work",
+                "required operation parameter",
+            ),
+            (
+                "daily",
+                "actor: absent, operation: work, with: {count: wrong}",
+                "operation parameter `count` is invalid",
+            ),
+        ] {
+            let source = format!(
+                "manifest_version: 1\noperations: {{work: {{params: {{count: {{type: semver}}}}, steps: []}}}}\nloops: {{{name}: {{{body}, target: example/repo, every: hourly}}}}\n"
+            );
+            let manifest = PolicyManifest::parse_yaml(&source).expect("parse loop");
+            let error = manifest.validate_in_context(None).expect_err(body);
+            assert!(
+                matches!(error, ManifestValidationError::InvalidLoop { .. }),
+                "{error}"
+            );
+            assert!(error.to_string().contains(message), "{body}: {error}");
         }
     }
 

@@ -17,7 +17,11 @@ fn fixture() -> (TempDir, PathBuf) {
 }
 
 fn ostrom() -> Command {
+    static ISOLATED_HOME: std::sync::OnceLock<TempDir> = std::sync::OnceLock::new();
+    let home = ISOLATED_HOME.get_or_init(|| TempDir::new().expect("isolated operator home"));
     let mut command = Command::new(env!("CARGO_BIN_EXE_ostrom"));
+    command.env("OSTROM_HOME", home.path());
+    command.env_remove("OSTROM_POLICY_MANIFEST");
     command.env_remove("OSTROM_FIXTURE_CADENCE");
     command.env_remove("OSTROM_FIXTURE_TOKEN");
     command
@@ -45,7 +49,18 @@ fn normalized_manifest(working_directory: &Path, manifest: &Path, trusted_keys: 
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    output.stdout
+    normalized_yaml(output.stdout)
+}
+
+fn normalized_yaml(stdout: Vec<u8>) -> Vec<u8> {
+    let text = String::from_utf8(stdout).expect("UTF-8 normalized output");
+    let (context, rest) = text.split_once('\n').expect("context line");
+    assert!(context.starts_with("valid: "), "{context}");
+    rest.lines()
+        .skip_while(|line| line.starts_with("unresolved: "))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .into_bytes()
 }
 
 #[test]
@@ -230,7 +245,8 @@ fn validate_and_normalized_accept_the_composed_fixture() {
         "{}",
         String::from_utf8_lossy(&normalized.stderr)
     );
-    let yaml = String::from_utf8(normalized.stdout).expect("normalized YAML is UTF-8");
+    let yaml =
+        String::from_utf8(normalized_yaml(normalized.stdout)).expect("normalized YAML is UTF-8");
     assert!(!yaml.contains("includes:"));
     assert!(yaml.contains("actors:\n    - builder"), "{yaml}");
     PolicyManifest::from_yaml(&yaml).expect("normalized output remains a valid manifest");
@@ -247,7 +263,7 @@ fn fixture_reproduces_builder_decisions_for_all_eleven_repositories() {
         .expect("run normalized validate");
     assert!(output.status.success());
     let manifest = PolicyManifest::from_yaml(
-        &String::from_utf8(output.stdout).expect("normalized YAML is UTF-8"),
+        &String::from_utf8(normalized_yaml(output.stdout)).expect("normalized YAML is UTF-8"),
     )
     .expect("normalized manifest parses");
 
@@ -287,7 +303,7 @@ fn duhem_area_schema_replay_resolves_to_builder() {
         .output()
         .expect("run normalized validate");
     let manifest = PolicyManifest::from_yaml(
-        &String::from_utf8(output.stdout).expect("normalized YAML is UTF-8"),
+        &String::from_utf8(normalized_yaml(output.stdout)).expect("normalized YAML is UTF-8"),
     )
     .expect("normalized manifest parses");
     let candidate = PolicyCandidate {
@@ -360,7 +376,7 @@ fn deny_beats_grant_in_either_include_order() {
             .expect("run validate");
         assert!(output.status.success());
         let manifest = PolicyManifest::from_yaml(
-            &String::from_utf8(output.stdout).expect("normalized YAML is UTF-8"),
+            &String::from_utf8(normalized_yaml(output.stdout)).expect("normalized YAML is UTF-8"),
         )
         .expect("normalized manifest parses");
         let candidate = PolicyCandidate {
@@ -674,7 +690,10 @@ fn inline_and_leaf_checks_compose_and_sign_identically() {
         .expect("normalize leaf manifest");
     assert!(inline_normalized.status.success());
     assert!(leaf_normalized.status.success());
-    assert_eq!(inline_normalized.stdout, leaf_normalized.stdout);
+    assert_eq!(
+        normalized_yaml(inline_normalized.stdout),
+        normalized_yaml(leaf_normalized.stdout)
+    );
     assert_eq!(
         fs::read(inline_manifest.with_extension("yml.sig")).expect("read inline signature"),
         fs::read(leaf_manifest.with_extension("yml.sig")).expect("read leaf signature")
