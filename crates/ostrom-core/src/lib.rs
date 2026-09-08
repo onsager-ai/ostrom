@@ -64,7 +64,7 @@ pub use policy::{
     PolicySelectorError, PromptFileReference, PromptNamedReference, PromptResolutionError,
     PromptValue, ResolvedInput, ResolvedLoop, ResolvedLoopCeilings, RuleDecl, RuleDefaults,
     SelectorFinding, SelectorMatch, SelectorPrefix, SelectorResolutionError, SelectorUniverse,
-    StallDuration, StallDurationError, StepDecl, UnmatchedPolicy, UnresolvedReference,
+    StallDuration, StallDurationError, StepDecl, SweepPolicy, UnmatchedPolicy, UnresolvedReference,
 };
 pub use store::{
     AttemptOutcome, CHECK_STORE_SCHEMA_VERSION, CheckRun, CheckRunId, CheckStore, CheckStoreFault,

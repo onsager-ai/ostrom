@@ -248,6 +248,30 @@ this with `crontab -e`:
 0 * * * * OSTROM_HOME=/absolute/path/to/scratch /absolute/path/to/ostrom sweep
 ```
 
+To refresh a roster subset, use `ostrom sweep --repositories
+placeholder-org/alpha,placeholder-org/beta`. Every other roster repository must
+have a prior sweep state; its queue and state records are carried forward, and
+it contributes no new velocity observation. Unknown repository names refuse
+before any write. `--mode` still independently selects how much history to read
+for each selected repository. Without `--repositories`, output and generation
+bytes follow the existing full-roster behavior.
+
+Policy may optionally declare:
+
+```yaml
+sweep:
+  max_age: 30m
+  detect_every: 5m
+```
+
+Those are the defaults for an authored `sweep: {}` section. Durations use a
+positive integer followed by `s`, `m`, `h`, `d`, or `w`, exactly as check
+freshness durations do. These values describe cadence for callers, not a
+scheduler this crate starts. Nothing reads `detect_every` yet: it is the cadence
+for the change detection tracked in ostrom #531, which ships no flag here.
+`init` omits the section. Authored sweep loops and the `sweep` loop preset
+remain available for a local schedule.
+
 The SessionStart hook never calls `gh`; it renders the durable files written by
 the scheduled sweep and performs only the local portion of the drift scan. It
 emits one JSON document whose

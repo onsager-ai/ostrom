@@ -471,7 +471,7 @@ fn positive_freshness(seconds: u64) -> Result<u64, FreshnessError> {
         .ok_or(FreshnessError::Invalid)
 }
 
-fn parse_duration(value: &str) -> Result<u64, FreshnessError> {
+pub(crate) fn parse_duration(value: &str) -> Result<u64, FreshnessError> {
     let split = value
         .find(|character: char| !character.is_ascii_digit())
         .ok_or(FreshnessError::Invalid)?;

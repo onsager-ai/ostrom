@@ -39,6 +39,25 @@ pub struct PolicyManifest {
     pub denies: BTreeMap<String, RuleDecl>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub loops: BTreeMap<String, LoopDecl>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sweep: Option<SweepPolicy>,
+}
+
+/// Freshness and detection cadence for callers scheduling portfolio reads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SweepPolicy {
+    pub max_age: String,
+    pub detect_every: String,
+}
+
+impl Default for SweepPolicy {
+    fn default() -> Self {
+        Self {
+            max_age: "30m".to_owned(),
+            detect_every: "5m".to_owned(),
+        }
+    }
 }
 
 impl PolicyManifest {
@@ -134,6 +153,15 @@ impl PolicyManifest {
             return Err(ManifestValidationError::ManifestVersion(
                 self.manifest_version,
             ));
+        }
+        if let Some(sweep) = &self.sweep {
+            for (field, value) in [
+                ("max_age", &sweep.max_age),
+                ("detect_every", &sweep.detect_every),
+            ] {
+                crate::check::parse_duration(value)
+                    .map_err(|_| ManifestValidationError::InvalidSweepDuration(field))?;
+            }
         }
         for (name, declaration) in &self.inputs {
             if declaration.secret && declaration.default.is_some() {
@@ -494,6 +522,8 @@ pub enum PromptResolutionError {
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ManifestValidationError {
+    #[error("sweep.{0} must be a positive integer duration ending in s, m, h, d, or w")]
+    InvalidSweepDuration(&'static str),
     #[error("unsupported manifest_version {0}; expected 1")]
     ManifestVersion(u32),
     #[error("secret input `{0}` may not carry a committed default")]

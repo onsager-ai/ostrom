@@ -129,6 +129,8 @@ pub struct SweepOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SweepOutcome {
     pub project_count: usize,
+    pub repositories_read: usize,
+    pub repositories_carried: usize,
     pub queue_changes: usize,
     pub mode: SweepMode,
     pub faults: Vec<String>,
@@ -271,7 +273,7 @@ pub fn run_sweep_with_publication_source(
     source: &dyn PublicationSource,
 ) -> Result<SweepOutcome, SweepError> {
     let mut minter = GitHubInstallationTokenMinter;
-    run_sweep_with_minter_and_publication_source(options, source, &mut minter)
+    run_sweep_with_minter_and_publication_source(options, source, &mut minter, None)
         .map(|(outcome, _mirror)| outcome)
 }
 
@@ -280,7 +282,7 @@ pub fn run_sweep_with_mirror(
 ) -> Result<(SweepOutcome, Vec<RepositorySnapshot>), SweepError> {
     let source = JsonlPublicationSource::new(&options.paths);
     let mut minter = GitHubInstallationTokenMinter;
-    run_sweep_with_minter_and_publication_source(options, &source, &mut minter)
+    run_sweep_with_minter_and_publication_source(options, &source, &mut minter, None)
 }
 
 #[cfg(test)]
@@ -289,15 +291,70 @@ fn run_sweep_with_minter(
     minter: &mut dyn InstallationTokenMinter,
 ) -> Result<(SweepOutcome, Vec<RepositorySnapshot>), SweepError> {
     let source = JsonlPublicationSource::new(&options.paths);
-    run_sweep_with_minter_and_publication_source(options, &source, minter)
+    run_sweep_with_minter_and_publication_source(options, &source, minter, None)
+}
+
+/// Re-read a selected roster subset through the normal generation writer.
+pub fn run_selected_sweep_with_publication_source(
+    options: &SweepOptions,
+    source: &dyn PublicationSource,
+    repositories: &[String],
+) -> Result<SweepOutcome, SweepError> {
+    let mut minter = GitHubInstallationTokenMinter;
+    run_sweep_with_minter_and_publication_source(options, source, &mut minter, Some(repositories))
+        .map(|(outcome, _)| outcome)
+}
+
+fn selected_config(
+    config: &MandateConfig,
+    repositories: &[String],
+) -> Result<MandateConfig, SweepError> {
+    if repositories.is_empty() {
+        return Err(SweepError::Config(
+            "repository selection is empty".to_owned(),
+        ));
+    }
+    for repo in repositories {
+        if !config
+            .projects
+            .iter()
+            .any(|project| project.repo.as_str() == repo)
+        {
+            return Err(SweepError::Config(format!(
+                "repository {repo} is absent from the roster"
+            )));
+        }
+    }
+    let mut selected = config.clone();
+    selected.projects.retain(|project| {
+        repositories
+            .iter()
+            .any(|repo| repo == project.repo.as_str())
+    });
+    Ok(selected)
 }
 
 fn run_sweep_with_minter_and_publication_source(
     options: &SweepOptions,
     source: &dyn PublicationSource,
     minter: &mut dyn InstallationTokenMinter,
+    repositories: Option<&[String]>,
 ) -> Result<(SweepOutcome, Vec<RepositorySnapshot>), SweepError> {
     let config = load_config(&options.paths, &options.working_directory)?;
+    // Validate the complete selection before authentication, events, or generation writes.
+    let acquisition_config = repositories
+        .map(|repos| selected_config(&config, repos))
+        .transpose()?;
+    let carried = config
+        .projects
+        .iter()
+        .filter(|project| {
+            acquisition_config
+                .as_ref()
+                .is_some_and(|selected| !selected.projects.iter().any(|p| p.repo == project.repo))
+        })
+        .map(|project| project.repo.as_str().to_owned())
+        .collect::<BTreeSet<_>>();
     let gate_config = load_gate_config(&options.paths, &options.working_directory)
         .map_err(|error| SweepError::Config(format!("gate.yaml: {error}")))?;
     let roster_coverage = roster_coverage_findings(&config, &gate_config);
@@ -324,6 +381,17 @@ fn run_sweep_with_minter_and_publication_source(
     let latest_pr_repairs = latest_pr_repairs(&options.paths.trace_file())?;
     let state_path = options.paths.state.join("state.json");
     let old_state = read_state(&state_path)?;
+    for repo in &carried {
+        if old_state
+            .pointer("/repos")
+            .and_then(|repos| repos.get(repo))
+            .is_none()
+        {
+            return Err(SweepError::State(format!(
+                "cannot carry forward {repo}: no previous repository state; run a full roster sweep first"
+            )));
+        }
+    }
     let mode = effective_mode(
         options.requested_mode,
         &config,
@@ -333,12 +401,27 @@ fn run_sweep_with_minter_and_publication_source(
 
     let (snapshots, mut faults) = if let Some(path) = &options.fixture {
         let bytes = fs::read(path).map_err(|error| SweepError::Fixture(error.to_string()))?;
-        let fixture: SweepFixture = serde_json::from_slice(&bytes)
+        let mut fixture: SweepFixture = serde_json::from_slice(&bytes)
             .map_err(|error| SweepError::Fixture(error.to_string()))?;
-        validate_fixture(&config, &fixture)?;
+        if let Some(selected) = &acquisition_config {
+            fixture.repositories.retain(|snapshot| {
+                selected
+                    .projects
+                    .iter()
+                    .any(|project| project.repo == snapshot.repo)
+            });
+        }
+        validate_fixture(acquisition_config.as_ref().unwrap_or(&config), &fixture)?;
         (fixture.repositories, Vec::new())
     } else {
-        acquire_by_organization(options, &config, &old_state, mode, minter)?
+        acquire_by_organization(
+            options,
+            acquisition_config.as_ref().unwrap_or(&config),
+            &old_state,
+            mode,
+            minter,
+            repositories,
+        )?
     };
     let configured_repositories = config
         .projects
@@ -396,6 +479,9 @@ fn run_sweep_with_minter_and_publication_source(
 
     for project in &config.projects {
         let repo = project.repo.as_str();
+        if carried.contains(repo) {
+            continue;
+        }
         let Some(snapshot) = snapshots_by_repo.remove(repo) else {
             let reason = format!(
                 "authentication or GitHub query failed; repository acquisition produced no result for {repo}"
@@ -450,8 +536,28 @@ fn run_sweep_with_minter_and_publication_source(
             options.started_at,
         );
     } else if let Some(object) = new_state.as_object_mut() {
-        object.remove("policy_holds");
-        object.remove("stalled_holds");
+        if carried.is_empty() {
+            object.remove("policy_holds");
+            object.remove("stalled_holds");
+        } else {
+            // Policy removal can retire holds only for repositories re-read
+            // now; the other repositories still carry their previous evidence.
+            if let Some(holds) = object
+                .get_mut("policy_holds")
+                .and_then(Value::as_object_mut)
+            {
+                holds.retain(|id, _| {
+                    id.rsplit_once('#')
+                        .is_some_and(|(repo, _)| carried.contains(repo))
+                });
+            }
+            if let Some(stalled) = object
+                .get_mut("stalled_holds")
+                .and_then(Value::as_array_mut)
+            {
+                stalled.retain(|hold| carried.contains(string_field(hold, &["repo"])));
+            }
+        }
     }
 
     new_state["version"] = json!(2);
@@ -459,7 +565,7 @@ fn run_sweep_with_minter_and_publication_source(
     new_state["sweep_mode"] = json!(mode_name(mode));
     new_state["roster_coverage"] =
         serde_json::to_value(roster_coverage).expect("roster coverage findings serialize");
-    if mode == SweepMode::Full {
+    if mode == SweepMode::Full && carried.is_empty() {
         new_state["last_full_reconciliation"] = json!(format_time(options.started_at));
     }
     let configured = configured_repositories;
@@ -467,7 +573,18 @@ fn run_sweep_with_minter_and_publication_source(
         repos.retain(|repo, _| configured.contains(repo.as_str()));
     }
 
-    let mut ranking_faults = Vec::new();
+    let mut ranking_faults = old_state
+        .get("work_ranking_faults")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|id| {
+            id.rsplit_once('#')
+                .is_some_and(|(repo, _)| carried.contains(repo))
+        })
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
     for item in &config.work_ranking {
         let Some((repo, reference)) = item.rsplit_once('#') else {
             continue;
@@ -524,7 +641,7 @@ fn run_sweep_with_minter_and_publication_source(
     new_state["work_ranking"] = json!(&config.work_ranking);
     new_state["work_ranking_faults"] = json!(ranking_faults);
 
-    let final_rows = reconcile_queue(
+    let mut final_rows = reconcile_queue(
         existing,
         generated,
         &active_ids,
@@ -533,6 +650,15 @@ fn run_sweep_with_minter_and_publication_source(
         &unacquired_repositories,
     )?;
     let before = read_queue(&options.paths.queue_file())?;
+    for row in &mut final_rows {
+        if carried.contains(string_field(row.value(), &["repo"])) {
+            if let Some(old) = before.iter().find(|old| {
+                string_field(old.value(), &["id"]) == string_field(row.value(), &["id"])
+            }) {
+                *row = old.clone();
+            }
+        }
+    }
     let queue_changes = symmetric_queue_changes(&before, &final_rows);
     let graph = graph_from_state(&new_state, &final_rows, &configured);
     for fault in &graph.faults {
@@ -601,6 +727,8 @@ fn run_sweep_with_minter_and_publication_source(
     Ok((
         SweepOutcome {
             project_count: config.projects.len(),
+            repositories_read: acquired_repositories.len(),
+            repositories_carried: carried.len(),
             queue_changes,
             mode,
             faults,
@@ -628,7 +756,29 @@ pub fn acquire_org_from_github_with_faults(
     started_at: DateTime<Utc>,
     mode: SweepMode,
 ) -> Result<(Vec<RepositorySnapshot>, Vec<String>), SweepError> {
+    acquire_selected_org_from_github_with_faults(
+        paths,
+        working_directory,
+        org,
+        started_at,
+        mode,
+        None,
+    )
+}
+
+pub fn acquire_selected_org_from_github_with_faults(
+    paths: &OstromPaths,
+    working_directory: &Path,
+    org: &str,
+    started_at: DateTime<Utc>,
+    mode: SweepMode,
+    repositories: Option<&[String]>,
+) -> Result<(Vec<RepositorySnapshot>, Vec<String>), SweepError> {
     let config = load_config(paths, working_directory)?;
+    let config = repositories
+        .map(|repos| selected_config(&config, repos))
+        .transpose()?
+        .unwrap_or(config);
     let state = read_state(&paths.state.join("state.json"))?;
     let gh_host = environment::GH_HOST
         .value()
@@ -721,6 +871,7 @@ fn acquire_by_organization(
     _old_state: &Value,
     mode: SweepMode,
     minter: &mut dyn InstallationTokenMinter,
+    selected: Option<&[String]>,
 ) -> Result<(Vec<RepositorySnapshot>, Vec<String>), SweepError> {
     let mut snapshots = Vec::new();
     let mut faults = Vec::new();
@@ -750,6 +901,9 @@ fn acquire_by_organization(
             .env("GH_TOKEN", token.expose())
             .env("GITHUB_TOKEN", token.expose())
             .current_dir(&options.working_directory);
+        if let Some(selected) = selected {
+            command.args(["--repositories", &selected.join(",")]);
+        }
         // A caller such as cutover replay can deliberately supply a collapsed
         // scratch home without changing the parent process environment. Keep
         // the inner acquisition on that same scratch policy/state root. Normal

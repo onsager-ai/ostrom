@@ -1,0 +1,167 @@
+{
+  "version": 2,
+  "repos": {
+    "placeholder-org/alpha": {
+      "cursor": "2026-08-02T00:00:00Z",
+      "previous_cursor": "initial",
+      "selector_hash": "738115998",
+      "unclassified": 0,
+      "items": {
+        "placeholder-org/alpha#1": {
+          "updated": "2026-08-01T00:00:00Z",
+          "fingerprint": "alpha original||1||none||false|",
+          "first_seen": "2026-08-02T00:00:00Z",
+          "classification": "reserved",
+          "matched_selector": "ref:#1",
+          "stuck": false
+        }
+      },
+      "records": {
+        "placeholder-org/alpha#1": {
+          "id": "placeholder-org/alpha#1",
+          "repo": "placeholder-org/alpha",
+          "number": 1,
+          "ref": "#1",
+          "type": "issue",
+          "title": "alpha original",
+          "blocked_by": [],
+          "parent": null,
+          "children": [],
+          "closes": [],
+          "labels": [],
+          "refs": [
+            1
+          ],
+          "closing_refs": [],
+          "files": [],
+          "opened": "2026-08-01T00:00:00Z",
+          "updated": "2026-08-01T00:00:00Z",
+          "ci": "none",
+          "mergeable": "",
+          "ready": false,
+          "review": "",
+          "fingerprint": "alpha original||1||none||false|"
+        }
+      },
+      "etag": "\"alpha-issues\"",
+      "ci_drift": {},
+      "merge_gate_merges": {},
+      "merge_gate_floor": null,
+      "merge_gate_faults": {},
+      "merge_gate_fault_count": 0,
+      "item_implementation_merges": {},
+      "item_closure_faults": {},
+      "item_closure_fault_count": 0,
+      "unexplained_branch_writes": {},
+      "unexplained_write_count": 0
+    },
+    "placeholder-org/beta": {
+      "cursor": "2026-08-02T00:00:00Z",
+      "previous_cursor": "initial",
+      "selector_hash": "738115998",
+      "unclassified": 0,
+      "items": {
+        "placeholder-org/beta#1": {
+          "updated": "2026-08-01T00:00:00Z",
+          "fingerprint": "beta original||1||none||false|",
+          "first_seen": "2026-08-02T00:00:00Z",
+          "classification": "reserved",
+          "matched_selector": "ref:#1",
+          "stuck": false
+        }
+      },
+      "records": {
+        "placeholder-org/beta#1": {
+          "id": "placeholder-org/beta#1",
+          "repo": "placeholder-org/beta",
+          "number": 1,
+          "ref": "#1",
+          "type": "issue",
+          "title": "beta original",
+          "blocked_by": [],
+          "parent": null,
+          "children": [],
+          "closes": [],
+          "labels": [],
+          "refs": [
+            1
+          ],
+          "closing_refs": [],
+          "files": [],
+          "opened": "2026-08-01T00:00:00Z",
+          "updated": "2026-08-01T00:00:00Z",
+          "ci": "none",
+          "mergeable": "",
+          "ready": false,
+          "review": "",
+          "fingerprint": "beta original||1||none||false|"
+        }
+      },
+      "etag": "\"beta-issues\"",
+      "ci_drift": {},
+      "merge_gate_merges": {},
+      "merge_gate_floor": "2026-08-01T00:00:00Z",
+      "merge_gate_faults": {},
+      "merge_gate_fault_count": 0,
+      "item_implementation_merges": {},
+      "item_closure_faults": {},
+      "item_closure_fault_count": 0,
+      "unexplained_branch_writes": {},
+      "unexplained_write_count": 0
+    }
+  },
+  "velocity": {
+    "observed_days": {
+      "2026-08-02": [
+        "placeholder-org/alpha",
+        "placeholder-org/beta"
+      ]
+    },
+    "pulls": {}
+  },
+  "sweep_mode": "full",
+  "roster_coverage": [
+    {
+      "repo": "placeholder-org/alpha",
+      "finding": "missing_policy_document_entry",
+      "missing_document": "gate.yaml"
+    },
+    {
+      "repo": "placeholder-org/beta",
+      "finding": "missing_policy_document_entry",
+      "missing_document": "gate.yaml"
+    }
+  ],
+  "last_full_reconciliation": "2026-08-02T00:00:00Z",
+  "work_ranking": [],
+  "work_ranking_faults": [],
+  "dependency_graph": {
+    "graph_version": 1,
+    "configured_repositories": [
+      "placeholder-org/alpha",
+      "placeholder-org/beta"
+    ],
+    "nodes": [
+      {
+        "id": "placeholder-org/alpha#1",
+        "open": true,
+        "dependencies": [],
+        "unsatisfied": [],
+        "children": [],
+        "dispatchable": true,
+        "unblocking_power": 0
+      },
+      {
+        "id": "placeholder-org/beta#1",
+        "open": true,
+        "dependencies": [],
+        "unsatisfied": [],
+        "children": [],
+        "dispatchable": true,
+        "unblocking_power": 0
+      }
+    ],
+    "edges": [],
+    "faults": []
+  }
+}
