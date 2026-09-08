@@ -376,6 +376,7 @@ esac
     assert!(calls.contains("If-None-Match: fixture-etag"));
     assert!(calls.contains("since=2026-07-31T00:00:00Z"));
     assert!(calls.contains("api graphql -f query=query OstromDependencyGraph"));
+    assert!(calls.contains("mergedBy{login __typename}"));
     assert!(calls.contains("pr list --repo example-org/example-repo --state open --limit 200"));
     assert!(calls.contains(
         "api -X GET search/issues -f q=repo:example-org/example-repo is:pr is:merged merged:>=2026-07-02 -F per_page=100 -F page=1"
@@ -465,6 +466,7 @@ fn unexplained_merges_and_reserved_branches_share_the_alarm_kind() {
             "number": 1,
             "title": "Machine merge without order",
             "author": {"login": "builder[bot]", "is_bot": true},
+            "mergedBy": {"login": "placeholder-merger[bot]", "__typename": "Bot"},
             "closingIssuesReferences": [],
             "createdAt": "2026-07-04T00:00:00Z",
             "mergedAt": "2026-07-05T00:00:00Z",
@@ -474,6 +476,7 @@ fn unexplained_merges_and_reserved_branches_share_the_alarm_kind() {
             "number": 2,
             "title": "Machine merge with order",
             "author": {"login": "builder[bot]", "is_bot": true},
+            "mergedBy": {"login": "placeholder-merger[bot]", "__typename": "Bot"},
             "closingIssuesReferences": [{"number": 99}],
             "createdAt": "2026-07-04T00:00:00Z",
             "mergedAt": "2026-07-05T00:00:00Z",

@@ -10,6 +10,7 @@ use ostrom_core::{
     GatePublicationRecords, PublicationSnapshot, PublicationSource, PublicationSourceFault,
     RepositoryName,
 };
+use serde::Serialize;
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 
@@ -17,6 +18,7 @@ use crate::{
     OstromPaths,
     app_token::{InstallationTokenMinter, ScopedAppTokenRequest, authenticated_output},
     environment, set_private_file_mode,
+    velocity::{Attribution, VelocityLedger},
 };
 
 const READ_PERMISSIONS: &str = "metadata:read,contents:read";
@@ -261,7 +263,10 @@ fn derive_tree(
         }
     }
 
-    let rollup = build_rollup(&queue, &gate, &state)?;
+    let mut rollup = build_rollup(&queue, &gate, &state)?;
+    // Read the private ledger through its typed contract, then emit only
+    // counters. Neither PR identities nor actor objects cross this boundary.
+    rollup["velocity_by_day"] = build_velocity_by_day(&state_source)?;
     let schema_id = schema_id(&allowlist.schema_value)?;
     let manifest = json!({
         "schema_id": format!("git:{schema_id}"),
@@ -783,6 +788,111 @@ fn build_rollup(queue: &[Value], gate: &[Value], state: &Value) -> Result<Value,
         "queue_age_buckets": ages,
         "repo_classifications": classifications,
     }))
+}
+
+#[derive(Default, Serialize)]
+struct AttributionCounts {
+    loop_to_loop: u64,
+    loop_to_principal: u64,
+    principal: u64,
+}
+
+impl AttributionCounts {
+    fn increment(&mut self, attribution: Attribution) {
+        *match attribution {
+            Attribution::LoopToLoop => &mut self.loop_to_loop,
+            Attribution::LoopToPrincipal => &mut self.loop_to_principal,
+            Attribution::Principal => &mut self.principal,
+        } += 1;
+    }
+}
+
+#[derive(Default, Serialize)]
+struct MergeLatency {
+    count: u64,
+    total: u64,
+    min: Option<u64>,
+    max: Option<u64>,
+    mean: Option<f64>,
+}
+
+#[derive(Default, Serialize)]
+struct VelocityDay {
+    observed_repositories: usize,
+    opened: AttributionCounts,
+    opened_pending: u64,
+    merged: AttributionCounts,
+    unattended_latency_seconds: MergeLatency,
+}
+
+fn build_velocity_by_day(state: &Value) -> Result<Value, PublishError> {
+    let ledger = VelocityLedger::from_state(state)
+        .map_err(|error| invalid_record("state.velocity", error.to_string()))?;
+    if ledger.observed_days.values().any(BTreeSet::is_empty) {
+        return Err(invalid_record(
+            "state.velocity",
+            "observation day has no repositories",
+        ));
+    }
+    let mut days = ledger
+        .observed_days
+        .iter()
+        .map(|(day, repos)| {
+            (
+                *day,
+                VelocityDay {
+                    observed_repositories: repos.len(),
+                    ..VelocityDay::default()
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    for (pr, pull) in &ledger.pulls {
+        let observed_on = |day| {
+            ledger
+                .observed_days
+                .get(&day)
+                .is_some_and(|repos| repos.contains(&pull.repository))
+        };
+        let opened_day = pull.opened_at.date_naive();
+        if observed_on(opened_day) {
+            let day = days.get_mut(&opened_day).expect("observed day exists");
+            if let Some(attribution) = pull.attribution {
+                day.opened.increment(attribution);
+            } else {
+                day.opened_pending += 1;
+            }
+        }
+        if let Some(fact) = &pull.merge {
+            if fact.pr != *pr
+                || fact.opened_at != pull.opened_at
+                || Some(fact.attribution) != pull.attribution
+                || fact.merged_at < fact.opened_at
+            {
+                return Err(invalid_record("state.velocity", "inconsistent merge fact"));
+            }
+            let merged_day = fact.merged_at.date_naive();
+            if !observed_on(merged_day) {
+                continue;
+            }
+            let day = days.get_mut(&merged_day).expect("observed day exists");
+            day.merged.increment(fact.attribution);
+            if fact.attribution == Attribution::LoopToLoop {
+                let seconds = u64::try_from((fact.merged_at - fact.opened_at).num_seconds())
+                    .map_err(|error| invalid_record("state.velocity", error.to_string()))?;
+                let latency = &mut day.unattended_latency_seconds;
+                latency.count += 1;
+                latency.total = latency
+                    .total
+                    .checked_add(seconds)
+                    .ok_or_else(|| invalid_record("state.velocity", "latency total overflow"))?;
+                latency.min = Some(latency.min.map_or(seconds, |min| min.min(seconds)));
+                latency.max = Some(latency.max.map_or(seconds, |max| max.max(seconds)));
+                latency.mean = Some(latency.total as f64 / latency.count as f64);
+            }
+        }
+    }
+    Ok(serde_json::to_value(days).expect("velocity counters serialize"))
 }
 
 fn schema_id(value: &Value) -> Result<String, PublishError> {
@@ -1481,6 +1591,148 @@ mod tests {
             destination,
             published_at: "2026-08-01T00:05:00Z".parse().expect("fixture time"),
             cadence_hours: 24,
+        }
+    }
+
+    #[test]
+    fn velocity_by_day_matches_direct_counts_and_keeps_dark_days_absent() {
+        let root = crate::velocity::tests::fixture();
+        let state: Value =
+            serde_json::from_slice(&fs::read(root.path().join("state.json")).unwrap()).unwrap();
+        let velocity = build_velocity_by_day(&state).unwrap();
+        assert_eq!(velocity.as_object().unwrap().len(), 3);
+        assert!(velocity.get("2026-08-02").is_none());
+        assert!(velocity.get("2026-07-30").is_none());
+        let pulls = crate::velocity::tests::pulls();
+        for day in ["2026-08-01", "2026-08-03", "2026-08-04"] {
+            for (class, numbers) in [
+                ("loop_to_loop", vec![1, 5, 6, 7]),
+                ("loop_to_principal", vec![2]),
+                ("principal", vec![3, 4, 9]),
+            ] {
+                for (field, time) in [("opened", "createdAt"), ("merged", "mergedAt")] {
+                    let count = pulls
+                        .iter()
+                        .filter(|pull| {
+                            numbers.contains(&pull["number"].as_u64().unwrap())
+                                && pull[time]
+                                    .as_str()
+                                    .is_some_and(|time| time.starts_with(day))
+                        })
+                        .count();
+                    assert_eq!(velocity[day][field][class], count, "{day} {field} {class}");
+                }
+            }
+        }
+        assert_eq!(velocity["2026-08-01"]["opened_pending"], 1);
+        assert_eq!(
+            velocity["2026-08-04"]["merged"],
+            json!({"loop_to_loop": 0, "loop_to_principal": 0, "principal": 0})
+        );
+        assert_eq!(
+            velocity["2026-08-03"]["unattended_latency_seconds"],
+            json!({
+                "count": 2, "total": 349200, "min": 172800, "max": 176400, "mean": 174600.0,
+            })
+        );
+        assert_eq!(
+            velocity["2026-08-04"]["unattended_latency_seconds"],
+            json!({
+                "count": 0, "total": 0, "min": null, "max": null, "mean": null,
+            })
+        );
+        assert_eq!(build_velocity_by_day(&json!({})).unwrap(), json!({}));
+        // One repository being reachable does not fill a dark day for another.
+        let mut partial = state;
+        partial["velocity"]["observed_days"]["2026-08-03"] = json!(["placeholder-org/other"]);
+        let partial = build_velocity_by_day(&partial).unwrap();
+        assert_eq!(partial["2026-08-03"]["merged"]["loop_to_loop"], 0);
+    }
+
+    #[test]
+    fn no_published_record_contains_a_login() {
+        let root = crate::velocity::tests::fixture();
+        let paths = OstromPaths {
+            config: root.path().into(),
+            state: root.path().into(),
+        };
+        // Exercise the existing machine_author paths as well as the new ledger.
+        let mut state: Value =
+            serde_json::from_slice(&fs::read(paths.sweep_state_file()).unwrap()).unwrap();
+        state["repos"]["placeholder-org/velocity"]["merge_gate_merges"]["placeholder-org/velocity#1"]
+            ["machine_author"] =
+            json!({"login": crate::velocity::tests::LOGINS[0], "is_bot": true});
+        fs::write(
+            paths.sweep_state_file(),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+        let queue = json!({
+            "id": "placeholder-org/velocity#1", "age_days": 2,
+            "mandate": {"scope_evidence": {"machine_author": {"login": crate::velocity::tests::LOGINS[0]}}}
+        });
+        fs::write(paths.queue_file(), jsonl(&[queue])).unwrap();
+        fs::write(root.path().join("gate.jsonl"), b"").unwrap();
+        let source = JsonlPublicationSource::new(&paths);
+        let destination = PublishDestination::explicit(
+            RepositoryName::new("placeholder-org/publication").unwrap(),
+        );
+        let options = fixture_options(&paths, &source, &destination);
+        let allowlist = parse_allowlist(
+            serde_json::from_str(SHIPPED_ALLOWLIST).unwrap(),
+            Path::new(SHIPPED_ALLOWLIST_PATH),
+        )
+        .unwrap();
+        let tree = derive_tree(&options, &allowlist).expect("derive every published file");
+        assert!(!tree.files.is_empty());
+        assert!(
+            String::from_utf8_lossy(&fs::read(paths.sweep_state_file()).unwrap())
+                .contains(crate::velocity::tests::LOGINS[0])
+        );
+        for (path, bytes) in &tree.files {
+            let output = String::from_utf8_lossy(bytes);
+            for login in crate::velocity::tests::LOGINS {
+                assert!(!output.contains(login), "{} leaked {login}", path.display());
+            }
+        }
+        let trace = fs::read_to_string(paths.trace_file()).unwrap();
+        for login in crate::velocity::tests::LOGINS {
+            assert!(!trace.contains(login), "merge trace leaked {login}");
+        }
+        let rollup: Value = serde_json::from_slice(&tree.files[Path::new("rollup.json")]).unwrap();
+        assert_eq!(
+            rollup["velocity_by_day"]["2026-08-03"]["merged"]["loop_to_loop"],
+            2
+        );
+    }
+
+    #[test]
+    fn velocity_rollup_refuses_unknown_or_inconsistent_private_data() {
+        let root = crate::velocity::tests::fixture();
+        let state: Value =
+            serde_json::from_slice(&fs::read(root.path().join("state.json")).unwrap()).unwrap();
+        for (pointer, replacement, message) in [
+            (
+                "/velocity/pulls/placeholder-org~1velocity#1/merge/attribution",
+                json!("unknown"),
+                "unknown variant",
+            ),
+            (
+                "/velocity/pulls/placeholder-org~1velocity#1/merge/opened_at",
+                json!("2026-08-04T00:00:00Z"),
+                "inconsistent merge fact",
+            ),
+            (
+                "/velocity/observed_days/2026-08-01",
+                json!([]),
+                "observation day has no repositories",
+            ),
+        ] {
+            let mut invalid = state.clone();
+            *invalid.pointer_mut(pointer).unwrap() = replacement;
+            let error =
+                build_velocity_by_day(&invalid).expect_err("invalid ledger must not publish zeros");
+            assert!(error.to_string().contains(message), "{error}");
         }
     }
 

@@ -28,7 +28,9 @@ use crate::{
     read_queue, read_trace,
     run_events::{DecisionRequest, RunEventError, SWEEP_RUN_ID},
     selector::{SelectorCandidate, glob_match, selector_match},
-    set_private_file_mode, write_queue,
+    set_private_file_mode,
+    velocity::{Attribution, MergeFact, ObservedPull, VelocityLedger, actor_observed, is_machine},
+    write_queue,
 };
 
 const QUERY_LIMIT: usize = 200;
@@ -367,6 +369,14 @@ fn run_sweep_with_minter_and_publication_source(
         .collect::<BTreeSet<_>>();
     let (work_orders, work_order_warnings) = load_work_orders(&options.paths)?;
     faults.extend(work_order_warnings);
+    let (velocity, merge_facts) = observe_velocity(
+        &options.paths,
+        &old_state,
+        &snapshots,
+        &configured_repositories,
+        &work_orders,
+        options.started_at,
+    )?;
 
     let mut decision_requests = snapshots
         .iter()
@@ -445,6 +455,7 @@ fn run_sweep_with_minter_and_publication_source(
     }
 
     new_state["version"] = json!(2);
+    new_state["velocity"] = serde_json::to_value(velocity).expect("velocity ledger serializes");
     new_state["sweep_mode"] = json!(mode_name(mode));
     new_state["roster_coverage"] =
         serde_json::to_value(roster_coverage).expect("roster coverage findings serialize");
@@ -536,6 +547,23 @@ fn run_sweep_with_minter_and_publication_source(
             .filter_map(|row| queue_decision_request(row.value())),
     );
     emit_decision_requests(&options.paths, options.started_at, &decision_requests)?;
+    // Append before advancing state. A retry reads the facts already appended,
+    // so a failed state write cannot duplicate a merge on the next sweep.
+    for fact in merge_facts {
+        crate::append_trace(
+            &options.paths.trace_file(),
+            &crate::TraceAppend {
+                ts: format_time(options.started_at),
+                kind: "pr-merged".to_owned(),
+                fact: serde_json::to_value(fact)
+                    .expect("merge fact serializes")
+                    .as_object()
+                    .expect("merge fact is an object")
+                    .clone(),
+                narration: Map::new(),
+            },
+        )?;
+    }
     backup_previous_sweep(&options.paths)?;
     write_queue(&options.paths.queue_file(), &final_rows)?;
     write_json_private(&state_path, &new_state)?;
@@ -1005,7 +1033,7 @@ fn fetch_merged_pull_requests(repo: &str, search: &str) -> Result<Vec<Value>, Sw
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let query = r#"query OstromMergedPullRequestNodes($ids:[ID!]!){nodes(ids:$ids){... on PullRequest{number title author{login __typename} closingIssuesReferences(first:100){nodes{number}} createdAt mergedAt headRefOid headRefName state}}}"#;
+        let query = r#"query OstromMergedPullRequestNodes($ids:[ID!]!){nodes(ids:$ids){... on PullRequest{number title author{login __typename} mergedBy{login __typename} closingIssuesReferences(first:100){nodes{number}} createdAt mergedAt headRefOid headRefName state}}}"#;
         let query_field = format!("query={query}");
         let mut args = vec![
             "api".to_owned(),
@@ -2279,7 +2307,7 @@ fn analyze_merge_gate(
                 .pointer("/author/isBot")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-        let machine_authored = is_bot || author_login.ends_with("[bot]");
+        let machine_authored = is_machine(&pull["author"]);
         // Deduplicate and order by issue *number*, not by the rendered string.
         // These references reach the fingerprint through a join, so ordering
         // them lexicographically would place #10 before #9 and re-emit the
@@ -2692,6 +2720,138 @@ fn analyze_item_closure(
             "faults": faults,
         }),
     }
+}
+
+fn observe_velocity(
+    paths: &OstromPaths,
+    state: &Value,
+    snapshots: &[RepositorySnapshot],
+    configured: &BTreeSet<String>,
+    orders: &[WorkOrderEvidence],
+    observed_at: DateTime<Utc>,
+) -> Result<(VelocityLedger, Vec<MergeFact>), SweepError> {
+    let mut ledger = VelocityLedger::from_state(state)
+        .map_err(|error| SweepError::State(format!("velocity: {error}")))?;
+    let mut recorded = BTreeMap::<String, MergeFact>::new();
+    let mut completions = Vec::new();
+    for row in read_trace(&paths.trace_file())?.rows {
+        let row = row.map_err(|error| SweepError::State(error.to_string()))?;
+        if row.kind == "pr-merged" {
+            let fact: MergeFact = serde_json::from_value(Value::Object(row.fact))
+                .map_err(|error| SweepError::State(format!("pr-merged: {error}")))?;
+            if recorded.get(&fact.pr).is_some_and(|old| old != &fact) {
+                return Err(SweepError::State(format!(
+                    "conflicting merge facts for {}",
+                    fact.pr
+                )));
+            }
+            let repository = fact
+                .pr
+                .rsplit_once('#')
+                .ok_or_else(|| SweepError::State("pr-merged has no repository pointer".to_owned()))?
+                .0
+                .to_owned();
+            ledger.pulls.insert(
+                fact.pr.clone(),
+                ObservedPull {
+                    repository,
+                    opened_at: fact.opened_at,
+                    attribution: Some(fact.attribution),
+                    merge: Some(fact.clone()),
+                },
+            );
+            recorded.insert(fact.pr.clone(), fact);
+        } else if row.kind == "work-completed" {
+            completions.push(Value::Object(row.fact));
+        }
+    }
+    let mut facts = Vec::new();
+    for snapshot in snapshots
+        .iter()
+        .filter(|snapshot| configured.contains(snapshot.repo.as_str()))
+    {
+        let repo = snapshot.repo.as_str();
+        ledger
+            .observed_days
+            .entry(observed_at.date_naive())
+            .or_default()
+            .insert(repo.to_owned());
+        for (pull, merged) in snapshot
+            .open_prs
+            .iter()
+            .map(|pull| (pull, false))
+            .chain(snapshot.merged_prs.iter().map(|pull| (pull, true)))
+        {
+            let number = number_field(pull, &["number"]).ok_or_else(|| {
+                SweepError::Acquisition(format!("velocity: {repo} PR has no number"))
+            })?;
+            let pr = format!("{repo}#{number}");
+            if recorded.contains_key(&pr) {
+                continue;
+            }
+            if !actor_observed(&pull["author"]) {
+                return Err(SweepError::Acquisition(format!(
+                    "velocity: {pr} has no author identity"
+                )));
+            }
+            let opened_at = parse_time(string_field(pull, &["createdAt"])).ok_or_else(|| {
+                SweepError::Acquisition(format!("velocity: {pr} has no valid createdAt"))
+            })?;
+            let mut observation = ObservedPull {
+                repository: repo.to_owned(),
+                opened_at,
+                attribution: (!is_machine(&pull["author"])).then_some(Attribution::Principal),
+                merge: None,
+            };
+            if merged {
+                let merged_at = parse_time(string_field(pull, &["mergedAt"]))
+                    .filter(|merged_at| *merged_at >= opened_at && *merged_at <= observed_at)
+                    .ok_or_else(|| {
+                        SweepError::Acquisition(format!("velocity: {pr} has no valid mergedAt"))
+                    })?;
+                // Missing merger data must not turn machine work into a human
+                // intervention (or an unattended delivery) by assumption.
+                if is_machine(&pull["author"]) && !actor_observed(&pull["mergedBy"]) {
+                    return Err(SweepError::Acquisition(format!(
+                        "velocity: {pr} has no mergedBy identity"
+                    )));
+                }
+                let order_id = completions
+                    .iter()
+                    .rev()
+                    .find_map(|fact| {
+                        (pull_number_from_url(repo, string_field(fact, &["pr_url"]))
+                            == Some(number))
+                        .then(|| nonempty_string(fact, &["order_id"]).map(str::to_owned))
+                        .flatten()
+                    })
+                    .or_else(|| {
+                        let branch = nonempty_string(pull, &["headRefName"])?;
+                        let matching = orders
+                            .iter()
+                            .filter(|order| order.repository == repo && order.branch_name == branch)
+                            .map(|order| order.order_id.clone())
+                            .collect::<BTreeSet<_>>();
+                        (matching.len() == 1)
+                            .then(|| matching.into_iter().next())
+                            .flatten()
+                    });
+                let fact = MergeFact {
+                    pr: pr.clone(),
+                    order_id,
+                    opened_at,
+                    merged_at,
+                    attribution: Attribution::classify(&pull["author"], &pull["mergedBy"]),
+                };
+                observation.attribution = Some(fact.attribution);
+                observation.merge = Some(fact.clone());
+                recorded.insert(pr.clone(), fact.clone());
+                facts.push(fact);
+            }
+            ledger.pulls.insert(pr, observation);
+        }
+    }
+    Ok((ledger, facts))
 }
 
 fn completed_items_by_pull(paths: &OstromPaths, repo: &str) -> BTreeMap<u64, String> {
@@ -4071,6 +4231,42 @@ mod tests {
     use umwelt_runtime::Source;
 
     use super::*;
+
+    #[test]
+    fn merge_history_refuses_malformed_and_conflicting_facts() {
+        let root = tempdir().unwrap();
+        let paths = OstromPaths {
+            config: root.path().into(),
+            state: root.path().into(),
+        };
+        let row = json!({
+            "ts": "2026-08-03T12:00:00Z", "kind": "pr-merged", "narration": {},
+            "fact": {"pr": "placeholder-org/velocity#1", "order_id": null,
+                "opened_at": "2026-08-01T01:00:00Z", "merged_at": "2026-08-03T01:00:00Z",
+                "attribution": "loop_to_loop"}
+        });
+        let mut conflict = row.clone();
+        conflict["fact"]["attribution"] = json!("loop_to_principal");
+        let mut identity = row.clone();
+        identity["fact"]["login"] = json!("placeholder-private-login");
+        for (contents, expected) in [
+            ("{broken\n".to_owned(), "malformed sprint trace"),
+            (format!("{row}\n{conflict}\n"), "conflicting merge facts"),
+            (format!("{identity}\n"), "unknown field `login`"),
+        ] {
+            fs::write(paths.trace_file(), contents).unwrap();
+            let error = observe_velocity(
+                &paths,
+                &json!({}),
+                &[],
+                &BTreeSet::new(),
+                &[],
+                "2026-08-04T00:00:00Z".parse().unwrap(),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
     use crate::{
         Clock, SelectAction, SelectOutcome, SelectRequest, TraceAppend,
         app_token::ScopedInstallationToken, append_trace, run_selection,
@@ -4117,6 +4313,7 @@ mod tests {
     fn repair_test_pr(number: u64, mergeable: &str, files: &[&str]) -> Value {
         json!({
             "number": number,
+            "author": {"login": "placeholder-author", "__typename": "User"},
             "title": format!("fix: placeholder pull request {number}"),
             "state": "OPEN",
             "body": "Ostrom-Role: builder",
