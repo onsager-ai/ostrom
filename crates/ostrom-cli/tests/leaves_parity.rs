@@ -306,7 +306,7 @@ fn granted_record_is_consumed_by_the_existing_sweep_join() {
     let sweep_fixture = fixture.home.path().join("sweep.json");
     fs::write(
         &sweep_fixture,
-        r#"{"repositories":[{"repo":"placeholder-org/alpha","issues":[],"open_prs":[],"merged_prs":[{"number":1,"title":"Placeholder floor","author":{"login":"placeholder-bot[bot]","isBot":true},"closingIssuesReferences":[],"createdAt":"2026-07-01T00:00:00Z","mergedAt":"2026-07-01T01:00:00Z","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","state":"MERGED"},{"number":7,"title":"Placeholder exception join","author":{"login":"placeholder-bot[bot]","isBot":true},"closingIssuesReferences":[],"createdAt":"2026-07-02T00:00:00Z","mergedAt":"2026-07-03T00:00:00Z","headRefOid":"1111111111111111111111111111111111111111","state":"MERGED"}],"default_branch":null,"ci_runs":[]}]}"#,
+        r#"{"repositories":[{"repo":"placeholder-org/alpha","issues":[],"open_prs":[],"merged_prs":[{"number":1,"title":"Placeholder floor","author":{"login":"placeholder-bot[bot]","isBot":true},"mergedBy":{"login":"placeholder-merger[bot]","__typename":"Bot"},"closingIssuesReferences":[],"createdAt":"2026-07-01T00:00:00Z","mergedAt":"2026-07-01T01:00:00Z","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","state":"MERGED"},{"number":7,"title":"Placeholder exception join","author":{"login":"placeholder-bot[bot]","isBot":true},"mergedBy":{"login":"placeholder-merger[bot]","__typename":"Bot"},"closingIssuesReferences":[],"createdAt":"2026-07-02T00:00:00Z","mergedAt":"2026-07-03T00:00:00Z","headRefOid":"1111111111111111111111111111111111111111","state":"MERGED"}],"default_branch":null,"ci_runs":[]}]}"#,
     )
     .unwrap();
 

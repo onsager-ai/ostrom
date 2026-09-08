@@ -20,6 +20,18 @@ fn replaying_344_and_351_produces_two_stalled_hold_findings_in_the_digest() {
     fs::copy(fixture("manifest.yml"), home.path().join("ostrom.yaml"))
         .expect("copy policy manifest");
     let trusted_keys = support::sign_manifest(&home.path().join("ostrom.yaml"));
+    let mut github: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture("github.json")).expect("read policy fixture"))
+            .expect("parse policy fixture");
+    for repository in github["repositories"].as_array_mut().unwrap() {
+        for pull in repository["open_prs"].as_array_mut().unwrap() {
+            pull["author"] =
+                serde_json::json!({"login": "placeholder-author", "__typename": "User"});
+            pull["createdAt"] = serde_json::json!("2026-08-01T00:00:00Z");
+        }
+    }
+    let github_path = home.path().join("github.json");
+    fs::write(&github_path, serde_json::to_vec(&github).unwrap()).expect("write sweep fixture");
     for started_at in ["2026-08-01T00:00:00Z", "2026-08-09T00:00:00Z"] {
         let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
             .current_dir(home.path())
@@ -28,7 +40,7 @@ fn replaying_344_and_351_produces_two_stalled_hold_findings_in_the_digest() {
             .args([
                 "sweep",
                 "--fixture",
-                fixture("github.json").to_str().expect("UTF-8 fixture path"),
+                github_path.to_str().expect("UTF-8 fixture path"),
                 "--started-at",
                 started_at,
             ])

@@ -33,6 +33,7 @@ mod selector;
 mod sweep;
 mod trace;
 pub mod umwelt_edge;
+mod velocity;
 mod work_order;
 mod worktree;
 
