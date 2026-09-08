@@ -437,6 +437,128 @@ fn composing_does_not_disturb_the_sweep_backup_directory() {
 }
 
 #[test]
+fn validate_and_compose_agree_on_acceptance() {
+    enum Input<'a> {
+        Init,
+        Operator(&'a str),
+        Repository(&'a str),
+    }
+
+    enum Expectation {
+        Agree,
+        KnownDivergence {
+            validate_accepts: bool,
+            compose_accepts: bool,
+        },
+    }
+
+    let repository_with_grants = Fixture::repository_policy("delegated");
+    let operator_with_grants =
+        format!("{OPERATOR}grants:\n  delegated: {{actors: builder, operations: work}}\n");
+    let cases = [
+        ("unedited init output", Input::Init, Expectation::Agree),
+        (
+            "operator with grants",
+            Input::Operator(&operator_with_grants),
+            Expectation::Agree,
+        ),
+        (
+            "repository without grants",
+            Input::Repository("manifest_version: 1\n"),
+            Expectation::Agree,
+        ),
+        (
+            "grant with an actor absent from both scopes",
+            Input::Repository(
+                "manifest_version: 1\ngrants:\n  invalid: {actors: absent, operations: work}\n",
+            ),
+            Expectation::Agree,
+        ),
+        (
+            "repository grant naming an operator actor",
+            Input::Repository(&repository_with_grants),
+            // #466, ruling 2026-09-08: agreement is per resolution context.
+            // Validate currently checks in isolation; compose resolves against
+            // OSTROM_HOME. The follow-up will make validate use that context
+            // and report isolated cross-manifest references as unresolved here.
+            // An omitted case is one nobody remembers was considered. Pinning
+            // today's divergence makes its fix fail this assertion, forcing the
+            // marker off instead of relying on someone remembering it is here.
+            Expectation::KnownDivergence {
+                validate_accepts: false,
+                compose_accepts: true,
+            },
+        ),
+    ];
+
+    let mut saw_mutual_acceptance = false;
+    let mut saw_mutual_rejection = false;
+    for (name, input, expectation) in cases {
+        let mut fixture = Fixture::new();
+        if matches!(input, Input::Init | Input::Operator(_)) {
+            fixture.manifest = fixture.home.join("ostrom.yaml");
+        }
+        match input {
+            Input::Init => {
+                fs::remove_file(&fixture.manifest).expect("remove fixture operator manifest");
+                let init = fixture
+                    .command()
+                    .arg("init")
+                    .output()
+                    .expect("run ostrom init");
+                assert!(
+                    init.status.success(),
+                    "{name}: {}",
+                    String::from_utf8_lossy(&init.stderr)
+                );
+            }
+            Input::Operator(source) | Input::Repository(source) => {
+                fs::write(&fixture.manifest, source).expect("write agreement case");
+            }
+        }
+        fixture.trusted_keys = support::sign_manifest(&fixture.manifest);
+
+        // Both commands receive the same signed file and operator context.
+        let validate = fixture
+            .command()
+            .arg("validate")
+            .arg(&fixture.manifest)
+            .output()
+            .expect("run ostrom validate");
+        let compose = fixture.compose();
+        let validate_accepts = validate.status.success();
+        let compose_accepts = compose.status.success();
+        let diagnostic = format!(
+            "case `{name}`\nvalidate: accepted={validate_accepts}\nstdout: {}\nstderr: {}\ncompose: accepted={compose_accepts}\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&validate.stdout).trim(),
+            String::from_utf8_lossy(&validate.stderr).trim(),
+            String::from_utf8_lossy(&compose.stdout).trim(),
+            String::from_utf8_lossy(&compose.stderr).trim(),
+        );
+        match expectation {
+            Expectation::Agree => {
+                assert_eq!(validate_accepts, compose_accepts, "{diagnostic}");
+                saw_mutual_acceptance |= validate_accepts;
+                saw_mutual_rejection |= !validate_accepts;
+            }
+            Expectation::KnownDivergence {
+                validate_accepts: expected_validate,
+                compose_accepts: expected_compose,
+            } => assert_eq!(
+                (validate_accepts, compose_accepts),
+                (expected_validate, expected_compose),
+                "known divergence changed; revisit the #466 marker\n{diagnostic}"
+            ),
+        }
+    }
+    assert!(
+        saw_mutual_acceptance,
+        "cases must exercise mutual acceptance"
+    );
+    assert!(saw_mutual_rejection, "cases must exercise mutual rejection");
+}
+
+#[test]
 fn init_manifest_validates_and_composes_as_operator_policy() {
     let root = TempDir::new().expect("temporary init fixture");
     let home = root.path().join("home");
