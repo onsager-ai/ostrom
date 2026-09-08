@@ -2817,17 +2817,18 @@ grants:
     operations: gate-pass
 "#;
 
-/// Write a starting operator manifest and the prompts it references.
+/// Write a starting operator manifest and the prompts available to presets.
 fn run_init(paths: &OstromPaths, force: bool) -> Result<(), Box<dyn std::error::Error>> {
     let manifest = paths.config.join("ostrom.yaml");
     let prompts = paths.config.join("prompts");
-    let files: [(PathBuf, &str); 3] = [
+    let files: [(PathBuf, &str); 4] = [
         (manifest.clone(), DEFAULT_MANIFEST),
         (prompts.join("work.md"), PassRole::Builder.default_prompt()),
         (
             prompts.join("gatekeep.md"),
             PassRole::Gatekeeper.default_prompt(),
         ),
+        (prompts.join("triage.md"), ostrom_store::TRIAGE_PROMPT),
     ];
 
     // Refuse rather than overwrite: this file is the operator's authored
