@@ -41,4 +41,12 @@ OSTROM_CAPTURE_DECISION_FIXTURES=1 cargo +1.88 test -p ostrom-store --test decis
 The capture flag only creates missing files from emitted events and refuses
 to overwrite existing captures. Ordinary test runs require the files to exist,
 compare their pretty-printed envelopes, and parse and validate each against
-the pinned ethogram SDK (`ba892e843db9df7cbc74bd52e2933799fa8cd3d9`).
+the pinned ethogram SDK (`9e3cd3701b88b53f9b18e93480a477b3724dab40`).
+
+`expected/decision-answered.json` was recaptured at that rev, which added
+`requestedRunId` to `decision.answered`. Its one new line names `gate` — the
+run that emitted the matching `decision.requested` — not the judgment run the
+answer itself lives on. Ethogram's own `conformance/v1/decision-answered-excuse.json`
+is the earlier copy of this capture and does not carry the field; nothing here
+reads that copy, so the two now differ. Ostrom #523 owns deciding whether the
+corpus entry is recontributed or deliberately kept as the field-absent case.

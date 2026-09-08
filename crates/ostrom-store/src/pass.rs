@@ -1101,6 +1101,10 @@ fn check_signal(
                 request.clock.epoch_seconds()
             ),
             kind: ControlKind::Interrupt,
+            // Required only for `answer` (ostrom #510, out of scope here);
+            // this constructs an interrupt, so both stay absent.
+            decision_id: None,
+            option_id: None,
             text: None,
             truncated: None,
             by: "scheduler".to_owned(),

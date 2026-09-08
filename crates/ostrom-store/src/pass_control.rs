@@ -9,8 +9,8 @@ use std::{
 
 use ethogram::{
     CAPTURE_REFUSED, CONTROL_APPLIED, CONTROL_REQUESTED, CaptureRefusalCause,
-    CaptureRefusedPayload, ControlAppliedPayload, ControlRequestedPayload, EventDraft,
-    MAX_EXCERPT_SCALARS, PayloadExtension, excerpt,
+    CaptureRefusedPayload, ControlAppliedPayload, ControlAppliedReason, ControlRequestedPayload,
+    EventDraft, MAX_EXCERPT_SCALARS, PayloadExtension, excerpt,
 };
 
 use crate::run_events::open_fd;
@@ -93,7 +93,7 @@ pub(crate) fn unsupported(request: &ControlRequestedPayload) -> [EventDraft; 2] 
             payload: serde_json::to_value(ControlAppliedPayload {
                 control_id: request.control_id.clone(),
                 ok: false,
-                reason: Some("unsupported".to_owned()),
+                reason: Some(ControlAppliedReason::Unsupported),
                 truncated: None,
                 landed_in: None,
                 extra: PayloadExtension::from_iter([("by".to_owned(), request.by.clone().into())]),

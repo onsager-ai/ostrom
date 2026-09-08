@@ -64,7 +64,7 @@ pub fn answer_queue_decision(
     clock: &Clock,
 ) -> Result<Vec<u8>, DecisionAnswerError> {
     let _lock = AnswerLock::acquire(paths)?;
-    let request = find_request(paths, decision_id)?;
+    let (request, requested_run_id) = find_request(paths, decision_id)?;
     if request.subject.as_deref() != Some(item) {
         return refuse("decision subject does not match the supplied item");
     }
@@ -78,7 +78,7 @@ pub fn answer_queue_decision(
         return refuse("this answer is already recorded; no delivery was retried");
     }
     // Validate before identity lookup, delivery, or any answer/run append.
-    let mut answer = prepare_answer(&request, option, &history)?;
+    let mut answer = prepare_answer(&request, option, &history, requested_run_id)?;
     if request.kind == DecisionKind::Tripwire && queue_verb(option) != Some(verb) {
         return refuse("queue verb must agree with the decision option");
     }
@@ -188,6 +188,7 @@ fn prepare_answer(
     request: &DecisionRequestedPayload,
     option: &str,
     history: &[Map<String, Value>],
+    requested_run_id: String,
 ) -> Result<DecisionAnsweredPayload, DecisionAnswerError> {
     let mut answer = DecisionAnsweredPayload {
         decision_id: request.decision_id.clone(),
@@ -195,6 +196,9 @@ fn prepare_answer(
         by: "pending-forge-identity".to_owned(),
         by_timeout: None,
         reversal: None,
+        // find_request only ever returns a request paired with the run that
+        // carried its decision.requested event, so this is always known here.
+        requested_run_id: Some(requested_run_id),
         extra: PayloadExtension::new(),
     };
     if let Some(condition) = option.strip_prefix("revoke:") {
@@ -262,11 +266,15 @@ fn queue_verb(option: &str) -> Option<QueueDecision> {
     }
 }
 
+/// Returns the matching `decision.requested` payload together with the id of
+/// the run that emitted it — `DecisionAnsweredPayload.requested_run_id` needs
+/// that run, since ostrom answers on a fresh judgment run rather than the one
+/// that asked.
 fn find_request(
     paths: &OstromPaths,
     decision_id: &str,
-) -> Result<DecisionRequestedPayload, DecisionAnswerError> {
-    let mut found = None;
+) -> Result<(DecisionRequestedPayload, String), DecisionAnswerError> {
+    let mut found: Option<(DecisionRequestedPayload, String)> = None;
     let entries = match fs::read_dir(paths.runs_dir()) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -294,11 +302,20 @@ fn find_request(
             {
                 continue;
             }
+            let run_id = event.run_id.clone();
             let request: DecisionRequestedPayload = serde_json::from_value(event.payload)?;
-            if found.as_ref().is_some_and(|prior| prior != &request) {
-                return refuse("conflicting requests for this decisionId");
+            match &found {
+                Some((prior, _)) if prior != &request => {
+                    return refuse("conflicting requests for this decisionId");
+                }
+                // A repeated gate run re-emits an identical request under the
+                // same decisionId, so several runs may carry it. Directory
+                // iteration order decides which one is kept, and that is
+                // sound: each is a run where this decision was genuinely
+                // asked, which is all requestedRunId claims.
+                Some(_) => {}
+                None => found = Some((request, run_id)),
             }
-            found = Some(request);
         }
     }
     found.ok_or_else(|| DecisionAnswerError::Refused(format!("unknown decision {decision_id}")))

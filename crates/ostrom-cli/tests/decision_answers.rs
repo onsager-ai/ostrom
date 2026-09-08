@@ -284,7 +284,11 @@ fn answers_use_a_new_judgment_run_after_the_request_run_finished() {
         assert_eq!(answer.option_id, verb);
         assert_eq!(answer.by, "github:user:42");
         assert_eq!(answer.reversal.as_deref(), Some(reversal));
-        assert!(event.payload.get("requestedRunId").is_none());
+        // ethogram 9e3cd370 added requestedRunId so a consumer holding only
+        // the answer can find the asking run; ostrom answers on a new
+        // judgment run, so this must name the original "request-run", not
+        // the answering run (`event.run_id`, asserted below).
+        assert_eq!(answer.requested_run_id.as_deref(), Some("request-run"));
         assert!(event.payload.get("byTimeout").is_none());
         let run = FileSink::new(fixture.paths.runs_dir())
             .read_from(&event.run_id, 0)
@@ -313,6 +317,43 @@ fn answers_use_a_new_judgment_run_after_the_request_run_finished() {
         success(&fixture.answer(reversal, "decision-1", reversal));
         assert_eq!(fixture.answered().len(), 2);
     }
+}
+
+/// Dedicated guard for the field most likely to regress to `None`:
+/// `requested_run_id` must name the run that actually emitted the matching
+/// `decision.requested`, not merely be present. Uses a distinctive run id
+/// (rather than reusing "request-run") so the assertion cannot pass by
+/// accident against some other constant in the fixture.
+#[test]
+fn requested_run_id_names_the_asking_run_not_the_answering_run() {
+    let fixture = Fixture::new();
+    fixture.queue();
+    let request = fixture.request_on(
+        "asking-run-7f3a",
+        "decision-2",
+        "tripwire",
+        &["approve", "reject", "defer"],
+    );
+    success(&fixture.answer("approve", "decision-2", "approve"));
+    let events = fixture.events();
+    let event = events
+        .iter()
+        .find(|event| event.event_type == ethogram::DECISION_ANSWERED)
+        .unwrap();
+    let answer: ethogram::DecisionAnsweredPayload =
+        serde_json::from_value(event.payload.clone()).unwrap();
+    ethogram::validate_decision_answer_against_request(&request, &answer).unwrap();
+    assert_eq!(
+        answer.requested_run_id.as_deref(),
+        Some("asking-run-7f3a"),
+        "requested_run_id must name the run that emitted decision.requested"
+    );
+    // The answer lives on a fresh judgment run, not the asking run: naming
+    // the answering run here would be exactly the regression this guards.
+    assert_ne!(
+        answer.requested_run_id.as_deref(),
+        Some(event.run_id.as_str())
+    );
 }
 
 #[test]
