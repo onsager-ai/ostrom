@@ -795,6 +795,11 @@ struct AttributionCounts {
     loop_to_loop: u64,
     loop_to_principal: u64,
     principal: u64,
+    /// A deleted forge account stood in for the author or the merger.
+    /// Counted here, never folded into `loop_to_loop` (it is not unattended)
+    /// or `loop_to_principal` (that would fabricate a human intervention
+    /// that was never observed).
+    unattributed: u64,
 }
 
 impl AttributionCounts {
@@ -803,6 +808,7 @@ impl AttributionCounts {
             Attribution::LoopToLoop => &mut self.loop_to_loop,
             Attribution::LoopToPrincipal => &mut self.loop_to_principal,
             Attribution::Principal => &mut self.principal,
+            Attribution::Unattributed => &mut self.unattributed,
         } += 1;
     }
 }
@@ -1627,7 +1633,9 @@ mod tests {
         assert_eq!(velocity["2026-08-01"]["opened_pending"], 1);
         assert_eq!(
             velocity["2026-08-04"]["merged"],
-            json!({"loop_to_loop": 0, "loop_to_principal": 0, "principal": 0})
+            json!({
+                "loop_to_loop": 0, "loop_to_principal": 0, "principal": 0, "unattributed": 0,
+            })
         );
         assert_eq!(
             velocity["2026-08-03"]["unattended_latency_seconds"],
@@ -1647,6 +1655,40 @@ mod tests {
         partial["velocity"]["observed_days"]["2026-08-03"] = json!(["placeholder-org/other"]);
         let partial = build_velocity_by_day(&partial).unwrap();
         assert_eq!(partial["2026-08-03"]["merged"]["loop_to_loop"], 0);
+    }
+
+    #[test]
+    fn unattributed_gets_its_own_bucket_and_no_latency() {
+        // A deleted forge account stood in for the author on this pull, so
+        // its final class is settled (`unattributed`) independent of the
+        // merger. It must land in its own bucket in both `opened` and
+        // `merged`, must not inflate `opened_pending`, and must contribute
+        // no unattended latency (that is `loop_to_loop`-only).
+        let state = json!({"velocity": {
+            "observed_days": {"2026-08-01": ["placeholder-org/velocity"]},
+            "pulls": {
+                "placeholder-org/velocity#1": {
+                    "repository": "placeholder-org/velocity",
+                    "opened_at": "2026-08-01T00:00:00Z",
+                    "attribution": "unattributed",
+                    "merge": {
+                        "pr": "placeholder-org/velocity#1",
+                        "order_id": null,
+                        "opened_at": "2026-08-01T00:00:00Z",
+                        "merged_at": "2026-08-01T02:00:00Z",
+                        "attribution": "unattributed",
+                    },
+                },
+            },
+        }});
+        let velocity = build_velocity_by_day(&state).unwrap();
+        assert_eq!(velocity["2026-08-01"]["opened"]["unattributed"], 1);
+        assert_eq!(velocity["2026-08-01"]["opened_pending"], 0);
+        assert_eq!(velocity["2026-08-01"]["merged"]["unattributed"], 1);
+        assert_eq!(
+            velocity["2026-08-01"]["unattended_latency_seconds"],
+            json!({"count": 0, "total": 0, "min": null, "max": null, "mean": null})
+        );
     }
 
     #[test]

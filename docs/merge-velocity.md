@@ -25,11 +25,21 @@ compiled into the binary. The attribution vocabulary is:
 | `loop_to_loop` | Machine | Machine |
 | `loop_to_principal` | Machine | Human |
 | `principal` | Human | Either |
+| `unattributed` | Deleted account (`null`) | Either |
+| `unattributed` | Machine | Deleted account (`null`) |
 
-Only `loop_to_loop` is unattended. A missing author, a missing merger for a
-machine-authored PR, or invalid merge times refuses the sweep before advancing
-its queue/state generation. The merger is irrelevant to human-authored work's
-class. Actor identities never enter new trace facts or published aggregates.
+Only `loop_to_loop` is unattended. `unattributed` is never counted as
+unattended: GitHub renders a deleted forge account as a JSON `null` actor —
+the "ghost" user — and this is normal forge data, not malformed evidence. A
+null author or a null merger for a machine-authored PR records `unattributed`
+and the sweep proceeds. Getting this backwards — reading an unknown merger as
+a human one — would fabricate evidence that the loop needed human help, which
+is worse than the defect it replaces: it would look like data rather than an
+error. Invalid merge times still refuse the sweep before advancing its
+queue/state generation, since a broken timestamp on a merged PR is evidence
+something is wrong, unlike a deleted account. The merger is irrelevant to
+human-authored work's class, and to a null-authored pull's class. Actor
+identities never enter new trace facts or published aggregates.
 
 Merge facts are keyed by PR, appended before state is advanced, and checked
 against the existing trace on subsequent sweeps. A retry after a failed state
@@ -53,20 +63,23 @@ unchanged. There is no new published trace file.
 ```json
 {
   "observed_repositories": 1,
-  "opened": {"loop_to_loop": 2, "loop_to_principal": 1, "principal": 3},
+  "opened": {"loop_to_loop": 2, "loop_to_principal": 1, "principal": 3, "unattributed": 0},
   "opened_pending": 1,
-  "merged": {"loop_to_loop": 0, "loop_to_principal": 0, "principal": 0},
+  "merged": {"loop_to_loop": 0, "loop_to_principal": 0, "principal": 0, "unattributed": 0},
   "unattended_latency_seconds": {"count": 0, "total": 0, "min": null, "max": null, "mean": null}
 }
 ```
 
 `opened` counts observed PRs by their eventual merge class on their opening date.
-Human-authored PRs are immediately `principal`. Machine-authored PRs without an
-observed merger contribute to `opened_pending`, which is a count of unresolved
-attribution, not a fourth class or a count of currently open PRs. When a merge is
-observed, its opening moves from pending into its class; the sum stays constant.
-`merged` counts observed merges by their GitHub merge date. Neither count measures
-`work-completed` events.
+Human-authored PRs are immediately `principal`. A PR with a deleted (`null`)
+author is immediately `unattributed`, for the same reason: no later merger
+observation can recover an author identity that was never there. Machine-authored
+PRs with an observed author but no observed merger yet contribute to
+`opened_pending`, which is a count of unresolved attribution, not a fourth class
+or a count of currently open PRs. When a merge is observed, its opening moves
+from pending into its class; the sum stays constant. `merged` counts observed
+merges by their GitHub merge date. Neither count measures `work-completed`
+events.
 
 Latency is opened-to-merged elapsed whole seconds, aggregated on the merge date
 only for `loop_to_loop`. `count` and `total` support weighted aggregation across

@@ -2789,18 +2789,36 @@ fn observe_velocity(
             if recorded.contains_key(&pr) {
                 continue;
             }
-            if !actor_observed(&pull["author"]) {
+            let author = &pull["author"];
+            // GitHub renders a deleted forge account as a JSON `null` actor —
+            // the "ghost" user. That is normal forge data, not malformed
+            // evidence, and unlike a broken timestamp it is unfixable: one
+            // such pull request sitting in a repository's recent-merge
+            // lookback window would otherwise refuse every later sweep for
+            // that repository, forever. Only a still-unrecognizable actor
+            // shape (present, but identifying neither a login nor a bot
+            // flag) refuses here; a genuine `null` is handled below by
+            // `Attribution::classify` as `Unattributed`.
+            if !author.is_null() && !actor_observed(author) {
                 return Err(SweepError::Acquisition(format!(
-                    "velocity: {pr} has no author identity"
+                    "velocity: {pr} has a malformed author identity"
                 )));
             }
             let opened_at = parse_time(string_field(pull, &["createdAt"])).ok_or_else(|| {
                 SweepError::Acquisition(format!("velocity: {pr} has no valid createdAt"))
             })?;
+            let attribution = if author.is_null() {
+                // A deleted author account settles the class now: no later
+                // merger observation can recover whether it was ever human
+                // or machine, so this is final rather than pending.
+                Some(Attribution::Unattributed)
+            } else {
+                (!is_machine(author)).then_some(Attribution::Principal)
+            };
             let mut observation = ObservedPull {
                 repository: repo.to_owned(),
                 opened_at,
-                attribution: (!is_machine(&pull["author"])).then_some(Attribution::Principal),
+                attribution,
                 merge: None,
             };
             if merged {
@@ -2809,11 +2827,18 @@ fn observe_velocity(
                     .ok_or_else(|| {
                         SweepError::Acquisition(format!("velocity: {pr} has no valid mergedAt"))
                     })?;
-                // Missing merger data must not turn machine work into a human
-                // intervention (or an unattended delivery) by assumption.
-                if is_machine(&pull["author"]) && !actor_observed(&pull["mergedBy"]) {
+                let merger = &pull["mergedBy"];
+                // A malformed, non-null merger shape still refuses: unlike a
+                // deleted account, an unrecognizable shape carries no
+                // assurance it is forge data rather than a parsing defect. A
+                // genuinely null merger on a machine-authored pull request is
+                // not refused — `Attribution::classify` below records it
+                // `Unattributed` rather than fabricating a human
+                // intervention (which would be worse than refusing: it would
+                // look like evidence instead of an error).
+                if is_machine(author) && !merger.is_null() && !actor_observed(merger) {
                     return Err(SweepError::Acquisition(format!(
-                        "velocity: {pr} has no mergedBy identity"
+                        "velocity: {pr} has a malformed mergedBy identity"
                     )));
                 }
                 let order_id = completions
@@ -2841,7 +2866,7 @@ fn observe_velocity(
                     order_id,
                     opened_at,
                     merged_at,
-                    attribution: Attribution::classify(&pull["author"], &pull["mergedBy"]),
+                    attribution: Attribution::classify(author, merger),
                 };
                 observation.attribution = Some(fact.attribution);
                 observation.merge = Some(fact.clone());

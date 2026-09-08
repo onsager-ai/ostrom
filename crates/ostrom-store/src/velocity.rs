@@ -37,13 +37,43 @@ pub(crate) enum Attribution {
     LoopToLoop,
     LoopToPrincipal,
     Principal,
+    /// The author or the merger is GitHub's "ghost" — a deleted forge account,
+    /// rendered as a JSON `null` actor. This is normal forge data, not
+    /// malformed evidence: unlike a null or contradictory timestamp on a
+    /// merged pull request, it carries no information to refuse over, and a
+    /// repository holding one such pull request forever would otherwise
+    /// refuse every later sweep. Never counted as unattended and contributes
+    /// no latency.
+    Unattributed,
 }
 
 impl Attribution {
+    /// `author` and `merger` may be a genuine null actor (a deleted account);
+    /// that is not the same failure as a caller passing a still-malformed,
+    /// non-null actor shape (an object identifying neither a login nor a
+    /// bot flag) — callers must refuse the latter themselves before reaching
+    /// this classifier, since only a real `null` reaches it un-refused.
     pub(crate) fn classify(author: &Value, merger: &Value) -> Self {
+        if author.is_null() {
+            // A deleted author account could have been human or machine —
+            // there is no way to know, so it is its own class rather than a
+            // guess in either direction.
+            return Self::Unattributed;
+        }
         if !is_machine(author) {
-            Self::Principal
-        } else if is_machine(merger) {
+            // Human authorship alone settles the class: the merger is
+            // irrelevant, whether it is a known actor, a deleted one, or
+            // (already refused above the classifier) malformed.
+            return Self::Principal;
+        }
+        if merger.is_null() {
+            // A machine author with an unknown merger must not be read as a
+            // human merger: that would fabricate evidence that the loop
+            // needed help, inflating exactly the signal this feature exists
+            // to measure.
+            return Self::Unattributed;
+        }
+        if is_machine(merger) {
             Self::LoopToLoop
         } else {
             Self::LoopToPrincipal
@@ -68,6 +98,9 @@ pub(crate) struct ObservedPull {
     pub opened_at: DateTime<Utc>,
     /// None means machine-authored with no observed merger yet. It is pending,
     /// never an unattended delivery inferred from authorship alone.
+    /// `Some(Unattributed)` before a merge is observed means the author
+    /// identity itself is a deleted account: that outcome is already final,
+    /// since no later merger observation can recover who authored the pull.
     pub attribution: Option<Attribution>,
     pub merge: Option<MergeFact>,
 }
@@ -218,6 +251,38 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn null_actor_classifies_unattributed_never_fabricating_a_human_merger() {
+        let human = json!({"login": "placeholder-person", "__typename": "User"});
+        let machine = json!({"login": "placeholder-machine[bot]"});
+        let ghost = Value::Null;
+        // A deleted author account: unknowable whether it was ever human or
+        // machine, so it is its own class regardless of the merger.
+        assert_eq!(
+            Attribution::classify(&ghost, &human),
+            Attribution::Unattributed
+        );
+        assert_eq!(
+            Attribution::classify(&ghost, &machine),
+            Attribution::Unattributed
+        );
+        assert_eq!(
+            Attribution::classify(&ghost, &ghost),
+            Attribution::Unattributed
+        );
+        // The case that matters most: a machine author with a deleted (null)
+        // merger must never be read as a human merger. Getting this backward
+        // would fabricate evidence that the loop needed human help.
+        let classified = Attribution::classify(&machine, &ghost);
+        assert_eq!(classified, Attribution::Unattributed);
+        assert_ne!(classified, Attribution::LoopToPrincipal);
+        // A human author is Principal regardless of the merger's identity.
+        assert_eq!(
+            Attribution::classify(&human, &ghost),
+            Attribution::Principal
+        );
+    }
+
+    #[test]
     fn missing_merge_evidence_refuses_before_writing_any_generation() {
         let root = fixture();
         let paths = OstromPaths {
@@ -241,9 +306,14 @@ pub(crate) mod tests {
             publish: PublishTarget::Disabled,
             policy: None,
         };
+        // A null actor (GitHub's "ghost" deleted account) is normal forge
+        // data and is covered separately by
+        // `null_actor_evidence_advances_the_sweep_generation`. Only
+        // contradictory or missing timestamps, and actor shapes that are
+        // present but unrecognizable (neither null nor identifying a login
+        // or bot flag), remain refusals.
         for (field, value) in [
-            ("author", Value::Null),
-            ("mergedBy", Value::Null),
+            ("author", json!({})),
             ("mergedBy", json!({})),
             ("createdAt", Value::Null),
             ("mergedAt", Value::Null),
@@ -265,6 +335,66 @@ pub(crate) mod tests {
             for (bytes, path) in &before {
                 assert_eq!(*bytes, fs::read(path).unwrap());
             }
+        }
+    }
+
+    #[test]
+    fn null_actor_evidence_advances_the_sweep_generation_as_unattributed() {
+        let root = fixture();
+        let paths = OstromPaths {
+            config: root.path().into(),
+            state: root.path().into(),
+        };
+        let options = SweepOptions {
+            paths: paths.clone(),
+            working_directory: root.path().into(),
+            executable: root.path().join("unused"),
+            plugin_root: root.path().into(),
+            started_at: "2026-08-05T12:00:00Z".parse().unwrap(),
+            requested_mode: SweepMode::Full,
+            fixture: Some(root.path().join("unattributed.json")),
+            publish: PublishTarget::Disabled,
+            policy: None,
+        };
+        // Case 97: a null author (a deleted account authored the pull).
+        // Case 98: a machine author with a null merger (a deleted account
+        // merged it) — this must classify `Unattributed`, never
+        // `loop_to_principal`, since the merger is genuinely unknown rather
+        // than known-human.
+        for (number, field) in [(97, "author"), (98, "mergedBy")] {
+            let mut pull = pulls().remove(0);
+            pull["number"] = json!(number);
+            pull["headRefName"] = json!(format!("placeholder-branch-{number}"));
+            pull[field] = Value::Null;
+            fs::write(
+                options.fixture.as_ref().unwrap(),
+                serde_json::to_vec(&json!({"repositories": [{
+                    "repo": "placeholder-org/velocity", "merged_prs": [pull],
+                }]}))
+                .unwrap(),
+            )
+            .unwrap();
+            run_sweep(&options)
+                .expect("a null actor is normal forge data and must not refuse the sweep");
+            let state: Value =
+                serde_json::from_slice(&fs::read(paths.sweep_state_file()).unwrap()).unwrap();
+            let pr = format!("placeholder-org/velocity#{number}");
+            assert_eq!(
+                state["velocity"]["pulls"][pr.as_str()]["attribution"],
+                "unattributed",
+                "a null {field} must classify unattributed, not a fabricated human merger"
+            );
+            assert_eq!(
+                state["velocity"]["pulls"][pr.as_str()]["merge"]["attribution"],
+                "unattributed"
+            );
+            let trace = fs::read_to_string(paths.trace_file()).unwrap();
+            let fact = trace
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .find(|row| row["kind"] == "pr-merged" && row["fact"]["pr"] == pr)
+                .unwrap_or_else(|| panic!("no pr-merged fact recorded for {pr}"));
+            assert_eq!(fact["fact"]["attribution"], "unattributed");
         }
     }
 
