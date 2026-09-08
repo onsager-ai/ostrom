@@ -316,14 +316,8 @@ enum Command {
         #[arg(long, value_enum, default_value_t = CliSweepMode::Auto)]
         mode: CliSweepMode,
         /// Re-read only these roster repositories; carry the others forward.
-        #[arg(long, value_delimiter = ',', conflicts_with = "detect")]
+        #[arg(long, value_delimiter = ',')]
         repositories: Option<Vec<String>>,
-        /// Read-only conditional change detection using existing gh authentication.
-        #[arg(long, conflicts_with_all = ["publish_repository", "inner_org", "mode"])]
-        detect: bool,
-        /// Retained generation to compare: current (default) or previous.
-        #[arg(long, requires = "detect")]
-        since: Option<String>,
         /// Recorded GitHub responses for a hermetic parity run.
         #[arg(long, hide = true)]
         fixture: Option<PathBuf>,
@@ -1156,30 +1150,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Sweep {
             mode,
             repositories,
-            detect,
-            since,
             fixture,
             publish_repository,
             inner_org,
             started_at,
         } => {
-            if detect {
-                let results = ostrom_store::detect_sweep(
-                    &paths,
-                    &env::current_dir()?,
-                    fixture.as_deref(),
-                    since.as_deref(),
-                )?;
-                for (repo, changed) in &results {
-                    println!("{}: {repo}", if *changed { "changed" } else { "unchanged" });
-                }
-                println!(
-                    "detect: {} changed of {}",
-                    results.iter().filter(|(_, changed)| *changed).count(),
-                    results.len()
-                );
-                return Ok(());
-            }
             let started_at = resolve_started_at(started_at.as_deref(), &clock)?;
             if let Some(org) = inner_org {
                 let cwd = env::current_dir()?;

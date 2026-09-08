@@ -256,23 +256,6 @@ before any write. `--mode` still independently selects how much history to read
 for each selected repository. Without `--repositories`, output and generation
 bytes follow the existing full-roster behavior.
 
-`ostrom sweep --detect` prints `changed: owner/name` or `unchanged: owner/name`
-for each roster repository, then `detect: N changed of M`, and exits zero.
-It writes nothing under `OSTROM_HOME`: only real sweeps establish stored ETags.
-Detection uses existing `gh` authentication, including an explicit `GH_TOKEN`;
-it does not mint or cache credentials. `--since current` (the default) and
-`--since previous` select the two retained generation slots. Other identifiers
-and unavailable explicit slots refuse; there is no generation archive.
-
-Detection checks the stored issue ETag, closed-issue updates, PR `updatedAt`
-and membership, and default-branch presence. The current record format has no
-conditional baseline for branch tips, CI, PR check/status rollups, changed
-files, or issue relationships. These sources conservatively make a repository
-`changed`; a failed probe does too. Consequently only fully checked empty
-repositories can currently report `unchanged`. A quiet repository with a default
-branch still needs a real sweep. This avoids treating a PR or CI change as
-fresh evidence of no change.
-
 Policy may optionally declare:
 
 ```yaml
@@ -283,9 +266,11 @@ sweep:
 
 Those are the defaults for an authored `sweep: {}` section. Durations use a
 positive integer followed by `s`, `m`, `h`, `d`, or `w`, exactly as check
-freshness durations do. These settings describe cadence for callers; they do
-not start a scheduler. `init` omits the section. Authored sweep loops and the
-`sweep` loop preset remain available for a local schedule.
+freshness durations do. These values describe cadence for callers, not a
+scheduler this crate starts. Nothing reads `detect_every` yet: it is the cadence
+for the change detection tracked in ostrom #531, which ships no flag here.
+`init` omits the section. Authored sweep loops and the `sweep` loop preset
+remain available for a local schedule.
 
 The SessionStart hook never calls `gh`; it renders the durable files written by
 the scheduled sweep and performs only the local portion of the drift scan. It

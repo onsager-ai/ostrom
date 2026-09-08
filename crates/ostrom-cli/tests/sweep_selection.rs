@@ -74,13 +74,6 @@ impl Fixture {
     fn state(&self) -> Value {
         serde_json::from_slice(&fs::read(self.home.join("state.json")).unwrap()).unwrap()
     }
-    fn conditional(&self) {
-        let mut value = self.responses();
-        for repo in value["repositories"].as_array_mut().unwrap() {
-            repo["issue_not_modified"] = json!(true);
-        }
-        self.write(&value);
-    }
 }
 fn success(output: Output) -> String {
     assert!(
@@ -228,82 +221,6 @@ fn selected_non_roster_refusal_leaves_whole_home_untouched() {
     }
 }
 
-#[test]
-fn detect_round_trip_uses_only_real_sweep_etags() {
-    let fixture = Fixture::new(true);
-    let changed = format!("changed: {ALPHA}\nchanged: {BETA}\ndetect: 2 changed of 2\n");
-    assert_eq!(fixture.sweep(&["--detect"], FIRST), changed);
-    assert_eq!(
-        fixture.sweep(&["--detect"], FIRST),
-        changed,
-        "detect must not establish its own baseline"
-    );
-    fixture.sweep(&[], FIRST);
-    fixture.conditional();
-    assert_eq!(
-        fixture.sweep(&["--detect"], NEXT),
-        format!("unchanged: {ALPHA}\nunchanged: {BETA}\ndetect: 0 changed of 2\n")
-    );
-    let mut value = fixture.responses();
-    value["repositories"][1]["issue_etag"] = json!("changed");
-    fixture.write(&value);
-    assert_eq!(
-        fixture.sweep(&["--detect"], NEXT),
-        format!("unchanged: {ALPHA}\nchanged: {BETA}\ndetect: 1 changed of 2\n")
-    );
-}
-
-#[test]
-fn detect_writes_nothing_under_whole_home() {
-    let fixture = Fixture::new(true);
-    for prior in [false, true] {
-        if prior {
-            fixture.sweep(&[], FIRST);
-            fixture.conditional();
-        }
-        let before = snapshot(&fixture.home);
-        fixture.sweep(&["--detect"], NEXT);
-        assert_unchanged(&before, &snapshot(&fixture.home));
-    }
-}
-
-#[test]
-fn detect_reports_pr_only_change_with_unchanged_issues() {
-    let fixture = Fixture::new(true);
-    fixture.sweep(&[], FIRST);
-    fixture.conditional();
-    let mut value = fixture.responses();
-    value["repositories"][0]["open_prs"] =
-        json!([{"number": 2, "updatedAt": NEXT, "state": "OPEN"}]);
-    fixture.write(&value);
-    assert_eq!(
-        fixture.sweep(&["--detect"], NEXT),
-        format!("changed: {ALPHA}\nunchanged: {BETA}\ndetect: 1 changed of 2\n")
-    );
-}
-
-#[test]
-fn detect_refuses_unknown_or_unavailable_generations_without_writes() {
-    let fixture = Fixture::new(true);
-    for id in ["../outside", "previous", "current"] {
-        let before = snapshot(&fixture.home);
-        assert!(
-            !fixture
-                .run(&["--detect", "--since", id], NEXT)
-                .status
-                .success()
-        );
-        assert_unchanged(&before, &snapshot(&fixture.home));
-    }
-    fixture.sweep(&[], FIRST);
-    fixture.sweep(&[], NEXT);
-    fixture.conditional();
-    assert_eq!(
-        fixture.sweep(&["--detect", "--since", "previous"], NEXT),
-        format!("unchanged: {ALPHA}\nunchanged: {BETA}\ndetect: 0 changed of 2\n")
-    );
-}
-
 fn validate_sweep_policy(value: &str) -> Output {
     let root = TempDir::new().unwrap();
     let manifest = root.path().join("policy.yaml");
@@ -366,102 +283,6 @@ fn sweep_schema_refuses_unparseable_duration() {
             assert!(String::from_utf8_lossy(&output.stderr).contains(&format!("sweep.{field}")));
         }
     }
-}
-
-#[test]
-fn detect_cannot_certify_branch_ci_or_existing_pr_evidence() {
-    let fixture = Fixture::new(true);
-    fixture.sweep(&[], FIRST);
-    fixture.conditional();
-    for (field, evidence) in [
-        ("default_branch", json!("main")),
-        ("branches", json!([{"name":"topic"}])),
-        ("ci_runs", json!([{"status":"completed"}])),
-        ("branch_read_degraded", json!(true)),
-        ("warnings", json!(["unobserved"])),
-    ] {
-        let mut value = fixture.responses();
-        value["repositories"][0][field] = evidence;
-        fixture.write(&value);
-        assert_eq!(
-            fixture.sweep(&["--detect"], NEXT),
-            format!("changed: {ALPHA}\nunchanged: {BETA}\ndetect: 1 changed of 2\n")
-        );
-        value["repositories"][0]
-            .as_object_mut()
-            .unwrap()
-            .remove(field);
-        fixture.write(&value);
-    }
-}
-
-#[test]
-fn live_detect_checks_conditional_issues_prs_and_branch_without_writes() {
-    use std::os::unix::fs::PermissionsExt as _;
-    let fixture = Fixture::new(true);
-    fixture.sweep(&[], FIRST);
-    let bin = fixture.root.path().join("bin");
-    fs::create_dir(&bin).unwrap();
-    let gh = bin.join("gh");
-    fs::write(
-        &gh,
-        r#"#!/bin/sh
-printf '%s\n' "$*" >> "$PROBE_LOG"
-case "$*" in
-  'api '*If-None-Match*) printf 'HTTP/2 304\r\n\r\n' ;;
-  'api '*'/issues?'*) printf 'HTTP/2 200\r\n\r\n[]' ;;
-  'pr list --repo placeholder-org/alpha '*) /bin/cat "$PR_RESPONSE" ;;
-  'pr list --repo placeholder-org/beta '*) printf '[]' ;;
-  'repo view '*) printf '{"defaultBranchRef":null}' ;;
-  *) exit 1 ;;
-esac
-"#,
-    )
-    .unwrap();
-    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
-    let log = fixture.root.path().join("probes");
-    let prs = fixture.root.path().join("prs.json");
-    fs::write(&prs, "[]").unwrap();
-    let run = || {
-        Command::new(env!("CARGO_BIN_EXE_ostrom"))
-            .env_clear()
-            .env("OSTROM_HOME", &fixture.home)
-            .env("PATH", &bin)
-            .env("PROBE_LOG", &log)
-            .env("PR_RESPONSE", &prs)
-            .current_dir(fixture.root.path())
-            .args(["sweep", "--detect"])
-            .output()
-            .unwrap()
-    };
-    let before = snapshot(&fixture.home);
-    assert_eq!(
-        success(run()),
-        format!("unchanged: {ALPHA}\nunchanged: {BETA}\ndetect: 0 changed of 2\n")
-    );
-    fs::write(
-        &prs,
-        format!("[{{\"number\":2,\"updatedAt\":\"{NEXT}\",\"state\":\"OPEN\"}}]"),
-    )
-    .unwrap();
-    assert_eq!(
-        success(run()),
-        format!("changed: {ALPHA}\nunchanged: {BETA}\ndetect: 1 changed of 2\n")
-    );
-    assert_unchanged(&before, &snapshot(&fixture.home));
-    let log = fs::read_to_string(log).unwrap();
-    for name in ["alpha", "beta"] {
-        assert!(
-            log.contains(&format!("If-None-Match: \"{name}-issues\"")),
-            "stored ETag was not sent: {log}"
-        );
-        assert!(log.contains(&format!("pr list --repo placeholder-org/{name} --state all --limit 200 --json number,updatedAt,state")));
-        assert!(log.contains(&format!(
-            "repo view placeholder-org/{name} --json defaultBranchRef"
-        )));
-    }
-    assert!(log.contains("state=all"));
-    assert!(log.contains("since=2026-08-02T00:00:00Z"));
 }
 
 #[test]
