@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 
 use ostrom_core::PolicyManifest;
 use serde::Serialize;
+use thiserror::Error;
 
 #[derive(Serialize)]
 struct Preset {
@@ -105,6 +106,7 @@ actors:
     permission_mode: auto
 operations:
   portfolio-sweep:
+    description: Runs the publication sweep over the portfolio queue.
     steps:
       - uses: cmd/run
         with:
@@ -130,22 +132,174 @@ loops:
     ]))
 }
 
+/// Two presets declared the same key in the same section of the manifest.
+///
+/// This is deliberately reachable only through [`merge_disjoint`], never as an
+/// assertion buried inside `render()` over the hardcoded catalogue: the real
+/// catalogue is static and never collides, so a guard living inside `render()`
+/// could never be exercised by a test. Extracting the merge lets a test build
+/// a synthetic, colliding catalogue and prove the guard actually trips.
+#[derive(Debug, Error, PartialEq, Eq)]
+#[error("preset collision: {section} `{key}` is declared by both `{first}` and `{second}`")]
+pub(crate) struct PresetCollision {
+    section: &'static str,
+    key: String,
+    first: String,
+    second: String,
+}
+
+/// Merge each preset's manifest fragment, refusing a collision on any shared
+/// `actors`, `operations`, `grants` or `loops` key rather than letting
+/// [`BTreeMap::extend`] silently let the later preset win.
+fn merge_disjoint<'a>(
+    presets: impl IntoIterator<Item = (&'a str, &'a PolicyManifest)>,
+) -> Result<PolicyManifest, PresetCollision> {
+    let mut merged =
+        PolicyManifest::parse_yaml("manifest_version: 1\n").expect("literal fragment parses");
+    let mut actor_origins = BTreeMap::<String, String>::new();
+    let mut operation_origins = BTreeMap::<String, String>::new();
+    let mut grant_origins = BTreeMap::<String, String>::new();
+    let mut loop_origins = BTreeMap::<String, String>::new();
+    for (name, fragment) in presets {
+        merge_section(
+            &mut merged.actors,
+            &mut actor_origins,
+            &fragment.actors,
+            "actors",
+            name,
+        )?;
+        merge_section(
+            &mut merged.operations,
+            &mut operation_origins,
+            &fragment.operations,
+            "operations",
+            name,
+        )?;
+        merge_section(
+            &mut merged.grants,
+            &mut grant_origins,
+            &fragment.grants,
+            "grants",
+            name,
+        )?;
+        merge_section(
+            &mut merged.loops,
+            &mut loop_origins,
+            &fragment.loops,
+            "loops",
+            name,
+        )?;
+    }
+    Ok(merged)
+}
+
+fn merge_section<T: Clone>(
+    target: &mut BTreeMap<String, T>,
+    origins: &mut BTreeMap<String, String>,
+    incoming: &BTreeMap<String, T>,
+    section: &'static str,
+    preset: &str,
+) -> Result<(), PresetCollision> {
+    for (key, value) in incoming {
+        if let Some(first) = origins.get(key) {
+            return Err(PresetCollision {
+                section,
+                key: key.clone(),
+                first: first.clone(),
+                second: preset.to_owned(),
+            });
+        }
+        target.insert(key.clone(), value.clone());
+        origins.insert(key.clone(), preset.to_owned());
+    }
+    Ok(())
+}
+
 pub(crate) fn render(json: bool) -> Result<String, Box<dyn std::error::Error>> {
     let presets = catalogue()?;
     if json {
         return Ok(format!("{}\n", serde_json::to_string_pretty(&presets)?));
     }
-    let mut fragment = PolicyManifest::parse_yaml("manifest_version: 1\n")?;
-    for preset in presets.into_values() {
-        fragment.actors.extend(preset.fragment.actors);
-        fragment.operations.extend(preset.fragment.operations);
-        fragment.grants.extend(preset.fragment.grants);
-        fragment.loops.extend(preset.fragment.loops);
-    }
+    let fragment = merge_disjoint(
+        presets
+            .iter()
+            .map(|(name, preset)| (*name, &preset.fragment)),
+    )?;
     Ok(format!(
         "# Optional loop presets: merge the declarations you want into ostrom.yaml.\n\
          # Replace every placeholder-org/portfolio with your repository.\n\
          # Agent prompt files are written by ostrom init.\n{}",
         fragment.to_yaml()?
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn real_catalogue_merges_without_collision() {
+        let presets = catalogue().expect("catalogue parses");
+        let merged = merge_disjoint(
+            presets
+                .iter()
+                .map(|(name, preset)| (*name, &preset.fragment)),
+        )
+        .expect("the three shipped presets do not collide");
+        for actor in ["builder", "gatekeeper", "sweeper"] {
+            assert!(merged.actors.contains_key(actor), "missing actor {actor}");
+        }
+        for operation in ["build-pass", "gate-pass", "portfolio-sweep"] {
+            assert!(
+                merged.operations.contains_key(operation),
+                "missing operation {operation}"
+            );
+        }
+        for grant in ["builder-build", "gatekeeper-gate", "sweep"] {
+            assert!(merged.grants.contains_key(grant), "missing grant {grant}");
+        }
+        for loop_name in ["builder-day", "gatekeeper", "sweep"] {
+            assert!(
+                merged.loops.contains_key(loop_name),
+                "missing loop {loop_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn colliding_presets_are_refused_by_name() {
+        let first = PolicyManifest::parse_yaml(
+            r#"manifest_version: 1
+actors:
+  builder:
+    permission_mode: auto
+"#,
+        )
+        .expect("first fragment parses");
+        let second = PolicyManifest::parse_yaml(
+            r#"manifest_version: 1
+actors:
+  builder:
+    permission_mode: manual
+"#,
+        )
+        .expect("second fragment parses");
+
+        let error = merge_disjoint([("alpha", &first), ("beta", &second)])
+            .expect_err("a shared actor key must be refused, not silently overwritten");
+
+        assert_eq!(
+            error,
+            PresetCollision {
+                section: "actors",
+                key: "builder".to_owned(),
+                first: "alpha".to_owned(),
+                second: "beta".to_owned(),
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            "preset collision: actors `builder` is declared by both `alpha` and `beta`"
+        );
+    }
 }
