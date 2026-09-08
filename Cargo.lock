@@ -82,7 +82,7 @@ dependencies = [
 [[package]]
 name = "ethogram"
 version = "0.1.0"
-source = "git+https://github.com/onsager-ai/ethogram?rev=ba892e843db9df7cbc74bd52e2933799fa8cd3d9#ba892e843db9df7cbc74bd52e2933799fa8cd3d9"
+source = "git+https://github.com/onsager-ai/ethogram?rev=9e3cd3701b88b53f9b18e93480a477b3724dab40#9e3cd3701b88b53f9b18e93480a477b3724dab40"
 dependencies = [
  "serde",
  "serde_json",
@@ -91,7 +91,7 @@ dependencies = [
 [[package]]
 name = "ethogram-corpus"
 version = "0.1.0"
-source = "git+https://github.com/onsager-ai/ethogram?rev=ba892e843db9df7cbc74bd52e2933799fa8cd3d9#ba892e843db9df7cbc74bd52e2933799fa8cd3d9"
+source = "git+https://github.com/onsager-ai/ethogram?rev=9e3cd3701b88b53f9b18e93480a477b3724dab40#9e3cd3701b88b53f9b18e93480a477b3724dab40"
 dependencies = [
  "ethogram",
  "serde_json",
