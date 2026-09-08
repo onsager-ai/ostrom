@@ -1,0 +1,42 @@
+# Operator policy for the delivery roles.
+#
+# `ostrom pass builder` and `ostrom pass gatekeeper` resolve their prompt and
+# permission mode from the actor declared here. Until this manifest is signed
+# and trusted, both fall back to what the binary ships -- which is exactly the
+# text in ./prompts, so adopting this file changes nothing until you edit it.
+#
+# Sign it with:
+#   ostrom sign --key-id <id> --key <private.pem> ostrom.yaml
+manifest_version: 1
+
+actors:
+  builder:
+    description: Writes work orders and dispatches implementers, unattended.
+    permission_mode: auto
+  gatekeeper:
+    description: Judges finished work. Acts only on confirmation.
+    permission_mode: manual
+
+operations:
+  build-pass:
+    description: One builder pass over the portfolio queue.
+    steps:
+      - uses: agent/claude
+        with:
+          prompt: {from: ./prompts/work.md}
+  gate-pass:
+    description: One gatekeeper pass over open pull requests.
+    steps:
+      - uses: agent/claude
+        with:
+          prompt: {from: ./prompts/gatekeep.md}
+
+# A grant binds an actor to an operation. The profile each pass hands its
+# harness is derived from these, so widening a role is an edit here.
+grants:
+  builder-build:
+    actors: builder
+    operations: build-pass
+  gatekeeper-gate:
+    actors: gatekeeper
+    operations: gate-pass
