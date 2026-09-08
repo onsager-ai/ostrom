@@ -447,7 +447,11 @@ fn validate_and_compose_agree_on_acceptance() {
     }
 
     enum Expectation {
-        Agree,
+        /// validate and compose must reach the same verdict, and it must be
+        /// this one. Carrying the verdict as data keeps each case's expectation
+        /// beside the case; deriving it from the case name instead would mean a
+        /// rename silently changes what is asserted.
+        Agree { accepted: bool },
     }
 
     // Declare the operation locally so isolation leaves exactly the actor
@@ -459,33 +463,40 @@ fn validate_and_compose_agree_on_acceptance() {
     let operator_with_grants =
         format!("{OPERATOR}grants:\n  delegated: {{actors: builder, operations: work}}\n");
     let cases = [
-        ("unedited init output", Input::Init, Expectation::Agree),
+        (
+            "unedited init output",
+            Input::Init,
+            Expectation::Agree { accepted: true },
+        ),
         (
             "operator with grants",
             Input::Operator(&operator_with_grants),
-            Expectation::Agree,
+            Expectation::Agree { accepted: true },
         ),
         (
             "repository without grants",
             Input::Repository("manifest_version: 1\n"),
-            Expectation::Agree,
+            Expectation::Agree { accepted: true },
         ),
         (
             "grant with an actor absent from both scopes",
             Input::Repository(
                 "manifest_version: 1\ngrants:\n  invalid: {actors: absent, operations: work}\n",
             ),
-            Expectation::Agree,
+            // Resolvable in no scope, so both refuse even with a context.
+            Expectation::Agree { accepted: false },
         ),
         (
             "repository grant naming an operator actor",
             Input::Repository(&repository_with_grants),
-            Expectation::Agree,
+            Expectation::Agree { accepted: true },
         ),
         (
             "repository grant naming an operator actor in isolation",
             Input::IsolatedRepository(&repository_with_grants),
-            Expectation::Agree,
+            // Strict acceptance is the definition: unresolved here is a refusal,
+            // even though the default validate exits 0 and says so.
+            Expectation::Agree { accepted: false },
         ),
     ];
 
@@ -570,8 +581,9 @@ fn validate_and_compose_agree_on_acceptance() {
             String::from_utf8_lossy(&compose.stdout).trim(),
             String::from_utf8_lossy(&compose.stderr).trim(),
         );
-        let expected_acceptance = !matches!(input, Input::IsolatedRepository(_))
-            && name != "grant with an actor absent from both scopes";
+        let Expectation::Agree {
+            accepted: expected_acceptance,
+        } = expectation;
         assert_eq!(
             (validate_accepts, compose_accepts),
             (expected_acceptance, expected_acceptance),
@@ -581,7 +593,10 @@ fn validate_and_compose_agree_on_acceptance() {
             assert_eq!(validate.status.code(), Some(1), "{diagnostic}");
             assert_eq!(compose.status.code(), Some(1), "{diagnostic}");
         }
-        if name == "repository grant naming an operator actor" {
+        // Every repository input carries an operator context, so an accepted
+        // one must say it resolved against it. Keyed on the input rather than
+        // the case name, so a rename cannot silently skip the assertion.
+        if matches!(input, Input::Repository(_)) && expected_acceptance {
             assert_eq!(
                 String::from_utf8_lossy(&validate.stdout).lines().next(),
                 Some(
@@ -595,13 +610,8 @@ fn validate_and_compose_agree_on_acceptance() {
                 "{diagnostic}"
             );
         }
-        match expectation {
-            Expectation::Agree => {
-                assert_eq!(validate_accepts, compose_accepts, "{diagnostic}");
-                saw_mutual_acceptance |= validate_accepts;
-                saw_mutual_rejection |= !validate_accepts;
-            }
-        }
+        saw_mutual_acceptance |= validate_accepts;
+        saw_mutual_rejection |= !validate_accepts;
     }
     assert!(
         saw_mutual_acceptance,
