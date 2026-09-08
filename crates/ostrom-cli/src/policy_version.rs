@@ -121,14 +121,18 @@ pub(crate) enum CurrentPolicyError {
 pub(crate) fn run_compose(
     paths: &OstromPaths,
     manifest_path: &Path,
+    unsigned: bool,
 ) -> Result<ComposeOutcome, PolicyVersionError> {
-    let manifest = policy_manifest::compose_manifest(paths, manifest_path)?;
+    let manifest = policy_manifest::compose_manifest(paths, manifest_path, unsigned)?;
     let digest = policy_manifest_digest(&manifest)?;
     let rendered = manifest
         .to_yaml()
         .map_err(PolicyVersionError::Render)?
         .into_bytes();
-    install_version(paths, &manifest, &digest, &rendered, || Ok(()))?;
+    if !unsigned {
+        install_version(paths, &manifest, &digest, &rendered, || Ok(()))?;
+    }
+    policy_manifest::report_unsigned_composition(unsigned);
     Ok(ComposeOutcome {
         path: paths.policy_versions_dir().join(&digest),
         digest,

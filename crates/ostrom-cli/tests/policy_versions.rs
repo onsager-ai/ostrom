@@ -942,7 +942,12 @@ fn strict_validation_and_composition_share_remaining_acceptance_checks() {
     ] {
         fs::write(&fixture.manifest, source).expect("write invalid policy");
         support::sign_manifest(&fixture.manifest);
-        for args in [vec!["validate", "--strict"], vec!["compose"]] {
+        for args in [
+            vec!["validate", "--strict"],
+            vec!["compose"],
+            vec!["validate", "--strict", "--unsigned"],
+            vec!["compose", "--unsigned"],
+        ] {
             let output = fixture
                 .command()
                 .env("OSTROM_TEST_466_COUNT", "not-an-integer")

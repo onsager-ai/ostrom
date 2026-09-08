@@ -26,6 +26,7 @@ pub(crate) fn run_validate(
     path: &Path,
     normalized: bool,
     strict: bool,
+    unsigned: bool,
     operator: Option<&Path>,
 ) -> Result<(), PolicyLoadError> {
     let normalized_path = normalize_manifest_path(path);
@@ -36,7 +37,9 @@ pub(crate) fn run_validate(
     };
     let mut unresolved = Vec::new();
     let bundle = if operator_path.is_some() {
-        verify(&loaded.manifest, &normalized_path)?;
+        if !unsigned {
+            verify(&loaded.manifest, &normalized_path)?;
+        }
         let bundle = build_bundle_with_operator(
             normalized_path.into_owned(),
             loaded.clone(),
@@ -51,7 +54,9 @@ pub(crate) fn run_validate(
             .map_err(|error| PolicyLoadError::Validation(error.to_string()))?;
         validate_operation_names(&loaded.manifest)?;
         validate_check_requirements(&loaded.manifest)?;
-        verify(&loaded.manifest, &normalized_path)?;
+        if !unsigned {
+            verify(&loaded.manifest, &normalized_path)?;
+        }
         unresolved.sort_by_key(|reference| {
             loaded
                 .reference_order
@@ -89,6 +94,7 @@ pub(crate) fn run_validate(
             println!("unresolved: {} -> {}", reference.path, reference.name);
         }
     }
+    report_unsigned_composition(unsigned);
     if strict && !unresolved.is_empty() {
         return Err(PolicyLoadError::Validation(format!(
             "{} unresolved reference(s) in isolation",
@@ -105,6 +111,14 @@ pub(crate) fn run_validate(
         );
     }
     Ok(())
+}
+
+pub(crate) fn report_unsigned_composition(unsigned: bool) {
+    if unsigned {
+        eprintln!(
+            "composition performed without verifying the candidate's signature; nothing was written"
+        );
+    }
 }
 
 // Validation and composition use the same input, selector, and adjacent-policy
@@ -238,20 +252,32 @@ pub(crate) fn load_bundle(
     paths: &OstromPaths,
     path: &Path,
 ) -> Result<PolicyBundle, PolicyLoadError> {
+    load_bundle_inner(paths, path, false)
+}
+
+fn load_bundle_inner(
+    paths: &OstromPaths,
+    path: &Path,
+    unsigned: bool,
+) -> Result<PolicyBundle, PolicyLoadError> {
     let repository_path = normalize_manifest_path(path).into_owned();
     let repository = load_composed(&repository_path)?;
-    verify(&repository.manifest, &repository_path)?;
+    if !unsigned {
+        verify(&repository.manifest, &repository_path)?;
+    }
     build_bundle(paths, repository_path, repository)
 }
 
 /// Compose policy into its effective manifest, retaining an operator root as
 /// operator policy or layering a repository root with the adopting operator.
-/// Every signed input is verified before the effective manifest is returned.
+/// Only the command's explicit unsigned flag may skip the candidate signature;
+/// a separately loaded operator context still requires verification.
 pub(crate) fn compose_manifest(
     paths: &OstromPaths,
     path: &Path,
+    unsigned: bool,
 ) -> Result<PolicyManifest, PolicyLoadError> {
-    let bundle = load_bundle(paths, path)?;
+    let bundle = load_bundle_inner(paths, path, unsigned)?;
     validate_manifest(&bundle.manifest)?;
     validate_command_manifest(path, &bundle.manifest)?;
     Ok(bundle.manifest)
@@ -1717,6 +1743,114 @@ mod tests {
     use ostrom_store::{OstromPaths, PolicyBundle, PolicyOrigins};
 
     const LEGACY_NOTICE_CHILD: &str = "OSTROM_TEST_LEGACY_NOTICE_CHILD";
+
+    #[test]
+    fn signed_and_unsigned_composition_have_identical_manifest_bytes_and_digests() {
+        const CHILD: &str = "OSTROM_TEST_COMPOSITION_AGREEMENT_CHILD";
+        if let Some(root) = env::var_os(CHILD) {
+            let root = Path::new(&root);
+            let paths = OstromPaths {
+                config: root.join("operator"),
+                state: root.join("operator"),
+            };
+            for path in [
+                paths.config.join("ostrom.yaml"),
+                root.join("repository.yaml"),
+            ] {
+                let signed =
+                    super::compose_manifest(&paths, &path, false).expect("signed composition");
+                let unsigned =
+                    super::compose_manifest(&paths, &path, true).expect("unsigned composition");
+                assert_eq!(
+                    signed.to_yaml().expect("signed YAML").as_bytes(),
+                    unsigned.to_yaml().expect("unsigned YAML").as_bytes()
+                );
+                assert_eq!(
+                    ostrom_store::policy_manifest_digest(&signed).expect("signed digest"),
+                    ostrom_store::policy_manifest_digest(&unsigned).expect("unsigned digest")
+                );
+                assert!(unsigned.operations.contains_key("work"));
+                assert_eq!(
+                    unsigned.prompts["work"],
+                    ostrom_core::PromptValue::Inline("Draft policy.\n".to_owned())
+                );
+            }
+            return;
+        }
+
+        use rsa::{
+            RsaPrivateKey, RsaPublicKey,
+            pkcs8::{EncodePrivateKey as _, EncodePublicKey as _, LineEnding},
+            rand_core::OsRng,
+        };
+        let root = tempdir().expect("composition fixture");
+        let operator = root.path().join("operator");
+        fs::create_dir(&operator).expect("operator directory");
+        fs::write(operator.join("prompt.md"), "Draft policy.\n").expect("prompt file");
+        fs::write(
+            operator.join("actor.yaml"),
+            "actor: builder\npermission_mode: manual\n",
+        )
+        .expect("included actor");
+        fs::write(
+            operator.join("ostrom.yaml"),
+            concat!(
+                "manifest_version: 1\nincludes: [actor.yaml]\n",
+                "prompts: {work: {from: prompt.md}}\n",
+                "operations: {work: {steps: []}}\n",
+            ),
+        )
+        .expect("operator policy");
+        fs::write(
+            root.path().join("repository.yaml"),
+            concat!(
+                "manifest_version: 1\n",
+                "grants: {delegated: {actors: builder, operations: work}}\n",
+            ),
+        )
+        .expect("repository policy");
+        let private = RsaPrivateKey::new(&mut OsRng, 2048).expect("test signing key");
+        let key = root.path().join("private.pem");
+        fs::write(
+            &key,
+            private
+                .to_pkcs8_pem(LineEnding::LF)
+                .expect("private PEM")
+                .as_bytes(),
+        )
+        .expect("private key file");
+        fs::write(
+            root.path().join("principal.pem"),
+            RsaPublicKey::from(&private)
+                .to_public_key_pem(LineEnding::LF)
+                .expect("public PEM"),
+        )
+        .expect("public key file");
+        for path in [
+            operator.join("ostrom.yaml"),
+            root.path().join("repository.yaml"),
+        ] {
+            ostrom_store::sign_policy_manifest(
+                &load_composed(&path).expect("authored policy").manifest,
+                &path,
+                "principal",
+                &key,
+            )
+            .expect("sign composed fixture");
+        }
+        let output = Command::new(env::current_exe().expect("test executable"))
+            .env(CHILD, root.path())
+            .env_remove("OSTROM_POLICY_MANIFEST")
+            .env("OSTROM_POLICY_TRUSTED_KEYS", root.path())
+            .args(["--exact", "policy_manifest::tests::signed_and_unsigned_composition_have_identical_manifest_bytes_and_digests", "--nocapture"])
+            .output().expect("compare in isolated trust environment");
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn legacy_notice_is_emitted_once_for_repeated_lookup() {
