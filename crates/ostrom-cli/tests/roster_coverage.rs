@@ -85,9 +85,12 @@ fn repository_present_in_both_documents_has_no_finding() {
 
 #[test]
 fn validate_refuses_delegated_without_gate_but_accepts_an_ungoverned_repository() {
+    let home = tempfile::tempdir().expect("isolated operator home");
     let governed = fixture();
     let trusted_keys = support::sign_manifest(&governed.path().join("ostrom.yaml"));
     let invalid = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .env("OSTROM_HOME", home.path())
+        .env_remove("OSTROM_POLICY_MANIFEST")
         .args(["validate"])
         .arg(governed.path().join("ostrom.yaml"))
         .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
@@ -102,6 +105,17 @@ fn validate_refuses_delegated_without_gate_but_accepts_an_ungoverned_repository(
     );
     assert!(stderr.contains("gate.yaml"), "{stderr}");
 
+    let compose = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .env("OSTROM_HOME", home.path())
+        .env_remove("OSTROM_POLICY_MANIFEST")
+        .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
+        .arg("compose")
+        .arg(governed.path().join("ostrom.yaml"))
+        .output()
+        .expect("compose mismatched legacy policy");
+    assert_eq!(compose.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&compose.stderr).contains("gate.yaml"));
+
     let ungoverned = tempfile::tempdir().expect("ungoverned repository fixture");
     fs::write(
         ungoverned.path().join("ostrom.yaml"),
@@ -110,6 +124,8 @@ fn validate_refuses_delegated_without_gate_but_accepts_an_ungoverned_repository(
     .expect("write ungoverned manifest");
     let trusted_keys = support::sign_manifest(&ungoverned.path().join("ostrom.yaml"));
     let valid = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .env("OSTROM_HOME", home.path())
+        .env_remove("OSTROM_POLICY_MANIFEST")
         .args(["validate"])
         .arg(ungoverned.path().join("ostrom.yaml"))
         .env("OSTROM_POLICY_TRUSTED_KEYS", trusted_keys)

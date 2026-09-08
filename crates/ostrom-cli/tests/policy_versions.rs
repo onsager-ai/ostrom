@@ -58,6 +58,7 @@ impl Fixture {
         command
             .current_dir(&self.repository)
             .env("OSTROM_HOME", &self.home)
+            .env_remove("OSTROM_POLICY_MANIFEST")
             .env("OSTROM_POLICY_TRUSTED_KEYS", &self.trusted_keys);
         command
     }
@@ -442,52 +443,60 @@ fn validate_and_compose_agree_on_acceptance() {
         Init,
         Operator(&'a str),
         Repository(&'a str),
+        IsolatedRepository(&'a str),
     }
 
     enum Expectation {
-        Agree,
-        KnownDivergence {
-            validate_accepts: bool,
-            compose_accepts: bool,
-        },
+        /// validate and compose must reach the same verdict, and it must be
+        /// this one. Carrying the verdict as data keeps each case's expectation
+        /// beside the case; deriving it from the case name instead would mean a
+        /// rename silently changes what is asserted.
+        Agree { accepted: bool },
     }
 
-    let repository_with_grants = Fixture::repository_policy("delegated");
+    // Declare the operation locally so isolation leaves exactly the actor
+    // unresolved. Both context rows use these identical bytes.
+    let repository_with_grants = format!(
+        "{}operations: {{work: {{steps: []}}}}\n",
+        Fixture::repository_policy("delegated")
+    );
     let operator_with_grants =
         format!("{OPERATOR}grants:\n  delegated: {{actors: builder, operations: work}}\n");
     let cases = [
-        ("unedited init output", Input::Init, Expectation::Agree),
+        (
+            "unedited init output",
+            Input::Init,
+            Expectation::Agree { accepted: true },
+        ),
         (
             "operator with grants",
             Input::Operator(&operator_with_grants),
-            Expectation::Agree,
+            Expectation::Agree { accepted: true },
         ),
         (
             "repository without grants",
             Input::Repository("manifest_version: 1\n"),
-            Expectation::Agree,
+            Expectation::Agree { accepted: true },
         ),
         (
             "grant with an actor absent from both scopes",
             Input::Repository(
                 "manifest_version: 1\ngrants:\n  invalid: {actors: absent, operations: work}\n",
             ),
-            Expectation::Agree,
+            // Resolvable in no scope, so both refuse even with a context.
+            Expectation::Agree { accepted: false },
         ),
         (
             "repository grant naming an operator actor",
             Input::Repository(&repository_with_grants),
-            // #466, ruling 2026-09-08: agreement is per resolution context.
-            // Validate currently checks in isolation; compose resolves against
-            // OSTROM_HOME. The follow-up will make validate use that context
-            // and report isolated cross-manifest references as unresolved here.
-            // An omitted case is one nobody remembers was considered. Pinning
-            // today's divergence makes its fix fail this assertion, forcing the
-            // marker off instead of relying on someone remembering it is here.
-            Expectation::KnownDivergence {
-                validate_accepts: false,
-                compose_accepts: true,
-            },
+            Expectation::Agree { accepted: true },
+        ),
+        (
+            "repository grant naming an operator actor in isolation",
+            Input::IsolatedRepository(&repository_with_grants),
+            // Strict acceptance is the definition: unresolved here is a refusal,
+            // even though the default validate exits 0 and says so.
+            Expectation::Agree { accepted: false },
         ),
     ];
 
@@ -512,16 +521,53 @@ fn validate_and_compose_agree_on_acceptance() {
                     String::from_utf8_lossy(&init.stderr)
                 );
             }
+            Input::IsolatedRepository(source) => {
+                fs::remove_file(fixture.home.join("ostrom.yaml")).expect("remove operator context");
+                fs::write(&fixture.manifest, source).expect("write isolated agreement case");
+            }
             Input::Operator(source) | Input::Repository(source) => {
                 fs::write(&fixture.manifest, source).expect("write agreement case");
             }
         }
         fixture.trusted_keys = support::sign_manifest(&fixture.manifest);
 
+        // Strict exit status defines acceptance. Default validation may succeed
+        // while explicitly reporting references unresolved in this same input.
+        if matches!(input, Input::IsolatedRepository(_)) {
+            let default = fixture
+                .command()
+                .arg("validate")
+                .arg(&fixture.manifest)
+                .output()
+                .expect("default isolated validation");
+            assert_eq!(
+                default.status.code(),
+                Some(0),
+                "{}",
+                String::from_utf8_lossy(&default.stderr)
+            );
+            let stdout = String::from_utf8(default.stdout).expect("UTF-8 diagnostics");
+            assert_eq!(
+                stdout.lines().next(),
+                Some(
+                    format!(
+                        "valid: {} (isolated; 1 unresolved)",
+                        fixture.manifest.display()
+                    )
+                    .as_str()
+                )
+            );
+            assert!(
+                stdout
+                    .lines()
+                    .any(|line| line == "unresolved: grants.delegated.actors -> builder"),
+                "{stdout}"
+            );
+        }
         // Both commands receive the same signed file and operator context.
         let validate = fixture
             .command()
-            .arg("validate")
+            .args(["validate", "--strict"])
             .arg(&fixture.manifest)
             .output()
             .expect("run ostrom validate");
@@ -535,27 +581,383 @@ fn validate_and_compose_agree_on_acceptance() {
             String::from_utf8_lossy(&compose.stdout).trim(),
             String::from_utf8_lossy(&compose.stderr).trim(),
         );
-        match expectation {
-            Expectation::Agree => {
-                assert_eq!(validate_accepts, compose_accepts, "{diagnostic}");
-                saw_mutual_acceptance |= validate_accepts;
-                saw_mutual_rejection |= !validate_accepts;
-            }
-            Expectation::KnownDivergence {
-                validate_accepts: expected_validate,
-                compose_accepts: expected_compose,
-            } => assert_eq!(
-                (validate_accepts, compose_accepts),
-                (expected_validate, expected_compose),
-                "known divergence changed; revisit the #466 marker\n{diagnostic}"
-            ),
+        let Expectation::Agree {
+            accepted: expected_acceptance,
+        } = expectation;
+        assert_eq!(
+            (validate_accepts, compose_accepts),
+            (expected_acceptance, expected_acceptance),
+            "{diagnostic}"
+        );
+        if !expected_acceptance {
+            assert_eq!(validate.status.code(), Some(1), "{diagnostic}");
+            assert_eq!(compose.status.code(), Some(1), "{diagnostic}");
         }
+        // Every repository input carries an operator context, so an accepted
+        // one must say it resolved against it. Keyed on the input rather than
+        // the case name, so a rename cannot silently skip the assertion.
+        if matches!(input, Input::Repository(_)) && expected_acceptance {
+            assert_eq!(
+                String::from_utf8_lossy(&validate.stdout).lines().next(),
+                Some(
+                    format!(
+                        "valid: {} (resolved against operator {})",
+                        fixture.manifest.display(),
+                        fixture.home.join("ostrom.yaml").display()
+                    )
+                    .as_str()
+                ),
+                "{diagnostic}"
+            );
+        }
+        saw_mutual_acceptance |= validate_accepts;
+        saw_mutual_rejection |= !validate_accepts;
     }
     assert!(
         saw_mutual_acceptance,
         "cases must exercise mutual acceptance"
     );
     assert!(saw_mutual_rejection, "cases must exercise mutual rejection");
+}
+
+#[test]
+fn validate_reports_bare_isolation() {
+    let fixture = Fixture::new();
+    fs::remove_file(fixture.home.join("ostrom.yaml")).expect("remove context");
+    fs::write(&fixture.manifest, "manifest_version: 1\n").expect("empty manifest");
+    support::sign_manifest(&fixture.manifest);
+    for strict in [false, true] {
+        let mut command = fixture.command();
+        command.arg("validate").arg(&fixture.manifest);
+        if strict {
+            command.arg("--strict");
+        }
+        let output = command.output().expect("validate isolated manifest");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("UTF-8 output"),
+            format!("valid: {} (isolated)\n", fixture.manifest.display())
+        );
+    }
+}
+
+#[test]
+fn validate_lists_all_unresolved_references_in_manifest_order_and_strict_refuses() {
+    let fixture = Fixture::new();
+    fs::remove_file(fixture.home.join("ostrom.yaml")).expect("remove context");
+    // Deliberately differ from sorted map, section, and validation field order.
+    fs::write(&fixture.manifest, concat!(
+        "manifest_version: 1\n",
+        "denies:\n  z-last: {operations: [z-op, a-op], actors: [z-actor, a-actor]}\n",
+        "loops:\n  tick: {operation: tick-op, actor: ticker, target: example/repo, every: hourly}\n",
+        "grants:\n  z-last: {operations: work, actors: builder}\n  a-first: {actors: reviewer}\n",
+        "includes: [z-leaf.yaml, a-fragment.yaml]\n",
+    )).expect("write references");
+    fs::write(
+        fixture.repository.join("z-leaf.yaml"),
+        "deny: leaf\noperations: leaf-op\nactors: leaf-actor\n",
+    )
+    .expect("write leaf");
+    fs::write(
+        fixture.repository.join("a-fragment.yaml"),
+        "denies:\n  fragment: {actors: fragment-actor, operations: fragment-op}\n",
+    )
+    .expect("write fragment");
+    support::sign_manifest(&fixture.manifest);
+    let expected = format!(
+        concat!(
+            "valid: {} (isolated; 13 unresolved)\n",
+            "unresolved: denies.z-last.operations -> z-op\n",
+            "unresolved: denies.z-last.operations -> a-op\n",
+            "unresolved: denies.z-last.actors -> z-actor\n",
+            "unresolved: denies.z-last.actors -> a-actor\n",
+            "unresolved: loops.tick.operation -> tick-op\n",
+            "unresolved: loops.tick.actor -> ticker\n",
+            "unresolved: grants.z-last.operations -> work\n",
+            "unresolved: grants.z-last.actors -> builder\n",
+            "unresolved: grants.a-first.actors -> reviewer\n",
+            "unresolved: denies.leaf.operations -> leaf-op\n",
+            "unresolved: denies.leaf.actors -> leaf-actor\n",
+            "unresolved: denies.fragment.actors -> fragment-actor\n",
+            "unresolved: denies.fragment.operations -> fragment-op\n",
+        ),
+        fixture.manifest.display()
+    );
+    for strict in [false, true] {
+        let mut command = fixture.command();
+        command.arg("validate").arg(&fixture.manifest);
+        if strict {
+            command.arg("--strict");
+        }
+        let output = command.output().expect("validate references");
+        assert_eq!(
+            output.status.code(),
+            Some(i32::from(strict)),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("UTF-8 output"),
+            expected
+        );
+        if strict {
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("invalid policy manifest: 13 unresolved reference(s) in isolation")
+            );
+        }
+    }
+    let normalized = fixture
+        .command()
+        .args(["validate", "--normalized"])
+        .arg(&fixture.manifest)
+        .output()
+        .expect("normalize unresolved manifest");
+    assert_eq!(normalized.status.code(), Some(0));
+    // --normalized keeps stdout a pure YAML document; the diagnostics go to
+    // stderr so a consumer can pipe stdout straight into a parser.
+    assert_eq!(
+        String::from_utf8(normalized.stderr).expect("UTF-8 diagnostics"),
+        expected
+    );
+    let yaml = String::from_utf8(normalized.stdout).expect("UTF-8 normalized output");
+    let parsed = PolicyManifest::parse_yaml(&yaml).expect("normalized manifest");
+    assert_eq!(
+        parsed
+            .validate_in_context(None)
+            .expect("still unresolved")
+            .len(),
+        13
+    );
+}
+
+#[test]
+fn unresolved_order_preserves_yaml_keys_decoded_as_strings() {
+    let fixture = Fixture::new();
+    fs::remove_file(fixture.home.join("ostrom.yaml")).expect("remove context");
+    fs::write(
+        &fixture.manifest,
+        concat!(
+            "manifest_version: 1\ngrants:\n",
+            "  z: {actors: first}\n",
+            "  12: {actors: second}\n",
+            "  0xC: {actors: third}\n",
+            "  true: {actors: fourth}\n",
+            "  a: {actors: fifth}\n",
+        ),
+    )
+    .expect("numeric and boolean rule names");
+    support::sign_manifest(&fixture.manifest);
+    let output = fixture
+        .command()
+        .arg("validate")
+        .arg(&fixture.manifest)
+        .output()
+        .expect("validate string-decoded keys");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("UTF-8 output"),
+        format!(
+            concat!(
+                "valid: {} (isolated; 5 unresolved)\n",
+                "unresolved: grants.z.actors -> first\n",
+                "unresolved: grants.12.actors -> second\n",
+                "unresolved: grants.0xC.actors -> third\n",
+                "unresolved: grants.true.actors -> fourth\n",
+                "unresolved: grants.a.actors -> fifth\n",
+            ),
+            fixture.manifest.display()
+        )
+    );
+}
+
+#[test]
+fn explicit_operator_overrides_discovery_and_resolves_the_named_file() {
+    let fixture = Fixture::new();
+    let operator = fixture.repository.join("chosen-policy.yaml");
+    fs::write(&operator, OPERATOR).expect("explicit operator");
+    support::sign_manifest(&operator);
+    // Ambiguous discovery must not prevent an explicit context from being used.
+    fs::write(fixture.home.join("ostrom.yml"), OPERATOR).expect("ambiguous discovery");
+    let discovered = fixture
+        .command()
+        .arg("validate")
+        .arg(&fixture.manifest)
+        .output()
+        .expect("discover ambiguous context");
+    assert_eq!(discovered.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&discovered.stderr).contains("both policy manifest paths exist")
+    );
+    for strict in [false, true] {
+        let mut command = fixture.command();
+        command
+            .arg("validate")
+            .arg(&fixture.manifest)
+            .arg("--operator")
+            .arg(&operator);
+        if strict {
+            command.arg("--strict");
+        }
+        let output = command.output().expect("validate in explicit context");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("UTF-8 output"),
+            format!(
+                "valid: {} (resolved against operator {})\n",
+                fixture.manifest.display(),
+                operator.display()
+            )
+        );
+    }
+    fs::write(&operator, "manifest_version: 1\n").expect("tamper with explicit operator");
+    let tampered = fixture
+        .command()
+        .arg("validate")
+        .arg(&fixture.manifest)
+        .arg("--operator")
+        .arg(&operator)
+        .output()
+        .expect("verify explicit operator signature");
+    assert_eq!(tampered.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&tampered.stderr).contains("signature"));
+
+    for contents in [
+        Some("manifest_version: 1\n"),
+        Some("manifest_version: 2\n"),
+        None,
+    ] {
+        if let Some(contents) = contents {
+            fs::write(&operator, contents).expect("replace operator");
+            support::sign_manifest(&operator);
+        } else {
+            fs::remove_file(&operator).expect("remove explicit context");
+        }
+        let output = fixture
+            .command()
+            .arg("validate")
+            .arg(&fixture.manifest)
+            .arg("--operator")
+            .arg(&operator)
+            .output()
+            .expect("refuse invalid explicit context");
+        assert_eq!(output.status.code(), Some(1));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let expected = match contents {
+            Some("manifest_version: 1\n") => "unknown actor `builder`",
+            Some(_) => "manifest_version 2; expected 1",
+            None => "could not read",
+        };
+        assert!(stderr.contains(expected), "{stderr}");
+        assert!(output.stdout.is_empty());
+    }
+}
+
+#[test]
+fn strict_isolated_acceptance_checks_effective_operation_scope() {
+    let fixture = Fixture::new();
+    fs::remove_file(fixture.home.join("ostrom.yaml")).expect("remove context");
+    fs::write(
+        &fixture.manifest,
+        format!("{OPERATOR}grants: {{delegated: {{actors: builder, operations: work}}}}\n"),
+    )
+    .expect("self-contained source");
+    support::sign_manifest(&fixture.manifest);
+    let default = fixture
+        .command()
+        .arg("validate")
+        .arg(&fixture.manifest)
+        .output()
+        .expect("validate authored declarations");
+    assert_eq!(
+        default.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&default.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(default.stdout).expect("UTF-8 output"),
+        format!("valid: {} (isolated)\n", fixture.manifest.display())
+    );
+    // Repository operations are not adopted, even when their declarations are
+    // well formed. Strict acceptance must check composition's effective scope.
+    for args in [vec!["validate", "--strict"], vec!["compose"]] {
+        let output = fixture
+            .command()
+            .args(args)
+            .arg(&fixture.manifest)
+            .output()
+            .expect("check effective acceptance");
+        assert_eq!(output.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("unknown operation `work`"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn strict_help_defines_acceptance_by_exit_status() {
+    let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .args(["validate", "--help"])
+        .output()
+        .expect("validate help");
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).expect("UTF-8 help");
+    assert!(help.contains("--strict"), "{help}");
+    assert!(
+        help.contains("Define acceptance by exit status: unresolved references are invalid"),
+        "{help}"
+    );
+}
+
+#[test]
+fn strict_validation_and_composition_share_remaining_acceptance_checks() {
+    let fixture = Fixture::new();
+    for (source, message) in [
+        (
+            "manifest_version: 1\ninputs: {count: {type: integer, env: OSTROM_TEST_466_COUNT}}\n",
+            "input `count`",
+        ),
+        (
+            "manifest_version: 1\ngrants: {bad: {where: 'actor:absent'}}\n",
+            "invalid selector",
+        ),
+    ] {
+        fs::write(&fixture.manifest, source).expect("write invalid policy");
+        support::sign_manifest(&fixture.manifest);
+        for args in [vec!["validate", "--strict"], vec!["compose"]] {
+            let output = fixture
+                .command()
+                .env("OSTROM_TEST_466_COUNT", "not-an-integer")
+                .args(args)
+                .arg(&fixture.manifest)
+                .output()
+                .expect("check acceptance");
+            assert_eq!(output.status.code(), Some(1));
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains(message),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
 }
 
 #[test]

@@ -17,7 +17,11 @@ fn fixture() -> (TempDir, PathBuf) {
 }
 
 fn ostrom() -> Command {
+    static ISOLATED_HOME: std::sync::OnceLock<TempDir> = std::sync::OnceLock::new();
+    let home = ISOLATED_HOME.get_or_init(|| TempDir::new().expect("isolated operator home"));
     let mut command = Command::new(env!("CARGO_BIN_EXE_ostrom"));
+    command.env("OSTROM_HOME", home.path());
+    command.env_remove("OSTROM_POLICY_MANIFEST");
     command.env_remove("OSTROM_FIXTURE_CADENCE");
     command.env_remove("OSTROM_FIXTURE_TOKEN");
     command

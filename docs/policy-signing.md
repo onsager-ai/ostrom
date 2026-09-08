@@ -31,6 +31,41 @@ export OSTROM_POLICY_TRUSTED_KEYS=/run/ostrom/trusted-policy-keys
 ostrom validate /policy/ostrom.yaml
 ```
 
+## Resolution context
+
+`ostrom validate` resolves a manifest's references in a context. With one — the
+operator manifest found via `OSTROM_HOME`, or an explicit `--operator <file>` —
+a grant or loop may name an actor or operation the operator manifest declares,
+and validation resolves it there. Composition already did this, so the two now
+reach the same verdict on the same input.
+
+Without a context, a reference that could only resolve elsewhere is not an
+error. It is reported as unresolved *here* and validation still exits 0:
+
+```sh
+ostrom validate /policy/ostrom.yaml
+valid: /policy/ostrom.yaml (isolated; 1 unresolved)
+unresolved: grants.delegated.actors -> builder
+```
+
+The first line always names the context: `(resolved against operator <path>)`,
+`(isolated)`, or `(isolated; N unresolved)`.
+
+`--strict` makes unresolved references a refusal, with the invalid-manifest
+exit code. It is the definition of acceptance: a consumer reading only exit
+codes should use it, and "validate accepts this manifest" means `--strict`
+exited 0. Without it, exit 0 means the file is well formed, which is not the
+same claim.
+
+With `--normalized`, stdout is the composed YAML document and nothing else;
+the context and `unresolved:` lines go to stderr so stdout stays parseable.
+
+`ostrom compose` now applies the same input resolution, selector findings and
+adjacent-policy check that validation applies. These previously ran only in
+`ostrom validate`, so a manifest that composed before may now be refused at
+composition for a fault it always had. This is a behaviour change for anything
+pinning this CLI.
+
 `ostrom validate` reports repository actor declarations as portability
 findings, naming each actor's source file, while still exiting successfully.
 The operator manifest is the roster-owning layer, so actor declarations there

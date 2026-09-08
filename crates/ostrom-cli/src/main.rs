@@ -85,9 +85,15 @@ enum Command {
     },
     /// Parse and validate an Ostrom policy manifest.
     Validate {
-        /// Print the fully composed scalar/list-normalized manifest.
+        /// Print the scalar/list-normalized manifest after validation diagnostics.
         #[arg(long)]
         normalized: bool,
+        /// Define acceptance by exit status: unresolved references are invalid.
+        #[arg(long)]
+        strict: bool,
+        /// Resolve references against this operator manifest instead of discovery.
+        #[arg(long, value_name = "FILE")]
+        operator: Option<PathBuf>,
         manifest: PathBuf,
     },
     /// Generate portable repository policy from the adopting operator manifest.
@@ -657,8 +663,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         } => policy_manifest::run_sign(&manifest, &key_id, &key)?,
         Command::Validate {
             normalized,
+            strict,
+            operator,
             manifest,
-        } => policy_manifest::run_validate(&paths, &manifest, normalized)?,
+        } => policy_manifest::run_validate(
+            &paths,
+            &manifest,
+            normalized,
+            strict,
+            operator.as_deref(),
+        )?,
         Command::Generate { repository, output } => {
             policy_manifest::run_generate(&paths, &repository, output.as_deref())?
         }
