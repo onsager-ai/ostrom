@@ -81,13 +81,28 @@ unresolved: grants.delegated.actors -> builder
 ```
 
 The first line always names the context: `(resolved against operator <path>)`,
-`(isolated)`, or `(isolated; N unresolved)`.
+`(isolated)`, `(isolated; N unresolved)`, or — when every reference resolves
+but the manifest declares actors or operations of its own —
+`(isolated; evaluated as repository policy)`. With no operator to adopt it,
+such a manifest is judged as repository policy: its own operations, prompts
+and loops are not adopted, so a grant or loop naming one of them can still be
+refused even though nothing was unresolved. The context line says so only
+when that assumption is load-bearing; a manifest with no actors and no
+operations gets the plain `(isolated)` line, unchanged.
 
 `--strict` makes unresolved references a refusal, with the invalid-manifest
 exit code. It is the definition of acceptance: a consumer reading only exit
 codes should use it, and "validate accepts this manifest" means `--strict`
 exited 0. Without it, exit 0 means the file is well formed, which is not the
 same claim.
+
+A `--strict` or `compose` refusal that only holds under the repository-policy
+assumption says so, rather than reporting the symptom alone:
+
+```sh
+ostrom validate --strict /policy/ostrom.yaml
+as repository policy: grant `delegated` names unknown operation `work`
+```
 
 With `--normalized`, stdout is the composed YAML document and nothing else;
 the context and `unresolved:` lines go to stderr so stdout stays parseable.
