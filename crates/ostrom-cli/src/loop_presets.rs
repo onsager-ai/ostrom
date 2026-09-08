@@ -129,6 +129,38 @@ loops:
                 placeholder_paths: &["/grants/sweep/repositories/0", "/loops/sweep/target"],
             },
         ),
+        (
+            "triage",
+            Preset {
+                fragment: PolicyManifest::parse_yaml(
+                    r#"manifest_version: 1
+actors:
+  triage:
+    description: Orders the portfolio queue. Classifies readiness, blockers and stale work.
+    permission_mode: auto
+operations:
+  queue-triage:
+    description: One triage pass over the portfolio queue.
+    steps:
+      - uses: agent/claude
+        with:
+          prompt: {from: ./prompts/triage.md}
+grants:
+  triage-queue:
+    actors: triage
+    operations: queue-triage
+loops:
+  unattended-triage:
+    actor: triage
+    operation: queue-triage
+    target: placeholder-org/portfolio
+    every: hourly
+"#,
+                )?,
+                secret_names: &["triage"],
+                placeholder_paths: &["/loops/unattended-triage/target"],
+            },
+        ),
     ]))
 }
 
@@ -245,20 +277,20 @@ mod tests {
                 .iter()
                 .map(|(name, preset)| (*name, &preset.fragment)),
         )
-        .expect("the three shipped presets do not collide");
-        for actor in ["builder", "gatekeeper", "sweeper"] {
+        .expect("the four shipped presets do not collide");
+        for actor in ["builder", "gatekeeper", "sweeper", "triage"] {
             assert!(merged.actors.contains_key(actor), "missing actor {actor}");
         }
-        for operation in ["build-pass", "gate-pass", "portfolio-sweep"] {
+        for operation in ["build-pass", "gate-pass", "portfolio-sweep", "queue-triage"] {
             assert!(
                 merged.operations.contains_key(operation),
                 "missing operation {operation}"
             );
         }
-        for grant in ["builder-build", "gatekeeper-gate", "sweep"] {
+        for grant in ["builder-build", "gatekeeper-gate", "sweep", "triage-queue"] {
             assert!(merged.grants.contains_key(grant), "missing grant {grant}");
         }
-        for loop_name in ["builder-day", "gatekeeper", "sweep"] {
+        for loop_name in ["builder-day", "gatekeeper", "sweep", "unattended-triage"] {
             assert!(
                 merged.loops.contains_key(loop_name),
                 "missing loop {loop_name}"

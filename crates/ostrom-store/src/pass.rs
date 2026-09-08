@@ -106,6 +106,13 @@ impl PassRole {
     }
 }
 
+/// The triage prompt `ostrom init` writes, owned by the crate that holds the
+/// asset. Triage is not a `PassRole`: it runs as an operation's `agent/claude`
+/// step from policy, not as `ostrom pass <role>`, so it has no variant above.
+/// It is a const rather than a cross-crate `include_str!` so the file stays
+/// owned here and moving the assets directory cannot silently break a consumer.
+pub const TRIAGE_PROMPT: &str = include_str!("../assets/prompts/triage.md");
+
 impl PassRole {
     /// The permission mode this build ships for the role.
     ///
