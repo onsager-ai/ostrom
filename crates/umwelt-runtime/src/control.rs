@@ -10,8 +10,8 @@ use std::{
 
 use ethogram::{
     CONTROL_APPLIED, CONTROL_REQUESTED, ControlAppliedPayload, ControlAppliedReason, ControlKind,
-    ControlRequestedPayload, EventDraft, PayloadExtension, RUN_FINISHED, RunFinishedPayload,
-    validate,
+    ControlRequestedPayload, EventDraft, MAX_EXCERPT_SCALARS, PayloadExtension, RUN_FINISHED,
+    RunFinishedPayload, excerpt, validate,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -362,13 +362,13 @@ impl<R: SessionResumer> RunControl<R> {
                         ),
                     )?;
                 }
-                Err(ResumeError::Harness(_)) => {
+                Err(ResumeError::Harness(reason)) => {
                     sink.append(
                         &self.run_id,
                         applied_draft(
                             &steer.control_id,
                             false,
-                            Some(ControlAppliedReason::Rejected),
+                            Some(ControlAppliedReason::Unknown(reason)),
                             None,
                         ),
                     )?;
@@ -417,23 +417,34 @@ fn requested_draft(payload: ControlRequestedPayload) -> EventDraft {
     draft(CONTROL_REQUESTED, payload)
 }
 
-/// Record a typed reason category. A harness's own diagnostic words are not
-/// carried on the wire; the caller of `SessionResumer::resume` still has the
-/// `ResumeError` if it needs them. `Unknown` is for unrecognised wire members,
-/// not producer diagnostics.
+/// Record a reason, bounding a harness's own diagnostic words as the unfamiliar
+/// string case. `Unknown` is the open union's sanctioned slot for bounded producer
+/// prose, not a place to smuggle a value that has a typed member. Under principle 2,
+/// excerpt once here at the producer; the sink's `validate` is the second line of
+/// defence. Typed reasons carry no free text and never carry a truncation flag.
 fn applied_draft(
     control_id: &str,
     ok: bool,
     reason: Option<ControlAppliedReason>,
     landed_in: Option<&str>,
 ) -> EventDraft {
+    let (reason, truncated) = match reason {
+        Some(ControlAppliedReason::Unknown(diagnostic)) => {
+            let bounded = excerpt(&diagnostic, MAX_EXCERPT_SCALARS);
+            (
+                Some(ControlAppliedReason::Unknown(bounded.text)),
+                bounded.truncated.then_some(true),
+            )
+        }
+        reason => (reason, None),
+    };
     draft(
         CONTROL_APPLIED,
         ControlAppliedPayload {
             control_id: control_id.to_owned(),
             ok,
             reason,
-            truncated: None,
+            truncated,
             landed_in: landed_in.map(str::to_owned),
             extra: PayloadExtension::new(),
         },
@@ -1043,14 +1054,18 @@ mod tests {
     }
 
     #[test]
-    fn harness_resume_failure_reports_rejected_without_diagnostic_or_truncation() {
+    fn harness_resume_failure_reports_excerpted_diagnostic_with_truncation() {
         let sink = MemorySink::default();
         let diagnostic = "harness refused to resume:".repeat(1_000);
         assert_eq!(diagnostic.len(), 26_000);
         let resumer = RecordingResumer {
-            error: Some(ResumeError::Harness(diagnostic)),
+            error: Some(ResumeError::Harness(diagnostic.clone())),
             ..RecordingResumer::succeeding()
         };
+        let error = resumer
+            .resume("session-1", "next text")
+            .expect_err("resume fails");
+        assert_eq!(error, ResumeError::Harness(diagnostic.clone()));
         let mut control = RunControl::new(
             "run-1",
             Some("session-1".to_owned()),
@@ -1066,7 +1081,7 @@ mod tests {
 
         control
             .process_exited(ProcessExit::Normal, finished(RunOutcome::Completed), &sink)
-            .expect("rejected reply");
+            .expect("harness failure reply");
 
         let events = sink.events();
         assert_eq!(
@@ -1078,12 +1093,59 @@ mod tests {
         );
         let applied: ControlAppliedPayload = payload(&events[1]);
         assert!(!applied.ok);
-        assert_eq!(applied.reason, Some(ControlAppliedReason::Rejected));
-        assert_eq!(applied.truncated, None);
+        let Some(ControlAppliedReason::Unknown(retained)) = &applied.reason else {
+            panic!("expected the harness diagnostic as an unknown reason");
+        };
+        assert_eq!(retained.chars().count(), MAX_EXCERPT_SCALARS);
+        assert_eq!(
+            retained,
+            &diagnostic
+                .chars()
+                .take(MAX_EXCERPT_SCALARS)
+                .collect::<String>()
+        );
+        assert_eq!(applied.truncated, Some(true));
         assert!(applied.extra.is_empty());
+        validate(CONTROL_APPLIED, &applied).expect("valid bounded harness diagnostic");
+        assert_eq!(error, ResumeError::Harness(diagnostic));
+        assert!(!control.is_live());
+    }
+
+    #[test]
+    fn harness_resume_failure_reports_short_diagnostic_without_truncation() {
+        let sink = MemorySink::default();
+        let diagnostic = "harness could not open the session";
+        assert!(diagnostic.chars().count() < MAX_EXCERPT_SCALARS);
+        let resumer = RecordingResumer {
+            error: Some(ResumeError::Harness(diagnostic.to_owned())),
+            ..RecordingResumer::succeeding()
+        };
+        let mut control = RunControl::new(
+            "run-1",
+            Some("session-1".to_owned()),
+            RunCaps::default(),
+            resumer,
+        );
+        control
+            .steer(
+                request("control-1", ControlKind::Steer, Some("next text")),
+                &sink,
+            )
+            .expect("queue steer");
+        control
+            .process_exited(ProcessExit::Normal, finished(RunOutcome::Completed), &sink)
+            .expect("harness failure reply");
+
+        let events = sink.events();
+        let applied: ControlAppliedPayload = payload(&events[1]);
+        assert!(!applied.ok);
+        assert_eq!(
+            applied.reason,
+            Some(ControlAppliedReason::Unknown(diagnostic.to_owned()))
+        );
+        assert_eq!(applied.truncated, None);
         assert!(events[1].payload.get("truncated").is_none());
-        assert!(!events[1].payload.to_string().contains("harness refused"));
-        validate(CONTROL_APPLIED, &applied).expect("valid rejected reply");
+        validate(CONTROL_APPLIED, &applied).expect("valid short harness diagnostic");
         assert!(!control.is_live());
     }
 
