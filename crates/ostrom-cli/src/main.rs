@@ -45,6 +45,7 @@ use ostrom_store::{
 };
 
 mod cutover_replay;
+mod loop_presets;
 mod loop_supervisor;
 mod operation_dispatch;
 mod policy_manifest;
@@ -378,6 +379,12 @@ enum LoopCommand {
 
 #[derive(Debug, Subcommand)]
 enum LoopsCommand {
+    /// Print a catalogue of optional loop declarations to merge into operator policy.
+    Presets {
+        /// Include secret names and required placeholder paths beside each fragment.
+        #[arg(long)]
+        json: bool,
+    },
     /// Write generated units without enabling, starting, or reloading them.
     Render {
         /// Artifact directory; defaults to the Ostrom config root's `systemd` directory.
@@ -1436,15 +1443,17 @@ fn run_loops_command(
     paths: &OstromPaths,
     command: LoopsCommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let manifest = policy_manifest::load(&policy_manifest::adopting_manifest_path(paths)?)?;
     match command {
+        LoopsCommand::Presets { json } => print!("{}", loop_presets::render(json)?),
         LoopsCommand::Render { output } => {
+            let manifest = policy_manifest::load(&policy_manifest::adopting_manifest_path(paths)?)?;
             let output = output.unwrap_or_else(|| paths.config.join("systemd"));
             for path in render_loop_units(&manifest, &output)? {
                 println!("{}", path.display());
             }
         }
         LoopsCommand::Check { installed } => {
+            let manifest = policy_manifest::load(&policy_manifest::adopting_manifest_path(paths)?)?;
             let drift = ostrom_checks::check_loop_units_drift(&manifest, &installed)?;
             if !drift.is_clean() {
                 return Err(LoopCommandError::Drift {
