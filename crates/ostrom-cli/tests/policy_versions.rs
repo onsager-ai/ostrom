@@ -719,11 +719,14 @@ fn validate_lists_all_unresolved_references_in_manifest_order_and_strict_refuses
         .output()
         .expect("normalize unresolved manifest");
     assert_eq!(normalized.status.code(), Some(0));
-    let stdout = String::from_utf8(normalized.stdout).expect("UTF-8 normalized output");
-    let yaml = stdout
-        .strip_prefix(&expected)
-        .expect("context and references precede YAML");
-    let parsed = PolicyManifest::parse_yaml(yaml).expect("normalized manifest");
+    // --normalized keeps stdout a pure YAML document; the diagnostics go to
+    // stderr so a consumer can pipe stdout straight into a parser.
+    assert_eq!(
+        String::from_utf8(normalized.stderr).expect("UTF-8 diagnostics"),
+        expected
+    );
+    let yaml = String::from_utf8(normalized.stdout).expect("UTF-8 normalized output");
+    let parsed = PolicyManifest::parse_yaml(&yaml).expect("normalized manifest");
     assert_eq!(
         parsed
             .validate_in_context(None)

@@ -75,9 +75,19 @@ pub(crate) fn run_validate(
         None if unresolved.is_empty() => "isolated".to_owned(),
         None => format!("isolated; {} unresolved", unresolved.len()),
     };
-    println!("valid: {} ({context})", path.display());
-    for reference in &unresolved {
-        println!("unresolved: {} -> {}", reference.path, reference.name);
+    // With --normalized, stdout is a machine-readable YAML document, so the
+    // diagnostics go to stderr rather than corrupting it. A consumer piping
+    // `validate --normalized` must get YAML and nothing else.
+    if normalized {
+        eprintln!("valid: {} ({context})", path.display());
+        for reference in &unresolved {
+            eprintln!("unresolved: {} -> {}", reference.path, reference.name);
+        }
+    } else {
+        println!("valid: {} ({context})", path.display());
+        for reference in &unresolved {
+            println!("unresolved: {} -> {}", reference.path, reference.name);
+        }
     }
     if strict && !unresolved.is_empty() {
         return Err(PolicyLoadError::Validation(format!(
