@@ -96,3 +96,6 @@ pub fn copy_fixture_directory(source: &Path) -> TempDir {
     copy_contents(source, destination.path());
     destination
 }
+
+#[cfg(unix)]
+pub mod tree;

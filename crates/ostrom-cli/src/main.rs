@@ -33,15 +33,15 @@ use ostrom_store::{
     PassRole, PlanOptions, PublishDestination, PublishTarget, QueueDecision, ReplayOptions,
     RunOutcome, RunRequest, SelectAction, SelectError, SelectOutcome, SelectRequest, SignalFlags,
     SweepError, SweepMode, SweepOptions, SweepParityOptions, TraceAppend, TraceView,
-    UnavailableAssessmentDeriver, acquire_lease, acquire_org_from_github_with_faults,
-    answer_queue_decision, append_trace_checked, audit, branch_name, clear_work_order,
-    create_work_order, credential_output, decide_queue_item, encode_org_snapshots_with_faults,
-    encode_selection, environment, finalize_exited_implementer, grant_excuse, grant_excuse_at_head,
-    item_hash, lease_status, lint_queue_state, list_excuses, list_queue_json, local_drift, migrate,
-    read_trace_json, release_lease, render_constitution, render_digest, replay, revoke_excuse,
-    run_dispatch_with_registry, run_gate, run_implement_with_registry, run_pass, run_plan,
-    run_repair_prs, run_selection, run_sweep_parity, run_sweep_with_publication_source,
-    validate_lease_name, validate_work_order_file,
+    UnavailableAssessmentDeriver, acquire_lease, answer_queue_decision, append_trace_checked,
+    audit, branch_name, clear_work_order, create_work_order, credential_output, decide_queue_item,
+    encode_org_snapshots_with_faults, encode_selection, environment, finalize_exited_implementer,
+    grant_excuse, grant_excuse_at_head, item_hash, lease_status, lint_queue_state, list_excuses,
+    list_queue_json, local_drift, migrate, read_trace_json, release_lease, render_constitution,
+    render_digest, replay, revoke_excuse, run_dispatch_with_registry, run_gate,
+    run_implement_with_registry, run_pass, run_plan, run_repair_prs, run_selection,
+    run_sweep_parity, run_sweep_with_publication_source, validate_lease_name,
+    validate_work_order_file,
 };
 
 mod cutover_replay;
@@ -315,6 +315,15 @@ enum Command {
         /// Force full/incremental acquisition or select automatically.
         #[arg(long, value_enum, default_value_t = CliSweepMode::Auto)]
         mode: CliSweepMode,
+        /// Re-read only these roster repositories; carry the others forward.
+        #[arg(long, value_delimiter = ',', conflicts_with = "detect")]
+        repositories: Option<Vec<String>>,
+        /// Read-only conditional change detection using existing gh authentication.
+        #[arg(long, conflicts_with_all = ["publish_repository", "inner_org", "mode"])]
+        detect: bool,
+        /// Retained generation to compare: current (default) or previous.
+        #[arg(long, requires = "detect")]
+        since: Option<String>,
         /// Recorded GitHub responses for a hermetic parity run.
         #[arg(long, hide = true)]
         fixture: Option<PathBuf>,
@@ -1146,28 +1155,50 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Sweep {
             mode,
+            repositories,
+            detect,
+            since,
             fixture,
             publish_repository,
             inner_org,
             started_at,
         } => {
+            if detect {
+                let results = ostrom_store::detect_sweep(
+                    &paths,
+                    &env::current_dir()?,
+                    fixture.as_deref(),
+                    since.as_deref(),
+                )?;
+                for (repo, changed) in &results {
+                    println!("{}: {repo}", if *changed { "changed" } else { "unchanged" });
+                }
+                println!(
+                    "detect: {} changed of {}",
+                    results.iter().filter(|(_, changed)| *changed).count(),
+                    results.len()
+                );
+                return Ok(());
+            }
             let started_at = resolve_started_at(started_at.as_deref(), &clock)?;
             if let Some(org) = inner_org {
                 let cwd = env::current_dir()?;
-                let (snapshots, faults) = match acquire_org_from_github_with_faults(
-                    &paths,
-                    &cwd,
-                    &org,
-                    started_at,
-                    mode.into(),
-                ) {
-                    Ok(result) => result,
-                    Err(error @ SweepError::BranchListingTruncated(_)) => {
-                        eprintln!("{error}");
-                        std::process::exit(6);
-                    }
-                    Err(error) => return Err(error.into()),
-                };
+                let (snapshots, faults) =
+                    match ostrom_store::acquire_selected_org_from_github_with_faults(
+                        &paths,
+                        &cwd,
+                        &org,
+                        started_at,
+                        mode.into(),
+                        repositories.as_deref(),
+                    ) {
+                        Ok(result) => result,
+                        Err(error @ SweepError::BranchListingTruncated(_)) => {
+                            eprintln!("{error}");
+                            std::process::exit(6);
+                        }
+                        Err(error) => return Err(error.into()),
+                    };
                 io::stdout().write_all(&encode_org_snapshots_with_faults(snapshots, faults)?)?;
                 return Ok(());
             }
@@ -1183,24 +1214,37 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .map_or_else(|| cwd.join("crates/ostrom-store/assets"), PathBuf::from);
             let policy = policy_manifest::load_optional_bundle(&paths, &cwd)?;
             let publication_source = JsonlPublicationSource::new(&paths);
-            let outcome = run_sweep_with_publication_source(
-                &SweepOptions {
-                    paths,
-                    working_directory: cwd,
-                    executable,
-                    plugin_root,
-                    started_at,
-                    requested_mode: mode.into(),
-                    fixture,
-                    publish,
-                    policy,
-                },
-                &publication_source,
-            )?;
-            println!(
+            let options = SweepOptions {
+                paths,
+                working_directory: cwd,
+                executable,
+                plugin_root,
+                started_at,
+                requested_mode: mode.into(),
+                fixture,
+                publish,
+                policy,
+            };
+            let outcome = if let Some(repositories) = &repositories {
+                ostrom_store::run_selected_sweep_with_publication_source(
+                    &options,
+                    &publication_source,
+                    repositories,
+                )?
+            } else {
+                run_sweep_with_publication_source(&options, &publication_source)?
+            };
+            print!(
                 "mandate sweep: {} projects; {} queue changes",
                 outcome.project_count, outcome.queue_changes
             );
+            if repositories.is_some() {
+                print!(
+                    "; {} repositories read; {} carried forward",
+                    outcome.repositories_read, outcome.repositories_carried
+                );
+            }
+            println!();
             for fault in &outcome.faults {
                 eprintln!("mandate sweep: {fault}");
             }

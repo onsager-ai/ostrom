@@ -1,0 +1,30 @@
+{
+  "repositories": [
+    {
+      "repo": "placeholder-org/alpha",
+      "issue_etag": "\"alpha-issues\"",
+      "issues": [
+        {
+          "number": 1,
+          "title": "alpha original",
+          "state": "open",
+          "created_at": "2026-08-01T00:00:00Z",
+          "updated_at": "2026-08-01T00:00:00Z"
+        }
+      ]
+    },
+    {
+      "repo": "placeholder-org/beta",
+      "issue_etag": "\"beta-issues\"",
+      "issues": [
+        {
+          "number": 1,
+          "title": "beta original",
+          "state": "open",
+          "created_at": "2026-08-01T00:00:00Z",
+          "updated_at": "2026-08-01T00:00:00Z"
+        }
+      ]
+    }
+  ]
+}

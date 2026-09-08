@@ -192,7 +192,20 @@ fn merge_disjoint<'a>(
     let mut operation_origins = BTreeMap::<String, String>::new();
     let mut grant_origins = BTreeMap::<String, String>::new();
     let mut loop_origins = BTreeMap::<String, String>::new();
+    let mut sweep_origin = None;
     for (name, fragment) in presets {
+        if let Some(sweep) = &fragment.sweep {
+            if let Some(first) = sweep_origin {
+                return Err(PresetCollision {
+                    section: "sweep",
+                    key: "sweep".to_owned(),
+                    first,
+                    second: name.to_owned(),
+                });
+            }
+            merged.sweep = Some(sweep.clone());
+            sweep_origin = Some(name.to_owned());
+        }
         merge_section(
             &mut merged.actors,
             &mut actor_origins,
@@ -332,6 +345,22 @@ actors:
         assert_eq!(
             error.to_string(),
             "preset collision: actors `builder` is declared by both `alpha` and `beta`"
+        );
+    }
+    #[test]
+    fn sweep_section_is_preserved_and_collisions_refuse() {
+        let first = PolicyManifest::from_yaml("manifest_version: 1\nsweep: {}\n").unwrap();
+        let second =
+            PolicyManifest::from_yaml("manifest_version: 1\nsweep: {max_age: 1h}\n").unwrap();
+        assert_eq!(
+            merge_disjoint([("alpha", &first)]).unwrap().sweep,
+            first.sweep
+        );
+        let error = merge_disjoint([("alpha", &first), ("beta", &second)])
+            .expect_err("shared sweep section must refuse");
+        assert_eq!(
+            error.to_string(),
+            "preset collision: sweep `sweep` is declared by both `alpha` and `beta`"
         );
     }
 }
