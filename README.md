@@ -190,6 +190,11 @@ Remove the retired entries from `~/.claude/settings.json`: the `ostrom` entry
 under `enabledPlugins`, and the `ostrom` marketplace under
 `extraKnownMarketplaces`.
 
+Live permission answers during a pass require adopted policy and a derived
+settings profile. Passes using an operator-owned `roles/<role>.settings.json`
+continue to return `unsupported` for live answers; ostrom never edits that file.
+See [pass control](docs/pass-control.md) for the permission bridge and its limits.
+
 ## Mandate
 
 `mandate` resolves its small YAML schema in three layers: shipped defaults

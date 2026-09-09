@@ -48,38 +48,53 @@ A valid steer is recorded as `control.requested`, immediately followed by
 `control.applied` with `ok: false`, `reason: "unsupported"`, and the same `by`.
 Nothing is queued, and the pass continues to its normal terminal event.
 
-## Answers are not delivered to a running pass
+## Permission answers
 
-A pass does not accept an answer to a decision through this descriptor. A
-control verb other than `interrupt` — including an `answer` verb a supervisor
-might try to send — is recorded as `control.requested` and immediately
-answered with `control.applied`, `ok: false`, `reason: "unsupported"`, and the
-same `by`, exactly as steering is above. This is the same path, not a special
-case carved out for answers.
+Live permission answers require adopted policy and a derived profile. With an
+operator-owned `roles/<role>.settings.json`, an answer still receives
+`control.applied` with `ok: false`, `reason: "unsupported"`, and the same `by`.
+Ostrom never edits or composes over that operator-owned file.
 
-The reason is structural, not a missing feature. The harness is spawned
-headless, with `--print` and `stdout` piped for capture; it has no writable
-stdin, so there is no channel on which a running pass could be handed an
-answer even if ostrom wanted to send one. The session's `RunControl` is built
-with `NoSteer`, which cannot resume the harness session either. This is the
-same limitation that makes steering unsupported above, not a second one.
+For a derived profile, the pass writes a per-run settings file under its run
+directory before spawning Claude. Its `PermissionRequest` command carries an
+unpredictable private channel path. The channel file and transport messages are
+mode 0600 inside a mode 0700 directory; the runner removes that directory and the
+settings at run end, including interruption and errors. Durable events remain.
+Private channel opening currently supports Linux and macOS; other platforms
+refuse bridge setup rather than weakening the file checks.
+This also fixes the latent per-role derived-settings overwrite: two runs no
+longer share `roles/<role>.derived.settings.json`.
 
-ostrom itself never raises a permission decision. Where a permission decision
-raised elsewhere is rendered for a principal, ostrom's hook output directs the
-reader to "Answer through the requesting process" rather than offering a
-command, because there is no `ostrom queue` verb for it. A decision ostrom
-does raise — a tripwire, a gate inconclusive, a budget decision, or one put
-to a human — is answered out of band, by a separate `ostrom
-queue` invocation that emits its own `decision.answered` on its own run; the
-pass that raised the decision has usually already finished by the time that
-answer lands.
+When Claude requests permission for a granted call, the hook asks the runner to
+emit `decision.requested` through its existing sink, then waits for an answer.
+The bridge does not add permission prompts to already preapproved calls. It
+supports the current renderer's `Bash(ostrom <operation> *)` grants, conservatively
+requiring an `ostrom` command with plain arguments. Shell syntax, quoted arguments,
+and tools outside those grants are denied rather than interpreted as authorization.
 
-A supervisor should treat `reason: "unsupported"` on an attempted answer as a
-definite negative acknowledgement, not as a reason to wait for a timeout, and
-should deliver the actual answer through the out-of-band `ostrom queue` path
-instead. ostrom issue #528 tracks a permission bridge that would let a
-running pass be answered directly; until that lands, the descriptor behaves
-as described here.
+A decision offers `allow` and `deny`, sets `expiresAt` to its deadline, and sets
+ethogram's decision-level `onTimeout` to `deny`. Its wait is 30 seconds. The Claude
+handler timeout is derived as that wait plus a named five-second margin so the
+hook's denial can return before handler cancellation. The hook's explicit JSON
+denial is the sole expiry mechanism; it uses `interrupt: false` and a message
+naming the decision and stating `no answer within onTimeout`. Pass caps still
+apply. No answer, a lost channel, and invalid transport data fail closed.
+
+The spawning supervisor sends an `answer` control with the offered `decisionId`
+and `optionId`. Before forwarding, the runner rejects unknown decisions, duplicate
+answers, and unoffered options with `no-such-decision`, `already-answered`, and
+`option-not-offered`, respectively. An expired or unavailable channel receives
+`not-live`. `by` is preserved without interpreting the principal identity.
+
+After the hook acknowledges the forwarded choice, the runner emits
+`decision.answered` with `requestedRunId` naming the asking run, followed by
+`control.applied` with `ok: true`. Both events belong to the live pass. Expiry emits
+`decision.answered` with `byTimeout: true`; a forwarded control that did not arrive
+in time gets `ok: false`. Correlation uses the channel path and a per-channel
+sequence. This uses Claude Code 2.1.265's synchronous `PermissionRequest` contract.
+
+Tripwire, gate, budget, and other out-of-band decisions retain their existing
+`ostrom queue` answer path. Steering remains unsupported on a Claude pass.
 
 Malformed JSON, invalid drafts, and other event types produce
 `capture.refused` with `cause: "malformed"` and a bounded explanation. The reader

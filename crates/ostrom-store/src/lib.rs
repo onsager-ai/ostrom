@@ -20,6 +20,7 @@ mod parity;
 mod pass;
 mod pass_control;
 mod paths;
+pub mod permission_bridge;
 mod plan;
 mod policy;
 mod policy_signature;

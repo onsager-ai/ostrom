@@ -215,6 +215,7 @@ struct PassGuard {
     events: RunEventGuard,
     control: Option<RunControl<NoSteer>>,
     process_exit: ProcessExit,
+    permission_bridge: Option<crate::permission_bridge::PermissionBridge>,
 }
 
 struct NoSteer;
@@ -242,7 +243,21 @@ fn terminal_outcome(explicit: Option<String>, panicking: bool) -> String {
 
 impl PassGuard {
     fn finish(&mut self) -> Result<(), PassError> {
-        let mut failure = None;
+        let mut failure = self
+            .permission_bridge
+            .take()
+            .and_then(|bridge| bridge.close().err())
+            .map(|error| {
+                PassError::failed(
+                    self.role,
+                    format!("could not remove permission channel: {error}"),
+                    1,
+                )
+            });
+        if failure.is_some() {
+            self.outcome = Some("failed".to_owned());
+            self.reason = Some("permission-channel-cleanup".to_owned());
+        }
         let outcome = terminal_outcome(self.outcome.clone(), thread::panicking());
         if self.started {
             let now = self.clock.epoch_seconds();
@@ -505,6 +520,7 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
         events,
         control: None,
         process_exit: ProcessExit::Abnormal,
+        permission_bridge: None,
     };
     append_trace(
         &request.paths.trace_file(),
@@ -536,18 +552,28 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
     // operator who has adopted no policy.
     let roles = request.paths.state.join("roles");
     let settings = if let Some(derived) = &request.derived_settings {
-        let path = roles.join(format!("{}.derived.settings.json", request.role.name()));
-        if let Err(error) = fs::create_dir_all(&roles).and_then(|()| fs::write(&path, derived)) {
-            guard.outcome = Some("failed".to_owned());
-            return Err(PassError::failed(
+        guard.outcome = Some("failed".to_owned());
+        let directory = request
+            .paths
+            .runs_dir()
+            .join(umwelt_runtime::run_directory_name(guard.events.run_id()));
+        let executable = std::env::current_exe()
+            .map_err(|error| PassError::failed(request.role, error.to_string(), 1))?;
+        let bridge = crate::permission_bridge::PermissionBridge::create(
+            &directory,
+            guard.events.run_id(),
+            derived,
+            &executable,
+        )
+        .map_err(|error| {
+            PassError::failed(
                 request.role,
-                format!(
-                    "could not write derived role settings to {}: {error}",
-                    path.display()
-                ),
+                format!("could not create permission bridge: {error}"),
                 1,
-            ));
-        }
+            )
+        })?;
+        let path = bridge.settings_path().to_owned();
+        guard.permission_bridge = Some(bridge);
         path
     } else {
         let path = roles.join(format!("{}.settings.json", request.role.name()));
@@ -781,6 +807,11 @@ fn wait_for_child(
     let control_input = request.control_fd.map(pass_control::read_control);
 
     loop {
+        if let Some(bridge) = &mut guard.permission_bridge {
+            bridge.poll(&guard.events).map_err(|error| {
+                PassError::failed(guard.role, format!("permission event: {error}"), 1)
+            })?;
+        }
         if capture_open {
             match capture.recv_timeout(Duration::from_millis(50)) {
                 Ok(Ok(raw)) => {
@@ -841,6 +872,18 @@ fn wait_for_child(
                         "interrupted by control descriptor",
                         130,
                     ));
+                }
+                Ok(input)
+                    if input.kind == ControlKind::Answer && guard.permission_bridge.is_some() =>
+                {
+                    guard
+                        .permission_bridge
+                        .as_mut()
+                        .expect("bridge present")
+                        .answer(&guard.events, input)
+                        .map_err(|error| {
+                            PassError::failed(guard.role, format!("permission answer: {error}"), 1)
+                        })?;
                 }
                 Ok(input) => {
                     // NoSteer cannot resume this pass. Refuse immediately; the
@@ -1108,7 +1151,7 @@ fn check_signal(
                 request.clock.epoch_seconds()
             ),
             kind: ControlKind::Interrupt,
-            // Required only for `answer` (ostrom #510, out of scope here);
+            // Required only for `answer`;
             // this constructs an interrupt, so both stay absent.
             decision_id: None,
             option_id: None,
@@ -1510,6 +1553,7 @@ mod sink_refusal_tests {
             events,
             control: None,
             process_exit: ProcessExit::Normal,
+            permission_bridge: None,
         };
         let drafts = [payload, json!({"text": "still working"})]
             .map(|payload| EventDraft {

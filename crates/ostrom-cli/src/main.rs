@@ -412,6 +412,11 @@ enum LoopsCommand {
 
 #[derive(Debug, Subcommand)]
 enum HookCommand {
+    /// Answer a synchronous permission request through the pass's private channel.
+    PermissionRequest {
+        #[arg(long)]
+        channel: PathBuf,
+    },
     /// Emit the layered constitution for SessionStart.
     SessionStart,
     /// Render and acknowledge the durable queue digest.
@@ -863,6 +868,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Command::Hook { command } => match command {
+            HookCommand::PermissionRequest { channel } => {
+                let output = ostrom_store::permission_bridge::permission_request_from_reader(
+                    &channel,
+                    io::stdin().lock(),
+                );
+                serde_json::to_writer(io::stdout().lock(), &output)?;
+            }
             HookCommand::SessionStart => {
                 let cwd = env::current_dir().unwrap_or_default();
                 // An override only; with none, the shipped rules compiled
@@ -3448,52 +3460,60 @@ mod tests {
         let rendered = ostrom_checks::generate_operation_settings(&manifest, "operator")
             .expect("generated operation settings");
         let settings = root.path().join("derived.settings.json");
-        std::fs::write(&settings, rendered).expect("write real generated settings");
-
-        // Doctor validates settings without a trust prompt or an API call.
-        // Isolate local settings and disable background telemetry/update traffic.
-        let output = std::process::Command::new(&claude)
-            .arg("--settings")
-            .arg(&settings)
-            .arg("doctor")
-            .current_dir(root.path())
-            .env("CLAUDE_CONFIG_DIR", root.path().join("config"))
-            .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
-            .stdin(std::process::Stdio::null())
-            .output();
-        let output = match output {
-            Ok(output) => output,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                // Write directly so a successful test cannot hide the skip in libtest capture.
-                writeln!(
+        std::fs::write(&settings, &rendered).expect("write real generated settings");
+        let bridge = ostrom_store::permission_bridge::PermissionBridge::create(
+            root.path(),
+            "doctor-run",
+            &rendered,
+            &std::env::current_exe().unwrap(),
+        )
+        .expect("create real per-run bridge settings");
+        for settings in [&settings, &bridge.settings_path().to_owned()] {
+            // Doctor validates settings without a trust prompt or an API call.
+            // Isolate local settings and disable background telemetry/update traffic.
+            let output = std::process::Command::new(&claude)
+                .arg("--settings")
+                .arg(settings)
+                .arg("doctor")
+                .current_dir(root.path())
+                .env("CLAUDE_CONFIG_DIR", root.path().join("config"))
+                .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+                .stdin(std::process::Stdio::null())
+                .output();
+            let output = match output {
+                Ok(output) => output,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // Write directly so a successful test cannot hide the skip in libtest capture.
+                    writeln!(
                     std::io::stderr(),
                     "SKIP generated_operation_settings_agree_with_claude_doctor: Claude binary {} is absent (resolved by default_claude_bin: CLAUDE_BIN, then ~/.local/bin/claude, then claude when no home is available): {error}",
                     claude.display(),
                 )
                 .expect("print skip reason");
-                return;
-            }
-            Err(error) => panic!("could not run {} doctor: {error}", claude.display()),
-        };
-        let diagnostic = format!(
-            "stdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-        println!("{diagnostic}");
-        assert!(
-            !diagnostic.to_ascii_lowercase().contains("invalid settings"),
-            "Claude doctor rejected generate_operation_settings output:\n{diagnostic}",
-        );
-        assert!(
-            output.status.success(),
-            "Claude doctor failed with {}:\n{diagnostic}",
-            output.status,
-        );
-        assert!(
-            diagnostic.contains("Claude Code doctor"),
-            "Claude doctor did not report a completed check:\n{diagnostic}",
-        );
+                    return;
+                }
+                Err(error) => panic!("could not run {} doctor: {error}", claude.display()),
+            };
+            let diagnostic = format!(
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            println!("{diagnostic}");
+            assert!(
+                !diagnostic.to_ascii_lowercase().contains("invalid settings"),
+                "Claude doctor rejected generate_operation_settings output:\n{diagnostic}",
+            );
+            assert!(
+                output.status.success(),
+                "Claude doctor failed with {}:\n{diagnostic}",
+                output.status,
+            );
+            assert!(
+                diagnostic.contains("Claude Code doctor"),
+                "Claude doctor did not report a completed check:\n{diagnostic}",
+            );
+        }
     }
 
     #[test]

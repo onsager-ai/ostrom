@@ -2095,7 +2095,10 @@ fn a_declared_actor_owns_the_pass_prompt_and_permission_mode() {
     // The declaration is the operator's, not a visited repository's. A pass
     // travels between repositories, so a repository able to declare the
     // operation could rewrite the instructions the builder arrives with.
-    let fixture = Fixture::new("printf '%s\\n' \"$@\" >\"$OSTROM_TEST_ARGS\"");
+    let fixture = Fixture::new(
+        r#"printf '%s\n' "$@" >"$OSTROM_TEST_ARGS"
+cp "$3" "$OSTROM_HOME/observed-settings.json""#,
+    );
     let manifest = fixture.state.join("ostrom.yaml");
     fs::write(
         &manifest,
@@ -2143,15 +2146,13 @@ fn a_declared_actor_owns_the_pass_prompt_and_permission_mode() {
     // grant outranks it: the profile the harness receives is derived from
     // policy, so it cannot drift from the authorization it expresses.
     assert!(
-        args.contains("builder.derived.settings.json"),
+        args.contains("/permission-") && args.contains(".settings.json"),
         "grants should derive the profile, not the hand-written file: {args}"
     );
-    let derived = fs::read_to_string(fixture.state.join("roles/builder.derived.settings.json"))
+    let derived = fs::read_to_string(fixture.state.join("observed-settings.json"))
         .expect("read derived role settings");
-    assert!(
-        derived.contains("\"OSTROM_ACTOR\": \"builder\""),
-        "{derived}"
-    );
+    let derived: Value = serde_json::from_str(&derived).expect("parse derived settings");
+    assert_eq!(derived["env"]["OSTROM_ACTOR"], "builder");
 }
 
 #[test]
@@ -2208,4 +2209,251 @@ fn init_produces_a_manifest_whose_edited_prompt_reaches_the_harness() {
     // The actor declares `auto`, which is also the builder's shipped default;
     // asserting it confirms the actor was read rather than merely defaulted.
     assert!(args.contains("--permission-mode\nauto\n"), "{args}");
+}
+
+#[test]
+fn operator_owned_settings_keep_answer_unsupported_and_are_never_edited() {
+    let fixture = Fixture::new("while ! test -f \"$OSTROM_HOME/continue\"; do sleep 0.02; done");
+    let settings = fixture.state.join("roles/builder.settings.json");
+    let before = fs::read(&settings).unwrap();
+    let mut child = fixture
+        .command()
+        .args(["--control-fd", "0", "--events-fd", "1"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut pipe = child.stdin.take().unwrap();
+    let mut control = control_request("answer", "spawning-supervisor");
+    control["payload"]["decisionId"] = "not-a-live-permission".into();
+    control["payload"]["optionId"] = "allow".into();
+    writeln!(pipe, "{control}").unwrap();
+    let applied = wait_for_run_event(&fixture, "control.applied");
+    assert_eq!(applied["payload"]["ok"], false);
+    assert_eq!(applied["payload"]["reason"], "unsupported");
+    assert_eq!(applied["payload"]["by"], "spawning-supervisor");
+    assert_eq!(fs::read(&settings).unwrap(), before);
+    fs::write(fixture.state.join("continue"), "").unwrap();
+    assert!(finish_control_pass(child).status.success());
+    assert_eq!(fs::read(&settings).unwrap(), before);
+}
+
+fn bridge_policy(fixture: &Fixture) -> PathBuf {
+    let manifest = fixture.state.join("ostrom.yaml");
+    fs::write(&manifest, "manifest_version: 1\nactors: {builder: {permission_mode: manual}}\noperations:\n  build-pass:\n    steps: [{uses: agent/claude, with: {prompt: 'permission transport fixture'}}]\ngrants:\n  builder-build: {actors: builder, operations: build-pass}\n").unwrap();
+    support::sign_manifest(&manifest)
+}
+
+// A simulated Claude process invokes the actual ostrom hook command from the actual settings.
+// This integration fixture is not the real Claude exchange required for the protocol corpus.
+const BRIDGE_HARNESS: &str = r#"
+python3 - "$@" <<'PY'
+import json, os, pathlib, subprocess, sys, time
+args = sys.argv[1:]
+settings = pathlib.Path(args[args.index('--settings') + 1])
+state = pathlib.Path(os.environ['OSTROM_HOME'])
+(state / 'settings-path').write_text(str(settings))
+profile = json.loads(settings.read_text())
+(state / 'bridge-settings.json').write_text(json.dumps(profile))
+handler = profile['hooks']['PermissionRequest'][0]['hooks'][0]
+request = {'hook_event_name': 'PermissionRequest', 'tool_name': 'Bash', 'tool_input': {'command': 'ostrom build-pass sample'}}
+result = subprocess.run(handler['command'], shell=True, input=json.dumps(request), text=True, capture_output=True, timeout=handler['timeout'])
+(state / 'hook-output.json').write_text(result.stdout)
+print(json.dumps({'type':'result', 'subtype':'success', 'session_id':'bridge-fixture', 'duration_ms':1, 'num_turns':1, 'total_cost_usd':0}))
+PY
+"#;
+
+#[test]
+fn permission_answer_crosses_fd_four_and_releases_the_real_hook_process() {
+    let fixture = Fixture::new(BRIDGE_HARNESS);
+    let keys = bridge_policy(&fixture);
+    let mut command = Command::new("sh");
+    command
+        .args([
+            "-c",
+            "exec 4<&0; exec \"$@\"",
+            "spawning-supervisor",
+            env!("CARGO_BIN_EXE_ostrom"),
+            "pass",
+            "builder",
+            "--control-fd",
+            "4",
+            "--events-fd",
+            "1",
+        ])
+        .env_clear()
+        .env("PATH", env::var_os("PATH").unwrap_or_default())
+        .env("OSTROM_HOME", &fixture.state)
+        .env("HOME", fixture.root.path())
+        .env("CLAUDE_CONFIG_DIR", fixture.root.path())
+        .env("CLAUDE_BIN", &fixture.claude)
+        .env("OSTROM_POLICY_TRUSTED_KEYS", keys)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    let mut pipe = child.stdin.take().unwrap();
+    let requested = wait_for_run_event(&fixture, "decision.requested");
+    let steer = control_request("steer", "spawning-supervisor");
+    writeln!(pipe, "{steer}").unwrap();
+    let refused = wait_for_run_event(&fixture, "control.applied");
+    assert_eq!(refused["payload"]["reason"], "unsupported");
+    assert_eq!(refused["payload"]["by"], "spawning-supervisor");
+    let mut control = control_request("answer", "spawning-supervisor");
+    control["payload"]["decisionId"] = requested["payload"]["decisionId"].clone();
+    control["payload"]["optionId"] = "allow".into();
+    writeln!(pipe, "{control}").unwrap();
+    let output = finish_control_pass(child);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout,
+        fixture.run_event_bytes(),
+        "the event descriptor and durable sink must agree"
+    );
+    let hook: Value =
+        serde_json::from_slice(&fs::read(fixture.state.join("hook-output.json")).unwrap()).unwrap();
+    assert_eq!(hook["hookSpecificOutput"]["decision"]["behavior"], "allow");
+    let events = fixture.run_events();
+    let answered = events
+        .iter()
+        .find(|e| e["type"] == "decision.answered")
+        .unwrap();
+    assert_eq!(answered["payload"]["requestedRunId"], requested["runId"]);
+    assert_eq!(answered["runId"], requested["runId"]);
+    assert_eq!(
+        answered["payload"]["decisionId"],
+        requested["payload"]["decisionId"]
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e["type"] == "control.applied" && e["payload"]["ok"] == true)
+    );
+    let path = fs::read_to_string(fixture.state.join("settings-path")).unwrap();
+    assert!(
+        !Path::new(&path).exists(),
+        "per-run settings survived normal exit"
+    );
+    assert!(
+        !Path::new(&path).parent().unwrap().exists(),
+        "private channel directory survived normal exit"
+    );
+    assert!(
+        !fixture
+            .state
+            .join("roles/builder.derived.settings.json")
+            .exists()
+    );
+}
+
+#[test]
+fn permission_channel_is_removed_on_interrupt_and_harness_failure() {
+    for interrupt in [true, false] {
+        let fixture = Fixture::new(if interrupt {
+            BRIDGE_HARNESS
+        } else {
+            "printf '%s' \"$3\" >\"$OSTROM_HOME/settings-path\"; exit 19"
+        });
+        let keys = bridge_policy(&fixture);
+        let mut child = fixture
+            .command()
+            .env("OSTROM_POLICY_TRUSTED_KEYS", keys)
+            .args(["--control-fd", "0"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        if interrupt {
+            wait_for_run_event(&fixture, "decision.requested");
+            writeln!(
+                child.stdin.as_mut().unwrap(),
+                "{}",
+                control_request("interrupt", "spawning-supervisor")
+            )
+            .unwrap();
+        }
+        let output = finish_control_pass(child);
+        assert!(!output.status.success());
+        let settings = fs::read_to_string(fixture.state.join("settings-path")).unwrap();
+        assert!(
+            !Path::new(&settings).parent().unwrap().exists(),
+            "channel survived abnormal run end"
+        );
+        let events = fixture.run_events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e["type"] == "run.finished")
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn permission_channel_is_removed_when_harness_cannot_spawn() {
+    let fixture = Fixture::new("true");
+    let keys = bridge_policy(&fixture);
+    fs::write(
+        &fixture.claude,
+        "#!/missing-permission-harness-interpreter\n",
+    )
+    .unwrap();
+    let output = fixture
+        .command()
+        .env("OSTROM_POLICY_TRUSTED_KEYS", keys)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(
+        fixture.run_events().last().unwrap()["payload"]["outcome"],
+        "failed",
+        "spawn failure was recorded as success"
+    );
+    for run in fs::read_dir(fixture.state.join("runs")).unwrap().flatten() {
+        assert!(
+            !fs::read_dir(run.path())
+                .unwrap()
+                .flatten()
+                .any(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("permission-")),
+            "channel survived spawn failure"
+        );
+    }
+}
+
+#[test]
+fn permission_cleanup_error_is_a_failed_pass() {
+    let fixture = Fixture::new(
+        "printf '%s' \"$3\" >\"$OSTROM_HOME/settings-path\"; chmod 500 \"$(dirname \"$(dirname \"$3\")\")\"",
+    );
+    let keys = bridge_policy(&fixture);
+    let output = fixture
+        .command()
+        .env("OSTROM_POLICY_TRUSTED_KEYS", keys)
+        .output()
+        .unwrap();
+    let settings = fs::read_to_string(fixture.state.join("settings-path")).unwrap();
+    let directory = Path::new(&settings).parent().unwrap().parent().unwrap();
+    fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        !output.status.success(),
+        "cleanup failure exited successfully"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("could not remove permission channel")
+    );
+    assert_eq!(
+        fixture.run_events().last().unwrap()["payload"]["outcome"],
+        "failed",
+        "cleanup failure was recorded as success"
+    );
 }
