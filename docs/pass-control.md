@@ -74,8 +74,20 @@ sets its per-server `timeout` in milliseconds. Claude receives `--mcp-config`,
 The channel file and transport messages are mode 0600 inside a mode 0700
 directory; the runner removes that directory, the settings, and the MCP config
 at run end, including interruption and errors. Durable events remain. Private
-channel opening supports Linux and macOS; other platforms refuse bridge setup.
-Two runs never share `roles/<role>.derived.settings.json`.
+channel opening supports Linux and macOS. Two runs never share
+`roles/<role>.derived.settings.json`.
+
+On any other platform the pass does not fail: it proceeds the way a
+policy-adopted pass did before the bridge existed. The derived profile is
+still written per run rather than to the shared
+`roles/<role>.derived.settings.json` -- that fix survives regardless of
+bridge support -- but no `mcp.json` is rendered and Claude receives none of
+`--mcp-config`, `--strict-mcp-config`, `--permission-prompts`, or
+`--permission-prompt-tool`. A live answer on the control descriptor is then
+refused exactly as any control verb other than `interrupt` is refused above:
+`control.applied` with `ok: false`, `reason: "unsupported"`, and the same
+`by`. The pass emits one `agent.warning{stage:"permission-bridge"}` naming the
+platform, so the absence of live answers is observable rather than silent.
 
 The stdio server supports MCP initialization, tool discovery, and calls to its
 single `approve` tool. Claude sends `tool_name`, `input`, and `tool_use_id`;

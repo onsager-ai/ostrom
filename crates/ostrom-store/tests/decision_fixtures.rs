@@ -271,6 +271,7 @@ fn budget_decision_fixture() {
         facts_only: false,
         caps: Default::default(),
         clock: clock(),
+        platform: std::env::consts::OS,
     });
     assert!(
         matches!(result, Err(PassError::BudgetHeld(_))),
