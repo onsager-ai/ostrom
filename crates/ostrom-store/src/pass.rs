@@ -455,12 +455,22 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
         request.clock.clone(),
         RunEventStart {
             run_id: generated_run_id(request.role.name(), &request.clock),
-            kind: RunKind::Loop,
+            // ostrom#546: every invocation this function can observe is a
+            // one-off dispatch -- `ostrom pass <role>` run by hand, or by a
+            // supervisor dispatching one pass. `loop` requires a declared
+            // `schedule`, which nothing here sets or has to set from; a
+            // scheduled invocation (ethogram #64/#65's `loop`) is a separate,
+            // frozen-contract change, not this one.
+            kind: RunKind::Handoff,
             actor: request.role.name().to_owned(),
             harness: "claude".to_owned(),
             model: None,
             schedule: None,
             repository: None,
+            // No `PassRequest` field carries an order id or equivalent intent
+            // reference (unlike `implement.rs`'s `order.order_id`), so this
+            // stays `None` rather than being synthesised from the role or the
+            // prompt.
             work_order: None,
             ceilings: wire_ceilings(request.caps),
         },
@@ -1617,7 +1627,9 @@ mod sink_refusal_tests {
             clock.clone(),
             RunEventStart {
                 run_id: run_id.to_owned(),
-                kind: RunKind::Loop,
+                // ostrom#546: this fixture stands in for what `run_pass`
+                // itself emits, so it must agree with the real producer.
+                kind: RunKind::Handoff,
                 actor: "builder".to_owned(),
                 harness: "claude".to_owned(),
                 model: None,
@@ -1689,6 +1701,20 @@ mod sink_refusal_tests {
                 .map(|event| event.event_type.as_str())
                 .collect::<Vec<_>>(),
             ["run.started", CAPTURE_REFUSED, AGENT_TEXT, "run.finished"]
+        );
+        // ostrom#546: a pass is a dispatched, unscheduled run, so its
+        // run.started must declare `handoff` and never `schedule` -- the
+        // fact that made `loop` wrong for every pass.
+        assert_eq!(events[0].payload["kind"], "handoff");
+        assert!(
+            events[0]
+                .payload
+                .as_object()
+                .unwrap()
+                .get("schedule")
+                .is_none(),
+            "a pass's run.started must not carry a schedule: {:?}",
+            events[0].payload
         );
         assert_eq!(
             events.iter().map(|event| event.seq).collect::<Vec<_>>(),
@@ -2026,6 +2052,21 @@ mod platform_fallback_pass_tests {
         let events = FileSink::new(paths.runs_dir())
             .read_from(&run_id, 0)
             .expect("read durable events");
+        // ostrom#546: `run_pass` is invoked as a one-off dispatch, never a
+        // declared schedule, so its run.started must declare `handoff` and
+        // carry no `schedule` -- the fact that made `loop` wrong here.
+        assert_eq!(events.first().unwrap().event_type, "run.started");
+        assert_eq!(events[0].payload["kind"], "handoff");
+        assert!(
+            events[0]
+                .payload
+                .as_object()
+                .unwrap()
+                .get("schedule")
+                .is_none(),
+            "a pass's run.started must not carry a schedule: {:?}",
+            events[0].payload
+        );
         let warnings: Vec<_> = events
             .iter()
             .filter(|event| event.event_type == ethogram::AGENT_WARNING)

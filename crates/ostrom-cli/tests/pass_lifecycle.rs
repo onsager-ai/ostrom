@@ -1290,7 +1290,10 @@ fn error_exit_releases_and_finalizes() {
     assert_eq!(fixture.trace().last().unwrap()["fact"]["outcome"], "failed");
     let events = fixture.run_events();
     assert_eq!(events[0]["type"], "run.started");
-    assert_eq!(events[0]["payload"]["kind"], "loop");
+    // ostrom#546: a pass is a dispatched, unscheduled run -- `handoff`, never
+    // `loop`, which requires a declared `schedule` nothing here sets.
+    assert_eq!(events[0]["payload"]["kind"], "handoff");
+    assert!(events[0]["payload"].get("schedule").is_none());
     assert_eq!(events[1]["type"], "run.finished");
     assert_eq!(events[1]["payload"]["outcome"], "failed");
     assert_eq!(events[1]["payload"]["reason"], "pass-failed");
