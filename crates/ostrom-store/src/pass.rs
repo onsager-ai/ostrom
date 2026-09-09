@@ -28,8 +28,8 @@ use umwelt_runtime::{
 use crate::{
     Clock, LeaseActionError, OstromPaths, OwnedLease, PassState, RunEventError, RunEventGuard,
     RunEventStart, SignalFlags, TraceAppend, append_trace, environment, generated_run_id,
-    pass_control, read_lease, read_pass_state, read_trace, selection::dispatchability_snapshot,
-    write_pass_state,
+    pass_control, pass_control::ControlInput, read_lease, read_pass_state, read_trace,
+    selection::dispatchability_snapshot, write_pass_state,
 };
 
 pub const MAX_TURNS: &str = "200";
@@ -857,7 +857,7 @@ fn wait_for_child(
             && let Ok(input) = input.try_recv()
         {
             match input {
-                Ok(input) if input.kind == ControlKind::Interrupt => {
+                ControlInput::Request(input) if input.kind == ControlKind::Interrupt => {
                     let control = guard.control.as_mut().expect("spawned pass has RunControl");
                     guard
                         .events
@@ -876,7 +876,7 @@ fn wait_for_child(
                         130,
                     ));
                 }
-                Ok(input)
+                ControlInput::Request(input)
                     if input.kind == ControlKind::Answer && guard.permission_bridge.is_some() =>
                 {
                     guard
@@ -888,7 +888,7 @@ fn wait_for_child(
                             PassError::failed(guard.role, format!("permission answer: {error}"), 1)
                         })?;
                 }
-                Ok(input) => {
+                ControlInput::Request(input) => {
                     // NoSteer cannot resume this pass. Refuse immediately; the
                     // runtime's steer method would queue until process exit.
                     for draft in pass_control::unsupported(&input) {
@@ -901,7 +901,7 @@ fn wait_for_child(
                         })?;
                     }
                 }
-                Err(detail) => {
+                ControlInput::Refused(detail) => {
                     eprintln!("ostrom control: {detail}");
                     guard
                         .events
@@ -910,6 +910,21 @@ fn wait_for_child(
                             PassError::failed(
                                 guard.role,
                                 format!("could not record control refusal: {error}"),
+                                1,
+                            )
+                        })?;
+                }
+                ControlInput::Ended(cause) => {
+                    // Non-terminal: the descriptor stopped, the pass has not.
+                    // #528's incident is exactly the absence of this branch.
+                    eprintln!("ostrom control: {cause}");
+                    guard
+                        .events
+                        .append(pass_control::ended(&cause))
+                        .map_err(|error| {
+                            PassError::failed(
+                                guard.role,
+                                format!("could not record control descriptor termination: {error}"),
                                 1,
                             )
                         })?;

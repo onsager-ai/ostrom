@@ -377,6 +377,44 @@ fn a_control_descriptor_above_stderr_is_inherited_through_the_supervisor() {
 }
 
 #[test]
+fn control_fd_end_of_input_is_reported_not_dropped() {
+    // ostrom#528's incident: a supervisor closed its write end (or the pass
+    // hit a read error) and the pass emitted nothing at all -- no
+    // control.requested, no control.applied, no capture.refused, silent
+    // stderr. This is the reader's own termination, not a refused control,
+    // and it must not be silent again.
+    let stream = CLAUDE_STREAM_JSON
+        .lines()
+        .take(2)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let fixture = Fixture::new(&format!("{}\nexec sleep 30", stream_script(&stream)));
+    let mut child = fixture
+        .command()
+        .args(["--control-fd", "0"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("start controlled pass");
+    let input = child.stdin.take().expect("control pipe");
+    wait_for_run_event(&fixture, "agent.tool_use");
+    // A supervisor done sending control is not a supervisor that is gone:
+    // closing this end must still reach the run's events.
+    drop(input);
+    let warning = wait_for_run_event(&fixture, "agent.warning");
+    assert_eq!(warning["payload"]["stage"], "control-descriptor");
+    assert!(
+        warning["payload"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("end of input"),
+        "message should name end of input: {warning}"
+    );
+    signal(child.id(), "TERM");
+    let _ = wait(child);
+}
+
+#[test]
 fn an_invalid_control_fd_environment_value_is_a_configuration_error() {
     let fixture = Fixture::new("exit 0");
     let output = fixture
@@ -526,13 +564,16 @@ fn closed_and_unreadable_control_descriptors_do_not_fail_the_pass() {
         );
         assert_eq!(output.stdout, fixture.run_event_bytes());
         let events = fixture.run_events();
-        let refusals = events
+        // Neither shape is malformed input (nothing was ever read); both are
+        // the control reader stopping, reported as a warning, not a refusal.
+        let warnings = events
             .iter()
-            .filter(|event| event["type"] == "capture.refused")
+            .filter(|event| event["type"] == "agent.warning")
             .collect::<Vec<_>>();
-        assert_eq!(refusals.len(), 1);
-        let detail = refusals[0]["payload"]["detail"].as_str().unwrap();
-        assert!(detail.contains(if unreadable {
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0]["payload"]["stage"], "control-descriptor");
+        let message = warnings[0]["payload"]["message"].as_str().unwrap();
+        assert!(message.contains(if unreadable {
             "could not read control descriptor"
         } else {
             "could not open control fd"
@@ -561,12 +602,34 @@ fn control_eof_and_an_idle_writer_do_not_delay_normal_exit() {
         let output = finish_control_pass(child);
         assert!(output.status.success());
         assert!(output.stdout.is_empty());
-        assert!(output.stderr.is_empty());
         let events = fixture.run_events();
         assert!(!events.iter().any(
             |event| event["type"].as_str().unwrap().starts_with("control.")
                 || event["type"] == "capture.refused"
         ));
+        let warnings = events
+            .iter()
+            .filter(|event| event["type"] == "agent.warning")
+            .collect::<Vec<_>>();
+        if close_writer {
+            // Closing the write end is an end of input, not the silence of
+            // ostrom#528: it must still surface, even though it never delays
+            // or fails a pass that finishes on its own.
+            assert!(
+                output
+                    .stderr
+                    .starts_with(b"ostrom control: reached end of input"),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(warnings.len(), 1);
+            assert_eq!(warnings[0]["payload"]["stage"], "control-descriptor");
+        } else {
+            // The writer never closes: the reader is still blocked on read()
+            // when this pass ends, and never gets to report anything.
+            assert!(output.stderr.is_empty());
+            assert!(warnings.is_empty());
+        }
         assert_one_terminal(&events, "completed");
     }
 }

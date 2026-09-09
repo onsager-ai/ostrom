@@ -11,9 +11,10 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use ethogram::{
-    ControlAppliedPayload, ControlAppliedReason, ControlRequestedPayload, DecisionAnsweredPayload,
-    DecisionDossier, DecisionKind, DecisionOption, DecisionRequestedPayload, EventDraft,
-    MAX_EXCERPT_SCALARS, PayloadExtension, excerpt,
+    AGENT_WARNING, AgentWarningPayload, ControlAppliedPayload, ControlAppliedReason,
+    ControlRequestedPayload, DecisionAnsweredPayload, DecisionDossier, DecisionKind,
+    DecisionOption, DecisionRequestedPayload, EventDraft, MAX_EXCERPT_SCALARS, PayloadExtension,
+    excerpt,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -573,6 +574,23 @@ fn complete(
         events.append(applied(
             control,
             timeout.then_some(ControlAppliedReason::NotLive),
+        ))?;
+    } else if timeout {
+        // `decision.answered{byTimeout:true}` alone reads exactly like "the
+        // supervisor chose not to answer" -- indistinguishable from "an
+        // answer was sent and lost" (ostrom#528). No control ever arrived
+        // for this decision, so say that plainly, beside the fact above.
+        let message = excerpt(
+            &format!("decision {id} expired with no control received on the descriptor"),
+            MAX_EXCERPT_SCALARS,
+        );
+        events.append(draft(
+            AGENT_WARNING,
+            &AgentWarningPayload {
+                stage: Some("permission-bridge".to_owned()),
+                message: message.text,
+                extra: PayloadExtension::new(),
+            },
         ))?;
     }
     pending.answered = true;
@@ -1190,13 +1208,49 @@ mod tests {
         assert!(output.to_string().contains(&id));
         f.poll();
         let wire = f.wire();
-        assert_eq!(wire.last().unwrap().event_type, ethogram::DECISION_ANSWERED);
-        assert_eq!(wire.last().unwrap().payload["byTimeout"], true);
-        assert_eq!(
-            wire.last().unwrap().payload["requestedRunId"],
-            "permission-test"
-        );
+        let answered = &wire[wire.len() - 2];
+        assert_eq!(answered.event_type, ethogram::DECISION_ANSWERED);
+        assert_eq!(answered.payload["byTimeout"], true);
+        assert_eq!(answered.payload["requestedRunId"], "permission-test");
         assert_eq!(wire[1].payload["onTimeout"], "deny");
+        // No control ever arrived for this decision: distinguishable from an
+        // answer that was sent and lost (ostrom#528).
+        let warning = wire.last().unwrap();
+        assert_eq!(warning.event_type, ethogram::AGENT_WARNING);
+        assert_eq!(warning.payload["stage"], "permission-bridge");
+        assert!(
+            warning.payload["message"].as_str().unwrap().contains(&id),
+            "message should name the decision: {warning:?}"
+        );
+    }
+
+    #[test]
+    fn expiry_with_no_control_received_warns_distinctly_from_a_lost_answer() {
+        // This is the guard for ostrom#528's incident: `decision.answered{byTimeout:true}`
+        // alone cannot be told apart from "an answer was sent and lost". A pending
+        // decision that never saw a control at all must say so.
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let mut f = Fixture::new();
+        let handle = f.start_handler(input(), Duration::from_millis(150));
+        let id = f.wait_request();
+        assert_denied(&handle.join().unwrap());
+        f.poll();
+        let wire = f.wire();
+        let warnings: Vec<_> = wire
+            .iter()
+            .filter(|event| event.event_type == ethogram::AGENT_WARNING)
+            .collect();
+        assert_eq!(warnings.len(), 1, "expected exactly one warning: {wire:?}");
+        assert_eq!(warnings[0].payload["stage"], "permission-bridge");
+        let message = warnings[0].payload["message"].as_str().unwrap();
+        assert!(message.contains(&id), "message should name {id}: {message}");
+        assert!(
+            message.contains("no control received"),
+            "message should state no control ever arrived: {message}"
+        );
+        for event in &wire {
+            ethogram::validate(&event.event_type, &event.payload).unwrap();
+        }
     }
 
     #[test]
@@ -1220,7 +1274,13 @@ mod tests {
         assert_eq!(f.wire().last().unwrap().payload["reason"], "not-live");
         assert_denied(&handle.join().unwrap());
         f.poll();
-        assert_eq!(f.wire().last().unwrap().payload["byTimeout"], true);
+        let wire = f.wire();
+        let answered = &wire[wire.len() - 2];
+        assert_eq!(answered.event_type, ethogram::DECISION_ANSWERED);
+        assert_eq!(answered.payload["byTimeout"], true);
+        // The rejected "allow" above never set `pending.control`, so this
+        // expiry, too, never received a control.
+        assert_eq!(wire.last().unwrap().event_type, ethogram::AGENT_WARNING);
     }
 
     #[test]
@@ -1274,7 +1334,9 @@ mod tests {
         assert_denied(&handle.join().unwrap());
         thread::sleep(Duration::from_millis(160));
         f.poll();
-        assert_eq!(f.wire().last().unwrap().payload["byTimeout"], true);
+        let wire = f.wire();
+        assert_eq!(wire[wire.len() - 2].payload["byTimeout"], true);
+        assert_eq!(wire.last().unwrap().event_type, ethogram::AGENT_WARNING);
     }
 
     #[test]
@@ -1423,11 +1485,13 @@ mod tests {
         );
         assert_denied(&handle.join().unwrap());
         f.poll();
+        let wire = f.wire();
         assert_eq!(
-            f.wire().last().unwrap().payload["byTimeout"],
+            wire[wire.len() - 2].payload["byTimeout"],
             true,
             "invalid receipt prevented expiry"
         );
+        assert_eq!(wire.last().unwrap().event_type, ethogram::AGENT_WARNING);
     }
 
     #[test]
