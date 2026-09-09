@@ -1,6 +1,6 @@
 use std::{
     fs,
-    io::Write,
+    io::{self, Write},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::mpsc::{self, Receiver, RecvTimeoutError},
@@ -158,6 +158,11 @@ pub struct PassRequest {
     pub facts_only: bool,
     pub caps: RunCaps,
     pub clock: Clock,
+    /// The value [`std::env::consts::OS`] would report, threaded through
+    /// explicitly so the ostrom#544 platform fallback can be exercised by
+    /// injection rather than by requiring a Windows host in CI. Production
+    /// always passes `std::env::consts::OS` itself.
+    pub platform: &'static str,
 }
 
 #[derive(Debug, Error)]
@@ -385,6 +390,63 @@ impl Drop for PassGuard {
     }
 }
 
+/// The result of resolving a derived (policy-adopted) profile into settings
+/// for this run: either a live bridge, or ostrom#544's fallback for a
+/// platform with no private-channel form.
+enum DerivedRunSettings {
+    Bridged(crate::permission_bridge::PermissionBridge),
+    Fallback { path: PathBuf, warning: EventDraft },
+}
+
+/// Writes the derived profile for one run, never the shared
+/// `roles/<role>.derived.settings.json` two concurrent passes of one role
+/// would overwrite. This is the ostrom#544 fallback's settings write; the
+/// bridge writes its own copy under its private channel directory instead.
+fn write_fallback_settings(
+    run_directory: &Path,
+    run_id: &str,
+    derived: &str,
+) -> io::Result<PathBuf> {
+    fs::create_dir_all(run_directory)?;
+    let path = run_directory.join(format!(
+        "{}.settings.json",
+        umwelt_runtime::run_directory_name(run_id)
+    ));
+    fs::write(&path, derived)?;
+    Ok(path)
+}
+
+/// Whether `platform` can host a bridge decides the whole shape of this
+/// run's settings: a bridge and its per-run MCP config when it can, or
+/// ostrom#544's fallback -- still per-run settings, no MCP config, one named
+/// warning -- when it cannot. Pure aside from the filesystem writes either
+/// branch makes, and takes `platform` as an explicit argument rather than
+/// reading `std::env::consts::OS` itself, so the fallback is unit-testable by
+/// injecting an unsupported name instead of requiring a Windows host.
+fn resolve_derived_settings(
+    run_directory: &Path,
+    run_id: &str,
+    derived: &str,
+    executable: &Path,
+    platform: &str,
+) -> io::Result<DerivedRunSettings> {
+    if crate::permission_bridge::platform_supports_bridge(platform) {
+        let bridge = crate::permission_bridge::PermissionBridge::create(
+            run_directory,
+            run_id,
+            derived,
+            executable,
+        )?;
+        Ok(DerivedRunSettings::Bridged(bridge))
+    } else {
+        let path = write_fallback_settings(run_directory, run_id, derived)?;
+        Ok(DerivedRunSettings::Fallback {
+            path,
+            warning: crate::permission_bridge::platform_fallback_warning(platform),
+        })
+    }
+}
+
 pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
     let mut events = RunEventGuard::start(
         &request.paths,
@@ -559,22 +621,44 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
             .join(umwelt_runtime::run_directory_name(guard.events.run_id()));
         let executable = std::env::current_exe()
             .map_err(|error| PassError::failed(request.role, error.to_string(), 1))?;
-        let bridge = crate::permission_bridge::PermissionBridge::create(
+        match resolve_derived_settings(
             &directory,
             guard.events.run_id(),
             derived,
             &executable,
+            request.platform,
         )
         .map_err(|error| {
             PassError::failed(
                 request.role,
-                format!("could not create permission bridge: {error}"),
+                format!("could not prepare permission settings: {error}"),
                 1,
             )
-        })?;
-        let path = bridge.settings_path().to_owned();
-        guard.permission_bridge = Some(bridge);
-        path
+        })? {
+            DerivedRunSettings::Bridged(bridge) => {
+                let path = bridge.settings_path().to_owned();
+                guard.permission_bridge = Some(bridge);
+                path
+            }
+            DerivedRunSettings::Fallback { path, warning } => {
+                // ostrom#544: this platform has no private-channel form (only
+                // Linux and macOS do), so the pass proceeds as it did before
+                // #541 -- `guard.permission_bridge` stays `None`, which is
+                // already what makes a live answer on the control descriptor
+                // fall through to the same `unsupported` refusal any other
+                // control verb this pass does not implement receives, and
+                // already what keeps `--mcp-config` and friends off the
+                // harness invocation below. The warning says why, by name.
+                guard.events.append(warning).map_err(|error| {
+                    PassError::failed(
+                        request.role,
+                        format!("could not append permission-bridge warning: {error}"),
+                        1,
+                    )
+                })?;
+                path
+            }
+        }
     } else {
         let path = roles.join(format!("{}.settings.json", request.role.name()));
         if !path.is_file() {
@@ -1755,5 +1839,222 @@ mod exit_code_tests {
             DISARMED_EXIT_CODE
         );
         assert_eq!(PassError::LeaseHeld("builder").exit_code(), 0);
+    }
+}
+
+#[cfg(test)]
+mod resolve_derived_settings_tests {
+    // Exercises the same pure decision `run_pass` uses (`platform_supports_bridge`
+    // via `resolve_derived_settings`), by injecting an unsupported OS name -- never
+    // by gating on `cfg(target_os)` or requiring a Windows host (ostrom#544).
+    use super::{DerivedRunSettings, resolve_derived_settings};
+    use std::path::Path;
+
+    const DERIVED: &str =
+        r#"{"permissions":{"defaultMode":"dontAsk","allow":["Bash(ostrom deploy *)"]}}"#;
+
+    #[test]
+    fn unsupported_platform_writes_per_run_settings_with_no_bridge_and_one_warning() {
+        let root = tempfile::tempdir().expect("temporary run directory");
+        let resolved = resolve_derived_settings(
+            root.path(),
+            "fallback-run",
+            DERIVED,
+            Path::new("ostrom"),
+            "unsupported",
+        )
+        .expect("fallback resolves without a bridge");
+        let DerivedRunSettings::Fallback { path, warning } = resolved else {
+            panic!("an unsupported platform must not produce a bridge");
+        };
+        // Per run, inside this run's own directory -- never the shared
+        // roles/<role>.derived.settings.json two concurrent passes of one
+        // role would overwrite (the defect #541 fixed, which must survive
+        // regardless of bridge support).
+        assert_eq!(path, root.path().join("fallback-run.settings.json"));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read fallback settings"),
+            DERIVED,
+            "the fallback must not rewrite the derived profile"
+        );
+        // No MCP config is ever rendered for a fallback run: there is no path
+        // to hold one, so nothing can be pointed to by `--mcp-config`.
+        assert!(
+            !root.path().join("mcp.json").exists(),
+            "a fallback run must never render mcp.json"
+        );
+        assert_eq!(warning.payload["stage"], "permission-bridge");
+        assert!(
+            warning.payload["message"]
+                .as_str()
+                .unwrap()
+                .contains("unsupported"),
+            "{warning:?}"
+        );
+    }
+
+    #[test]
+    fn linux_and_macos_still_produce_a_bridge() {
+        for os in ["linux", "macos"] {
+            let root = tempfile::tempdir().expect("temporary run directory");
+            let resolved = resolve_derived_settings(
+                root.path(),
+                "bridged-run",
+                DERIVED,
+                Path::new("ostrom"),
+                os,
+            )
+            .unwrap_or_else(|error| panic!("{os} bridge creation failed: {error}"));
+            assert!(
+                matches!(resolved, DerivedRunSettings::Bridged(_)),
+                "{os} must still take the bridge path"
+            );
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod platform_fallback_pass_tests {
+    // The pass-level counterpart to `resolve_derived_settings_tests`: the same
+    // injection (`PassRequest::platform`), run through the whole pass so the
+    // real `Command` this pass spawns is asserted on, not a stand-in for it.
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    use umwelt_runtime::{FileSink, Source};
+
+    use super::{Clock, OstromPaths, PassRequest, PassRole, run_pass};
+
+    const CLAUDE_STREAM_JSON: &str = concat!(
+        "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"fallback-fixture\",\"model\":\"claude-fixture\"}\n",
+        "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"tool-fixture\",\"name\":\"Bash\",\"input\":{\"command\":\"true\"}}]}}\n",
+        "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"tool-fixture\",\"content\":\"ok\",\"is_error\":false}]}}\n",
+        "{\"type\":\"result\",\"subtype\":\"success\",\"session_id\":\"fallback-fixture\",\"duration_ms\":1,\"num_turns\":1,\"total_cost_usd\":0,",
+        "\"usage\":{\"input_tokens\":10,\"output_tokens\":5,\"cache_read_input_tokens\":2,\"cache_creation_input_tokens\":3}}\n"
+    );
+
+    #[test]
+    fn a_policy_adopted_pass_survives_a_platform_with_no_bridge() {
+        let root = tempfile::tempdir().expect("temporary pass fixture");
+        let paths = OstromPaths {
+            config: root.path().to_path_buf(),
+            state: root.path().to_path_buf(),
+        };
+        fs::write(paths.state.join("loop-armed"), "").expect("arm pass");
+        let argv_file = root.path().join("argv.txt");
+        let claude_bin = root.path().join("claude-stub");
+        fs::write(
+            &claude_bin,
+            format!(
+                "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > {}\nprintf '%s' '{CLAUDE_STREAM_JSON}'\n",
+                argv_file.display()
+            ),
+        )
+        .expect("write claude stub");
+        fs::set_permissions(&claude_bin, fs::Permissions::from_mode(0o755)).expect("chmod stub");
+
+        let derived =
+            r#"{"permissions":{"defaultMode":"dontAsk","allow":["Bash(ostrom deploy *)"]}}"#;
+        let request = PassRequest {
+            paths: paths.clone(),
+            working_directory: root.path().to_path_buf(),
+            role: PassRole::Builder,
+            prompt: "ostrom#544 fallback fixture".to_owned(),
+            permission_mode: PassRole::Builder.default_permission_mode(),
+            derived_settings: Some(derived.to_owned()),
+            claude_bin,
+            signals: Default::default(),
+            supervisor_pid: None,
+            events_fd: None,
+            control_fd: None,
+            facts_only: false,
+            caps: Default::default(),
+            clock: Clock::default(),
+            // Injected, not the host running this test (ostrom#544): CI runs
+            // this on Linux, where the real bridge would otherwise succeed
+            // and this test would exercise nothing.
+            platform: "windows",
+        };
+        run_pass(&request).expect("a platform with no bridge must not fail the pass");
+
+        let argv = fs::read_to_string(&argv_file).expect("read captured argv");
+        for flag in [
+            "--mcp-config",
+            "--strict-mcp-config",
+            "--permission-prompts",
+            "--permission-prompt-tool",
+        ] {
+            assert!(
+                !argv.contains(flag),
+                "a fallback pass must never pass {flag} to the harness: {argv}"
+            );
+        }
+        let lines: Vec<&str> = argv.lines().collect();
+        let settings_index = lines
+            .iter()
+            .position(|line| *line == "--settings")
+            .expect("--settings must still be passed");
+        let settings_path = std::path::PathBuf::from(lines[settings_index + 1]);
+        assert!(
+            settings_path.starts_with(paths.runs_dir()),
+            "fallback settings must live under the run directory: {settings_path:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(&settings_path).expect("read fallback settings"),
+            derived
+        );
+        assert!(
+            !paths
+                .state
+                .join("roles/builder.derived.settings.json")
+                .exists(),
+            "a fallback pass must never write the shared derived settings file"
+        );
+
+        let run_entries: Vec<_> = fs::read_dir(paths.runs_dir())
+            .expect("read runs directory")
+            .map(|entry| entry.expect("run directory entry"))
+            .collect();
+        assert_eq!(
+            run_entries.len(),
+            1,
+            "expected exactly one run directory: {run_entries:?}"
+        );
+        let run_id = run_entries[0]
+            .file_name()
+            .into_string()
+            .expect("run id is valid UTF-8");
+        let events = FileSink::new(paths.runs_dir())
+            .read_from(&run_id, 0)
+            .expect("read durable events");
+        let warnings: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type == ethogram::AGENT_WARNING)
+            .collect();
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one agent.warning: {events:?}"
+        );
+        assert_eq!(warnings[0].payload["stage"], "permission-bridge");
+        assert!(
+            warnings[0].payload["message"]
+                .as_str()
+                .unwrap()
+                .contains("windows"),
+            "the warning must name the platform: {:?}",
+            warnings[0].payload
+        );
+        // The stub harness reports no inner `ostrom pass` work of its own, so
+        // this run's own terminal outcome is the ordinary "no-op" a bare
+        // stream produces regardless of platform (see pass_lifecycle.rs's
+        // identical `stream_script(CLAUDE_STREAM_JSON)` fixtures) -- the
+        // point here is that it is a clean terminal event at all, not
+        // "failed" the way #544 regressed it to.
+        assert_eq!(events.last().unwrap().event_type, "run.finished");
+        assert_ne!(
+            events.last().unwrap().payload["outcome"],
+            "failed",
+            "a platform with no bridge must not fail the pass: {events:?}"
+        );
     }
 }

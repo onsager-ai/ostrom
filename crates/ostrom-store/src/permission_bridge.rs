@@ -107,6 +107,42 @@ fn channel_open_flags(os: &str) -> Option<i32> {
     }
 }
 
+/// Whether this repository's private permission channel form exists for `os`
+/// (Linux and macOS today). The pass checks this *before* attempting
+/// [`PermissionBridge::create`], so a platform without it takes the pass's
+/// pre-#541 fallback -- no bridge, no MCP flags, a live answer refused as
+/// unsupported -- rather than failing outright (ostrom#544). Kept as a
+/// one-line wrapper over the same pure decision `channel_open_flags` already
+/// makes, so the fallback and the bridge itself can never disagree about
+/// which platforms are supported.
+pub(crate) fn platform_supports_bridge(os: &str) -> bool {
+    channel_open_flags(os).is_some()
+}
+
+/// The one `agent.warning{stage:"permission-bridge"}` a fallback pass emits,
+/// naming the platform so the absence of live answers is observable rather
+/// than silent (ostrom#544; this repository's principle 5).
+pub(crate) fn platform_fallback_warning(os: &str) -> EventDraft {
+    let message = excerpt(
+        &format!(
+            "private permission channels are unsupported on {os}; the pass \
+             proceeds without a bridge, so a live control answer is refused \
+             as unsupported"
+        ),
+        MAX_EXCERPT_SCALARS,
+    );
+    EventDraft {
+        event_type: AGENT_WARNING.to_owned(),
+        payload: serde_json::to_value(AgentWarningPayload {
+            stage: Some("permission-bridge".to_owned()),
+            message: message.text,
+            extra: PayloadExtension::new(),
+        })
+        .expect("agent.warning payload serialises"),
+        captured_at: None,
+    }
+}
+
 fn open_channel_file(path: &Path) -> io::Result<File> {
     let flags = channel_open_flags(std::env::consts::OS).ok_or_else(|| {
         io::Error::new(
@@ -1784,5 +1820,38 @@ mod native_open_tests {
             channel_open_flags("unsupported").is_none(),
             "unsupported platform silently weakened channel opening"
         );
+    }
+}
+
+// Not unix-gated: the platform decision and the warning it emits are pure
+// functions of an injected OS string (ostrom#544), so this must not depend on
+// the host this test happens to run on -- and must never require Windows.
+#[cfg(test)]
+mod fallback_decision_tests {
+    use super::{AGENT_WARNING, platform_fallback_warning, platform_supports_bridge};
+
+    #[test]
+    fn only_linux_and_macos_report_bridge_support() {
+        assert!(platform_supports_bridge("linux"));
+        assert!(platform_supports_bridge("macos"));
+        for os in ["windows", "freebsd", "unsupported", ""] {
+            assert!(
+                !platform_supports_bridge(os),
+                "{os} was wrongly reported as bridge-capable"
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_warning_names_the_platform_once() {
+        let draft = platform_fallback_warning("windows");
+        assert_eq!(draft.event_type, AGENT_WARNING);
+        assert_eq!(draft.payload["stage"], "permission-bridge");
+        let message = draft.payload["message"].as_str().unwrap();
+        assert!(
+            message.contains("windows"),
+            "warning must name the platform: {message}"
+        );
+        ethogram::validate(&draft.event_type, &draft.payload).unwrap();
     }
 }

@@ -2690,6 +2690,7 @@ fn run_pass_worker(
         facts_only,
         caps,
         clock,
+        platform: std::env::consts::OS,
     };
     match run_pass(&request) {
         Ok(()) => std::process::exit(0),
