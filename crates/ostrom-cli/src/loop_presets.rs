@@ -102,7 +102,7 @@ loops:
                     r#"manifest_version: 1
 actors:
   sweeper:
-    description: Publishes the portfolio sweep. Reads widely, writes only what publication allows.
+    description: Publishes the portfolio sweep. Reads widely, writes only what publication allows. The loops.sweep entry schedules the sweep from a local cron-style scheduler on one machine; a hosted substrate schedules the sweep itself and should not adopt that loop.
     permission_mode: auto
 operations:
   portfolio-sweep:
@@ -309,6 +309,32 @@ mod tests {
                 "missing loop {loop_name}"
             );
         }
+    }
+
+    // The presets endpoint passes this description through verbatim, so its
+    // bytes are what an operator reads before applying the preset. #527 ruled
+    // that it must say a hosted substrate schedules the sweep itself; pinning
+    // the whole string is what turns that ruling into a guard.
+    #[test]
+    fn the_sweep_preset_description_says_a_hosted_substrate_schedules_its_own_sweep() {
+        let presets = catalogue().expect("catalogue parses");
+        let sweeper = presets
+            .get("sweep")
+            .expect("the sweep preset is shipped")
+            .fragment
+            .actors
+            .get("sweeper")
+            .expect("the sweep preset declares the sweeper actor");
+
+        assert_eq!(
+            sweeper.description.as_deref(),
+            Some(
+                "Publishes the portfolio sweep. Reads widely, writes only what publication \
+                 allows. The loops.sweep entry schedules the sweep from a local cron-style \
+                 scheduler on one machine; a hosted substrate schedules the sweep itself and \
+                 should not adopt that loop."
+            )
+        );
     }
 
     #[test]
