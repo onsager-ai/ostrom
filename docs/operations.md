@@ -69,7 +69,8 @@ ostrom operations --settings builder
 ostrom operations --actor builder --check-settings /path/to/builder.settings.json
 ```
 
-Generated settings use `defaultMode: deny`, set `OSTROM_ACTOR`, contain one
+Generated settings use `defaultMode: dontAsk` — refuse without prompting, the
+only mode a headless pass can honour — set `OSTROM_ACTOR`, contain one
 `Bash(ostrom <operation> *)` allow per grant, and contain no deny list. These
 commands print a profile; `ostrom pass` derives and installs its own from the
 same grants when the manifest declares its actor.

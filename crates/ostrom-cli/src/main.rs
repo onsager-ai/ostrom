@@ -3428,9 +3428,73 @@ fn legacy_home() -> Result<PathBuf, Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write as _;
+
     use clap::Parser as _;
 
     use super::{CheckCommand, Cli, Command};
+
+    #[test]
+    fn generated_operation_settings_agree_with_claude_doctor() {
+        let claude = super::default_claude_bin();
+        let root = tempfile::tempdir().expect("doctor temporary directory");
+        let manifest = ostrom_core::PolicyManifest::from_yaml(
+            "manifest_version: 1\n\
+             actors: {operator: {}}\n\
+             operations: {comment: {steps: [{uses: gh/post-verdict, with: {note: placeholder}}]}}\n\
+             grants: {operator-comment: {actors: operator, operations: comment}}\n",
+        )
+        .expect("policy manifest");
+        let rendered = ostrom_checks::generate_operation_settings(&manifest, "operator")
+            .expect("generated operation settings");
+        let settings = root.path().join("derived.settings.json");
+        std::fs::write(&settings, rendered).expect("write real generated settings");
+
+        // Doctor validates settings without a trust prompt or an API call.
+        // Isolate local settings and disable background telemetry/update traffic.
+        let output = std::process::Command::new(&claude)
+            .arg("--settings")
+            .arg(&settings)
+            .arg("doctor")
+            .current_dir(root.path())
+            .env("CLAUDE_CONFIG_DIR", root.path().join("config"))
+            .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+            .stdin(std::process::Stdio::null())
+            .output();
+        let output = match output {
+            Ok(output) => output,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Write directly so a successful test cannot hide the skip in libtest capture.
+                writeln!(
+                    std::io::stderr(),
+                    "SKIP generated_operation_settings_agree_with_claude_doctor: Claude binary {} is absent (resolved by default_claude_bin: CLAUDE_BIN, then ~/.local/bin/claude, then claude when no home is available): {error}",
+                    claude.display(),
+                )
+                .expect("print skip reason");
+                return;
+            }
+            Err(error) => panic!("could not run {} doctor: {error}", claude.display()),
+        };
+        let diagnostic = format!(
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        println!("{diagnostic}");
+        assert!(
+            !diagnostic.to_ascii_lowercase().contains("invalid settings"),
+            "Claude doctor rejected generate_operation_settings output:\n{diagnostic}",
+        );
+        assert!(
+            output.status.success(),
+            "Claude doctor failed with {}:\n{diagnostic}",
+            output.status,
+        );
+        assert!(
+            diagnostic.contains("Claude Code doctor"),
+            "Claude doctor did not report a completed check:\n{diagnostic}",
+        );
+    }
 
     #[test]
     fn unsigned_requires_an_explicit_argument_on_compose_or_validate() {
