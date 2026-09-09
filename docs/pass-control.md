@@ -56,8 +56,16 @@ operator-owned `roles/<role>.settings.json`, an answer still receives
 Ostrom never edits or composes over that operator-owned file.
 
 For a derived profile, the pass writes per-run settings and MCP configuration
-under its run directory before spawning Claude. Settings contain exactly the
-policy renderer's profile, without a hooks block. The MCP config registers
+under its run directory before spawning Claude. Settings contain the policy
+renderer's profile, without a hooks block, except for one override: the bridge
+sets `permissions.defaultMode` to `default` where the renderer emits `dontAsk`.
+Measured against Claude Code 2.1.265, an ungranted call under `dontAsk` is
+refused before the permission-prompt tool is ever consulted — there would be
+nothing for this bridge to receive — while `default` is the mode that reaches
+the tool for exactly that call. This override applies only to the bridged,
+per-run settings; an unbridged operator-owned or generated profile keeps
+`dontAsk`, which stays correct there because a prompt with nobody to answer it
+should be denied. The MCP config registers
 `ostrom permission-server --channel <private-path>` as `ostrom_permission` and
 sets its per-server `timeout` in milliseconds. Claude receives `--mcp-config`,
 `--strict-mcp-config`, `--permission-prompts host`, and
@@ -74,12 +82,22 @@ single `approve` tool. Claude sends `tool_name`, `input`, and `tool_use_id`;
 the response is one MCP text content block containing a JSON allow/deny object.
 An allow returns the original input in `updatedInput`.
 
-When Claude requests permission for a granted call, the handler asks the runner
-to emit `decision.requested` through its existing sink, then waits for an answer.
-The bridge does not add prompts to already preapproved calls. It supports the
-renderer’s `Bash(ostrom <operation> *)` grants, conservatively requiring an
-`ostrom` command with plain arguments. Shell syntax, quoted arguments, and tools
-outside those grants are denied.
+A call the actor's grants permit is auto-allowed by Claude itself under
+`default` mode before the permission-prompt tool is ever consulted, so
+unattended operation is unaffected: the grants that already authorize an
+operation keep authorizing it without a principal in the loop. The bridge
+independently re-checks the rendered `Bash(ostrom <operation> *)` grants,
+conservatively requiring an `ostrom` command with plain arguments, and treats
+a call its own check finds granted as belt-and-braces — it should not
+normally arrive at all — and auto-allows it rather than escalating.
+
+A call the grants do not permit is exactly what reaches the permission-prompt
+tool. For that call, the handler asks the runner to emit `decision.requested`
+through its existing sink, then waits for an answer: this becomes a decision
+the principal answers, not an unattended denial. Shell syntax and quoted
+arguments the bridge's conservative check cannot recognize as a rendered
+grant fall into the same path. An unanswered decision expires and denies, as
+below.
 
 A decision offers `allow` and `deny`, sets `expiresAt` to its deadline, and sets
 ethogram's decision-level `onTimeout` to `deny`. Its wait is 30 seconds. The

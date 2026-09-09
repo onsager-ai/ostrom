@@ -210,7 +210,7 @@ impl PermissionBridge {
         derived: &str,
         executable: &Path,
     ) -> io::Result<Self> {
-        let profile: Value = serde_json::from_str(derived)?;
+        let mut profile: Value = serde_json::from_str(derived)?;
         let allow = profile["permissions"]["allow"]
             .as_array()
             .ok_or_else(|| invalid("derived permissions.allow is absent"))?
@@ -225,6 +225,16 @@ impl PermissionBridge {
         if allow.iter().any(|rule| operation(rule).is_none()) {
             return Err(invalid("unsupported derived permission rule"));
         }
+        // Measured against Claude Code 2.1.265: under `defaultMode: "dontAsk"` (the
+        // generated profile's unbridged mode), an ungranted call is refused before the
+        // permission-prompt tool is ever consulted -- there is nothing for this bridge
+        // to receive. Only `"default"` reaches the tool for an ungranted call, which is
+        // exactly the case this bridge exists to turn into `decision.requested`. A
+        // granted call still never reaches the tool: the rendered allow rule matches it
+        // first. This override is the bridged case only; the unbridged profile keeps
+        // `dontAsk`, which is correct there because a prompt with nobody to answer it
+        // should be denied.
+        profile["permissions"]["defaultMode"] = json!("default");
         let directory = tempfile::Builder::new()
             .prefix("permission-")
             .rand_bytes(24)
@@ -343,17 +353,28 @@ impl PermissionBridge {
                     }
                     self.processed.insert(sequence);
                     let id = request.tool_use_id.clone();
-                    if !granted(&self.allow, &request.input) {
+                    if granted(&self.allow, &request.input) {
+                        // A call the rendered allow rule permits is auto-allowed by
+                        // Claude itself before the permission-prompt tool is ever
+                        // consulted (measured, Claude Code 2.1.265: `defaultMode:
+                        // "default"` plus a matching allow rule never reaches the
+                        // tool), so a granted request should not normally arrive
+                        // here at all. Treat its arrival as belt-and-braces and
+                        // auto-allow rather than escalate a call the actor's own
+                        // grants already permit.
                         let _ = publish(
                             self.directory.path(),
                             &member("reply", &id),
                             &Reply {
                                 tool_use_id: id.clone(),
-                                option: "deny".to_owned(),
+                                option: "allow".to_owned(),
                             },
                         );
                         continue;
                     }
+                    // Ungranted: this is exactly the call `defaultMode: "default"`
+                    // forwards to the permission-prompt tool. Turn it into a decision
+                    // the principal can answer instead of denying it unattended.
                     let draft = requested(&id, &request);
                     events.append(draft)?;
                     self.pending.insert(
@@ -831,7 +852,12 @@ mod tests {
             let bridge = PermissionBridge::create(
                 &paths.runs_dir().join("permission-test"),
                 "permission-test",
-                r#"{"permissions":{"defaultMode":"dontAsk","allow":["Bash(ostrom build *)"]}}"#,
+                // The default input() command ("ostrom build item") is deliberately
+                // outside this allow list, so it is ungranted and drives the
+                // decision.requested flow most tests exercise. A dedicated grant
+                // ("deploy") lets a separate test exercise the granted, auto-allowed
+                // path without contaminating the ungranted default.
+                r#"{"permissions":{"defaultMode":"dontAsk","allow":["Bash(ostrom deploy *)"]}}"#,
                 Path::new("/tmp/ostrom 'quoted' executable"),
             )
             .unwrap();
@@ -1340,31 +1366,71 @@ mod tests {
     }
 
     #[test]
-    fn ungranted_tools_and_shell_syntax_are_denied_without_interrupting() {
+    fn ungranted_tools_and_shell_syntax_raise_a_decision_instead_of_denying_outright() {
+        // The gate inverted (ostrom#528): under the bridged profile's
+        // `defaultMode: "default"`, a call the rendered allow rule does not cover
+        // is exactly what reaches the permission-prompt tool (measured, Claude
+        // Code 2.1.265), so it becomes a decision the principal can answer rather
+        // than an unattended, immediate denial.
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         for value in [
             json!({"tool_use_id": "toolu_test", "tool_name": "Write", "input": {}}),
             json!({"tool_use_id": "toolu_test", "tool_name": "Bash", "input": {"command": "ostrom other item"}}),
-            json!({"tool_use_id": "toolu_test", "tool_name": "Bash", "input": {"command": "ostrom build item; rm something"}}),
+            json!({"tool_use_id": "toolu_test", "tool_name": "Bash", "input": {"command": "ostrom deploy item; rm something"}}),
         ] {
             let mut f = Fixture::new();
             let handle = f.start_handler(value, Duration::from_secs(2));
-            let until = Instant::now() + Duration::from_secs(1);
-            while !handle.is_finished() {
-                f.poll();
-                assert!(
-                    Instant::now() < until,
-                    "ungranted call was not promptly denied"
-                );
-                thread::sleep(POLL);
-            }
+            let id = f.wait_request();
+            assert_eq!(id, "toolu_test");
+            f.answer(&id, "deny");
             assert_denied(&handle.join().unwrap());
-            assert!(
-                !f.wire()
+            f.poll();
+            assert_eq!(
+                f.wire()
                     .iter()
-                    .any(|e| e.event_type == ethogram::DECISION_REQUESTED)
+                    .filter(|e| e.event_type == ethogram::DECISION_REQUESTED)
+                    .count(),
+                1,
+                "ungranted call did not raise exactly one decision"
             );
         }
+    }
+
+    #[test]
+    fn granted_calls_are_auto_allowed_without_escalation() {
+        // A call the rendered allow rule permits is auto-allowed by Claude itself
+        // before the permission-prompt tool is ever consulted, so it should not
+        // normally reach this bridge at all. If it does, this is the
+        // belt-and-braces path: allow it promptly, and never raise a decision.
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let mut f = Fixture::new();
+        let granted = json!({"tool_use_id": "toolu_test", "tool_name": "Bash", "input": {"command": "ostrom deploy item"}});
+        let handle = f.start_handler(granted, Duration::from_secs(2));
+        let until = Instant::now() + Duration::from_secs(1);
+        while !handle.is_finished() {
+            f.poll();
+            assert!(
+                Instant::now() < until,
+                "granted call was not promptly auto-allowed"
+            );
+            thread::sleep(POLL);
+        }
+        let output = handle.join().unwrap();
+        assert_eq!(
+            output["behavior"], "allow",
+            "granted call was not auto-allowed"
+        );
+        assert!(
+            f.bridge.pending.is_empty(),
+            "granted call was escalated into a pending decision"
+        );
+        f.poll();
+        assert!(
+            !f.wire()
+                .iter()
+                .any(|e| e.event_type == ethogram::DECISION_REQUESTED),
+            "granted call raised a decision instead of auto-allowing"
+        );
     }
 
     #[test]
@@ -1455,7 +1521,12 @@ mod tests {
         let settings: Value = read(f.bridge.settings_path()).unwrap();
         assert_eq!(
             settings,
-            json!({"permissions":{"defaultMode":"dontAsk","allow":["Bash(ostrom build *)"]}})
+            // `create()` overrides `defaultMode` to `"default"` for the bridged
+            // profile: under the generated profile's `"dontAsk"`, an ungranted call
+            // is refused before the permission-prompt tool is ever consulted
+            // (measured, Claude Code 2.1.265), so this bridge would never receive a
+            // request to turn into `decision.requested`.
+            json!({"permissions":{"defaultMode":"default","allow":["Bash(ostrom deploy *)"]}})
         );
         assert!(f.root.path().exists());
     }

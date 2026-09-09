@@ -3469,9 +3469,24 @@ mod tests {
             &std::env::current_exe().unwrap(),
         )
         .expect("create real per-run bridge settings");
+        // The unbridged generated profile keeps `dontAsk`; the bridge overrides its
+        // own rendered copy to `default` (ostrom#528) since an ungranted call under
+        // `dontAsk` never reaches the permission-prompt tool. Both must still agree
+        // with `doctor` below.
+        let generated: serde_json::Value =
+            serde_json::from_str(&rendered).expect("generated settings parse");
+        assert_eq!(generated["permissions"]["defaultMode"], "dontAsk");
+        let bridged: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(bridge.settings_path()).unwrap())
+                .expect("bridged settings parse");
+        assert_eq!(bridged["permissions"]["defaultMode"], "default");
         for settings in [&settings, &bridge.settings_path().to_owned()] {
             // Doctor validates settings without a trust prompt or an API call.
             // Isolate local settings and disable background telemetry/update traffic.
+            // The second iteration validates the rendered bridged settings
+            // (`defaultMode: "default"`) together with the bridge's `mcpServers`
+            // carrier, exactly as the first iteration validates the unbridged
+            // generated profile.
             let output = std::process::Command::new(&claude)
                 .arg("--settings")
                 .arg(settings)

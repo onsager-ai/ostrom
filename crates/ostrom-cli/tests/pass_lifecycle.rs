@@ -2310,7 +2310,14 @@ fn bridge_policy(fixture: &Fixture) -> PathBuf {
 
 // A simulated Claude process invokes the actual ostrom MCP server from the rendered MCP config.
 // This integration fixture is not the real Claude exchange required for the protocol corpus.
-const BRIDGE_HARNESS: &str = r#"
+// The simulated call's command is templated: real Claude only ever reaches this tool for a
+// call its own grant evaluation did not auto-allow, so tests choose whether the templated
+// call is granted or not to exercise the auto-allow path or the decision path.
+fn bridge_harness(command: &str) -> String {
+    BRIDGE_HARNESS_TEMPLATE.replace("__OSTROM_BRIDGE_COMMAND__", command)
+}
+
+const BRIDGE_HARNESS_TEMPLATE: &str = r#"
 # Keep the stdin the pass gave us on fd 9: the heredoc below replaces fd 0.
 exec 9<&0
 python3 - "$@" <<'PY'
@@ -2331,12 +2338,16 @@ state = pathlib.Path(os.environ['OSTROM_HOME'])
 profile = json.loads(settings.read_text())
 (state / 'bridge-settings.json').write_text(json.dumps(profile))
 assert 'hooks' not in profile
+# ostrom#528: the bridged profile overrides defaultMode to "default". Under the
+# generated "dontAsk", an ungranted call is refused before this tool is ever
+# consulted (measured, Claude Code 2.1.265), so real Claude would never reach it.
+assert profile['permissions']['defaultMode'] == 'default'
 assert '--strict-mcp-config' in args
 assert args[args.index('--permission-prompts') + 1] == 'host'
 mcp = json.loads(pathlib.Path(args[args.index('--mcp-config') + 1]).read_text())
 server_name, server = next(iter(mcp['mcpServers'].items()))
 assert args[args.index('--permission-prompt-tool') + 1] == 'mcp__' + server_name + '__approve'
-request = {'tool_use_id': 'toolu_fixture', 'tool_name': 'Bash', 'input': {'command': 'ostrom build-pass sample'}}
+request = {'tool_use_id': 'toolu_fixture', 'tool_name': 'Bash', 'input': {'command': '__OSTROM_BRIDGE_COMMAND__'}}
 messages = [
     {'jsonrpc':'2.0', 'id':0, 'method':'initialize', 'params':{'protocolVersion':'2025-11-25'}},
     {'jsonrpc':'2.0', 'method':'notifications/initialized'},
@@ -2355,7 +2366,10 @@ PY
 
 #[test]
 fn permission_answer_crosses_fd_four_and_releases_the_real_mcp_process() {
-    let fixture = Fixture::new(BRIDGE_HARNESS);
+    // Deliberately outside the rendered grant (which covers only "build-pass"): a
+    // granted call is auto-allowed by real Claude before this tool is ever
+    // consulted, so a call reaching the tool at all is, by construction, ungranted.
+    let fixture = Fixture::new(&bridge_harness("ostrom other-pass sample"));
     let keys = bridge_policy(&fixture);
     let mut command = Command::new("sh");
     command
@@ -2442,10 +2456,44 @@ fn permission_answer_crosses_fd_four_and_releases_the_real_mcp_process() {
 }
 
 #[test]
+fn granted_call_is_auto_allowed_without_a_decision_across_the_real_mcp_process() {
+    // The rendered grant covers "build-pass": real Claude auto-allows this call
+    // under the bridged profile's `defaultMode: "default"` before ever
+    // consulting the permission-prompt tool. If it arrives here anyway (this
+    // fixture drives the tool directly, unlike real Claude), ostrom's own
+    // belt-and-braces check must still allow it promptly and never raise a
+    // decision for the principal.
+    let fixture = Fixture::new(&bridge_harness("ostrom build-pass sample"));
+    let keys = bridge_policy(&fixture);
+    let output = fixture
+        .command()
+        .env("OSTROM_POLICY_TRUSTED_KEYS", keys)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let hook: Value =
+        serde_json::from_slice(&fs::read(fixture.state.join("permission-output.json")).unwrap())
+            .unwrap();
+    assert_eq!(hook["behavior"], "allow");
+    assert!(
+        !fixture
+            .run_events()
+            .iter()
+            .any(|e| e["type"] == "decision.requested"),
+        "a granted call raised a decision instead of auto-allowing"
+    );
+}
+
+#[test]
 fn permission_channel_is_removed_on_interrupt_and_harness_failure() {
     for interrupt in [true, false] {
+        let harness = bridge_harness("ostrom other-pass sample");
         let fixture = Fixture::new(if interrupt {
-            BRIDGE_HARNESS
+            &harness
         } else {
             "printf '%s' \"$3\" >\"$OSTROM_HOME/settings-path\"; exit 19"
         });
