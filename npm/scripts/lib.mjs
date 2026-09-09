@@ -1,8 +1,15 @@
+import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
+
+// Defaults for the platform-propagation wait: 40 attempts at 15s apart is ten
+// minutes, up from the 20 (five minutes) that the v0.13.0 release run
+// outlasted, leaving its launcher unpublished.
+export const PLATFORM_WAIT_ATTEMPTS = 40;
+export const PLATFORM_WAIT_DELAY_MS = 15000;
 
 export const ROOT = resolve(here, '..', '..');
 export const config = JSON.parse(
@@ -76,4 +83,31 @@ export function argValue(args, flag, fallback) {
     throw new Error(`${flag} requires a value`);
   }
   return value;
+}
+
+function defaultView(packageName, version) {
+  return execFileSync(
+    'npm',
+    ['view', `${packageName}@${version}`, 'version'],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
+  ).trim();
+}
+
+// Whether <packageName>@<version> is already on the registry. `view` defaults
+// to a real `npm view` call and throws on any npm failure (E404, auth,
+// network); a caller may inject a fake for tests.
+//
+// The true/false split here is deliberately asymmetric: this returns `true`
+// only on positive evidence (the view succeeded and its output is exactly
+// `version`), and `false` for every other outcome, thrown errors included. A
+// false `true` would silently skip publishing a version that was never
+// actually published — the exact failure this function exists to prevent. A
+// false `false` only causes a redundant publish attempt, which then fails
+// loudly on its own if the version really is already there.
+export function registryHasVersion(packageName, version, view = defaultView) {
+  try {
+    return view(packageName, version) === version;
+  } catch {
+    return false;
+  }
 }
