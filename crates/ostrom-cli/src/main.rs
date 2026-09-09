@@ -29,22 +29,20 @@ use ostrom_store::{
     AgentRegistry, AssessmentHarness, AuditOptions, Clock, CodexHarness, DigestOptions,
     DispatchOutcome, DispatchRequest, ExecutableAssessmentDeriver, GateError, GateOptions,
     HarnessAssessmentDeriver, ImplementRequest, JsonlCheckStore, JsonlPublicationSource,
-    MigrationOutcome, OrchestratorRunRequest, OstromPaths, PASS_KILL_GRACE_MS, PassRequest,
-    PassRole, PlanOptions, PublishDestination, PublishTarget, QueueDecision, ReplayOptions,
-    RunOutcome, RunRequest, SelectAction, SelectError, SelectOutcome, SelectRequest, SignalFlags,
-    SweepError, SweepMode, SweepOptions, SweepParityOptions, TraceAppend, TraceView,
-    UnavailableAssessmentDeriver, acquire_lease, answer_queue_decision, append_trace_checked,
-    audit, branch_name, clear_work_order, create_work_order, credential_output, decide_queue_item,
-    encode_org_snapshots_with_faults, encode_selection, environment, finalize_exited_implementer,
-    grant_excuse, grant_excuse_at_head, item_hash, lease_status, lint_queue_state, list_excuses,
-    list_queue_json, local_drift, migrate, read_trace_json, release_lease, render_constitution,
-    render_digest, replay, revoke_excuse, run_dispatch_with_registry, run_gate,
-    run_implement_with_registry, run_pass, run_plan, run_repair_prs, run_selection,
-    run_sweep_parity, run_sweep_with_publication_source, validate_lease_name,
+    OrchestratorRunRequest, OstromPaths, PASS_KILL_GRACE_MS, PassRequest, PassRole, PlanOptions,
+    PublishDestination, PublishTarget, QueueDecision, ReplayOptions, RunOutcome, RunRequest,
+    SelectAction, SelectError, SelectOutcome, SelectRequest, SignalFlags, SweepError, SweepMode,
+    SweepOptions, TraceAppend, TraceView, UnavailableAssessmentDeriver, acquire_lease,
+    answer_queue_decision, append_trace_checked, audit, branch_name, clear_work_order,
+    create_work_order, credential_output, decide_queue_item, encode_org_snapshots_with_faults,
+    encode_selection, environment, finalize_exited_implementer, grant_excuse, grant_excuse_at_head,
+    item_hash, lease_status, lint_queue_state, list_excuses, list_queue_json, local_drift,
+    read_trace_json, release_lease, render_constitution, render_digest, replay, revoke_excuse,
+    run_dispatch_with_registry, run_gate, run_implement_with_registry, run_pass, run_plan,
+    run_repair_prs, run_selection, run_sweep_with_publication_source, validate_lease_name,
     validate_work_order_file,
 };
 
-mod cutover_replay;
 mod loop_presets;
 mod loop_supervisor;
 mod operation_dispatch;
@@ -310,12 +308,7 @@ enum Command {
         force: bool,
     },
     /// Move legacy Claude-hosted data to XDG config and state roots.
-    Migrate,
     /// Compare native output with recorded legacy evidence in scratch state.
-    Parity {
-        #[command(subcommand)]
-        command: ParityCommand,
-    },
     /// Reconcile the governed GitHub roster into the private queue.
     Sweep {
         /// Force full/incremental acquisition or select automatically.
@@ -516,40 +509,6 @@ enum WorkOrderCommand {
     BranchName { item_id: String },
     /// Append work-failed for one named stranded order.
     Clear { identifier: String },
-}
-
-#[derive(Debug, Subcommand)]
-enum ParityCommand {
-    /// Compare native sweep rows with recorded shell rows by id and field.
-    Sweep {
-        /// The clock used when the shell evidence was recorded.
-        #[arg(long)]
-        started_at: Option<String>,
-        /// Recorded GitHub responses matching the shell evidence.
-        #[arg(long)]
-        fixture: PathBuf,
-        /// Queue bytes recorded from the retired shell implementation.
-        #[arg(long)]
-        recorded_queue: PathBuf,
-    },
-    /// Produce all three empty-diff gates for the one-step policy cutover.
-    Cutover {
-        /// Directory containing the legacy policy and loop surfaces.
-        #[arg(long)]
-        legacy: PathBuf,
-        /// Explicit composed manifest to compare with the legacy surfaces.
-        #[arg(long)]
-        manifest: PathBuf,
-        /// Previously frozen acquisition to replay without live GitHub reads.
-        #[arg(long, conflicts_with = "snapshot_output")]
-        snapshot: Option<PathBuf>,
-        /// Capture one live acquisition here before evaluating either policy.
-        #[arg(long, conflicts_with = "snapshot")]
-        snapshot_output: Option<PathBuf>,
-        /// Observation clock shared by acquisition and both evaluations.
-        #[arg(long)]
-        started_at: Option<String>,
-    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -1069,96 +1028,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::WorkOrder { command } => run_work_order_command(&paths, command, &clock)?,
         Command::Init { force } => {
             run_init(&paths, force)?;
-        }
-        Command::Migrate => {
-            let legacy = legacy_home()?;
-            match migrate(&legacy, &paths, clock.epoch_seconds())? {
-                MigrationOutcome::Migrated => println!(
-                    "migrated Ostrom config to {} and state to {}; legacy pointer retained at {}",
-                    paths.config.display(),
-                    paths.state.display(),
-                    legacy.display()
-                ),
-                MigrationOutcome::AlreadyMigrated => {
-                    println!("Ostrom state is already migrated; legacy pointer is unchanged")
-                }
-                MigrationOutcome::NothingToMigrate => {
-                    println!("no legacy Ostrom state exists; nothing to migrate")
-                }
-            }
-        }
-        Command::Parity {
-            command:
-                ParityCommand::Sweep {
-                    started_at,
-                    fixture,
-                    recorded_queue,
-                },
-        } => {
-            let started_at = resolve_started_at(started_at.as_deref(), &clock)?;
-            let cwd = env::current_dir()?;
-            let executable = env::current_exe()?;
-            let plugin_root = environment::OSTROM_PLUGIN_ROOT
-                .value_os()
-                .map_or_else(|| cwd.join("crates/ostrom-store/assets"), PathBuf::from);
-            let options = SweepParityOptions::from_environment(
-                cwd,
-                executable,
-                plugin_root,
-                started_at,
-                fixture,
-                recorded_queue,
-            )?;
-            let outcome = run_sweep_parity(&options)?;
-            if outcome.differences.is_empty() {
-                println!(
-                    "parity sweep: zero divergences across {} row(s)",
-                    outcome.row_count
-                );
-            } else {
-                for (field, ids) in &outcome.differences {
-                    println!(
-                        "parity sweep: {field} differs on {} row(s): {}",
-                        ids.len(),
-                        ids.join(", ")
-                    );
-                }
-                std::process::exit(1);
-            }
-        }
-        Command::Parity {
-            command:
-                ParityCommand::Cutover {
-                    legacy,
-                    manifest,
-                    snapshot,
-                    snapshot_output,
-                    started_at,
-                },
-        } => {
-            let started_at = resolve_started_at(started_at.as_deref(), &clock)?;
-            let cwd = env::current_dir()?;
-            let plugin_root = environment::OSTROM_PLUGIN_ROOT
-                .value_os()
-                .map_or_else(|| cwd.join("crates/ostrom-store/assets"), PathBuf::from);
-            let options = cutover_replay::CutoverReplayOptions {
-                scratch_root: cutover_replay::scratch_home_from_environment()?,
-                legacy,
-                manifest,
-                snapshot,
-                snapshot_output,
-                executable: env::current_exe()?,
-                plugin_root,
-                started_at,
-            };
-            match cutover_replay::run(&options) {
-                Ok(output) => io::stdout().write_all(output.as_bytes())?,
-                Err(cutover_replay::CutoverReplayError::NonEmpty(output)) => {
-                    io::stdout().write_all(output.as_bytes())?;
-                    std::process::exit(1);
-                }
-                Err(error) => return Err(error.into()),
-            }
         }
         Command::Sweep {
             mode,
@@ -3427,17 +3296,6 @@ fn parse_started_at(value: &str, source: &str) -> Result<DateTime<Utc>, io::Erro
                 format!("{source} is not a valid RFC3339 instant: {error}"),
             )
         })
-}
-
-fn legacy_home() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    // The override exists for hermetic operator rehearsals. Tests call the
-    // migration library with explicit temporary paths and never resolve this
-    // default, which is the live directory the task forbids the suite to read.
-    if let Some(path) = environment::OSTROM_LEGACY_HOME.value_os() {
-        return Ok(PathBuf::from(path));
-    }
-    let base = BaseDirs::new().ok_or("could not resolve the legacy home directory")?;
-    Ok(base.home_dir().join(".claude/ostrom"))
 }
 
 #[cfg(test)]
