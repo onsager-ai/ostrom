@@ -2311,8 +2311,19 @@ fn bridge_policy(fixture: &Fixture) -> PathBuf {
 // A simulated Claude process invokes the actual ostrom MCP server from the rendered MCP config.
 // This integration fixture is not the real Claude exchange required for the protocol corpus.
 const BRIDGE_HARNESS: &str = r#"
+# Keep the stdin the pass gave us on fd 9: the heredoc below replaces fd 0.
+exec 9<&0
 python3 - "$@" <<'PY'
 import json, os, pathlib, subprocess, sys, time
+# Real Claude drains its inherited stdin to EOF even when the prompt is an
+# argument, so an inherited stdin lets the harness eat the principal's answer
+# off the control descriptor -- a dup of fd 0 under docs/pass-control.md.
+# Reading here would only race ostrom's reader and the race is not the point:
+# assert the pass gave us no stdin to eat. Fails at once if it ever does.
+import stat as _stat
+_in = os.fstat(9)
+assert _stat.S_ISCHR(_in.st_mode) and _in.st_rdev == os.stat('/dev/null').st_rdev, \
+    'the harness must be spawned with a null stdin, not the control descriptor'
 args = sys.argv[1:]
 settings = pathlib.Path(args[args.index('--settings') + 1])
 state = pathlib.Path(os.environ['OSTROM_HOME'])

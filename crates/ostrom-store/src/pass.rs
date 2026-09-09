@@ -682,6 +682,13 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
             MAX_TURNS,
             &request.prompt,
         ])
+        // The harness reads its inherited stdin to EOF even when the prompt
+        // is an argument, and a supervisor that follows docs/pass-control.md
+        // hands us the control descriptor as a dup of fd 0 -- so an inherited
+        // stdin lets the harness eat the principal's answer, racing our own
+        // reader for it. Three of five real passes lost their control that
+        // way (#528). The pass never writes to the harness's stdin.
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::from(error_output));
     if let Some(bridge) = &guard.permission_bridge {
