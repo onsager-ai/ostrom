@@ -207,11 +207,6 @@ pub const OSTROM_HOME: EnvironmentVariable = variable(
     EnvironmentClass::Location,
     "platform config and state directories",
 );
-pub const OSTROM_LEGACY_HOME: EnvironmentVariable = variable(
-    "OSTROM_LEGACY_HOME",
-    EnvironmentClass::Location,
-    "$CLAUDE_CONFIG_DIR/ostrom",
-);
 pub const OSTROM_NODE_FALLBACKS: EnvironmentVariable = variable(
     "OSTROM_NODE_FALLBACKS",
     EnvironmentClass::Location,
@@ -300,7 +295,6 @@ pub const ENVIRONMENT_VARIABLES: &[EnvironmentVariable] = &[
     OSTROM_EVENTS_FD,
     OSTROM_FACTS_ONLY,
     OSTROM_HOME,
-    OSTROM_LEGACY_HOME,
     OSTROM_NODE_FALLBACKS,
     OSTROM_PLAN_DERIVER,
     OSTROM_PLUGIN_ROOT,

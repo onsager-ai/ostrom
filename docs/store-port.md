@@ -22,7 +22,8 @@ but narration cannot cross the public store port.
 The repository ships one implementation, `ostrom-store::JsonlSweepStore`. It
 uses compact, newline-terminated JSONL in the resolved XDG state directory and
 retains the Bash tools’ byte discipline. Its compatibility queue reader is
-covered by the Rust/Bash byte-parity integration test. Store selection remains
+covered by `legacy_row_without_item_type_remains_dispatchable` in
+`ostrom-store::selection`. Store selection remains
 part of the same typed configuration that selected the sweep inputs; the
 existing scratch-config guard is evaluated before any configured publish
 destination is contacted.
