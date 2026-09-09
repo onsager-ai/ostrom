@@ -44,11 +44,15 @@ originated downstream, restate it; do not cite its home.
 **4. Actors are data; the binary hardcodes no actor set.** `builder` and `gatekeeper` are one
 operator's configuration, not architecture. Which actors exist, what each does, and how each runs
 are answers the manifest gives. Reintroducing a fixed set as spec framing — "the builder pass" —
-moves the hardcoding rather than removing it.
+moves the hardcoding rather than removing it. This is the standard a change is held to, not a
+description of the binary today: the fixed role enums are still here, and #537 records where.
 
-<!-- Source: #447 and #450, which deleted PassRole, CliPassRole and DeliveryRole. Preconditions:
-     assumes the manifest can express every actor property the binary needs. Invalid if some
-     property genuinely cannot be declared, which is a reason to extend the manifest. -->
+<!-- Source: #447 and #450, which specify deleting PassRole, CliPassRole and DeliveryRole. Both
+     are open and neither has been implemented: the three enums are live at
+     crates/ostrom-store/src/pass.rs:70, crates/ostrom-cli/src/main.rs:615 and
+     crates/ostrom-checks/src/doctor.rs:1481 (#537). Preconditions: assumes the manifest can
+     express every actor property the binary needs. Invalid if some property genuinely cannot be
+     declared, which is a reason to extend the manifest. -->
 
 **5. A refusal is distinguishable from a success.** Anything a scheduler reads must tell "it
 refused" apart from "it ran and succeeded" — exit status first, then the recorded fact. A silent
@@ -94,7 +98,8 @@ consumed as evidence.
 `ostrom pass <name>` is invoked as a child process by a scheduler — the units `ostrom up` generates
 locally, or any other. These are frozen and change only by a spec that both sides carry:
 
-- the argv shape `ostrom pass <actor> [<operation>]`
+- the argv shape `ostrom pass <role>` — today a fixed `builder | gatekeeper`; the open
+  `ostrom pass <actor> [<operation>]` form is #447's intent, not the code (#537)
 - the `<name>-pass-id` and `<name>-wake-counter` identity files: 8 lowercase hex, unsigned integer
 - the `<name>-dispatchability-hash` file: 64 hex
 - the `pass-ended` fact in `sprint.jsonl`
