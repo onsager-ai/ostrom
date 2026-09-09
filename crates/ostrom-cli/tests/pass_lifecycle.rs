@@ -2245,7 +2245,7 @@ fn bridge_policy(fixture: &Fixture) -> PathBuf {
     support::sign_manifest(&manifest)
 }
 
-// A simulated Claude process invokes the actual ostrom hook command from the actual settings.
+// A simulated Claude process invokes the actual ostrom MCP server from the rendered MCP config.
 // This integration fixture is not the real Claude exchange required for the protocol corpus.
 const BRIDGE_HARNESS: &str = r#"
 python3 - "$@" <<'PY'
@@ -2256,16 +2256,31 @@ state = pathlib.Path(os.environ['OSTROM_HOME'])
 (state / 'settings-path').write_text(str(settings))
 profile = json.loads(settings.read_text())
 (state / 'bridge-settings.json').write_text(json.dumps(profile))
-handler = profile['hooks']['PermissionRequest'][0]['hooks'][0]
-request = {'hook_event_name': 'PermissionRequest', 'tool_name': 'Bash', 'tool_input': {'command': 'ostrom build-pass sample'}}
-result = subprocess.run(handler['command'], shell=True, input=json.dumps(request), text=True, capture_output=True, timeout=handler['timeout'])
-(state / 'hook-output.json').write_text(result.stdout)
+assert 'hooks' not in profile
+assert '--strict-mcp-config' in args
+assert args[args.index('--permission-prompts') + 1] == 'host'
+mcp = json.loads(pathlib.Path(args[args.index('--mcp-config') + 1]).read_text())
+server_name, server = next(iter(mcp['mcpServers'].items()))
+assert args[args.index('--permission-prompt-tool') + 1] == 'mcp__' + server_name + '__approve'
+request = {'tool_use_id': 'toolu_fixture', 'tool_name': 'Bash', 'input': {'command': 'ostrom build-pass sample'}}
+messages = [
+    {'jsonrpc':'2.0', 'id':0, 'method':'initialize', 'params':{'protocolVersion':'2025-11-25'}},
+    {'jsonrpc':'2.0', 'method':'notifications/initialized'},
+    {'jsonrpc':'2.0', 'id':1, 'method':'tools/list'},
+    {'jsonrpc':'2.0', 'id':2, 'method':'tools/call', 'params':{'name':'approve', 'arguments':request}},
+]
+result = subprocess.run([server['command'], *server['args']], input=''.join(json.dumps(m) + '\n' for m in messages), text=True, capture_output=True, timeout=server['timeout']/1000)
+assert result.returncode == 0, result.stderr
+replies = [json.loads(line) for line in result.stdout.splitlines()]
+assert [r['id'] for r in replies] == [0,1,2]
+assert replies[1]['result']['tools'][0]['name'] == 'approve'
+(state / 'permission-output.json').write_text(replies[2]['result']['content'][0]['text'])
 print(json.dumps({'type':'result', 'subtype':'success', 'session_id':'bridge-fixture', 'duration_ms':1, 'num_turns':1, 'total_cost_usd':0}))
 PY
 "#;
 
 #[test]
-fn permission_answer_crosses_fd_four_and_releases_the_real_hook_process() {
+fn permission_answer_crosses_fd_four_and_releases_the_real_mcp_process() {
     let fixture = Fixture::new(BRIDGE_HARNESS);
     let keys = bridge_policy(&fixture);
     let mut command = Command::new("sh");
@@ -2316,8 +2331,9 @@ fn permission_answer_crosses_fd_four_and_releases_the_real_hook_process() {
         "the event descriptor and durable sink must agree"
     );
     let hook: Value =
-        serde_json::from_slice(&fs::read(fixture.state.join("hook-output.json")).unwrap()).unwrap();
-    assert_eq!(hook["hookSpecificOutput"]["decision"]["behavior"], "allow");
+        serde_json::from_slice(&fs::read(fixture.state.join("permission-output.json")).unwrap())
+            .unwrap();
+    assert_eq!(hook["behavior"], "allow");
     let events = fixture.run_events();
     let answered = events
         .iter()

@@ -684,6 +684,9 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::from(error_output));
+    if let Some(bridge) = &guard.permission_bridge {
+        bridge.configure(&mut command);
+    }
     set_process_group(&mut command);
     let mut child = command.spawn().map_err(|error| {
         PassError::failed(request.role, format!("could not start Claude: {error}"), 1)

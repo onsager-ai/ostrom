@@ -3,7 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
-    io::{self, Read, Write},
+    io::{self, BufRead, Read, Write},
     path::{Path, PathBuf},
     thread,
     time::{Duration, Instant},
@@ -22,15 +22,15 @@ use tempfile::{NamedTempFile, TempDir};
 
 use crate::RunEventGuard;
 
-// Claude Code 2.1.265, inspected as embedded JavaScript in the installed binary:
-// PermissionRequest awaits the synchronous hook (184985466, 187934000); the
-// command timeout is seconds (178974691) and starts before spawn (187965069).
-// Cancellation returns before parsing output (187972070). The hook itself must
-// emit the decision object before then; decision-level onTimeout is ethogram policy.
+// Tripwire against Claude Code 2.1.265: the step-1 probe's 90 s stalled MCP
+// permission call was honoured, so no bound shorter than that was in force.
+// A bound above 90 s was never measured. The design depends only on our wait;
+// we explicitly set the per-server tool-call timeout in the rendered MCP config.
 const WAIT_SECONDS: u64 = 30;
-// Leave time for the hook's own denial to be read before Claude cancels the handler.
 const HANDLER_MARGIN_SECONDS: u64 = 5;
-const HANDLER_SECONDS: u64 = WAIT_SECONDS + HANDLER_MARGIN_SECONDS;
+const HANDLER_TIMEOUT_MS: u64 = (WAIT_SECONDS + HANDLER_MARGIN_SECONDS) * 1000;
+const MCP_SERVER: &str = "ostrom_permission";
+const MCP_TOOL: &str = "approve";
 const POLL: Duration = Duration::from_millis(10);
 const MAX_TRANSPORT_BYTES: u64 = 1_048_576;
 
@@ -44,6 +44,7 @@ struct Channel {
 #[serde(deny_unknown_fields)]
 struct Request {
     sequence: u64,
+    tool_use_id: String,
     expires_at: DateTime<Utc>,
     input: Value,
 }
@@ -51,14 +52,14 @@ struct Request {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Reply {
-    sequence: u64,
+    tool_use_id: String,
     option: String,
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Receipt {
-    sequence: u64,
+    tool_use_id: String,
     option: String,
     timeout: bool,
 }
@@ -75,6 +76,7 @@ pub struct PermissionBridge {
     channel: PathBuf,
     identity: File,
     settings: PathBuf,
+    mcp_config: PathBuf,
     allow: Vec<String>,
     pending: BTreeMap<String, Pending>,
     processed: BTreeSet<u64>,
@@ -183,20 +185,20 @@ fn same_channel(path: &Path, identity: &File) -> io::Result<()> {
     Ok(())
 }
 
-fn decision_id(channel: &Path, sequence: u64) -> String {
-    // Correlate by channel path and sequence without disclosing the channel capability.
-    format!(
-        "permission-{:x}-{sequence}",
-        Sha256::digest(channel.as_os_str().as_encoded_bytes())
-    )
+fn member(prefix: &str, tool_use_id: &str) -> String {
+    // File-safe encoding only; the harness id itself is the decision/control correlator.
+    format!("{prefix}-{:x}.json", Sha256::digest(tool_use_id.as_bytes()))
 }
 
-fn member(prefix: &str, sequence: u64) -> String {
-    format!("{prefix}-{sequence}.json")
+fn request_member(sequence: u64) -> String {
+    format!("request-{sequence}.json")
 }
 
-fn shell_quote(value: &Path) -> String {
-    format!("'{}'", value.to_string_lossy().replace('\'', "'\\''"))
+fn tool_use_id(input: &Value) -> io::Result<&str> {
+    input["tool_use_id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| invalid("permission tool_use_id is absent"))
 }
 
 impl PermissionBridge {
@@ -244,12 +246,6 @@ impl PermissionBridge {
             "{}.settings.json",
             umwelt_runtime::run_directory_name(run_id)
         ));
-        let mut profile = profile;
-        profile["hooks"] = json!({"PermissionRequest": [{"hooks": [{
-            "type": "command",
-            "command": format!("{} hook permission-request --channel {}", shell_quote(executable), shell_quote(&channel)),
-            "timeout": HANDLER_SECONDS
-        }]}]});
         publish(
             directory.path(),
             settings
@@ -258,11 +254,25 @@ impl PermissionBridge {
                 .ok_or_else(|| invalid("settings filename"))?,
             &profile,
         )?;
+        let mcp_config = directory.path().join("mcp.json");
+        publish(
+            directory.path(),
+            "mcp.json",
+            &json!({"mcpServers": {
+                MCP_SERVER: {
+                    "type": "stdio",
+                    "command": executable,
+                    "args": ["permission-server", "--channel", channel],
+                    "timeout": HANDLER_TIMEOUT_MS
+                }
+            }}),
+        )?;
         Ok(Self {
             directory,
             channel,
             identity,
             settings,
+            mcp_config,
             allow,
             pending: BTreeMap::new(),
             processed: BTreeSet::new(),
@@ -278,12 +288,36 @@ impl PermissionBridge {
         &self.settings
     }
 
+    #[must_use]
+    pub fn mcp_config_path(&self) -> &Path {
+        &self.mcp_config
+    }
+
+    pub(crate) fn configure(&self, command: &mut std::process::Command) {
+        command.arg("--mcp-config").arg(&self.mcp_config).args([
+            "--strict-mcp-config",
+            "--permission-prompts",
+            "host",
+            "--permission-prompt-tool",
+            &format!("mcp__{MCP_SERVER}__{MCP_TOOL}"),
+        ]);
+    }
+
     pub(crate) fn poll(&mut self, events: &RunEventGuard) -> Result<(), crate::RunEventError> {
         if same_channel(&self.channel, &self.identity).is_ok() {
-            // Each request is atomically published by one hook; each reply by the runner.
+            // Each request is atomically published by one tool call; each reply by the runner.
             // These are transport messages, not a second event sink or bounding pass.
             if let Ok(entries) = fs::read_dir(self.directory.path()) {
-                for entry in entries.flatten() {
+                let mut entries: Vec<_> = entries.flatten().collect();
+                entries.sort_by_key(|e| {
+                    e.file_name().to_str().and_then(|n| {
+                        n.strip_prefix("request-")?
+                            .strip_suffix(".json")?
+                            .parse::<u64>()
+                            .ok()
+                    })
+                });
+                for entry in entries {
                     let name = entry.file_name();
                     let Some(sequence) = name
                         .to_str()
@@ -294,23 +328,26 @@ impl PermissionBridge {
                     else {
                         continue;
                     };
-                    let id = decision_id(&self.channel, sequence);
                     if self.processed.contains(&sequence) {
                         continue;
                     }
                     let Ok(request) = read::<Request>(&entry.path()) else {
                         continue;
                     };
-                    if request.sequence != sequence {
+                    if request.sequence != sequence
+                        || tool_use_id(&request.input).ok() != Some(request.tool_use_id.as_str())
+                        || self.pending.contains_key(&request.tool_use_id)
+                    {
                         continue;
                     }
                     self.processed.insert(sequence);
+                    let id = request.tool_use_id.clone();
                     if !granted(&self.allow, &request.input) {
                         let _ = publish(
                             self.directory.path(),
-                            &member("reply", sequence),
+                            &member("reply", &id),
                             &Reply {
-                                sequence,
+                                tool_use_id: id.clone(),
                                 option: "deny".to_owned(),
                             },
                         );
@@ -333,16 +370,10 @@ impl PermissionBridge {
             if pending.answered {
                 continue;
             }
-            let receipt = read::<Receipt>(
-                &self
-                    .directory
-                    .path()
-                    .join(member("receipt", pending.request.sequence)),
-            )
-            .ok();
+            let receipt = read::<Receipt>(&self.directory.path().join(member("receipt", id))).ok();
             let receipt = receipt.filter(|r| {
                 same_channel(&self.channel, &self.identity).is_ok()
-                    && r.sequence == pending.request.sequence
+                    && r.tool_use_id == *id
                     && (r.option == "allow" || r.option == "deny")
                     && (!r.timeout || r.option == "deny")
             });
@@ -372,7 +403,7 @@ impl PermissionBridge {
         // Source: principal, 2026-09-08/09, approving ostrom #528's private-channel form.
         // Preconditions: holds only while the channel is created by the pass runner under the run
         // directory at mode 0600, is removed at run end, has no socket, path or network form reachable
-        // by anything but that run's hook, and no reader other than the spawning supervisor.
+        // by anything but that run's permission server, and no reader other than the spawning supervisor.
         // Invalid the moment any of those changes.
         events.append(draft(ethogram::CONTROL_REQUESTED, &input))?;
         let reason = match input
@@ -404,12 +435,12 @@ impl PermissionBridge {
             .get_mut(input.decision_id.as_ref().expect("validated decision"))
             .expect("validated request");
         let reply = Reply {
-            sequence: pending.request.sequence,
+            tool_use_id: pending.request.tool_use_id.clone(),
             option: input.option_id.clone().expect("validated option"),
         };
         if publish(
             self.directory.path(),
-            &member("reply", reply.sequence),
+            &member("reply", &reply.tool_use_id),
             &reply,
         )
         .is_err()
@@ -433,10 +464,10 @@ fn operation(rule: &str) -> Option<&str> {
 }
 
 fn granted(allow: &[String], input: &Value) -> bool {
-    if input["hook_event_name"] != "PermissionRequest" || input["tool_name"] != "Bash" {
+    if input["tool_name"] != "Bash" {
         return false;
     }
-    let Some(command) = input["tool_input"]["command"].as_str() else {
+    let Some(command) = input["input"]["command"].as_str() else {
         return false;
     };
     // A conservative subset of Bash's grant pattern. Shell syntax is never interpreted here.
@@ -457,7 +488,7 @@ fn requested(id: &str, request: &Request) -> EventDraft {
     let question = excerpt(
         &format!(
             "Allow {} with input {}?",
-            request.input["tool_name"], request.input["tool_input"]
+            request.input["tool_name"], request.input["input"]
         ),
         MAX_EXCERPT_SCALARS,
     );
@@ -549,38 +580,24 @@ fn complete(
 }
 
 fn denial(id: &str) -> Value {
-    json!({"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": {
-        "behavior": "deny", "interrupt": false, "message": format!("{id}: no answer within onTimeout")
-    }}})
+    json!({"behavior": "deny", "interrupt": false,
+        "message": format!("{id}: no answer within onTimeout")})
 }
 
-/// Claude closes hook stdin after writing the request. Bound transport allocation;
-/// event narration is excerpted only when the runner constructs its event draft.
-pub fn permission_request_from_reader(channel: &Path, reader: impl Read) -> Value {
-    let mut bytes = Vec::new();
-    if reader
-        .take(MAX_TRANSPORT_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .is_err()
-        || bytes.len() as u64 > MAX_TRANSPORT_BYTES
-    {
-        return denial(&decision_id(channel, 0));
-    }
-    let input = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    permission_request(channel, &input)
-}
-
-/// Execute the synchronous hook. Every failure returns an explicit tool-only denial.
+/// Execute one permission call. Every failure returns an explicit tool-only denial.
 #[must_use]
 pub fn permission_request(channel: &Path, input: &Value) -> Value {
-    hook(channel, input, Duration::from_secs(WAIT_SECONDS))
+    handle_permission(channel, input, Duration::from_secs(WAIT_SECONDS))
 }
 
-fn hook(channel: &Path, input: &Value, wait: Duration) -> Value {
+fn handle_permission(channel: &Path, input: &Value, wait: Duration) -> Value {
     let started = Instant::now();
-    let mut id = decision_id(channel, 0);
+    let id = tool_use_id(input)
+        .unwrap_or("invalid-permission-request")
+        .to_owned();
     let mut published_sequence = None;
     let result = (|| -> io::Result<Value> {
+        tool_use_id(input)?;
         let identity = private_file(channel)?;
         same_channel(channel, &identity)?;
         let config: Channel = read(channel)?;
@@ -592,15 +609,17 @@ fn hook(channel: &Path, input: &Value, wait: Duration) -> Value {
             .ok_or_else(|| invalid("channel directory absent"))?;
         let expires_at = crate::Clock::realtime().now()
             + chrono::Duration::from_std(wait).map_err(io::Error::other)?;
+        // Claim this harness id once; a repeated call must never consume an earlier allow.
+        publish(directory, &member("claim", &id), &input)?;
         let mut sequence = 1_u64;
         loop {
             same_channel(channel, &identity)?;
-            id = decision_id(channel, sequence);
             match publish(
                 directory,
-                &member("request", sequence),
+                &request_member(sequence),
                 &Request {
                     sequence,
+                    tool_use_id: id.clone(),
                     expires_at,
                     input: input.clone(),
                 },
@@ -622,11 +641,10 @@ fn hook(channel: &Path, input: &Value, wait: Duration) -> Value {
                 break;
             }
             same_channel(channel, &identity)?;
-            let path = directory.join(member("reply", sequence));
+            let path = directory.join(member("reply", &id));
             match read::<Reply>(&path) {
                 Ok(reply) => {
-                    if reply.sequence != sequence
-                        || !matches!(reply.option.as_str(), "allow" | "deny")
+                    if reply.tool_use_id != id || !matches!(reply.option.as_str(), "allow" | "deny")
                     {
                         return Err(invalid("invalid permission reply"));
                     }
@@ -636,15 +654,15 @@ fn hook(channel: &Path, input: &Value, wait: Duration) -> Value {
                     same_channel(channel, &identity)?;
                     publish(
                         directory,
-                        &member("receipt", sequence),
+                        &member("receipt", &id),
                         &Receipt {
-                            sequence,
+                            tool_use_id: id.clone(),
                             option: reply.option.clone(),
                             timeout: false,
                         },
                     )?;
                     return Ok(if reply.option == "allow" {
-                        json!({"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": {"behavior": "allow"}}})
+                        json!({"behavior": "allow", "updatedInput": input["input"]})
                     } else {
                         denial(&id)
                     });
@@ -656,9 +674,9 @@ fn hook(channel: &Path, input: &Value, wait: Duration) -> Value {
         }
         let _ = publish(
             directory,
-            &member("receipt", sequence),
+            &member("receipt", &id),
             &Receipt {
-                sequence,
+                tool_use_id: id.clone(),
                 option: "deny".to_owned(),
                 timeout: true,
             },
@@ -666,13 +684,13 @@ fn hook(channel: &Path, input: &Value, wait: Duration) -> Value {
         Ok(denial(&id))
     })();
     result.unwrap_or_else(|_| {
-        if let Some(sequence) = published_sequence {
+        if published_sequence.is_some() {
             if let Some(directory) = channel.parent() {
                 let _ = publish(
                     directory,
-                    &member("receipt", sequence),
+                    &member("receipt", &id),
                     &Receipt {
-                        sequence,
+                        tool_use_id: id.clone(),
                         option: "deny".to_owned(),
                         timeout: true,
                     },
@@ -683,12 +701,82 @@ fn hook(channel: &Path, input: &Value, wait: Duration) -> Value {
     })
 }
 
+/// Newline-delimited JSON-RPC over stdio. Only this MCP tool is exposed; the pass
+/// loop remains the sole event writer. Each tool call waits on its private channel.
+pub fn serve_stdio(
+    channel: &Path,
+    mut input: impl BufRead,
+    mut output: impl Write,
+) -> io::Result<()> {
+    loop {
+        let mut bytes = Vec::new();
+        let count = input
+            .by_ref()
+            .take(MAX_TRANSPORT_BYTES + 1)
+            .read_until(b'\n', &mut bytes)?;
+        if count == 0 {
+            return Ok(());
+        }
+        if count as u64 > MAX_TRANSPORT_BYTES {
+            return Err(invalid("MCP request exceeds byte limit"));
+        }
+        let response = match serde_json::from_slice::<Value>(&bytes) {
+            Err(_) => {
+                json!({"jsonrpc":"2.0", "id":null, "error":{"code":-32700,"message":"Parse error"}})
+            }
+            Ok(message) => {
+                if message["jsonrpc"] != "2.0" || !message["method"].is_string() {
+                    json!({"jsonrpc":"2.0", "id":null, "error":{"code":-32600,"message":"Invalid Request"}})
+                } else if let Some(id) = message.get("id") {
+                    let result = match message["method"].as_str().unwrap() {
+                        "initialize" => Ok(json!({
+                            "protocolVersion":"2025-11-25",
+                            "capabilities":{"tools":{}},
+                            "serverInfo":{"name":MCP_SERVER,"version":env!("CARGO_PKG_VERSION")}
+                        })),
+                        "tools/list" => Ok(json!({"tools":[{
+                            "name":MCP_TOOL, "description":"Answer a pass permission request",
+                            "inputSchema":{"type":"object", "properties":{
+                                "tool_name":{"type":"string"}, "input":{"type":"object"},
+                                "tool_use_id":{"type":"string", "minLength":1}
+                            }, "required":["tool_name","input","tool_use_id"]}
+                        }]})),
+                        "tools/call" if message["params"]["name"] == MCP_TOOL => {
+                            let decision =
+                                permission_request(channel, &message["params"]["arguments"]);
+                            Ok(json!({"content":[{"type":"text","text":decision.to_string()}]}))
+                        }
+                        "tools/call" => {
+                            Err(json!({"code":-32602,"message":"Unknown permission tool"}))
+                        }
+                        "ping" => Ok(json!({})),
+                        _ => Err(json!({"code":-32601,"message":"Method not found"})),
+                    };
+                    match result {
+                        Ok(result) => json!({"jsonrpc":"2.0", "id":id, "result":result}),
+                        Err(error) => json!({"jsonrpc":"2.0", "id":id, "error":error}),
+                    }
+                } else {
+                    // Notifications, including initialized/cancelled, have no response.
+                    continue;
+                }
+            }
+        };
+        serde_json::to_writer(&mut output, &response)?;
+        output.write_all(b"\n")?;
+        output.flush()?;
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::{Clock, OstromPaths, RunEventStart};
     use std::os::unix::fs::{PermissionsExt, symlink};
     use umwelt_runtime::{FileSink, Source};
+
+    // Keep short deadline tests independent of each other's filesystem contention.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct Fixture {
         root: TempDir,
@@ -746,7 +834,10 @@ mod tests {
                 if let Some(id) = self.bridge.pending.keys().next() {
                     return id.clone();
                 }
-                assert!(Instant::now() < until, "hook never published its request");
+                assert!(
+                    Instant::now() < until,
+                    "handler never published its request"
+                );
                 thread::sleep(POLL);
             }
         }
@@ -759,22 +850,18 @@ mod tests {
             let input: ControlRequestedPayload = serde_json::from_value(json!({"controlId": format!("control-{option}"), "kind": "answer", "decisionId": id, "optionId": option, "by": "spawning-supervisor"})).unwrap();
             self.bridge.answer(&self.events, input).unwrap();
         }
-        fn start_hook(&self, input: Value, wait: Duration) -> thread::JoinHandle<Value> {
+        fn start_handler(&self, input: Value, wait: Duration) -> thread::JoinHandle<Value> {
             let path = self.bridge.channel.clone();
-            thread::spawn(move || hook(&path, &input, wait))
+            thread::spawn(move || handle_permission(&path, &input, wait))
         }
     }
 
     fn input() -> Value {
-        json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash", "tool_input": {"command": "ostrom build item"}})
+        json!({"tool_use_id": "toolu_test", "tool_name": "Bash", "input": {"command": "ostrom build item"}})
     }
     fn assert_denied(output: &Value) {
-        let decision = &output["hookSpecificOutput"]["decision"];
-        assert_eq!(
-            output["hookSpecificOutput"]["hookEventName"],
-            "PermissionRequest"
-        );
-        assert_eq!(decision["behavior"], "deny", "hook must fail closed");
+        let decision = output;
+        assert_eq!(decision["behavior"], "deny", "handler must fail closed");
         assert_eq!(
             decision["interrupt"], false,
             "denial must not interrupt the run"
@@ -788,26 +875,230 @@ mod tests {
     }
 
     #[test]
+    fn expiry_deny_message_is_a_stable_model_visible_contract() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let output = denial("toolu_01FH91gQucc6nx6tynSQiDbW");
+        assert_eq!(
+            output,
+            json!({"behavior":"deny", "interrupt":false,
+            "message":"toolu_01FH91gQucc6nx6tynSQiDbW: no answer within onTimeout"})
+        );
+    }
+
+    #[test]
+    fn harness_id_is_the_decision_and_reply_correlator() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let mut f = Fixture::new();
+        let handle = f.start_handler(input(), Duration::from_secs(2));
+        let id = f.wait_request();
+        assert_eq!(id, "toolu_test");
+        f.answer(&id, "allow");
+        let reply: Reply = read(&f.bridge.directory.path().join(member("reply", &id))).unwrap();
+        assert_eq!(reply.tool_use_id, id);
+        let output = handle.join().unwrap();
+        assert_eq!(output["behavior"], "allow");
+        assert_eq!(output["updatedInput"], input()["input"]);
+        f.poll();
+        assert_eq!(f.wire()[3].payload["decisionId"], id);
+    }
+
+    #[test]
+    fn repeated_tool_use_id_cannot_reuse_an_allow() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let mut f = Fixture::new();
+        let handle = f.start_handler(input(), Duration::from_secs(2));
+        let id = f.wait_request();
+        f.answer(&id, "allow");
+        assert_eq!(handle.join().unwrap()["behavior"], "allow");
+        f.poll();
+        assert_denied(&handle_permission(
+            &f.bridge.channel,
+            &input(),
+            Duration::from_millis(100),
+        ));
+        assert!(
+            !f.bridge.directory.path().join(request_member(2)).exists(),
+            "repeated tool_use_id published another request"
+        );
+        f.poll();
+        assert_eq!(
+            f.wire()
+                .iter()
+                .filter(|e| e.event_type == ethogram::DECISION_REQUESTED)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn absent_or_mismatched_tool_use_id_cannot_register_a_request() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let mut f = Fixture::new();
+        for id in [Value::Null, json!(""), json!(17)] {
+            let mut value = input();
+            value["tool_use_id"] = id;
+            assert_denied(&handle_permission(
+                &f.bridge.channel,
+                &value,
+                Duration::from_millis(100),
+            ));
+            assert!(
+                !f.bridge.directory.path().join(request_member(1)).exists(),
+                "absent tool_use_id was published"
+            );
+        }
+        publish(
+            f.bridge.directory.path(),
+            &request_member(1),
+            &Request {
+                sequence: 1,
+                tool_use_id: "toolu_other".into(),
+                expires_at: crate::Clock::realtime().now() + chrono::Duration::seconds(30),
+                input: input(),
+            },
+        )
+        .unwrap();
+        f.poll();
+        assert!(
+            f.bridge.pending.is_empty(),
+            "mismatched tool_use_id was registered"
+        );
+    }
+
+    #[test]
+    fn duplicate_transport_request_cannot_replace_pending_decision() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let mut f = Fixture::new();
+        let handle = f.start_handler(input(), Duration::from_secs(2));
+        let id = f.wait_request();
+        f.answer(&id, "allow");
+        let mut request: Request =
+            read(&f.bridge.directory.path().join(request_member(1))).unwrap();
+        request.sequence = 2;
+        publish(f.bridge.directory.path(), &request_member(2), &request).unwrap();
+        f.poll();
+        assert_eq!(
+            f.wire()
+                .iter()
+                .filter(|e| e.event_type == ethogram::DECISION_REQUESTED)
+                .count(),
+            1
+        );
+        assert_eq!(handle.join().unwrap()["behavior"], "allow");
+    }
+
+    #[test]
+    fn wrong_receipt_id_cannot_complete_a_decision() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let mut f = Fixture::new();
+        let handle = f.start_handler(input(), Duration::from_secs(2));
+        let id = f.wait_request();
+        publish(
+            f.bridge.directory.path(),
+            &member("receipt", &id),
+            &Receipt {
+                tool_use_id: "toolu_other".into(),
+                option: "deny".into(),
+                timeout: true,
+            },
+        )
+        .unwrap();
+        f.poll();
+        assert!(
+            !f.bridge.pending[&id].answered,
+            "receipt for another tool_use_id was accepted"
+        );
+        fs::remove_file(&f.bridge.channel).unwrap();
+        assert_denied(&handle.join().unwrap());
+    }
+
+    #[test]
+    fn mcp_protocol_loads_one_tool_and_preserves_the_content_wire() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let f = Fixture::new();
+        let mut bytes = Vec::new();
+        for message in [
+            json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}),
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+            json!({"jsonrpc":"2.0","id":"list","method":"tools/list"}),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"approve","arguments":input()}}),
+        ] {
+            writeln!(bytes, "{message}").unwrap();
+        }
+        // Missing channel exercises a real tool response without a runner or a wait.
+        fs::remove_file(&f.bridge.channel).unwrap();
+        let mut output = Vec::new();
+        serve_stdio(&f.bridge.channel, bytes.as_slice(), &mut output).unwrap();
+        let replies: Vec<Value> = output
+            .split(|b| *b == b'\n')
+            .filter(|b| !b.is_empty())
+            .map(|b| serde_json::from_slice(b).unwrap())
+            .collect();
+        assert_eq!(replies.len(), 3, "MCP must not reply to notifications");
+        assert_eq!(replies[0]["result"]["protocolVersion"], "2025-11-25");
+        assert_eq!(replies[1]["id"], "list");
+        assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(replies[1]["result"]["tools"][0]["name"], MCP_TOOL);
+        let content = &replies[2]["result"]["content"];
+        assert_eq!(content.as_array().unwrap().len(), 1);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(
+            serde_json::from_str::<Value>(content[0]["text"].as_str().unwrap()).unwrap(),
+            denial("toolu_test")
+        );
+    }
+
+    #[test]
+    fn mcp_rejects_invalid_protocol_methods_and_tools_without_a_channel_write() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let f = Fixture::new();
+        for (message, code) in [
+            ("not json\n".to_owned(), -32700),
+            (json!({"jsonrpc":"1.0","id":3,"method":"tools/list"}).to_string(), -32600),
+            (json!({"jsonrpc":"2.0","id":3,"method":5}).to_string(), -32600),
+            (json!({"jsonrpc":"2.0","id":3,"method":"unknown"}).to_string(), -32601),
+            (json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"other","arguments":input()}}).to_string(), -32602),
+        ] {
+            let mut output = Vec::new();
+            serve_stdio(&f.bridge.channel, message.as_bytes(), &mut output).unwrap();
+            let reply: Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(reply["error"]["code"], code, "{message}");
+            assert!(!f.bridge.directory.path().join(request_member(1)).exists());
+        }
+        let mut output = Vec::new();
+        let bytes = vec![b' '; MAX_TRANSPORT_BYTES as usize + 1];
+        assert!(
+            serve_stdio(&f.bridge.channel, bytes.as_slice(), &mut output)
+                .unwrap_err()
+                .to_string()
+                .contains("MCP request exceeds byte limit")
+        );
+    }
+
+    #[test]
     fn handler_timeout_strictly_exceeds_decision_wait() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let fixture = Fixture::new();
-        let settings: Value = read(fixture.bridge.settings_path()).unwrap();
-        let handler = settings["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"]
-            .as_u64()
-            .unwrap();
+        let mcp: Value = read(fixture.bridge.mcp_config_path()).unwrap();
+        let handler = mcp["mcpServers"][MCP_SERVER]["timeout"].as_u64().unwrap();
         let channel: Channel = read(&fixture.bridge.channel).unwrap();
         assert!(
-            handler > channel.wait_seconds,
-            "handler timeout must strictly exceed decision wait: handler={handler}s wait={}s",
+            handler > channel.wait_seconds * 1000,
+            "handler timeout must strictly exceed decision wait: handler={handler}ms wait={}s",
             channel.wait_seconds
         );
-        assert_eq!(handler, channel.wait_seconds + HANDLER_MARGIN_SECONDS);
+        assert_eq!(
+            handler,
+            (channel.wait_seconds + HANDLER_MARGIN_SECONDS) * 1000
+        );
     }
 
     #[test]
     fn valid_answers_are_receipted_on_the_requesting_run() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         for option in ["allow", "deny"] {
             let mut f = Fixture::new();
-            let handle = f.start_hook(input(), Duration::from_secs(2));
+            let handle = f.start_handler(input(), Duration::from_secs(2));
             let id = f.wait_request();
             f.answer(&id, option);
             assert!(
@@ -820,10 +1111,7 @@ mod tests {
             if option == "deny" {
                 assert_denied(&output);
             } else {
-                assert_eq!(
-                    output["hookSpecificOutput"]["decision"]["behavior"],
-                    "allow"
-                );
+                assert_eq!(output["behavior"], "allow");
             }
             f.poll();
             let wire = f.wire();
@@ -850,9 +1138,10 @@ mod tests {
     }
 
     #[test]
-    fn invalid_answers_never_reach_the_hook() {
+    fn invalid_answers_never_reach_the_handler() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let mut f = Fixture::new();
-        let handle = f.start_hook(input(), Duration::from_secs(2));
+        let handle = f.start_handler(input(), Duration::from_secs(2));
         let id = f.wait_request();
         for (id, option, reason) in [
             ("unknown", "allow", "no-such-decision"),
@@ -861,7 +1150,11 @@ mod tests {
             f.answer(id, option);
             assert_eq!(f.wire().last().unwrap().payload["reason"], reason);
             assert!(
-                !f.bridge.directory.path().join(member("reply", 1)).exists(),
+                !f.bridge
+                    .directory
+                    .path()
+                    .join(member("reply", "toolu_test"))
+                    .exists(),
                 "invalid answer was forwarded"
             );
             assert!(!handle.is_finished());
@@ -883,15 +1176,16 @@ mod tests {
 
     #[test]
     fn expiry_denies_and_records_timeout_without_a_supervisor() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let mut f = Fixture::new();
-        let handle = f.start_hook(input(), Duration::from_millis(150));
+        let handle = f.start_handler(input(), Duration::from_millis(150));
         let id = f.wait_request();
         let began = Instant::now();
         let output = handle.join().unwrap();
         assert_denied(&output);
         assert!(
             began.elapsed() < Duration::from_secs(1),
-            "expiry hung the hook"
+            "expiry hung the handler"
         );
         assert!(output.to_string().contains(&id));
         f.poll();
@@ -907,6 +1201,7 @@ mod tests {
 
     #[test]
     fn missing_channel_denies_promptly() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let f = Fixture::new();
         fs::remove_file(&f.bridge.channel).unwrap();
         let start = Instant::now();
@@ -916,8 +1211,9 @@ mod tests {
 
     #[test]
     fn channel_removed_while_waiting_denies_and_refuses_forwarding() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let mut f = Fixture::new();
-        let handle = f.start_hook(input(), Duration::from_secs(2));
+        let handle = f.start_handler(input(), Duration::from_secs(2));
         let id = f.wait_request();
         fs::remove_file(&f.bridge.channel).unwrap();
         f.answer(&id, "allow");
@@ -929,6 +1225,7 @@ mod tests {
 
     #[test]
     fn replacement_and_nonprivate_channels_are_rejected() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let f = Fixture::new();
         let original = f.bridge.channel.with_extension("original");
         fs::rename(&f.bridge.channel, &original).unwrap();
@@ -961,14 +1258,15 @@ mod tests {
 
     #[test]
     fn malformed_reply_is_never_an_allow() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let mut f = Fixture::new();
-        let handle = f.start_hook(input(), Duration::from_millis(150));
+        let handle = f.start_handler(input(), Duration::from_millis(150));
         f.wait_request();
         publish(
             f.bridge.directory.path(),
-            &member("reply", 1),
+            &member("reply", "toolu_test"),
             &Reply {
-                sequence: 99,
+                tool_use_id: "toolu_unknown".into(),
                 option: "allow".into(),
             },
         )
@@ -981,13 +1279,14 @@ mod tests {
 
     #[test]
     fn ungranted_tools_and_shell_syntax_are_denied_without_interrupting() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         for value in [
-            json!({"hook_event_name": "PermissionRequest", "tool_name": "Write", "tool_input": {}}),
-            json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash", "tool_input": {"command": "ostrom other item"}}),
-            json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash", "tool_input": {"command": "ostrom build item; rm something"}}),
+            json!({"tool_use_id": "toolu_test", "tool_name": "Write", "input": {}}),
+            json!({"tool_use_id": "toolu_test", "tool_name": "Bash", "input": {"command": "ostrom other item"}}),
+            json!({"tool_use_id": "toolu_test", "tool_name": "Bash", "input": {"command": "ostrom build item; rm something"}}),
         ] {
             let mut f = Fixture::new();
-            let handle = f.start_hook(value, Duration::from_secs(2));
+            let handle = f.start_handler(value, Duration::from_secs(2));
             let until = Instant::now() + Duration::from_secs(1);
             while !handle.is_finished() {
                 f.poll();
@@ -1008,6 +1307,7 @@ mod tests {
 
     #[test]
     fn channels_are_private_distinct_and_removed_with_settings() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let f = Fixture::new();
         let other = Fixture::new();
         assert_ne!(f.bridge.channel, other.bridge.channel);
@@ -1029,6 +1329,7 @@ mod tests {
 
     #[test]
     fn same_run_directory_never_shares_settings_or_channels() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let f = Fixture::new();
         let first_bytes = fs::read(f.bridge.settings_path()).unwrap();
         let second = PermissionBridge::create(
@@ -1041,19 +1342,18 @@ mod tests {
         assert_ne!(f.bridge.channel, second.channel);
         assert_ne!(f.bridge.settings_path(), second.settings_path());
         assert_eq!(fs::read(f.bridge.settings_path()).unwrap(), first_bytes);
-        assert_ne!(
-            decision_id(&f.bridge.channel, 1),
-            decision_id(&second.channel, 1)
-        );
         f.bridge.close().unwrap();
         assert!(second.channel.exists());
     }
 
     #[test]
-    fn concurrent_hooks_get_distinct_per_channel_sequences() {
+    fn concurrent_calls_get_distinct_per_channel_sequences() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let mut f = Fixture::new();
-        let a = f.start_hook(input(), Duration::from_secs(2));
-        let b = f.start_hook(input(), Duration::from_secs(2));
+        let a = f.start_handler(input(), Duration::from_secs(2));
+        let mut second = input();
+        second["tool_use_id"] = "toolu_second".into();
+        let b = f.start_handler(second, Duration::from_secs(2));
         let until = Instant::now() + Duration::from_secs(1);
         while f.bridge.pending.len() != 2 {
             f.poll();
@@ -1066,10 +1366,7 @@ mod tests {
         f.answer(&ids[1], "deny");
         let results = [a.join().unwrap(), b.join().unwrap()];
         assert_eq!(
-            results
-                .iter()
-                .filter(|v| v["hookSpecificOutput"]["decision"]["behavior"] == "allow")
-                .count(),
+            results.iter().filter(|v| v["behavior"] == "allow").count(),
             1
         );
         f.poll();
@@ -1083,30 +1380,35 @@ mod tests {
     }
 
     #[test]
-    fn command_quotes_channel_and_executable_without_shell_expansion() {
+    fn mcp_argv_preserves_channel_and_executable_without_shell_expansion() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let f = Fixture::new();
-        let settings: Value = read(f.bridge.settings_path()).unwrap();
-        let command = settings["hooks"]["PermissionRequest"][0]["hooks"][0]["command"]
-            .as_str()
-            .unwrap();
-        assert!(
-            command.contains("'\\''quoted'\\''"),
-            "executable quotes were lost"
+        let mcp: Value = read(f.bridge.mcp_config_path()).unwrap();
+        let server = &mcp["mcpServers"][MCP_SERVER];
+        assert_eq!(server["command"], "/tmp/ostrom 'quoted' executable");
+        assert_eq!(
+            server["args"],
+            json!(["permission-server", "--channel", f.bridge.channel])
         );
-        assert!(command.ends_with(&shell_quote(&f.bridge.channel)));
+        let settings: Value = read(f.bridge.settings_path()).unwrap();
+        assert_eq!(
+            settings,
+            json!({"permissions":{"defaultMode":"dontAsk","allow":["Bash(ostrom build *)"]}})
+        );
         assert!(f.root.path().exists());
     }
 
     #[test]
     fn unsolicited_receipt_cannot_authorize_and_does_not_prevent_expiry() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let mut f = Fixture::new();
-        let handle = f.start_hook(input(), Duration::from_millis(100));
+        let handle = f.start_handler(input(), Duration::from_millis(100));
         f.wait_request();
         publish(
             f.bridge.directory.path(),
-            &member("receipt", 1),
+            &member("receipt", "toolu_test"),
             &Receipt {
-                sequence: 1,
+                tool_use_id: "toolu_test".into(),
                 option: "allow".into(),
                 timeout: false,
             },
@@ -1130,25 +1432,34 @@ mod tests {
 
     #[test]
     fn expired_answers_are_not_forwarded() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let mut f = Fixture::new();
-        let handle = f.start_hook(input(), Duration::from_millis(100));
+        let handle = f.start_handler(input(), Duration::from_millis(100));
         let id = f.wait_request();
         f.bridge.pending.get_mut(&id).unwrap().request.expires_at =
             crate::Clock::realtime().now() - chrono::Duration::seconds(1);
         f.answer(&id, "allow");
         assert_eq!(f.wire().last().unwrap().payload["reason"], "not-live");
-        assert!(!f.bridge.directory.path().join(member("reply", 1)).exists());
+        assert!(
+            !f.bridge
+                .directory
+                .path()
+                .join(member("reply", "toolu_test"))
+                .exists()
+        );
         assert_denied(&handle.join().unwrap());
     }
 
     #[test]
     fn mismatched_request_sequence_is_never_registered() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let mut f = Fixture::new();
         publish(
             f.bridge.directory.path(),
-            &member("request", 1),
+            &request_member(1),
             &Request {
                 sequence: 2,
+                tool_use_id: "toolu_test".into(),
                 expires_at: crate::Clock::realtime().now() + chrono::Duration::seconds(30),
                 input: input(),
             },
@@ -1168,6 +1479,7 @@ mod tests {
 
     #[test]
     fn grant_matching_never_broadens_the_rendered_literal_prefix() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let allow = vec!["Bash(ostrom build *)".to_owned()];
         for command in [
             " ostrom build item",
@@ -1179,7 +1491,7 @@ mod tests {
             "ostrom build 'item'",
         ] {
             let mut value = input();
-            value["tool_input"]["command"] = command.into();
+            value["input"]["command"] = command.into();
             assert!(
                 !granted(&allow, &value),
                 "command outside the rendered grant was accepted: {command}"
@@ -1190,10 +1502,12 @@ mod tests {
 
     #[test]
     fn input_excerpt_is_bounded_once_and_validates() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let request = Request {
             sequence: 1,
+            tool_use_id: "toolu_test".into(),
             expires_at: crate::Clock::realtime().now(),
-            input: json!({"tool_name": "Bash", "tool_input": {"command": "😀".repeat(MAX_EXCERPT_SCALARS + 100)}}),
+            input: json!({"tool_name": "Bash", "input": {"command": "😀".repeat(MAX_EXCERPT_SCALARS + 100)}}),
         };
         let value = requested("bounded", &request);
         ethogram::validate(&value.event_type, &value.payload).unwrap();
@@ -1236,12 +1550,16 @@ mod boundary_tests {
         )
         .unwrap();
         fs::write(&bridge.channel, r#"{"wait_seconds":35}"#).unwrap();
-        let value = hook(&bridge.channel, &json!({}), Duration::from_millis(20));
+        let value = handle_permission(
+            &bridge.channel,
+            &json!({"tool_use_id":"toolu_test"}),
+            Duration::from_millis(20),
+        );
         assert!(
-            !bridge.directory.path().join(member("request", 1)).exists(),
+            !bridge.directory.path().join(request_member(1)).exists(),
             "changed wait was accepted"
         );
-        assert_eq!(value["hookSpecificOutput"]["decision"]["behavior"], "deny");
+        assert_eq!(value["behavior"], "deny");
         fs::write(&bridge.channel, r#"{"wait_seconds":30}"#).unwrap();
         fs::set_permissions(bridge.directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
         assert!(
@@ -1269,8 +1587,6 @@ mod boundary_tests {
                 .to_string()
                 .contains("byte limit")
         );
-        let output = permission_request_from_reader(&bridge.channel, bytes.as_slice());
-        assert_eq!(output["hookSpecificOutput"]["decision"]["behavior"], "deny");
         fs::hard_link(&bridge.channel, bridge.directory.path().join("linked")).unwrap();
         assert!(
             private_file(&bridge.channel).is_err(),

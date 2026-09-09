@@ -55,43 +55,66 @@ operator-owned `roles/<role>.settings.json`, an answer still receives
 `control.applied` with `ok: false`, `reason: "unsupported"`, and the same `by`.
 Ostrom never edits or composes over that operator-owned file.
 
-For a derived profile, the pass writes a per-run settings file under its run
-directory before spawning Claude. Its `PermissionRequest` command carries an
-unpredictable private channel path. The channel file and transport messages are
-mode 0600 inside a mode 0700 directory; the runner removes that directory and the
-settings at run end, including interruption and errors. Durable events remain.
-Private channel opening currently supports Linux and macOS; other platforms
-refuse bridge setup rather than weakening the file checks.
-This also fixes the latent per-role derived-settings overwrite: two runs no
-longer share `roles/<role>.derived.settings.json`.
+For a derived profile, the pass writes per-run settings and MCP configuration
+under its run directory before spawning Claude. Settings contain exactly the
+policy renderer's profile, without a hooks block. The MCP config registers
+`ostrom permission-server --channel <private-path>` as `ostrom_permission` and
+sets its per-server `timeout` in milliseconds. Claude receives `--mcp-config`,
+`--strict-mcp-config`, `--permission-prompts host`, and
+`--permission-prompt-tool mcp__ostrom_permission__approve`.
 
-When Claude requests permission for a granted call, the hook asks the runner to
-emit `decision.requested` through its existing sink, then waits for an answer.
-The bridge does not add permission prompts to already preapproved calls. It
-supports the current renderer's `Bash(ostrom <operation> *)` grants, conservatively
-requiring an `ostrom` command with plain arguments. Shell syntax, quoted arguments,
-and tools outside those grants are denied rather than interpreted as authorization.
+The channel file and transport messages are mode 0600 inside a mode 0700
+directory; the runner removes that directory, the settings, and the MCP config
+at run end, including interruption and errors. Durable events remain. Private
+channel opening supports Linux and macOS; other platforms refuse bridge setup.
+Two runs never share `roles/<role>.derived.settings.json`.
+
+The stdio server supports MCP initialization, tool discovery, and calls to its
+single `approve` tool. Claude sends `tool_name`, `input`, and `tool_use_id`;
+the response is one MCP text content block containing a JSON allow/deny object.
+An allow returns the original input in `updatedInput`.
+
+When Claude requests permission for a granted call, the handler asks the runner
+to emit `decision.requested` through its existing sink, then waits for an answer.
+The bridge does not add prompts to already preapproved calls. It supports the
+renderer’s `Bash(ostrom <operation> *)` grants, conservatively requiring an
+`ostrom` command with plain arguments. Shell syntax, quoted arguments, and tools
+outside those grants are denied.
 
 A decision offers `allow` and `deny`, sets `expiresAt` to its deadline, and sets
-ethogram's decision-level `onTimeout` to `deny`. Its wait is 30 seconds. The Claude
-handler timeout is derived as that wait plus a named five-second margin so the
-hook's denial can return before handler cancellation. The hook's explicit JSON
-denial is the sole expiry mechanism; it uses `interrupt: false` and a message
-naming the decision and stating `no answer within onTimeout`. Pass caps still
-apply. No answer, a lost channel, and invalid transport data fail closed.
+ethogram's decision-level `onTimeout` to `deny`. Its wait is 30 seconds. The
+per-server MCP `timeout` is derived as `(wait + five-second margin) * 1000`,
+currently 35000 ms. The inequality test reads the emitted MCP and channel
+configurations. No environment inheritance is assumed for the path or timeout.
 
-The spawning supervisor sends an `answer` control with the offered `decisionId`
-and `optionId`. Before forwarding, the runner rejects unknown decisions, duplicate
-answers, and unoffered options with `no-such-decision`, `already-answered`, and
-`option-not-offered`, respectively. An expired or unavailable channel receives
-`not-live`. `by` is preserved without interpreting the principal identity.
+Ostrom's explicit denial is the expiry mechanism. Its stable, model-visible
+message is `<tool_use_id>: no answer within onTimeout`, with `behavior: deny`
+and `interrupt: false`; a missed answer denies the tool call without stopping
+the pass. Pass caps still apply. No answer, a lost channel, and invalid transport
+data fail closed. A step-1 probe against Claude Code 2.1.265 observed a response
+after a 90 s stall being honoured. No shorter bound was in force; a bound above
+90 s was never measured. The design relies only on Ostrom's wait and explicitly
+sets the server timeout rather than inferring a harness default.
 
-After the hook acknowledges the forwarded choice, the runner emits
-`decision.answered` with `requestedRunId` naming the asking run, followed by
-`control.applied` with `ok: true`. Both events belong to the live pass. Expiry emits
-`decision.answered` with `byTimeout: true`; a forwarded control that did not arrive
-in time gets `ok: false`. Correlation uses the channel path and a per-channel
-sequence. This uses Claude Code 2.1.265's synchronous `PermissionRequest` contract.
+The spawning supervisor sends an `answer` control whose `decisionId` is the
+harness's `tool_use_id` and whose `optionId` is an offered option. Before
+forwarding, the runner rejects unknown decisions, duplicate answers, and
+unoffered options with `no-such-decision`, `already-answered`, and
+`option-not-offered`. An expired or unavailable channel receives `not-live`.
+`by` is preserved without interpreting the principal identity.
+
+After the handler acknowledges the choice, the runner emits `decision.answered`
+with `requestedRunId` naming the asking run, followed by `control.applied` with
+`ok: true`. Expiry emits `decision.answered` with `byTimeout: true`; a forwarded
+control that did not arrive in time gets `ok: false`. Requests, replies, and
+receipts match on `tool_use_id`; the per-channel sequence only orders requests.
+Repeated tool-use ids cannot reuse an earlier allow.
+
+Claude Code 2.1.265's `doctor` validates the settings but ignores the MCP carrier:
+it also accepts deliberately malformed `mcpServers` fields. The agreement test
+passes the rendered files and pins that limitation. Local protocol and pass
+lifecycle tests cover the emitted MCP argv, framing, and timeout; doctor success
+is not evidence that Claude loaded the server.
 
 Tripwire, gate, budget, and other out-of-band decisions retain their existing
 `ostrom queue` answer path. Steering remains unsupported on a Claude pass.

@@ -68,6 +68,12 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Serve the pass permission-prompt MCP tool over stdio.
+    PermissionServer {
+        #[arg(long)]
+        channel: PathBuf,
+    },
+
     /// Compose signed policy into an immutable content-addressed version.
     Compose {
         /// Skip the candidate's signature verification and write nothing.
@@ -412,11 +418,6 @@ enum LoopsCommand {
 
 #[derive(Debug, Subcommand)]
 enum HookCommand {
-    /// Answer a synchronous permission request through the pass's private channel.
-    PermissionRequest {
-        #[arg(long)]
-        channel: PathBuf,
-    },
     /// Emit the layered constitution for SessionStart.
     SessionStart,
     /// Render and acknowledge the durable queue digest.
@@ -867,14 +868,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(output.exit_code);
             }
         }
+        Command::PermissionServer { channel } => {
+            ostrom_store::permission_bridge::serve_stdio(
+                &channel,
+                io::stdin().lock(),
+                io::stdout().lock(),
+            )?;
+        }
         Command::Hook { command } => match command {
-            HookCommand::PermissionRequest { channel } => {
-                let output = ostrom_store::permission_bridge::permission_request_from_reader(
-                    &channel,
-                    io::stdin().lock(),
-                );
-                serde_json::to_writer(io::stdout().lock(), &output)?;
-            }
             HookCommand::SessionStart => {
                 let cwd = env::current_dir().unwrap_or_default();
                 // An override only; with none, the shipped rules compiled
@@ -3474,6 +3475,9 @@ mod tests {
             let output = std::process::Command::new(&claude)
                 .arg("--settings")
                 .arg(settings)
+                .arg("--mcp-config")
+                .arg(bridge.mcp_config_path())
+                .arg("--strict-mcp-config")
                 .arg("doctor")
                 .current_dir(root.path())
                 .env("CLAUDE_CONFIG_DIR", root.path().join("config"))
@@ -3514,6 +3518,41 @@ mod tests {
                 "Claude doctor did not report a completed check:\n{diagnostic}",
             );
         }
+        // Tripwire, Claude Code 2.1.265: doctor ignores --mcp-config, even with
+        // malformed server fields. Passing the carrier above is not MCP validation.
+        let mut invalid: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(bridge.mcp_config_path()).unwrap()).unwrap();
+        for server in invalid["mcpServers"].as_object_mut().unwrap().values_mut() {
+            server["command"] = false.into();
+            server["timeout"] = "not milliseconds".into();
+        }
+        let invalid_path = root.path().join("invalid-mcp.json");
+        std::fs::write(&invalid_path, invalid.to_string()).unwrap();
+        let output = std::process::Command::new(&claude)
+            .arg("--settings")
+            .arg(bridge.settings_path())
+            .arg("--mcp-config")
+            .arg(&invalid_path)
+            .arg("--strict-mcp-config")
+            .arg("doctor")
+            .current_dir(root.path())
+            .env("CLAUDE_CONFIG_DIR", root.path().join("config"))
+            .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        let diagnostic = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success() && diagnostic.contains("Claude Code doctor"),
+            "Doctor's MCP coverage changed; replace the documented limitation with a rejection assertion:\n{diagnostic}"
+        );
+        println!(
+            "Claude doctor accepted malformed mcpServers: this test proves settings agreement only. MCP framing and rendered timeout/argv are pinned by the permission bridge and pass lifecycle tests."
+        );
     }
 
     #[test]
