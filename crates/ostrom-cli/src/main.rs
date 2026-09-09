@@ -68,6 +68,12 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Serve the pass permission-prompt MCP tool over stdio.
+    PermissionServer {
+        #[arg(long)]
+        channel: PathBuf,
+    },
+
     /// Compose signed policy into an immutable content-addressed version.
     Compose {
         /// Skip the candidate's signature verification and write nothing.
@@ -861,6 +867,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if output.exit_code != 0 {
                 std::process::exit(output.exit_code);
             }
+        }
+        Command::PermissionServer { channel } => {
+            ostrom_store::permission_bridge::serve_stdio(
+                &channel,
+                io::stdin().lock(),
+                io::stdout().lock(),
+            )?;
         }
         Command::Hook { command } => match command {
             HookCommand::SessionStart => {
@@ -3448,51 +3461,112 @@ mod tests {
         let rendered = ostrom_checks::generate_operation_settings(&manifest, "operator")
             .expect("generated operation settings");
         let settings = root.path().join("derived.settings.json");
-        std::fs::write(&settings, rendered).expect("write real generated settings");
-
-        // Doctor validates settings without a trust prompt or an API call.
-        // Isolate local settings and disable background telemetry/update traffic.
-        let output = std::process::Command::new(&claude)
-            .arg("--settings")
-            .arg(&settings)
-            .arg("doctor")
-            .current_dir(root.path())
-            .env("CLAUDE_CONFIG_DIR", root.path().join("config"))
-            .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
-            .stdin(std::process::Stdio::null())
-            .output();
-        let output = match output {
-            Ok(output) => output,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                // Write directly so a successful test cannot hide the skip in libtest capture.
-                writeln!(
+        std::fs::write(&settings, &rendered).expect("write real generated settings");
+        let bridge = ostrom_store::permission_bridge::PermissionBridge::create(
+            root.path(),
+            "doctor-run",
+            &rendered,
+            &std::env::current_exe().unwrap(),
+        )
+        .expect("create real per-run bridge settings");
+        // The unbridged generated profile keeps `dontAsk`; the bridge overrides its
+        // own rendered copy to `default` (ostrom#528) since an ungranted call under
+        // `dontAsk` never reaches the permission-prompt tool. Both must still agree
+        // with `doctor` below.
+        let generated: serde_json::Value =
+            serde_json::from_str(&rendered).expect("generated settings parse");
+        assert_eq!(generated["permissions"]["defaultMode"], "dontAsk");
+        let bridged: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(bridge.settings_path()).unwrap())
+                .expect("bridged settings parse");
+        assert_eq!(bridged["permissions"]["defaultMode"], "default");
+        for settings in [&settings, &bridge.settings_path().to_owned()] {
+            // Doctor validates settings without a trust prompt or an API call.
+            // Isolate local settings and disable background telemetry/update traffic.
+            // The second iteration validates the rendered bridged settings
+            // (`defaultMode: "default"`) together with the bridge's `mcpServers`
+            // carrier, exactly as the first iteration validates the unbridged
+            // generated profile.
+            let output = std::process::Command::new(&claude)
+                .arg("--settings")
+                .arg(settings)
+                .arg("--mcp-config")
+                .arg(bridge.mcp_config_path())
+                .arg("--strict-mcp-config")
+                .arg("doctor")
+                .current_dir(root.path())
+                .env("CLAUDE_CONFIG_DIR", root.path().join("config"))
+                .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+                .stdin(std::process::Stdio::null())
+                .output();
+            let output = match output {
+                Ok(output) => output,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // Write directly so a successful test cannot hide the skip in libtest capture.
+                    writeln!(
                     std::io::stderr(),
                     "SKIP generated_operation_settings_agree_with_claude_doctor: Claude binary {} is absent (resolved by default_claude_bin: CLAUDE_BIN, then ~/.local/bin/claude, then claude when no home is available): {error}",
                     claude.display(),
                 )
                 .expect("print skip reason");
-                return;
-            }
-            Err(error) => panic!("could not run {} doctor: {error}", claude.display()),
-        };
+                    return;
+                }
+                Err(error) => panic!("could not run {} doctor: {error}", claude.display()),
+            };
+            let diagnostic = format!(
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            println!("{diagnostic}");
+            assert!(
+                !diagnostic.to_ascii_lowercase().contains("invalid settings"),
+                "Claude doctor rejected generate_operation_settings output:\n{diagnostic}",
+            );
+            assert!(
+                output.status.success(),
+                "Claude doctor failed with {}:\n{diagnostic}",
+                output.status,
+            );
+            assert!(
+                diagnostic.contains("Claude Code doctor"),
+                "Claude doctor did not report a completed check:\n{diagnostic}",
+            );
+        }
+        // Tripwire, Claude Code 2.1.265: doctor ignores --mcp-config, even with
+        // malformed server fields. Passing the carrier above is not MCP validation.
+        let mut invalid: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(bridge.mcp_config_path()).unwrap()).unwrap();
+        for server in invalid["mcpServers"].as_object_mut().unwrap().values_mut() {
+            server["command"] = false.into();
+            server["timeout"] = "not milliseconds".into();
+        }
+        let invalid_path = root.path().join("invalid-mcp.json");
+        std::fs::write(&invalid_path, invalid.to_string()).unwrap();
+        let output = std::process::Command::new(&claude)
+            .arg("--settings")
+            .arg(bridge.settings_path())
+            .arg("--mcp-config")
+            .arg(&invalid_path)
+            .arg("--strict-mcp-config")
+            .arg("doctor")
+            .current_dir(root.path())
+            .env("CLAUDE_CONFIG_DIR", root.path().join("config"))
+            .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
         let diagnostic = format!(
-            "stdout:\n{}\nstderr:\n{}",
+            "{}{}",
             String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-        println!("{diagnostic}");
-        assert!(
-            !diagnostic.to_ascii_lowercase().contains("invalid settings"),
-            "Claude doctor rejected generate_operation_settings output:\n{diagnostic}",
+            String::from_utf8_lossy(&output.stderr)
         );
         assert!(
-            output.status.success(),
-            "Claude doctor failed with {}:\n{diagnostic}",
-            output.status,
+            output.status.success() && diagnostic.contains("Claude Code doctor"),
+            "Doctor's MCP coverage changed; replace the documented limitation with a rejection assertion:\n{diagnostic}"
         );
-        assert!(
-            diagnostic.contains("Claude Code doctor"),
-            "Claude doctor did not report a completed check:\n{diagnostic}",
+        println!(
+            "Claude doctor accepted malformed mcpServers: this test proves settings agreement only. MCP framing and rendered timeout/argv are pinned by the permission bridge and pass lifecycle tests."
         );
     }
 

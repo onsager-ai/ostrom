@@ -48,38 +48,101 @@ A valid steer is recorded as `control.requested`, immediately followed by
 `control.applied` with `ok: false`, `reason: "unsupported"`, and the same `by`.
 Nothing is queued, and the pass continues to its normal terminal event.
 
-## Answers are not delivered to a running pass
+## Permission answers
 
-A pass does not accept an answer to a decision through this descriptor. A
-control verb other than `interrupt` — including an `answer` verb a supervisor
-might try to send — is recorded as `control.requested` and immediately
-answered with `control.applied`, `ok: false`, `reason: "unsupported"`, and the
-same `by`, exactly as steering is above. This is the same path, not a special
-case carved out for answers.
+Live permission answers require adopted policy and a derived profile. With an
+operator-owned `roles/<role>.settings.json`, an answer still receives
+`control.applied` with `ok: false`, `reason: "unsupported"`, and the same `by`.
+Ostrom never edits or composes over that operator-owned file.
 
-The reason is structural, not a missing feature. The harness is spawned
-headless, with `--print` and `stdout` piped for capture; it has no writable
-stdin, so there is no channel on which a running pass could be handed an
-answer even if ostrom wanted to send one. The session's `RunControl` is built
-with `NoSteer`, which cannot resume the harness session either. This is the
-same limitation that makes steering unsupported above, not a second one.
+For a derived profile, the pass writes per-run settings and MCP configuration
+under its run directory before spawning Claude. Settings contain the policy
+renderer's profile, without a hooks block, except for one override: the bridge
+sets `permissions.defaultMode` to `default` where the renderer emits `dontAsk`.
+Measured against Claude Code 2.1.265, an ungranted call under `dontAsk` is
+refused before the permission-prompt tool is ever consulted — there would be
+nothing for this bridge to receive — while `default` is the mode that reaches
+the tool for exactly that call. This override applies only to the bridged,
+per-run settings; an unbridged operator-owned or generated profile keeps
+`dontAsk`, which stays correct there because a prompt with nobody to answer it
+should be denied. The MCP config registers
+`ostrom permission-server --channel <private-path>` as `ostrom_permission` and
+sets its per-server `timeout` in milliseconds. Claude receives `--mcp-config`,
+`--strict-mcp-config`, `--permission-prompts host`, and
+`--permission-prompt-tool mcp__ostrom_permission__approve`.
 
-ostrom itself never raises a permission decision. Where a permission decision
-raised elsewhere is rendered for a principal, ostrom's hook output directs the
-reader to "Answer through the requesting process" rather than offering a
-command, because there is no `ostrom queue` verb for it. A decision ostrom
-does raise — a tripwire, a gate inconclusive, a budget decision, or one put
-to a human — is answered out of band, by a separate `ostrom
-queue` invocation that emits its own `decision.answered` on its own run; the
-pass that raised the decision has usually already finished by the time that
-answer lands.
+The channel file and transport messages are mode 0600 inside a mode 0700
+directory; the runner removes that directory, the settings, and the MCP config
+at run end, including interruption and errors. Durable events remain. Private
+channel opening supports Linux and macOS; other platforms refuse bridge setup.
+Two runs never share `roles/<role>.derived.settings.json`.
 
-A supervisor should treat `reason: "unsupported"` on an attempted answer as a
-definite negative acknowledgement, not as a reason to wait for a timeout, and
-should deliver the actual answer through the out-of-band `ostrom queue` path
-instead. ostrom issue #528 tracks a permission bridge that would let a
-running pass be answered directly; until that lands, the descriptor behaves
-as described here.
+The stdio server supports MCP initialization, tool discovery, and calls to its
+single `approve` tool. Claude sends `tool_name`, `input`, and `tool_use_id`;
+the response is one MCP text content block containing a JSON allow/deny object.
+An allow returns the original input in `updatedInput`.
+
+A call the actor's grants permit is auto-allowed by Claude itself under
+`default` mode before the permission-prompt tool is ever consulted, so
+unattended operation is unaffected: the grants that already authorize an
+operation keep authorizing it without a principal in the loop.
+
+Every call that does reach the tool becomes a decision, including one the
+bridge's own re-check of the rendered `Bash(ostrom <operation> *)` grants finds
+granted. That case should not arise, and its arrival is the reason it is not
+allowed: if a granted call reached the tool, something outside this profile
+refused it first — a working-directory or managed ask/deny rule, or a matcher
+disagreement — and allowing it would let ostrom out-permit the harness,
+overriding a rule the harness applied. That is exactly when a principal should
+see the call, so it escalates like any other and the dossier carries
+`outrankedGrant: true` to say the actor's own grants permitted what something
+else refused.
+
+A call the grants do not permit is exactly what reaches the permission-prompt
+tool. For that call, the handler asks the runner to emit `decision.requested`
+through its existing sink, then waits for an answer: this becomes a decision
+the principal answers, not an unattended denial. Shell syntax and quoted
+arguments the bridge's conservative check cannot recognize as a rendered
+grant fall into the same path. An unanswered decision expires and denies, as
+below.
+
+A decision offers `allow` and `deny`, sets `expiresAt` to its deadline, and sets
+ethogram's decision-level `onTimeout` to `deny`. Its wait is 30 seconds. The
+per-server MCP `timeout` is derived as `(wait + five-second margin) * 1000`,
+currently 35000 ms. The inequality test reads the emitted MCP and channel
+configurations. No environment inheritance is assumed for the path or timeout.
+
+Ostrom's explicit denial is the expiry mechanism. Its stable, model-visible
+message is `<tool_use_id>: no answer within onTimeout`, with `behavior: deny`
+and `interrupt: false`; a missed answer denies the tool call without stopping
+the pass. Pass caps still apply. No answer, a lost channel, and invalid transport
+data fail closed. A step-1 probe against Claude Code 2.1.265 observed a response
+after a 90 s stall being honoured. No shorter bound was in force; a bound above
+90 s was never measured. The design relies only on Ostrom's wait and explicitly
+sets the server timeout rather than inferring a harness default.
+
+The spawning supervisor sends an `answer` control whose `decisionId` is the
+harness's `tool_use_id` and whose `optionId` is an offered option. Before
+forwarding, the runner rejects unknown decisions, duplicate answers, and
+unoffered options with `no-such-decision`, `already-answered`, and
+`option-not-offered`. An expired or unavailable channel receives `not-live`.
+`by` is preserved without interpreting the principal identity.
+
+After the handler acknowledges the choice, the runner emits `decision.answered`
+with `requestedRunId` naming the asking run, followed by `control.applied` with
+`ok: true`. Expiry emits `decision.answered` with `byTimeout: true`; a forwarded
+control that did not arrive in time gets `ok: false`. Requests, replies, and
+receipts match on `tool_use_id`; the per-channel sequence only orders requests.
+Repeated tool-use ids cannot reuse an earlier allow.
+
+Claude Code 2.1.265's `doctor` validates the settings but ignores the MCP carrier:
+it also accepts deliberately malformed `mcpServers` fields. The agreement test
+passes the rendered files and pins that limitation. Local protocol and pass
+lifecycle tests cover the emitted MCP argv, framing, and timeout; doctor success
+is not evidence that Claude loaded the server.
+
+Tripwire, gate, budget, and other out-of-band decisions retain their existing
+`ostrom queue` answer path. Steering remains unsupported on a Claude pass.
 
 Malformed JSON, invalid drafts, and other event types produce
 `capture.refused` with `cause: "malformed"` and a bounded explanation. The reader
