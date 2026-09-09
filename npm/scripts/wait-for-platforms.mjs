@@ -1,27 +1,24 @@
-import { execFileSync } from 'node:child_process';
 import {
+  PLATFORM_WAIT_ATTEMPTS,
+  PLATFORM_WAIT_DELAY_MS,
   argValue,
   cargoVersion,
   config,
   platformPackageName,
+  registryHasVersion,
 } from './lib.mjs';
 
 const args = process.argv.slice(2);
 const version = argValue(args, '--version', cargoVersion());
-const attempts = Number(argValue(args, '--attempts', '20'));
-const delayMs = Number(argValue(args, '--delay-ms', '15000'));
+const attempts = Number(
+  argValue(args, '--attempts', String(PLATFORM_WAIT_ATTEMPTS)),
+);
+const delayMs = Number(
+  argValue(args, '--delay-ms', String(PLATFORM_WAIT_DELAY_MS)),
+);
 
 function visible(packageName) {
-  try {
-    const output = execFileSync(
-      'npm',
-      ['view', `${packageName}@${version}`, 'version'],
-      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
-    ).trim();
-    return output === version;
-  } catch {
-    return false;
-  }
+  return registryHasVersion(packageName, version);
 }
 
 const sleep = (milliseconds) =>
