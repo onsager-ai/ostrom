@@ -95,8 +95,13 @@ consumed as evidence.
 
 ## The frozen pass contract
 
-`ostrom pass <name>` is invoked as a child process by a scheduler — the units `ostrom up` generates
-locally, or any other. These are frozen and change only by a spec that both sides carry:
+`ostrom pass <name>` is invoked as a child process by a supervisor: by hand, or by any scheduler an
+operator writes. **Not by the units `ostrom up` generates** — those invoke `ostrom loop run <name>`
+(`ostrom-checks/src/umwelt_edge.rs`), and nothing generates an `ostrom pass` unit. A scheduler may
+still invoke a pass on a timer, but the argv is the same either way, so ostrom cannot observe that one
+did; that is why a pass declares `handoff` and not `loop` (#546), and why letting a scheduler declare
+its schedule is a change to this contract (#550). These are frozen and change only by a spec that both
+sides carry:
 
 - the argv shape `ostrom pass <role>` — today a fixed `builder | gatekeeper`; the open
   `ostrom pass <actor> [<operation>]` form is #447's intent, not the code (#537)
