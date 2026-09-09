@@ -193,7 +193,7 @@ fn operations_list_and_settings_follow_grants() {
         .expect("generate settings");
     assert!(settings.status.success());
     let settings = String::from_utf8(settings.stdout).expect("settings are UTF-8");
-    assert!(settings.contains("\"defaultMode\": \"deny\""));
+    assert!(settings.contains("\"defaultMode\": \"dontAsk\""));
     assert!(settings.contains("Bash(ostrom local-proof *)"));
     assert!(!settings.contains("gatekeeper"));
 }

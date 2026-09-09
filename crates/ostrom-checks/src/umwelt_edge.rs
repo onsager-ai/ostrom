@@ -539,7 +539,7 @@ pub fn resolved_operation_settings(
         .to_owned(),
         profile: HarnessProfile {
             environment: BTreeMap::from([("OSTROM_ACTOR".to_owned(), actor.to_owned())]),
-            default_mode: "deny".to_owned(),
+            default_mode: "dontAsk".to_owned(),
             allow,
         },
         ceilings: ostrom_store::umwelt_edge::run_ceilings(ceilings),
@@ -755,6 +755,17 @@ mod tests {
 
     use super::*;
 
+    // permissions.defaultMode enum read from Claude Code 2.1.265.
+    // This is the settings enum, not the --permission-mode flag's enum.
+    const CLAUDE_SETTINGS_DEFAULT_MODES: &[&str] = &[
+        "acceptEdits",
+        "auto",
+        "bypassPermissions",
+        "default",
+        "dontAsk",
+        "plan",
+    ];
+
     const POLICY: &str = "manifest_version: 1\nactors: {builder: {}, gatekeeper: {permission_mode: manual}}\noperations:\n  comment:\n    steps:\n      - uses: gh/post-verdict\n        with: {note: placeholder}\n  merge:\n    steps:\n      - uses: gh/merge-pr\n        requires: ready\ngrants:\n  builder-comment: {actors: builder, operations: comment}\n  gatekeeper-merge: {actors: gatekeeper, operations: merge}\n";
 
     fn command_catalogue(script: &str) -> CatalogueEnumeration {
@@ -824,7 +835,8 @@ mod tests {
 
         assert_eq!(resolved.prompt, "Resolve the selected operation.");
         assert_eq!(resolved.permission_mode, "auto");
-        assert_eq!(resolved.profile.default_mode, "deny");
+        assert_eq!(resolved.profile.default_mode, "dontAsk");
+        assert!(CLAUDE_SETTINGS_DEFAULT_MODES.contains(&resolved.profile.default_mode.as_str()));
         assert_eq!(resolved.profile.environment["OSTROM_ACTOR"], "builder");
         assert_eq!(resolved.profile.allow, ["Bash(ostrom comment *)"]);
         assert_eq!(resolved.ceilings.concurrent, Some(2));
@@ -839,7 +851,7 @@ mod tests {
                 "    \"OSTROM_ACTOR\": \"builder\"\n",
                 "  },\n",
                 "  \"permissions\": {\n",
-                "    \"defaultMode\": \"deny\",\n",
+                "    \"defaultMode\": \"dontAsk\",\n",
                 "    \"allow\": [\n",
                 "      \"Bash(ostrom comment *)\"\n",
                 "    ]\n",
