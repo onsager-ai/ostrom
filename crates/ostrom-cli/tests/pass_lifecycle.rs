@@ -2456,13 +2456,15 @@ fn permission_answer_crosses_fd_four_and_releases_the_real_mcp_process() {
 }
 
 #[test]
-fn granted_call_is_auto_allowed_without_a_decision_across_the_real_mcp_process() {
-    // The rendered grant covers "build-pass": real Claude auto-allows this call
-    // under the bridged profile's `defaultMode: "default"` before ever
-    // consulting the permission-prompt tool. If it arrives here anyway (this
-    // fixture drives the tool directly, unlike real Claude), ostrom's own
-    // belt-and-braces check must still allow it promptly and never raise a
-    // decision for the principal.
+fn a_granted_call_reaching_the_tool_escalates_across_the_real_mcp_process() {
+    // The rendered grant covers "build-pass", and real Claude auto-allows such a
+    // call under the bridged profile before the permission-prompt tool is ever
+    // consulted. This fixture drives the tool directly, so it stands in for the
+    // case where something outside ostrom's profile refused the call first: a cwd
+    // or managed ask/deny rule, or a matcher disagreement. ostrom must not allow
+    // what the harness refused, so it escalates like any other call, records that
+    // the actor's own grants permitted it, and -- with no supervisor here to
+    // answer -- expires closed.
     let fixture = Fixture::new(&bridge_harness("ostrom build-pass sample"));
     let keys = bridge_policy(&fixture);
     let output = fixture
@@ -2475,16 +2477,21 @@ fn granted_call_is_auto_allowed_without_a_decision_across_the_real_mcp_process()
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let events = fixture.run_events();
+    let requested = events
+        .iter()
+        .find(|e| e["type"] == "decision.requested")
+        .expect("a granted call that reaches the tool must raise a decision");
+    assert_eq!(
+        requested["payload"]["dossier"]["outrankedGrant"], true,
+        "the dossier must record that the actor's grants permitted this call"
+    );
     let hook: Value =
         serde_json::from_slice(&fs::read(fixture.state.join("permission-output.json")).unwrap())
             .unwrap();
-    assert_eq!(hook["behavior"], "allow");
-    assert!(
-        !fixture
-            .run_events()
-            .iter()
-            .any(|e| e["type"] == "decision.requested"),
-        "a granted call raised a decision instead of auto-allowing"
+    assert_eq!(
+        hook["behavior"], "deny",
+        "an unanswered escalation must expire closed, never fall open to allow"
     );
 }
 

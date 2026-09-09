@@ -353,29 +353,21 @@ impl PermissionBridge {
                     }
                     self.processed.insert(sequence);
                     let id = request.tool_use_id.clone();
-                    if granted(&self.allow, &request.input) {
-                        // A call the rendered allow rule permits is auto-allowed by
-                        // Claude itself before the permission-prompt tool is ever
-                        // consulted (measured, Claude Code 2.1.265: `defaultMode:
-                        // "default"` plus a matching allow rule never reaches the
-                        // tool), so a granted request should not normally arrive
-                        // here at all. Treat its arrival as belt-and-braces and
-                        // auto-allow rather than escalate a call the actor's own
-                        // grants already permit.
-                        let _ = publish(
-                            self.directory.path(),
-                            &member("reply", &id),
-                            &Reply {
-                                tool_use_id: id.clone(),
-                                option: "allow".to_owned(),
-                            },
-                        );
-                        continue;
-                    }
-                    // Ungranted: this is exactly the call `defaultMode: "default"`
-                    // forwards to the permission-prompt tool. Turn it into a decision
-                    // the principal can answer instead of denying it unattended.
-                    let draft = requested(&id, &request);
+                    // Every call that reaches the tool becomes a decision. An
+                    // ungranted one is the ordinary case: `defaultMode: "default"`
+                    // forwards exactly those, and turning them into a decision the
+                    // principal answers is what this bridge is for.
+                    //
+                    // A *granted* one is the interesting case. Claude auto-allows a
+                    // matching allow rule before the tool is consulted (measured,
+                    // 2.1.265), so a granted call arriving here means something
+                    // outranked the grant -- a cwd or managed ask/deny rule, or a
+                    // matcher disagreement. Allowing it would let ostrom out-permit
+                    // the harness, overriding a rule the harness applied. That is
+                    // precisely when a human should see it, so it escalates like any
+                    // other and the dossier says why.
+                    let outranked = granted(&self.allow, &request.input);
+                    let draft = requested(&id, &request, outranked);
                     events.append(draft)?;
                     self.pending.insert(
                         id,
@@ -506,7 +498,7 @@ fn granted(allow: &[String], input: &Value) -> bool {
     })
 }
 
-fn requested(id: &str, request: &Request) -> EventDraft {
+fn requested(id: &str, request: &Request, outranked_grant: bool) -> EventDraft {
     let question = excerpt(
         &format!(
             "Allow {} with input {}?",
@@ -525,7 +517,15 @@ fn requested(id: &str, request: &Request) -> EventDraft {
                 recommended_action: "deny".to_owned(),
                 blast_radius: "This tool call only".to_owned(),
                 truncated: Some(question.truncated),
-                extra: PayloadExtension::new(),
+                // Present only when true, and only then meaningful: the actor's own
+                // grants permit this call, yet it still reached the tool, so a rule
+                // outside ostrom's profile refused it first. A principal answering
+                // this decision should know that before choosing.
+                extra: if outranked_grant {
+                    PayloadExtension::from_iter([("outrankedGrant".to_owned(), true.into())])
+                } else {
+                    PayloadExtension::new()
+                },
             },
             options: vec![
                 DecisionOption {
@@ -1397,39 +1397,36 @@ mod tests {
     }
 
     #[test]
-    fn granted_calls_are_auto_allowed_without_escalation() {
-        // A call the rendered allow rule permits is auto-allowed by Claude itself
-        // before the permission-prompt tool is ever consulted, so it should not
-        // normally reach this bridge at all. If it does, this is the
-        // belt-and-braces path: allow it promptly, and never raise a decision.
+    fn a_granted_call_reaching_the_tool_escalates_and_is_flagged() {
+        // Claude auto-allows a matching allow rule before the tool is consulted, so
+        // a granted call arriving here means something outside ostrom's profile
+        // refused it first. Allowing it would let ostrom out-permit the harness, so
+        // it escalates like any other call and the dossier records the anomaly.
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let mut f = Fixture::new();
         let granted = json!({"tool_use_id": "toolu_test", "tool_name": "Bash", "input": {"command": "ostrom deploy item"}});
-        let handle = f.start_handler(granted, Duration::from_secs(2));
-        let until = Instant::now() + Duration::from_secs(1);
-        while !handle.is_finished() {
+        let _handle = f.start_handler(granted, Duration::from_secs(2));
+        let until = Instant::now() + Duration::from_secs(2);
+        loop {
             f.poll();
+            if !f.bridge.pending.is_empty() {
+                break;
+            }
             assert!(
                 Instant::now() < until,
-                "granted call was not promptly auto-allowed"
+                "granted call reaching the tool was not escalated"
             );
             thread::sleep(POLL);
         }
-        let output = handle.join().unwrap();
+        let requested = f
+            .wire()
+            .into_iter()
+            .find(|e| e.event_type == ethogram::DECISION_REQUESTED)
+            .expect("a granted call that reaches the tool must raise a decision");
         assert_eq!(
-            output["behavior"], "allow",
-            "granted call was not auto-allowed"
-        );
-        assert!(
-            f.bridge.pending.is_empty(),
-            "granted call was escalated into a pending decision"
-        );
-        f.poll();
-        assert!(
-            !f.wire()
-                .iter()
-                .any(|e| e.event_type == ethogram::DECISION_REQUESTED),
-            "granted call raised a decision instead of auto-allowing"
+            requested.payload["dossier"]["outrankedGrant"], true,
+            "the dossier must say the actor's grants permitted this call, so the \
+             principal knows something outranked them"
         );
     }
 
@@ -1644,7 +1641,7 @@ mod tests {
             expires_at: crate::Clock::realtime().now(),
             input: json!({"tool_name": "Bash", "input": {"command": "😀".repeat(MAX_EXCERPT_SCALARS + 100)}}),
         };
-        let value = requested("bounded", &request);
+        let value = requested("bounded", &request, false);
         ethogram::validate(&value.event_type, &value.payload).unwrap();
         assert_eq!(value.payload["dossier"]["truncated"], true);
         assert_eq!(

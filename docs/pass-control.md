@@ -85,11 +85,18 @@ An allow returns the original input in `updatedInput`.
 A call the actor's grants permit is auto-allowed by Claude itself under
 `default` mode before the permission-prompt tool is ever consulted, so
 unattended operation is unaffected: the grants that already authorize an
-operation keep authorizing it without a principal in the loop. The bridge
-independently re-checks the rendered `Bash(ostrom <operation> *)` grants,
-conservatively requiring an `ostrom` command with plain arguments, and treats
-a call its own check finds granted as belt-and-braces — it should not
-normally arrive at all — and auto-allows it rather than escalating.
+operation keep authorizing it without a principal in the loop.
+
+Every call that does reach the tool becomes a decision, including one the
+bridge's own re-check of the rendered `Bash(ostrom <operation> *)` grants finds
+granted. That case should not arise, and its arrival is the reason it is not
+allowed: if a granted call reached the tool, something outside this profile
+refused it first — a working-directory or managed ask/deny rule, or a matcher
+disagreement — and allowing it would let ostrom out-permit the harness,
+overriding a rule the harness applied. That is exactly when a principal should
+see the call, so it escalates like any other and the dossier carries
+`outrankedGrant: true` to say the actor's own grants permitted what something
+else refused.
 
 A call the grants do not permit is exactly what reaches the permission-prompt
 tool. For that call, the handler asks the runner to emit `decision.requested`
