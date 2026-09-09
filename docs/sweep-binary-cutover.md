@@ -35,23 +35,6 @@ Use `--mode full` for an operator-requested complete reconciliation. Normal
 `--mode auto` operation performs incremental issue acquisition when state is
 eligible and schedules a full reconciliation at least every 24 hours.
 
-## Recorded parity evidence
-
-The developer parity command compares the current Rust sweep with bytes
-captured from the retired implementation. It is hermetic and always disables
-publication:
-
-```sh
-OSTROM_HOME=/absolute/path/to/scratch \
-  ostrom parity sweep \
-  --started-at 2026-08-01T00:00:00Z \
-  --fixture crates/ostrom-cli/tests/fixtures/parity-sweep/github.json \
-  --recorded-queue crates/ostrom-cli/tests/fixtures/parity-sweep/queue.shell.jsonl
-```
-
-The scratch home must contain the matching placeholder `mandates.yaml`. Zero
-per-field divergences is the required result.
-
 ## Recovery
 
 There is no script rollback path. Stop or disable the timer if the installed

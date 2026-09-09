@@ -15,8 +15,6 @@ mod hooks;
 mod implement;
 mod lease;
 mod leaves;
-mod migration;
-mod parity;
 mod pass;
 mod pass_control;
 mod paths;
@@ -66,8 +64,6 @@ pub use leaves::{
     AuditError, AuditOptions, ExcuseError, LocalDriftError, audit, grant_excuse,
     grant_excuse_at_head, list_excuses, local_drift, revoke_excuse,
 };
-pub use migration::{MigrationOutcome, migrate};
-pub use parity::{ParityError, SweepParityOptions, SweepParityOutcome, run_sweep_parity};
 pub use pass::{
     MAX_TURNS as PASS_MAX_TURNS, PASS_KILL_GRACE_MS, PassError, PassRequest, PassRole,
     TRIAGE_PROMPT, run_pass,
