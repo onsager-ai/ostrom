@@ -861,6 +861,14 @@ mod tests {
     // Keep short deadline tests independent of each other's filesystem contention.
     static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    // A liveness backstop for fixture setup, not a property under test
+    // (ostrom#556): comfortably longer than any plausible scheduling delay, so
+    // a loaded machine cannot make a live request look expired -- or make
+    // `wait_request` give up -- before the assertions that follow have had a
+    // chance to run. Tests that deliberately exercise real expiry keep their
+    // own short, purpose-built duration instead of this one.
+    const GENEROUS_WAIT: Duration = Duration::from_secs(30);
+
     struct Fixture {
         root: TempDir,
         paths: OstromPaths,
@@ -916,7 +924,7 @@ mod tests {
             self.bridge.poll(&self.events).unwrap();
         }
         fn wait_request(&mut self) -> String {
-            let until = Instant::now() + Duration::from_secs(2);
+            let until = Instant::now() + GENEROUS_WAIT;
             loop {
                 self.poll();
                 if let Some(id) = self.bridge.pending.keys().next() {
@@ -1186,16 +1194,26 @@ mod tests {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         for option in ["allow", "deny"] {
             let mut f = Fixture::new();
-            let handle = f.start_handler(input(), Duration::from_secs(2));
+            let handle = f.start_handler(input(), GENEROUS_WAIT);
             let id = f.wait_request();
             f.answer(&id, option);
+            // The background handler can finish its round trip -- read the
+            // reply, publish its own receipt, return -- at any speed; join it
+            // now so the absence check below is a fact about program order,
+            // not a race against how fast that happened. `control.applied` is
+            // appended only by `poll()`'s `complete()`, or by `answer()`'s own
+            // immediate-reason branches (none of which apply to a live,
+            // on-time, valid answer) -- never as a side effect of forwarding
+            // or of the round trip completing. Asserting it here, after the
+            // round trip is certainly over and before `poll()` has run even
+            // once, proves that regardless of speed (ostrom#556).
+            let output = handle.join().unwrap();
             assert!(
                 !f.wire()
                     .iter()
                     .any(|e| e.event_type == ethogram::CONTROL_APPLIED),
                 "forward alone must not claim delivery"
             );
-            let output = handle.join().unwrap();
             if option == "deny" {
                 assert_denied(&output);
             } else {
@@ -1229,7 +1247,13 @@ mod tests {
     fn invalid_answers_never_reach_the_handler() {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let mut f = Fixture::new();
-        let handle = f.start_handler(input(), Duration::from_secs(2));
+        // A generous wait, not the property under test (ostrom#556): the
+        // request's own real expiry shares this value, and 2s of headroom
+        // could be exhausted by scheduling contention alone before this test
+        // ever gets to answer, making a live request look expired and turning
+        // "invalid answers never reach the handler" into "the request already
+        // expired," a different failure entirely.
+        let handle = f.start_handler(input(), GENEROUS_WAIT);
         let id = f.wait_request();
         for (id, option, reason) in [
             ("unknown", "allow", "no-such-decision"),
