@@ -605,10 +605,25 @@ fn applied(input: &ControlRequestedPayload, reason: Option<ControlAppliedReason>
         &ControlAppliedPayload {
             control_id: input.control_id.clone(),
             ok: reason.is_none(),
+            // The applier is the principal that made the request. ostrom has
+            // that identity in hand, unlike umwelt, which is why this is
+            // `Some` here and `None` there (onsager-ai/umwelt#46).
+            //
+            // It was already on the wire, carried through the untyped `extra`
+            // extension because ethogram had no typed member for it until
+            // onsager-ai/ethogram#67. This moves it to the typed field.
+            //
+            // The bytes are expected to be unchanged -- ethogram sorts payload
+            // keys explicitly, so `by` lands in the same position either way --
+            // but nothing in this repository proves that: `decision_fixtures.rs`
+            // captures decision events and holds no `control.applied` at all.
+            // Stated as the expectation it is, rather than cited to a golden
+            // that does not cover it.
+            by: Some(input.by.clone()),
             reason,
             truncated: None,
             landed_in: None,
-            extra: PayloadExtension::from_iter([("by".to_owned(), input.by.clone().into())]),
+            extra: PayloadExtension::new(),
         },
     )
 }

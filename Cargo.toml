@@ -5,6 +5,12 @@ members = [
     "crates/ostrom-core",
     "crates/ostrom-store",
 ]
+# The vendored ethogram tree carries its own [workspace]. Without this exclude
+# Cargo binds ethogram/crates/ethogram to ostrom's workspace instead, so its
+# version.workspace and serde_json.workspace resolve against ostrom -- the
+# crate reports ostrom's version and silently loses serde_json's
+# float_roundtrip, which ethogram requires for correct money-field round-trips.
+exclude = ["ethogram"]
 resolver = "2"
 
 [workspace.package]
@@ -20,7 +26,7 @@ chrono = { version = "=0.4.44", default-features = false, features = ["std", "se
 clap = { version = "4.5.45", features = ["derive"] }
 base64 = "=0.22.1"
 directories = "6.0.0"
-ethogram = { git = "https://github.com/onsager-ai/ethogram", rev = "9e3cd3701b88b53f9b18e93480a477b3724dab40" }
+ethogram = { path = "ethogram/crates/ethogram" }
 indexmap = "2"
 regex = "=1.12.3"
 rsa = { version = "=0.9.8", features = ["sha2"] }
@@ -33,8 +39,8 @@ serde_yaml = "0.9.34"
 tempfile = "3.20.0"
 thiserror = "2.0.16"
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }
-umwelt-capture = { git = "https://github.com/onsager-ai/umwelt.git", rev = "1c2c1f60e80d13a1cd9f1e2b020a9976cc7f5ee2" }
-umwelt-runtime = { git = "https://github.com/onsager-ai/umwelt.git", rev = "1c2c1f60e80d13a1cd9f1e2b020a9976cc7f5ee2" }
+umwelt-capture = { git = "https://github.com/onsager-ai/umwelt.git", rev = "e3581e32" }
+umwelt-runtime = { git = "https://github.com/onsager-ai/umwelt.git", rev = "e3581e32" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -43,3 +49,12 @@ unsafe_code = "forbid"
 all = { level = "deny", priority = -1 }
 disallowed_types = "allow"
 disallowed_methods = "deny"
+
+# umwelt depends on ethogram by git rev. With ostrom's own dependency moved to
+# the vendored path, those are two distinct copies of one crate and every type
+# crossing the boundary stops unifying -- 27 compile errors of the form
+# "expected ethogram::Event, found ethogram::Event". The patch redirects the
+# git source to the vendored tree so there is exactly one ethogram in the
+# graph. It is removed when umwelt is folded and stops being a git dependency.
+[patch."https://github.com/onsager-ai/ethogram"]
+ethogram = { path = "ethogram/crates/ethogram" }
