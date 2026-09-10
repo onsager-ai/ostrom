@@ -1,0 +1,44 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The workspace-detection guard that made this job a vacuous pass is gone: the
+      # onsager-ai/umwelt#2 extraction PR created Cargo.toml, so the three steps below always run
+      # and a failure is a real failure. rust-toolchain.toml pins the toolchain and
+      # carries rustfmt and clippy, so there is no component-installation step.
+      - name: Toolchain
+        run: rustc --version && cargo --version && cargo fmt --version && cargo clippy --version
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      # Run twice: `--all-features` turns on preserve-order-probe, which
+      # reproduces a consumer enabling serde_json/preserve_order somewhere in
+      # the dependency graph. Without the plain run first, the feature-off
+      # path — the one umwelt itself actually builds under — would go
+      # untested and "identical either way" would only be proven one way.
+      - name: cargo test
+        run: cargo test --workspace
+
+      - name: cargo test --all-features
+        run: cargo test --workspace --all-features

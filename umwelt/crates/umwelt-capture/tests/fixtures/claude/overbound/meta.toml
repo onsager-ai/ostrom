@@ -1,0 +1,30 @@
+harness = "claude-code"
+cli_version = "2.1.263"
+captured_at = "2026-09-07"
+model = "claude-haiku-4-5-20251001"
+command = "claude -p --output-format stream-json --verbose --model haiku"
+prompt_source = "stdin"
+events = 13
+
+exercises = [
+  "ONE assistant text block of 190,253 UTF-16 code units — trips the 16 KiB bound",
+]
+
+incomplete = true
+incomplete_reason = "The run hit the capturing session's own wall-clock before a terminal frame, so there is NO result event. Usable as the truncation fixture; NOT usable as a complete session."
+
+[scrub]
+narration = "the over-bound text is `lorem` repeated and is already placeholder-shaped; left byte-identical so the bound and cut point stay honest. Other narration replaced at exact length."
+ids = "real (session_id)"
+paths = "absolute paths rewritten under /workspace"
+
+[notes]
+boundary = "The text is pure ASCII, so truncation cannot land mid-surrogate. This fixture exercises the BOUND, not the code-point boundary rule. The astral case is covered by constructed tests in both SDKs (ethogram-fb verified 14 inputs cross-SDK); a paid capture for it was considered and deliberately declined."
+assertion = "excerpt() on this text (onsager-ai/chreode#472, merged): kept=16384, truncated=true, no lone surrogate, valid UTF-8 round trip."
+
+[chreode_output]
+file = "chreode-output.jsonl"
+what = "Output of chreode's claude normaliser over raw.ndjson. Kept for DIFFING against umwelt's normaliser. NOT an expectation."
+correct_for_this_harness = true
+contents = "2 drafts: agent.started, and one agent.text with truncated=true (16384 chars kept from a 190,253-char source)."
+caveat = "This capture has no result frame, so there is no agent.completed and no cost or usage to fold. See incomplete_reason above."

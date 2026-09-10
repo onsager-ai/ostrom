@@ -1,0 +1,37 @@
+[package]
+name = "umwelt-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[example]]
+name = "capture_interrupt"
+test = true
+
+[features]
+conformance = []
+# Not a product feature. It reproduces, inside this crate's own CI, what a
+# consumer does to us when it enables serde_json's `preserve_order` anywhere in
+# the dependency graph — Cargo unifies features, so that choice reaches this
+# crate whether or not it wants it. ostrom's workspace enables it. The trace
+# bytes must come out identical either way, so CI runs the suite twice: once
+# plain, once with this on.
+preserve-order-probe = ["serde_json/preserve_order"]
+
+[dependencies]
+chrono.workspace = true
+ethogram.workspace = true
+indexmap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+toml.workspace = true
+umwelt-capture = { path = "../umwelt-capture" }
+
+[lints]
+workspace = true
