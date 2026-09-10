@@ -246,6 +246,9 @@ fn inspect_worktree(
         Err(error) if error.starts_with(UNMERGED_LOCAL_COMMITS_PREFIX) => {
             report.reason = UNMERGED_LOCAL_COMMITS_REASON.to_owned();
         }
+        Err(error) if error.starts_with(PUBLICATION_UNVERIFIABLE_PREFIX) => {
+            report.reason = PUBLICATION_UNVERIFIABLE_REASON.to_owned();
+        }
         Err(_) => report.reason = "worktree-removal-failed".to_owned(),
     }
     report
@@ -582,12 +585,24 @@ pub(crate) struct ReclaimedWorktree {
     pub branch_count: usize,
 }
 
-/// `reclaim_worktree`'s error message starts with this when the branch has
-/// commits the default branch does not, so a caller can tell "would destroy
-/// unpushed work" apart from every other failure without inventing a second
-/// error type across the crate boundary this function is shared over.
+/// `reclaim_worktree`'s error message starts with one of these when the
+/// reclaim was refused to protect work, so a caller can tell those apart from
+/// every other failure without inventing a second error type across the crate
+/// boundary this function is shared over.
+///
+/// The two are kept separate because they ask the operator for different
+/// things. `unmerged-local-commits` says the branch carries commits the
+/// published tip does not: push it, or decide the work is dead.
+/// `publication-unverifiable` says nothing here is known to be unpushed --
+/// there was simply no published tip to check against, because no pull request
+/// resolved this item or the one that did carried no `headRefOid`. Reporting
+/// the second as the first sends the operator looking for unmerged work that
+/// may not exist, and hides the size of the permanently-retained backlog,
+/// which is the number worth counting.
 pub(crate) const UNMERGED_LOCAL_COMMITS_PREFIX: &str = "unmerged-local-commits:";
 pub(crate) const UNMERGED_LOCAL_COMMITS_REASON: &str = "unmerged-local-commits";
+pub(crate) const PUBLICATION_UNVERIFIABLE_PREFIX: &str = "publication-unverifiable:";
+pub(crate) const PUBLICATION_UNVERIFIABLE_REASON: &str = "publication-unverifiable";
 
 pub(crate) fn reclaim_worktree(
     source: &Path,
@@ -634,7 +649,7 @@ pub(crate) fn reclaim_worktree(
             }
             Err(()) => {
                 return Err(format!(
-                    "{UNMERGED_LOCAL_COMMITS_PREFIX} could not verify branch {branch} against a published tip"
+                    "{PUBLICATION_UNVERIFIABLE_PREFIX} could not verify branch {branch} against a published tip"
                 ));
             }
         }

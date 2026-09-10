@@ -306,6 +306,11 @@ fn closed_item_without_any_pull_request_cannot_verify_publication_and_is_retaine
     // `headRefOid` to check the branch's tip against -- the content-safety
     // guard in `reclaim_worktree` has nothing to verify and must refuse,
     // even though `resolution_state` itself is satisfied the item is done.
+    //
+    // The reason must be `publication-unverifiable`, not
+    // `unmerged-local-commits`: nothing here is known to be unpushed, and
+    // naming it after unmerged work sends the operator hunting for commits
+    // that may not exist instead of for the missing pull request.
     let fixture = Fixture::new();
     let output = run(fixture.command(true).env(
         "OSTROM_TEST_ISSUE",
@@ -313,7 +318,7 @@ fn closed_item_without_any_pull_request_cannot_verify_publication_and_is_retaine
     ));
     let rows = output_rows(&output);
     assert_eq!(rows[0]["outcome"], "retained");
-    assert_eq!(rows[0]["reason"], "unmerged-local-commits");
+    assert_eq!(rows[0]["reason"], "publication-unverifiable");
     assert!(fixture.worktree.exists());
     assert!(
         Command::new("git")
