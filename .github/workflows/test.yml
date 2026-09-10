@@ -151,8 +151,13 @@ jobs:
       - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
         with:
           node-version: 24
-          cache: pnpm
-          cache-dependency-path: ethogram/pnpm-lock.yaml
+          # No `cache: pnpm`. Its post step runs `pnpm store path` from the
+          # repository root, where action post steps ignore
+          # `defaults.run.working-directory` -- and Corepack cannot resolve
+          # pnpm there, because `packageManager` lives in
+          # `ethogram/package.json` and ostrom has no root `package.json`. The
+          # post step then fails and reds an otherwise green job. The install
+          # it would have saved takes seconds.
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
       - name: Typecheck
@@ -176,8 +181,13 @@ jobs:
       - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
         with:
           node-version: 24
-          cache: pnpm
-          cache-dependency-path: ethogram/pnpm-lock.yaml
+          # No `cache: pnpm`. Its post step runs `pnpm store path` from the
+          # repository root, where action post steps ignore
+          # `defaults.run.working-directory` -- and Corepack cannot resolve
+          # pnpm there, because `packageManager` lives in
+          # `ethogram/package.json` and ostrom has no root `package.json`. The
+          # post step then fails and reds an otherwise green job. The install
+          # it would have saved takes seconds.
       - name: Install dependencies
         working-directory: ethogram
         run: pnpm install --frozen-lockfile
