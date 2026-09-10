@@ -613,12 +613,14 @@ fn applied(input: &ControlRequestedPayload, reason: Option<ControlAppliedReason>
             // extension because ethogram had no typed member for it until
             // onsager-ai/ethogram#67. This moves it to the typed field.
             //
-            // The bytes are expected to be unchanged -- ethogram sorts payload
-            // keys explicitly, so `by` lands in the same position either way --
-            // but nothing in this repository proves that: `decision_fixtures.rs`
-            // captures decision events and holds no `control.applied` at all.
-            // Stated as the expectation it is, rather than cited to a golden
-            // that does not cover it.
+            // The value and its presence are covered: `pass_lifecycle.rs:335`
+            // and `:454` assert `payload["by"]` on a real emission. What is
+            // not covered here is **key order** -- `serialise_event`
+            // (`run_events.rs:456`) sorts payload keys explicitly, so `by`
+            // should land in the same position typed as it did through
+            // `extra`, and no test in this repository pins that. Not cited to
+            // `decision_fixtures.rs`, which captures decision events and holds
+            // no `control.applied` at all.
             by: Some(input.by.clone()),
             reason,
             truncated: None,

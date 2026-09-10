@@ -151,13 +151,14 @@ jobs:
       - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
         with:
           node-version: 24
-          # No `cache: pnpm`. Its post step runs `pnpm store path` from the
-          # repository root, where action post steps ignore
-          # `defaults.run.working-directory` -- and Corepack cannot resolve
-          # pnpm there, because `packageManager` lives in
-          # `ethogram/package.json` and ostrom has no root `package.json`. The
-          # post step then fails and reds an otherwise green job. The install
-          # it would have saved takes seconds.
+          # No `cache: pnpm`, and re-enabling it needs more than adding the
+          # line back. setup-node computes the pnpm store path at the
+          # repository root -- action post steps ignore
+          # `defaults.run.working-directory` -- while the install runs under
+          # the imported tree and populates a different store. The post step
+          # then fails its own path validation ("Path(s) specified in the
+          # action for caching do(es) not exist"), which reds a job whose every
+          # real step passed. The install it would have saved takes seconds.
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
       - name: Typecheck
@@ -165,10 +166,7 @@ jobs:
       - name: Test
         run: |
           pnpm -r test 2>&1 | tee ../ethogram-ts.log
-          grep -qE '^.{0,4}tests 162$' ../ethogram-ts.log \
-            || { echo "::error title=ethogram TypeScript count moved::expected 162 tests"; exit 1; }
-          grep -qE '^.{0,4}fail 0$' ../ethogram-ts.log \
-            || { echo "::error title=ethogram TypeScript failures::expected 0 failures"; exit 1; }
+          node ../.github/scripts/assert-node-test-count.mjs ../ethogram-ts.log 162
 
   ethogram-conformance:
     name: ethogram cross-language conformance
@@ -181,13 +179,14 @@ jobs:
       - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
         with:
           node-version: 24
-          # No `cache: pnpm`. Its post step runs `pnpm store path` from the
-          # repository root, where action post steps ignore
-          # `defaults.run.working-directory` -- and Corepack cannot resolve
-          # pnpm there, because `packageManager` lives in
-          # `ethogram/package.json` and ostrom has no root `package.json`. The
-          # post step then fails and reds an otherwise green job. The install
-          # it would have saved takes seconds.
+          # No `cache: pnpm`, and re-enabling it needs more than adding the
+          # line back. setup-node computes the pnpm store path at the
+          # repository root -- action post steps ignore
+          # `defaults.run.working-directory` -- while the install runs under
+          # the imported tree and populates a different store. The post step
+          # then fails its own path validation ("Path(s) specified in the
+          # action for caching do(es) not exist"), which reds a job whose every
+          # real step passed. The install it would have saved takes seconds.
       - name: Install dependencies
         working-directory: ethogram
         run: pnpm install --frozen-lockfile
@@ -201,3 +200,32 @@ jobs:
           grep -q 'compared 31 fixtures' ../conformance.log
           grep -q 'compared 23 validation error cases' ../conformance.log
           grep -q 'compared 6 agreement inputs' ../conformance.log
+
+  umwelt-rust:
+    name: umwelt suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Test the imported tree
+        run: |
+          cargo test --manifest-path umwelt/Cargo.toml --workspace \
+            2>&1 | tee umwelt-rust.log
+          node .github/scripts/assert-cargo-count.mjs umwelt-rust.log 144
+
+  umwelt-preserve-order-probe:
+    name: umwelt under a consumer's preserve_order
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      # ostrom's workspace enables serde_json/preserve_order and Cargo unifies
+      # features across a graph, so this reaches umwelt whether it wants it or
+      # not. onsager-ai/umwelt#45 answered that with an explicit recursive key sort; this
+      # run is what keeps that sort honest. Without it the trace bytes could
+      # move under a consumer's feature and nothing here would notice.
+      - name: Test with the probe feature
+        run: |
+          cargo test --manifest-path umwelt/Cargo.toml --workspace --all-features \
+            2>&1 | tee umwelt-probe.log
+          node .github/scripts/assert-cargo-count.mjs umwelt-probe.log 145

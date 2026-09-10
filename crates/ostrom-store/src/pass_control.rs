@@ -136,8 +136,8 @@ pub(crate) fn unsupported(request: &ControlRequestedPayload) -> [EventDraft; 2] 
                 control_id: request.control_id.clone(),
                 ok: false,
                 // Typed now that ethogram has the member; previously smuggled
-                // through `extra`. Bytes expected unchanged, unproven here --
-                // see the note in permission_bridge.rs.
+                // through `extra`. Value and presence are covered; only key
+                // order is unpinned -- see the note in permission_bridge.rs.
                 by: Some(request.by.clone()),
                 reason: Some(ControlAppliedReason::Unsupported),
                 truncated: None,

@@ -1642,7 +1642,8 @@ mod sink_refusal_tests {
 
     use super::{
         Clock, OstromPaths, OwnedLease, PassError, PassGuard, PassRole, ProcessExit, RunEventError,
-        RunEventGuard, RunEventStart, RunKind, append_observed, read_trace, sink_refused_draft,
+        RunEventGuard, RunEventStart, RunKind, append_observed, capture_refused_draft, read_trace,
+        sink_refused_draft,
     };
 
     fn assert_refused_pass_finishes(payload: Value) -> Value {
@@ -1809,12 +1810,10 @@ mod sink_refusal_tests {
         // stated rule.
         //
         // What ostrom owns is that the sink refused, that the refusal was
-        // stored with a usable detail, and that the detail names the field
-        // this test chose to corrupt. `text` is this test's own knowledge.
-        // The typed field, not the prose. `field` is a countable fact in the
-        // same payload and names what ostrom corrupted; keying on it is what
-        // this test claims to do, and `detail.contains("text")` would still
-        // have been an assertion about wording.
+        // stored, and which field it attributed the refusal to. `field` is a
+        // countable fact in the same payload and holds `payload.text`, so it
+        // survives any rewording and fails if the attribution moves. The
+        // detail is asserted non-empty and nothing more.
         assert_eq!(refusal["field"], "payload.text");
         assert!(
             refusal["detail"]
@@ -1876,6 +1875,32 @@ mod sink_refusal_tests {
         assert_eq!(payload["truncated"], true);
         assert_eq!(
             payload["detail"]
+                .as_str()
+                .expect("bounded detail")
+                .chars()
+                .count(),
+            MAX_EXCERPT_SCALARS
+        );
+    }
+
+    /// The same bound, on the other producer of `capture.refused`.
+    ///
+    /// `capture_refused_draft` excerpts a `CaptureFault`'s message the same way
+    /// `sink_refused_draft` excerpts a sink's detail, and until now nothing
+    /// tripped it. A normaliser rejection carries the offending input in its
+    /// reason, so an oversized raw line reaches this path in production --
+    /// which is exactly the case that must stay storable.
+    #[test]
+    fn a_capture_fault_message_is_bounded_too() {
+        let draft = capture_refused_draft(
+            "capture-bound",
+            &umwelt_capture::CaptureFault::NormaliserRejected {
+                reason: "🦀".repeat(MAX_EXCERPT_SCALARS + 1),
+            },
+        );
+        assert_eq!(draft.payload["truncated"], true);
+        assert_eq!(
+            draft.payload["detail"]
                 .as_str()
                 .expect("bounded detail")
                 .chars()
