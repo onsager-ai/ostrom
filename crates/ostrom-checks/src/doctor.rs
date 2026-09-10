@@ -11,7 +11,7 @@ use std::{
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use ostrom_core::ActionDefinition;
-use ostrom_store::environment;
+use ostrom_store::{DISPATCH_FAILURE_CLEARED_KIND, environment};
 use serde_json::{Map, Value, json};
 
 use crate::{
@@ -1437,7 +1437,11 @@ fn active_dispatch_failure_escalations(source: &str) -> Vec<String> {
                     .unwrap_or("reason unavailable");
                 active.insert(item_id.to_owned(), reason.to_owned());
             }
-            Some("work-completed" | "queue-item-dropped") => {
+            Some(kind)
+                if kind == "work-completed"
+                    || kind == "queue-item-dropped"
+                    || kind == DISPATCH_FAILURE_CLEARED_KIND =>
+            {
                 active.remove(item_id);
             }
             _ => {}
@@ -1951,6 +1955,33 @@ mod tests {
                 "WARN|work-orders|0 in flight; repeated dispatch failures escalated: placeholder-org/alpha#7 (branch-already-pushed)|",
                 "inspect the named failure and resolve it before dispatching the item again\n",
             )
+        );
+    }
+
+    /// The operator's manual release valve (`ostrom trace append
+    /// dispatch-failure-cleared ...`) must clear an escalation here the same
+    /// way `work-completed` and `queue-item-dropped` already do, or the
+    /// doctor keeps warning about an item dispatch itself has already
+    /// resumed retrying.
+    #[test]
+    fn work_orders_treats_a_manual_release_as_clearing_an_escalation() {
+        let fixture = Fixture::new();
+        let state = fixture.config_dir.join("ostrom");
+        fs::create_dir_all(&state).unwrap();
+        fs::write(
+            state.join("sprint.jsonl"),
+            concat!(
+                r#"{"ts":"2026-08-19T01:00:00Z","kind":"dispatch-failure-escalated","fact":{"schema_version":1,"item_id":"placeholder-org/alpha#7","order_id":"placeholder-order","action":"suppress-dispatch","failure_reason":"branch-already-pushed","failure_count":2},"narration":{"reason":"Repeated failure.","conclusion":"Dispatch suppressed."}}"#,
+                "\n",
+                r#"{"ts":"2026-08-19T02:00:00Z","kind":"dispatch-failure-cleared","fact":{"schema_version":1,"item_id":"placeholder-org/alpha#7"},"narration":{"reason":"Operator cleared it.","conclusion":"No longer suppressed."}}"#,
+                "\n",
+            ),
+        )
+        .expect("write escalation and release trace");
+
+        assert_eq!(
+            run_doctor_check(fixture.options(), "work-orders").unwrap(),
+            "OK|work-orders|no work orders in flight|\n"
         );
     }
 

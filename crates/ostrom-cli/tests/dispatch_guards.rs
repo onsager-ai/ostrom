@@ -403,6 +403,103 @@ fn a_second_identical_dispatch_failure_escalates_and_suppresses_a_third_attempt(
     );
 }
 
+/// #259 x #554 (ruling, part 1): a reclaim or a drop is a state change that
+/// makes two earlier identical failures stale evidence, so the newest-first
+/// walk must also break on `worktree-reclaimed` and `queue-item-dropped` --
+/// and on the operator's manual release valve, `dispatch-failure-cleared`,
+/// for the escalation that would otherwise have no path back once dispatch
+/// itself is what refuses. Each reset fact is appended here the way an
+/// upstream actor (a reclaimed worktree, a queue reconciliation, or an
+/// operator running `ostrom trace append`) would produce it -- this PR does
+/// not itself produce `worktree-reclaimed` (that arrives with #554).
+#[test]
+fn a_reset_fact_clears_a_repeated_failure_escalation() {
+    for reset_kind in [
+        "worktree-reclaimed",
+        "queue-item-dropped",
+        "dispatch-failure-cleared",
+    ] {
+        let fixture = Fixture::new();
+        for _ in 0..2 {
+            let output = run(fixture
+                .command()
+                .env("OSTROM_TEST_BRANCH_PAGE_1", matched_page()));
+            assert_refused(&output, 3, "matched_key=branch_name");
+        }
+        assert!(
+            fixture
+                .trace()
+                .iter()
+                .any(|row| row["kind"] == "dispatch-failure-escalated"),
+            "{reset_kind}: escalation did not record on the second identical failure"
+        );
+
+        let mut trace =
+            fs::read_to_string(fixture.state.join("sprint.jsonl")).expect("read seeded trace");
+        trace.push_str(&format!(
+            "{{\"ts\":{ts:?},\"kind\":{kind:?},\"fact\":{{\"item_id\":{item:?}}},\"narration\":{{}}}}\n",
+            ts = fixture.timestamp(),
+            kind = reset_kind,
+            item = ITEM_ID,
+        ));
+        fs::write(fixture.state.join("sprint.jsonl"), trace).expect("write reset trace");
+
+        let output = run(fixture
+            .command()
+            .env("OSTROM_TEST_BRANCH_PAGE_1", default_page()));
+        assert!(
+            output.status.success(),
+            "{reset_kind}: dispatch should proceed once the escalation is reset: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            fixture.calls.exists(),
+            "{reset_kind}: the reset dispatch must reach systemd"
+        );
+    }
+}
+
+/// #259 x #554 (ruling, part 2): the guard now runs after
+/// `reject_closing_pull_requests` rather than before `preflight_worktree`,
+/// so a dispatch with an active escalation still pays for the branch and
+/// closing-pull-request reads before refusing -- which is what lets a
+/// same-pass reclaim (via a merged closing pull request, added by #554)
+/// clear the escalation before the guard is ever reached.
+#[test]
+fn the_repeated_failure_guard_runs_after_the_closing_pull_request_check() {
+    let fixture = Fixture::new();
+    for _ in 0..2 {
+        let output = run(fixture
+            .command()
+            .env("OSTROM_TEST_BRANCH_PAGE_1", matched_page()));
+        assert_refused(&output, 3, "matched_key=branch_name");
+    }
+    assert!(
+        fixture
+            .trace()
+            .iter()
+            .any(|row| row["kind"] == "dispatch-failure-escalated"),
+        "escalation did not record on the second identical failure"
+    );
+
+    let gh_log = fixture.root.path().join("gh.calls");
+    let third = run(fixture
+        .command()
+        .env("OSTROM_TEST_BRANCH_PAGE_1", default_page())
+        .env("OSTROM_TEST_GH_LOG", &gh_log));
+    assert_refused(&third, 3, "repeated failure escalated");
+    assert!(
+        !fixture.calls.exists(),
+        "an escalated item must not reach systemd"
+    );
+
+    let log = fs::read_to_string(&gh_log).unwrap_or_default();
+    assert!(
+        log.contains("issue view"),
+        "reject_closing_pull_requests must run before the repeated-failure guard refuses: {log}"
+    );
+}
+
 #[test]
 fn degraded_branch_evidence_fails_closed_with_a_named_trace() {
     for (variable, value, detail) in [

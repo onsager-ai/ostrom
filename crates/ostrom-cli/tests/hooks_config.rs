@@ -170,6 +170,69 @@ projects:
     assert!(stdout.contains(
         "placeholder-org/alpha#7 — branch-already-pushed (2 identical failures; dispatch suppressed)"
     ));
+    assert!(
+        stdout.contains("ostrom trace append dispatch-failure-cleared"),
+        "the digest must tell the operator how to clear an escalation: {stdout}"
+    );
+}
+
+/// Companion to `digest_surfaces_repeated_dispatch_failure_escalations`: an
+/// escalation that has already resolved -- by `work-completed`,
+/// `queue-item-dropped`, or the operator's manual
+/// `dispatch-failure-cleared` -- must not be reported as still needing
+/// attention. Doctor's `active_dispatch_failure_escalations` already applies
+/// this clearing rule; before this fix the digest did not, so an item that
+/// escalated and resolved inside one digest window read as unresolved here.
+#[test]
+fn digest_omits_dispatch_failure_escalations_that_have_already_resolved() {
+    let fixture = tempdir().expect("temporary digest fixture");
+    fs::write(
+        fixture.path().join("mandates.yaml"),
+        r#"provider: file
+cadence_hours: 24
+stuck_after_days: 7
+search_roots: []
+bounce_all: []
+projects:
+  - repo: placeholder-org/alpha
+    delegated: []
+    excluded: []
+    reserved: []
+    default: delegated
+    paused: false
+    bounce: []
+"#,
+    )
+    .unwrap();
+    fs::write(fixture.path().join("queue.jsonl"), "").unwrap();
+    fs::write(
+        fixture.path().join("state.json"),
+        "{\"version\":2,\"repos\":{}}\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.path().join("sprint.jsonl"),
+        concat!(
+            r#"{"ts":"2026-08-19T01:00:00Z","kind":"dispatch-failure-escalated","fact":{"schema_version":1,"item_id":"placeholder-org/alpha#7","order_id":"placeholder-order","action":"suppress-dispatch","failure_reason":"branch-already-pushed","failure_count":2},"narration":{"reason":"Repeated failure.","conclusion":"Dispatch suppressed."}}"#,
+            "\n",
+            r#"{"ts":"2026-08-19T02:00:00Z","kind":"dispatch-failure-cleared","fact":{"schema_version":1,"item_id":"placeholder-org/alpha#7"},"narration":{"reason":"Operator cleared it.","conclusion":"No longer suppressed."}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .args(["hook", "digest"])
+        .env("OSTROM_HOME", fixture.path())
+        .current_dir(fixture.path())
+        .output()
+        .expect("render digest");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 digest");
+    assert!(
+        !stdout.contains("DISPATCH FAILURES ESCALATED"),
+        "a cleared escalation must not be reported: {stdout}"
+    );
 }
 
 #[test]

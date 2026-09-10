@@ -722,7 +722,7 @@ fn run_sweep_with_minter_and_publication_source(
                 ]),
                 narration: Map::from_iter([(
                     "conclusion".to_owned(),
-                    json!("The queue item was removed because its GitHub issue is closed."),
+                    json!("The queue item was removed because its subject is no longer open."),
                 )]),
             },
         )?;
@@ -1158,13 +1158,74 @@ fn acquire_repository(
 }
 
 fn fetch_open_issues(repo: &str) -> Result<Vec<Value>, SweepError> {
+    fetch_open_issues_with(
+        repo,
+        || {
+            gh_json(&[
+                "api",
+                "-X",
+                "GET",
+                "search/issues",
+                "-f",
+                &format!("q=repo:{repo} is:issue is:open"),
+                "-F",
+                "per_page=1",
+            ])
+        },
+        |page| gh_json(&["api", "-X", "GET", &open_issues_page_endpoint(repo, page)]),
+    )
+}
+
+/// `sort=created` is deliberate: creation time never changes, so an issue
+/// updated mid-crawl cannot move across the page boundary. `sort=updated`
+/// let an already-fetched issue's update shift every issue behind it up one
+/// slot, silently dropping the one at the boundary from this crawl -- and
+/// from `analyze_repository`'s `open_ids`, which then evicted its
+/// still-open queue row as `subject-closed`.
+fn open_issues_page_endpoint(repo: &str, page: u64) -> String {
+    format!("repos/{repo}/issues?state=open&sort=created&direction=asc&per_page=100&page={page}")
+}
+
+fn fetch_open_issues_with(
+    repo: &str,
+    fetch_count: impl FnOnce() -> Result<Value, SweepError>,
+    mut fetch_page: impl FnMut(u64) -> Result<Value, SweepError>,
+) -> Result<Vec<Value>, SweepError> {
+    // Every sibling crawl in this file refuses a truncated result rather than
+    // trusting a short page: `fetch_branches` against `QUERY_LIMIT`,
+    // `fetch_merged_pull_requests` against `search/issues`'s `total_count`.
+    // This follows the merged-pull-request shape: read the exhaustive count
+    // once from search, then refuse if the REST crawl disagrees or the count
+    // itself exceeds GitHub's exhaustive search limit.
+    let search_result = fetch_count()?;
+    let total_count = search_result
+        .get("total_count")
+        .and_then(Value::as_u64)
+        .and_then(|count| usize::try_from(count).ok())
+        .ok_or_else(|| {
+            SweepError::Acquisition(format!(
+                "open issue count query for {repo} returned no result count"
+            ))
+        })?;
+    let incomplete = search_result
+        .get("incomplete_results")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if incomplete {
+        return Err(SweepError::Acquisition(format!(
+            "open issue count query for {repo} reported incomplete results; refusing a truncated sweep"
+        )));
+    }
+    if total_count > GITHUB_SEARCH_RESULT_LIMIT {
+        return Err(SweepError::Acquisition(format!(
+            "{repo} has {total_count} open issues, exceeding GitHub's exhaustive search limit {GITHUB_SEARCH_RESULT_LIMIT}; refusing a truncated sweep"
+        )));
+    }
+
     let mut issues = Vec::new();
     let mut page = 1_u64;
     loop {
-        let endpoint = format!(
-            "repos/{repo}/issues?state=open&sort=updated&direction=asc&per_page=100&page={page}"
-        );
-        let values = gh_json(&["api", "-X", "GET", &endpoint])?;
+        let values = fetch_page(page)?;
         let values = values.as_array().cloned().ok_or_else(|| {
             SweepError::Acquisition(format!(
                 "current open issues query for {repo} returned a non-array body"
@@ -1173,10 +1234,23 @@ fn fetch_open_issues(repo: &str) -> Result<Vec<Value>, SweepError> {
         let count = values.len();
         issues.extend(values);
         if count < 100 {
-            return Ok(issues);
+            break;
         }
         page = page.saturating_add(1);
     }
+    // The REST crawl includes pull requests (GitHub's `issues` endpoint does
+    // not exclude them); the search count above is scoped to `is:issue`, so
+    // the cross-check compares like with like.
+    let crawled_issue_count = issues
+        .iter()
+        .filter(|issue| issue.get("pull_request").is_none())
+        .count();
+    if crawled_issue_count != total_count {
+        return Err(SweepError::Acquisition(format!(
+            "current open issues query for {repo} crawled {crawled_issue_count} issues but the search count was {total_count}; refusing a potentially incomplete sweep"
+        )));
+    }
+    Ok(issues)
 }
 
 fn fetch_merged_pull_requests(repo: &str, search: &str) -> Result<Vec<Value>, SweepError> {
@@ -3303,6 +3377,14 @@ fn reconcile_queue(
         .collect::<Vec<_>>();
     for mut row in generated {
         let id = string_field(&row, &["id"]).to_owned();
+        // Carried-forward rows above are already guarded by `closed_ids`;
+        // enforcing it here too means the invariant holds by construction
+        // rather than by every upstream generator remembering to pre-filter
+        // (`work_ranking`'s own `closed_ids` check needed adding for exactly
+        // this reason).
+        if closed_ids.contains(&id) {
+            continue;
+        }
         let ranking_fault = string_field(&row, &["kind"]) == "drift"
             && row
                 .get("mandate")
@@ -5588,6 +5670,47 @@ denies:
         assert_eq!(reconciled[0].value()["needs_judgment"], false);
     }
 
+    /// The carried-forward guard (`!closed_ids.contains(id)`) only protects
+    /// existing rows; a `generated` row for a closed id relied on every
+    /// upstream generator pre-filtering it (`work_ranking` needed its own
+    /// `closed_ids` check for exactly this reason). Enforcing it once here,
+    /// at the merge point, holds the invariant by construction even for a
+    /// generator that forgets.
+    #[test]
+    fn a_generated_row_for_a_closed_id_is_dropped_at_the_merge_point() {
+        let id = "placeholder-org/alpha#7";
+        let generated = vec![json!({
+            "id": id,
+            "repo": "placeholder-org/alpha",
+            "ref": "#7",
+            "title": "A generator that forgot to pre-filter closed ids",
+            "kind": "moved",
+            "mandate": {"reason": "placeholder"},
+            "state": "pending",
+            "opened": "2026-07-01T00:00:00Z",
+            "age_days": 1,
+            "aged_out": false,
+            "needs_judgment": false,
+            "blocked_by": [],
+        })];
+
+        let reconciled = reconcile_queue(
+            Vec::new(),
+            generated,
+            &BTreeSet::new(),
+            &BTreeSet::from([id.to_owned()]),
+            &BTreeMap::new(),
+            &BTreeSet::from(["placeholder-org/alpha".to_owned()]),
+            &BTreeSet::new(),
+        )
+        .expect("reconcile placeholder queue");
+
+        assert!(
+            reconciled.is_empty(),
+            "a closed id must not survive reconciliation even from a generated row: {reconciled:?}"
+        );
+    }
+
     #[test]
     fn every_roster_repository_under_an_organization_enters_its_scope() {
         let scopes = roster(&["placeholder-org/alpha", "placeholder-org/beta"]);
@@ -5692,6 +5815,116 @@ denies:
         assert_eq!(calls[2].1, 3);
         assert_eq!(pulls[200]["number"], 201);
         assert_eq!(pulls[0]["author"]["isBot"], true);
+    }
+
+    fn open_issue_page(start: usize, end: usize) -> Vec<Value> {
+        (start..end)
+            .map(|index| json!({"number": index + 1, "title": format!("Placeholder open issue {}", index + 1)}))
+            .collect()
+    }
+
+    #[test]
+    fn open_issue_query_paginates_past_query_limit_and_agrees_with_the_search_count() {
+        let total = QUERY_LIMIT + 1;
+        let mut page_calls = Vec::new();
+        let issues = fetch_open_issues_with(
+            "placeholder-org/alpha",
+            || Ok(json!({"total_count": total, "incomplete_results": false})),
+            |page| {
+                page_calls.push(page);
+                let start = match page {
+                    1 => 0,
+                    2 => 100,
+                    3 => 200,
+                    other => panic!("unexpected page {other}"),
+                };
+                let end = (start + 100).min(total);
+                Ok(Value::Array(open_issue_page(start, end)))
+            },
+        )
+        .expect("all open-issue pages are acquired");
+
+        assert_eq!(issues.len(), total);
+        assert_eq!(page_calls, vec![1, 2, 3]);
+        assert_eq!(issues[200]["number"], 201);
+    }
+
+    #[test]
+    fn open_issue_query_refuses_when_the_crawl_disagrees_with_the_search_count() {
+        // This is the shape of the paginate-on-`updated` race: an issue
+        // shifts across the page boundary mid-crawl and the REST pages never
+        // see it, while the search-provided count still reflects it. Without
+        // the cross-check this silently returns one issue short instead of
+        // refusing, and `analyze_repository` would evict that issue's queue
+        // row as `subject-closed` even though it is still open.
+        let result = fetch_open_issues_with(
+            "placeholder-org/alpha",
+            || Ok(json!({"total_count": 3, "incomplete_results": false})),
+            |page| {
+                assert_eq!(page, 1, "a single short page ends the crawl");
+                Ok(Value::Array(open_issue_page(0, 2)))
+            },
+        );
+        let error = result.expect_err("a crawl short of the search count must refuse");
+        assert!(
+            error
+                .to_string()
+                .contains("crawled 2 issues but the search count was 3"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn open_issue_query_refuses_before_crawling_past_the_exhaustive_search_limit() {
+        let mut page_calls = 0;
+        let result = fetch_open_issues_with(
+            "placeholder-org/alpha",
+            || {
+                Ok(
+                    json!({"total_count": GITHUB_SEARCH_RESULT_LIMIT + 1, "incomplete_results": false}),
+                )
+            },
+            |_page| {
+                page_calls += 1;
+                Ok(json!([]))
+            },
+        );
+        let error = result.expect_err("a count past the search limit must refuse without crawling");
+        assert!(
+            error
+                .to_string()
+                .contains("exceeding GitHub's exhaustive search limit"),
+            "{error}"
+        );
+        assert_eq!(
+            page_calls, 0,
+            "the bound is checked before any page is fetched"
+        );
+    }
+
+    #[test]
+    fn open_issue_query_refuses_an_incomplete_search_result() {
+        let result = fetch_open_issues_with(
+            "placeholder-org/alpha",
+            || Ok(json!({"total_count": 1, "incomplete_results": true})),
+            |_page| panic!("an incomplete search result must refuse before crawling"),
+        );
+        let error = result.expect_err("incomplete search results must refuse");
+        assert!(error.to_string().contains("incomplete results"), "{error}");
+    }
+
+    #[test]
+    fn open_issue_query_paginates_on_created_not_updated() {
+        // #259 x #554: `sort=updated` lets an already-fetched issue's update
+        // during the crawl shift every issue behind it up one slot, so the
+        // issue at the page boundary is never fetched. `sort=created` is
+        // immutable, so paging cannot miss an issue this way.
+        assert!(
+            open_issues_page_endpoint("placeholder-org/alpha", 1)
+                .contains("sort=created&direction=asc"),
+            "open-issue pagination must key off an immutable field"
+        );
+        assert!(!open_issues_page_endpoint("placeholder-org/alpha", 1).contains("sort=updated"));
     }
 
     #[test]

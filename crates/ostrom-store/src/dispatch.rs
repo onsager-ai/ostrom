@@ -212,8 +212,6 @@ fn run_dispatch_with_registry_and_minter(
         eprintln!("ostrom dispatch: {removal}");
     }
 
-    refuse_repeated_dispatch_failure(&context)?;
-
     preflight_worktree(&context)?;
     let config = load_config_or_defaults(&request.paths, &request.working_directory).ok();
     resolve_source_repository(&context, config.as_ref())?;
@@ -262,6 +260,14 @@ fn run_dispatch_with_registry_and_minter(
         reject_unlanded_branch(&mut context, &pages, branch, minter)?;
     }
     reject_closing_pull_requests(&mut context, minter)?;
+
+    // Everything above this point is API reads and a preflight check: it
+    // spends no worktree or branch work. Running the repeated-failure guard
+    // only now means a dispatch that reclaims its worktree during
+    // `reject_closing_pull_requests` (a merged closing pull request frees the
+    // branch for a fresh attempt) has a newer reset fact in its trace than
+    // the failures that would otherwise have refused it here.
+    refuse_repeated_dispatch_failure(&context)?;
 
     let runner_launch = registry
         .prepare(runner_name, &crate::RunCaps::default())
@@ -1415,6 +1421,25 @@ fn ensure_repeated_failure_escalated(context: &DispatchContext<'_>) -> Result<()
     Ok(())
 }
 
+/// The operator's manual release valve for a repeated-failure escalation
+/// that has no other path back. `work-completed` cannot happen once dispatch
+/// itself is what refuses, so the doctor's advice to "resolve it before
+/// dispatching the item again" would otherwise have no exit except a
+/// hand-edit of the trace. An operator who has fixed the underlying cause
+/// clears it with the existing generic trace surface:
+///
+/// ```text
+/// ostrom trace append dispatch-failure-cleared \
+///   '{"schema_version":1,"item_id":"<item-id>"}' \
+///   '{"reason":"<why the cause is resolved>"}'
+/// ```
+///
+/// recorded here as a reset point in the walk below, and treated the same
+/// way by `active_dispatch_failure_escalations` (ostrom-checks::doctor) and
+/// the `DISPATCH FAILURES ESCALATED` digest section (ostrom-store::hooks) so
+/// all three surfaces agree on when an escalation is no longer active.
+pub const DISPATCH_FAILURE_CLEARED_KIND: &str = "dispatch-failure-cleared";
+
 fn repeated_failure(
     context: &DispatchContext<'_>,
 ) -> Result<Option<RepeatedFailure>, DispatchError> {
@@ -1437,7 +1462,15 @@ fn repeated_failure(
                     escalated_reasons.insert(value.to_owned());
                 }
             }
-            "work-completed" => break,
+            // A reclaim or a drop is a state change that makes two earlier
+            // identical failures stale evidence: the worktree or branch
+            // identity the failures describe no longer exists, or the item
+            // itself has left the queue. Both are reset points, exactly like
+            // `work-completed` and the operator's manual release above.
+            "work-completed"
+            | "worktree-reclaimed"
+            | "queue-item-dropped"
+            | DISPATCH_FAILURE_CLEARED_KIND => break,
             "work-failed" => {
                 let Some(value) = row.fact.get("reason").and_then(Value::as_str) else {
                     break;
