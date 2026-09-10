@@ -30,16 +30,17 @@ use ostrom_store::{
     DispatchOutcome, DispatchRequest, ExecutableAssessmentDeriver, GateError, GateOptions,
     HarnessAssessmentDeriver, ImplementRequest, JsonlCheckStore, JsonlPublicationSource,
     OrchestratorRunRequest, OstromPaths, PASS_KILL_GRACE_MS, PassRequest, PassRole, PlanOptions,
-    PublishDestination, PublishTarget, QueueDecision, ReplayOptions, RunOutcome, RunRequest,
-    SelectAction, SelectError, SelectOutcome, SelectRequest, SignalFlags, SweepError, SweepMode,
-    SweepOptions, TraceAppend, TraceView, UnavailableAssessmentDeriver, acquire_lease,
-    answer_queue_decision, append_trace_checked, audit, branch_name, clear_work_order,
-    create_work_order, credential_output, decide_queue_item, encode_org_snapshots_with_faults,
-    encode_selection, environment, finalize_exited_implementer, grant_excuse, grant_excuse_at_head,
-    item_hash, lease_status, lint_queue_state, list_excuses, list_queue_json, local_drift,
-    read_trace_json, release_lease, render_constitution, render_digest, replay, revoke_excuse,
-    run_dispatch_with_registry, run_gate, run_implement_with_registry, run_pass, run_plan,
-    run_repair_prs, run_selection, run_sweep_with_publication_source, validate_lease_name,
+    PublishDestination, PublishTarget, QueueDecision, ReapWorktreesOptions, ReplayOptions,
+    RunOutcome, RunRequest, SelectAction, SelectError, SelectOutcome, SelectRequest, SignalFlags,
+    SweepError, SweepMode, SweepOptions, TraceAppend, TraceView, UnavailableAssessmentDeriver,
+    acquire_lease, answer_queue_decision, append_trace_checked, audit, branch_name,
+    clear_work_order, create_work_order, credential_output, decide_queue_item,
+    encode_org_snapshots_with_faults, encode_selection, environment, finalize_exited_implementer,
+    grant_excuse, grant_excuse_at_head, item_hash, lease_status, lint_queue_state, list_excuses,
+    list_queue_json, local_drift, read_trace_json, release_lease, render_constitution,
+    render_digest, replay, revoke_excuse, run_dispatch_with_registry, run_gate,
+    run_implement_with_registry, run_pass, run_plan, run_reap_worktrees, run_repair_prs,
+    run_selection, run_sweep_with_publication_source, validate_lease_name,
     validate_work_order_file,
 };
 
@@ -239,6 +240,12 @@ enum Command {
         /// Also stream stamped ethogram events to this open file descriptor.
         #[arg(long)]
         events_fd: Option<u32>,
+    },
+    /// Report or remove worktrees whose remote work is mechanically resolved.
+    ReapWorktrees {
+        /// Remove eligible clean worktrees. Omission is a dry run.
+        #[arg(long)]
+        apply: bool,
     },
     #[command(name = "__pass-worker", hide = true)]
     PassWorker {
@@ -896,6 +903,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 arguments.extend(["--events-fd".into(), fd.to_string().into()]);
             }
             supervise(&arguments, Some((&work_order_file, &unit_name)), &clock)
+        }
+        Command::ReapWorktrees { apply } => {
+            let outcome = run_reap_worktrees(&ReapWorktreesOptions {
+                paths,
+                apply,
+                clock,
+            })?;
+            for report in &outcome.reports {
+                serde_json::to_writer(&mut io::stdout(), report)?;
+                println!();
+            }
+            serde_json::to_writer(&mut io::stdout(), &outcome.summary)?;
+            println!();
         }
         Command::PassWorker {
             role,

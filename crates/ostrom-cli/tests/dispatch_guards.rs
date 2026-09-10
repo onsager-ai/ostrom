@@ -102,6 +102,10 @@ if [ "$1 $2" = "gh api" ] && printf '%s' "$3" | grep -q '/branches?'; then
   if [ "$page" = 1 ]; then printf '%s\n' "${OSTROM_TEST_BRANCH_PAGE_1:-[]}"; else printf '%s\n' "${OSTROM_TEST_BRANCH_PAGE_2:-[]}"; fi
   exit 0
 fi
+if [ "$1 $2" = "gh api" ] && [ "$3" = -X ] && [ "$4" = DELETE ]; then
+  [ "${OSTROM_TEST_REF_DELETE_FAIL:-0}" = 0 ] || exit 42
+  exit 0
+fi
 if [ "$1 $2 $3" = "gh repo view" ]; then printf '%s\n' main; exit 0; fi
 if [ "$1 $2" = "gh api" ] && printf '%s' "$3" | grep -q '/compare/'; then printf '%s\n' "${OSTROM_TEST_AHEAD:-0}"; exit 0; fi
 if [ "$1 $2 $3" = "gh pr list" ]; then
@@ -220,6 +224,13 @@ exit 97
         self.state
             .join(format!("implementer-item-{}.lease", self.item_hash()))
     }
+
+    /// The commit SHA `BRANCH` currently points to in `self.source` -- what
+    /// a pull request's `headRefOid` would report if GitHub had last
+    /// observed the branch at exactly this point.
+    fn branch_sha(&self) -> String {
+        git_output(&self.source, &["rev-parse", BRANCH])
+    }
 }
 
 fn workspace_root() -> PathBuf {
@@ -245,6 +256,24 @@ fn git(path: &Path, arguments: &[&str]) {
             .expect("run git")
             .success()
     );
+}
+
+fn git_output(path: &Path, arguments: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(arguments)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {arguments:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("UTF-8 git output")
+        .trim()
+        .to_owned()
 }
 
 fn default_page() -> String {
@@ -308,13 +337,15 @@ fn source_roots_refuse_before_remote_reads_or_reservations() {
 #[test]
 fn branch_listing_finds_exact_matches_across_pages_and_classifies_pr_state() {
     let page_one = matched_page();
-    for (pulls, allowed) in [
-        ("[]", false),
-        (r#"[{"number":1,"state":"OPEN","mergedAt":null}]"#, false),
-        (r#"[{"number":1,"state":"CLOSED","mergedAt":null}]"#, false),
+    for (pulls, reason) in [
+        ("[]", "branch-in-flight"),
         (
-            r#"[{"number":1,"state":"MERGED","mergedAt":"2026-08-01T00:00:00Z"}]"#,
-            true,
+            r#"[{"number":1,"state":"OPEN","mergedAt":null}]"#,
+            "branch-in-flight",
+        ),
+        (
+            r#"[{"number":1,"state":"CLOSED","mergedAt":null}]"#,
+            "branch-in-flight",
         ),
     ] {
         let fixture = Fixture::new();
@@ -323,17 +354,11 @@ fn branch_listing_finds_exact_matches_across_pages_and_classifies_pr_state() {
             .env("OSTROM_TEST_BRANCH_PAGE_1", &page_one)
             .env("OSTROM_TEST_BRANCH_PRS", pulls)
             .env("OSTROM_TEST_AHEAD", "4"));
-        assert_eq!(output.status.success(), allowed, "{pulls}");
-        if allowed {
-            assert!(fixture.calls.exists());
-            assert_eq!(fixture.trace()[0]["kind"], "work-dispatched");
-        } else {
-            assert_refused(&output, 3, "matched_key=branch_name");
-            let row = &fixture.trace()[0];
-            assert_eq!(row["fact"]["reason"], "branch-already-pushed");
-            assert_eq!(row["fact"]["ahead_of_default"], 4);
-            assert_eq!(row["fact"]["branch_listing"]["page_count"], 1);
-        }
+        assert_refused(&output, 3, "matched_key=branch_name");
+        let row = &fixture.trace()[0];
+        assert_eq!(row["fact"]["reason"], reason);
+        assert_eq!(row["fact"]["ahead_of_default"], 4);
+        assert_eq!(row["fact"]["branch_listing"]["page_count"], 1);
     }
 
     let fixture = Fixture::new();
@@ -384,10 +409,7 @@ fn a_second_identical_dispatch_failure_escalates_and_suppresses_a_third_attempt(
         .find(|row| row["kind"] == "dispatch-failure-escalated")
         .expect("second failure escalation");
     assert_eq!(escalation["fact"]["item_id"], ITEM_ID);
-    assert_eq!(
-        escalation["fact"]["failure_reason"],
-        "branch-already-pushed"
-    );
+    assert_eq!(escalation["fact"]["failure_reason"], "branch-in-flight");
     assert_eq!(escalation["fact"]["failure_count"], 2);
     assert_eq!(escalation["fact"]["action"], "suppress-dispatch");
 
@@ -575,22 +597,21 @@ fn a_numeric_branch_name_coincidence_is_not_identity_evidence() {
 
 #[test]
 fn closing_pull_requests_are_identity_keys_but_part_of_prose_is_not() {
-    for state in ["OPEN", "MERGED"] {
-        let fixture = Fixture::new();
-        let url = "https://example.invalid/pull/91";
-        let references = json!({"closedByPullRequestsReferences":[{"url":url}]}).to_string();
-        let pull = json!({"number":91,"state":state,"mergedAt":null,"url":url}).to_string();
-        let output = run(fixture
-            .command()
-            .env("OSTROM_TEST_BRANCH_PAGE_1", default_page())
-            .env("OSTROM_TEST_CLOSING_REFS", references)
-            .env("OSTROM_TEST_CLOSING_PR", pull));
-        assert_refused(&output, 3, "matched_key=closing_pull_request");
-        assert_eq!(
-            fixture.trace()[0]["fact"]["matched_key"]["type"],
-            "closing_pull_request"
-        );
-    }
+    let fixture = Fixture::new();
+    let url = "https://example.invalid/pull/91";
+    let references = json!({"closedByPullRequestsReferences":[{"url":url}]}).to_string();
+    let pull = json!({"number":91,"state":"OPEN","mergedAt":null,"url":url}).to_string();
+    let output = run(fixture
+        .command()
+        .env("OSTROM_TEST_BRANCH_PAGE_1", default_page())
+        .env("OSTROM_TEST_CLOSING_REFS", references)
+        .env("OSTROM_TEST_CLOSING_PR", pull));
+    assert_refused(&output, 3, "matched_key=closing_pull_request");
+    assert_eq!(fixture.trace()[0]["fact"]["reason"], "branch-in-flight");
+    assert_eq!(
+        fixture.trace()[0]["fact"]["matched_key"]["type"],
+        "closing_pull_request"
+    );
 
     let fixture = Fixture::new();
     let output = run(
@@ -606,6 +627,422 @@ fn closing_pull_requests_are_identity_keys_but_part_of_prose_is_not() {
         output.status.success(),
         "Part of prose must remain dispatchable: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn a_reclaim_releases_the_repeated_failure_guard_on_the_same_pass() {
+    // The case both #252's reclaim and #259's escalation guard exist for, and
+    // that neither could test alone: on #252's branch nothing produced the
+    // escalation to release, and on #259's branch nothing emitted
+    // `worktree-reclaimed`. Together they can cancel -- the guard refusing
+    // before the reclaim that would have cleared it -- so this is the test
+    // that the two compose rather than merely coexist. No fact is seeded:
+    // the reclaim has to produce `worktree-reclaimed` itself.
+    let fixture = Fixture::new();
+    let worktree = fixture
+        .state
+        .join("implementer-worktrees")
+        .join(fixture.item_hash());
+    fs::create_dir_all(worktree.parent().expect("worktree parent"))
+        .expect("create worktree parent");
+    git(
+        &fixture.source,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            BRANCH,
+            worktree.to_str().expect("UTF-8 worktree"),
+            "refs/remotes/origin/main",
+        ],
+    );
+
+    // Two identical refusals while the pull request is still open.
+    for _ in 0..2 {
+        let output = run(fixture
+            .command()
+            .env("OSTROM_TEST_BRANCH_PAGE_1", matched_page())
+            .env(
+                "OSTROM_TEST_BRANCH_PRS",
+                r#"[{"number":1,"state":"OPEN","mergedAt":null}]"#,
+            ));
+        assert_refused(&output, 3, "matched_key=branch_name");
+    }
+    assert!(
+        fixture
+            .trace()
+            .iter()
+            .any(|row| row["kind"] == "dispatch-failure-escalated"),
+        "the second identical refusal must escalate, or this test proves nothing"
+    );
+
+    // The pull request merges. The next dispatch must reclaim and proceed:
+    // the reclaim's `worktree-reclaimed` is newer than the two failures, so
+    // the repeated-failure guard sees a state change rather than stale evidence.
+    let url = "https://example.invalid/pull/91";
+    let published_tip = fixture.branch_sha();
+    let output = run(
+        fixture
+            .command()
+            .env("OSTROM_TEST_BRANCH_PAGE_1", matched_page())
+            .env(
+                "OSTROM_TEST_BRANCH_PRS",
+                r#"[{"number":1,"state":"MERGED","mergedAt":"2026-08-01T00:00:00Z"}]"#,
+            )
+            .env(
+                "OSTROM_TEST_CLOSING_REFS",
+                json!({"closedByPullRequestsReferences":[{"url":url}]}).to_string(),
+            )
+            .env(
+                "OSTROM_TEST_CLOSING_PR",
+                json!({"number":91,"state":"MERGED","mergedAt":"2026-08-01T00:00:00Z","url":url,"headRefOid":published_tip})
+                    .to_string(),
+            ),
+    );
+    assert!(
+        output.status.success(),
+        "the reclaim must release the escalation on the same pass; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(fixture.calls.exists(), "the dispatch never ran");
+    assert!(
+        fixture
+            .trace()
+            .iter()
+            .any(|row| row["kind"] == "worktree-reclaimed"),
+        "the reclaim itself must have produced the fact that released the guard"
+    );
+}
+
+#[test]
+fn merged_branch_still_on_the_remote_is_deleted_and_the_dispatch_proceeds() {
+    // ostrom#252's acceptance, and the state most roster repositories are
+    // actually in: `delete_branch_on_merge` is off, so the head branch survives
+    // the merge. Refusing here would make a re-dispatch impossible for every
+    // such item on every pass. The merged ref is deleted and the dispatch runs.
+    let fixture = Fixture::new();
+    let worktree = fixture
+        .state
+        .join("implementer-worktrees")
+        .join(fixture.item_hash());
+    fs::create_dir_all(worktree.parent().expect("worktree parent"))
+        .expect("create worktree parent");
+    git(
+        &fixture.source,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            BRANCH,
+            worktree.to_str().expect("UTF-8 worktree"),
+            "refs/remotes/origin/main",
+        ],
+    );
+    let url = "https://example.invalid/pull/91";
+    let published_tip = fixture.branch_sha();
+    let output = run(fixture
+        .command()
+        // the branch still matches on the remote, unlike the test below
+        .env("OSTROM_TEST_BRANCH_PAGE_1", matched_page())
+        .env(
+            "OSTROM_TEST_BRANCH_PRS",
+            r#"[{"number":1,"state":"MERGED","mergedAt":"2026-08-01T00:00:00Z"}]"#,
+        )
+        .env(
+            "OSTROM_TEST_CLOSING_REFS",
+            json!({"closedByPullRequestsReferences":[{"url":url}]}).to_string(),
+        )
+        .env(
+            "OSTROM_TEST_CLOSING_PR",
+            json!({"number":91,"state":"MERGED","mergedAt":"2026-08-01T00:00:00Z","url":url,"headRefOid":published_tip})
+                .to_string(),
+        ));
+    assert!(
+        output.status.success(),
+        "a re-dispatch after a merge must succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(fixture.calls.exists(), "the dispatch never ran");
+    assert!(!worktree.exists(), "the local worktree was not reclaimed");
+    assert!(
+        !Command::new("git")
+            .arg("-C")
+            .arg(&fixture.source)
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{BRANCH}")
+            ])
+            .status()
+            .expect("show-ref")
+            .success(),
+        "the local branch survived the reclaim, so the next dispatch would refuse again"
+    );
+}
+
+#[test]
+fn a_merged_ref_that_cannot_be_deleted_still_refuses_by_name() {
+    // The refusal is kept for the case where cleanup genuinely cannot happen.
+    // Proceeding would push against a ref we failed to remove.
+    let fixture = Fixture::new();
+    let output = run(fixture
+        .command()
+        .env("OSTROM_TEST_BRANCH_PAGE_1", matched_page())
+        .env(
+            "OSTROM_TEST_BRANCH_PRS",
+            r#"[{"number":1,"state":"MERGED","mergedAt":"2026-08-01T00:00:00Z"}]"#,
+        )
+        .env("OSTROM_TEST_REF_DELETE_FAIL", "1"));
+    assert_refused(&output, 3, "matched_key=branch_name");
+    assert_eq!(
+        fixture.trace()[0]["fact"]["reason"],
+        "branch-merged-not-cleaned"
+    );
+}
+
+#[test]
+fn merged_and_remote_cleaned_branch_reclaims_local_worktree_before_dispatch() {
+    let fixture = Fixture::new();
+    let worktree = fixture
+        .state
+        .join("implementer-worktrees")
+        .join(fixture.item_hash());
+    fs::create_dir_all(worktree.parent().expect("worktree parent"))
+        .expect("create worktree parent");
+    git(
+        &fixture.source,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            BRANCH,
+            worktree.to_str().expect("UTF-8 worktree"),
+            "refs/remotes/origin/main",
+        ],
+    );
+    let url = "https://example.invalid/pull/91";
+    let published_tip = fixture.branch_sha();
+    let output = run(fixture
+        .command()
+        .env("OSTROM_TEST_BRANCH_PAGE_1", default_page())
+        .env(
+            "OSTROM_TEST_CLOSING_REFS",
+            json!({"closedByPullRequestsReferences":[{"url":url}]}).to_string(),
+        )
+        .env(
+            "OSTROM_TEST_CLOSING_PR",
+            json!({"number":91,"state":"MERGED","mergedAt":"2026-08-01T00:00:00Z","url":url,"headRefOid":published_tip})
+                .to_string(),
+        ));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!worktree.exists());
+    assert!(fixture.calls.exists());
+    assert!(
+        !Command::new("git")
+            .arg("-C")
+            .arg(&fixture.source)
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{BRANCH}"),
+            ])
+            .status()
+            .expect("inspect branch")
+            .success()
+    );
+    let trace = fixture.trace();
+    assert_eq!(trace[0]["kind"], "worktree-reclaimed");
+    assert_eq!(trace[0]["fact"]["worktree_count"], 1);
+    assert!(trace[0]["fact"]["reclaimed_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(trace[1]["kind"], "work-dispatched");
+}
+
+#[test]
+fn merged_branch_with_an_unpushed_local_commit_is_preserved() {
+    // The worktree is clean -- nothing uncommitted -- but its branch carries
+    // a commit that was never pushed: an implementer committed after its
+    // last push, then was killed or timed out. `worktree_status` cannot see
+    // this; the reclaim must refuse rather than run `git branch -D` and make
+    // that commit unreachable.
+    let fixture = Fixture::new();
+    let worktree = fixture
+        .state
+        .join("implementer-worktrees")
+        .join(fixture.item_hash());
+    fs::create_dir_all(worktree.parent().expect("worktree parent"))
+        .expect("create worktree parent");
+    git(
+        &fixture.source,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            BRANCH,
+            worktree.to_str().expect("UTF-8 worktree"),
+            "refs/remotes/origin/main",
+        ],
+    );
+    // Capture the tip GitHub is presumed to have observed *before* the
+    // unpushed commit below -- the guard now checks ancestry against this
+    // published tip, not against the default branch's current tip.
+    let published_tip = fixture.branch_sha();
+    // A real content change, not `--allow-empty`: an empty commit leaves the
+    // branch's tree identical to its parent, which would make this look
+    // like a no-op rather than a genuine unpushed commit.
+    fs::write(worktree.join("unpushed.txt"), "expensive work\n").expect("write unpushed work");
+    git(&worktree, &["add", "unpushed.txt"]);
+    git(&worktree, &["commit", "-m", "unpushed work"]);
+    let url = "https://example.invalid/pull/91";
+    let output = run(fixture
+        .command()
+        .env("OSTROM_TEST_BRANCH_PAGE_1", default_page())
+        .env(
+            "OSTROM_TEST_CLOSING_REFS",
+            json!({"closedByPullRequestsReferences":[{"url":url}]}).to_string(),
+        )
+        .env(
+            "OSTROM_TEST_CLOSING_PR",
+            json!({"number":91,"state":"MERGED","mergedAt":"2026-08-01T00:00:00Z","url":url,"headRefOid":published_tip})
+                .to_string(),
+        ));
+    assert_refused(&output, 3, "unmerged-local-commits");
+    assert!(worktree.exists());
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&fixture.source)
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{BRANCH}"),
+            ])
+            .status()
+            .expect("inspect branch")
+            .success(),
+        "the branch must survive a refused reclaim"
+    );
+    assert_eq!(
+        fixture.trace()[0]["fact"]["reason"],
+        "branch-merged-not-cleaned"
+    );
+}
+
+#[test]
+fn live_lease_prevents_reclaiming_a_merged_worktree() {
+    // A duplicate dispatch for an item whose earlier pull request just
+    // merged must not reclaim the worktree a live implementer is sitting
+    // in, ahead of the lease/in-flight guard that would otherwise refuse
+    // the duplicate.
+    let fixture = Fixture::new();
+    let worktree = fixture
+        .state
+        .join("implementer-worktrees")
+        .join(fixture.item_hash());
+    fs::create_dir_all(worktree.parent().expect("worktree parent"))
+        .expect("create worktree parent");
+    git(
+        &fixture.source,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            BRANCH,
+            worktree.to_str().expect("UTF-8 worktree"),
+            "refs/remotes/origin/main",
+        ],
+    );
+    fs::write(
+        fixture.lease(),
+        format!(
+            "{{\"owner\":\"ostrom-implementer-elsewhere\",\"started_at\":{},\"expires_at\":{}}}\n",
+            fixture.now,
+            fixture.now + 3_600,
+        ),
+    )
+    .expect("write live lease");
+    let url = "https://example.invalid/pull/91";
+    let output = run(fixture
+        .command()
+        .env("OSTROM_TEST_BRANCH_PAGE_1", default_page())
+        .env(
+            "OSTROM_TEST_CLOSING_REFS",
+            json!({"closedByPullRequestsReferences":[{"url":url}]}).to_string(),
+        )
+        .env(
+            "OSTROM_TEST_CLOSING_PR",
+            json!({"number":91,"state":"MERGED","mergedAt":"2026-08-01T00:00:00Z","url":url})
+                .to_string(),
+        ));
+    assert_refused(&output, 3, "live implementer lease");
+    assert!(worktree.exists());
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&fixture.source)
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{BRANCH}"),
+            ])
+            .status()
+            .expect("inspect branch")
+            .success(),
+        "the branch must survive while a lease is live"
+    );
+    let trace = fixture.trace();
+    assert_eq!(trace[0]["kind"], "work-failed");
+    assert_eq!(trace[0]["fact"]["reason"], "live-implementer-lease");
+}
+
+#[test]
+fn merged_branch_with_dirty_local_worktree_is_named_and_preserved() {
+    let fixture = Fixture::new();
+    let worktree = fixture
+        .state
+        .join("implementer-worktrees")
+        .join(fixture.item_hash());
+    fs::create_dir_all(worktree.parent().expect("worktree parent"))
+        .expect("create worktree parent");
+    git(
+        &fixture.source,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            BRANCH,
+            worktree.to_str().expect("UTF-8 worktree"),
+            "refs/remotes/origin/main",
+        ],
+    );
+    fs::write(worktree.join("preserved.txt"), "expensive work\n").expect("write dirty work");
+    let url = "https://example.invalid/pull/91";
+    let output = run(fixture
+        .command()
+        .env("OSTROM_TEST_BRANCH_PAGE_1", default_page())
+        .env(
+            "OSTROM_TEST_CLOSING_REFS",
+            json!({"closedByPullRequestsReferences":[{"url":url}]}).to_string(),
+        )
+        .env(
+            "OSTROM_TEST_CLOSING_PR",
+            json!({"number":91,"state":"MERGED","mergedAt":"2026-08-01T00:00:00Z","url":url})
+                .to_string(),
+        ));
+    assert_refused(&output, 3, "dirty or unreadable");
+    assert!(worktree.join("preserved.txt").exists());
+    assert!(!fixture.calls.exists());
+    assert_eq!(
+        fixture.trace()[0]["fact"]["reason"],
+        "branch-merged-not-cleaned"
     );
 }
 
