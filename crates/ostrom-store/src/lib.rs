@@ -43,7 +43,8 @@ pub use clock::Clock;
 pub use commit_checks::{CheckReadError, CommitChecks, read_commit_checks};
 pub use decision_answers::{DecisionAnswerError, answer_queue_decision};
 pub use dispatch::{
-    DispatchError, DispatchOutcome, DispatchRequest, run_dispatch, run_dispatch_with_registry,
+    DISPATCH_FAILURE_CLEARED_KIND, DispatchError, DispatchOutcome, DispatchRequest, run_dispatch,
+    run_dispatch_with_registry,
 };
 pub use environment::{ENVIRONMENT_VARIABLES, EnvironmentClass, EnvironmentVariable};
 pub use event_store::JsonlEventStore;

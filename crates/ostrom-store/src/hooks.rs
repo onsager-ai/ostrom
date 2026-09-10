@@ -13,8 +13,8 @@ use serde_json::{Map, Value, json};
 use umwelt_runtime::{FileSink, Source};
 
 use crate::{
-    Clock, OstromPaths, SweepError, load_config, load_config_or_defaults, local_drift, read_queue,
-    read_trace,
+    Clock, DISPATCH_FAILURE_CLEARED_KIND, OstromPaths, SweepError, load_config,
+    load_config_or_defaults, local_drift, read_queue, read_trace,
 };
 
 #[derive(Debug, Clone)]
@@ -140,6 +140,19 @@ pub fn render_digest(options: &DigestOptions) -> HookOutput {
         for decision in decisions {
             push_line(&mut body, &decision);
         }
+    }
+    let failure_escalations = read_failure_escalations(&options.paths.trace_file(), &since);
+    if !failure_escalations.is_empty() {
+        push_line(&mut body, "DISPATCH FAILURES ESCALATED");
+        for escalation in failure_escalations {
+            push_line(&mut body, &escalation);
+        }
+        push_line(
+            &mut body,
+            &format!(
+                "resolve the named cause, then: ostrom trace append {DISPATCH_FAILURE_CLEARED_KIND} '{{\"schema_version\":1,\"item_id\":\"<item-id>\"}}' '{{\"reason\":\"<why the cause is resolved>\"}}'"
+            ),
+        );
     }
 
     let waiting_repositories = render_waiting_decisions(
@@ -671,6 +684,61 @@ fn read_decisions(path: &Path, since: &str) -> Vec<String> {
         .collect::<Vec<_>>();
     decisions.sort_by(|left, right| right.0.cmp(&left.0));
     decisions.into_iter().map(|(_, row)| row).collect()
+}
+
+/// Mirrors doctor's `active_dispatch_failure_escalations`: an escalation is
+/// active only until a later `work-completed`, `queue-item-dropped`, or an
+/// operator's manual `dispatch-failure-cleared` names the same item. Without
+/// this, an item that escalates and then resolves inside one digest window
+/// is reported here as still needing attention even though dispatch would
+/// already have picked it back up.
+fn read_failure_escalations(path: &Path, since: &str) -> Vec<String> {
+    let mut active = BTreeMap::<String, (String, String, u64)>::new();
+    for row in fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+    {
+        let Some(item) = row.pointer("/fact/item_id").and_then(Value::as_str) else {
+            continue;
+        };
+        match row.get("kind").and_then(Value::as_str) {
+            Some("dispatch-failure-escalated") => {
+                let (Some(ts), Some(reason)) = (
+                    row.get("ts").and_then(Value::as_str),
+                    row.pointer("/fact/failure_reason").and_then(Value::as_str),
+                ) else {
+                    continue;
+                };
+                let count = row
+                    .pointer("/fact/failure_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(2);
+                active.insert(item.to_owned(), (ts.to_owned(), reason.to_owned(), count));
+            }
+            Some(kind)
+                if kind == "work-completed"
+                    || kind == "queue-item-dropped"
+                    || kind == DISPATCH_FAILURE_CLEARED_KIND =>
+            {
+                active.remove(item);
+            }
+            _ => {}
+        }
+    }
+    let mut escalations = active
+        .into_iter()
+        .filter_map(|(item, (ts, reason, count))| {
+            (ts.as_str() > since).then(|| {
+                (
+                    ts,
+                    format!("{item} — {reason} ({count} identical failures; dispatch suppressed)"),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    escalations.sort_by(|left, right| right.0.cmp(&left.0));
+    escalations.into_iter().map(|(_, row)| row).collect()
 }
 
 fn unresolvable_repositories(state: Option<&Value>) -> BTreeSet<String> {

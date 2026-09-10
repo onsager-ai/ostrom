@@ -11,7 +11,7 @@ use std::{
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use ostrom_core::ActionDefinition;
-use ostrom_store::environment;
+use ostrom_store::{DISPATCH_FAILURE_CLEARED_KIND, environment};
 use serde_json::{Map, Value, json};
 
 use crate::{
@@ -1354,7 +1354,8 @@ fn check_work_orders(context: &DoctorContext) -> DoctorResult {
         return no_work_orders();
     };
     let orders = in_flight(source);
-    if orders.is_empty() {
+    let escalations = active_dispatch_failure_escalations(source);
+    if orders.is_empty() && escalations.is_empty() {
         return no_work_orders();
     }
     let mut faults = Vec::new();
@@ -1398,6 +1399,17 @@ fn check_work_orders(context: &DoctorContext) -> DoctorResult {
             ),
             "confirm the user systemd manager is reachable and inspect the transient unit",
         )
+    } else if !escalations.is_empty() {
+        DoctorResult::new(
+            DoctorStatus::Warn,
+            "work-orders",
+            format!(
+                "{} in flight; repeated dispatch failures escalated: {}",
+                orders.len(),
+                escalations.join(", ")
+            ),
+            "inspect the named failure and resolve it before dispatching the item again",
+        )
     } else {
         DoctorResult::new(
             DoctorStatus::Ok,
@@ -1406,6 +1418,39 @@ fn check_work_orders(context: &DoctorContext) -> DoctorResult {
             "",
         )
     }
+}
+
+fn active_dispatch_failure_escalations(source: &str) -> Vec<String> {
+    let mut active = BTreeMap::<String, String>::new();
+    for line in source.lines().filter(|line| !line.is_empty()) {
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(item_id) = record.pointer("/fact/item_id").and_then(Value::as_str) else {
+            continue;
+        };
+        match record.get("kind").and_then(Value::as_str) {
+            Some("dispatch-failure-escalated") => {
+                let reason = record
+                    .pointer("/fact/failure_reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("reason unavailable");
+                active.insert(item_id.to_owned(), reason.to_owned());
+            }
+            Some(kind)
+                if kind == "work-completed"
+                    || kind == "queue-item-dropped"
+                    || kind == DISPATCH_FAILURE_CLEARED_KIND =>
+            {
+                active.remove(item_id);
+            }
+            _ => {}
+        }
+    }
+    active
+        .into_iter()
+        .map(|(item, reason)| format!("{item} ({reason})"))
+        .collect()
 }
 
 fn visible_order(order: &DispatchFact) -> String {
@@ -1888,6 +1933,56 @@ mod tests {
         ] {
             assert!(output.contains(expected), "missing {expected}: {output}");
         }
+    }
+
+    #[test]
+    fn work_orders_warns_about_repeated_dispatch_failure_escalations() {
+        let fixture = Fixture::new();
+        let state = fixture.config_dir.join("ostrom");
+        fs::create_dir_all(&state).unwrap();
+        fs::write(
+            state.join("sprint.jsonl"),
+            concat!(
+                r#"{"ts":"2026-08-19T01:00:00Z","kind":"dispatch-failure-escalated","fact":{"schema_version":1,"item_id":"placeholder-org/alpha#7","order_id":"placeholder-order","action":"suppress-dispatch","failure_reason":"branch-already-pushed","failure_count":2},"narration":{"reason":"Repeated failure.","conclusion":"Dispatch suppressed."}}"#,
+                "\n",
+            ),
+        )
+        .expect("write escalation trace");
+
+        assert_eq!(
+            run_doctor_check(fixture.options(), "work-orders").unwrap(),
+            concat!(
+                "WARN|work-orders|0 in flight; repeated dispatch failures escalated: placeholder-org/alpha#7 (branch-already-pushed)|",
+                "inspect the named failure and resolve it before dispatching the item again\n",
+            )
+        );
+    }
+
+    /// The operator's manual release valve (`ostrom trace append
+    /// dispatch-failure-cleared ...`) must clear an escalation here the same
+    /// way `work-completed` and `queue-item-dropped` already do, or the
+    /// doctor keeps warning about an item dispatch itself has already
+    /// resumed retrying.
+    #[test]
+    fn work_orders_treats_a_manual_release_as_clearing_an_escalation() {
+        let fixture = Fixture::new();
+        let state = fixture.config_dir.join("ostrom");
+        fs::create_dir_all(&state).unwrap();
+        fs::write(
+            state.join("sprint.jsonl"),
+            concat!(
+                r#"{"ts":"2026-08-19T01:00:00Z","kind":"dispatch-failure-escalated","fact":{"schema_version":1,"item_id":"placeholder-org/alpha#7","order_id":"placeholder-order","action":"suppress-dispatch","failure_reason":"branch-already-pushed","failure_count":2},"narration":{"reason":"Repeated failure.","conclusion":"Dispatch suppressed."}}"#,
+                "\n",
+                r#"{"ts":"2026-08-19T02:00:00Z","kind":"dispatch-failure-cleared","fact":{"schema_version":1,"item_id":"placeholder-org/alpha#7"},"narration":{"reason":"Operator cleared it.","conclusion":"No longer suppressed."}}"#,
+                "\n",
+            ),
+        )
+        .expect("write escalation and release trace");
+
+        assert_eq!(
+            run_doctor_check(fixture.options(), "work-orders").unwrap(),
+            "OK|work-orders|no work orders in flight|\n"
+        );
     }
 
     #[cfg(unix)]
