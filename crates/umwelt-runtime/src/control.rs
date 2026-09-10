@@ -422,6 +422,18 @@ fn requested_draft(payload: ControlRequestedPayload) -> EventDraft {
 /// prose, not a place to smuggle a value that has a typed member. Under principle 2,
 /// excerpt once here at the producer; the sink's `validate` is the second line of
 /// defence. Typed reasons carry no free text and never carry a truncation flag.
+///
+/// `by` is `None`. ethogram defines it as the principal identity that
+/// applied the control — an identity a consumer renders and never
+/// interprets. No applier identity is in scope here and `RunControl` never
+/// receives one, so `Some` would mean either inventing a rendered identity,
+/// which principle 6 forbids, or asserting the supervisor's identity, which
+/// umwelt does not know. The corpus fixture `control-applied-answer.json`
+/// carries `by: "spawning-supervisor"`, confirming the identity that
+/// matters is the caller's. It becomes `Some` when a caller threads an
+/// applier identity into `RunControl` at construction — a new public
+/// parameter, and a decision that umwelt asserts who applied a control
+/// rather than only that it was applied.
 fn applied_draft(
     control_id: &str,
     ok: bool,
@@ -443,6 +455,7 @@ fn applied_draft(
         ControlAppliedPayload {
             control_id: control_id.to_owned(),
             ok,
+            by: None,
             reason,
             truncated,
             landed_in: landed_in.map(str::to_owned),
