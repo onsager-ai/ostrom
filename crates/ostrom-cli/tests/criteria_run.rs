@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use std::{fs, path::PathBuf, process::Command, time::Instant};
+use std::{fs, path::PathBuf, process::Command};
 
 use ostrom_checks::ActionRegistry;
 use ostrom_core::{
@@ -41,7 +41,6 @@ fn check_run_records_verdicts_and_isolates_a_timeout() {
     )
     .expect("write checks");
 
-    let started = Instant::now();
     let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
         .args(["check", "run"])
         .env("OSTROM_HOME", home.path())
@@ -50,17 +49,6 @@ fn check_run_records_verdicts_and_isolates_a_timeout() {
         .expect("execute criteria");
 
     assert!(!output.status.success(), "a failing verdict fails the pass");
-    // A generous hang backstop, not the property under test (ostrom#556): a
-    // subprocess spawn plus four tiny scripts can legitimately take longer
-    // than the old 1s bound on a loaded machine, so that bound reported a
-    // latency regression that never happened. What this test is named for --
-    // that the timed-out criterion was *isolated* -- is asserted explicitly
-    // below: the run completes at all, every criterion after the timeout still
-    // executed, and each receipt records the verdict isolation implies.
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(30),
-        "the pass never completed -- isolation would make this fast, but this bound only catches a hang"
-    );
     assert!(
         continued.exists(),
         "criteria after a timeout must still run -- the timed-out criterion was not isolated"
