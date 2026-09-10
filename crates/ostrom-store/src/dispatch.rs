@@ -26,6 +26,7 @@ use crate::{
     },
     append_trace, configured_retention_days, environment, load_config_or_defaults, read_lease,
     read_trace,
+    reap::{WorktreeStatus, directory_bytes, reclaim_worktree, worktree_status},
     run_events::{DISPATCH_RUN_ID, emit_decision_requests},
     sweep_worktrees,
     work_order::{implementer_lease_ttl, in_flight_orders, reap_stale_work_orders},
@@ -208,7 +209,7 @@ fn run_dispatch_with_registry_and_minter(
 
     preflight_worktree(&context)?;
     let config = load_config_or_defaults(&request.paths, &request.working_directory).ok();
-    resolve_source_repository(&context, config.as_ref())?;
+    let source_repository = resolve_source_repository(&context, config.as_ref())?;
 
     let pages = match list_remote_branches(&context, minter) {
         Ok(pages) => pages,
@@ -253,7 +254,7 @@ fn run_dispatch_with_registry_and_minter(
     if let Some(branch) = listing.matched.as_ref() {
         reject_unlanded_branch(&mut context, &pages, branch, minter)?;
     }
-    reject_closing_pull_requests(&mut context, minter)?;
+    reject_closing_pull_requests(&mut context, &source_repository, minter)?;
 
     let runner_launch = registry
         .prepare(runner_name, &crate::RunCaps::default())
@@ -1031,7 +1032,22 @@ fn reject_unlanded_branch(
                 .all(|pull| pull["state"].as_str() == Some("MERGED"))
     });
     if landed {
-        return Ok(());
+        context.matched_key = Some(("branch_name", context.order.branch_name.clone()));
+        let detail = FailureDetail {
+            branch_name: Some(branch.name.clone()),
+            repository: Some(context.order.repository.clone()),
+            head_sha: Some(branch.commit.sha.clone()),
+            ahead_of_default: Some(ahead.map_or_else(|| json!("unknown"), |value| json!(value))),
+            ..FailureDetail::default()
+        };
+        let _ = append_failure(context, "branch-merged-not-cleaned", detail);
+        return Err(DispatchError::new(
+            3,
+            format!(
+                "ostrom dispatch: merged branch was not cleaned: matched_key=branch_name:{} repository={} branch={}",
+                context.order.branch_name, context.order.repository, branch.name
+            ),
+        ));
     }
     context.matched_key = Some(("branch_name", context.order.branch_name.clone()));
     let detail = FailureDetail {
@@ -1041,7 +1057,7 @@ fn reject_unlanded_branch(
         ahead_of_default: Some(ahead.map_or_else(|| json!("unknown"), |value| json!(value))),
         ..FailureDetail::default()
     };
-    let _ = append_failure(context, "branch-already-pushed", detail);
+    let _ = append_failure(context, "branch-in-flight", detail);
     Err(DispatchError::new(
         3,
         format!(
@@ -1057,6 +1073,7 @@ fn reject_unlanded_branch(
 
 fn reject_closing_pull_requests(
     context: &mut DispatchContext<'_>,
+    source_repository: &Path,
     minter: &mut dyn InstallationTokenMinter,
 ) -> Result<(), DispatchError> {
     let references = gh_json(
@@ -1144,11 +1161,11 @@ fn reject_closing_pull_requests(
                 format!("ostrom dispatch: closing pull request state was malformed for {url}"),
             ));
         }
-        if matches!(pull["state"].as_str(), Some("OPEN" | "MERGED")) {
+        if pull["state"].as_str() == Some("OPEN") {
             context.matched_key = Some(("closing_pull_request", url.clone()));
             let _ = append_failure(
                 context,
-                "branch-already-pushed",
+                "branch-in-flight",
                 FailureDetail {
                     repository: Some(context.order.repository.clone()),
                     ..FailureDetail::default()
@@ -1162,8 +1179,110 @@ fn reject_closing_pull_requests(
                 ),
             ));
         }
+        if pull["state"].as_str() == Some("MERGED") {
+            context.matched_key = Some(("closing_pull_request", url.clone()));
+            reclaim_merged_worktree(context, source_repository)?;
+        }
     }
     Ok(())
+}
+
+fn reclaim_merged_worktree(
+    context: &DispatchContext<'_>,
+    source_repository: &Path,
+) -> Result<(), DispatchError> {
+    let root = context
+        .request
+        .paths
+        .state
+        .join("implementer-worktrees")
+        .join(&context.item_hash);
+    let existed = root.exists();
+    let existing_branch = existed
+        .then(|| git_text(&root, &["branch", "--show-current"]))
+        .flatten()
+        .filter(|branch| !branch.is_empty())
+        .unwrap_or_else(|| context.order.branch_name.clone());
+    if existed {
+        match worktree_status(&root) {
+            WorktreeStatus::Clean => {}
+            WorktreeStatus::Dirty | WorktreeStatus::Unreadable => {
+                let _ = append_failure(
+                    context,
+                    "branch-merged-not-cleaned",
+                    FailureDetail {
+                        worktree_path: Some(root.clone()),
+                        branch_name: Some(existing_branch.clone()),
+                        repository: Some(context.order.repository.clone()),
+                        ..FailureDetail::default()
+                    },
+                );
+                return Err(DispatchError::new(
+                    3,
+                    format!(
+                        "ostrom dispatch: merged branch was not cleaned because worktree {} is dirty or unreadable",
+                        root.display()
+                    ),
+                ));
+            }
+        }
+        if directory_bytes(&root).is_err() {
+            let _ = append_failure(
+                context,
+                "branch-merged-not-cleaned",
+                FailureDetail {
+                    worktree_path: Some(root.clone()),
+                    branch_name: Some(existing_branch),
+                    repository: Some(context.order.repository.clone()),
+                    ..FailureDetail::default()
+                },
+            );
+            return Err(DispatchError::new(
+                3,
+                format!(
+                    "ostrom dispatch: merged branch was not cleaned because worktree {} is unreadable",
+                    root.display()
+                ),
+            ));
+        }
+    }
+    let reclaimed = reclaim_worktree(source_repository, &root, &context.order.branch_name)
+        .map_err(|error| {
+            let _ = append_failure(
+                context,
+                "branch-merged-not-cleaned",
+                FailureDetail {
+                    worktree_path: existed.then(|| root.clone()),
+                    branch_name: Some(existing_branch.clone()),
+                    repository: Some(context.order.repository.clone()),
+                    ..FailureDetail::default()
+                },
+            );
+            DispatchError::new(
+                3,
+                format!("ostrom dispatch: merged branch cleanup failed: {error}"),
+            )
+        })?;
+    let mut fact = Map::new();
+    fact.insert("schema_version".to_owned(), json!(1));
+    fact.insert("item_id".to_owned(), json!(context.order.item_id));
+    fact.insert("order_id".to_owned(), json!(context.order.order_id));
+    fact.insert("item_hash".to_owned(), json!(context.item_hash));
+    fact.insert("repository".to_owned(), json!(context.order.repository));
+    fact.insert("branch_name".to_owned(), json!(existing_branch));
+    fact.insert(
+        "worktree_path".to_owned(),
+        if existed {
+            json!(root.display().to_string())
+        } else {
+            Value::Null
+        },
+    );
+    fact.insert("worktree_count".to_owned(), json!(usize::from(existed)));
+    fact.insert("branch_count".to_owned(), json!(reclaimed.branch_count));
+    fact.insert("reclaimed_bytes".to_owned(), json!(reclaimed.bytes));
+    append_fact(context, "worktree-reclaimed", fact)
+        .map_err(|_| DispatchError::new(1, "ostrom dispatch: could not record worktree-reclaimed"))
 }
 
 fn resolve_ostrom(context: &DispatchContext<'_>) -> Result<PathBuf, DispatchError> {
