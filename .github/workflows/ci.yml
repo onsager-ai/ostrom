@@ -32,5 +32,13 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+      # Run twice: `--all-features` turns on preserve-order-probe, which
+      # reproduces a consumer enabling serde_json/preserve_order somewhere in
+      # the dependency graph. Without the plain run first, the feature-off
+      # path — the one umwelt itself actually builds under — would go
+      # untested and "identical either way" would only be proven one way.
       - name: cargo test
+        run: cargo test --workspace
+
+      - name: cargo test --all-features
         run: cargo test --workspace --all-features
