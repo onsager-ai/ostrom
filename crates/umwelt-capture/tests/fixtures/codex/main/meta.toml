@@ -27,7 +27,7 @@ not_exercised = [
 ]
 
 [scrub]
-# ethogram #6: narration replaced by placeholder of the SAME length, structure
+# onsager-ai/ethogram#6: narration replaced by placeholder of the SAME length, structure
 # and ids real. Verified: text lengths byte-identical before and after.
 narration = "replaced, exact length preserved"
 ids = "real (thread_id, item_N)"
@@ -54,15 +54,15 @@ discarding the real item.started events. And it emits ZERO agent.text, because
 chreode matches assistant_message/message while codex emits agent_message.
 
 Adopting it would bake into a conformance corpus exactly the guesses this
-capture was run to retire. Per ethogram#4, a fixture that guesses is withdrawn
-rather than corrected. Blocked on chreode#474.
+capture was run to retire. Per onsager-ai/ethogram#4, a fixture that guesses is withdrawn
+rather than corrected. Blocked on onsager-ai/chreode#474.
 """
 
 [notes.accumulation]
 # Flagged by umwelt-bd: the `not_exercised` list above turned out to be
 # load-bearing rather than bookkeeping.
 why_multiple_turns_matters = """
-ethogram's accumulation ruling (#6, 2026-09-07) states its own precondition:
+ethogram's accumulation ruling (onsager-ai/ethogram#6, 2026-09-07) states its own precondition:
 it assumes every harness reports SESSION-CUMULATIVE cost on its result frames,
 and is "invalid for a harness that reports per-frame increments, whose
 normaliser must accumulate before emitting so the wire stays cumulative."

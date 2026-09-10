@@ -5,7 +5,7 @@ fn sink_calls_ethogram_validate_on_append_and_forward() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sink.rs");
     let source = fs::read_to_string(&path).expect("read sink.rs");
     // Defend CLAUDE.md principle 2: consumers built on this documented guard
-    // before either call existed (#37). Check each production method, ignoring
+    // before either call existed (onsager-ai/umwelt#37). Check each production method, ignoring
     // comments; the behavioral battery separately proves refusals and ordering.
     let implementation = source
         .split("impl Sink for FileSink {")

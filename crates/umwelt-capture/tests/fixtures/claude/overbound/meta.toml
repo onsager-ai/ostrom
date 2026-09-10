@@ -20,7 +20,7 @@ paths = "absolute paths rewritten under /workspace"
 
 [notes]
 boundary = "The text is pure ASCII, so truncation cannot land mid-surrogate. This fixture exercises the BOUND, not the code-point boundary rule. The astral case is covered by constructed tests in both SDKs (ethogram-fb verified 14 inputs cross-SDK); a paid capture for it was considered and deliberately declined."
-assertion = "excerpt() on this text (chreode#472, merged): kept=16384, truncated=true, no lone surrogate, valid UTF-8 round trip."
+assertion = "excerpt() on this text (onsager-ai/chreode#472, merged): kept=16384, truncated=true, no lone surrogate, valid UTF-8 round trip."
 
 [chreode_output]
 file = "chreode-output.jsonl"

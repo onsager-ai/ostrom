@@ -37,7 +37,7 @@ are not wrong. But the two completions are NOT additive:
   costUsd=0.09765190000000001  turns=3  durationMs=12357  sessionId=<absent>
   costUsd=0.09765190000000001  turns=1  durationMs=1664   sessionId=<absent>
 
-Under the accumulation semantics ethogram ruled on 2026-09-07 (ethogram#6),
+Under the accumulation semantics ethogram ruled on 2026-09-07 (onsager-ai/ethogram#6),
 costUsd and usage on agent.completed are CUMULATIVE for the session named by
 sessionId; a consumer takes the MAXIMUM across agent.completed events sharing a
 sessionId and sums only across DISTINCT sessionIds. turns and durationMs are
@@ -49,15 +49,15 @@ Note sessionId is ABSENT from these payloads, and NOT merely because chreode
 fails to emit it. As of ethogram main 2ac51cd, AgentCompletedPayload is
 stage/turns/costUsd/model/usage/durationMs/estimated/extra -- there is no
 session field to emit, while AgentStartedPayload does have one. The ruling in
-ethogram#6's comments adopted it; nothing has shipped it, and there are no open
+onsager-ai/ethogram#6's comments adopted it; nothing has shipped it, and there are no open
 PRs. So a reader who sets out to "fix" a producer will find nowhere in the
 ethogram vocabulary to put it.
 
 chreode is a partial exception worth stating precisely: it has NOT adopted
-ethogram's package yet (that is chreode#470, parked), so its own agent.completed
-payload is chreode's to extend additively, and chreode#475 can be fixed properly
+ethogram's package yet (that is onsager-ai/chreode#470, parked), so its own agent.completed
+payload is chreode's to extend additively, and onsager-ai/chreode#475 can be fixed properly
 rather than by inference. A consumer of ethogram's types cannot do the same
 until the field ships there.
 
-Either way, a reader who sums what this file shows lands exactly in chreode#475.
+Either way, a reader who sums what this file shows lands exactly in onsager-ai/chreode#475.
 """

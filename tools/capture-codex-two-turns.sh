@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Two-turn codex capture for onsager-ai/umwelt#20.
 #
-# Settles ethogram #6's stated precondition: does codex report SESSION-CUMULATIVE
+# Settles onsager-ai/ethogram#6's stated precondition: does codex report SESSION-CUMULATIVE
 # usage on turn.completed, or a PER-TURN increment? A codex normaliser cannot be
 # written until this is known, because a cumulative wire requires the normaliser
 # to accumulate before emitting if the harness reports increments.

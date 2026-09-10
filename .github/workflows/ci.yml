@@ -20,7 +20,7 @@ jobs:
       - uses: actions/checkout@v4
 
       # The workspace-detection guard that made this job a vacuous pass is gone: the
-      # umwelt#2 extraction PR created Cargo.toml, so the three steps below always run
+      # onsager-ai/umwelt#2 extraction PR created Cargo.toml, so the three steps below always run
       # and a failure is a real failure. rust-toolchain.toml pins the toolchain and
       # carries rustfmt and clippy, so there is no component-installation step.
       - name: Toolchain
