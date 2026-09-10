@@ -13,8 +13,8 @@ use thiserror::Error;
 use crate::{
     Clock, OstromPaths, TraceAppend,
     app_token::{
-        AuthenticatedCommandError, GitHubInstallationTokenMinter, InstallationTokenMinter,
-        ScopedAppTokenRequest, authenticated_output,
+        GitHubInstallationTokenMinter, InstallationTokenMinter, ScopedAppTokenRequest,
+        authenticated_output,
     },
     append_trace, read_lease,
 };
@@ -238,10 +238,20 @@ fn inspect_worktree(
         report.reason = "worktree-source-unreadable".to_owned();
         return report;
     };
-    match reclaim_worktree(&source, worktree, &branch) {
+    match reclaim_worktree(
+        &options.paths,
+        &order.repository,
+        &source,
+        worktree,
+        &branch,
+        minter,
+    ) {
         Ok(_) => {
             report.outcome = "reaped".to_owned();
             report.reclaimed_bytes = report.bytes;
+        }
+        Err(error) if error.starts_with(UNMERGED_LOCAL_COMMITS_PREFIX) => {
+            report.reason = UNMERGED_LOCAL_COMMITS_REASON.to_owned();
         }
         Err(_) => report.reason = "worktree-removal-failed".to_owned(),
     }
@@ -394,6 +404,7 @@ fn resolution_state(
 
 fn closing_reference(text: &str, item_ref: &str) -> bool {
     let lower = text.to_ascii_lowercase();
+    let item_ref = item_ref.to_ascii_lowercase();
     [
         "close ",
         "closes ",
@@ -406,7 +417,25 @@ fn closing_reference(text: &str, item_ref: &str) -> bool {
         "references ",
     ]
     .iter()
-    .any(|verb| lower.contains(&format!("{verb}{}", item_ref.to_ascii_lowercase())))
+    .any(|verb| {
+        let needle = format!("{verb}{item_ref}");
+        let mut search_from = 0;
+        while let Some(offset) = lower[search_from..].find(needle.as_str()) {
+            let start = search_from + offset;
+            let end = start + needle.len();
+            // `fixes #7` must not match `fixes #712`: the reference is only a
+            // match when nothing that could extend it (another digit) follows.
+            let extends = lower[end..]
+                .chars()
+                .next()
+                .is_some_and(|character| character.is_ascii_digit());
+            if !extends {
+                return true;
+            }
+            search_from = start + 1;
+        }
+        false
+    })
 }
 
 fn pull_states(value: &Value) -> Result<BTreeSet<String>, ()> {
@@ -422,6 +451,25 @@ fn pull_states(value: &Value) -> Result<BTreeSet<String>, ()> {
     Ok(states)
 }
 
+/// The one `gh_json` for both this module and `dispatch.rs`: checks exit
+/// status only. `gh` writes update notices and rate-limit warnings to stderr
+/// on exit 0, so treating any stderr output as failure retained every
+/// worktree as `github-state-unreadable` in exactly the environments this
+/// reaper exists for.
+pub(crate) fn gh_json_output(
+    paths: &OstromPaths,
+    scope: ScopedAppTokenRequest<'_>,
+    command: &[&str],
+    minter: &mut dyn InstallationTokenMinter,
+) -> Result<Value, String> {
+    let output =
+        authenticated_output(paths, scope, command, minter).map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+    }
+    serde_json::from_slice(&output.stdout).map_err(|error| error.to_string())
+}
+
 fn gh_json(
     options: &ReapWorktreesOptions,
     repository: &str,
@@ -429,17 +477,13 @@ fn gh_json(
     command: &[&str],
     minter: &mut dyn InstallationTokenMinter,
 ) -> Result<Value, ()> {
-    let output = authenticated_output(
+    gh_json_output(
         &options.paths,
         ScopedAppTokenRequest::new("builder", repository, repository, permissions),
         command,
         minter,
     )
-    .map_err(|_: AuthenticatedCommandError| ())?;
-    if !output.status.success() || !output.stderr.is_empty() {
-        return Err(());
-    }
-    serde_json::from_slice(&output.stdout).map_err(|_| ())
+    .map_err(|_| ())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -495,10 +539,21 @@ pub(crate) struct ReclaimedWorktree {
     pub branch_count: usize,
 }
 
+/// `reclaim_worktree`'s error message starts with this when the branch has
+/// commits the default branch does not, so a caller can tell "would destroy
+/// unpushed work" apart from every other failure without inventing a second
+/// error type across the crate boundary this function is shared over.
+pub(crate) const UNMERGED_LOCAL_COMMITS_PREFIX: &str = "unmerged-local-commits:";
+pub(crate) const UNMERGED_LOCAL_COMMITS_REASON: &str = "unmerged-local-commits";
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn reclaim_worktree(
+    paths: &OstromPaths,
+    repository: &str,
     source: &Path,
     worktree: &Path,
     expected_branch: &str,
+    minter: &mut dyn InstallationTokenMinter,
 ) -> Result<ReclaimedWorktree, String> {
     let bytes = if worktree.exists() {
         directory_bytes(worktree).map_err(|()| "worktree size is unreadable".to_owned())?
@@ -517,6 +572,35 @@ pub(crate) fn reclaim_worktree(
         {
             branches.insert(branch);
         }
+    }
+    branches.insert(expected_branch.to_owned());
+
+    // `worktree_status` above only catches uncommitted changes. A worktree
+    // can be clean and still hold commits that were never pushed -- an
+    // implementer committed after its last push, then was killed or timed
+    // out. Refuse before anything is removed: `git branch -D` below would
+    // otherwise make those commits unreachable, from both this function's
+    // callers (`inspect_worktree` and `reclaim_merged_worktree`).
+    for branch in &branches {
+        if !local_branch_exists(source, branch) {
+            continue;
+        }
+        match branch_has_unpublished_tree(paths, repository, source, branch, minter) {
+            Ok(false) => {}
+            Ok(true) => {
+                return Err(format!(
+                    "{UNMERGED_LOCAL_COMMITS_PREFIX} branch {branch} has content not on the default branch"
+                ));
+            }
+            Err(()) => {
+                return Err(format!(
+                    "{UNMERGED_LOCAL_COMMITS_PREFIX} could not verify branch {branch} is fully merged into the default branch"
+                ));
+            }
+        }
+    }
+
+    if worktree.exists() {
         let output = Command::new("git")
             .arg("-C")
             .arg(source)
@@ -529,7 +613,6 @@ pub(crate) fn reclaim_worktree(
             return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
         }
     }
-    branches.insert(expected_branch.to_owned());
     let mut branch_count = 0;
     for branch in branches {
         if !local_branch_exists(source, &branch) {
@@ -551,6 +634,126 @@ pub(crate) fn reclaim_worktree(
         bytes,
         branch_count,
     })
+}
+
+/// Whether `branch` carries a tree the repository's default branch does not.
+/// `Ok(false)` proves the branch is fully merged; anything else means the
+/// caller must not delete `branch`.
+///
+/// This compares trees, not commit ancestry: a squash merge creates a new
+/// commit on the default branch with a different SHA, so a squash-merged
+/// branch's original commits are never ancestors of it and `rev-list --count`
+/// would report it "ahead" forever, refusing every reclaim including the one
+/// this guard exists to allow. Comparing trees the way `implement.rs`'s
+/// `has_unpublished_tree` already does lets a squash-merged branch whose
+/// content fully landed be told apart from one carrying genuinely unpublished
+/// work.
+fn branch_has_unpublished_tree(
+    paths: &OstromPaths,
+    repository: &str,
+    source: &Path,
+    branch: &str,
+    minter: &mut dyn InstallationTokenMinter,
+) -> Result<bool, ()> {
+    // Refresh the default branch's tip first: in the merged case the remote
+    // copy of `branch` may already be gone, so its own upstream is not
+    // available to compare against the way `leaves.rs` does for a live
+    // branch -- the repository's default branch always is, but a source
+    // repository that has not fetched recently must not compare against a
+    // stale tree. Go through the same authenticated channel as every other
+    // GitHub network call here: a plain `git fetch origin` would depend on
+    // ambient credentials this process does not carry.
+    if let Some(default_branch) = gh_json_output(
+        paths,
+        ScopedAppTokenRequest::new("builder", repository, repository, "metadata:read"),
+        &[
+            "gh",
+            "repo",
+            "view",
+            repository,
+            "--json",
+            "defaultBranchRef",
+        ],
+        minter,
+    )
+    .ok()
+    .and_then(|value| {
+        value
+            .get("defaultBranchRef")
+            .and_then(|reference| reference.get("name"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    }) {
+        let remote = format!("https://github.com/{repository}.git");
+        let refspec = format!("{default_branch}:refs/remotes/origin/{default_branch}");
+        let _ = authenticated_output(
+            paths,
+            ScopedAppTokenRequest::new(
+                "builder",
+                repository,
+                repository,
+                "metadata:read,contents:read",
+            ),
+            &[
+                "git",
+                "-C",
+                &source.display().to_string(),
+                "fetch",
+                "--quiet",
+                &remote,
+                &refspec,
+            ],
+            minter,
+        );
+    }
+    // Best-effort above: a solo operator's source repository may have no
+    // configured GitHub App, or the fetch may fail for reasons that do not
+    // bear on whether `branch` is merged. Fall back to whatever the source
+    // repository's own refs already show either way.
+    let default_ref = default_branch_reference(source).ok_or(())?;
+    // Compare trees directly in `source`, not a worktree's `HEAD`: the
+    // branch's worktree may already be gone (the merged case this guard
+    // protects), and `source` carries the branch's commits regardless.
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(source)
+        .args(["diff", "--quiet", &default_ref, branch])
+        .status()
+        .map_err(|_| ())?;
+    match status.code() {
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        _ => Err(()),
+    }
+}
+
+fn default_branch_reference(source: &Path) -> Option<String> {
+    let symbolic = git_text(source, &["symbolic-ref", "-q", "refs/remotes/origin/HEAD"]);
+    if symbolic
+        .as_deref()
+        .is_some_and(|reference| verified_commit(source, reference))
+    {
+        return symbolic;
+    }
+    for candidate in [
+        "refs/remotes/origin/main",
+        "refs/remotes/origin/master",
+        "refs/heads/main",
+        "refs/heads/master",
+    ] {
+        if verified_commit(source, candidate) {
+            return Some(candidate.to_owned());
+        }
+    }
+    None
+}
+
+fn verified_commit(source: &Path, reference: &str) -> bool {
+    git_text(
+        source,
+        &["rev-parse", "--verify", &format!("{reference}^{{commit}}")],
+    )
+    .is_some()
 }
 
 fn local_branch_exists(source: &Path, branch: &str) -> bool {

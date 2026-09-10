@@ -327,3 +327,58 @@ fn a_live_implementer_lease_retains_the_worktree() {
     assert!(fixture.worktree.exists());
     assert!(!gh_log.exists());
 }
+
+#[test]
+fn open_item_without_pull_request_evidence_is_retained() {
+    // No env overrides: the stub `gh` answers with an OPEN issue, no closing
+    // references, and no pull requests anywhere -- the default shape,
+    // exercised here because no other test names this specific reason.
+    let fixture = Fixture::new();
+    let output = run(&mut fixture.command(true));
+    let rows = output_rows(&output);
+    assert_eq!(rows[0]["outcome"], "retained");
+    assert_eq!(rows[0]["reason"], "item-open-no-resolved-pull-request");
+    assert!(fixture.worktree.exists());
+}
+
+#[test]
+fn merged_worktree_with_an_unpushed_local_commit_is_retained_not_reaped() {
+    // The worktree is clean (nothing uncommitted) but its branch carries a
+    // commit that was never pushed anywhere -- the implementer committed
+    // after its last push, then was killed or timed out. `worktree_status`
+    // alone cannot see this; deleting the branch here would make the commit
+    // unreachable.
+    let fixture = Fixture::new();
+    // A real content change, not `--allow-empty`: the guard compares trees
+    // (a squash merge changes ancestry but not content), so an empty commit
+    // would leave the branch's tree identical to `main`'s and the guard
+    // would wrongly call it safe to reap.
+    fs::write(fixture.worktree.join("unpushed.txt"), "expensive work\n")
+        .expect("write unpushed work");
+    git(&fixture.worktree, &["add", "unpushed.txt"]);
+    git(&fixture.worktree, &["commit", "-m", "unpushed work"]);
+    let output = run(fixture.command(true).env(
+        "OSTROM_TEST_PRS",
+        r#"[{"number":7,"state":"MERGED","url":"https://example.invalid/pull/7"}]"#,
+    ));
+    let rows = output_rows(&output);
+    assert_eq!(rows[0]["outcome"], "retained");
+    assert_eq!(rows[0]["reason"], "unmerged-local-commits");
+    assert_eq!(rows[0]["reclaimed_bytes"], 0);
+    assert!(fixture.worktree.exists());
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&fixture.source)
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{}", fixture.branch),
+            ])
+            .status()
+            .expect("inspect branch")
+            .success(),
+        "the branch must survive a refused reclaim"
+    );
+}

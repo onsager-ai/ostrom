@@ -618,6 +618,139 @@ fn merged_and_remote_cleaned_branch_reclaims_local_worktree_before_dispatch() {
 }
 
 #[test]
+fn merged_branch_with_an_unpushed_local_commit_is_preserved() {
+    // The worktree is clean -- nothing uncommitted -- but its branch carries
+    // a commit that was never pushed: an implementer committed after its
+    // last push, then was killed or timed out. `worktree_status` cannot see
+    // this; the reclaim must refuse rather than run `git branch -D` and make
+    // that commit unreachable.
+    let fixture = Fixture::new();
+    let worktree = fixture
+        .state
+        .join("implementer-worktrees")
+        .join(fixture.item_hash());
+    fs::create_dir_all(worktree.parent().expect("worktree parent"))
+        .expect("create worktree parent");
+    git(
+        &fixture.source,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            BRANCH,
+            worktree.to_str().expect("UTF-8 worktree"),
+            "refs/remotes/origin/main",
+        ],
+    );
+    // A real content change, not `--allow-empty`: the guard compares trees
+    // (a squash merge changes ancestry but not content), so an empty commit
+    // would leave the branch's tree identical to `main`'s and the guard
+    // would wrongly call it safe to reclaim.
+    fs::write(worktree.join("unpushed.txt"), "expensive work\n").expect("write unpushed work");
+    git(&worktree, &["add", "unpushed.txt"]);
+    git(&worktree, &["commit", "-m", "unpushed work"]);
+    let url = "https://example.invalid/pull/91";
+    let output = run(fixture
+        .command()
+        .env("OSTROM_TEST_BRANCH_PAGE_1", default_page())
+        .env(
+            "OSTROM_TEST_CLOSING_REFS",
+            json!({"closedByPullRequestsReferences":[{"url":url}]}).to_string(),
+        )
+        .env(
+            "OSTROM_TEST_CLOSING_PR",
+            json!({"number":91,"state":"MERGED","mergedAt":"2026-08-01T00:00:00Z","url":url})
+                .to_string(),
+        ));
+    assert_refused(&output, 3, "unmerged-local-commits");
+    assert!(worktree.exists());
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&fixture.source)
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{BRANCH}"),
+            ])
+            .status()
+            .expect("inspect branch")
+            .success(),
+        "the branch must survive a refused reclaim"
+    );
+    assert_eq!(
+        fixture.trace()[0]["fact"]["reason"],
+        "branch-merged-not-cleaned"
+    );
+}
+
+#[test]
+fn live_lease_prevents_reclaiming_a_merged_worktree() {
+    // A duplicate dispatch for an item whose earlier pull request just
+    // merged must not reclaim the worktree a live implementer is sitting
+    // in, ahead of the lease/in-flight guard that would otherwise refuse
+    // the duplicate.
+    let fixture = Fixture::new();
+    let worktree = fixture
+        .state
+        .join("implementer-worktrees")
+        .join(fixture.item_hash());
+    fs::create_dir_all(worktree.parent().expect("worktree parent"))
+        .expect("create worktree parent");
+    git(
+        &fixture.source,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            BRANCH,
+            worktree.to_str().expect("UTF-8 worktree"),
+            "refs/remotes/origin/main",
+        ],
+    );
+    fs::write(
+        fixture.lease(),
+        format!(
+            "{{\"owner\":\"ostrom-implementer-elsewhere\",\"started_at\":{},\"expires_at\":{}}}\n",
+            fixture.now,
+            fixture.now + 3_600,
+        ),
+    )
+    .expect("write live lease");
+    let url = "https://example.invalid/pull/91";
+    let output = run(fixture
+        .command()
+        .env("OSTROM_TEST_BRANCH_PAGE_1", default_page())
+        .env(
+            "OSTROM_TEST_CLOSING_REFS",
+            json!({"closedByPullRequestsReferences":[{"url":url}]}).to_string(),
+        )
+        .env(
+            "OSTROM_TEST_CLOSING_PR",
+            json!({"number":91,"state":"MERGED","mergedAt":"2026-08-01T00:00:00Z","url":url})
+                .to_string(),
+        ));
+    assert_refused(&output, 3, "live implementer lease");
+    assert!(worktree.exists());
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&fixture.source)
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{BRANCH}"),
+            ])
+            .status()
+            .expect("inspect branch")
+            .success(),
+        "the branch must survive while a lease is live"
+    );
+}
+
+#[test]
 fn merged_branch_with_dirty_local_worktree_is_named_and_preserved() {
     let fixture = Fixture::new();
     let worktree = fixture
