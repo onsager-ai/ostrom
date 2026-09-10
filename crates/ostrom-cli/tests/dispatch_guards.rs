@@ -224,6 +224,13 @@ exit 97
         self.state
             .join(format!("implementer-item-{}.lease", self.item_hash()))
     }
+
+    /// The commit SHA `BRANCH` currently points to in `self.source` -- what
+    /// a pull request's `headRefOid` would report if GitHub had last
+    /// observed the branch at exactly this point.
+    fn branch_sha(&self) -> String {
+        git_output(&self.source, &["rev-parse", BRANCH])
+    }
 }
 
 fn workspace_root() -> PathBuf {
@@ -249,6 +256,24 @@ fn git(path: &Path, arguments: &[&str]) {
             .expect("run git")
             .success()
     );
+}
+
+fn git_output(path: &Path, arguments: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(arguments)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {arguments:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("UTF-8 git output")
+        .trim()
+        .to_owned()
 }
 
 fn default_page() -> String {
@@ -495,6 +520,7 @@ fn merged_branch_still_on_the_remote_is_deleted_and_the_dispatch_proceeds() {
         ],
     );
     let url = "https://example.invalid/pull/91";
+    let published_tip = fixture.branch_sha();
     let output = run(fixture
         .command()
         // the branch still matches on the remote, unlike the test below
@@ -509,7 +535,7 @@ fn merged_branch_still_on_the_remote_is_deleted_and_the_dispatch_proceeds() {
         )
         .env(
             "OSTROM_TEST_CLOSING_PR",
-            json!({"number":91,"state":"MERGED","mergedAt":"2026-08-01T00:00:00Z","url":url})
+            json!({"number":91,"state":"MERGED","mergedAt":"2026-08-01T00:00:00Z","url":url,"headRefOid":published_tip})
                 .to_string(),
         ));
     assert!(
@@ -577,6 +603,7 @@ fn merged_and_remote_cleaned_branch_reclaims_local_worktree_before_dispatch() {
         ],
     );
     let url = "https://example.invalid/pull/91";
+    let published_tip = fixture.branch_sha();
     let output = run(fixture
         .command()
         .env("OSTROM_TEST_BRANCH_PAGE_1", default_page())
@@ -586,7 +613,7 @@ fn merged_and_remote_cleaned_branch_reclaims_local_worktree_before_dispatch() {
         )
         .env(
             "OSTROM_TEST_CLOSING_PR",
-            json!({"number":91,"state":"MERGED","mergedAt":"2026-08-01T00:00:00Z","url":url})
+            json!({"number":91,"state":"MERGED","mergedAt":"2026-08-01T00:00:00Z","url":url,"headRefOid":published_tip})
                 .to_string(),
         ));
     assert!(
@@ -642,10 +669,13 @@ fn merged_branch_with_an_unpushed_local_commit_is_preserved() {
             "refs/remotes/origin/main",
         ],
     );
-    // A real content change, not `--allow-empty`: the guard compares trees
-    // (a squash merge changes ancestry but not content), so an empty commit
-    // would leave the branch's tree identical to `main`'s and the guard
-    // would wrongly call it safe to reclaim.
+    // Capture the tip GitHub is presumed to have observed *before* the
+    // unpushed commit below -- the guard now checks ancestry against this
+    // published tip, not against the default branch's current tip.
+    let published_tip = fixture.branch_sha();
+    // A real content change, not `--allow-empty`: an empty commit leaves the
+    // branch's tree identical to its parent, which would make this look
+    // like a no-op rather than a genuine unpushed commit.
     fs::write(worktree.join("unpushed.txt"), "expensive work\n").expect("write unpushed work");
     git(&worktree, &["add", "unpushed.txt"]);
     git(&worktree, &["commit", "-m", "unpushed work"]);
@@ -659,7 +689,7 @@ fn merged_branch_with_an_unpushed_local_commit_is_preserved() {
         )
         .env(
             "OSTROM_TEST_CLOSING_PR",
-            json!({"number":91,"state":"MERGED","mergedAt":"2026-08-01T00:00:00Z","url":url})
+            json!({"number":91,"state":"MERGED","mergedAt":"2026-08-01T00:00:00Z","url":url,"headRefOid":published_tip})
                 .to_string(),
         ));
     assert_refused(&output, 3, "unmerged-local-commits");
@@ -748,6 +778,9 @@ fn live_lease_prevents_reclaiming_a_merged_worktree() {
             .success(),
         "the branch must survive while a lease is live"
     );
+    let trace = fixture.trace();
+    assert_eq!(trace[0]["kind"], "work-failed");
+    assert_eq!(trace[0]["fact"]["reason"], "live-implementer-lease");
 }
 
 #[test]

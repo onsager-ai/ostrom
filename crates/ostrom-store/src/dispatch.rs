@@ -1189,7 +1189,7 @@ fn reject_closing_pull_requests(
                 "view",
                 &url,
                 "--json",
-                "number,state,mergedAt,url",
+                "number,state,mergedAt,url,headRefOid",
             ],
             minter,
         )
@@ -1212,12 +1212,17 @@ fn reject_closing_pull_requests(
             ));
         }
         let state = pull["state"].as_str().unwrap_or_default().to_owned();
-        resolved.push((url, state));
+        let number = pull["number"].as_i64().unwrap_or_default();
+        let head_ref_oid = pull["headRefOid"].as_str().map(str::to_owned);
+        resolved.push((url, state, number, head_ref_oid));
     }
 
     // Pass one: any OPEN closing pull request blocks, regardless of where it
     // sorted against a MERGED one above.
-    if let Some((url, _)) = resolved.iter().find(|(_, state)| state.as_str() == "OPEN") {
+    if let Some((url, ..)) = resolved
+        .iter()
+        .find(|(_, state, ..)| state.as_str() == "OPEN")
+    {
         context.matched_key = Some(("closing_pull_request", url.clone()));
         let _ = append_failure(
             context,
@@ -1238,13 +1243,17 @@ fn reject_closing_pull_requests(
 
     // Pass two: reclaim once. A second MERGED closing pull request would
     // otherwise duplicate the `worktree-reclaimed` fact and re-run cleanup
-    // against an already-empty worktree.
-    if let Some((url, _)) = resolved
+    // against an already-empty worktree. Several MERGED pull requests can
+    // close the same item (a superseded one reopened and merged again); the
+    // newest by number is the one whose `headRefOid` reflects what GitHub
+    // most recently observed on this branch.
+    if let Some((url, _, _, head_ref_oid)) = resolved
         .iter()
-        .find(|(_, state)| state.as_str() == "MERGED")
+        .filter(|(_, state, ..)| state.as_str() == "MERGED")
+        .max_by_key(|(_, _, number, _)| *number)
     {
         context.matched_key = Some(("closing_pull_request", url.clone()));
-        reclaim_merged_worktree(context, source_repository, minter)?;
+        reclaim_merged_worktree(context, source_repository, head_ref_oid.as_deref())?;
         // The reclaim succeeded, so this dispatch is no longer refusing on
         // branch identity. `append_failure` writes `matched_key` into every
         // work-failed fact, so leaving it set would make a later refusal --
@@ -1257,7 +1266,7 @@ fn reject_closing_pull_requests(
 fn reclaim_merged_worktree(
     context: &DispatchContext<'_>,
     source_repository: &Path,
-    minter: &mut dyn InstallationTokenMinter,
+    published_tip: Option<&str>,
 ) -> Result<(), DispatchError> {
     // `matched_key` is set by the caller before this runs, so stderr for
     // every refusal below can be correlated back to the closing pull request
@@ -1288,6 +1297,16 @@ fn reclaim_merged_worktree(
         .join(format!("implementer-item-{}.lease", context.item_hash));
     match read_lease(&lease_path) {
         Ok(Some(lease)) if lease.expires_at > context.request.clock.epoch_seconds() => {
+            let _ = append_failure(
+                context,
+                "live-implementer-lease",
+                FailureDetail {
+                    worktree_path: root.exists().then(|| root.clone()),
+                    branch_name: Some(context.order.branch_name.clone()),
+                    repository: Some(context.order.repository.clone()),
+                    ..FailureDetail::default()
+                },
+            );
             return Err(DispatchError::new(
                 3,
                 format!(
@@ -1298,6 +1317,16 @@ fn reclaim_merged_worktree(
         }
         Ok(_) => {}
         Err(_) => {
+            let _ = append_failure(
+                context,
+                "implementer-lease-unreadable",
+                FailureDetail {
+                    worktree_path: root.exists().then(|| root.clone()),
+                    branch_name: Some(context.order.branch_name.clone()),
+                    repository: Some(context.order.repository.clone()),
+                    ..FailureDetail::default()
+                },
+            );
             return Err(DispatchError::new(
                 3,
                 format!(
@@ -1358,12 +1387,10 @@ fn reclaim_merged_worktree(
         }
     }
     let reclaimed = reclaim_worktree(
-        &context.request.paths,
-        &context.order.repository,
         source_repository,
         &root,
         &context.order.branch_name,
-        minter,
+        published_tip,
     )
     .map_err(|error| {
         let _ = append_failure(

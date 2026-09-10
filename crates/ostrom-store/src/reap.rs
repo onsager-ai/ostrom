@@ -222,12 +222,12 @@ fn inspect_worktree(
             return report;
         }
     };
-    let reap_reason = match resolution {
+    let (reap_reason, published_tip) = match resolution {
         Resolution::Retain(reason) => {
             report.reason = reason.to_owned();
             return report;
         }
-        Resolution::Reap(reason) => reason,
+        Resolution::Reap(reason, tip) => (reason, tip),
     };
     report.reason = reap_reason.to_owned();
     if !options.apply {
@@ -238,14 +238,7 @@ fn inspect_worktree(
         report.reason = "worktree-source-unreadable".to_owned();
         return report;
     };
-    match reclaim_worktree(
-        &options.paths,
-        &order.repository,
-        &source,
-        worktree,
-        &branch,
-        minter,
-    ) {
+    match reclaim_worktree(&source, worktree, &branch, published_tip.as_deref()) {
         Ok(_) => {
             report.outcome = "reaped".to_owned();
             report.reclaimed_bytes = report.bytes;
@@ -260,7 +253,46 @@ fn inspect_worktree(
 
 enum Resolution {
     Retain(&'static str),
-    Reap(&'static str),
+    /// The reason to reap, plus the `headRefOid` GitHub last reported for the
+    /// pull request that resolved this item -- the tip `reclaim_worktree`
+    /// must find the branch to be an ancestor of before it is safe to
+    /// destroy. `None` when no pull request exists to supply one at all: the
+    /// content-safety guard in `reclaim_worktree` then has nothing to verify
+    /// against and refuses on its own, independent of this resolution.
+    Reap(&'static str, Option<String>),
+}
+
+/// One pull request's identity, state and last-known head commit, gathered
+/// from either a `--head`-filtered listing or a specific `gh pr view`. Kept
+/// as a plain record (not folded into a set of state strings) because
+/// choosing which pull request's `headRefOid` to trust when several resolved
+/// this item requires comparing `number`, not just states.
+struct PullSummary {
+    number: i64,
+    state: String,
+    head_ref_oid: Option<String>,
+}
+
+fn parse_pulls(value: &Value) -> Result<Vec<PullSummary>, ()> {
+    let pulls = value.as_array().ok_or(())?;
+    let mut summaries = Vec::with_capacity(pulls.len());
+    for pull in pulls {
+        let number = pull.get("number").and_then(Value::as_i64).ok_or(())?;
+        let state = pull.get("state").and_then(Value::as_str).ok_or(())?;
+        if !matches!(state, "OPEN" | "CLOSED" | "MERGED") {
+            return Err(());
+        }
+        let head_ref_oid = pull
+            .get("headRefOid")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        summaries.push(PullSummary {
+            number,
+            state: state.to_owned(),
+            head_ref_oid,
+        });
+    }
+    Ok(summaries)
 }
 
 fn resolution_state(
@@ -305,11 +337,11 @@ fn resolution_state(
             "--state",
             "all",
             "--json",
-            "number,state,url",
+            "number,state,url,headRefOid",
         ],
         minter,
     )?;
-    let mut pull_states = pull_states(&branch_pulls)?;
+    let mut pulls = parse_pulls(&branch_pulls)?;
     let issue = gh_json(
         options,
         &order.repository,
@@ -344,17 +376,33 @@ fn resolution_state(
             options,
             &order.repository,
             "metadata:read,pull_requests:read",
-            &["gh", "pr", "view", &url, "--json", "state,url"],
+            &[
+                "gh",
+                "pr",
+                "view",
+                &url,
+                "--json",
+                "number,state,url,headRefOid",
+            ],
             minter,
         )?;
         if pull.get("url").and_then(Value::as_str) != Some(url.as_str()) {
             return Err(());
         }
+        let number = pull.get("number").and_then(Value::as_i64).ok_or(())?;
         let state = pull.get("state").and_then(Value::as_str).ok_or(())?;
         if !matches!(state, "OPEN" | "CLOSED" | "MERGED") {
             return Err(());
         }
-        pull_states.insert(state.to_owned());
+        let head_ref_oid = pull
+            .get("headRefOid")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        pulls.push(PullSummary {
+            number,
+            state: state.to_owned(),
+            head_ref_oid,
+        });
     }
     let open_pulls = gh_json(
         options,
@@ -376,7 +424,7 @@ fn resolution_state(
         minter,
     )?;
     let open_pulls = open_pulls.as_array().ok_or(())?;
-    if open_pulls.iter().any(|pull| {
+    let text_matched_open = open_pulls.iter().any(|pull| {
         let text = format!(
             "{}\n{}",
             pull.get("title")
@@ -385,19 +433,27 @@ fn resolution_state(
             pull.get("body").and_then(Value::as_str).unwrap_or_default()
         );
         text.contains(&order.item_id) || closing_reference(&text, &order.item_ref)
-    }) {
-        pull_states.insert("OPEN".to_owned());
-    }
-    if pull_states.contains("OPEN") {
+    });
+    if text_matched_open || pulls.iter().any(|pull| pull.state == "OPEN") {
         return Ok(Resolution::Retain("pull-request-open"));
     }
-    if pull_states.contains("MERGED") || pull_states.contains("CLOSED") {
+    // Several pull requests can have resolved this item (a closing reference
+    // plus its own `--head` match, or a history of superseded pull
+    // requests); the newest one's `headRefOid` is the tip GitHub most
+    // recently observed, so it is the one `reclaim_worktree` must check
+    // ancestry against.
+    if let Some(newest) = pulls
+        .iter()
+        .filter(|pull| matches!(pull.state.as_str(), "MERGED" | "CLOSED"))
+        .max_by_key(|pull| pull.number)
+    {
         return Ok(Resolution::Reap(
             "pull-request-resolved-remote-branch-absent",
+            newest.head_ref_oid.clone(),
         ));
     }
     if item_state == "CLOSED" {
-        return Ok(Resolution::Reap("item-closed-no-open-pull-request"));
+        return Ok(Resolution::Reap("item-closed-no-open-pull-request", None));
     }
     Ok(Resolution::Retain("item-open-no-resolved-pull-request"))
 }
@@ -436,19 +492,6 @@ fn closing_reference(text: &str, item_ref: &str) -> bool {
         }
         false
     })
-}
-
-fn pull_states(value: &Value) -> Result<BTreeSet<String>, ()> {
-    let pulls = value.as_array().ok_or(())?;
-    let mut states = BTreeSet::new();
-    for pull in pulls {
-        let state = pull.get("state").and_then(Value::as_str).ok_or(())?;
-        if !matches!(state, "OPEN" | "CLOSED" | "MERGED") {
-            return Err(());
-        }
-        states.insert(state.to_owned());
-    }
-    Ok(states)
 }
 
 /// The one `gh_json` for both this module and `dispatch.rs`: checks exit
@@ -546,14 +589,11 @@ pub(crate) struct ReclaimedWorktree {
 pub(crate) const UNMERGED_LOCAL_COMMITS_PREFIX: &str = "unmerged-local-commits:";
 pub(crate) const UNMERGED_LOCAL_COMMITS_REASON: &str = "unmerged-local-commits";
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn reclaim_worktree(
-    paths: &OstromPaths,
-    repository: &str,
     source: &Path,
     worktree: &Path,
     expected_branch: &str,
-    minter: &mut dyn InstallationTokenMinter,
+    published_tip: Option<&str>,
 ) -> Result<ReclaimedWorktree, String> {
     let bytes = if worktree.exists() {
         directory_bytes(worktree).map_err(|()| "worktree size is unreadable".to_owned())?
@@ -585,16 +625,16 @@ pub(crate) fn reclaim_worktree(
         if !local_branch_exists(source, branch) {
             continue;
         }
-        match branch_has_unpublished_tree(paths, repository, source, branch, minter) {
-            Ok(false) => {}
-            Ok(true) => {
+        match branch_tip_is_published(source, branch, published_tip) {
+            Ok(true) => {}
+            Ok(false) => {
                 return Err(format!(
-                    "{UNMERGED_LOCAL_COMMITS_PREFIX} branch {branch} has content not on the default branch"
+                    "{UNMERGED_LOCAL_COMMITS_PREFIX} branch {branch} carries commits the published tip does not"
                 ));
             }
             Err(()) => {
                 return Err(format!(
-                    "{UNMERGED_LOCAL_COMMITS_PREFIX} could not verify branch {branch} is fully merged into the default branch"
+                    "{UNMERGED_LOCAL_COMMITS_PREFIX} could not verify branch {branch} against a published tip"
                 ));
             }
         }
@@ -636,124 +676,38 @@ pub(crate) fn reclaim_worktree(
     })
 }
 
-/// Whether `branch` carries a tree the repository's default branch does not.
-/// `Ok(false)` proves the branch is fully merged; anything else means the
-/// caller must not delete `branch`.
-///
-/// This compares trees, not commit ancestry: a squash merge creates a new
-/// commit on the default branch with a different SHA, so a squash-merged
-/// branch's original commits are never ancestors of it and `rev-list --count`
-/// would report it "ahead" forever, refusing every reclaim including the one
-/// this guard exists to allow. Comparing trees the way `implement.rs`'s
-/// `has_unpublished_tree` already does lets a squash-merged branch whose
-/// content fully landed be told apart from one carrying genuinely unpublished
-/// work.
-fn branch_has_unpublished_tree(
-    paths: &OstromPaths,
-    repository: &str,
+/// Whether `branch`'s tip in `source` is an ancestor of, or equal to,
+/// `published_tip` -- the last commit GitHub reported observing on this
+/// branch (a pull request's `headRefOid`). `Ok(true)` proves GitHub saw
+/// everything on `branch`: this holds even across a squash merge, which
+/// gives the default branch an unrelated new SHA, because `published_tip` is
+/// the branch's own pre-squash tip and an unmodified branch is always
+/// exactly equal to it -- unlike comparing against the default branch's
+/// current tip, which drifts as the default branch moves for unrelated
+/// reasons. `Ok(false)` means `branch` is a strict descendant carrying
+/// commits GitHub never saw, or its history is unrelated to `published_tip`
+/// altogether. `Err(())` covers everything that cannot be told apart from
+/// unsafe: no `published_tip` at all (no pull request resolved this item, or
+/// the one that did carried no `headRefOid`), or a `published_tip` this
+/// repository has no record of. The caller must refuse in every case except
+/// the first.
+fn branch_tip_is_published(
     source: &Path,
     branch: &str,
-    minter: &mut dyn InstallationTokenMinter,
+    published_tip: Option<&str>,
 ) -> Result<bool, ()> {
-    // Refresh the default branch's tip first: in the merged case the remote
-    // copy of `branch` may already be gone, so its own upstream is not
-    // available to compare against the way `leaves.rs` does for a live
-    // branch -- the repository's default branch always is, but a source
-    // repository that has not fetched recently must not compare against a
-    // stale tree. Go through the same authenticated channel as every other
-    // GitHub network call here: a plain `git fetch origin` would depend on
-    // ambient credentials this process does not carry.
-    if let Some(default_branch) = gh_json_output(
-        paths,
-        ScopedAppTokenRequest::new("builder", repository, repository, "metadata:read"),
-        &[
-            "gh",
-            "repo",
-            "view",
-            repository,
-            "--json",
-            "defaultBranchRef",
-        ],
-        minter,
-    )
-    .ok()
-    .and_then(|value| {
-        value
-            .get("defaultBranchRef")
-            .and_then(|reference| reference.get("name"))
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-    }) {
-        let remote = format!("https://github.com/{repository}.git");
-        let refspec = format!("{default_branch}:refs/remotes/origin/{default_branch}");
-        let _ = authenticated_output(
-            paths,
-            ScopedAppTokenRequest::new(
-                "builder",
-                repository,
-                repository,
-                "metadata:read,contents:read",
-            ),
-            &[
-                "git",
-                "-C",
-                &source.display().to_string(),
-                "fetch",
-                "--quiet",
-                &remote,
-                &refspec,
-            ],
-            minter,
-        );
-    }
-    // Best-effort above: a solo operator's source repository may have no
-    // configured GitHub App, or the fetch may fail for reasons that do not
-    // bear on whether `branch` is merged. Fall back to whatever the source
-    // repository's own refs already show either way.
-    let default_ref = default_branch_reference(source).ok_or(())?;
-    // Compare trees directly in `source`, not a worktree's `HEAD`: the
-    // branch's worktree may already be gone (the merged case this guard
-    // protects), and `source` carries the branch's commits regardless.
-    let status = Command::new("git")
+    let published_tip = published_tip.ok_or(())?;
+    let output = Command::new("git")
         .arg("-C")
         .arg(source)
-        .args(["diff", "--quiet", &default_ref, branch])
-        .status()
+        .args(["merge-base", "--is-ancestor", branch, published_tip])
+        .output()
         .map_err(|_| ())?;
-    match status.code() {
-        Some(0) => Ok(false),
-        Some(1) => Ok(true),
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
         _ => Err(()),
     }
-}
-
-fn default_branch_reference(source: &Path) -> Option<String> {
-    let symbolic = git_text(source, &["symbolic-ref", "-q", "refs/remotes/origin/HEAD"]);
-    if symbolic
-        .as_deref()
-        .is_some_and(|reference| verified_commit(source, reference))
-    {
-        return symbolic;
-    }
-    for candidate in [
-        "refs/remotes/origin/main",
-        "refs/remotes/origin/master",
-        "refs/heads/main",
-        "refs/heads/master",
-    ] {
-        if verified_commit(source, candidate) {
-            return Some(candidate.to_owned());
-        }
-    }
-    None
-}
-
-fn verified_commit(source: &Path, reference: &str) -> bool {
-    git_text(
-        source,
-        &["rev-parse", "--verify", &format!("{reference}^{{commit}}")],
-    )
-    .is_some()
 }
 
 fn local_branch_exists(source: &Path, branch: &str) -> bool {

@@ -132,6 +132,30 @@ exit 97
             .map(|line| serde_json::from_str(line).expect("trace JSON"))
             .collect()
     }
+
+    /// The commit SHA `self.branch` currently points to in `self.source` --
+    /// what a pull request's `headRefOid` would report if GitHub had last
+    /// observed the branch at exactly this point.
+    fn branch_sha(&self) -> String {
+        git_output(&self.source, &["rev-parse", &self.branch])
+    }
+
+    /// A commit that exists in `self.source` but shares no history with
+    /// `self.branch` -- an orphan, standing in for a `headRefOid` whose
+    /// history this repository cannot relate to the branch at all.
+    fn unrelated_sha(&self) -> String {
+        git(
+            &self.source,
+            &["checkout", "-q", "--orphan", "unrelated-history"],
+        );
+        fs::write(self.source.join("unrelated.txt"), "unrelated\n").expect("write unrelated file");
+        git(&self.source, &["add", "unrelated.txt"]);
+        git(&self.source, &["commit", "-m", "unrelated history"]);
+        let sha = git_output(&self.source, &["rev-parse", "HEAD"]);
+        git(&self.source, &["checkout", "-q", "main"]);
+        git(&self.source, &["branch", "-D", "unrelated-history"]);
+        sha
+    }
 }
 
 fn executable(path: &Path, body: &str) {
@@ -150,6 +174,24 @@ fn git(path: &Path, arguments: &[&str]) {
             .success(),
         "git {arguments:?}"
     );
+}
+
+fn git_output(path: &Path, arguments: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(arguments)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {arguments:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("UTF-8 git output")
+        .trim()
+        .to_owned()
 }
 
 fn run(command: &mut Command) -> Output {
@@ -171,10 +213,17 @@ fn output_rows(output: &Output) -> Vec<Value> {
 #[test]
 fn merged_remote_absent_worktree_is_dry_run_then_reaped_with_byte_totals() {
     let fixture = Fixture::new();
-    let dry = run(fixture.command(false).env(
-        "OSTROM_TEST_PRS",
-        r#"[{"number":7,"state":"MERGED","url":"https://example.invalid/pull/7"}]"#,
-    ));
+    // The branch was never touched beyond its fork point, so its own tip is
+    // exactly what GitHub would have last observed as this pull request's
+    // `headRefOid` -- an ancestry check against it must reclaim.
+    let prs = json!([{
+        "number": 7,
+        "state": "MERGED",
+        "url": "https://example.invalid/pull/7",
+        "headRefOid": fixture.branch_sha(),
+    }])
+    .to_string();
+    let dry = run(fixture.command(false).env("OSTROM_TEST_PRS", &prs));
     let rows = output_rows(&dry);
     assert_eq!(rows[0]["outcome"], "would-reap");
     assert_eq!(
@@ -185,10 +234,7 @@ fn merged_remote_absent_worktree_is_dry_run_then_reaped_with_byte_totals() {
     assert!(rows[0]["bytes"].as_u64().unwrap() > 0);
     assert!(fixture.worktree.exists());
 
-    let applied = run(fixture.command(true).env(
-        "OSTROM_TEST_PRS",
-        r#"[{"number":7,"state":"MERGED","url":"https://example.invalid/pull/7"}]"#,
-    ));
+    let applied = run(fixture.command(true).env("OSTROM_TEST_PRS", &prs));
     let rows = output_rows(&applied);
     assert_eq!(rows[0]["outcome"], "reaped");
     assert_eq!(rows[0]["reclaimed_bytes"], rows[0]["bytes"]);
@@ -255,16 +301,35 @@ fn remote_branch_is_retained_even_when_the_local_worktree_is_clean() {
 }
 
 #[test]
-fn closed_item_without_an_open_pull_request_is_reaped() {
+fn closed_item_without_any_pull_request_cannot_verify_publication_and_is_retained() {
+    // No pull request ever existed for this branch, so there is no
+    // `headRefOid` to check the branch's tip against -- the content-safety
+    // guard in `reclaim_worktree` has nothing to verify and must refuse,
+    // even though `resolution_state` itself is satisfied the item is done.
     let fixture = Fixture::new();
     let output = run(fixture.command(true).env(
         "OSTROM_TEST_ISSUE",
         r#"{"state":"CLOSED","closedByPullRequestsReferences":[]}"#,
     ));
     let rows = output_rows(&output);
-    assert_eq!(rows[0]["outcome"], "reaped");
-    assert_eq!(rows[0]["reason"], "item-closed-no-open-pull-request");
-    assert!(!fixture.worktree.exists());
+    assert_eq!(rows[0]["outcome"], "retained");
+    assert_eq!(rows[0]["reason"], "unmerged-local-commits");
+    assert!(fixture.worktree.exists());
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&fixture.source)
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{}", fixture.branch),
+            ])
+            .status()
+            .expect("inspect branch")
+            .success(),
+        "the branch must survive a refused reclaim"
+    );
 }
 
 #[test]
@@ -344,27 +409,130 @@ fn open_item_without_pull_request_evidence_is_retained() {
 #[test]
 fn merged_worktree_with_an_unpushed_local_commit_is_retained_not_reaped() {
     // The worktree is clean (nothing uncommitted) but its branch carries a
-    // commit that was never pushed anywhere -- the implementer committed
-    // after its last push, then was killed or timed out. `worktree_status`
-    // alone cannot see this; deleting the branch here would make the commit
-    // unreachable.
+    // commit made after GitHub's last observed tip -- the implementer
+    // committed after its last push, then was killed or timed out.
+    // `worktree_status` alone cannot see this; deleting the branch here
+    // would make the commit unreachable.
     let fixture = Fixture::new();
-    // A real content change, not `--allow-empty`: the guard compares trees
-    // (a squash merge changes ancestry but not content), so an empty commit
-    // would leave the branch's tree identical to `main`'s and the guard
-    // would wrongly call it safe to reap.
+    // Capture the tip GitHub is presumed to have observed *before* adding
+    // the unpushed commit -- the published tip must be a strict ancestor of
+    // the branch, not equal to it, for this to exercise the descendant case.
+    let published_tip = fixture.branch_sha();
+    // A real content change, not `--allow-empty`: an empty commit leaves the
+    // branch's tree identical to its parent, which would make this look
+    // like a no-op rather than a genuine unpushed commit.
     fs::write(fixture.worktree.join("unpushed.txt"), "expensive work\n")
         .expect("write unpushed work");
     git(&fixture.worktree, &["add", "unpushed.txt"]);
     git(&fixture.worktree, &["commit", "-m", "unpushed work"]);
     let output = run(fixture.command(true).env(
         "OSTROM_TEST_PRS",
-        r#"[{"number":7,"state":"MERGED","url":"https://example.invalid/pull/7"}]"#,
+        json!([{
+            "number": 7,
+            "state": "MERGED",
+            "url": "https://example.invalid/pull/7",
+            "headRefOid": published_tip,
+        }])
+        .to_string(),
     ));
     let rows = output_rows(&output);
     assert_eq!(rows[0]["outcome"], "retained");
     assert_eq!(rows[0]["reason"], "unmerged-local-commits");
     assert_eq!(rows[0]["reclaimed_bytes"], 0);
+    assert!(fixture.worktree.exists());
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&fixture.source)
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{}", fixture.branch),
+            ])
+            .status()
+            .expect("inspect branch")
+            .success(),
+        "the branch must survive a refused reclaim"
+    );
+}
+
+#[test]
+fn merged_worktree_at_the_published_tip_is_reclaimed_even_after_the_default_branch_moves() {
+    // The regression test for the guard this correction replaces: a tip-to-
+    // tip tree diff against the default branch (the previous, buggy guard)
+    // is empty only while the default branch has not moved since the branch
+    // landed. Here `main` advances *after* the branch's tip was published,
+    // touching the very file the branch already carries -- `git diff --quiet
+    // main branch` sees a difference and would wrongly refuse. Ancestry
+    // against the branch's own published tip does not care what the default
+    // branch does afterward.
+    let fixture = Fixture::new();
+    let published_tip = fixture.branch_sha();
+    fs::write(
+        fixture.source.join("README.md"),
+        "advanced past the pull request\n",
+    )
+    .expect("advance the default branch");
+    git(&fixture.source, &["add", "README.md"]);
+    git(
+        &fixture.source,
+        &["commit", "-m", "advance main after the merge"],
+    );
+    let output = run(fixture.command(true).env(
+        "OSTROM_TEST_PRS",
+        json!([{
+            "number": 7,
+            "state": "MERGED",
+            "url": "https://example.invalid/pull/7",
+            "headRefOid": published_tip,
+        }])
+        .to_string(),
+    ));
+    let rows = output_rows(&output);
+    assert_eq!(rows[0]["outcome"], "reaped");
+    assert_eq!(
+        rows[0]["reason"],
+        "pull-request-resolved-remote-branch-absent"
+    );
+    assert!(!fixture.worktree.exists());
+    assert!(
+        !Command::new("git")
+            .arg("-C")
+            .arg(&fixture.source)
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{}", fixture.branch),
+            ])
+            .status()
+            .expect("inspect branch")
+            .success(),
+        "the branch must not survive a correctly reclaimed worktree"
+    );
+}
+
+#[test]
+fn merged_worktree_with_a_published_tip_unrelated_to_local_history_is_retained() {
+    // The pull request's `headRefOid` shares no history with the local
+    // branch at all -- neither an ancestor nor a descendant. This cannot be
+    // told apart from "unsafe", so the guard must refuse rather than guess.
+    let fixture = Fixture::new();
+    let unrelated_tip = fixture.unrelated_sha();
+    let output = run(fixture.command(true).env(
+        "OSTROM_TEST_PRS",
+        json!([{
+            "number": 7,
+            "state": "MERGED",
+            "url": "https://example.invalid/pull/7",
+            "headRefOid": unrelated_tip,
+        }])
+        .to_string(),
+    ));
+    let rows = output_rows(&output);
+    assert_eq!(rows[0]["outcome"], "retained");
+    assert_eq!(rows[0]["reason"], "unmerged-local-commits");
     assert!(fixture.worktree.exists());
     assert!(
         Command::new("git")
