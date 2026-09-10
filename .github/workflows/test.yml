@@ -119,7 +119,7 @@ jobs:
         run: |
           cargo test --manifest-path ethogram/crates/ethogram/Cargo.toml \
             2>&1 | tee ethogram-rust.log
-          node .github/scripts/assert-cargo-count.mjs ethogram-rust.log 186
+          node .github/scripts/assert-cargo-count.mjs ethogram-rust.log 186 ethogram
 
   ethogram-preserve-order-probe:
     name: ethogram under a consumer's preserve_order
@@ -135,7 +135,7 @@ jobs:
         run: |
           cargo test --manifest-path ethogram/crates/ethogram/Cargo.toml \
             --features preserve-order-probe 2>&1 | tee ethogram-probe.log
-          node .github/scripts/assert-cargo-count.mjs ethogram-probe.log 186
+          node .github/scripts/assert-cargo-count.mjs ethogram-probe.log 186 "ethogram probe"
 
   ethogram-typescript:
     name: ethogram TypeScript suite
@@ -211,7 +211,7 @@ jobs:
         run: |
           cargo test --manifest-path umwelt/Cargo.toml --workspace \
             2>&1 | tee umwelt-rust.log
-          node .github/scripts/assert-cargo-count.mjs umwelt-rust.log 144
+          node .github/scripts/assert-cargo-count.mjs umwelt-rust.log 144 umwelt
 
   umwelt-preserve-order-probe:
     name: umwelt under a consumer's preserve_order
@@ -228,4 +228,4 @@ jobs:
         run: |
           cargo test --manifest-path umwelt/Cargo.toml --workspace --all-features \
             2>&1 | tee umwelt-probe.log
-          node .github/scripts/assert-cargo-count.mjs umwelt-probe.log 145
+          node .github/scripts/assert-cargo-count.mjs umwelt-probe.log 145 "umwelt probe"

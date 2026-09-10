@@ -5,7 +5,7 @@
 // being covered. This sums every `test result:` line and compares the total.
 import { readFileSync } from 'node:fs';
 
-const [logPath, expectedRaw] = process.argv.slice(2);
+const [logPath, expectedRaw, label = logPath] = process.argv.slice(2);
 const expected = Number(expectedRaw);
 const log = readFileSync(logPath, 'utf8');
 
@@ -20,14 +20,14 @@ for (const line of log.split('\n')) {
 }
 
 if (failed !== 0) {
-  console.log(`::error title=ethogram suite failed::${failed} failing of ${passed + failed}`);
+  console.log(`::error title=${label} suite failed::${failed} failing of ${passed + failed}`);
   process.exit(1);
 }
 if (passed !== expected) {
   console.log(
-    `::error title=ethogram test count moved::expected ${expected} executed, saw ${passed}. ` +
+    `::error title=${label} test count moved::expected ${expected} executed, saw ${passed}. ` +
       'If this is a deliberate change, update the count here in the same commit.',
   );
   process.exit(1);
 }
-console.log(`ethogram suite: ${passed} executed, 0 failed`);
+console.log(`${label}: ${passed} executed, 0 failed`);

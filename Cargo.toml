@@ -5,11 +5,15 @@ members = [
     "crates/ostrom-core",
     "crates/ostrom-store",
 ]
-# The vendored ethogram tree carries its own [workspace]. Without this exclude
-# Cargo binds ethogram/crates/ethogram to ostrom's workspace instead, so its
-# version.workspace and serde_json.workspace resolve against ostrom -- the
-# crate reports ostrom's version and silently loses serde_json's
-# float_roundtrip, which ethogram requires for correct money-field round-trips.
+# Both imported trees carry their own [workspace]. Without this exclude Cargo
+# binds their crates to ostrom's workspace instead, so `version.workspace` and
+# `serde_json.workspace` resolve against ostrom.
+#
+# The two fail differently, which is why neither can be dropped on the
+# strength of the other. ethogram fails **silently**: the crate reports
+# ostrom's version and loses serde_json's `float_roundtrip`, which its own
+# manifest calls REQUIRED, and a captured `costUsd` is then re-emitted as a
+# different number with no error. umwelt fails **loudly**, at manifest load.
 exclude = ["ethogram", "umwelt"]
 resolver = "2"
 
