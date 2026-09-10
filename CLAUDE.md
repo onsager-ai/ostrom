@@ -28,7 +28,7 @@ Which fields are bounded is ethogram's rule, not ours. `parse_event` deliberatel
 
 - **ethogram is pinned by git rev**, not a registry version. It is unpublished and the names are provisional.
 - **No `ostrom-*` crate**, asserted over the manifest text. The test matches `ostrom[-_]` because a rename can spell it either way.
-- **umwelt must not enable `serde_json/preserve_order`.** Cargo unifies features across a whole graph, so enabling it here turns it on inside every crate a consumer builds — it once came close to silently disabling ethogram's canonical key sort while both repositories' tests stayed green. Byte order is a property of our own types instead: the trace record is a struct with a frozen field order and `IndexMap` fields, and a manifest test forbids the feature returning.
+- **`serde_json/preserve_order` stays off by default.** The trace writer sorts nested keys explicitly, so umwelt's bytes do not depend on `serde_json/preserve_order`; a probe feature (`preserve-order-probe`), off by default, proves that in CI and must not be enabled by consumers; the default stays off because Cargo unifies features across a whole graph and enabling it here would reach other crates — ethogram's canonical key sort among them, which once came close to being silently disabled while both repositories' tests stayed green.
 
 ## Working in this repository
 
