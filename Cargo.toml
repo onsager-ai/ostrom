@@ -10,7 +10,7 @@ members = [
 # version.workspace and serde_json.workspace resolve against ostrom -- the
 # crate reports ostrom's version and silently loses serde_json's
 # float_roundtrip, which ethogram requires for correct money-field round-trips.
-exclude = ["ethogram"]
+exclude = ["ethogram", "umwelt"]
 resolver = "2"
 
 [workspace.package]
@@ -39,8 +39,8 @@ serde_yaml = "0.9.34"
 tempfile = "3.20.0"
 thiserror = "2.0.16"
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }
-umwelt-capture = { git = "https://github.com/onsager-ai/umwelt.git", rev = "e3581e32" }
-umwelt-runtime = { git = "https://github.com/onsager-ai/umwelt.git", rev = "e3581e32" }
+umwelt-capture = { path = "umwelt/crates/umwelt-capture" }
+umwelt-runtime = { path = "umwelt/crates/umwelt-runtime" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

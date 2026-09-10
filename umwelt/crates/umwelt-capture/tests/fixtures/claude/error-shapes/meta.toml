@@ -1,0 +1,50 @@
+harness = "claude-code"
+cli_version = "2.1.263"
+captured_at = "2026-09-07"
+model = "claude-haiku-4-5-20251001"
+command = "claude -p --output-format stream-json --verbose --model haiku --max-turns 1 --allowedTools Bash"
+prompt_source = "stdin"
+events = 9
+
+# Captured for onsager-ai/umwelt#27: the two shapes the first three captures never
+# contained, which the Claude Code normaliser (onsager-ai/umwelt#26) refuses today.
+exercises = [
+  "tool_result with is_error: true (a Bash command exiting non-zero)",
+  "result with subtype: error_max_turns (the --max-turns 1 cap tripping)",
+]
+
+[notes]
+one_stream = "Both shapes arrive in a single stream, so one run settles both refusals."
+turns = "result.num_turns is 2 even under --max-turns 1; the cap is not a count of result turns."
+third_shape = """
+Beyond the two commissioned shapes, chreode's normaliser emits agent.warning
+from the non-success result subtype. That is the SIXTH agent.* type in
+onsager-ai/ethogram#6's family and the one the corpus had no fixture for, so this capture
+completes the set rather than only filling the two named gaps.
+"""
+
+[scrub]
+narration = "text and thinking blocks replaced by placeholder of the same character length"
+ids = "real (session_id, toolu_*)"
+paths = "absolute paths rewritten under /workspace"
+tool_result_content = """
+KEPT REAL: "Exit code 1\\ncat: /nonexistent-file-xyz: No such file or directory".
+It is a shell error message about a file that never existed, not narration and
+not operator data, and it is the payload the is_error flag describes -- replacing
+it would leave the fixture asserting an error whose evidence had been removed.
+"""
+
+[not_exercised]
+other_error_subtypes = "Only error_max_turns. error_during_execution and any other non-success subtype remain uncaptured."
+
+[chreode_output]
+file = "chreode-output.jsonl"
+what = "Output of chreode's claude normaliser over raw.ndjson. Kept for DIFFING against umwelt's normaliser. NOT an expectation."
+correct_for_this_harness = true
+contents = "6 drafts: agent.started, agent.text, agent.tool_use, agent.tool_result (isError=true), agent.completed, agent.warning."
+note = """
+The agent.warning is chreode's rendering of the non-success result subtype:
+message = 'claude result subtype \"error_max_turns\"'. onsager-ai/umwelt#26 refuses this
+shape today, which is what onsager-ai/umwelt#27 rules on -- so this file shows one
+producer's choice, not the ruled one. Compare, do not adopt.
+"""

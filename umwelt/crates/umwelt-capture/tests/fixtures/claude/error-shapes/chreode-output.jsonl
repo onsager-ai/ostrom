@@ -1,0 +1,6 @@
+{"type":"agent.started","payload":{"stage":"generate","model":"claude-haiku-4-5-20251001","sessionId":"a36f9a2b-cb4d-4a6f-89c0-cec7e08eec3d"}}
+{"type":"agent.text","payload":{"stage":"generate","text":"the agent reported a short step of routi"}}
+{"type":"agent.tool_use","payload":{"stage":"generate","tool":"Bash","inputExcerpt":"{\"command\":\"cat /nonexistent-file-xyz\",\"description\":\"First attempt to cat a nonexistent file\"}","toolUseId":"toolu_01VL7aVtfw8YsTXwszEqRDbW"}}
+{"type":"agent.tool_result","payload":{"stage":"generate","tool":"Bash","isError":true,"resultExcerpt":"Exit code 1\ncat: /nonexistent-file-xyz: No such file or directory","toolUseId":"toolu_01VL7aVtfw8YsTXwszEqRDbW"}}
+{"type":"agent.completed","payload":{"stage":"generate","turns":2,"costUsd":0.0223935,"model":"claude-haiku-4-5-20251001","usage":{"inputTokens":9,"outputTokens":193,"cacheReadTokens":13615,"cacheCreationTokens":9517},"durationMs":3380}}
+{"type":"agent.warning","payload":{"stage":"generate","message":"claude result subtype \"error_max_turns\""}}

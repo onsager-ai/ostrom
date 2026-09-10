@@ -1746,7 +1746,6 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 [[package]]
 name = "umwelt-capture"
 version = "0.1.0"
-source = "git+https://github.com/onsager-ai/umwelt.git?rev=e3581e32#e3581e32963e15aee234596ecf888510435ff2c1"
 dependencies = [
  "ethogram",
  "indexmap",
@@ -1759,7 +1758,6 @@ dependencies = [
 [[package]]
 name = "umwelt-runtime"
 version = "0.1.0"
-source = "git+https://github.com/onsager-ai/umwelt.git?rev=e3581e32#e3581e32963e15aee234596ecf888510435ff2c1"
 dependencies = [
  "chrono",
  "ethogram",
