@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use ethogram::{
     AGENT_WARNING, AgentWarningPayload, ControlAppliedPayload, ControlAppliedReason,
     ControlRequestedPayload, DecisionAnsweredPayload, DecisionDossier, DecisionKind,
@@ -576,7 +576,15 @@ fn requested(id: &str, request: &Request, outranked_grant: bool) -> EventDraft {
                 },
             ],
             subject: Some("Bash".to_owned()),
-            expires_at: Some(request.expires_at.to_rfc3339()),
+            // The same rendering the sink stamps `ts` with at the pinned umwelt
+            // rev -- milliseconds and `Z`. Bare `to_rfc3339()` gives nanoseconds
+            // and `+00:00`, so one event carried two timestamp shapes and a
+            // consumer parsing one format met both (ostrom#545).
+            expires_at: Some(
+                request
+                    .expires_at
+                    .to_rfc3339_opts(SecondsFormat::Millis, true),
+            ),
             on_timeout: Some("deny".to_owned()),
             extra: PayloadExtension::new(),
         },
@@ -1666,6 +1674,49 @@ mod tests {
             );
         }
         assert!(granted(&allow, &input()));
+    }
+
+    /// Principle 6 at the umwelt edge: `expiresAt` is ostrom's to render and
+    /// `ts` is the sink's to stamp, so the two can drift. This compares them on
+    /// one real emitted event rather than restating either rule, which is the
+    /// only version that keeps holding when the sink's own format moves.
+    #[test]
+    fn expires_at_is_rendered_in_the_shape_the_sink_stamps_ts_with() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let mut f = Fixture::new();
+        let _handle = f.start_handler(input(), Duration::from_secs(2));
+        let until = Instant::now() + Duration::from_secs(2);
+        loop {
+            f.poll();
+            if !f.bridge.pending.is_empty() {
+                break;
+            }
+            assert!(Instant::now() < until, "no decision was raised");
+            thread::sleep(POLL);
+        }
+        let requested = f
+            .wire()
+            .into_iter()
+            .find(|e| e.event_type == ethogram::DECISION_REQUESTED)
+            .expect("decision.requested");
+        let expires_at = requested.payload["expiresAt"]
+            .as_str()
+            .expect("expiresAt is a string")
+            .to_owned();
+        let ts = requested.ts.clone();
+
+        let shape = |t: &str| {
+            let fraction = t
+                .rsplit_once('.')
+                .map(|(_, rest)| rest.trim_end_matches('Z').len());
+            (t.ends_with('Z'), fraction)
+        };
+        assert_eq!(
+            shape(&expires_at),
+            shape(&ts),
+            "expiresAt {expires_at} and the sink's ts {ts} must carry the same \
+             timestamp shape; one event must not present a consumer with two"
+        );
     }
 
     #[test]
