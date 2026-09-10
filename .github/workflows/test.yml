@@ -94,3 +94,100 @@ jobs:
           node npm/scripts/assert-version.mjs --version-output target/debug/ostrom-version.txt
       - name: Test offline npm distribution
         run: bash npm/tests/test.sh
+
+  # The four jobs below run the imported ethogram tree's own suites.
+  #
+  # They exist because `exclude = ["ethogram"]` is required for the imported
+  # crate to resolve its own workspace values, and its consequence is that the
+  # crate is not a workspace member: `cargo test --workspace` runs none of its
+  # tests, and `ethogram/.github/workflows/ci.yml` is inert because GitHub runs
+  # workflows only from the repository root. Without these jobs the import
+  # would silently stop running 186 Rust tests, 162 TypeScript tests, the
+  # cross-language conformance suite and the preserve_order probe -- and every
+  # other check would stay green while it happened.
+  #
+  # Counts are asserted, not just exit codes. A suite that stops discovering
+  # its tests exits 0.
+
+  ethogram-rust:
+    name: ethogram Rust suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Test the imported crate
+        run: |
+          cargo test --manifest-path ethogram/crates/ethogram/Cargo.toml \
+            2>&1 | tee ethogram-rust.log
+          node .github/scripts/assert-cargo-count.mjs ethogram-rust.log 186
+
+  ethogram-preserve-order-probe:
+    name: ethogram under a consumer's preserve_order
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      # ostrom's own workspace enables serde_json/preserve_order, and Cargo
+      # unifies features across a graph. This is the run that proves the
+      # imported crate's canonical form does not move under it -- the claim
+      # ostrom relies on when it vendors the crate at all.
+      - name: Test with the probe feature
+        run: |
+          cargo test --manifest-path ethogram/crates/ethogram/Cargo.toml \
+            --features preserve-order-probe 2>&1 | tee ethogram-probe.log
+          node .github/scripts/assert-cargo-count.mjs ethogram-probe.log 186
+
+  ethogram-typescript:
+    name: ethogram TypeScript suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: ethogram
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Enable Corepack
+        run: corepack enable
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: ethogram/pnpm-lock.yaml
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Typecheck
+        run: pnpm -r run typecheck
+      - name: Test
+        run: |
+          pnpm -r test 2>&1 | tee ../ethogram-ts.log
+          grep -qE '^.{0,4}tests 162$' ../ethogram-ts.log \
+            || { echo "::error title=ethogram TypeScript count moved::expected 162 tests"; exit 1; }
+          grep -qE '^.{0,4}fail 0$' ../ethogram-ts.log \
+            || { echo "::error title=ethogram TypeScript failures::expected 0 failures"; exit 1; }
+
+  ethogram-conformance:
+    name: ethogram cross-language conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Enable Corepack
+        run: corepack enable
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: ethogram/pnpm-lock.yaml
+      - name: Install dependencies
+        working-directory: ethogram
+        run: pnpm install --frozen-lockfile
+      # This job is the mechanical proof behind ethogram's first repository
+      # principle: the two SDKs are held together by conformance, not by
+      # discipline. After the import, this is the only place that runs.
+      - name: Compare SDK serialisation
+        working-directory: ethogram
+        run: |
+          ./conformance/run.sh 2>&1 | tee ../conformance.log
+          grep -q 'compared 31 fixtures' ../conformance.log
+          grep -q 'compared 23 validation error cases' ../conformance.log
+          grep -q 'compared 6 agreement inputs' ../conformance.log
