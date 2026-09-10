@@ -102,6 +102,10 @@ if [ "$1 $2" = "gh api" ] && printf '%s' "$3" | grep -q '/branches?'; then
   if [ "$page" = 1 ]; then printf '%s\n' "${OSTROM_TEST_BRANCH_PAGE_1:-[]}"; else printf '%s\n' "${OSTROM_TEST_BRANCH_PAGE_2:-[]}"; fi
   exit 0
 fi
+if [ "$1 $2" = "gh api" ] && [ "$3" = -X ] && [ "$4" = DELETE ]; then
+  [ "${OSTROM_TEST_REF_DELETE_FAIL:-0}" = 0 ] || exit 42
+  exit 0
+fi
 if [ "$1 $2 $3" = "gh repo view" ]; then printf '%s\n' main; exit 0; fi
 if [ "$1 $2" = "gh api" ] && printf '%s' "$3" | grep -q '/compare/'; then printf '%s\n' "${OSTROM_TEST_AHEAD:-0}"; exit 0; fi
 if [ "$1 $2 $3" = "gh pr list" ]; then
@@ -318,10 +322,6 @@ fn branch_listing_finds_exact_matches_across_pages_and_classifies_pr_state() {
             r#"[{"number":1,"state":"CLOSED","mergedAt":null}]"#,
             "branch-in-flight",
         ),
-        (
-            r#"[{"number":1,"state":"MERGED","mergedAt":"2026-08-01T00:00:00Z"}]"#,
-            "branch-merged-not-cleaned",
-        ),
     ] {
         let fixture = Fixture::new();
         let output = run(fixture
@@ -467,6 +467,92 @@ fn closing_pull_requests_are_identity_keys_but_part_of_prose_is_not() {
         output.status.success(),
         "Part of prose must remain dispatchable: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn merged_branch_still_on_the_remote_is_deleted_and_the_dispatch_proceeds() {
+    // ostrom#252's acceptance, and the state most roster repositories are
+    // actually in: `delete_branch_on_merge` is off, so the head branch survives
+    // the merge. Refusing here would make a re-dispatch impossible for every
+    // such item on every pass. The merged ref is deleted and the dispatch runs.
+    let fixture = Fixture::new();
+    let worktree = fixture
+        .state
+        .join("implementer-worktrees")
+        .join(fixture.item_hash());
+    fs::create_dir_all(worktree.parent().expect("worktree parent"))
+        .expect("create worktree parent");
+    git(
+        &fixture.source,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            BRANCH,
+            worktree.to_str().expect("UTF-8 worktree"),
+            "refs/remotes/origin/main",
+        ],
+    );
+    let url = "https://example.invalid/pull/91";
+    let output = run(fixture
+        .command()
+        // the branch still matches on the remote, unlike the test below
+        .env("OSTROM_TEST_BRANCH_PAGE_1", matched_page())
+        .env(
+            "OSTROM_TEST_BRANCH_PRS",
+            r#"[{"number":1,"state":"MERGED","mergedAt":"2026-08-01T00:00:00Z"}]"#,
+        )
+        .env(
+            "OSTROM_TEST_CLOSING_REFS",
+            json!({"closedByPullRequestsReferences":[{"url":url}]}).to_string(),
+        )
+        .env(
+            "OSTROM_TEST_CLOSING_PR",
+            json!({"number":91,"state":"MERGED","mergedAt":"2026-08-01T00:00:00Z","url":url})
+                .to_string(),
+        ));
+    assert!(
+        output.status.success(),
+        "a re-dispatch after a merge must succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(fixture.calls.exists(), "the dispatch never ran");
+    assert!(!worktree.exists(), "the local worktree was not reclaimed");
+    assert!(
+        !Command::new("git")
+            .arg("-C")
+            .arg(&fixture.source)
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{BRANCH}")
+            ])
+            .status()
+            .expect("show-ref")
+            .success(),
+        "the local branch survived the reclaim, so the next dispatch would refuse again"
+    );
+}
+
+#[test]
+fn a_merged_ref_that_cannot_be_deleted_still_refuses_by_name() {
+    // The refusal is kept for the case where cleanup genuinely cannot happen.
+    // Proceeding would push against a ref we failed to remove.
+    let fixture = Fixture::new();
+    let output = run(fixture
+        .command()
+        .env("OSTROM_TEST_BRANCH_PAGE_1", matched_page())
+        .env(
+            "OSTROM_TEST_BRANCH_PRS",
+            r#"[{"number":1,"state":"MERGED","mergedAt":"2026-08-01T00:00:00Z"}]"#,
+        )
+        .env("OSTROM_TEST_REF_DELETE_FAIL", "1"));
+    assert_refused(&output, 3, "matched_key=branch_name");
+    assert_eq!(
+        fixture.trace()[0]["fact"]["reason"],
+        "branch-merged-not-cleaned"
     );
 }
 

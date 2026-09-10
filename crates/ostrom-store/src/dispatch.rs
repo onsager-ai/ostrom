@@ -1032,22 +1032,66 @@ fn reject_unlanded_branch(
                 .all(|pull| pull["state"].as_str() == Some("MERGED"))
     });
     if landed {
-        context.matched_key = Some(("branch_name", context.order.branch_name.clone()));
-        let detail = FailureDetail {
-            branch_name: Some(branch.name.clone()),
-            repository: Some(context.order.repository.clone()),
-            head_sha: Some(branch.commit.sha.clone()),
-            ahead_of_default: Some(ahead.map_or_else(|| json!("unknown"), |value| json!(value))),
-            ..FailureDetail::default()
-        };
-        let _ = append_failure(context, "branch-merged-not-cleaned", detail);
-        return Err(DispatchError::new(
-            3,
-            format!(
-                "ostrom dispatch: merged branch was not cleaned: matched_key=branch_name:{} repository={} branch={}",
-                context.order.branch_name, context.order.repository, branch.name
-            ),
-        ));
+        // The pull request merged and the head branch is still on the remote.
+        // That is not an edge: `delete_branch_on_merge` is off for most roster
+        // repositories, so it is the ordinary state after a merge. Refusing here
+        // would make #252's acceptance -- a re-dispatch after a merge succeeds --
+        // unreachable for every such item, on every pass, forever.
+        //
+        // So delete the merged ref and fall through to
+        // `reject_closing_pull_requests`, whose MERGED arm reclaims the local
+        // worktree and its branch and lets the dispatch proceed. This is the one
+        // call in dispatch that mints `contents:write`, and it is scoped to the
+        // single ref of a branch whose pull requests are all merged.
+        // `gh_output`, not `gh_json`: a ref deletion answers 204 with an empty
+        // body, which is not JSON, so parsing it would report failure on every
+        // success and send the refusal below every time.
+        let deleted = gh_output(
+            context,
+            "metadata:read,contents:write",
+            &[
+                "gh",
+                "api",
+                "-X",
+                "DELETE",
+                &format!(
+                    "repos/{}/git/refs/heads/{}",
+                    context.order.repository, branch.name
+                ),
+            ],
+            minter,
+        )
+        .map_err(|error| error.to_string())
+        .and_then(|output| {
+            if output.status.success() {
+                Ok(())
+            } else {
+                Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+            }
+        });
+        if let Err(error) = deleted {
+            // Cleanup genuinely could not happen. Keep the named refusal rather
+            // than proceeding into a push against a ref we failed to remove.
+            context.matched_key = Some(("branch_name", context.order.branch_name.clone()));
+            let detail = FailureDetail {
+                branch_name: Some(branch.name.clone()),
+                repository: Some(context.order.repository.clone()),
+                head_sha: Some(branch.commit.sha.clone()),
+                ahead_of_default: Some(
+                    ahead.map_or_else(|| json!("unknown"), |value| json!(value)),
+                ),
+                ..FailureDetail::default()
+            };
+            let _ = append_failure(context, "branch-merged-not-cleaned", detail);
+            return Err(DispatchError::new(
+                3,
+                format!(
+                    "ostrom dispatch: merged branch was not cleaned: matched_key=branch_name:{} repository={} branch={} error={error}",
+                    context.order.branch_name, context.order.repository, branch.name
+                ),
+            ));
+        }
+        return Ok(());
     }
     context.matched_key = Some(("branch_name", context.order.branch_name.clone()));
     let detail = FailureDetail {
@@ -1182,6 +1226,11 @@ fn reject_closing_pull_requests(
         if pull["state"].as_str() == Some("MERGED") {
             context.matched_key = Some(("closing_pull_request", url.clone()));
             reclaim_merged_worktree(context, source_repository)?;
+            // The reclaim succeeded, so this dispatch is no longer refusing on
+            // branch identity. `append_failure` writes `matched_key` into every
+            // work-failed fact, so leaving it set would make a later refusal --
+            // capacity, budget, launch -- read as a branch-identity refusal.
+            context.matched_key = None;
         }
     }
     Ok(())
