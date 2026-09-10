@@ -1318,6 +1318,55 @@ fn successful_pass_emits_a_completed_lifecycle() {
     assert!(events[1]["payload"]["durationMs"].is_u64());
 }
 
+/// ostrom#478/#485's defect class, third instance: a real builder pass on
+/// 2026-09-10 failed at step 3, worked zero items, and exited 0. Both records
+/// of that run said it failed -- the wire's `run.finished` carried
+/// `{"outcome": "failed", "reason": "pass-failed"}` and the fact's
+/// `pass-ended` carried `{"outcome": "failed-repair-scan", "exit_code": 1,
+/// "worked_items": 0}` -- but the Claude *process* itself exited 0, so
+/// `run_pass` returned `Ok(())` and a scheduler invoking `ostrom pass
+/// builder` on a timer would have recorded success forever for a pass that
+/// fails identically every time.
+///
+/// This fixture reproduces the exact shape: the fake claude has no `exit` of
+/// its own (the trailing `printf` succeeds), so the process exits 0, while
+/// the inner protocol it writes to `sprint.jsonl` records the same
+/// `failed-repair-scan` outcome the real incident did. A fixture whose child
+/// process itself exited non-zero would already pass on unfixed `main` and
+/// prove nothing about this defect.
+#[test]
+fn a_recorded_failure_exits_nonzero_even_though_the_agent_process_exited_zero() {
+    let fixture = Fixture::new(concat!(
+        "printf '%s\\n' '{\"ts\":\"2026-08-01T00:00:00Z\",\"kind\":\"pass-started\",\"fact\":{\"owner\":\"builder-inner-wake1\"},\"narration\":{}}' >>\"$OSTROM_HOME/sprint.jsonl\"\n",
+        "printf '%s\\n' '{\"ts\":\"2026-08-01T00:00:01Z\",\"kind\":\"pass-ended\",\"fact\":{\"owner\":\"builder-inner-wake1\",\"outcome\":\"failed-repair-scan\",\"exit_code\":1,\"worked_items\":0},\"narration\":{}}' >>\"$OSTROM_HOME/sprint.jsonl\""
+    ));
+
+    let output = fixture.command().output().expect("run pass");
+
+    // The point of this test: exit status, not the fact or the wire -- both
+    // of those are already correct today and are asserted below only to
+    // confirm the fix moved no byte of either record.
+    assert!(
+        !output.status.success(),
+        "a pass recorded as failed must not exit 0: {output:?}"
+    );
+    assert_ne!(output.status.code(), Some(0));
+
+    assert_eq!(
+        fixture.trace().last().expect("pass-ended row")["fact"]["outcome"],
+        "failed-repair-scan"
+    );
+    let events = fixture.run_events();
+    let finished = events
+        .iter()
+        .filter(|event| event["type"] == "run.finished")
+        .collect::<Vec<_>>();
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0]["payload"]["outcome"], "failed");
+    assert_eq!(finished[0]["payload"]["reason"], "pass-failed");
+    fixture.assert_released();
+}
+
 #[test]
 fn sigterm_releases_finalizes_and_kills_the_process_group() {
     let fixture = Fixture::new(concat!(
@@ -1723,11 +1772,21 @@ fn wrapper_outcome_follows_inner_protocol_evidence() {
         ),
         ("exit 42", false, "failed", None),
         (
+            // ostrom#478/#485's defect class, third instance: the agent
+            // process here exits 0 (the script has no `exit`, so it falls
+            // through to the printf's own success) while its own inner
+            // pass-ended report says the pass failed. This case used to
+            // assert `success == true`, which documented the defect rather
+            // than catching it -- a scheduler reading exit status would have
+            // recorded success for a pass that failed every time. It is
+            // fixed to `false` now that `run_pass` reuses `event_outcome` to
+            // decide the exit status from the recorded outcome, not just the
+            // child's own status.
             concat!(
                 "printf '%s\\n' '{\"ts\":\"2026-08-01T00:00:00Z\",\"kind\":\"pass-started\",\"fact\":{\"owner\":\"builder-inner-wake1\"},\"narration\":{}}' >>\"$OSTROM_HOME/sprint.jsonl\"\n",
                 "printf '%s\\n' '{\"ts\":\"2026-08-01T00:00:00Z\",\"kind\":\"pass-ended\",\"fact\":{\"outcome\":\"failed\"},\"narration\":{}}' >>\"$OSTROM_HOME/sprint.jsonl\""
             ),
-            true,
+            false,
             "failed",
             None,
         ),

@@ -843,9 +843,42 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
     }
     prune_transcripts(&run_dir);
     let code = status.code().unwrap_or(1);
+    // Capture the terminal outcome `guard.finish()` is about to write, before
+    // it runs: `finish()` only overwrites `guard.outcome` on its own internal
+    // failure (permission-channel cleanup), a branch that always returns
+    // `Err` and so never reaches the `?` below. `thread::panicking()` mirrors
+    // exactly what `finish()` itself will fall back to when no explicit
+    // outcome was recorded (`terminal_outcome`'s only other caller), so this
+    // is the same string that lands in the `pass-ended` fact and on the wire.
+    let recorded_outcome = terminal_outcome(guard.outcome.clone(), thread::panicking());
     guard.finish()?;
     if status.success() {
-        Ok(())
+        // ostrom#478/#485's defect class, third instance: the agent process
+        // can exit 0 while its own pass-ended report says it failed (a real
+        // 2026-09-10 builder pass did exactly this, recorded
+        // `failed-repair-scan` with `exit_code: 1` and still returned 0). A
+        // scheduler reads exit status first, so a recorded failure must make
+        // this process exit non-zero even though Claude itself did not fail.
+        // `event_outcome` is the one place that decides "failed" for the
+        // wire; reusing it here, rather than a second list of failure
+        // strings, is what keeps the exit status and the wire from drifting
+        // apart (repo principle 6).
+        if matches!(event_outcome(&recorded_outcome), EventRunOutcome::Failed) {
+            Err(PassError::failed(
+                request.role,
+                format!(
+                    "Claude run exited 0 but the pass recorded outcome {recorded_outcome:?}{}; transcript at {}",
+                    guard
+                        .reason
+                        .as_deref()
+                        .map_or_else(String::new, |reason| format!(" (reason: {reason})")),
+                    log.display()
+                ),
+                1,
+            ))
+        } else {
+            Ok(())
+        }
     } else {
         Err(PassError::failed(
             request.role,
