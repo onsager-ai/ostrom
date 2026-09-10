@@ -409,10 +409,7 @@ fn a_second_identical_dispatch_failure_escalates_and_suppresses_a_third_attempt(
         .find(|row| row["kind"] == "dispatch-failure-escalated")
         .expect("second failure escalation");
     assert_eq!(escalation["fact"]["item_id"], ITEM_ID);
-    assert_eq!(
-        escalation["fact"]["failure_reason"],
-        "branch-already-pushed"
-    );
+    assert_eq!(escalation["fact"]["failure_reason"], "branch-in-flight");
     assert_eq!(escalation["fact"]["failure_count"], 2);
     assert_eq!(escalation["fact"]["action"], "suppress-dispatch");
 
@@ -630,6 +627,91 @@ fn closing_pull_requests_are_identity_keys_but_part_of_prose_is_not() {
         output.status.success(),
         "Part of prose must remain dispatchable: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn a_reclaim_releases_the_repeated_failure_guard_on_the_same_pass() {
+    // The case both #252's reclaim and #259's escalation guard exist for, and
+    // that neither could test alone: on #252's branch nothing produced the
+    // escalation to release, and on #259's branch nothing emitted
+    // `worktree-reclaimed`. Together they can cancel -- the guard refusing
+    // before the reclaim that would have cleared it -- so this is the test
+    // that the two compose rather than merely coexist. No fact is seeded:
+    // the reclaim has to produce `worktree-reclaimed` itself.
+    let fixture = Fixture::new();
+    let worktree = fixture
+        .state
+        .join("implementer-worktrees")
+        .join(fixture.item_hash());
+    fs::create_dir_all(worktree.parent().expect("worktree parent"))
+        .expect("create worktree parent");
+    git(
+        &fixture.source,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            BRANCH,
+            worktree.to_str().expect("UTF-8 worktree"),
+            "refs/remotes/origin/main",
+        ],
+    );
+
+    // Two identical refusals while the pull request is still open.
+    for _ in 0..2 {
+        let output = run(fixture
+            .command()
+            .env("OSTROM_TEST_BRANCH_PAGE_1", matched_page())
+            .env(
+                "OSTROM_TEST_BRANCH_PRS",
+                r#"[{"number":1,"state":"OPEN","mergedAt":null}]"#,
+            ));
+        assert_refused(&output, 3, "matched_key=branch_name");
+    }
+    assert!(
+        fixture
+            .trace()
+            .iter()
+            .any(|row| row["kind"] == "dispatch-failure-escalated"),
+        "the second identical refusal must escalate, or this test proves nothing"
+    );
+
+    // The pull request merges. The next dispatch must reclaim and proceed:
+    // the reclaim's `worktree-reclaimed` is newer than the two failures, so
+    // the repeated-failure guard sees a state change rather than stale evidence.
+    let url = "https://example.invalid/pull/91";
+    let published_tip = fixture.branch_sha();
+    let output = run(
+        fixture
+            .command()
+            .env("OSTROM_TEST_BRANCH_PAGE_1", matched_page())
+            .env(
+                "OSTROM_TEST_BRANCH_PRS",
+                r#"[{"number":1,"state":"MERGED","mergedAt":"2026-08-01T00:00:00Z"}]"#,
+            )
+            .env(
+                "OSTROM_TEST_CLOSING_REFS",
+                json!({"closedByPullRequestsReferences":[{"url":url}]}).to_string(),
+            )
+            .env(
+                "OSTROM_TEST_CLOSING_PR",
+                json!({"number":91,"state":"MERGED","mergedAt":"2026-08-01T00:00:00Z","url":url,"headRefOid":published_tip})
+                    .to_string(),
+            ),
+    );
+    assert!(
+        output.status.success(),
+        "the reclaim must release the escalation on the same pass; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(fixture.calls.exists(), "the dispatch never ran");
+    assert!(
+        fixture
+            .trace()
+            .iter()
+            .any(|row| row["kind"] == "worktree-reclaimed"),
+        "the reclaim itself must have produced the fact that released the guard"
     );
 }
 
