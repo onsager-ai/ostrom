@@ -135,10 +135,14 @@ pub(crate) fn unsupported(request: &ControlRequestedPayload) -> [EventDraft; 2] 
             payload: serde_json::to_value(ControlAppliedPayload {
                 control_id: request.control_id.clone(),
                 ok: false,
+                // Typed now that ethogram has the member; previously smuggled
+                // through `extra`. Bytes expected unchanged, unproven here --
+                // see the note in permission_bridge.rs.
+                by: Some(request.by.clone()),
                 reason: Some(ControlAppliedReason::Unsupported),
                 truncated: None,
                 landed_in: None,
-                extra: PayloadExtension::from_iter([("by".to_owned(), request.by.clone().into())]),
+                extra: PayloadExtension::new(),
             })
             .expect("control.applied payload serialises"),
             captured_at: None,
