@@ -155,6 +155,8 @@ pub struct SweepFixture {
 #[serde(deny_unknown_fields)]
 pub struct RepositorySnapshot {
     pub repo: RepositoryName,
+    /// The exhaustive current-open issue set plus any closed entries observed
+    /// in the bounded change feed used for cursor movement.
     #[serde(default)]
     pub issues: Vec<Value>,
     #[serde(default)]
@@ -237,6 +239,7 @@ struct ClassifiedItem {
 struct RepoAnalysis {
     generated: Vec<Value>,
     active_ids: BTreeSet<String>,
+    closed_ids: BTreeSet<String>,
     current: BTreeMap<String, Value>,
     state: Value,
 }
@@ -472,6 +475,7 @@ fn run_sweep_with_minter_and_publication_source(
         .collect::<BTreeMap<_, _>>();
     let mut generated = Vec::new();
     let mut active_ids = BTreeSet::new();
+    let mut closed_ids = BTreeSet::new();
     let mut current = BTreeMap::new();
     let mut verified_repositories = BTreeSet::new();
     let mut new_state = old_state.clone();
@@ -522,6 +526,7 @@ fn run_sweep_with_minter_and_publication_source(
         )?;
         generated.extend(analysis.generated);
         active_ids.extend(analysis.active_ids);
+        closed_ids.extend(analysis.closed_ids);
         current.extend(analysis.current);
         new_state["repos"][repo] = analysis.state;
     }
@@ -586,6 +591,9 @@ fn run_sweep_with_minter_and_publication_source(
         .map(str::to_owned)
         .collect::<Vec<_>>();
     for item in &config.work_ranking {
+        if closed_ids.contains(item) {
+            continue;
+        }
         let Some((repo, reference)) = item.rsplit_once('#') else {
             continue;
         };
@@ -641,10 +649,18 @@ fn run_sweep_with_minter_and_publication_source(
     new_state["work_ranking"] = json!(&config.work_ranking);
     new_state["work_ranking_faults"] = json!(ranking_faults);
 
+    let dropped_closed = existing
+        .iter()
+        .filter_map(|row| {
+            let id = string_field(row.value(), &["id"]);
+            closed_ids.contains(id).then(|| id.to_owned())
+        })
+        .collect::<BTreeSet<_>>();
     let mut final_rows = reconcile_queue(
         existing,
         generated,
         &active_ids,
+        &closed_ids,
         &current,
         &configured,
         &unacquired_repositories,
@@ -693,6 +709,24 @@ fn run_sweep_with_minter_and_publication_source(
     backup_previous_sweep(&options.paths)?;
     write_queue(&options.paths.queue_file(), &final_rows)?;
     write_json_private(&state_path, &new_state)?;
+    for item_id in dropped_closed {
+        crate::append_trace(
+            &options.paths.trace_file(),
+            &crate::TraceAppend {
+                ts: format_time(options.started_at),
+                kind: "queue-item-dropped".to_owned(),
+                fact: Map::from_iter([
+                    ("item_id".to_owned(), json!(item_id)),
+                    ("action".to_owned(), json!("drop-from-queue")),
+                    ("reason".to_owned(), json!("subject-closed")),
+                ]),
+                narration: Map::from_iter([(
+                    "conclusion".to_owned(),
+                    json!("The queue item was removed because its subject is no longer open."),
+                )]),
+            },
+        )?;
+    }
 
     // Publication observes only a durable successful generation. Every
     // refusal path, including zero acquisition, returns above the writes and
@@ -945,18 +979,19 @@ fn acquire_repository(
     previous: &Value,
     config: &MandateConfig,
     started_at: DateTime<Utc>,
-    mode: SweepMode,
+    _mode: SweepMode,
 ) -> Result<RepositorySnapshot, SweepError> {
     let repo_name = repo.as_str();
     let previous_cursor = previous.get("cursor").and_then(Value::as_str).unwrap_or("");
     let previous_etag = previous.get("etag").and_then(Value::as_str).unwrap_or("");
-    let issue_since = if mode == SweepMode::Incremental {
-        previous_cursor
+    let (delta, issue_etag, issue_not_modified) = if previous_cursor.is_empty() {
+        (Vec::new(), None, false)
     } else {
-        ""
+        fetch_issues(repo_name, previous_cursor, previous_etag)?
     };
-    let closed_delta = if mode == SweepMode::Full && !previous_cursor.is_empty() {
-        let (delta, _, _) = fetch_issues(repo_name, previous_cursor, "")?;
+    let closed_delta = if previous_cursor.is_empty() {
+        Vec::new()
+    } else {
         delta
             .into_iter()
             .filter(|issue| {
@@ -964,11 +999,13 @@ fn acquire_repository(
                     && string_field(issue, &["state"]).eq_ignore_ascii_case("closed")
             })
             .collect()
-    } else {
-        Vec::new()
     };
-    let (mut issues, issue_etag, issue_not_modified) =
-        fetch_issues(repo_name, issue_since, previous_etag)?;
+    // The bounded change feed is useful for cursor movement, but it is not a
+    // safe source of truth for closure eviction: a busy window can omit the
+    // newest changes and a later cursor can make that omission permanent.
+    // Carry a complete current-open set on every snapshot so analysis can
+    // reconcile old records even when their closure is absent from `delta`.
+    let mut issues = fetch_open_issues(repo_name)?;
     issues.extend(closed_delta);
     enrich_issue_relationships(repo_name, &mut issues)?;
 
@@ -1118,6 +1155,102 @@ fn acquire_repository(
         ci_runs,
         warnings,
     })
+}
+
+fn fetch_open_issues(repo: &str) -> Result<Vec<Value>, SweepError> {
+    fetch_open_issues_with(
+        repo,
+        || {
+            gh_json(&[
+                "api",
+                "-X",
+                "GET",
+                "search/issues",
+                "-f",
+                &format!("q=repo:{repo} is:issue is:open"),
+                "-F",
+                "per_page=1",
+            ])
+        },
+        |page| gh_json(&["api", "-X", "GET", &open_issues_page_endpoint(repo, page)]),
+    )
+}
+
+/// `sort=created` is deliberate: creation time never changes, so an issue
+/// updated mid-crawl cannot move across the page boundary. `sort=updated`
+/// let an already-fetched issue's update shift every issue behind it up one
+/// slot, silently dropping the one at the boundary from this crawl -- and
+/// from `analyze_repository`'s `open_ids`, which then evicted its
+/// still-open queue row as `subject-closed`.
+fn open_issues_page_endpoint(repo: &str, page: u64) -> String {
+    format!("repos/{repo}/issues?state=open&sort=created&direction=asc&per_page=100&page={page}")
+}
+
+fn fetch_open_issues_with(
+    repo: &str,
+    fetch_count: impl FnOnce() -> Result<Value, SweepError>,
+    mut fetch_page: impl FnMut(u64) -> Result<Value, SweepError>,
+) -> Result<Vec<Value>, SweepError> {
+    // Every sibling crawl in this file refuses a truncated result rather than
+    // trusting a short page: `fetch_branches` against `QUERY_LIMIT`,
+    // `fetch_merged_pull_requests` against `search/issues`'s `total_count`.
+    // This follows the merged-pull-request shape: read the exhaustive count
+    // once from search, then refuse if the REST crawl disagrees or the count
+    // itself exceeds GitHub's exhaustive search limit.
+    let search_result = fetch_count()?;
+    let total_count = search_result
+        .get("total_count")
+        .and_then(Value::as_u64)
+        .and_then(|count| usize::try_from(count).ok())
+        .ok_or_else(|| {
+            SweepError::Acquisition(format!(
+                "open issue count query for {repo} returned no result count"
+            ))
+        })?;
+    let incomplete = search_result
+        .get("incomplete_results")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if incomplete {
+        return Err(SweepError::Acquisition(format!(
+            "open issue count query for {repo} reported incomplete results; refusing a truncated sweep"
+        )));
+    }
+    if total_count > GITHUB_SEARCH_RESULT_LIMIT {
+        return Err(SweepError::Acquisition(format!(
+            "{repo} has {total_count} open issues, exceeding GitHub's exhaustive search limit {GITHUB_SEARCH_RESULT_LIMIT}; refusing a truncated sweep"
+        )));
+    }
+
+    let mut issues = Vec::new();
+    let mut page = 1_u64;
+    loop {
+        let values = fetch_page(page)?;
+        let values = values.as_array().cloned().ok_or_else(|| {
+            SweepError::Acquisition(format!(
+                "current open issues query for {repo} returned a non-array body"
+            ))
+        })?;
+        let count = values.len();
+        issues.extend(values);
+        if count < 100 {
+            break;
+        }
+        page = page.saturating_add(1);
+    }
+    // The REST crawl includes pull requests (GitHub's `issues` endpoint does
+    // not exclude them); the search count above is scoped to `is:issue`, so
+    // the cross-check compares like with like.
+    let crawled_issue_count = issues
+        .iter()
+        .filter(|issue| issue.get("pull_request").is_none())
+        .count();
+    if crawled_issue_count != total_count {
+        return Err(SweepError::Acquisition(format!(
+            "current open issues query for {repo} crawled {crawled_issue_count} issues but the search count was {total_count}; refusing a potentially incomplete sweep"
+        )));
+    }
+    Ok(issues)
 }
 
 fn fetch_merged_pull_requests(repo: &str, search: &str) -> Result<Vec<Value>, SweepError> {
@@ -1482,7 +1615,7 @@ fn analyze_repository(
     let repo = project.repo.as_str();
     let previous_cursor = previous.get("cursor").and_then(Value::as_str);
     let initial = previous_cursor.is_none();
-    let closed_ids = snapshot
+    let mut closed_ids = snapshot
         .issues
         .iter()
         .filter(|issue| issue.get("pull_request").is_none())
@@ -1490,6 +1623,24 @@ fn analyze_repository(
         .filter_map(|issue| number_field(issue, &["number"]))
         .map(|number| format!("{repo}#{number}"))
         .collect::<BTreeSet<_>>();
+    let open_ids = snapshot
+        .issues
+        .iter()
+        .filter(|issue| issue.get("pull_request").is_none())
+        .filter(|issue| !string_field(issue, &["state"]).eq_ignore_ascii_case("closed"))
+        .filter_map(|issue| number_field(issue, &["number"]))
+        .map(|number| format!("{repo}#{number}"))
+        .collect::<BTreeSet<_>>();
+    closed_ids.extend(
+        previous
+            .get("records")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flat_map(|records| records.values())
+            .filter_map(|value| serde_json::from_value::<NormalizedItem>(value.clone()).ok())
+            .filter(|item| item.item_type == "issue" && !open_ids.contains(&item.id))
+            .map(|item| item.id),
+    );
 
     let mut fresh = snapshot
         .issues
@@ -1779,6 +1930,7 @@ fn analyze_repository(
     Ok(RepoAnalysis {
         generated,
         active_ids,
+        closed_ids,
         current,
         state,
     })
@@ -3201,6 +3353,7 @@ fn reconcile_queue(
     existing: Vec<QueueDocument>,
     generated: Vec<Value>,
     active_ids: &BTreeSet<String>,
+    closed_ids: &BTreeSet<String>,
     current: &BTreeMap<String, Value>,
     configured: &BTreeSet<String>,
     unacquired_repositories: &BTreeSet<String>,
@@ -3214,15 +3367,24 @@ fn reconcile_queue(
         .filter(|row| {
             let id = string_field(row, &["id"]);
             let repo = string_field(row, &["repo"]);
-            active_ids.contains(id)
-                || string_field(row, &["state"]) == "approved"
-                || unacquired_repositories.contains(repo)
-                || (!configured.contains(repo) && string_field(row, &["kind"]) == "drift")
+            !closed_ids.contains(id)
+                && (active_ids.contains(id)
+                    || string_field(row, &["state"]) == "approved"
+                    || unacquired_repositories.contains(repo)
+                    || (!configured.contains(repo) && string_field(row, &["kind"]) == "drift"))
         })
         .cloned()
         .collect::<Vec<_>>();
     for mut row in generated {
         let id = string_field(&row, &["id"]).to_owned();
+        // Carried-forward rows above are already guarded by `closed_ids`;
+        // enforcing it here too means the invariant holds by construction
+        // rather than by every upstream generator remembering to pre-filter
+        // (`work_ranking`'s own `closed_ids` check needed adding for exactly
+        // this reason).
+        if closed_ids.contains(&id) {
+            continue;
+        }
         let ranking_fault = string_field(&row, &["kind"]) == "drift"
             && row
                 .get("mandate")
@@ -4599,6 +4761,128 @@ mod tests {
             .find(|row| row.get("id").and_then(Value::as_str) == Some(id.as_str()))
     }
 
+    /// #259: a `stuck` row must not outlive its subject's closure, including
+    /// when an incremental sweep's bounded change feed never sees the
+    /// closure — the cursor has already advanced past it. The fixture models
+    /// the current-open-issue set as exhaustively empty (as a live
+    /// acquisition would report via `fetch_open_issues`, independent of the
+    /// change-feed `since` window), so reconciliation in `analyze_repository`
+    /// is the only thing that can evict the carried-forward record. Before
+    /// the fix, only a delta match evicted a closed record, so this failed
+    /// with the row and its trace-free-standing state surviving the sweep.
+    #[test]
+    fn incremental_sweep_drops_a_stuck_row_when_closure_is_absent_from_the_delta() {
+        let home = tempdir().expect("temporary incremental-closure home");
+        write_repair_test_config(home.path(), false);
+        let paths = repair_test_paths(home.path());
+        fs::write(
+            paths.sweep_state_file(),
+            serde_json::to_vec(&json!({
+                "version": 2,
+                "sweep_mode": "incremental",
+                "repos": {
+                    "placeholder-org/alpha": {
+                        "cursor": "2026-08-01T00:00:00Z",
+                        "records": {
+                            "placeholder-org/alpha#7": {
+                                "id": "placeholder-org/alpha#7",
+                                "repo": "placeholder-org/alpha",
+                                "number": 7,
+                                "ref": "#7",
+                                "type": "issue",
+                                "title": "Closed placeholder work",
+                                "blocked_by": [],
+                                "parent": Value::Null,
+                                "children": [],
+                                "closes": [],
+                                "labels": [],
+                                "refs": [7],
+                                "closing_refs": [],
+                                "files": [],
+                                "opened": "2026-07-01T00:00:00Z",
+                                "updated": "2026-07-15T00:00:00Z",
+                                "ci": "none",
+                                "ready": false,
+                                "review": "",
+                                "fingerprint": "placeholder-closed-fingerprint",
+                            }
+                        }
+                    }
+                }
+            }))
+            .expect("serialize prior incremental state"),
+        )
+        .expect("write prior incremental state");
+        fs::write(
+            paths.queue_file(),
+            concat!(
+                r##"{"id":"placeholder-org/alpha#7","repo":"placeholder-org/alpha","ref":"#7","title":"Closed placeholder work","kind":"stuck","mandate":{"reason":"placeholder stuck reason"},"state":"pending","opened":"2026-07-01T00:00:00Z","age_days":31,"aged_out":true,"needs_judgment":false,"blocked_by":[]}"##,
+                "\n",
+            ),
+        )
+        .expect("write stuck queue row");
+
+        let fixture_path = home.path().join("sweep-fixture.json");
+        fs::write(
+            &fixture_path,
+            serde_json::to_vec(&json!({
+                "repositories": [{
+                    "repo": "placeholder-org/alpha",
+                    "issues": [],
+                    "issue_not_modified": true,
+                    "open_prs": [],
+                    "merged_prs": [],
+                    "default_branch": "main",
+                    "branches": [],
+                    "branch_read_degraded": false,
+                    "ci_runs": [],
+                }]
+            }))
+            .expect("serialize closure fixture"),
+        )
+        .expect("write closure fixture");
+
+        run_sweep(&SweepOptions {
+            working_directory: home.path().to_path_buf(),
+            executable: home.path().join("unused-ostrom"),
+            plugin_root: home.path().to_path_buf(),
+            paths: paths.clone(),
+            started_at: "2026-08-02T00:00:00Z".parse().expect("valid sweep time"),
+            requested_mode: SweepMode::Incremental,
+            fixture: Some(fixture_path),
+            publish: PublishTarget::Disabled,
+            policy: None,
+        })
+        .expect("incremental closure sweep succeeds");
+
+        let queue = read_queue(&paths.queue_file()).expect("read post-sweep queue");
+        assert!(
+            queue.is_empty(),
+            "a closed stuck row survived an incremental sweep whose delta omitted the closure"
+        );
+
+        let state: Value = serde_json::from_slice(
+            &fs::read(paths.sweep_state_file()).expect("read post-sweep state"),
+        )
+        .expect("parse post-sweep state");
+        assert!(
+            state["repos"]["placeholder-org/alpha"]["records"]
+                .get("placeholder-org/alpha#7")
+                .is_none(),
+            "closed record survived an already-advanced cursor"
+        );
+
+        let trace = fs::read_to_string(paths.trace_file()).expect("read drop trace");
+        let dropped = trace
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("trace row"))
+            .find(|row| row["kind"] == "queue-item-dropped")
+            .expect("closed-item drop trace");
+        assert_eq!(dropped["fact"]["item_id"], "placeholder-org/alpha#7");
+        assert_eq!(dropped["fact"]["reason"], "subject-closed");
+        assert_eq!(dropped["fact"]["action"], "drop-from-queue");
+    }
+
     #[test]
     fn decision_fixture_roster_emits_only_the_three_permission_boundaries() {
         let home = tempdir().expect("temporary decision fixture home");
@@ -5373,6 +5657,7 @@ denies:
             existing,
             generated,
             &BTreeSet::from([id.to_owned()]),
+            &BTreeSet::new(),
             &BTreeMap::new(),
             &BTreeSet::from(["placeholder-org/alpha".to_owned()]),
             &BTreeSet::new(),
@@ -5383,6 +5668,47 @@ denies:
         assert_eq!(reconciled[0].value()["state"], "deferred");
         assert_eq!(reconciled[0].value()["kind"], "moved");
         assert_eq!(reconciled[0].value()["needs_judgment"], false);
+    }
+
+    /// The carried-forward guard (`!closed_ids.contains(id)`) only protects
+    /// existing rows; a `generated` row for a closed id relied on every
+    /// upstream generator pre-filtering it (`work_ranking` needed its own
+    /// `closed_ids` check for exactly this reason). Enforcing it once here,
+    /// at the merge point, holds the invariant by construction even for a
+    /// generator that forgets.
+    #[test]
+    fn a_generated_row_for_a_closed_id_is_dropped_at_the_merge_point() {
+        let id = "placeholder-org/alpha#7";
+        let generated = vec![json!({
+            "id": id,
+            "repo": "placeholder-org/alpha",
+            "ref": "#7",
+            "title": "A generator that forgot to pre-filter closed ids",
+            "kind": "moved",
+            "mandate": {"reason": "placeholder"},
+            "state": "pending",
+            "opened": "2026-07-01T00:00:00Z",
+            "age_days": 1,
+            "aged_out": false,
+            "needs_judgment": false,
+            "blocked_by": [],
+        })];
+
+        let reconciled = reconcile_queue(
+            Vec::new(),
+            generated,
+            &BTreeSet::new(),
+            &BTreeSet::from([id.to_owned()]),
+            &BTreeMap::new(),
+            &BTreeSet::from(["placeholder-org/alpha".to_owned()]),
+            &BTreeSet::new(),
+        )
+        .expect("reconcile placeholder queue");
+
+        assert!(
+            reconciled.is_empty(),
+            "a closed id must not survive reconciliation even from a generated row: {reconciled:?}"
+        );
     }
 
     #[test]
@@ -5489,6 +5815,116 @@ denies:
         assert_eq!(calls[2].1, 3);
         assert_eq!(pulls[200]["number"], 201);
         assert_eq!(pulls[0]["author"]["isBot"], true);
+    }
+
+    fn open_issue_page(start: usize, end: usize) -> Vec<Value> {
+        (start..end)
+            .map(|index| json!({"number": index + 1, "title": format!("Placeholder open issue {}", index + 1)}))
+            .collect()
+    }
+
+    #[test]
+    fn open_issue_query_paginates_past_query_limit_and_agrees_with_the_search_count() {
+        let total = QUERY_LIMIT + 1;
+        let mut page_calls = Vec::new();
+        let issues = fetch_open_issues_with(
+            "placeholder-org/alpha",
+            || Ok(json!({"total_count": total, "incomplete_results": false})),
+            |page| {
+                page_calls.push(page);
+                let start = match page {
+                    1 => 0,
+                    2 => 100,
+                    3 => 200,
+                    other => panic!("unexpected page {other}"),
+                };
+                let end = (start + 100).min(total);
+                Ok(Value::Array(open_issue_page(start, end)))
+            },
+        )
+        .expect("all open-issue pages are acquired");
+
+        assert_eq!(issues.len(), total);
+        assert_eq!(page_calls, vec![1, 2, 3]);
+        assert_eq!(issues[200]["number"], 201);
+    }
+
+    #[test]
+    fn open_issue_query_refuses_when_the_crawl_disagrees_with_the_search_count() {
+        // This is the shape of the paginate-on-`updated` race: an issue
+        // shifts across the page boundary mid-crawl and the REST pages never
+        // see it, while the search-provided count still reflects it. Without
+        // the cross-check this silently returns one issue short instead of
+        // refusing, and `analyze_repository` would evict that issue's queue
+        // row as `subject-closed` even though it is still open.
+        let result = fetch_open_issues_with(
+            "placeholder-org/alpha",
+            || Ok(json!({"total_count": 3, "incomplete_results": false})),
+            |page| {
+                assert_eq!(page, 1, "a single short page ends the crawl");
+                Ok(Value::Array(open_issue_page(0, 2)))
+            },
+        );
+        let error = result.expect_err("a crawl short of the search count must refuse");
+        assert!(
+            error
+                .to_string()
+                .contains("crawled 2 issues but the search count was 3"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn open_issue_query_refuses_before_crawling_past_the_exhaustive_search_limit() {
+        let mut page_calls = 0;
+        let result = fetch_open_issues_with(
+            "placeholder-org/alpha",
+            || {
+                Ok(
+                    json!({"total_count": GITHUB_SEARCH_RESULT_LIMIT + 1, "incomplete_results": false}),
+                )
+            },
+            |_page| {
+                page_calls += 1;
+                Ok(json!([]))
+            },
+        );
+        let error = result.expect_err("a count past the search limit must refuse without crawling");
+        assert!(
+            error
+                .to_string()
+                .contains("exceeding GitHub's exhaustive search limit"),
+            "{error}"
+        );
+        assert_eq!(
+            page_calls, 0,
+            "the bound is checked before any page is fetched"
+        );
+    }
+
+    #[test]
+    fn open_issue_query_refuses_an_incomplete_search_result() {
+        let result = fetch_open_issues_with(
+            "placeholder-org/alpha",
+            || Ok(json!({"total_count": 1, "incomplete_results": true})),
+            |_page| panic!("an incomplete search result must refuse before crawling"),
+        );
+        let error = result.expect_err("incomplete search results must refuse");
+        assert!(error.to_string().contains("incomplete results"), "{error}");
+    }
+
+    #[test]
+    fn open_issue_query_paginates_on_created_not_updated() {
+        // #259 x #554: `sort=updated` lets an already-fetched issue's update
+        // during the crawl shift every issue behind it up one slot, so the
+        // issue at the page boundary is never fetched. `sort=created` is
+        // immutable, so paging cannot miss an issue this way.
+        assert!(
+            open_issues_page_endpoint("placeholder-org/alpha", 1)
+                .contains("sort=created&direction=asc"),
+            "open-issue pagination must key off an immutable field"
+        );
+        assert!(!open_issues_page_endpoint("placeholder-org/alpha", 1).contains("sort=updated"));
     }
 
     #[test]
