@@ -240,6 +240,51 @@ mod tests {
     use super::{TraceAppend, append_trace, read_trace};
     use crate::StoreError;
 
+    /// umwelt sorts nested trace keys explicitly, and this is the run that
+    /// proves it in the build that actually matters.
+    ///
+    /// ostrom's workspace enables `serde_json/preserve_order` and Cargo
+    /// unifies features across a graph, so the imported umwelt is compiled
+    /// *with* it -- the configuration umwelt's own suite does not ship under.
+    /// Before onsager-ai/umwelt#45 that feature moved these bytes: nested `fact.zebra` came
+    /// out `{"zebra":1,"alpha":2}` instead of `{"alpha":2,"zebra":1}`.
+    ///
+    /// umwelt's `preserve-order-probe` job covers the same property from the
+    /// imported tree. This covers it from here, where `preserve_order` is on
+    /// because ostrom asked for it rather than because a test asked for it.
+    #[test]
+    fn nested_trace_keys_are_sorted_under_ostroms_preserve_order() {
+        let fixture = tempdir().expect("temp dir");
+        let path = fixture.path().join("sprint.jsonl");
+        append_trace(
+            &path,
+            &TraceAppend {
+                ts: "2030-01-02T03:04:05Z".to_owned(),
+                kind: "nested-order".to_owned(),
+                // Top-level order is the operator's and must survive; nested
+                // order is umwelt's to normalise. Both are asserted below by
+                // comparing bytes, not by parsing back into a map -- parsing
+                // would re-impose whichever order the map type prefers and
+                // hide exactly the defect this guards.
+                fact: Map::from_iter([
+                    ("zebra".to_owned(), json!({"mango": 1, "apple": 2})),
+                    ("alpha".to_owned(), json!(3)),
+                ]),
+                narration: Map::new(),
+            },
+        )
+        .expect("append nested trace");
+        let written = fs::read_to_string(&path).expect("read trace");
+        assert_eq!(
+            written,
+            concat!(
+                r#"{"ts":"2030-01-02T03:04:05Z","kind":"nested-order","#,
+                r#""fact":{"zebra":{"apple":2,"mango":1},"alpha":3},"narration":{}}"#,
+                "\n"
+            )
+        );
+    }
+
     #[test]
     fn malformed_append_is_named_as_a_trace_error_without_a_fake_line() {
         let fixture = tempdir().expect("temp dir");
