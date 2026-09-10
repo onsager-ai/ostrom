@@ -231,6 +231,13 @@ pub struct QueueItem {
     pub graph_dispatchable: bool,
     #[serde(default)]
     pub unblocking_power: usize,
+    // Legacy queue rows predate `item_type`. Treat a missing field as an
+    // issue rather than excluding it, or an upgrade would silently drop real
+    // queued work from the ranking (mirrors `dispatchable_item_type` in
+    // ostrom-store's selection.rs, which made the same call for the same
+    // reason).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_type: Option<String>,
 }
 
 impl QueueItem {
@@ -239,6 +246,7 @@ impl QueueItem {
         self.graph_dispatchable
             && self.kind != "parked"
             && self.state != "deferred"
+            && self.item_type.as_deref() != Some("pull_request")
             && (matches!(self.kind.as_str(), "moved" | "stuck")
                 || (self.state == "approved"
                     && matches!(self.kind.as_str(), "tripwire" | "decision")))
@@ -811,6 +819,7 @@ acknowledgements: []
             blocked_by: Vec::new(),
             graph_dispatchable: true,
             unblocking_power: 0,
+            item_type: None,
         }
     }
 
@@ -1223,6 +1232,39 @@ acknowledgements: []
                 "example-org/example-repo#2",
                 "example-org/example-repo#1",
             ]
+        );
+    }
+
+    #[test]
+    fn mechanical_ranking_excludes_pull_requests_but_keeps_legacy_rows() {
+        let mut pull_request = queue(
+            "example-org/example-repo#5",
+            "stuck",
+            "pending",
+            "2030-01-01",
+        );
+        pull_request.item_type = Some("pull_request".to_owned());
+        let mut issue = queue(
+            "example-org/example-repo#6",
+            "stuck",
+            "pending",
+            "2030-01-02",
+        );
+        issue.item_type = Some("issue".to_owned());
+        // A legacy queue row predates `item_type`. It must stay dispatchable
+        // exactly like an explicit issue does, or an upgrade would silently
+        // drop real queued work from the ranking.
+        let legacy = queue(
+            "example-org/example-repo#7",
+            "stuck",
+            "pending",
+            "2030-01-03",
+        );
+        assert_eq!(legacy.item_type, None);
+        let items = vec![pull_request, issue, legacy];
+        assert_eq!(
+            mechanical_ranking(&items, &[]),
+            vec!["example-org/example-repo#6", "example-org/example-repo#7",]
         );
     }
 
