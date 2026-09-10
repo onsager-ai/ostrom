@@ -26,6 +26,7 @@ use crate::{
     },
     append_trace, configured_retention_days, environment, load_config_or_defaults, read_lease,
     read_trace,
+    reap::{WorktreeStatus, directory_bytes, gh_json_output, reclaim_worktree, worktree_status},
     run_events::{DISPATCH_RUN_ID, emit_decision_requests},
     sweep_worktrees,
     work_order::{implementer_lease_ttl, in_flight_orders, reap_stale_work_orders},
@@ -214,7 +215,7 @@ fn run_dispatch_with_registry_and_minter(
 
     preflight_worktree(&context)?;
     let config = load_config_or_defaults(&request.paths, &request.working_directory).ok();
-    resolve_source_repository(&context, config.as_ref())?;
+    let source_repository = resolve_source_repository(&context, config.as_ref())?;
 
     let pages = match list_remote_branches(&context, minter) {
         Ok(pages) => pages,
@@ -259,7 +260,7 @@ fn run_dispatch_with_registry_and_minter(
     if let Some(branch) = listing.matched.as_ref() {
         reject_unlanded_branch(&mut context, &pages, branch, minter)?;
     }
-    reject_closing_pull_requests(&mut context, minter)?;
+    reject_closing_pull_requests(&mut context, &source_repository, minter)?;
 
     // Everything above this point is API reads and a preflight check: it
     // spends no worktree or branch work. Running the repeated-failure guard
@@ -1045,6 +1046,65 @@ fn reject_unlanded_branch(
                 .all(|pull| pull["state"].as_str() == Some("MERGED"))
     });
     if landed {
+        // The pull request merged and the head branch is still on the remote.
+        // That is not an edge: `delete_branch_on_merge` is off for most roster
+        // repositories, so it is the ordinary state after a merge. Refusing here
+        // would make #252's acceptance -- a re-dispatch after a merge succeeds --
+        // unreachable for every such item, on every pass, forever.
+        //
+        // So delete the merged ref and fall through to
+        // `reject_closing_pull_requests`, whose MERGED arm reclaims the local
+        // worktree and its branch and lets the dispatch proceed. This is the one
+        // call in dispatch that mints `contents:write`, and it is scoped to the
+        // single ref of a branch whose pull requests are all merged.
+        // `gh_output`, not `gh_json`: a ref deletion answers 204 with an empty
+        // body, which is not JSON, so parsing it would report failure on every
+        // success and send the refusal below every time.
+        let deleted = gh_output(
+            context,
+            "metadata:read,contents:write",
+            &[
+                "gh",
+                "api",
+                "-X",
+                "DELETE",
+                &format!(
+                    "repos/{}/git/refs/heads/{}",
+                    context.order.repository, branch.name
+                ),
+            ],
+            minter,
+        )
+        .map_err(|error| error.to_string())
+        .and_then(|output| {
+            if output.status.success() {
+                Ok(())
+            } else {
+                Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+            }
+        });
+        if let Err(error) = deleted {
+            // Cleanup genuinely could not happen. Keep the named refusal rather
+            // than proceeding into a push against a ref we failed to remove.
+            context.matched_key = Some(("branch_name", context.order.branch_name.clone()));
+            let detail = FailureDetail {
+                branch_name: Some(branch.name.clone()),
+                repository: Some(context.order.repository.clone()),
+                head_sha: Some(branch.commit.sha.clone()),
+                ahead_of_default: Some(
+                    ahead.map_or_else(|| json!("unknown"), |value| json!(value)),
+                ),
+                ..FailureDetail::default()
+            };
+            let _ = append_failure(context, "branch-merged-not-cleaned", detail);
+            return Err(DispatchError::new(
+                3,
+                format!(
+                    "ostrom dispatch: merged branch was not cleaned: matched_key=branch_name:{} repository={} branch={} error={error}",
+                    context.order.branch_name, context.order.repository, branch.name
+                ),
+            ));
+        }
         return Ok(());
     }
     context.matched_key = Some(("branch_name", context.order.branch_name.clone()));
@@ -1055,7 +1115,7 @@ fn reject_unlanded_branch(
         ahead_of_default: Some(ahead.map_or_else(|| json!("unknown"), |value| json!(value))),
         ..FailureDetail::default()
     };
-    let _ = append_failure(context, "branch-already-pushed", detail);
+    let _ = append_failure(context, "branch-in-flight", detail);
     Err(DispatchError::new(
         3,
         format!(
@@ -1071,6 +1131,7 @@ fn reject_unlanded_branch(
 
 fn reject_closing_pull_requests(
     context: &mut DispatchContext<'_>,
+    source_repository: &Path,
     minter: &mut dyn InstallationTokenMinter,
 ) -> Result<(), DispatchError> {
     let references = gh_json(
@@ -1126,6 +1187,12 @@ fn reject_closing_pull_requests(
         };
         urls.insert(url.to_owned());
     }
+    // Resolve every URL's state before mutating anything. `urls` is a
+    // `BTreeSet` walked in lexicographic order, so a MERGED URL that sorts
+    // before an OPEN one must not reclaim the worktree destructively only for
+    // the OPEN one to refuse `branch-in-flight` right after: a refusal must
+    // not leave a mutation behind.
+    let mut resolved = Vec::with_capacity(urls.len());
     for url in urls {
         let pull = gh_json(
             context,
@@ -1136,7 +1203,7 @@ fn reject_closing_pull_requests(
                 "view",
                 &url,
                 "--json",
-                "number,state,mergedAt,url",
+                "number,state,mergedAt,url,headRefOid",
             ],
             minter,
         )
@@ -1158,12 +1225,98 @@ fn reject_closing_pull_requests(
                 format!("ostrom dispatch: closing pull request state was malformed for {url}"),
             ));
         }
-        if matches!(pull["state"].as_str(), Some("OPEN" | "MERGED")) {
-            context.matched_key = Some(("closing_pull_request", url.clone()));
+        let state = pull["state"].as_str().unwrap_or_default().to_owned();
+        let number = pull["number"].as_i64().unwrap_or_default();
+        let head_ref_oid = pull["headRefOid"].as_str().map(str::to_owned);
+        resolved.push((url, state, number, head_ref_oid));
+    }
+
+    // Pass one: any OPEN closing pull request blocks, regardless of where it
+    // sorted against a MERGED one above.
+    if let Some((url, ..)) = resolved
+        .iter()
+        .find(|(_, state, ..)| state.as_str() == "OPEN")
+    {
+        context.matched_key = Some(("closing_pull_request", url.clone()));
+        let _ = append_failure(
+            context,
+            "branch-in-flight",
+            FailureDetail {
+                repository: Some(context.order.repository.clone()),
+                ..FailureDetail::default()
+            },
+        );
+        return Err(DispatchError::new(
+            3,
+            format!(
+                "ostrom dispatch: remote work already exists: matched_key=closing_pull_request:{url} item={}",
+                context.order.item_id
+            ),
+        ));
+    }
+
+    // Pass two: reclaim once. A second MERGED closing pull request would
+    // otherwise duplicate the `worktree-reclaimed` fact and re-run cleanup
+    // against an already-empty worktree. Several MERGED pull requests can
+    // close the same item (a superseded one reopened and merged again); the
+    // newest by number is the one whose `headRefOid` reflects what GitHub
+    // most recently observed on this branch.
+    if let Some((url, _, _, head_ref_oid)) = resolved
+        .iter()
+        .filter(|(_, state, ..)| state.as_str() == "MERGED")
+        .max_by_key(|(_, _, number, _)| *number)
+    {
+        context.matched_key = Some(("closing_pull_request", url.clone()));
+        reclaim_merged_worktree(context, source_repository, head_ref_oid.as_deref())?;
+        // The reclaim succeeded, so this dispatch is no longer refusing on
+        // branch identity. `append_failure` writes `matched_key` into every
+        // work-failed fact, so leaving it set would make a later refusal --
+        // capacity, budget, launch -- read as a branch-identity refusal.
+        context.matched_key = None;
+    }
+    Ok(())
+}
+
+fn reclaim_merged_worktree(
+    context: &DispatchContext<'_>,
+    source_repository: &Path,
+    published_tip: Option<&str>,
+) -> Result<(), DispatchError> {
+    // `matched_key` is set by the caller before this runs, so stderr for
+    // every refusal below can be correlated back to the closing pull request
+    // that triggered the reclaim -- the same way the OPEN branch already does.
+    let matched_key_suffix = context
+        .matched_key
+        .as_ref()
+        .map_or_else(String::new, |(kind, value)| {
+            format!(" matched_key={kind}:{value}")
+        });
+    let root = context
+        .request
+        .paths
+        .state
+        .join("implementer-worktrees")
+        .join(&context.item_hash);
+
+    // `reap.rs`'s own `inspect_worktree` retains a worktree with a live
+    // implementer lease. This reclaim runs ahead of `in_flight_orders` and
+    // `acquire_dispatch_lease` in the caller, so without this check a
+    // duplicate dispatch for an item whose earlier pull request just merged
+    // could reclaim the worktree a live implementer is sitting in, before the
+    // guard that would have refused the duplicate ever runs.
+    let lease_path = context
+        .request
+        .paths
+        .state
+        .join(format!("implementer-item-{}.lease", context.item_hash));
+    match read_lease(&lease_path) {
+        Ok(Some(lease)) if lease.expires_at > context.request.clock.epoch_seconds() => {
             let _ = append_failure(
                 context,
-                "branch-already-pushed",
+                "live-implementer-lease",
                 FailureDetail {
+                    worktree_path: root.exists().then(|| root.clone()),
+                    branch_name: Some(context.order.branch_name.clone()),
                     repository: Some(context.order.repository.clone()),
                     ..FailureDetail::default()
                 },
@@ -1171,13 +1324,124 @@ fn reject_closing_pull_requests(
             return Err(DispatchError::new(
                 3,
                 format!(
-                    "ostrom dispatch: remote work already exists: matched_key=closing_pull_request:{url} item={}",
+                    "ostrom dispatch: item already has a live implementer lease: {}{matched_key_suffix}",
+                    context.order.item_id
+                ),
+            ));
+        }
+        Ok(_) => {}
+        Err(_) => {
+            let _ = append_failure(
+                context,
+                "implementer-lease-unreadable",
+                FailureDetail {
+                    worktree_path: root.exists().then(|| root.clone()),
+                    branch_name: Some(context.order.branch_name.clone()),
+                    repository: Some(context.order.repository.clone()),
+                    ..FailureDetail::default()
+                },
+            );
+            return Err(DispatchError::new(
+                3,
+                format!(
+                    "ostrom dispatch: implementer lease for {} is unreadable{matched_key_suffix}",
                     context.order.item_id
                 ),
             ));
         }
     }
-    Ok(())
+
+    let existed = root.exists();
+    let existing_branch = existed
+        .then(|| git_text(&root, &["branch", "--show-current"]))
+        .flatten()
+        .filter(|branch| !branch.is_empty())
+        .unwrap_or_else(|| context.order.branch_name.clone());
+    if existed {
+        match worktree_status(&root) {
+            WorktreeStatus::Clean => {}
+            WorktreeStatus::Dirty | WorktreeStatus::Unreadable => {
+                let _ = append_failure(
+                    context,
+                    "branch-merged-not-cleaned",
+                    FailureDetail {
+                        worktree_path: Some(root.clone()),
+                        branch_name: Some(existing_branch.clone()),
+                        repository: Some(context.order.repository.clone()),
+                        ..FailureDetail::default()
+                    },
+                );
+                return Err(DispatchError::new(
+                    3,
+                    format!(
+                        "ostrom dispatch: merged branch was not cleaned because worktree {} is dirty or unreadable{matched_key_suffix}",
+                        root.display()
+                    ),
+                ));
+            }
+        }
+        if directory_bytes(&root).is_err() {
+            let _ = append_failure(
+                context,
+                "branch-merged-not-cleaned",
+                FailureDetail {
+                    worktree_path: Some(root.clone()),
+                    branch_name: Some(existing_branch),
+                    repository: Some(context.order.repository.clone()),
+                    ..FailureDetail::default()
+                },
+            );
+            return Err(DispatchError::new(
+                3,
+                format!(
+                    "ostrom dispatch: merged branch was not cleaned because worktree {} is unreadable{matched_key_suffix}",
+                    root.display()
+                ),
+            ));
+        }
+    }
+    let reclaimed = reclaim_worktree(
+        source_repository,
+        &root,
+        &context.order.branch_name,
+        published_tip,
+    )
+    .map_err(|error| {
+        let _ = append_failure(
+            context,
+            "branch-merged-not-cleaned",
+            FailureDetail {
+                worktree_path: existed.then(|| root.clone()),
+                branch_name: Some(existing_branch.clone()),
+                repository: Some(context.order.repository.clone()),
+                ..FailureDetail::default()
+            },
+        );
+        DispatchError::new(
+            3,
+            format!("ostrom dispatch: merged branch cleanup failed: {error}{matched_key_suffix}"),
+        )
+    })?;
+    let mut fact = Map::new();
+    fact.insert("schema_version".to_owned(), json!(1));
+    fact.insert("item_id".to_owned(), json!(context.order.item_id));
+    fact.insert("order_id".to_owned(), json!(context.order.order_id));
+    fact.insert("item_hash".to_owned(), json!(context.item_hash));
+    fact.insert("repository".to_owned(), json!(context.order.repository));
+    fact.insert("branch_name".to_owned(), json!(existing_branch));
+    fact.insert(
+        "worktree_path".to_owned(),
+        if existed {
+            json!(root.display().to_string())
+        } else {
+            Value::Null
+        },
+    );
+    fact.insert("worktree_count".to_owned(), json!(usize::from(existed)));
+    fact.insert("branch_count".to_owned(), json!(reclaimed.branch_count));
+    fact.insert("reclaimed_bytes".to_owned(), json!(reclaimed.bytes));
+    append_fact(context, "worktree-reclaimed", fact)
+        .map_err(|_| DispatchError::new(1, "ostrom dispatch: could not record worktree-reclaimed"))
 }
 
 fn resolve_ostrom(context: &DispatchContext<'_>) -> Result<PathBuf, DispatchError> {
@@ -1278,12 +1542,19 @@ fn gh_json(
     command: &[&str],
     minter: &mut dyn InstallationTokenMinter,
 ) -> Result<Value, String> {
-    let output =
-        gh_output(context, permissions, command, minter).map_err(|error| error.to_string())?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).into_owned());
-    }
-    serde_json::from_slice(&output.stdout).map_err(|error| error.to_string())
+    // Shared with `reap.rs`: one `gh_json` that checks exit status only. `gh`
+    // writes update notices and rate-limit warnings to stderr on exit 0.
+    gh_json_output(
+        &context.request.paths,
+        ScopedAppTokenRequest::new(
+            "builder",
+            &context.order.repository,
+            &context.order.repository,
+            permissions,
+        ),
+        command,
+        minter,
+    )
 }
 
 fn gh_text_quiet(
