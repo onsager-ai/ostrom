@@ -1811,11 +1811,16 @@ mod sink_refusal_tests {
         // What ostrom owns is that the sink refused, that the refusal was
         // stored with a usable detail, and that the detail names the field
         // this test chose to corrupt. `text` is this test's own knowledge.
-        let detail = refusal["detail"].as_str().expect("validation detail");
-        assert!(!detail.is_empty(), "a refusal must explain itself");
+        // The typed field, not the prose. `field` is a countable fact in the
+        // same payload and names what ostrom corrupted; keying on it is what
+        // this test claims to do, and `detail.contains("text")` would still
+        // have been an assertion about wording.
+        assert_eq!(refusal["field"], "payload.text");
         assert!(
-            detail.contains("text"),
-            "the detail must name the corrupted field: {detail:?}"
+            refusal["detail"]
+                .as_str()
+                .is_some_and(|detail| !detail.is_empty()),
+            "a refusal must still explain itself"
         );
         assert!(refusal.get("count").is_none());
         assert!(refusal.get("max").is_none());
