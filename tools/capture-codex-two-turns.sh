@@ -7,7 +7,9 @@
 # to accumulate before emitting if the harness reports increments.
 #
 # ONE authorised run. Do not retry on a usage-limit error — stop and report.
-# Codex usage limit is exhausted until 2026-09-15 09:47.
+# Confirm the Codex quota is actually available before spending the
+# authorisation: this script cannot be cheaply re-run, and a limit hit
+# halfway through leaves a half-captured thread that answers nothing.
 
 set -euo pipefail
 
@@ -42,6 +44,10 @@ echo "== turn 2 (resume) =="
     -c sandbox_mode="workspace-write" \
     - ) > "$OUT/turn2.ndjson" 2> "$OUT/turn2.stderr" || {
     echo "turn 2 failed (exit $?); see $OUT/turn2.stderr — STOP, do not retry" >&2; exit 1; }
+
+if grep -qiE 'usage limit|rate limit|quota' "$OUT/turn2.stderr" "$OUT/turn2.ndjson" 2>/dev/null; then
+  echo "usage limit hit on turn 2 — STOP and report; do not retry" >&2; exit 2
+fi
 
 cat "$OUT/turn1.ndjson" "$OUT/turn2.ndjson" > "$OUT/raw.ndjson"
 
