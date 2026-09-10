@@ -1800,13 +1800,23 @@ mod sink_refusal_tests {
     fn invalid_agent_text_is_refused_by_the_real_sink_and_the_pass_finishes() {
         let refusal = assert_refused_pass_finishes(json!({"text": false}));
         assert_eq!(refusal["cause"], "malformed");
+        // Deliberately not pinned to the SDK's wording, not even a substring.
+        // `capture.refused.detail` is documented **non-authoritative**
+        // (onsager-ai/ethogram#15): the countable facts are the typed fields, and consumers
+        // must not key on diagnostic prose. This assertion used to pin that
+        // prose, which is the one field the producing repository says is not a
+        // contract -- so it was not merely brittle, it was asserting against a
+        // stated rule.
+        //
+        // What ostrom owns is that the sink refused, that the refusal was
+        // stored with a usable detail, and that the detail names the field
+        // this test chose to corrupt. `text` is this test's own knowledge.
+        let detail = refusal["detail"].as_str().expect("validation detail");
+        assert!(!detail.is_empty(), "a refusal must explain itself");
         assert!(
-            refusal["detail"]
-                .as_str()
-                .expect("validation detail")
-                .contains("expected a string")
+            detail.contains("text"),
+            "the detail must name the corrupted field: {detail:?}"
         );
-        assert_eq!(refusal["truncated"], false);
         assert!(refusal.get("count").is_none());
         assert!(refusal.get("max").is_none());
     }
@@ -1818,15 +1828,62 @@ mod sink_refusal_tests {
             "truncated": "🦀".repeat(MAX_EXCERPT_SCALARS + 1),
         }));
         assert_eq!(refusal["cause"], "malformed");
-        assert_eq!(refusal["truncated"], true);
-        assert_eq!(
+        // No truncation assertion here any more. ethogram's validation
+        // messages stopped echoing the offending value, so this input no
+        // longer produces an oversized detail and the assertion would pass by
+        // guarding nothing. The bounding property is ostrom's, so it is tested
+        // at ostrom's own seam instead -- see the two `bounding_` tests below.
+        assert!(
             refusal["detail"]
+                .as_str()
+                .is_some_and(|detail| !detail.is_empty()),
+            "the refusal must still be stored with a detail"
+        );
+    }
+
+    /// The bounding property, at ostrom's seam rather than through ethogram.
+    ///
+    /// `sink_refused_draft` excerpts a sink's detail to `MAX_EXCERPT_SCALARS`
+    /// before storing it, so a refusal can always be written. That decision is
+    /// ostrom's: it chooses to excerpt and it chooses the bound. It used to be
+    /// covered incidentally, because ethogram's validation messages echoed the
+    /// offending value and so ran long. They no longer do, which would have
+    /// left the guard passing vacuously -- so it is asserted directly, with an
+    /// oversized detail this test constructs rather than one it hopes to
+    /// provoke.
+    fn refusal_detail(detail: String) -> Value {
+        let draft = sink_refused_draft(
+            PassRole::Builder,
+            "sink-refusal-seam",
+            AGENT_TEXT.to_owned(),
+            RunEventError::Sink(SinkFault::Invalid {
+                path: "payload.text".to_owned(),
+                detail,
+            }),
+        )
+        .expect("a sink refusal always drafts");
+        draft.payload
+    }
+
+    #[test]
+    fn bounding_truncates_an_oversized_detail() {
+        let payload = refusal_detail("🦀".repeat(MAX_EXCERPT_SCALARS + 1));
+        assert_eq!(payload["truncated"], true);
+        assert_eq!(
+            payload["detail"]
                 .as_str()
                 .expect("bounded detail")
                 .chars()
                 .count(),
             MAX_EXCERPT_SCALARS
         );
+    }
+
+    #[test]
+    fn bounding_leaves_a_detail_within_the_bound_alone() {
+        let payload = refusal_detail("short enough".to_owned());
+        assert_eq!(payload["truncated"], false);
+        assert_eq!(payload["detail"], "short enough");
     }
 
     #[test]

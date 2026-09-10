@@ -21,7 +21,7 @@ const ULP_SENSITIVE_COST: &str = "0.09765190000000001";
 #[test]
 fn the_vendored_ethogram_round_trips_a_ulp_sensitive_cost() {
     let wire = format!(
-        r#"{{"v":1,"type":"run.finished","runId":"run-float","seq":1,"ts":"2026-09-10T00:00:00.000Z","payload":{{"costUsd":{ULP_SENSITIVE_COST},"outcome":"completed"}}}}"#
+        r#"{{"v":1,"type":"run.finished","runId":"run-float","seq":1,"ts":"2026-09-10T00:00:00.000Z","payload":{{"costUsd":{ULP_SENSITIVE_COST},"durationMs":118,"outcome":"completed"}}}}"#
     );
 
     let event = ethogram::parse_event(&wire).expect("the capture parses");
