@@ -824,6 +824,10 @@ fn queue_item(
             .collect(),
         graph_dispatchable: graph.map_or(!graph_required, |node| node.dispatchable),
         unblocking_power: graph.map_or(0, |node| node.unblocking_power),
+        item_type: value
+            .get("item_type")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
     })
 }
 

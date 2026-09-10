@@ -440,6 +440,10 @@ fn queue_item(
             .collect(),
         graph_dispatchable: node.dispatchable,
         unblocking_power: node.unblocking_power,
+        item_type: row
+            .get("item_type")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
     })
 }
 
@@ -719,10 +723,12 @@ fn append_fact(path: &Path, timestamp: &str, kind: &str, fact: Value) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use ostrom_core::QueueItem;
+    use std::collections::BTreeMap;
+
+    use ostrom_core::{QueueItem, WorkGraphNode};
     use serde_json::json;
 
-    use super::{authorized, dispatchable_item_type};
+    use super::{authorized, dispatchable_item_type, queue_item};
     use crate::sweep::PR_REPAIR_CONFLICT_REASON_PREFIX;
 
     fn item(kind: &str) -> QueueItem {
@@ -734,6 +740,7 @@ mod tests {
             blocked_by: Vec::new(),
             graph_dispatchable: true,
             unblocking_power: 0,
+            item_type: None,
         }
     }
 
@@ -750,6 +757,53 @@ mod tests {
             }
         });
         assert!(!authorized(&item("drift"), &repair_conflict));
+    }
+
+    #[test]
+    fn the_row_predicate_and_the_carried_field_agree() {
+        // `authorized` judges pull requests from the raw row via
+        // `dispatchable_item_type`, while `QueueItem::dispatchable` in
+        // ostrom-core judges the same thing from the carried `item_type`
+        // field. Two definitions of one question, so repo principle 6 owes a
+        // test that they agree -- otherwise the selection path and the plan
+        // path can drift apart silently.
+        let graph = WorkGraphNode {
+            id: "example-org/example-repo#1".to_owned(),
+            open: true,
+            dependencies: Vec::new(),
+            unsatisfied: Vec::new(),
+            children: Vec::new(),
+            dispatchable: true,
+            unblocking_power: 0,
+        };
+        for (item_type, dispatchable) in [
+            (Some("pull_request"), false),
+            (Some("issue"), true),
+            (None, true),
+        ] {
+            let mut row = json!({
+                "id": "example-org/example-repo#1",
+                "opened": "2030-01-01",
+                "kind": "moved",
+                "state": "pending",
+            });
+            if let Some(item_type) = item_type {
+                row["item_type"] = json!(item_type);
+            }
+            let nodes = BTreeMap::from([("example-org/example-repo#1", &graph)]);
+            let item = queue_item(&row, &nodes).expect("row builds a queue item");
+            assert_eq!(item.item_type.as_deref(), item_type);
+            assert_eq!(
+                dispatchable_item_type(&row),
+                dispatchable,
+                "row predicate disagrees for {item_type:?}"
+            );
+            assert_eq!(
+                item.dispatchable(),
+                dispatchable,
+                "carried field disagrees for {item_type:?}"
+            );
+        }
     }
 
     #[test]

@@ -304,6 +304,39 @@ fn no_goals_plan_preserves_sweep_queue_bytes_and_mechanical_steps() {
 }
 
 #[test]
+fn pull_request_queue_rows_never_reach_the_plan_ranking() {
+    let home = tempdir().expect("plan home");
+    configure(home.path());
+    fs::write(
+        home.path().join("queue.jsonl"),
+        concat!(
+            r##"{"id":"example-org/example-repo#20","repo":"example-org/example-repo","ref":"#20","title":"Open a pull request","item_type":"pull_request","kind":"decision","mandate":{"reason":"reserved ref:#20"},"state":"approved","opened":"2026-07-01T00:00:00Z","blocked_by":[]}"##,
+            "\n",
+            r##"{"id":"example-org/example-repo#21","repo":"example-org/example-repo","ref":"#21","title":"An ordinary issue","kind":"decision","mandate":{"reason":"reserved ref:#21"},"state":"approved","opened":"2026-07-02T00:00:00Z","blocked_by":[]}"##,
+            "\n",
+        ),
+    )
+    .expect("write approved queue state");
+
+    let output = run(home.path(), "plan");
+    assert!(
+        output.status.success(),
+        "plan stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: Value =
+        serde_json::from_slice(&fs::read(home.path().join("plan.json")).expect("plan output"))
+            .expect("parse plan");
+    // The pull-request row (#20) is approved and otherwise dispatchable —
+    // only its item_type excludes it. If it ever reappears here, ostrom is
+    // back to recording an open pull request as ranked, dispatchable work.
+    assert_eq!(
+        document["ranking"]["ordered"],
+        json!(["example-org/example-repo#21"])
+    );
+}
+
+#[test]
 fn unavailable_deriver_and_missing_check_are_visible_without_empty_ranking() {
     let home = tempdir().expect("plan home");
     configure(home.path());
