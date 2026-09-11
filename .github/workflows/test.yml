@@ -211,7 +211,7 @@ jobs:
         run: |
           cargo test --manifest-path umwelt/Cargo.toml --workspace \
             2>&1 | tee umwelt-rust.log
-          node .github/scripts/assert-cargo-count.mjs umwelt-rust.log 144 umwelt
+          node .github/scripts/assert-cargo-count.mjs umwelt-rust.log 147 umwelt
 
   umwelt-preserve-order-probe:
     name: umwelt under a consumer's preserve_order
@@ -228,4 +228,4 @@ jobs:
         run: |
           cargo test --manifest-path umwelt/Cargo.toml --workspace --all-features \
             2>&1 | tee umwelt-probe.log
-          node .github/scripts/assert-cargo-count.mjs umwelt-probe.log 145 "umwelt probe"
+          node .github/scripts/assert-cargo-count.mjs umwelt-probe.log 148 "umwelt probe"
