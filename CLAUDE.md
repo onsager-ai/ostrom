@@ -37,9 +37,21 @@ downstream repository appears anywhere here — not in code, not in configuratio
 and not as a citation. The dependency runs one way only, and it does not run back. Where a rule
 originated downstream, restate it; do not cite its home.
 
+One exception, and only one: an **operational record** — an issue body or comment recording what a
+pass selected, dispatched, judged or merged — may name the repository the event happened in. A
+record that cannot name its subject cannot be checked against the event, and an unverifiable record
+is not a record. Naming where a run acted states a fact about that run; it does not make ostrom
+depend on the thing named. Everything else is unchanged: code, configuration, documentation, and
+citations of rules still name nothing downstream.
+
 <!-- Source: the same 2026-08-13 boundary tests, test 3; enforced on this file by #490's review,
-     which caught it naming a downstream repository eight times while stating this rule.
-     Preconditions: assumes ostrom stays the open commons half of the pair. -->
+     which caught it naming a downstream repository eight times while stating this rule. The
+     operational-record exception is the principal's word, 2026-09-11, on the case in #553: every
+     record of the loop's first unattended merge names the repository it merged in, and a record
+     that could not would not be evidence of anything.
+     Preconditions: assumes ostrom stays the open commons half of the pair; and assumes operational
+     records stay records — a rule, a dependency or a design decision dressed as a record is still
+     a rule, a dependency or a design decision, and this exception does not reach it. -->
 
 **4. Actors are data; the binary hardcodes no actor set.** `builder` and `gatekeeper` are one
 operator's configuration, not architecture. Which actors exist, what each does, and how each runs
