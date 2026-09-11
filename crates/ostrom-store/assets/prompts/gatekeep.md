@@ -127,7 +127,7 @@ ostrom credential gatekeeper "$repository" \
 ostrom credential gatekeeper "$repository" \
   --repositories "$repository" \
   --permissions metadata:read,contents:write,pull_requests:write -- \
-  gh pr merge "$pr_number" --repo "$repository"
+  gh pr merge "$pr_number" --repo "$repository" --squash
 ```
 
 Those are the only write scopes for these operations: the verdict comment does
