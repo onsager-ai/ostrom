@@ -38,6 +38,10 @@ const QUERY_LIMIT: usize = 200;
 /// page is requested. Crossing that platform cap remains a refusal because an
 /// exhaustive merge-gate population cannot be proven.
 const GITHUB_SEARCH_RESULT_LIMIT: usize = 1_000;
+/// The roster's busiest repositories hold on the order of 300 pull requests
+/// today (#562). This leaves real headroom so a legitimate repository history
+/// is never mistaken for a truncated read of `gh pr list --state all`.
+const PULL_REQUEST_HEAD_BRANCH_LIMIT: usize = 3_000;
 const FULL_RECONCILIATION_HOURS: i64 = 24;
 /// A partially reachable portfolio remains useful when failed repositories are
 /// retained from the previous generation. Zero acquired repositories cannot
@@ -167,6 +171,22 @@ pub struct RepositorySnapshot {
     pub open_prs: Vec<Value>,
     #[serde(default)]
     pub merged_prs: Vec<Value>,
+    /// The durable evidence a pushed branch was proposed: every pull request
+    /// in the repository's own history, in any state, reduced to its number,
+    /// state and head branch name. Work orders are local, transient and
+    /// reaped, so this is the correlation that survives after they are gone
+    /// (#562). `#[serde(default)]` keeps state serialized before this field
+    /// existed deserializable.
+    #[serde(default)]
+    pub pull_request_heads: Vec<Value>,
+    /// Set when this sweep could not read `pull_request_heads` for this
+    /// repository (a failed or unavailable query, not a truncated one, which
+    /// refuses the repository's acquisition outright). Absence of evidence is
+    /// not evidence of absence: while this is set, the branch-write check must
+    /// not treat a candidate branch's absence from `pull_request_heads` as
+    /// proof it has no pull request. Mirrors `branch_read_degraded`.
+    #[serde(default)]
+    pub pull_request_head_read_degraded: bool,
     #[serde(default)]
     pub default_branch: Option<String>,
     #[serde(default)]
@@ -1080,6 +1100,12 @@ fn acquire_repository(
     let search = format!("merged:>={cutoff}");
     let merged_prs = fetch_merged_pull_requests(repo_name, &search)?;
 
+    let (pull_request_heads, pull_request_head_read_degraded, pull_request_head_warning) =
+        resolve_pull_request_heads(repo_name, fetch_pull_request_heads(repo_name))?;
+    if let Some(warning) = pull_request_head_warning {
+        warnings.push(warning);
+    }
+
     let (default_branch, branches, branch_read_degraded, ci_runs) = match gh_json(&[
         "repo",
         "view",
@@ -1149,6 +1175,8 @@ fn acquire_repository(
         issue_not_modified,
         open_prs,
         merged_prs,
+        pull_request_heads,
+        pull_request_head_read_degraded,
         default_branch,
         branches,
         branch_read_degraded,
@@ -1443,6 +1471,74 @@ fn fetch_branches(repo: &str) -> Result<Vec<Value>, SweepError> {
     Err(SweepError::BranchListingTruncated(format!(
         "branch query for {repo} reached query_limit {QUERY_LIMIT}; refusing a truncated sweep"
     )))
+}
+
+/// The durable evidence a pushed branch was proposed (#562): every pull
+/// request in the repository, in any state, reduced to its number, state and
+/// head branch name. `gh pr list --state all` does not paginate the way the
+/// change-feed queries in this file do; a single call with real headroom
+/// either returns the whole history or is judged truncated outright.
+fn fetch_pull_request_heads(repo: &str) -> Result<Vec<Value>, SweepError> {
+    fetch_pull_request_heads_with(repo, |repo, limit| {
+        gh_json(&[
+            "pr",
+            "list",
+            "--repo",
+            repo,
+            "--state",
+            "all",
+            "--limit",
+            &limit.to_string(),
+            "--json",
+            "number,state,headRefName",
+        ])
+    })
+}
+
+fn fetch_pull_request_heads_with(
+    repo: &str,
+    fetch: impl FnOnce(&str, usize) -> Result<Value, SweepError>,
+) -> Result<Vec<Value>, SweepError> {
+    let value = fetch(repo, PULL_REQUEST_HEAD_BRANCH_LIMIT)?;
+    let heads = value.as_array().cloned().ok_or_else(|| {
+        SweepError::Acquisition(format!(
+            "pull-request head-branch query for {repo} returned a non-array body"
+        ))
+    })?;
+    if heads.len() >= PULL_REQUEST_HEAD_BRANCH_LIMIT {
+        return Err(SweepError::BranchListingTruncated(format!(
+            "pull-request head-branch query for {repo} reached query_limit {PULL_REQUEST_HEAD_BRANCH_LIMIT}; refusing a truncated sweep"
+        )));
+    }
+    Ok(heads)
+}
+
+/// Classifies a pull-request head-branch read for one repository.
+///
+/// A truncated read (`SweepError::BranchListingTruncated`) cannot prove a
+/// branch has no pull request, so — mirroring `fetch_branches`'s own
+/// truncation handling — it propagates and aborts this repository's
+/// acquisition rather than let the #562 join run on a partial list. Any other
+/// failure (authentication, network, a missing repository) degrades only the
+/// pushed-branch correlation for this repository: the snapshot still
+/// acquires and counts toward `MIN_ACQUIRED_REPOSITORIES_TO_WRITE`, and the
+/// unexplained-write check must not treat a candidate branch's absence from
+/// the (empty) result as proof it has no pull request.
+fn resolve_pull_request_heads(
+    repo: &str,
+    result: Result<Vec<Value>, SweepError>,
+) -> Result<(Vec<Value>, bool, Option<String>), SweepError> {
+    match result {
+        Ok(heads) => Ok((heads, false, None)),
+        Err(error @ SweepError::BranchListingTruncated(_)) => Err(error),
+        Err(error) => Ok((
+            Vec::new(),
+            true,
+            Some(format!(
+                "pull-request head-branch query for {repo} could not be read: {error}; unexplained-write checks for pushed branches are limited to work-order correlation this sweep"
+            )),
+        )),
+    }
 }
 
 fn fetch_issues(
@@ -3233,6 +3329,15 @@ fn item_number(repo: &str, item_id: &str) -> Option<u64> {
     number.parse::<u64>().ok().filter(|number| *number > 0)
 }
 
+/// The pull request, if any, whose head branch is `branch_name`. Any state
+/// (open, closed or merged) counts: `#562`'s claim is that someone proposed
+/// the branch, not that the proposal succeeded.
+fn matching_pull_request<'a>(heads: &'a [Value], branch_name: &str) -> Option<&'a Value> {
+    heads
+        .iter()
+        .find(|pull| nonempty_string(pull, &["headRefName"]) == Some(branch_name))
+}
+
 fn analyze_branch_writes(
     repo: &str,
     snapshot: &RepositorySnapshot,
@@ -3281,6 +3386,20 @@ fn analyze_branch_writes(
         if !matching_work_orders.is_empty() {
             continue;
         }
+        // #562: work orders are local, transient and reaped, so the
+        // correlation above decays to nothing once an order file is gone. The
+        // durable, remote evidence is the repository's own pull request list:
+        // a pushed branch that is the head of ANY pull request there, in ANY
+        // state, was proposed by someone and is explained.
+        if snapshot.pull_request_head_read_degraded {
+            // A failed or truncated read cannot prove this branch has no
+            // pull request. Absence of evidence is not evidence of absence:
+            // do not manufacture an alarm from a degraded read. The
+            // acquisition warning already surfaces the degraded read.
+            continue;
+        }
+        let explaining_pull_request =
+            matching_pull_request(&snapshot.pull_request_heads, branch_name);
         let branch_sha = branch
             .pointer("/commit/sha")
             .and_then(Value::as_str)
@@ -3288,47 +3407,75 @@ fn analyze_branch_writes(
         let id = format!("{repo}@refs/heads/{branch_name}");
         let title = format!("Pushed branch {branch_name}");
         let fingerprint = format!("branch-v1|{branch_name}|{branch_sha}");
-        let scope_evidence = json!({
-            "basis": [],
-            "machine_author": null,
-            "work_order_refs": [],
-            "gate_verdict": null,
-            "classification": "unexplained",
-            "branch_name": branch_name,
-            "branch_sha": branch_sha,
-            "matching_work_orders": [],
-        });
-        active_ids.insert(id.clone());
-        current.insert(
-            id.clone(),
-            json!({"id": id, "title": title, "age_days": 0, "aged_out": false}),
-        );
-        if old_writes
-            .get(&id)
-            .and_then(|write| write.get("fingerprint"))
-            .and_then(Value::as_str)
-            != Some(fingerprint.as_str())
-            || queued_kinds.get(&id).map(String::as_str) != Some("unexplained-write")
-        {
-            generated.push(json!({
-                "id": id,
-                "repo": repo,
-                "ref": format!("@{branch_name}"),
-                "title": title,
-                "kind": "unexplained-write",
-                "mandate": {
-                    "reason": format!(
-                        "unexplained write: pushed branch {branch_name} has no matching work order"
-                    ),
-                    "scope_evidence": scope_evidence,
-                },
-                "state": "pending",
-                "opened": format_time(started_at),
-                "age_days": 0,
-                "aged_out": false,
-                "needs_judgment": false,
-                "blocked_by": [],
-            }));
+        let scope_evidence = if let Some(pull) = explaining_pull_request {
+            json!({
+                "basis": [{
+                    "type": "pull_request",
+                    "number": number_field(pull, &["number"]),
+                    "state": string_field(pull, &["state"]),
+                }],
+                "machine_author": null,
+                "work_order_refs": [],
+                "gate_verdict": null,
+                "classification": "explained-by-pull-request",
+                "branch_name": branch_name,
+                "branch_sha": branch_sha,
+                "matching_work_orders": [],
+            })
+        } else {
+            json!({
+                "basis": [],
+                "machine_author": null,
+                "work_order_refs": [],
+                "gate_verdict": null,
+                "classification": "unexplained",
+                "branch_name": branch_name,
+                "branch_sha": branch_sha,
+                "matching_work_orders": [],
+            })
+        };
+        if explaining_pull_request.is_none() {
+            active_ids.insert(id.clone());
+            current.insert(
+                id.clone(),
+                json!({"id": id, "title": title, "age_days": 0, "aged_out": false}),
+            );
+            if old_writes
+                .get(&id)
+                .and_then(|write| write.get("fingerprint"))
+                .and_then(Value::as_str)
+                != Some(fingerprint.as_str())
+                || queued_kinds.get(&id).map(String::as_str) != Some("unexplained-write")
+            {
+                generated.push(json!({
+                    "id": id,
+                    "repo": repo,
+                    "ref": format!("@{branch_name}"),
+                    "title": title,
+                    "kind": "unexplained-write",
+                    "mandate": {
+                        // The text understates the check as of #562: a row now
+                        // survives only when NEITHER a work order NOR a pull
+                        // request explains the branch. It is left alone
+                        // deliberately — `decisionId` is derived from this
+                        // string, so correcting it re-keys every unexplained
+                        // -write decision and re-asks questions already
+                        // answered. Correcting it is a record-shape change and
+                        // owed its own spec; the scope evidence beside it
+                        // already records the pull-request half accurately.
+                        "reason": format!(
+                            "unexplained write: pushed branch {branch_name} has no matching work order"
+                        ),
+                        "scope_evidence": scope_evidence,
+                    },
+                    "state": "pending",
+                    "opened": format_time(started_at),
+                    "age_days": 0,
+                    "aged_out": false,
+                    "needs_judgment": false,
+                    "blocked_by": [],
+                }));
+            }
         }
         writes.insert(
             id,
@@ -3671,6 +3818,12 @@ fn validate_fixture(config: &MandateConfig, fixture: &SweepFixture) -> Result<()
                     snapshot.repo
                 )));
             }
+        }
+        if snapshot.pull_request_heads.len() >= PULL_REQUEST_HEAD_BRANCH_LIMIT {
+            return Err(SweepError::Fixture(format!(
+                "pull-request head-branch query for {} reached query_limit {PULL_REQUEST_HEAD_BRANCH_LIMIT}; refusing a truncated sweep",
+                snapshot.repo
+            )));
         }
     }
     Ok(())
@@ -5957,6 +6110,371 @@ denies:
         assert_eq!(faults.len(), 1);
         assert!(faults[0].contains("placeholder-org/alpha"));
         assert!(faults[0].contains("placeholder repository query failed"));
+    }
+
+    // --- #562: a pushed branch explained by a pull request, not a work order ---
+
+    fn pushed_branch(name: &str, sha: &str) -> Value {
+        json!({"name": name, "commit": {"sha": sha}})
+    }
+
+    fn branch_write_snapshot(
+        branches: Vec<Value>,
+        pull_request_heads: Vec<Value>,
+    ) -> RepositorySnapshot {
+        RepositorySnapshot {
+            repo: RepositoryName::new("placeholder-org/alpha")
+                .expect("valid placeholder repository"),
+            issues: Vec::new(),
+            issue_etag: None,
+            issue_not_modified: false,
+            open_prs: Vec::new(),
+            merged_prs: Vec::new(),
+            pull_request_heads,
+            pull_request_head_read_degraded: false,
+            default_branch: Some("main".to_owned()),
+            branches,
+            branch_read_degraded: false,
+            ci_runs: Vec::new(),
+            warnings: Vec::new(),
+        }
+    }
+
+    fn analyze_placeholder_branch_writes(snapshot: &RepositorySnapshot) -> SupplementalAnalysis {
+        analyze_branch_writes(
+            "placeholder-org/alpha",
+            snapshot,
+            &json!({}),
+            &[],
+            &BTreeMap::new(),
+            "2026-09-06T00:00:00Z"
+                .parse()
+                .expect("valid placeholder sweep time"),
+        )
+    }
+
+    const PUSHED_BRANCH_ID: &str = "placeholder-org/alpha@refs/heads/ostrom/218-abc123def456";
+
+    #[test]
+    fn a_branch_with_a_merged_pull_request_and_no_work_order_is_not_flagged() {
+        // This is #562: 68 of 69 `unexplained-write` rows in the live queue
+        // were branches explained by a pull request that outlived its (local,
+        // transient, reaped) work order. This test MUST fail on unmodified
+        // `analyze_branch_writes` -- that failure is captured verbatim in the
+        // pull request this change ships in.
+        let snapshot = branch_write_snapshot(
+            vec![
+                pushed_branch("main", "1111111111111111111111111111111111111111"),
+                pushed_branch(
+                    "ostrom/218-abc123def456",
+                    "2222222222222222222222222222222222222222",
+                ),
+            ],
+            vec![json!({
+                "number": 481,
+                "state": "MERGED",
+                "headRefName": "ostrom/218-abc123def456",
+            })],
+        );
+        let analysis = analyze_placeholder_branch_writes(&snapshot);
+        assert!(
+            analysis.generated.is_empty(),
+            "a branch explained by a merged pull request must not be flagged as unexplained-write: {:?}",
+            analysis.generated
+        );
+        assert!(
+            !analysis.active_ids.contains(PUSHED_BRANCH_ID),
+            "an explained branch must not surface as an active queue item"
+        );
+        let write = &analysis.extra_state["writes"][PUSHED_BRANCH_ID];
+        assert_eq!(
+            write["scope_evidence"]["classification"], "explained-by-pull-request",
+            "the absence of an alarm should stay legible in the persisted scope evidence: {write}"
+        );
+        assert_eq!(write["scope_evidence"]["basis"][0]["number"], 481);
+        assert_eq!(write["scope_evidence"]["basis"][0]["state"], "MERGED");
+    }
+
+    #[test]
+    fn a_branch_with_neither_a_work_order_nor_a_pull_request_is_still_flagged() {
+        let snapshot = branch_write_snapshot(
+            vec![
+                pushed_branch("main", "1111111111111111111111111111111111111111"),
+                pushed_branch(
+                    "ostrom/218-abc123def456",
+                    "2222222222222222222222222222222222222222",
+                ),
+            ],
+            Vec::new(),
+        );
+        let analysis = analyze_placeholder_branch_writes(&snapshot);
+        assert_eq!(analysis.generated.len(), 1);
+        assert_eq!(analysis.generated[0]["kind"], "unexplained-write");
+        assert_eq!(analysis.generated[0]["id"], PUSHED_BRANCH_ID);
+        assert!(analysis.active_ids.contains(PUSHED_BRANCH_ID));
+        let write = &analysis.extra_state["writes"][PUSHED_BRANCH_ID];
+        assert_eq!(write["scope_evidence"]["classification"], "unexplained");
+        assert_eq!(write["scope_evidence"]["basis"], json!([]));
+    }
+
+    #[test]
+    fn a_closed_unmerged_pull_request_also_explains_a_branch() {
+        // 18 of the 69 live rows were this exact case: closed but never
+        // merged. Neither `open_prs` (REST, no headRefName) nor `merged_prs`
+        // (GraphQL, merged only) covers it -- only the dedicated `--state all`
+        // head-branch fetch does.
+        let snapshot = branch_write_snapshot(
+            vec![
+                pushed_branch("main", "1111111111111111111111111111111111111111"),
+                pushed_branch(
+                    "ostrom/218-abc123def456",
+                    "2222222222222222222222222222222222222222",
+                ),
+            ],
+            vec![json!({
+                "number": 512,
+                "state": "CLOSED",
+                "headRefName": "ostrom/218-abc123def456",
+            })],
+        );
+        let analysis = analyze_placeholder_branch_writes(&snapshot);
+        assert!(
+            analysis.generated.is_empty(),
+            "a branch explained by a closed-unmerged pull request must not be flagged: {:?}",
+            analysis.generated
+        );
+        let write = &analysis.extra_state["writes"][PUSHED_BRANCH_ID];
+        assert_eq!(
+            write["scope_evidence"]["classification"],
+            "explained-by-pull-request"
+        );
+        assert_eq!(write["scope_evidence"]["basis"][0]["number"], 512);
+        assert_eq!(write["scope_evidence"]["basis"][0]["state"], "CLOSED");
+    }
+
+    #[test]
+    fn a_degraded_pull_request_head_read_does_not_flag_the_branch() {
+        let mut snapshot = branch_write_snapshot(
+            vec![
+                pushed_branch("main", "1111111111111111111111111111111111111111"),
+                pushed_branch(
+                    "ostrom/218-abc123def456",
+                    "2222222222222222222222222222222222222222",
+                ),
+            ],
+            Vec::new(),
+        );
+        snapshot.pull_request_head_read_degraded = true;
+        let analysis = analyze_placeholder_branch_writes(&snapshot);
+        assert!(
+            analysis.generated.is_empty(),
+            "a degraded read cannot prove absence and must not manufacture an alarm: {:?}",
+            analysis.generated
+        );
+        assert!(!analysis.active_ids.contains(PUSHED_BRANCH_ID));
+    }
+
+    // --- #562: truncated vs. unavailable pull-request head-branch reads ---
+
+    #[test]
+    fn a_truncated_pull_request_head_read_refuses_rather_than_degrading() {
+        let truncated_page = |_repo: &str, limit: usize| {
+            Ok(Value::Array(
+                (0..limit)
+                    .map(|index| {
+                        json!({
+                            "number": index + 1,
+                            "state": "OPEN",
+                            "headRefName": format!("ostrom/{index}-placeholder"),
+                        })
+                    })
+                    .collect(),
+            ))
+        };
+        let error = fetch_pull_request_heads_with("placeholder-org/alpha", truncated_page)
+            .expect_err("a read that reaches the query limit must refuse");
+        assert!(
+            matches!(error, SweepError::BranchListingTruncated(_)),
+            "a truncated pull-request head-branch read must use the same refusal shape as \
+             `fetch_branches`, not a soft degrade: {error}"
+        );
+        assert!(error.to_string().contains("pull-request head-branch query"));
+        assert!(error.to_string().contains("placeholder-org/alpha"));
+
+        // `resolve_pull_request_heads` is exactly what `acquire_repository`
+        // calls this error's result through; it must propagate rather than
+        // downgrade a truncation into a degrade.
+        let result = fetch_pull_request_heads_with("placeholder-org/alpha", truncated_page);
+        let propagated = resolve_pull_request_heads("placeholder-org/alpha", result)
+            .expect_err("a truncated read must abort this repository's acquisition");
+        assert!(matches!(propagated, SweepError::BranchListingTruncated(_)));
+    }
+
+    #[test]
+    fn a_pull_request_head_read_under_the_limit_is_not_truncated() {
+        let heads = fetch_pull_request_heads_with("placeholder-org/alpha", |_repo, _limit| {
+            Ok(json!([
+                {"number": 1, "state": "MERGED", "headRefName": "ostrom/1-abc"},
+            ]))
+        })
+        .expect("a read under the query limit succeeds");
+        assert_eq!(heads.len(), 1);
+    }
+
+    #[test]
+    fn an_unavailable_pull_request_head_read_degrades_this_repository_without_aborting() {
+        let (heads, degraded, warning) = resolve_pull_request_heads(
+            "placeholder-org/alpha",
+            Err(SweepError::Acquisition(
+                "gh: command exited with a non-zero status".to_owned(),
+            )),
+        )
+        .expect("a non-truncation failure must degrade rather than abort acquisition");
+        assert!(heads.is_empty());
+        assert!(degraded);
+        let warning = warning.expect("a degraded read must surface a warning");
+        assert!(warning.contains("placeholder-org/alpha"));
+        assert!(warning.contains("gh: command exited with a non-zero status"));
+    }
+
+    #[test]
+    fn an_unavailable_pull_request_head_read_degrades_only_its_own_repository() {
+        // Two repositories, one roster: alpha's pull-request head read
+        // succeeds (empty, so its pushed branch is genuinely unexplained and
+        // must still be flagged) while beta's read failed this sweep (not
+        // truncated -- just unavailable). Invariant 1 (still acquired, still
+        // counted) and invariant 2 (a per-repo failure stays per-repo) both
+        // hold: beta still produces a snapshot, alpha's evaluation is
+        // untouched, and the sweep still writes.
+        let home = tempdir().expect("temporary isolation-fixture home");
+        let paths = repair_test_paths(home.path());
+        fs::write(
+            home.path().join("mandates.yaml"),
+            concat!(
+                "provider: file\n",
+                "cadence_hours: 1\n",
+                "stuck_after_days: 7\n",
+                "search_roots: []\n",
+                "hold_labels: []\n",
+                "bounce_all: []\n",
+                "projects:\n",
+                "  - repo: placeholder-org/alpha\n",
+                "    delegated: []\n",
+                "    excluded: []\n",
+                "    reserved: []\n",
+                "    default: unclassified\n",
+                "    paused: false\n",
+                "    bounce: []\n",
+                "  - repo: placeholder-org/beta\n",
+                "    delegated: []\n",
+                "    excluded: []\n",
+                "    reserved: []\n",
+                "    default: unclassified\n",
+                "    paused: false\n",
+                "    bounce: []\n",
+            ),
+        )
+        .expect("write two-repository placeholder roster");
+
+        let beta_warning = "pull-request head-branch query for placeholder-org/beta could not \
+             be read: GitHub acquisition failed: placeholder outage; unexplained-write checks \
+             for pushed branches are limited to work-order correlation this sweep";
+        let fixture_path = home.path().join("isolation-fixture.json");
+        fs::write(
+            &fixture_path,
+            serde_json::to_vec(&json!({
+                "repositories": [
+                    {
+                        "repo": "placeholder-org/alpha",
+                        "issues": [],
+                        "open_prs": [],
+                        "merged_prs": [],
+                        "default_branch": "main",
+                        "branches": [
+                            {"name": "main", "commit": {"sha": "1111111111111111111111111111111111111111"}},
+                            {"name": "ostrom/1-aaaaaaaaaaaa", "commit": {"sha": "2222222222222222222222222222222222222222"}},
+                        ],
+                        "branch_read_degraded": false,
+                        "ci_runs": [],
+                    },
+                    {
+                        "repo": "placeholder-org/beta",
+                        "issues": [],
+                        "open_prs": [],
+                        "merged_prs": [],
+                        "pull_request_head_read_degraded": true,
+                        "warnings": [beta_warning],
+                        "default_branch": "main",
+                        "branches": [
+                            {"name": "main", "commit": {"sha": "3333333333333333333333333333333333333333"}},
+                            {"name": "ostrom/2-bbbbbbbbbbbb", "commit": {"sha": "4444444444444444444444444444444444444444"}},
+                        ],
+                        "branch_read_degraded": false,
+                        "ci_runs": [],
+                    },
+                ]
+            }))
+            .expect("serialize isolation fixture"),
+        )
+        .expect("write isolation fixture");
+
+        let outcome = run_sweep(&SweepOptions {
+            working_directory: home.path().to_path_buf(),
+            executable: home.path().join("unused-ostrom"),
+            plugin_root: home.path().to_path_buf(),
+            paths: paths.clone(),
+            started_at: "2026-09-06T00:00:00Z"
+                .parse()
+                .expect("valid isolation sweep time"),
+            requested_mode: SweepMode::Full,
+            fixture: Some(fixture_path),
+            publish: PublishTarget::Disabled,
+            policy: None,
+        })
+        .expect("a degraded pull-request head read for one repository must not refuse the sweep");
+
+        assert!(
+            outcome
+                .faults
+                .iter()
+                .any(|fault| fault.contains("placeholder-org/beta")
+                    && fault.contains("pull-request head-branch query")),
+            "the degraded read must surface as a fault: {:?}",
+            outcome.faults
+        );
+
+        let queue = read_queue(&paths.queue_file()).expect("read isolation-fixture queue");
+        let kinds_by_id = queue
+            .iter()
+            .map(|row| {
+                (
+                    string_field(row.value(), &["id"]).to_owned(),
+                    string_field(row.value(), &["kind"]).to_owned(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            kinds_by_id.get("placeholder-org/alpha@refs/heads/ostrom/1-aaaaaaaaaaaa"),
+            Some(&"unexplained-write".to_owned()),
+            "alpha's own evaluation must be unaffected by beta's degraded read: {kinds_by_id:?}"
+        );
+        assert_eq!(
+            kinds_by_id.get("placeholder-org/beta@refs/heads/ostrom/2-bbbbbbbbbbbb"),
+            None,
+            "a degraded read must not manufacture an unexplained-write row: {kinds_by_id:?}"
+        );
+        assert!(
+            queue.iter().any(|row| {
+                string_field(row.value(), &["repo"]) == "placeholder-org/beta"
+                    && string_field(row.value(), &["kind"]) == "drift"
+                    && row
+                        .value()
+                        .pointer("/mandate/reason")
+                        .and_then(Value::as_str)
+                        .is_some_and(|reason| reason.contains("pull-request head-branch query"))
+            }),
+            "the degraded read must surface as a drift fault row: {queue:?}"
+        );
     }
 
     #[test]
