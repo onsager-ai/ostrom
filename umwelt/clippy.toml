@@ -1,0 +1,20 @@
+# This file is intentionally empty of keys. Its only job is to exist.
+#
+# `umwelt/` is a subtree imported from its own repository, and this tree is
+# linted under the configuration that repository had: whatever `cargo clippy`
+# finds at `-D warnings` with no extra `disallowed-*` rules. Clippy resolves
+# `clippy.toml` by walking up from the linted crate to the nearest one it
+# finds; without a file here, that walk would not stop at this tree's own
+# root, it would continue up to ostrom's, and ostrom's root `clippy.toml`
+# would silently start applying to vendored code that never agreed to it.
+#
+# ostrom's root file bans `chrono::Utc::now` (production time must come from
+# an injected `ostrom_store::clock::Clock`, established by #385) and the types
+# `std::path::Path`, `std::path::PathBuf` and `std::io::Error`. Those are
+# ostrom's own conventions, not umwelt's. umwelt does have a `Clock`, but it
+# is monotonic by design — `watchdog.rs`, returning `Duration` — because that
+# is what the caps must measure, so it cannot supply the wall-clock `ts` the
+# sink stamps onto an envelope. Satisfying ostrom's rule here would mean
+# threading a second, wall-clock source through the sink: a scope increase,
+# not fold parity. The gate being restored here is the one umwelt's own CI
+# used to run, and that gate never included these.

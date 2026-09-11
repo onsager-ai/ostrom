@@ -115,6 +115,13 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      # ethogram/clippy.toml stops this walk at ethogram's own root instead of
+      # ostrom's: these are ethogram's source CI's own flags, unchanged, and
+      # ostrom's disallowed-types/disallowed-methods rules must not reach in.
+      - name: Check formatting
+        run: cargo fmt --check --manifest-path ethogram/Cargo.toml
+      - name: Lint
+        run: cargo clippy --manifest-path ethogram/Cargo.toml --all-targets -- -D warnings
       - name: Test the imported crate
         run: |
           cargo test --manifest-path ethogram/crates/ethogram/Cargo.toml \
@@ -207,6 +214,15 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      # umwelt/clippy.toml stops this walk at umwelt's own root instead of
+      # ostrom's: these are umwelt's source CI's own flags, unchanged, and
+      # ostrom's disallowed-types/disallowed-methods rules must not reach in.
+      - name: cargo fmt
+        run: cargo fmt --all --check --manifest-path umwelt/Cargo.toml
+      - name: cargo clippy
+        run: |
+          cargo clippy --manifest-path umwelt/Cargo.toml --workspace \
+            --all-targets --all-features -- -D warnings
       - name: Test the imported tree
         run: |
           cargo test --manifest-path umwelt/Cargo.toml --workspace \
