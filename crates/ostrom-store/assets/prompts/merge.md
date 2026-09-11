@@ -219,7 +219,7 @@ instead; do not continue to another write after an invisible failure.
      if ostrom credential gatekeeper "$repository" \
        --repositories "$repository" \
        --permissions metadata:read,contents:write,pull_requests:write -- \
-       gh pr merge "$pr_number" --repo "$repository"; then
+       gh pr merge "$pr_number" --repo "$repository" --squash; then
        write_exit=0
      else
        write_exit=$?

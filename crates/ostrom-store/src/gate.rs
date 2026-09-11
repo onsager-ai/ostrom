@@ -2294,6 +2294,55 @@ projects:
         assert!(!options.paths.trace_file().exists());
     }
 
+    /// Every shipped `gh pr merge` invocation must name a merge method.
+    ///
+    /// Without one, `gh` exits 1 **without contacting GitHub** — it refuses to
+    /// infer a method non-interactively when a repository allows more than
+    /// one. A real gatekeeper pass on 2026-09-11 judged onsager-ai/duhem#522 `pass` on every
+    /// condition and then failed to deliver it for exactly this reason,
+    /// recording `write-failed` with `exit_code: 1`. The token was never
+    /// involved, which is why no permission test would have caught it.
+    ///
+    /// This asserts the shape rather than the choice: any of the three flags
+    /// satisfies it. Which method a repository wants is policy, and a
+    /// per-repository `merge_method` is a separate question recorded on
+    /// onsager-ai/ostrom#553 — but a command with no method at all cannot be right for any
+    /// repository.
+    #[test]
+    fn every_shipped_merge_command_names_a_method() {
+        let prompts = [
+            ("merge.md", include_str!("../assets/prompts/merge.md")),
+            ("gatekeep.md", include_str!("../assets/prompts/gatekeep.md")),
+            ("work.md", include_str!("../assets/prompts/work.md")),
+            ("triage.md", include_str!("../assets/prompts/triage.md")),
+        ];
+        let mut checked = 0;
+        for (name, prompt) in prompts {
+            for (number, line) in prompt.lines().enumerate() {
+                // The invocation, not prose about it. A real call names the
+                // pull request, so it always reads `gh pr merge "$...`;
+                // prose and comments write the bare command in backticks.
+                if !line.contains("gh pr merge \"") {
+                    continue;
+                }
+                checked += 1;
+                assert!(
+                    ["--squash", "--merge", "--rebase"]
+                        .iter()
+                        .any(|flag| line.contains(flag)),
+                    "{name}:{} invokes `gh pr merge` with no merge method, which exits 1 \
+                     without contacting GitHub: {line:?}",
+                    number + 1
+                );
+            }
+        }
+        // A scan that reaches nothing passes every assertion made over it.
+        assert!(
+            checked >= 2,
+            "expected the shipped prompts to invoke `gh pr merge`, found {checked}"
+        );
+    }
+
     #[test]
     fn merge_prompt_stops_after_the_gate_raises_its_decision() {
         let prompt = include_str!("../assets/prompts/merge.md");
