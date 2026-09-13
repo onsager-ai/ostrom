@@ -446,6 +446,7 @@ fn run_sweep_with_minter_and_publication_source(
             repositories,
         )?
     };
+    let acquired_through = crate::Clock::realtime().now();
     let configured_repositories = config
         .projects
         .iter()
@@ -482,6 +483,7 @@ fn run_sweep_with_minter_and_publication_source(
         &configured_repositories,
         &work_orders,
         options.started_at,
+        acquired_through,
     )?;
 
     let mut decision_requests = snapshots
@@ -3131,6 +3133,9 @@ fn observe_velocity(
     configured: &BTreeSet<String>,
     orders: &[WorkOrderEvidence],
     observed_at: DateTime<Utc>,
+    // Acquisition completes after sweep start; bound merges here while observed_at
+    // keeps ledger day bucketing anchored to the start, even across UTC midnight.
+    acquired_through: DateTime<Utc>,
 ) -> Result<(VelocityLedger, Vec<MergeFact>), SweepError> {
     let mut ledger = VelocityLedger::from_state(state)
         .map_err(|error| SweepError::State(format!("velocity: {error}")))?;
@@ -3224,11 +3229,19 @@ fn observe_velocity(
                 merge: None,
             };
             if merged {
-                let merged_at = parse_time(string_field(pull, &["mergedAt"]))
-                    .filter(|merged_at| *merged_at >= opened_at && *merged_at <= observed_at)
-                    .ok_or_else(|| {
-                        SweepError::Acquisition(format!("velocity: {pr} has no valid mergedAt"))
-                    })?;
+                let merged_at = parse_time(string_field(pull, &["mergedAt"])).ok_or_else(|| {
+                    SweepError::Acquisition(format!("velocity: {pr} has no valid mergedAt"))
+                })?;
+                if merged_at < opened_at {
+                    return Err(SweepError::Acquisition(format!(
+                        "velocity: {pr} mergedAt {merged_at} is before the pull request was opened at {opened_at}"
+                    )));
+                }
+                if merged_at > acquired_through {
+                    return Err(SweepError::Acquisition(format!(
+                        "velocity: {pr} mergedAt {merged_at} is after acquisition completed at {acquired_through}"
+                    )));
+                }
                 let merger = &pull["mergedBy"];
                 // A malformed, non-null merger shape still refuses: unlike a
                 // deleted account, an unrecognizable shape carries no
@@ -4727,6 +4740,129 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_pull_request_merging_mid_sweep_does_not_refuse_the_sweep() {
+        let root = tempdir().unwrap();
+        write_repair_test_config(root.path(), false);
+        let started_at = "2026-08-03T23:59:00Z".parse().unwrap();
+        let mut snapshot = branch_write_snapshot(vec![], vec![]);
+        snapshot.merged_prs = vec![json!({
+            "number": 566,
+            "author": {"login": "placeholder-author", "__typename": "User"},
+            "createdAt": "2026-08-03T23:58:00Z",
+            "mergedAt": "2026-08-04T00:00:00Z"
+        })];
+        let fixture_path = root.path().join("sweep-fixture.json");
+        fs::write(
+            &fixture_path,
+            serde_json::to_vec(&json!({"repositories": [snapshot]})).unwrap(),
+        )
+        .unwrap();
+        run_sweep(&SweepOptions {
+            working_directory: root.path().to_path_buf(),
+            executable: root.path().join("unused-ostrom"),
+            plugin_root: root.path().to_path_buf(),
+            paths: repair_test_paths(root.path()),
+            started_at,
+            requested_mode: SweepMode::Full,
+            fixture: Some(fixture_path),
+            publish: PublishTarget::Disabled,
+            policy: None,
+        })
+        .expect("a merge after sweep start but before acquisition completion is valid");
+        let state = read_state(&root.path().join("state.json")).unwrap();
+        let ledger = VelocityLedger::from_state(&state).unwrap();
+        assert_eq!(
+            ledger.observed_days,
+            BTreeMap::from([(
+                started_at.date_naive(),
+                BTreeSet::from([REPAIR_TEST_REPO.to_owned()])
+            )])
+        );
+        assert!(ledger.pulls["placeholder-org/alpha#566"].merge.is_some());
+    }
+
+    #[test]
+    fn velocity_merge_window_preserves_start_day_and_refuses_invalid_timestamps() {
+        let root = tempdir().unwrap();
+        let paths = repair_test_paths(root.path());
+        let started_at = "2026-08-03T23:59:00Z".parse::<DateTime<Utc>>().unwrap();
+        let acquired_through = "2026-08-04T00:01:00Z".parse::<DateTime<Utc>>().unwrap();
+        let opened_at = "2026-08-03T23:58:00Z".parse::<DateTime<Utc>>().unwrap();
+        let observe = |merged_at: Option<&str>| {
+            let mut snapshot = branch_write_snapshot(vec![], vec![]);
+            let mut pull = json!({
+                "number": 566,
+                "author": {"login": "placeholder-author", "__typename": "User"},
+                "createdAt": opened_at,
+            });
+            if let Some(merged_at) = merged_at {
+                pull["mergedAt"] = json!(merged_at);
+            }
+            snapshot.merged_prs.push(pull);
+            observe_velocity(
+                &paths,
+                &json!({}),
+                &[snapshot],
+                &BTreeSet::from([REPAIR_TEST_REPO.to_owned()]),
+                &[],
+                started_at,
+                acquired_through,
+            )
+        };
+
+        // Both endpoints are inclusive; a mid-acquisition merge across midnight
+        // belongs to the observation's start day, not the completion day.
+        for timestamp in [
+            "2026-08-03T23:58:00Z",
+            "2026-08-04T00:00:00Z",
+            "2026-08-04T00:01:00Z",
+        ] {
+            let (ledger, facts) = observe(Some(timestamp)).unwrap();
+            assert_eq!(facts.len(), 1);
+            assert_eq!(
+                facts[0].merged_at,
+                timestamp.parse::<DateTime<Utc>>().unwrap()
+            );
+            assert_eq!(
+                ledger.observed_days,
+                BTreeMap::from([(
+                    started_at.date_naive(),
+                    BTreeSet::from([REPAIR_TEST_REPO.to_owned()])
+                )])
+            );
+        }
+
+        for (timestamp, expected) in [
+            (
+                "2026-08-03T23:57:00Z",
+                format!(
+                    "velocity: placeholder-org/alpha#566 mergedAt 2026-08-03 23:57:00 UTC is before the pull request was opened at {opened_at}"
+                ),
+            ),
+            (
+                "2026-08-04T00:02:00Z",
+                format!(
+                    "velocity: placeholder-org/alpha#566 mergedAt 2026-08-04 00:02:00 UTC is after acquisition completed at {acquired_through}"
+                ),
+            ),
+        ] {
+            let error = observe(Some(timestamp)).unwrap_err();
+            assert!(
+                matches!(error, SweepError::Acquisition(ref message) if message == &expected),
+                "{error}"
+            );
+        }
+        for timestamp in [None, Some("not-a-timestamp")] {
+            let error = observe(timestamp).unwrap_err();
+            assert!(
+                matches!(error, SweepError::Acquisition(ref message)
+                if message == "velocity: placeholder-org/alpha#566 has no valid mergedAt"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
     fn merge_history_refuses_malformed_and_conflicting_facts() {
         let root = tempdir().unwrap();
         let paths = OstromPaths {
@@ -4755,6 +4891,7 @@ mod tests {
                 &[],
                 &BTreeSet::new(),
                 &[],
+                "2026-08-04T00:00:00Z".parse().unwrap(),
                 "2026-08-04T00:00:00Z".parse().unwrap(),
             )
             .unwrap_err();
