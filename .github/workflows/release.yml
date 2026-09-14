@@ -34,7 +34,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ github.event.inputs.tag && format('refs/tags/{0}', github.event.inputs.tag) || github.ref }}
       - id: msrv
         name: Read rust-version from Cargo.toml
         uses: ./.github/actions/resolve-msrv
@@ -43,6 +43,19 @@ jobs:
         env:
           RELEASE_DISPATCH_TAG: ${{ github.event.inputs.tag }}
         run: node npm/scripts/release-meta.mjs
+      - name: Refuse a dispatch this tag cannot publish
+        # On a dispatch every job runs the tag's own scripts, but this workflow
+        # file comes from the dispatching ref. A tag cut before dispatch
+        # recovery existed has a release-meta.mjs that ignores the tag input and
+        # reports is-release=false, so every publish step would be skipped and
+        # the run would end green with nothing published. The refusal lives
+        # here because only this file is guaranteed to be new enough to make it.
+        if: github.event.inputs.tag != '' && steps.meta.outputs.rebuild-of-tag != 'true'
+        env:
+          RELEASE_DISPATCH_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          echo "::error::tag ${RELEASE_DISPATCH_TAG} predates dispatch recovery; this workflow cannot publish it"
+          exit 1
 
   build:
     name: Build ${{ matrix.platform }}
@@ -56,7 +69,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ github.event.inputs.tag && format('refs/tags/{0}', github.event.inputs.tag) || github.ref }}
       - name: Install pinned Rust toolchain
         shell: bash
         env:
@@ -99,7 +112,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ github.event.inputs.tag && format('refs/tags/{0}', github.event.inputs.tag) || github.ref }}
       - name: Set up Node.js for npm provenance
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:

@@ -37,3 +37,10 @@ Two situations follow from that:
 
 A plain `workflow_dispatch` with no `tag` still only builds and packs; it
 never publishes.
+
+**Dispatch recovery works only for tags that contain it**: the first release
+cut after #586, and every release after that. On a dispatch, each job runs
+the tag's own scripts. An older tag's scripts ignore the `tag` input and
+would skip every publish step, ending green with nothing published, so the
+workflow refuses such a tag outright. An older tag whose artifacts have
+expired has no automated recovery.

@@ -109,6 +109,31 @@ test('registryState throws — and never returns absent — after persistent non
   assert.equal(calls, 3, 'one initial attempt plus 2 retries');
 });
 
+test('registryState throws — and never returns absent — when npm reports a non-404 error as JSON', async () => {
+  // In production, defaultView returns npm's error JSON from `error.stdout` as
+  // a value, not a thrown error. A real E401, E403, E500 or ETIMEDOUT arrives
+  // here as data, so this is the path an auth or registry failure actually
+  // takes. Only E404 may mean absent.
+  let calls = 0;
+  await assert.rejects(
+    () =>
+      registryState('@ostrom/cli', '1.0.0', {
+        view: () => {
+          calls += 1;
+          return { error: { code: 'E403', summary: 'Forbidden' } };
+        },
+        sleep: noopSleep,
+        retries: 2,
+      }),
+    (error) => {
+      assert.match(error.message, /@ostrom\/cli@1\.0\.0/);
+      assert.match(error.message, /E403/);
+      return true;
+    },
+  );
+  assert.equal(calls, 3, 'one initial attempt plus 2 retries, then a throw');
+});
+
 // --- lib.mjs: decidePublishAction ---------------------------------------
 
 test('decidePublishAction publishes an absent package', () => {

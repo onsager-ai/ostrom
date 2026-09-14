@@ -74,6 +74,12 @@ export async function waitForPackages({
         // hold the right bytes and simply be unreachable for a few minutes.
         // The package stays pending and the time budget decides; the last
         // such error is reported if the budget runs out.
+        //
+        // Each such read has already spent registryState's own retries, about
+        // 62s by default, before arriving here. During an outage, one pass over
+        // five pending packages can therefore take about five minutes, and the
+        // budget can overrun by up to that much. That is accepted: overrunning
+        // a wait is harmless, and giving up early is the failure this avoids.
         lastUnknown = `${pkg.name}@${pkg.version}: ${error.message}`;
         continue;
       }

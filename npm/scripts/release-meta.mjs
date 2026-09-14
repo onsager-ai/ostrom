@@ -29,20 +29,31 @@ if (isDispatchRebuild) {
       `dispatch tag ${dispatchTag} does not match Cargo version v${version} at this checkout`,
     );
   }
-  // The checkout step already resolved `ref: <tag>`, which happily accepts a
-  // branch or any other ref sharing the tag's name. Confirm an actual tag
-  // exists before treating this as a recognised recovery build, so a typo or
-  // a same-named branch fails loudly here instead of silently rebuilding the
-  // wrong commit under a release label.
+  // release.yml checks out `refs/tags/<tag>`, but what matters is the commit
+  // actually on disk. The tag must exist, and HEAD must be the commit it
+  // points to. Otherwise a same-named branch, or a checkout that resolved to
+  // something else, would publish absent packages from the wrong commit, with
+  // a gitHead that matches nothing on the registry. Both are refused here,
+  // before any package is staged.
+  const git = (revision) =>
+    execFileSync('git', ['rev-parse', '--verify', '--quiet', revision], {
+      cwd: ROOT,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+  let tagCommit;
   try {
-    execFileSync(
-      'git',
-      ['rev-parse', '--verify', '--quiet', `refs/tags/${dispatchTag}`],
-      { cwd: ROOT, stdio: ['ignore', 'ignore', 'ignore'] },
-    );
+    tagCommit = git(`refs/tags/${dispatchTag}^{commit}`);
   } catch {
     throw new Error(
       `dispatch tag ${dispatchTag} does not resolve to an existing tag in this checkout`,
+    );
+  }
+  const headCommit = git('HEAD');
+  if (tagCommit !== headCommit) {
+    throw new Error(
+      `dispatch tag ${dispatchTag} is ${tagCommit}, but this checkout is ${headCommit}; ` +
+        'refusing to publish from any commit other than the tag\'s',
     );
   }
 }
