@@ -67,6 +67,11 @@ impl fmt::Display for HarnessVersion {
 /// Versions between 2.1.238 and this floor were not measured (ostrom#587).
 pub const MIN_BRIDGE_HARNESS_VERSION: HarnessVersion = HarnessVersion::new(2, 1, 265);
 
+/// The `reason` a pass records when it refuses to launch a bridged run on a
+/// harness below [`MIN_BRIDGE_HARNESS_VERSION`]. It has one definition, shared
+/// by the pass that records it and by `doctor`, which reports it (ostrom#587).
+pub const HARNESS_UNSUPPORTED_REASON: &str = "harness-unsupported";
+
 fn parse_version_component(
     component: Option<&str>,
     missing: &'static str,

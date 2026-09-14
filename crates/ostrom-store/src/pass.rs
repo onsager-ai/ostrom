@@ -45,9 +45,15 @@ pub const MAX_TURNS: &str = "200";
 /// a considered halving of Umwelt's default, so the next reader does not mistake
 /// an inheritance for a judgement.
 pub const PASS_KILL_GRACE_MS: u64 = 5_000;
-// EX_CONFIG: the pass invocation is valid, but local configuration explicitly
-// refuses to execute it.
-const CONFIG_REFUSAL_EXIT_CODE: i32 = 78;
+// EX_CONFIG: the pass invocation is valid, but the local arm configuration
+// explicitly refuses to execute it.
+const DISARMED_EXIT_CODE: i32 = 78;
+// EX_UNAVAILABLE: the pass needs a support program, the harness, that is
+// present but cannot do what this pass requires (ostrom#587). It has its own
+// code rather than sharing EX_CONFIG with a disarmed pass, so a consumer
+// reading only the exit status cannot mistake a harness too old for the
+// bridge for a pass the operator chose not to run.
+const HARNESS_UNAVAILABLE_EXIT_CODE: i32 = 69;
 // EX_TEMPFAIL: the pass is held at its daily spend cap and can run once
 // the ceiling resets or is raised.
 const BUDGET_HELD_EXIT_CODE: i32 = 75;
@@ -197,9 +203,9 @@ impl PassError {
         match self {
             Self::Failed { code, .. } => *code,
             Self::LeaseHeld(_) => 0,
-            Self::Disarmed(_) => CONFIG_REFUSAL_EXIT_CODE,
+            Self::Disarmed(_) => DISARMED_EXIT_CODE,
             Self::BudgetHeld(_) => BUDGET_HELD_EXIT_CODE,
-            Self::HarnessUnsupported { .. } => CONFIG_REFUSAL_EXIT_CODE,
+            Self::HarnessUnsupported { .. } => HARNESS_UNAVAILABLE_EXIT_CODE,
         }
     }
 
@@ -824,7 +830,7 @@ fn run_pass_with_bridge_probe_timeout(
             // that cannot run the bridge is a broken environment, and it must not
             // read as a quiet pass to anything folding these records (ostrom#587).
             guard.outcome = Some("unstarted".to_owned());
-            guard.reason = Some("harness-unsupported".to_owned());
+            guard.reason = Some(crate::permission_bridge::HARNESS_UNSUPPORTED_REASON.to_owned());
             guard.cost_usd = Some(0.0);
             guard.finish()?;
             return Err(error);
@@ -1004,7 +1010,15 @@ fn run_pass_with_bridge_probe_timeout(
         // wire; reusing it here, rather than a second list of failure
         // strings, is what keeps the exit status and the wire from drifting
         // apart (repo principle 6).
-        if matches!(event_outcome(&recorded_outcome), EventRunOutcome::Failed) {
+        // `Unstarted` counts too. Before ostrom#587 gave it an arm,
+        // `event_outcome` sent an unrecognised `unstarted` to its `Failed`
+        // catch-all, so a recorded `unstarted` already exited non-zero here.
+        // A run that did start cannot honestly record that it did not, and
+        // the new arm must not turn that into a silent exit 0.
+        if matches!(
+            event_outcome(&recorded_outcome),
+            EventRunOutcome::Failed | EventRunOutcome::Unstarted
+        ) {
             Err(PassError::failed(
                 request.role,
                 format!(
@@ -2126,21 +2140,46 @@ mod event_outcome_tests {
 
 #[cfg(test)]
 mod exit_code_tests {
-    use super::{BUDGET_HELD_EXIT_CODE, CONFIG_REFUSAL_EXIT_CODE, PassError};
+    use super::{
+        BUDGET_HELD_EXIT_CODE, DISARMED_EXIT_CODE, HARNESS_UNAVAILABLE_EXIT_CODE, PassError,
+    };
 
     #[test]
     fn budget_held_disarmed_and_lease_held_have_distinct_exit_codes() {
         assert_eq!(BUDGET_HELD_EXIT_CODE, 75);
-        assert_eq!(CONFIG_REFUSAL_EXIT_CODE, 78);
+        assert_eq!(DISARMED_EXIT_CODE, 78);
         assert_eq!(
             PassError::BudgetHeld("builder").exit_code(),
             BUDGET_HELD_EXIT_CODE
         );
         assert_eq!(
             PassError::Disarmed("builder").exit_code(),
-            CONFIG_REFUSAL_EXIT_CODE
+            DISARMED_EXIT_CODE
         );
         assert_eq!(PassError::LeaseHeld("builder").exit_code(), 0);
+    }
+
+    // A consumer that has only the exit status must still be able to tell the
+    // refusals apart (ostrom#587). The codes are distinct, and a harness
+    // refusal in particular does not share disarmed's EX_CONFIG.
+    #[test]
+    fn a_harness_refusal_exits_with_its_own_code_not_disarmed() {
+        let harness = PassError::HarnessUnsupported {
+            role: "builder",
+            version: "2.1.238".to_owned(),
+            path: std::path::PathBuf::from("claude"),
+            minimum: crate::permission_bridge::MIN_BRIDGE_HARNESS_VERSION,
+        };
+        assert_eq!(HARNESS_UNAVAILABLE_EXIT_CODE, 69);
+        assert_eq!(harness.exit_code(), HARNESS_UNAVAILABLE_EXIT_CODE);
+        let codes = [
+            harness.exit_code(),
+            PassError::Disarmed("builder").exit_code(),
+            PassError::BudgetHeld("builder").exit_code(),
+            PassError::LeaseHeld("builder").exit_code(),
+        ];
+        let distinct: std::collections::BTreeSet<i32> = codes.iter().copied().collect();
+        assert_eq!(distinct.len(), codes.len(), "exit codes collide: {codes:?}");
     }
 }
 
@@ -2225,8 +2264,8 @@ mod platform_fallback_pass_tests {
     use umwelt_runtime::{FileSink, Source};
 
     use super::{
-        CONFIG_REFUSAL_EXIT_CODE, Clock, OstromPaths, PassError, PassRequest, PassRole, run_pass,
-        run_pass_with_bridge_probe_timeout,
+        Clock, HARNESS_UNAVAILABLE_EXIT_CODE, OstromPaths, PassError, PassRequest, PassRole,
+        run_pass, run_pass_with_bridge_probe_timeout,
     };
     use crate::{permission_bridge::MIN_BRIDGE_HARNESS_VERSION, read_trace};
 
@@ -2316,7 +2355,7 @@ mod platform_fallback_pass_tests {
     fn assert_harness_refusal(fixture: &HarnessFixture, timeout: Duration) -> PassError {
         let error = run_pass_with_bridge_probe_timeout(&fixture.request("linux"), timeout)
             .expect_err("the bridged pass must refuse this harness");
-        assert_eq!(error.exit_code(), CONFIG_REFUSAL_EXIT_CODE);
+        assert_eq!(error.exit_code(), HARNESS_UNAVAILABLE_EXIT_CODE);
         assert!(
             matches!(&error, PassError::HarnessUnsupported { .. }),
             "the refusal must keep its dedicated type: {error:?}"

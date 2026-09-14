@@ -1638,6 +1638,27 @@ fn check_role_pass(context: &DoctorContext, role: DeliveryRole) -> DoctorResult 
             "run ostrom operations --settings <actor> and install the derived profile for that role",
         );
     }
+    // A harness too old for the permission bridge refuses every bridged pass
+    // the same way until Claude Code is upgraded (ostrom#587). Each refusal is
+    // a fresh `unstarted` record, which neither the streak checks below nor
+    // the age check can see, so without this branch doctor would say OK
+    // indefinitely. The refusal is deterministic and never heals by itself,
+    // so one is enough.
+    if pass_outcome(record) == Some("unstarted")
+        && pass_reason(record) == Some(ostrom_store::permission_bridge::HARNESS_UNSUPPORTED_REASON)
+    {
+        return DoctorResult::new(
+            DoctorStatus::Fail,
+            check_name,
+            format!(
+                "last {role_name} pass refused to launch: Claude Code is too old for the permission bridge, {timestamp} (age {age})"
+            ),
+            format!(
+                "upgrade Claude Code to at least {}",
+                ostrom_store::permission_bridge::MIN_BRIDGE_HARNESS_VERSION
+            ),
+        );
+    }
     // One no-op can be a contended lease or a disarmed mid-window wake. Three
     // consecutive no-ops mean the timer is alive but the protocol has stopped
     // taking ownership, the production failure that the age check cannot see.
@@ -1696,6 +1717,13 @@ fn check_role_pass(context: &DoctorContext, role: DeliveryRole) -> DoctorResult 
             "",
         )
     }
+}
+
+fn pass_reason(record: &Value) -> Option<&str> {
+    record
+        .get("fact")
+        .and_then(|fact| fact.get("reason"))
+        .and_then(Value::as_str)
 }
 
 fn pass_outcome(record: &Value) -> Option<&str> {
@@ -1875,6 +1903,42 @@ mod tests {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
             path
         }
+    }
+
+    /// One `pass-ended` record, 30 minutes before the fixture clock, so the
+    /// age check alone would call the builder pass current.
+    fn write_builder_pass_ended(fixture: &Fixture, outcome: &str, reason: &str) {
+        let state = fixture.config_dir.join("ostrom");
+        fs::create_dir_all(&state).unwrap();
+        let record = serde_json::json!({
+            "ts": "2026-07-31T23:30:00Z",
+            "kind": "pass-ended",
+            "fact": {"owner": "builder-a1b2c3d4-wake7", "outcome": outcome, "reason": reason},
+            "narration": {},
+        });
+        fs::write(state.join("sprint.jsonl"), format!("{record}\n")).unwrap();
+    }
+
+    #[test]
+    fn builder_pass_fails_on_a_single_harness_unsupported_refusal() {
+        let fixture = Fixture::new();
+        write_builder_pass_ended(&fixture, "unstarted", "harness-unsupported");
+        let output = run_doctor_check(fixture.options(), "builder-pass").unwrap();
+        assert!(output.starts_with("FAIL|builder-pass|"), "{output}");
+        assert!(output.contains("Claude Code is too old"), "{output}");
+        let remedy = format!(
+            "upgrade Claude Code to at least {}",
+            ostrom_store::permission_bridge::MIN_BRIDGE_HARNESS_VERSION
+        );
+        assert!(output.contains(&remedy), "{output}");
+    }
+
+    #[test]
+    fn builder_pass_does_not_fail_an_unstarted_pass_with_another_reason() {
+        let fixture = Fixture::new();
+        write_builder_pass_ended(&fixture, "unstarted", "spawn");
+        let output = run_doctor_check(fixture.options(), "builder-pass").unwrap();
+        assert!(!output.starts_with("FAIL|"), "{output}");
     }
 
     fn catalogue(check: &str) -> CatalogueEnumeration {

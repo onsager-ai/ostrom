@@ -350,6 +350,25 @@ for the wire format, ordering, and supervisor-owned authorisation.
 The lease and trace are machine-local runtime state. Like the real roster,
 queue, and read cursors, they never belong in this repository.
 
+### Exit status
+
+`ostrom pass <role>` exits with a status a scheduler can act on before reading
+any record:
+
+| status | meaning |
+|---|---|
+| 0 | the pass completed, found nothing to do, or another pass holds the lease |
+| 1 | an ostrom-side failure, or the agent exited 0 while the pass recorded a failure (#561) |
+| 69 | `EX_UNAVAILABLE`: a bridged pass refused to launch because Claude Code is below the minimum the permission bridge needs, or its version could not be read (#587); upgrade Claude Code |
+| 75 | `EX_TEMPFAIL`: held at the daily spend cap; the same invocation succeeds once the ceiling resets or is raised |
+| 78 | `EX_CONFIG`: the pass is disarmed |
+| 129, 130, 143 | ended by `SIGHUP`, `SIGINT` (including an interrupt on the control descriptor), or `SIGTERM` |
+| any other non-zero | the agent process's own exit status, passed through |
+
+No two refusals share a status, so a consumer that reads only the exit status
+can still tell them apart. The `pass-ended` fact and `run.finished` carry the
+outcome and reason.
+
 ### Answering a decision
 
 The SessionStart digest's `DECISIONS WAITING` section groups open decisions by
