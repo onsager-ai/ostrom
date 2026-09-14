@@ -1,11 +1,11 @@
 use std::{
     fs,
-    io::{self, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::mpsc::{self, Receiver, RecvTimeoutError},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use chrono::DateTime;
@@ -45,15 +45,16 @@ pub const MAX_TURNS: &str = "200";
 /// a considered halving of Umwelt's default, so the next reader does not mistake
 /// an inheritance for a judgement.
 pub const PASS_KILL_GRACE_MS: u64 = 5_000;
-// EX_CONFIG: the pass invocation is valid, but the local arm configuration
-// explicitly refuses to execute it.
-const DISARMED_EXIT_CODE: i32 = 78;
+// EX_CONFIG: the pass invocation is valid, but local configuration explicitly
+// refuses to execute it.
+const CONFIG_REFUSAL_EXIT_CODE: i32 = 78;
 // EX_TEMPFAIL: the pass is held at its daily spend cap and can run once
 // the ceiling resets or is raised.
 const BUDGET_HELD_EXIT_CODE: i32 = 75;
 const DEFAULT_DAILY_CAP_USD: f64 = 50.0;
 const DEFAULT_LEASE_TTL_SECONDS: u64 = 3_600;
 const PASS_TERMINATION_GRACE: Duration = Duration::from_millis(PASS_KILL_GRACE_MS);
+const BRIDGE_HARNESS_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Render a permission mode as the flag value the Claude harness expects.
 ///
@@ -179,6 +180,15 @@ pub enum PassError {
     Disarmed(&'static str),
     #[error("ostrom {0} pass: daily spend cap reached; held until the ceiling resets or is raised")]
     BudgetHeld(&'static str),
+    #[error(
+        "ostrom {role} pass: Claude Code {version} at {path} cannot run a bridged pass: the permission bridge needs --permission-prompts and --permission-prompt-tool, available from Claude Code {minimum} (the lowest verified version); upgrade Claude Code to at least {minimum}"
+    )]
+    HarnessUnsupported {
+        role: &'static str,
+        version: String,
+        path: PathBuf,
+        minimum: crate::permission_bridge::HarnessVersion,
+    },
 }
 
 impl PassError {
@@ -187,8 +197,9 @@ impl PassError {
         match self {
             Self::Failed { code, .. } => *code,
             Self::LeaseHeld(_) => 0,
-            Self::Disarmed(_) => DISARMED_EXIT_CODE,
+            Self::Disarmed(_) => CONFIG_REFUSAL_EXIT_CODE,
             Self::BudgetHeld(_) => BUDGET_HELD_EXIT_CODE,
+            Self::HarnessUnsupported { .. } => CONFIG_REFUSAL_EXIT_CODE,
         }
     }
 
@@ -197,6 +208,15 @@ impl PassError {
             role: role.name(),
             message: message.into(),
             code,
+        }
+    }
+
+    fn harness_unsupported(role: PassRole, path: &Path, version: impl Into<String>) -> Self {
+        Self::HarnessUnsupported {
+            role: role.name(),
+            version: version.into(),
+            path: path.to_owned(),
+            minimum: crate::permission_bridge::MIN_BRIDGE_HARNESS_VERSION,
         }
     }
 }
@@ -448,6 +468,91 @@ fn resolve_derived_settings(
 }
 
 pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
+    run_pass_with_bridge_probe_timeout(request, BRIDGE_HARNESS_PROBE_TIMEOUT)
+}
+
+fn probe_bridge_harness_version(
+    claude_bin: &Path,
+    timeout: Duration,
+) -> Result<crate::permission_bridge::HarnessVersion, String> {
+    let mut stdout = tempfile::tempfile()
+        .map_err(|error| format!("version stdout could not be captured: {error}"))?;
+    let mut stderr = tempfile::tempfile()
+        .map_err(|error| format!("version stderr could not be captured: {error}"))?;
+    let child_stdout = stdout
+        .try_clone()
+        .map_err(|error| format!("version stdout could not be captured: {error}"))?;
+    let child_stderr = stderr
+        .try_clone()
+        .map_err(|error| format!("version stderr could not be captured: {error}"))?;
+    let mut child = Command::new(claude_bin)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(child_stdout))
+        .stderr(Stdio::from(child_stderr))
+        .spawn()
+        .map_err(|error| format!("version probe could not start: {error}"))?;
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("version probe could not be waited for: {error}"));
+            }
+        }
+        if started.elapsed() >= timeout {
+            // This probe is not an agent session and gets no process group. Kill
+            // exactly the child PID so the ten-second compatibility check cannot
+            // turn into an unbounded pre-launch wait (ostrom#587).
+            let kill_result = child.kill();
+            let _ = child.wait();
+            return Err(kill_result.map_or_else(
+                |error| {
+                    format!(
+                        "version probe timed out after {} ms and could not be killed: {error}",
+                        timeout.as_millis()
+                    )
+                },
+                |()| format!("version probe timed out after {} ms", timeout.as_millis()),
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+
+    let mut stdout_bytes = Vec::new();
+    stdout
+        .seek(SeekFrom::Start(0))
+        .and_then(|_| stdout.read_to_end(&mut stdout_bytes))
+        .map_err(|error| format!("version stdout could not be read: {error}"))?;
+    let mut stderr_bytes = Vec::new();
+    stderr
+        .seek(SeekFrom::Start(0))
+        .and_then(|_| stderr.read_to_end(&mut stderr_bytes))
+        .map_err(|error| format!("version stderr could not be read: {error}"))?;
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr_bytes);
+        let detail = stderr.lines().next().unwrap_or_default().trim();
+        return Err(if detail.is_empty() {
+            format!("version probe exited {status}")
+        } else {
+            format!("version probe exited {status}: {detail}")
+        });
+    }
+    let stdout = String::from_utf8(stdout_bytes)
+        .map_err(|_| "version stdout was not valid UTF-8".to_owned())?;
+    crate::permission_bridge::parse_harness_version(&stdout).map_err(|error| {
+        let first_line = stdout.lines().next().unwrap_or_default();
+        format!("version output could not be parsed ({error}): {first_line:?}")
+    })
+}
+
+fn run_pass_with_bridge_probe_timeout(
+    request: &PassRequest,
+    bridge_probe_timeout: Duration,
+) -> Result<(), PassError> {
     let mut events = RunEventGuard::start(
         &request.paths,
         request.events_fd,
@@ -688,6 +793,31 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
             format!("{} is not marked executable", request.claude_bin.display()),
             1,
         ));
+    }
+    if guard.permission_bridge.is_some() {
+        let probe = probe_bridge_harness_version(&request.claude_bin, bridge_probe_timeout);
+        let refusal = match probe {
+            Ok(version) if version < crate::permission_bridge::MIN_BRIDGE_HARNESS_VERSION => {
+                Some(PassError::harness_unsupported(
+                    request.role,
+                    &request.claude_bin,
+                    version.to_string(),
+                ))
+            }
+            Ok(_) => None,
+            Err(reason) => Some(PassError::harness_unsupported(
+                request.role,
+                &request.claude_bin,
+                format!("version could not be established ({reason})"),
+            )),
+        };
+        if let Some(error) = refusal {
+            guard.outcome = Some("no-op".to_owned());
+            guard.reason = Some("harness-unsupported".to_owned());
+            guard.cost_usd = Some(0.0);
+            guard.finish()?;
+            return Err(error);
+        }
     }
     let spent = daily_spend(&request.paths, &request.clock.date());
     let cap = daily_cap();
@@ -1970,19 +2100,19 @@ mod terminal_outcome_tests {
 
 #[cfg(test)]
 mod exit_code_tests {
-    use super::{BUDGET_HELD_EXIT_CODE, DISARMED_EXIT_CODE, PassError};
+    use super::{BUDGET_HELD_EXIT_CODE, CONFIG_REFUSAL_EXIT_CODE, PassError};
 
     #[test]
     fn budget_held_disarmed_and_lease_held_have_distinct_exit_codes() {
         assert_eq!(BUDGET_HELD_EXIT_CODE, 75);
-        assert_eq!(DISARMED_EXIT_CODE, 78);
+        assert_eq!(CONFIG_REFUSAL_EXIT_CODE, 78);
         assert_eq!(
             PassError::BudgetHeld("builder").exit_code(),
             BUDGET_HELD_EXIT_CODE
         );
         assert_eq!(
             PassError::Disarmed("builder").exit_code(),
-            DISARMED_EXIT_CODE
+            CONFIG_REFUSAL_EXIT_CODE
         );
         assert_eq!(PassError::LeaseHeld("builder").exit_code(), 0);
     }
@@ -2061,14 +2191,18 @@ mod resolve_derived_settings_tests {
 
 #[cfg(all(test, unix))]
 mod platform_fallback_pass_tests {
-    // The pass-level counterpart to `resolve_derived_settings_tests`: the same
-    // injection (`PassRequest::platform`), run through the whole pass so the
-    // real `Command` this pass spawns is asserted on, not a stand-in for it.
-    use std::{fs, os::unix::fs::PermissionsExt};
+    // These pass-level tests run the real bridge/fallback decision and the real
+    // `Command` construction against a stub. Only the ten-second production
+    // timeout has a seam; timeout coverage injects a shorter value.
+    use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, time::Duration};
 
     use umwelt_runtime::{FileSink, Source};
 
-    use super::{Clock, OstromPaths, PassRequest, PassRole, run_pass};
+    use super::{
+        CONFIG_REFUSAL_EXIT_CODE, Clock, OstromPaths, PassError, PassRequest, PassRole, run_pass,
+        run_pass_with_bridge_probe_timeout,
+    };
+    use crate::{permission_bridge::MIN_BRIDGE_HARNESS_VERSION, read_trace};
 
     const CLAUDE_STREAM_JSON: &str = concat!(
         "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"fallback-fixture\",\"model\":\"claude-fixture\"}\n",
@@ -2078,51 +2212,210 @@ mod platform_fallback_pass_tests {
         "\"usage\":{\"input_tokens\":10,\"output_tokens\":5,\"cache_read_input_tokens\":2,\"cache_creation_input_tokens\":3}}\n"
     );
 
+    const DERIVED: &str =
+        r#"{"permissions":{"defaultMode":"dontAsk","allow":["Bash(ostrom deploy *)"]}}"#;
+
+    struct HarnessFixture {
+        root: tempfile::TempDir,
+        paths: OstromPaths,
+        claude_bin: PathBuf,
+        argv_file: PathBuf,
+        calls_file: PathBuf,
+    }
+
+    impl HarnessFixture {
+        fn new(version_case: &str) -> Self {
+            let root = tempfile::tempdir().expect("temporary pass fixture");
+            let paths = OstromPaths {
+                config: root.path().to_path_buf(),
+                state: root.path().to_path_buf(),
+            };
+            fs::write(paths.state.join("loop-armed"), "").expect("arm pass");
+            let argv_file = root.path().join("argv.txt");
+            let calls_file = root.path().join("calls.txt");
+            let claude_bin = root.path().join("claude-stub");
+            fs::write(
+                &claude_bin,
+                format!(
+                    "#!/usr/bin/env bash\nprintf '%s\\n' \"$1\" >> '{}'\nif [[ \"$1\" == \"--version\" ]]; then\n{version_case}\nfi\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s' '{CLAUDE_STREAM_JSON}'\n",
+                    calls_file.display(),
+                    argv_file.display(),
+                ),
+            )
+            .expect("write claude stub");
+            fs::set_permissions(&claude_bin, fs::Permissions::from_mode(0o755))
+                .expect("chmod stub");
+            Self {
+                root,
+                paths,
+                claude_bin,
+                argv_file,
+                calls_file,
+            }
+        }
+
+        fn request(&self, platform: &'static str) -> PassRequest {
+            PassRequest {
+                paths: self.paths.clone(),
+                working_directory: self.root.path().to_path_buf(),
+                role: PassRole::Builder,
+                prompt: "ostrom#587 harness floor fixture".to_owned(),
+                permission_mode: PassRole::Builder.default_permission_mode(),
+                derived_settings: Some(DERIVED.to_owned()),
+                claude_bin: self.claude_bin.clone(),
+                signals: Default::default(),
+                supervisor_pid: None,
+                events_fd: None,
+                control_fd: None,
+                facts_only: false,
+                caps: Default::default(),
+                clock: Clock::default(),
+                platform,
+            }
+        }
+
+        fn argv(&self) -> String {
+            fs::read_to_string(&self.argv_file).expect("read captured agent argv")
+        }
+
+        fn calls(&self) -> String {
+            fs::read_to_string(&self.calls_file).expect("read captured harness calls")
+        }
+    }
+
+    fn successful_version(version: impl std::fmt::Display) -> String {
+        format!("printf '%s\\n' '{version} (Claude Code)'\nexit 0")
+    }
+
+    fn assert_harness_refusal(fixture: &HarnessFixture, timeout: Duration) -> PassError {
+        let error = run_pass_with_bridge_probe_timeout(&fixture.request("linux"), timeout)
+            .expect_err("the bridged pass must refuse this harness");
+        assert_eq!(error.exit_code(), CONFIG_REFUSAL_EXIT_CODE);
+        assert!(
+            matches!(&error, PassError::HarnessUnsupported { .. }),
+            "the refusal must keep its dedicated type: {error:?}"
+        );
+        assert!(
+            !fixture.argv_file.exists(),
+            "the stub received an agent invocation: {}",
+            fixture.argv()
+        );
+        error
+    }
+
     #[test]
-    fn a_policy_adopted_pass_survives_a_platform_with_no_bridge() {
-        let root = tempfile::tempdir().expect("temporary pass fixture");
-        let paths = OstromPaths {
-            config: root.path().to_path_buf(),
-            state: root.path().to_path_buf(),
-        };
-        fs::write(paths.state.join("loop-armed"), "").expect("arm pass");
-        let argv_file = root.path().join("argv.txt");
-        let claude_bin = root.path().join("claude-stub");
-        fs::write(
-            &claude_bin,
-            format!(
-                "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > {}\nprintf '%s' '{CLAUDE_STREAM_JSON}'\n",
-                argv_file.display()
-            ),
-        )
-        .expect("write claude stub");
-        fs::set_permissions(&claude_bin, fs::Permissions::from_mode(0o755)).expect("chmod stub");
+    fn bridged_pass_refuses_a_version_below_the_lowest_verified_version() {
+        let fixture = HarnessFixture::new(&successful_version("2.1.238"));
+        let error = assert_harness_refusal(&fixture, Duration::from_secs(1));
+        let message = error.to_string();
+        assert!(message.contains("2.1.238"), "{message}");
+        assert!(
+            message.contains(&MIN_BRIDGE_HARNESS_VERSION.to_string()),
+            "{message}"
+        );
+        let harness_path = fixture.claude_bin.to_string_lossy();
+        assert!(message.contains(harness_path.as_ref()), "{message}");
+        assert!(message.contains("--permission-prompts"), "{message}");
+        assert!(message.contains("--permission-prompt-tool"), "{message}");
+        assert!(
+            message.contains("upgrade Claude Code to at least"),
+            "{message}"
+        );
+        assert_eq!(fixture.calls(), "--version\n");
 
-        let derived =
-            r#"{"permissions":{"defaultMode":"dontAsk","allow":["Bash(ostrom deploy *)"]}}"#;
-        let request = PassRequest {
-            paths: paths.clone(),
-            working_directory: root.path().to_path_buf(),
-            role: PassRole::Builder,
-            prompt: "ostrom#544 fallback fixture".to_owned(),
-            permission_mode: PassRole::Builder.default_permission_mode(),
-            derived_settings: Some(derived.to_owned()),
-            claude_bin,
-            signals: Default::default(),
-            supervisor_pid: None,
-            events_fd: None,
-            control_fd: None,
-            facts_only: false,
-            caps: Default::default(),
-            clock: Clock::default(),
-            // Injected, not the host running this test (ostrom#544): CI runs
-            // this on Linux, where the real bridge would otherwise succeed
-            // and this test would exercise nothing.
-            platform: "windows",
-        };
+        let trace = read_trace(&fixture.paths.trace_file()).expect("read pass trace");
+        let terminal = trace
+            .rows
+            .into_iter()
+            .filter_map(Result::ok)
+            .find(|row| row.kind == "pass-ended")
+            .expect("the refusal records pass-ended");
+        assert_eq!(terminal.fact["outcome"], "no-op");
+        assert_eq!(terminal.fact["reason"], "harness-unsupported");
+
+        let run_id = fs::read_dir(fixture.paths.runs_dir())
+            .expect("read run records")
+            .next()
+            .expect("one run record")
+            .expect("read run entry")
+            .file_name()
+            .into_string()
+            .expect("UTF-8 run id");
+        let events = FileSink::new(fixture.paths.runs_dir())
+            .read_from(&run_id, 0)
+            .expect("read durable events");
+        assert!(
+            events
+                .iter()
+                .all(|event| !event.event_type.starts_with("agent.")),
+            "a refused pass must not emit agent events: {events:?}"
+        );
+        assert_eq!(events.last().unwrap().payload["outcome"], "no-op");
+        assert_eq!(
+            events.last().unwrap().payload["reason"],
+            "harness-unsupported"
+        );
+    }
+
+    #[test]
+    fn bridged_pass_accepts_the_lowest_verified_version_and_adds_bridge_flags() {
+        let fixture = HarnessFixture::new(&successful_version(MIN_BRIDGE_HARNESS_VERSION));
+        run_pass(&fixture.request("linux"))
+            .expect("the lowest verified version must pass the bridge floor");
+        assert_eq!(fixture.calls(), "--version\n--print\n");
+        assert!(
+            fixture
+                .argv()
+                .lines()
+                .any(|arg| arg == "--permission-prompts"),
+            "the accepted pass did not receive bridge flags"
+        );
+    }
+
+    #[test]
+    fn bridged_pass_refuses_garbage_version_output() {
+        let fixture = HarnessFixture::new("printf '%s\\n' 'not a version'\nexit 0");
+        let error = assert_harness_refusal(&fixture, Duration::from_secs(1));
+        assert!(error.to_string().contains("could not be parsed"));
+    }
+
+    #[test]
+    fn bridged_pass_refuses_a_nonzero_version_probe() {
+        let fixture = HarnessFixture::new("printf '%s\\n' 'probe failed' >&2\nexit 17");
+        let error = assert_harness_refusal(&fixture, Duration::from_secs(1));
+        let message = error.to_string();
+        assert!(message.contains("exited"), "{message}");
+        assert!(message.contains("probe failed"), "{message}");
+    }
+
+    #[test]
+    fn bridged_pass_refuses_a_version_probe_that_cannot_spawn() {
+        let fixture = HarnessFixture::new(&successful_version(MIN_BRIDGE_HARNESS_VERSION));
+        fs::write(&fixture.claude_bin, "not an executable format")
+            .expect("replace stub with invalid executable");
+        let error = assert_harness_refusal(&fixture, Duration::from_secs(1));
+        assert!(error.to_string().contains("could not start"));
+    }
+
+    #[test]
+    fn bridged_pass_refuses_a_version_probe_timeout() {
+        let fixture = HarnessFixture::new("while :; do :; done");
+        let error = assert_harness_refusal(&fixture, Duration::from_millis(30));
+        assert!(error.to_string().contains("timed out"));
+    }
+
+    #[test]
+    fn fallback_pass_launches_the_same_old_harness_without_a_version_probe() {
+        let fixture = HarnessFixture::new(&successful_version("2.1.238"));
+        let request = fixture.request("windows");
         run_pass(&request).expect("a platform with no bridge must not fail the pass");
+        assert_eq!(
+            fixture.calls(),
+            "--print\n",
+            "a fallback pass must not run the version probe"
+        );
 
-        let argv = fs::read_to_string(&argv_file).expect("read captured argv");
+        let argv = fixture.argv();
         for flag in [
             "--mcp-config",
             "--strict-mcp-config",
@@ -2141,22 +2434,23 @@ mod platform_fallback_pass_tests {
             .expect("--settings must still be passed");
         let settings_path = std::path::PathBuf::from(lines[settings_index + 1]);
         assert!(
-            settings_path.starts_with(paths.runs_dir()),
+            settings_path.starts_with(fixture.paths.runs_dir()),
             "fallback settings must live under the run directory: {settings_path:?}"
         );
         assert_eq!(
             fs::read_to_string(&settings_path).expect("read fallback settings"),
-            derived
+            DERIVED
         );
         assert!(
-            !paths
+            !fixture
+                .paths
                 .state
                 .join("roles/builder.derived.settings.json")
                 .exists(),
             "a fallback pass must never write the shared derived settings file"
         );
 
-        let run_entries: Vec<_> = fs::read_dir(paths.runs_dir())
+        let run_entries: Vec<_> = fs::read_dir(fixture.paths.runs_dir())
             .expect("read runs directory")
             .map(|entry| entry.expect("run directory entry"))
             .collect();
@@ -2169,7 +2463,7 @@ mod platform_fallback_pass_tests {
             .file_name()
             .into_string()
             .expect("run id is valid UTF-8");
-        let events = FileSink::new(paths.runs_dir())
+        let events = FileSink::new(fixture.paths.runs_dir())
             .read_from(&run_id, 0)
             .expect("read durable events");
         // ostrom#546: `run_pass` is invoked as a one-off dispatch, never a

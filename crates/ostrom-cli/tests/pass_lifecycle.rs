@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use ostrom_store::permission_bridge::MIN_BRIDGE_HARNESS_VERSION;
 use serde_json::{Value, json};
 
 mod support;
@@ -56,7 +57,13 @@ impl Fixture {
         fs::write(state.join("builder-pass-id"), "a1b2c3d4\n").expect("write id");
         fs::write(state.join("builder-wake-counter"), "6\n").expect("write wake");
         let claude = root.path().join("claude-stub");
-        fs::write(&claude, format!("#!/usr/bin/env bash\n{script}\n")).expect("write stub");
+        fs::write(
+            &claude,
+            format!(
+                "#!/usr/bin/env bash\nif [[ \"$1\" == \"--version\" ]]; then\n  printf '%s\\n' '{MIN_BRIDGE_HARNESS_VERSION} (Claude Code)'\n  exit 0\nfi\n{script}\n"
+            ),
+        )
+        .expect("write stub");
         fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).expect("chmod stub");
         Self {
             root,
@@ -2609,7 +2616,9 @@ fn permission_channel_is_removed_when_harness_cannot_spawn() {
     let keys = bridge_policy(&fixture);
     fs::write(
         &fixture.claude,
-        "#!/missing-permission-harness-interpreter\n",
+        format!(
+            "#!/usr/bin/env bash\nif [[ \"$1\" == \"--version\" ]]; then\n  rm -- \"$0\"\n  printf '%s\\n' '{MIN_BRIDGE_HARNESS_VERSION} (Claude Code)'\n  exit 0\nfi\n"
+        ),
     )
     .unwrap();
     let output = fixture
