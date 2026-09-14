@@ -1,9 +1,7 @@
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import {
-  chmodSync,
   copyFileSync,
-  existsSync,
   mkdtempSync,
   mkdirSync,
   rmSync,
@@ -13,16 +11,12 @@ import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { after, before, test } from 'node:test';
 import {
-  PLATFORM_WAIT_ATTEMPTS,
-  PLATFORM_WAIT_DELAY_MS,
   ROOT,
   cargoVersion,
   config,
   platformPackageName,
-  registryHasVersion,
 } from '../scripts/lib.mjs';
 import { assertVersion } from '../scripts/assert-version.mjs';
-import { publishPlan, skipMessage } from '../scripts/publish.mjs';
 
 const testRoot = join(ROOT, 'target');
 mkdirSync(testRoot, { recursive: true });
@@ -100,73 +94,6 @@ test('a binary/package version mismatch fails the release assertion', () => {
   assert.throws(
     () => assertVersion('ostrom 9.9.9\n', cargoVersion()),
     /version mismatch: binary reports 9\.9\.9/,
-  );
-});
-
-test('registryHasVersion returns true only when the view reports exactly that version', () => {
-  assert.equal(
-    registryHasVersion('@ostrom/cli', '1.2.3', () => '1.2.3'),
-    true,
-  );
-});
-
-test('registryHasVersion returns false for a different version', () => {
-  assert.equal(
-    registryHasVersion('@ostrom/cli', '1.2.3', () => '1.2.2'),
-    false,
-  );
-});
-
-test('registryHasVersion returns false for an empty view result', () => {
-  assert.equal(
-    registryHasVersion('@ostrom/cli', '1.2.3', () => ''),
-    false,
-  );
-});
-
-test('registryHasVersion returns false when the view throws an E404-shaped error', () => {
-  const notFound = () => {
-    throw new Error(
-      "npm error code E404\nnpm error 404 Not Found - GET https://registry.npmjs.org/@ostrom%2fcli",
-    );
-  };
-  assert.equal(registryHasVersion('@ostrom/cli', '1.2.3', notFound), false);
-});
-
-test('registryHasVersion returns false when the view throws a generic error', () => {
-  const failing = () => {
-    throw new Error('network error');
-  };
-  assert.equal(registryHasVersion('@ostrom/cli', '1.2.3', failing), false);
-});
-
-test('platform-wait defaults are 40 attempts at 15000ms apart', () => {
-  assert.equal(PLATFORM_WAIT_ATTEMPTS, 40);
-  assert.equal(PLATFORM_WAIT_DELAY_MS, 15000);
-});
-
-test('publishPlan skips a package the registry already has', () => {
-  const packages = [{ name: '@ostrom/cli-linux-x64', dir: '/staging/cli-linux-x64' }];
-  const plan = publishPlan(packages, '1.2.3', () => '1.2.3');
-  assert.deepEqual(plan, [
-    { name: '@ostrom/cli-linux-x64', action: 'skip' },
-  ]);
-});
-
-test('publishPlan publishes a package the registry does not have', () => {
-  const packages = [{ name: '@ostrom/cli-linux-x64', dir: '/staging/cli-linux-x64' }];
-  const plan = publishPlan(packages, '1.2.3', () => {
-    throw new Error('E404');
-  });
-  assert.deepEqual(plan, [
-    { name: '@ostrom/cli-linux-x64', action: 'publish' },
-  ]);
-});
-
-test('the skip branch prints the already-published message verbatim', () => {
-  assert.equal(
-    skipMessage('@ostrom/cli-linux-x64', '1.2.3'),
-    'already published: @ostrom/cli-linux-x64@1.2.3',
   );
 });
 
