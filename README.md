@@ -365,9 +365,11 @@ any record:
 | 129, 130, 143 | ended by `SIGHUP`, `SIGINT` (including an interrupt on the control descriptor), or `SIGTERM` |
 | any other non-zero | the agent process's own exit status, passed through |
 
-No two refusals share a status, so a consumer that reads only the exit status
-can still tell them apart. The `pass-ended` fact and `run.finished` carry the
-outcome and reason.
+No two refusals that call for different action share a status, so a consumer
+that reads only the exit status can still act correctly. A lease held by
+another pass exits 0 on purpose: that invocation has nothing to do, and
+nothing is wrong. The `pass-ended` fact and `run.finished` carry the outcome
+and reason.
 
 ### Answering a decision
 
