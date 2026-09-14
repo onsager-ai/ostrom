@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use ostrom_store::permission_bridge::MIN_BRIDGE_HARNESS_VERSION;
 use serde_json::{Value, json};
 
 mod support;
@@ -56,7 +57,13 @@ impl Fixture {
         fs::write(state.join("builder-pass-id"), "a1b2c3d4\n").expect("write id");
         fs::write(state.join("builder-wake-counter"), "6\n").expect("write wake");
         let claude = root.path().join("claude-stub");
-        fs::write(&claude, format!("#!/usr/bin/env bash\n{script}\n")).expect("write stub");
+        fs::write(
+            &claude,
+            format!(
+                "#!/usr/bin/env bash\nif [[ \"$1\" == \"--version\" ]]; then\n  printf '%s\\n' '{MIN_BRIDGE_HARNESS_VERSION} (Claude Code)'\n  exit 0\nfi\n{script}\n"
+            ),
+        )
+        .expect("write stub");
         fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).expect("chmod stub");
         Self {
             root,
@@ -1367,6 +1374,35 @@ fn a_recorded_failure_exits_nonzero_even_though_the_agent_process_exited_zero() 
     fixture.assert_released();
 }
 
+/// ostrom#587 gave `unstarted` its own arm in `event_outcome`. Before that, an
+/// unrecognised `unstarted` fell to the `Failed` catch-all, and so exited
+/// non-zero through the check the test above pins. Unless that check is widened
+/// too, the new arm turns a recorded `unstarted` from a run that did start into
+/// a silent exit 0.
+#[test]
+fn a_recorded_unstarted_outcome_exits_nonzero_even_though_the_agent_process_exited_zero() {
+    let fixture = Fixture::new(concat!(
+        "printf '%s\\n' '{\"ts\":\"2026-08-01T00:00:00Z\",\"kind\":\"pass-started\",\"fact\":{\"owner\":\"builder-inner-wake1\"},\"narration\":{}}' >>\"$OSTROM_HOME/sprint.jsonl\"\n",
+        "printf '%s\\n' '{\"ts\":\"2026-08-01T00:00:01Z\",\"kind\":\"pass-ended\",\"fact\":{\"owner\":\"builder-inner-wake1\",\"outcome\":\"unstarted\"},\"narration\":{}}' >>\"$OSTROM_HOME/sprint.jsonl\""
+    ));
+
+    let output = fixture.command().output().expect("run pass");
+
+    assert!(
+        !output.status.success(),
+        "a pass recorded as unstarted must not exit 0: {output:?}"
+    );
+    assert_ne!(output.status.code(), Some(0));
+    let events = fixture.run_events();
+    let finished = events
+        .iter()
+        .filter(|event| event["type"] == "run.finished")
+        .collect::<Vec<_>>();
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0]["payload"]["outcome"], "unstarted");
+    fixture.assert_released();
+}
+
 #[test]
 fn sigterm_releases_finalizes_and_kills_the_process_group() {
     let fixture = Fixture::new(concat!(
@@ -2609,7 +2645,9 @@ fn permission_channel_is_removed_when_harness_cannot_spawn() {
     let keys = bridge_policy(&fixture);
     fs::write(
         &fixture.claude,
-        "#!/missing-permission-harness-interpreter\n",
+        format!(
+            "#!/usr/bin/env bash\nif [[ \"$1\" == \"--version\" ]]; then\n  rm -- \"$0\"\n  printf '%s\\n' '{MIN_BRIDGE_HARNESS_VERSION} (Claude Code)'\n  exit 0\nfi\n"
+        ),
     )
     .unwrap();
     let output = fixture

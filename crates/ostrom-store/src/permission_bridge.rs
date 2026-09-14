@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fmt,
     fs::{self, File},
     io::{self, BufRead, Read, Write},
     path::{Path, PathBuf},
@@ -34,6 +35,88 @@ const MCP_SERVER: &str = "ostrom_permission";
 const MCP_TOOL: &str = "approve";
 const POLL: Duration = Duration::from_millis(10);
 const MAX_TRANSPORT_BYTES: u64 = 1_048_576;
+
+/// A numerically comparable Claude Code version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct HarnessVersion {
+    major: u64,
+    minor: u64,
+    patch: u64,
+}
+
+impl HarnessVersion {
+    #[must_use]
+    pub const fn new(major: u64, minor: u64, patch: u64) -> Self {
+        Self {
+            major,
+            minor,
+            patch,
+        }
+    }
+}
+
+impl fmt::Display for HarnessVersion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+/// The lowest Claude Code version verified to accept the permission bridge
+/// flags. Claude Code 2.1.238 rejects `--permission-prompts` and
+/// `--permission-prompt-tool`; 2.1.265, 2.1.267, and 2.1.270 accept them.
+/// Versions between 2.1.238 and this floor were not measured (ostrom#587).
+pub const MIN_BRIDGE_HARNESS_VERSION: HarnessVersion = HarnessVersion::new(2, 1, 265);
+
+/// The `reason` a pass records when it refuses to launch a bridged run on a
+/// harness below [`MIN_BRIDGE_HARNESS_VERSION`]. It has one definition, shared
+/// by the pass that records it and by `doctor`, which reports it (ostrom#587).
+pub const HARNESS_UNSUPPORTED_REASON: &str = "harness-unsupported";
+
+fn parse_version_component(
+    component: Option<&str>,
+    missing: &'static str,
+    invalid: &'static str,
+) -> Result<u64, &'static str> {
+    let component = component.ok_or(missing)?;
+    if component.is_empty() || !component.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid);
+    }
+    component.parse().map_err(|_| invalid)
+}
+
+/// Parse the leading `MAJOR.MINOR.PATCH` from the first line of
+/// `claude --version` stdout. A version that cannot be established exactly is
+/// a refusal, so this deliberately accepts neither prefixes nor partial forms.
+pub fn parse_harness_version(stdout: &str) -> Result<HarnessVersion, &'static str> {
+    let first_line = stdout.lines().next().ok_or("version output was empty")?;
+    let leading = first_line
+        .split_ascii_whitespace()
+        .next()
+        .ok_or("the first line was empty")?;
+    if !first_line.starts_with(leading) {
+        return Err("the first line does not start with a version");
+    }
+    let mut components = leading.split('.');
+    let major = parse_version_component(
+        components.next(),
+        "the version has no major component",
+        "the major version is not numeric",
+    )?;
+    let minor = parse_version_component(
+        components.next(),
+        "the version has no minor component",
+        "the minor version is not numeric",
+    )?;
+    let patch = parse_version_component(
+        components.next(),
+        "the version has no patch component",
+        "the patch version is not numeric",
+    )?;
+    if components.next().is_some() {
+        return Err("the version has more than three components");
+    }
+    Ok(HarnessVersion::new(major, minor, patch))
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -865,6 +948,48 @@ pub fn serve_stdio(
         serde_json::to_writer(&mut output, &response)?;
         output.write_all(b"\n")?;
         output.flush()?;
+    }
+}
+
+#[cfg(test)]
+mod harness_version_tests {
+    use super::{HarnessVersion, MIN_BRIDGE_HARNESS_VERSION, parse_harness_version};
+
+    #[test]
+    fn parses_verified_claude_code_versions() {
+        assert_eq!(
+            parse_harness_version("2.1.270 (Claude Code)\n"),
+            Ok(HarnessVersion::new(2, 1, 270))
+        );
+        assert_eq!(
+            parse_harness_version(&format!("{MIN_BRIDGE_HARNESS_VERSION} (Claude Code)\n")),
+            Ok(MIN_BRIDGE_HARNESS_VERSION)
+        );
+    }
+
+    #[test]
+    fn orders_each_version_component_numerically() {
+        assert!(HarnessVersion::new(2, 1, 265) < HarnessVersion::new(2, 1, 270));
+        assert!(HarnessVersion::new(2, 1, 99) < HarnessVersion::new(2, 1, 265));
+        assert!(HarnessVersion::new(2, 2, 0) > HarnessVersion::new(2, 1, 999));
+        assert!(HarnessVersion::new(3, 0, 0) > HarnessVersion::new(2, 9, 9));
+    }
+
+    #[test]
+    fn refuses_versions_that_cannot_be_read_exactly() {
+        for output in [
+            "2.1\n",
+            "v2.1.265\n",
+            "",
+            "x.y.z\n",
+            " 2.1.265\n",
+            "+2.1.265\n",
+        ] {
+            assert!(
+                parse_harness_version(output).is_err(),
+                "unreadable output was accepted: {output:?}"
+            );
+        }
     }
 }
 
