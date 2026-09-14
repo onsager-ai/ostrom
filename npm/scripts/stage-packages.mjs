@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import {
   chmodSync,
   copyFileSync,
@@ -17,6 +18,7 @@ import {
   config,
   mainPackageName,
   platformPackageName,
+  requireGitHead,
   requireSafeOutputPath,
   sourcePlatformDir,
 } from './lib.mjs';
@@ -30,6 +32,28 @@ const outputRoot = requireSafeOutputPath(
   resolve(ROOT, argValue(args, '--output', config.stagingDir)),
 );
 const version = argValue(args, '--version', cargoVersion());
+
+// Identity travels with the bytes. This is written into every staged
+// package.json (platform packages and the launcher) so publish.mjs and
+// wait-for-platforms.mjs can read back "the commit this build is from" from
+// the one place both of them already read: the staged manifest. Publishing
+// from a tarball rather than a directory (see publish.mjs) means npm no
+// longer adds this itself — a tarball packed from a directory carries no
+// gitHead in its package/package.json (measured on this machine) — so it has
+// to be put there explicitly, before pack.sh ever runs.
+function resolveGitHead() {
+  const explicit = argValue(args, '--git-head', undefined);
+  const value =
+    explicit ??
+    process.env.GITHUB_SHA ??
+    execFileSync('git', ['rev-parse', 'HEAD'], {
+      cwd: ROOT,
+      encoding: 'utf8',
+    }).trim();
+  return requireGitHead(value, explicit ? '--git-head' : 'resolved commit');
+}
+
+const gitHead = resolveGitHead();
 
 const headers = {
   linux: [[0x7f, 0x45, 0x4c, 0x46]],
@@ -91,6 +115,7 @@ for (const platform of config.platforms) {
   writeJson(join(packageRoot, 'package.json'), {
     name: packageName,
     version,
+    gitHead,
     description: `Prebuilt Ostrom CLI for ${platform.platform}.`,
     license: 'MIT',
     os: [platform.os],
@@ -120,6 +145,7 @@ chmodSync(join(mainRoot, 'bin.js'), 0o755);
 writeJson(join(mainRoot, 'package.json'), {
   name: mainPackageName(),
   version,
+  gitHead,
   description: 'Ostrom workflow commons command-line interface.',
   license: 'MIT',
   bin: { [config.binaryNames[0]]: 'bin.js' },

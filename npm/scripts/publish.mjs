@@ -6,23 +6,118 @@ import {
   argValue,
   cargoVersion,
   config,
+  decidePublishAction,
+  defaultSleep,
   packageDirs,
-  registryHasVersion,
+  readPackResults,
+  registryState,
+  resolvePublishablePackage,
 } from './lib.mjs';
+import { waitForPackages } from './wait-for-platforms.mjs';
 
-// The publish/skip decision for a batch of packages, kept pure and separate
-// from the execFileSync side effect so it can be unit-tested without
-// spawning npm. Never called in --dry-run mode: dry runs stay offline and
-// always publish.
-export function publishPlan(packages, version, view) {
-  return packages.map((pkg) => ({
-    name: pkg.name,
-    action: registryHasVersion(pkg.name, version, view) ? 'skip' : 'publish',
-  }));
+// How long to keep re-reading the registry after `npm publish` itself
+// reports failure, before believing that failure. npm's own exit code is not
+// trustworthy at the boundary this task exists to fix — a publish call can
+// fail its HTTP round trip while the registry still accepts and later serves
+// the bytes (see lib.mjs's registryState comment). This budget is shorter
+// than wait-for-platforms.mjs's because it only covers a registry catching
+// up with a publish call this process just made, not a cold wait for a
+// sibling job's packages.
+export const PUBLISH_RECOVERY_TIMEOUT_MS = 10 * 60 * 1000;
+
+function runNpmPublish({ tarballPath, tag, dryRun }) {
+  const npmArgs = [
+    'publish',
+    tarballPath,
+    '--access',
+    'public',
+    '--tag',
+    tag,
+    '--provenance',
+  ];
+  if (dryRun) npmArgs.push('--dry-run');
+  execFileSync('npm', npmArgs, { stdio: 'inherit' });
 }
 
-export function skipMessage(name, version) {
-  return `already published: ${name}@${version}`;
+// Publish (or skip, or recover) a single package, kept pure of process.exit
+// and separate from execFileSync so it can be unit-tested without spawning
+// npm or the real registry. `publish` and `state` are injected for tests;
+// production code gets `runNpmPublish` and `registryState`.
+export async function publishPackage({
+  name,
+  version,
+  tarballPath,
+  integrity,
+  gitHead,
+  tag,
+  rebuildOfTag = false,
+  dryRun = false,
+  publish = runNpmPublish,
+  state = registryState,
+  sleep = defaultSleep,
+  now = Date.now,
+  recoveryTimeoutMs = PUBLISH_RECOVERY_TIMEOUT_MS,
+}) {
+  if (dryRun) {
+    console.log(`[dry-run] publishing ${name}@${version}`);
+    publish({ tarballPath, tag, dryRun: true });
+    return { action: 'published' };
+  }
+
+  const current = await state(name, version, { sleep });
+  const decision = decidePublishAction(current, {
+    name,
+    version,
+    integrity,
+    gitHead,
+    rebuildOfTag,
+  });
+  if (decision.action === 'skip') {
+    console.log(decision.message);
+    return decision;
+  }
+
+  console.log(`publishing ${name}@${version} from ${tarballPath}`);
+  try {
+    publish({ tarballPath, tag, dryRun: false });
+    return { action: 'published' };
+  } catch (publishError) {
+    console.error(
+      `npm publish reported a failure for ${name}@${version}; re-reading ` +
+        `the registry before giving up: ${publishError.message}`,
+    );
+    try {
+      await waitForPackages({
+        packages: [{ name, version, integrity }],
+        expected: { gitHead, rebuildOfTag },
+        state,
+        sleep,
+        now,
+        timeoutMs: recoveryTimeoutMs,
+        tag,
+      });
+    } catch (recoveryError) {
+      // A REGISTRY_CONFLICT is the one genuine failure — the registry holds
+      // different bytes than this build produced — and is thrown as-is,
+      // naming both integrities and both commits. Anything else (the
+      // recovery wait timed out, or registryState itself could never
+      // classify the state) means the registry never confirmed this
+      // package, so the original `npm publish` error is not forgotten.
+      if (recoveryError.code === 'REGISTRY_CONFLICT') {
+        throw recoveryError;
+      }
+      throw new Error(
+        `npm publish failed for ${name}@${version} and the registry did ` +
+          `not confirm matching bytes within the recovery window: ` +
+          `${recoveryError.message}. Original npm publish error: ${publishError.message}`,
+      );
+    }
+    console.log(
+      `npm reported a publish failure for ${name}@${version}, but the ` +
+        'registry now holds the right bytes; treating this as success',
+    );
+    return { action: 'published-after-recovery' };
+  }
 }
 
 // Run only when invoked as a script, so tests may import the decision above
@@ -35,11 +130,16 @@ if (
 ) {
   const args = process.argv.slice(2);
   const dryRun = args.includes('--dry-run');
+  const rebuildOfTag = args.includes('--rebuild-of-tag');
   const target = argValue(args, '--target', 'platforms');
   const tag = argValue(args, '--tag', 'latest');
   const stagingRoot = resolve(
     ROOT,
     argValue(args, '--staging', config.stagingDir),
+  );
+  const tarballsRoot = resolve(
+    ROOT,
+    argValue(args, '--tarballs', 'target/npm-tarballs'),
   );
 
   if (!dryRun && config.scope.includes('placeholder')) {
@@ -55,30 +155,22 @@ if (
   });
 
   const version = cargoVersion();
-  const plan = dryRun
-    ? packages.map((pkg) => ({ name: pkg.name, action: 'publish' }))
-    : publishPlan(packages, version);
+  const packResults = readPackResults(tarballsRoot);
 
-  const actions = new Map(plan.map((entry) => [entry.name, entry.action]));
-
-  // Iterating the packages rather than the plan is deliberate: a package the
-  // plan somehow omitted gets published, not silently dropped.
+  // Iterating the staged packages rather than any precomputed plan is
+  // deliberate: a package pack-results.json somehow omitted throws (inside
+  // resolvePublishablePackage) rather than being silently skipped.
   for (const pkg of packages) {
-    if (actions.get(pkg.name) === 'skip') {
-      console.log(skipMessage(pkg.name, version));
-      continue;
-    }
-    const npmArgs = [
-      'publish',
-      pkg.dir,
-      '--access',
-      'public',
-      '--tag',
+    const resolved = resolvePublishablePackage(pkg, packResults, tarballsRoot);
+    await publishPackage({
+      name: pkg.name,
+      version,
+      tarballPath: resolved.tarballPath,
+      integrity: resolved.integrity,
+      gitHead: resolved.gitHead,
       tag,
-      '--provenance',
-    ];
-    if (dryRun) npmArgs.push('--dry-run');
-    console.log(`${dryRun ? '[dry-run] ' : ''}publishing ${pkg.name}`);
-    execFileSync('npm', npmArgs, { stdio: 'inherit' });
+      rebuildOfTag,
+      dryRun,
+    });
   }
 }
