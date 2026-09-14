@@ -384,6 +384,10 @@ fn event_outcome(outcome: &str) -> EventRunOutcome {
         "permission-denied" => EventRunOutcome::PermissionDenied,
         "interrupted" => EventRunOutcome::Interrupted,
         "canceled" => EventRunOutcome::Canceled,
+        // A run whose process never ran, such as ostrom#587's harness refusal.
+        // Without this arm it would fall through to `Failed`, which ethogram
+        // reserves for a process that ran and did not succeed.
+        "unstarted" => EventRunOutcome::Unstarted,
         _ => EventRunOutcome::Failed,
     }
 }
@@ -812,7 +816,14 @@ fn run_pass_with_bridge_probe_timeout(
             )),
         };
         if let Some(error) = refusal {
-            guard.outcome = Some("no-op".to_owned());
+            // `unstarted`, not `no-op`. In ethogram's closed outcome set, `no-op`
+            // says the run went ahead and found nothing to do, and `failed` says
+            // the process ran and did not succeed. Neither is true here:
+            // `run.started` was emitted and the agent was never spawned, which is
+            // exactly what `unstarted` means, with `reason` naming why. A harness
+            // that cannot run the bridge is a broken environment, and it must not
+            // read as a quiet pass to anything folding these records (ostrom#587).
+            guard.outcome = Some("unstarted".to_owned());
             guard.reason = Some("harness-unsupported".to_owned());
             guard.cost_usd = Some(0.0);
             guard.finish()?;
@@ -2099,6 +2110,21 @@ mod terminal_outcome_tests {
 }
 
 #[cfg(test)]
+mod event_outcome_tests {
+    use super::{EventRunOutcome, event_outcome};
+
+    // The wire mapping is a match with a `Failed` catch-all, so an outcome
+    // the fact ledger records but this function forgets goes out as `failed`
+    // without any error. ostrom#587's refusal depends on `unstarted` surviving.
+    #[test]
+    fn an_unstarted_run_reaches_the_wire_as_unstarted_not_failed() {
+        assert_eq!(event_outcome("unstarted"), EventRunOutcome::Unstarted);
+        assert_eq!(event_outcome("no-op"), EventRunOutcome::NoOp);
+        assert_eq!(event_outcome("not-an-outcome"), EventRunOutcome::Failed);
+    }
+}
+
+#[cfg(test)]
 mod exit_code_tests {
     use super::{BUDGET_HELD_EXIT_CODE, CONFIG_REFUSAL_EXIT_CODE, PassError};
 
@@ -2330,7 +2356,7 @@ mod platform_fallback_pass_tests {
             .filter_map(Result::ok)
             .find(|row| row.kind == "pass-ended")
             .expect("the refusal records pass-ended");
-        assert_eq!(terminal.fact["outcome"], "no-op");
+        assert_eq!(terminal.fact["outcome"], "unstarted");
         assert_eq!(terminal.fact["reason"], "harness-unsupported");
 
         let run_id = fs::read_dir(fixture.paths.runs_dir())
@@ -2350,7 +2376,7 @@ mod platform_fallback_pass_tests {
                 .all(|event| !event.event_type.starts_with("agent.")),
             "a refused pass must not emit agent events: {events:?}"
         );
-        assert_eq!(events.last().unwrap().payload["outcome"], "no-op");
+        assert_eq!(events.last().unwrap().payload["outcome"], "unstarted");
         assert_eq!(
             events.last().unwrap().payload["reason"],
             "harness-unsupported"
