@@ -43,3 +43,17 @@
 - **Breaking:** the shipped sweep preset no longer declares `loops.sweep`.
   Builder and gatekeeper passes refresh stale sweep generations before an agent
   session, and the shipped prompts no longer invoke a sweep themselves.
+- **Breaking:** `ostrom loop run` (and the units `ostrom up` generates) now runs
+  a builder or gatekeeper loop whose operation has an `agent/` step as a full
+  loop-bound pass (`__pass-worker --loop`) instead of a bare agent run. Such a
+  loop is now subject to the pass arming check, the pass lease and sweep
+  freshness: a scheduled loop whose state has no `loop-armed` marker exits 78
+  and records a failure on every slot after upgrading. Arm it before upgrading.
+- A loop-bound gatekeeper judges only the pull requests in its pass's sweep
+  generation, filtered to the effective repository set, instead of enumerating
+  live open pull requests. A pull request opened after that generation waits
+  for the next fresh generation, up to `sweep.max_age` (30 minutes by default).
+- `ostrom plan` reuses a fresh sweep generation instead of always sweeping, and
+  reports `swept` and `generation_id`.
+- A manual `ostrom sweep` exits non-zero while another sweep holds the sweep
+  lease (#599 tracks a distinct, retryable status).
