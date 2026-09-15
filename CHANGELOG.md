@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+## 0.15.0 (2026-09-15)
+
+- Implementer dispatch gains a `process` backend, selected explicitly with
+  `MANDATE_DISPATCH_BACKEND=process`, for environments without a user service
+  manager (#590, #594). The implementer runs in its own session and process
+  group and outlives the dispatching pass. It starts with a cleared environment
+  plus an explicit allowlist, including proxy variables when set, and writes a
+  private per-item log that is removed when its worktree is reclaimed. Its
+  lease records process identity, and liveness is read from procfs alone: a
+  dead, zombie or recycled implementer is reclaimed, and an unreadable process
+  entry falls back to the lease TTL rather than being treated as dead.
+  Implementers still inherit the dispatcher's descriptors that lack
+  close-on-exec (#595).
+- Loop-bound passes take `--loop <name>` and resolve their effective repository
+  set from the verified manifest. The operator may supply the available set
+  with `OSTROM_AVAILABLE_REPOSITORIES`; without it, the set is the repositories
+  the policy and mandates name. Sweep always covers the whole available set.
+  Work selection, dispatch and `ostrom gate` refuse repositories outside the
+  effective set (#591).
 - Loop wakes now fail before work when their effective repository set is empty,
   while gatekeeper wakes with a non-empty scope and no snapshot candidates end
   successfully without starting an agent session.
