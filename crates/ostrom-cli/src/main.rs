@@ -35,15 +35,16 @@ use ostrom_store::{
     QueueDecision, ReapWorktreesOptions, ReplayOptions, RunOutcome, RunRequest, SelectAction,
     SelectError, SelectOutcome, SelectRequest, SignalFlags, SweepError, SweepMode, SweepOptions,
     TraceAppend, TraceView, UnavailableAssessmentDeriver, acquire_lease, answer_queue_decision,
-    append_trace_checked, audit, available_repositories, branch_name, clear_work_order,
-    create_work_order, credential_output, decide_queue_item, effective_repositories,
-    encode_org_snapshots_with_faults, encode_selection, environment, finalize_exited_implementer,
-    grant_excuse, grant_excuse_at_head, inherited_repository_scope, item_hash, lease_status,
-    lint_queue_state, list_excuses, list_queue_json, load_config_or_defaults, local_drift,
-    parse_repository_list, read_trace_json, release_lease, render_constitution, render_digest,
-    replay, revoke_excuse, run_dispatch_with_registry, run_gate, run_implement_with_registry,
-    run_pass, run_plan, run_reap_worktrees, run_repair_prs, run_selection,
-    run_sweep_with_publication_source, validate_lease_name, validate_work_order_file,
+    append_trace, append_trace_checked, audit, available_repositories, branch_name,
+    clear_work_order, create_work_order, credential_output, decide_queue_item,
+    effective_repositories, encode_org_snapshots_with_faults, encode_selection, environment,
+    finalize_exited_implementer, generated_run_id, grant_excuse, grant_excuse_at_head,
+    inherited_repository_scope, item_hash, lease_status, lint_queue_state, list_excuses,
+    list_queue_json, load_config_or_defaults, local_drift, parse_repository_list, read_trace_json,
+    release_lease, render_constitution, render_digest, replay, revoke_excuse,
+    run_dispatch_with_registry, run_gate, run_implement_with_registry, run_pass, run_plan,
+    run_reap_worktrees, run_repair_prs, run_selection, run_sweep_with_publication_source,
+    validate_lease_name, validate_work_order_file,
 };
 
 mod loop_presets;
@@ -1485,6 +1486,28 @@ fn dispatch_resolved_loop(
     resolved: ostrom_core::ResolvedLoop,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let working_directory = env::current_dir()?;
+    let mandates = load_config_or_defaults(paths, &working_directory)?;
+    let available = available_repositories(Some(manifest), &mandates)?;
+    let effective = effective_repositories(&resolved, &available, manifest);
+    for skipped in &effective.skipped {
+        eprintln!(
+            "ostrom loop {}: skipped {}: {}",
+            resolved.name, skipped.repository, skipped.reason
+        );
+    }
+    if effective.repositories.is_empty() {
+        record_empty_loop_scope(paths, &resolved, &effective.skipped)?;
+        return Err(LoopCommandError::NoEffectiveRepositories {
+            name: resolved.name,
+            skipped: effective
+                .skipped
+                .iter()
+                .map(|skipped| format!("{} ({})", skipped.repository, skipped.reason))
+                .collect::<Vec<_>>()
+                .join(", "),
+        }
+        .into());
+    }
     if matches!(resolved.actor.as_str(), "builder" | "gatekeeper")
         && manifest
             .operations
@@ -1514,15 +1537,6 @@ fn dispatch_resolved_loop(
         ))
         .into());
     }
-    let mandates = load_config_or_defaults(paths, &working_directory)?;
-    let available = available_repositories(Some(manifest), &mandates)?;
-    let effective = effective_repositories(&resolved, &available, manifest);
-    for skipped in &effective.skipped {
-        eprintln!(
-            "ostrom loop {}: skipped {}: {}",
-            resolved.name, skipped.repository, skipped.reason
-        );
-    }
     let plugin_root = environment::OSTROM_PLUGIN_ROOT.value_os().map_or_else(
         || working_directory.join("crates/ostrom-store/assets"),
         PathBuf::from,
@@ -1546,6 +1560,52 @@ fn dispatch_resolved_loop(
         };
         dispatch_operation(manifest, &resolved.actor, &invocation, &mut runtime)?;
     }
+    Ok(())
+}
+
+fn record_empty_loop_scope(
+    paths: &OstromPaths,
+    resolved: &ResolvedLoop,
+    skipped: &[ostrom_store::SkippedRepository],
+) -> Result<(), ostrom_store::StoreError> {
+    let clock = Clock::realtime();
+    let owner = generated_run_id(&format!("loop-{}", resolved.name), &clock);
+    let common = serde_json::Map::from_iter([
+        ("owner".to_owned(), serde_json::json!(owner)),
+        ("loop".to_owned(), serde_json::json!(resolved.name)),
+        ("actor".to_owned(), serde_json::json!(resolved.actor)),
+        ("repositories".to_owned(), serde_json::json!([])),
+        (
+            "skipped_repositories".to_owned(),
+            serde_json::json!(skipped),
+        ),
+        (
+            "reason".to_owned(),
+            serde_json::json!("no-effective-repositories"),
+        ),
+    ]);
+    append_trace(
+        &paths.trace_file(),
+        &TraceAppend {
+            ts: clock.timestamp(),
+            kind: "pass-started".to_owned(),
+            fact: common.clone(),
+            narration: serde_json::Map::new(),
+        },
+    )?;
+    let mut terminal = common;
+    terminal.insert("outcome".to_owned(), serde_json::json!("failed"));
+    terminal.insert("cost_usd".to_owned(), serde_json::json!(0.0));
+    terminal.insert("duration_seconds".to_owned(), serde_json::json!(0));
+    append_trace(
+        &paths.trace_file(),
+        &TraceAppend {
+            ts: clock.timestamp(),
+            kind: "pass-ended".to_owned(),
+            fact: terminal,
+            narration: serde_json::Map::new(),
+        },
+    )?;
     Ok(())
 }
 
@@ -2200,6 +2260,8 @@ enum LoopCommandError {
         declared: String,
         enforced: String,
     },
+    #[error("loop `{name}`: no-effective-repositories; skipped repositories: {skipped}")]
+    NoEffectiveRepositories { name: String, skipped: String },
     #[error(
         "loop units at `{}` drift (missing: {}; changed: {}; unexpected: {})",
         installed.display(),

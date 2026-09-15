@@ -3,6 +3,9 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     process::Command,
+    sync::atomic::{AtomicU64, Ordering},
+    thread,
+    time::{Duration as StdDuration, Instant},
 };
 
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
@@ -17,8 +20,8 @@ use serde_json::{Map, Value, json};
 use thiserror::Error;
 
 use crate::{
-    AppTokenError, OstromPaths, PolicyBundle, PublishDestination, PublishError, QueueDocument,
-    StoreError,
+    AppTokenError, Clock, LeaseActionError, OstromPaths, OwnedLease, PolicyBundle,
+    PublishDestination, PublishError, QueueDocument, StoreError,
     app_token::{GitHubInstallationTokenMinter, InstallationTokenMinter, ScopedAppTokenRequest},
     available_repositories,
     commit_checks::read_commit_checks,
@@ -49,6 +52,11 @@ const FULL_RECONCILIATION_HOURS: i64 = 24;
 /// distinguish a quiet portfolio from the 2026-08-18 authentication outage,
 /// so that incident-shaped result must never reach persistence.
 const MIN_ACQUIRED_REPOSITORIES_TO_WRITE: usize = 1;
+const SWEEP_LEASE_NAME: &str = "sweep.lease";
+const SWEEP_LEASE_TTL_SECONDS: u64 = 3_600;
+pub(crate) const SWEEP_LEASE_WAIT_SECONDS: u64 = 30;
+const SWEEP_LEASE_POLL_INTERVAL: StdDuration = StdDuration::from_millis(50);
+static SWEEP_LEASE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub(crate) const PR_REPAIR_CONFLICT_REASON_PREFIX: &str =
     "repair scan aborted on a content conflict";
 /// A sweep only observes portfolio state, so acquisition credentials must not
@@ -100,6 +108,10 @@ pub enum SweepError {
     RunEvent(#[from] RunEventError),
     #[error("decision fact {0} was reused with different content")]
     DecisionFactConflict(String),
+    #[error("sweep lease is held")]
+    LeaseHeld,
+    #[error("sweep lease remained held for {seconds} seconds")]
+    LeaseWaitTimedOut { seconds: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -311,6 +323,7 @@ pub fn run_sweep_with_publication_source(
     options: &SweepOptions,
     source: &dyn PublicationSource,
 ) -> Result<SweepOutcome, SweepError> {
+    let _lease = acquire_sweep_lease(&options.paths)?;
     let mut minter = GitHubInstallationTokenMinter;
     run_sweep_with_minter_and_publication_source(options, source, &mut minter, None)
         .map(|(outcome, _mirror)| outcome)
@@ -319,9 +332,17 @@ pub fn run_sweep_with_publication_source(
 pub fn run_sweep_with_mirror(
     options: &SweepOptions,
 ) -> Result<(SweepOutcome, Vec<RepositorySnapshot>), SweepError> {
+    let _lease = acquire_sweep_lease(&options.paths)?;
     let source = JsonlPublicationSource::new(&options.paths);
     let mut minter = GitHubInstallationTokenMinter;
     run_sweep_with_minter_and_publication_source(options, &source, &mut minter, None)
+}
+
+pub(crate) fn run_sweep_holding_lease(options: &SweepOptions) -> Result<SweepOutcome, SweepError> {
+    let source = JsonlPublicationSource::new(&options.paths);
+    let mut minter = GitHubInstallationTokenMinter;
+    run_sweep_with_minter_and_publication_source(options, &source, &mut minter, None)
+        .map(|(outcome, _mirror)| outcome)
 }
 
 #[cfg(test)]
@@ -329,6 +350,7 @@ fn run_sweep_with_minter(
     options: &SweepOptions,
     minter: &mut dyn InstallationTokenMinter,
 ) -> Result<(SweepOutcome, Vec<RepositorySnapshot>), SweepError> {
+    let _lease = acquire_sweep_lease(&options.paths)?;
     let source = JsonlPublicationSource::new(&options.paths);
     run_sweep_with_minter_and_publication_source(options, &source, minter, None)
 }
@@ -339,9 +361,53 @@ pub fn run_selected_sweep_with_publication_source(
     source: &dyn PublicationSource,
     repositories: &[String],
 ) -> Result<SweepOutcome, SweepError> {
+    let _lease = acquire_sweep_lease(&options.paths)?;
     let mut minter = GitHubInstallationTokenMinter;
     run_sweep_with_minter_and_publication_source(options, source, &mut minter, Some(repositories))
         .map(|(outcome, _)| outcome)
+}
+
+pub(crate) fn acquire_sweep_lease(paths: &OstromPaths) -> Result<OwnedLease, SweepError> {
+    let sequence = SWEEP_LEASE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let owner = format!("sweep-{}-{sequence}", std::process::id());
+    match OwnedLease::acquire(
+        &paths.state,
+        SWEEP_LEASE_NAME,
+        &owner,
+        Clock::realtime().epoch_seconds(),
+        SWEEP_LEASE_TTL_SECONDS,
+    ) {
+        Ok(lease) => Ok(lease),
+        Err(
+            LeaseActionError::Held
+            | LeaseActionError::HeldOrUnreadable
+            | LeaseActionError::ReclamationInProgress
+            | LeaseActionError::ChangedDuringReclamation
+            | LeaseActionError::AcquiredConcurrently
+            | LeaseActionError::MutationInProgress,
+        ) => Err(SweepError::LeaseHeld),
+        Err(error) => Err(SweepError::State(format!(
+            "could not acquire {SWEEP_LEASE_NAME}: {error}"
+        ))),
+    }
+}
+
+pub(crate) fn wait_for_sweep_lease(paths: &OstromPaths) -> Result<OwnedLease, SweepError> {
+    let deadline = Instant::now() + StdDuration::from_secs(SWEEP_LEASE_WAIT_SECONDS);
+    loop {
+        match acquire_sweep_lease(paths) {
+            Ok(lease) => return Ok(lease),
+            Err(SweepError::LeaseHeld) if Instant::now() < deadline => {
+                thread::sleep(SWEEP_LEASE_POLL_INTERVAL);
+            }
+            Err(SweepError::LeaseHeld) => {
+                return Err(SweepError::LeaseWaitTimedOut {
+                    seconds: SWEEP_LEASE_WAIT_SECONDS,
+                });
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn selected_config(
@@ -532,8 +598,9 @@ fn run_sweep_with_minter_and_publication_source(
         .collect::<Vec<_>>();
     let mirror = snapshots.clone();
     let mut generation_mirror = mirror.clone();
+    let mut generation_completed_at = options.started_at;
     if !carried.is_empty() {
-        let previous_generation = old_state
+        let previous_generation: SweepGeneration = old_state
             .get("sweep_generation")
             .cloned()
             .ok_or_else(|| {
@@ -548,6 +615,10 @@ fn run_sweep_with_minter_and_publication_source(
                     ))
                 })
             })?;
+        // This generation contains snapshots that were not acquired now. Its
+        // freshness is therefore bounded by the oldest generation it carries,
+        // even though its identity records the selected refresh performed now.
+        generation_completed_at = previous_generation.completed_at;
         let previous_mirror = load_sweep_snapshot(&options.paths, &previous_generation)?;
         generation_mirror.extend(
             previous_mirror
@@ -678,7 +749,7 @@ fn run_sweep_with_minter_and_publication_source(
             )
             .as_bytes(),
         ),
-        completed_at: options.started_at,
+        completed_at: generation_completed_at,
     };
     new_state["sweep_generation"] =
         serde_json::to_value(&generation).expect("sweep generation serializes");
@@ -915,6 +986,33 @@ pub fn latest_successful_generation(
         .map(serde_json::from_value)
         .transpose()
         .map_err(|error| SweepError::State(format!("{}: {error}", path.display())))
+}
+
+/// Mark the current sweep generation stale after a repository mutation.
+///
+/// Taking the sweep lease prevents a completed repair from racing a sweep's
+/// state write. The repair clears whichever generation is current after any
+/// in-flight sweep finishes, so the next pass must acquire a new snapshot.
+pub(crate) fn invalidate_sweep_generation(paths: &OstromPaths) -> Result<(), SweepError> {
+    let _lease = wait_for_sweep_lease(paths)?;
+    let path = paths.sweep_state_file();
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(SweepError::State(format!("{}: {error}", path.display()))),
+    };
+    let mut state: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| SweepError::State(format!("{}: {error}", path.display())))?;
+    let Some(object) = state.as_object_mut() else {
+        return Err(SweepError::State(format!(
+            "{}: state document is not an object",
+            path.display()
+        )));
+    };
+    if object.remove("sweep_generation").is_some() {
+        write_json_private(&path, &state)?;
+    }
+    Ok(())
 }
 
 #[must_use]

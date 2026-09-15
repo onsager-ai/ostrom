@@ -24,6 +24,11 @@ use crate::{
 };
 
 const SHIPPED_DEFAULTS: &str = include_str!("../assets/gate.defaults.yaml");
+/// Complete repository-read authority required by [`run_gate`]'s live
+/// acquisition: pull-request and closing-issue metadata, changed contents,
+/// check runs, commit statuses, and review threads.
+pub const GATE_READ_PERMISSIONS: &str =
+    "metadata:read,issues:read,pull_requests:read,checks:read,statuses:read,contents:read";
 const REVIEW_QUERY: &str = "query($owner:String!, $repo:String!, $number:Int!, $cursor:String) {\n  repository(owner:$owner, name:$repo) {\n    pullRequest(number:$number) {\n      author { login }\n      reviewThreads(first:100, after:$cursor) {\n        nodes {\n          id\n          isResolved\n          resolvedBy { login }\n          comments(last:1) { nodes { author { login } } }\n        }\n        pageInfo { hasNextPage endCursor }\n      }\n    }\n  }\n}";
 
 #[derive(Debug, Clone)]
@@ -1896,6 +1901,26 @@ mod tests {
         )
         .expect("write policy version");
         point_current(paths, digest);
+    }
+
+    #[test]
+    fn gatekeeper_prompt_read_scope_equals_the_gate_acquisition_requirement() {
+        let prompt = include_str!("../assets/prompts/gatekeep.md");
+        let lines = prompt.lines().collect::<Vec<_>>();
+        let gate_line = lines
+            .iter()
+            .position(|line| line.contains("ostrom gate \"$repository#$pr_number\""))
+            .expect("step 4 invokes ostrom gate");
+        let permissions = lines[..gate_line]
+            .iter()
+            .rev()
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix("--permissions ")
+                    .and_then(|value| value.split_whitespace().next())
+            })
+            .expect("step 4 declares gate read permissions");
+        assert_eq!(permissions, GATE_READ_PERMISSIONS);
     }
 
     #[test]

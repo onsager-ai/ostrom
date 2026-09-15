@@ -2435,6 +2435,84 @@ fn loop_bound_pass_records_the_intersected_granted_set_and_refuses_unknown_loops
 }
 
 #[test]
+fn loop_bound_passes_refuse_all_unavailable_and_all_ungranted_scopes() {
+    for (case, requested, granted, expected_reason) in [
+        (
+            "unavailable",
+            "placeholder-org/missing",
+            "placeholder-org/missing",
+            "repository-not-available",
+        ),
+        (
+            "ungranted",
+            "placeholder-org/alpha",
+            "placeholder-org/other",
+            "repository-not-granted",
+        ),
+    ] {
+        let fixture = Fixture::new("printf ran >\"$OSTROM_TEST_MARKER\"");
+        let manifest = fixture.state.join("ostrom.yaml");
+        fs::write(
+            &manifest,
+            format!(
+                "manifest_version: 1\nactors: {{builder: {{permission_mode: auto}}}}\noperations:\n  build-pass:\n    steps: [{{uses: agent/claude, with: {{prompt: 'empty scope fixture'}}}}]\ngrants:\n  builder-build: {{actors: builder, operations: build-pass, repositories: {granted}}}\nloops:\n  delivery:\n    actor: builder\n    operation: build-pass\n    repositories: {requested}\n    every: hourly\n"
+            ),
+        )
+        .expect("write empty-scope policy");
+        let trusted_keys = support::sign_manifest(&manifest);
+        let marker = fixture.root.path().join(format!("{case}-agent-ran"));
+
+        let output = fixture
+            .command()
+            .args(["--loop", "delivery"])
+            .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
+            .env("OSTROM_AVAILABLE_REPOSITORIES", "placeholder-org/alpha")
+            .env("OSTROM_TEST_MARKER", &marker)
+            .output()
+            .expect("run empty-scope pass");
+        assert_eq!(output.status.code(), Some(3), "{case}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("no-effective-repositories"),
+            "{case}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!marker.exists(), "{case}: agent process started");
+        assert!(
+            !fixture.state.join("pass-runs").exists(),
+            "{case}: transcript directory was created"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.state.join("builder-wake-counter"))
+                .expect("read unchanged wake counter"),
+            "6\n",
+            "{case}: empty scope advanced pass state"
+        );
+
+        let trace = fixture.trace();
+        assert_eq!(trace.len(), 2, "{case}: {trace:?}");
+        assert_eq!(trace[0]["kind"], "pass-started");
+        assert_eq!(trace[1]["kind"], "pass-ended");
+        for row in &trace {
+            assert_eq!(row["fact"]["repositories"], json!([]), "{case}");
+            assert_eq!(
+                row["fact"]["skipped_repositories"],
+                json!([{"repository": requested, "reason": expected_reason}]),
+                "{case}"
+            );
+            assert_eq!(row["fact"]["reason"], "no-effective-repositories", "{case}");
+        }
+        assert_eq!(trace[1]["fact"]["outcome"], "failed", "{case}");
+        let events = fixture.run_events();
+        assert_eq!(events.len(), 2, "{case}: {events:?}");
+        assert_eq!(events[1]["payload"]["outcome"], "failed", "{case}");
+        assert_eq!(
+            events[1]["payload"]["reason"], "no-effective-repositories",
+            "{case}"
+        );
+    }
+}
+
+#[test]
 fn loop_bound_gatekeeper_receives_only_snapshot_pull_requests_in_its_effective_set() {
     let fixture = Fixture::new("printf '%s\\n' \"$@\" >\"$OSTROM_TEST_ARGS\"");
     let manifest = fixture.state.join("ostrom.yaml");
@@ -2498,6 +2576,63 @@ fn loop_bound_gatekeeper_receives_only_snapshot_pull_requests_in_its_effective_s
     assert!(arguments.contains("\"number\": 11"));
     assert!(!arguments.contains("placeholder-org/beta"));
     assert!(!arguments.contains("\"number\": 22"));
+}
+
+#[test]
+fn loop_bound_gatekeeper_with_no_snapshot_candidates_is_idle_without_an_agent() {
+    let fixture = Fixture::new("printf ran >\"$OSTROM_TEST_MARKER\"");
+    let manifest = fixture.state.join("ostrom.yaml");
+    fs::write(
+        &manifest,
+        format!(
+            "{}\nloops:\n  review:\n    actor: gatekeeper\n    operation: gate-pass\n    repositories: placeholder-org/alpha\n    every: hourly\n",
+            include_str!("fixtures/loops/init.yaml")
+        ),
+    )
+    .expect("write idle gatekeeper policy");
+    fs::create_dir_all(fixture.state.join("prompts")).expect("create prompt directory");
+    fs::write(
+        fixture.state.join("prompts/work.md"),
+        include_str!("../../ostrom-store/assets/prompts/work.md"),
+    )
+    .expect("write builder prompt");
+    fs::write(
+        fixture.state.join("prompts/gatekeep.md"),
+        include_str!("../../ostrom-store/assets/prompts/gatekeep.md"),
+    )
+    .expect("write gatekeeper prompt");
+    let trusted_keys = support::sign_manifest(&manifest);
+    let marker = fixture.root.path().join("idle-gatekeeper-ran");
+
+    let output = fixture
+        .command_for("gatekeeper")
+        .args(["--loop", "review"])
+        .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
+        .env("OSTROM_AVAILABLE_REPOSITORIES", "placeholder-org/alpha")
+        .env("OSTROM_TEST_MARKER", &marker)
+        .output()
+        .expect("run idle gatekeeper");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!marker.exists(), "idle gatekeeper started an agent process");
+    assert!(
+        !fixture.state.join("pass-runs/gatekeeper").exists(),
+        "idle gatekeeper created a transcript"
+    );
+    let trace = fixture.trace();
+    assert_eq!(trace.len(), 2, "{trace:?}");
+    assert_eq!(trace[0]["kind"], "pass-started");
+    assert_eq!(trace[1]["kind"], "pass-ended");
+    assert_eq!(trace[1]["fact"]["outcome"], "no-candidates");
+    assert_eq!(
+        trace[1]["fact"]["repositories"],
+        json!(["placeholder-org/alpha"])
+    );
+    let events = fixture.run_events();
+    assert_eq!(events[1]["payload"]["outcome"], "no-op");
 }
 
 #[test]

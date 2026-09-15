@@ -1,12 +1,17 @@
 #![cfg(unix)]
 
 use ostrom_core::PolicyManifest;
-use ostrom_store::{PolicyBundle, PublishTarget, SweepMode, SweepOptions, run_sweep};
+use ostrom_store::{
+    PolicyBundle, PublishTarget, SweepGeneration, SweepMode, SweepOptions, generation_is_fresh,
+    run_sweep,
+};
 use serde_json::{Value, json};
 use std::{
     fs,
     path::Path,
     process::{Command, Output},
+    thread,
+    time::{Duration, Instant},
 };
 use tempfile::TempDir;
 mod support;
@@ -267,6 +272,24 @@ fn selected_sweep_carries_records_and_observes_only_read_repositories() {
         [ALPHA, BETA],
         "a partial refresh must retain the carried repository in the generation snapshot"
     );
+    let generation: SweepGeneration =
+        serde_json::from_value(fixture.state()["sweep_generation"].clone())
+            .expect("parse partial generation");
+    assert_eq!(
+        generation.completed_at,
+        FIRST
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .expect("valid first generation time"),
+        "a subset refresh must retain the carried generation's freshness age"
+    );
+    assert!(
+        !generation_is_fresh(
+            &generation,
+            NEXT.parse().expect("valid freshness time"),
+            60 * 60,
+        ),
+        "an aged full generation became fresh after a subset sweep"
+    );
     let trace = fs::read(fixture.home.join("sprint.jsonl")).unwrap();
     assert_eq!(
         String::from_utf8_lossy(&trace)
@@ -299,6 +322,54 @@ fn selected_non_roster_refusal_leaves_whole_home_untouched() {
         assert!(String::from_utf8_lossy(&output.stderr).contains("placeholder-org/missing"));
         assert_unchanged(&before, &snapshot(&fixture.home));
     }
+}
+
+#[test]
+fn concurrent_sweeps_cannot_interleave_generation_files() {
+    let fixture = Fixture::new(false);
+    let fifo = fixture.root.path().join("blocked-sweep-fixture");
+    let created = Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("create blocking sweep fixture");
+    assert!(created.success());
+    let mut first = Command::new(env!("CARGO_BIN_EXE_ostrom"));
+    first
+        .env_clear()
+        .env("OSTROM_HOME", &fixture.home)
+        .current_dir(fixture.root.path())
+        .args(["sweep", "--fixture"])
+        .arg(&fifo)
+        .args(["--started-at", FIRST]);
+    let first = first.spawn().expect("start first sweep");
+    let lease = fixture.home.join("sweep.lease");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !lease.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(lease.exists(), "first sweep did not acquire its lease");
+
+    let second = fixture.run(&[], NEXT);
+    fs::write(&fifo, RESPONSES).expect("release blocked sweep acquisition");
+    let first = first.wait_with_output().expect("wait for first sweep");
+    assert!(!second.status.success(), "concurrent sweep succeeded");
+    assert!(
+        String::from_utf8_lossy(&second.stderr).contains("sweep lease is held"),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let state = fixture.state();
+    let snapshot: Value = serde_json::from_slice(
+        &fs::read(fixture.home.join("sweep-snapshot.json")).expect("read sweep snapshot"),
+    )
+    .expect("parse sweep snapshot");
+    assert_eq!(state["sweep_generation"], snapshot["generation"]);
+    assert!(!lease.exists(), "completed sweep retained its lease");
 }
 
 fn validate_sweep_policy(value: &str) -> Output {

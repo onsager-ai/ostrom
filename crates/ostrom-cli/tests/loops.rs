@@ -210,6 +210,90 @@ loops:
     assert!(!marker.exists(), "dispatch must stop before its operation");
 }
 
+#[test]
+fn non_agent_loop_refuses_an_empty_effective_scope_with_terminal_records() {
+    let root = tempdir().expect("temporary empty-scope loop fixture");
+    let manifest = root.path().join("policy.yaml");
+    let marker = root.path().join("operation-ran");
+    fs::write(
+        &manifest,
+        r#"manifest_version: 1
+actors: {triage: {}}
+operations:
+  local-triage:
+    steps:
+      - uses: cmd/run
+        with:
+          script: 'printf ran > "$OSTROM_LOOP_MARKER"'
+grants:
+  local-triage:
+    actors: triage
+    operations: local-triage
+    repositories: placeholder-org/other
+loops:
+  unattended-triage:
+    actor: triage
+    operation: local-triage
+    repositories: placeholder-org/unavailable
+    every: hourly
+"#,
+    )
+    .expect("write empty-scope policy");
+    let trusted_keys = support::sign_manifest(&manifest);
+    let operator = root.path().join("ostrom.yaml");
+    fs::copy(&manifest, &operator).expect("install operator policy fixture");
+    support::sign_manifest(&operator);
+    let composed = ostrom()
+        .arg("compose")
+        .arg(&manifest)
+        .env("OSTROM_HOME", root.path())
+        .env("OSTROM_POLICY_MANIFEST", &operator)
+        .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
+        .output()
+        .expect("compose empty-scope policy");
+    assert!(
+        composed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&composed.stderr)
+    );
+
+    let output = ostrom()
+        .args(["loop", "run", "unattended-triage"])
+        .env("OSTROM_HOME", root.path())
+        .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
+        .env("OSTROM_AVAILABLE_REPOSITORIES", "placeholder-org/alpha")
+        .env("OSTROM_LOOP_MARKER", &marker)
+        .output()
+        .expect("run empty-scope non-agent loop");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no-effective-repositories"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!marker.exists(), "empty-scope operation ran");
+    let trace = fs::read_to_string(root.path().join("sprint.jsonl"))
+        .expect("read empty-scope trace")
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("trace row"))
+        .collect::<Vec<_>>();
+    assert_eq!(trace.len(), 2, "{trace:?}");
+    assert_eq!(trace[0]["kind"], "pass-started");
+    assert_eq!(trace[1]["kind"], "pass-ended");
+    for row in &trace {
+        assert_eq!(row["fact"]["repositories"], serde_json::json!([]));
+        assert_eq!(
+            row["fact"]["skipped_repositories"],
+            serde_json::json!([{
+                "repository": "placeholder-org/unavailable",
+                "reason": "repository-not-available"
+            }])
+        );
+        assert_eq!(row["fact"]["reason"], "no-effective-repositories");
+    }
+    assert_eq!(trace[1]["fact"]["outcome"], "failed");
+}
+
 fn loop_run(root: &Path, manifest: &Path, trusted_keys: &Path, marker: &Path) -> Command {
     let mut command = ostrom();
     command

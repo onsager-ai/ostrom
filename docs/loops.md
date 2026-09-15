@@ -55,6 +55,12 @@ the authorization boundary. A loop-bound gatekeeper judges only pull requests
 from the pass's sweep generation, so one opened afterward waits for the next
 fresh generation, up to `sweep.max_age`.
 
+An empty effective set is a failed wake named `no-effective-repositories`, with
+every skipped repository and reason recorded at both ends of the pass. No
+operation or agent starts. This differs from a gatekeeper wake whose effective
+set is non-empty but whose supplied snapshot contains no pull requests: that
+idle wake records `no-candidates`, starts no agent, and succeeds.
+
 The current composed policy version can instead own loop lifecycle directly:
 
 ```sh
