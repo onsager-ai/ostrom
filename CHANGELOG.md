@@ -13,6 +13,8 @@
 - Subset sweeps retain the prior generation's completion time for full-roster
   freshness, and a repository-changing pull-request repair invalidates the
   current generation.
+- Worktree sweeps now remove the corresponding implementer log after removing
+  an orphan or expired worktree, while retaining logs for retained worktrees.
 - Every shipped prompt that invokes `ostrom gate` now requests its declared
   acquisition scope, with a test preventing any prompt from drifting.
 - **Breaking:** loop declarations replace `target` with the scalar-or-list
