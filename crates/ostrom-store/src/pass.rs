@@ -245,7 +245,7 @@ fn prepare_sweep(request: &PassRequest) -> Result<PreparedSweep, String> {
     // The freshness decision and gatekeeper snapshot read share the writer's
     // lease. A pass that arrives during a sweep waits once, then evaluates the
     // generation the completed writer actually left behind.
-    let _lease = wait_for_sweep_lease(&request.paths).map_err(|error| error.to_string())?;
+    let lease = wait_for_sweep_lease(&request.paths).map_err(|error| error.to_string())?;
     let latest = latest_successful_generation(&request.paths).map_err(|error| error.to_string())?;
     let reusable = latest.filter(|generation| {
         generation_is_fresh(generation, request.clock.now(), sweep.max_age_seconds)
@@ -266,7 +266,8 @@ fn prepare_sweep(request: &PassRequest) -> Result<PreparedSweep, String> {
             });
         }
     }
-    let outcome = run_sweep_holding_lease(&sweep.options).map_err(|error| error.to_string())?;
+    let outcome =
+        run_sweep_holding_lease(&sweep.options, lease).map_err(|error| error.to_string())?;
     let snapshots = (request.role == PassRole::Gatekeeper)
         .then(|| load_sweep_snapshot(&request.paths, &outcome.generation))
         .transpose()
