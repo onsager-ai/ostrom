@@ -175,7 +175,7 @@ fn no_matching_rule_defaults_to_deny_and_names_every_consulted_scope() {
 #[test]
 fn repository_loop_is_inert_and_explain_reports_declared_but_not_adopted() {
     let fixture = RepositoryFixture::new(
-        "grants:\n  repository-work: {actors: builder, operations: work}\nloops:\n  repository-loop: {actor: builder, operation: work, target: placeholder-org/repository, every: hourly}\n",
+        "grants:\n  repository-work: {actors: builder, operations: work}\nloops:\n  repository-loop: {actor: builder, operation: work, repositories: placeholder-org/repository, every: hourly}\n",
     );
     fixture.write_overlay("");
     let rendered = fixture.home.path().join("systemd");

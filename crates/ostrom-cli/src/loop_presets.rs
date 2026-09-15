@@ -49,14 +49,14 @@ loops:
   builder-day:
     actor: builder
     operation: build-pass
-    target: placeholder-org/portfolio
+    repositories: placeholder-org/portfolio
     every: 08:15..21:15
     spend_usd: 20
     concurrent: 1
 "#,
                 )?,
                 secret_names: &["builder"],
-                placeholder_paths: &["/loops/builder-day/target"],
+                placeholder_paths: &["/loops/builder-day/repositories/0"],
             },
         ),
         (
@@ -83,12 +83,12 @@ loops:
   gatekeeper:
     actor: gatekeeper
     operation: gate-pass
-    target: placeholder-org/portfolio
+    repositories: placeholder-org/portfolio
     every: hourly
 "#,
                 )?,
                 secret_names: &["gatekeeper"],
-                placeholder_paths: &["/loops/gatekeeper/target"],
+                placeholder_paths: &["/loops/gatekeeper/repositories/0"],
             },
         ),
         (
@@ -102,7 +102,7 @@ loops:
                     r#"manifest_version: 1
 actors:
   sweeper:
-    description: Publishes the portfolio sweep. Reads widely, writes only what publication allows. The loops.sweep entry schedules the sweep from a local cron-style scheduler on one machine; a hosted substrate schedules the sweep itself and should not adopt that loop.
+    description: Publishes the portfolio sweep when invoked. Reads widely, writes only what publication allows.
     permission_mode: auto
 operations:
   portfolio-sweep:
@@ -116,17 +116,11 @@ grants:
     actors: sweeper
     operations: portfolio-sweep
     repositories: placeholder-org/portfolio
-loops:
-  sweep:
-    actor: sweeper
-    operation: portfolio-sweep
-    target: placeholder-org/portfolio
-    every: "*:45"
 "#,
                 )?,
                 // sweep::organization_token_request uses this credential name.
                 secret_names: &["gatekeeper"],
-                placeholder_paths: &["/grants/sweep/repositories/0", "/loops/sweep/target"],
+                placeholder_paths: &["/grants/sweep/repositories/0"],
             },
         ),
         (
@@ -153,12 +147,12 @@ loops:
   unattended-triage:
     actor: triage
     operation: queue-triage
-    target: placeholder-org/portfolio
+    repositories: placeholder-org/portfolio
     every: hourly
 "#,
                 )?,
                 secret_names: &["triage"],
-                placeholder_paths: &["/loops/unattended-triage/target"],
+                placeholder_paths: &["/loops/unattended-triage/repositories/0"],
             },
         ),
     ]))
@@ -303,7 +297,7 @@ mod tests {
         for grant in ["builder-build", "gatekeeper-gate", "sweep", "triage-queue"] {
             assert!(merged.grants.contains_key(grant), "missing grant {grant}");
         }
-        for loop_name in ["builder-day", "gatekeeper", "sweep", "unattended-triage"] {
+        for loop_name in ["builder-day", "gatekeeper", "unattended-triage"] {
             assert!(
                 merged.loops.contains_key(loop_name),
                 "missing loop {loop_name}"
@@ -311,12 +305,8 @@ mod tests {
         }
     }
 
-    // The presets endpoint passes this description through verbatim, so its
-    // bytes are what an operator reads before applying the preset. #527 ruled
-    // that it must say a hosted substrate schedules the sweep itself; pinning
-    // the whole string is what turns that ruling into a guard.
     #[test]
-    fn the_sweep_preset_description_says_a_hosted_substrate_schedules_its_own_sweep() {
+    fn the_sweep_preset_keeps_manual_operation_without_a_loop() {
         let presets = catalogue().expect("catalogue parses");
         let sweeper = presets
             .get("sweep")
@@ -329,12 +319,10 @@ mod tests {
         assert_eq!(
             sweeper.description.as_deref(),
             Some(
-                "Publishes the portfolio sweep. Reads widely, writes only what publication \
-                 allows. The loops.sweep entry schedules the sweep from a local cron-style \
-                 scheduler on one machine; a hosted substrate schedules the sweep itself and \
-                 should not adopt that loop."
+                "Publishes the portfolio sweep when invoked. Reads widely, writes only what publication allows."
             )
         );
+        assert!(presets["sweep"].fragment.loops.is_empty());
     }
 
     #[test]

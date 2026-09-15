@@ -35,29 +35,21 @@ loops:
   builder-day:
     actor: builder
     operation: build-pass
-    target: placeholder-org/portfolio
+    repositories: placeholder-org/portfolio
     every: 08:15..21:15
   builder-night:
     actor: builder
     operation: build-pass
-    target: placeholder-org/portfolio
+    repositories: placeholder-org/portfolio
     every: ["23:15", "02:15", "05:15"]
     concurrent: 2
   gatekeeper:
     actor: gatekeeper
     operation: gate-pass
-    target: placeholder-org/portfolio
+    repositories: placeholder-org/portfolio
     every: hourly
-  sweep:
-    actor: sweeper
-    operation: portfolio-sweep
-    target: placeholder-org/portfolio
-    every: "*:45"
-    publish: placeholder-org/public-mirror
-    cadence_hours: 24
-    stuck_after_days: 7
   unattended-triage:
     actor: triage
     operation: queue-triage
-    target: placeholder-org/portfolio
+    repositories: placeholder-org/portfolio
     every: hourly

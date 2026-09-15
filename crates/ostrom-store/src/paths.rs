@@ -53,6 +53,11 @@ impl OstromPaths {
     }
 
     #[must_use]
+    pub fn sweep_snapshot_file(&self) -> PathBuf {
+        self.state.join("sweep-snapshot.json")
+    }
+
+    #[must_use]
     pub fn previous_sweep_dir(&self) -> PathBuf {
         self.state.join("previous")
     }

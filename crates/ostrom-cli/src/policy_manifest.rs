@@ -239,9 +239,16 @@ fn project_repository_manifest(mut manifest: PolicyManifest, repository: &str) -
     manifest.prompts.clear();
     project_rules(&mut manifest.grants, repository);
     project_rules(&mut manifest.denies, repository);
-    manifest
-        .loops
-        .retain(|_, declaration| declaration.target == repository);
+    manifest.loops.retain(|_, declaration| {
+        declaration.repositories.is_empty()
+            || declaration
+                .repositories
+                .iter()
+                .any(|candidate| candidate == repository)
+    });
+    for declaration in manifest.loops.values_mut() {
+        declaration.repositories = Default::default();
+    }
     manifest
 }
 
@@ -1969,8 +1976,9 @@ denies:
     repositories: placeholder-org/target
     where: path:protected/**
 loops:
-  target-loop: {actor: builder, operation: work, target: placeholder-org/target, every: hourly}
-  other-loop: {actor: builder, operation: work, target: placeholder-org/other, every: hourly}
+  unscoped-loop: {actor: builder, operation: work, every: hourly}
+  target-loop: {actor: builder, operation: work, repositories: placeholder-org/target, every: hourly}
+  other-loop: {actor: builder, operation: work, repositories: placeholder-org/other, every: hourly}
 "#,
         )
         .expect("operator policy");
@@ -1993,8 +2001,15 @@ loops:
         );
         assert!(round_tripped.checks.contains_key("placeholder-green"));
         assert!(round_tripped.operations.contains_key("work"));
+        assert!(round_tripped.loops.contains_key("unscoped-loop"));
         assert!(round_tripped.loops.contains_key("target-loop"));
         assert!(!round_tripped.loops.contains_key("other-loop"));
+        assert!(
+            round_tripped
+                .loops
+                .values()
+                .all(|declaration| declaration.repositories.is_empty())
+        );
         validate_scoped_manifest(&round_tripped, Some(&operator))
             .expect("generated repository layer loads with operator policy");
 

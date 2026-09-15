@@ -31,6 +31,8 @@ pub struct GateOptions {
     pub paths: OstromPaths,
     pub working_directory: PathBuf,
     pub target: String,
+    /// `Some(empty)` refuses every target before acquisition.
+    pub repositories: Option<BTreeSet<String>>,
     pub timestamp: String,
 }
 
@@ -45,6 +47,8 @@ pub struct GateOutput {
 pub enum GateError {
     #[error("usage: ostrom gate <owner/repo#number>")]
     InvalidTarget,
+    #[error("mandate gate: repository-outside-effective-set: {0}")]
+    RepositoryOutsideEffectiveSet(String),
     #[error("mandate gate: could not serialize verdict")]
     Serialize,
     #[error("mandate gate: could not raise decision: {0}")]
@@ -56,6 +60,7 @@ impl GateError {
     pub const fn exit_code(&self) -> i32 {
         match self {
             Self::InvalidTarget => 64,
+            Self::RepositoryOutsideEffectiveSet(_) => 3,
             Self::Serialize => 2,
             Self::Decision(_) => 3,
         }
@@ -115,6 +120,15 @@ impl JudgmentState {
 
 pub fn run_gate(options: &GateOptions) -> Result<GateOutput, GateError> {
     let target = parse_target(&options.target)?;
+    if options
+        .repositories
+        .as_ref()
+        .is_some_and(|repositories| !repositories.contains(target.repo))
+    {
+        return Err(GateError::RepositoryOutsideEffectiveSet(
+            target.repo.to_owned(),
+        ));
+    }
     let (config, config_error, config_source) =
         load_gate_config_for_repo(&options.paths, &options.working_directory, target.repo);
 
@@ -2014,6 +2028,27 @@ projects:
     }
 
     #[test]
+    fn gate_refuses_a_target_outside_the_effective_repository_set_before_acquisition() {
+        let root = tempfile::tempdir().expect("gate scope fixture");
+        let error = run_gate(&GateOptions {
+            paths: OstromPaths {
+                config: root.path().to_path_buf(),
+                state: root.path().to_path_buf(),
+            },
+            working_directory: root.path().to_path_buf(),
+            target: "placeholder-org/outside#7".to_owned(),
+            repositories: Some(BTreeSet::from(["placeholder-org/inside".to_owned()])),
+            timestamp: "2030-01-02T03:04:05Z".to_owned(),
+        })
+        .expect_err("out-of-scope gate is refused");
+        assert!(matches!(
+            error,
+            GateError::RepositoryOutsideEffectiveSet(repository)
+                if repository == "placeholder-org/outside"
+        ));
+    }
+
+    #[test]
     fn malformed_judgment_history_is_cannot_tell() {
         let fixture = tempfile::tempdir().expect("temporary judgment fixture");
         let path = fixture.path().join("gate.jsonl");
@@ -2096,6 +2131,7 @@ projects:
             },
             working_directory: root.path().to_path_buf(),
             target: "placeholder-org/alpha#7".to_owned(),
+            repositories: None,
             timestamp: "2030-01-02T03:04:05Z".to_owned(),
         };
         (root, options)

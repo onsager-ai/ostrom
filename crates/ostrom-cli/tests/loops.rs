@@ -159,7 +159,7 @@ loops:
   builder-night:
     actor: builder
     operation: scheduled-work
-    target: placeholder-org/repository
+    repositories: placeholder-org/repository
     every: ["23:15", "02:15", "05:15"]
     concurrent: 2
 "#,

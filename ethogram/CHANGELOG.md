@@ -12,6 +12,12 @@ it is the version a first release would carry, not a marker that one happened.
 
 ## Unreleased
 
+### Run starts may carry a repository set
+
+`run.started` accepts an optional `repositories` string list alongside the
+existing single `repository`. Loop runs use the list; runs acting on one
+repository keep the scalar. Both fields remain optional.
+
 ### The corpus accessor comes back, inside this crate (onsager-ai/ethogram#70, onsager-ai/ostrom#553, umwelt#46)
 
 onsager-ai/ethogram#70's "zero dependents" finding was wrong. It deleted

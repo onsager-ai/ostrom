@@ -10,6 +10,7 @@ use thiserror::Error;
 
 use crate::{
     check::{CHECK_ACTIONS, CheckDefinition, InconclusivePolicy, validate_check_definitions},
+    domain::RepositoryName,
     operation::{OperationActionError, validate_operation},
 };
 
@@ -57,6 +58,15 @@ impl Default for SweepPolicy {
             max_age: "30m".to_owned(),
             detect_every: "5m".to_owned(),
         }
+    }
+}
+
+impl SweepPolicy {
+    /// Resolve the maximum age into seconds after manifest validation.
+    #[must_use]
+    pub fn max_age_seconds(&self) -> u64 {
+        crate::check::parse_duration(&self.max_age)
+            .expect("validated sweep.max_age is a positive duration")
     }
 }
 
@@ -295,6 +305,14 @@ impl PolicyManifest {
                     .to_owned(),
             });
         }
+        for repository in declaration.repositories.iter() {
+            RepositoryName::new(repository.clone()).map_err(|error| {
+                ManifestValidationError::InvalidLoop {
+                    name: name.to_owned(),
+                    message: format!("invalid repository `{repository}`: {error}"),
+                }
+            })?;
+        }
         let operation = self.operations.get(&declaration.operation).or_else(|| {
             context.and_then(|manifest| manifest.operations.get(&declaration.operation))
         });
@@ -383,7 +401,7 @@ impl PolicyManifest {
             name: name.to_owned(),
             actor: declaration.actor.clone(),
             operation: declaration.operation.clone(),
-            target: declaration.target.clone(),
+            repositories: declaration.repositories.clone(),
             parameters,
             every: declaration.every.clone(),
             ceilings: ResolvedLoopCeilings {
@@ -845,12 +863,12 @@ pub struct StepDecl {
     pub requires: NormalizedList<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct LoopDecl {
     pub actor: String,
     pub operation: String,
-    pub target: String,
+    #[serde(default, skip_serializing_if = "NormalizedList::is_empty")]
+    pub repositories: NormalizedList<String>,
     pub every: LoopCadence,
     #[serde(default, rename = "with", skip_serializing_if = "BTreeMap::is_empty")]
     pub parameters: BTreeMap<String, Value>,
@@ -866,6 +884,69 @@ pub struct LoopDecl {
     pub cadence_hours: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stuck_after_days: Option<u64>,
+}
+
+impl<'de> Deserialize<'de> for LoopDecl {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct AuthoredLoop {
+            actor: String,
+            operation: String,
+            #[serde(default)]
+            repositories: NormalizedList<String>,
+            #[serde(default)]
+            #[serde(rename = "target")]
+            _target: RemovedLoopTarget,
+            every: LoopCadence,
+            #[serde(default, rename = "with")]
+            parameters: BTreeMap<String, Value>,
+            #[serde(default)]
+            concurrent: Option<u64>,
+            #[serde(default)]
+            spend_usd: Option<f64>,
+            #[serde(default)]
+            tokens: Option<u64>,
+            #[serde(default)]
+            publish: Option<String>,
+            #[serde(default)]
+            cadence_hours: Option<u64>,
+            #[serde(default)]
+            stuck_after_days: Option<u64>,
+        }
+
+        let authored = AuthoredLoop::deserialize(deserializer)?;
+        Ok(Self {
+            actor: authored.actor,
+            operation: authored.operation,
+            repositories: authored.repositories,
+            every: authored.every,
+            parameters: authored.parameters,
+            concurrent: authored.concurrent,
+            spend_usd: authored.spend_usd,
+            tokens: authored.tokens,
+            publish: authored.publish,
+            cadence_hours: authored.cadence_hours,
+            stuck_after_days: authored.stuck_after_days,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RemovedLoopTarget;
+
+impl<'de> Deserialize<'de> for RemovedLoopTarget {
+    fn deserialize<D>(_deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Err(serde::de::Error::custom(
+            "loop field `target` was removed; use `repositories`",
+        ))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1022,7 +1103,7 @@ pub struct ResolvedLoop {
     pub name: String,
     pub actor: String,
     pub operation: String,
-    pub target: String,
+    pub repositories: NormalizedList<String>,
     pub parameters: BTreeMap<String, Value>,
     pub every: LoopCadence,
     pub ceilings: ResolvedLoopCeilings,
@@ -2016,7 +2097,7 @@ denies:
             "manifest_version: 1\n",
             "grants: {delegated: {actors: builder, operations: work}}\n",
             "denies: {protected: {actors: builder, operations: work}}\n",
-            "loops: {daily: {actor: builder, operation: work, target: example/repo, every: hourly}}\n",
+            "loops: {daily: {actor: builder, operation: work, repositories: example/repo, every: hourly}}\n",
         );
         let manifest = PolicyManifest::parse_yaml(source).expect("parse references");
         let unresolved = manifest
@@ -2189,7 +2270,7 @@ denies:
             ),
         ] {
             let source = format!(
-                "manifest_version: 1\noperations: {{work: {{params: {{count: {{type: semver}}}}, steps: []}}}}\nloops: {{{name}: {{{body}, target: example/repo, every: hourly}}}}\n"
+                "manifest_version: 1\noperations: {{work: {{params: {{count: {{type: semver}}}}, steps: []}}}}\nloops: {{{name}: {{{body}, repositories: example/repo, every: hourly}}}}\n"
             );
             let manifest = PolicyManifest::parse_yaml(&source).expect("parse loop");
             let error = manifest.validate_in_context(None).expect_err(body);
@@ -2329,7 +2410,7 @@ denies:
                 "extra",
             ),
             (
-                "manifest_version: 1\nloops:\n  sweep: {actor: sweeper, operation: sweep, target: placeholder-org/repo, every: hourly, extra: nope}\n",
+                "manifest_version: 1\nloops:\n  sweep: {actor: sweeper, operation: sweep, repositories: placeholder-org/repo, every: hourly, extra: nope}\n",
                 "extra",
             ),
             (
@@ -2350,8 +2431,49 @@ denies:
     }
 
     #[test]
+    fn loop_repositories_accept_absent_empty_scalar_and_list_and_target_is_refused() {
+        let prefix = "manifest_version: 1\nactors: {builder: {}}\noperations: {work: {steps: []}}\ngrants: {work: {actors: builder, operations: work}}\nloops:\n  delivery:\n    actor: builder\n    operation: work\n    every: hourly\n";
+        for (suffix, expected) in [
+            ("", Vec::<&str>::new()),
+            ("    repositories: []\n", Vec::new()),
+            (
+                "    repositories: placeholder-org/alpha\n",
+                vec!["placeholder-org/alpha"],
+            ),
+            (
+                "    repositories: [placeholder-org/alpha, placeholder-org/beta]\n",
+                vec!["placeholder-org/alpha", "placeholder-org/beta"],
+            ),
+        ] {
+            let manifest = PolicyManifest::from_yaml(&format!("{prefix}{suffix}"))
+                .expect("loop repository form parses");
+            assert_eq!(
+                manifest.loops["delivery"]
+                    .repositories
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+
+        let error =
+            PolicyManifest::from_yaml(&format!("{prefix}    target: placeholder-org/alpha\n"))
+                .expect_err("removed target is refused")
+                .to_string();
+        assert!(error.contains("target"), "{error}");
+        assert!(error.contains("repositories"), "{error}");
+
+        let error =
+            PolicyManifest::from_yaml(&format!("{prefix}    repositories: not-a-repository\n"))
+                .expect_err("invalid repository is refused")
+                .to_string();
+        assert!(error.contains("not-a-repository"), "{error}");
+    }
+
+    #[test]
     fn loop_cadence_grammar_is_closed_and_renders_systemd_calendar_values() {
-        let prefix = "manifest_version: 1\nactors: {builder: {}}\noperations: {work: {steps: []}}\ngrants:\n  work: {actors: builder, operations: work, repositories: placeholder-org/repo}\nloops:\n  cadence:\n    actor: builder\n    operation: work\n    target: placeholder-org/repo\n    every: ";
+        let prefix = "manifest_version: 1\nactors: {builder: {}}\noperations: {work: {steps: []}}\ngrants:\n  work: {actors: builder, operations: work, repositories: placeholder-org/repo}\nloops:\n  cadence:\n    actor: builder\n    operation: work\n    repositories: placeholder-org/repo\n    every: ";
         for (value, expected) in [
             ("hourly\n", "hourly"),
             ("'*:45'\n", "*-*-* *:45:00"),
@@ -2378,7 +2500,7 @@ denies:
         let declared = chrono::DateTime::parse_from_rfc3339("2026-08-24T08:16:00+08:00")
             .expect("fixed civil time");
         let due = PolicyManifest::from_yaml(
-            "manifest_version: 1\nactors: {builder: {}}\noperations: {work: {steps: []}}\ngrants:\n  work: {actors: builder, operations: work, repositories: placeholder-org/repo}\nloops:\n  due: {actor: builder, operation: work, target: placeholder-org/repo, every: '08:15..21:15'}\n",
+            "manifest_version: 1\nactors: {builder: {}}\noperations: {work: {steps: []}}\ngrants:\n  work: {actors: builder, operations: work, repositories: placeholder-org/repo}\nloops:\n  due: {actor: builder, operation: work, repositories: placeholder-org/repo, every: '08:15..21:15'}\n",
         )
         .expect("loop manifest")
         .resolve_loop("due")
@@ -2413,7 +2535,7 @@ denies:
     #[test]
     fn loop_ceilings_inherit_independently_and_can_override_one_value() {
         let manifest = PolicyManifest::from_yaml(
-            "manifest_version: 1\ndefaults:\n  loop: {concurrent: 6, spend_usd: 50, tokens: 200000}\nactors: {builder: {}}\noperations: {work: {steps: []}}\ngrants:\n  work: {actors: builder, operations: work, repositories: placeholder-org/repo}\nloops:\n  day: {actor: builder, operation: work, target: placeholder-org/repo, every: hourly}\n  night: {actor: builder, operation: work, target: placeholder-org/repo, every: hourly, concurrent: 2}\n",
+            "manifest_version: 1\ndefaults:\n  loop: {concurrent: 6, spend_usd: 50, tokens: 200000}\nactors: {builder: {}}\noperations: {work: {steps: []}}\ngrants:\n  work: {actors: builder, operations: work, repositories: placeholder-org/repo}\nloops:\n  day: {actor: builder, operation: work, repositories: placeholder-org/repo, every: hourly}\n  night: {actor: builder, operation: work, repositories: placeholder-org/repo, every: hourly, concurrent: 2}\n",
         )
         .expect("loop manifest");
         let day = manifest.resolve_loop("day").expect("day loop");

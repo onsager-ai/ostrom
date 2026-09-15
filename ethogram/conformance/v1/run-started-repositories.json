@@ -1,0 +1,16 @@
+{
+  "v": 1,
+  "type": "run.started",
+  "runId": "builder-loop-repositories-20260915T080000000Z-1-0",
+  "seq": 1,
+  "ts": "2026-09-15T08:00:00.000Z",
+  "payload": {
+    "actor": "builder",
+    "harness": "fixture",
+    "kind": "handoff",
+    "repositories": [
+      "placeholder-org/alpha",
+      "placeholder-org/beta"
+    ]
+  }
+}

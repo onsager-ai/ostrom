@@ -76,14 +76,19 @@ OSTROM_HOME=/path/to/ostrom-state cargo run -p ostrom-cli -- plan
 
 `ostrom sweep` authenticates once per distinct roster organization, performs
 bounded issue, open-PR, recent-merge, and default-branch CI reads, and writes
-the private queue and incremental state. Publishing is disabled unless an
+the private queue and incremental state. Its full roster is the comma-separated
+`owner/name` set in `OSTROM_AVAILABLE_REPOSITORIES`. When that input is absent,
+the compatibility roster is the union of repositories named by grants, denies,
+and mandate projects. An available repository without an authored mandate
+project receives the active, unclassified default project. Publishing is disabled unless an
 explicit typed destination is supplied with `--publish-repository owner/repo`;
 a scratch `OSTROM_HOME` can therefore never inherit the production hub target.
 The checked-in Bash sweep remains the live fallback and is not invoked by the
 Rust sweep.
 
-`ostrom plan` refreshes stale and never-run authored mechanical criteria, runs
-the same sweep, then strictly reads `goals.yaml`, mirrors durable check
+`ostrom plan` refreshes stale and never-run authored mechanical criteria, reuses
+a successful sweep generation younger than `sweep.max_age` or refreshes it,
+then strictly reads `goals.yaml`, mirrors durable check
 receipts, derives goal facts, and writes private `plan.json` plus its
 acknowledgement ledger. A goal is not semantically assessed while any cited
 criterion remains stale or never run; a recorded failing verdict remains a
@@ -238,8 +243,9 @@ project suppresses routine work but never reserved refs, tripwires, or failing
 CI. The first sweep baselines existing work, and selector changes re-baseline
 scope rather than flooding the queue.
 
-Run the sweep hourly outside Claude Code. Without an explicit
-`--publish-repository`, it writes only private queue and state. Incremental runs ask the
+Passes refresh the sweep on demand before starting an agent session. Manual
+sweeps remain available; without an explicit `--publish-repository`, they write
+only private queue and state. Incremental runs ask the
 issues REST change feed only for updates after the stored cursor and reuse each
 repository's ETag, so a quiet repository receives a rate-limit-free `304`.
 Open pull requests are still listed in full because check-rollup and changed-file
@@ -269,13 +275,13 @@ sweep:
   detect_every: 5m
 ```
 
-Those are the defaults for an authored `sweep: {}` section. Durations use a
+Those defaults also apply when `sweep` is absent. Durations use a
 positive integer followed by `s`, `m`, `h`, `d`, or `w`, exactly as check
-freshness durations do. These values describe cadence for callers, not a
-scheduler this crate starts. Nothing reads `detect_every` yet: it is the cadence
+freshness durations do. `ostrom pass` and `ostrom plan` enforce `max_age`
+against the latest successful generation. Nothing reads `detect_every` yet: it is the cadence
 for the change detection tracked in ostrom #531, which ships no flag here.
-`init` omits the section. Authored sweep loops and the `sweep` loop preset
-remain available for a local schedule.
+`init` omits the section. The sweep preset retains its actor, manual operation,
+and grant but declares no loop, so `ostrom up` does not schedule a sweep.
 
 The SessionStart hook never calls `gh`; it renders the durable files written by
 the scheduled sweep and performs only the local portion of the drift scan. It
@@ -511,7 +517,8 @@ in the operator manifest are expected and produce no finding.
 currently resolved, signed operator policy into a portable repository manifest.
 Omitting `--output` (or using `--output -`) writes YAML to stdout. The
 projection keeps applicable grants, denies, checks, selectors, operations, and
-repository-targeted loops,
+loops whose empty repository list applies everywhere or whose list includes the
+selected repository,
 removes the already-selected repository dimension from rules, and declares no
 actors. Generation does not sign or adopt the output; review and sign it before
 placing it at a repository policy entrypoint.

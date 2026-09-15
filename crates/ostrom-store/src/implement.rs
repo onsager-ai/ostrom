@@ -352,6 +352,7 @@ fn run_implement_with_registry_and_minter(
                 .map(|runner| runner.default_model().to_owned()),
             schedule: None,
             repository: order.as_ref().ok().map(|order| order.repository.clone()),
+            repositories: None,
             work_order: order.as_ref().ok().map(|order| order.order_id.clone()),
             ceilings: order.as_ref().ok().map(|order| EventRunCeilings {
                 cost_usd: Some(order.cost()),

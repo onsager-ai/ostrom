@@ -27,6 +27,8 @@ pub struct SelectRequest {
     pub paths: OstromPaths,
     pub working_directory: PathBuf,
     pub action: SelectAction,
+    /// `Some(empty)` deliberately selects no repository.
+    pub repositories: Option<BTreeSet<String>>,
     pub clock: Clock,
 }
 
@@ -112,6 +114,14 @@ pub fn run_selection(request: &SelectRequest) -> Result<(SelectOutcome, Vec<Stri
     let authorized = queue_items
         .iter()
         .enumerate()
+        .filter(|(index, _)| {
+            request.repositories.as_ref().is_none_or(|repositories| {
+                queue[*index]
+                    .get("repo")
+                    .and_then(Value::as_str)
+                    .is_some_and(|repository| repositories.contains(repository))
+            })
+        })
         .filter(|(index, item)| authorized(item, &queue[*index]))
         .collect::<Vec<_>>();
     let candidates = authorized

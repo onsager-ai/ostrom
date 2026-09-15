@@ -45,6 +45,8 @@ pub struct DispatchRequest {
     pub working_directory: PathBuf,
     pub plugin_root: PathBuf,
     pub order_file: PathBuf,
+    /// `Some(empty)` refuses every work order.
+    pub repositories: Option<BTreeSet<String>>,
     pub clock: Clock,
 }
 
@@ -204,6 +206,28 @@ fn run_dispatch_with_registry_and_minter(
         listing: ListingState::empty(),
         matched_key: None,
     };
+
+    if request
+        .repositories
+        .as_ref()
+        .is_some_and(|repositories| !repositories.contains(context.order.repository.as_str()))
+    {
+        let _ = append_failure(
+            &context,
+            "repository-outside-effective-set",
+            FailureDetail {
+                repository: Some(context.order.repository.clone()),
+                ..FailureDetail::default()
+            },
+        );
+        return Err(DispatchError::new(
+            3,
+            format!(
+                "ostrom dispatch: repository-outside-effective-set: {}",
+                context.order.repository
+            ),
+        ));
+    }
 
     let retention_days = configured_retention_days()
         .map_err(|error| DispatchError::new(2, format!("ostrom dispatch: {error}")))?;

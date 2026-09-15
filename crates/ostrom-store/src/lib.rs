@@ -27,6 +27,7 @@ mod queue;
 mod reap;
 mod repair;
 mod replay;
+mod repository_scope;
 mod run_events;
 mod selection;
 mod selector;
@@ -68,7 +69,7 @@ pub use leaves::{
 };
 pub use pass::{
     MAX_TURNS as PASS_MAX_TURNS, PASS_KILL_GRACE_MS, PassError, PassRequest, PassRole,
-    TRIAGE_PROMPT, run_pass,
+    PassSweepRequest, TRIAGE_PROMPT, run_pass,
 };
 pub use paths::OstromPaths;
 pub use plan::{
@@ -94,6 +95,12 @@ pub use reap::{
 };
 pub use repair::{RepairOptions, RepairOutput, run_repair_prs};
 pub use replay::{ReplayError, ReplayOptions, replay};
+pub use repository_scope::{
+    AvailableRepositoriesError, EffectiveRepositories, REPOSITORY_NOT_AVAILABLE,
+    REPOSITORY_NOT_GRANTED, SkippedRepository, available_repositories, effective_repositories,
+    inherited_repository_scope, parse_repository_list, project_available_mandates,
+    resolve_available_repositories,
+};
 pub use run_events::{RunEventError, RunEventGuard, RunEventStart, generated_run_id};
 pub use selection::{
     PlanApplication, SelectAction, SelectError, SelectOutcome, SelectRequest, encode_selection,
@@ -106,6 +113,9 @@ pub use sweep::{
     encode_org_snapshots_with_faults, load_config, load_config_or_defaults,
     run_selected_sweep_with_publication_source, run_sweep, run_sweep_with_mirror,
     run_sweep_with_publication_source, validate_roster_coverage,
+};
+pub use sweep::{
+    SweepGeneration, generation_is_fresh, latest_successful_generation, load_sweep_snapshot,
 };
 pub use trace::{
     MalformedTraceRow, TraceActionError, TraceFactRecord, TraceRead, TraceView,

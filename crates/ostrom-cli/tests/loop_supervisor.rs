@@ -50,7 +50,7 @@ loops:
   builder-day:
     actor: builder
     operation: scheduled-work
-    target: placeholder-org/repository
+    repositories: placeholder-org/repository
     every: {cadence}
 "#
         );
