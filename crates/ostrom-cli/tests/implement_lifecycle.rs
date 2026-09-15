@@ -386,6 +386,23 @@ fn token_ceiling_is_recorded_after_codex_completes() {
 }
 
 #[test]
+fn process_backend_is_preserved_on_success_and_failure_records() {
+    for (mode, expected_kind) in [("complete", "work-completed"), ("over", "work-failed")] {
+        let fixture = Fixture::new(100);
+        fixture.acquire();
+        let status = fixture
+            .command(mode)
+            .env("MANDATE_DISPATCH_BACKEND", "process")
+            .status()
+            .expect("run process-backend implementer");
+        assert_eq!(status.success(), mode == "complete");
+        let terminal = fixture.trace().pop().expect("terminal trace");
+        assert_eq!(terminal["kind"], expected_kind);
+        assert_eq!(terminal["fact"]["backend"], "process");
+    }
+}
+
+#[test]
 fn inherited_lease_refusal_still_emits_a_terminal_run() {
     let fixture = Fixture::new(100);
     fs::write(

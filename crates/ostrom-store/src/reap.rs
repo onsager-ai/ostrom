@@ -176,7 +176,7 @@ fn inspect_worktree(
         .state
         .join(format!("implementer-item-{item_hash}.lease"));
     match read_lease(&lease_path) {
-        Ok(Some(lease)) if lease.expires_at > options.clock.epoch_seconds() => {
+        Ok(Some(lease)) if lease.is_live(options.clock.epoch_seconds()) => {
             report.reason = "live-implementer-lease".to_owned();
             return report;
         }

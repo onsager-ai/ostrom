@@ -210,3 +210,120 @@ fn clear_names_one_stranded_order_and_refuses_a_live_one() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("still running"));
     assert_eq!(live.trace().len(), 1);
 }
+
+#[test]
+fn a_recycled_process_pid_is_reaped_before_its_lease_expires() {
+    let fixture = Fixture::new("exit 97");
+    let order_id = fixture.order_id();
+    fs::write(
+        fixture.state.join("sprint.jsonl"),
+        format!(
+            "{}\n",
+            json!({
+                "ts": "2099-01-01T00:00:00Z",
+                "kind": "work-dispatched",
+                "fact": {
+                    "schema_version": 1,
+                    "item_id": ITEM_ID,
+                    "order_id": order_id,
+                    "unit_name": UNIT,
+                    "backend": "process",
+                    "cost_ceiling_usd": 20,
+                    "token_ceiling": 500000
+                },
+                "narration": {}
+            })
+        ),
+    )
+    .expect("replace dispatched trace");
+    let pid = std::process::id();
+    let start_time = process_start_time(pid).expect("test process start time");
+    fs::write(
+        fixture
+            .state
+            .join(format!("implementer-item-{}.lease", item_hash(ITEM_ID))),
+        format!(
+            "{}\n",
+            json!({
+                "owner": UNIT,
+                "started_at": 1,
+                "expires_at": 4_102_444_800_u64,
+                "pid": pid,
+                "process_group_id": pid,
+                "process_start_time": start_time + 1
+            })
+        ),
+    )
+    .expect("write recycled-pid lease");
+
+    let output = fixture
+        .command()
+        .args(["work-order", "create", fixture.candidate.to_str().unwrap()])
+        .output()
+        .expect("replace order with recycled pid");
+    assert_success(&output);
+    let reaped = &fixture.trace()[1];
+    assert_eq!(reaped["fact"]["reason"], "stale-order-reaped");
+    assert_eq!(reaped["fact"]["backend"], "process");
+    assert_eq!(
+        reaped["fact"]["message"],
+        "process pid is dead or its start time differs"
+    );
+}
+
+#[test]
+fn an_untraced_dead_process_lease_does_not_block_order_replacement() {
+    let fixture = Fixture::new("exit 97");
+    fs::remove_file(fixture.state.join("sprint.jsonl")).expect("remove dispatch trace");
+    let pid = std::process::id();
+    let start_time = process_start_time(pid).expect("test process start time");
+    fs::write(
+        fixture
+            .state
+            .join(format!("implementer-item-{}.lease", item_hash(ITEM_ID))),
+        format!(
+            "{}\n",
+            json!({
+                "owner": UNIT,
+                "started_at": 1,
+                "expires_at": 4_102_444_800_u64,
+                "pid": pid,
+                "process_group_id": pid,
+                "process_start_time": start_time + 1
+            })
+        ),
+    )
+    .expect("write untraced dead process lease");
+
+    let output = fixture
+        .command()
+        .args(["work-order", "create", fixture.candidate.to_str().unwrap()])
+        .output()
+        .expect("replace order after dead process lease");
+    assert_success(&output);
+    assert!(
+        !fixture
+            .state
+            .join(format!("implementer-item-{}.lease", item_hash(ITEM_ID)))
+            .exists()
+    );
+}
+
+fn item_hash(item_id: &str) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .args(["work-order", "item-hash", item_id])
+        .output()
+        .expect("calculate item hash");
+    assert_success(&output);
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+fn process_start_time(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}

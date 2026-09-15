@@ -280,6 +280,16 @@ fn default_page() -> String {
     json!([{"name":"main","commit":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]).to_string()
 }
 
+fn process_start_time(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
 fn matched_page() -> String {
     json!([
         {"name":"main","commit":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},
@@ -1244,6 +1254,36 @@ fn a_live_item_lease_refuses_without_replacing_or_releasing_it() {
 }
 
 #[test]
+fn a_dead_process_lease_is_replaced_before_dispatch_guards_run() {
+    let fixture = Fixture::new();
+    let pid = std::process::id();
+    let start_time = process_start_time(pid).expect("test process start time");
+    fs::write(
+        fixture.lease(),
+        format!(
+            "{}\n",
+            json!({
+                "owner": "ostrom-implementer-prior",
+                "started_at": fixture.now,
+                "expires_at": fixture.now + 3_600,
+                "pid": pid,
+                "process_group_id": pid,
+                "process_start_time": start_time + 1
+            })
+        ),
+    )
+    .expect("write dead process lease");
+    let output = run(fixture
+        .command()
+        .env("OSTROM_TEST_BRANCH_PAGE_1", default_page())
+        .env("MANDATE_DISPATCH_BACKEND", "process")
+        .env("MANDATE_DAILY_CAP_USD", "1"));
+    assert_refused(&output, 3, "daily spend cap would be exceeded");
+    assert!(!fixture.lease().exists());
+    assert!(!fixture.calls.exists());
+}
+
+#[test]
 fn repository_concurrency_overrides_and_other_repositories_leave_room() {
     for (item, roster_limit, env_limit) in [
         ("example-org/other-repo#1", None, None),
@@ -1365,6 +1405,95 @@ fn projected_daily_spend_refuses_before_launch_and_releases_the_lease() {
     );
     ostrom_core::EventPayload::new(facts[0]["fact"].as_object().unwrap().clone())
         .expect("budget fact has no narration");
+}
+
+#[test]
+fn process_backend_refuses_capacity_and_budget_before_launch() {
+    let base_trace = |timestamp: &str, item: &str, order: &str| {
+        format!(
+            "{{\"ts\":{timestamp:?},\"kind\":\"work-dispatched\",\"fact\":{{\"item_id\":{item:?},\"order_id\":{order:?},\"unit_name\":\"ostrom-implementer-placeholder\",\"cost_ceiling_usd\":20,\"token_ceiling\":500000}},\"narration\":{{}}}}\n"
+        )
+    };
+    for (items, extra, message) in [
+        (
+            vec![
+                ("example-org/other-repo#1", "other-one"),
+                ("example-org/other-repo#2", "other-two"),
+            ],
+            None,
+            "concurrency limit reached (2/2)",
+        ),
+        (
+            vec![("example-org/example-repo#9", "same-repo")],
+            Some(("MANDATE_MAX_IMPLEMENTERS", "6")),
+            "per-repository concurrency limit reached",
+        ),
+    ] {
+        let fixture = Fixture::new();
+        let timestamp = fixture.timestamp();
+        let trace = items
+            .into_iter()
+            .map(|(item, order)| base_trace(&timestamp, item, order))
+            .collect::<String>();
+        fs::write(fixture.state.join("sprint.jsonl"), &trace).expect("write in-flight trace");
+        let mut command = fixture.command();
+        command
+            .env("OSTROM_TEST_BRANCH_PAGE_1", default_page())
+            .env("MANDATE_DISPATCH_BACKEND", "process");
+        if let Some((name, value)) = extra {
+            command.env(name, value);
+        }
+        let output = run(&mut command);
+        assert_refused(&output, 3, message);
+        assert_eq!(
+            fs::read_to_string(fixture.state.join("sprint.jsonl")).unwrap(),
+            trace
+        );
+        assert!(!fixture.calls.exists());
+        assert!(!fixture.lease().exists());
+    }
+
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.state.join("sprint.jsonl"),
+        format!(
+            "{{\"ts\":\"{}T00:00:00Z\",\"kind\":\"pass-ended\",\"fact\":{{\"cost_usd\":31}},\"narration\":{{}}}}\n",
+            fixture.today()
+        ),
+    )
+    .expect("write spend trace");
+    let output = run(fixture
+        .command()
+        .env("OSTROM_TEST_BRANCH_PAGE_1", default_page())
+        .env("MANDATE_DISPATCH_BACKEND", "process")
+        .env("MANDATE_DAILY_CAP_USD", "50"));
+    assert_refused(&output, 3, "daily spend cap would be exceeded");
+    assert_eq!(
+        fixture
+            .trace()
+            .into_iter()
+            .filter(|row| row["kind"] == "decision-requested")
+            .count(),
+        1
+    );
+    assert!(!fixture.calls.exists());
+    assert!(!fixture.lease().exists());
+}
+
+#[test]
+fn an_unknown_backend_names_both_accepted_values() {
+    let fixture = Fixture::new();
+    let output = run(fixture
+        .command()
+        .env("OSTROM_TEST_BRANCH_PAGE_1", default_page())
+        .env("MANDATE_DISPATCH_BACKEND", "placeholder"));
+    assert_refused(
+        &output,
+        2,
+        "unsupported backend: placeholder; accepted values: systemd, process",
+    );
+    assert!(!fixture.calls.exists());
+    assert!(!fixture.lease().exists());
 }
 
 #[test]
