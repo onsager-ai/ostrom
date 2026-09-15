@@ -5,7 +5,9 @@ use std::{
     fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 use ostrom_core::WorkOrder;
@@ -299,6 +301,221 @@ fn invalid_order_after_lease_adoption_releases_the_lease() {
     assert_eq!(events[1]["payload"]["outcome"], "failed");
 }
 
+#[test]
+fn process_backend_launches_a_detached_session_with_the_systemd_environment() {
+    let fixture = DispatchFixture::new(false);
+    let worker_calls = fixture.root.path().join("worker.calls");
+    let worker_environment = fixture.root.path().join("worker.env");
+    let worker = fixture.root.path().join("implementer-stub");
+    executable(
+        &worker,
+        &format!(
+            "printf '%s\\n' called >>'{}'\nenv >'{}'\nprintf '%s\\n' process-stdout\nprintf '%s\\n' process-stderr >&2\ni=0; while [ \"$i\" -lt 30 ]; do sleep 1; i=$((i + 1)); done",
+            worker_calls.display(),
+            worker_environment.display()
+        ),
+    );
+    let seam_calls = fixture.root.path().join("manager.calls");
+    let systemd_run = failing_seam(&fixture.root, "systemd-run-fail", &seam_calls);
+    let systemctl = failing_seam(&fixture.root, "systemctl-fail", &seam_calls);
+    let output = fixture
+        .dispatch(false)
+        .env("MANDATE_DISPATCH_BACKEND", "process")
+        .env("MANDATE_OSTROM_BIN", &worker)
+        .env("MANDATE_SYSTEMD_RUN_BIN", systemd_run)
+        .env("MANDATE_SYSTEMCTL_BIN", systemctl)
+        .env("OSTROM_TEST_DISPATCHER_SECRET", "sentinel")
+        .output()
+        .expect("dispatch through process backend");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let lease = process_lease(&fixture);
+    let pid = lease["pid"].as_u64().expect("lease pid") as u32;
+    let process_group = lease["process_group_id"]
+        .as_u64()
+        .expect("lease process group") as u32;
+    let _guard = KillProcessGroup(process_group);
+    assert_eq!(pid, process_group);
+    assert!(lease["process_start_time"].as_u64().unwrap() > 0);
+    let identity = proc_identity(pid).expect("live process identity");
+    assert_eq!(identity.0, process_group);
+    assert_eq!(identity.1, pid, "the process must lead a new session");
+    assert!(!seam_calls.exists(), "service-manager seams were invoked");
+    assert_eq!(fs::read_to_string(&worker_calls).unwrap(), "called\n");
+    let environment = fs::read_to_string(worker_environment).expect("captured environment");
+    for expected in [
+        format!("OSTROM_HOME={}", fixture.state.display()),
+        format!("HOME={}", fixture.home.display()),
+        format!("OSTROM_PLUGIN_ROOT={}", plugin_root().display()),
+        format!(
+            "MANDATE_IMPLEMENTER_SOURCE_REPO={}",
+            fixture.source.display()
+        ),
+        "MANDATE_DAILY_CAP_USD=50".to_owned(),
+        "MANDATE_MAX_IMPLEMENTERS=2".to_owned(),
+        "MANDATE_MAX_IMPLEMENTERS_PER_REPOSITORY=1".to_owned(),
+        "MANDATE_DISPATCH_BACKEND=process".to_owned(),
+        format!(
+            "MANDATE_LEASE_NAME=implementer-item-{}.lease",
+            fixture.item_hash
+        ),
+    ] {
+        assert!(
+            environment.lines().any(|line| line == expected),
+            "{environment}"
+        );
+    }
+    for absent in [
+        "CLAUDE_CONFIG_DIR=",
+        "MANDATE_GH_AS_BIN=",
+        "OSTROM_TEST_DISPATCHER_SECRET=",
+    ] {
+        assert!(
+            !environment.lines().any(|line| line.starts_with(absent)),
+            "unexpected inherited variable {absent}: {environment}"
+        );
+    }
+    assert!(environment.lines().any(|line| line.starts_with("PATH=")));
+    let log = fixture
+        .state
+        .join(format!("implementer-item-{}.log", fixture.item_hash));
+    let log_contents = fs::read_to_string(&log).expect("implementer log");
+    assert!(log_contents.contains("process-stdout"), "{log_contents}");
+    assert!(log_contents.contains("process-stderr"), "{log_contents}");
+    assert_eq!(
+        fs::metadata(log).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let trace = trace(&fixture.state);
+    let dispatched = trace
+        .iter()
+        .find(|row| row["kind"] == "work-dispatched")
+        .expect("work-dispatched row");
+    assert_eq!(dispatched["fact"]["backend"], "process");
+}
+
+#[test]
+fn killing_the_dispatcher_does_not_kill_or_duplicate_the_process_implementer() {
+    let fixture = DispatchFixture::new(false);
+    let worker_calls = fixture.root.path().join("durable-worker.calls");
+    let worker = fixture.root.path().join("durable-implementer-stub");
+    executable(
+        &worker,
+        &format!(
+            "printf '%s\\n' called >>'{}'\ni=0; while [ \"$i\" -lt 30 ]; do sleep 1; i=$((i + 1)); done",
+            worker_calls.display()
+        ),
+    );
+    let seam_calls = fixture.root.path().join("durable-manager.calls");
+    let systemd_run = failing_seam(&fixture.root, "durable-systemd-run-fail", &seam_calls);
+    let systemctl = failing_seam(&fixture.root, "durable-systemctl-fail", &seam_calls);
+    let configure = |command: &mut Command| {
+        command
+            .env("MANDATE_DISPATCH_BACKEND", "process")
+            .env("MANDATE_OSTROM_BIN", &worker)
+            .env("MANDATE_SYSTEMD_RUN_BIN", &systemd_run)
+            .env("MANDATE_SYSTEMCTL_BIN", &systemctl)
+            .env("MANDATE_IMPLEMENTER_STARTUP_GRACE_MILLISECONDS", "30000");
+    };
+    let mut first = fixture.dispatch(false);
+    configure(&mut first);
+    let mut dispatcher = first
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn dispatching process");
+    wait_until(Duration::from_secs(5), || {
+        fs::read(
+            fixture
+                .state
+                .join(format!("implementer-item-{}.lease", fixture.item_hash)),
+        )
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .is_some_and(|lease| lease["pid"].is_u64())
+    });
+    let lease = process_lease(&fixture);
+    let pid = lease["pid"].as_u64().unwrap() as u32;
+    let process_group = lease["process_group_id"].as_u64().unwrap() as u32;
+    let start_time = lease["process_start_time"].as_u64().unwrap();
+    let _guard = KillProcessGroup(process_group);
+    kill_pid(dispatcher.id(), "KILL");
+    assert!(!dispatcher.wait().unwrap().success());
+    assert_eq!(
+        proc_identity(pid).map(|identity| identity.2),
+        Some(start_time)
+    );
+
+    let mut second = fixture.dispatch(false);
+    configure(&mut second);
+    let output = second.output().expect("try duplicate dispatch");
+    assert_eq!(output.status.code(), Some(3));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("item already has a live implementer lease")
+    );
+    assert_eq!(fs::read_to_string(worker_calls).unwrap(), "called\n");
+    assert!(!seam_calls.exists(), "service-manager seams were invoked");
+}
+
+#[test]
+fn process_startup_failure_escalates_to_the_stubborn_grandchild() {
+    let fixture = DispatchFixture::new(false);
+    let group_file = fixture.root.path().join("failed-process.group");
+    let grandchild_file = fixture.root.path().join("failed-process.grandchild");
+    let term_seen = fixture.root.path().join("failed-process.term");
+    let worker = fixture.root.path().join("exiting-implementer-stub");
+    executable(
+        &worker,
+        &format!(
+            "printf '%s\\n' \"$BASHPID\" >'{}'\n( set +e; trap ': >\"{}\"' TERM; i=0; while [ \"$i\" -lt 30 ]; do sleep 1; i=$((i + 1)); done ) &\nprintf '%s\\n' \"$!\" >'{}'\nsleep 0.1\nexit 0",
+            group_file.display(),
+            term_seen.display(),
+            grandchild_file.display()
+        ),
+    );
+    let output = fixture
+        .dispatch(false)
+        .env("MANDATE_DISPATCH_BACKEND", "process")
+        .env("MANDATE_OSTROM_BIN", &worker)
+        .env("MANDATE_IMPLEMENTER_STARTUP_GRACE_MILLISECONDS", "250")
+        .env("MANDATE_IMPLEMENTER_TERMINATION_GRACE_SECONDS", "1")
+        .output()
+        .expect("dispatch short-lived process");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("exited during startup"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let process_group = fs::read_to_string(group_file)
+        .expect("process group")
+        .trim()
+        .parse::<u32>()
+        .expect("numeric process group");
+    let grandchild = fs::read_to_string(grandchild_file)
+        .expect("grandchild pid")
+        .trim()
+        .parse::<u32>()
+        .expect("numeric grandchild pid");
+    let _guard = KillProcessGroup(process_group);
+    assert!(term_seen.exists(), "the group did not receive TERM");
+    wait_until(Duration::from_secs(5), || {
+        !process_group_alive(process_group)
+    });
+    assert!(!process_group_alive(process_group));
+    assert!(!pid_alive(grandchild));
+    let failed = trace(&fixture.state)
+        .into_iter()
+        .find(|row| row["fact"]["reason"] == "dispatch-startup-failed")
+        .expect("startup failure row");
+    assert_eq!(failed["fact"]["backend"], "process");
+}
+
 fn captured_environment(path: &Path) -> BTreeMap<String, String> {
     let arguments = fs::read_to_string(path).expect("read captured systemd arguments");
     let mut environment = BTreeMap::new();
@@ -311,6 +528,95 @@ fn captured_environment(path: &Path) -> BTreeMap<String, String> {
         }
     }
     environment
+}
+
+fn process_lease(fixture: &DispatchFixture) -> Value {
+    serde_json::from_slice(
+        &fs::read(
+            fixture
+                .state
+                .join(format!("implementer-item-{}.lease", fixture.item_hash)),
+        )
+        .expect("process lease"),
+    )
+    .expect("process lease JSON")
+}
+
+fn trace(state: &Path) -> Vec<Value> {
+    fs::read_to_string(state.join("sprint.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("trace row"))
+        .collect()
+}
+
+fn proc_identity(pid: u32) -> Option<(u32, u32, u64)> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields = stat
+        .rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    Some((
+        fields.get(2)?.parse().ok()?,
+        fields.get(3)?.parse().ok()?,
+        fields.get(19)?.parse().ok()?,
+    ))
+}
+
+fn failing_seam(root: &TempDir, name: &str, calls: &Path) -> PathBuf {
+    let path = root.path().join(name);
+    executable(
+        &path,
+        &format!("printf '%s\\n' called >>'{}'; exit 97", calls.display()),
+    );
+    path
+}
+
+fn wait_until(ceiling: Duration, condition: impl Fn() -> bool) {
+    let deadline = Instant::now() + ceiling;
+    while !condition() {
+        assert!(Instant::now() < deadline, "condition was not reached");
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn kill_pid(pid: u32, signal: &str) {
+    let status = Command::new("/bin/kill")
+        .args([format!("-{signal}"), pid.to_string()])
+        .status()
+        .expect("send signal");
+    assert!(status.success());
+}
+
+fn pid_alive(pid: u32) -> bool {
+    Command::new("/bin/kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn process_group_alive(process_group: u32) -> bool {
+    Command::new("/bin/kill")
+        .args(["-0", "--", &format!("-{process_group}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+struct KillProcessGroup(u32);
+
+impl Drop for KillProcessGroup {
+    fn drop(&mut self) {
+        let _ = Command::new("/bin/kill")
+            .args(["-KILL", "--", &format!("-{}", self.0)])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
 }
 
 fn plugin_root() -> PathBuf {

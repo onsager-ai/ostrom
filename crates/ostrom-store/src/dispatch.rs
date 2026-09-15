@@ -6,7 +6,7 @@ use std::{
     fs::OpenOptions,
     io::Write,
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Child, Command, Output, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -24,8 +24,9 @@ use crate::{
         AuthenticatedCommandError, GitHubInstallationTokenMinter, InstallationTokenMinter,
         ScopedAppTokenRequest, authenticated_output,
     },
-    append_trace, configured_retention_days, environment, load_config_or_defaults, read_lease,
-    read_trace,
+    append_trace, configured_retention_days, environment,
+    lease::{ProcessIdentity, process_identity_is_live, read_process_identity},
+    load_config_or_defaults, read_lease, read_trace,
     reap::{WorktreeStatus, directory_bytes, gh_json_output, reclaim_worktree, worktree_status},
     run_events::{DISPATCH_RUN_ID, emit_decision_requests},
     sweep_worktrees,
@@ -573,18 +574,60 @@ fn after_lease(
             ),
         ));
     }
-    if context.backend != "systemd" {
-        return Err(DispatchError::new(
-            2,
-            format!("ostrom dispatch: unsupported backend: {}", context.backend),
-        ));
+    let state_environment = dispatch_state_environment(&context.request.paths);
+    let lease_name = format!("implementer-item-{}.lease", context.item_hash);
+    match context.backend.as_str() {
+        "systemd" => launch_systemd(
+            context,
+            runner_name,
+            runner_launch,
+            resolved_ostrom,
+            &state_environment,
+            &lease_name,
+            daily_cap,
+            max_implementers,
+            max_per_repository,
+        )?,
+        "process" => launch_process(
+            context,
+            runner_name,
+            runner_launch,
+            resolved_ostrom,
+            &lease_name,
+            daily_cap,
+            max_implementers,
+            max_per_repository,
+            lease,
+        )?,
+        _ => {
+            return Err(DispatchError::new(
+                2,
+                format!(
+                    "ostrom dispatch: unsupported backend: {}; accepted values: systemd, process",
+                    context.backend
+                ),
+            ));
+        }
     }
+    lease.disarm();
+    Ok(DispatchOutcome::Started(context.unit_name.clone()))
+}
 
+#[allow(clippy::too_many_arguments)]
+fn launch_systemd(
+    context: &DispatchContext<'_>,
+    runner_name: &str,
+    runner_launch: &RunnerLaunch,
+    resolved_ostrom: &Path,
+    state_environment: &str,
+    lease_name: &str,
+    daily_cap: f64,
+    max_implementers: usize,
+    max_per_repository: usize,
+) -> Result<(), DispatchError> {
     let systemd = environment::MANDATE_SYSTEMD_RUN_BIN
         .value_os()
         .map_or_else(|| PathBuf::from("systemd-run"), PathBuf::from);
-    let state_environment = dispatch_state_environment(&context.request.paths);
-    let lease_name = format!("implementer-item-{}.lease", context.item_hash);
     // The established systemd-run override is a synchronous fixture seam. Its
     // stubs either do not create units or run the child to completion, so only
     // the real backend (or a fixture with an explicit systemctl seam) can be
@@ -609,7 +652,7 @@ fn after_lease(
         "--property",
         "KillMode=control-group",
         "--setenv",
-        &state_environment,
+        state_environment,
         "--setenv",
         &format!(
             "OSTROM_PLUGIN_ROOT={}",
@@ -640,14 +683,7 @@ fn after_lease(
         .arg(runner_name)
         .status();
     if !status.is_ok_and(|status| status.success()) {
-        let _ = append_failure(
-            context,
-            "dispatch-failed",
-            FailureDetail {
-                duration_seconds: started.elapsed().as_secs(),
-                ..FailureDetail::default()
-            },
-        );
+        append_launch_failure(context, "dispatch-failed", started.elapsed());
         return Err(DispatchError::new(
             1,
             format!(
@@ -657,27 +693,130 @@ fn after_lease(
         ));
     }
     if verify_startup && !implementer_unit_is_alive(&context.unit_name) {
-        let _ = append_failure(
-            context,
-            "dispatch-startup-failed",
-            FailureDetail {
-                duration_seconds: started.elapsed().as_secs(),
-                ..FailureDetail::default()
-            },
-        );
-        return Err(DispatchError::new(
-            1,
-            format!(
-                "ostrom dispatch: implementer exited during startup: {}",
-                context.unit_name
-            ),
-        ));
+        append_launch_failure(context, "dispatch-startup-failed", started.elapsed());
+        return Err(startup_failure(context));
     }
     if verify_startup {
         append_dispatched(context)?;
     }
-    lease.disarm();
-    Ok(DispatchOutcome::Started(context.unit_name.clone()))
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_process(
+    context: &DispatchContext<'_>,
+    runner_name: &str,
+    runner_launch: &RunnerLaunch,
+    resolved_ostrom: &Path,
+    lease_name: &str,
+    daily_cap: f64,
+    max_implementers: usize,
+    max_per_repository: usize,
+    lease: &mut LeaseGuard,
+) -> Result<(), DispatchError> {
+    let started = Instant::now();
+    let (stdout, stderr) = open_process_log(context).map_err(|()| {
+        append_launch_failure(context, "dispatch-failed", started.elapsed());
+        DispatchError::new(
+            1,
+            format!(
+                "ostrom dispatch: process backend could not open the implementer log for {}",
+                context.unit_name
+            ),
+        )
+    })?;
+    let mut launch = Command::new("setsid");
+    launch
+        .env_clear()
+        .arg(resolved_ostrom)
+        .arg("implement")
+        .arg(&context.request.order_file)
+        .arg(&context.unit_name)
+        .arg(runner_name)
+        .stdin(Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr)
+        .env("OSTROM_PLUGIN_ROOT", &context.request.plugin_root)
+        .env("MANDATE_DAILY_CAP_USD", render_number(daily_cap))
+        .env("MANDATE_MAX_IMPLEMENTERS", max_implementers.to_string())
+        .env(
+            "MANDATE_MAX_IMPLEMENTERS_PER_REPOSITORY",
+            max_per_repository.to_string(),
+        )
+        .env("MANDATE_DISPATCH_BACKEND", &context.backend)
+        .env("MANDATE_LEASE_NAME", lease_name);
+    for variable in [
+        environment::HOME,
+        environment::PATH,
+        environment::CLAUDE_BIN,
+        environment::MANDATE_IMPLEMENTER_SOURCE_REPO,
+        environment::MANDATE_IMPLEMENTER_TERMINATION_GRACE_SECONDS,
+        environment::MANDATE_SECRETS_FILE,
+    ] {
+        if let Some(value) = variable.value_os() {
+            launch.env(variable.name, value);
+        }
+    }
+    set_process_state_environment(&mut launch, &context.request.paths);
+    for (name, value) in runner_launch.environment() {
+        launch.env(name, value);
+    }
+    let mut child = launch.spawn().map_err(|_| {
+        append_launch_failure(context, "dispatch-failed", started.elapsed());
+        DispatchError::new(
+            1,
+            format!(
+                "ostrom dispatch: process backend failed to launch {}",
+                context.unit_name
+            ),
+        )
+    })?;
+    let Some(identity) = wait_for_process_session(&mut child) else {
+        stop_process_child(&mut child);
+        append_launch_failure(context, "dispatch-startup-failed", started.elapsed());
+        return Err(startup_failure(context));
+    };
+    if lease.bind_process(identity).is_err() {
+        stop_process_child(&mut child);
+        append_launch_failure(context, "dispatch-failed", started.elapsed());
+        return Err(DispatchError::new(
+            1,
+            format!(
+                "ostrom dispatch: process backend could not record the lease for {}",
+                context.unit_name
+            ),
+        ));
+    }
+    wait_for_startup_grace();
+    if child.try_wait().ok().flatten().is_some()
+        || !process_identity_is_live(identity.pid, identity.start_time)
+    {
+        stop_process_child(&mut child);
+        append_launch_failure(context, "dispatch-startup-failed", started.elapsed());
+        return Err(startup_failure(context));
+    }
+    if let Err(error) = append_dispatched(context) {
+        stop_process_child(&mut child);
+        return Err(error);
+    }
+    drop(child);
+    Ok(())
+}
+
+fn open_process_log(context: &DispatchContext<'_>) -> Result<(fs::File, fs::File), ()> {
+    let path = context
+        .request
+        .paths
+        .state
+        .join(format!("implementer-item-{}.log", context.item_hash));
+    let stderr = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|_| ())?;
+    crate::set_private_file_mode(&path).map_err(|_| ())?;
+    let stdout = stderr.try_clone().map_err(|_| ())?;
+    Ok((stdout, stderr))
 }
 
 fn dispatch_state_environment(paths: &OstromPaths) -> String {
@@ -690,7 +829,39 @@ fn dispatch_state_environment(paths: &OstromPaths) -> String {
         )
 }
 
-fn implementer_unit_is_alive(unit_name: &str) -> bool {
+fn set_process_state_environment(command: &mut Command, paths: &OstromPaths) {
+    if let Some(config) = environment::CLAUDE_CONFIG_DIR
+        .value_os()
+        .filter(|value| !value.to_string_lossy().trim().is_empty())
+    {
+        command
+            .env_remove("OSTROM_HOME")
+            .env("CLAUDE_CONFIG_DIR", config);
+    } else {
+        command
+            .env_remove("CLAUDE_CONFIG_DIR")
+            .env("OSTROM_HOME", &paths.state);
+    }
+}
+
+fn wait_for_process_session(child: &mut Child) -> Option<ProcessIdentity> {
+    let pid = child.id();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        if let Some(identity) = read_process_identity(pid)
+            && identity.process_group_id == pid
+            && identity.session_id == pid
+        {
+            return Some(identity);
+        }
+        if child.try_wait().ok().flatten().is_some() || Instant::now() >= deadline {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_startup_grace() {
     let grace_milliseconds = environment::MANDATE_IMPLEMENTER_STARTUP_GRACE_MILLISECONDS
         .value()
         .and_then(|value| value.parse::<u64>().ok())
@@ -698,6 +869,40 @@ fn implementer_unit_is_alive(unit_name: &str) -> bool {
     if grace_milliseconds > 0 {
         thread::sleep(Duration::from_millis(grace_milliseconds));
     }
+}
+
+fn stop_process_child(child: &mut Child) {
+    let grace = environment::MANDATE_IMPLEMENTER_TERMINATION_GRACE_SECONDS
+        .value()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map_or_else(|| Duration::from_secs(5), Duration::from_secs);
+    umwelt_runtime::process_control::terminate_child_process_group(child, grace);
+}
+
+fn append_launch_failure(context: &DispatchContext<'_>, reason: &str, duration: Duration) {
+    let _ = append_failure(
+        context,
+        reason,
+        FailureDetail {
+            duration_seconds: duration.as_secs(),
+            ..FailureDetail::default()
+        },
+    );
+}
+
+fn startup_failure(context: &DispatchContext<'_>) -> DispatchError {
+    DispatchError::new(
+        1,
+        format!(
+            "ostrom dispatch: implementer exited during startup: {}",
+            context.unit_name
+        ),
+    )
+}
+
+fn implementer_unit_is_alive(unit_name: &str) -> bool {
+    wait_for_startup_grace();
     let systemctl = environment::MANDATE_SYSTEMCTL_BIN
         .value_os()
         .map_or_else(|| PathBuf::from("systemctl"), PathBuf::from);
@@ -1334,7 +1539,7 @@ fn reclaim_merged_worktree(
         .state
         .join(format!("implementer-item-{}.lease", context.item_hash));
     match read_lease(&lease_path) {
-        Ok(Some(lease)) if lease.expires_at > context.request.clock.epoch_seconds() => {
+        Ok(Some(lease)) if lease.is_live(context.request.clock.epoch_seconds()) => {
             let _ = append_failure(
                 context,
                 "live-implementer-lease",
@@ -1889,6 +2094,18 @@ struct LeaseGuard {
 }
 
 impl LeaseGuard {
+    fn bind_process(&self, identity: ProcessIdentity) -> Result<(), ()> {
+        let mut lease = read_lease(&self.path)
+            .ok()
+            .flatten()
+            .filter(|lease| lease.owner == self.owner)
+            .ok_or(())?;
+        lease.pid = Some(identity.pid);
+        lease.process_group_id = Some(identity.process_group_id);
+        lease.process_start_time = Some(identity.start_time);
+        crate::write_lease(&self.path, &lease).map_err(|_| ())
+    }
+
     fn release(&mut self) {
         if self.armed
             && read_lease(&self.path)
@@ -1921,7 +2138,12 @@ fn acquire_dispatch_lease(
     let now = clock.epoch_seconds();
     if let Ok(Some(existing)) = read_lease(path) {
         let derived_expiry = existing.started_at.saturating_add(ttl);
-        if existing.expires_at.min(derived_expiry) > now {
+        let live = if existing.process_identity().is_some() {
+            existing.is_live(now)
+        } else {
+            existing.expires_at.min(derived_expiry) > now
+        };
+        if live {
             return Err(3);
         }
         fs::remove_file(path).map_err(|_| 3)?;
@@ -1935,6 +2157,9 @@ fn acquire_dispatch_lease(
         owner: owner.to_owned(),
         started_at: now,
         expires_at: now.saturating_add(ttl),
+        pid: None,
+        process_group_id: None,
+        process_start_time: None,
     };
     let mut file = OpenOptions::new()
         .write(true)
