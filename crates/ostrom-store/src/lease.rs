@@ -1,8 +1,7 @@
 use std::{
     fs,
-    io::Write,
+    io::{self, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
 };
 
 use serde::{Deserialize, Serialize};
@@ -32,6 +31,13 @@ pub(crate) struct ProcessIdentity {
     pub process_group_id: u32,
     pub session_id: u32,
     pub start_time: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProcessLiveness {
+    Live,
+    NotLive,
+    Unknown,
 }
 
 #[derive(Debug, Error)]
@@ -123,44 +129,84 @@ impl LeaseRecord {
     #[must_use]
     pub(crate) fn is_live(&self, now: u64) -> bool {
         self.process_identity()
-            .map_or(self.expires_at > now, |(pid, _, start_time)| {
-                process_identity_is_live(pid, start_time)
-            })
+            .map_or(
+                self.expires_at > now,
+                |(pid, _, start_time)| match process_identity_is_live(pid, start_time) {
+                    ProcessLiveness::Live => true,
+                    ProcessLiveness::NotLive => false,
+                    ProcessLiveness::Unknown => self.expires_at > now,
+                },
+            )
     }
 }
 
-pub(crate) fn read_process_identity(pid: u32) -> Option<ProcessIdentity> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+pub(crate) fn read_process_identity(pid: u32) -> io::Result<Option<ProcessIdentity>> {
+    read_process_identity_at(Path::new("/proc"), pid)
+}
+
+fn read_process_identity_at(proc_root: &Path, pid: u32) -> io::Result<Option<ProcessIdentity>> {
+    let stat_path = proc_root.join(pid.to_string()).join("stat");
+    let stat = match fs::read_to_string(&stat_path) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::read_to_string(proc_root.join("self/stat"))?;
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
     let fields = stat
-        .rsplit_once(')')?
+        .rsplit_once(')')
+        .ok_or_else(invalid_process_stat)?
         .1
         .split_whitespace()
         .collect::<Vec<_>>();
-    Some(ProcessIdentity {
+    let identity = ProcessIdentity {
         pid,
-        state: fields.first()?.chars().next()?,
-        process_group_id: fields.get(2)?.parse().ok()?,
-        session_id: fields.get(3)?.parse().ok()?,
-        start_time: fields.get(19)?.parse().ok()?,
-    })
+        state: fields
+            .first()
+            .and_then(|field| field.chars().next())
+            .ok_or_else(invalid_process_stat)?,
+        process_group_id: fields
+            .get(2)
+            .ok_or_else(invalid_process_stat)?
+            .parse()
+            .map_err(|_| invalid_process_stat())?,
+        session_id: fields
+            .get(3)
+            .ok_or_else(invalid_process_stat)?
+            .parse()
+            .map_err(|_| invalid_process_stat())?,
+        start_time: fields
+            .get(19)
+            .ok_or_else(invalid_process_stat)?
+            .parse()
+            .map_err(|_| invalid_process_stat())?,
+    };
+    Ok(Some(identity))
 }
 
-pub(crate) fn process_identity_is_live(pid: u32, start_time: u64) -> bool {
-    let command = if Path::new("/bin/kill").is_file() {
-        "/bin/kill"
-    } else {
-        "kill"
-    };
-    let signalable = Command::new(command)
-        .args(["-0", &pid.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success());
-    signalable
-        && read_process_identity(pid).is_some_and(|observed| {
-            observed.start_time == start_time && !matches!(observed.state, 'Z' | 'X')
-        })
+fn invalid_process_stat() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "invalid process stat")
+}
+
+pub(crate) fn process_identity_is_live(pid: u32, start_time: u64) -> ProcessLiveness {
+    process_identity_is_live_at(Path::new("/proc"), pid, start_time)
+}
+
+pub(crate) fn process_identity_is_live_at(
+    proc_root: &Path,
+    pid: u32,
+    start_time: u64,
+) -> ProcessLiveness {
+    match read_process_identity_at(proc_root, pid) {
+        Ok(Some(observed))
+            if observed.start_time == start_time && !matches!(observed.state, 'Z' | 'X') =>
+        {
+            ProcessLiveness::Live
+        }
+        Ok(Some(_) | None) => ProcessLiveness::NotLive,
+        Err(_) => ProcessLiveness::Unknown,
+    }
 }
 
 pub fn read_lease(path: &Path) -> Result<Option<LeaseRecord>, StoreError> {
@@ -417,6 +463,8 @@ impl Drop for LeaseGuard {
 #[cfg(test)]
 mod tests {
     use std::{
+        fs,
+        path::Path,
         process::Command,
         sync::{
             Arc,
@@ -429,7 +477,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        LeaseRecord, process_identity_is_live, read_lease, read_process_identity, write_lease,
+        LeaseRecord, ProcessLiveness, process_identity_is_live, process_identity_is_live_at,
+        read_lease, read_process_identity, write_lease,
     };
 
     #[test]
@@ -456,7 +505,9 @@ mod tests {
     fn process_identity_round_trips_and_rejects_a_recycled_pid() {
         let fixture = tempdir().expect("temp dir");
         let path = fixture.path().join("implementer-item-placeholder.lease");
-        let identity = read_process_identity(std::process::id()).expect("current process identity");
+        let identity = read_process_identity(std::process::id())
+            .expect("read current process identity")
+            .expect("current process identity");
         let lease = LeaseRecord {
             owner: "implementer-placeholder".to_owned(),
             started_at: 10,
@@ -467,11 +518,14 @@ mod tests {
         };
         write_lease(&path, &lease).expect("write process lease");
         assert_eq!(read_lease(&path).expect("read process lease"), Some(lease));
-        assert!(process_identity_is_live(identity.pid, identity.start_time));
-        assert!(!process_identity_is_live(
-            identity.pid,
-            identity.start_time + 1
-        ));
+        assert_eq!(
+            process_identity_is_live(identity.pid, identity.start_time),
+            ProcessLiveness::Live
+        );
+        assert_eq!(
+            process_identity_is_live(identity.pid, identity.start_time + 1),
+            ProcessLiveness::NotLive
+        );
     }
 
     #[test]
@@ -483,7 +537,7 @@ mod tests {
         let pid = child.id();
         let deadline = Instant::now() + Duration::from_secs(5);
         let identity = loop {
-            if let Some(identity) = read_process_identity(pid)
+            if let Ok(Some(identity)) = read_process_identity(pid)
                 && matches!(identity.state, 'Z' | 'X')
             {
                 break Some(identity);
@@ -493,12 +547,58 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(10));
         };
-        let live = identity
-            .is_some_and(|identity| process_identity_is_live(identity.pid, identity.start_time));
+        let liveness =
+            identity.map(|identity| process_identity_is_live(identity.pid, identity.start_time));
         let status = child.wait().expect("reap short-lived child");
         assert!(status.success());
         assert!(identity.is_some(), "child did not enter a terminal state");
-        assert!(!live, "terminal process state was treated as live");
+        assert_eq!(liveness, Some(ProcessLiveness::NotLive));
+    }
+
+    #[test]
+    fn process_liveness_uses_procfs_without_invoking_a_kill_command() {
+        let fixture = tempdir().expect("process information fixture");
+        write_process_stat(fixture.path(), 42, 'S', 123);
+
+        assert_eq!(
+            process_identity_is_live_at(fixture.path(), 42, 123),
+            ProcessLiveness::Live
+        );
+        assert_eq!(
+            process_identity_is_live_at(fixture.path(), 42, 124),
+            ProcessLiveness::NotLive
+        );
+
+        let production = include_str!("lease.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production lease source");
+        assert!(!production.contains("/bin/kill"));
+        assert!(!production.contains("Command::new(\"kill\")"));
+    }
+
+    #[test]
+    fn terminal_missing_and_unreadable_process_entries_are_not_live() {
+        let fixture = tempdir().expect("process information fixture");
+        write_process_stat(fixture.path(), 42, 'Z', 123);
+        assert_eq!(
+            process_identity_is_live_at(fixture.path(), 42, 123),
+            ProcessLiveness::NotLive
+        );
+        assert_eq!(
+            process_identity_is_live_at(fixture.path(), 43, 123),
+            ProcessLiveness::NotLive
+        );
+
+        fs::create_dir_all(fixture.path().join("44/stat")).expect("create unreadable stat entry");
+        assert_eq!(
+            process_identity_is_live_at(fixture.path(), 44, 123),
+            ProcessLiveness::Unknown
+        );
+        assert_eq!(
+            process_identity_is_live_at(&fixture.path().join("unavailable"), 45, 123),
+            ProcessLiveness::Unknown
+        );
     }
 
     #[test]
@@ -537,5 +637,27 @@ mod tests {
         reading.store(false, Ordering::Relaxed);
         assert!(!reader.join().expect("join lease reader"));
         assert_eq!(read_lease(&path).expect("read final lease"), Some(lease));
+    }
+
+    fn write_process_stat(root: &Path, pid: u32, state: char, start_time: u64) {
+        let directory = root.join(pid.to_string());
+        fs::create_dir_all(&directory).expect("create process entry");
+        let self_directory = root.join("self");
+        fs::create_dir_all(&self_directory).expect("create current process entry");
+        fs::write(
+            self_directory.join("stat"),
+            "process information available\n",
+        )
+        .expect("write current process stat marker");
+        let mut fields = vec!["0".to_owned(); 20];
+        fields[0] = state.to_string();
+        fields[2] = pid.to_string();
+        fields[3] = pid.to_string();
+        fields[19] = start_time.to_string();
+        fs::write(
+            directory.join("stat"),
+            format!("{pid} (fixture process) {}\n", fields.join(" ")),
+        )
+        .expect("write process stat");
     }
 }

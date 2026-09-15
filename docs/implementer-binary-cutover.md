@@ -21,13 +21,17 @@ dispatching pass may end without ending the implementer; the next pass reads
 the lease before deciding whether the item is still live. The environment's
 init process should reap orphaned processes because a process-backend
 implementer outlives its dispatcher.
+Under the process backend, the implementer currently inherits the dispatcher's
+descriptors that lack close-on-exec, so an operator should start the dispatcher
+without extra inheritable descriptors where possible.
 
 The builder coordinator hands the order to the named runner in the agent
 registry. `agent/codex` is the shipped default and there is no fallback. A
 process-backend environment must supply the `codex` binary and its credential;
 Ostrom does not provision credentials. `claude-cli` remains selectable. The
-backend also requires the `setsid` utility and a Linux process-information
-filesystem for session creation and PID-recycling-safe liveness checks.
+backend also requires the `setsid` utility and Linux procfs mounted at `/proc`
+for session creation and PID-recycling-safe liveness checks. Liveness does not
+require a separate signaling utility.
 
 Dispatch resolves the `ostrom` executable before reserving work or launching
 either backend. Set
@@ -37,6 +41,9 @@ supplies its launch environment; for Codex, this includes the resolved Node
 directory required by an npm launcher's `#!/usr/bin/env node` shebang. Both
 backends also receive the state path, `OSTROM_PLUGIN_ROOT`, the daily and
 concurrency ceilings, the selected backend, and the item lease name.
+When they are set in the dispatcher's environment, the process backend also
+passes `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, and `ALL_PROXY`, plus their
+lowercase forms. Unset variables are omitted.
 
 For a failed launch, start with the dispatch error and the terminal row in
 `$OSTROM_HOME/sprint.jsonl`. `ostrom-unavailable` means
@@ -54,8 +61,9 @@ with the recorded `process_start_time` in a non-terminal process state.
 A terminal `work-failed` row names the implementer reason and records any
 preserved worktree. Failed or terminated runs deliberately retain unpublished
 edits under `$OSTROM_HOME/implementer-worktrees/<item-hash>`; retrying the same
-item reuses that worktree. The item lease is released only after the terminal
-row is durable. The systemd backend uses `KillMode=control-group`;
+item reuses that worktree. Its implementer log is retained for diagnosis until
+the worktree is reclaimed, when the log is removed with it. The item lease is
+released only after the terminal row is durable. The systemd backend uses `KillMode=control-group`;
 process-backend launch cleanup sends TERM to the new process group, waits
 `MANDATE_IMPLEMENTER_TERMINATION_GRACE_SECONDS`, then sends KILL when the group
 remains live. Both paths cover the runner and its descendants.
