@@ -39,8 +39,8 @@ fn disk_fixtures() -> Result<Vec<(String, String)>, Box<dyn Error>> {
     Ok(fixtures)
 }
 
-/// The important assertion in this file. A `len() == 31` check alone would
-/// pass a build that compiled in 31 fixtures none of which were the right
+/// The important assertion in this file. A `len() == 32` check alone would
+/// pass a build that compiled in 32 fixtures none of which were the right
 /// ones — a substitution, not just an omission. This instead walks the
 /// directory listing and the compiled-in slice in lockstep and names exactly
 /// which position and file disagree, so a build-script regression that skips
@@ -52,8 +52,8 @@ fn the_compiled_in_set_matches_the_directory_exactly() -> Result<(), Box<dyn Err
 
     assert_eq!(
         expected.len(),
-        31,
-        "conformance/v1 on disk does not hold 31 fixtures; this test's own \
+        32,
+        "conformance/v1 on disk does not hold 32 fixtures; this test's own \
          expectation is stale, not the accessor"
     );
 
@@ -94,8 +94,8 @@ fn the_compiled_in_set_matches_the_directory_exactly() -> Result<(), Box<dyn Err
 
     assert_eq!(
         actual.len(),
-        31,
-        "ethogram::v1_fixtures() returned {} fixtures, not the expected 31 — \
+        32,
+        "ethogram::v1_fixtures() returned {} fixtures, not the expected 32 — \
          the compiled-in set does not match the directory",
         actual.len()
     );

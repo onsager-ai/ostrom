@@ -70,7 +70,7 @@ from the other.
   (onsager-ai/ethogram#70). Those are real captures and stay: immutability binds them, and a
   withdrawal is for a fixture that was a guess, never for one that is merely
   redundant. The rule is forward-looking, and it exists because captures
-  arrive several fixtures at a time — 31 fixtures span 22 distinct
+  arrive several fixtures at a time — 32 fixtures span 23 distinct
   `(type, payload-key-set)` shapes, and without a stated bar that ratio only
   falls.
 - **The corpus deliberately holds more than one shape of the same event type.**

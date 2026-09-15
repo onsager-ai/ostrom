@@ -287,6 +287,7 @@ export interface RunStartedPayload {
   parentToolUseId?: string;
   schedule?: string;
   repository?: string;
+  repositories?: string[];
   workOrder?: string;
   ceilings?: RunCeilings;
 }
@@ -869,6 +870,7 @@ const RUN_STARTED_FIELDS = new Set<string>([
   "parentToolUseId",
   "schedule",
   "repository",
+  "repositories",
   "workOrder",
   "ceilings",
 ]);
@@ -1066,6 +1068,32 @@ function optionalString(
     );
   }
   return fieldValue;
+}
+
+function optionalStringArray(
+  value: Record<string, unknown>,
+  field: string,
+  name: string,
+): string[] | undefined {
+  if (!Object.hasOwn(value, field)) {
+    return undefined;
+  }
+  const fieldValue = value[field];
+  if (!Array.isArray(fieldValue)) {
+    throw new PayloadRepresentationError(
+      `${name}.${field}`,
+      `${name}.${field} must be an array when present`,
+    );
+  }
+  return fieldValue.map((entry, index) => {
+    if (typeof entry !== "string") {
+      throw new PayloadRepresentationError(
+        `${name}.${field}[${index}]`,
+        `${name}.${field}[${index}] must be a string`,
+      );
+    }
+    return entry;
+  });
 }
 
 function optionalNumber(
@@ -1278,6 +1306,7 @@ export function parseRunStartedPayload(value: unknown): RunStartedPayload {
   const parentToolUseId = optionalString(value, "parentToolUseId", name);
   const schedule = optionalString(value, "schedule", name);
   const repository = optionalString(value, "repository", name);
+  const repositories = optionalStringArray(value, "repositories", name);
   const workOrder = optionalString(value, "workOrder", name);
   const ceilings = Object.hasOwn(value, "ceilings")
     ? parseRunCeilings(value.ceilings)
@@ -1292,6 +1321,7 @@ export function parseRunStartedPayload(value: unknown): RunStartedPayload {
     ...(parentToolUseId === undefined ? {} : { parentToolUseId }),
     ...(schedule === undefined ? {} : { schedule }),
     ...(repository === undefined ? {} : { repository }),
+    ...(repositories === undefined ? {} : { repositories }),
     ...(workOrder === undefined ? {} : { workOrder }),
     ...(ceilings === undefined ? {} : { ceilings }),
     ...extractUnknownFields(value, RUN_STARTED_FIELDS),

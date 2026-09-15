@@ -123,16 +123,19 @@ fn formats_agree_and_have_stable_order_without_operator_configuration() {
         let expected = &fixture.loops[name];
         assert_eq!(declaration.actor, expected.actor);
         assert_eq!(declaration.operation, expected.operation);
-        assert_eq!(declaration.target, expected.target);
+        assert_eq!(declaration.repositories, expected.repositories);
         assert_eq!(declaration.every, expected.every);
     }
-    assert_eq!(combined.loops.len(), 4);
+    assert_eq!(combined.loops.len(), 3);
+    assert!(!combined.loops.contains_key("sweep"));
     assert_eq!(combined.loops["builder-day"].spend_usd, Some(20.0));
     assert_eq!(combined.loops["builder-day"].concurrent, Some(1));
     let sweep = &combined.operations["portfolio-sweep"];
     assert_eq!(sweep.steps.len(), 1);
     assert_eq!(sweep.steps[0].uses, "cmd/run");
     assert_eq!(sweep.steps[0].parameters["script"], "ostrom sweep");
+    assert!(combined.actors.contains_key("sweeper"));
+    assert!(combined.grants.contains_key("sweep"));
 }
 
 #[test]
@@ -147,7 +150,14 @@ fn each_preset_composes_after_filling_all_placeholders() {
         let composed = compose(home.path());
         for name in fragment.loops.keys() {
             let resolved = composed.resolve_loop(name).expect("adopted loop resolves");
-            assert_eq!(resolved.target, "placeholder-org/adopted-repository");
+            assert_eq!(
+                resolved
+                    .repositories
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                ["placeholder-org/adopted-repository"]
+            );
         }
     }
 }

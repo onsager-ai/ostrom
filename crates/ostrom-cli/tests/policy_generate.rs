@@ -35,8 +35,8 @@ denies:
     repositories: placeholder-org/target
     where: path:protected/**
 loops:
-  target-loop: {actor: builder, operation: work, target: placeholder-org/target, every: hourly}
-  other-loop: {actor: builder, operation: work, target: placeholder-org/other, every: hourly}
+  target-loop: {actor: builder, operation: work, repositories: placeholder-org/target, every: hourly}
+  other-loop: {actor: builder, operation: work, repositories: placeholder-org/other, every: hourly}
 "#
 }
 

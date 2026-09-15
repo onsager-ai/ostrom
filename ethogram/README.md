@@ -116,7 +116,7 @@ handoffs, and relays are kinds of run, not separate concepts.
 
 | type | required payload | optional payload | meaning |
 |---|---|---|---|
-| `run.started` | `kind`, `actor`, `harness` | `model`, `parentRunId`, `parentToolUseId`, `schedule`, `repository`, `workOrder`, `ceilings` | Opens one run and records the harness identity and any declared parent or bounds. |
+| `run.started` | `kind`, `actor`, `harness` | `model`, `parentRunId`, `parentToolUseId`, `schedule`, `repository`, `repositories`, `workOrder`, `ceilings` | Opens one run and records the harness identity and any declared parent, repository scope, or bounds. |
 | `run.finished` | `outcome`, `durationMs` | `reason`, `truncated`, `costUsd`, `usage`, `estimated` | Closes one run; failures use `outcome: "failed"` and `reason` so every run has one terminal event shape. |
 
 `kind` is one of `loop`, `handoff`, `subagent`, `session`, `judgment`, or

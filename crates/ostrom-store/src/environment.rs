@@ -222,6 +222,11 @@ pub const OSTROM_ACTOR: EnvironmentVariable = variable(
     EnvironmentClass::Identity,
     "no actor; operation dispatch refuses",
 );
+pub const OSTROM_AVAILABLE_REPOSITORIES: EnvironmentVariable = variable(
+    "OSTROM_AVAILABLE_REPOSITORIES",
+    EnvironmentClass::Identity,
+    "repositories named by policy rules and mandate projects",
+);
 pub const OSTROM_EVENTS_FD: EnvironmentVariable = variable(
     "OSTROM_EVENTS_FD",
     EnvironmentClass::Location,
@@ -231,6 +236,11 @@ pub const OSTROM_CONTROL_FD: EnvironmentVariable = variable(
     "OSTROM_CONTROL_FD",
     EnvironmentClass::Location,
     "no inbound control descriptor",
+);
+pub const OSTROM_EFFECTIVE_REPOSITORIES: EnvironmentVariable = variable(
+    "OSTROM_EFFECTIVE_REPOSITORIES",
+    EnvironmentClass::Identity,
+    "no loop-bound repository scope",
 );
 pub const OSTROM_FACTS_ONLY: EnvironmentVariable = variable(
     "OSTROM_FACTS_ONLY",
@@ -291,7 +301,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvironmentVariable] = &[
     MANDATE_WORKTREE_RETENTION_DAYS,
     NVM_DIR,
     OSTROM_ACTOR,
+    OSTROM_AVAILABLE_REPOSITORIES,
     OSTROM_CONTROL_FD,
+    OSTROM_EFFECTIVE_REPOSITORIES,
     OSTROM_EVENTS_FD,
     OSTROM_FACTS_ONLY,
     OSTROM_HOME,

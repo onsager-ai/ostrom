@@ -102,7 +102,7 @@ jobs:
   # crate is not a workspace member: `cargo test --workspace` runs none of its
   # tests, and `ethogram/.github/workflows/ci.yml` is inert because GitHub runs
   # workflows only from the repository root. Without these jobs the import
-  # would silently stop running 186 Rust tests, 162 TypeScript tests, the
+  # would silently stop running 187 Rust tests, 164 TypeScript tests, the
   # cross-language conformance suite and the preserve_order probe -- and every
   # other check would stay green while it happened.
   #
@@ -126,7 +126,7 @@ jobs:
         run: |
           cargo test --manifest-path ethogram/crates/ethogram/Cargo.toml \
             2>&1 | tee ethogram-rust.log
-          node .github/scripts/assert-cargo-count.mjs ethogram-rust.log 186 ethogram
+          node .github/scripts/assert-cargo-count.mjs ethogram-rust.log 187 ethogram
 
   ethogram-preserve-order-probe:
     name: ethogram under a consumer's preserve_order
@@ -142,7 +142,7 @@ jobs:
         run: |
           cargo test --manifest-path ethogram/crates/ethogram/Cargo.toml \
             --features preserve-order-probe 2>&1 | tee ethogram-probe.log
-          node .github/scripts/assert-cargo-count.mjs ethogram-probe.log 186 "ethogram probe"
+          node .github/scripts/assert-cargo-count.mjs ethogram-probe.log 187 "ethogram probe"
 
   ethogram-typescript:
     name: ethogram TypeScript suite
@@ -173,7 +173,7 @@ jobs:
       - name: Test
         run: |
           pnpm -r test 2>&1 | tee ../ethogram-ts.log
-          node ../.github/scripts/assert-node-test-count.mjs ../ethogram-ts.log 162
+          node ../.github/scripts/assert-node-test-count.mjs ../ethogram-ts.log 164
 
   ethogram-conformance:
     name: ethogram cross-language conformance
@@ -204,7 +204,7 @@ jobs:
         working-directory: ethogram
         run: |
           ./conformance/run.sh 2>&1 | tee ../conformance.log
-          grep -q 'compared 31 fixtures' ../conformance.log
+          grep -q 'compared 32 fixtures' ../conformance.log
           grep -q 'compared 23 validation error cases' ../conformance.log
           grep -q 'compared 6 agreement inputs' ../conformance.log
 

@@ -923,7 +923,7 @@ mod tests {
     #[test]
     fn reconciler_drift_remains_owned_by_ostrom() {
         let manifest = PolicyManifest::from_yaml(
-            "manifest_version: 1\nactors: {builder: {}}\noperations: {work: {steps: []}}\ngrants: {work: {actors: builder, operations: work}}\nloops:\n  builder:\n    actor: builder\n    operation: work\n    target: placeholder/repo\n    every: hourly\n",
+            "manifest_version: 1\nactors: {builder: {}}\noperations: {work: {steps: []}}\ngrants: {work: {actors: builder, operations: work}}\nloops:\n  builder:\n    actor: builder\n    operation: work\n    repositories: placeholder/repo\n    every: hourly\n",
         )
         .expect("manifest");
         let root = tempdir().expect("fixture");

@@ -138,8 +138,44 @@ fn selection_usage_matches_the_accepted_argument_shapes() {
     assert!(output.stdout.is_empty());
     assert_eq!(
         output.stderr,
-        b"usage: ostrom select-work list | select <owner> [already-attempted-id ...]\n"
+        b"usage: ostrom select-work list [--repositories owner/name,...] | select <owner> [--repositories owner/name,...] [already-attempted-id ...]\n"
     );
+}
+
+#[test]
+fn repository_filters_cannot_select_outside_the_explicit_or_inherited_scope() {
+    let fixture = tempdir().expect("fixture");
+    write_selection_fixture(fixture.path(), 0);
+    let binary = env!("CARGO_BIN_EXE_ostrom");
+
+    let outside = Command::new(binary)
+        .args([
+            "select-work",
+            "list",
+            "--repositories",
+            "placeholder-org/beta",
+        ])
+        .env("OSTROM_HOME", fixture.path())
+        .current_dir(fixture.path())
+        .output()
+        .expect("filter selection");
+    assert!(outside.status.success());
+    assert!(outside.stdout.is_empty());
+
+    let cannot_widen = Command::new(binary)
+        .args([
+            "select-work",
+            "list",
+            "--repositories",
+            "placeholder-org/alpha",
+        ])
+        .env("OSTROM_HOME", fixture.path())
+        .env("OSTROM_EFFECTIVE_REPOSITORIES", "placeholder-org/beta")
+        .current_dir(fixture.path())
+        .output()
+        .expect("intersect inherited selection scope");
+    assert!(cannot_widen.status.success());
+    assert!(cannot_widen.stdout.is_empty());
 }
 
 #[test]

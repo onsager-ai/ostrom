@@ -191,6 +191,7 @@ fn gate_and_answer_decision_fixtures() {
         paths: paths(),
         working_directory: PathBuf::from("."),
         target: SUBJECT.to_owned(),
+        repositories: None,
         timestamp: clock().timestamp(),
     })
     .expect("run gate over fixture roster");
@@ -269,6 +270,10 @@ fn budget_decision_fixture() {
         events_fd: None,
         control_fd: None,
         facts_only: false,
+        repositories: None,
+        skipped_repositories: Vec::new(),
+        repository_scope: None,
+        sweep: None,
         caps: Default::default(),
         clock: clock(),
         platform: std::env::consts::OS,

@@ -23,25 +23,27 @@ use ostrom_core::{
     CHECK_STORE_SCHEMA_VERSION, CHECKS_VERSION, Catalogue, CatalogueEnumeration,
     CheckContractError, CheckDefinition, CheckDocument, CheckFault, CheckRun, CheckRunId,
     CheckState, CheckVerdict, InconclusivePolicy, OperationAction, PermissionMode, PolicyManifest,
-    RepositoryName, ResolvedCheck, ResolvedLoopCeilings, SelectorPrefix, agent_run_parameters,
+    RepositoryName, ResolvedCheck, ResolvedLoop, ResolvedLoopCeilings, SelectorPrefix,
+    agent_run_parameters,
 };
 use ostrom_store::{
     AgentRegistry, AssessmentHarness, AuditOptions, Clock, CodexHarness, DigestOptions,
     DispatchOutcome, DispatchRequest, ExecutableAssessmentDeriver, GateError, GateOptions,
     HarnessAssessmentDeriver, ImplementRequest, JsonlCheckStore, JsonlPublicationSource,
-    OrchestratorRunRequest, OstromPaths, PASS_KILL_GRACE_MS, PassRequest, PassRole, PlanOptions,
-    PublishDestination, PublishTarget, QueueDecision, ReapWorktreesOptions, ReplayOptions,
-    RunOutcome, RunRequest, SelectAction, SelectError, SelectOutcome, SelectRequest, SignalFlags,
-    SweepError, SweepMode, SweepOptions, TraceAppend, TraceView, UnavailableAssessmentDeriver,
-    acquire_lease, answer_queue_decision, append_trace_checked, audit, branch_name,
-    clear_work_order, create_work_order, credential_output, decide_queue_item,
+    OrchestratorRunRequest, OstromPaths, PASS_KILL_GRACE_MS, PassRequest, PassRole,
+    PassSweepRequest, PlanOptions, PolicyBundle, PolicyOrigins, PublishDestination, PublishTarget,
+    QueueDecision, ReapWorktreesOptions, ReplayOptions, RunOutcome, RunRequest, SelectAction,
+    SelectError, SelectOutcome, SelectRequest, SignalFlags, SweepError, SweepMode, SweepOptions,
+    TraceAppend, TraceView, UnavailableAssessmentDeriver, acquire_lease, answer_queue_decision,
+    append_trace_checked, audit, available_repositories, branch_name, clear_work_order,
+    create_work_order, credential_output, decide_queue_item, effective_repositories,
     encode_org_snapshots_with_faults, encode_selection, environment, finalize_exited_implementer,
-    grant_excuse, grant_excuse_at_head, item_hash, lease_status, lint_queue_state, list_excuses,
-    list_queue_json, local_drift, read_trace_json, release_lease, render_constitution,
-    render_digest, replay, revoke_excuse, run_dispatch_with_registry, run_gate,
-    run_implement_with_registry, run_pass, run_plan, run_reap_worktrees, run_repair_prs,
-    run_selection, run_sweep_with_publication_source, validate_lease_name,
-    validate_work_order_file,
+    grant_excuse, grant_excuse_at_head, inherited_repository_scope, item_hash, lease_status,
+    lint_queue_state, list_excuses, list_queue_json, load_config_or_defaults, local_drift,
+    parse_repository_list, read_trace_json, release_lease, render_constitution, render_digest,
+    replay, revoke_excuse, run_dispatch_with_registry, run_gate, run_implement_with_registry,
+    run_pass, run_plan, run_reap_worktrees, run_repair_prs, run_selection,
+    run_sweep_with_publication_source, validate_lease_name, validate_work_order_file,
 };
 
 mod loop_presets;
@@ -221,6 +223,9 @@ enum Command {
     /// Run one unattended delivery pass for a role.
     Pass {
         role: CliPassRole,
+        /// Bind the pass to one declared loop's repository scope and ceilings.
+        #[arg(long)]
+        r#loop: Option<String>,
         /// Also stream stamped ethogram events to this open file descriptor.
         #[arg(long)]
         events_fd: Option<u32>,
@@ -250,6 +255,8 @@ enum Command {
     #[command(name = "__pass-worker", hide = true)]
     PassWorker {
         role: CliPassRole,
+        #[arg(long)]
+        r#loop: Option<String>,
         #[arg(long)]
         events_fd: Option<u32>,
         #[arg(long)]
@@ -723,23 +730,37 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             repositories,
             permissions,
             child,
-        } => match credential_output(
-            &paths,
-            &role,
-            &repository,
-            &repositories,
-            &permissions,
-            &child,
-        ) {
-            Ok(output) => {
-                io::stdout().write_all(&output.stdout)?;
-                io::stderr().write_all(&output.stderr)?;
-                if !output.status.success() {
-                    std::process::exit(output.status.code().unwrap_or(1));
+        } => {
+            if let Some(effective) = inherited_repository_scope()? {
+                let requested = parse_repository_list(&repositories)?;
+                if !effective.contains(&repository)
+                    || requested
+                        .iter()
+                        .any(|repository| !effective.contains(repository))
+                {
+                    exit_message("ostrom credential: repository-outside-effective-set", 111);
                 }
             }
-            Err(error) => exit_message(&format!("ostrom credential: {error}"), error.exit_code()),
-        },
+            match credential_output(
+                &paths,
+                &role,
+                &repository,
+                &repositories,
+                &permissions,
+                &child,
+            ) {
+                Ok(output) => {
+                    io::stdout().write_all(&output.stdout)?;
+                    io::stderr().write_all(&output.stderr)?;
+                    if !output.status.success() {
+                        std::process::exit(output.status.code().unwrap_or(1));
+                    }
+                }
+                Err(error) => {
+                    exit_message(&format!("ostrom credential: {error}"), error.exit_code())
+                }
+            }
+        }
         Command::Doctor { check } => run_doctor_command(check, &clock)?,
         Command::Check {
             command: CheckCommand::Run,
@@ -781,6 +802,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .get_mut("projects")
                 .and_then(serde_json::Value::as_array_mut)
             {
+                if let Some(repositories) = inherited_repository_scope()? {
+                    projects.retain(|project| {
+                        project
+                            .get("repo")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|repository| repositories.contains(repository))
+                    });
+                }
                 for project in projects {
                     if project
                         .get("max_implementers_per_repository")
@@ -867,6 +896,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         },
         Command::Pass {
             role,
+            r#loop,
             events_fd,
             control_fd,
             facts_only,
@@ -875,6 +905,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let control_fd = resolve_control_fd(control_fd)?;
             let facts_only = resolve_facts_only(facts_only)?;
             let mut arguments = vec!["__pass-worker".into(), role_name(role).into()];
+            if let Some(name) = r#loop {
+                arguments.extend(["--loop".into(), name.into()]);
+            }
             if let Some(fd) = events_fd {
                 arguments.extend(["--events-fd".into(), fd.to_string().into()]);
             }
@@ -919,12 +952,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::PassWorker {
             role,
+            r#loop,
             events_fd,
             control_fd,
             facts_only,
             supervisor_pid,
         } => run_pass_worker(
             role,
+            r#loop.as_deref(),
             supervisor_pid,
             resolve_events_fd(events_fd)?,
             resolve_control_fd(control_fd)?,
@@ -961,6 +996,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 paths,
                 working_directory: env::current_dir()?,
                 target: target[0].clone(),
+                repositories: inherited_repository_scope()?,
                 timestamp: clock.timestamp(),
             }) {
                 Ok(output) => output,
@@ -1448,28 +1484,68 @@ fn dispatch_resolved_loop(
     manifest: &ostrom_core::PolicyManifest,
     resolved: ostrom_core::ResolvedLoop,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let invocation = operation_dispatch::OperationInvocation {
-        name: resolved.operation.clone(),
-        target: resolved.target,
-        parameters: resolved.parameters,
-    };
     let working_directory = env::current_dir()?;
+    if matches!(resolved.actor.as_str(), "builder" | "gatekeeper")
+        && manifest
+            .operations
+            .get(&resolved.operation)
+            .is_some_and(|operation| {
+                operation
+                    .steps
+                    .iter()
+                    .any(|step| step.uses.starts_with("agent/"))
+            })
+    {
+        let status = ProcessCommand::new(env::current_exe()?)
+            .args([
+                "__pass-worker",
+                resolved.actor.as_str(),
+                "--loop",
+                resolved.name.as_str(),
+            ])
+            .arg(std::process::id().to_string())
+            .status()?;
+        if status.success() {
+            return Ok(());
+        }
+        return Err(io::Error::other(format!(
+            "loop `{}` pass exited with {status}",
+            resolved.name
+        ))
+        .into());
+    }
+    let mandates = load_config_or_defaults(paths, &working_directory)?;
+    let available = available_repositories(Some(manifest), &mandates)?;
+    let effective = effective_repositories(&resolved, &available, manifest);
+    for skipped in &effective.skipped {
+        eprintln!(
+            "ostrom loop {}: skipped {}: {}",
+            resolved.name, skipped.repository, skipped.reason
+        );
+    }
     let plugin_root = environment::OSTROM_PLUGIN_ROOT.value_os().map_or_else(
         || working_directory.join("crates/ostrom-store/assets"),
         PathBuf::from,
     );
-    let selector_prefixes =
-        operation_selector_prefixes(manifest, &resolved.actor, &invocation.name);
-    let mut runtime = CliOperationRuntime {
-        paths,
-        actor: &resolved.actor,
-        manifest,
-        working_directory: &working_directory,
-        plugin_root: &plugin_root,
-        selector_prefixes,
-        ceilings: Some(resolved.ceilings),
-    };
-    dispatch_operation(manifest, &resolved.actor, &invocation, &mut runtime)?;
+    for repository in effective.repositories {
+        let invocation = operation_dispatch::OperationInvocation {
+            name: resolved.operation.clone(),
+            target: repository,
+            parameters: resolved.parameters.clone(),
+        };
+        let selector_prefixes =
+            operation_selector_prefixes(manifest, &resolved.actor, &invocation.name);
+        let mut runtime = CliOperationRuntime {
+            paths,
+            actor: &resolved.actor,
+            manifest,
+            working_directory: &working_directory,
+            plugin_root: &plugin_root,
+            selector_prefixes,
+            ceilings: Some(resolved.ceilings),
+        };
+        dispatch_operation(manifest, &resolved.actor, &invocation, &mut runtime)?;
+    }
     Ok(())
 }
 
@@ -2546,6 +2622,7 @@ fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
 
 fn run_pass_worker(
     role: CliPassRole,
+    loop_name: Option<&str>,
     supervisor_pid: u32,
     events_fd: Option<u32>,
     control_fd: Option<u32>,
@@ -2563,13 +2640,64 @@ fn run_pass_worker(
         std::process::exit(1);
     });
     let role: PassRole = role.into();
-    let (prompt, permission_mode, derived_settings, caps) = resolve_pass_policy(&paths, role);
+    let policy = resolve_pass_policy(&paths, role, loop_name).unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(2);
+    });
+    let mandates = load_config_or_defaults(&paths, &working_directory).unwrap_or_else(|error| {
+        eprintln!("ostrom {} pass: {error}", role.name());
+        std::process::exit(1);
+    });
+    let available =
+        available_repositories(policy.manifest.as_ref(), &mandates).unwrap_or_else(|error| {
+            eprintln!("ostrom {} pass: {error}", role.name());
+            std::process::exit(2);
+        });
+    let effective = policy.resolved_loop.as_ref().map_or_else(
+        || ostrom_store::EffectiveRepositories {
+            repositories: available.iter().cloned().collect(),
+            skipped: Vec::new(),
+        },
+        |resolved| {
+            effective_repositories(
+                resolved,
+                &available,
+                policy
+                    .manifest
+                    .as_ref()
+                    .expect("a resolved loop has a manifest"),
+            )
+        },
+    );
+    let executable = env::current_exe().unwrap_or_else(|error| {
+        eprintln!(
+            "ostrom {} pass: could not resolve executable: {error}",
+            role.name()
+        );
+        std::process::exit(1);
+    });
+    let plugin_root = environment::OSTROM_PLUGIN_ROOT.value_os().map_or_else(
+        || working_directory.join("crates/ostrom-store/assets"),
+        PathBuf::from,
+    );
+    let sweep_policy = policy
+        .manifest
+        .as_ref()
+        .and_then(|manifest| manifest.sweep.clone())
+        .unwrap_or_default();
+    let sweep_bundle = policy
+        .manifest
+        .as_ref()
+        .zip(policy.manifest_path.as_ref())
+        .map(|(manifest, path)| {
+            PolicyBundle::operator(manifest.clone(), PolicyOrigins::from_root(manifest, path))
+        });
     let request = PassRequest {
-        prompt,
-        permission_mode,
-        derived_settings,
+        prompt: policy.prompt,
+        permission_mode: policy.permission_mode,
+        derived_settings: policy.derived_settings,
         paths,
-        working_directory,
+        working_directory: working_directory.clone(),
         role,
         claude_bin,
         signals,
@@ -2577,7 +2705,24 @@ fn run_pass_worker(
         events_fd,
         control_fd,
         facts_only,
-        caps,
+        repositories: loop_name.map(|_| effective.repositories.clone()),
+        skipped_repositories: effective.skipped,
+        repository_scope: Some(effective.repositories),
+        sweep: Some(PassSweepRequest {
+            options: SweepOptions {
+                paths: compatible_command_paths(),
+                working_directory,
+                executable,
+                plugin_root,
+                started_at: clock.now(),
+                requested_mode: SweepMode::Auto,
+                fixture: None,
+                publish: PublishTarget::Disabled,
+                policy: sweep_bundle,
+            },
+            max_age_seconds: sweep_policy.max_age_seconds(),
+        }),
+        caps: policy.caps,
         clock,
         platform: std::env::consts::OS,
     };
@@ -2607,59 +2752,108 @@ fn run_pass_worker(
 ///
 /// With no operator manifest, the prompt compiled into this binary runs, so an
 /// operator who has adopted no policy is not broken by this.
+struct ResolvedPassPolicy {
+    prompt: String,
+    permission_mode: PermissionMode,
+    derived_settings: Option<String>,
+    caps: umwelt_runtime::RunCaps,
+    manifest: Option<PolicyManifest>,
+    manifest_path: Option<PathBuf>,
+    resolved_loop: Option<ResolvedLoop>,
+}
+
 fn resolve_pass_policy(
     paths: &OstromPaths,
     role: PassRole,
-) -> (
-    String,
-    PermissionMode,
-    Option<String>,
-    umwelt_runtime::RunCaps,
-) {
-    let shipped = || {
-        (
-            role.default_prompt().to_owned(),
-            role.default_permission_mode(),
-            None,
-            umwelt_runtime::RunCaps {
-                kill_grace_ms: PASS_KILL_GRACE_MS,
-                ..umwelt_runtime::RunCaps::default()
-            },
-        )
+    loop_name: Option<&str>,
+) -> Result<ResolvedPassPolicy, Box<dyn std::error::Error>> {
+    let shipped = || ResolvedPassPolicy {
+        prompt: role.default_prompt().to_owned(),
+        permission_mode: role.default_permission_mode(),
+        derived_settings: None,
+        caps: umwelt_runtime::RunCaps {
+            kill_grace_ms: PASS_KILL_GRACE_MS,
+            ..umwelt_runtime::RunCaps::default()
+        },
+        manifest: None,
+        manifest_path: None,
+        resolved_loop: None,
     };
     // No operator manifest is the ordinary case and stays silent. One that
     // exists but will not load is not: falling back without a word is how a
     // pass runs for weeks under instructions its author believes were replaced.
-    let manifest = match policy_manifest::operator_manifest_path(paths) {
-        Ok(None) => return shipped(),
+    let (manifest, manifest_path) = match policy_manifest::operator_manifest_path(paths) {
+        Ok(None) if loop_name.is_none() => return Ok(shipped()),
+        Ok(None) => {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "ostrom {} pass: --loop requires a verified operator manifest",
+                    role.name()
+                ),
+            )
+            .into());
+        }
         Ok(Some(path)) => match policy_manifest::load(&path) {
-            Ok(manifest) => manifest,
+            Ok(manifest) => (manifest, path),
             Err(error) => {
+                if loop_name.is_some() {
+                    return Err(error.into());
+                }
                 eprintln!(
                     "warning: {} pass could not load operator policy ({error}); using the prompt compiled into this binary",
                     role.name()
                 );
-                return shipped();
+                return Ok(shipped());
             }
         },
         Err(error) => {
+            if loop_name.is_some() {
+                return Err(error.into());
+            }
             eprintln!(
                 "warning: {} pass could not resolve operator policy ({error}); using the prompt compiled into this binary",
                 role.name()
             );
-            return shipped();
+            return Ok(shipped());
         }
     };
 
-    let prompt = match resolve_inspection_prompt(&manifest, role.name()) {
+    let resolved_loop = loop_name
+        .map(|name| manifest.resolve_loop(name))
+        .transpose()?;
+    if let Some(resolved) = &resolved_loop
+        && resolved.actor != role.name()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "ostrom {} pass: loop `{}` belongs to actor `{}`",
+                role.name(),
+                resolved.name,
+                resolved.actor
+            ),
+        )
+        .into());
+    }
+
+    let prompt = match resolved_loop.as_ref().map_or_else(
+        || resolve_inspection_prompt(&manifest, role.name()),
+        |resolved| {
+            manifest
+                .resolve_operation_prompt(&resolved.operation)
+                .map_err(Into::into)
+        },
+    ) {
         Ok(prompt) => prompt,
-        Err(error) => {
+        Err(error) if resolved_loop.is_none() => {
             eprintln!(
                 "warning: {} pass is not bound to a prompted operation ({error}); using the prompt compiled into this binary",
                 role.name()
             );
             role.default_prompt().to_owned()
         }
+        Err(error) => return Err(error),
     };
     let permission_mode = manifest.actors.get(role.name()).map_or_else(
         || role.default_permission_mode(),
@@ -2670,21 +2864,38 @@ fn resolve_pass_policy(
     // than policy says by editing a file beside the manifest.
     let derived_settings = match generate_operation_settings(&manifest, role.name()) {
         Ok(settings) => Some(settings),
-        Err(error) => {
+        Err(error) if resolved_loop.is_none() => {
             eprintln!(
                 "warning: {} pass could not derive a settings profile from its grants ({error}); using the operator's role settings file",
                 role.name()
             );
             None
         }
+        Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidData, error).into()),
     };
+    let ceilings = resolved_loop.as_ref().map_or(
+        ResolvedLoopCeilings {
+            tokens: manifest.defaults.r#loop.tokens,
+            spend_usd: manifest.defaults.r#loop.spend_usd,
+            concurrent: manifest.defaults.r#loop.concurrent,
+        },
+        |resolved| resolved.ceilings,
+    );
     let caps = umwelt_runtime::RunCaps {
-        tokens: manifest.defaults.r#loop.tokens,
-        cost_usd: manifest.defaults.r#loop.spend_usd,
+        tokens: ceilings.tokens,
+        cost_usd: ceilings.spend_usd,
         kill_grace_ms: PASS_KILL_GRACE_MS,
         ..umwelt_runtime::RunCaps::default()
     };
-    (prompt, permission_mode, derived_settings, caps)
+    Ok(ResolvedPassPolicy {
+        prompt,
+        permission_mode,
+        derived_settings,
+        caps,
+        manifest: Some(manifest),
+        manifest_path: Some(manifest_path),
+        resolved_loop,
+    })
 }
 
 /// The operator manifest `ostrom init` writes.
@@ -2877,6 +3088,10 @@ fn run_dispatch_command(arguments: Vec<String>, clock: Clock) -> ! {
         working_directory,
         plugin_root,
         order_file: PathBuf::from(order_file),
+        repositories: inherited_repository_scope().unwrap_or_else(|error| {
+            eprintln!("ostrom dispatch: {error}");
+            std::process::exit(2);
+        }),
         clock,
     };
     let registry = core_agent_registry();
@@ -2896,10 +3111,30 @@ fn run_dispatch_command(arguments: Vec<String>, clock: Clock) -> ! {
     }
 }
 
-fn run_select_work(arguments: Vec<String>, clock: Clock) -> ! {
+fn run_select_work(mut arguments: Vec<String>, clock: Clock) -> ! {
     let usage = || {
-        eprintln!("usage: ostrom select-work list | select <owner> [already-attempted-id ...]");
+        eprintln!(
+            "usage: ostrom select-work list [--repositories owner/name,...] | select <owner> [--repositories owner/name,...] [already-attempted-id ...]"
+        );
         std::process::exit(2);
+    };
+    let explicit_repositories = match take_repository_filter(&mut arguments) {
+        Ok(repositories) => repositories,
+        Err(error) => {
+            eprintln!("mandate selection: {error}");
+            std::process::exit(2);
+        }
+    };
+    let inherited_repositories = inherited_repository_scope().unwrap_or_else(|error| {
+        eprintln!("mandate selection: {error}");
+        std::process::exit(2);
+    });
+    let repositories = match (explicit_repositories, inherited_repositories) {
+        (Some(explicit), Some(inherited)) => {
+            Some(explicit.intersection(&inherited).cloned().collect())
+        }
+        (Some(repositories), None) | (None, Some(repositories)) => Some(repositories),
+        (None, None) => None,
     };
     let action = match arguments.as_slice() {
         [action] if action == "list" => SelectAction::List,
@@ -2923,6 +3158,7 @@ fn run_select_work(arguments: Vec<String>, clock: Clock) -> ! {
             std::process::exit(1);
         }),
         action,
+        repositories,
         clock,
     };
     match run_selection(&request) {
@@ -2957,6 +3193,33 @@ fn run_select_work(arguments: Vec<String>, clock: Clock) -> ! {
             std::process::exit(code);
         }
     }
+}
+
+fn take_repository_filter(arguments: &mut Vec<String>) -> Result<Option<BTreeSet<String>>, String> {
+    let mut supplied = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        let (value, consumed) = if arguments[index] == "--repositories" {
+            (
+                arguments
+                    .get(index + 1)
+                    .cloned()
+                    .ok_or_else(|| "--repositories requires a value".to_owned())?,
+                2,
+            )
+        } else if let Some(value) = arguments[index].strip_prefix("--repositories=") {
+            (value.to_owned(), 1)
+        } else {
+            index += 1;
+            continue;
+        };
+        if supplied.is_some() {
+            return Err("--repositories may be supplied only once".to_owned());
+        }
+        supplied = Some(parse_repository_list(&value).map_err(|error| error.to_string())?);
+        arguments.drain(index..index + consumed);
+    }
+    Ok(supplied)
 }
 
 fn run_doctor_command(

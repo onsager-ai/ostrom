@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
+    fs, io,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -20,10 +20,11 @@ use crate::{
     AppTokenError, OstromPaths, PolicyBundle, PublishDestination, PublishError, QueueDocument,
     StoreError,
     app_token::{GitHubInstallationTokenMinter, InstallationTokenMinter, ScopedAppTokenRequest},
+    available_repositories,
     commit_checks::read_commit_checks,
     environment,
     gate::load_gate_config,
-    io_error,
+    io_error, project_available_mandates,
     publish::{JsonlPublicationSource, PublishOptions, PublishOutcome, publish},
     read_queue, read_trace,
     run_events::{DecisionRequest, RunEventError, SWEEP_RUN_ID},
@@ -139,6 +140,21 @@ pub struct SweepOutcome {
     pub mode: SweepMode,
     pub faults: Vec<String>,
     pub publication_failure: Option<String>,
+    pub generation: SweepGeneration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SweepGeneration {
+    pub id: String,
+    pub completed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredSweepSnapshot {
+    generation: SweepGeneration,
+    repositories: Vec<RepositorySnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -363,7 +379,31 @@ fn run_sweep_with_minter_and_publication_source(
     minter: &mut dyn InstallationTokenMinter,
     repositories: Option<&[String]>,
 ) -> Result<(SweepOutcome, Vec<RepositorySnapshot>), SweepError> {
-    let config = load_config(&options.paths, &options.working_directory)?;
+    let authored_config = match load_config(&options.paths, &options.working_directory) {
+        Ok(config) => config,
+        Err(SweepError::NotConfigured(_))
+            if environment::OSTROM_AVAILABLE_REPOSITORIES
+                .value_os()
+                .is_some()
+                || options.policy.as_ref().is_some_and(|policy| {
+                    policy
+                        .manifest
+                        .grants
+                        .values()
+                        .chain(policy.manifest.denies.values())
+                        .any(|rule| !rule.repositories.is_empty())
+                }) =>
+        {
+            load_config_or_defaults(&options.paths, &options.working_directory)?
+        }
+        Err(error) => return Err(error),
+    };
+    let available = available_repositories(
+        options.policy.as_ref().map(|policy| &policy.manifest),
+        &authored_config,
+    )
+    .map_err(|error| SweepError::Config(error.to_string()))?;
+    let config = project_available_mandates(&authored_config, &available);
     // Validate the complete selection before authentication, events, or generation writes.
     let acquisition_config = repositories
         .map(|repos| selected_config(&config, repos))
@@ -491,6 +531,43 @@ fn run_sweep_with_minter_and_publication_source(
         .flat_map(human_decision_requests)
         .collect::<Vec<_>>();
     let mirror = snapshots.clone();
+    let mut generation_mirror = mirror.clone();
+    if !carried.is_empty() {
+        let previous_generation = old_state
+            .get("sweep_generation")
+            .cloned()
+            .ok_or_else(|| {
+                SweepError::State(
+                    "cannot carry forward sweep snapshot: run a full roster sweep first".to_owned(),
+                )
+            })
+            .and_then(|value| {
+                serde_json::from_value(value).map_err(|error| {
+                    SweepError::State(format!(
+                        "cannot carry forward sweep snapshot: invalid generation: {error}"
+                    ))
+                })
+            })?;
+        let previous_mirror = load_sweep_snapshot(&options.paths, &previous_generation)?;
+        generation_mirror.extend(
+            previous_mirror
+                .into_iter()
+                .filter(|snapshot| carried.contains(snapshot.repo.as_str())),
+        );
+        let mirrored = generation_mirror
+            .iter()
+            .map(|snapshot| snapshot.repo.as_str())
+            .collect::<BTreeSet<_>>();
+        if let Some(missing) = carried
+            .iter()
+            .find(|repository| !mirrored.contains(repository.as_str()))
+        {
+            return Err(SweepError::State(format!(
+                "cannot carry forward sweep snapshot for {missing}: run a full roster sweep first"
+            )));
+        }
+        generation_mirror.sort_by(|left, right| left.repo.as_str().cmp(right.repo.as_str()));
+    }
     let mut snapshots_by_repo = snapshots
         .into_iter()
         .map(|snapshot| (snapshot.repo.as_str().to_owned(), snapshot))
@@ -588,6 +665,23 @@ fn run_sweep_with_minter_and_publication_source(
     }
 
     new_state["version"] = json!(2);
+    let generation = SweepGeneration {
+        id: sha256_hex(
+            format!(
+                "{}\0{}",
+                format_time(options.started_at),
+                configured_repositories
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\0")
+            )
+            .as_bytes(),
+        ),
+        completed_at: options.started_at,
+    };
+    new_state["sweep_generation"] =
+        serde_json::to_value(&generation).expect("sweep generation serializes");
     new_state["velocity"] = serde_json::to_value(velocity).expect("velocity ledger serializes");
     new_state["sweep_mode"] = json!(mode_name(mode));
     new_state["roster_coverage"] =
@@ -730,6 +824,14 @@ fn run_sweep_with_minter_and_publication_source(
     }
     backup_previous_sweep(&options.paths)?;
     write_queue(&options.paths.queue_file(), &final_rows)?;
+    write_json_private(
+        &options.paths.sweep_snapshot_file(),
+        &serde_json::to_value(StoredSweepSnapshot {
+            generation: generation.clone(),
+            repositories: generation_mirror,
+        })
+        .expect("sweep snapshot serializes"),
+    )?;
     write_json_private(&state_path, &new_state)?;
     for item_id in dropped_closed {
         crate::append_trace(
@@ -789,9 +891,60 @@ fn run_sweep_with_minter_and_publication_source(
             mode,
             faults,
             publication_failure,
+            generation,
         },
         mirror,
     ))
+}
+
+/// Read the identity of the newest generation whose state write completed.
+pub fn latest_successful_generation(
+    paths: &OstromPaths,
+) -> Result<Option<SweepGeneration>, SweepError> {
+    let path = paths.sweep_state_file();
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(SweepError::State(format!("{}: {error}", path.display()))),
+    };
+    let state: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| SweepError::State(format!("{}: {error}", path.display())))?;
+    state
+        .get("sweep_generation")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|error| SweepError::State(format!("{}: {error}", path.display())))
+}
+
+#[must_use]
+pub fn generation_is_fresh(
+    generation: &SweepGeneration,
+    now: DateTime<Utc>,
+    max_age_seconds: u64,
+) -> bool {
+    let age = now.signed_duration_since(generation.completed_at);
+    age >= Duration::zero()
+        && age.num_seconds() < i64::try_from(max_age_seconds).unwrap_or(i64::MAX)
+}
+
+pub fn load_sweep_snapshot(
+    paths: &OstromPaths,
+    generation: &SweepGeneration,
+) -> Result<Vec<RepositorySnapshot>, SweepError> {
+    let path = paths.sweep_snapshot_file();
+    let bytes = fs::read(&path)
+        .map_err(|error| SweepError::State(format!("{}: {error}", path.display())))?;
+    let snapshot: StoredSweepSnapshot = serde_json::from_slice(&bytes)
+        .map_err(|error| SweepError::State(format!("{}: {error}", path.display())))?;
+    if snapshot.generation != *generation {
+        return Err(SweepError::State(format!(
+            "{} does not match successful generation {}",
+            path.display(),
+            generation.id
+        )));
+    }
+    Ok(snapshot.repositories)
 }
 
 pub fn acquire_org_from_github(
@@ -3997,6 +4150,7 @@ fn backup_previous_sweep(paths: &OstromPaths) -> Result<(), SweepError> {
     for (source, name) in [
         (paths.queue_file(), "queue.jsonl"),
         (paths.sweep_state_file(), "state.json"),
+        (paths.sweep_snapshot_file(), "sweep-snapshot.json"),
     ] {
         if !source.exists() {
             continue;
@@ -5577,6 +5731,7 @@ mod tests {
             working_directory: home.path().to_path_buf(),
             paths: paths.clone(),
             action: SelectAction::List,
+            repositories: None,
             clock: Clock::fixed(
                 "2026-08-21T01:00:30Z"
                     .parse()
@@ -5598,6 +5753,7 @@ mod tests {
                 owner: "builder-placeholder-wake1".to_owned(),
                 attempted: BTreeSet::new(),
             },
+            repositories: None,
             clock: Clock::fixed(
                 "2026-08-21T01:01:00Z"
                     .parse()

@@ -1038,6 +1038,7 @@ mod tests {
                     model: None,
                     schedule: None,
                     repository: None,
+                    repositories: None,
                     work_order: None,
                     ceilings: None,
                 },

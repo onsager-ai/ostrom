@@ -1,8 +1,12 @@
 # Policy loops
 
-A loop binds one actor and one policy operation to a cadence. The operation is
-dispatched through the same grant, deny, target-resolution, check, and action
-boundaries as an interactive operation; a loop cannot name an action directly.
+A loop binds one actor and one policy operation to a cadence. Its optional
+`repositories` scalar or list bounds the repositories a pass may act on; absent
+or empty means every repository supplied by the operator environment. The
+effective set is always intersected with that available set. A repository
+outside availability or the actor-operation grant is recorded as skipped and
+cannot stop granted repositories from running. A loop cannot name an action
+directly.
 
 ```yaml
 defaults:
@@ -14,27 +18,19 @@ loops:
   builder-day:
     actor: builder
     operation: build-pass
-    target: placeholder-org/portfolio
+    repositories: placeholder-org/portfolio
     every: 08:15..21:15
   builder-night:
     actor: builder
     operation: build-pass
-    target: placeholder-org/portfolio
+    repositories: placeholder-org/portfolio
     every: ["23:15", "02:15", "05:15"]
     concurrent: 2
   gatekeeper:
     actor: gatekeeper
     operation: gate-pass
-    target: placeholder-org/portfolio
+    repositories: placeholder-org/portfolio
     every: hourly
-  sweep:
-    actor: sweeper
-    operation: portfolio-sweep
-    target: placeholder-org/portfolio
-    every: "*:45"
-    publish: placeholder-org/public-mirror
-    cadence_hours: 24
-    stuck_after_days: 7
 ```
 
 `every` is intentionally closed. It accepts only `hourly`, `*:MM`, an
@@ -47,6 +43,17 @@ other named schedules.
 the resolved values, and `ostrom loop run` refuses if a caller supplies a
 different enforced value. A local `cmd/run` action receives the resolved
 values in its child environment.
+
+`ostrom pass builder --loop <name>` and `ostrom pass gatekeeper --loop <name>`
+resolve the verified declaration and enforce its effective repository set.
+Without `--loop`, a pass covers the available set. Sweep always covers the
+whole available set, regardless of a loop's narrower list, so one fresh
+generation can serve every pass.
+The loop scope reaches child commands through `OSTROM_EFFECTIVE_REPOSITORIES`
+in the session environment; it is a selection boundary, while grants remain
+the authorization boundary. A loop-bound gatekeeper judges only pull requests
+from the pass's sweep generation, so one opened afterward waits for the next
+fresh generation, up to `sweep.max_age`.
 
 The current composed policy version can instead own loop lifecycle directly:
 

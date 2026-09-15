@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 
 const ITEM_ID: &str = "example-org/example-repo#123";
+const REPOSITORY: &str = "example-org/example-repo";
 const BRANCH: &str = "ostrom/123-placeholder";
 const ORDER_ID: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -300,6 +301,44 @@ fn matched_page() -> String {
 
 fn run(command: &mut Command) -> Output {
     command.output().expect("run dispatch")
+}
+
+#[test]
+fn dispatch_refuses_a_work_order_outside_the_inherited_repository_scope() {
+    let fixture = Fixture::new();
+    let output = run(fixture
+        .command()
+        .env("OSTROM_EFFECTIVE_REPOSITORIES", "example-org/other-repo"));
+    assert_refused(&output, 3, "repository-outside-effective-set");
+    assert!(!fixture.calls.exists());
+    let trace = fixture.trace();
+    assert_eq!(trace.len(), 1);
+    assert_eq!(trace[0]["kind"], "work-failed");
+    assert_eq!(
+        trace[0]["fact"]["reason"],
+        "repository-outside-effective-set"
+    );
+}
+
+#[test]
+fn credential_refuses_a_repository_outside_the_inherited_repository_scope() {
+    let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .args([
+            "credential",
+            "gatekeeper",
+            REPOSITORY,
+            "--repositories",
+            REPOSITORY,
+            "--permissions",
+            "metadata:read",
+            "--",
+            "true",
+        ])
+        .env_clear()
+        .env("OSTROM_EFFECTIVE_REPOSITORIES", "example-org/other-repo")
+        .output()
+        .expect("run scoped credential command");
+    assert_refused(&output, 111, "repository-outside-effective-set");
 }
 
 fn assert_refused(output: &Output, code: i32, reason: &str) {

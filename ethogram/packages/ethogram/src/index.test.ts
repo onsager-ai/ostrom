@@ -334,6 +334,45 @@ describe("Event parsing", () => {
     );
   });
 
+  test("accepts run.started with repositories, repository, or neither", () => {
+    for (const payload of [
+      {
+        kind: "loop",
+        actor: "builder",
+        harness: "fixture",
+        repositories: ["placeholder-org/alpha", "placeholder-org/beta"],
+      },
+      {
+        kind: "handoff",
+        actor: "builder",
+        harness: "fixture",
+        repository: "placeholder-org/alpha",
+      },
+      { kind: "session", actor: "operator", harness: "fixture" },
+    ]) {
+      assert.doesNotThrow(() =>
+        parseEvent({ ...completeEvent(), type: "run.started", payload }),
+      );
+    }
+  });
+
+  test("rejects a non-string run.started repositories entry", () => {
+    assert.throws(
+      () =>
+        parseEvent({
+          ...completeEvent(),
+          type: "run.started",
+          payload: {
+            kind: "loop",
+            actor: "builder",
+            harness: "fixture",
+            repositories: ["placeholder-org/alpha", 7],
+          },
+        }),
+      /RunStartedPayload\.repositories\[1\] must be a string/,
+    );
+  });
+
   test("rejects null for the optional agent.completed.turns integer field", () => {
     assert.throws(
       () =>

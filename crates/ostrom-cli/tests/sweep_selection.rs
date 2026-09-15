@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+use ostrom_core::PolicyManifest;
+use ostrom_store::{PolicyBundle, PublishTarget, SweepMode, SweepOptions, run_sweep};
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -131,6 +133,70 @@ fn full_sweep_matches_base_generation_bytes_and_stdout() {
 }
 
 #[test]
+fn sweep_uses_the_operator_available_set_and_defaults_missing_mandate_projects() {
+    let fixture = Fixture::new(false);
+    let mut responses = fixture.responses();
+    let mut repository = responses["repositories"][0].clone();
+    repository["repo"] = json!("placeholder-org/available-only");
+    responses["repositories"] = json!([repository]);
+    fixture.write(&responses);
+    let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .env_clear()
+        .env("OSTROM_HOME", &fixture.home)
+        .env(
+            "OSTROM_AVAILABLE_REPOSITORIES",
+            "placeholder-org/available-only",
+        )
+        .current_dir(fixture.root.path())
+        .args(["sweep", "--fixture"])
+        .arg(&fixture.responses)
+        .args(["--started-at", FIRST])
+        .output()
+        .expect("sweep available set");
+    assert_eq!(
+        success(output),
+        "mandate sweep: 1 projects; 0 queue changes\n"
+    );
+    assert_eq!(
+        fixture.state()["dependency_graph"]["configured_repositories"],
+        json!(["placeholder-org/available-only"])
+    );
+    assert_eq!(
+        fixture.state()["repos"]["placeholder-org/available-only"]["unclassified"],
+        1
+    );
+}
+
+#[test]
+fn a_loop_repository_list_never_narrows_the_sweep_generation() {
+    let fixture = Fixture::new(false);
+    let manifest = PolicyManifest::from_yaml(
+        "manifest_version: 1\nactors: {builder: {}}\noperations: {work: {steps: []}}\ngrants: {work: {actors: builder, operations: work}}\nloops: {delivery: {actor: builder, operation: work, repositories: placeholder-org/alpha, every: hourly}}\n",
+    )
+    .expect("loop policy");
+    let outcome = run_sweep(&SweepOptions {
+        paths: ostrom_store::OstromPaths {
+            config: fixture.home.clone(),
+            state: fixture.home.clone(),
+        },
+        working_directory: fixture.root.path().to_path_buf(),
+        executable: fixture.root.path().join("unused-ostrom"),
+        plugin_root: fixture.root.path().to_path_buf(),
+        started_at: FIRST.parse().expect("valid sweep time"),
+        requested_mode: SweepMode::Full,
+        fixture: Some(fixture.responses.clone()),
+        publish: PublishTarget::Disabled,
+        policy: Some(PolicyBundle::repository(manifest)),
+    })
+    .expect("full roster sweep");
+    assert_eq!(outcome.project_count, 2);
+    assert_eq!(
+        fixture.state()["dependency_graph"]["configured_repositories"],
+        json!([ALPHA, BETA])
+    );
+}
+
+#[test]
 fn selected_sweep_carries_records_and_observes_only_read_repositories() {
     let fixture = Fixture::new(false);
     fixture.sweep(&[], FIRST);
@@ -186,6 +252,20 @@ fn selected_sweep_carries_records_and_observes_only_read_repositories() {
         fixture.state()["last_full_reconciliation"],
         FIRST,
         "partial acquisition must not reset whole-roster reconciliation"
+    );
+    let snapshot: Value = serde_json::from_slice(
+        &fs::read(fixture.home.join("sweep-snapshot.json")).expect("read sweep snapshot"),
+    )
+    .expect("parse sweep snapshot");
+    assert_eq!(
+        snapshot["repositories"]
+            .as_array()
+            .expect("snapshot repositories")
+            .iter()
+            .map(|repository| repository["repo"].as_str().expect("snapshot repository"))
+            .collect::<Vec<_>>(),
+        [ALPHA, BETA],
+        "a partial refresh must retain the carried repository in the generation snapshot"
     );
     let trace = fs::read(fixture.home.join("sprint.jsonl")).unwrap();
     assert_eq!(

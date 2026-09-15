@@ -25,7 +25,7 @@ fn fixture(policy: &str) -> TempDir {
 
 fn prompt_policy(prompt: &str, declarations: &str) -> String {
     format!(
-        "manifest_version: 1\nactors: {{builder: {{}}}}\n{declarations}operations:\n  inspect:\n    steps:\n      - uses: agent/claude\n        with:\n          prompt: {prompt}\ngrants:\n  builder-inspect: {{actors: builder, operations: inspect, repositories: placeholder-org/repo}}\nloops:\n  inspection-loop:\n    actor: builder\n    operation: inspect\n    target: placeholder-org/repo\n    every: hourly\n"
+        "manifest_version: 1\nactors: {{builder: {{}}}}\n{declarations}operations:\n  inspect:\n    steps:\n      - uses: agent/claude\n        with:\n          prompt: {prompt}\ngrants:\n  builder-inspect: {{actors: builder, operations: inspect, repositories: placeholder-org/repo}}\nloops:\n  inspection-loop:\n    actor: builder\n    operation: inspect\n    repositories: placeholder-org/repo\n    every: hourly\n"
     )
 }
 
