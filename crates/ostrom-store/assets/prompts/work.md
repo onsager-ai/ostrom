@@ -94,8 +94,10 @@ or an individual push failure as a reason to stop: those outcomes are already
 facts and the script continues through the bounded candidate set.
 
 The pass made the queue and state fresh before this session started. Do not
-refresh them again inside the agent session. After the repair scan, read, in
-order:
+refresh them again inside the agent session. The queue therefore predates any
+repair made in this session and must not be read as evidence of the repaired
+head; a successful repair invalidates its sweep generation so the next pass
+refreshes it. After the repair scan, read, in order:
 
 - `~/.claude/ostrom/mandates.yaml` — the authorization boundary: what each
   project delegates entirely and what bounces back. Its optional root-level

@@ -70,9 +70,10 @@ candidate input for this iteration.
 
 Do not read mandate YAML, resolve another roster, enumerate live pull requests,
 or add a repository or candidate. An empty `pull_requests` list is a valid
-iteration with nothing to judge. A malformed or missing pass-supplied JSON
-block is a pass failure: report it to the principal and stop before acquiring
-artifacts.
+idle iteration that the pass normally ends before starting this session. If
+one is nevertheless supplied, judge nothing. A malformed or missing
+pass-supplied JSON block is a pass failure: report it to the principal and stop
+before acquiring artifacts.
 
 ## 4. Authenticate per repository through the shared App
 
@@ -87,7 +88,7 @@ ahead of the command to run:
 ```sh
 ostrom credential gatekeeper "$repository" \
   --repositories "$repository" \
-  --permissions metadata:read,pull_requests:read -- \
+  --permissions metadata:read,issues:read,pull_requests:read,checks:read,statuses:read,contents:read -- \
   ostrom gate "$repository#$pr_number"
 ```
 
@@ -100,10 +101,11 @@ other exit code is the given command's own, unchanged.
 
 The required `gatekeeper` argument names the caller at the call site; it does
 not narrow the shared token. The mandatory flags make the repository-local
-`metadata:read,pull_requests:read` scope explicit; every acquisition retry must
-repeat the same command shape. The gatekeeper's own role is
-recorded in its `decision-taken` trace record, not stamped onto the merge commit — see
-Merge Protocol step 4 for why. An `Ostrom-Role: builder` trailer arriving on a
+`metadata:read,issues:read,pull_requests:read,checks:read,statuses:read,contents:read`
+scope explicit; every acquisition retry must repeat the same command shape.
+The gatekeeper's own role is recorded in its `decision-taken` trace record, not
+stamped onto the merge commit — see Merge Protocol step 4 for why. An
+`Ostrom-Role: builder` trailer arriving on a
 commit under review was written by the builder itself, so it is self-asserted
 advisory metadata, not evidence of who acted and never an input to the gate.
 

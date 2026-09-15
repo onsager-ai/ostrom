@@ -377,6 +377,19 @@ else
 fi
 "#,
     );
+    fs::write(
+        home.join("state.json"),
+        serde_json::to_vec(&json!({
+            "version": 2,
+            "sweep_generation": {
+                "id": "generation-before-repair",
+                "completed_at": "2026-08-20T00:00:00Z"
+            },
+            "sentinel": "preserved"
+        }))
+        .expect("serialize pre-repair generation"),
+    )
+    .expect("write pre-repair generation");
 
     let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
         .args(["repair-prs", "builder-placeholder-wake2"])
@@ -401,6 +414,14 @@ fi
     assert_eq!(summary["repaired"], 3);
     assert_eq!(summary["skipped"], 4);
     assert_eq!(summary["failed"], 0);
+    let state: Value =
+        serde_json::from_slice(&fs::read(home.join("state.json")).expect("read post-repair state"))
+            .expect("parse post-repair state");
+    assert!(
+        state.get("sweep_generation").is_none(),
+        "a repository-changing repair left the sweep generation fresh: {state}"
+    );
+    assert_eq!(state["sentinel"], "preserved");
     let repaired_head = String::from_utf8(
         Command::new("git")
             .arg(format!("--git-dir={}", remote.display()))

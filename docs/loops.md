@@ -49,11 +49,24 @@ resolve the verified declaration and enforce its effective repository set.
 Without `--loop`, a pass covers the available set. Sweep always covers the
 whole available set, regardless of a loop's narrower list, so one fresh
 generation can serve every pass.
+Sweep acquisition and generation writes hold one exclusive lease with a
+120-second expiry, renewed every 30 seconds while the sweep runs. Passes wait
+up to 30 seconds for that lease. A killed holder therefore clears within one
+expiry on every platform; where procfs is readable, a dead or recycled holder
+is reclaimed immediately. Before writing a generation, the sweep confirms it
+still owns the lease so a resumed, superseded holder cannot overwrite the new
+owner's records.
 The loop scope reaches child commands through `OSTROM_EFFECTIVE_REPOSITORIES`
 in the session environment; it is a selection boundary, while grants remain
 the authorization boundary. A loop-bound gatekeeper judges only pull requests
 from the pass's sweep generation, so one opened afterward waits for the next
 fresh generation, up to `sweep.max_age`.
+
+An empty effective set is a failed wake named `no-effective-repositories`, with
+every skipped repository and reason recorded at both ends of the pass. No
+operation or agent starts. This differs from a gatekeeper wake whose effective
+set is non-empty but whose supplied snapshot contains no pull requests: that
+idle wake records `no-candidates`, starts no agent, and succeeds.
 
 The current composed policy version can instead own loop lifecycle directly:
 

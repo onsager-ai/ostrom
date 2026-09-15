@@ -30,8 +30,12 @@ use crate::{
     Clock, LeaseActionError, OstromPaths, OwnedLease, PassState, RunEventError, RunEventGuard,
     RunEventStart, SignalFlags, SkippedRepository, SweepOptions, TraceAppend, append_trace,
     environment, generated_run_id, generation_is_fresh, latest_successful_generation,
-    load_sweep_snapshot, pass_control, pass_control::ControlInput, read_lease, read_pass_state,
-    read_trace, run_sweep, selection::dispatchability_snapshot, write_pass_state,
+    load_sweep_snapshot, pass_control,
+    pass_control::ControlInput,
+    read_lease, read_pass_state, read_trace,
+    selection::dispatchability_snapshot,
+    sweep::{run_sweep_holding_lease, wait_for_sweep_lease},
+    write_pass_state,
 };
 
 pub const MAX_TURNS: &str = "200";
@@ -196,6 +200,18 @@ enum PassSweepOutcome {
     NotManaged,
 }
 
+#[derive(Debug)]
+struct PreparedSweep {
+    outcome: PassSweepOutcome,
+    snapshots: Option<Vec<crate::RepositorySnapshot>>,
+}
+
+#[derive(Debug)]
+struct PreparedSession {
+    prompt: String,
+    candidate_count: Option<usize>,
+}
+
 impl PassSweepOutcome {
     fn generation_id(&self) -> Option<&str> {
         match self {
@@ -219,40 +235,70 @@ impl PassSweepOutcome {
     }
 }
 
-fn prepare_sweep(request: &PassRequest) -> Result<PassSweepOutcome, String> {
+fn prepare_sweep(request: &PassRequest) -> Result<PreparedSweep, String> {
     let Some(sweep) = &request.sweep else {
-        return Ok(PassSweepOutcome::NotManaged);
+        return Ok(PreparedSweep {
+            outcome: PassSweepOutcome::NotManaged,
+            snapshots: None,
+        });
     };
+    // The freshness decision and gatekeeper snapshot read share the writer's
+    // lease. A pass that arrives during a sweep waits once, then evaluates the
+    // generation the completed writer actually left behind.
+    let lease = wait_for_sweep_lease(&request.paths).map_err(|error| error.to_string())?;
     let latest = latest_successful_generation(&request.paths).map_err(|error| error.to_string())?;
-    if let Some(generation) = latest.filter(|generation| {
+    let reusable = latest.filter(|generation| {
         generation_is_fresh(generation, request.clock.now(), sweep.max_age_seconds)
-    }) {
-        return Ok(PassSweepOutcome::Reused(generation.id));
+    });
+    if let Some(generation) = reusable {
+        if request.role != PassRole::Gatekeeper {
+            return Ok(PreparedSweep {
+                outcome: PassSweepOutcome::Reused(generation.id),
+                snapshots: None,
+            });
+        }
+        // A mismatched state/snapshot pair is not reusable. Keeping the lease
+        // and falling through performs the same single repair sweep as plan.
+        if let Ok(snapshots) = load_sweep_snapshot(&request.paths, &generation) {
+            return Ok(PreparedSweep {
+                outcome: PassSweepOutcome::Reused(generation.id),
+                snapshots: Some(snapshots),
+            });
+        }
     }
-    run_sweep(&sweep.options)
-        .map(|outcome| PassSweepOutcome::Swept(outcome.generation.id))
-        .map_err(|error| error.to_string())
+    let outcome =
+        run_sweep_holding_lease(&sweep.options, lease).map_err(|error| error.to_string())?;
+    let snapshots = (request.role == PassRole::Gatekeeper)
+        .then(|| load_sweep_snapshot(&request.paths, &outcome.generation))
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    Ok(PreparedSweep {
+        outcome: PassSweepOutcome::Swept(outcome.generation.id),
+        snapshots,
+    })
 }
 
-fn session_prompt(request: &PassRequest, sweep: &PassSweepOutcome) -> Result<String, String> {
+fn session_prompt(request: &PassRequest, sweep: &PreparedSweep) -> Result<PreparedSession, String> {
     if request.role != PassRole::Gatekeeper || request.sweep.is_none() {
-        return Ok(request.prompt.clone());
+        return Ok(PreparedSession {
+            prompt: request.prompt.clone(),
+            candidate_count: None,
+        });
     }
     let generation_id = sweep
+        .outcome
         .generation_id()
         .ok_or_else(|| "managed gatekeeper pass has no sweep generation".to_owned())?;
-    let generation = latest_successful_generation(&request.paths)
-        .map_err(|error| error.to_string())?
-        .filter(|generation| generation.id == generation_id)
-        .ok_or_else(|| format!("successful sweep generation `{generation_id}` is unavailable"))?;
     let scope = request.repository_scope.as_ref().map(|repositories| {
         repositories
             .iter()
             .map(String::as_str)
             .collect::<BTreeSet<_>>()
     });
-    let snapshots =
-        load_sweep_snapshot(&request.paths, &generation).map_err(|error| error.to_string())?;
+    let snapshots = sweep
+        .snapshots
+        .as_ref()
+        .ok_or_else(|| "managed gatekeeper pass has no sweep snapshot".to_owned())?;
     let mut candidates = BTreeSet::new();
     let mut snapshot_repositories = BTreeSet::new();
     for snapshot in snapshots {
@@ -264,7 +310,7 @@ fn session_prompt(request: &PassRequest, sweep: &PassSweepOutcome) -> Result<Str
             continue;
         }
         snapshot_repositories.insert(repository.to_owned());
-        for pull_request in snapshot.open_prs {
+        for pull_request in &snapshot.open_prs {
             let number = pull_request.get("number").and_then(Value::as_u64).ok_or_else(|| {
                 format!(
                     "sweep generation `{generation_id}` has a pull request without a numeric number in `{repository}`"
@@ -286,11 +332,19 @@ fn session_prompt(request: &PassRequest, sweep: &PassSweepOutcome) -> Result<Str
         "effective_repositories": effective_repositories,
         "pull_requests": candidates,
     });
-    Ok(format!(
-        "{}\n\n## Sweep snapshot candidates for this pass\n\nUse this pass-supplied JSON as the complete candidate input. Judge only its `pull_requests`; do not enumerate live pull requests or add a repository.\n\n```json\n{}\n```\n",
-        request.prompt,
-        serde_json::to_string_pretty(&input).expect("gatekeeper input serializes")
-    ))
+    Ok(PreparedSession {
+        prompt: format!(
+            "{}\n\n## Sweep snapshot candidates for this pass\n\nUse this pass-supplied JSON as the complete candidate input. Judge only its `pull_requests`; do not enumerate live pull requests or add a repository.\n\n```json\n{}\n```\n",
+            request.prompt,
+            serde_json::to_string_pretty(&input).expect("gatekeeper input serializes")
+        ),
+        candidate_count: Some(
+            input["pull_requests"]
+                .as_array()
+                .expect("gatekeeper candidates are an array")
+                .len(),
+        ),
+    })
 }
 
 #[derive(Debug, Error)]
@@ -307,6 +361,8 @@ pub enum PassError {
     Disarmed(&'static str),
     #[error("ostrom {0} pass: daily spend cap reached; held until the ceiling resets or is raised")]
     BudgetHeld(&'static str),
+    #[error("ostrom {0} pass: no-effective-repositories")]
+    NoEffectiveRepositories(&'static str),
     #[error(
         "ostrom {role} pass: Claude Code {version} at {path} cannot run a bridged pass: the permission bridge needs --permission-prompts and --permission-prompt-tool, available from Claude Code {minimum} (the lowest verified version); upgrade Claude Code to at least {minimum}"
     )]
@@ -326,6 +382,7 @@ impl PassError {
             Self::LeaseHeld(_) => 0,
             Self::Disarmed(_) => DISARMED_EXIT_CODE,
             Self::BudgetHeld(_) => BUDGET_HELD_EXIT_CODE,
+            Self::NoEffectiveRepositories(_) => 3,
             Self::HarnessUnsupported { .. } => HARNESS_UNAVAILABLE_EXIT_CODE,
         }
     }
@@ -364,6 +421,8 @@ struct PassGuard {
     dispatchability_hash: Option<String>,
     queue_count: Option<usize>,
     dispatchable_count: Option<usize>,
+    repositories: Option<Vec<String>>,
+    skipped_repositories: Vec<SkippedRepository>,
     events: RunEventGuard,
     control: Option<RunControl<NoSteer>>,
     process_exit: ProcessExit,
@@ -442,6 +501,15 @@ impl PassGuard {
             if let Some(count) = self.dispatchable_count {
                 fact.insert("dispatchable_count".to_owned(), json!(count));
             }
+            if let Some(repositories) = &self.repositories {
+                fact.insert("repositories".to_owned(), json!(repositories));
+            }
+            if !self.skipped_repositories.is_empty() {
+                fact.insert(
+                    "skipped_repositories".to_owned(),
+                    json!(self.skipped_repositories),
+                );
+            }
             if let Err(error) = append_trace(
                 &self.paths.trace_file(),
                 &TraceAppend {
@@ -503,7 +571,7 @@ impl PassGuard {
 fn event_outcome(outcome: &str) -> EventRunOutcome {
     match outcome {
         "completed" => EventRunOutcome::Completed,
-        "no-op" => EventRunOutcome::NoOp,
+        "no-op" | "no-candidates" => EventRunOutcome::NoOp,
         // The fact ledger calls a spend refusal held; ethogram calls it blocked.
         "held" => EventRunOutcome::Blocked,
         "timed-out" => EventRunOutcome::TimedOut,
@@ -533,6 +601,74 @@ fn wire_ceilings(caps: RunCaps) -> Option<ethogram::RunCeilings> {
         || caps.tokens.is_some()
         || caps.cost_usd.is_some())
     .then(|| caps.to_wire())
+}
+
+fn refuse_empty_repository_scope(
+    request: &PassRequest,
+    events: &mut RunEventGuard,
+) -> Result<(), PassError> {
+    let owner = events.run_id().to_owned();
+    let repositories = request.repositories.as_ref().cloned().unwrap_or_default();
+    let common = Map::from_iter([
+        ("owner".to_owned(), json!(owner)),
+        ("repositories".to_owned(), json!(repositories)),
+        (
+            "skipped_repositories".to_owned(),
+            json!(request.skipped_repositories),
+        ),
+        ("reason".to_owned(), json!("no-effective-repositories")),
+    ]);
+    append_trace(
+        &request.paths.trace_file(),
+        &TraceAppend {
+            ts: request.clock.timestamp(),
+            kind: "pass-started".to_owned(),
+            fact: common.clone(),
+            narration: Map::new(),
+        },
+    )
+    .map_err(|error| {
+        PassError::failed(
+            request.role,
+            format!("could not append pass-started: {error}"),
+            1,
+        )
+    })?;
+    let mut terminal = common;
+    terminal.insert("outcome".to_owned(), json!("failed"));
+    terminal.insert("cost_usd".to_owned(), json!(0.0));
+    terminal.insert("duration_seconds".to_owned(), json!(0));
+    append_trace(
+        &request.paths.trace_file(),
+        &TraceAppend {
+            ts: request.clock.timestamp(),
+            kind: "pass-ended".to_owned(),
+            fact: terminal,
+            narration: Map::new(),
+        },
+    )
+    .map_err(|error| {
+        PassError::failed(
+            request.role,
+            format!("could not append pass-ended: {error}"),
+            1,
+        )
+    })?;
+    events
+        .finish(
+            EventRunOutcome::Failed,
+            Some("no-effective-repositories".to_owned()),
+            Some(0.0),
+            None,
+        )
+        .map_err(|error| {
+            PassError::failed(
+                request.role,
+                format!("could not append run.finished: {error}"),
+                1,
+            )
+        })?;
+    Err(PassError::NoEffectiveRepositories(request.role.name()))
 }
 
 impl Drop for PassGuard {
@@ -716,6 +852,9 @@ fn run_pass_with_bridge_probe_timeout(
             1,
         )
     })?;
+    if request.repositories.as_ref().is_some_and(Vec::is_empty) {
+        return refuse_empty_repository_scope(request, &mut events);
+    }
     let mut watchdog = CapsWatchdog::start(
         request.caps,
         SystemClock::default(),
@@ -823,14 +962,16 @@ fn run_pass_with_bridge_probe_timeout(
         dispatchability_hash: None,
         queue_count: None,
         dispatchable_count: None,
+        repositories: request.repositories.clone(),
+        skipped_repositories: request.skipped_repositories.clone(),
         events,
         control: None,
         process_exit: ProcessExit::Abnormal,
         permission_bridge: None,
     };
     let prepared = prepare_sweep(request)
-        .and_then(|sweep| session_prompt(request, &sweep).map(|prompt| (sweep, prompt)));
-    let (sweep, session_prompt) = match prepared {
+        .and_then(|sweep| session_prompt(request, &sweep).map(|session| (sweep, session)));
+    let (sweep, session) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
             let mut fact = Map::from_iter([
@@ -876,7 +1017,7 @@ fn run_pass_with_bridge_probe_timeout(
         }
     };
     let mut start_fact = Map::from_iter([("owner".to_owned(), json!(owner))]);
-    sweep.record(&mut start_fact);
+    sweep.outcome.record(&mut start_fact);
     if let Some(repositories) = &request.repositories {
         start_fact.insert("repositories".to_owned(), json!(repositories));
     }
@@ -903,6 +1044,15 @@ fn run_pass_with_bridge_probe_timeout(
         )
     })?;
     guard.started = true;
+    if request.repositories.is_some()
+        && request.role == PassRole::Gatekeeper
+        && session.candidate_count == Some(0)
+    {
+        guard.outcome = Some("no-candidates".to_owned());
+        guard.cost_usd = Some(0.0);
+        guard.finish()?;
+        return Ok(());
+    }
     let watermark = read_trace(&request.paths.trace_file())
         .map_err(|error| PassError::failed(request.role, error.to_string(), 1))?
         .rows
@@ -1098,7 +1248,7 @@ fn run_pass_with_bridge_probe_timeout(
             "--verbose",
             "--max-turns",
             MAX_TURNS,
-            &session_prompt,
+            &session.prompt,
         ])
         // The harness reads its inherited stdin to EOF even when the prompt
         // is an argument, and a supervisor that follows docs/pass-control.md
@@ -2044,6 +2194,8 @@ mod sink_refusal_tests {
             dispatchability_hash: None,
             queue_count: None,
             dispatchable_count: None,
+            repositories: None,
+            skipped_repositories: Vec::new(),
             events,
             control: None,
             process_exit: ProcessExit::Normal,
@@ -2318,6 +2470,7 @@ mod event_outcome_tests {
     fn an_unstarted_run_reaches_the_wire_as_unstarted_not_failed() {
         assert_eq!(event_outcome("unstarted"), EventRunOutcome::Unstarted);
         assert_eq!(event_outcome("no-op"), EventRunOutcome::NoOp);
+        assert_eq!(event_outcome("no-candidates"), EventRunOutcome::NoOp);
         assert_eq!(event_outcome("not-an-outcome"), EventRunOutcome::Failed);
     }
 }
@@ -2769,14 +2922,21 @@ mod platform_fallback_pass_tests {
 
 #[cfg(test)]
 mod sweep_freshness_tests {
-    use std::{fs, path::PathBuf};
+    use std::{
+        fs,
+        path::PathBuf,
+        thread,
+        time::{Duration, Instant},
+    };
 
     use serde_json::json;
 
     use super::{
         PassRequest, PassRole, PassSweepOutcome, PassSweepRequest, prepare_sweep, run_pass,
     };
-    use crate::{Clock, OstromPaths, PublishTarget, SweepMode, SweepOptions, read_trace};
+    use crate::{
+        Clock, OstromPaths, OwnedLease, PublishTarget, SweepMode, SweepOptions, read_trace,
+    };
 
     #[test]
     fn shipped_prompts_do_not_run_a_sweep() {
@@ -2877,7 +3037,8 @@ mod sweep_freshness_tests {
         )
         .expect("write state");
         assert_eq!(
-            prepare_sweep(&request(fresh.path(), "2026-09-15T10:29:59Z", None, 1_800,)),
+            prepare_sweep(&request(fresh.path(), "2026-09-15T10:29:59Z", None, 1_800,))
+                .map(|prepared| prepared.outcome),
             Ok(PassSweepOutcome::Reused("young-generation".to_owned()))
         );
 
@@ -2904,7 +3065,7 @@ mod sweep_freshness_tests {
                 1_800,
             ))
             .expect("stale pass sweeps");
-            assert!(matches!(outcome, PassSweepOutcome::Swept(_)));
+            assert!(matches!(outcome.outcome, PassSweepOutcome::Swept(_)));
         }
     }
 
@@ -2927,5 +3088,102 @@ mod sweep_freshness_tests {
         assert_eq!(rows[0].fact["sweep"], "failed");
         assert_eq!(rows[1].kind, "pass-ended");
         assert_eq!(rows[1].fact["reason"], "sweep-failed");
+    }
+
+    #[test]
+    fn pass_waits_for_a_held_sweep_lease_then_reuses_the_completed_generation() {
+        let root = tempfile::tempdir().expect("held sweep lease fixture");
+        let paths = OstromPaths {
+            config: root.path().to_path_buf(),
+            state: root.path().to_path_buf(),
+        };
+        let lease = OwnedLease::acquire(
+            &paths.state,
+            "sweep.lease",
+            "concurrent-sweep",
+            Clock::realtime().epoch_seconds(),
+            60,
+        )
+        .expect("hold sweep lease");
+        let state_path = root.path().join("state.json");
+        let snapshot_path = root.path().join("sweep-snapshot.json");
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            let generation = json!({
+                "id": "concurrent-generation",
+                "completed_at": "2026-09-15T10:20:00Z"
+            });
+            fs::write(
+                state_path,
+                serde_json::to_vec(&json!({"sweep_generation": generation.clone()}))
+                    .expect("serialize completed sweep state"),
+            )
+            .expect("write completed sweep state");
+            fs::write(
+                snapshot_path,
+                serde_json::to_vec(&json!({
+                    "generation": generation,
+                    "repositories": []
+                }))
+                .expect("serialize completed sweep snapshot"),
+            )
+            .expect("write completed sweep snapshot");
+            drop(lease);
+        });
+
+        let started = Instant::now();
+        let prepared = prepare_sweep(&request(root.path(), "2026-09-15T10:30:00Z", None, 1_800))
+            .expect("pass reuses concurrent sweep");
+        writer.join().expect("concurrent sweep writer");
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        assert_eq!(
+            prepared.outcome,
+            PassSweepOutcome::Reused("concurrent-generation".to_owned())
+        );
+    }
+
+    #[test]
+    fn gatekeeper_repairs_a_fresh_state_snapshot_mismatch_with_one_sweep() {
+        let root = tempfile::tempdir().expect("mismatched sweep fixture");
+        let fixture = write_sweep_inputs(root.path());
+        fs::write(
+            root.path().join("state.json"),
+            serde_json::to_vec(&json!({
+                "sweep_generation": {
+                    "id": "state-generation",
+                    "completed_at": "2026-09-15T10:20:00Z"
+                }
+            }))
+            .expect("serialize mismatched state"),
+        )
+        .expect("write mismatched state");
+        fs::write(
+            root.path().join("sweep-snapshot.json"),
+            serde_json::to_vec(&json!({
+                "generation": {
+                    "id": "snapshot-generation",
+                    "completed_at": "2026-09-15T10:20:00Z"
+                },
+                "repositories": []
+            }))
+            .expect("serialize mismatched snapshot"),
+        )
+        .expect("write mismatched snapshot");
+        let mut request = request(root.path(), "2026-09-15T10:30:00Z", Some(fixture), 1_800);
+        request.role = PassRole::Gatekeeper;
+        request.repository_scope = Some(vec!["placeholder-org/alpha".to_owned()]);
+
+        let prepared = prepare_sweep(&request).expect("gatekeeper repairs mismatch");
+        assert!(matches!(prepared.outcome, PassSweepOutcome::Swept(_)));
+        assert_eq!(prepared.snapshots.as_ref().map(Vec::len), Some(1));
+        let state: serde_json::Value = serde_json::from_slice(
+            &fs::read(root.path().join("state.json")).expect("read repaired state"),
+        )
+        .expect("parse repaired state");
+        let snapshot: serde_json::Value = serde_json::from_slice(
+            &fs::read(root.path().join("sweep-snapshot.json")).expect("read repaired snapshot"),
+        )
+        .expect("parse repaired snapshot");
+        assert_eq!(state["sweep_generation"], snapshot["generation"]);
     }
 }

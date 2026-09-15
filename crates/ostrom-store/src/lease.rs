@@ -128,10 +128,16 @@ impl LeaseRecord {
 
     #[must_use]
     pub(crate) fn is_live(&self, now: u64) -> bool {
+        self.is_live_at(now, Path::new("/proc"))
+    }
+
+    #[must_use]
+    pub(crate) fn is_live_at(&self, now: u64, proc_root: &Path) -> bool {
         self.process_identity()
             .map_or(
                 self.expires_at > now,
-                |(pid, _, start_time)| match process_identity_is_live(pid, start_time) {
+                |(pid, _, start_time)| match process_identity_is_live_at(proc_root, pid, start_time)
+                {
                     ProcessLiveness::Live => true,
                     ProcessLiveness::NotLive => false,
                     ProcessLiveness::Unknown => self.expires_at > now,
@@ -144,7 +150,10 @@ pub(crate) fn read_process_identity(pid: u32) -> io::Result<Option<ProcessIdenti
     read_process_identity_at(Path::new("/proc"), pid)
 }
 
-fn read_process_identity_at(proc_root: &Path, pid: u32) -> io::Result<Option<ProcessIdentity>> {
+pub(crate) fn read_process_identity_at(
+    proc_root: &Path,
+    pid: u32,
+) -> io::Result<Option<ProcessIdentity>> {
     let stat_path = proc_root.join(pid.to_string()).join("stat");
     let stat = match fs::read_to_string(&stat_path) {
         Ok(stat) => stat,
@@ -282,8 +291,6 @@ pub fn acquire_lease(
     if ttl == 0 {
         return Err(LeaseActionError::InvalidTtl);
     }
-    fs::create_dir_all(state_root).map_err(|_| LeaseActionError::HeldOrUnreadable)?;
-    let path = state_root.join(name);
     let record = LeaseRecord {
         owner: owner.to_owned(),
         started_at: now,
@@ -292,14 +299,79 @@ pub fn acquire_lease(
         process_group_id: None,
         process_start_time: None,
     };
-    let bytes = lease_bytes(&record);
+    acquire_lease_record(
+        state_root,
+        name,
+        now,
+        &record,
+        Path::new("/proc"),
+        LeaseExpiryPolicy::ProcessLifetime,
+    )
+}
+
+pub(crate) fn acquire_renewable_lease(
+    state_root: &Path,
+    name: &str,
+    owner: &str,
+    now: u64,
+    ttl: u64,
+    identity: Option<ProcessIdentity>,
+    proc_root: &Path,
+) -> Result<Vec<u8>, LeaseActionError> {
+    validate_lease_name(name)?;
+    if ttl == 0 {
+        return Err(LeaseActionError::InvalidTtl);
+    }
+    let (pid, process_group_id, process_start_time) =
+        identity.map_or((None, None, None), |identity| {
+            (
+                Some(identity.pid),
+                Some(identity.process_group_id),
+                Some(identity.start_time),
+            )
+        });
+    let record = LeaseRecord {
+        owner: owner.to_owned(),
+        started_at: now,
+        expires_at: now.saturating_add(ttl),
+        pid,
+        process_group_id,
+        process_start_time,
+    };
+    acquire_lease_record(
+        state_root,
+        name,
+        now,
+        &record,
+        proc_root,
+        LeaseExpiryPolicy::Renewable,
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LeaseExpiryPolicy {
+    ProcessLifetime,
+    Renewable,
+}
+
+fn acquire_lease_record(
+    state_root: &Path,
+    name: &str,
+    now: u64,
+    record: &LeaseRecord,
+    proc_root: &Path,
+    expiry_policy: LeaseExpiryPolicy,
+) -> Result<Vec<u8>, LeaseActionError> {
+    fs::create_dir_all(state_root).map_err(|_| LeaseActionError::HeldOrUnreadable)?;
+    let path = state_root.join(name);
+    let bytes = lease_bytes(record);
     if install_exclusive(&path, &bytes) {
         return Ok(bytes);
     }
     let held = read_lease(&path)
         .map_err(|_| LeaseActionError::HeldOrUnreadable)?
         .ok_or(LeaseActionError::HeldOrUnreadable)?;
-    if held.is_live(now) {
+    if lease_is_live(&held, now, proc_root, expiry_policy) {
         return Err(LeaseActionError::Held);
     }
 
@@ -308,7 +380,7 @@ pub fn acquire_lease(
     let held = read_lease(&path)
         .map_err(|_| LeaseActionError::ChangedDuringReclamation)?
         .ok_or(LeaseActionError::ChangedDuringReclamation)?;
-    if held.is_live(now) {
+    if lease_is_live(&held, now, proc_root, expiry_policy) {
         return Err(LeaseActionError::Held);
     }
     fs::remove_file(&path).map_err(|_| LeaseActionError::ChangedDuringReclamation)?;
@@ -317,6 +389,49 @@ pub fn acquire_lease(
     } else {
         Err(LeaseActionError::AcquiredConcurrently)
     }
+}
+
+fn lease_is_live(
+    lease: &LeaseRecord,
+    now: u64,
+    proc_root: &Path,
+    expiry_policy: LeaseExpiryPolicy,
+) -> bool {
+    match expiry_policy {
+        LeaseExpiryPolicy::ProcessLifetime => lease.is_live_at(now, proc_root),
+        LeaseExpiryPolicy::Renewable => {
+            lease.expires_at > now
+                && lease.process_identity().is_none_or(|(pid, _, start_time)| {
+                    process_identity_is_live_at(proc_root, pid, start_time)
+                        != ProcessLiveness::NotLive
+                })
+        }
+    }
+}
+
+pub(crate) fn renew_lease(
+    state_root: &Path,
+    name: &str,
+    owner: &str,
+    expected_identity: Option<(u32, u32, u64)>,
+    now: u64,
+    ttl: u64,
+) -> Result<(), LeaseActionError> {
+    validate_lease_name(name)?;
+    if ttl == 0 {
+        return Err(LeaseActionError::InvalidTtl);
+    }
+    let path = state_root.join(name);
+    let guard_path = state_root.join(format!(".{name}.guard"));
+    let _guard = LeaseGuard::acquire(&guard_path).ok_or(LeaseActionError::MutationInProgress)?;
+    let mut held = read_lease(&path)
+        .map_err(|_| LeaseActionError::NoReadableLease)?
+        .ok_or(LeaseActionError::NoReadableLease)?;
+    if held.owner != owner || held.process_identity() != expected_identity {
+        return Err(LeaseActionError::OwnerMismatch);
+    }
+    held.expires_at = held.expires_at.max(now.saturating_add(ttl));
+    write_lease(&path, &held).map_err(|_| LeaseActionError::HeldOrUnreadable)
 }
 
 pub fn release_lease(state_root: &Path, name: &str, owner: &str) -> Result<(), LeaseActionError> {
@@ -366,6 +481,24 @@ impl OwnedLease {
         ttl: u64,
     ) -> Result<Self, LeaseActionError> {
         acquire_lease(state_root, name, owner, now, ttl)?;
+        Ok(Self {
+            state_root: state_root.to_path_buf(),
+            name: name.to_owned(),
+            owner: owner.to_owned(),
+            armed: true,
+        })
+    }
+
+    pub(crate) fn acquire_renewable(
+        state_root: &Path,
+        name: &str,
+        owner: &str,
+        now: u64,
+        ttl: u64,
+        identity: Option<ProcessIdentity>,
+        proc_root: &Path,
+    ) -> Result<Self, LeaseActionError> {
+        acquire_renewable_lease(state_root, name, owner, now, ttl, identity, proc_root)?;
         Ok(Self {
             state_root: state_root.to_path_buf(),
             name: name.to_owned(),

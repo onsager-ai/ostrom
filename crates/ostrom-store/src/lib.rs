@@ -51,8 +51,9 @@ pub use environment::{ENVIRONMENT_VARIABLES, EnvironmentClass, EnvironmentVariab
 pub use event_store::JsonlEventStore;
 pub use file_store::JsonlSweepStore;
 pub use gate::{
-    GateError, GateOptions, GateOutput, GateReplaySnapshot, acquire_gate_replay_snapshot,
-    evaluate_gate_replay, gate_config_needs_diff_content, load_gate_config, run_gate,
+    GATE_READ_PERMISSIONS, GateError, GateOptions, GateOutput, GateReplaySnapshot,
+    acquire_gate_replay_snapshot, evaluate_gate_replay, gate_config_needs_diff_content,
+    load_gate_config, run_gate,
 };
 pub use hooks::{DigestOptions, HookOutput, render_constitution, render_digest};
 pub use implement::{

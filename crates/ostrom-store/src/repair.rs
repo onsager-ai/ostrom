@@ -15,6 +15,7 @@ use crate::{
         ScopedAppTokenRequest, authenticated_output,
     },
     append_trace, environment, load_config_or_defaults, read_commit_checks,
+    sweep::invalidate_sweep_generation,
 };
 
 const REPAIR_CAP: usize = 3;
@@ -49,6 +50,8 @@ pub enum RepairError {
     Trace,
     #[error("mandate repair: could not serialize summary")]
     Serialize,
+    #[error("mandate repair: could not invalidate the sweep generation: {0}")]
+    Invalidate(String),
 }
 
 impl RepairError {
@@ -56,7 +59,7 @@ impl RepairError {
     pub const fn exit_code(&self) -> i32 {
         match self {
             Self::Config(_) => 2,
-            Self::Temporary(_) | Self::Trace | Self::Serialize => 1,
+            Self::Temporary(_) | Self::Trace | Self::Serialize | Self::Invalidate(_) => 1,
         }
     }
 }
@@ -226,6 +229,11 @@ fn run_repair_prs_with_minter(
                 .join(format!("candidate-{}", summary.attempted)),
             &mut summary,
         )?;
+    }
+
+    if summary.repaired > 0 {
+        invalidate_sweep_generation(&options.paths)
+            .map_err(|error| RepairError::Invalidate(error.to_string()))?;
     }
 
     let encoded = serde_json::to_string(&json!({
