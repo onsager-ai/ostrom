@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+## 0.15.0 (2026-09-15)
+
+- Implementer dispatch gains a `process` backend, selected explicitly with
+  `MANDATE_DISPATCH_BACKEND=process`, for environments without a user service
+  manager (#590, #594). The implementer runs in its own session and process
+  group and outlives the dispatching pass. It starts with a cleared environment
+  plus an explicit allowlist, including proxy variables when set, and writes a
+  private per-item log that is removed when its worktree is reclaimed. Its
+  lease records process identity, and liveness is read from procfs alone: a
+  dead, zombie or recycled implementer is reclaimed, and an unreadable process
+  entry falls back to the lease TTL rather than being treated as dead.
+  Implementers still inherit the dispatcher's descriptors that lack
+  close-on-exec (#595).
+- Loop-bound passes take `--loop <name>` and resolve their effective repository
+  set from the verified manifest. The operator may supply the available set
+  with `OSTROM_AVAILABLE_REPOSITORIES`; without it, the set is the repositories
+  the policy and mandates name. Sweep always covers the whole available set.
+  Work selection, dispatch and `ostrom gate` refuse repositories outside the
+  effective set (#591).
 - Loop wakes now fail before work when their effective repository set is empty,
   while gatekeeper wakes with a non-empty scope and no snapshot candidates end
   successfully without starting an agent session.
@@ -24,3 +43,17 @@
 - **Breaking:** the shipped sweep preset no longer declares `loops.sweep`.
   Builder and gatekeeper passes refresh stale sweep generations before an agent
   session, and the shipped prompts no longer invoke a sweep themselves.
+- **Breaking:** `ostrom loop run` (and the units `ostrom up` generates) now runs
+  a builder or gatekeeper loop whose operation has an `agent/` step as a full
+  loop-bound pass (`__pass-worker --loop`) instead of a bare agent run. Such a
+  loop is now subject to the pass arming check, the pass lease and sweep
+  freshness: a scheduled loop whose state has no `loop-armed` marker exits 78
+  and records a failure on every slot after upgrading. Arm it before upgrading.
+- A loop-bound gatekeeper judges only the pull requests in its pass's sweep
+  generation, filtered to the effective repository set, instead of enumerating
+  live open pull requests. A pull request opened after that generation waits
+  for the next fresh generation, up to `sweep.max_age` (30 minutes by default).
+- `ostrom plan` reuses a fresh sweep generation instead of always sweeping, and
+  reports `swept` and `generation_id`.
+- A manual `ostrom sweep` exits non-zero while another sweep holds the sweep
+  lease (#599 tracks a distinct, retryable status).
