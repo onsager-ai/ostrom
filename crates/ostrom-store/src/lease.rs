@@ -288,8 +288,6 @@ pub fn acquire_lease(
     if ttl == 0 {
         return Err(LeaseActionError::InvalidTtl);
     }
-    fs::create_dir_all(state_root).map_err(|_| LeaseActionError::HeldOrUnreadable)?;
-    let path = state_root.join(name);
     let record = LeaseRecord {
         owner: owner.to_owned(),
         started_at: now,
@@ -298,7 +296,41 @@ pub fn acquire_lease(
         process_group_id: None,
         process_start_time: None,
     };
-    let bytes = lease_bytes(&record);
+    acquire_lease_record(state_root, name, now, &record)
+}
+
+pub(crate) fn acquire_process_lease(
+    state_root: &Path,
+    name: &str,
+    owner: &str,
+    now: u64,
+    ttl: u64,
+    identity: ProcessIdentity,
+) -> Result<Vec<u8>, LeaseActionError> {
+    validate_lease_name(name)?;
+    if ttl == 0 {
+        return Err(LeaseActionError::InvalidTtl);
+    }
+    let record = LeaseRecord {
+        owner: owner.to_owned(),
+        started_at: now,
+        expires_at: now.saturating_add(ttl),
+        pid: Some(identity.pid),
+        process_group_id: Some(identity.process_group_id),
+        process_start_time: Some(identity.start_time),
+    };
+    acquire_lease_record(state_root, name, now, &record)
+}
+
+fn acquire_lease_record(
+    state_root: &Path,
+    name: &str,
+    now: u64,
+    record: &LeaseRecord,
+) -> Result<Vec<u8>, LeaseActionError> {
+    fs::create_dir_all(state_root).map_err(|_| LeaseActionError::HeldOrUnreadable)?;
+    let path = state_root.join(name);
+    let bytes = lease_bytes(record);
     if install_exclusive(&path, &bytes) {
         return Ok(bytes);
     }
@@ -372,6 +404,23 @@ impl OwnedLease {
         ttl: u64,
     ) -> Result<Self, LeaseActionError> {
         acquire_lease(state_root, name, owner, now, ttl)?;
+        Ok(Self {
+            state_root: state_root.to_path_buf(),
+            name: name.to_owned(),
+            owner: owner.to_owned(),
+            armed: true,
+        })
+    }
+
+    pub(crate) fn acquire_for_process(
+        state_root: &Path,
+        name: &str,
+        owner: &str,
+        now: u64,
+        ttl: u64,
+        identity: ProcessIdentity,
+    ) -> Result<Self, LeaseActionError> {
+        acquire_process_lease(state_root, name, owner, now, ttl, identity)?;
         Ok(Self {
             state_root: state_root.to_path_buf(),
             name: name.to_owned(),

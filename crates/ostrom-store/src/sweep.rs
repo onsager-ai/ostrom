@@ -36,7 +36,7 @@ use crate::{
     selector::{SelectorCandidate, glob_match, selector_match},
     set_private_file_mode,
     velocity::{Attribution, MergeFact, ObservedPull, VelocityLedger, actor_observed, is_machine},
-    write_lease, write_queue,
+    write_queue,
 };
 
 const QUERY_LIMIT: usize = 200;
@@ -372,16 +372,22 @@ pub fn run_selected_sweep_with_publication_source(
 }
 
 pub(crate) fn acquire_sweep_lease(paths: &OstromPaths) -> Result<OwnedLease, SweepError> {
+    let identity = read_process_identity(std::process::id())
+        .map_err(|error| {
+            SweepError::State(format!("could not read sweep process identity: {error}"))
+        })?
+        .ok_or_else(|| SweepError::State("sweep process identity is unavailable".to_owned()))?;
     let sequence = SWEEP_LEASE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let owner = format!("sweep-{}-{sequence}", std::process::id());
-    let lease = match OwnedLease::acquire(
+    match OwnedLease::acquire_for_process(
         &paths.state,
         SWEEP_LEASE_NAME,
         &owner,
         Clock::realtime().epoch_seconds(),
         SWEEP_LEASE_TTL_SECONDS,
+        identity,
     ) {
-        Ok(lease) => lease,
+        Ok(lease) => Ok(lease),
         Err(
             LeaseActionError::Held
             | LeaseActionError::HeldOrUnreadable
@@ -389,30 +395,11 @@ pub(crate) fn acquire_sweep_lease(paths: &OstromPaths) -> Result<OwnedLease, Swe
             | LeaseActionError::ChangedDuringReclamation
             | LeaseActionError::AcquiredConcurrently
             | LeaseActionError::MutationInProgress,
-        ) => return Err(SweepError::LeaseHeld),
-        Err(error) => {
-            return Err(SweepError::State(format!(
-                "could not acquire {SWEEP_LEASE_NAME}: {error}"
-            )));
-        }
-    };
-    let identity = read_process_identity(std::process::id())
-        .map_err(|error| {
-            SweepError::State(format!("could not read sweep process identity: {error}"))
-        })?
-        .ok_or_else(|| SweepError::State("sweep process identity is unavailable".to_owned()))?;
-    let path = paths.state.join(SWEEP_LEASE_NAME);
-    let mut record = crate::read_lease(&path)
-        .map_err(|error| SweepError::State(format!("could not read {SWEEP_LEASE_NAME}: {error}")))?
-        .filter(|record| record.owner == owner)
-        .ok_or_else(|| SweepError::State(format!("lost ownership of {SWEEP_LEASE_NAME}")))?;
-    record.pid = Some(identity.pid);
-    record.process_group_id = Some(identity.process_group_id);
-    record.process_start_time = Some(identity.start_time);
-    write_lease(&path, &record).map_err(|error| {
-        SweepError::State(format!("could not bind {SWEEP_LEASE_NAME}: {error}"))
-    })?;
-    Ok(lease)
+        ) => Err(SweepError::LeaseHeld),
+        Err(error) => Err(SweepError::State(format!(
+            "could not acquire {SWEEP_LEASE_NAME}: {error}"
+        ))),
+    }
 }
 
 pub(crate) fn wait_for_sweep_lease(paths: &OstromPaths) -> Result<OwnedLease, SweepError> {
