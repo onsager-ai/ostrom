@@ -25,8 +25,10 @@ use crate::{
 
 const SHIPPED_DEFAULTS: &str = include_str!("../assets/gate.defaults.yaml");
 /// Complete repository-read authority required by [`run_gate`]'s live
-/// acquisition: pull-request and closing-issue metadata, changed contents,
-/// check runs, commit statuses, and review threads.
+/// acquisition. `gh pr view` needs metadata and pull-request reads, plus issue
+/// reads for `closingIssuesReferences`; [`acquire_checks`] reads check runs and
+/// commit statuses; [`acquire_paths`] and [`acquire_diff_content`] read diff
+/// contents; and [`acquire_threads`] reads pull-request review threads.
 pub const GATE_READ_PERMISSIONS: &str =
     "metadata:read,issues:read,pull_requests:read,checks:read,statuses:read,contents:read";
 const REVIEW_QUERY: &str = "query($owner:String!, $repo:String!, $number:Int!, $cursor:String) {\n  repository(owner:$owner, name:$repo) {\n    pullRequest(number:$number) {\n      author { login }\n      reviewThreads(first:100, after:$cursor) {\n        nodes {\n          id\n          isResolved\n          resolvedBy { login }\n          comments(last:1) { nodes { author { login } } }\n        }\n        pageInfo { hasNextPage endCursor }\n      }\n    }\n  }\n}";
@@ -1904,23 +1906,58 @@ mod tests {
     }
 
     #[test]
-    fn gatekeeper_prompt_read_scope_equals_the_gate_acquisition_requirement() {
-        let prompt = include_str!("../assets/prompts/gatekeep.md");
-        let lines = prompt.lines().collect::<Vec<_>>();
-        let gate_line = lines
-            .iter()
-            .position(|line| line.contains("ostrom gate \"$repository#$pr_number\""))
-            .expect("step 4 invokes ostrom gate");
-        let permissions = lines[..gate_line]
-            .iter()
-            .rev()
-            .find_map(|line| {
-                line.trim()
-                    .strip_prefix("--permissions ")
-                    .and_then(|value| value.split_whitespace().next())
-            })
-            .expect("step 4 declares gate read permissions");
-        assert_eq!(permissions, GATE_READ_PERMISSIONS);
+    fn every_shipped_prompt_gate_invocation_uses_the_declared_read_scope() {
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/prompts");
+        let mut prompts = fs::read_dir(&directory)
+            .expect("read shipped prompt directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "md"))
+            .collect::<Vec<_>>();
+        prompts.sort();
+        let mut checked = Vec::new();
+        for path in prompts {
+            let prompt = fs::read_to_string(&path).expect("read shipped prompt");
+            for block in prompt
+                .split("```sh")
+                .skip(1)
+                .filter_map(|tail| tail.split_once("```").map(|(block, _remainder)| block))
+            {
+                let invokes_credential = block
+                    .lines()
+                    .any(|line| line.trim().starts_with("ostrom credential "));
+                let invokes_gate = block.lines().any(|line| {
+                    let line = line.trim();
+                    line.starts_with("ostrom gate ") || line.contains("-- ostrom gate ")
+                });
+                if !invokes_credential || !invokes_gate {
+                    continue;
+                }
+                let permissions = block
+                    .lines()
+                    .find_map(|line| {
+                        line.trim()
+                            .strip_prefix("--permissions ")
+                            .and_then(|value| value.split_whitespace().next())
+                    })
+                    .unwrap_or_else(|| {
+                        panic!("{} gate invocation has no read scope", path.display())
+                    });
+                assert_eq!(
+                    permissions,
+                    GATE_READ_PERMISSIONS,
+                    "{} gate invocation drifted",
+                    path.display()
+                );
+                checked.push(
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .expect("UTF-8 prompt name")
+                        .to_owned(),
+                );
+            }
+        }
+        assert_eq!(checked, ["gatekeep.md", "merge.md"]);
     }
 
     #[test]

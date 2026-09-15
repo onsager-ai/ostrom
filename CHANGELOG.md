@@ -13,8 +13,8 @@
 - Subset sweeps retain the prior generation's completion time for full-roster
   freshness, and a repository-changing pull-request repair invalidates the
   current generation.
-- The gatekeeper prompt now requests every read permission used by `ostrom gate`,
-  with a test tying the example to the gate's declared acquisition scope.
+- Every shipped prompt that invokes `ostrom gate` now requests its declared
+  acquisition scope, with a test preventing any prompt from drifting.
 - **Breaking:** loop declarations replace `target` with the scalar-or-list
   `repositories` field. Absent or empty means every available repository;
   manifests that still contain `target` are refused with the replacement name.
