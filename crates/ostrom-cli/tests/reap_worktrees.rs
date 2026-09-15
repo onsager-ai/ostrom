@@ -140,6 +140,14 @@ exit 97
         git_output(&self.source, &["rev-parse", &self.branch])
     }
 
+    fn item_hash(&self) -> String {
+        self.worktree
+            .file_name()
+            .expect("worktree item hash")
+            .to_string_lossy()
+            .into_owned()
+    }
+
     /// A commit that exists in `self.source` but shares no history with
     /// `self.branch` -- an orphan, standing in for a `headRefOid` whose
     /// history this repository cannot relate to the branch at all.
@@ -213,6 +221,10 @@ fn output_rows(output: &Output) -> Vec<Value> {
 #[test]
 fn merged_remote_absent_worktree_is_dry_run_then_reaped_with_byte_totals() {
     let fixture = Fixture::new();
+    let log = fixture
+        .state
+        .join(format!("implementer-item-{}.log", fixture.item_hash()));
+    fs::write(&log, "preserved diagnosis\n").expect("write implementer log");
     // The branch was never touched beyond its fork point, so its own tip is
     // exactly what GitHub would have last observed as this pull request's
     // `headRefOid` -- an ancestry check against it must reclaim.
@@ -233,6 +245,7 @@ fn merged_remote_absent_worktree_is_dry_run_then_reaped_with_byte_totals() {
     assert_eq!(rows[0]["reclaimed_bytes"], 0);
     assert!(rows[0]["bytes"].as_u64().unwrap() > 0);
     assert!(fixture.worktree.exists());
+    assert!(log.exists(), "dry-run removed the implementer log");
 
     let applied = run(fixture.command(true).env("OSTROM_TEST_PRS", &prs));
     let rows = output_rows(&applied);
@@ -241,6 +254,7 @@ fn merged_remote_absent_worktree_is_dry_run_then_reaped_with_byte_totals() {
     assert!(rows[1]["reclaimed_bytes"].as_u64().unwrap() > 0);
     assert_eq!(rows[1]["reaped_count"], 1);
     assert!(!fixture.worktree.exists());
+    assert!(!log.exists(), "reclaim retained the implementer log");
     assert!(
         !Command::new("git")
             .arg("-C")
@@ -266,6 +280,10 @@ fn merged_remote_absent_worktree_is_dry_run_then_reaped_with_byte_totals() {
 #[test]
 fn dirty_closed_item_is_retained_without_consulting_github() {
     let fixture = Fixture::new();
+    let log = fixture
+        .state
+        .join(format!("implementer-item-{}.log", fixture.item_hash()));
+    fs::write(&log, "failed run diagnosis\n").expect("write implementer log");
     fs::write(fixture.worktree.join("preserved.txt"), "expensive result\n")
         .expect("write dirty work");
     let gh_log = fixture.root.path().join("gh.calls");
@@ -281,6 +299,7 @@ fn dirty_closed_item_is_retained_without_consulting_github() {
     assert_eq!(rows[0]["reason"], "dirty-worktree");
     assert_eq!(rows[0]["reclaimed_bytes"], 0);
     assert!(fixture.worktree.join("preserved.txt").exists());
+    assert!(log.exists(), "retention removed the implementer log");
     assert!(!gh_log.exists());
     assert_eq!(fixture.trace()[0]["kind"], "worktree-retained");
 }
