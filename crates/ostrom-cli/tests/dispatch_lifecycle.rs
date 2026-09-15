@@ -14,6 +14,17 @@ use ostrom_core::WorkOrder;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
+const PROXY_VARIABLES: &[(&str, &str)] = &[
+    ("ALL_PROXY", "upper-all-placeholder"),
+    ("HTTPS_PROXY", "upper-secure-placeholder"),
+    ("HTTP_PROXY", "upper-plain-placeholder"),
+    ("NO_PROXY", "upper-bypass-placeholder"),
+    ("all_proxy", "lower-all-placeholder"),
+    ("https_proxy", "lower-secure-placeholder"),
+    ("http_proxy", "lower-plain-placeholder"),
+    ("no_proxy", "lower-bypass-placeholder"),
+];
+
 struct DispatchFixture {
     root: TempDir,
     home: PathBuf,
@@ -318,15 +329,17 @@ fn process_backend_launches_a_detached_session_with_the_systemd_environment() {
     let seam_calls = fixture.root.path().join("manager.calls");
     let systemd_run = failing_seam(&fixture.root, "systemd-run-fail", &seam_calls);
     let systemctl = failing_seam(&fixture.root, "systemctl-fail", &seam_calls);
-    let output = fixture
-        .dispatch(false)
+    let mut command = fixture.dispatch(false);
+    command
         .env("MANDATE_DISPATCH_BACKEND", "process")
         .env("MANDATE_OSTROM_BIN", &worker)
         .env("MANDATE_SYSTEMD_RUN_BIN", systemd_run)
         .env("MANDATE_SYSTEMCTL_BIN", systemctl)
-        .env("OSTROM_TEST_DISPATCHER_SECRET", "sentinel")
-        .output()
-        .expect("dispatch through process backend");
+        .env("OSTROM_TEST_DISPATCHER_SECRET", "sentinel");
+    for (name, value) in PROXY_VARIABLES {
+        command.env(name, value);
+    }
+    let output = command.output().expect("dispatch through process backend");
     assert!(
         output.status.success(),
         "{}",
@@ -369,6 +382,13 @@ fn process_backend_launches_a_detached_session_with_the_systemd_environment() {
             "{environment}"
         );
     }
+    for (name, value) in PROXY_VARIABLES {
+        let expected = format!("{name}={value}");
+        assert!(
+            environment.lines().any(|line| line == expected),
+            "missing process proxy variable {name}: {environment}"
+        );
+    }
     for absent in [
         "CLAUDE_CONFIG_DIR=",
         "MANDATE_GH_AS_BIN=",
@@ -396,6 +416,56 @@ fn process_backend_launches_a_detached_session_with_the_systemd_environment() {
         .find(|row| row["kind"] == "work-dispatched")
         .expect("work-dispatched row");
     assert_eq!(dispatched["fact"]["backend"], "process");
+}
+
+#[test]
+fn process_backend_omits_unset_proxy_variables_and_other_ambient_values() {
+    let fixture = DispatchFixture::new(false);
+    let worker_environment = fixture.root.path().join("unset-proxy-worker.env");
+    let worker = fixture.root.path().join("unset-proxy-implementer-stub");
+    executable(
+        &worker,
+        &format!(
+            "env >'{}'\ni=0; while [ \"$i\" -lt 30 ]; do sleep 1; i=$((i + 1)); done",
+            worker_environment.display()
+        ),
+    );
+    let mut command = fixture.dispatch(false);
+    command
+        .env("MANDATE_DISPATCH_BACKEND", "process")
+        .env("MANDATE_OSTROM_BIN", &worker)
+        .env("OSTROM_TEST_DISPATCHER_SECRET", "sentinel");
+    for (name, _) in PROXY_VARIABLES {
+        command.env_remove(name);
+    }
+
+    let output = command.output().expect("dispatch without proxy variables");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lease = process_lease(&fixture);
+    let process_group = lease["process_group_id"]
+        .as_u64()
+        .expect("lease process group") as u32;
+    let _guard = KillProcessGroup(process_group);
+    let environment = fs::read_to_string(worker_environment).expect("captured worker environment");
+    for (name, _) in PROXY_VARIABLES {
+        assert!(
+            !environment
+                .lines()
+                .any(|line| line.starts_with(&format!("{name}="))),
+            "unexpected process proxy variable {name}: {environment}"
+        );
+    }
+    assert!(
+        !environment
+            .lines()
+            .any(|line| line.starts_with("OSTROM_TEST_DISPATCHER_SECRET=")),
+        "non-allowlisted dispatcher value reached the implementer: {environment}"
+    );
 }
 
 #[test]

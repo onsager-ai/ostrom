@@ -25,9 +25,12 @@ use crate::{
         ScopedAppTokenRequest, authenticated_output,
     },
     append_trace, configured_retention_days, environment,
-    lease::{ProcessIdentity, process_identity_is_live, read_process_identity},
+    lease::{ProcessIdentity, ProcessLiveness, process_identity_is_live, read_process_identity},
     load_config_or_defaults, read_lease, read_trace,
-    reap::{WorktreeStatus, directory_bytes, gh_json_output, reclaim_worktree, worktree_status},
+    reap::{
+        WorktreeStatus, directory_bytes, gh_json_output, reclaim_worktree, remove_implementer_log,
+        worktree_status,
+    },
     run_events::{DISPATCH_RUN_ID, emit_decision_requests},
     sweep_worktrees,
     work_order::{implementer_lease_ttl, in_flight_orders, reap_stale_work_orders},
@@ -746,12 +749,20 @@ fn launch_process(
         .env("MANDATE_DISPATCH_BACKEND", &context.backend)
         .env("MANDATE_LEASE_NAME", lease_name);
     for variable in [
+        environment::ALL_PROXY,
         environment::HOME,
+        environment::HTTPS_PROXY,
+        environment::HTTP_PROXY,
         environment::PATH,
         environment::CLAUDE_BIN,
         environment::MANDATE_IMPLEMENTER_SOURCE_REPO,
         environment::MANDATE_IMPLEMENTER_TERMINATION_GRACE_SECONDS,
         environment::MANDATE_SECRETS_FILE,
+        environment::NO_PROXY,
+        environment::ALL_PROXY_LOWERCASE,
+        environment::HTTPS_PROXY_LOWERCASE,
+        environment::HTTP_PROXY_LOWERCASE,
+        environment::NO_PROXY_LOWERCASE,
     ] {
         if let Some(value) = variable.value_os() {
             launch.env(variable.name, value);
@@ -789,7 +800,7 @@ fn launch_process(
     }
     wait_for_startup_grace();
     if child.try_wait().ok().flatten().is_some()
-        || !process_identity_is_live(identity.pid, identity.start_time)
+        || process_identity_is_live(identity.pid, identity.start_time) == ProcessLiveness::NotLive
     {
         stop_process_child(&mut child);
         append_launch_failure(context, "dispatch-startup-failed", started.elapsed());
@@ -848,7 +859,7 @@ fn wait_for_process_session(child: &mut Child) -> Option<ProcessIdentity> {
     let pid = child.id();
     let deadline = Instant::now() + Duration::from_secs(1);
     loop {
-        if let Some(identity) = read_process_identity(pid)
+        if let Ok(Some(identity)) = read_process_identity(pid)
             && identity.process_group_id == pid
             && identity.session_id == pid
         {
@@ -1651,6 +1662,21 @@ fn reclaim_merged_worktree(
             format!("ostrom dispatch: merged branch cleanup failed: {error}{matched_key_suffix}"),
         )
     })?;
+    if let Err(error) = remove_implementer_log(&context.request.paths.state, &context.item_hash) {
+        let _ = append_failure(
+            context,
+            "branch-merged-not-cleaned",
+            FailureDetail {
+                branch_name: Some(existing_branch.clone()),
+                repository: Some(context.order.repository.clone()),
+                ..FailureDetail::default()
+            },
+        );
+        return Err(DispatchError::new(
+            1,
+            format!("ostrom dispatch: merged branch cleanup failed: {error}"),
+        ));
+    }
     let mut fact = Map::new();
     fact.insert("schema_version".to_owned(), json!(1));
     fact.insert("item_id".to_owned(), json!(context.order.item_id));
