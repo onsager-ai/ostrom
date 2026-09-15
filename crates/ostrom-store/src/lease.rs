@@ -128,10 +128,16 @@ impl LeaseRecord {
 
     #[must_use]
     pub(crate) fn is_live(&self, now: u64) -> bool {
+        self.is_live_at(now, Path::new("/proc"))
+    }
+
+    #[must_use]
+    pub(crate) fn is_live_at(&self, now: u64, proc_root: &Path) -> bool {
         self.process_identity()
             .map_or(
                 self.expires_at > now,
-                |(pid, _, start_time)| match process_identity_is_live(pid, start_time) {
+                |(pid, _, start_time)| match process_identity_is_live_at(proc_root, pid, start_time)
+                {
                     ProcessLiveness::Live => true,
                     ProcessLiveness::NotLive => false,
                     ProcessLiveness::Unknown => self.expires_at > now,

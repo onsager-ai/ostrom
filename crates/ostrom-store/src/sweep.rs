@@ -27,14 +27,16 @@ use crate::{
     commit_checks::read_commit_checks,
     environment,
     gate::load_gate_config,
-    io_error, project_available_mandates,
+    io_error,
+    lease::read_process_identity,
+    project_available_mandates,
     publish::{JsonlPublicationSource, PublishOptions, PublishOutcome, publish},
     read_queue, read_trace,
     run_events::{DecisionRequest, RunEventError, SWEEP_RUN_ID},
     selector::{SelectorCandidate, glob_match, selector_match},
     set_private_file_mode,
     velocity::{Attribution, MergeFact, ObservedPull, VelocityLedger, actor_observed, is_machine},
-    write_queue,
+    write_lease, write_queue,
 };
 
 const QUERY_LIMIT: usize = 200;
@@ -53,6 +55,8 @@ const FULL_RECONCILIATION_HOURS: i64 = 24;
 /// so that incident-shaped result must never reach persistence.
 const MIN_ACQUIRED_REPOSITORIES_TO_WRITE: usize = 1;
 const SWEEP_LEASE_NAME: &str = "sweep.lease";
+// Process liveness is authoritative when readable. One hour is the fallback
+// window when it is not, long enough for a realistic full-roster acquisition.
 const SWEEP_LEASE_TTL_SECONDS: u64 = 3_600;
 pub(crate) const SWEEP_LEASE_WAIT_SECONDS: u64 = 30;
 const SWEEP_LEASE_POLL_INTERVAL: StdDuration = StdDuration::from_millis(50);
@@ -370,14 +374,14 @@ pub fn run_selected_sweep_with_publication_source(
 pub(crate) fn acquire_sweep_lease(paths: &OstromPaths) -> Result<OwnedLease, SweepError> {
     let sequence = SWEEP_LEASE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let owner = format!("sweep-{}-{sequence}", std::process::id());
-    match OwnedLease::acquire(
+    let lease = match OwnedLease::acquire(
         &paths.state,
         SWEEP_LEASE_NAME,
         &owner,
         Clock::realtime().epoch_seconds(),
         SWEEP_LEASE_TTL_SECONDS,
     ) {
-        Ok(lease) => Ok(lease),
+        Ok(lease) => lease,
         Err(
             LeaseActionError::Held
             | LeaseActionError::HeldOrUnreadable
@@ -385,15 +389,41 @@ pub(crate) fn acquire_sweep_lease(paths: &OstromPaths) -> Result<OwnedLease, Swe
             | LeaseActionError::ChangedDuringReclamation
             | LeaseActionError::AcquiredConcurrently
             | LeaseActionError::MutationInProgress,
-        ) => Err(SweepError::LeaseHeld),
-        Err(error) => Err(SweepError::State(format!(
-            "could not acquire {SWEEP_LEASE_NAME}: {error}"
-        ))),
-    }
+        ) => return Err(SweepError::LeaseHeld),
+        Err(error) => {
+            return Err(SweepError::State(format!(
+                "could not acquire {SWEEP_LEASE_NAME}: {error}"
+            )));
+        }
+    };
+    let identity = read_process_identity(std::process::id())
+        .map_err(|error| {
+            SweepError::State(format!("could not read sweep process identity: {error}"))
+        })?
+        .ok_or_else(|| SweepError::State("sweep process identity is unavailable".to_owned()))?;
+    let path = paths.state.join(SWEEP_LEASE_NAME);
+    let mut record = crate::read_lease(&path)
+        .map_err(|error| SweepError::State(format!("could not read {SWEEP_LEASE_NAME}: {error}")))?
+        .filter(|record| record.owner == owner)
+        .ok_or_else(|| SweepError::State(format!("lost ownership of {SWEEP_LEASE_NAME}")))?;
+    record.pid = Some(identity.pid);
+    record.process_group_id = Some(identity.process_group_id);
+    record.process_start_time = Some(identity.start_time);
+    write_lease(&path, &record).map_err(|error| {
+        SweepError::State(format!("could not bind {SWEEP_LEASE_NAME}: {error}"))
+    })?;
+    Ok(lease)
 }
 
 pub(crate) fn wait_for_sweep_lease(paths: &OstromPaths) -> Result<OwnedLease, SweepError> {
-    let deadline = Instant::now() + StdDuration::from_secs(SWEEP_LEASE_WAIT_SECONDS);
+    wait_for_sweep_lease_for(paths, StdDuration::from_secs(SWEEP_LEASE_WAIT_SECONDS))
+}
+
+fn wait_for_sweep_lease_for(
+    paths: &OstromPaths,
+    wait: StdDuration,
+) -> Result<OwnedLease, SweepError> {
+    let deadline = Instant::now() + wait;
     loop {
         match acquire_sweep_lease(paths) {
             Ok(lease) => return Ok(lease),
@@ -402,7 +432,7 @@ pub(crate) fn wait_for_sweep_lease(paths: &OstromPaths) -> Result<OwnedLease, Sw
             }
             Err(SweepError::LeaseHeld) => {
                 return Err(SweepError::LeaseWaitTimedOut {
-                    seconds: SWEEP_LEASE_WAIT_SECONDS,
+                    seconds: wait.as_secs(),
                 });
             }
             Err(error) => return Err(error),
@@ -4990,6 +5020,91 @@ mod tests {
     use umwelt_runtime::Source;
 
     use super::*;
+    use crate::{LeaseRecord, read_lease, write_lease};
+
+    #[test]
+    fn dead_and_recycled_sweep_holders_are_reclaimed_before_the_ttl() {
+        let identity = read_process_identity(std::process::id())
+            .expect("read current process identity")
+            .expect("current process identity");
+        for (case, pid, process_group_id, process_start_time) in [
+            ("dead", u32::MAX, 1, 1),
+            (
+                "recycled",
+                identity.pid,
+                identity.process_group_id,
+                identity.start_time.saturating_add(1),
+            ),
+        ] {
+            let root = tempdir().expect("stale sweep lease fixture");
+            let paths = OstromPaths {
+                config: root.path().to_path_buf(),
+                state: root.path().to_path_buf(),
+            };
+            let now = Clock::realtime().epoch_seconds();
+            write_lease(
+                &paths.state.join(SWEEP_LEASE_NAME),
+                &LeaseRecord {
+                    owner: format!("{case}-sweep"),
+                    started_at: now,
+                    expires_at: now.saturating_add(SWEEP_LEASE_TTL_SECONDS),
+                    pid: Some(pid),
+                    process_group_id: Some(process_group_id),
+                    process_start_time: Some(process_start_time),
+                },
+            )
+            .expect("write stale sweep lease");
+
+            let lease = wait_for_sweep_lease_for(&paths, StdDuration::from_millis(100))
+                .unwrap_or_else(|error| panic!("{case} holder was not reclaimed: {error}"));
+            let replacement = read_lease(&paths.state.join(SWEEP_LEASE_NAME))
+                .expect("read replacement sweep lease")
+                .expect("replacement sweep lease");
+            assert_ne!(replacement.owner, format!("{case}-sweep"));
+            assert_eq!(replacement.pid, Some(identity.pid));
+            assert_eq!(
+                replacement.process_start_time,
+                Some(identity.start_time),
+                "{case} lease was not rebound to the current process"
+            );
+            drop(lease);
+        }
+    }
+
+    #[test]
+    fn a_live_sweep_holder_blocks_until_the_bounded_wait_expires() {
+        let root = tempdir().expect("live sweep lease fixture");
+        let paths = OstromPaths {
+            config: root.path().to_path_buf(),
+            state: root.path().to_path_buf(),
+        };
+        let held = acquire_sweep_lease(&paths).expect("hold live sweep lease");
+
+        let error = wait_for_sweep_lease_for(&paths, StdDuration::from_millis(75))
+            .expect_err("live sweep holder must block");
+
+        assert!(matches!(error, SweepError::LeaseWaitTimedOut { .. }));
+        drop(held);
+    }
+
+    #[test]
+    fn an_unreadable_sweep_process_identity_falls_back_to_the_ttl() {
+        let root = tempdir().expect("unreadable sweep identity fixture");
+        let paths = OstromPaths {
+            config: root.path().to_path_buf(),
+            state: root.path().to_path_buf(),
+        };
+        let held = acquire_sweep_lease(&paths).expect("hold sweep lease");
+        let record = read_lease(&paths.state.join(SWEEP_LEASE_NAME))
+            .expect("read sweep lease")
+            .expect("sweep lease");
+        assert!(record.process_identity().is_some());
+        let unavailable_proc = root.path().join("unavailable-proc");
+
+        assert!(record.is_live_at(record.started_at, &unavailable_proc));
+        assert!(!record.is_live_at(record.expires_at, &unavailable_proc));
+        drop(held);
+    }
 
     #[test]
     fn a_pull_request_merging_mid_sweep_does_not_refuse_the_sweep() {
