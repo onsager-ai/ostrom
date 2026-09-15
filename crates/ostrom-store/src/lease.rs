@@ -2,9 +2,11 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
 };
 
 use serde::{Deserialize, Serialize};
+use tempfile::NamedTempFile;
 use thiserror::Error;
 
 use crate::{StoreError, io_error, set_private_file_mode};
@@ -15,6 +17,21 @@ pub struct LeaseRecord {
     pub owner: String,
     pub started_at: u64,
     pub expires_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_group_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_start_time: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProcessIdentity {
+    pub pid: u32,
+    pub state: char,
+    pub process_group_id: u32,
+    pub session_id: u32,
+    pub start_time: u64,
 }
 
 #[derive(Debug, Error)]
@@ -74,8 +91,76 @@ impl LeaseRecord {
                 message: "expires_at precedes started_at".to_owned(),
             });
         }
+        let process_fields = [
+            self.pid.is_some(),
+            self.process_group_id.is_some(),
+            self.process_start_time.is_some(),
+        ];
+        if process_fields.iter().any(|present| *present)
+            && !process_fields.iter().all(|present| *present)
+        {
+            return Err(StoreError::MalformedLease {
+                name: name.to_owned(),
+                message:
+                    "process identity must include pid, process_group_id and process_start_time"
+                        .to_owned(),
+            });
+        }
+        if self.pid == Some(0) || self.process_group_id == Some(0) {
+            return Err(StoreError::MalformedLease {
+                name: name.to_owned(),
+                message: "process identity must use positive ids".to_owned(),
+            });
+        }
         Ok(())
     }
+
+    #[must_use]
+    pub(crate) fn process_identity(&self) -> Option<(u32, u32, u64)> {
+        Some((self.pid?, self.process_group_id?, self.process_start_time?))
+    }
+
+    #[must_use]
+    pub(crate) fn is_live(&self, now: u64) -> bool {
+        self.process_identity()
+            .map_or(self.expires_at > now, |(pid, _, start_time)| {
+                process_identity_is_live(pid, start_time)
+            })
+    }
+}
+
+pub(crate) fn read_process_identity(pid: u32) -> Option<ProcessIdentity> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields = stat
+        .rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    Some(ProcessIdentity {
+        pid,
+        state: fields.first()?.chars().next()?,
+        process_group_id: fields.get(2)?.parse().ok()?,
+        session_id: fields.get(3)?.parse().ok()?,
+        start_time: fields.get(19)?.parse().ok()?,
+    })
+}
+
+pub(crate) fn process_identity_is_live(pid: u32, start_time: u64) -> bool {
+    let command = if Path::new("/bin/kill").is_file() {
+        "/bin/kill"
+    } else {
+        "kill"
+    };
+    let signalable = Command::new(command)
+        .args(["-0", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    signalable
+        && read_process_identity(pid).is_some_and(|observed| {
+            observed.start_time == start_time && !matches!(observed.state, 'Z' | 'X')
+        })
 }
 
 pub fn read_lease(path: &Path) -> Result<Option<LeaseRecord>, StoreError> {
@@ -102,14 +187,27 @@ pub fn write_lease(path: &Path, lease: &LeaseRecord) -> Result<(), StoreError> {
         .and_then(|name| name.to_str())
         .unwrap_or("lease");
     lease.validate(name)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| io_error("create lease directory", parent, error))?;
-    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)
+        .map_err(|error| io_error("create lease directory", parent, error))?;
     let mut bytes = serde_json::to_vec(lease).expect("lease serializes");
     bytes.push(b'\n');
-    fs::write(path, bytes).map_err(|error| io_error("write lease", path, error))?;
-    set_private_file_mode(path)
+    let mut temporary = NamedTempFile::new_in(parent)
+        .map_err(|error| io_error("create temporary lease", path, error))?;
+    temporary
+        .write_all(&bytes)
+        .map_err(|error| io_error("write temporary lease", path, error))?;
+    temporary
+        .flush()
+        .map_err(|error| io_error("flush temporary lease", path, error))?;
+    set_private_file_mode(temporary.path())?;
+    temporary
+        .persist(path)
+        .map_err(|error| io_error("replace lease", path, error.error))?;
+    Ok(())
 }
 
 pub fn validate_lease_name(name: &str) -> Result<(), LeaseActionError> {
@@ -144,6 +242,9 @@ pub fn acquire_lease(
         owner: owner.to_owned(),
         started_at: now,
         expires_at: now.saturating_add(ttl),
+        pid: None,
+        process_group_id: None,
+        process_start_time: None,
     };
     let bytes = lease_bytes(&record);
     if install_exclusive(&path, &bytes) {
@@ -152,7 +253,7 @@ pub fn acquire_lease(
     let held = read_lease(&path)
         .map_err(|_| LeaseActionError::HeldOrUnreadable)?
         .ok_or(LeaseActionError::HeldOrUnreadable)?;
-    if now < held.expires_at {
+    if held.is_live(now) {
         return Err(LeaseActionError::Held);
     }
 
@@ -161,7 +262,7 @@ pub fn acquire_lease(
     let held = read_lease(&path)
         .map_err(|_| LeaseActionError::ChangedDuringReclamation)?
         .ok_or(LeaseActionError::ChangedDuringReclamation)?;
-    if now < held.expires_at {
+    if held.is_live(now) {
         return Err(LeaseActionError::Held);
     }
     fs::remove_file(&path).map_err(|_| LeaseActionError::ChangedDuringReclamation)?;
@@ -315,9 +416,21 @@ impl Drop for LeaseGuard {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        process::Command,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        thread,
+        time::{Duration, Instant},
+    };
+
     use tempfile::tempdir;
 
-    use super::{LeaseRecord, read_lease, write_lease};
+    use super::{
+        LeaseRecord, process_identity_is_live, read_lease, read_process_identity, write_lease,
+    };
 
     #[test]
     fn lease_matches_bash_field_order() {
@@ -327,6 +440,9 @@ mod tests {
             owner: "builder-synthetic".to_owned(),
             started_at: 10,
             expires_at: 20,
+            pid: None,
+            process_group_id: None,
+            process_start_time: None,
         };
         write_lease(&path, &lease).expect("write lease");
         assert_eq!(read_lease(&path).expect("read lease"), Some(lease));
@@ -334,5 +450,92 @@ mod tests {
             std::fs::read_to_string(path).expect("read bytes"),
             "{\"owner\":\"builder-synthetic\",\"started_at\":10,\"expires_at\":20}\n"
         );
+    }
+
+    #[test]
+    fn process_identity_round_trips_and_rejects_a_recycled_pid() {
+        let fixture = tempdir().expect("temp dir");
+        let path = fixture.path().join("implementer-item-placeholder.lease");
+        let identity = read_process_identity(std::process::id()).expect("current process identity");
+        let lease = LeaseRecord {
+            owner: "implementer-placeholder".to_owned(),
+            started_at: 10,
+            expires_at: 20,
+            pid: Some(identity.pid),
+            process_group_id: Some(identity.process_group_id),
+            process_start_time: Some(identity.start_time),
+        };
+        write_lease(&path, &lease).expect("write process lease");
+        assert_eq!(read_lease(&path).expect("read process lease"), Some(lease));
+        assert!(process_identity_is_live(identity.pid, identity.start_time));
+        assert!(!process_identity_is_live(
+            identity.pid,
+            identity.start_time + 1
+        ));
+    }
+
+    #[test]
+    fn exited_unreaped_process_is_not_live() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn short-lived child");
+        let pid = child.id();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let identity = loop {
+            if let Some(identity) = read_process_identity(pid)
+                && matches!(identity.state, 'Z' | 'X')
+            {
+                break Some(identity);
+            }
+            if Instant::now() >= deadline {
+                break None;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        let live = identity
+            .is_some_and(|identity| process_identity_is_live(identity.pid, identity.start_time));
+        let status = child.wait().expect("reap short-lived child");
+        assert!(status.success());
+        assert!(identity.is_some(), "child did not enter a terminal state");
+        assert!(!live, "terminal process state was treated as live");
+    }
+
+    #[test]
+    fn lease_replacement_remains_readable_during_concurrent_reads() {
+        let fixture = tempdir().expect("temp dir");
+        let path = fixture.path().join("implementer-item-placeholder.lease");
+        let mut lease = LeaseRecord {
+            owner: "a".repeat(32_768),
+            started_at: 10,
+            expires_at: 20,
+            pid: None,
+            process_group_id: None,
+            process_start_time: None,
+        };
+        write_lease(&path, &lease).expect("write initial lease");
+
+        let reading = Arc::new(AtomicBool::new(true));
+        let reader_path = path.clone();
+        let reader_flag = Arc::clone(&reading);
+        let reader = thread::spawn(move || {
+            let mut unreadable = false;
+            while reader_flag.load(Ordering::Relaxed) {
+                unreadable |= read_lease(&reader_path).is_err();
+            }
+            unreadable |= read_lease(&reader_path).is_err();
+            unreadable
+        });
+        for index in 0..200 {
+            lease.owner = if index % 2 == 0 {
+                "a".repeat(32_768)
+            } else {
+                "b".repeat(32_768)
+            };
+            write_lease(&path, &lease).expect("replace lease atomically");
+        }
+        reading.store(false, Ordering::Relaxed);
+        assert!(!reader.join().expect("join lease reader"));
+        assert_eq!(read_lease(&path).expect("read final lease"), Some(lease));
     }
 }

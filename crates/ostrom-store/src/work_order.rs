@@ -23,8 +23,8 @@ use tempfile::NamedTempFile;
 use thiserror::Error;
 
 use crate::{
-    Clock, TraceAppend, TraceFactRecord, append_trace, environment, read_lease, read_trace,
-    set_private_file_mode,
+    Clock, TraceAppend, TraceFactRecord, append_trace, environment,
+    lease::process_identity_is_live, read_lease, read_trace, set_private_file_mode,
 };
 
 const DEFAULT_COST_CEILING_USD: &str = "20";
@@ -485,13 +485,18 @@ fn reap_stale_work_orders_matching(
     let now = clock.epoch_seconds();
     let mut reaped = Vec::new();
     for order in in_flight_orders(&trace_path)? {
-        if order_id.is_some_and(|expected| order.order_id != expected)
-            || !order_is_stale(&order, now)
-        {
+        if order_id.is_some_and(|expected| order.order_id != expected) {
             continue;
         }
-        let observation = observe_unit(&order);
+        let stale = order_is_stale(&order, now);
+        if order.backend != "process" && !stale {
+            continue;
+        }
+        let observation = observe_unit(state_root, &order);
         if observation.liveness == UnitLiveness::Live {
+            continue;
+        }
+        if observation.liveness == UnitLiveness::Unknown && !stale {
             continue;
         }
         if append_terminal_failure(
@@ -530,7 +535,7 @@ pub fn clear_work_order(
         return Err(WorkOrderError::AmbiguousInFlight(identifier.to_owned()));
     }
     let order = matches.pop().expect("one matching order");
-    let observation = observe_unit(&order);
+    let observation = observe_unit(state_root, &order);
     match observation.liveness {
         UnitLiveness::Live => {
             return Err(WorkOrderError::StillRunning(order.order_id));
@@ -604,7 +609,10 @@ fn order_is_stale(order: &InFlightOrder, now: u64) -> bool {
     ))
 }
 
-fn observe_unit(order: &InFlightOrder) -> UnitObservation {
+fn observe_unit(state_root: &Path, order: &InFlightOrder) -> UnitObservation {
+    if order.backend == "process" {
+        return observe_process(state_root, order);
+    }
     if order.backend != "systemd" {
         return UnitObservation {
             liveness: UnitLiveness::Unknown,
@@ -679,6 +687,57 @@ fn observe_unit(order: &InFlightOrder) -> UnitObservation {
         liveness: UnitLiveness::NotLive,
         exit_code,
         detail: format!("systemd unit is {state}"),
+    }
+}
+
+fn observe_process(state_root: &Path, order: &InFlightOrder) -> UnitObservation {
+    let path = state_root.join(format!(
+        "implementer-item-{}.lease",
+        item_hash(&order.item_id)
+    ));
+    let lease = match read_lease(&path) {
+        Ok(Some(lease)) if lease.owner == order.unit_name => lease,
+        Ok(Some(_)) => {
+            return UnitObservation {
+                liveness: UnitLiveness::Unknown,
+                exit_code: None,
+                detail: "process lease belongs to another owner".to_owned(),
+            };
+        }
+        Ok(None) => {
+            return UnitObservation {
+                liveness: UnitLiveness::NotLive,
+                exit_code: None,
+                detail: "process lease does not exist".to_owned(),
+            };
+        }
+        Err(_) => {
+            return UnitObservation {
+                liveness: UnitLiveness::Unknown,
+                exit_code: None,
+                detail: "process lease is unreadable".to_owned(),
+            };
+        }
+    };
+    let Some((pid, _, start_time)) = lease.process_identity() else {
+        return UnitObservation {
+            liveness: UnitLiveness::Unknown,
+            exit_code: None,
+            detail: "process lease has no process identity".to_owned(),
+        };
+    };
+    if process_identity_is_live(pid, start_time) {
+        UnitObservation {
+            liveness: UnitLiveness::Live,
+            exit_code: None,
+            detail: "process identity is live".to_owned(),
+        }
+    } else {
+        UnitObservation {
+            liveness: UnitLiveness::NotLive,
+            exit_code: None,
+            detail: "process pid is dead or its start time differs".to_owned(),
+        }
     }
 }
 
@@ -792,7 +851,7 @@ fn remove_expired_lease(path: &Path, now: u64) {
     if read_lease(path)
         .ok()
         .flatten()
-        .is_some_and(|lease| lease.expires_at <= now)
+        .is_some_and(|lease| !lease.is_live(now))
     {
         let _ = fs::remove_file(path);
     }
