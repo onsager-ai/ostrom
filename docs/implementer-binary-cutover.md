@@ -12,11 +12,15 @@ Both backends run:
 ostrom implement <work-order-file> <unit-name> [implementer-runner]
 ```
 
-The process backend starts this command in a new session with null stdin. Its
-item lease records the process id, process-group id, and process start time.
-That identity lets a later pass distinguish the original implementer from a
-recycled process id. A dispatching pass may end without ending the implementer;
-the next pass reads the lease before deciding whether the item is still live.
+The process backend starts this command in a new session with null stdin and
+appends stdout and stderr to the private
+`implementer-item-<hash>.log` file beside its lease. The item lease records the
+process id, process-group id, and process start time. That identity lets a later
+pass distinguish the original implementer from a recycled process id. A
+dispatching pass may end without ending the implementer; the next pass reads
+the lease before deciding whether the item is still live. The environment's
+init process should reap orphaned processes because a process-backend
+implementer outlives its dispatcher.
 
 The builder coordinator hands the order to the named runner in the agent
 registry. `agent/codex` is the shipped default and there is no fallback. A
@@ -43,8 +47,9 @@ starts an implementer.
 
 For the systemd backend, inspect a started unit with `systemctl --user status
 <unit-name>` and `journalctl --user-unit <unit-name>`. For the process backend,
-inspect the corresponding `implementer-item-<hash>.lease`; it is live only
-while its `pid` exists with the recorded `process_start_time`.
+inspect the corresponding `implementer-item-<hash>.lease` and
+`implementer-item-<hash>.log`; the lease is live only while its `pid` exists
+with the recorded `process_start_time` in a non-terminal process state.
 
 A terminal `work-failed` row names the implementer reason and records any
 preserved worktree. Failed or terminated runs deliberately retain unpublished

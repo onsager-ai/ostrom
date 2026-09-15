@@ -691,16 +691,27 @@ fn launch_process(
     lease: &mut LeaseGuard,
 ) -> Result<(), DispatchError> {
     let started = Instant::now();
+    let (stdout, stderr) = open_process_log(context).map_err(|()| {
+        append_launch_failure(context, "dispatch-failed", started.elapsed());
+        DispatchError::new(
+            1,
+            format!(
+                "ostrom dispatch: process backend could not open the implementer log for {}",
+                context.unit_name
+            ),
+        )
+    })?;
     let mut launch = Command::new("setsid");
     launch
+        .env_clear()
         .arg(resolved_ostrom)
         .arg("implement")
         .arg(&context.request.order_file)
         .arg(&context.unit_name)
         .arg(runner_name)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr)
         .env("OSTROM_PLUGIN_ROOT", &context.request.plugin_root)
         .env("MANDATE_DAILY_CAP_USD", render_number(daily_cap))
         .env("MANDATE_MAX_IMPLEMENTERS", max_implementers.to_string())
@@ -710,6 +721,18 @@ fn launch_process(
         )
         .env("MANDATE_DISPATCH_BACKEND", &context.backend)
         .env("MANDATE_LEASE_NAME", lease_name);
+    for variable in [
+        environment::HOME,
+        environment::PATH,
+        environment::CLAUDE_BIN,
+        environment::MANDATE_IMPLEMENTER_SOURCE_REPO,
+        environment::MANDATE_IMPLEMENTER_TERMINATION_GRACE_SECONDS,
+        environment::MANDATE_SECRETS_FILE,
+    ] {
+        if let Some(value) = variable.value_os() {
+            launch.env(variable.name, value);
+        }
+    }
     set_process_state_environment(&mut launch, &context.request.paths);
     for (name, value) in runner_launch.environment() {
         launch.env(name, value);
@@ -754,6 +777,22 @@ fn launch_process(
     }
     drop(child);
     Ok(())
+}
+
+fn open_process_log(context: &DispatchContext<'_>) -> Result<(fs::File, fs::File), ()> {
+    let path = context
+        .request
+        .paths
+        .state
+        .join(format!("implementer-item-{}.log", context.item_hash));
+    let stderr = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|_| ())?;
+    crate::set_private_file_mode(&path).map_err(|_| ())?;
+    let stdout = stderr.try_clone().map_err(|_| ())?;
+    Ok((stdout, stderr))
 }
 
 fn dispatch_state_environment(paths: &OstromPaths) -> String {
@@ -2040,15 +2079,7 @@ impl LeaseGuard {
         lease.pid = Some(identity.pid);
         lease.process_group_id = Some(identity.process_group_id);
         lease.process_start_time = Some(identity.start_time);
-        let mut bytes = serde_json::to_vec(&lease).map_err(|_| ())?;
-        bytes.push(b'\n');
-        let mut file = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&self.path)
-            .map_err(|_| ())?;
-        crate::set_private_file_mode(&self.path).map_err(|_| ())?;
-        file.write_all(&bytes).map_err(|_| ())
+        crate::write_lease(&self.path, &lease).map_err(|_| ())
     }
 
     fn release(&mut self) {
