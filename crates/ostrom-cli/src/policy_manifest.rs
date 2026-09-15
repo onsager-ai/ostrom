@@ -247,7 +247,7 @@ fn project_repository_manifest(mut manifest: PolicyManifest, repository: &str) -
                 .any(|candidate| candidate == repository)
     });
     for declaration in manifest.loops.values_mut() {
-        declaration.repositories = Default::default();
+        declaration.repositories = vec![repository.to_owned()].into();
     }
     manifest
 }
@@ -2004,12 +2004,12 @@ loops:
         assert!(round_tripped.loops.contains_key("unscoped-loop"));
         assert!(round_tripped.loops.contains_key("target-loop"));
         assert!(!round_tripped.loops.contains_key("other-loop"));
-        assert!(
-            round_tripped
-                .loops
-                .values()
-                .all(|declaration| declaration.repositories.is_empty())
-        );
+        assert!(round_tripped.loops.values().all(|declaration| {
+            declaration
+                .repositories
+                .iter()
+                .eq(["placeholder-org/target"])
+        }));
         validate_scoped_manifest(&round_tripped, Some(&operator))
             .expect("generated repository layer loads with operator policy");
 

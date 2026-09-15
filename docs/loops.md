@@ -49,6 +49,11 @@ resolve the verified declaration and enforce its effective repository set.
 Without `--loop`, a pass covers the available set. Sweep always covers the
 whole available set, regardless of a loop's narrower list, so one fresh
 generation can serve every pass.
+The loop scope reaches child commands through `OSTROM_EFFECTIVE_REPOSITORIES`
+in the session environment; it is a selection boundary, while grants remain
+the authorization boundary. A loop-bound gatekeeper judges only pull requests
+from the pass's sweep generation, so one opened afterward waits for the next
+fresh generation, up to `sweep.max_age`.
 
 The current composed policy version can instead own loop lifecycle directly:
 

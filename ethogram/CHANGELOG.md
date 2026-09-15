@@ -17,6 +17,8 @@ it is the version a first release would carry, not a marker that one happened.
 `run.started` accepts an optional `repositories` string list alongside the
 existing single `repository`. Loop runs use the list; runs acting on one
 repository keep the scalar. Both fields remain optional.
+The added conformance capture brings the corpus to 32 fixtures spanning 23
+distinct `(type, payload-key-set)` shapes.
 
 ### The corpus accessor comes back, inside this crate (onsager-ai/ethogram#70, onsager-ai/ostrom#553, umwelt#46)
 
@@ -47,7 +49,7 @@ could go stale.
 A new reach assertion, `crates/ethogram/tests/corpus_accessor.rs`, walks the
 directory listing and the compiled-in slice in lockstep and names the exact
 position and file where they disagree, so a build script that silently drops
-or substitutes a fixture fails loudly rather than passing a `len() == 31`
+or substitutes a fixture fails loudly rather than passing a `len() == 32`
 check that a substitution would also pass.
 
 **Publish caveat, stated once here for a future publisher to meet**:
@@ -59,9 +61,8 @@ not included. Nothing is published today (`publish = false`;
 onsager-ai/ethogram#10 records why); a first publish would need an `include`
 list reaching outside the crate, or the fixtures moved inside it.
 
-No wire byte, fixture, or SDK behaviour changed. Corpus still 31 fixtures;
-`conformance/run.sh` still reports 31 fixtures, 23 validation error cases, 6
-agreement inputs, 36 typed and 1 untyped-only, unchanged.
+That accessor change altered no wire byte, fixture, or SDK behaviour. Current
+corpus totals are recorded by the entries above.
 
 ### A captured `run.started`, and a rule about absent fields (onsager-ai/ethogram#77, onsager-ai/ostrom#546)
 
@@ -86,9 +87,10 @@ which the producer genuinely leaves unset. Two absences, two different facts,
 identical notation; where an absence invites the wrong reading, the corpus now
 says which it is.
 
-Corpus 30 → 31 fixtures, 21 → 22 distinct `(type, payload-key-set)` shapes.
-`conformance/run.sh` reports 31 fixtures, 23 validation error cases and 6
-agreement inputs. No wire byte, existing fixture or behaviour changed.
+At that change, the corpus moved from 30 to 31 fixtures and from 21 to 22
+distinct `(type, payload-key-set)` shapes. The conformance run reported 31
+fixtures, 23 validation error cases and 6 agreement inputs. No wire byte,
+existing fixture or behaviour changed.
 
 ### A fixture may be first to pin a rendering (onsager-ai/ethogram#70, onsager-ai/ostrom#552)
 
