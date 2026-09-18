@@ -751,17 +751,23 @@ pub fn run_plan(
     Ok(document)
 }
 
-fn load_goals(config_root: &Path, cwd: &Path) -> Result<GoalsDocument, PlanError> {
-    let user = config_root.join("goals.yaml");
+/// Locate an operator-authored goals document by the one precedence rule
+/// both `run_plan` and `ostrom goals validate` must agree on: a
+/// per-repository override at `.ostrom/goals.yaml` under `cwd` wins over the
+/// operator's shared `goals.yaml` in the Ostrom config root. `None` means
+/// neither location holds a file; callers decide what that means for them.
+#[must_use]
+pub fn discover_goals_path(config_root: &Path, cwd: &Path) -> Option<PathBuf> {
     let repository = cwd.join(".ostrom/goals.yaml");
-    let path = if repository.exists() {
-        Some(repository)
-    } else if user.exists() {
-        Some(user)
-    } else {
-        None
-    };
-    let Some(path) = path else {
+    if repository.exists() {
+        return Some(repository);
+    }
+    let user = config_root.join("goals.yaml");
+    if user.exists() { Some(user) } else { None }
+}
+
+fn load_goals(config_root: &Path, cwd: &Path) -> Result<GoalsDocument, PlanError> {
+    let Some(path) = discover_goals_path(config_root, cwd) else {
         return Ok(GoalsDocument {
             goals_version: 1,
             goals: Vec::new(),

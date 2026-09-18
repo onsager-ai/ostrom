@@ -76,7 +76,8 @@ pub use paths::OstromPaths;
 pub use plan::{
     AssessmentDeriver, AssessmentDeriverError, AssessmentHarness, AssessmentInput,
     ExecutableAssessmentDeriver, GoalPlan, HarnessAssessmentDeriver, PlanDocument, PlanError,
-    PlanFault, PlanOptions, PlanRanking, PlanSweep, UnavailableAssessmentDeriver, run_plan,
+    PlanFault, PlanOptions, PlanRanking, PlanSweep, UnavailableAssessmentDeriver,
+    discover_goals_path, run_plan,
 };
 pub use policy::{
     ActorPortabilityFinding, ConsultedScope, InertDeclaration, PolicyBundle, PolicyExplanation,

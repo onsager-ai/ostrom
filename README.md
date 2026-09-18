@@ -101,6 +101,26 @@ authorization-preserving ranking are unchanged. The builder selector consumes
 a plan only when its queue basis and principal `work_ranking` still match,
 otherwise it visibly falls back to the existing ordering.
 
+`ostrom goals validate [<path>]` parses and validates a goals document
+without running a pass. Given a path, it validates exactly that file.
+Omitted, it uses the same discovery `ostrom plan` uses: a repository
+override at `.ostrom/goals.yaml` under the working directory, else the
+operator's `goals.yaml` in the Ostrom config root. Unlike `ostrom plan`,
+which tolerates no goals document as a legitimate empty plan, the validate
+command treats finding nothing as a refusal — an operator asking whether
+their goals document is valid must not get exit 0 when there is no document
+to check. On success it prints `valid: <path>` to stdout and exits 0;
+on failure it prints the problem to stderr and exits with one of:
+
+| status | meaning |
+|---|---|
+| 2 | the goals document could not be read: missing, not a file, unreadable, or (with no path argument) not found at either discovery location |
+| 3 | the document is not parseable YAML |
+| 4 | `goals_version` is unsupported |
+| 5 | the document parses but is semantically invalid (empty field, duplicate goal or check, unknown goal reference, empty action note) |
+
+No two refusals that call for different action share a status.
+
 Every named harness may conclude only `on-track`, `at-risk`, `off-track`, or
 `blocked` for the supplied goal. Claude returns its structured-output envelope,
 Codex returns output checked against the same schema, and Copilot returns its
