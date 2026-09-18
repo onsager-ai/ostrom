@@ -122,8 +122,13 @@ on failure it prints the problem to stderr and exits with one of:
 No two refusals that call for different action share a status. Exit 2 is absent
 from that table because it is not a refusal about the document: a usage error
 exits 2 from argument parsing, before the command runs. That is why the
-unreadable class is `EX_NOINPUT` rather than 2, and why the remaining codes stay
-low — nothing else claims them.
+unreadable class is `EX_NOINPUT` rather than 2.
+
+The remaining codes stay low because nothing claims them *within this command*.
+Other commands do return 3, 4 and 5 for refusals of their own, which is harmless:
+an exit status is read against the command that produced it. Argument parsing is
+the exception, because it claims 2 across the whole binary before any command
+runs, so 2 is the one status a refusal here cannot use.
 
 Every named harness may conclude only `on-track`, `at-risk`, `off-track`, or
 `blocked` for the supplied goal. Claude returns its structured-output envelope,

@@ -2519,9 +2519,20 @@ fn run_work_order_command(
 /// `EX_NOINPUT`, and deliberately not 2. clap exits 2 on a usage error from
 /// `Cli::parse()`, before this command is entered, so 2 already means "fix
 /// your command line" for every invocation of this binary; sharing it would
-/// put two refusals calling for different action on one status. The three
-/// codes below stay low because nothing else claims them: clap owns 2, a
-/// panic is 101, and a signal is 129 or above.
+/// put two refusals calling for different action on one status.
+///
+/// Only 2 had to move. The three codes below stay low because nothing claims
+/// them *within this command* — other commands do return 3, 4 and 5 from their
+/// own `exit_code()` implementations (`queue`, `lease`, `work_order`, `leaves`,
+/// `pass`, `gate`, `replay`), which is harmless because a status is read
+/// against the command that produced it. Argument parsing is the exception: it
+/// claims 2 across the whole binary, before any command runs.
+///
+/// Moving them into sysexits for tidiness would cost information. `EX_DATAERR`
+/// (65) is the only honest value for all three of malformed YAML, an
+/// unsupported version and a semantically invalid document, so a "consistent"
+/// scheme would collapse three refusals a consumer can currently tell apart
+/// into one status.
 const GOALS_UNREADABLE_EXIT_CODE: i32 = 66;
 /// `GoalsError::Yaml` — the document is not parseable YAML.
 const GOALS_YAML_EXIT_CODE: i32 = 3;
