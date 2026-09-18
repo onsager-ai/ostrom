@@ -73,7 +73,7 @@ fn formats_agree_and_have_stable_order_without_operator_configuration() {
     let catalogue = catalogue.as_object().expect("catalogue object");
     assert_eq!(
         catalogue.keys().map(String::as_str).collect::<Vec<_>>(),
-        ["builder", "gatekeeper", "sweep", "triage"]
+        ["builder", "gatekeeper", "plan", "sweep", "triage"]
     );
     assert_eq!(
         catalogue["builder"]["secret_names"],
@@ -81,6 +81,10 @@ fn formats_agree_and_have_stable_order_without_operator_configuration() {
     );
     assert_eq!(
         catalogue["gatekeeper"]["secret_names"],
+        serde_json::json!(["gatekeeper"])
+    );
+    assert_eq!(
+        catalogue["plan"]["secret_names"],
         serde_json::json!(["gatekeeper"])
     );
     assert_eq!(
@@ -126,10 +130,16 @@ fn formats_agree_and_have_stable_order_without_operator_configuration() {
         assert_eq!(declaration.repositories, expected.repositories);
         assert_eq!(declaration.every, expected.every);
     }
-    assert_eq!(combined.loops.len(), 3);
+    assert_eq!(combined.loops.len(), 4);
     assert!(!combined.loops.contains_key("sweep"));
     assert_eq!(combined.loops["builder-day"].spend_usd, Some(20.0));
     assert_eq!(combined.loops["builder-day"].concurrent, Some(1));
+    assert_eq!(combined.loops["daily-plan"].spend_usd, Some(5.0));
+    assert_eq!(combined.loops["daily-plan"].concurrent, Some(1));
+    assert_eq!(
+        combined.loops["daily-plan"].every.on_calendars(),
+        ["*-*-* 06:30:00"]
+    );
     let sweep = &combined.operations["portfolio-sweep"];
     assert_eq!(sweep.steps.len(), 1);
     assert_eq!(sweep.steps[0].uses, "cmd/run");
