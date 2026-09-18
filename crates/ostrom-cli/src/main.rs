@@ -2515,7 +2515,14 @@ fn run_work_order_command(
 /// The goals document could not be read at all: missing, not a file,
 /// unreadable, or (with no path argument) not discovered anywhere. This is a
 /// CLI-level refusal, not a `GoalsError` — reading happens before parsing.
-const GOALS_UNREADABLE_EXIT_CODE: i32 = 2;
+///
+/// `EX_NOINPUT`, and deliberately not 2. clap exits 2 on a usage error from
+/// `Cli::parse()`, before this command is entered, so 2 already means "fix
+/// your command line" for every invocation of this binary; sharing it would
+/// put two refusals calling for different action on one status. The three
+/// codes below stay low because nothing else claims them: clap owns 2, a
+/// panic is 101, and a signal is 129 or above.
+const GOALS_UNREADABLE_EXIT_CODE: i32 = 66;
 /// `GoalsError::Yaml` — the document is not parseable YAML.
 const GOALS_YAML_EXIT_CODE: i32 = 3;
 /// `GoalsError::UnsupportedVersion` — `goals_version` is not one this build

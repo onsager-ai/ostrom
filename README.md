@@ -114,12 +114,16 @@ on failure it prints the problem to stderr and exits with one of:
 
 | status | meaning |
 |---|---|
-| 2 | the goals document could not be read: missing, not a file, unreadable, or (with no path argument) not found at either discovery location |
+| 66 | `EX_NOINPUT`: the goals document could not be read: missing, not a file, unreadable, or (with no path argument) not found at either discovery location |
 | 3 | the document is not parseable YAML |
 | 4 | `goals_version` is unsupported |
 | 5 | the document parses but is semantically invalid (empty field, duplicate goal or check, unknown goal reference, empty action note) |
 
-No two refusals that call for different action share a status.
+No two refusals that call for different action share a status. Exit 2 is absent
+from that table because it is not a refusal about the document: a usage error
+exits 2 from argument parsing, before the command runs. That is why the
+unreadable class is `EX_NOINPUT` rather than 2, and why the remaining codes stay
+low — nothing else claims them.
 
 Every named harness may conclude only `on-track`, `at-risk`, `off-track`, or
 `blocked` for the supplied goal. Claude returns its structured-output envelope,

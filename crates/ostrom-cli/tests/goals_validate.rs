@@ -102,13 +102,13 @@ fn a_valid_goals_document_exits_zero_and_prints_its_path() {
 }
 
 #[test]
-fn a_missing_document_refuses_with_code_2() {
+fn a_missing_document_refuses_with_code_66() {
     let home = TempDir::new().expect("home");
     let missing = home.path().join("missing-goals.yaml");
 
     let output = validate(home.path(), home.path(), Some(&missing));
 
-    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert_eq!(output.status.code(), Some(66), "{}", stderr(&output));
     assert!(stdout(&output).is_empty());
     assert!(!stderr(&output).is_empty());
 }
@@ -192,7 +192,50 @@ fn the_four_refusal_codes_are_pairwise_distinct() {
     ];
     let distinct: BTreeSet<i32> = codes.iter().copied().collect();
     assert_eq!(distinct.len(), codes.len(), "exit codes collide: {codes:?}");
-    assert_eq!(codes, [2, 3, 4, 5]);
+    assert_eq!(codes, [66, 3, 4, 5]);
+}
+
+/// A usage error is not a refusal about the document and must not share a
+/// status with one. clap exits 2 from `Cli::parse()` before this command is
+/// entered, which is why the unreadable class is `EX_NOINPUT` and not 2.
+///
+/// The pairwise test above cannot catch this: every invocation it makes
+/// parses successfully, so it never reaches clap's exit path and stays green
+/// while 2 means both "fix your command line" and "there is no document".
+#[test]
+fn a_usage_error_shares_no_status_with_any_refusal() {
+    let home = TempDir::new().expect("home");
+    let missing = home.path().join("missing.yaml");
+    let malformed = home.path().join("malformed.yaml");
+    fs::write(&malformed, MALFORMED_YAML).expect("write malformed goals");
+    let unsupported = home.path().join("unsupported.yaml");
+    fs::write(&unsupported, UNSUPPORTED_VERSION).expect("write unsupported-version goals");
+    let invalid = home.path().join("invalid.yaml");
+    fs::write(&invalid, DUPLICATE_GOAL).expect("write semantically invalid goals");
+
+    let usage = ostrom(home.path())
+        .args(["goals", "validate", "--no-such-flag"])
+        .current_dir(home.path())
+        .output()
+        .expect("run ostrom goals validate with an unknown flag");
+    let usage_code = usage.status.code().expect("usage exit code");
+    assert_eq!(usage_code, 2, "{}", stderr(&usage));
+
+    for (label, path) in [
+        ("unreadable", &missing),
+        ("malformed", &malformed),
+        ("unsupported version", &unsupported),
+        ("semantically invalid", &invalid),
+    ] {
+        let code = validate(home.path(), home.path(), Some(path))
+            .status
+            .code()
+            .expect("refusal exit code");
+        assert_ne!(
+            code, usage_code,
+            "the {label} refusal shares clap's usage status {usage_code}"
+        );
+    }
 }
 
 #[test]
@@ -237,13 +280,13 @@ fn repository_goals_take_precedence_over_the_config_root_and_the_config_root_is_
 }
 
 #[test]
-fn no_goals_document_anywhere_refuses_with_code_2_naming_both_locations() {
+fn no_goals_document_anywhere_refuses_with_code_66_naming_both_locations() {
     let home = TempDir::new().expect("home");
     let cwd = TempDir::new().expect("cwd");
 
     let output = validate(home.path(), cwd.path(), None);
 
-    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert_eq!(output.status.code(), Some(66), "{}", stderr(&output));
     assert!(stdout(&output).is_empty());
     let message = stderr(&output);
     let repository = cwd.path().join(".ostrom/goals.yaml");
