@@ -125,10 +125,21 @@ loops:
     concurrent: 1
 "#,
                 )?,
-                // sweep::organization_token_request uses this credential name:
-                // `ostrom plan` runs the sweep acquisition path, which mints a
-                // scoped installation token under the `gatekeeper` role even
-                // though publication stays disabled.
+                // `sweep::organization_token_request` mints the scoped
+                // installation token under the `gatekeeper` role, and
+                // `ostrom plan` reaches it — but only when it actually sweeps.
+                // `run_plan` reuses the latest successful generation while it is
+                // fresher than `sweep.max_age` (default 30m) and mints nothing
+                // in that branch. Publication stays disabled either way: the
+                // token is minted to query, not to publish.
+                //
+                // At this loop's daily cadence the previous generation is always
+                // stale, so every scheduled pass sweeps and every scheduled pass
+                // needs the secret. The trap is interactive: a hand-run
+                // `ostrom plan` shortly after a successful sweep reuses the
+                // generation and succeeds with no credential at all, so an
+                // operator who tests by hand and sees it pass has learned
+                // nothing about whether 06:30 will.
                 secret_names: &["gatekeeper"],
                 placeholder_paths: &["/loops/daily-plan/repositories/0"],
             },
