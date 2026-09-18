@@ -2525,8 +2525,12 @@ fn run_work_order_command(
 /// them *within this command* — other commands do return 3, 4 and 5 from their
 /// own `exit_code()` implementations (`queue`, `lease`, `work_order`, `leaves`,
 /// `pass`, `gate`, `replay`), which is harmless because a status is read
-/// against the command that produced it. Argument parsing is the exception: it
-/// claims 2 across the whole binary, before any command runs.
+/// against the command that produced it. 2 is the exception, and for more than
+/// clap: argument parsing claims it before any command runs, and several
+/// commands exit 2 for failures of their own — the pass path does so when
+/// `resolve_pass_policy` will not resolve, which is no kind of usage error. 2
+/// is the most overloaded status in this binary, which is the reason a refusal
+/// here must not add to it.
 ///
 /// Moving them into sysexits for tidiness would cost information. `EX_DATAERR`
 /// (65) is the only honest value for all three of malformed YAML, an

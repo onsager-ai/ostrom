@@ -126,9 +126,10 @@ unreadable class is `EX_NOINPUT` rather than 2.
 
 The remaining codes stay low because nothing claims them *within this command*.
 Other commands do return 3, 4 and 5 for refusals of their own, which is harmless:
-an exit status is read against the command that produced it. Argument parsing is
-the exception, because it claims 2 across the whole binary before any command
-runs, so 2 is the one status a refusal here cannot use.
+an exit status is read against the command that produced it. Exit 2 is the
+exception, and for more than argument parsing: it is claimed before any command
+runs, and several commands also exit 2 for failures of their own. It is the most
+overloaded status in the binary, which is why a refusal here must not add to it.
 
 Every named harness may conclude only `on-track`, `at-risk`, `off-track`, or
 `blocked` for the supplied goal. Claude returns its structured-output envelope,
