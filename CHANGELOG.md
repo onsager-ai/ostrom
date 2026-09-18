@@ -15,8 +15,9 @@
   into the pass. The exit status carries the verdict: 0 valid, 66 (`EX_NOINPUT`)
   could not be read or was not found, 3 unparseable YAML, 4 unsupported
   `goals_version`, 5 parses but semantically invalid. Those are refusal classes
-  rather than one code per error, and 2 is never a document verdict, because
-  argument parsing claims it before the command runs.
+  rather than one code per error, and 2 is never a document verdict: it is the
+  most overloaded status in the binary, claimed by argument parsing before any
+  command runs and by several commands' own failures.
 - A `plan` loop preset, so `ostrom plan` can be scheduled through signed policy
   (#603). It declares the `planner` actor, the `portfolio-plan` operation
   wrapping `ostrom plan` as a `cmd/run` step, the `plan-portfolio` grant, and the
