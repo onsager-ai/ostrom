@@ -7,11 +7,13 @@ defaults:
 actors:
   builder: {}
   gatekeeper: {}
+  planner: {}
   sweeper: {}
   triage: {}
 operations:
   build-pass: {steps: []}
   gate-pass: {steps: []}
+  portfolio-plan: {steps: []}
   portfolio-sweep: {steps: []}
   queue-triage: {steps: []}
 grants:
@@ -22,6 +24,10 @@ grants:
   gatekeeper-pass:
     actors: gatekeeper
     operations: gate-pass
+    repositories: placeholder-org/portfolio
+  plan-portfolio:
+    actors: planner
+    operations: portfolio-plan
     repositories: placeholder-org/portfolio
   sweep:
     actors: sweeper
@@ -43,6 +49,11 @@ loops:
     repositories: placeholder-org/portfolio
     every: ["23:15", "02:15", "05:15"]
     concurrent: 2
+  daily-plan:
+    actor: planner
+    operation: portfolio-plan
+    repositories: placeholder-org/portfolio
+    every: ["06:30"]
   gatekeeper:
     actor: gatekeeper
     operation: gate-pass
