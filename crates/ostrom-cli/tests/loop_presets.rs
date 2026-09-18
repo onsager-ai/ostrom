@@ -177,10 +177,18 @@ fn only_the_sweep_preset_carries_a_deprecated_field_and_it_names_no_hosted_subst
                 "must point at pass-time freshness: {reason}"
             );
             // Principle 3: no downstream repository, hosted substrate, customer
-            // or URL. These are exactly the shapes such a name would take.
-            assert!(!reason.contains("http"), "{reason}");
-            assert!(!reason.contains("hub"), "{reason}");
-            assert!(!reason.contains("onsager"), "{reason}");
+            // or URL. The two controls come first so this guard is seen to be
+            // capable of failing: a plain `contains("hub")` would pass
+            // "Ostrom Hub" and would trip on "github".
+            assert!(
+                support::names_a_substrate("use the Ostrom Hub instead"),
+                "the guard must fail on the violation it exists for"
+            );
+            assert!(
+                !support::names_a_substrate("github.com/example"),
+                "the guard must not trip on an innocuous word containing `hub`"
+            );
+            assert!(!support::names_a_substrate(reason), "{reason}");
         } else {
             assert!(
                 !object.contains_key("deprecated"),

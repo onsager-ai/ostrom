@@ -671,6 +671,22 @@ fn report_actor_portability_findings(findings: &[ActorPortabilityFinding]) {
 /// the sweep, not a particular string such as `loops.sweep`. A loop renamed
 /// `nightly-refresh` that schedules the same operation has exactly the defect
 /// this warning exists for.
+///
+/// What it does not catch, named here rather than left to be found later. The
+/// script is read as text, so an indirect invocation escapes: `sh -c "ostrom
+/// sweep"`, a wrapper, an invocation through a variable, a Windows
+/// `ostrom.exe`, or `ostrom sweep; …` where the token carries the separator.
+/// Those are acceptable gaps for a non-fatal lint.
+///
+/// One gap is different in kind and worth stating plainly: an operation that
+/// sweeps *internally*, rather than invoking `ostrom sweep`, is invisible here.
+/// `ostrom plan` is such an operation — it runs the sweep acquisition path
+/// itself, and with `sweep.max_age` at its 30m default a daily cadence leaves
+/// every scheduled run outside the reuse window, so the shipped `daily-plan`
+/// loop performs a whole-roster sweep on each run. This lint will never say so,
+/// because the script reads `ostrom plan`. That preset ships declared and
+/// unenabled pending #378; whoever weighs enabling it should know that no
+/// warning here will raise this.
 fn report_sweep_loop_scheduling_findings(manifest: &PolicyManifest) {
     for (name, declaration) in &manifest.loops {
         let Some(operation) = manifest.operations.get(&declaration.operation) else {

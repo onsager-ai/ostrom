@@ -97,5 +97,24 @@ pub fn copy_fixture_directory(source: &Path) -> TempDir {
     destination
 }
 
+/// Whether `text` names something principle 3 keeps out of operator-facing
+/// text: a hosted substrate, a hosted URL, a customer, or a downstream
+/// repository.
+///
+/// Case-folded and word-aware, because the obvious spelling is broken in both
+/// directions. A plain `contains("hub")` sails past "Ostrom Hub" — the likeliest
+/// violation there is — while tripping on the innocuous "github". A guard that
+/// cannot fail on the violation it exists for is not a guard, so callers pair
+/// this with a control asserting it does fail on one.
+pub fn names_a_substrate(text: &str) -> bool {
+    let lowered = text.to_lowercase();
+    if lowered.contains("://") {
+        return true;
+    }
+    lowered
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|word| matches!(word, "hub" | "railway" | "onsager"))
+}
+
 #[cfg(unix)]
 pub mod tree;

@@ -155,10 +155,18 @@ fn a_loop_scheduling_the_sweep_operation_gets_a_lint_naming_no_hosted_substrate(
     assert!(stderr.contains("ostrom sweep"), "{stderr}");
     assert!(stderr.to_lowercase().contains("freshness"), "{stderr}");
     // Principle 3: the replacement is a downstream service and may not be
-    // named. These are exactly the shapes such a name would take.
-    assert!(!stderr.contains("http"), "{stderr}");
-    assert!(!stderr.contains("hub"), "{stderr}");
-    assert!(!stderr.contains("onsager"), "{stderr}");
+    // named. The two controls come first so this guard is seen to be capable
+    // of failing: a plain `contains("hub")` would pass "Ostrom Hub" and would
+    // trip on "github".
+    assert!(
+        support::names_a_substrate("use the Ostrom Hub instead"),
+        "the guard must fail on the violation it exists for"
+    );
+    assert!(
+        !support::names_a_substrate("github.com/example"),
+        "the guard must not trip on an innocuous word containing `hub`"
+    );
+    assert!(!support::names_a_substrate(&stderr), "{stderr}");
 }
 
 #[test]
