@@ -751,17 +751,32 @@ pub fn run_plan(
     Ok(document)
 }
 
-fn load_goals(config_root: &Path, cwd: &Path) -> Result<GoalsDocument, PlanError> {
-    let user = config_root.join("goals.yaml");
+/// Locate an operator-authored goals document by the one precedence rule
+/// both `run_plan` and `ostrom goals validate` must agree on: a
+/// per-repository override at `.ostrom/goals.yaml` under `cwd` wins over the
+/// operator's shared `goals.yaml` in the Ostrom config root. `None` means
+/// neither location holds a file; callers decide what that means for them.
+///
+/// `cwd` must be the working directory the pass will actually run in, or two
+/// callers resolve different repository overrides and the sharing this
+/// function exists for stops holding. `run_plan` passes
+/// `options.sweep.working_directory`; `ostrom goals validate` passes
+/// `env::current_dir()`. Those agree only because every `working_directory`
+/// in the CLI is itself built from `env::current_dir()` — an invariant of the
+/// callers, not of this function, so a future caller that computes one
+/// differently must pass the directory the pass will use, not its own.
+#[must_use]
+pub fn discover_goals_path(config_root: &Path, cwd: &Path) -> Option<PathBuf> {
     let repository = cwd.join(".ostrom/goals.yaml");
-    let path = if repository.exists() {
-        Some(repository)
-    } else if user.exists() {
-        Some(user)
-    } else {
-        None
-    };
-    let Some(path) = path else {
+    if repository.exists() {
+        return Some(repository);
+    }
+    let user = config_root.join("goals.yaml");
+    if user.exists() { Some(user) } else { None }
+}
+
+fn load_goals(config_root: &Path, cwd: &Path) -> Result<GoalsDocument, PlanError> {
+    let Some(path) = discover_goals_path(config_root, cwd) else {
         return Ok(GoalsDocument {
             goals_version: 1,
             goals: Vec::new(),

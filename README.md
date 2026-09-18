@@ -101,6 +101,36 @@ authorization-preserving ranking are unchanged. The builder selector consumes
 a plan only when its queue basis and principal `work_ranking` still match,
 otherwise it visibly falls back to the existing ordering.
 
+`ostrom goals validate [<path>]` parses and validates a goals document
+without running a pass. Given a path, it validates exactly that file.
+Omitted, it uses the same discovery `ostrom plan` uses: a repository
+override at `.ostrom/goals.yaml` under the working directory, else the
+operator's `goals.yaml` in the Ostrom config root. Unlike `ostrom plan`,
+which tolerates no goals document as a legitimate empty plan, the validate
+command treats finding nothing as a refusal — an operator asking whether
+their goals document is valid must not get exit 0 when there is no document
+to check. On success it prints `valid: <path>` to stdout and exits 0;
+on failure it prints the problem to stderr and exits with one of:
+
+| status | meaning |
+|---|---|
+| 66 | `EX_NOINPUT`: the goals document could not be read: missing, not a file, unreadable, or (with no path argument) not found at either discovery location |
+| 3 | the document is not parseable YAML |
+| 4 | `goals_version` is unsupported |
+| 5 | the document parses but is semantically invalid (empty field, duplicate goal or check, unknown goal reference, empty action note) |
+
+No two refusals that call for different action share a status. Exit 2 is absent
+from that table because it is not a refusal about the document: a usage error
+exits 2 from argument parsing, before the command runs. That is why the
+unreadable class is `EX_NOINPUT` rather than 2.
+
+The remaining codes stay low because nothing claims them *within this command*.
+Other commands do return 3, 4 and 5 for refusals of their own, which is harmless:
+an exit status is read against the command that produced it. Exit 2 is the
+exception, and for more than argument parsing: it is claimed before any command
+runs, and several commands also exit 2 for failures of their own. It is the most
+overloaded status in the binary, which is why a refusal here must not add to it.
+
 Every named harness may conclude only `on-track`, `at-risk`, `off-track`, or
 `blocked` for the supplied goal. Claude returns its structured-output envelope,
 Codex returns output checked against the same schema, and Copilot returns its

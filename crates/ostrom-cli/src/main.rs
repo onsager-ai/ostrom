@@ -22,9 +22,9 @@ use ostrom_checks::{
 use ostrom_core::{
     CHECK_STORE_SCHEMA_VERSION, CHECKS_VERSION, Catalogue, CatalogueEnumeration,
     CheckContractError, CheckDefinition, CheckDocument, CheckFault, CheckRun, CheckRunId,
-    CheckState, CheckVerdict, InconclusivePolicy, OperationAction, PermissionMode, PolicyManifest,
-    RepositoryName, ResolvedCheck, ResolvedLoop, ResolvedLoopCeilings, SelectorPrefix,
-    agent_run_parameters,
+    CheckState, CheckVerdict, GoalsDocument, GoalsError, InconclusivePolicy, OperationAction,
+    PermissionMode, PolicyManifest, RepositoryName, ResolvedCheck, ResolvedLoop,
+    ResolvedLoopCeilings, SelectorPrefix, agent_run_parameters,
 };
 use ostrom_store::{
     AgentRegistry, AssessmentHarness, AuditOptions, Clock, CodexHarness, DigestOptions,
@@ -36,7 +36,7 @@ use ostrom_store::{
     SelectError, SelectOutcome, SelectRequest, SignalFlags, SweepError, SweepMode, SweepOptions,
     TraceAppend, TraceView, UnavailableAssessmentDeriver, acquire_lease, answer_queue_decision,
     append_trace, append_trace_checked, audit, available_repositories, branch_name,
-    clear_work_order, create_work_order, credential_output, decide_queue_item,
+    clear_work_order, create_work_order, credential_output, decide_queue_item, discover_goals_path,
     effective_repositories, encode_org_snapshots_with_faults, encode_selection, environment,
     finalize_exited_implementer, generated_run_id, grant_excuse, grant_excuse_at_head,
     inherited_repository_scope, item_hash, lease_status, lint_queue_state, list_excuses,
@@ -316,6 +316,11 @@ enum Command {
         #[command(subcommand)]
         command: WorkOrderCommand,
     },
+    /// Inspect an operator-authored goals document.
+    Goals {
+        #[command(subcommand)]
+        command: GoalsCommand,
+    },
     /// Write a starting operator policy manifest and its delivery prompts.
     Init {
         /// Overwrite an existing manifest and prompts.
@@ -524,6 +529,17 @@ enum WorkOrderCommand {
     BranchName { item_id: String },
     /// Append work-failed for one named stranded order.
     Clear { identifier: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum GoalsCommand {
+    /// Parse and validate a goals document; this never runs a pass.
+    Validate {
+        /// Goals document to validate. Omit to discover it: a repository
+        /// override at `.ostrom/goals.yaml` under the working directory,
+        /// else the operator's `goals.yaml` in the Ostrom config root.
+        path: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -1083,6 +1099,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         },
         Command::Lease { command } => run_lease_command(&paths, command, &clock)?,
         Command::WorkOrder { command } => run_work_order_command(&paths, command, &clock)?,
+        Command::Goals { command } => run_goals_command(&paths, command)?,
         Command::Init { force } => {
             run_init(&paths, force)?;
         }
@@ -2489,6 +2506,105 @@ fn run_work_order_command(
             match clear_work_order(&paths.state, &identifier, clock) {
                 Ok(cleared) => println!("{} {}", cleared.order_id, cleared.item_id),
                 Err(error) => exit_message(&error.to_string(), error.exit_code()),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The goals document could not be read at all: missing, not a file,
+/// unreadable, or (with no path argument) not discovered anywhere. This is a
+/// CLI-level refusal, not a `GoalsError` — reading happens before parsing.
+///
+/// `EX_NOINPUT`, and deliberately not 2. clap exits 2 on a usage error from
+/// `Cli::parse()`, before this command is entered, so 2 already means "fix
+/// your command line" for every invocation of this binary; sharing it would
+/// put two refusals calling for different action on one status.
+///
+/// Only 2 had to move. The three codes below stay low because nothing claims
+/// them *within this command* — other commands do return 3, 4 and 5 from their
+/// own `exit_code()` implementations (`queue`, `lease`, `work_order`, `leaves`,
+/// `pass`, `gate`, `replay`), which is harmless because a status is read
+/// against the command that produced it. 2 is the exception, and for more than
+/// clap: argument parsing claims it before any command runs, and several
+/// commands exit 2 for failures of their own — the pass path does so when
+/// `resolve_pass_policy` will not resolve, which is no kind of usage error. 2
+/// is the most overloaded status in this binary, which is the reason a refusal
+/// here must not add to it.
+///
+/// Moving them into sysexits for tidiness would cost information. `EX_DATAERR`
+/// (65) is the only honest value for all three of malformed YAML, an
+/// unsupported version and a semantically invalid document, so a "consistent"
+/// scheme would collapse three refusals a consumer can currently tell apart
+/// into one status.
+const GOALS_UNREADABLE_EXIT_CODE: i32 = 66;
+/// `GoalsError::Yaml` — the document is not parseable YAML.
+const GOALS_YAML_EXIT_CODE: i32 = 3;
+/// `GoalsError::UnsupportedVersion` — `goals_version` is not one this build
+/// understands.
+const GOALS_UNSUPPORTED_VERSION_EXIT_CODE: i32 = 4;
+/// The document parses but is semantically invalid: `GoalsError::{
+/// EmptyGoalField, DuplicateGoal, InvalidReference, DuplicateCheck,
+/// UnknownGoal, EmptyActionNote}`. These six variants all mean "fix the
+/// content of your document" — one refusal class, one code (ostrom
+/// principle 5: no two refusals that call for different action share a
+/// status).
+const GOALS_INVALID_EXIT_CODE: i32 = 5;
+
+/// Map a `GoalsError` to the CLI's exit status. `ostrom-core` carries no
+/// `exit_code` precedent and stays free of runtime concerns (dependency
+/// rules), so the mapping lives here, at the boundary that has a process
+/// exit status to assign.
+const fn goals_error_exit_code(error: &GoalsError) -> i32 {
+    match error {
+        GoalsError::Yaml(_) => GOALS_YAML_EXIT_CODE,
+        GoalsError::UnsupportedVersion => GOALS_UNSUPPORTED_VERSION_EXIT_CODE,
+        GoalsError::EmptyGoalField
+        | GoalsError::DuplicateGoal(_)
+        | GoalsError::InvalidReference(_)
+        | GoalsError::DuplicateCheck(_)
+        | GoalsError::UnknownGoal(_)
+        | GoalsError::EmptyActionNote(_) => GOALS_INVALID_EXIT_CODE,
+    }
+}
+
+fn run_goals_command(
+    paths: &OstromPaths,
+    command: GoalsCommand,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        GoalsCommand::Validate { path } => {
+            let resolved = match path {
+                Some(path) => path,
+                None => {
+                    let cwd = env::current_dir()?;
+                    match discover_goals_path(&paths.config, &cwd) {
+                        Some(path) => path,
+                        None => {
+                            let repository = cwd.join(".ostrom/goals.yaml");
+                            let operator = paths.config.join("goals.yaml");
+                            exit_message(
+                                &format!(
+                                    "no goals document found: searched {} and {}",
+                                    repository.display(),
+                                    operator.display()
+                                ),
+                                GOALS_UNREADABLE_EXIT_CODE,
+                            );
+                        }
+                    }
+                }
+            };
+            let text = match fs::read_to_string(&resolved) {
+                Ok(text) => text,
+                Err(error) => exit_message(
+                    &format!("{}: {error}", resolved.display()),
+                    GOALS_UNREADABLE_EXIT_CODE,
+                ),
+            };
+            match GoalsDocument::from_yaml(&text) {
+                Ok(_) => println!("valid: {}", resolved.display()),
+                Err(error) => exit_message(&error.to_string(), goals_error_exit_code(&error)),
             }
         }
     }
