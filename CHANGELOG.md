@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+## 0.16.0 (2026-09-18)
+
+- `ostrom goals validate [<path>]` parses and validates an operator-authored
+  goals document without running a pass (#602). Given a path it validates that
+  file; omitted, it uses the discovery `ostrom plan` already applies — a
+  per-repository override at `.ostrom/goals.yaml`, else the operator's
+  `goals.yaml` in the config root — and both callers now share one definition of
+  where goals live rather than two that can drift. Finding no document is a
+  refusal, deliberately unlike `ostrom plan`, which treats an absent document as
+  a legitimate empty plan; a test pins both so the stricter contract cannot leak
+  into the pass. The exit status carries the verdict: 0 valid, 66 (`EX_NOINPUT`)
+  could not be read or was not found, 3 unparseable YAML, 4 unsupported
+  `goals_version`, 5 parses but semantically invalid. Those are refusal classes
+  rather than one code per error, and 2 is never a document verdict: it is the
+  most overloaded status in the binary, claimed by argument parsing before any
+  command runs and by several commands' own failures.
+- A `plan` loop preset, so `ostrom plan` can be scheduled through signed policy
+  (#603). It declares the `planner` actor, the `portfolio-plan` operation
+  wrapping `ostrom plan` as a `cmd/run` step, the `plan-portfolio` grant, and the
+  `daily-plan` loop at `06:30` with `concurrent: 1` and `spend_usd: 5`. The
+  preset needs the `gatekeeper` credential, but only when the pass actually
+  sweeps: `run_plan` reuses a generation newer than `sweep.max_age` and mints no
+  token in that branch, so a hand-run shortly after a successful sweep can pass
+  without the secret while the scheduled pass fails. Declaring is not enabling —
+  the loop ships unenabled pending #378.
+
 ## 0.15.0 (2026-09-15)
 
 - Implementer dispatch gains a `process` backend, selected explicitly with
