@@ -122,6 +122,78 @@ fn operator_actor_declarations_have_no_portability_findings() {
 }
 
 #[test]
+fn a_loop_scheduling_the_sweep_operation_gets_a_lint_naming_no_hosted_substrate() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let manifest = temporary.path().join("ostrom.yaml");
+    fs::write(
+        &manifest,
+        "manifest_version: 1\n\
+         actors:\n  sweeper: {permission_mode: auto}\n\
+         operations:\n  portfolio-sweep:\n    steps:\n      - uses: cmd/run\n        with: {script: 'ostrom sweep'}\n\
+         loops:\n  nightly-refresh:\n    actor: sweeper\n    operation: portfolio-sweep\n    every: hourly\n",
+    )
+    .expect("write manifest scheduling the sweep operation");
+
+    let output = ostrom()
+        .args(["validate", "--unsigned"])
+        .arg(&manifest)
+        .output()
+        .expect("validate manifest scheduling the sweep operation");
+
+    assert!(
+        output.status.success(),
+        "the lint must not change exit status: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 diagnostics");
+    assert!(stderr.contains("lint: loop `nightly-refresh`"), "{stderr}");
+    assert!(stderr.contains("portfolio-sweep"), "{stderr}");
+    assert!(
+        stderr.contains("no longer scheduled from the loop scheduler"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("ostrom sweep"), "{stderr}");
+    assert!(stderr.to_lowercase().contains("freshness"), "{stderr}");
+    // Principle 3: the replacement is a downstream service and may not be
+    // named. These are exactly the shapes such a name would take.
+    assert!(!stderr.contains("http"), "{stderr}");
+    assert!(!stderr.contains("hub"), "{stderr}");
+    assert!(!stderr.contains("onsager"), "{stderr}");
+}
+
+#[test]
+fn a_loop_scheduling_a_non_sweep_operation_gets_no_sweep_lint() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let manifest = temporary.path().join("ostrom.yaml");
+    fs::write(
+        &manifest,
+        "manifest_version: 1\n\
+         actors:\n  builder: {permission_mode: auto}\n\
+         operations:\n  build-pass:\n    steps:\n      - uses: cmd/run\n        with: {script: 'ostrom plan'}\n\
+         loops:\n  builder-day:\n    actor: builder\n    operation: build-pass\n    every: hourly\n",
+    )
+    .expect("write manifest scheduling a non-sweep operation");
+
+    let output = ostrom()
+        .args(["validate", "--unsigned"])
+        .arg(&manifest)
+        .output()
+        .expect("validate manifest scheduling a non-sweep operation");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 diagnostics");
+    assert!(!stderr.contains("lint: loop"), "{stderr}");
+    assert!(
+        !stderr.contains("no longer scheduled from the loop scheduler"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn glob_includes_compose_identically_for_all_manifest_path_forms() {
     let (root, manifest) = fixture();
     let trusted_keys =
