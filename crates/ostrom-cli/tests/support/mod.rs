@@ -97,5 +97,34 @@ pub fn copy_fixture_directory(source: &Path) -> TempDir {
     destination
 }
 
+/// Whether `text` names something principle 3 keeps out of operator-facing
+/// text.
+///
+/// **What this actually covers, because the name reads broader than the code:**
+/// any `://`, and the whole words `hub`, `railway` and `onsager`. Principle 3 is
+/// wider — downstream repositories by name, customers, private substrates — and
+/// none of those are listed. That is sufficient for the two strings this
+/// currently guards. A new call site must check that the list reaches its case
+/// rather than inheriting a pass it has not earned; a general name in shared
+/// support is exactly how an unearned pass spreads.
+///
+/// The two rules are not redundant: a bare hostname carrying no scheme escapes
+/// the `://` test, and is caught only if it happens to contain a listed word.
+///
+/// Case-folded and word-aware, because the obvious spelling is broken in both
+/// directions. A plain `contains("hub")` sails past "Ostrom Hub" — the likeliest
+/// violation there is — while tripping on the innocuous "github". A guard that
+/// cannot fail on the violation it exists for is not a guard, so callers pair
+/// this with a control asserting it does fail on one.
+pub fn names_a_substrate(text: &str) -> bool {
+    let lowered = text.to_lowercase();
+    if lowered.contains("://") {
+        return true;
+    }
+    lowered
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|word| matches!(word, "hub" | "railway" | "onsager"))
+}
+
 #[cfg(unix)]
 pub mod tree;

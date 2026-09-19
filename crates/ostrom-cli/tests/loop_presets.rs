@@ -96,7 +96,11 @@ fn formats_agree_and_have_stable_order_without_operator_configuration() {
         serde_json::json!(["triage"])
     );
     let mut combined = PolicyManifest::parse_yaml("manifest_version: 1\n").unwrap();
-    for preset in catalogue.values() {
+    for (name, preset) in catalogue {
+        let mut expected_keys = vec!["fragment", "secret_names", "placeholder_paths"];
+        if name.as_str() == "sweep" {
+            expected_keys.push("deprecated");
+        }
         assert_eq!(
             preset
                 .as_object()
@@ -104,7 +108,8 @@ fn formats_agree_and_have_stable_order_without_operator_configuration() {
                 .keys()
                 .map(String::as_str)
                 .collect::<Vec<_>>(),
-            ["fragment", "secret_names", "placeholder_paths"]
+            expected_keys,
+            "{name}"
         );
         assert!(
             preset["secret_names"]
@@ -146,6 +151,51 @@ fn formats_agree_and_have_stable_order_without_operator_configuration() {
     assert_eq!(sweep.steps[0].parameters["script"], "ostrom sweep");
     assert!(combined.actors.contains_key("sweeper"));
     assert!(combined.grants.contains_key("sweep"));
+}
+
+#[test]
+fn only_the_sweep_preset_carries_a_deprecated_field_and_it_names_no_hosted_substrate() {
+    let home = TempDir::new().expect("temporary home");
+    let catalogue = presets(home.path());
+    let catalogue = catalogue.as_object().expect("catalogue object");
+
+    for (name, preset) in catalogue {
+        let object = preset.as_object().expect("preset object");
+        if name == "sweep" {
+            assert!(
+                object.contains_key("deprecated"),
+                "the sweep preset must carry `deprecated`"
+            );
+            let reason = preset["deprecated"].as_str().expect("deprecated reason");
+            assert!(reason.contains("loops.sweep"), "{reason}");
+            assert!(
+                reason.contains("ostrom sweep"),
+                "must point at invoking `ostrom sweep`: {reason}"
+            );
+            assert!(
+                reason.to_lowercase().contains("freshness"),
+                "must point at pass-time freshness: {reason}"
+            );
+            // Principle 3: no downstream repository, hosted substrate, customer
+            // or URL. The two controls come first so this guard is seen to be
+            // capable of failing: a plain `contains("hub")` would pass
+            // "Ostrom Hub" and would trip on "github".
+            assert!(
+                support::names_a_substrate("use the Ostrom Hub instead"),
+                "the guard must fail on the violation it exists for"
+            );
+            assert!(
+                !support::names_a_substrate("github.com/example"),
+                "the guard must not trip on an innocuous word containing `hub`"
+            );
+            assert!(!support::names_a_substrate(reason), "{reason}");
+        } else {
+            assert!(
+                !object.contains_key("deprecated"),
+                "{name}: `deprecated` must be absent, not merely null"
+            );
+        }
+    }
 }
 
 #[test]

@@ -10,7 +10,7 @@ use std::{
 use chrono::{DateTime, Utc};
 use ostrom_core::{
     ActorDecl, CheckDefinition, LoopDecl, OperationDecl, PolicyManifest, PromptValue,
-    RepositoryName, RuleDecl, SelectorFinding, SelectorUniverse,
+    RepositoryName, RuleDecl, SelectorFinding, SelectorUniverse, StepDecl,
 };
 use ostrom_store::{
     ActorPortabilityFinding, OstromPaths, PolicyBundle, PolicyExplanation, PolicyOrigins,
@@ -73,6 +73,7 @@ pub(crate) fn run_validate(
         }
     };
     report_actor_portability_findings(bundle.actor_portability_findings());
+    report_sweep_loop_scheduling_findings(&bundle.manifest);
     validate_command_manifest(path, &bundle.manifest)?;
 
     // Isolation with no unresolved references still evaluates the file under
@@ -661,6 +662,80 @@ fn report_actor_portability_findings(findings: &[ActorPortabilityFinding]) {
             finding.source.display()
         );
     }
+}
+
+/// Warn on a loop that schedules an operation invoking `ostrom sweep`.
+///
+/// Matches on the *operation a loop schedules*, not on the loop's own key:
+/// the loop's name is operator-chosen, and the thing deprecated is scheduling
+/// the sweep, not a particular string such as `loops.sweep`. A loop renamed
+/// `nightly-refresh` that schedules the same operation has exactly the defect
+/// this warning exists for.
+///
+/// What it does not catch, named here rather than left to be found later. The
+/// script is read as text, so an indirect invocation escapes: `sh -c "ostrom
+/// sweep"`, a wrapper, an invocation through a variable, a Windows
+/// `ostrom.exe`, or `ostrom sweep; …` where the token carries the separator.
+/// Those are acceptable gaps for a non-fatal lint.
+///
+/// One gap is different in kind and worth stating plainly: an operation that
+/// sweeps *internally*, rather than invoking `ostrom sweep`, is invisible here.
+/// `ostrom plan` is such an operation — it runs the sweep acquisition path
+/// itself, and with `sweep.max_age` at its 30m default a daily cadence leaves
+/// every scheduled run outside the reuse window, so the shipped `daily-plan`
+/// loop performs a whole-roster sweep on each run. This lint will never say so,
+/// because the script reads `ostrom plan`. That preset ships declared and
+/// unenabled pending #378; whoever weighs enabling it should know that no
+/// warning here will raise this.
+fn report_sweep_loop_scheduling_findings(manifest: &PolicyManifest) {
+    for (name, declaration) in &manifest.loops {
+        let Some(operation) = manifest.operations.get(&declaration.operation) else {
+            continue;
+        };
+        if operation_invokes_ostrom_sweep(operation) {
+            eprintln!(
+                "lint: loop `{name}` schedules operation `{}`, which invokes `ostrom sweep`; \
+                 sweeping is no longer scheduled from the loop scheduler. Invoke `ostrom sweep` \
+                 directly, or rely on pass-time freshness instead of a recurring schedule.",
+                declaration.operation
+            );
+        }
+    }
+}
+
+/// Whether any step of `operation` runs `ostrom sweep` through `cmd/run`.
+fn operation_invokes_ostrom_sweep(operation: &OperationDecl) -> bool {
+    operation.steps.iter().any(step_invokes_ostrom_sweep)
+}
+
+fn step_invokes_ostrom_sweep(step: &StepDecl) -> bool {
+    step.uses == "cmd/run"
+        && step
+            .parameters
+            .get("script")
+            .and_then(Value::as_str)
+            .is_some_and(script_invokes_ostrom_sweep)
+}
+
+fn script_invokes_ostrom_sweep(script: &str) -> bool {
+    script
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|pair| token_names_ostrom(pair[0]) && pair[1] == "sweep")
+}
+
+/// Whether `token` names the ostrom binary, however the script spelled it: a
+/// bare `ostrom`, or a path such as `/usr/local/bin/ostrom`.
+///
+/// Comparing the whole token would miss the path form, and miss it silently,
+/// which is the worse failure for a lint: it stays quiet on exactly the loop it
+/// exists to flag. A basename comparison rather than a suffix one, so
+/// `not-ostrom` does not match.
+fn token_names_ostrom(token: &str) -> bool {
+    Path::new(token)
+        .file_name()
+        .is_some_and(|name| name.to_str() == Some("ostrom"))
 }
 
 fn merge_fallback<T>(target: &mut BTreeMap<String, T>, fallback: BTreeMap<String, T>) {
@@ -1763,8 +1838,42 @@ mod tests {
 
     use super::{
         PolicyLoadError, compose_scopes, default_manifest_path, load_composed,
-        project_repository_manifest, validate_scoped_manifest,
+        project_repository_manifest, script_invokes_ostrom_sweep, validate_scoped_manifest,
     };
+
+    /// The sweep lint must fire however the script spells the binary. Matching
+    /// the whole token missed `/usr/local/bin/ostrom sweep` and missed it
+    /// silently, which is the failure a lint can least afford: quiet on exactly
+    /// the loop it exists to flag. The negatives pin that widening the match to
+    /// a basename did not widen it into `not-ostrom` or `sweep-report`.
+    #[test]
+    fn the_sweep_lint_matches_ostrom_however_the_script_spells_it() {
+        for script in [
+            "ostrom sweep",
+            "ostrom sweep --detect",
+            "cd /srv && ostrom sweep",
+            "/usr/local/bin/ostrom sweep",
+            "./bin/ostrom sweep",
+        ] {
+            assert!(
+                script_invokes_ostrom_sweep(script),
+                "must match the sweep invocation: {script}"
+            );
+        }
+        for script in [
+            "ostrom plan",
+            "ostrom sweep-report",
+            "not-ostrom sweep",
+            "ostrom",
+            "sweep",
+            "",
+        ] {
+            assert!(
+                !script_invokes_ostrom_sweep(script),
+                "must not match: {script}"
+            );
+        }
+    }
 
     #[test]
     fn missing_and_unsafe_prompt_files_are_refused() {

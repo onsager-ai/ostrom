@@ -21,6 +21,10 @@ struct Preset {
     fragment: PolicyManifest,
     secret_names: &'static [&'static str],
     placeholder_paths: &'static [&'static str],
+    /// Why a declaration this preset used to carry was removed, so a consumer
+    /// reads a stated fact instead of inferring from an absent key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deprecated: Option<&'static str>,
 }
 
 fn catalogue() -> Result<BTreeMap<&'static str, Preset>, serde_yaml::Error> {
@@ -57,6 +61,7 @@ loops:
                 )?,
                 secret_names: &["builder"],
                 placeholder_paths: &["/loops/builder-day/repositories/0"],
+                deprecated: None,
             },
         ),
         (
@@ -89,6 +94,7 @@ loops:
                 )?,
                 secret_names: &["gatekeeper"],
                 placeholder_paths: &["/loops/gatekeeper/repositories/0"],
+                deprecated: None,
             },
         ),
         (
@@ -142,6 +148,7 @@ loops:
                 // nothing about whether 06:30 will.
                 secret_names: &["gatekeeper"],
                 placeholder_paths: &["/loops/daily-plan/repositories/0"],
+                deprecated: None,
             },
         ),
         (
@@ -174,6 +181,11 @@ grants:
                 // sweep::organization_token_request uses this credential name.
                 secret_names: &["gatekeeper"],
                 placeholder_paths: &["/grants/sweep/repositories/0"],
+                deprecated: Some(
+                    "loops.sweep was removed: sweeping is no longer scheduled from the loop \
+                     scheduler. Invoke `ostrom sweep` directly, or rely on pass-time freshness \
+                     instead of a recurring schedule.",
+                ),
             },
         ),
         (
@@ -206,6 +218,7 @@ loops:
                 )?,
                 secret_names: &["triage"],
                 placeholder_paths: &["/loops/unattended-triage/repositories/0"],
+                deprecated: None,
             },
         ),
     ]))
