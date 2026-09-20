@@ -32,11 +32,12 @@ use ostrom_store::{
     HarnessAssessmentDeriver, ImplementRequest, JsonlCheckStore, JsonlPublicationSource,
     OrchestratorRunRequest, OstromPaths, PASS_KILL_GRACE_MS, PassRequest, PassRole,
     PassSweepRequest, PlanOptions, PolicyBundle, PolicyOrigins, PublishDestination, PublishTarget,
-    QueueDecision, ReapWorktreesOptions, ReplayOptions, RunOutcome, RunRequest, SelectAction,
-    SelectError, SelectOutcome, SelectRequest, SignalFlags, SweepError, SweepMode, SweepOptions,
-    TraceAppend, TraceView, UnavailableAssessmentDeriver, acquire_lease, answer_queue_decision,
-    append_trace, append_trace_checked, audit, available_repositories, branch_name,
-    clear_work_order, create_work_order, credential_output, decide_queue_item, discover_goals_path,
+    QueueDecision, ReapWorktreesOptions, ReplayOptions, RunOutcome, RunRequest,
+    SWEEP_LEASE_CONTENTION_EXIT_CODE, SelectAction, SelectError, SelectOutcome, SelectRequest,
+    SignalFlags, SweepError, SweepMode, SweepOptions, SweepOutcome, TraceAppend, TraceView,
+    UnavailableAssessmentDeriver, acquire_lease, answer_queue_decision, append_trace,
+    append_trace_checked, audit, available_repositories, branch_name, clear_work_order,
+    create_work_order, credential_output, decide_queue_item, discover_goals_path,
     effective_repositories, encode_org_snapshots_with_faults, encode_selection, environment,
     finalize_exited_implementer, generated_run_id, grant_excuse, grant_excuse_at_head,
     inherited_repository_scope, item_hash, lease_status, lint_queue_state, list_excuses,
@@ -1157,13 +1158,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 policy,
             };
             let outcome = if let Some(repositories) = &repositories {
-                ostrom_store::run_selected_sweep_with_publication_source(
-                    &options,
-                    &publication_source,
-                    repositories,
+                exit_on_sweep_lease_contention(
+                    ostrom_store::run_selected_sweep_with_publication_source(
+                        &options,
+                        &publication_source,
+                        repositories,
+                    ),
                 )?
             } else {
-                run_sweep_with_publication_source(&options, &publication_source)?
+                exit_on_sweep_lease_contention(run_sweep_with_publication_source(
+                    &options,
+                    &publication_source,
+                ))?
             };
             print!(
                 "mandate sweep: {} projects; {} queue changes",
@@ -2621,6 +2627,25 @@ fn work_order_usage() -> ! {
 fn exit_message(message: &str, code: i32) -> ! {
     eprintln!("{message}");
     std::process::exit(code);
+}
+
+/// `ostrom sweep`'s own lease-contention exit, kept the same number
+/// (`SWEEP_LEASE_CONTENTION_EXIT_CODE`) as a pass whose sweep preparation
+/// contended on the same lease (ostrom#599), so a supervisor sees one status
+/// for one condition regardless of which surface hit it.
+fn exit_on_sweep_lease_contention(
+    result: Result<SweepOutcome, SweepError>,
+) -> Result<SweepOutcome, Box<dyn std::error::Error>> {
+    match result {
+        Ok(outcome) => Ok(outcome),
+        Err(error @ (SweepError::LeaseHeld | SweepError::LeaseWaitTimedOut { .. })) => {
+            exit_message(
+                &format!("mandate sweep: {error}"),
+                SWEEP_LEASE_CONTENTION_EXIT_CODE,
+            )
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn role_name(role: CliPassRole) -> &'static str {

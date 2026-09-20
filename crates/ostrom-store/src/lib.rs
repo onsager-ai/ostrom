@@ -70,7 +70,7 @@ pub use leaves::{
 };
 pub use pass::{
     MAX_TURNS as PASS_MAX_TURNS, PASS_KILL_GRACE_MS, PassError, PassRequest, PassRole,
-    PassSweepRequest, TRIAGE_PROMPT, run_pass,
+    PassSweepRequest, SWEEP_LEASE_CONTENTION_EXIT_CODE, TRIAGE_PROMPT, run_pass,
 };
 pub use paths::OstromPaths;
 pub use plan::{
@@ -109,10 +109,10 @@ pub use selection::{
     run_selection,
 };
 pub use sweep::{
-    PublishTarget, RepositorySnapshot, RosterCoverageFinding, SweepError, SweepFixture, SweepMode,
-    SweepOptions, SweepOutcome, acquire_org_from_github, acquire_org_from_github_with_faults,
-    acquire_selected_org_from_github_with_faults, encode_org_snapshots,
-    encode_org_snapshots_with_faults, load_config, load_config_or_defaults,
+    PublishTarget, RepositorySnapshot, RosterCoverageFinding, SWEEP_LEASE_CEILING_SECONDS,
+    SweepError, SweepFixture, SweepMode, SweepOptions, SweepOutcome, acquire_org_from_github,
+    acquire_org_from_github_with_faults, acquire_selected_org_from_github_with_faults,
+    encode_org_snapshots, encode_org_snapshots_with_faults, load_config, load_config_or_defaults,
     run_selected_sweep_with_publication_source, run_sweep, run_sweep_with_mirror,
     run_sweep_with_publication_source, validate_roster_coverage,
 };

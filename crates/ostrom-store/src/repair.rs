@@ -2,6 +2,7 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::{Command, Output},
+    time::Duration,
 };
 
 use regex::Regex;
@@ -15,7 +16,7 @@ use crate::{
         ScopedAppTokenRequest, authenticated_output,
     },
     append_trace, environment, load_config_or_defaults, read_commit_checks,
-    sweep::invalidate_sweep_generation,
+    sweep::{SWEEP_LEASE_CEILING_SECONDS, invalidate_sweep_generation_for},
 };
 
 const REPAIR_CAP: usize = 3;
@@ -50,8 +51,6 @@ pub enum RepairError {
     Trace,
     #[error("mandate repair: could not serialize summary")]
     Serialize,
-    #[error("mandate repair: could not invalidate the sweep generation: {0}")]
-    Invalidate(String),
 }
 
 impl RepairError {
@@ -59,7 +58,7 @@ impl RepairError {
     pub const fn exit_code(&self) -> i32 {
         match self {
             Self::Config(_) => 2,
-            Self::Temporary(_) | Self::Trace | Self::Serialize | Self::Invalidate(_) => 1,
+            Self::Temporary(_) | Self::Trace | Self::Serialize => 1,
         }
     }
 }
@@ -232,8 +231,11 @@ fn run_repair_prs_with_minter(
     }
 
     if summary.repaired > 0 {
-        invalidate_sweep_generation(&options.paths)
-            .map_err(|error| RepairError::Invalidate(error.to_string()))?;
+        invalidate_after_repair(
+            &options.paths,
+            Duration::from_secs(SWEEP_LEASE_CEILING_SECONDS),
+            &mut context.stderr,
+        );
     }
 
     let encoded = serde_json::to_string(&json!({
@@ -255,6 +257,22 @@ fn run_repair_prs_with_minter(
         stderr: context.stderr,
         exit_code: i32::from(summary.repositories > 0 && summary.scanned_repositories == 0),
     })
+}
+
+/// Invalidate the sweep generation after a repository-changing repair,
+/// without reporting the repair itself failed if invalidation cannot proceed
+/// (ostrom#599): the repair's real work already landed either way. Taking
+/// the sweep lease inside `invalidate_sweep_generation_for` can itself
+/// contend with an in-flight sweep; failing the whole repair over that would
+/// throw away real work, so contention (or any other invalidation failure)
+/// is recorded as a stderr diagnostic instead. The return type is `()`, not
+/// a `Result`: this can never fail its caller, by construction.
+fn invalidate_after_repair(paths: &OstromPaths, wait: Duration, stderr: &mut String) {
+    if let Err(error) = invalidate_sweep_generation_for(paths, wait) {
+        stderr.push_str(&format!(
+            "mandate repair: could not invalidate the sweep generation: {error}\n"
+        ));
+    }
 }
 
 fn collect_candidates(
@@ -1158,5 +1176,78 @@ fn synthetic_output(error: std::io::Error) -> Output {
             stdout: Vec::new(),
             stderr: error.to_string().into_bytes(),
         }
+    }
+}
+
+#[cfg(test)]
+mod invalidate_after_repair_tests {
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::OwnedLease;
+
+    // ostrom#599: a repair that changed a repository must not report itself
+    // failed merely because invalidating the sweep generation contended with
+    // an in-flight sweep's own lease hold. This holds that lease and drives
+    // `invalidate_after_repair` with a short bound — not the production
+    // 1800s ceiling (`SWEEP_LEASE_CEILING_SECONDS`) the real call site
+    // passes — so the contention is reached without a real 1800s wait. If a
+    // future change stopped recording the reason (or started propagating the
+    // failure to the caller instead), this assertion is what would catch it.
+    #[test]
+    fn a_held_sweep_lease_is_recorded_in_stderr_without_failing_the_caller() {
+        let root = tempdir().expect("held sweep lease fixture");
+        let paths = OstromPaths {
+            config: root.path().to_path_buf(),
+            state: root.path().to_path_buf(),
+        };
+        let lease = OwnedLease::acquire(
+            &paths.state,
+            "sweep.lease",
+            "in-flight-sweep",
+            Clock::realtime().epoch_seconds(),
+            60,
+        )
+        .expect("hold sweep lease");
+
+        let mut stderr = String::new();
+        invalidate_after_repair(&paths, Duration::from_millis(75), &mut stderr);
+
+        assert!(
+            stderr.contains("could not invalidate the sweep generation"),
+            "the contention reason was not recorded: {stderr:?}"
+        );
+        drop(lease);
+    }
+
+    // The companion case: when nothing contends, invalidation succeeds and
+    // nothing is recorded, so the stderr assertion above is not vacuously
+    // true for every input.
+    #[test]
+    fn an_uncontended_lease_invalidates_silently() {
+        let root = tempdir().expect("uncontended sweep lease fixture");
+        let paths = OstromPaths {
+            config: root.path().to_path_buf(),
+            state: root.path().to_path_buf(),
+        };
+        fs::write(
+            paths.sweep_state_file(),
+            serde_json::to_vec(&json!({
+                "sweep_generation": {
+                    "id": "pre-repair-generation",
+                    "completed_at": "2026-09-15T10:00:00Z"
+                }
+            }))
+            .expect("serialize pre-repair generation"),
+        )
+        .expect("write pre-repair generation");
+
+        let mut stderr = String::new();
+        invalidate_after_repair(&paths, Duration::from_millis(75), &mut stderr);
+
+        assert!(stderr.is_empty(), "unexpected diagnostic: {stderr:?}");
+        let state: Value = serde_json::from_slice(&fs::read(paths.sweep_state_file()).unwrap())
+            .expect("parse post-invalidation state");
+        assert!(state.get("sweep_generation").is_none());
     }
 }

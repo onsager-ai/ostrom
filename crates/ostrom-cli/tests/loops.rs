@@ -88,6 +88,44 @@ fn rendered_units_match_the_committed_fixture_and_check_clean() {
     );
 }
 
+// ostrom#599: the sweep-lease wait ceiling is derived from this same
+// `TimeoutStartSec`, a value `umwelt-runtime`'s loop unit renderer holds as a
+// template literal rather than a constant it shares with `ostrom-store`. This
+// is the independent side of that derivation (repo principle 6): if the
+// rendered unit's timeout ever moves, this fails until
+// `ostrom_store::SWEEP_LEASE_CEILING_SECONDS` moves with it.
+#[test]
+fn every_loop_services_timeout_agrees_with_the_sweep_lease_ceiling() {
+    let expected = fixture().join("expected");
+    // `ostrom-up.service` is excluded deliberately, not by oversight: it runs
+    // `ostrom up` to reconcile loops from policy, not a pass, so it is a
+    // `Type=oneshot` unit rendered without a `TimeoutStartSec` line at all
+    // (verified against the checked-in fixture) — including it would panic
+    // below on "no TimeoutStartSec line" rather than test anything about the
+    // sweep lease ceiling.
+    let mut services = unit_names(&expected)
+        .into_iter()
+        .filter(|name| name.ends_with(".service") && name != "ostrom-up.service")
+        .peekable();
+    assert!(services.peek().is_some(), "no loop .service fixtures found");
+    for name in services {
+        let contents = fs::read_to_string(expected.join(&name)).expect("expected unit contents");
+        let timeout_line = contents
+            .lines()
+            .find(|line| line.starts_with("TimeoutStartSec="))
+            .unwrap_or_else(|| panic!("{name} has no TimeoutStartSec line"));
+        let seconds: u64 = timeout_line
+            .trim_start_matches("TimeoutStartSec=")
+            .parse()
+            .unwrap_or_else(|error| panic!("{name}: malformed TimeoutStartSec: {error}"));
+        assert_eq!(
+            seconds,
+            ostrom_store::SWEEP_LEASE_CEILING_SECONDS,
+            "{name}'s TimeoutStartSec no longer matches the sweep lease ceiling"
+        );
+    }
+}
+
 #[test]
 fn unattended_triage_has_its_own_actor_settings_profile() {
     let root = tempdir().expect("temporary settings fixture");
