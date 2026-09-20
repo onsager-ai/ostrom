@@ -1128,6 +1128,7 @@ fn evaluate_checks(project: &GateProject, acquisition: &Acquisition) -> Value {
         );
     }
     let mut selected = Vec::new();
+    let mut dead_selectors = Vec::new();
     for selector in &project.required_checks {
         let matches = acquisition
             .checks
@@ -1135,7 +1136,11 @@ fn evaluate_checks(project: &GateProject, acquisition: &Acquisition) -> Value {
             .filter(|check| glob_match(check_name(check), selector, false))
             .map(|check| json!({"name": check_name(check), "state": check_state(check)}))
             .collect::<Vec<_>>();
-        let result = if matches.is_empty()
+        let dead = matches.is_empty();
+        if dead {
+            dead_selectors.push(selector);
+        }
+        let result = if dead
             || matches
                 .iter()
                 .any(|check| known_failure(check["state"].as_str().unwrap_or_default()))
@@ -1154,7 +1159,9 @@ fn evaluate_checks(project: &GateProject, acquisition: &Acquisition) -> Value {
         } else {
             "pass"
         };
-        selected.push(json!({"selector": selector, "result": result, "matches": matches}));
+        selected.push(
+            json!({"selector": selector, "result": result, "dead": dead, "matches": matches}),
+        );
     }
     let result = if selected.iter().any(|value| value["result"] == "fail") {
         "fail"
@@ -1171,7 +1178,7 @@ fn evaluate_checks(project: &GateProject, acquisition: &Acquisition) -> Value {
     } else {
         vec!["content-derived"]
     };
-    let mut detail = json!({"selectors": selected});
+    let mut detail = json!({"selectors": selected, "dead_selectors": dead_selectors});
     if !acquisition.checks_partial_error.is_empty() {
         detail["partial_read"] = json!({"statuses": acquisition.checks_partial_error});
     }

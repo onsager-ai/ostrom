@@ -385,6 +385,15 @@ fn unreadable_check_runs_only_make_required_checks_inconclusive() {
         text.contains("Resource not accessible by integration"),
         "{text}"
     );
+    let checks_line = text
+        .lines()
+        .find(|line| line.starts_with("condition required_checks:"))
+        .unwrap();
+    let detail: serde_json::Value =
+        serde_json::from_str(checks_line.split_once("detail=").unwrap().1).unwrap();
+    assert!(detail.get("reason").is_some());
+    assert!(detail.get("selectors").is_none());
+    assert!(detail.get("dead_selectors").is_none());
     for name in [
         "mergeable",
         "draft",
@@ -416,12 +425,69 @@ fn rest_check_runs_distinguish_pass_failure_pending_and_absence() {
             "{mode}: {text}"
         );
         assert!(text.contains(detail), "{mode}: {text}");
+        let checks_line = text
+            .lines()
+            .find(|line| line.starts_with("condition required_checks:"))
+            .unwrap();
+        let detail: serde_json::Value =
+            serde_json::from_str(checks_line.split_once("detail=").unwrap().1).unwrap();
+        let dead = mode == "no-check-runs";
+        assert_eq!(detail["selectors"][0]["dead"], dead, "{mode}: {text}");
+        assert_eq!(
+            detail["dead_selectors"],
+            if dead {
+                serde_json::json!(["verify-*"])
+            } else {
+                serde_json::json!([])
+            },
+            "{mode}: {text}"
+        );
+        if matches!(mode, "no-check-runs" | "check-failure") {
+            assert_eq!(detail["selectors"][0]["result"], "fail", "{text}");
+        }
         if mode == "check-running" {
             assert!(text.contains("verify-linux"), "{text}");
             assert!(!text.contains("condition required_checks: fail"), "{text}");
             assert!(!text.contains("condition required_checks: pass"), "{text}");
         }
     }
+}
+
+#[test]
+fn dead_selectors_preserve_policy_order_among_matching_selectors() {
+    let fixture = Fixture::new();
+    let config_path = fixture.home.join("gate.yaml");
+    let config = fs::read_to_string(&config_path).unwrap();
+    fs::write(
+        config_path,
+        config.replace(
+            "required_checks: [verify-*]",
+            "required_checks: [missing-z, verify-*, missing-a]",
+        ),
+    )
+    .unwrap();
+    let output = fixture.run("pass", 23, "2323232323232323");
+    assert_eq!(output.status.code(), Some(1));
+    let text = output_text(&output);
+    let checks_line = text
+        .lines()
+        .find(|line| line.starts_with("condition required_checks: fail"))
+        .unwrap();
+    let detail: serde_json::Value =
+        serde_json::from_str(checks_line.split_once("detail=").unwrap().1).unwrap();
+    assert_eq!(
+        detail["dead_selectors"],
+        serde_json::json!(["missing-z", "missing-a"])
+    );
+    assert_eq!(
+        detail["selectors"],
+        serde_json::json!([
+            {"selector": "missing-z", "result": "fail", "dead": true, "matches": []},
+            {"selector": "verify-*", "result": "pass", "dead": false,
+             "matches": [{"name": "verify-linux", "state": "SUCCESS"}]},
+            {"selector": "missing-a", "result": "fail", "dead": true, "matches": []}
+        ])
+    );
 }
 
 #[test]
