@@ -288,8 +288,8 @@ const fn sweep_failure_status(error: &PrepareSweepError) -> (&'static str, i32) 
 /// Takes an explicit sweep-lease wait ceiling (ostrom#599) rather than
 /// defaulting to `SWEEP_LEASE_CEILING_SECONDS` itself, so a test that wants
 /// to drive contention to its exit status is not stuck with the production
-/// 1800s default. `run_pass`'s own call site passes
-/// `SWEEP_LEASE_CEILING_SECONDS` explicitly for its production wait.
+/// default. `run_pass`'s own call site passes `SWEEP_LEASE_CEILING_SECONDS`
+/// explicitly for its production wait.
 fn prepare_sweep(
     request: &PassRequest,
     sweep_wait: Duration,
@@ -3288,7 +3288,7 @@ mod sweep_freshness_tests {
     // ostrom#599: a holder that keeps renewing past the wait ceiling must
     // classify as contention, not a generic sweep failure. Uses the
     // injectable `sweep_wait` bound so this is reached in milliseconds
-    // instead of the production 1800s ceiling.
+    // instead of the production `SWEEP_LEASE_CEILING_SECONDS` ceiling.
     #[test]
     fn a_sweep_lease_held_past_the_wait_classifies_as_contention() {
         let root = tempfile::tempdir().expect("contended sweep lease fixture");
@@ -3324,7 +3324,7 @@ mod sweep_freshness_tests {
     // same way `failed_sweep_ends_the_pass_before_an_agent_turn_and_records_the_reason`
     // proves it for a generic sweep failure. The injectable `sweep_wait`
     // (the third argument here, unavailable through the public `run_pass`)
-    // is what makes this reachable without a real 1800s wait.
+    // is what makes this reachable without a real multi-minute wait.
     #[test]
     fn a_pass_whose_sweep_preparation_contends_exits_with_the_contention_status() {
         let root = tempfile::tempdir().expect("contended pass fixture");

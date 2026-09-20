@@ -1190,8 +1190,8 @@ mod invalidate_after_repair_tests {
     // failed merely because invalidating the sweep generation contended with
     // an in-flight sweep's own lease hold. This holds that lease and drives
     // `invalidate_after_repair` with a short bound — not the production
-    // 1800s ceiling (`SWEEP_LEASE_CEILING_SECONDS`) the real call site
-    // passes — so the contention is reached without a real 1800s wait. If a
+    // ceiling (`SWEEP_LEASE_CEILING_SECONDS`) the real call site passes — so
+    // the contention is reached without a real multi-minute wait. If a
     // future change stopped recording the reason (or started propagating the
     // failure to the caller instead), this assertion is what would catch it.
     #[test]
