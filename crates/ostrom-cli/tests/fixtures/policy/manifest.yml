@@ -43,7 +43,7 @@ loops:
   sweep:
     actor: builder
     operation: work
-    target: onsager-ai/ostrom-hub
+    repositories: onsager-ai/ostrom-hub
     every: hourly
     cadence_hours: 24
     stuck_after_days: 7

@@ -654,7 +654,7 @@ fn validate_lists_all_unresolved_references_in_manifest_order_and_strict_refuses
     fs::write(&fixture.manifest, concat!(
         "manifest_version: 1\n",
         "denies:\n  z-last: {operations: [z-op, a-op], actors: [z-actor, a-actor]}\n",
-        "loops:\n  tick: {operation: tick-op, actor: ticker, target: example/repo, every: hourly}\n",
+        "loops:\n  tick: {operation: tick-op, actor: ticker, repositories: example/repo, every: hourly}\n",
         "grants:\n  z-last: {operations: work, actors: builder}\n  a-first: {actors: reviewer}\n",
         "includes: [z-leaf.yaml, a-fragment.yaml]\n",
     )).expect("write references");

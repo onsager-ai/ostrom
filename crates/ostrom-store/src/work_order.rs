@@ -23,8 +23,9 @@ use tempfile::NamedTempFile;
 use thiserror::Error;
 
 use crate::{
-    Clock, TraceAppend, TraceFactRecord, append_trace, environment, read_lease, read_trace,
-    set_private_file_mode,
+    Clock, TraceAppend, TraceFactRecord, append_trace, environment,
+    lease::{ProcessLiveness, process_identity_is_live_at},
+    read_lease, read_trace, set_private_file_mode,
 };
 
 const DEFAULT_COST_CEILING_USD: &str = "20";
@@ -481,17 +482,31 @@ fn reap_stale_work_orders_matching(
     order_id: Option<&str>,
     clock: &Clock,
 ) -> Result<Vec<ClearedWorkOrder>, WorkOrderError> {
+    reap_stale_work_orders_matching_at(state_root, order_id, clock, Path::new("/proc"))
+}
+
+fn reap_stale_work_orders_matching_at(
+    state_root: &Path,
+    order_id: Option<&str>,
+    clock: &Clock,
+    proc_root: &Path,
+) -> Result<Vec<ClearedWorkOrder>, WorkOrderError> {
     let trace_path = state_root.join("sprint.jsonl");
     let now = clock.epoch_seconds();
     let mut reaped = Vec::new();
     for order in in_flight_orders(&trace_path)? {
-        if order_id.is_some_and(|expected| order.order_id != expected)
-            || !order_is_stale(&order, now)
-        {
+        if order_id.is_some_and(|expected| order.order_id != expected) {
             continue;
         }
-        let observation = observe_unit(&order);
+        let stale = order_is_stale(&order, now);
+        if order.backend != "process" && !stale {
+            continue;
+        }
+        let observation = observe_unit_at(state_root, &order, proc_root);
         if observation.liveness == UnitLiveness::Live {
+            continue;
+        }
+        if observation.liveness == UnitLiveness::Unknown && !stale {
             continue;
         }
         if append_terminal_failure(
@@ -530,7 +545,7 @@ pub fn clear_work_order(
         return Err(WorkOrderError::AmbiguousInFlight(identifier.to_owned()));
     }
     let order = matches.pop().expect("one matching order");
-    let observation = observe_unit(&order);
+    let observation = observe_unit(state_root, &order);
     match observation.liveness {
         UnitLiveness::Live => {
             return Err(WorkOrderError::StillRunning(order.order_id));
@@ -604,7 +619,14 @@ fn order_is_stale(order: &InFlightOrder, now: u64) -> bool {
     ))
 }
 
-fn observe_unit(order: &InFlightOrder) -> UnitObservation {
+fn observe_unit(state_root: &Path, order: &InFlightOrder) -> UnitObservation {
+    observe_unit_at(state_root, order, Path::new("/proc"))
+}
+
+fn observe_unit_at(state_root: &Path, order: &InFlightOrder, proc_root: &Path) -> UnitObservation {
+    if order.backend == "process" {
+        return observe_process_at(state_root, order, proc_root);
+    }
     if order.backend != "systemd" {
         return UnitObservation {
             liveness: UnitLiveness::Unknown,
@@ -679,6 +701,65 @@ fn observe_unit(order: &InFlightOrder) -> UnitObservation {
         liveness: UnitLiveness::NotLive,
         exit_code,
         detail: format!("systemd unit is {state}"),
+    }
+}
+
+fn observe_process_at(
+    state_root: &Path,
+    order: &InFlightOrder,
+    proc_root: &Path,
+) -> UnitObservation {
+    let path = state_root.join(format!(
+        "implementer-item-{}.lease",
+        item_hash(&order.item_id)
+    ));
+    let lease = match read_lease(&path) {
+        Ok(Some(lease)) if lease.owner == order.unit_name => lease,
+        Ok(Some(_)) => {
+            return UnitObservation {
+                liveness: UnitLiveness::Unknown,
+                exit_code: None,
+                detail: "process lease belongs to another owner".to_owned(),
+            };
+        }
+        Ok(None) => {
+            return UnitObservation {
+                liveness: UnitLiveness::NotLive,
+                exit_code: None,
+                detail: "process lease does not exist".to_owned(),
+            };
+        }
+        Err(_) => {
+            return UnitObservation {
+                liveness: UnitLiveness::Unknown,
+                exit_code: None,
+                detail: "process lease is unreadable".to_owned(),
+            };
+        }
+    };
+    let Some((pid, _, start_time)) = lease.process_identity() else {
+        return UnitObservation {
+            liveness: UnitLiveness::Unknown,
+            exit_code: None,
+            detail: "process lease has no process identity".to_owned(),
+        };
+    };
+    match process_identity_is_live_at(proc_root, pid, start_time) {
+        ProcessLiveness::Live => UnitObservation {
+            liveness: UnitLiveness::Live,
+            exit_code: None,
+            detail: "process identity is live".to_owned(),
+        },
+        ProcessLiveness::NotLive => UnitObservation {
+            liveness: UnitLiveness::NotLive,
+            exit_code: None,
+            detail: "process pid is dead or its start time differs".to_owned(),
+        },
+        ProcessLiveness::Unknown => UnitObservation {
+            liveness: UnitLiveness::Unknown,
+            exit_code: None,
+            detail: "process identity is unreadable".to_owned(),
+        },
     }
 }
 
@@ -792,7 +873,7 @@ fn remove_expired_lease(path: &Path, now: u64) {
     if read_lease(path)
         .ok()
         .flatten()
-        .is_some_and(|lease| lease.expires_at <= now)
+        .is_some_and(|lease| !lease.is_live(now))
     {
         let _ = fs::remove_file(path);
     }
@@ -800,8 +881,14 @@ fn remove_expired_lease(path: &Path, now: u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{branch_name, item_hash, validate_work_order_file};
-    use std::path::Path;
+    use super::{
+        branch_name, item_hash, reap_stale_work_orders_matching_at, validate_work_order_file,
+    };
+    use crate::{Clock, LeaseRecord, write_lease};
+    use chrono::{DateTime, Utc};
+    use serde_json::json;
+    use std::{fs, path::Path};
+    use tempfile::tempdir;
 
     #[test]
     fn identifiers_match_recorded_shell_values() {
@@ -820,5 +907,61 @@ mod tests {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../ostrom-cli/tests/fixtures/leaves/state-writing/work-order.bash-era.json");
         validate_work_order_file(&fixture).expect("Bash-era order remains valid");
+    }
+
+    #[test]
+    fn unreadable_process_identity_does_not_reap_an_unexpired_order() {
+        let fixture = tempdir().expect("unreadable process fixture");
+        let state = fixture.path().join("state");
+        let proc_root = fixture.path().join("proc");
+        fs::create_dir_all(&state).expect("create state root");
+        fs::create_dir_all(proc_root.join("42/stat")).expect("create unreadable process stat");
+        let timestamp = "2026-08-01T00:00:00Z";
+        let item_id = "placeholder-org/alpha#42";
+        let unit_name = "ostrom-implementer-placeholder";
+        let trace = format!(
+            "{}\n",
+            json!({
+                "ts": timestamp,
+                "kind": "work-dispatched",
+                "fact": {
+                    "schema_version": 1,
+                    "item_id": item_id,
+                    "order_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                    "unit_name": unit_name,
+                    "backend": "process",
+                    "cost_ceiling_usd": 20,
+                    "token_ceiling": 500000
+                },
+                "narration": {}
+            })
+        );
+        fs::write(state.join("sprint.jsonl"), &trace).expect("write dispatch trace");
+        write_lease(
+            &state.join(format!("implementer-item-{}.lease", item_hash(item_id))),
+            &LeaseRecord {
+                owner: unit_name.to_owned(),
+                started_at: 1,
+                expires_at: 4_102_444_800,
+                pid: Some(42),
+                process_group_id: Some(42),
+                process_start_time: Some(123),
+            },
+        )
+        .expect("write process lease");
+        let clock = Clock::fixed(
+            DateTime::parse_from_rfc3339(timestamp)
+                .expect("fixed timestamp")
+                .with_timezone(&Utc),
+        );
+
+        let reaped = reap_stale_work_orders_matching_at(&state, None, &clock, &proc_root)
+            .expect("observe unreadable process identity");
+
+        assert!(reaped.is_empty());
+        assert_eq!(
+            fs::read_to_string(state.join("sprint.jsonl")).expect("read unchanged trace"),
+            trace
+        );
     }
 }

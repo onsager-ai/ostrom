@@ -93,16 +93,11 @@ its JSON summary from stdout for the report, but do not use a repair conflict
 or an individual push failure as a reason to stop: those outcomes are already
 facts and the script continues through the bounded candidate set.
 
-After the repair scan, sweep before reading anything the sweep produces. A
-successful repair changed a repository and therefore invalidated even a young
-`state.json`; an unsuccessful or empty scan does not make a sweep less useful.
-The sweep is cheap and idempotent, so run it every builder pass here.
-
-```sh
-ostrom sweep
-```
-
-Then read, in order:
+The pass made the queue and state fresh before this session started. Do not
+refresh them again inside the agent session. The queue therefore predates any
+repair made in this session and must not be read as evidence of the repaired
+head; a successful repair invalidates its sweep generation so the next pass
+refreshes it. After the repair scan, read, in order:
 
 - `~/.claude/ostrom/mandates.yaml` — the authorization boundary: what each
   project delegates entirely and what bounces back. Its optional root-level
@@ -111,7 +106,7 @@ Then read, in order:
   Its optional root-level `work_ranking` is a highest-first list of canonical
   `owner/repo#number` item IDs. It orders only work that is dispatchable after
   every authorization and hold check; it never changes that candidate set.
-- `~/.claude/ostrom/queue.jsonl` — what the last sweep found. Rows are
+- `~/.claude/ostrom/queue.jsonl` — what the pass's sweep generation found. Rows are
   pointers, so resolve titles from GitHub rather than trusting cached text.
 - The SessionStart digest, if it is in context.
 

@@ -615,6 +615,12 @@ pub struct RunStartedPayload {
         deserialize_with = "deserialize_optional",
         skip_serializing_if = "Option::is_none"
     )]
+    pub repositories: Option<Vec<String>>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub work_order: Option<String>,
     #[serde(
         default,
@@ -3484,6 +3490,7 @@ mod tests {
                 parent_tool_use_id: Some("tool-7".to_owned()),
                 schedule: Some("builder@2026-09-06T10:45Z".to_owned()),
                 repository: Some("onsager-ai/ethogram".to_owned()),
+                repositories: None,
                 work_order: Some("order-5".to_owned()),
                 ceilings: Some(RunCeilings {
                     cost_usd: Some(2.5),
@@ -3547,6 +3554,7 @@ mod tests {
                 parent_tool_use_id: None,
                 schedule: None,
                 repository: None,
+                repositories: None,
                 work_order: None,
                 ceilings: Some(RunCeilings {
                     cost_usd: Some(2.5),
@@ -3877,6 +3885,7 @@ mod tests {
                 parent_tool_use_id: None,
                 schedule: None,
                 repository: None,
+                repositories: None,
                 work_order: None,
                 ceilings: None,
                 extra: PayloadExtension::new(),
@@ -3910,6 +3919,28 @@ mod tests {
             serialise_event(&finished).unwrap(),
             r#"{"v":1,"type":"run.finished","runId":"run-root","seq":2,"ts":"2026-09-06T00:00:01.000Z","payload":{"durationMs":1000,"outcome":"no-op"}}"#
         );
+    }
+
+    #[test]
+    fn run_started_accepts_a_repository_list_single_repository_or_neither() {
+        for value in [
+            json!({
+                "kind": "loop",
+                "actor": "builder",
+                "harness": "fixture",
+                "repositories": ["placeholder-org/alpha", "placeholder-org/beta"]
+            }),
+            json!({
+                "kind": "handoff",
+                "actor": "builder",
+                "harness": "fixture",
+                "repository": "placeholder-org/alpha"
+            }),
+            json!({"kind": "session", "actor": "operator", "harness": "fixture"}),
+        ] {
+            let payload: RunStartedPayload = serde_json::from_value(value).unwrap();
+            validate(RUN_STARTED, &payload).unwrap();
+        }
     }
 
     // -- control.* (spec onsager-ai/ethogram#8) ---------------------------------------------

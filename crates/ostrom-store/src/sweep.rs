@@ -1,8 +1,15 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
+    fmt, fs, io,
     path::{Path, PathBuf},
     process::Command,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc::{self, RecvTimeoutError, Sender},
+    },
+    thread::{self, JoinHandle},
+    time::{Duration as StdDuration, Instant},
 };
 
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
@@ -17,13 +24,16 @@ use serde_json::{Map, Value, json};
 use thiserror::Error;
 
 use crate::{
-    AppTokenError, OstromPaths, PolicyBundle, PublishDestination, PublishError, QueueDocument,
-    StoreError,
+    AppTokenError, Clock, LeaseActionError, OstromPaths, OwnedLease, PolicyBundle,
+    PublishDestination, PublishError, QueueDocument, StoreError,
     app_token::{GitHubInstallationTokenMinter, InstallationTokenMinter, ScopedAppTokenRequest},
+    available_repositories,
     commit_checks::read_commit_checks,
     environment,
     gate::load_gate_config,
     io_error,
+    lease::{ProcessIdentity, read_process_identity_at, renew_lease},
+    project_available_mandates,
     publish::{JsonlPublicationSource, PublishOptions, PublishOutcome, publish},
     read_queue, read_trace,
     run_events::{DecisionRequest, RunEventError, SWEEP_RUN_ID},
@@ -48,6 +58,14 @@ const FULL_RECONCILIATION_HOURS: i64 = 24;
 /// distinguish a quiet portfolio from the 2026-08-18 authentication outage,
 /// so that incident-shaped result must never reach persistence.
 const MIN_ACQUIRED_REPOSITORIES_TO_WRITE: usize = 1;
+const SWEEP_LEASE_NAME: &str = "sweep.lease";
+// A live holder renews well inside this expiry. Process liveness can reclaim a
+// dead holder sooner; the expiry bounds recovery everywhere else.
+const SWEEP_LEASE_TTL_SECONDS: u64 = 120;
+const SWEEP_LEASE_RENEW_SECONDS: u64 = 30;
+pub(crate) const SWEEP_LEASE_WAIT_SECONDS: u64 = 30;
+const SWEEP_LEASE_POLL_INTERVAL: StdDuration = StdDuration::from_millis(50);
+static SWEEP_LEASE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub(crate) const PR_REPAIR_CONFLICT_REASON_PREFIX: &str =
     "repair scan aborted on a content conflict";
 /// A sweep only observes portfolio state, so acquisition credentials must not
@@ -99,6 +117,12 @@ pub enum SweepError {
     RunEvent(#[from] RunEventError),
     #[error("decision fact {0} was reused with different content")]
     DecisionFactConflict(String),
+    #[error("sweep lease is held")]
+    LeaseHeld,
+    #[error("sweep lease remained held for {seconds} seconds")]
+    LeaseWaitTimedOut { seconds: u64 },
+    #[error("sweep-lease-lost: {detail}")]
+    LeaseLost { detail: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,6 +163,21 @@ pub struct SweepOutcome {
     pub mode: SweepMode,
     pub faults: Vec<String>,
     pub publication_failure: Option<String>,
+    pub generation: SweepGeneration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SweepGeneration {
+    pub id: String,
+    pub completed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredSweepSnapshot {
+    generation: SweepGeneration,
+    repositories: Vec<RepositorySnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -286,6 +325,225 @@ struct RepositoryEvidence<'a> {
     latest_pr_repairs: &'a BTreeMap<String, PrRepairEvidence>,
 }
 
+type SweepLeaseClock = Arc<dyn Fn() -> u64 + Send + Sync>;
+
+#[derive(Clone)]
+struct SweepLeaseTiming {
+    ttl_seconds: u64,
+    renewal_interval: StdDuration,
+    now: SweepLeaseClock,
+}
+
+impl SweepLeaseTiming {
+    fn production() -> Self {
+        Self {
+            ttl_seconds: SWEEP_LEASE_TTL_SECONDS,
+            renewal_interval: StdDuration::from_secs(SWEEP_LEASE_RENEW_SECONDS),
+            now: Arc::new(|| Clock::realtime().epoch_seconds()),
+        }
+    }
+}
+
+impl fmt::Debug for SweepLeaseTiming {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SweepLeaseTiming")
+            .field("ttl_seconds", &self.ttl_seconds)
+            .field("renewal_interval", &self.renewal_interval)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct SweepLease {
+    _lease: OwnedLease,
+    state_root: PathBuf,
+    owner: String,
+    identity: Option<ProcessIdentity>,
+    timing: SweepLeaseTiming,
+    stop: Option<Sender<()>>,
+    renewal: Option<JoinHandle<()>>,
+    ownership_lost: Arc<AtomicBool>,
+    diagnostics: Arc<Mutex<Vec<String>>>,
+    renewal_operation: Arc<Mutex<()>>,
+}
+
+impl SweepLease {
+    fn acquire(
+        paths: &OstromPaths,
+        proc_root: &Path,
+        timing: SweepLeaseTiming,
+    ) -> Result<Self, SweepError> {
+        let identity = read_process_identity_at(proc_root, std::process::id())
+            .ok()
+            .flatten();
+        let sequence = SWEEP_LEASE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let owner = format!("sweep-{}-{sequence}", std::process::id());
+        let lease = OwnedLease::acquire_renewable(
+            &paths.state,
+            SWEEP_LEASE_NAME,
+            &owner,
+            (timing.now)(),
+            timing.ttl_seconds,
+            identity,
+            proc_root,
+        )
+        .map_err(map_sweep_lease_acquisition_error)?;
+        let expected_identity =
+            identity.map(|identity| (identity.pid, identity.process_group_id, identity.start_time));
+        let state_root = paths.state.clone();
+        let thread_owner = owner.clone();
+        let thread_timing = timing.clone();
+        let ownership_lost = Arc::new(AtomicBool::new(false));
+        let thread_ownership_lost = Arc::clone(&ownership_lost);
+        let diagnostics = Arc::new(Mutex::new(Vec::new()));
+        let thread_diagnostics = Arc::clone(&diagnostics);
+        let renewal_operation = Arc::new(Mutex::new(()));
+        let thread_renewal_operation = Arc::clone(&renewal_operation);
+        let (stop, stop_receiver) = mpsc::channel();
+        let renewal = thread::Builder::new()
+            .name("ostrom-sweep-lease".to_owned())
+            .spawn(move || {
+                loop {
+                    match stop_receiver.recv_timeout(thread_timing.renewal_interval) {
+                        Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                        Err(RecvTimeoutError::Timeout) => {}
+                    }
+                    let _operation = thread_renewal_operation
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if let Err(error) = renew_lease(
+                        &state_root,
+                        SWEEP_LEASE_NAME,
+                        &thread_owner,
+                        expected_identity,
+                        (thread_timing.now)(),
+                        thread_timing.ttl_seconds,
+                    ) {
+                        let lost = matches!(
+                            error,
+                            LeaseActionError::OwnerMismatch | LeaseActionError::NoReadableLease
+                        );
+                        if lost {
+                            thread_ownership_lost.store(true, Ordering::Release);
+                        }
+                        let diagnostic = if lost {
+                            format!(
+                                "sweep-lease-lost: renewal could not confirm ownership: {error}"
+                            )
+                        } else {
+                            format!("sweep-lease-renewal-failed: {error}")
+                        };
+                        thread_diagnostics
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(diagnostic);
+                        if lost {
+                            break;
+                        }
+                    }
+                }
+            })
+            .map_err(|error| {
+                SweepError::State(format!("could not start sweep lease renewal: {error}"))
+            })?;
+        Ok(Self {
+            _lease: lease,
+            state_root: paths.state.clone(),
+            owner,
+            identity,
+            timing,
+            stop: Some(stop),
+            renewal: Some(renewal),
+            ownership_lost,
+            diagnostics,
+            renewal_operation,
+        })
+    }
+
+    fn confirm_ownership(&self) -> Result<(), SweepError> {
+        if self.ownership_lost.load(Ordering::Acquire) {
+            return Err(SweepError::LeaseLost {
+                detail: "the renewal thread observed a different owner".to_owned(),
+            });
+        }
+        let _operation = self
+            .renewal_operation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let expected_identity = self
+            .identity
+            .map(|identity| (identity.pid, identity.process_group_id, identity.start_time));
+        renew_lease(
+            &self.state_root,
+            SWEEP_LEASE_NAME,
+            &self.owner,
+            expected_identity,
+            (self.timing.now)(),
+            self.timing.ttl_seconds,
+        )
+        .map_err(|error| SweepError::LeaseLost {
+            detail: format!("could not confirm ownership before generation writes: {error}"),
+        })?;
+        if self.ownership_lost.load(Ordering::Acquire) {
+            return Err(SweepError::LeaseLost {
+                detail: "the renewal thread observed a different owner".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn stop_renewal(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(renewal) = self.renewal.take()
+            && renewal.join().is_err()
+        {
+            self.diagnostics
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push("sweep-lease-renewal-failed: renewal thread panicked".to_owned());
+        }
+    }
+
+    fn take_diagnostics(&self) -> Vec<String> {
+        std::mem::take(
+            &mut *self
+                .diagnostics
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    #[cfg(test)]
+    fn abandon(mut self) {
+        self.stop_renewal();
+        self._lease.disarm();
+    }
+}
+
+impl Drop for SweepLease {
+    fn drop(&mut self) {
+        self.stop_renewal();
+        for diagnostic in self.take_diagnostics() {
+            eprintln!("mandate sweep: {diagnostic}");
+        }
+    }
+}
+
+fn map_sweep_lease_acquisition_error(error: LeaseActionError) -> SweepError {
+    match error {
+        LeaseActionError::Held
+        | LeaseActionError::HeldOrUnreadable
+        | LeaseActionError::ReclamationInProgress
+        | LeaseActionError::ChangedDuringReclamation
+        | LeaseActionError::AcquiredConcurrently
+        | LeaseActionError::MutationInProgress => SweepError::LeaseHeld,
+        error => SweepError::State(format!("could not acquire {SWEEP_LEASE_NAME}: {error}")),
+    }
+}
+
 pub fn run_sweep(options: &SweepOptions) -> Result<SweepOutcome, SweepError> {
     let source = JsonlPublicationSource::new(&options.paths);
     run_sweep_with_publication_source(options, &source)
@@ -295,17 +553,51 @@ pub fn run_sweep_with_publication_source(
     options: &SweepOptions,
     source: &dyn PublicationSource,
 ) -> Result<SweepOutcome, SweepError> {
+    let lease = acquire_sweep_lease(&options.paths)?;
     let mut minter = GitHubInstallationTokenMinter;
-    run_sweep_with_minter_and_publication_source(options, source, &mut minter, None)
-        .map(|(outcome, _mirror)| outcome)
+    let result = run_sweep_with_minter_and_publication_source(
+        options,
+        source,
+        &mut minter,
+        &lease,
+        None,
+        None,
+    );
+    finish_sweep(lease, result).map(|(outcome, _mirror)| outcome)
 }
 
 pub fn run_sweep_with_mirror(
     options: &SweepOptions,
 ) -> Result<(SweepOutcome, Vec<RepositorySnapshot>), SweepError> {
+    let lease = acquire_sweep_lease(&options.paths)?;
     let source = JsonlPublicationSource::new(&options.paths);
     let mut minter = GitHubInstallationTokenMinter;
-    run_sweep_with_minter_and_publication_source(options, &source, &mut minter, None)
+    let result = run_sweep_with_minter_and_publication_source(
+        options,
+        &source,
+        &mut minter,
+        &lease,
+        None,
+        None,
+    );
+    finish_sweep(lease, result)
+}
+
+pub(crate) fn run_sweep_holding_lease(
+    options: &SweepOptions,
+    lease: SweepLease,
+) -> Result<SweepOutcome, SweepError> {
+    let source = JsonlPublicationSource::new(&options.paths);
+    let mut minter = GitHubInstallationTokenMinter;
+    let result = run_sweep_with_minter_and_publication_source(
+        options,
+        &source,
+        &mut minter,
+        &lease,
+        None,
+        None,
+    );
+    finish_sweep(lease, result).map(|(outcome, _mirror)| outcome)
 }
 
 #[cfg(test)]
@@ -313,8 +605,11 @@ fn run_sweep_with_minter(
     options: &SweepOptions,
     minter: &mut dyn InstallationTokenMinter,
 ) -> Result<(SweepOutcome, Vec<RepositorySnapshot>), SweepError> {
+    let lease = acquire_sweep_lease(&options.paths)?;
     let source = JsonlPublicationSource::new(&options.paths);
-    run_sweep_with_minter_and_publication_source(options, &source, minter, None)
+    let result =
+        run_sweep_with_minter_and_publication_source(options, &source, minter, &lease, None, None);
+    finish_sweep(lease, result)
 }
 
 /// Re-read a selected roster subset through the normal generation writer.
@@ -323,9 +618,88 @@ pub fn run_selected_sweep_with_publication_source(
     source: &dyn PublicationSource,
     repositories: &[String],
 ) -> Result<SweepOutcome, SweepError> {
+    let lease = acquire_sweep_lease(&options.paths)?;
     let mut minter = GitHubInstallationTokenMinter;
-    run_sweep_with_minter_and_publication_source(options, source, &mut minter, Some(repositories))
-        .map(|(outcome, _)| outcome)
+    let result = run_sweep_with_minter_and_publication_source(
+        options,
+        source,
+        &mut minter,
+        &lease,
+        Some(repositories),
+        None,
+    );
+    finish_sweep(lease, result).map(|(outcome, _)| outcome)
+}
+
+fn finish_sweep(
+    mut lease: SweepLease,
+    result: Result<(SweepOutcome, Vec<RepositorySnapshot>), SweepError>,
+) -> Result<(SweepOutcome, Vec<RepositorySnapshot>), SweepError> {
+    lease.stop_renewal();
+    let diagnostics = lease.take_diagnostics();
+    match result {
+        Ok((mut outcome, mirror)) => {
+            outcome.faults.extend(diagnostics);
+            Ok((outcome, mirror))
+        }
+        Err(error) => {
+            for diagnostic in diagnostics {
+                eprintln!("mandate sweep: {diagnostic}");
+            }
+            Err(error)
+        }
+    }
+}
+
+pub(crate) fn acquire_sweep_lease(paths: &OstromPaths) -> Result<SweepLease, SweepError> {
+    acquire_sweep_lease_with_proc_root(paths, Path::new("/proc"), SweepLeaseTiming::production())
+}
+
+fn acquire_sweep_lease_with_proc_root(
+    paths: &OstromPaths,
+    proc_root: &Path,
+    timing: SweepLeaseTiming,
+) -> Result<SweepLease, SweepError> {
+    SweepLease::acquire(paths, proc_root, timing)
+}
+
+pub(crate) fn wait_for_sweep_lease(paths: &OstromPaths) -> Result<SweepLease, SweepError> {
+    wait_for_sweep_lease_for(paths, StdDuration::from_secs(SWEEP_LEASE_WAIT_SECONDS))
+}
+
+fn wait_for_sweep_lease_for(
+    paths: &OstromPaths,
+    wait: StdDuration,
+) -> Result<SweepLease, SweepError> {
+    wait_for_sweep_lease_with_proc_root(
+        paths,
+        Path::new("/proc"),
+        wait,
+        SweepLeaseTiming::production(),
+    )
+}
+
+fn wait_for_sweep_lease_with_proc_root(
+    paths: &OstromPaths,
+    proc_root: &Path,
+    wait: StdDuration,
+    timing: SweepLeaseTiming,
+) -> Result<SweepLease, SweepError> {
+    let deadline = Instant::now() + wait;
+    loop {
+        match acquire_sweep_lease_with_proc_root(paths, proc_root, timing.clone()) {
+            Ok(lease) => return Ok(lease),
+            Err(SweepError::LeaseHeld) if Instant::now() < deadline => {
+                thread::sleep(SWEEP_LEASE_POLL_INTERVAL);
+            }
+            Err(SweepError::LeaseHeld) => {
+                return Err(SweepError::LeaseWaitTimedOut {
+                    seconds: wait.as_secs(),
+                });
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn selected_config(
@@ -361,9 +735,35 @@ fn run_sweep_with_minter_and_publication_source(
     options: &SweepOptions,
     source: &dyn PublicationSource,
     minter: &mut dyn InstallationTokenMinter,
+    lease: &SweepLease,
     repositories: Option<&[String]>,
+    before_commit: Option<&dyn Fn()>,
 ) -> Result<(SweepOutcome, Vec<RepositorySnapshot>), SweepError> {
-    let config = load_config(&options.paths, &options.working_directory)?;
+    let authored_config = match load_config(&options.paths, &options.working_directory) {
+        Ok(config) => config,
+        Err(SweepError::NotConfigured(_))
+            if environment::OSTROM_AVAILABLE_REPOSITORIES
+                .value_os()
+                .is_some()
+                || options.policy.as_ref().is_some_and(|policy| {
+                    policy
+                        .manifest
+                        .grants
+                        .values()
+                        .chain(policy.manifest.denies.values())
+                        .any(|rule| !rule.repositories.is_empty())
+                }) =>
+        {
+            load_config_or_defaults(&options.paths, &options.working_directory)?
+        }
+        Err(error) => return Err(error),
+    };
+    let available = available_repositories(
+        options.policy.as_ref().map(|policy| &policy.manifest),
+        &authored_config,
+    )
+    .map_err(|error| SweepError::Config(error.to_string()))?;
+    let config = project_available_mandates(&authored_config, &available);
     // Validate the complete selection before authentication, events, or generation writes.
     let acquisition_config = repositories
         .map(|repos| selected_config(&config, repos))
@@ -446,6 +846,7 @@ fn run_sweep_with_minter_and_publication_source(
             repositories,
         )?
     };
+    let acquired_through = crate::Clock::realtime().now();
     let configured_repositories = config
         .projects
         .iter()
@@ -482,6 +883,7 @@ fn run_sweep_with_minter_and_publication_source(
         &configured_repositories,
         &work_orders,
         options.started_at,
+        acquired_through,
     )?;
 
     let mut decision_requests = snapshots
@@ -489,6 +891,48 @@ fn run_sweep_with_minter_and_publication_source(
         .flat_map(human_decision_requests)
         .collect::<Vec<_>>();
     let mirror = snapshots.clone();
+    let mut generation_mirror = mirror.clone();
+    let mut generation_completed_at = options.started_at;
+    if !carried.is_empty() {
+        let previous_generation: SweepGeneration = old_state
+            .get("sweep_generation")
+            .cloned()
+            .ok_or_else(|| {
+                SweepError::State(
+                    "cannot carry forward sweep snapshot: run a full roster sweep first".to_owned(),
+                )
+            })
+            .and_then(|value| {
+                serde_json::from_value(value).map_err(|error| {
+                    SweepError::State(format!(
+                        "cannot carry forward sweep snapshot: invalid generation: {error}"
+                    ))
+                })
+            })?;
+        // This generation contains snapshots that were not acquired now. Its
+        // freshness is therefore bounded by the oldest generation it carries,
+        // even though its identity records the selected refresh performed now.
+        generation_completed_at = previous_generation.completed_at;
+        let previous_mirror = load_sweep_snapshot(&options.paths, &previous_generation)?;
+        generation_mirror.extend(
+            previous_mirror
+                .into_iter()
+                .filter(|snapshot| carried.contains(snapshot.repo.as_str())),
+        );
+        let mirrored = generation_mirror
+            .iter()
+            .map(|snapshot| snapshot.repo.as_str())
+            .collect::<BTreeSet<_>>();
+        if let Some(missing) = carried
+            .iter()
+            .find(|repository| !mirrored.contains(repository.as_str()))
+        {
+            return Err(SweepError::State(format!(
+                "cannot carry forward sweep snapshot for {missing}: run a full roster sweep first"
+            )));
+        }
+        generation_mirror.sort_by(|left, right| left.repo.as_str().cmp(right.repo.as_str()));
+    }
     let mut snapshots_by_repo = snapshots
         .into_iter()
         .map(|snapshot| (snapshot.repo.as_str().to_owned(), snapshot))
@@ -586,6 +1030,23 @@ fn run_sweep_with_minter_and_publication_source(
     }
 
     new_state["version"] = json!(2);
+    let generation = SweepGeneration {
+        id: sha256_hex(
+            format!(
+                "{}\0{}",
+                format_time(options.started_at),
+                configured_repositories
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\0")
+            )
+            .as_bytes(),
+        ),
+        completed_at: generation_completed_at,
+    };
+    new_state["sweep_generation"] =
+        serde_json::to_value(&generation).expect("sweep generation serializes");
     new_state["velocity"] = serde_json::to_value(velocity).expect("velocity ledger serializes");
     new_state["sweep_mode"] = json!(mode_name(mode));
     new_state["roster_coverage"] =
@@ -708,6 +1169,13 @@ fn run_sweep_with_minter_and_publication_source(
             .filter(|row| string_field(row.value(), &["state"]) == "pending")
             .filter_map(|row| queue_decision_request(row.value())),
     );
+    if let Some(before_commit) = before_commit {
+        before_commit();
+    }
+    // Refresh and verify the exact owner immediately before the generation's
+    // first durable write. A lapsed holder that resumes after another sweep
+    // took over must not interleave any part of the old generation.
+    lease.confirm_ownership()?;
     emit_decision_requests(&options.paths, options.started_at, &decision_requests)?;
     // Append before advancing state. A retry reads the facts already appended,
     // so a failed state write cannot duplicate a merge on the next sweep.
@@ -728,6 +1196,14 @@ fn run_sweep_with_minter_and_publication_source(
     }
     backup_previous_sweep(&options.paths)?;
     write_queue(&options.paths.queue_file(), &final_rows)?;
+    write_json_private(
+        &options.paths.sweep_snapshot_file(),
+        &serde_json::to_value(StoredSweepSnapshot {
+            generation: generation.clone(),
+            repositories: generation_mirror,
+        })
+        .expect("sweep snapshot serializes"),
+    )?;
     write_json_private(&state_path, &new_state)?;
     for item_id in dropped_closed {
         crate::append_trace(
@@ -787,9 +1263,87 @@ fn run_sweep_with_minter_and_publication_source(
             mode,
             faults,
             publication_failure,
+            generation,
         },
         mirror,
     ))
+}
+
+/// Read the identity of the newest generation whose state write completed.
+pub fn latest_successful_generation(
+    paths: &OstromPaths,
+) -> Result<Option<SweepGeneration>, SweepError> {
+    let path = paths.sweep_state_file();
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(SweepError::State(format!("{}: {error}", path.display()))),
+    };
+    let state: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| SweepError::State(format!("{}: {error}", path.display())))?;
+    state
+        .get("sweep_generation")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|error| SweepError::State(format!("{}: {error}", path.display())))
+}
+
+/// Mark the current sweep generation stale after a repository mutation.
+///
+/// Taking the sweep lease prevents a completed repair from racing a sweep's
+/// state write. The repair clears whichever generation is current after any
+/// in-flight sweep finishes, so the next pass must acquire a new snapshot.
+pub(crate) fn invalidate_sweep_generation(paths: &OstromPaths) -> Result<(), SweepError> {
+    let _lease = wait_for_sweep_lease(paths)?;
+    let path = paths.sweep_state_file();
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(SweepError::State(format!("{}: {error}", path.display()))),
+    };
+    let mut state: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| SweepError::State(format!("{}: {error}", path.display())))?;
+    let Some(object) = state.as_object_mut() else {
+        return Err(SweepError::State(format!(
+            "{}: state document is not an object",
+            path.display()
+        )));
+    };
+    if object.remove("sweep_generation").is_some() {
+        write_json_private(&path, &state)?;
+    }
+    Ok(())
+}
+
+#[must_use]
+pub fn generation_is_fresh(
+    generation: &SweepGeneration,
+    now: DateTime<Utc>,
+    max_age_seconds: u64,
+) -> bool {
+    let age = now.signed_duration_since(generation.completed_at);
+    age >= Duration::zero()
+        && age.num_seconds() < i64::try_from(max_age_seconds).unwrap_or(i64::MAX)
+}
+
+pub fn load_sweep_snapshot(
+    paths: &OstromPaths,
+    generation: &SweepGeneration,
+) -> Result<Vec<RepositorySnapshot>, SweepError> {
+    let path = paths.sweep_snapshot_file();
+    let bytes = fs::read(&path)
+        .map_err(|error| SweepError::State(format!("{}: {error}", path.display())))?;
+    let snapshot: StoredSweepSnapshot = serde_json::from_slice(&bytes)
+        .map_err(|error| SweepError::State(format!("{}: {error}", path.display())))?;
+    if snapshot.generation != *generation {
+        return Err(SweepError::State(format!(
+            "{} does not match successful generation {}",
+            path.display(),
+            generation.id
+        )));
+    }
+    Ok(snapshot.repositories)
 }
 
 pub fn acquire_org_from_github(
@@ -3131,6 +3685,9 @@ fn observe_velocity(
     configured: &BTreeSet<String>,
     orders: &[WorkOrderEvidence],
     observed_at: DateTime<Utc>,
+    // Acquisition completes after sweep start; bound merges here while observed_at
+    // keeps ledger day bucketing anchored to the start, even across UTC midnight.
+    acquired_through: DateTime<Utc>,
 ) -> Result<(VelocityLedger, Vec<MergeFact>), SweepError> {
     let mut ledger = VelocityLedger::from_state(state)
         .map_err(|error| SweepError::State(format!("velocity: {error}")))?;
@@ -3224,11 +3781,19 @@ fn observe_velocity(
                 merge: None,
             };
             if merged {
-                let merged_at = parse_time(string_field(pull, &["mergedAt"]))
-                    .filter(|merged_at| *merged_at >= opened_at && *merged_at <= observed_at)
-                    .ok_or_else(|| {
-                        SweepError::Acquisition(format!("velocity: {pr} has no valid mergedAt"))
-                    })?;
+                let merged_at = parse_time(string_field(pull, &["mergedAt"])).ok_or_else(|| {
+                    SweepError::Acquisition(format!("velocity: {pr} has no valid mergedAt"))
+                })?;
+                if merged_at < opened_at {
+                    return Err(SweepError::Acquisition(format!(
+                        "velocity: {pr} mergedAt {merged_at} is before the pull request was opened at {opened_at}"
+                    )));
+                }
+                if merged_at > acquired_through {
+                    return Err(SweepError::Acquisition(format!(
+                        "velocity: {pr} mergedAt {merged_at} is after acquisition completed at {acquired_through}"
+                    )));
+                }
                 let merger = &pull["mergedBy"];
                 // A malformed, non-null merger shape still refuses: unlike a
                 // deleted account, an unrecognizable shape carries no
@@ -3984,6 +4549,7 @@ fn backup_previous_sweep(paths: &OstromPaths) -> Result<(), SweepError> {
     for (source, name) in [
         (paths.queue_file(), "queue.jsonl"),
         (paths.sweep_state_file(), "state.json"),
+        (paths.sweep_snapshot_file(), "sweep-snapshot.json"),
     ] {
         if !source.exists() {
             continue;
@@ -4725,6 +5291,497 @@ mod tests {
     use umwelt_runtime::Source;
 
     use super::*;
+    use crate::{LeaseRecord, read_lease, write_lease};
+    use ostrom_core::{PublicationSnapshot, PublicationSourceFault};
+
+    struct TrackingPublicationSource {
+        called: Arc<AtomicBool>,
+    }
+
+    impl PublicationSource for TrackingPublicationSource {
+        fn snapshot(&self) -> Result<PublicationSnapshot, PublicationSourceFault> {
+            self.called.store(true, Ordering::Release);
+            Err(PublicationSourceFault::StateMissing(
+                "unexpected publication".to_owned(),
+            ))
+        }
+    }
+
+    fn test_sweep_lease_timing(now: &Arc<AtomicU64>) -> SweepLeaseTiming {
+        let now = Arc::clone(now);
+        SweepLeaseTiming {
+            ttl_seconds: 2,
+            renewal_interval: StdDuration::from_millis(5),
+            now: Arc::new(move || now.load(Ordering::Acquire)),
+        }
+    }
+
+    fn wait_for_lease_expiry_after(path: &Path, now: u64) {
+        let deadline = Instant::now() + StdDuration::from_millis(250);
+        loop {
+            if read_lease(path)
+                .expect("read renewing sweep lease")
+                .is_some_and(|lease| lease.expires_at > now)
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "sweep lease was not renewed after {now}"
+            );
+            thread::sleep(StdDuration::from_millis(1));
+        }
+    }
+
+    fn write_process_stat(
+        proc_root: &Path,
+        pid: u32,
+        state: char,
+        process_group_id: u32,
+        start_time: u64,
+    ) {
+        let directory = proc_root.join(pid.to_string());
+        fs::create_dir_all(&directory).expect("create process entry");
+        let self_directory = proc_root.join("self");
+        fs::create_dir_all(&self_directory).expect("create current process entry");
+        fs::write(
+            self_directory.join("stat"),
+            "process information available\n",
+        )
+        .expect("write current process marker");
+        let mut fields = vec!["0".to_owned(); 20];
+        fields[0] = state.to_string();
+        fields[2] = process_group_id.to_string();
+        fields[3] = process_group_id.to_string();
+        fields[19] = start_time.to_string();
+        fs::write(
+            directory.join("stat"),
+            format!("{pid} (fixture process) {}\n", fields.join(" ")),
+        )
+        .expect("write process stat");
+    }
+
+    #[test]
+    fn dead_and_recycled_sweep_holders_are_reclaimed_before_the_ttl() {
+        let current_pid = std::process::id();
+        let current_process_group = 17;
+        let current_start_time = 123;
+        for (case, pid, process_group_id, process_start_time) in [
+            ("dead", u32::MAX, 1, 1),
+            (
+                "recycled",
+                current_pid,
+                current_process_group,
+                current_start_time + 1,
+            ),
+        ] {
+            let root = tempdir().expect("stale sweep lease fixture");
+            let paths = OstromPaths {
+                config: root.path().to_path_buf(),
+                state: root.path().to_path_buf(),
+            };
+            let proc_root = root.path().join("proc");
+            write_process_stat(
+                &proc_root,
+                current_pid,
+                'S',
+                current_process_group,
+                current_start_time,
+            );
+            let now = Arc::new(AtomicU64::new(100));
+            let timing = test_sweep_lease_timing(&now);
+            write_lease(
+                &paths.state.join(SWEEP_LEASE_NAME),
+                &LeaseRecord {
+                    owner: format!("{case}-sweep"),
+                    started_at: now.load(Ordering::Acquire),
+                    expires_at: now.load(Ordering::Acquire) + timing.ttl_seconds,
+                    pid: Some(pid),
+                    process_group_id: Some(process_group_id),
+                    process_start_time: Some(process_start_time),
+                },
+            )
+            .expect("write stale sweep lease");
+
+            let lease = wait_for_sweep_lease_with_proc_root(
+                &paths,
+                &proc_root,
+                StdDuration::from_millis(100),
+                timing,
+            )
+            .unwrap_or_else(|error| panic!("{case} holder was not reclaimed: {error}"));
+            let replacement = read_lease(&paths.state.join(SWEEP_LEASE_NAME))
+                .expect("read replacement sweep lease")
+                .expect("replacement sweep lease");
+            assert_ne!(replacement.owner, format!("{case}-sweep"));
+            assert_eq!(replacement.pid, Some(current_pid));
+            assert_eq!(
+                replacement.process_start_time,
+                Some(current_start_time),
+                "{case} lease was not rebound to the current process"
+            );
+            drop(lease);
+        }
+    }
+
+    #[test]
+    fn a_live_sweep_holder_blocks_until_the_bounded_wait_expires() {
+        let root = tempdir().expect("live sweep lease fixture");
+        let paths = OstromPaths {
+            config: root.path().to_path_buf(),
+            state: root.path().to_path_buf(),
+        };
+        let proc_root = root.path().join("unavailable-proc");
+        let now = Arc::new(AtomicU64::new(100));
+        let timing = test_sweep_lease_timing(&now);
+        let held = acquire_sweep_lease_with_proc_root(&paths, &proc_root, timing.clone())
+            .expect("hold live sweep lease");
+
+        let error = wait_for_sweep_lease_with_proc_root(
+            &paths,
+            &proc_root,
+            StdDuration::from_millis(75),
+            timing,
+        )
+        .expect_err("live sweep holder must block");
+
+        assert!(matches!(error, SweepError::LeaseWaitTimedOut { .. }));
+        drop(held);
+    }
+
+    #[test]
+    fn procfs_unavailable_acquires_a_time_only_lease_and_renews_it_exclusively() {
+        let root = tempdir().expect("unreadable sweep identity fixture");
+        let paths = OstromPaths {
+            config: root.path().to_path_buf(),
+            state: root.path().to_path_buf(),
+        };
+        let lease_path = paths.state.join(SWEEP_LEASE_NAME);
+        let proc_root = root.path().join("unavailable-proc");
+        let now = Arc::new(AtomicU64::new(100));
+        let timing = test_sweep_lease_timing(&now);
+        let held = acquire_sweep_lease_with_proc_root(&paths, &proc_root, timing.clone())
+            .expect("procfs-unavailable acquisition must succeed");
+        let record = read_lease(&lease_path)
+            .expect("read sweep lease")
+            .expect("sweep lease");
+        assert_eq!(record.process_identity(), None);
+
+        now.store(101, Ordering::Release);
+        wait_for_lease_expiry_after(&lease_path, 102);
+        let error = acquire_sweep_lease_with_proc_root(&paths, &proc_root, timing)
+            .expect_err("renewed lease must remain exclusive");
+
+        assert!(matches!(error, SweepError::LeaseHeld));
+        drop(held);
+    }
+
+    #[test]
+    fn stopped_sweep_lease_renewal_is_reclaimable_after_the_short_ttl() {
+        let root = tempdir().expect("stopped sweep renewal fixture");
+        let paths = OstromPaths {
+            config: root.path().to_path_buf(),
+            state: root.path().to_path_buf(),
+        };
+        let lease_path = paths.state.join(SWEEP_LEASE_NAME);
+        let proc_root = root.path().join("unavailable-proc");
+        let now = Arc::new(AtomicU64::new(100));
+        let timing = test_sweep_lease_timing(&now);
+        let held = acquire_sweep_lease_with_proc_root(&paths, &proc_root, timing.clone())
+            .expect("acquire sweep lease");
+        let expires_at = read_lease(&lease_path)
+            .expect("read sweep lease")
+            .expect("sweep lease")
+            .expires_at;
+
+        held.abandon();
+        now.store(expires_at, Ordering::Release);
+        let replacement = acquire_sweep_lease_with_proc_root(&paths, &proc_root, timing)
+            .expect("stopped renewal must expire");
+
+        drop(replacement);
+    }
+
+    #[test]
+    fn a_renewing_sweep_holder_is_not_reclaimed_across_several_ttls() {
+        let root = tempdir().expect("renewing sweep lease fixture");
+        let paths = OstromPaths {
+            config: root.path().to_path_buf(),
+            state: root.path().to_path_buf(),
+        };
+        let lease_path = paths.state.join(SWEEP_LEASE_NAME);
+        let proc_root = root.path().join("proc");
+        write_process_stat(&proc_root, std::process::id(), 'S', 17, 123);
+        let now = Arc::new(AtomicU64::new(100));
+        let timing = test_sweep_lease_timing(&now);
+        let held = acquire_sweep_lease_with_proc_root(&paths, &proc_root, timing.clone())
+            .expect("acquire renewing sweep lease");
+
+        for _ in 0..3 {
+            let advanced = now.fetch_add(timing.ttl_seconds, Ordering::AcqRel) + timing.ttl_seconds;
+            wait_for_lease_expiry_after(&lease_path, advanced);
+            let error = acquire_sweep_lease_with_proc_root(&paths, &proc_root, timing.clone())
+                .expect_err("renewing holder must remain exclusive");
+            assert!(matches!(error, SweepError::LeaseHeld));
+        }
+
+        drop(held);
+    }
+
+    #[test]
+    fn stopped_renewal_expires_even_while_the_recorded_process_is_live() {
+        let root = tempdir().expect("live process with stopped renewal fixture");
+        let paths = OstromPaths {
+            config: root.path().to_path_buf(),
+            state: root.path().to_path_buf(),
+        };
+        let lease_path = paths.state.join(SWEEP_LEASE_NAME);
+        let proc_root = root.path().join("proc");
+        write_process_stat(&proc_root, std::process::id(), 'S', 17, 123);
+        let now = Arc::new(AtomicU64::new(100));
+        let timing = test_sweep_lease_timing(&now);
+        let held = acquire_sweep_lease_with_proc_root(&paths, &proc_root, timing.clone())
+            .expect("acquire process-bound sweep lease");
+        let expires_at = read_lease(&lease_path)
+            .expect("read process-bound sweep lease")
+            .expect("process-bound sweep lease")
+            .expires_at;
+
+        held.abandon();
+        now.store(expires_at, Ordering::Release);
+        let replacement = acquire_sweep_lease_with_proc_root(&paths, &proc_root, timing)
+            .expect("a live process without renewal must not hold an expired sweep lease");
+
+        drop(replacement);
+    }
+
+    #[test]
+    fn dropping_a_sweep_lease_stops_renewal_and_releases_it() {
+        let root = tempdir().expect("dropped sweep lease fixture");
+        let paths = OstromPaths {
+            config: root.path().to_path_buf(),
+            state: root.path().to_path_buf(),
+        };
+        let lease_path = paths.state.join(SWEEP_LEASE_NAME);
+        let proc_root = root.path().join("unavailable-proc");
+        let now = Arc::new(AtomicU64::new(100));
+        let timing = test_sweep_lease_timing(&now);
+        let held = acquire_sweep_lease_with_proc_root(&paths, &proc_root, timing.clone())
+            .expect("acquire sweep lease");
+
+        drop(held);
+        assert!(!lease_path.exists());
+        now.fetch_add(timing.ttl_seconds, Ordering::AcqRel);
+        thread::sleep(timing.renewal_interval * 3);
+        assert!(!lease_path.exists(), "renewal continued after drop");
+    }
+
+    #[test]
+    fn lost_sweep_lease_refuses_every_generation_write_and_publication() {
+        let root = tempdir().expect("lost sweep lease fixture");
+        let paths = repair_test_paths(root.path());
+        write_repair_test_config(root.path(), false);
+        let fixture_path = root.path().join("sweep-fixture.json");
+        fs::write(
+            &fixture_path,
+            serde_json::to_vec(&json!({
+                "repositories": [branch_write_snapshot(Vec::new(), Vec::new())]
+            }))
+            .expect("serialize sweep fixture"),
+        )
+        .expect("write sweep fixture");
+        let queue_before = b"".to_vec();
+        let state_before = b"{}\n".to_vec();
+        let snapshot_before = b"{\"sentinel\":\"previous snapshot\"}\n".to_vec();
+        fs::write(paths.queue_file(), &queue_before).expect("write prior queue");
+        fs::write(paths.sweep_state_file(), &state_before).expect("write prior state");
+        fs::write(paths.sweep_snapshot_file(), &snapshot_before).expect("write prior snapshot");
+        let options = SweepOptions {
+            paths: paths.clone(),
+            working_directory: root.path().to_path_buf(),
+            executable: root.path().join("unused-sweep-worker"),
+            plugin_root: root.path().to_path_buf(),
+            started_at: "2026-09-15T12:00:00Z".parse().expect("valid sweep time"),
+            requested_mode: SweepMode::Full,
+            fixture: Some(fixture_path),
+            publish: PublishTarget::Explicit(PublishDestination::explicit(
+                RepositoryName::new("placeholder-org/alpha")
+                    .expect("valid publication destination"),
+            )),
+            policy: None,
+        };
+        let published = Arc::new(AtomicBool::new(false));
+        let source = TrackingPublicationSource {
+            called: Arc::clone(&published),
+        };
+        let mut minter = GitHubInstallationTokenMinter;
+        let lease = acquire_sweep_lease(&paths).expect("acquire sweep lease");
+        let lease_path = paths.state.join(SWEEP_LEASE_NAME);
+        let take_lease = || {
+            let now = Clock::realtime().epoch_seconds();
+            write_lease(
+                &lease_path,
+                &LeaseRecord {
+                    owner: "replacement-sweep".to_owned(),
+                    started_at: now,
+                    expires_at: now + SWEEP_LEASE_TTL_SECONDS,
+                    pid: None,
+                    process_group_id: None,
+                    process_start_time: None,
+                },
+            )
+            .expect("replace sweep lease before commit");
+        };
+        let result = run_sweep_with_minter_and_publication_source(
+            &options,
+            &source,
+            &mut minter,
+            &lease,
+            None,
+            Some(&take_lease),
+        );
+        let error = finish_sweep(lease, result).expect_err("lost lease must fail the sweep");
+
+        assert!(matches!(error, SweepError::LeaseLost { .. }));
+        assert!(error.to_string().starts_with("sweep-lease-lost:"));
+        assert_eq!(
+            fs::read(paths.queue_file()).expect("read queue"),
+            queue_before
+        );
+        assert_eq!(
+            fs::read(paths.sweep_state_file()).expect("read state"),
+            state_before
+        );
+        assert_eq!(
+            fs::read(paths.sweep_snapshot_file()).expect("read snapshot"),
+            snapshot_before
+        );
+        assert!(!paths.previous_sweep_dir().exists());
+        assert!(!published.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_pull_request_merging_mid_sweep_does_not_refuse_the_sweep() {
+        let root = tempdir().unwrap();
+        write_repair_test_config(root.path(), false);
+        let started_at = "2026-08-03T23:59:00Z".parse().unwrap();
+        let mut snapshot = branch_write_snapshot(vec![], vec![]);
+        snapshot.merged_prs = vec![json!({
+            "number": 566,
+            "author": {"login": "placeholder-author", "__typename": "User"},
+            "createdAt": "2026-08-03T23:58:00Z",
+            "mergedAt": "2026-08-04T00:00:00Z"
+        })];
+        let fixture_path = root.path().join("sweep-fixture.json");
+        fs::write(
+            &fixture_path,
+            serde_json::to_vec(&json!({"repositories": [snapshot]})).unwrap(),
+        )
+        .unwrap();
+        run_sweep(&SweepOptions {
+            working_directory: root.path().to_path_buf(),
+            executable: root.path().join("unused-ostrom"),
+            plugin_root: root.path().to_path_buf(),
+            paths: repair_test_paths(root.path()),
+            started_at,
+            requested_mode: SweepMode::Full,
+            fixture: Some(fixture_path),
+            publish: PublishTarget::Disabled,
+            policy: None,
+        })
+        .expect("a merge after sweep start but before acquisition completion is valid");
+        let state = read_state(&root.path().join("state.json")).unwrap();
+        let ledger = VelocityLedger::from_state(&state).unwrap();
+        assert_eq!(
+            ledger.observed_days,
+            BTreeMap::from([(
+                started_at.date_naive(),
+                BTreeSet::from([REPAIR_TEST_REPO.to_owned()])
+            )])
+        );
+        assert!(ledger.pulls["placeholder-org/alpha#566"].merge.is_some());
+    }
+
+    #[test]
+    fn velocity_merge_window_preserves_start_day_and_refuses_invalid_timestamps() {
+        let root = tempdir().unwrap();
+        let paths = repair_test_paths(root.path());
+        let started_at = "2026-08-03T23:59:00Z".parse::<DateTime<Utc>>().unwrap();
+        let acquired_through = "2026-08-04T00:01:00Z".parse::<DateTime<Utc>>().unwrap();
+        let opened_at = "2026-08-03T23:58:00Z".parse::<DateTime<Utc>>().unwrap();
+        let observe = |merged_at: Option<&str>| {
+            let mut snapshot = branch_write_snapshot(vec![], vec![]);
+            let mut pull = json!({
+                "number": 566,
+                "author": {"login": "placeholder-author", "__typename": "User"},
+                "createdAt": opened_at,
+            });
+            if let Some(merged_at) = merged_at {
+                pull["mergedAt"] = json!(merged_at);
+            }
+            snapshot.merged_prs.push(pull);
+            observe_velocity(
+                &paths,
+                &json!({}),
+                &[snapshot],
+                &BTreeSet::from([REPAIR_TEST_REPO.to_owned()]),
+                &[],
+                started_at,
+                acquired_through,
+            )
+        };
+
+        // Both endpoints are inclusive; a mid-acquisition merge across midnight
+        // belongs to the observation's start day, not the completion day.
+        for timestamp in [
+            "2026-08-03T23:58:00Z",
+            "2026-08-04T00:00:00Z",
+            "2026-08-04T00:01:00Z",
+        ] {
+            let (ledger, facts) = observe(Some(timestamp)).unwrap();
+            assert_eq!(facts.len(), 1);
+            assert_eq!(
+                facts[0].merged_at,
+                timestamp.parse::<DateTime<Utc>>().unwrap()
+            );
+            assert_eq!(
+                ledger.observed_days,
+                BTreeMap::from([(
+                    started_at.date_naive(),
+                    BTreeSet::from([REPAIR_TEST_REPO.to_owned()])
+                )])
+            );
+        }
+
+        for (timestamp, expected) in [
+            (
+                "2026-08-03T23:57:00Z",
+                format!(
+                    "velocity: placeholder-org/alpha#566 mergedAt 2026-08-03 23:57:00 UTC is before the pull request was opened at {opened_at}"
+                ),
+            ),
+            (
+                "2026-08-04T00:02:00Z",
+                format!(
+                    "velocity: placeholder-org/alpha#566 mergedAt 2026-08-04 00:02:00 UTC is after acquisition completed at {acquired_through}"
+                ),
+            ),
+        ] {
+            let error = observe(Some(timestamp)).unwrap_err();
+            assert!(
+                matches!(error, SweepError::Acquisition(ref message) if message == &expected),
+                "{error}"
+            );
+        }
+        for timestamp in [None, Some("not-a-timestamp")] {
+            let error = observe(timestamp).unwrap_err();
+            assert!(
+                matches!(error, SweepError::Acquisition(ref message)
+                if message == "velocity: placeholder-org/alpha#566 has no valid mergedAt"),
+                "{error}"
+            );
+        }
+    }
 
     #[test]
     fn merge_history_refuses_malformed_and_conflicting_facts() {
@@ -4755,6 +5812,7 @@ mod tests {
                 &[],
                 &BTreeSet::new(),
                 &[],
+                "2026-08-04T00:00:00Z".parse().unwrap(),
                 "2026-08-04T00:00:00Z".parse().unwrap(),
             )
             .unwrap_err();
@@ -5440,6 +6498,7 @@ mod tests {
             working_directory: home.path().to_path_buf(),
             paths: paths.clone(),
             action: SelectAction::List,
+            repositories: None,
             clock: Clock::fixed(
                 "2026-08-21T01:00:30Z"
                     .parse()
@@ -5461,6 +6520,7 @@ mod tests {
                 owner: "builder-placeholder-wake1".to_owned(),
                 attempted: BTreeSet::new(),
             },
+            repositories: None,
             clock: Clock::fixed(
                 "2026-08-21T01:01:00Z"
                     .parse()

@@ -112,6 +112,7 @@ pub fn answer_queue_decision(
             model: None,
             schedule: None,
             repository: None,
+            repositories: None,
             work_order: None,
             ceilings: None,
         },

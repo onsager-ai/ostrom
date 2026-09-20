@@ -24,6 +24,13 @@ use crate::{
 };
 
 const SHIPPED_DEFAULTS: &str = include_str!("../assets/gate.defaults.yaml");
+/// Complete repository-read authority required by [`run_gate`]'s live
+/// acquisition. `gh pr view` needs metadata and pull-request reads, plus issue
+/// reads for `closingIssuesReferences`; [`acquire_checks`] reads check runs and
+/// commit statuses; [`acquire_paths`] and [`acquire_diff_content`] read diff
+/// contents; and [`acquire_threads`] reads pull-request review threads.
+pub const GATE_READ_PERMISSIONS: &str =
+    "metadata:read,issues:read,pull_requests:read,checks:read,statuses:read,contents:read";
 const REVIEW_QUERY: &str = "query($owner:String!, $repo:String!, $number:Int!, $cursor:String) {\n  repository(owner:$owner, name:$repo) {\n    pullRequest(number:$number) {\n      author { login }\n      reviewThreads(first:100, after:$cursor) {\n        nodes {\n          id\n          isResolved\n          resolvedBy { login }\n          comments(last:1) { nodes { author { login } } }\n        }\n        pageInfo { hasNextPage endCursor }\n      }\n    }\n  }\n}";
 
 #[derive(Debug, Clone)]
@@ -31,6 +38,8 @@ pub struct GateOptions {
     pub paths: OstromPaths,
     pub working_directory: PathBuf,
     pub target: String,
+    /// `Some(empty)` refuses every target before acquisition.
+    pub repositories: Option<BTreeSet<String>>,
     pub timestamp: String,
 }
 
@@ -45,6 +54,8 @@ pub struct GateOutput {
 pub enum GateError {
     #[error("usage: ostrom gate <owner/repo#number>")]
     InvalidTarget,
+    #[error("mandate gate: repository-outside-effective-set: {0}")]
+    RepositoryOutsideEffectiveSet(String),
     #[error("mandate gate: could not serialize verdict")]
     Serialize,
     #[error("mandate gate: could not raise decision: {0}")]
@@ -56,6 +67,7 @@ impl GateError {
     pub const fn exit_code(&self) -> i32 {
         match self {
             Self::InvalidTarget => 64,
+            Self::RepositoryOutsideEffectiveSet(_) => 3,
             Self::Serialize => 2,
             Self::Decision(_) => 3,
         }
@@ -115,6 +127,15 @@ impl JudgmentState {
 
 pub fn run_gate(options: &GateOptions) -> Result<GateOutput, GateError> {
     let target = parse_target(&options.target)?;
+    if options
+        .repositories
+        .as_ref()
+        .is_some_and(|repositories| !repositories.contains(target.repo))
+    {
+        return Err(GateError::RepositoryOutsideEffectiveSet(
+            target.repo.to_owned(),
+        ));
+    }
     let (config, config_error, config_source) =
         load_gate_config_for_repo(&options.paths, &options.working_directory, target.repo);
 
@@ -1892,6 +1913,61 @@ mod tests {
     }
 
     #[test]
+    fn every_shipped_prompt_gate_invocation_uses_the_declared_read_scope() {
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/prompts");
+        let mut prompts = fs::read_dir(&directory)
+            .expect("read shipped prompt directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "md"))
+            .collect::<Vec<_>>();
+        prompts.sort();
+        let mut checked = Vec::new();
+        for path in prompts {
+            let prompt = fs::read_to_string(&path).expect("read shipped prompt");
+            for block in prompt
+                .split("```sh")
+                .skip(1)
+                .filter_map(|tail| tail.split_once("```").map(|(block, _remainder)| block))
+            {
+                let invokes_credential = block
+                    .lines()
+                    .any(|line| line.trim().starts_with("ostrom credential "));
+                let invokes_gate = block.lines().any(|line| {
+                    let line = line.trim();
+                    line.starts_with("ostrom gate ") || line.contains("-- ostrom gate ")
+                });
+                if !invokes_credential || !invokes_gate {
+                    continue;
+                }
+                let permissions = block
+                    .lines()
+                    .find_map(|line| {
+                        line.trim()
+                            .strip_prefix("--permissions ")
+                            .and_then(|value| value.split_whitespace().next())
+                    })
+                    .unwrap_or_else(|| {
+                        panic!("{} gate invocation has no read scope", path.display())
+                    });
+                assert_eq!(
+                    permissions,
+                    GATE_READ_PERMISSIONS,
+                    "{} gate invocation drifted",
+                    path.display()
+                );
+                checked.push(
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .expect("UTF-8 prompt name")
+                        .to_owned(),
+                );
+            }
+        }
+        assert_eq!(checked, ["gatekeep.md", "merge.md"]);
+    }
+
+    #[test]
     fn gate_config_preserves_shipped_user_repo_layering() {
         let fixture = tempfile::tempdir().expect("temporary gate config fixture");
         let paths = OstromPaths {
@@ -2021,6 +2097,27 @@ projects:
     }
 
     #[test]
+    fn gate_refuses_a_target_outside_the_effective_repository_set_before_acquisition() {
+        let root = tempfile::tempdir().expect("gate scope fixture");
+        let error = run_gate(&GateOptions {
+            paths: OstromPaths {
+                config: root.path().to_path_buf(),
+                state: root.path().to_path_buf(),
+            },
+            working_directory: root.path().to_path_buf(),
+            target: "placeholder-org/outside#7".to_owned(),
+            repositories: Some(BTreeSet::from(["placeholder-org/inside".to_owned()])),
+            timestamp: "2030-01-02T03:04:05Z".to_owned(),
+        })
+        .expect_err("out-of-scope gate is refused");
+        assert!(matches!(
+            error,
+            GateError::RepositoryOutsideEffectiveSet(repository)
+                if repository == "placeholder-org/outside"
+        ));
+    }
+
+    #[test]
     fn malformed_judgment_history_is_cannot_tell() {
         let fixture = tempfile::tempdir().expect("temporary judgment fixture");
         let path = fixture.path().join("gate.jsonl");
@@ -2103,6 +2200,7 @@ projects:
             },
             working_directory: root.path().to_path_buf(),
             target: "placeholder-org/alpha#7".to_owned(),
+            repositories: None,
             timestamp: "2030-01-02T03:04:05Z".to_owned(),
         };
         (root, options)

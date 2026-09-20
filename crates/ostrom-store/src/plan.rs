@@ -19,10 +19,10 @@ use serde_json::Value;
 use tempfile::tempdir;
 use thiserror::Error;
 
-use crate::sweep::run_sweep_with_mirror;
 use crate::{
     JsonlCheckStore, QueueDocument, RepositorySnapshot, StoreError, SweepError, SweepOptions,
-    io_error, read_queue, set_private_file_mode,
+    generation_is_fresh, io_error, latest_successful_generation, load_sweep_snapshot, read_queue,
+    run_sweep_with_mirror, set_private_file_mode,
 };
 
 const ASSESSMENTS_PER_PLAN: usize = 20;
@@ -394,6 +394,8 @@ pub struct PlanSweep {
     pub projects: usize,
     pub queue_changes: usize,
     pub mode: String,
+    pub swept: bool,
+    pub generation_id: String,
     pub check_runs: usize,
 }
 
@@ -461,7 +463,49 @@ pub fn run_plan(
         &options.sweep.paths.config,
         &options.sweep.working_directory,
     )?;
-    let (outcome, mirror) = run_sweep_with_mirror(&options.sweep)?;
+    let sweep_policy = options
+        .sweep
+        .policy
+        .as_ref()
+        .and_then(|policy| policy.manifest.sweep.clone())
+        .unwrap_or_default();
+    let reusable = latest_successful_generation(&options.sweep.paths)?
+        .filter(|generation| {
+            generation_is_fresh(
+                generation,
+                options.sweep.started_at,
+                sweep_policy.max_age_seconds(),
+            )
+        })
+        .and_then(|generation| {
+            load_sweep_snapshot(&options.sweep.paths, &generation)
+                .ok()
+                .map(|snapshot| (generation, snapshot))
+        });
+    let (mirror, projects, queue_changes, mode, swept, generation_id, sweep_faults) =
+        if let Some((generation, mirror)) = reusable {
+            let projects = mirror.len();
+            (
+                mirror,
+                projects,
+                0,
+                "reused".to_owned(),
+                false,
+                generation.id,
+                Vec::new(),
+            )
+        } else {
+            let (outcome, mirror) = run_sweep_with_mirror(&options.sweep)?;
+            (
+                mirror,
+                outcome.project_count,
+                outcome.queue_changes,
+                format!("{:?}", outcome.mode).to_lowercase(),
+                true,
+                outcome.generation.id,
+                outcome.faults,
+            )
+        };
     let mut milestone_input = load_milestones(&mirror);
     let (check_runs, check_mirror_fault) =
         match JsonlCheckStore::new(&options.sweep.paths).snapshot() {
@@ -523,8 +567,7 @@ pub fn run_plan(
     let principal = read_work_ranking(&options.sweep.paths.state.join("state.json"))?;
     let ledger_path = options.sweep.paths.state.join("plan-acknowledgements.json");
     let mut ledger = read_ledger(&ledger_path)?;
-    let mut faults = outcome
-        .faults
+    let mut faults = sweep_faults
         .iter()
         .map(|detail| PlanFault {
             stage: "mirror".to_owned(),
@@ -687,9 +730,11 @@ pub fn run_plan(
         plan_version: PLAN_VERSION,
         generated_at: options.sweep.started_at,
         sweep: PlanSweep {
-            projects: outcome.project_count,
-            queue_changes: outcome.queue_changes,
-            mode: format!("{:?}", outcome.mode).to_lowercase(),
+            projects,
+            queue_changes,
+            mode,
+            swept,
+            generation_id,
             check_runs: check_runs.len(),
         },
         goals: plans,
@@ -706,17 +751,32 @@ pub fn run_plan(
     Ok(document)
 }
 
-fn load_goals(config_root: &Path, cwd: &Path) -> Result<GoalsDocument, PlanError> {
-    let user = config_root.join("goals.yaml");
+/// Locate an operator-authored goals document by the one precedence rule
+/// both `run_plan` and `ostrom goals validate` must agree on: a
+/// per-repository override at `.ostrom/goals.yaml` under `cwd` wins over the
+/// operator's shared `goals.yaml` in the Ostrom config root. `None` means
+/// neither location holds a file; callers decide what that means for them.
+///
+/// `cwd` must be the working directory the pass will actually run in, or two
+/// callers resolve different repository overrides and the sharing this
+/// function exists for stops holding. `run_plan` passes
+/// `options.sweep.working_directory`; `ostrom goals validate` passes
+/// `env::current_dir()`. Those agree only because every `working_directory`
+/// in the CLI is itself built from `env::current_dir()` — an invariant of the
+/// callers, not of this function, so a future caller that computes one
+/// differently must pass the directory the pass will use, not its own.
+#[must_use]
+pub fn discover_goals_path(config_root: &Path, cwd: &Path) -> Option<PathBuf> {
     let repository = cwd.join(".ostrom/goals.yaml");
-    let path = if repository.exists() {
-        Some(repository)
-    } else if user.exists() {
-        Some(user)
-    } else {
-        None
-    };
-    let Some(path) = path else {
+    if repository.exists() {
+        return Some(repository);
+    }
+    let user = config_root.join("goals.yaml");
+    if user.exists() { Some(user) } else { None }
+}
+
+fn load_goals(config_root: &Path, cwd: &Path) -> Result<GoalsDocument, PlanError> {
+    let Some(path) = discover_goals_path(config_root, cwd) else {
         return Ok(GoalsDocument {
             goals_version: 1,
             goals: Vec::new(),
@@ -1064,11 +1124,18 @@ mod tests {
         };
         let plan = run_plan(&options, &mut UnavailableAssessmentDeriver).expect("run plan");
         assert_eq!(plan.sweep.check_runs, 1);
+        assert!(plan.sweep.swept);
+        let generation_id = plan.sweep.generation_id.clone();
         assert!(plan.goals[0].facts.met);
         assert_eq!(
             plan.goals[0].facts.met_when_status[0].state,
             ostrom_core::CheckState::Passing
         );
         assert!(plan.goals[0].assessment.is_none());
+
+        let reused = run_plan(&options, &mut UnavailableAssessmentDeriver)
+            .expect("reuse the fresh sweep generation");
+        assert!(!reused.sweep.swept);
+        assert_eq!(reused.sweep.generation_id, generation_id);
     }
 }

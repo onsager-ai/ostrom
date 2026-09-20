@@ -11,7 +11,7 @@ use chrono::DateTime;
 use ostrom_core::WorkOrder;
 use thiserror::Error;
 
-use crate::{Clock, environment, read_trace};
+use crate::{Clock, environment, read_trace, reap::remove_implementer_log};
 
 pub const DEFAULT_WORKTREE_RETENTION_DAYS: u64 = 7;
 pub const DEFAULT_WORKTREE_CEILING_BYTES: u64 = 20 * 1024 * 1024 * 1024;
@@ -45,6 +45,7 @@ pub enum WorktreeError {
 pub enum WorktreeRemovalReason {
     Closed,
     Orphan,
+    ImplementerLogRemovalFailed,
 }
 
 impl WorktreeRemovalReason {
@@ -52,6 +53,7 @@ impl WorktreeRemovalReason {
         match self {
             Self::Closed => "closed",
             Self::Orphan => "orphan",
+            Self::ImplementerLogRemovalFailed => "implementer-log-removal-failed",
         }
     }
 }
@@ -64,6 +66,14 @@ pub struct WorktreeRemoval {
 
 impl std::fmt::Display for WorktreeRemoval {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.reason == WorktreeRemovalReason::ImplementerLogRemovalFailed {
+            return write!(
+                formatter,
+                "removed implementer worktree {}; {}",
+                self.path.display(),
+                self.reason.as_str()
+            );
+        }
         write!(
             formatter,
             "removed {} implementer worktree {}",
@@ -161,10 +171,11 @@ pub fn sweep_worktrees(
         confined_existing_path(&root, &path)?;
         if !git_registry_contains(&path)? {
             remove_confined(&root, &path)?;
-            removals.push(WorktreeRemoval {
+            removals.push(record_worktree_removal(
+                state_root,
                 path,
-                reason: WorktreeRemovalReason::Orphan,
-            });
+                WorktreeRemovalReason::Orphan,
+            ));
             continue;
         }
         let Some(hash) = path.file_name().and_then(|name| name.to_str()) else {
@@ -177,12 +188,33 @@ pub fn sweep_worktrees(
             continue;
         }
         remove_registered_worktree(&root, &path)?;
-        removals.push(WorktreeRemoval {
+        removals.push(record_worktree_removal(
+            state_root,
             path,
-            reason: WorktreeRemovalReason::Closed,
-        });
+            WorktreeRemovalReason::Closed,
+        ));
     }
     Ok(WorktreeSweep { removals })
+}
+
+fn record_worktree_removal(
+    state_root: &Path,
+    path: PathBuf,
+    reason: WorktreeRemovalReason,
+) -> WorktreeRemoval {
+    let log_removal_failed = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|item_hash| remove_implementer_log(state_root, item_hash).err())
+        .is_some();
+    WorktreeRemoval {
+        path,
+        reason: if log_removal_failed {
+            WorktreeRemovalReason::ImplementerLogRemovalFailed
+        } else {
+            reason
+        },
+    }
 }
 
 pub fn worktree_footprint(root: &Path) -> Result<WorktreeFootprint, WorktreeError> {
@@ -534,11 +566,16 @@ mod tests {
     fn an_old_open_order_is_never_reaped() {
         let fixture = Fixture::new();
         fixture.write_trace(&[dispatch()]);
+        let log = fixture
+            .state
+            .join(format!("implementer-item-{}.log", item_hash(ITEM_ID)));
+        fs::write(&log, "retained diagnosis\n").expect("write retained log");
 
         let sweep = sweep_worktrees(&fixture.state, &clock(), 1).expect("sweep open order");
 
         assert!(sweep.removals.is_empty());
         assert!(fixture.worktree.is_dir());
+        assert!(log.is_file(), "retained worktree lost its implementer log");
         assert!(
             registered_under(&fixture.source, &worktree_root(&fixture.state))
                 .contains(&fixture.worktree)
@@ -549,12 +586,20 @@ mod tests {
     fn a_closed_order_is_removed_through_git_after_retention() {
         let fixture = Fixture::new();
         fixture.write_trace(&[dispatch(), terminal()]);
+        let log = fixture
+            .state
+            .join(format!("implementer-item-{}.log", item_hash(ITEM_ID)));
+        fs::write(&log, "expired diagnosis\n").expect("write expired log");
 
         let sweep = sweep_worktrees(&fixture.state, &clock(), 7).expect("sweep closed order");
 
         assert_eq!(sweep.removals.len(), 1);
         assert_eq!(sweep.removals[0].reason, WorktreeRemovalReason::Closed);
         assert!(!fixture.worktree.exists());
+        assert!(
+            !log.exists(),
+            "expired worktree retained its implementer log"
+        );
         assert!(registered_under(&fixture.source, &worktree_root(&fixture.state)).is_empty());
     }
 
@@ -562,9 +607,14 @@ mod tests {
     fn orphan_reconciliation_is_reported_agrees_with_git_and_is_idempotent() {
         let fixture = Fixture::new();
         fixture.write_trace(&[dispatch()]);
-        let orphan = worktree_root(&fixture.state).join("orphan-placeholder");
+        let orphan_hash = item_hash("placeholder-org/alpha#99");
+        let orphan = worktree_root(&fixture.state).join(&orphan_hash);
+        let log = fixture
+            .state
+            .join(format!("implementer-item-{orphan_hash}.log"));
         fs::create_dir(&orphan).expect("create orphan");
         fs::write(orphan.join("artifact"), "placeholder").expect("write orphan artifact");
+        fs::write(&log, "orphan diagnosis\n").expect("write orphan log");
 
         let first = sweep_worktrees(&fixture.state, &clock(), 7).expect("first sweep");
 
@@ -574,6 +624,10 @@ mod tests {
         assert!(rendered.contains("removed orphan implementer worktree"));
         assert!(rendered.contains(orphan.to_str().expect("UTF-8 orphan path")));
         assert!(!orphan.exists());
+        assert!(
+            !log.exists(),
+            "orphan worktree retained its implementer log"
+        );
         assert_eq!(
             directories_under(&worktree_root(&fixture.state)),
             registered_under(&fixture.source, &worktree_root(&fixture.state))
@@ -581,6 +635,35 @@ mod tests {
 
         let second = sweep_worktrees(&fixture.state, &clock(), 7).expect("second sweep");
         assert!(second.removals.is_empty());
+    }
+
+    #[test]
+    fn an_implementer_log_removal_failure_is_a_reason_not_a_sweep_failure() {
+        let fixture = Fixture::new();
+        fixture.write_trace(&[dispatch()]);
+        let orphan_hash = item_hash("placeholder-org/alpha#99");
+        let orphan = worktree_root(&fixture.state).join(&orphan_hash);
+        let log = fixture
+            .state
+            .join(format!("implementer-item-{orphan_hash}.log"));
+        fs::create_dir(&orphan).expect("create orphan");
+        fs::create_dir(&log).expect("make log removal fail");
+
+        let sweep = sweep_worktrees(&fixture.state, &clock(), 7)
+            .expect("log failure must not fail worktree sweep");
+
+        assert_eq!(sweep.removals.len(), 1);
+        assert_eq!(
+            sweep.removals[0].reason,
+            WorktreeRemovalReason::ImplementerLogRemovalFailed
+        );
+        assert!(
+            sweep.removals[0]
+                .to_string()
+                .contains("implementer-log-removal-failed")
+        );
+        assert!(!orphan.exists());
+        assert!(log.is_dir());
     }
 
     #[test]

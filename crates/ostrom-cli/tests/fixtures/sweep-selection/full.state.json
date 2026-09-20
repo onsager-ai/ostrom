@@ -110,6 +110,10 @@
       "unexplained_write_count": 0
     }
   },
+  "sweep_generation": {
+    "id": "ea26c9fc391776add6283066742657936408f8621dc0ad6adebeabda779c4cee",
+    "completed_at": "2026-08-02T00:00:00Z"
+  },
   "velocity": {
     "observed_days": {
       "2026-08-02": [

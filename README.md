@@ -76,14 +76,19 @@ OSTROM_HOME=/path/to/ostrom-state cargo run -p ostrom-cli -- plan
 
 `ostrom sweep` authenticates once per distinct roster organization, performs
 bounded issue, open-PR, recent-merge, and default-branch CI reads, and writes
-the private queue and incremental state. Publishing is disabled unless an
+the private queue and incremental state. Its full roster is the comma-separated
+`owner/name` set in `OSTROM_AVAILABLE_REPOSITORIES`. When that input is absent,
+the compatibility roster is the union of repositories named by grants, denies,
+and mandate projects. An available repository without an authored mandate
+project receives the active, unclassified default project. Publishing is disabled unless an
 explicit typed destination is supplied with `--publish-repository owner/repo`;
 a scratch `OSTROM_HOME` can therefore never inherit the production hub target.
 The checked-in Bash sweep remains the live fallback and is not invoked by the
 Rust sweep.
 
-`ostrom plan` refreshes stale and never-run authored mechanical criteria, runs
-the same sweep, then strictly reads `goals.yaml`, mirrors durable check
+`ostrom plan` refreshes stale and never-run authored mechanical criteria, reuses
+a successful sweep generation younger than `sweep.max_age` or refreshes it,
+then strictly reads `goals.yaml`, mirrors durable check
 receipts, derives goal facts, and writes private `plan.json` plus its
 acknowledgement ledger. A goal is not semantically assessed while any cited
 criterion remains stale or never run; a recorded failing verdict remains a
@@ -95,6 +100,36 @@ configured, the existing `assessment_unavailable` fault and mechanical
 authorization-preserving ranking are unchanged. The builder selector consumes
 a plan only when its queue basis and principal `work_ranking` still match,
 otherwise it visibly falls back to the existing ordering.
+
+`ostrom goals validate [<path>]` parses and validates a goals document
+without running a pass. Given a path, it validates exactly that file.
+Omitted, it uses the same discovery `ostrom plan` uses: a repository
+override at `.ostrom/goals.yaml` under the working directory, else the
+operator's `goals.yaml` in the Ostrom config root. Unlike `ostrom plan`,
+which tolerates no goals document as a legitimate empty plan, the validate
+command treats finding nothing as a refusal — an operator asking whether
+their goals document is valid must not get exit 0 when there is no document
+to check. On success it prints `valid: <path>` to stdout and exits 0;
+on failure it prints the problem to stderr and exits with one of:
+
+| status | meaning |
+|---|---|
+| 66 | `EX_NOINPUT`: the goals document could not be read: missing, not a file, unreadable, or (with no path argument) not found at either discovery location |
+| 3 | the document is not parseable YAML |
+| 4 | `goals_version` is unsupported |
+| 5 | the document parses but is semantically invalid (empty field, duplicate goal or check, unknown goal reference, empty action note) |
+
+No two refusals that call for different action share a status. Exit 2 is absent
+from that table because it is not a refusal about the document: a usage error
+exits 2 from argument parsing, before the command runs. That is why the
+unreadable class is `EX_NOINPUT` rather than 2.
+
+The remaining codes stay low because nothing claims them *within this command*.
+Other commands do return 3, 4 and 5 for refusals of their own, which is harmless:
+an exit status is read against the command that produced it. Exit 2 is the
+exception, and for more than argument parsing: it is claimed before any command
+runs, and several commands also exit 2 for failures of their own. It is the most
+overloaded status in the binary, which is why a refusal here must not add to it.
 
 Every named harness may conclude only `on-track`, `at-risk`, `off-track`, or
 `blocked` for the supplied goal. Claude returns its structured-output envelope,
@@ -238,8 +273,9 @@ project suppresses routine work but never reserved refs, tripwires, or failing
 CI. The first sweep baselines existing work, and selector changes re-baseline
 scope rather than flooding the queue.
 
-Run the sweep hourly outside Claude Code. Without an explicit
-`--publish-repository`, it writes only private queue and state. Incremental runs ask the
+Passes refresh the sweep on demand before starting an agent session. Manual
+sweeps remain available; without an explicit `--publish-repository`, they write
+only private queue and state. Incremental runs ask the
 issues REST change feed only for updates after the stored cursor and reuse each
 repository's ETag, so a quiet repository receives a rate-limit-free `304`.
 Open pull requests are still listed in full because check-rollup and changed-file
@@ -269,13 +305,13 @@ sweep:
   detect_every: 5m
 ```
 
-Those are the defaults for an authored `sweep: {}` section. Durations use a
+Those defaults also apply when `sweep` is absent. Durations use a
 positive integer followed by `s`, `m`, `h`, `d`, or `w`, exactly as check
-freshness durations do. These values describe cadence for callers, not a
-scheduler this crate starts. Nothing reads `detect_every` yet: it is the cadence
+freshness durations do. `ostrom pass` and `ostrom plan` enforce `max_age`
+against the latest successful generation. Nothing reads `detect_every` yet: it is the cadence
 for the change detection tracked in ostrom #531, which ships no flag here.
-`init` omits the section. Authored sweep loops and the `sweep` loop preset
-remain available for a local schedule.
+`init` omits the section. The sweep preset retains its actor, manual operation,
+and grant but declares no loop, so `ostrom up` does not schedule a sweep.
 
 The SessionStart hook never calls `gh`; it renders the durable files written by
 the scheduled sweep and performs only the local portion of the drift scan. It
@@ -349,6 +385,27 @@ for the wire format, ordering, and supervisor-owned authorisation.
 
 The lease and trace are machine-local runtime state. Like the real roster,
 queue, and read cursors, they never belong in this repository.
+
+### Exit status
+
+`ostrom pass <role>` exits with a status a scheduler can act on before reading
+any record:
+
+| status | meaning |
+|---|---|
+| 0 | the pass completed, found nothing to do, or another pass holds the lease |
+| 1 | an ostrom-side failure, or the agent exited 0 while the pass recorded a failure (#561) |
+| 69 | `EX_UNAVAILABLE`: a bridged pass refused to launch because Claude Code is below the minimum the permission bridge needs, or its version could not be read (#587); upgrade Claude Code |
+| 75 | `EX_TEMPFAIL`: held at the daily spend cap; the same invocation succeeds once the ceiling resets or is raised |
+| 78 | `EX_CONFIG`: the pass is disarmed |
+| 129, 130, 143 | ended by `SIGHUP`, `SIGINT` (including an interrupt on the control descriptor), or `SIGTERM` |
+| any other non-zero | the agent process's own exit status, passed through |
+
+No two refusals that call for different action share a status, so a consumer
+that reads only the exit status can still act correctly. A lease held by
+another pass exits 0 on purpose: that invocation has nothing to do, and
+nothing is wrong. The `pass-ended` fact and `run.finished` carry the outcome
+and reason.
 
 ### Answering a decision
 
@@ -490,7 +547,8 @@ in the operator manifest are expected and produce no finding.
 currently resolved, signed operator policy into a portable repository manifest.
 Omitting `--output` (or using `--output -`) writes YAML to stdout. The
 projection keeps applicable grants, denies, checks, selectors, operations, and
-repository-targeted loops,
+loops whose empty repository list applies everywhere or whose list includes the
+selected repository,
 removes the already-selected repository dimension from rules, and declares no
 actors. Generation does not sign or adopt the output; review and sign it before
 placing it at a repository policy entrypoint.

@@ -21,6 +21,10 @@ struct Preset {
     fragment: PolicyManifest,
     secret_names: &'static [&'static str],
     placeholder_paths: &'static [&'static str],
+    /// Why a declaration this preset used to carry was removed, so a consumer
+    /// reads a stated fact instead of inferring from an absent key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deprecated: Option<&'static str>,
 }
 
 fn catalogue() -> Result<BTreeMap<&'static str, Preset>, serde_yaml::Error> {
@@ -49,14 +53,15 @@ loops:
   builder-day:
     actor: builder
     operation: build-pass
-    target: placeholder-org/portfolio
+    repositories: placeholder-org/portfolio
     every: 08:15..21:15
     spend_usd: 20
     concurrent: 1
 "#,
                 )?,
                 secret_names: &["builder"],
-                placeholder_paths: &["/loops/builder-day/target"],
+                placeholder_paths: &["/loops/builder-day/repositories/0"],
+                deprecated: None,
             },
         ),
         (
@@ -83,12 +88,67 @@ loops:
   gatekeeper:
     actor: gatekeeper
     operation: gate-pass
-    target: placeholder-org/portfolio
+    repositories: placeholder-org/portfolio
     every: hourly
 "#,
                 )?,
                 secret_names: &["gatekeeper"],
-                placeholder_paths: &["/loops/gatekeeper/target"],
+                placeholder_paths: &["/loops/gatekeeper/repositories/0"],
+                deprecated: None,
+            },
+        ),
+        (
+            "plan",
+            Preset {
+                // `ostrom plan` runs the sweep acquisition path itself; any model
+                // call happens inside it via `--assessor` / `OSTROM_PLAN_DERIVER`.
+                // `cmd/run` is already in the closed action catalogue in
+                // ostrom-core/src/operation.rs; this introduces no new action.
+                fragment: PolicyManifest::parse_yaml(
+                    r#"manifest_version: 1
+actors:
+  planner:
+    description: Assesses goals against recorded facts and ranks the portfolio queue.
+    permission_mode: auto
+operations:
+  portfolio-plan:
+    description: "One planning pass: refresh facts, assess goals, write plan.json."
+    steps:
+      - uses: cmd/run
+        with:
+          script: ostrom plan
+grants:
+  plan-portfolio:
+    actors: planner
+    operations: portfolio-plan
+loops:
+  daily-plan:
+    actor: planner
+    operation: portfolio-plan
+    repositories: placeholder-org/portfolio
+    every: ["06:30"]
+    spend_usd: 5
+    concurrent: 1
+"#,
+                )?,
+                // `sweep::organization_token_request` mints the scoped
+                // installation token under the `gatekeeper` role, and
+                // `ostrom plan` reaches it — but only when it actually sweeps.
+                // `run_plan` reuses the latest successful generation while it is
+                // fresher than `sweep.max_age` (default 30m) and mints nothing
+                // in that branch. Publication stays disabled either way: the
+                // token is minted to query, not to publish.
+                //
+                // At this loop's daily cadence the previous generation is always
+                // stale, so every scheduled pass sweeps and every scheduled pass
+                // needs the secret. The trap is interactive: a hand-run
+                // `ostrom plan` shortly after a successful sweep reuses the
+                // generation and succeeds with no credential at all, so an
+                // operator who tests by hand and sees it pass has learned
+                // nothing about whether 06:30 will.
+                secret_names: &["gatekeeper"],
+                placeholder_paths: &["/loops/daily-plan/repositories/0"],
+                deprecated: None,
             },
         ),
         (
@@ -102,7 +162,7 @@ loops:
                     r#"manifest_version: 1
 actors:
   sweeper:
-    description: Publishes the portfolio sweep. Reads widely, writes only what publication allows. The loops.sweep entry schedules the sweep from a local cron-style scheduler on one machine; a hosted substrate schedules the sweep itself and should not adopt that loop.
+    description: Publishes the portfolio sweep when invoked. Reads widely, writes only what publication allows.
     permission_mode: auto
 operations:
   portfolio-sweep:
@@ -116,17 +176,16 @@ grants:
     actors: sweeper
     operations: portfolio-sweep
     repositories: placeholder-org/portfolio
-loops:
-  sweep:
-    actor: sweeper
-    operation: portfolio-sweep
-    target: placeholder-org/portfolio
-    every: "*:45"
 "#,
                 )?,
                 // sweep::organization_token_request uses this credential name.
                 secret_names: &["gatekeeper"],
-                placeholder_paths: &["/grants/sweep/repositories/0", "/loops/sweep/target"],
+                placeholder_paths: &["/grants/sweep/repositories/0"],
+                deprecated: Some(
+                    "loops.sweep was removed: sweeping is no longer scheduled from the loop \
+                     scheduler. Invoke `ostrom sweep` directly, or rely on pass-time freshness \
+                     instead of a recurring schedule.",
+                ),
             },
         ),
         (
@@ -153,12 +212,13 @@ loops:
   unattended-triage:
     actor: triage
     operation: queue-triage
-    target: placeholder-org/portfolio
+    repositories: placeholder-org/portfolio
     every: hourly
 "#,
                 )?,
                 secret_names: &["triage"],
-                placeholder_paths: &["/loops/unattended-triage/target"],
+                placeholder_paths: &["/loops/unattended-triage/repositories/0"],
+                deprecated: None,
             },
         ),
     ]))
@@ -291,19 +351,36 @@ mod tests {
                 .map(|(name, preset)| (*name, &preset.fragment)),
         )
         .expect("the four shipped presets do not collide");
-        for actor in ["builder", "gatekeeper", "sweeper", "triage"] {
+        for actor in ["builder", "gatekeeper", "planner", "sweeper", "triage"] {
             assert!(merged.actors.contains_key(actor), "missing actor {actor}");
         }
-        for operation in ["build-pass", "gate-pass", "portfolio-sweep", "queue-triage"] {
+        for operation in [
+            "build-pass",
+            "gate-pass",
+            "portfolio-plan",
+            "portfolio-sweep",
+            "queue-triage",
+        ] {
             assert!(
                 merged.operations.contains_key(operation),
                 "missing operation {operation}"
             );
         }
-        for grant in ["builder-build", "gatekeeper-gate", "sweep", "triage-queue"] {
+        for grant in [
+            "builder-build",
+            "gatekeeper-gate",
+            "plan-portfolio",
+            "sweep",
+            "triage-queue",
+        ] {
             assert!(merged.grants.contains_key(grant), "missing grant {grant}");
         }
-        for loop_name in ["builder-day", "gatekeeper", "sweep", "unattended-triage"] {
+        for loop_name in [
+            "builder-day",
+            "daily-plan",
+            "gatekeeper",
+            "unattended-triage",
+        ] {
             assert!(
                 merged.loops.contains_key(loop_name),
                 "missing loop {loop_name}"
@@ -311,12 +388,60 @@ mod tests {
         }
     }
 
-    // The presets endpoint passes this description through verbatim, so its
-    // bytes are what an operator reads before applying the preset. #527 ruled
-    // that it must say a hosted substrate schedules the sweep itself; pinning
-    // the whole string is what turns that ruling into a guard.
     #[test]
-    fn the_sweep_preset_description_says_a_hosted_substrate_schedules_its_own_sweep() {
+    fn the_plan_preset_wraps_ostrom_plan_with_conservative_ceilings_and_the_gatekeeper_credential()
+    {
+        let presets = catalogue().expect("catalogue parses");
+        let plan = &presets
+            .get("plan")
+            .expect("the plan preset is shipped")
+            .fragment;
+
+        let daily_plan = plan
+            .loops
+            .get("daily-plan")
+            .expect("the plan preset declares the daily-plan loop");
+        assert_eq!(
+            daily_plan.concurrent,
+            Some(1),
+            "an operator who wires up an assessor makes this loop spend; keep the ceiling"
+        );
+        assert_eq!(
+            daily_plan.spend_usd,
+            Some(5.0),
+            "plain `ostrom plan` is zero-spend, but the ceiling is a real guard, not decoration"
+        );
+
+        assert_eq!(
+            presets["plan"].secret_names,
+            &["gatekeeper"],
+            "ostrom plan runs the sweep acquisition path, which mints a token under \
+             the gatekeeper role even though publication stays disabled"
+        );
+
+        let operation = plan
+            .operations
+            .get("portfolio-plan")
+            .expect("the plan preset declares the portfolio-plan operation");
+        assert_eq!(operation.steps.len(), 1);
+        assert_eq!(operation.steps[0].uses, "cmd/run");
+        assert_eq!(operation.steps[0].parameters["script"], "ostrom plan");
+    }
+
+    #[test]
+    fn the_plan_preset_cadence_is_a_once_daily_time_list_not_the_unparseable_daily_keyword() {
+        let presets = catalogue().expect("catalogue parses");
+        let daily_plan = &presets["plan"].fragment.loops["daily-plan"];
+        // There is no `daily` keyword in the cadence grammar; a once-a-day
+        // cadence is a one-element list of `HH:MM` times. Assert on the
+        // rendered systemd `OnCalendar` form (public API) so an edit that
+        // silently turns this into `hourly` or a range fails loudly here
+        // rather than shipping a cadence nobody meant.
+        assert_eq!(daily_plan.every.on_calendars(), ["*-*-* 06:30:00"]);
+    }
+
+    #[test]
+    fn the_sweep_preset_keeps_manual_operation_without_a_loop() {
         let presets = catalogue().expect("catalogue parses");
         let sweeper = presets
             .get("sweep")
@@ -329,12 +454,10 @@ mod tests {
         assert_eq!(
             sweeper.description.as_deref(),
             Some(
-                "Publishes the portfolio sweep. Reads widely, writes only what publication \
-                 allows. The loops.sweep entry schedules the sweep from a local cron-style \
-                 scheduler on one machine; a hosted substrate schedules the sweep itself and \
-                 should not adopt that loop."
+                "Publishes the portfolio sweep when invoked. Reads widely, writes only what publication allows."
             )
         );
+        assert!(presets["sweep"].fragment.loops.is_empty());
     }
 
     #[test]

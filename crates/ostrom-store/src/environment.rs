@@ -79,6 +79,11 @@ const fn variable(
     }
 }
 
+pub const ALL_PROXY: EnvironmentVariable = variable(
+    "ALL_PROXY",
+    EnvironmentClass::Location,
+    "not passed to the process implementer",
+);
 pub const ASDF_DATA_DIR: EnvironmentVariable =
     variable("ASDF_DATA_DIR", EnvironmentClass::Location, "$HOME/.asdf");
 pub const CLAUDE_BIN: EnvironmentVariable =
@@ -102,6 +107,16 @@ pub const HOME: EnvironmentVariable = variable(
     "HOME",
     EnvironmentClass::Identity,
     "platform home directory",
+);
+pub const HTTPS_PROXY: EnvironmentVariable = variable(
+    "HTTPS_PROXY",
+    EnvironmentClass::Location,
+    "not passed to the process implementer",
+);
+pub const HTTP_PROXY: EnvironmentVariable = variable(
+    "HTTP_PROXY",
+    EnvironmentClass::Location,
+    "not passed to the process implementer",
 );
 pub const MANDATE_DAILY_CAP_USD: EnvironmentVariable = variable(
     "MANDATE_DAILY_CAP_USD",
@@ -200,6 +215,11 @@ pub const MANDATE_WORKTREE_RETENTION_DAYS: EnvironmentVariable = variable(
     EnvironmentClass::Ceiling,
     "built-in worktree retention window",
 );
+pub const NO_PROXY: EnvironmentVariable = variable(
+    "NO_PROXY",
+    EnvironmentClass::Location,
+    "not passed to the process implementer",
+);
 pub const NVM_DIR: EnvironmentVariable =
     variable("NVM_DIR", EnvironmentClass::Location, "$HOME/.nvm");
 pub const OSTROM_HOME: EnvironmentVariable = variable(
@@ -222,6 +242,11 @@ pub const OSTROM_ACTOR: EnvironmentVariable = variable(
     EnvironmentClass::Identity,
     "no actor; operation dispatch refuses",
 );
+pub const OSTROM_AVAILABLE_REPOSITORIES: EnvironmentVariable = variable(
+    "OSTROM_AVAILABLE_REPOSITORIES",
+    EnvironmentClass::Identity,
+    "repositories named by policy rules and mandate projects",
+);
 pub const OSTROM_EVENTS_FD: EnvironmentVariable = variable(
     "OSTROM_EVENTS_FD",
     EnvironmentClass::Location,
@@ -231,6 +256,11 @@ pub const OSTROM_CONTROL_FD: EnvironmentVariable = variable(
     "OSTROM_CONTROL_FD",
     EnvironmentClass::Location,
     "no inbound control descriptor",
+);
+pub const OSTROM_EFFECTIVE_REPOSITORIES: EnvironmentVariable = variable(
+    "OSTROM_EFFECTIVE_REPOSITORIES",
+    EnvironmentClass::Identity,
+    "no loop-bound repository scope",
 );
 pub const OSTROM_FACTS_ONLY: EnvironmentVariable = variable(
     "OSTROM_FACTS_ONLY",
@@ -259,8 +289,29 @@ pub const PATH: EnvironmentVariable = variable(
 );
 pub const VOLTA_HOME: EnvironmentVariable =
     variable("VOLTA_HOME", EnvironmentClass::Location, "$HOME/.volta");
+pub const ALL_PROXY_LOWERCASE: EnvironmentVariable = variable(
+    "all_proxy",
+    EnvironmentClass::Location,
+    "not passed to the process implementer",
+);
+pub const HTTPS_PROXY_LOWERCASE: EnvironmentVariable = variable(
+    "https_proxy",
+    EnvironmentClass::Location,
+    "not passed to the process implementer",
+);
+pub const HTTP_PROXY_LOWERCASE: EnvironmentVariable = variable(
+    "http_proxy",
+    EnvironmentClass::Location,
+    "not passed to the process implementer",
+);
+pub const NO_PROXY_LOWERCASE: EnvironmentVariable = variable(
+    "no_proxy",
+    EnvironmentClass::Location,
+    "not passed to the process implementer",
+);
 
 pub const ENVIRONMENT_VARIABLES: &[EnvironmentVariable] = &[
+    ALL_PROXY,
     ASDF_DATA_DIR,
     CLAUDE_BIN,
     CLAUDE_CONFIG_DIR,
@@ -269,6 +320,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvironmentVariable] = &[
     FNM_DIR,
     GH_HOST,
     HOME,
+    HTTPS_PROXY,
+    HTTP_PROXY,
     MANDATE_DAILY_CAP_USD,
     MANDATE_DISPATCH_BACKEND,
     MANDATE_GH_AS_BIN,
@@ -289,9 +342,12 @@ pub const ENVIRONMENT_VARIABLES: &[EnvironmentVariable] = &[
     MANDATE_SYSTEMD_RUN_BIN,
     MANDATE_WORKTREE_CEILING_BYTES,
     MANDATE_WORKTREE_RETENTION_DAYS,
+    NO_PROXY,
     NVM_DIR,
     OSTROM_ACTOR,
+    OSTROM_AVAILABLE_REPOSITORIES,
     OSTROM_CONTROL_FD,
+    OSTROM_EFFECTIVE_REPOSITORIES,
     OSTROM_EVENTS_FD,
     OSTROM_FACTS_ONLY,
     OSTROM_HOME,
@@ -302,6 +358,10 @@ pub const ENVIRONMENT_VARIABLES: &[EnvironmentVariable] = &[
     OSTROM_POLICY_TRUSTED_KEYS,
     PATH,
     VOLTA_HOME,
+    ALL_PROXY_LOWERCASE,
+    HTTP_PROXY_LOWERCASE,
+    HTTPS_PROXY_LOWERCASE,
+    NO_PROXY_LOWERCASE,
 ];
 
 fn sanitize(value: &str) -> String {

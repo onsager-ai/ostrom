@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use ostrom_store::permission_bridge::MIN_BRIDGE_HARNESS_VERSION;
 use serde_json::{Value, json};
 
 mod support;
@@ -55,8 +56,32 @@ impl Fixture {
         fs::write(state.join("loop-armed"), "").expect("arm pass");
         fs::write(state.join("builder-pass-id"), "a1b2c3d4\n").expect("write id");
         fs::write(state.join("builder-wake-counter"), "6\n").expect("write wake");
+        let generation = fresh_generation();
+        fs::write(
+            state.join("state.json"),
+            serde_json::to_vec(&json!({
+                "sweep_generation": generation.clone(),
+            }))
+            .expect("serialize fresh sweep generation"),
+        )
+        .expect("write fresh sweep generation");
+        fs::write(
+            state.join("sweep-snapshot.json"),
+            serde_json::to_vec(&json!({
+                "generation": generation,
+                "repositories": [],
+            }))
+            .expect("serialize fresh sweep snapshot"),
+        )
+        .expect("write fresh sweep snapshot");
         let claude = root.path().join("claude-stub");
-        fs::write(&claude, format!("#!/usr/bin/env bash\n{script}\n")).expect("write stub");
+        fs::write(
+            &claude,
+            format!(
+                "#!/usr/bin/env bash\nif [[ \"$1\" == \"--version\" ]]; then\n  printf '%s\\n' '{MIN_BRIDGE_HARNESS_VERSION} (Claude Code)'\n  exit 0\nfi\n{script}\n"
+            ),
+        )
+        .expect("write stub");
         fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).expect("chmod stub");
         Self {
             root,
@@ -122,6 +147,7 @@ projects:
         .expect("write blocked queue");
         let state = json!({
             "version": 2,
+            "sweep_generation": fresh_generation(),
             "work_ranking": [],
             "work_ranking_faults": [],
             "repos": {
@@ -199,6 +225,13 @@ projects:
             Some("pass-ended")
         );
     }
+}
+
+fn fresh_generation() -> Value {
+    json!({
+        "id": "pass-lifecycle-fresh-generation",
+        "completed_at": ostrom_store::Clock::default().now().to_rfc3339(),
+    })
 }
 
 #[test]
@@ -705,7 +738,7 @@ fn without_a_control_descriptor_stdin_is_ignored_and_existing_bytes_are_preserve
     );
     assert_eq!(normalize_pass_trace(&fs::read(fixture.state.join("sprint.jsonl")).unwrap()),
         concat!(
-            "{\"ts\":\"2026-08-01T00:00:00Z\",\"kind\":\"pass-started\",\"fact\":{\"owner\":\"builder-a1b2c3d4-wake7\"},\"narration\":{}}\n",
+            "{\"ts\":\"2026-08-01T00:00:00Z\",\"kind\":\"pass-started\",\"fact\":{\"owner\":\"builder-a1b2c3d4-wake7\",\"sweep\":\"reused\",\"generation_id\":\"pass-lifecycle-fresh-generation\"},\"narration\":{}}\n",
             "{\"ts\":\"2026-08-01T00:00:00Z\",\"kind\":\"pass-ended\",\"fact\":{\"owner\":\"builder-a1b2c3d4-wake7\",\"outcome\":\"no-op\",\"cost_usd\":1.25,\"duration_seconds\":0,\"reason\":\"blocked\"},\"narration\":{}}\n"
         ).as_bytes());
     let events = fixture.run_events();
@@ -1367,6 +1400,35 @@ fn a_recorded_failure_exits_nonzero_even_though_the_agent_process_exited_zero() 
     fixture.assert_released();
 }
 
+/// ostrom#587 gave `unstarted` its own arm in `event_outcome`. Before that, an
+/// unrecognised `unstarted` fell to the `Failed` catch-all, and so exited
+/// non-zero through the check the test above pins. Unless that check is widened
+/// too, the new arm turns a recorded `unstarted` from a run that did start into
+/// a silent exit 0.
+#[test]
+fn a_recorded_unstarted_outcome_exits_nonzero_even_though_the_agent_process_exited_zero() {
+    let fixture = Fixture::new(concat!(
+        "printf '%s\\n' '{\"ts\":\"2026-08-01T00:00:00Z\",\"kind\":\"pass-started\",\"fact\":{\"owner\":\"builder-inner-wake1\"},\"narration\":{}}' >>\"$OSTROM_HOME/sprint.jsonl\"\n",
+        "printf '%s\\n' '{\"ts\":\"2026-08-01T00:00:01Z\",\"kind\":\"pass-ended\",\"fact\":{\"owner\":\"builder-inner-wake1\",\"outcome\":\"unstarted\"},\"narration\":{}}' >>\"$OSTROM_HOME/sprint.jsonl\""
+    ));
+
+    let output = fixture.command().output().expect("run pass");
+
+    assert!(
+        !output.status.success(),
+        "a pass recorded as unstarted must not exit 0: {output:?}"
+    );
+    assert_ne!(output.status.code(), Some(0));
+    let events = fixture.run_events();
+    let finished = events
+        .iter()
+        .filter(|event| event["type"] == "run.finished")
+        .collect::<Vec<_>>();
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0]["payload"]["outcome"], "unstarted");
+    fixture.assert_released();
+}
+
 #[test]
 fn sigterm_releases_finalizes_and_kills_the_process_group() {
     let fixture = Fixture::new(concat!(
@@ -1756,6 +1818,8 @@ fn roles_receive_their_permission_modes_and_wakes_retain_one_identity() {
     let args = fs::read_to_string(gatekeeper_arguments).expect("read gatekeeper arguments");
     assert!(args.contains("--permission-mode\nmanual\n"));
     assert!(args.contains("# Mandate Gatekeep\n"));
+    assert!(args.contains("## Sweep snapshot candidates for this pass"));
+    assert!(args.contains("\"generation_id\": \"pass-lifecycle-fresh-generation\""));
     assert!(!args.lines().any(|line| line == "ostrom pass gatekeeper"));
     assert!(!args.lines().any(|line| line == "default"));
 }
@@ -2281,6 +2345,297 @@ cp "$3" "$OSTROM_HOME/observed-settings.json""#,
 }
 
 #[test]
+fn loop_bound_pass_records_the_intersected_granted_set_and_refuses_unknown_loops() {
+    let fixture =
+        Fixture::new("printf '%s\n' \"$OSTROM_EFFECTIVE_REPOSITORIES\" >\"$OSTROM_TEST_SCOPE\"");
+    let manifest = fixture.state.join("ostrom.yaml");
+    fs::write(
+        &manifest,
+        concat!(
+            "manifest_version: 1\n",
+            "actors: {builder: {permission_mode: auto}}\n",
+            "operations:\n",
+            "  build-pass:\n",
+            "    steps: [{uses: agent/claude, with: {prompt: 'loop scope fixture'}}]\n",
+            "grants:\n",
+            "  builder-build: {actors: builder, operations: build-pass, repositories: placeholder-org/alpha}\n",
+            "loops:\n",
+            "  delivery:\n",
+            "    actor: builder\n",
+            "    operation: build-pass\n",
+            "    repositories: [placeholder-org/alpha, placeholder-org/beta, placeholder-org/unavailable]\n",
+            "    every: hourly\n",
+        ),
+    )
+    .expect("write loop policy");
+    let trusted_keys = support::sign_manifest(&manifest);
+    let scope = fixture.root.path().join("scope");
+
+    let unknown = fixture
+        .command()
+        .args(["--loop", "undeclared"])
+        .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
+        .env(
+            "OSTROM_AVAILABLE_REPOSITORIES",
+            "placeholder-org/alpha,placeholder-org/beta",
+        )
+        .env("OSTROM_TEST_SCOPE", &scope)
+        .output()
+        .expect("run unknown loop");
+    assert_eq!(unknown.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&unknown.stderr).contains("unknown loop `undeclared`"));
+    assert!(!scope.exists());
+
+    let output = fixture
+        .command()
+        .args(["--loop", "delivery"])
+        .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
+        .env(
+            "OSTROM_AVAILABLE_REPOSITORIES",
+            "placeholder-org/alpha,placeholder-org/beta",
+        )
+        .env("OSTROM_TEST_SCOPE", &scope)
+        .output()
+        .expect("run loop-bound pass");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&scope).expect("read child scope"),
+        "placeholder-org/alpha\n"
+    );
+    let started = fixture
+        .trace()
+        .into_iter()
+        .find(|row| row["kind"] == "pass-started")
+        .expect("pass start record");
+    assert_eq!(
+        started["fact"]["repositories"],
+        json!(["placeholder-org/alpha"])
+    );
+    assert_eq!(
+        started["fact"]["skipped_repositories"],
+        json!([
+            {
+                "repository": "placeholder-org/beta",
+                "reason": "repository-not-granted"
+            },
+            {
+                "repository": "placeholder-org/unavailable",
+                "reason": "repository-not-available"
+            }
+        ])
+    );
+    assert_eq!(
+        fixture.run_events()[0]["payload"]["repositories"],
+        json!(["placeholder-org/alpha"])
+    );
+}
+
+#[test]
+fn loop_bound_passes_refuse_all_unavailable_and_all_ungranted_scopes() {
+    for (case, requested, granted, expected_reason) in [
+        (
+            "unavailable",
+            "placeholder-org/missing",
+            "placeholder-org/missing",
+            "repository-not-available",
+        ),
+        (
+            "ungranted",
+            "placeholder-org/alpha",
+            "placeholder-org/other",
+            "repository-not-granted",
+        ),
+    ] {
+        let fixture = Fixture::new("printf ran >\"$OSTROM_TEST_MARKER\"");
+        let manifest = fixture.state.join("ostrom.yaml");
+        fs::write(
+            &manifest,
+            format!(
+                "manifest_version: 1\nactors: {{builder: {{permission_mode: auto}}}}\noperations:\n  build-pass:\n    steps: [{{uses: agent/claude, with: {{prompt: 'empty scope fixture'}}}}]\ngrants:\n  builder-build: {{actors: builder, operations: build-pass, repositories: {granted}}}\nloops:\n  delivery:\n    actor: builder\n    operation: build-pass\n    repositories: {requested}\n    every: hourly\n"
+            ),
+        )
+        .expect("write empty-scope policy");
+        let trusted_keys = support::sign_manifest(&manifest);
+        let marker = fixture.root.path().join(format!("{case}-agent-ran"));
+
+        let output = fixture
+            .command()
+            .args(["--loop", "delivery"])
+            .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
+            .env("OSTROM_AVAILABLE_REPOSITORIES", "placeholder-org/alpha")
+            .env("OSTROM_TEST_MARKER", &marker)
+            .output()
+            .expect("run empty-scope pass");
+        assert_eq!(output.status.code(), Some(3), "{case}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("no-effective-repositories"),
+            "{case}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!marker.exists(), "{case}: agent process started");
+        assert!(
+            !fixture.state.join("pass-runs").exists(),
+            "{case}: transcript directory was created"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.state.join("builder-wake-counter"))
+                .expect("read unchanged wake counter"),
+            "6\n",
+            "{case}: empty scope advanced pass state"
+        );
+
+        let trace = fixture.trace();
+        assert_eq!(trace.len(), 2, "{case}: {trace:?}");
+        assert_eq!(trace[0]["kind"], "pass-started");
+        assert_eq!(trace[1]["kind"], "pass-ended");
+        for row in &trace {
+            assert_eq!(row["fact"]["repositories"], json!([]), "{case}");
+            assert_eq!(
+                row["fact"]["skipped_repositories"],
+                json!([{"repository": requested, "reason": expected_reason}]),
+                "{case}"
+            );
+            assert_eq!(row["fact"]["reason"], "no-effective-repositories", "{case}");
+        }
+        assert_eq!(trace[1]["fact"]["outcome"], "failed", "{case}");
+        let events = fixture.run_events();
+        assert_eq!(events.len(), 2, "{case}: {events:?}");
+        assert_eq!(events[1]["payload"]["outcome"], "failed", "{case}");
+        assert_eq!(
+            events[1]["payload"]["reason"], "no-effective-repositories",
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn loop_bound_gatekeeper_receives_only_snapshot_pull_requests_in_its_effective_set() {
+    let fixture = Fixture::new("printf '%s\\n' \"$@\" >\"$OSTROM_TEST_ARGS\"");
+    let manifest = fixture.state.join("ostrom.yaml");
+    fs::write(
+        &manifest,
+        format!(
+            "{}\nloops:\n  review:\n    actor: gatekeeper\n    operation: gate-pass\n    repositories: placeholder-org/alpha\n    every: hourly\n",
+            include_str!("fixtures/loops/init.yaml")
+        ),
+    )
+    .expect("write gatekeeper loop policy");
+    fs::create_dir_all(fixture.state.join("prompts")).expect("create prompt directory");
+    fs::write(
+        fixture.state.join("prompts/work.md"),
+        include_str!("../../ostrom-store/assets/prompts/work.md"),
+    )
+    .expect("write builder prompt");
+    fs::write(
+        fixture.state.join("prompts/gatekeep.md"),
+        include_str!("../../ostrom-store/assets/prompts/gatekeep.md"),
+    )
+    .expect("write gatekeeper prompt");
+    let trusted_keys = support::sign_manifest(&manifest);
+    let generation = serde_json::from_slice::<Value>(
+        &fs::read(fixture.state.join("state.json")).expect("read sweep state"),
+    )
+    .expect("parse sweep state")["sweep_generation"]
+        .clone();
+    fs::write(
+        fixture.state.join("sweep-snapshot.json"),
+        serde_json::to_vec(&json!({
+            "generation": generation,
+            "repositories": [
+                {"repo": "placeholder-org/alpha", "open_prs": [{"number": 11}]},
+                {"repo": "placeholder-org/beta", "open_prs": [{"number": 22}]},
+            ],
+        }))
+        .expect("serialize gatekeeper sweep snapshot"),
+    )
+    .expect("write gatekeeper sweep snapshot");
+    let arguments = fixture.root.path().join("gatekeeper-loop-arguments");
+
+    let output = fixture
+        .command_for("gatekeeper")
+        .args(["--loop", "review"])
+        .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
+        .env(
+            "OSTROM_AVAILABLE_REPOSITORIES",
+            "placeholder-org/alpha,placeholder-org/beta",
+        )
+        .env("OSTROM_TEST_ARGS", &arguments)
+        .output()
+        .expect("run loop-bound gatekeeper");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let arguments = fs::read_to_string(arguments).expect("read gatekeeper arguments");
+    assert!(arguments.contains("\"repository\": \"placeholder-org/alpha\""));
+    assert!(arguments.contains("\"number\": 11"));
+    assert!(!arguments.contains("placeholder-org/beta"));
+    assert!(!arguments.contains("\"number\": 22"));
+}
+
+#[test]
+fn loop_bound_gatekeeper_with_no_snapshot_candidates_is_idle_without_an_agent() {
+    let fixture = Fixture::new("printf ran >\"$OSTROM_TEST_MARKER\"");
+    let manifest = fixture.state.join("ostrom.yaml");
+    fs::write(
+        &manifest,
+        format!(
+            "{}\nloops:\n  review:\n    actor: gatekeeper\n    operation: gate-pass\n    repositories: placeholder-org/alpha\n    every: hourly\n",
+            include_str!("fixtures/loops/init.yaml")
+        ),
+    )
+    .expect("write idle gatekeeper policy");
+    fs::create_dir_all(fixture.state.join("prompts")).expect("create prompt directory");
+    fs::write(
+        fixture.state.join("prompts/work.md"),
+        include_str!("../../ostrom-store/assets/prompts/work.md"),
+    )
+    .expect("write builder prompt");
+    fs::write(
+        fixture.state.join("prompts/gatekeep.md"),
+        include_str!("../../ostrom-store/assets/prompts/gatekeep.md"),
+    )
+    .expect("write gatekeeper prompt");
+    let trusted_keys = support::sign_manifest(&manifest);
+    let marker = fixture.root.path().join("idle-gatekeeper-ran");
+
+    let output = fixture
+        .command_for("gatekeeper")
+        .args(["--loop", "review"])
+        .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
+        .env("OSTROM_AVAILABLE_REPOSITORIES", "placeholder-org/alpha")
+        .env("OSTROM_TEST_MARKER", &marker)
+        .output()
+        .expect("run idle gatekeeper");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!marker.exists(), "idle gatekeeper started an agent process");
+    assert!(
+        !fixture.state.join("pass-runs/gatekeeper").exists(),
+        "idle gatekeeper created a transcript"
+    );
+    let trace = fixture.trace();
+    assert_eq!(trace.len(), 2, "{trace:?}");
+    assert_eq!(trace[0]["kind"], "pass-started");
+    assert_eq!(trace[1]["kind"], "pass-ended");
+    assert_eq!(trace[1]["fact"]["outcome"], "no-candidates");
+    assert_eq!(
+        trace[1]["fact"]["repositories"],
+        json!(["placeholder-org/alpha"])
+    );
+    let events = fixture.run_events();
+    assert_eq!(events[1]["payload"]["outcome"], "no-op");
+}
+
+#[test]
 fn init_produces_a_manifest_whose_edited_prompt_reaches_the_harness() {
     // The point of `ostrom init` is that the prompt stops being a thing only a
     // release can change. It writes what the binary ships as an editable file,
@@ -2609,7 +2964,9 @@ fn permission_channel_is_removed_when_harness_cannot_spawn() {
     let keys = bridge_policy(&fixture);
     fs::write(
         &fixture.claude,
-        "#!/missing-permission-harness-interpreter\n",
+        format!(
+            "#!/usr/bin/env bash\nif [[ \"$1\" == \"--version\" ]]; then\n  rm -- \"$0\"\n  printf '%s\\n' '{MIN_BRIDGE_HARNESS_VERSION} (Claude Code)'\n  exit 0\nfi\n"
+        ),
     )
     .unwrap();
     let output = fixture

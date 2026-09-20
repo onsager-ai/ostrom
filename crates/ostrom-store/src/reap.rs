@@ -176,7 +176,7 @@ fn inspect_worktree(
         .state
         .join(format!("implementer-item-{item_hash}.lease"));
     match read_lease(&lease_path) {
-        Ok(Some(lease)) if lease.expires_at > options.clock.epoch_seconds() => {
+        Ok(Some(lease)) if lease.is_live(options.clock.epoch_seconds()) => {
             report.reason = "live-implementer-lease".to_owned();
             return report;
         }
@@ -242,6 +242,9 @@ fn inspect_worktree(
         Ok(_) => {
             report.outcome = "reaped".to_owned();
             report.reclaimed_bytes = report.bytes;
+            if remove_implementer_log(&options.paths.state, &item_hash).is_err() {
+                report.reason = "implementer-log-removal-failed".to_owned();
+            }
         }
         Err(error) if error.starts_with(UNMERGED_LOCAL_COMMITS_PREFIX) => {
             report.reason = UNMERGED_LOCAL_COMMITS_REASON.to_owned();
@@ -603,6 +606,18 @@ pub(crate) const UNMERGED_LOCAL_COMMITS_PREFIX: &str = "unmerged-local-commits:"
 pub(crate) const UNMERGED_LOCAL_COMMITS_REASON: &str = "unmerged-local-commits";
 pub(crate) const PUBLICATION_UNVERIFIABLE_PREFIX: &str = "publication-unverifiable:";
 pub(crate) const PUBLICATION_UNVERIFIABLE_REASON: &str = "publication-unverifiable";
+
+pub(crate) fn remove_implementer_log(state_root: &Path, item_hash: &str) -> Result<(), String> {
+    let path = state_root.join(format!("implementer-item-{item_hash}.log"));
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "could not remove implementer log {}: {error}",
+            path.display()
+        )),
+    }
+}
 
 pub(crate) fn reclaim_worktree(
     source: &Path,

@@ -1,11 +1,12 @@
 use std::{
+    collections::BTreeSet,
     fs,
-    io::{self, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::mpsc::{self, Receiver, RecvTimeoutError},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use chrono::DateTime;
@@ -27,9 +28,14 @@ use umwelt_runtime::{
 
 use crate::{
     Clock, LeaseActionError, OstromPaths, OwnedLease, PassState, RunEventError, RunEventGuard,
-    RunEventStart, SignalFlags, TraceAppend, append_trace, environment, generated_run_id,
-    pass_control, pass_control::ControlInput, read_lease, read_pass_state, read_trace,
-    selection::dispatchability_snapshot, write_pass_state,
+    RunEventStart, SignalFlags, SkippedRepository, SweepOptions, TraceAppend, append_trace,
+    environment, generated_run_id, generation_is_fresh, latest_successful_generation,
+    load_sweep_snapshot, pass_control,
+    pass_control::ControlInput,
+    read_lease, read_pass_state, read_trace,
+    selection::dispatchability_snapshot,
+    sweep::{run_sweep_holding_lease, wait_for_sweep_lease},
+    write_pass_state,
 };
 
 pub const MAX_TURNS: &str = "200";
@@ -48,12 +54,19 @@ pub const PASS_KILL_GRACE_MS: u64 = 5_000;
 // EX_CONFIG: the pass invocation is valid, but the local arm configuration
 // explicitly refuses to execute it.
 const DISARMED_EXIT_CODE: i32 = 78;
+// EX_UNAVAILABLE: the pass needs a support program, the harness, that is
+// present but cannot do what this pass requires (ostrom#587). It has its own
+// code rather than sharing EX_CONFIG with a disarmed pass, so a consumer
+// reading only the exit status cannot mistake a harness too old for the
+// bridge for a pass the operator chose not to run.
+const HARNESS_UNAVAILABLE_EXIT_CODE: i32 = 69;
 // EX_TEMPFAIL: the pass is held at its daily spend cap and can run once
 // the ceiling resets or is raised.
 const BUDGET_HELD_EXIT_CODE: i32 = 75;
 const DEFAULT_DAILY_CAP_USD: f64 = 50.0;
 const DEFAULT_LEASE_TTL_SECONDS: u64 = 3_600;
 const PASS_TERMINATION_GRACE: Duration = Duration::from_millis(PASS_KILL_GRACE_MS);
+const BRIDGE_HARNESS_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Render a permission mode as the flag value the Claude harness expects.
 ///
@@ -156,6 +169,15 @@ pub struct PassRequest {
     pub events_fd: Option<u32>,
     pub control_fd: Option<u32>,
     pub facts_only: bool,
+    /// Present for a loop-bound pass and omitted for an unbound pass.
+    pub repositories: Option<Vec<String>>,
+    pub skipped_repositories: Vec<SkippedRepository>,
+    /// Hard child-command scope. This is also present for an unbound pass,
+    /// where it contains the available set.
+    pub repository_scope: Option<Vec<String>>,
+    /// Production passes always supply freshness policy. Direct library
+    /// callers may omit it when another layer already owns freshness.
+    pub sweep: Option<PassSweepRequest>,
     pub caps: RunCaps,
     pub clock: Clock,
     /// The value [`std::env::consts::OS`] would report, threaded through
@@ -163,6 +185,166 @@ pub struct PassRequest {
     /// injection rather than by requiring a Windows host in CI. Production
     /// always passes `std::env::consts::OS` itself.
     pub platform: &'static str,
+}
+
+#[derive(Debug, Clone)]
+pub struct PassSweepRequest {
+    pub options: SweepOptions,
+    pub max_age_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PassSweepOutcome {
+    Swept(String),
+    Reused(String),
+    NotManaged,
+}
+
+#[derive(Debug)]
+struct PreparedSweep {
+    outcome: PassSweepOutcome,
+    snapshots: Option<Vec<crate::RepositorySnapshot>>,
+}
+
+#[derive(Debug)]
+struct PreparedSession {
+    prompt: String,
+    candidate_count: Option<usize>,
+}
+
+impl PassSweepOutcome {
+    fn generation_id(&self) -> Option<&str> {
+        match self {
+            Self::Swept(generation) | Self::Reused(generation) => Some(generation),
+            Self::NotManaged => None,
+        }
+    }
+
+    fn record(&self, fact: &mut Map<String, Value>) {
+        match self {
+            Self::Swept(generation) => {
+                fact.insert("sweep".to_owned(), json!("swept"));
+                fact.insert("generation_id".to_owned(), json!(generation));
+            }
+            Self::Reused(generation) => {
+                fact.insert("sweep".to_owned(), json!("reused"));
+                fact.insert("generation_id".to_owned(), json!(generation));
+            }
+            Self::NotManaged => {}
+        }
+    }
+}
+
+fn prepare_sweep(request: &PassRequest) -> Result<PreparedSweep, String> {
+    let Some(sweep) = &request.sweep else {
+        return Ok(PreparedSweep {
+            outcome: PassSweepOutcome::NotManaged,
+            snapshots: None,
+        });
+    };
+    // The freshness decision and gatekeeper snapshot read share the writer's
+    // lease. A pass that arrives during a sweep waits once, then evaluates the
+    // generation the completed writer actually left behind.
+    let lease = wait_for_sweep_lease(&request.paths).map_err(|error| error.to_string())?;
+    let latest = latest_successful_generation(&request.paths).map_err(|error| error.to_string())?;
+    let reusable = latest.filter(|generation| {
+        generation_is_fresh(generation, request.clock.now(), sweep.max_age_seconds)
+    });
+    if let Some(generation) = reusable {
+        if request.role != PassRole::Gatekeeper {
+            return Ok(PreparedSweep {
+                outcome: PassSweepOutcome::Reused(generation.id),
+                snapshots: None,
+            });
+        }
+        // A mismatched state/snapshot pair is not reusable. Keeping the lease
+        // and falling through performs the same single repair sweep as plan.
+        if let Ok(snapshots) = load_sweep_snapshot(&request.paths, &generation) {
+            return Ok(PreparedSweep {
+                outcome: PassSweepOutcome::Reused(generation.id),
+                snapshots: Some(snapshots),
+            });
+        }
+    }
+    let outcome =
+        run_sweep_holding_lease(&sweep.options, lease).map_err(|error| error.to_string())?;
+    let snapshots = (request.role == PassRole::Gatekeeper)
+        .then(|| load_sweep_snapshot(&request.paths, &outcome.generation))
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    Ok(PreparedSweep {
+        outcome: PassSweepOutcome::Swept(outcome.generation.id),
+        snapshots,
+    })
+}
+
+fn session_prompt(request: &PassRequest, sweep: &PreparedSweep) -> Result<PreparedSession, String> {
+    if request.role != PassRole::Gatekeeper || request.sweep.is_none() {
+        return Ok(PreparedSession {
+            prompt: request.prompt.clone(),
+            candidate_count: None,
+        });
+    }
+    let generation_id = sweep
+        .outcome
+        .generation_id()
+        .ok_or_else(|| "managed gatekeeper pass has no sweep generation".to_owned())?;
+    let scope = request.repository_scope.as_ref().map(|repositories| {
+        repositories
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+    });
+    let snapshots = sweep
+        .snapshots
+        .as_ref()
+        .ok_or_else(|| "managed gatekeeper pass has no sweep snapshot".to_owned())?;
+    let mut candidates = BTreeSet::new();
+    let mut snapshot_repositories = BTreeSet::new();
+    for snapshot in snapshots {
+        let repository = snapshot.repo.as_str();
+        if scope
+            .as_ref()
+            .is_some_and(|repositories| !repositories.contains(repository))
+        {
+            continue;
+        }
+        snapshot_repositories.insert(repository.to_owned());
+        for pull_request in &snapshot.open_prs {
+            let number = pull_request.get("number").and_then(Value::as_u64).ok_or_else(|| {
+                format!(
+                    "sweep generation `{generation_id}` has a pull request without a numeric number in `{repository}`"
+                )
+            })?;
+            candidates.insert((repository.to_owned(), number));
+        }
+    }
+    let effective_repositories = request
+        .repository_scope
+        .clone()
+        .unwrap_or_else(|| snapshot_repositories.into_iter().collect());
+    let candidates = candidates
+        .into_iter()
+        .map(|(repository, number)| json!({"repository": repository, "number": number}))
+        .collect::<Vec<_>>();
+    let input = json!({
+        "generation_id": generation_id,
+        "effective_repositories": effective_repositories,
+        "pull_requests": candidates,
+    });
+    Ok(PreparedSession {
+        prompt: format!(
+            "{}\n\n## Sweep snapshot candidates for this pass\n\nUse this pass-supplied JSON as the complete candidate input. Judge only its `pull_requests`; do not enumerate live pull requests or add a repository.\n\n```json\n{}\n```\n",
+            request.prompt,
+            serde_json::to_string_pretty(&input).expect("gatekeeper input serializes")
+        ),
+        candidate_count: Some(
+            input["pull_requests"]
+                .as_array()
+                .expect("gatekeeper candidates are an array")
+                .len(),
+        ),
+    })
 }
 
 #[derive(Debug, Error)]
@@ -179,6 +361,17 @@ pub enum PassError {
     Disarmed(&'static str),
     #[error("ostrom {0} pass: daily spend cap reached; held until the ceiling resets or is raised")]
     BudgetHeld(&'static str),
+    #[error("ostrom {0} pass: no-effective-repositories")]
+    NoEffectiveRepositories(&'static str),
+    #[error(
+        "ostrom {role} pass: Claude Code {version} at {path} cannot run a bridged pass: the permission bridge needs --permission-prompts and --permission-prompt-tool, available from Claude Code {minimum} (the lowest verified version); upgrade Claude Code to at least {minimum}"
+    )]
+    HarnessUnsupported {
+        role: &'static str,
+        version: String,
+        path: PathBuf,
+        minimum: crate::permission_bridge::HarnessVersion,
+    },
 }
 
 impl PassError {
@@ -189,6 +382,8 @@ impl PassError {
             Self::LeaseHeld(_) => 0,
             Self::Disarmed(_) => DISARMED_EXIT_CODE,
             Self::BudgetHeld(_) => BUDGET_HELD_EXIT_CODE,
+            Self::NoEffectiveRepositories(_) => 3,
+            Self::HarnessUnsupported { .. } => HARNESS_UNAVAILABLE_EXIT_CODE,
         }
     }
 
@@ -197,6 +392,15 @@ impl PassError {
             role: role.name(),
             message: message.into(),
             code,
+        }
+    }
+
+    fn harness_unsupported(role: PassRole, path: &Path, version: impl Into<String>) -> Self {
+        Self::HarnessUnsupported {
+            role: role.name(),
+            version: version.into(),
+            path: path.to_owned(),
+            minimum: crate::permission_bridge::MIN_BRIDGE_HARNESS_VERSION,
         }
     }
 }
@@ -217,6 +421,8 @@ struct PassGuard {
     dispatchability_hash: Option<String>,
     queue_count: Option<usize>,
     dispatchable_count: Option<usize>,
+    repositories: Option<Vec<String>>,
+    skipped_repositories: Vec<SkippedRepository>,
     events: RunEventGuard,
     control: Option<RunControl<NoSteer>>,
     process_exit: ProcessExit,
@@ -295,6 +501,15 @@ impl PassGuard {
             if let Some(count) = self.dispatchable_count {
                 fact.insert("dispatchable_count".to_owned(), json!(count));
             }
+            if let Some(repositories) = &self.repositories {
+                fact.insert("repositories".to_owned(), json!(repositories));
+            }
+            if !self.skipped_repositories.is_empty() {
+                fact.insert(
+                    "skipped_repositories".to_owned(),
+                    json!(self.skipped_repositories),
+                );
+            }
             if let Err(error) = append_trace(
                 &self.paths.trace_file(),
                 &TraceAppend {
@@ -356,7 +571,7 @@ impl PassGuard {
 fn event_outcome(outcome: &str) -> EventRunOutcome {
     match outcome {
         "completed" => EventRunOutcome::Completed,
-        "no-op" => EventRunOutcome::NoOp,
+        "no-op" | "no-candidates" => EventRunOutcome::NoOp,
         // The fact ledger calls a spend refusal held; ethogram calls it blocked.
         "held" => EventRunOutcome::Blocked,
         "timed-out" => EventRunOutcome::TimedOut,
@@ -364,6 +579,10 @@ fn event_outcome(outcome: &str) -> EventRunOutcome {
         "permission-denied" => EventRunOutcome::PermissionDenied,
         "interrupted" => EventRunOutcome::Interrupted,
         "canceled" => EventRunOutcome::Canceled,
+        // A run whose process never ran, such as ostrom#587's harness refusal.
+        // Without this arm it would fall through to `Failed`, which ethogram
+        // reserves for a process that ran and did not succeed.
+        "unstarted" => EventRunOutcome::Unstarted,
         _ => EventRunOutcome::Failed,
     }
 }
@@ -382,6 +601,74 @@ fn wire_ceilings(caps: RunCaps) -> Option<ethogram::RunCeilings> {
         || caps.tokens.is_some()
         || caps.cost_usd.is_some())
     .then(|| caps.to_wire())
+}
+
+fn refuse_empty_repository_scope(
+    request: &PassRequest,
+    events: &mut RunEventGuard,
+) -> Result<(), PassError> {
+    let owner = events.run_id().to_owned();
+    let repositories = request.repositories.as_ref().cloned().unwrap_or_default();
+    let common = Map::from_iter([
+        ("owner".to_owned(), json!(owner)),
+        ("repositories".to_owned(), json!(repositories)),
+        (
+            "skipped_repositories".to_owned(),
+            json!(request.skipped_repositories),
+        ),
+        ("reason".to_owned(), json!("no-effective-repositories")),
+    ]);
+    append_trace(
+        &request.paths.trace_file(),
+        &TraceAppend {
+            ts: request.clock.timestamp(),
+            kind: "pass-started".to_owned(),
+            fact: common.clone(),
+            narration: Map::new(),
+        },
+    )
+    .map_err(|error| {
+        PassError::failed(
+            request.role,
+            format!("could not append pass-started: {error}"),
+            1,
+        )
+    })?;
+    let mut terminal = common;
+    terminal.insert("outcome".to_owned(), json!("failed"));
+    terminal.insert("cost_usd".to_owned(), json!(0.0));
+    terminal.insert("duration_seconds".to_owned(), json!(0));
+    append_trace(
+        &request.paths.trace_file(),
+        &TraceAppend {
+            ts: request.clock.timestamp(),
+            kind: "pass-ended".to_owned(),
+            fact: terminal,
+            narration: Map::new(),
+        },
+    )
+    .map_err(|error| {
+        PassError::failed(
+            request.role,
+            format!("could not append pass-ended: {error}"),
+            1,
+        )
+    })?;
+    events
+        .finish(
+            EventRunOutcome::Failed,
+            Some("no-effective-repositories".to_owned()),
+            Some(0.0),
+            None,
+        )
+        .map_err(|error| {
+            PassError::failed(
+                request.role,
+                format!("could not append run.finished: {error}"),
+                1,
+            )
+        })?;
+    Err(PassError::NoEffectiveRepositories(request.role.name()))
 }
 
 impl Drop for PassGuard {
@@ -448,6 +735,91 @@ fn resolve_derived_settings(
 }
 
 pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
+    run_pass_with_bridge_probe_timeout(request, BRIDGE_HARNESS_PROBE_TIMEOUT)
+}
+
+fn probe_bridge_harness_version(
+    claude_bin: &Path,
+    timeout: Duration,
+) -> Result<crate::permission_bridge::HarnessVersion, String> {
+    let mut stdout = tempfile::tempfile()
+        .map_err(|error| format!("version stdout could not be captured: {error}"))?;
+    let mut stderr = tempfile::tempfile()
+        .map_err(|error| format!("version stderr could not be captured: {error}"))?;
+    let child_stdout = stdout
+        .try_clone()
+        .map_err(|error| format!("version stdout could not be captured: {error}"))?;
+    let child_stderr = stderr
+        .try_clone()
+        .map_err(|error| format!("version stderr could not be captured: {error}"))?;
+    let mut child = Command::new(claude_bin)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(child_stdout))
+        .stderr(Stdio::from(child_stderr))
+        .spawn()
+        .map_err(|error| format!("version probe could not start: {error}"))?;
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("version probe could not be waited for: {error}"));
+            }
+        }
+        if started.elapsed() >= timeout {
+            // This probe is not an agent session and gets no process group. Kill
+            // exactly the child PID so the ten-second compatibility check cannot
+            // turn into an unbounded pre-launch wait (ostrom#587).
+            let kill_result = child.kill();
+            let _ = child.wait();
+            return Err(kill_result.map_or_else(
+                |error| {
+                    format!(
+                        "version probe timed out after {} ms and could not be killed: {error}",
+                        timeout.as_millis()
+                    )
+                },
+                |()| format!("version probe timed out after {} ms", timeout.as_millis()),
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+
+    let mut stdout_bytes = Vec::new();
+    stdout
+        .seek(SeekFrom::Start(0))
+        .and_then(|_| stdout.read_to_end(&mut stdout_bytes))
+        .map_err(|error| format!("version stdout could not be read: {error}"))?;
+    let mut stderr_bytes = Vec::new();
+    stderr
+        .seek(SeekFrom::Start(0))
+        .and_then(|_| stderr.read_to_end(&mut stderr_bytes))
+        .map_err(|error| format!("version stderr could not be read: {error}"))?;
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr_bytes);
+        let detail = stderr.lines().next().unwrap_or_default().trim();
+        return Err(if detail.is_empty() {
+            format!("version probe exited {status}")
+        } else {
+            format!("version probe exited {status}: {detail}")
+        });
+    }
+    let stdout = String::from_utf8(stdout_bytes)
+        .map_err(|_| "version stdout was not valid UTF-8".to_owned())?;
+    crate::permission_bridge::parse_harness_version(&stdout).map_err(|error| {
+        let first_line = stdout.lines().next().unwrap_or_default();
+        format!("version output could not be parsed ({error}): {first_line:?}")
+    })
+}
+
+fn run_pass_with_bridge_probe_timeout(
+    request: &PassRequest,
+    bridge_probe_timeout: Duration,
+) -> Result<(), PassError> {
     let mut events = RunEventGuard::start(
         &request.paths,
         request.events_fd,
@@ -455,18 +827,16 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
         request.clock.clone(),
         RunEventStart {
             run_id: generated_run_id(request.role.name(), &request.clock),
-            // ostrom#546: every invocation this function can observe is a
-            // one-off dispatch -- `ostrom pass <role>` run by hand, or by a
-            // supervisor dispatching one pass. `loop` requires a declared
-            // `schedule`, which nothing here sets or has to set from; a
-            // scheduled invocation (ethogram #64/#65's `loop`) is a separate,
-            // frozen-contract change, not this one.
+            // The pass is still a one-off handoff when it is bound to a loop
+            // declaration. The optional repository list below carries that
+            // binding without inventing a schedule value at this layer.
             kind: RunKind::Handoff,
             actor: request.role.name().to_owned(),
             harness: "claude".to_owned(),
             model: None,
             schedule: None,
             repository: None,
+            repositories: request.repositories.clone(),
             // No `PassRequest` field carries an order id or equivalent intent
             // reference (unlike `implement.rs`'s `order.order_id`), so this
             // stays `None` rather than being synthesised from the role or the
@@ -482,6 +852,9 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
             1,
         )
     })?;
+    if request.repositories.as_ref().is_some_and(Vec::is_empty) {
+        return refuse_empty_repository_scope(request, &mut events);
+    }
     let mut watchdog = CapsWatchdog::start(
         request.caps,
         SystemClock::default(),
@@ -589,17 +962,77 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
         dispatchability_hash: None,
         queue_count: None,
         dispatchable_count: None,
+        repositories: request.repositories.clone(),
+        skipped_repositories: request.skipped_repositories.clone(),
         events,
         control: None,
         process_exit: ProcessExit::Abnormal,
         permission_bridge: None,
     };
+    let prepared = prepare_sweep(request)
+        .and_then(|sweep| session_prompt(request, &sweep).map(|session| (sweep, session)));
+    let (sweep, session) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let mut fact = Map::from_iter([
+                ("owner".to_owned(), json!(owner)),
+                ("sweep".to_owned(), json!("failed")),
+                ("reason".to_owned(), json!("sweep-failed")),
+            ]);
+            if let Some(repositories) = &request.repositories {
+                fact.insert("repositories".to_owned(), json!(repositories));
+            }
+            if !request.skipped_repositories.is_empty() {
+                fact.insert(
+                    "skipped_repositories".to_owned(),
+                    json!(request.skipped_repositories),
+                );
+            }
+            append_trace(
+                &request.paths.trace_file(),
+                &TraceAppend {
+                    ts: guard.trace_time.clone(),
+                    kind: "pass-started".to_owned(),
+                    fact,
+                    narration: Map::new(),
+                },
+            )
+            .map_err(|trace_error| {
+                PassError::failed(
+                    request.role,
+                    format!("could not append pass-started: {trace_error}"),
+                    1,
+                )
+            })?;
+            guard.started = true;
+            guard.outcome = Some("failed".to_owned());
+            guard.reason = Some("sweep-failed".to_owned());
+            guard.cost_usd = Some(0.0);
+            guard.finish()?;
+            return Err(PassError::failed(
+                request.role,
+                format!("sweep-failed: {error}"),
+                1,
+            ));
+        }
+    };
+    let mut start_fact = Map::from_iter([("owner".to_owned(), json!(owner))]);
+    sweep.outcome.record(&mut start_fact);
+    if let Some(repositories) = &request.repositories {
+        start_fact.insert("repositories".to_owned(), json!(repositories));
+    }
+    if !request.skipped_repositories.is_empty() {
+        start_fact.insert(
+            "skipped_repositories".to_owned(),
+            json!(request.skipped_repositories),
+        );
+    }
     append_trace(
         &request.paths.trace_file(),
         &TraceAppend {
             ts: guard.trace_time.clone(),
             kind: "pass-started".to_owned(),
-            fact: Map::from_iter([("owner".to_owned(), json!(owner))]),
+            fact: start_fact,
             narration: Map::new(),
         },
     )
@@ -611,6 +1044,15 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
         )
     })?;
     guard.started = true;
+    if request.repositories.is_some()
+        && request.role == PassRole::Gatekeeper
+        && session.candidate_count == Some(0)
+    {
+        guard.outcome = Some("no-candidates".to_owned());
+        guard.cost_usd = Some(0.0);
+        guard.finish()?;
+        return Ok(());
+    }
     let watermark = read_trace(&request.paths.trace_file())
         .map_err(|error| PassError::failed(request.role, error.to_string(), 1))?
         .rows
@@ -688,6 +1130,38 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
             format!("{} is not marked executable", request.claude_bin.display()),
             1,
         ));
+    }
+    if guard.permission_bridge.is_some() {
+        let probe = probe_bridge_harness_version(&request.claude_bin, bridge_probe_timeout);
+        let refusal = match probe {
+            Ok(version) if version < crate::permission_bridge::MIN_BRIDGE_HARNESS_VERSION => {
+                Some(PassError::harness_unsupported(
+                    request.role,
+                    &request.claude_bin,
+                    version.to_string(),
+                ))
+            }
+            Ok(_) => None,
+            Err(reason) => Some(PassError::harness_unsupported(
+                request.role,
+                &request.claude_bin,
+                format!("version could not be established ({reason})"),
+            )),
+        };
+        if let Some(error) = refusal {
+            // `unstarted`, not `no-op`. In ethogram's closed outcome set, `no-op`
+            // says the run went ahead and found nothing to do, and `failed` says
+            // the process ran and did not succeed. Neither is true here:
+            // `run.started` was emitted and the agent was never spawned, which is
+            // exactly what `unstarted` means, with `reason` naming why. A harness
+            // that cannot run the bridge is a broken environment, and it must not
+            // read as a quiet pass to anything folding these records (ostrom#587).
+            guard.outcome = Some("unstarted".to_owned());
+            guard.reason = Some(crate::permission_bridge::HARNESS_UNSUPPORTED_REASON.to_owned());
+            guard.cost_usd = Some(0.0);
+            guard.finish()?;
+            return Err(error);
+        }
     }
     let spent = daily_spend(&request.paths, &request.clock.date());
     let cap = daily_cap();
@@ -774,7 +1248,7 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
             "--verbose",
             "--max-turns",
             MAX_TURNS,
-            &request.prompt,
+            &session.prompt,
         ])
         // The harness reads its inherited stdin to EOF even when the prompt
         // is an argument, and a supervisor that follows docs/pass-control.md
@@ -787,6 +1261,12 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
         .stderr(Stdio::from(error_output));
     if let Some(bridge) = &guard.permission_bridge {
         bridge.configure(&mut command);
+    }
+    if let Some(repositories) = &request.repository_scope {
+        command.env(
+            environment::OSTROM_EFFECTIVE_REPOSITORIES.name,
+            repositories.join(","),
+        );
     }
     set_process_group(&mut command);
     let mut child = command.spawn().map_err(|error| {
@@ -863,7 +1343,15 @@ pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
         // wire; reusing it here, rather than a second list of failure
         // strings, is what keeps the exit status and the wire from drifting
         // apart (repo principle 6).
-        if matches!(event_outcome(&recorded_outcome), EventRunOutcome::Failed) {
+        // `Unstarted` counts too. Before ostrom#587 gave it an arm,
+        // `event_outcome` sent an unrecognised `unstarted` to its `Failed`
+        // catch-all, so a recorded `unstarted` already exited non-zero here.
+        // A run that did start cannot honestly record that it did not, and
+        // the new arm must not turn that into a silent exit 0.
+        if matches!(
+            event_outcome(&recorded_outcome),
+            EventRunOutcome::Failed | EventRunOutcome::Unstarted
+        ) {
             Err(PassError::failed(
                 request.role,
                 format!(
@@ -1669,6 +2157,7 @@ mod sink_refusal_tests {
                 model: None,
                 schedule: None,
                 repository: None,
+                repositories: None,
                 work_order: None,
                 ceilings: None,
             },
@@ -1705,6 +2194,8 @@ mod sink_refusal_tests {
             dispatchability_hash: None,
             queue_count: None,
             dispatchable_count: None,
+            repositories: None,
+            skipped_repositories: Vec::new(),
             events,
             control: None,
             process_exit: ProcessExit::Normal,
@@ -1969,8 +2460,26 @@ mod terminal_outcome_tests {
 }
 
 #[cfg(test)]
+mod event_outcome_tests {
+    use super::{EventRunOutcome, event_outcome};
+
+    // The wire mapping is a match with a `Failed` catch-all, so an outcome
+    // the fact ledger records but this function forgets goes out as `failed`
+    // without any error. ostrom#587's refusal depends on `unstarted` surviving.
+    #[test]
+    fn an_unstarted_run_reaches_the_wire_as_unstarted_not_failed() {
+        assert_eq!(event_outcome("unstarted"), EventRunOutcome::Unstarted);
+        assert_eq!(event_outcome("no-op"), EventRunOutcome::NoOp);
+        assert_eq!(event_outcome("no-candidates"), EventRunOutcome::NoOp);
+        assert_eq!(event_outcome("not-an-outcome"), EventRunOutcome::Failed);
+    }
+}
+
+#[cfg(test)]
 mod exit_code_tests {
-    use super::{BUDGET_HELD_EXIT_CODE, DISARMED_EXIT_CODE, PassError};
+    use super::{
+        BUDGET_HELD_EXIT_CODE, DISARMED_EXIT_CODE, HARNESS_UNAVAILABLE_EXIT_CODE, PassError,
+    };
 
     #[test]
     fn budget_held_disarmed_and_lease_held_have_distinct_exit_codes() {
@@ -1985,6 +2494,29 @@ mod exit_code_tests {
             DISARMED_EXIT_CODE
         );
         assert_eq!(PassError::LeaseHeld("builder").exit_code(), 0);
+    }
+
+    // A consumer that has only the exit status must still be able to tell the
+    // refusals apart (ostrom#587). The codes are distinct, and a harness
+    // refusal in particular does not share disarmed's EX_CONFIG.
+    #[test]
+    fn a_harness_refusal_exits_with_its_own_code_not_disarmed() {
+        let harness = PassError::HarnessUnsupported {
+            role: "builder",
+            version: "2.1.238".to_owned(),
+            path: std::path::PathBuf::from("claude"),
+            minimum: crate::permission_bridge::MIN_BRIDGE_HARNESS_VERSION,
+        };
+        assert_eq!(HARNESS_UNAVAILABLE_EXIT_CODE, 69);
+        assert_eq!(harness.exit_code(), HARNESS_UNAVAILABLE_EXIT_CODE);
+        let codes = [
+            harness.exit_code(),
+            PassError::Disarmed("builder").exit_code(),
+            PassError::BudgetHeld("builder").exit_code(),
+            PassError::LeaseHeld("builder").exit_code(),
+        ];
+        let distinct: std::collections::BTreeSet<i32> = codes.iter().copied().collect();
+        assert_eq!(distinct.len(), codes.len(), "exit codes collide: {codes:?}");
     }
 }
 
@@ -2061,14 +2593,18 @@ mod resolve_derived_settings_tests {
 
 #[cfg(all(test, unix))]
 mod platform_fallback_pass_tests {
-    // The pass-level counterpart to `resolve_derived_settings_tests`: the same
-    // injection (`PassRequest::platform`), run through the whole pass so the
-    // real `Command` this pass spawns is asserted on, not a stand-in for it.
-    use std::{fs, os::unix::fs::PermissionsExt};
+    // These pass-level tests run the real bridge/fallback decision and the real
+    // `Command` construction against a stub. Only the ten-second production
+    // timeout has a seam; timeout coverage injects a shorter value.
+    use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, time::Duration};
 
     use umwelt_runtime::{FileSink, Source};
 
-    use super::{Clock, OstromPaths, PassRequest, PassRole, run_pass};
+    use super::{
+        Clock, HARNESS_UNAVAILABLE_EXIT_CODE, OstromPaths, PassError, PassRequest, PassRole,
+        run_pass, run_pass_with_bridge_probe_timeout,
+    };
+    use crate::{permission_bridge::MIN_BRIDGE_HARNESS_VERSION, read_trace};
 
     const CLAUDE_STREAM_JSON: &str = concat!(
         "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"fallback-fixture\",\"model\":\"claude-fixture\"}\n",
@@ -2078,51 +2614,214 @@ mod platform_fallback_pass_tests {
         "\"usage\":{\"input_tokens\":10,\"output_tokens\":5,\"cache_read_input_tokens\":2,\"cache_creation_input_tokens\":3}}\n"
     );
 
+    const DERIVED: &str =
+        r#"{"permissions":{"defaultMode":"dontAsk","allow":["Bash(ostrom deploy *)"]}}"#;
+
+    struct HarnessFixture {
+        root: tempfile::TempDir,
+        paths: OstromPaths,
+        claude_bin: PathBuf,
+        argv_file: PathBuf,
+        calls_file: PathBuf,
+    }
+
+    impl HarnessFixture {
+        fn new(version_case: &str) -> Self {
+            let root = tempfile::tempdir().expect("temporary pass fixture");
+            let paths = OstromPaths {
+                config: root.path().to_path_buf(),
+                state: root.path().to_path_buf(),
+            };
+            fs::write(paths.state.join("loop-armed"), "").expect("arm pass");
+            let argv_file = root.path().join("argv.txt");
+            let calls_file = root.path().join("calls.txt");
+            let claude_bin = root.path().join("claude-stub");
+            fs::write(
+                &claude_bin,
+                format!(
+                    "#!/usr/bin/env bash\nprintf '%s\\n' \"$1\" >> '{}'\nif [[ \"$1\" == \"--version\" ]]; then\n{version_case}\nfi\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s' '{CLAUDE_STREAM_JSON}'\n",
+                    calls_file.display(),
+                    argv_file.display(),
+                ),
+            )
+            .expect("write claude stub");
+            fs::set_permissions(&claude_bin, fs::Permissions::from_mode(0o755))
+                .expect("chmod stub");
+            Self {
+                root,
+                paths,
+                claude_bin,
+                argv_file,
+                calls_file,
+            }
+        }
+
+        fn request(&self, platform: &'static str) -> PassRequest {
+            PassRequest {
+                paths: self.paths.clone(),
+                working_directory: self.root.path().to_path_buf(),
+                role: PassRole::Builder,
+                prompt: "ostrom#587 harness floor fixture".to_owned(),
+                permission_mode: PassRole::Builder.default_permission_mode(),
+                derived_settings: Some(DERIVED.to_owned()),
+                claude_bin: self.claude_bin.clone(),
+                signals: Default::default(),
+                supervisor_pid: None,
+                events_fd: None,
+                control_fd: None,
+                facts_only: false,
+                repositories: None,
+                skipped_repositories: Vec::new(),
+                repository_scope: None,
+                sweep: None,
+                caps: Default::default(),
+                clock: Clock::default(),
+                platform,
+            }
+        }
+
+        fn argv(&self) -> String {
+            fs::read_to_string(&self.argv_file).expect("read captured agent argv")
+        }
+
+        fn calls(&self) -> String {
+            fs::read_to_string(&self.calls_file).expect("read captured harness calls")
+        }
+    }
+
+    fn successful_version(version: impl std::fmt::Display) -> String {
+        format!("printf '%s\\n' '{version} (Claude Code)'\nexit 0")
+    }
+
+    fn assert_harness_refusal(fixture: &HarnessFixture, timeout: Duration) -> PassError {
+        let error = run_pass_with_bridge_probe_timeout(&fixture.request("linux"), timeout)
+            .expect_err("the bridged pass must refuse this harness");
+        assert_eq!(error.exit_code(), HARNESS_UNAVAILABLE_EXIT_CODE);
+        assert!(
+            matches!(&error, PassError::HarnessUnsupported { .. }),
+            "the refusal must keep its dedicated type: {error:?}"
+        );
+        assert!(
+            !fixture.argv_file.exists(),
+            "the stub received an agent invocation: {}",
+            fixture.argv()
+        );
+        error
+    }
+
     #[test]
-    fn a_policy_adopted_pass_survives_a_platform_with_no_bridge() {
-        let root = tempfile::tempdir().expect("temporary pass fixture");
-        let paths = OstromPaths {
-            config: root.path().to_path_buf(),
-            state: root.path().to_path_buf(),
-        };
-        fs::write(paths.state.join("loop-armed"), "").expect("arm pass");
-        let argv_file = root.path().join("argv.txt");
-        let claude_bin = root.path().join("claude-stub");
-        fs::write(
-            &claude_bin,
-            format!(
-                "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > {}\nprintf '%s' '{CLAUDE_STREAM_JSON}'\n",
-                argv_file.display()
-            ),
-        )
-        .expect("write claude stub");
-        fs::set_permissions(&claude_bin, fs::Permissions::from_mode(0o755)).expect("chmod stub");
+    fn bridged_pass_refuses_a_version_below_the_lowest_verified_version() {
+        let fixture = HarnessFixture::new(&successful_version("2.1.238"));
+        let error = assert_harness_refusal(&fixture, Duration::from_secs(1));
+        let message = error.to_string();
+        assert!(message.contains("2.1.238"), "{message}");
+        assert!(
+            message.contains(&MIN_BRIDGE_HARNESS_VERSION.to_string()),
+            "{message}"
+        );
+        let harness_path = fixture.claude_bin.to_string_lossy();
+        assert!(message.contains(harness_path.as_ref()), "{message}");
+        assert!(message.contains("--permission-prompts"), "{message}");
+        assert!(message.contains("--permission-prompt-tool"), "{message}");
+        assert!(
+            message.contains("upgrade Claude Code to at least"),
+            "{message}"
+        );
+        assert_eq!(fixture.calls(), "--version\n");
 
-        let derived =
-            r#"{"permissions":{"defaultMode":"dontAsk","allow":["Bash(ostrom deploy *)"]}}"#;
-        let request = PassRequest {
-            paths: paths.clone(),
-            working_directory: root.path().to_path_buf(),
-            role: PassRole::Builder,
-            prompt: "ostrom#544 fallback fixture".to_owned(),
-            permission_mode: PassRole::Builder.default_permission_mode(),
-            derived_settings: Some(derived.to_owned()),
-            claude_bin,
-            signals: Default::default(),
-            supervisor_pid: None,
-            events_fd: None,
-            control_fd: None,
-            facts_only: false,
-            caps: Default::default(),
-            clock: Clock::default(),
-            // Injected, not the host running this test (ostrom#544): CI runs
-            // this on Linux, where the real bridge would otherwise succeed
-            // and this test would exercise nothing.
-            platform: "windows",
-        };
+        let trace = read_trace(&fixture.paths.trace_file()).expect("read pass trace");
+        let terminal = trace
+            .rows
+            .into_iter()
+            .filter_map(Result::ok)
+            .find(|row| row.kind == "pass-ended")
+            .expect("the refusal records pass-ended");
+        assert_eq!(terminal.fact["outcome"], "unstarted");
+        assert_eq!(terminal.fact["reason"], "harness-unsupported");
+
+        let run_id = fs::read_dir(fixture.paths.runs_dir())
+            .expect("read run records")
+            .next()
+            .expect("one run record")
+            .expect("read run entry")
+            .file_name()
+            .into_string()
+            .expect("UTF-8 run id");
+        let events = FileSink::new(fixture.paths.runs_dir())
+            .read_from(&run_id, 0)
+            .expect("read durable events");
+        assert!(
+            events
+                .iter()
+                .all(|event| !event.event_type.starts_with("agent.")),
+            "a refused pass must not emit agent events: {events:?}"
+        );
+        assert_eq!(events.last().unwrap().payload["outcome"], "unstarted");
+        assert_eq!(
+            events.last().unwrap().payload["reason"],
+            "harness-unsupported"
+        );
+    }
+
+    #[test]
+    fn bridged_pass_accepts_the_lowest_verified_version_and_adds_bridge_flags() {
+        let fixture = HarnessFixture::new(&successful_version(MIN_BRIDGE_HARNESS_VERSION));
+        run_pass(&fixture.request("linux"))
+            .expect("the lowest verified version must pass the bridge floor");
+        assert_eq!(fixture.calls(), "--version\n--print\n");
+        assert!(
+            fixture
+                .argv()
+                .lines()
+                .any(|arg| arg == "--permission-prompts"),
+            "the accepted pass did not receive bridge flags"
+        );
+    }
+
+    #[test]
+    fn bridged_pass_refuses_garbage_version_output() {
+        let fixture = HarnessFixture::new("printf '%s\\n' 'not a version'\nexit 0");
+        let error = assert_harness_refusal(&fixture, Duration::from_secs(1));
+        assert!(error.to_string().contains("could not be parsed"));
+    }
+
+    #[test]
+    fn bridged_pass_refuses_a_nonzero_version_probe() {
+        let fixture = HarnessFixture::new("printf '%s\\n' 'probe failed' >&2\nexit 17");
+        let error = assert_harness_refusal(&fixture, Duration::from_secs(1));
+        let message = error.to_string();
+        assert!(message.contains("exited"), "{message}");
+        assert!(message.contains("probe failed"), "{message}");
+    }
+
+    #[test]
+    fn bridged_pass_refuses_a_version_probe_that_cannot_spawn() {
+        let fixture = HarnessFixture::new(&successful_version(MIN_BRIDGE_HARNESS_VERSION));
+        fs::write(&fixture.claude_bin, "not an executable format")
+            .expect("replace stub with invalid executable");
+        let error = assert_harness_refusal(&fixture, Duration::from_secs(1));
+        assert!(error.to_string().contains("could not start"));
+    }
+
+    #[test]
+    fn bridged_pass_refuses_a_version_probe_timeout() {
+        let fixture = HarnessFixture::new("while :; do :; done");
+        let error = assert_harness_refusal(&fixture, Duration::from_millis(30));
+        assert!(error.to_string().contains("timed out"));
+    }
+
+    #[test]
+    fn fallback_pass_launches_the_same_old_harness_without_a_version_probe() {
+        let fixture = HarnessFixture::new(&successful_version("2.1.238"));
+        let request = fixture.request("windows");
         run_pass(&request).expect("a platform with no bridge must not fail the pass");
+        assert_eq!(
+            fixture.calls(),
+            "--print\n",
+            "a fallback pass must not run the version probe"
+        );
 
-        let argv = fs::read_to_string(&argv_file).expect("read captured argv");
+        let argv = fixture.argv();
         for flag in [
             "--mcp-config",
             "--strict-mcp-config",
@@ -2141,22 +2840,23 @@ mod platform_fallback_pass_tests {
             .expect("--settings must still be passed");
         let settings_path = std::path::PathBuf::from(lines[settings_index + 1]);
         assert!(
-            settings_path.starts_with(paths.runs_dir()),
+            settings_path.starts_with(fixture.paths.runs_dir()),
             "fallback settings must live under the run directory: {settings_path:?}"
         );
         assert_eq!(
             fs::read_to_string(&settings_path).expect("read fallback settings"),
-            derived
+            DERIVED
         );
         assert!(
-            !paths
+            !fixture
+                .paths
                 .state
                 .join("roles/builder.derived.settings.json")
                 .exists(),
             "a fallback pass must never write the shared derived settings file"
         );
 
-        let run_entries: Vec<_> = fs::read_dir(paths.runs_dir())
+        let run_entries: Vec<_> = fs::read_dir(fixture.paths.runs_dir())
             .expect("read runs directory")
             .map(|entry| entry.expect("run directory entry"))
             .collect();
@@ -2169,7 +2869,7 @@ mod platform_fallback_pass_tests {
             .file_name()
             .into_string()
             .expect("run id is valid UTF-8");
-        let events = FileSink::new(paths.runs_dir())
+        let events = FileSink::new(fixture.paths.runs_dir())
             .read_from(&run_id, 0)
             .expect("read durable events");
         // ostrom#546: `run_pass` is invoked as a one-off dispatch, never a
@@ -2217,5 +2917,273 @@ mod platform_fallback_pass_tests {
             "failed",
             "a platform with no bridge must not fail the pass: {events:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod sweep_freshness_tests {
+    use std::{
+        fs,
+        path::PathBuf,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    use serde_json::json;
+
+    use super::{
+        PassRequest, PassRole, PassSweepOutcome, PassSweepRequest, prepare_sweep, run_pass,
+    };
+    use crate::{
+        Clock, OstromPaths, OwnedLease, PublishTarget, SweepMode, SweepOptions, read_trace,
+    };
+
+    #[test]
+    fn shipped_prompts_do_not_run_a_sweep() {
+        for (name, prompt) in [
+            ("work", include_str!("../assets/prompts/work.md")),
+            ("gatekeep", include_str!("../assets/prompts/gatekeep.md")),
+            ("merge", include_str!("../assets/prompts/merge.md")),
+            ("triage", include_str!("../assets/prompts/triage.md")),
+        ] {
+            assert!(
+                !prompt.contains("ostrom sweep"),
+                "{name} prompt runs a sweep"
+            );
+        }
+    }
+
+    fn request(
+        root: &std::path::Path,
+        now: &str,
+        fixture: Option<PathBuf>,
+        max_age_seconds: u64,
+    ) -> PassRequest {
+        let paths = OstromPaths {
+            config: root.to_path_buf(),
+            state: root.to_path_buf(),
+        };
+        let clock = Clock::fixed(now.parse().expect("valid pass time"));
+        PassRequest {
+            paths: paths.clone(),
+            working_directory: root.to_path_buf(),
+            role: PassRole::Builder,
+            prompt: "unused freshness prompt".to_owned(),
+            permission_mode: PassRole::Builder.default_permission_mode(),
+            derived_settings: None,
+            claude_bin: root.join("agent-must-not-run"),
+            signals: Default::default(),
+            supervisor_pid: None,
+            events_fd: None,
+            control_fd: None,
+            facts_only: false,
+            repositories: None,
+            skipped_repositories: Vec::new(),
+            repository_scope: None,
+            sweep: Some(PassSweepRequest {
+                options: SweepOptions {
+                    paths,
+                    working_directory: root.to_path_buf(),
+                    executable: root.join("unused-ostrom"),
+                    plugin_root: root.to_path_buf(),
+                    started_at: clock.now(),
+                    requested_mode: SweepMode::Auto,
+                    fixture,
+                    publish: PublishTarget::Disabled,
+                    policy: None,
+                },
+                max_age_seconds,
+            }),
+            caps: Default::default(),
+            clock,
+            platform: std::env::consts::OS,
+        }
+    }
+
+    fn write_sweep_inputs(root: &std::path::Path) -> PathBuf {
+        fs::write(
+            root.join("mandates.yaml"),
+            "provider: file\ncadence_hours: 1\nstuck_after_days: 7\nprojects:\n  - repo: placeholder-org/alpha\n",
+        )
+        .expect("write mandate roster");
+        let fixture = root.join("sweep.json");
+        fs::write(
+            &fixture,
+            serde_json::to_vec(&json!({
+                "repositories": [{
+                    "repo": "placeholder-org/alpha",
+                    "issues": [],
+                    "open_prs": []
+                }]
+            }))
+            .expect("serialize sweep fixture"),
+        )
+        .expect("write sweep fixture");
+        fixture
+    }
+
+    #[test]
+    fn young_generation_is_reused_and_old_or_absent_generations_are_swept() {
+        let fresh = tempfile::tempdir().expect("fresh generation fixture");
+        fs::write(
+            fresh.path().join("state.json"),
+            serde_json::to_vec(&json!({
+                "sweep_generation": {
+                    "id": "young-generation",
+                    "completed_at": "2026-09-15T10:00:00Z"
+                }
+            }))
+            .expect("serialize state"),
+        )
+        .expect("write state");
+        assert_eq!(
+            prepare_sweep(&request(fresh.path(), "2026-09-15T10:29:59Z", None, 1_800,))
+                .map(|prepared| prepared.outcome),
+            Ok(PassSweepOutcome::Reused("young-generation".to_owned()))
+        );
+
+        for completed_at in [None, Some("2026-09-15T09:59:59Z")] {
+            let stale = tempfile::tempdir().expect("stale generation fixture");
+            let fixture = write_sweep_inputs(stale.path());
+            if let Some(completed_at) = completed_at {
+                fs::write(
+                    stale.path().join("state.json"),
+                    serde_json::to_vec(&json!({
+                        "sweep_generation": {
+                            "id": "old-generation",
+                            "completed_at": completed_at
+                        }
+                    }))
+                    .expect("serialize old generation"),
+                )
+                .expect("write old generation");
+            }
+            let outcome = prepare_sweep(&request(
+                stale.path(),
+                "2026-09-15T10:30:00Z",
+                Some(fixture),
+                1_800,
+            ))
+            .expect("stale pass sweeps");
+            assert!(matches!(outcome.outcome, PassSweepOutcome::Swept(_)));
+        }
+    }
+
+    #[test]
+    fn failed_sweep_ends_the_pass_before_an_agent_turn_and_records_the_reason() {
+        let root = tempfile::tempdir().expect("failed sweep fixture");
+        fs::write(root.path().join("loop-armed"), "").expect("arm pass");
+        let result = run_pass(&request(root.path(), "2026-09-15T10:30:00Z", None, 1_800));
+        let error = result.expect_err("missing sweep roster fails the pass");
+        assert!(error.to_string().contains("sweep-failed"), "{error}");
+        assert!(!root.path().join("agent-must-not-run").exists());
+        assert!(!root.path().join("pass-runs").exists());
+        let trace = read_trace(&root.path().join("sprint.jsonl")).expect("read pass trace");
+        let rows = trace
+            .rows
+            .iter()
+            .map(|row| row.as_ref().expect("valid pass trace row"))
+            .collect::<Vec<_>>();
+        assert_eq!(rows[0].kind, "pass-started");
+        assert_eq!(rows[0].fact["sweep"], "failed");
+        assert_eq!(rows[1].kind, "pass-ended");
+        assert_eq!(rows[1].fact["reason"], "sweep-failed");
+    }
+
+    #[test]
+    fn pass_waits_for_a_held_sweep_lease_then_reuses_the_completed_generation() {
+        let root = tempfile::tempdir().expect("held sweep lease fixture");
+        let paths = OstromPaths {
+            config: root.path().to_path_buf(),
+            state: root.path().to_path_buf(),
+        };
+        let lease = OwnedLease::acquire(
+            &paths.state,
+            "sweep.lease",
+            "concurrent-sweep",
+            Clock::realtime().epoch_seconds(),
+            60,
+        )
+        .expect("hold sweep lease");
+        let state_path = root.path().join("state.json");
+        let snapshot_path = root.path().join("sweep-snapshot.json");
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            let generation = json!({
+                "id": "concurrent-generation",
+                "completed_at": "2026-09-15T10:20:00Z"
+            });
+            fs::write(
+                state_path,
+                serde_json::to_vec(&json!({"sweep_generation": generation.clone()}))
+                    .expect("serialize completed sweep state"),
+            )
+            .expect("write completed sweep state");
+            fs::write(
+                snapshot_path,
+                serde_json::to_vec(&json!({
+                    "generation": generation,
+                    "repositories": []
+                }))
+                .expect("serialize completed sweep snapshot"),
+            )
+            .expect("write completed sweep snapshot");
+            drop(lease);
+        });
+
+        let started = Instant::now();
+        let prepared = prepare_sweep(&request(root.path(), "2026-09-15T10:30:00Z", None, 1_800))
+            .expect("pass reuses concurrent sweep");
+        writer.join().expect("concurrent sweep writer");
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        assert_eq!(
+            prepared.outcome,
+            PassSweepOutcome::Reused("concurrent-generation".to_owned())
+        );
+    }
+
+    #[test]
+    fn gatekeeper_repairs_a_fresh_state_snapshot_mismatch_with_one_sweep() {
+        let root = tempfile::tempdir().expect("mismatched sweep fixture");
+        let fixture = write_sweep_inputs(root.path());
+        fs::write(
+            root.path().join("state.json"),
+            serde_json::to_vec(&json!({
+                "sweep_generation": {
+                    "id": "state-generation",
+                    "completed_at": "2026-09-15T10:20:00Z"
+                }
+            }))
+            .expect("serialize mismatched state"),
+        )
+        .expect("write mismatched state");
+        fs::write(
+            root.path().join("sweep-snapshot.json"),
+            serde_json::to_vec(&json!({
+                "generation": {
+                    "id": "snapshot-generation",
+                    "completed_at": "2026-09-15T10:20:00Z"
+                },
+                "repositories": []
+            }))
+            .expect("serialize mismatched snapshot"),
+        )
+        .expect("write mismatched snapshot");
+        let mut request = request(root.path(), "2026-09-15T10:30:00Z", Some(fixture), 1_800);
+        request.role = PassRole::Gatekeeper;
+        request.repository_scope = Some(vec!["placeholder-org/alpha".to_owned()]);
+
+        let prepared = prepare_sweep(&request).expect("gatekeeper repairs mismatch");
+        assert!(matches!(prepared.outcome, PassSweepOutcome::Swept(_)));
+        assert_eq!(prepared.snapshots.as_ref().map(Vec::len), Some(1));
+        let state: serde_json::Value = serde_json::from_slice(
+            &fs::read(root.path().join("state.json")).expect("read repaired state"),
+        )
+        .expect("parse repaired state");
+        let snapshot: serde_json::Value = serde_json::from_slice(
+            &fs::read(root.path().join("sweep-snapshot.json")).expect("read repaired snapshot"),
+        )
+        .expect("parse repaired snapshot");
+        assert_eq!(state["sweep_generation"], snapshot["generation"]);
     }
 }

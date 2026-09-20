@@ -1,12 +1,13 @@
 # Mandate Gatekeep
 
-Poll every repository in the mandate roster for open pull requests and drive the
-artifact-only Merge Protocol over each one. This loop may be started only by the
-principal in a separate gatekeeper session. The Merge Protocol is the second half
-of this document.
+Drive the artifact-only Merge Protocol over the pull requests in the sweep
+snapshot supplied at the end of this prompt. This loop may be started only by
+the principal in a separate gatekeeper session. The Merge Protocol is the
+second half of this document.
 
 Run the stateless after-implementation loop. This prompt is a thin driver over
-the Merge Protocol below; it discovers candidates but does not create another gate.
+the Merge Protocol below; the pass supplies its candidates and this session
+does not create another gate.
 
 ## 1. Enforce who starts the loop
 
@@ -59,23 +60,20 @@ external return only in narration. If a trace append fails, end the pass as a
 failure, release the lease as described in step 8, and stop rather than running
 an invisible pass.
 
-## 3. Resolve the roster once per iteration
+## 3. Accept the pass-supplied snapshot scope
 
-Use the existing mandate config resolution. Do not read the YAML directly or
-implement another roster parser. Resolve the same layered roster through the
-native CLI:
+The pass refreshed or reused one successful sweep generation before this
+session started. It appended JSON to this prompt containing that generation's
+identifier, the effective repositories, and the snapshot pull-request
+pointers in those repositories. Treat that JSON as the complete roster and
+candidate input for this iteration.
 
-```sh
-ostrom config
-```
-
-This prints the resolved roster JSON used by every native caller. If mandate
-is not configured, config resolution
-fails, or the resolved `projects` list is empty, report that fact to the
-principal and end the pass. From the resolved JSON, take only each
-project's `repo` pointer. Every roster repository is in scope, including a
-project marked `paused`; gatekeeping open pull requests is not routine
-builder work.
+Do not read mandate YAML, resolve another roster, enumerate live pull requests,
+or add a repository or candidate. An empty `pull_requests` list is a valid
+idle iteration that the pass normally ends before starting this session. If
+one is nevertheless supplied, judge nothing. A malformed or missing
+pass-supplied JSON block is a pass failure: report it to the principal and stop
+before acquiring artifacts.
 
 ## 4. Authenticate per repository through the shared App
 
@@ -83,15 +81,15 @@ builder work.
 there is no ambient credential here to discard or fall back to by accident.
 Never call `gh` directly, and never run a command that itself calls `gh`
 (such as `ostrom gate`) directly either. A session never needs to handle the
-installation token itself. Route every `gh` call for a roster repository
+installation token itself. Route every `gh` call for a supplied repository
 through `ostrom credential`, naming the role, repository, and complete scope
 ahead of the command to run:
 
 ```sh
 ostrom credential gatekeeper "$repository" \
   --repositories "$repository" \
-  --permissions metadata:read,pull_requests:read -- \
-  gh pr list --repo "$repository" --state open --limit 100 --json number
+  --permissions metadata:read,issues:read,pull_requests:read,checks:read,statuses:read,contents:read -- \
+  ostrom gate "$repository#$pr_number"
 ```
 
 `ostrom credential` mints a fresh installation token for that repository and
@@ -103,10 +101,11 @@ other exit code is the given command's own, unchanged.
 
 The required `gatekeeper` argument names the caller at the call site; it does
 not narrow the shared token. The mandatory flags make the repository-local
-`metadata:read,pull_requests:read` scope explicit; every pagination retry must
-repeat the same command shape. The gatekeeper's own role is
-recorded in its `decision-taken` trace record, not stamped onto the merge commit — see
-Merge Protocol step 4 for why. An `Ostrom-Role: builder` trailer arriving on a
+`metadata:read,issues:read,pull_requests:read,checks:read,statuses:read,contents:read`
+scope explicit; every acquisition retry must repeat the same command shape.
+The gatekeeper's own role is recorded in its `decision-taken` trace record, not
+stamped onto the merge commit — see Merge Protocol step 4 for why. An
+`Ostrom-Role: builder` trailer arriving on a
 commit under review was written by the builder itself, so it is self-asserted
 advisory metadata, not evidence of who acted and never an input to the gate.
 
@@ -147,11 +146,11 @@ Keep these two exit-`111` cases distinct:
   credential values, append the terminal row, release the lease, and end the
   pass.
 - **Minting fails for one repository.** Any other exit `111` from a correctly
-  formed roster-repository invocation is scoped to that repository. Retry the
+  formed repository invocation is scoped to that repository. Retry the
   exact same `ostrom credential` invocation once immediately, still with the
   `gatekeeper` role and that repository. If the retry also exits `111`, add the
   repository once to `skipped_repos`, report that it was skipped, discard any
-  partially enumerated candidates for it, and continue to the next repository.
+  candidates for it, and continue to the next repository.
   One immediate retry is the deliberate bound: it cheaply absorbs a transient
   installation lookup or token exchange failure without repeatedly delaying a
   pass against a genuinely broken repository.
@@ -162,25 +161,14 @@ environment.** Ending the pass for an unusable credential configuration and
 skipping a repository after its bounded retry both fail closed. An ambient
 token would escape the App's repository blast radius.
 
-## 5. Enumerate every open pull request
+## 5. Read every snapshot candidate
 
-Poll GitHub for all open pull requests in every roster repository, issuing
-every call through `ostrom credential` as in step 4. Each invocation mints and uses
-its own token and exits with it, so there is no persisted `GH_TOKEN` to
-unset between repositories or between pages. Paginate until there are no more results. Do not filter candidates through mandate
+Build the list of `(repo, PR number)` pointers directly from the supplied
+`pull_requests` array before evaluating any one of them. Verify that every
+pointer's repository occurs in `effective_repositories`; if one does not, fail
+the pass rather than judging it. Do not filter candidates through mandate
 selectors, the queue, prior gate verdicts, draft state, labels, or conclusions
-from another pull request. An iteration covers the whole roster because the
-artifact gate evaluates each pull request independently.
-
-Apply step 4's bounded retry to every pagination call. If a repository is
-skipped after a later page fails, discard the earlier pages from that
-repository so a partial enumeration is never mistaken for its complete set.
-Continue enumerating every other roster repository.
-
-Build a list of `(repo, PR number)` pointers before evaluating any one of them.
-Do not accept a candidate list from the builder. Judge every candidate gathered
-from successfully enumerated repositories even when `skipped_repos` is not
-empty.
+from another pull request. Do not accept a candidate list from the builder.
 
 ## 6. Drive the Merge Protocol independently for each candidate
 
@@ -236,9 +224,9 @@ duplicate comment suppressed, escalated to principal, and repeat escalation
 suppressed. `permission-denied` and `write-failed` are named actions; each must
 name its `operation` and `requested_scope`. Also emit one line per skipped
 repository naming its `owner/repo` pointer and that token minting still failed
-after one retry. If no open pull requests exist in the repositories that were
-successfully enumerated, report that once; do not describe a skipped repository
-as having no open pull requests.
+after one retry. If the snapshot contains no pull requests in the effective
+repositories, report that once; do not describe a skipped repository as having
+no open pull requests.
 
 Then stop. The external pass timer owns the next poll; never create, renew, or
 wait on an in-session recurring wake. Do not switch to event-driven delivery.
