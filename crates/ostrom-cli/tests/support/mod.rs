@@ -108,6 +108,16 @@ pub fn copy_fixture_directory(source: &Path) -> TempDir {
 /// rather than inheriting a pass it has not earned; a general name in shared
 /// support is exactly how an unearned pass spreads.
 ///
+/// **Those omissions are deliberate and must stay.** This guard can be
+/// tightened on shapes — a scheme, a bare hostname, an org-like token — but
+/// never by adding the names principle 3 keeps out: that list would then live
+/// in this public repository and be the disclosure it exists to prevent. A
+/// guard against naming a thing cannot name the thing.
+///
+/// So it is one-sided by construction rather than by neglect. A positive
+/// result is evidence; a clean result is not proof of absence, and no amount
+/// of work on this function will make it proof.
+///
 /// The two rules are not redundant: a bare hostname carrying no scheme escapes
 /// the `://` test, and is caught only if it happens to contain a listed word.
 ///
