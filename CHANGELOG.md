@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **Breaking:** `RepairError::Invalidate` is removed from the public
+  `ostrom-store` enum (#599). A repair that changes a repository no longer
+  fails outright when it cannot invalidate the sweep generation — contention
+  with an in-flight sweep, or any other invalidation failure, is recorded as
+  a stderr diagnostic instead, so the repair's own exit code is unaffected.
+  Nothing outside this workspace consumes `ostrom-store` today, so this costs
+  nothing now, but it is a breaking change to a public type and is recorded
+  as one.
+
 ## 0.16.0 (2026-09-18)
 
 - `ostrom goals validate [<path>]` parses and validates an operator-authored

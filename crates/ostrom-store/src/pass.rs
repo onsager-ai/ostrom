@@ -34,7 +34,9 @@ use crate::{
     pass_control::ControlInput,
     read_lease, read_pass_state, read_trace,
     selection::dispatchability_snapshot,
-    sweep::{run_sweep_holding_lease, wait_for_sweep_lease},
+    sweep::{
+        SWEEP_LEASE_CEILING_SECONDS, SweepError, run_sweep_holding_lease, wait_for_sweep_lease_for,
+    },
     write_pass_state,
 };
 
@@ -63,6 +65,15 @@ const HARNESS_UNAVAILABLE_EXIT_CODE: i32 = 69;
 // EX_TEMPFAIL: the pass is held at its daily spend cap and can run once
 // the ceiling resets or is raised.
 const BUDGET_HELD_EXIT_CODE: i32 = 75;
+// Sysexits has no "resource busy" meaning, so 76 is chosen only because it is
+// a free value alongside the three exit codes above, not for its sysexits
+// `EX_PROTOCOL` name. Lease contention (ostrom#599) gets its own status
+// rather than sharing BUDGET_HELD_EXIT_CODE: contention resolves itself by
+// retrying unchanged, unlike a daily-cap hold, which calls for different
+// operator action. The same number is used on the `ostrom sweep` CLI path
+// (not routed through `PassError`) so a supervisor sees one status for one
+// condition regardless of which surface hit it.
+pub const SWEEP_LEASE_CONTENTION_EXIT_CODE: i32 = 76;
 const DEFAULT_DAILY_CAP_USD: f64 = 50.0;
 const DEFAULT_LEASE_TTL_SECONDS: u64 = 3_600;
 const PASS_TERMINATION_GRACE: Duration = Duration::from_millis(PASS_KILL_GRACE_MS);
@@ -235,7 +246,54 @@ impl PassSweepOutcome {
     }
 }
 
-fn prepare_sweep(request: &PassRequest) -> Result<PreparedSweep, String> {
+/// A `prepare_sweep` failure, distinguishing lease contention from every
+/// other sweep failure so the caller can give contention its own reason and
+/// exit status (ostrom#599) instead of flattening every cause to a string.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+enum PrepareSweepError {
+    #[error("{0}")]
+    LeaseContention(String),
+    #[error("{0}")]
+    Other(String),
+}
+
+/// Classify a sweep failure as lease contention or anything else. Both
+/// `SweepError::LeaseHeld` (the pass's own single acquisition attempt) and
+/// `SweepError::LeaseWaitTimedOut` (the bounded wait ran out) mean the same
+/// thing to a caller: the lease stayed held by someone else, not that the
+/// sweep itself failed.
+fn classify_sweep_error(error: SweepError) -> PrepareSweepError {
+    if matches!(
+        error,
+        SweepError::LeaseHeld | SweepError::LeaseWaitTimedOut { .. }
+    ) {
+        PrepareSweepError::LeaseContention(error.to_string())
+    } else {
+        PrepareSweepError::Other(error.to_string())
+    }
+}
+
+/// The trace `reason` and pass exit status a `prepare_sweep` failure is
+/// recorded and exited with. A pure function so the mapping itself, not just
+/// its use inside `run_pass`, is directly testable (ostrom#599).
+const fn sweep_failure_status(error: &PrepareSweepError) -> (&'static str, i32) {
+    match error {
+        PrepareSweepError::LeaseContention(_) => {
+            ("sweep-lease-contention", SWEEP_LEASE_CONTENTION_EXIT_CODE)
+        }
+        PrepareSweepError::Other(_) => ("sweep-failed", 1),
+    }
+}
+
+/// Takes an explicit sweep-lease wait ceiling (ostrom#599) rather than
+/// defaulting to `SWEEP_LEASE_CEILING_SECONDS` itself, so a test that wants
+/// to drive contention to its exit status is not stuck with the production
+/// default. `run_pass`'s own call site passes `SWEEP_LEASE_CEILING_SECONDS`
+/// explicitly for its production wait.
+fn prepare_sweep(
+    request: &PassRequest,
+    sweep_wait: Duration,
+) -> Result<PreparedSweep, PrepareSweepError> {
     let Some(sweep) = &request.sweep else {
         return Ok(PreparedSweep {
             outcome: PassSweepOutcome::NotManaged,
@@ -245,8 +303,9 @@ fn prepare_sweep(request: &PassRequest) -> Result<PreparedSweep, String> {
     // The freshness decision and gatekeeper snapshot read share the writer's
     // lease. A pass that arrives during a sweep waits once, then evaluates the
     // generation the completed writer actually left behind.
-    let lease = wait_for_sweep_lease(&request.paths).map_err(|error| error.to_string())?;
-    let latest = latest_successful_generation(&request.paths).map_err(|error| error.to_string())?;
+    let lease =
+        wait_for_sweep_lease_for(&request.paths, sweep_wait).map_err(classify_sweep_error)?;
+    let latest = latest_successful_generation(&request.paths).map_err(classify_sweep_error)?;
     let reusable = latest.filter(|generation| {
         generation_is_fresh(generation, request.clock.now(), sweep.max_age_seconds)
     });
@@ -266,12 +325,11 @@ fn prepare_sweep(request: &PassRequest) -> Result<PreparedSweep, String> {
             });
         }
     }
-    let outcome =
-        run_sweep_holding_lease(&sweep.options, lease).map_err(|error| error.to_string())?;
+    let outcome = run_sweep_holding_lease(&sweep.options, lease).map_err(classify_sweep_error)?;
     let snapshots = (request.role == PassRole::Gatekeeper)
         .then(|| load_sweep_snapshot(&request.paths, &outcome.generation))
         .transpose()
-        .map_err(|error| error.to_string())?;
+        .map_err(classify_sweep_error)?;
     Ok(PreparedSweep {
         outcome: PassSweepOutcome::Swept(outcome.generation.id),
         snapshots,
@@ -735,7 +793,11 @@ fn resolve_derived_settings(
 }
 
 pub fn run_pass(request: &PassRequest) -> Result<(), PassError> {
-    run_pass_with_bridge_probe_timeout(request, BRIDGE_HARNESS_PROBE_TIMEOUT)
+    run_pass_with_bridge_probe_timeout(
+        request,
+        BRIDGE_HARNESS_PROBE_TIMEOUT,
+        Duration::from_secs(SWEEP_LEASE_CEILING_SECONDS),
+    )
 }
 
 fn probe_bridge_harness_version(
@@ -819,6 +881,7 @@ fn probe_bridge_harness_version(
 fn run_pass_with_bridge_probe_timeout(
     request: &PassRequest,
     bridge_probe_timeout: Duration,
+    sweep_wait: Duration,
 ) -> Result<(), PassError> {
     let mut events = RunEventGuard::start(
         &request.paths,
@@ -969,15 +1032,19 @@ fn run_pass_with_bridge_probe_timeout(
         process_exit: ProcessExit::Abnormal,
         permission_bridge: None,
     };
-    let prepared = prepare_sweep(request)
-        .and_then(|sweep| session_prompt(request, &sweep).map(|session| (sweep, session)));
+    let prepared = prepare_sweep(request, sweep_wait).and_then(|sweep| {
+        session_prompt(request, &sweep)
+            .map(|session| (sweep, session))
+            .map_err(PrepareSweepError::Other)
+    });
     let (sweep, session) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
+            let (reason, exit_code) = sweep_failure_status(&error);
             let mut fact = Map::from_iter([
                 ("owner".to_owned(), json!(owner)),
                 ("sweep".to_owned(), json!("failed")),
-                ("reason".to_owned(), json!("sweep-failed")),
+                ("reason".to_owned(), json!(reason)),
             ]);
             if let Some(repositories) = &request.repositories {
                 fact.insert("repositories".to_owned(), json!(repositories));
@@ -1006,13 +1073,13 @@ fn run_pass_with_bridge_probe_timeout(
             })?;
             guard.started = true;
             guard.outcome = Some("failed".to_owned());
-            guard.reason = Some("sweep-failed".to_owned());
+            guard.reason = Some(reason.to_owned());
             guard.cost_usd = Some(0.0);
             guard.finish()?;
             return Err(PassError::failed(
                 request.role,
-                format!("sweep-failed: {error}"),
-                1,
+                format!("{reason}: {error}"),
+                exit_code,
             ));
         }
     };
@@ -2479,12 +2546,14 @@ mod event_outcome_tests {
 mod exit_code_tests {
     use super::{
         BUDGET_HELD_EXIT_CODE, DISARMED_EXIT_CODE, HARNESS_UNAVAILABLE_EXIT_CODE, PassError,
+        SWEEP_LEASE_CONTENTION_EXIT_CODE,
     };
 
     #[test]
     fn budget_held_disarmed_and_lease_held_have_distinct_exit_codes() {
         assert_eq!(BUDGET_HELD_EXIT_CODE, 75);
         assert_eq!(DISARMED_EXIT_CODE, 78);
+        assert_eq!(SWEEP_LEASE_CONTENTION_EXIT_CODE, 76);
         assert_eq!(
             PassError::BudgetHeld("builder").exit_code(),
             BUDGET_HELD_EXIT_CODE
@@ -2498,7 +2567,9 @@ mod exit_code_tests {
 
     // A consumer that has only the exit status must still be able to tell the
     // refusals apart (ostrom#587). The codes are distinct, and a harness
-    // refusal in particular does not share disarmed's EX_CONFIG.
+    // refusal in particular does not share disarmed's EX_CONFIG. Sweep-lease
+    // contention (ostrom#599) is included: it must not collide with the
+    // daily-cap hold it is deliberately distinct from.
     #[test]
     fn a_harness_refusal_exits_with_its_own_code_not_disarmed() {
         let harness = PassError::HarnessUnsupported {
@@ -2514,9 +2585,60 @@ mod exit_code_tests {
             PassError::Disarmed("builder").exit_code(),
             PassError::BudgetHeld("builder").exit_code(),
             PassError::LeaseHeld("builder").exit_code(),
+            SWEEP_LEASE_CONTENTION_EXIT_CODE,
         ];
         let distinct: std::collections::BTreeSet<i32> = codes.iter().copied().collect();
         assert_eq!(distinct.len(), codes.len(), "exit codes collide: {codes:?}");
+    }
+}
+
+#[cfg(test)]
+mod sweep_lease_contention_mapping_tests {
+    use super::{
+        PrepareSweepError, SWEEP_LEASE_CONTENTION_EXIT_CODE, SweepError, classify_sweep_error,
+        sweep_failure_status,
+    };
+
+    // The mapping this guards: a sweep failure caused by the lease staying
+    // held by someone else must read as contention, not as a generic sweep
+    // failure, however it was observed (an immediate `LeaseHeld` from a
+    // single acquisition attempt, or a `LeaseWaitTimedOut` once the bounded
+    // wait ran out).
+    #[test]
+    fn lease_held_and_lease_wait_timed_out_both_classify_as_contention() {
+        assert!(matches!(
+            classify_sweep_error(SweepError::LeaseHeld),
+            PrepareSweepError::LeaseContention(_)
+        ));
+        assert!(matches!(
+            classify_sweep_error(SweepError::LeaseWaitTimedOut { seconds: 1_800 }),
+            PrepareSweepError::LeaseContention(_)
+        ));
+    }
+
+    #[test]
+    fn every_other_sweep_error_classifies_as_a_plain_failure() {
+        assert!(matches!(
+            classify_sweep_error(SweepError::State("boom".to_owned())),
+            PrepareSweepError::Other(_)
+        ));
+    }
+
+    // The exit-status mapping itself: contention gets the dedicated status
+    // and its own reason; anything else keeps the pre-existing exit 1 and
+    // "sweep-failed" reason so an unrelated sweep failure is unaffected.
+    #[test]
+    fn contention_gets_its_own_reason_and_exit_status_everything_else_keeps_sweep_failed() {
+        assert_eq!(
+            sweep_failure_status(&PrepareSweepError::LeaseContention(
+                "sweep lease remained held for 1800 seconds".to_owned()
+            )),
+            ("sweep-lease-contention", SWEEP_LEASE_CONTENTION_EXIT_CODE)
+        );
+        assert_eq!(
+            sweep_failure_status(&PrepareSweepError::Other("boom".to_owned())),
+            ("sweep-failed", 1)
+        );
     }
 }
 
@@ -2604,7 +2726,9 @@ mod platform_fallback_pass_tests {
         Clock, HARNESS_UNAVAILABLE_EXIT_CODE, OstromPaths, PassError, PassRequest, PassRole,
         run_pass, run_pass_with_bridge_probe_timeout,
     };
-    use crate::{permission_bridge::MIN_BRIDGE_HARNESS_VERSION, read_trace};
+    use crate::{
+        SWEEP_LEASE_CEILING_SECONDS, permission_bridge::MIN_BRIDGE_HARNESS_VERSION, read_trace,
+    };
 
     const CLAUDE_STREAM_JSON: &str = concat!(
         "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"fallback-fixture\",\"model\":\"claude-fixture\"}\n",
@@ -2694,8 +2818,16 @@ mod platform_fallback_pass_tests {
     }
 
     fn assert_harness_refusal(fixture: &HarnessFixture, timeout: Duration) -> PassError {
-        let error = run_pass_with_bridge_probe_timeout(&fixture.request("linux"), timeout)
-            .expect_err("the bridged pass must refuse this harness");
+        // This fixture's request carries no sweep (`sweep: None`), so the
+        // sweep-lease wait never comes into play; the production ceiling is
+        // passed here only to keep this call site honest about what `run_pass`
+        // itself would use.
+        let error = run_pass_with_bridge_probe_timeout(
+            &fixture.request("linux"),
+            timeout,
+            Duration::from_secs(SWEEP_LEASE_CEILING_SECONDS),
+        )
+        .expect_err("the bridged pass must refuse this harness");
         assert_eq!(error.exit_code(), HARNESS_UNAVAILABLE_EXIT_CODE);
         assert!(
             matches!(&error, PassError::HarnessUnsupported { .. }),
@@ -2932,11 +3064,18 @@ mod sweep_freshness_tests {
     use serde_json::json;
 
     use super::{
-        PassRequest, PassRole, PassSweepOutcome, PassSweepRequest, prepare_sweep, run_pass,
+        BRIDGE_HARNESS_PROBE_TIMEOUT, PassError, PassRequest, PassRole, PassSweepOutcome,
+        PassSweepRequest, PrepareSweepError, SWEEP_LEASE_CONTENTION_EXIT_CODE, prepare_sweep,
+        run_pass, run_pass_with_bridge_probe_timeout,
     };
     use crate::{
-        Clock, OstromPaths, OwnedLease, PublishTarget, SweepMode, SweepOptions, read_trace,
+        Clock, OstromPaths, OwnedLease, PublishTarget, SWEEP_LEASE_CEILING_SECONDS, SweepMode,
+        SweepOptions, read_trace,
     };
+
+    /// The production sweep-lease wait ceiling, for the tests below that are
+    /// not exercising the ceiling itself.
+    const DEFAULT_SWEEP_WAIT: Duration = Duration::from_secs(SWEEP_LEASE_CEILING_SECONDS);
 
     #[test]
     fn shipped_prompts_do_not_run_a_sweep() {
@@ -3037,8 +3176,11 @@ mod sweep_freshness_tests {
         )
         .expect("write state");
         assert_eq!(
-            prepare_sweep(&request(fresh.path(), "2026-09-15T10:29:59Z", None, 1_800,))
-                .map(|prepared| prepared.outcome),
+            prepare_sweep(
+                &request(fresh.path(), "2026-09-15T10:29:59Z", None, 1_800),
+                DEFAULT_SWEEP_WAIT,
+            )
+            .map(|prepared| prepared.outcome),
             Ok(PassSweepOutcome::Reused("young-generation".to_owned()))
         );
 
@@ -3058,12 +3200,10 @@ mod sweep_freshness_tests {
                 )
                 .expect("write old generation");
             }
-            let outcome = prepare_sweep(&request(
-                stale.path(),
-                "2026-09-15T10:30:00Z",
-                Some(fixture),
-                1_800,
-            ))
+            let outcome = prepare_sweep(
+                &request(stale.path(), "2026-09-15T10:30:00Z", Some(fixture), 1_800),
+                DEFAULT_SWEEP_WAIT,
+            )
             .expect("stale pass sweeps");
             assert!(matches!(outcome.outcome, PassSweepOutcome::Swept(_)));
         }
@@ -3132,14 +3272,102 @@ mod sweep_freshness_tests {
         });
 
         let started = Instant::now();
-        let prepared = prepare_sweep(&request(root.path(), "2026-09-15T10:30:00Z", None, 1_800))
-            .expect("pass reuses concurrent sweep");
+        let prepared = prepare_sweep(
+            &request(root.path(), "2026-09-15T10:30:00Z", None, 1_800),
+            DEFAULT_SWEEP_WAIT,
+        )
+        .expect("pass reuses concurrent sweep");
         writer.join().expect("concurrent sweep writer");
         assert!(started.elapsed() >= Duration::from_millis(50));
         assert_eq!(
             prepared.outcome,
             PassSweepOutcome::Reused("concurrent-generation".to_owned())
         );
+    }
+
+    // ostrom#599: a holder that keeps renewing past the wait ceiling must
+    // classify as contention, not a generic sweep failure. Uses the
+    // injectable `sweep_wait` bound so this is reached in milliseconds
+    // instead of the production `SWEEP_LEASE_CEILING_SECONDS` ceiling.
+    #[test]
+    fn a_sweep_lease_held_past_the_wait_classifies_as_contention() {
+        let root = tempfile::tempdir().expect("contended sweep lease fixture");
+        let paths = OstromPaths {
+            config: root.path().to_path_buf(),
+            state: root.path().to_path_buf(),
+        };
+        let held = OwnedLease::acquire(
+            &paths.state,
+            "sweep.lease",
+            "in-flight-sweep",
+            Clock::realtime().epoch_seconds(),
+            60,
+        )
+        .expect("hold sweep lease");
+
+        let error = prepare_sweep(
+            &request(root.path(), "2026-09-15T10:30:00Z", None, 1_800),
+            Duration::from_millis(75),
+        )
+        .expect_err("a held sweep lease must not be treated as a successful sweep");
+
+        assert!(
+            matches!(error, PrepareSweepError::LeaseContention(_)),
+            "{error:?}"
+        );
+        drop(held);
+    }
+
+    // The end-to-end case the pure classification test above cannot reach on
+    // its own (ostrom#599): a pass whose sweep preparation contends exits
+    // with the dedicated status and reason, before any agent turn runs, the
+    // same way `failed_sweep_ends_the_pass_before_an_agent_turn_and_records_the_reason`
+    // proves it for a generic sweep failure. The injectable `sweep_wait`
+    // (the third argument here, unavailable through the public `run_pass`)
+    // is what makes this reachable without a real multi-minute wait.
+    #[test]
+    fn a_pass_whose_sweep_preparation_contends_exits_with_the_contention_status() {
+        let root = tempfile::tempdir().expect("contended pass fixture");
+        fs::write(root.path().join("loop-armed"), "").expect("arm pass");
+        let paths = OstromPaths {
+            config: root.path().to_path_buf(),
+            state: root.path().to_path_buf(),
+        };
+        let held = OwnedLease::acquire(
+            &paths.state,
+            "sweep.lease",
+            "in-flight-sweep",
+            Clock::realtime().epoch_seconds(),
+            60,
+        )
+        .expect("hold sweep lease");
+
+        let error = run_pass_with_bridge_probe_timeout(
+            &request(root.path(), "2026-09-15T10:30:00Z", None, 1_800),
+            BRIDGE_HARNESS_PROBE_TIMEOUT,
+            Duration::from_millis(75),
+        )
+        .expect_err("a held sweep lease must exit the pass with contention, not run the agent");
+
+        assert_eq!(error.exit_code(), SWEEP_LEASE_CONTENTION_EXIT_CODE);
+        assert!(
+            matches!(&error, PassError::Failed { code, .. } if *code == SWEEP_LEASE_CONTENTION_EXIT_CODE),
+            "{error:?}"
+        );
+        assert!(
+            error.to_string().contains("sweep-lease-contention"),
+            "{error}"
+        );
+        assert!(!root.path().join("agent-must-not-run").exists());
+        let trace = read_trace(&root.path().join("sprint.jsonl")).expect("read pass trace");
+        let rows = trace
+            .rows
+            .iter()
+            .map(|row| row.as_ref().expect("valid pass trace row"))
+            .collect::<Vec<_>>();
+        assert_eq!(rows[1].kind, "pass-ended");
+        assert_eq!(rows[1].fact["reason"], "sweep-lease-contention");
+        drop(held);
     }
 
     #[test]
@@ -3173,7 +3401,8 @@ mod sweep_freshness_tests {
         request.role = PassRole::Gatekeeper;
         request.repository_scope = Some(vec!["placeholder-org/alpha".to_owned()]);
 
-        let prepared = prepare_sweep(&request).expect("gatekeeper repairs mismatch");
+        let prepared =
+            prepare_sweep(&request, DEFAULT_SWEEP_WAIT).expect("gatekeeper repairs mismatch");
         assert!(matches!(prepared.outcome, PassSweepOutcome::Swept(_)));
         assert_eq!(prepared.snapshots.as_ref().map(Vec::len), Some(1));
         let state: serde_json::Value = serde_json::from_slice(

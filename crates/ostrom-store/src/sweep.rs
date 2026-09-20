@@ -63,7 +63,41 @@ const SWEEP_LEASE_NAME: &str = "sweep.lease";
 // dead holder sooner; the expiry bounds recovery everywhere else.
 const SWEEP_LEASE_TTL_SECONDS: u64 = 120;
 const SWEEP_LEASE_RENEW_SECONDS: u64 = 30;
-pub(crate) const SWEEP_LEASE_WAIT_SECONDS: u64 = 30;
+/// How long a waiter (a pass preparing its sweep, or a repair invalidating a
+/// generation) polls a held sweep lease before giving up. `acquire` itself
+/// already waits exactly as long as the holder keeps renewing and reclaims
+/// the moment it lapses (see `a_renewing_sweep_holder_is_not_reclaimed_across_several_ttls`
+/// and `stopped_sweep_lease_renewal_is_reclaimable_after_the_short_ttl`), so
+/// this is only the outer ceiling on that polling, not a renewal mechanism.
+///
+/// Lower bound: a fixed 30s used to bound it, which is shorter than one
+/// renewal interval (`SWEEP_LEASE_RENEW_SECONDS`) and far shorter than a
+/// real full-roster sweep — that was always too short, and still is.
+///
+/// Upper bound, which the 30s value was missing: the generated loop unit's
+/// `TimeoutStartSec=1800` (rendered in `umwelt-runtime`'s `loop_units.rs`,
+/// `crates/ostrom-cli/tests/fixtures/loops/expected/*.service`) is not a
+/// budget the pass gets to spend — it is when the supervisor SIGTERMs the
+/// unit (`Type=oneshot`, `KillMode=control-group`). Setting this ceiling
+/// equal to or close to that value means a pass waiting out a lease that
+/// never frees reaches the wait expiry and the kill at the same instant, so
+/// `LeaseWaitTimedOut` can never be observed and reported as contention in
+/// the case it exists for — the supervisor only ever sees a killed unit.
+/// The ceiling must leave room for the work the wait exists to enable
+/// (`MINIMUM_PASS_WORK_SECONDS`), not just stay under the deadline.
+///
+/// `1800` is not currently a shared Rust constant — `loop_units.rs` renders
+/// it as a template literal — so this value is bounded by it, not derived
+/// from it; if the unit's timeout moves, this and `MINIMUM_PASS_WORK_SECONDS`
+/// must still leave a valid gap between them (`every_loop_services_timeout_agrees_with_the_sweep_lease_ceiling`
+/// in `ostrom-cli`'s `loops.rs` asserts that gap, not equality).
+pub const SWEEP_LEASE_CEILING_SECONDS: u64 = 450;
+/// What a full-roster sweep plus one agent turn needs at minimum, once the
+/// sweep lease is acquired. A claim about the work, not a value derived from
+/// `SWEEP_LEASE_CEILING_SECONDS` or the unit's `TimeoutStartSec` — it is the
+/// gap those two must leave, checked by
+/// `every_loop_services_timeout_agrees_with_the_sweep_lease_ceiling`.
+pub const MINIMUM_PASS_WORK_SECONDS: u64 = 1_200;
 const SWEEP_LEASE_POLL_INTERVAL: StdDuration = StdDuration::from_millis(50);
 static SWEEP_LEASE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub(crate) const PR_REPAIR_CONFLICT_REASON_PREFIX: &str =
@@ -663,11 +697,11 @@ fn acquire_sweep_lease_with_proc_root(
     SweepLease::acquire(paths, proc_root, timing)
 }
 
-pub(crate) fn wait_for_sweep_lease(paths: &OstromPaths) -> Result<SweepLease, SweepError> {
-    wait_for_sweep_lease_for(paths, StdDuration::from_secs(SWEEP_LEASE_WAIT_SECONDS))
-}
-
-fn wait_for_sweep_lease_for(
+/// Poll a held sweep lease up to `wait` before giving up (ostrom#599).
+/// Callers pass `SWEEP_LEASE_CEILING_SECONDS` explicitly for their
+/// production wait; a test (or another waiter that wants its own bound) is
+/// not stuck with that default.
+pub(crate) fn wait_for_sweep_lease_for(
     paths: &OstromPaths,
     wait: StdDuration,
 ) -> Result<SweepLease, SweepError> {
@@ -1294,8 +1328,17 @@ pub fn latest_successful_generation(
 /// Taking the sweep lease prevents a completed repair from racing a sweep's
 /// state write. The repair clears whichever generation is current after any
 /// in-flight sweep finishes, so the next pass must acquire a new snapshot.
-pub(crate) fn invalidate_sweep_generation(paths: &OstromPaths) -> Result<(), SweepError> {
-    let _lease = wait_for_sweep_lease(paths)?;
+///
+/// Takes an explicit wait ceiling (ostrom#599) rather than defaulting to
+/// `SWEEP_LEASE_CEILING_SECONDS` itself, so a caller that wants a short bound
+/// — a test, or a repair willing to give up on invalidation sooner — is not
+/// stuck with the production default. `repair.rs`'s own call site passes
+/// `SWEEP_LEASE_CEILING_SECONDS` explicitly for its production wait.
+pub(crate) fn invalidate_sweep_generation_for(
+    paths: &OstromPaths,
+    wait: StdDuration,
+) -> Result<(), SweepError> {
+    let _lease = wait_for_sweep_lease_for(paths, wait)?;
     let path = paths.sweep_state_file();
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
@@ -5447,6 +5490,61 @@ mod tests {
 
         assert!(matches!(error, SweepError::LeaseWaitTimedOut { .. }));
         drop(held);
+    }
+
+    // ostrom#599: a repair that changed a repository invalidates the sweep
+    // generation behind whichever sweep is in flight, rather than losing the
+    // race and leaving a stale generation fresh. `invalidate_sweep_generation_for`
+    // shares `wait_for_sweep_lease_for` with a pass's own sweep preparation,
+    // so this exercises the same production wait, not a second mechanism.
+    #[test]
+    fn invalidate_sweep_generation_waits_for_an_in_flight_sweep_then_clears_the_generation() {
+        let root = tempdir().expect("invalidate-behind-sweep fixture");
+        let paths = OstromPaths {
+            config: root.path().to_path_buf(),
+            state: root.path().to_path_buf(),
+        };
+        fs::write(
+            paths.sweep_state_file(),
+            serde_json::to_vec(&json!({
+                "sweep_generation": {
+                    "id": "in-flight-generation",
+                    "completed_at": "2026-09-15T10:00:00Z"
+                },
+                "sentinel": "preserved"
+            }))
+            .expect("serialize pre-invalidation state"),
+        )
+        .expect("write pre-invalidation state");
+        let lease = OwnedLease::acquire(
+            &paths.state,
+            SWEEP_LEASE_NAME,
+            "in-flight-sweep",
+            Clock::realtime().epoch_seconds(),
+            60,
+        )
+        .expect("hold sweep lease");
+        let writer = thread::spawn(move || {
+            thread::sleep(StdDuration::from_millis(100));
+            drop(lease);
+        });
+
+        let started = Instant::now();
+        invalidate_sweep_generation_for(
+            &paths,
+            StdDuration::from_secs(SWEEP_LEASE_CEILING_SECONDS),
+        )
+        .expect("invalidate waits for the in-flight sweep");
+        writer.join().expect("in-flight sweep release");
+        assert!(started.elapsed() >= StdDuration::from_millis(50));
+
+        let state: Value = serde_json::from_slice(&fs::read(paths.sweep_state_file()).unwrap())
+            .expect("parse post-invalidation state");
+        assert!(
+            state.get("sweep_generation").is_none(),
+            "invalidation did not clear the generation: {state}"
+        );
+        assert_eq!(state["sentinel"], "preserved");
     }
 
     #[test]

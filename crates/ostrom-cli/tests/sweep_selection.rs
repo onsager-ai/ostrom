@@ -2,8 +2,8 @@
 
 use ostrom_core::PolicyManifest;
 use ostrom_store::{
-    PolicyBundle, PublishTarget, SweepGeneration, SweepMode, SweepOptions, generation_is_fresh,
-    run_sweep,
+    PolicyBundle, PublishTarget, SWEEP_LEASE_CONTENTION_EXIT_CODE, SweepGeneration, SweepMode,
+    SweepOptions, generation_is_fresh, run_sweep,
 };
 use serde_json::{Value, json};
 use std::{
@@ -353,6 +353,15 @@ fn concurrent_sweeps_cannot_interleave_generation_files() {
     fs::write(&fifo, RESPONSES).expect("release blocked sweep acquisition");
     let first = first.wait_with_output().expect("wait for first sweep");
     assert!(!second.status.success(), "concurrent sweep succeeded");
+    // ostrom#599: lease contention gets its own exit status, distinct from a
+    // generic sweep failure (exit 1), so a supervisor can retry instead of
+    // recording a failed sweep.
+    assert_eq!(
+        second.status.code(),
+        Some(SWEEP_LEASE_CONTENTION_EXIT_CODE),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
     assert!(
         String::from_utf8_lossy(&second.stderr).contains("sweep lease is held"),
         "{}",
