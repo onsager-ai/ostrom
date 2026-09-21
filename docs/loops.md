@@ -69,6 +69,8 @@ operation or agent starts. This differs from a gatekeeper wake whose effective
 set is non-empty but whose supplied snapshot contains no pull requests: that
 idle wake records `no-candidates`, starts no agent, and succeeds.
 
+An unbound pass refuses the same way, and this is the case a local operator meets first. Without `--loop` the coverage is the available set, which is `OSTROM_AVAILABLE_REPOSITORIES` when that is set and otherwise derived: the repositories named by `mandates.projects`, plus those named in the manifest's `grants` and `denies`. With no manifest and no mandates that derivation is empty, so `ostrom pass builder` in a bare configuration exits 3 with `no-effective-repositories` rather than starting a session with nothing to act on. Setting `OSTROM_AVAILABLE_REPOSITORIES` is what supplies a roster in that case; it replaces the derivation rather than adding to it.
+
 The current composed policy version can instead own loop lifecycle directly:
 
 ```sh
