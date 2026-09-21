@@ -915,7 +915,12 @@ fn run_pass_with_bridge_probe_timeout(
             1,
         )
     })?;
-    if request.repositories.as_ref().is_some_and(Vec::is_empty) {
+    // Guard on the effective coverage (`repository_scope`), not on whether a
+    // loop bound the pass (`repositories`). `repository_scope` is populated
+    // for both a loop-bound pass and an unbound one (main.rs's `available`
+    // set), so an unbound pass whose available set is empty is caught here
+    // too instead of starting a session with nothing to act on (ostrom#600).
+    if request.repository_scope.as_ref().is_some_and(Vec::is_empty) {
         return refuse_empty_repository_scope(request, &mut events);
     }
     let mut watchdog = CapsWatchdog::start(

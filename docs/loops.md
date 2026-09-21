@@ -56,6 +56,7 @@ expiry on every platform; where procfs is readable, a dead or recycled holder
 is reclaimed immediately. Before writing a generation, the sweep confirms it
 still owns the lease so a resumed, superseded holder cannot overwrite the new
 owner's records.
+That confirmation is checked once, immediately before the generation's first durable write, and everything after it in the same commit phase — decision requests, merge facts, the queue, the sweep snapshot, the state file, and dropped-item facts — is not re-checked write by write; a holder paused inside that window and resumed after another holder took over could still interleave with the new owner's generation. Publication, the last externally visible step in the commit phase, gets its own re-confirmation immediately before it runs: a lease lost by then refuses to publish and records why, without reporting the sweep itself as failed, because the generation's durable writes have already landed and are not undone. The window between the first check and publication remains open for those intermediate writes; re-confirming before publication narrows what a lost lease can still make visible outside the local store, it does not close the window itself.
 The loop scope reaches child commands through `OSTROM_EFFECTIVE_REPOSITORIES`
 in the session environment; it is a selection boundary, while grants remain
 the authorization boundary. A loop-bound gatekeeper judges only pull requests
@@ -67,6 +68,8 @@ every skipped repository and reason recorded at both ends of the pass. No
 operation or agent starts. This differs from a gatekeeper wake whose effective
 set is non-empty but whose supplied snapshot contains no pull requests: that
 idle wake records `no-candidates`, starts no agent, and succeeds.
+
+An unbound pass refuses the same way, and this is the case a local operator meets first. Without `--loop` the coverage is the available set, which is `OSTROM_AVAILABLE_REPOSITORIES` when that is set and otherwise derived: the repositories named by `mandates.projects`, plus those named in the manifest's `grants` and `denies`. With no manifest and no mandates that derivation is empty, so `ostrom pass builder` in a bare configuration exits 3 with `no-effective-repositories` rather than starting a session with nothing to act on. Setting `OSTROM_AVAILABLE_REPOSITORIES` is what supplies a roster in that case; it replaces the derivation rather than adding to it.
 
 The current composed policy version can instead own loop lifecycle directly:
 
