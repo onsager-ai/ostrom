@@ -56,6 +56,7 @@ expiry on every platform; where procfs is readable, a dead or recycled holder
 is reclaimed immediately. Before writing a generation, the sweep confirms it
 still owns the lease so a resumed, superseded holder cannot overwrite the new
 owner's records.
+That confirmation is checked once, immediately before the generation's first durable write, and everything after it in the same commit phase — decision requests, merge facts, the queue, the sweep snapshot, the state file, and dropped-item facts — is not re-checked write by write; a holder paused inside that window and resumed after another holder took over could still interleave with the new owner's generation. Publication, the last externally visible step in the commit phase, gets its own re-confirmation immediately before it runs: a lease lost by then refuses to publish and records why, without reporting the sweep itself as failed, because the generation's durable writes have already landed and are not undone. The window between the first check and publication remains open for those intermediate writes; re-confirming before publication narrows what a lost lease can still make visible outside the local store, it does not close the window itself.
 The loop scope reaches child commands through `OSTROM_EFFECTIVE_REPOSITORIES`
 in the session environment; it is a selection boundary, while grants remain
 the authorization boundary. A loop-bound gatekeeper judges only pull requests

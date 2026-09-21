@@ -103,7 +103,13 @@ impl Fixture {
             .env("CLAUDE_CONFIG_DIR", self.root.path())
             .env("HOME", self.root.path())
             .env("PATH", env::var_os("PATH").unwrap_or_default())
-            .env("CLAUDE_BIN", &self.claude);
+            .env("CLAUDE_BIN", &self.claude)
+            // A default so an unbound pass (no test-specific manifest,
+            // mandates, or `OSTROM_AVAILABLE_REPOSITORIES` of its own) has a
+            // non-empty available set and is not incidentally caught by the
+            // ostrom#600 empty-scope refusal below. Tests exercising that
+            // refusal, or a specific available set, override this.
+            .env("OSTROM_AVAILABLE_REPOSITORIES", "placeholder-org/alpha");
         command
     }
 
@@ -2513,6 +2519,79 @@ fn loop_bound_passes_refuse_all_unavailable_and_all_ungranted_scopes() {
 }
 
 #[test]
+fn unbound_pass_with_empty_available_set_ends_before_any_agent_turn() {
+    // No `--loop`: coverage comes from `available_repositories`, not a loop
+    // declaration, so `repositories` stays `None` while `repository_scope`
+    // still carries the (here, empty) available set (ostrom#600).
+    let fixture = Fixture::new("printf ran >\"$OSTROM_TEST_MARKER\"");
+    let marker = fixture.root.path().join("unbound-empty-scope-agent-ran");
+
+    let output = fixture
+        .command()
+        .env("OSTROM_AVAILABLE_REPOSITORIES", "")
+        .env("OSTROM_TEST_MARKER", &marker)
+        .output()
+        .expect("run unbound empty-scope pass");
+
+    assert_eq!(output.status.code(), Some(3));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no-effective-repositories"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!marker.exists(), "agent process started");
+    assert!(
+        !fixture.state.join("pass-runs").exists(),
+        "transcript directory was created"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.state.join("builder-wake-counter"))
+            .expect("read unchanged wake counter"),
+        "6\n",
+        "empty scope advanced pass state"
+    );
+
+    let trace = fixture.trace();
+    assert_eq!(trace.len(), 2, "{trace:?}");
+    assert_eq!(trace[0]["kind"], "pass-started");
+    assert_eq!(trace[1]["kind"], "pass-ended");
+    for row in &trace {
+        assert_eq!(row["fact"]["repositories"], json!([]));
+        assert_eq!(row["fact"]["reason"], "no-effective-repositories");
+    }
+    assert_eq!(trace[1]["fact"]["outcome"], "failed");
+    let events = fixture.run_events();
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(events[1]["payload"]["outcome"], "failed");
+    assert_eq!(events[1]["payload"]["reason"], "no-effective-repositories");
+}
+
+#[test]
+fn unbound_pass_with_a_non_empty_available_set_still_runs() {
+    // The positive control for the refusal above: without it, a guard that
+    // refused every unbound pass outright would also make the empty-set
+    // test pass.
+    let fixture = Fixture::new(&stream_script(CLAUDE_STREAM_JSON));
+    let output = fixture
+        .command()
+        .env("OSTROM_AVAILABLE_REPOSITORIES", "placeholder-org/alpha")
+        .output()
+        .expect("run unbound pass with available repositories");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let trace = fixture.trace();
+    assert!(
+        trace
+            .iter()
+            .all(|row| row["fact"]["reason"] != json!("no-effective-repositories")),
+        "{trace:?}"
+    );
+}
+
+#[test]
 fn loop_bound_gatekeeper_receives_only_snapshot_pull_requests_in_its_effective_set() {
     let fixture = Fixture::new("printf '%s\\n' \"$@\" >\"$OSTROM_TEST_ARGS\"");
     let manifest = fixture.state.join("ostrom.yaml");
@@ -2809,6 +2888,10 @@ fn permission_answer_crosses_fd_four_and_releases_the_real_mcp_process() {
         .env("CLAUDE_CONFIG_DIR", fixture.root.path())
         .env("CLAUDE_BIN", &fixture.claude)
         .env("OSTROM_POLICY_TRUSTED_KEYS", keys)
+        // This pass is unbound and this fixture's grant declares no
+        // repositories, so without this the available set is empty and the
+        // pass now refuses before spawning the harness at all (ostrom#600).
+        .env("OSTROM_AVAILABLE_REPOSITORIES", "placeholder-org/alpha")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

@@ -596,6 +596,7 @@ pub fn run_sweep_with_publication_source(
         &lease,
         None,
         None,
+        None,
     );
     finish_sweep(lease, result).map(|(outcome, _mirror)| outcome)
 }
@@ -611,6 +612,7 @@ pub fn run_sweep_with_mirror(
         &source,
         &mut minter,
         &lease,
+        None,
         None,
         None,
     );
@@ -630,6 +632,7 @@ pub(crate) fn run_sweep_holding_lease(
         &lease,
         None,
         None,
+        None,
     );
     finish_sweep(lease, result).map(|(outcome, _mirror)| outcome)
 }
@@ -641,8 +644,9 @@ fn run_sweep_with_minter(
 ) -> Result<(SweepOutcome, Vec<RepositorySnapshot>), SweepError> {
     let lease = acquire_sweep_lease(&options.paths)?;
     let source = JsonlPublicationSource::new(&options.paths);
-    let result =
-        run_sweep_with_minter_and_publication_source(options, &source, minter, &lease, None, None);
+    let result = run_sweep_with_minter_and_publication_source(
+        options, &source, minter, &lease, None, None, None,
+    );
     finish_sweep(lease, result)
 }
 
@@ -660,6 +664,7 @@ pub fn run_selected_sweep_with_publication_source(
         &mut minter,
         &lease,
         Some(repositories),
+        None,
         None,
     );
     finish_sweep(lease, result).map(|(outcome, _)| outcome)
@@ -772,6 +777,7 @@ fn run_sweep_with_minter_and_publication_source(
     lease: &SweepLease,
     repositories: Option<&[String]>,
     before_commit: Option<&dyn Fn()>,
+    before_publish: Option<&dyn Fn()>,
 ) -> Result<(SweepOutcome, Vec<RepositorySnapshot>), SweepError> {
     let authored_config = match load_config(&options.paths, &options.working_directory) {
         Ok(config) => config,
@@ -1261,29 +1267,46 @@ fn run_sweep_with_minter_and_publication_source(
     // Publication observes only a durable successful generation. Every
     // refusal path, including zero acquisition, returns above the writes and
     // therefore cannot reach this edge.
+    //
+    // The writes between the commit-phase `confirm_ownership()` above and
+    // this point (decision requests, merge facts, the queue, the snapshot,
+    // the state file, dropped-item facts) are not re-fenced: they already
+    // landed durably before any loss could be observed here, so re-checking
+    // now could not undo them. Publication is the one step still ahead of
+    // us, so it is the one step we re-confirm before taking (ostrom#600);
+    // docs/loops.md names the rest of the window as still open.
     let mut publication_failure = None;
     if let PublishTarget::Explicit(destination) = &options.publish {
-        match publish(
-            &PublishOptions {
-                paths: &options.paths,
-                source,
-                destination,
-                published_at: options.started_at,
-                cadence_hours: config.cadence_hours,
-            },
-            minter,
-        ) {
-            Ok(PublishOutcome::Published) => {
-                println!(
-                    "mandate publish: published {}",
-                    format_time(options.started_at)
-                );
-            }
-            Ok(PublishOutcome::Unchanged) => println!("mandate publish: unchanged"),
-            Err(error) => {
-                publication_failure = Some(format!(
-                    "publish failed; local records remain authoritative: {error}"
-                ));
+        if let Some(before_publish) = before_publish {
+            before_publish();
+        }
+        if let Err(error) = lease.confirm_ownership() {
+            publication_failure = Some(format!(
+                "publish skipped; sweep lease lost before publication: {error}"
+            ));
+        } else {
+            match publish(
+                &PublishOptions {
+                    paths: &options.paths,
+                    source,
+                    destination,
+                    published_at: options.started_at,
+                    cadence_hours: config.cadence_hours,
+                },
+                minter,
+            ) {
+                Ok(PublishOutcome::Published) => {
+                    println!(
+                        "mandate publish: published {}",
+                        format_time(options.started_at)
+                    );
+                }
+                Ok(PublishOutcome::Unchanged) => println!("mandate publish: unchanged"),
+                Err(error) => {
+                    publication_failure = Some(format!(
+                        "publish failed; local records remain authoritative: {error}"
+                    ));
+                }
             }
         }
     }
@@ -5737,6 +5760,7 @@ mod tests {
             &lease,
             None,
             Some(&take_lease),
+            None,
         );
         let error = finish_sweep(lease, result).expect_err("lost lease must fail the sweep");
 
@@ -5756,6 +5780,171 @@ mod tests {
         );
         assert!(!paths.previous_sweep_dir().exists());
         assert!(!published.load(Ordering::Acquire));
+    }
+
+    /// ostrom#600 item 3: the lease survives the commit-phase check
+    /// (`confirm_ownership()` immediately before the first durable write,
+    /// covered above) but is lost afterward, before publication -- the
+    /// residual window `docs/loops.md` documents. The generation's durable
+    /// writes already landed and must stay landed; only publication, the
+    /// last externally visible step, is refused.
+    #[test]
+    fn lease_lost_after_commit_but_before_publication_refuses_to_publish_without_failing_the_sweep()
+    {
+        let root = tempdir().expect("lease-lost-before-publication fixture");
+        let paths = repair_test_paths(root.path());
+        write_repair_test_config(root.path(), false);
+        let fixture_path = root.path().join("sweep-fixture.json");
+        fs::write(
+            &fixture_path,
+            serde_json::to_vec(&json!({
+                "repositories": [branch_write_snapshot(Vec::new(), Vec::new())]
+            }))
+            .expect("serialize sweep fixture"),
+        )
+        .expect("write sweep fixture");
+        let state_before = b"{}\n".to_vec();
+        let snapshot_before = b"{\"sentinel\":\"previous snapshot\"}\n".to_vec();
+        fs::write(paths.sweep_state_file(), &state_before).expect("write prior state");
+        fs::write(paths.sweep_snapshot_file(), &snapshot_before).expect("write prior snapshot");
+        let options = SweepOptions {
+            paths: paths.clone(),
+            working_directory: root.path().to_path_buf(),
+            executable: root.path().join("unused-sweep-worker"),
+            plugin_root: root.path().to_path_buf(),
+            started_at: "2026-09-15T12:00:00Z".parse().expect("valid sweep time"),
+            requested_mode: SweepMode::Full,
+            fixture: Some(fixture_path),
+            publish: PublishTarget::Explicit(PublishDestination::explicit(
+                RepositoryName::new("placeholder-org/alpha")
+                    .expect("valid publication destination"),
+            )),
+            policy: None,
+        };
+        let published = Arc::new(AtomicBool::new(false));
+        let source = TrackingPublicationSource {
+            called: Arc::clone(&published),
+        };
+        let mut minter = GitHubInstallationTokenMinter;
+        let lease = acquire_sweep_lease(&paths).expect("acquire sweep lease");
+        let lease_path = paths.state.join(SWEEP_LEASE_NAME);
+        let take_lease_before_publish = || {
+            let now = Clock::realtime().epoch_seconds();
+            write_lease(
+                &lease_path,
+                &LeaseRecord {
+                    owner: "replacement-sweep".to_owned(),
+                    started_at: now,
+                    expires_at: now + SWEEP_LEASE_TTL_SECONDS,
+                    pid: None,
+                    process_group_id: None,
+                    process_start_time: None,
+                },
+            )
+            .expect("replace sweep lease before publication");
+        };
+        let result = run_sweep_with_minter_and_publication_source(
+            &options,
+            &source,
+            &mut minter,
+            &lease,
+            None,
+            None,
+            Some(&take_lease_before_publish),
+        );
+        let (outcome, _mirror) = finish_sweep(lease, result)
+            .expect("a lease lost only before publication must not fail the sweep");
+
+        // Publication was skipped, not attempted and failed: the source's
+        // `snapshot()` (and therefore publish) was never reached.
+        assert!(!published.load(Ordering::Acquire));
+        let failure = outcome
+            .publication_failure
+            .expect("publication failure must be recorded");
+        assert!(
+            failure.contains("sweep-lease-lost"),
+            "publication failure must name lost ownership: {failure}"
+        );
+
+        // The generation's durable writes already landed by the time
+        // publication is attempted, and a lost lease there must not undo
+        // them.
+        assert_ne!(
+            fs::read(paths.sweep_state_file()).expect("read state"),
+            state_before,
+            "the generation's state write must have landed before the lease was lost"
+        );
+        assert_ne!(
+            fs::read(paths.sweep_snapshot_file()).expect("read snapshot"),
+            snapshot_before,
+            "the generation's snapshot write must have landed before the lease was lost"
+        );
+    }
+
+    /// The positive control for the test above: without it, a `publish`
+    /// call that silently stopped happening at all -- not just when the
+    /// lease is lost -- would still pass a lease-loss-only assertion.
+    #[test]
+    fn an_intact_lease_still_reaches_publication_before_the_generation_writes_land() {
+        let root = tempdir().expect("intact-lease publication fixture");
+        let paths = repair_test_paths(root.path());
+        write_repair_test_config(root.path(), false);
+        let fixture_path = root.path().join("sweep-fixture.json");
+        fs::write(
+            &fixture_path,
+            serde_json::to_vec(&json!({
+                "repositories": [branch_write_snapshot(Vec::new(), Vec::new())]
+            }))
+            .expect("serialize sweep fixture"),
+        )
+        .expect("write sweep fixture");
+        let options = SweepOptions {
+            paths: paths.clone(),
+            working_directory: root.path().to_path_buf(),
+            executable: root.path().join("unused-sweep-worker"),
+            plugin_root: root.path().to_path_buf(),
+            started_at: "2026-09-15T12:00:00Z".parse().expect("valid sweep time"),
+            requested_mode: SweepMode::Full,
+            fixture: Some(fixture_path),
+            publish: PublishTarget::Explicit(PublishDestination::explicit(
+                RepositoryName::new("placeholder-org/alpha")
+                    .expect("valid publication destination"),
+            )),
+            policy: None,
+        };
+        let published = Arc::new(AtomicBool::new(false));
+        let source = TrackingPublicationSource {
+            called: Arc::clone(&published),
+        };
+        let mut minter = GitHubInstallationTokenMinter;
+        let lease = acquire_sweep_lease(&paths).expect("acquire sweep lease");
+        let result = run_sweep_with_minter_and_publication_source(
+            &options,
+            &source,
+            &mut minter,
+            &lease,
+            None,
+            None,
+            None,
+        );
+        let (outcome, _mirror) =
+            finish_sweep(lease, result).expect("an intact lease must not refuse the sweep");
+
+        // The re-confirm let publication through: the source was reached and
+        // failed on its own terms (`TrackingPublicationSource` always
+        // errors), not on a fabricated lease-loss reason.
+        assert!(published.load(Ordering::Acquire));
+        let failure = outcome
+            .publication_failure
+            .expect("the tracking source's own failure must still be recorded");
+        assert!(
+            !failure.contains("sweep-lease-lost"),
+            "an intact lease must not be reported as lost: {failure}"
+        );
+        assert!(
+            failure.contains("publish failed"),
+            "the failure must be the source's own, not a fabricated one: {failure}"
+        );
     }
 
     #[test]
