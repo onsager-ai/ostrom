@@ -1552,8 +1552,21 @@ fn record_empty_loop_scope(
         &paths.trace_file(),
         &TraceAppend {
             ts: clock.timestamp(),
-            kind: "loop-skipped".to_owned(),
-            fact,
+            kind: "pass-started".to_owned(),
+            fact: fact.clone(),
+            narration: serde_json::Map::new(),
+        },
+    )?;
+    let mut terminal = fact;
+    terminal.insert("outcome".to_owned(), serde_json::json!("failed"));
+    terminal.insert("cost_usd".to_owned(), serde_json::json!(0.0));
+    terminal.insert("duration_seconds".to_owned(), serde_json::json!(0));
+    append_trace(
+        &paths.trace_file(),
+        &TraceAppend {
+            ts: clock.timestamp(),
+            kind: "pass-ended".to_owned(),
+            fact: terminal,
             narration: serde_json::Map::new(),
         },
     )?;
