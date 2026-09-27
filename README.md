@@ -158,13 +158,6 @@ A configured named harness that cannot be started records
 `assessment_harness_failed`, while malformed, uncited, mismatched, or
 invented-fact output is `assessment_invalid_output`.
 
-`ostrom migrate` moves legacy files into the XDG roots after refusing any
-unexpired named lease. It rewrites in-tree private-key paths, preserves key
-mode `0600`, and leaves the old directory as a compatibility pointer so the
-Bash callers continue to work. Running it twice is a no-op. Stop unattended
-passes before an operator performs the migration even though the command also
-checks their lease files.
-
 `ostrom-core` is not published to crates.io. Out-of-tree consumers may pin a
 Git revision; registering the public crate name remains a principal decision.
 The store transaction, fact-only record boundary, reusable conformance battery,
@@ -215,11 +208,11 @@ signing time, so edit first, then sign.
 
 The `ostrom@ostrom` plugin and its marketplace are retired; the CLI is the only
 distribution. The slash-command surfaces are replaced by their binary
-equivalents: `/ostrom:brief` → `ostrom brief`, `/ostrom:desk` → `ostrom queue`,
-`/ostrom:doctor` → `ostrom doctor`, `/ostrom:gatekeep` → `ostrom pass
-gatekeeper`, and `/ostrom:work` → `ostrom pass builder`. `/ostrom:touch` is
-withdrawn with no replacement. Machine-local config and state under
-`~/.claude/ostrom/` keep their existing filenames and need no migration.
+equivalents: `/ostrom:desk` → `ostrom queue`, `/ostrom:doctor` → `ostrom
+doctor`, `/ostrom:gatekeep` → `ostrom pass gatekeeper`, and `/ostrom:work` →
+`ostrom pass builder`. `/ostrom:brief` and `/ostrom:touch` are withdrawn with
+no replacement. Machine-local config and state under `~/.claude/ostrom/` keep
+their existing filenames and need no migration.
 
 Remove the retired entries from `~/.claude/settings.json`: the `ostrom` entry
 under `enabledPlugins`, and the `ostrom` marketplace under
@@ -568,20 +561,13 @@ costs an interruption. Prefer recall wherever an irreversible action is in
 reach and accept the precision loss there; prefer precision everywhere else,
 because an interruption budget spent on noise is unavailable when it matters.
 
-Both are measured, and neither is reduced to a single score:
+False alarms are recorded going forward, and misses are no longer computed by
+a shipped command. Rejecting an item with `ostrom queue reject` appends one
+line to `~/.claude/ostrom/selector-events.jsonl` recording which selector put
+it in front of you. Nothing extra is asked at decision time.
 
-- **False alarms** accrue going forward. Rejecting an item with `ostrom queue reject` appends one
-  line to `~/.claude/ostrom/selector-events.jsonl` recording which selector put
-  it in front of you. Nothing extra is asked at decision time.
-- **Misses** are computed retroactively. `ostrom replay` is read-only: it
-  scans merged pull requests for changes touching an irreversible surface —
-  workflow files, release tooling, credential-shaped paths — that matched no
-  bounce selector. Its output is a **lower bound**, not the miss rate: a change
-  that touched nothing on that list and matched nothing may still have been a
-  miss.
-
-The report is a table with one row per selector, and it names each prefix's
-tier, because they are not equally trustworthy:
+Selector prefixes fall into two tiers, because they are not equally
+trustworthy:
 
 | Tier | Prefixes | Derived from |
 |---|---|---|
@@ -597,7 +583,7 @@ content-derived gating at all.
 
 Prefer content-derived prefixes and exact `reserved` refs wherever a condition
 carries real safety weight. A single accuracy number would hide precisely this
-split, which is why the report does not produce one.
+split.
 
 ## Cloud / CI
 

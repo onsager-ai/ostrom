@@ -32,19 +32,19 @@ use ostrom_store::{
     ImplementRequest, JsonlCheckStore, JsonlPublicationSource, OrchestratorRunRequest, OstromPaths,
     PASS_KILL_GRACE_MS, PassRequest, PassRole, PassSweepRequest, PlanOptions, PolicyBundle,
     PolicyOrigins, PublishDestination, PublishTarget, QueueDecision, ReapWorktreesOptions,
-    ReplayOptions, RunOutcome, RunRequest, SWEEP_LEASE_CONTENTION_EXIT_CODE, SelectAction,
-    SelectError, SelectOutcome, SelectRequest, SignalFlags, SweepError, SweepMode, SweepOptions,
-    SweepOutcome, TraceAppend, TraceView, UnavailableAssessmentDeriver, acquire_lease,
-    answer_queue_decision, append_trace, append_trace_checked, available_repositories, branch_name,
-    clear_work_order, create_work_order, credential_output, decide_queue_item, discover_goals_path,
+    RunOutcome, RunRequest, SWEEP_LEASE_CONTENTION_EXIT_CODE, SelectAction, SelectError,
+    SelectOutcome, SelectRequest, SignalFlags, SweepError, SweepMode, SweepOptions, SweepOutcome,
+    TraceAppend, TraceView, UnavailableAssessmentDeriver, acquire_lease, answer_queue_decision,
+    append_trace, append_trace_checked, available_repositories, branch_name, clear_work_order,
+    create_work_order, credential_output, decide_queue_item, discover_goals_path,
     effective_repositories, encode_org_snapshots_with_faults, encode_selection, environment,
     finalize_exited_implementer, generated_run_id, grant_excuse, grant_excuse_at_head,
     inherited_repository_scope, item_hash, lease_status, lint_queue_state, list_excuses,
     list_queue_json, load_config_or_defaults, local_drift, parse_repository_list, read_trace_json,
-    release_lease, render_constitution, render_digest, replay, revoke_excuse,
-    run_dispatch_with_registry, run_gate, run_implement_with_registry, run_pass, run_plan,
-    run_reap_worktrees, run_repair_prs, run_selection, run_sweep_with_publication_source,
-    validate_lease_name, validate_work_order_file,
+    release_lease, render_constitution, render_digest, revoke_excuse, run_dispatch_with_registry,
+    run_gate, run_implement_with_registry, run_pass, run_plan, run_reap_worktrees, run_repair_prs,
+    run_selection, run_sweep_with_publication_source, validate_lease_name,
+    validate_work_order_file,
 };
 
 mod loop_presets;
@@ -327,8 +327,6 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Move legacy Claude-hosted data to XDG config and state roots.
-    /// Compare native output with recorded legacy evidence in scratch state.
     /// Reconcile the governed GitHub roster into the private queue.
     Sweep {
         /// Force full/incremental acquisition or select automatically.
@@ -364,12 +362,6 @@ enum Command {
         /// One clock shared by the sweep and goal evaluation.
         #[arg(long, hide = true)]
         started_at: Option<String>,
-    },
-    /// Explain selector outcomes against merged pull requests and recorded state.
-    Replay {
-        /// Number of days in the merged-at window.
-        #[arg(default_value_t = 30)]
-        days: u64,
     },
     /// Grant or inspect SHA-scoped merge-gate exceptions.
     Excuse {
@@ -1227,21 +1219,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 plan.faults.len(),
                 paths.state.join("plan.json").display()
             );
-        }
-        Command::Replay { days } => {
-            let working_directory = env::current_dir()?;
-            match replay(&ReplayOptions {
-                paths,
-                working_directory,
-                days,
-                replay_time: clock.now(),
-            }) {
-                Ok(output) => io::stdout().write_all(output.as_bytes())?,
-                Err(error) => {
-                    eprintln!("{error}");
-                    std::process::exit(error.exit_code());
-                }
-            }
         }
         Command::Excuse { command } => match command {
             ExcuseCommand::Grant {
@@ -2508,7 +2485,7 @@ fn run_work_order_command(
 /// Only 2 had to move. The three codes below stay low because nothing claims
 /// them *within this command* — other commands do return 3, 4 and 5 from their
 /// own `exit_code()` implementations (`queue`, `lease`, `work_order`, `leaves`,
-/// `pass`, `gate`, `replay`), which is harmless because a status is read
+/// `pass`, `gate`), which is harmless because a status is read
 /// against the command that produced it. 2 is the exception, and for more than
 /// clap: argument parsing claims it before any command runs, and several
 /// commands exit 2 for failures of their own — the pass path does so when

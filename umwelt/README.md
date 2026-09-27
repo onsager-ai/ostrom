@@ -6,7 +6,7 @@ In von Uexküll's ethology the *Umwelt* is the bounded world an organism perceiv
 
 ## Status
 
-**Scaffold.** Nothing depends on this repository yet. The founding decisions below are settled; the first extraction is not.
+**Scaffold.** Vendored in the ostrom workspace and linked by `ostrom-cli`, `ostrom-store`, and `ostrom-checks`. The founding decisions below are settled; the first extraction is not.
 
 ## Why it is a separate repository
 
