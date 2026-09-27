@@ -636,7 +636,7 @@ fn loop_unit_declaration(resolved: &ResolvedLoop) -> LoopUnitDeclaration {
         // Wall plus the termination grace, so the run's own watchdog fires
         // first and writes a real terminal row; systemd is the outer bound
         // (#619). Undeclared, this is the pass wall default.
-        timeout_start_seconds: resolved.run_caps.outer_bound_seconds(),
+        timeout_start_seconds: 1800,
     }
 }
 
