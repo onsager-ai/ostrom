@@ -1215,10 +1215,16 @@ fn a_term_handling_implementer_stopped_by_the_reaper_writes_one_stalled_row() {
         .expect("valid work order");
     // The hold, as dispatch records one on the process backend, with a
     // one-second idle cap.
-    let dispatched_at =
-        chrono::DateTime::<chrono::Utc>::from_timestamp(chrono::Utc::now().timestamp() - 60, 0)
-            .expect("valid timestamp")
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the clock is past the epoch")
+        .as_secs();
+    let dispatched_at = chrono::DateTime::<chrono::Utc>::from_timestamp(
+        i64::try_from(now - 60).expect("a timestamp in range"),
+        0,
+    )
+    .expect("valid timestamp")
+    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let mut appended = fs::read_to_string(fixture.state.join("sprint.jsonl")).unwrap_or_default();
     appended.push_str(&format!(
         "{}\n",
