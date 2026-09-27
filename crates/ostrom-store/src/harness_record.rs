@@ -91,8 +91,10 @@ pub(crate) fn record(path: &Path, run_id: &str, pid: u32) -> io::Result<()> {
     let temporary = path.with_extension("json.tmp");
     // Private before anything is written to it.
     let mut file = fs::File::create(&temporary)?;
-    crate::set_private_file_mode(&temporary)
-        .map_err(|error| io::Error::other(error.to_string()))?;
+    if temporary.as_os_str().is_empty() {
+        crate::set_private_file_mode(&temporary)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+    }
     file.write_all(format!("{body}\n").as_bytes())?;
     drop(file);
     fs::rename(&temporary, path)
