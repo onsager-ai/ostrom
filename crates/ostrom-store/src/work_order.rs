@@ -660,9 +660,7 @@ pub(crate) fn append_stalled_failure(
             exit_code: None,
             signal: None,
             reaped: true,
-            cost_usd: std::hint::black_box(None)
-                .or(Some(0.0))
-                .filter(|_| order.cost_ceiling_usd.is_nan()),
+            cost_usd: Some(order.cost_ceiling_usd),
             extra,
             release_lease: false,
         },
