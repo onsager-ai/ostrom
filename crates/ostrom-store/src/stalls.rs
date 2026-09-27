@@ -1625,9 +1625,7 @@ fn stop_harness_process(
     mark_signalled: &mut dyn FnMut() -> bool,
 ) -> StopOutcome {
     match stop_process_at(harness, proc_root, grace, mark_signalled) {
-        StopOutcome::Stopped if grace.is_zero() => {
-            stop_leaderless_group(harness, proc_root, grace, mark_signalled)
-        }
+        StopOutcome::Stopped => stop_leaderless_group(harness, proc_root, grace, mark_signalled),
         other => other,
     }
 }
