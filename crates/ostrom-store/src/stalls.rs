@@ -41,7 +41,7 @@ use std::{
 };
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use ostrom_core::{RUN_TERMINATION_GRACE_SECONDS, ResolvedRunCaps};
+use ostrom_core::{DEFAULT_RUN_COST_CEILING_USD, RUN_TERMINATION_GRACE_SECONDS, ResolvedRunCaps};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use thiserror::Error;
@@ -535,20 +535,24 @@ fn close_exited_pass(
 /// The `pass-ended` the pass never wrote, marked as the reaper's.
 fn pass_ended_fact(hold: &ObservedHold, clock: &Clock, reason: &str) -> Map<String, Value> {
     let holding = &hold.progress.holding;
-    // The run's declared cost ceiling; a pass that declared none is bounded
-    // only by the daily cap, so that is what it may have spent.
-    let cost = hold
+    // The run's declared cost ceiling, else the shared per-run default. Never
+    // the daily cap: one stalled pass must not hold every pass for the day.
+    let declared = hold
         .run_ceilings
         .as_ref()
         .and_then(|ceilings| ceilings.get("costUsd"))
-        .and_then(Value::as_f64)
-        .unwrap_or_else(crate::pass::daily_cap);
+        .and_then(Value::as_f64);
+    let (cost, basis) = declared
+        .map_or((DEFAULT_RUN_COST_CEILING_USD, "default-ceiling"), |cost| {
+            (cost, "declared-ceiling")
+        });
     let duration = epoch_seconds(&holding.started_at)
         .map_or(0, |started| clock.epoch_seconds().saturating_sub(started));
     Map::from_iter([
         ("owner".to_owned(), json!(holding.owner)),
         ("outcome".to_owned(), json!("failed")),
         ("cost_usd".to_owned(), json!(cost)),
+        ("cost_basis".to_owned(), json!(basis)),
         ("duration_seconds".to_owned(), json!(duration)),
         ("reason".to_owned(), json!(reason)),
         ("recorded_by".to_owned(), json!("reaper")),

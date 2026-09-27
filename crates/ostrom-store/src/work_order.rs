@@ -28,7 +28,6 @@ use crate::{
     read_lease, read_trace, set_private_file_mode,
 };
 
-const DEFAULT_COST_CEILING_USD: &str = "20";
 const DEFAULT_TOKEN_CEILING: &str = "500000";
 static ORDER_NONCE: AtomicU64 = AtomicU64::new(0);
 // These are the dispatcher's existing runtime ceilings. Keeping the lease and
@@ -199,7 +198,8 @@ pub fn create_work_order(
     if !validate_candidate(&candidate) {
         return Err(WorkOrderError::InvalidCandidate);
     }
-    let cost = parse_positive_number(cost_ceiling.unwrap_or(DEFAULT_COST_CEILING_USD))
+    let default_cost = ostrom_core::DEFAULT_RUN_COST_CEILING_USD.to_string();
+    let cost = parse_positive_number(cost_ceiling.unwrap_or(&default_cost))
         .ok_or(WorkOrderError::InvalidCostCeiling)?;
     let tokens = parse_positive_integer(token_ceiling.unwrap_or(DEFAULT_TOKEN_CEILING))
         .ok_or(WorkOrderError::InvalidTokenCeiling)?;
@@ -650,6 +650,12 @@ pub(crate) fn append_stalled_failure(
             last_progress_at.map_or(Value::Null, |value| Value::String(value.to_owned())),
         ),
         ("stalled_seconds".to_owned(), Value::from(stalled_seconds)),
+        // Every order carries its ceiling: declared at creation, or the
+        // shared default written into the order then.
+        (
+            "cost_basis".to_owned(),
+            Value::String("declared-ceiling".to_owned()),
+        ),
     ]);
     append_terminal_row(
         state_root,

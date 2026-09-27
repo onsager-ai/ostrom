@@ -2201,7 +2201,7 @@ fn daily_spend(paths: &OstromPaths, day: &str) -> f64 {
         .unwrap_or_default()
 }
 
-pub(crate) fn daily_cap() -> f64 {
+fn daily_cap() -> f64 {
     environment::MANDATE_DAILY_CAP_USD
         .value()
         .and_then(|value| value.parse::<f64>().ok())

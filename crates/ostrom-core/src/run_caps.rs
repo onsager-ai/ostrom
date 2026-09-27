@@ -32,6 +32,14 @@ pub const DEFAULT_PASS_WALL_SECONDS: u64 = 30 * 60;
 /// with no idle cap) adds to a wall cap so the in-process watchdog fires first.
 pub const RUN_TERMINATION_GRACE_SECONDS: u64 = 5;
 
+/// The cost ceiling of one run, in US dollars, when nothing declares one: the
+/// default a work order is created with, and what the stall reaper charges a
+/// reaped pass that declared no ceiling of its own. One value, so the two
+/// fallbacks cannot disagree (principle 6). It is a per-run figure on purpose:
+/// charging a reaped pass the whole daily cap would hold every other pass for
+/// the rest of the day.
+pub const DEFAULT_RUN_COST_CEILING_USD: f64 = 20.0;
+
 /// A positive duration such as `90m`, `2s`, `4h` or `1d`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapDuration {

@@ -313,6 +313,7 @@ fn up_reaps_a_live_silent_implementer_past_its_idle_cap() {
             "reason": row["fact"]["reason"],
             "run_id": row["fact"]["run_id"],
             "cost_usd": row["fact"]["cost_usd"].as_f64(),
+            "cost_basis": row["fact"]["cost_basis"],
             "reaped": row["fact"]["reaped"],
             "stalled_seconds_past_the_cap": row["fact"]["stalled_seconds"]
                 .as_u64()
@@ -327,6 +328,7 @@ fn up_reaps_a_live_silent_implementer_past_its_idle_cap() {
             "reason": "stalled",
             "run_id": RUN,
             "cost_usd": 20.0,
+            "cost_basis": "declared-ceiling",
             "reaped": true,
             "stalled_seconds_past_the_cap": true,
         }),
@@ -495,6 +497,7 @@ fn up_closes_a_pass_whose_process_is_gone_without_a_terminal_row() {
             "reason": row["fact"]["reason"],
             "recorded_by": row["fact"]["recorded_by"],
             "cost_usd": row["fact"]["cost_usd"],
+            "cost_basis": row["fact"]["cost_basis"],
         }),
         json!({
             "up_succeeded": true,
@@ -503,6 +506,47 @@ fn up_closes_a_pass_whose_process_is_gone_without_a_terminal_row() {
             "reason": "exited-without-terminal",
             "recorded_by": "reaper",
             "cost_usd": 2.25,
+            "cost_basis": "declared-ceiling",
+        }),
+        "up stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// A reaped pass that declared no cost ceiling is charged the shared per-run
+/// default, the one a work order is created with, and says so. It is never
+/// charged the daily cap, which would hold every other pass for the day.
+#[test]
+fn a_reaped_pass_with_no_declared_ceiling_is_charged_the_per_run_default() {
+    let home = Home::new();
+    let mut sleeper = Sleeper::start();
+    home.pass_hold(Some(&sleeper), &json!({"idleMs": 1_000}));
+    thread::sleep(Duration::from_secs(3));
+
+    let output = home
+        .command()
+        .env("MANDATE_DAILY_CAP_USD", "40")
+        .arg("up")
+        .output()
+        .expect("run ostrom up");
+    let stopped = sleeper.wait_stopped(Duration::from_secs(15));
+
+    let ended = home.terminal_rows("pass-ended", "owner", PASS_OWNER);
+    let row = ended.first().cloned().unwrap_or(Value::Null);
+    assert_eq!(
+        json!({
+            "up_succeeded": output.status.success(),
+            "process_stopped": stopped,
+            "reason": row["fact"]["reason"],
+            "cost_usd": row["fact"]["cost_usd"].as_f64(),
+            "cost_basis": row["fact"]["cost_basis"],
+        }),
+        json!({
+            "up_succeeded": true,
+            "process_stopped": true,
+            "reason": "stalled",
+            "cost_usd": ostrom_core::DEFAULT_RUN_COST_CEILING_USD,
+            "cost_basis": "default-ceiling",
         }),
         "up stderr: {}",
         String::from_utf8_lossy(&output.stderr)
