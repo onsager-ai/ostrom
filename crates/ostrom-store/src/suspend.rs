@@ -171,13 +171,7 @@ impl SuspendTimeline {
         clock: &Clock,
         source: &dyn SuspendSource,
     ) -> Result<Self, String> {
-        // MUTATION A: suspended time is ignored, and an unreadable one is not refused.
-        let reading = SuspendReading {
-            boot_id: source
-                .read()
-                .map_or_else(|_| String::new(), |reading| reading.boot_id),
-            suspended_seconds: 0,
-        };
+        let reading = source.read()?;
         let now = clock.epoch_seconds();
         // A timeline that is missing, unreadable or from another boot is no
         // samples, which only counts more time as suspended.
