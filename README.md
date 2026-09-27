@@ -552,6 +552,39 @@ pull request resolves to the principal floor, a matching deny, or a blocked
 grant requirement. Crossing the threshold adds a `STALLED HOLDS` digest
 finding; it never changes `HOLD` into permission or merges the pull request.
 
+### Selector accuracy
+
+`ostrom queue lint` reports selectors that matched nothing, which is config hygiene,
+not accuracy. Two different errors matter and they are not symmetric. A **miss**
+is a safety failure — something crossed a boundary unreviewed. A **false alarm**
+costs an interruption. Prefer recall wherever an irreversible action is in
+reach and accept the precision loss there; prefer precision everywhere else,
+because an interruption budget spent on noise is unavailable when it matters.
+
+False alarms are recorded going forward, and misses are no longer computed by
+a shipped command. Rejecting an item with `ostrom queue reject` appends one
+line to `~/.claude/ostrom/selector-events.jsonl` recording which selector put
+it in front of you. Nothing extra is asked at decision time.
+
+Selector prefixes fall into two tiers, because they are not equally
+trustworthy:
+
+| Tier | Prefixes | Derived from |
+|---|---|---|
+| Content-derived | `path:`, `ref:` | the change itself |
+| Author-written | `title:`, `type:`, `scope:`, `label:` | text the item's author chose |
+
+`type:` and `scope:` are parsed out of the conventional-commit prefix of the
+item's **title**, and labels are set by whoever opened the item. So for any gate
+resting on the author-written tier, the party being gated selects whether the
+gate fires — a release pull request titled `chore: bump version` silently misses
+`type:release`. `path:` is also pull-request-only, so issues have no
+content-derived gating at all.
+
+Prefer content-derived prefixes and exact `reserved` refs wherever a condition
+carries real safety weight. A single accuracy number would hide precisely this
+split.
+
 ## Cloud / CI
 
 No token, no credential setup — the npm package is public. Install the CLI in
