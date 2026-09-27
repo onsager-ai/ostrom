@@ -159,7 +159,7 @@ impl Home {
     fn doctor_work_orders(&self) -> String {
         let output = self
             .command()
-            .args(["doctor", "work-orders"])
+            .args(["doctor", "--check", "work-orders"])
             .output()
             .expect("run doctor work-orders");
         String::from_utf8_lossy(&output.stdout).into_owned()
