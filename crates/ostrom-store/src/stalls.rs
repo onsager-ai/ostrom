@@ -649,6 +649,8 @@ fn recorded_pass_process(rows: &[TraceFactRecord], holding: &Holding) -> Option<
             row.kind == "pass-started"
                 && row.fact.get("owner").and_then(Value::as_str) == Some(owner)
         })
+        // TEMPORARY mutation (#636 second review): the newest opener only.
+        .take(1)
         .find_map(|row| ProcessIdentity::from_fact(&row.fact))
 }
 
@@ -914,7 +916,8 @@ fn classify(paths: &OstromPaths, hold: &ObservedHold, now: u64) -> Verdict {
                     return match identity.is_running() {
                         // A displaced pass that has hung is still a stalled
                         // hold: nothing else will ever end it.
-                        Some(true) if hold.progress.past_threshold() => {
+                        // TEMPORARY mutation (#636 second review): never stalled.
+                        Some(true) if hold.progress.past_threshold() && identity.pid == 0 => {
                             Verdict::Stalled(StopTarget::Process {
                                 identity,
                                 order: None,
