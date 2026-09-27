@@ -160,7 +160,6 @@ fn trace_event_type(kind: &str) -> Option<EventType> {
     let canonical = match kind {
         "pass-started" => "pass.started",
         "pass-ended" => "pass.ended",
-        "loop-skipped" => "loop.skipped",
         "item-selected" => "item.selected",
         "work-dispatched" => "work.dispatched",
         "work-completed" => "work.completed",
