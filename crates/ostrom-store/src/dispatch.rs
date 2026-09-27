@@ -345,7 +345,12 @@ fn run_dispatch_with_registry_and_minter(
     // A live hold that stopped making progress is reaped first (#619), so a
     // stuck run cannot count against the concurrency ceilings below or block
     // its own item from being dispatched again.
-    let reaped: Vec<crate::ReapedHold> = Vec::new();
+    let reaped = crate::stalls::reap_stalled_holds(
+        &request.paths,
+        &request.clock,
+        context.parent_run_id.as_deref(),
+    )
+    .map_err(|error| DispatchError::new(1, format!("ostrom dispatch: {error}")))?;
     for hold in reaped {
         eprintln!("ostrom dispatch: {hold}");
     }
@@ -688,7 +693,10 @@ fn launch_systemd(
         "--collect",
         "--no-block",
         "--property",
-        "RuntimeMaxSec=infinity",
+        &format!(
+            "RuntimeMaxSec={}",
+            context.request.implementer_caps.outer_bound_seconds()
+        ),
         "--property",
         "KillMode=control-group",
         "--setenv",

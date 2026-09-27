@@ -233,22 +233,21 @@ impl TerminalGuard {
         // stops the run, so the row says why. The run then must not add a
         // second one when the signal reaches it. Only a row naming this run
         // counts: an earlier attempt's row for the same order does not.
-        let trace_result = if std::hint::black_box(false)
-            && run_already_terminal(&self.paths, &self.order.order_id, self.run_events.run_id())
-        {
-            Ok(())
-        } else {
-            append_trace(
-                &self.paths.trace_file(),
-                &TraceAppend {
-                    ts: self.clock.timestamp(),
-                    kind: kind.to_owned(),
-                    fact,
-                    narration: Map::new(),
-                },
-            )
-            .map(|_| ())
-        };
+        let trace_result =
+            if run_already_terminal(&self.paths, &self.order.order_id, self.run_events.run_id()) {
+                Ok(())
+            } else {
+                append_trace(
+                    &self.paths.trace_file(),
+                    &TraceAppend {
+                        ts: self.clock.timestamp(),
+                        kind: kind.to_owned(),
+                        fact,
+                        narration: Map::new(),
+                    },
+                )
+                .map(|_| ())
+            };
         let event_usage = observed_usage.map(|usage| RunUsage {
             input_tokens: Some(weighted.saturating_sub(usage.output_tokens)),
             output_tokens: Some(usage.output_tokens),
@@ -542,7 +541,7 @@ impl WallCap {
                         loop {
                             if watchdog.check().is_some() {
                                 thread_tripped.store(true, Ordering::Release);
-                                let _ = &term;
+                                term.store(true, Ordering::SeqCst);
                                 break;
                             }
                             match receiver.recv_timeout(Duration::from_millis(50)) {
