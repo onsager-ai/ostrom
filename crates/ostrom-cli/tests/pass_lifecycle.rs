@@ -2093,6 +2093,65 @@ fn a_pass_whose_lease_is_lost_during_sweep_preparation_never_spawns_its_harness(
     );
 }
 
+/// #636 second review: the check before the harness starts reads the lease
+/// file, not only the renewal thread's flag, which can be a whole 30-second
+/// renewal interval stale. A lease taken over just before the pass would
+/// spawn stops it at once, long before its first renewal.
+#[test]
+fn a_lease_taken_before_the_renewal_notices_still_stops_the_harness_spawn() {
+    let fixture = Fixture::new("printf '%s\\n' started >\"$OSTROM_HOME/harness-started\"");
+    let sweep_lease = fixture.state.join("sweep.lease");
+    fs::write(
+        &sweep_lease,
+        format!(
+            "{{\"owner\":\"in-flight-sweep\",\"started_at\":1,\"expires_at\":{}}}\n",
+            u64::MAX
+        ),
+    )
+    .expect("hold the sweep lease");
+    // The default TTL: the first renewal is 30 s after the lease is taken.
+    let started = Instant::now();
+    let child = fixture
+        .command()
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start pass");
+    let lease = fixture.state.join("builder-pass.lease");
+    wait_for(&lease);
+    take_over_lease(&lease, "builder-successor-wake99");
+    fs::remove_file(&sweep_lease).expect("release the sweep lease");
+    let status = wait(child);
+    let elapsed = started.elapsed();
+
+    let ended = fixture
+        .trace()
+        .into_iter()
+        .filter(|row| row["kind"] == "pass-ended")
+        .collect::<Vec<_>>();
+    let row = ended.first().cloned().unwrap_or(Value::Null);
+    assert_eq!(
+        json!({
+            "ended_before_its_first_renewal": elapsed < Duration::from_secs(20),
+            "exited_nonzero": !status.success(),
+            "harness_started": fixture.state.join("harness-started").exists(),
+            "terminal_rows": ended.len(),
+            "reason": row["fact"]["reason"],
+            "cost_usd": row["fact"]["cost_usd"],
+            "lease_owner": lease_owner(&lease),
+        }),
+        json!({
+            "ended_before_its_first_renewal": true,
+            "exited_nonzero": true,
+            "harness_started": false,
+            "terminal_rows": 1,
+            "reason": "pass-lease-lost",
+            "cost_usd": 0.0,
+            "lease_owner": "builder-successor-wake99",
+        })
+    );
+}
+
 /// #619 change 1: a pass runs under the wall cap its policy declares, handed
 /// to the harness watchdog, which stops an agent that never finishes.
 #[test]

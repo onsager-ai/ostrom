@@ -837,26 +837,33 @@ fn with_process_identity(
 }
 
 /// End a pass whose lease was lost before its harness started (#636). The
-/// renewal thread only sets a flag; without this the pass would go on to
-/// start its harness alongside the pass that now holds the lease. The row says
-/// `pass-lease-lost` at zero cost, since nothing ran.
+/// renewal thread's flag can be a whole renewal interval stale, so the lease
+/// file itself is read: it must still name this pass's owner and process.
+/// Without this the pass would go on to start its harness alongside the pass
+/// that now holds the lease. The row says `pass-lease-lost` at zero cost,
+/// since nothing ran.
 fn end_if_lease_lost(
     request: &PassRequest,
     guard: &mut PassGuard,
     lease_name: &str,
+    identity: Option<(u32, u32, u64)>,
 ) -> Result<(), PassError> {
-    if !guard.renewal.as_ref().is_some_and(PassLeaseRenewal::lost) {
+    let held = read_lease(&request.paths.state.join(lease_name))
+        .ok()
+        .flatten()
+        .filter(|lease| lease.owner == guard.owner);
+    let still_held = held
+        .as_ref()
+        .is_some_and(|lease| lease.process_identity() == identity);
+    if still_held && !guard.renewal.as_ref().is_some_and(PassLeaseRenewal::lost) {
         return Ok(());
     }
     guard.outcome = Some("failed".to_owned());
     guard.reason = Some("pass-lease-lost".to_owned());
     guard.cost_usd = Some(0.0);
-    // A lease that no longer names this pass is not its to release.
-    if read_lease(&request.paths.state.join(lease_name))
-        .ok()
-        .flatten()
-        .is_none_or(|lease| lease.owner != guard.owner)
-    {
+    // A lease that no longer names this pass is not its to release. One that
+    // still does, lapsed or not, stays armed and `finish` releases it.
+    if held.is_none() {
         guard.lease.disarm();
     }
     guard.finish()?;
@@ -1230,6 +1237,8 @@ fn run_pass_with_bridge_probe_timeout(
         .map_err(|error| PassError::failed(request.role, error.to_string(), 1))?;
 
     let trace_time = request.clock.timestamp();
+    let expected_identity =
+        identity.map(|identity| (identity.pid, identity.process_group_id, identity.start_time));
     let mut guard = PassGuard {
         role: request.role,
         paths: request.paths.clone(),
@@ -1259,7 +1268,7 @@ fn run_pass_with_bridge_probe_timeout(
             &request.paths.state,
             &lease_name,
             &owner,
-            identity.map(|identity| (identity.pid, identity.process_group_id, identity.start_time)),
+            expected_identity,
             ttl,
             &request.clock,
         )
@@ -1352,7 +1361,7 @@ fn run_pass_with_bridge_probe_timeout(
     guard.started = true;
     // Sweep preparation can wait minutes on the sweep lease, long enough for
     // the pass lease to lapse and be taken over (#636).
-    end_if_lease_lost(request, &mut guard, &lease_name)?;
+    end_if_lease_lost(request, &mut guard, &lease_name, expected_identity)?;
     if request.repositories.is_some()
         && request.role == PassRole::Gatekeeper
         && session.candidate_count == Some(0)
@@ -1583,7 +1592,7 @@ fn run_pass_with_bridge_probe_timeout(
     // another run must not pass that run's id on as its own.
     command.env(environment::OSTROM_RUN_ID.name, guard.events.run_id());
     set_process_group(&mut command);
-    end_if_lease_lost(request, &mut guard, &lease_name)?;
+    end_if_lease_lost(request, &mut guard, &lease_name, expected_identity)?;
     let mut child = command.spawn().map_err(|error| {
         PassError::failed(request.role, format!("could not start Claude: {error}"), 1)
     })?;

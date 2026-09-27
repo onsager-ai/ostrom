@@ -347,10 +347,26 @@ impl Home {
 
 impl Home {
     /// A pass hold whose lease the next pass has taken over (#636): its
-    /// `pass-started` names `sleeper` as its process, and the lease now names
-    /// a later wake with no process of its own.
-    fn displaced_pass_hold(&self, sleeper: &Sleeper) {
+    /// `pass-started` names `sleeper` as its process, its `run.started`
+    /// declares `ceilings`, and the lease now names a later wake with no
+    /// process of its own.
+    fn displaced_pass_hold(&self, sleeper: &Sleeper, ceilings: &Value) {
         let now = epoch_now();
+        FileSink::new(self.path.join("runs"))
+            .append(
+                RUN,
+                EventDraft {
+                    event_type: "run.started".to_owned(),
+                    payload: json!({
+                        "kind": "handoff",
+                        "actor": "builder",
+                        "harness": "claude",
+                        "ceilings": ceilings,
+                    }),
+                    captured_at: None,
+                },
+            )
+            .expect("append run.started");
         let (process_group, start_time) = sleeper.identity();
         self.append_trace(&json!({
             "ts": timestamp(now - 30),
@@ -645,7 +661,7 @@ fn up_closes_a_pass_whose_process_is_gone_without_a_terminal_row() {
 fn a_displaced_pass_is_left_running_and_closed_only_once_its_process_is_gone() {
     let home = Home::new();
     let mut sleeper = Sleeper::start();
-    home.displaced_pass_hold(&sleeper);
+    home.displaced_pass_hold(&sleeper, &json!({}));
 
     let while_running = home.up();
     let rows_while_running = home.terminal_rows("pass-ended", "owner", PASS_OWNER).len();
@@ -683,6 +699,91 @@ fn a_displaced_pass_is_left_running_and_closed_only_once_its_process_is_gone() {
         "up stderr: {}{}",
         String::from_utf8_lossy(&while_running.stderr),
         String::from_utf8_lossy(&once_gone.stderr)
+    );
+}
+
+/// #636 second review: a displaced pass that has hung is still a stalled hold.
+/// Past its stall threshold, `up` stops the process its `pass-started`
+/// recorded (identity-checked, under the claim) and records it as stalled, as
+/// it would any stalled pass. The new holder's lease is left alone.
+#[test]
+fn a_displaced_pass_past_its_stall_threshold_is_stopped_as_stalled() {
+    let home = Home::new();
+    let mut sleeper = Sleeper::start();
+    home.displaced_pass_hold(&sleeper, &json!({"idleMs": 1_000, "costUsd": 4.5}));
+    // Past the one-second idle cap at second precision.
+    thread::sleep(Duration::from_secs(3));
+
+    let output = home.up();
+    let stopped = sleeper.wait_stopped(Duration::from_secs(15));
+
+    let ended = home.terminal_rows("pass-ended", "owner", PASS_OWNER);
+    let row = ended.first().cloned().unwrap_or(Value::Null);
+    let lease = fs::read_to_string(home.path.join("builder-pass.lease"))
+        .ok()
+        .and_then(|lease| serde_json::from_str::<Value>(&lease).ok())
+        .unwrap_or(Value::Null);
+    assert_eq!(
+        json!({
+            "up_succeeded": output.status.success(),
+            "reaped": reaped(&output),
+            "process_stopped": stopped,
+            "terminal_rows": ended.len(),
+            "reason": row["fact"]["reason"],
+            "recorded_by": row["fact"]["recorded_by"],
+            "cost_usd": row["fact"]["cost_usd"],
+            "claim_removed": !home.claim().exists(),
+            "lease_owner": lease["owner"],
+        }),
+        json!({
+            "up_succeeded": true,
+            "reaped": 1,
+            "process_stopped": true,
+            "terminal_rows": 1,
+            "reason": "stalled",
+            "recorded_by": "reaper",
+            "cost_usd": 4.5,
+            "claim_removed": true,
+            "lease_owner": SUCCESSOR_OWNER,
+        }),
+        "up stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// #636 second review: a later `pass-started` for the same owner that names
+/// no process (an agent's own record inside the pass, say) does not hide the
+/// process the pass recorded. The displaced pass is still left running, not
+/// closed as exited.
+#[test]
+fn a_later_opener_without_a_process_does_not_hide_the_recorded_one() {
+    let home = Home::new();
+    let mut sleeper = Sleeper::start();
+    home.displaced_pass_hold(&sleeper, &json!({}));
+    home.append_trace(&json!({
+        "ts": timestamp(epoch_now() - 10),
+        "kind": "pass-started",
+        "fact": {"owner": PASS_OWNER, "run_id": RUN},
+        "narration": {},
+    }));
+
+    let output = home.up();
+
+    assert_eq!(
+        json!({
+            "up_succeeded": output.status.success(),
+            "reaped": reaped(&output),
+            "rows": home.terminal_rows("pass-ended", "owner", PASS_OWNER).len(),
+            "left_running": sleeper.running(),
+        }),
+        json!({
+            "up_succeeded": true,
+            "reaped": 0,
+            "rows": 0,
+            "left_running": true,
+        }),
+        "up stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

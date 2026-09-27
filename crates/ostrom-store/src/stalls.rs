@@ -53,8 +53,9 @@
 //! the lease's process is the pass's. Once another pass has taken the lease
 //! over, or none holds it, the pass is judged by the process its `pass-started`
 //! recorded: one still running with that identity has been displaced, not
-//! exited, and is left to end itself with `pass-lease-lost`; only one whose
-//! process is gone is closed.
+//! exited, and is left to end itself with `pass-lease-lost` unless it is past
+//! its stall threshold, when that recorded process is stopped like any other
+//! stalled pass; only one whose process is gone is closed.
 //!
 //! A reaped run's `cost_usd` is its declared cost ceiling, never `null`: the
 //! real figure is unknowable once the process is gone, and every daily-cap
@@ -609,7 +610,7 @@ fn observe(paths: &OstromPaths, clock: &Clock) -> Result<Vec<ObservedHold>, Hold
                 .and_then(|run_id| run_started_ceilings(&events, run_id));
             let caps = hold_caps(holding.kind, &opener, run_ceilings.as_ref());
             let recorded_process = (holding.kind == HoldingKind::Pass)
-                .then(|| ProcessIdentity::from_fact(&opener))
+                .then(|| recorded_pass_process(&rows, &holding))
                 .flatten();
             let last_progress = [
                 epoch_seconds(&holding.started_at),
@@ -634,6 +635,21 @@ fn observe(paths: &OstromPaths, clock: &Clock) -> Result<Vec<ObservedHold>, Hold
             }
         })
         .collect())
+}
+
+/// The process the pass's own `pass-started` recorded (#636): the newest
+/// opener for its owner that names one. A later row for the same owner that
+/// names no process, such as one an agent appends inside the pass, does not
+/// hide it.
+fn recorded_pass_process(rows: &[TraceFactRecord], holding: &Holding) -> Option<ProcessIdentity> {
+    let owner = holding.owner.as_deref()?;
+    rows.iter()
+        .rev()
+        .filter(|row| {
+            row.kind == "pass-started"
+                && row.fact.get("owner").and_then(Value::as_str) == Some(owner)
+        })
+        .find_map(|row| ProcessIdentity::from_fact(&row.fact))
 }
 
 /// The fact of the latest record that opened this hold.
@@ -745,8 +761,9 @@ enum Verdict {
     /// A pass whose process is gone with no terminal row.
     Exited,
     /// A pass whose lease another pass has taken over while its own process
-    /// still runs (#636). It is not exited, and it is left to end itself with
-    /// `pass-lease-lost`.
+    /// still runs (#636), within its stall threshold. It is not exited, and it
+    /// is left to end itself with `pass-lease-lost`. Past its threshold it is
+    /// [`Verdict::Stalled`], and the process it recorded is what is stopped.
     Displaced,
 }
 
@@ -895,6 +912,14 @@ fn classify(paths: &OstromPaths, hold: &ObservedHold, now: u64) -> Verdict {
                 // recorded tells the two apart.
                 PassGeneration::Superseded(Some(identity)) => {
                     return match identity.is_running() {
+                        // A displaced pass that has hung is still a stalled
+                        // hold: nothing else will ever end it.
+                        Some(true) if hold.progress.past_threshold() => {
+                            Verdict::Stalled(StopTarget::Process {
+                                identity,
+                                order: None,
+                            })
+                        }
                         Some(true) => Verdict::Displaced,
                         Some(false) => Verdict::Exited,
                         // Not closed on a guess.
