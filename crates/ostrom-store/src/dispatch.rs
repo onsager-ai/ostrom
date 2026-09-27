@@ -2092,11 +2092,8 @@ fn append_dispatched(context: &DispatchContext<'_>) -> Result<(), DispatchError>
     fact.insert("order_id".to_owned(), json!(context.order.order_id));
     fact.insert("unit_name".to_owned(), json!(context.unit_name));
     fact.insert("backend".to_owned(), json!(context.backend));
-    fact.insert("run_id".to_owned(), json!(context.run_id));
-    fact.insert("runner".to_owned(), json!(context.runner));
-    if let Some(parent) = &context.parent_run_id {
-        fact.insert("parent_run_id".to_owned(), json!(parent));
-    }
+    // MUTATION (principle 7, #618): the run_id / runner / parent_run_id inserts are reverted.
+    let _ = (&context.runner, &context.parent_run_id);
     fact.insert(
         "cost_ceiling_usd".to_owned(),
         context.order.cost_ceiling_usd.clone(),
