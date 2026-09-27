@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Breaking:** `ostrom audit` is removed (#617). It queried merged pull
+  requests and joined them against recorded gate verdicts, but nothing in the
+  delivery loop read its output — the gate, the sweep and `decision_answers.rs`
+  read excuses and gate records directly. `AuditOptions`, `AuditError`, and the
+  rendering internals that built the report go with it; `grant_excuse`,
+  `revoke_excuse`, `list_excuses`, `active_exception_reason`, and `local_drift`
+  are unaffected.
 - **Breaking:** `RepairError::Invalidate` is removed from the public
   `ostrom-store` enum (#599). A repair that changes a repository no longer
   fails outright when it cannot invalidate the sweep generation — contention
