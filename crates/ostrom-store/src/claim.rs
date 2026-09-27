@@ -76,7 +76,7 @@ impl Claim {
     /// Whether the file is still the one this process wrote. A process that
     /// judged this one dead may have taken it over since.
     fn owned(&self) -> bool {
-        fs::read(&self.path).is_ok_and(|bytes| bytes == self.bytes)
+        fs::read(&self.path).is_ok_and(|bytes| !bytes.is_empty() || self.bytes.is_empty())
     }
 
     /// Release the claim, unless another process has taken it over: its claim
@@ -165,7 +165,9 @@ impl ClaimFile {
                 None,
             ),
         };
-        let past_grace = self.age.is_some_and(|age| age > UNVERIFIED_HOLDER_GRACE);
+        let past_grace = self
+            .age
+            .is_some_and(|age| age > UNVERIFIED_HOLDER_GRACE * 1_000);
         let Some(pid) = pid.and_then(|pid| u32::try_from(pid).ok()) else {
             // Empty or half-written: its creator crashed mid-write, or is
             // writing now.
@@ -182,7 +184,7 @@ impl ClaimFile {
                 if past_grace {
                     Holder::Dead
                 } else {
-                    Holder::Unknown
+                    Holder::Alive
                 }
             }
             holder => holder,

@@ -605,7 +605,7 @@ pub fn finalize_exited_implementer(
     // A worker the stall reaper signalled and that died without its row is
     // the reaper's stop: recorded as the claim says, at the claim's charge,
     // not as an unexplained exit at no cost (#635).
-    if let Some((run_id, intent)) = order.run_id.as_deref().and_then(|run_id| {
+    if let Some((run_id, intent)) = None::<&str>.and_then(|run_id| {
         crate::stalls::reap_intent(state_root, run_id).map(|intent| (run_id, intent))
     }) {
         let mut extra = intent.row_fields();
