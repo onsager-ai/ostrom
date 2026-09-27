@@ -164,6 +164,16 @@ impl TerminalGuard {
         // invoice. Keeping it numeric on every terminal row lets completed
         // work replace its in-flight reservation in the daily-cap total.
         let cost = weighted as f64 / self.order.tokens() as f64 * self.order.cost();
+        // A failure while the stall reaper holds a claim on this run is the
+        // reaper's stop reaching it (#635): the row says why, `stalled`, and
+        // charges what the reaper charges, whichever of the two writes it.
+        let intent = (kind == "work-failed")
+            .then(|| crate::stalls::reap_intent(&self.paths.state, self.run_events.run_id()))
+            .flatten();
+        let reason = intent
+            .as_ref()
+            .map_or(reason, |intent| Some(intent.reason.as_str()));
+        let cost = intent.as_ref().map_or(cost, |intent| intent.cost_usd);
         // A retry can turn an expensive partial edit into a cheap completion,
         // so failed worktrees remain addressable even when the child stopped
         // before its first commit.
@@ -226,13 +236,17 @@ impl TerminalGuard {
         if let Some(run_id) = &self.dispatched_run_id {
             fact.insert("run_id".to_owned(), json!(run_id));
         }
+        if let Some(intent) = &intent {
+            fact.insert("reaped".to_owned(), json!(true));
+            fact.extend(intent.row_fields());
+        }
         if let Err(error) = crate::reap_build_cache(&self.paths.state, &self.order.item_id) {
             eprintln!("ostrom implementer: could not reap build cache: {error}");
         }
-        // The stall reaper (#619) writes this run's terminal row before it
-        // stops the run, so the row says why. The run then must not add a
-        // second one when the signal reaches it. Only a row naming this run
-        // counts: an earlier attempt's row for the same order does not.
+        // A stall reaper that stopped this run and found no row wrote one
+        // (#619, #635). The run then must not add a second. Only a row naming
+        // this run counts: an earlier attempt's row for the same order does
+        // not.
         let trace_result =
             if run_already_terminal(&self.paths, &self.order.order_id, self.run_events.run_id()) {
                 Ok(())

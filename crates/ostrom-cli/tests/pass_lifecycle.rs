@@ -1711,6 +1711,123 @@ fn a_pass_the_reaper_already_ended_does_not_write_a_second_pass_ended() {
     assert!(!fixture.state.join("builder-pass.lease").exists());
 }
 
+/// #635: a stalled pass that handles `SIGTERM` writes its own `pass-ended`
+/// when `ostrom up` stops it. The reaper's claim on its run makes that row say
+/// `failed`, `stalled`, at the per-run ceiling, so there is exactly one row,
+/// written by the pass, saying why it ended.
+#[test]
+fn a_term_handling_pass_stopped_by_the_reaper_writes_one_stalled_pass_ended() {
+    let fixture = Fixture::new(concat!(
+        "printf '%s\\n' \"$$\" >\"$OSTROM_HOME/child.pid\"\n",
+        "trap 'exit 143' TERM\n",
+        "i=0; while [ \"$i\" -lt 60 ]; do sleep 1; i=$((i + 1)); done"
+    ));
+    // `ostrom up` needs a current policy version; the manifest stays outside
+    // the state root, so the pass itself runs exactly as it does without one.
+    let policy = fixture.root.path().join("policy");
+    fs::create_dir_all(&policy).expect("create the policy directory");
+    let manifest = policy.join("ostrom.yaml");
+    fs::write(&manifest, "manifest_version: 1\n").expect("write the operator manifest");
+    let trusted_keys = support::sign_manifest(&manifest);
+    let composed = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .arg("compose")
+        .arg(&manifest)
+        .current_dir(&policy)
+        .env("OSTROM_HOME", &fixture.state)
+        .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
+        .env_remove("OSTROM_POLICY_MANIFEST")
+        .output()
+        .expect("compose the current policy version");
+    assert!(
+        composed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&composed.stderr)
+    );
+
+    let mut child = fixture.command().spawn().expect("start pass");
+    wait_for(&fixture.state.join("child.pid"));
+    let started = fixture
+        .trace()
+        .into_iter()
+        .find(|row| row["kind"] == "pass-started")
+        .expect("the pass recorded its start");
+    let owner = started["fact"]["owner"].clone();
+    let run_id = started["fact"]["run_id"].clone();
+    // A pass's own watchdog enforces an idle cap declared to it, so a pass
+    // the reaper stops is one whose watchdog did not. A later opener for the
+    // same hold stands for that: it names the one-second cap the reaper
+    // judges the hold by.
+    let mut trace = fs::read_to_string(fixture.state.join("sprint.jsonl")).expect("read trace");
+    trace.push_str(&format!(
+        "{}\n",
+        json!({
+            "ts": "2026-08-01T00:00:00Z",
+            "kind": "pass-started",
+            "fact": {"owner": owner.clone(), "run_id": run_id.clone(), "idle_seconds": 1},
+            "narration": {},
+        })
+    ));
+    fs::write(fixture.state.join("sprint.jsonl"), trace).expect("record the idle cap");
+    // Past the one-second idle cap at second precision.
+    thread::sleep(Duration::from_secs(3));
+
+    let up = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .arg("up")
+        .current_dir(&fixture.state)
+        .env_clear()
+        .env("OSTROM_HOME", &fixture.state)
+        .env("HOME", fixture.root.path())
+        .env("PATH", env::var_os("PATH").unwrap_or_default())
+        .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
+        .output()
+        .expect("run ostrom up");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while child.try_wait().expect("poll the pass").is_none() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let ended = fixture
+        .trace()
+        .into_iter()
+        .filter(|row| row["kind"] == "pass-ended" && row["fact"]["owner"] == owner)
+        .collect::<Vec<_>>();
+    let row = ended.first().cloned().unwrap_or(Value::Null);
+    let claim = fixture.state.join(format!(
+        "reaping/{}.claim",
+        run_id.as_str().expect("the run id is a string")
+    ));
+    assert_eq!(
+        json!({
+            "up_succeeded": up.status.success(),
+            "up_reaped_it": String::from_utf8_lossy(&up.stdout).contains("reaped=1"),
+            "pass_stopped": child.try_wait().expect("poll the pass").is_some(),
+            "terminal_rows": ended.len(),
+            "outcome": row["fact"]["outcome"],
+            "reason": row["fact"]["reason"],
+            "cost_usd": row["fact"]["cost_usd"].as_f64(),
+            "cost_basis": row["fact"]["cost_basis"],
+            "written_by_the_pass": row["fact"]["recorded_by"].is_null(),
+            "claim_removed": !claim.exists(),
+            "lease_released": !fixture.state.join("builder-pass.lease").exists(),
+        }),
+        json!({
+            "up_succeeded": true,
+            "up_reaped_it": true,
+            "pass_stopped": true,
+            "terminal_rows": 1,
+            "outcome": "failed",
+            "reason": "stalled",
+            "cost_usd": ostrom_core::DEFAULT_RUN_COST_CEILING_USD,
+            "cost_basis": "default-ceiling",
+            "written_by_the_pass": true,
+            "claim_removed": true,
+            "lease_released": true,
+        }),
+        "up stderr: {}",
+        String::from_utf8_lossy(&up.stderr)
+    );
+}
+
 /// #619 change 3: a pass that cannot renew its lease stops rather than keep
 /// working under a lease another pass may now hold.
 #[test]

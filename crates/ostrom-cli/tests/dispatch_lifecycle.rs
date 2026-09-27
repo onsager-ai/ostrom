@@ -981,7 +981,7 @@ fn an_implementer_past_its_declared_wall_cap_is_stopped_and_says_why() {
             "codex_started": codex.is_some(),
             "codex_still_running": codex.is_some_and(pid_alive),
             "stopped_long_before_codex_would_exit": elapsed < Duration::from_secs(30),
-            "unit_outer_bound": unit.lines().any(|line| line == "RuntimeMaxSec=7"),
+            "unit_outer_bound": unit.lines().any(|line| line == "RuntimeMaxSec=122"),
         }),
         json!({
             "dispatched": true,
@@ -1004,6 +1004,9 @@ fn an_implementer_past_its_declared_wall_cap_is_stopped_and_says_why() {
 /// in-flight holds. The process is gone, its lease is released, its
 /// `work-failed` says `stalled` and charges the order's cost ceiling, and a
 /// second dispatch of the same item proceeds instead of being refused.
+///
+/// #635 N1: only a dispatch scoped to the hold's repository reaps it. A hand
+/// run with no repository scope reaps nothing and is refused by the live hold.
 #[test]
 fn a_live_silent_hold_is_reaped_by_dispatch_before_the_concurrency_count() {
     let fixture = DispatchFixture::new(false);
@@ -1016,6 +1019,7 @@ fn a_live_silent_hold_is_reaped_by_dispatch_before_the_concurrency_count() {
     let process_dispatch = || {
         fixture
             .dispatch(false)
+            .env("OSTROM_EFFECTIVE_REPOSITORIES", "placeholder-org/alpha")
             .env("MANDATE_DISPATCH_BACKEND", "process")
             .env("MANDATE_OSTROM_BIN", &worker)
             .env("MANDATE_IMPLEMENTER_STARTUP_GRACE_MILLISECONDS", "100")
@@ -1041,6 +1045,15 @@ fn a_live_silent_hold_is_reaped_by_dispatch_before_the_concurrency_count() {
     second_order["order_id"] =
         json!("1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
     fs::write(&fixture.order_file, format!("{second_order}\n")).expect("write second order");
+    let unscoped = fixture
+        .dispatch(false)
+        .env_remove("OSTROM_EFFECTIVE_REPOSITORIES")
+        .env("MANDATE_DISPATCH_BACKEND", "process")
+        .env("MANDATE_OSTROM_BIN", &worker)
+        .env("MANDATE_IMPLEMENTER_STARTUP_GRACE_MILLISECONDS", "100")
+        .output()
+        .expect("dispatch with no repository scope");
+    let unscoped_left_it_running = pid_alive(first_pid);
     let second = process_dispatch();
     let second_pid = fs::read(
         fixture
@@ -1066,6 +1079,8 @@ fn a_live_silent_hold_is_reaped_by_dispatch_before_the_concurrency_count() {
     let reaped = row("work-failed", &first_order["order_id"]);
     assert_eq!(
         json!({
+            "unscoped_dispatch_refused": !unscoped.status.success(),
+            "unscoped_dispatch_left_it_running": unscoped_left_it_running,
             "second_dispatch_succeeded": second.status.success(),
             "first_process_running": pid_alive(first_pid),
             "reason": reaped["fact"]["reason"],
@@ -1081,6 +1096,8 @@ fn a_live_silent_hold_is_reaped_by_dispatch_before_the_concurrency_count() {
             "second_order_dispatched": !row("work-dispatched", &second_order["order_id"]).is_null(),
         }),
         json!({
+            "unscoped_dispatch_refused": true,
+            "unscoped_dispatch_left_it_running": true,
             "second_dispatch_succeeded": true,
             "first_process_running": false,
             "reason": "stalled",
@@ -1180,6 +1197,184 @@ fn an_implementer_whose_order_the_reaper_already_closed_writes_no_second_termina
         .collect::<Vec<_>>();
     assert_eq!(terminal.len(), 1, "{terminal:?}");
     assert_eq!(terminal[0]["fact"]["reason"], "stalled");
+}
+
+/// #635: a stalled implementer that handles `SIGTERM` writes its own terminal
+/// row when `ostrom up` stops it. The reaper's claim on its run makes that row
+/// say `stalled` and charge the order's cost ceiling, so there is exactly one
+/// row, written by the run, saying why it ended.
+#[test]
+fn a_term_handling_implementer_stopped_by_the_reaper_writes_one_stalled_row() {
+    use std::os::unix::process::CommandExt as _;
+
+    let fixture = DispatchFixture::new(false);
+    compose_current(&fixture.state, "manifest_version: 1\n");
+    let (_codex_environment, credential) = runnable_implementer(&fixture);
+    let codex_pid = fixture.root.path().join("codex.pid");
+    executable(
+        &fixture.codex,
+        &format!(
+            "if [ \"${{1:-}}\" = --version ]; then exit 0; fi\nprintf '%s\\n' \"$$\" >'{}'\nexec sleep 60",
+            codex_pid.display()
+        ),
+    );
+    let unit = "ostrom-implementer-stalled";
+    let run_id = "implementer-stalled-placeholder-run";
+    let lease = fixture
+        .state
+        .join(format!("implementer-item-{}.lease", fixture.item_hash));
+    fs::write(
+        &lease,
+        format!("{{\"owner\":\"{unit}\",\"started_at\":1,\"expires_at\":9999999999}}\n"),
+    )
+    .expect("write the implementer lease");
+    let order = WorkOrder::from_json(&fs::read(&fixture.order_file).expect("read order"))
+        .expect("valid work order");
+    // The hold, as dispatch records one on the process backend, with a
+    // one-second idle cap.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the clock is past the epoch")
+        .as_secs();
+    let dispatched_at = chrono::DateTime::<chrono::Utc>::from_timestamp(
+        i64::try_from(now - 60).expect("a timestamp in range"),
+        0,
+    )
+    .expect("valid timestamp")
+    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let mut appended = fs::read_to_string(fixture.state.join("sprint.jsonl")).unwrap_or_default();
+    appended.push_str(&format!(
+        "{}\n",
+        json!({
+            "ts": dispatched_at,
+            "kind": "work-dispatched",
+            "fact": {
+                "schema_version": 1,
+                "item_id": &order.item_id,
+                "order_id": &order.order_id,
+                "unit_name": unit,
+                "backend": "process",
+                "run_id": run_id,
+                "runner": "agent/codex",
+                "wall_seconds": 14_400,
+                "idle_seconds": 1,
+                "cost_ceiling_usd": 20,
+                "token_ceiling": 500_000,
+                "cost_usd": null,
+                "duration_seconds": 0,
+            },
+            "narration": {},
+        })
+    ));
+    fs::write(fixture.state.join("sprint.jsonl"), appended).expect("record the dispatch");
+    let mut implementer = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .arg("implement")
+        .arg(&fixture.order_file)
+        .arg(unit)
+        .args(["--run-id", run_id])
+        .current_dir(fixture.root.path())
+        .env_clear()
+        .env("OSTROM_HOME", &fixture.state)
+        .env("HOME", &fixture.home)
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("OSTROM_PLUGIN_ROOT", plugin_root())
+        .env("MANDATE_IMPLEMENTER_SOURCE_REPO", &fixture.source)
+        .env("MANDATE_GH_AS_BIN", &credential)
+        .env("MANDATE_IMPLEMENTER_TERMINATION_GRACE_SECONDS", "1")
+        .env("CODEX_BIN", &fixture.codex)
+        .process_group(0)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start the implementer");
+    let implementer_pid = implementer.id();
+    let _group = KillProcessGroup(implementer_pid);
+    wait_until(Duration::from_secs(30), || {
+        fs::read_to_string(&codex_pid).is_ok_and(|pid| !pid.trim().is_empty())
+    });
+    // Bound to its process, as the process backend binds a dispatched one.
+    let (group, _, start_time) =
+        proc_identity(implementer_pid).expect("the implementer's process identity");
+    fs::write(
+        &lease,
+        json!({
+            "owner": unit,
+            "started_at": 1,
+            "expires_at": 9_999_999_999_u64,
+            "pid": implementer_pid,
+            "process_group_id": group,
+            "process_start_time": start_time,
+        })
+        .to_string(),
+    )
+    .expect("bind the lease to the implementer");
+    // Past the one-second idle cap at second precision.
+    thread::sleep(Duration::from_secs(3));
+
+    let up = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .arg("up")
+        .current_dir(&fixture.state)
+        .env("OSTROM_HOME", &fixture.state)
+        .env(
+            "OSTROM_POLICY_TRUSTED_KEYS",
+            fixture.state.join("trusted-policy-keys"),
+        )
+        .env_remove("OSTROM_POLICY_MANIFEST")
+        .env_remove("OSTROM_RUN_ID")
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .output()
+        .expect("run ostrom up");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while implementer
+        .try_wait()
+        .expect("poll the implementer")
+        .is_none()
+        && Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let terminal = trace(&fixture.state)
+        .into_iter()
+        .filter(|row| {
+            matches!(row["kind"].as_str(), Some("work-completed" | "work-failed"))
+                && row["fact"]["order_id"] == order.order_id.as_str()
+        })
+        .collect::<Vec<_>>();
+    let row = terminal.first().cloned().unwrap_or(Value::Null);
+    assert_eq!(
+        json!({
+            "up_succeeded": up.status.success(),
+            "up_reaped_it": String::from_utf8_lossy(&up.stdout).contains("reaped=1"),
+            "terminal_rows": terminal.len(),
+            "reason": row["fact"]["reason"],
+            "cost_usd": row["fact"]["cost_usd"].as_f64(),
+            "cost_basis": row["fact"]["cost_basis"],
+            "reaped": row["fact"]["reaped"],
+            "written_by_the_run": row["fact"]
+                .as_object()
+                .is_some_and(|fact| fact.contains_key("worktree_path")),
+            "claim_removed": !fixture
+                .state
+                .join(format!("reaping/{run_id}.claim"))
+                .exists(),
+            "lease_released": !lease.exists(),
+        }),
+        json!({
+            "up_succeeded": true,
+            "up_reaped_it": true,
+            "terminal_rows": 1,
+            "reason": "stalled",
+            "cost_usd": 20.0,
+            "cost_basis": "declared-ceiling",
+            "reaped": true,
+            "written_by_the_run": true,
+            "claim_removed": true,
+            "lease_released": true,
+        }),
+        "up stderr: {}",
+        String::from_utf8_lossy(&up.stderr)
+    );
 }
 
 /// Compose `manifest` as this state root's current policy version, signed as

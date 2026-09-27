@@ -536,6 +536,7 @@ impl PassLeaseRenewal {
         let thread = thread::Builder::new()
             .name("ostrom-pass-lease".to_owned())
             .spawn(move || {
+                let mut deferred = 0_u32;
                 loop {
                     match receiver.recv_timeout(interval) {
                         Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
@@ -549,10 +550,20 @@ impl PassLeaseRenewal {
                         clock.epoch_seconds(),
                         ttl_seconds,
                     ) {
-                        Ok(()) => {}
+                        Ok(()) => deferred = 0,
                         // Another process briefly holds the lease's mutation
                         // guard (a waiter probing it); the next tick retries.
-                        Err(LeaseActionError::MutationInProgress) => {}
+                        // A guard left by a dead process is taken over
+                        // (#635), so one that persists is held by a live
+                        // process and is said, not retried in silence.
+                        Err(LeaseActionError::MutationInProgress) => {
+                            deferred += 1;
+                            if deferred > 1 {
+                                eprintln!(
+                                    "ostrom pass: pass lease renewal deferred {deferred} times in a row: its mutation guard is held by a live process"
+                                );
+                            }
+                        }
                         Err(error) => {
                             eprintln!("ostrom pass: pass lease renewal failed: {error}");
                             thread_lost.store(true, Ordering::Release);
@@ -590,9 +601,9 @@ impl Drop for PassLeaseRenewal {
     }
 }
 
-/// Whether a `pass-ended` for `owner` is already on the trace. The stall
-/// reaper writes one for a pass it stops (#619); the pass must not then write a
-/// second terminal row for the same hold when the signal reaches it.
+/// Whether a `pass-ended` for `owner` is already on the trace. A stall reaper
+/// that stopped this pass and found no row writes one (#619, #635); the pass
+/// must not then write a second terminal row for the same hold.
 fn pass_already_ended(paths: &OstromPaths, owner: &str) -> bool {
     read_trace(&paths.trace_file()).is_ok_and(|trace| {
         trace.rows.into_iter().filter_map(Result::ok).any(|row| {
@@ -644,9 +655,22 @@ impl PassGuard {
             self.outcome = Some("failed".to_owned());
             self.reason = Some("permission-channel-cleanup".to_owned());
         }
-        let outcome = terminal_outcome(self.outcome.clone(), thread::panicking());
+        let mut outcome = terminal_outcome(self.outcome.clone(), thread::panicking());
         if self.started && pass_already_ended(&self.paths, &self.owner) {
             self.started = false;
+        }
+        // A pass that did not succeed while the stall reaper holds a claim on
+        // its run is the reaper's stop reaching it (#635): its `pass-ended`
+        // says why, `stalled`, and charges what the reaper charges, whichever
+        // of the two writes it.
+        let intent = (self.started
+            && !matches!(outcome.as_str(), "completed" | "no-op" | "no-candidates"))
+        .then(|| crate::stalls::reap_intent(&self.paths.state, self.events.run_id()))
+        .flatten();
+        if let Some(intent) = &intent {
+            outcome = "failed".to_owned();
+            self.reason = Some(intent.reason.clone());
+            self.cost_usd = Some(intent.cost_usd);
         }
         if self.started {
             let now = self.clock.epoch_seconds();
@@ -669,6 +693,9 @@ impl PassGuard {
             );
             if let Some(reason) = &self.reason {
                 fact.insert("reason".to_owned(), json!(reason));
+            }
+            if let Some(intent) = &intent {
+                fact.extend(intent.row_fields());
             }
             if let Some(hash) = &self.dispatchability_hash {
                 fact.insert("dispatchability_hash".to_owned(), json!(hash));

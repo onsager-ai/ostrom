@@ -1115,3 +1115,170 @@ fn supervisor_terminalizes_a_dispatched_worker_killed_before_drop() {
     assert_eq!(trace[1]["fact"]["reason"], "unit-exit-without-terminal");
     assert_eq!(trace[1]["fact"]["termination_signal"], "SIG9");
 }
+
+/// #635 review S-b: a worker the stall reaper signalled, which then died
+/// without writing its own row, is finalized by its supervisor as the reaper's
+/// claim says: `stalled` at the claim's charge, not an unexplained exit at no
+/// cost.
+#[test]
+fn supervisor_records_a_signalled_claims_reason_for_a_worker_killed_before_its_row() {
+    const RUN: &str = "implementer-claimed-placeholder-run";
+    let fixture = Fixture::new(100);
+    fixture.acquire();
+    let order = WorkOrder::from_json(&fs::read(&fixture.order_file).expect("read order"))
+        .expect("valid order");
+    fs::write(
+        fixture.state.join("sprint.jsonl"),
+        format!(
+            "{}\n",
+            json!({
+                "ts": "2026-08-01T00:00:00Z",
+                "kind": "work-dispatched",
+                "fact": {
+                    "schema_version": 1,
+                    "item_id": &order.item_id,
+                    "order_id": &order.order_id,
+                    "unit_name": &fixture.unit,
+                    "backend": "process",
+                    "run_id": RUN,
+                    "cost_ceiling_usd": 10,
+                    "token_ceiling": 100
+                },
+                "narration": {}
+            })
+        ),
+    )
+    .expect("record dispatch");
+    fs::create_dir_all(fixture.state.join("reaping")).expect("create the claim directory");
+    fs::write(
+        fixture.state.join(format!("reaping/{RUN}.claim")),
+        json!({
+            "run_id": RUN,
+            "kind": "implementer",
+            "order_id": &order.order_id,
+            "reason": "stalled",
+            "cost_usd": 10.0,
+            "cost_basis": "declared-ceiling",
+            "claimed_at": "2026-08-01T00:00:05Z",
+            "signalled_at": "2026-08-01T00:00:06Z",
+            "last_progress_at": "2026-08-01T00:00:00Z",
+            "stalled_seconds": 42,
+            "reaper_pid": 1,
+            "reaper_start_time": 1,
+        })
+        .to_string(),
+    )
+    .expect("write the reaper's signalled claim");
+    let child = fixture
+        .command("wait")
+        .args(["--run-id", RUN])
+        .spawn()
+        .expect("start implementer");
+    wait_for(&fixture.state.join("codex-grandchild.pid"));
+    let worker = wait_for_child(child.id());
+    signal(worker, "KILL");
+    assert_eq!(wait(child).code(), Some(1));
+
+    for pid_file in ["codex.pid", "codex-grandchild.pid"] {
+        if let Ok(pid) = fs::read_to_string(fixture.state.join(pid_file)) {
+            let _ = Command::new("kill").args(["-KILL", pid.trim()]).status();
+        }
+    }
+
+    let terminal = fixture
+        .trace()
+        .into_iter()
+        .filter(|row| row["kind"] == "work-failed")
+        .collect::<Vec<_>>();
+    let row = terminal.first().cloned().unwrap_or(Value::Null);
+    assert_eq!(
+        json!({
+            "terminal_rows": terminal.len(),
+            "reason": row["fact"]["reason"],
+            "cost_usd": row["fact"]["cost_usd"].as_f64(),
+            "cost_basis": row["fact"]["cost_basis"],
+            "stalled_seconds": row["fact"]["stalled_seconds"],
+            "run_id": row["fact"]["run_id"],
+            "reaped": row["fact"]["reaped"],
+            "termination_signal": row["fact"]["termination_signal"],
+            "lease_released": !fixture.lease_file.exists(),
+        }),
+        json!({
+            "terminal_rows": 1,
+            "reason": "stalled",
+            "cost_usd": 10.0,
+            "cost_basis": "declared-ceiling",
+            "stalled_seconds": 42,
+            "run_id": RUN,
+            "reaped": true,
+            "termination_signal": "SIG9",
+            "lease_released": true,
+        })
+    );
+}
+
+/// #635 review S-a: the same claim, never signalled (a stop the reaper
+/// refused, or a liveness it could not read before the first signal), did not
+/// end the run. A failure the run records on its own keeps its own reason and
+/// charge.
+#[test]
+fn a_claim_kept_without_a_signal_leaves_the_runs_own_reason() {
+    const RUN: &str = "implementer-unsignalled-placeholder-run";
+    let fixture = Fixture::new(100);
+    fixture.acquire();
+    let order = WorkOrder::from_json(&fs::read(&fixture.order_file).expect("read order"))
+        .expect("valid order");
+    fs::create_dir_all(fixture.state.join("reaping")).expect("create the claim directory");
+    fs::write(
+        fixture.state.join(format!("reaping/{RUN}.claim")),
+        json!({
+            "run_id": RUN,
+            "kind": "implementer",
+            "order_id": &order.order_id,
+            "reason": "stalled",
+            "cost_usd": 10.0,
+            "cost_basis": "declared-ceiling",
+            "claimed_at": "2026-08-01T00:00:05Z",
+            "signalled_at": null,
+            "reaper_pid": 1,
+            "reaper_start_time": 1,
+        })
+        .to_string(),
+    )
+    .expect("write the reaper's unsignalled claim");
+    let child = fixture
+        .command("wait")
+        .args(["--run-id", RUN, "--wall-seconds", "2"])
+        .spawn()
+        .expect("start implementer");
+    let status = wait(child);
+
+    for pid_file in ["codex.pid", "codex-grandchild.pid"] {
+        if let Ok(pid) = fs::read_to_string(fixture.state.join(pid_file)) {
+            let _ = Command::new("kill").args(["-KILL", pid.trim()]).status();
+        }
+    }
+
+    let terminal = fixture
+        .trace()
+        .into_iter()
+        .filter(|row| row["kind"] == "work-failed")
+        .collect::<Vec<_>>();
+    let row = terminal.first().cloned().unwrap_or(Value::Null);
+    assert_eq!(
+        json!({
+            "exited_nonzero": !status.success(),
+            "terminal_rows": terminal.len(),
+            "reason": row["fact"]["reason"],
+            "cost_basis": row["fact"]["cost_basis"],
+            "reaped": row["fact"]["reaped"],
+        }),
+        json!({
+            "exited_nonzero": true,
+            "terminal_rows": 1,
+            "reason": "wall-cap",
+            "cost_basis": null,
+            "reaped": null,
+        })
+    );
+}

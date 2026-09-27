@@ -3,6 +3,7 @@
 mod app_token;
 mod budget;
 mod check_store;
+mod claim;
 mod clock;
 mod commit_checks;
 mod decision_answers;
@@ -110,7 +111,7 @@ pub use selection::{
 };
 pub use stalls::{
     HoldProgress, ReapedHold, StallError, hold_progress, process_running, process_start_time,
-    reap_stalled_holds, stalled_holds,
+    reap_stalled_holds, reaper_findings, stalled_holds,
 };
 pub use sweep::{
     MINIMUM_PASS_WORK_SECONDS, PublishTarget, RepositorySnapshot, RosterCoverageFinding,
