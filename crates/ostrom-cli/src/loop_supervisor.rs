@@ -198,6 +198,15 @@ pub(crate) fn reconcile(
             summary.reaped += 1;
         }
     }
+    if ostrom_store::reaper_findings(paths)
+        .iter()
+        .any(|finding| finding.contains("the stall reaper failed"))
+    {
+        return Err(LoopSupervisorError::Unlaunchable {
+            name: "reconciler".to_owned(),
+            cause: "stall reaper failed".to_owned(),
+        });
+    }
     let consumption = measure_consumption(paths, clock);
     let local_now = clock.now().with_timezone(&Local);
 

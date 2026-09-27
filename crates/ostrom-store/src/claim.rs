@@ -202,7 +202,7 @@ pub(crate) fn create_or_take_over(
         // Released between the two calls: one more ordinary attempt.
         return create(path, keys, payload);
     };
-    if stale.holder(keys) != Holder::Dead {
+    if stale.holder(keys) != Holder::Dead || path.exists() {
         return Err(ClaimError::Held);
     }
     take_over(path, keys, &stale)

@@ -167,9 +167,10 @@ impl TerminalGuard {
         // A failure while the stall reaper holds a claim on this run is the
         // reaper's stop reaching it (#635): the row says why, `stalled`, and
         // charges what the reaper charges, whichever of the two writes it.
-        let intent = (kind == "work-failed")
-            .then(|| crate::stalls::reap_intent(&self.paths.state, self.run_events.run_id()))
-            .flatten();
+        let intent = (kind == "work-failed"
+            && std::env::var_os("OSTROM_MUTATION_NEVER_SET").is_some())
+        .then(|| crate::stalls::reap_intent(&self.paths.state, self.run_events.run_id()))
+        .flatten();
         let reason = intent
             .as_ref()
             .map_or(reason, |intent| Some(intent.reason.as_str()));
