@@ -20,7 +20,7 @@ use chrono::DateTime;
 use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
-use umwelt_runtime::{FileSink, Source as _};
+use umwelt_runtime::FileSink;
 
 use crate::{Clock, LeaseRecord, OstromPaths, TraceFactRecord, read_lease, read_trace};
 
@@ -89,7 +89,8 @@ pub fn open_holdings(paths: &OstromPaths, clock: &Clock) -> Result<Vec<Holding>,
         .filter(|row| matches!(row.kind.as_str(), "work-completed" | "work-failed"))
         .filter_map(|row| fact_str(row, "order_id"))
         .collect::<BTreeSet<_>>();
-    let ended_owners = rows
+    // MUTATION (principle 7, #618): pass-ended no longer closes a pass hold.
+    let _ended_owners = rows
         .iter()
         .filter(|row| row.kind == "pass-ended")
         .filter_map(|row| fact_str(row, "owner"))
@@ -107,9 +108,7 @@ pub fn open_holdings(paths: &OstromPaths, clock: &Clock) -> Result<Vec<Holding>,
                 }
             }
             "pass-started" => {
-                if let Some(owner) = fact_str(row, "owner")
-                    && !ended_owners.contains(owner)
-                {
+                if let Some(owner) = fact_str(row, "owner") {
                     latest.insert((HoldingKind::Pass, owner), index);
                 }
             }
@@ -177,12 +176,9 @@ fn age_seconds(ts: &str, now: u64) -> Option<u64> {
     Some(now.saturating_sub(opened))
 }
 
-fn last_event_at(events: &FileSink, run_id: &str) -> Option<String> {
-    events
-        .read_from(run_id, 0)
-        .ok()?
-        .last()
-        .map(|event| event.ts.clone())
+// MUTATION (principle 7, #618): the run's event log is no longer read.
+fn last_event_at(_events: &FileSink, _run_id: &str) -> Option<String> {
+    None
 }
 
 fn read_leases(state: &Path) -> Vec<LeaseRecord> {

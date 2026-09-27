@@ -665,8 +665,8 @@ fn wire_ceilings(caps: RunCaps) -> Option<ethogram::RunCeilings> {
 /// written under and its harness child receives as `OSTROM_RUN_ID`, so a hold
 /// can be followed from the fact to the process. `pass-ended` is part of the
 /// frozen pass contract and does not gain it.
-fn with_run_id(mut fact: Map<String, Value>, run_id: &str) -> Map<String, Value> {
-    fact.insert("run_id".to_owned(), json!(run_id));
+// MUTATION (principle 7, #618): pass-started no longer names the run id.
+fn with_run_id(fact: Map<String, Value>, _run_id: &str) -> Map<String, Value> {
     fact
 }
 
@@ -1353,7 +1353,7 @@ fn run_pass_with_bridge_probe_timeout(
     // `/proc/<pid>/environ`, and an `ostrom dispatch` the agent runs records it
     // as `parent_run_id`. Set here, never inherited: a pass started under
     // another run must not pass that run's id on as its own.
-    command.env(environment::OSTROM_RUN_ID.name, guard.events.run_id());
+    // MUTATION (principle 7, #618): the harness OSTROM_RUN_ID line is reverted.
     set_process_group(&mut command);
     let mut child = command.spawn().map_err(|error| {
         PassError::failed(request.role, format!("could not start Claude: {error}"), 1)
