@@ -546,7 +546,7 @@ impl PassLeaseRenewal {
                         &name,
                         &owner,
                         identity,
-                        std::hint::black_box(0) * clock.epoch_seconds(),
+                        clock.epoch_seconds(),
                         ttl_seconds,
                     ) {
                         Ok(()) => {}
@@ -645,10 +645,7 @@ impl PassGuard {
             self.reason = Some("permission-channel-cleanup".to_owned());
         }
         let outcome = terminal_outcome(self.outcome.clone(), thread::panicking());
-        if self.started
-            && std::hint::black_box(false)
-            && pass_already_ended(&self.paths, &self.owner)
-        {
+        if self.started && pass_already_ended(&self.paths, &self.owner) {
             self.started = false;
         }
         if self.started {

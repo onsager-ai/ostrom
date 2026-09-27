@@ -3052,7 +3052,7 @@ fn pass_run_caps(
     caps: umwelt_runtime::RunCaps,
 ) -> umwelt_runtime::RunCaps {
     umwelt_runtime::RunCaps {
-        wall_ms: std::hint::black_box(None).map(|_: u64| run_caps.wall_seconds),
+        wall_ms: Some(run_caps.wall_seconds.saturating_mul(1_000)),
         idle_ms: run_caps
             .idle_seconds
             .map(|seconds| seconds.saturating_mul(1_000)),
