@@ -282,6 +282,22 @@ pub const OSTROM_PLUGIN_ROOT: EnvironmentVariable = variable(
     EnvironmentClass::Location,
     "derived plugin root",
 );
+/// The run id of the ostrom run a process belongs to. ostrom sets it on every
+/// harness child it starts, and an external observer keys on it through
+/// `/proc/<pid>/environ`, so the name is a contract (docs/loops.md). ostrom
+/// itself reads it only to record a dispatch's `parent_run_id`.
+pub const OSTROM_RUN_ID: EnvironmentVariable = variable(
+    "OSTROM_RUN_ID",
+    EnvironmentClass::Identity,
+    "no enclosing ostrom run; a dispatch records no parent_run_id",
+);
+/// The work order an implementer's harness is executing. Set, never read, by
+/// ostrom; the name is the same observer contract as `OSTROM_RUN_ID`.
+pub const OSTROM_WORK_ORDER_ID: EnvironmentVariable = variable(
+    "OSTROM_WORK_ORDER_ID",
+    EnvironmentClass::Identity,
+    "not an implementer harness",
+);
 pub const PATH: EnvironmentVariable = variable(
     "PATH",
     EnvironmentClass::Identity,
@@ -356,6 +372,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvironmentVariable] = &[
     OSTROM_PLUGIN_ROOT,
     OSTROM_POLICY_MANIFEST,
     OSTROM_POLICY_TRUSTED_KEYS,
+    OSTROM_RUN_ID,
+    OSTROM_WORK_ORDER_ID,
     PATH,
     VOLTA_HOME,
     ALL_PROXY_LOWERCASE,

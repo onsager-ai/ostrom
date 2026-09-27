@@ -8,7 +8,7 @@ use std::{
 
 use chrono::Local;
 use ostrom_core::{PolicyManifest, ResolvedLoopCeilings};
-use ostrom_store::{Clock, OstromPaths, read_trace};
+use ostrom_store::{Clock, Holding, LeaseState, OstromPaths, open_holdings, read_trace};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use thiserror::Error;
@@ -146,6 +146,8 @@ pub(crate) enum LoopSupervisorError {
         #[source]
         source: io::Error,
     },
+    #[error(transparent)]
+    Holdings(#[from] ostrom_store::HoldingsError),
 }
 
 pub(crate) fn reconcile(
@@ -256,7 +258,53 @@ pub(crate) fn render_ps(paths: &OstromPaths, clock: &Clock) -> Result<String, Lo
             "{name}  {status}  {concurrent}  {spend}  {tokens} tokens\n"
         ));
     }
+    output.push_str(&render_holdings(&open_holdings(paths, clock)?));
     Ok(output)
+}
+
+/// The open holds as JSON lines, one object per hold, for a scheduler or an
+/// observer that should not parse a table. It reads only local files and needs
+/// no current policy, unlike the loop table.
+pub(crate) fn render_holdings_json(
+    paths: &OstromPaths,
+    clock: &Clock,
+) -> Result<String, LoopSupervisorError> {
+    let mut output = String::new();
+    for holding in open_holdings(paths, clock)? {
+        output.push_str(&serde_json::to_string(&holding).expect("a holding serializes as JSON"));
+        output.push('\n');
+    }
+    Ok(output)
+}
+
+fn render_holdings(holdings: &[Holding]) -> String {
+    if holdings.is_empty() {
+        return "\nholdings: none\n".to_owned();
+    }
+    let mut output = "\nholdings\nrun_id  runner  item  age  last_event  lease\n".to_owned();
+    for holding in holdings {
+        let field = |value: Option<&str>| value.unwrap_or("-").to_owned();
+        output.push_str(&format!(
+            "{}  {}  {}  {}  {}  {}\n",
+            field(holding.run_id.as_deref()),
+            field(holding.runner.as_deref()),
+            field(holding.item.as_deref()),
+            holding
+                .age_seconds
+                .map_or_else(|| "-".to_owned(), render_age),
+            field(holding.last_event_at.as_deref()),
+            field(holding.lease.map(LeaseState::as_str)),
+        ));
+    }
+    output
+}
+
+fn render_age(seconds: u64) -> String {
+    match seconds {
+        0..60 => format!("{seconds}s"),
+        60..3_600 => format!("{}m", seconds / 60),
+        _ => format!("{}h{:02}m", seconds / 3_600, seconds % 3_600 / 60),
+    }
 }
 
 pub(crate) fn read_logs(paths: &OstromPaths, name: &str) -> Result<Vec<u8>, LoopSupervisorError> {

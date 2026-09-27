@@ -416,6 +416,23 @@ fn process_backend_launches_a_detached_session_with_the_systemd_environment() {
         .find(|row| row["kind"] == "work-dispatched")
         .expect("work-dispatched row");
     assert_eq!(dispatched["fact"]["backend"], "process");
+    // #618: the process backend hands the implementer the same ids the hold
+    // records, compared with the record rather than pinned.
+    let run_id = dispatched["fact"]["run_id"]
+        .as_str()
+        .expect("work-dispatched names its run id");
+    let order_id = dispatched["fact"]["order_id"]
+        .as_str()
+        .expect("work-dispatched names its order");
+    for expected in [
+        format!("OSTROM_RUN_ID={run_id}"),
+        format!("OSTROM_WORK_ORDER_ID={order_id}"),
+    ] {
+        assert!(
+            environment.lines().any(|line| line == expected),
+            "missing {expected}: {environment}"
+        );
+    }
 }
 
 #[test]
@@ -584,6 +601,396 @@ fn process_startup_failure_escalates_to_the_stubborn_grandchild() {
         .find(|row| row["fact"]["reason"] == "dispatch-startup-failed")
         .expect("startup failure row");
     assert_eq!(failed["fact"]["backend"], "process");
+}
+
+/// #618: dispatch mints one run id and every record of the hold carries it.
+/// `work-dispatched` names it; the implementer writes its events and its
+/// terminal row under it; the Codex child receives it, and the order id, in
+/// its environment. Each is compared with the record dispatch wrote, never
+/// pinned a second time, so a side that mints its own id fails here.
+#[test]
+fn dispatch_mints_the_run_id_the_implementer_and_its_harness_carry() {
+    let fixture = DispatchFixture::new(false);
+    let (codex_environment, credential) = runnable_implementer(&fixture);
+    // A service-manager seam that runs the unit to completion, with exactly
+    // the environment dispatch declared through `--setenv`.
+    let systemd_run = fixture.root.path().join("systemd-run-executes");
+    executable(
+        &systemd_run,
+        concat!(
+            "while [ \"$#\" -gt 0 ]; do\n",
+            "  case \"$1\" in\n",
+            "    --setenv) export \"$2\"; shift 2 ;;\n",
+            "    --unit|--description|--property) shift 2 ;;\n",
+            "    --*) shift ;;\n",
+            "    *) break ;;\n",
+            "  esac\n",
+            "done\n",
+            "\"$@\" >>\"$FAKE_IMPLEMENTER_LOG\" 2>&1 || true"
+        ),
+    );
+    let implementer_log = fixture.root.path().join("implementer.log");
+
+    let output = fixture
+        .dispatch(false)
+        .env("MANDATE_GH_AS_BIN", &credential)
+        .env("MANDATE_SYSTEMD_RUN_BIN", &systemd_run)
+        .env("FAKE_IMPLEMENTER_LOG", &implementer_log)
+        .env("OSTROM_RUN_ID", "builder-parent-placeholder-run")
+        .output()
+        .expect("dispatch through an executing service-manager seam");
+
+    let log = fs::read_to_string(&implementer_log).unwrap_or_default();
+    assert!(
+        output.status.success(),
+        "{}\nimplementer: {log}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let trace = trace(&fixture.state);
+    let dispatched = trace
+        .iter()
+        .find(|row| row["kind"] == "work-dispatched")
+        .expect("work-dispatched row");
+    let recorded = dispatched["fact"]["run_id"].clone();
+    let order_id = dispatched["fact"]["order_id"]
+        .as_str()
+        .expect("work-dispatched names its order");
+    // Every observation is gathered before one comparison, so a failure shows
+    // each place the id is missing or different at once instead of stopping
+    // at the first.
+    let implementer_events_run_id = run_started_events(&fixture.state)
+        .into_iter()
+        .find(|event| event["payload"]["workOrder"] == order_id)
+        .map_or(Value::Null, |event| event["runId"].clone());
+    let terminal_run_id = trace
+        .iter()
+        .find(|row| {
+            matches!(row["kind"].as_str(), Some("work-completed" | "work-failed"))
+                && row["fact"]["order_id"] == order_id
+        })
+        .map_or(Value::Null, |row| row["fact"]["run_id"].clone());
+    let environment = fs::read_to_string(&codex_environment).unwrap_or_default();
+    let harness = |name: &str| {
+        environment
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}=")))
+            .map_or(Value::Null, |value| json!(value))
+    };
+    assert_eq!(
+        json!({
+            "work_dispatched_names_a_run_id": recorded.is_string(),
+            "runner": dispatched["fact"]["runner"],
+            "parent_run_id": dispatched["fact"]["parent_run_id"],
+            "implementer_events_run_id": implementer_events_run_id,
+            "implementer_terminal_run_id": terminal_run_id,
+            "harness_OSTROM_RUN_ID": harness("OSTROM_RUN_ID"),
+            "harness_OSTROM_WORK_ORDER_ID": harness("OSTROM_WORK_ORDER_ID"),
+        }),
+        json!({
+            "work_dispatched_names_a_run_id": true,
+            "runner": "agent/codex",
+            "parent_run_id": "builder-parent-placeholder-run",
+            "implementer_events_run_id": recorded,
+            "implementer_terminal_run_id": recorded,
+            "harness_OSTROM_RUN_ID": recorded,
+            "harness_OSTROM_WORK_ORDER_ID": order_id,
+        }),
+        "implementer log: {log}\nharness environment: {environment}"
+    );
+}
+
+/// #618: `ostrom ps --json` lists an open dispatch under the run id its record
+/// names, and drops it once a terminal row for that order is appended.
+#[test]
+fn ps_json_lists_an_open_dispatch_until_its_terminal_row() {
+    let fixture = DispatchFixture::new(false);
+    let output = fixture
+        .dispatch(false)
+        .output()
+        .expect("dispatch through the recording seam");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let dispatched = trace(&fixture.state)
+        .into_iter()
+        .find(|row| row["kind"] == "work-dispatched")
+        .expect("work-dispatched row");
+
+    let open = ps_json(&fixture.state);
+    assert_eq!(open.len(), 1, "{open:?}");
+    assert_eq!(open[0]["kind"], "implementer");
+    assert_eq!(open[0]["run_id"], dispatched["fact"]["run_id"]);
+    assert_eq!(open[0]["runner"], dispatched["fact"]["runner"]);
+    assert_eq!(open[0]["item"], dispatched["fact"]["item_id"]);
+    assert_eq!(open[0]["order_id"], dispatched["fact"]["order_id"]);
+    assert_eq!(open[0]["owner"], dispatched["fact"]["unit_name"]);
+    assert_eq!(open[0]["started_at"], dispatched["ts"]);
+    assert_eq!(open[0]["lease"], "live");
+
+    // The lease column follows the lease itself: one past its expiry reads
+    // `expired` while the hold stays open.
+    let lease_file = fixture
+        .state
+        .join(format!("implementer-item-{}.lease", fixture.item_hash));
+    let mut lease: Value =
+        serde_json::from_slice(&fs::read(&lease_file).expect("read dispatch lease"))
+            .expect("dispatch lease JSON");
+    lease["started_at"] = json!(1);
+    lease["expires_at"] = json!(1);
+    fs::write(&lease_file, lease.to_string()).expect("expire dispatch lease");
+    let expired = ps_json(&fixture.state);
+    assert_eq!(expired.len(), 1, "{expired:?}");
+    assert_eq!(expired[0]["lease"], "expired");
+
+    let completed = json!({
+        "ts": dispatched["ts"],
+        "kind": "work-completed",
+        "fact": {
+            "schema_version": 1,
+            "item_id": dispatched["fact"]["item_id"],
+            "order_id": dispatched["fact"]["order_id"],
+        },
+        "narration": {},
+    });
+    let mut appended = fs::read_to_string(fixture.state.join("sprint.jsonl")).expect("read trace");
+    appended.push_str(&format!("{completed}\n"));
+    fs::write(fixture.state.join("sprint.jsonl"), appended).expect("append work-completed");
+
+    let closed = ps_json(&fixture.state);
+    assert!(closed.is_empty(), "{closed:?}");
+}
+
+/// #618 review: an `ostrom implement` run by hand inside another run (a pass's
+/// agent, say) labels its harness child with its own run id and its own order,
+/// never with the ids it inherited. Otherwise the hold is misattributed to the
+/// enclosing run, and anything acting on that label acts on the wrong process.
+#[test]
+fn a_hand_run_implementer_labels_its_harness_with_its_own_run_not_an_inherited_one() {
+    let fixture = DispatchFixture::new(false);
+    let (codex_environment, credential) = runnable_implementer(&fixture);
+    let unit = "ostrom-implementer-hand-run";
+    fs::write(
+        fixture
+            .state
+            .join(format!("implementer-item-{}.lease", fixture.item_hash)),
+        format!("{{\"owner\":\"{unit}\",\"started_at\":1,\"expires_at\":9999999999}}\n"),
+    )
+    .expect("write the implementer lease a hand run adopts");
+    let order_id = WorkOrder::from_json(&fs::read(&fixture.order_file).expect("read order"))
+        .expect("valid work order")
+        .order_id;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .arg("implement")
+        .arg(&fixture.order_file)
+        .arg(unit)
+        .current_dir(fixture.root.path())
+        .env_clear()
+        .env("OSTROM_HOME", &fixture.state)
+        .env("HOME", &fixture.home)
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("OSTROM_PLUGIN_ROOT", plugin_root())
+        .env("MANDATE_IMPLEMENTER_SOURCE_REPO", &fixture.source)
+        .env("MANDATE_GH_AS_BIN", &credential)
+        .env("CODEX_BIN", &fixture.codex)
+        .env("OSTROM_RUN_ID", "builder-inherited-placeholder-run")
+        .env("OSTROM_WORK_ORDER_ID", "inherited-placeholder-order")
+        .output()
+        .expect("run the implementer by hand");
+
+    let run_id = run_started_events(&fixture.state)
+        .into_iter()
+        .find(|event| event["payload"]["workOrder"] == order_id.as_str())
+        .map_or(Value::Null, |event| event["runId"].clone());
+    let environment = fs::read_to_string(&codex_environment).unwrap_or_default();
+    let harness = |name: &str| {
+        environment
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}=")))
+            .map_or(Value::Null, |value| json!(value))
+    };
+    assert_eq!(
+        json!({
+            "implementer_run_found": run_id.is_string(),
+            "harness_OSTROM_RUN_ID": harness("OSTROM_RUN_ID"),
+            "harness_OSTROM_WORK_ORDER_ID": harness("OSTROM_WORK_ORDER_ID"),
+        }),
+        json!({
+            "implementer_run_found": true,
+            "harness_OSTROM_RUN_ID": run_id,
+            "harness_OSTROM_WORK_ORDER_ID": order_id,
+        }),
+        "implementer stderr: {}\nharness environment: {environment}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// #618 review: a `work-dispatched` row written before run ids were recorded,
+/// with no `run_id` and no `runner`, is still a hold. `ps --json` lists it with
+/// both as null and drops it on its terminal row.
+#[test]
+fn ps_json_lists_a_legacy_dispatch_row_until_its_terminal_row() {
+    let root = tempfile::tempdir().expect("legacy trace fixture");
+    let state = root.path();
+    let dispatched = json!({
+        "ts": "2026-08-01T00:00:00Z",
+        "kind": "work-dispatched",
+        "fact": {
+            "schema_version": 1,
+            "item_id": "placeholder-org/alpha#7",
+            "order_id": "legacy-placeholder-order",
+            "unit_name": "ostrom-implementer-legacy",
+            "backend": "systemd",
+            "cost_ceiling_usd": 20,
+            "token_ceiling": 500000
+        },
+        "narration": {}
+    });
+    fs::write(state.join("sprint.jsonl"), format!("{dispatched}\n")).expect("write legacy trace");
+
+    let open = ps_json(state);
+    let listed = open
+        .iter()
+        .map(|holding| {
+            json!({
+                "kind": holding["kind"],
+                "run_id": holding["run_id"],
+                "runner": holding["runner"],
+                "item": holding["item"],
+                "order_id": holding["order_id"],
+                "owner": holding["owner"],
+                "started_at": holding["started_at"],
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        json!(listed),
+        json!([{
+            "kind": "implementer",
+            "run_id": null,
+            "runner": null,
+            "item": "placeholder-org/alpha#7",
+            "order_id": "legacy-placeholder-order",
+            "owner": "ostrom-implementer-legacy",
+            "started_at": "2026-08-01T00:00:00Z",
+        }])
+    );
+
+    let completed = json!({
+        "ts": "2026-08-01T01:00:00Z",
+        "kind": "work-completed",
+        "fact": {"schema_version": 1, "item_id": "placeholder-org/alpha#7", "order_id": "legacy-placeholder-order"},
+        "narration": {}
+    });
+    fs::write(
+        state.join("sprint.jsonl"),
+        format!("{dispatched}\n{completed}\n"),
+    )
+    .expect("append the legacy terminal row");
+    let closed = ps_json(state);
+    assert!(closed.is_empty(), "{closed:?}");
+}
+
+/// Make the fixture's implementer able to reach its harness: a source clone to
+/// branch from, a credential stub that answers both dispatch's reads and the
+/// implementer's, and a Codex stub that records its environment and fails.
+/// Returns the recorded-environment path and the credential stub.
+fn runnable_implementer(fixture: &DispatchFixture) -> (PathBuf, PathBuf) {
+    let source = &fixture.source;
+    git(source, &["init", "-b", "main"]);
+    git(source, &["config", "user.email", "fixture@example.invalid"]);
+    git(source, &["config", "user.name", "Fixture"]);
+    fs::write(source.join("README.md"), "placeholder\n").expect("write source");
+    git(source, &["add", "README.md"]);
+    git(source, &["commit", "-m", "base"]);
+    git(
+        source,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/placeholder-org/alpha.git",
+        ],
+    );
+    git(source, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+
+    let codex_environment = fixture.root.path().join("codex.env");
+    executable(
+        &fixture.codex,
+        &format!(
+            "if [ \"${{1:-}}\" = --version ]; then exit 0; fi\nenv >'{}'\nexit 1",
+            codex_environment.display()
+        ),
+    );
+    // Answers both dispatch's reads and the implementer's, keyed on the
+    // command after the wrapper's `--`.
+    let credential = fixture.root.path().join("run-through-credential-stub");
+    executable(
+        &credential,
+        concat!(
+            "while [ \"$#\" -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n",
+            "shift\n",
+            "case \"$*\" in\n",
+            "  *'/branches?'*) printf '%s\\n' '[{\"name\":\"main\",\"commit\":{\"sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}]' ;;\n",
+            "  *' issue view '*) printf '%s\\n' '{\"closedByPullRequestsReferences\":[]}' ;;\n",
+            "  'gh pr list '*) printf '%s\\n' '[]' ;;\n",
+            "  'gh repo view '*) printf '%s\\n' main ;;\n",
+            "  'git -C '*' fetch '*) git -C \"$3\" update-ref refs/remotes/origin/main refs/heads/main ;;\n",
+            "  *) exit 1 ;;\n",
+            "esac"
+        ),
+    );
+    (codex_environment, credential)
+}
+
+fn ps_json(state: &Path) -> Vec<Value> {
+    let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .args(["ps", "--json"])
+        .env("OSTROM_HOME", state)
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .output()
+        .expect("run ps --json");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("ps --json is UTF-8")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("ps --json line is JSON"))
+        .collect()
+}
+
+fn run_started_events(state: &Path) -> Vec<Value> {
+    let Ok(runs) = fs::read_dir(state.join("runs")) else {
+        return Vec::new();
+    };
+    runs.flatten()
+        .filter_map(|run| fs::read_to_string(run.path().join("events.jsonl")).ok())
+        .filter_map(|events| {
+            events
+                .lines()
+                .next()
+                .and_then(|line| serde_json::from_str::<Value>(line).ok())
+        })
+        .filter(|event| event["type"] == "run.started")
+        .collect()
+}
+
+fn git(path: &Path, arguments: &[&str]) {
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(arguments)
+            .status()
+            .expect("run git")
+            .success(),
+        "git {arguments:?}"
+    );
 }
 
 fn captured_environment(path: &Path) -> BTreeMap<String, String> {

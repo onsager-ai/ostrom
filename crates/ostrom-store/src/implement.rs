@@ -46,6 +46,11 @@ pub struct ImplementRequest {
     pub supervisor_pid: Option<u32>,
     pub events_fd: Option<u32>,
     pub clock: Clock,
+    /// The run id dispatch minted and recorded in `work-dispatched`. When
+    /// present, this run's events are written under it and its terminal row
+    /// names it. Absent (a hand run), the implementer mints its own as before
+    /// and its terminal row is unchanged.
+    pub run_id: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -123,6 +128,9 @@ struct TerminalGuard {
     conflicted_paths: Vec<String>,
     withheld_paths: Vec<String>,
     run_events: RunEventGuard,
+    /// Dispatch's run id, echoed on the terminal row only when dispatch
+    /// supplied it, so a hand run's terminal row keeps today's shape.
+    dispatched_run_id: Option<String>,
 }
 
 impl TerminalGuard {
@@ -160,7 +168,7 @@ impl TerminalGuard {
             None
         };
         let branch = preserved.as_ref().map(|_| self.order.branch_name.clone());
-        let fact = Map::from_iter([
+        let mut fact = Map::from_iter([
             ("schema_version".to_owned(), json!(1)),
             ("item_id".to_owned(), json!(self.order.item_id)),
             ("order_id".to_owned(), json!(self.order.order_id)),
@@ -199,6 +207,9 @@ impl TerminalGuard {
             ("withheld_paths".to_owned(), json!(self.withheld_paths)),
             ("usage".to_owned(), usage.json()),
         ]);
+        if let Some(run_id) = &self.dispatched_run_id {
+            fact.insert("run_id".to_owned(), json!(run_id));
+        }
         if let Err(error) = crate::reap_build_cache(&self.paths.state, &self.order.item_id) {
             eprintln!("ostrom implementer: could not reap build cache: {error}");
         }
@@ -335,7 +346,10 @@ fn run_implement_with_registry_and_minter(
         false,
         request.clock.clone(),
         RunEventStart {
-            run_id: generated_run_id(&request.unit_name, &request.clock),
+            run_id: request
+                .run_id
+                .clone()
+                .unwrap_or_else(|| generated_run_id(&request.unit_name, &request.clock)),
             kind: RunKind::Handoff,
             actor: "builder".to_owned(),
             harness: runner.as_ref().map_or_else(
@@ -438,6 +452,7 @@ fn run_implement_with_registry_and_minter(
         conflicted_paths: Vec::new(),
         withheld_paths: Vec::new(),
         run_events,
+        dispatched_run_id: request.run_id.clone(),
     };
     match implement_inner(request, &mut guard, registry, runner_name, minter) {
         Ok(url) => {
@@ -610,6 +625,21 @@ fn implement_inner(
             signals: request.signals.clone(),
             supervisor_pid: request.supervisor_pid,
             termination_grace,
+            // Set here, never inherited: an `ostrom implement` run by hand
+            // inside another run (a pass's agent, say) must not label its
+            // harness with that run's id. This is the implementer's effective
+            // run id, dispatch's `--run-id` or the one it minted, and the
+            // order it is executing (docs/loops.md).
+            environment: vec![
+                (
+                    environment::OSTROM_RUN_ID.name.into(),
+                    guard.run_events.run_id().into(),
+                ),
+                (
+                    environment::OSTROM_WORK_ORDER_ID.name.into(),
+                    guard.order.order_id.clone().into(),
+                ),
+            ],
         }),
     ) {
         RunOutcome::Exited(status) => status,

@@ -24,7 +24,7 @@ use crate::{
         AuthenticatedCommandError, GitHubInstallationTokenMinter, InstallationTokenMinter,
         ScopedAppTokenRequest, authenticated_output,
     },
-    append_trace, configured_retention_days, environment,
+    append_trace, configured_retention_days, environment, generated_run_id,
     lease::{ProcessIdentity, ProcessLiveness, process_identity_is_live, read_process_identity},
     load_config_or_defaults, read_lease, read_trace,
     reap::{
@@ -131,6 +131,16 @@ struct DispatchContext<'a> {
     backend: String,
     listing: ListingState,
     matched_key: Option<(&'static str, String)>,
+    /// The implementer's run id. Dispatch records the hold, so dispatch mints
+    /// the id: `work-dispatched` names it, `ostrom implement --run-id` writes
+    /// its events under it, and the harness child receives it as
+    /// `OSTROM_RUN_ID`.
+    run_id: String,
+    /// The registry key of the implementer harness, recorded as `runner`.
+    runner: String,
+    /// This dispatcher's own `OSTROM_RUN_ID`, when a run started it: the edge
+    /// from a pass to the implementer its agent dispatched.
+    parent_run_id: Option<String>,
 }
 
 struct RepeatedFailure {
@@ -199,6 +209,7 @@ fn run_dispatch_with_registry_and_minter(
     })?;
     let item_hash = order.item_hash();
     let unit_name = format!("ostrom-implementer-{}", &item_hash[..16]);
+    let run_id = generated_run_id(&unit_name, &request.clock);
     let mut context = DispatchContext {
         request,
         order,
@@ -209,6 +220,11 @@ fn run_dispatch_with_registry_and_minter(
             .unwrap_or_else(|| "systemd".to_owned()),
         listing: ListingState::empty(),
         matched_key: None,
+        run_id,
+        runner: runner_name.to_owned(),
+        parent_run_id: environment::OSTROM_RUN_ID
+            .value()
+            .filter(|value| !value.trim().is_empty()),
     };
 
     if request
@@ -579,11 +595,22 @@ fn after_lease(
     }
     let state_environment = dispatch_state_environment(&context.request.paths);
     let lease_name = format!("implementer-item-{}.lease", context.item_hash);
+    // Both backends hand the runner's environment to `ostrom implement`, and
+    // the harness child inherits it from there, so this is how the Codex
+    // process learns which run and which order it serves. The names are an
+    // observer contract (docs/loops.md).
+    let runner_launch = runner_launch
+        .clone()
+        .with_environment(environment::OSTROM_RUN_ID.name, &context.run_id)
+        .with_environment(
+            environment::OSTROM_WORK_ORDER_ID.name,
+            &context.order.order_id,
+        );
     match context.backend.as_str() {
         "systemd" => launch_systemd(
             context,
             runner_name,
-            runner_launch,
+            &runner_launch,
             resolved_ostrom,
             &state_environment,
             &lease_name,
@@ -594,7 +621,7 @@ fn after_lease(
         "process" => launch_process(
             context,
             runner_name,
-            runner_launch,
+            &runner_launch,
             resolved_ostrom,
             &lease_name,
             daily_cap,
@@ -684,6 +711,8 @@ fn launch_systemd(
         .arg(&context.request.order_file)
         .arg(&context.unit_name)
         .arg(runner_name)
+        .arg("--run-id")
+        .arg(&context.run_id)
         .status();
     if !status.is_ok_and(|status| status.success()) {
         append_launch_failure(context, "dispatch-failed", started.elapsed());
@@ -736,6 +765,8 @@ fn launch_process(
         .arg(&context.request.order_file)
         .arg(&context.unit_name)
         .arg(runner_name)
+        .arg("--run-id")
+        .arg(&context.run_id)
         .stdin(Stdio::null())
         .stdout(stdout)
         .stderr(stderr)
@@ -2061,6 +2092,11 @@ fn append_dispatched(context: &DispatchContext<'_>) -> Result<(), DispatchError>
     fact.insert("order_id".to_owned(), json!(context.order.order_id));
     fact.insert("unit_name".to_owned(), json!(context.unit_name));
     fact.insert("backend".to_owned(), json!(context.backend));
+    fact.insert("run_id".to_owned(), json!(context.run_id));
+    fact.insert("runner".to_owned(), json!(context.runner));
+    if let Some(parent) = &context.parent_run_id {
+        fact.insert("parent_run_id".to_owned(), json!(parent));
+    }
     fact.insert(
         "cost_ceiling_usd".to_owned(),
         context.order.cost_ceiling_usd.clone(),

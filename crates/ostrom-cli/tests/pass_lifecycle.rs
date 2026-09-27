@@ -744,7 +744,7 @@ fn without_a_control_descriptor_stdin_is_ignored_and_existing_bytes_are_preserve
     );
     assert_eq!(normalize_pass_trace(&fs::read(fixture.state.join("sprint.jsonl")).unwrap()),
         concat!(
-            "{\"ts\":\"2026-08-01T00:00:00Z\",\"kind\":\"pass-started\",\"fact\":{\"owner\":\"builder-a1b2c3d4-wake7\",\"sweep\":\"reused\",\"generation_id\":\"pass-lifecycle-fresh-generation\"},\"narration\":{}}\n",
+            "{\"ts\":\"2026-08-01T00:00:00Z\",\"kind\":\"pass-started\",\"fact\":{\"owner\":\"builder-a1b2c3d4-wake7\",\"sweep\":\"reused\",\"generation_id\":\"pass-lifecycle-fresh-generation\",\"run_id\":\"<pass-run-id>\"},\"narration\":{}}\n",
             "{\"ts\":\"2026-08-01T00:00:00Z\",\"kind\":\"pass-ended\",\"fact\":{\"owner\":\"builder-a1b2c3d4-wake7\",\"outcome\":\"no-op\",\"cost_usd\":1.25,\"duration_seconds\":0,\"reason\":\"blocked\"},\"narration\":{}}\n"
         ).as_bytes());
     let events = fixture.run_events();
@@ -1314,6 +1314,12 @@ fn normalize_pass_trace(bytes: &[u8]) -> Vec<u8> {
         if row["kind"] == "pass-ended" {
             row["fact"]["duration_seconds"] = Value::from(0);
         }
+        // The pass's run id carries its wall-clock start and pid (#618). Its
+        // presence and position are compared here; its value is compared with
+        // the run's own events in `a_pass_records_its_run_id_and_hands_it_to_the_harness`.
+        if row["kind"] == "pass-started" && row["fact"].get("run_id").is_some() {
+            row["fact"]["run_id"] = Value::String("<pass-run-id>".to_owned());
+        }
         serde_json::to_writer(&mut normalized, &row).expect("serialize normalized trace");
         normalized.push(b'\n');
     }
@@ -1336,6 +1342,96 @@ fn error_exit_releases_and_finalizes() {
     assert_eq!(events[1]["type"], "run.finished");
     assert_eq!(events[1]["payload"]["outcome"], "failed");
     assert_eq!(events[1]["payload"]["reason"], "pass-failed");
+}
+
+/// #618: the pass's run id is one value in four places -- `pass-started`, the
+/// run's own events, the harness child's `OSTROM_RUN_ID`, and the holding
+/// `ostrom ps --json` reports while the pass is open -- and each is compared
+/// with the record rather than pinned. The harness runs `ps` itself, so the
+/// open hold is observed from inside the pass, and it is gone once the pass
+/// has ended. Every observation is gathered before one comparison, so a
+/// failure shows each place that disagrees at once.
+#[test]
+fn a_pass_records_its_run_id_hands_it_to_the_harness_and_holds_until_it_ends() {
+    let fixture = Fixture::new(concat!(
+        "printf '%s\\n' \"$OSTROM_RUN_ID\" >\"$OSTROM_TEST_RUN_ID\"\n",
+        "\"$OSTROM_TEST_OSTROM\" ps --json >\"$OSTROM_TEST_PS\""
+    ));
+    let harness_run_id = fixture.root.path().join("harness-run-id");
+    let open_ps = fixture.root.path().join("ps-during-pass.jsonl");
+
+    let status = fixture
+        .command()
+        // A pass started under another run hands the harness its own id.
+        .env("OSTROM_RUN_ID", "inherited-placeholder-run")
+        .env("OSTROM_TEST_RUN_ID", &harness_run_id)
+        .env("OSTROM_TEST_PS", &open_ps)
+        .env("OSTROM_TEST_OSTROM", env!("CARGO_BIN_EXE_ostrom"))
+        .status()
+        .expect("run pass");
+    assert!(status.success());
+
+    let trace = fixture.trace();
+    let started = trace
+        .iter()
+        .find(|row| row["kind"] == "pass-started")
+        .expect("pass-started row");
+    let ended = trace
+        .iter()
+        .find(|row| row["kind"] == "pass-ended")
+        .expect("pass-ended row");
+    let recorded = started["fact"]["run_id"].clone();
+    let events = fixture.run_events();
+    let harness =
+        fs::read_to_string(&harness_run_id).map_or(Value::Null, |value| json!(value.trim_end()));
+    let pass_holds = |text: &str| {
+        text.lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("ps --json line"))
+            .filter(|holding| holding["kind"] == "pass")
+            .collect::<Vec<_>>()
+    };
+    let during = pass_holds(fs::read_to_string(&open_ps).unwrap_or_default().as_str());
+    let held = during.first().cloned().unwrap_or(Value::Null);
+    let held_last_event_is_an_event_of_the_run = events
+        .iter()
+        .any(|event| event["ts"] == held["last_event_at"]);
+    let after = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .args(["ps", "--json"])
+        .env_clear()
+        .env("OSTROM_HOME", &fixture.state)
+        .env("HOME", fixture.root.path())
+        .output()
+        .expect("run ps after the pass");
+    assert!(after.status.success());
+    let after = pass_holds(String::from_utf8_lossy(&after.stdout).as_ref());
+
+    assert_eq!(
+        json!({
+            "pass_started_names_a_run_id": recorded.is_string(),
+            "events_run_id": events[0]["runId"],
+            "harness_OSTROM_RUN_ID": harness,
+            "pass_ended_run_id": ended["fact"].get("run_id"),
+            "open_pass_holds_during": during.len(),
+            "held_run_id": held["run_id"],
+            "held_owner": held["owner"],
+            "held_lease": held["lease"],
+            "held_last_event_is_an_event_of_the_run": held_last_event_is_an_event_of_the_run,
+            "open_pass_holds_after": after.len(),
+        }),
+        json!({
+            "pass_started_names_a_run_id": true,
+            "events_run_id": recorded,
+            "harness_OSTROM_RUN_ID": recorded,
+            // `pass-ended` is part of the frozen pass contract.
+            "pass_ended_run_id": null,
+            "open_pass_holds_during": 1,
+            "held_run_id": recorded,
+            "held_owner": started["fact"]["owner"],
+            "held_lease": "live",
+            "held_last_event_is_an_event_of_the_run": true,
+            "open_pass_holds_after": 0,
+        })
+    );
 }
 
 #[test]
