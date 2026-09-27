@@ -1487,12 +1487,10 @@ fn acquire_repositories_independently(
     let mut snapshots = Vec::new();
     let faults = Vec::new();
     for repo in repositories {
-        match acquire(repo) {
-            Ok(snapshot) => snapshots.push(snapshot),
-            // TEMPORARY (#579 principle-7 evidence): swallow the fault
-            // without recording it, so the new test trips. Reverted in the
-            // next commit.
-            Err(_) => {}
+        // TEMPORARY (#579 principle-7 evidence): swallow the fault without
+        // recording it, so the new test trips. Reverted in the next commit.
+        if let Ok(snapshot) = acquire(repo) {
+            snapshots.push(snapshot);
         }
     }
     (snapshots, faults)
