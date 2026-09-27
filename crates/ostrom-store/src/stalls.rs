@@ -197,10 +197,23 @@ pub fn reap_stalled_holds(
     exclude_run_id: Option<&str>,
     repositories: Option<&BTreeSet<String>>,
 ) -> Vec<ReapedHold> {
-    let mut errors = Vec::new();
-    let reaped = reap_all(paths, clock, exclude_run_id, repositories, &mut errors);
-    record_errors(paths, clock, caller, &errors);
+    let mut pass = ReapPass::default();
+    let reaped = reap_all(paths, clock, exclude_run_id, repositories, &mut pass);
+    record_errors(paths, clock, caller, &pass);
     reaped
+}
+
+/// What one reap saw, so its record of failures clears only what it looked at.
+#[derive(Default)]
+struct ReapPass {
+    /// Whether the open holds could be read at all.
+    observed: bool,
+    /// Every open hold's run id.
+    open: BTreeSet<String>,
+    /// The run ids this reap examined: in scope, not its own.
+    examined: BTreeSet<String>,
+    /// Each error, with the run it concerned when it concerned one.
+    errors: Vec<(Option<String>, StallError)>,
 }
 
 /// What doctor should say about the reaper itself: its last error, and every
@@ -209,24 +222,21 @@ pub fn reap_stalled_holds(
 pub fn reaper_findings(paths: &OstromPaths) -> Vec<String> {
     let mut findings = Vec::new();
     match fs::read(last_error_path(paths)) {
-        Ok(bytes) => findings.push(serde_json::from_slice::<Value>(&bytes).ok().map_or_else(
-            || "the last reaper error record is unreadable".to_owned(),
-            |record| {
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes)
+            .ok()
+            .and_then(|record| record.get("failures").and_then(Value::as_array).cloned())
+        {
+            Some(failures) => findings.extend(failures.iter().map(|failure| {
                 format!(
-                    "the stall reaper failed at {} in ostrom {}: {}",
-                    record["ts"].as_str().unwrap_or("-"),
-                    record["caller"].as_str().unwrap_or("-"),
-                    record["errors"]
-                        .as_array()
-                        .map(|errors| errors
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .collect::<Vec<_>>()
-                            .join("; "))
-                        .unwrap_or_default()
+                    "the stall reaper failed at {} in ostrom {} (run={}): {}",
+                    failure["ts"].as_str().unwrap_or("-"),
+                    failure["caller"].as_str().unwrap_or("-"),
+                    failure["run_id"].as_str().unwrap_or("-"),
+                    failure["error"].as_str().unwrap_or("-")
                 )
-            },
-        )),
+            })),
+            None => findings.push("the last reaper error record is unreadable".to_owned()),
+        },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => findings.push(format!(
             "the last reaper error record is unreadable: {error}"
@@ -296,13 +306,29 @@ impl ReapIntent {
     }
 }
 
-/// The reaper's intent for `run_id`, when a claim names that run.
+/// The reaper's intent for `run_id`, when a claim names that run and the
+/// reaper has signalled it. A claim kept without a signal (a stop refused, or
+/// a liveness unknown before the first signal) did not end the run: a failure
+/// the run records on its own keeps its own reason (#635).
 pub(crate) fn reap_intent(state: &Path, run_id: &str) -> Option<ReapIntent> {
-    claim::read(&claim_path(state, run_id))
-        .ok()
-        .flatten()?
+    let file = claim::read(&claim_path(state, run_id)).ok().flatten()?;
+    let record = file.record()?;
+    record
+        .get("signalled_at")
+        .is_some_and(Value::is_string)
+        .then(|| ReapIntent::from_record(record))
+        .flatten()
+}
+
+/// Record in the claim that a signal is about to be sent, before it is sent,
+/// so the run it reaches finds it. `false` when that cannot be recorded: then
+/// nothing is signalled.
+fn mark_signalled(claim: &mut Claim, clock: &Clock) -> bool {
+    claim
         .record()
-        .and_then(ReapIntent::from_record)
+        .get("signalled_at")
+        .is_some_and(Value::is_string)
+        || claim.set("signalled_at", json!(clock.timestamp())).is_ok()
 }
 
 fn claims_dir(state: &Path) -> PathBuf {
@@ -343,26 +369,41 @@ fn last_error_path(paths: &OstromPaths) -> PathBuf {
     claims_dir(&paths.state).join("last-error.json")
 }
 
-/// Print every error, and keep the last run's errors where doctor reads them.
-/// A clean run clears the record.
-fn record_errors(paths: &OstromPaths, clock: &Clock, caller: &str, errors: &[StallError]) {
-    for error in errors {
+/// Print every error, and keep every failure no later reap has resolved where
+/// doctor reads it. A failure is cleared only by a reap that looked at what
+/// failed: its hold examined again, or gone; a failure that concerned no one
+/// hold, by any reap that could read the holds.
+fn record_errors(paths: &OstromPaths, clock: &Clock, caller: &str, pass: &ReapPass) {
+    for (_, error) in &pass.errors {
         eprintln!("ostrom {caller}: stall reaper: {error}");
     }
     let path = last_error_path(paths);
-    let result = if errors.is_empty() {
+    let previous = fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|record| record.get("failures").and_then(Value::as_array).cloned())
+        .unwrap_or_default();
+    let new = pass
+        .errors
+        .iter()
+        .map(|(run_id, error)| {
+            json!({
+                "ts": clock.timestamp(),
+                "caller": caller,
+                "run_id": run_id,
+                "error": error.to_string(),
+            })
+        })
+        .collect();
+    let failures = retained_failures(previous, pass, new);
+    let result = if failures.is_empty() {
         match fs::remove_file(&path) {
             Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
             _ => Ok(()),
         }
     } else {
-        let record = json!({
-            "ts": clock.timestamp(),
-            "caller": caller,
-            "errors": errors.iter().map(ToString::to_string).collect::<Vec<_>>(),
-        });
         fs::create_dir_all(claims_dir(&paths.state))
-            .and_then(|()| fs::write(&path, format!("{record}\n")))
+            .and_then(|()| fs::write(&path, format!("{}\n", json!({ "failures": failures }))))
     };
     if let Err(error) = result {
         eprintln!(
@@ -372,23 +413,42 @@ fn record_errors(paths: &OstromPaths, clock: &Clock, caller: &str, errors: &[Sta
     }
 }
 
+fn retained_failures(previous: Vec<Value>, pass: &ReapPass, new: Vec<Value>) -> Vec<Value> {
+    previous
+        .into_iter()
+        .filter(|failure| {
+            // A failure that concerned no one hold is replaced by this reap's
+            // own, if it has one.
+            failure["run_id"].as_str().is_some_and(|run_id| {
+                !pass.observed || (pass.open.contains(run_id) && !pass.examined.contains(run_id))
+            })
+        })
+        .chain(new)
+        .collect()
+}
+
 fn reap_all(
     paths: &OstromPaths,
     clock: &Clock,
     exclude_run_id: Option<&str>,
     repositories: Option<&BTreeSet<String>>,
-    errors: &mut Vec<StallError>,
+    pass: &mut ReapPass,
 ) -> Vec<ReapedHold> {
     let now = clock.epoch_seconds();
     let holds = match observe(paths, clock) {
         Ok(holds) => holds,
         Err(error) => {
-            errors.push(error.into());
+            pass.errors.push((None, error.into()));
             return Vec::new();
         }
     };
+    pass.observed = true;
+    pass.open = holds
+        .iter()
+        .filter_map(|hold| hold.progress.holding.run_id.clone())
+        .collect();
     if let Err(error) = remove_settled_claims(paths) {
-        errors.push(error);
+        pass.errors.push((None, error));
     }
     let mut reaped = Vec::new();
     for hold in holds {
@@ -400,6 +460,7 @@ fn reap_all(
         {
             continue;
         }
+        pass.examined.insert(run_id.clone());
         // A claim a reaper left is examined before anything else is decided
         // about its run: what that reaper decided is carried out, not redone.
         let action = if claim_path(&paths.state, &run_id).exists() {
@@ -413,7 +474,7 @@ fn reap_all(
         };
         match action {
             Ok(action) => reaped.extend(action),
-            Err(error) => errors.push(error),
+            Err(error) => pass.errors.push((Some(run_id), error)),
         }
     }
     reaped
@@ -821,7 +882,8 @@ enum StopOutcome {
     /// Liveness could not be read: an unreadable `/proc`, a unit state
     /// `systemctl` would not report.
     Unknown,
-    /// The target was this reaper's own process or process group.
+    /// Nothing was signalled: the target was this reaper's own process or
+    /// process group, or the claim could not record the signal first.
     Refused,
 }
 
@@ -866,6 +928,9 @@ fn claim_payload(
         ("cost_usd".to_owned(), json!(cost)),
         ("cost_basis".to_owned(), json!(basis)),
         ("claimed_at".to_owned(), json!(clock.timestamp())),
+        // Set just before the first signal: only a signalled run takes the
+        // claim's reason and charge into its own row.
+        ("signalled_at".to_owned(), Value::Null),
     ]);
     match holding.kind {
         HoldingKind::Implementer => payload.insert("order_id".to_owned(), json!(holding.order_id)),
@@ -916,7 +981,7 @@ fn reap_stalled(
 ) -> Result<Option<ReapedHold>, StallError> {
     let order = target.order();
     let payload = claim_payload(hold, run_id, "stalled", charge(hold, order), true, clock);
-    let Some(claim) = claim_run(paths, run_id, payload)? else {
+    let Some(mut claim) = claim_run(paths, run_id, payload)? else {
         return Ok(None);
     };
     // The run may have ended on its own since the snapshot.
@@ -924,9 +989,10 @@ fn reap_stalled(
         remove_claim(claim, run_id)?;
         return Ok(None);
     }
+    let mut mark = || mark_signalled(&mut claim, clock);
     let stop = match target {
-        StopTarget::Unit(order) => stop_unit(paths, order),
-        StopTarget::Process { identity, .. } => stop_process(*identity),
+        StopTarget::Unit(order) => stop_unit(paths, order, &mut mark),
+        StopTarget::Process { identity, .. } => stop_process(*identity, &mut mark),
     };
     finish_claim(
         paths,
@@ -992,7 +1058,7 @@ fn resume_claim(
     if stale.holder(REAPER) != Holder::Dead {
         return Ok(None);
     }
-    let claim = match claim::take_over(&path, REAPER, &stale) {
+    let mut claim = match claim::take_over(&path, REAPER, &stale) {
         Ok(claim) => claim,
         Err(ClaimError::Held) => return Ok(None),
         Err(ClaimError::Io(error)) => {
@@ -1028,13 +1094,17 @@ fn resume_claim(
                     // its process is gone.
                     Ok(None) => StopOutcome::Stopped,
                     Ok(Some(lease)) if lease.owner == order.unit_name => {
-                        ProcessIdentity::from_lease(&lease)
-                            .map_or(StopOutcome::Unknown, stop_process)
+                        ProcessIdentity::from_lease(&lease).map_or(
+                            StopOutcome::Unknown,
+                            |identity| {
+                                stop_process(identity, &mut || mark_signalled(&mut claim, clock))
+                            },
+                        )
                     }
                     Ok(Some(_)) | Err(_) => StopOutcome::Unknown,
                 }
             } else {
-                stop_unit(paths, &order)
+                stop_unit(paths, &order, &mut || mark_signalled(&mut claim, clock))
             };
             (stop, Some(order))
         }
@@ -1048,7 +1118,9 @@ fn resume_claim(
                 // The pass appends `pass-ended` before it releases its lease.
                 None => StopOutcome::Stopped,
                 Some(lease) => match ProcessIdentity::from_lease(&lease) {
-                    Some(identity) => stop_process(identity),
+                    Some(identity) => {
+                        stop_process(identity, &mut || mark_signalled(&mut claim, clock))
+                    }
                     None if lease.expires_at <= now => StopOutcome::Stopped,
                     None => StopOutcome::Unknown,
                 },
@@ -1160,7 +1232,11 @@ fn append_pass_ended(
 /// Stop the named unit through the service manager. Only a unit the service
 /// manager reports gone is stopped; one it will not report on is not. The
 /// unit's own control group is the whole of what is stopped.
-fn stop_unit(paths: &OstromPaths, order: &InFlightOrder) -> StopOutcome {
+fn stop_unit(
+    paths: &OstromPaths,
+    order: &InFlightOrder,
+    mark_signalled: &mut dyn FnMut() -> bool,
+) -> StopOutcome {
     let systemctl = environment::MANDATE_SYSTEMCTL_BIN
         .value_os()
         .map_or_else(|| PathBuf::from("systemctl"), PathBuf::from);
@@ -1169,6 +1245,9 @@ fn stop_unit(paths: &OstromPaths, order: &InFlightOrder) -> StopOutcome {
     } else {
         format!("{}.service", order.unit_name)
     };
+    if !mark_signalled() {
+        return StopOutcome::Refused;
+    }
     let _ = Command::new(systemctl)
         .args(["--user", "stop", &service])
         .stdout(Stdio::null())
@@ -1181,8 +1260,11 @@ fn stop_unit(paths: &OstromPaths, order: &InFlightOrder) -> StopOutcome {
     }
 }
 
-fn stop_process(identity: ProcessIdentity) -> StopOutcome {
-    stop_process_at(identity, Path::new("/proc"))
+fn stop_process(
+    identity: ProcessIdentity,
+    mark_signalled: &mut dyn FnMut() -> bool,
+) -> StopOutcome {
+    stop_process_at(identity, Path::new("/proc"), mark_signalled)
 }
 
 /// Stop exactly the recorded process: its group when it leads one (the
@@ -1190,7 +1272,11 @@ fn stop_process(identity: ProcessIdentity) -> StopOutcome {
 /// the pid alone. The identity is re-checked before every signal, so a pid
 /// that has since been recycled is never signalled, and a liveness `/proc`
 /// cannot answer is never taken for a stop.
-fn stop_process_at(identity: ProcessIdentity, proc_root: &Path) -> StopOutcome {
+fn stop_process_at(
+    identity: ProcessIdentity,
+    proc_root: &Path,
+    mark_signalled: &mut dyn FnMut() -> bool,
+) -> StopOutcome {
     // `None` while it still runs; otherwise what that settles.
     let settled = || match identity.is_running_at(proc_root) {
         Some(false) => Some(StopOutcome::Stopped),
@@ -1210,9 +1296,16 @@ fn stop_process_at(identity: ProcessIdentity, proc_root: &Path) -> StopOutcome {
     // The run's own TERM handling stops its harness with the termination
     // grace, so the reaper waits for that before escalating.
     let grace = Duration::from_secs(RUN_TERMINATION_GRACE_SECONDS.saturating_mul(2));
+    let mut marked = false;
     for signal in ["-TERM", "-KILL"] {
         if let Some(outcome) = settled() {
             return outcome;
+        }
+        if !marked {
+            if !mark_signalled() {
+                return StopOutcome::Refused;
+            }
+            marked = true;
         }
         let _ = Command::new(kill_command())
             .args([signal, "--", &target])
@@ -1285,7 +1378,12 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{ProcessIdentity, StopOutcome, in_scope, signal_target, stop_process_at};
+    use serde_json::{Value, json};
+
+    use super::{
+        ProcessIdentity, ReapPass, StallError, StopOutcome, in_scope, retained_failures,
+        signal_target, stop_process_at,
+    };
     use crate::{Holding, HoldingKind};
 
     fn identity(pid: u32, process_group_id: u32) -> ProcessIdentity {
@@ -1327,7 +1425,7 @@ mod tests {
         fs::create_dir_all(fixture.path().join("4194301/stat"))
             .expect("create an unreadable stat entry");
         assert_eq!(
-            stop_process_at(identity(4_194_301, 4_194_301), fixture.path()),
+            stop_process_at(identity(4_194_301, 4_194_301), fixture.path(), &mut || true),
             StopOutcome::Unknown
         );
     }
@@ -1364,6 +1462,45 @@ mod tests {
                 in_scope(&pass, None),
             ],
             [true, false, false, true, true]
+        );
+    }
+
+    /// #635 review nit: a clean reap clears only the failures it looked at.
+    /// One scoped to other repositories, or one that could not read the holds,
+    /// leaves the rest for doctor; a failure that concerned no one hold is
+    /// replaced, not accumulated.
+    #[test]
+    fn a_clean_reap_clears_only_the_failures_it_examined() {
+        let failure = |run_id: Option<&str>| json!({"run_id": run_id, "error": "fault"});
+        let previous = vec![
+            failure(Some("examined-run")),
+            failure(Some("unexamined-run")),
+            failure(Some("closed-run")),
+            failure(None),
+        ];
+        let pass = ReapPass {
+            observed: true,
+            open: BTreeSet::from(["examined-run".to_owned(), "unexamined-run".to_owned()]),
+            examined: BTreeSet::from(["examined-run".to_owned()]),
+            errors: Vec::new(),
+        };
+        let blind = ReapPass {
+            observed: false,
+            errors: vec![(None, StallError::Record("fault".to_owned()))],
+            ..ReapPass::default()
+        };
+        let run_ids = |failures: Vec<Value>| {
+            failures
+                .iter()
+                .map(|failure| failure["run_id"].clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            (
+                run_ids(retained_failures(previous.clone(), &pass, Vec::new())),
+                run_ids(retained_failures(previous, &blind, Vec::new())).len(),
+            ),
+            (vec![json!("unexamined-run")], 3)
         );
     }
 }

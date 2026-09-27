@@ -1004,6 +1004,9 @@ fn an_implementer_past_its_declared_wall_cap_is_stopped_and_says_why() {
 /// in-flight holds. The process is gone, its lease is released, its
 /// `work-failed` says `stalled` and charges the order's cost ceiling, and a
 /// second dispatch of the same item proceeds instead of being refused.
+///
+/// #635 N1: only a dispatch scoped to the hold's repository reaps it. A hand
+/// run with no repository scope reaps nothing and is refused by the live hold.
 #[test]
 fn a_live_silent_hold_is_reaped_by_dispatch_before_the_concurrency_count() {
     let fixture = DispatchFixture::new(false);
@@ -1016,6 +1019,7 @@ fn a_live_silent_hold_is_reaped_by_dispatch_before_the_concurrency_count() {
     let process_dispatch = || {
         fixture
             .dispatch(false)
+            .env("OSTROM_EFFECTIVE_REPOSITORIES", "placeholder-org/alpha")
             .env("MANDATE_DISPATCH_BACKEND", "process")
             .env("MANDATE_OSTROM_BIN", &worker)
             .env("MANDATE_IMPLEMENTER_STARTUP_GRACE_MILLISECONDS", "100")
@@ -1041,6 +1045,15 @@ fn a_live_silent_hold_is_reaped_by_dispatch_before_the_concurrency_count() {
     second_order["order_id"] =
         json!("1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
     fs::write(&fixture.order_file, format!("{second_order}\n")).expect("write second order");
+    let unscoped = fixture
+        .dispatch(false)
+        .env_remove("OSTROM_EFFECTIVE_REPOSITORIES")
+        .env("MANDATE_DISPATCH_BACKEND", "process")
+        .env("MANDATE_OSTROM_BIN", &worker)
+        .env("MANDATE_IMPLEMENTER_STARTUP_GRACE_MILLISECONDS", "100")
+        .output()
+        .expect("dispatch with no repository scope");
+    let unscoped_left_it_running = pid_alive(first_pid);
     let second = process_dispatch();
     let second_pid = fs::read(
         fixture
@@ -1066,6 +1079,8 @@ fn a_live_silent_hold_is_reaped_by_dispatch_before_the_concurrency_count() {
     let reaped = row("work-failed", &first_order["order_id"]);
     assert_eq!(
         json!({
+            "unscoped_dispatch_refused": !unscoped.status.success(),
+            "unscoped_dispatch_left_it_running": unscoped_left_it_running,
             "second_dispatch_succeeded": second.status.success(),
             "first_process_running": pid_alive(first_pid),
             "reason": reaped["fact"]["reason"],
@@ -1081,6 +1096,8 @@ fn a_live_silent_hold_is_reaped_by_dispatch_before_the_concurrency_count() {
             "second_order_dispatched": !row("work-dispatched", &second_order["order_id"]).is_null(),
         }),
         json!({
+            "unscoped_dispatch_refused": true,
+            "unscoped_dispatch_left_it_running": true,
             "second_dispatch_succeeded": true,
             "first_process_running": false,
             "reason": "stalled",

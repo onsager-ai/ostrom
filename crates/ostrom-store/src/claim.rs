@@ -22,12 +22,20 @@ use std::{
     fs,
     io::{self, Write as _},
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use serde_json::{Map, Value};
 
 use crate::{lease::read_process_identity, set_private_file_mode};
+
+/// How long a claim whose holder cannot be verified is presumed to be in use:
+/// an empty claim (its creator crashed between `create_new` and the write),
+/// or one naming a live pid with no start time to prove it is the same
+/// process. Past this it is stale. Every holder that can be verified writes
+/// within milliseconds, and no reaper holds a claim this long without
+/// recording its own start time.
+const UNVERIFIED_HOLDER_GRACE: Duration = Duration::from_secs(120);
 
 /// The field names a claim records its holder under. The reaper's claim uses
 /// the names its spec gives; the lease guard uses plain ones.
@@ -55,6 +63,9 @@ pub(crate) enum Holder {
 pub(crate) struct Claim {
     path: PathBuf,
     record: Map<String, Value>,
+    /// Exactly what this process wrote: the file is still this claim only
+    /// while it holds these bytes.
+    bytes: Vec<u8>,
 }
 
 impl Claim {
@@ -62,12 +73,59 @@ impl Claim {
         &self.record
     }
 
+    /// Whether the file is still the one this process wrote. A process that
+    /// judged this one dead may have taken it over since.
+    fn owned(&self) -> bool {
+        fs::read(&self.path).is_ok_and(|bytes| bytes == self.bytes)
+    }
+
+    /// Release the claim, unless another process has taken it over: its claim
+    /// is left alone.
     pub(crate) fn remove(self) -> io::Result<()> {
+        if !self.owned() {
+            return Ok(());
+        }
         match fs::remove_file(&self.path) {
             Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
             _ => Ok(()),
         }
     }
+
+    /// Record `value` under `key`, replacing the file atomically. Refused
+    /// when the file is no longer this claim.
+    pub(crate) fn set(&mut self, key: &str, value: Value) -> io::Result<()> {
+        if !self.owned() {
+            return Err(io::Error::other("the claim was taken over"));
+        }
+        let mut record = self.record.clone();
+        record.insert(key.to_owned(), value);
+        let bytes = record_bytes(&record);
+        let temporary = self.path.with_file_name(format!(
+            ".{}.{}.write",
+            file_name(&self.path),
+            std::process::id()
+        ));
+        fs::write(&temporary, &bytes)?;
+        let _ = set_private_file_mode(&temporary);
+        if let Err(error) = fs::rename(&temporary, &self.path) {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+        self.record = record;
+        self.bytes = bytes;
+        Ok(())
+    }
+}
+
+fn record_bytes(record: &Map<String, Value>) -> Vec<u8> {
+    let mut bytes = serde_json::to_vec(record).expect("a claim record serializes");
+    bytes.push(b'\n');
+    bytes
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map_or_else(String::new, |name| name.to_string_lossy().into_owned())
 }
 
 /// Why a claim could not be had.
@@ -83,6 +141,8 @@ pub(crate) enum ClaimError {
 pub(crate) struct ClaimFile {
     bytes: Vec<u8>,
     record: Option<Map<String, Value>>,
+    /// How long ago the file was last written, when that can be read.
+    age: Option<Duration>,
 }
 
 impl ClaimFile {
@@ -105,10 +165,28 @@ impl ClaimFile {
                 None,
             ),
         };
+        let past_grace = self.age.is_some_and(|age| age > UNVERIFIED_HOLDER_GRACE);
         let Some(pid) = pid.and_then(|pid| u32::try_from(pid).ok()) else {
-            return Holder::Unknown;
+            // Empty or half-written: its creator crashed mid-write, or is
+            // writing now.
+            return if past_grace {
+                Holder::Dead
+            } else {
+                Holder::Unknown
+            };
         };
-        holder_liveness(pid, start_time)
+        match holder_liveness(pid, start_time) {
+            // A live pid with no start time may be a recycled one: it is not
+            // trusted as the holder, and past the grace it is presumed gone.
+            Holder::Alive if start_time.is_none() => {
+                if past_grace {
+                    Holder::Dead
+                } else {
+                    Holder::Unknown
+                }
+            }
+            holder => holder,
+        }
     }
 }
 
@@ -133,7 +211,11 @@ pub(crate) fn read(path: &Path) -> io::Result<Option<ClaimFile>> {
     match fs::read(path) {
         Ok(bytes) => {
             let record = serde_json::from_slice::<Map<String, Value>>(&bytes).ok();
-            Ok(Some(ClaimFile { bytes, record }))
+            let age = fs::metadata(path)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| SystemTime::now().duration_since(modified).ok());
+            Ok(Some(ClaimFile { bytes, record, age }))
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
@@ -162,8 +244,7 @@ pub(crate) fn create(
             .flatten()
             .map_or(Value::Null, |identity| Value::from(identity.start_time)),
     );
-    let mut bytes = serde_json::to_vec(&record).expect("a claim record serializes");
-    bytes.push(b'\n');
+    let bytes = record_bytes(&record);
     let mut file = match fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -183,6 +264,7 @@ pub(crate) fn create(
     Ok(Claim {
         path: path.to_path_buf(),
         record,
+        bytes,
     })
 }
 
@@ -219,8 +301,7 @@ pub(crate) fn take_over(
         .map_or(0, |elapsed| elapsed.as_nanos());
     let aside = path.with_file_name(format!(
         ".{}.{}.{nanos}.stale",
-        path.file_name()
-            .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
+        file_name(path),
         std::process::id()
     ));
     match fs::rename(path, &aside) {
@@ -246,18 +327,23 @@ pub(crate) fn take_over(
 
 #[cfg(test)]
 mod tests {
-    use serde_json::Map;
+    use std::{
+        fs,
+        time::{Duration, SystemTime},
+    };
+
+    use serde_json::{Map, Value, json};
     use tempfile::tempdir;
 
-    use super::{ClaimError, HolderKeys, create};
+    use super::{ClaimError, Holder, HolderKeys, create, create_or_take_over, read};
 
     const KEYS: HolderKeys = HolderKeys {
         pid: "holder_pid",
         start_time: "holder_start_time",
     };
 
-    /// Exclusivity itself. Stale recovery has its one test in `lease.rs`,
-    /// through the lease guard that uses it.
+    /// Exclusivity itself. Stale recovery of a dead holder has its one test in
+    /// `lease.rs`, through the lease guard that uses it.
     #[test]
     fn a_claim_is_created_exactly_once() {
         let fixture = tempdir().expect("claim fixture");
@@ -268,5 +354,65 @@ mod tests {
         assert!(matches!(second, Err(ClaimError::Held)));
         first.expect("first claim").remove().expect("remove claim");
         assert!(!path.exists());
+    }
+
+    fn age(path: &std::path::Path, seconds: u64) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open claim")
+            .set_modified(SystemTime::now() - Duration::from_secs(seconds))
+            .expect("age claim");
+    }
+
+    /// #635 review nits: a holder that cannot be verified (an empty claim, a
+    /// live pid with no start time) is never trusted as alive, and past the
+    /// grace it is stale.
+    #[test]
+    fn an_unverifiable_holder_is_never_alive_and_is_stale_past_the_grace() {
+        let fixture = tempdir().expect("claim fixture");
+        let empty = fixture.path().join("empty.claim");
+        fs::write(&empty, "").expect("write an empty claim");
+        let fresh_empty = read(&empty).expect("read").expect("claim").holder(KEYS);
+        age(&empty, 600);
+        let old_empty = read(&empty).expect("read").expect("claim").holder(KEYS);
+
+        let unverified = fixture.path().join("unverified.claim");
+        fs::write(
+            &unverified,
+            json!({"holder_pid": std::process::id(), "holder_start_time": Value::Null}).to_string(),
+        )
+        .expect("write a claim with no start time");
+        let fresh_unverified = read(&unverified)
+            .expect("read")
+            .expect("claim")
+            .holder(KEYS);
+        age(&unverified, 600);
+        let taken = create_or_take_over(&unverified, KEYS, Map::new()).is_ok();
+
+        assert_eq!(
+            (fresh_empty, old_empty, fresh_unverified, taken),
+            (Holder::Unknown, Holder::Dead, Holder::Unknown, true)
+        );
+    }
+
+    /// #635 review nit: a claim this process no longer owns (another took it
+    /// over) is neither removed nor rewritten by it.
+    #[test]
+    fn a_claim_taken_over_by_another_is_left_alone() {
+        let fixture = tempdir().expect("claim fixture");
+        let path = fixture.path().join("run.claim");
+        let mut claim = create(&path, KEYS, Map::new()).expect("claim");
+        fs::write(&path, "{\"holder_pid\":1,\"holder_start_time\":1}\n")
+            .expect("another process takes it over");
+        let refused = claim.set("signalled_at", json!("now")).is_err();
+        claim.remove().expect("remove is not an error");
+        assert_eq!(
+            (refused, fs::read_to_string(&path).expect("still there")),
+            (
+                true,
+                "{\"holder_pid\":1,\"holder_start_time\":1}\n".to_owned()
+            )
+        );
     }
 }

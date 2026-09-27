@@ -134,6 +134,8 @@ pub(crate) struct InFlightOrder {
     pub backend: String,
     pub cost_ceiling_usd: f64,
     pub token_ceiling: u64,
+    /// The run id dispatch minted for this hold; absent before #618.
+    pub run_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -441,6 +443,12 @@ fn dispatch_fact(row: &TraceFactRecord) -> Option<InFlightOrder> {
             .to_owned(),
         cost_ceiling_usd: row.fact.get("cost_ceiling_usd").and_then(Value::as_f64)?,
         token_ceiling: row.fact.get("token_ceiling").and_then(Value::as_u64)?,
+        run_id: row
+            .fact
+            .get("run_id")
+            .and_then(Value::as_str)
+            .filter(|run_id| !run_id.is_empty())
+            .map(str::to_owned),
     })
 }
 
@@ -594,6 +602,30 @@ pub fn finalize_exited_implementer(
         (_, Some(signal)) => format!("implementer worker was killed by signal {signal}"),
         _ => "implementer worker exited without a status code".to_owned(),
     };
+    // A worker the stall reaper signalled and that died without its row is
+    // the reaper's stop: recorded as the claim says, at the claim's charge,
+    // not as an unexplained exit at no cost (#635).
+    if let Some((run_id, intent)) = order.run_id.as_deref().and_then(|run_id| {
+        crate::stalls::reap_intent(state_root, run_id).map(|intent| (run_id, intent))
+    }) {
+        let mut extra = intent.row_fields();
+        extra.insert("run_id".to_owned(), Value::String(run_id.to_owned()));
+        return append_terminal_row(
+            state_root,
+            &order,
+            TerminalRow {
+                reason: &intent.reason,
+                message: &detail,
+                exit_code,
+                signal,
+                reaped: true,
+                cost_usd: Some(intent.cost_usd),
+                extra,
+                release_lease: true,
+            },
+            clock,
+        );
+    }
     append_terminal_failure(
         state_root,
         &order,
