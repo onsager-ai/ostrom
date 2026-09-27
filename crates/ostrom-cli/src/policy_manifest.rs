@@ -1614,3 +1614,683 @@ mod tests {
         assert!(stderr.contains("ostrom.yaml"), "{stderr}");
     }
 }
+
+/// Coverage for repository/operator manifest discovery, precedence and
+/// attribution that `ostrom explain`'s own tests used to pin, ported when
+/// #617 C4 deleted that CLI command (review comment on PR #621). Deleting
+/// `ostrom explain` removed a CLI surface, not the code its tests exercised:
+/// `default_manifest_path`, `operator_manifest_path`, `load_bundle`, and
+/// `PolicyBundle::explain_pull_request` are all still on the surviving loop's
+/// path — `sweep` calls `load_optional_bundle` (which wraps
+/// `default_manifest_path` and `load_bundle`) every run and records a hold
+/// for every pull request `explain_pull_request` does not grant
+/// (`ostrom-store/src/sweep.rs` `update_policy_holds`, which calls
+/// `explain_pull_request` at its `policy.explain_pull_request(...)` line);
+/// `operation_dispatch`'s `authorize` calls `load_bundle`/`load_bundle_at_base`
+/// directly. These tests call that same surviving code in-process and assert
+/// on the returned `PolicyExplanation` fields instead of rendered text, since
+/// there is no longer a CLI command that renders it.
+#[cfg(test)]
+mod policy_discovery_tests {
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        sync::{Mutex, OnceLock},
+    };
+
+    use ostrom_store::{OstromPaths, PolicyBundle, PolicyLayer};
+    use tempfile::{TempDir, tempdir};
+
+    use super::{
+        PolicyLoadError, adopting_manifest_path, default_manifest_path, load, load_bundle,
+        load_composed, operator_manifest_path,
+    };
+
+    const KEY_ID: &str = "placeholder-principal";
+
+    /// `verify()` reads `OSTROM_POLICY_TRUSTED_KEYS` from the process
+    /// environment, which every test in this binary shares. No other test in
+    /// this crate's `src/` reads or depends on that variable being unset
+    /// in-process — the CLI integration tests that exercise it run the
+    /// compiled binary as a separate process via `Command::env`, so they
+    /// never observe this mutation. Serializing the tests below against one
+    /// another is therefore sufficient, and cheaper than the subprocess
+    /// re-exec `signed_and_unsigned_composition_have_identical_manifest_bytes_and_digests`
+    /// above uses for the same hazard.
+    fn with_trusted_keys<T>(directory: &Path, body: impl FnOnce() -> T) -> T {
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let previous = std::env::var_os("OSTROM_POLICY_TRUSTED_KEYS");
+        // Safety: serialized by `LOCK` above, and nothing else in this test
+        // binary sets or reads this variable in-process.
+        unsafe {
+            std::env::set_var("OSTROM_POLICY_TRUSTED_KEYS", directory);
+        }
+        let result = body();
+        // Safety: see above.
+        unsafe {
+            match &previous {
+                Some(value) => std::env::set_var("OSTROM_POLICY_TRUSTED_KEYS", value),
+                None => std::env::remove_var("OSTROM_POLICY_TRUSTED_KEYS"),
+            }
+        }
+        result
+    }
+
+    fn signing_key_pem_pair() -> &'static (String, String) {
+        static PAIR: OnceLock<(String, String)> = OnceLock::new();
+        PAIR.get_or_init(|| {
+            use rsa::{
+                RsaPrivateKey, RsaPublicKey,
+                pkcs8::{EncodePrivateKey as _, EncodePublicKey as _, LineEnding},
+                rand_core::OsRng,
+            };
+            let private = RsaPrivateKey::new(&mut OsRng, 2048).expect("generate test-only key");
+            let public = RsaPublicKey::from(&private);
+            (
+                private
+                    .to_pkcs8_pem(LineEnding::LF)
+                    .expect("encode test-only private key")
+                    .to_string(),
+                public
+                    .to_public_key_pem(LineEnding::LF)
+                    .expect("encode test-only public key"),
+            )
+        })
+    }
+
+    fn policy(rules: &str) -> String {
+        format!(
+            "manifest_version: 1\nactors: {{builder: {{}}}}\noperations: {{work: {{steps: []}}}}\n{rules}"
+        )
+    }
+
+    fn pull_request_fixture() -> serde_json::Value {
+        serde_json::json!({
+            "number": 1,
+            "title": "feat: layered policy",
+            "labels": [],
+            "files": [{"path": "src/lib.rs"}],
+            "checks": [],
+        })
+    }
+
+    struct DiscoveryFixture {
+        repository: TempDir,
+        home: TempDir,
+        trusted_keys: TempDir,
+        private_key: PathBuf,
+    }
+
+    impl DiscoveryFixture {
+        fn new(rules: &str) -> Self {
+            let repository = tempdir().expect("temporary repository");
+            let home = tempdir().expect("temporary operator home");
+            let trusted_keys = tempdir().expect("temporary trusted keys directory");
+            let (private_pem, public_pem) = signing_key_pem_pair();
+            fs::write(
+                trusted_keys.path().join(format!("{KEY_ID}.pem")),
+                public_pem,
+            )
+            .expect("write trusted public key");
+            let private_key = trusted_keys.path().join("private.pem");
+            fs::write(&private_key, private_pem).expect("write test-only private key");
+
+            fs::create_dir(repository.path().join(".git")).expect("repository boundary");
+            let manifest_path = repository.path().join("ostrom.yaml");
+            fs::write(&manifest_path, policy(rules)).expect("write repository manifest");
+
+            let fixture = Self {
+                repository,
+                home,
+                trusted_keys,
+                private_key,
+            };
+            fixture.sign(&manifest_path);
+            fixture
+        }
+
+        fn sign(&self, manifest_path: &Path) {
+            let loaded = load_composed(manifest_path).expect("load candidate for signing");
+            ostrom_store::sign_policy_manifest(
+                &loaded.manifest,
+                manifest_path,
+                KEY_ID,
+                &self.private_key,
+            )
+            .expect("sign test manifest");
+        }
+
+        fn write_overlay(&self, rules: &str) {
+            let path = self.home.path().join("ostrom.yaml");
+            fs::write(&path, format!("manifest_version: 1\n{rules}"))
+                .expect("write operator overlay");
+            self.sign(&path);
+        }
+
+        fn paths(&self) -> OstromPaths {
+            OstromPaths {
+                config: self.home.path().to_path_buf(),
+                state: self.home.path().to_path_buf(),
+            }
+        }
+
+        fn load(&self, manifest_path: &Path) -> PolicyBundle {
+            self.try_load(manifest_path).expect("load policy bundle")
+        }
+
+        fn try_load(&self, manifest_path: &Path) -> Result<PolicyBundle, PolicyLoadError> {
+            let paths = self.paths();
+            with_trusted_keys(self.trusted_keys.path(), || {
+                load_bundle(&paths, manifest_path)
+            })
+        }
+    }
+
+    #[test]
+    fn discovers_ostrom_yaml_from_a_nested_working_directory() {
+        let fixture = DiscoveryFixture::new(
+            "grants:\n  repository-grant: {actors: builder, operations: work}\n",
+        );
+        let nested = fixture.repository.path().join("one/two");
+        fs::create_dir_all(&nested).expect("nested working directory");
+        let paths = fixture.paths();
+        let manifest_path = default_manifest_path(&paths, &nested)
+            .expect("manifest discovery")
+            .expect("manifest found from a nested working directory");
+        assert_eq!(manifest_path, fixture.repository.path().join("ostrom.yaml"));
+
+        let bundle = fixture.load(&manifest_path);
+        let explanation = bundle.explain_pull_request(
+            "placeholder-org/repository",
+            &pull_request_fixture(),
+            "builder",
+            "work",
+        );
+        assert!(explanation.granted, "{explanation:#?}");
+        assert!(
+            explanation
+                .matching_grants
+                .contains(&"repository-grant".to_owned())
+        );
+        assert!(
+            explanation
+                .actor_portability_findings
+                .iter()
+                .any(|finding| {
+                    finding.actor == "builder"
+                        && finding.source == fixture.repository.path().join("ostrom.yaml")
+                })
+        );
+    }
+
+    #[test]
+    fn repository_deny_beats_operator_grant() {
+        let fixture = DiscoveryFixture::new(
+            "denies:\n  repository-veto: {actors: builder, operations: work}\n",
+        );
+        fixture.write_overlay(
+            "actors: {builder: {}}\noperations: {work: {steps: []}}\ngrants:\n  operator-grant: {actors: builder, operations: work}\n",
+        );
+        let paths = fixture.paths();
+        let manifest_path = default_manifest_path(&paths, fixture.repository.path())
+            .expect("manifest discovery")
+            .expect("repository manifest found");
+        let bundle = fixture.load(&manifest_path);
+        let explanation = bundle.explain_pull_request(
+            "placeholder-org/repository",
+            &pull_request_fixture(),
+            "builder",
+            "work",
+        );
+        assert!(!explanation.granted, "{explanation:#?}");
+        assert!(
+            explanation
+                .matching_denies
+                .contains(&"repository-veto".to_owned())
+        );
+        assert!(
+            explanation
+                .matching_grants
+                .contains(&"operator-grant".to_owned())
+        );
+    }
+
+    #[test]
+    fn no_matching_rule_defaults_to_deny_and_names_every_consulted_scope() {
+        let fixture = DiscoveryFixture::new("");
+        fixture.write_overlay("");
+        let paths = fixture.paths();
+        let manifest_path = default_manifest_path(&paths, fixture.repository.path())
+            .expect("manifest discovery")
+            .expect("repository manifest found");
+        let bundle = fixture.load(&manifest_path);
+        let explanation = bundle.explain_pull_request(
+            "placeholder-org/repository",
+            &pull_request_fixture(),
+            "builder",
+            "work",
+        );
+        assert!(!explanation.granted);
+        assert!(explanation.floor, "{explanation:#?}");
+        assert!(explanation.decision_source.starts_with("default deny"));
+        assert!(
+            explanation
+                .consulted_scopes
+                .iter()
+                .any(|scope| scope.layer == PolicyLayer::Repository)
+        );
+        assert!(
+            explanation
+                .consulted_scopes
+                .iter()
+                .any(|scope| scope.layer == PolicyLayer::Operator)
+        );
+    }
+
+    #[test]
+    fn repository_loop_is_inert_and_reports_declared_but_not_adopted() {
+        let fixture = DiscoveryFixture::new(
+            "grants:\n  repository-work: {actors: builder, operations: work}\nloops:\n  repository-loop: {actor: builder, operation: work, repositories: placeholder-org/repository, every: hourly}\n",
+        );
+        fixture.write_overlay("");
+        let paths = fixture.paths();
+
+        let operator_manifest_path =
+            adopting_manifest_path(&paths).expect("adopting manifest path");
+        let operator_manifest = with_trusted_keys(fixture.trusted_keys.path(), || {
+            load(&operator_manifest_path)
+        })
+        .expect("load operator manifest");
+        let rendered = fixture.home.path().join("systemd");
+        let written = ostrom_checks::render_loop_units(&operator_manifest, &rendered)
+            .expect("render adopted loops");
+        assert!(
+            written.is_empty(),
+            "a repository-declared loop must not render: {written:?}"
+        );
+
+        let manifest_path = default_manifest_path(&paths, fixture.repository.path())
+            .expect("manifest discovery")
+            .expect("repository manifest found");
+        let bundle = fixture.load(&manifest_path);
+        let explanation = bundle.explain_pull_request(
+            "placeholder-org/repository",
+            &pull_request_fixture(),
+            "builder",
+            "work",
+        );
+        assert!(explanation.inert_declarations.iter().any(|declaration| {
+            declaration.kind == "loop"
+                && declaration.id == "repository-loop"
+                && declaration.layer == PolicyLayer::Repository
+        }));
+    }
+
+    #[test]
+    fn yaml_and_yml_resolve_alone_but_both_are_ambiguous() {
+        let fixture = DiscoveryFixture::new(
+            "grants:\n  repository-grant: {actors: builder, operations: work}\n",
+        );
+        let yaml = fixture.repository.path().join("ostrom.yaml");
+        let yml = fixture.repository.path().join("ostrom.yml");
+        fs::rename(&yaml, &yml).expect("rename manifest extension");
+        fs::rename(
+            fixture.repository.path().join("ostrom.yaml.sig"),
+            fixture.repository.path().join("ostrom.yml.sig"),
+        )
+        .expect("rename signature extension");
+        let paths = fixture.paths();
+        let resolved = default_manifest_path(&paths, fixture.repository.path())
+            .expect("manifest discovery")
+            .expect("manifest resolves alone");
+        assert_eq!(resolved, yml);
+
+        fs::copy(&yml, &yaml).expect("add ambiguous yaml path");
+        let error = default_manifest_path(&paths, fixture.repository.path())
+            .expect_err("an ambiguous manifest must refuse");
+        match error {
+            PolicyLoadError::AmbiguousManifest {
+                yaml: found_yaml,
+                yml: found_yml,
+            } => {
+                assert_eq!(found_yaml, yaml);
+                assert_eq!(found_yml, yml);
+            }
+            other => panic!("expected AmbiguousManifest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn operator_yaml_and_yml_resolve_alone_but_both_are_ambiguous() {
+        let fixture = DiscoveryFixture::new("");
+        fixture.write_overlay(
+            "actors: {builder: {}}\noperations: {work: {steps: []}}\ngrants:\n  operator-grant: {actors: builder, operations: work}\n",
+        );
+        let yaml = fixture.home.path().join("ostrom.yaml");
+        let yml = fixture.home.path().join("ostrom.yml");
+        fs::rename(&yaml, &yml).expect("rename operator manifest extension");
+        fs::rename(
+            fixture.home.path().join("ostrom.yaml.sig"),
+            fixture.home.path().join("ostrom.yml.sig"),
+        )
+        .expect("rename operator signature extension");
+        let paths = fixture.paths();
+        let resolved = operator_manifest_path(&paths)
+            .expect("operator discovery")
+            .expect("operator manifest resolves alone");
+        assert_eq!(resolved, yml);
+
+        fs::copy(&yml, &yaml).expect("add ambiguous operator yaml path");
+        let error =
+            operator_manifest_path(&paths).expect_err("an ambiguous operator manifest must refuse");
+        match error {
+            PolicyLoadError::AmbiguousManifest {
+                yaml: found_yaml,
+                yml: found_yml,
+            } => {
+                assert_eq!(found_yaml, yaml);
+                assert_eq!(found_yml, yml);
+            }
+            other => panic!("expected AmbiguousManifest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn discovery_stops_at_git_boundary_and_refuses_operator_policy() {
+        let outer = tempdir().expect("outer directory");
+        let repository = outer.path().join("repository");
+        let nested = repository.join("nested");
+        let home = tempdir().expect("temporary operator home");
+        fs::create_dir_all(repository.join(".git")).expect("repository boundary");
+        fs::create_dir(&nested).expect("nested working directory");
+        fs::write(
+            outer.path().join("ostrom.yaml"),
+            policy("grants:\n  outer-grant: {actors: builder, operations: work}\n"),
+        )
+        .expect("write manifest above the repository boundary");
+        fs::write(
+            home.path().join("manifest.yml"),
+            policy("grants:\n  operator-grant: {actors: builder, operations: work}\n"),
+        )
+        .expect("write legacy operator manifest");
+
+        let paths = OstromPaths {
+            config: home.path().to_path_buf(),
+            state: home.path().to_path_buf(),
+        };
+        let resolved = default_manifest_path(&paths, &nested)
+            .expect("discovery must not error on an ungoverned repository");
+        assert!(
+            resolved.is_none(),
+            "a repository with no manifest at or below its .git boundary must be ungoverned, \
+             never falling through to `{}` or the operator manifest",
+            outer.path().join("ostrom.yaml").display()
+        );
+    }
+
+    #[test]
+    fn explicit_manifest_overrides_discovery() {
+        let fixture = DiscoveryFixture::new(
+            "denies:\n  discovered-deny: {actors: builder, operations: work}\n",
+        );
+        let explicit = fixture.repository.path().join("explicit.yaml");
+        fs::write(
+            &explicit,
+            policy("grants:\n  explicit-grant: {actors: builder, operations: work}\n"),
+        )
+        .expect("write explicit manifest");
+        fixture.sign(&explicit);
+
+        let bundle = fixture.load(&explicit);
+        let explanation = bundle.explain_pull_request(
+            "placeholder-org/repository",
+            &pull_request_fixture(),
+            "builder",
+            "work",
+        );
+        assert!(explanation.granted, "{explanation:#?}");
+        assert!(
+            explanation
+                .matching_grants
+                .contains(&"explicit-grant".to_owned())
+        );
+        assert!(
+            !explanation
+                .matching_denies
+                .contains(&"discovered-deny".to_owned())
+        );
+    }
+
+    #[test]
+    fn legacy_repository_manifest_resolves_and_grants() {
+        // The "exactly one deprecation notice" behaviour this fixture used to
+        // also pin is covered by the untouched
+        // `legacy_notice_is_emitted_once_for_repeated_lookup` in `mod tests`
+        // above, which must run in a child process because the warning fires
+        // from a `static Once`. This test only pins that discovery still
+        // resolves the legacy path and that the manifest found there still
+        // loads and grants.
+        let fixture =
+            DiscoveryFixture::new("grants:\n  legacy-grant: {actors: builder, operations: work}\n");
+        let legacy_directory = fixture.repository.path().join(".ostrom");
+        fs::create_dir(&legacy_directory).expect("legacy manifest directory");
+        fs::rename(
+            fixture.repository.path().join("ostrom.yaml"),
+            legacy_directory.join("manifest.yml"),
+        )
+        .expect("move manifest to the legacy path");
+        fs::rename(
+            fixture.repository.path().join("ostrom.yaml.sig"),
+            legacy_directory.join("manifest.yml.sig"),
+        )
+        .expect("move manifest signature to the legacy path");
+
+        let paths = fixture.paths();
+        let manifest_path = default_manifest_path(&paths, fixture.repository.path())
+            .expect("manifest discovery")
+            .expect("the legacy manifest still resolves");
+        assert_eq!(manifest_path, legacy_directory.join("manifest.yml"));
+        let bundle = fixture.load(&manifest_path);
+        let explanation = bundle.explain_pull_request(
+            "placeholder-org/repository",
+            &pull_request_fixture(),
+            "builder",
+            "work",
+        );
+        assert!(explanation.granted, "{explanation:#?}");
+        assert!(
+            explanation
+                .matching_grants
+                .contains(&"legacy-grant".to_owned())
+        );
+    }
+
+    #[test]
+    fn operator_grant_is_accepted_and_resolves_granted() {
+        let fixture = DiscoveryFixture::new("");
+        fixture
+            .write_overlay("grants:\n  forbidden-authority: {actors: builder, operations: work}\n");
+        let paths = fixture.paths();
+        let manifest_path = default_manifest_path(&paths, fixture.repository.path())
+            .expect("manifest discovery")
+            .expect("repository manifest found");
+        let bundle = fixture.load(&manifest_path);
+        let explanation = bundle.explain_pull_request(
+            "placeholder-org/repository",
+            &pull_request_fixture(),
+            "builder",
+            "work",
+        );
+        assert!(explanation.granted, "{explanation:#?}");
+        assert!(
+            explanation
+                .matching_grants
+                .contains(&"forbidden-authority".to_owned())
+        );
+        assert!(explanation.rules.iter().any(|rule| {
+            rule.id == "forbidden-authority" && rule.layer == PolicyLayer::Operator
+        }));
+    }
+
+    #[test]
+    fn operator_deny_beats_repository_grant_and_both_are_explained() {
+        let fixture = DiscoveryFixture::new(
+            "grants:\n  repository-grant: {actors: builder, operations: work}\n",
+        );
+        fixture.write_overlay("denies:\n  overlay-deny: {actors: builder, operations: work}\n");
+        let paths = fixture.paths();
+        let manifest_path = default_manifest_path(&paths, fixture.repository.path())
+            .expect("manifest discovery")
+            .expect("repository manifest found");
+        let bundle = fixture.load(&manifest_path);
+        let explanation = bundle.explain_pull_request(
+            "placeholder-org/repository",
+            &pull_request_fixture(),
+            "builder",
+            "work",
+        );
+        assert!(!explanation.granted, "{explanation:#?}");
+        assert!(
+            explanation
+                .matching_grants
+                .contains(&"repository-grant".to_owned())
+        );
+        assert!(
+            explanation
+                .matching_denies
+                .contains(&"overlay-deny".to_owned())
+        );
+        assert_eq!(explanation.hold_rule.as_deref(), Some("overlay-deny"));
+        assert!(
+            explanation
+                .decision_source
+                .contains("operator denies.overlay-deny")
+        );
+    }
+
+    #[test]
+    fn changing_the_overlay_after_signing_is_refused() {
+        let fixture = DiscoveryFixture::new("");
+        fixture.write_overlay("denies:\n  operator-veto: {actors: builder, operations: work}\n");
+        fs::write(
+            fixture.home.path().join("ostrom.yaml"),
+            "manifest_version: 1\ndenies:\n  changed-veto: {actors: builder, operations: work}\n",
+        )
+        .expect("tamper with the signed overlay without re-signing it");
+
+        let paths = fixture.paths();
+        let manifest_path = default_manifest_path(&paths, fixture.repository.path())
+            .expect("manifest discovery")
+            .expect("repository manifest found");
+        let error = fixture
+            .try_load(&manifest_path)
+            .expect_err("a tampered overlay must refuse to load");
+        assert!(
+            error.to_string().contains("signature verification failed"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn actor_portability_is_attributed_to_the_included_source() {
+        let fixture = DiscoveryFixture::new("");
+        let included = fixture.repository.path().join("included-actor.yaml");
+        fs::write(&included, "actor: gatekeeper\n").expect("write included actor");
+        let manifest_path = fixture.repository.path().join("ostrom.yaml");
+        fs::write(&manifest_path, policy("includes: [included-actor.yaml]\n"))
+            .expect("write including manifest");
+        fixture.sign(&manifest_path);
+
+        let paths = fixture.paths();
+        let resolved = default_manifest_path(&paths, fixture.repository.path())
+            .expect("manifest discovery")
+            .expect("repository manifest found");
+        let bundle = fixture.load(&resolved);
+        let explanation = bundle.explain_pull_request(
+            "placeholder-org/repository",
+            &pull_request_fixture(),
+            "builder",
+            "work",
+        );
+        let finding = explanation
+            .actor_portability_findings
+            .iter()
+            .find(|finding| finding.actor == "gatekeeper")
+            .expect("a gatekeeper actor portability finding");
+        assert_eq!(finding.source, included);
+        assert_eq!(finding.layer, PolicyLayer::Repository);
+    }
+
+    #[test]
+    fn included_grant_preserves_its_file_as_the_rule_origin() {
+        let fixture = DiscoveryFixture::new("");
+        fs::create_dir(fixture.repository.path().join(".ostrom"))
+            .expect("create include directory");
+        let included = fixture
+            .repository
+            .path()
+            .join(".ostrom/included-grant.yaml");
+        fs::write(
+            &included,
+            "grant: included-grant\nactors: builder\noperations: work\n",
+        )
+        .expect("write included grant");
+        let manifest_path = fixture.repository.path().join("ostrom.yaml");
+        fs::write(
+            &manifest_path,
+            policy("includes: [.ostrom/included-grant.yaml]\n"),
+        )
+        .expect("write including manifest");
+        fixture.sign(&manifest_path);
+
+        let paths = fixture.paths();
+        let resolved = default_manifest_path(&paths, fixture.repository.path())
+            .expect("manifest discovery")
+            .expect("repository manifest found");
+        let bundle = fixture.load(&resolved);
+        let explanation = bundle.explain_pull_request(
+            "placeholder-org/repository",
+            &pull_request_fixture(),
+            "builder",
+            "work",
+        );
+        let rule = explanation
+            .rules
+            .iter()
+            .find(|rule| rule.id == "included-grant")
+            .expect("an included-grant rule");
+        assert_eq!(rule.source, included);
+    }
+
+    #[test]
+    fn operator_deny_applies_and_is_attributed_to_its_scope_and_file() {
+        let fixture = DiscoveryFixture::new("");
+        fixture.write_overlay("denies:\n  operator-veto: {actors: builder, operations: work}\n");
+        let paths = fixture.paths();
+        let manifest_path = default_manifest_path(&paths, fixture.repository.path())
+            .expect("manifest discovery")
+            .expect("repository manifest found");
+        let bundle = fixture.load(&manifest_path);
+        let explanation = bundle.explain_pull_request(
+            "placeholder-org/repository",
+            &pull_request_fixture(),
+            "builder",
+            "work",
+        );
+        assert!(!explanation.granted, "{explanation:#?}");
+        let rule = explanation
+            .rules
+            .iter()
+            .find(|rule| rule.id == "operator-veto")
+            .expect("an operator-veto rule");
+        assert_eq!(rule.layer, PolicyLayer::Operator);
+        assert_eq!(rule.source, fixture.home.path().join("ostrom.yaml"));
+        assert_eq!(explanation.hold_rule.as_deref(), Some("operator-veto"));
+        assert!(
+            explanation
+                .decision_source
+                .contains("operator denies.operator-veto")
+        );
+    }
+}
