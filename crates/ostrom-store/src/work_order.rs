@@ -629,44 +629,62 @@ pub(crate) fn order_liveness(state_root: &Path, order: &InFlightOrder) -> UnitLi
     observe_unit(state_root, order).liveness
 }
 
-/// Close a live order the stall reaper is about to stop (#619). The row is
-/// written before the stop, so it is this row, not the signal the run then
-/// receives, that says why the run ended. Its `cost_usd` is the order's cost
-/// ceiling: the real figure is unknowable once the process is gone, and a
-/// daily-cap reader must stay conservative rather than undercount. The lease
-/// is left to the caller, which releases it only once the process is gone.
-pub(crate) fn append_stalled_failure(
+/// The terminal row the stall reaper writes for an implementer it stopped and
+/// confirmed stopped, when the run wrote none of its own (#619, #635): the
+/// run was killed, or never reached its terminal path. Its reason and cost come
+/// from the reaper's claim on the run, so they match what the run itself would
+/// have written from the same claim. The row is appended only while the order
+/// is still in flight, so a run that wrote its own row first keeps the only
+/// one. The lease is left to the caller.
+pub(crate) struct ReapedFailure<'a> {
+    pub run_id: &'a str,
+    pub reason: &'a str,
+    pub cost_usd: f64,
+    pub cost_basis: &'a str,
+    pub last_progress_at: Option<&'a str>,
+    pub stalled_seconds: Option<u64>,
+}
+
+pub(crate) fn append_reaped_failure(
     state_root: &Path,
     order: &InFlightOrder,
-    run_id: &str,
-    last_progress_at: Option<&str>,
-    stalled_seconds: u64,
+    failure: &ReapedFailure<'_>,
     clock: &Clock,
 ) -> Result<bool, WorkOrderError> {
     let extra = Map::from_iter([
-        ("run_id".to_owned(), Value::String(run_id.to_owned())),
+        (
+            "run_id".to_owned(),
+            Value::String(failure.run_id.to_owned()),
+        ),
         (
             "last_progress_at".to_owned(),
-            last_progress_at.map_or(Value::Null, |value| Value::String(value.to_owned())),
+            failure
+                .last_progress_at
+                .map_or(Value::Null, |value| Value::String(value.to_owned())),
         ),
-        ("stalled_seconds".to_owned(), Value::from(stalled_seconds)),
-        // Every order carries its ceiling: declared at creation, or the
-        // shared default written into the order then.
+        (
+            "stalled_seconds".to_owned(),
+            failure.stalled_seconds.map_or(Value::Null, Value::from),
+        ),
         (
             "cost_basis".to_owned(),
-            Value::String("declared-ceiling".to_owned()),
+            Value::String(failure.cost_basis.to_owned()),
         ),
     ]);
+    let message = failure.stalled_seconds.map_or_else(
+        || "stopped by the stall reaper".to_owned(),
+        |seconds| format!("no progress for {seconds} s; stopped by the stall reaper"),
+    );
     append_terminal_row(
         state_root,
         order,
         TerminalRow {
-            reason: "stalled",
-            message: &format!("no progress for {stalled_seconds} s; stopped by the stall reaper"),
+            reason: failure.reason,
+            message: &message,
             exit_code: None,
             signal: None,
             reaped: true,
-            cost_usd: Some(order.cost_ceiling_usd),
+            cost_usd: Some(failure.cost_usd),
             extra,
             release_lease: false,
         },

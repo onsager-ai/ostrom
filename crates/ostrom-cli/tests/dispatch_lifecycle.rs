@@ -981,7 +981,7 @@ fn an_implementer_past_its_declared_wall_cap_is_stopped_and_says_why() {
             "codex_started": codex.is_some(),
             "codex_still_running": codex.is_some_and(pid_alive),
             "stopped_long_before_codex_would_exit": elapsed < Duration::from_secs(30),
-            "unit_outer_bound": unit.lines().any(|line| line == "RuntimeMaxSec=7"),
+            "unit_outer_bound": unit.lines().any(|line| line == "RuntimeMaxSec=122"),
         }),
         json!({
             "dispatched": true,
@@ -1180,6 +1180,178 @@ fn an_implementer_whose_order_the_reaper_already_closed_writes_no_second_termina
         .collect::<Vec<_>>();
     assert_eq!(terminal.len(), 1, "{terminal:?}");
     assert_eq!(terminal[0]["fact"]["reason"], "stalled");
+}
+
+/// #635: a stalled implementer that handles `SIGTERM` writes its own terminal
+/// row when `ostrom up` stops it. The reaper's claim on its run makes that row
+/// say `stalled` and charge the order's cost ceiling, so there is exactly one
+/// row, written by the run, saying why it ended.
+#[test]
+fn a_term_handling_implementer_stopped_by_the_reaper_writes_one_stalled_row() {
+    use std::os::unix::process::CommandExt as _;
+
+    let fixture = DispatchFixture::new(false);
+    compose_current(&fixture.state, "manifest_version: 1\n");
+    let (_codex_environment, credential) = runnable_implementer(&fixture);
+    let codex_pid = fixture.root.path().join("codex.pid");
+    executable(
+        &fixture.codex,
+        &format!(
+            "if [ \"${{1:-}}\" = --version ]; then exit 0; fi\nprintf '%s\\n' \"$$\" >'{}'\nexec sleep 60",
+            codex_pid.display()
+        ),
+    );
+    let unit = "ostrom-implementer-stalled";
+    let run_id = "implementer-stalled-placeholder-run";
+    let lease = fixture
+        .state
+        .join(format!("implementer-item-{}.lease", fixture.item_hash));
+    fs::write(
+        &lease,
+        format!("{{\"owner\":\"{unit}\",\"started_at\":1,\"expires_at\":9999999999}}\n"),
+    )
+    .expect("write the implementer lease");
+    let order = WorkOrder::from_json(&fs::read(&fixture.order_file).expect("read order"))
+        .expect("valid work order");
+    // The hold, as dispatch records one on the process backend, with a
+    // one-second idle cap.
+    let dispatched_at =
+        chrono::DateTime::<chrono::Utc>::from_timestamp(chrono::Utc::now().timestamp() - 60, 0)
+            .expect("valid timestamp")
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let mut appended = fs::read_to_string(fixture.state.join("sprint.jsonl")).unwrap_or_default();
+    appended.push_str(&format!(
+        "{}\n",
+        json!({
+            "ts": dispatched_at,
+            "kind": "work-dispatched",
+            "fact": {
+                "schema_version": 1,
+                "item_id": &order.item_id,
+                "order_id": &order.order_id,
+                "unit_name": unit,
+                "backend": "process",
+                "run_id": run_id,
+                "runner": "agent/codex",
+                "wall_seconds": 14_400,
+                "idle_seconds": 1,
+                "cost_ceiling_usd": 20,
+                "token_ceiling": 500_000,
+                "cost_usd": null,
+                "duration_seconds": 0,
+            },
+            "narration": {},
+        })
+    ));
+    fs::write(fixture.state.join("sprint.jsonl"), appended).expect("record the dispatch");
+    let mut implementer = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .arg("implement")
+        .arg(&fixture.order_file)
+        .arg(unit)
+        .args(["--run-id", run_id])
+        .current_dir(fixture.root.path())
+        .env_clear()
+        .env("OSTROM_HOME", &fixture.state)
+        .env("HOME", &fixture.home)
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("OSTROM_PLUGIN_ROOT", plugin_root())
+        .env("MANDATE_IMPLEMENTER_SOURCE_REPO", &fixture.source)
+        .env("MANDATE_GH_AS_BIN", &credential)
+        .env("MANDATE_IMPLEMENTER_TERMINATION_GRACE_SECONDS", "1")
+        .env("CODEX_BIN", &fixture.codex)
+        .process_group(0)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start the implementer");
+    let implementer_pid = implementer.id();
+    let _group = KillProcessGroup(implementer_pid);
+    wait_until(Duration::from_secs(30), || {
+        fs::read_to_string(&codex_pid).is_ok_and(|pid| !pid.trim().is_empty())
+    });
+    // Bound to its process, as the process backend binds a dispatched one.
+    let (group, _, start_time) =
+        proc_identity(implementer_pid).expect("the implementer's process identity");
+    fs::write(
+        &lease,
+        json!({
+            "owner": unit,
+            "started_at": 1,
+            "expires_at": 9_999_999_999_u64,
+            "pid": implementer_pid,
+            "process_group_id": group,
+            "process_start_time": start_time,
+        })
+        .to_string(),
+    )
+    .expect("bind the lease to the implementer");
+    // Past the one-second idle cap at second precision.
+    thread::sleep(Duration::from_secs(3));
+
+    let up = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .arg("up")
+        .current_dir(&fixture.state)
+        .env("OSTROM_HOME", &fixture.state)
+        .env(
+            "OSTROM_POLICY_TRUSTED_KEYS",
+            fixture.state.join("trusted-policy-keys"),
+        )
+        .env_remove("OSTROM_POLICY_MANIFEST")
+        .env_remove("OSTROM_RUN_ID")
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .output()
+        .expect("run ostrom up");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while implementer
+        .try_wait()
+        .expect("poll the implementer")
+        .is_none()
+        && Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let terminal = trace(&fixture.state)
+        .into_iter()
+        .filter(|row| {
+            matches!(row["kind"].as_str(), Some("work-completed" | "work-failed"))
+                && row["fact"]["order_id"] == order.order_id.as_str()
+        })
+        .collect::<Vec<_>>();
+    let row = terminal.first().cloned().unwrap_or(Value::Null);
+    assert_eq!(
+        json!({
+            "up_succeeded": up.status.success(),
+            "up_reaped_it": String::from_utf8_lossy(&up.stdout).contains("reaped=1"),
+            "terminal_rows": terminal.len(),
+            "reason": row["fact"]["reason"],
+            "cost_usd": row["fact"]["cost_usd"].as_f64(),
+            "cost_basis": row["fact"]["cost_basis"],
+            "reaped": row["fact"]["reaped"],
+            "written_by_the_run": row["fact"]
+                .as_object()
+                .is_some_and(|fact| fact.contains_key("worktree_path")),
+            "claim_removed": !fixture
+                .state
+                .join(format!("reaping/{run_id}.claim"))
+                .exists(),
+            "lease_released": !lease.exists(),
+        }),
+        json!({
+            "up_succeeded": true,
+            "up_reaped_it": true,
+            "terminal_rows": 1,
+            "reason": "stalled",
+            "cost_usd": 20.0,
+            "cost_basis": "declared-ceiling",
+            "reaped": true,
+            "written_by_the_run": true,
+            "claim_removed": true,
+            "lease_released": true,
+        }),
+        "up stderr: {}",
+        String::from_utf8_lossy(&up.stderr)
+    );
 }
 
 /// Compose `manifest` as this state root's current policy version, signed as

@@ -10,7 +10,7 @@
 
 use std::{
     fs,
-    os::unix::process::CommandExt as _,
+    os::unix::{fs::PermissionsExt as _, process::CommandExt as _},
     path::PathBuf,
     process::{Child, Command, Output, Stdio},
     thread,
@@ -49,6 +49,37 @@ impl Sleeper {
 
     fn pid(&self) -> u32 {
         self.child.id()
+    }
+
+    /// A process that ignores `SIGTERM`, so only `SIGKILL` stops it.
+    fn ignoring_term() -> Self {
+        let child = Command::new("sh")
+            .args(["-c", "trap '' TERM; exec sleep 60"])
+            .process_group(0)
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("start a process that ignores SIGTERM");
+        // Only once `sleep` has replaced the shell is the trap in force.
+        let comm = format!("/proc/{}/comm", child.id());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !fs::read_to_string(&comm).is_ok_and(|name| name.trim() == "sleep") {
+            assert!(Instant::now() < deadline, "the shell never became sleep");
+            thread::sleep(Duration::from_millis(20));
+        }
+        Self { child }
+    }
+
+    /// Kill it, as a reaper's stop would have, and wait until it is gone.
+    fn kill(&mut self) {
+        let _ = Command::new("/bin/kill")
+            .args(["-KILL", "--", &format!("-{}", self.child.id())])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        assert!(
+            self.wait_stopped(Duration::from_secs(5)),
+            "the process outlived SIGKILL"
+        );
     }
 
     /// `(process group, start time)` as `/proc` records them.
@@ -187,6 +218,10 @@ impl Home {
             .collect()
     }
 
+    fn claim(&self) -> PathBuf {
+        self.path.join("reaping").join(format!("{RUN}.claim"))
+    }
+
     fn item_lease(&self) -> PathBuf {
         self.path.join(format!(
             "implementer-item-{}.lease",
@@ -235,6 +270,37 @@ impl Home {
         .expect("write the implementer lease");
     }
 
+    /// A systemd-backend implementer hold, dispatched a minute ago: its lease
+    /// is time-bound and names no process.
+    fn unit_hold(&self, idle_seconds: u64) {
+        let now = epoch_now();
+        self.append_trace(&json!({
+            "ts": timestamp(now - 60),
+            "kind": "work-dispatched",
+            "fact": {
+                "schema_version": 1,
+                "item_id": ITEM,
+                "order_id": ORDER,
+                "unit_name": UNIT,
+                "backend": "systemd",
+                "run_id": RUN,
+                "runner": "agent/codex",
+                "wall_seconds": 14_400,
+                "idle_seconds": idle_seconds,
+                "cost_ceiling_usd": 20,
+                "token_ceiling": 500_000,
+                "cost_usd": null,
+                "duration_seconds": 0,
+            },
+            "narration": {},
+        }));
+        fs::write(
+            self.item_lease(),
+            json!({"owner": UNIT, "started_at": now - 60, "expires_at": now + 3_600}).to_string(),
+        )
+        .expect("write the unit's lease");
+    }
+
     /// A pass hold: `pass-started` with its run id, the run's `run.started`
     /// with `ceilings`, and, when a process is given, the pass lease naming it.
     fn pass_hold(&self, sleeper: Option<&Sleeper>, ceilings: &Value) {
@@ -277,6 +343,29 @@ impl Home {
             .expect("write the pass lease");
         }
     }
+}
+
+/// The `reaped=` count `ostrom up` prints.
+fn reaped(output: &Output) -> u64 {
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .find_map(|word| word.strip_prefix("reaped="))
+        .and_then(|count| count.parse().ok())
+        .expect("ostrom up prints its reaped count")
+}
+
+/// The pid and start time of a process that has exited: a reaper that died.
+fn dead_process() -> (u32, u64) {
+    let mut child = Sleeper {
+        child: Command::new("sleep")
+            .arg("0.2")
+            .process_group(0)
+            .spawn()
+            .expect("start a short-lived process"),
+    };
+    let (_, start_time) = child.identity();
+    assert!(child.wait_stopped(Duration::from_secs(5)));
+    (child.pid(), start_time)
 }
 
 fn epoch_now() -> i64 {
@@ -632,6 +721,255 @@ grants:
             "previous_worker_running": true,
         }),
         "up stdout: {stdout}\nup stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// #635 S3, with `SIGKILL` escalation: two reapers race on one stalled hold
+/// whose process ignores `SIGTERM`. The claim on the run lets exactly one of
+/// them act: one stop, escalated to `SIGKILL` after the grace, one
+/// `work-failed`, one charge.
+#[test]
+fn two_reapers_racing_on_one_hold_record_one_row_and_one_charge() {
+    let home = Home::new();
+    let mut target = Sleeper::ignoring_term();
+    home.implementer_hold(&target, 1, 0);
+
+    let started = Instant::now();
+    let reapers = [(); 2].map(|()| {
+        home.command()
+            .arg("up")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start a reaper")
+    });
+    let outputs = reapers.map(|reaper| reaper.wait_with_output().expect("wait for a reaper"));
+    let elapsed = started.elapsed();
+    let stopped = target.wait_stopped(Duration::from_secs(5));
+
+    let failed = home.terminal_rows("work-failed", "order_id", ORDER);
+    let charged = failed
+        .iter()
+        .filter_map(|row| row["fact"]["cost_usd"].as_f64())
+        .sum::<f64>();
+    assert_eq!(
+        json!({
+            "both_succeeded": outputs.iter().all(|output| output.status.success()),
+            "reapers_that_reaped": outputs.iter().map(reaped).sum::<u64>(),
+            "terminal_rows": failed.len(),
+            "charged": charged,
+            "process_stopped": stopped,
+            "escalated_after_the_term_grace": elapsed
+                >= Duration::from_secs(ostrom_core::RUN_TERMINATION_GRACE_SECONDS * 2),
+            "claim_removed": !home.claim().exists(),
+            "lease_released": !home.item_lease().exists(),
+        }),
+        json!({
+            "both_succeeded": true,
+            "reapers_that_reaped": 1,
+            "terminal_rows": 1,
+            "charged": 20.0,
+            "process_stopped": true,
+            "escalated_after_the_term_grace": true,
+            "claim_removed": true,
+            "lease_released": true,
+        }),
+        "stderr: {} | {}",
+        String::from_utf8_lossy(&outputs[0].stderr),
+        String::from_utf8_lossy(&outputs[1].stderr)
+    );
+}
+
+/// #635: a reaper claimed a run and stopped it, then died before recording
+/// anything. The next reaper takes its claim over and completes it with what
+/// the claim says, once: a later reaper finds nothing left to do.
+#[test]
+fn a_claim_left_by_a_reaper_that_died_is_completed_once_by_the_next_reaper() {
+    let home = Home::new();
+    let mut sleeper = Sleeper::start();
+    home.implementer_hold(&sleeper, 1, 0);
+    let (reaper_pid, reaper_start_time) = dead_process();
+    fs::create_dir_all(home.path.join("reaping")).expect("create the claim directory");
+    fs::write(
+        home.claim(),
+        json!({
+            "run_id": RUN,
+            "kind": "implementer",
+            "order_id": ORDER,
+            "reason": "stalled",
+            "cost_usd": 20.0,
+            "cost_basis": "declared-ceiling",
+            "claimed_at": timestamp(epoch_now() - 5),
+            "last_progress_at": timestamp(epoch_now() - 60),
+            "stalled_seconds": 42,
+            "reaper_pid": reaper_pid,
+            "reaper_start_time": reaper_start_time,
+        })
+        .to_string(),
+    )
+    .expect("leave the dead reaper's claim");
+    // Its stop landed before it died.
+    sleeper.kill();
+
+    let first = home.up();
+    let second = home.up();
+
+    let failed = home.terminal_rows("work-failed", "order_id", ORDER);
+    let row = failed.first().cloned().unwrap_or(Value::Null);
+    assert_eq!(
+        json!({
+            "up_succeeded": first.status.success() && second.status.success(),
+            "first_reaped": reaped(&first),
+            "second_reaped": reaped(&second),
+            "terminal_rows": failed.len(),
+            "reason": row["fact"]["reason"],
+            "stalled_seconds_from_the_claim": row["fact"]["stalled_seconds"],
+            "cost_usd": row["fact"]["cost_usd"].as_f64(),
+            "cost_basis": row["fact"]["cost_basis"],
+            "claim_removed": !home.claim().exists(),
+            "lease_released": !home.item_lease().exists(),
+        }),
+        json!({
+            "up_succeeded": true,
+            "first_reaped": 1,
+            "second_reaped": 0,
+            "terminal_rows": 1,
+            "reason": "stalled",
+            "stalled_seconds_from_the_claim": 42,
+            "cost_usd": 20.0,
+            "cost_basis": "declared-ceiling",
+            "claim_removed": true,
+            "lease_released": true,
+        }),
+        "up stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+}
+
+/// #635 S1: a stop whose outcome cannot be read is not a stop. Here the
+/// service manager reports the unit live, accepts the stop, then will not say
+/// what the unit's state is. Nothing is recorded, nothing is released, the
+/// claim stays for the next reaper, and doctor says so.
+#[test]
+fn a_stop_that_cannot_be_confirmed_records_nothing_releases_nothing_and_keeps_the_claim() {
+    let home = Home::new();
+    home.unit_hold(1);
+    let calls = home.root.path().join("systemctl-show-calls");
+    let systemctl = home.root.path().join("systemctl-stub");
+    fs::write(
+        &systemctl,
+        format!(
+            concat!(
+                "#!/bin/sh\n",
+                "case \"$*\" in\n",
+                "  *' show '*)\n",
+                "    printf '%s\\n' show >>'{calls}'\n",
+                "    if [ \"$(wc -l <'{calls}')\" -eq 1 ]; then printf '%s\\n' ActiveState=active; exit 0; fi\n",
+                "    exit 1 ;;\n",
+                "esac\n",
+                "exit 0\n"
+            ),
+            calls = calls.display()
+        ),
+    )
+    .expect("write the systemctl stub");
+    fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755))
+        .expect("make the systemctl stub executable");
+
+    let output = home
+        .command()
+        .env("MANDATE_SYSTEMCTL_BIN", &systemctl)
+        .arg("up")
+        .output()
+        .expect("run ostrom up");
+    let doctor = home.doctor_work_orders();
+
+    let claim = fs::read(home.claim())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .unwrap_or(Value::Null);
+    assert_eq!(
+        json!({
+            "up_succeeded": output.status.success(),
+            "says_the_stop_is_unconfirmed": String::from_utf8_lossy(&output.stderr)
+                .contains("stop unconfirmed"),
+            "counted_as_reaped": reaped(&output),
+            "terminal_rows": home.terminal_rows("work-failed", "order_id", ORDER).len(),
+            "lease_held": home.item_lease().exists(),
+            "claim_kept_with_its_reason": claim["reason"],
+            "doctor_fails_on_the_kept_claim": doctor.starts_with("FAIL|work-orders|stall reaper:")
+                && doctor.contains(&format!("run={RUN}")),
+        }),
+        json!({
+            "up_succeeded": true,
+            "says_the_stop_is_unconfirmed": true,
+            "counted_as_reaped": 0,
+            "terminal_rows": 0,
+            "lease_held": true,
+            "claim_kept_with_its_reason": "stalled",
+            "doctor_fails_on_the_kept_claim": true,
+        }),
+        "up stderr: {}\ndoctor: {doctor}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// #635 S6: reaping is best effort and scheduling is not. A reaper that fails
+/// (here, on a trace it cannot read) is printed and recorded for doctor, and
+/// `ostrom up` still launches the loop that is due.
+#[test]
+fn a_reaper_error_is_recorded_for_doctor_and_does_not_stop_a_launch() {
+    let marker_root = TempDir::new().expect("marker directory");
+    let marker = marker_root.path().join("operation-ran");
+    let (home, _digest) = Home::composed(&format!(
+        r#"manifest_version: 1
+actors: {{builder: {{}}}}
+operations:
+  scheduled-work:
+    steps:
+      - uses: cmd/run
+        with:
+          script: 'touch "{}"'
+loops:
+  builder-day:
+    actor: builder
+    operation: scheduled-work
+    repositories: placeholder-org/repository
+    every: hourly
+grants:
+  scheduled: {{actors: builder, operations: scheduled-work, repositories: placeholder-org/repository}}
+"#,
+        marker.display()
+    ));
+    // A persistent fault the reaper cannot get past: the trace is unreadable.
+    fs::create_dir_all(home.path.join("sprint.jsonl")).expect("make the trace unreadable");
+
+    let output = home.up();
+    let doctor = home.doctor_work_orders();
+    let state = fs::read(home.path.join("loop-runs/builder-day.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .unwrap_or(Value::Null);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert_eq!(
+        json!({
+            "up_succeeded": output.status.success(),
+            "launched": stdout.contains("started=1"),
+            "loop_state_written": state["status"].is_string(),
+            "reaper_error_printed": String::from_utf8_lossy(&output.stderr)
+                .contains("ostrom up: stall reaper:"),
+            "doctor_names_the_reaper_error": doctor.starts_with("FAIL|work-orders|stall reaper:")
+                && doctor.contains("the stall reaper failed"),
+        }),
+        json!({
+            "up_succeeded": true,
+            "launched": true,
+            "loop_state_written": true,
+            "reaper_error_printed": true,
+            "doctor_names_the_reaper_error": true,
+        }),
+        "up stdout: {stdout}\nup stderr: {}\ndoctor: {doctor}",
         String::from_utf8_lossy(&output.stderr)
     );
 }

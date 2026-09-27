@@ -32,6 +32,15 @@ pub const DEFAULT_PASS_WALL_SECONDS: u64 = 30 * 60;
 /// with no idle cap) adds to a wall cap so the in-process watchdog fires first.
 pub const RUN_TERMINATION_GRACE_SECONDS: u64 = 5;
 
+/// The margin a systemd implementer unit's `RuntimeMaxSec` adds to the wall cap
+/// (#635 N2). `RuntimeMaxSec` counts from the unit's start, while the
+/// implementer's wall cap counts from after its preflight (source resolution,
+/// fetch, worktree), and once the cap trips the run still needs its
+/// termination grace to stop Codex and write its `wall-cap` row. Five seconds
+/// left systemd's signal racing that row; two minutes leaves the in-process
+/// watchdog comfortably first.
+pub const IMPLEMENTER_UNIT_RUNTIME_MARGIN_SECONDS: u64 = 120;
+
 /// The cost ceiling of one run, in US dollars, when nothing declares one: the
 /// default a work order is created with, and what the stall reaper charges a
 /// reaped pass that declared no ceiling of its own. One value, so the two
@@ -172,6 +181,14 @@ impl ResolvedRunCaps {
     pub const fn outer_bound_seconds(&self) -> u64 {
         self.wall_seconds
             .saturating_add(RUN_TERMINATION_GRACE_SECONDS)
+    }
+
+    /// The `RuntimeMaxSec` of a systemd implementer unit: the wall cap plus
+    /// [`IMPLEMENTER_UNIT_RUNTIME_MARGIN_SECONDS`].
+    #[must_use]
+    pub const fn implementer_unit_runtime_seconds(&self) -> u64 {
+        self.wall_seconds
+            .saturating_add(IMPLEMENTER_UNIT_RUNTIME_MARGIN_SECONDS)
     }
 
     /// `4h (default)` or `90m`, for `ostrom ps` and `ostrom doctor`.

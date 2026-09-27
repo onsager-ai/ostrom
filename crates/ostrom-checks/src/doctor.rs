@@ -11,7 +11,9 @@ use std::{
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use ostrom_core::{ActionDefinition, ResolvedRunCaps};
-use ostrom_store::{Clock, DISPATCH_FAILURE_CLEARED_KIND, OstromPaths, environment, stalled_holds};
+use ostrom_store::{
+    Clock, DISPATCH_FAILURE_CLEARED_KIND, OstromPaths, environment, reaper_findings, stalled_holds,
+};
 use serde_json::{Map, Value, json};
 
 use crate::{
@@ -1323,6 +1325,9 @@ fn systemd_unit_state(context: &DoctorContext, unit_name: &str) -> UnitState {
 }
 
 fn check_work_orders(context: &DoctorContext) -> DoctorResult {
+    if let Some(reaper) = reaper_result(context) {
+        return reaper;
+    }
     if let Some(stalled) = stalled_hold_result(context) {
         return stalled;
     }
@@ -1399,6 +1404,27 @@ fn check_work_orders(context: &DoctorContext) -> DoctorResult {
             "",
         )
     }
+}
+
+/// The stall reaper never stops `up` or `dispatch` from scheduling, so its
+/// failures surface here instead (#635): its last error, and every claim whose
+/// stop no live reaper is confirming. Either can leave a run holding its item
+/// or its spend, so either fails the check.
+fn reaper_result(context: &DoctorContext) -> Option<DoctorResult> {
+    let state_root = doctor_state_root(context);
+    let findings = reaper_findings(&OstromPaths {
+        config: state_root.clone(),
+        state: state_root,
+    });
+    if findings.is_empty() {
+        return None;
+    }
+    Some(DoctorResult::new(
+        DoctorStatus::Fail,
+        "work-orders",
+        format!("stall reaper: {}", findings.join("; ")),
+        "fix the named fault, or confirm the named run has stopped; the next ostrom up or ostrom dispatch retries and clears it",
+    ))
 }
 
 /// A live hold with no progress past its threshold fails the check, named by

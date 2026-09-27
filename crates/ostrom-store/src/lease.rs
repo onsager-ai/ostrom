@@ -8,7 +8,11 @@ use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
-use crate::{StoreError, io_error, set_private_file_mode};
+use crate::{
+    StoreError,
+    claim::{self, Claim, HolderKeys},
+    io_error, set_private_file_mode,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -564,32 +568,31 @@ fn install_exclusive(path: &Path, bytes: &[u8]) -> bool {
     true
 }
 
+/// The lease's mutation guard: a `create_new` claim naming this process, so a
+/// guard left behind by a process killed mid-mutation is recognised as stale
+/// and taken over instead of refusing every later renewal for ever (#635).
 struct LeaseGuard {
-    path: PathBuf,
+    claim: Option<Claim>,
 }
+
+const GUARD_HOLDER: HolderKeys = HolderKeys {
+    pid: "pid",
+    start_time: "start_time",
+};
 
 impl LeaseGuard {
     fn acquire(path: &Path) -> Option<Self> {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .ok()?;
-        if set_private_file_mode(path).is_err()
-            || writeln!(file, "{}.guard", std::process::id()).is_err()
-        {
-            let _ = fs::remove_file(path);
-            return None;
-        }
-        Some(Self {
-            path: path.to_path_buf(),
-        })
+        claim::create_or_take_over(path, GUARD_HOLDER, serde_json::Map::new())
+            .ok()
+            .map(|claim| Self { claim: Some(claim) })
     }
 }
 
 impl Drop for LeaseGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        if let Some(claim) = self.claim.take() {
+            let _ = claim.remove();
+        }
     }
 }
 
@@ -610,8 +613,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        LeaseRecord, ProcessLiveness, process_identity_is_live, process_identity_is_live_at,
-        read_lease, read_process_identity, write_lease,
+        LeaseActionError, LeaseRecord, ProcessLiveness, process_identity_is_live,
+        process_identity_is_live_at, read_lease, read_process_identity, renew_lease, write_lease,
     };
 
     #[test]
@@ -770,6 +773,84 @@ mod tests {
         reading.store(false, Ordering::Relaxed);
         assert!(!reader.join().expect("join lease reader"));
         assert_eq!(read_lease(&path).expect("read final lease"), Some(lease));
+    }
+
+    /// #635 N3, and the one stale-recovery test of the claim primitive that
+    /// the lease guard and the stall reaper share: a guard left by a process
+    /// that died mid-renewal is taken over, so renewal succeeds; a guard whose
+    /// holder is alive still refuses it.
+    #[test]
+    fn a_stale_lease_guard_is_recovered_and_a_live_one_still_refuses() {
+        let fixture = tempdir().expect("temp dir");
+        let lease = LeaseRecord {
+            owner: "builder-placeholder".to_owned(),
+            started_at: 10,
+            expires_at: 20,
+            pid: None,
+            process_group_id: None,
+            process_start_time: None,
+        };
+        write_lease(&fixture.path().join("builder-pass.lease"), &lease).expect("write lease");
+        let guard = fixture.path().join(".builder-pass.lease.guard");
+
+        let mut holder = Command::new("sleep")
+            .arg("0.2")
+            .spawn()
+            .expect("start a short-lived guard holder");
+        let dead = read_process_identity(holder.id())
+            .expect("read the holder")
+            .expect("the holder is running");
+        holder.wait().expect("reap the holder");
+        fs::write(
+            &guard,
+            format!(
+                "{{\"pid\":{},\"start_time\":{}}}\n",
+                dead.pid, dead.start_time
+            ),
+        )
+        .expect("leave a dead holder's guard");
+        let stale = renew_lease(
+            fixture.path(),
+            "builder-pass.lease",
+            "builder-placeholder",
+            None,
+            100,
+            30,
+        );
+        let renewed = read_lease(&fixture.path().join("builder-pass.lease"))
+            .expect("read lease")
+            .map(|lease| lease.expires_at);
+        let guard_released = !guard.exists();
+
+        let own = read_process_identity(std::process::id())
+            .expect("read this process")
+            .expect("this process is running");
+        fs::write(
+            &guard,
+            format!(
+                "{{\"pid\":{},\"start_time\":{}}}\n",
+                own.pid, own.start_time
+            ),
+        )
+        .expect("hold the guard from a live process");
+        let live = renew_lease(
+            fixture.path(),
+            "builder-pass.lease",
+            "builder-placeholder",
+            None,
+            200,
+            30,
+        );
+        assert_eq!(
+            (
+                stale.is_ok(),
+                renewed,
+                guard_released,
+                matches!(live, Err(LeaseActionError::MutationInProgress)),
+                guard.exists(),
+            ),
+            (true, Some(130), true, true, true)
+        );
     }
 
     fn write_process_stat(root: &Path, pid: u32, state: char, start_time: u64) {
