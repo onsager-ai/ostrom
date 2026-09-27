@@ -34,7 +34,7 @@ use crate::{
     Clock, LeaseActionError, OstromPaths, OwnedLease, PassState, RunEventError, RunEventGuard,
     RunEventStart, SignalFlags, SkippedRepository, SweepOptions, TraceAppend, append_trace,
     environment, generated_run_id, generation_is_fresh, latest_successful_generation,
-    lease::{read_process_identity, renew_lease},
+    lease::{ProcessIdentity, read_process_identity, renew_lease},
     load_sweep_snapshot, pass_control,
     pass_control::ControlInput,
     read_lease, read_pass_state, read_trace,
@@ -817,6 +817,56 @@ fn with_run_id(mut fact: Map<String, Value>, run_id: &str) -> Map<String, Value>
     fact
 }
 
+/// `pass-started` also names this pass's process, under the lease's own field
+/// names (#636). The lease names only its current holder, so once another pass
+/// takes it over this record is what the stall reaper tells a displaced pass,
+/// still running, from one whose process is gone.
+fn with_process_identity(
+    mut fact: Map<String, Value>,
+    identity: Option<ProcessIdentity>,
+) -> Map<String, Value> {
+    if let Some(identity) = identity {
+        fact.insert("pid".to_owned(), json!(identity.pid));
+        fact.insert(
+            "process_group_id".to_owned(),
+            json!(identity.process_group_id),
+        );
+        fact.insert("process_start_time".to_owned(), json!(identity.start_time));
+    }
+    fact
+}
+
+/// End a pass whose lease was lost before its harness started (#636). The
+/// renewal thread only sets a flag; without this the pass would go on to
+/// start its harness alongside the pass that now holds the lease. The row says
+/// `pass-lease-lost` at zero cost, since nothing ran.
+fn end_if_lease_lost(
+    request: &PassRequest,
+    guard: &mut PassGuard,
+    lease_name: &str,
+) -> Result<(), PassError> {
+    if !guard.renewal.as_ref().is_some_and(PassLeaseRenewal::lost) {
+        return Ok(());
+    }
+    guard.outcome = Some("failed".to_owned());
+    guard.reason = Some("pass-lease-lost".to_owned());
+    guard.cost_usd = Some(0.0);
+    // A lease that no longer names this pass is not its to release.
+    if read_lease(&request.paths.state.join(lease_name))
+        .ok()
+        .flatten()
+        .is_none_or(|lease| lease.owner != guard.owner)
+    {
+        guard.lease.disarm();
+    }
+    guard.finish()?;
+    Err(PassError::failed(
+        request.role,
+        "the pass lease was lost before the harness started; stopping",
+        1,
+    ))
+}
+
 fn refuse_empty_repository_scope(
     request: &PassRequest,
     events: &mut RunEventGuard,
@@ -1249,7 +1299,7 @@ fn run_pass_with_bridge_probe_timeout(
                 &TraceAppend {
                     ts: guard.trace_time.clone(),
                     kind: "pass-started".to_owned(),
-                    fact: with_run_id(fact, guard.events.run_id()),
+                    fact: with_process_identity(with_run_id(fact, guard.events.run_id()), identity),
                     narration: Map::new(),
                 },
             )
@@ -1288,7 +1338,7 @@ fn run_pass_with_bridge_probe_timeout(
         &TraceAppend {
             ts: guard.trace_time.clone(),
             kind: "pass-started".to_owned(),
-            fact: with_run_id(start_fact, guard.events.run_id()),
+            fact: with_process_identity(with_run_id(start_fact, guard.events.run_id()), identity),
             narration: Map::new(),
         },
     )
@@ -1300,6 +1350,9 @@ fn run_pass_with_bridge_probe_timeout(
         )
     })?;
     guard.started = true;
+    // Sweep preparation can wait minutes on the sweep lease, long enough for
+    // the pass lease to lapse and be taken over (#636).
+    end_if_lease_lost(request, &mut guard, &lease_name)?;
     if request.repositories.is_some()
         && request.role == PassRole::Gatekeeper
         && session.candidate_count == Some(0)
@@ -1530,6 +1583,7 @@ fn run_pass_with_bridge_probe_timeout(
     // another run must not pass that run's id on as its own.
     command.env(environment::OSTROM_RUN_ID.name, guard.events.run_id());
     set_process_group(&mut command);
+    end_if_lease_lost(request, &mut guard, &lease_name)?;
     let mut child = command.spawn().map_err(|error| {
         PassError::failed(request.role, format!("could not start Claude: {error}"), 1)
     })?;

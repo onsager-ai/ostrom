@@ -345,6 +345,40 @@ impl Home {
     }
 }
 
+impl Home {
+    /// A pass hold whose lease the next pass has taken over (#636): its
+    /// `pass-started` names `sleeper` as its process, and the lease now names
+    /// a later wake with no process of its own.
+    fn displaced_pass_hold(&self, sleeper: &Sleeper) {
+        let now = epoch_now();
+        let (process_group, start_time) = sleeper.identity();
+        self.append_trace(&json!({
+            "ts": timestamp(now - 30),
+            "kind": "pass-started",
+            "fact": {
+                "owner": PASS_OWNER,
+                "run_id": RUN,
+                "pid": sleeper.pid(),
+                "process_group_id": process_group,
+                "process_start_time": start_time,
+            },
+            "narration": {},
+        }));
+        fs::write(
+            self.path.join("builder-pass.lease"),
+            json!({
+                "owner": SUCCESSOR_OWNER,
+                "started_at": now - 5,
+                "expires_at": now + 120,
+            })
+            .to_string(),
+        )
+        .expect("hand the lease to the next pass");
+    }
+}
+
+const SUCCESSOR_OWNER: &str = "builder-a1b2c3d4-wake4";
+
 /// The `reaped=` count `ostrom up` prints.
 fn reaped(output: &Output) -> u64 {
     String::from_utf8_lossy(&output.stdout)
@@ -599,6 +633,56 @@ fn up_closes_a_pass_whose_process_is_gone_without_a_terminal_row() {
         }),
         "up stderr: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// #636: a pass the next pass took the lease from is judged by the process its
+/// `pass-started` recorded, not by whether a lease still names it. While that
+/// process runs the pass is displaced, not exited: `up` records and charges
+/// nothing, and leaves it to end itself. Once the process is gone the hold is
+/// closed with `exited-without-terminal`, and the new holder's lease is kept.
+#[test]
+fn a_displaced_pass_is_left_running_and_closed_only_once_its_process_is_gone() {
+    let home = Home::new();
+    let mut sleeper = Sleeper::start();
+    home.displaced_pass_hold(&sleeper);
+
+    let while_running = home.up();
+    let rows_while_running = home.terminal_rows("pass-ended", "owner", PASS_OWNER).len();
+    let left_running = sleeper.running();
+    sleeper.kill();
+    let once_gone = home.up();
+
+    let ended = home.terminal_rows("pass-ended", "owner", PASS_OWNER);
+    let row = ended.first().cloned().unwrap_or(Value::Null);
+    let lease = fs::read_to_string(home.path.join("builder-pass.lease"))
+        .ok()
+        .and_then(|lease| serde_json::from_str::<Value>(&lease).ok())
+        .unwrap_or(Value::Null);
+    assert_eq!(
+        json!({
+            "up_succeeded": [while_running.status.success(), once_gone.status.success()],
+            "reaped": [reaped(&while_running), reaped(&once_gone)],
+            "rows_while_running": rows_while_running,
+            "left_running": left_running,
+            "terminal_rows": ended.len(),
+            "reason": row["fact"]["reason"],
+            "recorded_by": row["fact"]["recorded_by"],
+            "lease_owner": lease["owner"],
+        }),
+        json!({
+            "up_succeeded": [true, true],
+            "reaped": [0, 1],
+            "rows_while_running": 0,
+            "left_running": true,
+            "terminal_rows": 1,
+            "reason": "exited-without-terminal",
+            "recorded_by": "reaper",
+            "lease_owner": SUCCESSOR_OWNER,
+        }),
+        "up stderr: {}{}",
+        String::from_utf8_lossy(&while_running.stderr),
+        String::from_utf8_lossy(&once_gone.stderr)
     );
 }
 
