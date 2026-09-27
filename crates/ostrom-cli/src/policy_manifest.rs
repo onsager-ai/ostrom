@@ -7,15 +7,11 @@ use std::{
     sync::Once,
 };
 
-use chrono::{DateTime, Utc};
 use ostrom_core::{
-    ActorDecl, CheckDefinition, LoopDecl, OperationDecl, PolicyManifest, PromptValue,
-    RepositoryName, RuleDecl, SelectorFinding, SelectorUniverse, StepDecl,
+    ActorDecl, CheckDefinition, LoopDecl, OperationDecl, PolicyManifest, PromptValue, RuleDecl,
+    SelectorFinding, SelectorUniverse, StepDecl,
 };
-use ostrom_store::{
-    ActorPortabilityFinding, OstromPaths, PolicyBundle, PolicyExplanation, PolicyOrigins,
-    SweepFixture, read_commit_checks,
-};
+use ostrom_store::{ActorPortabilityFinding, OstromPaths, PolicyBundle, PolicyOrigins};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use serde_yaml::{Mapping, Value};
@@ -208,62 +204,6 @@ pub(crate) fn run_sign(
     let signature = ostrom_store::sign_policy_manifest(&manifest, &path, key_id, private_key)?;
     println!("signed: {}", signature.display());
     Ok(())
-}
-
-pub(crate) fn run_generate(
-    paths: &OstromPaths,
-    repository: &str,
-    output: Option<&Path>,
-) -> Result<(), PolicyLoadError> {
-    let repository = RepositoryName::new(repository)
-        .map_err(|_| PolicyLoadError::InvalidRepository(repository.to_owned()))?;
-    let operator_path = adopting_manifest_path(paths)?;
-    let operator = load(&operator_path)?;
-    let generated = project_repository_manifest(operator, repository.as_str());
-    let yaml = generated
-        .to_yaml()
-        .map_err(|error| PolicyLoadError::Validation(error.to_string()))?;
-    if let Some(path) = output.filter(|path| *path != Path::new("-")) {
-        fs::write(path, yaml).map_err(|source| PolicyLoadError::Write {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    } else {
-        print!("{yaml}");
-    }
-    Ok(())
-}
-
-fn project_repository_manifest(mut manifest: PolicyManifest, repository: &str) -> PolicyManifest {
-    manifest.includes.clear();
-    manifest.actors.clear();
-    manifest.prompts.clear();
-    project_rules(&mut manifest.grants, repository);
-    project_rules(&mut manifest.denies, repository);
-    manifest.loops.retain(|_, declaration| {
-        declaration.repositories.is_empty()
-            || declaration
-                .repositories
-                .iter()
-                .any(|candidate| candidate == repository)
-    });
-    for declaration in manifest.loops.values_mut() {
-        declaration.repositories = vec![repository.to_owned()].into();
-    }
-    manifest
-}
-
-fn project_rules(rules: &mut BTreeMap<String, RuleDecl>, repository: &str) {
-    rules.retain(|_, declaration| {
-        declaration.repositories.is_empty()
-            || declaration
-                .repositories
-                .iter()
-                .any(|candidate| candidate == repository)
-    });
-    for declaration in rules.values_mut() {
-        declaration.repositories = Default::default();
-    }
 }
 
 pub(crate) fn load_bundle(
@@ -744,355 +684,6 @@ fn merge_fallback<T>(target: &mut BTreeMap<String, T>, fallback: BTreeMap<String
     }
 }
 
-pub(crate) struct ExplainOptions<'a> {
-    pub paths: &'a OstromPaths,
-    pub working_directory: &'a Path,
-    pub target: &'a str,
-    pub manifest: Option<&'a Path>,
-    pub fixture: Option<&'a Path>,
-    pub observed_at: DateTime<Utc>,
-    pub actor: &'a str,
-    pub operation: &'a str,
-}
-
-pub(crate) fn run_explain(options: &ExplainOptions<'_>) -> Result<String, PolicyLoadError> {
-    let discovered = options.manifest.is_none();
-    let manifest_path = if let Some(manifest) = options.manifest {
-        manifest.to_path_buf()
-    } else {
-        default_manifest_path(options.paths, options.working_directory)?.ok_or_else(|| {
-            PolicyLoadError::UngovernedRepository(repository_name(options.working_directory))
-        })?
-    };
-    let target = ExplainTarget::parse(options.target)?;
-    let pull_request = if let Some(fixture) = options.fixture {
-        fixture_pull_request(fixture, &target)?
-    } else {
-        acquire_pull_request(&target, options.working_directory)?
-    };
-    let bundle = if discovered {
-        pull_request
-            .get("baseRefOid")
-            .and_then(JsonValue::as_str)
-            .filter(|sha| !sha.is_empty())
-            .map_or_else(
-                || load_bundle(options.paths, &manifest_path),
-                |base_sha| {
-                    load_bundle_at_base(
-                        options.paths,
-                        &manifest_path,
-                        options.working_directory,
-                        base_sha,
-                    )
-                },
-            )?
-    } else {
-        load_bundle(options.paths, &manifest_path)?
-    };
-    let explanation = bundle.explain_pull_request(
-        &target.repository,
-        &pull_request,
-        options.actor,
-        options.operation,
-    );
-    let first_held = read_first_held(options.paths, &target.full);
-    Ok(render_explanation(
-        &target,
-        &explanation,
-        first_held,
-        options.observed_at,
-    ))
-}
-
-struct ExplainTarget {
-    repository: String,
-    number: u64,
-    full: String,
-}
-
-impl ExplainTarget {
-    fn parse(value: &str) -> Result<Self, PolicyLoadError> {
-        let Some((repository, number)) = value.rsplit_once('#') else {
-            return Err(PolicyLoadError::InvalidTarget);
-        };
-        let mut parts = repository.split('/');
-        if !matches!(
-            (parts.next(), parts.next(), parts.next()),
-            (Some(owner), Some(repo), None) if !owner.is_empty() && !repo.is_empty()
-        ) || number.starts_with('0')
-        {
-            return Err(PolicyLoadError::InvalidTarget);
-        }
-        let number = number
-            .parse::<u64>()
-            .ok()
-            .filter(|number| *number > 0)
-            .ok_or(PolicyLoadError::InvalidTarget)?;
-        Ok(Self {
-            repository: repository.to_owned(),
-            number,
-            full: value.to_owned(),
-        })
-    }
-}
-
-fn fixture_pull_request(path: &Path, target: &ExplainTarget) -> Result<JsonValue, PolicyLoadError> {
-    let source = fs::read(path).map_err(|source| PolicyLoadError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let fixture = serde_json::from_slice::<SweepFixture>(&source).map_err(|source| {
-        PolicyLoadError::Fixture {
-            path: path.to_path_buf(),
-            source,
-        }
-    })?;
-    fixture
-        .repositories
-        .into_iter()
-        .find(|snapshot| snapshot.repo.as_str() == target.repository)
-        .and_then(|snapshot| {
-            snapshot.open_prs.into_iter().find(|pull_request| {
-                pull_request.get("number").and_then(JsonValue::as_u64) == Some(target.number)
-            })
-        })
-        .ok_or_else(|| PolicyLoadError::PullRequestNotFound(target.full.clone()))
-}
-
-fn acquire_pull_request(
-    target: &ExplainTarget,
-    working_directory: &Path,
-) -> Result<JsonValue, PolicyLoadError> {
-    let output = Command::new("gh")
-        .current_dir(working_directory)
-        .args([
-            "pr",
-            "view",
-            &target.number.to_string(),
-            "--repo",
-            &target.repository,
-            "--json",
-            "number,title,labels,files,state,baseRefOid,headRefOid",
-        ])
-        .output()
-        .map_err(PolicyLoadError::GitHub)?;
-    if !output.status.success() {
-        return Err(PolicyLoadError::GitHubResponse(
-            String::from_utf8_lossy(&output.stderr)
-                .trim()
-                .chars()
-                .take(500)
-                .collect(),
-        ));
-    }
-    let mut pull_request: JsonValue =
-        serde_json::from_slice(&output.stdout).map_err(|source| PolicyLoadError::Fixture {
-            path: PathBuf::from("gh pr view"),
-            source,
-        })?;
-    let head_sha = pull_request
-        .get("headRefOid")
-        .and_then(JsonValue::as_str)
-        .filter(|sha| !sha.is_empty())
-        .ok_or_else(|| {
-            PolicyLoadError::GitHubResponse("pull request response had no head SHA".to_owned())
-        })?;
-    let checks = read_commit_checks(&target.repository, head_sha, |endpoint| {
-        let output = Command::new("gh")
-            .current_dir(working_directory)
-            .args(["api", endpoint])
-            .output()
-            .map_err(|error| error.to_string())?;
-        if output.status.success() {
-            Ok(output.stdout)
-        } else {
-            let error = String::from_utf8_lossy(&output.stderr)
-                .trim()
-                .chars()
-                .take(500)
-                .collect::<String>();
-            Err(if error.is_empty() {
-                "gh api failed without error detail".to_owned()
-            } else {
-                error
-            })
-        }
-    })
-    .map_err(|error| PolicyLoadError::GitHubResponse(error.to_string()))?;
-    if let Some(error) = checks.statuses_error {
-        eprintln!("ostrom explain: partial check read: {error}");
-    }
-    pull_request
-        .as_object_mut()
-        .ok_or_else(|| {
-            PolicyLoadError::GitHubResponse("pull request response was not an object".to_owned())
-        })?
-        .insert("checks".to_owned(), JsonValue::Array(checks.checks));
-    Ok(pull_request)
-}
-
-fn read_first_held(paths: &OstromPaths, id: &str) -> Option<DateTime<Utc>> {
-    let state = fs::read(paths.sweep_state_file()).ok()?;
-    let state = serde_json::from_slice::<JsonValue>(&state).ok()?;
-    let timestamp = state
-        .pointer(&format!("/policy_holds/{}", escape_pointer(id)))?
-        .get("first_held")?
-        .as_str()?;
-    DateTime::parse_from_rfc3339(timestamp)
-        .ok()
-        .map(|time| time.with_timezone(&Utc))
-}
-
-fn escape_pointer(value: &str) -> String {
-    value.replace('~', "~0").replace('/', "~1")
-}
-
-fn render_explanation(
-    target: &ExplainTarget,
-    explanation: &PolicyExplanation,
-    first_held: Option<DateTime<Utc>>,
-    observed_at: DateTime<Utc>,
-) -> String {
-    let mut output = format!("{}\n\nSCOPES CONSULTED\n", target.full);
-    for scope in &explanation.consulted_scopes {
-        output.push_str(&format!(
-            "  {:10} {}\n",
-            scope.layer.name(),
-            scope.path.display()
-        ));
-    }
-    output.push_str("\nSUBJECT RULES\n");
-    for rule in &explanation.rules {
-        let selectors = rule
-            .selectors
-            .iter()
-            .filter(|selector| selector.projection == "subject")
-            .map(|selector| selector.selector.as_str())
-            .collect::<Vec<_>>();
-        let predicate = if selectors.is_empty() {
-            "*".to_owned()
-        } else {
-            selectors.join(", ")
-        };
-        output.push_str(&format!(
-            "  {:10} {:5} {:24} {:38} {}{}  source: {}\n",
-            rule.layer.name(),
-            rule.kind,
-            rule.id,
-            predicate,
-            match_word(rule.subject_matched),
-            if rule.subject_matched {
-                String::new()
-            } else {
-                format!("  unmatched: {}", unmatched_name(rule.unmatched))
-            },
-            rule.source.display()
-        ));
-    }
-    output.push_str(&format!(
-        "\nACTOR RULES ({} / {})\n",
-        explanation.actor, explanation.operation
-    ));
-    for rule in &explanation.rules {
-        output.push_str(&format!(
-            "  {:10} {:5} {:24} {:38} {}  source: {}\n",
-            rule.layer.name(),
-            rule.kind,
-            rule.id,
-            format!(
-                "actor={} operation={}",
-                explanation.actor, explanation.operation
-            ),
-            match_word(rule.actor_matched),
-            rule.source.display()
-        ));
-    }
-    if !explanation.inert_declarations.is_empty() {
-        output.push_str("\nEXECUTABLE DECLARATIONS\n");
-        for declaration in &explanation.inert_declarations {
-            output.push_str(&format!(
-                "  {:10} {:9} {:24} DECLARED BUT NOT ADOPTED  source: {}\n",
-                declaration.layer.name(),
-                declaration.kind,
-                declaration.id,
-                declaration.source.display()
-            ));
-        }
-    }
-    if !explanation.actor_portability_findings.is_empty() {
-        output.push_str("\nACTOR PORTABILITY\n");
-        for finding in &explanation.actor_portability_findings {
-            output.push_str(&format!(
-                "  {:10} actor     {:24} NON-PORTABLE  source: {}\n",
-                finding.layer.name(),
-                finding.actor,
-                finding.source.display()
-            ));
-        }
-    }
-    output.push_str("\nAGGREGATE\n");
-    output.push_str(&format!(
-        "  decide       {:12} {}\n",
-        if explanation.granted {
-            explanation.actor.as_str()
-        } else {
-            "principal"
-        },
-        explanation.decision_source
-    ));
-    if explanation.floor {
-        output
-            .push_str("               no rule granted this pull request; principal is the floor\n");
-    }
-    for rule in explanation.rules.iter().filter(|rule| rule.matched) {
-        if let Some(requirement) = &rule.requirement {
-            output.push_str(&format!(
-                "  requires     {:12} {:12} {} (rule {})\n",
-                requirement.check, requirement.status, requirement.source, rule.id
-            ));
-        }
-    }
-    if !explanation.granted {
-        let held_seconds = first_held.map_or(0, |first| {
-            observed_at
-                .signed_duration_since(first)
-                .num_seconds()
-                .max(0) as u64
-        });
-        let held_days = held_seconds / 86_400;
-        let stalled = held_seconds >= explanation.stalls_after.as_seconds();
-        output.push_str(&format!(
-            "  held         {held_days}d of {}{}\n",
-            explanation.stalls_after,
-            if stalled { "  STALLED" } else { "" }
-        ));
-        output.push_str(&format!(
-            "  stalls_after {:12} {}\n",
-            explanation.stalls_after, explanation.stalls_source
-        ));
-        if first_held.is_none() {
-            output.push_str("               first-held time has not yet been recorded by sweep\n");
-        }
-    }
-    output.push_str(&format!(
-        "  verdict      {}\n",
-        if explanation.granted { "MERGE" } else { "HOLD" }
-    ));
-    output
-}
-
-fn match_word(matched: bool) -> &'static str {
-    if matched { "MATCH" } else { "no match" }
-}
-
-fn unmatched_name(policy: ostrom_core::UnmatchedPolicy) -> &'static str {
-    match policy {
-        ostrom_core::UnmatchedPolicy::Block => "block",
-        ostrom_core::UnmatchedPolicy::Warn => "warn",
-        ostrom_core::UnmatchedPolicy::Pass => "pass",
-    }
-}
-
 fn format_finding(finding: &SelectorFinding) -> String {
     match finding {
         SelectorFinding::Error {
@@ -1126,7 +717,6 @@ fn command_verbs() -> impl Iterator<Item = &'static str> {
         "credential",
         "dispatch",
         "doctor",
-        "explain",
         "excuse",
         "gate",
         "hook",
@@ -1749,36 +1339,14 @@ pub(crate) enum PolicyLoadError {
         version: u32,
         expected: u32,
     },
-    #[error("pull request must have the shape owner/repository#N")]
-    InvalidTarget,
-    #[error("repository must have the shape owner/name: {0}")]
-    InvalidRepository(String),
-    #[error("pull request `{0}` was not present in the fixture")]
-    PullRequestNotFound(String),
-    #[error("could not run gh: {0}")]
-    GitHub(io::Error),
-    #[error("gh could not read the pull request: {0}")]
-    GitHubResponse(String),
     #[error("could not create a policy snapshot: {0}")]
     Snapshot(io::Error),
     #[error("could not run the policy snapshot command: {0}")]
     GitSnapshot(io::Error),
     #[error("could not read policy from the pull request base: {0}")]
     GitSnapshotResponse(String),
-    #[error("could not parse pull-request fixture `{}`: {source}", path.display())]
-    Fixture {
-        path: PathBuf,
-        #[source]
-        source: serde_json::Error,
-    },
     #[error("could not read `{}`: {source}", path.display())]
     Io {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    #[error("could not write generated policy manifest `{}`: {source}", path.display())]
-    Write {
         path: PathBuf,
         #[source]
         source: io::Error,
@@ -1832,12 +1400,11 @@ pub(crate) enum PolicyLoadError {
 mod tests {
     use std::{env, fs, path::Path, process::Command};
 
-    use ostrom_core::{PolicyCandidate, PolicyManifest};
+    use ostrom_core::PolicyManifest;
     use tempfile::tempdir;
 
     use super::{
-        PolicyLoadError, compose_scopes, default_manifest_path, load_composed,
-        project_repository_manifest, script_invokes_ostrom_sweep, validate_scoped_manifest,
+        PolicyLoadError, default_manifest_path, load_composed, script_invokes_ostrom_sweep,
     };
 
     /// The sweep lint must fire however the script spells the binary. Matching
@@ -1897,7 +1464,7 @@ mod tests {
             ));
         }
     }
-    use ostrom_store::{OstromPaths, PolicyBundle, PolicyOrigins};
+    use ostrom_store::OstromPaths;
 
     const LEGACY_NOTICE_CHILD: &str = "OSTROM_TEST_LEGACY_NOTICE_CHILD";
 
@@ -2050,119 +1617,5 @@ mod tests {
         let stderr = String::from_utf8(output.stderr).expect("UTF-8 warning");
         assert_eq!(stderr.matches("deprecated").count(), 1, "{stderr}");
         assert!(stderr.contains("ostrom.yaml"), "{stderr}");
-    }
-
-    #[test]
-    fn generated_repository_policy_round_trips_is_portable_and_preserves_verdicts() {
-        let operator = PolicyManifest::from_yaml(
-            r#"
-manifest_version: 1
-actors: {builder: {}}
-checks:
-  placeholder-green:
-    uses: gh/check-run
-    with: {name: placeholder-ci}
-operations: {work: {steps: []}}
-grants:
-  target-grant:
-    actors: builder
-    operations: work
-    repositories: placeholder-org/target
-    where: label:delegated
-  global-grant:
-    actors: builder
-    operations: work
-    where: type:docs
-  other-grant:
-    actors: builder
-    operations: work
-    repositories: placeholder-org/other
-denies:
-  target-deny:
-    actors: builder
-    operations: work
-    repositories: placeholder-org/target
-    where: path:protected/**
-loops:
-  unscoped-loop: {actor: builder, operation: work, every: hourly}
-  target-loop: {actor: builder, operation: work, repositories: placeholder-org/target, every: hourly}
-  other-loop: {actor: builder, operation: work, repositories: placeholder-org/other, every: hourly}
-"#,
-        )
-        .expect("operator policy");
-        let generated = project_repository_manifest(operator.clone(), "placeholder-org/target");
-        let yaml = generated.to_yaml().expect("generated YAML");
-        let round_tripped = PolicyManifest::parse_yaml(&yaml).expect("generated manifest loads");
-
-        assert!(round_tripped.actors.is_empty());
-        assert!(!yaml.lines().any(|line| line == "actors:"), "{yaml}");
-        assert!(round_tripped.grants.contains_key("target-grant"));
-        assert!(round_tripped.grants.contains_key("global-grant"));
-        assert!(!round_tripped.grants.contains_key("other-grant"));
-        assert!(round_tripped.denies.contains_key("target-deny"));
-        assert!(
-            round_tripped
-                .grants
-                .values()
-                .chain(round_tripped.denies.values())
-                .all(|rule| rule.repositories.is_empty())
-        );
-        assert!(round_tripped.checks.contains_key("placeholder-green"));
-        assert!(round_tripped.operations.contains_key("work"));
-        assert!(round_tripped.loops.contains_key("unscoped-loop"));
-        assert!(round_tripped.loops.contains_key("target-loop"));
-        assert!(!round_tripped.loops.contains_key("other-loop"));
-        assert!(round_tripped.loops.values().all(|declaration| {
-            declaration
-                .repositories
-                .iter()
-                .eq(["placeholder-org/target"])
-        }));
-        validate_scoped_manifest(&round_tripped, Some(&operator))
-            .expect("generated repository layer loads with operator policy");
-
-        let repository_origins =
-            PolicyOrigins::from_root(&round_tripped, Path::new("generated/ostrom.yaml"));
-        let generated_only = PolicyBundle::repository_with_origins(
-            round_tripped.clone(),
-            repository_origins.clone(),
-        );
-        assert!(generated_only.actor_portability_findings().is_empty());
-
-        let operator_origins =
-            PolicyOrigins::from_root(&operator, Path::new("operator/ostrom.yaml"));
-        let operator_bundle = PolicyBundle::operator(operator.clone(), operator_origins.clone());
-        let resolved = compose_scopes(round_tripped.clone(), Some(&operator));
-        let layered_bundle = PolicyBundle::scoped(
-            resolved,
-            round_tripped,
-            repository_origins,
-            Some((operator, operator_origins)),
-        );
-        let cases = [
-            PolicyCandidate {
-                repository: "placeholder-org/target".to_owned(),
-                labels: vec!["delegated".to_owned()],
-                ..PolicyCandidate::default()
-            },
-            PolicyCandidate {
-                repository: "placeholder-org/target".to_owned(),
-                paths: vec!["protected/authority.txt".to_owned()],
-                labels: vec!["delegated".to_owned()],
-                ..PolicyCandidate::default()
-            },
-        ];
-        assert!(operator_bundle.decide("builder", "work", &cases[0]).granted);
-        assert!(!operator_bundle.decide("builder", "work", &cases[1]).granted);
-        for candidate in &cases {
-            assert_eq!(
-                generated_only.decide("builder", "work", candidate).granted,
-                operator_bundle.decide("builder", "work", candidate).granted
-            );
-            assert_eq!(
-                layered_bundle.decide("builder", "work", candidate).granted,
-                operator_bundle.decide("builder", "work", candidate).granted
-            );
-        }
     }
 }
