@@ -1092,10 +1092,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         repositories.as_deref(),
                     ) {
                         Ok(result) => result,
-                        Err(error @ SweepError::BranchListingTruncated(_)) => {
-                            eprintln!("{error}");
-                            std::process::exit(6);
-                        }
                         Err(error) => return Err(error.into()),
                     };
                 io::stdout().write_all(&encode_org_snapshots_with_faults(snapshots, faults)?)?;
