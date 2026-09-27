@@ -27,17 +27,16 @@ use ostrom_core::{
     ResolvedLoopCeilings, SelectorPrefix, agent_run_parameters,
 };
 use ostrom_store::{
-    AgentRegistry, AssessmentHarness, AuditOptions, Clock, CodexHarness, DigestOptions,
-    DispatchOutcome, DispatchRequest, ExecutableAssessmentDeriver, GateError, GateOptions,
-    HarnessAssessmentDeriver, ImplementRequest, JsonlCheckStore, JsonlPublicationSource,
-    OrchestratorRunRequest, OstromPaths, PASS_KILL_GRACE_MS, PassRequest, PassRole,
-    PassSweepRequest, PlanOptions, PolicyBundle, PolicyOrigins, PublishDestination, PublishTarget,
-    QueueDecision, ReapWorktreesOptions, ReplayOptions, RunOutcome, RunRequest,
-    SWEEP_LEASE_CONTENTION_EXIT_CODE, SelectAction, SelectError, SelectOutcome, SelectRequest,
-    SignalFlags, SweepError, SweepMode, SweepOptions, SweepOutcome, TraceAppend, TraceView,
-    UnavailableAssessmentDeriver, acquire_lease, answer_queue_decision, append_trace,
-    append_trace_checked, audit, available_repositories, branch_name, clear_work_order,
-    create_work_order, credential_output, decide_queue_item, discover_goals_path,
+    AgentRegistry, AssessmentHarness, Clock, CodexHarness, DigestOptions, DispatchOutcome,
+    DispatchRequest, ExecutableAssessmentDeriver, GateError, GateOptions, HarnessAssessmentDeriver,
+    ImplementRequest, JsonlCheckStore, JsonlPublicationSource, OrchestratorRunRequest, OstromPaths,
+    PASS_KILL_GRACE_MS, PassRequest, PassRole, PassSweepRequest, PlanOptions, PolicyBundle,
+    PolicyOrigins, PublishDestination, PublishTarget, QueueDecision, ReapWorktreesOptions,
+    ReplayOptions, RunOutcome, RunRequest, SWEEP_LEASE_CONTENTION_EXIT_CODE, SelectAction,
+    SelectError, SelectOutcome, SelectRequest, SignalFlags, SweepError, SweepMode, SweepOptions,
+    SweepOutcome, TraceAppend, TraceView, UnavailableAssessmentDeriver, acquire_lease,
+    answer_queue_decision, append_trace, append_trace_checked, available_repositories, branch_name,
+    clear_work_order, create_work_order, credential_output, decide_queue_item, discover_goals_path,
     effective_repositories, encode_org_snapshots_with_faults, encode_selection, environment,
     finalize_exited_implementer, generated_run_id, grant_excuse, grant_excuse_at_head,
     inherited_repository_scope, item_hash, lease_status, lint_queue_state, list_excuses,
@@ -365,12 +364,6 @@ enum Command {
         /// One clock shared by the sweep and goal evaluation.
         #[arg(long, hide = true)]
         started_at: Option<String>,
-    },
-    /// Audit merged pull requests against verdicts recorded at their merged SHA.
-    Audit {
-        /// Number of days in the merged-at window.
-        #[arg(long, default_value_t = 30)]
-        days: u64,
     },
     /// Explain selector outcomes against merged pull requests and recorded state.
     Replay {
@@ -1234,21 +1227,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 plan.faults.len(),
                 paths.state.join("plan.json").display()
             );
-        }
-        Command::Audit { days } => {
-            let working_directory = env::current_dir()?;
-            match audit(&AuditOptions {
-                paths,
-                working_directory,
-                days,
-                audit_time: clock.now(),
-            }) {
-                Ok(output) => io::stdout().write_all(output.as_bytes())?,
-                Err(error) => {
-                    eprintln!("{error}");
-                    std::process::exit(error.exit_code());
-                }
-            }
         }
         Command::Replay { days } => {
             let working_directory = env::current_dir()?;

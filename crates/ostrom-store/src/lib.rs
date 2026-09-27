@@ -65,8 +65,8 @@ pub use lease::{
     release_lease, validate_lease_name, write_lease,
 };
 pub use leaves::{
-    AuditError, AuditOptions, ExcuseError, LocalDriftError, audit, grant_excuse,
-    grant_excuse_at_head, list_excuses, local_drift, revoke_excuse,
+    ExcuseError, LocalDriftError, grant_excuse, grant_excuse_at_head, list_excuses, local_drift,
+    revoke_excuse,
 };
 pub use pass::{
     MAX_TURNS as PASS_MAX_TURNS, PASS_KILL_GRACE_MS, PassError, PassRequest, PassRole,
