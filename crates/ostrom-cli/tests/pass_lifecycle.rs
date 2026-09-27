@@ -744,7 +744,7 @@ fn without_a_control_descriptor_stdin_is_ignored_and_existing_bytes_are_preserve
     );
     assert_eq!(normalize_pass_trace(&fs::read(fixture.state.join("sprint.jsonl")).unwrap()),
         concat!(
-            "{\"ts\":\"2026-08-01T00:00:00Z\",\"kind\":\"pass-started\",\"fact\":{\"owner\":\"builder-a1b2c3d4-wake7\",\"sweep\":\"reused\",\"generation_id\":\"pass-lifecycle-fresh-generation\",\"run_id\":\"<pass-run-id>\"},\"narration\":{}}\n",
+            "{\"ts\":\"2026-08-01T00:00:00Z\",\"kind\":\"pass-started\",\"fact\":{\"owner\":\"builder-a1b2c3d4-wake7\",\"sweep\":\"reused\",\"generation_id\":\"pass-lifecycle-fresh-generation\",\"run_id\":\"<pass-run-id>\",\"pid\":\"<pass-pid>\",\"process_group_id\":\"<pass-process_group_id>\",\"process_start_time\":\"<pass-process_start_time>\"},\"narration\":{}}\n",
             "{\"ts\":\"2026-08-01T00:00:00Z\",\"kind\":\"pass-ended\",\"fact\":{\"owner\":\"builder-a1b2c3d4-wake7\",\"outcome\":\"no-op\",\"cost_usd\":1.25,\"duration_seconds\":0,\"reason\":\"blocked\"},\"narration\":{}}\n"
         ).as_bytes());
     let events = fixture.run_events();
@@ -1956,6 +1956,15 @@ fn a_lease_taken_over_while_the_pass_runs_is_not_recorded_as_exited() {
         .expect("the pass recorded its start");
     let owner = started["fact"]["owner"].clone();
     let lease = fixture.state.join("builder-pass.lease");
+    // What `pass-started` recorded is the process the lease named before the
+    // takeover: the pass worker, not the supervisor this test started.
+    let identity = |record: &Value| {
+        ["pid", "process_group_id", "process_start_time"].map(|key| record[key].clone())
+    };
+    let lease_identity = fs::read_to_string(&lease)
+        .ok()
+        .and_then(|lease| serde_json::from_str::<Value>(&lease).ok())
+        .map(|lease| identity(&lease));
     take_over_lease(&lease, "builder-successor-wake99");
 
     let up = Command::new(env!("CARGO_BIN_EXE_ostrom"))
@@ -1988,7 +1997,8 @@ fn a_lease_taken_over_while_the_pass_runs_is_not_recorded_as_exited() {
     let row = ended.first().cloned().unwrap_or(Value::Null);
     assert_eq!(
         json!({
-            "recorded_its_process": started["fact"]["pid"] == json!(child.id()),
+            "recorded_its_process": lease_identity.as_ref() == Some(&identity(&started["fact"]))
+                && started["fact"]["pid"].is_u64(),
             "up_succeeded": up.status.success(),
             "up_reaped_nothing": String::from_utf8_lossy(&up.stdout).contains("reaped=0"),
             "ran_through_up": ran_through_up,
