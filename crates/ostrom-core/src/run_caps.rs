@@ -49,7 +49,7 @@ pub const IMPLEMENTER_UNIT_RUNTIME_MARGIN_SECONDS: u64 = 120;
 /// and its watchdog, and once the wall cap trips the pass still needs its
 /// termination grace to stop its harness and write its own `pass-ended`. Five
 /// seconds left systemd's `SIGTERM` racing that row.
-pub const LOOP_UNIT_TIMEOUT_MARGIN_SECONDS: u64 = 120;
+pub const LOOP_UNIT_TIMEOUT_MARGIN_SECONDS: u64 = 5; // MUTATION A
 
 /// The cost ceiling of one run, in US dollars, when nothing declares one: the
 /// default a work order is created with, and what the stall reaper charges a
