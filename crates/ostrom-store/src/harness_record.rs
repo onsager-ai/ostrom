@@ -21,14 +21,22 @@
 //!
 //! The file is named by the supervisor's pid and start time, which the worker
 //! is given and the supervisor knows, so neither has to tell the other where
-//! it is; the reaper finds it by run id. The worker removes it once its
+//! it is; a worker run with no supervisor names it by its own. The reaper
+//! finds it by run id, so either way the reaper can reach the harness. The
+//! file is private (0600), as claims and leases are.
+//!
+//! The record is written just after the harness is spawned, so a worker
+//! killed in the moment between the two leaves its harness unrecorded.
+//! Closing that window would need code between fork and exec, which is
+//! `unsafe` and forbidden here. The worker removes it once its
 //! harness has exited; the supervisor or the reaper removes it once it has
 //! confirmed the harness gone.
 //!
 //! Everything under `<state>/harness/` is private state that only ostrom reads.
 
 use std::{
-    fs, io,
+    fs,
+    io::{self, Write as _},
     path::{Path, PathBuf},
 };
 
@@ -48,7 +56,8 @@ fn directory(state: &Path) -> PathBuf {
     state.join("harness")
 }
 
-/// Where the worker under supervisor `supervisor_pid` records its harness.
+/// Where the worker under supervisor `supervisor_pid` records its harness
+/// (a worker with no supervisor passes its own pid).
 /// The supervisor's start time is part of the name, so a recycled supervisor
 /// pid never shares a file with an earlier run. `None` when that start time
 /// cannot be read, and then nothing is recorded.
@@ -80,7 +89,12 @@ pub(crate) fn record(path: &Path, run_id: &str, pid: u32) -> io::Result<()> {
         "process_start_time": identity.start_time,
     });
     let temporary = path.with_extension("json.tmp");
-    fs::write(&temporary, format!("{body}\n"))?;
+    // Private before anything is written to it.
+    let mut file = fs::File::create(&temporary)?;
+    crate::set_private_file_mode(&temporary)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    file.write_all(format!("{body}\n").as_bytes())?;
+    drop(file);
     fs::rename(&temporary, path)
 }
 
@@ -151,7 +165,11 @@ pub(crate) fn remove(path: &Path) {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::process::{Command, Stdio};
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt as _,
+        process::{Command, Stdio},
+    };
 
     use tempfile::tempdir;
 
@@ -159,6 +177,7 @@ mod tests {
 
     /// The worker and the supervisor name the same file from the supervisor's
     /// pid, and the reaper finds it by run id with the identity `/proc` gave.
+    /// The file is private, as claims and leases are.
     #[test]
     fn a_recorded_harness_is_found_by_its_run_with_its_identity() {
         let state = tempdir().expect("state root");
@@ -175,14 +194,20 @@ mod tests {
         let _ = child.wait();
         recorded.expect("record the harness");
         let (found_path, harness) = found.expect("the record is found by its run");
+        let mode = fs::metadata(&path)
+            .expect("the record exists")
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(
             (
                 found_path == path,
                 harness.pid,
                 read(&path).map(|(run_id, _)| run_id),
                 other,
+                mode,
             ),
-            (true, child.id(), Some("run-a".to_owned()), None)
+            (true, child.id(), Some("run-a".to_owned()), None, 0o600)
         );
     }
 }

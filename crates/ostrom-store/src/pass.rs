@@ -1612,9 +1612,10 @@ fn run_pass_with_bridge_probe_timeout(
     // Claude leads its own process group, which no signal to this pass's
     // process reaches. Recorded as soon as it is spawned, it can still be
     // stopped if this worker is killed before it stops Claude itself (#633).
-    let harness = request
-        .supervisor_pid
-        .and_then(|pid| harness_record::record_path(&request.paths.state, pid));
+    let harness = harness_record::record_path(
+        &request.paths.state,
+        request.supervisor_pid.unwrap_or_else(std::process::id),
+    );
     if let Some(path) = &harness {
         harness_record::record_or_warn(path, guard.events.run_id(), child.id());
     }
