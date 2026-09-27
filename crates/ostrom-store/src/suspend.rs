@@ -113,10 +113,6 @@ fn monotonic(instant: Instant) -> Result<Duration, String> {
 }
 
 fn parse_instant(rendered: &str) -> Option<Duration> {
-    // MUTATION B: the rendering is never recognised.
-    if !rendered.is_empty() {
-        return None;
-    }
     let body = rendered
         .strip_prefix("Instant {")?
         .strip_suffix('}')?
@@ -229,11 +225,6 @@ impl SuspendTimeline {
 
     /// The wall-clock seconds from `since` to now, net of suspended time.
     pub(crate) fn awake_since(&self, since: u64) -> u64 {
-        // MUTATION B: every gap counts as suspended.
-        let _ignored = self.suspended_since(since);
-        if since < u64::MAX {
-            return 0;
-        }
         self.now
             .saturating_sub(since)
             .saturating_sub(self.suspended_since(since))
