@@ -346,8 +346,10 @@ fn run_implement_with_registry_and_minter(
         false,
         request.clock.clone(),
         RunEventStart {
-            // MUTATION (principle 7, #618): the recorded --run-id is ignored again.
-            run_id: generated_run_id(&request.unit_name, &request.clock),
+            run_id: request
+                .run_id
+                .clone()
+                .unwrap_or_else(|| generated_run_id(&request.unit_name, &request.clock)),
             kind: RunKind::Handoff,
             actor: "builder".to_owned(),
             harness: runner.as_ref().map_or_else(

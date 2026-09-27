@@ -599,12 +599,18 @@ fn after_lease(
     // the harness child inherits it from there, so this is how the Codex
     // process learns which run and which order it serves. The names are an
     // observer contract (docs/loops.md).
-    // MUTATION (principle 7, #618): OSTROM_RUN_ID / OSTROM_WORK_ORDER_ID are no longer added.
+    let runner_launch = runner_launch
+        .clone()
+        .with_environment(environment::OSTROM_RUN_ID.name, &context.run_id)
+        .with_environment(
+            environment::OSTROM_WORK_ORDER_ID.name,
+            &context.order.order_id,
+        );
     match context.backend.as_str() {
         "systemd" => launch_systemd(
             context,
             runner_name,
-            runner_launch,
+            &runner_launch,
             resolved_ostrom,
             &state_environment,
             &lease_name,
@@ -615,7 +621,7 @@ fn after_lease(
         "process" => launch_process(
             context,
             runner_name,
-            runner_launch,
+            &runner_launch,
             resolved_ostrom,
             &lease_name,
             daily_cap,
