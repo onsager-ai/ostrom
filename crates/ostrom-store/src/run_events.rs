@@ -496,8 +496,12 @@ impl Sink for RunEventSink {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn open_fd(fd: u32, options: &OpenOptions) -> std::io::Result<File> {
-    options.open(format!("/proc/self/fd/{fd}"))
+pub(crate) fn open_fd(_fd: u32, options: &OpenOptions) -> std::io::Result<File> {
+    // TEMPORARY, for #611 principle-7 evidence only: ignore the requested
+    // descriptor and always succeed against /dev/null, so the guard this PR's
+    // tests check is disabled. This commit is expected to fail CI and will be
+    // reverted before the PR is ready.
+    options.open("/dev/null")
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
