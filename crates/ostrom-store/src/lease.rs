@@ -413,7 +413,8 @@ fn lease_is_live(
     match expiry_policy {
         LeaseExpiryPolicy::ProcessLifetime => lease.is_live_at(now, proc_root),
         // MUTATION A: suspended time is ignored.
-        LeaseExpiryPolicy::Renewable(_) => {
+        LeaseExpiryPolicy::Renewable(suspended_since) => {
+            let _ignored = suspended_since(lease.started_at);
             lease.expires_at > now
                 && lease.process_identity().is_none_or(|(pid, _, start_time)| {
                     process_identity_is_live_at(proc_root, pid, start_time)
