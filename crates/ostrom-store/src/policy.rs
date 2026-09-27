@@ -361,7 +361,7 @@ impl PolicyBundle {
                     .as_ref()
                     .is_none_or(|requirement| requirement.allows)
         });
-        let granted = !effective_grants.is_empty() && matching_denies.is_empty();
+        let granted = !effective_grants.is_empty();
         let floor = matching_grants.is_empty() && matching_denies.is_empty();
 
         let deciding_rule = if granted {
