@@ -772,6 +772,21 @@ fn ps_json_lists_an_open_dispatch_until_its_terminal_row() {
     assert_eq!(open[0]["started_at"], dispatched["ts"]);
     assert_eq!(open[0]["lease"], "live");
 
+    // The lease column follows the lease itself: one past its expiry reads
+    // `expired` while the hold stays open.
+    let lease_file = fixture
+        .state
+        .join(format!("implementer-item-{}.lease", fixture.item_hash));
+    let mut lease: Value =
+        serde_json::from_slice(&fs::read(&lease_file).expect("read dispatch lease"))
+            .expect("dispatch lease JSON");
+    lease["started_at"] = json!(1);
+    lease["expires_at"] = json!(1);
+    fs::write(&lease_file, lease.to_string()).expect("expire dispatch lease");
+    let expired = ps_json(&fixture.state);
+    assert_eq!(expired.len(), 1, "{expired:?}");
+    assert_eq!(expired[0]["lease"], "expired");
+
     let completed = json!({
         "ts": dispatched["ts"],
         "kind": "work-completed",

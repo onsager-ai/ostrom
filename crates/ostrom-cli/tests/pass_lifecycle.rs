@@ -1349,7 +1349,8 @@ fn error_exit_releases_and_finalizes() {
 /// `ostrom ps --json` reports while the pass is open -- and each is compared
 /// with the record rather than pinned. The harness runs `ps` itself, so the
 /// open hold is observed from inside the pass, and it is gone once the pass
-/// has ended.
+/// has ended. Every observation is gathered before one comparison, so a
+/// failure shows each place that disagrees at once.
 #[test]
 fn a_pass_records_its_run_id_hands_it_to_the_harness_and_holds_until_it_ends() {
     let fixture = Fixture::new(concat!(
@@ -1375,46 +1376,25 @@ fn a_pass_records_its_run_id_hands_it_to_the_harness_and_holds_until_it_ends() {
         .iter()
         .find(|row| row["kind"] == "pass-started")
         .expect("pass-started row");
-    let recorded = started["fact"]["run_id"]
-        .as_str()
-        .expect("pass-started names its run id");
-    let events = fixture.run_events();
-    assert_eq!(events[0]["type"], "run.started");
-    assert_eq!(events[0]["runId"], started["fact"]["run_id"]);
-    assert_eq!(
-        fs::read_to_string(&harness_run_id)
-            .expect("the harness recorded its environment")
-            .trim_end(),
-        recorded
-    );
     let ended = trace
         .iter()
         .find(|row| row["kind"] == "pass-ended")
         .expect("pass-ended row");
-    assert!(
-        ended["fact"].get("run_id").is_none(),
-        "pass-ended is part of the frozen pass contract: {ended}"
-    );
-
-    let open = fs::read_to_string(&open_ps)
-        .expect("the harness ran ps")
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).expect("ps --json line"))
-        .collect::<Vec<_>>();
-    let holding = open
+    let recorded = started["fact"]["run_id"].clone();
+    let events = fixture.run_events();
+    let harness =
+        fs::read_to_string(&harness_run_id).map_or(Value::Null, |value| json!(value.trim_end()));
+    let pass_holds = |text: &str| {
+        text.lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("ps --json line"))
+            .filter(|holding| holding["kind"] == "pass")
+            .collect::<Vec<_>>()
+    };
+    let during = pass_holds(fs::read_to_string(&open_ps).unwrap_or_default().as_str());
+    let held = during.first().cloned().unwrap_or(Value::Null);
+    let held_last_event_is_an_event_of_the_run = events
         .iter()
-        .find(|holding| holding["kind"] == "pass")
-        .unwrap_or_else(|| panic!("the open pass was not listed: {open:?}"));
-    assert_eq!(holding["run_id"], started["fact"]["run_id"]);
-    assert_eq!(holding["owner"], started["fact"]["owner"]);
-    assert_eq!(holding["lease"], "live");
-    assert!(
-        events
-            .iter()
-            .any(|event| event["ts"] == holding["last_event_at"]),
-        "last_event_at is not an event of this run: {holding}"
-    );
-
+        .any(|event| event["ts"] == held["last_event_at"]);
     let after = Command::new(env!("CARGO_BIN_EXE_ostrom"))
         .args(["ps", "--json"])
         .env_clear()
@@ -1423,10 +1403,34 @@ fn a_pass_records_its_run_id_hands_it_to_the_harness_and_holds_until_it_ends() {
         .output()
         .expect("run ps after the pass");
     assert!(after.status.success());
-    assert!(
-        !String::from_utf8_lossy(&after.stdout).contains(recorded),
-        "the ended pass is still listed: {}",
-        String::from_utf8_lossy(&after.stdout)
+    let after = pass_holds(String::from_utf8_lossy(&after.stdout).as_ref());
+
+    assert_eq!(
+        json!({
+            "pass_started_names_a_run_id": recorded.is_string(),
+            "events_run_id": events[0]["runId"],
+            "harness_OSTROM_RUN_ID": harness,
+            "pass_ended_run_id": ended["fact"].get("run_id"),
+            "open_pass_holds_during": during.len(),
+            "held_run_id": held["run_id"],
+            "held_owner": held["owner"],
+            "held_lease": held["lease"],
+            "held_last_event_is_an_event_of_the_run": held_last_event_is_an_event_of_the_run,
+            "open_pass_holds_after": after.len(),
+        }),
+        json!({
+            "pass_started_names_a_run_id": true,
+            "events_run_id": recorded,
+            "harness_OSTROM_RUN_ID": recorded,
+            // `pass-ended` is part of the frozen pass contract.
+            "pass_ended_run_id": null,
+            "open_pass_holds_during": 1,
+            "held_run_id": recorded,
+            "held_owner": started["fact"]["owner"],
+            "held_lease": "live",
+            "held_last_event_is_an_event_of_the_run": true,
+            "open_pass_holds_after": 0,
+        })
     );
 }
 
