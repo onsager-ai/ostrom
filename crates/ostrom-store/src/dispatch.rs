@@ -344,13 +344,24 @@ fn run_dispatch_with_registry_and_minter(
 
     // A live hold that stopped making progress is reaped first (#619), so a
     // stuck run cannot count against the concurrency ceilings below or block
-    // its own item from being dispatched again.
-    let reaped = crate::stalls::reap_stalled_holds(
-        &request.paths,
-        &request.clock,
-        context.parent_run_id.as_deref(),
-    )
-    .map_err(|error| DispatchError::new(1, format!("ostrom dispatch: {error}")))?;
+    // its own item from being dispatched again. Dispatch reaps only the
+    // implementer holds for its own repositories, and a dispatch with no
+    // repository scope (a hand run) reaps nothing: only `ostrom up` reaps
+    // every hold. Reaping is best effort and never stops this dispatch: an
+    // error is printed and recorded for doctor (#635).
+    let reaped = request
+        .repositories
+        .as_ref()
+        .map(|repositories| {
+            crate::stalls::reap_stalled_holds(
+                &request.paths,
+                &request.clock,
+                "dispatch",
+                context.parent_run_id.as_deref(),
+                Some(repositories),
+            )
+        })
+        .unwrap_or_default();
     for hold in reaped {
         eprintln!("ostrom dispatch: {hold}");
     }
@@ -695,7 +706,10 @@ fn launch_systemd(
         "--property",
         &format!(
             "RuntimeMaxSec={}",
-            context.request.implementer_caps.outer_bound_seconds()
+            context
+                .request
+                .implementer_caps
+                .implementer_unit_runtime_seconds()
         ),
         "--property",
         "KillMode=control-group",

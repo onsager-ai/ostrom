@@ -168,8 +168,6 @@ pub(crate) enum LoopSupervisorError {
     },
     #[error(transparent)]
     Holdings(#[from] ostrom_store::HoldingsError),
-    #[error("ostrom up: {0}")]
-    Stalls(#[from] ostrom_store::StallError),
 }
 
 pub(crate) fn reconcile(
@@ -191,10 +189,14 @@ pub(crate) fn reconcile(
     // Reap before measuring, so a stuck run neither counts as live work nor
     // keeps its item from the next dispatch (#619). `ostrom up` is the
     // reconciler that already runs on a timer; no resident process is needed.
+    // It reaps every hold. Reaping is best effort and never stops the
+    // launches below: an error is printed and recorded for doctor (#635).
     let own_run = environment::OSTROM_RUN_ID.value();
-    for hold in reap_stalled_holds(paths, clock, own_run.as_deref())? {
+    for hold in reap_stalled_holds(paths, clock, "up", own_run.as_deref(), None) {
         eprintln!("ostrom up: {hold}");
-        summary.reaped += 1;
+        if hold.stopped {
+            summary.reaped += 1;
+        }
     }
     let consumption = measure_consumption(paths, clock);
     let local_now = clock.now().with_timezone(&Local);
