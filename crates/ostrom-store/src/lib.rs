@@ -31,6 +31,7 @@ mod repository_scope;
 mod run_events;
 mod selection;
 mod selector;
+mod stalls;
 mod sweep;
 mod trace;
 pub mod umwelt_edge;
@@ -106,6 +107,10 @@ pub use run_events::{RunEventError, RunEventGuard, RunEventStart, generated_run_
 pub use selection::{
     PlanApplication, SelectAction, SelectError, SelectOutcome, SelectRequest, encode_selection,
     run_selection,
+};
+pub use stalls::{
+    HoldProgress, ReapedHold, StallError, hold_progress, process_running, process_start_time,
+    reap_stalled_holds, stalled_holds,
 };
 pub use sweep::{
     MINIMUM_PASS_WORK_SECONDS, PublishTarget, RepositorySnapshot, RosterCoverageFinding,

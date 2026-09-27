@@ -13,7 +13,7 @@ use std::{
 
 use ostrom_core::{
     BranchListing, BranchListingFault, BranchListingOutcome, MandateConfig, RemoteBranch,
-    WorkOrder, resolve_exact_branch,
+    ResolvedRunCaps, WorkOrder, resolve_exact_branch,
 };
 use serde_json::{Map, Value, json};
 
@@ -52,6 +52,9 @@ pub struct DispatchRequest {
     /// `Some(empty)` refuses every work order.
     pub repositories: Option<BTreeSet<String>>,
     pub clock: Clock,
+    /// The implementer's wall and idle caps, resolved from the current policy
+    /// version's `defaults.implementer_ceilings` or the defaults (#619).
+    pub implementer_caps: ResolvedRunCaps,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -339,6 +342,18 @@ fn run_dispatch_with_registry_and_minter(
         })?;
     let resolved_ostrom = resolve_ostrom(&context)?;
 
+    // A live hold that stopped making progress is reaped first (#619), so a
+    // stuck run cannot count against the concurrency ceilings below or block
+    // its own item from being dispatched again.
+    let reaped = crate::stalls::reap_stalled_holds(
+        &request.paths,
+        &request.clock,
+        context.parent_run_id.as_deref(),
+    )
+    .map_err(|error| DispatchError::new(1, format!("ostrom dispatch: {error}")))?;
+    for hold in reaped {
+        eprintln!("ostrom dispatch: {hold}");
+    }
     // Reap before acquiring this item's lease. If an old order is genuinely
     // still live, its possibly expired lease must not be replaced merely to
     // discover the duplicate after the fact.
@@ -678,7 +693,10 @@ fn launch_systemd(
         "--collect",
         "--no-block",
         "--property",
-        "RuntimeMaxSec=infinity",
+        &format!(
+            "RuntimeMaxSec={}",
+            context.request.implementer_caps.outer_bound_seconds()
+        ),
         "--property",
         "KillMode=control-group",
         "--setenv",
@@ -713,6 +731,7 @@ fn launch_systemd(
         .arg(runner_name)
         .arg("--run-id")
         .arg(&context.run_id)
+        .args(implementer_cap_arguments(context.request.implementer_caps))
         .status();
     if !status.is_ok_and(|status| status.success()) {
         append_launch_failure(context, "dispatch-failed", started.elapsed());
@@ -767,6 +786,7 @@ fn launch_process(
         .arg(runner_name)
         .arg("--run-id")
         .arg(&context.run_id)
+        .args(implementer_cap_arguments(context.request.implementer_caps))
         .stdin(Stdio::null())
         .stdout(stdout)
         .stderr(stderr)
@@ -843,6 +863,16 @@ fn launch_process(
     }
     drop(child);
     Ok(())
+}
+
+/// `ostrom implement`'s hidden cap arguments: the caps this dispatch resolved,
+/// so the implementer enforces and records exactly what the hold names.
+fn implementer_cap_arguments(caps: ResolvedRunCaps) -> Vec<String> {
+    let mut arguments = vec!["--wall-seconds".to_owned(), caps.wall_seconds.to_string()];
+    if let Some(idle) = caps.idle_seconds {
+        arguments.extend(["--idle-seconds".to_owned(), idle.to_string()]);
+    }
+    arguments
 }
 
 fn open_process_log(context: &DispatchContext<'_>) -> Result<(fs::File, fs::File), ()> {
@@ -2094,6 +2124,16 @@ fn append_dispatched(context: &DispatchContext<'_>) -> Result<(), DispatchError>
     fact.insert("backend".to_owned(), json!(context.backend));
     fact.insert("run_id".to_owned(), json!(context.run_id));
     fact.insert("runner".to_owned(), json!(context.runner));
+    // The caps the hold runs under (#619). The stall reaper and doctor read
+    // them from here, so a hold is judged by the caps it was started with.
+    fact.insert(
+        "wall_seconds".to_owned(),
+        json!(context.request.implementer_caps.wall_seconds),
+    );
+    fact.insert(
+        "idle_seconds".to_owned(),
+        json!(context.request.implementer_caps.idle_seconds),
+    );
     if let Some(parent) = &context.parent_run_id {
         fact.insert("parent_run_id".to_owned(), json!(parent));
     }

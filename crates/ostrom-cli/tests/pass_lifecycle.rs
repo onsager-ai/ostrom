@@ -1584,6 +1584,86 @@ fn sigterm_releases_finalizes_and_kills_the_process_group() {
     );
 }
 
+/// #619 change 3: the pass lease renews while the pass runs, as the sweep
+/// lease does. With a two-second TTL and a pass that runs for five, every
+/// second pass started during it is refused, and the lease's expiry moves
+/// forward while the first pass holds it.
+#[test]
+fn a_pass_longer_than_its_lease_ttl_renews_the_lease_and_refuses_a_second_pass_throughout() {
+    let fixture = Fixture::new(&format!("sleep 5\n{}", stream_script(CLAUDE_STREAM_JSON)));
+    let lease = fixture.state.join("builder-pass.lease");
+    let first = fixture
+        .command()
+        .env("MANDATE_LEASE_TTL_SECONDS", "2")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start the long pass");
+    wait_for(&lease);
+    let read_lease = || -> Value {
+        serde_json::from_slice(&fs::read(&lease).expect("read pass lease")).expect("lease JSON")
+    };
+    let held = read_lease();
+
+    let mut second_passes = Vec::new();
+    for _ in 0..4 {
+        thread::sleep(Duration::from_millis(800));
+        second_passes.push(
+            fixture
+                .command()
+                .env("MANDATE_LEASE_TTL_SECONDS", "2")
+                .output()
+                .expect("start an overlapping pass")
+                .status
+                .success(),
+        );
+    }
+    let renewed = read_lease();
+    let status = wait(first);
+
+    let finished = fs::read_dir(fixture.state.join("runs"))
+        .expect("read run directories")
+        .flatten()
+        .filter_map(|run| fs::read_to_string(run.path().join("events.jsonl")).ok())
+        .filter_map(|events| {
+            events
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .find(|event| event["type"] == "run.finished")
+        })
+        .collect::<Vec<_>>();
+    let lease_held = finished
+        .iter()
+        .filter(|event| event["payload"]["reason"] == "lease-held")
+        .count();
+    let pass_started = fixture
+        .trace()
+        .into_iter()
+        .filter(|row| row["kind"] == "pass-started" && row["fact"]["run_id"].is_string())
+        .count();
+    assert_eq!(
+        json!({
+            "first_pass_succeeded": status.success(),
+            "second_passes_exited_zero": second_passes,
+            "second_passes_refused_as_lease_held": lease_held,
+            "passes_that_started": pass_started,
+            "same_owner_throughout": renewed["owner"] == held["owner"],
+            "expiry_moved_forward": renewed["expires_at"].as_u64() > held["expires_at"].as_u64(),
+            "lease_names_its_process": renewed["pid"].is_u64(),
+        }),
+        json!({
+            "first_pass_succeeded": true,
+            "second_passes_exited_zero": [true, true, true, true],
+            "second_passes_refused_as_lease_held": 4,
+            "passes_that_started": 1,
+            "same_owner_throughout": true,
+            "expiry_moved_forward": true,
+            "lease_names_its_process": true,
+        })
+    );
+    fixture.assert_released();
+}
+
 #[test]
 fn killed_child_releases_and_finalizes() {
     let fixture = Fixture::new("kill -KILL $$");

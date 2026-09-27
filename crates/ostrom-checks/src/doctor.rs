@@ -10,8 +10,8 @@ use std::{
 };
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use ostrom_core::ActionDefinition;
-use ostrom_store::{DISPATCH_FAILURE_CLEARED_KIND, environment};
+use ostrom_core::{ActionDefinition, ResolvedRunCaps};
+use ostrom_store::{Clock, DISPATCH_FAILURE_CLEARED_KIND, OstromPaths, environment, stalled_holds};
 use serde_json::{Map, Value, json};
 
 use crate::{
@@ -1323,6 +1323,9 @@ fn systemd_unit_state(context: &DoctorContext, unit_name: &str) -> UnitState {
 }
 
 fn check_work_orders(context: &DoctorContext) -> DoctorResult {
+    if let Some(stalled) = stalled_hold_result(context) {
+        return stalled;
+    }
     let TraceFile::Content(source) = &context.trace else {
         return no_work_orders();
     };
@@ -1387,10 +1390,69 @@ fn check_work_orders(context: &DoctorContext) -> DoctorResult {
         DoctorResult::new(
             DoctorStatus::Ok,
             "work-orders",
-            format!("{} in flight: {}", orders.len(), visible.join(", ")),
+            format!(
+                "{} in flight: {}; {}",
+                orders.len(),
+                visible.join(", "),
+                default_caps()
+            ),
             "",
         )
     }
+}
+
+/// A live hold with no progress past its threshold fails the check, named by
+/// its run id (#619). It uses the stall reaper's own definition, so doctor
+/// and the reaper cannot disagree about which hold is stalled.
+fn stalled_hold_result(context: &DoctorContext) -> Option<DoctorResult> {
+    let state_root = doctor_state_root(context);
+    let paths = OstromPaths {
+        config: state_root.clone(),
+        state: state_root,
+    };
+    let now = i64::try_from(context.options.now_epoch).ok()?;
+    let clock = Clock::fixed(DateTime::<Utc>::from_timestamp(now, 0)?);
+    let stalled = stalled_holds(&paths, &clock).ok()?;
+    if stalled.is_empty() {
+        return None;
+    }
+    let visible = stalled
+        .iter()
+        .map(|hold| {
+            format!(
+                "run={} item={} no progress for {}s (threshold {}s)",
+                hold.holding.run_id.as_deref().unwrap_or("-"),
+                hold.holding.item.as_deref().unwrap_or("-"),
+                hold.seconds_without_progress.unwrap_or_default(),
+                hold.stall_threshold_seconds
+            )
+        })
+        .collect::<Vec<_>>();
+    Some(DoctorResult::new(
+        DoctorStatus::Fail,
+        "work-orders",
+        format!("stalled hold: {}", visible.join(", ")),
+        "run ostrom up or ostrom dispatch to reap it, or stop the run by hand",
+    ))
+}
+
+/// The state root doctor's other state checks read: `OSTROM_HOME`, else the
+/// legacy root under the Claude configuration directory.
+fn doctor_state_root(context: &DoctorContext) -> PathBuf {
+    context
+        .env(environment::OSTROM_HOME.name)
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| context.options.config_dir.join("ostrom"), PathBuf::from)
+}
+
+/// The run caps that apply when policy declares none (#619).
+fn default_caps() -> String {
+    format!(
+        "default caps: implementer wall {}, pass wall {}, idle {}",
+        ResolvedRunCaps::implementer_default().render_wall(),
+        ResolvedRunCaps::pass_default().render_wall(),
+        ResolvedRunCaps::pass_default().render_idle()
+    )
 }
 
 fn active_dispatch_failure_escalations(source: &str) -> Vec<String> {
@@ -1437,7 +1499,7 @@ fn no_work_orders() -> DoctorResult {
     DoctorResult::new(
         DoctorStatus::Ok,
         "work-orders",
-        "no work orders in flight",
+        format!("no work orders in flight; {}", default_caps()),
         "",
     )
 }
@@ -1998,7 +2060,7 @@ mod tests {
 
         assert_eq!(
             run_doctor_check(fixture.options(), "work-orders").unwrap(),
-            "OK|work-orders|no work orders in flight|\n"
+            "OK|work-orders|no work orders in flight; default caps: implementer wall 4h (default), pass wall 30m (default), idle -|\n"
         );
     }
 
@@ -2138,7 +2200,7 @@ mod tests {
             "FAIL|dispatch-source-roots|search_roots is empty; dispatch cannot resolve source repositories|configure search_roots with a parent directory containing the roster checkouts\n",
             "WARN|trace-lease|trace absent; lease idle|run ostrom pass gatekeeper and confirm it creates sprint.jsonl\n",
             "WARN|trace-completeness|no gatekeeper pass ever recorded|run ostrom pass gatekeeper and confirm it records pass-ended\n",
-            "OK|work-orders|no work orders in flight|\n",
+            "OK|work-orders|no work orders in flight; default caps: implementer wall 4h (default), pass wall 30m (default), idle -|\n",
             "OK|worktrees|count=0 total_bytes=0 ceiling_bytes=21474836480|\n",
             "WARN|builder-pass|no builder pass ever recorded|run ostrom pass builder and confirm it records pass-ended\n",
             "WARN|gatekeeper-pass|no gatekeeper pass ever recorded|run ostrom pass gatekeeper and confirm it records pass-ended\n",

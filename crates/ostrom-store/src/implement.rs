@@ -1,15 +1,26 @@
 //! Execute one durable work order in a dedicated worktree.
 //!
-//! The process is intentionally not wall-clock bounded: systemd owns its
-//! lifecycle while the order's reservation and weighted-token ceiling bound
-//! spend. Codex edits offline; authenticated fetch, publish, and PR operations
-//! remain outside its sandbox.
+//! Every run has a wall cap (#619): the one dispatch resolved from policy, or
+//! `DEFAULT_IMPLEMENTER_WALL_SECONDS`. A `CapsWatchdog` holding only that cap
+//! is checked beside the harness; when it trips, the run is stopped through
+//! the same TERM path a scheduler signal takes, and its terminal row says
+//! `wall-cap`. The systemd unit's `RuntimeMaxSec` is the outer bound if this
+//! process itself hangs. Idle is not enforced here: Codex reports no per-turn
+//! events, so the stall reaper enforces it from the transcript's progress.
+//! Codex edits offline; authenticated fetch, publish, and PR operations remain
+//! outside its sandbox.
 
 use std::{
     fs,
     fs::File,
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Output, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, RecvTimeoutError},
+    },
+    thread,
     time::Duration,
 };
 
@@ -18,10 +29,12 @@ use ethogram::{
     PayloadExtension, RunCeilings as EventRunCeilings, RunKind, RunOutcome as EventRunOutcome,
     RunUsage,
 };
-use ostrom_core::{MandateConfig, WorkOrder};
+use ostrom_core::{MandateConfig, ResolvedRunCaps, WorkOrder};
 use regex::Regex;
 use serde_json::{Map, Value, json};
 use thiserror::Error;
+
+use umwelt_runtime::{CapsWatchdog, RunCaps, SystemClock};
 
 use crate::{
     AgentRegistry, Clock, CodexHarness, ImplementerRunRequest, LeaseActionError, OstromPaths,
@@ -51,6 +64,9 @@ pub struct ImplementRequest {
     /// names it. Absent (a hand run), the implementer mints its own as before
     /// and its terminal row is unchanged.
     pub run_id: Option<String>,
+    /// The wall and idle caps dispatch resolved from policy. A hand run gets
+    /// the implementer defaults.
+    pub caps: ResolvedRunCaps,
 }
 
 #[derive(Debug, Error)]
@@ -213,15 +229,23 @@ impl TerminalGuard {
         if let Err(error) = crate::reap_build_cache(&self.paths.state, &self.order.item_id) {
             eprintln!("ostrom implementer: could not reap build cache: {error}");
         }
-        let trace_result = append_trace(
-            &self.paths.trace_file(),
-            &TraceAppend {
-                ts: self.clock.timestamp(),
-                kind: kind.to_owned(),
-                fact,
-                narration: Map::new(),
-            },
-        );
+        // The stall reaper (#619) writes this order's terminal row before it
+        // stops the run, so the row says why. The run then must not add a
+        // second one when the signal reaches it.
+        let trace_result = if order_already_terminal(&self.paths, &self.order.order_id) {
+            Ok(())
+        } else {
+            append_trace(
+                &self.paths.trace_file(),
+                &TraceAppend {
+                    ts: self.clock.timestamp(),
+                    kind: kind.to_owned(),
+                    fact,
+                    narration: Map::new(),
+                },
+            )
+            .map(|_| ())
+        };
         let event_usage = observed_usage.map(|usage| RunUsage {
             input_tokens: Some(weighted.saturating_sub(usage.output_tokens)),
             output_tokens: Some(usage.output_tokens),
@@ -371,8 +395,11 @@ fn run_implement_with_registry_and_minter(
             ceilings: order.as_ref().ok().map(|order| EventRunCeilings {
                 cost_usd: Some(order.cost()),
                 tokens: Some(order.tokens()),
-                wall_ms: None,
-                idle_ms: None,
+                wall_ms: Some(request.caps.wall_seconds.saturating_mul(1_000)),
+                idle_ms: request
+                    .caps
+                    .idle_seconds
+                    .map(|seconds| seconds.saturating_mul(1_000)),
                 turns: None,
                 extra: PayloadExtension::new(),
             }),
@@ -454,7 +481,10 @@ fn run_implement_with_registry_and_minter(
         run_events,
         dispatched_run_id: request.run_id.clone(),
     };
-    match implement_inner(request, &mut guard, registry, runner_name, minter) {
+    let mut wall = WallCap::start(request.caps.wall_seconds, &request.signals);
+    let result = implement_inner(request, &mut guard, registry, runner_name, minter);
+    wall.stop();
+    match result {
         Ok(url) => {
             guard.pr_url = Some(url.clone());
             guard.append_terminal("work-completed", None)?;
@@ -462,9 +492,102 @@ fn run_implement_with_registry_and_minter(
             Ok(url)
         }
         Err(error) => {
+            let error = wall.classify(error);
             guard.fail(&error);
             Err(error)
         }
+    }
+}
+
+fn order_already_terminal(paths: &OstromPaths, order_id: &str) -> bool {
+    crate::read_trace(&paths.trace_file()).is_ok_and(|trace| {
+        trace.rows.into_iter().filter_map(Result::ok).any(|row| {
+            matches!(row.kind.as_str(), "work-completed" | "work-failed")
+                && row.fact.get("order_id").and_then(Value::as_str) == Some(order_id)
+        })
+    })
+}
+
+/// Checks a wall-only `CapsWatchdog` beside the harness and, when it trips,
+/// raises the run's own TERM flag, so the run stops through the path a
+/// scheduler signal already takes: Codex's process group is terminated with
+/// the termination grace and the terminal row is written by this process.
+struct WallCap {
+    seconds: u64,
+    tripped: Arc<AtomicBool>,
+    stop: Option<mpsc::Sender<()>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl WallCap {
+    fn start(seconds: u64, signals: &SignalFlags) -> Self {
+        let tripped = Arc::new(AtomicBool::new(false));
+        let caps = RunCaps {
+            wall_ms: Some(seconds.saturating_mul(1_000)),
+            ..RunCaps::default()
+        };
+        let term = signals.term_flag();
+        let thread_tripped = Arc::clone(&tripped);
+        let (stop, receiver) = mpsc::channel::<()>();
+        let thread = CapsWatchdog::new(caps, SystemClock::default())
+            .ok()
+            .and_then(|mut watchdog| {
+                thread::Builder::new()
+                    .name("ostrom-implementer-wall".to_owned())
+                    .spawn(move || {
+                        loop {
+                            if watchdog.check().is_some() {
+                                thread_tripped.store(true, Ordering::Release);
+                                term.store(true, Ordering::SeqCst);
+                                break;
+                            }
+                            match receiver.recv_timeout(Duration::from_millis(50)) {
+                                Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                                Err(RecvTimeoutError::Timeout) => {}
+                            }
+                        }
+                    })
+                    .ok()
+            });
+        Self {
+            seconds,
+            tripped,
+            stop: Some(stop),
+            thread,
+        }
+    }
+
+    fn tripped(&self) -> bool {
+        self.tripped.load(Ordering::Acquire)
+    }
+
+    fn stop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+
+    /// A stop the wall cap caused is recorded as `wall-cap`, never as the
+    /// signal it was delivered through.
+    fn classify(&self, error: ImplementError) -> ImplementError {
+        if self.tripped() {
+            ImplementError::new(
+                error.code,
+                "wall-cap",
+                format!("wall cap of {} s reached", self.seconds),
+            )
+        } else {
+            error
+        }
+    }
+}
+
+impl Drop for WallCap {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 

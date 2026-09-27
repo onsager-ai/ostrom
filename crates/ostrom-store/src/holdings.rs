@@ -185,7 +185,7 @@ fn last_event_at(events: &FileSink, run_id: &str) -> Option<String> {
         .map(|event| event.ts.clone())
 }
 
-fn read_leases(state: &Path) -> Vec<LeaseRecord> {
+pub(crate) fn read_leases(state: &Path) -> Vec<LeaseRecord> {
     let Ok(entries) = fs::read_dir(state) else {
         return Vec::new();
     };
