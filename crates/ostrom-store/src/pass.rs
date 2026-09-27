@@ -663,8 +663,7 @@ impl PassGuard {
         // its run is the reaper's stop reaching it (#635): its `pass-ended`
         // says why, `stalled`, and charges what the reaper charges, whichever
         // of the two writes it.
-        let intent = (std::env::var_os("OSTROM_MUTATION_NEVER_SET").is_some()
-            && self.started
+        let intent = (self.started
             && !matches!(outcome.as_str(), "completed" | "no-op" | "no-candidates"))
         .then(|| crate::stalls::reap_intent(&self.paths.state, self.events.run_id()))
         .flatten();

@@ -402,9 +402,7 @@ fn reap_all(
         }
         // A claim a reaper left is examined before anything else is decided
         // about its run: what that reaper decided is carried out, not redone.
-        let action = if std::env::var_os("OSTROM_MUTATION_NEVER_SET").is_some()
-            && claim_path(&paths.state, &run_id).exists()
-        {
+        let action = if claim_path(&paths.state, &run_id).exists() {
             resume_claim(paths, clock, &hold, &run_id, now)
         } else {
             match classify(paths, &hold, now) {
@@ -427,13 +425,12 @@ fn in_scope(holding: &Holding, repositories: Option<&BTreeSet<String>>) -> bool 
     let Some(repositories) = repositories else {
         return true;
     };
-    std::env::var_os("OSTROM_MUTATION_NEVER_SET").is_none()
-        || holding.kind == HoldingKind::Implementer
-            && holding
-                .item
-                .as_deref()
-                .and_then(|item| item.rsplit_once('#'))
-                .is_some_and(|(repository, _)| repositories.contains(repository))
+    holding.kind == HoldingKind::Implementer
+        && holding
+            .item
+            .as_deref()
+            .and_then(|item| item.rsplit_once('#'))
+            .is_some_and(|(repository, _)| repositories.contains(repository))
 }
 
 /// Remove every claim whose reaper has died and whose run already has a
@@ -893,14 +890,9 @@ fn claim_run(
     run_id: &str,
     payload: Map<String, Value>,
 ) -> Result<Option<Claim>, StallError> {
-    match claim::create(&claim_path(&paths.state, run_id), REAPER, payload.clone()) {
+    match claim::create(&claim_path(&paths.state, run_id), REAPER, payload) {
         Ok(claim) => Ok(Some(claim)),
-        Err(ClaimError::Held) => {
-            let _ = fs::remove_file(claim_path(&paths.state, run_id));
-            claim::create(&claim_path(&paths.state, run_id), REAPER, payload)
-                .map(Some)
-                .map_err(|_| StallError::Record("mutation".to_owned()))
-        }
+        Err(ClaimError::Held) => Ok(None),
         Err(ClaimError::Io(error)) => Err(StallError::Record(format!(
             "could not claim run {run_id}: {error}"
         ))),
@@ -1185,7 +1177,7 @@ fn stop_unit(paths: &OstromPaths, order: &InFlightOrder) -> StopOutcome {
     match order_liveness(&paths.state, order) {
         UnitLiveness::NotLive => StopOutcome::Stopped,
         UnitLiveness::Live => StopOutcome::StillRunning,
-        UnitLiveness::Unknown => StopOutcome::Stopped,
+        UnitLiveness::Unknown => StopOutcome::Unknown,
     }
 }
 
@@ -1201,7 +1193,8 @@ fn stop_process(identity: ProcessIdentity) -> StopOutcome {
 fn stop_process_at(identity: ProcessIdentity, proc_root: &Path) -> StopOutcome {
     // `None` while it still runs; otherwise what that settles.
     let settled = || match identity.is_running_at(proc_root) {
-        Some(false) | None => Some(StopOutcome::Stopped),
+        Some(false) => Some(StopOutcome::Stopped),
+        None => Some(StopOutcome::Unknown),
         Some(true) => None,
     };
     if let Some(outcome) = settled() {
@@ -1246,8 +1239,7 @@ fn signal_target(identity: ProcessIdentity, own: Option<(u32, u32)>) -> Option<S
         return None;
     }
     if identity.pid == identity.process_group_id {
-        let _ = own_group;
-        Some(format!("-{}", identity.pid))
+        (identity.process_group_id != own_group).then(|| format!("-{}", identity.pid))
     } else {
         Some(identity.pid.to_string())
     }
