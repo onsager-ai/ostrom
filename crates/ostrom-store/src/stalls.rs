@@ -1210,7 +1210,7 @@ fn stop_process_at(identity: ProcessIdentity, proc_root: &Path) -> StopOutcome {
     // The run's own TERM handling stops its harness with the termination
     // grace, so the reaper waits for that before escalating.
     let grace = Duration::from_secs(RUN_TERMINATION_GRACE_SECONDS.saturating_mul(2));
-    for signal in ["-TERM", "-KILL"] {
+    for signal in ["-TERM", "-TERM"] {
         if let Some(outcome) = settled() {
             return outcome;
         }
