@@ -3,6 +3,7 @@
 mod app_token;
 mod budget;
 mod check_store;
+mod claim;
 mod clock;
 mod commit_checks;
 mod decision_answers;
@@ -11,6 +12,7 @@ pub mod environment;
 mod event_store;
 mod file_store;
 mod gate;
+mod holdings;
 mod hooks;
 mod implement;
 mod lease;
@@ -30,6 +32,7 @@ mod repository_scope;
 mod run_events;
 mod selection;
 mod selector;
+mod stalls;
 mod sweep;
 mod trace;
 pub mod umwelt_edge;
@@ -53,7 +56,8 @@ pub use gate::{
     GATE_READ_PERMISSIONS, GateError, GateOptions, GateOutput, GateReplaySnapshot,
     gate_config_needs_diff_content, load_gate_config, run_gate,
 };
-pub use hooks::{DigestOptions, HookOutput, render_constitution, render_digest};
+pub use holdings::{Holding, HoldingKind, HoldingsError, LeaseState, open_holdings};
+pub use hooks::{DigestOptions, HookOutput, render_digest};
 pub use implement::{
     DEFAULT_IMPLEMENTER_RUNNER, ImplementError, ImplementRequest, run_implement,
     run_implement_with_registry,
@@ -104,6 +108,10 @@ pub use run_events::{RunEventError, RunEventGuard, RunEventStart, generated_run_
 pub use selection::{
     PlanApplication, SelectAction, SelectError, SelectOutcome, SelectRequest, encode_selection,
     run_selection,
+};
+pub use stalls::{
+    HoldProgress, ReapedHold, StallError, hold_progress, process_running, process_start_time,
+    reap_stalled_holds, reaper_findings, stalled_holds,
 };
 pub use sweep::{
     MINIMUM_PASS_WORK_SECONDS, PublishTarget, RepositorySnapshot, RosterCoverageFinding,

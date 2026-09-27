@@ -28,7 +28,6 @@ use crate::{
     read_lease, read_trace, set_private_file_mode,
 };
 
-const DEFAULT_COST_CEILING_USD: &str = "20";
 const DEFAULT_TOKEN_CEILING: &str = "500000";
 static ORDER_NONCE: AtomicU64 = AtomicU64::new(0);
 // These are the dispatcher's existing runtime ceilings. Keeping the lease and
@@ -135,10 +134,12 @@ pub(crate) struct InFlightOrder {
     pub backend: String,
     pub cost_ceiling_usd: f64,
     pub token_ceiling: u64,
+    /// The run id dispatch minted for this hold; absent before #618.
+    pub run_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UnitLiveness {
+pub(crate) enum UnitLiveness {
     Live,
     NotLive,
     Unknown,
@@ -199,7 +200,8 @@ pub fn create_work_order(
     if !validate_candidate(&candidate) {
         return Err(WorkOrderError::InvalidCandidate);
     }
-    let cost = parse_positive_number(cost_ceiling.unwrap_or(DEFAULT_COST_CEILING_USD))
+    let default_cost = ostrom_core::DEFAULT_RUN_COST_CEILING_USD.to_string();
+    let cost = parse_positive_number(cost_ceiling.unwrap_or(&default_cost))
         .ok_or(WorkOrderError::InvalidCostCeiling)?;
     let tokens = parse_positive_integer(token_ceiling.unwrap_or(DEFAULT_TOKEN_CEILING))
         .ok_or(WorkOrderError::InvalidTokenCeiling)?;
@@ -441,6 +443,12 @@ fn dispatch_fact(row: &TraceFactRecord) -> Option<InFlightOrder> {
             .to_owned(),
         cost_ceiling_usd: row.fact.get("cost_ceiling_usd").and_then(Value::as_f64)?,
         token_ceiling: row.fact.get("token_ceiling").and_then(Value::as_u64)?,
+        run_id: row
+            .fact
+            .get("run_id")
+            .and_then(Value::as_str)
+            .filter(|run_id| !run_id.is_empty())
+            .map(str::to_owned),
     })
 }
 
@@ -594,6 +602,30 @@ pub fn finalize_exited_implementer(
         (_, Some(signal)) => format!("implementer worker was killed by signal {signal}"),
         _ => "implementer worker exited without a status code".to_owned(),
     };
+    // A worker the stall reaper signalled and that died without its row is
+    // the reaper's stop: recorded as the claim says, at the claim's charge,
+    // not as an unexplained exit at no cost (#635).
+    if let Some((run_id, intent)) = order.run_id.as_deref().and_then(|run_id| {
+        crate::stalls::reap_intent(state_root, run_id).map(|intent| (run_id, intent))
+    }) {
+        let mut extra = intent.row_fields();
+        extra.insert("run_id".to_owned(), Value::String(run_id.to_owned()));
+        return append_terminal_row(
+            state_root,
+            &order,
+            TerminalRow {
+                reason: &intent.reason,
+                message: &detail,
+                exit_code,
+                signal,
+                reaped: true,
+                cost_usd: Some(intent.cost_usd),
+                extra,
+                release_lease: true,
+            },
+            clock,
+        );
+    }
     append_terminal_failure(
         state_root,
         &order,
@@ -621,6 +653,83 @@ fn order_is_stale(order: &InFlightOrder, now: u64) -> bool {
 
 fn observe_unit(state_root: &Path, order: &InFlightOrder) -> UnitObservation {
     observe_unit_at(state_root, order, Path::new("/proc"))
+}
+
+/// Whether an in-flight order's unit or process is running, as the stale
+/// order reaper judges it.
+pub(crate) fn order_liveness(state_root: &Path, order: &InFlightOrder) -> UnitLiveness {
+    observe_unit(state_root, order).liveness
+}
+
+/// The terminal row the stall reaper writes for an implementer it stopped and
+/// confirmed stopped, when the run wrote none of its own (#619, #635): the
+/// run was killed, or never reached its terminal path. Its reason and cost come
+/// from the reaper's claim on the run, so they match what the run itself would
+/// have written from the same claim. The row is appended only while the order
+/// is still in flight, so a run that wrote its own row first keeps the only
+/// one. The lease is left to the caller.
+pub(crate) struct ReapedFailure<'a> {
+    pub run_id: &'a str,
+    pub reason: &'a str,
+    pub cost_usd: f64,
+    pub cost_basis: &'a str,
+    pub last_progress_at: Option<&'a str>,
+    pub stalled_seconds: Option<u64>,
+}
+
+pub(crate) fn append_reaped_failure(
+    state_root: &Path,
+    order: &InFlightOrder,
+    failure: &ReapedFailure<'_>,
+    clock: &Clock,
+) -> Result<bool, WorkOrderError> {
+    let extra = Map::from_iter([
+        (
+            "run_id".to_owned(),
+            Value::String(failure.run_id.to_owned()),
+        ),
+        (
+            "last_progress_at".to_owned(),
+            failure
+                .last_progress_at
+                .map_or(Value::Null, |value| Value::String(value.to_owned())),
+        ),
+        (
+            "stalled_seconds".to_owned(),
+            failure.stalled_seconds.map_or(Value::Null, Value::from),
+        ),
+        (
+            "cost_basis".to_owned(),
+            Value::String(failure.cost_basis.to_owned()),
+        ),
+    ]);
+    let message = failure.stalled_seconds.map_or_else(
+        || "stopped by the stall reaper".to_owned(),
+        |seconds| format!("no progress for {seconds} s; stopped by the stall reaper"),
+    );
+    append_terminal_row(
+        state_root,
+        order,
+        TerminalRow {
+            reason: failure.reason,
+            message: &message,
+            exit_code: None,
+            signal: None,
+            reaped: true,
+            cost_usd: Some(failure.cost_usd),
+            extra,
+            release_lease: false,
+        },
+        clock,
+    )
+}
+
+/// Release the order's item lease if it still names the order's unit.
+pub(crate) fn release_order_lease(
+    state_root: &Path,
+    order: &InFlightOrder,
+) -> Result<(), WorkOrderError> {
+    release_matching_lease(state_root, order)
 }
 
 fn observe_unit_at(state_root: &Path, order: &InFlightOrder, proc_root: &Path) -> UnitObservation {
@@ -774,12 +883,59 @@ fn append_terminal_failure(
     reaped: bool,
     clock: &Clock,
 ) -> Result<bool, WorkOrderError> {
+    append_terminal_row(
+        state_root,
+        order,
+        TerminalRow {
+            reason,
+            message,
+            exit_code,
+            signal,
+            reaped,
+            cost_usd: None,
+            extra: Map::new(),
+            release_lease: true,
+        },
+        clock,
+    )
+}
+
+struct TerminalRow<'a> {
+    reason: &'a str,
+    message: &'a str,
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+    reaped: bool,
+    /// `None` records `0`, as every reaper row did before #619.
+    cost_usd: Option<f64>,
+    extra: Map<String, Value>,
+    release_lease: bool,
+}
+
+fn append_terminal_row(
+    state_root: &Path,
+    order: &InFlightOrder,
+    row: TerminalRow<'_>,
+    clock: &Clock,
+) -> Result<bool, WorkOrderError> {
+    let TerminalRow {
+        reason,
+        message,
+        exit_code,
+        signal,
+        reaped,
+        cost_usd,
+        extra,
+        release_lease,
+    } = row;
     let trace_path = state_root.join("sprint.jsonl");
     if !in_flight_orders(&trace_path)?
         .iter()
         .any(|candidate| candidate.order_id == order.order_id)
     {
-        release_matching_lease(state_root, order)?;
+        if release_lease {
+            release_matching_lease(state_root, order)?;
+        }
         return Ok(false);
     }
     let now = clock.epoch_seconds();
@@ -791,7 +947,7 @@ fn append_terminal_failure(
         .item_id
         .rsplit_once('#')
         .map(|(repository, _)| repository);
-    let fact = Map::from_iter([
+    let mut fact = Map::from_iter([
         ("schema_version".to_owned(), Value::from(1)),
         ("item_id".to_owned(), Value::String(order.item_id.clone())),
         ("order_id".to_owned(), Value::String(order.order_id.clone())),
@@ -810,7 +966,7 @@ fn append_terminal_failure(
         ),
         ("token_ceiling".to_owned(), Value::from(order.token_ceiling)),
         ("weighted_tokens".to_owned(), Value::from(0)),
-        ("cost_usd".to_owned(), Value::from(0)),
+        ("cost_usd".to_owned(), cost_value(cost_usd)),
         (
             "duration_seconds".to_owned(),
             Value::from(now.saturating_sub(dispatched_at)),
@@ -837,6 +993,7 @@ fn append_terminal_failure(
             }),
         ),
     ]);
+    fact.extend(extra);
     if let Err(error) = crate::reap_build_cache(state_root, &order.item_id) {
         eprintln!("ostrom work order: could not reap build cache: {error}");
     }
@@ -850,8 +1007,14 @@ fn append_terminal_failure(
         },
     )
     .map_err(|_| WorkOrderError::Write(trace_path.display().to_string()))?;
-    release_matching_lease(state_root, order)?;
+    if release_lease {
+        release_matching_lease(state_root, order)?;
+    }
     Ok(true)
+}
+
+fn cost_value(cost_usd: Option<f64>) -> Value {
+    cost_usd.map_or_else(|| Value::from(0), Value::from)
 }
 
 fn release_matching_lease(state_root: &Path, order: &InFlightOrder) -> Result<(), WorkOrderError> {

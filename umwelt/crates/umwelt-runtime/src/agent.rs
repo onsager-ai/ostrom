@@ -253,6 +253,10 @@ pub struct ImplementerRunRequest {
     pub signals: SignalFlags,
     pub supervisor_pid: Option<u32>,
     pub termination_grace: Duration,
+    /// Variables set on the harness child, replacing any value it would
+    /// otherwise inherit. The consumer names them; the runtime only applies
+    /// them.
+    pub environment: Vec<(OsString, OsString)>,
 }
 
 #[derive(Debug, Clone)]
@@ -270,6 +274,21 @@ impl RunnerLaunch {
     #[must_use]
     pub fn new(environment: Vec<(OsString, OsString)>) -> Self {
         Self { environment }
+    }
+
+    /// Add one variable to the environment the launched runner receives.
+    ///
+    /// The consumer names the variable and gives it meaning; the runtime only
+    /// carries it. A name added twice keeps both entries, and the later one
+    /// wins when the environment is applied in order.
+    #[must_use]
+    pub fn with_environment(
+        mut self,
+        name: impl Into<OsString>,
+        value: impl Into<OsString>,
+    ) -> Self {
+        self.environment.push((name.into(), value.into()));
+        self
     }
 
     #[must_use]
@@ -554,6 +573,7 @@ impl AgentRunner for CodexHarness {
                 "-o",
                 &request.result.display().to_string(),
             ])
+            .envs(request.environment.iter().cloned())
             .env("PATH", path)
             .stdin(Stdio::from(input))
             .stdout(Stdio::from(events))
@@ -951,6 +971,7 @@ mod tests {
             signals: SignalFlags::default(),
             supervisor_pid: None,
             termination_grace: Duration::from_secs(1),
+            environment: Vec::new(),
         })
     }
 

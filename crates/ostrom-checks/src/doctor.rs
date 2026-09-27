@@ -10,8 +10,10 @@ use std::{
 };
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use ostrom_core::ActionDefinition;
-use ostrom_store::{DISPATCH_FAILURE_CLEARED_KIND, environment};
+use ostrom_core::{ActionDefinition, ResolvedRunCaps};
+use ostrom_store::{
+    Clock, DISPATCH_FAILURE_CLEARED_KIND, OstromPaths, environment, reaper_findings, stalled_holds,
+};
 use serde_json::{Map, Value, json};
 
 use crate::{
@@ -31,7 +33,6 @@ pub const DOCTOR_CHECKS: &[&str] = &[
     "builder-pass",
     "gatekeeper-pass",
     "publish",
-    "environment",
     "config-parser",
 ];
 
@@ -227,7 +228,6 @@ fn run_named_check(context: &mut DoctorContext, name: &str) -> DoctorResult {
         "builder-pass" => check_role_pass(context, DeliveryRole::Builder),
         "gatekeeper-pass" => check_role_pass(context, DeliveryRole::Gatekeeper),
         "publish" => check_publish(context),
-        "environment" => check_environment(context),
         "config-parser" => check_config_parser(),
         _ => unreachable!("validated doctor check name"),
     }
@@ -701,31 +701,6 @@ fn check_cli_launcher(context: &DoctorContext) -> DoctorResult {
         ),
         format!("{INSTALL_COMMAND} (without --no-optional or --omit=optional)"),
     )
-}
-
-fn rule_layer_has_content(root: &Path) -> bool {
-    let mut files = vec![root.join("rules.md")];
-    files.extend(
-        fs::read_dir(root.join("rules.d"))
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().is_some_and(|extension| extension == "md")),
-    );
-    files.into_iter().any(|path| {
-        let Ok(mut text) = fs::read_to_string(path) else {
-            return false;
-        };
-        while let Some(start) = text.find("<!--") {
-            let Some(relative_end) = text[start + 4..].find("-->") else {
-                text.truncate(start);
-                break;
-            };
-            text.replace_range(start..start + 4 + relative_end + 3, "");
-        }
-        text.chars().any(|character| !character.is_whitespace())
-    })
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1350,6 +1325,12 @@ fn systemd_unit_state(context: &DoctorContext, unit_name: &str) -> UnitState {
 }
 
 fn check_work_orders(context: &DoctorContext) -> DoctorResult {
+    if let Some(reaper) = reaper_result(context) {
+        return reaper;
+    }
+    if let Some(stalled) = stalled_hold_result(context) {
+        return stalled;
+    }
     let TraceFile::Content(source) = &context.trace else {
         return no_work_orders();
     };
@@ -1414,10 +1395,90 @@ fn check_work_orders(context: &DoctorContext) -> DoctorResult {
         DoctorResult::new(
             DoctorStatus::Ok,
             "work-orders",
-            format!("{} in flight: {}", orders.len(), visible.join(", ")),
+            format!(
+                "{} in flight: {}; {}",
+                orders.len(),
+                visible.join(", "),
+                default_caps()
+            ),
             "",
         )
     }
+}
+
+/// The stall reaper never stops `up` or `dispatch` from scheduling, so its
+/// failures surface here instead (#635): its last error, and every claim whose
+/// stop no live reaper is confirming. Either can leave a run holding its item
+/// or its spend, so either fails the check.
+fn reaper_result(context: &DoctorContext) -> Option<DoctorResult> {
+    let state_root = doctor_state_root(context);
+    let findings = reaper_findings(&OstromPaths {
+        config: state_root.clone(),
+        state: state_root,
+    });
+    if findings.is_empty() {
+        return None;
+    }
+    Some(DoctorResult::new(
+        DoctorStatus::Fail,
+        "work-orders",
+        format!("stall reaper: {}", findings.join("; ")),
+        "fix the named fault, or confirm the named run has stopped; the next ostrom up or ostrom dispatch retries and clears it",
+    ))
+}
+
+/// A live hold with no progress past its threshold fails the check, named by
+/// its run id (#619). It uses the stall reaper's own definition, so doctor
+/// and the reaper cannot disagree about which hold is stalled.
+fn stalled_hold_result(context: &DoctorContext) -> Option<DoctorResult> {
+    let state_root = doctor_state_root(context);
+    let paths = OstromPaths {
+        config: state_root.clone(),
+        state: state_root,
+    };
+    let now = i64::try_from(context.options.now_epoch).ok()?;
+    let clock = Clock::fixed(DateTime::<Utc>::from_timestamp(now, 0)?);
+    let stalled = stalled_holds(&paths, &clock).ok()?;
+    if stalled.is_empty() {
+        return None;
+    }
+    let visible = stalled
+        .iter()
+        .map(|hold| {
+            format!(
+                "run={} item={} no progress for {}s (threshold {}s)",
+                hold.holding.run_id.as_deref().unwrap_or("-"),
+                hold.holding.item.as_deref().unwrap_or("-"),
+                hold.seconds_without_progress.unwrap_or_default(),
+                hold.stall_threshold_seconds
+            )
+        })
+        .collect::<Vec<_>>();
+    Some(DoctorResult::new(
+        DoctorStatus::Fail,
+        "work-orders",
+        format!("stalled hold: {}", visible.join(", ")),
+        "run ostrom up or ostrom dispatch to reap it, or stop the run by hand",
+    ))
+}
+
+/// The state root doctor's other state checks read: `OSTROM_HOME`, else the
+/// legacy root under the Claude configuration directory.
+fn doctor_state_root(context: &DoctorContext) -> PathBuf {
+    context
+        .env(environment::OSTROM_HOME.name)
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| context.options.config_dir.join("ostrom"), PathBuf::from)
+}
+
+/// The run caps that apply when policy declares none (#619).
+fn default_caps() -> String {
+    format!(
+        "default caps: implementer wall {}, pass wall {}, idle {}",
+        ResolvedRunCaps::implementer_default().render_wall(),
+        ResolvedRunCaps::pass_default().render_wall(),
+        ResolvedRunCaps::pass_default().render_idle()
+    )
 }
 
 fn active_dispatch_failure_escalations(source: &str) -> Vec<String> {
@@ -1464,7 +1525,7 @@ fn no_work_orders() -> DoctorResult {
     DoctorResult::new(
         DoctorStatus::Ok,
         "work-orders",
-        "no work orders in flight",
+        format!("no work orders in flight; {}", default_caps()),
         "",
     )
 }
@@ -1806,26 +1867,6 @@ fn check_publish(context: &DoctorContext) -> DoctorResult {
     }
 }
 
-fn check_environment(context: &DoctorContext) -> DoctorResult {
-    if context.env("CLAUDE_CODE_REMOTE").is_none() {
-        DoctorResult::new(DoctorStatus::Ok, "environment", "local", "")
-    } else if rule_layer_has_content(&context.options.config_dir.join("ostrom")) {
-        DoctorResult::new(
-            DoctorStatus::Ok,
-            "environment",
-            "cloud, user rules layer resolved",
-            "",
-        )
-    } else {
-        DoctorResult::new(
-            DoctorStatus::Warn,
-            "environment",
-            "cloud session, no user rules layer resolved (private layer absent)",
-            "provide the private layer's credentials/config for this environment",
-        )
-    }
-}
-
 fn check_config_parser() -> DoctorResult {
     DoctorResult::new(
         DoctorStatus::Ok,
@@ -2047,7 +2088,7 @@ mod tests {
 
         assert_eq!(
             run_doctor_check(fixture.options(), "work-orders").unwrap(),
-            "OK|work-orders|no work orders in flight|\n"
+            "OK|work-orders|no work orders in flight; default caps: implementer wall 4h (default), pass wall 30m (default), idle -|\n"
         );
     }
 
@@ -2187,12 +2228,11 @@ mod tests {
             "FAIL|dispatch-source-roots|search_roots is empty; dispatch cannot resolve source repositories|configure search_roots with a parent directory containing the roster checkouts\n",
             "WARN|trace-lease|trace absent; lease idle|run ostrom pass gatekeeper and confirm it creates sprint.jsonl\n",
             "WARN|trace-completeness|no gatekeeper pass ever recorded|run ostrom pass gatekeeper and confirm it records pass-ended\n",
-            "OK|work-orders|no work orders in flight|\n",
+            "OK|work-orders|no work orders in flight; default caps: implementer wall 4h (default), pass wall 30m (default), idle -|\n",
             "OK|worktrees|count=0 total_bytes=0 ceiling_bytes=21474836480|\n",
             "WARN|builder-pass|no builder pass ever recorded|run ostrom pass builder and confirm it records pass-ended\n",
             "WARN|gatekeeper-pass|no gatekeeper pass ever recorded|run ostrom pass gatekeeper and confirm it records pass-ended\n",
             "WARN|publish|no publish has been recorded|run ostrom sweep --publish-repository <owner/repo> and confirm the state branch is reachable\n",
-            "OK|environment|local|\n",
             "OK|config-parser|used the built-in ostrom-shape parser (top-level scalars, one level of nesting, inline lists, and comments; a DEFER line is still resolved by the caller)|\n"
         );
         assert_eq!(report, expected);

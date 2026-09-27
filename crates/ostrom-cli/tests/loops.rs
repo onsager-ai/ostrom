@@ -89,9 +89,10 @@ fn rendered_units_match_the_committed_fixture_and_check_clean() {
 }
 
 // ostrom#599 / #612: the sweep-lease wait ceiling is bounded by this same
-// `TimeoutStartSec`, a value `umwelt-runtime`'s loop unit renderer holds as a
-// template literal rather than a constant it shares with `ostrom-store`. This
-// is the independent side of that relationship (repo principle 6): if the
+// `TimeoutStartSec`, which since #619 is the loop's wall cap plus the
+// termination grace (`ostrom_core::DEFAULT_PASS_WALL_SECONDS` undeclared), a
+// value `ostrom-store` does not share. This is the independent side of that
+// relationship (repo principle 6): if the
 // rendered unit's timeout moves, or the ceiling moves, this fails until
 // `ostrom_store::SWEEP_LEASE_CEILING_SECONDS` and
 // `ostrom_store::MINIMUM_PASS_WORK_SECONDS` still leave a valid gap.

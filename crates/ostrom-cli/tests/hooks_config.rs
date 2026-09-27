@@ -4,47 +4,6 @@ use chrono::{DateTime, Utc};
 use tempfile::tempdir;
 
 #[test]
-fn session_start_constitution_matches_the_retired_shell_bytes() {
-    let fixture = tempdir().expect("temporary hook fixture");
-    let plugin = fixture.path().join("plugin");
-    let home = fixture.path().join("home");
-    let user = home.join(".claude/ostrom");
-    let repository = fixture.path().join("repository");
-    fs::create_dir_all(plugin.join("rules")).unwrap();
-    fs::create_dir_all(user.join("rules.d")).unwrap();
-    fs::create_dir_all(repository.join(".ostrom/rules.d")).unwrap();
-    fs::write(plugin.join("rules/frozen-rules.md"), "SHIPPED\n").unwrap();
-    fs::write(user.join("rules.md"), "<!-- seeded only -->\n").unwrap();
-    fs::write(user.join("rules.d/10-user.md"), "USER RULE\n").unwrap();
-    fs::write(repository.join(".ostrom/rules.md"), "REPO RULE\n").unwrap();
-
-    let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
-        .args(["hook", "session-start"])
-        .env("OSTROM_HOME", &user)
-        .env("OSTROM_PLUGIN_ROOT", &plugin)
-        .env("HOME", &home)
-        .current_dir(&repository)
-        .output()
-        .expect("render constitution");
-    assert!(output.status.success());
-    let expected = concat!(
-        "SHIPPED\n",
-        "\n",
-        "<!-- constitution: layers below override the shipped rules above on conflict -->\n",
-        "\n",
-        "<!-- constitution layer: user (~/.claude/ostrom/rules.d/10-user.md) -->\n",
-        "\n",
-        "USER RULE\n",
-        "\n",
-        "<!-- constitution layer: repo (./.ostrom/rules.md) -->\n",
-        "\n",
-        "REPO RULE\n",
-    );
-    assert_eq!(output.stdout, expected.as_bytes());
-    assert!(output.stderr.is_empty());
-}
-
-#[test]
 fn digest_envelope_matches_the_retired_shell_bytes() {
     let fixture = tempdir().expect("temporary digest fixture");
     fs::write(
