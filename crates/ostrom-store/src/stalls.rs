@@ -314,7 +314,7 @@ pub(crate) fn reap_intent(state: &Path, run_id: &str) -> Option<ReapIntent> {
     let file = claim::read(&claim_path(state, run_id)).ok().flatten()?;
     let record = file.record()?;
     record
-        .get("reason")
+        .get("signalled_at")
         .is_some_and(Value::is_string)
         .then(|| ReapIntent::from_record(record))
         .flatten()
@@ -420,7 +420,7 @@ fn retained_failures(previous: Vec<Value>, pass: &ReapPass, new: Vec<Value>) -> 
             // A failure that concerned no one hold is replaced by this reap's
             // own, if it has one.
             failure["run_id"].as_str().is_some_and(|run_id| {
-                !pass.observed || (pass.open.contains(run_id) && pass.examined.is_empty())
+                !pass.observed || (pass.open.contains(run_id) && !pass.examined.contains(run_id))
             })
         })
         .chain(new)

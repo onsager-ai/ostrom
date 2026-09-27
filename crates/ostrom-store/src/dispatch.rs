@@ -349,14 +349,16 @@ fn run_dispatch_with_registry_and_minter(
     // repository scope (a hand run) reaps nothing: only `ostrom up` reaps
     // every hold. Reaping is best effort and never stops this dispatch: an
     // error is printed and recorded for doctor (#635).
-    let reaped = Some(request.repositories.as_ref())
+    let reaped = request
+        .repositories
+        .as_ref()
         .map(|repositories| {
             crate::stalls::reap_stalled_holds(
                 &request.paths,
                 &request.clock,
                 "dispatch",
                 context.parent_run_id.as_deref(),
-                repositories,
+                Some(repositories),
             )
         })
         .unwrap_or_default();
