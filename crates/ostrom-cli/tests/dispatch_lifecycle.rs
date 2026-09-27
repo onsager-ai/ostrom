@@ -1097,6 +1097,85 @@ fn a_live_silent_hold_is_reaped_by_dispatch_before_the_concurrency_count() {
     );
 }
 
+/// #619: the stall reaper writes an order's `work-failed` before it signals
+/// the implementer. The implementer, stopping on that signal, must not add a
+/// second terminal row for the same order.
+#[test]
+fn an_implementer_whose_order_the_reaper_already_closed_writes_no_second_terminal_row() {
+    let fixture = DispatchFixture::new(false);
+    let (_codex_environment, credential) = runnable_implementer(&fixture);
+    let codex_pid = fixture.root.path().join("codex.pid");
+    executable(
+        &fixture.codex,
+        &format!(
+            "if [ \"${{1:-}}\" = --version ]; then exit 0; fi\nprintf '%s\\n' \"$$\" >'{}'\nexec sleep 60",
+            codex_pid.display()
+        ),
+    );
+    let unit = "ostrom-implementer-reaped";
+    fs::write(
+        fixture
+            .state
+            .join(format!("implementer-item-{}.lease", fixture.item_hash)),
+        format!("{{\"owner\":\"{unit}\",\"started_at\":1,\"expires_at\":9999999999}}\n"),
+    )
+    .expect("write the implementer lease");
+    let order_id = WorkOrder::from_json(&fs::read(&fixture.order_file).expect("read order"))
+        .expect("valid work order")
+        .order_id;
+    let implementer = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .arg("implement")
+        .arg(&fixture.order_file)
+        .arg(unit)
+        .current_dir(fixture.root.path())
+        .env_clear()
+        .env("OSTROM_HOME", &fixture.state)
+        .env("HOME", &fixture.home)
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("OSTROM_PLUGIN_ROOT", plugin_root())
+        .env("MANDATE_IMPLEMENTER_SOURCE_REPO", &fixture.source)
+        .env("MANDATE_GH_AS_BIN", &credential)
+        .env("CODEX_BIN", &fixture.codex)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start the implementer");
+    let implementer_pid = implementer.id();
+    let mut implementer = implementer;
+    wait_until(Duration::from_secs(30), || {
+        fs::read_to_string(&codex_pid).is_ok_and(|pid| !pid.trim().is_empty())
+    });
+    let reaped = json!({
+        "ts": "2026-08-01T00:00:00Z",
+        "kind": "work-failed",
+        "fact": {
+            "schema_version": 1,
+            "item_id": "placeholder-org/alpha#7",
+            "order_id": order_id,
+            "unit_name": unit,
+            "reason": "stalled",
+            "cost_usd": 20.0,
+            "reaped": true,
+        },
+        "narration": {},
+    });
+    let mut appended = fs::read_to_string(fixture.state.join("sprint.jsonl")).unwrap_or_default();
+    appended.push_str(&format!("{reaped}\n"));
+    fs::write(fixture.state.join("sprint.jsonl"), appended).expect("record the reaper's row");
+    kill_pid(implementer_pid, "TERM");
+    let _ = implementer.wait();
+
+    let terminal = trace(&fixture.state)
+        .into_iter()
+        .filter(|row| {
+            matches!(row["kind"].as_str(), Some("work-completed" | "work-failed"))
+                && row["fact"]["order_id"] == order_id.as_str()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(terminal.len(), 1, "{terminal:?}");
+    assert_eq!(terminal[0]["fact"]["reason"], "stalled");
+}
+
 /// Compose `manifest` as this state root's current policy version, signed as
 /// the operator's, the way `ostrom compose` installs one.
 fn compose_current(state: &Path, manifest: &str) {
