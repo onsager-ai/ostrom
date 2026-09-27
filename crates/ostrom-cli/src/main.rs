@@ -969,8 +969,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(fd) = events_fd {
                 arguments.extend(["--events-fd".into(), fd.to_string().into()]);
             }
-            // MUTATION (principle 7, #618): --run-id is no longer forwarded to the worker.
-            let _ = run_id;
+            if let Some(run_id) = run_id {
+                arguments.extend(["--run-id".into(), run_id.into()]);
+            }
             supervise(&arguments, Some((&work_order_file, &unit_name)), &clock)
         }
         Command::ReapWorktrees { apply } => {
