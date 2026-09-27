@@ -694,46 +694,52 @@ fn dispatch_mints_the_run_id_the_implementer_and_its_harness_carry() {
         .iter()
         .find(|row| row["kind"] == "work-dispatched")
         .expect("work-dispatched row");
-    let run_id = dispatched["fact"]["run_id"]
-        .as_str()
-        .expect("work-dispatched names its run id");
+    let recorded = dispatched["fact"]["run_id"].clone();
     let order_id = dispatched["fact"]["order_id"]
         .as_str()
         .expect("work-dispatched names its order");
-    assert_eq!(dispatched["fact"]["runner"], "agent/codex");
-    assert_eq!(
-        dispatched["fact"]["parent_run_id"],
-        "builder-parent-placeholder-run"
-    );
-
-    let implementer_run = run_started_events(&fixture.state)
+    // Every observation is gathered before one comparison, so a failure shows
+    // each place the id is missing or different at once instead of stopping
+    // at the first.
+    let implementer_events_run_id = run_started_events(&fixture.state)
         .into_iter()
         .find(|event| event["payload"]["workOrder"] == order_id)
-        .unwrap_or_else(|| panic!("no implementer run for the order; implementer: {log}"));
-    assert_eq!(
-        implementer_run["runId"], dispatched["fact"]["run_id"],
-        "the implementer wrote its events under an id dispatch did not record"
-    );
-    let terminal = trace
+        .map_or(Value::Null, |event| event["runId"].clone());
+    let terminal_run_id = trace
         .iter()
         .find(|row| {
             matches!(row["kind"].as_str(), Some("work-completed" | "work-failed"))
                 && row["fact"]["order_id"] == order_id
         })
-        .unwrap_or_else(|| panic!("no implementer terminal row; implementer: {log}"));
-    assert_eq!(terminal["fact"]["run_id"], dispatched["fact"]["run_id"]);
-
-    let environment = fs::read_to_string(&codex_environment)
-        .unwrap_or_else(|_| panic!("the Codex stub never ran; implementer: {log}"));
-    for expected in [
-        format!("OSTROM_RUN_ID={run_id}"),
-        format!("OSTROM_WORK_ORDER_ID={order_id}"),
-    ] {
-        assert!(
-            environment.lines().any(|line| line == expected),
-            "missing {expected}: {environment}"
-        );
-    }
+        .map_or(Value::Null, |row| row["fact"]["run_id"].clone());
+    let environment = fs::read_to_string(&codex_environment).unwrap_or_default();
+    let harness = |name: &str| {
+        environment
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}=")))
+            .map_or(Value::Null, |value| json!(value))
+    };
+    assert_eq!(
+        json!({
+            "work_dispatched_names_a_run_id": recorded.is_string(),
+            "runner": dispatched["fact"]["runner"],
+            "parent_run_id": dispatched["fact"]["parent_run_id"],
+            "implementer_events_run_id": implementer_events_run_id,
+            "implementer_terminal_run_id": terminal_run_id,
+            "harness_OSTROM_RUN_ID": harness("OSTROM_RUN_ID"),
+            "harness_OSTROM_WORK_ORDER_ID": harness("OSTROM_WORK_ORDER_ID"),
+        }),
+        json!({
+            "work_dispatched_names_a_run_id": true,
+            "runner": "agent/codex",
+            "parent_run_id": "builder-parent-placeholder-run",
+            "implementer_events_run_id": recorded,
+            "implementer_terminal_run_id": recorded,
+            "harness_OSTROM_RUN_ID": recorded,
+            "harness_OSTROM_WORK_ORDER_ID": order_id,
+        }),
+        "implementer log: {log}\nharness environment: {environment}"
+    );
 }
 
 /// #618: `ostrom ps --json` lists an open dispatch under the run id its record
