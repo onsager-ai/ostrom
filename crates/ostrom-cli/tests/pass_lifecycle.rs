@@ -1994,7 +1994,11 @@ fn a_term_to_a_pass_whose_worker_hangs_still_stops_its_harness() {
 
     signal(supervisor, "TERM");
     let deadline = Instant::now() + Duration::from_secs(30);
-    while support::same_process_running(harness, harness_start_time) && Instant::now() < deadline {
+    // The supervisor removes the record just after it sees the harness gone.
+    while (support::same_process_running(harness, harness_start_time)
+        || support::harness_records(&fixture.state) > 0)
+        && Instant::now() < deadline
+    {
         thread::sleep(Duration::from_millis(50));
     }
 
