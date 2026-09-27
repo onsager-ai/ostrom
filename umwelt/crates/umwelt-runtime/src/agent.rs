@@ -272,6 +272,21 @@ impl RunnerLaunch {
         Self { environment }
     }
 
+    /// Add one variable to the environment the launched runner receives.
+    ///
+    /// The consumer names the variable and gives it meaning; the runtime only
+    /// carries it. A name added twice keeps both entries, and the later one
+    /// wins when the environment is applied in order.
+    #[must_use]
+    pub fn with_environment(
+        mut self,
+        name: impl Into<OsString>,
+        value: impl Into<OsString>,
+    ) -> Self {
+        self.environment.push((name.into(), value.into()));
+        self
+    }
+
     #[must_use]
     pub fn environment(&self) -> &[(OsString, OsString)] {
         &self.environment

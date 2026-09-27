@@ -201,8 +201,12 @@ enum Command {
     Rollback,
     /// Reconcile due loop processes with the signed current policy version.
     Up,
-    /// Report declared loops and their persisted runtime state.
-    Ps,
+    /// Report declared loops, their persisted runtime state, and open holds.
+    Ps {
+        /// Print only the open holds, one JSON object per line.
+        #[arg(long)]
+        json: bool,
+    },
     /// Print the persisted log for one declared loop.
     Logs { name: String },
     /// Print stored ethogram events for one run.
@@ -247,6 +251,10 @@ enum Command {
         /// Also stream stamped ethogram events to this open file descriptor.
         #[arg(long)]
         events_fd: Option<u32>,
+        /// The run id dispatch recorded for this hold. Without it the
+        /// implementer mints its own, as a hand run always has.
+        #[arg(long, hide = true)]
+        run_id: Option<String>,
     },
     /// Report or remove worktrees whose remote work is mechanically resolved.
     ReapWorktrees {
@@ -274,6 +282,8 @@ enum Command {
         runner_name: String,
         #[arg(long)]
         events_fd: Option<u32>,
+        #[arg(long)]
+        run_id: Option<String>,
         supervisor_pid: u32,
     },
     #[command(name = "__loop-worker", hide = true)]
@@ -730,8 +740,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 outcome.started, outcome.stopped, outcome.unchanged, outcome.stale, outcome.not_due
             );
         }
-        Command::Ps => {
-            io::stdout().write_all(loop_supervisor::render_ps(&paths, &clock)?.as_bytes())?
+        Command::Ps { json } => {
+            let output = if json {
+                loop_supervisor::render_holdings_json(&paths, &clock)?
+            } else {
+                loop_supervisor::render_ps(&paths, &clock)?
+            };
+            io::stdout().write_all(output.as_bytes())?
         }
         Command::Logs { name } => {
             io::stdout().write_all(&loop_supervisor::read_logs(&paths, &name)?)?;
@@ -942,6 +957,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             unit_name,
             runner_name,
             events_fd,
+            run_id,
         } => {
             let events_fd = resolve_events_fd(events_fd)?;
             let mut arguments = vec![
@@ -952,6 +968,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             ];
             if let Some(fd) = events_fd {
                 arguments.extend(["--events-fd".into(), fd.to_string().into()]);
+            }
+            if let Some(run_id) = run_id {
+                arguments.extend(["--run-id".into(), run_id.into()]);
             }
             supervise(&arguments, Some((&work_order_file, &unit_name)), &clock)
         }
@@ -989,6 +1008,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             unit_name,
             runner_name,
             events_fd,
+            run_id,
             supervisor_pid,
         } => run_implement_worker(
             work_order_file,
@@ -996,6 +1016,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             runner_name,
             supervisor_pid,
             resolve_events_fd(events_fd)?,
+            run_id,
             clock,
         ),
         Command::Dispatch { arguments } => {
@@ -3235,6 +3256,7 @@ fn run_implement_worker(
     runner_name: String,
     supervisor_pid: u32,
     events_fd: Option<u32>,
+    run_id: Option<String>,
     clock: Clock,
 ) -> ! {
     let signals = register_signals().unwrap_or_else(|error| {
@@ -3259,6 +3281,7 @@ fn run_implement_worker(
         supervisor_pid: Some(supervisor_pid),
         events_fd,
         clock,
+        run_id,
     };
     let registry = core_agent_registry();
     match run_implement_with_registry(&request, &registry, &runner_name) {

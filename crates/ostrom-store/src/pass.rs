@@ -661,6 +661,15 @@ fn wire_ceilings(caps: RunCaps) -> Option<ethogram::RunCeilings> {
     .then(|| caps.to_wire())
 }
 
+/// `pass-started` names the run id minted for this pass, the id its events are
+/// written under and its harness child receives as `OSTROM_RUN_ID`, so a hold
+/// can be followed from the fact to the process. `pass-ended` is part of the
+/// frozen pass contract and does not gain it.
+fn with_run_id(mut fact: Map<String, Value>, run_id: &str) -> Map<String, Value> {
+    fact.insert("run_id".to_owned(), json!(run_id));
+    fact
+}
+
 fn refuse_empty_repository_scope(
     request: &PassRequest,
     events: &mut RunEventGuard,
@@ -681,7 +690,7 @@ fn refuse_empty_repository_scope(
         &TraceAppend {
             ts: request.clock.timestamp(),
             kind: "pass-started".to_owned(),
-            fact: common.clone(),
+            fact: with_run_id(common.clone(), events.run_id()),
             narration: Map::new(),
         },
     )
@@ -1065,7 +1074,7 @@ fn run_pass_with_bridge_probe_timeout(
                 &TraceAppend {
                     ts: guard.trace_time.clone(),
                     kind: "pass-started".to_owned(),
-                    fact,
+                    fact: with_run_id(fact, guard.events.run_id()),
                     narration: Map::new(),
                 },
             )
@@ -1104,7 +1113,7 @@ fn run_pass_with_bridge_probe_timeout(
         &TraceAppend {
             ts: guard.trace_time.clone(),
             kind: "pass-started".to_owned(),
-            fact: start_fact,
+            fact: with_run_id(start_fact, guard.events.run_id()),
             narration: Map::new(),
         },
     )
@@ -1340,6 +1349,11 @@ fn run_pass_with_bridge_probe_timeout(
             repositories.join(","),
         );
     }
+    // The run id `pass-started` records. An observer reads it from
+    // `/proc/<pid>/environ`, and an `ostrom dispatch` the agent runs records it
+    // as `parent_run_id`. Set here, never inherited: a pass started under
+    // another run must not pass that run's id on as its own.
+    command.env(environment::OSTROM_RUN_ID.name, guard.events.run_id());
     set_process_group(&mut command);
     let mut child = command.spawn().map_err(|error| {
         PassError::failed(request.role, format!("could not start Claude: {error}"), 1)

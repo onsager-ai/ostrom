@@ -10,6 +10,7 @@
   Nothing outside this workspace consumes `ostrom-store` today, so this costs
   nothing now, but it is a breaking change to a public type and is recorded
   as one.
+- Holdings: one run id per hold, recorded, passed to every harness child, and shown by `ostrom ps` (#618). `ostrom dispatch` now mints the implementer's run id and records it in `work-dispatched` as `run_id`, with `runner` (the registry key) and, when the dispatcher runs under an ostrom run, `parent_run_id`; it hands the id to `ostrom implement` through a hidden `--run-id`, and the implementer writes its events and its `work-completed` / `work-failed` row under it. `pass-started` gains `run_id`; `pass-ended` is unchanged. The record changes are additive. A pass's harness receives `OSTROM_RUN_ID`, and a dispatched implementer and its Codex child receive `OSTROM_RUN_ID` and `OSTROM_WORK_ORDER_ID`; both names are an external contract, documented in `docs/loops.md`. `ostrom ps` lists every open hold after the loop table (run id, runner, item, age, last event, lease state), and `ostrom ps --json` prints only the holds as JSON lines without needing a current policy version. A hand-run `ostrom implement` behaves as before. **Breaking** for struct-literal construction only: `ostrom_store::ImplementRequest` gains a public `run_id` field (pass `None` for today's behaviour).
 
 ## 0.16.0 (2026-09-18)
 

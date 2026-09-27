@@ -90,6 +90,25 @@ checked before the operation begins. `ps` and `logs` read the persisted state
 and log files; an unavailable measurement is printed as `unknown:<cause>`,
 never as zero.
 
+### Holdings
+
+After the loop table, `ostrom ps` lists every open hold, read from local files only: the trace, the lease files, and each run's event log. An implementer is held from its `work-dispatched` row until a `work-completed` or `work-failed` row with the same `order_id`; a pass is held from its `pass-started` row until a `pass-ended` row with the same `owner`. Each hold shows its run id, its runner (the registry key, such as `agent/codex`; `-` for a pass), its item (`-` for a pass), the age of the record that opened it, the time of the newest event in that run's `events.jsonl` under `<state>/runs`, and its lease state: `live`, `expired`, or `-` when no lease names the hold's owner. A record written before run ids were recorded shows `-` for what it lacks.
+
+`ostrom ps --json` prints only the holds, one JSON object per line, with the fields `kind` (`implementer` or `pass`), `run_id`, `runner`, `item`, `order_id`, `owner`, `started_at`, `age_seconds`, `last_event_at` and `lease`; a field the record lacks is `null`. It needs no current policy version, so a scheduler or an observer can read it on a machine that has never composed one.
+
+One run id names each hold. `ostrom dispatch` mints the implementer's run id before it starts the unit, records it in `work-dispatched` as `run_id` together with `runner` and, when the dispatcher itself runs under an ostrom run, `parent_run_id` (a pass's agent runs `ostrom dispatch`, so this is the pass-to-implementer edge), and passes it to `ostrom implement`, which writes its events and its terminal row under it. A pass records the run id it mints in `pass-started`; `pass-ended` is part of the frozen pass contract and is unchanged. A hand-run `ostrom implement` mints its own run id, as it always has, and its terminal row does not name it.
+
+#### The run environment is a contract
+
+`OSTROM_RUN_ID` and `OSTROM_WORK_ORDER_ID` are an external contract. An observer outside ostrom maps a live process to the run and the order it serves by reading them from `/proc/<pid>/environ`, so neither name is renamed, removed or given a different meaning except by a spec that the observer's side carries too.
+
+| Variable | Set on | Value |
+|---|---|---|
+| `OSTROM_RUN_ID` | a pass's harness process; a dispatched `ostrom implement` and its harness process | the `run_id` recorded in that run's `pass-started` or `work-dispatched` row |
+| `OSTROM_WORK_ORDER_ID` | a dispatched `ostrom implement` and its harness process | the `order_id` recorded in `work-dispatched` |
+
+ostrom sets each value explicitly on the child it starts, never by changing its own process environment, and the value it sets replaces any the parent inherited from an enclosing run. The dispatched implementer receives both through its runner's launch environment, under either dispatch backend, and its harness inherits them. ostrom reads `OSTROM_RUN_ID` itself only to record a dispatch's `parent_run_id`. Two processes do not carry the contract: a hand-run `ostrom implement`, whose harness inherits whatever the invoking environment holds, and the loop worker `ostrom up` starts, which has no run id of its own.
+
 Render and verify artifacts with:
 
 ```sh

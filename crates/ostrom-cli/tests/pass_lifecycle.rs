@@ -1314,6 +1314,12 @@ fn normalize_pass_trace(bytes: &[u8]) -> Vec<u8> {
         if row["kind"] == "pass-ended" {
             row["fact"]["duration_seconds"] = Value::from(0);
         }
+        // The pass's run id carries its wall-clock start and pid (#618). Its
+        // presence and position are compared here; its value is compared with
+        // the run's own events in `a_pass_records_its_run_id_and_hands_it_to_the_harness`.
+        if row["kind"] == "pass-started" && row["fact"].get("run_id").is_some() {
+            row["fact"]["run_id"] = Value::String("<pass-run-id>".to_owned());
+        }
         serde_json::to_writer(&mut normalized, &row).expect("serialize normalized trace");
         normalized.push(b'\n');
     }
@@ -1336,6 +1342,92 @@ fn error_exit_releases_and_finalizes() {
     assert_eq!(events[1]["type"], "run.finished");
     assert_eq!(events[1]["payload"]["outcome"], "failed");
     assert_eq!(events[1]["payload"]["reason"], "pass-failed");
+}
+
+/// #618: the pass's run id is one value in four places -- `pass-started`, the
+/// run's own events, the harness child's `OSTROM_RUN_ID`, and the holding
+/// `ostrom ps --json` reports while the pass is open -- and each is compared
+/// with the record rather than pinned. The harness runs `ps` itself, so the
+/// open hold is observed from inside the pass, and it is gone once the pass
+/// has ended.
+#[test]
+fn a_pass_records_its_run_id_hands_it_to_the_harness_and_holds_until_it_ends() {
+    let fixture = Fixture::new(concat!(
+        "printf '%s\\n' \"$OSTROM_RUN_ID\" >\"$OSTROM_TEST_RUN_ID\"\n",
+        "\"$OSTROM_TEST_OSTROM\" ps --json >\"$OSTROM_TEST_PS\""
+    ));
+    let harness_run_id = fixture.root.path().join("harness-run-id");
+    let open_ps = fixture.root.path().join("ps-during-pass.jsonl");
+
+    let status = fixture
+        .command()
+        // A pass started under another run hands the harness its own id.
+        .env("OSTROM_RUN_ID", "inherited-placeholder-run")
+        .env("OSTROM_TEST_RUN_ID", &harness_run_id)
+        .env("OSTROM_TEST_PS", &open_ps)
+        .env("OSTROM_TEST_OSTROM", env!("CARGO_BIN_EXE_ostrom"))
+        .status()
+        .expect("run pass");
+    assert!(status.success());
+
+    let trace = fixture.trace();
+    let started = trace
+        .iter()
+        .find(|row| row["kind"] == "pass-started")
+        .expect("pass-started row");
+    let recorded = started["fact"]["run_id"]
+        .as_str()
+        .expect("pass-started names its run id");
+    let events = fixture.run_events();
+    assert_eq!(events[0]["type"], "run.started");
+    assert_eq!(events[0]["runId"], started["fact"]["run_id"]);
+    assert_eq!(
+        fs::read_to_string(&harness_run_id)
+            .expect("the harness recorded its environment")
+            .trim_end(),
+        recorded
+    );
+    let ended = trace
+        .iter()
+        .find(|row| row["kind"] == "pass-ended")
+        .expect("pass-ended row");
+    assert!(
+        ended["fact"].get("run_id").is_none(),
+        "pass-ended is part of the frozen pass contract: {ended}"
+    );
+
+    let open = fs::read_to_string(&open_ps)
+        .expect("the harness ran ps")
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("ps --json line"))
+        .collect::<Vec<_>>();
+    let holding = open
+        .iter()
+        .find(|holding| holding["kind"] == "pass")
+        .unwrap_or_else(|| panic!("the open pass was not listed: {open:?}"));
+    assert_eq!(holding["run_id"], started["fact"]["run_id"]);
+    assert_eq!(holding["owner"], started["fact"]["owner"]);
+    assert_eq!(holding["lease"], "live");
+    assert!(
+        events
+            .iter()
+            .any(|event| event["ts"] == holding["last_event_at"]),
+        "last_event_at is not an event of this run: {holding}"
+    );
+
+    let after = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .args(["ps", "--json"])
+        .env_clear()
+        .env("OSTROM_HOME", &fixture.state)
+        .env("HOME", fixture.root.path())
+        .output()
+        .expect("run ps after the pass");
+    assert!(after.status.success());
+    assert!(
+        !String::from_utf8_lossy(&after.stdout).contains(recorded),
+        "the ended pass is still listed: {}",
+        String::from_utf8_lossy(&after.stdout)
+    );
 }
 
 #[test]
