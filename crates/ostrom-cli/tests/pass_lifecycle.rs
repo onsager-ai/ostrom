@@ -744,7 +744,7 @@ fn without_a_control_descriptor_stdin_is_ignored_and_existing_bytes_are_preserve
     );
     assert_eq!(normalize_pass_trace(&fs::read(fixture.state.join("sprint.jsonl")).unwrap()),
         concat!(
-            "{\"ts\":\"2026-08-01T00:00:00Z\",\"kind\":\"pass-started\",\"fact\":{\"owner\":\"builder-a1b2c3d4-wake7\",\"sweep\":\"reused\",\"generation_id\":\"pass-lifecycle-fresh-generation\"},\"narration\":{}}\n",
+            "{\"ts\":\"2026-08-01T00:00:00Z\",\"kind\":\"pass-started\",\"fact\":{\"owner\":\"builder-a1b2c3d4-wake7\",\"sweep\":\"reused\",\"generation_id\":\"pass-lifecycle-fresh-generation\",\"run_id\":\"<pass-run-id>\"},\"narration\":{}}\n",
             "{\"ts\":\"2026-08-01T00:00:00Z\",\"kind\":\"pass-ended\",\"fact\":{\"owner\":\"builder-a1b2c3d4-wake7\",\"outcome\":\"no-op\",\"cost_usd\":1.25,\"duration_seconds\":0,\"reason\":\"blocked\"},\"narration\":{}}\n"
         ).as_bytes());
     let events = fixture.run_events();
