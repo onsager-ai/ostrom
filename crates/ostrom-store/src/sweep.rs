@@ -1485,17 +1485,14 @@ fn acquire_repositories_independently(
     mut acquire: impl FnMut(RepositoryName) -> Result<RepositorySnapshot, SweepError>,
 ) -> (Vec<RepositorySnapshot>, Vec<String>) {
     let mut snapshots = Vec::new();
-    let mut faults = Vec::new();
+    let faults = Vec::new();
     for repo in repositories {
-        let name = repo.as_str().to_owned();
         match acquire(repo) {
             Ok(snapshot) => snapshots.push(snapshot),
             // TEMPORARY (#579 principle-7 evidence): swallow the fault
             // without recording it, so the new test trips. Reverted in the
             // next commit.
-            Err(_) => {
-                let _ = &name;
-            }
+            Err(_) => {}
         }
     }
     (snapshots, faults)
