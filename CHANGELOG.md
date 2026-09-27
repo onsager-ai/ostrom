@@ -14,7 +14,13 @@
   failures, undispatchable repositories, stalled holds, local drift) stay
   exactly as they were. The #617 plan originally grouped the digest with
   the constitution subsystem; the principal narrowed that ruling to
-  "Constitution only; keep digest."
+  "Constitution only; keep digest." `ostrom doctor`'s `environment` check
+  goes with the constitution code it existed to diagnose: `check_environment`
+  and `rule_layer_has_content` (`ostrom-checks/src/doctor.rs`) warned a
+  cloud session that no user rules layer was resolved, a warning about a
+  feature this PR deletes. Nothing else read the `CLAUDE_CODE_REMOTE`
+  local-vs-cloud distinction, so the check is removed rather than
+  narrowed, and `environment` drops from `DOCTOR_CHECKS`.
 - **Breaking:** `ostrom explain` and `ostrom generate` are removed (#617). Both
   were operator introspection tools, not on the delivery loop's path:
   `PolicyBundle::explain_pull_request` has its own production caller in the

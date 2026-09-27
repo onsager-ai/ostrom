@@ -31,7 +31,6 @@ pub const DOCTOR_CHECKS: &[&str] = &[
     "builder-pass",
     "gatekeeper-pass",
     "publish",
-    "environment",
     "config-parser",
 ];
 
@@ -227,7 +226,6 @@ fn run_named_check(context: &mut DoctorContext, name: &str) -> DoctorResult {
         "builder-pass" => check_role_pass(context, DeliveryRole::Builder),
         "gatekeeper-pass" => check_role_pass(context, DeliveryRole::Gatekeeper),
         "publish" => check_publish(context),
-        "environment" => check_environment(context),
         "config-parser" => check_config_parser(),
         _ => unreachable!("validated doctor check name"),
     }
@@ -701,31 +699,6 @@ fn check_cli_launcher(context: &DoctorContext) -> DoctorResult {
         ),
         format!("{INSTALL_COMMAND} (without --no-optional or --omit=optional)"),
     )
-}
-
-fn rule_layer_has_content(root: &Path) -> bool {
-    let mut files = vec![root.join("rules.md")];
-    files.extend(
-        fs::read_dir(root.join("rules.d"))
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().is_some_and(|extension| extension == "md")),
-    );
-    files.into_iter().any(|path| {
-        let Ok(mut text) = fs::read_to_string(path) else {
-            return false;
-        };
-        while let Some(start) = text.find("<!--") {
-            let Some(relative_end) = text[start + 4..].find("-->") else {
-                text.truncate(start);
-                break;
-            };
-            text.replace_range(start..start + 4 + relative_end + 3, "");
-        }
-        text.chars().any(|character| !character.is_whitespace())
-    })
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1804,26 +1777,6 @@ fn check_publish(context: &DoctorContext) -> DoctorResult {
     }
 }
 
-fn check_environment(context: &DoctorContext) -> DoctorResult {
-    if context.env("CLAUDE_CODE_REMOTE").is_none() {
-        DoctorResult::new(DoctorStatus::Ok, "environment", "local", "")
-    } else if rule_layer_has_content(&context.options.config_dir.join("ostrom")) {
-        DoctorResult::new(
-            DoctorStatus::Ok,
-            "environment",
-            "cloud, user rules layer resolved",
-            "",
-        )
-    } else {
-        DoctorResult::new(
-            DoctorStatus::Warn,
-            "environment",
-            "cloud session, no user rules layer resolved (private layer absent)",
-            "provide the private layer's credentials/config for this environment",
-        )
-    }
-}
-
 fn check_config_parser() -> DoctorResult {
     DoctorResult::new(
         DoctorStatus::Ok,
@@ -2190,7 +2143,6 @@ mod tests {
             "WARN|builder-pass|no builder pass ever recorded|run ostrom pass builder and confirm it records pass-ended\n",
             "WARN|gatekeeper-pass|no gatekeeper pass ever recorded|run ostrom pass gatekeeper and confirm it records pass-ended\n",
             "WARN|publish|no publish has been recorded|run ostrom sweep --publish-repository <owner/repo> and confirm the state branch is reachable\n",
-            "OK|environment|local|\n",
             "OK|config-parser|used the built-in ostrom-shape parser (top-level scalars, one level of nesting, inline lists, and comments; a DEFER line is still resolved by the caller)|\n"
         );
         assert_eq!(report, expected);
