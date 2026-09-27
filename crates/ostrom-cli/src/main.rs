@@ -41,8 +41,8 @@ use ostrom_store::{
     finalize_exited_implementer, generated_run_id, grant_excuse, grant_excuse_at_head,
     inherited_repository_scope, item_hash, lease_status, lint_queue_state, list_excuses,
     list_queue_json, load_config_or_defaults, local_drift, parse_repository_list, read_trace_json,
-    release_lease, render_constitution, render_digest, revoke_excuse, run_dispatch_with_registry,
-    run_gate, run_implement_with_registry, run_pass, run_plan, run_reap_worktrees, run_repair_prs,
+    release_lease, render_digest, revoke_excuse, run_dispatch_with_registry, run_gate,
+    run_implement_with_registry, run_pass, run_plan, run_reap_worktrees, run_repair_prs,
     run_selection, run_sweep_with_publication_source, validate_lease_name,
     validate_work_order_file,
 };
@@ -400,8 +400,6 @@ enum LoopsCommand {
 
 #[derive(Debug, Subcommand)]
 enum HookCommand {
-    /// Emit the layered constitution for SessionStart.
-    SessionStart,
     /// Render and acknowledge the durable queue digest.
     Digest,
 }
@@ -837,19 +835,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             )?;
         }
         Command::Hook { command } => match command {
-            HookCommand::SessionStart => {
-                let cwd = env::current_dir().unwrap_or_default();
-                // An override only; with none, the shipped rules compiled
-                // into the binary are the base layer.
-                let plugin_root = environment::OSTROM_PLUGIN_ROOT
-                    .value_os()
-                    .map_or_else(PathBuf::new, PathBuf::from);
-                let home = environment::HOME
-                    .value_os()
-                    .map_or_else(PathBuf::new, PathBuf::from);
-                let output = render_constitution(&plugin_root, &paths.config, &cwd, &home);
-                io::stdout().write_all(output.as_bytes())?;
-            }
             HookCommand::Digest => {
                 let output = render_digest(&DigestOptions {
                     paths,
