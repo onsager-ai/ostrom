@@ -9,6 +9,19 @@
   rendering internals that built the report go with it; `grant_excuse`,
   `revoke_excuse`, `list_excuses`, `active_exception_reason`, and `local_drift`
   are unaffected.
+- **Breaking:** `ostrom replay` is removed, along with its `ostrom-store`
+  module and CLI wiring (#617 C1). Nothing in the surviving delivery loop
+  reads its output; it scanned merged pull requests for misses against the
+  bounce selectors, a solo-operator report `ostrom queue lint` and `ostrom
+  queue reject` do not replace. The dead `acquire_gate_replay_snapshot` and
+  `evaluate_gate_replay` in `ostrom-store::gate`, re-exported at the crate
+  root with no caller anywhere in the workspace, go with it — the live gate
+  path already runs `acquire_metadata`, `evaluate_conditions`, and
+  `aggregate` directly. Also fixed: the README described two commands that
+  do not exist, `ostrom migrate` and `ostrom brief`, and `ostrom-cli`
+  carried orphaned doc comments for them; `umwelt/README.md` claimed nothing
+  depends on it, though `ostrom-cli`, `ostrom-store`, and `ostrom-checks`
+  all link it.
 - **Breaking:** `RepairError::Invalidate` is removed from the public
   `ostrom-store` enum (#599). A repair that changes a repository no longer
   fails outright when it cannot invalidate the sweep generation — contention

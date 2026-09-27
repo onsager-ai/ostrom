@@ -26,7 +26,6 @@ mod publish;
 mod queue;
 mod reap;
 mod repair;
-mod replay;
 mod repository_scope;
 mod run_events;
 mod selection;
@@ -52,8 +51,7 @@ pub use event_store::JsonlEventStore;
 pub use file_store::JsonlSweepStore;
 pub use gate::{
     GATE_READ_PERMISSIONS, GateError, GateOptions, GateOutput, GateReplaySnapshot,
-    acquire_gate_replay_snapshot, evaluate_gate_replay, gate_config_needs_diff_content,
-    load_gate_config, run_gate,
+    gate_config_needs_diff_content, load_gate_config, run_gate,
 };
 pub use hooks::{DigestOptions, HookOutput, render_constitution, render_digest};
 pub use implement::{
@@ -96,7 +94,6 @@ pub use reap::{
     WorktreeReapReport, run_reap_worktrees,
 };
 pub use repair::{RepairOptions, RepairOutput, run_repair_prs};
-pub use replay::{ReplayError, ReplayOptions, replay};
 pub use repository_scope::{
     AvailableRepositoriesError, EffectiveRepositories, REPOSITORY_NOT_AVAILABLE,
     REPOSITORY_NOT_GRANTED, SkippedRepository, available_repositories, effective_repositories,

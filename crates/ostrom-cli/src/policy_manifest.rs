@@ -1141,7 +1141,6 @@ fn command_verbs() -> impl Iterator<Item = &'static str> {
         "plan",
         "queue",
         "repair-prs",
-        "replay",
         "rollback",
         "select-work",
         "sign",

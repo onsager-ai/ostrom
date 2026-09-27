@@ -158,13 +158,6 @@ A configured named harness that cannot be started records
 `assessment_harness_failed`, while malformed, uncited, mismatched, or
 invented-fact output is `assessment_invalid_output`.
 
-`ostrom migrate` moves legacy files into the XDG roots after refusing any
-unexpired named lease. It rewrites in-tree private-key paths, preserves key
-mode `0600`, and leaves the old directory as a compatibility pointer so the
-Bash callers continue to work. Running it twice is a no-op. Stop unattended
-passes before an operator performs the migration even though the command also
-checks their lease files.
-
 `ostrom-core` is not published to crates.io. Out-of-tree consumers may pin a
 Git revision; registering the public crate name remains a principal decision.
 The store transaction, fact-only record boundary, reusable conformance battery,
@@ -215,11 +208,11 @@ signing time, so edit first, then sign.
 
 The `ostrom@ostrom` plugin and its marketplace are retired; the CLI is the only
 distribution. The slash-command surfaces are replaced by their binary
-equivalents: `/ostrom:brief` → `ostrom brief`, `/ostrom:desk` → `ostrom queue`,
-`/ostrom:doctor` → `ostrom doctor`, `/ostrom:gatekeep` → `ostrom pass
-gatekeeper`, and `/ostrom:work` → `ostrom pass builder`. `/ostrom:touch` is
-withdrawn with no replacement. Machine-local config and state under
-`~/.claude/ostrom/` keep their existing filenames and need no migration.
+equivalents: `/ostrom:desk` → `ostrom queue`, `/ostrom:doctor` → `ostrom
+doctor`, `/ostrom:gatekeep` → `ostrom pass gatekeeper`, and `/ostrom:work` →
+`ostrom pass builder`. `/ostrom:brief` and `/ostrom:touch` are withdrawn with
+no replacement. Machine-local config and state under `~/.claude/ostrom/` keep
+their existing filenames and need no migration.
 
 Remove the retired entries from `~/.claude/settings.json`: the `ostrom` entry
 under `enabledPlugins`, and the `ostrom` marketplace under
@@ -558,46 +551,6 @@ An individual grant or deny may override it. Sweep records the first time each
 pull request resolves to the principal floor, a matching deny, or a blocked
 grant requirement. Crossing the threshold adds a `STALLED HOLDS` digest
 finding; it never changes `HOLD` into permission or merges the pull request.
-
-### Selector accuracy
-
-`ostrom queue lint` reports selectors that matched nothing, which is config hygiene,
-not accuracy. Two different errors matter and they are not symmetric. A **miss**
-is a safety failure — something crossed a boundary unreviewed. A **false alarm**
-costs an interruption. Prefer recall wherever an irreversible action is in
-reach and accept the precision loss there; prefer precision everywhere else,
-because an interruption budget spent on noise is unavailable when it matters.
-
-Both are measured, and neither is reduced to a single score:
-
-- **False alarms** accrue going forward. Rejecting an item with `ostrom queue reject` appends one
-  line to `~/.claude/ostrom/selector-events.jsonl` recording which selector put
-  it in front of you. Nothing extra is asked at decision time.
-- **Misses** are computed retroactively. `ostrom replay` is read-only: it
-  scans merged pull requests for changes touching an irreversible surface —
-  workflow files, release tooling, credential-shaped paths — that matched no
-  bounce selector. Its output is a **lower bound**, not the miss rate: a change
-  that touched nothing on that list and matched nothing may still have been a
-  miss.
-
-The report is a table with one row per selector, and it names each prefix's
-tier, because they are not equally trustworthy:
-
-| Tier | Prefixes | Derived from |
-|---|---|---|
-| Content-derived | `path:`, `ref:` | the change itself |
-| Author-written | `title:`, `type:`, `scope:`, `label:` | text the item's author chose |
-
-`type:` and `scope:` are parsed out of the conventional-commit prefix of the
-item's **title**, and labels are set by whoever opened the item. So for any gate
-resting on the author-written tier, the party being gated selects whether the
-gate fires — a release pull request titled `chore: bump version` silently misses
-`type:release`. `path:` is also pull-request-only, so issues have no
-content-derived gating at all.
-
-Prefer content-derived prefixes and exact `reserved` refs wherever a condition
-carries real safety weight. A single accuracy number would hide precisely this
-split, which is why the report does not produce one.
 
 ## Cloud / CI
 
