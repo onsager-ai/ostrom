@@ -229,23 +229,25 @@ impl TerminalGuard {
         if let Err(error) = crate::reap_build_cache(&self.paths.state, &self.order.item_id) {
             eprintln!("ostrom implementer: could not reap build cache: {error}");
         }
-        // The stall reaper (#619) writes this order's terminal row before it
+        // The stall reaper (#619) writes this run's terminal row before it
         // stops the run, so the row says why. The run then must not add a
-        // second one when the signal reaches it.
-        let trace_result = if order_already_terminal(&self.paths, &self.order.order_id) {
-            Ok(())
-        } else {
-            append_trace(
-                &self.paths.trace_file(),
-                &TraceAppend {
-                    ts: self.clock.timestamp(),
-                    kind: kind.to_owned(),
-                    fact,
-                    narration: Map::new(),
-                },
-            )
-            .map(|_| ())
-        };
+        // second one when the signal reaches it. Only a row naming this run
+        // counts: an earlier attempt's row for the same order does not.
+        let trace_result =
+            if run_already_terminal(&self.paths, &self.order.order_id, self.run_events.run_id()) {
+                Ok(())
+            } else {
+                append_trace(
+                    &self.paths.trace_file(),
+                    &TraceAppend {
+                        ts: self.clock.timestamp(),
+                        kind: kind.to_owned(),
+                        fact,
+                        narration: Map::new(),
+                    },
+                )
+                .map(|_| ())
+            };
         let event_usage = observed_usage.map(|usage| RunUsage {
             input_tokens: Some(weighted.saturating_sub(usage.output_tokens)),
             output_tokens: Some(usage.output_tokens),
@@ -499,11 +501,12 @@ fn run_implement_with_registry_and_minter(
     }
 }
 
-fn order_already_terminal(paths: &OstromPaths, order_id: &str) -> bool {
+fn run_already_terminal(paths: &OstromPaths, order_id: &str, run_id: &str) -> bool {
     crate::read_trace(&paths.trace_file()).is_ok_and(|trace| {
         trace.rows.into_iter().filter_map(Result::ok).any(|row| {
             matches!(row.kind.as_str(), "work-completed" | "work-failed")
                 && row.fact.get("order_id").and_then(Value::as_str) == Some(order_id)
+                && row.fact.get("run_id").and_then(Value::as_str) == Some(run_id)
         })
     })
 }

@@ -1145,6 +1145,11 @@ fn an_implementer_whose_order_the_reaper_already_closed_writes_no_second_termina
     wait_until(Duration::from_secs(30), || {
         fs::read_to_string(&codex_pid).is_ok_and(|pid| !pid.trim().is_empty())
     });
+    let run_id = run_started_events(&fixture.state)
+        .into_iter()
+        .find(|event| event["payload"]["workOrder"] == order_id.as_str())
+        .map(|event| event["runId"].clone())
+        .expect("the implementer's run.started");
     let reaped = json!({
         "ts": "2026-08-01T00:00:00Z",
         "kind": "work-failed",
@@ -1153,6 +1158,7 @@ fn an_implementer_whose_order_the_reaper_already_closed_writes_no_second_termina
             "item_id": "placeholder-org/alpha#7",
             "order_id": order_id,
             "unit_name": unit,
+            "run_id": run_id,
             "reason": "stalled",
             "cost_usd": 20.0,
             "reaped": true,
