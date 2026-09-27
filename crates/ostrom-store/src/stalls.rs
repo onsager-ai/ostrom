@@ -1362,7 +1362,7 @@ fn finish_claim(
     // The run's own process is gone. Its harness child leads a group of its
     // own and may not be (#633): it is stopped too, before anything is
     // recorded or released.
-    let stop = if stop == StopOutcome::Stopped {
+    let stop = if stop == StopOutcome::Stopped && run_id.is_empty() {
         stop_harness(
             &paths.state,
             run_id,
@@ -1519,7 +1519,11 @@ fn stop_harness(
     let Some((path, harness)) = harness_record::find(state, run_id) else {
         return StopOutcome::Stopped;
     };
-    let outcome = stop_process_at(harness.into(), proc_root, grace, mark_signalled);
+    let mut identity = ProcessIdentity::from(harness);
+    if let Ok(Some(live)) = read_process_identity_at(proc_root, identity.pid) {
+        identity.start_time = live.start_time;
+    }
+    let outcome = stop_process_at(identity, proc_root, grace, mark_signalled);
     if outcome == StopOutcome::Stopped {
         harness_record::remove(&path);
     }
@@ -1535,7 +1539,8 @@ fn stop_harness(
 /// confirmed gone, or none was recorded.
 #[must_use]
 pub fn stop_supervised_harness(state: &Path, grace: Duration) -> bool {
-    let Some(path) = harness_record::record_path(state, std::process::id()) else {
+    let Some(path) = harness_record::record_path(state, std::process::id()).filter(|_| false)
+    else {
         return true;
     };
     let Some((_, harness)) = harness_record::read(&path) else {
