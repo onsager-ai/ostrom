@@ -542,10 +542,13 @@ fn pass_ended_fact(hold: &ObservedHold, clock: &Clock, reason: &str) -> Map<Stri
         .as_ref()
         .and_then(|ceilings| ceilings.get("costUsd"))
         .and_then(Value::as_f64);
-    let (cost, basis) = declared
-        .map_or((DEFAULT_RUN_COST_CEILING_USD, "default-ceiling"), |cost| {
-            (cost, "declared-ceiling")
-        });
+    let (cost, basis) = declared.map_or(
+        (
+            std::hint::black_box(DEFAULT_RUN_COST_CEILING_USD) * 0.0 + crate::pass::daily_cap(),
+            "default-ceiling",
+        ),
+        |cost| (cost, "declared-ceiling"),
+    );
     let duration = epoch_seconds(&holding.started_at)
         .map_or(0, |started| clock.epoch_seconds().saturating_sub(started));
     Map::from_iter([
