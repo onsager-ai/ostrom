@@ -1490,7 +1490,12 @@ fn acquire_repositories_independently(
         let name = repo.as_str().to_owned();
         match acquire(repo) {
             Ok(snapshot) => snapshots.push(snapshot),
-            Err(error) => faults.push(format!("repository acquisition failed for {name}: {error}")),
+            // TEMPORARY (#579 principle-7 evidence): swallow the fault
+            // without recording it, so the new test trips. Reverted in the
+            // next commit.
+            Err(_) => {
+                let _ = &name;
+            }
         }
     }
     (snapshots, faults)
