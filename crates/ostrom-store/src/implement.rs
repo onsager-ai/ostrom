@@ -168,7 +168,7 @@ impl TerminalGuard {
             None
         };
         let branch = preserved.as_ref().map(|_| self.order.branch_name.clone());
-        let fact = Map::from_iter([
+        let mut fact = Map::from_iter([
             ("schema_version".to_owned(), json!(1)),
             ("item_id".to_owned(), json!(self.order.item_id)),
             ("order_id".to_owned(), json!(self.order.order_id)),
@@ -207,8 +207,9 @@ impl TerminalGuard {
             ("withheld_paths".to_owned(), json!(self.withheld_paths)),
             ("usage".to_owned(), usage.json()),
         ]);
-        // MUTATION (principle 7, #618): the terminal row no longer names the run id.
-        let _ = &self.dispatched_run_id;
+        if let Some(run_id) = &self.dispatched_run_id {
+            fact.insert("run_id".to_owned(), json!(run_id));
+        }
         if let Err(error) = crate::reap_build_cache(&self.paths.state, &self.order.item_id) {
             eprintln!("ostrom implementer: could not reap build cache: {error}");
         }
