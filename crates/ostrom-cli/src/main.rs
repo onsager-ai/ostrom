@@ -1526,10 +1526,14 @@ fn record_empty_loop_scope(
 ) -> Result<(), ostrom_store::StoreError> {
     let clock = Clock::realtime();
     let owner = generated_run_id(&format!("loop-{}", resolved.name), &clock);
-    let common = serde_json::Map::from_iter([
+    let fact = serde_json::Map::from_iter([
         ("owner".to_owned(), serde_json::json!(owner)),
         ("loop".to_owned(), serde_json::json!(resolved.name)),
         ("actor".to_owned(), serde_json::json!(resolved.actor)),
+        (
+            "operation".to_owned(),
+            serde_json::json!(resolved.operation),
+        ),
         ("repositories".to_owned(), serde_json::json!([])),
         (
             "skipped_repositories".to_owned(),
@@ -1544,21 +1548,8 @@ fn record_empty_loop_scope(
         &paths.trace_file(),
         &TraceAppend {
             ts: clock.timestamp(),
-            kind: "pass-started".to_owned(),
-            fact: common.clone(),
-            narration: serde_json::Map::new(),
-        },
-    )?;
-    let mut terminal = common;
-    terminal.insert("outcome".to_owned(), serde_json::json!("failed"));
-    terminal.insert("cost_usd".to_owned(), serde_json::json!(0.0));
-    terminal.insert("duration_seconds".to_owned(), serde_json::json!(0));
-    append_trace(
-        &paths.trace_file(),
-        &TraceAppend {
-            ts: clock.timestamp(),
-            kind: "pass-ended".to_owned(),
-            fact: terminal,
+            kind: "loop-skipped".to_owned(),
+            fact,
             narration: serde_json::Map::new(),
         },
     )?;
