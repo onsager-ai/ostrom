@@ -1659,9 +1659,11 @@ fn check_role_pass(context: &DoctorContext, role: DeliveryRole) -> DoctorResult 
             ),
         );
     }
-    // One no-op can be a contended lease or a disarmed mid-window wake. Three
-    // consecutive no-ops mean the timer is alive but the protocol has stopped
-    // taking ownership, the production failure that the age check cannot see.
+    // A disarmed pass writes no pass-ended fact (it returns before the pass
+    // guard that would write one), so this streak can only be a contended
+    // lease. Three consecutive no-ops mean the timer is alive but the
+    // protocol has stopped taking ownership, the production failure that the
+    // age check cannot see.
     if recent.len() == 3
         && recent
             .iter()

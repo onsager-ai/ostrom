@@ -1564,7 +1564,7 @@ fn disarmed_and_outer_lease_held_passes_do_not_spawn_or_trace() {
     assert!(!disarmed.state.join("sprint.jsonl").exists());
     let events = disarmed.run_events();
     assert_eq!(events[1]["type"], "run.finished");
-    assert_eq!(events[1]["payload"]["outcome"], "no-op");
+    assert_eq!(events[1]["payload"]["outcome"], "unstarted");
     assert_eq!(events[1]["payload"]["reason"], "disarmed");
 
     let held = Fixture::new("touch \"$OSTROM_TEST_MARKER\"");

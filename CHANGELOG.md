@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **Breaking:** a disarmed pass now records `run.finished` with
+  `outcome: unstarted`, `reason: disarmed` (#589). It previously recorded
+  `outcome: no-op`, the same outcome a contended lease records, so a consumer
+  could not tell a disarmed loop from an ordinary lease race by outcome
+  alone. The lease-held path is unchanged: it still records `no-op` with
+  `reason: lease-held`, and the process exit code for a disarmed pass is
+  unchanged at 78. A consumer keying on `run.finished.outcome == "no-op"` to
+  recognise a disarmed pass must switch to `outcome == "unstarted"` with
+  `reason == "disarmed"`.
 - **Breaking:** `ostrom audit` is removed (#617). It queried merged pull
   requests and joined them against recorded gate verdicts, but nothing in the
   delivery loop read its output — the gate, the sweep and `decision_answers.rs`
