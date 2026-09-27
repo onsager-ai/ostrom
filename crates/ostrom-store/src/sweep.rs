@@ -75,8 +75,8 @@ const SWEEP_LEASE_RENEW_SECONDS: u64 = 30;
 /// real full-roster sweep — that was always too short, and still is.
 ///
 /// Upper bound, which the 30s value was missing: the generated loop unit's
-/// `TimeoutStartSec=1800` (rendered in `umwelt-runtime`'s `loop_units.rs`,
-/// `crates/ostrom-cli/tests/fixtures/loops/expected/*.service`) is not a
+/// `TimeoutStartSec` (the loop's wall cap plus the termination grace since
+/// #619, 1805 s undeclared; `crates/ostrom-cli/tests/fixtures/loops/expected/*.service`) is not a
 /// budget the pass gets to spend — it is when the supervisor SIGTERMs the
 /// unit (`Type=oneshot`, `KillMode=control-group`). Setting this ceiling
 /// equal to or close to that value means a pass waiting out a lease that
@@ -86,9 +86,9 @@ const SWEEP_LEASE_RENEW_SECONDS: u64 = 30;
 /// The ceiling must leave room for the work the wait exists to enable
 /// (`MINIMUM_PASS_WORK_SECONDS`), not just stay under the deadline.
 ///
-/// `1800` is not currently a shared Rust constant — `loop_units.rs` renders
-/// it as a template literal — so this value is bounded by it, not derived
-/// from it; if the unit's timeout moves, this and `MINIMUM_PASS_WORK_SECONDS`
+/// The unit's timeout is derived from the loop's wall cap
+/// (`ostrom_core::DEFAULT_PASS_WALL_SECONDS` when undeclared), not from this
+/// value, so this value is bounded by it; if the default moves, this and `MINIMUM_PASS_WORK_SECONDS`
 /// must still leave a valid gap between them (`every_loop_services_timeout_agrees_with_the_sweep_lease_ceiling`
 /// in `ostrom-cli`'s `loops.rs` asserts that gap, not equality).
 pub const SWEEP_LEASE_CEILING_SECONDS: u64 = 450;

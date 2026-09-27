@@ -13,7 +13,7 @@ use std::{
 
 use ostrom_core::{
     BranchListing, BranchListingFault, BranchListingOutcome, MandateConfig, RemoteBranch,
-    WorkOrder, resolve_exact_branch,
+    ResolvedRunCaps, WorkOrder, resolve_exact_branch,
 };
 use serde_json::{Map, Value, json};
 
@@ -24,7 +24,7 @@ use crate::{
         AuthenticatedCommandError, GitHubInstallationTokenMinter, InstallationTokenMinter,
         ScopedAppTokenRequest, authenticated_output,
     },
-    append_trace, configured_retention_days, environment,
+    append_trace, configured_retention_days, environment, generated_run_id,
     lease::{ProcessIdentity, ProcessLiveness, process_identity_is_live, read_process_identity},
     load_config_or_defaults, read_lease, read_trace,
     reap::{
@@ -52,6 +52,9 @@ pub struct DispatchRequest {
     /// `Some(empty)` refuses every work order.
     pub repositories: Option<BTreeSet<String>>,
     pub clock: Clock,
+    /// The implementer's wall and idle caps, resolved from the current policy
+    /// version's `defaults.implementer_ceilings` or the defaults (#619).
+    pub implementer_caps: ResolvedRunCaps,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,6 +134,16 @@ struct DispatchContext<'a> {
     backend: String,
     listing: ListingState,
     matched_key: Option<(&'static str, String)>,
+    /// The implementer's run id. Dispatch records the hold, so dispatch mints
+    /// the id: `work-dispatched` names it, `ostrom implement --run-id` writes
+    /// its events under it, and the harness child receives it as
+    /// `OSTROM_RUN_ID`.
+    run_id: String,
+    /// The registry key of the implementer harness, recorded as `runner`.
+    runner: String,
+    /// This dispatcher's own `OSTROM_RUN_ID`, when a run started it: the edge
+    /// from a pass to the implementer its agent dispatched.
+    parent_run_id: Option<String>,
 }
 
 struct RepeatedFailure {
@@ -199,6 +212,7 @@ fn run_dispatch_with_registry_and_minter(
     })?;
     let item_hash = order.item_hash();
     let unit_name = format!("ostrom-implementer-{}", &item_hash[..16]);
+    let run_id = generated_run_id(&unit_name, &request.clock);
     let mut context = DispatchContext {
         request,
         order,
@@ -209,6 +223,11 @@ fn run_dispatch_with_registry_and_minter(
             .unwrap_or_else(|| "systemd".to_owned()),
         listing: ListingState::empty(),
         matched_key: None,
+        run_id,
+        runner: runner_name.to_owned(),
+        parent_run_id: environment::OSTROM_RUN_ID
+            .value()
+            .filter(|value| !value.trim().is_empty()),
     };
 
     if request
@@ -323,6 +342,29 @@ fn run_dispatch_with_registry_and_minter(
         })?;
     let resolved_ostrom = resolve_ostrom(&context)?;
 
+    // A live hold that stopped making progress is reaped first (#619), so a
+    // stuck run cannot count against the concurrency ceilings below or block
+    // its own item from being dispatched again. Dispatch reaps only the
+    // implementer holds for its own repositories, and a dispatch with no
+    // repository scope (a hand run) reaps nothing: only `ostrom up` reaps
+    // every hold. Reaping is best effort and never stops this dispatch: an
+    // error is printed and recorded for doctor (#635).
+    let reaped = request
+        .repositories
+        .as_ref()
+        .map(|repositories| {
+            crate::stalls::reap_stalled_holds(
+                &request.paths,
+                &request.clock,
+                "dispatch",
+                context.parent_run_id.as_deref(),
+                Some(repositories),
+            )
+        })
+        .unwrap_or_default();
+    for hold in reaped {
+        eprintln!("ostrom dispatch: {hold}");
+    }
     // Reap before acquiring this item's lease. If an old order is genuinely
     // still live, its possibly expired lease must not be replaced merely to
     // discover the duplicate after the fact.
@@ -579,11 +621,22 @@ fn after_lease(
     }
     let state_environment = dispatch_state_environment(&context.request.paths);
     let lease_name = format!("implementer-item-{}.lease", context.item_hash);
+    // Both backends hand the runner's environment to `ostrom implement`, and
+    // the harness child inherits it from there, so this is how the Codex
+    // process learns which run and which order it serves. The names are an
+    // observer contract (docs/loops.md).
+    let runner_launch = runner_launch
+        .clone()
+        .with_environment(environment::OSTROM_RUN_ID.name, &context.run_id)
+        .with_environment(
+            environment::OSTROM_WORK_ORDER_ID.name,
+            &context.order.order_id,
+        );
     match context.backend.as_str() {
         "systemd" => launch_systemd(
             context,
             runner_name,
-            runner_launch,
+            &runner_launch,
             resolved_ostrom,
             &state_environment,
             &lease_name,
@@ -594,7 +647,7 @@ fn after_lease(
         "process" => launch_process(
             context,
             runner_name,
-            runner_launch,
+            &runner_launch,
             resolved_ostrom,
             &lease_name,
             daily_cap,
@@ -651,7 +704,13 @@ fn launch_systemd(
         "--collect",
         "--no-block",
         "--property",
-        "RuntimeMaxSec=infinity",
+        &format!(
+            "RuntimeMaxSec={}",
+            context
+                .request
+                .implementer_caps
+                .implementer_unit_runtime_seconds()
+        ),
         "--property",
         "KillMode=control-group",
         "--setenv",
@@ -684,6 +743,9 @@ fn launch_systemd(
         .arg(&context.request.order_file)
         .arg(&context.unit_name)
         .arg(runner_name)
+        .arg("--run-id")
+        .arg(&context.run_id)
+        .args(implementer_cap_arguments(context.request.implementer_caps))
         .status();
     if !status.is_ok_and(|status| status.success()) {
         append_launch_failure(context, "dispatch-failed", started.elapsed());
@@ -736,6 +798,9 @@ fn launch_process(
         .arg(&context.request.order_file)
         .arg(&context.unit_name)
         .arg(runner_name)
+        .arg("--run-id")
+        .arg(&context.run_id)
+        .args(implementer_cap_arguments(context.request.implementer_caps))
         .stdin(Stdio::null())
         .stdout(stdout)
         .stderr(stderr)
@@ -812,6 +877,16 @@ fn launch_process(
     }
     drop(child);
     Ok(())
+}
+
+/// `ostrom implement`'s hidden cap arguments: the caps this dispatch resolved,
+/// so the implementer enforces and records exactly what the hold names.
+fn implementer_cap_arguments(caps: ResolvedRunCaps) -> Vec<String> {
+    let mut arguments = vec!["--wall-seconds".to_owned(), caps.wall_seconds.to_string()];
+    if let Some(idle) = caps.idle_seconds {
+        arguments.extend(["--idle-seconds".to_owned(), idle.to_string()]);
+    }
+    arguments
 }
 
 fn open_process_log(context: &DispatchContext<'_>) -> Result<(fs::File, fs::File), ()> {
@@ -2061,6 +2136,21 @@ fn append_dispatched(context: &DispatchContext<'_>) -> Result<(), DispatchError>
     fact.insert("order_id".to_owned(), json!(context.order.order_id));
     fact.insert("unit_name".to_owned(), json!(context.unit_name));
     fact.insert("backend".to_owned(), json!(context.backend));
+    fact.insert("run_id".to_owned(), json!(context.run_id));
+    fact.insert("runner".to_owned(), json!(context.runner));
+    // The caps the hold runs under (#619). The stall reaper and doctor read
+    // them from here, so a hold is judged by the caps it was started with.
+    fact.insert(
+        "wall_seconds".to_owned(),
+        json!(context.request.implementer_caps.wall_seconds),
+    );
+    fact.insert(
+        "idle_seconds".to_owned(),
+        json!(context.request.implementer_caps.idle_seconds),
+    );
+    if let Some(parent) = &context.parent_run_id {
+        fact.insert("parent_run_id".to_owned(), json!(parent));
+    }
     fact.insert(
         "cost_ceiling_usd".to_owned(),
         context.order.cost_ceiling_usd.clone(),

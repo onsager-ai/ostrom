@@ -266,6 +266,7 @@ mod tests {
             signals: SignalFlags::default(),
             supervisor_pid: None,
             termination_grace: std::time::Duration::from_secs(1),
+            environment: Vec::new(),
         });
         let outcome = ClaudeHarness::new("missing", "fixture-v1", "fixture-model").run(&request);
         assert!(matches!(

@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+- **The stall reaper stops before it records, records each reaped run once, and never stops scheduling (#635).** Fix-forward to #619. Reaping is now claim, stop, confirm, record: the reaper claims a run by creating `<state>/reaping/<run_id>.claim` exclusively, so of two racing reapers exactly one stops, records and charges it; it writes a terminal row only after a confirmed stop and only when the run wrote none, and a stop it cannot confirm (unreadable `/proc`, a unit state `systemctl` will not report, a process that outlived `SIGKILL`) writes nothing, releases nothing and keeps the claim for the next reaper, which also completes a claim whose reaper died. A run that handles the reaper's `SIGTERM` writes the claim's reason and charge into its own row, so the row says `stalled` whoever writes it. A reaper error is printed and recorded in `<state>/reaping/last-error.json` instead of failing `ostrom up` or `ostrom dispatch`, and doctor's `work-orders` check fails on that record and on every kept claim. `ostrom dispatch` reaps only the implementer holds for its own repositories (an unscoped, hand-run dispatch reaps nothing), and the reaper never signals its own process or process group. The claim records `signalled_at` before the first signal: only a signalled claim relabels the run's own row, and a process-backend supervisor finalizing a worker that died without its row honours it too; a claim kept without a signal leaves a later failure, such as a wall cap, its own reason. An empty claim or one naming a live pid with no start time is never taken for live, and is stale after two minutes; a claim is removed or rewritten only by the process that wrote it; and a reap clears only the recorded failures it examined. The lease mutation guard now names its holder and a guard left by a dead process is taken over, so pass-lease renewal no longer retries it silently until the lease expires; persistent contention is printed. A systemd implementer unit's `RuntimeMaxSec` is the wall cap plus 120 s (`IMPLEMENTER_UNIT_RUNTIME_MARGIN_SECONDS`; was plus 5 s), so the implementer's own `wall-cap` row wins. `docs/loops.md` documents that an implementer's idle cap counts transcript writes only. Record shapes: `<state>/reaping/*.claim` and `last-error.json` are new private state; a run-written `work-failed` or `pass-ended` for a reaped run gains `cost_basis` (and `last_progress_at`, `stalled_seconds`; the implementer's also `reaped: true`). **Breaking, library only:** `ostrom_store::reap_stalled_holds` takes a caller name and a repository scope and returns the reaped holds instead of a `Result`; `ReapedHold::reason` is a `String`.
+- **Every run is bounded, and a stalled hold is reaped (#619).** Loops and `defaults.loop` accept `wall` and `idle` (durations such as `90m`), and `defaults.implementer_ceilings` sets the implementer's. Undeclared, a pass or loop run gets a 30-minute wall cap and an implementer 4 hours; neither gets an idle default. The implementer now enforces its wall cap with a `CapsWatchdog` (terminal reason `wall-cap`), its systemd unit carries `RuntimeMaxSec=<wall + 5 s>` instead of `infinity`, and rendered loop units carry `TimeoutStartSec=<wall + 5 s>` (1805 when undeclared, was 1800). `ostrom up` and `ostrom dispatch` reap a live hold with no progress past its threshold, writing `work-failed` / `pass-ended` with `reason: "stalled"` and `cost_usd` equal to the declared cost ceiling (a pass that declared none: the shared per-run default `DEFAULT_RUN_COST_CEILING_USD`, 20 USD, which is also the work-order default; `cost_basis` names which), and close a pass whose process is gone with `exited-without-terminal`. The pass lease names its process, renews every 30 s and defaults to a 120 s TTL (was 3600 s). `ostrom up` records `skipped:previous-live` instead of launching over a live worker. `ostrom ps` and `ostrom doctor` show the caps; doctor's `work-orders` check fails on a stalled hold. Record shapes: `work-dispatched` gains `wall_seconds` and `idle_seconds`; a reaper-written `pass-ended` gains `recorded_by`. **Breaking, struct literals only:** `ostrom_store::ImplementRequest` gains `caps`, `DispatchRequest` gains `implementer_caps`, and `umwelt_runtime::LoopUnitDeclaration` gains `timeout_start_seconds`.
+- **Breaking:** `ostrom hook session-start` is removed, with the layered
+  constitution/rules injection behind it (#617): `render_constitution` and
+  its helpers (`collect_layer`, `has_content`) in
+  `ostrom-store/src/hooks.rs`, the compiled-in `SHIPPED_RULES` constant, and
+  `assets/rules/frozen-rules.md` (the only file under `assets/rules/`, so
+  the directory goes too) along with the rule-capitalization trigger it
+  documented. `ostrom hook digest` and `ostrom local-drift` are unchanged —
+  `render_digest`, `DigestOptions`, `HookOutput`, `decision_inbox_url`, and
+  everything the digest reads (waiting decisions, escalated dispatch
+  failures, undispatchable repositories, stalled holds, local drift) stay
+  exactly as they were. The #617 plan originally grouped the digest with
+  the constitution subsystem; the principal narrowed that ruling to
+  "Constitution only; keep digest." `ostrom doctor`'s `environment` check
+  goes with the constitution code it existed to diagnose: `check_environment`
+  and `rule_layer_has_content` (`ostrom-checks/src/doctor.rs`) warned a
+  cloud session that no user rules layer was resolved, a warning about a
+  feature this PR deletes. Nothing else read the `CLAUDE_CODE_REMOTE`
+  local-vs-cloud distinction, so the check is removed rather than
+  narrowed, and `environment` drops from `DOCTOR_CHECKS`.
+- **Breaking:** `ostrom explain` and `ostrom generate` are removed (#617). Both
+  were operator introspection tools, not on the delivery loop's path:
+  `PolicyBundle::explain_pull_request` has its own production caller in the
+  sweep's policy holds (`sweep.rs`'s `update_policy_holds`), and that method,
+  `compose`, `sign`, `validate`, and `rollback` are unaffected. `run_explain`,
+  `run_generate`, their `ExplainOptions`/`ExplainTarget` types, GitHub
+  pull-request acquisition (`acquire_pull_request`, `fixture_pull_request`),
+  explanation rendering, and the repository-policy projection helpers
+  (`project_repository_manifest`, `project_rules`) go with them, along with
+  the now-unused `PolicyLoadError` variants they raised.
 - **Breaking:** `ostrom audit` is removed (#617). It queried merged pull
   requests and joined them against recorded gate verdicts, but nothing in the
   delivery loop read its output — the gate, the sweep and `decision_answers.rs`
@@ -30,6 +61,7 @@
   Nothing outside this workspace consumes `ostrom-store` today, so this costs
   nothing now, but it is a breaking change to a public type and is recorded
   as one.
+- Holdings: one run id per hold, recorded, passed to every harness child, and shown by `ostrom ps` (#618). `ostrom dispatch` now mints the implementer's run id and records it in `work-dispatched` as `run_id`, with `runner` (the registry key) and, when the dispatcher runs under an ostrom run, `parent_run_id`; it hands the id to `ostrom implement` through a hidden `--run-id`, and the implementer writes its events and its `work-completed` / `work-failed` row under it. `pass-started` gains `run_id`; `pass-ended` is unchanged. The record changes are additive. A pass's harness receives `OSTROM_RUN_ID`, and a dispatched implementer and its Codex child receive `OSTROM_RUN_ID` and `OSTROM_WORK_ORDER_ID`; both names are an external contract, documented in `docs/loops.md`. `ostrom ps` lists every open hold after the loop table (run id, runner, item, age, last event, lease state), and `ostrom ps --json` prints only the holds as JSON lines without needing a current policy version. `ostrom implement` sets both variables directly on its Codex child from its own effective run id and order, overriding anything inherited, so a hand run inside another run is never labelled with that run's id; otherwise a hand run behaves as before. **Breaking** for struct-literal construction only: `ostrom_store::ImplementRequest` gains a public `run_id` field (pass `None` for today's behaviour), and the vendored umwelt's `ImplementerRunRequest` gains a public `environment` field (pass an empty `Vec` for none).
 
 ## 0.16.0 (2026-09-18)
 

@@ -744,7 +744,7 @@ fn without_a_control_descriptor_stdin_is_ignored_and_existing_bytes_are_preserve
     );
     assert_eq!(normalize_pass_trace(&fs::read(fixture.state.join("sprint.jsonl")).unwrap()),
         concat!(
-            "{\"ts\":\"2026-08-01T00:00:00Z\",\"kind\":\"pass-started\",\"fact\":{\"owner\":\"builder-a1b2c3d4-wake7\",\"sweep\":\"reused\",\"generation_id\":\"pass-lifecycle-fresh-generation\"},\"narration\":{}}\n",
+            "{\"ts\":\"2026-08-01T00:00:00Z\",\"kind\":\"pass-started\",\"fact\":{\"owner\":\"builder-a1b2c3d4-wake7\",\"sweep\":\"reused\",\"generation_id\":\"pass-lifecycle-fresh-generation\",\"run_id\":\"<pass-run-id>\"},\"narration\":{}}\n",
             "{\"ts\":\"2026-08-01T00:00:00Z\",\"kind\":\"pass-ended\",\"fact\":{\"owner\":\"builder-a1b2c3d4-wake7\",\"outcome\":\"no-op\",\"cost_usd\":1.25,\"duration_seconds\":0,\"reason\":\"blocked\"},\"narration\":{}}\n"
         ).as_bytes());
     let events = fixture.run_events();
@@ -1314,6 +1314,12 @@ fn normalize_pass_trace(bytes: &[u8]) -> Vec<u8> {
         if row["kind"] == "pass-ended" {
             row["fact"]["duration_seconds"] = Value::from(0);
         }
+        // The pass's run id carries its wall-clock start and pid (#618). Its
+        // presence and position are compared here; its value is compared with
+        // the run's own events in `a_pass_records_its_run_id_and_hands_it_to_the_harness`.
+        if row["kind"] == "pass-started" && row["fact"].get("run_id").is_some() {
+            row["fact"]["run_id"] = Value::String("<pass-run-id>".to_owned());
+        }
         serde_json::to_writer(&mut normalized, &row).expect("serialize normalized trace");
         normalized.push(b'\n');
     }
@@ -1336,6 +1342,96 @@ fn error_exit_releases_and_finalizes() {
     assert_eq!(events[1]["type"], "run.finished");
     assert_eq!(events[1]["payload"]["outcome"], "failed");
     assert_eq!(events[1]["payload"]["reason"], "pass-failed");
+}
+
+/// #618: the pass's run id is one value in four places -- `pass-started`, the
+/// run's own events, the harness child's `OSTROM_RUN_ID`, and the holding
+/// `ostrom ps --json` reports while the pass is open -- and each is compared
+/// with the record rather than pinned. The harness runs `ps` itself, so the
+/// open hold is observed from inside the pass, and it is gone once the pass
+/// has ended. Every observation is gathered before one comparison, so a
+/// failure shows each place that disagrees at once.
+#[test]
+fn a_pass_records_its_run_id_hands_it_to_the_harness_and_holds_until_it_ends() {
+    let fixture = Fixture::new(concat!(
+        "printf '%s\\n' \"$OSTROM_RUN_ID\" >\"$OSTROM_TEST_RUN_ID\"\n",
+        "\"$OSTROM_TEST_OSTROM\" ps --json >\"$OSTROM_TEST_PS\""
+    ));
+    let harness_run_id = fixture.root.path().join("harness-run-id");
+    let open_ps = fixture.root.path().join("ps-during-pass.jsonl");
+
+    let status = fixture
+        .command()
+        // A pass started under another run hands the harness its own id.
+        .env("OSTROM_RUN_ID", "inherited-placeholder-run")
+        .env("OSTROM_TEST_RUN_ID", &harness_run_id)
+        .env("OSTROM_TEST_PS", &open_ps)
+        .env("OSTROM_TEST_OSTROM", env!("CARGO_BIN_EXE_ostrom"))
+        .status()
+        .expect("run pass");
+    assert!(status.success());
+
+    let trace = fixture.trace();
+    let started = trace
+        .iter()
+        .find(|row| row["kind"] == "pass-started")
+        .expect("pass-started row");
+    let ended = trace
+        .iter()
+        .find(|row| row["kind"] == "pass-ended")
+        .expect("pass-ended row");
+    let recorded = started["fact"]["run_id"].clone();
+    let events = fixture.run_events();
+    let harness =
+        fs::read_to_string(&harness_run_id).map_or(Value::Null, |value| json!(value.trim_end()));
+    let pass_holds = |text: &str| {
+        text.lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("ps --json line"))
+            .filter(|holding| holding["kind"] == "pass")
+            .collect::<Vec<_>>()
+    };
+    let during = pass_holds(fs::read_to_string(&open_ps).unwrap_or_default().as_str());
+    let held = during.first().cloned().unwrap_or(Value::Null);
+    let held_last_event_is_an_event_of_the_run = events
+        .iter()
+        .any(|event| event["ts"] == held["last_event_at"]);
+    let after = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .args(["ps", "--json"])
+        .env_clear()
+        .env("OSTROM_HOME", &fixture.state)
+        .env("HOME", fixture.root.path())
+        .output()
+        .expect("run ps after the pass");
+    assert!(after.status.success());
+    let after = pass_holds(String::from_utf8_lossy(&after.stdout).as_ref());
+
+    assert_eq!(
+        json!({
+            "pass_started_names_a_run_id": recorded.is_string(),
+            "events_run_id": events[0]["runId"],
+            "harness_OSTROM_RUN_ID": harness,
+            "pass_ended_run_id": ended["fact"].get("run_id"),
+            "open_pass_holds_during": during.len(),
+            "held_run_id": held["run_id"],
+            "held_owner": held["owner"],
+            "held_lease": held["lease"],
+            "held_last_event_is_an_event_of_the_run": held_last_event_is_an_event_of_the_run,
+            "open_pass_holds_after": after.len(),
+        }),
+        json!({
+            "pass_started_names_a_run_id": true,
+            "events_run_id": recorded,
+            "harness_OSTROM_RUN_ID": recorded,
+            // `pass-ended` is part of the frozen pass contract.
+            "pass_ended_run_id": null,
+            "open_pass_holds_during": 1,
+            "held_run_id": recorded,
+            "held_owner": started["fact"]["owner"],
+            "held_lease": "live",
+            "held_last_event_is_an_event_of_the_run": true,
+            "open_pass_holds_after": 0,
+        })
+    );
 }
 
 #[test]
@@ -1485,6 +1581,346 @@ fn sigterm_releases_finalizes_and_kills_the_process_group() {
             .status()
             .expect("probe grandchild")
             .success()
+    );
+}
+
+/// #619 change 3: the pass lease renews while the pass runs, as the sweep
+/// lease does. With a two-second TTL and a pass that runs for five, every
+/// second pass started during it is refused, and the lease's expiry moves
+/// forward while the first pass holds it.
+#[test]
+fn a_pass_longer_than_its_lease_ttl_renews_the_lease_and_refuses_a_second_pass_throughout() {
+    let fixture = Fixture::new(&format!("sleep 5\n{}", stream_script(CLAUDE_STREAM_JSON)));
+    let lease = fixture.state.join("builder-pass.lease");
+    let first = fixture
+        .command()
+        .env("MANDATE_LEASE_TTL_SECONDS", "2")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start the long pass");
+    wait_for(&lease);
+    let read_lease = || -> Value {
+        serde_json::from_slice(&fs::read(&lease).expect("read pass lease")).expect("lease JSON")
+    };
+    let held = read_lease();
+
+    let mut second_passes = Vec::new();
+    for _ in 0..4 {
+        thread::sleep(Duration::from_millis(800));
+        second_passes.push(
+            fixture
+                .command()
+                .env("MANDATE_LEASE_TTL_SECONDS", "2")
+                .output()
+                .expect("start an overlapping pass")
+                .status
+                .success(),
+        );
+    }
+    let renewed = read_lease();
+    let status = wait(first);
+
+    let finished = fs::read_dir(fixture.state.join("runs"))
+        .expect("read run directories")
+        .flatten()
+        .filter_map(|run| fs::read_to_string(run.path().join("events.jsonl")).ok())
+        .filter_map(|events| {
+            events
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .find(|event| event["type"] == "run.finished")
+        })
+        .collect::<Vec<_>>();
+    let lease_held = finished
+        .iter()
+        .filter(|event| event["payload"]["reason"] == "lease-held")
+        .count();
+    let pass_started = fixture
+        .trace()
+        .into_iter()
+        .filter(|row| row["kind"] == "pass-started" && row["fact"]["run_id"].is_string())
+        .count();
+    assert_eq!(
+        json!({
+            "first_pass_succeeded": status.success(),
+            "second_passes_exited_zero": second_passes,
+            "second_passes_refused_as_lease_held": lease_held,
+            "passes_that_started": pass_started,
+            "same_owner_throughout": renewed["owner"] == held["owner"],
+            "expiry_moved_forward": renewed["expires_at"].as_u64() > held["expires_at"].as_u64(),
+            "lease_names_its_process": renewed["pid"].is_u64(),
+        }),
+        json!({
+            "first_pass_succeeded": true,
+            "second_passes_exited_zero": [true, true, true, true],
+            "second_passes_refused_as_lease_held": 4,
+            "passes_that_started": 1,
+            "same_owner_throughout": true,
+            "expiry_moved_forward": true,
+            "lease_names_its_process": true,
+        })
+    );
+    fixture.assert_released();
+}
+
+/// #619: the stall reaper writes a pass's `pass-ended` before it signals the
+/// pass. The pass, stopping on that signal, must not add a second terminal
+/// row for the same hold.
+#[test]
+fn a_pass_the_reaper_already_ended_does_not_write_a_second_pass_ended() {
+    let fixture = Fixture::new(concat!(
+        "printf '%s\\n' \"$$\" >\"$OSTROM_HOME/child.pid\"\n",
+        "trap 'exit 143' TERM\n",
+        "i=0; while [ \"$i\" -lt 30 ]; do sleep 1; i=$((i + 1)); done"
+    ));
+    let child = fixture.command().spawn().expect("start pass");
+    wait_for(&fixture.state.join("child.pid"));
+    let owner = fixture
+        .trace()
+        .into_iter()
+        .find(|row| row["kind"] == "pass-started")
+        .map(|row| row["fact"]["owner"].clone())
+        .expect("pass-started names its owner");
+    let reaped = json!({
+        "ts": "2026-08-01T00:00:00Z",
+        "kind": "pass-ended",
+        "fact": {
+            "owner": owner,
+            "outcome": "failed",
+            "cost_usd": 0.5,
+            "duration_seconds": 1,
+            "reason": "stalled",
+            "recorded_by": "reaper",
+        },
+        "narration": {},
+    });
+    let mut trace = fs::read_to_string(fixture.state.join("sprint.jsonl")).expect("read trace");
+    trace.push_str(&format!("{reaped}\n"));
+    fs::write(fixture.state.join("sprint.jsonl"), trace).expect("record the reaper's pass-ended");
+    signal(child.id(), "TERM");
+    let _ = wait(child);
+
+    let ended = fixture
+        .trace()
+        .into_iter()
+        .filter(|row| row["kind"] == "pass-ended" && row["fact"]["owner"] == owner)
+        .collect::<Vec<_>>();
+    assert_eq!(ended.len(), 1, "{ended:?}");
+    assert_eq!(ended[0]["fact"]["recorded_by"], "reaper");
+    assert!(!fixture.state.join("builder-pass.lease").exists());
+}
+
+/// #635: a stalled pass that handles `SIGTERM` writes its own `pass-ended`
+/// when `ostrom up` stops it. The reaper's claim on its run makes that row say
+/// `failed`, `stalled`, at the per-run ceiling, so there is exactly one row,
+/// written by the pass, saying why it ended.
+#[test]
+fn a_term_handling_pass_stopped_by_the_reaper_writes_one_stalled_pass_ended() {
+    let fixture = Fixture::new(concat!(
+        "printf '%s\\n' \"$$\" >\"$OSTROM_HOME/child.pid\"\n",
+        "trap 'exit 143' TERM\n",
+        "i=0; while [ \"$i\" -lt 60 ]; do sleep 1; i=$((i + 1)); done"
+    ));
+    // `ostrom up` needs a current policy version; the manifest stays outside
+    // the state root, so the pass itself runs exactly as it does without one.
+    let policy = fixture.root.path().join("policy");
+    fs::create_dir_all(&policy).expect("create the policy directory");
+    let manifest = policy.join("ostrom.yaml");
+    fs::write(&manifest, "manifest_version: 1\n").expect("write the operator manifest");
+    let trusted_keys = support::sign_manifest(&manifest);
+    let composed = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .arg("compose")
+        .arg(&manifest)
+        .current_dir(&policy)
+        .env("OSTROM_HOME", &fixture.state)
+        .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
+        .env_remove("OSTROM_POLICY_MANIFEST")
+        .output()
+        .expect("compose the current policy version");
+    assert!(
+        composed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&composed.stderr)
+    );
+
+    let mut child = fixture.command().spawn().expect("start pass");
+    wait_for(&fixture.state.join("child.pid"));
+    let started = fixture
+        .trace()
+        .into_iter()
+        .find(|row| row["kind"] == "pass-started")
+        .expect("the pass recorded its start");
+    let owner = started["fact"]["owner"].clone();
+    let run_id = started["fact"]["run_id"].clone();
+    // A pass's own watchdog enforces an idle cap declared to it, so a pass
+    // the reaper stops is one whose watchdog did not. A later opener for the
+    // same hold stands for that: it names the one-second cap the reaper
+    // judges the hold by.
+    let mut trace = fs::read_to_string(fixture.state.join("sprint.jsonl")).expect("read trace");
+    trace.push_str(&format!(
+        "{}\n",
+        json!({
+            "ts": "2026-08-01T00:00:00Z",
+            "kind": "pass-started",
+            "fact": {"owner": owner.clone(), "run_id": run_id.clone(), "idle_seconds": 1},
+            "narration": {},
+        })
+    ));
+    fs::write(fixture.state.join("sprint.jsonl"), trace).expect("record the idle cap");
+    // Past the one-second idle cap at second precision.
+    thread::sleep(Duration::from_secs(3));
+
+    let up = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .arg("up")
+        .current_dir(&fixture.state)
+        .env_clear()
+        .env("OSTROM_HOME", &fixture.state)
+        .env("HOME", fixture.root.path())
+        .env("PATH", env::var_os("PATH").unwrap_or_default())
+        .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
+        .output()
+        .expect("run ostrom up");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while child.try_wait().expect("poll the pass").is_none() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let ended = fixture
+        .trace()
+        .into_iter()
+        .filter(|row| row["kind"] == "pass-ended" && row["fact"]["owner"] == owner)
+        .collect::<Vec<_>>();
+    let row = ended.first().cloned().unwrap_or(Value::Null);
+    let claim = fixture.state.join(format!(
+        "reaping/{}.claim",
+        run_id.as_str().expect("the run id is a string")
+    ));
+    assert_eq!(
+        json!({
+            "up_succeeded": up.status.success(),
+            "up_reaped_it": String::from_utf8_lossy(&up.stdout).contains("reaped=1"),
+            "pass_stopped": child.try_wait().expect("poll the pass").is_some(),
+            "terminal_rows": ended.len(),
+            "outcome": row["fact"]["outcome"],
+            "reason": row["fact"]["reason"],
+            "cost_usd": row["fact"]["cost_usd"].as_f64(),
+            "cost_basis": row["fact"]["cost_basis"],
+            "written_by_the_pass": row["fact"]["recorded_by"].is_null(),
+            "claim_removed": !claim.exists(),
+            "lease_released": !fixture.state.join("builder-pass.lease").exists(),
+        }),
+        json!({
+            "up_succeeded": true,
+            "up_reaped_it": true,
+            "pass_stopped": true,
+            "terminal_rows": 1,
+            "outcome": "failed",
+            "reason": "stalled",
+            "cost_usd": ostrom_core::DEFAULT_RUN_COST_CEILING_USD,
+            "cost_basis": "default-ceiling",
+            "written_by_the_pass": true,
+            "claim_removed": true,
+            "lease_released": true,
+        }),
+        "up stderr: {}",
+        String::from_utf8_lossy(&up.stderr)
+    );
+}
+
+/// #619 change 3: a pass that cannot renew its lease stops rather than keep
+/// working under a lease another pass may now hold.
+#[test]
+fn a_pass_that_loses_its_lease_stops() {
+    let fixture = Fixture::new(concat!(
+        "printf '%s\\n' \"$$\" >\"$OSTROM_HOME/child.pid\"\n",
+        "trap 'exit 143' TERM\n",
+        "i=0; while [ \"$i\" -lt 20 ]; do sleep 1; i=$((i + 1)); done"
+    ));
+    let started = Instant::now();
+    let child = fixture
+        .command()
+        .env("MANDATE_LEASE_TTL_SECONDS", "2")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start pass");
+    wait_for(&fixture.state.join("child.pid"));
+    fs::write(
+        fixture.state.join("builder-pass.lease"),
+        format!(
+            "{{\"owner\":\"another-holder\",\"started_at\":1,\"expires_at\":{}}}\n",
+            u64::MAX
+        ),
+    )
+    .expect("hand the lease to another holder");
+    let status = wait(child);
+    let elapsed = started.elapsed();
+
+    let ended = fixture
+        .trace()
+        .into_iter()
+        .rev()
+        .find(|row| row["kind"] == "pass-ended")
+        .unwrap_or(Value::Null);
+    assert_eq!(
+        json!({
+            "exited_nonzero": !status.success(),
+            "stopped_before_the_agent_finished": elapsed < Duration::from_secs(15),
+            "outcome": ended["fact"]["outcome"],
+            "reason": ended["fact"]["reason"],
+        }),
+        json!({
+            "exited_nonzero": true,
+            "stopped_before_the_agent_finished": true,
+            "outcome": "failed",
+            "reason": "pass-lease-lost",
+        })
+    );
+}
+
+/// #619 change 1: a pass runs under the wall cap its policy declares, handed
+/// to the harness watchdog, which stops an agent that never finishes.
+#[test]
+fn a_pass_past_its_declared_wall_cap_is_stopped_by_its_watchdog() {
+    let fixture = Fixture::new("i=0; while [ \"$i\" -lt 20 ]; do sleep 1; i=$((i + 1)); done");
+    let manifest = fixture.state.join("ostrom.yaml");
+    fs::write(
+        &manifest,
+        "manifest_version: 1\ndefaults:\n  loop:\n    wall: 2s\n",
+    )
+    .expect("write a wall-capped operator manifest");
+    let trusted_keys = support::sign_manifest(&manifest);
+
+    let started = Instant::now();
+    let output = fixture
+        .command()
+        .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
+        .output()
+        .expect("run the wall-capped pass");
+    let elapsed = started.elapsed();
+
+    let events = fixture.run_events();
+    let started_event = events
+        .iter()
+        .find(|event| event["type"] == "run.started")
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert_eq!(
+        json!({
+            "exited_nonzero": !output.status.success(),
+            "names_the_wall_cap": String::from_utf8_lossy(&output.stderr).contains("reached its wall cap"),
+            "stopped_long_before_the_agent_finished": elapsed < Duration::from_secs(15),
+            "run_started_wall_ms": started_event["payload"]["ceilings"]["wallMs"],
+        }),
+        json!({
+            "exited_nonzero": true,
+            "names_the_wall_cap": true,
+            "stopped_long_before_the_agent_finished": true,
+            "run_started_wall_ms": 2000,
+        }),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

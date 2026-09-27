@@ -90,6 +90,60 @@ checked before the operation begins. `ps` and `logs` read the persisted state
 and log files; an unavailable measurement is printed as `unknown:<cause>`,
 never as zero.
 
+### Holdings
+
+After the loop table, `ostrom ps` lists every open hold, read from local files only: the trace, the lease files, and each run's event log. An implementer is held from its `work-dispatched` row until a `work-completed` or `work-failed` row with the same `order_id`; a pass is held from its `pass-started` row until a `pass-ended` row with the same `owner`. Each hold shows its run id, its runner (the registry key, such as `agent/codex`; `-` for a pass), its item (`-` for a pass), the age of the record that opened it, the time of the newest event in that run's `events.jsonl` under `<state>/runs`, its lease state: `live`, `expired`, or `-` when no lease names the hold's owner, and the wall cap, idle cap and last progress the stall reaper judges it by. A record written before run ids were recorded shows `-` for what it lacks.
+
+`ostrom ps --json` prints only the holds, one JSON object per line, with the fields `kind` (`implementer` or `pass`), `run_id`, `runner`, `item`, `order_id`, `owner`, `started_at`, `age_seconds`, `last_event_at`, `lease`, and since #619 `wall_seconds`, `idle_seconds`, `stall_threshold_seconds`, `last_progress_at` and `seconds_without_progress` (see Run caps and stalls); a field the record lacks is `null`. It needs no current policy version, so a scheduler or an observer can read it on a machine that has never composed one.
+
+One run id names each hold. `ostrom dispatch` mints the implementer's run id before it starts the unit, records it in `work-dispatched` as `run_id` together with `runner` and, when the dispatcher itself runs under an ostrom run, `parent_run_id` (a pass's agent runs `ostrom dispatch`, so this is the pass-to-implementer edge), and passes it to `ostrom implement`, which writes its events and its terminal row under it. A pass records the run id it mints in `pass-started`; `pass-ended` is part of the frozen pass contract and is unchanged. A hand-run `ostrom implement` mints its own run id, as it always has, and its terminal row does not name it; its harness child still receives that id, as below.
+
+#### The run environment is a contract
+
+`OSTROM_RUN_ID` and `OSTROM_WORK_ORDER_ID` are an external contract. An observer outside ostrom maps a live process to the run and the order it serves by reading them from `/proc/<pid>/environ`, so neither name is renamed, removed or given a different meaning except by a spec that the observer's side carries too.
+
+| Variable | Set on | Value |
+|---|---|---|
+| `OSTROM_RUN_ID` | a pass's harness process; every implementer harness process; a dispatched `ostrom implement` | the pass's `run_id` from `pass-started`; the implementer's effective run id: the `run_id` recorded in `work-dispatched`, or the one a hand run minted |
+| `OSTROM_WORK_ORDER_ID` | every implementer harness process; a dispatched `ostrom implement` | the `order_id` of the work order being executed |
+
+ostrom sets each value explicitly on the child it starts, never by changing its own process environment, and the value it sets replaces any the parent inherited from an enclosing run. A dispatched `ostrom implement` receives both through its runner's launch environment, under either dispatch backend. `ostrom implement` then sets both again, directly on its harness child, from its own effective run id and order, so an implementer run by hand inside another run (a pass's agent, say) never labels its harness with that run's id. ostrom reads `OSTROM_RUN_ID` itself only to record a dispatch's `parent_run_id`. The loop worker `ostrom up` starts does not carry the contract; it has no run id of its own.
+
+### Run caps and stalls
+
+Every run has a wall cap, declared or defaulted. A loop declares `wall` and `idle` beside its other ceilings, and `defaults.loop` supplies them for every loop that does not. Implementers take theirs from `defaults.implementer_ceilings`, which `ostrom dispatch` reads from the current composed version:
+
+```yaml
+defaults:
+  loop:
+    wall: 30m
+  implementer_ceilings:
+    wall: 4h
+    idle: 20m
+loops:
+  builder-night:
+    actor: builder
+    operation: build-pass
+    every: ["23:15", "02:15", "05:15"]
+    wall: 45m
+```
+
+Durations are whole numbers of `s`, `m`, `h` or `d`. With nothing declared, a pass (and any loop run) gets a 30-minute wall cap and an implementer gets 4 hours. Neither gets an idle default: an idle cap alone is weaker than a wall cap, because a hung tool call suspends idle timing indefinitely. The defaults are named constants in `ostrom-core` (`DEFAULT_PASS_WALL_SECONDS`, `DEFAULT_IMPLEMENTER_WALL_SECONDS`, `RUN_TERMINATION_GRACE_SECONDS`), and `ostrom ps` and `ostrom doctor` show them.
+
+Each cap is enforced inside the run. A pass hands `wall` and `idle` to its harness watchdog. An implementer checks its wall cap beside the Codex harness; when it trips, the run stops through the same path a `SIGTERM` takes and its `work-failed` row says `wall-cap`. Codex reports no per-turn events yet, so an implementer's idle cap is enforced only by the stall reaper below, and it counts only writes to the implementer's transcript. A command that runs for a long time without output, such as a full test suite, writes nothing while it runs: an implementer's idle cap must be longer than the longest silent command it may run, or the reaper stops it mid-command. Each cap also has an outer bound. A rendered loop unit's `TimeoutStartSec` is the wall cap plus the five-second termination grace. A systemd implementer unit's `RuntimeMaxSec` is the wall cap plus two minutes (`IMPLEMENTER_UNIT_RUNTIME_MARGIN_SECONDS`), because it counts from the unit's start while the implementer's wall cap counts from after its preflight, and the run still needs its termination grace to write its `wall-cap` row. Either way the in-process watchdog fires first and the run writes its own terminal row.
+
+A live hold that stops making progress is reaped where ostrom already runs, with no resident process: `ostrom up` checks every open hold, and `ostrom dispatch` checks the implementer holds for its own repositories before it counts in-flight holds against the concurrency ceilings. A dispatch with no repository scope, such as one run by hand, reaps nothing: only `ostrom up` reaps every hold. Progress is the newest of the hold's start, its run's last event, and its transcript file's modification time. A hold is stalled when it is live and has made no progress for longer than its idle cap or, with none, its wall cap plus the termination grace. The caps are the ones the hold started with: `work-dispatched` records `wall_seconds` and `idle_seconds`, and a pass's `run.started` carries its own `ceilings`.
+
+Reaping is claim, stop, confirm, record. The reaper first claims the run by creating `<state>/reaping/<run_id>.claim` exclusively; the claim records the reason, the charge, when it was made, the reaper's own pid and start time, and, set just before the first signal is sent, `signalled_at`. Only one process can create it, so when two reapers race (an `ostrom up` timer and an `ostrom dispatch`, say) exactly one stops, records and charges the run, and the other leaves it alone. The reaper then stops exactly what the hold's own lease or unit names. For the systemd backend that is the implementer's unit. For the process backend, and for a pass, it is the recorded process group, or the recorded process alone when that process does not lead its group. Before each signal the reaper re-checks the recorded pid, start time and process group; it never signals a pid that now belongs to another process, and never its own process or a process group it belongs to. `SIGTERM` comes first, `SIGKILL` after twice the termination grace.
+
+A run that handles the signal writes its own terminal row, and when a signalled claim names its run, that row carries the claim's reason and charge. So does the row a process-backend implementer's supervisor writes for a worker that died without its own. The trace therefore says `stalled` whether the run, its supervisor or the reaper wrote the row. A claim kept without a signal did not end the run, so a failure the run later records on its own, such as its wall cap, keeps its own reason and charge. Only once the stop is confirmed, and only when no terminal row exists yet (the run was killed, or never reached its terminal path), does the reaper write the row, release an implementer's lease and remove the claim. A stop it cannot confirm writes nothing and releases nothing: `/proc` it cannot read, a unit whose state `systemctl` will not report, a process still running after `SIGKILL`, or a target it refused because it is the reaper's own. The claim then stays, and the next `ostrom up` or `ostrom dispatch` examines it before anything else about that hold. A claim whose reaper has died is taken over and carried out with what it records; one whose run already has a terminal row is removed. A claim whose holder cannot be verified (one left empty by a crash mid-write, or one naming a live pid with no start time) is never taken for a live reaper's, and after two minutes it is stale. A process removes or rewrites a claim only while the file is still the one it wrote.
+
+An implementer's row is `work-failed` with `reason: "stalled"`, `reaped: true`, `last_progress_at`, `stalled_seconds`, `cost_basis` and its `run_id`. A pass's row is `pass-ended` with `outcome: "failed"`, `reason: "stalled"`, `cost_basis`, `last_progress_at` and `stalled_seconds`, and `recorded_by: "reaper"` when the reaper wrote it. A pass whose process is already gone with no terminal row, for example one systemd stopped at its unit timeout, is closed the same way under a claim with `reason: "exited-without-terminal"`. A reaped run's `cost_usd` is its declared cost ceiling, never `null`: for an implementer, the order's `cost_ceiling_usd`; for a pass, its `run.started` `costUsd`, or when it declared none the per-run default a work order is created with (`DEFAULT_RUN_COST_CEILING_USD`, 20 USD), never the daily cap, which would hold every other pass for the rest of the day. The row's `cost_basis` says which applied: `declared-ceiling` or `default-ceiling`. The real figure is unknowable once the process is gone, and the daily-cap readers must stay conservative. A reaped item can be dispatched again like any failed one, and two identical failures still escalate.
+
+Reaping is best effort; scheduling is not. A reaper error (an unreadable trace, a lease or claim it cannot write) is printed to stderr and recorded in `<state>/reaping/last-error.json`, and `ostrom up` and `ostrom dispatch` go on launching. A failure is cleared only by a later reap that looked at what failed: its hold examined again or gone, or, for a failure that concerned no one hold, a reap that could read the holds. `ostrom doctor`'s `work-orders` check fails on that record and on every claim no live reaper is confirming, and otherwise on a stalled hold, naming its run id, using the same definition the reaper uses. Everything under `<state>/reaping/` is private state: only ostrom reads it, and no other reader should.
+
+The pass lease names the pass's process and renews every 30 seconds while the pass runs, with a 120-second TTL (`MANDATE_LEASE_TTL_SECONDS` overrides it; a shorter TTL renews proportionally faster). A pass that cannot renew stops with `reason: "pass-lease-lost"`. `ostrom up` does not launch a loop's slot while the previous worker for that loop is still running (its pid and start time from the loop-runs state); the slot is recorded as `skipped:previous-live` in the state and the log, and `up` reports `skipped=` beside its other counts.
+
 Render and verify artifacts with:
 
 ```sh

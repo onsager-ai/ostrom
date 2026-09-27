@@ -4,7 +4,11 @@ use std::{
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
-    sync::mpsc::{self, Receiver, RecvTimeoutError},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError, Sender},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -30,6 +34,7 @@ use crate::{
     Clock, LeaseActionError, OstromPaths, OwnedLease, PassState, RunEventError, RunEventGuard,
     RunEventStart, SignalFlags, SkippedRepository, SweepOptions, TraceAppend, append_trace,
     environment, generated_run_id, generation_is_fresh, latest_successful_generation,
+    lease::{read_process_identity, renew_lease},
     load_sweep_snapshot, pass_control,
     pass_control::ControlInput,
     read_lease, read_pass_state, read_trace,
@@ -75,7 +80,12 @@ const BUDGET_HELD_EXIT_CODE: i32 = 75;
 // condition regardless of which surface hit it.
 pub const SWEEP_LEASE_CONTENTION_EXIT_CODE: i32 = 76;
 const DEFAULT_DAILY_CAP_USD: f64 = 50.0;
-const DEFAULT_LEASE_TTL_SECONDS: u64 = 3_600;
+// The pass lease renews while the pass runs (#619), as the sweep lease does, so
+// its TTL only has to outlast a renewal interval, not the pass. A holder that
+// stops renewing is reclaimable within two minutes, far inside any wall cap;
+// before #619 a pass hung for more than an hour could be overlapped instead.
+const DEFAULT_LEASE_TTL_SECONDS: u64 = 120;
+const PASS_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(30);
 const PASS_TERMINATION_GRACE: Duration = Duration::from_millis(PASS_KILL_GRACE_MS);
 const BRIDGE_HARNESS_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -485,6 +495,121 @@ struct PassGuard {
     control: Option<RunControl<NoSteer>>,
     process_exit: ProcessExit,
     permission_bridge: Option<crate::permission_bridge::PermissionBridge>,
+    renewal: Option<PassLeaseRenewal>,
+}
+
+/// Renews the pass lease while the pass runs (#619), as `SweepLease` renews
+/// the sweep lease. A renewal that finds the lease gone or owned by someone
+/// else sets `lost`, and the pass stops at its next check: a pass that cannot
+/// renew must not keep working under a lease another pass may now hold.
+struct PassLeaseRenewal {
+    stop: Option<Sender<()>>,
+    thread: Option<thread::JoinHandle<()>>,
+    lost: Arc<AtomicBool>,
+}
+
+impl PassLeaseRenewal {
+    fn start(
+        state_root: &Path,
+        name: &str,
+        owner: &str,
+        identity: Option<(u32, u32, u64)>,
+        ttl_seconds: u64,
+        clock: &Clock,
+    ) -> io::Result<Self> {
+        // Renew several times per TTL. With the production TTL this is every
+        // 30 s; a short TTL (a fixture, or an operator override) renews
+        // proportionally faster so the lease never lapses between renewals.
+        let quarter_ttl = Duration::from_millis(ttl_seconds.saturating_mul(1_000) / 4);
+        let interval = if quarter_ttl < PASS_LEASE_RENEW_INTERVAL {
+            quarter_ttl.max(Duration::from_millis(100))
+        } else {
+            PASS_LEASE_RENEW_INTERVAL
+        };
+        let (stop, receiver) = mpsc::channel::<()>();
+        let lost = Arc::new(AtomicBool::new(false));
+        let thread_lost = Arc::clone(&lost);
+        let state_root = state_root.to_path_buf();
+        let name = name.to_owned();
+        let owner = owner.to_owned();
+        let clock = clock.clone();
+        let thread = thread::Builder::new()
+            .name("ostrom-pass-lease".to_owned())
+            .spawn(move || {
+                let mut deferred = 0_u32;
+                loop {
+                    match receiver.recv_timeout(interval) {
+                        Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                        Err(RecvTimeoutError::Timeout) => {}
+                    }
+                    match renew_lease(
+                        &state_root,
+                        &name,
+                        &owner,
+                        identity,
+                        clock.epoch_seconds(),
+                        ttl_seconds,
+                    ) {
+                        Ok(()) => deferred = 0,
+                        // Another process briefly holds the lease's mutation
+                        // guard (a waiter probing it); the next tick retries.
+                        // A guard left by a dead process is taken over
+                        // (#635), so one that persists is held by a live
+                        // process and is said, not retried in silence.
+                        Err(LeaseActionError::MutationInProgress) => {
+                            deferred += 1;
+                            if deferred > 1 {
+                                eprintln!(
+                                    "ostrom pass: pass lease renewal deferred {deferred} times in a row: its mutation guard is held by a live process"
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!("ostrom pass: pass lease renewal failed: {error}");
+                            thread_lost.store(true, Ordering::Release);
+                            break;
+                        }
+                    }
+                }
+            })?;
+        Ok(Self {
+            stop: Some(stop),
+            thread: Some(thread),
+            lost,
+        })
+    }
+
+    fn lost(&self) -> bool {
+        self.lost.load(Ordering::Acquire)
+    }
+
+    /// Stop renewing before the lease is released, so a renewal cannot race
+    /// the release for the lease's mutation guard.
+    fn stop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for PassLeaseRenewal {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Whether a `pass-ended` for `owner` is already on the trace. A stall reaper
+/// that stopped this pass and found no row writes one (#619, #635); the pass
+/// must not then write a second terminal row for the same hold.
+fn pass_already_ended(paths: &OstromPaths, owner: &str) -> bool {
+    read_trace(&paths.trace_file()).is_ok_and(|trace| {
+        trace.rows.into_iter().filter_map(Result::ok).any(|row| {
+            row.kind == "pass-ended" && row.fact.get("owner").and_then(Value::as_str) == Some(owner)
+        })
+    })
 }
 
 struct NoSteer;
@@ -512,6 +637,9 @@ fn terminal_outcome(explicit: Option<String>, panicking: bool) -> String {
 
 impl PassGuard {
     fn finish(&mut self) -> Result<(), PassError> {
+        if let Some(renewal) = &mut self.renewal {
+            renewal.stop();
+        }
         let mut failure = self
             .permission_bridge
             .take()
@@ -527,7 +655,23 @@ impl PassGuard {
             self.outcome = Some("failed".to_owned());
             self.reason = Some("permission-channel-cleanup".to_owned());
         }
-        let outcome = terminal_outcome(self.outcome.clone(), thread::panicking());
+        let mut outcome = terminal_outcome(self.outcome.clone(), thread::panicking());
+        if self.started && pass_already_ended(&self.paths, &self.owner) {
+            self.started = false;
+        }
+        // A pass that did not succeed while the stall reaper holds a claim on
+        // its run is the reaper's stop reaching it (#635): its `pass-ended`
+        // says why, `stalled`, and charges what the reaper charges, whichever
+        // of the two writes it.
+        let intent = (self.started
+            && !matches!(outcome.as_str(), "completed" | "no-op" | "no-candidates"))
+        .then(|| crate::stalls::reap_intent(&self.paths.state, self.events.run_id()))
+        .flatten();
+        if let Some(intent) = &intent {
+            outcome = "failed".to_owned();
+            self.reason = Some(intent.reason.clone());
+            self.cost_usd = Some(intent.cost_usd);
+        }
         if self.started {
             let now = self.clock.epoch_seconds();
             let mut fact = Map::new();
@@ -549,6 +693,9 @@ impl PassGuard {
             );
             if let Some(reason) = &self.reason {
                 fact.insert("reason".to_owned(), json!(reason));
+            }
+            if let Some(intent) = &intent {
+                fact.extend(intent.row_fields());
             }
             if let Some(hash) = &self.dispatchability_hash {
                 fact.insert("dispatchability_hash".to_owned(), json!(hash));
@@ -661,6 +808,15 @@ fn wire_ceilings(caps: RunCaps) -> Option<ethogram::RunCeilings> {
     .then(|| caps.to_wire())
 }
 
+/// `pass-started` names the run id minted for this pass, the id its events are
+/// written under and its harness child receives as `OSTROM_RUN_ID`, so a hold
+/// can be followed from the fact to the process. `pass-ended` is part of the
+/// frozen pass contract and does not gain it.
+fn with_run_id(mut fact: Map<String, Value>, run_id: &str) -> Map<String, Value> {
+    fact.insert("run_id".to_owned(), json!(run_id));
+    fact
+}
+
 fn refuse_empty_repository_scope(
     request: &PassRequest,
     events: &mut RunEventGuard,
@@ -681,7 +837,7 @@ fn refuse_empty_repository_scope(
         &TraceAppend {
             ts: request.clock.timestamp(),
             kind: "pass-started".to_owned(),
-            fact: common.clone(),
+            fact: with_run_id(common.clone(), events.run_id()),
             narration: Map::new(),
         },
     )
@@ -975,8 +1131,18 @@ fn run_pass_with_bridge_probe_timeout(
     });
     let next_wake = state.wake.saturating_add(1);
     let owner = format!("{}-{}-wake{next_wake}", request.role.name(), state.role_id);
-    let lease = match OwnedLease::acquire(&request.paths.state, &lease_name, &owner, lease_now, ttl)
-    {
+    // The lease names this process, so the stall reaper (#619) can tell a
+    // live pass from one whose process is gone, and stop exactly this one.
+    let identity = read_process_identity(std::process::id()).ok().flatten();
+    let lease = match OwnedLease::acquire_renewable(
+        &request.paths.state,
+        &lease_name,
+        &owner,
+        lease_now,
+        ttl,
+        identity,
+        Path::new("/proc"),
+    ) {
         Ok(lease) => lease,
         Err(
             LeaseActionError::Held
@@ -1036,7 +1202,25 @@ fn run_pass_with_bridge_probe_timeout(
         control: None,
         process_exit: ProcessExit::Abnormal,
         permission_bridge: None,
+        renewal: None,
     };
+    guard.renewal = Some(
+        PassLeaseRenewal::start(
+            &request.paths.state,
+            &lease_name,
+            &owner,
+            identity.map(|identity| (identity.pid, identity.process_group_id, identity.start_time)),
+            ttl,
+            &request.clock,
+        )
+        .map_err(|error| {
+            PassError::failed(
+                request.role,
+                format!("could not start pass lease renewal: {error}"),
+                1,
+            )
+        })?,
+    );
     let prepared = prepare_sweep(request, sweep_wait).and_then(|sweep| {
         session_prompt(request, &sweep)
             .map(|session| (sweep, session))
@@ -1065,7 +1249,7 @@ fn run_pass_with_bridge_probe_timeout(
                 &TraceAppend {
                     ts: guard.trace_time.clone(),
                     kind: "pass-started".to_owned(),
-                    fact,
+                    fact: with_run_id(fact, guard.events.run_id()),
                     narration: Map::new(),
                 },
             )
@@ -1104,7 +1288,7 @@ fn run_pass_with_bridge_probe_timeout(
         &TraceAppend {
             ts: guard.trace_time.clone(),
             kind: "pass-started".to_owned(),
-            fact: start_fact,
+            fact: with_run_id(start_fact, guard.events.run_id()),
             narration: Map::new(),
         },
     )
@@ -1340,6 +1524,11 @@ fn run_pass_with_bridge_probe_timeout(
             repositories.join(","),
         );
     }
+    // The run id `pass-started` records. An observer reads it from
+    // `/proc/<pid>/environ`, and an `ostrom dispatch` the agent runs records it
+    // as `parent_run_id`. Set here, never inherited: a pass started under
+    // another run must not pass that run's id on as its own.
+    command.env(environment::OSTROM_RUN_ID.name, guard.events.run_id());
     set_process_group(&mut command);
     let mut child = command.spawn().map_err(|error| {
         PassError::failed(request.role, format!("could not start Claude: {error}"), 1)
@@ -1641,6 +1830,15 @@ fn wait_for_child(
 
         if status.is_none() {
             check_signal(request, guard, Some(child), watchdog)?;
+            if guard.renewal.as_ref().is_some_and(PassLeaseRenewal::lost) {
+                guard.outcome = Some("failed".to_owned());
+                guard.reason = Some("pass-lease-lost".to_owned());
+                return Err(PassError::failed(
+                    request.role,
+                    "the pass lease could not be renewed; stopping",
+                    1,
+                ));
+            }
         }
 
         if let Some(trip) = watchdog.check() {
@@ -2272,6 +2470,7 @@ mod sink_refusal_tests {
             control: None,
             process_exit: ProcessExit::Normal,
             permission_bridge: None,
+            renewal: None,
         };
         let drafts = [payload, json!({"text": "still working"})]
             .map(|payload| EventDraft {

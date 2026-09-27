@@ -30,55 +30,6 @@ pub struct HookOutput {
     pub stderr: String,
 }
 
-/// The frozen rules this build ships, compiled in so the base constitution
-/// layer does not depend on an installed plugin tree.
-const SHIPPED_RULES: &str = include_str!("../assets/rules/frozen-rules.md");
-
-#[must_use]
-pub fn render_constitution(
-    plugin_root: &Path,
-    user_rules_root: &Path,
-    working_directory: &Path,
-    home: &Path,
-) -> String {
-    let mut layers = Vec::new();
-    collect_layer(&mut layers, "user", user_rules_root);
-    collect_layer(&mut layers, "repo", &working_directory.join(".ostrom"));
-
-    // The shipped layer is compiled in. It used to be read out of an installed
-    // plugin tree, which meant the constitution silently lost its base layer on
-    // any machine that had not installed the plugin — including every non-Claude
-    // harness. An explicit override still wins, for a fixture or a fork.
-    let mut output = fs::read_to_string(plugin_root.join("rules/frozen-rules.md"))
-        .unwrap_or_else(|_| SHIPPED_RULES.to_owned());
-    if !layers.is_empty() {
-        output.push('\n');
-        output.push_str(
-            "<!-- constitution: layers below override the shipped rules above on conflict -->\n",
-        );
-        let home = home.to_string_lossy();
-        for (label, file) in layers {
-            let display = if label == "repo" {
-                file.strip_prefix(working_directory).map_or_else(
-                    |_| file.to_string_lossy().into_owned(),
-                    |relative| format!("./{}", relative.display()),
-                )
-            } else {
-                let display = file.to_string_lossy();
-                display
-                    .strip_prefix(home.as_ref())
-                    .map_or_else(|| display.to_string(), |suffix| format!("~{suffix}"))
-            };
-            output.push('\n');
-            output.push_str(&format!(
-                "<!-- constitution layer: {label} ({display}) -->\n\n"
-            ));
-            output.push_str(&fs::read_to_string(file).unwrap_or_default());
-        }
-    }
-    output
-}
-
 pub fn render_digest(options: &DigestOptions) -> HookOutput {
     let waiting = read_waiting_decisions(&options.paths);
     let config = match load_config(&options.paths, &options.working_directory) {
@@ -268,50 +219,6 @@ pub fn render_digest(options: &DigestOptions) -> HookOutput {
     HookOutput {
         stdout,
         stderr: String::new(),
-    }
-}
-
-fn collect_layer(layers: &mut Vec<(&'static str, PathBuf)>, label: &'static str, root: &Path) {
-    let single = root.join("rules.md");
-    if has_content(&single) {
-        layers.push((label, single));
-    }
-    let mut fragments = fs::read_dir(root.join("rules.d"))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|extension| extension == "md"))
-        .collect::<Vec<_>>();
-    fragments.sort();
-    for fragment in fragments {
-        if has_content(&fragment) {
-            layers.push((label, fragment));
-        }
-    }
-}
-
-fn has_content(path: &Path) -> bool {
-    let Ok(text) = fs::read_to_string(path) else {
-        return false;
-    };
-    let mut remaining = text.as_str();
-    loop {
-        let Some(start) = remaining.find("<!--") else {
-            return remaining
-                .chars()
-                .any(|character| !character.is_whitespace());
-        };
-        if remaining[..start]
-            .chars()
-            .any(|character| !character.is_whitespace())
-        {
-            return true;
-        }
-        let Some(end) = remaining[start + 4..].find("-->") else {
-            return false;
-        };
-        remaining = &remaining[start + 4 + end + 3..];
     }
 }
 

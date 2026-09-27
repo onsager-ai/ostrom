@@ -633,6 +633,10 @@ fn loop_unit_declaration(resolved: &ResolvedLoop) -> LoopUnitDeclaration {
             tokens: Some("MANDATE_ORDER_TOKEN_CEILING".to_owned()),
         },
         ceilings: ostrom_store::umwelt_edge::run_ceilings(resolved.ceilings),
+        // Wall plus the termination grace, so the run's own watchdog fires
+        // first and writes a real terminal row; systemd is the outer bound
+        // (#619). Undeclared, this is the pass wall default.
+        timeout_start_seconds: resolved.run_caps.outer_bound_seconds(),
     }
 }
 
