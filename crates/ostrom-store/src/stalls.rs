@@ -760,9 +760,6 @@ enum PassGeneration {
 }
 
 fn pass_generation(paths: &OstromPaths, hold: &ObservedHold) -> PassGeneration {
-    // TEMPORARY mutation (#636 principle-7 evidence): judge by owner lookup
-    // alone, ignoring the recorded process.
-    let _ = hold.recorded_process;
     hold.progress
         .holding
         .owner
@@ -772,7 +769,10 @@ fn pass_generation(paths: &OstromPaths, hold: &ObservedHold) -> PassGeneration {
                 .into_iter()
                 .find(|lease| lease.owner == owner)
         })
-        .map_or(PassGeneration::Superseded(None), PassGeneration::Current)
+        .map_or(
+            PassGeneration::Superseded(hold.recorded_process),
+            PassGeneration::Current,
+        )
 }
 
 /// Exactly what a stalled hold's lease or unit names, and nothing else. An

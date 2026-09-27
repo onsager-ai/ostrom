@@ -840,7 +840,6 @@ fn with_process_identity(
 /// renewal thread only sets a flag; without this the pass would go on to
 /// start its harness alongside the pass that now holds the lease. The row says
 /// `pass-lease-lost` at zero cost, since nothing ran.
-#[allow(dead_code)] // TEMPORARY mutation (#636): both lease-lost checks removed.
 fn end_if_lease_lost(
     request: &PassRequest,
     guard: &mut PassGuard,
@@ -1353,6 +1352,7 @@ fn run_pass_with_bridge_probe_timeout(
     guard.started = true;
     // Sweep preparation can wait minutes on the sweep lease, long enough for
     // the pass lease to lapse and be taken over (#636).
+    end_if_lease_lost(request, &mut guard, &lease_name)?;
     if request.repositories.is_some()
         && request.role == PassRole::Gatekeeper
         && session.candidate_count == Some(0)
@@ -1583,6 +1583,7 @@ fn run_pass_with_bridge_probe_timeout(
     // another run must not pass that run's id on as its own.
     command.env(environment::OSTROM_RUN_ID.name, guard.events.run_id());
     set_process_group(&mut command);
+    end_if_lease_lost(request, &mut guard, &lease_name)?;
     let mut child = command.spawn().map_err(|error| {
         PassError::failed(request.role, format!("could not start Claude: {error}"), 1)
     })?;
