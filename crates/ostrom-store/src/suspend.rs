@@ -101,7 +101,8 @@ fn clocks() -> Result<(Duration, Duration), String> {
             .map_err(|error| format!("{name} is not a duration: {error}"))
     };
     let monotonic = read(ClockId::Monotonic, "CLOCK_MONOTONIC")?;
-    let boottime = read(ClockId::Boottime, "CLOCK_BOOTTIME")?;
+    // MUTATION C: the wrong clock stands in for CLOCK_BOOTTIME.
+    let boottime = read(ClockId::Realtime, "CLOCK_BOOTTIME")?;
     Ok((boottime, monotonic))
 }
 
