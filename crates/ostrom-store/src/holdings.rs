@@ -84,8 +84,7 @@ pub fn open_holdings(paths: &OstromPaths, clock: &Clock) -> Result<Vec<Holding>,
         .into_iter()
         .filter_map(Result::ok)
         .collect::<Vec<_>>();
-    // MUTATION (principle 7, #618): terminal rows no longer close a hold.
-    let _terminal_orders = rows
+    let terminal_orders = rows
         .iter()
         .filter(|row| matches!(row.kind.as_str(), "work-completed" | "work-failed"))
         .filter_map(|row| fact_str(row, "order_id"))
@@ -101,7 +100,9 @@ pub fn open_holdings(paths: &OstromPaths, clock: &Clock) -> Result<Vec<Holding>,
     for (index, row) in rows.iter().enumerate() {
         match row.kind.as_str() {
             "work-dispatched" => {
-                if let Some(order_id) = fact_str(row, "order_id") {
+                if let Some(order_id) = fact_str(row, "order_id")
+                    && !terminal_orders.contains(order_id)
+                {
                     latest.insert((HoldingKind::Implementer, order_id), index);
                 }
             }
@@ -199,12 +200,17 @@ fn read_leases(state: &Path) -> Vec<LeaseRecord> {
         .collect()
 }
 
-// MUTATION (principle 7, #618): the liveness check is reverted; every lease reads live.
-fn lease_state(leases: &[LeaseRecord], owner: &str, _now: u64) -> Option<LeaseState> {
+fn lease_state(leases: &[LeaseRecord], owner: &str, now: u64) -> Option<LeaseState> {
     leases
         .iter()
         .find(|lease| lease.owner == owner)
-        .map(|_lease| LeaseState::Live)
+        .map(|lease| {
+            if lease.is_live(now) {
+                LeaseState::Live
+            } else {
+                LeaseState::Expired
+            }
+        })
 }
 
 #[cfg(test)]

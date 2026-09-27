@@ -1353,7 +1353,7 @@ fn run_pass_with_bridge_probe_timeout(
     // `/proc/<pid>/environ`, and an `ostrom dispatch` the agent runs records it
     // as `parent_run_id`. Set here, never inherited: a pass started under
     // another run must not pass that run's id on as its own.
-    // MUTATION (principle 7, #618): the harness OSTROM_RUN_ID line is reverted.
+    command.env(environment::OSTROM_RUN_ID.name, guard.events.run_id());
     set_process_group(&mut command);
     let mut child = command.spawn().map_err(|error| {
         PassError::failed(request.role, format!("could not start Claude: {error}"), 1)
