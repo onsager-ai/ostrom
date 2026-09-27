@@ -339,21 +339,117 @@ loops:
         .lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("trace row"))
         .collect::<Vec<_>>();
-    assert_eq!(trace.len(), 2, "{trace:?}");
-    assert_eq!(trace[0]["kind"], "pass-started");
-    assert_eq!(trace[1]["kind"], "pass-ended");
-    for row in &trace {
-        assert_eq!(row["fact"]["repositories"], serde_json::json!([]));
-        assert_eq!(
-            row["fact"]["skipped_repositories"],
-            serde_json::json!([{
-                "repository": "placeholder-org/unavailable",
-                "reason": "repository-not-available"
-            }])
-        );
-        assert_eq!(row["fact"]["reason"], "no-effective-repositories");
-    }
-    assert_eq!(trace[1]["fact"]["outcome"], "failed");
+    assert_eq!(trace.len(), 1, "{trace:?}");
+    assert_eq!(trace[0]["kind"], "loop-skipped");
+    let fact = &trace[0]["fact"];
+    assert_eq!(fact["loop"], "unattended-triage");
+    assert_eq!(fact["actor"], "triage");
+    assert_eq!(fact["operation"], "local-triage");
+    assert_eq!(fact["repositories"], serde_json::json!([]));
+    assert_eq!(
+        fact["skipped_repositories"],
+        serde_json::json!([{
+            "repository": "placeholder-org/unavailable",
+            "reason": "repository-not-available"
+        }])
+    );
+    assert_eq!(fact["reason"], "no-effective-repositories");
+    assert!(fact.get("outcome").is_none(), "{fact:?}");
+    assert!(fact.get("cost_usd").is_none(), "{fact:?}");
+    assert!(fact.get("duration_seconds").is_none(), "{fact:?}");
+}
+
+#[test]
+fn pass_actor_loop_refuses_an_empty_effective_scope_with_one_loop_skipped_row() {
+    // The refusal in `dispatch_resolved_loop` precedes the branch that spawns
+    // `__pass-worker` for a builder/gatekeeper loop whose operation has an
+    // `agent/` step, so an empty effective scope must produce the same single
+    // `loop-skipped` row as a `cmd/run` loop, and no `pass-*` pair, no matter
+    // the actor.
+    let root = tempdir().expect("temporary pass-actor empty-scope loop fixture");
+    let manifest = root.path().join("policy.yaml");
+    fs::write(
+        &manifest,
+        r#"manifest_version: 1
+actors: {builder: {}}
+operations:
+  build-pass:
+    steps:
+      - uses: agent/claude
+        with:
+          prompt: 'empty scope fixture'
+grants:
+  build-pass:
+    actors: builder
+    operations: build-pass
+    repositories: placeholder-org/other
+loops:
+  delivery:
+    actor: builder
+    operation: build-pass
+    repositories: placeholder-org/unavailable
+    every: hourly
+"#,
+    )
+    .expect("write pass-actor empty-scope policy");
+    let trusted_keys = support::sign_manifest(&manifest);
+    let operator = root.path().join("ostrom.yaml");
+    fs::copy(&manifest, &operator).expect("install operator policy fixture");
+    support::sign_manifest(&operator);
+    let composed = ostrom()
+        .arg("compose")
+        .arg(&manifest)
+        .env("OSTROM_HOME", root.path())
+        .env("OSTROM_POLICY_MANIFEST", &operator)
+        .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
+        .output()
+        .expect("compose pass-actor empty-scope policy");
+    assert!(
+        composed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&composed.stderr)
+    );
+
+    let output = ostrom()
+        .args(["loop", "run", "delivery"])
+        .env("OSTROM_HOME", root.path())
+        .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
+        .env("OSTROM_AVAILABLE_REPOSITORIES", "placeholder-org/alpha")
+        .output()
+        .expect("run empty-scope pass-actor loop");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no-effective-repositories"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !root.path().join("pass-runs").exists(),
+        "empty scope spawned a pass worker"
+    );
+    let trace = fs::read_to_string(root.path().join("sprint.jsonl"))
+        .expect("read pass-actor empty-scope trace")
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("trace row"))
+        .collect::<Vec<_>>();
+    assert_eq!(trace.len(), 1, "{trace:?}");
+    assert_eq!(trace[0]["kind"], "loop-skipped");
+    let fact = &trace[0]["fact"];
+    assert_eq!(fact["loop"], "delivery");
+    assert_eq!(fact["actor"], "builder");
+    assert_eq!(fact["operation"], "build-pass");
+    assert_eq!(fact["repositories"], serde_json::json!([]));
+    assert_eq!(
+        fact["skipped_repositories"],
+        serde_json::json!([{
+            "repository": "placeholder-org/unavailable",
+            "reason": "repository-not-available"
+        }])
+    );
+    assert_eq!(fact["reason"], "no-effective-repositories");
+    assert!(fact.get("outcome").is_none(), "{fact:?}");
+    assert!(fact.get("cost_usd").is_none(), "{fact:?}");
+    assert!(fact.get("duration_seconds").is_none(), "{fact:?}");
 }
 
 fn loop_run(root: &Path, manifest: &Path, trusted_keys: &Path, marker: &Path) -> Command {

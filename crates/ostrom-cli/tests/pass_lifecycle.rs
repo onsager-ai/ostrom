@@ -744,7 +744,7 @@ fn without_a_control_descriptor_stdin_is_ignored_and_existing_bytes_are_preserve
     );
     assert_eq!(normalize_pass_trace(&fs::read(fixture.state.join("sprint.jsonl")).unwrap()),
         concat!(
-            "{\"ts\":\"2026-08-01T00:00:00Z\",\"kind\":\"pass-started\",\"fact\":{\"owner\":\"builder-a1b2c3d4-wake7\",\"sweep\":\"reused\",\"generation_id\":\"pass-lifecycle-fresh-generation\",\"run_id\":\"<pass-run-id>\"},\"narration\":{}}\n",
+            "{\"ts\":\"2026-08-01T00:00:00Z\",\"kind\":\"pass-started\",\"fact\":{\"owner\":\"builder-a1b2c3d4-wake7\",\"sweep\":\"reused\",\"generation_id\":\"pass-lifecycle-fresh-generation\",\"run_id\":\"<pass-run-id>\",\"pid\":\"<pass-pid>\",\"process_group_id\":\"<pass-process_group_id>\",\"process_start_time\":\"<pass-process_start_time>\"},\"narration\":{}}\n",
             "{\"ts\":\"2026-08-01T00:00:00Z\",\"kind\":\"pass-ended\",\"fact\":{\"owner\":\"builder-a1b2c3d4-wake7\",\"outcome\":\"no-op\",\"cost_usd\":1.25,\"duration_seconds\":0,\"reason\":\"blocked\"},\"narration\":{}}\n"
         ).as_bytes());
     let events = fixture.run_events();
@@ -1320,6 +1320,13 @@ fn normalize_pass_trace(bytes: &[u8]) -> Vec<u8> {
         if row["kind"] == "pass-started" && row["fact"].get("run_id").is_some() {
             row["fact"]["run_id"] = Value::String("<pass-run-id>".to_owned());
         }
+        // So is the process `pass-started` names (#636); the lease-takeover
+        // tests compare its value with the running pass.
+        for key in ["pid", "process_group_id", "process_start_time"] {
+            if row["kind"] == "pass-started" && row["fact"].get(key).is_some() {
+                row["fact"][key] = Value::String(format!("<pass-{key}>"));
+            }
+        }
         serde_json::to_writer(&mut normalized, &row).expect("serialize normalized trace");
         normalized.push(b'\n');
     }
@@ -1875,6 +1882,272 @@ fn a_pass_that_loses_its_lease_stops() {
             "stopped_before_the_agent_finished": true,
             "outcome": "failed",
             "reason": "pass-lease-lost",
+        })
+    );
+}
+
+/// Hand `lease` to another pass, as a takeover of a lapsed lease does. The
+/// replacement is atomic, so the pass never reads half a lease.
+fn take_over_lease(lease: &Path, owner: &str) {
+    let replacement = lease.with_extension("takeover");
+    fs::write(
+        &replacement,
+        format!(
+            "{{\"owner\":\"{owner}\",\"started_at\":1,\"expires_at\":{}}}\n",
+            u64::MAX
+        ),
+    )
+    .expect("write the successor's lease");
+    fs::rename(&replacement, lease).expect("hand the lease to another pass");
+}
+
+fn lease_owner(lease: &Path) -> Value {
+    fs::read_to_string(lease)
+        .ok()
+        .and_then(|lease| serde_json::from_str::<Value>(&lease).ok())
+        .map_or(Value::Null, |lease| lease["owner"].clone())
+}
+
+/// #636: a pass whose lease another pass takes over while its process still
+/// runs has been displaced, not exited. `ostrom up` records nothing for it,
+/// and the pass ends itself with `pass-lease-lost`: one row, its own.
+#[test]
+fn a_lease_taken_over_while_the_pass_runs_is_not_recorded_as_exited() {
+    let fixture = Fixture::new(concat!(
+        "printf '%s\\n' \"$$\" >\"$OSTROM_HOME/child.pid\"\n",
+        "trap 'exit 143' TERM\n",
+        "i=0; while [ \"$i\" -lt 90 ]; do sleep 1; i=$((i + 1)); done"
+    ));
+    // `ostrom up` needs a current policy version; the manifest stays outside
+    // the state root, so the pass itself runs exactly as it does without one.
+    let policy = fixture.root.path().join("policy");
+    fs::create_dir_all(&policy).expect("create the policy directory");
+    let manifest = policy.join("ostrom.yaml");
+    fs::write(&manifest, "manifest_version: 1\n").expect("write the operator manifest");
+    let trusted_keys = support::sign_manifest(&manifest);
+    let composed = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .arg("compose")
+        .arg(&manifest)
+        .current_dir(&policy)
+        .env("OSTROM_HOME", &fixture.state)
+        .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
+        .env_remove("OSTROM_POLICY_MANIFEST")
+        .output()
+        .expect("compose the current policy version");
+    assert!(
+        composed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&composed.stderr)
+    );
+
+    // The default TTL renews every 30 s, so the pass has not yet found its
+    // lease gone when `up` runs.
+    let mut child = fixture
+        .command()
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start pass");
+    wait_for(&fixture.state.join("child.pid"));
+    let started = fixture
+        .trace()
+        .into_iter()
+        .find(|row| row["kind"] == "pass-started")
+        .expect("the pass recorded its start");
+    let owner = started["fact"]["owner"].clone();
+    let lease = fixture.state.join("builder-pass.lease");
+    // What `pass-started` recorded is the process the lease named before the
+    // takeover: the pass worker, not the supervisor this test started.
+    let identity = |record: &Value| {
+        ["pid", "process_group_id", "process_start_time"].map(|key| record[key].clone())
+    };
+    let lease_identity = fs::read_to_string(&lease)
+        .ok()
+        .and_then(|lease| serde_json::from_str::<Value>(&lease).ok())
+        .map(|lease| identity(&lease));
+    take_over_lease(&lease, "builder-successor-wake99");
+
+    let up = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .arg("up")
+        .current_dir(&fixture.state)
+        .env_clear()
+        .env("OSTROM_HOME", &fixture.state)
+        .env("HOME", fixture.root.path())
+        .env("PATH", env::var_os("PATH").unwrap_or_default())
+        .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
+        .output()
+        .expect("run ostrom up");
+    let ran_through_up = child.try_wait().expect("poll the pass").is_none();
+    let rows_after_up = fixture
+        .trace()
+        .into_iter()
+        .filter(|row| row["kind"] == "pass-ended" && row["fact"]["owner"] == owner)
+        .count();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while child.try_wait().expect("poll the pass").is_none() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    let status = child.try_wait().expect("poll the pass");
+
+    let ended = fixture
+        .trace()
+        .into_iter()
+        .filter(|row| row["kind"] == "pass-ended" && row["fact"]["owner"] == owner)
+        .collect::<Vec<_>>();
+    let row = ended.first().cloned().unwrap_or(Value::Null);
+    assert_eq!(
+        json!({
+            "recorded_its_process": lease_identity.as_ref() == Some(&identity(&started["fact"]))
+                && started["fact"]["pid"].is_u64(),
+            "up_succeeded": up.status.success(),
+            "up_reaped_nothing": String::from_utf8_lossy(&up.stdout).contains("reaped=0"),
+            "ran_through_up": ran_through_up,
+            "rows_after_up": rows_after_up,
+            "pass_exited_nonzero": status.is_some_and(|status| !status.success()),
+            "terminal_rows": ended.len(),
+            "outcome": row["fact"]["outcome"],
+            "reason": row["fact"]["reason"],
+            "written_by_the_pass": row["fact"]["recorded_by"].is_null(),
+            "lease_owner": lease_owner(&lease),
+        }),
+        json!({
+            "recorded_its_process": true,
+            "up_succeeded": true,
+            "up_reaped_nothing": true,
+            "ran_through_up": true,
+            "rows_after_up": 0,
+            "pass_exited_nonzero": true,
+            "terminal_rows": 1,
+            "outcome": "failed",
+            "reason": "pass-lease-lost",
+            "written_by_the_pass": true,
+            "lease_owner": "builder-successor-wake99",
+        }),
+        "up stdout: {} stderr: {}",
+        String::from_utf8_lossy(&up.stdout),
+        String::from_utf8_lossy(&up.stderr)
+    );
+}
+
+/// #636: a pass whose lease is taken over while it waits in sweep preparation
+/// never starts its harness. It ends with `pass-lease-lost` at zero cost, and
+/// leaves the new holder's lease in place.
+#[test]
+fn a_pass_whose_lease_is_lost_during_sweep_preparation_never_spawns_its_harness() {
+    let fixture = Fixture::new("printf '%s\\n' started >\"$OSTROM_HOME/harness-started\"");
+    // Another sweep holds the sweep lease, so the pass waits in preparation.
+    let sweep_lease = fixture.state.join("sweep.lease");
+    fs::write(
+        &sweep_lease,
+        format!(
+            "{{\"owner\":\"in-flight-sweep\",\"started_at\":1,\"expires_at\":{}}}\n",
+            u64::MAX
+        ),
+    )
+    .expect("hold the sweep lease");
+    let child = fixture
+        .command()
+        .env("MANDATE_LEASE_TTL_SECONDS", "2")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start pass");
+    let lease = fixture.state.join("builder-pass.lease");
+    wait_for(&lease);
+    take_over_lease(&lease, "builder-successor-wake99");
+    // At this TTL the pass renews every 500 ms; several renewals find the
+    // lease gone while it is still waiting for the sweep lease.
+    thread::sleep(Duration::from_secs(3));
+    let waited_in_preparation = !fs::read_to_string(fixture.state.join("sprint.jsonl"))
+        .is_ok_and(|trace| trace.contains("\"pass-started\""));
+    fs::remove_file(&sweep_lease).expect("release the sweep lease");
+    let status = wait(child);
+
+    let ended = fixture
+        .trace()
+        .into_iter()
+        .filter(|row| row["kind"] == "pass-ended")
+        .collect::<Vec<_>>();
+    let row = ended.first().cloned().unwrap_or(Value::Null);
+    assert_eq!(
+        json!({
+            "waited_in_preparation": waited_in_preparation,
+            "exited_nonzero": !status.success(),
+            "harness_started": fixture.state.join("harness-started").exists(),
+            "terminal_rows": ended.len(),
+            "outcome": row["fact"]["outcome"],
+            "reason": row["fact"]["reason"],
+            "cost_usd": row["fact"]["cost_usd"],
+            "lease_owner": lease_owner(&lease),
+        }),
+        json!({
+            "waited_in_preparation": true,
+            "exited_nonzero": true,
+            "harness_started": false,
+            "terminal_rows": 1,
+            "outcome": "failed",
+            "reason": "pass-lease-lost",
+            "cost_usd": 0.0,
+            "lease_owner": "builder-successor-wake99",
+        })
+    );
+}
+
+/// #636 second review: the check before the harness starts reads the lease
+/// file, not only the renewal thread's flag, which can be a whole 30-second
+/// renewal interval stale. A lease taken over just before the pass would
+/// spawn stops it at once, long before its first renewal.
+#[test]
+fn a_lease_taken_before_the_renewal_notices_still_stops_the_harness_spawn() {
+    let fixture = Fixture::new("printf '%s\\n' started >\"$OSTROM_HOME/harness-started\"");
+    let sweep_lease = fixture.state.join("sweep.lease");
+    fs::write(
+        &sweep_lease,
+        format!(
+            "{{\"owner\":\"in-flight-sweep\",\"started_at\":1,\"expires_at\":{}}}\n",
+            u64::MAX
+        ),
+    )
+    .expect("hold the sweep lease");
+    // The default TTL: the first renewal is 30 s after the lease is taken.
+    let started = Instant::now();
+    let child = fixture
+        .command()
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start pass");
+    let lease = fixture.state.join("builder-pass.lease");
+    wait_for(&lease);
+    take_over_lease(&lease, "builder-successor-wake99");
+    fs::remove_file(&sweep_lease).expect("release the sweep lease");
+    let status = wait(child);
+    let elapsed = started.elapsed();
+
+    let ended = fixture
+        .trace()
+        .into_iter()
+        .filter(|row| row["kind"] == "pass-ended")
+        .collect::<Vec<_>>();
+    let row = ended.first().cloned().unwrap_or(Value::Null);
+    assert_eq!(
+        json!({
+            "ended_before_its_first_renewal": elapsed < Duration::from_secs(20),
+            "exited_nonzero": !status.success(),
+            "harness_started": fixture.state.join("harness-started").exists(),
+            "terminal_rows": ended.len(),
+            "reason": row["fact"]["reason"],
+            "cost_usd": row["fact"]["cost_usd"],
+            "lease_owner": lease_owner(&lease),
+        }),
+        json!({
+            "ended_before_its_first_renewal": true,
+            "exited_nonzero": true,
+            "harness_started": false,
+            "terminal_rows": 1,
+            "reason": "pass-lease-lost",
+            "cost_usd": 0.0,
+            "lease_owner": "builder-successor-wake99",
         })
     );
 }

@@ -48,6 +48,15 @@
 //! is gone with no claim is left to the existing stale-order reaper, which
 //! already closes it.
 //!
+//! A pass is judged by the generation of the lease it started under, not by
+//! whether some lease still names its owner (#636). While the lease names it,
+//! the lease's process is the pass's. Once another pass has taken the lease
+//! over, or none holds it, the pass is judged by the process its `pass-started`
+//! recorded: one still running with that identity has been displaced, not
+//! exited, and is left to end itself with `pass-lease-lost` unless it is past
+//! its stall threshold, when that recorded process is stopped like any other
+//! stalled pass; only one whose process is gone is closed.
+//!
 //! A reaped run's `cost_usd` is its declared cost ceiling, never `null`: the
 //! real figure is unknowable once the process is gone, and every daily-cap
 //! reader stays conservative rather than undercounting or turning unknown.
@@ -469,7 +478,7 @@ fn reap_all(
             match classify(paths, &hold, now) {
                 Verdict::Stalled(target) => reap_stalled(paths, clock, &hold, &run_id, &target),
                 Verdict::Exited => close_exited_pass(paths, clock, &hold, &run_id),
-                Verdict::Healthy => Ok(None),
+                Verdict::Healthy | Verdict::Displaced => Ok(None),
             }
         };
         match action {
@@ -575,6 +584,10 @@ struct ObservedHold {
     progress: HoldProgress,
     /// The `ceilings` of the run's `run.started` event, when it has one.
     run_ceilings: Option<Value>,
+    /// The process a pass's `pass-started` recorded (#636), when it recorded
+    /// one. It outlives a takeover of the lease, which names only the current
+    /// holder.
+    recorded_process: Option<ProcessIdentity>,
 }
 
 fn observe(paths: &OstromPaths, clock: &Clock) -> Result<Vec<ObservedHold>, HoldingsError> {
@@ -596,6 +609,9 @@ fn observe(paths: &OstromPaths, clock: &Clock) -> Result<Vec<ObservedHold>, Hold
                 .as_deref()
                 .and_then(|run_id| run_started_ceilings(&events, run_id));
             let caps = hold_caps(holding.kind, &opener, run_ceilings.as_ref());
+            let recorded_process = (holding.kind == HoldingKind::Pass)
+                .then(|| recorded_pass_process(&rows, &holding))
+                .flatten();
             let last_progress = [
                 epoch_seconds(&holding.started_at),
                 holding.last_event_at.as_deref().and_then(epoch_seconds),
@@ -615,9 +631,25 @@ fn observe(paths: &OstromPaths, clock: &Clock) -> Result<Vec<ObservedHold>, Hold
                     holding,
                 },
                 run_ceilings,
+                recorded_process,
             }
         })
         .collect())
+}
+
+/// The process the pass's own `pass-started` recorded (#636): the newest
+/// opener for its owner that names one. A later row for the same owner that
+/// names no process, such as one an agent appends inside the pass, does not
+/// hide it.
+fn recorded_pass_process(rows: &[TraceFactRecord], holding: &Holding) -> Option<ProcessIdentity> {
+    let owner = holding.owner.as_deref()?;
+    rows.iter()
+        .rev()
+        .filter(|row| {
+            row.kind == "pass-started"
+                && row.fact.get("owner").and_then(Value::as_str) == Some(owner)
+        })
+        .find_map(|row| ProcessIdentity::from_fact(&row.fact))
 }
 
 /// The fact of the latest record that opened this hold.
@@ -728,6 +760,36 @@ enum Verdict {
     Stalled(StopTarget),
     /// A pass whose process is gone with no terminal row.
     Exited,
+    /// A pass whose lease another pass has taken over while its own process
+    /// still runs (#636), within its stall threshold. It is not exited, and it
+    /// is left to end itself with `pass-lease-lost`. Past its threshold it is
+    /// [`Verdict::Stalled`], and the process it recorded is what is stopped.
+    Displaced,
+}
+
+/// Which lease generation a pass hold is judged by (#636).
+enum PassGeneration {
+    /// The lease still names the hold's owner.
+    Current(LeaseRecord),
+    /// Another pass holds the lease now, or none does. What remains is the
+    /// process the hold recorded when it started, if it recorded one.
+    Superseded(Option<ProcessIdentity>),
+}
+
+fn pass_generation(paths: &OstromPaths, hold: &ObservedHold) -> PassGeneration {
+    hold.progress
+        .holding
+        .owner
+        .as_deref()
+        .and_then(|owner| {
+            read_leases(&paths.state)
+                .into_iter()
+                .find(|lease| lease.owner == owner)
+        })
+        .map_or(
+            PassGeneration::Superseded(hold.recorded_process),
+            PassGeneration::Current,
+        )
 }
 
 /// Exactly what a stalled hold's lease or unit names, and nothing else. An
@@ -763,6 +825,17 @@ impl ProcessIdentity {
             pid,
             process_group_id,
             start_time,
+        })
+    }
+
+    /// The identity a `pass-started` fact records, under the lease's own
+    /// field names (#636).
+    fn from_fact(fact: &Map<String, Value>) -> Option<Self> {
+        let number = |key: &str| fact.get(key).and_then(Value::as_u64);
+        Some(Self {
+            pid: u32::try_from(number("pid")?).ok()?,
+            process_group_id: u32::try_from(number("process_group_id")?).ok()?,
+            start_time: number("process_start_time")?,
         })
     }
 
@@ -831,15 +904,32 @@ fn classify(paths: &OstromPaths, hold: &ObservedHold, now: u64) -> Verdict {
             }
         }
         HoldingKind::Pass => {
-            let lease = holding.owner.as_deref().and_then(|owner| {
-                read_leases(&paths.state)
-                    .into_iter()
-                    .find(|lease| lease.owner == owner)
-            });
-            let Some(lease) = lease else {
+            let lease = match pass_generation(paths, hold) {
+                PassGeneration::Current(lease) => lease,
                 // The pass appends `pass-ended` before it releases its lease,
-                // so an open hold with no lease is a pass that is gone.
-                return Verdict::Exited;
+                // so a hold no lease names is a pass that is gone, or one
+                // another pass took the lease from (#636). The process it
+                // recorded tells the two apart.
+                PassGeneration::Superseded(Some(identity)) => {
+                    return match identity.is_running() {
+                        // A displaced pass that has hung is still a stalled
+                        // hold: nothing else will ever end it.
+                        Some(true) if hold.progress.past_threshold() => {
+                            Verdict::Stalled(StopTarget::Process {
+                                identity,
+                                order: None,
+                            })
+                        }
+                        Some(true) => Verdict::Displaced,
+                        Some(false) => Verdict::Exited,
+                        // Not closed on a guess.
+                        None => Verdict::Healthy,
+                    };
+                }
+                // A hold that recorded no process (started before #636, or
+                // where `/proc` could not be read): nothing else can say it
+                // still runs.
+                PassGeneration::Superseded(None) => return Verdict::Exited,
             };
             match ProcessIdentity::from_lease(&lease) {
                 Some(identity) => match identity.is_running() {
@@ -1109,21 +1199,22 @@ fn resume_claim(
             (stop, Some(order))
         }
         HoldingKind::Pass => {
-            let lease = holding.owner.as_deref().and_then(|owner| {
-                read_leases(&paths.state)
-                    .into_iter()
-                    .find(|lease| lease.owner == owner)
-            });
-            let stop = match lease {
-                // The pass appends `pass-ended` before it releases its lease.
-                None => StopOutcome::Stopped,
-                Some(lease) => match ProcessIdentity::from_lease(&lease) {
+            let stop = match pass_generation(paths, hold) {
+                PassGeneration::Current(lease) => match ProcessIdentity::from_lease(&lease) {
                     Some(identity) => {
                         stop_process(identity, &mut || mark_signalled(&mut claim, clock))
                     }
                     None if lease.expires_at <= now => StopOutcome::Stopped,
                     None => StopOutcome::Unknown,
                 },
+                // A pass another took the lease from may still run (#636):
+                // the claim's stop reaches the process it recorded, which is
+                // re-checked before any signal and is `Stopped` once gone.
+                PassGeneration::Superseded(Some(identity)) => {
+                    stop_process(identity, &mut || mark_signalled(&mut claim, clock))
+                }
+                // The pass appends `pass-ended` before it releases its lease.
+                PassGeneration::Superseded(None) => StopOutcome::Stopped,
             };
             (stop, None)
         }
