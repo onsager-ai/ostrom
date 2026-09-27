@@ -100,9 +100,7 @@ pub fn open_holdings(paths: &OstromPaths, clock: &Clock) -> Result<Vec<Holding>,
     for (index, row) in rows.iter().enumerate() {
         match row.kind.as_str() {
             "work-dispatched" => {
-                // MUTATION (principle 7, #618 review): a row without a run id is no longer a hold.
                 if let Some(order_id) = fact_str(row, "order_id")
-                    && fact_str(row, "run_id").is_some()
                     && !terminal_orders.contains(order_id)
                 {
                     latest.insert((HoldingKind::Implementer, order_id), index);
