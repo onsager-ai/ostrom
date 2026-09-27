@@ -1835,6 +1835,184 @@ fn a_term_handling_pass_stopped_by_the_reaper_writes_one_stalled_pass_ended() {
     );
 }
 
+/// A Claude stub for #633 that ignores `SIGTERM`, records its pid, then
+/// freezes the pass worker that started it: a worker that never reaches its
+/// own stop of Claude.
+const HARNESS_FREEZING_ITS_WORKER: &str = concat!(
+    "trap '' TERM\n",
+    "printf '%s\\n' \"$$\" >\"$OSTROM_HOME/child.pid\"\n",
+    "sleep 2\n",
+    "kill -STOP \"$PPID\"\n",
+    "i=0; while [ \"$i\" -lt 120 ]; do sleep 1; i=$((i + 1)); done"
+);
+
+/// The harness pid the stub recorded, and its start time.
+fn recorded_harness(fixture: &Fixture) -> (u32, u64) {
+    wait_for(&fixture.state.join("child.pid"));
+    let pid = fs::read_to_string(fixture.state.join("child.pid"))
+        .expect("read the harness pid")
+        .trim()
+        .parse::<u32>()
+        .expect("a harness pid");
+    (
+        pid,
+        support::process_start_time(pid).expect("the harness's start time"),
+    )
+}
+
+/// #633: a stalled pass whose worker hangs while Claude ignores `SIGTERM` is
+/// stopped whole by `ostrom up`. The pass lease names the worker, which does
+/// not lead a process group, and Claude leads one of its own: without Claude's
+/// recorded identity the reaper's `KILL` reached the worker and left Claude
+/// running.
+#[test]
+fn a_reaped_pass_whose_harness_ignores_term_leaves_no_orphan() {
+    let fixture = Fixture::new(HARNESS_FREEZING_ITS_WORKER);
+    let policy = fixture.root.path().join("policy");
+    fs::create_dir_all(&policy).expect("create the policy directory");
+    let manifest = policy.join("ostrom.yaml");
+    fs::write(&manifest, "manifest_version: 1\n").expect("write the operator manifest");
+    let trusted_keys = support::sign_manifest(&manifest);
+    let composed = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .arg("compose")
+        .arg(&manifest)
+        .current_dir(&policy)
+        .env("OSTROM_HOME", &fixture.state)
+        .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
+        .env_remove("OSTROM_POLICY_MANIFEST")
+        .output()
+        .expect("compose the current policy version");
+    assert!(
+        composed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&composed.stderr)
+    );
+
+    let mut child = fixture.command().spawn().expect("start pass");
+    let (harness, harness_start_time) = recorded_harness(&fixture);
+    let _harness = support::KillSameProcessGroup(harness, harness_start_time);
+    let started = fixture
+        .trace()
+        .into_iter()
+        .find(|row| row["kind"] == "pass-started")
+        .expect("the pass recorded its start");
+    let owner = started["fact"]["owner"].clone();
+    let run_id = started["fact"]["run_id"].clone();
+    // The one-second idle cap the reaper judges the hold by, as in the
+    // TERM-handling test above.
+    let mut trace = fs::read_to_string(fixture.state.join("sprint.jsonl")).expect("read trace");
+    trace.push_str(&format!(
+        "{}\n",
+        json!({
+            "ts": "2026-08-01T00:00:00Z",
+            "kind": "pass-started",
+            "fact": {"owner": owner.clone(), "run_id": run_id.clone(), "idle_seconds": 1},
+            "narration": {},
+        })
+    ));
+    fs::write(fixture.state.join("sprint.jsonl"), trace).expect("record the idle cap");
+    // Past the idle cap, and past the moment Claude freezes the worker.
+    thread::sleep(Duration::from_secs(4));
+
+    let up = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .arg("up")
+        .current_dir(&fixture.state)
+        .env_clear()
+        .env("OSTROM_HOME", &fixture.state)
+        .env("HOME", fixture.root.path())
+        .env("PATH", env::var_os("PATH").unwrap_or_default())
+        .env("OSTROM_POLICY_TRUSTED_KEYS", &trusted_keys)
+        .output()
+        .expect("run ostrom up");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while (child.try_wait().expect("poll the pass").is_none()
+        || support::same_process_running(harness, harness_start_time))
+        && Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let ended = fixture
+        .trace()
+        .into_iter()
+        .filter(|row| row["kind"] == "pass-ended" && row["fact"]["owner"] == owner)
+        .collect::<Vec<_>>();
+    let row = ended.first().cloned().unwrap_or(Value::Null);
+    let claim = fixture.state.join(format!(
+        "reaping/{}.claim",
+        run_id.as_str().expect("the run id is a string")
+    ));
+    assert_eq!(
+        json!({
+            "up_reaped_it": String::from_utf8_lossy(&up.stdout).contains("reaped=1"),
+            "pass_stopped": child.try_wait().expect("poll the pass").is_some(),
+            "harness_running": support::same_process_running(harness, harness_start_time),
+            "terminal_rows": ended.len(),
+            "reason": row["fact"]["reason"],
+            "claim_removed": !claim.exists(),
+            "harness_records_left": support::harness_records(&fixture.state),
+        }),
+        json!({
+            "up_reaped_it": true,
+            "pass_stopped": true,
+            "harness_running": false,
+            "terminal_rows": 1,
+            "reason": "stalled",
+            "claim_removed": true,
+            "harness_records_left": 0,
+        }),
+        "up stderr: {}",
+        String::from_utf8_lossy(&up.stderr)
+    );
+}
+
+/// #633: `SIGTERM` to a pass's supervisor stops Claude without the reaper's
+/// help, even when the worker it forwards the signal to hangs: once the
+/// worker has not stopped Claude within twice the termination grace, the
+/// supervisor stops Claude's group itself.
+#[test]
+fn a_term_to_a_pass_whose_worker_hangs_still_stops_its_harness() {
+    use std::os::unix::process::CommandExt as _;
+
+    let fixture = Fixture::new(HARNESS_FREEZING_ITS_WORKER);
+    let mut child = fixture
+        .command()
+        .process_group(0)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start pass");
+    let supervisor = child.id();
+    let supervisor_start_time =
+        support::process_start_time(supervisor).expect("the supervisor's start time");
+    // The supervisor and its frozen worker share this group.
+    let pass = support::KillSameProcessGroup(supervisor, supervisor_start_time);
+    let (harness, harness_start_time) = recorded_harness(&fixture);
+    let _harness = support::KillSameProcessGroup(harness, harness_start_time);
+    // Past the moment Claude freezes the worker.
+    thread::sleep(Duration::from_secs(3));
+
+    signal(supervisor, "TERM");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while support::same_process_running(harness, harness_start_time) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let observed = (
+        support::same_process_running(harness, harness_start_time),
+        support::harness_records(&fixture.state),
+    );
+    // The worker stays frozen and the supervisor waits on it: both are this
+    // test's to end.
+    drop(pass);
+    let _ = child.wait();
+    assert_eq!(
+        observed,
+        (false, 0),
+        "the harness outlived a TERM to its supervisor"
+    );
+}
+
 /// #619 change 3: a pass that cannot renew its lease stops rather than keep
 /// working under a lease another pass may now hold.
 #[test]

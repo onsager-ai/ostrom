@@ -12,6 +12,7 @@ pub mod environment;
 mod event_store;
 mod file_store;
 mod gate;
+mod harness_record;
 mod holdings;
 mod hooks;
 mod implement;
@@ -60,8 +61,8 @@ pub use gate::{
 pub use holdings::{Holding, HoldingKind, HoldingsError, LeaseState, open_holdings};
 pub use hooks::{DigestOptions, HookOutput, render_digest};
 pub use implement::{
-    DEFAULT_IMPLEMENTER_RUNNER, ImplementError, ImplementRequest, run_implement,
-    run_implement_with_registry,
+    DEFAULT_IMPLEMENTER_RUNNER, ImplementError, ImplementRequest, implementer_termination_grace,
+    run_implement, run_implement_with_registry,
 };
 pub use lease::{
     LeaseActionError, LeaseRecord, OwnedLease, acquire_lease, lease_status, read_lease,
@@ -112,7 +113,7 @@ pub use selection::{
 };
 pub use stalls::{
     HoldProgress, ReapedHold, StallError, hold_progress, process_running, process_start_time,
-    reap_stalled_holds, reaper_findings, stalled_holds,
+    reap_stalled_holds, reaper_findings, stalled_holds, stop_supervised_harness,
 };
 pub use sweep::{
     MINIMUM_PASS_WORK_SECONDS, PublishTarget, RepositorySnapshot, RosterCoverageFinding,

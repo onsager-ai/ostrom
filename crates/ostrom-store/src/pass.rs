@@ -33,7 +33,8 @@ use umwelt_runtime::{
 use crate::{
     Clock, LeaseActionError, OstromPaths, OwnedLease, PassState, RunEventError, RunEventGuard,
     RunEventStart, SignalFlags, SkippedRepository, SweepOptions, TraceAppend, append_trace,
-    environment, generated_run_id, generation_is_fresh, latest_successful_generation,
+    environment, generated_run_id, generation_is_fresh, harness_record,
+    latest_successful_generation,
     lease::{ProcessIdentity, read_process_identity, renew_lease},
     load_sweep_snapshot, pass_control,
     pass_control::ControlInput,
@@ -1608,6 +1609,15 @@ fn run_pass_with_bridge_probe_timeout(
     let mut child = command.spawn().map_err(|error| {
         PassError::failed(request.role, format!("could not start Claude: {error}"), 1)
     })?;
+    // Claude leads its own process group, which no signal to this pass's
+    // process reaches. Recorded as soon as it is spawned, it can still be
+    // stopped if this worker is killed before it stops Claude itself (#633).
+    let harness = request
+        .supervisor_pid
+        .and_then(|pid| harness_record::record_path(&request.paths.state, pid));
+    if let Some(path) = &harness {
+        harness_record::record_or_warn(path, guard.events.run_id(), child.id());
+    }
     guard.child_spawned = true;
     guard.control = Some(RunControl::new(
         guard.events.run_id(),
@@ -1624,6 +1634,11 @@ fn run_pass_with_bridge_probe_timeout(
     if wait_result.is_err() && child.try_wait().ok().flatten().is_none() {
         terminate_child_process_group(&mut child, PASS_TERMINATION_GRACE);
         let _ = child.wait();
+    }
+    // Claude has been waited for and its group stopped: the record has
+    // nothing left to find.
+    if let Some(path) = &harness {
+        harness_record::remove(path);
     }
     let capture_result = capture_thread
         .join()
