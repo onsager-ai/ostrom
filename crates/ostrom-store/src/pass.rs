@@ -855,9 +855,7 @@ fn end_if_lease_lost(
     let still_held = held
         .as_ref()
         .is_some_and(|lease| lease.process_identity() == identity);
-    // TEMPORARY mutation (#636 second review): the renewal flag alone.
-    let _ = still_held;
-    if !guard.renewal.as_ref().is_some_and(PassLeaseRenewal::lost) {
+    if still_held && !guard.renewal.as_ref().is_some_and(PassLeaseRenewal::lost) {
         return Ok(());
     }
     guard.outcome = Some("failed".to_owned());
