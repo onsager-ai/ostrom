@@ -96,7 +96,7 @@ After the loop table, `ostrom ps` lists every open hold, read from local files o
 
 `ostrom ps --json` prints only the holds, one JSON object per line, with the fields `kind` (`implementer` or `pass`), `run_id`, `runner`, `item`, `order_id`, `owner`, `started_at`, `age_seconds`, `last_event_at` and `lease`; a field the record lacks is `null`. It needs no current policy version, so a scheduler or an observer can read it on a machine that has never composed one.
 
-One run id names each hold. `ostrom dispatch` mints the implementer's run id before it starts the unit, records it in `work-dispatched` as `run_id` together with `runner` and, when the dispatcher itself runs under an ostrom run, `parent_run_id` (a pass's agent runs `ostrom dispatch`, so this is the pass-to-implementer edge), and passes it to `ostrom implement`, which writes its events and its terminal row under it. A pass records the run id it mints in `pass-started`; `pass-ended` is part of the frozen pass contract and is unchanged. A hand-run `ostrom implement` mints its own run id, as it always has, and its terminal row does not name it.
+One run id names each hold. `ostrom dispatch` mints the implementer's run id before it starts the unit, records it in `work-dispatched` as `run_id` together with `runner` and, when the dispatcher itself runs under an ostrom run, `parent_run_id` (a pass's agent runs `ostrom dispatch`, so this is the pass-to-implementer edge), and passes it to `ostrom implement`, which writes its events and its terminal row under it. A pass records the run id it mints in `pass-started`; `pass-ended` is part of the frozen pass contract and is unchanged. A hand-run `ostrom implement` mints its own run id, as it always has, and its terminal row does not name it; its harness child still receives that id, as below.
 
 #### The run environment is a contract
 
@@ -104,10 +104,10 @@ One run id names each hold. `ostrom dispatch` mints the implementer's run id bef
 
 | Variable | Set on | Value |
 |---|---|---|
-| `OSTROM_RUN_ID` | a pass's harness process; a dispatched `ostrom implement` and its harness process | the `run_id` recorded in that run's `pass-started` or `work-dispatched` row |
-| `OSTROM_WORK_ORDER_ID` | a dispatched `ostrom implement` and its harness process | the `order_id` recorded in `work-dispatched` |
+| `OSTROM_RUN_ID` | a pass's harness process; every implementer harness process; a dispatched `ostrom implement` | the pass's `run_id` from `pass-started`; the implementer's effective run id: the `run_id` recorded in `work-dispatched`, or the one a hand run minted |
+| `OSTROM_WORK_ORDER_ID` | every implementer harness process; a dispatched `ostrom implement` | the `order_id` of the work order being executed |
 
-ostrom sets each value explicitly on the child it starts, never by changing its own process environment, and the value it sets replaces any the parent inherited from an enclosing run. The dispatched implementer receives both through its runner's launch environment, under either dispatch backend, and its harness inherits them. ostrom reads `OSTROM_RUN_ID` itself only to record a dispatch's `parent_run_id`. Two processes do not carry the contract: a hand-run `ostrom implement`, whose harness inherits whatever the invoking environment holds, and the loop worker `ostrom up` starts, which has no run id of its own.
+ostrom sets each value explicitly on the child it starts, never by changing its own process environment, and the value it sets replaces any the parent inherited from an enclosing run. A dispatched `ostrom implement` receives both through its runner's launch environment, under either dispatch backend. `ostrom implement` then sets both again, directly on its harness child, from its own effective run id and order, so an implementer run by hand inside another run (a pass's agent, say) never labels its harness with that run's id. ostrom reads `OSTROM_RUN_ID` itself only to record a dispatch's `parent_run_id`. The loop worker `ostrom up` starts does not carry the contract; it has no run id of its own.
 
 Render and verify artifacts with:
 

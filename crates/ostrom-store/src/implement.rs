@@ -625,6 +625,21 @@ fn implement_inner(
             signals: request.signals.clone(),
             supervisor_pid: request.supervisor_pid,
             termination_grace,
+            // Set here, never inherited: an `ostrom implement` run by hand
+            // inside another run (a pass's agent, say) must not label its
+            // harness with that run's id. This is the implementer's effective
+            // run id, dispatch's `--run-id` or the one it minted, and the
+            // order it is executing (docs/loops.md).
+            environment: vec![
+                (
+                    environment::OSTROM_RUN_ID.name.into(),
+                    guard.run_events.run_id().into(),
+                ),
+                (
+                    environment::OSTROM_WORK_ORDER_ID.name.into(),
+                    guard.order.order_id.clone().into(),
+                ),
+            ],
         }),
     ) {
         RunOutcome::Exited(status) => status,

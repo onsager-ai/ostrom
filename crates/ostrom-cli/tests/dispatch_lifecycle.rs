@@ -611,50 +611,7 @@ fn process_startup_failure_escalates_to_the_stubborn_grandchild() {
 #[test]
 fn dispatch_mints_the_run_id_the_implementer_and_its_harness_carry() {
     let fixture = DispatchFixture::new(false);
-    let source = &fixture.source;
-    git(source, &["init", "-b", "main"]);
-    git(source, &["config", "user.email", "fixture@example.invalid"]);
-    git(source, &["config", "user.name", "Fixture"]);
-    fs::write(source.join("README.md"), "placeholder\n").expect("write source");
-    git(source, &["add", "README.md"]);
-    git(source, &["commit", "-m", "base"]);
-    git(
-        source,
-        &[
-            "remote",
-            "add",
-            "origin",
-            "https://github.com/placeholder-org/alpha.git",
-        ],
-    );
-    git(source, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
-
-    let codex_environment = fixture.root.path().join("codex.env");
-    executable(
-        &fixture.codex,
-        &format!(
-            "if [ \"${{1:-}}\" = --version ]; then exit 0; fi\nenv >'{}'\nexit 1",
-            codex_environment.display()
-        ),
-    );
-    // Answers both dispatch's reads and the implementer's, keyed on the
-    // command after the wrapper's `--`.
-    let credential = fixture.root.path().join("run-through-credential-stub");
-    executable(
-        &credential,
-        concat!(
-            "while [ \"$#\" -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n",
-            "shift\n",
-            "case \"$*\" in\n",
-            "  *'/branches?'*) printf '%s\\n' '[{\"name\":\"main\",\"commit\":{\"sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}]' ;;\n",
-            "  *' issue view '*) printf '%s\\n' '{\"closedByPullRequestsReferences\":[]}' ;;\n",
-            "  'gh pr list '*) printf '%s\\n' '[]' ;;\n",
-            "  'gh repo view '*) printf '%s\\n' main ;;\n",
-            "  'git -C '*' fetch '*) git -C \"$3\" update-ref refs/remotes/origin/main refs/heads/main ;;\n",
-            "  *) exit 1 ;;\n",
-            "esac"
-        ),
-    );
+    let (codex_environment, credential) = runnable_implementer(&fixture);
     // A service-manager seam that runs the unit to completion, with exactly
     // the environment dispatch declared through `--setenv`.
     let systemd_run = fixture.root.path().join("systemd-run-executes");
@@ -803,6 +760,189 @@ fn ps_json_lists_an_open_dispatch_until_its_terminal_row() {
 
     let closed = ps_json(&fixture.state);
     assert!(closed.is_empty(), "{closed:?}");
+}
+
+/// #618 review: an `ostrom implement` run by hand inside another run (a pass's
+/// agent, say) labels its harness child with its own run id and its own order,
+/// never with the ids it inherited. Otherwise the hold is misattributed to the
+/// enclosing run, and anything acting on that label acts on the wrong process.
+#[test]
+fn a_hand_run_implementer_labels_its_harness_with_its_own_run_not_an_inherited_one() {
+    let fixture = DispatchFixture::new(false);
+    let (codex_environment, credential) = runnable_implementer(&fixture);
+    let unit = "ostrom-implementer-hand-run";
+    fs::write(
+        fixture
+            .state
+            .join(format!("implementer-item-{}.lease", fixture.item_hash)),
+        format!("{{\"owner\":\"{unit}\",\"started_at\":1,\"expires_at\":9999999999}}\n"),
+    )
+    .expect("write the implementer lease a hand run adopts");
+    let order_id = WorkOrder::from_json(&fs::read(&fixture.order_file).expect("read order"))
+        .expect("valid work order")
+        .order_id;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .arg("implement")
+        .arg(&fixture.order_file)
+        .arg(unit)
+        .current_dir(fixture.root.path())
+        .env_clear()
+        .env("OSTROM_HOME", &fixture.state)
+        .env("HOME", &fixture.home)
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("OSTROM_PLUGIN_ROOT", plugin_root())
+        .env("MANDATE_IMPLEMENTER_SOURCE_REPO", &fixture.source)
+        .env("MANDATE_GH_AS_BIN", &credential)
+        .env("CODEX_BIN", &fixture.codex)
+        .env("OSTROM_RUN_ID", "builder-inherited-placeholder-run")
+        .env("OSTROM_WORK_ORDER_ID", "inherited-placeholder-order")
+        .output()
+        .expect("run the implementer by hand");
+
+    let run_id = run_started_events(&fixture.state)
+        .into_iter()
+        .find(|event| event["payload"]["workOrder"] == order_id.as_str())
+        .map_or(Value::Null, |event| event["runId"].clone());
+    let environment = fs::read_to_string(&codex_environment).unwrap_or_default();
+    let harness = |name: &str| {
+        environment
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}=")))
+            .map_or(Value::Null, |value| json!(value))
+    };
+    assert_eq!(
+        json!({
+            "implementer_run_found": run_id.is_string(),
+            "harness_OSTROM_RUN_ID": harness("OSTROM_RUN_ID"),
+            "harness_OSTROM_WORK_ORDER_ID": harness("OSTROM_WORK_ORDER_ID"),
+        }),
+        json!({
+            "implementer_run_found": true,
+            "harness_OSTROM_RUN_ID": run_id,
+            "harness_OSTROM_WORK_ORDER_ID": order_id,
+        }),
+        "implementer stderr: {}\nharness environment: {environment}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// #618 review: a `work-dispatched` row written before run ids were recorded,
+/// with no `run_id` and no `runner`, is still a hold. `ps --json` lists it with
+/// both as null and drops it on its terminal row.
+#[test]
+fn ps_json_lists_a_legacy_dispatch_row_until_its_terminal_row() {
+    let root = tempfile::tempdir().expect("legacy trace fixture");
+    let state = root.path();
+    let dispatched = json!({
+        "ts": "2026-08-01T00:00:00Z",
+        "kind": "work-dispatched",
+        "fact": {
+            "schema_version": 1,
+            "item_id": "placeholder-org/alpha#7",
+            "order_id": "legacy-placeholder-order",
+            "unit_name": "ostrom-implementer-legacy",
+            "backend": "systemd",
+            "cost_ceiling_usd": 20,
+            "token_ceiling": 500000
+        },
+        "narration": {}
+    });
+    fs::write(state.join("sprint.jsonl"), format!("{dispatched}\n")).expect("write legacy trace");
+
+    let open = ps_json(state);
+    let listed = open
+        .iter()
+        .map(|holding| {
+            json!({
+                "kind": holding["kind"],
+                "run_id": holding["run_id"],
+                "runner": holding["runner"],
+                "item": holding["item"],
+                "order_id": holding["order_id"],
+                "owner": holding["owner"],
+                "started_at": holding["started_at"],
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        json!(listed),
+        json!([{
+            "kind": "implementer",
+            "run_id": null,
+            "runner": null,
+            "item": "placeholder-org/alpha#7",
+            "order_id": "legacy-placeholder-order",
+            "owner": "ostrom-implementer-legacy",
+            "started_at": "2026-08-01T00:00:00Z",
+        }])
+    );
+
+    let completed = json!({
+        "ts": "2026-08-01T01:00:00Z",
+        "kind": "work-completed",
+        "fact": {"schema_version": 1, "item_id": "placeholder-org/alpha#7", "order_id": "legacy-placeholder-order"},
+        "narration": {}
+    });
+    fs::write(
+        state.join("sprint.jsonl"),
+        format!("{dispatched}\n{completed}\n"),
+    )
+    .expect("append the legacy terminal row");
+    let closed = ps_json(state);
+    assert!(closed.is_empty(), "{closed:?}");
+}
+
+/// Make the fixture's implementer able to reach its harness: a source clone to
+/// branch from, a credential stub that answers both dispatch's reads and the
+/// implementer's, and a Codex stub that records its environment and fails.
+/// Returns the recorded-environment path and the credential stub.
+fn runnable_implementer(fixture: &DispatchFixture) -> (PathBuf, PathBuf) {
+    let source = &fixture.source;
+    git(source, &["init", "-b", "main"]);
+    git(source, &["config", "user.email", "fixture@example.invalid"]);
+    git(source, &["config", "user.name", "Fixture"]);
+    fs::write(source.join("README.md"), "placeholder\n").expect("write source");
+    git(source, &["add", "README.md"]);
+    git(source, &["commit", "-m", "base"]);
+    git(
+        source,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/placeholder-org/alpha.git",
+        ],
+    );
+    git(source, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+
+    let codex_environment = fixture.root.path().join("codex.env");
+    executable(
+        &fixture.codex,
+        &format!(
+            "if [ \"${{1:-}}\" = --version ]; then exit 0; fi\nenv >'{}'\nexit 1",
+            codex_environment.display()
+        ),
+    );
+    // Answers both dispatch's reads and the implementer's, keyed on the
+    // command after the wrapper's `--`.
+    let credential = fixture.root.path().join("run-through-credential-stub");
+    executable(
+        &credential,
+        concat!(
+            "while [ \"$#\" -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n",
+            "shift\n",
+            "case \"$*\" in\n",
+            "  *'/branches?'*) printf '%s\\n' '[{\"name\":\"main\",\"commit\":{\"sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}]' ;;\n",
+            "  *' issue view '*) printf '%s\\n' '{\"closedByPullRequestsReferences\":[]}' ;;\n",
+            "  'gh pr list '*) printf '%s\\n' '[]' ;;\n",
+            "  'gh repo view '*) printf '%s\\n' main ;;\n",
+            "  'git -C '*' fetch '*) git -C \"$3\" update-ref refs/remotes/origin/main refs/heads/main ;;\n",
+            "  *) exit 1 ;;\n",
+            "esac"
+        ),
+    );
+    (codex_environment, credential)
 }
 
 fn ps_json(state: &Path) -> Vec<Value> {
