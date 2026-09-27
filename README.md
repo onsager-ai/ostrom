@@ -12,26 +12,11 @@ personal constitution.
 
 ## What it ships
 
-- **`ostrom` — one binary with two cooperating subsystems** — layered
-  constitution injection via `ostrom hook session-start`: shipped rules, then
-  user rules, then repo rules (most-specific wins).
-- **The rule-capitalization trigger** — the agent proposes freezing a
-  rule after the same class of correction recurs; it never
-  self-installs one.
 - **Mandate portfolio steering** — an hourly sweep and SessionStart digest that reads
   open GitHub issues, PRs, and CI through `gh`; keeps a private,
   file-backed queue of pointers; and routes approve/reject/defer decisions
-  through `ostrom queue`. Tripwires reuse constitution's escalation-dossier
+  through `ostrom queue`. Tripwires use the escalation-dossier
   protocol and never auto-proceed.
-
-### One-way dependency convention
-
-The mandate subsystem may reuse the constitution subsystem's
-escalation-dossier shape. The constitution subsystem must never learn about
-mandates, queues, grants, or GitHub. This is a convention: nothing enforces it.
-It matters because the agent-workflow constitution must remain usable and
-reasoned about independently of portfolio steering, even though both now ship
-inside one plugin.
 
 ## Layout
 
@@ -574,26 +559,6 @@ Only needed for **teammates or shared repos**. To make a
 repo self-register for anyone who opens it, merge
 `repo-pointer/settings.json` into its `.claude/settings.json` and commit.
 
-## Rules layering
-
-The SessionStart injection is **layered**, most-specific wins: shipped
-`frozen-rules.md` → `~/.claude/ostrom/rules.md` + `rules.d/*.md`
-(user) → `./.ostrom/rules.md` + `rules.d/*.md` (repo). A later layer wins on
-conflict; a missing layer is skipped silently, so an adopter with no user or
-repo rules sees output byte-identical to the shipped file alone. Each layer
-that fires is preceded by an HTML-comment provenance marker naming the file
-it came from.
-
-There is **no org `extends:` hop for rules** — rules have no fetch story, so a
-shared org constitution isn't a thing this repo ships. Your actual rules are
-yours, not shippable, and belong in `~/.claude/ostrom/rules.md` (or a private
-repo layer) — **outside this repo**. Match `frozen-rules.md`'s own style: a
-`##` rule heading, body, then a `Source:`/`Preconditions:` HTML comment.
-
-The shipped layer is compiled into the binary, so the base constitution is
-present under any harness and on a machine that installed no plugin.
-`OSTROM_PLUGIN_ROOT` still overrides it, for a fixture or a fork.
-
 ## Doctor
 
 `ostrom doctor` is the native Rust prober. It reports on CLI
@@ -602,10 +567,8 @@ trace/lease/work-order health, recurring delivery passes, publish freshness,
 environment shape, and the supported config parser shape.
 
 It exists because silent degradation is the actual failure mode here, not
-a crash. The SessionStart hook injects the shipped rules and nothing else
-when no user layer is present, and looks exactly like it's working. Nothing
-errors — a documented bootstrap one-liner 404s for months because nothing
-ever checked. `ostrom doctor` is the
+a crash. Nothing errors — a documented bootstrap one-liner 404s for months
+because nothing ever checked. `ostrom doctor` is the
 thing that checks: read-only against your configuration and state, and turns
 each of those silent states into an `OK` / `WARN` / `FAIL` line with a
 concrete remedy.
@@ -613,8 +576,7 @@ concrete remedy.
 
 ## Amend (修宪)
 
-Edit the shipped assets here — `crates/ostrom-store/assets/rules/frozen-rules.md`
-or a prompt under `crates/ostrom-store/assets/prompts/` — and cut a release.
+Edit a prompt under `crates/ostrom-store/assets/prompts/` and cut a release.
 Environments pick it up via `npm install --global @ostrom/cli`.
 
 ## Rollback

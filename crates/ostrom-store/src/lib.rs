@@ -55,7 +55,7 @@ pub use gate::{
     gate_config_needs_diff_content, load_gate_config, run_gate,
 };
 pub use holdings::{Holding, HoldingKind, HoldingsError, LeaseState, open_holdings};
-pub use hooks::{DigestOptions, HookOutput, render_constitution, render_digest};
+pub use hooks::{DigestOptions, HookOutput, render_digest};
 pub use implement::{
     DEFAULT_IMPLEMENTER_RUNNER, ImplementError, ImplementRequest, run_implement,
     run_implement_with_registry,

@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **Breaking:** `ostrom hook session-start` is removed, with the layered
+  constitution/rules injection behind it (#617): `render_constitution` and
+  its helpers (`collect_layer`, `has_content`) in
+  `ostrom-store/src/hooks.rs`, the compiled-in `SHIPPED_RULES` constant, and
+  `assets/rules/frozen-rules.md` (the only file under `assets/rules/`, so
+  the directory goes too) along with the rule-capitalization trigger it
+  documented. `ostrom hook digest` and `ostrom local-drift` are unchanged —
+  `render_digest`, `DigestOptions`, `HookOutput`, `decision_inbox_url`, and
+  everything the digest reads (waiting decisions, escalated dispatch
+  failures, undispatchable repositories, stalled holds, local drift) stay
+  exactly as they were. The #617 plan originally grouped the digest with
+  the constitution subsystem; the principal narrowed that ruling to
+  "Constitution only; keep digest."
 - **Breaking:** `ostrom explain` and `ostrom generate` are removed (#617). Both
   were operator introspection tools, not on the delivery loop's path:
   `PolicyBundle::explain_pull_request` has its own production caller in the
