@@ -33,6 +33,7 @@ mod run_events;
 mod selection;
 mod selector;
 mod stalls;
+mod suspend;
 mod sweep;
 mod trace;
 pub mod umwelt_edge;

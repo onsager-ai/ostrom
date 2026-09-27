@@ -313,6 +313,13 @@ pub fn acquire_lease(
     )
 }
 
+/// Acquire a lease its holder renews while it runs. A held lease is reclaimed
+/// once its holder's process is gone, or once it has lapsed: its expiry, moved
+/// later by `suspended_since(started_at)`, the seconds the machine spent
+/// suspended since the holder took it (#637). A holder cannot renew while the
+/// machine sleeps, so a resumed holder must not lose its lease to sleep alone.
+/// A caller that does not judge suspended time passes `&|_| 0`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn acquire_renewable_lease(
     state_root: &Path,
     name: &str,
@@ -321,6 +328,7 @@ pub(crate) fn acquire_renewable_lease(
     ttl: u64,
     identity: Option<ProcessIdentity>,
     proc_root: &Path,
+    suspended_since: &dyn Fn(u64) -> u64,
 ) -> Result<Vec<u8>, LeaseActionError> {
     validate_lease_name(name)?;
     if ttl == 0 {
@@ -348,14 +356,15 @@ pub(crate) fn acquire_renewable_lease(
         now,
         &record,
         proc_root,
-        LeaseExpiryPolicy::Renewable,
+        LeaseExpiryPolicy::Renewable(suspended_since),
     )
 }
 
-#[derive(Debug, Clone, Copy)]
-enum LeaseExpiryPolicy {
+#[derive(Clone, Copy)]
+enum LeaseExpiryPolicy<'a> {
     ProcessLifetime,
-    Renewable,
+    /// Expiry, net of the seconds suspended since the given wall-clock second.
+    Renewable(&'a dyn Fn(u64) -> u64),
 }
 
 fn acquire_lease_record(
@@ -364,7 +373,7 @@ fn acquire_lease_record(
     now: u64,
     record: &LeaseRecord,
     proc_root: &Path,
-    expiry_policy: LeaseExpiryPolicy,
+    expiry_policy: LeaseExpiryPolicy<'_>,
 ) -> Result<Vec<u8>, LeaseActionError> {
     fs::create_dir_all(state_root).map_err(|_| LeaseActionError::HeldOrUnreadable)?;
     let path = state_root.join(name);
@@ -399,12 +408,15 @@ fn lease_is_live(
     lease: &LeaseRecord,
     now: u64,
     proc_root: &Path,
-    expiry_policy: LeaseExpiryPolicy,
+    expiry_policy: LeaseExpiryPolicy<'_>,
 ) -> bool {
     match expiry_policy {
         LeaseExpiryPolicy::ProcessLifetime => lease.is_live_at(now, proc_root),
-        LeaseExpiryPolicy::Renewable => {
-            lease.expires_at > now
+        LeaseExpiryPolicy::Renewable(suspended_since) => {
+            lease
+                .expires_at
+                .saturating_add(suspended_since(lease.started_at))
+                > now
                 && lease.process_identity().is_none_or(|(pid, _, start_time)| {
                     process_identity_is_live_at(proc_root, pid, start_time)
                         != ProcessLiveness::NotLive
@@ -493,6 +505,7 @@ impl OwnedLease {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn acquire_renewable(
         state_root: &Path,
         name: &str,
@@ -501,8 +514,18 @@ impl OwnedLease {
         ttl: u64,
         identity: Option<ProcessIdentity>,
         proc_root: &Path,
+        suspended_since: &dyn Fn(u64) -> u64,
     ) -> Result<Self, LeaseActionError> {
-        acquire_renewable_lease(state_root, name, owner, now, ttl, identity, proc_root)?;
+        acquire_renewable_lease(
+            state_root,
+            name,
+            owner,
+            now,
+            ttl,
+            identity,
+            proc_root,
+            suspended_since,
+        )?;
         Ok(Self {
             state_root: state_root.to_path_buf(),
             name: name.to_owned(),
@@ -613,8 +636,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        LeaseActionError, LeaseRecord, ProcessLiveness, process_identity_is_live,
-        process_identity_is_live_at, read_lease, read_process_identity, renew_lease, write_lease,
+        LeaseActionError, LeaseRecord, ProcessLiveness, acquire_renewable_lease,
+        process_identity_is_live, process_identity_is_live_at, read_lease, read_process_identity,
+        renew_lease, write_lease,
     };
 
     #[test]
@@ -873,5 +897,54 @@ mod tests {
             format!("{pid} (fixture process) {}\n", fields.join(" ")),
         )
         .expect("write process stat");
+    }
+
+    /// #637: a renewable lease whose holder still runs, and which lapsed by
+    /// the wall clock only because the machine slept, is not taken over; the
+    /// same lease with no suspended time is.
+    #[test]
+    fn a_lease_that_lapsed_only_while_the_machine_slept_is_not_taken_over() {
+        let own = read_process_identity(std::process::id())
+            .expect("read this process")
+            .expect("this process is running");
+        let attempt = |suspended: u64| {
+            let fixture = tempdir().expect("temp dir");
+            write_lease(
+                &fixture.path().join("builder-pass.lease"),
+                &LeaseRecord {
+                    owner: "builder-asleep".to_owned(),
+                    started_at: 1_000,
+                    expires_at: 1_120,
+                    pid: Some(own.pid),
+                    process_group_id: Some(own.process_group_id),
+                    process_start_time: Some(own.start_time),
+                },
+            )
+            .expect("write the sleeping holder's lease");
+            let acquired = acquire_renewable_lease(
+                fixture.path(),
+                "builder-pass.lease",
+                "builder-resumed-successor",
+                11_830,
+                120,
+                None,
+                Path::new("/proc"),
+                &|since| if since <= 1_010 { suspended } else { 0 },
+            );
+            let holder = read_lease(&fixture.path().join("builder-pass.lease"))
+                .expect("read lease")
+                .map(|lease| lease.owner);
+            (acquired.err().map(|error| error.to_string()), holder)
+        };
+        assert_eq!(
+            [attempt(10_800), attempt(0)],
+            [
+                (
+                    Some(LeaseActionError::Held.to_string()),
+                    Some("builder-asleep".to_owned())
+                ),
+                (None, Some("builder-resumed-successor".to_owned())),
+            ]
+        );
     }
 }

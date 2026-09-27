@@ -39,6 +39,7 @@ use crate::{
     pass_control::ControlInput,
     read_lease, read_pass_state, read_trace,
     selection::dispatchability_snapshot,
+    suspend::{SuspendTimeline, SystemSuspend},
     sweep::{
         SWEEP_LEASE_CEILING_SECONDS, SweepError, run_sweep_holding_lease, wait_for_sweep_lease_for,
     },
@@ -1191,6 +1192,16 @@ fn run_pass_with_bridge_probe_timeout(
     // The lease names this process, so the stall reaper (#619) can tell a
     // live pass from one whose process is gone, and stop exactly this one.
     let identity = read_process_identity(std::process::id()).ok().flatten();
+    // A pass that held the lease while the machine slept could not renew it
+    // then; its lease is judged net of that time, so it is not taken over for
+    // sleeping alone (#637). Unreadable, it is judged by the wall clock, as
+    // before.
+    let suspend = SuspendTimeline::read(&request.paths.state, &request.clock, &SystemSuspend).ok();
+    let suspended_since = |since: u64| {
+        suspend
+            .as_ref()
+            .map_or(0, |timeline| timeline.suspended_since(since))
+    };
     let lease = match OwnedLease::acquire_renewable(
         &request.paths.state,
         &lease_name,
@@ -1199,6 +1210,7 @@ fn run_pass_with_bridge_probe_timeout(
         ttl,
         identity,
         Path::new("/proc"),
+        &suspended_since,
     ) {
         Ok(lease) => lease,
         Err(

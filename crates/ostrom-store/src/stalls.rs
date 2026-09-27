@@ -61,6 +61,13 @@
 //! real figure is unknowable once the process is gone, and every daily-cap
 //! reader stays conservative rather than undercounting or turning unknown.
 //!
+//! **Suspended time is not silence** (#637). A run's own watchdog measures with
+//! a clock that stops while the machine is suspended; the wall clock does not.
+//! A gap in progress, and a lease's expiry where the reaper judges it, are
+//! measured net of the time the machine spent suspended ([`crate::suspend`]).
+//! When that time cannot be read, the reaper judges nothing that invocation:
+//! it records why for doctor and reaps nothing, rather than reap blind.
+//!
 //! Reaping is best effort and scheduling is not: an error is printed, recorded
 //! in `<state>/reaping/last-error.json` for doctor, and never stops `up` or
 //! `dispatch` from launching.
@@ -91,6 +98,7 @@ use crate::{
     holdings::read_leases,
     lease::{read_process_identity, read_process_identity_at},
     open_holdings, read_trace,
+    suspend::{SuspendSource, SuspendTimeline, SystemSuspend},
     work_order::{
         InFlightOrder, ReapedFailure, UnitLiveness, append_reaped_failure, in_flight_orders,
         order_liveness, release_order_lease,
@@ -114,7 +122,13 @@ pub struct HoldProgress {
     /// How long the hold may go without progress while live.
     pub stall_threshold_seconds: u64,
     pub last_progress_at: Option<String>,
+    /// Seconds since the last progress, net of the time the machine spent
+    /// suspended (#637).
     pub seconds_without_progress: Option<u64>,
+    /// How many of the wall-clock seconds since the last progress the machine
+    /// spent suspended, at most. `None` when that could not be read, and then
+    /// `seconds_without_progress` is the plain wall-clock gap.
+    pub suspended_seconds: Option<u64>,
 }
 
 impl HoldProgress {
@@ -132,6 +146,10 @@ pub enum StallError {
     Holdings(#[from] HoldingsError),
     #[error("could not record a reaped hold: {0}")]
     Record(String),
+    #[error(
+        "reaping skipped: the time this machine spent suspended could not be read ({0}), and no stall is judged without it"
+    )]
+    SuspendUnknown(String),
 }
 
 /// What the reaper did to one hold.
@@ -173,21 +191,27 @@ pub fn hold_progress(
     paths: &OstromPaths,
     clock: &Clock,
 ) -> Result<Vec<HoldProgress>, HoldingsError> {
-    Ok(observe(paths, clock)?
+    let timeline = SuspendTimeline::read(&paths.state, clock, &SystemSuspend).ok();
+    Ok(observe(paths, clock, timeline.as_ref())?
         .into_iter()
         .map(|hold| hold.progress)
         .collect())
 }
 
-/// Every hold that is live and past its threshold, for `ostrom doctor`.
+/// Every hold that is live and past its threshold, for `ostrom doctor`. When
+/// the time the machine spent suspended cannot be read, no hold is judged
+/// stalled, as the reaper judges none; the reaper records why for doctor.
 pub fn stalled_holds(
     paths: &OstromPaths,
     clock: &Clock,
 ) -> Result<Vec<HoldProgress>, HoldingsError> {
+    let Ok(timeline) = SuspendTimeline::read(&paths.state, clock, &SystemSuspend) else {
+        return Ok(Vec::new());
+    };
     let now = clock.epoch_seconds();
-    Ok(observe(paths, clock)?
+    Ok(observe(paths, clock, Some(&timeline))?
         .into_iter()
-        .filter(|hold| matches!(classify(paths, hold, now), Verdict::Stalled(_)))
+        .filter(|hold| matches!(classify(paths, hold, now, &timeline), Verdict::Stalled(_)))
         .map(|hold| hold.progress)
         .collect())
 }
@@ -206,8 +230,48 @@ pub fn reap_stalled_holds(
     exclude_run_id: Option<&str>,
     repositories: Option<&BTreeSet<String>>,
 ) -> Vec<ReapedHold> {
+    reap_stalled_holds_with(
+        paths,
+        clock,
+        &SystemSuspend,
+        caller,
+        exclude_run_id,
+        repositories,
+    )
+}
+
+/// [`reap_stalled_holds`] with the suspended time read from `suspend`. It is
+/// read once. When it cannot be read, nothing is judged or reaped, and the
+/// reason is recorded where doctor reads it (#637).
+pub(crate) fn reap_stalled_holds_with(
+    paths: &OstromPaths,
+    clock: &Clock,
+    suspend: &dyn SuspendSource,
+    caller: &str,
+    exclude_run_id: Option<&str>,
+    repositories: Option<&BTreeSet<String>>,
+) -> Vec<ReapedHold> {
     let mut pass = ReapPass::default();
-    let reaped = reap_all(paths, clock, exclude_run_id, repositories, &mut pass);
+    let reaped = match SuspendTimeline::read(&paths.state, clock, suspend) {
+        Ok(timeline) => {
+            let reaped = reap_all(
+                paths,
+                clock,
+                &timeline,
+                exclude_run_id,
+                repositories,
+                &mut pass,
+            );
+            if let Err(error) = timeline.record(&paths.state) {
+                pass.errors.push((None, StallError::Record(error)));
+            }
+            reaped
+        }
+        Err(why) => {
+            pass.errors.push((None, StallError::SuspendUnknown(why)));
+            Vec::new()
+        }
+    };
     record_errors(paths, clock, caller, &pass);
     reaped
 }
@@ -439,12 +503,13 @@ fn retained_failures(previous: Vec<Value>, pass: &ReapPass, new: Vec<Value>) -> 
 fn reap_all(
     paths: &OstromPaths,
     clock: &Clock,
+    timeline: &SuspendTimeline,
     exclude_run_id: Option<&str>,
     repositories: Option<&BTreeSet<String>>,
     pass: &mut ReapPass,
 ) -> Vec<ReapedHold> {
     let now = clock.epoch_seconds();
-    let holds = match observe(paths, clock) {
+    let holds = match observe(paths, clock, Some(timeline)) {
         Ok(holds) => holds,
         Err(error) => {
             pass.errors.push((None, error.into()));
@@ -473,9 +538,9 @@ fn reap_all(
         // A claim a reaper left is examined before anything else is decided
         // about its run: what that reaper decided is carried out, not redone.
         let action = if claim_path(&paths.state, &run_id).exists() {
-            resume_claim(paths, clock, &hold, &run_id, now)
+            resume_claim(paths, clock, &hold, &run_id, now, timeline)
         } else {
-            match classify(paths, &hold, now) {
+            match classify(paths, &hold, now, timeline) {
                 Verdict::Stalled(target) => reap_stalled(paths, clock, &hold, &run_id, &target),
                 Verdict::Exited => close_exited_pass(paths, clock, &hold, &run_id),
                 Verdict::Healthy | Verdict::Displaced => Ok(None),
@@ -590,7 +655,13 @@ struct ObservedHold {
     recorded_process: Option<ProcessIdentity>,
 }
 
-fn observe(paths: &OstromPaths, clock: &Clock) -> Result<Vec<ObservedHold>, HoldingsError> {
+/// Every open hold, with its progress measured net of suspended time when
+/// `suspend` is known and by the wall clock alone when it is not.
+fn observe(
+    paths: &OstromPaths,
+    clock: &Clock,
+    suspend: Option<&SuspendTimeline>,
+) -> Result<Vec<ObservedHold>, HoldingsError> {
     let holdings = open_holdings(paths, clock)?;
     let rows = read_trace(&paths.trace_file())
         .map_err(|error| HoldingsError::Trace(error.to_string()))?
@@ -626,8 +697,15 @@ fn observe(paths: &OstromPaths, clock: &Clock) -> Result<Vec<ObservedHold>, Hold
                     idle_seconds: caps.idle_seconds,
                     stall_threshold_seconds: caps.stall_threshold_seconds(),
                     last_progress_at: last_progress.and_then(render_epoch),
-                    seconds_without_progress: last_progress
-                        .map(|progress| now.saturating_sub(progress)),
+                    seconds_without_progress: last_progress.map(|progress| {
+                        suspend.map_or_else(
+                            || now.saturating_sub(progress),
+                            |timeline| timeline.awake_since(progress),
+                        )
+                    }),
+                    suspended_seconds: last_progress.and_then(|progress| {
+                        suspend.map(|timeline| timeline.suspended_since(progress))
+                    }),
                     holding,
                 },
                 run_ceilings,
@@ -860,8 +938,23 @@ impl ProcessIdentity {
     }
 }
 
+/// Whether a lease that names no process has lapsed: its expiry, moved later by
+/// the time the machine spent suspended since it was taken (#637). A holder
+/// cannot renew while the machine sleeps, so sleep alone never lapses it.
+fn lease_lapsed(lease: &LeaseRecord, now: u64, timeline: &SuspendTimeline) -> bool {
+    lease
+        .expires_at
+        .saturating_add(timeline.suspended_since(lease.started_at))
+        <= now
+}
+
 /// The one definition of a stalled hold, shared by the reaper and doctor.
-fn classify(paths: &OstromPaths, hold: &ObservedHold, now: u64) -> Verdict {
+fn classify(
+    paths: &OstromPaths,
+    hold: &ObservedHold,
+    now: u64,
+    timeline: &SuspendTimeline,
+) -> Verdict {
     let holding = &hold.progress.holding;
     // A hold with no run id predates #618, or is an agent's own protocol
     // record inside a pass; the run that owns it is judged, not the record.
@@ -944,7 +1037,7 @@ fn classify(paths: &OstromPaths, hold: &ObservedHold, now: u64) -> Verdict {
                 },
                 // A lease that names no process: only its expiry can say the
                 // pass has gone, and nothing about it can be stopped.
-                None if lease.expires_at <= now => Verdict::Exited,
+                None if lease_lapsed(&lease, now, timeline) => Verdict::Exited,
                 None => Verdict::Healthy,
             }
         }
@@ -1133,6 +1226,7 @@ fn resume_claim(
     hold: &ObservedHold,
     run_id: &str,
     now: u64,
+    timeline: &SuspendTimeline,
 ) -> Result<Option<ReapedHold>, StallError> {
     let path = claim_path(&paths.state, run_id);
     let stale = match claim::read(&path) {
@@ -1204,7 +1298,7 @@ fn resume_claim(
                     Some(identity) => {
                         stop_process(identity, &mut || mark_signalled(&mut claim, clock))
                     }
-                    None if lease.expires_at <= now => StopOutcome::Stopped,
+                    None if lease_lapsed(&lease, now, timeline) => StopOutcome::Stopped,
                     None => StopOutcome::Unknown,
                 },
                 // A pass another took the lease from may still run (#636):
@@ -1593,5 +1687,236 @@ mod tests {
             ),
             (vec![json!("unexamined-run")], 3)
         );
+    }
+
+    /// #637: a hold on a real process of this test's own, judged at a fixed
+    /// wall-clock instant with the suspended time a fixture reports.
+    #[cfg(unix)]
+    mod suspended {
+        use std::{
+            fs,
+            os::unix::process::CommandExt as _,
+            process::{Child, Command, Stdio},
+        };
+
+        use chrono::{DateTime, SecondsFormat, Utc};
+        use serde_json::{Value, json};
+        use tempfile::{TempDir, tempdir};
+
+        use super::super::{ReapedHold, reap_stalled_holds_with, reaper_findings};
+        use crate::{
+            Clock, OstromPaths,
+            lease::read_process_identity,
+            suspend::{SuspendReading, SuspendSource, timeline_path},
+        };
+
+        const OWNER: &str = "builder-a1b2c3d4-wake3";
+        const RUN: &str = "builder-suspended-placeholder-run";
+        /// 2026-08-01T12:00:00Z.
+        const NOW: u64 = 1_785_585_600;
+        const THREE_HOURS: u64 = 3 * 60 * 60;
+        /// The pass started just over three hours ago and has written nothing
+        /// since. Undeclared, its stall threshold is the pass wall default
+        /// plus the grace, 1805 s.
+        const STARTED: u64 = NOW - THREE_HOURS - 10;
+
+        /// A process of this test's own, its own group leader, killed with
+        /// its group on drop, never by pattern.
+        struct Sleeper(Child);
+
+        impl Sleeper {
+            fn start() -> Self {
+                Self(
+                    Command::new("sleep")
+                        .arg("60")
+                        .process_group(0)
+                        .stdin(Stdio::null())
+                        .spawn()
+                        .expect("start a sleeping process"),
+                )
+            }
+
+            fn running(&mut self) -> bool {
+                self.0.try_wait().expect("poll the process").is_none()
+            }
+        }
+
+        impl Drop for Sleeper {
+            fn drop(&mut self) {
+                let _ = Command::new("/bin/kill")
+                    .args(["-KILL", "--", &format!("-{}", self.0.id())])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                let _ = self.0.wait();
+            }
+        }
+
+        struct Suspended(Result<u64, String>);
+
+        impl SuspendSource for Suspended {
+            fn read(&self) -> Result<SuspendReading, String> {
+                self.0.clone().map(|suspended_seconds| SuspendReading {
+                    boot_id: "fixture-boot".to_owned(),
+                    suspended_seconds,
+                })
+            }
+        }
+
+        fn timestamp(epoch: u64) -> String {
+            DateTime::<Utc>::from_timestamp(i64::try_from(epoch).expect("epoch"), 0)
+                .expect("valid epoch")
+                .to_rfc3339_opts(SecondsFormat::Secs, true)
+        }
+
+        fn clock(epoch: u64) -> Clock {
+            Clock::fixed(
+                DateTime::<Utc>::from_timestamp(i64::try_from(epoch).expect("epoch"), 0)
+                    .expect("valid epoch"),
+            )
+        }
+
+        /// A pass hold as `ostrom pass` records one: `pass-started` and the
+        /// pass lease, both naming `sleeper` when one is given. A reaper run
+        /// before the hold began left one sample, with nothing suspended yet.
+        fn pass_hold(sleeper: Option<&Sleeper>) -> (TempDir, OstromPaths) {
+            let root = tempdir().expect("state root");
+            let paths = OstromPaths {
+                config: root.path().to_path_buf(),
+                state: root.path().to_path_buf(),
+            };
+            let mut fact = json!({"owner": OWNER, "run_id": RUN});
+            let mut lease = json!({
+                "owner": OWNER,
+                "started_at": STARTED,
+                "expires_at": STARTED + 120,
+            });
+            if let Some(sleeper) = sleeper {
+                let identity = read_process_identity(sleeper.0.id())
+                    .expect("read the process")
+                    .expect("the process is running");
+                for record in [&mut fact, &mut lease] {
+                    record["pid"] = json!(identity.pid);
+                    record["process_group_id"] = json!(identity.process_group_id);
+                    record["process_start_time"] = json!(identity.start_time);
+                }
+            }
+            let row = json!({
+                "ts": timestamp(STARTED),
+                "kind": "pass-started",
+                "fact": fact,
+                "narration": {},
+            });
+            fs::write(paths.trace_file(), format!("{row}\n")).expect("write the trace");
+            fs::write(paths.state.join("builder-pass.lease"), lease.to_string())
+                .expect("write the pass lease");
+            let timeline = timeline_path(&paths.state);
+            fs::create_dir_all(timeline.parent().expect("timeline directory"))
+                .expect("create the reaping directory");
+            fs::write(
+                timeline,
+                json!({"boot_id": "fixture-boot", "samples": [[STARTED - 10, 0]]}).to_string(),
+            )
+            .expect("write the earlier sample");
+            (root, paths)
+        }
+
+        fn reap(paths: &OstromPaths, at: u64, suspended: Result<u64, String>) -> Vec<ReapedHold> {
+            reap_stalled_holds_with(paths, &clock(at), &Suspended(suspended), "up", None, None)
+        }
+
+        fn pass_ended(paths: &OstromPaths) -> Vec<Value> {
+            fs::read_to_string(paths.trace_file())
+                .expect("read the trace")
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).expect("trace row"))
+                .filter(|row| row["kind"] == "pass-ended")
+                .map(|row| row["fact"]["reason"].clone())
+                .collect()
+        }
+
+        /// Three hours asleep is not three hours silent: the resumed pass is
+        /// not reaped on resume, nor five minutes later, once a reaper run has
+        /// already seen the suspend.
+        #[test]
+        fn a_three_hour_suspend_with_no_real_stall_reaps_nothing() {
+            let mut sleeper = Sleeper::start();
+            let (_root, paths) = pass_hold(Some(&sleeper));
+            let reaped = [
+                reap(&paths, NOW, Ok(THREE_HOURS)).len(),
+                reap(&paths, NOW + 300, Ok(THREE_HOURS)).len(),
+            ];
+            assert_eq!(
+                (reaped, sleeper.running(), pass_ended(&paths)),
+                ([0, 0], true, Vec::<Value>::new())
+            );
+        }
+
+        /// The same three hours with the machine awake is a stall, and it is
+        /// reaped.
+        #[test]
+        fn a_real_stall_of_the_same_length_is_still_reaped() {
+            let mut sleeper = Sleeper::start();
+            let (_root, paths) = pass_hold(Some(&sleeper));
+            let reaped = reap(&paths, NOW, Ok(0))
+                .into_iter()
+                .map(|hold| (hold.reason, hold.stopped))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                (reaped, sleeper.running(), pass_ended(&paths)),
+                (
+                    vec![("stalled".to_owned(), true)],
+                    false,
+                    vec![json!("stalled")]
+                )
+            );
+        }
+
+        /// When the suspended time cannot be read, nothing is judged: the
+        /// stall above is left running, nothing is recorded against it, and
+        /// the reason is where doctor reads it.
+        #[test]
+        fn unreadable_suspended_time_skips_reaping_and_records_why() {
+            let mut sleeper = Sleeper::start();
+            let (_root, paths) = pass_hold(Some(&sleeper));
+            let reaped = reap(&paths, NOW, Err("fixture: no clock".to_owned())).len();
+            let findings = reaper_findings(&paths);
+            assert_eq!(
+                (
+                    reaped,
+                    sleeper.running(),
+                    pass_ended(&paths),
+                    findings.len(),
+                    findings.iter().any(|finding| finding
+                        .contains("the time this machine spent suspended could not be read")
+                        && finding.contains("fixture: no clock")),
+                ),
+                (0, true, Vec::<Value>::new(), 1, true),
+                "{findings:?}"
+            );
+        }
+
+        /// A pass lease that names no process lapses by its expiry alone, and
+        /// the machine sleeping is not that: it is closed only when the time
+        /// awake has passed its expiry.
+        #[test]
+        fn a_lease_naming_no_process_does_not_lapse_while_the_machine_sleeps() {
+            let (_asleep_root, asleep) = pass_hold(None);
+            let (_awake_root, awake) = pass_hold(None);
+            assert_eq!(
+                (
+                    reap(&asleep, NOW, Ok(THREE_HOURS)).len(),
+                    pass_ended(&asleep),
+                    reap(&awake, NOW, Ok(0)).len(),
+                    pass_ended(&awake),
+                ),
+                (
+                    0,
+                    Vec::<Value>::new(),
+                    1,
+                    vec![json!("exited-without-terminal")]
+                )
+            );
+        }
     }
 }
