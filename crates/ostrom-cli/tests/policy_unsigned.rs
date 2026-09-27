@@ -272,29 +272,6 @@ fn environment_cannot_enable_unsigned_and_missing_trust_still_refuses() {
 }
 
 #[test]
-fn generate_still_requires_a_signature_and_rejects_the_unsigned_flag() {
-    let fixture = Fixture::new();
-    fixture.remove_signature();
-    let before = snapshot(&fixture.home);
-    let refused = fixture
-        .command()
-        .args(["generate", "example/repository"])
-        .env("OSTROM_UNSIGNED", "true")
-        .output()
-        .expect("generate unsigned operator policy");
-    assert_eq!(refused.status.code(), Some(1));
-    assert!(refused.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&refused.stderr).contains("policy signature is missing"));
-    let unsupported = fixture
-        .command()
-        .args(["generate", "--unsigned", "example/repository"])
-        .output()
-        .expect("generate has no unsigned flag");
-    assert_eq!(unsupported.status.code(), Some(2));
-    assert_unchanged(&before, &snapshot(&fixture.home));
-}
-
-#[test]
 fn unsigned_validation_preserves_resolution_context_and_strict_refusal() {
     let fixture = Fixture::new();
     let candidate = fixture.root.path().join("repository.yaml");

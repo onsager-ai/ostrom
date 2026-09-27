@@ -110,14 +110,6 @@ enum Command {
         operator: Option<PathBuf>,
         manifest: PathBuf,
     },
-    /// Generate portable repository policy from the adopting operator manifest.
-    Generate {
-        /// Repository whose governing rules should be projected.
-        repository: String,
-        /// Output path; omit or use `-` to write the manifest to stdout.
-        #[arg(long)]
-        output: Option<PathBuf>,
-    },
     /// List the operations declared by the active policy manifest.
     Operations {
         /// Restrict the list to operations granted somewhere to this actor.
@@ -136,25 +128,6 @@ enum Command {
             conflicts_with_all = ["actor", "settings", "check_settings"]
         )]
         prompt: Option<String>,
-    },
-    /// Explain how authored policy resolves for one pull request.
-    Explain {
-        target: String,
-        /// Policy manifest; defaults to repository discovery.
-        #[arg(long)]
-        manifest: Option<PathBuf>,
-        /// Actor projection to explain.
-        #[arg(long, default_value = "builder")]
-        actor: String,
-        /// Operation projection to explain.
-        #[arg(long, default_value = "work")]
-        operation: String,
-        /// Recorded sweep responses for a hermetic explanation.
-        #[arg(long, hide = true)]
-        fixture: Option<PathBuf>,
-        /// Observation clock for hermetic replay.
-        #[arg(long, hide = true)]
-        started_at: Option<String>,
     },
     /// Run one declared policy loop.
     Loop {
@@ -676,9 +649,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             unsigned,
             operator.as_deref(),
         )?,
-        Command::Generate { repository, output } => {
-            policy_manifest::run_generate(&paths, &repository, output.as_deref())?
-        }
         Command::Operations {
             actor,
             settings,
@@ -691,28 +661,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             check_settings.as_deref(),
             prompt.as_deref(),
         )?,
-        Command::Explain {
-            target,
-            manifest,
-            actor,
-            operation,
-            fixture,
-            started_at,
-        } => {
-            let observed_at = resolve_started_at(started_at.as_deref(), &clock)?;
-            let cwd = env::current_dir()?;
-            let output = policy_manifest::run_explain(&policy_manifest::ExplainOptions {
-                paths: &paths,
-                working_directory: &cwd,
-                target: &target,
-                manifest: manifest.as_deref(),
-                fixture: fixture.as_deref(),
-                observed_at,
-                actor: &actor,
-                operation: &operation,
-            })?;
-            io::stdout().write_all(output.as_bytes())?;
-        }
         Command::Loop { command } => match command {
             LoopCommand::Run { name } => run_loop_command(&paths, &name)?,
         },

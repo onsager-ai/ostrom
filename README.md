@@ -515,36 +515,7 @@ is the intended price of keeping merge authority out of the builder, not a
 defect or a hidden background service. Claude Code's `/loop` is session-scoped,
 so closing the gatekeeper session stops the polling.
 
-### Explain policy and stalled holds
-
-`ostrom explain owner/repository#123` evaluates the pull request against every
-authored grant and deny, separates subject matching from the actor/operation
-projection, names any `requires:` check and its result, and prints the aggregate
-verdict with the deciding rule, scope, and source file. It discovers
-`ostrom.yaml` or `ostrom.yml` from the working directory up to the repository's
-`.git` boundary;
-`--manifest` selects an explicit file. The deprecated `.ostrom/manifest.yml`
-and user-config `manifest.yml` locations remain available during migration, but
-a repository without either repository manifest is reported as ungoverned and
-never falls through to the operator manifest. The separately signed operator
-manifest is `<Ostrom config>/ostrom.yaml` (or `.yml`). Denies from either scope
-win absolutely, a grant from either scope suffices when no deny matches, and an
-unmatched request is denied. Repository `loops:` and `operations:` declarations
-are reported but inert; only declarations in the operator manifest are adopted.
-If both filename extensions exist for one document, loading refuses both.
-Repository actor declarations are reported under `ACTOR PORTABILITY`, with one
-non-failing finding per actor and the file that declared it. Actor declarations
-in the operator manifest are expected and produce no finding.
-
-`ostrom generate owner/repository --output /path/to/ostrom.yaml` projects the
-currently resolved, signed operator policy into a portable repository manifest.
-Omitting `--output` (or using `--output -`) writes YAML to stdout. The
-projection keeps applicable grants, denies, checks, selectors, operations, and
-loops whose empty repository list applies everywhere or whose list includes the
-selected repository,
-removes the already-selected repository dimension from rules, and declares no
-actors. Generation does not sign or adopt the output; review and sign it before
-placing it at a repository policy entrypoint.
+### Stalled holds
 
 The policy `defaults` map accepts `stalls_after: 7d`, which is also the default.
 An individual grant or deny may override it. Sweep records the first time each

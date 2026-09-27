@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **Breaking:** `ostrom explain` and `ostrom generate` are removed (#617). Both
+  were operator introspection tools, not on the delivery loop's path:
+  `PolicyBundle::explain_pull_request` has its own production caller in the
+  sweep's policy holds (`sweep.rs`'s `update_policy_holds`), and that method,
+  `compose`, `sign`, `validate`, and `rollback` are unaffected. `run_explain`,
+  `run_generate`, their `ExplainOptions`/`ExplainTarget` types, GitHub
+  pull-request acquisition (`acquire_pull_request`, `fixture_pull_request`),
+  explanation rendering, and the repository-policy projection helpers
+  (`project_repository_manifest`, `project_rules`) go with them, along with
+  the now-unused `PolicyLoadError` variants they raised.
 - **Breaking:** `ostrom audit` is removed (#617). It queried merged pull
   requests and joined them against recorded gate verdicts, but nothing in the
   delivery loop read its output — the gate, the sweep and `decision_answers.rs`
