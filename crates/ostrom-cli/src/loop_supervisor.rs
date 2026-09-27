@@ -7,8 +7,11 @@ use std::{
 };
 
 use chrono::Local;
-use ostrom_core::{PolicyManifest, ResolvedLoopCeilings};
-use ostrom_store::{Clock, Holding, LeaseState, OstromPaths, open_holdings, read_trace};
+use ostrom_core::{PolicyManifest, ResolvedLoopCeilings, ResolvedRunCaps, render_seconds};
+use ostrom_store::{
+    Clock, HoldProgress, LeaseState, OstromPaths, environment, hold_progress, process_running,
+    process_start_time, read_trace, reap_stalled_holds,
+};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use thiserror::Error;
@@ -32,6 +35,10 @@ enum LoopStatus {
     Stopped,
     Stale,
     Inconclusive,
+    /// A slot came due while the previous worker for the loop was still
+    /// running, so it was recorded and not launched (#619).
+    #[serde(rename = "skipped:previous-live")]
+    SkippedPreviousLive,
 }
 
 impl LoopStatus {
@@ -44,11 +51,17 @@ impl LoopStatus {
             Self::Stopped => "stopped",
             Self::Stale => "stale:slot_age_exceeded",
             Self::Inconclusive => "inconclusive",
+            Self::SkippedPreviousLive => "skipped:previous-live",
         }
     }
 
+    /// A skip record carries the still-running worker's pid, so it may be
+    /// alive exactly as that worker's own record was.
     const fn may_be_alive(self) -> bool {
-        matches!(self, Self::Starting | Self::Running)
+        matches!(
+            self,
+            Self::Starting | Self::Running | Self::SkippedPreviousLive
+        )
     }
 }
 
@@ -61,6 +74,10 @@ struct LoopRunState {
     schedule_slot: String,
     status: LoopStatus,
     pid: Option<u32>,
+    /// The worker's start time from `/proc`, so a recycled pid is not taken
+    /// for the worker (#619). Absent in records written before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    process_start_time: Option<u64>,
     started_at: String,
     finished_at: Option<String>,
     reason: Option<String>,
@@ -75,6 +92,7 @@ impl LoopRunState {
             schedule_slot: schedule_slot.to_owned(),
             status: LoopStatus::Starting,
             pid: None,
+            process_start_time: None,
             started_at: clock.timestamp(),
             finished_at: None,
             reason: None,
@@ -104,6 +122,8 @@ pub(crate) struct UpSummary {
     pub unchanged: usize,
     pub not_due: usize,
     pub stale: usize,
+    pub skipped: usize,
+    pub reaped: usize,
 }
 
 #[derive(Debug, Error)]
@@ -148,6 +168,8 @@ pub(crate) enum LoopSupervisorError {
     },
     #[error(transparent)]
     Holdings(#[from] ostrom_store::HoldingsError),
+    #[error("ostrom up: {0}")]
+    Stalls(#[from] ostrom_store::StallError),
 }
 
 pub(crate) fn reconcile(
@@ -166,6 +188,14 @@ pub(crate) fn reconcile(
         }
     })?;
     let mut summary = stop_obsolete(paths, clock, &current)?;
+    // Reap before measuring, so a stuck run neither counts as live work nor
+    // keeps its item from the next dispatch (#619). `ostrom up` is the
+    // reconciler that already runs on a timer; no resident process is needed.
+    let own_run = environment::OSTROM_RUN_ID.value();
+    for hold in reap_stalled_holds(paths, clock, own_run.as_deref())? {
+        eprintln!("ostrom up: {hold}");
+        summary.reaped += 1;
+    }
     let consumption = measure_consumption(paths, clock);
     let local_now = clock.now().with_timezone(&Local);
 
@@ -180,12 +210,42 @@ pub(crate) fn reconcile(
             summary.not_due += 1;
             continue;
         };
-        if let Some(existing) = read_state(paths, name)?
+        let existing = read_state(paths, name)?;
+        if let Some(existing) = &existing
             && existing.version == current.digest
             && existing.schedule_slot == slot.identity
             && existing.status != LoopStatus::Inconclusive
         {
             summary.unchanged += 1;
+            continue;
+        }
+        // Never launch over a worker that is still running: two workers for
+        // one loop overlap their slots and double their spend. The skip is
+        // recorded, with the live worker's identity carried forward, so the
+        // next slot checks the same worker again (principle 5).
+        if let Some(existing) = &existing
+            && existing.status.may_be_alive()
+            && let Some(pid) = existing.pid
+            && process_running(pid, existing.process_start_time)
+        {
+            let reason = format!("previous-live pid={pid} slot={}", existing.schedule_slot);
+            let mut state = LoopRunState::starting(name, &current.digest, &slot.identity, clock);
+            state.status = LoopStatus::SkippedPreviousLive;
+            state.pid = Some(pid);
+            state.process_start_time = existing.process_start_time;
+            state.finished_at = Some(clock.timestamp());
+            state.reason = Some(reason.clone());
+            write_state(paths, &state)?;
+            append_log(
+                paths,
+                name,
+                &format!(
+                    "{} skipped:previous-live slot={} {reason}\n",
+                    clock.timestamp(),
+                    slot.identity
+                ),
+            )?;
+            summary.skipped += 1;
             continue;
         }
         if slot.age.num_seconds() > SLOT_STALE_AFTER_SECONDS {
@@ -255,10 +315,18 @@ pub(crate) fn render_ps(paths: &OstromPaths, clock: &Clock) -> Result<String, Lo
         let spend = render_spend(consumption.spend_usd, resolved.ceilings.spend_usd);
         let tokens = render_u64(consumption.tokens, resolved.ceilings.tokens);
         output.push_str(&format!(
-            "{name}  {status}  {concurrent}  {spend}  {tokens} tokens\n"
+            "{name}  {status}  {concurrent}  {spend}  {tokens} tokens  wall={}  idle={}\n",
+            resolved.run_caps.render_wall(),
+            resolved.run_caps.render_idle()
         ));
     }
-    output.push_str(&render_holdings(&open_holdings(paths, clock)?));
+    let implementer = current.manifest.defaults.implementer_ceilings.run_caps();
+    output.push_str(&format!(
+        "\nimplementer caps: wall={}  idle={}\n",
+        implementer.render_wall(),
+        implementer.render_idle()
+    ));
+    output.push_str(&render_holdings(&hold_progress(paths, clock)?));
     Ok(output)
 }
 
@@ -270,22 +338,25 @@ pub(crate) fn render_holdings_json(
     clock: &Clock,
 ) -> Result<String, LoopSupervisorError> {
     let mut output = String::new();
-    for holding in open_holdings(paths, clock)? {
-        output.push_str(&serde_json::to_string(&holding).expect("a holding serializes as JSON"));
+    for hold in hold_progress(paths, clock)? {
+        output.push_str(&serde_json::to_string(&hold).expect("a holding serializes as JSON"));
         output.push('\n');
     }
     Ok(output)
 }
 
-fn render_holdings(holdings: &[Holding]) -> String {
-    if holdings.is_empty() {
+fn render_holdings(holds: &[HoldProgress]) -> String {
+    if holds.is_empty() {
         return "\nholdings: none\n".to_owned();
     }
-    let mut output = "\nholdings\nrun_id  runner  item  age  last_event  lease\n".to_owned();
-    for holding in holdings {
+    let mut output =
+        "\nholdings\nrun_id  runner  item  age  last_event  lease  wall  idle  last_progress\n"
+            .to_owned();
+    for hold in holds {
+        let holding = &hold.holding;
         let field = |value: Option<&str>| value.unwrap_or("-").to_owned();
         output.push_str(&format!(
-            "{}  {}  {}  {}  {}  {}\n",
+            "{}  {}  {}  {}  {}  {}  {}  {}  {}\n",
             field(holding.run_id.as_deref()),
             field(holding.runner.as_deref()),
             field(holding.item.as_deref()),
@@ -294,6 +365,14 @@ fn render_holdings(holdings: &[Holding]) -> String {
                 .map_or_else(|| "-".to_owned(), render_age),
             field(holding.last_event_at.as_deref()),
             field(holding.lease.map(LeaseState::as_str)),
+            render_seconds(hold.wall_seconds),
+            ResolvedRunCaps {
+                wall_seconds: hold.wall_seconds,
+                wall_declared: true,
+                idle_seconds: hold.idle_seconds,
+            }
+            .render_idle(),
+            field(hold.last_progress_at.as_deref()),
         ));
     }
     output
@@ -353,6 +432,7 @@ pub(crate) fn worker_started(
     }
     state.status = LoopStatus::Running;
     state.pid = Some(std::process::id());
+    state.process_start_time = process_start_time(std::process::id());
     write_state(paths, &state)?;
     Ok(current.manifest)
 }
@@ -370,12 +450,18 @@ pub(crate) fn worker_finished(
             cause: "activation_state_missing".to_owned(),
         });
     };
+    state.pid = None;
+    state.process_start_time = None;
+    // A skip record now describes the slot that was skipped, not this
+    // worker's; it keeps saying so once the worker it waited on is gone.
+    if state.status == LoopStatus::SkippedPreviousLive {
+        return write_state(paths, &state);
+    }
     state.status = if succeeded {
         LoopStatus::Completed
     } else {
         LoopStatus::Failed
     };
-    state.pid = None;
     state.finished_at = Some(clock.timestamp());
     state.reason = reason;
     write_state(paths, &state)
@@ -419,6 +505,7 @@ fn stop_obsolete(
             terminate_process_group(name, pid)?;
             state.status = LoopStatus::Stopped;
             state.pid = None;
+            state.process_start_time = None;
             state.finished_at = Some(clock.timestamp());
             state.reason = Some(if declared {
                 "version_changed".to_owned()

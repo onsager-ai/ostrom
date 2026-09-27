@@ -18,6 +18,7 @@ mod domain;
 mod operation;
 mod plan;
 mod policy;
+mod run_caps;
 mod store;
 mod work_graph;
 
@@ -57,14 +58,19 @@ pub use plan::{
     fact_table, mechanical_ranking, validate_assessment,
 };
 pub use policy::{
-    ActorDecl, CheckDefaults, InputDecl, InputResolutionError, InputType, LoopActivationSlot,
-    LoopCadence, LoopDecl, LoopResolutionError, LoopTime, ManifestDefaults, ManifestError,
-    ManifestValidationError, NormalizedList, OperationDecl, OperationParamDecl, OperationParamType,
-    PermissionMode, PolicyCandidate, PolicyDecision, PolicyManifest, PolicySelector,
-    PolicySelectorError, PromptFileReference, PromptNamedReference, PromptResolutionError,
-    PromptValue, ResolvedInput, ResolvedLoop, ResolvedLoopCeilings, RuleDecl, RuleDefaults,
-    SelectorFinding, SelectorMatch, SelectorPrefix, SelectorResolutionError, SelectorUniverse,
-    StallDuration, StallDurationError, StepDecl, SweepPolicy, UnmatchedPolicy, UnresolvedReference,
+    ActorDecl, CheckDefaults, ImplementerCeilings, InputDecl, InputResolutionError, InputType,
+    LoopActivationSlot, LoopCadence, LoopDecl, LoopResolutionError, LoopTime, ManifestDefaults,
+    ManifestError, ManifestValidationError, NormalizedList, OperationDecl, OperationParamDecl,
+    OperationParamType, PermissionMode, PolicyCandidate, PolicyDecision, PolicyManifest,
+    PolicySelector, PolicySelectorError, PromptFileReference, PromptNamedReference,
+    PromptResolutionError, PromptValue, ResolvedInput, ResolvedLoop, ResolvedLoopCeilings,
+    RuleDecl, RuleDefaults, SelectorFinding, SelectorMatch, SelectorPrefix,
+    SelectorResolutionError, SelectorUniverse, StallDuration, StallDurationError, StepDecl,
+    SweepPolicy, UnmatchedPolicy, UnresolvedReference,
+};
+pub use run_caps::{
+    CapDuration, CapDurationError, DEFAULT_IMPLEMENTER_WALL_SECONDS, DEFAULT_PASS_WALL_SECONDS,
+    DEFAULT_RUN_COST_CEILING_USD, RUN_TERMINATION_GRACE_SECONDS, ResolvedRunCaps, render_seconds,
 };
 pub use store::{
     AttemptOutcome, CHECK_STORE_SCHEMA_VERSION, CheckRun, CheckRunId, CheckStore, CheckStoreFault,

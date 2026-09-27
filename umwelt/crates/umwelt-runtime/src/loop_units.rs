@@ -43,6 +43,9 @@ pub struct LoopUnitDeclaration {
     pub environment: BTreeMap<String, String>,
     pub ceiling_environment: CeilingEnvironmentNames,
     pub ceilings: LoopCeilings,
+    /// The unit's `TimeoutStartSec`: the outer bound the supervisor puts on
+    /// one run. The consumer derives it from the run's own caps.
+    pub timeout_start_seconds: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -365,7 +368,10 @@ fn render_service(config: &LoopUnitGeneratorConfig, declaration: &LoopUnitDeclar
             .join(" "),
     );
     source.push('\n');
-    source.push_str("TimeoutStartSec=1800\nKillMode=control-group\n");
+    source.push_str(&format!(
+        "TimeoutStartSec={}\nKillMode=control-group\n",
+        declaration.timeout_start_seconds
+    ));
     source
 }
 
@@ -450,6 +456,7 @@ mod tests {
                     spend_usd: Some(50.0),
                     tokens: Some(200_000),
                 },
+                timeout_start_seconds: 1800,
             },
             LoopUnitDeclaration {
                 name: "nightly".to_owned(),
@@ -471,6 +478,7 @@ mod tests {
                     spend_usd: Some(50.0),
                     tokens: Some(200_000),
                 },
+                timeout_start_seconds: 1800,
             },
         ]
     }

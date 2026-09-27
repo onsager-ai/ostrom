@@ -24,7 +24,7 @@ use ostrom_core::{
     CheckContractError, CheckDefinition, CheckDocument, CheckFault, CheckRun, CheckRunId,
     CheckState, CheckVerdict, GoalsDocument, GoalsError, InconclusivePolicy, OperationAction,
     PermissionMode, PolicyManifest, RepositoryName, ResolvedCheck, ResolvedLoop,
-    ResolvedLoopCeilings, SelectorPrefix, agent_run_parameters,
+    ResolvedLoopCeilings, ResolvedRunCaps, SelectorPrefix, agent_run_parameters,
 };
 use ostrom_store::{
     AgentRegistry, AssessmentHarness, Clock, CodexHarness, DigestOptions, DispatchOutcome,
@@ -227,6 +227,13 @@ enum Command {
         /// implementer mints its own, as a hand run always has.
         #[arg(long, hide = true)]
         run_id: Option<String>,
+        /// The wall cap dispatch resolved from policy, in seconds. Without it
+        /// the implementer default applies.
+        #[arg(long, hide = true)]
+        wall_seconds: Option<u64>,
+        /// The idle cap dispatch resolved from policy, in seconds.
+        #[arg(long, hide = true)]
+        idle_seconds: Option<u64>,
     },
     /// Report or remove worktrees whose remote work is mechanically resolved.
     ReapWorktrees {
@@ -256,6 +263,10 @@ enum Command {
         events_fd: Option<u32>,
         #[arg(long)]
         run_id: Option<String>,
+        #[arg(long)]
+        wall_seconds: Option<u64>,
+        #[arg(long)]
+        idle_seconds: Option<u64>,
         supervisor_pid: u32,
     },
     #[command(name = "__loop-worker", hide = true)]
@@ -667,8 +678,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let executable = env::current_exe()?;
             let outcome = loop_supervisor::reconcile(&paths, &clock, &executable)?;
             println!(
-                "reconciled started={} stopped={} unchanged={} stale={} not-due={}",
-                outcome.started, outcome.stopped, outcome.unchanged, outcome.stale, outcome.not_due
+                "reconciled started={} stopped={} unchanged={} stale={} not-due={} skipped={} reaped={}",
+                outcome.started,
+                outcome.stopped,
+                outcome.unchanged,
+                outcome.stale,
+                outcome.not_due,
+                outcome.skipped,
+                outcome.reaped
             );
         }
         Command::Ps { json } => {
@@ -876,6 +893,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             runner_name,
             events_fd,
             run_id,
+            wall_seconds,
+            idle_seconds,
         } => {
             let events_fd = resolve_events_fd(events_fd)?;
             let mut arguments = vec![
@@ -889,6 +908,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             if let Some(run_id) = run_id {
                 arguments.extend(["--run-id".into(), run_id.into()]);
+            }
+            if let Some(seconds) = wall_seconds {
+                arguments.extend(["--wall-seconds".into(), seconds.to_string().into()]);
+            }
+            if let Some(seconds) = idle_seconds {
+                arguments.extend(["--idle-seconds".into(), seconds.to_string().into()]);
             }
             supervise(&arguments, Some((&work_order_file, &unit_name)), &clock)
         }
@@ -927,6 +952,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             runner_name,
             events_fd,
             run_id,
+            wall_seconds,
+            idle_seconds,
             supervisor_pid,
         } => run_implement_worker(
             work_order_file,
@@ -935,6 +962,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             supervisor_pid,
             resolve_events_fd(events_fd)?,
             run_id,
+            implementer_run_caps(wall_seconds, idle_seconds),
             clock,
         ),
         Command::Dispatch { arguments } => {
@@ -2883,10 +2911,10 @@ fn resolve_pass_policy(
         prompt: role.default_prompt().to_owned(),
         permission_mode: role.default_permission_mode(),
         derived_settings: None,
-        caps: umwelt_runtime::RunCaps {
-            kill_grace_ms: PASS_KILL_GRACE_MS,
-            ..umwelt_runtime::RunCaps::default()
-        },
+        caps: pass_run_caps(
+            ResolvedRunCaps::pass_default(),
+            umwelt_runtime::RunCaps::default(),
+        ),
         manifest: None,
         manifest_path: None,
         resolved_loop: None,
@@ -2993,12 +3021,18 @@ fn resolve_pass_policy(
         },
         |resolved| resolved.ceilings,
     );
-    let caps = umwelt_runtime::RunCaps {
-        tokens: ceilings.tokens,
-        cost_usd: ceilings.spend_usd,
-        kill_grace_ms: PASS_KILL_GRACE_MS,
-        ..umwelt_runtime::RunCaps::default()
-    };
+    let run_caps = resolved_loop.as_ref().map_or_else(
+        || manifest.defaults.r#loop.run_caps(),
+        |resolved| resolved.run_caps,
+    );
+    let caps = pass_run_caps(
+        run_caps,
+        umwelt_runtime::RunCaps {
+            tokens: ceilings.tokens,
+            cost_usd: ceilings.spend_usd,
+            ..umwelt_runtime::RunCaps::default()
+        },
+    );
     Ok(ResolvedPassPolicy {
         prompt,
         permission_mode,
@@ -3008,6 +3042,23 @@ fn resolve_pass_policy(
         manifest_path: Some(manifest_path),
         resolved_loop,
     })
+}
+
+/// A pass's harness caps: every pass has a wall cap, declared or defaulted
+/// (#619), and an idle cap only when one is declared. The watchdog enforces
+/// both; the kill grace is the pass's own termination grace.
+fn pass_run_caps(
+    run_caps: ResolvedRunCaps,
+    caps: umwelt_runtime::RunCaps,
+) -> umwelt_runtime::RunCaps {
+    umwelt_runtime::RunCaps {
+        wall_ms: Some(run_caps.wall_seconds.saturating_mul(1_000)),
+        idle_ms: run_caps
+            .idle_seconds
+            .map(|seconds| seconds.saturating_mul(1_000)),
+        kill_grace_ms: PASS_KILL_GRACE_MS,
+        ..caps
+    }
 }
 
 /// The operator manifest `ostrom init` writes.
@@ -3138,6 +3189,7 @@ fn core_agent_registry() -> AgentRegistry {
     registry
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_implement_worker(
     work_order_file: PathBuf,
     unit_name: String,
@@ -3145,6 +3197,7 @@ fn run_implement_worker(
     supervisor_pid: u32,
     events_fd: Option<u32>,
     run_id: Option<String>,
+    caps: ResolvedRunCaps,
     clock: Clock,
 ) -> ! {
     let signals = register_signals().unwrap_or_else(|error| {
@@ -3170,6 +3223,7 @@ fn run_implement_worker(
         events_fd,
         clock,
         run_id,
+        caps,
     };
     let registry = core_agent_registry();
     match run_implement_with_registry(&request, &registry, &runner_name) {
@@ -3180,6 +3234,36 @@ fn run_implement_worker(
         Err(error) => {
             eprintln!("{error}");
             std::process::exit(error.code);
+        }
+    }
+}
+
+/// The caps an implementer runs with: what dispatch passed, else the defaults.
+fn implementer_run_caps(wall_seconds: Option<u64>, idle_seconds: Option<u64>) -> ResolvedRunCaps {
+    let defaults = ResolvedRunCaps::implementer_default();
+    ResolvedRunCaps {
+        wall_seconds: wall_seconds
+            .filter(|seconds| *seconds > 0)
+            .unwrap_or(defaults.wall_seconds),
+        wall_declared: wall_seconds.is_some(),
+        idle_seconds: idle_seconds.filter(|seconds| *seconds > 0),
+    }
+}
+
+/// `defaults.implementer_ceilings` from the current composed version, digest
+/// checked (#619). With no current version the constants apply; a current
+/// version that exists but cannot be trusted refuses dispatch rather than
+/// silently running an implementer without the caps its operator declared.
+fn dispatch_implementer_caps(paths: &OstromPaths) -> ResolvedRunCaps {
+    match policy_version::load_current(paths) {
+        Ok(current) => current.manifest.defaults.implementer_ceilings.run_caps(),
+        Err(policy_version::CurrentPolicyError::Inconclusive {
+            cause: "current_missing",
+            ..
+        }) => ResolvedRunCaps::implementer_default(),
+        Err(error) => {
+            eprintln!("ostrom dispatch: {error}");
+            std::process::exit(2);
         }
     }
 }
@@ -3197,11 +3281,14 @@ fn run_dispatch_command(arguments: Vec<String>, clock: Clock) -> ! {
         || working_directory.join("crates/ostrom-store/assets"),
         PathBuf::from,
     );
+    let paths = compatible_command_paths();
+    let implementer_caps = dispatch_implementer_caps(&paths);
     let request = DispatchRequest {
-        paths: compatible_command_paths(),
+        paths,
         working_directory,
         plugin_root,
         order_file: PathBuf::from(order_file),
+        implementer_caps,
         repositories: inherited_repository_scope().unwrap_or_else(|error| {
             eprintln!("ostrom dispatch: {error}");
             std::process::exit(2);

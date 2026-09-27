@@ -14,6 +14,8 @@ use ostrom_core::WorkOrder;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
+mod support;
+
 const PROXY_VARIABLES: &[(&str, &str)] = &[
     ("ALL_PROXY", "upper-all-placeholder"),
     ("HTTPS_PROXY", "upper-secure-placeholder"),
@@ -891,6 +893,315 @@ fn ps_json_lists_a_legacy_dispatch_row_until_its_terminal_row() {
     .expect("append the legacy terminal row");
     let closed = ps_json(state);
     assert!(closed.is_empty(), "{closed:?}");
+}
+
+/// #619 change 1: an implementer runs under the wall cap its operator
+/// declared in `defaults.implementer_ceilings`, read by dispatch from the
+/// current composed version. A Codex stub that never finishes is stopped by
+/// the implementer's own watchdog at that cap, the terminal row says
+/// `wall-cap`, and the unit carries the cap plus the termination grace as its
+/// outer bound.
+#[test]
+fn an_implementer_past_its_declared_wall_cap_is_stopped_and_says_why() {
+    let fixture = DispatchFixture::new(false);
+    let (_codex_environment, credential) = runnable_implementer(&fixture);
+    let codex_pid = fixture.root.path().join("codex.pid");
+    executable(
+        &fixture.codex,
+        &format!(
+            "if [ \"${{1:-}}\" = --version ]; then exit 0; fi\nprintf '%s\\n' \"$$\" >'{}'\nexec sleep 60",
+            codex_pid.display()
+        ),
+    );
+    compose_current(
+        &fixture.state,
+        "manifest_version: 1\ndefaults:\n  implementer_ceilings: {wall: 2s}\n",
+    );
+    let unit_arguments = fixture.root.path().join("unit-arguments");
+    let systemd_run = fixture.root.path().join("systemd-run-records-and-executes");
+    executable(
+        &systemd_run,
+        concat!(
+            "printf '%s\\n' \"$@\" >\"$FAKE_UNIT_ARGUMENTS\"\n",
+            "while [ \"$#\" -gt 0 ]; do\n",
+            "  case \"$1\" in\n",
+            "    --setenv) export \"$2\"; shift 2 ;;\n",
+            "    --unit|--description|--property) shift 2 ;;\n",
+            "    --*) shift ;;\n",
+            "    *) break ;;\n",
+            "  esac\n",
+            "done\n",
+            "\"$@\" >>\"$FAKE_IMPLEMENTER_LOG\" 2>&1 || true"
+        ),
+    );
+    let implementer_log = fixture.root.path().join("implementer.log");
+
+    let started = Instant::now();
+    let output = fixture
+        .dispatch(false)
+        .env("MANDATE_GH_AS_BIN", &credential)
+        .env("MANDATE_SYSTEMD_RUN_BIN", &systemd_run)
+        .env("FAKE_UNIT_ARGUMENTS", &unit_arguments)
+        .env("FAKE_IMPLEMENTER_LOG", &implementer_log)
+        .output()
+        .expect("dispatch an implementer that never finishes");
+    let elapsed = started.elapsed();
+
+    let log = fs::read_to_string(&implementer_log).unwrap_or_default();
+    let trace = trace(&fixture.state);
+    let dispatched = trace
+        .iter()
+        .find(|row| row["kind"] == "work-dispatched")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let order_id = dispatched["fact"]["order_id"].clone();
+    let terminal = trace
+        .iter()
+        .find(|row| {
+            matches!(row["kind"].as_str(), Some("work-completed" | "work-failed"))
+                && row["fact"]["order_id"] == order_id
+        })
+        .cloned()
+        .unwrap_or(Value::Null);
+    let run_started = run_started_events(&fixture.state)
+        .into_iter()
+        .find(|event| event["payload"]["workOrder"] == order_id)
+        .unwrap_or(Value::Null);
+    let codex = fs::read_to_string(&codex_pid)
+        .ok()
+        .and_then(|pid| pid.trim().parse::<u32>().ok());
+    let unit = fs::read_to_string(&unit_arguments).unwrap_or_default();
+    assert_eq!(
+        json!({
+            "dispatched": output.status.success(),
+            "work_dispatched_wall_seconds": dispatched["fact"]["wall_seconds"],
+            "run_started_wall_ms": run_started["payload"]["ceilings"]["wallMs"],
+            "terminal_kind": terminal["kind"],
+            "terminal_reason": terminal["fact"]["reason"],
+            "codex_started": codex.is_some(),
+            "codex_still_running": codex.is_some_and(pid_alive),
+            "stopped_long_before_codex_would_exit": elapsed < Duration::from_secs(30),
+            "unit_outer_bound": unit.lines().any(|line| line == "RuntimeMaxSec=7"),
+        }),
+        json!({
+            "dispatched": true,
+            "work_dispatched_wall_seconds": 2,
+            "run_started_wall_ms": 2000,
+            "terminal_kind": "work-failed",
+            "terminal_reason": "wall-cap",
+            "codex_started": true,
+            "codex_still_running": false,
+            "stopped_long_before_codex_would_exit": true,
+            "unit_outer_bound": true,
+        }),
+        "dispatch stderr: {}\nimplementer log: {log}\nunit arguments: {unit}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// #619 change 2: a hold whose process is alive but silent past its idle cap
+/// is reaped by the next `ostrom dispatch` before that dispatch counts
+/// in-flight holds. The process is gone, its lease is released, its
+/// `work-failed` says `stalled` and charges the order's cost ceiling, and a
+/// second dispatch of the same item proceeds instead of being refused.
+#[test]
+fn a_live_silent_hold_is_reaped_by_dispatch_before_the_concurrency_count() {
+    let fixture = DispatchFixture::new(false);
+    compose_current(
+        &fixture.state,
+        "manifest_version: 1\ndefaults:\n  implementer_ceilings: {idle: 1s}\n",
+    );
+    let worker = fixture.root.path().join("silent-implementer-stub");
+    executable(&worker, "exec sleep 60");
+    let process_dispatch = || {
+        fixture
+            .dispatch(false)
+            .env("MANDATE_DISPATCH_BACKEND", "process")
+            .env("MANDATE_OSTROM_BIN", &worker)
+            .env("MANDATE_IMPLEMENTER_STARTUP_GRACE_MILLISECONDS", "100")
+            .output()
+            .expect("dispatch through the process backend")
+    };
+    let first_order: Value =
+        serde_json::from_slice(&fs::read(&fixture.order_file).expect("read order"))
+            .expect("order JSON");
+    let first = process_dispatch();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_pid = process_lease(&fixture)["pid"].as_u64().expect("lease pid") as u32;
+    let _first_guard = KillProcessGroup(first_pid);
+    // Past the one-second idle cap at second precision.
+    thread::sleep(Duration::from_secs(3));
+
+    // A new order for the same item, as the next pass would write.
+    let mut second_order = first_order.clone();
+    second_order["order_id"] =
+        json!("1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+    fs::write(&fixture.order_file, format!("{second_order}\n")).expect("write second order");
+    let second = process_dispatch();
+    let second_pid = fs::read(
+        fixture
+            .state
+            .join(format!("implementer-item-{}.lease", fixture.item_hash)),
+    )
+    .ok()
+    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+    .and_then(|lease| lease["pid"].as_u64())
+    .map(|pid| pid as u32);
+    let _second_guard = second_pid.map(KillProcessGroup);
+    wait_until(Duration::from_secs(15), || !pid_alive(first_pid));
+
+    let trace = trace(&fixture.state);
+    let row = |kind: &str, order: &Value| {
+        trace
+            .iter()
+            .find(|row| row["kind"] == kind && row["fact"]["order_id"] == *order)
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    let first_dispatched = row("work-dispatched", &first_order["order_id"]);
+    let reaped = row("work-failed", &first_order["order_id"]);
+    assert_eq!(
+        json!({
+            "second_dispatch_succeeded": second.status.success(),
+            "first_process_running": pid_alive(first_pid),
+            "reason": reaped["fact"]["reason"],
+            "run_id_matches_the_hold": reaped["fact"]["run_id"] == first_dispatched["fact"]["run_id"],
+            "cost_usd_is_the_ceiling": reaped["fact"]["cost_usd"].as_f64()
+                == first_dispatched["fact"]["cost_ceiling_usd"].as_f64(),
+            "cost_usd_is_a_number": reaped["fact"]["cost_usd"].is_number(),
+            "names_its_last_progress": reaped["fact"]["last_progress_at"].is_string(),
+            "stalled_past_the_cap": reaped["fact"]["stalled_seconds"]
+                .as_u64()
+                .is_some_and(|seconds| seconds > 1),
+            "lease_names_a_new_process": second_pid.is_some_and(|pid| pid != first_pid),
+            "second_order_dispatched": !row("work-dispatched", &second_order["order_id"]).is_null(),
+        }),
+        json!({
+            "second_dispatch_succeeded": true,
+            "first_process_running": false,
+            "reason": "stalled",
+            "run_id_matches_the_hold": true,
+            "cost_usd_is_the_ceiling": true,
+            "cost_usd_is_a_number": true,
+            "names_its_last_progress": true,
+            "stalled_past_the_cap": true,
+            "lease_names_a_new_process": true,
+            "second_order_dispatched": true,
+        }),
+        "second dispatch stderr: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+}
+
+/// #619: the stall reaper writes an order's `work-failed` before it signals
+/// the implementer. The implementer, stopping on that signal, must not add a
+/// second terminal row for the same order.
+#[test]
+fn an_implementer_whose_order_the_reaper_already_closed_writes_no_second_terminal_row() {
+    let fixture = DispatchFixture::new(false);
+    let (_codex_environment, credential) = runnable_implementer(&fixture);
+    let codex_pid = fixture.root.path().join("codex.pid");
+    executable(
+        &fixture.codex,
+        &format!(
+            "if [ \"${{1:-}}\" = --version ]; then exit 0; fi\nprintf '%s\\n' \"$$\" >'{}'\nexec sleep 60",
+            codex_pid.display()
+        ),
+    );
+    let unit = "ostrom-implementer-reaped";
+    fs::write(
+        fixture
+            .state
+            .join(format!("implementer-item-{}.lease", fixture.item_hash)),
+        format!("{{\"owner\":\"{unit}\",\"started_at\":1,\"expires_at\":9999999999}}\n"),
+    )
+    .expect("write the implementer lease");
+    let order_id = WorkOrder::from_json(&fs::read(&fixture.order_file).expect("read order"))
+        .expect("valid work order")
+        .order_id;
+    let implementer = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .arg("implement")
+        .arg(&fixture.order_file)
+        .arg(unit)
+        .current_dir(fixture.root.path())
+        .env_clear()
+        .env("OSTROM_HOME", &fixture.state)
+        .env("HOME", &fixture.home)
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("OSTROM_PLUGIN_ROOT", plugin_root())
+        .env("MANDATE_IMPLEMENTER_SOURCE_REPO", &fixture.source)
+        .env("MANDATE_GH_AS_BIN", &credential)
+        .env("CODEX_BIN", &fixture.codex)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start the implementer");
+    let implementer_pid = implementer.id();
+    let mut implementer = implementer;
+    wait_until(Duration::from_secs(30), || {
+        fs::read_to_string(&codex_pid).is_ok_and(|pid| !pid.trim().is_empty())
+    });
+    let run_id = run_started_events(&fixture.state)
+        .into_iter()
+        .find(|event| event["payload"]["workOrder"] == order_id.as_str())
+        .map(|event| event["runId"].clone())
+        .expect("the implementer's run.started");
+    let reaped = json!({
+        "ts": "2026-08-01T00:00:00Z",
+        "kind": "work-failed",
+        "fact": {
+            "schema_version": 1,
+            "item_id": "placeholder-org/alpha#7",
+            "order_id": order_id,
+            "unit_name": unit,
+            "run_id": run_id,
+            "reason": "stalled",
+            "cost_usd": 20.0,
+            "reaped": true,
+        },
+        "narration": {},
+    });
+    let mut appended = fs::read_to_string(fixture.state.join("sprint.jsonl")).unwrap_or_default();
+    appended.push_str(&format!("{reaped}\n"));
+    fs::write(fixture.state.join("sprint.jsonl"), appended).expect("record the reaper's row");
+    kill_pid(implementer_pid, "TERM");
+    let _ = implementer.wait();
+
+    let terminal = trace(&fixture.state)
+        .into_iter()
+        .filter(|row| {
+            matches!(row["kind"].as_str(), Some("work-completed" | "work-failed"))
+                && row["fact"]["order_id"] == order_id.as_str()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(terminal.len(), 1, "{terminal:?}");
+    assert_eq!(terminal[0]["fact"]["reason"], "stalled");
+}
+
+/// Compose `manifest` as this state root's current policy version, signed as
+/// the operator's, the way `ostrom compose` installs one.
+fn compose_current(state: &Path, manifest: &str) {
+    let path = state.join("ostrom.yaml");
+    fs::write(&path, manifest).expect("write operator manifest");
+    let trusted_keys = support::sign_manifest(&path);
+    let output = Command::new(env!("CARGO_BIN_EXE_ostrom"))
+        .current_dir(state)
+        .env("OSTROM_HOME", state)
+        .env("OSTROM_POLICY_TRUSTED_KEYS", trusted_keys)
+        .env_remove("OSTROM_POLICY_MANIFEST")
+        .arg("compose")
+        .arg(&path)
+        .output()
+        .expect("compose the current policy version");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// Make the fixture's implementer able to reach its harness: a source clone to

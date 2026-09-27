@@ -561,6 +561,34 @@ fn compose_scopes(
     if repository.defaults.r#loop.tokens.is_none() {
         repository.defaults.r#loop.tokens = operator.defaults.r#loop.tokens;
     }
+    if repository.defaults.r#loop.wall.is_none() {
+        repository
+            .defaults
+            .r#loop
+            .wall
+            .clone_from(&operator.defaults.r#loop.wall);
+    }
+    if repository.defaults.r#loop.idle.is_none() {
+        repository
+            .defaults
+            .r#loop
+            .idle
+            .clone_from(&operator.defaults.r#loop.idle);
+    }
+    if repository.defaults.implementer_ceilings.wall.is_none() {
+        repository
+            .defaults
+            .implementer_ceilings
+            .wall
+            .clone_from(&operator.defaults.implementer_ceilings.wall);
+    }
+    if repository.defaults.implementer_ceilings.idle.is_none() {
+        repository
+            .defaults
+            .implementer_ceilings
+            .idle
+            .clone_from(&operator.defaults.implementer_ceilings.idle);
+    }
 
     merge_fallback(&mut repository.inputs, operator.inputs.clone());
     merge_fallback(&mut repository.actors, operator.actors.clone());

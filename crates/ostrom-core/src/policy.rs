@@ -12,6 +12,9 @@ use crate::{
     check::{CHECK_ACTIONS, CheckDefinition, InconclusivePolicy, validate_check_definitions},
     domain::RepositoryName,
     operation::{OperationActionError, validate_operation},
+    run_caps::{
+        CapDuration, DEFAULT_IMPLEMENTER_WALL_SECONDS, DEFAULT_PASS_WALL_SECONDS, ResolvedRunCaps,
+    },
 };
 
 pub const POLICY_MANIFEST_VERSION: u32 = 1;
@@ -409,6 +412,17 @@ impl PolicyManifest {
                 spend_usd: declaration.spend_usd.or(self.defaults.r#loop.spend_usd),
                 tokens: declaration.tokens.or(self.defaults.r#loop.tokens),
             },
+            run_caps: ResolvedRunCaps::resolve(
+                declaration
+                    .wall
+                    .as_ref()
+                    .or(self.defaults.r#loop.wall.as_ref()),
+                declaration
+                    .idle
+                    .as_ref()
+                    .or(self.defaults.r#loop.idle.as_ref()),
+                DEFAULT_PASS_WALL_SECONDS,
+            ),
             publish: declaration.publish.clone(),
             cadence_hours: declaration.cadence_hours,
             stuck_after_days: declaration.stuck_after_days,
@@ -878,6 +892,12 @@ pub struct LoopDecl {
     pub spend_usd: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens: Option<u64>,
+    /// The wall cap of each run of this loop (#619).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall: Option<CapDuration>,
+    /// The idle cap of each run of this loop (#619).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle: Option<CapDuration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publish: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -911,6 +931,10 @@ impl<'de> Deserialize<'de> for LoopDecl {
             #[serde(default)]
             tokens: Option<u64>,
             #[serde(default)]
+            wall: Option<CapDuration>,
+            #[serde(default)]
+            idle: Option<CapDuration>,
+            #[serde(default)]
             publish: Option<String>,
             #[serde(default)]
             cadence_hours: Option<u64>,
@@ -928,6 +952,8 @@ impl<'de> Deserialize<'de> for LoopDecl {
             concurrent: authored.concurrent,
             spend_usd: authored.spend_usd,
             tokens: authored.tokens,
+            wall: authored.wall,
+            idle: authored.idle,
             publish: authored.publish,
             cadence_hours: authored.cadence_hours,
             stuck_after_days: authored.stuck_after_days,
@@ -1107,6 +1133,8 @@ pub struct ResolvedLoop {
     pub parameters: BTreeMap<String, Value>,
     pub every: LoopCadence,
     pub ceilings: ResolvedLoopCeilings,
+    /// The wall and idle caps each run of this loop is started with.
+    pub run_caps: ResolvedRunCaps,
     pub publish: Option<String>,
     pub cadence_hours: Option<u64>,
     pub stuck_after_days: Option<u64>,
@@ -1238,6 +1266,8 @@ pub struct ManifestDefaults {
     pub stalls_after: StallDuration,
     #[serde(default, skip_serializing_if = "LoopDefaults::is_empty")]
     pub r#loop: LoopDefaults,
+    #[serde(default, skip_serializing_if = "ImplementerCeilings::is_empty")]
+    pub implementer_ceilings: ImplementerCeilings,
     #[serde(default, skip_serializing_if = "CheckDefaults::is_empty")]
     pub check: CheckDefaults,
     #[serde(default, skip_serializing_if = "RuleDefaults::is_grant_default")]
@@ -1254,6 +1284,7 @@ impl Default for ManifestDefaults {
         Self {
             stalls_after: default_stalls_after(),
             r#loop: LoopDefaults::default(),
+            implementer_ceilings: ImplementerCeilings::default(),
             check: CheckDefaults::default(),
             grant: RuleDefaults::default(),
             deny: RuleDefaults::deny(),
@@ -1265,6 +1296,7 @@ impl ManifestDefaults {
     fn is_empty(&self) -> bool {
         is_default_stalls_after(&self.stalls_after)
             && self.r#loop.is_empty()
+            && self.implementer_ceilings.is_empty()
             && self.check.is_empty()
             && self.grant.is_grant_default()
             && self.deny.is_deny_default()
@@ -1385,11 +1417,56 @@ pub struct LoopDefaults {
     pub spend_usd: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall: Option<CapDuration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle: Option<CapDuration>,
 }
 
 impl LoopDefaults {
     fn is_empty(&self) -> bool {
-        self.concurrent.is_none() && self.spend_usd.is_none() && self.tokens.is_none()
+        self.concurrent.is_none()
+            && self.spend_usd.is_none()
+            && self.tokens.is_none()
+            && self.wall.is_none()
+            && self.idle.is_none()
+    }
+
+    /// The caps of a pass bound to no loop: these defaults, else the constants.
+    #[must_use]
+    pub fn run_caps(&self) -> ResolvedRunCaps {
+        ResolvedRunCaps::resolve(
+            self.wall.as_ref(),
+            self.idle.as_ref(),
+            DEFAULT_PASS_WALL_SECONDS,
+        )
+    }
+}
+
+/// `defaults.implementer_ceilings`: the wall and idle caps of every
+/// implementer run (#619). Named so it cannot collide with a runner list.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImplementerCeilings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall: Option<CapDuration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle: Option<CapDuration>,
+}
+
+impl ImplementerCeilings {
+    fn is_empty(&self) -> bool {
+        self.wall.is_none() && self.idle.is_none()
+    }
+
+    /// These declarations, else the implementer constants.
+    #[must_use]
+    pub fn run_caps(&self) -> ResolvedRunCaps {
+        ResolvedRunCaps::resolve(
+            self.wall.as_ref(),
+            self.idle.as_ref(),
+            DEFAULT_IMPLEMENTER_WALL_SECONDS,
+        )
     }
 }
 
