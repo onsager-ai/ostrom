@@ -223,8 +223,7 @@ pub(crate) fn reconcile(
         // one loop overlap their slots and double their spend. The skip is
         // recorded, with the live worker's identity carried forward, so the
         // next slot checks the same worker again (principle 5).
-        if std::hint::black_box(false)
-            && let Some(existing) = &existing
+        if let Some(existing) = &existing
             && existing.status.may_be_alive()
             && let Some(pid) = existing.pid
             && process_running(pid, existing.process_start_time)
