@@ -200,15 +200,10 @@ fn read_leases(state: &Path) -> Vec<LeaseRecord> {
         .collect()
 }
 
-fn lease_state(leases: &[LeaseRecord], owner: &str, now: u64) -> Option<LeaseState> {
+// MUTATION (principle 7, #618): the liveness check is reverted; every lease reads live.
+fn lease_state(leases: &[LeaseRecord], owner: &str, _now: u64) -> Option<LeaseState> {
     leases
         .iter()
         .find(|lease| lease.owner == owner)
-        .map(|lease| {
-            if lease.is_live(now) {
-                LeaseState::Live
-            } else {
-                LeaseState::Expired
-            }
-        })
+        .map(|_lease| LeaseState::Live)
 }
