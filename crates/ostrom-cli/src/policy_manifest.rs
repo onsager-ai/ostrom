@@ -509,10 +509,6 @@ fn repository_root(cwd: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-fn repository_name(cwd: &Path) -> PathBuf {
-    repository_root(cwd).unwrap_or_else(|| cwd.to_path_buf())
-}
-
 fn warn_legacy_manifest(path: &Path) {
     static NOTICE: Once = Once::new();
     NOTICE.call_once(|| {
@@ -1400,7 +1396,6 @@ pub(crate) enum PolicyLoadError {
 mod tests {
     use std::{env, fs, path::Path, process::Command};
 
-    use ostrom_core::PolicyManifest;
     use tempfile::tempdir;
 
     use super::{
