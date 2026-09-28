@@ -954,6 +954,7 @@ impl<'de> Deserialize<'de> for LoopDecl {
             idle: Option<CapDuration>,
             #[serde(default)]
             implementers: Vec<ImplementerDecl>,
+            #[serde(default)]
             admission: AdmissionLimits,
             #[serde(default)]
             publish: Option<String>,
