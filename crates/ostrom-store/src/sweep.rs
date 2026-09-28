@@ -130,6 +130,12 @@ pub enum SweepError {
     },
     #[error(transparent)]
     AppToken(#[from] AppTokenError),
+    /// A branch or pull-request head-branch read hit its query limit before
+    /// finishing. It cannot prove what a complete read would have shown, so
+    /// it refuses only the repository it was reading — propagated through
+    /// `acquire_repositories_independently` into a per-repository fault, not
+    /// a whole-sweep abort. See `fetch_branches` and
+    /// `fetch_pull_request_heads_with`.
     #[error("{0}")]
     BranchListingTruncated(String),
     #[error("sweep fixture is malformed: {0}")]
@@ -1593,9 +1599,6 @@ fn acquire_by_organization(
             .map_err(|error| SweepError::Acquisition(error.to_string()))?;
         if !output.status.success() {
             let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            if output.status.code() == Some(6) {
-                return Err(SweepError::BranchListingTruncated(detail));
-            }
             faults.push(format!(
                 "authentication or GitHub query failed for organization {org}{}",
                 if detail.is_empty() {
@@ -2092,7 +2095,7 @@ fn fetch_branches(repo: &str) -> Result<Vec<Value>, SweepError> {
         }
     }
     Err(SweepError::BranchListingTruncated(format!(
-        "branch query for {repo} reached query_limit {QUERY_LIMIT}; refusing a truncated sweep"
+        "branch query for {repo} reached query_limit {QUERY_LIMIT}; refusing this repository's acquisition"
     )))
 }
 
@@ -2130,7 +2133,7 @@ fn fetch_pull_request_heads_with(
     })?;
     if heads.len() >= PULL_REQUEST_HEAD_BRANCH_LIMIT {
         return Err(SweepError::BranchListingTruncated(format!(
-            "pull-request head-branch query for {repo} reached query_limit {PULL_REQUEST_HEAD_BRANCH_LIMIT}; refusing a truncated sweep"
+            "pull-request head-branch query for {repo} reached query_limit {PULL_REQUEST_HEAD_BRANCH_LIMIT}; refusing this repository's acquisition"
         )));
     }
     Ok(heads)
@@ -7460,6 +7463,48 @@ denies:
         assert_eq!(faults.len(), 1);
         assert!(faults[0].contains("placeholder-org/alpha"));
         assert!(faults[0].contains("placeholder repository query failed"));
+    }
+
+    #[test]
+    fn a_truncated_repository_faults_alone_and_does_not_abort_the_sweep() {
+        // #579: `BranchListingTruncated` refuses only the repository it was
+        // reading. It must land in `acquire_repositories_independently` like
+        // any other per-repository error — one fault, one surviving
+        // snapshot — not abort the whole sweep the way the retired exit-6
+        // handling once claimed.
+        let repositories = vec![
+            RepositoryName::new("placeholder-org/alpha").expect("valid alpha repository"),
+            RepositoryName::new("placeholder-org/beta").expect("valid beta repository"),
+        ];
+        let (snapshots, faults) = acquire_repositories_independently(repositories, |repo| {
+            if repo.as_str().ends_with("/alpha") {
+                return Err(SweepError::BranchListingTruncated(format!(
+                    "branch query for {} reached query_limit 2; refusing this repository's acquisition",
+                    repo.as_str()
+                )));
+            }
+            serde_json::from_value(json!({
+                "repo": repo.as_str(),
+                "issues": [],
+                "open_prs": [],
+                "merged_prs": [],
+                "default_branch": "main",
+                "branches": [],
+                "branch_read_degraded": false,
+                "ci_runs": [],
+            }))
+            .map_err(|error| SweepError::Fixture(error.to_string()))
+        });
+
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].repo.as_str(), "placeholder-org/beta");
+        assert_eq!(faults.len(), 1);
+        assert!(faults[0].contains("placeholder-org/alpha"));
+        assert!(
+            faults[0].contains("refusing this repository's acquisition"),
+            "the fault must name the truncation, not swallow it: {}",
+            faults[0]
+        );
     }
 
     // --- #562: a pushed branch explained by a pull request, not a work order ---
