@@ -637,6 +637,9 @@ fn loop_unit_declaration(resolved: &ResolvedLoop) -> LoopUnitDeclaration {
         // writes a real terminal row; systemd is the outer bound (#619, #637).
         // Undeclared, the wall is the pass wall default.
         timeout_start_seconds: resolved.run_caps.loop_unit_timeout_seconds(),
+        unit_resources: ostrom_store::umwelt_edge::run_unit_resource_limits(
+            &resolved.admission.unit,
+        ),
     }
 }
 

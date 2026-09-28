@@ -7,12 +7,16 @@ use std::{
 };
 
 use chrono::Local;
-use ostrom_core::{PolicyManifest, ResolvedLoopCeilings, ResolvedRunCaps, render_seconds};
+use ostrom_core::{
+    AdmissionDecision, PolicyManifest, ResolvedLoopCeilings, ResolvedRunCaps, render_seconds,
+};
 use ostrom_store::{
-    Clock, HoldProgress, LeaseState, OstromPaths, environment, hold_progress, process_running,
-    process_start_time, read_trace, reap_stalled_holds,
+    Clock, HoldProgress, LeaseState, OstromPaths, TraceAppend, append_trace, environment,
+    hold_progress, process_running, process_start_time, read_trace, reap_stalled_holds,
+    umwelt_edge,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, json};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
@@ -39,6 +43,12 @@ enum LoopStatus {
     /// running, so it was recorded and not launched (#619).
     #[serde(rename = "skipped:previous-live")]
     SkippedPreviousLive,
+    /// The machine could not take this launch: an over-limit or unreadable
+    /// admission reading held it for this attempt (#628). Nothing started,
+    /// so unlike `Stopped` this is retried on the very next reconciliation
+    /// rather than waiting for the next scheduled slot.
+    #[serde(rename = "admission-held")]
+    AdmissionHeld,
 }
 
 impl LoopStatus {
@@ -52,7 +62,17 @@ impl LoopStatus {
             Self::Stale => "stale:slot_age_exceeded",
             Self::Inconclusive => "inconclusive",
             Self::SkippedPreviousLive => "skipped:previous-live",
+            Self::AdmissionHeld => "admission-held",
         }
+    }
+
+    /// A record whose slot is retried on the very next reconciliation,
+    /// rather than treated as this slot's settled outcome. `Inconclusive` is
+    /// the existing member of this set (#619); `AdmissionHeld` joins it
+    /// because nothing started and the machine may cool within minutes,
+    /// long before the loop's own cadence would otherwise check again.
+    const fn retried_every_tick(self) -> bool {
+        matches!(self, Self::Inconclusive | Self::AdmissionHeld)
     }
 
     /// A skip record carries the still-running worker's pid, so it may be
@@ -124,6 +144,8 @@ pub(crate) struct UpSummary {
     pub stale: usize,
     pub skipped: usize,
     pub reaped: usize,
+    /// A launch the machine could not take for this attempt (#628).
+    pub admission_held: usize,
 }
 
 #[derive(Debug, Error)]
@@ -216,7 +238,7 @@ pub(crate) fn reconcile(
         if let Some(existing) = &existing
             && existing.version == current.digest
             && existing.schedule_slot == slot.identity
-            && existing.status != LoopStatus::Inconclusive
+            && !existing.status.retried_every_tick()
         {
             summary.unchanged += 1;
             continue;
@@ -285,6 +307,56 @@ pub(crate) fn reconcile(
             )?;
             summary.stopped += 1;
             continue;
+        }
+        // Resource admission (#628): held for this attempt only, so a
+        // machine that cools within minutes is retried on the very next
+        // reconciliation rather than waiting for the loop's own cadence.
+        // Undeclared limits (`is_empty`) skip the read entirely.
+        if !resolved.admission.is_empty() {
+            let (sys_root, proc_root) = umwelt_edge::admission_roots();
+            let reading = umwelt_edge::read_admission_reading(&sys_root, &proc_root);
+            if let AdmissionDecision::Held {
+                reason,
+                metric,
+                limit,
+                reading: value,
+                detail,
+            } = resolved.admission.decide(&reading)
+            {
+                let reason_text = format!(
+                    "{} ({metric}) limit={limit} reading={}{}",
+                    reason.as_str(),
+                    value.map_or_else(|| "unreadable".to_owned(), |value| value.to_string()),
+                    if detail.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" detail={detail}")
+                    }
+                );
+                let mut state =
+                    LoopRunState::starting(name, &current.digest, &slot.identity, clock);
+                state.status = LoopStatus::AdmissionHeld;
+                state.finished_at = Some(clock.timestamp());
+                state.reason = Some(reason_text.clone());
+                write_state(paths, &state)?;
+                append_log(
+                    paths,
+                    name,
+                    &format!("{} admission-held: {reason_text}\n", clock.timestamp()),
+                )?;
+                append_admission_held_fact(
+                    paths,
+                    clock,
+                    name,
+                    reason.as_str(),
+                    metric,
+                    limit,
+                    value,
+                    &detail,
+                )?;
+                summary.admission_held += 1;
+                continue;
+            }
         }
         launch_worker(
             paths,
@@ -648,6 +720,43 @@ fn write_state(paths: &OstromPaths, state: &LoopRunState) -> Result<(), LoopSupe
             source: error.error,
         })?;
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_admission_held_fact(
+    paths: &OstromPaths,
+    clock: &Clock,
+    loop_name: &str,
+    reason: &str,
+    metric: &str,
+    limit: f64,
+    reading: Option<f64>,
+    detail: &str,
+) -> Result<(), LoopSupervisorError> {
+    let mut fact = Map::new();
+    fact.insert("schema_version".to_owned(), json!(1));
+    fact.insert("loop".to_owned(), json!(loop_name));
+    fact.insert("reason".to_owned(), json!(reason));
+    fact.insert("metric".to_owned(), json!(metric));
+    fact.insert("limit".to_owned(), json!(limit));
+    fact.insert("reading".to_owned(), json!(reading));
+    if !detail.is_empty() {
+        fact.insert("detail".to_owned(), json!(detail));
+    }
+    append_trace(
+        &paths.trace_file(),
+        &TraceAppend {
+            ts: clock.timestamp(),
+            kind: "admission-held".to_owned(),
+            fact,
+            narration: Map::new(),
+        },
+    )
+    .map(|_| ())
+    .map_err(|source| LoopSupervisorError::Unlaunchable {
+        name: loop_name.to_owned(),
+        cause: format!("could not record admission-held: {source}"),
+    })
 }
 
 fn append_log(paths: &OstromPaths, name: &str, message: &str) -> Result<(), LoopSupervisorError> {

@@ -11,6 +11,7 @@
 //! additions may land in minor releases; breaking changes require a minor
 //! version bump and migration notes.
 
+mod admission;
 mod check;
 mod decision;
 mod dispatch;
@@ -25,6 +26,9 @@ mod work_graph;
 #[cfg(feature = "conformance")]
 pub mod conformance;
 
+pub use admission::{
+    AdmissionDecision, AdmissionHoldReason, AdmissionLimits, AdmissionReading, UnitResourceLimits,
+};
 pub use check::{
     ActionDefinition, AgentParameters, CHECK_ACTIONS, CHECKS_VERSION, Catalogue,
     CatalogueEnumeration, CheckBasis, CheckContractError, CheckDefinition, CheckDocument,

@@ -601,6 +601,12 @@ fn compose_scopes(
             .runner_retry
             .clone_from(&operator.defaults.runner_retry);
     }
+    // Field by field, the same fallback `resolve_loop` gives a loop's own
+    // `admission` override against `defaults.admission` (#628).
+    repository.defaults.admission = repository
+        .defaults
+        .admission
+        .override_defaults(&operator.defaults.admission);
 
     merge_fallback(&mut repository.inputs, operator.inputs.clone());
     merge_fallback(&mut repository.actors, operator.actors.clone());

@@ -118,6 +118,23 @@ pub const HTTP_PROXY: EnvironmentVariable = variable(
     EnvironmentClass::Location,
     "not passed to the process implementer",
 );
+/// The procfs root read for load-average admission (#628): `loadavg` under
+/// `<root>/`. Injectable so a test can point it at a fixture tree instead of
+/// the real host's `/proc`.
+pub const MANDATE_ADMISSION_PROC_ROOT: EnvironmentVariable = variable(
+    "MANDATE_ADMISSION_PROC_ROOT",
+    EnvironmentClass::Location,
+    "/proc",
+);
+/// The sysfs root read for CPU temperature and online-CPU-count admission
+/// (#628): hwmon and thermal zone entries under `<root>/class/`, and CPU
+/// topology under `<root>/devices/system/cpu/`. Injectable so a test can
+/// point it at a fixture tree instead of the real host's `/sys`.
+pub const MANDATE_ADMISSION_SYS_ROOT: EnvironmentVariable = variable(
+    "MANDATE_ADMISSION_SYS_ROOT",
+    EnvironmentClass::Location,
+    "/sys",
+);
 pub const MANDATE_DAILY_CAP_USD: EnvironmentVariable = variable(
     "MANDATE_DAILY_CAP_USD",
     EnvironmentClass::Ceiling,
@@ -345,6 +362,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvironmentVariable] = &[
     HOME,
     HTTPS_PROXY,
     HTTP_PROXY,
+    MANDATE_ADMISSION_PROC_ROOT,
+    MANDATE_ADMISSION_SYS_ROOT,
     MANDATE_DAILY_CAP_USD,
     MANDATE_DISPATCH_BACKEND,
     MANDATE_GH_AS_BIN,

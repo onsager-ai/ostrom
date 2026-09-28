@@ -9,6 +9,7 @@ use serde_yaml::Value;
 use thiserror::Error;
 
 use crate::{
+    admission::AdmissionLimits,
     check::{CHECK_ACTIONS, CheckDefinition, InconclusivePolicy, validate_check_definitions},
     domain::RepositoryName,
     operation::{OperationActionError, validate_operation},
@@ -428,6 +429,9 @@ impl PolicyManifest {
                     .or(self.defaults.r#loop.idle.as_ref()),
                 DEFAULT_PASS_WALL_SECONDS,
             ),
+            admission: declaration
+                .admission
+                .override_defaults(&self.defaults.admission),
             publish: declaration.publish.clone(),
             cadence_hours: declaration.cadence_hours,
             stuck_after_days: declaration.stuck_after_days,
@@ -909,6 +913,9 @@ pub struct LoopDecl {
     /// replacing `defaults.implementers` when non-empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub implementers: Vec<ImplementerDecl>,
+    /// Overrides `defaults.admission`, field by field (#628).
+    #[serde(default, skip_serializing_if = "AdmissionLimits::is_empty")]
+    pub admission: AdmissionLimits,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publish: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -947,6 +954,7 @@ impl<'de> Deserialize<'de> for LoopDecl {
             idle: Option<CapDuration>,
             #[serde(default)]
             implementers: Vec<ImplementerDecl>,
+            admission: AdmissionLimits,
             #[serde(default)]
             publish: Option<String>,
             #[serde(default)]
@@ -968,6 +976,7 @@ impl<'de> Deserialize<'de> for LoopDecl {
             wall: authored.wall,
             idle: authored.idle,
             implementers: authored.implementers,
+            admission: authored.admission,
             publish: authored.publish,
             cadence_hours: authored.cadence_hours,
             stuck_after_days: authored.stuck_after_days,
@@ -1149,6 +1158,10 @@ pub struct ResolvedLoop {
     pub ceilings: ResolvedLoopCeilings,
     /// The wall and idle caps each run of this loop is started with.
     pub run_caps: ResolvedRunCaps,
+    /// The resource admission limits this loop's worker is launched under
+    /// (#628): the loop's own declaration, falling back field by field to
+    /// `defaults.admission`.
+    pub admission: AdmissionLimits,
     pub publish: Option<String>,
     pub cadence_hours: Option<u64>,
     pub stuck_after_days: Option<u64>,
@@ -1290,6 +1303,10 @@ pub struct ManifestDefaults {
     /// parseable reset time stays unavailable (#626). Undeclared: one hour.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runner_retry: Option<CapDuration>,
+    /// `defaults.admission`: resource limits checked before every launch
+    /// (#628), overridable per loop field by field.
+    #[serde(default, skip_serializing_if = "AdmissionLimits::is_empty")]
+    pub admission: AdmissionLimits,
     #[serde(default, skip_serializing_if = "CheckDefaults::is_empty")]
     pub check: CheckDefaults,
     #[serde(default, skip_serializing_if = "RuleDefaults::is_grant_default")]
@@ -1309,6 +1326,7 @@ impl Default for ManifestDefaults {
             implementer_ceilings: ImplementerCeilings::default(),
             implementers: Vec::new(),
             runner_retry: None,
+            admission: AdmissionLimits::default(),
             check: CheckDefaults::default(),
             grant: RuleDefaults::default(),
             deny: RuleDefaults::deny(),
@@ -1323,6 +1341,7 @@ impl ManifestDefaults {
             && self.implementer_ceilings.is_empty()
             && self.implementers.is_empty()
             && self.runner_retry.is_none()
+            && self.admission.is_empty()
             && self.check.is_empty()
             && self.grant.is_grant_default()
             && self.deny.is_deny_default()

@@ -20,7 +20,7 @@ use ostrom_checks::{
     generate_operation_settings, render_loop_units, run_doctor, run_doctor_check,
 };
 use ostrom_core::{
-    CHECK_STORE_SCHEMA_VERSION, CHECKS_VERSION, Catalogue, CatalogueEnumeration,
+    AdmissionLimits, CHECK_STORE_SCHEMA_VERSION, CHECKS_VERSION, Catalogue, CatalogueEnumeration,
     CheckContractError, CheckDefinition, CheckDocument, CheckFault, CheckRun, CheckRunId,
     CheckState, CheckVerdict, GoalsDocument, GoalsError, InconclusivePolicy, OperationAction,
     PermissionMode, PolicyManifest, RepositoryName, ResolvedCheck, ResolvedLoop,
@@ -694,14 +694,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let executable = env::current_exe()?;
             let outcome = loop_supervisor::reconcile(&paths, &clock, &executable)?;
             println!(
-                "reconciled started={} stopped={} unchanged={} stale={} not-due={} skipped={} reaped={}",
+                "reconciled started={} stopped={} unchanged={} stale={} not-due={} skipped={} reaped={} admission-held={}",
                 outcome.started,
                 outcome.stopped,
                 outcome.unchanged,
                 outcome.stale,
                 outcome.not_due,
                 outcome.skipped,
-                outcome.reaped
+                outcome.reaped,
+                outcome.admission_held
             );
         }
         Command::Ps { json } => {
@@ -3356,6 +3357,24 @@ fn dispatch_usage() -> ! {
     std::process::exit(2);
 }
 
+/// `defaults.admission` from the current composed version (#628). With no
+/// current version admission is empty (undeclared admits, principle 2); a
+/// current version that exists but cannot be trusted refuses dispatch, as
+/// `dispatch_policy` already does for caps and runners.
+fn dispatch_admission_limits(paths: &OstromPaths) -> AdmissionLimits {
+    match policy_version::load_current(paths) {
+        Ok(current) => current.manifest.defaults.admission.clone(),
+        Err(policy_version::CurrentPolicyError::Inconclusive {
+            cause: "current_missing",
+            ..
+        }) => AdmissionLimits::default(),
+        Err(error) => {
+            eprintln!("ostrom dispatch: {error}");
+            std::process::exit(2);
+        }
+    }
+}
+
 fn run_dispatch_command(arguments: Vec<String>, clock: Clock) -> ! {
     let mut runner_override = None;
     let mut positional = Vec::new();
@@ -3389,6 +3408,7 @@ fn run_dispatch_command(arguments: Vec<String>, clock: Clock) -> ! {
     );
     let paths = compatible_command_paths();
     let (implementer_caps, implementers, runner_retry_seconds) = dispatch_policy(&paths);
+    let admission_limits = dispatch_admission_limits(&paths);
     let request = DispatchRequest {
         paths,
         working_directory,
@@ -3398,6 +3418,7 @@ fn run_dispatch_command(arguments: Vec<String>, clock: Clock) -> ! {
         implementers,
         runner_override,
         runner_retry_seconds,
+        admission_limits,
         repositories: inherited_repository_scope().unwrap_or_else(|error| {
             eprintln!("ostrom dispatch: {error}");
             std::process::exit(2);

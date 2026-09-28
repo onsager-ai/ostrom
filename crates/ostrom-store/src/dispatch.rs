@@ -14,8 +14,9 @@ use std::{
 use chrono::{DateTime, SecondsFormat, Utc};
 use ethogram::DecisionKind;
 use ostrom_core::{
-    BranchListing, BranchListingFault, BranchListingOutcome, DecisionOption, Dossier,
-    ImplementerDecl, MandateConfig, RemoteBranch, ResolvedRunCaps, WorkOrder, resolve_exact_branch,
+    AdmissionDecision, AdmissionLimits, BranchListing, BranchListingFault, BranchListingOutcome,
+    DecisionOption, Dossier, ImplementerDecl, MandateConfig, RemoteBranch, ResolvedRunCaps,
+    WorkOrder, resolve_exact_branch,
 };
 use serde_json::{Map, Value, json};
 
@@ -66,6 +67,9 @@ pub struct DispatchRequest {
     pub runner_override: Option<String>,
     /// How long a runner that refused without a reset time stays unavailable.
     pub runner_retry_seconds: u64,
+    /// Resource admission limits, resolved from the current policy version's
+    /// `defaults.admission` (#628). Empty admits unconditionally.
+    pub admission_limits: AdmissionLimits,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -247,6 +251,10 @@ fn run_dispatch_with_registry_and_minter(
             .value()
             .filter(|value| !value.trim().is_empty()),
     };
+
+    // Checked before any GitHub call or worktree work, so a machine the
+    // admission limits refuse spends nothing finding that out (#628).
+    check_admission(&context)?;
 
     if request
         .repositories
@@ -2310,6 +2318,50 @@ fn append_failure_escalation(
     )
     .map(|_| ())
     .map_err(|error| DispatchError::new(1, format!("ostrom dispatch: {error}")))
+}
+
+/// Hold the launch when the machine cannot take it (#628). Undeclared limits
+/// (`admission_limits.is_empty()`) skip the read entirely, so a solo operator
+/// on a machine with no sensors pays nothing for this check. A declared
+/// limit that is over, or whose sensor could not be read, records
+/// `admission-held` and refuses this attempt without touching the lease or
+/// starting anything; the item is retried on the next dispatch.
+fn check_admission(context: &DispatchContext<'_>) -> Result<(), DispatchError> {
+    if context.request.admission_limits.is_empty() {
+        return Ok(());
+    }
+    let (sys_root, proc_root) = crate::umwelt_edge::admission_roots();
+    let reading = crate::umwelt_edge::read_admission_reading(&sys_root, &proc_root);
+    let AdmissionDecision::Held {
+        reason,
+        metric,
+        limit,
+        reading,
+        detail,
+    } = context.request.admission_limits.decide(&reading)
+    else {
+        return Ok(());
+    };
+    let mut fact = Map::new();
+    fact.insert("schema_version".to_owned(), json!(1));
+    fact.insert("item_id".to_owned(), json!(context.order.item_id));
+    fact.insert("order_id".to_owned(), json!(context.order.order_id));
+    fact.insert("reason".to_owned(), json!(reason.as_str()));
+    fact.insert("metric".to_owned(), json!(metric));
+    fact.insert("limit".to_owned(), json!(limit));
+    fact.insert("reading".to_owned(), json!(reading));
+    if !detail.is_empty() {
+        fact.insert("detail".to_owned(), json!(detail));
+    }
+    append_fact(context, "admission-held", fact)?;
+    Err(DispatchError::new(
+        3,
+        format!(
+            "ostrom dispatch: admission held for {} ({metric}): {}",
+            context.order.item_id,
+            reason.as_str()
+        ),
+    ))
 }
 
 fn append_dispatched(context: &DispatchContext<'_>) -> Result<(), DispatchError> {
