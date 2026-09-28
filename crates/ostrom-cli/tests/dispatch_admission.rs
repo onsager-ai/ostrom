@@ -144,7 +144,9 @@ impl Fixture {
     /// harness is needed to observe a successful `work-dispatched`.
     fn dispatch_through_a_stub_worker(&self) -> Command {
         let worker = self.root.path().join("implementer-worker-stub");
-        executable(&worker, "exit 0");
+        // Outlive the startup grace check below, or dispatch reads it as
+        // "exited during startup" rather than a real launch.
+        executable(&worker, "sleep 0.3\nexit 0");
         let mut command = self.dispatch();
         command
             .env("MANDATE_DISPATCH_BACKEND", "process")
