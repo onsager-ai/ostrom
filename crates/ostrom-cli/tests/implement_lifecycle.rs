@@ -762,13 +762,13 @@ fn codex_invocation_failures_are_named_and_release_the_lease() {
         (
             "quota-error",
             1,
-            "codex-unavailable",
+            "runner-unavailable",
             Some("You've hit your usage limit. Try again at 11:34 AM."),
         ),
         (
             "quota-turn-failed",
             1,
-            "codex-unavailable",
+            "runner-unavailable",
             Some("You've hit your usage limit. Try again at 12:34 PM."),
         ),
     ] {
@@ -779,8 +779,22 @@ fn codex_invocation_failures_are_named_and_release_the_lease() {
         assert!(!fixture.lease_file.exists());
         let terminal = fixture.trace().pop().expect("failure trace");
         assert_eq!(terminal["fact"]["reason"], reason);
+        let availability = fs::read(fixture.state.join("runner-availability.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
         if let Some(message) = message {
             assert_eq!(terminal["fact"]["message"], message);
+            // #626: an allowance refusal names its runner and marks it
+            // unavailable until the reset it reported.
+            assert_eq!(terminal["fact"]["runner"], "agent/codex");
+            let entry =
+                &availability.expect("runner availability recorded")["runners"]["agent/codex"];
+            assert_eq!(entry["reset_reported"], true);
+            assert_eq!(entry["message"], message);
+            assert!(entry["until"].is_string());
+        } else {
+            assert!(terminal["fact"].get("runner").is_none());
+            assert!(availability.is_none(), "{mode} is not an allowance refusal");
         }
     }
 }

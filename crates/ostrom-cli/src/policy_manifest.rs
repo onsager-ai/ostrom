@@ -589,6 +589,18 @@ fn compose_scopes(
             .idle
             .clone_from(&operator.defaults.implementer_ceilings.idle);
     }
+    if repository.defaults.implementers.is_empty() {
+        repository
+            .defaults
+            .implementers
+            .clone_from(&operator.defaults.implementers);
+    }
+    if repository.defaults.runner_retry.is_none() {
+        repository
+            .defaults
+            .runner_retry
+            .clone_from(&operator.defaults.runner_retry);
+    }
     // Field by field, the same fallback `resolve_loop` gives a loop's own
     // `admission` override against `defaults.admission` (#628).
     repository.defaults.admission = repository

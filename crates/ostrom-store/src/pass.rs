@@ -194,6 +194,8 @@ pub struct PassRequest {
     pub facts_only: bool,
     /// Present for a loop-bound pass and omitted for an unbound pass.
     pub repositories: Option<Vec<String>>,
+    /// The loop this pass is bound to, handed to its agent as `OSTROM_LOOP`.
+    pub loop_name: Option<String>,
     pub skipped_repositories: Vec<SkippedRepository>,
     /// Hard child-command scope. This is also present for an unbound pass,
     /// where it contains the available set.
@@ -1599,6 +1601,12 @@ fn run_pass_with_bridge_probe_timeout(
             repositories.join(","),
         );
     }
+    // Set or removed, never inherited: a dispatch the agent runs resolves the
+    // implementer order of this pass's loop, not an enclosing run's.
+    match &request.loop_name {
+        Some(name) => command.env(environment::OSTROM_LOOP.name, name),
+        None => command.env_remove(environment::OSTROM_LOOP.name),
+    };
     // The run id `pass-started` records. An observer reads it from
     // `/proc/<pid>/environ`, and an `ostrom dispatch` the agent runs records it
     // as `parent_run_id`. Set here, never inherited: a pass started under
@@ -3090,6 +3098,7 @@ mod platform_fallback_pass_tests {
                 control_fd: None,
                 facts_only: false,
                 repositories: None,
+                loop_name: None,
                 skipped_repositories: Vec::new(),
                 repository_scope: None,
                 sweep: None,
@@ -3412,6 +3421,7 @@ mod sweep_freshness_tests {
             control_fd: None,
             facts_only: false,
             repositories: None,
+            loop_name: None,
             skipped_repositories: Vec::new(),
             repository_scope: None,
             sweep: Some(PassSweepRequest {

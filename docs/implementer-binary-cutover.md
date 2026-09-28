@@ -26,9 +26,14 @@ descriptors that lack close-on-exec, so an operator should start the dispatcher
 without extra inheritable descriptors where possible.
 
 The builder coordinator hands the order to the named runner in the agent
-registry. `agent/codex` is the shipped default and there is no fallback. A
-process-backend environment must supply the `codex` binary and its credential;
-Ostrom does not provision credentials. `claude-cli` remains selectable. The
+registry. `agent/codex` is the shipped default. Policy may declare an ordered
+`implementers` list (for example `agent/codex`, then `agent/claude`); a runner
+that refuses on an allowance limit is marked unavailable until its reset and
+the next dispatch falls back to the next declared runner, recording
+`work-rerouted`, and when every one is unavailable the item is held with a
+decision request (see `docs/loops.md`). A process-backend environment must
+supply each declared runner's binary and its credential; Ostrom does not
+provision credentials. The
 backend also requires the `setsid` utility and Linux procfs mounted at `/proc`
 for session creation and PID-recycling-safe liveness checks. Liveness does not
 require a separate signaling utility.
@@ -50,7 +55,9 @@ For a failed launch, start with the dispatch error and the terminal row in
 `MANDATE_OSTROM_BIN` was invalid or, when the override was unset, `ostrom`
 could not be resolved on `PATH`. `codex-unavailable` means the Codex executable
 or its Node interpreter could not be resolved or executed. Neither failure
-starts an implementer.
+starts an implementer. `runner-unavailable` means the runner started and
+refused on an allowance limit; its row names the `runner`, and
+`runner-availability.json` records until when it is skipped.
 
 For the systemd backend, inspect a started unit with `systemctl --user status
 <unit-name>` and `journalctl --user-unit <unit-name>`. For the process backend,

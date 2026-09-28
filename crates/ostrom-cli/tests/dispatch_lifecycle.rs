@@ -1564,6 +1564,584 @@ fn a_reaped_implementer_whose_harness_ignores_term_leaves_no_orphan() {
     );
 }
 
+const TWO_RUNNERS: &str = concat!(
+    "manifest_version: 1\n",
+    "defaults:\n",
+    "  runner_retry: 2h\n",
+    "  implementers:\n",
+    "    - {runner: agent/codex}\n",
+    "    - {runner: agent/claude, model: claude-placeholder}\n",
+);
+
+/// A `systemd-run` stub that runs the implementer to completion in place.
+fn executing_systemd_run(fixture: &DispatchFixture) -> PathBuf {
+    let systemd_run = fixture.root.path().join("systemd-run-executes");
+    executable(
+        &systemd_run,
+        concat!(
+            "while [ \"$#\" -gt 0 ]; do\n",
+            "  case \"$1\" in\n",
+            "    --setenv) export \"$2\"; shift 2 ;;\n",
+            "    --unit|--description|--property) shift 2 ;;\n",
+            "    --*) shift ;;\n",
+            "    *) break ;;\n",
+            "  esac\n",
+            "done\n",
+            "\"$@\" >>\"$FAKE_IMPLEMENTER_LOG\" 2>&1 || true"
+        ),
+    );
+    systemd_run
+}
+
+fn write_availability(state: &Path, runners: &[(&str, &str)]) {
+    let runners = runners
+        .iter()
+        .map(|(runner, until)| {
+            (
+                (*runner).to_owned(),
+                json!({
+                    "until": until,
+                    "reset_reported": true,
+                    "reason": "usage-limit",
+                    "message": "placeholder limit",
+                    "recorded_at": "2026-09-28T00:00:00Z",
+                    "run_id": "placeholder-run",
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    fs::write(
+        state.join("runner-availability.json"),
+        json!({"schema_version": 1, "runners": runners}).to_string(),
+    )
+    .expect("write runner availability");
+}
+
+/// #626: a runner that refuses on an allowance limit ends its run with
+/// `runner-unavailable` and is marked unavailable; the next dispatch of the
+/// same item goes to the next declared runner and records `work-rerouted`.
+/// The refusal says nothing about the item, so two of them never escalate.
+#[test]
+fn a_usage_limit_reroutes_the_next_dispatch_and_never_escalates() {
+    let fixture = DispatchFixture::new(false);
+    let (_codex_environment, credential) = runnable_implementer(&fixture);
+    executable(
+        &fixture.codex,
+        r#"if [ "${1:-}" = --version ]; then exit 0; fi
+echo "{\"type\":\"error\",\"message\":\"You've hit your usage limit. Try again later.\"}"
+exit 1"#,
+    );
+    compose_current(&fixture.state, TWO_RUNNERS);
+    let implementer_log = fixture.root.path().join("implementer.log");
+    let first = fixture
+        .dispatch(false)
+        .env("MANDATE_GH_AS_BIN", &credential)
+        .env("MANDATE_SYSTEMD_RUN_BIN", executing_systemd_run(&fixture))
+        .env("FAKE_IMPLEMENTER_LOG", &implementer_log)
+        .output()
+        .expect("dispatch to a Codex out of allowance");
+    // A second refusal of the same item: two identical failures would
+    // otherwise escalate and refuse the next dispatch.
+    let mut trace_file = fs::OpenOptions::new()
+        .append(true)
+        .open(fixture.state.join("sprint.jsonl"))
+        .expect("open trace");
+    std::io::Write::write_all(
+        &mut trace_file,
+        format!(
+            "{}\n",
+            json!({
+                "ts": "2026-09-28T00:00:00Z",
+                "kind": "work-failed",
+                "fact": {
+                    "schema_version": 1,
+                    "item_id": "placeholder-org/alpha#7",
+                    "order_id": "2123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                    "reason": "runner-unavailable",
+                    "runner": "agent/codex",
+                },
+                "narration": {},
+            })
+        )
+        .as_bytes(),
+    )
+    .expect("append a second refusal");
+    let (claude, _canary_calls) = claude_canary_stub(&fixture, "DENIED");
+    let (path, _) = control_curl(&fixture, 0);
+    let second = fixture
+        .dispatch(false)
+        .env("PATH", path)
+        .env("MANDATE_GH_AS_BIN", &credential)
+        .env("CLAUDE_BIN", &claude)
+        .output()
+        .expect("dispatch the same item again");
+
+    let trace = trace(&fixture.state);
+    let refused = trace
+        .iter()
+        .find(|row| row["kind"] == "work-failed")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let rerouted = trace
+        .iter()
+        .find(|row| row["kind"] == "work-rerouted")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let last_dispatched = trace
+        .iter()
+        .rev()
+        .find(|row| row["kind"] == "work-dispatched")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let availability: Value = fs::read(fixture.state.join("runner-availability.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or(Value::Null);
+    let unit = fs::read_to_string(&fixture.systemd_args).unwrap_or_default();
+    assert_eq!(
+        json!({
+            "first_dispatched": first.status.success(),
+            "refusal_reason": refused["fact"]["reason"],
+            "refusal_runner": refused["fact"]["runner"],
+            "codex_reset_reported": availability["runners"]["agent/codex"]["reset_reported"],
+            "second_dispatched": second.status.success(),
+            "rerouted_from": rerouted["fact"]["from"],
+            "rerouted_to": rerouted["fact"]["to"],
+            "rerouted_until_recorded": rerouted["fact"]["until"].is_string(),
+            "rerouted_item": rerouted["fact"]["item_id"],
+            "dispatched_runner": last_dispatched["fact"]["runner"],
+            "unit_runs_claude": unit.lines().any(|line| line == "agent/claude"),
+            "unit_passes_model": unit.lines().any(|line| line == "--model=claude-placeholder"),
+            "escalated": trace.iter().any(|row| row["kind"] == "dispatch-failure-escalated"),
+        }),
+        json!({
+            "first_dispatched": true,
+            "refusal_reason": "runner-unavailable",
+            "refusal_runner": "agent/codex",
+            "codex_reset_reported": false,
+            "second_dispatched": true,
+            "rerouted_from": "agent/codex",
+            "rerouted_to": "agent/claude",
+            "rerouted_until_recorded": true,
+            "rerouted_item": "placeholder-org/alpha#7",
+            "dispatched_runner": "agent/claude",
+            "unit_runs_claude": true,
+            "unit_passes_model": true,
+            "escalated": false,
+        }),
+        "first: {}\nsecond: {}\nimplementer log: {}",
+        String::from_utf8_lossy(&first.stderr),
+        String::from_utf8_lossy(&second.stderr),
+        fs::read_to_string(&implementer_log).unwrap_or_default()
+    );
+}
+
+/// #626: when every declared runner is unavailable, dispatch holds the item
+/// with a `decision.requested` naming the earliest reset and exits non-zero.
+#[test]
+fn every_runner_unavailable_is_a_decision_and_a_non_zero_exit() {
+    let fixture = DispatchFixture::new(false);
+    compose_current(&fixture.state, TWO_RUNNERS);
+    write_availability(
+        &fixture.state,
+        &[
+            ("agent/codex", "2099-01-02T00:00:00Z"),
+            ("agent/claude", "2099-01-01T00:00:00Z"),
+        ],
+    );
+    let output = fixture.dispatch(false).output().expect("dispatch");
+    let trace = trace(&fixture.state);
+    let decision = trace
+        .iter()
+        .find(|row| row["kind"] == "decision-requested")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        json!({
+            "exit": output.status.code(),
+            "decision_subject": decision["fact"]["subject"],
+            "decision_kind": decision["fact"]["kind"],
+            "names_earliest_reset": stderr.contains("agent/claude until 2099-01-01T00:00:00Z"),
+            "dispatched": trace.iter().any(|row| row["kind"] == "work-dispatched"),
+        }),
+        json!({
+            "exit": 3,
+            "decision_subject": "placeholder-org/alpha#7",
+            "decision_kind": "human_decides",
+            "names_earliest_reset": true,
+            "dispatched": false,
+        }),
+        "{stderr}"
+    );
+}
+
+/// #626: a runner whose recorded reset has passed is available again, and
+/// with no policy the order is `[agent/codex]`.
+#[test]
+fn a_reset_in_the_past_makes_the_runner_available_again() {
+    let fixture = DispatchFixture::new(false);
+    write_availability(&fixture.state, &[("agent/codex", "2000-01-01T00:00:00Z")]);
+    let output = fixture.dispatch(false).output().expect("dispatch");
+    let trace = trace(&fixture.state);
+    let dispatched = trace
+        .iter()
+        .find(|row| row["kind"] == "work-dispatched")
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(dispatched["fact"]["runner"], "agent/codex");
+    assert!(!trace.iter().any(|row| row["kind"] == "work-rerouted"));
+}
+
+/// #626: `--runner` overrides the declared order for a hand run.
+#[test]
+fn the_runner_flag_overrides_the_declared_order() {
+    let fixture = DispatchFixture::new(false);
+    compose_current(&fixture.state, TWO_RUNNERS);
+    let (claude, _canary_calls) = claude_canary_stub(&fixture, "DENIED");
+    let (path, _) = control_curl(&fixture, 0);
+    let output = fixture
+        .dispatch(false)
+        .env("PATH", path)
+        .arg("--runner")
+        .arg("agent/claude")
+        .env("CLAUDE_BIN", &claude)
+        .output()
+        .expect("dispatch with --runner");
+    let trace = trace(&fixture.state);
+    let dispatched = trace
+        .iter()
+        .find(|row| row["kind"] == "work-dispatched")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let unit = fs::read_to_string(&fixture.systemd_args).unwrap_or_default();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(dispatched["fact"]["runner"], "agent/claude");
+    assert!(unit.lines().any(|line| line == "agent/claude"), "{unit}");
+    assert!(!trace.iter().any(|row| row["kind"] == "work-rerouted"));
+}
+
+/// A Claude stub for the sandbox canary: it reports the version in
+/// `claude.version` (2.1.283 when absent), counts each session, runs "the
+/// command" in its working directory and reports the network as `network`.
+fn claude_canary_stub(fixture: &DispatchFixture, network: &str) -> (PathBuf, PathBuf) {
+    let claude = fixture.root.path().join("claude-stub");
+    let calls = fixture.root.path().join("claude.calls");
+    let version = fixture.root.path().join("claude.version");
+    executable(
+        &claude,
+        &format!(
+            concat!(
+                "if [ \"${{1:-}}\" = --version ]; then echo \"$(cat '{version}' 2>/dev/null || echo 2.1.283) (Claude Code)\"; exit 0; fi\n",
+                "printf '%s\\n' call >>'{calls}'\n",
+                "cat >/dev/null\n",
+                "touch inside.marker\n",
+                "echo '{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"tool_result\",\"tool_use_id\":\"t1\",\"content\":\"CANARY-NETWORK-{network}\"}}]}}}}'\n",
+                "echo '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"DONE\",\"total_cost_usd\":0.01}}'",
+            ),
+            version = version.display(),
+            calls = calls.display(),
+            network = network,
+        ),
+    );
+    (claude, calls)
+}
+
+/// A `curl` for the canary's unsandboxed control that exits `exit` and records
+/// the proxy variables it saw. Returns a `PATH` that finds it first.
+fn control_curl(fixture: &DispatchFixture, exit: i32) -> (String, PathBuf) {
+    let directory = fixture.root.path().join("control-bin");
+    fs::create_dir_all(&directory).expect("create control bin");
+    let seen = fixture.root.path().join("control.env");
+    executable(
+        &directory.join("curl"),
+        &format!(
+            "env | grep -i '_proxy=' >'{}' || true\necho \"curl: (5) Unsupported proxy scheme for '${{HTTPS_PROXY:-}}'\" >&2\nexit {exit}",
+            seen.display()
+        ),
+    );
+    let path = format!(
+        "{}:{}",
+        directory.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    (path, seen)
+}
+
+fn canary_calls(calls: &Path) -> usize {
+    fs::read_to_string(calls).map_or(0, |calls| calls.lines().count())
+}
+
+/// #626: Claude Code runs without a settings file it cannot read, so Claude is
+/// used only after a canary saw its sandbox deny the network. A Claude whose
+/// canary reaches the network is marked unavailable with `sandbox-unverified`
+/// and routing moves on to the next runner.
+#[test]
+fn a_claude_whose_canary_reaches_the_network_is_skipped_for_the_next_runner() {
+    let fixture = DispatchFixture::new(false);
+    compose_current(
+        &fixture.state,
+        "manifest_version: 1\ndefaults:\n  implementers: [{runner: agent/claude}, {runner: agent/codex}]\n",
+    );
+    let (claude, calls) = claude_canary_stub(&fixture, "REACHED");
+    let (path, _) = control_curl(&fixture, 0);
+    let output = fixture
+        .dispatch(false)
+        .env("PATH", path)
+        .env("CLAUDE_BIN", &claude)
+        .output()
+        .expect("dispatch");
+    let trace = trace(&fixture.state);
+    let row = |kind: &str| {
+        trace
+            .iter()
+            .find(|row| row["kind"] == kind)
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    let availability: Value = fs::read(fixture.state.join("runner-availability.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or(Value::Null);
+    assert_eq!(
+        json!({
+            "dispatched": output.status.success(),
+            "canary_ran": canary_calls(&calls),
+            "canary_outcome": row("sandbox-checked")["fact"]["outcome"],
+            "canary_cost_recorded": row("sandbox-checked")["fact"]["cost_usd"],
+            "claude_reason": availability["runners"]["agent/claude"]["reason"],
+            "rerouted_from": row("work-rerouted")["fact"]["from"],
+            "runner": row("work-dispatched")["fact"]["runner"],
+            "pass_cached": fixture.state.join("sandbox-canary.json").exists(),
+        }),
+        json!({
+            "dispatched": true,
+            "canary_ran": 1,
+            "canary_outcome": "fail",
+            "canary_cost_recorded": 0.01,
+            "claude_reason": "sandbox-unverified",
+            "rerouted_from": "agent/claude",
+            "runner": "agent/codex",
+            "pass_cached": false,
+        }),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// #626: a denied sandboxed attempt means nothing unless ostrom itself can
+/// reach the host. An unreachable control is inconclusive: no Claude session
+/// is spent, nothing is cached, and routing moves on.
+#[test]
+fn an_unreachable_control_is_inconclusive_and_caches_nothing() {
+    let fixture = DispatchFixture::new(false);
+    compose_current(
+        &fixture.state,
+        "manifest_version: 1\ndefaults:\n  implementers: [{runner: agent/claude}, {runner: agent/codex}]\n",
+    );
+    let (claude, calls) = claude_canary_stub(&fixture, "DENIED");
+    let (path, _) = control_curl(&fixture, 7);
+    let output = fixture
+        .dispatch(false)
+        .env("PATH", path)
+        .env("CLAUDE_BIN", &claude)
+        .output()
+        .expect("dispatch");
+    let trace = trace(&fixture.state);
+    let row = |kind: &str| {
+        trace
+            .iter()
+            .find(|row| row["kind"] == kind)
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    let availability: Value = fs::read(fixture.state.join("runner-availability.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or(Value::Null);
+    assert_eq!(
+        json!({
+            "dispatched": output.status.success(),
+            "claude_sessions": canary_calls(&calls),
+            "canary_outcome": row("sandbox-checked")["fact"]["outcome"],
+            "claude_reason": availability["runners"]["agent/claude"]["reason"],
+            "runner": row("work-dispatched")["fact"]["runner"],
+            "pass_cached": fixture.state.join("sandbox-canary.json").exists(),
+        }),
+        json!({
+            "dispatched": true,
+            "claude_sessions": 0,
+            "canary_outcome": "inconclusive",
+            "claude_reason": "sandbox-inconclusive",
+            "runner": "agent/codex",
+            "pass_cached": false,
+        }),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// #626: curl echoes a malformed proxy URL verbatim on stderr, credential
+/// and all, so a failed control's record must not carry its stderr.
+#[test]
+fn a_failed_control_never_records_the_proxy_secret_curl_echoed() {
+    let fixture = DispatchFixture::new(false);
+    let (claude, _calls) = claude_canary_stub(&fixture, "DENIED");
+    let (path, _) = control_curl(&fixture, 5);
+    let output = fixture
+        .dispatch(false)
+        .env("PATH", path)
+        .env("HTTPS_PROXY", "bogus://u:s3cret@proxy.invalid")
+        .arg("--runner=agent/claude")
+        .env("CLAUDE_BIN", &claude)
+        .output()
+        .expect("dispatch");
+    let checked = trace(&fixture.state)
+        .into_iter()
+        .find(|row| row["kind"] == "sandbox-checked")
+        .unwrap_or(Value::Null);
+    let leaked = ["sprint.jsonl", "events.jsonl", "runner-availability.json"]
+        .iter()
+        .filter(|file| {
+            fs::read_to_string(fixture.state.join(file)).is_ok_and(|text| text.contains("s3cret"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        json!({
+            "outcome": checked["fact"]["outcome"],
+            "files_holding_the_secret": leaked,
+        }),
+        json!({
+            "outcome": "inconclusive",
+            "files_holding_the_secret": [],
+        }),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// #626: the control runs with the operator's proxy environment unchanged,
+/// and the `sandbox-checked` fact records those variables with any
+/// credential removed.
+#[test]
+fn the_control_sees_the_proxy_environment_and_the_record_never_holds_its_secret() {
+    let fixture = DispatchFixture::new(false);
+    let (claude, _calls) = claude_canary_stub(&fixture, "DENIED");
+    let (path, seen) = control_curl(&fixture, 0);
+    let output = fixture
+        .dispatch(false)
+        .env("PATH", path)
+        .env("HTTPS_PROXY", "http://user:s3cret@proxy.invalid:3128")
+        .env("no_proxy", "localhost,.internal.invalid")
+        .arg("--runner=agent/claude")
+        .env("CLAUDE_BIN", &claude)
+        .output()
+        .expect("dispatch");
+    let control = fs::read_to_string(&seen).unwrap_or_default();
+    let checked = trace(&fixture.state)
+        .into_iter()
+        .find(|row| row["kind"] == "sandbox-checked")
+        .unwrap_or(Value::Null);
+    let leaked = ["sprint.jsonl", "events.jsonl"].iter().any(|file| {
+        fs::read_to_string(fixture.state.join(file)).is_ok_and(|text| text.contains("s3cret"))
+    });
+    assert_eq!(
+        json!({
+            "dispatched": output.status.success(),
+            "control_saw_proxy": control
+                .lines()
+                .any(|line| line == "HTTPS_PROXY=http://user:s3cret@proxy.invalid:3128"),
+            "control_saw_no_proxy": control
+                .lines()
+                .any(|line| line == "no_proxy=localhost,.internal.invalid"),
+            "outcome": checked["fact"]["outcome"],
+            "recorded_proxy": checked["fact"]["proxy"],
+            "secret_in_a_record": leaked,
+        }),
+        json!({
+            "dispatched": true,
+            "control_saw_proxy": true,
+            "control_saw_no_proxy": true,
+            "outcome": "pass",
+            "recorded_proxy": {
+                "HTTPS_PROXY": "http://proxy.invalid:3128",
+                "no_proxy": "localhost,.internal.invalid",
+            },
+            "secret_in_a_record": false,
+        }),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// #626: a denied canary is cached per (claude version, profile hash); the
+/// same binary is not checked again, and a new version is.
+#[test]
+fn a_passing_canary_is_cached_until_the_claude_version_changes() {
+    let fixture = DispatchFixture::new(false);
+    let (claude, calls) = claude_canary_stub(&fixture, "DENIED");
+    let (path, _) = control_curl(&fixture, 0);
+    let dispatch = || {
+        fixture
+            .dispatch(false)
+            .env("PATH", &path)
+            .arg("--runner=agent/claude")
+            .env("CLAUDE_BIN", &claude)
+            .output()
+            .expect("dispatch")
+    };
+    let first = dispatch();
+    let cache: Value = fs::read(fixture.state.join("sandbox-canary.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or(Value::Null);
+    let after_first = canary_calls(&calls);
+    // The item is now held, so these dispatches are refused after the runner
+    // is chosen; only whether the canary ran again matters here.
+    let _ = dispatch();
+    let after_same_version = canary_calls(&calls);
+    fs::write(fixture.root.path().join("claude.version"), "2.1.300").expect("upgrade claude");
+    let _ = dispatch();
+    let after_upgrade = canary_calls(&calls);
+    let dispatched = trace(&fixture.state)
+        .into_iter()
+        .find(|row| row["kind"] == "work-dispatched")
+        .unwrap_or(Value::Null);
+    assert_eq!(
+        json!({
+            "first_dispatched": first.status.success(),
+            "runner": dispatched["fact"]["runner"],
+            "cached_version": cache["runners"]["agent/claude"]["version"],
+            "cached_hash_is_sha256": cache["runners"]["agent/claude"]["profile_sha256"]
+                .as_str()
+                .is_some_and(|hash| hash.len() == 64),
+            "after_first": after_first,
+            "after_same_version": after_same_version,
+            "after_upgrade": after_upgrade,
+        }),
+        json!({
+            "first_dispatched": true,
+            "runner": "agent/claude",
+            "cached_version": "2.1.283 (Claude Code)",
+            "cached_hash_is_sha256": true,
+            "after_first": 1,
+            "after_same_version": 1,
+            "after_upgrade": 2,
+        }),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+}
+
 /// Compose `manifest` as this state root's current policy version, signed as
 /// the operator's, the way `ostrom compose` installs one.
 fn compose_current(state: &Path, manifest: &str) {

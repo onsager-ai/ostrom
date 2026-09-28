@@ -11,9 +11,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+use chrono::{DateTime, SecondsFormat, Utc};
+use ethogram::DecisionKind;
 use ostrom_core::{
     AdmissionDecision, AdmissionLimits, BranchListing, BranchListingFault, BranchListingOutcome,
-    MandateConfig, RemoteBranch, ResolvedRunCaps, WorkOrder, resolve_exact_branch,
+    DecisionOption, Dossier, ImplementerDecl, MandateConfig, RemoteBranch, ResolvedRunCaps,
+    WorkOrder, resolve_exact_branch,
 };
 use serde_json::{Map, Value, json};
 
@@ -25,13 +28,15 @@ use crate::{
         ScopedAppTokenRequest, authenticated_output,
     },
     append_trace, configured_retention_days, environment, generated_run_id,
+    implement::RUNNER_UNAVAILABLE_REASON,
     lease::{ProcessIdentity, ProcessLiveness, process_identity_is_live, read_process_identity},
     load_config_or_defaults, read_lease, read_trace,
     reap::{
         WorktreeStatus, directory_bytes, gh_json_output, reclaim_worktree, remove_implementer_log,
         worktree_status,
     },
-    run_events::{DISPATCH_RUN_ID, emit_decision_requests},
+    run_events::{DISPATCH_RUN_ID, DecisionRequest, emit_decision_requests},
+    runner_availability::{read_availability, unavailable_until},
     sweep_worktrees,
     work_order::{implementer_lease_ttl, in_flight_orders, reap_stale_work_orders},
 };
@@ -55,6 +60,13 @@ pub struct DispatchRequest {
     /// The implementer's wall and idle caps, resolved from the current policy
     /// version's `defaults.implementer_ceilings` or the defaults (#619).
     pub implementer_caps: ResolvedRunCaps,
+    /// The declared implementer runner order (#626), resolved from the current
+    /// policy version; empty means `[agent/codex]`.
+    pub implementers: Vec<ImplementerDecl>,
+    /// `--runner`: a hand run's choice, replacing the declared order.
+    pub runner_override: Option<String>,
+    /// How long a runner that refused without a reset time stays unavailable.
+    pub runner_retry_seconds: u64,
     /// Resource admission limits, resolved from the current policy version's
     /// `defaults.admission` (#628). Empty admits unconditionally.
     pub admission_limits: AdmissionLimits,
@@ -144,6 +156,12 @@ struct DispatchContext<'a> {
     run_id: String,
     /// The registry key of the implementer harness, recorded as `runner`.
     runner: String,
+    /// The model and effort declared for that runner.
+    model: Option<String>,
+    effort: Option<String>,
+    /// The preferred runner this dispatch skipped, and until when it is
+    /// unavailable: recorded as `work-rerouted` beside `work-dispatched`.
+    rerouted: Option<(String, DateTime<Utc>)>,
     /// This dispatcher's own `OSTROM_RUN_ID`, when a run started it: the edge
     /// from a pass to the implementer its agent dispatched.
     parent_run_id: Option<String>,
@@ -163,10 +181,9 @@ pub fn run_dispatch(request: &DispatchRequest) -> Result<DispatchOutcome, Dispat
 pub fn run_dispatch_with_registry(
     request: &DispatchRequest,
     registry: &AgentRegistry,
-    runner_name: &str,
 ) -> Result<DispatchOutcome, DispatchError> {
     let mut minter = GitHubInstallationTokenMinter;
-    run_dispatch_with_registry_and_minter(request, registry, runner_name, &mut minter)
+    run_dispatch_with_registry_and_minter(request, registry, &mut minter)
 }
 
 fn run_dispatch_with_minter(
@@ -177,13 +194,12 @@ fn run_dispatch_with_minter(
         crate::umwelt_edge::node_fallbacks(),
     ))
     .expect("the shipped Codex harness registration is valid");
-    run_dispatch_with_registry_and_minter(request, &registry, DEFAULT_IMPLEMENTER_RUNNER, minter)
+    run_dispatch_with_registry_and_minter(request, &registry, minter)
 }
 
 fn run_dispatch_with_registry_and_minter(
     request: &DispatchRequest,
     registry: &AgentRegistry,
-    runner_name: &str,
     minter: &mut dyn InstallationTokenMinter,
 ) -> Result<DispatchOutcome, DispatchError> {
     if !request.order_file.is_file() {
@@ -227,7 +243,10 @@ fn run_dispatch_with_registry_and_minter(
         listing: ListingState::empty(),
         matched_key: None,
         run_id,
-        runner: runner_name.to_owned(),
+        runner: DEFAULT_IMPLEMENTER_RUNNER.to_owned(),
+        model: None,
+        effort: None,
+        rerouted: None,
         parent_run_id: environment::OSTROM_RUN_ID
             .value()
             .filter(|value| !value.trim().is_empty()),
@@ -323,6 +342,13 @@ fn run_dispatch_with_registry_and_minter(
     // branch for a fresh attempt) has a newer reset fact in its trace than
     // the failures that would otherwise have refused it here.
     refuse_repeated_dispatch_failure(&context)?;
+
+    // The runner is chosen only now, after every check that could refuse the
+    // item for its own sake, so an all-runners-unavailable hold is never
+    // raised for an item that would have been refused anyway.
+    choose_runner(&mut context, registry)?;
+    let runner_name = context.runner.clone();
+    let runner_name = runner_name.as_str();
 
     let runner_launch = registry
         .prepare(runner_name, &crate::RunCaps::default())
@@ -588,7 +614,7 @@ fn after_lease(
         .filter(|row| {
             matches!(
                 row.kind.as_str(),
-                "pass-ended" | "work-completed" | "work-failed"
+                "pass-ended" | "work-completed" | "work-failed" | "sandbox-checked"
             )
         })
         .filter_map(|row| row.fact.get("cost_usd").and_then(Value::as_f64))
@@ -752,7 +778,7 @@ fn launch_systemd(
         .arg(runner_name)
         .arg("--run-id")
         .arg(&context.run_id)
-        .args(implementer_cap_arguments(context.request.implementer_caps))
+        .args(implementer_arguments(context))
         .status();
     if !status.is_ok_and(|status| status.success()) {
         append_launch_failure(context, "dispatch-failed", started.elapsed());
@@ -807,7 +833,7 @@ fn launch_process(
         .arg(runner_name)
         .arg("--run-id")
         .arg(&context.run_id)
-        .args(implementer_cap_arguments(context.request.implementer_caps))
+        .args(implementer_arguments(context))
         .stdin(Stdio::null())
         .stdout(stdout)
         .stderr(stderr)
@@ -886,14 +912,167 @@ fn launch_process(
     Ok(())
 }
 
-/// `ostrom implement`'s hidden cap arguments: the caps this dispatch resolved,
-/// so the implementer enforces and records exactly what the hold names.
-fn implementer_cap_arguments(caps: ResolvedRunCaps) -> Vec<String> {
+/// `ostrom implement`'s hidden arguments: the caps this dispatch resolved, so
+/// the implementer enforces and records exactly what the hold names, and the
+/// model, effort and retry policy declared for the chosen runner.
+fn implementer_arguments(context: &DispatchContext<'_>) -> Vec<String> {
+    let caps = context.request.implementer_caps;
     let mut arguments = vec!["--wall-seconds".to_owned(), caps.wall_seconds.to_string()];
     if let Some(idle) = caps.idle_seconds {
         arguments.extend(["--idle-seconds".to_owned(), idle.to_string()]);
     }
+    if let Some(model) = &context.model {
+        arguments.push(format!("--model={model}"));
+    }
+    if let Some(effort) = &context.effort {
+        arguments.push(format!("--effort={effort}"));
+    }
+    arguments.extend([
+        "--runner-retry-seconds".to_owned(),
+        context.request.runner_retry_seconds.to_string(),
+    ]);
     arguments
+}
+
+/// Take the first declared runner that is not marked unavailable (#626). When
+/// every one is, hold the item with a `decision.requested` naming the earliest
+/// reset and refuse with a non-zero exit: never a silent wait.
+fn choose_runner(
+    context: &mut DispatchContext<'_>,
+    registry: &AgentRegistry,
+) -> Result<(), DispatchError> {
+    let request = context.request;
+    let declared = if request.implementers.is_empty() {
+        vec![ImplementerDecl::default_runner()]
+    } else {
+        request.implementers.clone()
+    };
+    let order = match &request.runner_override {
+        Some(runner) => vec![
+            declared
+                .iter()
+                .find(|entry| &entry.runner == runner)
+                .cloned()
+                .unwrap_or_else(|| ImplementerDecl {
+                    runner: runner.clone(),
+                    model: None,
+                    effort: None,
+                }),
+        ],
+        None => declared,
+    };
+    let availability = read_availability(&request.paths).map_err(|error| {
+        DispatchError::new(1, format!("ostrom dispatch: runner availability: {error}"))
+    })?;
+    let now = request.clock.now();
+    let mut skipped = Vec::new();
+    for entry in order {
+        if let Some(until) = unavailable_until(&availability, &entry.runner, now) {
+            skipped.push((entry.runner, until));
+            continue;
+        }
+        // Claude runs only once its sandbox was seen to hold (#626). A failed
+        // canary has marked it unavailable, so it is skipped like a limit.
+        if entry.runner == crate::implement::CLAUDE_RUNNER
+            && let Err(message) = crate::sandbox_canary::ensure_claude_sandbox(
+                &request.paths,
+                &request.clock,
+                registry,
+                entry.model.as_deref(),
+                request.runner_retry_seconds,
+            )
+        {
+            eprintln!("ostrom dispatch: {} skipped: {message}", entry.runner);
+            let until = read_availability(&request.paths)
+                .ok()
+                .and_then(|availability| unavailable_until(&availability, &entry.runner, now))
+                .unwrap_or(now);
+            skipped.push((entry.runner, until));
+            continue;
+        }
+        context.runner = entry.runner;
+        context.model = entry.model;
+        context.effort = entry.effort;
+        context.rerouted = skipped.into_iter().next();
+        return Ok(());
+    }
+    hold_for_runners(context, &skipped)
+}
+
+fn hold_for_runners(
+    context: &DispatchContext<'_>,
+    unavailable: &[(String, DateTime<Utc>)],
+) -> Result<(), DispatchError> {
+    let earliest = unavailable
+        .iter()
+        .min_by_key(|(_, until)| *until)
+        .map(|(runner, until)| (runner.as_str(), rfc3339(*until)))
+        .unwrap_or(("-", String::from("-")));
+    let runners = unavailable
+        .iter()
+        .map(|(runner, until)| format!("{runner} until {}", rfc3339(*until)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let item = &context.order.item_id;
+    let decision = DecisionRequest {
+        decision_id: format!(
+            "runners-unavailable-{}-{}",
+            &context.item_hash[..16],
+            earliest.1.replace([':', '-'], "")
+        ),
+        kind: DecisionKind::HumanDecides,
+        subject: item.clone(),
+        dossier: Dossier {
+            question: format!(
+                "Every declared implementer runner for {item} is out of allowance ({runners}). The earliest reset is {} at {}. Wait for it, or declare another runner?",
+                earliest.0, earliest.1
+            ),
+            options_ruled_out: vec![
+                "Waiting silently until a runner resets".to_owned(),
+                "Dispatching to a runner that reported an allowance limit".to_owned(),
+            ],
+            recommended_action: format!(
+                "Wait until {}; the next dispatch after it proceeds on its own.",
+                earliest.1
+            ),
+            blast_radius: format!(
+                "Only {item}; other items are held the same way until a runner resets."
+            ),
+        },
+        options: vec![
+            DecisionOption {
+                id: "wait".to_owned(),
+                label: format!("Wait for {} to reset at {}", earliest.0, earliest.1),
+            },
+            DecisionOption {
+                id: "reroute".to_owned(),
+                label: "Author a policy version that declares another runner in `implementers`"
+                    .to_owned(),
+            },
+        ],
+    };
+    emit_decision_requests(
+        &context.request.paths,
+        &context.request.clock.timestamp(),
+        DISPATCH_RUN_ID,
+        &[decision],
+    )
+    .map_err(|error| {
+        DispatchError::new(
+            3,
+            format!("ostrom dispatch: every implementer runner is unavailable; could not emit the decision: {error}"),
+        )
+    })?;
+    Err(DispatchError::new(
+        3,
+        format!(
+            "ostrom dispatch: every implementer runner is unavailable for {item} ({runners}); held with a decision request"
+        ),
+    ))
+}
+
+fn rfc3339(time: DateTime<Utc>) -> String {
+    time.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
 fn open_process_log(context: &DispatchContext<'_>) -> Result<(fs::File, fs::File), ()> {
@@ -2083,6 +2262,11 @@ fn repeated_failure(
                 let Some(value) = row.fact.get("reason").and_then(Value::as_str) else {
                     break;
                 };
+                // A runner out of allowance says nothing about the item
+                // (#626): it neither counts toward nor interrupts a streak.
+                if value == RUNNER_UNAVAILABLE_REASON {
+                    continue;
+                }
                 match &reason {
                     None => {
                         reason = Some(value.to_owned());
@@ -2181,6 +2365,20 @@ fn check_admission(context: &DispatchContext<'_>) -> Result<(), DispatchError> {
 }
 
 fn append_dispatched(context: &DispatchContext<'_>) -> Result<(), DispatchError> {
+    if let Some((from, until)) = &context.rerouted {
+        let fact = Map::from_iter([
+            ("schema_version".to_owned(), json!(1)),
+            ("item_id".to_owned(), json!(context.order.item_id)),
+            ("order_id".to_owned(), json!(context.order.order_id)),
+            ("run_id".to_owned(), json!(context.run_id)),
+            ("from".to_owned(), json!(from)),
+            ("to".to_owned(), json!(context.runner)),
+            ("until".to_owned(), json!(rfc3339(*until))),
+        ]);
+        append_fact(context, "work-rerouted", fact).map_err(|_| {
+            DispatchError::new(1, "ostrom dispatch: could not record work-rerouted")
+        })?;
+    }
     let mut fact = Map::new();
     fact.insert("schema_version".to_owned(), json!(1));
     fact.insert("item_id".to_owned(), json!(context.order.item_id));

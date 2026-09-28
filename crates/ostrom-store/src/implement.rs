@@ -34,6 +34,7 @@ use regex::Regex;
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 
+use umwelt_capture::{Normaliser, claude::ClaudeNormaliser};
 use umwelt_runtime::{CapsWatchdog, RunCaps, SpawnObserver, SystemClock};
 
 use crate::{
@@ -46,7 +47,14 @@ use crate::{
     append_trace, environment, generated_run_id, harness_record, load_config_or_defaults,
 };
 
-pub const DEFAULT_IMPLEMENTER_RUNNER: &str = "agent/codex";
+pub use ostrom_core::DEFAULT_IMPLEMENTER_RUNNER;
+
+/// The terminal reason of a run whose runner refused on an allowance limit
+/// (#626). It says nothing about the item, so dispatch never counts it toward
+/// a repeated-failure escalation.
+pub const RUNNER_UNAVAILABLE_REASON: &str = "runner-unavailable";
+
+pub(crate) const CLAUDE_RUNNER: &str = "agent/claude";
 
 #[derive(Debug, Clone)]
 pub struct ImplementRequest {
@@ -67,6 +75,13 @@ pub struct ImplementRequest {
     /// The wall and idle caps dispatch resolved from policy. A hand run gets
     /// the implementer defaults.
     pub caps: ResolvedRunCaps,
+    /// The model and effort policy declared for this runner (#626). `None`
+    /// leaves the harness default.
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    /// How long the runner stays unavailable after an allowance refusal that
+    /// reported no reset time: `defaults.runner_retry`, else one hour.
+    pub runner_retry_seconds: u64,
 }
 
 #[derive(Debug, Error)]
@@ -147,6 +162,8 @@ struct TerminalGuard {
     /// Dispatch's run id, echoed on the terminal row only when dispatch
     /// supplied it, so a hand run's terminal row keeps today's shape.
     dispatched_run_id: Option<String>,
+    /// The runner registry key, named on a `runner-unavailable` row.
+    runner: String,
 }
 
 impl TerminalGuard {
@@ -235,6 +252,9 @@ impl TerminalGuard {
         ]);
         if let Some(run_id) = &self.dispatched_run_id {
             fact.insert("run_id".to_owned(), json!(run_id));
+        }
+        if reason == Some(RUNNER_UNAVAILABLE_REASON) {
+            fact.insert("runner".to_owned(), json!(self.runner));
         }
         if let Some(intent) = &intent {
             fact.insert("reaped".to_owned(), json!(true));
@@ -401,9 +421,11 @@ fn run_implement_with_registry_and_minter(
                 },
                 |runner| runner.name().to_owned(),
             ),
-            model: runner
-                .as_ref()
-                .map(|runner| runner.default_model().to_owned()),
+            model: request.model.clone().or_else(|| {
+                runner
+                    .as_ref()
+                    .map(|runner| runner.default_model().to_owned())
+            }),
             schedule: None,
             repository: order.as_ref().ok().map(|order| order.repository.clone()),
             repositories: None,
@@ -496,8 +518,23 @@ fn run_implement_with_registry_and_minter(
         withheld_paths: Vec::new(),
         run_events,
         dispatched_run_id: request.run_id.clone(),
+        runner: runner_name.to_owned(),
     };
-    let mut wall = WallCap::start(request.caps.wall_seconds, &request.signals);
+    // Claude reports per-turn usage in its stream, so its token ceiling is
+    // enforced while it runs by the same watchdog. Codex reports usage only
+    // at the end and keeps the end-of-run check below.
+    let tokens = (runner_name == CLAUDE_RUNNER).then(|| {
+        (
+            request
+                .paths
+                .state
+                .join("implementer-runs")
+                .join(&guard.order.order_id)
+                .join("events.jsonl"),
+            guard.order.tokens(),
+        )
+    });
+    let mut wall = WallCap::start(request.caps.wall_seconds, tokens, &request.signals);
     let result = implement_inner(request, &mut guard, registry, runner_name, minter);
     wall.stop();
     match result {
@@ -529,22 +566,35 @@ fn run_already_terminal(paths: &OstromPaths, order_id: &str, run_id: &str) -> bo
 /// raises the run's own TERM flag, so the run stops through the path a
 /// scheduler signal already takes: Codex's process group is terminated with
 /// the termination grace and the terminal row is written by this process.
-struct WallCap {
+pub(crate) struct WallCap {
     seconds: u64,
+    tokens: Option<u64>,
     tripped: Arc<AtomicBool>,
+    tripped_tokens: Arc<AtomicBool>,
     stop: Option<mpsc::Sender<()>>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
 impl WallCap {
-    fn start(seconds: u64, signals: &SignalFlags) -> Self {
+    /// `tokens`, when present, is a Claude transcript and its token ceiling:
+    /// the transcript is followed and fed to the watchdog as it grows.
+    pub(crate) fn start(
+        seconds: u64,
+        tokens: Option<(PathBuf, u64)>,
+        signals: &SignalFlags,
+    ) -> Self {
         let tripped = Arc::new(AtomicBool::new(false));
+        let tripped_tokens = Arc::new(AtomicBool::new(false));
         let caps = RunCaps {
             wall_ms: Some(seconds.saturating_mul(1_000)),
+            tokens: tokens.as_ref().map(|(_, ceiling)| *ceiling),
             ..RunCaps::default()
         };
+        let ceiling = tokens.as_ref().map(|(_, ceiling)| *ceiling);
+        let mut follower = tokens.map(|(path, _)| TranscriptFollower::new(path));
         let term = signals.term_flag();
         let thread_tripped = Arc::clone(&tripped);
+        let thread_tripped_tokens = Arc::clone(&tripped_tokens);
         let (stop, receiver) = mpsc::channel::<()>();
         let thread = CapsWatchdog::new(caps, SystemClock::default())
             .ok()
@@ -553,7 +603,16 @@ impl WallCap {
                     .name("ostrom-implementer-wall".to_owned())
                     .spawn(move || {
                         loop {
-                            if watchdog.check().is_some() {
+                            let observed = follower.as_mut().and_then(|follower| {
+                                follower
+                                    .events()
+                                    .into_iter()
+                                    .find_map(|event| watchdog.observe(&event).ok().flatten())
+                            });
+                            if let Some(trip) = observed.or_else(|| watchdog.check()) {
+                                if trip.cap() == umwelt_runtime::Cap::Tokens {
+                                    thread_tripped_tokens.store(true, Ordering::Release);
+                                }
                                 thread_tripped.store(true, Ordering::Release);
                                 term.store(true, Ordering::SeqCst);
                                 break;
@@ -568,7 +627,9 @@ impl WallCap {
             });
         Self {
             seconds,
+            tokens: ceiling,
             tripped,
+            tripped_tokens,
             stop: Some(stop),
             thread,
         }
@@ -578,7 +639,7 @@ impl WallCap {
         self.tripped.load(Ordering::Acquire)
     }
 
-    fn stop(&mut self) {
+    pub(crate) fn stop(&mut self) {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
@@ -590,7 +651,16 @@ impl WallCap {
     /// A stop the wall cap caused is recorded as `wall-cap`, never as the
     /// signal it was delivered through.
     fn classify(&self, error: ImplementError) -> ImplementError {
-        if self.tripped() {
+        if self.tripped_tokens.load(Ordering::Acquire) {
+            ImplementError::new(
+                error.code,
+                "token-ceiling-exceeded",
+                format!(
+                    "token ceiling of {} reached while running",
+                    self.tokens.unwrap_or_default()
+                ),
+            )
+        } else if self.tripped() {
             ImplementError::new(
                 error.code,
                 "wall-cap",
@@ -605,6 +675,60 @@ impl WallCap {
 impl Drop for WallCap {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// Follows a Claude `stream-json` transcript as the harness writes it and
+/// normalises each complete line into an event the watchdog can observe.
+struct TranscriptFollower {
+    path: PathBuf,
+    offset: usize,
+    pending: String,
+    normaliser: ClaudeNormaliser,
+    sequence: u64,
+}
+
+impl TranscriptFollower {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            offset: 0,
+            pending: String::new(),
+            normaliser: ClaudeNormaliser::new(),
+            sequence: 0,
+        }
+    }
+
+    fn events(&mut self) -> Vec<ethogram::Event> {
+        let Ok(contents) = fs::read(&self.path) else {
+            return Vec::new();
+        };
+        if contents.len() < self.offset {
+            // The harness truncated the file when it started: begin again.
+            *self = Self::new(self.path.clone());
+        }
+        self.pending
+            .push_str(&String::from_utf8_lossy(&contents[self.offset..]));
+        self.offset = contents.len();
+        let mut events = Vec::new();
+        while let Some(end) = self.pending.find('\n') {
+            let line = self.pending[..end].to_owned();
+            self.pending.drain(..=end);
+            // A line the normaliser refuses carries no usage to count.
+            for draft in self.normaliser.line(&line).unwrap_or_default() {
+                self.sequence += 1;
+                events.push(ethogram::Event {
+                    v: 1,
+                    event_type: draft.event_type,
+                    run_id: "implementer".to_owned(),
+                    seq: self.sequence,
+                    ts: String::new(),
+                    payload: draft.payload,
+                    captured_at: None,
+                });
+            }
+        }
+        events
     }
 }
 
@@ -661,6 +785,19 @@ fn implement_inner(
             "implementer-harness-unavailable",
             format!("implementer harness is not registered: {runner_name}"),
         ));
+    }
+    // A Claude run never starts unless its sandbox was seen to hold for this
+    // binary and this profile (#626); a hand run is checked like a dispatch.
+    if runner_name == CLAUDE_RUNNER
+        && let Err(message) = crate::sandbox_canary::ensure_claude_sandbox(
+            &request.paths,
+            &request.clock,
+            registry,
+            request.model.as_deref(),
+            request.runner_retry_seconds,
+        )
+    {
+        return Err(ImplementError::new(1, RUNNER_UNAVAILABLE_REASON, message));
     }
     let default_branch = default_branch_result(gh_text(
         request,
@@ -774,6 +911,9 @@ fn implement_inner(
             transcript: events_file.clone(),
             token_ceiling: guard.order.tokens(),
             offline: true,
+            model: request.model.clone(),
+            effort: request.effort.clone(),
+            max_turns: None,
             signals: request.signals.clone(),
             supervisor_pid: request.supervisor_pid,
             termination_grace,
@@ -840,9 +980,26 @@ fn implement_inner(
     };
     if !status.success() {
         let code = exit_code(status);
-        let reason = codex_failure_reason(code, &events_file);
-        let message = codex_usage_limit_message(&events_file)
-            .unwrap_or_else(|| format!("Codex exited with status {code}"));
+        let events = fs::read_to_string(&events_file).unwrap_or_default();
+        if let Some(message) = usage_limit_message(runner_name, &events) {
+            mark_runner_unavailable(request, guard, runner_name, &message);
+            return Err(ImplementError::new(
+                code,
+                RUNNER_UNAVAILABLE_REASON,
+                message,
+            ));
+        }
+        let (reason, message) = if runner_name == DEFAULT_IMPLEMENTER_RUNNER {
+            (
+                codex_failure_reason(code, &events),
+                format!("Codex exited with status {code}"),
+            )
+        } else {
+            (
+                format!("implementer-exit-{code}"),
+                format!("{runner_name} exited with status {code}"),
+            )
+        };
         return Err(ImplementError::new(code, reason, message));
     }
 
@@ -1033,13 +1190,9 @@ fn termination_grace() -> Result<Duration, ImplementError> {
     }
 }
 
-fn codex_failure_reason(code: i32, events_file: &Path) -> String {
-    let events = fs::read_to_string(events_file).unwrap_or_default();
+fn codex_failure_reason(code: i32, events: &str) -> String {
     match code {
         126 | 127 => "codex-unavailable".to_owned(),
-        1 if codex_usage_limit_message_from_events(&events).is_some() => {
-            "codex-unavailable".to_owned()
-        }
         1 if events.lines().any(|line| {
             line.starts_with("Error loading config.toml:")
                 || (line.starts_with("Error: features.")
@@ -1061,9 +1214,65 @@ fn codex_failure_reason(code: i32, events_file: &Path) -> String {
 
 const CODEX_USAGE_LIMIT_MESSAGE: &str = "You've hit your usage limit.";
 
-fn codex_usage_limit_message(events_file: &Path) -> Option<String> {
-    let events = fs::read_to_string(events_file).ok()?;
-    codex_usage_limit_message_from_events(&events)
+/// The runner's own words when it refused on an allowance limit, or `None`
+/// when it failed for any other reason.
+fn usage_limit_message(runner_name: &str, events: &str) -> Option<String> {
+    if runner_name == CLAUDE_RUNNER {
+        claude_usage_limit_message_from_events(events)
+    } else {
+        codex_usage_limit_message_from_events(events)
+    }
+}
+
+/// Claude Code ends a refused run with an error `result` event. The phrases
+/// matched here are inferred from observed messages ("Claude AI usage limit
+/// reached|<epoch>", "You've hit your limit"); an unmatched refusal stays an
+/// ordinary failure.
+fn claude_usage_limit_message_from_events(events: &str) -> Option<String> {
+    events.lines().rev().find_map(|line| {
+        let event: Value = serde_json::from_str(line).ok()?;
+        if event.get("type").and_then(Value::as_str) != Some("result")
+            || event.get("is_error").and_then(Value::as_bool) != Some(true)
+        {
+            return None;
+        }
+        let message = event.get("result").and_then(Value::as_str)?;
+        let lower = message.to_ascii_lowercase();
+        (lower.contains("usage limit") || lower.contains("hit your limit"))
+            .then(|| message.to_owned())
+    })
+}
+
+/// Record that `runner_name` is out of allowance until the reset it reported,
+/// else for the declared retry. A failure to record is printed, not fatal:
+/// the terminal row still says `runner-unavailable`.
+fn mark_runner_unavailable(
+    request: &ImplementRequest,
+    guard: &TerminalGuard,
+    runner_name: &str,
+    message: &str,
+) {
+    let now = request.clock.now();
+    let zone = crate::runner_availability::local_zone(&request.clock);
+    let reported = crate::runner_availability::parse_reset(message, now, &zone);
+    let until = reported.unwrap_or_else(|| {
+        now + chrono::Duration::seconds(
+            i64::try_from(request.runner_retry_seconds).unwrap_or(i64::MAX / 2),
+        )
+    });
+    let entry = crate::UnavailableRunner {
+        until: until.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        reset_reported: reported.is_some(),
+        message: message.chars().take(500).collect(),
+        reason: "usage-limit".to_owned(),
+        recorded_at: request.clock.timestamp(),
+        run_id: guard.run_events.run_id().to_owned(),
+    };
+    if let Err(error) =
+        crate::runner_availability::mark_unavailable(&request.paths, runner_name, entry)
+    {
+        eprintln!("ostrom implementer: could not record {runner_name} as unavailable: {error}");
+    }
 }
 
 fn codex_usage_limit_message_from_events(events: &str) -> Option<String> {
@@ -1108,6 +1317,19 @@ fn read_usage(path: &Path) -> Usage {
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
     {
+        // Claude's terminal `result` event carries the run's total usage.
+        if event.get("type").and_then(Value::as_str) == Some("result")
+            && let Some(total) = event.get("usage").and_then(Value::as_object)
+        {
+            let field = |name: &str| total.get(name).and_then(Value::as_u64).unwrap_or_default();
+            turns += 1;
+            usage.input_tokens += field("input_tokens")
+                + field("cache_creation_input_tokens")
+                + field("cache_read_input_tokens");
+            *usage.cached_input_tokens.get_or_insert(0) += field("cache_read_input_tokens");
+            usage.output_tokens += field("output_tokens");
+            continue;
+        }
         if event.get("type").and_then(Value::as_str) != Some("turn.completed") {
             continue;
         }
