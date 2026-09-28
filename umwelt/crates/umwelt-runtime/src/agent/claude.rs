@@ -54,7 +54,7 @@ pub fn implementer_settings() -> Value {
             "allowUnsandboxedCommands": false,
             "network": {
                 "allowedDomains": [],
-                "strictAllowlist": true,
+                "strictAllowlist": false,
             },
         },
     })
@@ -76,6 +76,7 @@ pub fn implementer_arguments(
 ) -> Vec<String> {
     let mut arguments = vec![
         "--print".to_owned(),
+        "--add-dir=/".to_owned(),
         "--restricted".to_owned(),
         "--tools".to_owned(),
         IMPLEMENTER_TOOLS.to_owned(),

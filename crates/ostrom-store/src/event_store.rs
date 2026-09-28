@@ -165,7 +165,6 @@ fn trace_event_type(kind: &str) -> Option<EventType> {
         "work-dispatched" => "work.dispatched",
         "work-completed" => "work.completed",
         "work-failed" => "work.failed",
-        "work-rerouted" => "work.rerouted",
         "artifact-produced" => "artifact.produced",
         "gate-verdict-consumed" => "gate-verdict.consumed",
         "pr-repair" => "pr.repair",
