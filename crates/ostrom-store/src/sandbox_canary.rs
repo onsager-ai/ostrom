@@ -117,9 +117,11 @@ fn check(
         .ok()
         .and_then(|bytes| serde_json::from_slice::<CanaryPasses>(&bytes).ok())
         .unwrap_or_default();
-    if passes.runners.get(CLAUDE_RUNNER).is_some_and(|pass| {
-        pass.version.len() == version.len() && pass.profile_sha256 == profile_sha256
-    }) {
+    if passes
+        .runners
+        .get(CLAUDE_RUNNER)
+        .is_some_and(|pass| pass.version == version && pass.profile_sha256 == profile_sha256)
+    {
         return Ok(());
     }
 
@@ -202,7 +204,7 @@ fn check(
 
 fn canary_prompt(outside: &Path) -> String {
     format!(
-        "This is an automated sandbox check. Use the Bash tool to run exactly this one command, once, and then reply with the single word DONE. Do not run anything else.\n\n```\ntouch {INSIDE_MARKER}; touch '{}' 2>/dev/null; if curl -sS -m 5 -o /dev/null https://example.com 2>/dev/null || bash -c 'exec 3<>/dev/tcp/example.com/443' 2>/dev/null; then echo {NETWORK_REACHED}; else echo {NETWORK_DENIED}; fi\n```\n",
+        "This is an automated sandbox check. Use the Bash tool to run exactly this one command, once, and then reply with the single word DONE. Do not run anything else.\n\n```\ntouch {INSIDE_MARKER}; touch '{}' 2>/dev/null; if curl -sS -m 5 -o /dev/null https://example.com 2>/dev/null || bash --noprofile -c 'exec 3<>/dev/tcp/example.com/443' 2>/dev/null; then echo {NETWORK_REACHED}; else echo {NETWORK_DENIED}; fi\n```\n",
         outside.display()
     )
 }
@@ -220,7 +222,7 @@ pub(crate) fn judge(transcript: &str, ran: bool, escaped: bool) -> Result<(), St
     if output.is_empty() {
         return Err("the canary transcript holds no command output".to_owned());
     }
-    if output.contains("MUTATION-NEVER") {
+    if output.contains(NETWORK_REACHED) {
         return Err("a sandboxed command reached the network".to_owned());
     }
     if !output.contains(NETWORK_DENIED) {
@@ -329,6 +331,15 @@ mod tests {
     fn only_a_denied_network_and_a_contained_write_pass() {
         assert_eq!(judge(&result("CANARY-NETWORK-DENIED"), true, false), Ok(()));
         assert!(judge(&result("CANARY-NETWORK-REACHED"), true, false).is_err());
+        assert!(
+            judge(
+                &result("CANARY-NETWORK-REACHED\\nCANARY-NETWORK-DENIED"),
+                true,
+                false
+            )
+            .is_err(),
+            "any sign of reaching the network fails, whatever else is printed"
+        );
         assert!(judge(&result("CANARY-NETWORK-DENIED"), true, true).is_err());
         assert!(judge(&result("CANARY-NETWORK-DENIED"), false, false).is_err());
         assert!(judge(&result("permission denied"), true, false).is_err());

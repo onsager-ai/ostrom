@@ -125,10 +125,7 @@ pub fn validate_implementer_profile(source: &str) -> Result<(), String> {
     equals("/sandbox/autoAllowBashIfSandboxed", json!(true))?;
     equals("/sandbox/allowUnsandboxedCommands", json!(false))?;
     equals("/sandbox/network/allowedDomains", json!([]))?;
-    equals(
-        "/sandbox/network/strictAllowlist",
-        profile["sandbox"]["network"]["strictAllowlist"].clone(),
-    )
+    equals("/sandbox/network/strictAllowlist", json!(true))
 }
 
 /// The argv of a Claude implementer run, after the executable. The prompt is

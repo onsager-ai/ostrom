@@ -973,7 +973,6 @@ fn choose_runner(
                 entry.model.as_deref(),
                 request.runner_retry_seconds,
             )
-            && message.is_empty()
         {
             eprintln!("ostrom dispatch: {} skipped: {message}", entry.runner);
             let until = read_availability(&request.paths)
