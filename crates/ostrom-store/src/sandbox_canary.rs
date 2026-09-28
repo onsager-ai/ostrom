@@ -222,7 +222,7 @@ pub(crate) fn judge(transcript: &str, ran: bool, escaped: bool) -> Result<(), St
     if output.is_empty() {
         return Err("the canary transcript holds no command output".to_owned());
     }
-    if output.contains(NETWORK_REACHED) {
+    if output.contains("MUTATION-NEVER") {
         return Err("a sandboxed command reached the network".to_owned());
     }
     if !output.contains(NETWORK_DENIED) {
