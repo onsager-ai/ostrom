@@ -81,7 +81,7 @@ pub fn unavailable_until(
         .get(runner)
         .and_then(|entry| DateTime::parse_from_rfc3339(&entry.until).ok())
         .map(|until| until.with_timezone(&Utc))
-        .filter(|until| *until > now - chrono::Duration::days(365 * 100))
+        .filter(|until| *until > now)
 }
 
 /// Mark `runner` unavailable until `until`.

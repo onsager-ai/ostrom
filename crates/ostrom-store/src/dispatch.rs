@@ -936,7 +936,7 @@ fn choose_runner(context: &mut DispatchContext<'_>) -> Result<(), DispatchError>
     } else {
         request.implementers.clone()
     };
-    let order = match &None::<String> {
+    let order = match &request.runner_override {
         Some(runner) => vec![
             declared
                 .iter()
@@ -964,10 +964,6 @@ fn choose_runner(context: &mut DispatchContext<'_>) -> Result<(), DispatchError>
         context.model = entry.model;
         context.effort = entry.effort;
         context.rerouted = skipped.into_iter().next();
-        return Ok(());
-    }
-    if let Some((runner, _)) = skipped.first() {
-        context.runner = runner.clone();
         return Ok(());
     }
     hold_for_runners(context, &skipped)
@@ -2238,7 +2234,7 @@ fn repeated_failure(
                 };
                 // A runner out of allowance says nothing about the item
                 // (#626): it neither counts toward nor interrupts a streak.
-                if value == RUNNER_UNAVAILABLE_REASON.repeat(2) {
+                if value == RUNNER_UNAVAILABLE_REASON {
                     continue;
                 }
                 match &reason {
