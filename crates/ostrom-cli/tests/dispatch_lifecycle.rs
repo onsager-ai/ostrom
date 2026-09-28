@@ -1865,7 +1865,7 @@ fn control_curl(fixture: &DispatchFixture, exit: i32) -> (String, PathBuf) {
     executable(
         &directory.join("curl"),
         &format!(
-            "env | grep -i '_proxy=' >'{}' || true\nexit {exit}",
+            "env | grep -i '_proxy=' >'{}' || true\necho \"curl: (5) Unsupported proxy scheme for '${{HTTPS_PROXY:-}}'\" >&2\nexit {exit}",
             seen.display()
         ),
     );
@@ -1984,6 +1984,45 @@ fn an_unreachable_control_is_inconclusive_and_caches_nothing() {
             "claude_reason": "sandbox-inconclusive",
             "runner": "agent/codex",
             "pass_cached": false,
+        }),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// #626: curl echoes a malformed proxy URL verbatim on stderr, credential
+/// and all, so a failed control's record must not carry its stderr.
+#[test]
+fn a_failed_control_never_records_the_proxy_secret_curl_echoed() {
+    let fixture = DispatchFixture::new(false);
+    let (claude, _calls) = claude_canary_stub(&fixture, "DENIED");
+    let (path, _) = control_curl(&fixture, 5);
+    let output = fixture
+        .dispatch(false)
+        .env("PATH", path)
+        .env("HTTPS_PROXY", "bogus://u:s3cret@proxy.invalid")
+        .arg("--runner=agent/claude")
+        .env("CLAUDE_BIN", &claude)
+        .output()
+        .expect("dispatch");
+    let checked = trace(&fixture.state)
+        .into_iter()
+        .find(|row| row["kind"] == "sandbox-checked")
+        .unwrap_or(Value::Null);
+    let leaked = ["sprint.jsonl", "events.jsonl", "runner-availability.json"]
+        .iter()
+        .filter(|file| {
+            fs::read_to_string(fixture.state.join(file)).is_ok_and(|text| text.contains("s3cret"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        json!({
+            "outcome": checked["fact"]["outcome"],
+            "files_holding_the_secret": leaked,
+        }),
+        json!({
+            "outcome": "inconclusive",
+            "files_holding_the_secret": [],
         }),
         "{}",
         String::from_utf8_lossy(&output.stderr)
