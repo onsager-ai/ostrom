@@ -37,6 +37,16 @@
   (`project_repository_manifest`, `project_rules`) go with them, along with
   the now-unused `PolicyLoadError` variants they raised.
 - `ostrom sweep --inner-org` no longer has an exit-code-6 path for a truncated branch or pull-request head-branch listing, and the outer sweep worker no longer translates a status-6 exit into `SweepError::BranchListingTruncated` (#579). Both were already unreachable: `acquire_repositories_independently` turns every per-repository error, `BranchListingTruncated` included, into a fault before the inner-org call can return it or the worker can exit non-zero for that reason, so no live behaviour changes. The variant survives — `fetch_branches` and `fetch_pull_request_heads_with` still refuse a repository whose branch listing hit its query limit rather than let `resolve_pull_request_heads`'s #562 join run on a partial list — but its two messages now read "refusing this repository's acquisition" instead of "refusing a truncated sweep", matching the per-repository outcome the code has always produced. A grep of this workspace found no other reader of exit code 6; whether a repository outside this workspace parses that exit code from `ostrom sweep` is still open and is called out in the PR for the coordinator to check before merge.
+
+- **Breaking:** a disarmed pass now records `run.finished` with
+  `outcome: unstarted`, `reason: disarmed` (#589). It previously recorded
+  `outcome: no-op`, the same outcome a contended lease records, so a consumer
+  could not tell a disarmed loop from an ordinary lease race by outcome
+  alone. The lease-held path is unchanged: it still records `no-op` with
+  `reason: lease-held`, and the process exit code for a disarmed pass is
+  unchanged at 78. A consumer keying on `run.finished.outcome == "no-op"` to
+  recognise a disarmed pass must switch to `outcome == "unstarted"` with
+  `reason == "disarmed"`.
 - **Breaking:** `ostrom audit` is removed (#617). It queried merged pull
   requests and joined them against recorded gate verdicts, but nothing in the
   delivery loop read its output — the gate, the sweep and `decision_answers.rs`

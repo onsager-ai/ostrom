@@ -1152,7 +1152,7 @@ fn run_pass_with_bridge_probe_timeout(
     if let Err(error) = validate_arm(request) {
         events
             .finish(
-                EventRunOutcome::NoOp,
+                EventRunOutcome::Unstarted,
                 Some("disarmed".to_owned()),
                 Some(0.0),
                 None,
