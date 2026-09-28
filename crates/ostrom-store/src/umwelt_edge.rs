@@ -7,7 +7,7 @@ use std::{
 };
 
 use indexmap::IndexMap;
-use ostrom_core::ResolvedLoopCeilings;
+use ostrom_core::{AdmissionReading, ResolvedLoopCeilings, UnitResourceLimits};
 use serde_json::{Map, Value};
 use umwelt_runtime::PassState;
 
@@ -35,6 +35,42 @@ pub const fn run_ceilings(ceilings: ResolvedLoopCeilings) -> umwelt_runtime::Loo
         concurrent: ceilings.concurrent,
         spend_usd: ceilings.spend_usd,
         tokens: ceilings.tokens,
+    }
+}
+
+/// Convert Ostrom's declared unit resource limits into harness render inputs.
+#[must_use]
+pub fn run_unit_resource_limits(limits: &UnitResourceLimits) -> umwelt_runtime::UnitResourceLimits {
+    umwelt_runtime::UnitResourceLimits {
+        cpu_quota: limits.cpu_quota.clone(),
+        nice: limits.nice,
+        memory_max: limits.memory_max.clone(),
+    }
+}
+
+/// The sysfs and procfs roots admission reads from: `MANDATE_ADMISSION_SYS_ROOT`
+/// and `MANDATE_ADMISSION_PROC_ROOT`, else the real host's `/sys` and `/proc`
+/// (#628). Injectable so a test can point them at a fixture tree.
+#[must_use]
+pub fn admission_roots() -> (PathBuf, PathBuf) {
+    let sys_root = environment::MANDATE_ADMISSION_SYS_ROOT
+        .value_os()
+        .map_or_else(|| PathBuf::from("/sys"), PathBuf::from);
+    let proc_root = environment::MANDATE_ADMISSION_PROC_ROOT
+        .value_os()
+        .map_or_else(|| PathBuf::from("/proc"), PathBuf::from);
+    (sys_root, proc_root)
+}
+
+/// Read the host's CPU temperature and load average (umwelt observes the
+/// host), converted into ostrom's judging type. ostrom decides what a
+/// reading means; this call only takes it.
+#[must_use]
+pub fn read_admission_reading(sys_root: &Path, proc_root: &Path) -> AdmissionReading {
+    let reading = umwelt_runtime::read_host_resources(sys_root, proc_root);
+    AdmissionReading {
+        cpu_temp_c: reading.cpu_temp_c,
+        load_per_cpu: reading.load_per_cpu,
     }
 }
 

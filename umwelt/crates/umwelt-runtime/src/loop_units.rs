@@ -33,6 +33,24 @@ pub struct CeilingEnvironmentNames {
     pub tokens: Option<String>,
 }
 
+/// Declared systemd resource properties a rendered unit carries (#628).
+/// ostrom owns whether and what to declare (`defaults.admission.unit`); this
+/// is the render target, values passed through unexamined except for shape
+/// safety (single line, no control characters).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UnitResourceLimits {
+    pub cpu_quota: Option<String>,
+    pub nice: Option<i64>,
+    pub memory_max: Option<String>,
+}
+
+impl UnitResourceLimits {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.cpu_quota.is_none() && self.nice.is_none() && self.memory_max.is_none()
+    }
+}
+
 /// A systemd loop already resolved into harness-facing process inputs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LoopUnitDeclaration {
@@ -46,6 +64,8 @@ pub struct LoopUnitDeclaration {
     /// The unit's `TimeoutStartSec`: the outer bound the supervisor puts on
     /// one run. The consumer derives it from the run's own caps.
     pub timeout_start_seconds: u64,
+    /// Declared `CPUQuota=`/`Nice=`/`MemoryMax=` (#628), empty by default.
+    pub unit_resources: UnitResourceLimits,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -318,6 +338,27 @@ fn validate_declaration(declaration: &LoopUnitDeclaration) -> Result<(), LoopUni
     {
         return invalid(declaration, "spend ceiling must be finite");
     }
+    for value in [
+        declaration.unit_resources.cpu_quota.as_deref(),
+        declaration.unit_resources.memory_max.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if value.is_empty() || value.contains(['\0', '\n', '\r']) {
+            return invalid(
+                declaration,
+                "unit resource values must be non-empty single lines",
+            );
+        }
+    }
+    if declaration
+        .unit_resources
+        .nice
+        .is_some_and(|value| !(-20..=19).contains(&value))
+    {
+        return invalid(declaration, "nice must be between -20 and 19");
+    }
     Ok(())
 }
 
@@ -372,6 +413,7 @@ fn render_service(config: &LoopUnitGeneratorConfig, declaration: &LoopUnitDeclar
         "TimeoutStartSec={}\nKillMode=control-group\n",
         declaration.timeout_start_seconds
     ));
+    render_unit_resources(&mut source, &declaration.unit_resources);
     source
 }
 
@@ -384,6 +426,18 @@ fn render_ceilings(source: &mut String, names: &CeilingEnvironmentNames, ceiling
     }
     if let (Some(name), Some(value)) = (&names.tokens, ceilings.tokens) {
         source.push_str(&format!("Environment={name}={value}\n"));
+    }
+}
+
+fn render_unit_resources(source: &mut String, limits: &UnitResourceLimits) {
+    if let Some(cpu_quota) = &limits.cpu_quota {
+        source.push_str(&format!("CPUQuota={cpu_quota}\n"));
+    }
+    if let Some(nice) = limits.nice {
+        source.push_str(&format!("Nice={nice}\n"));
+    }
+    if let Some(memory_max) = &limits.memory_max {
+        source.push_str(&format!("MemoryMax={memory_max}\n"));
     }
 }
 
@@ -457,6 +511,7 @@ mod tests {
                     tokens: Some(200_000),
                 },
                 timeout_start_seconds: 1800,
+                unit_resources: UnitResourceLimits::default(),
             },
             LoopUnitDeclaration {
                 name: "nightly".to_owned(),
@@ -479,6 +534,7 @@ mod tests {
                     tokens: Some(200_000),
                 },
                 timeout_start_seconds: 1800,
+                unit_resources: UnitResourceLimits::default(),
             },
         ]
     }
@@ -575,6 +631,59 @@ mod tests {
             .contents;
         assert!(nightly_timer.contains("OnCalendar=*-*-* 23,02,05:15:00\n"));
         assert!(loop_execstart_is_not_shell(&config, &units));
+    }
+
+    #[test]
+    fn a_declared_unit_resource_limit_renders_its_systemd_property() {
+        let config = generator_config();
+        let mut declarations = declarations();
+        declarations[0].unit_resources = UnitResourceLimits {
+            cpu_quota: Some("200%".to_owned()),
+            nice: Some(10),
+            memory_max: Some("8G".to_owned()),
+        };
+        let units = generate_loop_units(&config, &declarations).expect("units");
+
+        let daytime_service = &units
+            .iter()
+            .find(|unit| unit.name == "example-loop-daytime.service")
+            .expect("daytime service")
+            .contents;
+        assert!(daytime_service.contains("CPUQuota=200%\n"));
+        assert!(daytime_service.contains("Nice=10\n"));
+        assert!(daytime_service.contains("MemoryMax=8G\n"));
+
+        let nightly_service = &units
+            .iter()
+            .find(|unit| unit.name == "example-loop-nightly.service")
+            .expect("nightly service")
+            .contents;
+        assert!(
+            !nightly_service.contains("CPUQuota="),
+            "an undeclared limit renders no property"
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_nice_value_is_refused() {
+        let config = generator_config();
+        let mut declarations = declarations();
+        declarations[0].unit_resources = UnitResourceLimits {
+            cpu_quota: None,
+            nice: Some(20),
+            memory_max: None,
+        };
+
+        let error = generate_loop_units(&config, &declarations)
+            .expect_err("nice outside -20..=19 must be refused");
+        assert!(
+            matches!(
+                error,
+                LoopUnitError::InvalidDeclaration { ref message, .. }
+                    if message.contains("nice")
+            ),
+            "expected a loud refusal naming the bad nice value, got {error:?}"
+        );
     }
 
     #[test]
