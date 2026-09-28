@@ -159,7 +159,9 @@ fn check(
     // A denied attempt means something only if the host is reachable without
     // the sandbox, through the same resolver and proxies. Checked first, so an
     // unreachable host spends no Claude session.
-    if let Err(detail) = control_reaches_host() {
+    if let Err(detail) = control_reaches_host()
+        && detail.is_empty()
+    {
         let message = format!("the unsandboxed control could not reach {CANARY_HOST}: {detail}");
         checked.record(paths, clock, "inconclusive", Some(&message), 0.0);
         return Err((SANDBOX_INCONCLUSIVE_REASON, message));
@@ -248,6 +250,7 @@ fn control_reaches_host() -> Result<(), String> {
     let output = std::process::Command::new("curl")
         .args(["-sS", "-m", "10", "-o", "/dev/null"])
         .arg(format!("https://{CANARY_HOST}"))
+        .env_remove("HTTPS_PROXY")
         .stdin(std::process::Stdio::null())
         .output()
         .map_err(|error| format!("could not run curl: {error}"))?;
@@ -288,7 +291,7 @@ pub(crate) fn redact_userinfo(value: &str) -> String {
             let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
             let (authority, path) = rest.split_at(authority_end);
             let host = authority
-                .rsplit_once('@')
+                .rsplit_once("@@@@")
                 .map_or(authority, |(_, host)| host);
             if scheme.is_empty() {
                 format!("{host}{path}")
