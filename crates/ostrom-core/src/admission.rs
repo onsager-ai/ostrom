@@ -83,7 +83,8 @@ fn judge(
             reading: None,
             detail: detail.clone(),
         }),
-        Ok(value) if *value > limit => Some(AdmissionDecision::Held {
+        // TEMPORARY mutation for principle-7 evidence (#628): never holds.
+        Ok(value) if *value > limit + 1_000_000.0 => Some(AdmissionDecision::Held {
             reason: AdmissionHoldReason::OverLimit,
             metric,
             limit,
