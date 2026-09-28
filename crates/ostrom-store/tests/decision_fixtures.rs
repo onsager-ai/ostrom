@@ -271,6 +271,7 @@ fn budget_decision_fixture() {
         control_fd: None,
         facts_only: false,
         repositories: None,
+        loop_name: None,
         skipped_repositories: Vec::new(),
         repository_scope: None,
         sweep: None,

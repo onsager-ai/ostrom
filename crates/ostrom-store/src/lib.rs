@@ -31,6 +31,7 @@ mod reap;
 mod repair;
 mod repository_scope;
 mod run_events;
+mod runner_availability;
 mod selection;
 mod selector;
 mod stalls;
@@ -107,6 +108,10 @@ pub use repository_scope::{
     resolve_available_repositories,
 };
 pub use run_events::{RunEventError, RunEventGuard, RunEventStart, generated_run_id};
+pub use runner_availability::{
+    RUNNER_AVAILABILITY_FILE, RunnerAvailability, UnavailableRunner, read_availability,
+    unavailable_until,
+};
 pub use selection::{
     PlanApplication, SelectAction, SelectError, SelectOutcome, SelectRequest, encode_selection,
     run_selection,

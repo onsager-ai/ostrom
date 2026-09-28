@@ -1564,6 +1564,269 @@ fn a_reaped_implementer_whose_harness_ignores_term_leaves_no_orphan() {
     );
 }
 
+const TWO_RUNNERS: &str = concat!(
+    "manifest_version: 1\n",
+    "defaults:\n",
+    "  runner_retry: 2h\n",
+    "  implementers:\n",
+    "    - {runner: agent/codex}\n",
+    "    - {runner: agent/claude, model: claude-placeholder}\n",
+);
+
+/// A `systemd-run` stub that runs the implementer to completion in place.
+fn executing_systemd_run(fixture: &DispatchFixture) -> PathBuf {
+    let systemd_run = fixture.root.path().join("systemd-run-executes");
+    executable(
+        &systemd_run,
+        concat!(
+            "while [ \"$#\" -gt 0 ]; do\n",
+            "  case \"$1\" in\n",
+            "    --setenv) export \"$2\"; shift 2 ;;\n",
+            "    --unit|--description|--property) shift 2 ;;\n",
+            "    --*) shift ;;\n",
+            "    *) break ;;\n",
+            "  esac\n",
+            "done\n",
+            "\"$@\" >>\"$FAKE_IMPLEMENTER_LOG\" 2>&1 || true"
+        ),
+    );
+    systemd_run
+}
+
+fn write_availability(state: &Path, runners: &[(&str, &str)]) {
+    let runners = runners
+        .iter()
+        .map(|(runner, until)| {
+            (
+                (*runner).to_owned(),
+                json!({
+                    "until": until,
+                    "reset_reported": true,
+                    "message": "placeholder limit",
+                    "recorded_at": "2026-09-28T00:00:00Z",
+                    "run_id": "placeholder-run",
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    fs::write(
+        state.join("runner-availability.json"),
+        json!({"schema_version": 1, "runners": runners}).to_string(),
+    )
+    .expect("write runner availability");
+}
+
+/// #626: a runner that refuses on an allowance limit ends its run with
+/// `runner-unavailable` and is marked unavailable; the next dispatch of the
+/// same item goes to the next declared runner and records `work-rerouted`.
+/// The refusal says nothing about the item, so two of them never escalate.
+#[test]
+fn a_usage_limit_reroutes_the_next_dispatch_and_never_escalates() {
+    let fixture = DispatchFixture::new(false);
+    let (_codex_environment, credential) = runnable_implementer(&fixture);
+    executable(
+        &fixture.codex,
+        r#"if [ "${1:-}" = --version ]; then exit 0; fi
+echo "{\"type\":\"error\",\"message\":\"You've hit your usage limit. Try again later.\"}"
+exit 1"#,
+    );
+    compose_current(&fixture.state, TWO_RUNNERS);
+    let implementer_log = fixture.root.path().join("implementer.log");
+    let first = fixture
+        .dispatch(false)
+        .env("MANDATE_GH_AS_BIN", &credential)
+        .env("MANDATE_SYSTEMD_RUN_BIN", executing_systemd_run(&fixture))
+        .env("FAKE_IMPLEMENTER_LOG", &implementer_log)
+        .output()
+        .expect("dispatch to a Codex out of allowance");
+    // A second refusal of the same item: two identical failures would
+    // otherwise escalate and refuse the next dispatch.
+    let mut trace_file = fs::OpenOptions::new()
+        .append(true)
+        .open(fixture.state.join("sprint.jsonl"))
+        .expect("open trace");
+    std::io::Write::write_all(
+        &mut trace_file,
+        format!(
+            "{}\n",
+            json!({
+                "ts": "2026-09-28T00:00:00Z",
+                "kind": "work-failed",
+                "fact": {
+                    "schema_version": 1,
+                    "item_id": "placeholder-org/alpha#7",
+                    "order_id": "2123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                    "reason": "runner-unavailable",
+                    "runner": "agent/codex",
+                },
+                "narration": {},
+            })
+        )
+        .as_bytes(),
+    )
+    .expect("append a second refusal");
+    let claude = fixture.root.path().join("claude-stub");
+    executable(&claude, "exit 0");
+    let second = fixture
+        .dispatch(false)
+        .env("MANDATE_GH_AS_BIN", &credential)
+        .env("CLAUDE_BIN", &claude)
+        .output()
+        .expect("dispatch the same item again");
+
+    let trace = trace(&fixture.state);
+    let refused = trace
+        .iter()
+        .find(|row| row["kind"] == "work-failed")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let rerouted = trace
+        .iter()
+        .find(|row| row["kind"] == "work-rerouted")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let last_dispatched = trace
+        .iter()
+        .rev()
+        .find(|row| row["kind"] == "work-dispatched")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let availability: Value = fs::read(fixture.state.join("runner-availability.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or(Value::Null);
+    let unit = fs::read_to_string(&fixture.systemd_args).unwrap_or_default();
+    assert_eq!(
+        json!({
+            "first_dispatched": first.status.success(),
+            "refusal_reason": refused["fact"]["reason"],
+            "refusal_runner": refused["fact"]["runner"],
+            "codex_reset_reported": availability["runners"]["agent/codex"]["reset_reported"],
+            "second_dispatched": second.status.success(),
+            "rerouted_from": rerouted["fact"]["from"],
+            "rerouted_to": rerouted["fact"]["to"],
+            "rerouted_until_recorded": rerouted["fact"]["until"].is_string(),
+            "rerouted_item": rerouted["fact"]["item_id"],
+            "dispatched_runner": last_dispatched["fact"]["runner"],
+            "unit_runs_claude": unit.lines().any(|line| line == "agent/claude"),
+            "unit_passes_model": unit.lines().any(|line| line == "--model=claude-placeholder"),
+            "escalated": trace.iter().any(|row| row["kind"] == "dispatch-failure-escalated"),
+        }),
+        json!({
+            "first_dispatched": true,
+            "refusal_reason": "runner-unavailable",
+            "refusal_runner": "agent/codex",
+            "codex_reset_reported": false,
+            "second_dispatched": true,
+            "rerouted_from": "agent/codex",
+            "rerouted_to": "agent/claude",
+            "rerouted_until_recorded": true,
+            "rerouted_item": "placeholder-org/alpha#7",
+            "dispatched_runner": "agent/claude",
+            "unit_runs_claude": true,
+            "unit_passes_model": true,
+            "escalated": false,
+        }),
+        "first: {}\nsecond: {}\nimplementer log: {}",
+        String::from_utf8_lossy(&first.stderr),
+        String::from_utf8_lossy(&second.stderr),
+        fs::read_to_string(&implementer_log).unwrap_or_default()
+    );
+}
+
+/// #626: when every declared runner is unavailable, dispatch holds the item
+/// with a `decision.requested` naming the earliest reset and exits non-zero.
+#[test]
+fn every_runner_unavailable_is_a_decision_and_a_non_zero_exit() {
+    let fixture = DispatchFixture::new(false);
+    compose_current(&fixture.state, TWO_RUNNERS);
+    write_availability(
+        &fixture.state,
+        &[
+            ("agent/codex", "2099-01-02T00:00:00Z"),
+            ("agent/claude", "2099-01-01T00:00:00Z"),
+        ],
+    );
+    let output = fixture.dispatch(false).output().expect("dispatch");
+    let trace = trace(&fixture.state);
+    let decision = trace
+        .iter()
+        .find(|row| row["kind"] == "decision-requested")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        json!({
+            "exit": output.status.code(),
+            "decision_subject": decision["fact"]["subject"],
+            "decision_kind": decision["fact"]["kind"],
+            "names_earliest_reset": stderr.contains("agent/claude until 2099-01-01T00:00:00Z"),
+            "dispatched": trace.iter().any(|row| row["kind"] == "work-dispatched"),
+        }),
+        json!({
+            "exit": 3,
+            "decision_subject": "placeholder-org/alpha#7",
+            "decision_kind": "human_decides",
+            "names_earliest_reset": true,
+            "dispatched": false,
+        }),
+        "{stderr}"
+    );
+}
+
+/// #626: a runner whose recorded reset has passed is available again, and
+/// with no policy the order is `[agent/codex]`.
+#[test]
+fn a_reset_in_the_past_makes_the_runner_available_again() {
+    let fixture = DispatchFixture::new(false);
+    write_availability(&fixture.state, &[("agent/codex", "2000-01-01T00:00:00Z")]);
+    let output = fixture.dispatch(false).output().expect("dispatch");
+    let trace = trace(&fixture.state);
+    let dispatched = trace
+        .iter()
+        .find(|row| row["kind"] == "work-dispatched")
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(dispatched["fact"]["runner"], "agent/codex");
+    assert!(!trace.iter().any(|row| row["kind"] == "work-rerouted"));
+}
+
+/// #626: `--runner` overrides the declared order for a hand run.
+#[test]
+fn the_runner_flag_overrides_the_declared_order() {
+    let fixture = DispatchFixture::new(false);
+    compose_current(&fixture.state, TWO_RUNNERS);
+    let claude = fixture.root.path().join("claude-stub");
+    executable(&claude, "exit 0");
+    let output = fixture
+        .dispatch(false)
+        .arg("--runner")
+        .arg("agent/claude")
+        .env("CLAUDE_BIN", &claude)
+        .output()
+        .expect("dispatch with --runner");
+    let trace = trace(&fixture.state);
+    let dispatched = trace
+        .iter()
+        .find(|row| row["kind"] == "work-dispatched")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let unit = fs::read_to_string(&fixture.systemd_args).unwrap_or_default();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(dispatched["fact"]["runner"], "agent/claude");
+    assert!(unit.lines().any(|line| line == "agent/claude"), "{unit}");
+    assert!(!trace.iter().any(|row| row["kind"] == "work-rerouted"));
+}
+
 /// Compose `manifest` as this state root's current policy version, signed as
 /// the operator's, the way `ostrom compose` installs one.
 fn compose_current(state: &Path, manifest: &str) {

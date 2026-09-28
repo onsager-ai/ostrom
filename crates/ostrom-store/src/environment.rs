@@ -227,6 +227,13 @@ pub const OSTROM_HOME: EnvironmentVariable = variable(
     EnvironmentClass::Location,
     "platform config and state directories",
 );
+/// The loop a pass is bound to, set on its harness child so an `ostrom
+/// dispatch` its agent runs resolves that loop's implementer order (#626).
+pub const OSTROM_LOOP: EnvironmentVariable = variable(
+    "OSTROM_LOOP",
+    EnvironmentClass::Identity,
+    "no loop; dispatch uses defaults.implementers",
+);
 pub const OSTROM_NODE_FALLBACKS: EnvironmentVariable = variable(
     "OSTROM_NODE_FALLBACKS",
     EnvironmentClass::Location,
@@ -367,6 +374,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvironmentVariable] = &[
     OSTROM_EVENTS_FD,
     OSTROM_FACTS_ONLY,
     OSTROM_HOME,
+    OSTROM_LOOP,
     OSTROM_NODE_FALLBACKS,
     OSTROM_PLAN_DERIVER,
     OSTROM_PLUGIN_ROOT,

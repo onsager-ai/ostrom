@@ -250,6 +250,12 @@ pub struct ImplementerRunRequest {
     pub transcript: PathBuf,
     pub token_ceiling: u64,
     pub offline: bool,
+    /// The model the consumer chose for this run; `None` leaves the harness
+    /// default.
+    pub model: Option<String>,
+    /// The reasoning effort the consumer chose for this run; `None` leaves the
+    /// harness default.
+    pub effort: Option<String>,
     pub signals: SignalFlags,
     pub supervisor_pid: Option<u32>,
     pub termination_grace: Duration,
@@ -594,23 +600,34 @@ impl AgentRunner for CodexHarness {
         };
         let mut command = Command::new(executable);
         // This literal is deliberately pinned: implementer work is offline.
+        command.args([
+            "exec",
+            "--json",
+            "-C",
+            &request.worktree.display().to_string(),
+            "-s",
+            "workspace-write",
+            "-c",
+            "approval_policy=\"never\"",
+            "-c",
+            "sandbox_workspace_write.network_access=false",
+            "-c",
+            "web_search=\"disabled\"",
+            "-o",
+            &request.result.display().to_string(),
+        ]);
+        // A declared model and effort follow the pinned sandbox and never
+        // replace it. Each is one `=`-joined argument, so a value cannot be
+        // read as a flag of its own.
+        if let Some(model) = &request.model {
+            command.arg(format!("--model={model}"));
+        }
+        if let Some(effort) = &request.effort {
+            command
+                .arg("-c")
+                .arg(format!("model_reasoning_effort=\"{effort}\""));
+        }
         command
-            .args([
-                "exec",
-                "--json",
-                "-C",
-                &request.worktree.display().to_string(),
-                "-s",
-                "workspace-write",
-                "-c",
-                "approval_policy=\"never\"",
-                "-c",
-                "sandbox_workspace_write.network_access=false",
-                "-c",
-                "web_search=\"disabled\"",
-                "-o",
-                &request.result.display().to_string(),
-            ])
             .envs(request.environment.iter().cloned())
             .env("PATH", path)
             .stdin(Stdio::from(input))
@@ -627,38 +644,46 @@ impl AgentRunner for CodexHarness {
             }
         };
         request.spawned.notify(child.id());
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    process_control::kill_remaining_process_group(child.id());
-                    return ProcessOutcome::Exited(status);
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    return ProcessOutcome::Error(ActionFault::new(
-                        "runner_io",
-                        Some(error.to_string()),
-                    ));
-                }
+        supervise_implementer(&mut child, request)
+    }
+}
+
+/// Wait for an implementer harness child, stopping its process group on a
+/// forwarded signal or when its supervisor is gone. Shared by every
+/// implementer harness, so each is bounded the same way.
+pub(crate) fn supervise_implementer(
+    child: &mut std::process::Child,
+    request: &ImplementerRunRequest,
+) -> ProcessOutcome {
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                process_control::kill_remaining_process_group(child.id());
+                return ProcessOutcome::Exited(status);
             }
-            let signal = request.signals.take_pending();
-            let orphaned = request
-                .supervisor_pid
-                .is_some_and(|pid| !process_control::process_alive(pid));
-            if signal.is_some() || orphaned {
-                let signal = signal.unwrap_or("TERM");
-                let termination_signal = process_control::terminate_child_process_group(
-                    &mut child,
-                    request.termination_grace,
-                );
-                let _ = child.wait();
-                return ProcessOutcome::Terminated(RunTermination {
-                    signal,
-                    termination_signal,
-                });
+            Ok(None) => {}
+            Err(error) => {
+                return ProcessOutcome::Error(ActionFault::new(
+                    "runner_io",
+                    Some(error.to_string()),
+                ));
             }
-            thread::sleep(Duration::from_millis(50));
         }
+        let signal = request.signals.take_pending();
+        let orphaned = request
+            .supervisor_pid
+            .is_some_and(|pid| !process_control::process_alive(pid));
+        if signal.is_some() || orphaned {
+            let signal = signal.unwrap_or("TERM");
+            let termination_signal =
+                process_control::terminate_child_process_group(child, request.termination_grace);
+            let _ = child.wait();
+            return ProcessOutcome::Terminated(RunTermination {
+                signal,
+                termination_signal,
+            });
+        }
+        thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -1007,6 +1032,8 @@ mod tests {
             transcript: root.join("events.jsonl"),
             token_ceiling: 100,
             offline: true,
+            model: None,
+            effort: None,
             signals: SignalFlags::default(),
             supervisor_pid: None,
             termination_grace: Duration::from_secs(1),
@@ -1149,5 +1176,39 @@ mod tests {
             .expect("read captured Codex arguments");
         assert!(arguments.contains("-c sandbox_workspace_write.network_access=false"));
         assert!(!arguments.contains("sandbox_workspace_write.network_access=true"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_implementer_argv_carries_a_declared_model_and_effort_after_the_sandbox() {
+        let root = tempdir().expect("Codex runner fixture");
+        fs::create_dir(root.path().join("worktree")).expect("create fixture worktree");
+        fs::write(root.path().join("prompt.md"), "fixture prompt\n").expect("write fixture prompt");
+        let runner = CodexHarness::new("/bin/echo", "fixture-v1", "fixture-model", Vec::new());
+        let RunRequest::Implementer(mut request) = implementer_request(root.path()) else {
+            unreachable!("the fixture is an implementer request");
+        };
+        request.model = Some("fixture-model-x".to_owned());
+        request.effort = Some("max".to_owned());
+
+        let outcome = runner.run(&RunRequest::Implementer(request));
+
+        assert!(
+            outcome.status().is_some_and(|status| status.success()),
+            "Codex fixture outcome: {outcome:?}"
+        );
+        let arguments = fs::read_to_string(root.path().join("events.jsonl"))
+            .expect("read captured Codex arguments");
+        let sandbox = arguments
+            .find("-c sandbox_workspace_write.network_access=false")
+            .expect("the offline sandbox is still pinned");
+        let model = arguments
+            .find("--model=fixture-model-x")
+            .expect("the declared model is passed");
+        assert!(sandbox < model, "{arguments}");
+        assert!(
+            arguments.contains("-c model_reasoning_effort=\"max\""),
+            "{arguments}"
+        );
     }
 }

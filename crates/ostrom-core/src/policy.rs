@@ -200,6 +200,7 @@ impl PolicyManifest {
             "tokens",
             self.defaults.r#loop.tokens.map(|value| value as f64),
         )?;
+        validate_implementers("defaults.implementers", &self.defaults.implementers)?;
         validate_check_definitions(&self.checks, CHECK_ACTIONS)
             .map_err(|error| ManifestValidationError::InvalidChecks(error.to_string()))?;
         for (name, prompt) in &self.prompts {
@@ -355,6 +356,10 @@ impl PolicyManifest {
                 operation: declaration.operation.clone(),
             })?;
         }
+        validate_implementers(
+            &format!("loops.{name}.implementers"),
+            &declaration.implementers,
+        )?;
         validate_positive_ceiling(name, "concurrent", declaration.concurrent.map(|v| v as f64))?;
         validate_positive_ceiling(name, "spend_usd", declaration.spend_usd)?;
         validate_positive_ceiling(name, "tokens", declaration.tokens.map(|v| v as f64))?;
@@ -588,6 +593,8 @@ pub enum ManifestValidationError {
     InvalidLoop { name: String, message: String },
     #[error("checks are invalid: {0}")]
     InvalidChecks(String),
+    #[error("`{field}` is invalid: {message}")]
+    InvalidImplementers { field: String, message: String },
     #[error("prompt `{name}` is invalid: {message}")]
     InvalidPrompt { name: String, message: String },
     #[error("operation `{operation}` step {step} references unknown prompt `prompts.{prompt}`")]
@@ -898,6 +905,10 @@ pub struct LoopDecl {
     /// The idle cap of each run of this loop (#619).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle: Option<CapDuration>,
+    /// The implementer runner order for work this loop dispatches (#626),
+    /// replacing `defaults.implementers` when non-empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub implementers: Vec<ImplementerDecl>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publish: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -935,6 +946,8 @@ impl<'de> Deserialize<'de> for LoopDecl {
             #[serde(default)]
             idle: Option<CapDuration>,
             #[serde(default)]
+            implementers: Vec<ImplementerDecl>,
+            #[serde(default)]
             publish: Option<String>,
             #[serde(default)]
             cadence_hours: Option<u64>,
@@ -954,6 +967,7 @@ impl<'de> Deserialize<'de> for LoopDecl {
             tokens: authored.tokens,
             wall: authored.wall,
             idle: authored.idle,
+            implementers: authored.implementers,
             publish: authored.publish,
             cadence_hours: authored.cadence_hours,
             stuck_after_days: authored.stuck_after_days,
@@ -1268,6 +1282,14 @@ pub struct ManifestDefaults {
     pub r#loop: LoopDefaults,
     #[serde(default, skip_serializing_if = "ImplementerCeilings::is_empty")]
     pub implementer_ceilings: ImplementerCeilings,
+    /// The declared implementer runner order (#626): dispatch takes the first
+    /// entry that is not marked unavailable. Empty means `[agent/codex]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub implementers: Vec<ImplementerDecl>,
+    /// How long a runner that refused on an allowance limit without a
+    /// parseable reset time stays unavailable (#626). Undeclared: one hour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner_retry: Option<CapDuration>,
     #[serde(default, skip_serializing_if = "CheckDefaults::is_empty")]
     pub check: CheckDefaults,
     #[serde(default, skip_serializing_if = "RuleDefaults::is_grant_default")]
@@ -1285,6 +1307,8 @@ impl Default for ManifestDefaults {
             stalls_after: default_stalls_after(),
             r#loop: LoopDefaults::default(),
             implementer_ceilings: ImplementerCeilings::default(),
+            implementers: Vec::new(),
+            runner_retry: None,
             check: CheckDefaults::default(),
             grant: RuleDefaults::default(),
             deny: RuleDefaults::deny(),
@@ -1297,6 +1321,8 @@ impl ManifestDefaults {
         is_default_stalls_after(&self.stalls_after)
             && self.r#loop.is_empty()
             && self.implementer_ceilings.is_empty()
+            && self.implementers.is_empty()
+            && self.runner_retry.is_none()
             && self.check.is_empty()
             && self.grant.is_grant_default()
             && self.deny.is_deny_default()
@@ -1468,6 +1494,136 @@ impl ImplementerCeilings {
             DEFAULT_IMPLEMENTER_WALL_SECONDS,
         )
     }
+}
+
+/// The registry key of the implementer runner used when policy declares none.
+pub const DEFAULT_IMPLEMENTER_RUNNER: &str = "agent/codex";
+
+/// How long a runner that refused on an allowance limit stays unavailable when
+/// it reported no reset time and `defaults.runner_retry` is undeclared.
+pub const DEFAULT_RUNNER_RETRY_SECONDS: u64 = 60 * 60;
+
+/// One entry of an implementer runner order (#626): a runner registry key such
+/// as `agent/codex`, and optionally the model and effort it runs with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImplementerDecl {
+    pub runner: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+impl ImplementerDecl {
+    /// The entry used when policy declares no order: Codex with its defaults.
+    #[must_use]
+    pub fn default_runner() -> Self {
+        Self {
+            runner: DEFAULT_IMPLEMENTER_RUNNER.to_owned(),
+            model: None,
+            effort: None,
+        }
+    }
+}
+
+impl PolicyManifest {
+    /// The implementer runner order for work dispatched under `loop_name`:
+    /// the loop's own non-empty list, else `defaults.implementers`, else
+    /// `[agent/codex]`. An unknown loop name is an error, never a silent fall
+    /// back to the defaults.
+    pub fn resolve_implementers(
+        &self,
+        loop_name: Option<&str>,
+    ) -> Result<Vec<ImplementerDecl>, LoopResolutionError> {
+        let declared = match loop_name {
+            Some(name) => {
+                let declaration = self
+                    .loops
+                    .get(name)
+                    .ok_or_else(|| LoopResolutionError::Unknown(name.to_owned()))?;
+                if declaration.implementers.is_empty() {
+                    &self.defaults.implementers
+                } else {
+                    &declaration.implementers
+                }
+            }
+            None => &self.defaults.implementers,
+        };
+        Ok(if declared.is_empty() {
+            vec![ImplementerDecl::default_runner()]
+        } else {
+            declared.clone()
+        })
+    }
+
+    /// `defaults.runner_retry` in seconds, else [`DEFAULT_RUNNER_RETRY_SECONDS`].
+    #[must_use]
+    pub fn runner_retry_seconds(&self) -> u64 {
+        self.defaults
+            .runner_retry
+            .as_ref()
+            .map_or(DEFAULT_RUNNER_RETRY_SECONDS, CapDuration::as_seconds)
+    }
+}
+
+/// An implementer order names each runner at most once, and every value it
+/// hands to a harness argv is a plain token: nothing may begin with `-` and be
+/// read as a flag.
+fn validate_implementers(
+    field: &str,
+    implementers: &[ImplementerDecl],
+) -> Result<(), ManifestValidationError> {
+    let invalid = |message: String| ManifestValidationError::InvalidImplementers {
+        field: field.to_owned(),
+        message,
+    };
+    let mut seen = BTreeSet::new();
+    for entry in implementers {
+        let component = entry.runner.strip_prefix("agent/").unwrap_or_default();
+        if component.is_empty()
+            || !component
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(invalid(format!(
+                "runner `{}` must be a registry key such as `agent/codex`",
+                entry.runner
+            )));
+        }
+        if !seen.insert(entry.runner.as_str()) {
+            return Err(invalid(format!(
+                "runner `{}` is declared more than once",
+                entry.runner
+            )));
+        }
+        if let Some(model) = &entry.model
+            && !valid_harness_token(model)
+        {
+            return Err(invalid(format!(
+                "model `{model}` of `{}` must be a non-empty token that does not begin with `-`",
+                entry.runner
+            )));
+        }
+        if let Some(effort) = &entry.effort
+            && (effort.is_empty() || !effort.bytes().all(|byte| byte.is_ascii_lowercase()))
+        {
+            return Err(invalid(format!(
+                "effort `{effort}` of `{}` must be a lowercase word such as `high`",
+                entry.runner
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn valid_harness_token(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('-')
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/' | b'[' | b']')
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2913,5 +3069,112 @@ denies:
         ));
         assert!(format!("{:?}", findings[0]).contains("retired-tools"));
         assert!(format!("{:?}", findings[0]).contains("*-tools"));
+    }
+
+    /// #626: the runner order is `[agent/codex]` when nothing is declared,
+    /// `defaults.implementers` otherwise, and a loop's own list replaces the
+    /// defaults for work that loop dispatches.
+    #[test]
+    fn implementer_order_resolves_from_loop_then_defaults_then_codex() {
+        let undeclared = PolicyManifest::from_yaml("manifest_version: 1\n").expect("parse");
+        assert_eq!(
+            undeclared.resolve_implementers(None).expect("resolve"),
+            [ImplementerDecl::default_runner()]
+        );
+        assert_eq!(
+            undeclared.runner_retry_seconds(),
+            DEFAULT_RUNNER_RETRY_SECONDS
+        );
+
+        let manifest = PolicyManifest::from_yaml(concat!(
+            "manifest_version: 1\n",
+            "defaults:\n",
+            "  runner_retry: 2h\n",
+            "  implementers:\n",
+            "    - {runner: agent/codex, model: gpt-placeholder, effort: max}\n",
+            "    - {runner: agent/claude, model: claude-placeholder}\n",
+            "actors: {builder: {}}\n",
+            "operations: {work: {steps: []}}\n",
+            "loops:\n",
+            "  day: {actor: builder, operation: work, every: hourly}\n",
+            "  night:\n",
+            "    actor: builder\n",
+            "    operation: work\n",
+            "    every: hourly\n",
+            "    implementers: [{runner: agent/claude}]\n",
+        ))
+        .expect("parse declared order");
+        let runners = |loop_name| {
+            manifest
+                .resolve_implementers(loop_name)
+                .expect("resolve")
+                .into_iter()
+                .map(|entry| entry.runner)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(runners(None), ["agent/codex", "agent/claude"]);
+        assert_eq!(runners(Some("day")), ["agent/codex", "agent/claude"]);
+        assert_eq!(runners(Some("night")), ["agent/claude"]);
+        assert_eq!(
+            manifest.resolve_implementers(None).expect("resolve")[0],
+            ImplementerDecl {
+                runner: "agent/codex".to_owned(),
+                model: Some("gpt-placeholder".to_owned()),
+                effort: Some("max".to_owned()),
+            }
+        );
+        assert_eq!(manifest.runner_retry_seconds(), 7_200);
+        assert_eq!(
+            manifest.resolve_implementers(Some("missing")),
+            Err(LoopResolutionError::Unknown("missing".to_owned()))
+        );
+    }
+
+    #[test]
+    fn an_implementer_order_names_each_runner_once_with_plain_tokens() {
+        for (source, fragment) in [
+            (
+                "  implementers: [{runner: agent/codex}, {runner: agent/codex}]\n",
+                "declared more than once",
+            ),
+            ("  implementers: [{runner: codex}]\n", "registry key"),
+            ("  implementers: [{runner: agent/}]\n", "registry key"),
+            (
+                "  implementers: [{runner: agent/codex, model: '--dangerous'}]\n",
+                "does not begin with `-`",
+            ),
+            (
+                "  implementers: [{runner: agent/codex, effort: High}]\n",
+                "lowercase word",
+            ),
+        ] {
+            let error =
+                PolicyManifest::from_yaml(&format!("manifest_version: 1\ndefaults:\n{source}"))
+                    .expect_err("invalid order must be refused");
+            assert!(error.to_string().contains(fragment), "{source}: {error}");
+        }
+        let error = PolicyManifest::from_yaml(concat!(
+            "manifest_version: 1\n",
+            "actors: {builder: {}}\n",
+            "operations: {work: {steps: []}}\n",
+            "loops:\n",
+            "  day:\n",
+            "    actor: builder\n",
+            "    operation: work\n",
+            "    every: hourly\n",
+            "    implementers: [{runner: agent/claude}, {runner: agent/claude}]\n",
+        ))
+        .expect_err("a loop's order is validated too");
+        assert!(
+            error.to_string().contains("loops.day.implementers"),
+            "{error}"
+        );
+        assert!(
+            PolicyManifest::parse_yaml(
+                "manifest_version: 1\ndefaults:\n  implementers: [{runner: agent/codex, sandbox: none}]\n"
+            )
+            .is_err(),
+            "an unknown entry field is refused, not ignored"
+        );
     }
 }

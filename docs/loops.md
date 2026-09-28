@@ -119,8 +119,25 @@ One run id names each hold. `ostrom dispatch` mints the implementer's run id bef
 |---|---|---|
 | `OSTROM_RUN_ID` | a pass's harness process; every implementer harness process; a dispatched `ostrom implement` | the pass's `run_id` from `pass-started`; the implementer's effective run id: the `run_id` recorded in `work-dispatched`, or the one a hand run minted |
 | `OSTROM_WORK_ORDER_ID` | every implementer harness process; a dispatched `ostrom implement` | the `order_id` of the work order being executed |
+| `OSTROM_LOOP` | a loop-bound pass's harness process (removed on an unbound pass's) | the loop's name, so an `ostrom dispatch` the agent runs resolves that loop's implementer order (#626) |
 
 ostrom sets each value explicitly on the child it starts, never by changing its own process environment, and the value it sets replaces any the parent inherited from an enclosing run. A dispatched `ostrom implement` receives both through its runner's launch environment, under either dispatch backend. `ostrom implement` then sets both again, directly on its harness child, from its own effective run id and order, so an implementer run by hand inside another run (a pass's agent, say) never labels its harness with that run's id. ostrom reads `OSTROM_RUN_ID` itself only to record a dispatch's `parent_run_id`. The loop worker `ostrom up` starts does not carry the contract; it has no run id of its own.
+
+### Implementer runners and allowance routing
+
+Which runner implements a work order is policy (#626). `defaults.implementers` declares an ordered list, at most one entry per runner, each naming a runner registry key and optionally a `model` and `effort`; a loop's own `implementers` replaces it for the work that loop dispatches (the pass tells its agent the loop through `OSTROM_LOOP`). With nothing declared, or no current policy version, the order is `[agent/codex]`, as before.
+
+```yaml
+defaults:
+  runner_retry: 1h
+  implementers:
+    - {runner: agent/codex, effort: high}
+    - {runner: agent/claude, model: claude-sonnet-5}
+```
+
+`ostrom dispatch` takes the first runner that is not marked unavailable and records it as `runner` in `work-dispatched`; `--runner <key>` replaces the order for a hand run. A runner that refuses on an allowance limit ends its run with `work-failed`, `reason: "runner-unavailable"` and `runner`, and is marked unavailable in `<state>/runner-availability.json` until the reset time it reported, or for `defaults.runner_retry` (one hour when undeclared) when it reported none that could be read; its own message is kept there. That reason says nothing about the item, so it never counts toward the repeated-failure escalation. A later dispatch skips the runner until its reset passes and records `work-rerouted` (`item_id`, `order_id`, `run_id`, `from`, `to`, `until`) beside `work-dispatched`. When every declared runner is unavailable, dispatch holds the item with a `decision.requested` (subject: the item) naming the earliest reset and exits 3; it never waits silently.
+
+The Claude implementer runs `claude --print --restricted` in the worktree with a generated settings profile beside its transcript: every shell command runs in Claude Code's sandbox, which fails rather than run unsandboxed, never retries a blocked command outside it, may write only the worktree and its temp directory, and reaches no network host (no allowed domain, strict allowlist); `WebFetch` and `WebSearch` are denied and no MCP server is loaded. This matches Codex's `workspace-write` sandbox with network off. It needs Claude Code 2.1.259 or later and refuses an older release. Its token ceiling is enforced while it runs by the same watchdog, from the usage its stream reports.
 
 ### Run caps and stalls
 

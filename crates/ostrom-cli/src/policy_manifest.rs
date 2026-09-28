@@ -589,6 +589,18 @@ fn compose_scopes(
             .idle
             .clone_from(&operator.defaults.implementer_ceilings.idle);
     }
+    if repository.defaults.implementers.is_empty() {
+        repository
+            .defaults
+            .implementers
+            .clone_from(&operator.defaults.implementers);
+    }
+    if repository.defaults.runner_retry.is_none() {
+        repository
+            .defaults
+            .runner_retry
+            .clone_from(&operator.defaults.runner_retry);
+    }
 
     merge_fallback(&mut repository.inputs, operator.inputs.clone());
     merge_fallback(&mut repository.actors, operator.actors.clone());

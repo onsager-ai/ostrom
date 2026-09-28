@@ -234,6 +234,16 @@ enum Command {
         /// The idle cap dispatch resolved from policy, in seconds.
         #[arg(long, hide = true)]
         idle_seconds: Option<u64>,
+        /// The model policy declared for this runner.
+        #[arg(long, hide = true)]
+        model: Option<String>,
+        /// The effort policy declared for this runner.
+        #[arg(long, hide = true)]
+        effort: Option<String>,
+        /// How long this runner stays unavailable after an allowance refusal
+        /// that reported no reset time, in seconds.
+        #[arg(long, hide = true)]
+        runner_retry_seconds: Option<u64>,
     },
     /// Report or remove worktrees whose remote work is mechanically resolved.
     ReapWorktrees {
@@ -267,6 +277,12 @@ enum Command {
         wall_seconds: Option<u64>,
         #[arg(long)]
         idle_seconds: Option<u64>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        effort: Option<String>,
+        #[arg(long)]
+        runner_retry_seconds: Option<u64>,
         supervisor_pid: u32,
     },
     #[command(name = "__loop-worker", hide = true)]
@@ -895,6 +911,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             run_id,
             wall_seconds,
             idle_seconds,
+            model,
+            effort,
+            runner_retry_seconds,
         } => {
             let events_fd = resolve_events_fd(events_fd)?;
             let mut arguments = vec![
@@ -914,6 +933,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             if let Some(seconds) = idle_seconds {
                 arguments.extend(["--idle-seconds".into(), seconds.to_string().into()]);
+            }
+            if let Some(model) = model {
+                arguments.push(format!("--model={model}").into());
+            }
+            if let Some(effort) = effort {
+                arguments.push(format!("--effort={effort}").into());
+            }
+            if let Some(seconds) = runner_retry_seconds {
+                arguments.extend(["--runner-retry-seconds".into(), seconds.to_string().into()]);
             }
             supervise(&arguments, Some((&work_order_file, &unit_name)), &clock)
         }
@@ -954,6 +982,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             run_id,
             wall_seconds,
             idle_seconds,
+            model,
+            effort,
+            runner_retry_seconds,
             supervisor_pid,
         } => run_implement_worker(
             work_order_file,
@@ -963,6 +994,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             resolve_events_fd(events_fd)?,
             run_id,
             implementer_run_caps(wall_seconds, idle_seconds),
+            (model, effort),
+            runner_retry_seconds.unwrap_or(ostrom_core::DEFAULT_RUNNER_RETRY_SECONDS),
             clock,
         ),
         Command::Dispatch { arguments } => {
@@ -2865,6 +2898,7 @@ fn run_pass_worker(
         control_fd,
         facts_only,
         repositories: loop_name.map(|_| effective.repositories.clone()),
+        loop_name: loop_name.map(str::to_owned),
         skipped_repositories: effective.skipped,
         repository_scope: Some(effective.repositories),
         sweep: Some(PassSweepRequest {
@@ -3217,6 +3251,8 @@ fn run_implement_worker(
     events_fd: Option<u32>,
     run_id: Option<String>,
     caps: ResolvedRunCaps,
+    (model, effort): (Option<String>, Option<String>),
+    runner_retry_seconds: u64,
     clock: Clock,
 ) -> ! {
     let signals = register_signals().unwrap_or_else(|error| {
@@ -3243,6 +3279,9 @@ fn run_implement_worker(
         clock,
         run_id,
         caps,
+        model,
+        effort,
+        runner_retry_seconds,
     };
     let registry = core_agent_registry();
     match run_implement_with_registry(&request, &registry, &runner_name) {
@@ -3269,17 +3308,42 @@ fn implementer_run_caps(wall_seconds: Option<u64>, idle_seconds: Option<u64>) ->
     }
 }
 
-/// `defaults.implementer_ceilings` from the current composed version, digest
-/// checked (#619). With no current version the constants apply; a current
-/// version that exists but cannot be trusted refuses dispatch rather than
-/// silently running an implementer without the caps its operator declared.
-fn dispatch_implementer_caps(paths: &OstromPaths) -> ResolvedRunCaps {
+/// What dispatch takes from the current composed version, digest checked:
+/// `defaults.implementer_ceilings` (#619), and the implementer runner order
+/// and retry (#626) of the loop the dispatcher runs under (`OSTROM_LOOP`),
+/// else of `defaults`. With no current version the constants apply and the
+/// order is `[agent/codex]`; a current version that exists but cannot be
+/// trusted refuses dispatch rather than silently running an implementer
+/// without the policy its operator declared.
+fn dispatch_policy(
+    paths: &OstromPaths,
+) -> (ResolvedRunCaps, Vec<ostrom_core::ImplementerDecl>, u64) {
     match policy_version::load_current(paths) {
-        Ok(current) => current.manifest.defaults.implementer_ceilings.run_caps(),
+        Ok(current) => {
+            let loop_name = environment::OSTROM_LOOP
+                .value()
+                .filter(|name| !name.trim().is_empty());
+            let implementers = current
+                .manifest
+                .resolve_implementers(loop_name.as_deref())
+                .unwrap_or_else(|error| {
+                    eprintln!("ostrom dispatch: {error}");
+                    std::process::exit(2);
+                });
+            (
+                current.manifest.defaults.implementer_ceilings.run_caps(),
+                implementers,
+                current.manifest.runner_retry_seconds(),
+            )
+        }
         Err(policy_version::CurrentPolicyError::Inconclusive {
             cause: "current_missing",
             ..
-        }) => ResolvedRunCaps::implementer_default(),
+        }) => (
+            ResolvedRunCaps::implementer_default(),
+            vec![ostrom_core::ImplementerDecl::default_runner()],
+            ostrom_core::DEFAULT_RUNNER_RETRY_SECONDS,
+        ),
         Err(error) => {
             eprintln!("ostrom dispatch: {error}");
             std::process::exit(2);
@@ -3287,10 +3351,33 @@ fn dispatch_implementer_caps(paths: &OstromPaths) -> ResolvedRunCaps {
     }
 }
 
+fn dispatch_usage() -> ! {
+    eprintln!("usage: ostrom dispatch [--runner <agent/name>] <work-order-file>");
+    std::process::exit(2);
+}
+
 fn run_dispatch_command(arguments: Vec<String>, clock: Clock) -> ! {
+    let mut runner_override = None;
+    let mut positional = Vec::new();
+    let mut arguments = arguments.into_iter();
+    while let Some(argument) = arguments.next() {
+        if argument == "--runner" {
+            runner_override = Some(arguments.next().unwrap_or_else(|| dispatch_usage()));
+        } else if let Some(runner) = argument.strip_prefix("--runner=") {
+            runner_override = Some(runner.to_owned());
+        } else {
+            positional.push(argument);
+        }
+    }
+    let arguments = positional;
+    if runner_override
+        .as_deref()
+        .is_some_and(|runner| !runner.starts_with("agent/") || runner.len() <= "agent/".len())
+    {
+        dispatch_usage();
+    }
     let [order_file] = arguments.as_slice() else {
-        eprintln!("usage: ostrom dispatch <work-order-file>");
-        std::process::exit(2);
+        dispatch_usage();
     };
     let working_directory = env::current_dir().unwrap_or_else(|error| {
         eprintln!("ostrom dispatch: could not resolve working directory: {error}");
@@ -3301,13 +3388,16 @@ fn run_dispatch_command(arguments: Vec<String>, clock: Clock) -> ! {
         PathBuf::from,
     );
     let paths = compatible_command_paths();
-    let implementer_caps = dispatch_implementer_caps(&paths);
+    let (implementer_caps, implementers, runner_retry_seconds) = dispatch_policy(&paths);
     let request = DispatchRequest {
         paths,
         working_directory,
         plugin_root,
         order_file: PathBuf::from(order_file),
         implementer_caps,
+        implementers,
+        runner_override,
+        runner_retry_seconds,
         repositories: inherited_repository_scope().unwrap_or_else(|error| {
             eprintln!("ostrom dispatch: {error}");
             std::process::exit(2);
@@ -3315,11 +3405,7 @@ fn run_dispatch_command(arguments: Vec<String>, clock: Clock) -> ! {
         clock,
     };
     let registry = core_agent_registry();
-    match run_dispatch_with_registry(
-        &request,
-        &registry,
-        ostrom_store::DEFAULT_IMPLEMENTER_RUNNER,
-    ) {
+    match run_dispatch_with_registry(&request, &registry) {
         Ok(DispatchOutcome::Started(unit)) => {
             println!("{unit}");
             std::process::exit(0);
