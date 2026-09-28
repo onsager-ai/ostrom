@@ -244,25 +244,21 @@ fn check(
 /// Reach the canary's host without the sandbox, the way the canary's own
 /// `curl` would: the same binary, and this process's environment unchanged, so
 /// the operator's proxy variables apply exactly as they would to the canary.
+/// Only the exit status is kept: curl's stderr can echo a proxy URL verbatim,
+/// credential and all.
 fn control_reaches_host() -> Result<(), String> {
-    let output = std::process::Command::new("curl")
+    let status = std::process::Command::new("curl")
         .args(["-sS", "-m", "10", "-o", "/dev/null"])
         .arg(format!("https://{CANARY_HOST}"))
         .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|error| format!("could not run curl: {error}"))?;
-    if output.status.success() {
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|error| format!("could not run curl: {}", error.kind()))?;
+    if status.success() {
         Ok(())
     } else {
-        Err(format!(
-            "curl exited with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-                .trim()
-                .chars()
-                .take(200)
-                .collect::<String>()
-        ))
+        Err(format!("curl exited with {status}"))
     }
 }
 
@@ -285,15 +281,14 @@ pub(crate) fn redact_userinfo(value: &str) -> String {
         .split(',')
         .map(|item| {
             let (scheme, rest) = item.split_once("://").unwrap_or(("", item));
-            let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-            let (authority, path) = rest.split_at(authority_end);
-            let host = authority
-                .rsplit_once('@')
-                .map_or(authority, |(_, host)| host);
+            // Everything up to the last `@` goes, even across a `/`, `?` or
+            // `#`: a raw password in a proxy variable may hold any of them.
+            // A path holding an `@` is over-redacted, which is the safe way.
+            let rest = rest.rsplit_once('@').map_or(rest, |(_, host)| host);
             if scheme.is_empty() {
-                format!("{host}{path}")
+                rest.to_owned()
             } else {
-                format!("{scheme}://{host}{path}")
+                format!("{scheme}://{rest}")
             }
         })
         .collect::<Vec<_>>()
