@@ -47,8 +47,7 @@ pub fn read_host_resources(sys_root: &Path, proc_root: &Path) -> HostResourceRea
 /// possibly tracking a hotter unrelated sensor there — the least bad default
 /// when nothing names the package explicitly.
 pub fn read_cpu_temp_c(sys_root: &Path) -> Result<f64, String> {
-    // TEMPORARY mutation for principle-7 evidence (#628): never matches.
-    if let Some(value) = read_labelled_hwmon_temp(sys_root, "Package id 0 (disabled)") {
+    if let Some(value) = read_labelled_hwmon_temp(sys_root, "Package id 0") {
         return Ok(value);
     }
     if let Some(value) = read_thermal_zone_temp(sys_root, "x86_pkg_temp") {

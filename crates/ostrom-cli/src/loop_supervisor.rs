@@ -314,14 +314,7 @@ pub(crate) fn reconcile(
         // Undeclared limits (`is_empty`) skip the read entirely.
         if !resolved.admission.is_empty() {
             let (sys_root, proc_root) = umwelt_edge::admission_roots();
-            let _ = umwelt_edge::read_admission_reading(&sys_root, &proc_root);
-            // TEMPORARY mutation for principle-7 evidence (#628): the taken
-            // reading is discarded above and replaced with an always-clean
-            // one, so the guard never holds.
-            let reading = ostrom_core::AdmissionReading {
-                cpu_temp_c: Ok(0.0),
-                load_per_cpu: Ok(0.0),
-            };
+            let reading = umwelt_edge::read_admission_reading(&sys_root, &proc_root);
             if let AdmissionDecision::Held {
                 reason,
                 metric,

@@ -235,8 +235,7 @@ fn run_dispatch_with_registry_and_minter(
 
     // Checked before any GitHub call or worktree work, so a machine the
     // admission limits refuse spends nothing finding that out (#628).
-    // TEMPORARY mutation for principle-7 evidence (#628): guard disabled.
-    let _ = check_admission(&context);
+    check_admission(&context)?;
 
     if request
         .repositories
