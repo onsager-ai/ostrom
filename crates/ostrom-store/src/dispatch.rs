@@ -338,7 +338,7 @@ fn run_dispatch_with_registry_and_minter(
     // The runner is chosen only now, after every check that could refuse the
     // item for its own sake, so an all-runners-unavailable hold is never
     // raised for an item that would have been refused anyway.
-    choose_runner(&mut context)?;
+    choose_runner(&mut context, registry)?;
     let runner_name = context.runner.clone();
     let runner_name = runner_name.as_str();
 
@@ -606,7 +606,7 @@ fn after_lease(
         .filter(|row| {
             matches!(
                 row.kind.as_str(),
-                "pass-ended" | "work-completed" | "work-failed"
+                "pass-ended" | "work-completed" | "work-failed" | "sandbox-checked"
             )
         })
         .filter_map(|row| row.fact.get("cost_usd").and_then(Value::as_f64))
@@ -929,7 +929,10 @@ fn implementer_arguments(context: &DispatchContext<'_>) -> Vec<String> {
 /// Take the first declared runner that is not marked unavailable (#626). When
 /// every one is, hold the item with a `decision.requested` naming the earliest
 /// reset and refuse with a non-zero exit: never a silent wait.
-fn choose_runner(context: &mut DispatchContext<'_>) -> Result<(), DispatchError> {
+fn choose_runner(
+    context: &mut DispatchContext<'_>,
+    registry: &AgentRegistry,
+) -> Result<(), DispatchError> {
     let request = context.request;
     let declared = if request.implementers.is_empty() {
         vec![ImplementerDecl::default_runner()]
@@ -957,6 +960,25 @@ fn choose_runner(context: &mut DispatchContext<'_>) -> Result<(), DispatchError>
     let mut skipped = Vec::new();
     for entry in order {
         if let Some(until) = unavailable_until(&availability, &entry.runner, now) {
+            skipped.push((entry.runner, until));
+            continue;
+        }
+        // Claude runs only once its sandbox was seen to hold (#626). A failed
+        // canary has marked it unavailable, so it is skipped like a limit.
+        if entry.runner == crate::implement::CLAUDE_RUNNER
+            && let Err(message) = crate::sandbox_canary::ensure_claude_sandbox(
+                &request.paths,
+                &request.clock,
+                registry,
+                entry.model.as_deref(),
+                request.runner_retry_seconds,
+            )
+        {
+            eprintln!("ostrom dispatch: {} skipped: {message}", entry.runner);
+            let until = read_availability(&request.paths)
+                .ok()
+                .and_then(|availability| unavailable_until(&availability, &entry.runner, now))
+                .unwrap_or(now);
             skipped.push((entry.runner, until));
             continue;
         }

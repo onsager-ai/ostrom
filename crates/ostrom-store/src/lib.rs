@@ -32,6 +32,7 @@ mod repair;
 mod repository_scope;
 mod run_events;
 mod runner_availability;
+mod sandbox_canary;
 mod selection;
 mod selector;
 mod stalls;

@@ -1602,6 +1602,7 @@ fn write_availability(state: &Path, runners: &[(&str, &str)]) {
                 json!({
                     "until": until,
                     "reset_reported": true,
+                    "reason": "usage-limit",
                     "message": "placeholder limit",
                     "recorded_at": "2026-09-28T00:00:00Z",
                     "run_id": "placeholder-run",
@@ -1665,8 +1666,7 @@ exit 1"#,
         .as_bytes(),
     )
     .expect("append a second refusal");
-    let claude = fixture.root.path().join("claude-stub");
-    executable(&claude, "exit 0");
+    let (claude, _canary_calls) = claude_canary_stub(&fixture, "DENIED");
     let second = fixture
         .dispatch(false)
         .env("MANDATE_GH_AS_BIN", &credential)
@@ -1801,8 +1801,7 @@ fn a_reset_in_the_past_makes_the_runner_available_again() {
 fn the_runner_flag_overrides_the_declared_order() {
     let fixture = DispatchFixture::new(false);
     compose_current(&fixture.state, TWO_RUNNERS);
-    let claude = fixture.root.path().join("claude-stub");
-    executable(&claude, "exit 0");
+    let (claude, _canary_calls) = claude_canary_stub(&fixture, "DENIED");
     let output = fixture
         .dispatch(false)
         .arg("--runner")
@@ -1825,6 +1824,148 @@ fn the_runner_flag_overrides_the_declared_order() {
     assert_eq!(dispatched["fact"]["runner"], "agent/claude");
     assert!(unit.lines().any(|line| line == "agent/claude"), "{unit}");
     assert!(!trace.iter().any(|row| row["kind"] == "work-rerouted"));
+}
+
+/// A Claude stub for the sandbox canary: it reports the version in
+/// `claude.version` (2.1.283 when absent), counts each session, runs "the
+/// command" in its working directory and reports the network as `network`.
+fn claude_canary_stub(fixture: &DispatchFixture, network: &str) -> (PathBuf, PathBuf) {
+    let claude = fixture.root.path().join("claude-stub");
+    let calls = fixture.root.path().join("claude.calls");
+    let version = fixture.root.path().join("claude.version");
+    executable(
+        &claude,
+        &format!(
+            concat!(
+                "if [ \"${{1:-}}\" = --version ]; then echo \"$(cat '{version}' 2>/dev/null || echo 2.1.283) (Claude Code)\"; exit 0; fi\n",
+                "printf '%s\\n' call >>'{calls}'\n",
+                "cat >/dev/null\n",
+                "touch inside.marker\n",
+                "echo '{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"tool_result\",\"tool_use_id\":\"t1\",\"content\":\"CANARY-NETWORK-{network}\"}}]}}}}'\n",
+                "echo '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"DONE\",\"total_cost_usd\":0.01}}'",
+            ),
+            version = version.display(),
+            calls = calls.display(),
+            network = network,
+        ),
+    );
+    (claude, calls)
+}
+
+fn canary_calls(calls: &Path) -> usize {
+    fs::read_to_string(calls).map_or(0, |calls| calls.lines().count())
+}
+
+/// #626: Claude Code runs without a settings file it cannot read, so Claude is
+/// used only after a canary saw its sandbox deny the network. A Claude whose
+/// canary reaches the network is marked unavailable with `sandbox-unverified`
+/// and routing moves on to the next runner.
+#[test]
+fn a_claude_whose_canary_reaches_the_network_is_skipped_for_the_next_runner() {
+    let fixture = DispatchFixture::new(false);
+    compose_current(
+        &fixture.state,
+        "manifest_version: 1\ndefaults:\n  implementers: [{runner: agent/claude}, {runner: agent/codex}]\n",
+    );
+    let (claude, calls) = claude_canary_stub(&fixture, "REACHED");
+    let output = fixture
+        .dispatch(false)
+        .env("CLAUDE_BIN", &claude)
+        .output()
+        .expect("dispatch");
+    let trace = trace(&fixture.state);
+    let row = |kind: &str| {
+        trace
+            .iter()
+            .find(|row| row["kind"] == kind)
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    let availability: Value = fs::read(fixture.state.join("runner-availability.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or(Value::Null);
+    assert_eq!(
+        json!({
+            "dispatched": output.status.success(),
+            "canary_ran": canary_calls(&calls),
+            "canary_outcome": row("sandbox-checked")["fact"]["outcome"],
+            "canary_cost_recorded": row("sandbox-checked")["fact"]["cost_usd"],
+            "claude_reason": availability["runners"]["agent/claude"]["reason"],
+            "rerouted_from": row("work-rerouted")["fact"]["from"],
+            "runner": row("work-dispatched")["fact"]["runner"],
+            "pass_cached": fixture.state.join("sandbox-canary.json").exists(),
+        }),
+        json!({
+            "dispatched": true,
+            "canary_ran": 1,
+            "canary_outcome": "fail",
+            "canary_cost_recorded": 0.01,
+            "claude_reason": "sandbox-unverified",
+            "rerouted_from": "agent/claude",
+            "runner": "agent/codex",
+            "pass_cached": false,
+        }),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// #626: a denied canary is cached per (claude version, profile hash); the
+/// same binary is not checked again, and a new version is.
+#[test]
+fn a_passing_canary_is_cached_until_the_claude_version_changes() {
+    let fixture = DispatchFixture::new(false);
+    let (claude, calls) = claude_canary_stub(&fixture, "DENIED");
+    let dispatch = || {
+        fixture
+            .dispatch(false)
+            .arg("--runner=agent/claude")
+            .env("CLAUDE_BIN", &claude)
+            .output()
+            .expect("dispatch")
+    };
+    let first = dispatch();
+    let cache: Value = fs::read(fixture.state.join("sandbox-canary.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or(Value::Null);
+    let after_first = canary_calls(&calls);
+    // The item is now held, so these dispatches are refused after the runner
+    // is chosen; only whether the canary ran again matters here.
+    let _ = dispatch();
+    let after_same_version = canary_calls(&calls);
+    fs::write(fixture.root.path().join("claude.version"), "2.1.300").expect("upgrade claude");
+    let _ = dispatch();
+    let after_upgrade = canary_calls(&calls);
+    let dispatched = trace(&fixture.state)
+        .into_iter()
+        .find(|row| row["kind"] == "work-dispatched")
+        .unwrap_or(Value::Null);
+    assert_eq!(
+        json!({
+            "first_dispatched": first.status.success(),
+            "runner": dispatched["fact"]["runner"],
+            "cached_version": cache["runners"]["agent/claude"]["version"],
+            "cached_hash_is_sha256": cache["runners"]["agent/claude"]["profile_sha256"]
+                .as_str()
+                .is_some_and(|hash| hash.len() == 64),
+            "after_first": after_first,
+            "after_same_version": after_same_version,
+            "after_upgrade": after_upgrade,
+        }),
+        json!({
+            "first_dispatched": true,
+            "runner": "agent/claude",
+            "cached_version": "2.1.283 (Claude Code)",
+            "cached_hash_is_sha256": true,
+            "after_first": 1,
+            "after_same_version": 1,
+            "after_upgrade": 2,
+        }),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
 }
 
 /// Compose `manifest` as this state root's current policy version, signed as

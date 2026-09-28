@@ -54,7 +54,7 @@ pub use ostrom_core::DEFAULT_IMPLEMENTER_RUNNER;
 /// a repeated-failure escalation.
 pub const RUNNER_UNAVAILABLE_REASON: &str = "runner-unavailable";
 
-const CLAUDE_RUNNER: &str = "agent/claude";
+pub(crate) const CLAUDE_RUNNER: &str = "agent/claude";
 
 #[derive(Debug, Clone)]
 pub struct ImplementRequest {
@@ -566,7 +566,7 @@ fn run_already_terminal(paths: &OstromPaths, order_id: &str, run_id: &str) -> bo
 /// raises the run's own TERM flag, so the run stops through the path a
 /// scheduler signal already takes: Codex's process group is terminated with
 /// the termination grace and the terminal row is written by this process.
-struct WallCap {
+pub(crate) struct WallCap {
     seconds: u64,
     tokens: Option<u64>,
     tripped: Arc<AtomicBool>,
@@ -578,7 +578,11 @@ struct WallCap {
 impl WallCap {
     /// `tokens`, when present, is a Claude transcript and its token ceiling:
     /// the transcript is followed and fed to the watchdog as it grows.
-    fn start(seconds: u64, tokens: Option<(PathBuf, u64)>, signals: &SignalFlags) -> Self {
+    pub(crate) fn start(
+        seconds: u64,
+        tokens: Option<(PathBuf, u64)>,
+        signals: &SignalFlags,
+    ) -> Self {
         let tripped = Arc::new(AtomicBool::new(false));
         let tripped_tokens = Arc::new(AtomicBool::new(false));
         let caps = RunCaps {
@@ -635,7 +639,7 @@ impl WallCap {
         self.tripped.load(Ordering::Acquire)
     }
 
-    fn stop(&mut self) {
+    pub(crate) fn stop(&mut self) {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
@@ -782,6 +786,19 @@ fn implement_inner(
             format!("implementer harness is not registered: {runner_name}"),
         ));
     }
+    // A Claude run never starts unless its sandbox was seen to hold for this
+    // binary and this profile (#626); a hand run is checked like a dispatch.
+    if runner_name == CLAUDE_RUNNER
+        && let Err(message) = crate::sandbox_canary::ensure_claude_sandbox(
+            &request.paths,
+            &request.clock,
+            registry,
+            request.model.as_deref(),
+            request.runner_retry_seconds,
+        )
+    {
+        return Err(ImplementError::new(1, RUNNER_UNAVAILABLE_REASON, message));
+    }
     let default_branch = default_branch_result(gh_text(
         request,
         &guard.order.repository,
@@ -896,6 +913,7 @@ fn implement_inner(
             offline: true,
             model: request.model.clone(),
             effort: request.effort.clone(),
+            max_turns: None,
             signals: request.signals.clone(),
             supervisor_pid: request.supervisor_pid,
             termination_grace,
@@ -1246,6 +1264,7 @@ fn mark_runner_unavailable(
         until: until.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         reset_reported: reported.is_some(),
         message: message.chars().take(500).collect(),
+        reason: "usage-limit".to_owned(),
         recorded_at: request.clock.timestamp(),
         run_id: guard.run_events.run_id().to_owned(),
     };

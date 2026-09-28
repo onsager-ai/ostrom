@@ -60,6 +60,74 @@ pub fn implementer_settings() -> Value {
     })
 }
 
+/// The exact bytes of the implementer profile as it is written to disk.
+#[must_use]
+pub fn implementer_settings_source() -> String {
+    let mut source =
+        serde_json::to_string_pretty(&implementer_settings()).unwrap_or_else(|_| String::new());
+    source.push('\n');
+    source
+}
+
+/// Check a profile read back from disk against the boundary it must express.
+///
+/// Claude Code silently ignores a settings file it cannot parse or validate, so
+/// nothing downstream would notice a profile that lost its sandbox. This is an
+/// independent statement of that boundary, not a comparison with
+/// [`implementer_settings`]: exactly these keys, with exactly these values.
+pub fn validate_implementer_profile(source: &str) -> Result<(), String> {
+    let profile: Value =
+        serde_json::from_str(source).map_err(|error| format!("profile is not JSON: {error}"))?;
+    let keys = |value: &Value, path: &str, expected: &[&str]| -> Result<(), String> {
+        let object = value
+            .as_object()
+            .ok_or_else(|| format!("`{path}` is not an object"))?;
+        let mut actual = object.keys().map(String::as_str).collect::<Vec<_>>();
+        actual.sort_unstable();
+        let mut expected = expected.to_vec();
+        expected.sort_unstable();
+        if actual == expected {
+            Ok(())
+        } else {
+            Err(format!(
+                "`{path}` has keys {actual:?}, expected {expected:?}"
+            ))
+        }
+    };
+    let equals = |pointer: &str, expected: Value| -> Result<(), String> {
+        match profile.pointer(pointer) {
+            Some(actual) if *actual == expected => Ok(()),
+            actual => Err(format!("`{pointer}` is {actual:?}, expected {expected}")),
+        }
+    };
+    keys(&profile, "", &["$schema", "permissions", "sandbox"])?;
+    keys(&profile["permissions"], "permissions", &["deny"])?;
+    keys(
+        &profile["sandbox"],
+        "sandbox",
+        &[
+            "enabled",
+            "failIfUnavailable",
+            "autoAllowBashIfSandboxed",
+            "allowUnsandboxedCommands",
+            "network",
+        ],
+    )?;
+    keys(
+        &profile["sandbox"]["network"],
+        "sandbox.network",
+        &["allowedDomains", "strictAllowlist"],
+    )?;
+    equals("/$schema", json!(SETTINGS_SCHEMA))?;
+    equals("/permissions/deny", json!(["WebFetch", "WebSearch"]))?;
+    equals("/sandbox/enabled", json!(true))?;
+    equals("/sandbox/failIfUnavailable", json!(true))?;
+    equals("/sandbox/autoAllowBashIfSandboxed", json!(true))?;
+    equals("/sandbox/allowUnsandboxedCommands", json!(false))?;
+    equals("/sandbox/network/allowedDomains", json!([]))?;
+    equals("/sandbox/network/strictAllowlist", json!(true))
+}
+
 /// The argv of a Claude implementer run, after the executable. The prompt is
 /// read from stdin and the run's working directory is the worktree.
 ///
@@ -73,6 +141,7 @@ pub fn implementer_arguments(
     settings: &Path,
     model: Option<&str>,
     effort: Option<&str>,
+    max_turns: Option<u64>,
 ) -> Vec<String> {
     let mut arguments = vec![
         "--print".to_owned(),
@@ -92,7 +161,7 @@ pub fn implementer_arguments(
         "stream-json".to_owned(),
         "--verbose".to_owned(),
         "--max-turns".to_owned(),
-        PASS_MAX_TURNS.to_owned(),
+        max_turns.map_or_else(|| PASS_MAX_TURNS.to_owned(), |turns| turns.to_string()),
     ];
     if let Some(model) = model {
         arguments.push(format!("--model={model}"));
@@ -225,6 +294,10 @@ impl Harness for ClaudeHarness {
 }
 
 impl AgentRunner for ClaudeHarness {
+    fn installed_version(&self) -> Option<String> {
+        self.reported_version()
+    }
+
     fn run(&self, request: &RunRequest) -> ProcessOutcome {
         match request {
             RunRequest::Orchestrator(request) => self.run_orchestrator(request),
@@ -234,6 +307,19 @@ impl AgentRunner for ClaudeHarness {
 }
 
 impl ClaudeHarness {
+    /// What `claude --version` prints, or `None` when it does not run.
+    fn reported_version(&self) -> Option<String> {
+        let output = Command::new(&self.executable)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    }
+
     fn run_orchestrator(&self, request: &OrchestratorRunRequest) -> ProcessOutcome {
         let output = match fs::File::create(&request.transcript) {
             Ok(output) => output,
@@ -307,18 +393,20 @@ impl ClaudeHarness {
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .join(CLAUDE_IMPLEMENTER_SETTINGS_FILE);
-        let mut profile = match serde_json::to_string_pretty(&implementer_settings()) {
-            Ok(profile) => profile,
-            Err(error) => {
-                return ProcessOutcome::Error(ActionFault::new(
-                    "runner_io",
-                    Some(error.to_string()),
-                ));
-            }
-        };
-        profile.push('\n');
-        if let Err(error) = fs::write(&settings, profile) {
+        if let Err(error) = fs::write(&settings, implementer_settings_source()) {
             return io(error);
+        }
+        // Read back what the harness will read, and refuse to launch unless it
+        // is exactly the boundary: Claude Code would run without it silently.
+        let written = match fs::read_to_string(&settings) {
+            Ok(written) => written,
+            Err(error) => return io(error),
+        };
+        if let Err(detail) = validate_implementer_profile(&written) {
+            return ProcessOutcome::Error(ActionFault::new(
+                "implementer_profile_invalid",
+                Some(detail),
+            ));
         }
         let events = match fs::File::create(&request.transcript) {
             Ok(events) => events,
@@ -338,6 +426,7 @@ impl ClaudeHarness {
                 &settings,
                 request.model.as_deref(),
                 request.effort.as_deref(),
+                request.max_turns,
             ))
             .current_dir(&request.worktree)
             .envs(request.environment.iter().cloned())
@@ -366,22 +455,8 @@ impl ClaudeHarness {
     }
 
     fn check_implementer_version(&self) -> Result<(), ActionFault> {
-        let output = Command::new(&self.executable)
-            .arg("--version")
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|error| {
-                ActionFault::new(
-                    "runner_unavailable",
-                    Some(format!("could not start Claude: {error}")),
-                )
-            })?;
-        let reported = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        let version = if output.status.success() {
-            parse_version(&reported)
-        } else {
-            None
-        };
+        let reported = self.reported_version().unwrap_or_default();
+        let version = parse_version(&reported);
         match version {
             Some(version) if version >= CLAUDE_IMPLEMENTER_MINIMUM_VERSION => Ok(()),
             _ => {
@@ -554,6 +629,7 @@ mod tests {
             offline,
             model: Some("fixture-model-x".to_owned()),
             effort: Some("high".to_owned()),
+            max_turns: None,
             signals: SignalFlags::default(),
             supervisor_pid: None,
             termination_grace: std::time::Duration::from_secs(1),
@@ -592,6 +668,7 @@ mod tests {
             Path::new("/state/implementer-runs/placeholder/claude-implementer.settings.json"),
             Some("fixture-model"),
             Some("high"),
+            None,
         );
         let roots = implementer_write_roots(&arguments, &implementer_settings(), worktree)
             .expect("the file tools are confined");
@@ -664,7 +741,7 @@ mod tests {
         );
         assert!(settings["permissions"].get("allow").is_none());
 
-        let arguments = implementer_arguments(Path::new("profile.json"), None, None);
+        let arguments = implementer_arguments(Path::new("profile.json"), None, None, Some(4));
         let pair = |flag: &str| {
             arguments
                 .iter()
@@ -678,6 +755,7 @@ mod tests {
         assert_eq!(pair("--settings"), Some("profile.json"));
         assert_eq!(pair("--permission-mode"), Some("acceptEdits"));
         assert_eq!(pair("--permission-prompts"), Some("none"));
+        assert_eq!(pair("--max-turns"), Some("4"));
         assert_eq!(pair("--disallowed-tools"), Some("WebFetch,WebSearch"));
         let tools = pair("--tools")
             .expect("tools are named")
@@ -735,7 +813,7 @@ mod tests {
         );
         assert_eq!(
             read("argv").lines().collect::<Vec<_>>(),
-            implementer_arguments(&settings, Some("fixture-model-x"), Some("high"))
+            implementer_arguments(&settings, Some("fixture-model-x"), Some("high"), None)
         );
         assert_eq!(read("stdin"), "Implement the placeholder.\n");
         let profile: Value = serde_json::from_str(
@@ -743,6 +821,8 @@ mod tests {
         )
         .expect("profile JSON");
         assert_eq!(profile, implementer_settings());
+        validate_implementer_profile(&fs::read_to_string(&settings).expect("profile"))
+            .expect("the written profile is the boundary");
         assert_eq!(
             fs::read_to_string(&request.result).expect("result file"),
             "placeholder done"
@@ -777,5 +857,78 @@ mod tests {
         assert!(!ran.exists(), "an older release must never be started");
         assert_eq!(parse_version("2.1.283 (Claude Code)"), Some((2, 1, 283)));
         assert_eq!(parse_version("not a version"), None);
+    }
+
+    /// #626: Claude Code silently ignores an invalid settings file, so the
+    /// harness checks the profile's shape itself and refuses to launch on any
+    /// difference from the boundary.
+    #[test]
+    fn a_profile_that_is_not_exactly_the_boundary_is_refused() {
+        validate_implementer_profile(&implementer_settings_source())
+            .expect("the generated profile is the boundary");
+        let mutate = |edit: &dyn Fn(&mut Value)| {
+            let mut profile = implementer_settings();
+            edit(&mut profile);
+            validate_implementer_profile(&profile.to_string())
+        };
+        for (name, result) in [
+            ("not JSON", validate_implementer_profile("{not json")),
+            (
+                "unknown top-level key",
+                mutate(&|profile: &mut Value| profile["extra"] = json!(1)),
+            ),
+            (
+                "unknown sandbox key",
+                mutate(&|profile: &mut Value| {
+                    profile["sandbox"]["excludedCommands"] = json!(["curl"])
+                }),
+            ),
+            (
+                "mistyped enabled",
+                mutate(&|profile: &mut Value| profile["sandbox"]["enabled"] = json!("yes-please")),
+            ),
+            (
+                "an allowed domain",
+                mutate(&|profile: &mut Value| {
+                    profile["sandbox"]["network"]["allowedDomains"] = json!(["example.com"]);
+                }),
+            ),
+            (
+                "strict allowlist off",
+                mutate(&|profile: &mut Value| {
+                    profile["sandbox"]["network"]["strictAllowlist"] = json!(false)
+                }),
+            ),
+            (
+                "unsandboxed retry allowed",
+                mutate(&|profile: &mut Value| {
+                    profile["sandbox"]["allowUnsandboxedCommands"] = json!(true)
+                }),
+            ),
+            (
+                "WebFetch no longer denied",
+                mutate(&|profile: &mut Value| {
+                    profile["permissions"]["deny"] = json!(["WebSearch"])
+                }),
+            ),
+        ] {
+            assert!(result.is_err(), "{name} must be refused");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_claude_harness_reports_its_installed_version() {
+        let fixture = tempdir().expect("fixture directory");
+        let claude = fixture.path().join("claude-stub");
+        stub(&claude, "echo '2.1.283 (Claude Code)'");
+        assert_eq!(
+            ClaudeHarness::new(&claude, "claude-fixture-v1", "fixture-model").installed_version(),
+            Some("2.1.283 (Claude Code)".to_owned())
+        );
+        assert_eq!(
+            ClaudeHarness::new("/nonexistent/claude", "v", "m").installed_version(),
+            None
+        );
     }
 }

@@ -256,6 +256,8 @@ pub struct ImplementerRunRequest {
     /// The reasoning effort the consumer chose for this run; `None` leaves the
     /// harness default.
     pub effort: Option<String>,
+    /// A turn bound tighter than the harness default, for a short check run.
+    pub max_turns: Option<u64>,
     pub signals: SignalFlags,
     pub supervisor_pid: Option<u32>,
     pub termination_grace: Duration,
@@ -374,6 +376,12 @@ pub trait AgentRunner: Harness {
     fn prepare(&self, caps: &RunCaps) -> Result<RunnerLaunch, ActionFault> {
         refuse_unenforceable_caps(self.name(), self.enforceable_caps(), caps)?;
         Ok(RunnerLaunch::new(Vec::new()))
+    }
+
+    /// What the installed harness reports as its version, when it can say.
+    /// A consumer keys checks of the installed binary on it.
+    fn installed_version(&self) -> Option<String> {
+        None
     }
 
     fn run(&self, request: &RunRequest) -> ProcessOutcome;
@@ -1034,6 +1042,7 @@ mod tests {
             offline: true,
             model: None,
             effort: None,
+            max_turns: None,
             signals: SignalFlags::default(),
             supervisor_pid: None,
             termination_grace: Duration::from_secs(1),

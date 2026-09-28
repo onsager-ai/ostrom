@@ -8,7 +8,7 @@
 //!
 //! ```json
 //! {"schema_version":1,"runners":{"agent/codex":{"until":"2026-09-28T11:34:00Z",
-//!   "reset_reported":true,"message":"You've hit your usage limit. ...",
+//!   "reset_reported":true,"reason":"usage-limit","message":"You've hit your usage limit. ...",
 //!   "recorded_at":"2026-09-28T09:00:00Z","run_id":"..."}}}
 //! ```
 
@@ -42,6 +42,9 @@ pub struct UnavailableRunner {
     /// Whether `until` is the reset the runner reported. `false` means it
     /// reported none that could be read, and `until` is the declared retry.
     pub reset_reported: bool,
+    /// Why: `usage-limit` (the runner refused on its allowance) or
+    /// `sandbox-unverified` (the Claude sandbox canary did not pass).
+    pub reason: String,
     /// The runner's own words, recorded so an unread reset can be checked.
     pub message: String,
     pub recorded_at: String,
@@ -233,6 +236,7 @@ mod tests {
             UnavailableRunner {
                 until: "2026-09-28T08:59:59Z".to_owned(),
                 reset_reported: true,
+                reason: "usage-limit".to_owned(),
                 message: String::new(),
                 recorded_at: "2026-09-28T08:00:00Z".to_owned(),
                 run_id: "placeholder".to_owned(),
