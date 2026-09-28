@@ -452,6 +452,14 @@ mod tests {
             redact_userinfo("http://a:p@b@proxy.invalid"),
             "http://proxy.invalid"
         );
+        assert_eq!(
+            redact_userinfo("http://user:pa/ss@proxy.invalid:3128"),
+            "http://proxy.invalid:3128"
+        );
+        assert_eq!(
+            redact_userinfo("http://user:p?a#s@proxy.invalid"),
+            "http://proxy.invalid"
+        );
     }
 
     fn result(text: &str) -> String {
