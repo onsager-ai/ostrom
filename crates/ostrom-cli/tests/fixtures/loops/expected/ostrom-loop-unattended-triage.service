@@ -11,5 +11,5 @@ Environment=MANDATE_DAILY_CAP_USD=50
 Environment=MANDATE_MAX_IMPLEMENTERS=6
 Environment=MANDATE_ORDER_TOKEN_CEILING=200000
 ExecStart=ostrom loop run unattended-triage
-TimeoutStartSec=1805
+TimeoutStartSec=1920
 KillMode=control-group

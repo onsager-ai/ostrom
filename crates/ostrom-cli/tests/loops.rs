@@ -89,8 +89,8 @@ fn rendered_units_match_the_committed_fixture_and_check_clean() {
 }
 
 // ostrom#599 / #612: the sweep-lease wait ceiling is bounded by this same
-// `TimeoutStartSec`, which since #619 is the loop's wall cap plus the
-// termination grace (`ostrom_core::DEFAULT_PASS_WALL_SECONDS` undeclared), a
+// `TimeoutStartSec`, which since #637 is the loop's wall cap plus two minutes
+// (`ostrom_core::DEFAULT_PASS_WALL_SECONDS` undeclared), a
 // value `ostrom-store` does not share. This is the independent side of that
 // relationship (repo principle 6): if the
 // rendered unit's timeout moves, or the ceiling moves, this fails until
@@ -148,6 +148,58 @@ fn every_loop_services_timeout_agrees_with_the_sweep_lease_ceiling() {
             ostrom_store::SWEEP_LEASE_CEILING_SECONDS
         );
     }
+}
+
+/// #637 (carried over from #635 N2): a rendered loop unit's `TimeoutStartSec`
+/// leaves the pass's own watchdog two minutes past its wall cap, not five
+/// seconds. The timeout counts from the unit's start, before the pass and its
+/// watchdog have started, and a pass whose wall cap trips still needs its
+/// termination grace to write its own `pass-ended` before systemd signals it.
+/// It reads what `ostrom loops render` writes, not the committed fixture, and
+/// every fixture loop declares no wall, so its wall is the pass default.
+#[test]
+fn every_loop_services_timeout_leaves_the_watchdog_two_minutes() {
+    let root = tempdir().expect("temporary render fixture");
+    let output = SignedFixture::new()
+        .ostrom()
+        .args(["loops", "render", "--output"])
+        .arg(root.path())
+        .env("OSTROM_HOME", root.path())
+        .output()
+        .expect("render loop units");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let services = unit_names(root.path())
+        .into_iter()
+        .filter(|name| name.ends_with(".service") && name != "ostrom-up.service")
+        .collect::<Vec<_>>();
+    assert!(!services.is_empty(), "no loop .service units rendered");
+    let short = services
+        .iter()
+        .filter_map(|name| {
+            let contents =
+                fs::read_to_string(root.path().join(name)).expect("rendered unit contents");
+            let seconds = contents
+                .lines()
+                .find_map(|line| line.strip_prefix("TimeoutStartSec="))
+                .and_then(|value| value.parse::<u64>().ok());
+            // The independent claim: two minutes past the wall, not a
+            // restatement of the margin constant.
+            match seconds {
+                Some(seconds) if seconds >= ostrom_core::DEFAULT_PASS_WALL_SECONDS + 2 * 60 => None,
+                other => Some(format!("{name}: TimeoutStartSec={other:?}")),
+            }
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        short.is_empty(),
+        "loop units whose timeout leaves the watchdog less than two minutes past the \
+         pass wall default ({}s): {short:?}",
+        ostrom_core::DEFAULT_PASS_WALL_SECONDS
+    );
 }
 
 #[test]

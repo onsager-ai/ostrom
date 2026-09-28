@@ -28,8 +28,10 @@ pub const DEFAULT_IMPLEMENTER_WALL_SECONDS: u64 = 4 * 60 * 60;
 pub const DEFAULT_PASS_WALL_SECONDS: u64 = 30 * 60;
 
 /// The grace between `SIGTERM` and `SIGKILL` when a run is stopped, and the
-/// margin an outer bound (a unit's runtime limit, the stall threshold of a run
-/// with no idle cap) adds to a wall cap so the in-process watchdog fires first.
+/// margin the stall threshold of a run with no idle cap adds to its wall cap
+/// so the in-process watchdog fires first. A systemd unit's own bound adds
+/// more (`IMPLEMENTER_UNIT_RUNTIME_MARGIN_SECONDS`,
+/// `LOOP_UNIT_TIMEOUT_MARGIN_SECONDS`).
 pub const RUN_TERMINATION_GRACE_SECONDS: u64 = 5;
 
 /// The margin a systemd implementer unit's `RuntimeMaxSec` adds to the wall cap
@@ -40,6 +42,14 @@ pub const RUN_TERMINATION_GRACE_SECONDS: u64 = 5;
 /// left systemd's signal racing that row; two minutes leaves the in-process
 /// watchdog comfortably first.
 pub const IMPLEMENTER_UNIT_RUNTIME_MARGIN_SECONDS: u64 = 120;
+
+/// The margin a rendered loop unit's `TimeoutStartSec` adds to the loop's wall
+/// cap (#637, carried over from #635 N2). It is the same race: the timeout
+/// counts from the unit's start, before `ostrom loop run` has started the pass
+/// and its watchdog, and once the wall cap trips the pass still needs its
+/// termination grace to stop its harness and write its own `pass-ended`. Five
+/// seconds left systemd's `SIGTERM` racing that row.
+pub const LOOP_UNIT_TIMEOUT_MARGIN_SECONDS: u64 = 120;
 
 /// The cost ceiling of one run, in US dollars, when nothing declares one: the
 /// default a work order is created with, and what the stall reaper charges a
@@ -176,11 +186,12 @@ impl ResolvedRunCaps {
         }
     }
 
-    /// The outer bound a supervisor puts on the whole run: wall plus grace.
+    /// The `TimeoutStartSec` of a rendered loop unit: the wall cap plus
+    /// [`LOOP_UNIT_TIMEOUT_MARGIN_SECONDS`].
     #[must_use]
-    pub const fn outer_bound_seconds(&self) -> u64 {
+    pub const fn loop_unit_timeout_seconds(&self) -> u64 {
         self.wall_seconds
-            .saturating_add(RUN_TERMINATION_GRACE_SECONDS)
+            .saturating_add(LOOP_UNIT_TIMEOUT_MARGIN_SECONDS)
     }
 
     /// The `RuntimeMaxSec` of a systemd implementer unit: the wall cap plus

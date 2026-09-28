@@ -71,7 +71,8 @@ pub use policy::{
 pub use run_caps::{
     CapDuration, CapDurationError, DEFAULT_IMPLEMENTER_WALL_SECONDS, DEFAULT_PASS_WALL_SECONDS,
     DEFAULT_RUN_COST_CEILING_USD, IMPLEMENTER_UNIT_RUNTIME_MARGIN_SECONDS,
-    RUN_TERMINATION_GRACE_SECONDS, ResolvedRunCaps, render_seconds,
+    LOOP_UNIT_TIMEOUT_MARGIN_SECONDS, RUN_TERMINATION_GRACE_SECONDS, ResolvedRunCaps,
+    render_seconds,
 };
 pub use store::{
     AttemptOutcome, CHECK_STORE_SCHEMA_VERSION, CheckRun, CheckRunId, CheckStore, CheckStoreFault,

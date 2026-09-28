@@ -75,8 +75,8 @@ const SWEEP_LEASE_RENEW_SECONDS: u64 = 30;
 /// real full-roster sweep — that was always too short, and still is.
 ///
 /// Upper bound, which the 30s value was missing: the generated loop unit's
-/// `TimeoutStartSec` (the loop's wall cap plus the termination grace since
-/// #619, 1805 s undeclared; `crates/ostrom-cli/tests/fixtures/loops/expected/*.service`) is not a
+/// `TimeoutStartSec` (the loop's wall cap plus two minutes since #637, 1920 s
+/// undeclared; `crates/ostrom-cli/tests/fixtures/loops/expected/*.service`) is not a
 /// budget the pass gets to spend — it is when the supervisor SIGTERMs the
 /// unit (`Type=oneshot`, `KillMode=control-group`). Setting this ceiling
 /// equal to or close to that value means a pass waiting out a lease that
@@ -427,6 +427,9 @@ impl SweepLease {
             timing.ttl_seconds,
             identity,
             proc_root,
+            // The sweep lease is still judged by the wall clock alone: its
+            // timing is injected for tests, and suspended time is not (#637).
+            &|_| 0,
         )
         .map_err(map_sweep_lease_acquisition_error)?;
         let expected_identity =
