@@ -137,11 +137,9 @@ umwelt ships the fixture, and the agree test is owed.
   does not, and its `TraceAppend` uses `IndexMap` fields with a frozen struct order instead — a
   producer that deserializes through `serde_json::Value` before handing umwelt a record loses the
   operator's top-level key order silently. ostrom's edge must convert, not re-parse.
-- **The one-way subsystem convention.** The mandate subsystem may reuse the constitution
-  subsystem's escalation-dossier shape; the constitution subsystem must never learn about mandates,
-  queues, grants or GitHub. Nothing enforces this.
 
-<!-- Source: onsager-ai/umwelt#7 and its removal; the subsystem convention from README.
+<!-- Source: onsager-ai/umwelt#7 and its removal. The one-way subsystem convention that stood
+     here was retired in #617: its precondition, a constitution subsystem, no longer exists (#623).
      Preconditions: assumes Cargo keeps unifying features across a graph. Invalid if umwelt ever
      publishes, at which point the pin becomes a version. -->
 
