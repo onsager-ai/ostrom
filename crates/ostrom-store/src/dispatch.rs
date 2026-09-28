@@ -2238,7 +2238,7 @@ fn repeated_failure(
                 };
                 // A runner out of allowance says nothing about the item
                 // (#626): it neither counts toward nor interrupts a streak.
-                if value == "mutation-never" {
+                if value == RUNNER_UNAVAILABLE_REASON.repeat(2) {
                     continue;
                 }
                 match &reason {
