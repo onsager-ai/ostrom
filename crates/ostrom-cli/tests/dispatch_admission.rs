@@ -23,6 +23,7 @@ struct Fixture {
     source: PathBuf,
     order_file: PathBuf,
     gh_as: PathBuf,
+    codex: PathBuf,
     sys_root: PathBuf,
     proc_root: PathBuf,
 }
@@ -75,6 +76,9 @@ impl Fixture {
             ),
         );
 
+        let codex = root.path().join("codex-stub");
+        executable(&codex, "exit 0");
+
         let sys_root = root.path().join("sys");
         let proc_root = root.path().join("proc");
         fs::create_dir_all(&sys_root).expect("create fixture sys root");
@@ -86,6 +90,7 @@ impl Fixture {
             source,
             order_file,
             gh_as,
+            codex,
             sys_root,
             proc_root,
         }
@@ -128,6 +133,7 @@ impl Fixture {
             .env("OSTROM_PLUGIN_ROOT", plugin_root())
             .env("MANDATE_IMPLEMENTER_SOURCE_REPO", &self.source)
             .env("MANDATE_GH_AS_BIN", &self.gh_as)
+            .env("CODEX_BIN", &self.codex)
             .env("MANDATE_ADMISSION_SYS_ROOT", &self.sys_root)
             .env("MANDATE_ADMISSION_PROC_ROOT", &self.proc_root);
         command

@@ -46,7 +46,6 @@ pub fn read_host_resources(sys_root: &Path, proc_root: &Path) -> HostResourceRea
 /// machine with no coretemp or x86_pkg_temp support covered, at the cost of
 /// possibly tracking a hotter unrelated sensor there — the least bad default
 /// when nothing names the package explicitly.
-#[must_use]
 pub fn read_cpu_temp_c(sys_root: &Path) -> Result<f64, String> {
     if let Some(value) = read_labelled_hwmon_temp(sys_root, "Package id 0") {
         return Ok(value);
@@ -70,7 +69,6 @@ pub fn read_cpu_temp_c(sys_root: &Path) -> Result<f64, String> {
 }
 
 /// The 1-minute load average divided by the online CPU count.
-#[must_use]
 pub fn read_load_per_cpu(proc_root: &Path, sys_root: &Path) -> Result<f64, String> {
     let loadavg_path = proc_root.join("loadavg");
     let contents = fs::read_to_string(&loadavg_path)
@@ -169,10 +167,11 @@ fn hwmon_temp_inputs(sys_root: &Path) -> Vec<f64> {
         for device_entry in device_entries.filter_map(Result::ok) {
             let name = device_entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            if name.starts_with("temp") && name.ends_with("_input") {
-                if let Some(value) = read_millidegrees(&device.join(name)) {
-                    values.push(value);
-                }
+            if name.starts_with("temp")
+                && name.ends_with("_input")
+                && let Some(value) = read_millidegrees(&device.join(name))
+            {
+                values.push(value);
             }
         }
     }
