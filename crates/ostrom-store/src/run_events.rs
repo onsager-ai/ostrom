@@ -841,14 +841,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_closed_live_descriptor_does_not_stop_the_durable_run() {
-        let (root, paths, clock) = fixture();
-        let closed = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(root.path().join("closed.jsonl"))
-            .expect("open descriptor to close");
-        let fd = u32::try_from(closed.as_raw_fd()).expect("non-negative event descriptor");
-        drop(closed);
+        let (_root, paths, clock) = fixture();
+        // A descriptor number that can never be live, not one that was live a moment
+        // ago: an open-then-drop can be reassigned to another test thread before this
+        // test uses it, and `mirror` would then append this run's events into that
+        // thread's file (#611). Linux caps descriptor numbers at `nr_open`
+        // (1,048,576 by default), so `/proc/self/fd/2147483647` is always `ENOENT`
+        // and no thread can ever make it valid.
+        let fd = u32::try_from(i32::MAX).expect("i32::MAX fits in u32");
 
         let mut run = RunEventGuard::start(
             &paths,
@@ -882,6 +882,54 @@ mod tests {
 
         let events = FileSink::new(paths.runs_dir())
             .read_from("closed-fd-fixture", 0)
+            .expect("read durable lifecycle");
+        assert_eq!(events.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_broken_pipe_reader_does_not_stop_the_durable_run() {
+        // `open_fd` reopens the live descriptor through `/proc/self/fd/{fd}`, which
+        // succeeds even with the read end gone; it is the first write, inside
+        // `mirror`, that trips `EPIPE`. That is a different branch than a closed
+        // descriptor (open itself fails) and no other test exercises it (#611).
+        let (_root, paths, clock) = fixture();
+        let (reader, writer) = std::io::pipe().expect("open an anonymous pipe");
+        let fd = u32::try_from(writer.as_raw_fd()).expect("non-negative event descriptor");
+        drop(reader);
+
+        let mut run = RunEventGuard::start(
+            &paths,
+            Some(fd),
+            false,
+            clock,
+            RunEventStart {
+                run_id: "broken-pipe-fixture".to_owned(),
+                kind: RunKind::Loop,
+                actor: "builder".to_owned(),
+                harness: "claude".to_owned(),
+                model: None,
+                schedule: None,
+                repository: None,
+                repositories: None,
+                work_order: None,
+                ceilings: None,
+            },
+        )
+        .expect("a broken pipe cannot prevent run.started");
+        assert!(
+            run.sink
+                .live
+                .lock()
+                .expect("live event sink lock")
+                .live_fault
+                .is_some()
+        );
+        run.finish(RunOutcome::Completed, None, None, None)
+            .expect("a broken pipe cannot prevent run.finished");
+
+        let events = FileSink::new(paths.runs_dir())
+            .read_from("broken-pipe-fixture", 0)
             .expect("read durable lifecycle");
         assert_eq!(events.len(), 2);
     }

@@ -9,16 +9,10 @@
 //! suspended time.
 //!
 //! **The reading.** The kernel's suspended total since boot is
-//! `CLOCK_BOOTTIME` minus `CLOCK_MONOTONIC`. `CLOCK_BOOTTIME` is the first
-//! field of `/proc/uptime`, read once per reading. Neither std nor any
-//! dependency ostrom already has reads `CLOCK_MONOTONIC` as a value comparable
-//! across processes without `unsafe`: `Instant` is opaque. Its `Debug`
-//! rendering on Linux is the raw `timespec` (`Instant { tv_sec: …, tv_nsec: …
-//! }`), and that is what is read here. The rendering is not a stable
-//! interface, so it is checked: one that does not parse, or a monotonic value
-//! past the boot time, makes the reading fail, and a failed reading never
-//! reaps. `the_monotonic_clock_is_read_from_instant` trips when the toolchain
-//! changes the rendering.
+//! `CLOCK_BOOTTIME` minus `CLOCK_MONOTONIC`, both read with `clock_gettime`
+//! through `rustix`, once per reading. Only a Linux kernel has
+//! `CLOCK_BOOTTIME`; anywhere else the reading fails, and a failed reading
+//! never reaps.
 //!
 //! **The timeline.** The total says how long the machine has slept since boot,
 //! not when. Each reaper run records its reading, with the wall-clock second it
@@ -35,7 +29,7 @@ use std::{
     fs,
     io::Write as _,
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
@@ -49,7 +43,7 @@ use crate::Clock;
 const MAX_SAMPLES: usize = 64;
 
 /// A difference of at most this many seconds between two totals is reading
-/// noise (`/proc/uptime` has centisecond resolution), not a suspend.
+/// noise, not a suspend.
 const NOISE_SECONDS: u64 = 1;
 
 /// One reading of the suspended total.
@@ -67,83 +61,58 @@ pub(crate) trait SuspendSource {
     fn read(&self) -> Result<SuspendReading, String>;
 }
 
-/// The kernel's clocks, as `/proc` and `Instant` expose them.
+/// The kernel's clocks.
 pub(crate) struct SystemSuspend;
 
 impl SuspendSource for SystemSuspend {
     fn read(&self) -> Result<SuspendReading, String> {
-        read_at(Path::new("/proc"), Instant::now())
-    }
-}
-
-fn read_at(proc_root: &Path, instant: Instant) -> Result<SuspendReading, String> {
-    let monotonic = monotonic(instant)?;
-    let uptime_path = proc_root.join("uptime");
-    let uptime = fs::read_to_string(&uptime_path)
-        .map_err(|error| format!("could not read {}: {error}", uptime_path.display()))?;
-    let boottime = boottime(&uptime)
-        .ok_or_else(|| format!("{} is not an uptime: {uptime:?}", uptime_path.display()))?;
-    // A monotonic clock ahead of the boot clock is not the pair this reads.
-    if monotonic > boottime.saturating_add(Duration::from_secs(NOISE_SECONDS)) {
-        return Err(format!(
-            "the monotonic clock ({}s) is ahead of the boot clock ({}s)",
-            monotonic.as_secs(),
-            boottime.as_secs()
-        ));
-    }
-    let boot_id_path = proc_root.join("sys/kernel/random/boot_id");
-    let boot_id = fs::read_to_string(&boot_id_path)
-        .map_err(|error| format!("could not read {}: {error}", boot_id_path.display()))?
-        .trim()
-        .to_owned();
-    if boot_id.is_empty() {
-        return Err(format!("{} is empty", boot_id_path.display()));
-    }
-    Ok(SuspendReading {
-        boot_id,
-        suspended_seconds: boottime.saturating_sub(monotonic).as_secs(),
-    })
-}
-
-/// `CLOCK_MONOTONIC` at `instant`, from its `Debug` rendering.
-fn monotonic(instant: Instant) -> Result<Duration, String> {
-    let rendered = format!("{instant:?}");
-    parse_instant(&rendered)
-        .ok_or_else(|| format!("this toolchain renders Instant as {rendered:?}, not a timespec"))
-}
-
-fn parse_instant(rendered: &str) -> Option<Duration> {
-    let body = rendered
-        .strip_prefix("Instant {")?
-        .strip_suffix('}')?
-        .trim();
-    let (mut seconds, mut nanoseconds) = (None, None);
-    for field in body.split(',') {
-        let (key, value) = field.split_once(':')?;
-        match key.trim() {
-            "tv_sec" => seconds = Some(value.trim().parse::<u64>().ok()?),
-            "tv_nsec" => nanoseconds = Some(value.trim().parse::<u32>().ok()?),
-            _ => return None,
+        let (boottime, monotonic) = clocks()?;
+        // Read in that order, the boot clock cannot trail the monotonic one;
+        // if it does, these are not the clocks this reads.
+        if monotonic > boottime {
+            return Err(format!(
+                "CLOCK_MONOTONIC ({}s) is ahead of CLOCK_BOOTTIME ({}s)",
+                monotonic.as_secs(),
+                boottime.as_secs()
+            ));
         }
+        let boot_id_path = Path::new("/proc/sys/kernel/random/boot_id");
+        let boot_id = fs::read_to_string(boot_id_path)
+            .map_err(|error| format!("could not read {}: {error}", boot_id_path.display()))?
+            .trim()
+            .to_owned();
+        if boot_id.is_empty() {
+            return Err(format!("{} is empty", boot_id_path.display()));
+        }
+        Ok(SuspendReading {
+            boot_id,
+            suspended_seconds: boottime.saturating_sub(monotonic).as_secs(),
+        })
     }
-    let nanoseconds = nanoseconds.filter(|nanoseconds| *nanoseconds < 1_000_000_000)?;
-    Some(Duration::new(seconds?, nanoseconds))
 }
 
-/// The first field of `/proc/uptime`: `CLOCK_BOOTTIME`, in seconds with a
-/// fraction.
-fn boottime(uptime: &str) -> Option<Duration> {
-    let field = uptime.split_whitespace().next()?;
-    let (whole, fraction) = field.split_once('.').unwrap_or((field, ""));
-    let seconds = whole.parse::<u64>().ok()?;
-    if !fraction.chars().all(|character| character.is_ascii_digit()) {
-        return None;
-    }
-    // Centiseconds in practice; any precision is read to the millisecond.
-    let milliseconds = format!("{fraction:0<3}")
-        .get(..3)
-        .and_then(|digits| digits.parse::<u64>().ok())?;
-    Some(Duration::from_secs(seconds) + Duration::from_millis(milliseconds))
+/// `(CLOCK_BOOTTIME, CLOCK_MONOTONIC)`, the monotonic clock read first.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn clocks() -> Result<(Duration, Duration), String> {
+    use rustix::time::{ClockId, clock_gettime};
+
+    let read = |id: ClockId, name: &str| {
+        Duration::try_from(clock_gettime(id))
+            .map_err(|error| format!("{name} is not a duration: {error}"))
+    };
+    let monotonic = read(ClockId::Monotonic, "CLOCK_MONOTONIC")?;
+    let boottime = read(ClockId::Boottime, "CLOCK_BOOTTIME")?;
+    Ok((boottime, monotonic))
+}
+
+/// No `CLOCK_BOOTTIME` here: suspended time cannot be read, and nothing is
+/// judged by it.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn clocks() -> Result<(Duration, Duration), String> {
+    Err(format!(
+        "this platform ({}) has no CLOCK_BOOTTIME",
+        std::env::consts::OS
+    ))
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -285,44 +254,45 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{
-        SuspendReading, SuspendSource, SuspendTimeline, SystemSuspend, boottime, compact,
-        monotonic, parse_instant,
-    };
+    use super::{SuspendReading, SuspendSource, SuspendTimeline, SystemSuspend, clocks, compact};
     use crate::Clock;
 
-    /// The `Debug` rendering of `Instant` is how `CLOCK_MONOTONIC` is read
-    /// (#637). If a toolchain changes it, this fails, and in production every
-    /// reap is skipped rather than judged without suspended time.
+    /// #637: the reading is the kernel's own pair of clocks. The boot clock
+    /// agrees with `/proc/uptime`, an independent reader of the same clock,
+    /// and the monotonic clock advances with `Instant` (also
+    /// `CLOCK_MONOTONIC`) and never exceeds the boot clock.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
-    fn the_monotonic_clock_is_read_from_instant() {
-        let first = monotonic(Instant::now()).expect("Instant renders as a timespec");
-        thread::sleep(Duration::from_millis(20));
-        let second = monotonic(Instant::now()).expect("Instant renders as a timespec");
-        let uptime = fs::read_to_string("/proc/uptime").expect("read /proc/uptime");
-        let boot = boottime(&uptime).expect("parse /proc/uptime");
+    fn the_system_source_reads_the_kernels_boot_and_monotonic_clocks() {
+        let uptime = |text: String| {
+            text.split_whitespace()
+                .next()
+                .and_then(|field| field.parse::<f64>().ok())
+                .map(Duration::from_secs_f64)
+                .expect("parse /proc/uptime")
+        };
+        let before = uptime(fs::read_to_string("/proc/uptime").expect("read /proc/uptime"));
+        let started = Instant::now();
+        let (boot, first) = clocks().expect("read the clocks");
+        thread::sleep(Duration::from_millis(50));
+        let (_, second) = clocks().expect("read the clocks");
+        let elapsed = started.elapsed();
+        let after = uptime(fs::read_to_string("/proc/uptime").expect("read /proc/uptime"));
         let reading = SystemSuspend.read().expect("read suspended time");
+        let advanced = second.checked_sub(first);
         assert_eq!(
             (
-                second
-                    .checked_sub(first)
-                    .map(|elapsed| elapsed >= Duration::from_millis(20)
-                        && elapsed < Duration::from_secs(5)),
-                second <= boot + Duration::from_secs(1),
+                before <= boot + Duration::from_millis(20)
+                    && boot <= after + Duration::from_millis(20),
+                first <= boot,
+                advanced.is_some_and(|advanced| advanced >= Duration::from_millis(50)
+                    && advanced <= elapsed + Duration::from_millis(20)),
                 reading.boot_id.is_empty(),
-                parse_instant("Instant { tv_sec: 12, tv_nsec: 500000000 }"),
-                parse_instant("Instant { t: 12 }"),
-                boottime("468705.43 5363972.73\n"),
+                u128::from(reading.suspended_seconds) <= after.as_millis() / 1_000,
             ),
-            (
-                Some(true),
-                true,
-                false,
-                Some(Duration::from_millis(12_500)),
-                None,
-                Some(Duration::from_millis(468_705_430)),
-            ),
-            "reading: {reading:?}"
+            (true, true, true, false, true),
+            "uptime {before:?}..{after:?}, boot {boot:?}, monotonic {first:?} then {second:?} \
+             over {elapsed:?}, reading {reading:?}"
         );
     }
 

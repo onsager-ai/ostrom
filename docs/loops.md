@@ -64,12 +64,25 @@ from the pass's sweep generation, so one opened afterward waits for the next
 fresh generation, up to `sweep.max_age`.
 
 An empty effective set is a failed wake named `no-effective-repositories`, with
-every skipped repository and reason recorded at both ends of the pass. No
-operation or agent starts. This differs from a gatekeeper wake whose effective
-set is non-empty but whose supplied snapshot contains no pull requests: that
-idle wake records `no-candidates`, starts no agent, and succeeds.
+every skipped repository and reason recorded. No operation or agent starts.
+This differs from a gatekeeper wake whose effective set is non-empty but whose
+supplied snapshot contains no pull requests: that idle wake records
+`no-candidates`, starts no agent, and succeeds.
 
-An unbound pass refuses the same way, and this is the case a local operator meets first. Without `--loop` the coverage is the available set, which is `OSTROM_AVAILABLE_REPOSITORIES` when that is set and otherwise derived: the repositories named by `mandates.projects`, plus those named in the manifest's `grants` and `denies`. With no manifest and no mandates that derivation is empty, so `ostrom pass builder` in a bare configuration exits 3 with `no-effective-repositories` rather than starting a session with nothing to act on. Setting `OSTROM_AVAILABLE_REPOSITORIES` is what supplies a roster in that case; it replaces the derivation rather than adding to it.
+A loop-bound refusal — `ostrom loop run <name>`, or a loop unit, for any
+actor — writes a single `loop-skipped` fact: nothing started, so there is
+nothing to close. An unbound pass (no `--loop`) refuses the same condition
+differently: a pass process did start, so it keeps the `pass-started`/
+`pass-ended` pair, with the terminal `pass-ended` carrying `outcome: "failed"`.
+This is the case a local operator meets first. Without `--loop` the coverage
+is the available set, which is `OSTROM_AVAILABLE_REPOSITORIES` when that is
+set and otherwise derived: the repositories named by `mandates.projects`,
+plus those named in the manifest's `grants` and `denies`. With no manifest
+and no mandates that derivation is empty, so `ostrom pass builder` in a bare
+configuration exits 3 with `no-effective-repositories` rather than starting a
+session with nothing to act on. Setting `OSTROM_AVAILABLE_REPOSITORIES` is
+what supplies a roster in that case; it replaces the derivation rather than
+adding to it.
 
 The current composed policy version can instead own loop lifecycle directly:
 
@@ -134,7 +147,7 @@ Each cap is enforced inside the run. A pass hands `wall` and `idle` to its harne
 
 A live hold that stops making progress is reaped where ostrom already runs, with no resident process: `ostrom up` checks every open hold, and `ostrom dispatch` checks the implementer holds for its own repositories before it counts in-flight holds against the concurrency ceilings. A dispatch with no repository scope, such as one run by hand, reaps nothing: only `ostrom up` reaps every hold. Progress is the newest of the hold's start, its run's last event, and its transcript file's modification time. A hold is stalled when it is live and has made no progress for longer than its idle cap or, with none, its wall cap plus the termination grace. The caps are the ones the hold started with: `work-dispatched` records `wall_seconds` and `idle_seconds`, and a pass's `run.started` carries its own `ceilings`.
 
-A suspended machine is not a stalled run. A run's own watchdog measures its caps with the monotonic clock, which stops while the machine is suspended, and so does systemd's unit timeout; the wall clock does not. So the gap since a hold's last progress is measured net of the time the machine spent suspended, and so is a lease's expiry wherever the reaper or a pass judges it: a pass that held its lease while the machine slept could not renew it then, and the next pass does not take it over for that alone. The suspended total is `CLOCK_BOOTTIME` minus `CLOCK_MONOTONIC`: the first from `/proc/uptime`, read once per reaper run, and the second from the Rust standard library's monotonic clock, whose value it exposes only through its debug rendering, which is therefore checked on every read. Each reaper run records the total, with the wall-clock second and the boot it belongs to, in `<state>/reaping/suspend-timeline.json`, and the time suspended since a hold's last progress is bounded from above by the records on either side of it. A missing record counts more time as suspended, never less, so it can delay a reap but never cause one; on the first reaper run after a suspend, before any record brackets it, a gap is discounted by up to the whole suspended total. When the suspended time cannot be read (no `/proc`, as on macOS and Windows, or a toolchain whose monotonic clock renders differently), the reaper judges nothing that run: it reaps nothing, prints why and records it in `<state>/reaping/last-error.json`, where doctor's `work-orders` check reports it, and doctor judges no hold stalled either. It never reaps blind. `ostrom ps --json` reports `seconds_without_progress` net of suspended time and `suspended_seconds` beside it. The sweep lease is still judged by the wall clock alone.
+A suspended machine is not a stalled run. A run's own watchdog measures its caps with the monotonic clock, which stops while the machine is suspended, and so does systemd's unit timeout; the wall clock does not. So the gap since a hold's last progress is measured net of the time the machine spent suspended, and so is a lease's expiry wherever the reaper or a pass judges it: a pass that held its lease while the machine slept could not renew it then, and the next pass does not take it over for that alone. The suspended total is `CLOCK_BOOTTIME` minus `CLOCK_MONOTONIC`, both read with `clock_gettime` once per reaper run. Each reaper run records the total, with the wall-clock second and the boot it belongs to, in `<state>/reaping/suspend-timeline.json`, and the time suspended since a hold's last progress is bounded from above by the records on either side of it. A missing record counts more time as suspended, never less, so it can delay a reap but never cause one; on the first reaper run after a suspend, before any record brackets it, a gap is discounted by up to the whole suspended total. When the suspended time cannot be read (only a Linux kernel has `CLOCK_BOOTTIME`, so never on macOS or Windows), the reaper judges nothing that run: it reaps nothing, prints why and records it in `<state>/reaping/last-error.json`, where doctor's `work-orders` check reports it, and doctor judges no hold stalled either. It never reaps blind. `ostrom ps --json` reports `seconds_without_progress` net of suspended time and `suspended_seconds` beside it. The sweep lease is still judged by the wall clock alone.
 
 Reaping is claim, stop, confirm, record. The reaper first claims the run by creating `<state>/reaping/<run_id>.claim` exclusively; the claim records the reason, the charge, when it was made, the reaper's own pid and start time, and, set just before the first signal is sent, `signalled_at`. Only one process can create it, so when two reapers race (an `ostrom up` timer and an `ostrom dispatch`, say) exactly one stops, records and charges the run, and the other leaves it alone. The reaper then stops exactly what the hold's own lease or unit names. For the systemd backend that is the implementer's unit. For the process backend, and for a pass, it is the recorded process group, or the recorded process alone when that process does not lead its group. Before each signal the reaper re-checks the recorded pid, start time and process group; it never signals a pid that now belongs to another process, and never its own process or a process group it belongs to. `SIGTERM` comes first, `SIGKILL` after twice the termination grace.
 
