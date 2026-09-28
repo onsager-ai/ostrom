@@ -11,6 +11,7 @@ pub mod pass_state;
 pub mod process;
 pub mod process_control;
 pub mod registry;
+pub mod resources;
 pub mod sink;
 pub mod trace;
 pub mod watchdog;
@@ -32,7 +33,7 @@ pub use follower::{
 };
 pub use loop_units::{
     CeilingEnvironmentNames, LoopUnit, LoopUnitDeclaration, LoopUnitDrift, LoopUnitError,
-    LoopUnitGeneratorConfig, check_loop_units_drift, generate_loop_units,
+    LoopUnitGeneratorConfig, UnitResourceLimits, check_loop_units_drift, generate_loop_units,
     loop_execstart_is_not_shell, render_loop_units,
 };
 pub use operation_settings::{
@@ -41,6 +42,7 @@ pub use operation_settings::{
 };
 pub use pass_state::{PassState, PassStateError, read_pass_state, write_pass_state};
 pub use registry::{CheckAction, CheckReceipt, execute_check_action};
+pub use resources::{HostResourceReading, read_cpu_temp_c, read_host_resources, read_load_per_cpu};
 pub use sink::{FileSink, Sink, SinkFault, Source, SourceFault, run_directory_name};
 pub use trace::{TraceAppend, TraceAppendError, TraceFactRecord, append_trace};
 pub use watchdog::{

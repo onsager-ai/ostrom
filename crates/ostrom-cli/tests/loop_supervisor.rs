@@ -21,24 +21,45 @@ struct Fixture {
     manifest: PathBuf,
     trusted_keys: PathBuf,
     marker: PathBuf,
+    sys_root: PathBuf,
+    proc_root: PathBuf,
 }
 
 impl Fixture {
     fn new(spend_usd: f64) -> Self {
-        Self::with_cadence(spend_usd, "hourly")
+        Self::build(spend_usd, "hourly", "")
     }
 
     fn with_cadence(spend_usd: f64, cadence: &str) -> Self {
+        Self::build(spend_usd, cadence, "")
+    }
+
+    /// A fixture whose loop declares `defaults.admission.max_cpu_temp_c`
+    /// (#628), so a test can point `sys_root`/`proc_root` at a fixture
+    /// sensor tree via `up_with_admission_roots`.
+    fn with_admission(max_cpu_temp_c: f64) -> Self {
+        Self::build(
+            50.0,
+            "hourly",
+            &format!("\n  admission: {{max_cpu_temp_c: {max_cpu_temp_c}}}"),
+        )
+    }
+
+    fn build(spend_usd: f64, cadence: &str, extra_defaults: &str) -> Self {
         let root = TempDir::new().expect("temporary loop supervisor fixture");
         let home = root.path().join("home");
         let repository = root.path().join("repository");
         let marker = root.path().join("operation-ran");
+        let sys_root = root.path().join("sys");
+        let proc_root = root.path().join("proc");
         fs::create_dir_all(&home).expect("create home");
         fs::create_dir_all(repository.join(".git")).expect("create repository boundary");
+        fs::create_dir_all(&sys_root).expect("create fixture sys root");
+        fs::create_dir_all(&proc_root).expect("create fixture proc root");
         let operator = format!(
             r#"manifest_version: 1
 defaults:
-  loop: {{concurrent: 6, spend_usd: {spend_usd}, tokens: 200000}}
+  loop: {{concurrent: 6, spend_usd: {spend_usd}, tokens: 200000}}{extra_defaults}
 actors: {{builder: {{}}}}
 operations:
   scheduled-work:
@@ -70,6 +91,8 @@ loops:
             manifest,
             trusted_keys,
             marker,
+            sys_root,
+            proc_root,
         }
     }
 
@@ -85,6 +108,23 @@ loops:
             .env_remove("MANDATE_MAX_IMPLEMENTERS")
             .env_remove("MANDATE_ORDER_TOKEN_CEILING");
         command
+    }
+
+    fn write_coretemp_package(&self, millidegrees_c: i64) {
+        let hwmon = self.sys_root.join("class/hwmon/hwmon0");
+        fs::create_dir_all(&hwmon).expect("create fixture hwmon directory");
+        fs::write(hwmon.join("temp1_label"), "Package id 0\n").expect("write sensor label");
+        fs::write(hwmon.join("temp1_input"), format!("{millidegrees_c}\n"))
+            .expect("write sensor reading");
+    }
+
+    fn up_with_admission_roots(&self) -> Output {
+        self.command()
+            .arg("up")
+            .env("MANDATE_ADMISSION_SYS_ROOT", &self.sys_root)
+            .env("MANDATE_ADMISSION_PROC_ROOT", &self.proc_root)
+            .output()
+            .expect("run ostrom up with admission roots")
     }
 
     fn compose(&self) -> String {
@@ -291,6 +331,55 @@ fn an_exceeded_ceiling_stops_before_the_operation() {
     let state = fs::read_to_string(fixture.home.join("loop-runs/builder-day.json"))
         .expect("read stopped state");
     assert!(state.contains("ceiling_exceeded:spend_usd"), "{state}");
+}
+
+/// #628: a loop whose declared `admission.max_cpu_temp_c` the fixture
+/// sensor tree reads over is held, not launched, and the hold is retried on
+/// the very next reconciliation rather than treated as this slot's settled
+/// outcome (unlike `an_exceeded_ceiling_stops_before_the_operation`, whose
+/// `stopped` status only clears on the loop's next scheduled slot).
+#[test]
+fn an_over_limit_reading_holds_the_loop_worker_and_is_retried_next_tick() {
+    let fixture = Fixture::with_admission(80.0);
+    fixture.compose();
+    fixture.write_coretemp_package(91_000);
+
+    let held = fixture.up_with_admission_roots();
+    assert!(
+        held.status.success(),
+        "{}",
+        String::from_utf8_lossy(&held.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&held.stdout).contains("admission-held=1"),
+        "{}",
+        String::from_utf8_lossy(&held.stdout)
+    );
+    assert!(
+        !fixture.marker.exists(),
+        "operation ran while over the limit"
+    );
+    let state = fs::read_to_string(fixture.home.join("loop-runs/builder-day.json"))
+        .expect("read admission-held state");
+    assert!(state.contains("\"admission-held\""), "{state}");
+    assert!(state.contains("over-limit"), "{state}");
+    assert!(state.contains("max_cpu_temp_c"), "{state}");
+
+    // The package cools; the very next reconciliation runs the operation,
+    // with no wait for a new scheduled slot.
+    fixture.write_coretemp_package(60_000);
+    let proceeded = fixture.up_with_admission_roots();
+    assert!(
+        proceeded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&proceeded.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&proceeded.stdout).contains("started=1"),
+        "{}",
+        String::from_utf8_lossy(&proceeded.stdout)
+    );
+    fixture.wait_for_marker();
 }
 
 #[test]

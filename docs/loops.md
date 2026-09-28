@@ -161,6 +161,30 @@ Reaping is best effort; scheduling is not. A reaper error (an unreadable trace, 
 
 The pass lease names the pass's process and renews every 30 seconds while the pass runs, with a 120-second TTL (`MANDATE_LEASE_TTL_SECONDS` overrides it; a shorter TTL renews proportionally faster). A pass that cannot renew stops with `reason: "pass-lease-lost"`. It checks immediately before it starts its harness, and again once sweep preparation (which can wait minutes on the sweep lease) is done, by reading the lease file itself, which must still name its owner and process, as well as the renewal's flag, which can be a renewal interval stale, so a pass that lost its lease never starts its harness alongside the pass that now holds it; that row has `outcome: "failed"` and `cost_usd: 0.0`, and the new holder's lease is left in place. `ostrom up` does not launch a loop's slot while the previous worker for that loop is still running (its pid and start time from the loop-runs state); the slot is recorded as `skipped:previous-live` in the state and the log, and `up` reports `skipped=` beside its other counts.
 
+### Resource admission
+
+A launch — a loop worker `ostrom up` starts, or an implementer `ostrom dispatch` starts — is held for that attempt when the machine cannot take it. `defaults.admission` declares the limits, overridable per loop field by field, the same way `defaults.loop`'s `wall`/`idle` already are:
+
+```yaml
+defaults:
+  admission:
+    max_cpu_temp_c: 85      # the hottest CPU package/core sensor
+    max_load_per_cpu: 0.8   # 1-minute load average / online CPUs
+    unit: { cpu_quota: 200%, nice: 10, memory_max: 8G }
+loops:
+  builder-night:
+    actor: builder
+    operation: build-pass
+    every: ["23:15", "02:15", "05:15"]
+    admission: { max_cpu_temp_c: 70 }
+```
+
+An undeclared limit admits unconditionally and is never read, so a solo operator on a machine with no sensors pays nothing for this (principle 2). A declared limit is checked against a reading taken fresh for that attempt: the hottest hwmon sensor labelled exactly `Package id 0` (coretemp's name for the package sensor), else the thermal zone typed `x86_pkg_temp`, else the maximum over every readable hwmon `temp*_input` and thermal zone `temp` file — a named sensor is preferred over the plain maximum because an unrelated zone (`acpitz`, a case or SSD sensor) commonly reads hotter than the CPU package under ordinary load, and a maximum would then track a sensor that says nothing about the package the limit means to protect. Load is `/proc/loadavg`'s 1-minute figure divided by the online CPU count. Both roots default to `/sys` and `/proc` and are injectable (`MANDATE_ADMISSION_SYS_ROOT`, `MANDATE_ADMISSION_PROC_ROOT`) for a test fixture, never for a real operator override.
+
+An over-limit reading records `admission-held` (`reason: "over-limit"`, the metric, the limit and the reading) and starts nothing: no lease is touched, no order is marked failed. The same attempt is simply retried — the next `ostrom dispatch` for the item, or, for a loop worker, the very next `ostrom up` reconciliation rather than waiting for the loop's own cadence slot (`ostrom up`'s loop-run state carries an `admission-held` status excluded from the "unchanged" settle check, the way `inconclusive` already is). A declared limit whose sensor cannot be read holds just as loudly, `reason: "sensor-unreadable"`, with a non-zero exit: a guard that quietly admits when it cannot see is not a guard (principles 5 and 7).
+
+Reading the machine is umwelt's job (it observes the host): `umwelt_runtime::read_host_resources`. Judging a reading against declared limits is ostrom's: `ostrom_core::AdmissionLimits::decide`, which touches no filesystem and is checked with a reading built by hand. `defaults.admission.unit`'s `cpu_quota`, `nice` and `memory_max` are declared systemd resource properties: a rendered loop unit and an implementer's systemd unit carry them as `CPUQuota=`, `Nice=` and `MemoryMax=` when declared, and omit them otherwise. On the machine this was written for, `nice` alone was measured not to reduce sustained heat, so `cpu_quota` is the property that actually matters; declaring one without the other is expected.
+
 Render and verify artifacts with:
 
 ```sh
