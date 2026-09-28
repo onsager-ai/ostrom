@@ -19,7 +19,7 @@ pub use agent::claude::ClaudeHarness;
 pub use agent::{
     ActionFault, AgentRegistry, AgentRunner, CapSupport, CodexHarness, Harness,
     ImplementerRunRequest, LoopCeilings, OrchestratorRunRequest, ProcessOutcome, RunCaps,
-    RunRequest, RunTermination, RunnerLaunch, SignalFlags,
+    RunRequest, RunTermination, RunnerLaunch, SignalFlags, SpawnObserver,
 };
 pub use command::CommandProvider;
 pub use control::{

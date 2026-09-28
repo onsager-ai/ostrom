@@ -29,12 +29,12 @@ use ethogram::{
     PayloadExtension, RunCeilings as EventRunCeilings, RunKind, RunOutcome as EventRunOutcome,
     RunUsage,
 };
-use ostrom_core::{MandateConfig, ResolvedRunCaps, WorkOrder};
+use ostrom_core::{MandateConfig, RUN_TERMINATION_GRACE_SECONDS, ResolvedRunCaps, WorkOrder};
 use regex::Regex;
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 
-use umwelt_runtime::{CapsWatchdog, RunCaps, SystemClock};
+use umwelt_runtime::{CapsWatchdog, RunCaps, SpawnObserver, SystemClock};
 
 use crate::{
     AgentRegistry, Clock, CodexHarness, ImplementerRunRequest, LeaseActionError, OstromPaths,
@@ -43,7 +43,7 @@ use crate::{
         AuthenticatedCommandError, GitHubInstallationTokenMinter, InstallationTokenMinter,
         ScopedAppTokenRequest, authenticated_output,
     },
-    append_trace, environment, generated_run_id, load_config_or_defaults,
+    append_trace, environment, generated_run_id, harness_record, load_config_or_defaults,
 };
 
 pub const DEFAULT_IMPLEMENTER_RUNNER: &str = "agent/codex";
@@ -753,7 +753,19 @@ fn implement_inner(
     let _input = File::open(&prompt_file)
         .map_err(|error| ImplementError::new(1, "prompt-read-failed", error.to_string()))?;
     drop(events);
-    let status = match registry.run(
+    // The harness leads its own process group, which no signal to this run's
+    // supervisor reaches. Recorded as soon as it is spawned, it can still be
+    // stopped if this worker is killed before it stops the harness itself
+    // (#633).
+    let harness = harness_record::record_path(
+        &request.paths.state,
+        request.supervisor_pid.unwrap_or_else(std::process::id),
+    );
+    let spawned = harness.clone().map_or_else(SpawnObserver::default, |path| {
+        let run_id = guard.run_events.run_id().to_owned();
+        SpawnObserver::new(move |pid| harness_record::record_or_warn(&path, &run_id, pid))
+    });
+    let outcome = registry.run(
         runner_name,
         &RunRequest::Implementer(ImplementerRunRequest {
             prompt: prompt_file,
@@ -780,8 +792,15 @@ fn implement_inner(
                     guard.order.order_id.clone().into(),
                 ),
             ],
+            spawned,
         }),
-    ) {
+    );
+    // Exited or terminated, the harness has been waited for and its group
+    // stopped: the record has nothing left to find.
+    if let (Some(path), RunOutcome::Exited(_) | RunOutcome::Terminated(_)) = (&harness, &outcome) {
+        harness_record::remove(path);
+    }
+    let status = match outcome {
         RunOutcome::Exited(status) => status,
         RunOutcome::Terminated(termination) => {
             guard.termination_signal = termination.termination_signal;
@@ -984,6 +1003,18 @@ fn check_interrupt_before_spawn(
     ))
 }
 
+/// How long an implementer's worker gives its harness to stop after `TERM`
+/// before it kills the harness's group: what an operator configured, else
+/// `RUN_TERMINATION_GRACE_SECONDS`. A supervisor waits on the same value
+/// (#633). A value that does not parse makes the worker refuse to run, with
+/// `termination-grace-invalid`, before it starts any harness; the supervisor
+/// then falls back to the same default, so no harness is ever timed by a
+/// grace the worker did not use.
+#[must_use]
+pub fn implementer_termination_grace() -> Duration {
+    termination_grace().unwrap_or(Duration::from_secs(RUN_TERMINATION_GRACE_SECONDS))
+}
+
 fn termination_grace() -> Result<Duration, ImplementError> {
     match environment::MANDATE_IMPLEMENTER_TERMINATION_GRACE_SECONDS.value() {
         Some(value) => value
@@ -998,7 +1029,7 @@ fn termination_grace() -> Result<Duration, ImplementError> {
                     "termination grace must be a positive integer",
                 )
             }),
-        None => Ok(Duration::from_secs(5)),
+        None => Ok(Duration::from_secs(RUN_TERMINATION_GRACE_SECONDS)),
     }
 }
 

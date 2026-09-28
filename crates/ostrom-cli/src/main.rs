@@ -39,12 +39,12 @@ use ostrom_store::{
     create_work_order, credential_output, decide_queue_item, discover_goals_path,
     effective_repositories, encode_org_snapshots_with_faults, encode_selection, environment,
     finalize_exited_implementer, generated_run_id, grant_excuse, grant_excuse_at_head,
-    inherited_repository_scope, item_hash, lease_status, lint_queue_state, list_excuses,
-    list_queue_json, load_config_or_defaults, local_drift, parse_repository_list, read_trace_json,
-    release_lease, render_digest, revoke_excuse, run_dispatch_with_registry, run_gate,
-    run_implement_with_registry, run_pass, run_plan, run_reap_worktrees, run_repair_prs,
-    run_selection, run_sweep_with_publication_source, validate_lease_name,
-    validate_work_order_file,
+    implementer_termination_grace, inherited_repository_scope, item_hash, lease_status,
+    lint_queue_state, list_excuses, list_queue_json, load_config_or_defaults, local_drift,
+    parse_repository_list, read_trace_json, release_lease, render_digest, revoke_excuse,
+    run_dispatch_with_registry, run_gate, run_implement_with_registry, run_pass, run_plan,
+    run_reap_worktrees, run_repair_prs, run_selection, run_sweep_with_publication_source,
+    stop_supervised_harness, validate_lease_name, validate_work_order_file,
 };
 
 mod loop_presets;
@@ -2696,9 +2696,30 @@ fn supervise(arguments: &[OsString], implementer: Option<(&Path, &str)>, clock: 
             eprintln!("ostrom: could not start worker: {error}");
             std::process::exit(1);
         });
+    // The worker records the harness child it starts (Codex, Claude), which
+    // leads a process group of its own that no signal to this process or the
+    // worker reaches (#633). The grace is how long the worker's own stop of
+    // its harness may take.
+    let state = compatible_command_paths().state;
+    let grace = if implementer.is_some() {
+        implementer_termination_grace()
+    } else {
+        Duration::from_millis(PASS_KILL_GRACE_MS)
+    };
+    let mut forwarded: Option<std::time::Instant> = None;
+    let mut harness_stopped = false;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
+                // A worker that exited without stopping its harness (killed
+                // outright, or crashed) leaves it running with nothing
+                // watching it. It is stopped here, before the run is recorded
+                // and its lease released.
+                if !stop_supervised_harness(&state, grace) {
+                    eprintln!(
+                        "ostrom: the harness this run started could not be confirmed stopped"
+                    );
+                }
                 if let Some((order_file, unit_name)) = implementer {
                     let signal = exit_signal(&status);
                     if let Err(error) = finalize_exited_implementer(
@@ -2730,6 +2751,17 @@ fn supervise(arguments: &[OsString], implementer: Option<(&Path, &str)>, clock: 
             let _ = std::process::Command::new(command)
                 .args([format!("-{name}"), child.id().to_string()])
                 .status();
+            forwarded.get_or_insert_with(std::time::Instant::now);
+        }
+        // A forwarded signal stops the run through its worker, which stops
+        // its harness within the grace. A harness still running at twice the
+        // grace means the worker is hung, and the harness is stopped from here
+        // (#633); the worker still ends the run and writes its row.
+        if !harness_stopped && forwarded.is_some_and(|at| at.elapsed() >= grace.saturating_mul(2)) {
+            harness_stopped = true;
+            if !stop_supervised_harness(&state, grace) {
+                eprintln!("ostrom: the harness this run started could not be confirmed stopped");
+            }
         }
         thread::sleep(Duration::from_millis(25));
     }

@@ -138,3 +138,56 @@ pub fn names_a_substrate(text: &str) -> bool {
 
 #[cfg(unix)]
 pub mod tree;
+
+/// The start time `/proc` records for `pid`.
+pub fn process_start_time(pid: u32) -> Option<u64> {
+    fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()?
+        .rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
+/// Whether `pid` still runs as the process that started at `start_time`: a
+/// zombie, an exited pid or a recycled one is not.
+pub fn same_process_running(pid: u32, start_time: u64) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            let fields = stat
+                .rsplit_once(')')?
+                .1
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            Some(
+                !matches!(fields.first()?.as_str(), "Z" | "X")
+                    && fields.get(19)?.parse::<u64>().ok()? == start_time,
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// How many harness records (#633) a state root still holds.
+pub fn harness_records(state: &Path) -> usize {
+    fs::read_dir(state.join("harness")).map_or(0, |entries| entries.flatten().count())
+}
+
+/// Kills a process group on drop, only while its leader is still the process
+/// that started at the recorded time, so a recycled pid is never signalled.
+pub struct KillSameProcessGroup(pub u32, pub u64);
+
+impl Drop for KillSameProcessGroup {
+    fn drop(&mut self) {
+        if same_process_running(self.0, self.1) {
+            let _ = Command::new("/bin/kill")
+                .args(["-KILL", "--", &format!("-{}", self.0)])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+}

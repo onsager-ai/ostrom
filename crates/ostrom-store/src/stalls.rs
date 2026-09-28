@@ -38,6 +38,13 @@
 //!    that outlived `KILL`, a target it refused) leaves no row, releases
 //!    nothing and keeps the claim.
 //!
+//! A run's harness child (Codex, Claude) leads a process group of its own,
+//! which no signal to the run's own process reaches (#633). Once that process
+//! is confirmed gone, the reaper stops the harness its worker recorded
+//! ([`crate::harness_record`]), identity-checked like the run's own process,
+//! before it records or releases anything; a harness it cannot confirm gone
+//! leaves the stop unconfirmed.
+//!
 //! The next reaper examines a kept claim before anything else about that
 //! hold. A claim whose reaper has died is taken over and completed with what
 //! it recorded; one whose run already has a terminal row is removed.
@@ -95,6 +102,7 @@ use crate::{
     TraceFactRecord, append_trace,
     claim::{self, Claim, ClaimError, Holder, HolderKeys},
     environment,
+    harness_record::{self, RecordedHarness},
     holdings::read_leases,
     lease::{read_process_identity, read_process_identity_at},
     open_holdings, read_trace,
@@ -524,6 +532,7 @@ fn reap_all(
     if let Err(error) = remove_settled_claims(paths) {
         pass.errors.push((None, error));
     }
+    remove_settled_harness_records(&paths.state);
     let mut reaped = Vec::new();
     for hold in holds {
         let Some(run_id) = hold.progress.holding.run_id.clone() else {
@@ -605,6 +614,18 @@ fn remove_settled_claims(paths: &OstromPaths) -> Result<(), StallError> {
         }
     }
     Ok(())
+}
+
+/// Remove every harness record whose process is confirmed gone (#633). A
+/// run killed with its whole group, by its service manager say, leaves its
+/// record behind; a process identity that has ended never runs again, so
+/// nothing can need the record. One `/proc` cannot answer for is kept.
+fn remove_settled_harness_records(state: &Path) {
+    for (path, _, harness) in harness_record::all(state) {
+        if ProcessIdentity::from(harness).is_running() == Some(false) {
+            harness_record::remove(&path);
+        }
+    }
 }
 
 fn trace_rows(paths: &OstromPaths) -> Result<Vec<TraceFactRecord>, StallError> {
@@ -894,6 +915,16 @@ struct ProcessIdentity {
     pid: u32,
     process_group_id: u32,
     start_time: u64,
+}
+
+impl From<RecordedHarness> for ProcessIdentity {
+    fn from(harness: RecordedHarness) -> Self {
+        Self {
+            pid: harness.pid,
+            process_group_id: harness.process_group_id,
+            start_time: harness.start_time,
+        }
+    }
 }
 
 impl ProcessIdentity {
@@ -1324,10 +1355,24 @@ fn finish_claim(
     clock: &Clock,
     holding: &Holding,
     run_id: &str,
-    claim: Claim,
+    mut claim: Claim,
     stop: StopOutcome,
     order: Option<&InFlightOrder>,
 ) -> Result<Option<ReapedHold>, StallError> {
+    // The run's own process is gone. Its harness child leads a group of its
+    // own and may not be (#633): it is stopped too, before anything is
+    // recorded or released.
+    let stop = if stop == StopOutcome::Stopped {
+        stop_harness(
+            &paths.state,
+            run_id,
+            Path::new("/proc"),
+            reaper_grace(),
+            &mut || mark_signalled(&mut claim, clock),
+        )
+    } else {
+        stop
+    };
     let intent = ReapIntent::from_record(claim.record())
         .ok_or_else(|| StallError::Record(format!("the claim on run {run_id} is incomplete")))?;
     let reaped = ReapedHold {
@@ -1449,17 +1494,71 @@ fn stop_process(
     identity: ProcessIdentity,
     mark_signalled: &mut dyn FnMut() -> bool,
 ) -> StopOutcome {
-    stop_process_at(identity, Path::new("/proc"), mark_signalled)
+    stop_process_at(identity, Path::new("/proc"), reaper_grace(), mark_signalled)
+}
+
+/// How long the reaper waits after each signal. A run's own TERM handling
+/// stops its harness with the termination grace, so the reaper allows twice
+/// that before escalating.
+fn reaper_grace() -> Duration {
+    Duration::from_secs(RUN_TERMINATION_GRACE_SECONDS.saturating_mul(2))
+}
+
+/// Stop the harness child recorded for `run_id` (#633), once the run's own
+/// process is gone: its group, identity-checked before every signal like any
+/// other stop, and then any member of that group that outlived it. No record,
+/// or a record whose process group is empty or whose pid has been recycled,
+/// is `Stopped` without a signal. A confirmed stop removes the record.
+fn stop_harness(
+    state: &Path,
+    run_id: &str,
+    proc_root: &Path,
+    grace: Duration,
+    mark_signalled: &mut dyn FnMut() -> bool,
+) -> StopOutcome {
+    let Some((path, harness)) = harness_record::find(state, run_id) else {
+        return StopOutcome::Stopped;
+    };
+    let outcome = stop_harness_process(harness.into(), proc_root, grace, mark_signalled);
+    if outcome == StopOutcome::Stopped {
+        harness_record::remove(&path);
+    }
+    outcome
+}
+
+/// Stop the harness child this supervisor's worker recorded, if it still
+/// runs (#633). A supervisor calls it when its worker has exited, or when a
+/// signal it forwarded has not stopped the run within twice `grace`: a worker
+/// killed or hung before it stops its own harness would otherwise leave it
+/// running, since the harness leads a process group of its own. The recorded
+/// identity is re-checked before every signal. `true` when the harness is
+/// confirmed gone, or none was recorded.
+#[must_use]
+pub fn stop_supervised_harness(state: &Path, grace: Duration) -> bool {
+    let Some(path) = harness_record::record_path(state, std::process::id()) else {
+        return true;
+    };
+    let Some((_, harness)) = harness_record::read(&path) else {
+        return true;
+    };
+    let stopped = stop_harness_process(harness.into(), Path::new("/proc"), grace, &mut || true)
+        == StopOutcome::Stopped;
+    if stopped {
+        harness_record::remove(&path);
+    }
+    stopped
 }
 
 /// Stop exactly the recorded process: its group when it leads one (the
-/// process backend starts every implementer as a session leader), otherwise
-/// the pid alone. The identity is re-checked before every signal, so a pid
-/// that has since been recycled is never signalled, and a liveness `/proc`
-/// cannot answer is never taken for a stop.
+/// process backend starts every implementer as a session leader, and every
+/// harness child leads its own), otherwise the pid alone. The identity is
+/// re-checked before every signal, so a pid that has since been recycled is
+/// never signalled, and a liveness `/proc` cannot answer is never taken for a
+/// stop. `grace` is the wait after each signal.
 fn stop_process_at(
     identity: ProcessIdentity,
     proc_root: &Path,
+    grace: Duration,
     mark_signalled: &mut dyn FnMut() -> bool,
 ) -> StopOutcome {
     // `None` while it still runs; otherwise what that settles.
@@ -1478,9 +1577,18 @@ fn stop_process_at(
     let Some(target) = signal_target(identity, own) else {
         return StopOutcome::Refused;
     };
-    // The run's own TERM handling stops its harness with the termination
-    // grace, so the reaper waits for that before escalating.
-    let grace = Duration::from_secs(RUN_TERMINATION_GRACE_SECONDS.saturating_mul(2));
+    signal_until_settled(&settled, &target, grace, mark_signalled)
+}
+
+/// `SIGTERM` to `target`, then `SIGKILL` after `grace`, until `settled`
+/// settles it. `settled` is checked before every signal, so nothing is
+/// signalled once it has.
+fn signal_until_settled(
+    settled: &dyn Fn() -> Option<StopOutcome>,
+    target: &str,
+    grace: Duration,
+    mark_signalled: &mut dyn FnMut() -> bool,
+) -> StopOutcome {
     let mut marked = false;
     for signal in ["-TERM", "-KILL"] {
         if let Some(outcome) = settled() {
@@ -1493,7 +1601,7 @@ fn stop_process_at(
             marked = true;
         }
         let _ = Command::new(kill_command())
-            .args([signal, "--", &target])
+            .args([signal, "--", target])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
@@ -1506,6 +1614,97 @@ fn stop_process_at(
         }
     }
     settled().unwrap_or(StopOutcome::StillRunning)
+}
+
+/// Stop a recorded harness: its leader, then whatever is left of the group it
+/// led.
+fn stop_harness_process(
+    harness: ProcessIdentity,
+    proc_root: &Path,
+    grace: Duration,
+    mark_signalled: &mut dyn FnMut() -> bool,
+) -> StopOutcome {
+    match stop_process_at(harness, proc_root, grace, mark_signalled) {
+        StopOutcome::Stopped => stop_leaderless_group(harness, proc_root, grace, mark_signalled),
+        other => other,
+    }
+}
+
+/// Stop what is left of a harness's process group once its leader is gone
+/// (#633 review). A command the harness started, such as a build, stays in
+/// the harness's group when the harness exits, with no parent watching it.
+///
+/// The group is signalled only while the leader's pid is free, or still names
+/// the recorded process as a zombie. Linux does not reuse a pid while a
+/// process group of that id still has members, so a group with members under
+/// that id can only be this harness's. A leader pid that now names another
+/// process means the group emptied and the id was reused: nothing is
+/// signalled. A member is a process `kill -0` reaches in the group and `/proc`
+/// shows running in it; a zombie is not one, so a leader its hung parent never
+/// reaps does not keep the group occupied. `Stopped` only once no member is
+/// left; never this process's own group.
+fn stop_leaderless_group(
+    harness: ProcessIdentity,
+    proc_root: &Path,
+    grace: Duration,
+    mark_signalled: &mut dyn FnMut() -> bool,
+) -> StopOutcome {
+    let group = harness.process_group_id;
+    // A harness that did not lead its group leaves nothing of its own there.
+    if harness.pid != group {
+        return StopOutcome::Stopped;
+    }
+    let settled = || match read_process_identity_at(proc_root, harness.pid) {
+        Err(_) => Some(StopOutcome::Unknown),
+        Ok(Some(observed))
+            if observed.start_time != harness.start_time || observed.process_group_id != group =>
+        {
+            Some(StopOutcome::Stopped)
+        }
+        Ok(_) if !group_signallable(group) => Some(StopOutcome::Stopped),
+        Ok(_) => match live_group_members(proc_root, group) {
+            None => Some(StopOutcome::Unknown),
+            Some(0) => Some(StopOutcome::Stopped),
+            Some(_) => None,
+        },
+    };
+    if let Some(outcome) = settled() {
+        return outcome;
+    }
+    let own_group = read_process_identity_at(proc_root, std::process::id())
+        .ok()
+        .flatten()
+        .map(|own| own.process_group_id);
+    if own_group.is_none_or(|own_group| own_group == group) {
+        return StopOutcome::Refused;
+    }
+    signal_until_settled(&settled, &format!("-{group}"), grace, mark_signalled)
+}
+
+/// Whether `kill -0` reaches any process in `group`.
+fn group_signallable(group: u32) -> bool {
+    Command::new(kill_command())
+        .args(["-0", "--", &format!("-{group}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// How many processes `/proc` shows running in `group`, zombies excluded.
+/// `None` when `/proc` cannot be listed.
+fn live_group_members(proc_root: &Path, group: u32) -> Option<usize> {
+    Some(
+        fs::read_dir(proc_root)
+            .ok()?
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+            .filter_map(|pid| read_process_identity_at(proc_root, pid).ok().flatten())
+            .filter(|observed| {
+                observed.process_group_id == group && !matches!(observed.state, 'Z' | 'X')
+            })
+            .count(),
+    )
 }
 
 /// The `kill` argument for `identity`, or `None` when signalling it would
@@ -1610,7 +1809,12 @@ mod tests {
         fs::create_dir_all(fixture.path().join("4194301/stat"))
             .expect("create an unreadable stat entry");
         assert_eq!(
-            stop_process_at(identity(4_194_301, 4_194_301), fixture.path(), &mut || true),
+            stop_process_at(
+                identity(4_194_301, 4_194_301),
+                fixture.path(),
+                std::time::Duration::from_secs(1),
+                &mut || true
+            ),
             StopOutcome::Unknown
         );
     }
@@ -1687,6 +1891,238 @@ mod tests {
             ),
             (vec![json!("unexamined-run")], 3)
         );
+    }
+
+    /// #633: the harness child a run recorded, stopped once the run's own
+    /// process is gone. Each process here is this test's own, leads its own
+    /// group as a harness does, and is killed with its group on drop, never by
+    /// pattern.
+    #[cfg(unix)]
+    mod harness {
+        use std::{
+            fs,
+            os::unix::process::CommandExt as _,
+            process::{Child, Command, Stdio},
+            time::Duration,
+        };
+
+        use serde_json::json;
+        use tempfile::tempdir;
+
+        use super::super::{StopOutcome, stop_harness};
+        use crate::lease::read_process_identity;
+
+        struct Harness(Child);
+
+        impl Harness {
+            /// A harness that ignores `SIGTERM`, as a hung one may.
+            fn ignoring_term() -> Self {
+                Self(
+                    Command::new("sh")
+                        .args(["-c", "trap '' TERM; exec sleep 60"])
+                        .process_group(0)
+                        .stdin(Stdio::null())
+                        .spawn()
+                        .expect("start a harness that ignores TERM"),
+                )
+            }
+
+            fn running(&mut self) -> bool {
+                self.0.try_wait().expect("poll the harness").is_none()
+            }
+
+            /// Record this process for `run_id` as a worker records its
+            /// harness, with its start time moved by `start_time_offset`.
+            fn record(&self, state: &std::path::Path, run_id: &str, start_time_offset: u64) {
+                // `sh` has exec'd `sleep` once it ignores TERM; its identity
+                // is the same either way.
+                let identity = read_process_identity(self.0.id())
+                    .expect("read the harness")
+                    .expect("the harness is running");
+                fs::create_dir_all(state.join("harness")).expect("create the record directory");
+                fs::write(
+                    state.join(format!("harness/{run_id}.json")),
+                    json!({
+                        "run_id": run_id,
+                        "pid": identity.pid,
+                        "process_group_id": identity.process_group_id,
+                        "process_start_time": identity.start_time + start_time_offset,
+                    })
+                    .to_string(),
+                )
+                .expect("write the harness record");
+            }
+        }
+
+        impl Drop for Harness {
+            fn drop(&mut self) {
+                let _ = Command::new("/bin/kill")
+                    .args(["-KILL", "--", &format!("-{}", self.0.id())])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                let _ = self.0.wait();
+            }
+        }
+
+        /// A harness that ignores TERM is killed with its group once its
+        /// run's own process is gone, and its record is removed.
+        #[test]
+        fn a_harness_that_ignores_term_is_killed_with_its_group() {
+            let state = tempdir().expect("state root");
+            let mut harness = Harness::ignoring_term();
+            // Let `sh` install the trap and exec before it is signalled.
+            std::thread::sleep(Duration::from_millis(300));
+            harness.record(state.path(), "run-a", 0);
+            let mut signals = 0;
+            let outcome = stop_harness(
+                state.path(),
+                "run-a",
+                std::path::Path::new("/proc"),
+                Duration::from_secs(1),
+                &mut || {
+                    signals += 1;
+                    true
+                },
+            );
+            assert_eq!(
+                (
+                    outcome,
+                    harness.running(),
+                    signals > 0,
+                    state.path().join("harness/run-a.json").exists(),
+                ),
+                (StopOutcome::Stopped, false, true, false)
+            );
+        }
+
+        /// Whether `pid` still runs as the process that started at
+        /// `start_time`; a zombie does not.
+        fn running(pid: u32, start_time: u64) -> bool {
+            read_process_identity(pid)
+                .ok()
+                .flatten()
+                .is_some_and(|observed| {
+                    observed.start_time == start_time && !matches!(observed.state, 'Z' | 'X')
+                })
+        }
+
+        /// Kills one process on drop, only while it is still the one that
+        /// started at the recorded time.
+        struct Survivor(u32, u64);
+
+        impl Drop for Survivor {
+            fn drop(&mut self) {
+                if running(self.0, self.1) {
+                    let _ = Command::new("/bin/kill")
+                        .args(["-KILL", &self.0.to_string()])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                }
+            }
+        }
+
+        /// #633 review: the harness exits on its own and leaves a command it
+        /// started (a build, say) running in its group with no parent. Once
+        /// the leader is gone the group is stopped, the survivor ignoring
+        /// TERM, and the stop is confirmed only when the group is empty.
+        #[test]
+        fn a_group_that_outlives_its_harness_is_stopped() {
+            let state = tempdir().expect("state root");
+            let survivor_file = state.path().join("survivor.pid");
+            let mut leader = Command::new("sh")
+                .args([
+                    "-c",
+                    &format!(
+                        "trap '' TERM; sleep 60 & printf '%s' \"$!\" >'{}'; sleep 1",
+                        survivor_file.display()
+                    ),
+                ])
+                .process_group(0)
+                .stdin(Stdio::null())
+                .spawn()
+                .expect("start a harness that leaves a survivor");
+            // Recorded while the leader runs, as its worker records it.
+            let identity = read_process_identity(leader.id())
+                .expect("read the harness")
+                .expect("the harness is running");
+            fs::create_dir_all(state.path().join("harness")).expect("create the record directory");
+            fs::write(
+                state.path().join("harness/run-a.json"),
+                json!({
+                    "run_id": "run-a",
+                    "pid": identity.pid,
+                    "process_group_id": identity.process_group_id,
+                    "process_start_time": identity.start_time,
+                })
+                .to_string(),
+            )
+            .expect("write the harness record");
+            let _ = leader.wait();
+            let survivor = fs::read_to_string(&survivor_file)
+                .expect("read the survivor pid")
+                .trim()
+                .parse::<u32>()
+                .expect("a survivor pid");
+            let survivor_identity = read_process_identity(survivor)
+                .expect("read the survivor")
+                .expect("the survivor outlived its harness");
+            let _survivor = Survivor(survivor, survivor_identity.start_time);
+            let mut signals = 0;
+            let outcome = stop_harness(
+                state.path(),
+                "run-a",
+                std::path::Path::new("/proc"),
+                Duration::from_secs(1),
+                &mut || {
+                    signals += 1;
+                    true
+                },
+            );
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while running(survivor, survivor_identity.start_time)
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            assert_eq!(
+                (
+                    survivor_identity.process_group_id == identity.pid,
+                    outcome,
+                    running(survivor, survivor_identity.start_time),
+                    signals > 0,
+                    state.path().join("harness/run-a.json").exists(),
+                ),
+                (true, StopOutcome::Stopped, false, true, false)
+            );
+        }
+
+        /// A recorded harness pid now carried by a process with another start
+        /// time has been recycled: it is not this run's harness and is never
+        /// signalled.
+        #[test]
+        fn a_recycled_harness_pid_is_never_signalled() {
+            let state = tempdir().expect("state root");
+            let mut harness = Harness::ignoring_term();
+            std::thread::sleep(Duration::from_millis(300));
+            harness.record(state.path(), "run-a", 1);
+            let mut signals = 0;
+            let outcome = stop_harness(
+                state.path(),
+                "run-a",
+                std::path::Path::new("/proc"),
+                Duration::from_secs(1),
+                &mut || {
+                    signals += 1;
+                    true
+                },
+            );
+            assert_eq!(
+                (outcome, harness.running(), signals),
+                (StopOutcome::Stopped, true, 0)
+            );
+        }
     }
 
     /// #637: a hold on a real process of this test's own, judged at a fixed

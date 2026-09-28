@@ -257,6 +257,44 @@ pub struct ImplementerRunRequest {
     /// otherwise inherit. The consumer names them; the runtime only applies
     /// them.
     pub environment: Vec<(OsString, OsString)>,
+    /// Told the harness child's pid once it is spawned, before the runtime
+    /// waits on it.
+    pub spawned: SpawnObserver,
+}
+
+/// Told the pid of a harness child the runtime has just spawned.
+///
+/// The child leads its own process group, so the pid is also its group id.
+/// The runtime stops that group on every path it controls; a consumer that
+/// must still reach the group after this process is gone (killed outright,
+/// say) records it from here. The runtime only reports the pid; what is
+/// recorded, and where, is the consumer's.
+#[derive(Clone, Default)]
+pub struct SpawnObserver(Option<Observer>);
+
+type Observer = Arc<dyn Fn(u32) + Send + Sync>;
+
+impl SpawnObserver {
+    #[must_use]
+    pub fn new(observer: impl Fn(u32) + Send + Sync + 'static) -> Self {
+        Self(Some(Arc::new(observer)))
+    }
+
+    /// Report `pid` to the observer, if there is one.
+    pub fn notify(&self, pid: u32) {
+        if let Some(observer) = &self.0 {
+            observer(pid);
+        }
+    }
+}
+
+impl std::fmt::Debug for SpawnObserver {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("SpawnObserver")
+            .field(&self.0.as_ref().map(|_| "observer"))
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -588,6 +626,7 @@ impl AgentRunner for CodexHarness {
                 ));
             }
         };
+        request.spawned.notify(child.id());
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
@@ -972,6 +1011,7 @@ mod tests {
             supervisor_pid: None,
             termination_grace: Duration::from_secs(1),
             environment: Vec::new(),
+            spawned: SpawnObserver::default(),
         })
     }
 
