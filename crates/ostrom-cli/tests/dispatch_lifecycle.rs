@@ -1667,8 +1667,10 @@ exit 1"#,
     )
     .expect("append a second refusal");
     let (claude, _canary_calls) = claude_canary_stub(&fixture, "DENIED");
+    let (path, _) = control_curl(&fixture, 0);
     let second = fixture
         .dispatch(false)
+        .env("PATH", path)
         .env("MANDATE_GH_AS_BIN", &credential)
         .env("CLAUDE_BIN", &claude)
         .output()
@@ -1802,8 +1804,10 @@ fn the_runner_flag_overrides_the_declared_order() {
     let fixture = DispatchFixture::new(false);
     compose_current(&fixture.state, TWO_RUNNERS);
     let (claude, _canary_calls) = claude_canary_stub(&fixture, "DENIED");
+    let (path, _) = control_curl(&fixture, 0);
     let output = fixture
         .dispatch(false)
+        .env("PATH", path)
         .arg("--runner")
         .arg("agent/claude")
         .env("CLAUDE_BIN", &claude)
@@ -1852,6 +1856,27 @@ fn claude_canary_stub(fixture: &DispatchFixture, network: &str) -> (PathBuf, Pat
     (claude, calls)
 }
 
+/// A `curl` for the canary's unsandboxed control that exits `exit` and records
+/// the proxy variables it saw. Returns a `PATH` that finds it first.
+fn control_curl(fixture: &DispatchFixture, exit: i32) -> (String, PathBuf) {
+    let directory = fixture.root.path().join("control-bin");
+    fs::create_dir_all(&directory).expect("create control bin");
+    let seen = fixture.root.path().join("control.env");
+    executable(
+        &directory.join("curl"),
+        &format!(
+            "env | grep -i '_proxy=' >'{}' || true\nexit {exit}",
+            seen.display()
+        ),
+    );
+    let path = format!(
+        "{}:{}",
+        directory.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    (path, seen)
+}
+
 fn canary_calls(calls: &Path) -> usize {
     fs::read_to_string(calls).map_or(0, |calls| calls.lines().count())
 }
@@ -1868,8 +1893,10 @@ fn a_claude_whose_canary_reaches_the_network_is_skipped_for_the_next_runner() {
         "manifest_version: 1\ndefaults:\n  implementers: [{runner: agent/claude}, {runner: agent/codex}]\n",
     );
     let (claude, calls) = claude_canary_stub(&fixture, "REACHED");
+    let (path, _) = control_curl(&fixture, 0);
     let output = fixture
         .dispatch(false)
+        .env("PATH", path)
         .env("CLAUDE_BIN", &claude)
         .output()
         .expect("dispatch");
@@ -1911,15 +1938,123 @@ fn a_claude_whose_canary_reaches_the_network_is_skipped_for_the_next_runner() {
     );
 }
 
+/// #626: a denied sandboxed attempt means nothing unless ostrom itself can
+/// reach the host. An unreachable control is inconclusive: no Claude session
+/// is spent, nothing is cached, and routing moves on.
+#[test]
+fn an_unreachable_control_is_inconclusive_and_caches_nothing() {
+    let fixture = DispatchFixture::new(false);
+    compose_current(
+        &fixture.state,
+        "manifest_version: 1\ndefaults:\n  implementers: [{runner: agent/claude}, {runner: agent/codex}]\n",
+    );
+    let (claude, calls) = claude_canary_stub(&fixture, "DENIED");
+    let (path, _) = control_curl(&fixture, 7);
+    let output = fixture
+        .dispatch(false)
+        .env("PATH", path)
+        .env("CLAUDE_BIN", &claude)
+        .output()
+        .expect("dispatch");
+    let trace = trace(&fixture.state);
+    let row = |kind: &str| {
+        trace
+            .iter()
+            .find(|row| row["kind"] == kind)
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    let availability: Value = fs::read(fixture.state.join("runner-availability.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or(Value::Null);
+    assert_eq!(
+        json!({
+            "dispatched": output.status.success(),
+            "claude_sessions": canary_calls(&calls),
+            "canary_outcome": row("sandbox-checked")["fact"]["outcome"],
+            "claude_reason": availability["runners"]["agent/claude"]["reason"],
+            "runner": row("work-dispatched")["fact"]["runner"],
+            "pass_cached": fixture.state.join("sandbox-canary.json").exists(),
+        }),
+        json!({
+            "dispatched": true,
+            "claude_sessions": 0,
+            "canary_outcome": "inconclusive",
+            "claude_reason": "sandbox-inconclusive",
+            "runner": "agent/codex",
+            "pass_cached": false,
+        }),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// #626: the control runs with the operator's proxy environment unchanged,
+/// and the `sandbox-checked` fact records those variables with any
+/// credential removed.
+#[test]
+fn the_control_sees_the_proxy_environment_and_the_record_never_holds_its_secret() {
+    let fixture = DispatchFixture::new(false);
+    let (claude, _calls) = claude_canary_stub(&fixture, "DENIED");
+    let (path, seen) = control_curl(&fixture, 0);
+    let output = fixture
+        .dispatch(false)
+        .env("PATH", path)
+        .env("HTTPS_PROXY", "http://user:s3cret@proxy.invalid:3128")
+        .env("no_proxy", "localhost,.internal.invalid")
+        .arg("--runner=agent/claude")
+        .env("CLAUDE_BIN", &claude)
+        .output()
+        .expect("dispatch");
+    let control = fs::read_to_string(&seen).unwrap_or_default();
+    let checked = trace(&fixture.state)
+        .into_iter()
+        .find(|row| row["kind"] == "sandbox-checked")
+        .unwrap_or(Value::Null);
+    let leaked = ["sprint.jsonl", "events.jsonl"].iter().any(|file| {
+        fs::read_to_string(fixture.state.join(file)).is_ok_and(|text| text.contains("s3cret"))
+    });
+    assert_eq!(
+        json!({
+            "dispatched": output.status.success(),
+            "control_saw_proxy": control
+                .lines()
+                .any(|line| line == "HTTPS_PROXY=http://user:s3cret@proxy.invalid:3128"),
+            "control_saw_no_proxy": control
+                .lines()
+                .any(|line| line == "no_proxy=localhost,.internal.invalid"),
+            "outcome": checked["fact"]["outcome"],
+            "recorded_proxy": checked["fact"]["proxy"],
+            "secret_in_a_record": leaked,
+        }),
+        json!({
+            "dispatched": true,
+            "control_saw_proxy": true,
+            "control_saw_no_proxy": true,
+            "outcome": "pass",
+            "recorded_proxy": {
+                "HTTPS_PROXY": "http://proxy.invalid:3128",
+                "no_proxy": "localhost,.internal.invalid",
+            },
+            "secret_in_a_record": false,
+        }),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// #626: a denied canary is cached per (claude version, profile hash); the
 /// same binary is not checked again, and a new version is.
 #[test]
 fn a_passing_canary_is_cached_until_the_claude_version_changes() {
     let fixture = DispatchFixture::new(false);
     let (claude, calls) = claude_canary_stub(&fixture, "DENIED");
+    let (path, _) = control_curl(&fixture, 0);
     let dispatch = || {
         fixture
             .dispatch(false)
+            .env("PATH", &path)
             .arg("--runner=agent/claude")
             .env("CLAUDE_BIN", &claude)
             .output()

@@ -36,6 +36,25 @@ use crate::{
 
 pub const SANDBOX_CANARY_FILE: &str = "sandbox-canary.json";
 pub const SANDBOX_UNVERIFIED_REASON: &str = "sandbox-unverified";
+/// The canary could not tell: the unsandboxed control did not reach the host,
+/// so a denied sandboxed attempt proves nothing. Nothing is cached.
+pub const SANDBOX_INCONCLUSIVE_REASON: &str = "sandbox-inconclusive";
+
+/// The host both the canary and its unsandboxed control try to reach.
+const CANARY_HOST: &str = "example.com";
+
+/// The proxy variables curl honours, read from the environment the control
+/// and the canary both inherit, and recorded with credentials redacted.
+const PROXY_VARIABLES: [crate::environment::EnvironmentVariable; 8] = [
+    crate::environment::ALL_PROXY,
+    crate::environment::HTTPS_PROXY,
+    crate::environment::HTTP_PROXY,
+    crate::environment::NO_PROXY,
+    crate::environment::ALL_PROXY_LOWERCASE,
+    crate::environment::HTTPS_PROXY_LOWERCASE,
+    crate::environment::HTTP_PROXY_LOWERCASE,
+    crate::environment::NO_PROXY_LOWERCASE,
+];
 
 /// The canary's bounds: a few turns, two minutes, and a token ceiling that
 /// covers one short session's cached system prompt.
@@ -77,13 +96,13 @@ pub(crate) fn ensure_claude_sandbox(
 ) -> Result<(), String> {
     let run_id = generated_run_id("sandbox-canary", clock);
     let result = check(paths, clock, registry, model, &run_id);
-    if let Err(message) = &result {
+    if let Err((reason, message)) = &result {
         let until = clock.now()
             + chrono::Duration::seconds(i64::try_from(retry_seconds).unwrap_or(i64::MAX / 2));
         let entry = crate::UnavailableRunner {
             until: until.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             reset_reported: false,
-            reason: SANDBOX_UNVERIFIED_REASON.to_owned(),
+            reason: (*reason).to_owned(),
             message: message.chars().take(500).collect(),
             recorded_at: clock.timestamp(),
             run_id,
@@ -92,7 +111,13 @@ pub(crate) fn ensure_claude_sandbox(
             eprintln!("ostrom: could not record {CLAUDE_RUNNER} as unavailable: {error}");
         }
     }
-    result.map_err(|message| format!("{SANDBOX_UNVERIFIED_REASON}: {message}"))
+    result.map_err(|(reason, message)| format!("{reason}: {message}"))
+}
+
+type CanaryFailure = (&'static str, String);
+
+fn unverified(message: impl Into<String>) -> CanaryFailure {
+    (SANDBOX_UNVERIFIED_REASON, message.into())
 }
 
 fn check(
@@ -101,14 +126,14 @@ fn check(
     registry: &AgentRegistry,
     model: Option<&str>,
     run_id: &str,
-) -> Result<(), String> {
+) -> Result<(), CanaryFailure> {
     let runner = registry
         .get(CLAUDE_RUNNER)
-        .ok_or_else(|| "the Claude harness is not registered".to_owned())?;
+        .ok_or_else(|| unverified("the Claude harness is not registered"))?;
     let version = runner
         .installed_version()
         .filter(|version| !version.is_empty())
-        .ok_or_else(|| "`claude --version` did not report a version".to_owned())?;
+        .ok_or_else(|| unverified("`claude --version` did not report a version"))?;
     let profile_sha256 = ostrom_core::sha256_hex(
         umwelt_runtime::agent::claude::implementer_settings_source().as_bytes(),
     );
@@ -125,14 +150,30 @@ fn check(
         return Ok(());
     }
 
+    let checked = Checked {
+        run_id,
+        version: &version,
+        profile_sha256: &profile_sha256,
+        proxy: proxy_environment(),
+    };
+    // A denied attempt means something only if the host is reachable without
+    // the sandbox, through the same resolver and proxies. Checked first, so an
+    // unreachable host spends no Claude session.
+    if let Err(detail) = control_reaches_host() {
+        let message = format!("the unsandboxed control could not reach {CANARY_HOST}: {detail}");
+        checked.record(paths, clock, "inconclusive", Some(&message), 0.0);
+        return Err((SANDBOX_INCONCLUSIVE_REASON, message));
+    }
+
     let directory = paths.state.join("sandbox-canary").join(run_id);
     let work = directory.join("work");
-    fs::create_dir_all(&work).map_err(|error| format!("could not prepare the canary: {error}"))?;
+    fs::create_dir_all(&work)
+        .map_err(|error| unverified(format!("could not prepare the canary: {error}")))?;
     let outside = directory.join("outside.marker");
     let prompt = directory.join("prompt.md");
     let transcript = directory.join("transcript.jsonl");
     fs::write(&prompt, canary_prompt(&outside))
-        .map_err(|error| format!("could not prepare the canary: {error}"))?;
+        .map_err(|error| unverified(format!("could not prepare the canary: {error}")))?;
     let signals = SignalFlags::default();
     let mut bound = WallCap::start(
         CANARY_WALL_SECONDS,
@@ -179,16 +220,14 @@ fn check(
                 .unwrap_or_default()
         )),
     };
-    record(
+    checked.record(
         paths,
         clock,
-        run_id,
-        &version,
-        &profile_sha256,
+        if verdict.is_ok() { "pass" } else { "fail" },
         verdict.as_ref().err(),
         cost(&events),
     );
-    verdict?;
+    verdict.map_err(unverified)?;
     passes.schema_version = 1;
     passes.runners.insert(
         CLAUDE_RUNNER.to_owned(),
@@ -199,12 +238,71 @@ fn check(
             run_id: run_id.to_owned(),
         },
     );
-    write_private(&cache_path, &passes)
+    write_private(&cache_path, &passes).map_err(unverified)
+}
+
+/// Reach the canary's host without the sandbox, the way the canary's own
+/// `curl` would: the same binary, and this process's environment unchanged, so
+/// the operator's proxy variables apply exactly as they would to the canary.
+fn control_reaches_host() -> Result<(), String> {
+    let output = std::process::Command::new("curl")
+        .args(["-sS", "-m", "10", "-o", "/dev/null"])
+        .arg(format!("https://{CANARY_HOST}"))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|error| format!("could not run curl: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "curl exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+                .trim()
+                .chars()
+                .take(200)
+                .collect::<String>()
+        ))
+    }
+}
+
+/// The proxy variables that are set, with any `user:password@` removed.
+fn proxy_environment() -> Map<String, Value> {
+    PROXY_VARIABLES
+        .iter()
+        .filter_map(|variable| {
+            variable
+                .value()
+                .map(|value| (variable.name.to_owned(), json!(redact_userinfo(&value))))
+        })
+        .collect()
+}
+
+/// Remove the userinfo of every URL in `value` (a comma-separated list is
+/// handled item by item), so a proxy credential never reaches a record.
+pub(crate) fn redact_userinfo(value: &str) -> String {
+    value
+        .split(',')
+        .map(|item| {
+            let (scheme, rest) = item.split_once("://").unwrap_or(("", item));
+            let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+            let (authority, path) = rest.split_at(authority_end);
+            let host = authority
+                .rsplit_once('@')
+                .map_or(authority, |(_, host)| host);
+            if scheme.is_empty() {
+                format!("{host}{path}")
+            } else {
+                format!("{scheme}://{host}{path}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn canary_prompt(outside: &Path) -> String {
     format!(
-        "This is an automated sandbox check. Use the Bash tool to run exactly this one command, once, and then reply with the single word DONE. Do not run anything else.\n\n```\ntouch {INSIDE_MARKER}; touch '{}' 2>/dev/null; if curl -sS -m 5 -o /dev/null https://example.com 2>/dev/null || bash --noprofile -c 'exec 3<>/dev/tcp/example.com/443' 2>/dev/null; then echo {NETWORK_REACHED}; else echo {NETWORK_DENIED}; fi\n```\n",
+        "This is an automated sandbox check. Use the Bash tool to run exactly this one command, once, and then reply with the single word DONE. Do not run anything else.\n\n```\ntouch {INSIDE_MARKER}; touch '{}' 2>/dev/null; if curl -sS -m 5 -o /dev/null https://{CANARY_HOST} 2>/dev/null || bash --noprofile -c 'exec 3<>/dev/tcp/{CANARY_HOST}/443' 2>/dev/null; then echo {NETWORK_REACHED}; else echo {NETWORK_DENIED}; fi\n```\n",
         outside.display()
     )
 }
@@ -272,38 +370,45 @@ fn cost(transcript: &str) -> f64 {
         .sum()
 }
 
-fn record(
-    paths: &OstromPaths,
-    clock: &Clock,
-    run_id: &str,
-    version: &str,
-    profile_sha256: &str,
-    failure: Option<&String>,
-    cost_usd: f64,
-) {
-    let fact = Map::from_iter([
-        ("schema_version".to_owned(), json!(1)),
-        ("runner".to_owned(), json!(CLAUDE_RUNNER)),
-        ("run_id".to_owned(), json!(run_id)),
-        ("version".to_owned(), json!(version)),
-        ("profile_sha256".to_owned(), json!(profile_sha256)),
-        (
-            "outcome".to_owned(),
-            json!(if failure.is_none() { "pass" } else { "fail" }),
-        ),
-        ("failure".to_owned(), json!(failure)),
-        ("cost_usd".to_owned(), json!(cost_usd)),
-    ]);
-    if let Err(error) = append_trace(
-        &paths.trace_file(),
-        &TraceAppend {
-            ts: clock.timestamp(),
-            kind: "sandbox-checked".to_owned(),
-            fact,
-            narration: Map::new(),
-        },
+/// What one canary run is recorded under, in its `sandbox-checked` fact.
+struct Checked<'a> {
+    run_id: &'a str,
+    version: &'a str,
+    profile_sha256: &'a str,
+    proxy: Map<String, Value>,
+}
+
+impl Checked<'_> {
+    fn record(
+        &self,
+        paths: &OstromPaths,
+        clock: &Clock,
+        outcome: &str,
+        failure: Option<&String>,
+        cost_usd: f64,
     ) {
-        eprintln!("ostrom: could not record the sandbox canary: {error}");
+        let fact = Map::from_iter([
+            ("schema_version".to_owned(), json!(1)),
+            ("runner".to_owned(), json!(CLAUDE_RUNNER)),
+            ("run_id".to_owned(), json!(self.run_id)),
+            ("version".to_owned(), json!(self.version)),
+            ("profile_sha256".to_owned(), json!(self.profile_sha256)),
+            ("outcome".to_owned(), json!(outcome)),
+            ("failure".to_owned(), json!(failure)),
+            ("cost_usd".to_owned(), json!(cost_usd)),
+            ("proxy".to_owned(), Value::Object(self.proxy.clone())),
+        ]);
+        if let Err(error) = append_trace(
+            &paths.trace_file(),
+            &TraceAppend {
+                ts: clock.timestamp(),
+                kind: "sandbox-checked".to_owned(),
+                fact,
+                narration: Map::new(),
+            },
+        ) {
+            eprintln!("ostrom: could not record the sandbox canary: {error}");
+        }
     }
 }
 
@@ -319,7 +424,35 @@ fn write_private(path: &Path, passes: &CanaryPasses) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::judge;
+    use super::{judge, redact_userinfo};
+
+    #[test]
+    fn a_proxy_credential_never_survives_redaction() {
+        assert_eq!(
+            redact_userinfo("http://user:s3cret@proxy.invalid:3128"),
+            "http://proxy.invalid:3128"
+        );
+        assert_eq!(
+            redact_userinfo("socks5h://s3cret@proxy.invalid:1080/path?q=1"),
+            "socks5h://proxy.invalid:1080/path?q=1"
+        );
+        assert_eq!(
+            redact_userinfo("user:s3cret@proxy.invalid:3128"),
+            "proxy.invalid:3128"
+        );
+        assert_eq!(
+            redact_userinfo("http://proxy.invalid:3128"),
+            "http://proxy.invalid:3128"
+        );
+        assert_eq!(
+            redact_userinfo("localhost,.internal.invalid"),
+            "localhost,.internal.invalid"
+        );
+        assert_eq!(
+            redact_userinfo("http://a:p@b@proxy.invalid"),
+            "http://proxy.invalid"
+        );
+    }
 
     fn result(text: &str) -> String {
         format!(
