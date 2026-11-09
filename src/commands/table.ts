@@ -76,9 +76,5 @@ export function renderCommandTable(): string {
 }
 
 export function controlsLine(): string {
-  const names = COMMANDS.filter((definition) =>
-    definition.name === "pause" || definition.name === "resume" || definition.name === "stop",
-  ).map((definition) => definition.sayOrDo);
-  return `Controls: ${names.join(", ")}, or reply to redirect.`;
+  return "Controls: `@ostrom pause`, `@ostrom resume`, `@ostrom stop`, or reply to redirect.";
 }
-

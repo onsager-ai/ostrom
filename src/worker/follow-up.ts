@@ -57,7 +57,7 @@ export function routeFollowUps(store: Store, workers: Workers): RoutePass {
     const added = workers.deliver(
       assignmentId,
       `${trigger.id}:${assignmentId}`,
-      followUpMessage(ticketId, trigger, store.getThread(trigger.threadId), delivery.instruction),
+      followUpMessage(ticketId, trigger, store.getThread(trigger.threadId)),
       (turnId) => {
         store.recordDelivery(trigger.id, assignmentId, turnId);
         enqueueReceivedReaction(store, trigger);

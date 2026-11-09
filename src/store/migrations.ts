@@ -319,6 +319,11 @@ export const migrations: readonly string[] = [
   INSERT INTO ticket_v14 SELECT * FROM ticket;
   DROP TABLE ticket;
   ALTER TABLE ticket_v14 RENAME TO ticket;
+  CREATE TRIGGER ticket_needs_accept BEFORE INSERT ON ticket
+  WHEN (SELECT verdict FROM decision WHERE id = NEW.decision_id) IS NOT 'accept'
+  BEGIN
+    SELECT RAISE(ABORT, 'only an accept decision creates a ticket');
+  END;
   `,
 ];
 

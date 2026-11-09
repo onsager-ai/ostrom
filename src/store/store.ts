@@ -72,8 +72,6 @@ export interface PendingDelivery {
   trigger: Trigger;
   ticketId: number;
   assignmentId: number | null;
-  /** Plain text from a non-collaborator is information rather than an instruction. */
-  instruction: boolean;
 }
 
 export type CommandReceiptName = "redirect" | "pause" | "resume" | "stop" | "forbidden" | "close_issue" | "close_pull_request";
@@ -701,7 +699,6 @@ export class Store {
       trigger: toTrigger(row),
       ticketId: row["p_ticket_id"] as number,
       assignmentId: row["p_assignment_id"] as number | null,
-      instruction: true,
     }));
   }
 
