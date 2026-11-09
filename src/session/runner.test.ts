@@ -12,9 +12,11 @@ test("Claude resumes the same session with the explicit model", async () => {
     yield { type: "system", subtype: "init", session_id: "session", model: "haiku" } as SDKMessage;
     yield { type: "result", subtype: "success", session_id: "session", result: "ok", is_error: false, modelUsage: { haiku: {}, auxiliary: {} }, usage: { input_tokens: 4, cache_read_input_tokens: 3, cache_creation_input_tokens: 1, output_tokens: 2 } } as unknown as SDKMessage;
   };
-  const session = claudeRunner({}, run).start({ cwd: "/tmp", model: "haiku" });
+  const ids: string[] = [];
+  const session = claudeRunner({}, run).start({ cwd: "/tmp", model: "haiku", onSessionId: (id) => ids.push(id) });
   assert.deepEqual(await session.send("hello"), { sessionId: "session", text: "ok", status: "completed", model: "haiku", modelUsage: { haiku: {}, auxiliary: {} }, usage: { inputTokens: 5, cachedInputTokens: 3, outputTokens: 2 } });
   await session.send("again");
+  assert.deepEqual(ids, ["session"]);
   assert.deepEqual(calls, [{ model: "haiku", permissionMode: "bypassPermissions", allowDangerouslySkipPermissions: true }, { model: "haiku", resume: "session", permissionMode: "bypassPermissions", allowDangerouslySkipPermissions: true }]);
 });
 
@@ -32,6 +34,17 @@ test("Codex returns an unverified model and forwards resume options", async () =
   assert.equal(result.model, null);
   assert.deepEqual(result.usage, { inputTokens: 1, cachedInputTokens: 3, outputTokens: 2 });
   assert.deepEqual(seen, { id: "id", options: { workingDirectory: "/tmp", model: "luna", sandboxMode: "workspace-write", networkAccessEnabled: true, approvalPolicy: "never" } });
+});
+
+test("Codex reports its session id before the turn completes", async () => {
+  const ids: string[] = [];
+  const thread = { runStreamed: async () => ({ events: (async function* (): AsyncGenerator<ThreadEvent> {
+    yield { type: "thread.started", thread_id: "native-id" };
+    assert.deepEqual(ids, ["native-id"]);
+    yield { type: "turn.completed", usage: { input_tokens: 0, cached_input_tokens: 0, cache_write_input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0 } };
+  })() }) };
+  const client = { startThread: () => thread } as unknown as Pick<Codex, "startThread" | "resumeThread">;
+  await codexRunner({}, client).start({ cwd: "/tmp", model: "luna", onSessionId: (id) => ids.push(id) }).send("hello");
 });
 
 test("Codex cancellation is reported rather than treated as success", async () => {
