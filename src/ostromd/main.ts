@@ -68,6 +68,11 @@ export interface MainDeps {
   addWorktree?: WorkersDeps["addWorktree"];
   /** The Workers a `run` shares across its ticks; one-shot commands make their own. */
   workers?: Workers;
+  /**
+   * The store those Workers use. A pass given Workers must use their store too: a turn's callbacks
+   * write to the store the pass handed them, after the pass itself has returned.
+   */
+  store?: Store;
 }
 
 function sleep(ms: number, stop: AbortSignal): Promise<void> {
@@ -113,7 +118,7 @@ async function tick(deps: MainDeps): Promise<number> {
   const failed: string[] = [];
   const owned = deps.workers === undefined ? openWorkers(deps) : undefined;
   if (owned !== undefined) logRecovery(owned.workers.recover(), deps);
-  const shared = { ...deps, workers: deps.workers ?? owned!.workers };
+  const shared = { ...deps, workers: deps.workers ?? owned!.workers, store: deps.store ?? owned!.store };
   try {
     for (const step of TICK) {
       const code = await main(["dev", step], shared);
@@ -151,7 +156,7 @@ async function run(intervalSeconds: number, deps: MainDeps): Promise<number> {
   try {
     await api.start();
     while (!deps.stop.aborted) {
-      code = await tick({ ...deps, workers: owned.workers });
+      code = await tick({ ...deps, workers: owned.workers, store: owned.store });
       if (deps.stop.aborted) break;
       await deps.sleep(intervalSeconds * 1000, deps.stop);
     }
@@ -242,7 +247,7 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
   let own: Workers | undefined;
   try {
     const config = loadConfig(deps.env);
-    store = Store.open(config.dbPath);
+    store = deps.store ?? Store.open(config.dbPath);
     const openStore = store;
     // A one-shot command's Workers live until its turns finish; a run's are shared across ticks.
     const workers = () => deps.workers ?? (own ??= makeWorkers(deps, openStore));
@@ -341,7 +346,7 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
     try {
       await own?.drain();
     } finally {
-      store?.close();
+      if (deps.store === undefined) store?.close();
     }
   }
 }
