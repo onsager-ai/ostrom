@@ -788,7 +788,11 @@ export class Store {
     const id = `card-thread-${threadId}`;
     const kind: OutboxKind = thread.statusCardCommentId === null ? "comment" : "edit";
     const target = thread.statusCardCommentId === null ? null : String(thread.statusCardCommentId);
-    const existing = this.#get("SELECT sent_at FROM outbox WHERE id = ?", id);
+    const existing = this.#get(
+      "SELECT id, sent_at FROM outbox WHERE id = ? OR (id LIKE ? AND sent_at IS NULL) ORDER BY id DESC LIMIT 1",
+      id,
+      `${id}-%`,
+    );
     if (existing === undefined) {
       this.#insertReply({ id, threadId, body, kind, ...(target === null ? {} : { target }) });
       return;
@@ -799,7 +803,7 @@ export class Store {
     }
     this.#run(
       "UPDATE outbox SET body = ?, kind = ?, target = ?, next_attempt_at = ?, last_error = NULL WHERE id = ?",
-      body, kind, target, this.#stamp(), id,
+      body, kind, target, this.#stamp(), existing["id"] as string,
     );
   }
 
