@@ -19,8 +19,8 @@ function budget(overrides: Partial<TicketBudget> = {}): TicketBudget {
 test("budget accounting includes every token category and recognizes warning and limit thresholds", () => {
   assert.equal(budgetUsage(budget(), "tokens", NOW), 80);
   assert.equal(budgetWarning(budget(), NOW), "time");
-  assert.equal(budgetReached(budget(), NOW), "escalations");
-  assert.equal(budgetReached(budget({ escalationLimit: 1 }), NOW), null);
+  assert.equal(budgetReached(budget(), NOW), null);
+  assert.equal(budgetReached(budget({ escalationLimit: 1, escalations: 1 }), NOW), "escalations");
   assert.equal(budgetWarning(budget({ timeMinutes: 120 }), NOW), "turns");
 });
 

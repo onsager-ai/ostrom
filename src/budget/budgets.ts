@@ -34,11 +34,11 @@ export function loadBudgetDefaults(env: Record<string, string | undefined>): Bud
 }
 
 export function budgetWarning(budget: TicketBudget, now: Date): BudgetLimit | null {
-  return BUDGET_LIMITS.find((limit) => budgetUsage(budget, limit, now) * 100 >= budgetLimit(budget, limit) * 80) ?? null;
+  return BUDGET_LIMITS.find((limit) => budgetLimit(budget, limit) > 0 && budgetUsage(budget, limit, now) * 100 >= budgetLimit(budget, limit) * 80) ?? null;
 }
 
 export function budgetReached(budget: TicketBudget, now: Date): BudgetLimit | null {
-  return BUDGET_LIMITS.find((limit) => budgetUsage(budget, limit, now) >= budgetLimit(budget, limit)) ?? null;
+  return BUDGET_LIMITS.find((limit) => budgetLimit(budget, limit) > 0 && budgetUsage(budget, limit, now) >= budgetLimit(budget, limit)) ?? null;
 }
 
 export function budgetUsage(budget: TicketBudget, limit: BudgetLimit, now: Date): number {
