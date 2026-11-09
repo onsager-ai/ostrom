@@ -9,6 +9,8 @@ export type ThreadKind = "issue" | "pull_request";
 export type Verdict = "accept" | "ignore" | "stop";
 export type TicketState = "open" | "ended";
 export type AssignmentState = "pending" | "running" | "ended";
+/** What the last observation of a running Worker's T3 thread found worth flagging. */
+export type AssignmentOutcome = "waiting" | "failed" | "cancelled";
 
 export interface Source {
   id: number;
@@ -61,6 +63,19 @@ export interface Assignment {
   createdAt: string;
   startedAt: string | null;
   endedAt: string | null;
+  /** Why the assignment ended; always set when it ended without starting. */
+  endReason: string | null;
+  outcome: AssignmentOutcome | null;
+  outcomeAt: string | null;
+}
+
+/** What a Worker brief is built from: the accepted thread, the decision, and its triggers. */
+export interface TicketContext {
+  ticket: Ticket;
+  thread: Thread;
+  source: Source;
+  reason: string;
+  triggerUrls: string[];
 }
 
 export interface NewReply {
@@ -238,6 +253,20 @@ export class Store {
     return toTicket(row);
   }
 
+  /** The ticket with the thread, decision reason and trigger URLs that opened it. */
+  ticketContext(ticketId: number): TicketContext {
+    const ticket = this.getTicket(ticketId);
+    const decision = this.#get("SELECT thread_id, reason FROM decision WHERE id = ?", ticket.decisionId)!;
+    const thread = this.getThread(decision["thread_id"] as number);
+    const source = toSource(this.#get("SELECT * FROM source WHERE id = ?", thread.sourceId)!);
+    const triggerUrls = this.#all(
+      `SELECT "trigger".url FROM decision_trigger JOIN "trigger" ON "trigger".id = decision_trigger.trigger_id
+       WHERE decision_trigger.decision_id = ? ORDER BY "trigger".occurred_at, "trigger".id`,
+      ticket.decisionId,
+    ).map((row) => row["url"] as string);
+    return { ticket, thread, source, reason: decision["reason"] as string, triggerUrls };
+  }
+
   endTicket(ticketId: number): void {
     const { changes } = this.#run(
       "UPDATE ticket SET state = 'ended', ended_at = ? WHERE id = ? AND state = 'open'",
@@ -295,6 +324,46 @@ export class Store {
       assignmentId,
     );
     if (Number(changes) !== 1) this.#illegalAssignment(assignmentId, "ended");
+  }
+
+  /** `pending → ended`: the Worker never started, for the reason given. */
+  abandonAssignment(assignmentId: number, reason: string): void {
+    if (reason === "") throw new Error("reason must not be empty");
+    const { changes } = this.#run(
+      "UPDATE assignment SET state = 'ended', ended_at = ?, end_reason = ? WHERE id = ? AND state = 'pending'",
+      this.#stamp(),
+      reason,
+      assignmentId,
+    );
+    if (Number(changes) !== 1) this.#illegalAssignment(assignmentId, "ended");
+  }
+
+  /** Every running assignment, oldest first. */
+  runningAssignments(): Assignment[] {
+    return this.#all("SELECT * FROM assignment WHERE state = 'running' ORDER BY id").map(toAssignment);
+  }
+
+  /**
+   * Records what the latest look at a running Worker's thread found, or null for nothing to
+   * flag. The timestamp moves only when the outcome changes, so it says since when it holds.
+   */
+  recordOutcome(assignmentId: number, outcome: AssignmentOutcome | null): void {
+    const { changes } = this.#run(
+      `UPDATE assignment
+       SET outcome_at = CASE WHEN outcome IS ? THEN outcome_at WHEN ? IS NULL THEN NULL ELSE ? END,
+           outcome = ?
+       WHERE id = ? AND state = 'running'`,
+      outcome,
+      outcome,
+      this.#stamp(),
+      outcome,
+      assignmentId,
+    );
+    if (Number(changes) !== 1) {
+      throw new IllegalTransition(
+        `assignment ${assignmentId} is ${this.getAssignment(assignmentId).state}; only a running one has an outcome`,
+      );
+    }
   }
 
   #illegalAssignment(assignmentId: number, to: AssignmentState): never {
@@ -452,6 +521,9 @@ function toAssignment(row: Row): Assignment {
     createdAt: row["created_at"] as string,
     startedAt: row["started_at"] as string | null,
     endedAt: row["ended_at"] as string | null,
+    endReason: row["end_reason"] as string | null,
+    outcome: row["outcome"] as AssignmentOutcome | null,
+    outcomeAt: row["outcome_at"] as string | null,
   };
 }
 

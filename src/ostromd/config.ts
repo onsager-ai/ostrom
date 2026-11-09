@@ -26,3 +26,32 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
   if (dbPath === "") throw new Error("OSTROM_DB must be the path to the store");
   return { repo, allowlist, dbPath };
 }
+
+// Worker dispatch reads four more, all required and with no defaults, so a Worker never runs
+// on a model nobody chose:
+//
+//   OSTROM_T3_PROJECT       T3 Code project id, or a path inside the project
+//   OSTROM_WORKER_BASE      branch each Worker's worktree starts from and its PR targets
+//   OSTROM_WORKER_PROVIDER  T3 provider instance id, e.g. claudeAgent
+//   OSTROM_WORKER_MODEL     model slug, e.g. claude-haiku-5-5
+
+export interface WorkerConfig {
+  project: string;
+  base: string;
+  provider: string;
+  model: string;
+}
+
+export function loadWorkerConfig(env: Record<string, string | undefined>): WorkerConfig {
+  const read = (name: string) => {
+    const value = env[name]?.trim() ?? "";
+    if (value === "") throw new Error(`${name} must be set to dispatch Workers`);
+    return value;
+  };
+  return {
+    project: read("OSTROM_T3_PROJECT"),
+    base: read("OSTROM_WORKER_BASE"),
+    provider: read("OSTROM_WORKER_PROVIDER"),
+    model: read("OSTROM_WORKER_MODEL"),
+  };
+}

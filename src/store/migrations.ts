@@ -107,6 +107,38 @@ export const migrations: readonly string[] = [
   ) STRICT;
   CREATE INDEX outbox_due ON outbox (next_attempt_at) WHERE sent_at IS NULL;
   `,
+
+  // 2: Worker dispatch. An assignment whose T3 start failed ends from pending with the reason,
+  // and a running assignment carries the last outcome observed on its T3 thread. SQLite cannot
+  // alter CHECK constraints, so the table is rebuilt; nothing references it.
+  `
+  CREATE TABLE assignment_v2 (
+    id           INTEGER PRIMARY KEY,
+    ticket_id    INTEGER NOT NULL REFERENCES ticket (id),
+    state        TEXT NOT NULL CHECK (state IN ('pending', 'running', 'ended')),
+    t3_thread_id TEXT UNIQUE,            -- the T3 Code Worker thread; set when it starts running
+    created_at   TEXT NOT NULL,
+    started_at   TEXT,
+    ended_at     TEXT,
+    end_reason   TEXT CHECK (end_reason <> ''),
+    outcome      TEXT CHECK (outcome IN ('waiting', 'failed', 'cancelled')),
+    outcome_at   TEXT,
+    CHECK ((t3_thread_id IS NULL) = (started_at IS NULL)),
+    CHECK (state <> 'pending' OR t3_thread_id IS NULL),
+    CHECK (state <> 'running' OR t3_thread_id IS NOT NULL),
+    CHECK ((state = 'ended') = (ended_at IS NOT NULL)),
+    -- An assignment that never started ends only with a reason.
+    CHECK (state <> 'ended' OR t3_thread_id IS NOT NULL OR end_reason IS NOT NULL),
+    CHECK (state = 'ended' OR end_reason IS NULL),
+    CHECK ((outcome IS NULL) = (outcome_at IS NULL)),
+    CHECK (outcome IS NULL OR t3_thread_id IS NOT NULL)
+  ) STRICT;
+  INSERT INTO assignment_v2 (id, ticket_id, state, t3_thread_id, created_at, started_at, ended_at)
+    SELECT id, ticket_id, state, t3_thread_id, created_at, started_at, ended_at FROM assignment;
+  DROP TABLE assignment;
+  ALTER TABLE assignment_v2 RENAME TO assignment;
+  CREATE INDEX assignment_by_ticket ON assignment (ticket_id);
+  `,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */

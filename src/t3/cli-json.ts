@@ -21,6 +21,10 @@ export type T3ThreadStatus = (typeof T3_THREAD_STATUSES)[number];
 const PULL_REQUEST_STATES = ["open", "closed", "merged"] as const;
 export type T3PullRequestState = (typeof PULL_REQUEST_STATES)[number];
 
+export const T3_PULL_REQUEST_SOURCES = ["manual", "created", "agent", "stack", "stack-dismissed"] as const;
+/** How the PR came to be on the thread; `stack-dismissed` is one the user hid from it. */
+export type T3PullRequestSource = (typeof T3_PULL_REQUEST_SOURCES)[number];
+
 const MESSAGE_ROLES = ["user", "assistant"] as const;
 export type T3MessageRole = (typeof MESSAGE_ROLES)[number];
 
@@ -35,6 +39,14 @@ export interface T3RunResult {
   readonly error: string | null;
 }
 
+/** `t3 thread start --json` without `--wait`: the thread was created and its first run queued. */
+export interface T3LaunchResult {
+  readonly threadId: string;
+  readonly projectId: string;
+  /** null when the thread was launched without a first message. */
+  readonly runId: string | null;
+}
+
 export interface T3LinkedPullRequest {
   readonly repository: string;
   readonly number: number;
@@ -46,6 +58,7 @@ export interface T3PullRequest {
   readonly repository: string;
   readonly number: number;
   readonly url: string;
+  readonly source: T3PullRequestSource;
   /** null until T3 has read the PR from its host. */
   readonly state: T3PullRequestState | null;
 }
@@ -81,6 +94,15 @@ export class T3OutputError extends Error {
 
 export function parseRunResult(stdout: string): T3RunResult {
   return readRunResult(parseJson(stdout), "$");
+}
+
+export function parseLaunchResult(stdout: string): T3LaunchResult {
+  const value = record(parseJson(stdout), "$");
+  return {
+    threadId: string(value["threadId"], "$.threadId"),
+    projectId: string(value["projectId"], "$.projectId"),
+    runId: nullable(string, value["runId"], "$.runId"),
+  };
 }
 
 export function parseThreadShow(stdout: string): T3ThreadShow {
@@ -145,6 +167,7 @@ function readPullRequest(input: unknown, path: string): T3PullRequest {
     repository: string(value["repository"], `${path}.repository`),
     number: count(value["number"], `${path}.number`),
     url: string(value["url"], `${path}.url`),
+    source: oneOf(T3_PULL_REQUEST_SOURCES, value["source"], `${path}.source`),
     state: nullable(
       (state, statePath) => oneOf(PULL_REQUEST_STATES, state, statePath),
       value["state"],

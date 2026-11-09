@@ -288,3 +288,118 @@ test("due replies come back oldest due first, up to the limit", () => {
   assert.deepEqual(store.dueReplies().map((r) => r.id), ["r2", "r1", "r3"]);
   assert.deepEqual(store.dueReplies(2).map((r) => r.id), ["r2", "r1"]);
 });
+
+test("an assignment whose Worker never started ends from pending with the reason", () => {
+  const { store, accept } = fixture();
+  const id = store.createAssignment(accept());
+  assert.throws(() => store.abandonAssignment(id, ""), /must not be empty/);
+  store.abandonAssignment(id, "t3 thread start exited 1: no such project");
+  const ended = store.getAssignment(id);
+  assert.equal(ended.state, "ended");
+  assert.equal(ended.t3ThreadId, null);
+  assert.equal(ended.endReason, "t3 thread start exited 1: no such project");
+  assert.equal(ended.endedAt, "2026-11-09T12:00:00.000Z");
+  assert.throws(() => store.abandonAssignment(id, "again"), /ended → ended is not allowed/);
+  assert.throws(() => store.startAssignment(id, "t3-late"), /ended → running is not allowed/);
+
+  const running = store.createAssignment(accept());
+  store.startAssignment(running, "t3-thread-9");
+  assert.throws(() => store.abandonAssignment(running, "no"), /running → ended is not allowed/);
+});
+
+test("the schema refuses an unstarted assignment that ends without a reason", () => {
+  const db = new DatabaseSync(":memory:", { enableForeignKeyConstraints: true });
+  const store = new Store(db);
+  const source = store.ensureSource("github", "o/r");
+  const thread = store.ensureThread({ sourceId: source.id, kind: "issue", number: 1, url: "u" });
+  const trigger = store.insertTrigger({
+    sourceId: source.id, sourceEventId: "e", threadId: thread, kind: "issue_comment", actor: "a", url: "u",
+    occurredAt: new Date(),
+  }).id;
+  const ticketId = store.recordDecision({ threadId: thread, triggerIds: [trigger], verdict: "accept", reason: "r" })
+    .ticketId!;
+  const id = store.createAssignment(ticketId);
+  assert.throws(
+    () => db.prepare("UPDATE assignment SET state = 'ended', ended_at = 'x' WHERE id = ?").run(id),
+    /CHECK constraint failed/,
+  );
+});
+
+test("a running assignment records its observed outcome, timed from when it first held", () => {
+  const { store, accept, advance } = fixture();
+  const id = store.createAssignment(accept());
+  assert.throws(() => store.recordOutcome(id, "waiting"), /pending; only a running one has an outcome/);
+  store.startAssignment(id, "t3-thread-1");
+  assert.deepEqual(store.runningAssignments().map((a) => a.id), [id]);
+
+  store.recordOutcome(id, "waiting");
+  assert.equal(store.getAssignment(id).outcomeAt, "2026-11-09T12:00:00.000Z");
+  advance(60_000);
+  store.recordOutcome(id, "waiting");
+  assert.equal(store.getAssignment(id).outcomeAt, "2026-11-09T12:00:00.000Z", "the same outcome keeps its time");
+  store.recordOutcome(id, "failed");
+  assert.deepEqual(
+    [store.getAssignment(id).outcome, store.getAssignment(id).outcomeAt],
+    ["failed", "2026-11-09T12:01:00.000Z"],
+  );
+  store.recordOutcome(id, null);
+  assert.deepEqual([store.getAssignment(id).outcome, store.getAssignment(id).outcomeAt], [null, null]);
+
+  store.endAssignment(id);
+  assert.deepEqual(store.runningAssignments(), []);
+  assert.throws(() => store.recordOutcome(id, "failed"), /ended; only a running one has an outcome/);
+});
+
+test("a ticket's context is its thread, the decision reason, and its triggers in order", () => {
+  const { store, source, issue, trigger } = fixture();
+  const first = trigger();
+  const second = trigger();
+  const { ticketId } = store.recordDecision({
+    threadId: issue,
+    triggerIds: [second, first],
+    verdict: "accept",
+    reason: "asks for a fix",
+  });
+  const context = store.ticketContext(ticketId!);
+  assert.equal(context.ticket.id, ticketId);
+  assert.deepEqual(context.thread, {
+    id: issue,
+    sourceId: source.id,
+    kind: "issue",
+    number: 7,
+    url: "https://github.com/onsager-ai/ostrom/issues/7",
+  });
+  assert.deepEqual(context.source, source);
+  assert.equal(context.reason, "asks for a fix");
+  assert.deepEqual(context.triggerUrls, [
+    "https://github.com/onsager-ai/ostrom/issues/7#issuecomment-1",
+    "https://github.com/onsager-ai/ostrom/issues/7#issuecomment-2",
+  ]);
+});
+
+test("migration 2 keeps the assignments a version 1 store already holds", () => {
+  const db = new DatabaseSync(":memory:", { enableForeignKeyConstraints: true });
+  db.exec(migrations[0]!);
+  db.exec(`
+    CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL) STRICT;
+    INSERT INTO schema_version VALUES (1, '2026-11-09T00:00:00.000Z');
+    INSERT INTO source (id, kind, name) VALUES (1, 'github', 'o/r');
+    INSERT INTO thread (id, source_id, kind, number, url) VALUES (1, 1, 'issue', 1, 'u');
+    INSERT INTO decision (id, thread_id, verdict, reason, decided_at) VALUES (1, 1, 'accept', 'r', 't');
+    INSERT INTO ticket (id, decision_id, state, opened_at) VALUES (1, 1, 'open', 't');
+    INSERT INTO assignment (id, ticket_id, state, created_at) VALUES (1, 1, 'pending', 't');
+    INSERT INTO assignment (id, ticket_id, state, t3_thread_id, created_at, started_at)
+      VALUES (2, 1, 'running', 'thr', 't', 't');
+  `);
+  const store = new Store(db);
+  assert.equal(store.getAssignment(1).state, "pending");
+  assert.deepEqual(
+    { ...store.getAssignment(2) },
+    {
+      id: 2, ticketId: 1, state: "running", t3ThreadId: "thr", createdAt: "t", startedAt: "t", endedAt: null,
+      endReason: null, outcome: null, outcomeAt: null,
+    },
+  );
+  store.abandonAssignment(1, "never started");
+  assert.equal(store.getAssignment(1).endReason, "never started");
+});
