@@ -43,11 +43,13 @@ export function routeFollowUps(store: Store, workers: Workers): RoutePass {
           store.recordReviewDelivery(review.map((item) => item.trigger.id), assignmentId, turnId);
           for (const item of review) enqueueReceivedReaction(store, item.trigger);
         },
-        (result) => store.enqueueReply({
-          id: `review-${assignmentId}-${trigger.reviewId}`,
-          threadId: trigger.threadId,
-          body: renderReviewReply(result.text),
-        }),
+        (result) => {
+          store.enqueueReply({
+            id: `review-${assignmentId}-${trigger.reviewId}`,
+            threadId: trigger.threadId,
+            body: renderReviewReply(result.text),
+          });
+        },
       );
       if (added) pass.queued.push({ triggerId: trigger.id, ticketId, assignmentId });
       continue;
