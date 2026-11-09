@@ -380,6 +380,35 @@ export const migrations: readonly string[] = [
   ALTER TABLE command_receipt_v20 RENAME TO command_receipt;
   CREATE INDEX command_receipt_by_ticket ON command_receipt (ticket_id, trigger_id);
   `,
+
+  // 21: A stall may come from Ostrom's own signals (a budget limit, the same turn error twice),
+  // with no Semon reason. Those rows carry a cause; the old check rejected them.
+  `
+  CREATE TABLE stall_v21 (
+    id                  INTEGER PRIMARY KEY,
+    assignment_id       INTEGER NOT NULL REFERENCES assignment (id),
+    semon_reason        TEXT CHECK (semon_reason <> ''),
+    t3_reason           TEXT CHECK (t3_reason <> ''),
+    detail              TEXT,
+    detected_at         TEXT NOT NULL,
+    cleared_at          TEXT,
+    action              TEXT CHECK (action IN ('wait', 'stop')),
+    answered_at         TEXT,
+    cause               TEXT,
+    recovery_attempts   INTEGER NOT NULL DEFAULT 0 CHECK (recovery_attempts >= 0 AND recovery_attempts <= 2),
+    public_at           TEXT,
+    cleared_by_human_at TEXT,
+    CHECK (semon_reason IS NOT NULL OR t3_reason IS NOT NULL OR cause IS NOT NULL),
+    CHECK ((action IS NULL) = (answered_at IS NULL))
+  ) STRICT;
+  INSERT INTO stall_v21 (id, assignment_id, semon_reason, t3_reason, detail, detected_at, cleared_at, action,
+    answered_at, cause, recovery_attempts, public_at, cleared_by_human_at)
+  SELECT id, assignment_id, semon_reason, t3_reason, detail, detected_at, cleared_at, action,
+    answered_at, cause, recovery_attempts, public_at, cleared_by_human_at FROM stall;
+  DROP TABLE stall;
+  ALTER TABLE stall_v21 RENAME TO stall;
+  CREATE UNIQUE INDEX stall_open_episode ON stall (assignment_id) WHERE cleared_at IS NULL;
+  `,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */
