@@ -122,6 +122,8 @@ Each was fixed in its own PR, merged on green CI, and the daemon restarted onto 
 
 Recorded for later, not needed for the pass criterion:
 
+- A restart by graceful stop (SIGTERM) mid-turn was not repeated after #682; only the SIGKILL
+  restart above is verified on the sandbox.
 - #675: a review turn interrupted by a restart loses its reply.
 - #677: a newly opened issue that asks for Ostrom is not a trigger; only comments are.
 - #678 (fixed in #680): any update to an open issue with an ended ticket, including Ostrom's own card
