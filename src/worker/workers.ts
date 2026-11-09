@@ -34,6 +34,9 @@ export function gitDir(repo: string): string {
   return join(repo, ".git");
 }
 
+/** Turns that run even on a paused ticket: those that pause it, and those that stop it. */
+const RUNS_WHILE_PAUSED = ["budget-pause-", "stuck-", "operator-stop-", "stop-", "close-issue-"];
+
 export const INTERRUPTED_PROMPT =
   "You were interrupted while working on this ticket. Check your state (git status, your branch and " +
   "pull request) and continue where you stopped.";
@@ -216,7 +219,7 @@ export class Workers {
     const assignment = store.getAssignment(id);
     if (this.#stopping || assignment.state !== "running") return;
     const ticket = store.getTicket(assignment.ticketId);
-    if (ticket.state === "paused" && !key.startsWith("budget-pause-") && !key.startsWith("stuck-")) return;
+    if (ticket.state === "paused" && !RUNS_WHILE_PAUSED.some((prefix) => key.startsWith(prefix))) return;
     const session = this.#session(assignment);
     const turn = store.beginTurn(id);
     onStart?.(`${assignment.sessionId}:${turn}`);
