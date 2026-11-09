@@ -93,7 +93,6 @@ test("a review with three inline comments gets one Worker turn, one reply, and r
   const pass = routeFollowUps(store, workers);
   assert.deepEqual(pass, { queued: [{ triggerId: review, ticketId, assignmentId }], failed: [] });
   await tick();
-  runner.sessions[0]!.reply = () => "Thanks — I made the requested changes.";
   runner.sessions[0]!.release();
   await workers.drain();
 
@@ -106,7 +105,7 @@ test("a review with three inline comments gets one Worker turn, one reply, and r
   assert.deepEqual(store.pendingDeliveries(), []);
   assert.deepEqual(
     store.dueReplies().filter((reply) => reply.kind === "comment").map((reply) => [reply.id, reply.body]),
-    [["review-1-44", "Thanks — I made the requested changes."]],
+    [["review-1-44", "ok"]],
   );
   assert.deepEqual(
     store.dueReplies().filter((reply) => reply.kind === "reaction").map((reply) => reply.id).sort(),
