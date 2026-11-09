@@ -157,7 +157,7 @@ test("undecided triggers: no decision, no delivery, and no open ticket subscribe
 
   // While a send to the Worker keeps failing, the trigger still belongs to the Worker, not the Router.
   t3.threads.clear();
-  assert.equal((await routeFollowUps(store, t3.cli)).failed.length, 1);
+  assert.equal((await routeFollowUps(store, t3.cli)).failed.length, 2, "the issue's and the PR's follow-ups");
   assert.ok(!store.undecidedTriggers().some((t) => t.id === onPr));
   assert.equal(store.getTicket(ticketId).state, "open");
 });

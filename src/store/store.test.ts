@@ -427,7 +427,7 @@ test("a delivery is recorded once, and only for a ticket subscribed to the trigg
 });
 
 test("a decision's reply is queued with it, under an id derived from the decision", () => {
-  const { store, issue, trigger } = fixture();
+  const { store, source, issue, trigger } = fixture();
   const { decisionId, replyId } = store.recordDecision({
     threadId: issue,
     triggerIds: [trigger()],
@@ -439,10 +439,11 @@ test("a decision's reply is queued with it, under an id derived from the decisio
   assert.equal(store.hasReply(replyId!), true);
   assert.deepEqual(store.dueReplies().map((r) => [r.id, r.threadId, r.body]), [[replyId, issue, "On it."]]);
   assert.equal(store.recordDecision({ threadId: issue, triggerIds: [trigger()], verdict: "ignore", reason: "no" }).replyId, null);
-  // An empty reply fails the whole decision: no decision row, no trigger link.
-  const left = trigger();
+  // An empty reply fails the whole decision: no decision row, no trigger link, no ticket.
+  const fresh = store.ensureThread({ sourceId: source.id, kind: "issue", number: 20, url: "u20" });
+  const left = trigger(fresh);
   assert.throws(
-    () => store.recordDecision({ threadId: issue, triggerIds: [left], verdict: "accept", reason: "r", reply: " " }),
+    () => store.recordDecision({ threadId: fresh, triggerIds: [left], verdict: "accept", reason: "r", reply: " " }),
     /must not be empty/,
   );
   assert.deepEqual(store.undecidedTriggers().map((t) => t.id), [left]);
