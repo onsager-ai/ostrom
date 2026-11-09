@@ -22,10 +22,14 @@ for (const state of ["working", "recovering", "paused", "stuck", "done", "stoppe
 test("status card snapshot: budget warning and budget pause", async () => {
   assert.equal(
     renderStatusCard({ ...base, state: "paused", budgetWarning: "tokens", pauseCause: "budget reached: tokens" }),
-    await snapshot("budget-paused"),
+    await budgetSnapshot(),
   );
 });
 
 async function snapshot(state: StatusCardState): Promise<string> {
   return readFile(new URL(`./__snapshots__/status-card-${state}.md`, import.meta.url), "utf8");
+}
+
+async function budgetSnapshot(): Promise<string> {
+  return readFile(new URL("./__snapshots__/status-card-budget-paused.md", import.meta.url), "utf8");
 }
