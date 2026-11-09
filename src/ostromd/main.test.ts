@@ -361,6 +361,22 @@ test(
   }),
 );
 
+test(
+  "a pass given the run's store leaves it open for Worker turns that finish later",
+  withDb(async (dbPath) => {
+    const github = new FakeGitHub(() => new Date());
+    const store = Store.open(dbPath);
+    try {
+      const pass = deps(tickEnv(dbPath), github.gh, semonAnswer(20, []));
+      pass.deps.store = store;
+      for (const step of TICK) await main(["dev", step], pass.deps);
+      assert.deepEqual(store.pendingDeliveries(), []);
+    } finally {
+      store.close();
+    }
+  }),
+);
+
 test("tick and run check every variable before any pass", async () => {
   for (const argv of [["dev", "tick"], ["run", "--interval", "60"]]) {
     const run = deps({ ...tickEnv("/nonexistent/ostrom.sqlite"), OSTROM_ROUTER_HARNESS: "t3" }, async () => "[]");
