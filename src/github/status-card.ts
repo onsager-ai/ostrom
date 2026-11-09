@@ -1,6 +1,7 @@
 // The one quiet, editable status comment per thread. GitHub does not notify people about edits,
 // so this carries routine progress while normal outbox comments remain for moments needing action.
 
+import { controlsLine } from "../commands/table.ts";
 import { replyMarker } from "./marker.ts";
 
 export type StatusCardState = "working" | "paused" | "stuck" | "done" | "stopped";
@@ -37,7 +38,7 @@ export function renderStatusCard(card: StatusCard): string {
     "",
     `Harness: \`${card.harness}\` · Model: \`${card.model}\``,
     `Last activity: ${utcMinute(card.lastActivityAt)}`,
-    "Controls: `@ostrom pause`, `@ostrom stop`, or reply to redirect.",
+    controlsLine(),
     "",
     replyMarker(card.markerId),
   );
