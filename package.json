@@ -1,7 +1,7 @@
 {
   "name": "ostrom",
   "private": true,
-  "description": "A super agent: GitHub events in, a Router that dispatches, isolated Workers on T3 Code.",
+  "description": "A super agent: GitHub events in, a Router that dispatches, isolated background Workers as native Claude and Codex sessions.",
   "license": "MIT",
   "type": "module",
   "engines": {

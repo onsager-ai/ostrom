@@ -56,7 +56,7 @@ test("read-only Router sessions deny Claude edits and use Codex read-only sandbo
   })() }) };
   const client = { startThread: (options: unknown) => { codexOptions = options; return thread; } } as unknown as Pick<Codex, "startThread" | "resumeThread">;
   await codexRunner({}, client).start({ cwd: "/scratch", model: "luna", sandbox: "read-only" }).send("route");
-  assert.deepEqual(codexOptions, { workingDirectory: "/scratch", model: "luna", sandboxMode: "read-only", networkAccessEnabled: true, approvalPolicy: "never" });
+  assert.deepEqual(codexOptions, { workingDirectory: "/scratch", model: "luna", sandboxMode: "read-only", networkAccessEnabled: false, approvalPolicy: "never" });
 });
 
 test("Codex reports its session id before the turn completes", async () => {

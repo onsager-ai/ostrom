@@ -95,7 +95,7 @@ export function codexRunner(config: CodexOptions, client: CodexClient = new Code
       workingDirectory: options.cwd,
       model: options.model,
       sandboxMode: options.sandbox ?? "workspace-write",
-      networkAccessEnabled: true,
+      networkAccessEnabled: options.sandbox !== "read-only",
       approvalPolicy: "never" as const,
       ...(options.writableDirs?.length ? { additionalDirectories: options.writableDirs } : {}),
     };
