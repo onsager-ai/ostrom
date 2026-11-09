@@ -92,8 +92,8 @@ export interface MainDeps {
 
 function sleep(ms: number, stop: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
+    // Not unref'd: this timer is what keeps an idle `ostromd run` alive between ticks.
     const timer = setTimeout(done, ms);
-    timer.unref();
     stop.addEventListener("abort", done, { once: true });
     function done() {
       clearTimeout(timer);
