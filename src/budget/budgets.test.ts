@@ -19,7 +19,7 @@ function budget(overrides: Partial<TicketBudget> = {}): TicketBudget {
 test("budget accounting excludes cached input from token limits but keeps it in stored usage", () => {
   assert.equal(budgetUsage(budget(), "tokens", NOW), 50);
   assert.equal(budgetWarning(budget(), NOW), "time");
-  assert.equal(budgetReached(budget(), NOW), null);
+  assert.equal(budgetReached(budget(), NOW), "idle");
   assert.equal(budgetReached(budget({ escalationLimit: 1, escalations: 1 }), NOW), "escalations");
   assert.equal(budgetWarning(budget({ timeMinutes: 120 }), NOW), "turns");
 });

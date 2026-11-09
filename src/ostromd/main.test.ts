@@ -290,7 +290,7 @@ test(
     }).id;
     const { ticketId } = store.recordDecision({ threadId: issue, triggerIds: [trigger], verdict: "accept", reason: "fix it" });
     const assignmentId = store.createAssignment(ticketId!);
-    store.configureNativeAssignment(assignmentId, { harness: "codex", model: "m", worktree: "/w", branch: "ostrom/ticket-1-1", machine: "host" });
+    store.configureNativeAssignment(assignmentId, { harness: "claude", model: "claude-haiku-5-5", worktree: "/w", branch: "ostrom/ticket-1-1", machine: "host" });
     store.startNativeAssignment(assignmentId, "session-1");
     store.close();
     const stalled = semonAnswer(20, [{ id: "s", branch: "ostrom/ticket-1-1", stall_reason: "waiting-question", open_question: { text: "Which?" } }]);
