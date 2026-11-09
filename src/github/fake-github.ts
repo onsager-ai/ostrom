@@ -56,13 +56,16 @@ export class FakeGitHub {
     return item;
   }
 
-  reviewComment(pr: number, input: CommentInput): Item {
+  reviewComment(pr: number, input: CommentInput & { reviewId?: number; path?: string; line?: number }): Item {
     const id = ++this.#ids;
     const item: Item = {
       id,
       node_id: `PRRC_${id}`,
       html_url: `${this.#threadUrl(pr, true)}#discussion_r${id}`,
       pull_request_url: `https://api.github.com/repos/${this.repo}/pulls/${pr}`,
+      pull_request_review_id: input.reviewId ?? id,
+      ...(input.path === undefined ? {} : { path: input.path }),
+      ...(input.line === undefined ? {} : { line: input.line }),
       ...this.#common(input),
     };
     this.reviewComments.push(item);
@@ -103,6 +106,7 @@ export class FakeGitHub {
     const [api, flag, method, path, ...rest] = args;
     if (api !== "api" || flag !== "--method" || path === undefined) throw new Error(`fake gh: ${args.join(" ")}`);
     if (method === "POST") return JSON.stringify(this.#post(path, rest));
+    if (method === "PATCH") return JSON.stringify(this.#patch(path, rest));
     if (method !== "GET") throw new Error(`fake gh: method ${method}`);
     const body = JSON.stringify(this.#getOne(path) ?? this.#get(path));
     this.afterGet?.(path);
@@ -167,12 +171,24 @@ export class FakeGitHub {
   }
 
   #post(path: string, rest: string[]): Item {
-    const match = path.match(new RegExp(`^repos/${this.repo}/issues/(\\d+)/comments$`));
+    const issue = path.match(new RegExp(`^repos/${this.repo}/issues/(\\d+)/comments$`));
+    const reaction = path.match(new RegExp(`^repos/${this.repo}/(issues/comments|pulls/comments)/(\\d+)/reactions$`));
     const [flag, field] = rest;
-    if (!match || flag !== "-f" || field === undefined || !field.startsWith("body=")) {
-      throw new Error(`fake gh: POST ${path}`);
+    if (issue && flag === "-f" && field?.startsWith("body=")) {
+      return this.comment(Number(issue[1]), { login: "operator", body: field.slice("body=".length), at: this.#now() });
     }
-    return this.comment(Number(match[1]), { login: "operator", body: field.slice("body=".length), at: this.#now() });
+    if (reaction && flag === "-f" && field?.startsWith("content=")) return { id: ++this.#ids, content: field.slice("content=".length) };
+    throw new Error(`fake gh: POST ${path}`);
+  }
+
+  #patch(path: string, rest: string[]): Item {
+    const match = path.match(new RegExp(`^repos/${this.repo}/issues/comments/(\\d+)$`));
+    const [flag, field] = rest;
+    if (!match || flag !== "-f" || !field?.startsWith("body=")) throw new Error(`fake gh: PATCH ${path}`);
+    const comment = this.issueComments.find((item) => item["id"] === Number(match[1]));
+    if (comment === undefined) throw new Error("gh api failed: gh: Not Found (HTTP 404)");
+    this.edit(comment, field.slice("body=".length), this.#now());
+    return comment;
   }
 
   #common(input: CommentInput): Item {

@@ -297,6 +297,7 @@ test("a ticket's context is its thread, the decision reason, and its triggers in
     kind: "issue",
     number: 7,
     url: "https://github.com/onsager-ai/ostrom/issues/7",
+    statusCardCommentId: null,
   });
   assert.deepEqual(context.source, source);
   assert.equal(context.reason, "asks for a fix");

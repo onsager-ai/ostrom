@@ -123,7 +123,7 @@ test("an accept records a ticket, dispatches a Worker and queues the Router's ac
   const workerSession = s.runner.sessions.find((candidate) => candidate.options.sandbox !== "read-only");
   assert.equal(s.store().runningAssignments()[0]?.sessionId, workerSession?.id);
   assert.deepEqual(
-    s.store().dueReplies().map((reply) => [reply.id, reply.body]),
+    s.store().dueReplies().map((reply) => [reply.id, reply.body]).filter(([id]) => id !== `card-thread-${decision.thread}`),
     [[decision.replyId, "On it: a Worker is starting."]],
   );
   assert.deepEqual(s.store().undecidedTriggers(), []);

@@ -264,6 +264,31 @@ export const migrations: readonly string[] = [
   DROP TABLE router_thread;
   ALTER TABLE delivery RENAME COLUMN t3_run_id TO turn_id;
   `,
+
+  // 10: Every GitHub thread has at most one editable status card. The comment id is recorded
+  // only after GitHub confirms the post, so a crash before that point is recovered by the marker.
+  `
+  ALTER TABLE thread ADD COLUMN status_card_comment_id INTEGER;
+  `,
+
+  // 11: The outbox sends comments, card edits and reactions. Existing reply rows become comments.
+  `
+  ALTER TABLE outbox ADD COLUMN kind TEXT NOT NULL DEFAULT 'comment'
+    CHECK (kind IN ('comment', 'edit', 'reaction', 'label'));
+  ALTER TABLE outbox ADD COLUMN target TEXT;
+  ALTER TABLE outbox ADD COLUMN reaction TEXT;
+  ALTER TABLE outbox ADD COLUMN blocking INTEGER NOT NULL DEFAULT 0 CHECK (blocking IN (0, 1));
+  `,
+
+  // 12: Submitted reviews are delivered as one Worker turn with their inline comments. Trigger
+  // bodies and locations are immutable source data for that turn, never a transcript copy.
+  `
+  ALTER TABLE "trigger" ADD COLUMN review_id TEXT;
+  ALTER TABLE "trigger" ADD COLUMN body TEXT;
+  ALTER TABLE "trigger" ADD COLUMN path TEXT;
+  ALTER TABLE "trigger" ADD COLUMN line INTEGER;
+  CREATE INDEX trigger_review ON "trigger" (thread_id, review_id) WHERE review_id IS NOT NULL;
+  `,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */

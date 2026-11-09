@@ -4,6 +4,7 @@
 
 import { join } from "node:path";
 
+import { queueStatusCard } from "../github/cards.ts";
 import type { WorkerConfig } from "../ostromd/config.ts";
 import { rolloutModel } from "../session/rollout.ts";
 import type { Runner, Session, TurnResult } from "../session/runner.ts";
@@ -68,6 +69,7 @@ export class Workers {
         onSessionId: (sessionId) => {
           store.startNativeAssignment(id, sessionId);
           store.beginTurn(id);
+          queueStatusCard(store, ticketId);
           this.#sessions.set(id, session);
           resolve(sessionId);
         },
@@ -90,13 +92,19 @@ export class Workers {
    * the turn's id; that is when the caller records delivery, so a message lost with the queue in a
    * crash is sent again. Returns false when the same key is already queued.
    */
-  deliver(assignmentId: number, key: string, prompt: string, onStart: (turnId: string) => void): boolean {
+  deliver(
+    assignmentId: number,
+    key: string,
+    prompt: string,
+    onStart: (turnId: string) => void,
+    onComplete?: (result: TurnResult) => void,
+  ): boolean {
     if (this.#queued.has(key)) return false;
     this.#queued.add(key);
     void this.#enqueue(assignmentId, () => this.#turn(assignmentId, prompt, (turnId) => {
       onStart(turnId);
       this.#queued.delete(key);
-    })).finally(() => this.#queued.delete(key));
+    }, onComplete)).finally(() => this.#queued.delete(key));
     return true;
   }
 
@@ -167,7 +175,12 @@ export class Workers {
     this.#finished(id, result);
   }
 
-  async #turn(id: number, prompt: string, onStart?: (turnId: string) => void): Promise<void> {
+  async #turn(
+    id: number,
+    prompt: string,
+    onStart?: (turnId: string) => void,
+    onComplete?: (result: TurnResult) => void,
+  ): Promise<void> {
     const { store } = this.#deps;
     const assignment = store.getAssignment(id);
     if (assignment.state !== "running") return;
@@ -182,6 +195,7 @@ export class Workers {
       return;
     }
     this.#finished(id, result);
+    if (result.status === "completed") onComplete?.(result);
   }
 
   #failed(id: number, error: unknown): void {
@@ -189,6 +203,7 @@ export class Workers {
     this.#deps.log?.(`assignment ${id}: turn failed: ${message}`);
     this.#deps.store.endTurn(id, null);
     this.#mark(id, "failed");
+    queueStatusCard(this.#deps.store, this.#deps.store.getAssignment(id).ticketId);
   }
 
   #finished(id: number, result: TurnResult): void {
@@ -205,6 +220,7 @@ export class Workers {
       }
     }
     this.#mark(id, result.status === "cancelled" ? "cancelled" : null);
+    queueStatusCard(store, assignment.ticketId);
   }
 
   /** Records an outcome unless the Router ended the assignment while the turn ran. */
