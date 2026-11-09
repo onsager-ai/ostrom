@@ -25,6 +25,7 @@ test("recorded Claude events retain the fields consumed by the runner", () => {
   assert.equal(typeof result.session_id, "string"); assert.equal(typeof result.result, "string");
   assert.equal(typeof result.is_error, "boolean");
   assert.equal(typeof result.usage.input_tokens, "number"); assert.equal(typeof result.usage.output_tokens, "number");
+  assert.equal(typeof result.usage.cache_read_input_tokens, "number"); assert.equal(typeof result.usage.cache_creation_input_tokens, "number");
   assert.ok(Object.keys(result.modelUsage).length > 0);
 });
 

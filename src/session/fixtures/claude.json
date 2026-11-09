@@ -13,7 +13,9 @@
     "is_error": false,
     "usage": {
       "input_tokens": 2,
-      "output_tokens": 4
+      "output_tokens": 4,
+      "cache_creation_input_tokens": 7,
+      "cache_read_input_tokens": 11
     },
     "modelUsage": {
       "claude-haiku-5-5": {}

@@ -72,8 +72,10 @@ export class FakeRunner implements Runner {
       return session;
     }
     const send = session.send.bind(session);
+    let announced = false;
     session.send = async (prompt) => {
-      options.onSessionId?.(session.id);
+      if (!announced) options.onSessionId?.(session.id);
+      announced = true;
       if (this.failAfterId !== undefined) throw this.failAfterId;
       return send(prompt);
     };
