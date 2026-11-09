@@ -7,13 +7,17 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { FakeGitHub } from "../github/fake-github.ts";
 import { Store } from "../store/store.ts";
-import { loadConfig } from "./config.ts";
+import { loadConfig, loadWorkerConfig } from "./config.ts";
 import { main, type MainDeps } from "./main.ts";
 
-function deps(env: Record<string, string>, gh: MainDeps["gh"]) {
+const noT3: MainDeps["t3"] = async () => {
+  throw new Error("this test does not run t3");
+};
+
+function deps(env: Record<string, string>, gh: MainDeps["gh"], t3: MainDeps["t3"] = noT3) {
   const out: string[] = [];
   const err: string[] = [];
-  return { out, err, deps: { env, gh, stdout: (l: string) => out.push(l), stderr: (l: string) => err.push(l) } };
+  return { out, err, deps: { env, gh, t3, stdout: (l: string) => out.push(l), stderr: (l: string) => err.push(l) } };
 }
 
 function withDb(body: (dbPath: string) => Promise<void>) {
@@ -87,5 +91,64 @@ test(
     const run = deps(env, github.gh);
     assert.equal(await main(["send"], run.deps), 1);
     assert.match(run.err.join("\n"), /ack-1 failed: HTTP 502/);
+  }),
+);
+
+const workerEnv = {
+  OSTROM_T3_PROJECT: "/work/ostrom",
+  OSTROM_WORKER_BASE: "main",
+  OSTROM_WORKER_PROVIDER: "claudeAgent",
+  OSTROM_WORKER_MODEL: "claude-haiku-5-5",
+};
+
+test("Worker config has four required variables and no default model", () => {
+  assert.deepEqual(loadWorkerConfig(workerEnv), {
+    project: "/work/ostrom",
+    base: "main",
+    provider: "claudeAgent",
+    model: "claude-haiku-5-5",
+  });
+  for (const name of Object.keys(workerEnv)) {
+    assert.throws(() => loadWorkerConfig({ ...workerEnv, [name]: " " }), new RegExp(name));
+  }
+});
+
+test("dispatch needs one ticket id", async () => {
+  for (const argv of [["dispatch"], ["dispatch", "x"], ["dispatch", "0"], ["dispatch", "1", "2"], ["observe", "1"]]) {
+    const run = deps({}, async () => "[]");
+    assert.equal(await main(argv, run.deps), 2, argv.join(" "));
+  }
+});
+
+test(
+  "dispatch and observe run through t3, and a t3 failure exits non-zero",
+  withDb(async (dbPath) => {
+    const env = { OSTROM_REPO: "o/r", OSTROM_ALLOWLIST: "alice", OSTROM_DB: dbPath };
+    const store = Store.open(dbPath);
+    const source = store.ensureSource("github", "o/r");
+    const issue = store.ensureThread({ sourceId: source.id, kind: "issue", number: 7, url: "https://github.com/o/r/issues/7" });
+    const trigger = store.insertTrigger({
+      sourceId: source.id, sourceEventId: "IC_1", threadId: issue, kind: "issue_comment", actor: "alice",
+      url: "https://github.com/o/r/issues/7#issuecomment-1", occurredAt: new Date(),
+    }).id;
+    store.recordDecision({ threadId: issue, triggerIds: [trigger], verdict: "accept", reason: "fix it" });
+    store.close();
+
+    const missing = deps(env, async () => "[]");
+    assert.equal(await main(["dispatch", "1"], missing.deps), 1);
+    assert.match(missing.err.join("\n"), /OSTROM_T3_PROJECT/);
+
+    const launched = { threadId: "mcp:w", projectId: "mcp:p", runId: "run:1" };
+    const started = deps({ ...env, ...workerEnv }, async () => "[]", async () => ({
+      code: 0, stdout: JSON.stringify(launched), stderr: "",
+    }));
+    assert.equal(await main(["dispatch", "1"], started.deps), 0);
+    assert.deepEqual(JSON.parse(started.out[0]!), {
+      ticketId: 1, assignmentId: 1, t3ThreadId: "mcp:w", branch: "ostrom/ticket-1-1",
+    });
+
+    const unreadable = deps(env, async () => "[]", async () => ({ code: 1, stdout: "", stderr: "server down" }));
+    assert.equal(await main(["observe"], unreadable.deps), 1);
+    assert.match(unreadable.err.join("\n"), /assignment 1 failed: t3 thread show exited 1: server down/);
   }),
 );

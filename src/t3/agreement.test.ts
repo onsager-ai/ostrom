@@ -11,7 +11,13 @@ import * as Arbitrary from "effect/Arbitrary";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
-import { parseRunResult, parseThreadShow, T3_THREAD_STATUSES } from "./cli-json.ts";
+import {
+  parseLaunchResult,
+  parseRunResult,
+  parseThreadShow,
+  T3_PULL_REQUEST_SOURCES,
+  T3_THREAD_STATUSES,
+} from "./cli-json.ts";
 import { T3_PIN } from "./pin.ts";
 
 const vendor = new URL("../../vendor/t3code/", import.meta.url);
@@ -28,8 +34,18 @@ const base = await import(baseSchemasPath);
 const ThreadDetail = contracts.OrchestratorMcpThreadDetail;
 const TimelineItem = contracts.OrchestratorMcpThreadTimelineItem;
 const ThreadStatus = contracts.OrchestratorMcpThreadStatus;
+const PullRequestSource = contracts.OrchestratorMcpThreadPullRequest.fields["source"];
 const ThreadId = base.ThreadId;
 const RunId = base.RunId;
+const ProjectId = base.ProjectId;
+
+// What `t3 thread start --json` prints without --wait: the CLI's own ThreadLaunchResult, decoded
+// from the t3_thread_launch reply and printed as is (apps/server/src/cli/thread.ts).
+const LaunchResult = Schema.Struct({
+  threadId: ThreadId,
+  projectId: ProjectId,
+  runId: Schema.NullOr(RunId),
+});
 
 // What `t3 thread start|send --wait --json` prints. Upstream has no named schema for it: the CLI
 // builds it inline in finishRun (apps/server/src/cli/thread.ts). The structure below is read from
@@ -92,6 +108,9 @@ test("the CLI still builds its --json output the way the schemas above assume", 
     `role: item.type === "user_message" ? "user" : "assistant",`,
     `runId: item.runId,`,
     `return yield* printJson({ thread, messages });`,
+    // start without --wait: the launch result, decoded with the CLI's own struct.
+    `const ThreadLaunchResult = Schema.Struct({\n  threadId: ThreadId,\n  projectId: ProjectId,\n  runId: Schema.NullOr(RunId),\n});`,
+    `yield* flags.json ? printJson(launched) : Console.log(launched.threadId);`,
   ];
   for (const anchor of anchors) {
     assert.ok(cli.includes(anchor), `upstream thread.ts changed; re-derive the shape around: ${anchor}`);
@@ -107,11 +126,32 @@ test("every thread status upstream can report is one the parser accepts", () => 
   }
 });
 
+const literalsOf = (schema: unknown): string[] =>
+  (schema as { members?: ReadonlyArray<unknown>; literal?: string; literals?: readonly string[] })
+    .members?.flatMap(literalsOf) ??
+  (schema as { literals?: readonly string[] }).literals?.slice() ??
+  ((schema as { literal?: string }).literal === undefined ? [] : [(schema as { literal: string }).literal]);
+
+test("every pull request source upstream can report is one the parser accepts", () => {
+  const upstream = literalsOf(PullRequestSource);
+  assert.ok(upstream.length > 0, "could not read the upstream pull request sources");
+  for (const source of upstream) {
+    assert.ok((T3_PULL_REQUEST_SOURCES as readonly string[]).includes(source), `unknown upstream source ${source}`);
+  }
+});
+
 test("the real captures are valid under the upstream schemas", () => {
   for (const name of ["start.json", "send.json"]) {
     decode(RunResult, JSON.parse(fixture(name)));
   }
   decode(ThreadShow, JSON.parse(fixture("show.json")));
+  decode(LaunchResult, JSON.parse(fixture("launch.json")));
+});
+
+test("the launch-result parser reads every value upstream can print", async () => {
+  for (const value of await printed(LaunchResult)) {
+    assert.deepEqual(parseLaunchResult(JSON.stringify(value)), value);
+  }
 });
 
 test("the run-result parser reads every value upstream can print", async () => {
@@ -151,6 +191,7 @@ test("the thread-show parser reads every value upstream can print", async () => 
           repository: pr.repository,
           number: pr.number,
           url: pr.url,
+          source: pr.source,
           state: pr.state,
         })),
       },
