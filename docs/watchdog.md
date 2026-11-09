@@ -43,5 +43,7 @@ node src/ostromd/main.ts run --interval 15
 OSTROM_BUDGET_IDLE_MIN=3 node src/watchdog/scripted-stall.ts <issue-number>
 ```
 
-The seeded Worker brief runs `sleep 3600`, then asks which colour to use, red or blue. Stop the
+The seeded Worker brief runs `sleep 3600` again after every interruption and never commits or opens a
+pull request, so the ladder's recovery prompts cannot end the stall; it then asks which colour to
+use, red or blue. Stop the
 daemon and remove its scratch worktree and branch after the exercise.
