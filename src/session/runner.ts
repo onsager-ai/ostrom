@@ -47,6 +47,7 @@ export function claudeRunner(env: Record<string, string | undefined>, run: Claud
       if (signal?.aborted) abort();
       let model: string | null = null;
       try {
+        if (signal?.aborted) return { sessionId: id, text: "", status: "cancelled", usage: null, model };
         for await (const message of run({ prompt, options: {
           cwd: options.cwd, model: options.model, env, abortController,
           ...(id === null ? {} : { resume: id }),
@@ -89,6 +90,7 @@ export function codexRunner(config: CodexOptions, client: CodexClient = new Code
       busy = true;
       let text = "";
       try {
+        if (signal?.aborted) return { sessionId: id, text, status: "cancelled", usage: null, model: null };
         const { events } = await thread.runStreamed(prompt, signal ? { signal } : {});
         for await (const event of events) {
           if (event.type === "thread.started") id = event.thread_id;

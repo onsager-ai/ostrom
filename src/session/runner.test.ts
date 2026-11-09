@@ -34,8 +34,7 @@ test("Codex returns an unverified model and forwards resume options", async () =
 
 test("Codex cancellation is reported rather than treated as success", async () => {
   const thread = { runStreamed: async (_prompt: string, options: { signal: AbortSignal }) => {
-    assert.equal(options.signal.aborted, true);
-    throw new Error("aborted");
+    assert.fail(`cancelled turn unexpectedly started: ${options.signal.aborted}`);
   } };
   const client = { startThread: () => thread } as unknown as Pick<Codex, "startThread" | "resumeThread">;
   const controller = new AbortController(); controller.abort();
