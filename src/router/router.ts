@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import { DEFAULT_BUDGET, type BudgetDefaults } from "../budget/budgets.ts";
 import { join } from "node:path";
 
+import { queueStatusCard } from "../github/cards.ts";
 import { ghGet, type GhRunner } from "../github/gh.ts";
 import type { RouterConfig } from "../ostromd/config.ts";
 import type { Runner } from "../session/runner.ts";
@@ -190,6 +191,8 @@ export async function routeCandidates(options: RouteOptions): Promise<RoutePassR
       { id: key, threadId: outcome.thread, body: reply },
       outcome.terminal ? { assignmentId: outcome.assignmentId } : undefined,
     );
+    // The card shows the ended state; otherwise it would keep its last live one.
+    if (ticketEnded) queueStatusCard(store, outcome.ticketId);
     result.outcomes.push({ key, event: outcome.event, ticketId: outcome.ticketId, ticketEnded });
   }
   await dispatchPending(options, result);
