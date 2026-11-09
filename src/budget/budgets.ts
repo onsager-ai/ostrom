@@ -41,6 +41,13 @@ export function budgetReached(budget: TicketBudget, now: Date): BudgetLimit | nu
   return BUDGET_LIMITS.find((limit) => budgetLimit(budget, limit) > 0 && budgetUsage(budget, limit, now) >= budgetLimit(budget, limit)) ?? null;
 }
 
+/** Limits that can change only when a Worker has completed a native turn. Time and idle are Watchdog signals. */
+export function turnBudgetReached(budget: TicketBudget, now: Date): BudgetLimit | null {
+  return (["turns", "tokens", "escalations"] as const).find(
+    (limit) => budgetLimit(budget, limit) > 0 && budgetUsage(budget, limit, now) >= budgetLimit(budget, limit),
+  ) ?? null;
+}
+
 export function budgetUsage(budget: TicketBudget, limit: BudgetLimit, now: Date): number {
   switch (limit) {
     case "time":

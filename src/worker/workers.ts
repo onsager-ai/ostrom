@@ -4,7 +4,7 @@
 
 import { join } from "node:path";
 
-import { budgetReached } from "../budget/budgets.ts";
+import { turnBudgetReached } from "../budget/budgets.ts";
 import { queueStatusCard } from "../github/cards.ts";
 import type { WorkerConfig } from "../ostromd/config.ts";
 import { rolloutModel } from "../session/rollout.ts";
@@ -218,7 +218,7 @@ export class Workers {
     store.clearTurnError(id);
     const assignment = store.getAssignment(id);
     if (assignment.state !== "running") return;
-    const reached = budgetReached(store.ticketBudget(assignment.ticketId), new Date());
+    const reached = turnBudgetReached(store.ticketBudget(assignment.ticketId), new Date());
     if (store.getTicket(assignment.ticketId).state === "open" && reached !== null && !this.#budgetPauses.has(id)) {
       this.#budgetPauses.add(id);
       store.pauseTicketForBudget(assignment.ticketId, reached);

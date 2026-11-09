@@ -280,7 +280,7 @@ const semonAnswer = (minutes: number, stalls: unknown[]) => async () => ({
 test(
   "watchdog prints each check, flags a stall once, and a failed Semon read exits non-zero",
   withDb(async (dbPath) => {
-    const env = { OSTROM_REPO: "o/r", OSTROM_ALLOWLIST: "alice", OSTROM_DB: dbPath, OSTROM_STALL_MINUTES: "20" };
+    const env = { OSTROM_REPO: "o/r", OSTROM_ALLOWLIST: "alice", OSTROM_DB: dbPath, OSTROM_STALL_MINUTES: "20", ...workerEnv };
     const store = Store.open(dbPath);
     const source = store.ensureSource("github", "o/r");
     const issue = store.ensureThread({ sourceId: source.id, kind: "issue", number: 7, url: "https://github.com/o/r/issues/7" });
