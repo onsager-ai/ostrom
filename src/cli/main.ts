@@ -85,7 +85,10 @@ async function api(command: Command, env: Record<string, string | undefined>): P
   if (command.name === "show") return call(socketPath, "GET", `/v1/tickets/${command.ticketId}`);
   if (command.name === "preview") return call(socketPath, "GET", "/v1/preview");
   if (command.name === "extend") return call(socketPath, "POST", `/v1/tickets/${command.ticketId}/extend`, command.increases);
-  return call(socketPath, "POST", `/v1/tickets/${command.ticketId}/${command.name}`);
+  if (command.name === "pause" || command.name === "resume" || command.name === "stop") {
+    return call(socketPath, "POST", `/v1/tickets/${command.ticketId}/${command.name}`);
+  }
+  throw new Error("unsupported command");
 }
 
 function call(socketPath: string, method: "GET" | "POST", path: string, body?: unknown): Promise<unknown> {
@@ -133,7 +136,10 @@ function direct(command: Command, path: string): unknown {
 }
 
 function output(command: Command, value: unknown): void {
-  if (command.json) return process.stdout.write(`${JSON.stringify(value)}\n`);
+  if (command.json) {
+    process.stdout.write(`${JSON.stringify(value)}\n`);
+    return;
+  }
   if (command.name === "status") return status(value as OperatorStatus);
   if (command.name === "tickets") return tickets(value as OperatorTicket[]);
   if (command.name === "show" || command.name === "pause" || command.name === "resume" || command.name === "stop" || command.name === "extend") return show(value as OperatorTicketDetail);
