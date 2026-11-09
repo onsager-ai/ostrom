@@ -12,6 +12,8 @@ semon query stalls --idle-minutes <OSTROM_STALL_MINUTES> --since 1d --json
 
 Semon reports native sessions waiting on a question, whose process has gone, or which produce no output. A Worker is matched by its worktree branch, `ostrom/ticket-<ticket>-<assignment>`. A failed Semon read makes the pass fail and does not clear an existing episode.
 
+Workers are driven turn by turn, so Semon's verdicts are read against the turn. Between turns no process runs and a Worker that waits for review produces no output, so only an unanswered question counts. During a turn, a verdict counts only once the turn itself has run for `OSTROM_STALL_MINUTES`, because Semon's idle clock starts at the session's last write, which may predate the turn.
+
 ## Episodes and the Router
 
 A stall opens one `stall` row and remains one episode until Semon no longer reports it. The Router sees each unanswered, uncleared episode once and answers `wait` or `stop`; a stop needs a reply and ends the assignment only after that Router answer.

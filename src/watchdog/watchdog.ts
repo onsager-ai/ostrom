@@ -114,7 +114,8 @@ export async function watchdog(options: WatchdogOptions): Promise<WatchdogPass> 
     pass.failed.push({ what: "semon stalls", error: message(error) });
   }
   for (const assignment of store.runningAssignments()) {
-    const matched = assignment.branch === null ? undefined : semon?.find((stall) => stall.branch === assignment.branch);
+    const found = assignment.branch === null ? undefined : semon?.find((stall) => stall.branch === assignment.branch);
+    const matched = found !== undefined && semonCounts(found, assignment.turnStartedAt, idleMinutes, now()) ? found : undefined;
     const semonReason = matched?.stallReason ?? null;
     const checked: Checked = {
       assignmentId: assignment.id,
@@ -139,6 +140,16 @@ export async function watchdog(options: WatchdogOptions): Promise<WatchdogPass> 
     pass.checked.push(checked);
   }
   return pass;
+}
+
+/**
+ * Whether Semon's stall applies to a Worker driven turn by turn. Between turns no process runs, so
+ * only an unanswered question counts; a Worker that finished and waits for review is not stalled.
+ * During a turn, Semon's idle clock may predate it, so the turn itself must have run that long.
+ */
+function semonCounts(stall: SemonStall, turnStartedAt: string | null, idleMinutes: number, now: Date): boolean {
+  if (turnStartedAt === null) return stall.stallReason === "waiting-question";
+  return now.getTime() - Date.parse(turnStartedAt) >= idleMinutes * 60_000;
 }
 
 function record(value: unknown, path: string): Record<string, unknown> {
