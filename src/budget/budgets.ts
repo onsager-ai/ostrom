@@ -50,7 +50,8 @@ export function budgetUsage(budget: TicketBudget, limit: BudgetLimit, now: Date)
       return Math.max(0, Math.floor((now.getTime() - Date.parse(activity)) / 60_000));
     }
     case "turns": return budget.turns;
-    case "tokens": return budget.inputTokens + budget.cachedInputTokens + budget.outputTokens;
+    // Cached input remains recorded for operators but does not consume the ticket token budget.
+    case "tokens": return budget.inputTokens + budget.outputTokens;
     case "escalations": return budget.escalations;
   }
 }

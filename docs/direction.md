@@ -143,8 +143,9 @@ Stack: TypeScript on Node, chosen by the user on 2026-11-09. No orchestration fr
 operator ruled on 2026-11-09 that Mastra is not needed, and ACP is deprioritised. CI runs the tests;
 nothing is built or tested locally on the operator's laptop. Milestone-1 budget defaults are
 `OSTROM_BUDGET_TIME_MIN=480` (8 wall-clock hours), `OSTROM_BUDGET_IDLE_MIN=30`,
-`OSTROM_BUDGET_TURNS=80`, `OSTROM_BUDGET_TOKENS=1000000`, and `OSTROM_BUDGET_ESCALATIONS=0`.
-A new ticket stores these values, so later environment changes do not alter existing work; `ostrom
+`OSTROM_BUDGET_TURNS=80`, `OSTROM_BUDGET_TOKENS=1000000` (fresh input plus output; cached input is
+recorded but not limited), and `OSTROM_BUDGET_ESCALATIONS=0`. A new ticket stores these values, so
+later environment changes do not alter existing work; `ostrom
 extend` raises an individual ticket's limits. Workers run on cheap tiers (gpt-6-luna, Haiku) unless
 a ticket's budget says otherwise.
 
