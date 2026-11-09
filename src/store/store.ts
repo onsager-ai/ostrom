@@ -541,7 +541,7 @@ export class Store {
               COALESCE(SUM(assignment.cached_input_tokens), 0) AS cached_input_tokens,
               COALESCE(SUM(assignment.output_tokens), 0) AS output_tokens,
               MAX(assignment.last_activity_at) AS last_activity_at
-         FROM ticket LEFT JOIN assignment ON assignment.ticket_id = ticket.id WHERE ticket.id = ? GROUP BY ticket.id`
+         FROM ticket LEFT JOIN assignment ON assignment.ticket_id = ticket.id WHERE ticket.id = ? GROUP BY ticket.id`,
       ticketId,
     );
     if (row === undefined) throw new Error(`no ticket ${ticketId}`);
