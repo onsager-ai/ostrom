@@ -97,3 +97,42 @@ test("the process runner uses no shell and feeds stdin", async () => {
   assert.deepEqual(failed, { code: 3, stdout: "", stderr: "boom" });
   await assert.rejects(processRunner("/nonexistent/t3")({ args: [] }), /ENOENT/);
 });
+
+test("a Router run starts in the project folder, waits, and keeps a failed run's thread id", async () => {
+  const { calls, cli } = recording({ code: 0, stdout: fixture("start.json"), stderr: "" });
+  const run = await cli.startRun({
+    project: "/work/ostrom",
+    title: "Ostrom Router",
+    message: "--judge-this",
+    provider: "claudeAgent",
+    model: "claude-haiku-5-5",
+  });
+  assert.equal(run.reply, "READY");
+  assert.deepEqual(calls, [
+    {
+      args: [
+        "thread", "start",
+        "--title", "Ostrom Router",
+        "--provider", "claudeAgent",
+        "--model", "claude-haiku-5-5",
+        "--wait", "--json",
+        "/work/ostrom",
+        "-",
+      ],
+      stdin: "--judge-this",
+    },
+  ]);
+  const failedRun = JSON.stringify({ threadId: "mcp:r", runId: "run:1", status: "failed", reply: null, error: "boom" });
+  const failed = recording({ code: 1, stdout: failedRun, stderr: "The run failed." });
+  assert.equal((await failed.cli.sendRun("mcp:r", "x")).status, "failed");
+  assert.deepEqual(failed.calls[0]?.args, ["thread", "send", "--wait", "--json", "mcp:r", "-"]);
+  const missing = recording({ code: 1, stdout: "", stderr: "Thread mcp:r was not found.\n" }).cli;
+  await assert.rejects(missing.sendRun("mcp:r", "x"), { name: "T3CommandError" });
+});
+
+test("show tells a thread T3 no longer has apart from any other failure", async () => {
+  const gone = recording({ code: 1, stdout: "", stderr: "Thread mcp:x is no longer available.\n" }).cli;
+  await assert.rejects(gone.showThread("mcp:x"), { name: "T3ThreadGone" });
+  const down = recording({ code: 1, stdout: "", stderr: "connect ECONNREFUSED" }).cli;
+  await assert.rejects(down.showThread("mcp:x"), { name: "T3CommandError" });
+});

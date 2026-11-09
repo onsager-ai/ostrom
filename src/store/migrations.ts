@@ -163,6 +163,17 @@ export const migrations: readonly string[] = [
     SELECT RAISE(ABORT, 'a delivery needs the assignment''s ticket subscribed to the trigger''s thread');
   END;
   `,
+
+  // 4: the Router. Each row is one T3 Code thread the Router ran in; the newest is the current
+  // one, and a row is added when the previous thread is gone. Every batch the Router judges is
+  // self-contained, so a new Router needs nothing from the old one's context.
+  `
+  CREATE TABLE router_thread (
+    id           INTEGER PRIMARY KEY,
+    t3_thread_id TEXT NOT NULL UNIQUE CHECK (t3_thread_id <> ''),
+    started_at   TEXT NOT NULL
+  ) STRICT;
+  `,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */

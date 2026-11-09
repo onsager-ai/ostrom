@@ -102,10 +102,28 @@ export class FakeGitHub {
     if (api !== "api" || flag !== "--method" || path === undefined) throw new Error(`fake gh: ${args.join(" ")}`);
     if (method === "POST") return JSON.stringify(this.#post(path, rest));
     if (method !== "GET") throw new Error(`fake gh: method ${method}`);
-    const body = JSON.stringify(this.#get(path));
+    const body = JSON.stringify(this.#getOne(path) ?? this.#get(path));
     this.afterGet?.(path);
     return body;
   };
+
+  /** One comment or review by id, as GitHub serves it; a missing one fails as `gh` does on a 404. */
+  #getOne(path: string): Item | undefined {
+    const route = path.slice(`repos/${this.repo}/`.length);
+    let match: RegExpMatchArray | null;
+    let found: Item | undefined;
+    if ((match = route.match(/^issues\/comments\/(\d+)$/))) {
+      found = this.issueComments.find((c) => c["id"] === Number(match![1]));
+    } else if ((match = route.match(/^pulls\/comments\/(\d+)$/))) {
+      found = this.reviewComments.find((c) => c["id"] === Number(match![1]));
+    } else if ((match = route.match(/^pulls\/(\d+)\/reviews\/(\d+)$/))) {
+      found = this.reviews.get(Number(match[1]))?.find((r) => r["id"] === Number(match![2]));
+    } else {
+      return undefined;
+    }
+    if (found === undefined) throw new Error(`gh api failed: gh: Not Found (HTTP 404)`);
+    return found;
+  }
 
   #get(path: string): Item[] {
     const url = new URL(`https://api.github.com/${path}`);

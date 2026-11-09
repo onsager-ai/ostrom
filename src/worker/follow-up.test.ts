@@ -129,33 +129,35 @@ test("a trigger on an unsubscribed thread is left for the Router", async () => {
 
 test("undecided triggers: no decision, no delivery, and no open ticket subscribed to the thread", async () => {
   const { store, t3, thread, issue, pr, trigger, ticketId } = fixture();
-  // The accept's own trigger on #7 has a decision; the ticket is not subscribed to #7.
+  // The accept subscribed the ticket to #7, so a later comment there is the Worker's.
   const onIssue = trigger(issue);
-  const onOther = trigger(thread("issue", 9));
+  const other = thread("issue", 9);
+  const onOther = trigger(other);
   const chatter = thread("issue", 10);
   store.recordDecision({ threadId: chatter, triggerIds: [trigger(chatter)], verdict: "ignore", reason: "chatter" });
   const onPr = trigger(pr);
 
   const undecided = store.undecidedTriggers();
-  assert.deepEqual(undecided.map((t) => t.id), [onIssue, onOther], "oldest first; the PR's trigger is the Worker's");
+  assert.deepEqual(undecided.map((t) => t.id), [onOther], "the issue's and the PR's triggers are the Worker's");
+  assert.deepEqual(store.pendingDeliveries().map((p) => p.trigger.id), [onIssue, onPr]);
   assert.deepEqual(
     { ...undecided[0] },
     {
-      id: onIssue,
+      id: onOther,
       sourceId: 1,
-      sourceEventId: `E_${onIssue}`,
-      threadId: issue,
+      sourceEventId: `E_${onOther}`,
+      threadId: other,
       kind: "issue_comment",
       actor: "alice",
-      url: `https://github.com/${REPO}/issues/7#event-${onIssue}`,
-      occurredAt: new Date(Date.UTC(2026, 10, 9, 11, onIssue)).toISOString(),
+      url: `https://github.com/${REPO}/issues/9#event-${onOther}`,
+      occurredAt: new Date(Date.UTC(2026, 10, 9, 11, onOther)).toISOString(),
       receivedAt: "2026-11-09T12:00:00.000Z",
     },
   );
 
   // While a send to the Worker keeps failing, the trigger still belongs to the Worker, not the Router.
   t3.threads.clear();
-  assert.equal((await routeFollowUps(store, t3.cli)).failed.length, 1);
+  assert.equal((await routeFollowUps(store, t3.cli)).failed.length, 2, "the issue's and the PR's follow-ups");
   assert.ok(!store.undecidedTriggers().some((t) => t.id === onPr));
   assert.equal(store.getTicket(ticketId).state, "open");
 });

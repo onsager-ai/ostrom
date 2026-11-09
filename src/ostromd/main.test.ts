@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { FakeGitHub } from "../github/fake-github.ts";
 import { Store } from "../store/store.ts";
-import { loadConfig, loadWorkerConfig } from "./config.ts";
+import { loadConfig, loadRouterConfig, loadWorkerConfig } from "./config.ts";
 import { main, type MainDeps } from "./main.ts";
 
 const noT3: MainDeps["t3"] = async () => {
@@ -114,7 +114,7 @@ test("Worker config has four required variables and no default model", () => {
 });
 
 test("dispatch needs one ticket id", async () => {
-  for (const argv of [["dispatch"], ["dispatch", "x"], ["dispatch", "0"], ["dispatch", "1", "2"], ["observe", "1"], ["route", "1"]]) {
+  for (const argv of [["dispatch"], ["dispatch", "x"], ["dispatch", "0"], ["dispatch", "1", "2"], ["observe", "1"], ["route", "1"], ["route-candidates", "1"]]) {
     const run = deps({}, async () => "[]");
     assert.equal(await main(argv, run.deps), 2, argv.join(" "));
   }
@@ -186,5 +186,55 @@ test(
     const replay = deps(env, async () => "[]");
     assert.equal(await main(["route"], replay.deps), 0);
     assert.deepEqual(replay.out, []);
+  }),
+);
+
+test("Router config needs a provider and model, with no default", () => {
+  const env = { OSTROM_T3_PROJECT: "/work/ostrom", OSTROM_ROUTER_PROVIDER: "claudeAgent", OSTROM_ROUTER_MODEL: "claude-haiku-5-5" };
+  assert.deepEqual(loadRouterConfig(env), { project: "/work/ostrom", provider: "claudeAgent", model: "claude-haiku-5-5" });
+  for (const name of Object.keys(env)) {
+    assert.throws(() => loadRouterConfig({ ...env, [name]: "" }), new RegExp(name));
+  }
+});
+
+test(
+  "route-candidates prints the pass as JSON lines, and invalid Router output exits non-zero",
+  withDb(async (dbPath) => {
+    const env = {
+      OSTROM_REPO: "o/r", OSTROM_ALLOWLIST: "alice", OSTROM_DB: dbPath, ...workerEnv,
+      OSTROM_ROUTER_PROVIDER: "claudeAgent", OSTROM_ROUTER_MODEL: "claude-haiku-5-5",
+    };
+    const store = Store.open(dbPath);
+    const source = store.ensureSource("github", "o/r");
+    const issue = store.ensureThread({ sourceId: source.id, kind: "issue", number: 7, url: "https://github.com/o/r/issues/7" });
+    const trigger = store.insertTrigger({
+      sourceId: source.id, sourceEventId: "IC_1", threadId: issue, kind: "issue_comment", actor: "alice",
+      url: "https://github.com/o/r/issues/7#issuecomment-1", occurredAt: new Date(),
+    }).id;
+    store.close();
+    const gh: MainDeps["gh"] = async () => JSON.stringify({ body: "please fix the typo" });
+
+    const missing = deps({ ...env, OSTROM_ROUTER_MODEL: "" }, gh);
+    assert.equal(await main(["route-candidates"], missing.deps), 1);
+    assert.match(missing.err.join("\n"), /OSTROM_ROUTER_MODEL/);
+
+    const run = (reply: string) => ({
+      code: 0, stdout: JSON.stringify({ threadId: "mcp:router", runId: "run:1", status: "completed", reply, error: null }), stderr: "",
+    });
+    const garbled = deps(env, gh, async () => run("I accept."));
+    assert.equal(await main(["route-candidates"], garbled.deps), 1);
+    assert.match(garbled.err.join("\n"), /Router reply is not JSON/);
+
+    const answer = {
+      decisions: [{ thread: issue, triggers: [trigger], verdict: "ignore", reason: "nothing asked", reply: null }],
+      outcomes: [],
+    };
+    const shown = JSON.parse(readFileSync(new URL("../t3/fixtures/show.json", import.meta.url), "utf8"));
+    const judged = deps(env, gh, async ({ args }) =>
+      args[1] === "show" ? { code: 0, stdout: JSON.stringify(shown), stderr: "" } : run(JSON.stringify(answer)),
+    );
+    assert.equal(await main(["route-candidates"], judged.deps), 0);
+    assert.deepEqual(judged.out.map((line) => JSON.parse(line).type), ["router", "decision"]);
+    assert.equal(JSON.parse(judged.out[1]!).verdict, "ignore");
   }),
 );

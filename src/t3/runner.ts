@@ -5,9 +5,11 @@
 import { spawn } from "node:child_process";
 import {
   parseLaunchResult,
+  parseRunResult,
   parseSendResult,
   parseThreadShow,
   type T3LaunchResult,
+  type T3RunResult,
   type T3SendResult,
   type T3ThreadShow,
 } from "./cli-json.ts";
@@ -27,7 +29,16 @@ export interface T3Exit {
 export type T3Runner = (invocation: T3Invocation) => Promise<T3Exit>;
 
 export class T3CommandError extends Error {
-  override readonly name = "T3CommandError";
+  override readonly name: string = "T3CommandError";
+}
+
+/**
+ * `t3 thread show` on a thread that does not exist or was deleted. At the pin the server answers
+ * `Thread <id> is no longer available.` (apps/server/src/mcp/OrchestratorMcpService.ts,
+ * `loadReadableThread`) and the CLI prints that message alone and exits 1.
+ */
+export class T3ThreadGone extends T3CommandError {
+  override readonly name = "T3ThreadGone";
 }
 
 /** The real runner: spawns `bin` (default `t3` on PATH) with no shell. */
@@ -55,6 +66,15 @@ export interface StartThread {
   /** The branch, tag or commit the new worktree starts from. */
   readonly worktreeBase: string;
   readonly branch: string;
+  readonly provider: string;
+  readonly model: string;
+}
+
+/** A thread with no worktree that runs in the project folder, such as the Router. */
+export interface StartRun {
+  readonly project: string;
+  readonly title: string;
+  readonly message: string;
   readonly provider: string;
   readonly model: string;
 }
@@ -109,17 +129,64 @@ export class T3Cli {
   }
 
   async showThread(threadId: string): Promise<T3ThreadShow> {
-    return parseThreadShow(
-      await this.#call({ args: ["thread", "show", "--messages", "0", "--json", threadId] }),
-    );
+    const exit = await this.#run({ args: ["thread", "show", "--messages", "0", "--json", threadId] });
+    if (exit.code === 1 && exit.stderr.trim() === `Thread ${threadId} is no longer available.`) {
+      throw new T3ThreadGone(`t3 thread ${threadId} is no longer available`);
+    }
+    return parseThreadShow(this.#stdout(["thread", "show"], exit));
+  }
+
+  /**
+   * `t3 thread start --wait --json`: creates the thread, waits for its first run to end and
+   * returns the run. A run that failed or waits for an answer is returned too, not thrown, so
+   * the caller keeps the new thread's id; it checks `status` itself.
+   */
+  async startRun(start: StartRun): Promise<T3RunResult> {
+    return this.#waited({
+      args: [
+        "thread",
+        "start",
+        "--title",
+        start.title,
+        "--provider",
+        start.provider,
+        "--model",
+        start.model,
+        "--wait",
+        "--json",
+        start.project,
+        "-",
+      ],
+      stdin: start.message,
+    });
+  }
+
+  /** `t3 thread send --wait --json`: queues the message as the next turn and waits for it to end. */
+  async sendRun(threadId: string, message: string): Promise<T3RunResult> {
+    return this.#waited({ args: ["thread", "send", "--wait", "--json", threadId, "-"], stdin: message });
+  }
+
+  /**
+   * With `--wait --json` the CLI prints the run result even when it exits 1 (the run failed) or
+   * 2 (it waits for an answer). Any other exit, or no result on stdout, is a command error.
+   */
+  async #waited(invocation: T3Invocation): Promise<T3RunResult> {
+    const exit = await this.#run(invocation);
+    if ((exit.code === 1 || exit.code === 2) && exit.stdout.trim() !== "") {
+      return parseRunResult(exit.stdout);
+    }
+    return parseRunResult(this.#stdout(invocation.args, exit));
   }
 
   async #call(invocation: T3Invocation): Promise<string> {
-    const exit = await this.#run(invocation);
+    return this.#stdout(invocation.args, await this.#run(invocation));
+  }
+
+  #stdout(args: readonly string[], exit: T3Exit): string {
     if (exit.code !== 0) {
       const detail = exit.stderr.trim() || exit.stdout.trim() || "no output";
       throw new T3CommandError(
-        `t3 ${invocation.args.slice(0, 2).join(" ")} exited ${exit.code ?? "by signal"}: ${detail}`,
+        `t3 ${args.slice(0, 2).join(" ")} exited ${exit.code ?? "by signal"}: ${detail}`,
       );
     }
     return exit.stdout;
