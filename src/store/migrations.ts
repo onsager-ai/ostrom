@@ -195,6 +195,20 @@ export const migrations: readonly string[] = [
   ) STRICT;
   CREATE UNIQUE INDEX stall_open_episode ON stall (assignment_id) WHERE cleared_at IS NULL;
   `,
+
+  // 6: Native Worker session metadata. Legacy T3 columns remain until the Router moves.
+  `
+  ALTER TABLE assignment ADD COLUMN harness TEXT CHECK (harness IN ('claude', 'codex'));
+  ALTER TABLE assignment ADD COLUMN model TEXT;
+  ALTER TABLE assignment ADD COLUMN session_id TEXT;
+  ALTER TABLE assignment ADD COLUMN worktree TEXT;
+  ALTER TABLE assignment ADD COLUMN branch TEXT;
+  ALTER TABLE assignment ADD COLUMN machine TEXT;
+  ALTER TABLE assignment ADD COLUMN turns INTEGER NOT NULL DEFAULT 0 CHECK (turns >= 0);
+  ALTER TABLE assignment ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0 CHECK (input_tokens >= 0);
+  ALTER TABLE assignment ADD COLUMN cached_input_tokens INTEGER NOT NULL DEFAULT 0 CHECK (cached_input_tokens >= 0);
+  ALTER TABLE assignment ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0 CHECK (output_tokens >= 0);
+  `,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */

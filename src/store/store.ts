@@ -92,6 +92,16 @@ export interface Assignment {
   ticketId: number;
   state: AssignmentState;
   t3ThreadId: string | null;
+  harness: "claude" | "codex" | null;
+  model: string | null;
+  sessionId: string | null;
+  worktree: string | null;
+  branch: string | null;
+  machine: string | null;
+  turns: number;
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
   createdAt: string;
   startedAt: string | null;
   endedAt: string | null;
@@ -826,6 +836,16 @@ function toAssignment(row: Row): Assignment {
     ticketId: row["ticket_id"] as number,
     state: row["state"] as AssignmentState,
     t3ThreadId: row["t3_thread_id"] as string | null,
+    harness: row["harness"] as Assignment["harness"],
+    model: row["model"] as string | null,
+    sessionId: row["session_id"] as string | null,
+    worktree: row["worktree"] as string | null,
+    branch: row["branch"] as string | null,
+    machine: row["machine"] as string | null,
+    turns: row["turns"] as number,
+    inputTokens: row["input_tokens"] as number,
+    cachedInputTokens: row["cached_input_tokens"] as number,
+    outputTokens: row["output_tokens"] as number,
     createdAt: row["created_at"] as string,
     startedAt: row["started_at"] as string | null,
     endedAt: row["ended_at"] as string | null,
