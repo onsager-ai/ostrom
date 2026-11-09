@@ -173,6 +173,26 @@ test("restart recovery resumes running sessions by id and sends the interrupted 
   assert.match(store.getAssignment(stuck).endReason!, /before the session started/);
 });
 
+test("a stop cuts off the running turn, starts no queued one, and leaves the turn for recovery", async () => {
+  const { store, runner, ticketId, workers, make } = fixture();
+  runner.hold = true;
+  await workers.dispatch(ticketId);
+  workers.deliver(1, "queued", "next", () => {});
+  workers.stop();
+  await workers.drain();
+  assert.deepEqual(runner.sessions[0]!.prompts.length, 1, "the queued turn never started");
+  const a = store.getAssignment(1);
+  assert.deepEqual([a.state, a.outcome, a.lastError], ["running", null, null]);
+  assert.notEqual(a.turnStartedAt, null, "the cut-off turn stays open");
+
+  runner.hold = false;
+  const restarted = make();
+  assert.deepEqual(restarted.recover().interrupted, [1]);
+  await restarted.drain();
+  assert.deepEqual(runner.sessions.at(-1)!.prompts, [INTERRUPTED_PROMPT]);
+  assert.equal(store.getAssignment(1).turnStartedAt, null);
+});
+
 function rollout(model: string | null, thread = "sess-1") {
   const dir = mkdtempSync(join(tmpdir(), "workers-"));
   if (model !== null) {
