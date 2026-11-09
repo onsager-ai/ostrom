@@ -89,9 +89,8 @@ test("a review with three inline comments gets one Worker turn, one reply, and r
     trigger(pr, "pull_request_review_comment", { reviewId: "44", body: "Handle null.", path: "src/b.ts", line: 31 }),
     trigger(pr, "pull_request_review_comment", { reviewId: "44", body: "Add coverage.", path: "src/c.ts", line: 8 }),
   ];
-  runner.sessions[0]!.reply = () => "Thanks — I made the requested changes.";
-
   const pass = routeFollowUps(store, workers);
+  runner.sessions[0]!.reply = () => "Thanks — I made the requested changes.";
   assert.deepEqual(pass, { queued: [{ triggerId: review, ticketId, assignmentId }], failed: [] });
   await workers.drain();
 
