@@ -81,7 +81,27 @@ test("a Semon stall on a native Worker's branch is recorded once per episode", a
   s.setSemon([]);
   assert.equal((await watchdog(s.options())).checked[0]!.clearedStallId, 1, "the fixture clock keeps the idle budget below its limit");
   s.setSemon([semonStall(a.branch, "no-output", null)]);
-  assert.equal((await watchdog(s.options())).checked[0]!.stallId, 2);
+  s.store.beginTurn(a.assignmentId);
+  const later = new Date(NOW.getTime() + MINUTES * 60_000);
+  assert.equal((await watchdog({ ...s.options(), now: () => later })).checked[0]!.stallId, 2);
+});
+
+test("Semon's idle verdicts need a turn that has itself been idle; a question counts between turns", async () => {
+  const s = setup();
+  const a = s.startWorker(1);
+  // Between turns: the Worker finished and waits for review. No output is expected, not a stall.
+  for (const reason of ["no-output", "process-gone"]) {
+    s.setSemon([semonStall(a.branch, reason, null)]);
+    assert.equal((await watchdog(s.options())).checked[0]!.stallId, null, reason);
+  }
+  // A turn that has just started: Semon's clock still counts from the session's last write.
+  s.store.beginTurn(a.assignmentId);
+  s.setSemon([semonStall(a.branch, "no-output", null)]);
+  assert.equal((await watchdog(s.options())).checked[0]!.stallId, null);
+  // An unanswered question between turns is the scripted stall, and counts.
+  s.store.endTurn(a.assignmentId, null);
+  s.setSemon([semonStall(a.branch)]);
+  assert.equal((await watchdog(s.options())).checked[0]!.semonReason, "waiting-question");
 });
 
 test("an unreadable Semon read fails without clearing open episodes", async () => {
