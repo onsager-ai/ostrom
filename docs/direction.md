@@ -161,7 +161,9 @@ nothing is built or tested locally on the operator's laptop. Workers run on chea
    that value also covers OAuth and other providers, so it does not establish the credential used.
    Codex's native records reported `magpie` as configured and `openai` with the SDK override; both
    calls completed, but neither the events nor the session record identified the credential source.
-   The direct-provider calls therefore do not yet prove that the operator's logins were used.
+   CLI status separately reports Claude `oauth_token` and Codex `Logged in using ChatGPT`, but it
+   does not tie either login to the SDK calls. The calls therefore do not yet prove which login
+   was used.
 2. **Model checks.** The Codex SDK reports token usage but not the model. Ostrom must confirm the
    model each turn used (from the native session record) so that a resume never silently runs on an
    expensive default, as happened once in the spike.
