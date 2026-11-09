@@ -4,6 +4,7 @@
 //   OSTROM_ALLOWLIST  comma-separated GitHub logins who may start work
 //   OSTROM_DB         path to the SQLite store
 
+import { readFileSync } from "node:fs";
 import { hostname } from "node:os";
 
 export { loadBudgetDefaults, type BudgetDefaults } from "../budget/budgets.ts";
@@ -38,6 +39,8 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
 //   OSTROM_WORKER_WORKTREES  directory holding the worktrees; default <repo>.worktrees
 //   OSTROM_WORKER_HARNESS    claude or codex; default codex
 //   OSTROM_WORKER_MODEL      model slug; default gpt-6-luna
+//   OSTROM_WORKER_RULES_FILE a file of the machine's house rules (heat limits, where tests run),
+//                            added to every Worker brief; default none
 
 export interface WorkerConfig {
   repo: string;
@@ -46,6 +49,8 @@ export interface WorkerConfig {
   harness: "claude" | "codex";
   model: string;
   machine: string;
+  /** House rules added to every brief, read from OSTROM_WORKER_RULES_FILE. */
+  rules?: string;
 }
 
 export function loadWorkerConfig(env: Record<string, string | undefined>): WorkerConfig {
@@ -66,7 +71,15 @@ export function loadWorkerConfig(env: Record<string, string | undefined>): Worke
     harness,
     model: env["OSTROM_WORKER_MODEL"]?.trim() || "gpt-6-luna",
     machine: hostname(),
+    ...rulesFrom(env["OSTROM_WORKER_RULES_FILE"]?.trim()),
   };
+}
+
+function rulesFrom(path: string | undefined): { rules?: string } {
+  if (!path) return {};
+  const rules = readFileSync(path, "utf8").trim();
+  if (rules === "") throw new Error(`OSTROM_WORKER_RULES_FILE ${path} is empty`);
+  return { rules };
 }
 
 // The Router uses a fresh, read-only session per batch:

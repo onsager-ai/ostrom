@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -130,6 +130,20 @@ test("Worker config requires a repo and base, and defaults to codex on gpt-6-lun
     assert.throws(() => loadWorkerConfig({ ...required, [name]: " " }), new RegExp(name));
   }
   assert.throws(() => loadWorkerConfig({ ...required, OSTROM_WORKER_HARNESS: "gemini" }), /OSTROM_WORKER_HARNESS/);
+});
+
+test("Worker house rules come from a file, and an empty one is refused", () => {
+  const required = { OSTROM_WORKER_REPO: "/work/ostrom", OSTROM_WORKER_BASE: "main" };
+  const dir = mkdtempSync(join(tmpdir(), "ostrom-rules-"));
+  try {
+    writeFileSync(join(dir, "rules.md"), "Run tests in CI only.\n");
+    writeFileSync(join(dir, "empty.md"), "  \n");
+    assert.equal(loadWorkerConfig({ ...required, OSTROM_WORKER_RULES_FILE: join(dir, "rules.md") }).rules, "Run tests in CI only.");
+    assert.throws(() => loadWorkerConfig({ ...required, OSTROM_WORKER_RULES_FILE: join(dir, "empty.md") }), /is empty/);
+    assert.equal(loadWorkerConfig(required).rules, undefined);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("dispatch needs one ticket id", async () => {
