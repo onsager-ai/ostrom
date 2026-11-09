@@ -154,6 +154,14 @@ test("a status card posts once then future states edit the same comment", async 
   assert.equal(github.commentsOn(7)[0]!["body"], "## Ostrom: Done");
 });
 
+test("a status card that already carries its marker is posted with exactly one", async () => {
+  const { store, thread, send, github } = fixture();
+  store.enqueueStatusCard(thread, `## Ostrom: Working\n\n${replyMarker(`card-thread-${thread}`)}\n`);
+  await send();
+  const body = github.commentsOn(7)[0]!["body"] as string;
+  assert.equal(body.split(replyMarker(`card-thread-${thread}`)).length - 1, 1);
+});
+
 test("reactions use the endpoint for their source comment", async () => {
   const { store, thread, send, github } = fixture();
   store.enqueueReply({
