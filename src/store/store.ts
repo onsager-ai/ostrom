@@ -421,6 +421,23 @@ export class Store {
     return toAssignment(row);
   }
 
+  configureNativeAssignment(assignmentId: number, options: { harness: "claude" | "codex"; model: string; worktree: string; branch: string; machine: string }): void {
+    const { changes } = this.#run(
+      `UPDATE assignment SET harness = ?, model = ?, worktree = ?, branch = ?, machine = ? WHERE id = ? AND state = 'pending'`,
+      options.harness, options.model, options.worktree, options.branch, options.machine, assignmentId,
+    );
+    if (Number(changes) !== 1) this.#illegalAssignment(assignmentId, "pending");
+  }
+
+  startNativeAssignment(assignmentId: number, sessionId: string): void {
+    if (!sessionId) throw new Error("sessionId must not be empty");
+    const { changes } = this.#run(
+      `UPDATE assignment SET state = 'running', session_id = ?, started_at = ? WHERE id = ? AND state = 'pending'`,
+      sessionId, this.#stamp(), assignmentId,
+    );
+    if (Number(changes) !== 1) this.#illegalAssignment(assignmentId, "running");
+  }
+
   /** `pending → running`, recording the T3 Code thread the Worker runs in. */
   startAssignment(assignmentId: number, t3ThreadId: string): void {
     if (t3ThreadId === "") throw new Error("t3ThreadId must not be empty");

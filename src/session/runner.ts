@@ -19,6 +19,7 @@ export interface SessionOptions {
   cwd: string;
   model: string;
   sessionId?: string;
+  onSessionId?: (id: string) => void;
 }
 
 export interface Runner {
@@ -55,6 +56,7 @@ export function claudeRunner(env: Record<string, string | undefined>, run: Claud
           ...(id === null ? {} : { resume: id }),
         } })) {
           if (message.type === "system" && message.subtype === "init") {
+            if (id === null) options.onSessionId?.(message.session_id);
             id = message.session_id;
             model = message.model;
           }
@@ -93,7 +95,10 @@ export function codexRunner(config: CodexOptions, client: CodexClient = new Code
         if (signal?.aborted) return { sessionId: id, text, status: "cancelled", usage: null, model: null };
         const { events } = await thread.runStreamed(prompt, signal ? { signal } : {});
         for await (const event of events) {
-          if (event.type === "thread.started") id = event.thread_id;
+          if (event.type === "thread.started") {
+            if (id === null) options.onSessionId?.(event.thread_id);
+            id = event.thread_id;
+          }
           if (event.type === "item.completed" && event.item.type === "agent_message") text = event.item.text;
           if (event.type === "error") throw new Error(event.message);
           if (event.type === "turn.failed") throw new Error(event.error.message);

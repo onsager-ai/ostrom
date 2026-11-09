@@ -209,6 +209,48 @@ export const migrations: readonly string[] = [
   ALTER TABLE assignment ADD COLUMN cached_input_tokens INTEGER NOT NULL DEFAULT 0 CHECK (cached_input_tokens >= 0);
   ALTER TABLE assignment ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0 CHECK (output_tokens >= 0);
   `,
+
+  // 7: A running assignment may use a native session instead of a T3 thread.
+  `
+  CREATE TABLE assignment_v7 (
+    id INTEGER PRIMARY KEY,
+    ticket_id INTEGER NOT NULL REFERENCES ticket(id),
+    state TEXT NOT NULL CHECK (state IN ('pending', 'running', 'ended')),
+    t3_thread_id TEXT UNIQUE,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    ended_at TEXT,
+    end_reason TEXT CHECK (end_reason <> ''),
+    outcome TEXT CHECK (outcome IN ('waiting', 'failed', 'cancelled')),
+    outcome_at TEXT,
+    harness TEXT CHECK (harness IN ('claude', 'codex')),
+    model TEXT, session_id TEXT, worktree TEXT, branch TEXT, machine TEXT,
+    turns INTEGER NOT NULL DEFAULT 0 CHECK (turns >= 0),
+    input_tokens INTEGER NOT NULL DEFAULT 0 CHECK (input_tokens >= 0),
+    cached_input_tokens INTEGER NOT NULL DEFAULT 0 CHECK (cached_input_tokens >= 0),
+    output_tokens INTEGER NOT NULL DEFAULT 0 CHECK (output_tokens >= 0),
+    CHECK (state <> 'pending' OR (t3_thread_id IS NULL AND session_id IS NULL AND started_at IS NULL)),
+    CHECK (state <> 'running' OR (started_at IS NOT NULL AND (t3_thread_id IS NOT NULL OR session_id IS NOT NULL))),
+    CHECK ((state = 'ended') = (ended_at IS NOT NULL)),
+    CHECK (state <> 'ended' OR started_at IS NOT NULL OR end_reason IS NOT NULL),
+    CHECK (state = 'ended' OR end_reason IS NULL),
+    CHECK ((outcome IS NULL) = (outcome_at IS NULL)),
+    CHECK (outcome IS NULL OR started_at IS NOT NULL)
+  ) STRICT;
+  INSERT INTO assignment_v7 SELECT * FROM assignment;
+  DROP TRIGGER delivery_needs_subscription;
+  DROP TABLE assignment;
+  ALTER TABLE assignment_v7 RENAME TO assignment;
+  CREATE INDEX assignment_by_ticket ON assignment (ticket_id);
+  CREATE TRIGGER delivery_needs_subscription BEFORE INSERT ON delivery
+  WHEN NOT EXISTS (
+    SELECT 1 FROM assignment JOIN subscription ON subscription.ticket_id = assignment.ticket_id
+    JOIN "trigger" ON "trigger".thread_id = subscription.thread_id
+    WHERE assignment.id = NEW.assignment_id AND "trigger".id = NEW.trigger_id
+  ) BEGIN
+    SELECT RAISE(ABORT, 'a delivery needs the assignment''s ticket subscribed to the trigger''s thread');
+  END;
+  `,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */
@@ -226,9 +268,14 @@ export function migrate(db: DatabaseSync, at: Date = new Date()): number {
   for (const [index, sql] of migrations.entries()) {
     const version = index + 1;
     if (version <= current) continue;
+    // Rebuilding a referenced table requires foreign keys disabled outside the transaction.
+    if (version === 7) db.exec("PRAGMA foreign_keys = OFF");
     db.exec("BEGIN IMMEDIATE");
     try {
       db.exec(sql);
+      if (version === 7 && db.prepare("PRAGMA foreign_key_check").get() !== undefined) {
+        throw new Error("assignment migration broke a foreign key");
+      }
       db.prepare("INSERT INTO schema_version (version, applied_at) VALUES (?, ?)").run(
         version,
         at.toISOString(),
@@ -237,6 +284,8 @@ export function migrate(db: DatabaseSync, at: Date = new Date()): number {
     } catch (error) {
       db.exec("ROLLBACK");
       throw error;
+    } finally {
+      if (version === 7) db.exec("PRAGMA foreign_keys = ON");
     }
   }
   return migrations.length;
