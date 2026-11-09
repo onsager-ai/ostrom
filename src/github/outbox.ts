@@ -100,7 +100,11 @@ async function postCommentBatch(replies: readonly Reply[], options: SendOptions,
       result.found.push(reply.id);
     }
     if (remaining.length === 0) return;
-    const body = remaining.map((reply) => `${reply.body}\n\n${replyMarker(reply.id)}`).join("\n\n---\n\n");
+    // A rendered status card already carries its marker, so later edits keep it; add one only when missing.
+    const body = remaining.map((reply) => {
+      const marker = replyMarker(reply.id);
+      return reply.body.includes(marker) ? reply.body : `${reply.body}\n\n${marker}`;
+    }).join("\n\n---\n\n");
     const posted = JSON.parse(await gh(["api", "--method", "POST", `repos/${repo}/issues/${number}/comments`, "-f", `body=${body}`])) as { id?: unknown };
     for (const reply of remaining) {
       store.markReplySent(reply.id);
