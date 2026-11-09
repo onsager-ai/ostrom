@@ -1,0 +1,22 @@
+[
+  {
+    "type": "system",
+    "subtype": "init",
+    "session_id": "redacted",
+    "model": "claude-haiku-5-5"
+  },
+  {
+    "type": "result",
+    "subtype": "success",
+    "session_id": "redacted",
+    "result": "OK",
+    "is_error": false,
+    "usage": {
+      "input_tokens": 2,
+      "output_tokens": 4
+    },
+    "modelUsage": {
+      "claude-haiku-5-5": {}
+    }
+  }
+]

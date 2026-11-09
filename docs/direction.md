@@ -114,8 +114,8 @@ noted.
 
 1. **Session runner.** `src/session/`: one small interface over the Claude Agent SDK and the Codex
    SDK (start, send a turn, resume by ID, cancel, and per-turn usage), plus worktree creation. The
-   SDK versions are pinned and covered by agreement tests. `src/t3/` and `vendor/t3code/` are
-   removed.
+   SDK versions are pinned and covered by agreement tests. `src/t3/` and `vendor/t3code/` remain
+   until PR 3, when their last callers move to the runner.
 2. **Workers on the runner.** Dispatch, follow-ups as resumed turns, outcomes from turn results and
    PR state, and resume after an `ostromd` restart. A migration adds the session fields and
    `machine` to `assignment`.
@@ -156,9 +156,15 @@ nothing is built or tested locally on the operator's laptop. Workers run on chea
 
 ## Open questions
 
-1. **Logins.** Do the SDKs run on the operator's own Claude and Codex logins, or do they need API
-   keys? The spike did not prove either (it used the configured gateway and Magpie provider). PR 1
-   must settle this before any Worker runs.
+1. **Logins: answered 2026-11-09 (PR 1), by elimination.** Tiny SDK calls succeeded with every
+   API-key and gateway credential removed. For Claude, `ANTHROPIC_API_KEY` was unset and the
+   gateway's `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_BASE_URL` were dropped, and the result reported
+   `apiKeySource: none`; the only credential left was the Claude Code login. For Codex, the
+   provider was `openai`, `OPENAI_API_KEY` was unset, and `~/.codex/auth.json` holds no API key; the
+   only credential left was the ChatGPT login. So both SDKs can run on the operator's own logins.
+   The choice is configuration: `OSTROM_CLAUDE_AUTH=login` and `OSTROM_CODEX_PROVIDER=openai`. By
+   default the operator's environment passes through unchanged, which on this machine means the
+   gateway and the Magpie provider.
 2. **Model checks.** The Codex SDK reports token usage but not the model. Ostrom must confirm the
    model each turn used (from the native session record) so that a resume never silently runs on an
    expensive default, as happened once in the spike.
