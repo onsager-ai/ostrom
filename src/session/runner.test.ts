@@ -10,7 +10,7 @@ test("Claude resumes the same session with the explicit model", async () => {
   const run = async function* (input: Parameters<typeof import("@anthropic-ai/claude-agent-sdk").query>[0]): AsyncGenerator<SDKMessage> {
     calls.push({ ...(input.options?.model ? { model: input.options.model } : {}), ...(input.options?.resume ? { resume: input.options.resume } : {}) });
     yield { type: "system", subtype: "init", session_id: "session", model: "haiku" } as SDKMessage;
-    yield { type: "result", subtype: "success", session_id: "session", result: "ok", is_error: false, modelUsage: { haiku: {} }, usage: { input_tokens: 4, output_tokens: 2 } } as unknown as SDKMessage;
+    yield { type: "result", subtype: "success", session_id: "session", result: "ok", is_error: false, modelUsage: { haiku: {} }, usage: { input_tokens: 4, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 2 } } as unknown as SDKMessage;
   };
   const session = claudeRunner({}, run).start({ cwd: "/tmp", model: "haiku" });
   assert.deepEqual(await session.send("hello"), { sessionId: "session", text: "ok", status: "completed", model: "haiku", usage: { inputTokens: 4, outputTokens: 2 } });

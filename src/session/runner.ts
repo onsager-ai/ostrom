@@ -62,7 +62,7 @@ export function claudeRunner(env: Record<string, string | undefined>, run: Claud
             const models = Object.keys(message.modelUsage);
             model = models.length === 1 ? models[0] ?? null : null;
             return { sessionId: id, text: message.result, status: "completed", model,
-              usage: { inputTokens: message.usage.input_tokens, outputTokens: message.usage.output_tokens } };
+              usage: { inputTokens: message.usage.input_tokens + message.usage.cache_read_input_tokens + message.usage.cache_creation_input_tokens, outputTokens: message.usage.output_tokens } };
           }
         }
         throw new Error("Claude ended without a result");
