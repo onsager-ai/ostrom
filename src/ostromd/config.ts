@@ -89,7 +89,7 @@ export function loadRouterConfig(env: Record<string, string | undefined>): Route
 }
 
 // The Watchdog reads one more, required: how long a Worker may show no progress before it counts
-// as stalled. It is both Semon's `--idle-minutes` and the age of the T3 thread's last update.
+// as stalled. It is Semon's `--idle-minutes` threshold.
 //
 //   OSTROM_STALL_MINUTES  a positive whole number of minutes, e.g. 20
 

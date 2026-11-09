@@ -62,7 +62,6 @@ export interface PendingDelivery {
   trigger: Trigger;
   ticketId: number;
   assignmentId: number | null;
-  t3ThreadId: string | null;
 }
 
 export interface NewDecision {
@@ -91,7 +90,6 @@ export interface Assignment {
   id: number;
   ticketId: number;
   state: AssignmentState;
-  t3ThreadId: string | null;
   harness: "claude" | "codex" | null;
   model: string | null;
   sessionId: string | null;
@@ -128,7 +126,6 @@ export interface Stall {
   id: number;
   assignmentId: number;
   semonReason: string | null;
-  t3Reason: string | null;
   detail: string | null;
   detectedAt: string;
   clearedAt: string | null;
@@ -139,7 +136,6 @@ export interface Stall {
 export interface NewStall {
   assignmentId: number;
   semonReason: string | null;
-  t3Reason: string | null;
   detail: string | null;
 }
 
@@ -441,19 +437,6 @@ export class Store {
     if (Number(changes) !== 1) this.#illegalAssignment(assignmentId, "running");
   }
 
-  /** `pending → running`, recording the T3 Code thread the Worker runs in. */
-  startAssignment(assignmentId: number, t3ThreadId: string): void {
-    if (t3ThreadId === "") throw new Error("t3ThreadId must not be empty");
-    const { changes } = this.#run(
-      `UPDATE assignment SET state = 'running', t3_thread_id = ?, started_at = ?
-       WHERE id = ? AND state = 'pending'`,
-      t3ThreadId,
-      this.#stamp(),
-      assignmentId,
-    );
-    if (Number(changes) !== 1) this.#illegalAssignment(assignmentId, "running");
-  }
-
   /** `running → ended`, with the reason when the Worker was stopped rather than finished. */
   endAssignment(assignmentId: number, reason: string | null = null): void {
     const { changes } = this.#run(
@@ -481,8 +464,7 @@ export class Store {
   abandonedAssignments(): Assignment[] {
     return this.#all(
       `SELECT assignment.* FROM assignment JOIN ticket ON ticket.id = assignment.ticket_id
-       WHERE assignment.state = 'ended' AND assignment.t3_thread_id IS NULL
-         AND assignment.end_reason IS NOT NULL AND ticket.state = 'open'
+       WHERE assignment.state = 'ended' AND assignment.end_reason IS NOT NULL AND ticket.state = 'open'
        ORDER BY assignment.id`,
     ).map(toAssignment);
   }
@@ -580,7 +562,7 @@ export class Store {
   /** Every follow-up owed to an open ticket's Worker, oldest trigger first, then by ticket. */
   pendingDeliveries(): PendingDelivery[] {
     return this.#all(
-      `SELECT t.*, ticket.id AS p_ticket_id, worker.id AS p_assignment_id, worker.t3_thread_id AS p_t3_thread_id
+      `SELECT t.*, ticket.id AS p_ticket_id, worker.id AS p_assignment_id
        FROM "trigger" AS t
        JOIN subscription ON subscription.thread_id = t.thread_id
        JOIN ticket ON ticket.id = subscription.ticket_id AND ticket.state = 'open'
@@ -595,21 +577,17 @@ export class Store {
       trigger: toTrigger(row),
       ticketId: row["p_ticket_id"] as number,
       assignmentId: row["p_assignment_id"] as number | null,
-      t3ThreadId: row["p_t3_thread_id"] as string | null,
     }));
   }
 
-  /**
-   * Records that the trigger reached the assignment's Worker as T3 run `t3RunId`. Recording the
-   * same delivery again is a no-op marked duplicate.
-   */
-  recordDelivery(triggerId: number, assignmentId: number, t3RunId: string): { duplicate: boolean } {
+  /** Records the native turn that received the trigger. Duplicate delivery is a no-op. */
+  recordDelivery(triggerId: number, assignmentId: number, turnId: string): { duplicate: boolean } {
     const { changes } = this.#run(
-      `INSERT INTO delivery (trigger_id, assignment_id, t3_run_id, delivered_at) VALUES (?, ?, ?, ?)
+      `INSERT INTO delivery (trigger_id, assignment_id, turn_id, delivered_at) VALUES (?, ?, ?, ?)
        ON CONFLICT DO NOTHING`,
       triggerId,
       assignmentId,
-      t3RunId,
+      turnId,
       this.#stamp(),
     );
     return { duplicate: Number(changes) === 0 };
@@ -630,11 +608,10 @@ export class Store {
       const open = this.#get("SELECT id FROM stall WHERE assignment_id = ? AND cleared_at IS NULL", stall.assignmentId);
       if (open !== undefined) return { id: open["id"] as number, duplicate: true };
       const id = this.#get(
-        `INSERT INTO stall (assignment_id, semon_reason, t3_reason, detail, detected_at)
-         VALUES (?, ?, ?, ?, ?) RETURNING id`,
+        `INSERT INTO stall (assignment_id, semon_reason, detail, detected_at)
+         VALUES (?, ?, ?, ?) RETURNING id`,
         stall.assignmentId,
         stall.semonReason,
-        stall.t3Reason,
         stall.detail,
         this.#stamp(),
       )!["id"] as number;
@@ -697,23 +674,6 @@ export class Store {
       if (action === "wait") return { replyId, ticketId: assignment.ticketId, ticketEnded: false };
       return { replyId, ticketId: assignment.ticketId, ticketEnded: this.#endWork(assignment) };
     });
-  }
-
-  // --- the Router ----------------------------------------------------------------------------
-
-  /** The T3 Code thread the Router currently runs in, or null before the first one starts. */
-  routerThread(): string | null {
-    const row = this.#get("SELECT t3_thread_id FROM router_thread ORDER BY id DESC LIMIT 1");
-    return row === undefined ? null : (row["t3_thread_id"] as string);
-  }
-
-  /** Records a newly started Router thread; it becomes the current one. */
-  recordRouterThread(t3ThreadId: string): void {
-    this.#run(
-      "INSERT INTO router_thread (t3_thread_id, started_at) VALUES (?, ?)",
-      t3ThreadId,
-      this.#stamp(),
-    );
   }
 
   // --- outbox --------------------------------------------------------------------------------
@@ -890,7 +850,6 @@ function toAssignment(row: Row): Assignment {
     id: row["id"] as number,
     ticketId: row["ticket_id"] as number,
     state: row["state"] as AssignmentState,
-    t3ThreadId: row["t3_thread_id"] as string | null,
     harness: row["harness"] as Assignment["harness"],
     model: row["model"] as string | null,
     sessionId: row["session_id"] as string | null,
@@ -916,8 +875,7 @@ function toStall(row: Row): Stall {
   return {
     id: row["id"] as number,
     assignmentId: row["assignment_id"] as number,
-    semonReason: row["semon_reason"] as string | null,
-    t3Reason: row["t3_reason"] as string | null,
+    semonReason: row["semon_reason"] as string,
     detail: row["detail"] as string | null,
     detectedAt: row["detected_at"] as string,
     clearedAt: row["cleared_at"] as string | null,

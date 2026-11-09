@@ -213,7 +213,6 @@ test("the answer must decide each candidate once, on its thread, and answer exac
         threadUrl: "u",
         request: "r",
         semonReason: "waiting-question",
-        t3Reason: null,
         detail: "Which colour?",
         since: "t",
       },
@@ -428,7 +427,7 @@ test("a flagged stall reaches the Router once; wait leaves the Worker, stop ends
   const turns = () => s.routerSessions().length;
   assert.equal(turns(), 1);
 
-  const waiting = s.store().recordStall({ assignmentId: a!.assignmentId, semonReason: "waiting-question", t3Reason: "waiting-request", detail: "Which file?" });
+  const waiting = s.store().recordStall({ assignmentId: a!.assignmentId, semonReason: "waiting-question", detail: "Which file?" });
   s.answer = (batch) => ({
     decisions: [],
     outcomes: [],
@@ -441,7 +440,7 @@ test("a flagged stall reaches the Router once; wait leaves the Worker, stop ends
     thread: first.decisions[0]!.thread,
     threadUrl: "https://github.com/onsager-ai/ostrom/issues/7",
     request: "fix the README typo",
-    signals: { semon: "waiting-question", t3: "waiting-request" },
+    signals: { semon: "waiting-question" },
     detail: "Which file?",
     since: NOW.toISOString(),
   }]);
@@ -452,12 +451,12 @@ test("a flagged stall reaches the Router once; wait leaves the Worker, stop ends
   assert.equal(s.store().dueReplies().find((r) => r.id === `stall-${waiting.id}`)?.body, "The Worker asks: which file?");
 
   // The same episode is not flagged again, so the Router is not asked.
-  s.store().recordStall({ assignmentId: a!.assignmentId, semonReason: "waiting-question", t3Reason: null, detail: null });
+  s.store().recordStall({ assignmentId: a!.assignmentId, semonReason: "waiting-question", detail: null });
   assert.equal((await routeCandidates(s.options())).router, null);
   assert.equal(turns(), 2);
 
   // A Router answer that does not check out records nothing; the stall stays flagged.
-  const gone = s.store().recordStall({ assignmentId: b!.assignmentId, semonReason: "process-gone", t3Reason: null, detail: null });
+  const gone = s.store().recordStall({ assignmentId: b!.assignmentId, semonReason: "process-gone", detail: null });
   s.answer = (batch) => ({
     decisions: [],
     outcomes: [],

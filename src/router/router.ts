@@ -75,7 +75,6 @@ export interface StallItem {
   threadUrl: string;
   request: string;
   semonReason: string | null;
-  t3Reason: string | null;
   detail: string | null;
   since: string;
 }
@@ -360,7 +359,6 @@ function flaggedStalls(store: Store): StallItem[] {
       threadUrl: context.thread.url,
       request: context.reason,
       semonReason: stall.semonReason,
-      t3Reason: stall.t3Reason,
       detail: stall.detail,
       since: stall.detectedAt,
     };
@@ -423,7 +421,7 @@ export function routerMessage(batch: Batch): string {
       thread: stall.thread,
       threadUrl: stall.threadUrl,
       request: stall.request,
-      signals: { semon: stall.semonReason, t3: stall.t3Reason },
+      signals: { semon: stall.semonReason },
       detail: stall.detail,
       since: stall.since,
     })),
@@ -448,8 +446,7 @@ export function routerMessage(batch: Batch): string {
     "",
     "Each stall is a Worker the Watchdog found making no progress. Its signals say why: from Semon,",
     '"waiting-question" (it asked a question and waits), "process-gone" (its process died) or "no-output"',
-    '(it is working but writes nothing); from T3, "waiting-request" (it waits on a pending request) or',
-    '"no-update" (its run has not changed). "detail" is its open question, if any. For every stall choose',
+    '(it is working but writes nothing). "detail" is its open question, if any. For every stall choose',
     '"action": "wait" leaves the Worker be, with reply null or a short note telling the person on the',
     'thread what the Worker waits for; "stop" ends the work, and its reply tells the person it stopped.',
     "",

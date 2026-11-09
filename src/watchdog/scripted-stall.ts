@@ -1,34 +1,30 @@
-// The scripted stall (docs/direction.md, milestone 1 pass criterion): seeds a throwaway store with
-// one accepted ticket and starts a real T3 Worker for it whose brief makes it ask a question and
-// wait. After OSTROM_STALL_MINUTES the Watchdog flags it.
+// The scripted stall (docs/direction.md, milestone 1 pass criterion): seeds a throwaway store,
+// creates a native Worker's worktree, and starts it on gpt-6-luna with one question to ask.
+// After OSTROM_STALL_MINUTES the Watchdog flags the stalled native session.
 //
 //   node src/watchdog/scripted-stall.ts <issue-number>
 //
-// Environment: OSTROM_REPO, OSTROM_ALLOWLIST, OSTROM_DB (use a new file), and for the T3 thread
-// this script still starts (native Workers run headless and cannot ask a question):
-// OSTROM_T3_PROJECT, OSTROM_WORKER_BASE, OSTROM_STALL_PROVIDER, OSTROM_STALL_MODEL.
-// The issue is only where a Router reply would go; nothing is posted unless `ostromd send` runs
-// on this store, so never run `send` on it. The procedure, and how to clean up the worktree and
-// branch the Worker gets, is in docs/watchdog.md.
+// Environment: OSTROM_REPO, OSTROM_ALLOWLIST, OSTROM_DB (use a new file), OSTROM_WORKER_REPO and
+// OSTROM_WORKER_BASE. The issue is only where a Router reply would go; nothing is posted unless
+// `ostromd send` runs on this store, so never run `send` on it.
 
-import { loadConfig } from "../ostromd/config.ts";
+import { join } from "node:path";
+
+import { loadConfig, loadWorkerConfig } from "../ostromd/config.ts";
+import { sessionConfig } from "../session/config.ts";
+import { codexRunner } from "../session/runner.ts";
+import { createWorktree } from "../session/worktree.ts";
 import { Store } from "../store/store.ts";
-import { processRunner, T3Cli } from "../t3/runner.ts";
 
 export const STALL_BRIEF = [
-  "This is a scripted stall for Ostrom's Watchdog test. Do not read GitHub, run commands or edit files.",
-  "Ask the operator exactly one question with your AskUserQuestion tool: \"Which colour should the",
-  'scripted stall use?", with the options "red" and "blue". Then wait for the answer and do nothing else.',
+  "This is a scripted stall for Ostrom's Watchdog test.",
+  "Ask the operator exactly one question: Which colour should the scripted stall use, red or blue?",
+  "Wait for the answer. Do not make any edits or run commands.",
 ].join("\n");
 
 async function scriptedStall(issue: number): Promise<void> {
   const config = loadConfig(process.env);
-  const read = (name: string) => {
-    const value = process.env[name]?.trim() ?? "";
-    if (value === "") throw new Error(`${name} must be set`);
-    return value;
-  };
-  const t3 = { project: read("OSTROM_T3_PROJECT"), base: read("OSTROM_WORKER_BASE"), provider: read("OSTROM_STALL_PROVIDER"), model: read("OSTROM_STALL_MODEL") };
+  const worker = loadWorkerConfig(process.env);
   const store = Store.open(config.dbPath);
   try {
     const source = store.ensureSource("github", config.repo);
@@ -50,18 +46,21 @@ async function scriptedStall(issue: number): Promise<void> {
       reason: "Scripted stall: the Worker asks a question and waits.",
     });
     const assignmentId = store.createAssignment(ticketId!);
-    const branch = `ostrom/ticket-${ticketId}-${assignmentId}`;
-    const { threadId: t3ThreadId } = await new T3Cli(processRunner()).startThread({
-      project: t3.project,
-      title: `Ostrom scripted stall: ticket ${ticketId}`,
-      brief: STALL_BRIEF,
-      worktreeBase: t3.base,
-      branch,
-      provider: t3.provider,
-      model: t3.model,
+    const path = join(worker.worktrees, `ticket-${ticketId}-${assignmentId}`);
+    const branch = await createWorktree(worker.repo, path, worker.base, ticketId!, assignmentId);
+    store.configureNativeAssignment(assignmentId, {
+      harness: "codex", model: "gpt-6-luna", worktree: path, branch, machine: worker.machine,
     });
-    store.startAssignment(assignmentId, t3ThreadId);
-    process.stdout.write(`${JSON.stringify({ ticketId, assignmentId, t3ThreadId, branch })}\n`);
+    const { codex } = sessionConfig(process.env);
+    const session = codexRunner(codex).start({
+      cwd: path,
+      model: "gpt-6-luna",
+      writableDirs: [join(worker.repo, ".git")],
+      onSessionId: (sessionId) => store.startNativeAssignment(assignmentId, sessionId),
+    });
+    const result = await session.send(STALL_BRIEF);
+    if (result.status !== "completed" || result.sessionId === null) throw new Error("scripted Worker did not start");
+    process.stdout.write(`${JSON.stringify({ ticketId, assignmentId, sessionId: result.sessionId, branch, worktree: path })}\n`);
   } finally {
     store.close();
   }

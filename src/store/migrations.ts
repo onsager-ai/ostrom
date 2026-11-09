@@ -257,6 +257,13 @@ export const migrations: readonly string[] = [
   ALTER TABLE assignment ADD COLUMN turn_started_at TEXT;
   ALTER TABLE assignment ADD COLUMN interruptions INTEGER NOT NULL DEFAULT 0 CHECK (interruptions >= 0);
   `,
+
+  // 9: Router sessions are one-shot. T3 Worker columns remain for a later migration because
+  // existing running T3 assignments have no native session ID to preserve through a clean rebuild.
+  `
+  DROP TABLE router_thread;
+  ALTER TABLE delivery RENAME COLUMN t3_run_id TO turn_id;
+  `,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */
@@ -275,11 +282,11 @@ export function migrate(db: DatabaseSync, at: Date = new Date()): number {
     const version = index + 1;
     if (version <= current) continue;
     // Rebuilding a referenced table requires foreign keys disabled outside the transaction.
-    if (version === 7) db.exec("PRAGMA foreign_keys = OFF");
+    if (version === 7 || version === 9) db.exec("PRAGMA foreign_keys = OFF");
     db.exec("BEGIN IMMEDIATE");
     try {
       db.exec(sql);
-      if (version === 7 && db.prepare("PRAGMA foreign_key_check").get() !== undefined) {
+      if ((version === 7 || version === 9) && db.prepare("PRAGMA foreign_key_check").get() !== undefined) {
         throw new Error("assignment migration broke a foreign key");
       }
       db.prepare("INSERT INTO schema_version (version, applied_at) VALUES (?, ?)").run(
@@ -291,7 +298,7 @@ export function migrate(db: DatabaseSync, at: Date = new Date()): number {
       db.exec("ROLLBACK");
       throw error;
     } finally {
-      if (version === 7) db.exec("PRAGMA foreign_keys = ON");
+      if (version === 7 || version === 9) db.exec("PRAGMA foreign_keys = ON");
     }
   }
   return migrations.length;

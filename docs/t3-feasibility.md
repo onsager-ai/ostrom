@@ -1,5 +1,7 @@
 # Can an external process drive T3 Code?
 
+Historical note: this feasibility record predates the native-session migration; Ostrom no longer uses T3 Code.
+
 Checked 2026-11-09 against the installed `t3` v0.1.7 (runtime `~/.t3/runtime/versions/0.1.7`,
 database migration 79) and the public source at `pingdotgg/t3code` `main` @ `d0f1f7200d`.
 That commit is 419 commits past the `v0.1.7` release tag (`322f6544df`), which is the source the
