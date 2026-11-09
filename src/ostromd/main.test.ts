@@ -66,7 +66,7 @@ test("config comes from three required environment variables", () => {
 
 test("poll with bad config exits non-zero", async () => {
   const { err, deps: d } = deps({}, async () => "[]");
-  assert.equal(await main(["poll"], d), 1);
+  assert.equal(await main(["dev", "poll"], d), 1);
   assert.match(err.join("\n"), /OSTROM_REPO/);
 });
 
@@ -79,13 +79,13 @@ test(
     github.comment(7, { login: "alice", body: "hello", at: new Date() });
 
     const ok = deps(env, github.gh);
-    assert.equal(await main(["poll"], ok.deps), 0);
+    assert.equal(await main(["dev", "poll"], ok.deps), 0);
     assert.equal(ok.out.length, 1);
     assert.equal(JSON.parse(ok.out[0]!).body, "hello");
 
     github.failWhen = () => new Error("HTTP 500");
     const failed = deps(env, github.gh);
-    assert.equal(await main(["poll"], failed.deps), 1);
+    assert.equal(await main(["dev", "poll"], failed.deps), 1);
     assert.match(failed.err.join("\n"), /HTTP 500/);
   }),
 );
@@ -104,7 +104,7 @@ test(
 
     const env = { OSTROM_REPO: github.repo, OSTROM_ALLOWLIST: "alice", OSTROM_DB: dbPath };
     const run = deps(env, github.gh);
-    assert.equal(await main(["send"], run.deps), 1);
+    assert.equal(await main(["dev", "send"], run.deps), 1);
     assert.match(run.err.join("\n"), /ack-1 failed: HTTP 502/);
   }),
 );
@@ -135,7 +135,7 @@ test("Worker config requires a repo and base, and defaults to codex on gpt-6-lun
 test("dispatch needs one ticket id", async () => {
   for (const argv of [["dispatch"], ["dispatch", "x"], ["dispatch", "0"], ["dispatch", "1", "2"], ["observe", "1"], ["route", "1"], ["route-candidates", "1"]]) {
     const run = deps({}, async () => "[]");
-    assert.equal(await main(argv, run.deps), 2, argv.join(" "));
+    assert.equal(await main(["dev", ...argv], run.deps), 2, argv.join(" "));
   }
 });
 
@@ -154,11 +154,11 @@ test(
     store.close();
 
     const missing = deps(env, async () => "[]");
-    assert.equal(await main(["dispatch", "1"], missing.deps), 1);
+    assert.equal(await main(["dev", "dispatch", "1"], missing.deps), 1);
     assert.match(missing.err.join("\n"), /OSTROM_WORKER_REPO/);
 
     const started = deps({ ...env, ...workerEnv }, async () => "[]");
-    assert.equal(await main(["dispatch", "1"], started.deps), 0);
+    assert.equal(await main(["dev", "dispatch", "1"], started.deps), 0);
     assert.deepEqual(JSON.parse(started.out[0]!), {
       ticketId: 1, assignmentId: 1, sessionId: "sess-1", branch: "ostrom/ticket-1-1",
     });
@@ -167,7 +167,7 @@ test(
     const unreadable = deps(env, async () => {
       throw new Error("gh down");
     });
-    assert.equal(await main(["observe"], unreadable.deps), 1);
+    assert.equal(await main(["dev", "observe"], unreadable.deps), 1);
     assert.match(unreadable.err.join("\n"), /assignment 1 failed: gh down/);
   }),
 );
@@ -190,7 +190,7 @@ test(
     store.close();
 
     const none = deps(env, async () => "[]");
-    assert.equal(await main(["route"], none.deps), 1);
+    assert.equal(await main(["dev", "route"], none.deps), 1);
     assert.match(none.err.join("\n"), /trigger 2 to ticket 1 failed: ticket 1 has no running Worker/);
 
     const reopened = Store.open(dbPath);
@@ -200,13 +200,13 @@ test(
     reopened.close();
 
     const up = deps(env, async () => "[]");
-    assert.equal(await main(["route"], up.deps), 0);
+    assert.equal(await main(["dev", "route"], up.deps), 0);
     assert.deepEqual(up.out.map((line) => JSON.parse(line)), [{ triggerId: followUp, ticketId: 1, assignmentId }]);
     assert.equal(up.runner.sessions[0]?.id, "sess-9");
     assert.equal(up.runner.sessions[0]?.prompts.length, 1, "the command waited for the turn");
 
     const replay = deps(env, async () => "[]");
-    assert.equal(await main(["route"], replay.deps), 0);
+    assert.equal(await main(["dev", "route"], replay.deps), 0);
     assert.deepEqual(replay.out, []);
   }),
 );
@@ -237,7 +237,7 @@ test(
     const gh: MainDeps["gh"] = async () => JSON.stringify({ body: "please fix the typo" });
 
     const badHarness = deps({ ...env, OSTROM_ROUTER_HARNESS: "t3" }, gh);
-    assert.equal(await main(["route-candidates"], badHarness.deps), 1);
+    assert.equal(await main(["dev", "route-candidates"], badHarness.deps), 1);
     assert.match(badHarness.err.join("\n"), /OSTROM_ROUTER_HARNESS/);
 
     const garbled = deps(env, gh);
@@ -246,7 +246,7 @@ test(
       session.reply = () => "I accept.";
       return session;
     }) as typeof garbled.runner.start;
-    assert.equal(await main(["route-candidates"], garbled.deps), 1);
+    assert.equal(await main(["dev", "route-candidates"], garbled.deps), 1);
     assert.match(garbled.err.join("\n"), /Router reply is not JSON/);
 
     const answer = {
@@ -260,7 +260,7 @@ test(
       session.reply = () => JSON.stringify(answer);
       return session;
     }) as typeof judged.runner.start;
-    assert.equal(await main(["route-candidates"], judged.deps), 0);
+    assert.equal(await main(["dev", "route-candidates"], judged.deps), 0);
     assert.deepEqual(judged.out.map((line) => JSON.parse(line).type), ["router", "decision"]);
     assert.equal(JSON.parse(judged.out[1]!).verdict, "ignore");
   }),
@@ -296,20 +296,20 @@ test(
     const stalled = semonAnswer(20, [{ id: "s", branch: "ostrom/ticket-1-1", stall_reason: "waiting-question", open_question: { text: "Which?" } }]);
 
     const missing = deps({ ...env, OSTROM_STALL_MINUTES: "" }, async () => "[]", stalled);
-    assert.equal(await main(["watchdog"], missing.deps), 1);
+    assert.equal(await main(["dev", "watchdog"], missing.deps), 1);
     assert.match(missing.err.join("\n"), /OSTROM_STALL_MINUTES/);
 
     const first = deps(env, async () => "[]", stalled);
-    assert.equal(await main(["watchdog"], first.deps), 0);
+    assert.equal(await main(["dev", "watchdog"], first.deps), 0);
     assert.deepEqual(first.out.map((line) => JSON.parse(line)), [{
       assignmentId: 1, semonReason: "waiting-question", stallId: 1, newEpisode: true, clearedStallId: null,
     }]);
     const second = deps(env, async () => "[]", stalled);
-    assert.equal(await main(["watchdog"], second.deps), 0);
+    assert.equal(await main(["dev", "watchdog"], second.deps), 0);
     assert.equal(JSON.parse(second.out[0]!).newEpisode, false);
 
     const broken = deps(env, async () => "[]", async () => ({ code: 1, stdout: "", stderr: "no logs" }));
-    assert.equal(await main(["watchdog"], broken.deps), 1);
+    assert.equal(await main(["dev", "watchdog"], broken.deps), 1);
     assert.match(broken.err.join("\n"), /semon stalls failed: semon query stalls exited 1: no logs/);
     assert.equal(broken.out.length, 1);
   }),
@@ -331,14 +331,14 @@ test(
   withDb(async (dbPath) => {
     const github = new FakeGitHub(() => new Date());
     const ok = deps(tickEnv(dbPath), github.gh, semonAnswer(20, []));
-    assert.equal(await main(["tick"], ok.deps), 0);
+    assert.equal(await main(["dev", "tick"], ok.deps), 0);
     assert.deepEqual(passes(ok.err), [...TICK, "tick"]);
     assert.match(ok.err.at(-1)!, /all 7 passes ran/);
 
     // Intake and Semon both fail; every other pass still runs, and the tick names the failures.
     github.failWhen = () => new Error("HTTP 500");
     const failed = deps(tickEnv(dbPath), github.gh, async () => ({ code: 127, stdout: "", stderr: "semon: not found" }));
-    assert.equal(await main(["tick"], failed.deps), 1);
+    assert.equal(await main(["dev", "tick"], failed.deps), 1);
     assert.deepEqual(
       passes(failed.err).filter((name, i, all) => name !== all[i - 1]),
       [...TICK, "tick"],
@@ -348,7 +348,7 @@ test(
 );
 
 test("tick and run check every variable before any pass", async () => {
-  for (const argv of [["tick"], ["run", "--interval", "60"]]) {
+  for (const argv of [["dev", "tick"], ["run", "--interval", "60"]]) {
     const run = deps({ ...tickEnv("/nonexistent/ostrom.sqlite"), OSTROM_ROUTER_HARNESS: "t3" }, async () => "[]");
     assert.equal(await main(argv, run.deps), 1);
     assert.deepEqual(run.err.length, 1);
@@ -359,7 +359,7 @@ test("tick and run check every variable before any pass", async () => {
 test("run needs --interval with whole seconds", async () => {
   for (const argv of [["run"], ["run", "60"], ["run", "--interval"], ["run", "--interval", "0"], ["run", "--interval", "1.5"], ["tick", "x"], ["watchdog", "1"]]) {
     const run = deps({}, async () => "[]");
-    assert.equal(await main(argv, run.deps), 2, argv.join(" "));
+    assert.equal(await main(["dev", ...argv], run.deps), 2, argv.join(" "));
   }
 });
 

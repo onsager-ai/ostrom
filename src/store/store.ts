@@ -122,6 +122,28 @@ export interface TicketBudget {
   lastActivityAt: string | null;
 }
 
+/** The compact records displayed by the local operator API. */
+export interface OperatorTicket extends Ticket {
+  thread: Thread;
+  assignment: Assignment | null;
+  budget: TicketBudget;
+}
+
+export interface OperatorTicketDetail extends OperatorTicket {
+  context: TicketContext;
+  triggers: Trigger[];
+  decisions: { id: number; verdict: Verdict; reason: string; decidedAt: string }[];
+  assignments: Assignment[];
+  outbox: Reply[];
+}
+
+export interface OperatorStatus {
+  tickets: { open: number; paused: number; ended: number };
+  runningWorkers: Assignment[];
+  stuckTickets: { ticketId: number; assignmentId: number; cause: string | null; detectedAt: string }[];
+  tokensToday: number;
+}
+
 export interface Assignment {
   id: number;
   ticketId: number;
@@ -452,6 +474,58 @@ export class Store {
     const row = this.#get("SELECT * FROM ticket WHERE id = ?", ticketId);
     if (row === undefined) throw new Error(`no ticket ${ticketId}`);
     return toTicket(row);
+  }
+
+  /** Tickets in operator-list order, with the fields needed by CLI and dashboard clients. */
+  operatorTickets(): OperatorTicket[] {
+    return this.#all("SELECT id FROM ticket ORDER BY id DESC").map((row) => this.#operatorTicket(row["id"] as number));
+  }
+
+  /** One ticket and its durable operator-visible timeline. */
+  operatorTicket(ticketId: number): OperatorTicketDetail {
+    const summary = this.#operatorTicket(ticketId);
+    const context = this.ticketContext(ticketId);
+    const triggers = this.#all(
+      `SELECT "trigger".* FROM "trigger" JOIN subscription ON subscription.thread_id = "trigger".thread_id
+       WHERE subscription.ticket_id = ? ORDER BY "trigger".occurred_at, "trigger".id`,
+      ticketId,
+    ).map(toTrigger);
+    const decisions = this.#all(
+      `SELECT decision.id, decision.verdict, decision.reason, decision.decided_at FROM decision
+       JOIN subscription ON subscription.thread_id = decision.thread_id WHERE subscription.ticket_id = ?
+       ORDER BY decision.id`,
+      ticketId,
+    ).map((row) => ({ id: row["id"] as number, verdict: row["verdict"] as Verdict, reason: row["reason"] as string, decidedAt: row["decided_at"] as string }));
+    const assignments = this.#all("SELECT * FROM assignment WHERE ticket_id = ? ORDER BY id", ticketId).map(toAssignment);
+    const outbox = this.#all(
+      `SELECT outbox.* FROM outbox JOIN subscription ON subscription.thread_id = outbox.thread_id
+       WHERE subscription.ticket_id = ? ORDER BY outbox.enqueued_at, outbox.id`,
+      ticketId,
+    ).map(toReply);
+    return { ...summary, context, triggers, decisions, assignments, outbox };
+  }
+
+  /** The daemon-wide counter view. Time zone is SQLite's UTC day, matching stored timestamps. */
+  operatorStatus(): OperatorStatus {
+    const states = this.#all("SELECT state, COUNT(*) AS count FROM ticket GROUP BY state");
+    const counts = new Map(states.map((row) => [row["state"] as TicketState, row["count"] as number]));
+    const runningWorkers = this.runningAssignments();
+    const stuckTickets = this.#all(
+      `SELECT ticket.id AS ticket_id, assignment.id AS assignment_id, stall.cause, stall.detected_at
+       FROM stall JOIN assignment ON assignment.id = stall.assignment_id JOIN ticket ON ticket.id = assignment.ticket_id
+       WHERE stall.cleared_at IS NULL ORDER BY stall.detected_at, stall.id`,
+    ).map((row) => ({ ticketId: row["ticket_id"] as number, assignmentId: row["assignment_id"] as number,
+      cause: row["cause"] as string | null, detectedAt: row["detected_at"] as string }));
+    const today = this.#get(
+      "SELECT COALESCE(SUM(input_tokens + output_tokens), 0) AS tokens FROM assignment WHERE last_activity_at >= date('now')",
+    )!["tokens"] as number;
+    return { tickets: { open: counts.get("open") ?? 0, paused: counts.get("paused") ?? 0, ended: counts.get("ended") ?? 0 }, runningWorkers, stuckTickets, tokensToday: today };
+  }
+
+  #operatorTicket(ticketId: number): OperatorTicket {
+    const ticket = this.getTicket(ticketId);
+    const context = this.ticketContext(ticketId);
+    return { ...ticket, thread: context.thread, assignment: this.latestAssignment(ticketId), budget: this.ticketBudget(ticketId) };
   }
 
   /** The ticket with the thread, decision reason and trigger URLs that opened it. */

@@ -1,0 +1,16 @@
+[Unit]
+Description=Ostrom background daemon
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/ostrom/env
+# systemd's own PATH has neither Node nor the agent CLIs; the env file sets PATH, and env finds
+# ostromd on it.
+ExecStart=/usr/bin/env ostromd run --interval 60
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

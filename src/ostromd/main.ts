@@ -1,8 +1,10 @@
+#!/usr/bin/env node
 // ostromd: the daemon that runs intake, filtering, fan-out, the outbox and the Watchdog.
-// See docs/direction.md. Each pass is its own command; `tick` runs them all once in order, and
-// `run` repeats `tick`. Installing it as a service is not done here.
+// See docs/direction.md. The operator starts only `run`; individual passes remain under `dev`.
 
-import { routeCommands } from "../commands/commands.ts";
+import { defaultSocketPath, localApi } from "../api/server.ts";
+import { operatorControls, routeCommands } from "../commands/commands.ts";
+import { renderPreview } from "../github/preview.ts";
 import { execGh, type GhRunner } from "../github/gh.ts";
 import { sendDueReplies } from "../github/outbox.ts";
 import { processRunner, type ProcessRunner } from "../process.ts";
@@ -35,40 +37,18 @@ import { loadBudgetDefaults, loadConfig, loadRouterConfig, loadWatchdogConfig, l
  */
 export const TICK = ["poll", "observe", "commands", "route", "watchdog", "route-candidates", "send"] as const;
 
-const USAGE = `usage: ostromd <command>
+const USAGE = `usage: ostromd run --interval <seconds>
+       ostromd dev <pass> [ticket-id]
 
 commands:
-  poll   read new GitHub events once; print each candidate trigger as a JSON line
-  send   post due outbox replies once
-  dispatch <ticket-id>
-         start a native Worker session for an open ticket and wait for its turns to finish;
-         print the assignment as a JSON line
-  observe
-         look up the PRs opened from every running Worker's branch once; subscribe tickets to
-         them and print each observation as a JSON line
-  commands
-         authorize and consume fixed commands and redirects on subscribed threads before they can
-         reach the Router or the ordinary Worker follow-up path
-  route  queue each new trigger on a subscribed thread as a turn on its ticket's Worker session,
-         wait for the turns to finish, and print each queued follow-up as a JSON line
-  watchdog
-         check every running Worker once with Semon's stalls read, run the deterministic stuck
-         recovery ladder, and print each check as a JSON line
-  route-candidates
-         one Router pass: ask the Router to judge undecided triggers and word outcome replies,
-         record its decisions, dispatch accepted tickets, queue replies and end finished or
-         stopped tickets; print each record as a JSON line
-  tick   run every pass once: ${TICK.join(" → ")}; a failed pass is reported, the rest still
-         run, and the tick exits non-zero
   run --interval <seconds>
-         repeat tick, waiting that long after each, until SIGINT or SIGTERM
+         repeat the daemon loop until SIGINT or SIGTERM
+  dev <pass>
+         developer-only one-shot pass: poll, send, dispatch <ticket-id>, observe, commands,
+         route, watchdog, route-candidates or tick
 
-environment: OSTROM_REPO, OSTROM_ALLOWLIST, OSTROM_DB;
-  dispatch also needs OSTROM_WORKER_REPO, OSTROM_WORKER_BASE (optional: OSTROM_WORKER_WORKTREES,
-  OSTROM_WORKER_HARNESS=claude|codex, default codex, OSTROM_WORKER_MODEL, default gpt-6-luna);
-  route-candidates needs those, optional OSTROM_ROUTER_HARNESS=claude|codex (default codex) and
-  OSTROM_ROUTER_MODEL (default gpt-6-luna); watchdog needs OSTROM_STALL_MINUTES; tick and run
-  need all of them
+run needs OSTROM_REPO, OSTROM_ALLOWLIST, OSTROM_DB and the worker/router/watchdog configuration;
+see docs/running.md. Developer passes retain their existing environment requirements.
 `;
 
 export interface MainDeps {
@@ -136,7 +116,7 @@ async function tick(deps: MainDeps): Promise<number> {
   const shared = { ...deps, workers: deps.workers ?? owned!.workers };
   try {
     for (const step of TICK) {
-      const code = await main([step], shared);
+      const code = await main(["dev", step], shared);
       if (code !== 0) failed.push(`${step} (exit ${code})`);
     }
   } finally {
@@ -158,14 +138,25 @@ async function run(intervalSeconds: number, deps: MainDeps): Promise<number> {
   }
   let code = 0;
   const owned = openWorkers(deps);
+  const controls = operatorControls(owned.store, owned.workers, deps.gh, loadConfig(deps.env).repo);
+  const api = localApi(owned.store, {
+    socketPath: defaultSocketPath(deps.env),
+    control: {
+      ...controls,
+      extend: async (ticketId, increases) => { owned.store.extendTicketBudget(ticketId, increases); },
+      preview: async () => renderPreview(owned.store),
+    },
+  });
   logRecovery(owned.workers.recover(), deps);
   try {
+    await api.start();
     while (!deps.stop.aborted) {
       code = await tick({ ...deps, workers: owned.workers });
       if (deps.stop.aborted) break;
       await deps.sleep(intervalSeconds * 1000, deps.stop);
     }
   } finally {
+    await api.close();
     await owned.close();
   }
   return code;
@@ -187,6 +178,7 @@ function openWorkers(deps: MainDeps) {
   const store = Store.open(loadConfig(deps.env).dbPath);
   const workers = makeWorkers(deps, store);
   return {
+    store,
     workers,
     close: async () => {
       try {
@@ -222,14 +214,16 @@ function logRecovery(pass: ReturnType<Workers["recover"]>, deps: MainDeps): void
 
 /** Runs one command and returns its exit code. Anything that did not do its job is non-zero. */
 export async function main(argv: readonly string[], deps: MainDeps = defaults): Promise<number> {
-  const [command, ...rest] = argv;
+  const [requested, ...argvRest] = argv;
+  const developer = requested === "dev";
+  const [command, ...rest] = developer ? argvRest : [requested, ...argvRest];
   const ticketArg = rest[0];
   const valid =
     command === "dispatch"
-      ? rest.length === 1 && /^[1-9]\d*$/.test(ticketArg!)
+      ? developer && rest.length === 1 && /^[1-9]\d*$/.test(ticketArg!)
       : command === "run"
-        ? rest.length === 2 && rest[0] === "--interval" && /^[1-9]\d*$/.test(rest[1]!)
-        : (command === "poll" ||
+        ? !developer && rest.length === 2 && rest[0] === "--interval" && /^[1-9]\d*$/.test(rest[1]!)
+        : developer && (command === "poll" ||
             command === "send" ||
             command === "observe" ||
             command === "commands" ||

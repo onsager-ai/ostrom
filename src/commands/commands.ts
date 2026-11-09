@@ -10,6 +10,49 @@ export interface CommandPass {
   failed: { triggerId: number; ticketId: number; error: string }[];
 }
 
+/** Operator controls share the Worker delivery and durable state transitions used by GitHub commands. */
+export function operatorControls(store: Store, workers: Workers, gh: GhRunner, repo: string): {
+  pause(ticketId: number): Promise<void>;
+  resume(ticketId: number): Promise<void>;
+  stop(ticketId: number): Promise<void>;
+} {
+  const running = (ticketId: number) => {
+    const assignment = store.latestAssignment(ticketId);
+    if (assignment?.state !== "running") throw new Error(`ticket ${ticketId} has no running Worker`);
+    return assignment;
+  };
+  return {
+    async pause(ticketId) {
+      const assignment = running(ticketId);
+      store.pauseTicket(ticketId);
+      queueStatusCard(store, ticketId);
+      workers.deliver(assignment.id, `operator-pause-${ticketId}`, "Pause this ticket after the current work finishes. Push your work in progress, then stop and wait for Ostrom to resume you.", () => {});
+    },
+    async resume(ticketId) {
+      const assignment = running(ticketId);
+      store.resumeTicket(ticketId);
+      queueStatusCard(store, ticketId);
+      workers.deliver(assignment.id, `operator-resume-${ticketId}`, "This ticket has resumed. Continue your work.", () => {});
+    },
+    async stop(ticketId) {
+      const assignment = running(ticketId);
+      workers.deliver(
+        assignment.id,
+        `operator-stop-${ticketId}`,
+        "Stop this ticket gracefully. Push your work in progress and summarise precisely where you stopped.",
+        () => {},
+        async (result) => {
+          for (const pr of await pullRequests(gh, repo, assignment.branch!)) await gh(["pr", "ready", "--undo", pr]);
+          store.endAssignment(assignment.id, "stopped by operator");
+          store.endTicket(ticketId);
+          store.enqueueReply({ id: `operator-stopped-${ticketId}`, threadId: store.ticketContext(ticketId).thread.id, body: result.text, blocking: true });
+          queueStatusCard(store, ticketId);
+        },
+      );
+    },
+  };
+}
+
 /**
  * Consumes subscribed-thread comments before ordinary follow-up routing. This is the only path
  * that parses control words, so a command is never supplied to the Router or a Worker as text.
