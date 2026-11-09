@@ -1,3 +1,0 @@
-check: rust-green
-uses: gh/check-run
-with: {name: placeholder-ci}

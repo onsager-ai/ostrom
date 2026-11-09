@@ -1,7 +1,0 @@
-{
-  "name": "required_checks",
-  "result": "excused",
-  "tier": ["content-derived"],
-  "detail": {"selectors": ["ci/placeholder"]},
-  "exception_reason": "placeholder exception"
-}

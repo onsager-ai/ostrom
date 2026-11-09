@@ -1,3 +1,0 @@
-check: ready-to-merge
-uses: cmd/run
-with: {script: "exit 0"}

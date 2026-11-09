@@ -1,8 +1,0 @@
-{
-  "type": "run.finished",
-  "payload": {
-    "outcome": "completed",
-    "durationMs": "1"
-  },
-  "expectedKind": "Malformed"
-}

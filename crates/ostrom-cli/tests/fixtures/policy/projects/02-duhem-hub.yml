@@ -1,5 +1,0 @@
-grant: duhem-hub-builder
-actors: builder
-operations: work
-repositories: onsager-ai/duhem-hub
-where: label:area:ingest
