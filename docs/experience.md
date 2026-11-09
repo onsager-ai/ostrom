@@ -1,7 +1,6 @@
 # Ostrom experience
 
-Status: draft, 2026-11-09. The operator accepted this design on 2026-11-09. Some questions are still
-open and are listed in each journey. This document comes before `direction.md` on runtime choices:
+Status: accepted, 2026-11-09. The operator's decisions are recorded in each journey. This document comes before `direction.md` on runtime choices:
 the experience decides the stack, not the other way round.
 
 ## Principle: Ostrom is background
@@ -105,13 +104,14 @@ is present before it is sent:
 - Status cards, batched comments and stuck replies are snapshot-tested against recorded GitHub
   fixtures, so a wording change shows up as a diff in review.
 
-Open questions:
+Decided by the operator on 2026-11-09:
 
-- Should pause and stop also be labels that people add, such as `ostrom:stop`, for bulk triage
-  from the issue list?
-- Should the operator get a grace window (30 minutes, say) before the public stuck reply, or should
-  both go out at once?
-- The batching window and the limit on new comments: are 10 and 30 minutes the right defaults?
+- Pause and stop will also be labels that people can add, such as `ostrom:stop`, for bulk triage
+  from the issue list. This comes in milestone 2.
+- The operator gets a 30-minute grace window before the public stuck reply. This comes in
+  milestone 2; until then, the stuck reply goes out when the operator step is reached.
+- Batching defaults: a 10-minute gathering window, and at most one new comment per thread per 30
+  minutes. A blocking question skips the wait.
 
 ## Journey 2: the operator
 
