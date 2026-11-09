@@ -156,14 +156,15 @@ nothing is built or tested locally on the operator's laptop. Workers run on chea
 
 ## Open questions
 
-1. **Logins — still open.** On 2026-11-09, tiny SDK calls succeeded both as configured and with
-   gateway environment credentials removed. Claude reported `apiKeySource: none` in both cases;
-   that value also covers OAuth and other providers, so it does not establish the credential used.
-   Codex's native records reported `magpie` as configured and `openai` with the SDK override; both
-   calls completed, but neither the events nor the session record identified the credential source.
-   CLI status separately reports Claude `oauth_token` and Codex `Logged in using ChatGPT`, but it
-   does not tie either login to the SDK calls. The calls therefore do not yet prove which login
-   was used.
+1. **Logins: answered 2026-11-09 (PR 1), by elimination.** Tiny SDK calls succeeded with every
+   API-key and gateway credential removed. For Claude, `ANTHROPIC_API_KEY` was unset and the
+   gateway's `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_BASE_URL` were dropped, and the result reported
+   `apiKeySource: none`; the only credential left was the Claude Code login. For Codex, the
+   provider was `openai`, `OPENAI_API_KEY` was unset, and `~/.codex/auth.json` holds no API key; the
+   only credential left was the ChatGPT login. So both SDKs can run on the operator's own logins.
+   The choice is configuration: `OSTROM_CLAUDE_AUTH=login` and `OSTROM_CODEX_PROVIDER=openai`. By
+   default the operator's environment passes through unchanged, which on this machine means the
+   gateway and the Magpie provider.
 2. **Model checks.** The Codex SDK reports token usage but not the model. Ostrom must confirm the
    model each turn used (from the native session record) so that a resume never silently runs on an
    expensive default, as happened once in the spike.

@@ -45,3 +45,10 @@ test("Codex cancellation is reported rather than treated as success", async () =
 test("provider selection comes from the environment", () => {
   assert.deepEqual(sessionConfig({ OSTROM_CODEX_PROVIDER: "openai" }).codex.config, { model_provider: "openai" });
 });
+
+test("Claude login mode drops gateway and API-key variables", () => {
+  const env = { ANTHROPIC_AUTH_TOKEN: "t", ANTHROPIC_BASE_URL: "u", ANTHROPIC_API_KEY: "k", HOME: "/h" };
+  assert.deepEqual(sessionConfig({ ...env, OSTROM_CLAUDE_AUTH: "login" }).claudeEnv, { HOME: "/h", OSTROM_CLAUDE_AUTH: "login" });
+  assert.deepEqual(sessionConfig(env).claudeEnv, env);
+  assert.throws(() => sessionConfig({ OSTROM_CLAUDE_AUTH: "key" }), /env or login/);
+});
