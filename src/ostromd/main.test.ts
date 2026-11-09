@@ -97,7 +97,7 @@ test(
     const store = Store.open(dbPath);
     const source = store.ensureSource("github", github.repo);
     const thread = store.ensureThread({ sourceId: source.id, kind: "issue", number: 7, url: "u" });
-    store.enqueueReply({ id: "ack-1", threadId: thread, body: "On it." });
+    store.enqueueReply({ id: "ack-1", threadId: thread, body: "On it.", blocking: true });
     store.close();
     github.issue(7);
     github.failWhen = (args) => (args[2] === "POST" ? new Error("HTTP 502") : undefined);
