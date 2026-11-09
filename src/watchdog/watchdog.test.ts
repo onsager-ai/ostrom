@@ -104,6 +104,19 @@ test("Semon's idle verdicts need a turn that has itself been idle; a question co
   assert.equal((await watchdog(s.options())).checked[0]!.semonReason, "waiting-question");
 });
 
+test("Ostrom's own signal records a stall without a Semon reason", async () => {
+  const s = setup();
+  const a = s.startWorker(1);
+  s.store.recordTurnError(a.assignmentId, "boom");
+  s.store.recordTurnError(a.assignmentId, "boom");
+  s.setSemon([]);
+  const pass = await watchdog(s.options());
+  assert.deepEqual(pass.failed, []);
+  const stallId = pass.checked[0]!.stallId!;
+  assert.equal(s.store.getStall(stallId).semonReason, null);
+  assert.equal(s.store.getStall(stallId).cause, "same turn error twice");
+});
+
 test("an unreadable Semon read fails without clearing open episodes", async () => {
   const s = setup();
   const a = s.startWorker(1);
