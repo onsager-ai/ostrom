@@ -10,21 +10,23 @@ foreground sessions, such as T3 Code threads, on its own, and never clutters the
 workbench. People reach Ostrom in two ways only:
 
 - **GitHub**, where everyone else acts: issues, mentions, comments, reviews and PRs.
-- **The operator's foreground**, by deliberate choice: the `ostrom` CLI and a dashboard,
-  plus *promote to foreground* for a single session in T3.
+- **The operator's foreground**, by deliberate choice: the `ostrom` CLI and a dashboard.
+  Sessions themselves are read with Semon.
 
 ```
  GitHub (people act)          Ostrom (background)                   Operator (foreground)   
  ───────────────────          ─────────────────────────────         ────────────────────────
  issue / @mention   ───▶      intake › router › workers › outbox    `ostrom` CLI + dashboard
  comments, reviews  ◀───      store · subscriptions · watchdog ───▶ pause / stop a ticket
- Ostrom's replies, PRs        ticket 12 · codex · luna              promote a session ⇄
-                              ticket 15 · claude · haiku            (open in T3, hand back)
+ Ostrom's replies, PRs        ticket 12 · codex · luna              sessions read with Semon
+                              ticket 15 · claude · haiku
 ```
 
-**Promote to foreground.** Any Worker is a real Claude Code or Codex session with its own session
-or thread ID. The operator can open that session in T3, talk to it, and hand it back. Ostrom then
-carries on with the same session. Nothing appears in T3 unless the operator asks for it.
+**Native sessions, background or foreground.** Every Worker is a real Claude Code or Codex session
+with its own session or thread ID, so it is the same kind of session the operator runs in the
+foreground. The operator reads it with Semon. To talk to it, the operator runs `ostrom pause`, opens
+it (`claude --resume`, `codex resume`), and then runs `ostrom resume`, so one session never has two
+drivers. A dedicated "promote to foreground" feature is deferred (operator, 2026-11-09).
 
 ## Journey 1: someone on GitHub
 
@@ -81,8 +83,8 @@ specific, honest reply.
    crash, an exhausted budget, or an unanswered question.
 2. **Recover (silent).** Ostrom resumes the same session, then retries, then moves up one tier, with
    at most two attempts. The card shows "recovering".
-3. **Operator.** The stall appears in the operator's status view first. The operator can promote
-   the session to T3 and unblock it.
+3. **Operator.** The stall appears in the operator's status view first. The operator can pause
+   the ticket, open the session and unblock it.
 4. **Public.** Ostrom posts one stuck reply, labels the issue `ostrom:stuck` and sets the card to
    **Stuck**. There are no further pings until someone replies.
 
@@ -120,8 +122,8 @@ Background by default, no clutter.
 1. Work happens without any new T3 threads.
 2. The operator glances at one status view: what is running, what is stuck, and what it cost.
 3. The Watchdog flags a stalled Worker.
-4. The operator promotes that session into T3 and unblocks it.
-5. The operator hands it back, and Ostrom carries on.
+4. The operator reads the session with Semon, pauses the ticket, opens the session and unblocks it.
+5. The operator resumes the ticket, and Ostrom carries on with the same session.
 
 ### Status view: the `ostrom` CLI and a dashboard
 
@@ -132,15 +134,16 @@ line, in the style of `t3`. The CLI and a dashboard are two clients of one local
 | Command | Does |
 |---|---|
 | `ostrom status` | Machines, running Workers, stuck tickets, and spend today |
-| `ostrom tickets` / `ostrom show <ticket>` | List tickets, or show one: timeline, decisions, session, budget used |
+| `ostrom tickets` / `ostrom show <ticket>` | List tickets, or show one: timeline, decisions, budget used, and the session ID to read with Semon |
 | `ostrom pause` / `resume` / `stop <ticket>` | The same effects as the GitHub commands |
 | `ostrom extend <ticket> --time 1h --cost 2` | Raise a ticket's budget |
-| `ostrom promote <ticket>` / `ostrom handback <ticket>` | Open the Worker's own session in T3, then return it to the background |
 | `ostrom pin <ticket> <machine>` | Override where a ticket runs |
 | `ostrom preview` / `ostrom replay <trigger>` | Developer tools (see journey 3) |
 
 Every command takes `--json`. The dashboard is a local web page with the same views, plus an
-attention list: stuck tickets, near-budget tickets, and machines that are offline or running hot.
+attention list: stuck tickets, near-budget tickets, and machines that are offline or running hot. Ostrom has
+no log or transcript viewer of its own: sessions are read with Semon (`semon sessions --watch` or
+`--serve`, `semon query read_transcript <id>`), and the daemon's own logs go to journald.
 
 ### Budgets per ticket
 
@@ -193,7 +196,7 @@ complete. Each item below is something a person can see working.
 | The stuck ladder and the stuck template (operator step is `ostrom status`) | A grace window before the public stuck reply |
 | Budgets: time, idle time, turns and tokens; pause at a limit; `ostrom extend` | Cost estimates per provider |
 | `ostrom status`, `tickets`, `show`, `pause`/`resume`/`stop`, all with `--json` | The dashboard (milestone 2, on the same API) |
-| Native Claude and Codex sessions resumed by ID after an `ostromd` restart | `ostrom promote`/`handback` (milestone 2) |
+| Native Claude and Codex sessions resumed by ID after an `ostromd` restart | |
 | A `machine` field on every assignment, always this machine | The placement strategy across machines (milestone 3) |
 | `ostrom preview` and snapshot tests of everything posted | `ostrom replay` |
 
@@ -201,7 +204,7 @@ complete. Each item below is something a person can see working.
 
 | Experience | Requirement | Evidence so far |
 |---|---|---|
-| Promote a Worker to T3 | Workers are native Claude Code or Codex sessions with their own IDs | `@mastra/claude` and `@openai/codex-sdk` both returned resumable native IDs |
+| Open any Worker as a normal session | Workers are native Claude Code or Codex sessions with their own IDs | `@mastra/claude` and `@openai/codex-sdk` both returned resumable native IDs |
 | The same Worker answers follow-ups | Resume a session from a stored ID after a host crash | Passed between turns for both; mid-turn crash not tested |
 | A reviewer replies days later | Durable pause and resume | Mastra workflows passed across processes; real multi-day delay not tested |
 | The operator does not pick machines | A placement strategy with machine affinity | Designed above; no runs yet |
@@ -215,6 +218,4 @@ ticket state machine it already has. ACP is deprioritised: it is not widely adop
 needs Claude and Codex for now. The spike evidence is outside this repository, in
 `ostrom-spikes/mastra` and `ostrom-spikes/mastra-sdk` (`FINDINGS.md` in each).
 
-The runtime in `direction.md`, with the Router and Workers as T3 threads, does not meet the
-background principle. `direction.md` will be re-derived from this document once the open questions
-above have answers.
+`direction.md` is derived from this document.
