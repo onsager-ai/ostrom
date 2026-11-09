@@ -506,6 +506,24 @@ export class Store {
     if (Number(changes) !== 1) throw new IllegalTransition(`ticket ${ticketId}: ${this.getTicket(ticketId).state} → paused is not allowed`);
   }
 
+  /** Raises one or more ticket limits. A paused budget ticket resumes on its existing session. */
+  extendTicketBudget(ticketId: number, increases: { timeMinutes?: number; turns?: number; tokens?: number }): void {
+    if (Object.keys(increases).length === 0) throw new Error("at least one budget extension is required");
+    for (const [name, value] of Object.entries(increases)) {
+      if (!Number.isSafeInteger(value) || value! <= 0) throw new Error(`budget ${name} extension must be a positive whole number`);
+    }
+    const ticket = this.getTicket(ticketId);
+    if (ticket.state !== "open" && ticket.state !== "paused") {
+      throw new IllegalTransition(`ticket ${ticketId} is ${ticket.state}; it cannot be extended`);
+    }
+    this.#run(
+      `UPDATE ticket SET budget_time_minutes = budget_time_minutes + ?, budget_turns = budget_turns + ?,
+       budget_tokens = budget_tokens + ?, state = CASE WHEN pause_cause LIKE 'budget reached:%' THEN 'open' ELSE state END,
+       pause_cause = CASE WHEN pause_cause LIKE 'budget reached:%' THEN NULL ELSE pause_cause END WHERE id = ?`,
+      increases.timeMinutes ?? 0, increases.turns ?? 0, increases.tokens ?? 0, ticketId,
+    );
+  }
+
   /** Returns stored limits and usage accumulated from every assignment on this ticket. */
   ticketBudget(ticketId: number): TicketBudget {
     const row = this.#get(
