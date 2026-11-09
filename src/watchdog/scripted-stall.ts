@@ -1,6 +1,7 @@
 // The scripted stall (docs/direction.md, milestone 1 pass criterion) only seeds a throwaway store.
 // The already-running ostromd dispatches it normally, so it owns and can cancel the hung Worker
-// turn. After OSTROM_STALL_MINUTES the Watchdog flags the native session.
+// turn. The ticket takes its budget from the same environment as a Router-accepted one; a short
+// OSTROM_BUDGET_IDLE_MIN makes the Watchdog flag the hung turn (see docs/watchdog.md).
 //
 //   node src/watchdog/scripted-stall.ts <issue-number>
 //
@@ -8,6 +9,7 @@
 // where the stuck reply would go; nothing is posted unless the daemon's send pass runs on this
 // store, so never run a throwaway exercise against a live daemon store.
 
+import { loadBudgetDefaults, type BudgetDefaults } from "../budget/budgets.ts";
 import { loadConfig } from "../ostromd/config.ts";
 import { Store } from "../store/store.ts";
 
@@ -18,7 +20,7 @@ export const STALL_BRIEF = [
 ].join("\n");
 
 /** Seeds an accepted ticket for normal daemon dispatch; it never starts a Worker session itself. */
-export function seedScriptedStall(store: Store, repo: string, actor: string, issue: number): number {
+export function seedScriptedStall(store: Store, repo: string, actor: string, issue: number, budget?: BudgetDefaults): number {
   const source = store.ensureSource("github", repo);
   const url = `https://github.com/${repo}/issues/${issue}`;
   const threadId = store.ensureThread({ sourceId: source.id, kind: "issue", number: issue, url });
@@ -36,7 +38,7 @@ export function seedScriptedStall(store: Store, repo: string, actor: string, iss
     triggerIds: [trigger.id],
     verdict: "accept",
     reason: STALL_BRIEF,
-  });
+  }, budget);
   return ticketId!;
 }
 
@@ -44,7 +46,7 @@ async function scriptedStall(issue: number): Promise<void> {
   const config = loadConfig(process.env);
   const store = Store.open(config.dbPath);
   try {
-    const ticketId = seedScriptedStall(store, config.repo, config.allowlist[0]!, issue);
+    const ticketId = seedScriptedStall(store, config.repo, config.allowlist[0]!, issue, loadBudgetDefaults(process.env));
     process.stdout.write(`${JSON.stringify({ ticketId })}\n`);
   } finally {
     store.close();
