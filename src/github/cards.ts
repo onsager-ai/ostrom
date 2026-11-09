@@ -19,12 +19,14 @@ export function queueStatusCard(store: Store, ticketId: number, now = new Date()
             assignment.outcome === "failed" ? "stuck" : "working";
   const budget = store.ticketBudget(ticketId);
   const warning = budgetWarning(budget, now);
+  const pullRequest = store.ticketPullRequest(ticketId);
   const lastActivityAt = new Date(assignment.lastActivityAt ?? assignment.outcomeAt ?? assignment.startedAt ?? assignment.createdAt);
   store.enqueueStatusCard(
     context.thread.id,
     renderStatusCard({
       state,
       ...(assignment.endReason === "issue closed" ? { stoppedReason: "issue closed" as const } : {}),
+      ...(pullRequest === null ? {} : { pullRequest: pullRequest.url }),
       ...(warning === null ? {} : { budgetWarning: warning }),
       ...(ticket.pauseCause === null ? {} : { pauseCause: ticket.pauseCause }),
       harness: assignment.harness,

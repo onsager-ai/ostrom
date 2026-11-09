@@ -89,6 +89,16 @@ test("observe subscribes the ticket to the Worker's PRs, once across passes", as
   assert.deepEqual(second.observed[0]?.newlySubscribed, []);
 });
 
+test("a newly observed PR refreshes the status card with its link", async () => {
+  const { store, github, ticketId, worker } = fixture();
+  const id = worker("sess-1");
+  github.pulls.push({ branch: `ostrom/ticket-${ticketId}-${id}`, number: 12, state: "open" });
+  await observe(store, github.gh, REPO);
+  const cards = store.operatorTicket(ticketId).outbox.filter((reply) => reply.id.startsWith("card-thread-"));
+  assert.equal(cards.length, 1);
+  assert.match(cards[0]!.body, /^PR: https:\/\/github\.com\/onsager-ai\/ostrom\/pull\/12$/m);
+});
+
 test("observe reports the outcome the Worker's turns recorded and leaves it alone", async () => {
   const { store, github, worker } = fixture();
   const id = worker("sess-1");

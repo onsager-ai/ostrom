@@ -815,6 +815,16 @@ export class Store {
     return { duplicate: Number(changes) === 0 };
   }
 
+  /** The newest pull request subscribed to the ticket, for the status card's PR link. */
+  ticketPullRequest(ticketId: number): Thread | null {
+    const row = this.#get(
+      `SELECT thread.id FROM subscription JOIN thread ON thread.id = subscription.thread_id
+       WHERE subscription.ticket_id = ? AND thread.kind = 'pull_request' ORDER BY thread.number DESC LIMIT 1`,
+      ticketId,
+    );
+    return row === undefined ? null : this.getThread(row["id"] as number);
+  }
+
   /** Removes subscriptions after a PR attempt closes, so later issue discussion asks the Router again. */
   unsubscribeTicket(ticketId: number): void {
     this.#run("DELETE FROM subscription WHERE ticket_id = ?", ticketId);

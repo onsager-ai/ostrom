@@ -2,6 +2,7 @@
 // `workers.ts`; here a running Worker is followed through GitHub until its PR exists. Everything
 // here is deterministic; no model call is made by Ostrom itself.
 
+import { queueStatusCard } from "../github/cards.ts";
 import { ghGet, type GhRunner } from "../github/gh.ts";
 import type { AssignmentOutcome, Store, TicketContext } from "../store/store.ts";
 
@@ -96,6 +97,8 @@ export async function observe(store: Store, gh: GhRunner, repo: string): Promise
       const threadId = store.ensureThread({ sourceId: source.id, kind: "pull_request", number: pr.number, url: pr.url });
       if (!store.subscribe(assignment.ticketId, threadId).duplicate) newlySubscribed.push(pr.number);
     }
+    // The card links the PR, so a new one refreshes it.
+    if (newlySubscribed.length > 0) queueStatusCard(store, assignment.ticketId);
     pass.observed.push({
       assignmentId: assignment.id,
       sessionId: assignment.sessionId,
