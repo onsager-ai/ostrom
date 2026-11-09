@@ -29,7 +29,11 @@ function fixture() {
   const issue = thread("issue", 7);
   const pr = thread("pull_request", 12);
   let events = 0;
-  const trigger = (threadId: number, kind = "issue_comment") =>
+  const trigger = (
+    threadId: number,
+    kind = "issue_comment",
+    extra: Partial<{ reviewId: string; body: string; path: string; line: number }> = {},
+  ) =>
     store.insertTrigger({
       sourceId: source.id,
       sourceEventId: `E_${++events}`,
@@ -38,6 +42,7 @@ function fixture() {
       actor: "alice",
       url: `${store.getThread(threadId).url}#event-${events}`,
       occurredAt: new Date(Date.UTC(2026, 10, 9, 11, events)),
+      ...extra,
     }).id;
   const accept = (threadId: number) =>
     store.recordDecision({ threadId, triggerIds: [trigger(threadId)], verdict: "accept", reason: "asks for work" })
@@ -74,6 +79,37 @@ test("a review on a subscribed PR goes to the ticket's Worker session, with no d
   assert.deepEqual(store.pendingDeliveries(), []);
   assert.deepEqual(store.undecidedTriggers(), [], "a delivered trigger never reaches the Router");
   assert.equal(store.getAssignment(assignmentId).turns, 1);
+});
+
+test("a review with three inline comments gets one Worker turn, one reply, and receipt reactions", async () => {
+  const { store, runner, workers, pr, trigger, ticketId, assignmentId } = fixture();
+  const review = trigger(pr, "pull_request_review", { reviewId: "44", body: "Please make these changes." });
+  const comments = [
+    trigger(pr, "pull_request_review_comment", { reviewId: "44", body: "Rename this.", path: "src/a.ts", line: 12 }),
+    trigger(pr, "pull_request_review_comment", { reviewId: "44", body: "Handle null.", path: "src/b.ts", line: 31 }),
+    trigger(pr, "pull_request_review_comment", { reviewId: "44", body: "Add coverage.", path: "src/c.ts", line: 8 }),
+  ];
+  runner.sessions[0]!.reply = () => "Thanks — I made the requested changes.";
+
+  const pass = routeFollowUps(store, workers);
+  assert.deepEqual(pass, { queued: [{ triggerId: review, ticketId, assignmentId }], failed: [] });
+  await workers.drain();
+
+  const [prompt] = runner.sessions[0]!.prompts;
+  assert.match(prompt!, /Review body:\nPlease make these changes\./);
+  assert.match(prompt!, /1\. src\/a\.ts:12\nRename this\./);
+  assert.match(prompt!, /2\. src\/b\.ts:31\nHandle null\./);
+  assert.match(prompt!, /3\. src\/c\.ts:8\nAdd coverage\./);
+  assert.equal(runner.sessions[0]!.prompts.length, 1);
+  assert.deepEqual(store.pendingDeliveries(), []);
+  assert.deepEqual(
+    store.dueReplies().filter((reply) => reply.kind === "comment").map((reply) => [reply.id, reply.body]),
+    [["review-1-44", "Thanks — I made the requested changes."]],
+  );
+  assert.deepEqual(
+    store.dueReplies().filter((reply) => reply.kind === "reaction").map((reply) => reply.id).sort(),
+    comments.map((id) => `received-${id}`).sort(),
+  );
 });
 
 test("the follow-up is a summary plus a pointer to the trigger", () => {

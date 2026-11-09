@@ -56,13 +56,16 @@ export class FakeGitHub {
     return item;
   }
 
-  reviewComment(pr: number, input: CommentInput): Item {
+  reviewComment(pr: number, input: CommentInput & { reviewId?: number; path?: string; line?: number }): Item {
     const id = ++this.#ids;
     const item: Item = {
       id,
       node_id: `PRRC_${id}`,
       html_url: `${this.#threadUrl(pr, true)}#discussion_r${id}`,
       pull_request_url: `https://api.github.com/repos/${this.repo}/pulls/${pr}`,
+      pull_request_review_id: input.reviewId ?? id,
+      ...(input.path === undefined ? {} : { path: input.path }),
+      ...(input.line === undefined ? {} : { line: input.line }),
       ...this.#common(input),
     };
     this.reviewComments.push(item);

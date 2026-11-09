@@ -92,13 +92,19 @@ export class Workers {
    * the turn's id; that is when the caller records delivery, so a message lost with the queue in a
    * crash is sent again. Returns false when the same key is already queued.
    */
-  deliver(assignmentId: number, key: string, prompt: string, onStart: (turnId: string) => void): boolean {
+  deliver(
+    assignmentId: number,
+    key: string,
+    prompt: string,
+    onStart: (turnId: string) => void,
+    onComplete?: (result: TurnResult) => void,
+  ): boolean {
     if (this.#queued.has(key)) return false;
     this.#queued.add(key);
     void this.#enqueue(assignmentId, () => this.#turn(assignmentId, prompt, (turnId) => {
       onStart(turnId);
       this.#queued.delete(key);
-    })).finally(() => this.#queued.delete(key));
+    }, onComplete)).finally(() => this.#queued.delete(key));
     return true;
   }
 
@@ -169,7 +175,12 @@ export class Workers {
     this.#finished(id, result);
   }
 
-  async #turn(id: number, prompt: string, onStart?: (turnId: string) => void): Promise<void> {
+  async #turn(
+    id: number,
+    prompt: string,
+    onStart?: (turnId: string) => void,
+    onComplete?: (result: TurnResult) => void,
+  ): Promise<void> {
     const { store } = this.#deps;
     const assignment = store.getAssignment(id);
     if (assignment.state !== "running") return;
@@ -184,6 +195,7 @@ export class Workers {
       return;
     }
     this.#finished(id, result);
+    if (result.status === "completed") onComplete?.(result);
   }
 
   #failed(id: number, error: unknown): void {

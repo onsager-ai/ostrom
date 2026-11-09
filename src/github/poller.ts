@@ -27,6 +27,10 @@ export interface GitHubEvent {
   actor: string;
   body: string;
   occurredAt: Date;
+  /** GitHub numeric review id that groups inline comments with their submitted review. */
+  reviewId?: string;
+  path?: string;
+  line?: number;
 }
 
 /** A stored trigger the Router has not seen yet. The body is carried, not stored. */
@@ -136,6 +140,10 @@ export async function pollOnce(options: PollOptions): Promise<PollResult> {
       actor: event.actor,
       url: event.url,
       occurredAt: event.occurredAt,
+      reviewId: event.reviewId,
+      body: event.body,
+      path: event.path,
+      line: event.line,
     });
     if (inserted.duplicate) {
       result.duplicates++;
@@ -260,6 +268,8 @@ function issueCommentEvent(item: Item): GitHubEvent {
 
 function reviewCommentEvent(item: Item): GitHubEvent {
   const url = field(item, "html_url", "string");
+  const reviewId = item["pull_request_review_id"];
+  if (typeof reviewId !== "number") throw new Error("GitHub review comment is missing pull_request_review_id");
   return {
     id: field(item, "node_id", "string"),
     kind: "pull_request_review_comment",
@@ -270,6 +280,9 @@ function reviewCommentEvent(item: Item): GitHubEvent {
     actor: login(item),
     body: bodyOf(item),
     occurredAt: new Date(field(item, "created_at", "string")),
+    reviewId: String(reviewId),
+    ...(typeof item["path"] === "string" ? { path: item["path"] } : {}),
+    ...(typeof item["line"] === "number" ? { line: item["line"] } : {}),
   };
 }
 
@@ -294,6 +307,7 @@ function reviewEvent(item: Item, pr: number): GitHubEvent | null {
     actor: login(item),
     body,
     occurredAt: new Date(field(item, "submitted_at", "string")),
+    reviewId: String(field(item, "id", "number")),
   };
 }
 

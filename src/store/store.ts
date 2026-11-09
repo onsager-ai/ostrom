@@ -40,6 +40,10 @@ export interface NewTrigger {
   actor: string;
   url: string;
   occurredAt: Date;
+  reviewId?: string;
+  body?: string;
+  path?: string;
+  line?: number;
 }
 
 /** A stored trigger. Timestamps are ISO strings as stored. */
@@ -53,6 +57,10 @@ export interface Trigger {
   url: string;
   occurredAt: string;
   receivedAt: string;
+  reviewId?: string;
+  body?: string;
+  path?: string;
+  line?: number;
 }
 
 /**
@@ -288,8 +296,8 @@ export class Store {
   insertTrigger(trigger: NewTrigger): Inserted {
     const inserted = this.#get(
       `INSERT INTO "trigger"
-         (source_id, source_event_id, thread_id, kind, actor, url, occurred_at, received_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         (source_id, source_event_id, thread_id, kind, actor, url, occurred_at, received_at, review_id, body, path, line)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (source_id, source_event_id) DO NOTHING
        RETURNING id`,
       trigger.sourceId,
@@ -300,6 +308,10 @@ export class Store {
       trigger.url,
       trigger.occurredAt.toISOString(),
       this.#stamp(),
+      trigger.reviewId ?? null,
+      trigger.body ?? null,
+      trigger.path ?? null,
+      trigger.line ?? null,
     );
     if (inserted !== undefined) return { id: inserted["id"] as number, duplicate: false };
     const existing = this.#get(
@@ -628,6 +640,13 @@ export class Store {
     return { duplicate: Number(changes) === 0 };
   }
 
+  /** Records a grouped review delivery atomically, so a replay never splits it into more turns. */
+  recordReviewDelivery(triggerIds: readonly number[], assignmentId: number, turnId: string): void {
+    this.#transaction(() => {
+      for (const triggerId of triggerIds) this.recordDelivery(triggerId, assignmentId, turnId);
+    });
+  }
+
   // --- stalls -------------------------------------------------------------------------------
 
   /**
@@ -924,6 +943,10 @@ function toTrigger(row: Row): Trigger {
     url: row["url"] as string,
     occurredAt: row["occurred_at"] as string,
     receivedAt: row["received_at"] as string,
+    reviewId: row["review_id"] as string | null,
+    body: row["body"] as string | null,
+    path: row["path"] as string | null,
+    line: row["line"] as number | null,
   };
 }
 

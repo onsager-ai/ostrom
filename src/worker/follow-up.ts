@@ -1,12 +1,8 @@
-// Thread subscription (docs/direction.md, milestone 1 step 4): a new trigger on a thread that an
-// open ticket is subscribed to goes straight to that ticket's Worker, with no decision and without
-// reaching the Router. Delivery is a resumed turn on the Worker's session, queued behind any turn
-// that is running. Everything here is deterministic.
-//
-// A trigger whose subscribed tickets have all ended is not delivered: it stays undecided and goes
-// to the Router (`Store.undecidedTriggers`), because whether a message on finished work asks for
-// more work is an accept/ignore judgement, not a routing step (AGENTS.md rule 3).
+// Thread subscription: a new trigger on a subscribed thread goes straight to its Worker's
+// session. A submitted review and all of its inline comments are one logical follow-up: one turn,
+// one acknowledgement reaction, and one summary reply after the Worker completes.
 
+import { renderReviewReply } from "../github/review-reply.ts";
 import type { Store, Thread, Trigger } from "../store/store.ts";
 import type { Workers } from "./workers.ts";
 
@@ -17,34 +13,68 @@ export interface Delivered {
 }
 
 export interface RoutePass {
-  /** Follow-ups queued on a Worker's session this pass; each is recorded when its turn starts. */
   queued: Delivered[];
-  /** Follow-ups not queued this pass; each is tried again on the next one. */
   failed: { triggerId: number; ticketId: number; error: string }[];
 }
 
-/**
- * One pass over the follow-ups owed to Workers. Each is queued behind the session's running turn
- * and recorded only when its turn starts, so a follow-up lost with the queue in a crash is sent
- * again, one already queued is not queued twice, and a replayed pass delivers nothing twice.
- */
 export function routeFollowUps(store: Store, workers: Workers): RoutePass {
   const pass: RoutePass = { queued: [], failed: [] };
-  for (const pending of store.pendingDeliveries()) {
-    const { trigger, ticketId, assignmentId } = pending;
+  const pending = store.pendingDeliveries();
+  const grouped = new Set<string>();
+  for (const delivery of pending) {
+    const { trigger, ticketId, assignmentId } = delivery;
     if (assignmentId === null) {
       pass.failed.push({ triggerId: trigger.id, ticketId, error: `ticket ${ticketId} has no running Worker` });
+      continue;
+    }
+    if (trigger.reviewId !== null) {
+      const key = `${ticketId}:${assignmentId}:${trigger.reviewId}`;
+      if (grouped.has(key)) continue;
+      grouped.add(key);
+      const review = pending.filter((item) =>
+        item.ticketId === ticketId && item.assignmentId === assignmentId && item.trigger.reviewId === trigger.reviewId,
+      );
+      const added = workers.deliver(
+        assignmentId,
+        `review-${key}`,
+        reviewFollowUpMessage(ticketId, store.getThread(trigger.threadId), review.map((item) => item.trigger)),
+        (turnId) => {
+          store.recordReviewDelivery(review.map((item) => item.trigger.id), assignmentId, turnId);
+          for (const item of review) enqueueReceivedReaction(store, item.trigger);
+        },
+        (result) => store.enqueueReply({
+          id: `review-${assignmentId}-${trigger.reviewId}`,
+          threadId: trigger.threadId,
+          body: renderReviewReply(result.text),
+        }),
+      );
+      if (added) pass.queued.push({ triggerId: trigger.id, ticketId, assignmentId });
       continue;
     }
     const added = workers.deliver(
       assignmentId,
       `${trigger.id}:${assignmentId}`,
       followUpMessage(ticketId, trigger, store.getThread(trigger.threadId)),
-      (turnId) => store.recordDelivery(trigger.id, assignmentId, turnId),
+      (turnId) => {
+        store.recordDelivery(trigger.id, assignmentId, turnId);
+        enqueueReceivedReaction(store, trigger);
+      },
     );
     if (added) pass.queued.push({ triggerId: trigger.id, ticketId, assignmentId });
   }
   return pass;
+}
+
+function enqueueReceivedReaction(store: Store, trigger: Trigger): void {
+  if (trigger.kind === "pull_request_review") return;
+  store.enqueueReply({
+    id: `received-${trigger.id}`,
+    threadId: trigger.threadId,
+    body: "",
+    kind: "reaction",
+    target: trigger.url,
+    reaction: "eyes",
+  });
 }
 
 const KIND_NOUNS: Record<string, string> = {
@@ -53,10 +83,7 @@ const KIND_NOUNS: Record<string, string> = {
   pull_request_review: "review",
 };
 
-/**
- * The follow-up a Worker receives: a summary plus a pointer ("Inline & Spill"). It never copies
- * the comment body; the Worker reads it with `gh`.
- */
+/** A non-review follow-up remains a summary and pointer rather than duplicating GitHub content. */
 export function followUpMessage(ticketId: number, trigger: Trigger, thread: Thread): string {
   const noun = KIND_NOUNS[trigger.kind] ?? trigger.kind;
   const on = thread.kind === "issue" ? "issue" : "pull request";
@@ -68,4 +95,26 @@ export function followUpMessage(ticketId: number, trigger: Trigger, thread: Thre
     "to the branch of your existing pull request; do not open a new one. Do not comment on GitHub",
     "yourself: Ostrom replies to people.",
   ].join("\n");
+}
+
+/** The complete submitted review is one Worker turn, with every inline comment and its location. */
+export function reviewFollowUpMessage(ticketId: number, thread: Thread, triggers: readonly Trigger[]): string {
+  const review = triggers.find((trigger) => trigger.kind === "pull_request_review") ?? triggers[0]!;
+  const comments = triggers.filter((trigger) => trigger.kind === "pull_request_review_comment");
+  const lines = [
+    `Review follow-up for Ostrom ticket ${ticketId} on pull request #${thread.number}: ${review.url}`,
+    `Reviewer: @${review.actor}`,
+    "",
+    "Review body:",
+    review.kind === "pull_request_review" ? (review.body ?? "") : "(no review body)",
+    "",
+    "Inline comments:",
+    ...comments.flatMap((comment, index) => [
+      `${index + 1}. ${comment.path ?? "unknown path"}:${comment.line ?? "unknown line"}`,
+      comment.body ?? "",
+    ]),
+    "",
+    "Address the review. Ostrom will post one summary reply using your final answer; do not comment on GitHub yourself.",
+  ];
+  return lines.join("\n");
 }

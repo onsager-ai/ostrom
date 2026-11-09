@@ -45,7 +45,7 @@ export async function sendDueReplies(options: SendOptions): Promise<SendResult> 
       await sendOne(reply, options, result);
       continue;
     }
-    if (reply.id === `card-thread-${reply.threadId}`) {
+    if (reply.id === `card-thread-${reply.threadId}` || reply.id.startsWith("review-")) {
       await postCommentBatch([reply], options, result);
       continue;
     }
