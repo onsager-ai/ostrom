@@ -4,7 +4,8 @@ import { test } from "node:test";
 
 import { parseRunResult, parseThreadShow, T3OutputError } from "./cli-json.ts";
 
-// Real captures from the first paid run (2026-11-09, claude-haiku-5-5, t3 v0.1.7).
+// Real captures from the first paid run (2026-11-09, claude-haiku-5-5, t3 v0.1.7). show.json is
+// redacted: the home directory in worktreePath and the app.t3.codes link are placeholders.
 const fixture = (name: string) => readFileSync(new URL(`./fixtures/${name}`, import.meta.url), "utf8");
 const threadId = "mcp:bde2f85c-59db-4aa8-9c6a-17b3791c4eee";
 const run = (ordinal: number) => `run:thread:mcp%3Abde2f85c-59db-4aa8-9c6a-17b3791c4eee:ordinal:${ordinal}`;
@@ -38,7 +39,7 @@ test("reads `thread show --json`", () => {
     settled: false,
     pendingRequestCount: 0,
     branch: "spike/t3-start",
-    worktreePath: "/home/marvin/.t3/worktrees/ostrom/spike-t3-start",
+    worktreePath: "/home/user/.t3/worktrees/ostrom/spike-t3-start",
     linkedPullRequest: null,
     pullRequests: [],
   });

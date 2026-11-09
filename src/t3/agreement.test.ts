@@ -64,10 +64,15 @@ const printed = async (schema: Schema.Constraint): Promise<any[]> => {
   return values.map((value) => JSON.parse(JSON.stringify(value)));
 };
 
-test("the vendored upstream tree is the pinned commit and CLI version", () => {
-  assert.match(vendored("SOURCE.md"), new RegExp(`^- Commit: ${T3_PIN.commit}$`, "m"));
-  assert.match(vendored("SOURCE.md"), new RegExp(`^- Repository: https://github.com/${T3_PIN.repository}$`, "m"));
-  assert.equal(JSON.parse(vendored("packages/contracts/package.json")).version, T3_PIN.cliVersion);
+// The vendor script resolves the release tag to its commit against upstream and records both.
+// Upstream's package.json files are not evidence of the release version: at the v0.1.7 tag they
+// still read 0.1.6, because the release build stamps the version.
+test("the vendored upstream tree is the pinned release tag and its commit", () => {
+  const source = vendored("SOURCE.md");
+  assert.equal(T3_PIN.releaseTag, `v${T3_PIN.cliVersion}`);
+  assert.match(source, new RegExp(`^- Repository: https://github.com/${T3_PIN.repository}$`, "m"));
+  assert.match(source, new RegExp(`^- Tag: ${T3_PIN.releaseTag.replaceAll(".", "\\.")}$`, "m"));
+  assert.match(source, new RegExp(`^- Commit: ${T3_PIN.commit}$`, "m"));
 });
 
 test("the CLI still builds its --json output the way the schemas above assume", () => {

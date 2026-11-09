@@ -122,9 +122,10 @@ and the prototype. CI runs the tests; nothing is built or tested locally on the 
 5. **Router recovery.** If the Router thread's context fills up or the thread dies, a new Router has
    to be started from store state. Decide whether that is a Watchdog job.
 6. **T3 version drift.** The WS contract is T3's internal one. Decide where the pin and the agreement
-   test against `@t3tools/contracts` live. Settled for the CLI surface: the pin is `src/t3/pin.ts`,
-   the upstream schemas are vendored under `vendor/t3code`, and `src/t3/agreement.test.ts` checks
-   the parsers against them. The WS contract gets the same treatment when Ostrom first uses it.
+   test against `@t3tools/contracts` live. Settled for the CLI surface: the pin is `src/t3/pin.ts`
+   (`t3` v0.1.7, release tag commit `322f6544df`), the upstream schemas are vendored under
+   `vendor/t3code`, and `src/t3/agreement.test.ts` checks the parsers against them. The WS
+   contract gets the same treatment when Ostrom first uses it.
 7. **Semon readiness.** Today Semon exposes `list_sessions`, `get_session`, `read_transcript` and
    `stalls`. SQL/FTS is step 4 of Semon's ASI plan. Milestone 1 should need only `stalls` and
    `read_transcript`.

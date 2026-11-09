@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
-# Copy the upstream T3 Code files the agreement test reads, verbatim, at one commit.
-# Usage: scripts/vendor-t3code.sh <full-commit-sha>
-# Afterwards, set the same commit in src/t3/pin.ts and let CI run the agreement test.
+# Copy the upstream T3 Code files the agreement test reads, verbatim, at the commit a release
+# tag points to. Pin the tag of the installed `t3` binary (`t3 --version`), not a branch tip.
+# Usage: scripts/vendor-t3code.sh <release-tag, e.g. v0.1.7>
+# Afterwards, set the same tag and commit in src/t3/pin.ts and let CI run the agreement test.
 set -euo pipefail
 
-rev="${1:?usage: scripts/vendor-t3code.sh <full-commit-sha>}"
-[[ "$rev" =~ ^[0-9a-f]{40}$ ]] || { echo "expected a full 40-character commit sha" >&2; exit 1; }
-
+tag="${1:?usage: scripts/vendor-t3code.sh <release-tag>}"
 repo="pingdotgg/t3code"
+
+# An annotated tag lists its commit as <tag>^{}; a lightweight tag lists it directly.
+refs="$(git ls-remote "https://github.com/$repo.git" "refs/tags/$tag" "refs/tags/$tag^{}")"
+rev="$(awk -v peeled="refs/tags/$tag^{}" '$2 == peeled { print $1 }' <<<"$refs")"
+[[ -n "$rev" ]] || rev="$(awk -v ref="refs/tags/$tag" '$2 == ref { print $1 }' <<<"$refs")"
+[[ "$rev" =~ ^[0-9a-f]{40}$ ]] || { echo "tag $tag not found in $repo" >&2; exit 1; }
+
 root="$(cd "$(dirname "$0")/.." && pwd)"
 dest="$root/vendor/t3code"
 
@@ -16,12 +22,11 @@ dest="$root/vendor/t3code"
 files=(
   LICENSE
   apps/server/src/cli/thread.ts
-  packages/contracts/package.json
 )
 for name in auth baseSchemas chatAttachment checkpointDiff composerContext environment guestShare \
   model modelSelection orchestrationProject orchestrationV2 orchestrationV2IdTable orchestratorMcp \
   project providerInstance providerPolicy providerRuntime pullRequest scheduledTask secretReference \
-  secretRequest sourceControl threadMetadataMcp threadPullRequest threadSearch threadTags \
+  sourceControl threadMetadataMcp threadPullRequest threadSearch threadTags \
   threadTitle vcs; do
   files+=("packages/contracts/src/$name.ts")
 done
@@ -38,6 +43,7 @@ done
   echo "Copied verbatim by \`scripts/vendor-t3code.sh\`. Do not edit; re-run the script to re-pin."
   echo
   echo "- Repository: https://github.com/$repo"
+  echo "- Tag: $tag"
   echo "- Commit: $rev"
   echo "- Tree: https://github.com/$repo/tree/$rev"
   echo

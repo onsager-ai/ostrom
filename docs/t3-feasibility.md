@@ -2,6 +2,8 @@
 
 Checked 2026-11-09 against the installed `t3` v0.1.7 (runtime `~/.t3/runtime/versions/0.1.7`,
 database migration 79) and the public source at `pingdotgg/t3code` `main` @ `d0f1f7200d`.
+That commit is 419 commits past the `v0.1.7` release tag (`322f6544df`), which is the source the
+installed binary was built from and the one Ostrom pins (`src/t3/pin.ts`).
 
 **Verdict: yes.** A plain process with no agent session can create T3 Code threads, send them
 messages, stop them, and read their state. The daemon therefore can drive Workers itself; the Router
