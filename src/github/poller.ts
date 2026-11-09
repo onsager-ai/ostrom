@@ -140,10 +140,10 @@ export async function pollOnce(options: PollOptions): Promise<PollResult> {
       actor: event.actor,
       url: event.url,
       occurredAt: event.occurredAt,
-      reviewId: event.reviewId,
+      ...(event.reviewId === undefined ? {} : { reviewId: event.reviewId }),
       body: event.body,
-      path: event.path,
-      line: event.line,
+      ...(event.path === undefined ? {} : { path: event.path }),
+      ...(event.line === undefined ? {} : { line: event.line }),
     });
     if (inserted.duplicate) {
       result.duplicates++;

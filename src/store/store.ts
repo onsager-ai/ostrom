@@ -943,10 +943,10 @@ function toTrigger(row: Row): Trigger {
     url: row["url"] as string,
     occurredAt: row["occurred_at"] as string,
     receivedAt: row["received_at"] as string,
-    reviewId: row["review_id"] as string | null,
-    body: row["body"] as string | null,
-    path: row["path"] as string | null,
-    line: row["line"] as number | null,
+    ...(row["review_id"] === null ? {} : { reviewId: row["review_id"] as string }),
+    ...(row["body"] === null ? {} : { body: row["body"] as string }),
+    ...(row["path"] === null ? {} : { path: row["path"] as string }),
+    ...(row["line"] === null ? {} : { line: row["line"] as number }),
   };
 }
 

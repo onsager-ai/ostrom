@@ -27,7 +27,7 @@ export function routeFollowUps(store: Store, workers: Workers): RoutePass {
       pass.failed.push({ triggerId: trigger.id, ticketId, error: `ticket ${ticketId} has no running Worker` });
       continue;
     }
-    if (trigger.reviewId !== null) {
+    if (trigger.reviewId !== undefined) {
       const key = `${ticketId}:${assignmentId}:${trigger.reviewId}`;
       if (grouped.has(key)) continue;
       grouped.add(key);
