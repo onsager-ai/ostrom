@@ -83,6 +83,7 @@ test("a review on a subscribed PR goes to the ticket's Worker session, with no d
 
 test("a review with three inline comments gets one Worker turn, one reply, and receipt reactions", async () => {
   const { store, runner, workers, pr, trigger, ticketId, assignmentId } = fixture();
+  runner.hold = true;
   const review = trigger(pr, "pull_request_review", { reviewId: "44", body: "Please make these changes." });
   const comments = [
     trigger(pr, "pull_request_review_comment", { reviewId: "44", body: "Rename this.", path: "src/a.ts", line: 12 }),
@@ -90,8 +91,10 @@ test("a review with three inline comments gets one Worker turn, one reply, and r
     trigger(pr, "pull_request_review_comment", { reviewId: "44", body: "Add coverage.", path: "src/c.ts", line: 8 }),
   ];
   const pass = routeFollowUps(store, workers);
-  runner.sessions[0]!.reply = () => "Thanks — I made the requested changes.";
   assert.deepEqual(pass, { queued: [{ triggerId: review, ticketId, assignmentId }], failed: [] });
+  await tick();
+  runner.sessions[0]!.reply = () => "Thanks — I made the requested changes.";
+  runner.sessions[0]!.release();
   await workers.drain();
 
   const [prompt] = runner.sessions[0]!.prompts;
