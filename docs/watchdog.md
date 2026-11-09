@@ -20,15 +20,23 @@ A stall opens one `stall` row and remains one episode until Semon no longer repo
 
 ## Scripted stall
 
-Use a throwaway database and never run `ostromd send` against it.
+Semon currently reports a completed Codex exec turn as `ended`, not `waiting-question`, even when
+its last Worker message says it is waiting for an answer. The exercise therefore hangs an *open*
+turn with no output (`sleep 3600`), which Semon reports as `no-output`; the Watchdog counts that
+only after the turn itself has run for `OSTROM_STALL_MINUTES`.
+
+Use a throwaway database. Start `ostromd run` against that store first, with a small stall threshold;
+the script only seeds an accepted decision. The daemon dispatches the ticket in its normal
+`route-candidates` pass and owns the turn it later cancels. Its public stuck reply is queued in the
+outbox and posts to the supplied issue when the daemon reaches its `send` pass.
 
 ```sh
 export OSTROM_REPO=onsager-ai/ostrom OSTROM_ALLOWLIST=<login> OSTROM_DB=/tmp/ostrom-stall/ostrom.sqlite
 export OSTROM_WORKER_REPO=<main-checkout> OSTROM_WORKER_BASE=main OSTROM_STALL_MINUTES=2
+node src/ostromd/main.ts run --interval 15
+# in another terminal, with the same environment:
 node src/watchdog/scripted-stall.ts <issue-number>
-# wait OSTROM_STALL_MINUTES
-node src/ostromd/main.ts watchdog
-node src/ostromd/main.ts route-candidates
 ```
 
-The script starts a Codex `gpt-6-luna` session in a scratch Git worktree on `ostrom/ticket-<t>-<a>` and asks one question. It prints the ticket, assignment, native session ID, branch and worktree. Remove that worktree and branch after the exercise.
+The seeded Worker brief runs `sleep 3600`, then asks which colour to use, red or blue. Stop the
+daemon and remove its scratch worktree and branch after the exercise.

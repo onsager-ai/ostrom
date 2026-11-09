@@ -1,7 +1,40 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { afterEach, test } from "node:test";
 
-import { parseStuckReply, renderStuckReply } from "./stuck.ts";
+import { Store } from "../store/store.ts";
+import { FakeRunner } from "../worker/fake-runner.ts";
+import { Workers } from "../worker/workers.ts";
+import { routeFollowUps } from "../worker/follow-up.ts";
+import { advanceStuckLadder, parseStuckReply, renderStuckReply } from "./stuck.ts";
+
+const REPO = "onsager-ai/ostrom";
+const stores: Store[] = [];
+
+afterEach(() => {
+  while (stores.length > 0) stores.pop()!.close();
+});
+
+function fixture() {
+  const now = new Date("2026-11-09T12:00:00.000Z");
+  const store = Store.open(":memory:", { now: () => now });
+  stores.push(store);
+  const source = store.ensureSource("github", REPO);
+  const threadId = store.ensureThread({ sourceId: source.id, kind: "issue", number: 7, url: `https://github.com/${REPO}/issues/7` });
+  const trigger = store.insertTrigger({
+    sourceId: source.id, sourceEventId: "accepted", threadId, kind: "issue_comment", actor: "alice",
+    url: `https://github.com/${REPO}/issues/7#issuecomment-1`, occurredAt: now,
+  });
+  const ticketId = store.recordDecision({ threadId, triggerIds: [trigger.id], verdict: "accept", reason: "work" }).ticketId!;
+  const runner = new FakeRunner();
+  runner.hold = true;
+  const workers = new Workers({
+    store,
+    config: { repo: "/repo", base: "main", worktrees: "/wt", harness: "codex", model: "gpt-6-luna", machine: "host" },
+    runners: { claude: runner, codex: runner },
+    addWorktree: async () => "branch",
+  });
+  return { store, runner, workers, ticketId, threadId };
+}
 
 test("stuck reply snapshot", () => {
   assert.equal(
@@ -27,4 +60,62 @@ test("malformed Worker reply gets a complete, honest fallback", () => {
     choices: "1. provide the missing decision\n2. stop this ticket",
     workSoFar: "The Worker was asked to push its work in progress before this message.",
   });
+});
+
+test("three stall episodes on one Worker recover twice, then queue its public stuck reply", async () => {
+  const { store, runner, workers, ticketId } = fixture();
+  await workers.dispatch(ticketId);
+  const assignmentId = 1;
+  const session = runner.sessions[0]!;
+
+  const first = store.recordStall({ assignmentId, semonReason: "no-output", detail: null, cause: "no-output" }).id;
+  const recoveryOne = await advanceStuckLadder(store, workers);
+  session.auto = true;
+  await workers.drain();
+  assert.deepEqual(recoveryOne, { recovered: [first], published: [] });
+  assert.match(session.prompts.at(-1)!, /detected that this ticket is stuck/);
+  assert.equal(store.getAssignment(assignmentId).stallRecoveryAttempts, 1);
+
+  store.clearStall(assignmentId);
+  const second = store.recordStall({ assignmentId, semonReason: "no-output", detail: null, cause: "no-output" }).id;
+  const recoveryTwo = await advanceStuckLadder(store, workers);
+  await workers.drain();
+  assert.deepEqual(recoveryTwo, { recovered: [second], published: [] });
+  assert.match(session.prompts.at(-1)!, /still sees this ticket as stuck/);
+  assert.equal(store.getAssignment(assignmentId).stallRecoveryAttempts, 2);
+
+  store.clearStall(assignmentId);
+  const third = store.recordStall({ assignmentId, semonReason: "no-output", detail: null, cause: "no-output" }).id;
+  assert.deepEqual(await advanceStuckLadder(store, workers), { recovered: [], published: [third] });
+  await workers.drain();
+  assert.equal(store.getStall(third).publicAt, "2026-11-09T12:00:00.000Z");
+  assert.ok(store.dueReplies().some((reply) => reply.id === `stuck-${third}`));
+});
+
+test("a human follow-up resets the Worker recovery count", async () => {
+  const { store, runner, workers, ticketId, threadId } = fixture();
+  await workers.dispatch(ticketId);
+  const assignmentId = 1;
+  const session = runner.sessions[0]!;
+  const first = store.recordStall({ assignmentId, semonReason: "no-output", detail: null }).id;
+  await advanceStuckLadder(store, workers);
+  session.auto = true;
+  await workers.drain();
+  store.clearStall(assignmentId);
+  const second = store.recordStall({ assignmentId, semonReason: "no-output", detail: null }).id;
+  await advanceStuckLadder(store, workers);
+  await workers.drain();
+  store.clearStall(assignmentId);
+  const publicStall = store.recordStall({ assignmentId, semonReason: "no-output", detail: null }).id;
+  await advanceStuckLadder(store, workers);
+  await workers.drain();
+  assert.equal(store.getStall(publicStall).publicAt, "2026-11-09T12:00:00.000Z");
+
+  store.insertTrigger({
+    sourceId: store.ensureSource("github", REPO).id, sourceEventId: "human", threadId, kind: "issue_comment", actor: "alice",
+    url: `https://github.com/${REPO}/issues/7#issuecomment-human`, occurredAt: new Date("2026-11-09T12:01:00.000Z"), body: "try red",
+  });
+  routeFollowUps(store, workers);
+  await workers.drain();
+  assert.equal(store.getAssignment(assignmentId).stallRecoveryAttempts, 0);
 });

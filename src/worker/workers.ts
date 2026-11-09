@@ -44,6 +44,7 @@ export class Workers {
   readonly #chains = new Map<number, Promise<void>>();
   readonly #queued = new Set<string>();
   readonly #budgetPauses = new Set<number>();
+  readonly #inFlight = new Map<number, AbortController>();
 
   constructor(deps: WorkersDeps) {
     this.#deps = deps;
@@ -110,6 +111,14 @@ export class Workers {
     return true;
   }
 
+  /** Cancels the turn currently running for an assignment, if any. */
+  cancel(assignmentId: number): boolean {
+    const controller = this.#inFlight.get(assignmentId);
+    if (controller === undefined || controller.signal.aborted) return false;
+    controller.abort();
+    return true;
+  }
+
   /**
    * Run once at start. A native assignment that never got a session ends; the others resume by
    * session ID, and one whose turn was cut off is sent a turn to check its state and go on.
@@ -163,16 +172,23 @@ export class Workers {
 
   async #firstTurn(id: number, session: Session, prompt: string): Promise<void> {
     const { store } = this.#deps;
+    const controller = new AbortController();
+    this.#inFlight.set(id, controller);
     let result: TurnResult;
     try {
-      result = await session.send(prompt);
+      result = await session.send(prompt, controller.signal);
     } catch (error) {
-      if (store.getAssignment(id).state === "pending") {
+      if (controller.signal.aborted) {
+        store.endTurn(id, null);
+        store.clearTurnError(id);
+      } else if (store.getAssignment(id).state === "pending") {
         store.abandonAssignment(id, error instanceof Error ? error.message : String(error));
       } else {
         this.#failed(id, error);
       }
       return;
+    } finally {
+      if (this.#inFlight.get(id) === controller) this.#inFlight.delete(id);
     }
     this.#finished(id, result);
   }
@@ -192,12 +208,21 @@ export class Workers {
     const session = this.#session(assignment);
     const turn = store.beginTurn(id);
     onStart?.(`${assignment.sessionId}:${turn}`);
+    const controller = new AbortController();
+    this.#inFlight.set(id, controller);
     let result: TurnResult;
     try {
-      result = await session.send(prompt);
+      result = await session.send(prompt, controller.signal);
     } catch (error) {
-      this.#failed(id, error);
+      if (controller.signal.aborted) {
+        store.endTurn(id, null);
+        store.clearTurnError(id);
+      } else {
+        this.#failed(id, error);
+      }
       return;
+    } finally {
+      if (this.#inFlight.get(id) === controller) this.#inFlight.delete(id);
     }
     this.#finished(id, result);
     if (result.status === "completed") await onComplete?.(result);
@@ -218,6 +243,10 @@ export class Workers {
     store.clearTurnError(id);
     const assignment = store.getAssignment(id);
     if (assignment.state !== "running") return;
+    if (result.status === "cancelled") {
+      queueStatusCard(store, assignment.ticketId);
+      return;
+    }
     const reached = turnBudgetReached(store.ticketBudget(assignment.ticketId), new Date());
     if (store.getTicket(assignment.ticketId).state === "open" && reached !== null && !this.#budgetPauses.has(id)) {
       this.#budgetPauses.add(id);
@@ -240,7 +269,9 @@ export class Workers {
         return;
       }
     }
-    this.#mark(id, result.status === "cancelled" ? "cancelled" : null);
+    // Ostrom only aborts a turn to replace it. That cancellation is bookkeeping, not a terminal
+    // Worker outcome: the next queued turn must still run on this assignment.
+    this.#mark(id, null);
     queueStatusCard(store, assignment.ticketId);
   }
 

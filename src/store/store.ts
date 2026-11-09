@@ -160,6 +160,8 @@ export interface Assignment {
   outputTokens: number;
   lastError: string | null;
   consecutiveErrors: number;
+  /** Silent stuck-ladder recovery attempts since the last human follow-up. */
+  stallRecoveryAttempts: number;
   /** The last time this Worker completed a turn. */
   lastActivityAt: string | null;
   /** Set while a turn runs; still set when ostromd starts means the turn was interrupted. */
@@ -686,7 +688,8 @@ export class Store {
   /** `running → ended`, with the reason when the Worker was stopped rather than finished. */
   endAssignment(assignmentId: number, reason: string | null = null): void {
     const { changes } = this.#run(
-      "UPDATE assignment SET state = 'ended', ended_at = ?, end_reason = ? WHERE id = ? AND state = 'running'",
+      `UPDATE assignment SET state = 'ended', ended_at = ?, end_reason = ?, stall_recovery_attempts = 0
+       WHERE id = ? AND state = 'running'`,
       this.#stamp(),
       reason,
       assignmentId,
@@ -936,26 +939,32 @@ export class Store {
       const open = this.#get("SELECT id FROM stall WHERE assignment_id = ? AND cleared_at IS NULL", stall.assignmentId);
       if (open !== undefined) return { id: open["id"] as number, duplicate: true };
       const id = this.#get(
-        `INSERT INTO stall (assignment_id, semon_reason, detail, detected_at, cause)
-         VALUES (?, ?, ?, ?, ?) RETURNING id`,
+        `INSERT INTO stall (assignment_id, semon_reason, detail, detected_at, cause, recovery_attempts)
+         VALUES (?, ?, ?, ?, ?, (SELECT stall_recovery_attempts FROM assignment WHERE id = ?)) RETURNING id`,
         stall.assignmentId,
         stall.semonReason,
         stall.detail,
         this.#stamp(),
         stall.cause ?? null,
+        stall.assignmentId,
       )!["id"] as number;
       return { id, duplicate: false };
     });
   }
 
-  /** Starts the next silent recovery. The third call returns null, leaving public escalation due. */
+  /** Starts the next silent recovery for this Worker. The third call leaves public escalation due. */
   beginStallRecovery(stallId: number): Stall | null {
-    const row = this.#get(
-      `UPDATE stall SET recovery_attempts = recovery_attempts + 1
-       WHERE id = ? AND cleared_at IS NULL AND public_at IS NULL AND recovery_attempts < 2 RETURNING *`,
-      stallId,
-    );
-    return row === undefined ? null : toStall(row);
+    return this.#transaction(() => {
+      const row = this.#get(
+        `UPDATE assignment SET stall_recovery_attempts = stall_recovery_attempts + 1
+         WHERE id = (SELECT assignment_id FROM stall WHERE id = ? AND cleared_at IS NULL AND public_at IS NULL)
+           AND stall_recovery_attempts < 2 RETURNING stall_recovery_attempts`,
+        stallId,
+      );
+      if (row === undefined) return null;
+      this.#run("UPDATE stall SET recovery_attempts = ? WHERE id = ?", row["stall_recovery_attempts"], stallId);
+      return this.getStall(stallId);
+    });
   }
 
   /** Marks the one public stuck reply as queued. It cannot be repeated for this episode. */
@@ -968,14 +977,18 @@ export class Store {
     return toStall(row);
   }
 
-  /** A human reply clears the public stuck state without losing the episode record. */
+  /** A human reply clears the open stuck state and restarts the Worker recovery ladder. */
   clearStallForHumanReply(assignmentId: number): number | null {
-    const row = this.#get(
-      `UPDATE stall SET cleared_by_human_at = ?, cleared_at = ?
-       WHERE assignment_id = ? AND public_at IS NOT NULL AND cleared_at IS NULL RETURNING id`,
-      this.#stamp(), this.#stamp(), assignmentId,
-    );
-    return row === undefined ? null : row["id"] as number;
+    return this.#transaction(() => {
+      const row = this.#get(
+        `UPDATE stall SET cleared_by_human_at = ?, cleared_at = ?
+         WHERE assignment_id = ? AND cleared_at IS NULL RETURNING id`,
+        this.#stamp(), this.#stamp(), assignmentId,
+      );
+      if (row === undefined) return null;
+      this.#run("UPDATE assignment SET stall_recovery_attempts = 0 WHERE id = ?", assignmentId);
+      return row["id"] as number;
+    });
   }
 
   /** Ends the assignment's open stall episode, if any. Returns its id, or null when none was open. */
@@ -1303,6 +1316,7 @@ function toAssignment(row: Row): Assignment {
     outputTokens: row["output_tokens"] as number,
     lastError: row["last_error"] as string | null,
     consecutiveErrors: row["consecutive_errors"] as number,
+    stallRecoveryAttempts: row["stall_recovery_attempts"] as number,
     lastActivityAt: row["last_activity_at"] as string | null,
     turnStartedAt: row["turn_started_at"] as string | null,
     interruptions: row["interruptions"] as number,
