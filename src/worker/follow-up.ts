@@ -1,63 +1,49 @@
 // Thread subscription (docs/direction.md, milestone 1 step 4): a new trigger on a thread that an
 // open ticket is subscribed to goes straight to that ticket's Worker, with no decision and without
-// reaching the Router. Delivery is `t3 thread send` without `--wait` (open question 1): T3 queues
-// the message as the Worker's next turn. Everything here is deterministic.
+// reaching the Router. Delivery is a resumed turn on the Worker's session, queued behind any turn
+// that is running. Everything here is deterministic.
 //
 // A trigger whose subscribed tickets have all ended is not delivered: it stays undecided and goes
 // to the Router (`Store.undecidedTriggers`), because whether a message on finished work asks for
 // more work is an accept/ignore judgement, not a routing step (AGENTS.md rule 3).
 
 import type { Store, Thread, Trigger } from "../store/store.ts";
-import type { T3SendDelivery, T3SendResult } from "../t3/cli-json.ts";
-import type { T3Cli } from "../t3/runner.ts";
+import type { Workers } from "./workers.ts";
 
 export interface Delivered {
   triggerId: number;
   ticketId: number;
   assignmentId: number;
-  t3ThreadId: string;
-  t3RunId: string;
-  delivery: T3SendDelivery;
 }
 
 export interface RoutePass {
-  delivered: Delivered[];
-  /** Follow-ups not delivered this pass; each is tried again on the next one. */
+  /** Follow-ups queued on a Worker's session this pass; each is recorded when its turn starts. */
+  queued: Delivered[];
+  /** Follow-ups not queued this pass; each is tried again on the next one. */
   failed: { triggerId: number; ticketId: number; error: string }[];
 }
 
 /**
- * One pass over the follow-ups owed to Workers. Each is sent and only then recorded, so a failed
- * send is reported and retried by the next pass, and a replayed pass sends nothing twice.
+ * One pass over the follow-ups owed to Workers. Each is queued behind the session's running turn
+ * and recorded only when its turn starts, so a follow-up lost with the queue in a crash is sent
+ * again, one already queued is not queued twice, and a replayed pass delivers nothing twice.
  */
-export async function routeFollowUps(store: Store, t3: T3Cli): Promise<RoutePass> {
-  const pass: RoutePass = { delivered: [], failed: [] };
+export function routeFollowUps(store: Store, workers: Workers): RoutePass {
+  const pass: RoutePass = { queued: [], failed: [] };
   for (const pending of store.pendingDeliveries()) {
-    const { trigger, ticketId, assignmentId, t3ThreadId } = pending;
-    if (assignmentId === null || t3ThreadId === null) {
-      pass.failed.push({ triggerId: trigger.id, ticketId, error: `ticket ${ticketId} has no running Worker` });
+    const { trigger, ticketId, assignmentId } = pending;
+    if (assignmentId === null || pending.t3ThreadId !== null) {
+      const error = assignmentId === null ? `ticket ${ticketId} has no running Worker` : `ticket ${ticketId}'s Worker is a T3 thread, not a session`;
+      pass.failed.push({ triggerId: trigger.id, ticketId, error });
       continue;
     }
-    let sent: T3SendResult;
-    try {
-      sent = await t3.sendMessage(t3ThreadId, followUpMessage(ticketId, trigger, store.getThread(trigger.threadId)));
-    } catch (error) {
-      pass.failed.push({
-        triggerId: trigger.id,
-        ticketId,
-        error: error instanceof Error ? error.message : String(error),
-      });
-      continue;
-    }
-    store.recordDelivery(trigger.id, assignmentId, sent.runId);
-    pass.delivered.push({
-      triggerId: trigger.id,
-      ticketId,
+    const added = workers.deliver(
       assignmentId,
-      t3ThreadId,
-      t3RunId: sent.runId,
-      delivery: sent.delivery,
-    });
+      `${trigger.id}:${assignmentId}`,
+      followUpMessage(ticketId, trigger, store.getThread(trigger.threadId)),
+      (turnId) => store.recordDelivery(trigger.id, assignmentId, turnId),
+    );
+    if (added) pass.queued.push({ triggerId: trigger.id, ticketId, assignmentId });
   }
   return pass;
 }

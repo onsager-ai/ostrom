@@ -6,11 +6,15 @@ import { execGh, type GhRunner } from "../github/gh.ts";
 import { sendDueReplies } from "../github/outbox.ts";
 import { pollOnce } from "../github/poller.ts";
 import { routeCandidates } from "../router/router.ts";
+import { sessionConfig } from "../session/config.ts";
+import { codexSessionsDir } from "../session/rollout.ts";
+import { claudeRunner, codexRunner, type Runner } from "../session/runner.ts";
 import { Store } from "../store/store.ts";
 import { processRunner, T3Cli, type T3Runner } from "../t3/runner.ts";
 import { watchdog } from "../watchdog/watchdog.ts";
-import { dispatch, observe } from "../worker/dispatch.ts";
+import { observe } from "../worker/dispatch.ts";
 import { routeFollowUps } from "../worker/follow-up.ts";
+import { Workers, type WorkersDeps } from "../worker/workers.ts";
 import { loadConfig, loadRouterConfig, loadWatchdogConfig, loadWorkerConfig } from "./config.ts";
 
 /**
@@ -34,12 +38,13 @@ commands:
   poll   read new GitHub events once; print each candidate trigger as a JSON line
   send   post due outbox replies once
   dispatch <ticket-id>
-         start a T3 Code Worker for an open ticket; print the assignment as a JSON line
+         start a native Worker session for an open ticket and wait for its turns to finish;
+         print the assignment as a JSON line
   observe
-         read every running Worker's T3 thread once; subscribe tickets to their PRs and
-         print each observation as a JSON line
-  route  send each new trigger on a subscribed thread to its ticket's Worker once; print each
-         delivery as a JSON line
+         look up the PRs opened from every running Worker's branch once; subscribe tickets to
+         them and print each observation as a JSON line
+  route  queue each new trigger on a subscribed thread as a turn on its ticket's Worker session,
+         wait for the turns to finish, and print each queued follow-up as a JSON line
   watchdog
          check every running Worker once with Semon's stalls read and its T3 thread state;
          record each new stall episode for the Router's next batch and print each check as a
@@ -54,8 +59,9 @@ commands:
          repeat tick, waiting that long after each, until SIGINT or SIGTERM
 
 environment: OSTROM_REPO, OSTROM_ALLOWLIST, OSTROM_DB;
-  dispatch also needs OSTROM_T3_PROJECT, OSTROM_WORKER_BASE, OSTROM_WORKER_PROVIDER,
-  OSTROM_WORKER_MODEL; route-candidates needs those and OSTROM_ROUTER_PROVIDER,
+  dispatch also needs OSTROM_WORKER_REPO, OSTROM_WORKER_BASE (optional: OSTROM_WORKER_WORKTREES,
+  OSTROM_WORKER_HARNESS=claude|codex, default codex, OSTROM_WORKER_MODEL, default gpt-6-luna);
+  route-candidates needs those, OSTROM_T3_PROJECT, OSTROM_ROUTER_PROVIDER and
   OSTROM_ROUTER_MODEL; watchdog needs OSTROM_STALL_MINUTES; tick and run need all of them
 `;
 
@@ -71,6 +77,13 @@ export interface MainDeps {
   sleep: (ms: number, stop: AbortSignal) => Promise<void>;
   /** Aborted when `run` should stop after the current tick. */
   stop: AbortSignal;
+  /** Session runners; default to the real Claude and Codex SDKs configured from `env`. */
+  runners?: Record<"claude" | "codex", Runner>;
+  /** Where Codex rollout records live; default ~/.codex/sessions. */
+  codexSessions?: string;
+  addWorktree?: WorkersDeps["addWorktree"];
+  /** The Workers a `run` shares across its ticks; one-shot commands make their own. */
+  workers?: Workers;
 }
 
 function sleep(ms: number, stop: AbortSignal): Promise<void> {
@@ -113,9 +126,16 @@ async function tick(deps: MainDeps): Promise<number> {
     return 1;
   }
   const failed: string[] = [];
-  for (const step of TICK) {
-    const code = await main([step], deps);
-    if (code !== 0) failed.push(`${step} (exit ${code})`);
+  const owned = deps.workers === undefined ? openWorkers(deps) : undefined;
+  if (owned !== undefined) logRecovery(owned.workers.recover(), deps);
+  const shared = { ...deps, workers: deps.workers ?? owned!.workers };
+  try {
+    for (const step of TICK) {
+      const code = await main([step], shared);
+      if (code !== 0) failed.push(`${step} (exit ${code})`);
+    }
+  } finally {
+    if (owned !== undefined) await owned.close();
   }
   deps.stderr(
     failed.length === 0 ? `ostromd tick: all ${TICK.length} passes ran` : `ostromd tick: failed: ${failed.join(", ")}`,
@@ -132,12 +152,67 @@ async function run(intervalSeconds: number, deps: MainDeps): Promise<number> {
     return 1;
   }
   let code = 0;
-  while (!deps.stop.aborted) {
-    code = await tick(deps);
-    if (deps.stop.aborted) break;
-    await deps.sleep(intervalSeconds * 1000, deps.stop);
+  const owned = openWorkers(deps);
+  logRecovery(owned.workers.recover(), deps);
+  try {
+    while (!deps.stop.aborted) {
+      code = await tick({ ...deps, workers: owned.workers });
+      if (deps.stop.aborted) break;
+      await deps.sleep(intervalSeconds * 1000, deps.stop);
+    }
+  } finally {
+    await owned.close();
   }
   return code;
+}
+
+function makeWorkers(deps: MainDeps, store: Store): Workers {
+  return new Workers({
+    store,
+    config: loadWorkerConfig(deps.env),
+    runners: deps.runners ?? realRunners(deps.env),
+    codexSessions: deps.codexSessions ?? codexSessionsDir(),
+    ...(deps.addWorktree === undefined ? {} : { addWorktree: deps.addWorktree }),
+    log: (line) => deps.stderr(`ostromd: ${line}`),
+  });
+}
+
+/** A Workers on its own store connection, so its turns outlive the store a single pass opens. */
+function openWorkers(deps: MainDeps) {
+  const store = Store.open(loadConfig(deps.env).dbPath);
+  const workers = makeWorkers(deps, store);
+  return {
+    workers,
+    close: async () => {
+      try {
+        await workers.drain();
+      } finally {
+        store.close();
+      }
+    },
+  };
+}
+
+function realRunners(env: MainDeps["env"]): Record<"claude" | "codex", Runner> {
+  const { claudeEnv, codex } = sessionConfig(env);
+  return { claude: lazy(() => claudeRunner(claudeEnv)), codex: lazy(() => codexRunner(codex)) };
+}
+
+/** Builds an SDK runner on first use, so a harness that is never started is never constructed. */
+function lazy(make: () => Runner): Runner {
+  let runner: Runner | undefined;
+  return {
+    start: (options) => (runner ??= make()).start(options),
+    resume: (options) => (runner ??= make()).resume(options),
+  };
+}
+
+function logRecovery(pass: ReturnType<Workers["recover"]>, deps: MainDeps): void {
+  if (pass.resumed.length + pass.abandoned.length === 0) return;
+  deps.stderr(
+    `ostromd recover: ${pass.resumed.length} resumed, ${pass.interrupted.length} interrupted, ` +
+      `${pass.abandoned.length} never started`,
+  );
 }
 
 /** Runs one command and returns its exit code. Anything that did not do its job is non-zero. */
@@ -164,18 +239,21 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
   if (command === "tick") return tick(deps);
   if (command === "run") return run(Number(rest[1]), deps);
   let store: Store | undefined;
+  let own: Workers | undefined;
   try {
     const config = loadConfig(deps.env);
     store = Store.open(config.dbPath);
+    const openStore = store;
+    // A one-shot command's Workers live until its turns finish; a run's are shared across ticks.
+    const workers = () => deps.workers ?? (own ??= makeWorkers(deps, openStore));
     if (command === "dispatch") {
-      const worker = loadWorkerConfig(deps.env);
       const ticketId = Number(ticketArg);
-      const dispatched = await dispatch(store, new T3Cli(deps.t3), worker, ticketId);
+      const dispatched = await workers().dispatch(ticketId);
       deps.stdout(JSON.stringify({ ticketId, ...dispatched }));
       return 0;
     }
     if (command === "observe") {
-      const pass = await observe(store, new T3Cli(deps.t3), config.repo);
+      const pass = await observe(store, deps.gh, config.repo);
       for (const observed of pass.observed) deps.stdout(JSON.stringify(observed));
       for (const failure of pass.failed) {
         deps.stderr(`ostromd observe: assignment ${failure.assignmentId} failed: ${failure.error}`);
@@ -184,14 +262,14 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
       return pass.failed.length === 0 ? 0 : 1;
     }
     if (command === "route") {
-      const pass = await routeFollowUps(store, new T3Cli(deps.t3));
-      for (const delivered of pass.delivered) deps.stdout(JSON.stringify(delivered));
+      const pass = routeFollowUps(store, workers());
+      for (const queued of pass.queued) deps.stdout(JSON.stringify(queued));
       for (const failure of pass.failed) {
         deps.stderr(
           `ostromd route: trigger ${failure.triggerId} to ticket ${failure.ticketId} failed: ${failure.error}`,
         );
       }
-      deps.stderr(`ostromd route: ${pass.delivered.length} delivered, ${pass.failed.length} failed`);
+      deps.stderr(`ostromd route: ${pass.queued.length} queued, ${pass.failed.length} failed`);
       return pass.failed.length === 0 ? 0 : 1;
     }
     if (command === "watchdog") {
@@ -214,9 +292,8 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
       return pass.failed.length === 0 ? 0 : 1;
     }
     if (command === "route-candidates") {
-      const worker = loadWorkerConfig(deps.env);
       const router = loadRouterConfig(deps.env);
-      const pass = await routeCandidates({ store, gh: deps.gh, t3: new T3Cli(deps.t3), repo: config.repo, worker, router });
+      const pass = await routeCandidates({ store, gh: deps.gh, t3: new T3Cli(deps.t3), repo: config.repo, workers: workers(), router });
       if (pass.router !== null) deps.stdout(JSON.stringify({ type: "router", ...pass.router }));
       for (const decision of pass.decisions) deps.stdout(JSON.stringify({ type: "decision", ...decision }));
       for (const outcome of pass.outcomes) deps.stdout(JSON.stringify({ type: "outcome", ...outcome }));
@@ -249,7 +326,11 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
     deps.stderr(`ostromd ${command}: ${error instanceof Error ? error.message : String(error)}`);
     return 1;
   } finally {
-    store?.close();
+    try {
+      await own?.drain();
+    } finally {
+      store?.close();
+    }
   }
 }
 

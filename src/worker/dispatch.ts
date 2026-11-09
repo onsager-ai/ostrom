@@ -1,49 +1,9 @@
-// Worker dispatch (docs/direction.md, milestone 1 step 3): start a T3 Code Worker for an accepted
-// ticket, then follow it through T3 thread state until its PR exists (open question 2, option B).
-// Everything here is deterministic; no model call is made by Ostrom itself.
+// The Worker brief and observation (docs/direction.md, milestone 1 step 3): Workers start in
+// `workers.ts`; here a running Worker is followed through GitHub until its PR exists. Everything
+// here is deterministic; no model call is made by Ostrom itself.
 
-import type { WorkerConfig } from "../ostromd/config.ts";
+import { ghGet, type GhRunner } from "../github/gh.ts";
 import type { AssignmentOutcome, Store, TicketContext } from "../store/store.ts";
-import type { T3Thread } from "../t3/cli-json.ts";
-import type { T3Cli } from "../t3/runner.ts";
-
-export interface Dispatched {
-  assignmentId: number;
-  t3ThreadId: string;
-  branch: string;
-}
-
-/**
- * Creates an assignment for an open ticket and starts its Worker. If T3 does not start it, the
- * assignment ends with the error as its reason and the error is rethrown.
- */
-export async function dispatch(
-  store: Store,
-  t3: T3Cli,
-  worker: WorkerConfig,
-  ticketId: number,
-): Promise<Dispatched> {
-  const context = store.ticketContext(ticketId);
-  const assignmentId = store.createAssignment(ticketId);
-  const branch = `ostrom/ticket-${ticketId}-${assignmentId}`;
-  let t3ThreadId: string;
-  try {
-    ({ threadId: t3ThreadId } = await t3.startThread({
-      project: worker.project,
-      title: `Ostrom ticket ${ticketId}: ${context.source.name}#${context.thread.number}`,
-      brief: workerBrief(context, branch, worker.base),
-      worktreeBase: worker.base,
-      branch,
-      provider: worker.provider,
-      model: worker.model,
-    }));
-  } catch (error) {
-    store.abandonAssignment(assignmentId, error instanceof Error ? error.message : String(error));
-    throw error;
-  }
-  store.startAssignment(assignmentId, t3ThreadId);
-  return { assignmentId, t3ThreadId, branch };
-}
 
 /**
  * The Worker's first message: a summary plus pointers ("Inline & Spill"). It quotes no comment
@@ -64,17 +24,44 @@ export function workerBrief(context: TicketContext, branch: string, base: string
     `Do the work in this worktree on branch ${branch}. Commit, push the branch, and open a pull request`,
     `on ${source.name} against ${base} whose description says "Refs #${thread.number}".`,
     "Do not comment on GitHub yourself: Ostrom replies to people. Review comments on your pull",
-    "request will reach you in this thread.",
+    "request will reach you in this session as follow-up messages.",
+    "You run unattended: never stop to ask an interactive question. Decide, state your assumption in",
+    "the pull request description, and carry on.",
   ].join("\n");
+}
+
+export type PullRequestState = "open" | "closed" | "merged";
+
+export interface BranchPullRequest {
+  number: number;
+  url: string;
+  state: PullRequestState;
+}
+
+/** The pull requests on `repo` whose head is `branch`, in any state, by number. */
+export async function pullRequestsForBranch(gh: GhRunner, repo: string, branch: string): Promise<BranchPullRequest[]> {
+  const owner = repo.split("/")[0]!;
+  const found = await ghGet(gh, `repos/${repo}/pulls?head=${encodeURIComponent(`${owner}:${branch}`)}&state=all&per_page=100`);
+  if (!Array.isArray(found)) throw new Error(`gh pulls for ${branch}: expected a list`);
+  return found
+    .map((item: Record<string, unknown>) => {
+      if (typeof item["number"] !== "number" || typeof item["html_url"] !== "string") {
+        throw new Error(`gh pulls for ${branch}: unexpected item ${JSON.stringify(item)}`);
+      }
+      const state: PullRequestState = item["merged_at"] != null ? "merged" : item["state"] === "closed" ? "closed" : "open";
+      return { number: item["number"], url: item["html_url"], state };
+    })
+    .sort((a, b) => a.number - b.number);
 }
 
 export interface Observed {
   assignmentId: number;
-  t3ThreadId: string;
-  /** Pull requests on the repo the thread shows, by number. */
+  sessionId: string;
+  /** Pull requests from the Worker's branch, by number. */
   pullRequests: number[];
   /** Of those, the ones this pass subscribed the ticket to for the first time. */
   newlySubscribed: number[];
+  /** What the Worker's turns recorded (failed or cancelled), or null for nothing to flag. */
   outcome: AssignmentOutcome | null;
 }
 
@@ -84,18 +71,18 @@ export interface ObservePass {
 }
 
 /**
- * One pass over running assignments: read each Worker's T3 thread, subscribe its ticket to the
- * PRs it opened on `repo`, and record an outcome worth flagging. A thread that cannot be read is
+ * One pass over running Workers: find the PRs opened from each Worker's branch with `gh`,
+ * subscribe its ticket to them, and report the outcome its turns recorded. A lookup that fails is
  * reported and the pass goes on to the next one.
  */
-export async function observe(store: Store, t3: T3Cli, repo: string): Promise<ObservePass> {
+export async function observe(store: Store, gh: GhRunner, repo: string): Promise<ObservePass> {
   const source = store.ensureSource("github", repo);
   const pass: ObservePass = { observed: [], failed: [] };
   for (const assignment of store.runningAssignments()) {
-    const t3ThreadId = assignment.t3ThreadId!;
-    let thread: T3Thread;
+    if (assignment.sessionId === null) continue;
+    let pullRequests: BranchPullRequest[];
     try {
-      ({ thread } = await t3.showThread(t3ThreadId));
+      pullRequests = await pullRequestsForBranch(gh, repo, assignment.branch!);
     } catch (error) {
       pass.failed.push({
         assignmentId: assignment.id,
@@ -103,47 +90,18 @@ export async function observe(store: Store, t3: T3Cli, repo: string): Promise<Ob
       });
       continue;
     }
-    const pullRequests = pullRequestsOn(thread, repo);
     const newlySubscribed: number[] = [];
     for (const pr of pullRequests) {
-      const threadId = store.ensureThread({
-        sourceId: source.id,
-        kind: "pull_request",
-        number: pr.number,
-        url: pr.url,
-      });
+      const threadId = store.ensureThread({ sourceId: source.id, kind: "pull_request", number: pr.number, url: pr.url });
       if (!store.subscribe(assignment.ticketId, threadId).duplicate) newlySubscribed.push(pr.number);
     }
-    const outcome = outcomeOf(thread);
-    store.recordOutcome(assignment.id, outcome);
     pass.observed.push({
       assignmentId: assignment.id,
-      t3ThreadId,
+      sessionId: assignment.sessionId,
       pullRequests: pullRequests.map((pr) => pr.number),
       newlySubscribed,
-      outcome,
+      outcome: assignment.outcome,
     });
   }
   return pass;
-}
-
-/** The thread's PRs on `repo`, linked or listed, by number; ones the user dismissed are left out. */
-export function pullRequestsOn(thread: T3Thread, repo: string): { number: number; url: string }[] {
-  const same = (repository: string) => repository.toLowerCase() === repo.toLowerCase();
-  const found = new Map<number, string>();
-  if (thread.linkedPullRequest !== null && same(thread.linkedPullRequest.repository)) {
-    found.set(thread.linkedPullRequest.number, thread.linkedPullRequest.url);
-  }
-  for (const pr of thread.pullRequests) {
-    if (pr.host === "github.com" && same(pr.repository) && pr.source !== "stack-dismissed") {
-      if (!found.has(pr.number)) found.set(pr.number, pr.url);
-    }
-  }
-  return [...found].sort(([a], [b]) => a - b).map(([number, url]) => ({ number, url }));
-}
-
-export function outcomeOf(thread: T3Thread): AssignmentOutcome | null {
-  if (thread.status === "failed" || thread.status === "cancelled") return thread.status;
-  if (thread.status === "waiting" && thread.pendingRequestCount > 0) return "waiting";
-  return null;
 }

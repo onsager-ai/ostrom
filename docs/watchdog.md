@@ -40,7 +40,7 @@ Router's reply would be posted to the issue.
 ```sh
 export OSTROM_REPO=onsager-ai/ostrom OSTROM_ALLOWLIST=<login> OSTROM_DB=/tmp/ostrom-stall/ostrom.sqlite
 export OSTROM_T3_PROJECT=<path inside the T3 project> OSTROM_WORKER_BASE=main
-export OSTROM_WORKER_PROVIDER=claudeAgent OSTROM_WORKER_MODEL=claude-haiku-5-5
+export OSTROM_STALL_PROVIDER=claudeAgent OSTROM_STALL_MODEL=claude-haiku-5-5
 export OSTROM_ROUTER_PROVIDER=claudeAgent OSTROM_ROUTER_MODEL=claude-haiku-5-5 OSTROM_STALL_MINUTES=2
 
 node src/watchdog/scripted-stall.ts <issue-number>   # prints ticketId, assignmentId, t3ThreadId, branch

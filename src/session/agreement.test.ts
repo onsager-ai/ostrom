@@ -8,8 +8,8 @@ import type { AgentMessageItem, ItemCompletedEvent, ThreadStartedEvent, TurnComp
 // here makes removal or type changes in those fields a compile-time failure.
 type ClaudeInit = Pick<SDKSystemMessage, "type" | "subtype" | "session_id" | "model">;
 type ClaudeResult = Pick<SDKResultSuccess, "type" | "subtype" | "session_id" | "result" | "is_error"> & {
-  usage: Pick<SDKResultSuccess["usage"], "input_tokens" | "output_tokens">;
-  modelUsage: Record<string, object>;
+  usage: Pick<SDKResultSuccess["usage"], "input_tokens" | "output_tokens" | "cache_read_input_tokens" | "cache_creation_input_tokens">;
+  modelUsage: SDKResultSuccess["modelUsage"];
 };
 type CodexMessage = Pick<ItemCompletedEvent, "type"> & { item: Pick<AgentMessageItem, "id" | "type" | "text"> };
 
@@ -25,6 +25,7 @@ test("recorded Claude events retain the fields consumed by the runner", () => {
   assert.equal(typeof result.session_id, "string"); assert.equal(typeof result.result, "string");
   assert.equal(typeof result.is_error, "boolean");
   assert.equal(typeof result.usage.input_tokens, "number"); assert.equal(typeof result.usage.output_tokens, "number");
+  assert.equal(typeof result.usage.cache_read_input_tokens, "number"); assert.equal(typeof result.usage.cache_creation_input_tokens, "number");
   assert.ok(Object.keys(result.modelUsage).length > 0);
 });
 
@@ -34,5 +35,6 @@ test("recorded Codex events retain the fields consumed by the runner", () => {
   assert.equal(message.type, "item.completed"); assert.equal(message.item.type, "agent_message");
   assert.equal(typeof message.item.text, "string");
   assert.equal(completed.type, "turn.completed");
-  assert.equal(typeof completed.usage.input_tokens, "number"); assert.equal(typeof completed.usage.output_tokens, "number");
+  assert.equal(typeof completed.usage.input_tokens, "number"); assert.equal(typeof completed.usage.cached_input_tokens, "number");
+  assert.equal(typeof completed.usage.output_tokens, "number");
 });

@@ -110,7 +110,8 @@ export interface WatchdogOptions {
 
 export interface Checked {
   assignmentId: number;
-  t3ThreadId: string;
+  /** Null for a native Worker, which has no T3 thread and is matched to Semon by its branch. */
+  t3ThreadId: string | null;
   semonReason: string | null;
   t3Reason: string | null;
   /** The open stall episode, or null when the Worker is not stalled. */
@@ -140,17 +141,20 @@ export async function watchdog(options: WatchdogOptions): Promise<WatchdogPass> 
   }
   const now = options.now();
   for (const assignment of store.runningAssignments()) {
-    const t3ThreadId = assignment.t3ThreadId!;
-    let thread: T3Thread;
-    let t3Reason: string | null;
-    try {
-      ({ thread } = await options.t3.showThread(t3ThreadId));
-      t3Reason = t3StallReason(thread, now, idleMinutes);
-    } catch (error) {
-      pass.failed.push({ what: `read assignment ${assignment.id}`, error: message(error) });
-      continue;
+    const t3ThreadId = assignment.t3ThreadId;
+    let branch: string | null = assignment.branch;
+    let t3Reason: string | null = null;
+    if (t3ThreadId !== null) {
+      try {
+        const { thread } = await options.t3.showThread(t3ThreadId);
+        t3Reason = t3StallReason(thread, now, idleMinutes);
+        branch = thread.branch;
+      } catch (error) {
+        pass.failed.push({ what: `read assignment ${assignment.id}`, error: message(error) });
+        continue;
+      }
     }
-    const matched = thread.branch === null ? undefined : semon?.find((stall) => stall.branch === thread.branch);
+    const matched = branch === null ? undefined : semon?.find((stall) => stall.branch === branch);
     const semonReason = matched?.stallReason ?? null;
     const checked: Checked = {
       assignmentId: assignment.id,

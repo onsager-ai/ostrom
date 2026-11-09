@@ -399,10 +399,38 @@ test("migration 2 keeps the assignments a version 1 store already holds", () => 
     {
       id: 2, ticketId: 1, state: "running", t3ThreadId: "thr", createdAt: "t", startedAt: "t", endedAt: null,
       endReason: null, outcome: null, outcomeAt: null,
+      harness: null, model: null, sessionId: null, worktree: null, branch: null, machine: null,
+      turns: 0, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, turnStartedAt: null, interruptions: 0,
     },
   );
   store.abandonAssignment(1, "never started");
   assert.equal(store.getAssignment(1).endReason, "never started");
+});
+
+test("migration 7 preserves deliveries and stalls referencing assignments", () => {
+  const db = new DatabaseSync(":memory:", { enableForeignKeyConstraints: true });
+  db.exec("CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL) STRICT");
+  for (let i = 0; i < 6; i++) {
+    db.exec(migrations[i]!);
+    db.prepare("INSERT INTO schema_version VALUES (?, 't')").run(i + 1);
+  }
+  db.exec(`
+    INSERT INTO source VALUES (1, 'github', 'o/r', NULL);
+    INSERT INTO thread VALUES (1, 1, 'issue', 1, 'u');
+    INSERT INTO "trigger" VALUES (1, 1, 'e', 1, 'issue_comment', 'a', 'u', 't', 't');
+    INSERT INTO decision VALUES (1, 1, 'accept', 'r', 't');
+    INSERT INTO ticket VALUES (1, 1, 'open', 't', NULL);
+    INSERT INTO subscription VALUES (1, 1, 't');
+    INSERT INTO assignment (id, ticket_id, state, t3_thread_id, created_at, started_at) VALUES (1, 1, 'running', 'thr', 't', 't');
+    INSERT INTO delivery VALUES (1, 1, 'run', 't');
+    INSERT INTO stall (id, assignment_id, semon_reason, detected_at) VALUES (1, 1, 'idle', 't');
+  `);
+  migrate(db);
+  assert.equal(db.prepare("SELECT assignment_id FROM delivery").get()?.["assignment_id"], 1);
+  assert.equal(db.prepare("SELECT assignment_id FROM stall").get()?.["assignment_id"], 1);
+  assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
+  assert.equal(db.prepare("PRAGMA foreign_keys").get()?.["foreign_keys"], 1);
+  db.close();
 });
 
 test("a delivery is recorded once, and only for a ticket subscribed to the trigger's thread", () => {
@@ -491,4 +519,34 @@ test("the newest recorded Router thread is the current one", () => {
   store.recordRouterThread("mcp:router-2");
   assert.equal(store.routerThread(), "mcp:router-2");
   assert.throws(() => store.recordRouterThread("mcp:router-1"), /UNIQUE/);
+});
+
+test("a native turn is counted, marked while it runs, and its usage is added", () => {
+  const { store, accept } = fixture();
+  const id = store.createAssignment(accept());
+  store.configureNativeAssignment(id, { harness: "codex", model: "m", worktree: "/w", branch: "b", machine: "h" });
+  assert.throws(() => store.beginTurn(id), IllegalTransition);
+  store.startNativeAssignment(id, "sess");
+  assert.equal(store.beginTurn(id), 1);
+  assert.notEqual(store.getAssignment(id).turnStartedAt, null);
+  store.endTurn(id, { inputTokens: 5, cachedInputTokens: 3, outputTokens: 2 });
+  store.endTurn(id, null);
+  store.recordInterruption(id);
+  assert.equal(store.beginTurn(id), 2);
+  store.endTurn(id, { inputTokens: 1, cachedInputTokens: 1, outputTokens: 1 });
+  const a = store.getAssignment(id);
+  assert.deepEqual(
+    [a.turns, a.turnStartedAt, a.inputTokens, a.cachedInputTokens, a.outputTokens, a.interruptions],
+    [2, null, 6, 4, 3, 1],
+  );
+});
+
+test("a stopped native assignment ends with its reason and is owed a reply; a finished one is not", () => {
+  const { store, accept } = fixture();
+  const stopped = store.createAssignment(accept());
+  store.configureNativeAssignment(stopped, { harness: "codex", model: "m", worktree: "/w", branch: "b", machine: "h" });
+  store.startNativeAssignment(stopped, "s1");
+  assert.deepEqual(store.pendingAssignments().map((a) => a.id), []);
+  store.endAssignment(stopped, "model mismatch");
+  assert.deepEqual(store.abandonedAssignments().map((a) => [a.id, a.endReason]), [[stopped, "model mismatch"]]);
 });
