@@ -16,6 +16,7 @@ export class FakeSession implements Session {
   readonly id: string;
   readonly options: SessionOptions;
   readonly resumed: boolean;
+  reply: (prompt: string) => string = () => "ok";
 
   constructor(id: string, options: SessionOptions, resumed: boolean) {
     this.id = id;
@@ -31,7 +32,7 @@ export class FakeSession implements Session {
       if (this.failWith !== undefined) throw this.failWith;
       const result: TurnResult = {
         sessionId: this.id,
-        text: "ok",
+        text: this.reply(prompt),
         status: "completed",
         usage: { inputTokens: 10, cachedInputTokens: 5, outputTokens: 2 },
         model: null,

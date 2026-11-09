@@ -119,7 +119,7 @@ const workerEnv = {
   OSTROM_WORKER_HARNESS: "claude",
   OSTROM_WORKER_MODEL: "claude-haiku-5-5",
 };
-const routerEnv = { OSTROM_T3_PROJECT: "/work/ostrom" };
+const routerEnv = { OSTROM_ROUTER_HARNESS: "codex", OSTROM_ROUTER_MODEL: "gpt-6-luna" };
 
 test("Worker config requires a repo and base, and defaults to codex on gpt-6-luna", () => {
   const required = { OSTROM_WORKER_REPO: "/work/ostrom", OSTROM_WORKER_BASE: "main" };
@@ -215,12 +215,13 @@ test(
   }),
 );
 
-test("Router config needs a provider and model, with no default", () => {
-  const env = { OSTROM_T3_PROJECT: "/work/ostrom", OSTROM_ROUTER_PROVIDER: "claudeAgent", OSTROM_ROUTER_MODEL: "claude-haiku-5-5" };
-  assert.deepEqual(loadRouterConfig(env), { project: "/work/ostrom", provider: "claudeAgent", model: "claude-haiku-5-5" });
-  for (const name of Object.keys(env)) {
-    assert.throws(() => loadRouterConfig({ ...env, [name]: "" }), new RegExp(name));
-  }
+test("Router config defaults to the small Codex tier and validates its harness", () => {
+  assert.deepEqual(loadRouterConfig({}), { harness: "codex", model: "gpt-6-luna" });
+  assert.deepEqual(
+    loadRouterConfig({ OSTROM_ROUTER_HARNESS: "claude", OSTROM_ROUTER_MODEL: "claude-haiku-5-5" }),
+    { harness: "claude", model: "claude-haiku-5-5" },
+  );
+  assert.throws(() => loadRouterConfig({ OSTROM_ROUTER_HARNESS: "t3" }), /OSTROM_ROUTER_HARNESS/);
 });
 
 test(
@@ -228,7 +229,6 @@ test(
   withDb(async (dbPath) => {
     const env = {
       OSTROM_REPO: "o/r", OSTROM_ALLOWLIST: "alice", OSTROM_DB: dbPath, ...workerEnv, ...routerEnv,
-      OSTROM_ROUTER_PROVIDER: "claudeAgent", OSTROM_ROUTER_MODEL: "claude-haiku-5-5",
     };
     const store = Store.open(dbPath);
     const source = store.ensureSource("github", "o/r");
@@ -240,14 +240,16 @@ test(
     store.close();
     const gh: MainDeps["gh"] = async () => JSON.stringify({ body: "please fix the typo" });
 
-    const missing = deps({ ...env, OSTROM_ROUTER_MODEL: "" }, gh);
-    assert.equal(await main(["route-candidates"], missing.deps), 1);
-    assert.match(missing.err.join("\n"), /OSTROM_ROUTER_MODEL/);
+    const badHarness = deps({ ...env, OSTROM_ROUTER_HARNESS: "t3" }, gh);
+    assert.equal(await main(["route-candidates"], badHarness.deps), 1);
+    assert.match(badHarness.err.join("\n"), /OSTROM_ROUTER_HARNESS/);
 
-    const run = (reply: string) => ({
-      code: 0, stdout: JSON.stringify({ threadId: "mcp:router", runId: "run:1", status: "completed", reply, error: null }), stderr: "",
-    });
-    const garbled = deps(env, gh, async () => run("I accept."));
+    const garbled = deps(env, gh);
+    garbled.runner.start = ((options) => {
+      const session = new FakeRunner().start(options);
+      session.reply = () => "I accept.";
+      return session;
+    }) as typeof garbled.runner.start;
     assert.equal(await main(["route-candidates"], garbled.deps), 1);
     assert.match(garbled.err.join("\n"), /Router reply is not JSON/);
 
@@ -256,10 +258,12 @@ test(
       outcomes: [],
       stalls: [],
     };
-    const shown = JSON.parse(readFileSync(new URL("../t3/fixtures/show.json", import.meta.url), "utf8"));
-    const judged = deps(env, gh, async ({ args }) =>
-      args[1] === "show" ? { code: 0, stdout: JSON.stringify(shown), stderr: "" } : run(JSON.stringify(answer)),
-    );
+    const judged = deps(env, gh);
+    judged.runner.start = ((options) => {
+      const session = new FakeRunner().start(options);
+      session.reply = () => JSON.stringify(answer);
+      return session;
+    }) as typeof judged.runner.start;
     assert.equal(await main(["route-candidates"], judged.deps), 0);
     assert.deepEqual(judged.out.map((line) => JSON.parse(line).type), ["router", "decision"]);
     assert.equal(JSON.parse(judged.out[1]!).verdict, "ignore");
@@ -322,7 +326,7 @@ test(
 
 const tickEnv = (dbPath: string) => ({
   OSTROM_REPO: "onsager-ai/ostrom", OSTROM_ALLOWLIST: "alice", OSTROM_DB: dbPath, ...workerEnv, ...routerEnv,
-  OSTROM_ROUTER_PROVIDER: "claudeAgent", OSTROM_ROUTER_MODEL: "claude-haiku-5-5", OSTROM_STALL_MINUTES: "20",
+  OSTROM_STALL_MINUTES: "20",
 });
 /** The pass each summary line on stderr came from, in order. */
 const passes = (err: string[]) => err.map((line) => /^ostromd ([\w-]+):/.exec(line)?.[1]);
@@ -354,10 +358,10 @@ test(
 
 test("tick and run check every variable before any pass", async () => {
   for (const argv of [["tick"], ["run", "--interval", "60"]]) {
-    const run = deps({ ...tickEnv("/nonexistent/ostrom.sqlite"), OSTROM_ROUTER_MODEL: "" }, async () => "[]");
+    const run = deps({ ...tickEnv("/nonexistent/ostrom.sqlite"), OSTROM_ROUTER_HARNESS: "t3" }, async () => "[]");
     assert.equal(await main(argv, run.deps), 1);
     assert.deepEqual(run.err.length, 1);
-    assert.match(run.err[0]!, /OSTROM_ROUTER_MODEL/);
+    assert.match(run.err[0]!, /OSTROM_ROUTER_HARNESS/);
   }
 });
 

@@ -1,21 +1,22 @@
-// The Router (docs/direction.md, milestone 1 steps 2 and 5): a long-lived T3 Code thread whose
-// model judges candidates (accept, ignore or stop) and writes the words of each reply. Everything
-// else is code (AGENTS.md rule 3): which triggers are candidates, which outcomes are owed a reply,
-// checking the model's answer, recording decisions, dispatching Workers, queueing replies, and
-// ending finished work. A stall the Watchdog flagged is judged here too (step 6): the model
-// chooses wait or stop and words any reply; code carries out that answer and nothing more.
+// The Router (docs/direction.md, milestone 1 steps 2 and 5) judges candidates (accept, ignore or
+// stop) and writes the words of each reply. Everything else is code (AGENTS.md rule 3): which
+// triggers are candidates, which outcomes are owed a reply, checking the model's answer, recording
+// decisions, dispatching Workers, queueing replies, and ending finished work. A stall the Watchdog
+// flagged is judged here too (step 6): the model chooses wait or stop and words any reply; code
+// carries out that answer and nothing more.
 //
-// Transport: the daemon sends the Router one self-contained batch per pass with
-// `t3 thread send --wait --json` and reads a strict JSON answer from the run's reply. T3 Code at
-// the pin gives a thread no custom MCP server (see the PR that added this file), so the Router has
-// no Ostrom tools. An answer that does not check out records nothing, and its candidates stay
-// candidates for the next pass.
+// Transport: each pass starts a fresh, read-only native session in a temporary directory and sends
+// it one self-contained batch. The Router has no Ostrom tools and no state to resume. An answer
+// that does not check out records nothing, and its candidates stay candidates for the next pass.
+
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { ghGet, type GhRunner } from "../github/gh.ts";
 import type { RouterConfig } from "../ostromd/config.ts";
+import type { Runner } from "../session/runner.ts";
 import { stallReplyId, type StallAction, type Store, type Trigger, type Verdict } from "../store/store.ts";
-import type { T3RunResult } from "../t3/cli-json.ts";
-import { T3ThreadGone, type T3Cli } from "../t3/runner.ts";
 import { pullRequestsForBranch, type BranchPullRequest } from "../worker/dispatch.ts";
 import type { Workers } from "../worker/workers.ts";
 
@@ -120,8 +121,8 @@ export class RouterRunError extends Error {
 // --- one pass --------------------------------------------------------------------------------
 
 export interface RoutePassResult {
-  /** The Router thread asked this pass, and whether it was newly started; null if not asked. */
-  router: { t3ThreadId: string; started: boolean } | null;
+  /** The fresh Router session asked this pass; null if there was nothing to judge. */
+  router: { sessionId: string } | null;
   decisions: {
     decisionId: number;
     thread: number;
@@ -140,11 +141,11 @@ export interface RoutePassResult {
 export interface RouteOptions {
   store: Store;
   gh: GhRunner;
-  t3: T3Cli;
   /** owner/name */
   repo: string;
   workers: Workers;
   router: RouterConfig;
+  runners: Record<"claude" | "codex", Runner>;
 }
 
 /**
@@ -167,7 +168,7 @@ export async function routeCandidates(options: RouteOptions): Promise<RoutePassR
   if (batch.threads.length === 0 && batch.outcomes.length === 0 && batch.stalls.length === 0) return result;
 
   const asked = await askRouter(options, routerMessage(batch));
-  result.router = { t3ThreadId: asked.t3ThreadId, started: asked.started };
+  result.router = { sessionId: asked.sessionId };
   const answer = parseRouterAnswer(asked.reply, batch);
 
   for (const decision of answer.decisions) {
@@ -369,43 +370,30 @@ function flaggedStalls(store: Store): StallItem[] {
 // --- asking the Router -----------------------------------------------------------------------
 
 /**
- * Sends the batch to the current Router thread, or starts a new one when there is none or T3 no
- * longer has it (open question 5: the minimal recovery). A new Router needs nothing but the batch,
- * because every batch carries the whole contract.
+ * Starts one fresh, read-only Router session for this batch. The batch contains the whole contract,
+ * so the Router has no state to resume and no need to write in the checkout.
  */
 async function askRouter(
   options: RouteOptions,
   text: string,
-): Promise<{ t3ThreadId: string; started: boolean; reply: string }> {
-  const { store, t3, router } = options;
-  let current = store.routerThread();
-  if (current !== null) {
-    try {
-      await t3.showThread(current);
-    } catch (error) {
-      if (!(error instanceof T3ThreadGone)) throw error;
-      current = null;
-    }
-  }
-  let run: T3RunResult;
-  if (current === null) {
-    run = await t3.startRun({
-      project: router.project,
-      title: "Ostrom Router",
-      message: text,
-      provider: router.provider,
-      model: router.model,
+): Promise<{ sessionId: string; reply: string }> {
+  const cwd = await mkdtemp(join(tmpdir(), "ostrom-router-"));
+  try {
+    let sessionId: string | null = null;
+    const session = options.runners[options.router.harness].start({
+      cwd,
+      model: options.router.model,
+      sandbox: "read-only",
+      onSessionId: (id) => { sessionId = id; },
     });
-    store.recordRouterThread(run.threadId);
-  } else {
-    run = await t3.sendRun(current, text);
+    const result = await session.send(text);
+    if (result.status !== "completed" || sessionId === null) {
+      throw new RouterRunError(`Router session ${sessionId ?? "unknown"} ended ${result.status}`);
+    }
+    return { sessionId, reply: result.text };
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
   }
-  if (run.status !== "completed" || run.reply === null) {
-    throw new RouterRunError(
-      `Router run ${run.runId} on ${run.threadId} ended ${run.status}${run.error === null ? "" : `: ${run.error}`}`,
-    );
-  }
-  return { t3ThreadId: run.threadId, started: current === null, reply: run.reply };
 }
 
 const OUTCOME_MEANING: Record<OutcomeEvent, string> = {

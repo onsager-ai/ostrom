@@ -61,8 +61,9 @@ commands:
 environment: OSTROM_REPO, OSTROM_ALLOWLIST, OSTROM_DB;
   dispatch also needs OSTROM_WORKER_REPO, OSTROM_WORKER_BASE (optional: OSTROM_WORKER_WORKTREES,
   OSTROM_WORKER_HARNESS=claude|codex, default codex, OSTROM_WORKER_MODEL, default gpt-6-luna);
-  route-candidates needs those, OSTROM_T3_PROJECT, OSTROM_ROUTER_PROVIDER and
-  OSTROM_ROUTER_MODEL; watchdog needs OSTROM_STALL_MINUTES; tick and run need all of them
+  route-candidates needs those, optional OSTROM_ROUTER_HARNESS=claude|codex (default codex) and
+  OSTROM_ROUTER_MODEL (default gpt-6-luna); watchdog needs OSTROM_STALL_MINUTES; tick and run
+  need all of them
 `;
 
 export interface MainDeps {
@@ -293,7 +294,14 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
     }
     if (command === "route-candidates") {
       const router = loadRouterConfig(deps.env);
-      const pass = await routeCandidates({ store, gh: deps.gh, t3: new T3Cli(deps.t3), repo: config.repo, workers: workers(), router });
+      const pass = await routeCandidates({
+        store,
+        gh: deps.gh,
+        repo: config.repo,
+        workers: workers(),
+        router,
+        runners: deps.runners ?? realRunners(deps.env),
+      });
       if (pass.router !== null) deps.stdout(JSON.stringify({ type: "router", ...pass.router }));
       for (const decision of pass.decisions) deps.stdout(JSON.stringify({ type: "decision", ...decision }));
       for (const outcome of pass.outcomes) deps.stdout(JSON.stringify({ type: "outcome", ...outcome }));
