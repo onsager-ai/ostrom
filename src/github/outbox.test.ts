@@ -141,7 +141,7 @@ test("a status card posts once then future states edit the same comment", async 
   store.enqueueStatusCard(thread, "## Ostrom: Working");
   assert.deepEqual((await send()).sent, [`card-thread-${thread}`]);
   const id = github.commentsOn(7)[0]!["id"] as number;
-  store.setStatusCardCommentId(thread, id);
+  assert.equal(store.getThread(thread).statusCardCommentId, id);
   store.enqueueStatusCard(thread, "## Ostrom: Done");
   assert.deepEqual((await send()).sent, [`card-thread-${thread}-${new Date(T0).toISOString()}`]);
   assert.equal(github.commentsOn(7).length, 1);

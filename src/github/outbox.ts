@@ -90,18 +90,24 @@ async function postCommentBatch(replies: readonly Reply[], options: SendOptions,
   try {
     const remaining: Reply[] = [];
     for (const reply of replies) {
-      if (await alreadyPosted(gh, repo, number, reply, replyMarker(reply.id), options.perPage ?? 100)) {
-        store.markReplySent(reply.id);
-        result.found.push(reply.id);
-      } else {
+      const found = await alreadyPosted(gh, repo, number, reply, replyMarker(reply.id), options.perPage ?? 100);
+      if (found === null) {
         remaining.push(reply);
+      } else {
+        store.markReplySent(reply.id);
+        if (isStatusCard(reply)) store.setStatusCardCommentId(reply.threadId, found);
+        result.found.push(reply.id);
       }
     }
     if (remaining.length === 0) return;
     const body = remaining.map((reply) => `${reply.body}\n\n${replyMarker(reply.id)}`).join("\n\n---\n\n");
-    await gh(["api", "--method", "POST", `repos/${repo}/issues/${number}/comments`, "-f", `body=${body}`]);
+    const posted = JSON.parse(await gh(["api", "--method", "POST", `repos/${repo}/issues/${number}/comments`, "-f", `body=${body}`])) as { id?: unknown };
     for (const reply of remaining) {
       store.markReplySent(reply.id);
+      if (isStatusCard(reply)) {
+        if (typeof posted.id !== "number") throw new Error("GitHub did not return the status card comment id");
+        store.setStatusCardCommentId(reply.threadId, posted.id);
+      }
       result.sent.push(reply.id);
     }
   } catch (error) {
@@ -160,15 +166,23 @@ async function alreadyPosted(
   reply: Reply,
   marker: string,
   perPage: number,
-): Promise<boolean> {
+): Promise<number | null> {
   const since = sinceParam(new Date(reply.enqueuedAt));
   for (let page = 1; ; page++) {
     const path = `repos/${repo}/issues/${number}/comments?since=${since}&per_page=${perPage}&page=${page}`;
     const comments = await ghGet(gh, path);
     if (!Array.isArray(comments)) throw new Error(`GET ${path}: expected a JSON array`);
-    if (comments.some((c: { body?: unknown }) => typeof c.body === "string" && c.body.includes(marker))) return true;
-    if (comments.length < perPage) return false;
+    const found = comments.find((c: { body?: unknown }) => typeof c.body === "string" && c.body.includes(marker)) as { id?: unknown } | undefined;
+    if (found !== undefined) {
+      if (typeof found.id !== "number") throw new Error(`GET ${path}: marker comment has no numeric id`);
+      return found.id;
+    }
+    if (comments.length < perPage) return null;
   }
+}
+
+function isStatusCard(reply: Reply): boolean {
+  return reply.id === `card-thread-${reply.threadId}` || reply.id.startsWith(`card-thread-${reply.threadId}-`);
 }
 
 function minutesFromEnv(name: string, fallback: number): number {
