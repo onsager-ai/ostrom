@@ -56,7 +56,7 @@ export const COMMANDS: readonly CommandDefinition[] = [
     name: "forbidden",
     sayOrDo: "A command from someone without permission",
     effect: "Ignored",
-    whoMay: "",
+    whoMay: " ",
     acknowledgement: "😕 only; no comment, so no noise and no argument",
   },
 ];
