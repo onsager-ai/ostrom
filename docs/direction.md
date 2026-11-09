@@ -114,8 +114,8 @@ noted.
 
 1. **Session runner.** `src/session/`: one small interface over the Claude Agent SDK and the Codex
    SDK (start, send a turn, resume by ID, cancel, and per-turn usage), plus worktree creation. The
-   SDK versions are pinned and covered by agreement tests. `src/t3/` and `vendor/t3code/` are
-   removed.
+   SDK versions are pinned and covered by agreement tests. `src/t3/` and `vendor/t3code/` remain
+   until PR 3, when their last callers move to the runner.
 2. **Workers on the runner.** Dispatch, follow-ups as resumed turns, outcomes from turn results and
    PR state, and resume after an `ostromd` restart. A migration adds the session fields and
    `machine` to `assignment`.
@@ -156,9 +156,12 @@ nothing is built or tested locally on the operator's laptop. Workers run on chea
 
 ## Open questions
 
-1. **Logins.** Do the SDKs run on the operator's own Claude and Codex logins, or do they need API
-   keys? The spike did not prove either (it used the configured gateway and Magpie provider). PR 1
-   must settle this before any Worker runs.
+1. **Logins — still open.** On 2026-11-09, tiny SDK calls succeeded both as configured and with
+   gateway environment credentials removed. Claude reported `apiKeySource: none` in both cases;
+   that value also covers OAuth and other providers, so it does not establish the credential used.
+   Codex's native records reported `magpie` as configured and `openai` with the SDK override; both
+   calls completed, but neither the events nor the session record identified the credential source.
+   The direct-provider calls therefore do not yet prove that the operator's logins were used.
 2. **Model checks.** The Codex SDK reports token usage but not the model. Ostrom must confirm the
    model each turn used (from the native session record) so that a resume never silently runs on an
    expensive default, as happened once in the spike.
