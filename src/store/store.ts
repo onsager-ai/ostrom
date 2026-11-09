@@ -347,9 +347,10 @@ export class Store {
        WHERE NOT EXISTS (SELECT 1 FROM decision_trigger WHERE trigger_id = t.id)
          AND NOT EXISTS (SELECT 1 FROM delivery WHERE trigger_id = t.id)
          AND NOT EXISTS (SELECT 1 FROM command_receipt WHERE trigger_id = t.id)
-         AND NOT EXISTS (
-           SELECT 1 FROM subscription JOIN ticket ON ticket.id = subscription.ticket_id
-           WHERE subscription.thread_id = t.thread_id AND ticket.state IN ('open', 'paused'))
+         AND (
+           t.kind = 'issue_state' OR NOT EXISTS (
+             SELECT 1 FROM subscription JOIN ticket ON ticket.id = subscription.ticket_id
+             WHERE subscription.thread_id = t.thread_id AND ticket.state IN ('open', 'paused')))
        ORDER BY t.occurred_at, t.id`,
     ).map(toTrigger);
   }

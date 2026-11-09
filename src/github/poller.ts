@@ -271,13 +271,13 @@ function issueCommentEvent(item: Item): GitHubEvent {
 
 function issueStateEvent(item: Item, store: Store, sourceId: number): GitHubEvent | null {
   const state = item["state"];
-  if (state !== "closed") return null;
+  if (state !== "closed" && state !== "open") return null;
   const kind: ThreadKind = item["pull_request"] == null ? "issue" : "pull_request";
   const number = field(item, "number", "number");
-  const thread = store.findThread(sourceId, number) ??
-    store.getThread(store.ensureThread({ sourceId, kind, number, url: field(item, "html_url", "string") }));
-  const tickets = store.ticketsForThread(thread.id);
-  if (!tickets.some((ticket) => ticket.state === "open" || ticket.state === "paused")) return null;
+  const existing = store.findThread(sourceId, number);
+  if (state === "open" && (existing === null || !store.ticketsForThread(existing.id).some((ticket) => ticket.state === "ended"))) return null;
+  const thread = existing ?? store.getThread(store.ensureThread({ sourceId, kind, number, url: field(item, "html_url", "string") }));
+  if (state === "closed" && !store.ticketsForThread(thread.id).some((ticket) => ticket.state === "open" || ticket.state === "paused")) return null;
   const url = field(item, "html_url", "string");
   return {
     id: `${field(item, "node_id", "string")}:${state}:${field(item, "updated_at", "string")}`,

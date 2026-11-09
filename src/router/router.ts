@@ -223,7 +223,7 @@ async function candidateThreads(options: RouteOptions): Promise<ThreadView[]> {
       view = { thread: thread.id, kind: thread.kind, number: thread.number, url: thread.url, candidates: [] };
       byThread.set(thread.id, view);
     }
-    const body = await fetchBody(options.gh, options.repo, trigger, view.number);
+    const body = trigger.kind === "issue_state" ? (trigger.body ?? "") : await fetchBody(options.gh, options.repo, trigger, view.number);
     view.candidates.push({
       trigger: trigger.id,
       kind: trigger.kind,
