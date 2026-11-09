@@ -20,22 +20,26 @@ A stall opens one `stall` row and remains one episode until Semon no longer repo
 
 ## Scripted stall
 
-Semon currently reports a completed Codex exec turn as `ended`, not `waiting-question`, even when
-its last Worker message says it is waiting for an answer. The exercise therefore hangs an *open*
-turn with no output (`sleep 3600`), which Semon reports as `no-output`; the Watchdog counts that
-only after the turn itself has run for `OSTROM_STALL_MINUTES`.
+Semon reports a completed Codex exec turn as `ended`, not `waiting-question`, even when its last
+Worker message says it is waiting for an answer. Nor does a hung command look idle to Semon: Codex
+polls a long-running command about once a minute, so the session keeps writing and Semon reports it
+working. The exercise therefore hangs an *open* turn (`sleep 3600`) under a short idle budget. The
+idle budget counts from the assignment's last finished turn, so it flags the hung turn as
+`budget reached: idle`. Each ladder step cancels the turn, which restarts that count, so each of the
+two recoveries and the public reply comes one idle budget after the last.
 
-Use a throwaway database. Start `ostromd run` against that store first, with a small stall threshold;
-the script only seeds an accepted decision. The daemon dispatches the ticket in its normal
-`route-candidates` pass and owns the turn it later cancels. Its public stuck reply is queued in the
-outbox and posts to the supplied issue when the daemon reaches its `send` pass.
+Use a throwaway database. Start `ostromd run` against that store first; the script only seeds an
+accepted decision, whose ticket takes its budget from the environment as a Router-accepted one does.
+The daemon dispatches the ticket in its normal `route-candidates` pass and owns the turn it later
+cancels. Its public stuck reply is queued in the outbox and posts to the supplied issue when the
+daemon reaches its `send` pass.
 
 ```sh
 export OSTROM_REPO=onsager-ai/ostrom OSTROM_ALLOWLIST=<login> OSTROM_DB=/tmp/ostrom-stall/ostrom.sqlite
 export OSTROM_WORKER_REPO=<main-checkout> OSTROM_WORKER_BASE=main OSTROM_STALL_MINUTES=2
 node src/ostromd/main.ts run --interval 15
 # in another terminal, with the same environment:
-node src/watchdog/scripted-stall.ts <issue-number>
+OSTROM_BUDGET_IDLE_MIN=3 node src/watchdog/scripted-stall.ts <issue-number>
 ```
 
 The seeded Worker brief runs `sleep 3600`, then asks which colour to use, red or blue. Stop the
