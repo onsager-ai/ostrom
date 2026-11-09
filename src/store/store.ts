@@ -962,7 +962,7 @@ export class Store {
         stallId,
       );
       if (row === undefined) return null;
-      this.#run("UPDATE stall SET recovery_attempts = ? WHERE id = ?", row["stall_recovery_attempts"], stallId);
+      this.#run("UPDATE stall SET recovery_attempts = ? WHERE id = ?", row["stall_recovery_attempts"] as number, stallId);
       return this.getStall(stallId);
     });
   }
