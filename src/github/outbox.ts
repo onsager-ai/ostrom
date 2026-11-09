@@ -90,14 +90,14 @@ async function postCommentBatch(replies: readonly Reply[], options: SendOptions,
   let remaining: Reply[] = [];
   try {
     for (const reply of replies) {
+      // Add before deriving the marker so a malformed id is recorded as a retryable failure too.
+      remaining.push(reply);
       const found = await alreadyPosted(gh, repo, number, reply, replyMarker(reply.id), options.perPage ?? 100);
-      if (found === null) {
-        remaining.push(reply);
-      } else {
-        store.markReplySent(reply.id);
-        if (isStatusCard(reply)) store.setStatusCardCommentId(reply.threadId, found);
-        result.found.push(reply.id);
-      }
+      if (found === null) continue;
+      remaining.pop();
+      store.markReplySent(reply.id);
+      if (isStatusCard(reply)) store.setStatusCardCommentId(reply.threadId, found);
+      result.found.push(reply.id);
     }
     if (remaining.length === 0) return;
     const body = remaining.map((reply) => `${reply.body}\n\n${replyMarker(reply.id)}`).join("\n\n---\n\n");
