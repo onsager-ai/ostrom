@@ -29,3 +29,6 @@ Developer-only one-shot passes remain available as `ostromd dev <pass>`:
 `poll`, `send`, `dispatch <ticket>`, `observe`, `commands`, `route`, `watchdog`,
 `route-candidates`, and `tick`. They are retained for their existing tests and
 for controlled sandbox diagnosis.
+
+Set `OSTROM_WORKER_RULES_FILE` to a file of the machine's house rules (for example its heat
+limits, and that tests run in CI rather than locally). Its text closes every Worker's brief.

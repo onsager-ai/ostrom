@@ -9,7 +9,7 @@ import type { AssignmentOutcome, Store, TicketContext } from "../store/store.ts"
  * The Worker's first message: a summary plus pointers ("Inline & Spill"). It quotes no comment
  * bodies; the Worker reads the thread itself.
  */
-export function workerBrief(context: TicketContext, branch: string, base: string): string {
+export function workerBrief(context: TicketContext, branch: string, base: string, rules?: string): string {
   const { ticket, thread, source } = context;
   const noun = thread.kind === "issue" ? "issue" : "pull request";
   return [
@@ -27,6 +27,7 @@ export function workerBrief(context: TicketContext, branch: string, base: string
     "request will reach you in this session as follow-up messages.",
     "You run unattended: never stop to ask an interactive question. Decide, state your assumption in",
     "the pull request description, and carry on.",
+    ...(rules === undefined ? [] : ["", "House rules for this machine, which you must follow:", rules]),
   ].join("\n");
 }
 

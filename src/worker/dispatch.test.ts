@@ -52,6 +52,13 @@ test("the brief tells an unattended Worker never to block on a question", () => 
   assert.match(workerBrief(store.ticketContext(ticketId), "b", "main"), /never stop to ask an interactive question/);
 });
 
+test("the machine's house rules close the brief when configured, and are absent otherwise", () => {
+  const { store, ticketId } = fixture();
+  const context = store.ticketContext(ticketId);
+  assert.match(workerBrief(context, "b", "main", "Run tests in CI only."), /House rules for this machine, which you must follow:\nRun tests in CI only\.$/);
+  assert.doesNotMatch(workerBrief(context, "b", "main"), /House rules/);
+});
+
 test("a branch's pull requests are read from GitHub with their state", async () => {
   const { github } = fixture();
   github.pulls.push({ branch: "ostrom/ticket-1-1", number: 12, state: "open" }, { branch: "ostrom/ticket-1-1", number: 11, state: "merged" },

@@ -76,7 +76,7 @@ export class Workers {
           resolve(sessionId);
         },
       });
-      const turn = this.#enqueue(id, () => this.#firstTurn(id, session, workerBrief(context, branch, config.base)));
+      const turn = this.#enqueue(id, () => this.#firstTurn(id, session, workerBrief(context, branch, config.base, config.rules)));
       await Promise.race([started, turn]);
       const assignment = store.getAssignment(id);
       if (assignment.state === "ended") throw new Error(assignment.endReason ?? "the session did not start");
