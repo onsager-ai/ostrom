@@ -1,0 +1,18 @@
+{
+  "name": "ostrom",
+  "private": true,
+  "description": "A super agent: GitHub events in, a Router that dispatches, isolated Workers on T3 Code.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=24.22.2"
+  },
+  "scripts": {
+    "typecheck": "tsc",
+    "test": "node --test \"src/**/*.test.ts\""
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "typescript": "7.0.2"
+  }
+}
