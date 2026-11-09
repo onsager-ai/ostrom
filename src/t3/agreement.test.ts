@@ -55,6 +55,11 @@ const ThreadShow = Schema.Struct({
   ),
 });
 
+// The upstream schemas arrive untyped (see the computed import above), which leaves their
+// decoding services as `any`; upstream's schemas need none, so decode them as plain codecs.
+const decode = (schema: Schema.Constraint, value: unknown) =>
+  Schema.decodeUnknownSync(schema as unknown as Schema.Codec<unknown>)(value);
+
 const SAMPLES = 300;
 // Values as the CLI prints them: generated from the upstream schema, then through JSON.
 const printed = async (schema: Schema.Constraint): Promise<any[]> => {
@@ -104,9 +109,9 @@ test("every thread status upstream can report is one the parser accepts", () => 
 
 test("the real captures are valid under the upstream schemas", () => {
   for (const name of ["start.json", "send.json"]) {
-    Schema.decodeUnknownSync(RunResult)(JSON.parse(fixture(name)));
+    decode(RunResult, JSON.parse(fixture(name)));
   }
-  Schema.decodeUnknownSync(ThreadShow)(JSON.parse(fixture("show.json")));
+  decode(ThreadShow, JSON.parse(fixture("show.json")));
 });
 
 test("the run-result parser reads every value upstream can print", async () => {
