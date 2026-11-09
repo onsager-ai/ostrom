@@ -3,6 +3,9 @@
 Status: draft, 2026-11-09. This is a direction, not a spec. The pre-restart Ostrom lives in Git
 history (see the restart PR for the archive tag).
 
+**Superseded in part:** the runtime here (Router and Workers as T3 threads) breaks the background
+principle in `docs/experience.md`, which now comes first. This document will be re-derived from it.
+
 ## What Ostrom is
 
 Ostrom is a super agent for one operator. Events come in from GitHub (later from chat, CI and
