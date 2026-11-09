@@ -1,3 +1,5 @@
+<img src="docs/brand/favicon.svg" width="48" height="48" alt="Ostrom">
+
 # ostrom
 
 A harness-agnostic CLI shipping small mechanisms for governing
