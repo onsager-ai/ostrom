@@ -1,12 +1,14 @@
 // Runs the `t3` CLI. Arguments go to the process as an argv array and never through a shell;
-// the Worker brief goes on stdin (`-` as the message), so its text is never parsed as a flag.
+// briefs and messages go on stdin (`-` as the message), so their text is never parsed as a flag.
 // A non-zero exit or output the parsers reject is an error, never a success (AGENTS.md rule 4).
 
 import { spawn } from "node:child_process";
 import {
   parseLaunchResult,
+  parseSendResult,
   parseThreadShow,
   type T3LaunchResult,
+  type T3SendResult,
   type T3ThreadShow,
 } from "./cli-json.ts";
 
@@ -94,6 +96,16 @@ export class T3Cli {
       throw new T3CommandError(`t3 thread start created ${launched.threadId} without starting a run`);
     }
     return launched;
+  }
+
+  /**
+   * `t3 thread send` without `--wait`: T3 starts a run on an idle thread or queues the message as
+   * the busy thread's next turn (docs/direction.md, open question 1). Nothing is interrupted.
+   */
+  async sendMessage(threadId: string, message: string): Promise<T3SendResult> {
+    return parseSendResult(
+      await this.#call({ args: ["thread", "send", "--json", threadId, "-"], stdin: message }),
+    );
   }
 
   async showThread(threadId: string): Promise<T3ThreadShow> {

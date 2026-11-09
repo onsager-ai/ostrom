@@ -1,6 +1,6 @@
 // ostromd: the daemon that will run intake, filtering, fan-out, the outbox and the Watchdog.
-// See docs/direction.md. For now it runs one pass of intake, the outbox, Worker dispatch or Worker
-// observation per invocation; scheduling the passes comes later.
+// See docs/direction.md. For now it runs one pass of intake, the outbox, Worker dispatch, Worker
+// observation or follow-up routing per invocation; scheduling the passes comes later.
 
 import { execGh, type GhRunner } from "../github/gh.ts";
 import { sendDueReplies } from "../github/outbox.ts";
@@ -8,6 +8,7 @@ import { pollOnce } from "../github/poller.ts";
 import { Store } from "../store/store.ts";
 import { processRunner, T3Cli, type T3Runner } from "../t3/runner.ts";
 import { dispatch, observe } from "../worker/dispatch.ts";
+import { routeFollowUps } from "../worker/follow-up.ts";
 import { loadConfig, loadWorkerConfig } from "./config.ts";
 
 const USAGE = `usage: ostromd <command>
@@ -20,6 +21,8 @@ commands:
   observe
          read every running Worker's T3 thread once; subscribe tickets to their PRs and
          print each observation as a JSON line
+  route  send each new trigger on a subscribed thread to its ticket's Worker once; print each
+         delivery as a JSON line
 
 environment: OSTROM_REPO, OSTROM_ALLOWLIST, OSTROM_DB;
   dispatch also needs OSTROM_T3_PROJECT, OSTROM_WORKER_BASE, OSTROM_WORKER_PROVIDER,
@@ -49,7 +52,8 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
   const valid =
     command === "dispatch"
       ? rest.length === 1 && /^[1-9]\d*$/.test(ticketArg!)
-      : (command === "poll" || command === "send" || command === "observe") && rest.length === 0;
+      : (command === "poll" || command === "send" || command === "observe" || command === "route") &&
+        rest.length === 0;
   if (!valid) {
     deps.stderr(USAGE.trimEnd());
     return 2;
@@ -72,6 +76,17 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
         deps.stderr(`ostromd observe: assignment ${failure.assignmentId} failed: ${failure.error}`);
       }
       deps.stderr(`ostromd observe: ${pass.observed.length} observed, ${pass.failed.length} failed`);
+      return pass.failed.length === 0 ? 0 : 1;
+    }
+    if (command === "route") {
+      const pass = await routeFollowUps(store, new T3Cli(deps.t3));
+      for (const delivered of pass.delivered) deps.stdout(JSON.stringify(delivered));
+      for (const failure of pass.failed) {
+        deps.stderr(
+          `ostromd route: trigger ${failure.triggerId} to ticket ${failure.ticketId} failed: ${failure.error}`,
+        );
+      }
+      deps.stderr(`ostromd route: ${pass.delivered.length} delivered, ${pass.failed.length} failed`);
       return pass.failed.length === 0 ? 0 : 1;
     }
     if (command === "poll") {

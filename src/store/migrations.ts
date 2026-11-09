@@ -139,6 +139,30 @@ export const migrations: readonly string[] = [
   ALTER TABLE assignment_v2 RENAME TO assignment;
   CREATE INDEX assignment_by_ticket ON assignment (ticket_id);
   `,
+
+  // 3: follow-up delivery. A trigger on a subscribed thread is sent to the ticket's Worker
+  // without a decision; this records that it reached that Worker, and the T3 run it became, so a
+  // replayed pass does not send it again.
+  `
+  CREATE TABLE delivery (
+    trigger_id    INTEGER NOT NULL REFERENCES "trigger" (id),
+    assignment_id INTEGER NOT NULL REFERENCES assignment (id),
+    t3_run_id     TEXT NOT NULL CHECK (t3_run_id <> ''),
+    delivered_at  TEXT NOT NULL,
+    PRIMARY KEY (trigger_id, assignment_id)
+  ) STRICT, WITHOUT ROWID;
+  CREATE INDEX delivery_by_assignment ON delivery (assignment_id);
+  CREATE TRIGGER delivery_needs_subscription BEFORE INSERT ON delivery
+  WHEN NOT EXISTS (
+    SELECT 1 FROM assignment
+    JOIN subscription ON subscription.ticket_id = assignment.ticket_id
+    JOIN "trigger" ON "trigger".thread_id = subscription.thread_id
+    WHERE assignment.id = NEW.assignment_id AND "trigger".id = NEW.trigger_id
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'a delivery needs the assignment''s ticket subscribed to the trigger''s thread');
+  END;
+  `,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */

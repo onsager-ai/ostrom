@@ -47,6 +47,17 @@ export interface T3LaunchResult {
   readonly runId: string | null;
 }
 
+export const T3_SEND_DELIVERIES = ["started", "queued", "steered", "restarted"] as const;
+/** How T3 took a message: it started a run on an idle thread, or queued it behind the busy one. */
+export type T3SendDelivery = (typeof T3_SEND_DELIVERIES)[number];
+
+/** `t3 thread send --json` without `--wait`: the message was accepted as run `runId`. */
+export interface T3SendResult {
+  readonly threadId: string;
+  readonly runId: string;
+  readonly delivery: T3SendDelivery;
+}
+
 export interface T3LinkedPullRequest {
   readonly repository: string;
   readonly number: number;
@@ -102,6 +113,15 @@ export function parseLaunchResult(stdout: string): T3LaunchResult {
     threadId: string(value["threadId"], "$.threadId"),
     projectId: string(value["projectId"], "$.projectId"),
     runId: nullable(string, value["runId"], "$.runId"),
+  };
+}
+
+export function parseSendResult(stdout: string): T3SendResult {
+  const value = record(parseJson(stdout), "$");
+  return {
+    threadId: string(value["threadId"], "$.threadId"),
+    runId: string(value["runId"], "$.runId"),
+    delivery: oneOf(T3_SEND_DELIVERIES, value["delivery"], "$.delivery"),
   };
 }
 

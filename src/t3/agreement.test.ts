@@ -14,6 +14,7 @@ import * as Schema from "effect/Schema";
 import {
   parseLaunchResult,
   parseRunResult,
+  parseSendResult,
   parseThreadShow,
   T3_PULL_REQUEST_SOURCES,
   T3_THREAD_STATUSES,
@@ -34,6 +35,8 @@ const base = await import(baseSchemasPath);
 const ThreadDetail = contracts.OrchestratorMcpThreadDetail;
 const TimelineItem = contracts.OrchestratorMcpThreadTimelineItem;
 const ThreadStatus = contracts.OrchestratorMcpThreadStatus;
+// What `t3 thread send --json` prints without --wait: the t3_thread_send reply, printed as is.
+const SendResult = contracts.OrchestratorMcpThreadSendResult;
 const PullRequestSource = contracts.OrchestratorMcpThreadPullRequest.fields["source"];
 const ThreadId = base.ThreadId;
 const RunId = base.RunId;
@@ -111,6 +114,9 @@ test("the CLI still builds its --json output the way the schemas above assume", 
     // start without --wait: the launch result, decoded with the CLI's own struct.
     `const ThreadLaunchResult = Schema.Struct({\n  threadId: ThreadId,\n  projectId: ProjectId,\n  runId: Schema.NullOr(RunId),\n});`,
     `yield* flags.json ? printJson(launched) : Console.log(launched.threadId);`,
+    // send without --wait: the t3_thread_send reply, decoded with the upstream schema.
+    `OrchestratorMcpThreadSendResult,\n          );`,
+    `? printJson(sent)`,
   ];
   for (const anchor of anchors) {
     assert.ok(cli.includes(anchor), `upstream thread.ts changed; re-derive the shape around: ${anchor}`);
@@ -146,6 +152,17 @@ test("the real captures are valid under the upstream schemas", () => {
   }
   decode(ThreadShow, JSON.parse(fixture("show.json")));
   decode(LaunchResult, JSON.parse(fixture("launch.json")));
+  decode(SendResult, JSON.parse(fixture("send-nowait.json")));
+});
+
+test("the send-result parser reads every value upstream can print", async () => {
+  for (const value of await printed(SendResult)) {
+    assert.deepEqual(parseSendResult(JSON.stringify(value)), {
+      threadId: value.threadId,
+      runId: value.runId,
+      delivery: value.delivery,
+    });
+  }
 });
 
 test("the launch-result parser reads every value upstream can print", async () => {
