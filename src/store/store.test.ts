@@ -492,3 +492,62 @@ test("the newest recorded Router thread is the current one", () => {
   assert.equal(store.routerThread(), "mcp:router-2");
   assert.throws(() => store.recordRouterThread("mcp:router-1"), /UNIQUE/);
 });
+
+test("evidence joins a ticket's records to its T3 thread ids and GitHub URLs, and no other ticket's", () => {
+  const { store, source, issue, trigger } = fixture();
+  const T = "2026-11-09T12:00:00.000Z";
+  const { ticketId } = store.recordDecision({
+    threadId: issue, triggerIds: [trigger()], verdict: "accept", reason: "asks for work", reply: "On it.",
+  });
+  const assignmentId = store.createAssignment(ticketId!);
+  store.startAssignment(assignmentId, "mcp:worker");
+  const pr = store.ensureThread({ sourceId: source.id, kind: "pull_request", number: 12, url: "https://github.com/onsager-ai/ostrom/pull/12" });
+  store.subscribe(ticketId!, pr);
+  const review = trigger(pr);
+  store.recordDelivery(review, assignmentId, "run:1");
+  const stallId = store.recordStall({ assignmentId, semonReason: null, t3Reason: "waiting-request", detail: null }).id;
+  store.answerStall(stallId, "wait", "Still on it.");
+  store.enqueueOutcomeReply({ id: "outcome-a1-pr12-merged", threadId: issue, body: "Merged." }, { assignmentId });
+
+  // A second ticket's replies, and an outcome id that only shares a prefix, stay out of the first.
+  const other = store.ensureThread({ sourceId: source.id, kind: "issue", number: 9, url: "https://github.com/onsager-ai/ostrom/issues/9" });
+  const second = store.recordDecision({ threadId: other, triggerIds: [trigger(other)], verdict: "accept", reason: "r", reply: "Ok." });
+  store.enqueueReply({ id: "outcome-a11-failed", threadId: other, body: "x" });
+
+  const reply = (id: string, threadUrl: string) => ({ id, threadUrl, enqueuedAt: T, sentAt: null, attempts: 0, lastError: null });
+  const first = {
+    ticketId, state: "ended", openedAt: T, endedAt: T,
+    decision: {
+      id: 1, verdict: "accept", reason: "asks for work", decidedAt: T,
+      thread: { kind: "issue", number: 7, url: "https://github.com/onsager-ai/ostrom/issues/7" },
+    },
+    triggers: [{ id: 1, kind: "issue_comment", actor: "someone", url: "https://github.com/onsager-ai/ostrom/issues/7#issuecomment-1", occurredAt: T }],
+    assignments: [{
+      id: assignmentId, state: "ended", t3ThreadId: "mcp:worker", branch: `ostrom/ticket-${ticketId}-${assignmentId}`,
+      startedAt: T, endedAt: T, endReason: null, outcome: null,
+    }],
+    subscriptions: [
+      { kind: "issue", number: 7, url: "https://github.com/onsager-ai/ostrom/issues/7", subscribedAt: T },
+      { kind: "pull_request", number: 12, url: "https://github.com/onsager-ai/ostrom/pull/12", subscribedAt: T },
+    ],
+    followUps: [{
+      triggerUrl: "https://github.com/onsager-ai/ostrom/issues/7#issuecomment-2", actor: "someone", assignmentId,
+      t3ThreadId: "mcp:worker", t3RunId: "run:1", deliveredAt: T,
+    }],
+    stalls: [{
+      id: stallId, assignmentId, semonReason: null, t3Reason: "waiting-request",
+      detectedAt: T, clearedAt: null, action: "wait", answeredAt: T,
+    }],
+    replies: [
+      reply("decision-1", "https://github.com/onsager-ai/ostrom/issues/7"),
+      reply("outcome-a1-pr12-merged", "https://github.com/onsager-ai/ostrom/issues/7"),
+      reply(`stall-${stallId}`, "https://github.com/onsager-ai/ostrom/issues/7"),
+    ],
+  };
+  assert.deepEqual(store.evidence(ticketId), [first]);
+  const all = store.evidence();
+  assert.deepEqual(all.map((t) => (t as { ticketId: number }).ticketId), [ticketId, second.ticketId]);
+  assert.deepEqual(all[0], first);
+  assert.deepEqual((all[1] as { replies: { id: string }[] }).replies.map((r) => r.id), ["decision-2"]);
+  assert.deepEqual(store.evidence(99), []);
+});

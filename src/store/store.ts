@@ -2,6 +2,7 @@
 // See docs/direction.md, "Data model". Only the operations milestone 1 needs live here.
 
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
+import { EVIDENCE_SQL } from "./evidence.ts";
 import { migrate } from "./migrations.ts";
 
 export type SourceKind = "github";
@@ -752,6 +753,16 @@ export class Store {
     const row = this.#get("SELECT sent_at FROM outbox WHERE id = ?", replyId);
     if (row === undefined) throw new Error(`no outbox reply ${replyId}`);
     throw new IllegalTransition(`outbox ${replyId} was already sent at ${String(row["sent_at"])}`);
+  }
+
+  // --- evidence ------------------------------------------------------------------------------
+
+  /** The pass criterion's evidence (src/store/evidence.ts): one object per ticket, or for one. */
+  evidence(ticketId: number | null = null): unknown[] {
+    return this.#db
+      .prepare(EVIDENCE_SQL)
+      .all({ ticket: ticketId })
+      .map((row) => JSON.parse(row["evidence"] as string) as unknown);
   }
 
   // --- plumbing ------------------------------------------------------------------------------

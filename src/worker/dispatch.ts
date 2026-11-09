@@ -4,7 +4,7 @@
 
 import type { WorkerConfig } from "../ostromd/config.ts";
 import type { AssignmentOutcome, Store, TicketContext } from "../store/store.ts";
-import type { T3Thread } from "../t3/cli-json.ts";
+import { hasPendingRequest, type T3Thread } from "../t3/cli-json.ts";
 import type { T3Cli } from "../t3/runner.ts";
 
 export interface Dispatched {
@@ -47,7 +47,9 @@ export async function dispatch(
 
 /**
  * The Worker's first message: a summary plus pointers ("Inline & Spill"). It quotes no comment
- * bodies; the Worker reads the thread itself.
+ * bodies; the Worker reads the thread itself. It forbids interactive questions: at the T3 pin
+ * `t3 thread send` queues the follow-up (`mode: "queue"`), and a pending request blocks the runs
+ * queued behind it until someone answers, so a GitHub reply could never unblock the Worker.
  */
 export function workerBrief(context: TicketContext, branch: string, base: string): string {
   const { ticket, thread, source } = context;
@@ -65,6 +67,12 @@ export function workerBrief(context: TicketContext, branch: string, base: string
     `on ${source.name} against ${base} whose description says "Refs #${thread.number}".`,
     "Do not comment on GitHub yourself: Ostrom replies to people. Review comments on your pull",
     "request will reach you in this thread.",
+    "",
+    "Never ask a question with an interactive tool such as AskUserQuestion: nobody is watching this",
+    "thread, and a reply from GitHub queues behind an unanswered question instead of answering it.",
+    "If you need an answer, commit what you have (`git commit --allow-empty` if there is nothing yet),",
+    "push, open the pull request or update its description with your question in it, and end your",
+    "turn. The answer reaches you here as a follow-up.",
   ].join("\n");
 }
 
@@ -142,8 +150,12 @@ export function pullRequestsOn(thread: T3Thread, repo: string): { number: number
   return [...found].sort(([a], [b]) => a - b).map(([number, url]) => ({ number, url }));
 }
 
+/**
+ * Failed and cancelled come first; otherwise a pending request is `waiting` whatever the status
+ * reads, the same signal the Watchdog's T3 rule uses.
+ */
 export function outcomeOf(thread: T3Thread): AssignmentOutcome | null {
   if (thread.status === "failed" || thread.status === "cancelled") return thread.status;
-  if (thread.status === "waiting" && thread.pendingRequestCount > 0) return "waiting";
+  if (hasPendingRequest(thread)) return "waiting";
   return null;
 }

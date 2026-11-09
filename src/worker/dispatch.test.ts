@@ -100,6 +100,9 @@ test("the brief is a summary plus pointers and asks for a PR that references the
   assert.match(brief, new RegExp(`- https://github.com/${REPO}/issues/7#issuecomment-1\n`));
   assert.match(brief, /branch ostrom\/ticket-1-1/);
   assert.match(brief, new RegExp(`pull request\non ${REPO} against main whose description says "Refs #7"`));
+  // A queued GitHub reply cannot answer a pending question, so the brief rules them out.
+  assert.match(brief, /Never ask a question with an interactive tool such as AskUserQuestion/);
+  assert.match(brief, /with your question in it, and end your\nturn/);
 });
 
 test("a failed start ends the assignment with the reason and is not a success", async () => {
@@ -173,7 +176,8 @@ test("observe records waiting and failed outcomes, and clears them when the Work
   const a = await dispatch(store, t3.cli, worker, ticketId);
   const b = await dispatch(store, t3.cli, worker, ticketId);
   const c = await dispatch(store, t3.cli, worker, ticketId);
-  t3.threads.set(a.t3ThreadId, { status: "waiting", pendingRequestCount: 1 });
+  // A Worker blocked on its question reads `running` with a pending request, as the scripted stall showed.
+  t3.threads.set(a.t3ThreadId, { status: "running", pendingRequestCount: 1 });
   t3.threads.set(b.t3ThreadId, { status: "failed", pendingRequestCount: 0 });
   t3.threads.set(c.t3ThreadId, { status: "cancelled", pendingRequestCount: 0 });
 

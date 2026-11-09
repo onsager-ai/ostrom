@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { FakeGitHub } from "../github/fake-github.ts";
+import { EVIDENCE_SQL } from "../store/evidence.ts";
 import { Store } from "../store/store.ts";
 import { loadConfig, loadRouterConfig, loadWatchdogConfig, loadWorkerConfig } from "./config.ts";
 import { main, TICK, type MainDeps } from "./main.ts";
@@ -376,3 +377,48 @@ test(
     assert.equal(run.err.filter((line) => line.startsWith("ostromd tick:")).length, 2);
   }),
 );
+
+test("evidence takes no argument or --ticket with a ticket id", async () => {
+  for (const argv of [["evidence", "1"], ["evidence", "--ticket"], ["evidence", "--ticket", "0"], ["evidence", "--ticket", "1", "2"]]) {
+    const run = deps({}, async () => "[]");
+    assert.equal(await main(argv, run.deps), 2, argv.join(" "));
+  }
+});
+
+test(
+  "evidence prints each ticket as a JSON line, and a missing ticket exits non-zero",
+  withDb(async (dbPath) => {
+    const env = { OSTROM_REPO: "o/r", OSTROM_ALLOWLIST: "alice", OSTROM_DB: dbPath };
+    const store = Store.open(dbPath);
+    const source = store.ensureSource("github", "o/r");
+    for (const number of [7, 8]) {
+      const issue = store.ensureThread({ sourceId: source.id, kind: "issue", number, url: `https://github.com/o/r/issues/${number}` });
+      const trigger = store.insertTrigger({
+        sourceId: source.id, sourceEventId: `IC_${number}`, threadId: issue, kind: "issue_comment", actor: "alice",
+        url: `https://github.com/o/r/issues/${number}#issuecomment-1`, occurredAt: new Date(),
+      }).id;
+      store.recordDecision({ threadId: issue, triggerIds: [trigger], verdict: "accept", reason: "fix it" });
+    }
+    const expected = store.evidence();
+    store.close();
+
+    const all = deps(env, async () => "[]");
+    assert.equal(await main(["evidence"], all.deps), 0);
+    assert.deepEqual(all.out.map((line) => JSON.parse(line)), expected);
+    assert.equal(all.out.length, 2);
+
+    const one = deps(env, async () => "[]");
+    assert.equal(await main(["evidence", "--ticket", "2"], one.deps), 0);
+    assert.deepEqual(one.out.map((line) => JSON.parse(line)), [expected[1]]);
+
+    const missing = deps(env, async () => "[]");
+    assert.equal(await main(["evidence", "--ticket", "3"], missing.deps), 1);
+    assert.deepEqual(missing.out, []);
+    assert.match(missing.err.join("\n"), /no ticket 3/);
+  }),
+);
+
+test("docs/running.md quotes the evidence query the code runs", () => {
+  const doc = readFileSync(fileURLToPath(new URL("../../docs/running.md", import.meta.url)), "utf8");
+  assert.ok(doc.includes(`\`\`\`sql\n${EVIDENCE_SQL}\n\`\`\``), "the sql block in docs/running.md differs from EVIDENCE_SQL");
+});

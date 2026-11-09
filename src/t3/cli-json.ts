@@ -89,6 +89,15 @@ export interface T3Thread {
   readonly updatedAt: string;
 }
 
+/**
+ * Whether the thread is blocked on a question or approval until someone answers it. Status does
+ * not say so: the scripted stall's Worker, blocked on its question, read `running` with
+ * `pendingRequestCount` 1 at the pin.
+ */
+export function hasPendingRequest(thread: T3Thread): boolean {
+  return thread.pendingRequestCount > 0;
+}
+
 export interface T3Message {
   readonly role: T3MessageRole;
   readonly runId: string | null;

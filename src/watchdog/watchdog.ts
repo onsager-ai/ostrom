@@ -17,7 +17,7 @@
 // with Semon unread, an episode is never cleared, because a missing signal is not a recovery.
 
 import type { Store } from "../store/store.ts";
-import type { T3Thread } from "../t3/cli-json.ts";
+import { hasPendingRequest, type T3Thread } from "../t3/cli-json.ts";
 import type { T3Cli, T3Runner } from "../t3/runner.ts";
 
 /** The window of session logs Semon reads; older Worker stalls are left to the T3 signal. */
@@ -87,15 +87,14 @@ export function parseSemonStalls(stdout: string, idleMinutes: number): SemonStal
 /**
  * The T3 rule: `waiting-request` for a thread with a pending request, `no-update` for one running
  * a run, either with no update for `idleMinutes`; null otherwise. A pending request is checked on
- * its own, not with status `waiting`: the scripted stall's Worker, blocked on its question, read
- * `running` with `pendingRequestCount` 1 at the pin. A thread whose run ended (completed, failed,
+ * its own, not with status `waiting` (see `hasPendingRequest`). A thread whose run ended (completed, failed,
  * ...) is not stalled here: observe and the Router's outcomes cover it.
  */
 export function t3StallReason(thread: T3Thread, now: Date, idleMinutes: number): string | null {
   const updated = Date.parse(thread.updatedAt);
   if (Number.isNaN(updated)) throw new Error(`t3 thread ${thread.threadId} has updatedAt ${JSON.stringify(thread.updatedAt)}`);
   if (now.getTime() - updated < idleMinutes * 60_000) return null;
-  if (thread.pendingRequestCount > 0) return "waiting-request";
+  if (hasPendingRequest(thread)) return "waiting-request";
   if (thread.activeRunId !== null && (thread.status === "running" || thread.status === "starting")) return "no-update";
   return null;
 }

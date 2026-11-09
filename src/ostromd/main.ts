@@ -52,6 +52,9 @@ commands:
          run, and the tick exits non-zero
   run --interval <seconds>
          repeat tick, waiting that long after each, until SIGINT or SIGTERM
+  evidence [--ticket <ticket-id>]
+         print each ticket's records, joined to its T3 thread ids and GitHub URLs, as a JSON
+         line (docs/running.md); a ticket that does not exist exits non-zero
 
 environment: OSTROM_REPO, OSTROM_ALLOWLIST, OSTROM_DB;
   dispatch also needs OSTROM_T3_PROJECT, OSTROM_WORKER_BASE, OSTROM_WORKER_PROVIDER,
@@ -149,7 +152,9 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
       ? rest.length === 1 && /^[1-9]\d*$/.test(ticketArg!)
       : command === "run"
         ? rest.length === 2 && rest[0] === "--interval" && /^[1-9]\d*$/.test(rest[1]!)
-        : (command === "poll" ||
+        : command === "evidence"
+          ? rest.length === 0 || (rest.length === 2 && rest[0] === "--ticket" && /^[1-9]\d*$/.test(rest[1]!))
+          : (command === "poll" ||
             command === "send" ||
             command === "observe" ||
             command === "route" ||
@@ -172,6 +177,17 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
       const ticketId = Number(ticketArg);
       const dispatched = await dispatch(store, new T3Cli(deps.t3), worker, ticketId);
       deps.stdout(JSON.stringify({ ticketId, ...dispatched }));
+      return 0;
+    }
+    if (command === "evidence") {
+      const ticketId = rest.length === 2 ? Number(rest[1]) : null;
+      const tickets = store.evidence(ticketId);
+      for (const ticket of tickets) deps.stdout(JSON.stringify(ticket));
+      if (ticketId !== null && tickets.length === 0) {
+        deps.stderr(`ostromd evidence: no ticket ${ticketId}`);
+        return 1;
+      }
+      deps.stderr(`ostromd evidence: ${tickets.length} tickets`);
       return 0;
     }
     if (command === "observe") {
