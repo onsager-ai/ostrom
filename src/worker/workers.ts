@@ -27,6 +27,11 @@ export interface WorkersDeps {
   log?: (line: string) => void;
 }
 
+/** The main clone's Git directory, where a worktree's commits are written. */
+export function gitDir(repo: string): string {
+  return join(repo, ".git");
+}
+
 export const INTERRUPTED_PROMPT =
   "You were interrupted while working on this ticket. Check your state (git status, your branch and " +
   "pull request) and continue where you stopped.";
@@ -59,6 +64,7 @@ export class Workers {
       const session = this.#deps.runners[config.harness].start({
         cwd: path,
         model: config.model,
+        writableDirs: [gitDir(config.repo)],
         onSessionId: (sessionId) => {
           store.startNativeAssignment(id, sessionId);
           store.beginTurn(id);
@@ -129,6 +135,7 @@ export class Workers {
         cwd: assignment.worktree!,
         model: assignment.model!,
         sessionId: assignment.sessionId!,
+        writableDirs: [gitDir(this.#deps.config.repo)],
       });
       this.#sessions.set(assignment.id, session);
     }

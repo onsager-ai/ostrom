@@ -29,11 +29,11 @@ test("Codex returns an unverified model and forwards resume options", async () =
   let seen: unknown;
   const thread = { runStreamed: async () => ({ events: (async function* () { yield* events; })() }) };
   const client = { startThread: () => thread, resumeThread: (id: string, options: unknown) => { seen = { id, options }; return thread; } } as unknown as Pick<Codex, "startThread" | "resumeThread">;
-  const session = codexRunner({}, client).resume({ cwd: "/tmp", model: "luna", sessionId: "id" });
+  const session = codexRunner({}, client).resume({ cwd: "/tmp", model: "luna", sessionId: "id", writableDirs: ["/repo/.git"] });
   const result = await session.send("hello");
   assert.equal(result.model, null);
   assert.deepEqual(result.usage, { inputTokens: 1, cachedInputTokens: 3, outputTokens: 2 });
-  assert.deepEqual(seen, { id: "id", options: { workingDirectory: "/tmp", model: "luna", sandboxMode: "workspace-write", networkAccessEnabled: true, approvalPolicy: "never" } });
+  assert.deepEqual(seen, { id: "id", options: { workingDirectory: "/tmp", model: "luna", sandboxMode: "workspace-write", networkAccessEnabled: true, approvalPolicy: "never", additionalDirectories: ["/repo/.git"] } });
 });
 
 test("Codex reports its session id before the turn completes", async () => {

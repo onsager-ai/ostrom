@@ -20,6 +20,8 @@ export interface SessionOptions {
   model: string;
   sessionId?: string;
   onSessionId?: (id: string) => void;
+  /** More writable directories. A worktree's Git data lives in the main clone's `.git`, outside `cwd`. */
+  writableDirs?: string[];
 }
 
 export interface Runner {
@@ -85,7 +87,7 @@ export function codexRunner(config: CodexOptions, client: CodexClient = new Code
     requireOptions(options);
     let id = options.sessionId ?? null;
     let busy = false;
-    const threadOptions = { workingDirectory: options.cwd, model: options.model, sandboxMode: "workspace-write" as const, networkAccessEnabled: true, approvalPolicy: "never" as const };
+    const threadOptions = { workingDirectory: options.cwd, model: options.model, sandboxMode: "workspace-write" as const, networkAccessEnabled: true, approvalPolicy: "never" as const, ...(options.writableDirs?.length ? { additionalDirectories: options.writableDirs } : {}) };
     const thread: CodexThread = id === null ? client.startThread(threadOptions) : client.resumeThread(id, threadOptions);
     return { async send(prompt, signal) {
       if (busy) throw new Error("session already has a running turn");
