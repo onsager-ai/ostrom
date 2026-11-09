@@ -7,7 +7,7 @@ import { migrate } from "./migrations.ts";
 export type SourceKind = "github";
 export type ThreadKind = "issue" | "pull_request";
 export type Verdict = "accept" | "ignore" | "stop";
-export type TicketState = "open" | "ended";
+export type TicketState = "open" | "paused" | "ended";
 export type AssignmentState = "pending" | "running" | "ended";
 /** What the last observation of a running Worker found worth flagging. */
 export type AssignmentOutcome = "waiting" | "failed" | "cancelled";
@@ -72,6 +72,13 @@ export interface PendingDelivery {
   trigger: Trigger;
   ticketId: number;
   assignmentId: number | null;
+}
+
+export type CommandReceiptName = "redirect" | "pause" | "resume" | "stop" | "forbidden" | "close_issue" | "close_pull_request";
+
+export interface PendingCommand {
+  trigger: Trigger;
+  ticketId: number;
 }
 
 export interface NewDecision {
@@ -243,6 +250,11 @@ export class Store {
     if (Number(changes) !== 1) throw new Error(`no source ${sourceId}`);
   }
 
+  findThread(sourceId: number, number: number): Thread | null {
+    const row = this.#get("SELECT * FROM thread WHERE source_id = ? AND number = ?", sourceId, number);
+    return row === undefined ? null : this.getThread(row["id"] as number);
+  }
+
   /** Returns the thread's id, creating the thread on first sight. */
   ensureThread(thread: NewThread): number {
     this.#run(
@@ -332,9 +344,11 @@ export class Store {
       `SELECT * FROM "trigger" AS t
        WHERE NOT EXISTS (SELECT 1 FROM decision_trigger WHERE trigger_id = t.id)
          AND NOT EXISTS (SELECT 1 FROM delivery WHERE trigger_id = t.id)
-         AND NOT EXISTS (
-           SELECT 1 FROM subscription JOIN ticket ON ticket.id = subscription.ticket_id
-           WHERE subscription.thread_id = t.thread_id AND ticket.state = 'open')
+         AND NOT EXISTS (SELECT 1 FROM command_receipt WHERE trigger_id = t.id)
+         AND (
+           t.kind = 'issue_state' OR NOT EXISTS (
+             SELECT 1 FROM subscription JOIN ticket ON ticket.id = subscription.ticket_id
+             WHERE subscription.thread_id = t.thread_id AND ticket.state IN ('open', 'paused')))
        ORDER BY t.occurred_at, t.id`,
     ).map(toTrigger);
   }
@@ -425,9 +439,29 @@ export class Store {
     return { ticket, thread, source, reason: decision["reason"] as string, triggerUrls };
   }
 
+  pauseTicket(ticketId: number): void {
+    const { changes } = this.#run(
+      "UPDATE ticket SET state = 'paused' WHERE id = ? AND state = 'open'",
+      ticketId,
+    );
+    if (Number(changes) !== 1) {
+      throw new IllegalTransition(`ticket ${ticketId}: ${this.getTicket(ticketId).state} → paused is not allowed`);
+    }
+  }
+
+  resumeTicket(ticketId: number): void {
+    const { changes } = this.#run(
+      "UPDATE ticket SET state = 'open' WHERE id = ? AND state = 'paused'",
+      ticketId,
+    );
+    if (Number(changes) !== 1) {
+      throw new IllegalTransition(`ticket ${ticketId}: ${this.getTicket(ticketId).state} → open is not allowed`);
+    }
+  }
+
   endTicket(ticketId: number): void {
     const { changes } = this.#run(
-      "UPDATE ticket SET state = 'ended', ended_at = ? WHERE id = ? AND state = 'open'",
+      "UPDATE ticket SET state = 'ended', ended_at = ? WHERE id = ? AND state IN ('open', 'paused')",
       this.#stamp(),
       ticketId,
     );
@@ -595,6 +629,11 @@ export class Store {
     return { duplicate: Number(changes) === 0 };
   }
 
+  /** Removes subscriptions after a PR attempt closes, so later issue discussion asks the Router again. */
+  unsubscribeTicket(ticketId: number): void {
+    this.#run("DELETE FROM subscription WHERE ticket_id = ?", ticketId);
+  }
+
   /** Every ticket subscribed to the thread, open or ended, oldest first. */
   ticketsForThread(threadId: number): Ticket[] {
     return this.#all(
@@ -606,6 +645,39 @@ export class Store {
 
   // --- deliveries ----------------------------------------------------------------------------
 
+  /** Commands and redirects on open or paused tickets that no earlier pass consumed. */
+  pendingCommands(): PendingCommand[] {
+    return this.#all(
+      `SELECT t.*, ticket.id AS p_ticket_id
+       FROM "trigger" AS t
+       JOIN subscription ON subscription.thread_id = t.thread_id
+       JOIN ticket ON ticket.id = subscription.ticket_id AND ticket.state IN ('open', 'paused')
+       WHERE t.kind IN ('issue_comment', 'issue_state')
+         AND (ticket.state = 'open' OR t.kind = 'issue_state' OR lower(ltrim(COALESCE(t.body, ''))) GLOB '@ostrom *')
+         AND NOT EXISTS (SELECT 1 FROM decision_trigger WHERE trigger_id = t.id)
+         AND NOT EXISTS (SELECT 1 FROM delivery WHERE delivery.trigger_id = t.id)
+         AND NOT EXISTS (
+           SELECT 1 FROM command_receipt
+           WHERE command_receipt.trigger_id = t.id AND command_receipt.ticket_id = ticket.id)
+       ORDER BY occurred_at, id, p_ticket_id`,
+    ).map((row) => ({ trigger: toTrigger(row), ticketId: row["p_ticket_id"] as number }));
+  }
+
+  /** Records a consumed command or redirect once. */
+  recordCommandReceipt(
+    triggerId: number,
+    ticketId: number,
+    command: CommandReceiptName,
+    instruction: boolean,
+  ): { duplicate: boolean } {
+    const { changes } = this.#run(
+      `INSERT INTO command_receipt (trigger_id, ticket_id, command, instruction, handled_at)
+       VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING`,
+      triggerId, ticketId, command, Number(instruction), this.#stamp(),
+    );
+    return { duplicate: Number(changes) === 0 };
+  }
+
   /** Every follow-up owed to an open ticket's Worker, oldest trigger first, then by ticket. */
   pendingDeliveries(): PendingDelivery[] {
     return this.#all(
@@ -616,6 +688,9 @@ export class Store {
        LEFT JOIN assignment AS worker ON worker.id = (
          SELECT id FROM assignment WHERE ticket_id = ticket.id AND state = 'running' ORDER BY id DESC LIMIT 1)
        WHERE NOT EXISTS (SELECT 1 FROM decision_trigger WHERE trigger_id = t.id)
+         AND NOT EXISTS (
+           SELECT 1 FROM command_receipt
+           WHERE command_receipt.trigger_id = t.id AND command_receipt.ticket_id = ticket.id)
          AND NOT EXISTS (
            SELECT 1 FROM delivery JOIN assignment ON assignment.id = delivery.assignment_id
            WHERE delivery.trigger_id = t.id AND assignment.ticket_id = ticket.id)
@@ -764,7 +839,7 @@ export class Store {
       "SELECT 1 FROM assignment WHERE ticket_id = ? AND state = 'running'",
       assignment.ticketId,
     );
-    if (stillRunning !== undefined || this.getTicket(assignment.ticketId).state !== "open") return false;
+    if (stillRunning !== undefined || this.getTicket(assignment.ticketId).state === "ended") return false;
     this.endTicket(assignment.ticketId);
     return true;
   }

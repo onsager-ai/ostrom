@@ -289,6 +289,42 @@ export const migrations: readonly string[] = [
   ALTER TABLE "trigger" ADD COLUMN line INTEGER;
   CREATE INDEX trigger_review ON "trigger" (thread_id, review_id) WHERE review_id IS NOT NULL;
   `,
+
+  // 13: Commands are consumed before ordinary follow-up delivery. A receipt is per ticket because
+  // one subscribed thread can fan out to several tickets; it is also the durable instruction/info
+  // classification for redirects from people outside the repository.
+  `
+  CREATE TABLE command_receipt (
+    trigger_id   INTEGER NOT NULL REFERENCES "trigger" (id),
+    ticket_id    INTEGER NOT NULL REFERENCES ticket (id),
+    command      TEXT NOT NULL CHECK (command IN ('redirect', 'pause', 'resume', 'stop', 'forbidden', 'close_issue', 'close_pull_request')),
+    instruction  INTEGER NOT NULL CHECK (instruction IN (0, 1)),
+    handled_at   TEXT NOT NULL,
+    PRIMARY KEY (trigger_id, ticket_id)
+  ) STRICT, WITHOUT ROWID;
+  CREATE INDEX command_receipt_by_ticket ON command_receipt (ticket_id, trigger_id);
+  `,
+
+  // 14: A paused ticket retains its Worker session but does not receive another follow-up until
+  // it is resumed. Existing stores are rebuilt because SQLite cannot change a CHECK in place.
+  `
+  CREATE TABLE ticket_v14 (
+    id          INTEGER PRIMARY KEY,
+    decision_id INTEGER NOT NULL UNIQUE REFERENCES decision (id),
+    state       TEXT NOT NULL CHECK (state IN ('open', 'paused', 'ended')),
+    opened_at   TEXT NOT NULL,
+    ended_at    TEXT,
+    CHECK ((state = 'ended') = (ended_at IS NOT NULL))
+  ) STRICT;
+  INSERT INTO ticket_v14 SELECT * FROM ticket;
+  DROP TABLE ticket;
+  ALTER TABLE ticket_v14 RENAME TO ticket;
+  CREATE TRIGGER ticket_needs_accept BEFORE INSERT ON ticket
+  WHEN (SELECT verdict FROM decision WHERE id = NEW.decision_id) IS NOT 'accept'
+  BEGIN
+    SELECT RAISE(ABORT, 'only an accept decision creates a ticket');
+  END;
+  `,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */
@@ -307,11 +343,11 @@ export function migrate(db: DatabaseSync, at: Date = new Date()): number {
     const version = index + 1;
     if (version <= current) continue;
     // Rebuilding a referenced table requires foreign keys disabled outside the transaction.
-    if (version === 7 || version === 9) db.exec("PRAGMA foreign_keys = OFF");
+    if (version === 7 || version === 9 || version === 14) db.exec("PRAGMA foreign_keys = OFF");
     db.exec("BEGIN IMMEDIATE");
     try {
       db.exec(sql);
-      if ((version === 7 || version === 9) && db.prepare("PRAGMA foreign_key_check").get() !== undefined) {
+      if ((version === 7 || version === 9 || version === 14) && db.prepare("PRAGMA foreign_key_check").get() !== undefined) {
         throw new Error("assignment migration broke a foreign key");
       }
       db.prepare("INSERT INTO schema_version (version, applied_at) VALUES (?, ?)").run(
@@ -323,7 +359,7 @@ export function migrate(db: DatabaseSync, at: Date = new Date()): number {
       db.exec("ROLLBACK");
       throw error;
     } finally {
-      if (version === 7 || version === 9) db.exec("PRAGMA foreign_keys = ON");
+      if (version === 7 || version === 9 || version === 14) db.exec("PRAGMA foreign_keys = ON");
     }
   }
   return migrations.length;

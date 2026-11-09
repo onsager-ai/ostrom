@@ -11,12 +11,14 @@ export function queueStatusCard(store: Store, ticketId: number, now = new Date()
   if (assignment === null || assignment.harness === null || assignment.model === null) return;
   const state: StatusCardState =
     ticket.state === "ended" ? (assignment.endReason === null ? "done" : "stopped") :
-      assignment.outcome === "failed" ? "stuck" : "working";
+      ticket.state === "paused" ? "paused" :
+        assignment.outcome === "failed" ? "stuck" : "working";
   const lastActivityAt = new Date(assignment.outcomeAt ?? assignment.startedAt ?? assignment.createdAt);
   store.enqueueStatusCard(
     context.thread.id,
     renderStatusCard({
       state,
+      ...(assignment.endReason === "issue closed" ? { stoppedReason: "issue closed" as const } : {}),
       harness: assignment.harness,
       model: assignment.model,
       lastActivityAt,

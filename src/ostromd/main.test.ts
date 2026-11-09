@@ -323,7 +323,7 @@ const tickEnv = (dbPath: string) => ({
 const passes = (err: string[]) => err.map((line) => /^ostromd ([\w-]+):/.exec(line)?.[1]);
 
 test("tick runs every pass once, in order", () => {
-  assert.deepEqual([...TICK], ["poll", "observe", "route", "watchdog", "route-candidates", "send"]);
+  assert.deepEqual([...TICK], ["poll", "observe", "commands", "route", "watchdog", "route-candidates", "send"]);
 });
 
 test(
@@ -333,7 +333,7 @@ test(
     const ok = deps(tickEnv(dbPath), github.gh, semonAnswer(20, []));
     assert.equal(await main(["tick"], ok.deps), 0);
     assert.deepEqual(passes(ok.err), [...TICK, "tick"]);
-    assert.match(ok.err.at(-1)!, /all 6 passes ran/);
+    assert.match(ok.err.at(-1)!, /all 7 passes ran/);
 
     // Intake and Semon both fail; every other pass still runs, and the tick names the failures.
     github.failWhen = () => new Error("HTTP 500");

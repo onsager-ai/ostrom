@@ -1,12 +1,14 @@
 // The one quiet, editable status comment per thread. GitHub does not notify people about edits,
 // so this carries routine progress while normal outbox comments remain for moments needing action.
 
+import { controlsLine } from "../commands/table.ts";
 import { replyMarker } from "./marker.ts";
 
 export type StatusCardState = "working" | "paused" | "stuck" | "done" | "stopped";
 
 export interface StatusCard {
   state: StatusCardState;
+  stoppedReason?: "issue closed";
   /** The Worker's newest known checklist, in its order. Omit when it has not published one. */
   plan?: readonly string[];
   pullRequest?: string;
@@ -28,7 +30,7 @@ const STATE_LABEL: Record<StatusCardState, string> = {
 
 /** Renders the exact Markdown stored in and edited on the GitHub status-card comment. */
 export function renderStatusCard(card: StatusCard): string {
-  const lines = [`## Ostrom: ${STATE_LABEL[card.state]}`];
+  const lines = [`## Ostrom: ${card.stoppedReason === "issue closed" ? "Stopped: issue closed" : STATE_LABEL[card.state]}`];
   if (card.plan !== undefined && card.plan.length > 0) {
     lines.push("", "### Plan", ...card.plan.map((item) => `- [ ] ${item}`));
   }
@@ -37,7 +39,7 @@ export function renderStatusCard(card: StatusCard): string {
     "",
     `Harness: \`${card.harness}\` · Model: \`${card.model}\``,
     `Last activity: ${utcMinute(card.lastActivityAt)}`,
-    "Controls: `@ostrom pause`, `@ostrom stop`, or reply to redirect.",
+    controlsLine(),
     "",
     replyMarker(card.markerId),
   );

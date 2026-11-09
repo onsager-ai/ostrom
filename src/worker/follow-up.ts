@@ -43,11 +43,13 @@ export function routeFollowUps(store: Store, workers: Workers): RoutePass {
           store.recordReviewDelivery(review.map((item) => item.trigger.id), assignmentId, turnId);
           for (const item of review) enqueueReceivedReaction(store, item.trigger);
         },
-        (result) => store.enqueueReply({
-          id: `review-${assignmentId}-${trigger.reviewId}`,
-          threadId: trigger.threadId,
-          body: renderReviewReply(result.text),
-        }),
+        (result) => {
+          store.enqueueReply({
+            id: `review-${assignmentId}-${trigger.reviewId}`,
+            threadId: trigger.threadId,
+            body: renderReviewReply(result.text),
+          });
+        },
       );
       if (added) pass.queued.push({ triggerId: trigger.id, ticketId, assignmentId });
       continue;
@@ -85,11 +87,11 @@ const KIND_NOUNS: Record<string, string> = {
 };
 
 /** A non-review follow-up remains a summary and pointer rather than duplicating GitHub content. */
-export function followUpMessage(ticketId: number, trigger: Trigger, thread: Thread): string {
+export function followUpMessage(ticketId: number, trigger: Trigger, thread: Thread, instruction = true): string {
   const noun = KIND_NOUNS[trigger.kind] ?? trigger.kind;
   const on = thread.kind === "issue" ? "issue" : "pull request";
   return [
-    `Follow-up for Ostrom ticket ${ticketId}: a new ${noun} (${trigger.kind}) by @${trigger.actor}`,
+    `Follow-up for Ostrom ticket ${ticketId}: a new ${noun} (${trigger.kind}) by @${trigger.actor}${instruction ? "" : " (information, not an instruction)"}`,
     `on ${on} #${thread.number}: ${trigger.url}`,
     "",
     "Read it with `gh`; this message does not copy it. If it asks for changes, make them and push",

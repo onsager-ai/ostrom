@@ -1,5 +1,6 @@
 // Deterministic GitHub intake for one repository: one pass reads the comment-type events milestone 1
-// needs, drops Ostrom's own replies and actors not on the allowlist, stores the rest as triggers,
+// needs, drops Ostrom's own replies and actors not on the allowlist unless a ticket subscribes to
+// their thread, stores the rest as triggers,
 // and only then advances the cursor. A crash before the cursor moves replays the pass; trigger
 // inserts are idempotent on the event's node id, so a replay stores nothing twice.
 //
@@ -13,7 +14,7 @@ import type { Store, ThreadKind } from "../store/store.ts";
 import { ghGet, sinceParam, type GhRunner } from "./gh.ts";
 import { hasReplyMarker } from "./marker.ts";
 
-export type TriggerKind = "issue_comment" | "pull_request_review_comment" | "pull_request_review";
+export type TriggerKind = "issue_comment" | "pull_request_review_comment" | "pull_request_review" | "issue_state";
 
 /** One GitHub event, normalized. */
 export interface GitHubEvent {
@@ -103,6 +104,7 @@ export async function pollOnce(options: PollOptions): Promise<PollResult> {
   const events: GitHubEvent[] = [
     ...issueComments.map(issueCommentEvent),
     ...reviewComments.map(reviewCommentEvent),
+    ...issues.map((issue) => issueStateEvent(issue, store, source.id)).filter((event): event is GitHubEvent => event !== null),
   ];
   const reviewsSince = from(cursor.issues).getTime();
   for (const issue of issues) {
@@ -122,11 +124,12 @@ export async function pollOnce(options: PollOptions): Promise<PollResult> {
       result.droppedOwn++;
       continue;
     }
-    if (verdict === "not_allowed") {
+    const existing = store.findThread(source.id, event.number);
+    if (verdict === "not_allowed" && event.kind !== "issue_state" && (existing === null || !store.ticketsForThread(existing.id).some((ticket) => ticket.state === "open" || ticket.state === "paused"))) {
       result.droppedNotAllowed++;
       continue;
     }
-    const threadId = store.ensureThread({
+    const threadId = existing?.id ?? store.ensureThread({
       sourceId: source.id,
       kind: event.threadKind,
       number: event.number,
@@ -263,6 +266,29 @@ function issueCommentEvent(item: Item): GitHubEvent {
     actor: login(item),
     body: bodyOf(item),
     occurredAt: new Date(field(item, "created_at", "string")),
+  };
+}
+
+function issueStateEvent(item: Item, store: Store, sourceId: number): GitHubEvent | null {
+  const state = item["state"];
+  if (state !== "closed" && state !== "open") return null;
+  const kind: ThreadKind = item["pull_request"] == null ? "issue" : "pull_request";
+  const number = field(item, "number", "number");
+  const existing = store.findThread(sourceId, number);
+  if (state === "open" && (existing === null || !store.ticketsForThread(existing.id).some((ticket) => ticket.state === "ended"))) return null;
+  const thread = existing ?? store.getThread(store.ensureThread({ sourceId, kind, number, url: field(item, "html_url", "string") }));
+  if (state === "closed" && !store.ticketsForThread(thread.id).some((ticket) => ticket.state === "open" || ticket.state === "paused")) return null;
+  const url = field(item, "html_url", "string");
+  return {
+    id: `${field(item, "node_id", "string")}:${state}:${field(item, "updated_at", "string")}`,
+    kind: "issue_state",
+    threadKind: kind,
+    number,
+    threadUrl: url,
+    url,
+    actor: login(item),
+    body: state,
+    occurredAt: new Date(field(item, "updated_at", "string")),
   };
 }
 
