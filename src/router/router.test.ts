@@ -438,63 +438,15 @@ test("a comment deleted since intake reaches the Router as deleted; long bodies 
   assert.equal(long!.excerpt.length, 601);
 });
 
-test("a flagged stall reaches the Router once; wait leaves the Worker, stop ends the work", async () => {
+test("a flagged stall does not make the Router run", async () => {
   const s = setup();
   s.comment("please fix the typo", 57);
-  s.comment("and the CONTRIBUTING typo", 58, 8);
   await s.poll();
   const first = await routeCandidates(s.options());
-  const [a, b] = first.dispatched;
-  const turns = () => s.routerSessions().length;
-  assert.equal(turns(), 1);
-
-  const waiting = s.store().recordStall({ assignmentId: a!.assignmentId, semonReason: "waiting-question", detail: "Which file?" });
-  s.answer = (batch) => ({
-    decisions: [],
-    outcomes: [],
-    stalls: batch.stalls.map((stall) => ({ key: stall.key, action: "wait" as const, reply: "The Worker asks: which file?" })),
-  });
-  const flagged = await routeCandidates(s.options());
-  const sent = batchOf(s.routerSessions().at(-1)!.prompts[0]!) as unknown as { stalls: Record<string, unknown>[] };
-  assert.deepEqual(sent.stalls, [{
-    key: `stall-${waiting.id}`,
-    thread: first.decisions[0]!.thread,
-    threadUrl: "https://github.com/onsager-ai/ostrom/issues/7",
-    request: "fix the README typo",
-    signals: { semon: "waiting-question" },
-    detail: "Which file?",
-    since: NOW.toISOString(),
-  }]);
-  assert.deepEqual(flagged.stalls, [{
-    key: `stall-${waiting.id}`, action: "wait", ticketId: a!.ticketId, replyId: `stall-${waiting.id}`, ticketEnded: false,
-  }]);
-  assert.equal(s.store().getAssignment(a!.assignmentId).state, "running");
-  assert.equal(s.store().dueReplies().find((r) => r.id === `stall-${waiting.id}`)?.body, "The Worker asks: which file?");
-
-  // The same episode is not flagged again, so the Router is not asked.
-  s.store().recordStall({ assignmentId: a!.assignmentId, semonReason: "waiting-question", detail: null });
-  assert.equal((await routeCandidates(s.options())).router, null);
-  assert.equal(turns(), 2);
-
-  // A Router answer that does not check out records nothing; the stall stays flagged.
-  const gone = s.store().recordStall({ assignmentId: b!.assignmentId, semonReason: "process-gone", detail: null });
-  s.answer = (batch) => ({
-    decisions: [],
-    outcomes: [],
-    stalls: batch.stalls.map((stall) => ({ key: stall.key, action: "stop" as const, reply: null })),
-  });
-  await assert.rejects(routeCandidates(s.options()), /a stop needs a reply/);
-  assert.deepEqual(s.store().unansweredStalls().map((stall) => stall.id), [gone.id]);
-  assert.equal(s.store().getAssignment(b!.assignmentId).state, "running");
-
-  s.answer = (batch) => ({
-    decisions: [],
-    outcomes: [],
-    stalls: batch.stalls.map((stall) => ({ key: stall.key, action: "stop" as const, reply: "The Worker died; work stopped." })),
-  });
-  const stopped = await routeCandidates(s.options());
-  assert.deepEqual(stopped.stalls.map((stall) => [stall.action, stall.ticketEnded]), [["stop", true]]);
-  assert.equal(s.store().getAssignment(b!.assignmentId).state, "ended");
-  assert.equal(s.store().getTicket(b!.ticketId).state, "ended");
-  assert.equal(s.store().getTicket(a!.ticketId).state, "open");
+  const assignment = first.dispatched[0]!;
+  s.store().recordStall({ assignmentId: assignment.assignmentId, semonReason: "waiting-question", detail: "Which file?" });
+  const next = await routeCandidates(s.options());
+  assert.equal(next.router, null);
+  assert.deepEqual(next.stalls, []);
+  assert.equal(s.store().getAssignment(assignment.assignmentId).state, "running");
 });
