@@ -149,16 +149,28 @@ export function stallReplyId(stallId: number): string {
   return `stall-${stallId}`;
 }
 
+export type OutboxKind = "comment" | "edit" | "reaction" | "label";
+
 export interface NewReply {
   id: string;
   threadId: number;
   body: string;
+  kind?: OutboxKind;
+  /** GitHub comment id for an edit; source comment URL for a reaction. */
+  target?: string;
+  reaction?: "eyes" | "+1" | "confused";
+  /** A human question: it bypasses batching and the per-thread comment gap. */
+  blocking?: boolean;
 }
 
 export interface Reply {
   id: string;
   threadId: number;
   body: string;
+  kind: OutboxKind;
+  target: string | null;
+  reaction: "eyes" | "+1" | "confused" | null;
+  blocking: boolean;
   enqueuedAt: string;
   attempts: number;
   nextAttemptAt: string;
@@ -524,6 +536,12 @@ export class Store {
     return this.#all("SELECT * FROM assignment WHERE state = 'running' ORDER BY id").map(toAssignment);
   }
 
+  /** The newest running or ended assignment for a ticket, if it has one. */
+  latestAssignment(ticketId: number): Assignment | null {
+    const row = this.#get("SELECT * FROM assignment WHERE ticket_id = ? ORDER BY id DESC LIMIT 1", ticketId);
+    return row === undefined ? null : toAssignment(row);
+  }
+
   /**
    * Records what the latest look at a running Worker's thread found, or null for nothing to
    * flag. The timestamp moves only when the outcome changes, so it says since when it holds.
@@ -738,24 +756,51 @@ export class Store {
   }
 
   #insertReply(reply: NewReply): { duplicate: boolean } {
+    const kind = reply.kind ?? "comment";
+    const target = reply.target ?? null;
+    const reaction = reply.reaction ?? null;
+    const blocking = reply.blocking === true ? 1 : 0;
+    if ((kind === "edit" || kind === "reaction") && target === null) throw new Error(`outbox ${kind} needs a target`);
+    if ((kind === "reaction") !== (reaction !== null)) throw new Error("only a reaction has a reaction value");
     const existing = this.#get("SELECT * FROM outbox WHERE id = ?", reply.id);
     if (existing !== undefined) {
       const queued = toReply(existing);
-      if (queued.threadId !== reply.threadId || queued.body !== reply.body) {
+      if (
+        queued.threadId !== reply.threadId || queued.body !== reply.body || queued.kind !== kind ||
+        queued.target !== target || queued.reaction !== reaction || queued.blocking !== (blocking === 1)
+      ) {
         throw new Error(`outbox ${reply.id} already holds a different reply`);
       }
       return { duplicate: true };
     }
     const at = this.#stamp();
     this.#run(
-      "INSERT INTO outbox (id, thread_id, body, enqueued_at, next_attempt_at) VALUES (?, ?, ?, ?, ?)",
-      reply.id,
-      reply.threadId,
-      reply.body,
-      at,
-      at,
+      `INSERT INTO outbox (id, thread_id, body, kind, target, reaction, blocking, enqueued_at, next_attempt_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      reply.id, reply.threadId, reply.body, kind, target, reaction, blocking, at, at,
     );
     return { duplicate: false };
+  }
+
+  /** Coalesces an unsent card update so only the latest state is delivered. */
+  enqueueStatusCard(threadId: number, body: string): void {
+    const thread = this.getThread(threadId);
+    const id = `card-thread-${threadId}`;
+    const kind: OutboxKind = thread.statusCardCommentId === null ? "comment" : "edit";
+    const target = thread.statusCardCommentId === null ? null : String(thread.statusCardCommentId);
+    const existing = this.#get("SELECT sent_at FROM outbox WHERE id = ?", id);
+    if (existing === undefined) {
+      this.#insertReply({ id, threadId, body, kind, ...(target === null ? {} : { target }) });
+      return;
+    }
+    if (existing["sent_at"] !== null) {
+      this.#insertReply({ id: `${id}-${this.#stamp()}`, threadId, body, kind, ...(target === null ? {} : { target }) });
+      return;
+    }
+    this.#run(
+      "UPDATE outbox SET body = ?, kind = ?, target = ?, next_attempt_at = ?, last_error = NULL WHERE id = ?",
+      body, kind, target, this.#stamp(), id,
+    );
   }
 
   /** Unsent replies whose next attempt is due, oldest due first. */
@@ -766,6 +811,32 @@ export class Store {
       this.#stamp(),
       limit,
     ).map(toReply);
+  }
+
+  /** Every unsent delivery, in the same order a send pass considers it. */
+  pendingReplies(limit = 50): Reply[] {
+    return this.#all(
+      "SELECT * FROM outbox WHERE sent_at IS NULL ORDER BY next_attempt_at, enqueued_at, id LIMIT ?",
+      limit,
+    ).map(toReply);
+  }
+
+  /** The latest successful non-blocking comment on a thread, if there is one. */
+  lastCommentSentAt(threadId: number): string | null {
+    const row = this.#get(
+      "SELECT MAX(sent_at) AS sent_at FROM outbox WHERE thread_id = ? AND kind = 'comment' AND blocking = 0",
+      threadId,
+    );
+    return row?.["sent_at"] as string | null;
+  }
+
+  /** Reschedules an unsent reply without counting an attempt. */
+  deferReply(replyId: string, nextAttemptAt: Date): void {
+    const { changes } = this.#run(
+      "UPDATE outbox SET next_attempt_at = ? WHERE id = ? AND sent_at IS NULL",
+      nextAttemptAt.toISOString(), replyId,
+    );
+    if (Number(changes) !== 1) this.#unsentReplyMissing(replyId);
   }
 
   /** Marks a reply sent. Marking it sent a second time throws. */
@@ -906,6 +977,10 @@ function toReply(row: Row): Reply {
     id: row["id"] as string,
     threadId: row["thread_id"] as number,
     body: row["body"] as string,
+    kind: row["kind"] as OutboxKind,
+    target: row["target"] as string | null,
+    reaction: row["reaction"] as Reply["reaction"],
+    blocking: row["blocking"] === 1,
     enqueuedAt: row["enqueued_at"] as string,
     attempts: row["attempts"] as number,
     nextAttemptAt: row["next_attempt_at"] as string,

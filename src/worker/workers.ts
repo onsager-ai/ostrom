@@ -4,6 +4,7 @@
 
 import { join } from "node:path";
 
+import { queueStatusCard } from "../github/cards.ts";
 import type { WorkerConfig } from "../ostromd/config.ts";
 import { rolloutModel } from "../session/rollout.ts";
 import type { Runner, Session, TurnResult } from "../session/runner.ts";
@@ -68,6 +69,7 @@ export class Workers {
         onSessionId: (sessionId) => {
           store.startNativeAssignment(id, sessionId);
           store.beginTurn(id);
+          queueStatusCard(store, ticketId);
           this.#sessions.set(id, session);
           resolve(sessionId);
         },
@@ -189,6 +191,7 @@ export class Workers {
     this.#deps.log?.(`assignment ${id}: turn failed: ${message}`);
     this.#deps.store.endTurn(id, null);
     this.#mark(id, "failed");
+    queueStatusCard(this.#deps.store, this.#deps.store.getAssignment(id).ticketId);
   }
 
   #finished(id: number, result: TurnResult): void {
@@ -205,6 +208,7 @@ export class Workers {
       }
     }
     this.#mark(id, result.status === "cancelled" ? "cancelled" : null);
+    queueStatusCard(store, assignment.ticketId);
   }
 
   /** Records an outcome unless the Router ended the assignment while the turn ran. */

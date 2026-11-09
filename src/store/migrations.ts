@@ -270,6 +270,15 @@ export const migrations: readonly string[] = [
   `
   ALTER TABLE thread ADD COLUMN status_card_comment_id INTEGER;
   `,
+
+  // 11: The outbox sends comments, card edits and reactions. Existing reply rows become comments.
+  `
+  ALTER TABLE outbox ADD COLUMN kind TEXT NOT NULL DEFAULT 'comment'
+    CHECK (kind IN ('comment', 'edit', 'reaction', 'label'));
+  ALTER TABLE outbox ADD COLUMN target TEXT;
+  ALTER TABLE outbox ADD COLUMN reaction TEXT;
+  ALTER TABLE outbox ADD COLUMN blocking INTEGER NOT NULL DEFAULT 0 CHECK (blocking IN (0, 1));
+  `,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */

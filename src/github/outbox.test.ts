@@ -21,7 +21,7 @@ function fixture() {
     url: "https://github.com/onsager-ai/ostrom/issues/7",
   });
   const send = (extra: Partial<SendOptions> = {}) =>
-    sendDueReplies({ store, gh: github.gh, repo: github.repo, now: clock, ...extra });
+    sendDueReplies({ store, gh: github.gh, repo: github.repo, now: clock, batchWindowMs: 0, ...extra });
   const posts = () => github.calls.filter((args) => args[2] === "POST").length;
   const reply = (id: string) => store.dueReplies().find((r) => r.id === id);
   return { store, github, thread, send, posts, reply, advance: (ms: number) => (now = new Date(now.getTime() + ms)) };
@@ -121,4 +121,39 @@ test("a reply whose id cannot go in a marker fails instead of posting unmarked",
   assert.equal(result.failed.length, 1);
   assert.match(result.failed[0]!.error, /cannot go in a marker/);
   assert.equal(posts(), 0);
+});
+
+test("ordinary comments batch after the gathering window while a blocking question skips it", async () => {
+  const { store, thread, send, github, advance } = fixture();
+  store.enqueueReply({ id: "r1", threadId: thread, body: "first" });
+  store.enqueueReply({ id: "r2", threadId: thread, body: "second" });
+  assert.deepEqual(await send({ batchWindowMs: 10 * 60_000 }), { sent: [], found: [], failed: [] });
+  advance(10 * 60_000);
+  assert.deepEqual((await send()).sent, ["r1", "r2"]);
+  assert.match(github.commentsOn(7)[0]!["body"] as string, /first[\s\S]*---[\s\S]*second/);
+
+  store.enqueueReply({ id: "q1", threadId: thread, body: "need a decision", blocking: true });
+  assert.deepEqual((await send({ batchWindowMs: 10 * 60_000 })).sent, ["q1"]);
+});
+
+test("a status card posts once then future states edit the same comment", async () => {
+  const { store, thread, send, github } = fixture();
+  store.enqueueStatusCard(thread, "## Ostrom: Working");
+  assert.deepEqual((await send()).sent, [`card-thread-${thread}`]);
+  const id = github.commentsOn(7)[0]!["id"] as number;
+  store.setStatusCardCommentId(thread, id);
+  store.enqueueStatusCard(thread, "## Ostrom: Done");
+  assert.deepEqual((await send()).sent, [`card-thread-${thread}-${new Date(T0).toISOString()}`]);
+  assert.equal(github.commentsOn(7).length, 1);
+  assert.equal(github.commentsOn(7)[0]!["body"], "## Ostrom: Done");
+});
+
+test("reactions use the endpoint for their source comment", async () => {
+  const { store, thread, send, github } = fixture();
+  store.enqueueReply({
+    id: "seen-1", threadId: thread, body: "", kind: "reaction", reaction: "eyes",
+    target: "https://github.com/onsager-ai/ostrom/issues/7#issuecomment-1001",
+  });
+  assert.deepEqual((await send()).sent, ["seen-1"]);
+  assert.ok(github.calls.some((args) => args[3] === `repos/${github.repo}/issues/comments/1001/reactions`));
 });
