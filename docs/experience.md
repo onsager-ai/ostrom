@@ -123,25 +123,79 @@ Background by default, no clutter.
 4. The operator promotes that session into T3 and unblocks it.
 5. The operator hands it back, and Ostrom carries on.
 
-Open questions:
+### Status view: the `ostrom` CLI and a dashboard
 
-- Where does the status view live: a standing Ostrom thread, a dashboard, a GitHub project board,
-  or `ostromd status`?
-- Should each ticket have a cost limit?
-- Does the operator choose which machine runs a Worker, or does Ostrom?
+`ostromd` is only the daemon; it has no user-facing commands. `ostrom` is the operator's command
+line, in the style of `t3`. The CLI and a dashboard are two clients of one local API served by
+`ostromd`, so both always show the same thing.
+
+| Command | Does |
+|---|---|
+| `ostrom status` | Machines, running Workers, stuck tickets, and spend today |
+| `ostrom tickets` / `ostrom show <ticket>` | List tickets, or show one: timeline, decisions, session, budget used |
+| `ostrom pause` / `resume` / `stop <ticket>` | The same effects as the GitHub commands |
+| `ostrom extend <ticket> --time 1h --cost 2` | Raise a ticket's budget |
+| `ostrom promote <ticket>` / `ostrom handback <ticket>` | Open the Worker's own session in T3, then return it to the background |
+| `ostrom pin <ticket> <machine>` | Override where a ticket runs |
+| `ostrom preview` / `ostrom replay <trigger>` | Developer tools (see journey 3) |
+
+Every command takes `--json`. The dashboard is a local web page with the same views, plus an
+attention list: stuck tickets, near-budget tickets, and machines that are offline or running hot.
+
+### Budgets per ticket
+
+Every ticket runs under a budget with several limits: wall-clock time, idle time, turns, tokens,
+estimated cost, and tier escalations. Defaults come per tier and can be overridden per repository
+or per label.
+
+- At 80% of any limit, the status card and dashboard show a warning.
+- At a limit, the Worker **pauses**. It is not killed: it pushes its work in progress, and the stuck
+  ladder starts with the cause "budget reached". The operator can `ostrom extend` it or stop it.
+- Subscription plans have no per-call price, so Ostrom always enforces tokens and time, and treats
+  cost as an estimate.
+
+### Machine placement strategy
+
+Each machine runs `ostromd` and registers its capabilities: installed harnesses and logins,
+repositories, free Worker slots, and thermal headroom. Ostrom places each new ticket by a fixed
+strategy, in this order:
+
+1. **Pinned:** an operator pin (`ostrom pin`) or a repository rule wins.
+2. **Affinity:** a ticket that already has a session stays on that machine. Follow-ups, resumes and
+   promotion all go to where the session lives.
+3. **Capable:** only machines that have the needed harness, login and repository.
+4. **Headroom:** prefer the machine with free slots and thermal headroom; a laptop near its heat
+   limit takes no new Workers.
+5. **Long-running work prefers always-on machines**, such as a server, over a laptop that sleeps.
+
+The strategy is code with a reason recorded for each placement, and `ostrom show` displays it.
 
 ## Journey 3: people developing Ostrom
 
-1. Run one tick locally against recorded GitHub data.
-2. No paid model calls by default.
-3. Replay any trigger and see each decision it led to.
+1. Run Ostrom end to end against a **sandbox GitHub repository**, a real repository kept for this
+   purpose, rather than recorded fixtures.
+2. Use cheap tiers by default: gpt-6-luna and Haiku.
+3. `ostrom preview` shows what a tick would post; `ostrom replay <trigger>` re-runs one trigger and
+   shows each decision it led to.
 4. Adding a harness or model tier is a configuration change.
-5. CI runs the tests and the agreement tests; the operator's laptop does not.
+5. CI runs the tests, snapshot tests and agreement tests; the operator's laptop does not.
 
-Open questions:
+## Milestone 1 scope
 
-- Which of these does milestone 1 need?
-- Recorded fixtures or a sandbox repository?
+Milestone 1 proves the loop on one machine and the sandbox repository, with the GitHub experience
+complete. Each item below is something a person can see working.
+
+| In milestone 1 | Later |
+|---|---|
+| Intake → Router → one Worker → PR, on the sandbox repository | More repositories, chat and CI as sources |
+| Status card, reactions, outbox batching, one reply per review | Labels as controls (`ostrom:stop`) |
+| Redirect by comment; `@ostrom pause`/`resume`/`stop`; closing the issue or PR | |
+| The stuck ladder and the stuck template (operator step is `ostrom status`) | A grace window before the public stuck reply |
+| Budgets: time, idle time, turns and tokens; pause at a limit; `ostrom extend` | Cost estimates per provider |
+| `ostrom status`, `tickets`, `show`, `pause`/`resume`/`stop`, all with `--json` | The dashboard (milestone 2, on the same API) |
+| Native Claude and Codex sessions resumed by ID after an `ostromd` restart | `ostrom promote`/`handback` (milestone 2) |
+| A `machine` field on every assignment, always this machine | The placement strategy across machines (milestone 3) |
+| `ostrom preview` and snapshot tests of everything posted | `ostrom replay` |
 
 ## What the experience requires of the runtime
 
@@ -150,12 +204,16 @@ Open questions:
 | Promote a Worker to T3 | Workers are native Claude Code or Codex sessions with their own IDs | `@mastra/claude` and `@openai/codex-sdk` both returned resumable native IDs |
 | The same Worker answers follow-ups | Resume a session from a stored ID after a host crash | Passed between turns for both; mid-turn crash not tested |
 | A reviewer replies days later | Durable pause and resume | Mastra workflows passed across processes; real multi-day delay not tested |
-| The operator does not pick machines | Run and resume across machines | Unproven; Temporal and Restate support it directly, Mastra needs shared storage |
+| The operator does not pick machines | A placement strategy with machine affinity | Designed above; no runs yet |
 | Ostrom runs on the operator's plans | Use the operator's Claude and Codex logins, not API keys | Unproven |
+| Budgets per ticket | Token and turn counts from every turn | Both SDKs report token usage; the Codex SDK does not report the model, so Ostrom checks it from the session record |
 
-The spike evidence is outside this repository, in `ostrom-spikes/mastra` and `ostrom-spikes/mastra-sdk`
-(`FINDINGS.md` in each). ACP is deprioritised: it is not widely adopted, and Ostrom only needs
-Claude and Codex for now.
+**Runtime decision (operator, 2026-11-09): no orchestration framework.** Mastra is not needed. Ostrom
+calls the vendor SDKs directly, `@anthropic-ai/claude-agent-sdk` and `@openai/codex-sdk`. It keeps its
+durable state (tickets, sessions, pauses, budgets and placement) in its own SQLite store, as the
+ticket state machine it already has. ACP is deprioritised: it is not widely adopted, and Ostrom only
+needs Claude and Codex for now. The spike evidence is outside this repository, in
+`ostrom-spikes/mastra` and `ostrom-spikes/mastra-sdk` (`FINDINGS.md` in each).
 
 The runtime in `direction.md`, with the Router and Workers as T3 threads, does not meet the
 background principle. `direction.md` will be re-derived from this document once the open questions
