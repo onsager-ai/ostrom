@@ -52,6 +52,7 @@ export async function advanceStuckLadder(store: Store, workers: Workers): Promis
     if (stall.recoveryAttempts < 2 && stall.publicAt === null) {
       const started = store.beginStallRecovery(stall.id);
       if (started === null) continue;
+      workers.cancel(stall.assignmentId);
       workers.deliver(
         stall.assignmentId,
         `stuck-recovery-${stall.id}-${started.recoveryAttempts}`,
@@ -76,6 +77,7 @@ async function publish(store: Store, workers: Workers, stall: Stall): Promise<vo
   const context = store.ticketContext(assignment.ticketId);
   store.publishStall(stall.id);
   if (store.getTicket(assignment.ticketId).state === "open") store.pauseTicket(assignment.ticketId);
+  workers.cancel(assignment.id);
   workers.deliver(
     assignment.id,
     `stuck-public-${stall.id}`,

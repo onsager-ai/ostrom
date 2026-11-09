@@ -357,6 +357,13 @@ export const migrations: readonly string[] = [
   ALTER TABLE assignment ADD COLUMN last_error TEXT;
   ALTER TABLE assignment ADD COLUMN consecutive_errors INTEGER NOT NULL DEFAULT 0 CHECK (consecutive_errors >= 0);
   `,
+
+  // 19: Recovery attempts belong to the Worker, not a transient Semon stall episode. A human
+  // reply resets this counter; ending an assignment does too.
+  `
+  ALTER TABLE assignment ADD COLUMN stall_recovery_attempts INTEGER NOT NULL DEFAULT 0
+    CHECK (stall_recovery_attempts >= 0 AND stall_recovery_attempts <= 2);
+  `,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */

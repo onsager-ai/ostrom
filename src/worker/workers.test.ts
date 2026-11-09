@@ -60,6 +60,21 @@ test("dispatch makes the worktree, starts the session with the brief and stores 
   assert.deepEqual([done.turnStartedAt, done.inputTokens, done.cachedInputTokens, done.outputTokens, done.outcome], [null, 10, 5, 2, null]);
 });
 
+test("cancelling an in-flight turn lets its queued replacement run without a cancelled outcome", async () => {
+  const { store, runner, ticketId, workers } = fixture();
+  runner.hold = true;
+  await workers.dispatch(ticketId);
+  const session = runner.sessions[0]!;
+  assert.equal(workers.cancel(1), true);
+  session.auto = true;
+  workers.deliver(1, "replacement", "continue", () => {});
+  await workers.drain();
+  assert.deepEqual(session.prompts.slice(-1), ["continue"]);
+  assert.equal(store.getAssignment(1).turnStartedAt, null);
+  assert.equal(store.getAssignment(1).outcome, null);
+  assert.equal(session.maxRunning, 1);
+});
+
 test("a reached ticket budget pauses after the current turn and asks the Worker to push WIP", async () => {
   const { store, runner, ticketId, workers } = fixture();
   store.setTicketBudget(ticketId, { timeMinutes: 480, idleMinutes: 30, turns: 1, tokens: 1_000_000, escalations: 0 });

@@ -24,7 +24,9 @@ export function routeFollowUps(store: Store, workers: Workers): RoutePass {
   const grouped = new Set<string>();
   for (const delivery of pending) {
     const { trigger, ticketId, assignmentId } = delivery;
-    if (assignmentId !== null && store.clearStallForHumanReply(assignmentId) !== null) {
+    const cleared = assignmentId === null ? null : store.clearStallForHumanReply(assignmentId);
+    // Only the public stuck step pauses the ticket; a silent recovery leaves it open.
+    if (cleared !== null && store.getStall(cleared).publicAt !== null) {
       store.resumeTicket(ticketId);
       queueStatusCard(store, ticketId);
     }

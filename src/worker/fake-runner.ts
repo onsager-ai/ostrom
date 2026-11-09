@@ -6,7 +6,7 @@ import type { Runner, Session, SessionOptions, TurnResult } from "../session/run
 export class FakeSession implements Session {
   readonly prompts: string[] = [];
   /** Turns that have started and not finished; the test calls `release` to finish the oldest. */
-  readonly #open: { resolve: (r: TurnResult) => void; reject: (e: Error) => void }[] = [];
+  readonly #open: { resolve: (r: TurnResult) => void; reject: (e: Error) => void; cancel: () => void }[] = [];
   /** When true a turn finishes at once instead of waiting for `release`. */
   auto = true;
   failWith: Error | undefined;
@@ -24,7 +24,7 @@ export class FakeSession implements Session {
     this.resumed = resumed;
   }
 
-  async send(prompt: string): Promise<TurnResult> {
+  async send(prompt: string, signal?: AbortSignal): Promise<TurnResult> {
     this.prompts.push(prompt);
     this.running++;
     this.maxRunning = Math.max(this.maxRunning, this.running);
@@ -37,15 +37,32 @@ export class FakeSession implements Session {
         usage: { inputTokens: 10, cachedInputTokens: 5, outputTokens: 2 },
         model: null,
       };
+      if (signal?.aborted) return { ...result, status: "cancelled", usage: null };
       if (this.auto) return result;
-      return await new Promise<TurnResult>((resolve, reject) => this.#open.push({ resolve, reject }));
+      return await new Promise<TurnResult>((resolve, reject) => {
+        let open!: { resolve: (turn: TurnResult) => void; reject: (error: Error) => void; cancel: () => void };
+        open = {
+          resolve: (turn: TurnResult) => {
+            signal?.removeEventListener("abort", open.cancel);
+            resolve(turn);
+          },
+          reject,
+          cancel: () => {
+            const index = this.#open.indexOf(open);
+            if (index !== -1) this.#open.splice(index, 1);
+            resolve({ ...result, status: "cancelled", usage: null });
+          },
+        };
+        signal?.addEventListener("abort", open.cancel, { once: true });
+        this.#open.push(open);
+      });
     } finally {
       this.running--;
     }
   }
 
   release(): void {
-    this.#open.shift()!.resolve({
+    this.#open.shift()?.resolve({
       sessionId: this.id,
       text: "ok",
       status: "completed",
@@ -74,11 +91,11 @@ export class FakeRunner implements Runner {
     }
     const send = session.send.bind(session);
     let announced = false;
-    session.send = async (prompt) => {
+    session.send = async (prompt, signal) => {
       if (!announced) options.onSessionId?.(session.id);
       announced = true;
       if (this.failAfterId !== undefined) throw this.failAfterId;
-      return send(prompt);
+      return send(prompt, signal);
     };
     return session;
   }

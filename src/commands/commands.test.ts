@@ -98,14 +98,18 @@ test("a command without permission only gets a confused reaction", async () => {
   assert.deepEqual(store.dueReplies().map((reply) => reply.reaction), ["confused"]);
 });
 
-test("closing the issue gets the graceful stop prompt and ends with the distinct card state", async () => {
-  const { github, runner, store, workers, ticketId } = fixture();
+test("closing the issue cancels a hung turn, gets the graceful stop prompt and ends with the distinct card state", async () => {
+  const { github, runner, store, workers, ticketId, assignmentId } = fixture();
+  runner.hold = true;
+  workers.deliver(assignmentId, "hung", "work", () => {});
+  await Promise.resolve();
   const source = store.ensureSource("github", REPO);
   store.insertTrigger({
     sourceId: source.id, sourceEventId: "closed-state", threadId: store.ticketContext(ticketId).thread.id,
     kind: "issue_state", actor: "operator", url: `https://github.com/${REPO}/issues/7`, occurredAt: new Date(), body: "closed",
   });
   await routeCommands(store, workers, github.gh, REPO);
+  runner.sessions[0]!.auto = true;
   await workers.drain();
   assert.match(runner.sessions[0]!.prompts.at(-1)!, /issue was closed/);
   assert.equal(store.getTicket(ticketId).state, "ended");
