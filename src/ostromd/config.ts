@@ -6,6 +6,8 @@
 
 import { hostname } from "node:os";
 
+export { loadBudgetDefaults, type BudgetDefaults } from "../budget/budgets.ts";
+
 export interface Config {
   repo: string;
   allowlist: string[];

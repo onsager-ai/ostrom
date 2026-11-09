@@ -54,6 +54,17 @@ test("dispatch makes the worktree, starts the session with the brief and stores 
   assert.deepEqual([done.turnStartedAt, done.inputTokens, done.cachedInputTokens, done.outputTokens, done.outcome], [null, 10, 5, 2, null]);
 });
 
+test("a reached ticket budget pauses after the current turn and asks the Worker to push WIP", async () => {
+  const { store, runner, ticketId, workers } = fixture();
+  store.setTicketBudget(ticketId, { timeMinutes: 480, idleMinutes: 30, turns: 1, tokens: 1_000_000, escalations: 0 });
+  await workers.dispatch(ticketId);
+  await workers.drain();
+  assert.equal(store.getTicket(ticketId).state, "paused");
+  assert.equal(store.getTicket(ticketId).pauseCause, "budget reached: turns");
+  assert.match(runner.sessions[0]!.prompts[1]!, /Push your work in progress/);
+  assert.equal(store.getAssignment(1).turns, 2);
+});
+
 test("the session starts on the configured harness", async () => {
   const claude = new FakeRunner();
   const codex = new FakeRunner();

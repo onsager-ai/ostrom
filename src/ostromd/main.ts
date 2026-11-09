@@ -16,7 +16,7 @@ import { watchdog } from "../watchdog/watchdog.ts";
 import { observe } from "../worker/dispatch.ts";
 import { routeFollowUps } from "../worker/follow-up.ts";
 import { Workers, type WorkersDeps } from "../worker/workers.ts";
-import { loadConfig, loadRouterConfig, loadWatchdogConfig, loadWorkerConfig } from "./config.ts";
+import { loadBudgetDefaults, loadConfig, loadRouterConfig, loadWatchdogConfig, loadWorkerConfig } from "./config.ts";
 
 /**
  * The passes one tick runs, in this order:
@@ -306,6 +306,7 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
         workers: workers(),
         router,
         runners: deps.runners ?? realRunners(deps.env),
+        budget: loadBudgetDefaults(deps.env),
       });
       if (pass.router !== null) deps.stdout(JSON.stringify({ type: "router", ...pass.router }));
       for (const decision of pass.decisions) deps.stdout(JSON.stringify({ type: "decision", ...decision }));

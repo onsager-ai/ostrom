@@ -4,6 +4,7 @@
 
 import { join } from "node:path";
 
+import { budgetReached } from "../budget/budgets.ts";
 import { queueStatusCard } from "../github/cards.ts";
 import type { WorkerConfig } from "../ostromd/config.ts";
 import { rolloutModel } from "../session/rollout.ts";
@@ -42,6 +43,7 @@ export class Workers {
   readonly #sessions = new Map<number, Session>();
   readonly #chains = new Map<number, Promise<void>>();
   readonly #queued = new Set<string>();
+  readonly #budgetPauses = new Set<number>();
 
   constructor(deps: WorkersDeps) {
     this.#deps = deps;
@@ -211,6 +213,20 @@ export class Workers {
     store.endTurn(id, result.usage);
     const assignment = store.getAssignment(id);
     if (assignment.state !== "running") return;
+    const reached = budgetReached(store.ticketBudget(assignment.ticketId), new Date());
+    if (store.getTicket(assignment.ticketId).state === "open" && reached !== null && !this.#budgetPauses.has(id)) {
+      this.#budgetPauses.add(id);
+      store.pauseTicketForBudget(assignment.ticketId, reached);
+      this.deliver(
+        id,
+        `budget-pause-${assignment.ticketId}-${reached}`,
+        "The ticket budget has been reached. Push your work in progress, then stop and wait for Ostrom to resume you.",
+        () => {},
+      );
+      queueStatusCard(store, assignment.ticketId);
+      return;
+    }
+    if (store.getTicket(assignment.ticketId).state === "open") this.#budgetPauses.delete(id);
     if (assignment.harness === "codex" && this.#deps.codexSessions !== undefined) {
       const reason = this.#modelProblem(assignment, this.#deps.codexSessions);
       if (reason !== null) {

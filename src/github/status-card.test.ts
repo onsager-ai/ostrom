@@ -19,6 +19,13 @@ for (const state of ["working", "paused", "stuck", "done", "stopped"] as const) 
   });
 }
 
+test("status card snapshot: budget warning and budget pause", async () => {
+  assert.equal(
+    renderStatusCard({ ...base, state: "paused", budgetWarning: "tokens", pauseCause: "budget reached: tokens" }),
+    await snapshot("budget-paused"),
+  );
+}
+
 async function snapshot(state: StatusCardState): Promise<string> {
   return readFile(new URL(`./__snapshots__/status-card-${state}.md`, import.meta.url), "utf8");
 }

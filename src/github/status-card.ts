@@ -9,6 +9,8 @@ export type StatusCardState = "working" | "paused" | "stuck" | "done" | "stopped
 export interface StatusCard {
   state: StatusCardState;
   stoppedReason?: "issue closed";
+  budgetWarning?: string;
+  pauseCause?: string;
   /** The Worker's newest known checklist, in its order. Omit when it has not published one. */
   plan?: readonly string[];
   pullRequest?: string;
@@ -35,6 +37,8 @@ export function renderStatusCard(card: StatusCard): string {
     lines.push("", "### Plan", ...card.plan.map((item) => `- [ ] ${item}`));
   }
   if (card.pullRequest !== undefined) lines.push("", `PR: ${card.pullRequest}`);
+  if (card.budgetWarning !== undefined) lines.push("", `Warning: budget at 80% — ${card.budgetWarning}`);
+  if (card.pauseCause !== undefined) lines.push("", `Paused: ${card.pauseCause}`);
   lines.push(
     "",
     `Harness: \`${card.harness}\` · Model: \`${card.model}\``,

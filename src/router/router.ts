@@ -11,6 +11,8 @@
 
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
+
+import { DEFAULT_BUDGET, type BudgetDefaults } from "../budget/budgets.ts";
 import { join } from "node:path";
 
 import { ghGet, type GhRunner } from "../github/gh.ts";
@@ -145,6 +147,7 @@ export interface RouteOptions {
   workers: Workers;
   router: RouterConfig;
   runners: Record<"claude" | "codex", Runner>;
+  budget?: BudgetDefaults;
 }
 
 /**
@@ -177,7 +180,7 @@ export async function routeCandidates(options: RouteOptions): Promise<RoutePassR
       verdict: decision.verdict,
       reason: decision.reason,
       ...(decision.reply === null ? {} : { reply: decision.reply }),
-    });
+    }, options.budget ?? DEFAULT_BUDGET);
     result.decisions.push({ ...recorded, thread: decision.thread, triggers: decision.triggers, verdict: decision.verdict });
   }
   const outcomes = new Map(batch.outcomes.map((outcome) => [outcome.key, outcome]));
