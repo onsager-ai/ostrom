@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { test } from "node:test";
+import { afterEach, test } from "node:test";
 
 import { Store } from "../store/store.ts";
 import { FakeRunner } from "./fake-runner.ts";
@@ -11,9 +11,15 @@ import { INTERRUPTED_PROMPT, Workers, type WorkersDeps } from "./workers.ts";
 
 const REPO = "onsager-ai/ostrom";
 const config = { repo: "/repo", base: "main", worktrees: "/wt", harness: "codex" as const, model: "gpt-6-luna", machine: "host" };
+const stores: Store[] = [];
+
+afterEach(() => {
+  while (stores.length > 0) stores.pop()!.close();
+});
 
 function fixture(extra: Partial<WorkersDeps> = {}, harness: "claude" | "codex" = "codex") {
   const store = Store.open(":memory:", { now: () => new Date("2026-11-09T12:00:00.000Z") });
+  stores.push(store);
   const source = store.ensureSource("github", REPO);
   const issue = store.ensureThread({ sourceId: source.id, kind: "issue", number: 7, url: `https://github.com/${REPO}/issues/7` });
   const trigger = store.insertTrigger({
@@ -52,6 +58,17 @@ test("dispatch makes the worktree, starts the session with the brief and stores 
   await workers.drain();
   const done = store.getAssignment(1);
   assert.deepEqual([done.turnStartedAt, done.inputTokens, done.cachedInputTokens, done.outputTokens, done.outcome], [null, 10, 5, 2, null]);
+});
+
+test("a reached ticket budget pauses after the current turn and asks the Worker to push WIP", async () => {
+  const { store, runner, ticketId, workers } = fixture();
+  store.setTicketBudget(ticketId, { timeMinutes: 480, idleMinutes: 30, turns: 1, tokens: 1_000_000, escalations: 0 });
+  await workers.dispatch(ticketId);
+  await workers.drain();
+  assert.equal(store.getTicket(ticketId).state, "paused");
+  assert.equal(store.getTicket(ticketId).pauseCause, "budget reached: turns");
+  assert.match(runner.sessions[0]!.prompts[1]!, /Push your work in progress/);
+  assert.equal(store.getAssignment(1).turns, 2);
 });
 
 test("the session starts on the configured harness", async () => {

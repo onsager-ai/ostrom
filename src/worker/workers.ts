@@ -4,6 +4,7 @@
 
 import { join } from "node:path";
 
+import { turnBudgetReached } from "../budget/budgets.ts";
 import { queueStatusCard } from "../github/cards.ts";
 import type { WorkerConfig } from "../ostromd/config.ts";
 import { rolloutModel } from "../session/rollout.ts";
@@ -42,6 +43,7 @@ export class Workers {
   readonly #sessions = new Map<number, Session>();
   readonly #chains = new Map<number, Promise<void>>();
   readonly #queued = new Set<string>();
+  readonly #budgetPauses = new Set<number>();
 
   constructor(deps: WorkersDeps) {
     this.#deps = deps;
@@ -104,7 +106,7 @@ export class Workers {
     void this.#enqueue(assignmentId, () => this.#turn(assignmentId, prompt, (turnId) => {
       onStart(turnId);
       this.#queued.delete(key);
-    }, onComplete)).finally(() => this.#queued.delete(key));
+    }, onComplete, key)).finally(() => this.#queued.delete(key));
     return true;
   }
 
@@ -180,10 +182,13 @@ export class Workers {
     prompt: string,
     onStart?: (turnId: string) => void,
     onComplete?: (result: TurnResult) => void | Promise<void>,
+    key = "",
   ): Promise<void> {
     const { store } = this.#deps;
     const assignment = store.getAssignment(id);
     if (assignment.state !== "running") return;
+    const ticket = store.getTicket(assignment.ticketId);
+    if (ticket.state === "paused" && !key.startsWith("budget-pause-") && !key.startsWith("stuck-")) return;
     const session = this.#session(assignment);
     const turn = store.beginTurn(id);
     onStart?.(`${assignment.sessionId}:${turn}`);
@@ -202,6 +207,7 @@ export class Workers {
     const message = error instanceof Error ? error.message : String(error);
     this.#deps.log?.(`assignment ${id}: turn failed: ${message}`);
     this.#deps.store.endTurn(id, null);
+    this.#deps.store.recordTurnError(id, message);
     this.#mark(id, "failed");
     queueStatusCard(this.#deps.store, this.#deps.store.getAssignment(id).ticketId);
   }
@@ -209,8 +215,23 @@ export class Workers {
   #finished(id: number, result: TurnResult): void {
     const { store } = this.#deps;
     store.endTurn(id, result.usage);
+    store.clearTurnError(id);
     const assignment = store.getAssignment(id);
     if (assignment.state !== "running") return;
+    const reached = turnBudgetReached(store.ticketBudget(assignment.ticketId), new Date());
+    if (store.getTicket(assignment.ticketId).state === "open" && reached !== null && !this.#budgetPauses.has(id)) {
+      this.#budgetPauses.add(id);
+      store.pauseTicketForBudget(assignment.ticketId, reached);
+      this.deliver(
+        id,
+        `budget-pause-${assignment.ticketId}-${reached}`,
+        "The ticket budget has been reached. Push your work in progress, then stop and wait for Ostrom to resume you.",
+        () => {},
+      );
+      queueStatusCard(store, assignment.ticketId);
+      return;
+    }
+    if (store.getTicket(assignment.ticketId).state === "open") this.#budgetPauses.delete(id);
     if (assignment.harness === "codex" && this.#deps.codexSessions !== undefined) {
       const reason = this.#modelProblem(assignment, this.#deps.codexSessions);
       if (reason !== null) {

@@ -1,13 +1,28 @@
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
-import { test } from "node:test";
+import { afterEach, test } from "node:test";
 import { migrate, migrations } from "./migrations.ts";
 import { IllegalTransition, Store } from "./store.ts";
+
+const stores: Store[] = [];
+const databases: DatabaseSync[] = [];
+
+afterEach(() => {
+  while (stores.length > 0) stores.pop()!.close();
+  while (databases.length > 0) databases.pop()!.close();
+});
+
+function database(options: ConstructorParameters<typeof DatabaseSync>[1] = {}): DatabaseSync {
+  const db = new DatabaseSync(":memory:", options);
+  databases.push(db);
+  return db;
+}
 
 /** A store on an in-memory database with a clock the test moves by hand. */
 function fixture() {
   let now = new Date("2026-11-09T12:00:00.000Z");
   const store = Store.open(":memory:", { now: () => now });
+  stores.push(store);
   const source = store.ensureSource("github", "onsager-ai/ostrom");
   const issue = store.ensureThread({
     sourceId: source.id,
@@ -40,7 +55,7 @@ function fixture() {
 }
 
 test("migrations apply once and record their version", () => {
-  const db = new DatabaseSync(":memory:");
+  const db = database();
   assert.equal(migrate(db), migrations.length);
   assert.equal(migrate(db), migrations.length);
   const rows = db.prepare("SELECT version FROM schema_version ORDER BY version").all();
@@ -51,7 +66,7 @@ test("migrations apply once and record their version", () => {
 });
 
 test("a database newer than the code is refused", () => {
-  const db = new DatabaseSync(":memory:");
+  const db = database();
   migrate(db);
   db.prepare("INSERT INTO schema_version (version, applied_at) VALUES (?, ?)").run(
     migrations.length + 1,
@@ -136,7 +151,7 @@ test("only an accept decision creates a ticket", () => {
 });
 
 test("the schema refuses a ticket for a decision that is not an accept", () => {
-  const db = new DatabaseSync(":memory:");
+  const db = database();
   const store = new Store(db);
   const source = store.ensureSource("github", "o/r");
   const thread = store.ensureThread({ sourceId: source.id, kind: "issue", number: 1, url: "u" });
@@ -166,7 +181,7 @@ test("a decision rolls back whole when a trigger is not on its thread", () => {
 });
 
 test("a trigger cannot be edited after it is stored", () => {
-  const db = new DatabaseSync(":memory:");
+  const db = database();
   const store = new Store(db);
   const source = store.ensureSource("github", "o/r");
   const thread = store.ensureThread({ sourceId: source.id, kind: "issue", number: 1, url: "u" });
@@ -262,7 +277,7 @@ test("due replies come back oldest due first, up to the limit", () => {
 });
 
 test("the schema refuses an unstarted assignment that ends without a reason", () => {
-  const db = new DatabaseSync(":memory:", { enableForeignKeyConstraints: true });
+  const db = database({ enableForeignKeyConstraints: true });
   const store = new Store(db);
   const source = store.ensureSource("github", "o/r");
   const thread = store.ensureThread({ sourceId: source.id, kind: "issue", number: 1, url: "u" });
@@ -359,6 +374,33 @@ test("a native turn is counted, marked while it runs, and its usage is added", (
     [a.turns, a.turnStartedAt, a.inputTokens, a.cachedInputTokens, a.outputTokens, a.interruptions],
     [2, null, 6, 4, 3, 1],
   );
+});
+
+test("a ticket budget persists limits and sums every assignment's turn usage", () => {
+  const { store, accept } = fixture();
+  const ticketId = accept();
+  store.setTicketBudget(ticketId, { timeMinutes: 90, idleMinutes: 15, turns: 4, tokens: 500, escalations: 1 });
+  const first = store.createAssignment(ticketId);
+  store.configureNativeAssignment(first, { harness: "codex", model: "m", worktree: "/w1", branch: "b1", machine: "h" });
+  store.startNativeAssignment(first, "s1");
+  store.beginTurn(first);
+  store.endTurn(first, { inputTokens: 10, cachedInputTokens: 20, outputTokens: 30 });
+  store.endAssignment(first);
+  const second = store.createAssignment(ticketId);
+  store.configureNativeAssignment(second, { harness: "codex", model: "m", worktree: "/w2", branch: "b2", machine: "h" });
+  store.startNativeAssignment(second, "s2");
+  store.beginTurn(second);
+  store.endTurn(second, { inputTokens: 1, cachedInputTokens: 2, outputTokens: 3 });
+  const budget = store.ticketBudget(ticketId);
+  assert.deepEqual(
+    [budget.ticketId, budget.timeMinutes, budget.idleMinutes, budget.turnLimit, budget.tokenLimit, budget.escalationLimit,
+      budget.escalations, budget.turns, budget.inputTokens, budget.cachedInputTokens, budget.outputTokens, budget.lastActivityAt],
+    [ticketId, 90, 15, 4, 500, 1, 0, 2, 11, 22, 33, budget.openedAt],
+  );
+  store.pauseTicketForBudget(ticketId, "tokens");
+  assert.equal(store.getTicket(ticketId).pauseCause, "budget reached: tokens");
+  store.resumeTicket(ticketId);
+  assert.equal(store.getTicket(ticketId).pauseCause, null);
 });
 
 test("a stopped native assignment ends with its reason and is owed a reply; a finished one is not", () => {

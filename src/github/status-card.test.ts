@@ -13,12 +13,23 @@ const base: Omit<StatusCard, "state"> = {
   markerId: "card-thread-7",
 };
 
-for (const state of ["working", "paused", "stuck", "done", "stopped"] as const) {
+for (const state of ["working", "recovering", "paused", "stuck", "done", "stopped"] as const) {
   test(`status card snapshot: ${state}`, async () => {
     assert.equal(renderStatusCard({ ...base, state }), await snapshot(state));
   });
 }
 
+test("status card snapshot: budget warning and budget pause", async () => {
+  assert.equal(
+    renderStatusCard({ ...base, state: "paused", budgetWarning: "tokens", pauseCause: "budget reached: tokens" }),
+    await budgetSnapshot(),
+  );
+});
+
 async function snapshot(state: StatusCardState): Promise<string> {
   return readFile(new URL(`./__snapshots__/status-card-${state}.md`, import.meta.url), "utf8");
+}
+
+async function budgetSnapshot(): Promise<string> {
+  return readFile(new URL("./__snapshots__/status-card-budget-paused.md", import.meta.url), "utf8");
 }

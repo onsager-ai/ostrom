@@ -325,6 +325,38 @@ export const migrations: readonly string[] = [
     SELECT RAISE(ABORT, 'only an accept decision creates a ticket');
   END;
   `,
+
+  // 15: Ticket budgets are durable, per-ticket limits. Assignment counters remain the source of
+  // turn and token usage; ticket-level queries sum every assignment for the ticket.
+  `
+  ALTER TABLE ticket ADD COLUMN budget_time_minutes INTEGER NOT NULL DEFAULT 480 CHECK (budget_time_minutes > 0);
+  ALTER TABLE ticket ADD COLUMN budget_idle_minutes INTEGER NOT NULL DEFAULT 30 CHECK (budget_idle_minutes > 0);
+  ALTER TABLE ticket ADD COLUMN budget_turns INTEGER NOT NULL DEFAULT 80 CHECK (budget_turns > 0);
+  ALTER TABLE ticket ADD COLUMN budget_tokens INTEGER NOT NULL DEFAULT 1000000 CHECK (budget_tokens > 0);
+  ALTER TABLE ticket ADD COLUMN budget_escalations INTEGER NOT NULL DEFAULT 0 CHECK (budget_escalations >= 0);
+  ALTER TABLE ticket ADD COLUMN escalations INTEGER NOT NULL DEFAULT 0 CHECK (escalations >= 0);
+  ALTER TABLE ticket ADD COLUMN pause_cause TEXT CHECK (pause_cause <> '');
+  `,
+
+  // 16: Idle budgets use the end of the latest completed native turn, not worker startup.
+  `
+  ALTER TABLE assignment ADD COLUMN last_activity_at TEXT;
+  `,
+
+  // 17: The stuck ladder is deterministic. It records two silent recovery attempts, then one
+  // public escalation; a human reply clears the episode and permits ordinary follow-up delivery.
+  `
+  ALTER TABLE stall ADD COLUMN cause TEXT;
+  ALTER TABLE stall ADD COLUMN recovery_attempts INTEGER NOT NULL DEFAULT 0 CHECK (recovery_attempts >= 0 AND recovery_attempts <= 2);
+  ALTER TABLE stall ADD COLUMN public_at TEXT;
+  ALTER TABLE stall ADD COLUMN cleared_by_human_at TEXT;
+  `,
+
+  // 18: The Watchdog detects the same turn error twice consecutively without retaining a transcript.
+  `
+  ALTER TABLE assignment ADD COLUMN last_error TEXT;
+  ALTER TABLE assignment ADD COLUMN consecutive_errors INTEGER NOT NULL DEFAULT 0 CHECK (consecutive_errors >= 0);
+  `,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */

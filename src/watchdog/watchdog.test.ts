@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { test } from "node:test";
+import { afterEach, test } from "node:test";
 
 import type { ProcessRunner } from "../process.ts";
 import { Store } from "../store/store.ts";
@@ -11,6 +11,11 @@ const NOW = new Date("2026-11-09T12:00:00.000Z");
 const MINUTES = 20;
 const semonFixture = () => readFileSync(new URL("./fixtures/semon-stalls.json", import.meta.url), "utf8");
 const ok = (value: unknown) => ({ code: 0, stdout: JSON.stringify(value), stderr: "" });
+const stores: Store[] = [];
+
+afterEach(() => {
+  while (stores.length > 0) stores.pop()!.close();
+});
 
 const semonStall = (branch: string | null, reason = "waiting-question", question: string | null = "Which colour?") => ({
   id: `session-${branch}`,
@@ -24,6 +29,7 @@ const semonStall = (branch: string | null, reason = "waiting-question", question
 
 function setup() {
   const store = Store.open(":memory:", { now: () => NOW });
+  stores.push(store);
   const source = store.ensureSource("github", REPO);
   const issue = store.ensureThread({ sourceId: source.id, kind: "issue", number: 7, url: `https://github.com/${REPO}/issues/7` });
   const startWorker = (n: number) => {
@@ -45,7 +51,7 @@ function setup() {
     assert.deepEqual(args, semonStallsArgs(MINUTES));
     return ok({ now: 1, idle_minutes: MINUTES, rule: "…", stalls: semonStalls, window_start: 0 });
   };
-  const options = (): WatchdogOptions => ({ store, semon, idleMinutes: MINUTES });
+  const options = (): WatchdogOptions => ({ store, semon, idleMinutes: MINUTES, now: () => NOW });
   return { store, startWorker, options, setSemon: (stalls: unknown[]) => (semonStalls = stalls), breakSemon: (runner: ProcessRunner) => (semon = runner) };
 }
 
@@ -73,7 +79,7 @@ test("a Semon stall on a native Worker's branch is recorded once per episode", a
   assert.equal(s.store.getStall(1).detail, "Which colour?");
   assert.equal((await watchdog(s.options())).checked[0]!.newEpisode, false);
   s.setSemon([]);
-  assert.equal((await watchdog(s.options())).checked[0]!.clearedStallId, 1);
+  assert.equal((await watchdog(s.options())).checked[0]!.clearedStallId, 1, "the fixture clock keeps the idle budget below its limit");
   s.setSemon([semonStall(a.branch, "no-output", null)]);
   assert.equal((await watchdog(s.options())).checked[0]!.stallId, 2);
 });

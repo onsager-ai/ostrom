@@ -1,14 +1,20 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { afterEach, test } from "node:test";
 
 import { FakeGitHub } from "../github/fake-github.ts";
 import { Store } from "../store/store.ts";
 import { observe, pullRequestsForBranch, workerBrief } from "./dispatch.ts";
 
 const REPO = "onsager-ai/ostrom";
+const stores: Store[] = [];
+
+afterEach(() => {
+  while (stores.length > 0) stores.pop()!.close();
+});
 
 function fixture() {
   const store = Store.open(":memory:", { now: () => new Date("2026-11-09T12:00:00.000Z") });
+  stores.push(store);
   const github = new FakeGitHub(() => new Date("2026-11-09T12:00:00.000Z"));
   const source = store.ensureSource("github", REPO);
   const issue = store.ensureThread({ sourceId: source.id, kind: "issue", number: 7, url: `https://github.com/${REPO}/issues/7` });
