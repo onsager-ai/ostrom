@@ -6,7 +6,7 @@ import { claudeRunner, codexRunner } from "./runner.ts";
 import { sessionConfig } from "./config.ts";
 
 test("Claude resumes the same session with the explicit model", async () => {
-  const calls: { model?: string; resume?: string; permissionMode?: string; allowDangerouslySkipPermissions?: boolean }[] = [];
+  const calls: { model?: string; resume?: string; permissionMode: string | undefined; allowDangerouslySkipPermissions: boolean | undefined }[] = [];
   const run = async function* (input: Parameters<typeof import("@anthropic-ai/claude-agent-sdk").query>[0]): AsyncGenerator<SDKMessage> {
     calls.push({ ...(input.options?.model ? { model: input.options.model } : {}), ...(input.options?.resume ? { resume: input.options.resume } : {}), permissionMode: input.options?.permissionMode, allowDangerouslySkipPermissions: input.options?.allowDangerouslySkipPermissions });
     yield { type: "system", subtype: "init", session_id: "session", model: "haiku" } as SDKMessage;
