@@ -80,3 +80,20 @@ export function loadRouterConfig(env: Record<string, string | undefined>): Route
     model: read("OSTROM_ROUTER_MODEL"),
   };
 }
+
+// The Watchdog reads one more, required: how long a Worker may show no progress before it counts
+// as stalled. It is both Semon's `--idle-minutes` and the age of the T3 thread's last update.
+//
+//   OSTROM_STALL_MINUTES  a positive whole number of minutes, e.g. 20
+
+export interface WatchdogConfig {
+  idleMinutes: number;
+}
+
+export function loadWatchdogConfig(env: Record<string, string | undefined>): WatchdogConfig {
+  const value = env["OSTROM_STALL_MINUTES"]?.trim() ?? "";
+  if (!/^[1-9]\d*$/.test(value)) {
+    throw new Error(`OSTROM_STALL_MINUTES must be a positive whole number of minutes, got ${JSON.stringify(value)}`);
+  }
+  return { idleMinutes: Number(value) };
+}

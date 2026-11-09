@@ -42,6 +42,7 @@ test("reads `thread show --json`", () => {
     worktreePath: "/home/user/.t3/worktrees/ostrom/spike-t3-start",
     linkedPullRequest: null,
     pullRequests: [],
+    updatedAt: "2026-11-09T04:02:18.386Z",
   });
   assert.deepEqual(
     shown.messages.map(({ role, runId, text }) => ({ role, runId, text })),

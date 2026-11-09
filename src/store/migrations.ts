@@ -174,6 +174,27 @@ export const migrations: readonly string[] = [
     started_at   TEXT NOT NULL
   ) STRICT;
   `,
+
+  // 5: the Watchdog. One row per stall episode of a running assignment: opened when a signal
+  // first shows the Worker stalled, cleared when no signal shows it any more. A row is flagged to
+  // the Router once; its answer (wait or stop) is recorded on the row. At most one episode of an
+  // assignment is open at a time.
+  `
+  CREATE TABLE stall (
+    id            INTEGER PRIMARY KEY,
+    assignment_id INTEGER NOT NULL REFERENCES assignment (id),
+    semon_reason  TEXT CHECK (semon_reason <> ''),  -- Semon's stall_reason, when Semon listed it
+    t3_reason     TEXT CHECK (t3_reason <> ''),     -- the T3 thread-state rule that matched
+    detail        TEXT,                             -- e.g. the Worker's open question
+    detected_at   TEXT NOT NULL,
+    cleared_at    TEXT,
+    action        TEXT CHECK (action IN ('wait', 'stop')),
+    answered_at   TEXT,
+    CHECK (semon_reason IS NOT NULL OR t3_reason IS NOT NULL),
+    CHECK ((action IS NULL) = (answered_at IS NULL))
+  ) STRICT;
+  CREATE UNIQUE INDEX stall_open_episode ON stall (assignment_id) WHERE cleared_at IS NULL;
+  `,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */

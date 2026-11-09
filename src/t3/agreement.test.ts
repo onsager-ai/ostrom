@@ -211,6 +211,7 @@ test("the thread-show parser reads every value upstream can print", async () => 
           source: pr.source,
           state: pr.state,
         })),
+        updatedAt: thread.updatedAt,
       },
       messages: value.messages,
     });

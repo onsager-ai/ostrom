@@ -85,6 +85,8 @@ export interface T3Thread {
   readonly linkedPullRequest: T3LinkedPullRequest | null;
   /** Upstream may omit the field; an omitted list reads as empty. */
   readonly pullRequests: readonly T3PullRequest[];
+  /** When T3 last changed the thread, as printed; the Watchdog reads it as an ISO timestamp. */
+  readonly updatedAt: string;
 }
 
 export interface T3Message {
@@ -168,6 +170,7 @@ function readThread(input: unknown, path: string): T3Thread {
         : array(pullRequests, `${path}.pullRequests`).map((item, index) =>
             readPullRequest(item, `${path}.pullRequests[${index}]`),
           ),
+    updatedAt: string(value["updatedAt"], `${path}.updatedAt`),
   };
 }
 
