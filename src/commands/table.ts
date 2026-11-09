@@ -56,7 +56,7 @@ export const COMMANDS: readonly CommandDefinition[] = [
     name: "forbidden",
     sayOrDo: "A command from someone without permission",
     effect: "Ignored",
-    whoMay: "  ",
+    whoMay: "",
     acknowledgement: "😕 only; no comment, so no noise and no argument",
   },
 ];
@@ -70,9 +70,13 @@ export function renderCommandTable(): string {
     "| Say or do | Effect | Who may | Acknowledged by |",
     "|---|---|---|---|",
     ...COMMANDS.map((definition) =>
-      `| ${definition.sayOrDo} | ${definition.effect} | ${definition.whoMay} | ${definition.acknowledgement} |`,
+      `| ${definition.sayOrDo} | ${definition.effect} |${cell(definition.whoMay)}| ${definition.acknowledgement} |`,
     ),
   ].join("\n");
+}
+
+function cell(value: string): string {
+  return value === "" ? " " : ` ${value} `;
 }
 
 export function controlsLine(): string {
