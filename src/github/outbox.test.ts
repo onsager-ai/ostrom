@@ -116,7 +116,7 @@ test("the search matches the exact id and reads every page", async () => {
 
 test("a reply whose id cannot go in a marker fails instead of posting unmarked", async () => {
   const { store, thread, send, posts } = fixture();
-  store.enqueueReply({ id: "bad id -->", threadId: thread, body: "x" });
+  store.enqueueReply({ id: "bad id -->", threadId: thread, body: "x", blocking: true });
   const result = await send();
   assert.equal(result.failed.length, 1);
   assert.match(result.failed[0]!.error, /cannot go in a marker/);
