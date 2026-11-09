@@ -2,6 +2,7 @@
 // See docs/direction.md. Each pass is its own command; `tick` runs them all once in order, and
 // `run` repeats `tick`. Installing it as a service is not done here.
 
+import { defaultSocketPath, localApi } from "../api/server.ts";
 import { routeCommands } from "../commands/commands.ts";
 import { execGh, type GhRunner } from "../github/gh.ts";
 import { sendDueReplies } from "../github/outbox.ts";
@@ -158,14 +159,17 @@ async function run(intervalSeconds: number, deps: MainDeps): Promise<number> {
   }
   let code = 0;
   const owned = openWorkers(deps);
+  const api = localApi(owned.store, defaultSocketPath(deps.env));
   logRecovery(owned.workers.recover(), deps);
   try {
+    await api.start();
     while (!deps.stop.aborted) {
       code = await tick({ ...deps, workers: owned.workers });
       if (deps.stop.aborted) break;
       await deps.sleep(intervalSeconds * 1000, deps.stop);
     }
   } finally {
+    await api.close();
     await owned.close();
   }
   return code;
@@ -187,6 +191,7 @@ function openWorkers(deps: MainDeps) {
   const store = Store.open(loadConfig(deps.env).dbPath);
   const workers = makeWorkers(deps, store);
   return {
+    store,
     workers,
     close: async () => {
       try {
