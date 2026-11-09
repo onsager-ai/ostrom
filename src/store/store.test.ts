@@ -229,12 +229,13 @@ test("subscriptions are many-to-many and looked up by thread", () => {
   const a = accept();
   const b = accept();
 
-  assert.deepEqual(store.subscribe(a, issue), { duplicate: false });
+  // An accept subscribes its ticket to the thread it was accepted on.
+  assert.deepEqual(store.subscribe(a, issue), { duplicate: true });
   assert.deepEqual(store.subscribe(a, pr), { duplicate: false });
   assert.deepEqual(store.subscribe(b, pr), { duplicate: false });
   assert.deepEqual(store.subscribe(a, pr), { duplicate: true });
 
-  assert.deepEqual(store.ticketsForThread(issue).map((t) => t.id), [a]);
+  assert.deepEqual(store.ticketsForThread(issue).map((t) => t.id), [a, b]);
   assert.deepEqual(store.ticketsForThread(pr).map((t) => t.id), [a, b]);
   const nobody = store.ensureThread({ sourceId: source.id, kind: "issue", number: 9, url: "i9" });
   assert.deepEqual(store.ticketsForThread(nobody), []);
@@ -409,10 +410,8 @@ test("a delivery is recorded once, and only for a ticket subscribed to the trigg
   const ticketId = accept();
   const assignmentId = store.createAssignment(ticketId);
   store.startAssignment(assignmentId, "mcp:worker");
+  // The accept subscribed the ticket to its own thread, so a later comment there is a follow-up.
   const followUp = trigger();
-  assert.throws(() => store.recordDelivery(followUp, assignmentId, "run:1"), /needs the assignment's ticket subscribed/);
-
-  store.subscribe(ticketId, issue);
   assert.deepEqual(store.pendingDeliveries().map((p) => [p.trigger.id, p.ticketId, p.assignmentId, p.t3ThreadId]), [
     [followUp, ticketId, assignmentId, "mcp:worker"],
   ]);
@@ -421,7 +420,10 @@ test("a delivery is recorded once, and only for a ticket subscribed to the trigg
   assert.deepEqual(store.pendingDeliveries(), []);
 
   const elsewhere = store.ensureThread({ sourceId: source.id, kind: "issue", number: 8, url: "u8" });
-  assert.throws(() => store.recordDelivery(trigger(elsewhere), assignmentId, "run:3"), /subscribed/);
+  assert.throws(
+    () => store.recordDelivery(trigger(elsewhere), assignmentId, "run:3"),
+    /needs the assignment's ticket subscribed/,
+  );
 });
 
 test("a decision's reply is queued with it, under an id derived from the decision", () => {

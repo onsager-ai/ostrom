@@ -264,8 +264,11 @@ export class Store {
   // --- decisions and tickets -----------------------------------------------------------------
 
   /**
-   * Records the Router's judgement. An accept opens a ticket, and a reply is queued, in the same
-   * transaction, so a decision never exists without the acknowledgement it carried.
+   * Records the Router's judgement. In the same transaction a reply is queued, so a decision never
+   * exists without the acknowledgement it carried, and an accept opens a ticket subscribed to the
+   * decision's own thread, so later comments there go to the ticket's Worker as follow-ups
+   * instead of reaching the Router as new work. The accepted triggers have this decision, so
+   * they are never delivered as follow-ups themselves.
    */
   recordDecision(decision: NewDecision): {
     decisionId: number;
@@ -305,6 +308,12 @@ export class Store {
         decisionId,
         at,
       )!["id"] as number;
+      this.#run(
+        "INSERT INTO subscription (ticket_id, thread_id, subscribed_at) VALUES (?, ?, ?)",
+        ticketId,
+        decision.threadId,
+        at,
+      );
       return { decisionId, ticketId, replyId };
     });
   }

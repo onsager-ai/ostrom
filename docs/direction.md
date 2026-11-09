@@ -82,7 +82,7 @@ Borrowed from the prototype's domain and narrowed to what milestone 1 needs:
 | `decision` | The Router's judgement on a batch of Triggers: `accept`, `ignore` or `stop`, with a reason | Only an accept creates a Ticket |
 | `ticket` | One unit of accepted work | `open → ended`; a person's message resumes it |
 | `assignment` | A Ticket bound to one T3 Worker thread id | `pending → running → ended`; a Ticket may have several |
-| `subscription` | Ticket ↔ thread (many-to-many) | Fan-out without a new Decision; the Worker's PR thread is subscribed automatically |
+| `subscription` | Ticket ↔ thread (many-to-many) | Fan-out without a new Decision; an accept subscribes its own thread, and the Worker's PR thread is subscribed automatically |
 | `outbox` | Replies owed to GitHub, each with an id | Each reply is sent once; retried with backoff |
 
 ## Milestone 1

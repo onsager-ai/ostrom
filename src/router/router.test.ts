@@ -7,6 +7,7 @@ import { test } from "node:test";
 import { FakeGitHub } from "../github/fake-github.ts";
 import { pollOnce } from "../github/poller.ts";
 import { Store } from "../store/store.ts";
+import { routeFollowUps } from "../worker/follow-up.ts";
 import { T3Cli, type T3Exit, type T3Invocation } from "../t3/runner.ts";
 import {
   bodyPath,
@@ -105,11 +106,12 @@ function setup(dbPath = ":memory:") {
   const now = () => NOW;
   const github = new FakeGitHub(now);
   github.issue(7);
+  github.issue(8);
   const t3 = new FakeT3();
   let store = Store.open(dbPath, { now });
   const options = (): RouteOptions => ({ store, gh: github.gh, t3: t3.cli, repo: github.repo, worker, router });
-  const comment = (body: string, minute = 58) =>
-    github.comment(7, { login: "alice", body, at: new Date(`2026-11-09T11:${minute}:00Z`) });
+  const comment = (body: string, minute = 58, issue = 7) =>
+    github.comment(issue, { login: "alice", body, at: new Date(`2026-11-09T11:${minute}:00Z`) });
   const poll = () => pollOnce({ store, gh: github.gh, repo: github.repo, allowlist: ["alice"], now });
   const reopen = () => {
     store.close();
@@ -364,7 +366,7 @@ test("a Router thread T3 no longer has is replaced by a new one; any other error
   assert.equal(s.store().routerThread(), "mcp:router-1");
 
   s.t3.routers.delete("mcp:router-1");
-  s.comment("and the one in CONTRIBUTING", 58);
+  s.comment("and please fix the CONTRIBUTING typo", 58, 8);
   await s.poll();
   s.t3.showExit = { code: 1, stdout: "", stderr: "connect ECONNREFUSED 127.0.0.1:3773" };
   await assert.rejects(routeCandidates(s.options()), /ECONNREFUSED/);
@@ -376,6 +378,38 @@ test("a Router thread T3 no longer has is replaced by a new one; any other error
   assert.equal(s.store().routerThread(), pass.router?.t3ThreadId);
   assert.notEqual(pass.router?.t3ThreadId, "mcp:router-1");
   assert.equal(pass.decisions.length, 1);
+});
+
+test("a follow-up on the accepted issue goes to its Worker, not to the Router", async () => {
+  const s = setup();
+  s.comment("please fix the typo", 57);
+  await s.poll();
+  const first = await routeCandidates(s.options());
+  const { ticketId } = first.decisions[0]!;
+  const { assignmentId, t3ThreadId } = first.dispatched[0]!;
+  const issue = first.decisions[0]!.thread;
+  assert.deepEqual(s.store().ticketsForThread(issue).map((t) => t.id), [ticketId]);
+  // The accepted trigger has its decision: it is neither a candidate nor owed to the Worker.
+  assert.deepEqual(s.store().pendingDeliveries(), []);
+
+  s.comment("also the one in CONTRIBUTING.md", 58);
+  await s.poll();
+  assert.deepEqual(s.store().undecidedTriggers(), []);
+  const turns = s.t3.routerTurns.length;
+  assert.equal((await routeCandidates(s.options())).router, null);
+  assert.equal(s.t3.routerTurns.length, turns);
+
+  // #655's follow-up pass delivers it to the Worker; the fake t3 queues it as the next run.
+  const sends: string[] = [];
+  const followUps = new T3Cli(async (invocation) => {
+    sends.push(invocation.args[3]!);
+    return ok({ threadId: invocation.args[3], messageId: "message:m", runId: "run:f", status: "queued", delivery: "queued" });
+  });
+  const routed = await routeFollowUps(s.store(), followUps);
+  assert.deepEqual(routed.failed, []);
+  assert.deepEqual(routed.delivered.map((d) => [d.ticketId, d.assignmentId, d.t3ThreadId]), [[ticketId, assignmentId, t3ThreadId]]);
+  assert.deepEqual(sends, [t3ThreadId]);
+  assert.deepEqual(await routeFollowUps(s.store(), followUps), { delivered: [], failed: [] });
 });
 
 test("a trigger's body is fetched by the id in its URL", () => {
