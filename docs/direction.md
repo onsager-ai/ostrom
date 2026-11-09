@@ -143,4 +143,5 @@ and the prototype. CI runs the tests; nothing is built or tested locally on the 
    contract gets the same treatment when Ostrom first uses it.
 7. **Semon readiness.** Today Semon exposes `list_sessions`, `get_session`, `read_transcript` and
    `stalls`. SQL/FTS is step 4 of Semon's ASI plan. Milestone 1 should need only `stalls` and
-   `read_transcript`.
+   `read_transcript`. The Watchdog uses `stalls` through `semon query` (CLI, not MCP), matched to
+   Workers by branch; see `docs/watchdog.md`.

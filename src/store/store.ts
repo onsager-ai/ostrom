@@ -110,6 +110,34 @@ export interface TicketContext {
   triggerUrls: string[];
 }
 
+/** One stall episode of a running assignment (migration 5). */
+export interface Stall {
+  id: number;
+  assignmentId: number;
+  semonReason: string | null;
+  t3Reason: string | null;
+  detail: string | null;
+  detectedAt: string;
+  clearedAt: string | null;
+  action: StallAction | null;
+  answeredAt: string | null;
+}
+
+export interface NewStall {
+  assignmentId: number;
+  semonReason: string | null;
+  t3Reason: string | null;
+  detail: string | null;
+}
+
+/** The Router's answer to a flagged stall: leave the Worker be, or stop the work. */
+export type StallAction = "wait" | "stop";
+
+/** The outbox id of the reply the Router wrote for a stall: stable, so it is sent once. */
+export function stallReplyId(stallId: number): string {
+  return `stall-${stallId}`;
+}
+
 export interface NewReply {
   id: string;
   threadId: number;
@@ -522,6 +550,90 @@ export class Store {
     return { duplicate: Number(changes) === 0 };
   }
 
+  // --- stalls -------------------------------------------------------------------------------
+
+  /**
+   * Opens a stall episode for the assignment, unless one is open already: an ongoing stall is
+   * recorded once, however many passes see it. Returns the open episode's id.
+   */
+  recordStall(stall: NewStall): Inserted {
+    return this.#transaction(() => {
+      const assignment = this.getAssignment(stall.assignmentId);
+      if (assignment.state !== "running") {
+        throw new IllegalTransition(`assignment ${stall.assignmentId} is ${assignment.state}; only a running one stalls`);
+      }
+      const open = this.#get("SELECT id FROM stall WHERE assignment_id = ? AND cleared_at IS NULL", stall.assignmentId);
+      if (open !== undefined) return { id: open["id"] as number, duplicate: true };
+      const id = this.#get(
+        `INSERT INTO stall (assignment_id, semon_reason, t3_reason, detail, detected_at)
+         VALUES (?, ?, ?, ?, ?) RETURNING id`,
+        stall.assignmentId,
+        stall.semonReason,
+        stall.t3Reason,
+        stall.detail,
+        this.#stamp(),
+      )!["id"] as number;
+      return { id, duplicate: false };
+    });
+  }
+
+  /** Ends the assignment's open stall episode, if any. Returns its id, or null when none was open. */
+  clearStall(assignmentId: number): number | null {
+    const row = this.#get(
+      "UPDATE stall SET cleared_at = ? WHERE assignment_id = ? AND cleared_at IS NULL RETURNING id",
+      this.#stamp(),
+      assignmentId,
+    );
+    return row === undefined ? null : (row["id"] as number);
+  }
+
+  getStall(stallId: number): Stall {
+    const row = this.#get("SELECT * FROM stall WHERE id = ?", stallId);
+    if (row === undefined) throw new Error(`no stall ${stallId}`);
+    return toStall(row);
+  }
+
+  /** Open stall episodes the Router has not answered, on running assignments, oldest first. */
+  unansweredStalls(): Stall[] {
+    return this.#all(
+      `SELECT stall.* FROM stall JOIN assignment ON assignment.id = stall.assignment_id
+       WHERE stall.cleared_at IS NULL AND stall.answered_at IS NULL AND assignment.state = 'running'
+       ORDER BY stall.id`,
+    ).map(toStall);
+  }
+
+  /**
+   * Records the Router's answer to a stall. In the same transaction its reply, if any, is queued
+   * on the thread the ticket was accepted on, and a `stop` ends the assignment and, once no
+   * assignment of it runs, the ticket. Code never stops work on a stall without this answer.
+   */
+  answerStall(
+    stallId: number,
+    action: StallAction,
+    reply: string | null,
+  ): { replyId: string | null; ticketId: number; ticketEnded: boolean } {
+    return this.#transaction(() => {
+      const { changes } = this.#run(
+        "UPDATE stall SET action = ?, answered_at = ? WHERE id = ? AND answered_at IS NULL",
+        action,
+        this.#stamp(),
+        stallId,
+      );
+      if (Number(changes) !== 1) {
+        throw new IllegalTransition(`stall ${stallId} was already answered ${String(this.getStall(stallId).action)}`);
+      }
+      const assignment = this.getAssignment(this.getStall(stallId).assignmentId);
+      let replyId: string | null = null;
+      if (reply !== null) {
+        replyId = stallReplyId(stallId);
+        const threadId = this.ticketContext(assignment.ticketId).thread.id;
+        this.#insertReply({ id: replyId, threadId, body: reply });
+      }
+      if (action === "wait") return { replyId, ticketId: assignment.ticketId, ticketEnded: false };
+      return { replyId, ticketId: assignment.ticketId, ticketEnded: this.#endWork(assignment) };
+    });
+  }
+
   // --- the Router ----------------------------------------------------------------------------
 
   /** The T3 Code thread the Router currently runs in, or null before the first one starts. */
@@ -559,18 +671,23 @@ export class Store {
     return this.#transaction(() => {
       const { duplicate } = this.#insertReply(reply);
       if (end === undefined) return { duplicate, ticketEnded: false };
-      const assignment = this.getAssignment(end.assignmentId);
-      if (assignment.state === "running") this.endAssignment(assignment.id);
-      const stillRunning = this.#get(
-        "SELECT 1 FROM assignment WHERE ticket_id = ? AND state = 'running'",
-        assignment.ticketId,
-      );
-      if (stillRunning !== undefined || this.getTicket(assignment.ticketId).state !== "open") {
-        return { duplicate, ticketEnded: false };
-      }
-      this.endTicket(assignment.ticketId);
-      return { duplicate, ticketEnded: true };
+      return { duplicate, ticketEnded: this.#endWork(this.getAssignment(end.assignmentId)) };
     });
+  }
+
+  /**
+   * Ends the assignment if it still runs, and its ticket once no assignment of it runs. Call
+   * inside a transaction. Returns whether the ticket ended.
+   */
+  #endWork(assignment: Assignment): boolean {
+    if (assignment.state === "running") this.endAssignment(assignment.id);
+    const stillRunning = this.#get(
+      "SELECT 1 FROM assignment WHERE ticket_id = ? AND state = 'running'",
+      assignment.ticketId,
+    );
+    if (stillRunning !== undefined || this.getTicket(assignment.ticketId).state !== "open") return false;
+    this.endTicket(assignment.ticketId);
+    return true;
   }
 
   /** Whether a reply with this id was ever queued, sent or not. */
@@ -715,6 +832,20 @@ function toAssignment(row: Row): Assignment {
     endReason: row["end_reason"] as string | null,
     outcome: row["outcome"] as AssignmentOutcome | null,
     outcomeAt: row["outcome_at"] as string | null,
+  };
+}
+
+function toStall(row: Row): Stall {
+  return {
+    id: row["id"] as number,
+    assignmentId: row["assignment_id"] as number,
+    semonReason: row["semon_reason"] as string | null,
+    t3Reason: row["t3_reason"] as string | null,
+    detail: row["detail"] as string | null,
+    detectedAt: row["detected_at"] as string,
+    clearedAt: row["cleared_at"] as string | null,
+    action: row["action"] as StallAction | null,
+    answeredAt: row["answered_at"] as string | null,
   };
 }
 
