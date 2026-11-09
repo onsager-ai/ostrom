@@ -136,6 +136,8 @@ export interface Assignment {
   inputTokens: number;
   cachedInputTokens: number;
   outputTokens: number;
+  lastError: string | null;
+  consecutiveErrors: number;
   /** The last time this Worker completed a turn. */
   lastActivityAt: string | null;
   /** Set while a turn runs; still set when ostromd starts means the turn was interrupted. */
@@ -169,12 +171,17 @@ export interface Stall {
   clearedAt: string | null;
   action: StallAction | null;
   answeredAt: string | null;
+  cause: string | null;
+  recoveryAttempts: number;
+  publicAt: string | null;
+  clearedByHumanAt: string | null;
 }
 
 export interface NewStall {
   assignmentId: number;
   semonReason: string | null;
   detail: string | null;
+  cause?: string;
 }
 
 /** The Router's answer to a flagged stall: leave the Worker be, or stop the work. */
@@ -663,6 +670,20 @@ export class Store {
     );
   }
 
+  /** Records whether this failure repeats the immediately preceding failure. */
+  recordTurnError(assignmentId: number, error: string): void {
+    this.#run(
+      `UPDATE assignment SET consecutive_errors = CASE WHEN last_error = ? THEN consecutive_errors + 1 ELSE 1 END,
+       last_error = ? WHERE id = ?`,
+      error, error, assignmentId,
+    );
+  }
+
+  /** Clears the repeated-error detector after a successful turn. */
+  clearTurnError(assignmentId: number): void {
+    this.#run("UPDATE assignment SET last_error = NULL, consecutive_errors = 0 WHERE id = ?", assignmentId);
+  }
+
   /** Counts a turn that a restart found unfinished. */
   recordInterruption(assignmentId: number): void {
     this.#run("UPDATE assignment SET interruptions = interruptions + 1 WHERE id = ?", assignmentId);
@@ -769,13 +790,16 @@ export class Store {
     return { duplicate: Number(changes) === 0 };
   }
 
-  /** Every follow-up owed to an open ticket's Worker, oldest trigger first, then by ticket. */
+  /** Every follow-up owed to an open ticket's Worker, including the first human reply after public Stuck. */
   pendingDeliveries(): PendingDelivery[] {
     return this.#all(
       `SELECT t.*, ticket.id AS p_ticket_id, worker.id AS p_assignment_id
        FROM "trigger" AS t
        JOIN subscription ON subscription.thread_id = t.thread_id
-       JOIN ticket ON ticket.id = subscription.ticket_id AND ticket.state = 'open'
+       JOIN ticket ON ticket.id = subscription.ticket_id AND (
+         ticket.state = 'open' OR EXISTS (
+           SELECT 1 FROM stall JOIN assignment AS stalled ON stalled.id = stall.assignment_id
+           WHERE stalled.ticket_id = ticket.id AND stall.public_at IS NOT NULL AND stall.cleared_at IS NULL))
        LEFT JOIN assignment AS worker ON worker.id = (
          SELECT id FROM assignment WHERE ticket_id = ticket.id AND state = 'running' ORDER BY id DESC LIMIT 1)
        WHERE NOT EXISTS (SELECT 1 FROM decision_trigger WHERE trigger_id = t.id)
@@ -828,15 +852,46 @@ export class Store {
       const open = this.#get("SELECT id FROM stall WHERE assignment_id = ? AND cleared_at IS NULL", stall.assignmentId);
       if (open !== undefined) return { id: open["id"] as number, duplicate: true };
       const id = this.#get(
-        `INSERT INTO stall (assignment_id, semon_reason, detail, detected_at)
-         VALUES (?, ?, ?, ?) RETURNING id`,
+        `INSERT INTO stall (assignment_id, semon_reason, detail, detected_at, cause)
+         VALUES (?, ?, ?, ?, ?) RETURNING id`,
         stall.assignmentId,
         stall.semonReason,
         stall.detail,
         this.#stamp(),
+        stall.cause ?? null,
       )!["id"] as number;
       return { id, duplicate: false };
     });
+  }
+
+  /** Starts the next silent recovery. The third call returns null, leaving public escalation due. */
+  beginStallRecovery(stallId: number): Stall | null {
+    const row = this.#get(
+      `UPDATE stall SET recovery_attempts = recovery_attempts + 1
+       WHERE id = ? AND cleared_at IS NULL AND public_at IS NULL AND recovery_attempts < 2 RETURNING *`,
+      stallId,
+    );
+    return row === undefined ? null : toStall(row);
+  }
+
+  /** Marks the one public stuck reply as queued. It cannot be repeated for this episode. */
+  publishStall(stallId: number): Stall {
+    const row = this.#get(
+      "UPDATE stall SET public_at = ? WHERE id = ? AND cleared_at IS NULL AND public_at IS NULL RETURNING *",
+      this.#stamp(), stallId,
+    );
+    if (row === undefined) throw new IllegalTransition(`stall ${stallId} cannot be published`);
+    return toStall(row);
+  }
+
+  /** A human reply clears the public stuck state without losing the episode record. */
+  clearStallForHumanReply(assignmentId: number): number | null {
+    const row = this.#get(
+      `UPDATE stall SET cleared_by_human_at = ?, cleared_at = ?
+       WHERE assignment_id = ? AND public_at IS NOT NULL AND cleared_at IS NULL RETURNING id`,
+      this.#stamp(), this.#stamp(), assignmentId,
+    );
+    return row === undefined ? null : row["id"] as number;
   }
 
   /** Ends the assignment's open stall episode, if any. Returns its id, or null when none was open. */
@@ -855,11 +910,31 @@ export class Store {
     return toStall(row);
   }
 
-  /** Open stall episodes the Router has not answered, on running assignments, oldest first. */
+  /** Public stuck tickets for the operator status view (PR 7 consumes this query). */
+  stuckTickets(): { ticket: Ticket; stall: Stall }[] {
+    return this.#all(
+      `SELECT ticket.*, stall.id AS stall_id, stall.assignment_id AS stall_assignment_id,
+              stall.semon_reason AS stall_semon_reason, stall.detail AS stall_detail,
+              stall.detected_at AS stall_detected_at, stall.cleared_at AS stall_cleared_at,
+              stall.action AS stall_action, stall.answered_at AS stall_answered_at, stall.cause AS stall_cause,
+              stall.recovery_attempts AS stall_recovery_attempts, stall.public_at AS stall_public_at,
+              stall.cleared_by_human_at AS stall_cleared_by_human_at
+       FROM ticket JOIN assignment ON assignment.ticket_id = ticket.id JOIN stall ON stall.assignment_id = assignment.id
+       WHERE stall.public_at IS NOT NULL AND stall.cleared_at IS NULL ORDER BY stall.public_at, ticket.id`,
+    ).map((row) => ({ ticket: toTicket(row), stall: toStall({
+      id: row["stall_id"], assignment_id: row["stall_assignment_id"], semon_reason: row["stall_semon_reason"],
+      detail: row["stall_detail"], detected_at: row["stall_detected_at"], cleared_at: row["stall_cleared_at"],
+      action: row["stall_action"], answered_at: row["stall_answered_at"], cause: row["stall_cause"],
+      recovery_attempts: row["stall_recovery_attempts"], public_at: row["stall_public_at"],
+      cleared_by_human_at: row["stall_cleared_by_human_at"],
+    }) }));
+  }
+
+  /** Open deterministic stuck episodes, on running assignments, oldest first. */
   unansweredStalls(): Stall[] {
     return this.#all(
       `SELECT stall.* FROM stall JOIN assignment ON assignment.id = stall.assignment_id
-       WHERE stall.cleared_at IS NULL AND stall.answered_at IS NULL AND assignment.state = 'running'
+       WHERE stall.cleared_at IS NULL AND assignment.state = 'running'
        ORDER BY stall.id`,
     ).map(toStall);
   }
@@ -1142,6 +1217,8 @@ function toAssignment(row: Row): Assignment {
     inputTokens: row["input_tokens"] as number,
     cachedInputTokens: row["cached_input_tokens"] as number,
     outputTokens: row["output_tokens"] as number,
+    lastError: row["last_error"] as string | null,
+    consecutiveErrors: row["consecutive_errors"] as number,
     lastActivityAt: row["last_activity_at"] as string | null,
     turnStartedAt: row["turn_started_at"] as string | null,
     interruptions: row["interruptions"] as number,
@@ -1164,6 +1241,10 @@ function toStall(row: Row): Stall {
     clearedAt: row["cleared_at"] as string | null,
     action: row["action"] as StallAction | null,
     answeredAt: row["answered_at"] as string | null,
+    cause: row["cause"] as string | null,
+    recoveryAttempts: row["recovery_attempts"] as number,
+    publicAt: row["public_at"] as string | null,
+    clearedByHumanAt: row["cleared_by_human_at"] as string | null,
   };
 }
 

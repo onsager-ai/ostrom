@@ -9,6 +9,7 @@
 // output. A Worker's session is matched to its assignment by its git branch
 // (`ostrom/ticket-<ticket>-<assignment>`). A failed read is reported and never clears an episode.
 
+import { budgetReached } from "../budget/budgets.ts";
 import type { ProcessRunner } from "../process.ts";
 import type { Store } from "../store/store.ts";
 
@@ -120,11 +121,14 @@ export async function watchdog(options: WatchdogOptions): Promise<WatchdogPass> 
       newEpisode: false,
       clearedStallId: null,
     };
-    if (semonReason !== null) {
+    const budget = budgetReached(store.ticketBudget(assignment.ticketId), new Date());
+    const repeatedError = assignment.consecutiveErrors >= 2;
+    if (semonReason !== null || budget !== null || repeatedError) {
       const question = matched?.openQuestion ?? null;
       const detail =
-        question === null ? null : question.length > DETAIL_CHARS ? `${question.slice(0, DETAIL_CHARS)}…` : question;
-      const recorded = store.recordStall({ assignmentId: assignment.id, semonReason, detail });
+        question === null ? assignment.lastError : question.length > DETAIL_CHARS ? `${question.slice(0, DETAIL_CHARS)}…` : question;
+      const cause = budget === null ? repeatedError ? "same turn error twice" : semonReason! : `budget reached: ${budget}`;
+      const recorded = store.recordStall({ assignmentId: assignment.id, semonReason, detail, cause });
       checked.stallId = recorded.id;
       checked.newEpisode = !recorded.duplicate;
     } else if (semon !== null) {

@@ -106,7 +106,7 @@ export class Workers {
     void this.#enqueue(assignmentId, () => this.#turn(assignmentId, prompt, (turnId) => {
       onStart(turnId);
       this.#queued.delete(key);
-    }, onComplete)).finally(() => this.#queued.delete(key));
+    }, onComplete, key)).finally(() => this.#queued.delete(key));
     return true;
   }
 
@@ -182,10 +182,13 @@ export class Workers {
     prompt: string,
     onStart?: (turnId: string) => void,
     onComplete?: (result: TurnResult) => void | Promise<void>,
+    key = "",
   ): Promise<void> {
     const { store } = this.#deps;
     const assignment = store.getAssignment(id);
     if (assignment.state !== "running") return;
+    const ticket = store.getTicket(assignment.ticketId);
+    if (ticket.state === "paused" && !key.startsWith("budget-pause-") && !key.startsWith("stuck-")) return;
     const session = this.#session(assignment);
     const turn = store.beginTurn(id);
     onStart?.(`${assignment.sessionId}:${turn}`);
@@ -204,6 +207,7 @@ export class Workers {
     const message = error instanceof Error ? error.message : String(error);
     this.#deps.log?.(`assignment ${id}: turn failed: ${message}`);
     this.#deps.store.endTurn(id, null);
+    this.#deps.store.recordTurnError(id, message);
     this.#mark(id, "failed");
     queueStatusCard(this.#deps.store, this.#deps.store.getAssignment(id).ticketId);
   }
@@ -211,6 +215,7 @@ export class Workers {
   #finished(id: number, result: TurnResult): void {
     const { store } = this.#deps;
     store.endTurn(id, result.usage);
+    store.clearTurnError(id);
     const assignment = store.getAssignment(id);
     if (assignment.state !== "running") return;
     const reached = budgetReached(store.ticketBudget(assignment.ticketId), new Date());

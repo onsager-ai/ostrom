@@ -4,7 +4,7 @@
 import { controlsLine } from "../commands/table.ts";
 import { replyMarker } from "./marker.ts";
 
-export type StatusCardState = "working" | "paused" | "stuck" | "done" | "stopped";
+export type StatusCardState = "working" | "recovering" | "paused" | "stuck" | "done" | "stopped";
 
 export interface StatusCard {
   state: StatusCardState;
@@ -24,6 +24,7 @@ export interface StatusCard {
 
 const STATE_LABEL: Record<StatusCardState, string> = {
   working: "Working",
+  recovering: "Recovering",
   paused: "Paused",
   stuck: "Stuck",
   done: "Done",

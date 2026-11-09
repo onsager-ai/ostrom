@@ -165,9 +165,9 @@ export async function routeCandidates(options: RouteOptions): Promise<RoutePassR
   const batch: Batch = {
     threads: await candidateThreads(options),
     outcomes: await pendingOutcomes(options, result),
-    stalls: flaggedStalls(options.store),
+    stalls: [],
   };
-  if (batch.threads.length === 0 && batch.outcomes.length === 0 && batch.stalls.length === 0) return result;
+  if (batch.threads.length === 0 && batch.outcomes.length === 0) return result;
 
   const asked = await askRouter(options, routerMessage(batch));
   result.router = { sessionId: asked.sessionId };
@@ -192,12 +192,6 @@ export async function routeCandidates(options: RouteOptions): Promise<RoutePassR
     );
     result.outcomes.push({ key, event: outcome.event, ticketId: outcome.ticketId, ticketEnded });
   }
-  const stalls = new Map(batch.stalls.map((stall) => [stall.key, stall]));
-  for (const { key, action, reply } of answer.stalls) {
-    const recorded = store.answerStall(stalls.get(key)!.stallId, action, reply);
-    result.stalls.push({ key, action, ...recorded });
-  }
-
   await dispatchPending(options, result);
   return result;
 }

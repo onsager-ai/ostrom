@@ -12,6 +12,7 @@ import { sessionConfig } from "../session/config.ts";
 import { codexSessionsDir } from "../session/rollout.ts";
 import { claudeRunner, codexRunner, type Runner } from "../session/runner.ts";
 import { Store } from "../store/store.ts";
+import { advanceStuckLadder } from "../watchdog/stuck.ts";
 import { watchdog } from "../watchdog/watchdog.ts";
 import { observe } from "../worker/dispatch.ts";
 import { routeFollowUps } from "../worker/follow-up.ts";
@@ -51,12 +52,12 @@ commands:
   route  queue each new trigger on a subscribed thread as a turn on its ticket's Worker session,
          wait for the turns to finish, and print each queued follow-up as a JSON line
   watchdog
-         check every running Worker once with Semon's stalls read; record each new stall episode
-         for the Router's next batch and print each check as a JSON line
+         check every running Worker once with Semon's stalls read, run the deterministic stuck
+         recovery ladder, and print each check as a JSON line
   route-candidates
-         one Router pass: ask the Router to judge undecided triggers, word outcome replies and
-         answer flagged stalls (wait or stop), record its decisions, dispatch accepted tickets,
-         queue replies and end finished or stopped tickets; print each record as a JSON line
+         one Router pass: ask the Router to judge undecided triggers and word outcome replies,
+         record its decisions, dispatch accepted tickets, queue replies and end finished or
+         stopped tickets; print each record as a JSON line
   tick   run every pass once: ${TICK.join(" → ")}; a failed pass is reported, the rest still
          run, and the tick exits non-zero
   run --interval <seconds>
@@ -117,6 +118,7 @@ function loadTickConfig(env: MainDeps["env"]): void {
   loadWorkerConfig(env);
   loadRouterConfig(env);
   loadWatchdogConfig(env);
+  loadBudgetDefaults(env);
 }
 
 /** One tick: every pass in TICK order, each opening the store itself and reporting as its command does. */
@@ -287,13 +289,14 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
     if (command === "watchdog") {
       const { idleMinutes } = loadWatchdogConfig(deps.env);
       const pass = await watchdog({ store, semon: deps.semon, idleMinutes });
+      const ladder = await advanceStuckLadder(store, workers());
       for (const checked of pass.checked) deps.stdout(JSON.stringify(checked));
       for (const failure of pass.failed) deps.stderr(`ostromd watchdog: ${failure.what} failed: ${failure.error}`);
       const flagged = pass.checked.filter((checked) => checked.newEpisode).length;
       const stalled = pass.checked.filter((checked) => checked.stallId !== null).length;
       deps.stderr(
         `ostromd watchdog: ${pass.checked.length} checked, ${stalled} stalled, ${flagged} newly flagged, ` +
-          `${pass.failed.length} failed`,
+          `${ladder.recovered.length} recovering, ${ladder.published.length} public, ${pass.failed.length} failed`,
       );
       return pass.failed.length === 0 ? 0 : 1;
     }

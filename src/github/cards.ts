@@ -10,10 +10,13 @@ export function queueStatusCard(store: Store, ticketId: number, now = new Date()
   const ticket = context.ticket;
   const assignment = store.latestAssignment(ticketId);
   if (assignment === null || assignment.harness === null || assignment.model === null) return;
+  const openStall = store.unansweredStalls().find((stall) => stall.assignmentId === assignment.id);
   const state: StatusCardState =
     ticket.state === "ended" ? (assignment.endReason === null ? "done" : "stopped") :
-      ticket.state === "paused" ? "paused" :
-        assignment.outcome === "failed" ? "stuck" : "working";
+      openStall !== undefined && openStall.publicAt !== null ? "stuck" :
+        openStall !== undefined ? "recovering" :
+          ticket.state === "paused" ? "paused" :
+            assignment.outcome === "failed" ? "stuck" : "working";
   const budget = store.ticketBudget(ticketId);
   const warning = budgetWarning(budget, now);
   const lastActivityAt = new Date(assignment.lastActivityAt ?? assignment.outcomeAt ?? assignment.startedAt ?? assignment.createdAt);

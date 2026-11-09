@@ -2,6 +2,7 @@
 // session. A submitted review and all of its inline comments are one logical follow-up: one turn,
 // one acknowledgement reaction, and one summary reply after the Worker completes.
 
+import { queueStatusCard } from "../github/cards.ts";
 import { renderReviewReply } from "../github/review-reply.ts";
 import type { Store, Thread, Trigger } from "../store/store.ts";
 import type { Workers } from "./workers.ts";
@@ -23,6 +24,10 @@ export function routeFollowUps(store: Store, workers: Workers): RoutePass {
   const grouped = new Set<string>();
   for (const delivery of pending) {
     const { trigger, ticketId, assignmentId } = delivery;
+    if (assignmentId !== null && store.clearStallForHumanReply(assignmentId) !== null) {
+      store.resumeTicket(ticketId);
+      queueStatusCard(store, ticketId);
+    }
     if (assignmentId === null) {
       pass.failed.push({ triggerId: trigger.id, ticketId, error: `ticket ${ticketId} has no running Worker` });
       continue;
