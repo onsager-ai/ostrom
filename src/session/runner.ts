@@ -97,6 +97,8 @@ export function codexRunner(config: CodexOptions, client: CodexClient = new Code
       sandboxMode: options.sandbox ?? "workspace-write",
       networkAccessEnabled: options.sandbox !== "read-only",
       approvalPolicy: "never" as const,
+      // A read-only session (the Router) runs in a scratch directory that is not a Git repository.
+      ...(options.sandbox === "read-only" ? { skipGitRepoCheck: true } : {}),
       ...(options.writableDirs?.length ? { additionalDirectories: options.writableDirs } : {}),
     };
     const thread: CodexThread = id === null ? client.startThread(threadOptions) : client.resumeThread(id, threadOptions);
