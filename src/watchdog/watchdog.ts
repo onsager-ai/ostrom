@@ -81,6 +81,8 @@ export interface WatchdogOptions {
   store: Store;
   semon: ProcessRunner;
   idleMinutes: number;
+  /** Clock used for budget evaluation; injectable for deterministic checks. */
+  now?: () => Date;
 }
 
 export interface Checked {
@@ -102,7 +104,7 @@ export interface WatchdogPass {
 
 /** One pass over running assignments. */
 export async function watchdog(options: WatchdogOptions): Promise<WatchdogPass> {
-  const { store, idleMinutes } = options;
+  const { store, idleMinutes, now = () => new Date() } = options;
   const pass: WatchdogPass = { checked: [], failed: [] };
   let semon: SemonStall[] | null;
   try {
@@ -121,7 +123,7 @@ export async function watchdog(options: WatchdogOptions): Promise<WatchdogPass> 
       newEpisode: false,
       clearedStallId: null,
     };
-    const budget = budgetReached(store.ticketBudget(assignment.ticketId), new Date());
+    const budget = budgetReached(store.ticketBudget(assignment.ticketId), now());
     const repeatedError = assignment.consecutiveErrors >= 2;
     if (semonReason !== null || budget !== null || repeatedError) {
       const question = matched?.openQuestion ?? null;

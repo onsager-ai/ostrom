@@ -12,7 +12,7 @@
   },
   "scripts": {
     "typecheck": "tsc",
-    "test": "node --test \"src/**/*.test.ts\""
+    "test": "node --test --test-timeout=60000 \"src/**/*.test.ts\""
   },
   "devDependencies": {
     "@types/node": "24.19.2",

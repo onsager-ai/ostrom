@@ -93,6 +93,7 @@ export interface MainDeps {
 function sleep(ms: number, stop: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
     const timer = setTimeout(done, ms);
+    timer.unref();
     stop.addEventListener("abort", done, { once: true });
     function done() {
       clearTimeout(timer);

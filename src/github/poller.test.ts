@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
-import { test } from "node:test";
+import { afterEach, test } from "node:test";
 import { Store } from "../store/store.ts";
 import { FakeGitHub } from "./fake-github.ts";
 import { replyMarker } from "./marker.ts";
@@ -8,6 +8,11 @@ import { classify, pollOnce, type PollOptions } from "./poller.ts";
 
 const T0 = Date.parse("2026-11-09T12:00:00.000Z");
 const at = (minutes: number) => new Date(T0 + minutes * 60_000);
+const stores: Store[] = [];
+
+afterEach(() => {
+  while (stores.length > 0) stores.pop()!.close();
+});
 
 /** A store and a fake GitHub sharing a clock; the first pass has already set the baseline at T0. */
 async function fixture() {
@@ -15,6 +20,7 @@ async function fixture() {
   const clock = () => now;
   const db = new DatabaseSync(":memory:", { enableForeignKeyConstraints: true });
   const store = new Store(db, { now: clock });
+  stores.push(store);
   const github = new FakeGitHub(clock);
   const poll = (extra: Partial<PollOptions> = {}) =>
     pollOnce({ store, gh: github.gh, repo: github.repo, allowlist: ["Alice", "bob"], now: clock, ...extra });
@@ -28,6 +34,7 @@ async function fixture() {
 test("the first pass sets a baseline instead of replaying history", async () => {
   let now = at(0);
   const store = Store.open(":memory:", { now: () => now });
+  stores.push(store);
   const github = new FakeGitHub(() => now);
   github.issue(1);
   github.comment(1, { login: "alice", body: "old", at: at(-60) });

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { test } from "node:test";
+import { afterEach, test } from "node:test";
 
 import { Store } from "../store/store.ts";
 import { FakeRunner } from "./fake-runner.ts";
@@ -11,9 +11,15 @@ import { INTERRUPTED_PROMPT, Workers, type WorkersDeps } from "./workers.ts";
 
 const REPO = "onsager-ai/ostrom";
 const config = { repo: "/repo", base: "main", worktrees: "/wt", harness: "codex" as const, model: "gpt-6-luna", machine: "host" };
+const stores: Store[] = [];
+
+afterEach(() => {
+  while (stores.length > 0) stores.pop()!.close();
+});
 
 function fixture(extra: Partial<WorkersDeps> = {}, harness: "claude" | "codex" = "codex") {
   const store = Store.open(":memory:", { now: () => new Date("2026-11-09T12:00:00.000Z") });
+  stores.push(store);
   const source = store.ensureSource("github", REPO);
   const issue = store.ensureThread({ sourceId: source.id, kind: "issue", number: 7, url: `https://github.com/${REPO}/issues/7` });
   const trigger = store.insertTrigger({

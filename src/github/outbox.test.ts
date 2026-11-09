@@ -1,16 +1,22 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { afterEach, test } from "node:test";
 import { Store } from "../store/store.ts";
 import { FakeGitHub } from "./fake-github.ts";
 import { replyMarker } from "./marker.ts";
 import { defaultBackoffMs, sendDueReplies, type SendOptions } from "./outbox.ts";
 
 const T0 = Date.parse("2026-11-09T12:00:00.000Z");
+const stores: Store[] = [];
+
+afterEach(() => {
+  while (stores.length > 0) stores.pop()!.close();
+});
 
 function fixture() {
   let now = new Date(T0);
   const clock = () => now;
   const store = Store.open(":memory:", { now: clock });
+  stores.push(store);
   const github = new FakeGitHub(clock);
   const source = store.ensureSource("github", github.repo);
   github.issue(7);

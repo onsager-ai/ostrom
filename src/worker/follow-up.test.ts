@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { afterEach, test } from "node:test";
 
 import { Store } from "../store/store.ts";
 import { FakeRunner } from "./fake-runner.ts";
@@ -8,6 +8,11 @@ import { Workers } from "./workers.ts";
 
 const REPO = "onsager-ai/ostrom";
 const tick = () => new Promise((resolve) => setImmediate(resolve));
+const stores: Store[] = [];
+
+afterEach(() => {
+  while (stores.length > 0) stores.pop()!.close();
+});
 
 /**
  * Issue #7 asked for work and was accepted; its Worker runs in session `session-1` and
@@ -15,6 +20,7 @@ const tick = () => new Promise((resolve) => setImmediate(resolve));
  */
 function fixture() {
   const store = Store.open(":memory:", { now: () => new Date("2026-11-09T12:00:00.000Z") });
+  stores.push(store);
   const runner = new FakeRunner();
   const config = { repo: "/repo", base: "main", worktrees: "/wt", harness: "codex" as const, model: "gpt-6-luna", machine: "host" };
   const workers = new Workers({ store, config, runners: { claude: runner, codex: runner } });

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { test } from "node:test";
+import { afterEach, test } from "node:test";
 
 import { FakeGitHub } from "../github/fake-github.ts";
 import { Store } from "../store/store.ts";
@@ -11,10 +11,16 @@ import { parseComment } from "./parser.ts";
 import { controlsLine, renderCommandTable } from "./table.ts";
 
 const REPO = "onsager-ai/ostrom";
+const stores: Store[] = [];
+
+afterEach(() => {
+  while (stores.length > 0) stores.pop()!.close();
+});
 
 function fixture() {
   const now = new Date("2026-11-09T12:00:00.000Z");
   const store = Store.open(":memory:", { now: () => now });
+  stores.push(store);
   const github = new FakeGitHub(() => now);
   const runner = new FakeRunner();
   const workers = new Workers({
