@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 // The operator CLI. It uses ostromd's Unix-socket API; when the daemon is not running, read-only
 // views can still inspect the SQLite store directly.
 

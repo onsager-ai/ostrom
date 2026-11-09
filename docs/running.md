@@ -1,8 +1,12 @@
 # Running Ostrom
 
-`ostromd` is a user service. Put its runtime configuration in
+`ostromd` is a user service. Install the two commands from a checkout with `npm link`
+(they run their TypeScript directly on Node 24). Put the runtime configuration in
 `~/.config/ostrom/env` (including `OSTROM_REPO`, `OSTROM_ALLOWLIST`, `OSTROM_DB`,
-worker, router, and Watchdog variables), then install the checked-in unit:
+worker, router, and Watchdog variables). It must also set `PATH`: systemd starts user services
+with a minimal one, and the daemon and its Workers need `node`, `ostromd`, `git`, `gh`, `semon`,
+`codex` and `claude`. Copy your shell's value, for example with
+`echo "PATH=$PATH" >> ~/.config/ostrom/env`. Then install the checked-in unit:
 
 ```sh
 mkdir -p ~/.config/systemd/user

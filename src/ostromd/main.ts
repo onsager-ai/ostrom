@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 // ostromd: the daemon that runs intake, filtering, fan-out, the outbox and the Watchdog.
 // See docs/direction.md. The operator starts only `run`; individual passes remain under `dev`.
 
