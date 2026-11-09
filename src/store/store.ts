@@ -119,7 +119,8 @@ export interface TicketBudget {
   inputTokens: number;
   cachedInputTokens: number;
   outputTokens: number;
-  lastActivityAt: string | null;
+  /** When the ticket's running turn started; null between turns. */
+  turnStartedAt: string | null;
 }
 
 /** The compact records displayed by the local operator API. */
@@ -616,7 +617,7 @@ export class Store {
               COALESCE(SUM(assignment.input_tokens), 0) AS input_tokens,
               COALESCE(SUM(assignment.cached_input_tokens), 0) AS cached_input_tokens,
               COALESCE(SUM(assignment.output_tokens), 0) AS output_tokens,
-              MAX(assignment.last_activity_at) AS last_activity_at
+              MAX(assignment.turn_started_at) AS turn_started_at
          FROM ticket LEFT JOIN assignment ON assignment.ticket_id = ticket.id WHERE ticket.id = ? GROUP BY ticket.id`,
       ticketId,
     );
@@ -628,7 +629,7 @@ export class Store {
       escalationLimit: row["budget_escalations"] as number, escalations: row["escalations"] as number,
       turns: row["turns"] as number, inputTokens: row["input_tokens"] as number,
       cachedInputTokens: row["cached_input_tokens"] as number, outputTokens: row["output_tokens"] as number,
-      lastActivityAt: row["last_activity_at"] as string | null,
+      turnStartedAt: row["turn_started_at"] as string | null,
     };
   }
 
