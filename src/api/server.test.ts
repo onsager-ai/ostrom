@@ -62,7 +62,8 @@ test("the local API serves status, tickets and a ticket over a 0600 Unix socket"
     temperature: async () => 42,
     control: {
       pause: async (id) => { store.pauseTicket(id); },
-      resume: async () => {}, stop: async () => {}, extend: async () => {}, preview: async () => "",
+      resume: async (id) => { store.resumeTicket(id); }, stop: async () => {},
+      extend: async (id, increases) => { store.extendTicketBudget(id, increases); }, preview: async () => "",
     },
   });
   try {
@@ -101,6 +102,12 @@ test("the local API serves status, tickets and a ticket over a 0600 Unix socket"
     const paused = await call(socketPath, "POST", `/v1/tickets/${ticketId}/pause`);
     assert.equal(paused.status, 200);
     assert.equal((paused.body as { state: string }).state, "paused");
+    const resumed = await call(socketPath, "POST", `/v1/tickets/${ticketId}/resume`);
+    assert.equal(resumed.status, 200);
+    assert.equal((resumed.body as { state: string }).state, "open");
+    const extended = await call(socketPath, "POST", `/v1/tickets/${ticketId}/extend`, { turns: 2 });
+    assert.equal(extended.status, 200);
+    assert.equal(((extended.body as { budget: { turnLimit: number } }).budget).turnLimit, 82);
   } finally {
     await api.close();
     store.close();

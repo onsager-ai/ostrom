@@ -41,22 +41,17 @@ test("read-only CLI falls back to the store and formats tickets", async () => {
   }
 });
 
-test("extend raises stored limits and resumes a budget-paused ticket", async () => {
+test("mutating CLI commands require a running daemon", async () => {
   const directory = mkdtempSync(join(tmpdir(), "ostrom-cli-"));
   const path = join(directory, "ostrom.db");
   try {
     const id = ticket(path);
-    const store = Store.open(path);
-    store.pauseTicketForBudget(id, "turns");
-    store.close();
-    assert.equal(await main(["extend", String(id), "--time", "60", "--turns", "2", "--tokens", "100"], { OSTROM_DB: path }), 0);
-    const extended = Store.open(path);
+    assert.equal(await main(["extend", String(id), "--time", "60"], { OSTROM_DB: path, HOME: directory }), 1);
+    const unchanged = Store.open(path);
     try {
-      assert.equal(extended.getTicket(id).state, "open");
-      const budget = extended.ticketBudget(id);
-      assert.deepEqual([budget.timeMinutes, budget.turnLimit, budget.tokenLimit], [540, 82, 1_000_100]);
+      assert.equal(unchanged.ticketBudget(id).timeMinutes, 480);
     } finally {
-      extended.close();
+      unchanged.close();
     }
   } finally {
     rmSync(directory, { recursive: true, force: true });
