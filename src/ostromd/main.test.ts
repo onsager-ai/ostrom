@@ -348,9 +348,9 @@ test(
 );
 
 test("tick and run check every variable before any pass", async () => {
-  for (const argv of [["tick"], ["run", "--interval", "60"]]) {
+  for (const argv of [["dev", "tick"], ["run", "--interval", "60"]]) {
     const run = deps({ ...tickEnv("/nonexistent/ostrom.sqlite"), OSTROM_ROUTER_HARNESS: "t3" }, async () => "[]");
-    assert.equal(await main(["dev", ...argv], run.deps), 1);
+    assert.equal(await main(argv, run.deps), 1);
     assert.deepEqual(run.err.length, 1);
     assert.match(run.err[0]!, /OSTROM_ROUTER_HARNESS/);
   }

@@ -30,8 +30,7 @@ export function defaultSocketPath(env: Record<string, string | undefined> = proc
   const runtime = env["XDG_RUNTIME_DIR"]?.trim();
   if (runtime !== undefined && runtime !== "") return join(runtime, "ostrom", "ostromd.sock");
   const home = env["HOME"]?.trim();
-  if (home === undefined || home === "") throw new Error("HOME is required when XDG_RUNTIME_DIR is unset");
-  return join(home, ".local", "state", "ostrom", "ostromd.sock");
+  return join(home === undefined || home === "" ? "." : home, ".local", "state", "ostrom", "ostromd.sock");
 }
 
 /** Creates the API but does not bind the socket until start. */
