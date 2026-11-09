@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,9 +11,6 @@ import { FakeRunner } from "../worker/fake-runner.ts";
 import { loadConfig, loadRouterConfig, loadWatchdogConfig, loadWorkerConfig } from "./config.ts";
 import { main, TICK, type MainDeps } from "./main.ts";
 
-const noT3: MainDeps["t3"] = async () => {
-  throw new Error("this test does not run t3");
-};
 const noSemon: MainDeps["semon"] = async () => {
   throw new Error("this test does not run semon");
 };
@@ -21,14 +18,13 @@ const noSemon: MainDeps["semon"] = async () => {
 function deps(
   env: Record<string, string>,
   gh: MainDeps["gh"],
-  t3: MainDeps["t3"] = noT3,
   semon: MainDeps["semon"] = noSemon,
 ) {
   const out: string[] = [];
   const err: string[] = [];
   const runner = new FakeRunner();
   const d: MainDeps = {
-    env, gh, t3, semon,
+    env, gh, semon,
     stdout: (l: string) => out.push(l),
     stderr: (l: string) => err.push(l),
     sleep: async () => {},
@@ -119,7 +115,7 @@ const workerEnv = {
   OSTROM_WORKER_HARNESS: "claude",
   OSTROM_WORKER_MODEL: "claude-haiku-5-5",
 };
-const routerEnv = { OSTROM_T3_PROJECT: "/work/ostrom" };
+const routerEnv = { OSTROM_ROUTER_HARNESS: "codex", OSTROM_ROUTER_MODEL: "gpt-6-luna" };
 
 test("Worker config requires a repo and base, and defaults to codex on gpt-6-luna", () => {
   const required = { OSTROM_WORKER_REPO: "/work/ostrom", OSTROM_WORKER_BASE: "main" };
@@ -215,12 +211,13 @@ test(
   }),
 );
 
-test("Router config needs a provider and model, with no default", () => {
-  const env = { OSTROM_T3_PROJECT: "/work/ostrom", OSTROM_ROUTER_PROVIDER: "claudeAgent", OSTROM_ROUTER_MODEL: "claude-haiku-5-5" };
-  assert.deepEqual(loadRouterConfig(env), { project: "/work/ostrom", provider: "claudeAgent", model: "claude-haiku-5-5" });
-  for (const name of Object.keys(env)) {
-    assert.throws(() => loadRouterConfig({ ...env, [name]: "" }), new RegExp(name));
-  }
+test("Router config defaults to the small Codex tier and validates its harness", () => {
+  assert.deepEqual(loadRouterConfig({}), { harness: "codex", model: "gpt-6-luna" });
+  assert.deepEqual(
+    loadRouterConfig({ OSTROM_ROUTER_HARNESS: "claude", OSTROM_ROUTER_MODEL: "claude-haiku-5-5" }),
+    { harness: "claude", model: "claude-haiku-5-5" },
+  );
+  assert.throws(() => loadRouterConfig({ OSTROM_ROUTER_HARNESS: "t3" }), /OSTROM_ROUTER_HARNESS/);
 });
 
 test(
@@ -228,7 +225,6 @@ test(
   withDb(async (dbPath) => {
     const env = {
       OSTROM_REPO: "o/r", OSTROM_ALLOWLIST: "alice", OSTROM_DB: dbPath, ...workerEnv, ...routerEnv,
-      OSTROM_ROUTER_PROVIDER: "claudeAgent", OSTROM_ROUTER_MODEL: "claude-haiku-5-5",
     };
     const store = Store.open(dbPath);
     const source = store.ensureSource("github", "o/r");
@@ -240,14 +236,16 @@ test(
     store.close();
     const gh: MainDeps["gh"] = async () => JSON.stringify({ body: "please fix the typo" });
 
-    const missing = deps({ ...env, OSTROM_ROUTER_MODEL: "" }, gh);
-    assert.equal(await main(["route-candidates"], missing.deps), 1);
-    assert.match(missing.err.join("\n"), /OSTROM_ROUTER_MODEL/);
+    const badHarness = deps({ ...env, OSTROM_ROUTER_HARNESS: "t3" }, gh);
+    assert.equal(await main(["route-candidates"], badHarness.deps), 1);
+    assert.match(badHarness.err.join("\n"), /OSTROM_ROUTER_HARNESS/);
 
-    const run = (reply: string) => ({
-      code: 0, stdout: JSON.stringify({ threadId: "mcp:router", runId: "run:1", status: "completed", reply, error: null }), stderr: "",
-    });
-    const garbled = deps(env, gh, async () => run("I accept."));
+    const garbled = deps(env, gh);
+    garbled.runner.start = ((options) => {
+      const session = new FakeRunner().start(options);
+      session.reply = () => "I accept.";
+      return session;
+    }) as typeof garbled.runner.start;
     assert.equal(await main(["route-candidates"], garbled.deps), 1);
     assert.match(garbled.err.join("\n"), /Router reply is not JSON/);
 
@@ -256,10 +254,12 @@ test(
       outcomes: [],
       stalls: [],
     };
-    const shown = JSON.parse(readFileSync(new URL("../t3/fixtures/show.json", import.meta.url), "utf8"));
-    const judged = deps(env, gh, async ({ args }) =>
-      args[1] === "show" ? { code: 0, stdout: JSON.stringify(shown), stderr: "" } : run(JSON.stringify(answer)),
-    );
+    const judged = deps(env, gh);
+    judged.runner.start = ((options) => {
+      const session = new FakeRunner().start(options);
+      session.reply = () => JSON.stringify(answer);
+      return session;
+    }) as typeof judged.runner.start;
     assert.equal(await main(["route-candidates"], judged.deps), 0);
     assert.deepEqual(judged.out.map((line) => JSON.parse(line).type), ["router", "decision"]);
     assert.equal(JSON.parse(judged.out[1]!).verdict, "ignore");
@@ -273,11 +273,6 @@ test("Watchdog config needs a positive whole number of minutes", () => {
   }
 });
 
-const shownWorker = (fields: Record<string, unknown>) => {
-  const value = JSON.parse(readFileSync(new URL("../t3/fixtures/show.json", import.meta.url), "utf8"));
-  Object.assign(value.thread, fields);
-  return { code: 0, stdout: JSON.stringify(value), stderr: "" };
-};
 const semonAnswer = (minutes: number, stalls: unknown[]) => async () => ({
   code: 0, stdout: JSON.stringify({ idle_minutes: minutes, stalls }), stderr: "",
 });
@@ -294,26 +289,26 @@ test(
       url: "https://github.com/o/r/issues/7#issuecomment-1", occurredAt: new Date(),
     }).id;
     const { ticketId } = store.recordDecision({ threadId: issue, triggerIds: [trigger], verdict: "accept", reason: "fix it" });
-    store.startAssignment(store.createAssignment(ticketId!), "mcp:w");
+    const assignmentId = store.createAssignment(ticketId!);
+    store.configureNativeAssignment(assignmentId, { harness: "codex", model: "m", worktree: "/w", branch: "ostrom/ticket-1-1", machine: "host" });
+    store.startNativeAssignment(assignmentId, "session-1");
     store.close();
-    const t3 = async () => shownWorker({ threadId: "mcp:w", branch: "ostrom/ticket-1-1", status: "running", activeRunId: "run:1", updatedAt: new Date().toISOString() });
     const stalled = semonAnswer(20, [{ id: "s", branch: "ostrom/ticket-1-1", stall_reason: "waiting-question", open_question: { text: "Which?" } }]);
 
-    const missing = deps({ ...env, OSTROM_STALL_MINUTES: "" }, async () => "[]", t3, stalled);
+    const missing = deps({ ...env, OSTROM_STALL_MINUTES: "" }, async () => "[]", stalled);
     assert.equal(await main(["watchdog"], missing.deps), 1);
     assert.match(missing.err.join("\n"), /OSTROM_STALL_MINUTES/);
 
-    const first = deps(env, async () => "[]", t3, stalled);
+    const first = deps(env, async () => "[]", stalled);
     assert.equal(await main(["watchdog"], first.deps), 0);
     assert.deepEqual(first.out.map((line) => JSON.parse(line)), [{
-      assignmentId: 1, t3ThreadId: "mcp:w", semonReason: "waiting-question", t3Reason: null,
-      stallId: 1, newEpisode: true, clearedStallId: null,
+      assignmentId: 1, semonReason: "waiting-question", stallId: 1, newEpisode: true, clearedStallId: null,
     }]);
-    const second = deps(env, async () => "[]", t3, stalled);
+    const second = deps(env, async () => "[]", stalled);
     assert.equal(await main(["watchdog"], second.deps), 0);
     assert.equal(JSON.parse(second.out[0]!).newEpisode, false);
 
-    const broken = deps(env, async () => "[]", t3, async () => ({ code: 1, stdout: "", stderr: "no logs" }));
+    const broken = deps(env, async () => "[]", async () => ({ code: 1, stdout: "", stderr: "no logs" }));
     assert.equal(await main(["watchdog"], broken.deps), 1);
     assert.match(broken.err.join("\n"), /semon stalls failed: semon query stalls exited 1: no logs/);
     assert.equal(broken.out.length, 1);
@@ -322,7 +317,7 @@ test(
 
 const tickEnv = (dbPath: string) => ({
   OSTROM_REPO: "onsager-ai/ostrom", OSTROM_ALLOWLIST: "alice", OSTROM_DB: dbPath, ...workerEnv, ...routerEnv,
-  OSTROM_ROUTER_PROVIDER: "claudeAgent", OSTROM_ROUTER_MODEL: "claude-haiku-5-5", OSTROM_STALL_MINUTES: "20",
+  OSTROM_STALL_MINUTES: "20",
 });
 /** The pass each summary line on stderr came from, in order. */
 const passes = (err: string[]) => err.map((line) => /^ostromd ([\w-]+):/.exec(line)?.[1]);
@@ -335,14 +330,14 @@ test(
   "tick runs the passes in order, reports a failed one, runs the rest and exits non-zero",
   withDb(async (dbPath) => {
     const github = new FakeGitHub(() => new Date());
-    const ok = deps(tickEnv(dbPath), github.gh, noT3, semonAnswer(20, []));
+    const ok = deps(tickEnv(dbPath), github.gh, semonAnswer(20, []));
     assert.equal(await main(["tick"], ok.deps), 0);
     assert.deepEqual(passes(ok.err), [...TICK, "tick"]);
     assert.match(ok.err.at(-1)!, /all 6 passes ran/);
 
     // Intake and Semon both fail; every other pass still runs, and the tick names the failures.
     github.failWhen = () => new Error("HTTP 500");
-    const failed = deps(tickEnv(dbPath), github.gh, noT3, async () => ({ code: 127, stdout: "", stderr: "semon: not found" }));
+    const failed = deps(tickEnv(dbPath), github.gh, async () => ({ code: 127, stdout: "", stderr: "semon: not found" }));
     assert.equal(await main(["tick"], failed.deps), 1);
     assert.deepEqual(
       passes(failed.err).filter((name, i, all) => name !== all[i - 1]),
@@ -354,10 +349,10 @@ test(
 
 test("tick and run check every variable before any pass", async () => {
   for (const argv of [["tick"], ["run", "--interval", "60"]]) {
-    const run = deps({ ...tickEnv("/nonexistent/ostrom.sqlite"), OSTROM_ROUTER_MODEL: "" }, async () => "[]");
+    const run = deps({ ...tickEnv("/nonexistent/ostrom.sqlite"), OSTROM_ROUTER_HARNESS: "t3" }, async () => "[]");
     assert.equal(await main(argv, run.deps), 1);
     assert.deepEqual(run.err.length, 1);
-    assert.match(run.err[0]!, /OSTROM_ROUTER_MODEL/);
+    assert.match(run.err[0]!, /OSTROM_ROUTER_HARNESS/);
   }
 });
 
@@ -374,7 +369,7 @@ test(
     const github = new FakeGitHub(() => new Date());
     const stop = new AbortController();
     const waits: number[] = [];
-    const run = deps(tickEnv(dbPath), github.gh, noT3, semonAnswer(20, []));
+    const run = deps(tickEnv(dbPath), github.gh, semonAnswer(20, []));
     run.deps.stop = stop.signal;
     run.deps.sleep = async (ms) => {
       waits.push(ms);

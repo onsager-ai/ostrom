@@ -114,13 +114,12 @@ noted.
 
 1. **Session runner.** `src/session/`: one small interface over the Claude Agent SDK and the Codex
    SDK (start, send a turn, resume by ID, cancel, and per-turn usage), plus worktree creation. The
-   SDK versions are pinned and covered by agreement tests. `src/t3/` and `vendor/t3code/` remain
-   until PR 3, when their last callers move to the runner.
+   SDK versions are pinned and covered by agreement tests.
 2. **Workers on the runner.** Dispatch, follow-ups as resumed turns, outcomes from turn results and
    PR state, and resume after an `ostromd` restart. A migration adds the session fields and
    `machine` to `assignment`.
 3. **Router on the runner.** One-shot calls on a cheap tier with the existing strict JSON contract;
-   the `router_thread` table goes.
+   T3 Code, its vendor copy, and its Router state are removed.
 4. **Status card and outbox.** One card per issue, edited in place; reactions as acknowledgements;
    batching; one reply per review. Snapshot tests of everything posted, and `ostrom preview`.
 5. **Commands.** One command table in code for redirect, `@ostrom pause`/`resume`/`stop`, and
@@ -173,8 +172,8 @@ nothing is built or tested locally on the operator's laptop. Workers run on chea
    in milestone 1). Option B: a dedicated bot account or GitHub App.
 4. **Who merges.** Does the pass criterion allow a human to click merge, or must merging be
    unattended? A human merge is a decision, not relaying, but the target needs stating.
-5. **Mid-turn crashes.** The spikes resumed sessions after crashes between turns only. What a Worker
-   sees after `ostromd` dies mid-turn is still to be tested in PR 2.
+5. **Mid-turn crashes: narrowed.** A restart records an interrupted native turn and sends the
+   resumed session the recovery prompt; production still needs an observed mid-turn crash run.
 6. **Semon readiness.** Today Semon exposes `list_sessions`, `get_session`, `read_transcript` and
    `stalls`. The Watchdog uses `stalls` through `semon query` (CLI, not MCP), matched to Workers by
    branch; see `docs/watchdog.md`. If the operator needs a ticket view in Semon, it is added there.

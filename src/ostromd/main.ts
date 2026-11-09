@@ -4,13 +4,13 @@
 
 import { execGh, type GhRunner } from "../github/gh.ts";
 import { sendDueReplies } from "../github/outbox.ts";
+import { processRunner, type ProcessRunner } from "../process.ts";
 import { pollOnce } from "../github/poller.ts";
 import { routeCandidates } from "../router/router.ts";
 import { sessionConfig } from "../session/config.ts";
 import { codexSessionsDir } from "../session/rollout.ts";
 import { claudeRunner, codexRunner, type Runner } from "../session/runner.ts";
 import { Store } from "../store/store.ts";
-import { processRunner, T3Cli, type T3Runner } from "../t3/runner.ts";
 import { watchdog } from "../watchdog/watchdog.ts";
 import { observe } from "../worker/dispatch.ts";
 import { routeFollowUps } from "../worker/follow-up.ts";
@@ -46,9 +46,8 @@ commands:
   route  queue each new trigger on a subscribed thread as a turn on its ticket's Worker session,
          wait for the turns to finish, and print each queued follow-up as a JSON line
   watchdog
-         check every running Worker once with Semon's stalls read and its T3 thread state;
-         record each new stall episode for the Router's next batch and print each check as a
-         JSON line
+         check every running Worker once with Semon's stalls read; record each new stall episode
+         for the Router's next batch and print each check as a JSON line
   route-candidates
          one Router pass: ask the Router to judge undecided triggers, word outcome replies and
          answer flagged stalls (wait or stop), record its decisions, dispatch accepted tickets,
@@ -61,16 +60,15 @@ commands:
 environment: OSTROM_REPO, OSTROM_ALLOWLIST, OSTROM_DB;
   dispatch also needs OSTROM_WORKER_REPO, OSTROM_WORKER_BASE (optional: OSTROM_WORKER_WORKTREES,
   OSTROM_WORKER_HARNESS=claude|codex, default codex, OSTROM_WORKER_MODEL, default gpt-6-luna);
-  route-candidates needs those, OSTROM_T3_PROJECT, OSTROM_ROUTER_PROVIDER and
-  OSTROM_ROUTER_MODEL; watchdog needs OSTROM_STALL_MINUTES; tick and run need all of them
+  route-candidates needs those, optional OSTROM_ROUTER_HARNESS=claude|codex (default codex) and
+  OSTROM_ROUTER_MODEL (default gpt-6-luna); watchdog needs OSTROM_STALL_MINUTES; tick and run
+  need all of them
 `;
 
 export interface MainDeps {
   env: Record<string, string | undefined>;
   gh: GhRunner;
-  t3: T3Runner;
-  /** Runs `semon`; same shape as the t3 runner. */
-  semon: T3Runner;
+  semon: ProcessRunner;
   stdout: (line: string) => void;
   stderr: (line: string) => void;
   /** Waits between ticks of `run`; resolves early when `stop` aborts. */
@@ -101,7 +99,6 @@ function sleep(ms: number, stop: AbortSignal): Promise<void> {
 const defaults: MainDeps = {
   env: process.env,
   gh: execGh,
-  t3: processRunner(),
   semon: processRunner("semon"),
   stdout: (line) => process.stdout.write(`${line}\n`),
   stderr: (line) => process.stderr.write(`${line}\n`),
@@ -274,13 +271,7 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
     }
     if (command === "watchdog") {
       const { idleMinutes } = loadWatchdogConfig(deps.env);
-      const pass = await watchdog({
-        store,
-        t3: new T3Cli(deps.t3),
-        semon: deps.semon,
-        idleMinutes,
-        now: () => new Date(),
-      });
+      const pass = await watchdog({ store, semon: deps.semon, idleMinutes });
       for (const checked of pass.checked) deps.stdout(JSON.stringify(checked));
       for (const failure of pass.failed) deps.stderr(`ostromd watchdog: ${failure.what} failed: ${failure.error}`);
       const flagged = pass.checked.filter((checked) => checked.newEpisode).length;
@@ -293,7 +284,14 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
     }
     if (command === "route-candidates") {
       const router = loadRouterConfig(deps.env);
-      const pass = await routeCandidates({ store, gh: deps.gh, t3: new T3Cli(deps.t3), repo: config.repo, workers: workers(), router });
+      const pass = await routeCandidates({
+        store,
+        gh: deps.gh,
+        repo: config.repo,
+        workers: workers(),
+        router,
+        runners: deps.runners ?? realRunners(deps.env),
+      });
       if (pass.router !== null) deps.stdout(JSON.stringify({ type: "router", ...pass.router }));
       for (const decision of pass.decisions) deps.stdout(JSON.stringify({ type: "decision", ...decision }));
       for (const outcome of pass.outcomes) deps.stdout(JSON.stringify({ type: "outcome", ...outcome }));

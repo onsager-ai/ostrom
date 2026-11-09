@@ -39,8 +39,8 @@ test("dispatch makes the worktree, starts the session with the brief and stores 
   assert.deepEqual(worktrees, [["/repo", `/wt/ticket-${ticketId}-1`, "main"]]);
   const a = store.getAssignment(1);
   assert.deepEqual(
-    [a.state, a.harness, a.model, a.sessionId, a.worktree, a.branch, a.machine, a.turns, a.t3ThreadId],
-    ["running", "codex", "gpt-6-luna", "sess-1", `/wt/ticket-${ticketId}-1`, dispatched.branch, "host", 1, null],
+    [a.state, a.harness, a.model, a.sessionId, a.worktree, a.branch, a.machine, a.turns],
+    ["running", "codex", "gpt-6-luna", "sess-1", `/wt/ticket-${ticketId}-1`, dispatched.branch, "host", 1],
   );
   assert.notEqual(a.turnStartedAt, null, "the first turn is still running");
   const session = runner.sessions[0]!;

@@ -36,6 +36,29 @@ test("Codex returns an unverified model and forwards resume options", async () =
   assert.deepEqual(seen, { id: "id", options: { workingDirectory: "/tmp", model: "luna", sandboxMode: "workspace-write", networkAccessEnabled: true, approvalPolicy: "never", additionalDirectories: ["/repo/.git"] } });
 });
 
+test("read-only Router sessions deny Claude edits and use Codex read-only sandbox", async () => {
+  let claudeOptions: unknown;
+  const run = async function* (input: Parameters<typeof import("@anthropic-ai/claude-agent-sdk").query>[0]): AsyncGenerator<SDKMessage> {
+    claudeOptions = input.options;
+    yield { type: "system", subtype: "init", session_id: "claude-router", model: "haiku" } as SDKMessage;
+    yield { type: "result", subtype: "success", session_id: "claude-router", result: "{}", is_error: false, modelUsage: {}, usage: { input_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 0 } } as unknown as SDKMessage;
+  };
+  await claudeRunner({}, run).start({ cwd: "/scratch", model: "haiku", sandbox: "read-only" }).send("route");
+  assert.deepEqual(claudeOptions, {
+    cwd: "/scratch", model: "haiku", env: {}, abortController: (claudeOptions as { abortController: AbortController }).abortController,
+    permissionMode: "plan", disallowedTools: ["Bash", "Edit", "Write"],
+  });
+
+  let codexOptions: unknown;
+  const thread = { runStreamed: async () => ({ events: (async function* (): AsyncGenerator<ThreadEvent> {
+    yield { type: "thread.started", thread_id: "codex-router" };
+    yield { type: "turn.completed", usage: { input_tokens: 0, cached_input_tokens: 0, cache_write_input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0 } };
+  })() }) };
+  const client = { startThread: (options: unknown) => { codexOptions = options; return thread; } } as unknown as Pick<Codex, "startThread" | "resumeThread">;
+  await codexRunner({}, client).start({ cwd: "/scratch", model: "luna", sandbox: "read-only" }).send("route");
+  assert.deepEqual(codexOptions, { workingDirectory: "/scratch", model: "luna", sandboxMode: "read-only", networkAccessEnabled: false, approvalPolicy: "never" });
+});
+
 test("Codex reports its session id before the turn completes", async () => {
   const ids: string[] = [];
   const thread = { runStreamed: async () => ({ events: (async function* (): AsyncGenerator<ThreadEvent> {

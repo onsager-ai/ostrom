@@ -67,33 +67,29 @@ export function loadWorkerConfig(env: Record<string, string | undefined>): Worke
   };
 }
 
-// The Router reads two more, also required with no defaults, plus OSTROM_T3_PROJECT, the project
-// its thread runs in:
+// The Router uses a fresh, read-only session per batch:
 //
-//   OSTROM_ROUTER_PROVIDER  T3 provider instance id for the Router thread, e.g. claudeAgent
-//   OSTROM_ROUTER_MODEL     model slug for the Router thread, e.g. claude-haiku-5-5
+//   OSTROM_ROUTER_HARNESS  claude or codex; default codex
+//   OSTROM_ROUTER_MODEL    model slug; default gpt-6-luna
 
 export interface RouterConfig {
-  project: string;
-  provider: string;
+  harness: "claude" | "codex";
   model: string;
 }
 
 export function loadRouterConfig(env: Record<string, string | undefined>): RouterConfig {
-  const read = (name: string) => {
-    const value = env[name]?.trim() ?? "";
-    if (value === "") throw new Error(`${name} must be set to run the Router`);
-    return value;
-  };
+  const harness = env["OSTROM_ROUTER_HARNESS"]?.trim() || "codex";
+  if (harness !== "claude" && harness !== "codex") {
+    throw new Error(`OSTROM_ROUTER_HARNESS must be claude or codex, got ${JSON.stringify(harness)}`);
+  }
   return {
-    project: read("OSTROM_T3_PROJECT"),
-    provider: read("OSTROM_ROUTER_PROVIDER"),
-    model: read("OSTROM_ROUTER_MODEL"),
+    harness,
+    model: env["OSTROM_ROUTER_MODEL"]?.trim() || "gpt-6-luna",
   };
 }
 
 // The Watchdog reads one more, required: how long a Worker may show no progress before it counts
-// as stalled. It is both Semon's `--idle-minutes` and the age of the T3 thread's last update.
+// as stalled. It is Semon's `--idle-minutes` threshold.
 //
 //   OSTROM_STALL_MINUTES  a positive whole number of minutes, e.g. 20
 

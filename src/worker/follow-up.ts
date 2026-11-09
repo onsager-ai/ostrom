@@ -32,9 +32,8 @@ export function routeFollowUps(store: Store, workers: Workers): RoutePass {
   const pass: RoutePass = { queued: [], failed: [] };
   for (const pending of store.pendingDeliveries()) {
     const { trigger, ticketId, assignmentId } = pending;
-    if (assignmentId === null || pending.t3ThreadId !== null) {
-      const error = assignmentId === null ? `ticket ${ticketId} has no running Worker` : `ticket ${ticketId}'s Worker is a T3 thread, not a session`;
-      pass.failed.push({ triggerId: trigger.id, ticketId, error });
+    if (assignmentId === null) {
+      pass.failed.push({ triggerId: trigger.id, ticketId, error: `ticket ${ticketId} has no running Worker` });
       continue;
     }
     const added = workers.deliver(

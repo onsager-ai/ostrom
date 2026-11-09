@@ -20,6 +20,8 @@ export interface SessionOptions {
   model: string;
   sessionId?: string;
   onSessionId?: (id: string) => void;
+  /** A Router uses a one-shot, read-only session; Workers retain their writable worktree. */
+  sandbox?: "read-only" | "workspace-write";
   /** More writable directories. A worktree's Git data lives in the main clone's `.git`, outside `cwd`. */
   writableDirs?: string[];
 }
@@ -54,7 +56,9 @@ export function claudeRunner(env: Record<string, string | undefined>, run: Claud
         if (signal?.aborted) return { sessionId: id, text: "", status: "cancelled", usage: null, model };
         for await (const message of run({ prompt, options: {
           cwd: options.cwd, model: options.model, env, abortController,
-          permissionMode: "bypassPermissions", allowDangerouslySkipPermissions: true,
+          ...(options.sandbox === "read-only"
+            ? { permissionMode: "plan" as const, disallowedTools: ["Bash", "Edit", "Write"] }
+            : { permissionMode: "bypassPermissions" as const, allowDangerouslySkipPermissions: true }),
           ...(id === null ? {} : { resume: id }),
         } })) {
           if (message.type === "system" && message.subtype === "init") {
@@ -87,7 +91,14 @@ export function codexRunner(config: CodexOptions, client: CodexClient = new Code
     requireOptions(options);
     let id = options.sessionId ?? null;
     let busy = false;
-    const threadOptions = { workingDirectory: options.cwd, model: options.model, sandboxMode: "workspace-write" as const, networkAccessEnabled: true, approvalPolicy: "never" as const, ...(options.writableDirs?.length ? { additionalDirectories: options.writableDirs } : {}) };
+    const threadOptions = {
+      workingDirectory: options.cwd,
+      model: options.model,
+      sandboxMode: options.sandbox ?? "workspace-write",
+      networkAccessEnabled: options.sandbox !== "read-only",
+      approvalPolicy: "never" as const,
+      ...(options.writableDirs?.length ? { additionalDirectories: options.writableDirs } : {}),
+    };
     const thread: CodexThread = id === null ? client.startThread(threadOptions) : client.resumeThread(id, threadOptions);
     return { async send(prompt, signal) {
       if (busy) throw new Error("session already has a running turn");

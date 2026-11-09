@@ -61,7 +61,7 @@ test("a review on a subscribed PR goes to the ticket's Worker session, with no d
   const review = trigger(pr, "pull_request_review_comment");
   const [pending] = store.pendingDeliveries();
   assert.deepEqual({ ...pending, trigger: pending?.trigger.id }, {
-    trigger: review, ticketId, assignmentId, t3ThreadId: null,
+    trigger: review, ticketId, assignmentId,
   });
 
   const pass = routeFollowUps(store, workers);
@@ -211,17 +211,5 @@ test("an open ticket with no running Worker holds its follow-up and reports it",
     failed: [{ triggerId: id, ticketId, error: `ticket ${ticketId} has no running Worker` }],
   });
   assert.deepEqual(store.undecidedTriggers(), []);
-  assert.deepEqual(runner.sessions, []);
-});
-
-test("a ticket whose Worker is a legacy T3 thread is reported, not sent to", () => {
-  const { store, runner, workers, pr, trigger, ticketId, assignmentId, accept, issue } = fixture();
-  store.endAssignment(assignmentId);
-  const legacy = accept(issue);
-  store.subscribe(legacy, pr);
-  store.startAssignment(store.createAssignment(legacy), "mcp:old");
-  const id = trigger(pr);
-  const pass = routeFollowUps(store, workers);
-  assert.deepEqual(pass.failed.map((f) => [f.triggerId, f.ticketId]), [[id, ticketId], [id, legacy]]);
   assert.deepEqual(runner.sessions, []);
 });

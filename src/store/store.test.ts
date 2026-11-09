@@ -194,35 +194,6 @@ test("a ticket goes open → ended once", () => {
   assert.throws(() => store.createAssignment(ticketId), IllegalTransition);
 });
 
-test("an assignment goes pending → running → ended with its T3 thread id", () => {
-  const { store, accept } = fixture();
-  const ticketId = accept();
-  const first = store.createAssignment(ticketId);
-  assert.equal(store.getAssignment(first).state, "pending");
-  assert.equal(store.getAssignment(first).t3ThreadId, null);
-
-  assert.throws(() => store.endAssignment(first), /pending → ended is not allowed/);
-
-  store.startAssignment(first, "t3-thread-1");
-  const running = store.getAssignment(first);
-  assert.equal(running.state, "running");
-  assert.equal(running.t3ThreadId, "t3-thread-1");
-  assert.throws(() => store.startAssignment(first, "t3-thread-2"), /running → running is not allowed/);
-
-  store.endAssignment(first);
-  assert.equal(store.getAssignment(first).state, "ended");
-  assert.equal(store.getAssignment(first).t3ThreadId, "t3-thread-1");
-  assert.throws(() => store.endAssignment(first), /ended → ended is not allowed/);
-  assert.throws(() => store.startAssignment(first, "t3-thread-3"), /ended → running is not allowed/);
-
-  const second = store.createAssignment(ticketId);
-  assert.notEqual(second, first, "a ticket may have several assignments");
-  assert.throws(() => store.startAssignment(second, "t3-thread-1"), /UNIQUE constraint/);
-  assert.equal(store.getAssignment(second).state, "pending");
-  assert.throws(() => store.startAssignment(second, ""), /must not be empty/);
-  assert.throws(() => store.getAssignment(999), /no assignment 999/);
-});
-
 test("subscriptions are many-to-many and looked up by thread", () => {
   const { store, source, issue, accept } = fixture();
   const pr = store.ensureThread({ sourceId: source.id, kind: "pull_request", number: 8, url: "pr" });
@@ -290,24 +261,6 @@ test("due replies come back oldest due first, up to the limit", () => {
   assert.deepEqual(store.dueReplies(2).map((r) => r.id), ["r2", "r1"]);
 });
 
-test("an assignment whose Worker never started ends from pending with the reason", () => {
-  const { store, accept } = fixture();
-  const id = store.createAssignment(accept());
-  assert.throws(() => store.abandonAssignment(id, ""), /must not be empty/);
-  store.abandonAssignment(id, "t3 thread start exited 1: no such project");
-  const ended = store.getAssignment(id);
-  assert.equal(ended.state, "ended");
-  assert.equal(ended.t3ThreadId, null);
-  assert.equal(ended.endReason, "t3 thread start exited 1: no such project");
-  assert.equal(ended.endedAt, "2026-11-09T12:00:00.000Z");
-  assert.throws(() => store.abandonAssignment(id, "again"), /ended → ended is not allowed/);
-  assert.throws(() => store.startAssignment(id, "t3-late"), /ended → running is not allowed/);
-
-  const running = store.createAssignment(accept());
-  store.startAssignment(running, "t3-thread-9");
-  assert.throws(() => store.abandonAssignment(running, "no"), /running → ended is not allowed/);
-});
-
 test("the schema refuses an unstarted assignment that ends without a reason", () => {
   const db = new DatabaseSync(":memory:", { enableForeignKeyConstraints: true });
   const store = new Store(db);
@@ -324,31 +277,6 @@ test("the schema refuses an unstarted assignment that ends without a reason", ()
     () => db.prepare("UPDATE assignment SET state = 'ended', ended_at = 'x' WHERE id = ?").run(id),
     /CHECK constraint failed/,
   );
-});
-
-test("a running assignment records its observed outcome, timed from when it first held", () => {
-  const { store, accept, advance } = fixture();
-  const id = store.createAssignment(accept());
-  assert.throws(() => store.recordOutcome(id, "waiting"), /pending; only a running one has an outcome/);
-  store.startAssignment(id, "t3-thread-1");
-  assert.deepEqual(store.runningAssignments().map((a) => a.id), [id]);
-
-  store.recordOutcome(id, "waiting");
-  assert.equal(store.getAssignment(id).outcomeAt, "2026-11-09T12:00:00.000Z");
-  advance(60_000);
-  store.recordOutcome(id, "waiting");
-  assert.equal(store.getAssignment(id).outcomeAt, "2026-11-09T12:00:00.000Z", "the same outcome keeps its time");
-  store.recordOutcome(id, "failed");
-  assert.deepEqual(
-    [store.getAssignment(id).outcome, store.getAssignment(id).outcomeAt],
-    ["failed", "2026-11-09T12:01:00.000Z"],
-  );
-  store.recordOutcome(id, null);
-  assert.deepEqual([store.getAssignment(id).outcome, store.getAssignment(id).outcomeAt], [null, null]);
-
-  store.endAssignment(id);
-  assert.deepEqual(store.runningAssignments(), []);
-  assert.throws(() => store.recordOutcome(id, "failed"), /ended; only a running one has an outcome/);
 });
 
 test("a ticket's context is its thread, the decision reason, and its triggers in order", () => {
@@ -378,82 +306,6 @@ test("a ticket's context is its thread, the decision reason, and its triggers in
   ]);
 });
 
-test("migration 2 keeps the assignments a version 1 store already holds", () => {
-  const db = new DatabaseSync(":memory:", { enableForeignKeyConstraints: true });
-  db.exec(migrations[0]!);
-  db.exec(`
-    CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL) STRICT;
-    INSERT INTO schema_version VALUES (1, '2026-11-09T00:00:00.000Z');
-    INSERT INTO source (id, kind, name) VALUES (1, 'github', 'o/r');
-    INSERT INTO thread (id, source_id, kind, number, url) VALUES (1, 1, 'issue', 1, 'u');
-    INSERT INTO decision (id, thread_id, verdict, reason, decided_at) VALUES (1, 1, 'accept', 'r', 't');
-    INSERT INTO ticket (id, decision_id, state, opened_at) VALUES (1, 1, 'open', 't');
-    INSERT INTO assignment (id, ticket_id, state, created_at) VALUES (1, 1, 'pending', 't');
-    INSERT INTO assignment (id, ticket_id, state, t3_thread_id, created_at, started_at)
-      VALUES (2, 1, 'running', 'thr', 't', 't');
-  `);
-  const store = new Store(db);
-  assert.equal(store.getAssignment(1).state, "pending");
-  assert.deepEqual(
-    { ...store.getAssignment(2) },
-    {
-      id: 2, ticketId: 1, state: "running", t3ThreadId: "thr", createdAt: "t", startedAt: "t", endedAt: null,
-      endReason: null, outcome: null, outcomeAt: null,
-      harness: null, model: null, sessionId: null, worktree: null, branch: null, machine: null,
-      turns: 0, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, turnStartedAt: null, interruptions: 0,
-    },
-  );
-  store.abandonAssignment(1, "never started");
-  assert.equal(store.getAssignment(1).endReason, "never started");
-});
-
-test("migration 7 preserves deliveries and stalls referencing assignments", () => {
-  const db = new DatabaseSync(":memory:", { enableForeignKeyConstraints: true });
-  db.exec("CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL) STRICT");
-  for (let i = 0; i < 6; i++) {
-    db.exec(migrations[i]!);
-    db.prepare("INSERT INTO schema_version VALUES (?, 't')").run(i + 1);
-  }
-  db.exec(`
-    INSERT INTO source VALUES (1, 'github', 'o/r', NULL);
-    INSERT INTO thread VALUES (1, 1, 'issue', 1, 'u');
-    INSERT INTO "trigger" VALUES (1, 1, 'e', 1, 'issue_comment', 'a', 'u', 't', 't');
-    INSERT INTO decision VALUES (1, 1, 'accept', 'r', 't');
-    INSERT INTO ticket VALUES (1, 1, 'open', 't', NULL);
-    INSERT INTO subscription VALUES (1, 1, 't');
-    INSERT INTO assignment (id, ticket_id, state, t3_thread_id, created_at, started_at) VALUES (1, 1, 'running', 'thr', 't', 't');
-    INSERT INTO delivery VALUES (1, 1, 'run', 't');
-    INSERT INTO stall (id, assignment_id, semon_reason, detected_at) VALUES (1, 1, 'idle', 't');
-  `);
-  migrate(db);
-  assert.equal(db.prepare("SELECT assignment_id FROM delivery").get()?.["assignment_id"], 1);
-  assert.equal(db.prepare("SELECT assignment_id FROM stall").get()?.["assignment_id"], 1);
-  assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
-  assert.equal(db.prepare("PRAGMA foreign_keys").get()?.["foreign_keys"], 1);
-  db.close();
-});
-
-test("a delivery is recorded once, and only for a ticket subscribed to the trigger's thread", () => {
-  const { store, source, issue, trigger, accept } = fixture();
-  const ticketId = accept();
-  const assignmentId = store.createAssignment(ticketId);
-  store.startAssignment(assignmentId, "mcp:worker");
-  // The accept subscribed the ticket to its own thread, so a later comment there is a follow-up.
-  const followUp = trigger();
-  assert.deepEqual(store.pendingDeliveries().map((p) => [p.trigger.id, p.ticketId, p.assignmentId, p.t3ThreadId]), [
-    [followUp, ticketId, assignmentId, "mcp:worker"],
-  ]);
-  assert.deepEqual(store.recordDelivery(followUp, assignmentId, "run:1"), { duplicate: false });
-  assert.deepEqual(store.recordDelivery(followUp, assignmentId, "run:2"), { duplicate: true });
-  assert.deepEqual(store.pendingDeliveries(), []);
-
-  const elsewhere = store.ensureThread({ sourceId: source.id, kind: "issue", number: 8, url: "u8" });
-  assert.throws(
-    () => store.recordDelivery(trigger(elsewhere), assignmentId, "run:3"),
-    /needs the assignment's ticket subscribed/,
-  );
-});
-
 test("a decision's reply is queued with it, under an id derived from the decision", () => {
   const { store, source, issue, trigger } = fixture();
   const { decisionId, replyId } = store.recordDecision({
@@ -477,48 +329,15 @@ test("a decision's reply is queued with it, under an id derived from the decisio
   assert.deepEqual(store.undecidedTriggers().map((t) => t.id), [left]);
 });
 
-test("a terminal outcome reply ends the assignment and, with no other running, the ticket", () => {
-  const { store, issue, accept } = fixture();
-  const ticketId = accept();
-  assert.deepEqual(store.undispatchedTickets(), [ticketId]);
-  const first = store.createAssignment(ticketId);
-  store.startAssignment(first, "mcp:w1");
-  const second = store.createAssignment(ticketId);
-  store.startAssignment(second, "mcp:w2");
-  assert.deepEqual(store.undispatchedTickets(), []);
-
-  const opened = store.enqueueOutcomeReply({ id: "outcome-a1-pr12-opened", threadId: issue, body: "PR open" });
-  assert.deepEqual(opened, { duplicate: false, ticketEnded: false });
-  assert.equal(store.getAssignment(first).state, "running");
-
-  const failed = store.enqueueOutcomeReply({ id: "outcome-a1-failed", threadId: issue, body: "x" }, { assignmentId: first });
-  assert.deepEqual(failed, { duplicate: false, ticketEnded: false });
-  assert.equal(store.getAssignment(first).state, "ended");
-  assert.equal(store.getTicket(ticketId).state, "open");
-
-  const merged = store.enqueueOutcomeReply({ id: "outcome-a2-pr13-merged", threadId: issue, body: "y" }, { assignmentId: second });
-  assert.deepEqual(merged, { duplicate: false, ticketEnded: true });
-  assert.equal(store.getTicket(ticketId).state, "ended");
-});
-
 test("an abandoned assignment is listed only while its ticket is open", () => {
   const { store, issue, accept } = fixture();
   const ticketId = accept();
   const assignmentId = store.createAssignment(ticketId);
-  store.abandonAssignment(assignmentId, "t3 down");
+  store.abandonAssignment(assignmentId, "runner unavailable");
   assert.deepEqual(store.abandonedAssignments().map((a) => a.id), [assignmentId]);
   store.enqueueOutcomeReply({ id: "outcome-a1-failed", threadId: issue, body: "failed" }, { assignmentId });
   assert.deepEqual(store.abandonedAssignments(), []);
   assert.equal(store.getTicket(ticketId).state, "ended");
-});
-
-test("the newest recorded Router thread is the current one", () => {
-  const { store } = fixture();
-  assert.equal(store.routerThread(), null);
-  store.recordRouterThread("mcp:router-1");
-  store.recordRouterThread("mcp:router-2");
-  assert.equal(store.routerThread(), "mcp:router-2");
-  assert.throws(() => store.recordRouterThread("mcp:router-1"), /UNIQUE/);
 });
 
 test("a native turn is counted, marked while it runs, and its usage is added", () => {
