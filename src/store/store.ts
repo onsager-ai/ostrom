@@ -897,7 +897,7 @@ export class Store {
   /** Ends the assignment's open stall episode, if any. Returns its id, or null when none was open. */
   clearStall(assignmentId: number): number | null {
     const row = this.#get(
-      "UPDATE stall SET cleared_at = ? WHERE assignment_id = ? AND cleared_at IS NULL RETURNING id",
+      "UPDATE stall SET cleared_at = ? WHERE assignment_id = ? AND cleared_at IS NULL AND public_at IS NULL RETURNING id",
       this.#stamp(),
       assignmentId,
     );
