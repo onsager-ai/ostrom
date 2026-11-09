@@ -17,6 +17,7 @@ export class FakeGitHub {
   readonly reviewComments: Item[] = [];
   readonly issues = new Map<number, Item>();
   readonly reviews = new Map<number, Item[]>();
+  readonly permissions = new Map<string, string>();
   /** Pull requests served by `pulls?head=`: head branch, number, state. */
   readonly pulls: { branch: string; number: number; state: "open" | "closed" | "merged" }[] = [];
   readonly calls: string[][] = [];
@@ -35,8 +36,11 @@ export class FakeGitHub {
     if (this.issues.has(number)) return;
     this.issues.set(number, {
       number,
+      user: { login: "alice" },
       node_id: `${pr ? "PR" : "I"}_${number}`,
+      html_url: this.#threadUrl(number, pr),
       updated_at: iso(this.#now()),
+      state: "open",
       ...(pr ? { pull_request: { url: `https://api.github.com/repos/${this.repo}/pulls/${number}` } } : {}),
     });
   }
@@ -95,6 +99,20 @@ export class FakeGitHub {
     item["updated_at"] = iso(at);
   }
 
+  reopen(number: number, at: Date): void {
+    const issue = this.issues.get(number);
+    if (issue === undefined) throw new Error(`fake gh: no issue #${number}`);
+    issue["state"] = "open";
+    issue["updated_at"] = iso(at);
+  }
+
+  close(number: number, at: Date): void {
+    const issue = this.issues.get(number);
+    if (issue === undefined) throw new Error(`fake gh: no issue #${number}`);
+    issue["state"] = "closed";
+    issue["updated_at"] = iso(at);
+  }
+
   commentsOn(number: number): Item[] {
     return this.issueComments.filter((c) => (c["issue_url"] as string).endsWith(`/issues/${number}`));
   }
@@ -118,7 +136,11 @@ export class FakeGitHub {
     const route = path.slice(`repos/${this.repo}/`.length);
     let match: RegExpMatchArray | null;
     let found: Item | undefined;
-    if ((match = route.match(/^issues\/comments\/(\d+)$/))) {
+    if ((match = route.match(/^collaborators\/([^/]+)\/permission$/))) {
+      return { permission: this.permissions.get(decodeURIComponent(match[1]!)) ?? "none" };
+    } else if ((match = route.match(/^issues\/(\d+)$/))) {
+      found = this.issues.get(Number(match[1]));
+    } else if ((match = route.match(/^issues\/comments\/(\d+)$/))) {
       found = this.issueComments.find((c) => c["id"] === Number(match![1]));
     } else if ((match = route.match(/^pulls\/comments\/(\d+)$/))) {
       found = this.reviewComments.find((c) => c["id"] === Number(match![1]));
@@ -137,6 +159,8 @@ export class FakeGitHub {
     const prefix = `/repos/${this.repo}/`;
     if (!url.pathname.startsWith(prefix)) throw new Error(`fake gh: unknown repo in ${path}`);
     const route = url.pathname.slice(prefix.length);
+    const permission = route.match(/^collaborators\/([^/]+)\/permission$/);
+    if (permission) return [{ permission: this.permissions.get(decodeURIComponent(permission[1]!)) ?? "none" }];
     let items: Item[];
     let match: RegExpMatchArray | null;
     if (route === "issues/comments") items = this.issueComments;

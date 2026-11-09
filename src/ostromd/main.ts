@@ -2,6 +2,7 @@
 // See docs/direction.md. Each pass is its own command; `tick` runs them all once in order, and
 // `run` repeats `tick`. Installing it as a service is not done here.
 
+import { routeCommands } from "../commands/commands.ts";
 import { execGh, type GhRunner } from "../github/gh.ts";
 import { sendDueReplies } from "../github/outbox.ts";
 import { processRunner, type ProcessRunner } from "../process.ts";
@@ -22,7 +23,8 @@ import { loadConfig, loadRouterConfig, loadWatchdogConfig, loadWorkerConfig } fr
  * - poll: new GitHub events become triggers; everything after works on what is stored.
  * - observe: a Worker's newly opened PR is subscribed to its ticket before anything routes, so a
  *   review comment polled in the same tick is a follow-up, not a candidate for the Router.
- * - route: follow-ups, including those, reach their Workers.
+ * - commands: fixed control words are authorized and consumed before any Worker delivery.
+ * - route: ordinary follow-ups, including those, reach their Workers.
  * - watchdog: after a follow-up may have unblocked a Worker, and before the Router, so a new
  *   stall is flagged in this tick's batch.
  * - route-candidates: the Router judges candidates, outcomes and stalls and queues replies.
@@ -30,7 +32,7 @@ import { loadConfig, loadRouterConfig, loadWatchdogConfig, loadWorkerConfig } fr
  * Each pass reads and writes only the store and its own neighbour, so none depends on an earlier
  * one succeeding: a failed pass is reported and the rest still run.
  */
-export const TICK = ["poll", "observe", "route", "watchdog", "route-candidates", "send"] as const;
+export const TICK = ["poll", "observe", "commands", "route", "watchdog", "route-candidates", "send"] as const;
 
 const USAGE = `usage: ostromd <command>
 
@@ -43,6 +45,9 @@ commands:
   observe
          look up the PRs opened from every running Worker's branch once; subscribe tickets to
          them and print each observation as a JSON line
+  commands
+         authorize and consume fixed commands and redirects on subscribed threads before they can
+         reach the Router or the ordinary Worker follow-up path
   route  queue each new trigger on a subscribed thread as a turn on its ticket's Worker session,
          wait for the turns to finish, and print each queued follow-up as a JSON line
   watchdog
@@ -224,6 +229,7 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
         : (command === "poll" ||
             command === "send" ||
             command === "observe" ||
+            command === "commands" ||
             command === "route" ||
             command === "watchdog" ||
             command === "route-candidates" ||
@@ -256,6 +262,15 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
         deps.stderr(`ostromd observe: assignment ${failure.assignmentId} failed: ${failure.error}`);
       }
       deps.stderr(`ostromd observe: ${pass.observed.length} observed, ${pass.failed.length} failed`);
+      return pass.failed.length === 0 ? 0 : 1;
+    }
+    if (command === "commands") {
+      const pass = await routeCommands(store, workers(), deps.gh, config.repo);
+      for (const handled of pass.handled) deps.stdout(JSON.stringify(handled));
+      for (const failure of pass.failed) {
+        deps.stderr(`ostromd commands: trigger ${failure.triggerId} for ticket ${failure.ticketId} failed: ${failure.error}`);
+      }
+      deps.stderr(`ostromd commands: ${pass.handled.length} handled, ${pass.failed.length} failed`);
       return pass.failed.length === 0 ? 0 : 1;
     }
     if (command === "route") {

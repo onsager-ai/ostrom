@@ -43,7 +43,7 @@ export const COMMANDS: readonly CommandDefinition[] = [
     sayOrDo: "Close the issue",
     effect: "Same as stop. The branch is kept; reopening the issue asks the Router again.",
     whoMay: "Whoever can close it",
-    acknowledgement: "Card updated, no new comment",
+    acknowledgement: "Card **Stopped: issue closed**",
   },
   {
     name: "close_pull_request",

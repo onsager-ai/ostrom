@@ -8,6 +8,7 @@ export type StatusCardState = "working" | "paused" | "stuck" | "done" | "stopped
 
 export interface StatusCard {
   state: StatusCardState;
+  stoppedReason?: "issue closed";
   /** The Worker's newest known checklist, in its order. Omit when it has not published one. */
   plan?: readonly string[];
   pullRequest?: string;
@@ -29,7 +30,7 @@ const STATE_LABEL: Record<StatusCardState, string> = {
 
 /** Renders the exact Markdown stored in and edited on the GitHub status-card comment. */
 export function renderStatusCard(card: StatusCard): string {
-  const lines = [`## Ostrom: ${STATE_LABEL[card.state]}`];
+  const lines = [`## Ostrom: ${card.stoppedReason === "issue closed" ? "Stopped: issue closed" : STATE_LABEL[card.state]}`];
   if (card.plan !== undefined && card.plan.length > 0) {
     lines.push("", "### Plan", ...card.plan.map((item) => `- [ ] ${item}`));
   }

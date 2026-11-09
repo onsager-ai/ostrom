@@ -97,7 +97,7 @@ export class Workers {
     key: string,
     prompt: string,
     onStart: (turnId: string) => void,
-    onComplete?: (result: TurnResult) => void,
+    onComplete?: (result: TurnResult) => void | Promise<void>,
   ): boolean {
     if (this.#queued.has(key)) return false;
     this.#queued.add(key);
@@ -179,7 +179,7 @@ export class Workers {
     id: number,
     prompt: string,
     onStart?: (turnId: string) => void,
-    onComplete?: (result: TurnResult) => void,
+    onComplete?: (result: TurnResult) => void | Promise<void>,
   ): Promise<void> {
     const { store } = this.#deps;
     const assignment = store.getAssignment(id);
@@ -195,7 +195,7 @@ export class Workers {
       return;
     }
     this.#finished(id, result);
-    if (result.status === "completed") onComplete?.(result);
+    if (result.status === "completed") await onComplete?.(result);
   }
 
   #failed(id: number, error: unknown): void {
