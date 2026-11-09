@@ -55,3 +55,28 @@ export function loadWorkerConfig(env: Record<string, string | undefined>): Worke
     model: read("OSTROM_WORKER_MODEL"),
   };
 }
+
+// The Router reads two more, also required with no defaults, plus OSTROM_T3_PROJECT, the project
+// its thread runs in:
+//
+//   OSTROM_ROUTER_PROVIDER  T3 provider instance id for the Router thread, e.g. claudeAgent
+//   OSTROM_ROUTER_MODEL     model slug for the Router thread, e.g. claude-haiku-5-5
+
+export interface RouterConfig {
+  project: string;
+  provider: string;
+  model: string;
+}
+
+export function loadRouterConfig(env: Record<string, string | undefined>): RouterConfig {
+  const read = (name: string) => {
+    const value = env[name]?.trim() ?? "";
+    if (value === "") throw new Error(`${name} must be set to run the Router`);
+    return value;
+  };
+  return {
+    project: read("OSTROM_T3_PROJECT"),
+    provider: read("OSTROM_ROUTER_PROVIDER"),
+    model: read("OSTROM_ROUTER_MODEL"),
+  };
+}

@@ -5,11 +5,12 @@
 import { execGh, type GhRunner } from "../github/gh.ts";
 import { sendDueReplies } from "../github/outbox.ts";
 import { pollOnce } from "../github/poller.ts";
+import { routeCandidates } from "../router/router.ts";
 import { Store } from "../store/store.ts";
 import { processRunner, T3Cli, type T3Runner } from "../t3/runner.ts";
 import { dispatch, observe } from "../worker/dispatch.ts";
 import { routeFollowUps } from "../worker/follow-up.ts";
-import { loadConfig, loadWorkerConfig } from "./config.ts";
+import { loadConfig, loadRouterConfig, loadWorkerConfig } from "./config.ts";
 
 const USAGE = `usage: ostromd <command>
 
@@ -23,10 +24,16 @@ commands:
          print each observation as a JSON line
   route  send each new trigger on a subscribed thread to its ticket's Worker once; print each
          delivery as a JSON line
+  route-candidates
+         one Router pass: ask the Router to judge undecided triggers and word outcome replies,
+         record its decisions, dispatch accepted tickets, queue replies and end finished
+         tickets; print each record as a JSON line. Run it after route, so follow-ups owed to
+         open tickets are delivered first.
 
 environment: OSTROM_REPO, OSTROM_ALLOWLIST, OSTROM_DB;
   dispatch also needs OSTROM_T3_PROJECT, OSTROM_WORKER_BASE, OSTROM_WORKER_PROVIDER,
-  OSTROM_WORKER_MODEL
+  OSTROM_WORKER_MODEL; route-candidates needs those and OSTROM_ROUTER_PROVIDER,
+  OSTROM_ROUTER_MODEL
 `;
 
 export interface MainDeps {
@@ -52,7 +59,11 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
   const valid =
     command === "dispatch"
       ? rest.length === 1 && /^[1-9]\d*$/.test(ticketArg!)
-      : (command === "poll" || command === "send" || command === "observe" || command === "route") &&
+      : (command === "poll" ||
+          command === "send" ||
+          command === "observe" ||
+          command === "route" ||
+          command === "route-candidates") &&
         rest.length === 0;
   if (!valid) {
     deps.stderr(USAGE.trimEnd());
@@ -87,6 +98,21 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
         );
       }
       deps.stderr(`ostromd route: ${pass.delivered.length} delivered, ${pass.failed.length} failed`);
+      return pass.failed.length === 0 ? 0 : 1;
+    }
+    if (command === "route-candidates") {
+      const worker = loadWorkerConfig(deps.env);
+      const router = loadRouterConfig(deps.env);
+      const pass = await routeCandidates({ store, gh: deps.gh, t3: new T3Cli(deps.t3), repo: config.repo, worker, router });
+      if (pass.router !== null) deps.stdout(JSON.stringify({ type: "router", ...pass.router }));
+      for (const decision of pass.decisions) deps.stdout(JSON.stringify({ type: "decision", ...decision }));
+      for (const outcome of pass.outcomes) deps.stdout(JSON.stringify({ type: "outcome", ...outcome }));
+      for (const dispatched of pass.dispatched) deps.stdout(JSON.stringify({ type: "dispatch", ...dispatched }));
+      for (const failure of pass.failed) deps.stderr(`ostromd route-candidates: ${failure.what} failed: ${failure.error}`);
+      deps.stderr(
+        `ostromd route-candidates: ${pass.decisions.length} decisions, ${pass.outcomes.length} outcome replies, ` +
+          `${pass.dispatched.length} dispatched, ${pass.failed.length} failed`,
+      );
       return pass.failed.length === 0 ? 0 : 1;
     }
     if (command === "poll") {

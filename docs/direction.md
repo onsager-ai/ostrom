@@ -46,9 +46,9 @@ thread id and asks Semon or T3 for the session.
 ## How the pieces connect
 
 ```
-GitHub ──poll──▶ ostromd ──filter──▶ store (SQLite) ──candidate──▶ Router (T3 thread)
-                   │  ▲                                              │ ostrom MCP tools:
-                   │  └──────────── accept / ignore / reply ◀────────┘ read, route, reply
+GitHub ──poll──▶ ostromd ──filter──▶ store (SQLite) ──batch───────▶ Router (T3 thread)
+                   │  ▲                                              │ t3 thread send --wait:
+                   │  └──── JSON: accept / ignore / stop, replies ◀──┘ one strict JSON answer
                    │
                    ├─ accept ──▶ t3: create Worker thread (worktree) ──▶ opens PR
                    ├─ follow-up on a subscribed thread ──▶ t3: send/steer to that Worker
@@ -58,8 +58,16 @@ GitHub ──poll──▶ ostromd ──filter──▶ store (SQLite) ──ca
 
 The daemon (`ostromd`) runs intake, filtering, fan-out, the outbox and the Watchdog, and it calls
 T3 itself. `docs/t3-feasibility.md` shows that it can. The Router is a long-lived T3 Code thread
-that judges candidates through Ostrom's MCP tools. The model makes the judgement calls; the daemon
-does every deterministic step. A follow-up on a subscribed thread goes straight from the daemon to
+that judges candidates and words replies. Each pass (`ostromd route-candidates`), the daemon sends
+it one self-contained batch with `t3 thread send --wait --json`: the contract, the undecided
+triggers with a short excerpt of each body and its URL, and the outcomes owed a reply. The Router
+answers with one strict JSON object; an answer that does not check out records nothing, and its
+candidates stay candidates. The Router has no Ostrom MCP tools, because at the pinned T3 version
+(`322f6544df`) a thread gets exactly one MCP server, T3's own `t3-code`: the Claude adapter builds
+`mcpServers` with that entry only, the Codex adapter sets only `mcp_servers.t3-code`, and neither
+the thread, project nor provider-instance contract has a field for another. The model makes the
+judgement calls and writes the words; the daemon does every deterministic step, including ending a
+ticket once a terminal outcome (PR merged or closed, Worker failed or cancelled) has its reply. A follow-up on a subscribed thread goes straight from the daemon to
 its Worker and never reaches the Router.
 
 ## Data model
@@ -110,17 +118,24 @@ and the prototype. CI runs the tests; nothing is built or tested locally on the 
 1. **Follow-up delivery.** Should follow-ups use `t3 thread send` (queued as the next turn) or the
    WS `message.dispatch` with `steer`? Proposal: use the CLI first and switch when a queued
    follow-up turns out to be too late.
-2. **How Workers report.** Option A: Workers get Ostrom MCP tools (`report`, `ack`, `handback`), which
-   requires registering the MCP server in each provider's config. Option B: `ostromd` derives
-   outcomes from T3 thread state (`status`, `settled`, `linkedPullRequest`, `pendingRequestCount`).
-   Proposal: B for milestone 1.
+2. **How Workers and the Router report.** Option A: they get Ostrom MCP tools (`report`, `ack`,
+   `handback`; for the Router `candidates`, `decide`, `reply`). Option B: `ostromd` derives
+   Worker outcomes from T3 thread state (`status`, `settled`, `linkedPullRequest`,
+   `pendingRequestCount`) and reads the Router's judgement from its run's reply. **Chosen: B for
+   both in milestone 1.** At the pin T3 Code gives a thread no MCP server but its own (see "How
+   the pieces connect"), so A would mean registering the server in config T3 does not own, per
+   provider: user-level settings reach every session on the machine, and project-level settings
+   reach every thread in the project. Revisit if T3 adds per-thread MCP servers.
 3. **Bot identity.** Replies go out through the operator's own `gh` login, so the "drop my own events"
    filter cannot rely on the actor. Option A: a hidden marker in each reply body (free, used in
    milestone 1). Option B: a dedicated bot account or GitHub App.
 4. **Who merges.** Does the pass criterion allow a human to click merge, or must merging be
    unattended? A human merge is a decision, not relaying, but the target needs stating.
 5. **Router recovery.** If the Router thread's context fills up or the thread dies, a new Router has
-   to be started from store state. Decide whether that is a Watchdog job.
+   to be started from store state. Milestone 1 keeps it minimal: the store records each Router
+   thread, every batch carries the whole contract, and a pass whose stored thread T3 reports gone
+   (`t3 thread show`: "is no longer available") starts a new one with that batch. Detecting a
+   full context or a stuck Router is still open; decide whether that is a Watchdog job.
 6. **T3 version drift.** The WS contract is T3's internal one. Decide where the pin and the agreement
    test against `@t3tools/contracts` live. Settled for the CLI surface: the pin is `src/t3/pin.ts`
    (`t3` v0.1.7, release tag commit `322f6544df`), the upstream schemas are vendored under

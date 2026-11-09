@@ -70,6 +70,13 @@ export interface NewDecision {
   triggerIds: readonly number[];
   verdict: Verdict;
   reason: string;
+  /** A reply to post on the thread, queued in the same transaction under `decisionReplyId`. */
+  reply?: string;
+}
+
+/** The outbox id of the reply a decision carried: stable, so the reply is sent once. */
+export function decisionReplyId(decisionId: number): string {
+  return `decision-${decisionId}`;
 }
 
 export interface Ticket {
@@ -256,8 +263,15 @@ export class Store {
 
   // --- decisions and tickets -----------------------------------------------------------------
 
-  /** Records the Router's judgement. An accept opens a ticket in the same transaction. */
-  recordDecision(decision: NewDecision): { decisionId: number; ticketId: number | null } {
+  /**
+   * Records the Router's judgement. An accept opens a ticket, and a reply is queued, in the same
+   * transaction, so a decision never exists without the acknowledgement it carried.
+   */
+  recordDecision(decision: NewDecision): {
+    decisionId: number;
+    ticketId: number | null;
+    replyId: string | null;
+  } {
     return this.#transaction(() => {
       const at = this.#stamp();
       const decisionId = this.#get(
@@ -279,14 +293,29 @@ export class Store {
           triggerId,
         );
       }
-      if (decision.verdict !== "accept") return { decisionId, ticketId: null };
+      let replyId: string | null = null;
+      if (decision.reply !== undefined) {
+        if (decision.reply.trim() === "") throw new Error("a decision's reply must not be empty");
+        replyId = decisionReplyId(decisionId);
+        this.#insertReply({ id: replyId, threadId: decision.threadId, body: decision.reply });
+      }
+      if (decision.verdict !== "accept") return { decisionId, ticketId: null, replyId };
       const ticketId = this.#get(
         "INSERT INTO ticket (decision_id, state, opened_at) VALUES (?, 'open', ?) RETURNING id",
         decisionId,
         at,
       )!["id"] as number;
-      return { decisionId, ticketId };
+      return { decisionId, ticketId, replyId };
     });
+  }
+
+  /** Open tickets that have never had an assignment: accepted, but no Worker was created yet. */
+  undispatchedTickets(): number[] {
+    return this.#all(
+      `SELECT id FROM ticket WHERE state = 'open'
+       AND NOT EXISTS (SELECT 1 FROM assignment WHERE assignment.ticket_id = ticket.id)
+       ORDER BY id`,
+    ).map((row) => row["id"] as number);
   }
 
   getTicket(ticketId: number): Ticket {
@@ -378,6 +407,15 @@ export class Store {
       assignmentId,
     );
     if (Number(changes) !== 1) this.#illegalAssignment(assignmentId, "ended");
+  }
+
+  /** Assignments that ended without a Worker ever starting, on tickets still open, oldest first. */
+  abandonedAssignments(): Assignment[] {
+    return this.#all(
+      `SELECT assignment.* FROM assignment JOIN ticket ON ticket.id = assignment.ticket_id
+       WHERE assignment.state = 'ended' AND assignment.t3_thread_id IS NULL AND ticket.state = 'open'
+       ORDER BY assignment.id`,
+    ).map(toAssignment);
   }
 
   /** Every running assignment, oldest first. */
@@ -475,6 +513,23 @@ export class Store {
     return { duplicate: Number(changes) === 0 };
   }
 
+  // --- the Router ----------------------------------------------------------------------------
+
+  /** The T3 Code thread the Router currently runs in, or null before the first one starts. */
+  routerThread(): string | null {
+    const row = this.#get("SELECT t3_thread_id FROM router_thread ORDER BY id DESC LIMIT 1");
+    return row === undefined ? null : (row["t3_thread_id"] as string);
+  }
+
+  /** Records a newly started Router thread; it becomes the current one. */
+  recordRouterThread(t3ThreadId: string): void {
+    this.#run(
+      "INSERT INTO router_thread (t3_thread_id, started_at) VALUES (?, ?)",
+      t3ThreadId,
+      this.#stamp(),
+    );
+  }
+
   // --- outbox --------------------------------------------------------------------------------
 
   /**
@@ -482,26 +537,57 @@ export class Store {
    * no-op marked duplicate; the same id with different content is an error.
    */
   enqueueReply(reply: NewReply): { duplicate: boolean } {
+    return this.#transaction(() => this.#insertReply(reply));
+  }
+
+  /**
+   * Queues an outcome reply. With `end`, the outcome is terminal: in the same transaction the
+   * assignment ends if it is still running, and its ticket ends once no assignment of it is
+   * running. A crash therefore never leaves a reply queued for work that still looks live, nor
+   * work ended without its reply. Returns whether the ticket ended.
+   */
+  enqueueOutcomeReply(reply: NewReply, end?: { assignmentId: number }): { duplicate: boolean; ticketEnded: boolean } {
     return this.#transaction(() => {
-      const existing = this.#get("SELECT * FROM outbox WHERE id = ?", reply.id);
-      if (existing !== undefined) {
-        const queued = toReply(existing);
-        if (queued.threadId !== reply.threadId || queued.body !== reply.body) {
-          throw new Error(`outbox ${reply.id} already holds a different reply`);
-        }
-        return { duplicate: true };
-      }
-      const at = this.#stamp();
-      this.#run(
-        "INSERT INTO outbox (id, thread_id, body, enqueued_at, next_attempt_at) VALUES (?, ?, ?, ?, ?)",
-        reply.id,
-        reply.threadId,
-        reply.body,
-        at,
-        at,
+      const { duplicate } = this.#insertReply(reply);
+      if (end === undefined) return { duplicate, ticketEnded: false };
+      const assignment = this.getAssignment(end.assignmentId);
+      if (assignment.state === "running") this.endAssignment(assignment.id);
+      const stillRunning = this.#get(
+        "SELECT 1 FROM assignment WHERE ticket_id = ? AND state = 'running'",
+        assignment.ticketId,
       );
-      return { duplicate: false };
+      if (stillRunning !== undefined || this.getTicket(assignment.ticketId).state !== "open") {
+        return { duplicate, ticketEnded: false };
+      }
+      this.endTicket(assignment.ticketId);
+      return { duplicate, ticketEnded: true };
     });
+  }
+
+  /** Whether a reply with this id was ever queued, sent or not. */
+  hasReply(replyId: string): boolean {
+    return this.#get("SELECT 1 FROM outbox WHERE id = ?", replyId) !== undefined;
+  }
+
+  #insertReply(reply: NewReply): { duplicate: boolean } {
+    const existing = this.#get("SELECT * FROM outbox WHERE id = ?", reply.id);
+    if (existing !== undefined) {
+      const queued = toReply(existing);
+      if (queued.threadId !== reply.threadId || queued.body !== reply.body) {
+        throw new Error(`outbox ${reply.id} already holds a different reply`);
+      }
+      return { duplicate: true };
+    }
+    const at = this.#stamp();
+    this.#run(
+      "INSERT INTO outbox (id, thread_id, body, enqueued_at, next_attempt_at) VALUES (?, ?, ?, ?, ?)",
+      reply.id,
+      reply.threadId,
+      reply.body,
+      at,
+      at,
+    );
+    return { duplicate: false };
   }
 
   /** Unsent replies whose next attempt is due, oldest due first. */

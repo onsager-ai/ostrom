@@ -423,3 +423,69 @@ test("a delivery is recorded once, and only for a ticket subscribed to the trigg
   const elsewhere = store.ensureThread({ sourceId: source.id, kind: "issue", number: 8, url: "u8" });
   assert.throws(() => store.recordDelivery(trigger(elsewhere), assignmentId, "run:3"), /subscribed/);
 });
+
+test("a decision's reply is queued with it, under an id derived from the decision", () => {
+  const { store, issue, trigger } = fixture();
+  const { decisionId, replyId } = store.recordDecision({
+    threadId: issue,
+    triggerIds: [trigger()],
+    verdict: "accept",
+    reason: "asks for work",
+    reply: "On it.",
+  });
+  assert.equal(replyId, `decision-${decisionId}`);
+  assert.equal(store.hasReply(replyId!), true);
+  assert.deepEqual(store.dueReplies().map((r) => [r.id, r.threadId, r.body]), [[replyId, issue, "On it."]]);
+  assert.equal(store.recordDecision({ threadId: issue, triggerIds: [trigger()], verdict: "ignore", reason: "no" }).replyId, null);
+  // An empty reply fails the whole decision: no decision row, no trigger link.
+  const left = trigger();
+  assert.throws(
+    () => store.recordDecision({ threadId: issue, triggerIds: [left], verdict: "accept", reason: "r", reply: " " }),
+    /must not be empty/,
+  );
+  assert.deepEqual(store.undecidedTriggers().map((t) => t.id), [left]);
+});
+
+test("a terminal outcome reply ends the assignment and, with no other running, the ticket", () => {
+  const { store, issue, accept } = fixture();
+  const ticketId = accept();
+  assert.deepEqual(store.undispatchedTickets(), [ticketId]);
+  const first = store.createAssignment(ticketId);
+  store.startAssignment(first, "mcp:w1");
+  const second = store.createAssignment(ticketId);
+  store.startAssignment(second, "mcp:w2");
+  assert.deepEqual(store.undispatchedTickets(), []);
+
+  const opened = store.enqueueOutcomeReply({ id: "outcome-a1-pr12-opened", threadId: issue, body: "PR open" });
+  assert.deepEqual(opened, { duplicate: false, ticketEnded: false });
+  assert.equal(store.getAssignment(first).state, "running");
+
+  const failed = store.enqueueOutcomeReply({ id: "outcome-a1-failed", threadId: issue, body: "x" }, { assignmentId: first });
+  assert.deepEqual(failed, { duplicate: false, ticketEnded: false });
+  assert.equal(store.getAssignment(first).state, "ended");
+  assert.equal(store.getTicket(ticketId).state, "open");
+
+  const merged = store.enqueueOutcomeReply({ id: "outcome-a2-pr13-merged", threadId: issue, body: "y" }, { assignmentId: second });
+  assert.deepEqual(merged, { duplicate: false, ticketEnded: true });
+  assert.equal(store.getTicket(ticketId).state, "ended");
+});
+
+test("an abandoned assignment is listed only while its ticket is open", () => {
+  const { store, issue, accept } = fixture();
+  const ticketId = accept();
+  const assignmentId = store.createAssignment(ticketId);
+  store.abandonAssignment(assignmentId, "t3 down");
+  assert.deepEqual(store.abandonedAssignments().map((a) => a.id), [assignmentId]);
+  store.enqueueOutcomeReply({ id: "outcome-a1-failed", threadId: issue, body: "failed" }, { assignmentId });
+  assert.deepEqual(store.abandonedAssignments(), []);
+  assert.equal(store.getTicket(ticketId).state, "ended");
+});
+
+test("the newest recorded Router thread is the current one", () => {
+  const { store } = fixture();
+  assert.equal(store.routerThread(), null);
+  store.recordRouterThread("mcp:router-1");
+  store.recordRouterThread("mcp:router-2");
+  assert.equal(store.routerThread(), "mcp:router-2");
+  assert.throws(() => store.recordRouterThread("mcp:router-1"), /UNIQUE/);
+});
