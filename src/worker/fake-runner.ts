@@ -13,11 +13,15 @@ export class FakeSession implements Session {
   running = 0;
   maxRunning = 0;
 
-  constructor(
-    readonly id: string,
-    readonly options: SessionOptions,
-    readonly resumed: boolean,
-  ) {}
+  readonly id: string;
+  readonly options: SessionOptions;
+  readonly resumed: boolean;
+
+  constructor(id: string, options: SessionOptions, resumed: boolean) {
+    this.id = id;
+    this.options = options;
+    this.resumed = resumed;
+  }
 
   async send(prompt: string): Promise<TurnResult> {
     this.prompts.push(prompt);
