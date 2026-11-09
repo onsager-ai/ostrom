@@ -1,5 +1,0 @@
-grant: duhem-builder
-actors: builder
-operations: work
-repositories: onsager-ai/duhem
-where: label:area:schema
