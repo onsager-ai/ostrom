@@ -6,7 +6,7 @@ import { FakeGitHub } from "../github/fake-github.ts";
 import { Store } from "../store/store.ts";
 import { FakeRunner } from "../worker/fake-runner.ts";
 import { Workers } from "../worker/workers.ts";
-import { routeCommands } from "./commands.ts";
+import { operatorControls, routeCommands } from "./commands.ts";
 import { parseComment } from "./parser.ts";
 import { controlsLine, renderCommandTable } from "./table.ts";
 
@@ -130,6 +130,31 @@ test("closing the issue cancels a hung turn, gets the graceful stop prompt and e
   assert.match(runner.sessions[0]!.prompts.at(-1)!, /issue was closed/);
   assert.equal(store.getTicket(ticketId).state, "ended");
   assert.ok(store.dueReplies().some((reply) => reply.id === `stopped-issue-closed-${ticketId}`));
+});
+
+test("a paused ticket can still be stopped: by command, by closing the issue, or by the operator", async () => {
+  const ways: Record<string, (f: ReturnType<typeof fixture>) => Promise<unknown>> = {
+    command: async ({ store, github, workers, comment }) => {
+      comment("stop-1", "alice", "@ostrom stop");
+      await routeCommands(store, workers, github.gh, REPO);
+    },
+    "closed issue": async ({ store, github, workers, ticketId }) => {
+      store.insertTrigger({
+        sourceId: store.ensureSource("github", REPO).id, sourceEventId: "closed-state", threadId: store.ticketContext(ticketId).thread.id,
+        kind: "issue_state", actor: "operator", url: `https://github.com/${REPO}/issues/7`, occurredAt: new Date(), body: "closed",
+      });
+      await routeCommands(store, workers, github.gh, REPO);
+    },
+    operator: async ({ store, github, workers, ticketId }) => operatorControls(store, workers, github.gh, REPO).stop(ticketId),
+  };
+  for (const [way, stop] of Object.entries(ways)) {
+    const f = fixture();
+    f.store.pauseTicket(f.ticketId);
+    await stop(f);
+    await f.workers.drain();
+    assert.match(f.runner.sessions.at(-1)?.prompts.at(-1) ?? "", /gracefully/, way);
+    assert.equal(f.store.getTicket(f.ticketId).state, "ended", way);
+  }
 });
 
 test("a merged PR leaves the attempt to the Router's outcome; a PR closed unmerged ends it", async () => {
