@@ -41,7 +41,7 @@ export function renderStatusCard(card: StatusCard): string {
     "",
     replyMarker(card.markerId),
   );
-  return lines.join("\n");
+  return `${lines.join("\n")}\n`;
 }
 
 function minutesAgo(lastActivityAt: Date, now: Date): number {
