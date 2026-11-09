@@ -1,5 +1,5 @@
 // The outbox sender. Comments use hidden markers for crash recovery; status-card edits are
-// idempotent PUTs; reactions use GitHub's reaction endpoints. New ordinary comments are batched
+// idempotent PATCHes; reactions use GitHub's reaction endpoints. New ordinary comments are batched
 // per thread so routine progress is quiet, while blocking questions go out immediately.
 
 import type { Reply, Store } from "../store/store.ts";
