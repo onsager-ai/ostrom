@@ -332,6 +332,8 @@ test("each outcome gets one reply, and a merged PR ends the assignment and the t
   assert.equal(turns(), 3);
   const outcomeReplies = s.store().dueReplies().filter((reply) => reply.id.startsWith("outcome-"));
   assert.deepEqual(outcomeReplies.map((reply) => reply.body).sort(), ["Update: pr_merged", "Update: pr_opened"]);
+  const card = s.store().dueReplies().filter((reply) => reply.id.startsWith("card-thread-")).at(-1)!;
+  assert.match(card.body, /^## Ostrom: Done$/m);
 });
 
 test("a Worker that failed to start gets one failure reply, and its ticket ends", async () => {

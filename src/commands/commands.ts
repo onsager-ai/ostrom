@@ -1,6 +1,7 @@
 import { queueStatusCard } from "../github/cards.ts";
 import { ghGet, type GhRunner } from "../github/gh.ts";
 import type { Store, Trigger } from "../store/store.ts";
+import { pullRequestsForBranch } from "../worker/dispatch.ts";
 import { followUpMessage } from "../worker/follow-up.ts";
 import type { Workers } from "../worker/workers.ts";
 import { parseComment } from "./parser.ts";
@@ -84,10 +85,17 @@ export async function routeCommands(
       if (command === "close_pull_request") {
         const assignment = store.latestAssignment(pending.ticketId);
         if (assignment?.state !== "running") throw new Error(`ticket ${pending.ticketId} has no running Worker`);
+        // GitHub reports a merged PR as closed. A merge is the work done, which the Router's outcome
+        // pass reports and which ends the ticket, so only a PR closed without merging ends the attempt.
+        const number = store.getThread(pending.trigger.threadId).number;
+        const merged = (await pullRequestsForBranch(gh, repo, assignment.branch!))
+          .some((pr) => pr.number === number && pr.state === "merged");
         store.recordCommandReceipt(pending.trigger.id, pending.ticketId, "close_pull_request", true);
-        store.unsubscribeTicket(pending.ticketId);
-        store.endAssignment(assignment.id, "pull request closed");
-        queueStatusCard(store, pending.ticketId);
+        if (!merged) {
+          store.unsubscribeTicket(pending.ticketId);
+          store.endAssignment(assignment.id, "pull request closed");
+          queueStatusCard(store, pending.ticketId);
+        }
       } else if (command === "close_issue") {
         const assignment = store.latestAssignment(pending.ticketId);
         if (assignment?.state !== "running") throw new Error(`ticket ${pending.ticketId} has no running Worker`);
