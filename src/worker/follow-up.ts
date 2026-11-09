@@ -34,6 +34,7 @@ export function routeFollowUps(store: Store, workers: Workers): RoutePass {
       const review = pending.filter((item) =>
         item.ticketId === ticketId && item.assignmentId === assignmentId && item.trigger.reviewId === trigger.reviewId,
       );
+      if (!review.some((item) => item.trigger.kind === "pull_request_review")) continue;
       const added = workers.deliver(
         assignmentId,
         `review-${key}`,
