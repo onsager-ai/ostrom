@@ -87,8 +87,8 @@ async function sendComments(
 async function postCommentBatch(replies: readonly Reply[], options: SendOptions, result: SendResult): Promise<void> {
   const { store, gh, repo } = options;
   const number = store.getThread(replies[0]!.threadId).number;
+  let remaining: Reply[] = [];
   try {
-    const remaining: Reply[] = [];
     for (const reply of replies) {
       const found = await alreadyPosted(gh, repo, number, reply, replyMarker(reply.id), options.perPage ?? 100);
       if (found === null) {
@@ -111,9 +111,7 @@ async function postCommentBatch(replies: readonly Reply[], options: SendOptions,
       result.sent.push(reply.id);
     }
   } catch (error) {
-    for (const reply of replies) {
-      if (reply.sentAt === null) fail(reply, error, options, result);
-    }
+    for (const reply of remaining) fail(reply, error, options, result);
   }
 }
 
