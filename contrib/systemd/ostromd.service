@@ -1,0 +1,14 @@
+[Unit]
+Description=Ostrom background daemon
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/ostrom/env
+ExecStart=ostromd run --interval 60
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

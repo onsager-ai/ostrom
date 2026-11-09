@@ -22,6 +22,25 @@ function ticket(path: string): number {
   }
 }
 
+test("read-only CLI falls back to the store and formats tickets", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "ostrom-cli-"));
+  const path = join(directory, "ostrom.db");
+  const output: string[] = [];
+  const write = process.stdout.write;
+  process.stdout.write = ((line: string) => { output.push(line); return true; }) as typeof process.stdout.write;
+  try {
+    const id = ticket(path);
+    assert.equal(await main(["tickets"], { OSTROM_DB: path, HOME: directory }), 0);
+    assert.match(output.join(""), new RegExp(`^TICKET.*\\n${id}`));
+    output.length = 0;
+    assert.equal(await main(["show", String(id)], { OSTROM_DB: path, HOME: directory }), 0);
+    assert.match(output.join(""), /ticket 1  open/);
+  } finally {
+    process.stdout.write = write;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("extend raises stored limits and resumes a budget-paused ticket", async () => {
   const directory = mkdtempSync(join(tmpdir(), "ostrom-cli-"));
   const path = join(directory, "ostrom.db");

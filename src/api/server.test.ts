@@ -9,15 +9,20 @@ import { Store } from "../store/store.ts";
 import { defaultSocketPath, localApi } from "./server.ts";
 
 function get(socketPath: string, path: string): Promise<{ status: number; body: unknown }> {
+  return call(socketPath, "GET", path);
+}
+
+function call(socketPath: string, method: "GET" | "POST", path: string, body?: unknown): Promise<{ status: number; body: unknown }> {
   return new Promise((resolve, reject) => {
-    const client = request({ socketPath, path, method: "GET" }, (response) => {
+    const encoded = body === undefined ? undefined : JSON.stringify(body);
+    const client = request({ socketPath, path, method, headers: encoded === undefined ? undefined : { "content-type": "application/json", "content-length": Buffer.byteLength(encoded) } }, (response) => {
       let text = "";
       response.setEncoding("utf8");
       response.on("data", (chunk: string) => { text += chunk; });
       response.on("end", () => resolve({ status: response.statusCode!, body: JSON.parse(text) }));
     });
     client.once("error", reject);
-    client.end();
+    client.end(encoded);
   });
 }
 
@@ -49,7 +54,14 @@ test("the local API serves status, tickets and a ticket over a 0600 Unix socket"
   const socketPath = join(directory, "run", "ostromd.sock");
   const ticketId = fixture(database);
   const store = Store.open(database);
-  const api = localApi(store, socketPath);
+  const api = localApi(store, {
+    socketPath,
+    temperature: async () => 42,
+    control: {
+      pause: async (id) => { store.pauseTicket(id); },
+      resume: async () => {}, stop: async () => {}, extend: async () => {}, preview: async () => "",
+    },
+  });
   try {
     await api.start();
     assert.equal(statSync(socketPath).mode & 0o777, 0o600);
@@ -82,6 +94,10 @@ test("the local API serves status, tickets and a ticket over a 0600 Unix socket"
     assert.equal(shown.context.reason, "requested fix");
     assert.equal(shown.triggers[0]!.body, "please fix it");
     assert.equal(shown.outbox[0]!.id, "reply-1");
+
+    const paused = await call(socketPath, "POST", `/v1/tickets/${ticketId}/pause`);
+    assert.equal(paused.status, 200);
+    assert.equal((paused.body as { state: string }).state, "paused");
   } finally {
     await api.close();
     store.close();

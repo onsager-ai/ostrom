@@ -8,7 +8,8 @@
     "node": ">=24.22.2"
   },
   "bin": {
-    "ostrom": "src/cli/main.ts"
+    "ostrom": "src/cli/main.ts",
+    "ostromd": "src/ostromd/main.ts"
   },
   "scripts": {
     "typecheck": "tsc",

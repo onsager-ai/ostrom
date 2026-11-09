@@ -486,10 +486,9 @@ export class Store {
     const summary = this.#operatorTicket(ticketId);
     const context = this.ticketContext(ticketId);
     const triggers = this.#all(
-      `SELECT "trigger".* FROM decision_trigger JOIN decision ON decision.id = decision_trigger.decision_id
-       JOIN "trigger" ON "trigger".id = decision_trigger.trigger_id WHERE decision.id = ?
-       ORDER BY "trigger".occurred_at, "trigger".id`,
-      summary.decisionId,
+      `SELECT "trigger".* FROM "trigger" JOIN subscription ON subscription.thread_id = "trigger".thread_id
+       WHERE subscription.ticket_id = ? ORDER BY "trigger".occurred_at, "trigger".id`,
+      ticketId,
     ).map(toTrigger);
     const decisions = this.#all(
       `SELECT decision.id, decision.verdict, decision.reason, decision.decided_at FROM decision
