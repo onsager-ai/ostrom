@@ -115,7 +115,7 @@ async function tick(deps: MainDeps): Promise<number> {
   const shared = { ...deps, workers: deps.workers ?? owned!.workers };
   try {
     for (const step of TICK) {
-      const code = await main([step], shared);
+      const code = await main(["dev", step], shared);
       if (code !== 0) failed.push(`${step} (exit ${code})`);
     }
   } finally {

@@ -91,7 +91,10 @@ async function api(command: Command, env: Record<string, string | undefined>): P
 function call(socketPath: string, method: "GET" | "POST", path: string, body?: unknown): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const encoded = body === undefined ? undefined : JSON.stringify(body);
-    const client = request({ socketPath, path, method, headers: encoded === undefined ? undefined : { "content-type": "application/json", "content-length": Buffer.byteLength(encoded) } }, (response) => {
+    const options = encoded === undefined ? { socketPath, path, method } : {
+      socketPath, path, method, headers: { "content-type": "application/json", "content-length": Buffer.byteLength(encoded) },
+    };
+    const client = request(options, (response) => {
       let text = "";
       response.setEncoding("utf8");
       response.on("data", (chunk: string) => { text += chunk; });
