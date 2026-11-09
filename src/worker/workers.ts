@@ -45,6 +45,7 @@ export class Workers {
   readonly #queued = new Set<string>();
   readonly #budgetPauses = new Set<number>();
   readonly #inFlight = new Map<number, AbortController>();
+  #stopping = false;
 
   constructor(deps: WorkersDeps) {
     this.#deps = deps;
@@ -120,6 +121,15 @@ export class Workers {
   }
 
   /**
+   * For an ostromd shutdown: cuts off every running turn and starts no queued one. A cut-off turn
+   * stays open in the store, so the next start resumes it by session ID (`recover`), as after a crash.
+   */
+  stop(): void {
+    this.#stopping = true;
+    for (const controller of this.#inFlight.values()) controller.abort();
+  }
+
+  /**
    * Run once at start. A native assignment that never got a session ends; the others resume by
    * session ID, and one whose turn was cut off is sent a turn to check its state and go on.
    */
@@ -178,6 +188,7 @@ export class Workers {
     try {
       result = await session.send(prompt, controller.signal);
     } catch (error) {
+      if (this.#stopping) return;
       if (controller.signal.aborted) {
         store.endTurn(id, null);
         store.clearTurnError(id);
@@ -190,6 +201,7 @@ export class Workers {
     } finally {
       if (this.#inFlight.get(id) === controller) this.#inFlight.delete(id);
     }
+    if (this.#stopping) return;
     this.#finished(id, result);
   }
 
@@ -202,7 +214,7 @@ export class Workers {
   ): Promise<void> {
     const { store } = this.#deps;
     const assignment = store.getAssignment(id);
-    if (assignment.state !== "running") return;
+    if (this.#stopping || assignment.state !== "running") return;
     const ticket = store.getTicket(assignment.ticketId);
     if (ticket.state === "paused" && !key.startsWith("budget-pause-") && !key.startsWith("stuck-")) return;
     const session = this.#session(assignment);
@@ -214,6 +226,7 @@ export class Workers {
     try {
       result = await session.send(prompt, controller.signal);
     } catch (error) {
+      if (this.#stopping) return;
       if (controller.signal.aborted) {
         store.endTurn(id, null);
         store.clearTurnError(id);
@@ -224,6 +237,7 @@ export class Workers {
     } finally {
       if (this.#inFlight.get(id) === controller) this.#inFlight.delete(id);
     }
+    if (this.#stopping) return;
     this.#finished(id, result);
     if (result.status === "completed") await onComplete?.(result);
   }

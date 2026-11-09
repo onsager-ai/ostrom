@@ -394,6 +394,42 @@ test("run needs --interval with whole seconds", async () => {
 });
 
 test(
+  "a stopped run cuts off a running Worker turn instead of waiting for it, and leaves it open",
+  withDb(async (dbPath) => {
+    const store = Store.open(dbPath);
+    const source = store.ensureSource("github", "onsager-ai/ostrom");
+    const issue = store.ensureThread({ sourceId: source.id, kind: "issue", number: 7, url: "https://github.com/onsager-ai/ostrom/issues/7" });
+    const trigger = store.insertTrigger({
+      sourceId: source.id, sourceEventId: "IC_1", threadId: issue, kind: "issue_comment", actor: "alice",
+      url: "https://github.com/onsager-ai/ostrom/issues/7#issuecomment-1", occurredAt: new Date(),
+    }).id;
+    const { ticketId } = store.recordDecision({ threadId: issue, triggerIds: [trigger], verdict: "accept", reason: "fix it" });
+    const assignmentId = store.createAssignment(ticketId!);
+    store.configureNativeAssignment(assignmentId, { harness: "claude", model: "claude-haiku-5-5", worktree: "/w", branch: "ostrom/ticket-1-1", machine: "host" });
+    store.startNativeAssignment(assignmentId, "session-1");
+    store.beginTurn(assignmentId); // a crash cut this turn off; recovery resumes it and the turn holds
+    store.close();
+
+    const github = new FakeGitHub(() => new Date());
+    const stop = new AbortController();
+    const run = deps(tickEnv(dbPath), github.gh, semonAnswer(20, []));
+    run.runner.hold = true;
+    run.deps.stop = stop.signal;
+    run.deps.sleep = async () => { stop.abort(); };
+    await main(["run", "--interval", "30"], run.deps);
+
+    const after = Store.open(dbPath);
+    try {
+      const a = after.getAssignment(assignmentId);
+      assert.deepEqual([a.state, a.outcome, a.interruptions], ["running", null, 1]);
+      assert.notEqual(a.turnStartedAt, null, "the next start resumes it");
+    } finally {
+      after.close();
+    }
+  }),
+);
+
+test(
   "run repeats tick with the interval between, until stopped, and exits with the last tick's code",
   withDb(async (dbPath) => {
     const github = new FakeGitHub(() => new Date());

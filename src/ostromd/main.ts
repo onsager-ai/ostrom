@@ -153,6 +153,8 @@ async function run(intervalSeconds: number, deps: MainDeps): Promise<number> {
     },
   });
   logRecovery(owned.workers.recover(), deps);
+  // A stop cuts off running turns rather than waiting for them; recovery resumes them on the next start.
+  deps.stop.addEventListener("abort", () => owned.workers.stop(), { once: true });
   try {
     await api.start();
     while (!deps.stop.aborted) {
