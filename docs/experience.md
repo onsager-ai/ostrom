@@ -11,13 +11,13 @@ foreground sessions, such as T3 Code threads, on its own, and never clutters the
 workbench. People reach Ostrom in two ways only:
 
 - **GitHub**, where everyone else acts: issues, mentions, comments, reviews and PRs.
-- **The operator's foreground**, by deliberate choice: one status view, plus *promote to
-  foreground* for a single session.
+- **The operator's foreground**, by deliberate choice: the `ostrom` CLI and a dashboard,
+  plus *promote to foreground* for a single session in T3.
 
 ```
- GitHub (people act)          Ostrom (background)                   Operator (T3 foreground)
+ GitHub (people act)          Ostrom (background)                   Operator (foreground)   
  ───────────────────          ─────────────────────────────         ────────────────────────
- issue / @mention   ───▶      intake › router › workers › outbox    one standing status view
+ issue / @mention   ───▶      intake › router › workers › outbox    `ostrom` CLI + dashboard
  comments, reviews  ◀───      store · subscriptions · watchdog ───▶ pause / stop a ticket
  Ostrom's replies, PRs        ticket 12 · codex · luna              promote a session ⇄
                               ticket 15 · claude · haiku            (open in T3, hand back)
