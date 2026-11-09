@@ -6,29 +6,31 @@ import { claudeRunner, codexRunner } from "./runner.ts";
 import { sessionConfig } from "./config.ts";
 
 test("Claude resumes the same session with the explicit model", async () => {
-  const calls: { model?: string; resume?: string }[] = [];
+  const calls: { model?: string; resume?: string; permissionMode?: string; allowDangerouslySkipPermissions?: boolean }[] = [];
   const run = async function* (input: Parameters<typeof import("@anthropic-ai/claude-agent-sdk").query>[0]): AsyncGenerator<SDKMessage> {
-    calls.push({ ...(input.options?.model ? { model: input.options.model } : {}), ...(input.options?.resume ? { resume: input.options.resume } : {}) });
+    calls.push({ ...(input.options?.model ? { model: input.options.model } : {}), ...(input.options?.resume ? { resume: input.options.resume } : {}), permissionMode: input.options?.permissionMode, allowDangerouslySkipPermissions: input.options?.allowDangerouslySkipPermissions });
     yield { type: "system", subtype: "init", session_id: "session", model: "haiku" } as SDKMessage;
-    yield { type: "result", subtype: "success", session_id: "session", result: "ok", is_error: false, modelUsage: { haiku: {} }, usage: { input_tokens: 4, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 2 } } as unknown as SDKMessage;
+    yield { type: "result", subtype: "success", session_id: "session", result: "ok", is_error: false, modelUsage: { haiku: {}, auxiliary: {} }, usage: { input_tokens: 4, cache_read_input_tokens: 3, cache_creation_input_tokens: 1, output_tokens: 2 } } as unknown as SDKMessage;
   };
   const session = claudeRunner({}, run).start({ cwd: "/tmp", model: "haiku" });
-  assert.deepEqual(await session.send("hello"), { sessionId: "session", text: "ok", status: "completed", model: "haiku", modelUsage: { haiku: {} }, usage: { inputTokens: 4, cachedInputTokens: 0, outputTokens: 2 } });
+  assert.deepEqual(await session.send("hello"), { sessionId: "session", text: "ok", status: "completed", model: "haiku", modelUsage: { haiku: {}, auxiliary: {} }, usage: { inputTokens: 5, cachedInputTokens: 3, outputTokens: 2 } });
   await session.send("again");
-  assert.deepEqual(calls, [{ model: "haiku" }, { model: "haiku", resume: "session" }]);
+  assert.deepEqual(calls, [{ model: "haiku", permissionMode: "bypassPermissions", allowDangerouslySkipPermissions: true }, { model: "haiku", resume: "session", permissionMode: "bypassPermissions", allowDangerouslySkipPermissions: true }]);
 });
 
 test("Codex returns an unverified model and forwards resume options", async () => {
   const events: ThreadEvent[] = [
     { type: "thread.started", thread_id: "id" },
     { type: "item.completed", item: { type: "agent_message", id: "item", text: "ok" } },
-    { type: "turn.completed", usage: { input_tokens: 4, cached_input_tokens: 0, cache_write_input_tokens: 0, output_tokens: 2, reasoning_output_tokens: 0 } },
+    { type: "turn.completed", usage: { input_tokens: 4, cached_input_tokens: 3, cache_write_input_tokens: 0, output_tokens: 2, reasoning_output_tokens: 0 } },
   ];
   let seen: unknown;
   const thread = { runStreamed: async () => ({ events: (async function* () { yield* events; })() }) };
   const client = { startThread: () => thread, resumeThread: (id: string, options: unknown) => { seen = { id, options }; return thread; } } as unknown as Pick<Codex, "startThread" | "resumeThread">;
   const session = codexRunner({}, client).resume({ cwd: "/tmp", model: "luna", sessionId: "id" });
-  assert.equal((await session.send("hello")).model, null);
+  const result = await session.send("hello");
+  assert.equal(result.model, null);
+  assert.deepEqual(result.usage, { inputTokens: 1, cachedInputTokens: 3, outputTokens: 2 });
   assert.deepEqual(seen, { id: "id", options: { workingDirectory: "/tmp", model: "luna", sandboxMode: "workspace-write", networkAccessEnabled: true, approvalPolicy: "never" } });
 });
 
