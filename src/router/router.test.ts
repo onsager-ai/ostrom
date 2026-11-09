@@ -108,8 +108,8 @@ test("an accept records a ticket, dispatches a Worker and queues the Router's ac
   await s.poll();
   const pass = await routeCandidates(s.options());
 
-  assert.deepEqual(pass.router, { sessionId: "sess-1" });
   const [session] = s.routerSessions();
+  assert.deepEqual(pass.router, { sessionId: session?.id });
   assert.equal(session?.options.sandbox, "read-only");
   assert.equal(session?.options.model, "gpt-6-luna");
   const sent = batchOf(session!.prompts[0]!);
@@ -120,7 +120,8 @@ test("an accept records a ticket, dispatches a Worker and queues the Router's ac
   assert.equal(decision.verdict, "accept");
   assert.equal(decision.replyId, `decision-${decision.decisionId}`);
   assert.deepEqual(pass.dispatched.map((d) => d.ticketId), [decision.ticketId]);
-  assert.equal(s.store().runningAssignments()[0]?.sessionId, "sess-1");
+  const workerSession = s.runner.sessions.find((candidate) => candidate.options.sandbox !== "read-only");
+  assert.equal(s.store().runningAssignments()[0]?.sessionId, workerSession?.id);
   assert.deepEqual(
     s.store().dueReplies().map((reply) => [reply.id, reply.body]),
     [[decision.replyId, "On it: a Worker is starting."]],
@@ -337,7 +338,27 @@ test("a Worker that failed to start gets one failure reply, and its ticket ends"
   const s = setup();
   s.comment("please fix the typo");
   await s.poll();
-  s.runner.startFailure = new Error("Project not found.");
+  let routerAnswered = false;
+  const start = s.runner.start.bind(s.runner);
+  s.runner.start = (options) => {
+    if (options.sandbox === "read-only") {
+      const session = start(options);
+      const send = session.send.bind(session);
+      session.send = async (prompt) => {
+        const result = await send(prompt);
+        routerAnswered = true;
+        return result;
+      };
+      return session;
+    }
+    if (routerAnswered) {
+      s.runner.startFailure = new Error("Project not found.");
+      const worker = start(options);
+      s.runner.startFailure = undefined;
+      return worker;
+    }
+    return start(options);
+  };
   const first = await routeCandidates(s.options());
   assert.match(first.failed[0]?.error ?? "", /Project not found/);
   const ticketId = first.decisions[0]!.ticketId!;
