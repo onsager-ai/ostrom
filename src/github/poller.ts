@@ -101,10 +101,13 @@ export async function pollOnce(options: PollOptions): Promise<PollResult> {
   const reviewComments = await listUpdatedSince(gh, `repos/${repo}/pulls/comments`, from(cursor.reviewComments), perPage);
   const issues = await listUpdatedSince(gh, `repos/${repo}/issues`, from(cursor.issues), perPage, "state=all");
 
+  const issueStateEvents = await Promise.all(
+    issues.map((issue) => issueStateEventsFor(issue, store, source.id, gh, repo, perPage)),
+  );
   const events: GitHubEvent[] = [
     ...issueComments.map(issueCommentEvent),
     ...reviewComments.map(reviewCommentEvent),
-    ...issues.map((issue) => issueStateEvent(issue, store, source.id)).filter((event): event is GitHubEvent => event !== null),
+    ...issueStateEvents.flat(),
   ];
   const reviewsSince = from(cursor.issues).getTime();
   for (const issue of issues) {
@@ -269,17 +272,47 @@ function issueCommentEvent(item: Item): GitHubEvent {
   };
 }
 
-function issueStateEvent(item: Item, store: Store, sourceId: number): GitHubEvent | null {
+async function issueStateEventsFor(
+  item: Item,
+  store: Store,
+  sourceId: number,
+  gh: GhRunner,
+  repo: string,
+  perPage: number,
+): Promise<GitHubEvent[]> {
   const state = item["state"];
-  if (state !== "closed" && state !== "open") return null;
+  if (state !== "closed" && state !== "open") return [];
   const kind: ThreadKind = item["pull_request"] == null ? "issue" : "pull_request";
   const number = field(item, "number", "number");
   const existing = store.findThread(sourceId, number);
-  if (state === "open" && (existing === null || !store.ticketsForThread(existing.id).some((ticket) => ticket.state === "ended"))) return null;
+  if (state === "open") {
+    if (existing === null) return [];
+    const tickets = store.ticketsForThread(existing.id);
+    if (tickets.some((ticket) => ticket.state === "open" || ticket.state === "paused")) return [];
+    const endedAt = tickets.reduce<string | null>((latest, ticket) => {
+      if (ticket.state !== "ended") return latest;
+      return latest === null || ticket.endedAt! > latest ? ticket.endedAt! : latest;
+    }, null);
+    if (endedAt === null) return [];
+    const url = field(item, "html_url", "string");
+    return (await listPages(gh, `repos/${repo}/issues/${number}/events`, perPage))
+      .filter((event) => event["event"] === "reopened" && field(event, "created_at", "string") > endedAt)
+      .map((event) => ({
+        id: `issue-event:${field(event, "id", "number")}`,
+        kind: "issue_state" as const,
+        threadKind: kind,
+        number,
+        threadUrl: url,
+        url,
+        actor: eventActor(event),
+        body: "open",
+        occurredAt: new Date(field(event, "created_at", "string")),
+      }));
+  }
   const thread = existing ?? store.getThread(store.ensureThread({ sourceId, kind, number, url: field(item, "html_url", "string") }));
-  if (state === "closed" && !store.ticketsForThread(thread.id).some((ticket) => ticket.state === "open" || ticket.state === "paused")) return null;
+  if (!store.ticketsForThread(thread.id).some((ticket) => ticket.state === "open" || ticket.state === "paused")) return [];
   const url = field(item, "html_url", "string");
-  return {
+  return [{
     id: `${field(item, "node_id", "string")}:${state}:${field(item, "updated_at", "string")}`,
     kind: "issue_state",
     threadKind: kind,
@@ -289,7 +322,7 @@ function issueStateEvent(item: Item, store: Store, sourceId: number): GitHubEven
     actor: login(item),
     body: state,
     occurredAt: new Date(field(item, "updated_at", "string")),
-  };
+  }];
 }
 
 function reviewCommentEvent(item: Item): GitHubEvent {
@@ -341,6 +374,11 @@ function reviewEvent(item: Item, pr: number): GitHubEvent | null {
 function login(item: Item): string {
   const user = item["user"] as Item | null | undefined;
   return typeof user?.["login"] === "string" ? user["login"] : "";
+}
+
+function eventActor(item: Item): string {
+  const actor = item["actor"] as Item | null | undefined;
+  return typeof actor?.["login"] === "string" ? actor["login"] : "";
 }
 
 function bodyOf(item: Item): string {

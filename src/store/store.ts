@@ -75,7 +75,7 @@ export interface PendingDelivery {
   assignmentId: number | null;
 }
 
-export type CommandReceiptName = "redirect" | "pause" | "resume" | "stop" | "forbidden" | "close_issue" | "close_pull_request";
+export type CommandReceiptName = "redirect" | "pause" | "resume" | "stop" | "forbidden" | "close_issue" | "close_pull_request" | "ignore_issue_state";
 
 export interface PendingCommand {
   trigger: Trigger;

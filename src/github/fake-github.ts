@@ -17,6 +17,7 @@ export class FakeGitHub {
   readonly reviewComments: Item[] = [];
   readonly issues = new Map<number, Item>();
   readonly reviews = new Map<number, Item[]>();
+  readonly issueEvents = new Map<number, Item[]>();
   readonly permissions = new Map<string, string>();
   /** Pull requests served by `pulls?head=`: head branch, number, state. */
   readonly pulls: { branch: string; number: number; state: "open" | "closed" | "merged" }[] = [];
@@ -104,6 +105,7 @@ export class FakeGitHub {
     if (issue === undefined) throw new Error(`fake gh: no issue #${number}`);
     issue["state"] = "open";
     issue["updated_at"] = iso(at);
+    this.#issueEvent(number, "reopened", at);
   }
 
   close(number: number, at: Date): void {
@@ -176,6 +178,7 @@ export class FakeGitHub {
           merged_at: pull.state === "merged" ? "2026-11-09T12:00:00Z" : null,
         }));
     } else if (route === "issues") items = [...this.issues.values()];
+    else if ((match = route.match(/^issues\/(\d+)\/events$/))) items = this.issueEvents.get(Number(match[1])) ?? [];
     else if ((match = route.match(/^pulls\/(\d+)\/reviews$/))) items = this.reviews.get(Number(match[1])) ?? [];
     else if ((match = route.match(/^issues\/(\d+)\/comments$/))) items = this.commentsOn(Number(match[1]));
     else throw new Error(`fake gh: no route ${route}`);
@@ -213,6 +216,16 @@ export class FakeGitHub {
     if (comment === undefined) throw new Error("gh api failed: gh: Not Found (HTTP 404)");
     this.edit(comment, field.slice("body=".length), this.#now());
     return comment;
+  }
+
+  #issueEvent(number: number, event: string, at: Date): void {
+    const id = ++this.#ids;
+    this.issueEvents.set(number, [...(this.issueEvents.get(number) ?? []), {
+      id,
+      event,
+      actor: { login: "alice" },
+      created_at: iso(at),
+    }]);
   }
 
   #common(input: CommentInput): Item {

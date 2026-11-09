@@ -86,6 +86,63 @@ test("a pass stores all three comment kinds as triggers on their threads, in tim
   );
 });
 
+test("an open issue update after its ticket ended does not become a reopen", async () => {
+  const { store, github, poll, setNow } = await fixture();
+  github.issue(7);
+  const source = store.ensureSource("github", github.repo);
+  const threadId = store.ensureThread({ sourceId: source.id, kind: "issue", number: 7, url: `https://github.com/${github.repo}/issues/7` });
+  const accepted = store.insertTrigger({
+    sourceId: source.id, sourceEventId: "accepted", threadId, kind: "issue_comment", actor: "alice",
+    url: `https://github.com/${github.repo}/issues/7#issuecomment-1`, occurredAt: at(0),
+  }).id;
+  const ticketId = store.recordDecision({ threadId, triggerIds: [accepted], verdict: "accept", reason: "work" }).ticketId!;
+  store.endTicket(ticketId);
+  github.comment(7, { login: "operator", body: replyMarker("card"), at: at(1) });
+  setNow(10);
+
+  assert.deepEqual((await poll()).candidates, []);
+  assert.equal(github.calls.some((args) => args[3]?.includes("/issues/7/events")), true);
+});
+
+test("a real reopen after its ticket ended is stored once by its event id", async () => {
+  const { store, github, poll, setNow } = await fixture();
+  github.issue(7);
+  const source = store.ensureSource("github", github.repo);
+  const threadId = store.ensureThread({ sourceId: source.id, kind: "issue", number: 7, url: `https://github.com/${github.repo}/issues/7` });
+  const accepted = store.insertTrigger({
+    sourceId: source.id, sourceEventId: "accepted", threadId, kind: "issue_comment", actor: "alice",
+    url: `https://github.com/${github.repo}/issues/7#issuecomment-1`, occurredAt: at(0),
+  }).id;
+  const ticketId = store.recordDecision({ threadId, triggerIds: [accepted], verdict: "accept", reason: "work" }).ticketId!;
+  setNow(1);
+  store.endTicket(ticketId);
+  github.close(7, at(2));
+  github.reopen(7, at(3));
+  setNow(10);
+
+  const first = await poll();
+  assert.deepEqual(first.candidates.map((candidate) => [candidate.kind, candidate.body]), [["issue_state", "open"]]);
+  assert.equal((await poll()).candidates.length, 0);
+});
+
+test("a real reopen does not yield an open trigger while its ticket is open", async () => {
+  const { store, github, poll, setNow } = await fixture();
+  github.issue(7);
+  const source = store.ensureSource("github", github.repo);
+  const threadId = store.ensureThread({ sourceId: source.id, kind: "issue", number: 7, url: `https://github.com/${github.repo}/issues/7` });
+  const accepted = store.insertTrigger({
+    sourceId: source.id, sourceEventId: "accepted", threadId, kind: "issue_comment", actor: "alice",
+    url: `https://github.com/${github.repo}/issues/7#issuecomment-1`, occurredAt: at(0),
+  }).id;
+  store.recordDecision({ threadId, triggerIds: [accepted], verdict: "accept", reason: "work" });
+  github.close(7, at(2));
+  github.reopen(7, at(3));
+  setNow(10);
+
+  assert.deepEqual((await poll()).candidates, []);
+  assert.equal(github.calls.some((args) => args[3]?.includes("/issues/7/events")), false);
+});
+
 test("Ostrom's own replies and actors off the allowlist are dropped and not stored", async () => {
   const { github, poll, count, setNow } = await fixture();
   github.issue(7);
