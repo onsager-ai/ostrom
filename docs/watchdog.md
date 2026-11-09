@@ -23,10 +23,11 @@ A stall opens one `stall` row and remains one episode until Semon no longer repo
 Semon reports a completed Codex exec turn as `ended`, not `waiting-question`, even when its last
 Worker message says it is waiting for an answer. Nor does a hung command look idle to Semon: Codex
 polls a long-running command about once a minute, so the session keeps writing and Semon reports it
-working. The exercise therefore hangs an *open* turn (`sleep 3600`) under a short idle budget. The
-idle budget counts from the assignment's last finished turn, so it flags the hung turn as
-`budget reached: idle`. Each ladder step cancels the turn, which restarts that count, so each of the
-two recoveries and the public reply comes one idle budget after the last.
+working. The exercise therefore hangs an *open* turn (`sleep 3600`) under a short idle budget. Idle
+time is how long the running turn has gone without finishing; between turns a Worker waits on people
+and is not idle. The budget flags the hung turn as `budget reached: idle`. Each ladder step cancels
+the turn and starts a recovery turn, so each of the two recoveries and the public reply comes one
+idle budget after the last, as long as the Worker keeps hanging.
 
 Use a throwaway database. Start `ostromd run` against that store first; the script only seeds an
 accepted decision, whose ticket takes its budget from the environment as a Router-accepted one does.

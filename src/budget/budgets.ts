@@ -52,10 +52,10 @@ export function budgetUsage(budget: TicketBudget, limit: BudgetLimit, now: Date)
   switch (limit) {
     case "time":
       return Math.max(0, Math.floor((now.getTime() - Date.parse(budget.openedAt)) / 60_000));
-    case "idle": {
-      const activity = budget.lastActivityAt ?? budget.openedAt;
-      return Math.max(0, Math.floor((now.getTime() - Date.parse(activity)) / 60_000));
-    }
+    // Idle time is how long the running turn has gone without finishing. Between turns the Worker
+    // waits on people (a review, an answer), which is not idle; Semon's verdicts follow the same rule.
+    case "idle":
+      return budget.turnStartedAt === null ? 0 : Math.max(0, Math.floor((now.getTime() - Date.parse(budget.turnStartedAt)) / 60_000));
     case "turns": return budget.turns;
     // Cached input remains recorded for operators but does not consume the ticket token budget.
     case "tokens": return budget.inputTokens + budget.outputTokens;

@@ -394,8 +394,8 @@ test("a ticket budget persists limits and sums every assignment's turn usage", (
   const budget = store.ticketBudget(ticketId);
   assert.deepEqual(
     [budget.ticketId, budget.timeMinutes, budget.idleMinutes, budget.turnLimit, budget.tokenLimit, budget.escalationLimit,
-      budget.escalations, budget.turns, budget.inputTokens, budget.cachedInputTokens, budget.outputTokens, budget.lastActivityAt],
-    [ticketId, 90, 15, 4, 500, 1, 0, 2, 11, 22, 33, budget.openedAt],
+      budget.escalations, budget.turns, budget.inputTokens, budget.cachedInputTokens, budget.outputTokens, budget.turnStartedAt],
+    [ticketId, 90, 15, 4, 500, 1, 0, 2, 11, 22, 33, null],
   );
   store.pauseTicketForBudget(ticketId, "tokens");
   assert.equal(store.getTicket(ticketId).pauseCause, "budget reached: tokens");

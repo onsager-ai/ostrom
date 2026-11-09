@@ -104,6 +104,17 @@ test("Semon's idle verdicts need a turn that has itself been idle; a question co
   assert.equal((await watchdog(s.options())).checked[0]!.semonReason, "waiting-question");
 });
 
+test("the idle budget flags a turn that has run past it, never a Worker waiting between turns", async () => {
+  const s = setup();
+  const a = s.startWorker(1);
+  s.setSemon([]);
+  const later = { ...s.options(), now: () => new Date(NOW.getTime() + 45 * 60_000) };
+  assert.equal((await watchdog(later)).checked[0]!.stallId, null, "45 minutes waiting for review is not idle");
+  s.store.beginTurn(a.assignmentId);
+  const hung = await watchdog(later);
+  assert.equal(s.store.getStall(hung.checked[0]!.stallId!).cause, "budget reached: idle");
+});
+
 test("Ostrom's own signal records a stall without a Semon reason", async () => {
   const s = setup();
   const a = s.startWorker(1);
