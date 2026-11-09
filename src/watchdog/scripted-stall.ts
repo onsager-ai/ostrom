@@ -4,13 +4,14 @@
 //
 //   node src/watchdog/scripted-stall.ts <issue-number>
 //
-// Environment as for `ostromd dispatch`: OSTROM_REPO, OSTROM_ALLOWLIST, OSTROM_DB (use a new
-// file), OSTROM_T3_PROJECT, OSTROM_WORKER_BASE, OSTROM_WORKER_PROVIDER, OSTROM_WORKER_MODEL.
+// Environment: OSTROM_REPO, OSTROM_ALLOWLIST, OSTROM_DB (use a new file), and for the T3 thread
+// this script still starts (native Workers run headless and cannot ask a question):
+// OSTROM_T3_PROJECT, OSTROM_WORKER_BASE, OSTROM_STALL_PROVIDER, OSTROM_STALL_MODEL.
 // The issue is only where a Router reply would go; nothing is posted unless `ostromd send` runs
 // on this store, so never run `send` on it. The procedure, and how to clean up the worktree and
 // branch the Worker gets, is in docs/watchdog.md.
 
-import { loadConfig, loadWorkerConfig } from "../ostromd/config.ts";
+import { loadConfig } from "../ostromd/config.ts";
 import { Store } from "../store/store.ts";
 import { processRunner, T3Cli } from "../t3/runner.ts";
 
@@ -22,7 +23,12 @@ export const STALL_BRIEF = [
 
 async function scriptedStall(issue: number): Promise<void> {
   const config = loadConfig(process.env);
-  const worker = loadWorkerConfig(process.env);
+  const read = (name: string) => {
+    const value = process.env[name]?.trim() ?? "";
+    if (value === "") throw new Error(`${name} must be set`);
+    return value;
+  };
+  const t3 = { project: read("OSTROM_T3_PROJECT"), base: read("OSTROM_WORKER_BASE"), provider: read("OSTROM_STALL_PROVIDER"), model: read("OSTROM_STALL_MODEL") };
   const store = Store.open(config.dbPath);
   try {
     const source = store.ensureSource("github", config.repo);
@@ -46,13 +52,13 @@ async function scriptedStall(issue: number): Promise<void> {
     const assignmentId = store.createAssignment(ticketId!);
     const branch = `ostrom/ticket-${ticketId}-${assignmentId}`;
     const { threadId: t3ThreadId } = await new T3Cli(processRunner()).startThread({
-      project: worker.project,
+      project: t3.project,
       title: `Ostrom scripted stall: ticket ${ticketId}`,
       brief: STALL_BRIEF,
-      worktreeBase: worker.base,
+      worktreeBase: t3.base,
       branch,
-      provider: worker.provider,
-      model: worker.model,
+      provider: t3.provider,
+      model: t3.model,
     });
     store.startAssignment(assignmentId, t3ThreadId);
     process.stdout.write(`${JSON.stringify({ ticketId, assignmentId, t3ThreadId, branch })}\n`);

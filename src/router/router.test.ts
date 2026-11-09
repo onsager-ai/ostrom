@@ -7,7 +7,9 @@ import { test } from "node:test";
 import { FakeGitHub } from "../github/fake-github.ts";
 import { pollOnce } from "../github/poller.ts";
 import { Store } from "../store/store.ts";
+import { FakeRunner } from "../worker/fake-runner.ts";
 import { routeFollowUps } from "../worker/follow-up.ts";
+import { Workers } from "../worker/workers.ts";
 import { T3Cli, type T3Exit, type T3Invocation } from "../t3/runner.ts";
 import {
   bodyPath,
@@ -20,7 +22,7 @@ import {
   type RouterAnswer,
 } from "./router.ts";
 
-const worker = { project: "/work/ostrom", base: "main", provider: "claudeAgent", model: "claude-haiku-5-5" };
+const workerConfig = { repo: "/repo", base: "main", worktrees: "/wt", harness: "codex" as const, model: "gpt-6-luna", machine: "host" };
 const router = { project: "/work/ostrom", provider: "claudeAgent", model: "claude-haiku-5-5" };
 const shownThread = () => JSON.parse(readFileSync(new URL("../t3/fixtures/show.json", import.meta.url), "utf8"));
 const ok = (value: unknown): T3Exit => ({ code: 0, stdout: JSON.stringify(value), stderr: "" });
@@ -45,16 +47,14 @@ const acceptAll = (batch: Batch): RouterAnswer => ({
 
 /**
  * A stand-in `t3`. `start --wait` and `send --wait` are Router turns answered by `answer`;
- * `start` without `--wait` is a Worker; `show` reads either kind, and a thread it does not know
+ * `show` reads a Router thread, and a thread it does not know
  * is gone, worded as T3 words it at the pin.
  */
 class FakeT3 {
   readonly calls: T3Invocation[] = [];
   readonly routers = new Set<string>();
-  readonly workers = new Map<string, Record<string, unknown>>();
   answer: (batch: Batch) => RouterAnswer | string = acceptAll;
   routerStatus: "completed" | "failed" = "completed";
-  workerStartExit: T3Exit | undefined;
   showExit: T3Exit | undefined;
   #threads = 0;
   #runs = 0;
@@ -66,13 +66,6 @@ class FakeT3 {
   readonly cli = new T3Cli(async (invocation) => {
     this.calls.push(invocation);
     const [, verb] = invocation.args;
-    const waits = invocation.args.includes("--wait");
-    if (verb === "start" && !waits) {
-      if (this.workerStartExit !== undefined) return this.workerStartExit;
-      const threadId = `mcp:worker-${++this.#threads}`;
-      this.workers.set(threadId, { status: "running", pendingRequestCount: 0 });
-      return ok({ threadId, projectId: "mcp:project", runId: `run:${threadId}:1` });
-    }
     if (verb === "start" || verb === "send") {
       let threadId: string;
       if (verb === "start") {
@@ -93,7 +86,7 @@ class FakeT3 {
     assert.equal(verb, "show");
     if (this.showExit !== undefined) return this.showExit;
     const threadId = invocation.args.at(-1)!;
-    const fields = this.routers.has(threadId) ? { status: "completed" } : this.workers.get(threadId);
+    const fields = this.routers.has(threadId) ? { status: "completed" } : undefined;
     if (fields === undefined) return { code: 1, stdout: "", stderr: `Thread ${threadId} is no longer available.\n` };
     const value = shownThread();
     Object.assign(value.thread, { threadId, linkedPullRequest: null, pullRequests: [] }, fields);
@@ -109,8 +102,12 @@ function setup(dbPath = ":memory:") {
   github.issue(7);
   github.issue(8);
   const t3 = new FakeT3();
+  const runner = new FakeRunner();
   let store = Store.open(dbPath, { now });
-  const options = (): RouteOptions => ({ store, gh: github.gh, t3: t3.cli, repo: github.repo, worker, router });
+  const addWorktree = async (_repo: string, _path: string, _base: string, ticket: number, assignment: number) =>
+    `ostrom/ticket-${ticket}-${assignment}`;
+  const workers = () => new Workers({ store, config: workerConfig, runners: { claude: runner, codex: runner }, addWorktree });
+  const options = (): RouteOptions => ({ store, gh: github.gh, t3: t3.cli, repo: github.repo, workers: workers(), router });
   const comment = (body: string, minute = 58, issue = 7) =>
     github.comment(issue, { login: "alice", body, at: new Date(`2026-11-09T11:${minute}:00Z`) });
   const poll = () => pollOnce({ store, gh: github.gh, repo: github.repo, allowlist: ["alice"], now });
@@ -118,7 +115,7 @@ function setup(dbPath = ":memory:") {
     store.close();
     store = Store.open(dbPath, { now });
   };
-  return { github, t3, store: () => store, options, comment, poll, reopen };
+  return { github, t3, runner, workers, store: () => store, options, comment, poll, reopen };
 }
 
 const pr = (number: number, state: string) => ({
@@ -149,7 +146,7 @@ test("an accept records a ticket, dispatches a Worker and queues the Router's ac
   assert.equal(decision.verdict, "accept");
   assert.equal(decision.replyId, `decision-${decision.decisionId}`);
   assert.deepEqual(pass.dispatched.map((d) => d.ticketId), [decision.ticketId]);
-  assert.equal(s.store().runningAssignments()[0]?.t3ThreadId, "mcp:worker-2");
+  assert.equal(s.store().runningAssignments()[0]?.sessionId, "sess-1");
   assert.deepEqual(
     s.store().dueReplies().map((reply) => [reply.id, reply.body]),
     [[decision.replyId, "On it: a Worker is starting."]],
@@ -343,10 +340,10 @@ test("each outcome gets one reply, and a merged PR ends the assignment and the t
   await s.poll();
   const first = await routeCandidates(s.options());
   const ticketId = first.decisions[0]!.ticketId!;
-  const { assignmentId, t3ThreadId } = first.dispatched[0]!;
+  const { assignmentId, branch } = first.dispatched[0]!;
   const turns = () => s.t3.routerTurns.length;
 
-  s.t3.workers.set(t3ThreadId, { status: "completed", pendingRequestCount: 0, pullRequests: [pr(12, "open")] });
+  s.github.pulls.push({ branch, number: 12, state: "open" });
   const opened = await routeCandidates(s.options());
   assert.deepEqual(opened.outcomes, [
     { key: `outcome-a${assignmentId}-pr12-opened`, event: "pr_opened", ticketId, ticketEnded: false },
@@ -359,7 +356,7 @@ test("each outcome gets one reply, and a merged PR ends the assignment and the t
   assert.equal((await routeCandidates(s.options())).router, null);
   assert.equal(turns(), 2);
 
-  s.t3.workers.set(t3ThreadId, { status: "completed", pendingRequestCount: 0, pullRequests: [pr(12, "merged")] });
+  s.github.pulls[0]!.state = "merged";
   const merged = await routeCandidates(s.options());
   assert.deepEqual(merged.outcomes, [
     { key: `outcome-a${assignmentId}-pr12-merged`, event: "pr_merged", ticketId, ticketEnded: true },
@@ -378,7 +375,7 @@ test("a Worker that failed to start gets one failure reply, and its ticket ends"
   const s = setup();
   s.comment("please fix the typo");
   await s.poll();
-  s.t3.workerStartExit = { code: 1, stdout: "", stderr: "Project not found." };
+  s.runner.startFailure = new Error("Project not found.");
   const first = await routeCandidates(s.options());
   assert.match(first.failed[0]?.error ?? "", /Project not found/);
   const ticketId = first.decisions[0]!.ticketId!;
@@ -421,7 +418,7 @@ test("a follow-up on the accepted issue goes to its Worker, not to the Router", 
   await s.poll();
   const first = await routeCandidates(s.options());
   const { ticketId } = first.decisions[0]!;
-  const { assignmentId, t3ThreadId } = first.dispatched[0]!;
+  const { assignmentId } = first.dispatched[0]!;
   const issue = first.decisions[0]!.thread;
   assert.deepEqual(s.store().ticketsForThread(issue).map((t) => t.id), [ticketId]);
   // The accepted trigger has its decision: it is neither a candidate nor owed to the Worker.
@@ -434,17 +431,14 @@ test("a follow-up on the accepted issue goes to its Worker, not to the Router", 
   assert.equal((await routeCandidates(s.options())).router, null);
   assert.equal(s.t3.routerTurns.length, turns);
 
-  // #655's follow-up pass delivers it to the Worker; the fake t3 queues it as the next run.
-  const sends: string[] = [];
-  const followUps = new T3Cli(async (invocation) => {
-    sends.push(invocation.args[3]!);
-    return ok({ threadId: invocation.args[3], messageId: "message:m", runId: "run:f", status: "queued", delivery: "queued" });
-  });
-  const routed = await routeFollowUps(s.store(), followUps);
+  // The follow-up pass queues it as a turn on the Worker's session.
+  const workers = s.workers();
+  const routed = routeFollowUps(s.store(), workers);
   assert.deepEqual(routed.failed, []);
-  assert.deepEqual(routed.delivered.map((d) => [d.ticketId, d.assignmentId, d.t3ThreadId]), [[ticketId, assignmentId, t3ThreadId]]);
-  assert.deepEqual(sends, [t3ThreadId]);
-  assert.deepEqual(await routeFollowUps(s.store(), followUps), { delivered: [], failed: [] });
+  assert.deepEqual(routed.queued.map((d) => [d.ticketId, d.assignmentId]), [[ticketId, assignmentId]]);
+  await workers.drain();
+  assert.equal(s.runner.sessions.at(-1)?.prompts.length, 1);
+  assert.deepEqual(routeFollowUps(s.store(), workers), { queued: [], failed: [] });
 });
 
 test("a trigger's body is fetched by the id in its URL", () => {

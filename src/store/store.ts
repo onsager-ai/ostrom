@@ -102,6 +102,9 @@ export interface Assignment {
   inputTokens: number;
   cachedInputTokens: number;
   outputTokens: number;
+  /** Set while a turn runs; still set when ostromd starts means the turn was interrupted. */
+  turnStartedAt: string | null;
+  interruptions: number;
   createdAt: string;
   startedAt: string | null;
   endedAt: string | null;
@@ -451,11 +454,12 @@ export class Store {
     if (Number(changes) !== 1) this.#illegalAssignment(assignmentId, "running");
   }
 
-  /** `running → ended`. */
-  endAssignment(assignmentId: number): void {
+  /** `running → ended`, with the reason when the Worker was stopped rather than finished. */
+  endAssignment(assignmentId: number, reason: string | null = null): void {
     const { changes } = this.#run(
-      "UPDATE assignment SET state = 'ended', ended_at = ? WHERE id = ? AND state = 'running'",
+      "UPDATE assignment SET state = 'ended', ended_at = ?, end_reason = ? WHERE id = ? AND state = 'running'",
       this.#stamp(),
+      reason,
       assignmentId,
     );
     if (Number(changes) !== 1) this.#illegalAssignment(assignmentId, "ended");
@@ -473,13 +477,47 @@ export class Store {
     if (Number(changes) !== 1) this.#illegalAssignment(assignmentId, "ended");
   }
 
-  /** Assignments that ended without a Worker ever starting, on tickets still open, oldest first. */
+  /** Assignments that ended with a reason (never started, or stopped), on open tickets, oldest first. */
   abandonedAssignments(): Assignment[] {
     return this.#all(
       `SELECT assignment.* FROM assignment JOIN ticket ON ticket.id = assignment.ticket_id
-       WHERE assignment.state = 'ended' AND assignment.t3_thread_id IS NULL AND ticket.state = 'open'
+       WHERE assignment.state = 'ended' AND assignment.t3_thread_id IS NULL
+         AND assignment.end_reason IS NOT NULL AND ticket.state = 'open'
        ORDER BY assignment.id`,
     ).map(toAssignment);
+  }
+
+  /** Assignments created but not yet started, oldest first. */
+  pendingAssignments(): Assignment[] {
+    return this.#all("SELECT * FROM assignment WHERE state = 'pending' ORDER BY id").map(toAssignment);
+  }
+
+  /** Marks a native turn as running and returns the assignment's turn number. */
+  beginTurn(assignmentId: number): number {
+    const row = this.#get(
+      "UPDATE assignment SET turns = turns + 1, turn_started_at = ? WHERE id = ? AND state = 'running' RETURNING turns",
+      this.#stamp(),
+      assignmentId,
+    );
+    if (row === undefined) this.#illegalAssignment(assignmentId, "running");
+    return row!["turns"] as number;
+  }
+
+  /** Clears the running turn and adds its usage, when it reported any. */
+  endTurn(assignmentId: number, usage: { inputTokens: number; cachedInputTokens: number; outputTokens: number } | null): void {
+    this.#run(
+      `UPDATE assignment SET turn_started_at = NULL, input_tokens = input_tokens + ?,
+         cached_input_tokens = cached_input_tokens + ?, output_tokens = output_tokens + ? WHERE id = ?`,
+      usage?.inputTokens ?? 0,
+      usage?.cachedInputTokens ?? 0,
+      usage?.outputTokens ?? 0,
+      assignmentId,
+    );
+  }
+
+  /** Counts a turn that a restart found unfinished. */
+  recordInterruption(assignmentId: number): void {
+    this.#run("UPDATE assignment SET interruptions = interruptions + 1 WHERE id = ?", assignmentId);
   }
 
   /** Every running assignment, oldest first. */
@@ -863,6 +901,8 @@ function toAssignment(row: Row): Assignment {
     inputTokens: row["input_tokens"] as number,
     cachedInputTokens: row["cached_input_tokens"] as number,
     outputTokens: row["output_tokens"] as number,
+    turnStartedAt: row["turn_started_at"] as string | null,
+    interruptions: row["interruptions"] as number,
     createdAt: row["created_at"] as string,
     startedAt: row["started_at"] as string | null,
     endedAt: row["ended_at"] as string | null,

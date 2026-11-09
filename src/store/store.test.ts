@@ -400,7 +400,7 @@ test("migration 2 keeps the assignments a version 1 store already holds", () => 
       id: 2, ticketId: 1, state: "running", t3ThreadId: "thr", createdAt: "t", startedAt: "t", endedAt: null,
       endReason: null, outcome: null, outcomeAt: null,
       harness: null, model: null, sessionId: null, worktree: null, branch: null, machine: null,
-      turns: 0, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0,
+      turns: 0, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, turnStartedAt: null, interruptions: 0,
     },
   );
   store.abandonAssignment(1, "never started");
@@ -519,4 +519,34 @@ test("the newest recorded Router thread is the current one", () => {
   store.recordRouterThread("mcp:router-2");
   assert.equal(store.routerThread(), "mcp:router-2");
   assert.throws(() => store.recordRouterThread("mcp:router-1"), /UNIQUE/);
+});
+
+test("a native turn is counted, marked while it runs, and its usage is added", () => {
+  const { store, accept } = fixture();
+  const id = store.createAssignment(accept());
+  store.configureNativeAssignment(id, { harness: "codex", model: "m", worktree: "/w", branch: "b", machine: "h" });
+  assert.throws(() => store.beginTurn(id), IllegalTransition);
+  store.startNativeAssignment(id, "sess");
+  assert.equal(store.beginTurn(id), 1);
+  assert.notEqual(store.getAssignment(id).turnStartedAt, null);
+  store.endTurn(id, { inputTokens: 5, cachedInputTokens: 3, outputTokens: 2 });
+  store.endTurn(id, null);
+  store.recordInterruption(id);
+  assert.equal(store.beginTurn(id), 2);
+  store.endTurn(id, { inputTokens: 1, cachedInputTokens: 1, outputTokens: 1 });
+  const a = store.getAssignment(id);
+  assert.deepEqual(
+    [a.turns, a.turnStartedAt, a.inputTokens, a.cachedInputTokens, a.outputTokens, a.interruptions],
+    [2, null, 6, 4, 3, 1],
+  );
+});
+
+test("a stopped native assignment ends with its reason and is owed a reply; a finished one is not", () => {
+  const { store, accept } = fixture();
+  const stopped = store.createAssignment(accept());
+  store.configureNativeAssignment(stopped, { harness: "codex", model: "m", worktree: "/w", branch: "b", machine: "h" });
+  store.startNativeAssignment(stopped, "s1");
+  assert.deepEqual(store.pendingAssignments().map((a) => a.id), []);
+  store.endAssignment(stopped, "model mismatch");
+  assert.deepEqual(store.abandonedAssignments().map((a) => [a.id, a.endReason]), [[stopped, "model mismatch"]]);
 });

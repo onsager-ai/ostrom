@@ -12,11 +12,12 @@
 // candidates for the next pass.
 
 import { ghGet, type GhRunner } from "../github/gh.ts";
-import type { RouterConfig, WorkerConfig } from "../ostromd/config.ts";
+import type { RouterConfig } from "../ostromd/config.ts";
 import { stallReplyId, type StallAction, type Store, type Trigger, type Verdict } from "../store/store.ts";
-import type { T3RunResult, T3Thread } from "../t3/cli-json.ts";
+import type { T3RunResult } from "../t3/cli-json.ts";
 import { T3ThreadGone, type T3Cli } from "../t3/runner.ts";
-import { dispatch, outcomeOf, pullRequestsOn } from "../worker/dispatch.ts";
+import { pullRequestsForBranch, type BranchPullRequest } from "../worker/dispatch.ts";
+import type { Workers } from "../worker/workers.ts";
 
 /** How much of a comment body the batch carries inline; the rest is behind its URL. */
 export const EXCERPT_CHARS = 600;
@@ -131,7 +132,7 @@ export interface RoutePassResult {
   }[];
   outcomes: { key: string; event: OutcomeEvent; ticketId: number; ticketEnded: boolean }[];
   stalls: { key: string; action: StallAction; ticketId: number; replyId: string | null; ticketEnded: boolean }[];
-  dispatched: { ticketId: number; assignmentId: number; t3ThreadId: string; branch: string }[];
+  dispatched: { ticketId: number; assignmentId: number; sessionId: string; branch: string }[];
   /** Work this pass could not do; the command exits non-zero when any is listed. */
   failed: { what: string; error: string }[];
 }
@@ -142,7 +143,7 @@ export interface RouteOptions {
   t3: T3Cli;
   /** owner/name */
   repo: string;
-  worker: WorkerConfig;
+  workers: Workers;
   router: RouterConfig;
 }
 
@@ -201,7 +202,7 @@ export async function routeCandidates(options: RouteOptions): Promise<RoutePassR
 async function dispatchPending(options: RouteOptions, result: RoutePassResult): Promise<void> {
   for (const ticketId of options.store.undispatchedTickets()) {
     try {
-      const dispatched = await dispatch(options.store, options.t3, options.worker, ticketId);
+      const dispatched = await options.workers.dispatch(ticketId);
       result.dispatched.push({ ticketId, ...dispatched });
     } catch (error) {
       // dispatch ended the assignment with this reason; the next pass owes a `failed` reply.
@@ -269,10 +270,11 @@ async function fetchBody(gh: GhRunner, repo: string, trigger: Trigger, number: n
 // --- outcomes --------------------------------------------------------------------------------
 
 /**
- * Outcomes of accepted work not yet replied to. A running Worker's T3 thread is read for its PRs
- * on the repo and its status; an assignment that never started is a failure. Each assignment
- * yields at most one terminal outcome per pass, and a PR first seen merged or closed is not also
- * reported as opened. A thread that cannot be read is reported and skipped.
+ * Outcomes of accepted work not yet replied to. A running Worker's branch is looked up with `gh`
+ * for its PRs and its turns' recorded outcome is read; an assignment that never started or was
+ * stopped is a failure. Each assignment yields at most one terminal outcome per pass, and a PR
+ * first seen merged or closed is not also reported as opened. A branch that cannot be read is
+ * reported and skipped.
  */
 async function pendingOutcomes(options: RouteOptions, result: RoutePassResult): Promise<Outcome[]> {
   const { store } = options;
@@ -282,9 +284,10 @@ async function pendingOutcomes(options: RouteOptions, result: RoutePassResult): 
   };
 
   for (const assignment of store.runningAssignments()) {
-    let thread: T3Thread;
+    if (assignment.sessionId === null) continue;
+    let pullRequests: BranchPullRequest[];
     try {
-      ({ thread } = await options.t3.showThread(assignment.t3ThreadId!));
+      pullRequests = await pullRequestsForBranch(options.gh, options.repo, assignment.branch!);
     } catch (error) {
       result.failed.push({ what: `read assignment ${assignment.id}`, error: message(error) });
       continue;
@@ -299,10 +302,9 @@ async function pendingOutcomes(options: RouteOptions, result: RoutePassResult): 
       detail: null,
     };
     let terminal: Outcome | null = null;
-    for (const pr of pullRequestsOn(thread, options.repo)) {
+    for (const pr of pullRequests) {
       if (context.thread.kind === "pull_request" && pr.number === context.thread.number) continue;
-      const state = thread.pullRequests.find((listed) => listed.number === pr.number)?.state ?? null;
-      const event: OutcomeEvent = state === "merged" ? "pr_merged" : state === "closed" ? "pr_closed" : "pr_opened";
+      const event: OutcomeEvent = pr.state === "merged" ? "pr_merged" : pr.state === "closed" ? "pr_closed" : "pr_opened";
       const outcome: Outcome = {
         ...base,
         key: `outcome-a${assignment.id}-pr${pr.number}-${event.slice(3)}`,
@@ -313,7 +315,7 @@ async function pendingOutcomes(options: RouteOptions, result: RoutePassResult): 
       if (!outcome.terminal) owed(outcome);
       else terminal ??= outcome;
     }
-    const status = outcomeOf(thread);
+    const status = assignment.outcome;
     if (terminal === null && (status === "failed" || status === "cancelled")) {
       terminal = { ...base, key: `outcome-a${assignment.id}-${status}`, event: status, terminal: true, pullRequest: null };
     }
@@ -332,7 +334,10 @@ async function pendingOutcomes(options: RouteOptions, result: RoutePassResult): 
       threadUrl: context.thread.url,
       request: context.reason,
       pullRequest: null,
-      detail: `the Worker could not be started: ${assignment.endReason}`,
+      detail:
+        assignment.startedAt === null
+          ? `the Worker could not be started: ${assignment.endReason}`
+          : `the Worker was stopped: ${assignment.endReason}`,
     });
   }
   return outcomes;

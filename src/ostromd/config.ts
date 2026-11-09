@@ -4,6 +4,8 @@
 //   OSTROM_ALLOWLIST  comma-separated GitHub logins who may start work
 //   OSTROM_DB         path to the SQLite store
 
+import { hostname } from "node:os";
+
 export interface Config {
   repo: string;
   allowlist: string[];
@@ -27,19 +29,21 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
   return { repo, allowlist, dbPath };
 }
 
-// Worker dispatch reads four more, all required and with no defaults, so a Worker never runs
-// on a model nobody chose:
+// Native Workers read these. The first two are required; the rest have defaults:
 //
-//   OSTROM_T3_PROJECT       T3 Code project id, or a path inside the project
-//   OSTROM_WORKER_BASE      branch each Worker's worktree starts from and its PR targets
-//   OSTROM_WORKER_PROVIDER  T3 provider instance id, e.g. claudeAgent
-//   OSTROM_WORKER_MODEL     model slug, e.g. claude-haiku-5-5
+//   OSTROM_WORKER_REPO       path to the git checkout each Worker's worktree is added to
+//   OSTROM_WORKER_BASE       branch each Worker's worktree starts from and its PR targets
+//   OSTROM_WORKER_WORKTREES  directory holding the worktrees; default <repo>.worktrees
+//   OSTROM_WORKER_HARNESS    claude or codex; default codex
+//   OSTROM_WORKER_MODEL      model slug; default gpt-6-luna
 
 export interface WorkerConfig {
-  project: string;
+  repo: string;
   base: string;
-  provider: string;
+  worktrees: string;
+  harness: "claude" | "codex";
   model: string;
+  machine: string;
 }
 
 export function loadWorkerConfig(env: Record<string, string | undefined>): WorkerConfig {
@@ -48,11 +52,18 @@ export function loadWorkerConfig(env: Record<string, string | undefined>): Worke
     if (value === "") throw new Error(`${name} must be set to dispatch Workers`);
     return value;
   };
+  const repo = read("OSTROM_WORKER_REPO");
+  const harness = env["OSTROM_WORKER_HARNESS"]?.trim() || "codex";
+  if (harness !== "claude" && harness !== "codex") {
+    throw new Error(`OSTROM_WORKER_HARNESS must be claude or codex, got ${JSON.stringify(harness)}`);
+  }
   return {
-    project: read("OSTROM_T3_PROJECT"),
+    repo,
     base: read("OSTROM_WORKER_BASE"),
-    provider: read("OSTROM_WORKER_PROVIDER"),
-    model: read("OSTROM_WORKER_MODEL"),
+    worktrees: env["OSTROM_WORKER_WORKTREES"]?.trim() || `${repo.replace(/\/+$/, "")}.worktrees`,
+    harness,
+    model: env["OSTROM_WORKER_MODEL"]?.trim() || "gpt-6-luna",
+    machine: hostname(),
   };
 }
 

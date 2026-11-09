@@ -251,6 +251,12 @@ export const migrations: readonly string[] = [
     SELECT RAISE(ABORT, 'a delivery needs the assignment''s ticket subscribed to the trigger''s thread');
   END;
   `,
+
+  // 8: a native turn in progress and the interruptions a restart found.
+  `
+  ALTER TABLE assignment ADD COLUMN turn_started_at TEXT;
+  ALTER TABLE assignment ADD COLUMN interruptions INTEGER NOT NULL DEFAULT 0 CHECK (interruptions >= 0);
+  `,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */

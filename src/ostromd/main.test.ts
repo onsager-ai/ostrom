@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { FakeGitHub } from "../github/fake-github.ts";
 import { Store } from "../store/store.ts";
+import { FakeRunner } from "../worker/fake-runner.ts";
 import { loadConfig, loadRouterConfig, loadWatchdogConfig, loadWorkerConfig } from "./config.ts";
 import { main, TICK, type MainDeps } from "./main.ts";
 
@@ -25,14 +26,17 @@ function deps(
 ) {
   const out: string[] = [];
   const err: string[] = [];
+  const runner = new FakeRunner();
   const d: MainDeps = {
     env, gh, t3, semon,
     stdout: (l: string) => out.push(l),
     stderr: (l: string) => err.push(l),
     sleep: async () => {},
     stop: new AbortController().signal,
+    runners: { claude: runner, codex: runner },
+    addWorktree: async (_repo, _path, _base, ticket, assignment) => `ostrom/ticket-${ticket}-${assignment}`,
   };
-  return { out, err, deps: d };
+  return { out, err, deps: d, runner };
 }
 
 function withDb(body: (dbPath: string) => Promise<void>) {
@@ -110,22 +114,26 @@ test(
 );
 
 const workerEnv = {
-  OSTROM_T3_PROJECT: "/work/ostrom",
+  OSTROM_WORKER_REPO: "/work/ostrom",
   OSTROM_WORKER_BASE: "main",
-  OSTROM_WORKER_PROVIDER: "claudeAgent",
+  OSTROM_WORKER_HARNESS: "claude",
   OSTROM_WORKER_MODEL: "claude-haiku-5-5",
 };
+const routerEnv = { OSTROM_T3_PROJECT: "/work/ostrom" };
 
-test("Worker config has four required variables and no default model", () => {
-  assert.deepEqual(loadWorkerConfig(workerEnv), {
-    project: "/work/ostrom",
-    base: "main",
-    provider: "claudeAgent",
-    model: "claude-haiku-5-5",
+test("Worker config requires a repo and base, and defaults to codex on gpt-6-luna", () => {
+  const required = { OSTROM_WORKER_REPO: "/work/ostrom", OSTROM_WORKER_BASE: "main" };
+  const { machine, ...config } = loadWorkerConfig(required);
+  assert.equal(machine.length > 0, true);
+  assert.deepEqual(config, {
+    repo: "/work/ostrom", base: "main", worktrees: "/work/ostrom.worktrees", harness: "codex", model: "gpt-6-luna",
   });
-  for (const name of Object.keys(workerEnv)) {
-    assert.throws(() => loadWorkerConfig({ ...workerEnv, [name]: " " }), new RegExp(name));
+  assert.equal(loadWorkerConfig(workerEnv).harness, "claude");
+  assert.equal(loadWorkerConfig({ ...workerEnv, OSTROM_WORKER_WORKTREES: "/wt" }).worktrees, "/wt");
+  for (const name of Object.keys(required)) {
+    assert.throws(() => loadWorkerConfig({ ...required, [name]: " " }), new RegExp(name));
   }
+  assert.throws(() => loadWorkerConfig({ ...required, OSTROM_WORKER_HARNESS: "gemini" }), /OSTROM_WORKER_HARNESS/);
 });
 
 test("dispatch needs one ticket id", async () => {
@@ -136,7 +144,7 @@ test("dispatch needs one ticket id", async () => {
 });
 
 test(
-  "dispatch and observe run through t3, and a t3 failure exits non-zero",
+  "dispatch starts a session and observe reads GitHub, and a gh failure exits non-zero",
   withDb(async (dbPath) => {
     const env = { OSTROM_REPO: "o/r", OSTROM_ALLOWLIST: "alice", OSTROM_DB: dbPath };
     const store = Store.open(dbPath);
@@ -151,27 +159,27 @@ test(
 
     const missing = deps(env, async () => "[]");
     assert.equal(await main(["dispatch", "1"], missing.deps), 1);
-    assert.match(missing.err.join("\n"), /OSTROM_T3_PROJECT/);
+    assert.match(missing.err.join("\n"), /OSTROM_WORKER_REPO/);
 
-    const launched = { threadId: "mcp:w", projectId: "mcp:p", runId: "run:1" };
-    const started = deps({ ...env, ...workerEnv }, async () => "[]", async () => ({
-      code: 0, stdout: JSON.stringify(launched), stderr: "",
-    }));
+    const started = deps({ ...env, ...workerEnv }, async () => "[]");
     assert.equal(await main(["dispatch", "1"], started.deps), 0);
     assert.deepEqual(JSON.parse(started.out[0]!), {
-      ticketId: 1, assignmentId: 1, t3ThreadId: "mcp:w", branch: "ostrom/ticket-1-1",
+      ticketId: 1, assignmentId: 1, sessionId: "sess-1", branch: "ostrom/ticket-1-1",
     });
+    assert.equal(started.runner.sessions[0]?.prompts.length, 1, "the command waited for the turn");
 
-    const unreadable = deps(env, async () => "[]", async () => ({ code: 1, stdout: "", stderr: "server down" }));
+    const unreadable = deps(env, async () => {
+      throw new Error("gh down");
+    });
     assert.equal(await main(["observe"], unreadable.deps), 1);
-    assert.match(unreadable.err.join("\n"), /assignment 1 failed: t3 thread show exited 1: server down/);
+    assert.match(unreadable.err.join("\n"), /assignment 1 failed: gh down/);
   }),
 );
 
 test(
-  "route prints deliveries as JSON lines, and a failed send exits non-zero until it is retried",
+  "route prints queued follow-ups as JSON lines, exits non-zero while a ticket has no Worker, and replays nothing",
   withDb(async (dbPath) => {
-    const env = { OSTROM_REPO: "o/r", OSTROM_ALLOWLIST: "alice", OSTROM_DB: dbPath };
+    const env = { OSTROM_REPO: "o/r", OSTROM_ALLOWLIST: "alice", OSTROM_DB: dbPath, ...workerEnv };
     const store = Store.open(dbPath);
     const source = store.ensureSource("github", "o/r");
     const issue = store.ensureThread({ sourceId: source.id, kind: "issue", number: 7, url: "https://github.com/o/r/issues/7" });
@@ -181,22 +189,25 @@ test(
         url: `https://github.com/o/r/issues/7#${id}`, occurredAt: new Date(),
       }).id;
     const { ticketId } = store.recordDecision({ threadId: issue, triggerIds: [comment("IC_1")], verdict: "accept", reason: "fix it" });
-    const assignmentId = store.createAssignment(ticketId!);
-    store.startAssignment(assignmentId, "mcp:w");
     store.subscribe(ticketId!, issue);
     const followUp = comment("IC_2");
     store.close();
 
-    const down = deps(env, async () => "[]", async () => ({ code: 1, stdout: "", stderr: "server down" }));
-    assert.equal(await main(["route"], down.deps), 1);
-    assert.match(down.err.join("\n"), /trigger 2 to ticket 1 failed: t3 thread send exited 1: server down/);
+    const none = deps(env, async () => "[]");
+    assert.equal(await main(["route"], none.deps), 1);
+    assert.match(none.err.join("\n"), /trigger 2 to ticket 1 failed: ticket 1 has no running Worker/);
 
-    const sent = { threadId: "mcp:w", messageId: "message:m", runId: "run:2", status: "queued", delivery: "queued" };
-    const up = deps(env, async () => "[]", async () => ({ code: 0, stdout: JSON.stringify(sent), stderr: "" }));
+    const reopened = Store.open(dbPath);
+    const assignmentId = reopened.createAssignment(ticketId!);
+    reopened.configureNativeAssignment(assignmentId, { harness: "claude", model: "m", worktree: "/w", branch: "b", machine: "h" });
+    reopened.startNativeAssignment(assignmentId, "sess-9");
+    reopened.close();
+
+    const up = deps(env, async () => "[]");
     assert.equal(await main(["route"], up.deps), 0);
-    assert.deepEqual(up.out.map((line) => JSON.parse(line)), [
-      { triggerId: followUp, ticketId: 1, assignmentId, t3ThreadId: "mcp:w", t3RunId: "run:2", delivery: "queued" },
-    ]);
+    assert.deepEqual(up.out.map((line) => JSON.parse(line)), [{ triggerId: followUp, ticketId: 1, assignmentId }]);
+    assert.equal(up.runner.sessions[0]?.id, "sess-9");
+    assert.equal(up.runner.sessions[0]?.prompts.length, 1, "the command waited for the turn");
 
     const replay = deps(env, async () => "[]");
     assert.equal(await main(["route"], replay.deps), 0);
@@ -216,7 +227,7 @@ test(
   "route-candidates prints the pass as JSON lines, and invalid Router output exits non-zero",
   withDb(async (dbPath) => {
     const env = {
-      OSTROM_REPO: "o/r", OSTROM_ALLOWLIST: "alice", OSTROM_DB: dbPath, ...workerEnv,
+      OSTROM_REPO: "o/r", OSTROM_ALLOWLIST: "alice", OSTROM_DB: dbPath, ...workerEnv, ...routerEnv,
       OSTROM_ROUTER_PROVIDER: "claudeAgent", OSTROM_ROUTER_MODEL: "claude-haiku-5-5",
     };
     const store = Store.open(dbPath);
@@ -310,7 +321,7 @@ test(
 );
 
 const tickEnv = (dbPath: string) => ({
-  OSTROM_REPO: "onsager-ai/ostrom", OSTROM_ALLOWLIST: "alice", OSTROM_DB: dbPath, ...workerEnv,
+  OSTROM_REPO: "onsager-ai/ostrom", OSTROM_ALLOWLIST: "alice", OSTROM_DB: dbPath, ...workerEnv, ...routerEnv,
   OSTROM_ROUTER_PROVIDER: "claudeAgent", OSTROM_ROUTER_MODEL: "claude-haiku-5-5", OSTROM_STALL_MINUTES: "20",
 });
 /** The pass each summary line on stderr came from, in order. */

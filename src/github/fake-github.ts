@@ -17,6 +17,8 @@ export class FakeGitHub {
   readonly reviewComments: Item[] = [];
   readonly issues = new Map<number, Item>();
   readonly reviews = new Map<number, Item[]>();
+  /** Pull requests served by `pulls?head=`: head branch, number, state. */
+  readonly pulls: { branch: string; number: number; state: "open" | "closed" | "merged" }[] = [];
   readonly calls: string[][] = [];
   /** Throw this from the next call whose argv matches. */
   failWhen: ((args: readonly string[]) => Error | undefined) | undefined;
@@ -135,7 +137,17 @@ export class FakeGitHub {
     let match: RegExpMatchArray | null;
     if (route === "issues/comments") items = this.issueComments;
     else if (route === "pulls/comments") items = this.reviewComments;
-    else if (route === "issues") items = [...this.issues.values()];
+    else if (route === "pulls") {
+      const head = q.get("head") ?? "";
+      return this.pulls
+        .filter((pull) => head === `${this.repo.split("/")[0]}:${pull.branch}`)
+        .map((pull) => ({
+          number: pull.number,
+          html_url: this.#threadUrl(pull.number, true),
+          state: pull.state === "open" ? "open" : "closed",
+          merged_at: pull.state === "merged" ? "2026-11-09T12:00:00Z" : null,
+        }));
+    } else if (route === "issues") items = [...this.issues.values()];
     else if ((match = route.match(/^pulls\/(\d+)\/reviews$/))) items = this.reviews.get(Number(match[1])) ?? [];
     else if ((match = route.match(/^issues\/(\d+)\/comments$/))) items = this.commentsOn(Number(match[1]));
     else throw new Error(`fake gh: no route ${route}`);
