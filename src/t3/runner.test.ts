@@ -50,6 +50,21 @@ test("show asks for the thread state without messages", async () => {
   assert.deepEqual(calls[0]?.args, ["thread", "show", "--messages", "0", "--json", "mcp:x"]);
 });
 
+test("send passes the message on stdin without --wait and reads the send result", async () => {
+  const { calls, cli } = recording({ code: 0, stdout: fixture("send-nowait.json"), stderr: "" });
+  const sent = await cli.sendMessage("mcp:f6e981f5-2da9-4a00-8d24-42f1dc982c93", "--not-a-flag");
+  assert.deepEqual(sent, {
+    threadId: "mcp:f6e981f5-2da9-4a00-8d24-42f1dc982c93",
+    runId: "run:thread:mcp%3Af6e981f5-2da9-4a00-8d24-42f1dc982c93:ordinal:2",
+    delivery: "started",
+  });
+  assert.deepEqual(calls, [
+    { args: ["thread", "send", "--json", "mcp:f6e981f5-2da9-4a00-8d24-42f1dc982c93", "-"], stdin: "--not-a-flag" },
+  ]);
+  const missing = recording({ code: 1, stdout: "", stderr: "Thread mcp:gone was not found.\n" }).cli;
+  await assert.rejects(missing.sendMessage("mcp:gone", "x"), /t3 thread send exited 1: Thread mcp:gone was not found\./);
+});
+
 test("a non-zero exit is an error carrying t3's message, even with JSON on stdout", async () => {
   const { cli } = recording({ code: 1, stdout: fixture("launch.json"), stderr: "Project not found.\n" });
   await assert.rejects(cli.startThread(start), {

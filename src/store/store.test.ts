@@ -403,3 +403,23 @@ test("migration 2 keeps the assignments a version 1 store already holds", () => 
   store.abandonAssignment(1, "never started");
   assert.equal(store.getAssignment(1).endReason, "never started");
 });
+
+test("a delivery is recorded once, and only for a ticket subscribed to the trigger's thread", () => {
+  const { store, source, issue, trigger, accept } = fixture();
+  const ticketId = accept();
+  const assignmentId = store.createAssignment(ticketId);
+  store.startAssignment(assignmentId, "mcp:worker");
+  const followUp = trigger();
+  assert.throws(() => store.recordDelivery(followUp, assignmentId, "run:1"), /needs the assignment's ticket subscribed/);
+
+  store.subscribe(ticketId, issue);
+  assert.deepEqual(store.pendingDeliveries().map((p) => [p.trigger.id, p.ticketId, p.assignmentId, p.t3ThreadId]), [
+    [followUp, ticketId, assignmentId, "mcp:worker"],
+  ]);
+  assert.deepEqual(store.recordDelivery(followUp, assignmentId, "run:1"), { duplicate: false });
+  assert.deepEqual(store.recordDelivery(followUp, assignmentId, "run:2"), { duplicate: true });
+  assert.deepEqual(store.pendingDeliveries(), []);
+
+  const elsewhere = store.ensureThread({ sourceId: source.id, kind: "issue", number: 8, url: "u8" });
+  assert.throws(() => store.recordDelivery(trigger(elsewhere), assignmentId, "run:3"), /subscribed/);
+});

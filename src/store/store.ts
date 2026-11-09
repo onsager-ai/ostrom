@@ -40,6 +40,31 @@ export interface NewTrigger {
   occurredAt: Date;
 }
 
+/** A stored trigger. Timestamps are ISO strings as stored. */
+export interface Trigger {
+  id: number;
+  sourceId: number;
+  sourceEventId: string;
+  threadId: number;
+  kind: string;
+  actor: string;
+  url: string;
+  occurredAt: string;
+  receivedAt: string;
+}
+
+/**
+ * A follow-up owed to a Worker: an undecided trigger on a thread that an open ticket is
+ * subscribed to, not yet delivered to that ticket. The assignment is the ticket's latest running
+ * one, or null when the ticket has no running Worker to take it.
+ */
+export interface PendingDelivery {
+  trigger: Trigger;
+  ticketId: number;
+  assignmentId: number | null;
+  t3ThreadId: string | null;
+}
+
 export interface NewDecision {
   threadId: number;
   triggerIds: readonly number[];
@@ -210,6 +235,23 @@ export class Store {
       trigger.sourceEventId,
     )!;
     return { id: existing["id"] as number, duplicate: true };
+  }
+
+  /**
+   * Triggers that still need the Router, oldest first: no decision has judged them, no Worker has
+   * been sent them, and no open ticket is subscribed to their thread (those go to its Worker). A
+   * trigger stored before a crash and never routed is still here on the next pass.
+   */
+  undecidedTriggers(): Trigger[] {
+    return this.#all(
+      `SELECT * FROM "trigger" AS t
+       WHERE NOT EXISTS (SELECT 1 FROM decision_trigger WHERE trigger_id = t.id)
+         AND NOT EXISTS (SELECT 1 FROM delivery WHERE trigger_id = t.id)
+         AND NOT EXISTS (
+           SELECT 1 FROM subscription JOIN ticket ON ticket.id = subscription.ticket_id
+           WHERE subscription.thread_id = t.thread_id AND ticket.state = 'open')
+       ORDER BY t.occurred_at, t.id`,
+    ).map(toTrigger);
   }
 
   // --- decisions and tickets -----------------------------------------------------------------
@@ -393,6 +435,46 @@ export class Store {
     ).map(toTicket);
   }
 
+  // --- deliveries ----------------------------------------------------------------------------
+
+  /** Every follow-up owed to an open ticket's Worker, oldest trigger first, then by ticket. */
+  pendingDeliveries(): PendingDelivery[] {
+    return this.#all(
+      `SELECT t.*, ticket.id AS p_ticket_id, worker.id AS p_assignment_id, worker.t3_thread_id AS p_t3_thread_id
+       FROM "trigger" AS t
+       JOIN subscription ON subscription.thread_id = t.thread_id
+       JOIN ticket ON ticket.id = subscription.ticket_id AND ticket.state = 'open'
+       LEFT JOIN assignment AS worker ON worker.id = (
+         SELECT id FROM assignment WHERE ticket_id = ticket.id AND state = 'running' ORDER BY id DESC LIMIT 1)
+       WHERE NOT EXISTS (SELECT 1 FROM decision_trigger WHERE trigger_id = t.id)
+         AND NOT EXISTS (
+           SELECT 1 FROM delivery JOIN assignment ON assignment.id = delivery.assignment_id
+           WHERE delivery.trigger_id = t.id AND assignment.ticket_id = ticket.id)
+       ORDER BY t.occurred_at, t.id, ticket.id`,
+    ).map((row) => ({
+      trigger: toTrigger(row),
+      ticketId: row["p_ticket_id"] as number,
+      assignmentId: row["p_assignment_id"] as number | null,
+      t3ThreadId: row["p_t3_thread_id"] as string | null,
+    }));
+  }
+
+  /**
+   * Records that the trigger reached the assignment's Worker as T3 run `t3RunId`. Recording the
+   * same delivery again is a no-op marked duplicate.
+   */
+  recordDelivery(triggerId: number, assignmentId: number, t3RunId: string): { duplicate: boolean } {
+    const { changes } = this.#run(
+      `INSERT INTO delivery (trigger_id, assignment_id, t3_run_id, delivered_at) VALUES (?, ?, ?, ?)
+       ON CONFLICT DO NOTHING`,
+      triggerId,
+      assignmentId,
+      t3RunId,
+      this.#stamp(),
+    );
+    return { duplicate: Number(changes) === 0 };
+  }
+
   // --- outbox --------------------------------------------------------------------------------
 
   /**
@@ -499,6 +581,20 @@ function toSource(row: Row): Source {
     kind: row["kind"] as SourceKind,
     name: row["name"] as string,
     cursor: row["cursor"] as string | null,
+  };
+}
+
+function toTrigger(row: Row): Trigger {
+  return {
+    id: row["id"] as number,
+    sourceId: row["source_id"] as number,
+    sourceEventId: row["source_event_id"] as string,
+    threadId: row["thread_id"] as number,
+    kind: row["kind"] as string,
+    actor: row["actor"] as string,
+    url: row["url"] as string,
+    occurredAt: row["occurred_at"] as string,
+    receivedAt: row["received_at"] as string,
   };
 }
 

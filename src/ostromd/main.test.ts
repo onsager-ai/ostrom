@@ -114,7 +114,7 @@ test("Worker config has four required variables and no default model", () => {
 });
 
 test("dispatch needs one ticket id", async () => {
-  for (const argv of [["dispatch"], ["dispatch", "x"], ["dispatch", "0"], ["dispatch", "1", "2"], ["observe", "1"]]) {
+  for (const argv of [["dispatch"], ["dispatch", "x"], ["dispatch", "0"], ["dispatch", "1", "2"], ["observe", "1"], ["route", "1"]]) {
     const run = deps({}, async () => "[]");
     assert.equal(await main(argv, run.deps), 2, argv.join(" "));
   }
@@ -150,5 +150,41 @@ test(
     const unreadable = deps(env, async () => "[]", async () => ({ code: 1, stdout: "", stderr: "server down" }));
     assert.equal(await main(["observe"], unreadable.deps), 1);
     assert.match(unreadable.err.join("\n"), /assignment 1 failed: t3 thread show exited 1: server down/);
+  }),
+);
+
+test(
+  "route prints deliveries as JSON lines, and a failed send exits non-zero until it is retried",
+  withDb(async (dbPath) => {
+    const env = { OSTROM_REPO: "o/r", OSTROM_ALLOWLIST: "alice", OSTROM_DB: dbPath };
+    const store = Store.open(dbPath);
+    const source = store.ensureSource("github", "o/r");
+    const issue = store.ensureThread({ sourceId: source.id, kind: "issue", number: 7, url: "https://github.com/o/r/issues/7" });
+    const comment = (id: string) =>
+      store.insertTrigger({
+        sourceId: source.id, sourceEventId: id, threadId: issue, kind: "issue_comment", actor: "alice",
+        url: `https://github.com/o/r/issues/7#${id}`, occurredAt: new Date(),
+      }).id;
+    const { ticketId } = store.recordDecision({ threadId: issue, triggerIds: [comment("IC_1")], verdict: "accept", reason: "fix it" });
+    const assignmentId = store.createAssignment(ticketId!);
+    store.startAssignment(assignmentId, "mcp:w");
+    store.subscribe(ticketId!, issue);
+    const followUp = comment("IC_2");
+    store.close();
+
+    const down = deps(env, async () => "[]", async () => ({ code: 1, stdout: "", stderr: "server down" }));
+    assert.equal(await main(["route"], down.deps), 1);
+    assert.match(down.err.join("\n"), /trigger 2 to ticket 1 failed: t3 thread send exited 1: server down/);
+
+    const sent = { threadId: "mcp:w", messageId: "message:m", runId: "run:2", status: "queued", delivery: "queued" };
+    const up = deps(env, async () => "[]", async () => ({ code: 0, stdout: JSON.stringify(sent), stderr: "" }));
+    assert.equal(await main(["route"], up.deps), 0);
+    assert.deepEqual(up.out.map((line) => JSON.parse(line)), [
+      { triggerId: followUp, ticketId: 1, assignmentId, t3ThreadId: "mcp:w", t3RunId: "run:2", delivery: "queued" },
+    ]);
+
+    const replay = deps(env, async () => "[]");
+    assert.equal(await main(["route"], replay.deps), 0);
+    assert.deepEqual(replay.out, []);
   }),
 );
