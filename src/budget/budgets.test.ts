@@ -21,7 +21,7 @@ test("budget accounting excludes cached input from token limits but keeps it in 
   assert.equal(budgetWarning(budget(), NOW), "time");
   assert.equal(budgetReached(budget(), NOW), "idle");
   assert.equal(budgetReached(budget({ idleMinutes: 60, escalationLimit: 1, escalations: 1 }), NOW), "escalations");
-  assert.equal(budgetWarning(budget({ timeMinutes: 120 }), NOW), "turns");
+  assert.equal(budgetWarning(budget({ timeMinutes: 120, idleMinutes: 60 }), NOW), "turns");
 });
 
 test("budget defaults are documented constants and env values are validated", () => {
