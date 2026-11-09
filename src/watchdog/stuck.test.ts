@@ -92,6 +92,26 @@ test("three stall episodes on one Worker recover twice, then queue its public st
   assert.ok(store.dueReplies().some((reply) => reply.id === `stuck-${third}`));
 });
 
+test("a human comment during a silent recovery reaches the Worker and leaves the ticket open", async () => {
+  const { store, runner, workers, ticketId, threadId } = fixture();
+  await workers.dispatch(ticketId);
+  const assignmentId = 1;
+  runner.sessions[0]!.auto = true;
+  store.recordStall({ assignmentId, semonReason: "no-output", detail: null });
+  await advanceStuckLadder(store, workers);
+  await workers.drain();
+  store.insertTrigger({
+    sourceId: store.ensureSource("github", REPO).id, sourceEventId: "human-early", threadId, kind: "issue_comment", actor: "alice",
+    url: `https://github.com/${REPO}/issues/7#issuecomment-early`, occurredAt: new Date("2026-11-09T12:01:00.000Z"), body: "try red",
+  });
+  const pass = routeFollowUps(store, workers);
+  await workers.drain();
+  assert.deepEqual(pass.failed, []);
+  assert.equal(pass.queued.length, 1);
+  assert.equal(store.getTicket(ticketId).state, "open");
+  assert.equal(store.getAssignment(assignmentId).stallRecoveryAttempts, 0);
+});
+
 test("a human follow-up resets the Worker recovery count", async () => {
   const { store, runner, workers, ticketId, threadId } = fixture();
   await workers.dispatch(ticketId);
