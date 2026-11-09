@@ -13,7 +13,7 @@ test("Claude resumes the same session with the explicit model", async () => {
     yield { type: "result", subtype: "success", session_id: "session", result: "ok", is_error: false, modelUsage: { haiku: {} }, usage: { input_tokens: 4, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 2 } } as unknown as SDKMessage;
   };
   const session = claudeRunner({}, run).start({ cwd: "/tmp", model: "haiku" });
-  assert.deepEqual(await session.send("hello"), { sessionId: "session", text: "ok", status: "completed", model: "haiku", usage: { inputTokens: 4, outputTokens: 2 } });
+  assert.deepEqual(await session.send("hello"), { sessionId: "session", text: "ok", status: "completed", model: "haiku", modelUsage: { haiku: {} }, usage: { inputTokens: 4, cachedInputTokens: 0, outputTokens: 2 } });
   await session.send("again");
   assert.deepEqual(calls, [{ model: "haiku" }, { model: "haiku", resume: "session" }]);
 });
@@ -29,7 +29,7 @@ test("Codex returns an unverified model and forwards resume options", async () =
   const client = { startThread: () => thread, resumeThread: (id: string, options: unknown) => { seen = { id, options }; return thread; } } as unknown as Pick<Codex, "startThread" | "resumeThread">;
   const session = codexRunner({}, client).resume({ cwd: "/tmp", model: "luna", sessionId: "id" });
   assert.equal((await session.send("hello")).model, null);
-  assert.deepEqual(seen, { id: "id", options: { workingDirectory: "/tmp", model: "luna" } });
+  assert.deepEqual(seen, { id: "id", options: { workingDirectory: "/tmp", model: "luna", sandboxMode: "workspace-write", networkAccessEnabled: true, approvalPolicy: "never" } });
 });
 
 test("Codex cancellation is reported rather than treated as success", async () => {
