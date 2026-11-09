@@ -1,0 +1,171 @@
+// A fake GitHub behind a GhRunner, for tests. It serves the REST shapes and query semantics intake
+// and the outbox rely on (`since` inclusive on updated_at, sort, per_page/page) and records posts.
+
+import type { GhRunner } from "./gh.ts";
+
+type Item = Record<string, unknown>;
+
+export interface CommentInput {
+  login: string | null;
+  body: string;
+  at: Date;
+}
+
+export class FakeGitHub {
+  readonly repo = "onsager-ai/ostrom";
+  readonly issueComments: Item[] = [];
+  readonly reviewComments: Item[] = [];
+  readonly issues = new Map<number, Item>();
+  readonly reviews = new Map<number, Item[]>();
+  readonly calls: string[][] = [];
+  /** Throw this from the next call whose argv matches. */
+  failWhen: ((args: readonly string[]) => Error | undefined) | undefined;
+  /** Called after each GET is answered, to change state between pages. */
+  afterGet: ((path: string) => void) | undefined;
+  #ids = 1000;
+  readonly #now: () => Date;
+
+  constructor(now: () => Date) {
+    this.#now = now;
+  }
+
+  issue(number: number, pr = false): void {
+    if (this.issues.has(number)) return;
+    this.issues.set(number, {
+      number,
+      node_id: `${pr ? "PR" : "I"}_${number}`,
+      updated_at: iso(this.#now()),
+      ...(pr ? { pull_request: { url: `https://api.github.com/repos/${this.repo}/pulls/${number}` } } : {}),
+    });
+  }
+
+  comment(number: number, input: CommentInput): Item {
+    const pr = this.issues.get(number)?.["pull_request"] != null;
+    const id = ++this.#ids;
+    const item: Item = {
+      id,
+      node_id: `IC_${id}`,
+      html_url: `${this.#threadUrl(number, pr)}#issuecomment-${id}`,
+      issue_url: `https://api.github.com/repos/${this.repo}/issues/${number}`,
+      ...this.#common(input),
+    };
+    this.issueComments.push(item);
+    this.#touch(number, input.at);
+    return item;
+  }
+
+  reviewComment(pr: number, input: CommentInput): Item {
+    const id = ++this.#ids;
+    const item: Item = {
+      id,
+      node_id: `PRRC_${id}`,
+      html_url: `${this.#threadUrl(pr, true)}#discussion_r${id}`,
+      pull_request_url: `https://api.github.com/repos/${this.repo}/pulls/${pr}`,
+      ...this.#common(input),
+    };
+    this.reviewComments.push(item);
+    this.#touch(pr, input.at);
+    return item;
+  }
+
+  review(pr: number, input: CommentInput & { state: string }): Item {
+    const id = ++this.#ids;
+    const item: Item = {
+      id,
+      node_id: `PRR_${id}`,
+      html_url: `${this.#threadUrl(pr, true)}#pullrequestreview-${id}`,
+      user: input.login === null ? null : { login: input.login },
+      body: input.body,
+      state: input.state,
+      submitted_at: input.state === "PENDING" ? null : iso(input.at),
+    };
+    this.reviews.set(pr, [...(this.reviews.get(pr) ?? []), item]);
+    this.#touch(pr, input.at);
+    return item;
+  }
+
+  /** Edits a comment, moving its updated_at as GitHub does. */
+  edit(item: Item, body: string, at: Date): void {
+    item["body"] = body;
+    item["updated_at"] = iso(at);
+  }
+
+  commentsOn(number: number): Item[] {
+    return this.issueComments.filter((c) => (c["issue_url"] as string).endsWith(`/issues/${number}`));
+  }
+
+  readonly gh: GhRunner = async (args) => {
+    this.calls.push([...args]);
+    const failure = this.failWhen?.(args);
+    if (failure) throw failure;
+    const [api, flag, method, path, ...rest] = args;
+    if (api !== "api" || flag !== "--method" || path === undefined) throw new Error(`fake gh: ${args.join(" ")}`);
+    if (method === "POST") return JSON.stringify(this.#post(path, rest));
+    if (method !== "GET") throw new Error(`fake gh: method ${method}`);
+    const body = JSON.stringify(this.#get(path));
+    this.afterGet?.(path);
+    return body;
+  };
+
+  #get(path: string): Item[] {
+    const url = new URL(`https://api.github.com/${path}`);
+    const q = url.searchParams;
+    const prefix = `/repos/${this.repo}/`;
+    if (!url.pathname.startsWith(prefix)) throw new Error(`fake gh: unknown repo in ${path}`);
+    const route = url.pathname.slice(prefix.length);
+    let items: Item[];
+    let match: RegExpMatchArray | null;
+    if (route === "issues/comments") items = this.issueComments;
+    else if (route === "pulls/comments") items = this.reviewComments;
+    else if (route === "issues") items = [...this.issues.values()];
+    else if ((match = route.match(/^pulls\/(\d+)\/reviews$/))) items = this.reviews.get(Number(match[1])) ?? [];
+    else if ((match = route.match(/^issues\/(\d+)\/comments$/))) items = this.commentsOn(Number(match[1]));
+    else throw new Error(`fake gh: no route ${route}`);
+
+    const since = q.get("since");
+    if (since !== null) items = items.filter((i) => Date.parse(i["updated_at"] as string) >= Date.parse(since));
+    if (q.get("sort") === "updated") {
+      items = [...items].sort(
+        (a, b) =>
+          Date.parse(a["updated_at"] as string) - Date.parse(b["updated_at"] as string) ||
+          (a["id"] as number) - (b["id"] as number),
+      );
+    }
+    const perPage = Number(q.get("per_page") ?? 30);
+    const page = Number(q.get("page") ?? 1);
+    return items.slice((page - 1) * perPage, page * perPage);
+  }
+
+  #post(path: string, rest: string[]): Item {
+    const match = path.match(new RegExp(`^repos/${this.repo}/issues/(\\d+)/comments$`));
+    const [flag, field] = rest;
+    if (!match || flag !== "-f" || field === undefined || !field.startsWith("body=")) {
+      throw new Error(`fake gh: POST ${path}`);
+    }
+    return this.comment(Number(match[1]), { login: "operator", body: field.slice("body=".length), at: this.#now() });
+  }
+
+  #common(input: CommentInput): Item {
+    return {
+      user: input.login === null ? null : { login: input.login },
+      body: input.body,
+      created_at: iso(input.at),
+      updated_at: iso(input.at),
+    };
+  }
+
+  #touch(number: number, at: Date): void {
+    const issue = this.issues.get(number);
+    if (issue === undefined) throw new Error(`fake gh: no issue #${number}`);
+    if (Date.parse(issue["updated_at"] as string) < at.getTime()) issue["updated_at"] = iso(at);
+  }
+
+  #threadUrl(number: number, pr: boolean): string {
+    return `https://github.com/${this.repo}/${pr ? "pull" : "issues"}/${number}`;
+  }
+}
+
+/** GitHub's timestamp form: ISO 8601 to the second. */
+export function iso(at: Date): string {
+  return at.toISOString().replace(/\.\d{3}Z$/, "Z");
+}

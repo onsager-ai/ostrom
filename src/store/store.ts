@@ -24,6 +24,10 @@ export interface NewThread {
   url: string;
 }
 
+export interface Thread extends NewThread {
+  id: number;
+}
+
 export interface NewTrigger {
   sourceId: number;
   sourceEventId: string;
@@ -151,6 +155,18 @@ export class Store {
       throw new Error(`thread #${thread.number} is kind ${String(row["kind"])}, not ${thread.kind}`);
     }
     return row["id"] as number;
+  }
+
+  getThread(threadId: number): Thread {
+    const row = this.#get("SELECT * FROM thread WHERE id = ?", threadId);
+    if (row === undefined) throw new Error(`no thread ${threadId}`);
+    return {
+      id: row["id"] as number,
+      sourceId: row["source_id"] as number,
+      kind: row["kind"] as ThreadKind,
+      number: row["number"] as number,
+      url: row["url"] as string,
+    };
   }
 
   // --- triggers ------------------------------------------------------------------------------
