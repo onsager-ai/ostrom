@@ -264,6 +264,12 @@ export const migrations: readonly string[] = [
   DROP TABLE router_thread;
   ALTER TABLE delivery RENAME COLUMN t3_run_id TO turn_id;
   `,
+
+  // 10: Every GitHub thread has at most one editable status card. The comment id is recorded
+  // only after GitHub confirms the post, so a crash before that point is recovered by the marker.
+  `
+  ALTER TABLE thread ADD COLUMN status_card_comment_id INTEGER;
+  `,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */

@@ -28,6 +28,8 @@ export interface NewThread {
 
 export interface Thread extends NewThread {
   id: number;
+  /** The GitHub issue-comment id of Ostrom's status card, once its first post succeeded. */
+  statusCardCommentId: number | null;
 }
 
 export interface NewTrigger {
@@ -250,7 +252,22 @@ export class Store {
       kind: row["kind"] as ThreadKind,
       number: row["number"] as number,
       url: row["url"] as string,
+      statusCardCommentId: row["status_card_comment_id"] as number | null,
     };
+  }
+
+  /** Records the one GitHub comment that may be edited as this thread's status card. */
+  setStatusCardCommentId(threadId: number, commentId: number): void {
+    if (!Number.isSafeInteger(commentId) || commentId <= 0) throw new Error("status card comment id must be positive");
+    const { changes } = this.#run(
+      "UPDATE thread SET status_card_comment_id = ? WHERE id = ? AND status_card_comment_id IS NULL",
+      commentId,
+      threadId,
+    );
+    if (Number(changes) === 1) return;
+    const thread = this.getThread(threadId);
+    if (thread.statusCardCommentId === commentId) return;
+    throw new IllegalTransition(`thread ${threadId} already has status card comment ${String(thread.statusCardCommentId)}`);
   }
 
   // --- triggers ------------------------------------------------------------------------------
