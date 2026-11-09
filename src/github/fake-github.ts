@@ -137,7 +137,7 @@ export class FakeGitHub {
     let match: RegExpMatchArray | null;
     let found: Item | undefined;
     if ((match = route.match(/^collaborators\/([^/]+)\/permission$/))) {
-      return { permission: this.permissions.get(decodeURIComponent(match[1]!)) ?? "none" };
+      return permissionBody(this.permissions.get(decodeURIComponent(match[1]!)) ?? "none");
     } else if ((match = route.match(/^issues\/(\d+)$/))) {
       found = this.issues.get(Number(match[1]));
     } else if ((match = route.match(/^issues\/comments\/(\d+)$/))) {
@@ -160,7 +160,7 @@ export class FakeGitHub {
     if (!url.pathname.startsWith(prefix)) throw new Error(`fake gh: unknown repo in ${path}`);
     const route = url.pathname.slice(prefix.length);
     const permission = route.match(/^collaborators\/([^/]+)\/permission$/);
-    if (permission) return [{ permission: this.permissions.get(decodeURIComponent(permission[1]!)) ?? "none" }];
+    if (permission) return [permissionBody(this.permissions.get(decodeURIComponent(permission[1]!)) ?? "none")];
     let items: Item[];
     let match: RegExpMatchArray | null;
     if (route === "issues/comments") items = this.issueComments;
@@ -238,4 +238,13 @@ export class FakeGitHub {
 /** GitHub's timestamp form: ISO 8601 to the second. */
 export function iso(at: Date): string {
   return at.toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
+/**
+ * GitHub's collaborator permission answer: `permission` is the legacy level (triage reads as
+ * "read", maintain as "write"); `role_name` is the actual role.
+ */
+function permissionBody(role: string): { permission: string; role_name: string } {
+  const legacy: Record<string, string> = { admin: "admin", maintain: "write", write: "write", triage: "read", read: "read" };
+  return { permission: legacy[role] ?? "none", role_name: role };
 }

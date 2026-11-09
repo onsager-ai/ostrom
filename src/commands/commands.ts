@@ -143,8 +143,10 @@ async function mayControl(
 async function collaborator(gh: GhRunner, repo: string, user: string, cache: Map<string, Promise<boolean>>): Promise<boolean> {
   const key = user.toLowerCase();
   const found = cache.get(key) ?? ghGet(gh, `repos/${repo}/collaborators/${encodeURIComponent(user)}/permission`).then((body) => {
-    const permission = (body as { permission?: unknown }).permission;
-    return permission === "triage" || permission === "write" || permission === "maintain" || permission === "admin";
+    // `permission` is the legacy level, where triage reads as "read"; `role_name` is the real role.
+    const { permission, role_name: role } = body as { permission?: unknown; role_name?: unknown };
+    return role === "triage" || role === "write" || role === "maintain" || role === "admin" ||
+      permission === "write" || permission === "admin";
   }).catch(() => false);
   cache.set(key, found);
   return found;
