@@ -364,6 +364,22 @@ export const migrations: readonly string[] = [
   ALTER TABLE assignment ADD COLUMN stall_recovery_attempts INTEGER NOT NULL DEFAULT 0
     CHECK (stall_recovery_attempts >= 0 AND stall_recovery_attempts <= 2);
   `,
+
+  // 20: An obsolete open issue-state trigger is consumed without affecting the subscribed ticket.
+  `
+  CREATE TABLE command_receipt_v20 (
+    trigger_id   INTEGER NOT NULL REFERENCES "trigger" (id),
+    ticket_id    INTEGER NOT NULL REFERENCES ticket (id),
+    command      TEXT NOT NULL CHECK (command IN ('redirect', 'pause', 'resume', 'stop', 'forbidden', 'close_issue', 'close_pull_request', 'ignore_issue_state')),
+    instruction  INTEGER NOT NULL CHECK (instruction IN (0, 1)),
+    handled_at   TEXT NOT NULL,
+    PRIMARY KEY (trigger_id, ticket_id)
+  ) STRICT, WITHOUT ROWID;
+  INSERT INTO command_receipt_v20 SELECT * FROM command_receipt;
+  DROP TABLE command_receipt;
+  ALTER TABLE command_receipt_v20 RENAME TO command_receipt;
+  CREATE INDEX command_receipt_by_ticket ON command_receipt (ticket_id, trigger_id);
+  `,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */

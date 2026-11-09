@@ -71,9 +71,14 @@ export async function routeCommands(
   for (const pending of store.pendingCommands()) {
     const parsed = parseComment(pending.trigger.body ?? "");
     const command = pending.trigger.kind === "issue_state" ?
-      (store.getThread(pending.trigger.threadId).kind === "issue" ? "close_issue" : "close_pull_request") :
+      (pending.trigger.body === "closed" ? (store.getThread(pending.trigger.threadId).kind === "issue" ? "close_issue" : "close_pull_request") : "ignore_issue_state") :
       parsed.kind === "command" ? parsed.command : "redirect";
     try {
+      if (command === "ignore_issue_state") {
+        store.recordCommandReceipt(pending.trigger.id, pending.ticketId, command, false);
+        pass.handled.push({ triggerId: pending.trigger.id, ticketId: pending.ticketId, command, allowed: true });
+        continue;
+      }
       const allowed = command === "redirect" || command === "close_issue" || command === "close_pull_request" || await mayControl(
         store, gh, repo, pending.trigger, pending.ticketId, permissions, authors,
       );

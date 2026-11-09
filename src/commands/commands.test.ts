@@ -98,6 +98,22 @@ test("a command without permission only gets a confused reaction", async () => {
   assert.deepEqual(store.dueReplies().map((reply) => reply.reaction), ["confused"]);
 });
 
+test("an open issue-state trigger is consumed without closing its open ticket", async () => {
+  const { store, github, workers, ticketId } = fixture();
+  const source = store.ensureSource("github", REPO);
+  const triggerId = store.insertTrigger({
+    sourceId: source.id, sourceEventId: "open-state", threadId: store.ticketContext(ticketId).thread.id,
+    kind: "issue_state", actor: "operator", url: `https://github.com/${REPO}/issues/7`, occurredAt: new Date(), body: "open",
+  }).id;
+
+  assert.deepEqual((await routeCommands(store, workers, github.gh, REPO)).handled, [
+    { triggerId, ticketId, command: "ignore_issue_state", allowed: true },
+  ]);
+  assert.equal(store.getTicket(ticketId).state, "open");
+  assert.deepEqual(store.pendingCommands(), []);
+  assert.deepEqual(store.pendingDeliveries(), []);
+});
+
 test("closing the issue cancels a hung turn, gets the graceful stop prompt and ends with the distinct card state", async () => {
   const { github, runner, store, workers, ticketId, assignmentId } = fixture();
   runner.hold = true;
