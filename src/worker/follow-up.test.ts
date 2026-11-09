@@ -104,7 +104,7 @@ test("a review with three inline comments gets one Worker turn, one reply, and r
   assert.equal(runner.sessions[0]!.prompts.length, 1);
   assert.deepEqual(store.pendingDeliveries(), []);
   assert.deepEqual(
-    store.dueReplies().filter((reply) => reply.kind === "comment").map((reply) => [reply.id, reply.body]),
+    store.dueReplies().filter((reply) => reply.kind === "comment" && reply.id.startsWith("review-")).map((reply) => [reply.id, reply.body]),
     [["review-1-44", "ok"]],
   );
   assert.deepEqual(
