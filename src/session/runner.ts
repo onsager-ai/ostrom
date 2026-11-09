@@ -58,6 +58,8 @@ export function claudeRunner(env: Record<string, string | undefined>, run: Claud
           if (message.type === "result") {
             id = message.session_id;
             if (message.subtype !== "success" || message.is_error) throw new Error("Claude turn failed");
+            const models = Object.keys(message.modelUsage);
+            model = models.length === 1 ? models[0] ?? null : null;
             return { sessionId: id, text: message.result, status: "completed", model,
               usage: { inputTokens: message.usage.input_tokens, outputTokens: message.usage.output_tokens } };
           }
