@@ -407,6 +407,32 @@ test("migration 2 keeps the assignments a version 1 store already holds", () => 
   assert.equal(store.getAssignment(1).endReason, "never started");
 });
 
+test("migration 7 preserves deliveries and stalls referencing assignments", () => {
+  const db = new DatabaseSync(":memory:", { enableForeignKeyConstraints: true });
+  db.exec("CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL) STRICT");
+  for (let i = 0; i < 6; i++) {
+    db.exec(migrations[i]!);
+    db.prepare("INSERT INTO schema_version VALUES (?, 't')").run(i + 1);
+  }
+  db.exec(`
+    INSERT INTO source VALUES (1, 'github', 'o/r', NULL);
+    INSERT INTO thread VALUES (1, 1, 'issue', 1, 'u');
+    INSERT INTO "trigger" VALUES (1, 1, 'e', 1, 'issue_comment', 'a', 'u', 't', 't');
+    INSERT INTO decision VALUES (1, 1, 'accept', 'r', 't');
+    INSERT INTO ticket VALUES (1, 1, 'open', 't', NULL);
+    INSERT INTO subscription VALUES (1, 1, 't');
+    INSERT INTO assignment (id, ticket_id, state, t3_thread_id, created_at, started_at) VALUES (1, 1, 'running', 'thr', 't', 't');
+    INSERT INTO delivery VALUES (1, 1, 'run', 't');
+    INSERT INTO stall (id, assignment_id, semon_reason, detected_at) VALUES (1, 1, 'idle', 't');
+  `);
+  migrate(db);
+  assert.equal(db.prepare("SELECT assignment_id FROM delivery").get()?.["assignment_id"], 1);
+  assert.equal(db.prepare("SELECT assignment_id FROM stall").get()?.["assignment_id"], 1);
+  assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
+  assert.equal(db.prepare("PRAGMA foreign_keys").get()?.["foreign_keys"], 1);
+  db.close();
+});
+
 test("a delivery is recorded once, and only for a ticket subscribed to the trigger's thread", () => {
   const { store, source, issue, trigger, accept } = fixture();
   const ticketId = accept();
