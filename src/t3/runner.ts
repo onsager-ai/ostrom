@@ -29,7 +29,7 @@ export interface T3Exit {
 export type T3Runner = (invocation: T3Invocation) => Promise<T3Exit>;
 
 export class T3CommandError extends Error {
-  override readonly name = "T3CommandError";
+  override readonly name: string = "T3CommandError";
 }
 
 /**
