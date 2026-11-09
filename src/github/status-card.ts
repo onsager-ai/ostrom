@@ -36,7 +36,7 @@ export function renderStatusCard(card: StatusCard): string {
   lines.push(
     "",
     `Harness: \`${card.harness}\` · Model: \`${card.model}\``,
-    `Last activity: ${minutesAgo(card.lastActivityAt, card.now)} min ago`,
+    `Last activity: ${utcMinute(card.lastActivityAt)}`,
     "Controls: `@ostrom pause`, `@ostrom stop`, or reply to redirect.",
     "",
     replyMarker(card.markerId),
@@ -44,6 +44,7 @@ export function renderStatusCard(card: StatusCard): string {
   return `${lines.join("\n")}\n`;
 }
 
-function minutesAgo(lastActivityAt: Date, now: Date): number {
-  return Math.max(0, Math.floor((now.getTime() - lastActivityAt.getTime()) / 60_000));
+// An absolute time, because the card is edited only on events: "N min ago" would go stale.
+function utcMinute(at: Date): string {
+  return `${at.toISOString().slice(0, 16).replace("T", " ")} UTC`;
 }
