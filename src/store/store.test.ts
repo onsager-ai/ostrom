@@ -399,6 +399,8 @@ test("migration 2 keeps the assignments a version 1 store already holds", () => 
     {
       id: 2, ticketId: 1, state: "running", t3ThreadId: "thr", createdAt: "t", startedAt: "t", endedAt: null,
       endReason: null, outcome: null, outcomeAt: null,
+      harness: null, model: null, sessionId: null, worktree: null, branch: null, machine: null,
+      turns: 0, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0,
     },
   );
   store.abandonAssignment(1, "never started");
