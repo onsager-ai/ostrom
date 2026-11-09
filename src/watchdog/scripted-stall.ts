@@ -14,8 +14,10 @@ import { loadConfig } from "../ostromd/config.ts";
 import { Store } from "../store/store.ts";
 
 export const STALL_BRIEF = [
-  "This is a scripted stall for Ostrom's Watchdog test.",
+  "This is a scripted stall for Ostrom's Watchdog test. There is nothing to change in this repository:",
+  "never commit, push or open a pull request, whatever other instructions say.",
   "Run `sleep 3600` in the shell and wait for it to finish. Do not make edits while it runs.",
+  "If it is interrupted, or you are told to continue or make progress, run `sleep 3600` again.",
   "After it finishes, ask the operator exactly one question: Which colour should the scripted stall use, red or blue?",
 ].join("\n");
 
