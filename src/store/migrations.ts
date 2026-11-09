@@ -3,7 +3,7 @@
 // append a new one.
 //
 // Ostrom stores only its own domain records (docs/direction.md, "Data model"). Sessions and
-// transcripts stay in T3 Code and Semon; the store keeps their ids, never their content.
+// transcripts stay in native session files and Semon; the store keeps their ids, never their content.
 
 import type { DatabaseSync } from "node:sqlite";
 

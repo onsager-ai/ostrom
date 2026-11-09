@@ -333,7 +333,7 @@ test("an abandoned assignment is listed only while its ticket is open", () => {
   const { store, issue, accept } = fixture();
   const ticketId = accept();
   const assignmentId = store.createAssignment(ticketId);
-  store.abandonAssignment(assignmentId, "t3 down");
+  store.abandonAssignment(assignmentId, "runner unavailable");
   assert.deepEqual(store.abandonedAssignments().map((a) => a.id), [assignmentId]);
   store.enqueueOutcomeReply({ id: "outcome-a1-failed", threadId: issue, body: "failed" }, { assignmentId });
   assert.deepEqual(store.abandonedAssignments(), []);

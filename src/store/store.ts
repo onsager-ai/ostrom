@@ -9,7 +9,7 @@ export type ThreadKind = "issue" | "pull_request";
 export type Verdict = "accept" | "ignore" | "stop";
 export type TicketState = "open" | "ended";
 export type AssignmentState = "pending" | "running" | "ended";
-/** What the last observation of a running Worker's T3 thread found worth flagging. */
+/** What the last observation of a running Worker found worth flagging. */
 export type AssignmentOutcome = "waiting" | "failed" | "cancelled";
 
 export interface Source {
