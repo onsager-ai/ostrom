@@ -71,6 +71,7 @@ export function routeFollowUps(store: Store, workers: Workers): RoutePass {
         store.recordDelivery(trigger.id, assignmentId, turnId);
         enqueueReceivedReaction(store, trigger);
       },
+      undefined,
       "follow_up",
       String(trigger.id),
     );

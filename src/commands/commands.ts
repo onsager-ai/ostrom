@@ -134,6 +134,7 @@ export async function routeCommands(
             store.recordDelivery(pending.trigger.id, assignment.id, turnId);
             enqueueReaction(store, pending.trigger, "eyes");
           },
+          undefined,
           "follow_up",
           String(pending.trigger.id),
         );

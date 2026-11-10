@@ -122,7 +122,9 @@ export class Workers {
     kind: QueuedTurnKind = queuedTurnKind(key),
     sourcePointer?: string,
   ): boolean {
-    const added = this.#deps.store.enqueueTurn({ assignmentId, deliveryKey: key, kind, prompt, sourcePointer });
+    const added = this.#deps.store.enqueueTurn({
+      assignmentId, deliveryKey: key, kind, prompt, ...(sourcePointer === undefined ? {} : { sourcePointer }),
+    });
     if (added.duplicate) return false;
     this.#schedule(assignmentId, key, onStart, onComplete);
     return true;
