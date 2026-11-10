@@ -45,7 +45,7 @@ export async function readMergeEvidence(gh: GhRunner, repo: string, prNumber: nu
   const baseRef = string(base, "ref");
   const [repository, protection, rules] = await Promise.all([
     ghMergeGet(gh, `repos/${repo}`),
-    optionalGet(gh, `repos/${repo}/branches/${encodeURIComponent(baseRef)}/protection`),
+    optionalGet(gh, `repos/${repo}/branches/${encodeURIComponent(baseRef)}/protection`, true),
     optionalGet(gh, `repos/${repo}/rules/branches/${encodeURIComponent(baseRef)}`),
   ]);
 
@@ -131,9 +131,15 @@ export async function readMergeEvidence(gh: GhRunner, repo: string, prNumber: nu
   return { pr: decoded, rollup, threads, reviews, rest: { pull, repository: object(repository), protection, rules } };
 }
 
-async function optionalGet(gh: GhRunner, path: string): Promise<unknown> {
+async function optionalGet(gh: GhRunner, path: string, classicProtection = false): Promise<unknown> {
   try { return await ghMergeGet(gh, path); }
-  catch (error) { return { unavailable: error instanceof Error ? error.message : String(error) }; }
+  catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    // execGh retains gh's exact HTTP error message. Only this endpoint's explicit absence of
+    // classic protection is safe to normalize; Not Found can hide a permission denial.
+    if (classicProtection && message === "gh api failed: gh: Branch not protected (HTTP 404)") return {};
+    return { unavailable: message };
+  }
 }
 
 async function graphql(gh: GhRunner, variables: Record<string, string | number | undefined>): Promise<Json> {
