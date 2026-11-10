@@ -34,7 +34,10 @@ export async function mergePass(options: MergePassOptions): Promise<MergePassRes
       const evidence = await readMergeEvidence(options.gh, options.repo, attempt.prNumber);
       if (evidence.pr.state === "MERGED") {
         complete(options, candidate, evidence, attempt.id, attempt.state === "pending" ? "ostrom" : "unknown");
-        if (attempt.state === "pending") options.store.finishMergeAttempt(attempt.id, "confirmed", { sha: mergeSha(evidence) });
+        if (attempt.state === "pending") {
+          const sha = mergeSha(evidence);
+          options.store.finishMergeAttempt(attempt.id, "confirmed", sha === null ? {} : { sha });
+        }
         result.reconciled.push(attempt.id);
       } else {
         if (attempt.state === "pending") options.store.finishMergeAttempt(attempt.id, "unknown", { error: "merge response was not durably observed" });
