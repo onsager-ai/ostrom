@@ -409,6 +409,11 @@ export const migrations: readonly string[] = [
   ALTER TABLE stall_v21 RENAME TO stall;
   CREATE UNIQUE INDEX stall_open_episode ON stall (assignment_id) WHERE cleared_at IS NULL;
   `,
+
+  // 22: Recovery finds reviews delivered to an interrupted native turn and restores their reply.
+  `
+  CREATE INDEX delivery_by_assignment_turn ON delivery (assignment_id, turn_id);
+  `,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */
