@@ -6,7 +6,9 @@ import { basename, join } from "node:path";
 
 import { turnBudgetReached } from "../budget/budgets.ts";
 import { queueStatusCard } from "../github/cards.ts";
+import { ghGet, type GhRunner } from "../github/gh.ts";
 import { renderReviewReply } from "../github/review-reply.ts";
+import { parseStuckReply, renderStuckReply } from "../watchdog/stuck.ts";
 import type { WorkerConfig } from "../ostromd/config.ts";
 import { rolloutModel } from "../session/rollout.ts";
 import type { Runner, Session, TurnResult } from "../session/runner.ts";
@@ -28,6 +30,9 @@ export interface WorkersDeps {
   codexSessions?: string;
   addWorktree?: typeof createWorktree;
   log?: (line: string) => void;
+  /** GitHub access is needed only to restore stop cleanup after a daemon restart. */
+  gh?: GhRunner;
+  repo?: string;
 }
 
 /** The writable Git metadata for a linked worktree's ordinary commits. */
@@ -61,6 +66,11 @@ export class Workers {
   readonly #deps: WorkersDeps;
   readonly #sessions = new Map<number, Session>();
   readonly #chains = new Map<number, Promise<void>>();
+  /** Live callback source only; durable queued_turn rows remain the scheduling authority. */
+  readonly #callbacksByKey = new Map<string, {
+    onStart: ((turnId: string) => void) | undefined;
+    onComplete: ((result: TurnResult) => void | Promise<void>) | undefined;
+  }>();
   readonly #budgetPauses = new Set<number>();
   readonly #inFlight = new Map<number, AbortController>();
   #stopping = false;
@@ -126,8 +136,20 @@ export class Workers {
       assignmentId, deliveryKey: key, kind, prompt, ...(sourcePointer === undefined ? {} : { sourcePointer }),
     });
     if (added.duplicate) return false;
-    this.#schedule(assignmentId, key, onStart, onComplete);
+    this.#callbacksByKey.set(this.#callbackKey(assignmentId, key), { onStart, onComplete });
+    this.#schedule(assignmentId, key);
     return true;
+  }
+
+  /** Releases a merge reservation and wakes every queued turn on that assignment. */
+  release(assignmentId: number): void {
+    this.#deps.store.releaseAssignmentReservation(assignmentId);
+    this.#scheduleQueued(assignmentId);
+  }
+
+  /** Wakes queued work after an external state change such as resume. */
+  wake(assignmentId: number): void {
+    this.#scheduleQueued(assignmentId);
   }
 
   /** Cancels the turn currently running for an assignment, if any. */
@@ -177,28 +199,11 @@ export class Workers {
               body: renderReviewReply(result.text),
             });
           }
-        }, "recovery");
+        }, "recovery", turnId);
       }
-      for (const turn of store.unfinishedTurns(assignment.id)) this.#schedule(assignment.id, turn.deliveryKey);
+      this.#scheduleQueued(assignment.id);
     }
-    this.#recoverStopCleanups();
     return pass;
-  }
-
-  /** Finishes a durable stop cleanup if its original callback was lost on process restart. */
-  #recoverStopCleanups(): void {
-    const { store } = this.#deps;
-    for (const cleanup of store.completedStopCleanups()) {
-      store.endAssignment(cleanup.assignmentId, cleanup.issueClosed ? "issue closed" : "stopped by command");
-      store.endTicket(cleanup.ticketId);
-      store.enqueueReply({
-        id: cleanup.issueClosed ? `stopped-issue-closed-${cleanup.ticketId}` : `stopped-${cleanup.ticketId}`,
-        threadId: cleanup.threadId,
-        body: "The ticket was stopped after Ostrom restarted.",
-        blocking: true,
-      });
-      queueStatusCard(store, cleanup.ticketId);
-    }
   }
 
   /** Resolves when every queued and running turn has finished. */
@@ -220,22 +225,27 @@ export class Workers {
     return session;
   }
 
-  #schedule(
-    id: number,
-    key: string,
-    onStart?: (turnId: string) => void,
-    onComplete?: (result: TurnResult) => void | Promise<void>,
-  ): void {
-    const restored = onStart === undefined ? this.#callbacks(id, key) : { onStart, onComplete };
-    void this.#enqueue(id, () => this.#turn(id, key, restored.onStart, restored.onComplete));
+  #callbackKey(id: number, key: string): string {
+    return `${id}:${key}`;
   }
 
-  /** Rebuilds the deterministic side effects for a persisted follow-up after a daemon restart. */
-  #callbacks(id: number, key: string): { onStart?: (turnId: string) => void; onComplete?: (result: TurnResult) => void } {
+  #scheduleQueued(id: number): void {
+    for (const turn of this.#deps.store.unfinishedTurns(id)) {
+      if (turn.state === "queued") this.#schedule(id, turn.deliveryKey);
+    }
+  }
+
+  #schedule(id: number, key: string): void {
+    const callbacks = this.#callbacksByKey.get(this.#callbackKey(id, key)) ?? this.#callbacks(id, key);
+    void this.#enqueue(id, () => this.#turn(id, key, callbacks.onStart, callbacks.onComplete));
+  }
+
+  /** Rebuilds the deterministic side effects for a persisted turn after a daemon restart. */
+  #callbacks(id: number, key: string): { onStart?: (turnId: string) => void; onComplete?: (result: TurnResult) => void | Promise<void> } {
     const turn = this.#deps.store.queuedTurn(id, key);
-    if (turn === null || turn.sourcePointer === null) return {};
+    if (turn === null) return {};
     const store = this.#deps.store;
-    if (turn.kind === "follow_up") {
+    if (turn.kind === "follow_up" && turn.sourcePointer !== null) {
       const trigger = store.getTrigger(Number(turn.sourcePointer));
       return {
         onStart: (turnId) => {
@@ -246,7 +256,7 @@ export class Workers {
         },
       };
     }
-    if (turn.kind === "review") {
+    if (turn.kind === "review" && turn.sourcePointer !== null) {
       const triggers = turn.sourcePointer.split(",").map((value) => store.getTrigger(Number(value)));
       const review = triggers.find((trigger) => trigger.reviewId !== undefined)!;
       return {
@@ -263,7 +273,60 @@ export class Workers {
         },
       };
     }
+    if (turn.kind === "control") return this.#restoredControl(id, key);
+    if (turn.kind === "budget_pause") return { onComplete: () => queueStatusCard(store, store.getAssignment(id).ticketId) };
+    if (turn.kind === "stuck") return this.#restoredStuck(id, key);
+    if (turn.kind === "recovery" && turn.sourcePointer !== null) {
+      return {
+        onComplete: (result) => {
+          for (const review of store.reviewDeliveries(id, turn.sourcePointer!)) {
+            store.enqueueReply({ id: `review-${id}-${review.reviewId}`, threadId: review.threadId, body: renderReviewReply(result.text) });
+          }
+        },
+      };
+    }
     return {};
+  }
+
+  #restoredControl(id: number, key: string): { onComplete?: (result: TurnResult) => Promise<void> } {
+    if (!/^(operator-stop-|stop-|close-issue-)/.test(key)) return {};
+    const { store, gh, repo } = this.#deps;
+    return {
+      onComplete: async (result) => {
+        const assignment = store.getAssignment(id);
+        const issueClosed = key.startsWith("close-issue-");
+        if (gh !== undefined && repo !== undefined && assignment.branch !== null) {
+          for (const pr of await openPullRequests(gh, repo, assignment.branch)) await gh(["pr", "ready", "--undo", pr]);
+        }
+        store.endAssignment(id, issueClosed ? "issue closed" : "stopped by command");
+        store.endTicket(assignment.ticketId);
+        const replyId = issueClosed ? `stopped-issue-closed-${assignment.ticketId}` :
+          key.startsWith("operator-stop-") ? `operator-stopped-${assignment.ticketId}` : `stopped-${assignment.ticketId}`;
+        store.enqueueReply({
+          id: replyId,
+          threadId: store.ticketContext(assignment.ticketId).thread.id,
+          body: result.text,
+          blocking: true,
+        });
+        queueStatusCard(store, assignment.ticketId);
+      },
+    };
+  }
+
+  #restoredStuck(id: number, key: string): { onComplete?: (result: TurnResult) => void } {
+    if (!key.startsWith("stuck-public-")) return {};
+    const stallId = Number(key.slice("stuck-public-".length));
+    const store = this.#deps.store;
+    const assignment = store.getAssignment(id);
+    return {
+      onComplete: (turn) => {
+        const stall = store.getStall(stallId);
+        const cause = stall.cause ?? stall.semonReason ?? "unknown";
+        const reply = renderStuckReply(parseStuckReply(turn.text, cause));
+        store.enqueueReply({ id: `stuck-${stall.id}`, threadId: store.ticketContext(assignment.ticketId).thread.id, body: reply, blocking: true });
+        queueStatusCard(store, assignment.ticketId);
+      },
+    };
   }
 
   #enqueue(id: number, job: () => Promise<void>): Promise<void> {
@@ -312,13 +375,16 @@ export class Workers {
     if (queued === null || queued.state !== "queued" || this.#stopping || assignment.state !== "running") return;
     const ticket = store.getTicket(assignment.ticketId);
     if (ticket.state === "paused" && !RUNS_WHILE_PAUSED.some((prefix) => key.startsWith(prefix))) return;
+    // No await separates this check from starting the native turn, so a held reservation never
+    // increments the ticket's turn budget.
+    if (store.reservationHeld(id)) return;
+    if (store.queuedTurn(id, key)?.state !== "queued") return;
     const session = this.#session(assignment);
+    const nextTurn = assignment.turns + 1;
+    const turnId = `${assignment.sessionId}:${nextTurn}`;
+    if (store.beginQueuedTurn(id, key, turnId) === null) return;
     const turn = store.beginTurn(id);
-    const turnId = `${assignment.sessionId}:${turn}`;
-    if (store.beginQueuedTurn(id, key, turnId) === null) {
-      store.endTurn(id, null);
-      return;
-    }
+    if (turn !== nextTurn) throw new Error(`assignment ${id}: queued turn number changed`);
     onStart?.(turnId);
     const controller = new AbortController();
     this.#inFlight.set(id, controller);
@@ -342,9 +408,7 @@ export class Workers {
     store.finishQueuedTurn(id, key);
     this.#finished(id, result);
     if (result.status === "completed") await onComplete?.(result);
-    for (const next of store.unfinishedTurns(id)) {
-      if (next.deliveryKey !== key && next.state === "queued") this.#schedule(id, next.deliveryKey);
-    }
+    this.#callbacksByKey.delete(this.#callbackKey(id, key));
   }
 
   #failed(id: number, error: unknown): void {
@@ -408,4 +472,15 @@ export class Workers {
     }
     return model === assignment.model ? null : `model mismatch: asked for ${assignment.model}, ran ${model}`;
   }
+}
+
+async function openPullRequests(gh: GhRunner, repo: string, branch: string): Promise<string[]> {
+  const owner = repo.split("/")[0]!;
+  const response = await ghGet(gh, `repos/${repo}/pulls?head=${encodeURIComponent(`${owner}:${branch}`)}&state=open&per_page=100`);
+  if (!Array.isArray(response)) throw new Error("expected open pull requests");
+  return response.map((value) => {
+    const url = (value as { html_url?: unknown }).html_url;
+    if (typeof url !== "string") throw new Error("open pull request has no URL");
+    return url;
+  });
 }

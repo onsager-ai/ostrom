@@ -1035,6 +1035,10 @@ export class Store {
     });
   }
 
+  reservationHeld(assignmentId: number): boolean {
+    return this.#get("SELECT 1 FROM assignment_reservation WHERE assignment_id = ?", assignmentId) !== undefined;
+  }
+
   releaseAssignmentReservation(assignmentId: number): void {
     this.#run("DELETE FROM assignment_reservation WHERE assignment_id = ?", assignmentId);
   }

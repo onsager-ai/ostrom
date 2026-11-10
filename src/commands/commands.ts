@@ -33,6 +33,7 @@ export function operatorControls(store: Store, workers: Workers, gh: GhRunner, r
       const assignment = running(ticketId);
       store.resumeTicket(ticketId);
       queueStatusCard(store, ticketId);
+      workers.wake(assignment.id);
       workers.deliver(assignment.id, `operator-resume-${ticketId}`, "This ticket has resumed. Continue your work.", () => {});
     },
     async stop(ticketId) {
@@ -157,6 +158,7 @@ export async function routeCommands(
         const assignment = store.latestAssignment(pending.ticketId);
         if (assignment?.state !== "running") throw new Error(`ticket ${pending.ticketId} has no running Worker`);
         store.resumeTicket(pending.ticketId);
+        workers.wake(assignment.id);
         workers.deliver(assignment.id, `resume-${pending.trigger.id}-${assignment.id}`, "This ticket has resumed. Continue your work.", () => {});
         store.recordCommandReceipt(pending.trigger.id, pending.ticketId, "resume", true);
         enqueueReaction(store, pending.trigger, "+1");

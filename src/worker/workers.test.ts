@@ -205,16 +205,17 @@ test("a queued turn survives a restart and runs exactly once", async () => {
   assert.equal(resumed.prompts.filter((prompt) => prompt === "next").length, 1);
 });
 
-test("a reservation blocks a new queued turn until released", async () => {
+test("a reservation blocks a new queued turn without consuming budget and release wakes it", async () => {
   const { store, runner, ticketId, workers } = fixture();
   await workers.dispatch(ticketId);
   await workers.drain();
+  const turns = store.getAssignment(1).turns;
   assert.equal(store.reserveAssignment(1), true);
   workers.deliver(1, "held", "wait", () => {});
   await workers.drain();
   assert.equal(runner.sessions[0]!.prompts.includes("wait"), false);
-  store.releaseAssignmentReservation(1);
-  workers.deliver(1, "wake", "wake", () => {});
+  assert.equal(store.getAssignment(1).turns, turns);
+  workers.release(1);
   await workers.drain();
   assert.equal(runner.sessions[0]!.prompts.includes("wait"), true);
   assert.equal(store.assignmentWorkIdle(1), true);

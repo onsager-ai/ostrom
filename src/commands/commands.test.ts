@@ -157,6 +157,18 @@ test("a paused ticket can still be stopped: by command, by closing the issue, or
   }
 });
 
+test("a reserved stop wakes on release and completes its cleanup", async () => {
+  const { store, github, workers, ticketId, assignmentId } = fixture();
+  assert.equal(store.reserveAssignment(assignmentId), true);
+  await operatorControls(store, workers, github.gh, REPO).stop(ticketId);
+  await workers.drain();
+  assert.equal(store.getTicket(ticketId).state, "open");
+  workers.release(assignmentId);
+  await workers.drain();
+  assert.equal(store.getTicket(ticketId).state, "ended");
+  assert.ok(store.dueReplies().some((reply) => reply.id === `operator-stopped-${ticketId}`));
+});
+
 test("a stop request survives resume and is recorded before cleanup", async () => {
   const { store, github, runner, workers, ticketId } = fixture();
   runner.hold = true;
@@ -166,6 +178,25 @@ test("a stop request survives resume and is recorded before cleanup", async () =
   store.pauseTicket(ticketId);
   store.resumeTicket(ticketId);
   assert.notEqual(store.getTicket(ticketId).stopRequestedAt, null);
+});
+
+test("a queued stop completes once after restart", async () => {
+  const { store, github, runner, workers, ticketId, assignmentId } = fixture();
+  assert.equal(store.reserveAssignment(assignmentId), true);
+  await operatorControls(store, workers, github.gh, REPO).stop(ticketId);
+  workers.stop();
+  await workers.drain();
+  store.releaseAssignmentReservation(assignmentId);
+  runner.hold = false;
+  const restarted = new Workers({
+    store,
+    config: { repo: "/repo", base: "main", worktrees: "/wt", harness: "codex", model: "gpt-6-luna", machine: "host" },
+    runners: { claude: runner, codex: runner }, gh: github.gh, repo: REPO,
+  });
+  restarted.recover();
+  await restarted.drain();
+  assert.equal(store.getTicket(ticketId).state, "ended");
+  assert.equal(store.dueReplies().filter((reply) => reply.id === `operator-stopped-${ticketId}`).length, 1);
 });
 
 test("a merged PR leaves the attempt to the Router's outcome; a PR closed unmerged ends it", async () => {
