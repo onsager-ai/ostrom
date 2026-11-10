@@ -109,6 +109,7 @@ async function postCommentBatch(replies: readonly Reply[], options: SendOptions,
     const posted = JSON.parse(await gh(["api", "--method", "POST", `repos/${repo}/issues/${number}/comments`, "-f", `body=${body}`])) as { id?: unknown };
     for (const reply of remaining) {
       store.markReplySent(reply.id);
+      store.markReadyReplySent(reply.id);
       if (isStatusCard(reply)) {
         if (typeof posted.id !== "number") throw new Error("GitHub did not return the status card comment id");
         store.setStatusCardCommentId(reply.threadId, posted.id);

@@ -10,4 +10,4 @@ Harness: `codex` · Model: `gpt-6-luna`
 Last activity: 2026-11-09 12:13 UTC
 Controls: `@ostrom pause`, `@ostrom resume`, `@ostrom stop`, or reply to redirect.
 
-<!-- ostrom:card-thread-7 -->
+<!-- ostrom:reply id=card-thread-7 -->
