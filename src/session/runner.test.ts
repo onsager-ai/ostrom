@@ -2,7 +2,7 @@ import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { Codex, ThreadEvent } from "@openai/codex-sdk";
-import { claudeRunner, codexRunner } from "./runner.ts";
+import { claudeRunner, codexRunner, codexWorkerConfigOverrides } from "./runner.ts";
 import { sessionConfig } from "./config.ts";
 
 test("Claude resumes the same session with the explicit model", async () => {
@@ -20,6 +20,13 @@ test("Claude resumes the same session with the explicit model", async () => {
   assert.deepEqual(calls, [{ model: "haiku", permissionMode: "bypassPermissions", allowDangerouslySkipPermissions: true }, { model: "haiku", resume: "session", permissionMode: "bypassPermissions", allowDangerouslySkipPermissions: true }]);
 });
 
+test("Codex worker profile explicitly grants only commit metadata paths", () => {
+  assert.deepEqual(codexWorkerConfigOverrides("/worktree", ["/repo/.git/objects", "/repo/.git/refs", "/repo/.git/logs", "/repo/.git/worktrees/ticket"]), [
+    'default_permissions="ostrom_worker"',
+    'permissions.ostrom_worker={filesystem={"/"="read","/worktree"="write","/repo/.git/objects"="write","/repo/.git/refs"="write","/repo/.git/logs"="write","/repo/.git/worktrees/ticket"="write"},network={enabled=true}}',
+  ]);
+});
+
 test("Codex returns an unverified model and forwards resume options", async () => {
   const events: ThreadEvent[] = [
     { type: "thread.started", thread_id: "id" },
@@ -33,7 +40,7 @@ test("Codex returns an unverified model and forwards resume options", async () =
   const result = await session.send("hello");
   assert.equal(result.model, null);
   assert.deepEqual(result.usage, { inputTokens: 1, cachedInputTokens: 3, outputTokens: 2 });
-  assert.deepEqual(seen, { id: "id", options: { workingDirectory: "/tmp", model: "luna", sandboxMode: "workspace-write", networkAccessEnabled: true, approvalPolicy: "never", additionalDirectories: ["/repo/.git"] } });
+  assert.deepEqual(seen, { id: "id", options: { workingDirectory: "/tmp", model: "luna", sandboxMode: "workspace-write", networkAccessEnabled: true, approvalPolicy: "never" } });
 });
 
 test("read-only Router sessions deny Claude edits and use Codex read-only sandbox", async () => {
