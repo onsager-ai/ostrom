@@ -507,6 +507,13 @@ export const migrations: readonly string[] = [
     PRIMARY KEY (repository, pr_number)
   ) STRICT;
   `,
+
+  // 26: Preserve send identity, positive HTTP acknowledgement and narrow reconciliation evidence.
+  `
+  ALTER TABLE merge_attempt ADD COLUMN actor_id INTEGER;
+  ALTER TABLE pr_merge ADD COLUMN merged_by_id INTEGER;
+  ALTER TABLE pr_merge ADD COLUMN evidence TEXT;
+  `,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */

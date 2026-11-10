@@ -341,7 +341,8 @@ test("each outcome gets one reply, and a merged PR ends the assignment and the t
   assert.equal((await routeCandidates(s.options())).router, null);
   assert.equal(turns(), 3);
   const outcomeReplies = s.store().dueReplies().filter((reply) => reply.id.startsWith("outcome-"));
-  assert.deepEqual(outcomeReplies.map((reply) => reply.body).sort(), ["Update: pr_merged", "Update: pr_opened"]);
+  assert.equal(outcomeReplies.find((reply) => reply.id.endsWith("-merged"))!.body, "Update: pr_merged");
+  assert.match(outcomeReplies.find((reply) => reply.id.endsWith("-opened"))!.body, /^Update: pr_opened\n\nOstrom will squash-merge automatically/);
   const card = s.store().dueReplies().filter((reply) => reply.id.startsWith("card-thread-")).at(-1)!;
   assert.match(card.body, /^## Ostrom: Done$/m);
 });

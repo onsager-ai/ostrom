@@ -270,6 +270,7 @@ export interface MergeAttempt {
   attemptNumber: number;
   method: "squash";
   requestedAt: string;
+  actorId: number;
   responseSha: string | null;
   error: string | null;
   nextRetryAt: string | null;
@@ -1006,7 +1007,8 @@ export class Store {
   /** Atomically claims a queued prompt once a runner is about to begin it. A reservation wins. */
   beginQueuedTurn(assignmentId: number, deliveryKey: string, turnId: string): QueuedTurn | null {
     return this.#transaction(() => {
-      if (this.#get("SELECT 1 FROM assignment_reservation WHERE assignment_id = ?", assignmentId) !== undefined) return null;
+      if (this.#get("SELECT 1 FROM assignment_reservation WHERE assignment_id = ?", assignmentId) !== undefined ||
+          this.#get("SELECT 1 FROM merge_attempt JOIN merge_candidate ON merge_candidate.id = merge_attempt.candidate_id WHERE merge_candidate.assignment_id = ? AND merge_attempt.state IN ('pending', 'unknown')", assignmentId) !== undefined) return null;
       const row = this.#get(
         `UPDATE queued_turn SET state = 'running', turn_id = ?, started_at = ?
          WHERE assignment_id = ? AND delivery_key = ? AND state = 'queued' RETURNING *`,
@@ -1035,11 +1037,12 @@ export class Store {
   }
 
   /** True only when no durable/in-flight local work or undispatched receipts remain. */
-  assignmentWorkIdle(assignmentId: number): boolean {
+  assignmentWorkIdle(assignmentId: number, ignoreReservation = false): boolean {
     const row = this.#get(
       `SELECT (SELECT turn_started_at FROM assignment WHERE id = ?) IS NULL
           AND NOT EXISTS (SELECT 1 FROM queued_turn WHERE assignment_id = ? AND state <> 'finished')
-          AND NOT EXISTS (SELECT 1 FROM assignment_reservation WHERE assignment_id = ?)
+          AND (? OR NOT EXISTS (SELECT 1 FROM assignment_reservation WHERE assignment_id = ?))
+          AND NOT EXISTS (SELECT 1 FROM merge_attempt WHERE candidate_id IN (SELECT id FROM merge_candidate WHERE assignment_id = ?) AND state IN ('pending', 'unknown'))
           AND NOT EXISTS (
             SELECT 1 FROM "trigger" AS t JOIN subscription ON subscription.thread_id = t.thread_id
             JOIN ticket ON ticket.id = subscription.ticket_id
@@ -1049,7 +1052,7 @@ export class Store {
               AND NOT EXISTS (SELECT 1 FROM delivery WHERE delivery.trigger_id = t.id)
               AND NOT EXISTS (SELECT 1 FROM command_receipt WHERE command_receipt.trigger_id = t.id AND command_receipt.ticket_id = ticket.id)
           ) AS idle`,
-      assignmentId, assignmentId, assignmentId, assignmentId,
+      assignmentId, assignmentId, ignoreReservation ? 1 : 0, assignmentId, assignmentId, assignmentId,
     );
     if (row === undefined) throw new Error(`no assignment ${assignmentId}`);
     return row["idle"] === 1;
@@ -1096,6 +1099,11 @@ export class Store {
       "INSERT INTO ready_reply (assignment_id, reply_id) VALUES (?, ?) ON CONFLICT (assignment_id) DO NOTHING",
       assignmentId, replyId,
     );
+  }
+
+  readyReplyId(assignmentId: number): string | null {
+    const row = this.#get("SELECT reply_id FROM ready_reply WHERE assignment_id = ?", assignmentId);
+    return row === undefined ? null : row["reply_id"] as string;
   }
 
   readyReplySentAt(assignmentId: number): string | null {
@@ -1163,16 +1171,20 @@ export class Store {
     ).map(toMergeAttempt);
   }
 
-  createMergeAttempt(candidate: MergeCandidate): MergeAttempt {
+  mergeAttempts(repository: string, prNumber: number): MergeAttempt[] {
+    return this.#all("SELECT * FROM merge_attempt WHERE repository = ? AND pr_number = ? ORDER BY id", repository, prNumber).map(toMergeAttempt);
+  }
+
+  createMergeAttempt(candidate: MergeCandidate, actorId: number): MergeAttempt {
     return this.#transaction(() => {
       const number = this.#get(
         "SELECT COALESCE(MAX(attempt_number), 0) + 1 AS number FROM merge_attempt WHERE repository = ? AND pr_number = ?",
         candidate.repository, candidate.prNumber,
       )!["number"] as number;
       const row = this.#get(
-        `INSERT INTO merge_attempt (candidate_id, repository, pr_number, head_sha, attempt_number, method, requested_at, state)
-         VALUES (?, ?, ?, ?, ?, 'squash', ?, 'pending') RETURNING *`,
-        candidate.id, candidate.repository, candidate.prNumber, candidate.headSha, number, this.#stamp(),
+        `INSERT INTO merge_attempt (candidate_id, repository, pr_number, head_sha, attempt_number, method, requested_at, actor_id, state)
+         VALUES (?, ?, ?, ?, ?, 'squash', ?, ?, 'pending') RETURNING *`,
+        candidate.id, candidate.repository, candidate.prNumber, candidate.headSha, number, this.#stamp(), actorId,
       )!;
       return toMergeAttempt(row);
     });
@@ -1194,9 +1206,12 @@ export class Store {
     return row?.["next_retry_at"] as string | null;
   }
 
-  prMerge(repository: string, prNumber: number): { origin: "ostrom" | "external" | "unknown"; mergedByLogin: string | null } | null {
-    const row = this.#get("SELECT origin, merged_by_login FROM pr_merge WHERE repository = ? AND pr_number = ?", repository, prNumber);
-    return row === undefined ? null : { origin: row["origin"] as "ostrom" | "external" | "unknown", mergedByLogin: row["merged_by_login"] as string | null };
+  prMerge(repository: string, prNumber: number): { origin: "ostrom" | "external" | "unknown"; mergedByLogin: string | null; mergedById: number | null; mergeSha: string; mergedAt: string } | null {
+    const row = this.#get("SELECT * FROM pr_merge WHERE repository = ? AND pr_number = ?", repository, prNumber);
+    return row === undefined ? null : {
+      origin: row["origin"] as "ostrom" | "external" | "unknown", mergedByLogin: row["merged_by_login"] as string | null,
+      mergedById: row["merged_by_id"] as number | null, mergeSha: row["merge_sha"] as string, mergedAt: row["merged_at"] as string,
+    };
   }
 
   ticketActivityAt(ticketId: number): string | null {
@@ -1212,16 +1227,19 @@ export class Store {
 
   recordMergeAndOutcome(input: {
     repository: string; prNumber: number; headSha: string; mergeSha: string | null; mergedAt: Date;
-    mergedByLogin: string | null; origin: "ostrom" | "external" | "unknown"; attemptId?: number;
-    assignmentId: number; threadId: number; body: string;
+    mergedByLogin: string | null; mergedById: number | null; origin: "ostrom" | "external" | "unknown"; attemptId?: number;
+    assignmentId: number; threadId: number; body: string; evidence: string;
   }): { duplicate: boolean; ticketEnded: boolean } {
     return this.#transaction(() => {
       this.#run(
-        `INSERT INTO pr_merge (repository, pr_number, head_sha, merge_sha, merged_at, merged_by_login, origin, attempt_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (repository, pr_number) DO NOTHING`,
+        `INSERT INTO pr_merge (repository, pr_number, head_sha, merge_sha, merged_at, merged_by_login, merged_by_id, origin, attempt_id, evidence)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (repository, pr_number) DO NOTHING`,
         input.repository, input.prNumber, input.headSha, input.mergeSha, input.mergedAt.toISOString(), input.mergedByLogin,
-        input.origin, input.attemptId ?? null,
+        input.mergedById, input.origin, input.attemptId ?? null, input.evidence,
       );
+      if (input.attemptId !== undefined) this.finishMergeAttempt(input.attemptId, "confirmed", input.mergeSha === null ? {} : { sha: input.mergeSha });
+      this.#run("UPDATE queued_turn SET state = 'finished', finished_at = ? WHERE assignment_id = ? AND state <> 'finished'", this.#stamp(), input.assignmentId);
+      this.releaseAssignmentReservation(input.assignmentId);
       const { duplicate } = this.#insertReply({
         id: `outcome-a${input.assignmentId}-pr${input.prNumber}-merged`, threadId: input.threadId, body: input.body,
       });
@@ -1476,6 +1494,13 @@ export class Store {
     return { duplicate: false };
   }
 
+  /** The latest stored card body, including an already delivered card. */
+  statusCardBody(threadId: number): string | null {
+    const id = `card-thread-${threadId}`;
+    const row = this.#get("SELECT body FROM outbox WHERE id = ? OR id LIKE ? ORDER BY enqueued_at DESC, id DESC LIMIT 1", id, `${id}-%`);
+    return row === undefined ? null : row["body"] as string;
+  }
+
   /** Coalesces an unsent card update so only the latest state is delivered. */
   enqueueStatusCard(threadId: number, body: string): void {
     const thread = this.getThread(threadId);
@@ -1483,7 +1508,7 @@ export class Store {
     const kind: OutboxKind = thread.statusCardCommentId === null ? "comment" : "edit";
     const target = thread.statusCardCommentId === null ? null : String(thread.statusCardCommentId);
     const existing = this.#get(
-      "SELECT id, sent_at FROM outbox WHERE id = ? OR (id LIKE ? AND sent_at IS NULL) ORDER BY id DESC LIMIT 1",
+      "SELECT id, sent_at, body FROM outbox WHERE id = ? OR id LIKE ? ORDER BY enqueued_at DESC, id DESC LIMIT 1",
       id,
       `${id}-%`,
     );
@@ -1491,6 +1516,7 @@ export class Store {
       this.#insertReply({ id, threadId, body, kind, ...(target === null ? {} : { target }) });
       return;
     }
+    if (existing["body"] === body) return;
     if (existing["sent_at"] !== null) {
       this.#insertReply({ id: `${id}-${this.#stamp()}`, threadId, body, kind, ...(target === null ? {} : { target }) });
       return;
@@ -1653,7 +1679,7 @@ function toMergeAttempt(row: Row): MergeAttempt {
     id: row["id"] as number, candidateId: row["candidate_id"] as number,
     repository: row["repository"] as string, prNumber: row["pr_number"] as number,
     headSha: row["head_sha"] as string, attemptNumber: row["attempt_number"] as number,
-    method: row["method"] as "squash", requestedAt: row["requested_at"] as string,
+    method: row["method"] as "squash", requestedAt: row["requested_at"] as string, actorId: row["actor_id"] as number,
     responseSha: row["response_sha"] as string | null, error: row["error"] as string | null,
     nextRetryAt: row["next_retry_at"] as string | null, state: row["state"] as MergeAttemptState,
   };

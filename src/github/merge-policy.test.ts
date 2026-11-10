@@ -9,8 +9,8 @@ const review = (id: string, state: string, commitOid = "head", author = "alice")
 function evidence(): MergeEvidence {
   return {
     pr: { number: 1, state: "OPEN", draft: false, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", authorLogin: "author", head: { ref: "b", sha: "head", repository: "o/r" }, base: { ref: "main", sha: "base", repository: "o/r" } },
-    rollup: { oid: "head", state: "SUCCESS", contexts: [], associatedPrNumbers: [1], suites: [{ status: "COMPLETED", conclusion: "SUCCESS", workflowRun: { event: "pull_request" } }] },
-    threads: [], reviews: [], rest: { pull: {}, repository: { allow_squash_merge: true }, protection: {}, rules: {} },
+    rollup: { oid: "head", state: "SUCCESS", contexts: [{ __typename: "CheckRun", databaseId: 10, name: "check", status: "COMPLETED", conclusion: "SUCCESS", checkSuite: { databaseId: 1, app: { databaseId: 15368 } } }], associatedPrNumbers: [1], suites: [{ databaseId: 1, status: "COMPLETED", conclusion: "SUCCESS", workflowRun: { event: "pull_request", runAttempt: 1, workflow: { databaseId: 1 } } }] },
+    threads: [], reviews: [], rest: { pull: {}, repository: { allow_squash_merge: true }, protection: {}, rules: [] },
   };
 }
 function input(): EligibilityInput {
@@ -40,10 +40,9 @@ test("eligibility reports every blocker in design order", () => {
     ["pull request head is from a fork", (v) => { v.evidence.pr.head.repository = "fork/r"; }],
     ["CI rollup is not successful for the captured head", (v) => { v.evidence.rollup!.state = "FAILURE"; }],
     ["no successful pull_request workflow is evidenced for this PR", (v) => { v.evidence.rollup!.suites = []; }],
-    ["a check suite is not complete", (v) => { v.evidence.rollup!.suites = [
-      { status: "COMPLETED", conclusion: "SUCCESS", workflowRun: { event: "pull_request" } },
-      { status: "QUEUED", conclusion: null, workflowRun: { event: "pull_request" } },
-    ]; }],
+    ["a check suite is not complete", (v) => { v.evidence.rollup!.suites.push(
+      { databaseId: 2, status: "QUEUED", conclusion: null, workflowRun: { event: "pull_request", runAttempt: 1, workflow: { databaseId: 2 } } },
+    ); }],
     ["branch requirements cannot be established", (v) => { v.evidence.rest.protection = { unavailable: "403" }; }],
     ["review requirements are not satisfied", (v) => { v.evidence.threads = [{ id: "t", resolved: false }]; }],
     ["quiet period has not elapsed", (v) => { v.local.readyReplySent = false; }],
@@ -51,10 +50,7 @@ test("eligibility reports every blocker in design order", () => {
   for (const [reason, change] of cases) { const value = input(); change(value); assert.deepEqual(mergeEligibility(value), { eligible: false, reason }); }
   assert.deepEqual(mergeEligibility(input()), { eligible: true });
   const fixtureSuites = input();
-  fixtureSuites.evidence.rollup!.suites = [
-    { status: "QUEUED", conclusion: null, workflowRun: null },
-    { status: "COMPLETED", conclusion: "SUCCESS", workflowRun: { event: "pull_request" } },
-  ];
+  fixtureSuites.evidence.rollup!.suites.push({ databaseId: 2, status: "QUEUED", conclusion: null, workflowRun: null });
   assert.deepEqual(mergeEligibility(fixtureSuites), { eligible: true });
 });
 

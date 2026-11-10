@@ -76,6 +76,7 @@ export interface MainDeps {
    * write to the store the pass handed them, after the pass itself has returned.
    */
   store?: Store;
+  mergeAllowed?: boolean;
 }
 
 function sleep(ms: number, stop: AbortSignal): Promise<void> {
@@ -125,7 +126,7 @@ async function tick(deps: MainDeps): Promise<number> {
   const shared = { ...deps, workers: deps.workers ?? owned!.workers, store: deps.store ?? owned!.store };
   try {
     for (const step of TICK) {
-      const code = await main(["dev", step], shared);
+      const code = await main(["dev", step], { ...shared, mergeAllowed: failed.length === 0 });
       if (code !== 0) failed.push(`${step} (exit ${code})`);
     }
   } finally {
@@ -311,7 +312,15 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
       return pass.failed.length === 0 ? 0 : 1;
     }
     if (command === "merge") {
-      const pass = await mergePass({ store, workers: workers(), gh: deps.gh, repo: config.repo, policy: config.mergePolicy });
+      const pass = await mergePass({ store, workers: workers(), gh: deps.gh, repo: config.repo, policy: config.mergePolicy,
+        base: loadWorkerConfig(deps.env).base, allowSend: deps.mergeAllowed ?? true,
+        refreshBeforeSend: async () => {
+          // The final evidence read follows fresh intake and controls. Any failure suppresses HTTP.
+          await pollOnce({ store: openStore, gh: deps.gh, repo: config.repo, allowlist: config.allowlist });
+          const controls = await routeCommands(openStore, workers(), deps.gh, config.repo);
+          if (controls.failed.length > 0) throw new Error("final controls failed");
+        },
+      });
       for (const assignmentId of pass.merged) deps.stdout(JSON.stringify({ assignmentId, merged: true }));
       for (const waiting of pass.waiting) deps.stdout(JSON.stringify({ ...waiting, merged: false }));
       for (const failure of pass.failed) deps.stderr(`ostromd merge: assignment ${failure.assignmentId} failed: ${failure.error}`);
@@ -328,6 +337,7 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
         router,
         runners: deps.runners ?? realRunners(deps.env),
         budget: loadBudgetDefaults(deps.env),
+        mergePolicy: config.mergePolicy,
       });
       if (pass.router !== null) deps.stdout(JSON.stringify({ type: "router", ...pass.router }));
       for (const decision of pass.decisions) deps.stdout(JSON.stringify({ type: "decision", ...decision }));

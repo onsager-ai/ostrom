@@ -16,6 +16,7 @@ import { DEFAULT_BUDGET, type BudgetDefaults } from "../budget/budgets.ts";
 import { join } from "node:path";
 
 import { queueStatusCard } from "../github/cards.ts";
+import { readyPolicySentence, type MergePolicy } from "../github/merge-policy.ts";
 import { ghGet, type GhRunner } from "../github/gh.ts";
 import type { RouterConfig } from "../ostromd/config.ts";
 import type { Runner } from "../session/runner.ts";
@@ -149,6 +150,7 @@ export interface RouteOptions {
   router: RouterConfig;
   runners: Record<"claude" | "codex", Runner>;
   budget?: BudgetDefaults;
+  mergePolicy?: MergePolicy;
 }
 
 /**
@@ -188,7 +190,7 @@ export async function routeCandidates(options: RouteOptions): Promise<RoutePassR
   for (const { key, reply } of answer.outcomes) {
     const outcome = outcomes.get(key)!;
     const { ticketEnded } = store.enqueueOutcomeReply(
-      { id: key, threadId: outcome.thread, body: reply },
+      { id: key, threadId: outcome.thread, body: outcome.event === "pr_opened" ? `${reply}\n\n${readyPolicySentence(options.mergePolicy ?? { strategy: "unattended" })}` : reply },
       outcome.terminal ? { assignmentId: outcome.assignmentId } : undefined,
     );
     if (outcome.event === "pr_opened") store.trackReadyReply(outcome.assignmentId, key);

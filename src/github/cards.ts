@@ -32,7 +32,7 @@ export function queueStatusCard(store: Store, ticketId: number, now = new Date()
       ...(pullRequest === null ? {} : { pullRequest: pullRequest.url }),
       ...(warning === null ? {} : { budgetWarning: warning }),
       ...(ticket.pauseCause === null ? {} : { pauseCause: ticket.pauseCause }),
-      ...(candidate === null ? {} : { mergeStatus: candidate.blockingReason ?? (candidate.quietDeadline === null ? "waiting for ready reply" : `earliest merge ${candidate.quietDeadline}`) }),
+      ...(candidate === null ? {} : { mergeStatus: `policy ${policy!.strategy}; head ${candidate.headSha}; ${candidate.blockingReason === "quiet period has not elapsed" && candidate.quietDeadline !== null ? `earliest merge ${candidate.quietDeadline}` : candidate.blockingReason ?? "waiting for ready reply"}` }),
       harness: assignment.harness,
       model: assignment.model,
       lastActivityAt,
