@@ -1,0 +1,109 @@
+{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "number": 8,
+        "state": "CLOSED",
+        "isDraft": true,
+        "mergeable": "MERGEABLE",
+        "mergeStateStatus": "CLEAN",
+        "reviewDecision": null,
+        "headRefName": "ostrom/ticket-7-7",
+        "headRefOid": "fd2d929802c33741c934f5c2acd7c9fc7008e235",
+        "baseRefName": "main",
+        "baseRefOid": "c07944528911f306a9d81d46a9eec784d706d764",
+        "reviewThreads": {
+          "nodes": [],
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          }
+        },
+        "reviews": {
+          "nodes": [],
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          }
+        },
+        "commits": {
+          "nodes": [
+            {
+              "commit": {
+                "oid": "fd2d929802c33741c934f5c2acd7c9fc7008e235",
+                "associatedPullRequests": {
+                  "nodes": [],
+                  "pageInfo": {
+                    "hasNextPage": false,
+                    "endCursor": null
+                  }
+                },
+                "statusCheckRollup": {
+                  "state": "SUCCESS",
+                  "contexts": {
+                    "nodes": [
+                      {
+                        "__typename": "CheckRun",
+                        "databaseId": 129312754022,
+                        "name": "test",
+                        "status": "COMPLETED",
+                        "conclusion": "SUCCESS",
+                        "checkSuite": {
+                          "databaseId": 115545444908,
+                          "status": "COMPLETED",
+                          "conclusion": "SUCCESS",
+                          "app": {
+                            "databaseId": 15368,
+                            "slug": "github-actions",
+                            "name": "GitHub Actions"
+                          }
+                        }
+                      }
+                    ],
+                    "pageInfo": {
+                      "hasNextPage": false,
+                      "endCursor": "MQ"
+                    }
+                  }
+                },
+                "checkSuites": {
+                  "nodes": [
+                    {
+                      "databaseId": 115545307799,
+                      "status": "QUEUED",
+                      "conclusion": null,
+                      "workflowRun": null
+                    },
+                    {
+                      "databaseId": 115545308784,
+                      "status": "QUEUED",
+                      "conclusion": null,
+                      "workflowRun": null
+                    },
+                    {
+                      "databaseId": 115545444908,
+                      "status": "COMPLETED",
+                      "conclusion": "SUCCESS",
+                      "workflowRun": {
+                        "event": "pull_request",
+                        "runAttempt": 1,
+                        "workflow": {
+                          "databaseId": 411827462,
+                          "name": "ci"
+                        }
+                      }
+                    }
+                  ],
+                  "pageInfo": {
+                    "hasNextPage": false,
+                    "endCursor": "Y3Vyc29yOnYyOpHPAAAAGucLkiw="
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

@@ -4,7 +4,7 @@
 
 import { defaultSocketPath, localApi } from "../api/server.ts";
 import { operatorControls, routeCommands } from "../commands/commands.ts";
-import { renderPreview } from "../github/preview.ts";
+import { renderMergeEligibilityPreview } from "../github/preview.ts";
 import { execGh, type GhRunner } from "../github/gh.ts";
 import { sendDueReplies } from "../github/outbox.ts";
 import { processRunner, type ProcessRunner } from "../process.ts";
@@ -149,7 +149,7 @@ async function run(intervalSeconds: number, deps: MainDeps): Promise<number> {
     control: {
       ...controls,
       extend: async (ticketId, increases) => { owned.store.extendTicketBudget(ticketId, increases); },
-      preview: async () => renderPreview(owned.store),
+      preview: async () => renderMergeEligibilityPreview(owned.store, deps.gh, loadConfig(deps.env).repo, loadConfig(deps.env).mergePolicy),
     },
   });
   logRecovery(owned.workers.recover(), deps);

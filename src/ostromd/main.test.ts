@@ -56,12 +56,21 @@ test("ostromd without a command prints usage and exits non-zero", () => {
 test("config comes from three required environment variables", () => {
   assert.deepEqual(
     loadConfig({ OSTROM_REPO: "onsager-ai/ostrom", OSTROM_ALLOWLIST: " alice, bob ,", OSTROM_DB: "/tmp/o.sqlite" }),
-    { repo: "onsager-ai/ostrom", allowlist: ["alice", "bob"], dbPath: "/tmp/o.sqlite" },
+    { repo: "onsager-ai/ostrom", allowlist: ["alice", "bob"], dbPath: "/tmp/o.sqlite", mergePolicy: { strategy: "unattended" } },
   );
   assert.throws(() => loadConfig({ OSTROM_ALLOWLIST: "a", OSTROM_DB: "x" }), /OSTROM_REPO/);
   assert.throws(() => loadConfig({ OSTROM_REPO: "nope", OSTROM_ALLOWLIST: "a", OSTROM_DB: "x" }), /OSTROM_REPO/);
   assert.throws(() => loadConfig({ OSTROM_REPO: "o/r", OSTROM_ALLOWLIST: " , ", OSTROM_DB: "x" }), /OSTROM_ALLOWLIST/);
   assert.throws(() => loadConfig({ OSTROM_REPO: "o/r", OSTROM_ALLOWLIST: "a" }), /OSTROM_DB/);
+});
+
+test("merge policy defaults to unattended and rejects inconsistent fields", () => {
+  assert.deepEqual(loadConfig({ OSTROM_REPO: "o/r", OSTROM_ALLOWLIST: "a", OSTROM_DB: "x" }).mergePolicy, { strategy: "unattended" });
+  assert.deepEqual(loadConfig({ OSTROM_REPO: "o/r", OSTROM_ALLOWLIST: "a", OSTROM_DB: "x", OSTROM_MERGE_STRATEGY: "approvals", OSTROM_MERGE_APPROVALS: "2", OSTROM_MERGE_APPROVERS: "Alice,bob" }).mergePolicy, { strategy: "approvals", approvals: 2, approvers: ["Alice", "bob"] });
+  assert.throws(() => loadConfig({ OSTROM_REPO: "o/r", OSTROM_ALLOWLIST: "a", OSTROM_DB: "x", OSTROM_MERGE_STRATEGY: "no" }), /OSTROM_MERGE_STRATEGY/);
+  assert.throws(() => loadConfig({ OSTROM_REPO: "o/r", OSTROM_ALLOWLIST: "a", OSTROM_DB: "x", OSTROM_MERGE_APPROVALS: "1" }), /require/);
+  assert.throws(() => loadConfig({ OSTROM_REPO: "o/r", OSTROM_ALLOWLIST: "a", OSTROM_DB: "x", OSTROM_MERGE_STRATEGY: "approvals", OSTROM_MERGE_APPROVALS: "0" }), /positive/);
+  assert.throws(() => loadConfig({ OSTROM_REPO: "o/r", OSTROM_ALLOWLIST: "a", OSTROM_DB: "x", OSTROM_MERGE_STRATEGY: "approvals", OSTROM_MERGE_APPROVALS: "1", OSTROM_MERGE_APPROVERS: "alice, Alice" }), /duplicate/);
 });
 
 test("poll with bad config exits non-zero", async () => {

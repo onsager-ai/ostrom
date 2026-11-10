@@ -5,7 +5,9 @@
 import { request } from "node:http";
 
 import { defaultSocketPath } from "../api/server.ts";
-import { renderPreview } from "../github/preview.ts";
+import { execGh } from "../github/gh.ts";
+import { renderMergeEligibilityPreview } from "../github/preview.ts";
+import { loadConfig } from "../ostromd/config.ts";
 import { Store, type OperatorStatus, type OperatorTicket, type OperatorTicketDetail } from "../store/store.ts";
 
 const USAGE = `usage: ostrom <command> [--json]
@@ -39,7 +41,7 @@ export async function main(argv: readonly string[], env: Record<string, string |
     const path = env["OSTROM_DB"]?.trim() ?? "";
     if (path === "") return failure("ostromd is not running; set OSTROM_DB for read-only fallback");
     try {
-      const result = direct(command, path);
+      const result = await direct(command, path);
       output(command, result);
       return 0;
     } catch (fallback) {
@@ -123,13 +125,16 @@ function unavailable(error: unknown): boolean {
   return error instanceof Error && ["ECONNREFUSED", "ENOENT", "ENOTSOCK"].some((code) => error.message.includes(code));
 }
 
-function direct(command: Command, path: string): unknown {
+async function direct(command: Command, path: string): Promise<unknown> {
   const store = Store.open(path);
   try {
     if (command.name === "status") return store.operatorStatus();
     if (command.name === "tickets") return store.operatorTickets();
     if (command.name === "show") return store.operatorTicket(command.ticketId);
-    if (command.name === "preview") return { markdown: renderPreview(store) };
+    if (command.name === "preview") {
+      const config = loadConfig(env);
+      return { markdown: await renderMergeEligibilityPreview(store, execGh, config.repo, config.mergePolicy) };
+    }
     throw new Error("mutating commands require ostromd to be running");
   } finally {
     store.close();

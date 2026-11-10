@@ -1,0 +1,64 @@
+query MergeEvidence(
+  $owner: String!
+  $name: String!
+  $number: Int!
+  $threadsAfter: String
+  $reviewsAfter: String
+  $contextsAfter: String
+  $suitesAfter: String
+  $associatedPrsAfter: String
+) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      number state isDraft mergeable mergeStateStatus reviewDecision
+      headRefName headRefOid baseRefName baseRefOid
+      reviewThreads(first: 100, after: $threadsAfter) {
+        nodes { id isResolved }
+        pageInfo { hasNextPage endCursor }
+      }
+      reviews(first: 100, after: $reviewsAfter) {
+        nodes {
+          id state submittedAt
+          author { __typename login ... on User { id } ... on Bot { id } }
+          commit { oid }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+      commits(last: 1) {
+        nodes {
+          commit {
+            oid
+            associatedPullRequests(first: 100, after: $associatedPrsAfter) {
+              nodes { number }
+              pageInfo { hasNextPage endCursor }
+            }
+            statusCheckRollup {
+              state
+              contexts(first: 100, after: $contextsAfter) {
+                nodes {
+                  __typename
+                  ... on CheckRun {
+                    databaseId name status conclusion
+                    checkSuite { databaseId status conclusion app { databaseId slug name } }
+                  }
+                  ... on StatusContext {
+                    context state
+                    creator { __typename login ... on User { id } ... on Bot { id } }
+                  }
+                }
+                pageInfo { hasNextPage endCursor }
+              }
+            }
+            checkSuites(first: 100, after: $suitesAfter) {
+              nodes {
+                databaseId status conclusion
+                workflowRun { event runAttempt workflow { databaseId name } }
+              }
+              pageInfo { hasNextPage endCursor }
+            }
+          }
+        }
+      }
+    }
+  }
+}

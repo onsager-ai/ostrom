@@ -23,6 +23,11 @@ export async function ghGet(gh: GhRunner, path: string): Promise<unknown> {
   return JSON.parse(await gh(["api", "--method", "GET", path]));
 }
 
+/** REST reads whose shape affects merge eligibility are pinned to one GitHub API version. */
+export async function ghMergeGet(gh: GhRunner, path: string): Promise<unknown> {
+  return JSON.parse(await gh(["api", "-H", "X-GitHub-Api-Version: 2022-11-28", "--method", "GET", path]));
+}
+
 /** GitHub's `since` takes ISO 8601 to the second; dropping milliseconds only widens the window. */
 export function sinceParam(at: Date): string {
   return at.toISOString().replace(/\.\d{3}Z$/, "Z");

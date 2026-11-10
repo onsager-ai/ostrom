@@ -414,6 +414,29 @@ export const migrations: readonly string[] = [
   `
   CREATE INDEX delivery_by_assignment_turn ON delivery (assignment_id, turn_id);
   `,
+
+  // 23: Read-only merge evaluation has one durable candidate per assignment/PR identity. Merge
+  // attempts and results are separate later work; this row only holds ownership and readiness data.
+  `
+  CREATE TABLE merge_candidate (
+    id                  INTEGER PRIMARY KEY,
+    assignment_id       INTEGER NOT NULL REFERENCES assignment (id),
+    repository          TEXT NOT NULL CHECK (repository <> ''),
+    pr_number           INTEGER NOT NULL CHECK (pr_number > 0),
+    head_sha            TEXT NOT NULL CHECK (head_sha <> ''),
+    base_sha            TEXT NOT NULL CHECK (base_sha <> ''),
+    policy              TEXT NOT NULL CHECK (policy <> ''),
+    activity_fingerprint TEXT,
+    activity_at         TEXT,
+    ready_reply_id      TEXT,
+    ready_sent_at       TEXT,
+    quiet_deadline      TEXT,
+    blocking_reason     TEXT,
+    UNIQUE (repository, pr_number),
+    UNIQUE (assignment_id, pr_number)
+  ) STRICT;
+  CREATE INDEX merge_candidate_assignment ON merge_candidate (assignment_id);
+  `,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */
