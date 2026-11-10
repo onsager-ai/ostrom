@@ -878,14 +878,14 @@ export class Store {
     return { duplicate: Number(changes) === 0 };
   }
 
-  /** Every follow-up owed to an open ticket's Worker, including the first human reply after public Stuck. */
+  /** Every follow-up owed to an open ticket's Worker, including the first human reply to a ticket paused at public Stuck. */
   pendingDeliveries(): PendingDelivery[] {
     return this.#all(
       `SELECT t.*, ticket.id AS p_ticket_id, worker.id AS p_assignment_id
        FROM "trigger" AS t
        JOIN subscription ON subscription.thread_id = t.thread_id
        JOIN ticket ON ticket.id = subscription.ticket_id AND (
-         ticket.state = 'open' OR EXISTS (
+         ticket.state = 'open' OR ticket.state = 'paused' AND EXISTS (
            SELECT 1 FROM stall JOIN assignment AS stalled ON stalled.id = stall.assignment_id
            WHERE stalled.ticket_id = ticket.id AND stall.public_at IS NOT NULL AND stall.cleared_at IS NULL))
        LEFT JOIN assignment AS worker ON worker.id = (

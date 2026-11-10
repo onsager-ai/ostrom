@@ -19,7 +19,7 @@ function numberedChoices(choices: string): string {
   const lines = choices.split("\n").map((line) => line.trim()).filter(Boolean);
   if (lines.length > 0 && lines.every((line) => /^\d+\.\s+\S/.test(line))) return lines.join("\n");
 
-  const alternatives = lines.length > 1 ? lines : choices.split(/\s+or\s+|;/i).map((choice) => choice.trim()).filter(Boolean);
+  const alternatives = lines.length > 1 ? lines : choices.split(/\s+or\s+|;/i).map((choice) => choice.trim().replace(/,$/, "")).filter(Boolean);
   if (alternatives.length < 2) return "1. provide the missing decision\n2. stop this ticket";
   return alternatives.map((choice, index) => `${index + 1}. ${choice}`).join("\n");
 }
