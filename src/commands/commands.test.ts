@@ -157,6 +157,17 @@ test("a paused ticket can still be stopped: by command, by closing the issue, or
   }
 });
 
+test("a stop request survives resume and is recorded before cleanup", async () => {
+  const { store, github, runner, workers, ticketId } = fixture();
+  runner.hold = true;
+  await operatorControls(store, workers, github.gh, REPO).stop(ticketId);
+  assert.notEqual(store.getTicket(ticketId).stopRequestedAt, null);
+  assert.equal(store.unfinishedTurns(1).length, 1);
+  store.pauseTicket(ticketId);
+  store.resumeTicket(ticketId);
+  assert.notEqual(store.getTicket(ticketId).stopRequestedAt, null);
+});
+
 test("a merged PR leaves the attempt to the Router's outcome; a PR closed unmerged ends it", async () => {
   for (const state of ["merged", "closed"] as const) {
     const { github, store, workers, ticketId, assignmentId } = fixture();
@@ -173,6 +184,15 @@ test("a merged PR leaves the attempt to the Router's outcome; a PR closed unmerg
     assert.deepEqual(store.pendingCommands(), [], state);
     assert.equal(store.getAssignment(assignmentId).state, state === "merged" ? "running" : "ended", state);
   }
+});
+
+test("a redirect receipt before its queued turn starts is not idle", async () => {
+  const { store, github, runner, workers, assignmentId, comment } = fixture();
+  runner.hold = true;
+  comment("redirect-idle", "alice", "please continue");
+  await routeCommands(store, workers, github.gh, REPO);
+  assert.equal(store.assignmentWorkIdle(assignmentId), false);
+  assert.equal(store.unfinishedTurns(assignmentId).length, 1);
 });
 
 test("a non-collaborator redirect reaches the Worker as information, not instruction", async () => {

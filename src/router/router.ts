@@ -191,6 +191,7 @@ export async function routeCandidates(options: RouteOptions): Promise<RoutePassR
       { id: key, threadId: outcome.thread, body: reply },
       outcome.terminal ? { assignmentId: outcome.assignmentId } : undefined,
     );
+    if (outcome.event === "pr_opened") store.trackReadyReply(outcome.assignmentId, key);
     // The card shows the ended state; otherwise it would keep its last live one.
     if (ticketEnded) queueStatusCard(store, outcome.ticketId);
     result.outcomes.push({ key, event: outcome.event, ticketId: outcome.ticketId, ticketEnded });

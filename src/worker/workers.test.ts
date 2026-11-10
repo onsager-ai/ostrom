@@ -188,6 +188,38 @@ test("restart recovery resumes running sessions by id and sends the interrupted 
   assert.match(store.getAssignment(stuck).endReason!, /before the session started/);
 });
 
+test("a queued turn survives a restart and runs exactly once", async () => {
+  const { runner, ticketId, workers, make } = fixture();
+  runner.hold = true;
+  await workers.dispatch(ticketId);
+  workers.deliver(1, "queued", "next", () => {});
+  workers.stop();
+  await workers.drain();
+
+  runner.hold = false;
+  const restarted = make();
+  restarted.recover();
+  await restarted.drain();
+  const resumed = runner.sessions.at(-1)!;
+  assert.deepEqual(resumed.prompts, [INTERRUPTED_PROMPT, "next"]);
+  assert.equal(resumed.prompts.filter((prompt) => prompt === "next").length, 1);
+});
+
+test("a reservation blocks a new queued turn until released", async () => {
+  const { store, runner, ticketId, workers } = fixture();
+  await workers.dispatch(ticketId);
+  await workers.drain();
+  assert.equal(store.reserveAssignment(1), true);
+  workers.deliver(1, "held", "wait", () => {});
+  await workers.drain();
+  assert.equal(runner.sessions[0]!.prompts.includes("wait"), false);
+  store.releaseAssignmentReservation(1);
+  workers.deliver(1, "wake", "wake", () => {});
+  await workers.drain();
+  assert.equal(runner.sessions[0]!.prompts.includes("wait"), true);
+  assert.equal(store.assignmentWorkIdle(1), true);
+});
+
 test("a stop cuts off the running turn, starts no queued one, and leaves the turn for recovery", async () => {
   const { store, runner, ticketId, workers, make } = fixture();
   runner.hold = true;
@@ -204,7 +236,7 @@ test("a stop cuts off the running turn, starts no queued one, and leaves the tur
   const restarted = make();
   assert.deepEqual(restarted.recover().interrupted, [1]);
   await restarted.drain();
-  assert.deepEqual(runner.sessions.at(-1)!.prompts, [INTERRUPTED_PROMPT]);
+  assert.deepEqual(runner.sessions.at(-1)!.prompts, [INTERRUPTED_PROMPT, "next"]);
   assert.equal(store.getAssignment(1).turnStartedAt, null);
 });
 

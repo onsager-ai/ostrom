@@ -37,8 +37,8 @@ export function operatorControls(store: Store, workers: Workers, gh: GhRunner, r
     },
     async stop(ticketId) {
       const assignment = running(ticketId);
-      workers.cancel(assignment.id);
-      workers.deliver(
+      store.requestStop(ticketId);
+      const queued = workers.deliver(
         assignment.id,
         `operator-stop-${ticketId}`,
         "Stop this ticket gracefully. Push your work in progress and summarise precisely where you stopped.",
@@ -51,6 +51,7 @@ export function operatorControls(store: Store, workers: Workers, gh: GhRunner, r
           queueStatusCard(store, ticketId);
         },
       );
+      if (queued) workers.cancel(assignment.id);
     },
   };
 }
@@ -105,9 +106,8 @@ export async function routeCommands(
       } else if (command === "close_issue") {
         const assignment = store.latestAssignment(pending.ticketId);
         if (assignment?.state !== "running") throw new Error(`ticket ${pending.ticketId} has no running Worker`);
-        store.recordCommandReceipt(pending.trigger.id, pending.ticketId, "close_issue", true);
-        workers.cancel(assignment.id);
-        workers.deliver(
+        store.requestStop(pending.ticketId);
+        const queued = workers.deliver(
           assignment.id,
           `close-issue-${pending.trigger.id}-${assignment.id}`,
           "The issue was closed. Stop this ticket gracefully, push your work in progress, and summarise precisely where you stopped.",
@@ -120,11 +120,12 @@ export async function routeCommands(
             queueStatusCard(store, pending.ticketId);
           },
         );
+        store.recordCommandReceipt(pending.trigger.id, pending.ticketId, "close_issue", true);
+        if (queued) workers.cancel(assignment.id);
       } else if (command === "redirect") {
         const assignment = store.latestAssignment(pending.ticketId);
         if (assignment?.state !== "running") throw new Error(`ticket ${pending.ticketId} has no running Worker`);
         const instruction = await collaborator(gh, repo, pending.trigger.actor, permissions);
-        store.recordCommandReceipt(pending.trigger.id, pending.ticketId, "redirect", instruction);
         const added = workers.deliver(
           assignment.id,
           `redirect-${pending.trigger.id}-${assignment.id}`,
@@ -133,36 +134,37 @@ export async function routeCommands(
             store.recordDelivery(pending.trigger.id, assignment.id, turnId);
             enqueueReaction(store, pending.trigger, "eyes");
           },
+          "follow_up",
+          String(pending.trigger.id),
         );
+        store.recordCommandReceipt(pending.trigger.id, pending.ticketId, "redirect", instruction);
         if (!added) continue;
       } else if (command === "pause") {
         const assignment = store.latestAssignment(pending.ticketId);
         if (assignment?.state !== "running") throw new Error(`ticket ${pending.ticketId} has no running Worker`);
         store.pauseTicket(pending.ticketId);
-        store.recordCommandReceipt(pending.trigger.id, pending.ticketId, "pause", true);
-        enqueueReaction(store, pending.trigger, "+1");
-        queueStatusCard(store, pending.ticketId);
         workers.deliver(
           assignment.id,
           `pause-${pending.trigger.id}-${assignment.id}`,
           "Pause this ticket after the current work finishes. Push your work in progress, then stop and wait for Ostrom to resume you.",
           () => {},
         );
+        store.recordCommandReceipt(pending.trigger.id, pending.ticketId, "pause", true);
+        enqueueReaction(store, pending.trigger, "+1");
+        queueStatusCard(store, pending.ticketId);
       } else if (command === "resume") {
         const assignment = store.latestAssignment(pending.ticketId);
         if (assignment?.state !== "running") throw new Error(`ticket ${pending.ticketId} has no running Worker`);
         store.resumeTicket(pending.ticketId);
+        workers.deliver(assignment.id, `resume-${pending.trigger.id}-${assignment.id}`, "This ticket has resumed. Continue your work.", () => {});
         store.recordCommandReceipt(pending.trigger.id, pending.ticketId, "resume", true);
         enqueueReaction(store, pending.trigger, "+1");
         queueStatusCard(store, pending.ticketId);
-        workers.deliver(assignment.id, `resume-${pending.trigger.id}-${assignment.id}`, "This ticket has resumed. Continue your work.", () => {});
       } else {
         const assignment = store.latestAssignment(pending.ticketId);
         if (assignment?.state !== "running") throw new Error(`ticket ${pending.ticketId} has no running Worker`);
-        store.recordCommandReceipt(pending.trigger.id, pending.ticketId, "stop", true);
-        enqueueReaction(store, pending.trigger, "+1");
-        workers.cancel(assignment.id);
-        workers.deliver(
+        store.requestStop(pending.ticketId);
+        const queued = workers.deliver(
           assignment.id,
           `stop-${pending.trigger.id}-${assignment.id}`,
           "Stop this ticket gracefully. Push your work in progress and summarise precisely where you stopped.",
@@ -175,6 +177,9 @@ export async function routeCommands(
             queueStatusCard(store, pending.ticketId);
           },
         );
+        store.recordCommandReceipt(pending.trigger.id, pending.ticketId, "stop", true);
+        enqueueReaction(store, pending.trigger, "+1");
+        if (queued) workers.cancel(assignment.id);
       }
       pass.handled.push({ triggerId: pending.trigger.id, ticketId: pending.ticketId, command, allowed });
     } catch (error) {

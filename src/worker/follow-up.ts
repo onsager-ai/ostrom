@@ -57,6 +57,8 @@ export function routeFollowUps(store: Store, workers: Workers): RoutePass {
             body: renderReviewReply(result.text),
           });
         },
+        "review",
+        review.map((item) => item.trigger.id).join(","),
       );
       if (added) pass.queued.push({ triggerId: trigger.id, ticketId, assignmentId });
       continue;
@@ -69,6 +71,8 @@ export function routeFollowUps(store: Store, workers: Workers): RoutePass {
         store.recordDelivery(trigger.id, assignmentId, turnId);
         enqueueReceivedReaction(store, trigger);
       },
+      "follow_up",
+      String(trigger.id),
     );
     if (added) pass.queued.push({ triggerId: trigger.id, ticketId, assignmentId });
   }

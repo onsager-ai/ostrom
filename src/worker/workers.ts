@@ -11,7 +11,7 @@ import type { WorkerConfig } from "../ostromd/config.ts";
 import { rolloutModel } from "../session/rollout.ts";
 import type { Runner, Session, TurnResult } from "../session/runner.ts";
 import { createWorktree } from "../session/worktree.ts";
-import type { Assignment, AssignmentOutcome, Store } from "../store/store.ts";
+import type { Assignment, AssignmentOutcome, QueuedTurnKind, Store } from "../store/store.ts";
 import { workerBrief } from "./dispatch.ts";
 
 export interface Dispatched {
@@ -42,17 +42,25 @@ export function gitDirs(repo: string, worktree: string): string[] {
 }
 
 /** Turns that run even on a paused ticket: those that pause it, and those that stop it. */
-const RUNS_WHILE_PAUSED = ["budget-pause-", "stuck-", "operator-stop-", "stop-", "close-issue-"];
+const RUNS_WHILE_PAUSED = ["budget-pause-", "stuck-", "operator-pause-", "operator-stop-", "pause-", "stop-", "close-issue-"];
 
 export const INTERRUPTED_PROMPT =
   "You were interrupted while working on this ticket. Check your state (git status, your branch and " +
   "pull request) and continue where you stopped.";
 
+function queuedTurnKind(key: string): QueuedTurnKind {
+  if (key.startsWith("review-")) return "review";
+  if (key.startsWith("budget-pause-")) return "budget_pause";
+  if (key.startsWith("stuck-")) return "stuck";
+  if (key.startsWith("recovery-")) return "recovery";
+  if (/^(operator-|pause-|resume-|stop-|close-issue-)/.test(key)) return "control";
+  return "follow_up";
+}
+
 export class Workers {
   readonly #deps: WorkersDeps;
   readonly #sessions = new Map<number, Session>();
   readonly #chains = new Map<number, Promise<void>>();
-  readonly #queued = new Set<string>();
   readonly #budgetPauses = new Set<number>();
   readonly #inFlight = new Map<number, AbortController>();
   #stopping = false;
@@ -102,9 +110,8 @@ export class Workers {
   }
 
   /**
-   * Queues a follow-up turn on the assignment's session. `onStart` runs when the turn begins, with
-   * the turn's id; that is when the caller records delivery, so a message lost with the queue in a
-   * crash is sent again. Returns false when the same key is already queued.
+   * Persists a follow-up before scheduling it. Delivery acknowledgements remain at turn start, so
+   * a crash between receipt and delivery leaves an unfinished row rather than falsely looking idle.
    */
   deliver(
     assignmentId: number,
@@ -112,13 +119,12 @@ export class Workers {
     prompt: string,
     onStart: (turnId: string) => void,
     onComplete?: (result: TurnResult) => void | Promise<void>,
+    kind: QueuedTurnKind = queuedTurnKind(key),
+    sourcePointer?: string,
   ): boolean {
-    if (this.#queued.has(key)) return false;
-    this.#queued.add(key);
-    void this.#enqueue(assignmentId, () => this.#turn(assignmentId, prompt, (turnId) => {
-      onStart(turnId);
-      this.#queued.delete(key);
-    }, onComplete, key)).finally(() => this.#queued.delete(key));
+    const added = this.#deps.store.enqueueTurn({ assignmentId, deliveryKey: key, kind, prompt, sourcePointer });
+    if (added.duplicate) return false;
+    this.#schedule(assignmentId, key, onStart, onComplete);
     return true;
   }
 
@@ -154,22 +160,43 @@ export class Workers {
       if (assignment.sessionId === null) continue;
       this.#session(assignment);
       pass.resumed.push(assignment.id);
-      if (assignment.turnStartedAt === null) continue;
-      const turnId = `${assignment.sessionId}:${assignment.turns}`;
-      const reviews = store.reviewDeliveries(assignment.id, turnId);
-      store.recordInterruption(assignment.id);
-      pass.interrupted.push(assignment.id);
-      void this.#enqueue(assignment.id, () => this.#turn(assignment.id, INTERRUPTED_PROMPT, undefined, (result) => {
-        for (const review of reviews) {
-          store.enqueueReply({
-            id: `review-${assignment.id}-${review.reviewId}`,
-            threadId: review.threadId,
-            body: renderReviewReply(result.text),
-          });
-        }
-      }));
+      if (assignment.turnStartedAt !== null) {
+        const turnId = `${assignment.sessionId}:${assignment.turns}`;
+        const reviews = store.reviewDeliveries(assignment.id, turnId);
+        store.recordInterruption(assignment.id);
+        store.finishRunningTurns(assignment.id);
+        store.endTurn(assignment.id, null);
+        pass.interrupted.push(assignment.id);
+        this.deliver(assignment.id, `recovery-${assignment.interruptions + 1}`, INTERRUPTED_PROMPT, () => {}, (result) => {
+          for (const review of reviews) {
+            store.enqueueReply({
+              id: `review-${assignment.id}-${review.reviewId}`,
+              threadId: review.threadId,
+              body: renderReviewReply(result.text),
+            });
+          }
+        }, "recovery");
+      }
+      for (const turn of store.unfinishedTurns(assignment.id)) this.#schedule(assignment.id, turn.deliveryKey);
     }
+    this.#recoverStopCleanups();
     return pass;
+  }
+
+  /** Finishes a durable stop cleanup if its original callback was lost on process restart. */
+  #recoverStopCleanups(): void {
+    const { store } = this.#deps;
+    for (const cleanup of store.completedStopCleanups()) {
+      store.endAssignment(cleanup.assignmentId, cleanup.issueClosed ? "issue closed" : "stopped by command");
+      store.endTicket(cleanup.ticketId);
+      store.enqueueReply({
+        id: cleanup.issueClosed ? `stopped-issue-closed-${cleanup.ticketId}` : `stopped-${cleanup.ticketId}`,
+        threadId: cleanup.threadId,
+        body: "The ticket was stopped after Ostrom restarted.",
+        blocking: true,
+      });
+      queueStatusCard(store, cleanup.ticketId);
+    }
   }
 
   /** Resolves when every queued and running turn has finished. */
@@ -189,6 +216,52 @@ export class Workers {
       this.#sessions.set(assignment.id, session);
     }
     return session;
+  }
+
+  #schedule(
+    id: number,
+    key: string,
+    onStart?: (turnId: string) => void,
+    onComplete?: (result: TurnResult) => void | Promise<void>,
+  ): void {
+    const restored = onStart === undefined ? this.#callbacks(id, key) : { onStart, onComplete };
+    void this.#enqueue(id, () => this.#turn(id, key, restored.onStart, restored.onComplete));
+  }
+
+  /** Rebuilds the deterministic side effects for a persisted follow-up after a daemon restart. */
+  #callbacks(id: number, key: string): { onStart?: (turnId: string) => void; onComplete?: (result: TurnResult) => void } {
+    const turn = this.#deps.store.queuedTurn(id, key);
+    if (turn === null || turn.sourcePointer === null) return {};
+    const store = this.#deps.store;
+    if (turn.kind === "follow_up") {
+      const trigger = store.getTrigger(Number(turn.sourcePointer));
+      return {
+        onStart: (turnId) => {
+          store.recordDelivery(trigger.id, id, turnId);
+          if (trigger.kind !== "pull_request_review") {
+            store.enqueueReply({ id: `received-${trigger.id}`, threadId: trigger.threadId, body: "", kind: "reaction", target: trigger.url, reaction: "eyes" });
+          }
+        },
+      };
+    }
+    if (turn.kind === "review") {
+      const triggers = turn.sourcePointer.split(",").map((value) => store.getTrigger(Number(value)));
+      const review = triggers.find((trigger) => trigger.reviewId !== undefined)!;
+      return {
+        onStart: (turnId) => {
+          store.recordReviewDelivery(triggers.map((trigger) => trigger.id), id, turnId);
+          for (const trigger of triggers) {
+            if (trigger.kind !== "pull_request_review") {
+              store.enqueueReply({ id: `received-${trigger.id}`, threadId: trigger.threadId, body: "", kind: "reaction", target: trigger.url, reaction: "eyes" });
+            }
+          }
+        },
+        onComplete: (result) => {
+          store.enqueueReply({ id: `review-${id}-${review.reviewId}`, threadId: review.threadId, body: renderReviewReply(result.text) });
+        },
+      };
+    }
+    return {};
   }
 
   #enqueue(id: number, job: () => Promise<void>): Promise<void> {
@@ -227,26 +300,32 @@ export class Workers {
 
   async #turn(
     id: number,
-    prompt: string,
+    key: string,
     onStart?: (turnId: string) => void,
     onComplete?: (result: TurnResult) => void | Promise<void>,
-    key = "",
   ): Promise<void> {
     const { store } = this.#deps;
     const assignment = store.getAssignment(id);
-    if (this.#stopping || assignment.state !== "running") return;
+    const queued = store.queuedTurn(id, key);
+    if (queued === null || queued.state !== "queued" || this.#stopping || assignment.state !== "running") return;
     const ticket = store.getTicket(assignment.ticketId);
     if (ticket.state === "paused" && !RUNS_WHILE_PAUSED.some((prefix) => key.startsWith(prefix))) return;
     const session = this.#session(assignment);
     const turn = store.beginTurn(id);
-    onStart?.(`${assignment.sessionId}:${turn}`);
+    const turnId = `${assignment.sessionId}:${turn}`;
+    if (store.beginQueuedTurn(id, key, turnId) === null) {
+      store.endTurn(id, null);
+      return;
+    }
+    onStart?.(turnId);
     const controller = new AbortController();
     this.#inFlight.set(id, controller);
     let result: TurnResult;
     try {
-      result = await session.send(prompt, controller.signal);
+      result = await session.send(queued.prompt, controller.signal);
     } catch (error) {
       if (this.#stopping) return;
+      store.finishQueuedTurn(id, key);
       if (controller.signal.aborted) {
         store.endTurn(id, null);
         store.clearTurnError(id);
@@ -258,8 +337,12 @@ export class Workers {
       if (this.#inFlight.get(id) === controller) this.#inFlight.delete(id);
     }
     if (this.#stopping) return;
+    store.finishQueuedTurn(id, key);
     this.#finished(id, result);
     if (result.status === "completed") await onComplete?.(result);
+    for (const next of store.unfinishedTurns(id)) {
+      if (next.deliveryKey !== key && next.state === "queued") this.#schedule(id, next.deliveryKey);
+    }
   }
 
   #failed(id: number, error: unknown): void {

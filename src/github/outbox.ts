@@ -96,6 +96,7 @@ async function postCommentBatch(replies: readonly Reply[], options: SendOptions,
       if (found === null) continue;
       remaining.pop();
       store.markReplySent(reply.id);
+      store.markReadyReplySent(reply.id);
       if (isStatusCard(reply)) store.setStatusCardCommentId(reply.threadId, found);
       result.found.push(reply.id);
     }
@@ -129,6 +130,7 @@ async function sendOne(reply: Reply, options: SendOptions, result: SendResult): 
       throw new Error(`outbox kind ${reply.kind} is not implemented`);
     }
     options.store.markReplySent(reply.id);
+    options.store.markReadyReplySent(reply.id);
     result.sent.push(reply.id);
   } catch (error) {
     fail(reply, error, options, result);
