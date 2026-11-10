@@ -84,7 +84,10 @@ async function consider(options: MergePassOptions, assignmentId: number, prNumbe
   } catch (error) {
     const errorText = message(error);
     const status = /HTTP (\d{3})\b/.exec(errorText);
-    options.store.finishMergeAttempt(attempt.id, status === null ? "unknown" : "failed", { error: errorText, nextRetryAt: status === null ? undefined : retry(options, attempt.attemptNumber) });
+    options.store.finishMergeAttempt(
+      attempt.id, status === null ? "unknown" : "failed",
+      status === null ? { error: errorText } : { error: errorText, nextRetryAt: retry(options, attempt.attemptNumber) },
+    );
     options.workers.release(assignmentId); result.failed.push({ assignmentId, error: errorText });
   }
 }
@@ -92,7 +95,7 @@ async function consider(options: MergePassOptions, assignmentId: number, prNumbe
 async function eligibilityFor(options: MergePassOptions, assignmentId: number, evidence: MergeEvidence, candidate: MergeCandidate, now: Date, readySentAt: string | null) {
   const assignment = options.store.getAssignment(assignmentId); const ticket = options.store.getTicket(assignment.ticketId);
   const approvals = options.policy.strategy === "approvals" ? { authorLogin: evidence.pr.authorLogin ?? "", identities: await approvalIdentities(options, evidence) } : undefined;
-  return mergeEligibility({ evidence, policy: options.policy, expected: { head: candidate.headSha, base: candidate.baseSha }, approvals,
+  return mergeEligibility({ evidence, policy: options.policy, expected: { head: candidate.headSha, base: candidate.baseSha }, ...(approvals === undefined ? {} : { approvals }),
     local: { issueOpen: ticket.state !== "ended", ticketOpen: ticket.state === "open", pausedOrStopping: ticket.state === "paused" || ticket.stopRequestedAt !== null,
       stalledOrFailed: assignment.outcome === "failed" || assignment.stallRecoveryAttempts > 0, budgetReached: budgetReached(options.store.ticketBudget(ticket.id), now) !== null,
       workerIdle: options.store.assignmentWorkIdle(assignmentId), readyReplySent: readySentAt !== null,
