@@ -7,6 +7,7 @@ export const MERGE_EVIDENCE_QUERY = readFileSync(new URL("./merge-evidence.graph
 
 type Json = Record<string, unknown>;
 type Page = { hasNextPage: boolean; endCursor: string | null };
+type ConnectionState = { cursor: string | undefined; done: boolean };
 
 export interface MergeReview {
   id: string;
@@ -34,11 +35,11 @@ export interface MergeEvidence {
 }
 
 /** Reads all pages of each connection. A missing field or changed enum shape is rejected. */
-export async function readMergeEvidence(gh: GhRunner, repo: string, number: number): Promise<MergeEvidence> {
+export async function readMergeEvidence(gh: GhRunner, repo: string, prNumber: number): Promise<MergeEvidence> {
   const [owner, name] = repo.split("/");
   if (!owner || !name) throw new Error(`invalid repository ${repo}`);
 
-  const pull = object(await ghMergeGet(gh, `repos/${repo}/pulls/${number}`));
+  const pull = object(await ghMergeGet(gh, `repos/${repo}/pulls/${prNumber}`));
   const base = object(pull, "base");
   const baseRef = string(base, "ref");
   const [repository, protection, rules] = await Promise.all([
@@ -53,50 +54,73 @@ export async function readMergeEvidence(gh: GhRunner, repo: string, number: numb
   const suites: unknown[] = [];
   const seen = { threads: new Set<string>(), reviews: new Set<string>(), contexts: new Set<string>(), suites: new Set<string>() };
   const associatedPrNumbers: number[] = [];
-  let cursors: Record<"threadsAfter" | "reviewsAfter" | "contextsAfter" | "suitesAfter" | "associatedPrsAfter", string | undefined> = {};
+  const state: Record<"threadsAfter" | "reviewsAfter" | "contextsAfter" | "suitesAfter" | "associatedPrsAfter", ConnectionState> = {
+    threadsAfter: { cursor: undefined, done: false }, reviewsAfter: { cursor: undefined, done: false },
+    contextsAfter: { cursor: undefined, done: false }, suitesAfter: { cursor: undefined, done: false },
+    associatedPrsAfter: { cursor: undefined, done: false },
+  };
   let pr: MergeEvidence["pr"] | null = null;
   let rollup: MergeEvidence["rollup"] = null;
 
   for (;;) {
-    const data = await graphql(gh, { owner, name, number, ...cursors });
+    const data = await graphql(gh, {
+      owner, name, number: prNumber,
+      threadsAfter: state.threadsAfter.cursor, reviewsAfter: state.reviewsAfter.cursor,
+      contextsAfter: state.contextsAfter.cursor, suitesAfter: state.suitesAfter.cursor,
+      associatedPrsAfter: state.associatedPrsAfter.cursor,
+    });
     const node = object(object(data, "repository"), "pullRequest");
     pr ??= decodePull(node);
     const threadPage = connection(node, "reviewThreads");
-    for (const item of threadPage.nodes) {
-      const row = object(item);
-      if (seen.threads.add(string(row, "id"))) threads.push({ id: string(row, "id"), resolved: boolean(row, "isResolved") });
+    if (!state.threadsAfter.done) {
+      for (const item of threadPage.nodes) {
+        const row = object(item);
+        if (seen.threads.add(string(row, "id"))) threads.push({ id: string(row, "id"), resolved: boolean(row, "isResolved") });
+      }
+      advance(state.threadsAfter, threadPage.page);
     }
     const reviewPage = connection(node, "reviews");
-    for (const item of reviewPage.nodes) {
-      const row = decodeReview(item);
-      if (seen.reviews.add(row.id)) reviews.push(row);
+    if (!state.reviewsAfter.done) {
+      for (const item of reviewPage.nodes) {
+        const row = decodeReview(item);
+        if (seen.reviews.add(row.id)) reviews.push(row);
+      }
+      advance(state.reviewsAfter, reviewPage.page);
     }
     const commit = object((array(object(node, "commits"), "nodes")[0] ?? {}), "commit");
     const associatedPage = connection(commit, "associatedPullRequests");
-    for (const item of associatedPage.nodes) associatedPrNumbers.push(number(object(item), "number"));
+    if (!state.associatedPrsAfter.done) {
+      for (const item of associatedPage.nodes) {
+        const value = number(object(item), "number");
+        if (!associatedPrNumbers.includes(value)) associatedPrNumbers.push(value);
+      }
+      advance(state.associatedPrsAfter, associatedPage.page);
+    }
     const status = commit["statusCheckRollup"] === null ? null : object(commit, "statusCheckRollup");
-    if (status !== null) {
+    if (status === null) state.contextsAfter.done = true;
+    else {
       const contextPage = connection(status, "contexts");
-      for (const item of contextPage.nodes) {
-        const row = object(item);
-        const key = `${string(row, "__typename")}:${nullableNumber(row, "databaseId") ?? nullableString(row, "context") ?? ""}`;
-        if (seen.contexts.add(key)) contexts.push(item);
+      if (!state.contextsAfter.done) {
+        for (const item of contextPage.nodes) {
+          const row = object(item);
+          const key = `${string(row, "__typename")}:${nullableNumber(row, "databaseId") ?? nullableString(row, "context") ?? ""}`;
+          if (seen.contexts.add(key)) contexts.push(item);
+        }
+        advance(state.contextsAfter, contextPage.page);
       }
       rollup ??= { oid: string(commit, "oid"), state: nullableString(status, "state"), contexts, suites, associatedPrNumbers };
-      cursors.contextsAfter = next(contextPage.page);
     }
     const suitePage = connection(commit, "checkSuites");
-    for (const item of suitePage.nodes) {
-      const row = object(item);
-      const key = String(number(row, "databaseId"));
-      if (seen.suites.add(key)) suites.push(item);
+    if (!state.suitesAfter.done) {
+      for (const item of suitePage.nodes) {
+        const row = object(item);
+        const key = String(number(row, "databaseId"));
+        if (seen.suites.add(key)) suites.push(item);
+      }
+      advance(state.suitesAfter, suitePage.page);
     }
     if (rollup !== null) rollup.suites = suites;
-    cursors.threadsAfter = next(threadPage.page);
-    cursors.reviewsAfter = next(reviewPage.page);
-    cursors.suitesAfter = next(suitePage.page);
-    cursors.associatedPrsAfter = next(associatedPage.page);
-    if (Object.values(cursors).every((cursor) => cursor === undefined)) break;
+    if (Object.values(state).every((connection) => connection.done)) break;
   }
 
   const decoded = pr!;
@@ -144,7 +168,15 @@ function connection(row: Json, key: string): { nodes: unknown[]; page: Page } {
   const page = object(value, "pageInfo");
   return { nodes: array(value, "nodes"), page: { hasNextPage: boolean(page, "hasNextPage"), endCursor: nullableString(page, "endCursor") } };
 }
-function next(page: Page): string | undefined { if (!page.hasNextPage) return undefined; if (page.endCursor === null) throw new Error("GitHub page has no end cursor"); return page.endCursor; }
+function advance(state: ConnectionState, page: Page): void {
+  if (page.hasNextPage) {
+    if (page.endCursor === null) throw new Error("GitHub page has no end cursor");
+    state.cursor = page.endCursor;
+  } else {
+    state.cursor = page.endCursor ?? state.cursor;
+    state.done = true;
+  }
+}
 function nestedString(value: Json, ...keys: string[]): string { let current: unknown = value; for (const key of keys) current = object(current)[key]; if (typeof current !== "string") throw new Error(`GitHub response is missing string ${keys.join(".")}`); return current; }
 function object(value: unknown, key?: string): Json { const result = key === undefined ? value : (value as Json)[key]; if (result === null || typeof result !== "object" || Array.isArray(result)) throw new Error(`GitHub response is missing object ${key ?? "value"}`); return result as Json; }
 function array(value: Json, key: string): unknown[] { if (!Array.isArray(value[key])) throw new Error(`GitHub response is missing array ${key}`); return value[key] as unknown[]; }

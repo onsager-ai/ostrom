@@ -1,6 +1,7 @@
 // Markdown preview of the next outbox send pass. It is deliberately read-only: the same pending
 // records and batching rules feed the real sender, so developers can inspect delivery before a tick.
 
+import { budgetReached } from "../budget/budgets.ts";
 import type { Reply, Store } from "../store/store.ts";
 import type { GhRunner } from "./gh.ts";
 import { mergeEligibility, type MergePolicy } from "./merge-policy.ts";
@@ -35,7 +36,7 @@ export async function renderMergeEligibilityPreview(
 ): Promise<string> {
   const reports: string[] = [];
   for (const ticket of store.operatorTickets()) {
-    if (ticket.state !== "open" || ticket.assignment === null || ticket.assignment.branch === null) continue;
+    if (ticket.assignment === null || ticket.assignment.branch === null) continue;
     const pr = store.ticketPullRequest(ticket.id);
     if (pr === null) continue;
     try {
@@ -43,13 +44,19 @@ export async function renderMergeEligibilityPreview(
       const result = mergeEligibility({
         evidence, policy, expected: { head: evidence.pr.head.sha, base: evidence.pr.base.sha },
         local: {
-          issueOpen: true, ticketOpen: true, pausedOrStopping: false,
+          issueOpen: true, ticketOpen: ticket.state === "open",
+          pausedOrStopping: ticket.state === "paused", // stop requests arrive with PR 2's durable state.
           stalledOrFailed: ticket.assignment.outcome === "failed" || ticket.assignment.stallRecoveryAttempts > 0,
-          budgetReached: false, workerIdle: ticket.assignment.turnStartedAt === null,
+          budgetReached: budgetReached(ticket.budget, now) !== null,
+          workerIdle: ticket.assignment.turnStartedAt === null,
           readyReplySent: false, quietUntil: null, now,
         },
       });
-      reports.push(`## Ticket ${ticket.id}, PR #${pr.number}\n\n${result.eligible ? "eligible" : `blocked: ${result.reason}`}`);
+      const untracked = [
+        "issue open state not tracked yet", "stop-request state not tracked yet",
+        "quiet window not tracked yet", "durable queued-work idle state not tracked yet",
+      ];
+      reports.push(`## Ticket ${ticket.id}, PR #${pr.number}\n\n${result.eligible ? "observed eligible on tracked evidence" : `blocked: ${result.reason}`}\n\n${untracked.join("; ")}.`);
     } catch (error) {
       reports.push(`## Ticket ${ticket.id}, PR #${pr.number}\n\nblocked: evidence read failed: ${error instanceof Error ? error.message : String(error)}`);
     }

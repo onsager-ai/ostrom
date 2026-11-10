@@ -41,7 +41,7 @@ export async function main(argv: readonly string[], env: Record<string, string |
     const path = env["OSTROM_DB"]?.trim() ?? "";
     if (path === "") return failure("ostromd is not running; set OSTROM_DB for read-only fallback");
     try {
-      const result = await direct(command, path);
+      const result = await direct(command, path, env);
       output(command, result);
       return 0;
     } catch (fallback) {
@@ -125,7 +125,7 @@ function unavailable(error: unknown): boolean {
   return error instanceof Error && ["ECONNREFUSED", "ENOENT", "ENOTSOCK"].some((code) => error.message.includes(code));
 }
 
-async function direct(command: Command, path: string): Promise<unknown> {
+async function direct(command: Command, path: string, env: Record<string, string | undefined>): Promise<unknown> {
   const store = Store.open(path);
   try {
     if (command.name === "status") return store.operatorStatus();

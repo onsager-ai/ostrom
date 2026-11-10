@@ -28,9 +28,10 @@ export function loadMergePolicy(env: Record<string, string | undefined>): MergeP
 export function effectiveReviews(reviews: readonly MergeReview[]): Map<string, MergeReview> {
   const effective = new Map<string, MergeReview>();
   for (const review of reviews) {
-    if (review.submittedAt === null || review.author?.id === null) continue;
-    if (review.state === "DISMISSED") { effective.delete(review.author.id); continue; }
-    if (review.state === "APPROVED" || review.state === "CHANGES_REQUESTED") effective.set(review.author.id, review);
+    const author = review.author;
+    if (review.submittedAt === null || author === null || author.id === null) continue;
+    if (review.state === "DISMISSED") { effective.delete(author.id); continue; }
+    if (review.state === "APPROVED" || review.state === "CHANGES_REQUESTED") effective.set(author.id, review);
   }
   return effective;
 }
@@ -41,8 +42,9 @@ export function countApprovals(reviews: readonly MergeReview[], head: string, au
   const allowed = new Set(allowlist.map((login) => login.toLowerCase()));
   let count = 0;
   for (const review of approved.values()) {
-    if (review.state !== "APPROVED" || review.commitOid !== head || review.author?.id === null) continue;
-    const identity = identities.get(review.author.id);
+    const author = review.author;
+    if (review.state !== "APPROVED" || review.commitOid !== head || author === null || author.id === null) continue;
+    const identity = identities.get(author.id);
     if (identity === undefined || identity.bot || identity.login.toLowerCase() === authorLogin.toLowerCase()) continue;
     if (identity.permission !== "write" && identity.permission !== "maintain" && identity.permission !== "admin") continue;
     if (allowed.size > 0 && !allowed.has(identity.login.toLowerCase())) continue;
@@ -65,6 +67,7 @@ export function mergeEligibility(input: EligibilityInput): { eligible: true } | 
   if (!local.issueOpen || !local.ticketOpen || local.pausedOrStopping || local.stalledOrFailed || local.budgetReached) return { eligible: false, reason: "local work is not mergeable" };
   if (!local.workerIdle) return { eligible: false, reason: "Worker is not idle" };
   if (evidence.pr.state !== "OPEN" || evidence.pr.draft || evidence.pr.head.sha !== input.expected.head || evidence.pr.base.sha !== input.expected.base || evidence.pr.mergeable !== "MERGEABLE" || evidence.pr.mergeStateStatus !== "CLEAN") return { eligible: false, reason: "pull request is not clean at the captured head and base" };
+  if (evidence.pr.head.repository !== evidence.pr.base.repository) return { eligible: false, reason: "pull request head is from a fork" };
   if (evidence.rollup === null || evidence.rollup.oid !== input.expected.head || evidence.rollup.state !== "SUCCESS") return { eligible: false, reason: "CI rollup is not successful for the captured head" };
   if (!evidence.rollup.associatedPrNumbers.includes(evidence.pr.number) || !evidence.rollup.suites.some((suite) => successfulPullRequestSuite(suite))) return { eligible: false, reason: "no successful pull_request workflow is evidenced for this PR" };
   if (evidence.rollup.suites.some((suite) => incompleteSuite(suite))) return { eligible: false, reason: "a check suite is not complete" };
@@ -89,7 +92,10 @@ function successfulPullRequestSuite(value: unknown): boolean {
 }
 
 function incompleteSuite(value: unknown): boolean {
-  return typeof value === "object" && value !== null && !Array.isArray(value) && (value as Record<string, unknown>)["status"] !== "COMPLETED";
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const suite = value as Record<string, unknown>;
+  const workflow = suite["workflowRun"];
+  return typeof workflow === "object" && workflow !== null && !Array.isArray(workflow) && suite["status"] !== "COMPLETED";
 }
 
 function unavailable(value: unknown): boolean {

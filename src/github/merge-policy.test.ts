@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { countApprovals, effectiveReviews, mergeEligibility } from "./merge-policy.ts";
+import { countApprovals, effectiveReviews, mergeEligibility, type EligibilityInput } from "./merge-policy.ts";
 import type { MergeEvidence, MergeReview } from "./merge-reader.ts";
 
 const review = (id: string, state: string, commitOid = "head", author = "alice"): MergeReview => ({ id, state, submittedAt: "2026-11-10T00:00:00Z", author: { id: `U_${author}`, login: author, type: "User" }, commitOid });
@@ -13,8 +13,8 @@ function evidence(): MergeEvidence {
     threads: [], reviews: [], rest: { pull: {}, repository: { allow_squash_merge: true }, protection: {}, rules: {} },
   };
 }
-function input() {
-  return { evidence: evidence(), policy: { strategy: "unattended" } as const, expected: { head: "head", base: "base" }, local: { issueOpen: true, ticketOpen: true, pausedOrStopping: false, stalledOrFailed: false, budgetReached: false, workerIdle: true, readyReplySent: true, quietUntil: new Date("2026-11-10T00:00:00Z"), now: new Date("2026-11-10T00:10:00Z") } };
+function input(): EligibilityInput {
+  return { evidence: evidence(), policy: { strategy: "unattended" }, expected: { head: "head", base: "base" }, local: { issueOpen: true, ticketOpen: true, pausedOrStopping: false, stalledOrFailed: false, budgetReached: false, workerIdle: true, readyReplySent: true, quietUntil: new Date("2026-11-10T00:00:00Z"), now: new Date("2026-11-10T00:10:00Z") } };
 }
 
 test("reviews reduce decisive state in order", () => {
@@ -37,15 +37,22 @@ test("eligibility reports every blocker in design order", () => {
     ["local work is not mergeable", (v) => { v.local.issueOpen = false; }],
     ["Worker is not idle", (v) => { v.local.workerIdle = false; }],
     ["pull request is not clean at the captured head and base", (v) => { v.evidence.pr.draft = true; }],
+    ["pull request head is from a fork", (v) => { v.evidence.pr.head.repository = "fork/r"; }],
     ["CI rollup is not successful for the captured head", (v) => { v.evidence.rollup!.state = "FAILURE"; }],
     ["no successful pull_request workflow is evidenced for this PR", (v) => { v.evidence.rollup!.suites = []; }],
-    ["a check suite is not complete", (v) => { v.evidence.rollup!.suites = [{ status: "QUEUED", conclusion: null, workflowRun: null }]; }],
+    ["a check suite is not complete", (v) => { v.evidence.rollup!.suites = [{ status: "QUEUED", conclusion: null, workflowRun: { event: "pull_request" } }]; }],
     ["branch requirements cannot be established", (v) => { v.evidence.rest.protection = { unavailable: "403" }; }],
     ["review requirements are not satisfied", (v) => { v.evidence.threads = [{ id: "t", resolved: false }]; }],
     ["quiet period has not elapsed", (v) => { v.local.readyReplySent = false; }],
   ];
   for (const [reason, change] of cases) { const value = input(); change(value); assert.deepEqual(mergeEligibility(value), { eligible: false, reason }); }
   assert.deepEqual(mergeEligibility(input()), { eligible: true });
+  const fixtureSuites = input();
+  fixtureSuites.evidence.rollup!.suites = [
+    { status: "QUEUED", conclusion: null, workflowRun: null },
+    { status: "COMPLETED", conclusion: "SUCCESS", workflowRun: { event: "pull_request" } },
+  ];
+  assert.deepEqual(mergeEligibility(fixtureSuites), { eligible: true });
 });
 
 test("approval and human policies are blockers", () => {
