@@ -149,6 +149,12 @@ later environment changes do not alter existing work; `ostrom
 extend` raises an individual ticket's limits. Workers run on cheap tiers (gpt-6-luna, Haiku) unless
 a ticket's budget says otherwise.
 
+## Milestone 2
+
+[The merging design](merging.md) proposes unattended merging by default, with human-merge and
+approval policies, the conditions for a deterministic daemon pass, and a sandbox verification plan.
+It is not implemented yet.
+
 ## Non-goals (for now)
 
 - Signed policy, gates, actor manifests, check catalogues, or verdict records.
@@ -180,9 +186,9 @@ a ticket's budget says otherwise.
    default, and with options of policy-based merging strategy". So Ostrom merges on its own by
    default, and a repository can choose a different merge strategy by policy. The milestone-1 run
    used human merges ([`e2e-m1.md`](e2e-m1.md)), which the pass criterion allows. The default's
-   conditions and the policy options are not designed yet; Journey 1's "the reviewer merges"
-   (`experience.md`) changes with that design. Rule 1 holds gates back until the loop runs and a
-   real failure calls for them; the loop now runs, and this policy is the operator's call.
+   conditions and policy options are proposed in [`merging.md`](merging.md), for milestone 2;
+   Journey 1 now points to that design. Rule 1 holds gates back until the loop runs and a real
+   failure calls for them; the loop now runs, and this policy is the operator's call.
 5. **Mid-turn crashes: narrowed.** A restart records an interrupted native turn and sends the
    resumed session the recovery prompt; production still needs an observed mid-turn crash run.
 6. **Semon readiness.** Today Semon exposes `list_sessions`, `get_session`, `read_transcript` and
