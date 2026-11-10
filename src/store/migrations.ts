@@ -514,6 +514,13 @@ export const migrations: readonly string[] = [
   ALTER TABLE pr_merge ADD COLUMN merged_by_id INTEGER;
   ALTER TABLE pr_merge ADD COLUMN evidence TEXT;
   `,
+
+  // 27: PR 2 already tracked opened replies, but their delivered text predates automatic merging.
+  // Reconstruct a fresh policy notice/window once for live work when merge sending is enabled.
+  `
+  DELETE FROM ready_reply WHERE reply_id LIKE 'outcome-%-opened'
+    AND assignment_id IN (SELECT id FROM assignment WHERE state = 'running');
+  `,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */

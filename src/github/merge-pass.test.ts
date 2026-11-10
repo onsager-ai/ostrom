@@ -1,5 +1,10 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import { migrations } from "../store/migrations.ts";
 
 import { Store } from "../store/store.ts";
 import { routeCandidates, type Batch } from "../router/router.ts";
@@ -348,6 +353,52 @@ test("first enable posts a distinct notice after an opened reply was sent before
   await mergePass(f.options());
   assert.equal(f.puts.length, 1);
   done(f, "ostrom");
+});
+
+test("merge-enabled migration refreshes previously tracked, delivered opened replies", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ostrom-merge-upgrade-"));
+  const path = join(dir, "store.db");
+  // Populate the pre-enable tracking state through public methods, then reopen at migration 26
+  // so the real migration, rather than a hand-written equivalent, upgrades those durable rows.
+  let store = Store.open(path);
+  const source = store.ensureSource("github", "o/r");
+  const thread = store.ensureThread({ sourceId: source.id, kind: "issue", number: 1, url: "https://github.com/o/r/issues/1" });
+  const trigger = store.insertTrigger({ sourceId: source.id, sourceEventId: "old", threadId: thread, kind: "issue_comment", actor: "alice", url: "https://github.com/o/r/issues/1#issuecomment-1", occurredAt: new Date() }).id;
+  const ticket = store.recordDecision({ threadId: thread, triggerIds: [trigger], verdict: "accept", reason: "work" }).ticketId!;
+  const assignment = store.createAssignment(ticket);
+  store.configureNativeAssignment(assignment, { harness: "claude", model: "m", worktree: "/w", branch: "b", machine: "h" });
+  store.startNativeAssignment(assignment, "s");
+  const opened = `outcome-a${assignment}-pr2-opened`;
+  store.enqueueReply({ id: opened, threadId: thread, body: "previous ready reply" });
+  store.trackReadyReply(assignment, opened);
+  store.markReplySent(opened);
+  assert.notEqual(store.readyReplySentAt(assignment), null);
+  store.close();
+  const upgrade = new DatabaseSync(path);
+  upgrade.prepare("DELETE FROM schema_version WHERE version = ?").run(migrations.length);
+  upgrade.close();
+  store = Store.open(path);
+  try {
+    assert.equal(store.readyReplyId(assignment), null);
+    assert.equal(store.hasReply(opened), true);
+    const pr = store.ensureThread({ sourceId: source.id, kind: "pull_request", number: 2, url: "https://github.com/o/r/pull/2" });
+    store.subscribe(ticket, pr);
+    const f = fixture();
+    let now = new Date();
+    const options: MergePassOptions = { ...f.options(), store, now: () => now,
+      workers: { release(id: number) { store.releaseAssignmentReservation(id); }, cancel() { return false; } } as unknown as Workers };
+    await mergePass(options);
+    const notice = `ready-a${assignment}-pr2`;
+    assert.equal(store.readyReplyId(assignment), notice);
+    assert.equal(store.readyReplySentAt(assignment), null);
+    store.markReplySent(notice);
+    await mergePass(options);
+    now = new Date(now.getTime() + 10 * MINUTE);
+    assert.deepEqual((await mergePass(options)).failed, []);
+    assert.equal(f.puts.length, 1);
+    assert.equal(store.prMerge("o/r", 2)!.origin, "ostrom");
+    f.store.close();
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("first enable repairs tracking attached after an already-sent opened reply", async () => {
