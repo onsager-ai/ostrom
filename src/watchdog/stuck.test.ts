@@ -56,7 +56,7 @@ test("stuck reply snapshot", () => {
 test("stuck reply numbers unnumbered choices", () => {
   const base = { tryingTo: "finish work", blockedBy: "a choice", tried: "two approaches", workSoFar: "The branch is pushed." };
   assert.ok(renderStuckReply({ ...base, choices: "Resume the stall later, or stop the stall and keep the current pull request" }).includes(
-    "**I need you to choose:** 1. Resume the stall later\n2. stop the stall and keep the current pull request",
+    "**I need you to choose:** 1. Resume the stall later,\n2. stop the stall and keep the current pull request",
   ));
   assert.ok(renderStuckReply({ ...base, choices: "1. continue\n2. stop" }).includes("**I need you to choose:** 1. continue\n2. stop"));
 });
