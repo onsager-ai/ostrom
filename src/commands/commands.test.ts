@@ -169,6 +169,25 @@ test("a reserved stop wakes on release and completes its cleanup", async () => {
   assert.ok(store.dueReplies().some((reply) => reply.id === `operator-stopped-${ticketId}`));
 });
 
+test("a stop completes its turn and cancels a queued follower without starting it", async () => {
+  const { store, github, runner, workers, ticketId, assignmentId } = fixture();
+  runner.hold = true;
+  await operatorControls(store, workers, github.gh, REPO).stop(ticketId);
+  await new Promise((resolve) => setImmediate(resolve));
+  workers.deliver(assignmentId, "follower", "must never run", () => { throw new Error("follower started"); });
+  runner.sessions[0]!.release();
+  await workers.drain();
+  assert.equal(store.getTicket(ticketId).state, "ended");
+  assert.equal(store.queuedTurn(assignmentId, `operator-stop-${ticketId}`)!.state, "finished");
+  const follower = store.queuedTurn(assignmentId, "follower")!;
+  assert.equal(follower.state, "cancelled");
+  assert.equal(follower.startedAt, null);
+  assert.equal(follower.turnId, null);
+  assert.notEqual(follower.finishedAt, null);
+  assert.deepEqual(store.unfinishedTurns(assignmentId), []);
+  assert.equal(runner.sessions[0]!.prompts.length, 1);
+});
+
 test("a stop request survives resume and is recorded before cleanup", async () => {
   const { store, github, runner, workers, ticketId } = fixture();
   runner.hold = true;

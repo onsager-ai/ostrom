@@ -65,6 +65,60 @@ test("migrations apply once and record their version", () => {
   );
 });
 
+test("queued-turn migration preserves every prior state and supports honest cancellation", () => {
+  const db = database();
+  // Build through migration 27, then migrate real queued/running/finished rows through 28.
+  const prefix = migrations.slice(0, 27);
+  db.exec("CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL) STRICT");
+  for (const [index, sql] of prefix.entries()) {
+    db.exec(sql);
+    db.prepare("INSERT INTO schema_version VALUES (?, ?)").run(index + 1, "2026-11-10T00:00:00Z");
+  }
+  // Minimal referenced records let all three old queue states exist before the forward migration.
+  const create = (state: string, started: string | null, finished: string | null) => db.prepare(
+    "INSERT INTO queued_turn (assignment_id, delivery_key, kind, prompt, state, created_at, started_at, finished_at) VALUES (1, ?, 'recovery', 'work', ?, '2026-11-10T00:00:00Z', ?, ?)",
+  ).run(state, state, started, finished);
+  db.exec("INSERT INTO source (id, kind, name) VALUES (1, 'github', 'o/r')");
+  db.exec("INSERT INTO thread (id, source_id, kind, number, url) VALUES (1, 1, 'issue', 1, 'https://github.com/o/r/issues/1')");
+  db.exec("INSERT INTO decision (id, thread_id, verdict, reason, decided_at) VALUES (1, 1, 'accept', 'work', '2026-11-10T00:00:00Z')");
+  db.exec("INSERT INTO ticket (id, decision_id, state, opened_at) VALUES (1, 1, 'open', '2026-11-10T00:00:00Z')");
+  db.exec("INSERT INTO assignment (id, ticket_id, state, created_at) VALUES (1, 1, 'pending', '2026-11-10T00:00:00Z')");
+  create("queued", null, null);
+  create("running", "2026-11-10T00:01:00Z", null);
+  create("finished", "2026-11-10T00:01:00Z", "2026-11-10T00:02:00Z");
+  const before = db.prepare("SELECT * FROM queued_turn ORDER BY delivery_key").all();
+  assert.equal(migrate(db), migrations.length);
+  assert.deepEqual(db.prepare("SELECT * FROM queued_turn ORDER BY delivery_key").all(), before);
+  db.prepare("UPDATE queued_turn SET state = 'cancelled', finished_at = ? WHERE delivery_key = 'queued'").run("2026-11-10T00:03:00Z");
+  assert.equal(db.prepare("SELECT started_at FROM queued_turn WHERE state = 'cancelled'").get()!["started_at"], null);
+  assert.throws(() => db.exec("UPDATE queued_turn SET state = 'finished' WHERE state = 'cancelled'"), /CHECK constraint/);
+  assert.throws(() => db.exec("UPDATE queued_turn SET started_at = 'invented' WHERE state = 'cancelled'"), /CHECK constraint/);
+  assert.equal(db.prepare("PRAGMA foreign_key_check").get(), undefined);
+});
+
+test("assignment terminal paths cancel queued prompts and finish started ones", () => {
+  for (const terminal of ["endAssignment", "abandonAssignment", "endTicket", "failed outcome"] as const) {
+    const { store, accept } = fixture();
+    const ticket = accept();
+    const assignment = store.createAssignment(ticket);
+    if (terminal !== "abandonAssignment") {
+      store.configureNativeAssignment(assignment, { harness: "codex", model: "m", worktree: "/w", branch: "b", machine: "h" });
+      store.startNativeAssignment(assignment, "s");
+      store.enqueueTurn({ assignmentId: assignment, deliveryKey: "running", kind: "follow_up", prompt: "running" });
+      store.beginQueuedTurn(assignment, "running", "s:1");
+    }
+    store.enqueueTurn({ assignmentId: assignment, deliveryKey: "queued", kind: "follow_up", prompt: "queued" });
+    if (terminal === "endAssignment") store.endAssignment(assignment, "closed PR");
+    else if (terminal === "abandonAssignment") store.abandonAssignment(assignment, "failed start");
+    else if (terminal === "endTicket") store.endTicket(ticket);
+    else store.enqueueOutcomeReply({ id: "failed", threadId: store.ticketContext(ticket).thread.id, body: "failed" }, { assignmentId: assignment });
+    assert.equal(store.queuedTurn(assignment, "queued")!.state, "cancelled", terminal);
+    assert.equal(store.queuedTurn(assignment, "queued")!.startedAt, null, terminal);
+    if (terminal !== "abandonAssignment") assert.equal(store.queuedTurn(assignment, "running")!.state, "finished", terminal);
+    assert.deepEqual(store.unfinishedTurns(assignment), [], terminal);
+  }
+});
+
 test("a database newer than the code is refused", () => {
   const db = database();
   migrate(db);
