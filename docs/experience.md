@@ -36,7 +36,9 @@ An issue author or reviewer, who never sees Ostrom's internals.
 2. Within minutes Ostrom replies with "taking this" or "not for me, because …".
 3. A PR appears, linked to the issue.
 4. Their later comments and reviews reach the **same** Worker, through thread subscription.
-5. The Worker revises; the reviewer merges.
+5. The Worker revises; Ostrom merges unattended by default, or waits for a human under the
+   repository's policy. The proposed milestone-2 conditions and policy options are in
+   [`merging.md`](merging.md); milestone 1 used human merges.
 
 ### Progress without flooding
 
