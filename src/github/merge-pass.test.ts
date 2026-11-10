@@ -4,7 +4,6 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { migrations } from "../store/migrations.ts";
 
 import { Store } from "../store/store.ts";
 import { routeCandidates, type Batch } from "../router/router.ts";
@@ -305,6 +304,22 @@ test("a merged PR with no attempt records external actor and queues its outcome 
   done(f, "external");
 });
 
+test("external merge cancels a never-started recovery and completes exactly once", async () => {
+  const f = fixture();
+  f.store.enqueueTurn({ assignmentId: f.assignment, deliveryKey: "recovery-1", kind: "recovery", prompt: "recover" });
+  f.remote.merged = true;
+  assert.deepEqual((await mergePass(f.options())).failed, []);
+  assert.deepEqual((await mergePass(f.options())).failed, []);
+  const turn = f.store.queuedTurn(f.assignment, "recovery-1")!;
+  assert.equal(turn.state, "cancelled");
+  assert.equal(turn.startedAt, null);
+  assert.equal(turn.turnId, null);
+  assert.notEqual(turn.finishedAt, null);
+  assert.deepEqual(f.store.unfinishedTurns(f.assignment), []);
+  assert.equal(f.puts.length, 0);
+  done(f, "external");
+});
+
 test("crash between reservation and attempt creation releases its orphan reservation", async () => {
   const f = fixture();
   assert.equal(f.store.reserveAssignment(f.assignment), true);
@@ -376,7 +391,7 @@ test("merge-enabled migration refreshes previously tracked, delivered opened rep
   assert.notEqual(store.readyReplySentAt(assignment), null);
   store.close();
   const upgrade = new DatabaseSync(path);
-  upgrade.prepare("DELETE FROM schema_version WHERE version = ?").run(migrations.length);
+  upgrade.prepare("DELETE FROM schema_version WHERE version >= 27").run();
   upgrade.close();
   store = Store.open(path, { now: () => now });
   try {

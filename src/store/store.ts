@@ -114,7 +114,7 @@ export interface Ticket {
 }
 
 export type QueuedTurnKind = "follow_up" | "review" | "control" | "budget_pause" | "stuck" | "recovery";
-export type QueuedTurnState = "queued" | "running" | "finished";
+export type QueuedTurnState = "queued" | "running" | "finished" | "cancelled";
 
 /** A durable Worker prompt. Source pointers identify domain data, not a transcript. */
 export interface QueuedTurn {
@@ -707,16 +707,16 @@ export class Store {
   }
 
   endTicket(ticketId: number): void {
-    const { changes } = this.#run(
-      "UPDATE ticket SET state = 'ended', ended_at = ? WHERE id = ? AND state IN ('open', 'paused')",
-      this.#stamp(),
-      ticketId,
-    );
-    if (Number(changes) !== 1) {
-      throw new IllegalTransition(
-        `ticket ${ticketId}: ${this.getTicket(ticketId).state} → ended is not allowed`,
+    this.#transaction(() => {
+      const { changes } = this.#run(
+        "UPDATE ticket SET state = 'ended', ended_at = ? WHERE id = ? AND state IN ('open', 'paused')",
+        this.#stamp(), ticketId,
       );
-    }
+      if (Number(changes) !== 1) {
+        throw new IllegalTransition(`ticket ${ticketId}: ${this.getTicket(ticketId).state} → ended is not allowed`);
+      }
+      for (const row of this.#all("SELECT id FROM assignment WHERE ticket_id = ?", ticketId)) this.#finishAssignmentTurns(row["id"] as number);
+    });
   }
 
   // --- assignments ---------------------------------------------------------------------------
@@ -761,26 +761,28 @@ export class Store {
 
   /** `running → ended`, with the reason when the Worker was stopped rather than finished. */
   endAssignment(assignmentId: number, reason: string | null = null): void {
-    const { changes } = this.#run(
-      `UPDATE assignment SET state = 'ended', ended_at = ?, end_reason = ?, stall_recovery_attempts = 0
-       WHERE id = ? AND state = 'running'`,
-      this.#stamp(),
-      reason,
-      assignmentId,
-    );
-    if (Number(changes) !== 1) this.#illegalAssignment(assignmentId, "ended");
+    this.#transaction(() => {
+      const { changes } = this.#run(
+        `UPDATE assignment SET state = 'ended', ended_at = ?, end_reason = ?, stall_recovery_attempts = 0
+         WHERE id = ? AND state = 'running'`,
+        this.#stamp(), reason, assignmentId,
+      );
+      if (Number(changes) !== 1) this.#illegalAssignment(assignmentId, "ended");
+      this.#finishAssignmentTurns(assignmentId);
+    });
   }
 
   /** `pending → ended`: the Worker never started, for the reason given. */
   abandonAssignment(assignmentId: number, reason: string): void {
     if (reason === "") throw new Error("reason must not be empty");
-    const { changes } = this.#run(
-      "UPDATE assignment SET state = 'ended', ended_at = ?, end_reason = ? WHERE id = ? AND state = 'pending'",
-      this.#stamp(),
-      reason,
-      assignmentId,
-    );
-    if (Number(changes) !== 1) this.#illegalAssignment(assignmentId, "ended");
+    this.#transaction(() => {
+      const { changes } = this.#run(
+        "UPDATE assignment SET state = 'ended', ended_at = ?, end_reason = ? WHERE id = ? AND state = 'pending'",
+        this.#stamp(), reason, assignmentId,
+      );
+      if (Number(changes) !== 1) this.#illegalAssignment(assignmentId, "ended");
+      this.#finishAssignmentTurns(assignmentId);
+    });
   }
 
   /** Assignments that ended with a reason (never started, or stopped), on open tickets, oldest first. */
@@ -994,7 +996,7 @@ export class Store {
   /** Unfinished prompts in per-assignment order, including a cut-off running turn. */
   unfinishedTurns(assignmentId: number): QueuedTurn[] {
     return this.#all(
-      "SELECT * FROM queued_turn WHERE assignment_id = ? AND state <> 'finished' ORDER BY created_at, delivery_key",
+      "SELECT * FROM queued_turn WHERE assignment_id = ? AND state IN ('queued', 'running') ORDER BY created_at, delivery_key",
       assignmentId,
     ).map(toQueuedTurn);
   }
@@ -1021,10 +1023,20 @@ export class Store {
   /** A completed or intentionally cancelled queued prompt is never started again. */
   finishQueuedTurn(assignmentId: number, deliveryKey: string): void {
     this.#run(
-      `UPDATE queued_turn SET state = 'finished', finished_at = ?
-       WHERE assignment_id = ? AND delivery_key = ? AND state <> 'finished'`,
+      `UPDATE queued_turn SET state = CASE WHEN state = 'queued' THEN 'cancelled' ELSE 'finished' END, finished_at = ?
+       WHERE assignment_id = ? AND delivery_key = ? AND state IN ('queued', 'running')`,
       this.#stamp(), assignmentId, deliveryKey,
     );
+  }
+
+  /** Terminal work cancels never-started prompts and finishes only turns that actually began. */
+  #finishAssignmentTurns(assignmentId: number): void {
+    this.#run(
+      `UPDATE queued_turn SET state = CASE WHEN state = 'queued' THEN 'cancelled' ELSE 'finished' END, finished_at = ?
+       WHERE assignment_id = ? AND state IN ('queued', 'running')`,
+      this.#stamp(), assignmentId,
+    );
+    this.releaseAssignmentReservation(assignmentId);
   }
 
   /** An interrupted native turn is replaced by its recovery prompt; queued followers remain. */
@@ -1040,7 +1052,7 @@ export class Store {
   assignmentWorkIdle(assignmentId: number, ignoreReservation = false): boolean {
     const row = this.#get(
       `SELECT (SELECT turn_started_at FROM assignment WHERE id = ?) IS NULL
-          AND NOT EXISTS (SELECT 1 FROM queued_turn WHERE assignment_id = ? AND state <> 'finished')
+          AND NOT EXISTS (SELECT 1 FROM queued_turn WHERE assignment_id = ? AND state IN ('queued', 'running'))
           AND (? OR NOT EXISTS (SELECT 1 FROM assignment_reservation WHERE assignment_id = ?))
           AND NOT EXISTS (SELECT 1 FROM merge_attempt WHERE candidate_id IN (SELECT id FROM merge_candidate WHERE assignment_id = ?) AND state IN ('pending', 'unknown'))
           AND NOT EXISTS (
@@ -1246,8 +1258,7 @@ export class Store {
         input.mergedById, input.origin, input.attemptId ?? null, input.evidence,
       );
       if (input.attemptId !== undefined) this.finishMergeAttempt(input.attemptId, "confirmed", input.mergeSha === null ? {} : { sha: input.mergeSha });
-      this.#run("UPDATE queued_turn SET state = 'finished', finished_at = ? WHERE assignment_id = ? AND state <> 'finished'", this.#stamp(), input.assignmentId);
-      this.releaseAssignmentReservation(input.assignmentId);
+      this.#finishAssignmentTurns(input.assignmentId);
       const { duplicate } = this.#insertReply({
         id: `outcome-a${input.assignmentId}-pr${input.prNumber}-merged`, threadId: input.threadId, body: input.body,
       });
@@ -1620,6 +1631,8 @@ export class Store {
   }
 
   #transaction<T>(body: () => T): T {
+    // Terminal helpers also run inside atomic outcome/reconciliation operations.
+    if (this.#db.isTransaction) return body();
     this.#db.exec("BEGIN IMMEDIATE");
     try {
       const result = body();
