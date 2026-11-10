@@ -104,16 +104,18 @@ export function claudeRunner(env: Record<string, string | undefined>, run: Claud
 export function codexRunner(config: CodexOptions, makeClient: CodexClientFactory = (options) => new Codex(options)): Runner {
   function create(options: SessionOptions): Session {
     requireOptions(options);
-    const workerConfig: CodexOptions = options.sandbox === "read-only" || options.writableDirs === undefined
-      ? config
-      : { ...config, configOverrides: [...(config.configOverrides ?? []), ...codexWorkerConfigOverrides(options.cwd, options.writableDirs)] };
+    // A Worker runs under its explicit profile; the SDK's sandbox flag would override it.
+    const profiled = options.sandbox !== "read-only" && options.writableDirs !== undefined;
+    const workerConfig: CodexOptions = profiled
+      ? { ...config, configOverrides: [...(config.configOverrides ?? []), ...codexWorkerConfigOverrides(options.cwd, options.writableDirs!)] }
+      : config;
     const codex = makeClient(workerConfig);
     let id = options.sessionId ?? null;
     let busy = false;
     const threadOptions = {
       workingDirectory: options.cwd,
       model: options.model,
-      ...(options.writableDirs === undefined ? { sandboxMode: options.sandbox ?? "workspace-write" } : {}),
+      ...(profiled ? {} : { sandboxMode: options.sandbox ?? "workspace-write" }),
       networkAccessEnabled: options.sandbox !== "read-only",
       approvalPolicy: "never" as const,
       // A read-only session (the Router) runs in a scratch directory that is not a Git repository.
