@@ -24,7 +24,7 @@ joined to the native session IDs (read through Semon) and the GitHub URLs. All t
 | Review follow-up reaches the same Worker | Pass | Review 2 on PR #2: one turn, one reply |
 | The status card stays a single comment | Pass | One card comment per issue, edited in place (`card-thread-1`, `card-thread-4`) |
 | `@ostrom pause` and `resume` keep the same session | Pass | Triggers 5 and 6, session `01a1c0c5-ff62-…` throughout |
-| An `ostromd` restart mid-ticket resumes the session by its ID | Pass | SIGKILL during turn 6, recovery `1 interrupted`, `codex exec resume 01a1c0c5-ff62-…` |
+| An `ostromd` restart mid-ticket resumes the session by its ID | Pass | SIGKILL during turn 6 and SIGTERM during ticket 9's turn 1; both logged `recover: 1 resumed, 1 interrupted` and resumed their stored Codex session IDs |
 | A scripted stall ends in the stuck reply | Pass | Ticket 8 below: two silent recoveries in the same session, then the public reply `stuck-6` |
 
 A human merged both PRs (open question 4). The merge is the operator's decision; nothing was relayed
@@ -120,10 +120,23 @@ Each was fixed in its own PR, merged on green CI, and the daemon restarted onto 
 | #685 | The first recovery prompt ("make progress") made the scripted Worker drop the sleep, assume an answer and open an empty PR. The stall brief now re-runs the sleep and never opens a PR |
 | #686 | `ostrom stop 7` did nothing to the paused ticket: every stop path is a turn, and Workers skipped turns on paused tickets |
 
+## Graceful-stop restart after #682
+
+[ostrom-sandbox#10](https://github.com/onsager-ai/ostrom-sandbox/issues/10), "Parse option skips blank
+lines", verified the previously unrun graceful-stop path. Ticket 9, assignment 9, Worker session
+`01a1c2fe-f999-7de3-9862-25db4fd0eaca` (Codex, `gpt-6-luna`, branch `ostrom/ticket-9-9`) was a
+temporary verification task. The issue was closed without a PR or merge after the check.
+
+| Time | Event | Record |
+|---|---|---|
+| 01:07:32 | Router accepts the request and dispatches the Worker; first turn is open | decision 21, ticket 9, assignment 9, [issue #10](https://github.com/onsager-ai/ostrom-sandbox/issues/10) |
+| 01:08:01 | `ostromd` receives SIGTERM by PID while that turn runs; its Codex child exits | store retains `running`, the original `turn_started_at`, `outcome` null and no turn error |
+| 01:08 | Restart logs `recover: 1 resumed, 1 interrupted, 0 never started` | Codex runs `resume 01a1c2fe-f999-7de3-9862-25db4fd0eaca` with `--model gpt-6-luna` |
+| 01:08:23 | The resumed rollout receives `INTERRUPTED_PROMPT` | "You were interrupted while working on this ticket. Check your state (git status, your branch and pull request) and continue where you stopped." |
+| 01:09–01:10 | Operator stops the temporary ticket; no PR or remote branch exists | ticket and assignment ended; issue closed [with this note](https://github.com/onsager-ai/ostrom-sandbox/issues/10#issuecomment-6755983168); worker worktree and local branch removed |
+
 Recorded for later, not needed for the pass criterion:
 
-- A restart by graceful stop (SIGTERM) mid-turn was not repeated after #682; only the SIGKILL
-  restart above is verified on the sandbox.
 - #675: a review turn interrupted by a restart loses its reply.
 - #677: a newly opened issue that asks for Ostrom is not a trigger; only comments are.
 - #678 (fixed in #680): any update to an open issue with an ended ticket, including Ostrom's own card
