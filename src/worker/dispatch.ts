@@ -28,6 +28,7 @@ export function workerBrief(context: TicketContext, branch: string, base: string
     "request will reach you in this session as follow-up messages.",
     "You run unattended: never stop to ask an interactive question. Decide, state your assumption in",
     "the pull request description, and carry on.",
+    "If a normal commit fails, report the failure; do not create or push commit objects with Git plumbing.",
     ...(rules === undefined ? [] : ["", "House rules for this machine, which you must follow:", rules]),
   ].join("\n");
 }

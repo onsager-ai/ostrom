@@ -7,7 +7,7 @@ import { afterEach, test } from "node:test";
 import { Store } from "../store/store.ts";
 import { FakeRunner } from "./fake-runner.ts";
 import { workerBrief } from "./dispatch.ts";
-import { INTERRUPTED_PROMPT, Workers, type WorkersDeps } from "./workers.ts";
+import { gitDirs, INTERRUPTED_PROMPT, Workers, type WorkersDeps } from "./workers.ts";
 
 const REPO = "onsager-ai/ostrom";
 const config = { repo: "/repo", base: "main", worktrees: "/wt", harness: "codex" as const, model: "gpt-6-luna", machine: "host" };
@@ -52,12 +52,27 @@ test("dispatch makes the worktree, starts the session with the brief and stores 
   const session = runner.sessions[0]!;
   assert.equal(session.options.cwd, `/wt/ticket-${ticketId}-1`);
   assert.equal(session.options.model, "gpt-6-luna");
+  assert.deepEqual(session.options.writableDirs, [
+    "/repo/.git/objects",
+    "/repo/.git/refs",
+    "/repo/.git/logs",
+    `/repo/.git/worktrees/ticket-${ticketId}-1`,
+  ]);
   assert.deepEqual(session.prompts, [workerBrief(store.ticketContext(ticketId), dispatched.branch, "main")]);
 
   session.release();
   await workers.drain();
   const done = store.getAssignment(1);
   assert.deepEqual([done.turnStartedAt, done.inputTokens, done.cachedInputTokens, done.outputTokens, done.outcome], [null, 10, 5, 2, null]);
+});
+
+test("linked worktrees grant only the Git paths a commit changes", () => {
+  assert.deepEqual(gitDirs("/repo", "/workers/ticket-12-34"), [
+    "/repo/.git/objects",
+    "/repo/.git/refs",
+    "/repo/.git/logs",
+    "/repo/.git/worktrees/ticket-12-34",
+  ]);
 });
 
 test("cancelling an in-flight turn lets its queued replacement run without a cancelled outcome", async () => {
