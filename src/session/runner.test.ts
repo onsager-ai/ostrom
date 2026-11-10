@@ -2,7 +2,7 @@ import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { Codex, ThreadEvent } from "@openai/codex-sdk";
-import { claudeRunner, codexRunner } from "./runner.ts";
+import { claudeRunner, codexRunner, codexWorkerConfigOverrides } from "./runner.ts";
 import { sessionConfig } from "./config.ts";
 
 test("Claude resumes the same session with the explicit model", async () => {
@@ -20,6 +20,37 @@ test("Claude resumes the same session with the explicit model", async () => {
   assert.deepEqual(calls, [{ model: "haiku", permissionMode: "bypassPermissions", allowDangerouslySkipPermissions: true }, { model: "haiku", resume: "session", permissionMode: "bypassPermissions", allowDangerouslySkipPermissions: true }]);
 });
 
+test("Codex worker profile explicitly grants only commit metadata paths", () => {
+  assert.deepEqual(codexWorkerConfigOverrides("/worktree", ["/repo/.git/objects", "/repo/.git/refs", "/repo/.git/logs", "/repo/.git/worktrees/ticket"]), [
+    'default_permissions="ostrom_worker"',
+    'permissions.ostrom_worker={filesystem={"/"="read","/worktree"="write","/repo/.git/objects"="write","/repo/.git/refs"="write","/repo/.git/logs"="write","/repo/.git/worktrees/ticket"="write"},network={enabled=true}}',
+  ]);
+});
+
+test("Codex constructs a Worker with its explicit profile and leaves the Router unchanged", async () => {
+  const configs: unknown[] = [];
+  const threadOptions: unknown[] = [];
+  const thread = { runStreamed: async () => ({ events: (async function* (): AsyncGenerator<ThreadEvent> {
+    yield { type: "thread.started", thread_id: "id" };
+    yield { type: "turn.completed", usage: { input_tokens: 0, cached_input_tokens: 0, cache_write_input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0 } };
+  })() }) };
+  const makeClient = (config: import("@openai/codex-sdk").CodexOptions) => {
+    configs.push(config);
+    return { startThread: (options: unknown) => { threadOptions.push(options); return thread; }, resumeThread: () => thread } as unknown as Pick<Codex, "startThread" | "resumeThread">;
+  };
+  const runner = codexRunner({ configOverrides: ["provider=\"openai\""] }, makeClient);
+  await runner.start({ cwd: "/worktree", model: "luna", writableDirs: ["/repo/.git/objects"] }).send("work");
+  await runner.start({ cwd: "/scratch", model: "luna", sandbox: "read-only" }).send("route");
+  assert.deepEqual(configs, [
+    { configOverrides: ["provider=\"openai\"", ...codexWorkerConfigOverrides("/worktree", ["/repo/.git/objects"])] },
+    { configOverrides: ["provider=\"openai\""] },
+  ]);
+  assert.deepEqual(threadOptions, [
+    { workingDirectory: "/worktree", model: "luna", networkAccessEnabled: true, approvalPolicy: "never" },
+    { workingDirectory: "/scratch", model: "luna", sandboxMode: "read-only", networkAccessEnabled: false, approvalPolicy: "never", skipGitRepoCheck: true },
+  ]);
+});
+
 test("Codex returns an unverified model and forwards resume options", async () => {
   const events: ThreadEvent[] = [
     { type: "thread.started", thread_id: "id" },
@@ -29,11 +60,11 @@ test("Codex returns an unverified model and forwards resume options", async () =
   let seen: unknown;
   const thread = { runStreamed: async () => ({ events: (async function* () { yield* events; })() }) };
   const client = { startThread: () => thread, resumeThread: (id: string, options: unknown) => { seen = { id, options }; return thread; } } as unknown as Pick<Codex, "startThread" | "resumeThread">;
-  const session = codexRunner({}, client).resume({ cwd: "/tmp", model: "luna", sessionId: "id", writableDirs: ["/repo/.git"] });
+  const session = codexRunner({}, () => client).resume({ cwd: "/tmp", model: "luna", sessionId: "id", writableDirs: ["/repo/.git"] });
   const result = await session.send("hello");
   assert.equal(result.model, null);
   assert.deepEqual(result.usage, { inputTokens: 1, cachedInputTokens: 3, outputTokens: 2 });
-  assert.deepEqual(seen, { id: "id", options: { workingDirectory: "/tmp", model: "luna", sandboxMode: "workspace-write", networkAccessEnabled: true, approvalPolicy: "never", additionalDirectories: ["/repo/.git"] } });
+  assert.deepEqual(seen, { id: "id", options: { workingDirectory: "/tmp", model: "luna", networkAccessEnabled: true, approvalPolicy: "never" } });
 });
 
 test("read-only Router sessions deny Claude edits and use Codex read-only sandbox", async () => {
@@ -55,7 +86,7 @@ test("read-only Router sessions deny Claude edits and use Codex read-only sandbo
     yield { type: "turn.completed", usage: { input_tokens: 0, cached_input_tokens: 0, cache_write_input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0 } };
   })() }) };
   const client = { startThread: (options: unknown) => { codexOptions = options; return thread; } } as unknown as Pick<Codex, "startThread" | "resumeThread">;
-  await codexRunner({}, client).start({ cwd: "/scratch", model: "luna", sandbox: "read-only" }).send("route");
+  await codexRunner({}, () => client).start({ cwd: "/scratch", model: "luna", sandbox: "read-only" }).send("route");
   assert.deepEqual(codexOptions, { workingDirectory: "/scratch", model: "luna", sandboxMode: "read-only", networkAccessEnabled: false, approvalPolicy: "never", skipGitRepoCheck: true });
 });
 
@@ -67,7 +98,7 @@ test("Codex reports its session id before the turn completes", async () => {
     yield { type: "turn.completed", usage: { input_tokens: 0, cached_input_tokens: 0, cache_write_input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0 } };
   })() }) };
   const client = { startThread: () => thread } as unknown as Pick<Codex, "startThread" | "resumeThread">;
-  await codexRunner({}, client).start({ cwd: "/tmp", model: "luna", onSessionId: (id) => ids.push(id) }).send("hello");
+  await codexRunner({}, () => client).start({ cwd: "/tmp", model: "luna", onSessionId: (id) => ids.push(id) }).send("hello");
 });
 
 test("Codex cancellation is reported rather than treated as success", async () => {
@@ -76,7 +107,7 @@ test("Codex cancellation is reported rather than treated as success", async () =
   } };
   const client = { startThread: () => thread } as unknown as Pick<Codex, "startThread" | "resumeThread">;
   const controller = new AbortController(); controller.abort();
-  const result = await codexRunner({}, client).start({ cwd: "/tmp", model: "luna" }).send("hello", controller.signal);
+  const result = await codexRunner({}, () => client).start({ cwd: "/tmp", model: "luna" }).send("hello", controller.signal);
   assert.equal(result.status, "cancelled");
 });
 

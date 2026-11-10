@@ -2,7 +2,7 @@
 // session started and resumed by ID through the session runner. Turns on one session run one at a
 // time; a follow-up queues behind the running turn. Everything here is deterministic.
 
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 import { turnBudgetReached } from "../budget/budgets.ts";
 import { queueStatusCard } from "../github/cards.ts";
@@ -30,9 +30,15 @@ export interface WorkersDeps {
   log?: (line: string) => void;
 }
 
-/** The main clone's Git directory, where a worktree's commits are written. */
-export function gitDir(repo: string): string {
-  return join(repo, ".git");
+/** The writable Git metadata for a linked worktree's ordinary commits. */
+export function gitDirs(repo: string, worktree: string): string[] {
+  const git = join(repo, ".git");
+  return [
+    join(git, "objects"),
+    join(git, "refs"),
+    join(git, "logs"),
+    join(git, "worktrees", basename(worktree)),
+  ];
 }
 
 /** Turns that run even on a paused ticket: those that pause it, and those that stop it. */
@@ -73,7 +79,7 @@ export class Workers {
       const session = this.#deps.runners[config.harness].start({
         cwd: path,
         model: config.model,
-        writableDirs: [gitDir(config.repo)],
+        writableDirs: gitDirs(config.repo, path),
         onSessionId: (sessionId) => {
           store.startNativeAssignment(id, sessionId);
           store.beginTurn(id);
@@ -178,7 +184,7 @@ export class Workers {
         cwd: assignment.worktree!,
         model: assignment.model!,
         sessionId: assignment.sessionId!,
-        writableDirs: [gitDir(this.#deps.config.repo)],
+        writableDirs: gitDirs(this.#deps.config.repo, assignment.worktree!),
       });
       this.#sessions.set(assignment.id, session);
     }

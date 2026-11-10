@@ -22,7 +22,7 @@ export interface SessionOptions {
   onSessionId?: (id: string) => void;
   /** A Router uses a one-shot, read-only session; Workers retain their writable worktree. */
   sandbox?: "read-only" | "workspace-write";
-  /** More writable directories. A worktree's Git data lives in the main clone's `.git`, outside `cwd`. */
+  /** Git metadata paths a Codex Worker needs outside its worktree. */
   writableDirs?: string[];
 }
 
@@ -34,6 +34,21 @@ export interface Runner {
 type ClaudeQuery = (options: Parameters<typeof query>[0]) => AsyncIterable<SDKMessage>;
 type CodexThread = { runStreamed: (prompt: string, options?: { signal?: AbortSignal }) => Promise<{ events: AsyncIterable<ThreadEvent> }> };
 type CodexClient = Pick<Codex, "startThread" | "resumeThread">;
+type CodexClientFactory = (config: CodexOptions) => CodexClient;
+
+const CODEX_WORKER_PROFILE = "ostrom_worker";
+
+/**
+ * Codex protects `.git` under workspace-write roots, including a linked worktree's gitdir.
+ * An explicit profile grants only the worktree and metadata paths Git changes for a commit.
+ */
+export function codexWorkerConfigOverrides(cwd: string, writableDirs: string[]): string[] {
+  const filesystem = [`${JSON.stringify("/")}=\"read\"`, `${JSON.stringify(cwd)}=\"write\"`, ...writableDirs.map((dir) => `${JSON.stringify(dir)}=\"write\"`)].join(",");
+  return [
+    `default_permissions=${JSON.stringify(CODEX_WORKER_PROFILE)}`,
+    `permissions.${CODEX_WORKER_PROFILE}={filesystem={${filesystem}},network={enabled=true}}`,
+  ];
+}
 
 function requireOptions(options: SessionOptions): void {
   if (!options.cwd || !options.model) throw new Error("cwd and model are required");
@@ -86,22 +101,27 @@ export function claudeRunner(env: Record<string, string | undefined>, run: Claud
   return { start: create, resume: create };
 }
 
-export function codexRunner(config: CodexOptions, client: CodexClient = new Codex(config)): Runner {
+export function codexRunner(config: CodexOptions, makeClient: CodexClientFactory = (options) => new Codex(options)): Runner {
   function create(options: SessionOptions): Session {
     requireOptions(options);
+    // A Worker runs under its explicit profile; the SDK's sandbox flag would override it.
+    const profiled = options.sandbox !== "read-only" && options.writableDirs !== undefined;
+    const workerConfig: CodexOptions = profiled
+      ? { ...config, configOverrides: [...(config.configOverrides ?? []), ...codexWorkerConfigOverrides(options.cwd, options.writableDirs!)] }
+      : config;
+    const codex = makeClient(workerConfig);
     let id = options.sessionId ?? null;
     let busy = false;
     const threadOptions = {
       workingDirectory: options.cwd,
       model: options.model,
-      sandboxMode: options.sandbox ?? "workspace-write",
+      ...(profiled ? {} : { sandboxMode: options.sandbox ?? "workspace-write" }),
       networkAccessEnabled: options.sandbox !== "read-only",
       approvalPolicy: "never" as const,
       // A read-only session (the Router) runs in a scratch directory that is not a Git repository.
       ...(options.sandbox === "read-only" ? { skipGitRepoCheck: true } : {}),
-      ...(options.writableDirs?.length ? { additionalDirectories: options.writableDirs } : {}),
     };
-    const thread: CodexThread = id === null ? client.startThread(threadOptions) : client.resumeThread(id, threadOptions);
+    const thread: CodexThread = id === null ? codex.startThread(threadOptions) : codex.resumeThread(id, threadOptions);
     return { async send(prompt, signal) {
       if (busy) throw new Error("session already has a running turn");
       busy = true;

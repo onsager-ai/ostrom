@@ -47,9 +47,11 @@ test("the brief is a summary plus pointers and asks for a PR that references the
   assert.match(brief, new RegExp(`pull request\non ${REPO} against main whose description says "Refs #7"`));
 });
 
-test("the brief tells an unattended Worker never to block on a question", () => {
+test("the brief tells an unattended Worker never to block on a question or work around a failed commit", () => {
   const { store, ticketId } = fixture();
-  assert.match(workerBrief(store.ticketContext(ticketId), "b", "main"), /never stop to ask an interactive question/);
+  const brief = workerBrief(store.ticketContext(ticketId), "b", "main");
+  assert.match(brief, /never stop to ask an interactive question/);
+  assert.match(brief, /do not create or push commit objects with Git plumbing/);
 });
 
 test("the machine's house rules close the brief when configured, and are absent otherwise", () => {
