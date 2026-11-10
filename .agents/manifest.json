@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "source": {
+    "repository": "onsager-ai/dev-skills",
+    "revision": "61052a24f65d0cffc017fdd1af9a848d36eabcbc"
+  },
+  "skills": [],
+  "rules": [
+    "git-hooks"
+  ],
+  "local_skills": [],
+  "hooks": [
+    "primary-checkout-guard"
+  ]
+}

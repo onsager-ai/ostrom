@@ -24,3 +24,9 @@ Claude and Codex sessions, follow-ups routed by thread subscription, and a Watch
 - Use one worktree per session, and branch before you commit.
 - The pre-restart code is in Git history only. Borrow pieces deliberately; nothing comes over by
   default.
+
+<!-- agent-config:begin -->
+## Shared agent conventions (generated)
+
+- **git-hooks:** Enable generated repository hooks once per clone with `git config core.hooksPath .githooks`; in linked worktrees this relative path resolves to each checkout's own `.githooks`. Never use `--no-verify`. A passing hook, or an unconfigured hook, is not formatter evidence: run and report the repository gate's real result, for example `cargo fmt --all -- --check; echo exit=$?`.
+<!-- agent-config:end -->
