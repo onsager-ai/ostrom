@@ -119,6 +119,31 @@ test("a review with three inline comments gets one Worker turn, one reply, and r
   );
 });
 
+test("a restart during a review turn posts its one reply when recovery completes", async () => {
+  const { store, runner, workers, pr, trigger } = fixture();
+  runner.hold = true;
+  trigger(pr, "pull_request_review", { reviewId: "44", body: "Please make these changes." });
+  trigger(pr, "pull_request_review_comment", { reviewId: "44", body: "Rename this.", path: "src/a.ts", line: 12 });
+  routeFollowUps(store, workers);
+  await tick();
+
+  workers.stop();
+  await workers.drain();
+  runner.hold = false;
+  const restarted = new Workers({
+    store,
+    config: { repo: "/repo", base: "main", worktrees: "/wt", harness: "codex", model: "gpt-6-luna", machine: "host" },
+    runners: { claude: runner, codex: runner },
+  });
+  assert.deepEqual(restarted.recover().interrupted, [1]);
+  await restarted.drain();
+
+  assert.deepEqual(
+    store.dueReplies().filter((reply) => reply.kind === "comment" && reply.id.startsWith("review-")).map((reply) => [reply.id, reply.body]),
+    [["review-1-44", "ok"]],
+  );
+});
+
 test("the follow-up is a summary plus a pointer to the trigger", () => {
   const { store, pr, trigger, ticketId } = fixture();
   const id = trigger(pr, "pull_request_review");

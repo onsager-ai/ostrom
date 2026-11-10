@@ -6,6 +6,7 @@ import { join } from "node:path";
 
 import { turnBudgetReached } from "../budget/budgets.ts";
 import { queueStatusCard } from "../github/cards.ts";
+import { renderReviewReply } from "../github/review-reply.ts";
 import type { WorkerConfig } from "../ostromd/config.ts";
 import { rolloutModel } from "../session/rollout.ts";
 import type { Runner, Session, TurnResult } from "../session/runner.ts";
@@ -148,9 +149,19 @@ export class Workers {
       this.#session(assignment);
       pass.resumed.push(assignment.id);
       if (assignment.turnStartedAt === null) continue;
+      const turnId = `${assignment.sessionId}:${assignment.turns}`;
+      const reviews = store.reviewDeliveries(assignment.id, turnId);
       store.recordInterruption(assignment.id);
       pass.interrupted.push(assignment.id);
-      void this.#enqueue(assignment.id, () => this.#turn(assignment.id, INTERRUPTED_PROMPT));
+      void this.#enqueue(assignment.id, () => this.#turn(assignment.id, INTERRUPTED_PROMPT, undefined, (result) => {
+        for (const review of reviews) {
+          store.enqueueReply({
+            id: `review-${assignment.id}-${review.reviewId}`,
+            threadId: review.threadId,
+            body: renderReviewReply(result.text),
+          });
+        }
+      }));
     }
     return pass;
   }

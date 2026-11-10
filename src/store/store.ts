@@ -75,6 +75,12 @@ export interface PendingDelivery {
   assignmentId: number | null;
 }
 
+/** A review delivered to one native turn, whose reply is owed when that turn resumes. */
+export interface ReviewDelivery {
+  threadId: number;
+  reviewId: string;
+}
+
 export type CommandReceiptName = "redirect" | "pause" | "resume" | "stop" | "forbidden" | "close_issue" | "close_pull_request" | "ignore_issue_state";
 
 export interface PendingCommand {
@@ -923,6 +929,18 @@ export class Store {
     this.#transaction(() => {
       for (const triggerId of triggerIds) this.recordDelivery(triggerId, assignmentId, turnId);
     });
+  }
+
+  /** Submitted reviews delivered to one native turn. Recovery re-attaches their summary reply. */
+  reviewDeliveries(assignmentId: number, turnId: string): ReviewDelivery[] {
+    return this.#all(
+      `SELECT "trigger".thread_id, "trigger".review_id FROM delivery
+       JOIN "trigger" ON "trigger".id = delivery.trigger_id
+       WHERE delivery.assignment_id = ? AND delivery.turn_id = ? AND "trigger".review_id IS NOT NULL
+       GROUP BY "trigger".thread_id, "trigger".review_id`,
+      assignmentId,
+      turnId,
+    ).map((row) => ({ threadId: row["thread_id"] as number, reviewId: row["review_id"] as string }));
   }
 
   // --- stalls -------------------------------------------------------------------------------
