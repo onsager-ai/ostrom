@@ -1094,11 +1094,17 @@ export class Store {
   }
 
   /** Associates the stable pr-opened reply with its assignment. Sending fills the timestamp. */
-  trackReadyReply(assignmentId: number, replyId: string): void {
+  trackReadyReply(assignmentId: number, replyId: string, replaceUnsent = false): void {
     this.#run(
-      "INSERT INTO ready_reply (assignment_id, reply_id) VALUES (?, ?) ON CONFLICT (assignment_id) DO NOTHING",
-      assignmentId, replyId,
+      `INSERT INTO ready_reply (assignment_id, reply_id) VALUES (?, ?)
+       ON CONFLICT (assignment_id) DO UPDATE SET reply_id = excluded.reply_id WHERE ? AND ready_reply.sent_at IS NULL`,
+      assignmentId, replyId, replaceUnsent ? 1 : 0,
     );
+  }
+
+  replySentAt(replyId: string): string | null {
+    const row = this.#get("SELECT sent_at FROM outbox WHERE id = ?", replyId);
+    return row === undefined ? null : row["sent_at"] as string | null;
   }
 
   readyReplyId(assignmentId: number): string | null {
@@ -1565,12 +1571,14 @@ export class Store {
 
   /** Marks a reply sent. Marking it sent a second time throws. */
   markReplySent(replyId: string): void {
-    const { changes } = this.#run(
-      "UPDATE outbox SET sent_at = ?, attempts = attempts + 1 WHERE id = ? AND sent_at IS NULL",
-      this.#stamp(),
-      replyId,
-    );
-    if (Number(changes) !== 1) this.#unsentReplyMissing(replyId);
+    this.#transaction(() => {
+      const { changes } = this.#run(
+        "UPDATE outbox SET sent_at = ?, attempts = attempts + 1 WHERE id = ? AND sent_at IS NULL",
+        this.#stamp(), replyId,
+      );
+      if (Number(changes) !== 1) this.#unsentReplyMissing(replyId);
+      this.markReadyReplySent(replyId);
+    });
   }
 
   /** Records a failed send and when to try again. A sent reply cannot fail afterwards. */

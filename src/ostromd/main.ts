@@ -35,8 +35,8 @@ import { loadBudgetDefaults, loadConfig, loadRouterConfig, loadWatchdogConfig, l
  *   sees every local interlock; before Router outcomes and sending so reconciliation owns merged replies.
  * - route-candidates: the Router judges candidates, outcomes and stalls and queues replies.
  * - send: replies queued by this tick's Router pass go out in this tick.
- * Each pass reads and writes only the store and its own neighbour, so none depends on an earlier
- * one succeeding: a failed pass is reported and the rest still run.
+ * A failed pass is reported and later passes still run; automatic sends are suppressed after a
+ * prerequisite failure while the merge pass continues reconciliation.
  */
 export const TICK = ["poll", "observe", "commands", "route", "watchdog", "merge", "route-candidates", "send"] as const;
 

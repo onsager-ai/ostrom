@@ -59,7 +59,7 @@ export async function mergePass(options: MergePassOptions): Promise<MergePassRes
 async function consider(options: MergePassOptions, assignmentId: number, prNumber: number, result: MergePassResult): Promise<void> {
   let observation = await observe(options, assignmentId, prNumber);
   let candidate = candidateFor(options, assignmentId, prNumber, observation);
-  if (observation.evidence.pr.state === "MERGED") {
+  if (observation.evidence.pr.state === "MERGED" && observation.owned) {
     complete(options, candidate, observation.evidence, undefined, "external");
     result.merged.push(assignmentId);
     return;
@@ -67,12 +67,14 @@ async function consider(options: MergePassOptions, assignmentId: number, prNumbe
   // New PRs wait for the Router's pr_opened reply. Only an old, untracked opened reply needs a
   // separate first-enable notice: reusing its ID would never produce a fresh delivery timestamp.
   const openedId = `outcome-a${assignmentId}-pr${prNumber}-opened`;
-  if (options.store.readyReplyId(assignmentId) === null && options.store.hasReply(openedId)) {
+  const tracked = options.store.readyReplyId(assignmentId);
+  const lostDeliveryTracking = tracked === openedId && options.store.readyReplySentAt(assignmentId) === null && options.store.replySentAt(openedId) !== null;
+  if ((tracked === null && options.store.hasReply(openedId)) || lostDeliveryTracking) {
     const id = `ready-a${assignmentId}-pr${prNumber}`;
     const context = options.store.ticketContext(options.store.getAssignment(assignmentId).ticketId);
     options.store.enqueueReply({ id, threadId: context.thread.id,
       body: `Pull request ready: https://github.com/${options.repo}/pull/${prNumber}\n\n${readyPolicySentence(options.policy)}` });
-    options.store.trackReadyReply(assignmentId, id);
+    options.store.trackReadyReply(assignmentId, id, lostDeliveryTracking);
     candidate = candidateFor(options, assignmentId, prNumber, observation);
   }
   const wait = (reason: string) => {
@@ -88,7 +90,7 @@ async function consider(options: MergePassOptions, assignmentId: number, prNumbe
   await options.refreshBeforeSend?.();
   observation = await observe(options, assignmentId, prNumber);
   candidate = candidateFor(options, assignmentId, prNumber, observation);
-  if (observation.evidence.pr.state === "MERGED") {
+  if (observation.evidence.pr.state === "MERGED" && observation.owned) {
     complete(options, candidate, observation.evidence, undefined, "external");
     result.merged.push(assignmentId);
     return;
@@ -162,7 +164,7 @@ async function observe(options: MergePassOptions, assignmentId: number, prNumber
     threads: evidence.threads,
   });
   return { evidence, issueOpen: issue["state"] === "open", activity,
-    owned: owners.length === 1 && pulls.length === 1 && pulls[0]!["number"] === prNumber && evidence.pr.head.ref === assignment.branch &&
+    owned: owners.length === 1 && (evidence.pr.state === "MERGED" || (pulls.length === 1 && pulls[0]!["number"] === prNumber)) && evidence.pr.head.ref === assignment.branch &&
       evidence.pr.head.repository === options.repo && evidence.pr.base.repository === options.repo && evidence.pr.base.ref === (options.base ?? "main") };
 }
 
@@ -210,7 +212,8 @@ function candidateFor(options: MergePassOptions, assignmentId: number, prNumber:
   const policy = JSON.stringify(options.policy);
   const readySentAt = options.store.readyReplySentAt(assignmentId);
   const { evidence } = observation;
-  const changed = old === null || old.headSha !== evidence.pr.head.sha || old.baseSha !== evidence.pr.base.sha || old.policy !== policy || old.readySentAt !== readySentAt || old.activityFingerprint !== observation.activity;
+  const policyChanged = old !== null && old.policy !== policy;
+  const changed = old === null || old.headSha !== evidence.pr.head.sha || old.baseSha !== evidence.pr.base.sha || policyChanged || old.readySentAt !== readySentAt || old.activityFingerprint !== observation.activity;
   const now = clock(options);
   return options.store.upsertMergeCandidate({ assignmentId, repository: options.repo, prNumber, headSha: evidence.pr.head.sha, baseSha: evidence.pr.base.sha, policy,
     activityFingerprint: observation.activity, activityAt: changed ? now : old.activityAt === null ? null : new Date(old.activityAt),

@@ -9,7 +9,7 @@ const review = (id: string, state: string, commitOid = "head", author = "alice")
 function evidence(): MergeEvidence {
   return {
     pr: { number: 1, state: "OPEN", draft: false, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", authorLogin: "author", head: { ref: "b", sha: "head", repository: "o/r" }, base: { ref: "main", sha: "base", repository: "o/r" } },
-    rollup: { oid: "head", state: "SUCCESS", contexts: [{ __typename: "CheckRun", databaseId: 10, name: "check", status: "COMPLETED", conclusion: "SUCCESS", checkSuite: { databaseId: 1, app: { databaseId: 15368 } } }], associatedPrNumbers: [1], suites: [{ databaseId: 1, status: "COMPLETED", conclusion: "SUCCESS", workflowRun: { event: "pull_request", runAttempt: 1, workflow: { databaseId: 1 } } }] },
+    rollup: { oid: "head", state: "SUCCESS", contexts: [{ __typename: "CheckRun", databaseId: 10, name: "check", status: "COMPLETED", conclusion: "SUCCESS", checkSuite: { databaseId: 1, app: { databaseId: 15368 } } }], associatedPrNumbers: [1], suites: [{ databaseId: 1, status: "COMPLETED", conclusion: "SUCCESS", repository: { nameWithOwner: "o/r" }, matchingPullRequests: { nodes: [{ number: 1 }], pageInfo: { hasNextPage: false } }, workflowRun: { event: "pull_request", runAttempt: 1, workflow: { databaseId: 1 } } }] },
     threads: [], reviews: [], rest: { pull: {}, repository: { allow_squash_merge: true }, protection: {}, rules: [] },
   };
 }
@@ -52,6 +52,41 @@ test("eligibility reports every blocker in design order", () => {
   const fixtureSuites = input();
   fixtureSuites.evidence.rollup!.suites.push({ databaseId: 2, status: "QUEUED", conclusion: null, workflowRun: null });
   assert.deepEqual(mergeEligibility(fixtureSuites), { eligible: true });
+});
+
+test("checks and protection requirements are enforced independently of CLEAN", () => {
+  const cases: [string, (value: EligibilityInput) => void][] = [
+    ["repository does not allow squash merging", (v) => { v.evidence.rest.repository["allow_squash_merge"] = false; }],
+    ["required check missing is missing or has the wrong app", (v) => { v.evidence.rest.protection = { required_status_checks: { checks: [{ context: "missing", app_id: 15368 }] } }; }],
+    ["required check check is missing or has the wrong app", (v) => { v.evidence.rest.protection = { required_status_checks: { checks: [{ context: "check", app_id: 999 }] } }; }],
+    ["repository approval requirements are not satisfied", (v) => { v.evidence.rest.protection = { required_pull_request_reviews: { required_approving_review_count: 1 } }; }],
+    ["unsupported review protection requires operator action", (v) => { v.evidence.rest.protection = { required_pull_request_reviews: { require_code_owner_reviews: true } }; }],
+    ["unsupported branch rule merge_queue requires operator action", (v) => { v.evidence.rest.rules = [{ type: "merge_queue" }]; }],
+    ["rules prohibit squash merging", (v) => { v.evidence.rest.rules = [{ type: "pull_request", parameters: { allowed_merge_methods: ["merge"] } }]; }],
+    ["a head check is not successful", (v) => { v.evidence.rollup!.contexts.push({ __typename: "CheckRun", status: "QUEUED", conclusion: null }); }],
+  ];
+  for (const [reason, change] of cases) {
+    const value = input(); change(value);
+    assert.deepEqual(mergeEligibility(value), { eligible: false, reason });
+  }
+  const required = input();
+  required.evidence.rest.rules = [{ type: "required_status_checks", parameters: { required_status_checks: [{ context: "check", integration_id: 15368 }] } }];
+  assert.deepEqual(mergeEligibility(required), { eligible: true });
+});
+
+test("newer failed workflow cannot be masked by old success and suite provenance must match this PR", () => {
+  const failed = input();
+  failed.evidence.rollup!.suites.push({ databaseId: 2, status: "COMPLETED", conclusion: "FAILURE", workflowRun: { event: "pull_request", runAttempt: 2, workflow: { databaseId: 1 } } });
+  assert.equal(mergeEligibility(failed).eligible, false);
+  for (const suite of [
+    { databaseId: 1, status: "COMPLETED", conclusion: "SUCCESS", workflowRun: { event: "push", runAttempt: 1, workflow: { databaseId: 1 } } },
+    { databaseId: 1, status: "COMPLETED", conclusion: "SUCCESS", repository: { nameWithOwner: "other/r" }, matchingPullRequests: { nodes: [{ number: 1 }], pageInfo: { hasNextPage: false } }, workflowRun: { event: "pull_request", runAttempt: 1, workflow: { databaseId: 1 } } },
+    { databaseId: 1, status: "COMPLETED", conclusion: "SUCCESS", repository: { nameWithOwner: "o/r" }, matchingPullRequests: { nodes: [{ number: 99 }], pageInfo: { hasNextPage: false } }, workflowRun: { event: "pull_request", runAttempt: 1, workflow: { databaseId: 1 } } },
+    { databaseId: 1, status: "COMPLETED", conclusion: "SUCCESS", repository: { nameWithOwner: "o/r" }, matchingPullRequests: { nodes: [{ number: 1 }], pageInfo: { hasNextPage: true } }, workflowRun: { event: "pull_request", runAttempt: 1, workflow: { databaseId: 1 } } },
+  ]) {
+    const value = input(); value.evidence.rollup!.suites = [suite];
+    assert.equal(mergeEligibility(value).eligible, false);
+  }
 });
 
 test("approval and human policies are blockers", () => {

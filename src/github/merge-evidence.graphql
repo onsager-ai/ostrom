@@ -53,6 +53,11 @@ query MergeEvidence(
             checkSuites(first: 100, after: $suitesAfter) {
               nodes {
                 databaseId status conclusion
+                repository { nameWithOwner }
+                matchingPullRequests(first: 100) {
+                  nodes { number }
+                  pageInfo { hasNextPage endCursor }
+                }
                 workflowRun { event runAttempt workflow { databaseId name } }
               }
               pageInfo { hasNextPage endCursor }

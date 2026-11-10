@@ -64,7 +64,7 @@ function fixture(policy: MergePolicy = { strategy: "unattended" }) {
         reviewDecision: "APPROVED", author: { login: "author" }, headRefName: "b", headRefOid: remote.head, baseRefName: "main", baseRefOid: "base",
         reviewThreads: connection([]), reviews: connection(remote.reviews), commits: { nodes: [{ commit: {
           oid: remote.head, associatedPullRequests: connection([{ number: 2 }]), statusCheckRollup: { state: "SUCCESS", contexts: connection([check]) },
-          checkSuites: connection([{ databaseId: 1, status: "COMPLETED", conclusion: "SUCCESS",
+          checkSuites: connection([{ databaseId: 1, status: "COMPLETED", conclusion: "SUCCESS", repository: { nameWithOwner: "o/r" }, matchingPullRequests: connection([{ number: 2 }]),
             workflowRun: { event: "pull_request", runAttempt: 1, workflow: { databaseId: 1, name: "ci" } } }]),
         } }] },
       } } } });
@@ -347,6 +347,22 @@ test("first enable posts a distinct notice after an opened reply was sent before
   f.advance(10 * MINUTE);
   await mergePass(f.options());
   assert.equal(f.puts.length, 1);
+  done(f, "ostrom");
+});
+
+test("first enable repairs tracking attached after an already-sent opened reply", async () => {
+  const f = fixture();
+  const opened = `outcome-a${f.assignment}-pr2-opened`;
+  f.store.enqueueReply({ id: opened, threadId: f.issue, body: "old reply" });
+  f.store.markReplySent(opened);
+  f.store.trackReadyReply(f.assignment, opened);
+  assert.equal(f.store.readyReplySentAt(f.assignment), null);
+  await mergePass(f.options());
+  assert.equal(f.store.readyReplyId(f.assignment), `ready-a${f.assignment}-pr2`);
+  await f.send();
+  await mergePass(f.options());
+  f.advance(10 * MINUTE);
+  await mergePass(f.options());
   done(f, "ostrom");
 });
 

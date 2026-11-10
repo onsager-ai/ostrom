@@ -53,6 +53,11 @@ export const INTERRUPTED_PROMPT =
   "You were interrupted while working on this ticket. Check your state (git status, your branch and " +
   "pull request) and continue where you stopped.";
 
+export function workerTurnPrompt(prompt: string): string {
+  const contract = "Do not merge, enable auto-merge, dismiss reviews, or resolve human review threads.";
+  return prompt.includes(contract) ? prompt : `${prompt}\n\n${contract}`;
+}
+
 function queuedTurnKind(key: string): QueuedTurnKind {
   if (key.startsWith("review-")) return "review";
   if (key.startsWith("budget-pause-")) return "budget_pause";
@@ -133,7 +138,7 @@ export class Workers {
     sourcePointer?: string,
   ): boolean {
     const added = this.#deps.store.enqueueTurn({
-      assignmentId, deliveryKey: key, kind, prompt, ...(sourcePointer === undefined ? {} : { sourcePointer }),
+      assignmentId, deliveryKey: key, kind, prompt: workerTurnPrompt(prompt), ...(sourcePointer === undefined ? {} : { sourcePointer }),
     });
     if (added.duplicate) return false;
     this.#callbacksByKey.set(this.#callbackKey(assignmentId, key), { onStart, onComplete });
@@ -390,7 +395,7 @@ export class Workers {
     this.#inFlight.set(id, controller);
     let result: TurnResult;
     try {
-      result = await session.send(queued.prompt, controller.signal);
+      result = await session.send(workerTurnPrompt(queued.prompt), controller.signal);
     } catch (error) {
       if (this.#stopping) return;
       store.finishQueuedTurn(id, key);

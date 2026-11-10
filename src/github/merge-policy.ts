@@ -102,17 +102,23 @@ function successfulWorkflow(evidence: MergeEvidence): boolean {
     const run = record(suite["workflowRun"]);
     if (suite["workflowRun"] === null) continue;
     const workflow = record(run["workflow"]);
+    if (record(record(suite["matchingPullRequests"])["pageInfo"])["hasNextPage"] === true) return false;
     if (typeof workflow["databaseId"] !== "number" || typeof suite["databaseId"] !== "number" || typeof run["runAttempt"] !== "number") return false;
     const old = latest.get(workflow["databaseId"]);
     if (old === undefined || Number(old["databaseId"]) < suite["databaseId"]) latest.set(workflow["databaseId"], suite);
     else if (old["databaseId"] === suite["databaseId"]) return false;
   }
   if ([...latest.values()].some((suite) => suite["status"] !== "COMPLETED" || !["SUCCESS", "NEUTRAL", "SKIPPED"].includes(String(suite["conclusion"])))) return false;
-  return [...latest.values()].some((suite) => record(suite["workflowRun"])["event"] === "pull_request" && suite["conclusion"] === "SUCCESS" &&
+  return [...latest.values()].some((suite) => {
+    const matching = record(suite["matchingPullRequests"]);
+    return record(suite["workflowRun"])["event"] === "pull_request" && suite["conclusion"] === "SUCCESS" &&
+    record(suite["repository"])["nameWithOwner"] === evidence.pr.base.repository &&
+    record(matching["pageInfo"])["hasNextPage"] === false && Array.isArray(matching["nodes"]) && matching["nodes"].some((node) => record(node)["number"] === evidence.pr.number) &&
     rollup.contexts.some((value) => {
       const check = record(value);
       return check["__typename"] === "CheckRun" && check["status"] === "COMPLETED" && check["conclusion"] === "SUCCESS" && record(check["checkSuite"])["databaseId"] === suite["databaseId"];
-    }));
+    });
+  });
 }
 
 function requiredEvidence(input: EligibilityInput): string | null {
@@ -191,5 +197,5 @@ function incompleteSuite(value: unknown): boolean {
 }
 
 function unavailable(value: unknown): boolean {
-  return typeof value === "object" && value !== null && !Array.isArray(value) && "unavailable" in value;
+  return typeof value === "object" && value !== null && !Array.isArray(value) && ("unavailable" in value || "message" in value || "status" in value);
 }
