@@ -178,6 +178,8 @@ function makeWorkers(deps: MainDeps, store: Store): Workers {
     runners: deps.runners ?? realRunners(deps.env),
     codexSessions: deps.codexSessions ?? codexSessionsDir(),
     ...(deps.addWorktree === undefined ? {} : { addWorktree: deps.addWorktree }),
+    gh: deps.gh,
+    repo: loadConfig(deps.env).repo,
     log: (line) => deps.stderr(`ostromd: ${line}`),
   });
 }

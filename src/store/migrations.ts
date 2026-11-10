@@ -437,6 +437,43 @@ export const migrations: readonly string[] = [
   ) STRICT;
   CREATE INDEX merge_candidate_assignment ON merge_candidate (assignment_id);
   `,
+
+  // 24: Worker turns that have not finished are durable. A delivery key is the caller's stable
+  // idempotency key; the prompt is retained only until the turn finishes, never as a transcript.
+  // A merge pass can reserve an otherwise idle assignment without holding a SQLite transaction
+  // over its GitHub request. Ready replies are recorded only when their outbox row is sent.
+  `
+  ALTER TABLE ticket ADD COLUMN stop_requested_at TEXT;
+
+  CREATE TABLE queued_turn (
+    assignment_id  INTEGER NOT NULL REFERENCES assignment (id),
+    delivery_key   TEXT NOT NULL CHECK (delivery_key <> ''),
+    kind           TEXT NOT NULL CHECK (kind IN ('follow_up', 'review', 'control', 'budget_pause', 'stuck', 'recovery')),
+    source_pointer TEXT,
+    prompt         TEXT NOT NULL CHECK (prompt <> ''),
+    state          TEXT NOT NULL CHECK (state IN ('queued', 'running', 'finished')),
+    turn_id        TEXT,
+    created_at     TEXT NOT NULL,
+    started_at     TEXT,
+    finished_at    TEXT,
+    PRIMARY KEY (assignment_id, delivery_key),
+    CHECK ((state = 'queued') = (started_at IS NULL)),
+    CHECK ((state = 'running') = (started_at IS NOT NULL AND finished_at IS NULL)),
+    CHECK ((state = 'finished') = (finished_at IS NOT NULL))
+  ) STRICT, WITHOUT ROWID;
+  CREATE INDEX queued_turn_unfinished ON queued_turn (assignment_id, state) WHERE state <> 'finished';
+
+  CREATE TABLE assignment_reservation (
+    assignment_id INTEGER PRIMARY KEY REFERENCES assignment (id),
+    held_at       TEXT NOT NULL
+  ) STRICT;
+
+  CREATE TABLE ready_reply (
+    assignment_id INTEGER PRIMARY KEY REFERENCES assignment (id),
+    reply_id      TEXT NOT NULL UNIQUE REFERENCES outbox (id),
+    sent_at       TEXT
+  ) STRICT;
+  `,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */

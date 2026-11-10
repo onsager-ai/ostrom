@@ -109,6 +109,25 @@ export interface Ticket {
   openedAt: string;
   endedAt: string | null;
   pauseCause: string | null;
+  /** Set before stop cancellation/cleanup; resume deliberately does not clear it. */
+  stopRequestedAt: string | null;
+}
+
+export type QueuedTurnKind = "follow_up" | "review" | "control" | "budget_pause" | "stuck" | "recovery";
+export type QueuedTurnState = "queued" | "running" | "finished";
+
+/** A durable Worker prompt. Source pointers identify domain data, not a transcript. */
+export interface QueuedTurn {
+  assignmentId: number;
+  deliveryKey: string;
+  kind: QueuedTurnKind;
+  sourcePointer: string | null;
+  prompt: string;
+  state: QueuedTurnState;
+  turnId: string | null;
+  createdAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
 }
 
 /** Limits and accumulated usage for one ticket. Token usage includes input, cached input and output. */
@@ -363,6 +382,12 @@ export class Store {
 
   // --- triggers ------------------------------------------------------------------------------
 
+  getTrigger(triggerId: number): Trigger {
+    const row = this.#get("SELECT * FROM \"trigger\" WHERE id = ?", triggerId);
+    if (row === undefined) throw new Error(`no trigger ${triggerId}`);
+    return toTrigger(row);
+  }
+
   /** Records an event once. A repeat of the same source event id is a no-op marked duplicate. */
   insertTrigger(trigger: NewTrigger): Inserted {
     const inserted = this.#get(
@@ -569,6 +594,15 @@ export class Store {
     if (Number(changes) !== 1) {
       throw new IllegalTransition(`ticket ${ticketId}: ${this.getTicket(ticketId).state} → open is not allowed`);
     }
+  }
+
+  /** Sets the durable interlock before a stop cancels a turn or queues its cleanup. */
+  requestStop(ticketId: number): void {
+    const { changes } = this.#run(
+      "UPDATE ticket SET stop_requested_at = COALESCE(stop_requested_at, ?) WHERE id = ? AND state IN ('open', 'paused')",
+      this.#stamp(), ticketId,
+    );
+    if (Number(changes) !== 1) throw new IllegalTransition(`ticket ${ticketId} cannot be stopped`);
   }
 
   /** Stores limits for a newly opened ticket, or changes limits before it starts. */
@@ -909,6 +943,137 @@ export class Store {
       ticketId: row["p_ticket_id"] as number,
       assignmentId: row["p_assignment_id"] as number | null,
     }));
+  }
+
+  // --- durable Worker turns -------------------------------------------------------------------
+
+  /** Records a queued prompt before the Worker scheduler may observe it. */
+  enqueueTurn(turn: { assignmentId: number; deliveryKey: string; kind: QueuedTurnKind; sourcePointer?: string; prompt: string }): { duplicate: boolean } {
+    if (turn.deliveryKey === "" || turn.prompt === "") throw new Error("queued turn needs a key and prompt");
+    const { changes } = this.#run(
+      `INSERT INTO queued_turn (assignment_id, delivery_key, kind, source_pointer, prompt, state, created_at)
+       VALUES (?, ?, ?, ?, ?, 'queued', ?) ON CONFLICT DO NOTHING`,
+      turn.assignmentId, turn.deliveryKey, turn.kind, turn.sourcePointer ?? null, turn.prompt, this.#stamp(),
+    );
+    return { duplicate: Number(changes) === 0 };
+  }
+
+  /** Unfinished prompts in per-assignment order, including a cut-off running turn. */
+  unfinishedTurns(assignmentId: number): QueuedTurn[] {
+    return this.#all(
+      "SELECT * FROM queued_turn WHERE assignment_id = ? AND state <> 'finished' ORDER BY created_at, delivery_key",
+      assignmentId,
+    ).map(toQueuedTurn);
+  }
+
+  queuedTurn(assignmentId: number, deliveryKey: string): QueuedTurn | null {
+    const row = this.#get("SELECT * FROM queued_turn WHERE assignment_id = ? AND delivery_key = ?", assignmentId, deliveryKey);
+    return row === undefined ? null : toQueuedTurn(row);
+  }
+
+  /** Atomically claims a queued prompt once a runner is about to begin it. A reservation wins. */
+  beginQueuedTurn(assignmentId: number, deliveryKey: string, turnId: string): QueuedTurn | null {
+    return this.#transaction(() => {
+      if (this.#get("SELECT 1 FROM assignment_reservation WHERE assignment_id = ?", assignmentId) !== undefined) return null;
+      const row = this.#get(
+        `UPDATE queued_turn SET state = 'running', turn_id = ?, started_at = ?
+         WHERE assignment_id = ? AND delivery_key = ? AND state = 'queued' RETURNING *`,
+        turnId, this.#stamp(), assignmentId, deliveryKey,
+      );
+      return row === undefined ? null : toQueuedTurn(row);
+    });
+  }
+
+  /** A completed or intentionally cancelled queued prompt is never started again. */
+  finishQueuedTurn(assignmentId: number, deliveryKey: string): void {
+    this.#run(
+      `UPDATE queued_turn SET state = 'finished', finished_at = ?
+       WHERE assignment_id = ? AND delivery_key = ? AND state <> 'finished'`,
+      this.#stamp(), assignmentId, deliveryKey,
+    );
+  }
+
+  /** An interrupted native turn is replaced by its recovery prompt; queued followers remain. */
+  finishRunningTurns(assignmentId: number): void {
+    this.#run(
+      `UPDATE queued_turn SET state = 'finished', finished_at = ?
+       WHERE assignment_id = ? AND state = 'running'`,
+      this.#stamp(), assignmentId,
+    );
+  }
+
+  /** True only when no durable/in-flight local work or undispatched receipts remain. */
+  assignmentWorkIdle(assignmentId: number): boolean {
+    const row = this.#get(
+      `SELECT (SELECT turn_started_at FROM assignment WHERE id = ?) IS NULL
+          AND NOT EXISTS (SELECT 1 FROM queued_turn WHERE assignment_id = ? AND state <> 'finished')
+          AND NOT EXISTS (SELECT 1 FROM assignment_reservation WHERE assignment_id = ?)
+          AND NOT EXISTS (
+            SELECT 1 FROM "trigger" AS t JOIN subscription ON subscription.thread_id = t.thread_id
+            JOIN ticket ON ticket.id = subscription.ticket_id
+            WHERE ticket.id = (SELECT ticket_id FROM assignment WHERE id = ?)
+              AND ticket.state IN ('open', 'paused')
+              AND NOT EXISTS (SELECT 1 FROM decision_trigger WHERE trigger_id = t.id)
+              AND NOT EXISTS (SELECT 1 FROM delivery WHERE delivery.trigger_id = t.id)
+              AND NOT EXISTS (SELECT 1 FROM command_receipt WHERE command_receipt.trigger_id = t.id AND command_receipt.ticket_id = ticket.id)
+          ) AS idle`,
+      assignmentId, assignmentId, assignmentId, assignmentId,
+    );
+    if (row === undefined) throw new Error(`no assignment ${assignmentId}`);
+    return row["idle"] === 1;
+  }
+
+  /** Holds an idle assignment so a merge pass can exclude a concurrent local turn start. */
+  reserveAssignment(assignmentId: number): boolean {
+    return this.#transaction(() => {
+      if (!this.assignmentWorkIdle(assignmentId)) return false;
+      const { changes } = this.#run(
+        "INSERT INTO assignment_reservation (assignment_id, held_at) VALUES (?, ?) ON CONFLICT DO NOTHING",
+        assignmentId, this.#stamp(),
+      );
+      return Number(changes) === 1;
+    });
+  }
+
+  reservationHeld(assignmentId: number): boolean {
+    return this.#get("SELECT 1 FROM assignment_reservation WHERE assignment_id = ?", assignmentId) !== undefined;
+  }
+
+  releaseAssignmentReservation(assignmentId: number): void {
+    this.#run("DELETE FROM assignment_reservation WHERE assignment_id = ?", assignmentId);
+  }
+
+  /** Completed stop turns that lost their in-memory cleanup callback in a daemon restart. */
+  completedStopCleanups(): { assignmentId: number; ticketId: number; threadId: number; issueClosed: boolean }[] {
+    return this.#all(
+      `SELECT assignment.id AS assignment_id, ticket.id AS ticket_id, decision.thread_id,
+              MAX(queued_turn.delivery_key LIKE 'close-issue-%') AS issue_closed
+       FROM queued_turn JOIN assignment ON assignment.id = queued_turn.assignment_id
+       JOIN ticket ON ticket.id = assignment.ticket_id JOIN decision ON decision.id = ticket.decision_id
+       WHERE queued_turn.kind = 'control' AND queued_turn.state = 'finished'
+         AND ticket.stop_requested_at IS NOT NULL AND assignment.state = 'running'
+         AND (queued_turn.delivery_key LIKE 'operator-stop-%' OR queued_turn.delivery_key LIKE 'stop-%' OR queued_turn.delivery_key LIKE 'close-issue-%')
+       GROUP BY assignment.id, ticket.id, decision.thread_id`,
+    ).map((row) => ({ assignmentId: row["assignment_id"] as number, ticketId: row["ticket_id"] as number,
+      threadId: row["thread_id"] as number, issueClosed: row["issue_closed"] === 1 }));
+  }
+
+  /** Associates the stable pr-opened reply with its assignment. Sending fills the timestamp. */
+  trackReadyReply(assignmentId: number, replyId: string): void {
+    this.#run(
+      "INSERT INTO ready_reply (assignment_id, reply_id) VALUES (?, ?) ON CONFLICT (assignment_id) DO NOTHING",
+      assignmentId, replyId,
+    );
+  }
+
+  readyReplySentAt(assignmentId: number): string | null {
+    const row = this.#get("SELECT sent_at FROM ready_reply WHERE assignment_id = ?", assignmentId);
+    return row === undefined ? null : row["sent_at"] as string | null;
+  }
+
+  /** Records confirmed outbox delivery; calling this for another reply has no effect. */
+  markReadyReplySent(replyId: string): void {
+    this.#run("UPDATE ready_reply SET sent_at = ? WHERE reply_id = ? AND sent_at IS NULL", this.#stamp(), replyId);
   }
 
   /** Records the native turn that received the trigger. Duplicate delivery is a no-op. */
@@ -1315,6 +1480,22 @@ function toTicket(row: Row): Ticket {
     openedAt: row["opened_at"] as string,
     endedAt: row["ended_at"] as string | null,
     pauseCause: row["pause_cause"] as string | null,
+    stopRequestedAt: row["stop_requested_at"] as string | null,
+  };
+}
+
+function toQueuedTurn(row: Row): QueuedTurn {
+  return {
+    assignmentId: row["assignment_id"] as number,
+    deliveryKey: row["delivery_key"] as string,
+    kind: row["kind"] as QueuedTurnKind,
+    sourcePointer: row["source_pointer"] as string | null,
+    prompt: row["prompt"] as string,
+    state: row["state"] as QueuedTurnState,
+    turnId: row["turn_id"] as string | null,
+    createdAt: row["created_at"] as string,
+    startedAt: row["started_at"] as string | null,
+    finishedAt: row["finished_at"] as string | null,
   };
 }
 

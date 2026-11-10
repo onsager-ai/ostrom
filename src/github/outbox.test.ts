@@ -142,6 +142,24 @@ test("ordinary comments batch after the gathering window while a blocking questi
   assert.deepEqual((await send({ batchWindowMs: 10 * 60_000 })).sent, ["q1"]);
 });
 
+test("a ready reply is timestamped only after GitHub confirms delivery", async () => {
+  const { store, thread, send } = fixture();
+  const source = store.ensureSource("github", "onsager-ai/ostrom");
+  const trigger = store.insertTrigger({
+    sourceId: source.id, sourceEventId: "accepted", threadId: thread, kind: "issue_comment", actor: "alice",
+    url: "https://github.com/onsager-ai/ostrom/issues/7#issuecomment-1", occurredAt: new Date(T0),
+  }).id;
+  const ticket = store.recordDecision({ threadId: thread, triggerIds: [trigger], verdict: "accept", reason: "work" }).ticketId!;
+  const assignment = store.createAssignment(ticket);
+  store.configureNativeAssignment(assignment, { harness: "codex", model: "m", worktree: "/w", branch: "b", machine: "h" });
+  store.startNativeAssignment(assignment, "s");
+  store.enqueueReply({ id: "outcome-a1-pr12-opened", threadId: thread, body: "Ready." });
+  store.trackReadyReply(assignment, "outcome-a1-pr12-opened");
+  assert.equal(store.readyReplySentAt(assignment), null);
+  await send();
+  assert.equal(store.readyReplySentAt(assignment), new Date(T0).toISOString());
+});
+
 test("a status card posts once then future states edit the same comment", async () => {
   const { store, thread, send, github } = fixture();
   store.enqueueStatusCard(thread, "## Ostrom: Working");

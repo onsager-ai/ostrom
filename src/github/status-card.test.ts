@@ -13,7 +13,7 @@ const base: Omit<StatusCard, "state"> = {
   markerId: "card-thread-7",
 };
 
-for (const state of ["working", "recovering", "paused", "stuck", "done", "stopped"] as const) {
+for (const state of ["working", "recovering", "paused", "stuck", "waiting_to_merge", "waiting_for_human_merge", "done", "stopped"] as const) {
   test(`status card snapshot: ${state}`, async () => {
     assert.equal(renderStatusCard({ ...base, state }), await snapshot(state));
   });
