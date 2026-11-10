@@ -4,7 +4,7 @@
 
 import { defaultSocketPath, localApi } from "../api/server.ts";
 import { operatorControls, routeCommands } from "../commands/commands.ts";
-import { renderPreview } from "../github/preview.ts";
+import { renderMergeEligibilityPreview } from "../github/preview.ts";
 import { execGh, type GhRunner } from "../github/gh.ts";
 import { sendDueReplies } from "../github/outbox.ts";
 import { processRunner, type ProcessRunner } from "../process.ts";
@@ -99,12 +99,13 @@ const defaults: MainDeps = {
 };
 
 /** Checks every variable a tick needs, so a misconfigured tick or run fails before any pass. */
-function loadTickConfig(env: MainDeps["env"]): void {
-  loadConfig(env);
+function loadTickConfig(env: MainDeps["env"]): ReturnType<typeof loadConfig> {
+  const config = loadConfig(env);
   loadWorkerConfig(env);
   loadRouterConfig(env);
   loadWatchdogConfig(env);
   loadBudgetDefaults(env);
+  return config;
 }
 
 /** One tick: every pass in TICK order, each opening the store itself and reporting as its command does. */
@@ -135,21 +136,22 @@ async function tick(deps: MainDeps): Promise<number> {
 
 /** Repeats `tick` until `stop` aborts. Exits with the last tick's code. */
 async function run(intervalSeconds: number, deps: MainDeps): Promise<number> {
+  let config: ReturnType<typeof loadConfig>;
   try {
-    loadTickConfig(deps.env);
+    config = loadTickConfig(deps.env);
   } catch (error) {
     deps.stderr(`ostromd run: ${error instanceof Error ? error.message : String(error)}`);
     return 1;
   }
   let code = 0;
   const owned = openWorkers(deps);
-  const controls = operatorControls(owned.store, owned.workers, deps.gh, loadConfig(deps.env).repo);
+  const controls = operatorControls(owned.store, owned.workers, deps.gh, config.repo);
   const api = localApi(owned.store, {
     socketPath: defaultSocketPath(deps.env),
     control: {
       ...controls,
       extend: async (ticketId, increases) => { owned.store.extendTicketBudget(ticketId, increases); },
-      preview: async () => renderPreview(owned.store),
+      preview: async () => renderMergeEligibilityPreview(owned.store, deps.gh, config.repo, config.mergePolicy),
     },
   });
   logRecovery(owned.workers.recover(), deps);

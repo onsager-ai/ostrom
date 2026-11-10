@@ -7,12 +7,15 @@
 import { readFileSync } from "node:fs";
 import { hostname } from "node:os";
 
+import { loadMergePolicy, type MergePolicy } from "../github/merge-policy.ts";
+
 export { loadBudgetDefaults, type BudgetDefaults } from "../budget/budgets.ts";
 
 export interface Config {
   repo: string;
   allowlist: string[];
   dbPath: string;
+  mergePolicy: MergePolicy;
 }
 
 export function loadConfig(env: Record<string, string | undefined>): Config {
@@ -29,7 +32,7 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
   }
   const dbPath = env["OSTROM_DB"]?.trim() ?? "";
   if (dbPath === "") throw new Error("OSTROM_DB must be the path to the store");
-  return { repo, allowlist, dbPath };
+  return { repo, allowlist, dbPath, mergePolicy: loadMergePolicy(env) };
 }
 
 // Native Workers read these. The first two are required; the rest have defaults:
