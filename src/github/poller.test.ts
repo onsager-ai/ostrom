@@ -104,7 +104,7 @@ test("only an allowlisted opened issue that asks Ostrom becomes a trigger", asyn
   const { github, poll, count, setNow } = await fixture();
   github.issue(7, false, { login: "alice", body: "please fix this", at: at(1) });
   github.issue(8, false, { login: "mallory", body: "@ostrom please fix this", at: at(2) });
-  github.issue(9, false, { login: "alice", body: replyMarker("ack-1"), at: at(3) });
+  github.issue(9, false, { login: "alice", body: `@ostrom please fix this\n\n${replyMarker("ack-1")}`, at: at(3) });
   setNow(10);
 
   const result = await poll();
