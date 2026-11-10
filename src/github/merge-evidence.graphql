@@ -11,6 +11,7 @@ query MergeEvidence(
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       number state isDraft mergeable mergeStateStatus reviewDecision
+      author { login }
       headRefName headRefOid baseRefName baseRefOid
       reviewThreads(first: 100, after: $threadsAfter) {
         nodes { id isResolved }

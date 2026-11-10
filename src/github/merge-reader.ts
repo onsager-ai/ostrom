@@ -27,6 +27,7 @@ export interface MergeEvidence {
     reviewDecision: string | null;
     head: { ref: string; sha: string; repository: string };
     base: { ref: string; sha: string; repository: string };
+    authorLogin: string | null;
   };
   rollup: { oid: string; state: string | null; contexts: unknown[]; suites: unknown[]; associatedPrNumbers: number[] } | null;
   threads: { id: string; resolved: boolean }[];
@@ -144,11 +145,13 @@ async function graphql(gh: GhRunner, variables: Record<string, string | number |
 }
 
 function decodePull(row: Json): MergeEvidence["pr"] {
+  const author = row["author"] === null ? null : object(row, "author");
   return {
     number: number(row, "number"), state: string(row, "state"), draft: boolean(row, "isDraft"),
     mergeable: string(row, "mergeable"), mergeStateStatus: string(row, "mergeStateStatus"), reviewDecision: nullableString(row, "reviewDecision"),
     head: { ref: string(row, "headRefName"), sha: string(row, "headRefOid"), repository: "" },
     base: { ref: string(row, "baseRefName"), sha: string(row, "baseRefOid"), repository: "" },
+    authorLogin: author === null ? null : nullableString(author, "login"),
   };
 }
 

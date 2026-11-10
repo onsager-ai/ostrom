@@ -8,7 +8,7 @@ const review = (id: string, state: string, commitOid = "head", author = "alice")
 
 function evidence(): MergeEvidence {
   return {
-    pr: { number: 1, state: "OPEN", draft: false, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", head: { ref: "b", sha: "head", repository: "o/r" }, base: { ref: "main", sha: "base", repository: "o/r" } },
+    pr: { number: 1, state: "OPEN", draft: false, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", authorLogin: "author", head: { ref: "b", sha: "head", repository: "o/r" }, base: { ref: "main", sha: "base", repository: "o/r" } },
     rollup: { oid: "head", state: "SUCCESS", contexts: [], associatedPrNumbers: [1], suites: [{ status: "COMPLETED", conclusion: "SUCCESS", workflowRun: { event: "pull_request" } }] },
     threads: [], reviews: [], rest: { pull: {}, repository: { allow_squash_merge: true }, protection: {}, rules: {} },
   };

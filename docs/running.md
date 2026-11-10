@@ -39,7 +39,10 @@ it never uses bypass, auto-merge, another method, or branch deletion. GitHub cha
 race the final request, so repositories requiring deliberate timing should use the human policy.
 
 A first merge-enabled restart gives existing Worker PRs a new ready notice and quiet window;
-previous green status does not make them immediately mergeable.
+previous green status does not make them immediately mergeable. The window restarts for stored
+human issue/PR triggers, completed Worker turns, review submissions, review-thread resolution
+changes, head/base changes, and policy changes. GitHub does not expose a reliable timestamp for
+review-thread resolution, so observing that change restarts the window at observation time.
 
 Set `OSTROM_WORKER_RULES_FILE` to a file of the machine's house rules (for example its heat
 limits, and that tests run in CI rather than locally). Its text closes every Worker's brief.

@@ -1118,6 +1118,11 @@ export class Store {
     return row === undefined ? null : toMergeCandidate(row);
   }
 
+  mergeCandidateForAssignment(assignmentId: number): MergeCandidate | null {
+    const row = this.#get("SELECT * FROM merge_candidate WHERE assignment_id = ? ORDER BY id DESC LIMIT 1", assignmentId);
+    return row === undefined ? null : toMergeCandidate(row);
+  }
+
   mergeCandidateById(candidateId: number): MergeCandidate {
     const row = this.#get("SELECT * FROM merge_candidate WHERE id = ?", candidateId);
     if (row === undefined) throw new Error(`no merge candidate ${candidateId}`);
@@ -1175,10 +1180,34 @@ export class Store {
 
   finishMergeAttempt(id: number, state: Exclude<MergeAttemptState, "pending">, result: { sha?: string; error?: string; nextRetryAt?: Date } = {}): void {
     const { changes } = this.#run(
-      `UPDATE merge_attempt SET state = ?, response_sha = ?, error = ?, next_retry_at = ? WHERE id = ? AND state = 'pending'`,
+      `UPDATE merge_attempt SET state = ?, response_sha = ?, error = ?, next_retry_at = ? WHERE id = ? AND state IN ('pending', 'unknown')`,
       state, result.sha ?? null, result.error ?? null, result.nextRetryAt?.toISOString() ?? null, id,
     );
-    if (Number(changes) !== 1) throw new IllegalTransition(`merge attempt ${id} is no longer pending`);
+    if (Number(changes) !== 1) throw new IllegalTransition(`merge attempt ${id} is no longer unresolved`);
+  }
+
+  mergeRetryAt(repository: string, prNumber: number): string | null {
+    const row = this.#get(
+      "SELECT MAX(next_retry_at) AS next_retry_at FROM merge_attempt WHERE repository = ? AND pr_number = ? AND state = 'failed'",
+      repository, prNumber,
+    );
+    return row?.["next_retry_at"] as string | null;
+  }
+
+  prMerge(repository: string, prNumber: number): { origin: "ostrom" | "external" | "unknown"; mergedByLogin: string | null } | null {
+    const row = this.#get("SELECT origin, merged_by_login FROM pr_merge WHERE repository = ? AND pr_number = ?", repository, prNumber);
+    return row === undefined ? null : { origin: row["origin"] as "ostrom" | "external" | "unknown", mergedByLogin: row["merged_by_login"] as string | null };
+  }
+
+  ticketActivityAt(ticketId: number): string | null {
+    const row = this.#get(
+      `SELECT MAX(at) AS at FROM (
+        SELECT occurred_at AS at FROM "trigger" JOIN subscription ON subscription.thread_id = "trigger".thread_id
+          WHERE subscription.ticket_id = ? AND COALESCE(body, '') NOT LIKE '%<!-- ostrom:%'
+        UNION ALL SELECT last_activity_at AS at FROM assignment WHERE ticket_id = ?
+      )`, ticketId, ticketId,
+    );
+    return row?.["at"] as string | null;
   }
 
   recordMergeAndOutcome(input: {
