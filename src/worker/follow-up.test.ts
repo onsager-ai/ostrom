@@ -270,6 +270,19 @@ test("a trigger fans out to every open subscribed ticket; ended ones are skipped
   ]);
 });
 
+test("a ticket ended while paused at public Stuck is owed no follow-up", () => {
+  const { store, workers, pr, trigger, ticketId, assignmentId } = fixture();
+  store.recordStall({ assignmentId, semonReason: "no-output", detail: null });
+  const stall = store.unansweredStalls()[0]!;
+  store.publishStall(stall.id);
+  store.endAssignment(assignmentId);
+  store.endTicket(ticketId);
+  trigger(pr);
+
+  assert.deepEqual(store.pendingDeliveries(), []);
+  assert.deepEqual(routeFollowUps(store, workers), { queued: [], failed: [] });
+});
+
 test("an open ticket with no running Worker holds its follow-up and reports it", () => {
   const { store, runner, workers, pr, trigger, ticketId, assignmentId } = fixture();
   store.endAssignment(assignmentId);
