@@ -28,7 +28,7 @@ test("approvals count distinct current-head eligible reviewers", () => {
     ["U_alice", { id: "U_alice", login: "alice", permission: "write" as const, bot: false }],
     ["U_bot", { id: "U_bot", login: "bot", permission: "admin" as const, bot: true }],
   ]);
-  assert.equal(countApprovals([review("1", "APPROVED"), review("2", "APPROVED", "old", "alice"), review("3", "APPROVED", "head", "bot")], "head", "author", identities, []), 1);
+  assert.equal(countApprovals([review("1", "APPROVED"), review("2", "APPROVED", "old", "bob"), review("3", "APPROVED", "head", "bot")], "head", "author", identities, []), 1);
   assert.equal(countApprovals([review("1", "APPROVED")], "head", "author", identities, ["nobody"]), 0);
 });
 
@@ -40,7 +40,10 @@ test("eligibility reports every blocker in design order", () => {
     ["pull request head is from a fork", (v) => { v.evidence.pr.head.repository = "fork/r"; }],
     ["CI rollup is not successful for the captured head", (v) => { v.evidence.rollup!.state = "FAILURE"; }],
     ["no successful pull_request workflow is evidenced for this PR", (v) => { v.evidence.rollup!.suites = []; }],
-    ["a check suite is not complete", (v) => { v.evidence.rollup!.suites = [{ status: "QUEUED", conclusion: null, workflowRun: { event: "pull_request" } }]; }],
+    ["a check suite is not complete", (v) => { v.evidence.rollup!.suites = [
+      { status: "COMPLETED", conclusion: "SUCCESS", workflowRun: { event: "pull_request" } },
+      { status: "QUEUED", conclusion: null, workflowRun: { event: "pull_request" } },
+    ]; }],
     ["branch requirements cannot be established", (v) => { v.evidence.rest.protection = { unavailable: "403" }; }],
     ["review requirements are not satisfied", (v) => { v.evidence.threads = [{ id: "t", resolved: false }]; }],
     ["quiet period has not elapsed", (v) => { v.local.readyReplySent = false; }],
