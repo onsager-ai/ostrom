@@ -314,6 +314,7 @@ async function pendingOutcomes(options: RouteOptions, result: RoutePassResult): 
         terminal: event !== "pr_opened",
         pullRequest: pr.url,
       };
+      if (event === "pr_merged" && store.hasReply(outcome.key)) continue;
       if (!outcome.terminal) owed(outcome);
       else terminal ??= outcome;
     }

@@ -30,5 +30,16 @@ Developer-only one-shot passes remain available as `ostromd dev <pass>`:
 `route-candidates`, and `tick`. They are retained for their existing tests and
 for controlled sandbox diagnosis.
 
+Merging is unattended by default. Set `OSTROM_MERGE_STRATEGY=human` to only observe human
+merges, or set `OSTROM_MERGE_STRATEGY=approvals` together with a positive
+`OSTROM_MERGE_APPROVALS` and optional comma-separated `OSTROM_MERGE_APPROVERS`. Before an
+unattended squash merge, Ostrom performs fresh GitHub evidence reads, requires the ready reply
+actually to have posted, and waits ten quiet minutes. It sends only SHA-guarded squash merges;
+it never uses bypass, auto-merge, another method, or branch deletion. GitHub changes can still
+race the final request, so repositories requiring deliberate timing should use the human policy.
+
+A first merge-enabled restart gives existing Worker PRs a new ready notice and quiet window;
+previous green status does not make them immediately mergeable.
+
 Set `OSTROM_WORKER_RULES_FILE` to a file of the machine's house rules (for example its heat
 limits, and that tests run in CI rather than locally). Its text closes every Worker's brief.

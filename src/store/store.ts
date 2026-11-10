@@ -244,6 +244,38 @@ export function stallReplyId(stallId: number): string {
 
 export type OutboxKind = "comment" | "edit" | "reaction" | "label";
 
+export interface MergeCandidate {
+  id: number;
+  assignmentId: number;
+  repository: string;
+  prNumber: number;
+  headSha: string;
+  baseSha: string;
+  policy: string;
+  activityFingerprint: string | null;
+  activityAt: string | null;
+  readyReplyId: string | null;
+  readySentAt: string | null;
+  quietDeadline: string | null;
+  blockingReason: string | null;
+}
+
+export type MergeAttemptState = "pending" | "confirmed" | "failed" | "unknown";
+export interface MergeAttempt {
+  id: number;
+  candidateId: number;
+  repository: string;
+  prNumber: number;
+  headSha: string;
+  attemptNumber: number;
+  method: "squash";
+  requestedAt: string;
+  responseSha: string | null;
+  error: string | null;
+  nextRetryAt: string | null;
+  state: MergeAttemptState;
+}
+
 export interface NewReply {
   id: string;
   threadId: number;
@@ -1076,6 +1108,98 @@ export class Store {
     this.#run("UPDATE ready_reply SET sent_at = ? WHERE reply_id = ? AND sent_at IS NULL", this.#stamp(), replyId);
   }
 
+  // --- merge reconciliation ------------------------------------------------------------------
+
+  mergeCandidate(assignmentId: number, repository: string, prNumber: number): MergeCandidate | null {
+    const row = this.#get(
+      "SELECT * FROM merge_candidate WHERE assignment_id = ? AND repository = ? AND pr_number = ?",
+      assignmentId, repository, prNumber,
+    );
+    return row === undefined ? null : toMergeCandidate(row);
+  }
+
+  mergeCandidateById(candidateId: number): MergeCandidate {
+    const row = this.#get("SELECT * FROM merge_candidate WHERE id = ?", candidateId);
+    if (row === undefined) throw new Error(`no merge candidate ${candidateId}`);
+    return toMergeCandidate(row);
+  }
+
+  upsertMergeCandidate(input: {
+    assignmentId: number; repository: string; prNumber: number; headSha: string; baseSha: string; policy: string;
+    activityFingerprint: string | null; activityAt: Date | null; readyReplyId: string | null; readySentAt: Date | null;
+    quietDeadline: Date | null; blockingReason: string | null;
+  }): MergeCandidate {
+    const existing = this.mergeCandidate(input.assignmentId, input.repository, input.prNumber);
+    if (existing === null) {
+      this.#run(
+        `INSERT INTO merge_candidate (assignment_id, repository, pr_number, head_sha, base_sha, policy, activity_fingerprint,
+          activity_at, ready_reply_id, ready_sent_at, quiet_deadline, blocking_reason)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        input.assignmentId, input.repository, input.prNumber, input.headSha, input.baseSha, input.policy,
+        input.activityFingerprint, input.activityAt?.toISOString() ?? null, input.readyReplyId,
+        input.readySentAt?.toISOString() ?? null, input.quietDeadline?.toISOString() ?? null, input.blockingReason,
+      );
+    } else {
+      this.#run(
+        `UPDATE merge_candidate SET head_sha = ?, base_sha = ?, policy = ?, activity_fingerprint = ?, activity_at = ?,
+          ready_reply_id = ?, ready_sent_at = ?, quiet_deadline = ?, blocking_reason = ? WHERE id = ?`,
+        input.headSha, input.baseSha, input.policy, input.activityFingerprint, input.activityAt?.toISOString() ?? null,
+        input.readyReplyId, input.readySentAt?.toISOString() ?? null, input.quietDeadline?.toISOString() ?? null,
+        input.blockingReason, existing.id,
+      );
+    }
+    return this.mergeCandidate(input.assignmentId, input.repository, input.prNumber)!;
+  }
+
+  unresolvedMergeAttempts(repository: string): MergeAttempt[] {
+    return this.#all(
+      "SELECT * FROM merge_attempt WHERE repository = ? AND state IN ('pending', 'unknown') ORDER BY id",
+      repository,
+    ).map(toMergeAttempt);
+  }
+
+  createMergeAttempt(candidate: MergeCandidate): MergeAttempt {
+    return this.#transaction(() => {
+      const number = this.#get(
+        "SELECT COALESCE(MAX(attempt_number), 0) + 1 AS number FROM merge_attempt WHERE repository = ? AND pr_number = ?",
+        candidate.repository, candidate.prNumber,
+      )!["number"] as number;
+      const row = this.#get(
+        `INSERT INTO merge_attempt (candidate_id, repository, pr_number, head_sha, attempt_number, method, requested_at, state)
+         VALUES (?, ?, ?, ?, ?, 'squash', ?, 'pending') RETURNING *`,
+        candidate.id, candidate.repository, candidate.prNumber, candidate.headSha, number, this.#stamp(),
+      )!;
+      return toMergeAttempt(row);
+    });
+  }
+
+  finishMergeAttempt(id: number, state: Exclude<MergeAttemptState, "pending">, result: { sha?: string; error?: string; nextRetryAt?: Date } = {}): void {
+    const { changes } = this.#run(
+      `UPDATE merge_attempt SET state = ?, response_sha = ?, error = ?, next_retry_at = ? WHERE id = ? AND state = 'pending'`,
+      state, result.sha ?? null, result.error ?? null, result.nextRetryAt?.toISOString() ?? null, id,
+    );
+    if (Number(changes) !== 1) throw new IllegalTransition(`merge attempt ${id} is no longer pending`);
+  }
+
+  recordMergeAndOutcome(input: {
+    repository: string; prNumber: number; headSha: string; mergeSha: string | null; mergedAt: Date;
+    mergedByLogin: string | null; origin: "ostrom" | "external" | "unknown"; attemptId?: number;
+    assignmentId: number; threadId: number; body: string;
+  }): { duplicate: boolean; ticketEnded: boolean } {
+    return this.#transaction(() => {
+      this.#run(
+        `INSERT INTO pr_merge (repository, pr_number, head_sha, merge_sha, merged_at, merged_by_login, origin, attempt_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (repository, pr_number) DO NOTHING`,
+        input.repository, input.prNumber, input.headSha, input.mergeSha, input.mergedAt.toISOString(), input.mergedByLogin,
+        input.origin, input.attemptId ?? null,
+      );
+      const { duplicate } = this.#insertReply({
+        id: `outcome-a${input.assignmentId}-pr${input.prNumber}-merged`, threadId: input.threadId, body: input.body,
+      });
+      return { duplicate, ticketEnded: this.#endWork(this.getAssignment(input.assignmentId)) };
+    });
+  }
+
   /** Records the native turn that received the trigger. Duplicate delivery is a no-op. */
   recordDelivery(triggerId: number, assignmentId: number, turnId: string): { duplicate: boolean } {
     const { changes } = this.#run(
@@ -1481,6 +1605,28 @@ function toTicket(row: Row): Ticket {
     endedAt: row["ended_at"] as string | null,
     pauseCause: row["pause_cause"] as string | null,
     stopRequestedAt: row["stop_requested_at"] as string | null,
+  };
+}
+
+function toMergeCandidate(row: Row): MergeCandidate {
+  return {
+    id: row["id"] as number, assignmentId: row["assignment_id"] as number,
+    repository: row["repository"] as string, prNumber: row["pr_number"] as number,
+    headSha: row["head_sha"] as string, baseSha: row["base_sha"] as string, policy: row["policy"] as string,
+    activityFingerprint: row["activity_fingerprint"] as string | null, activityAt: row["activity_at"] as string | null,
+    readyReplyId: row["ready_reply_id"] as string | null, readySentAt: row["ready_sent_at"] as string | null,
+    quietDeadline: row["quiet_deadline"] as string | null, blockingReason: row["blocking_reason"] as string | null,
+  };
+}
+
+function toMergeAttempt(row: Row): MergeAttempt {
+  return {
+    id: row["id"] as number, candidateId: row["candidate_id"] as number,
+    repository: row["repository"] as string, prNumber: row["pr_number"] as number,
+    headSha: row["head_sha"] as string, attemptNumber: row["attempt_number"] as number,
+    method: row["method"] as "squash", requestedAt: row["requested_at"] as string,
+    responseSha: row["response_sha"] as string | null, error: row["error"] as string | null,
+    nextRetryAt: row["next_retry_at"] as string | null, state: row["state"] as MergeAttemptState,
   };
 }
 

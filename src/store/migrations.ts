@@ -474,6 +474,39 @@ export const migrations: readonly string[] = [
     sent_at       TEXT
   ) STRICT;
   `,
+
+  // 25: A merge request is durable before it crosses the network. A pull request has one final
+  // result and never more than one unresolved request, so restart reconciliation has one truth.
+  `
+  CREATE TABLE merge_attempt (
+    id INTEGER PRIMARY KEY,
+    candidate_id INTEGER NOT NULL REFERENCES merge_candidate(id),
+    repository TEXT NOT NULL CHECK (repository <> ''),
+    pr_number INTEGER NOT NULL CHECK (pr_number > 0),
+    head_sha TEXT NOT NULL CHECK (head_sha <> ''),
+    attempt_number INTEGER NOT NULL CHECK (attempt_number > 0),
+    method TEXT NOT NULL CHECK (method = 'squash'),
+    requested_at TEXT NOT NULL,
+    response_sha TEXT,
+    error TEXT,
+    next_retry_at TEXT,
+    state TEXT NOT NULL CHECK (state IN ('pending', 'confirmed', 'failed', 'unknown')),
+    UNIQUE (repository, pr_number, attempt_number)
+  ) STRICT;
+  CREATE UNIQUE INDEX merge_attempt_unresolved ON merge_attempt(repository, pr_number)
+    WHERE state IN ('pending', 'unknown');
+  CREATE TABLE pr_merge (
+    repository TEXT NOT NULL,
+    pr_number INTEGER NOT NULL,
+    head_sha TEXT NOT NULL,
+    merge_sha TEXT,
+    merged_at TEXT NOT NULL,
+    merged_by_login TEXT,
+    origin TEXT NOT NULL CHECK (origin IN ('ostrom', 'external', 'unknown')),
+    attempt_id INTEGER REFERENCES merge_attempt(id),
+    PRIMARY KEY (repository, pr_number)
+  ) STRICT;
+  `,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */
