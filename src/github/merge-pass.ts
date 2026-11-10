@@ -1,6 +1,7 @@
 // Deterministic unattended merge and restart reconciliation. The Router never authorizes this pass.
 
 import { budgetReached } from "../budget/budgets.ts";
+import { queueStatusCard } from "./cards.ts";
 import type { Workers } from "../worker/workers.ts";
 import type { MergeCandidate, Store } from "../store/store.ts";
 import { ghMergeGet, ghSquashMerge, type GhRunner } from "./gh.ts";
@@ -122,9 +123,11 @@ function candidateFor(options: MergePassOptions, assignmentId: number, prNumber:
   const fingerprint = `${evidence.pr.head.sha}:${evidence.pr.base.sha}:${activityAt ?? "observed"}:${evidence.reviews.map((r) => `${r.id}:${r.state}:${r.submittedAt}`).join(",")}:${evidence.threads.map((t) => `${t.id}:${t.resolved}`).join(",")}`;
   const changed = old === null || old.headSha !== evidence.pr.head.sha || old.baseSha !== evidence.pr.base.sha || old.policy !== policy || old.readySentAt !== readySentAt || old.activityFingerprint !== fingerprint;
   const start = Math.max(now.getTime(), readySentAt === null ? 0 : Date.parse(readySentAt), activityAt === null ? 0 : Date.parse(activityAt));
-  return options.store.upsertMergeCandidate({ assignmentId, repository: options.repo, prNumber, headSha: evidence.pr.head.sha, baseSha: evidence.pr.base.sha, policy,
+  const candidate = options.store.upsertMergeCandidate({ assignmentId, repository: options.repo, prNumber, headSha: evidence.pr.head.sha, baseSha: evidence.pr.base.sha, policy,
     activityFingerprint: fingerprint, activityAt: activityAt === null ? null : new Date(activityAt), readyReplyId: old?.readyReplyId ?? null,
     readySentAt: readySentAt === null ? null : new Date(readySentAt), quietDeadline: changed ? new Date(start + QUIET_MS) : old.quietDeadline === null ? null : new Date(old.quietDeadline), blockingReason });
+  queueStatusCard(options.store, options.store.getAssignment(assignmentId).ticketId, now);
+  return candidate;
 }
 
 function complete(options: MergePassOptions, candidate: MergeCandidate, evidence: MergeEvidence, attemptId: number | undefined, origin: "ostrom" | "external" | "unknown", responseSha?: string): void {
