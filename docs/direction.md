@@ -151,9 +151,13 @@ a ticket's budget says otherwise.
 
 ## Milestone 2
 
-[The merging design](merging.md) proposes unattended merging by default, with human-merge and
-approval policies, the conditions for a deterministic daemon pass, and a sandbox verification plan.
-It is not implemented yet.
+[The merging design](merging.md) is implemented with unattended, human and approval policies,
+durable merge inhibition and reconciliation. [The sandbox run](e2e-m2.md) provides partial evidence:
+real Worker PRs and PR CI, ready delivery, same-session revision, pause across restart, stop to
+draft and a human merge reconciled as external after three separately reviewed fixes. Host thermal shutdowns prevented the natural unattended merge and completion proof. The
+follow-up's final window/merge, resume eligibility, runtime approval/protection gates and ambiguous
+send reconciliation remain deferred; read-only diagnostics are recorded separately and do not
+complete those runtime exercises.
 
 ## Non-goals (for now)
 
