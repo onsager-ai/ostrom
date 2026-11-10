@@ -98,7 +98,9 @@ async function eligibilityFor(options: MergePassOptions, assignmentId: number, e
   return mergeEligibility({ evidence, policy: options.policy, expected: { head: candidate.headSha, base: candidate.baseSha }, ...(approvals === undefined ? {} : { approvals }),
     local: { issueOpen: ticket.state !== "ended", ticketOpen: ticket.state === "open", pausedOrStopping: ticket.state === "paused" || ticket.stopRequestedAt !== null,
       stalledOrFailed: assignment.outcome === "failed" || assignment.stallRecoveryAttempts > 0, budgetReached: budgetReached(options.store.ticketBudget(ticket.id), now) !== null,
-      workerIdle: options.store.assignmentWorkIdle(assignmentId), readyReplySent: readySentAt !== null,
+      // During final evidence revalidation this pass itself holds the reservation; it is the lock
+      // proving no native turn can start, not concurrent work that should block the merge.
+      workerIdle: options.store.assignmentWorkIdle(assignmentId) || options.store.reservationHeld(assignmentId), readyReplySent: readySentAt !== null,
       quietUntil: candidate.quietDeadline === null ? null : new Date(candidate.quietDeadline), now } });
 }
 
