@@ -7,7 +7,7 @@ import { afterEach, test } from "node:test";
 import { Store } from "../store/store.ts";
 import { FakeRunner } from "./fake-runner.ts";
 import { workerBrief } from "./dispatch.ts";
-import { gitDirs, INTERRUPTED_PROMPT, Workers, type WorkersDeps } from "./workers.ts";
+import { gitDirs, INTERRUPTED_PROMPT, workerTurnPrompt, Workers, type WorkersDeps } from "./workers.ts";
 
 const REPO = "onsager-ai/ostrom";
 const config = { repo: "/repo", base: "main", worktrees: "/wt", harness: "codex" as const, model: "gpt-6-luna", machine: "host" };
@@ -84,7 +84,7 @@ test("cancelling an in-flight turn lets its queued replacement run without a can
   session.auto = true;
   workers.deliver(1, "replacement", "continue", () => {});
   await workers.drain();
-  assert.deepEqual(session.prompts.slice(-1), ["continue"]);
+  assert.deepEqual(session.prompts.slice(-1), [workerTurnPrompt("continue")]);
   assert.equal(store.getAssignment(1).turnStartedAt, null);
   assert.equal(store.getAssignment(1).outcome, null);
   assert.equal(session.maxRunning, 1);
@@ -179,7 +179,7 @@ test("restart recovery resumes running sessions by id and sends the interrupted 
   await restarted.drain();
   const resumed = runner.sessions.filter((s) => s.resumed);
   assert.deepEqual(resumed.map((s) => s.id), ["sess-1", "idle-session"]);
-  assert.deepEqual(resumed[0]?.prompts, [INTERRUPTED_PROMPT]);
+  assert.deepEqual(resumed[0]?.prompts, [workerTurnPrompt(INTERRUPTED_PROMPT)]);
   assert.deepEqual(resumed[1]?.prompts, []);
   const a = store.getAssignment(1);
   assert.deepEqual([a.interruptions, a.turnStartedAt, a.state], [1, null, "running"]);
@@ -201,8 +201,8 @@ test("a queued turn survives a restart and runs exactly once", async () => {
   restarted.recover();
   await restarted.drain();
   const resumed = runner.sessions.at(-1)!;
-  assert.deepEqual(resumed.prompts, [INTERRUPTED_PROMPT, "next"]);
-  assert.equal(resumed.prompts.filter((prompt) => prompt === "next").length, 1);
+  assert.deepEqual(resumed.prompts, [workerTurnPrompt(INTERRUPTED_PROMPT), workerTurnPrompt("next")]);
+  assert.equal(resumed.prompts.filter((prompt) => prompt === workerTurnPrompt("next")).length, 1);
 });
 
 test("a reservation blocks a new queued turn without consuming budget and release wakes it", async () => {
@@ -213,11 +213,11 @@ test("a reservation blocks a new queued turn without consuming budget and releas
   assert.equal(store.reserveAssignment(1), true);
   workers.deliver(1, "held", "wait", () => {});
   await workers.drain();
-  assert.equal(runner.sessions[0]!.prompts.includes("wait"), false);
+  assert.equal(runner.sessions[0]!.prompts.includes(workerTurnPrompt("wait")), false);
   assert.equal(store.getAssignment(1).turns, turns);
   workers.release(1);
   await workers.drain();
-  assert.equal(runner.sessions[0]!.prompts.includes("wait"), true);
+  assert.equal(runner.sessions[0]!.prompts.includes(workerTurnPrompt("wait")), true);
   assert.equal(store.assignmentWorkIdle(1), true);
 });
 
@@ -237,7 +237,7 @@ test("a stop cuts off the running turn, starts no queued one, and leaves the tur
   const restarted = make();
   assert.deepEqual(restarted.recover().interrupted, [1]);
   await restarted.drain();
-  assert.deepEqual(runner.sessions.at(-1)!.prompts, [INTERRUPTED_PROMPT, "next"]);
+  assert.deepEqual(runner.sessions.at(-1)!.prompts, [workerTurnPrompt(INTERRUPTED_PROMPT), workerTurnPrompt("next")]);
   assert.equal(store.getAssignment(1).turnStartedAt, null);
 });
 

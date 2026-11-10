@@ -54,7 +54,7 @@ test("reader finishes connections with different page counts without refetching 
     const suites = page(value("suitesAfter"), [], "s");
     const associated = page(value("associatedPrsAfter"), [{ number: 1 }], "p");
     return JSON.stringify({ data: { repository: { pullRequest: {
-      number: 1, state: "OPEN", isDraft: false, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN", reviewDecision: null,
+      number: 1, state: "OPEN", isDraft: false, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN", reviewDecision: null, author: { login: "alice" },
       headRefName: "branch", headRefOid: "head", baseRefName: "main", baseRefOid: "base",
       reviewThreads: threads, reviews, commits: { nodes: [{ commit: { oid: "head", associatedPullRequests: associated,
         statusCheckRollup: { state: "SUCCESS", contexts }, checkSuites: suites } }] },

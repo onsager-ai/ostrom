@@ -244,6 +244,39 @@ export function stallReplyId(stallId: number): string {
 
 export type OutboxKind = "comment" | "edit" | "reaction" | "label";
 
+export interface MergeCandidate {
+  id: number;
+  assignmentId: number;
+  repository: string;
+  prNumber: number;
+  headSha: string;
+  baseSha: string;
+  policy: string;
+  activityFingerprint: string | null;
+  activityAt: string | null;
+  readyReplyId: string | null;
+  readySentAt: string | null;
+  quietDeadline: string | null;
+  blockingReason: string | null;
+}
+
+export type MergeAttemptState = "pending" | "confirmed" | "failed" | "unknown";
+export interface MergeAttempt {
+  id: number;
+  candidateId: number;
+  repository: string;
+  prNumber: number;
+  headSha: string;
+  attemptNumber: number;
+  method: "squash";
+  requestedAt: string;
+  actorId: number;
+  responseSha: string | null;
+  error: string | null;
+  nextRetryAt: string | null;
+  state: MergeAttemptState;
+}
+
 export interface NewReply {
   id: string;
   threadId: number;
@@ -974,7 +1007,8 @@ export class Store {
   /** Atomically claims a queued prompt once a runner is about to begin it. A reservation wins. */
   beginQueuedTurn(assignmentId: number, deliveryKey: string, turnId: string): QueuedTurn | null {
     return this.#transaction(() => {
-      if (this.#get("SELECT 1 FROM assignment_reservation WHERE assignment_id = ?", assignmentId) !== undefined) return null;
+      if (this.#get("SELECT 1 FROM assignment_reservation WHERE assignment_id = ?", assignmentId) !== undefined ||
+          this.#get("SELECT 1 FROM merge_attempt JOIN merge_candidate ON merge_candidate.id = merge_attempt.candidate_id WHERE merge_candidate.assignment_id = ? AND merge_attempt.state IN ('pending', 'unknown')", assignmentId) !== undefined) return null;
       const row = this.#get(
         `UPDATE queued_turn SET state = 'running', turn_id = ?, started_at = ?
          WHERE assignment_id = ? AND delivery_key = ? AND state = 'queued' RETURNING *`,
@@ -1003,11 +1037,12 @@ export class Store {
   }
 
   /** True only when no durable/in-flight local work or undispatched receipts remain. */
-  assignmentWorkIdle(assignmentId: number): boolean {
+  assignmentWorkIdle(assignmentId: number, ignoreReservation = false): boolean {
     const row = this.#get(
       `SELECT (SELECT turn_started_at FROM assignment WHERE id = ?) IS NULL
           AND NOT EXISTS (SELECT 1 FROM queued_turn WHERE assignment_id = ? AND state <> 'finished')
-          AND NOT EXISTS (SELECT 1 FROM assignment_reservation WHERE assignment_id = ?)
+          AND (? OR NOT EXISTS (SELECT 1 FROM assignment_reservation WHERE assignment_id = ?))
+          AND NOT EXISTS (SELECT 1 FROM merge_attempt WHERE candidate_id IN (SELECT id FROM merge_candidate WHERE assignment_id = ?) AND state IN ('pending', 'unknown'))
           AND NOT EXISTS (
             SELECT 1 FROM "trigger" AS t JOIN subscription ON subscription.thread_id = t.thread_id
             JOIN ticket ON ticket.id = subscription.ticket_id
@@ -1017,7 +1052,7 @@ export class Store {
               AND NOT EXISTS (SELECT 1 FROM delivery WHERE delivery.trigger_id = t.id)
               AND NOT EXISTS (SELECT 1 FROM command_receipt WHERE command_receipt.trigger_id = t.id AND command_receipt.ticket_id = ticket.id)
           ) AS idle`,
-      assignmentId, assignmentId, assignmentId, assignmentId,
+      assignmentId, assignmentId, ignoreReservation ? 1 : 0, assignmentId, assignmentId, assignmentId,
     );
     if (row === undefined) throw new Error(`no assignment ${assignmentId}`);
     return row["idle"] === 1;
@@ -1026,7 +1061,9 @@ export class Store {
   /** Holds an idle assignment so a merge pass can exclude a concurrent local turn start. */
   reserveAssignment(assignmentId: number): boolean {
     return this.#transaction(() => {
-      if (!this.assignmentWorkIdle(assignmentId)) return false;
+      const assignment = this.getAssignment(assignmentId);
+      const ticket = this.getTicket(assignment.ticketId);
+      if (assignment.state !== "running" || ticket.state !== "open" || ticket.stopRequestedAt !== null || !this.assignmentWorkIdle(assignmentId)) return false;
       const { changes } = this.#run(
         "INSERT INTO assignment_reservation (assignment_id, held_at) VALUES (?, ?) ON CONFLICT DO NOTHING",
         assignmentId, this.#stamp(),
@@ -1059,11 +1096,22 @@ export class Store {
   }
 
   /** Associates the stable pr-opened reply with its assignment. Sending fills the timestamp. */
-  trackReadyReply(assignmentId: number, replyId: string): void {
+  trackReadyReply(assignmentId: number, replyId: string, replaceUnsent = false): void {
     this.#run(
-      "INSERT INTO ready_reply (assignment_id, reply_id) VALUES (?, ?) ON CONFLICT (assignment_id) DO NOTHING",
-      assignmentId, replyId,
+      `INSERT INTO ready_reply (assignment_id, reply_id) VALUES (?, ?)
+       ON CONFLICT (assignment_id) DO UPDATE SET reply_id = excluded.reply_id WHERE ? AND ready_reply.sent_at IS NULL`,
+      assignmentId, replyId, replaceUnsent ? 1 : 0,
     );
+  }
+
+  replySentAt(replyId: string): string | null {
+    const row = this.#get("SELECT sent_at FROM outbox WHERE id = ?", replyId);
+    return row === undefined ? null : row["sent_at"] as string | null;
+  }
+
+  readyReplyId(assignmentId: number): string | null {
+    const row = this.#get("SELECT reply_id FROM ready_reply WHERE assignment_id = ?", assignmentId);
+    return row === undefined ? null : row["reply_id"] as string;
   }
 
   readyReplySentAt(assignmentId: number): string | null {
@@ -1074,6 +1122,137 @@ export class Store {
   /** Records confirmed outbox delivery; calling this for another reply has no effect. */
   markReadyReplySent(replyId: string): void {
     this.#run("UPDATE ready_reply SET sent_at = ? WHERE reply_id = ? AND sent_at IS NULL", this.#stamp(), replyId);
+  }
+
+  // --- merge reconciliation ------------------------------------------------------------------
+
+  mergeCandidate(assignmentId: number, repository: string, prNumber: number): MergeCandidate | null {
+    const row = this.#get(
+      "SELECT * FROM merge_candidate WHERE assignment_id = ? AND repository = ? AND pr_number = ?",
+      assignmentId, repository, prNumber,
+    );
+    return row === undefined ? null : toMergeCandidate(row);
+  }
+
+  mergeCandidateForAssignment(assignmentId: number): MergeCandidate | null {
+    const row = this.#get("SELECT * FROM merge_candidate WHERE assignment_id = ? ORDER BY id DESC LIMIT 1", assignmentId);
+    return row === undefined ? null : toMergeCandidate(row);
+  }
+
+  mergeCandidateById(candidateId: number): MergeCandidate {
+    const row = this.#get("SELECT * FROM merge_candidate WHERE id = ?", candidateId);
+    if (row === undefined) throw new Error(`no merge candidate ${candidateId}`);
+    return toMergeCandidate(row);
+  }
+
+  upsertMergeCandidate(input: {
+    assignmentId: number; repository: string; prNumber: number; headSha: string; baseSha: string; policy: string;
+    activityFingerprint: string | null; activityAt: Date | null; readyReplyId: string | null; readySentAt: Date | null;
+    quietDeadline: Date | null; blockingReason: string | null;
+  }): MergeCandidate {
+    const existing = this.mergeCandidate(input.assignmentId, input.repository, input.prNumber);
+    if (existing === null) {
+      this.#run(
+        `INSERT INTO merge_candidate (assignment_id, repository, pr_number, head_sha, base_sha, policy, activity_fingerprint,
+          activity_at, ready_reply_id, ready_sent_at, quiet_deadline, blocking_reason)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        input.assignmentId, input.repository, input.prNumber, input.headSha, input.baseSha, input.policy,
+        input.activityFingerprint, input.activityAt?.toISOString() ?? null, input.readyReplyId,
+        input.readySentAt?.toISOString() ?? null, input.quietDeadline?.toISOString() ?? null, input.blockingReason,
+      );
+    } else {
+      this.#run(
+        `UPDATE merge_candidate SET head_sha = ?, base_sha = ?, policy = ?, activity_fingerprint = ?, activity_at = ?,
+          ready_reply_id = ?, ready_sent_at = ?, quiet_deadline = ?, blocking_reason = ? WHERE id = ?`,
+        input.headSha, input.baseSha, input.policy, input.activityFingerprint, input.activityAt?.toISOString() ?? null,
+        input.readyReplyId, input.readySentAt?.toISOString() ?? null, input.quietDeadline?.toISOString() ?? null,
+        input.blockingReason, existing.id,
+      );
+    }
+    return this.mergeCandidate(input.assignmentId, input.repository, input.prNumber)!;
+  }
+
+  unresolvedMergeAttempts(repository: string): MergeAttempt[] {
+    return this.#all(
+      "SELECT * FROM merge_attempt WHERE repository = ? AND state IN ('pending', 'unknown') ORDER BY id",
+      repository,
+    ).map(toMergeAttempt);
+  }
+
+  mergeAttempts(repository: string, prNumber: number): MergeAttempt[] {
+    return this.#all("SELECT * FROM merge_attempt WHERE repository = ? AND pr_number = ? ORDER BY id", repository, prNumber).map(toMergeAttempt);
+  }
+
+  createMergeAttempt(candidate: MergeCandidate, actorId: number): MergeAttempt {
+    return this.#transaction(() => {
+      const number = this.#get(
+        "SELECT COALESCE(MAX(attempt_number), 0) + 1 AS number FROM merge_attempt WHERE repository = ? AND pr_number = ?",
+        candidate.repository, candidate.prNumber,
+      )!["number"] as number;
+      const row = this.#get(
+        `INSERT INTO merge_attempt (candidate_id, repository, pr_number, head_sha, attempt_number, method, requested_at, actor_id, state)
+         VALUES (?, ?, ?, ?, ?, 'squash', ?, ?, 'pending') RETURNING *`,
+        candidate.id, candidate.repository, candidate.prNumber, candidate.headSha, number, this.#stamp(), actorId,
+      )!;
+      return toMergeAttempt(row);
+    });
+  }
+
+  finishMergeAttempt(id: number, state: Exclude<MergeAttemptState, "pending">, result: { sha?: string; error?: string; nextRetryAt?: Date } = {}): void {
+    const { changes } = this.#run(
+      `UPDATE merge_attempt SET state = ?, response_sha = ?, error = ?, next_retry_at = ? WHERE id = ? AND state IN ('pending', 'unknown')`,
+      state, result.sha ?? null, result.error ?? null, result.nextRetryAt?.toISOString() ?? null, id,
+    );
+    if (Number(changes) !== 1) throw new IllegalTransition(`merge attempt ${id} is no longer unresolved`);
+  }
+
+  mergeRetryAt(repository: string, prNumber: number): string | null {
+    const row = this.#get(
+      "SELECT MAX(next_retry_at) AS next_retry_at FROM merge_attempt WHERE repository = ? AND pr_number = ? AND state = 'failed'",
+      repository, prNumber,
+    );
+    return row?.["next_retry_at"] as string | null;
+  }
+
+  prMerge(repository: string, prNumber: number): { origin: "ostrom" | "external" | "unknown"; mergedByLogin: string | null; mergedById: number | null; mergeSha: string; mergedAt: string } | null {
+    const row = this.#get("SELECT * FROM pr_merge WHERE repository = ? AND pr_number = ?", repository, prNumber);
+    return row === undefined ? null : {
+      origin: row["origin"] as "ostrom" | "external" | "unknown", mergedByLogin: row["merged_by_login"] as string | null,
+      mergedById: row["merged_by_id"] as number | null, mergeSha: row["merge_sha"] as string, mergedAt: row["merged_at"] as string,
+    };
+  }
+
+  ticketActivityAt(ticketId: number): string | null {
+    const row = this.#get(
+      `SELECT MAX(at) AS at FROM (
+        SELECT occurred_at AS at FROM "trigger" JOIN subscription ON subscription.thread_id = "trigger".thread_id
+          WHERE subscription.ticket_id = ? AND COALESCE(body, '') NOT LIKE '%<!-- ostrom:%'
+        UNION ALL SELECT last_activity_at AS at FROM assignment WHERE ticket_id = ?
+      )`, ticketId, ticketId,
+    );
+    return row?.["at"] as string | null;
+  }
+
+  recordMergeAndOutcome(input: {
+    repository: string; prNumber: number; headSha: string; mergeSha: string | null; mergedAt: Date;
+    mergedByLogin: string | null; mergedById: number | null; origin: "ostrom" | "external" | "unknown"; attemptId?: number;
+    assignmentId: number; threadId: number; body: string; evidence: string;
+  }): { duplicate: boolean; ticketEnded: boolean } {
+    return this.#transaction(() => {
+      this.#run(
+        `INSERT INTO pr_merge (repository, pr_number, head_sha, merge_sha, merged_at, merged_by_login, merged_by_id, origin, attempt_id, evidence)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (repository, pr_number) DO NOTHING`,
+        input.repository, input.prNumber, input.headSha, input.mergeSha, input.mergedAt.toISOString(), input.mergedByLogin,
+        input.mergedById, input.origin, input.attemptId ?? null, input.evidence,
+      );
+      if (input.attemptId !== undefined) this.finishMergeAttempt(input.attemptId, "confirmed", input.mergeSha === null ? {} : { sha: input.mergeSha });
+      this.#run("UPDATE queued_turn SET state = 'finished', finished_at = ? WHERE assignment_id = ? AND state <> 'finished'", this.#stamp(), input.assignmentId);
+      this.releaseAssignmentReservation(input.assignmentId);
+      const { duplicate } = this.#insertReply({
+        id: `outcome-a${input.assignmentId}-pr${input.prNumber}-merged`, threadId: input.threadId, body: input.body,
+      });
+      return { duplicate, ticketEnded: this.#endWork(this.getAssignment(input.assignmentId)) };
+    });
   }
 
   /** Records the native turn that received the trigger. Duplicate delivery is a no-op. */
@@ -1323,6 +1502,13 @@ export class Store {
     return { duplicate: false };
   }
 
+  /** The latest stored card body, including an already delivered card. */
+  statusCardBody(threadId: number): string | null {
+    const id = `card-thread-${threadId}`;
+    const row = this.#get("SELECT body FROM outbox WHERE id = ? OR id LIKE ? ORDER BY enqueued_at DESC, id DESC LIMIT 1", id, `${id}-%`);
+    return row === undefined ? null : row["body"] as string;
+  }
+
   /** Coalesces an unsent card update so only the latest state is delivered. */
   enqueueStatusCard(threadId: number, body: string): void {
     const thread = this.getThread(threadId);
@@ -1330,7 +1516,7 @@ export class Store {
     const kind: OutboxKind = thread.statusCardCommentId === null ? "comment" : "edit";
     const target = thread.statusCardCommentId === null ? null : String(thread.statusCardCommentId);
     const existing = this.#get(
-      "SELECT id, sent_at FROM outbox WHERE id = ? OR (id LIKE ? AND sent_at IS NULL) ORDER BY id DESC LIMIT 1",
+      "SELECT id, sent_at, body FROM outbox WHERE id = ? OR id LIKE ? ORDER BY enqueued_at DESC, id DESC LIMIT 1",
       id,
       `${id}-%`,
     );
@@ -1338,6 +1524,7 @@ export class Store {
       this.#insertReply({ id, threadId, body, kind, ...(target === null ? {} : { target }) });
       return;
     }
+    if (existing["body"] === body) return;
     if (existing["sent_at"] !== null) {
       this.#insertReply({ id: `${id}-${this.#stamp()}`, threadId, body, kind, ...(target === null ? {} : { target }) });
       return;
@@ -1386,12 +1573,14 @@ export class Store {
 
   /** Marks a reply sent. Marking it sent a second time throws. */
   markReplySent(replyId: string): void {
-    const { changes } = this.#run(
-      "UPDATE outbox SET sent_at = ?, attempts = attempts + 1 WHERE id = ? AND sent_at IS NULL",
-      this.#stamp(),
-      replyId,
-    );
-    if (Number(changes) !== 1) this.#unsentReplyMissing(replyId);
+    this.#transaction(() => {
+      const { changes } = this.#run(
+        "UPDATE outbox SET sent_at = ?, attempts = attempts + 1 WHERE id = ? AND sent_at IS NULL",
+        this.#stamp(), replyId,
+      );
+      if (Number(changes) !== 1) this.#unsentReplyMissing(replyId);
+      this.markReadyReplySent(replyId);
+    });
   }
 
   /** Records a failed send and when to try again. A sent reply cannot fail afterwards. */
@@ -1481,6 +1670,28 @@ function toTicket(row: Row): Ticket {
     endedAt: row["ended_at"] as string | null,
     pauseCause: row["pause_cause"] as string | null,
     stopRequestedAt: row["stop_requested_at"] as string | null,
+  };
+}
+
+function toMergeCandidate(row: Row): MergeCandidate {
+  return {
+    id: row["id"] as number, assignmentId: row["assignment_id"] as number,
+    repository: row["repository"] as string, prNumber: row["pr_number"] as number,
+    headSha: row["head_sha"] as string, baseSha: row["base_sha"] as string, policy: row["policy"] as string,
+    activityFingerprint: row["activity_fingerprint"] as string | null, activityAt: row["activity_at"] as string | null,
+    readyReplyId: row["ready_reply_id"] as string | null, readySentAt: row["ready_sent_at"] as string | null,
+    quietDeadline: row["quiet_deadline"] as string | null, blockingReason: row["blocking_reason"] as string | null,
+  };
+}
+
+function toMergeAttempt(row: Row): MergeAttempt {
+  return {
+    id: row["id"] as number, candidateId: row["candidate_id"] as number,
+    repository: row["repository"] as string, prNumber: row["pr_number"] as number,
+    headSha: row["head_sha"] as string, attemptNumber: row["attempt_number"] as number,
+    method: row["method"] as "squash", requestedAt: row["requested_at"] as string, actorId: row["actor_id"] as number,
+    responseSha: row["response_sha"] as string | null, error: row["error"] as string | null,
+    nextRetryAt: row["next_retry_at"] as string | null, state: row["state"] as MergeAttemptState,
   };
 }
 

@@ -5,6 +5,7 @@
 import { defaultSocketPath, localApi } from "../api/server.ts";
 import { operatorControls, routeCommands } from "../commands/commands.ts";
 import { renderMergeEligibilityPreview } from "../github/preview.ts";
+import { mergePass } from "../github/merge-pass.ts";
 import { execGh, type GhRunner } from "../github/gh.ts";
 import { sendDueReplies } from "../github/outbox.ts";
 import { processRunner, type ProcessRunner } from "../process.ts";
@@ -30,12 +31,14 @@ import { loadBudgetDefaults, loadConfig, loadRouterConfig, loadWatchdogConfig, l
  * - route: ordinary follow-ups, including those, reach their Workers.
  * - watchdog: after a follow-up may have unblocked a Worker, and before the Router, so a new
  *   stall is flagged in this tick's batch.
+ * - merge: after controls, Worker follow-ups and Watchdog transitions, so its final direct read
+ *   sees every local interlock; before Router outcomes and sending so reconciliation owns merged replies.
  * - route-candidates: the Router judges candidates, outcomes and stalls and queues replies.
  * - send: replies queued by this tick's Router pass go out in this tick.
- * Each pass reads and writes only the store and its own neighbour, so none depends on an earlier
- * one succeeding: a failed pass is reported and the rest still run.
+ * A failed pass is reported and later passes still run; automatic sends are suppressed after a
+ * prerequisite failure while the merge pass continues reconciliation.
  */
-export const TICK = ["poll", "observe", "commands", "route", "watchdog", "route-candidates", "send"] as const;
+export const TICK = ["poll", "observe", "commands", "route", "watchdog", "merge", "route-candidates", "send"] as const;
 
 const USAGE = `usage: ostromd run --interval <seconds>
        ostromd dev <pass> [ticket-id]
@@ -45,7 +48,7 @@ commands:
          repeat the daemon loop until SIGINT or SIGTERM
   dev <pass>
          developer-only one-shot pass: poll, send, dispatch <ticket-id>, observe, commands,
-         route, watchdog, route-candidates or tick
+         route, watchdog, merge, route-candidates or tick
 
 run needs OSTROM_REPO, OSTROM_ALLOWLIST, OSTROM_DB and the worker/router/watchdog configuration;
 see docs/running.md. Developer passes retain their existing environment requirements.
@@ -73,6 +76,7 @@ export interface MainDeps {
    * write to the store the pass handed them, after the pass itself has returned.
    */
   store?: Store;
+  mergeAllowed?: boolean;
 }
 
 function sleep(ms: number, stop: AbortSignal): Promise<void> {
@@ -122,7 +126,7 @@ async function tick(deps: MainDeps): Promise<number> {
   const shared = { ...deps, workers: deps.workers ?? owned!.workers, store: deps.store ?? owned!.store };
   try {
     for (const step of TICK) {
-      const code = await main(["dev", step], shared);
+      const code = await main(["dev", step], { ...shared, mergeAllowed: failed.length === 0 });
       if (code !== 0) failed.push(`${step} (exit ${code})`);
     }
   } finally {
@@ -240,6 +244,7 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
             command === "commands" ||
             command === "route" ||
             command === "watchdog" ||
+            command === "merge" ||
             command === "route-candidates" ||
             command === "tick") &&
           rest.length === 0;
@@ -306,6 +311,22 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
       );
       return pass.failed.length === 0 ? 0 : 1;
     }
+    if (command === "merge") {
+      const pass = await mergePass({ store, workers: workers(), gh: deps.gh, repo: config.repo, policy: config.mergePolicy,
+        base: loadWorkerConfig(deps.env).base, allowSend: deps.mergeAllowed ?? true,
+        refreshBeforeSend: async () => {
+          // The final evidence read follows fresh intake and controls. Any failure suppresses HTTP.
+          await pollOnce({ store: openStore, gh: deps.gh, repo: config.repo, allowlist: config.allowlist });
+          const controls = await routeCommands(openStore, workers(), deps.gh, config.repo);
+          if (controls.failed.length > 0) throw new Error("final controls failed");
+        },
+      });
+      for (const assignmentId of pass.merged) deps.stdout(JSON.stringify({ assignmentId, merged: true }));
+      for (const waiting of pass.waiting) deps.stdout(JSON.stringify({ ...waiting, merged: false }));
+      for (const failure of pass.failed) deps.stderr(`ostromd merge: assignment ${failure.assignmentId} failed: ${failure.error}`);
+      deps.stderr(`ostromd merge: ${pass.merged.length} merged, ${pass.waiting.length} waiting, ${pass.reconciled.length} reconciled, ${pass.failed.length} failed`);
+      return pass.failed.length === 0 ? 0 : 1;
+    }
     if (command === "route-candidates") {
       const router = loadRouterConfig(deps.env);
       const pass = await routeCandidates({
@@ -316,6 +337,7 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
         router,
         runners: deps.runners ?? realRunners(deps.env),
         budget: loadBudgetDefaults(deps.env),
+        mergePolicy: config.mergePolicy,
       });
       if (pass.router !== null) deps.stdout(JSON.stringify({ type: "router", ...pass.router }));
       for (const decision of pass.decisions) deps.stdout(JSON.stringify({ type: "decision", ...decision }));

@@ -11,6 +11,7 @@ export interface StatusCard {
   stoppedReason?: "issue closed";
   budgetWarning?: string;
   pauseCause?: string;
+  mergeStatus?: string;
   /** The Worker's newest known checklist, in its order. Omit when it has not published one. */
   plan?: readonly string[];
   pullRequest?: string;
@@ -42,6 +43,7 @@ export function renderStatusCard(card: StatusCard): string {
   if (card.pullRequest !== undefined) lines.push("", `PR: ${card.pullRequest}`);
   if (card.budgetWarning !== undefined) lines.push("", `Warning: budget at 80% — ${card.budgetWarning}`);
   if (card.pauseCause !== undefined) lines.push("", `Paused: ${card.pauseCause}`);
+  if (card.mergeStatus !== undefined) lines.push("", `Merge: ${card.mergeStatus}`);
   lines.push(
     "",
     `Harness: \`${card.harness}\` · Model: \`${card.model}\``,

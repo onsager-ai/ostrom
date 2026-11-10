@@ -108,7 +108,7 @@ export function followUpMessage(ticketId: number, trigger: Trigger, thread: Thre
     "",
     "Read it with `gh`; this message does not copy it. If it asks for changes, make them and push",
     "to the branch of your existing pull request; do not open a new one. Do not comment on GitHub",
-    "yourself: Ostrom replies to people.",
+    "yourself: Ostrom replies to people. Do not merge, enable auto-merge, dismiss reviews, or resolve human review threads.",
   ].join("\n");
 }
 
@@ -130,6 +130,7 @@ export function reviewFollowUpMessage(ticketId: number, thread: Thread, triggers
     ]),
     "",
     "Address the review. Ostrom will post one summary reply using your final answer; do not comment on GitHub yourself.",
+    "Do not merge, enable auto-merge, dismiss reviews, or resolve human review threads.",
   ];
   return lines.join("\n");
 }

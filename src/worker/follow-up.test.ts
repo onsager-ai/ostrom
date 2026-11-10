@@ -4,7 +4,7 @@ import { afterEach, test } from "node:test";
 import { Store } from "../store/store.ts";
 import { FakeRunner } from "./fake-runner.ts";
 import { followUpMessage, routeFollowUps } from "./follow-up.ts";
-import { Workers } from "./workers.ts";
+import { workerTurnPrompt, Workers } from "./workers.ts";
 
 const REPO = "onsager-ai/ostrom";
 const tick = () => new Promise((resolve) => setImmediate(resolve));
@@ -81,7 +81,7 @@ test("a review on a subscribed PR goes to the ticket's Worker session, with no d
   const [session] = runner.sessions;
   assert.equal(session?.resumed, true);
   assert.equal(session?.id, "session-1");
-  assert.deepEqual(session?.prompts, [followUpMessage(ticketId, pending!.trigger, store.getThread(pr))]);
+  assert.deepEqual(session?.prompts, [workerTurnPrompt(followUpMessage(ticketId, pending!.trigger, store.getThread(pr)))]);
   assert.deepEqual(store.pendingDeliveries(), []);
   assert.deepEqual(store.undecidedTriggers(), [], "a delivered trigger never reaches the Router");
   assert.equal(store.getAssignment(assignmentId).turns, 1);

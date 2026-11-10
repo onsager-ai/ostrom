@@ -8,6 +8,7 @@
         "mergeable": "MERGEABLE",
         "mergeStateStatus": "CLEAN",
         "reviewDecision": null,
+        "author": { "login": "alice" },
         "headRefName": "ostrom/ticket-7-7",
         "headRefOid": "fd2d929802c33741c934f5c2acd7c9fc7008e235",
         "baseRefName": "main",
