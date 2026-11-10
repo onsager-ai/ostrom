@@ -59,14 +59,15 @@ not establish ownership. Human policy skips merge requests entirely. Otherwise a
    `mergeable=true` and GraphQL `mergeStateStatus=CLEAN`. Null/UNKNOWN waits for another tick;
    conflicts, BEHIND, BLOCKED, UNSTABLE and HAS_HOOKS block this first implementation. CLEAN alone
    is insufficient evidence of CI or protection compliance. [1][2]
-4. CI is green for this head SHA: at least one completed successful Actions `pull_request` run
-   associated with this PR, every latest relevant run/check completed without failure, and every
-   required check/status present from its required app. A push run or manual dispatch alone does
-   not qualify. Read legacy statuses as well as check runs. Accept `neutral`/`skipped` check
-   conclusions as GitHub does, but require an actual successful PR workflow; a missing required
-   workflow stays blocked. If GitHub evaluates checks on a test merge commit, require those too,
-   tied to the same head/base pair. Do not accept an older successful attempt over a queued or
-   running re-run. No checks is a visible block, not green. [3][4][5][6]
+4. CI evidence comes primarily from the head commit's `statusCheckRollup`, in the same GraphQL
+   query as merge/review state and threads. Require `commit.oid` to equal the captured head,
+   `state=SUCCESS`, and read every page of `contexts` (CheckRun or StatusContext). Every required
+   check/status from protection or rules must be present with the required identity. Also require
+   at least one completed SUCCESS check from this repository's successful `pull_request` workflow
+   for this PR; an empty rollup, push run or manual dispatch cannot qualify. Identify its suite,
+   matching PR and workflow through GraphQL, as described below. Accept NEUTRAL/SKIPPED contexts
+   as GitHub does only alongside that actual successful PR check/workflow. If GitHub evaluates
+   required checks on a test merge commit, read its rollup too, tied to this head/base pair. [3][4][6]
 5. No effective submitted CHANGES_REQUESTED review remains, from any reviewer, and no unresolved
    review thread remains, including outdated threads. Read every page. Reduce each reviewer's
    submitted decisive reviews in order: APPROVED replaces their previous request for changes;
@@ -76,9 +77,11 @@ not establish ownership. Human policy skips merge requests entirely. Otherwise a
 6. Read the base branch's classic protection and active rules, including inherited rulesets, on
    each final evaluation. Honor required checks and app identities, strict/up-to-date settings,
    required approvals, code owners, stale-review dismissal, last-push approval and conversation
-   resolution. Never use an admin override or bypass. A protection read denied or ambiguous 404
-   is not evidence of no protection. Block when applicable requirements cannot be established;
-   merge queues, unsupported rules and restricted squash merging require operator action. [8][9]
+   resolution. Read these ourselves because the operator's login may be an admin: GitHub exempts
+   admins from classic protection by default, so API acceptance alone cannot prove compliance. [10]
+   Never use an admin override or bypass. A protection read denied or ambiguous 404 is not evidence
+   of no protection. Block when applicable requirements cannot be established; merge queues,
+   unsupported rules and restricted squash merging require operator action. [8][9]
 7. The ready reply has actually been posted, and ten quiet minutes have passed. The timer starts
    at the latest of that post, PR discovery, any head/base change, any completed Worker turn, and
    the latest observed human activity on the issue or PR. Activity includes comments/edits,
@@ -181,9 +184,19 @@ the transition that sends HTTP; do not hold a SQLite transaction across the netw
 - **Human merge/close at the same time:** re-read after any ambiguous result. Already merged means
   reconcile once, never post a second done reply. Closed without merge means `pr_closed`; never
   reopen it. The actual GitHub merge result wins over a local pending request.
-- **Re-runs:** read current check suites/workflow attempts as well as runs, since a re-request can
-  queue a suite while an old check run still says success. Pending, failed or incomplete evidence
-  blocks. The exact re-run shapes need sandbox fixtures before enabling merging. [3][4]
+- **Re-runs:** the rollup combines check runs and statuses; its contexts expose current run status
+  and conclusion. Any check not COMPLETED and any status other than SUCCESS blocks. GitHub documents
+  NEUTRAL/SKIPPED as successful for required checks, but the GraphQL reference does not specify
+  their rollup aggregation or promise latest-attempt/atomic re-request visibility. [3][6]
+  A suite re-request explicitly resets the suite to QUEUED with no conclusion; the docs do not
+  promise its child runs reset simultaneously. [5] Supplement the rollup in the same query with
+  all head `checkSuites` pages and their status/conclusion, plus `workflowRun` event, workflow
+  identity, `runAttempt` and matching PRs. These fields establish PR-workflow provenance and detect
+  a queued suite before replacement contexts appear. [3][4] Use the latest suite/attempt per
+  workflow, never an older successful one; paginate and block ambiguous ordering. No separate
+  REST check-run, status, suite or Actions reader is planned. Fixtures must establish latest-
+  attempt selection and the suite/rollup transition before enabling merging. This cannot rule out
+  a re-run requested after the final read; that remains the send-time race described below.
 - **Protection:** read classic protection and active branch rules, plus repository merge settings;
   do not infer requirements from `CLEAN` or assume `check` is the required check everywhere. Treat
   unknown enforced rules as unsupported. GitHub remains the final enforcer, but a privileged login
@@ -229,9 +242,12 @@ a second handwritten copy of itself. Cover:
   SHA; repository squash setting; successful/false merge bodies and 403/405/409/422 responses. [1]
 - GraphQL merge/review states, all pages of review threads and `isResolved`, review author/state/
   commit; REST review order, submitted/dismissed reviews and null/deleted users. [2][7]
-- Actions run event/PR association/head/attempt/status, suites during re-request, check head/app/
-  name/status/conclusion and legacy status context/state; missing and multiple pages of checks,
-  same-name different apps, and head versus test-merge SHA. [3][4][5][6]
+- The shared GraphQL query's commit OID, rollup state and every contexts page: CheckRun identity/
+  suite/app/name/status/conclusion and StatusContext name/state/creator. Cover empty/null rollups,
+  SUCCESS alongside NEUTRAL/SKIPPED, pending/error/failure states, missing required checks,
+  same-name different apps, and head versus test-merge SHA. Supplement only with paginated head
+  suites and their workflow event/identity/attempt/matching PRs: prove a queued re-request blocks
+  while old contexts remain green, and an older success cannot mask the latest attempt. [3][4][5][6]
 - Classic protection including strict checks, app IDs, approval and bypass settings; active inherited
   branch rules including required checks, reviews, queue and merge methods; permission denial and
   genuinely unprotected branches. The selected API version's available fields must be verified,
@@ -262,8 +278,10 @@ workflow run/attempt URLs, review URLs and merge SHA. Add an evidence document o
 
 ## Implementation PRs
 
-1. **GitHub reader and policy data.** Add versioned reads, pagination, recorded agreement fixtures,
-   policy parsing and a read-only eligibility report. No merge calls. Forward migration adds
+1. **GitHub reader and policy data.** Add one GraphQL query for head rollup, merge/review state,
+   threads and the narrow suite/workflow supplement above, with pagination and agreement fixtures.
+   Keep REST reads for PR/merge settings and branch requirements; do not add separate CI readers.
+   Add policy parsing and a read-only eligibility report. No merge calls. Forward migration adds
    `merge_candidate` with ownership, policy/activity and ready-delivery fields. Show the report in
    preview; do not introduce a general check catalogue.
 2. **Durable work and merge inhibition.** Forward migration adds ticket stop-request state and a
@@ -287,9 +305,10 @@ for existing PRs with a fresh posted notice/window, so an old green PR cannot me
 
 - The operator's shared GitHub identity cannot prove origin after a lost HTTP response. This design
   records unknown; a dedicated GitHub App remains a separate identity decision.
-- Confirm against the pinned API version how re-requested Actions suites, workflow attempts and
-  test-merge checks join for this sandbox. Current documentation does not establish a fully atomic
-  re-run view. Block on ambiguous evidence until the agreement fixtures settle it.
+- Confirm with the committed GraphQL query how rollup contexts and suite/workflow attempts change
+  during re-request, including NEUTRAL/SKIPPED and test-merge checks. The docs define the fields,
+  not atomic ordering or latest-attempt selection. Block ambiguous evidence until fixtures settle
+  it; no separate REST/Actions CI reader is justified by the current documented field surface.
 - Confirm that the deployed credential can read both classic protection and inherited rules.
   A private repository's 404 can be ambiguous; setup must distinguish inaccessible protection
   from an unprotected branch. Missing permission blocks automatic merge rather than guessing.
@@ -301,10 +320,12 @@ needs fixtures at its pinned version.
 
 1. [Pull requests: get and merge](https://docs.github.com/en/rest/pulls/pulls#merge-a-pull-request).
 2. [GraphQL pull requests: merge/review enums, reviewThreads and reviewDecision](https://docs.github.com/en/graphql/reference/pulls).
-3. [Check runs and re-request behavior](https://docs.github.com/en/rest/checks/runs).
-4. [Actions workflow runs and attempts](https://docs.github.com/en/rest/actions/workflow-runs).
-5. [Commit statuses](https://docs.github.com/en/rest/commits/statuses#get-the-combined-status-for-a-specific-reference).
+3. [GraphQL commit rollup, contexts and status states](https://docs.github.com/en/graphql/reference/commits),
+   and [check runs, suites and check states](https://docs.github.com/en/graphql/reference/checks).
+4. [GraphQL workflow identity, event and attempt](https://docs.github.com/en/graphql/reference/actions).
+5. [Check suite re-request reset](https://docs.github.com/en/rest/checks/suites#rerequest-a-check-suite).
 6. [Troubleshooting required status checks](https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/collaborating-on-repositories-with-code-quality-features/troubleshooting-required-status-checks).
 7. [Pull request reviews](https://docs.github.com/en/rest/pulls/reviews#list-reviews-for-a-pull-request).
 8. [Branch protection](https://docs.github.com/en/rest/branches/branch-protection#get-branch-protection).
 9. [Active rules for a branch](https://docs.github.com/en/rest/repos/rules#get-rules-for-a-branch).
+10. [Protected branch bypass defaults and disabling bypass](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches).
