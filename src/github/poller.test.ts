@@ -86,6 +86,34 @@ test("a pass stores all three comment kinds as triggers on their threads, in tim
   );
 });
 
+test("a newly opened issue that asks Ostrom becomes one allowlisted trigger", async () => {
+  const { github, poll, count, setNow } = await fixture();
+  github.issue(7, false, { login: "Alice", body: "@ostrom please fix this", at: at(1) });
+  setNow(10);
+
+  const first = await poll();
+  assert.deepEqual(first.candidates.map((candidate) => [candidate.kind, candidate.actor, candidate.body]), [
+    ["issue_opened", "Alice", "@ostrom please fix this"],
+  ]);
+  assert.equal(count("trigger"), 1);
+  assert.deepEqual((await poll()).candidates, []);
+  assert.equal(count("trigger"), 1);
+});
+
+test("only an allowlisted opened issue that asks Ostrom becomes a trigger", async () => {
+  const { github, poll, count, setNow } = await fixture();
+  github.issue(7, false, { login: "alice", body: "please fix this", at: at(1) });
+  github.issue(8, false, { login: "mallory", body: "@ostrom please fix this", at: at(2) });
+  github.issue(9, false, { login: "alice", body: `@ostrom please fix this\n\n${replyMarker("ack-1")}`, at: at(3) });
+  setNow(10);
+
+  const result = await poll();
+  assert.deepEqual(result.candidates, []);
+  assert.equal(result.droppedOwn, 1);
+  assert.equal(result.droppedNotAllowed, 1);
+  assert.equal(count("trigger"), 0);
+});
+
 test("an open issue update after its ticket ended does not become a reopen", async () => {
   const { store, github, poll, setNow } = await fixture();
   github.issue(7);

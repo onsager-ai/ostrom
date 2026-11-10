@@ -102,6 +102,16 @@ const pr = (number: number, state: string) => ({
   state,
 });
 
+test("an opened issue reaches the Router with its current body", async () => {
+  const s = setup();
+  s.github.issue(9, false, { login: "alice", body: "@ostrom please fix this", at: new Date("2026-11-09T11:58:00Z") });
+  await s.poll();
+  await routeCandidates(s.options());
+
+  const [candidate] = batchOf(s.routerSessions()[0]!.prompts[0]!).threads[0]!.candidates;
+  assert.deepEqual([candidate!.kind, candidate!.excerpt], ["issue_opened", "@ostrom please fix this"]);
+});
+
 test("an accept records a ticket, dispatches a Worker and queues the Router's acknowledgement", async () => {
   const s = setup();
   s.comment("please fix the typo in the README");
@@ -421,6 +431,7 @@ test("a follow-up on the accepted issue goes to its Worker, not to the Router", 
 test("a trigger's body is fetched by the id in its URL", () => {
   const repo = "o/r";
   const url = (fragment: string) => `https://github.com/o/r/pull/3${fragment}`;
+  assert.equal(bodyPath(repo, { kind: "issue_opened", url: "https://github.com/o/r/issues/3" }, 3), "repos/o/r/issues/3");
   assert.equal(bodyPath(repo, { kind: "issue_comment", url: url("#issuecomment-5") }, 3), "repos/o/r/issues/comments/5");
   assert.equal(bodyPath(repo, { kind: "pull_request_review_comment", url: url("#discussion_r6") }, 3), "repos/o/r/pulls/comments/6");
   assert.equal(bodyPath(repo, { kind: "pull_request_review", url: url("#pullrequestreview-7") }, 3), "repos/o/r/pulls/3/reviews/7");
