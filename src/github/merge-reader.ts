@@ -137,7 +137,7 @@ async function optionalGet(gh: GhRunner, path: string, classicProtection = false
     const message = error instanceof Error ? error.message : String(error);
     // execGh retains gh's exact HTTP error message. Only this endpoint's explicit absence of
     // classic protection is safe to normalize; Not Found can hide a permission denial.
-    if (classicProtection && message === "gh api failed: gh: Branch not protected (HTTP 404)") return {};
+    if (classicProtection && /: gh: Branch not protected \(HTTP 404\)$/.test(message)) return {};
     return { unavailable: message };
   }
 }

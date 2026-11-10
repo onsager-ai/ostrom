@@ -7,7 +7,7 @@
 // Semon lists every native session on this machine whose log has had no line for N minutes and
 // that is waiting on a question, whose recorded-busy process is gone, or that is working with no
 // output. A Worker's session is matched to its assignment by its git branch
-// (`ostrom/ticket-<ticket>-<assignment>`). A failed read is reported and never clears an episode.
+// (`ostrom/ticket-<ticket>-<assignment>-<uuid>` for new work). A failed read is reported and never clears an episode.
 
 import { budgetReached } from "../budget/budgets.ts";
 import type { ProcessRunner } from "../process.ts";
