@@ -176,10 +176,13 @@ a ticket's budget says otherwise.
    events" filter cannot rely on the actor. Option A: a hidden marker in each reply body (free, used
    in milestone 1). Option B: a dedicated bot account or GitHub App.
 4. **Who merges: answered 2026-11-10.** The operator: "i don't think enforcing human merging is a
-   good idea". Ostrom does not require a human merge; the target is unattended merging. The
-   milestone-1 run used human merges ([`e2e-m1.md`](e2e-m1.md)), which the pass criterion allows.
-   When Ostrom may merge on its own is not designed yet, and Journey 1's "the reviewer merges"
-   (`experience.md`) changes with that design.
+   good idea". Ostrom does not require a human merge. Then: "let's keep merging unattended by
+   default, and with options of policy-based merging strategy". So Ostrom merges on its own by
+   default, and a repository can choose a different merge strategy by policy. The milestone-1 run
+   used human merges ([`e2e-m1.md`](e2e-m1.md)), which the pass criterion allows. The default's
+   conditions and the policy options are not designed yet; Journey 1's "the reviewer merges"
+   (`experience.md`) changes with that design. Rule 1 holds gates back until the loop runs and a
+   real failure calls for them; the loop now runs, and this policy is the operator's call.
 5. **Mid-turn crashes: narrowed.** A restart records an interrupted native turn and sends the
    resumed session the recovery prompt; production still needs an observed mid-turn crash run.
 6. **Semon readiness.** Today Semon exposes `list_sessions`, `get_session`, `read_transcript` and
