@@ -14,7 +14,7 @@ import type { Store, ThreadKind } from "../store/store.ts";
 import { ghGet, sinceParam, type GhRunner } from "./gh.ts";
 import { hasReplyMarker } from "./marker.ts";
 
-export type TriggerKind = "issue_comment" | "pull_request_review_comment" | "pull_request_review" | "issue_state";
+export type TriggerKind = "issue_opened" | "issue_comment" | "pull_request_review_comment" | "pull_request_review" | "issue_state";
 
 /** One GitHub event, normalized. */
 export interface GitHubEvent {
@@ -105,6 +105,7 @@ export async function pollOnce(options: PollOptions): Promise<PollResult> {
     issues.map((issue) => issueStateEventsFor(issue, store, source.id, gh, repo, perPage)),
   );
   const events: GitHubEvent[] = [
+    ...issues.flatMap((issue) => issueOpenedEvent(issue, from(cursor.issues))),
     ...issueComments.map(issueCommentEvent),
     ...reviewComments.map(reviewCommentEvent),
     ...issueStateEvents.flat(),
@@ -270,6 +271,27 @@ function issueCommentEvent(item: Item): GitHubEvent {
     body: bodyOf(item),
     occurredAt: new Date(field(item, "created_at", "string")),
   };
+}
+
+/** A newly opened issue asks the Router only when it explicitly mentions Ostrom in its body. */
+function issueOpenedEvent(item: Item, since: Date): GitHubEvent[] {
+  if (item["pull_request"] != null || item["state"] !== "open") return [];
+  const createdAt = new Date(field(item, "created_at", "string"));
+  if (createdAt.getTime() < since.getTime()) return [];
+  const body = bodyOf(item);
+  if (!/@ostrom\b/i.test(body)) return [];
+  const url = field(item, "html_url", "string");
+  return [{
+    id: `${field(item, "node_id", "string")}:opened`,
+    kind: "issue_opened",
+    threadKind: "issue",
+    number: field(item, "number", "number"),
+    threadUrl: url,
+    url,
+    actor: login(item),
+    body,
+    occurredAt: createdAt,
+  }];
 }
 
 async function issueStateEventsFor(

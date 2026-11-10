@@ -11,6 +11,8 @@ export interface CommentInput {
   at: Date;
 }
 
+export type IssueInput = Partial<CommentInput>;
+
 export class FakeGitHub {
   readonly repo = "onsager-ai/ostrom";
   readonly issueComments: Item[] = [];
@@ -33,14 +35,17 @@ export class FakeGitHub {
     this.#now = now;
   }
 
-  issue(number: number, pr = false): void {
+  issue(number: number, pr = false, input: IssueInput = {}): void {
     if (this.issues.has(number)) return;
+    const at = input.at ?? this.#now();
     this.issues.set(number, {
       number,
-      user: { login: "alice" },
+      user: input.login === null ? null : { login: input.login ?? "alice" },
       node_id: `${pr ? "PR" : "I"}_${number}`,
       html_url: this.#threadUrl(number, pr),
-      updated_at: iso(this.#now()),
+      body: input.body ?? "",
+      created_at: iso(at),
+      updated_at: iso(at),
       state: "open",
       ...(pr ? { pull_request: { url: `https://api.github.com/repos/${this.repo}/pulls/${number}` } } : {}),
     });

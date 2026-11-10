@@ -32,7 +32,7 @@ drivers. A dedicated "promote to foreground" feature is deferred (operator, 2026
 
 An issue author or reviewer, who never sees Ostrom's internals.
 
-1. Opens an issue or mentions Ostrom.
+1. Opens an issue that mentions Ostrom, or mentions Ostrom in a comment.
 2. Within minutes Ostrom replies with "taking this" or "not for me, because …".
 3. A PR appears, linked to the issue.
 4. Their later comments and reviews reach the **same** Worker, through thread subscription.
