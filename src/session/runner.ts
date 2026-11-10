@@ -34,6 +34,7 @@ export interface Runner {
 type ClaudeQuery = (options: Parameters<typeof query>[0]) => AsyncIterable<SDKMessage>;
 type CodexThread = { runStreamed: (prompt: string, options?: { signal?: AbortSignal }) => Promise<{ events: AsyncIterable<ThreadEvent> }> };
 type CodexClient = Pick<Codex, "startThread" | "resumeThread">;
+type CodexClientFactory = (config: CodexOptions) => CodexClient;
 
 const CODEX_WORKER_PROFILE = "ostrom_worker";
 
@@ -100,19 +101,19 @@ export function claudeRunner(env: Record<string, string | undefined>, run: Claud
   return { start: create, resume: create };
 }
 
-export function codexRunner(config: CodexOptions, client?: CodexClient): Runner {
+export function codexRunner(config: CodexOptions, makeClient: CodexClientFactory = (options) => new Codex(options)): Runner {
   function create(options: SessionOptions): Session {
     requireOptions(options);
     const workerConfig: CodexOptions = options.sandbox === "read-only" || options.writableDirs === undefined
       ? config
       : { ...config, configOverrides: [...(config.configOverrides ?? []), ...codexWorkerConfigOverrides(options.cwd, options.writableDirs)] };
-    const codex = client ?? new Codex(workerConfig);
+    const codex = makeClient(workerConfig);
     let id = options.sessionId ?? null;
     let busy = false;
     const threadOptions = {
       workingDirectory: options.cwd,
       model: options.model,
-      sandboxMode: options.sandbox ?? "workspace-write",
+      ...(options.writableDirs === undefined ? { sandboxMode: options.sandbox ?? "workspace-write" } : {}),
       networkAccessEnabled: options.sandbox !== "read-only",
       approvalPolicy: "never" as const,
       // A read-only session (the Router) runs in a scratch directory that is not a Git repository.
