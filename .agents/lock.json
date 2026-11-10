@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "manifest_sha256": "005a9d258a0a4f013f84c70e95989a49d95c4eb1268eff46fd5d2e08708b5e49",
+  "block_sha256": "6479c9d334056d5eda8feeee0883ab926dc231eb1db8e9d4b40a3ae791ed1d52",
+  "resolved_skills": [],
+  "files": {
+    ".agents/LICENSE.dev-skills": {
+      "sha256": "1141cb7b9b803241d6214c6bb0934f9c7f0d57eecdae8c35a4a2478fcdd6546c",
+      "owner": "shared-license",
+      "mode": "100644"
+    },
+    ".agents/sync.mjs": {
+      "sha256": "be96f56d2c4b814d0e7f5ad16d132cc445b930683816656e939c5d731d52cc3d",
+      "owner": "tooling",
+      "mode": "100644"
+    },
+    ".githooks/post-checkout": {
+      "sha256": "15d69d0fa92569d08cdf2ae43d14eca8f4bb7cbfad00c5940cfde1d8318c7596",
+      "owner": "hooks",
+      "mode": "100755"
+    },
+    ".githooks/README.md": {
+      "sha256": "f5853ef26495f6c7cabd497ad93239dd2cf7efb864c4672880acda79128a1fa6",
+      "owner": "hooks",
+      "mode": "100644"
+    },
+    ".github/workflows/agent-config.yml": {
+      "sha256": "60dca4b2ee7022d76732df2654190e246cdd510f9e6adef3941e3d9b602e3cb2",
+      "owner": "tooling",
+      "mode": "100644"
+    }
+  }
+}
