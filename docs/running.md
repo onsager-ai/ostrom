@@ -57,7 +57,9 @@ A lost response records unknown origin even when GitHub names the shared operato
 This implementation blocks code-owner selection, last-push approval, merge queues and unsupported
 active rules rather than guessing. A suite with more than 100 matching PRs blocks; its nested list
 is not paginated yet. Required checks found only on GitHub's test-merge commit also block because
-this reader evaluates the head rollup only. Unreadable or ambiguous protection responses block.
+this reader evaluates the head rollup only. The classic-protection endpoint's HTTP 404 with exact
+message `Branch not protected` means no classic protection; active rules and all other merge
+requirements still apply. Other 404s, any 403 and all other protection-read errors block.
 The sandbox matrix in `merging.md` remains a separate, unperformed verification step.
 
 Set `OSTROM_WORKER_RULES_FILE` to a file of the machine's house rules (for example its heat

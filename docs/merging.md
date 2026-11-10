@@ -80,7 +80,9 @@ not establish ownership. Human policy skips merge requests entirely. Otherwise a
    resolution. Read these ourselves because the operator's login may be an admin: GitHub exempts
    admins from classic protection by default, so API acceptance alone cannot prove compliance. [10]
    Never use an admin override or bypass. A protection read denied or ambiguous 404 is not evidence
-   of no protection. Block when applicable requirements cannot be established; merge queues,
+   of no protection. Only the classic-protection endpoint's HTTP 404 with the exact message
+   `Branch not protected` establishes no classic protection; active rules and every other merge
+   requirement still apply. Other 404s, 403s and all other errors block. Block when applicable requirements cannot be established; merge queues,
    unsupported rules and restricted squash merging require operator action. [8][9]
 7. The ready reply has actually been posted, and ten quiet minutes have passed. The timer starts
    at the latest of that post, PR discovery, any head/base change, any completed Worker turn, and

@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { readFileSync } from "node:fs";
 
 import { countApprovals, effectiveReviews, mergeEligibility, type EligibilityInput } from "./merge-policy.ts";
-import type { MergeEvidence, MergeReview } from "./merge-reader.ts";
+import { readMergeEvidence, type MergeEvidence, type MergeReview } from "./merge-reader.ts";
 
 const review = (id: string, state: string, commitOid = "head", author = "alice"): MergeReview => ({ id, state, submittedAt: "2026-11-10T00:00:00Z", author: { id: `U_${author}`, login: author, type: "User" }, commitOid });
 
@@ -16,6 +17,59 @@ function evidence(): MergeEvidence {
 function input(): EligibilityInput {
   return { evidence: evidence(), policy: { strategy: "unattended" }, expected: { head: "head", base: "base" }, local: { issueOpen: true, ticketOpen: true, pausedOrStopping: false, stalledOrFailed: false, budgetReached: false, workerIdle: true, readyReplySent: true, quietUntil: new Date("2026-11-10T00:00:00Z"), now: new Date("2026-11-10T00:10:00Z") } };
 }
+
+const unprotected = JSON.parse(readFileSync(new URL("./fixtures/merge-reader-unprotected.json", import.meta.url), "utf8")) as {
+  http_status: number; body: { message: string; status: string }; stderr: string;
+};
+
+// Exercise the actual reader error path, then apply its normalized requirements to otherwise
+// eligible evidence. The recorded sandbox PR is closed and is not itself a merge candidate.
+async function requirements(protectionError: string, rules: unknown = []) {
+  const recorded = (name: string): unknown => JSON.parse(readFileSync(new URL(`./fixtures/${name}`, import.meta.url), "utf8"));
+  const observed = await readMergeEvidence(async (args) => {
+    if (args[1] === "graphql") return JSON.stringify(recorded("merge-reader-graphql.json"));
+    const path = args.at(-1)!;
+    if (path.endsWith("/protection")) throw new Error(protectionError);
+    if (path.includes("/rules/")) {
+      if (rules instanceof Error) throw rules;
+      return JSON.stringify(rules);
+    }
+    if (path.endsWith("/pulls/8")) return JSON.stringify(recorded("merge-reader-pr.json"));
+    return JSON.stringify(recorded("merge-reader-repository.json"));
+  }, "onsager-ai/ostrom-sandbox", 8);
+  const value = input();
+  value.evidence.rest.protection = observed.rest.protection;
+  value.evidence.rest.rules = observed.rest.rules;
+  return value;
+}
+
+test("recorded Branch not protected 404 passes classic protection while rules and other requirements still apply", async () => {
+  assert.equal(unprotected.http_status, 404);
+  assert.equal(unprotected.body.status, "404");
+  assert.equal(unprotected.stderr, `gh: ${unprotected.body.message} (HTTP ${unprotected.http_status})`);
+  const error = `gh api failed: ${unprotected.stderr}`;
+  const value = await requirements(error);
+  assert.deepEqual(value.evidence.rest.protection, {});
+  assert.deepEqual(mergeEligibility(value), { eligible: true });
+  const ruled = await requirements(error, [{ type: "required_status_checks", parameters: { required_status_checks: [{ context: "missing", integration_id: 15368 }] } }]);
+  assert.deepEqual(mergeEligibility(ruled), { eligible: false, reason: "required check missing is missing or has the wrong app" });
+  const deniedRules = await requirements(error, new Error(error));
+  assert.deepEqual(mergeEligibility(deniedRules), { eligible: false, reason: "branch requirements cannot be established" });
+  value.evidence.rest.repository["allow_squash_merge"] = false;
+  assert.deepEqual(mergeEligibility(value), { eligible: false, reason: "repository does not allow squash merging" });
+});
+
+for (const error of [
+  "gh api failed: gh: Not Found (HTTP 404)",
+  "gh api failed: gh: Resource not accessible by integration (HTTP 403)",
+  "gh api failed: gh: Branch not protected (HTTP 403)",
+  "gh api failed: gh: Branch not protected (HTTP 500)",
+  "gh api failed: socket hang up",
+]) test(`protection read remains blocking for ${error}`, async () => {
+  const value = await requirements(error);
+  assert.deepEqual(value.evidence.rest.protection, { unavailable: error });
+  assert.deepEqual(mergeEligibility(value), { eligible: false, reason: "branch requirements cannot be established" });
+});
 
 test("reviews reduce decisive state in order", () => {
   const reduced = effectiveReviews([review("1", "CHANGES_REQUESTED"), review("2", "COMMENTED"), review("3", "APPROVED"), review("4", "DISMISSED")]);
