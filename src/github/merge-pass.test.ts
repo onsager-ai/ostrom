@@ -430,6 +430,22 @@ for (const reason of ["closed issue", "failed prerequisite", "ambiguous branch o
   unmerged(f);
 });
 
+test("pause accepted while final reviewer permission read is pending prevents PUT", async () => {
+  const f = fixture();
+  await ready(f);
+  let permissionReads = 0;
+  const options = f.options();
+  const gh = options.gh;
+  options.gh = async (args) => {
+    if (args.some((arg) => arg.endsWith("/permission")) && ++permissionReads === 2) f.store.pauseTicket(f.ticket);
+    return gh(args);
+  };
+  await mergePass(options);
+  assert.equal(permissionReads, 2);
+  assert.equal(f.puts.length, 0);
+  unmerged(f);
+});
+
 test("gh HTTP parser pins observed gh 2.98.0 stderr wrapped by execGh", () => {
   assert.equal(ghHttpStatus("gh api failed: gh: Not Found (HTTP 404)"), 404);
   assert.equal(ghHttpStatus("gh api failed: gh: Pull Request is not mergeable (HTTP 405)"), 405);

@@ -179,12 +179,13 @@ async function pages(options: MergePassOptions, path: string): Promise<Json[]> {
 }
 
 async function eligibilityFor(options: MergePassOptions, assignmentId: number, observation: Observation, candidate: MergeCandidate) {
-  const assignment = options.store.getAssignment(assignmentId);
-  const ticket = options.store.getTicket(assignment.ticketId);
   if (!observation.owned) return { eligible: false as const, reason: "pull request ownership or base is ambiguous" };
   if (options.policy.strategy === "human") return { eligible: false as const, reason: "waiting for a human merge" };
   const { evidence } = observation;
   const approvals = { authorLogin: evidence.pr.authorLogin ?? "", identities: await approvalIdentities(options, evidence) };
+  // Permission reads yield to the operator API; reread local controls after the last await.
+  const assignment = options.store.getAssignment(assignmentId);
+  const ticket = options.store.getTicket(assignment.ticketId);
   const now = clock(options);
   return mergeEligibility({ evidence, policy: options.policy, expected: { head: candidate.headSha, base: candidate.baseSha }, approvals,
     local: { issueOpen: observation.issueOpen, ticketOpen: ticket.state === "open", pausedOrStopping: ticket.state === "paused" || ticket.stopRequestedAt !== null,

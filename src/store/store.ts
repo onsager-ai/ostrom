@@ -1061,7 +1061,9 @@ export class Store {
   /** Holds an idle assignment so a merge pass can exclude a concurrent local turn start. */
   reserveAssignment(assignmentId: number): boolean {
     return this.#transaction(() => {
-      if (!this.assignmentWorkIdle(assignmentId)) return false;
+      const assignment = this.getAssignment(assignmentId);
+      const ticket = this.getTicket(assignment.ticketId);
+      if (assignment.state !== "running" || ticket.state !== "open" || ticket.stopRequestedAt !== null || !this.assignmentWorkIdle(assignmentId)) return false;
       const { changes } = this.#run(
         "INSERT INTO assignment_reservation (assignment_id, held_at) VALUES (?, ?) ON CONFLICT DO NOTHING",
         assignmentId, this.#stamp(),
