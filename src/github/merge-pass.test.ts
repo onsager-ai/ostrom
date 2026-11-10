@@ -360,7 +360,8 @@ test("merge-enabled migration refreshes previously tracked, delivered opened rep
   const path = join(dir, "store.db");
   // Populate the pre-enable tracking state through public methods, then reopen at migration 26
   // so the real migration, rather than a hand-written equivalent, upgrades those durable rows.
-  let store = Store.open(path);
+  let now = new Date("2026-11-10T12:00:00.000Z");
+  let store = Store.open(path, { now: () => now });
   const source = store.ensureSource("github", "o/r");
   const thread = store.ensureThread({ sourceId: source.id, kind: "issue", number: 1, url: "https://github.com/o/r/issues/1" });
   const trigger = store.insertTrigger({ sourceId: source.id, sourceEventId: "old", threadId: thread, kind: "issue_comment", actor: "alice", url: "https://github.com/o/r/issues/1#issuecomment-1", occurredAt: new Date() }).id;
@@ -377,14 +378,13 @@ test("merge-enabled migration refreshes previously tracked, delivered opened rep
   const upgrade = new DatabaseSync(path);
   upgrade.prepare("DELETE FROM schema_version WHERE version = ?").run(migrations.length);
   upgrade.close();
-  store = Store.open(path);
+  store = Store.open(path, { now: () => now });
   try {
     assert.equal(store.readyReplyId(assignment), null);
     assert.equal(store.hasReply(opened), true);
     const pr = store.ensureThread({ sourceId: source.id, kind: "pull_request", number: 2, url: "https://github.com/o/r/pull/2" });
     store.subscribe(ticket, pr);
     const f = fixture();
-    let now = new Date();
     const options: MergePassOptions = { ...f.options(), store, now: () => now,
       workers: { release(id: number) { store.releaseAssignmentReservation(id); }, cancel() { return false; } } as unknown as Workers };
     await mergePass(options);
