@@ -305,8 +305,11 @@ for existing PRs with a fresh posted notice/window, so an old green PR cannot me
 
 ## Open questions
 
-- The operator's shared GitHub identity cannot prove origin after a lost HTTP response. This design
-  records unknown; a dedicated GitHub App remains a separate identity decision.
+- **Identity answered 2026-11-11:** the operator chose a dedicated GitHub App, identified by App ID.
+  Startup resolves its slug and numeric bot user ID. A confirmed merge by that numeric bot ID is
+  attributed to Ostrom, including after a lost response. This assumes the App credential is reserved
+  for Ostrom. Without App configuration, the shared operator identity still cannot prove origin
+  after a lost response and records unknown. See [setup](running.md#github-app-identity).
 - Confirm with the committed GraphQL query how rollup contexts and suite/workflow attempts change
   during re-request, including NEUTRAL/SKIPPED and test-merge checks. The docs define the fields,
   not atomic ordering or latest-attempt selection. Block ambiguous evidence until fixtures settle

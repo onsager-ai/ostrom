@@ -52,7 +52,8 @@ The final send refreshes intake/controls, issue state, comments, PR/check/review
 branch requirements. A failed prerequisite pass suppresses sends while reconciliation continues.
 Only a confirmed GitHub merge ends work. Definite HTTP 4xx refusals back off (408 and 429 are treated
 as ambiguous); transport errors and 5xx keep the request unresolved until a fresh GitHub read.
-A lost response records unknown origin even when GitHub names the shared operator login.
+A lost response records unknown origin when GitHub names the shared operator login. With App
+configuration, the resolved App bot's numeric user ID establishes Ostrom attribution.
 
 This implementation blocks code-owner selection, last-push approval, merge queues and unsupported
 active rules rather than guessing. A suite with more than 100 matching PRs blocks; its nested list
@@ -64,3 +65,41 @@ The sandbox matrix in `merging.md` remains a separate, unperformed verification 
 
 Set `OSTROM_WORKER_RULES_FILE` to a file of the machine's house rules (for example its heat
 limits, and that tests run in CI rather than locally). Its text closes every Worker's brief.
+
+## GitHub App identity
+
+Set both `OSTROM_GITHUB_APP_ID=4544316` and `OSTROM_GITHUB_APP_KEY_FILE=/absolute/path/to/key.pem`
+for the daemon and CLI. Keep the PEM readable only by the service user. Never put its contents or
+an installation token in the environment file, repository, logs or brief. Setting just one variable
+fails startup; setting neither retains ambient `gh` authentication. The App's name can change:
+only its ID is configured. Startup looks up `GET /app` and `GET /users/{slug}[bot]` to resolve the
+current bot author/committer name and noreply email.
+
+Install the App on `OSTROM_REPO` (the current App is installed on the organization's repositories).
+Ostrom discovers that repository's installation with an App JWT at
+`GET /repos/{owner}/{repo}/installation`, then exchanges it for an installation token. The App
+needs Contents, Issues and Pull requests write, and Actions, Checks and Commit statuses read.
+**Administration: read is also needed for classic branch-protection reads.** Without it, automatic
+merge may block on an inaccessible protection response. Installation/settings changes remain an
+operator action. Reserve this App's credential for Ostrom so its bot ID proves merge attribution.
+
+Daemon/CLI `gh` children receive `GH_TOKEN` in their environment, never argv; the daemon caches
+it in memory until three minutes before expiry. JWTs use RS256 with 60 seconds of clock skew and
+a ten-minute maximum claim window. Keys are read only to sign; keys and tokens are never logged
+or saved. Authentication errors omit API bodies and credential values.
+
+Workers inherit temporary executable helpers on PATH and Git's process-scoped credential settings.
+Every `gh` invocation and every Git HTTPS credential request mints a fresh installation token, so
+turns longer than an hour keep working. The configured repository's common SSH URLs are rewritten
+to HTTPS in that process environment. Git credential requests are restricted to that repository;
+ambient Git helpers are cleared. No token is written to the helper files. Worker commits inherit
+both author and committer as the resolved App bot. Helpers are removed when the command/daemon
+finishes, after its Workers drain.
+
+This mechanism requires Workers to preserve PATH and Git's inherited environment and use normal
+`gh`/Git commands. An absolute `gh` path, overridden credentials, `git -c credential.helper=...`,
+or another SSH URL can bypass it; it is identity plumbing for trusted Workers, not a sandbox.
+Each command starts with a fresh token, but a single Git/gh transfer that lasts longer than the
+token lifetime can fail and must be retried explicitly. Minting on demand also costs API calls and
+requires the key file and the Ostrom checkout to remain available throughout the turn. Live proof
+of an App-authored sandbox PR, operator approval and App merge remains to be run by the operator.

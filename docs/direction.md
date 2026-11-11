@@ -182,9 +182,11 @@ complete those runtime exercises.
 2. **Model checks.** The Codex SDK reports token usage but not the model. Ostrom must confirm the
    model each turn used (from the native session record) so that a resume never silently runs on an
    expensive default, as happened once in the spike.
-3. **Bot identity.** Replies go out through the operator's own `gh` login, so the "drop my own
-   events" filter cannot rely on the actor. Option A: a hidden marker in each reply body (free, used
-   in milestone 1). Option B: a dedicated bot account or GitHub App.
+3. **Bot identity: answered 2026-11-11 by the operator.** Option B: a GitHub App, identified
+   by App ID, never its changeable name or slug. The daemon, CLI GitHub reads and Worker GitHub
+   commands use installation tokens when configured; see [running.md](running.md#github-app-identity).
+   Hidden reply markers remain for deduplication. With neither App variable set, ambient `gh`
+   authentication remains available.
 4. **Who merges: answered 2026-11-10.** The operator: "i don't think enforcing human merging is a
    good idea". Ostrom does not require a human merge. Then: "let's keep merging unattended by
    default, and with options of policy-based merging strategy". So Ostrom merges on its own by

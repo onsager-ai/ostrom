@@ -7,6 +7,7 @@
 import { readFileSync } from "node:fs";
 import { hostname } from "node:os";
 
+import { loadAppConfig } from "../github/app.ts";
 import { loadMergePolicy, type MergePolicy } from "../github/merge-policy.ts";
 
 export { loadBudgetDefaults, type BudgetDefaults } from "../budget/budgets.ts";
@@ -19,6 +20,7 @@ export interface Config {
 }
 
 export function loadConfig(env: Record<string, string | undefined>): Config {
+  loadAppConfig(env);
   const repo = env["OSTROM_REPO"]?.trim() ?? "";
   if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) {
     throw new Error(`OSTROM_REPO must be owner/name, got ${JSON.stringify(repo)}`);

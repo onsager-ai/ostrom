@@ -261,6 +261,28 @@ for (const status of [400, 401, 403, 404, 405, 409, 422]) test(`HTTP ${status} r
   done(f, "ostrom");
 });
 
+test("dedicated App bot attributes a lost response and avoids the user endpoint", async () => {
+  const f = fixture();
+  await ready(f);
+  f.calls.length = 0;
+  f.remote.putError = "gh api failed: socket hang up";
+  f.remote.mergeBeforeError = true;
+  await mergePass({ ...f.options(), appBotId: 42 });
+  assert.equal(f.calls.some((args) => args.at(-1) === "user"), false);
+  await mergePass({ ...f.options(), appBotId: 42 });
+  done(f, "ostrom");
+});
+
+test("a different merge actor stays unknown with App authentication", async () => {
+  const f = fixture();
+  await ready(f);
+  f.remote.putError = "gh api failed: timeout";
+  f.remote.mergeBeforeError = true;
+  await mergePass({ ...f.options(), appBotId: 99 });
+  await mergePass({ ...f.options(), appBotId: 99 });
+  done(f, "unknown");
+});
+
 for (const error of ["gh api failed: socket hang up", "gh api failed: timeout", "gh api failed: gh: server failure (HTTP 503)", "gh api failed: gh: timeout (HTTP 408)", "gh api failed: gh: throttled (HTTP 429)"]) {
   test(`${error}: lost result reconciles MERGED as unknown origin`, async () => {
     const f = fixture();
