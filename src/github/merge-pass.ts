@@ -16,6 +16,8 @@ export interface MergePassOptions {
   store: Store; workers: Workers; gh: GhRunner; repo: string; policy: MergePolicy; base?: string; now?: () => Date;
   /** Failed prerequisite passes suppress sends, but reconciliation must still run. */
   allowSend?: boolean;
+  /** Dedicated App bot resolved at startup; shared ambient actors cannot prove attribution. */
+  appBotId?: number;
   /** Intake and handle newly arrived controls before the final direct evidence read. */
   refreshBeforeSend?: () => Promise<void>;
 }
@@ -95,7 +97,7 @@ async function consider(options: MergePassOptions, assignmentId: number, prNumbe
     result.merged.push(assignmentId);
     return;
   }
-  const actor = object(await ghMergeGet(options.gh, "user"));
+  const actor = options.appBotId === undefined ? object(await ghMergeGet(options.gh, "user")) : { id: options.appBotId };
   if (typeof actor["id"] !== "number") throw new Error("GitHub did not identify the authenticated merge actor");
   const final = await eligibilityFor(options, assignmentId, observation, candidate);
   if (!final.eligible) { wait(final.reason); return; }
@@ -238,6 +240,7 @@ function complete(options: MergePassOptions, candidate: MergeCandidate, evidence
   const actor = pull["merged_by"] === null ? {} : object(pull["merged_by"]);
   const mergedByLogin = typeof actor["login"] === "string" ? actor["login"] : null;
   const mergedById = typeof actor["id"] === "number" ? actor["id"] : null;
+  if (options.appBotId !== undefined && mergedById === options.appBotId) origin = "ostrom";
   const sha = mergeSha(evidence);
   const mergedAt = pull["merged_at"];
   if (sha === null || typeof mergedAt !== "string" || !Number.isFinite(Date.parse(mergedAt))) throw new Error("merged PR has no merge SHA or timestamp");

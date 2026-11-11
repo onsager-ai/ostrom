@@ -6,17 +6,24 @@ import { execFile } from "node:child_process";
 /** Runs `gh` with `args` and resolves to its stdout. Rejects when `gh` exits non-zero. */
 export type GhRunner = (args: readonly string[]) => Promise<string>;
 
-/** The real runner. `gh` uses the operator's own login (docs/direction.md, open question 3). */
-export const execGh: GhRunner = (args) =>
-  new Promise((resolve, reject) => {
-    execFile("gh", [...args], { maxBuffer: 64 * 1024 * 1024 }, (error, stdout, stderr) => {
-      if (error) {
-        reject(new Error(`gh ${args.slice(0, 2).join(" ")} failed: ${stderr.trim() || error.message}`));
-      } else {
-        resolve(stdout);
-      }
+/** Credentials stay in the child's environment, never in argv. */
+export function githubRunner(token?: () => Promise<string>, env: NodeJS.ProcessEnv = process.env): GhRunner {
+  return async (args) => {
+    const credential = await token?.();
+    return new Promise((resolve, reject) => {
+      execFile("gh", [...args], { env: { ...env, ...(credential === undefined ? {} : { GH_TOKEN: credential }) }, maxBuffer: 64 * 1024 * 1024 }, (error, stdout, stderr) => {
+        if (error) {
+          const detail = stderr.trim() || error.message;
+          reject(new Error(`gh ${args.slice(0, 2).join(" ")} failed: ${credential ? detail.replaceAll(credential, "[redacted]") : detail}`));
+        } else {
+          resolve(stdout);
+        }
+      });
     });
-  });
+  };
+}
+
+export const execGh: GhRunner = githubRunner();
 
 /** GETs a REST path (with its query string) and parses the JSON response. */
 export async function ghGet(gh: GhRunner, path: string): Promise<unknown> {

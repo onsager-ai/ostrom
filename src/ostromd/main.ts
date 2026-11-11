@@ -6,7 +6,9 @@ import { defaultSocketPath, localApi } from "../api/server.ts";
 import { operatorControls, routeCommands } from "../commands/commands.ts";
 import { renderMergeEligibilityPreview } from "../github/preview.ts";
 import { mergePass } from "../github/merge-pass.ts";
-import { execGh, type GhRunner } from "../github/gh.ts";
+import { GitHubApp, loadAppConfig } from "../github/app.ts";
+import { workerAuth } from "../github/worker-auth.ts";
+import { execGh, githubRunner, type GhRunner } from "../github/gh.ts";
 import { sendDueReplies } from "../github/outbox.ts";
 import { processRunner, type ProcessRunner } from "../process.ts";
 import { pollOnce } from "../github/poller.ts";
@@ -77,6 +79,8 @@ export interface MainDeps {
    */
   store?: Store;
   mergeAllowed?: boolean;
+  appReady?: boolean;
+  appBotId?: number;
 }
 
 function sleep(ms: number, stop: AbortSignal): Promise<void> {
@@ -252,6 +256,21 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
     deps.stderr(USAGE.trimEnd());
     return 2;
   }
+  if (!deps.appReady) {
+    let auth: Awaited<ReturnType<typeof workerAuth>> | undefined;
+    try {
+      const config = loadAppConfig(deps.env);
+      if (config) {
+        const app = new GitHubApp(config, loadConfig(deps.env).repo);
+        auth = await workerAuth(app, deps.env);
+        return await main(argv, { ...deps, appReady: true, appBotId: auth.identity.id,
+          env: auth.env, gh: githubRunner(() => app.token(), deps.env) });
+      }
+    } catch (error) {
+      deps.stderr(`ostromd: ${error instanceof Error ? error.message : String(error)}`);
+      return 1;
+    } finally { await auth?.close(); }
+  }
   if (command === "tick") return tick(deps);
   if (command === "run") return run(Number(rest[1]), deps);
   let store: Store | undefined;
@@ -314,6 +333,7 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
     if (command === "merge") {
       const pass = await mergePass({ store, workers: workers(), gh: deps.gh, repo: config.repo, policy: config.mergePolicy,
         base: loadWorkerConfig(deps.env).base, allowSend: deps.mergeAllowed ?? true,
+        ...(deps.appBotId === undefined ? {} : { appBotId: deps.appBotId }),
         refreshBeforeSend: async () => {
           // The final evidence read follows fresh intake and controls. Any failure suppresses HTTP.
           await pollOnce({ store: openStore, gh: deps.gh, repo: config.repo, allowlist: config.allowlist });

@@ -5,7 +5,8 @@
 import { request } from "node:http";
 
 import { defaultSocketPath } from "../api/server.ts";
-import { execGh } from "../github/gh.ts";
+import { GitHubApp, loadAppConfig } from "../github/app.ts";
+import { execGh, githubRunner } from "../github/gh.ts";
 import { renderMergeEligibilityPreview } from "../github/preview.ts";
 import { loadConfig } from "../ostromd/config.ts";
 import { Store, type OperatorStatus, type OperatorTicket, type OperatorTicketDetail } from "../store/store.ts";
@@ -33,6 +34,7 @@ export async function main(argv: readonly string[], env: Record<string, string |
   const command = parse(argv);
   if (command === null) return usage();
   try {
+    loadAppConfig(env);
     const result = await api(command, env);
     output(command, result);
     return 0;
@@ -133,7 +135,10 @@ async function direct(command: Command, path: string, env: Record<string, string
     if (command.name === "show") return store.operatorTicket(command.ticketId);
     if (command.name === "preview") {
       const config = loadConfig(env);
-      return { markdown: await renderMergeEligibilityPreview(store, execGh, config.repo, config.mergePolicy) };
+      const appConfig = loadAppConfig(env);
+      const app = appConfig ? new GitHubApp(appConfig, config.repo) : undefined;
+      const gh = app ? githubRunner(() => app.token(), env) : execGh;
+      return { markdown: await renderMergeEligibilityPreview(store, gh, config.repo, config.mergePolicy) };
     }
     throw new Error("mutating commands require ostromd to be running");
   } finally {
