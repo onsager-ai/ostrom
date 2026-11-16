@@ -138,7 +138,7 @@ test("dispatch refuses an ended ticket without starting anything", async () => {
   assert.deepEqual(runner.sessions, []);
 });
 
-test("a turn that fails records a failed outcome; the next good turn clears it", async () => {
+test("a failed turn blocks queued deliveries before the Router ends the assignment", async () => {
   const { store, runner, ticketId, workers } = fixture();
   runner.hold = false;
   await workers.dispatch(ticketId);
@@ -146,14 +146,47 @@ test("a turn that fails records a failed outcome; the next good turn clears it",
   const session = () => runner.sessions.at(-1)!;
   session().failWith = new Error("boom");
   workers.deliver(1, "k1", "go", () => {});
+  let started = false;
+  workers.deliver(1, "operator-resume-1", "resume", () => { started = true; });
   await workers.drain();
   assert.equal(store.getAssignment(1).outcome, "failed");
   assert.equal(store.getAssignment(1).turnStartedAt, null);
   session().failWith = undefined;
   workers.deliver(1, "k2", "again", () => {});
   await workers.drain();
-  assert.equal(store.getAssignment(1).outcome, null);
-  assert.equal(store.getAssignment(1).turns, 3);
+  assert.equal(store.getAssignment(1).outcome, "failed");
+  assert.equal(store.getAssignment(1).lastError, "boom");
+  assert.equal(store.getAssignment(1).turns, 2);
+  assert.equal(started, false);
+  store.endAssignment(1);
+  store.endTicket(ticketId);
+  store.clearTurnError(1);
+  assert.equal(store.operatorTickets()[0]!.latestFailure?.summary, "boom");
+  assert.equal(store.operatorTickets()[0]!.recentFailures[0]?.summary, "boom");
+});
+
+test("a late success after the Router ends an assignment preserves its failure and skips callbacks", async () => {
+  const { store, runner, ticketId, workers } = fixture();
+  await workers.dispatch(ticketId);
+  await workers.drain();
+  const session = runner.sessions[0]!;
+  session.auto = false;
+  let completed = false;
+  workers.deliver(1, "approval", "continue", () => {}, () => { completed = true; });
+  // Let the queued turn start, then end the assignment while its result is still pending.
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(session.running, 1);
+  workers.deliver(1, "operator-pause-1", "pause", () => { assert.fail("ended assignment started a queued turn"); });
+  store.recordTurnError(1, "boom");
+  store.recordOutcome(1, "failed");
+  store.endAssignment(1);
+  store.endTicket(ticketId);
+  session.release();
+  await workers.drain();
+  assert.equal(store.getAssignment(1).lastError, "boom");
+  assert.equal(store.getAssignment(1).turnStartedAt, null);
+  assert.equal(store.operatorTickets()[0]!.latestFailure?.summary, "boom");
+  assert.equal(completed, false);
 });
 
 test("a first turn that fails after the session started is a failed outcome, not an abandon", async () => {

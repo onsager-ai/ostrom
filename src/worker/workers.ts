@@ -379,7 +379,7 @@ export class Workers {
     const { store } = this.#deps;
     const assignment = store.getAssignment(id);
     const queued = store.queuedTurn(id, key);
-    if (queued === null || queued.state !== "queued" || this.#stopping || assignment.state !== "running") return;
+    if (queued === null || queued.state !== "queued" || this.#stopping || assignment.state !== "running" || assignment.outcome === "failed") return;
     const ticket = store.getTicket(assignment.ticketId);
     if (ticket.state === "paused" && !RUNS_WHILE_PAUSED.some((prefix) => key.startsWith(prefix))) return;
     // No await separates this check from starting the native turn, so a held reservation never
@@ -414,7 +414,8 @@ export class Workers {
     if (this.#stopping) return;
     store.finishQueuedTurn(id, key);
     this.#finished(id, result);
-    if (result.status === "completed") await onComplete?.(result);
+    const current = store.getAssignment(id);
+    if (result.status === "completed" && current.state === "running" && current.outcome !== "failed") await onComplete?.(result);
     this.#callbacksByKey.delete(this.#callbackKey(id, key));
   }
 
@@ -429,10 +430,11 @@ export class Workers {
 
   #finished(id: number, result: TurnResult): void {
     const { store } = this.#deps;
+    // A late result still counts its usage, but cannot clear a failure or act for an ended assignment.
     store.endTurn(id, result.usage);
-    store.clearTurnError(id);
     const assignment = store.getAssignment(id);
-    if (assignment.state !== "running") return;
+    if (assignment.state !== "running" || assignment.outcome === "failed") return;
+    store.clearTurnError(id);
     if (result.status === "cancelled") {
       queueStatusCard(store, assignment.ticketId);
       return;

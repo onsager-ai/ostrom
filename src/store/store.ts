@@ -927,9 +927,9 @@ export class Store {
     );
   }
 
-  /** Clears the repeated-error detector after a successful turn. */
+  /** Clears the repeated-error detector after success, preserving terminal failure evidence. */
   clearTurnError(assignmentId: number): void {
-    this.#run("UPDATE assignment SET last_error = NULL, consecutive_errors = 0 WHERE id = ?", assignmentId);
+    this.#run("UPDATE assignment SET last_error = NULL, consecutive_errors = 0 WHERE id = ? AND state = 'running' AND outcome IS NOT 'failed'", assignmentId);
   }
 
   /** Counts a turn that a restart found unfinished. */

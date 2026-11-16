@@ -14,7 +14,7 @@ export function queueStatusCard(store: Store, ticketId: number, now = new Date()
   const candidate = store.mergeCandidateForAssignment(assignment.id);
   const policy = candidate === null ? null : JSON.parse(candidate.policy) as { strategy: string };
   const state: StatusCardState =
-    ticket.state === "ended" ? (assignment.endReason === null ? "done" : "stopped") :
+    ticket.state === "ended" ? (assignment.outcome === "failed" ? "failed" : assignment.endReason === null ? "done" : "stopped") :
       openStall !== undefined && openStall.publicAt !== null ? "stuck" :
         openStall !== undefined ? "recovering" :
           ticket.state === "paused" ? "paused" :
