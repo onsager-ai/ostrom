@@ -19,6 +19,13 @@ for (const state of ["working", "recovering", "paused", "stuck", "waiting_to_mer
   });
 }
 
+test("status card snapshot: paused while waiting for a human merge", async () => {
+  assert.equal(
+    renderStatusCard({ ...base, state: "paused", mergeStatus: "policy human; head abc123; waiting for a human merge" }),
+    await readFile(new URL("./__snapshots__/status-card-paused-human-merge.md", import.meta.url), "utf8"),
+  );
+});
+
 test("status card snapshot: budget warning and budget pause", async () => {
   assert.equal(
     renderStatusCard({ ...base, state: "paused", budgetWarning: "tokens", pauseCause: "budget reached: tokens" }),
