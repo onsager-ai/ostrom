@@ -151,13 +151,14 @@ a ticket's budget says otherwise.
 
 ## Milestone 2
 
-[The merging design](merging.md) is implemented with unattended, human and approval policies,
-durable merge inhibition and reconciliation. [The sandbox run](e2e-m2.md) provides partial evidence:
-real Worker PRs and PR CI, ready delivery, same-session revision, pause across restart, stop to
-draft and a human merge reconciled as external after three separately reviewed fixes. Host thermal shutdowns prevented the natural unattended merge and completion proof. The
-follow-up's final window/merge, resume eligibility, runtime approval/protection gates and ambiguous
-send reconciliation remain deferred; read-only diagnostics are recorded separately and do not
-complete those runtime exercises.
+Done, 2026-11-16. [The merging design](merging.md) is implemented with unattended, human and
+approval policies, durable merge inhibition and reconciliation. [The first sandbox run](e2e-m2.md)
+covered pause across restart, stop to draft and a human merge reconciled as external, but host
+overheating stopped it before an unattended merge. [The hp-code-2 run](e2e-m2-hp2.md) completed the
+rest as the GitHub App: an App-authored PR merged by the App after an operator approval, and a
+second merged unattended after a same-session review follow-up, each ending with a Done reply.
+Resume-to-merge after a pause, runtime protection gates and lost merge responses have unit tests
+but no live run yet.
 
 ## Non-goals (for now)
 
@@ -166,7 +167,7 @@ complete those runtime exercises.
 - Creating T3 Code threads, or "promote to foreground". Deferred by the operator on 2026-11-09:
   Workers are native sessions the operator can already open after `ostrom pause`.
 - More than one repository or machine, chat sources, CI-as-source, webhooks or any publicly
-  reachable listener, or a hosted service. The dashboard waits for milestone 2.
+  reachable listener, or a hosted service.
 
 ## Open questions
 
