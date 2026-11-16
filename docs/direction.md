@@ -75,7 +75,7 @@ ostrom (CLI) ──local API──▶ ostromd          Semon ──reads──�
 ```
 
 `ostromd` is the daemon and has no user-facing commands. `ostrom` is the operator's CLI and talks to
-`ostromd` over a local API; the milestone-2 dashboard uses the same API.
+`ostromd` over a local API; the milestone-3 dashboard uses the same API.
 
 The Router is a one-shot model call per batch, not a long-lived session. Every batch already carries
 the whole contract, the undecided triggers with short excerpts and URLs, and the outcomes owed a
@@ -159,6 +159,13 @@ rest as the GitHub App: an App-authored PR merged by the App after an operator a
 second merged unattended after a same-session review follow-up, each ending with a Done reply.
 Resume-to-merge after a pause, runtime protection gates and lost merge responses have unit tests
 but no live run yet.
+
+## Milestone 3
+
+Proposed, 2026-11-16. [The operator dashboard design](dashboard.md) adds a read-only local page
+on the CLI's daemon API: attention items, ticket progress, merge waits, failures, budgets and
+Watchdog health. It addresses the silent intake and failure diagnosis seen in the milestone-2
+run. Worker placement is deferred. Completion requires the live sandbox evidence in that design.
 
 ## Non-goals (for now)
 
