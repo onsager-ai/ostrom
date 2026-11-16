@@ -115,6 +115,16 @@ test("the idle budget flags a turn that has run past it, never a Worker waiting 
   assert.equal(s.store.getStall(hung.checked[0]!.stallId!).cause, "budget reached: idle");
 });
 
+test("the turn budget never flags the last allowed turn while it runs", async () => {
+  const s = setup();
+  const a = s.startWorker(1);
+  s.setSemon([]);
+  s.store.setTicketBudget(a.ticketId, { timeMinutes: 480, idleMinutes: 30, turns: 1, tokens: 1_000_000, escalations: 0 });
+  s.store.beginTurn(a.assignmentId);
+  assert.equal(s.store.getAssignment(a.assignmentId).turns, 1);
+  assert.equal((await watchdog(s.options())).checked[0]!.stallId, null, "turn 1 of 1 is allowed to finish");
+});
+
 test("Ostrom's own signal records a stall without a Semon reason", async () => {
   const s = setup();
   const a = s.startWorker(1);

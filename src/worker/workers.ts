@@ -435,10 +435,7 @@ export class Workers {
     const assignment = store.getAssignment(id);
     if (assignment.state !== "running" || assignment.outcome === "failed") return;
     store.clearTurnError(id);
-    if (result.status === "cancelled") {
-      queueStatusCard(store, assignment.ticketId);
-      return;
-    }
+    // A cancelled turn still counts toward the turn and token limits.
     const reached = turnBudgetReached(store.ticketBudget(assignment.ticketId), new Date());
     if (store.getTicket(assignment.ticketId).state === "open" && reached !== null && !this.#budgetPauses.has(id)) {
       this.#budgetPauses.add(id);
@@ -453,6 +450,10 @@ export class Workers {
       return;
     }
     if (store.getTicket(assignment.ticketId).state === "open") this.#budgetPauses.delete(id);
+    if (result.status === "cancelled") {
+      queueStatusCard(store, assignment.ticketId);
+      return;
+    }
     if (assignment.harness === "codex" && this.#deps.codexSessions !== undefined) {
       const reason = this.#modelProblem(assignment, this.#deps.codexSessions);
       if (reason !== null) {

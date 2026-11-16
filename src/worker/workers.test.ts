@@ -104,6 +104,19 @@ test("a reached ticket budget pauses after the current turn and asks the Worker 
   assert.equal(store.getAssignment(1).turns, 2);
 });
 
+test("a turn cancelled at its turn limit still pauses the ticket for budget", async () => {
+  const { store, runner, ticketId, workers } = fixture();
+  store.setTicketBudget(ticketId, { timeMinutes: 480, idleMinutes: 30, turns: 1, tokens: 1_000_000, escalations: 0 });
+  runner.hold = true;
+  await workers.dispatch(ticketId);
+  const session = runner.sessions[0]!;
+  assert.equal(workers.cancel(1), true);
+  session.auto = true;
+  await workers.drain();
+  assert.equal(store.getTicket(ticketId).state, "paused");
+  assert.equal(store.getTicket(ticketId).pauseCause, "budget reached: turns");
+});
+
 test("the session starts on the configured harness", async () => {
   const claude = new FakeRunner();
   const codex = new FakeRunner();
