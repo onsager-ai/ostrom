@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { generateKeyPairSync, verify } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -89,8 +89,12 @@ test("Worker environment installs on-demand helpers and bot commit identity with
   try {
     await writeFile(join(root, "gh"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
     const app = { identity: async () => ({ id: 123, name: "renamed[bot]", email: "123+renamed[bot]@users.noreply.github.com" }) } as GitHubApp;
-    const auth = await workerAuth(app, { PATH: root, OSTROM_REPO: "o/r", GH_TOKEN: "ambient", GITHUB_TOKEN: "ambient" });
+    const auth = await workerAuth(app, { PATH: root, OSTROM_REPO: "o/r", GH_CONFIG_DIR: "/operator-gh-config", GH_TOKEN: "ambient", GITHUB_TOKEN: "ambient" });
     try {
+      const configDirectory = join(auth.env["PATH"]!.split(":")[0]!, "gh-config");
+      assert.equal(auth.env["GH_CONFIG_DIR"], configDirectory);
+      assert.deepEqual(await readdir(configDirectory), []);
+      assert.equal((await stat(configDirectory)).mode & 0o777, 0o700);
       assert.equal(auth.env["GH_TOKEN"], undefined);
       assert.equal(auth.env["GITHUB_TOKEN"], undefined);
       assert.equal(auth.env["GIT_AUTHOR_NAME"], "renamed[bot]");
@@ -110,6 +114,7 @@ test("Worker environment installs on-demand helpers and bot commit identity with
       const wrapper = join(auth.env["PATH"]!.split(":")[0]!, "git-credential-ostrom");
       assert.equal((await exec(wrapper, ["store"], { env: gitEnv })).stdout, "");
     } finally { await auth.close(); }
+    await assert.rejects(access(auth.env["GH_CONFIG_DIR"]!), { code: "ENOENT" });
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
