@@ -53,7 +53,7 @@ test("dispatch makes the worktree, starts the session with the brief and stores 
   );
   assert.notEqual(a.turnStartedAt, null, "the first turn is still running");
   const session = runner.sessions[0]!;
-  assert.equal(session.options.cwd, `/wt/ticket-${ticketId}-1`);
+  assert.equal(session.options.cwd, worktree);
   assert.equal(session.options.model, "gpt-6-luna");
   assert.deepEqual(session.options.writableDirs, [
     "/repo/.git/objects",
