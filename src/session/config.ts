@@ -18,8 +18,14 @@ export function sessionConfig(env: Record<string, string | undefined>): {
   if (claudeAuth === "login") for (const name of CLAUDE_KEY_VARS) delete claudeEnv[name];
   const codexEnv = Object.fromEntries(Object.entries(env).filter((entry): entry is [string, string] => entry[1] !== undefined));
   const provider = env["OSTROM_CODEX_PROVIDER"]?.trim();
+  const appMode = Boolean(env["OSTROM_GITHUB_APP_ID"] && env["OSTROM_GITHUB_APP_KEY_FILE"]);
+  // Login profiles can put the operator's gh ahead of the App helper, including in snapshots.
+  const config = {
+    ...(provider ? { model_provider: provider } : {}),
+    ...(appMode ? { allow_login_shell: false, features: { shell_snapshot: false } } : {}),
+  };
   return {
     claudeEnv,
-    codex: { env: codexEnv, ...(provider ? { config: { model_provider: provider } } : {}) },
+    codex: { env: codexEnv, ...(provider || appMode ? { config } : {}) },
   };
 }
