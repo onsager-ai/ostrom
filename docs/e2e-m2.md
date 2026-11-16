@@ -1,7 +1,7 @@
 # Milestone 2 sandbox run
 
-Status: partially evidenced, 2026-11-10. The natural unattended merge is deferred after three
-thermal shutdowns; no successful milestone-2 end-to-end unattended merge is claimed. All times below are UTC. This document records observed results
+Status: partially evidenced, 2026-11-10; completed by [the hp-code-2 run](e2e-m2-hp2.md) on 2026-11-16.
+The 2026-11-10 run's natural unattended merge was deferred after three thermal shutdowns. All times below are UTC. This document records observed results
 against the public `onsager-ai/ostrom-sandbox`; it does not substitute unit tests for runtime evidence.
 
 ## Setup
