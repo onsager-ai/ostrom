@@ -29,9 +29,9 @@ function fixture(extra: Partial<WorkersDeps> = {}, harness: "claude" | "codex" =
   const { ticketId } = store.recordDecision({ threadId: issue, triggerIds: [trigger], verdict: "accept", reason: "fix the README typo" });
   const runner = new FakeRunner();
   const worktrees: string[][] = [];
-  const addWorktree: WorkersDeps["addWorktree"] = async (repo, path, base, ticket, assignment) => {
+  const addWorktree: WorkersDeps["addWorktree"] = async (repo, path, base, ticket, assignment, suffix) => {
     worktrees.push([repo, path, base]);
-    return `ostrom/ticket-${ticket}-${assignment}`;
+    return `ostrom/ticket-${ticket}-${assignment}-${suffix}`;
   };
   const make = () => new Workers({ store, config: { ...config, harness }, runners: { claude: runner, codex: runner }, addWorktree, ...extra });
   return { store, runner, worktrees, ticketId: ticketId!, workers: make(), make };
@@ -41,12 +41,15 @@ test("dispatch makes the worktree, starts the session with the brief and stores 
   const { store, runner, worktrees, ticketId, workers } = fixture();
   runner.hold = true;
   const dispatched = await workers.dispatch(ticketId);
-  assert.deepEqual(dispatched, { assignmentId: 1, sessionId: "sess-1", branch: `ostrom/ticket-${ticketId}-1` });
-  assert.deepEqual(worktrees, [["/repo", `/wt/ticket-${ticketId}-1`, "main"]]);
+  assert.deepEqual(dispatched, { assignmentId: 1, sessionId: "sess-1", branch: store.getAssignment(1).branch });
+  const worktree = store.getAssignment(1).worktree!;
+  assert.match(worktree, new RegExp(`^/wt/ticket-${ticketId}-1-[a-f0-9-]{36}$`));
+  assert.equal(dispatched.branch, `ostrom/ticket-${ticketId}-1-${worktree.split("-").at(-1)}`);
+  assert.deepEqual(worktrees, [["/repo", worktree, "main"]]);
   const a = store.getAssignment(1);
   assert.deepEqual(
     [a.state, a.harness, a.model, a.sessionId, a.worktree, a.branch, a.machine, a.turns],
-    ["running", "codex", "gpt-6-luna", "sess-1", `/wt/ticket-${ticketId}-1`, dispatched.branch, "host", 1],
+    ["running", "codex", "gpt-6-luna", "sess-1", worktree, dispatched.branch, "host", 1],
   );
   assert.notEqual(a.turnStartedAt, null, "the first turn is still running");
   const session = runner.sessions[0]!;
@@ -56,7 +59,7 @@ test("dispatch makes the worktree, starts the session with the brief and stores 
     "/repo/.git/objects",
     "/repo/.git/refs",
     "/repo/.git/logs",
-    `/repo/.git/worktrees/ticket-${ticketId}-1`,
+    `/repo/.git/worktrees/${worktree.split("/").at(-1)}`,
   ]);
   assert.deepEqual(session.prompts, [workerBrief(store.ticketContext(ticketId), dispatched.branch, "main")]);
 
