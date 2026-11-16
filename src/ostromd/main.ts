@@ -57,6 +57,7 @@ see docs/running.md. Developer passes retain their existing environment requirem
 `;
 
 export interface MainDeps {
+  watchdogHealth?: { lastAttemptAt: string | null; lastSuccess: boolean | null; lastSuccessAt: string | null; error: string | null };
   env: Record<string, string | undefined>;
   gh: GhRunner;
   semon: ProcessRunner;
@@ -130,7 +131,13 @@ async function tick(deps: MainDeps): Promise<number> {
   const shared = { ...deps, workers: deps.workers ?? owned!.workers, store: deps.store ?? owned!.store };
   try {
     for (const step of TICK) {
+      if (step === "watchdog" && deps.watchdogHealth !== undefined) deps.watchdogHealth.lastAttemptAt = new Date().toISOString();
       const code = await main(["dev", step], { ...shared, mergeAllowed: failed.length === 0 });
+      if (step === "watchdog" && deps.watchdogHealth !== undefined) {
+        deps.watchdogHealth.lastSuccess = code === 0;
+        if (code === 0) deps.watchdogHealth.error = null;
+        if (code === 0) deps.watchdogHealth.lastSuccessAt = deps.watchdogHealth.lastAttemptAt;
+      }
       if (code !== 0) failed.push(`${step} (exit ${code})`);
     }
   } finally {
@@ -154,8 +161,11 @@ async function run(intervalSeconds: number, deps: MainDeps): Promise<number> {
   let code = 0;
   const owned = openWorkers(deps);
   const controls = operatorControls(owned.store, owned.workers, deps.gh, config.repo);
+  const watchdogHealth = { lastAttemptAt: null as string | null, lastSuccess: null as boolean | null, lastSuccessAt: null as string | null, error: null as string | null };
   const api = localApi(owned.store, {
     socketPath: defaultSocketPath(deps.env),
+    watchdog: () => ({ ...watchdogHealth }),
+    tickIntervalSeconds: intervalSeconds,
     control: {
       ...controls,
       extend: async (ticketId, increases) => { owned.store.extendTicketBudget(ticketId, increases); },
@@ -168,7 +178,7 @@ async function run(intervalSeconds: number, deps: MainDeps): Promise<number> {
   try {
     await api.start();
     while (!deps.stop.aborted) {
-      code = await tick({ ...deps, workers: owned.workers, store: owned.store });
+      code = await tick({ ...deps, workers: owned.workers, store: owned.store, watchdogHealth });
       if (deps.stop.aborted) break;
       await deps.sleep(intervalSeconds * 1000, deps.stop);
     }
@@ -319,6 +329,7 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
     if (command === "watchdog") {
       const { idleMinutes } = loadWatchdogConfig(deps.env);
       const pass = await watchdog({ store, semon: deps.semon, idleMinutes });
+      if (deps.watchdogHealth !== undefined && pass.failed.length > 0) deps.watchdogHealth.error = pass.failed[0]!.error.slice(0, 240);
       const ladder = await advanceStuckLadder(store, workers());
       for (const checked of pass.checked) deps.stdout(JSON.stringify(checked));
       for (const failure of pass.failed) deps.stderr(`ostromd watchdog: ${failure.what} failed: ${failure.error}`);

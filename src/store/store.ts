@@ -2,6 +2,7 @@
 // See docs/direction.md, "Data model". Only the operations milestone 1 needs live here.
 
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
+import { budgetUsage, budgetWarning } from "../budget/budgets.ts";
 import type { BudgetDefaults } from "../budget/budgets.ts";
 import { migrate } from "./migrations.ts";
 
@@ -153,6 +154,28 @@ export interface OperatorTicket extends Ticket {
   thread: Thread;
   assignment: Assignment | null;
   budget: TicketBudget;
+  budgetUsage: Record<"time" | "idle" | "turns" | "tokens" | "escalations", number>;
+  budgetWarning: "time" | "idle" | "turns" | "tokens" | "escalations" | null;
+  pullRequests: string[];
+  mergeCandidate: { policy: string; blockingReason: string | null; quietDeadline: string | null } | null;
+  latestFailure: { kind: "assignment" | "dispatch"; summary: string; at: string } | null;
+  recentFailures: { kind: "assignment" | "dispatch"; summary: string; at: string }[];
+}
+
+export type IntakeReason = "missing @ostrom mention" | "unauthorized author";
+export interface IntakeReceipt {
+  sourceId: number;
+  sourceEventId: string;
+  url: string;
+  observedAt: string;
+  reason: IntakeReason;
+}
+export interface OperatorIntakeItem {
+  eventId: string;
+  url: string;
+  observedAt: string;
+  disposition: "accept" | "ignore" | "stop" | "awaiting decision" | "excluded";
+  reason: string | null;
 }
 
 export interface OperatorTicketDetail extends OperatorTicket {
@@ -168,6 +191,7 @@ export interface OperatorStatus {
   runningWorkers: Assignment[];
   stuckTickets: { ticketId: number; assignmentId: number; cause: string | null; detectedAt: string }[];
   tokensToday: number;
+  watchdog: { lastAttemptAt: string | null; lastSuccess: boolean | null; lastSuccessAt: string | null; error: string | null };
 }
 
 export interface Assignment {
@@ -361,6 +385,38 @@ export class Store {
     if (Number(changes) !== 1) throw new Error(`no source ${sourceId}`);
   }
 
+  /** Records an excluded newly opened issue once, preserving its first observation time. */
+  recordIntakeReceipt(receipt: Omit<IntakeReceipt, "observedAt"> & { observedAt?: string }): void {
+    this.#run(
+      `INSERT INTO intake_receipt (source_id, source_event_id, url, observed_at, reason)
+       VALUES (?, ?, ?, ?, ?) ON CONFLICT (source_id, source_event_id) DO NOTHING`,
+      receipt.sourceId, receipt.sourceEventId, receipt.url, receipt.observedAt ?? this.#stamp(), receipt.reason,
+    );
+  }
+
+  /** Recent triggers with their latest Router decision, plus excluded event receipts. */
+  operatorIntake(limit = 50): OperatorIntakeItem[] {
+    const triggers = this.#all(
+      `SELECT trigger.source_event_id, trigger.url, trigger.received_at,
+              (SELECT decision.verdict FROM decision JOIN decision_trigger ON decision_trigger.decision_id = decision.id
+               WHERE decision_trigger.trigger_id = trigger.id ORDER BY decision.id DESC LIMIT 1) AS verdict,
+              (SELECT decision.reason FROM decision JOIN decision_trigger ON decision_trigger.decision_id = decision.id
+               WHERE decision_trigger.trigger_id = trigger.id ORDER BY decision.id DESC LIMIT 1) AS reason
+       FROM "trigger" AS trigger
+       ORDER BY trigger.received_at DESC, trigger.url, trigger.source_event_id LIMIT ?`,
+      limit,
+    ).map((row): OperatorIntakeItem => ({
+      eventId: row["source_event_id"] as string, url: row["url"] as string, observedAt: row["received_at"] as string,
+      disposition: (row["verdict"] as OperatorIntakeItem["disposition"] | null) ?? "awaiting decision",
+      reason: row["reason"] as string | null,
+    }));
+    const receipts = this.#all("SELECT source_event_id, url, observed_at, reason FROM intake_receipt ORDER BY observed_at DESC, url, source_event_id LIMIT ?", limit).map((row): OperatorIntakeItem => ({
+      eventId: row["source_event_id"] as string, url: row["url"] as string, observedAt: row["observed_at"] as string,
+      disposition: "excluded", reason: row["reason"] as string,
+    }));
+    return [...triggers, ...receipts].sort((a, b) => b.observedAt.localeCompare(a.observedAt) || a.url.localeCompare(b.url) || a.eventId.localeCompare(b.eventId)).slice(0, limit);
+  }
+
   findThread(sourceId: number, number: number): Thread | null {
     const row = this.#get("SELECT * FROM thread WHERE source_id = ? AND number = ?", sourceId, number);
     return row === undefined ? null : this.getThread(row["id"] as number);
@@ -545,7 +601,20 @@ export class Store {
 
   /** Tickets in operator-list order, with the fields needed by CLI and dashboard clients. */
   operatorTickets(): OperatorTicket[] {
-    return this.#all("SELECT id FROM ticket ORDER BY id DESC").map((row) => this.#operatorTicket(row["id"] as number));
+    const tickets = this.#all("SELECT id FROM ticket ORDER BY id DESC").map((row) => this.#operatorTicket(row["id"] as number));
+    const failures = tickets.flatMap((ticket) => ticket.recentFailures.map((failure, index) => ({ ticketId: ticket.id, index, failure })))
+      .sort((a, b) => b.failure.at.localeCompare(a.failure.at)).slice(0, 20);
+    const visible = new Map<number, Set<number>>();
+    for (const { ticketId, index } of failures) {
+      const entries = visible.get(ticketId) ?? new Set<number>();
+      entries.add(index);
+      visible.set(ticketId, entries);
+    }
+    return tickets.map((ticket) => {
+      const keep = visible.get(ticket.id) ?? new Set<number>();
+      const recentFailures = ticket.recentFailures.filter((_, index) => keep.has(index));
+      return { ...ticket, recentFailures, latestFailure: recentFailures[0] ?? null };
+    });
   }
 
   /** One ticket and its durable operator-visible timeline. */
@@ -573,7 +642,7 @@ export class Store {
   }
 
   /** The daemon-wide counter view. Time zone is SQLite's UTC day, matching stored timestamps. */
-  operatorStatus(): OperatorStatus {
+  operatorStatus(watchdog: OperatorStatus["watchdog"] = { lastAttemptAt: null, lastSuccess: null, lastSuccessAt: null, error: null }): OperatorStatus {
     const states = this.#all("SELECT state, COUNT(*) AS count FROM ticket GROUP BY state");
     const counts = new Map(states.map((row) => [row["state"] as TicketState, row["count"] as number]));
     const runningWorkers = this.runningAssignments();
@@ -586,13 +655,38 @@ export class Store {
     const today = this.#get(
       "SELECT COALESCE(SUM(input_tokens + output_tokens), 0) AS tokens FROM assignment WHERE last_activity_at >= date('now')",
     )!["tokens"] as number;
-    return { tickets: { open: counts.get("open") ?? 0, paused: counts.get("paused") ?? 0, ended: counts.get("ended") ?? 0 }, runningWorkers, stuckTickets, tokensToday: today };
+    return { tickets: { open: counts.get("open") ?? 0, paused: counts.get("paused") ?? 0, ended: counts.get("ended") ?? 0 }, runningWorkers, stuckTickets, tokensToday: today, watchdog };
   }
 
   #operatorTicket(ticketId: number): OperatorTicket {
     const ticket = this.getTicket(ticketId);
     const context = this.ticketContext(ticketId);
-    return { ...ticket, thread: context.thread, assignment: this.latestAssignment(ticketId), budget: this.ticketBudget(ticketId) };
+    const assignment = this.latestAssignment(ticketId);
+    const budget = this.ticketBudget(ticketId);
+    const now = this.#now();
+    const recentFailures = this.#all(
+      `SELECT outcome, last_error, outcome_at, end_reason, ended_at FROM assignment
+       WHERE ticket_id = ? AND ((outcome = 'failed' AND last_error IS NOT NULL) OR (started_at IS NULL AND end_reason IS NOT NULL))
+       ORDER BY COALESCE(outcome_at, ended_at) DESC`, ticketId,
+    ).map((row) => ({ kind: row["outcome"] === "failed" ? "assignment" as const : "dispatch" as const,
+      summary: (row["last_error"] ?? row["end_reason"]) as string,
+      at: (row["outcome_at"] ?? row["ended_at"]) as string }));
+    const latestFailure = recentFailures[0];
+    const merge = assignment === null ? null : this.mergeCandidateForAssignment(assignment.id);
+    const prs = this.#all(
+      `SELECT thread.url FROM subscription JOIN thread ON thread.id = subscription.thread_id
+       WHERE subscription.ticket_id = ? AND thread.kind = 'pull_request' ORDER BY thread.number`, ticketId,
+    ).map((row) => row["url"] as string);
+    return {
+      ...ticket, thread: context.thread, assignment, budget,
+      budgetUsage: { time: budgetUsage(budget, "time", now), idle: budgetUsage(budget, "idle", now),
+        turns: budgetUsage(budget, "turns", now), tokens: budgetUsage(budget, "tokens", now),
+        escalations: budgetUsage(budget, "escalations", now) },
+      budgetWarning: budgetWarning(budget, now), pullRequests: prs,
+      mergeCandidate: merge === null ? null : { policy: merge.policy, blockingReason: merge.blockingReason, quietDeadline: merge.quietDeadline },
+      latestFailure: latestFailure ?? null,
+      recentFailures,
+    };
   }
 
   /** The ticket with the thread, decision reason and trigger URLs that opened it. */

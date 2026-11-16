@@ -330,6 +330,16 @@ test("due replies come back oldest due first, up to the limit", () => {
   assert.deepEqual(store.dueReplies(2).map((r) => r.id), ["r2", "r1"]);
 });
 
+test("intake receipts deduplicate and preserve first observation time", () => {
+  const { store, source, advance } = fixture();
+  const receipt = { sourceId: source.id, sourceEventId: "issue-1:opened", url: "https://github.com/o/r/issues/1", reason: "missing @ostrom mention" as const };
+  store.recordIntakeReceipt(receipt);
+  const first = store.operatorIntake()[0]!.observedAt;
+  advance(60_000);
+  store.recordIntakeReceipt(receipt);
+  assert.deepEqual(store.operatorIntake(), [{ eventId: "issue-1:opened", url: receipt.url, observedAt: first, disposition: "excluded", reason: receipt.reason }]);
+});
+
 test("the schema refuses an unstarted assignment that ends without a reason", () => {
   const db = database({ enableForeignKeyConstraints: true });
   const store = new Store(db);

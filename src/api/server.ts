@@ -24,6 +24,8 @@ export interface LocalApiOptions {
   socketPath?: string;
   control: ApiControl;
   temperature?: () => Promise<number | null>;
+  watchdog?: () => { lastAttemptAt: string | null; lastSuccess: boolean | null; lastSuccessAt: string | null; error: string | null };
+  tickIntervalSeconds?: number;
 }
 
 export function defaultSocketPath(env: Record<string, string | undefined> = process.env): string {
@@ -40,12 +42,18 @@ export function localApi(store: Store, options: LocalApiOptions): LocalApi {
     const url = new URL(request.url ?? "/", "http://localhost");
     try {
       if (request.method === "GET" && url.pathname === "/v1/status") {
-        return reply(response, 200, { ...store.operatorStatus(), machine: {
-          slots: { total: availableParallelism(), used: store.runningAssignments().length },
+        return reply(response, 200, { ...store.operatorStatus(options.watchdog?.()), watchdogTickIntervalSeconds: options.tickIntervalSeconds ?? null, machine: {
+          slots: { total: availableParallelism(), used: store.runningAssignments().length, meaning: "CPU parallelism" },
           temperature: await (options.temperature ?? latestTemperature)(),
         } });
       }
       if (request.method === "GET" && url.pathname === "/v1/tickets") return reply(response, 200, store.operatorTickets());
+      if (request.method === "GET" && url.pathname === "/v1/intake") {
+        const raw = url.searchParams.get("limit");
+        const limit = raw === null ? 50 : Number(raw);
+        if (!Number.isInteger(limit) || limit < 1 || limit > 200) return reply(response, 400, { error: "limit must be a whole number from 1 to 200" });
+        return reply(response, 200, store.operatorIntake(limit));
+      }
       const ticket = /^\/v1\/tickets\/([1-9]\d*)$/.exec(url.pathname);
       if (request.method === "GET" && ticket !== null) return reply(response, 200, store.operatorTicket(Number(ticket[1])));
       if (request.method === "GET" && url.pathname === "/v1/preview") return reply(response, 200, { markdown: await options.control.preview() });

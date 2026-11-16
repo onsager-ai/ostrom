@@ -101,6 +101,15 @@ export async function pollOnce(options: PollOptions): Promise<PollResult> {
   const reviewComments = await listUpdatedSince(gh, `repos/${repo}/pulls/comments`, from(cursor.reviewComments), perPage);
   const issues = await listUpdatedSince(gh, `repos/${repo}/issues`, from(cursor.issues), perPage, "state=all");
 
+  for (const issue of issues) {
+    const opened = issueOpenedReceiptEvent(issue, from(cursor.issues));
+    if (opened === null || classify(opened, allowlist) === "own") continue;
+    const reason = !/@ostrom\b/i.test(opened.body)
+      ? "missing @ostrom mention"
+      : !allowlist.has(opened.actor.toLowerCase()) ? "unauthorized author" : null;
+    if (reason !== null) store.recordIntakeReceipt({ sourceId: source.id, sourceEventId: opened.id, url: opened.url, reason });
+  }
+
   const issueStateEvents = await Promise.all(
     issues.map((issue) => issueStateEventsFor(issue, store, source.id, gh, repo, perPage)),
   );
@@ -275,13 +284,16 @@ function issueCommentEvent(item: Item): GitHubEvent {
 
 /** A newly opened issue asks the Router only when it explicitly mentions Ostrom in its body. */
 function issueOpenedEvent(item: Item, since: Date): GitHubEvent[] {
-  if (item["pull_request"] != null || item["state"] !== "open") return [];
+  const event = issueOpenedReceiptEvent(item, since);
+  return event !== null && /@ostrom\b/i.test(event.body) ? [event] : [];
+}
+
+function issueOpenedReceiptEvent(item: Item, since: Date): GitHubEvent | null {
+  if (item["pull_request"] != null || item["state"] !== "open") return null;
   const createdAt = new Date(field(item, "created_at", "string"));
-  if (createdAt.getTime() < since.getTime()) return [];
-  const body = bodyOf(item);
-  if (!/@ostrom\b/i.test(body)) return [];
+  if (createdAt.getTime() < since.getTime()) return null;
   const url = field(item, "html_url", "string");
-  return [{
+  return {
     id: `${field(item, "node_id", "string")}:opened`,
     kind: "issue_opened",
     threadKind: "issue",
@@ -289,9 +301,9 @@ function issueOpenedEvent(item: Item, since: Date): GitHubEvent[] {
     threadUrl: url,
     url,
     actor: login(item),
-    body,
+    body: bodyOf(item),
     occurredAt: createdAt,
-  }];
+  };
 }
 
 async function issueStateEventsFor(

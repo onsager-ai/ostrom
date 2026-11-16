@@ -19,7 +19,9 @@ The daemon runs `ostromd run --interval 60`, restarts after failures, and writes
 logs to the user journal. Inspect it with `journalctl --user -u ostromd`.
 
 The operator uses `ostrom status`, `tickets`, `show`, `pause`, `resume`, `stop`,
-`extend`, and `preview`. They use the daemon's Unix socket at
+`extend`, and `preview`. The local operator API also serves `GET /v1/intake?limit=50` with recent
+observed events, Router decisions and excluded newly opened issues. The CLI and dashboard clients use
+the daemon's Unix socket at
 `$XDG_RUNTIME_DIR/ostrom/ostromd.sock`, or
 `~/.local/state/ostrom/ostromd.sock` when `XDG_RUNTIME_DIR` is not set. The
 read-only commands can inspect `OSTROM_DB` directly while the daemon is down;
