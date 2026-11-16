@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createServer, request } from "node:http";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -19,7 +19,9 @@ function call(url: string, path: string, headers: Record<string, string> = {}, m
 
 test("dashboard bridge restricts loopback, credentials, host, origin, routes and methods", async () => {
   const directory = await mkdtemp(join(tmpdir(), "ostrom-dashboard-"));
-  const socketPath = join(directory, "daemon.sock");
+  const socketDirectory = join(directory, "ostrom");
+  await mkdir(socketDirectory);
+  const socketPath = join(socketDirectory, "ostromd.sock");
   const forwarded: string[] = [];
   const fake = createServer((req, res) => { forwarded.push(`${req.method} ${req.url}`); res.writeHead(200, { "content-type": "application/json" }); res.end("{}") });
   await new Promise<void>((resolve, reject) => { fake.once("error", reject); fake.listen(socketPath, resolve); });
@@ -42,7 +44,8 @@ test("dashboard bridge restricts loopback, credentials, host, origin, routes and
     await dash.close();
     await new Promise<void>((resolve, reject) => fake.close((error) => error ? reject(error) : resolve()));
   }
-  const down = await startDashboard({ XDG_RUNTIME_DIR: join(directory, "missing") });
+  await rm(socketDirectory, { recursive: true, force: true });
+  const down = await startDashboard({ XDG_RUNTIME_DIR: directory });
   try {
     const token = new URL(down.url).hash.slice(1);
     const response = await call(down.url, "/v1/status", { authorization: `Bearer ${token}` });

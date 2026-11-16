@@ -4,6 +4,7 @@ import { createServer, request, type Server } from "node:http";
 import { defaultSocketPath } from "../api/server.ts";
 
 const PAGE = new URL("./dashboard.html", import.meta.url);
+const VIEW = new URL("./dashboard-view.js", import.meta.url);
 const ALLOWED = new Set(["/v1/status", "/v1/tickets", "/v1/intake?limit=50"]);
 
 export interface DashboardServer {
@@ -22,10 +23,10 @@ export async function startDashboard(env: Record<string, string | undefined> = p
     const origin = incoming.headers.origin;
     if (host !== boundHost || (origin !== undefined && origin !== `http://${boundHost}`)) return send(outgoing, 403, "Forbidden");
     const pathname = incoming.url ?? "/";
-    if (incoming.method === "GET" && (pathname === "/" || pathname === "/dashboard.html")) {
+    if (incoming.method === "GET" && (pathname === "/" || pathname === "/dashboard.html" || pathname === "/dashboard-view.js")) {
       try {
-        outgoing.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-        outgoing.end(await readFile(PAGE));
+        outgoing.writeHead(200, { "content-type": pathname.endsWith(".js") ? "text/javascript; charset=utf-8" : "text/html; charset=utf-8" });
+        outgoing.end(await readFile(pathname.endsWith(".js") ? VIEW : PAGE));
       } catch {
         send(outgoing, 500, "Dashboard page unavailable");
       }
@@ -59,6 +60,7 @@ export async function startDashboard(env: Record<string, string | undefined> = p
 }
 
 function send(response: import("node:http").ServerResponse, status: number, body: string): void {
+  if (response.headersSent) return;
   response.writeHead(status, { "content-type": "text/plain; charset=utf-8" });
   response.end(body);
 }
