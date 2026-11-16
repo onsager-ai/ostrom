@@ -703,10 +703,11 @@ export class Store {
     return { ticket, thread, source, reason: decision["reason"] as string, triggerUrls };
   }
 
-  pauseTicket(ticketId: number): void {
+  /** Pauses an open ticket; the cause is shown to the operator until the ticket resumes. */
+  pauseTicket(ticketId: number, cause: string): void {
     const { changes } = this.#run(
-      "UPDATE ticket SET state = 'paused' WHERE id = ? AND state = 'open'",
-      ticketId,
+      "UPDATE ticket SET state = 'paused', pause_cause = ? WHERE id = ? AND state = 'open'",
+      cause, ticketId,
     );
     if (Number(changes) !== 1) {
       throw new IllegalTransition(`ticket ${ticketId}: ${this.getTicket(ticketId).state} → paused is not allowed`);

@@ -63,7 +63,7 @@ test("the local API serves status, tickets and a ticket over a 0600 Unix socket"
     watchdog: () => ({ lastAttemptAt: "2026-11-16T12:00:00Z", lastSuccess: false, lastSuccessAt: "2026-11-16T11:00:00Z", error: "semon unavailable" }),
     tickIntervalSeconds: 60,
     control: {
-      pause: async (id) => { store.pauseTicket(id); },
+      pause: async (id) => { store.pauseTicket(id, "test pause"); },
       resume: async (id) => { store.resumeTicket(id); }, stop: async () => {},
       extend: async (id, increases) => { store.extendTicketBudget(id, increases); }, preview: async () => "",
     },

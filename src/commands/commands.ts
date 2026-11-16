@@ -25,7 +25,7 @@ export function operatorControls(store: Store, workers: Workers, gh: GhRunner, r
   return {
     async pause(ticketId) {
       const assignment = running(ticketId);
-      store.pauseTicket(ticketId);
+      store.pauseTicket(ticketId, "paused by the operator");
       queueStatusCard(store, ticketId);
       workers.deliver(assignment.id, `operator-pause-${ticketId}`, "Pause this ticket after the current work finishes. Push your work in progress, then stop and wait for Ostrom to resume you.", () => {});
     },
@@ -144,7 +144,7 @@ export async function routeCommands(
       } else if (command === "pause") {
         const assignment = store.latestAssignment(pending.ticketId);
         if (assignment?.state !== "running") throw new Error(`ticket ${pending.ticketId} has no running Worker`);
-        store.pauseTicket(pending.ticketId);
+        store.pauseTicket(pending.ticketId, `paused by @${pending.trigger.actor} on GitHub`);
         workers.deliver(
           assignment.id,
           `pause-${pending.trigger.id}-${assignment.id}`,

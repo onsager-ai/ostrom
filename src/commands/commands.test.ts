@@ -72,6 +72,7 @@ test("an issue author may pause, and a command is never a pending Worker deliver
     { triggerId, ticketId, command: "pause", allowed: true },
   ]);
   assert.equal(store.getTicket(ticketId).state, "paused");
+  assert.equal(store.getTicket(ticketId).pauseCause, "paused by @alice on GitHub");
   assert.deepEqual(store.pendingDeliveries(), []);
   assert.equal(store.undecidedTriggers().length, 0);
   assert.ok(store.dueReplies().some((reply) => reply.reaction === "+1"));
@@ -149,7 +150,7 @@ test("a paused ticket can still be stopped: by command, by closing the issue, or
   };
   for (const [way, stop] of Object.entries(ways)) {
     const f = fixture();
-    f.store.pauseTicket(f.ticketId);
+    f.store.pauseTicket(f.ticketId, "test pause");
     await stop(f);
     await f.workers.drain();
     assert.match(f.runner.sessions.at(-1)?.prompts.at(-1) ?? "", /gracefully/, way);
@@ -194,7 +195,7 @@ test("a stop request survives resume and is recorded before cleanup", async () =
   await operatorControls(store, workers, github.gh, REPO).stop(ticketId);
   assert.notEqual(store.getTicket(ticketId).stopRequestedAt, null);
   assert.equal(store.unfinishedTurns(1).length, 1);
-  store.pauseTicket(ticketId);
+  store.pauseTicket(ticketId, "test pause");
   store.resumeTicket(ticketId);
   assert.notEqual(store.getTicket(ticketId).stopRequestedAt, null);
 });
