@@ -126,6 +126,7 @@ export function codexRunner(config: CodexOptions, makeClient: CodexClientFactory
       if (busy) throw new Error("session already has a running turn");
       busy = true;
       let text = "";
+      let lastNotice: string | null = null;
       try {
         if (signal?.aborted) return { sessionId: id, text, status: "cancelled", usage: null, model: null };
         const { events } = await thread.runStreamed(prompt, signal ? { signal } : {});
@@ -135,12 +136,13 @@ export function codexRunner(config: CodexOptions, makeClient: CodexClientFactory
             id = event.thread_id;
           }
           if (event.type === "item.completed" && event.item.type === "agent_message") text = event.item.text;
-          if (event.type === "error") throw new Error(event.message);
+          // codex exec also emits these notices while reconnecting; the turn may still finish.
+          if (event.type === "error") lastNotice = event.message;
           if (event.type === "turn.failed") throw new Error(event.error.message);
           if (event.type === "turn.completed") return { sessionId: id, text, status: "completed", model: null,
             usage: { inputTokens: event.usage.input_tokens - event.usage.cached_input_tokens, cachedInputTokens: event.usage.cached_input_tokens, outputTokens: event.usage.output_tokens } };
         }
-        throw new Error("Codex ended without a result");
+        throw new Error(`Codex ended without a result${lastNotice === null ? "" : `: ${lastNotice}`}`);
       } catch (error) {
         if (signal?.aborted) return { sessionId: id, text, status: "cancelled", usage: null, model: null };
         throw error;

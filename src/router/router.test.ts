@@ -347,6 +347,31 @@ test("each outcome gets one reply, and a merged PR ends the assignment and the t
   assert.match(card.body, /^## Ostrom: Done$/m);
 });
 
+test("a failed Worker outcome retains its subscribed PR and renders a Failed card", async () => {
+  const s = setup();
+  s.comment("please fix the typo");
+  await s.poll();
+  const first = await routeCandidates(s.options());
+  const ticketId = first.decisions[0]!.ticketId!;
+  const assignment = s.store().latestAssignment(ticketId)!;
+  const thread = s.store().ensureThread({ sourceId: s.store().ticketContext(ticketId).thread.sourceId,
+    kind: "pull_request", number: 33, url: pr(33, "open").url });
+  s.store().subscribe(ticketId, thread);
+  s.github.pulls.push({ branch: assignment.branch!, number: 33, state: "open" });
+  s.store().recordTurnError(assignment.id, "provider exhausted retries");
+  s.store().recordOutcome(assignment.id, "failed");
+
+  await routeCandidates(s.options());
+  const outcome = batchOf(s.routerSessions().at(-1)!.prompts[0]!).outcomes.find((item) => item.event === "failed")!;
+  assert.equal(outcome.pullRequest, pr(33, "open").url);
+  assert.equal(outcome.detail, "provider exhausted retries");
+  assert.equal(s.store().getTicket(ticketId).state, "ended");
+  const card = s.store().dueReplies().find((reply) => reply.id.startsWith("card-thread-"))!;
+  assert.match(card.body, /^## Ostrom: Failed$/m);
+  assert.match(card.body, /PR: https:\/\/github.com\/onsager-ai\/ostrom\/pull\/33/);
+  assert.equal(s.store().operatorTickets()[0]!.latestFailure?.summary, "provider exhausted retries");
+});
+
 test("a Worker that failed to start gets one failure reply, and its ticket ends", async () => {
   const s = setup();
   s.comment("please fix the typo");

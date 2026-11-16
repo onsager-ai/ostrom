@@ -322,7 +322,9 @@ async function pendingOutcomes(options: RouteOptions, result: RoutePassResult): 
     }
     const status = assignment.outcome;
     if (terminal === null && (status === "failed" || status === "cancelled")) {
-      terminal = { ...base, key: `outcome-a${assignment.id}-${status}`, event: status, terminal: true, pullRequest: null };
+      terminal = { ...base, key: `outcome-a${assignment.id}-${status}`, event: status, terminal: true,
+        pullRequest: store.ticketPullRequest(assignment.ticketId)?.url ?? pullRequests.find((pr) => pr.state === "open")?.url ?? null,
+        detail: assignment.lastError };
     }
     if (terminal !== null) owed(terminal);
   }

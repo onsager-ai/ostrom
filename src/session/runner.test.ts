@@ -111,6 +111,20 @@ test("Codex cancellation is reported rather than treated as success", async () =
   assert.equal(result.status, "cancelled");
 });
 
+test("Codex reconnect notices defer to the terminal turn event", async () => {
+  const notice: ThreadEvent = { type: "error", message: "Reconnecting... 1/5 (idle timeout waiting for SSE)" };
+  const completed: ThreadEvent = { type: "turn.completed", usage: { input_tokens: 0, cached_input_tokens: 0, cache_write_input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0 } };
+  const send = (events: ThreadEvent[]) => {
+    const thread = { runStreamed: async () => ({ events: (async function* () { yield* events; })() }) };
+    const client = { startThread: () => thread } as unknown as Pick<Codex, "startThread" | "resumeThread">;
+    return codexRunner({}, () => client).start({ cwd: "/tmp", model: "luna" }).send("hello");
+  };
+  assert.equal((await send([notice, completed])).status, "completed");
+  await assert.rejects(send([notice, { type: "turn.failed", error: { message: "provider exhausted retries" } }]), { message: "provider exhausted retries" });
+  await assert.rejects(send([notice]), { message: `Codex ended without a result: ${notice.message}` });
+  await assert.rejects(send([]), { message: "Codex ended without a result" });
+});
+
 test("provider selection comes from the environment", () => {
   assert.deepEqual(sessionConfig({ OSTROM_CODEX_PROVIDER: "openai" }).codex.config, { model_provider: "openai" });
 });
