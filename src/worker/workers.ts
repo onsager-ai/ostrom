@@ -2,6 +2,7 @@
 // session started and resumed by ID through the session runner. Turns on one session run one at a
 // time; a follow-up queues behind the running turn. Everything here is deterministic.
 
+import { randomUUID } from "node:crypto";
 import { basename, join } from "node:path";
 
 import { turnBudgetReached } from "../budget/budgets.ts";
@@ -94,8 +95,9 @@ export class Workers {
     const context = store.ticketContext(ticketId);
     const id = store.createAssignment(ticketId);
     try {
-      const path = join(config.worktrees, `ticket-${ticketId}-${id}`);
-      const branch = await (this.#deps.addWorktree ?? createWorktree)(config.repo, path, config.base, ticketId, id);
+      const suffix = randomUUID();
+      const path = join(config.worktrees, `ticket-${ticketId}-${id}-${suffix}`);
+      const branch = await (this.#deps.addWorktree ?? createWorktree)(config.repo, path, config.base, ticketId, id, suffix);
       store.configureNativeAssignment(id, { harness: config.harness, model: config.model, worktree: path, branch, machine: config.machine });
       let resolve!: (sessionId: string) => void;
       const started = new Promise<string>((r) => (resolve = r));
