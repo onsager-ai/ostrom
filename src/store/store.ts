@@ -159,6 +159,7 @@ export interface OperatorTicket extends Ticket {
   pullRequests: string[];
   mergeCandidate: { policy: string; blockingReason: string | null; quietDeadline: string | null } | null;
   latestFailure: { kind: "assignment" | "dispatch"; summary: string; at: string } | null;
+  recentFailures: { kind: "assignment" | "dispatch"; summary: string; at: string }[];
 }
 
 export type IntakeReason = "missing @ostrom mention" | "unauthorized author";
@@ -170,6 +171,7 @@ export interface IntakeReceipt {
   reason: IntakeReason;
 }
 export interface OperatorIntakeItem {
+  eventId: string;
   url: string;
   observedAt: string;
   disposition: "accept" | "ignore" | "stop" | "awaiting decision" | "excluded";
@@ -395,19 +397,19 @@ export class Store {
   /** Recent triggers with their latest Router decision, plus excluded event receipts. */
   operatorIntake(limit = 50): OperatorIntakeItem[] {
     const triggers = this.#all(
-      `SELECT trigger.url, trigger.received_at,
+      `SELECT trigger.source_event_id, trigger.url, trigger.received_at,
               (SELECT decision.verdict FROM decision JOIN decision_trigger ON decision_trigger.decision_id = decision.id
                WHERE decision_trigger.trigger_id = trigger.id ORDER BY decision.id DESC LIMIT 1) AS verdict,
               (SELECT decision.reason FROM decision JOIN decision_trigger ON decision_trigger.decision_id = decision.id
                WHERE decision_trigger.trigger_id = trigger.id ORDER BY decision.id DESC LIMIT 1) AS reason
        FROM "trigger" AS trigger`,
     ).map((row): OperatorIntakeItem => ({
-      url: row["url"] as string, observedAt: row["received_at"] as string,
+      eventId: row["source_event_id"] as string, url: row["url"] as string, observedAt: row["received_at"] as string,
       disposition: row["verdict"] as OperatorIntakeItem["disposition"] ?? "awaiting decision",
       reason: row["reason"] as string | null,
     }));
-    const receipts = this.#all("SELECT url, observed_at, reason FROM intake_receipt").map((row): OperatorIntakeItem => ({
-      url: row["url"] as string, observedAt: row["observed_at"] as string,
+    const receipts = this.#all("SELECT source_event_id, url, observed_at, reason FROM intake_receipt").map((row): OperatorIntakeItem => ({
+      eventId: row["source_event_id"] as string, url: row["url"] as string, observedAt: row["observed_at"] as string,
       disposition: "excluded", reason: row["reason"] as string,
     }));
     return [...triggers, ...receipts].sort((a, b) => b.observedAt.localeCompare(a.observedAt)).slice(0, limit);
@@ -598,10 +600,19 @@ export class Store {
   /** Tickets in operator-list order, with the fields needed by CLI and dashboard clients. */
   operatorTickets(): OperatorTicket[] {
     const tickets = this.#all("SELECT id FROM ticket ORDER BY id DESC").map((row) => this.#operatorTicket(row["id"] as number));
-    const failures = tickets.filter((ticket) => ticket.latestFailure !== null)
-      .sort((a, b) => b.latestFailure!.at.localeCompare(a.latestFailure!.at)).slice(0, 20);
-    const visible = new Set(failures.map((ticket) => ticket.id));
-    return tickets.map((ticket) => visible.has(ticket.id) ? ticket : { ...ticket, latestFailure: null });
+    const failures = tickets.flatMap((ticket) => ticket.recentFailures.map((failure) => ({ ticketId: ticket.id, failure })))
+      .sort((a, b) => b.failure.at.localeCompare(a.failure.at)).slice(0, 20);
+    const visible = new Map<number, Set<string>>();
+    for (const { ticketId, failure } of failures) {
+      const entries = visible.get(ticketId) ?? new Set<string>();
+      entries.add(`${failure.kind}:${failure.at}:${failure.summary}`);
+      visible.set(ticketId, entries);
+    }
+    return tickets.map((ticket) => {
+      const keep = visible.get(ticket.id) ?? new Set<string>();
+      const recentFailures = ticket.recentFailures.filter((failure) => keep.has(`${failure.kind}:${failure.at}:${failure.summary}`));
+      return { ...ticket, recentFailures, latestFailure: recentFailures[0] ?? null };
+    });
   }
 
   /** One ticket and its durable operator-visible timeline. */
@@ -651,11 +662,14 @@ export class Store {
     const assignment = this.latestAssignment(ticketId);
     const budget = this.ticketBudget(ticketId);
     const now = this.#now();
-    const latestFailure = this.#all(
+    const recentFailures = this.#all(
       `SELECT outcome, last_error, outcome_at, end_reason, ended_at FROM assignment
        WHERE ticket_id = ? AND ((outcome = 'failed' AND last_error IS NOT NULL) OR (started_at IS NULL AND end_reason IS NOT NULL))
-       ORDER BY COALESCE(outcome_at, ended_at) DESC LIMIT 1`, ticketId,
-    )[0];
+       ORDER BY COALESCE(outcome_at, ended_at) DESC`, ticketId,
+    ).map((row) => ({ kind: row["outcome"] === "failed" ? "assignment" as const : "dispatch" as const,
+      summary: (row["last_error"] ?? row["end_reason"]) as string,
+      at: (row["outcome_at"] ?? row["ended_at"]) as string }));
+    const latestFailure = recentFailures[0];
     const merge = assignment === null ? null : this.mergeCandidateForAssignment(assignment.id);
     const prs = this.#all(
       `SELECT thread.url FROM subscription JOIN thread ON thread.id = subscription.thread_id
@@ -668,11 +682,8 @@ export class Store {
         escalations: budgetUsage(budget, "escalations", now) },
       budgetWarning: budgetWarning(budget, now), pullRequests: prs,
       mergeCandidate: merge === null ? null : { policy: merge.policy, blockingReason: merge.blockingReason, quietDeadline: merge.quietDeadline },
-      latestFailure: latestFailure === undefined ? null : {
-        kind: latestFailure["outcome"] === "failed" ? "assignment" : "dispatch",
-        summary: (latestFailure["last_error"] ?? latestFailure["end_reason"]) as string,
-        at: (latestFailure["outcome_at"] ?? latestFailure["ended_at"]) as string,
-      },
+      latestFailure: latestFailure ?? null,
+      recentFailures,
     };
   }
 

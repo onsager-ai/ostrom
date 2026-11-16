@@ -46,7 +46,7 @@ function withDb(body: (dbPath: string) => Promise<void>) {
   };
 }
 
-test("run status carries watchdog memory and its configured interval", async () => {
+test("run resets watchdog status to unknown for each daemon lifetime", async () => {
   const directory = mkdtempSync(join(tmpdir(), "ostromd-status-"));
   const dbPath = join(directory, "ostrom.sqlite");
   const github = new FakeGitHub(() => new Date());
@@ -60,9 +60,7 @@ test("run status carries watchdog memory and its configured interval", async () 
   d.deps.sleep = async () => controller.abort();
   await main(["run", "--interval", "60"], d.deps);
   assert.equal(attempts, 1);
-  const store = Store.open(dbPath);
-  assert.deepEqual(store.operatorStatus().watchdog, { lastAttemptAt: null, lastSuccess: null, lastSuccessAt: null, error: null });
-  store.close();
+  assert.match(d.err.join("\n"), /semon unavailable/);
   rmSync(directory, { recursive: true, force: true });
 });
 

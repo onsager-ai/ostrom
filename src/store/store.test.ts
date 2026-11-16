@@ -337,7 +337,7 @@ test("intake receipts deduplicate and preserve first observation time", () => {
   const first = store.operatorIntake()[0]!.observedAt;
   advance(60_000);
   store.recordIntakeReceipt(receipt);
-  assert.deepEqual(store.operatorIntake(), [{ url: receipt.url, observedAt: first, disposition: "excluded", reason: receipt.reason }]);
+  assert.deepEqual(store.operatorIntake(), [{ eventId: "issue-1:opened", url: receipt.url, observedAt: first, disposition: "excluded", reason: receipt.reason }]);
 });
 
 test("the schema refuses an unstarted assignment that ends without a reason", () => {

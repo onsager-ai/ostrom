@@ -135,7 +135,7 @@ async function tick(deps: MainDeps): Promise<number> {
       const code = await main(["dev", step], { ...shared, mergeAllowed: failed.length === 0 });
       if (step === "watchdog" && deps.watchdogHealth !== undefined) {
         deps.watchdogHealth.lastSuccess = code === 0;
-        deps.watchdogHealth.error = code === 0 ? null : "Watchdog pass failed; see daemon log";
+        if (code === 0) deps.watchdogHealth.error = null;
         if (code === 0) deps.watchdogHealth.lastSuccessAt = deps.watchdogHealth.lastAttemptAt;
       }
       if (code !== 0) failed.push(`${step} (exit ${code})`);
@@ -329,6 +329,7 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
     if (command === "watchdog") {
       const { idleMinutes } = loadWatchdogConfig(deps.env);
       const pass = await watchdog({ store, semon: deps.semon, idleMinutes });
+      if (deps.watchdogHealth !== undefined && pass.failed.length > 0) deps.watchdogHealth.error = pass.failed[0]!.error.slice(0, 240);
       const ladder = await advanceStuckLadder(store, workers());
       for (const checked of pass.checked) deps.stdout(JSON.stringify(checked));
       for (const failure of pass.failed) deps.stderr(`ostromd watchdog: ${failure.what} failed: ${failure.error}`);

@@ -103,7 +103,7 @@ export async function pollOnce(options: PollOptions): Promise<PollResult> {
 
   for (const issue of issues) {
     const opened = issueOpenedReceiptEvent(issue, from(cursor.issues));
-    if (opened === null) continue;
+    if (opened === null || classify(opened, allowlist) === "own") continue;
     const reason = !/@ostrom\b/i.test(opened.body)
       ? "missing @ostrom mention"
       : !allowlist.has(opened.actor.toLowerCase()) ? "unauthorized author" : null;

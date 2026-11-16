@@ -60,6 +60,8 @@ test("the local API serves status, tickets and a ticket over a 0600 Unix socket"
   const api = localApi(store, {
     socketPath,
     temperature: async () => 42,
+    watchdog: () => ({ lastAttemptAt: "2026-11-16T12:00:00Z", lastSuccess: false, lastSuccessAt: "2026-11-16T11:00:00Z", error: "semon unavailable" }),
+    tickIntervalSeconds: 60,
     control: {
       pause: async (id) => { store.pauseTicket(id); },
       resume: async (id) => { store.resumeTicket(id); }, stop: async () => {},
@@ -77,6 +79,9 @@ test("the local API serves status, tickets and a ticket over a 0600 Unix socket"
       runningWorkers: { sessionId: string; inputTokens: number; outputTokens: number; turns: number }[];
       stuckTickets: unknown[];
       tokensToday: number;
+      watchdog: { lastAttemptAt: string | null; lastSuccess: boolean | null; lastSuccessAt: string | null; error: string | null };
+      watchdogTickIntervalSeconds: number;
+      machine: { slots: { total: number; used: number; meaning: string } };
     };
     assert.deepEqual(statusBody.tickets, { open: 1, paused: 0, ended: 0 });
     assert.deepEqual(statusBody.runningWorkers.map((worker) => ({
@@ -84,16 +89,24 @@ test("the local API serves status, tickets and a ticket over a 0600 Unix socket"
     })), [{ sessionId: "sess-1", turns: 1, inputTokens: 12, outputTokens: 4 }]);
     assert.deepEqual(statusBody.stuckTickets, []);
     assert.equal(statusBody.tokensToday, 16);
+    assert.deepEqual(statusBody.watchdog, { lastAttemptAt: "2026-11-16T12:00:00Z", lastSuccess: false, lastSuccessAt: "2026-11-16T11:00:00Z", error: "semon unavailable" });
+    assert.equal(statusBody.watchdogTickIntervalSeconds, 60);
+    assert.equal(statusBody.machine.slots.meaning, "CPU parallelism");
     const intake = await get(socketPath, "/v1/intake?limit=50");
     assert.equal(intake.status, 200);
     assert.equal((intake.body as { disposition: string }[])[0]!.disposition, "awaiting decision");
 
     const tickets = await get(socketPath, "/v1/tickets");
     assert.equal(tickets.status, 200);
-    const list = tickets.body as { id: number; assignment: { sessionId: string } }[];
+    const list = tickets.body as { id: number; assignment: { sessionId: string }; budgetUsage: { tokens: number }; budgetWarning: string | null; pullRequests: string[]; mergeCandidate: unknown; latestFailure: unknown }[];
     assert.equal(list.length, 1);
     assert.equal(list[0]!.id, ticketId);
     assert.equal(list[0]!.assignment.sessionId, "sess-1");
+    assert.equal(list[0]!.budgetUsage.tokens, 16);
+    assert.equal(list[0]!.budgetWarning, null);
+    assert.deepEqual(list[0]!.pullRequests, []);
+    assert.equal(list[0]!.mergeCandidate, null);
+    assert.equal(list[0]!.latestFailure, null);
 
     const detail = await get(socketPath, `/v1/tickets/${ticketId}`);
     assert.equal(detail.status, 200);
