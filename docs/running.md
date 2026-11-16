@@ -100,6 +100,9 @@ The wrapper supplies a fresh `GH_TOKEN` to its own child; GitHub CLI gives that 
 over stored credentials (`gh help environment`). If a shell reorders PATH or uses an absolute
 `gh` path, the unwrapped CLI has no saved login and fails authentication instead of acting as the
 operator. This configuration isolation applies only to Workers; the daemon's runner is unchanged.
+In App mode, Codex sessions disable login shells (`allow_login_shell=false`) and shell snapshots
+(`features.shell_snapshot=false`) so login profiles cannot put the operator's `gh` ahead of the
+helper. Non-App sessions retain their existing shell behavior; Claude shell behavior is unchanged.
 
 This mechanism requires Workers to preserve PATH and Git's inherited environment and use normal
 `gh`/Git commands. An absolute `gh` path, overridden credentials, `git -c credential.helper=...`,

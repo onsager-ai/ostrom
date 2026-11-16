@@ -115,6 +115,19 @@ test("provider selection comes from the environment", () => {
   assert.deepEqual(sessionConfig({ OSTROM_CODEX_PROVIDER: "openai" }).codex.config, { model_provider: "openai" });
 });
 
+test("App mode disables Codex login shells and snapshots while retaining provider and Worker environment", () => {
+  const env = { OSTROM_GITHUB_APP_ID: "1", OSTROM_GITHUB_APP_KEY_FILE: "/unused", PATH: "/app-helper:/usr/bin", GH_CONFIG_DIR: "/app-helper/gh-config" };
+  const config = sessionConfig(env);
+  assert.deepEqual(config.codex.config, { allow_login_shell: false, features: { shell_snapshot: false } });
+  assert.deepEqual(config.codex.env, env);
+  assert.deepEqual(config.claudeEnv, env);
+  assert.deepEqual(sessionConfig({ ...env, OSTROM_CODEX_PROVIDER: "openai" }).codex.config, {
+    model_provider: "openai", allow_login_shell: false, features: { shell_snapshot: false },
+  });
+  assert.equal(sessionConfig({}).codex.config, undefined);
+  assert.equal(sessionConfig({ OSTROM_GITHUB_APP_ID: "1" }).codex.config, undefined);
+});
+
 test("Claude login mode drops gateway and API-key variables", () => {
   const env = { ANTHROPIC_AUTH_TOKEN: "t", ANTHROPIC_BASE_URL: "u", ANTHROPIC_API_KEY: "k", HOME: "/h" };
   assert.deepEqual(sessionConfig({ ...env, OSTROM_CLAUDE_AUTH: "login" }).claudeEnv, { HOME: "/h", OSTROM_CLAUDE_AUTH: "login" });

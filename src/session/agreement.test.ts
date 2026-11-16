@@ -1,5 +1,11 @@
 import { strict as assert } from "node:assert";
 import { readFileSync } from "node:fs";
+import { execFile } from "node:child_process";
+import { mkdtemp, rm } from "node:fs/promises";
+import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { promisify } from "node:util";
 import { test } from "node:test";
 import type { SDKResultSuccess, SDKSystemMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { AgentMessageItem, ItemCompletedEvent, ThreadStartedEvent, TurnCompletedEvent } from "@openai/codex-sdk";
@@ -12,6 +18,24 @@ type ClaudeResult = Pick<SDKResultSuccess, "type" | "subtype" | "session_id" | "
   modelUsage: SDKResultSuccess["modelUsage"];
 };
 type CodexMessage = Pick<ItemCompletedEvent, "type"> & { item: Pick<AgentMessageItem, "id" | "type" | "text"> };
+
+test("pinned Codex CLI recognizes App shell controls as booleans", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ostrom-codex-shell-agreement-"));
+  try {
+    // Resolve the CLI dependency from the SDK, not an operator-installed codex on PATH.
+    const require = createRequire(import.meta.resolve("@openai/codex-sdk"));
+    const cli = join(dirname(require.resolve("@openai/codex/package.json")), "bin", "codex.js");
+    const exec = promisify(execFile);
+    const run = (...overrides: string[]) => exec(process.execPath,
+      [cli, ...overrides.flatMap((value) => ["-c", value]), "features", "list"],
+      { cwd: root, env: { PATH: process.env["PATH"], HOME: root, CODEX_HOME: root }, timeout: 15_000 });
+    const result = await run("allow_login_shell=false", "features.shell_snapshot=false");
+    assert.match(result.stdout, /^shell_snapshot[^\S\n]+[^\n]+[^\S\n]+false[^\S\n]*$/m);
+    // Unknown keys may be ignored; invalid-type rejection proves these keys are recognized.
+    await assert.rejects(run('allow_login_shell="invalid"'), /allow_login_shell|boolean/);
+    await assert.rejects(run('features.shell_snapshot="invalid"'), /shell_snapshot|boolean/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
 
 function fixture(name: string): unknown {
   return JSON.parse(readFileSync(new URL(`./fixtures/${name}.json`, import.meta.url), "utf8"));
