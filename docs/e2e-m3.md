@@ -142,10 +142,10 @@ The page has no mutating controls; it shows the CLI commands instead.
 
 ## Follow-ups
 
-- An approval with an empty body still queued a Worker turn for ticket 3 (15:18:30). The M2 notes
+- [#725](https://github.com/onsager-ai/ostrom/issues/725): an approval with an empty body still queued a Worker turn for ticket 3 (15:18:30). The M2 notes
   said it did not; they were wrong.
-- An ended ticket's published stall stays in Attention (ticket 2 after 15:33).
-- A ticket row shows the token count even when the warning is for turns.
+- [#726](https://github.com/onsager-ai/ostrom/issues/726): an ended ticket's published stall stays in Attention (ticket 2 after 15:33).
+- [#727](https://github.com/onsager-ai/ostrom/issues/727): a ticket row shows the token count even when the warning is for turns.
 - [#715](https://github.com/onsager-ai/ostrom/issues/715): provider at start versus resume, not
   exercised here.
 - Sandbox PR #33 is a correct change stranded by the second failure; it is closed with a note.
