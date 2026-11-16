@@ -46,23 +46,25 @@ function withDb(body: (dbPath: string) => Promise<void>) {
   };
 }
 
-test("run resets watchdog status to unknown for each daemon lifetime", async () => {
-  const directory = mkdtempSync(join(tmpdir(), "ostromd-status-"));
-  const dbPath = join(directory, "ostrom.sqlite");
-  const github = new FakeGitHub(() => new Date());
-  const controller = new AbortController();
-  let attempts = 0;
-  const d = deps({ OSTROM_REPO: github.repo, OSTROM_ALLOWLIST: "alice", OSTROM_DB: dbPath, OSTROM_STALL_MINUTES: "20" }, github.gh, async () => {
-    attempts++;
-    throw new Error("semon unavailable");
-  });
-  d.deps.stop = controller.signal;
-  d.deps.sleep = async () => controller.abort();
-  await main(["run", "--interval", "60"], d.deps);
-  assert.equal(attempts, 1);
-  assert.match(d.err.join("\n"), /semon unavailable/);
-  rmSync(directory, { recursive: true, force: true });
-});
+test(
+  "a tick records Watchdog health: failure with its error, then success",
+  withDb(async (dbPath) => {
+    const github = new FakeGitHub(() => new Date());
+    const health = { lastAttemptAt: null as string | null, lastSuccess: null as boolean | null, lastSuccessAt: null as string | null, error: null as string | null };
+    const failed = deps(tickEnv(dbPath), github.gh, async () => ({ code: 1, stdout: "", stderr: "semon unavailable" }));
+    assert.equal(await main(["dev", "tick"], { ...failed.deps, watchdogHealth: health }), 1);
+    assert.equal(health.lastSuccess, false);
+    assert.notEqual(health.lastAttemptAt, null);
+    assert.equal(health.lastSuccessAt, null);
+    assert.match(health.error ?? "", /semon unavailable/);
+
+    const ok = deps(tickEnv(dbPath), github.gh, semonAnswer(20, []));
+    assert.equal(await main(["dev", "tick"], { ...ok.deps, watchdogHealth: health }), 0);
+    assert.equal(health.lastSuccess, true);
+    assert.equal(health.error, null);
+    assert.equal(health.lastSuccessAt, health.lastAttemptAt);
+  }),
+);
 
 test("ostromd without a command prints usage and exits non-zero", () => {
   const entry = fileURLToPath(new URL("./main.ts", import.meta.url));
