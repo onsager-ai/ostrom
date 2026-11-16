@@ -184,6 +184,7 @@ test("a late success after the Router ends an assignment preserves its failure a
   session.release();
   await workers.drain();
   assert.equal(store.getAssignment(1).lastError, "boom");
+  assert.equal(store.getAssignment(1).turnStartedAt, null);
   assert.equal(store.operatorTickets()[0]!.latestFailure?.summary, "boom");
   assert.equal(completed, false);
 });

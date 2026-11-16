@@ -430,9 +430,10 @@ export class Workers {
 
   #finished(id: number, result: TurnResult): void {
     const { store } = this.#deps;
+    // A late result still counts its usage, but cannot clear a failure or act for an ended assignment.
+    store.endTurn(id, result.usage);
     const assignment = store.getAssignment(id);
     if (assignment.state !== "running" || assignment.outcome === "failed") return;
-    store.endTurn(id, result.usage);
     store.clearTurnError(id);
     if (result.status === "cancelled") {
       queueStatusCard(store, assignment.ticketId);
