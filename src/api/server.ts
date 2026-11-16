@@ -24,6 +24,8 @@ export interface LocalApiOptions {
   socketPath?: string;
   control: ApiControl;
   temperature?: () => Promise<number | null>;
+  watchdog?: () => { lastAttemptAt: string | null; lastSuccess: boolean | null; lastSuccessAt: string | null; error: string | null };
+  tickIntervalSeconds?: number;
 }
 
 export function defaultSocketPath(env: Record<string, string | undefined> = process.env): string {
@@ -40,8 +42,8 @@ export function localApi(store: Store, options: LocalApiOptions): LocalApi {
     const url = new URL(request.url ?? "/", "http://localhost");
     try {
       if (request.method === "GET" && url.pathname === "/v1/status") {
-        return reply(response, 200, { ...store.operatorStatus(), machine: {
-          slots: { total: availableParallelism(), used: store.runningAssignments().length },
+        return reply(response, 200, { ...store.operatorStatus(options.watchdog?.()), watchdogTickIntervalSeconds: options.tickIntervalSeconds ?? null, machine: {
+          slots: { total: availableParallelism(), used: store.runningAssignments().length, meaning: "CPU parallelism" },
           temperature: await (options.temperature ?? latestTemperature)(),
         } });
       }

@@ -84,6 +84,9 @@ test("the local API serves status, tickets and a ticket over a 0600 Unix socket"
     })), [{ sessionId: "sess-1", turns: 1, inputTokens: 12, outputTokens: 4 }]);
     assert.deepEqual(statusBody.stuckTickets, []);
     assert.equal(statusBody.tokensToday, 16);
+    const intake = await get(socketPath, "/v1/intake?limit=50");
+    assert.equal(intake.status, 200);
+    assert.equal((intake.body as { disposition: string }[])[0]!.disposition, "awaiting decision");
 
     const tickets = await get(socketPath, "/v1/tickets");
     assert.equal(tickets.status, 200);

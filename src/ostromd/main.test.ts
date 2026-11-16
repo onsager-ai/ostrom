@@ -46,6 +46,26 @@ function withDb(body: (dbPath: string) => Promise<void>) {
   };
 }
 
+test("run status carries watchdog memory and its configured interval", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "ostromd-status-"));
+  const dbPath = join(directory, "ostrom.sqlite");
+  const github = new FakeGitHub(() => new Date());
+  const controller = new AbortController();
+  let attempts = 0;
+  const d = deps({ OSTROM_REPO: github.repo, OSTROM_ALLOWLIST: "alice", OSTROM_DB: dbPath, OSTROM_WATCHDOG_IDLE_MIN: "20" }, github.gh, async () => {
+    attempts++;
+    throw new Error("semon unavailable");
+  });
+  d.deps.stop = controller.signal;
+  d.deps.sleep = async () => controller.abort();
+  await main(["run", "--interval", "60"], d.deps);
+  assert.equal(attempts, 1);
+  const store = Store.open(dbPath);
+  assert.deepEqual(store.operatorStatus().watchdog, { lastAttemptAt: null, lastSuccess: null, lastSuccessAt: null, error: null });
+  store.close();
+  rmSync(directory, { recursive: true, force: true });
+});
+
 test("ostromd without a command prints usage and exits non-zero", () => {
   const entry = fileURLToPath(new URL("./main.ts", import.meta.url));
   const run = spawnSync(process.execPath, [entry], { encoding: "utf8" });

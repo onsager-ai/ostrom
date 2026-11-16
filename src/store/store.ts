@@ -2,6 +2,7 @@
 // See docs/direction.md, "Data model". Only the operations milestone 1 needs live here.
 
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
+import { budgetUsage, budgetWarning } from "../budget/budgets.ts";
 import type { BudgetDefaults } from "../budget/budgets.ts";
 import { migrate } from "./migrations.ts";
 
@@ -153,6 +154,11 @@ export interface OperatorTicket extends Ticket {
   thread: Thread;
   assignment: Assignment | null;
   budget: TicketBudget;
+  budgetUsage: Record<"time" | "idle" | "turns" | "tokens" | "escalations", number>;
+  budgetWarning: "time" | "idle" | "turns" | "tokens" | "escalations" | null;
+  pullRequests: string[];
+  mergeCandidate: { policy: string; blockingReason: string | null; quietDeadline: string | null } | null;
+  latestFailure: { kind: "assignment" | "dispatch"; summary: string; at: string } | null;
 }
 
 export type IntakeReason = "missing @ostrom mention" | "unauthorized author";
@@ -183,6 +189,7 @@ export interface OperatorStatus {
   runningWorkers: Assignment[];
   stuckTickets: { ticketId: number; assignmentId: number; cause: string | null; detectedAt: string }[];
   tokensToday: number;
+  watchdog: { lastAttemptAt: string | null; lastSuccess: boolean | null; lastSuccessAt: string | null; error: string | null };
 }
 
 export interface Assignment {
@@ -590,7 +597,11 @@ export class Store {
 
   /** Tickets in operator-list order, with the fields needed by CLI and dashboard clients. */
   operatorTickets(): OperatorTicket[] {
-    return this.#all("SELECT id FROM ticket ORDER BY id DESC").map((row) => this.#operatorTicket(row["id"] as number));
+    const tickets = this.#all("SELECT id FROM ticket ORDER BY id DESC").map((row) => this.#operatorTicket(row["id"] as number));
+    const failures = tickets.filter((ticket) => ticket.latestFailure !== null)
+      .sort((a, b) => b.latestFailure!.at.localeCompare(a.latestFailure!.at)).slice(0, 20);
+    const visible = new Set(failures.map((ticket) => ticket.id));
+    return tickets.map((ticket) => visible.has(ticket.id) ? ticket : { ...ticket, latestFailure: null });
   }
 
   /** One ticket and its durable operator-visible timeline. */
@@ -618,7 +629,7 @@ export class Store {
   }
 
   /** The daemon-wide counter view. Time zone is SQLite's UTC day, matching stored timestamps. */
-  operatorStatus(): OperatorStatus {
+  operatorStatus(watchdog: OperatorStatus["watchdog"] = { lastAttemptAt: null, lastSuccess: null, lastSuccessAt: null, error: null }): OperatorStatus {
     const states = this.#all("SELECT state, COUNT(*) AS count FROM ticket GROUP BY state");
     const counts = new Map(states.map((row) => [row["state"] as TicketState, row["count"] as number]));
     const runningWorkers = this.runningAssignments();
@@ -631,13 +642,38 @@ export class Store {
     const today = this.#get(
       "SELECT COALESCE(SUM(input_tokens + output_tokens), 0) AS tokens FROM assignment WHERE last_activity_at >= date('now')",
     )!["tokens"] as number;
-    return { tickets: { open: counts.get("open") ?? 0, paused: counts.get("paused") ?? 0, ended: counts.get("ended") ?? 0 }, runningWorkers, stuckTickets, tokensToday: today };
+    return { tickets: { open: counts.get("open") ?? 0, paused: counts.get("paused") ?? 0, ended: counts.get("ended") ?? 0 }, runningWorkers, stuckTickets, tokensToday: today, watchdog };
   }
 
   #operatorTicket(ticketId: number): OperatorTicket {
     const ticket = this.getTicket(ticketId);
     const context = this.ticketContext(ticketId);
-    return { ...ticket, thread: context.thread, assignment: this.latestAssignment(ticketId), budget: this.ticketBudget(ticketId) };
+    const assignment = this.latestAssignment(ticketId);
+    const budget = this.ticketBudget(ticketId);
+    const now = this.#now();
+    const latestFailure = this.#all(
+      `SELECT outcome, last_error, outcome_at, end_reason, ended_at FROM assignment
+       WHERE ticket_id = ? AND ((outcome = 'failed' AND last_error IS NOT NULL) OR (started_at IS NULL AND end_reason IS NOT NULL))
+       ORDER BY COALESCE(outcome_at, ended_at) DESC LIMIT 1`, ticketId,
+    )[0];
+    const merge = assignment === null ? null : this.mergeCandidateForAssignment(assignment.id);
+    const prs = this.#all(
+      `SELECT thread.url FROM subscription JOIN thread ON thread.id = subscription.thread_id
+       WHERE subscription.ticket_id = ? AND thread.kind = 'pull_request' ORDER BY thread.number`, ticketId,
+    ).map((row) => row["url"] as string);
+    return {
+      ...ticket, thread: context.thread, assignment, budget,
+      budgetUsage: { time: budgetUsage(budget, "time", now), idle: budgetUsage(budget, "idle", now),
+        turns: budgetUsage(budget, "turns", now), tokens: budgetUsage(budget, "tokens", now),
+        escalations: budgetUsage(budget, "escalations", now) },
+      budgetWarning: budgetWarning(budget, now), pullRequests: prs,
+      mergeCandidate: merge === null ? null : { policy: merge.policy, blockingReason: merge.blockingReason, quietDeadline: merge.quietDeadline },
+      latestFailure: latestFailure === undefined ? null : {
+        kind: latestFailure["outcome"] === "failed" ? "assignment" : "dispatch",
+        summary: (latestFailure["last_error"] ?? latestFailure["end_reason"]) as string,
+        at: (latestFailure["outcome_at"] ?? latestFailure["ended_at"]) as string,
+      },
+    };
   }
 
   /** The ticket with the thread, decision reason and trigger URLs that opened it. */
