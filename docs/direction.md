@@ -162,10 +162,11 @@ but no live run yet.
 
 ## Milestone 3
 
-Proposed, 2026-11-16. [The operator dashboard design](dashboard.md) adds a read-only local page
-on the CLI's daemon API: attention items, ticket progress, merge waits, failures, budgets and
-Watchdog health. It addresses the silent intake and failure diagnosis seen in the milestone-2
-run. Worker placement is deferred. Completion requires the live sandbox evidence in that design.
+Done, 2026-11-16. [The operator dashboard](dashboard.md) is a read-only local page on the CLI's
+daemon API: attention items, ticket progress, merge waits, failures, budgets and Watchdog health.
+[The hp-code-2 run](e2e-m3.md) passed every live acceptance step. It also found three defects,
+fixed before it finished: a Codex reconnect notice ended a ticket and its reason was lost, a turn
+budget cancelled the last allowed turn, and several page gaps. Worker placement is deferred.
 
 ## Non-goals (for now)
 
