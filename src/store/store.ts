@@ -600,17 +600,17 @@ export class Store {
   /** Tickets in operator-list order, with the fields needed by CLI and dashboard clients. */
   operatorTickets(): OperatorTicket[] {
     const tickets = this.#all("SELECT id FROM ticket ORDER BY id DESC").map((row) => this.#operatorTicket(row["id"] as number));
-    const failures = tickets.flatMap((ticket) => ticket.recentFailures.map((failure) => ({ ticketId: ticket.id, failure })))
+    const failures = tickets.flatMap((ticket) => ticket.recentFailures.map((failure, index) => ({ ticketId: ticket.id, index, failure })))
       .sort((a, b) => b.failure.at.localeCompare(a.failure.at)).slice(0, 20);
-    const visible = new Map<number, Set<string>>();
-    for (const { ticketId, failure } of failures) {
-      const entries = visible.get(ticketId) ?? new Set<string>();
-      entries.add(`${failure.kind}:${failure.at}:${failure.summary}`);
+    const visible = new Map<number, Set<number>>();
+    for (const { ticketId, index } of failures) {
+      const entries = visible.get(ticketId) ?? new Set<number>();
+      entries.add(index);
       visible.set(ticketId, entries);
     }
     return tickets.map((ticket) => {
-      const keep = visible.get(ticket.id) ?? new Set<string>();
-      const recentFailures = ticket.recentFailures.filter((failure) => keep.has(`${failure.kind}:${failure.at}:${failure.summary}`));
+      const keep = visible.get(ticket.id) ?? new Set<number>();
+      const recentFailures = ticket.recentFailures.filter((_, index) => keep.has(index));
       return { ...ticket, recentFailures, latestFailure: recentFailures[0] ?? null };
     });
   }
