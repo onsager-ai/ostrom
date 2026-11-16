@@ -141,6 +141,8 @@ function done(f: Fixture, origin: "ostrom" | "external" | "unknown") {
   const replies = f.replies();
   assert.deepEqual(replies.filter((r) => r.id.endsWith("-merged")).map((r) => r.id), [`outcome-a${f.assignment}-pr2-merged`]);
   const body = replies.find((r) => r.id.endsWith("-merged"))!.body;
+  assert.match(f.store.statusCardBody(f.issue)!, /Ostrom: Done/);
+  assert.doesNotMatch(f.store.statusCardBody(f.issue)!, /Merge:.*waiting|Merge:.*blocked/i);
   assert.match(body, /@marvin/);
   assert.match(body, /https:\/\/github.com\/o\/r\/commit\/merge/);
   if (origin === "ostrom") assert.match(body, /Ostrom .* merged/);
@@ -176,7 +178,8 @@ test("human policy leaves a waiting_for_human_merge card and never sends PUT", a
   const candidate = f.store.mergeCandidateForAssignment(f.assignment)!;
   assert.equal(candidate.blockingReason, "waiting for a human merge");
   const card = f.store.statusCardBody(f.issue)!;
-  assert.match(card, /Waiting for a human merge/);
+  assert.match(card, /Ostrom: Waiting for a human merge/);
+  assert.match(card, /Merge: policy human; head head; waiting for a human merge/);
   assert.match(card, /policy human/);
   assert.match(card, /pause/);
   assert.match(card, /stop/);
