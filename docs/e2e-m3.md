@@ -31,7 +31,7 @@ Status: passed, 2026-11-16, after three fixes found by the run itself. This run 
 | 1. Intake and ticket view | Pass | Unmentioned [#31](https://github.com/onsager-ai/ostrom-sandbox/issues/31) shown `excluded · missing @ostrom mention` within one poll; [#32](https://github.com/onsager-ai/ostrom-sandbox/issues/32) became ticket 1 with issue and PR links, session ID and last completed turn |
 | 2. Approvals wait and merge | Pass | [PR #37](https://github.com/onsager-ai/ostrom-sandbox/pull/37) showed `policy approvals are not satisfied` with the review reminder, then `quiet period has not elapsed`; merged by the App at 15:31:16 |
 | 3. Failure after the ticket ends; CLI pause/resume | Pass after fixes | Ticket 5's 404 stays under Recent failures after the ticket ended; `ostrom pause 1` / `resume 1` were followed on the same session |
-| 4. Budget warning, pause, extension; stall item | Pass after fixes | Ticket 4 showed `budget warning (turns)`; ticket 6 paused with `budget reached: turns` and resumed after `ostrom extend 6`; ticket 2 showed `stuck — budget reached: idle` |
+| 4. Budget warning, pause, extension; stall item | Pass after fixes | Ticket 4 showed `budget warning (turns)`; ticket 6 paused with `budget reached: turns`, resumed after `ostrom extend 6` and merged unattended; ticket 2 showed `stuck — budget reached: idle` |
 | 5. Watchdog failure, recovery, restart, stale snapshot | Pass | Failure text shown; after restart health was all null, then `last read ok`; a stopped daemon turned the page stale and it recovered |
 | 6. Bridge security | Pass | See below |
 
@@ -95,7 +95,9 @@ Run 4b, revision `5d2e867`, `OSTROM_BUDGET_TURNS=2`: issue
 One review comment started turn 2. That turn finished, and at 15:39:16 the ticket paused with
 `budget reached: turns`, then ran the allowed push-your-work turn. `ostrom extend 6 --time 30
 --turns 3` at 15:39:36 reopened it (turns 3/5), and the next refresh showed it open with no pause
-item.
+item. PR #41 then merged unattended at 15:53:35 (`merge_sha=f3559c92…`, `merged_by_id=315274524`,
+`origin=ostrom`, `attempt_id=2`), and ticket 6 ended: the first live resume-to-merge after a
+pause, which the milestone-2 runs left to unit tests.
 
 ![Budget pause](e2e-m3/13-budget-paused.png)
 ![After the extension](e2e-m3/14-extended-resumed.png)
