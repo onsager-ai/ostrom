@@ -89,7 +89,7 @@ a ten-minute maximum claim window. Keys are read only to sign; keys and tokens a
 or saved. Authentication errors omit API bodies and credential values.
 
 Workers inherit temporary executable helpers on PATH and Git's process-scoped credential settings.
-Every `gh` invocation and every Git HTTPS credential request mints a fresh installation token, so
+Every wrapped `gh` invocation and every Git HTTPS credential request mints a fresh installation token, so
 turns longer than an hour keep working. The configured repository's common SSH URLs are rewritten
 to HTTPS in that process environment. Git credential requests are restricted to that repository;
 ambient Git helpers are cleared. No token is written to the helper files. Worker commits inherit
