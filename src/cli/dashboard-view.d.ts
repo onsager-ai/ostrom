@@ -11,6 +11,8 @@ export function attentionItems(
   tickets: { id: number; state: string; pauseCause: string | null; budgetWarning: string | null }[],
 ): AttentionItem[];
 
+export function policyLabel(policy: string): string;
+
 export function ageLabel(timestamp: string | null | undefined, now?: number): string;
 
 export function githubUrl(value: string): string | null;

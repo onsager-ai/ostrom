@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { ageLabel, attentionItems, createRefresh, githubUrl } from "./dashboard-view.js";
+import { ageLabel, attentionItems, createRefresh, githubUrl, policyLabel } from "./dashboard-view.js";
+
+test("merge policy is shown as words, not stored JSON", () => {
+  assert.equal(policyLabel('{"strategy":"approvals","approvals":1,"approvers":["tikazyq"]}'), "approvals: 1 from tikazyq");
+  assert.equal(policyLabel('{"strategy":"unattended"}'), "unattended");
+  assert.equal(policyLabel("not json"), "not json");
+});
 
 test("attention list includes stated operator causes and unavailable temperature", () => {
   const rows = attentionItems({ stuckTickets: [{ ticketId: 3, cause: "no progress", detectedAt: "now" }], watchdog: { lastSuccess: false, error: "read failed" }, machine: { temperature: null } }, [{ id: 4, state: "paused", pauseCause: "budget exhausted", budgetWarning: "tokens" }]);

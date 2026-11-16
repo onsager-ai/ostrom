@@ -85,7 +85,7 @@ async function publish(store: Store, workers: Workers, stall: Stall): Promise<vo
   const assignment = store.getAssignment(stall.assignmentId);
   const context = store.ticketContext(assignment.ticketId);
   store.publishStall(stall.id);
-  if (store.getTicket(assignment.ticketId).state === "open") store.pauseTicket(assignment.ticketId);
+  if (store.getTicket(assignment.ticketId).state === "open") store.pauseTicket(assignment.ticketId, "stuck turn reported by the Watchdog");
   workers.cancel(assignment.id);
   workers.deliver(
     assignment.id,

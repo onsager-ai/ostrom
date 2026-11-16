@@ -1,7 +1,8 @@
 // The daemon's local operator API. It is deliberately Unix-socket-only: Ostrom has no network
 // listener and the CLI/dashboard are clients on the same machine.
 
-import { chmod, mkdir, readFile, rm } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { chmod, mkdir, rm } from "node:fs/promises";
 import { availableParallelism } from "node:os";
 import { createServer, type Server } from "node:http";
 import { dirname, join } from "node:path";
@@ -89,14 +90,15 @@ async function json(request: import("node:http").IncomingMessage): Promise<{ tim
   return value as { timeMinutes?: number; turns?: number; tokens?: number };
 }
 
-async function latestTemperature(): Promise<number | null> {
-  try {
-    const log = await readFile("/home/marvin/.cache/thermal-watch/temps.log", "utf8");
-    const readings = [...log.matchAll(/pkg=(\d+(?:\.\d+)?)C/g)];
-    return readings.length === 0 ? null : Number(readings.at(-1)![1]);
-  } catch {
-    return null;
-  }
+// The operator's `thermal now` prints e.g. "30C sensor=/sys/...". It exits non-zero when the host
+// has no supported sensor or no `thermal` command, which the dashboard shows as unavailable.
+function latestTemperature(): Promise<number | null> {
+  return new Promise((resolve) => {
+    execFile("thermal", ["now"], { timeout: 2_000 }, (error, stdout) => {
+      const reading = error === null ? /^(\d+(?:\.\d+)?)C\b/.exec(stdout.trim()) : null;
+      resolve(reading === null ? null : Number(reading[1]));
+    });
+  });
 }
 
 function reply(response: import("node:http").ServerResponse, status: number, body: unknown): void {

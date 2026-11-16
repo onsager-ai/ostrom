@@ -515,7 +515,7 @@ for (const reason of ["closed issue", "failed prerequisite", "ambiguous branch o
   if (reason === "closed issue") f.remote.issueState = "closed";
   if (reason === "failed prerequisite") options.allowSend = false;
   if (reason === "ambiguous branch ownership") f.remote.openPulls = [2, 3];
-  if (reason === "local pause at final refresh") options.refreshBeforeSend = async () => { f.store.pauseTicket(f.ticket); };
+  if (reason === "local pause at final refresh") options.refreshBeforeSend = async () => { f.store.pauseTicket(f.ticket, "test pause"); };
   if (reason === "activity at final refresh") options.refreshBeforeSend = async () => { f.remote.comments.push({ id: 4, body: "wait", updated_at: f.now().toISOString() }); };
   await mergePass(options);
   assert.equal(f.puts.length, 0);
@@ -529,7 +529,7 @@ test("pause accepted while final reviewer permission read is pending prevents PU
   const options = f.options();
   const gh = options.gh;
   options.gh = async (args) => {
-    if (args.some((arg) => arg.endsWith("/permission")) && ++permissionReads === 2) f.store.pauseTicket(f.ticket);
+    if (args.some((arg) => arg.endsWith("/permission")) && ++permissionReads === 2) f.store.pauseTicket(f.ticket, "test pause");
     return gh(args);
   };
   await mergePass(options);

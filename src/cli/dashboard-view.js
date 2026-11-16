@@ -11,6 +11,15 @@ export function attentionItems(status, tickets) {
   return items;
 }
 
+/** Merge policy is stored as JSON, e.g. {"strategy":"approvals","approvals":1,"approvers":["a"]}. */
+export function policyLabel(policy) {
+  try {
+    const p = JSON.parse(policy);
+    if (p.strategy !== "approvals") return String(p.strategy);
+    return `approvals: ${p.approvals} from ${p.approvers?.length ? p.approvers.join(", ") : "any writer"}`;
+  } catch { return policy; }
+}
+
 export function ageLabel(timestamp, now = Date.now()) {
   if (timestamp == null) return "none";
   const age = Math.max(0, Math.floor((now - Date.parse(timestamp)) / 1000));
