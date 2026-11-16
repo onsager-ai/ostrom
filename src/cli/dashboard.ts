@@ -36,7 +36,7 @@ export async function startDashboard(env: Record<string, string | undefined> = p
     const authorization = incoming.headers.authorization ?? "";
     const supplied = /^Bearer ([0-9a-f]{64})$/.exec(authorization)?.[1] ?? "";
     if (supplied.length !== token.length || !timingSafeEqual(Buffer.from(supplied), Buffer.from(token))) return send(outgoing, 401, "Unauthorized");
-    const upstream = request({ socketPath, path: pathname, method: "GET", headers: { host: "ostromd", authorization: `Bearer ${token}` } }, (response) => {
+    const upstream = request({ socketPath, path: pathname, method: "GET", headers: { host: "ostromd" } }, (response) => {
       outgoing.writeHead(response.statusCode ?? 502, { "content-type": response.headers["content-type"] ?? "application/json" });
       response.pipe(outgoing);
     });
