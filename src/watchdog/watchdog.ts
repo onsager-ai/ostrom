@@ -9,7 +9,7 @@
 // output. A Worker's session is matched to its assignment by its git branch
 // (`ostrom/ticket-<ticket>-<assignment>-<uuid>` for new work). A failed read is reported and never clears an episode.
 
-import { budgetReached } from "../budget/budgets.ts";
+import { watchdogBudgetReached } from "../budget/budgets.ts";
 import type { ProcessRunner } from "../process.ts";
 import type { Store } from "../store/store.ts";
 
@@ -124,7 +124,7 @@ export async function watchdog(options: WatchdogOptions): Promise<WatchdogPass> 
       newEpisode: false,
       clearedStallId: null,
     };
-    const budget = budgetReached(store.ticketBudget(assignment.ticketId), now());
+    const budget = watchdogBudgetReached(store.ticketBudget(assignment.ticketId), now());
     const repeatedError = assignment.consecutiveErrors >= 2;
     if (semonReason !== null || budget !== null || repeatedError) {
       const question = matched?.openQuestion ?? null;

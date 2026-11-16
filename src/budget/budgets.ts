@@ -41,6 +41,12 @@ export function budgetReached(budget: TicketBudget, now: Date): BudgetLimit | nu
   return BUDGET_LIMITS.find((limit) => budgetLimit(budget, limit) > 0 && budgetUsage(budget, limit, now) >= budgetLimit(budget, limit)) ?? null;
 }
 
+/** The limits the Watchdog enforces while a turn runs. Turns, tokens and escalations are counted
+ * when a turn starts or ends, so they pause the ticket after the turn completes instead. */
+export function watchdogBudgetReached(budget: TicketBudget, now: Date): "time" | "idle" | null {
+  return (["time", "idle"] as const).find((limit) => budgetUsage(budget, limit, now) >= budgetLimit(budget, limit)) ?? null;
+}
+
 /** Limits that can change only when a Worker has completed a native turn. Time and idle are Watchdog signals. */
 export function turnBudgetReached(budget: TicketBudget, now: Date): BudgetLimit | null {
   return (["turns", "tokens", "escalations"] as const).find(
