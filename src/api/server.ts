@@ -46,6 +46,12 @@ export function localApi(store: Store, options: LocalApiOptions): LocalApi {
         } });
       }
       if (request.method === "GET" && url.pathname === "/v1/tickets") return reply(response, 200, store.operatorTickets());
+      if (request.method === "GET" && url.pathname === "/v1/intake") {
+        const raw = url.searchParams.get("limit");
+        const limit = raw === null ? 50 : Number(raw);
+        if (!Number.isInteger(limit) || limit < 1 || limit > 200) return reply(response, 400, { error: "limit must be a whole number from 1 to 200" });
+        return reply(response, 200, store.operatorIntake(limit));
+      }
       const ticket = /^\/v1\/tickets\/([1-9]\d*)$/.exec(url.pathname);
       if (request.method === "GET" && ticket !== null) return reply(response, 200, store.operatorTicket(Number(ticket[1])));
       if (request.method === "GET" && url.pathname === "/v1/preview") return reply(response, 200, { markdown: await options.control.preview() });

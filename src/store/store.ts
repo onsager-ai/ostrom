@@ -155,6 +155,21 @@ export interface OperatorTicket extends Ticket {
   budget: TicketBudget;
 }
 
+export type IntakeReason = "missing @ostrom mention" | "unauthorized author";
+export interface IntakeReceipt {
+  sourceId: number;
+  sourceEventId: string;
+  url: string;
+  observedAt: string;
+  reason: IntakeReason;
+}
+export interface OperatorIntakeItem {
+  url: string;
+  observedAt: string;
+  disposition: "accept" | "ignore" | "stop" | "awaiting decision" | "excluded";
+  reason: string | null;
+}
+
 export interface OperatorTicketDetail extends OperatorTicket {
   context: TicketContext;
   triggers: Trigger[];
@@ -359,6 +374,36 @@ export class Store {
   advanceCursor(sourceId: number, cursor: string): void {
     const { changes } = this.#run("UPDATE source SET cursor = ? WHERE id = ?", cursor, sourceId);
     if (Number(changes) !== 1) throw new Error(`no source ${sourceId}`);
+  }
+
+  /** Records an excluded newly opened issue once, preserving its first observation time. */
+  recordIntakeReceipt(receipt: Omit<IntakeReceipt, "observedAt"> & { observedAt?: string }): void {
+    this.#run(
+      `INSERT INTO intake_receipt (source_id, source_event_id, url, observed_at, reason)
+       VALUES (?, ?, ?, ?, ?) ON CONFLICT (source_id, source_event_id) DO NOTHING`,
+      receipt.sourceId, receipt.sourceEventId, receipt.url, receipt.observedAt ?? this.#stamp(), receipt.reason,
+    );
+  }
+
+  /** Recent triggers with their latest Router decision, plus excluded event receipts. */
+  operatorIntake(limit = 50): OperatorIntakeItem[] {
+    const triggers = this.#all(
+      `SELECT trigger.url, trigger.received_at,
+              (SELECT decision.verdict FROM decision JOIN decision_trigger ON decision_trigger.decision_id = decision.id
+               WHERE decision_trigger.trigger_id = trigger.id ORDER BY decision.id DESC LIMIT 1) AS verdict,
+              (SELECT decision.reason FROM decision JOIN decision_trigger ON decision_trigger.decision_id = decision.id
+               WHERE decision_trigger.trigger_id = trigger.id ORDER BY decision.id DESC LIMIT 1) AS reason
+       FROM "trigger" AS trigger`,
+    ).map((row): OperatorIntakeItem => ({
+      url: row["url"] as string, observedAt: row["received_at"] as string,
+      disposition: row["verdict"] as OperatorIntakeItem["disposition"] ?? "awaiting decision",
+      reason: row["reason"] as string | null,
+    }));
+    const receipts = this.#all("SELECT url, observed_at, reason FROM intake_receipt").map((row): OperatorIntakeItem => ({
+      url: row["url"] as string, observedAt: row["observed_at"] as string,
+      disposition: "excluded", reason: row["reason"] as string,
+    }));
+    return [...triggers, ...receipts].sort((a, b) => b.observedAt.localeCompare(a.observedAt)).slice(0, limit);
   }
 
   findThread(sourceId: number, number: number): Thread | null {
