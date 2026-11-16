@@ -18,6 +18,14 @@ systemctl --user enable --now ostromd
 The daemon runs `ostromd run --interval 60`, restarts after failures, and writes
 logs to the user journal. Inspect it with `journalctl --user -u ostromd`.
 
+Set `OSTROM_CODEX_PROVIDER` to override the operator's Codex `model_provider` for both new
+sessions and resumed turns. Ostrom passes it as the pinned SDK's `config.model_provider`
+(`codex exec --config model_provider=…`); when unset, Codex uses its own configuration.
+`OSTROM_CODEX_PROVIDER=openai` with no API key uses the ChatGPT login. Keep the provider stable
+for a Worker's lifetime: Codex refuses to resume a session created under another provider.
+Changing this variable does not migrate existing sessions. CI probes start and resume config
+resolution offline against a different file default, before any session or model call.
+
 The operator uses `ostrom status`, `tickets`, `show`, `pause`, `resume`, `stop`,
 `extend`, and `preview`. They use the daemon's Unix socket at
 `$XDG_RUNTIME_DIR/ostrom/ostromd.sock`, or
