@@ -1,4 +1,4 @@
-import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
@@ -16,6 +16,9 @@ export async function workerAuth(app: GitHubApp, env: NodeJS.ProcessEnv) {
   const identity = await app.identity();
   const directory = await mkdtemp(join(tmpdir(), "ostrom-app-"));
   try {
+    // A shell may reorder PATH and bypass our wrapper. Never let real gh use the operator's login.
+    const configDirectory = join(directory, "gh-config");
+    await mkdir(configDirectory, { mode: 0o700 });
     const helper = fileURLToPath(new URL("./worker-credential.ts", import.meta.url));
     for (const [name, mode] of [["gh", "gh"], ["git-credential-ostrom", "git"]] as const) {
       await writeFile(join(directory, name), `#!${process.execPath}\nimport { run } from ${JSON.stringify(new URL("./worker-credential.ts", import.meta.url).href)};\nawait run(${JSON.stringify(mode)}, ${JSON.stringify(executable)});\n`, { mode: 0o700 });
@@ -27,7 +30,7 @@ export async function workerAuth(app: GitHubApp, env: NodeJS.ProcessEnv) {
     const settings = [["credential.helper", ""], ["credential.https://github.com.helper", `!${quote(process.execPath)} ${quote(helper)} git`], ["credential.useHttpPath", "true"],
       [`url.https://github.com/${repo}.insteadOf`, `git@github.com:${repo}`],
       [`url.https://github.com/${repo}.insteadOf`, `ssh://git@github.com/${repo}`]];
-    const result: NodeJS.ProcessEnv = { ...env, PATH: `${directory}${delimiter}${env["PATH"] ?? ""}` };
+    const result: NodeJS.ProcessEnv = { ...env, GH_CONFIG_DIR: configDirectory, PATH: `${directory}${delimiter}${env["PATH"] ?? ""}` };
     delete result["GH_TOKEN"];
     delete result["GITHUB_TOKEN"];
     settings.forEach(([key, value], index) => {
