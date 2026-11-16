@@ -44,7 +44,7 @@ test("dispatch makes the worktree, starts the session with the brief and stores 
   assert.deepEqual(dispatched, { assignmentId: 1, sessionId: "sess-1", branch: store.getAssignment(1).branch });
   const worktree = store.getAssignment(1).worktree!;
   assert.match(worktree, new RegExp(`^/wt/ticket-${ticketId}-1-[a-f0-9-]{36}$`));
-  assert.equal(dispatched.branch, `ostrom/ticket-${ticketId}-1-${worktree.split("-").at(-1)}`);
+  assert.equal(dispatched.branch, `ostrom/ticket-${ticketId}-1-${worktree.slice(`/wt/ticket-${ticketId}-1-`.length)}`);
   assert.deepEqual(worktrees, [["/repo", worktree, "main"]]);
   const a = store.getAssignment(1);
   assert.deepEqual(
