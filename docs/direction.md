@@ -160,14 +160,22 @@ second merged unattended after a same-session review follow-up, each ending with
 Resume-to-merge after a pause, runtime protection gates and lost merge responses have unit tests
 but no live run yet.
 
+## Milestone 3
+
+Proposed: [multi-machine Worker placement](placement.md). Keep one daemon and store on one host,
+and run native Workers on a configured second host over SSH. This addresses the thermal failures
+that forced the M2 run to move machines. M3 lifts the single-machine restriction for Workers only;
+one repository remains the scope. The dashboard and automatic placement across a fleet come later.
+
 ## Non-goals (for now)
 
 - Signed policy, gates, actor manifests, check catalogues, or verdict records.
 - A session store, a transcript viewer or a log viewer. Semon reads sessions.
 - Creating T3 Code threads, or "promote to foreground". Deferred by the operator on 2026-11-09:
   Workers are native sessions the operator can already open after `ostrom pause`.
-- More than one repository or machine, chat sources, CI-as-source, webhooks or any publicly
-  reachable listener, or a hosted service.
+- More than one repository or daemon host, automatic placement across a fleet, chat sources,
+  CI-as-source, webhooks or any publicly reachable listener, or a hosted service. M3 permits a
+  configured second machine for Workers only.
 
 ## Open questions
 
