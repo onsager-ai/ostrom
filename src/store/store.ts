@@ -402,17 +402,19 @@ export class Store {
                WHERE decision_trigger.trigger_id = trigger.id ORDER BY decision.id DESC LIMIT 1) AS verdict,
               (SELECT decision.reason FROM decision JOIN decision_trigger ON decision_trigger.decision_id = decision.id
                WHERE decision_trigger.trigger_id = trigger.id ORDER BY decision.id DESC LIMIT 1) AS reason
-       FROM "trigger" AS trigger`,
+       FROM "trigger" AS trigger
+       ORDER BY trigger.received_at DESC, trigger.url, trigger.source_event_id LIMIT ?`,
+      limit,
     ).map((row): OperatorIntakeItem => ({
       eventId: row["source_event_id"] as string, url: row["url"] as string, observedAt: row["received_at"] as string,
-      disposition: row["verdict"] as OperatorIntakeItem["disposition"] ?? "awaiting decision",
+      disposition: (row["verdict"] as OperatorIntakeItem["disposition"] | null) ?? "awaiting decision",
       reason: row["reason"] as string | null,
     }));
-    const receipts = this.#all("SELECT source_event_id, url, observed_at, reason FROM intake_receipt").map((row): OperatorIntakeItem => ({
+    const receipts = this.#all("SELECT source_event_id, url, observed_at, reason FROM intake_receipt ORDER BY observed_at DESC, url, source_event_id LIMIT ?", limit).map((row): OperatorIntakeItem => ({
       eventId: row["source_event_id"] as string, url: row["url"] as string, observedAt: row["observed_at"] as string,
       disposition: "excluded", reason: row["reason"] as string,
     }));
-    return [...triggers, ...receipts].sort((a, b) => b.observedAt.localeCompare(a.observedAt)).slice(0, limit);
+    return [...triggers, ...receipts].sort((a, b) => b.observedAt.localeCompare(a.observedAt) || a.url.localeCompare(b.url) || a.eventId.localeCompare(b.eventId)).slice(0, limit);
   }
 
   findThread(sourceId: number, number: number): Thread | null {

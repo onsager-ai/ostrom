@@ -115,9 +115,9 @@ test("only an allowlisted opened issue that asks Ostrom becomes a trigger", asyn
   assert.equal(count("trigger"), 0);
   const intake = store.operatorIntake();
   assert.equal(intake.length, 2);
-  assert.deepEqual(intake.map((item) => [item.disposition, item.reason]), [
-    ["excluded", "unauthorized author"],
-    ["excluded", "missing @ostrom mention"],
+  assert.deepEqual(intake.map((item) => [item.disposition, item.reason, item.eventId]), [
+    ["excluded", "missing @ostrom mention", "I_7:opened"],
+    ["excluded", "unauthorized author", "I_8:opened"],
   ]);
   await poll();
   assert.equal(store.operatorIntake().length, 2);

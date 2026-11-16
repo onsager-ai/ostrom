@@ -94,7 +94,9 @@ test("the local API serves status, tickets and a ticket over a 0600 Unix socket"
     assert.equal(statusBody.machine.slots.meaning, "CPU parallelism");
     const intake = await get(socketPath, "/v1/intake?limit=50");
     assert.equal(intake.status, 200);
-    assert.equal((intake.body as { disposition: string }[])[0]!.disposition, "awaiting decision");
+    const intakeItems = intake.body as { disposition: string; reason: string }[];
+    assert.equal(intakeItems[0]!.disposition, "accept");
+    assert.equal(intakeItems[0]!.reason, "requested fix");
 
     const tickets = await get(socketPath, "/v1/tickets");
     assert.equal(tickets.status, 200);

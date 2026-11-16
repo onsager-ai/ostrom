@@ -52,7 +52,7 @@ test("run resets watchdog status to unknown for each daemon lifetime", async () 
   const github = new FakeGitHub(() => new Date());
   const controller = new AbortController();
   let attempts = 0;
-  const d = deps({ OSTROM_REPO: github.repo, OSTROM_ALLOWLIST: "alice", OSTROM_DB: dbPath, OSTROM_WATCHDOG_IDLE_MIN: "20" }, github.gh, async () => {
+  const d = deps({ OSTROM_REPO: github.repo, OSTROM_ALLOWLIST: "alice", OSTROM_DB: dbPath, OSTROM_STALL_MINUTES: "20" }, github.gh, async () => {
     attempts++;
     throw new Error("semon unavailable");
   });
