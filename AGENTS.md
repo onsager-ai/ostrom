@@ -13,7 +13,7 @@ Claude and Codex sessions, follow-ups routed by thread subscription, and a Watch
    threads. Ostrom stores its own domain records (triggers, threads, decisions, tickets,
    assignments, subscriptions, outbox) and pointers to the rest.
 3. **Deterministic first, then the model.** Filtering, dedup, fan-out and retries are code. Only
-   accept/ignore judgements and reply wording go to a model.
+   accept/ignore, model and effort judgements, and reply wording go to a model.
 4. **A refusal is not a success.** A command that did not do its job exits non-zero.
 5. **Pin what you cross.** The SDK versions and the shapes Ostrom reads from them are pinned and
    covered by agreement tests, not assumed.
