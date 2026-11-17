@@ -5,6 +5,11 @@ import { budgetWarning } from "../budget/budgets.ts";
 import type { Store } from "../store/store.ts";
 import { renderStatusCard, type StatusCardState } from "./status-card.ts";
 
+function shortHeadInReason(reason: string, headSha: string): string {
+  const match = /^Approved on (.+); the head is now [0-9a-f]+\. Approve again to merge\.$/.exec(reason);
+  return match === null ? reason : `Approved on ${match[1]}; the head is now ${headSha.slice(0, 7)}. Approve again to merge.`;
+}
+
 export function queueStatusCard(store: Store, ticketId: number, now = new Date()): void {
   const context = store.ticketContext(ticketId);
   const ticket = context.ticket;
@@ -33,7 +38,7 @@ export function queueStatusCard(store: Store, ticketId: number, now = new Date()
       ...(pullRequest === null ? {} : { pullRequest: pullRequest.url }),
       ...(warning === null ? {} : { budgetWarning: warning }),
       ...(ticket.pauseCause === null ? {} : { pauseCause: ticket.pauseCause }),
-      ...(candidate === null || ticket.state === "ended" ? {} : { mergeStatus: `policy ${policy!.strategy}; head ${candidate.headSha}; ${candidate.blockingReason === "quiet period has not elapsed" && candidate.quietDeadline !== null ? `earliest merge ${candidate.quietDeadline}` : candidate.blockingReason ?? "waiting for ready reply"}` }),
+      ...(candidate === null || ticket.state === "ended" ? {} : { mergeStatus: `policy ${policy!.strategy}; head ${candidate.headSha}; ${candidate.blockingReason === "quiet period has not elapsed" && candidate.quietDeadline !== null ? `earliest merge ${candidate.quietDeadline}` : candidate.blockingReason === null ? "waiting for ready reply" : shortHeadInReason(candidate.blockingReason, candidate.headSha)}` }),
       harness: assignment.harness,
       model: assignment.model,
       lastActivityAt,

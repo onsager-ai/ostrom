@@ -203,7 +203,7 @@ async function approvalIdentities(options: MergePassOptions, evidence: MergeEvid
   const identities = new Map<string, ApprovalIdentity>();
   for (const review of evidence.reviews) {
     const author = review.author;
-    if (author === null || author.id === null || author.login === null || identities.has(author.id) || review.state !== "APPROVED" || review.commitOid !== evidence.pr.head.sha) continue;
+    if (author === null || author.id === null || author.login === null || identities.has(author.id) || review.state !== "APPROVED" || review.commitOid === null) continue;
     const permission = object(await ghMergeGet(options.gh, `repos/${options.repo}/collaborators/${encodeURIComponent(author.login)}/permission`));
     const role = permission["permission"] ?? permission["role_name"];
     identities.set(author.id, { id: author.id, login: author.login,

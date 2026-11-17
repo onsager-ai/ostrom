@@ -143,6 +143,18 @@ test("newer failed workflow cannot be masked by old success and suite provenance
   }
 });
 
+test("approval policy distinguishes stale, current, and absent approvals", () => {
+  const value = input();
+  value.policy = { strategy: "approvals", approvals: 1, approvers: [] };
+  value.approvals = { authorLogin: "author", identities: new Map([["U_alice", { id: "U_alice", login: "alice", permission: "write", bot: false }]]) };
+  value.evidence.reviews = [review("old", "APPROVED", "0123456789abcdef")];
+  assert.deepEqual(mergeEligibility(value), { eligible: false, reason: "Approved on 0123456; the head is now head. Approve again to merge." });
+  value.evidence.reviews = [review("current", "APPROVED")];
+  assert.deepEqual(mergeEligibility(value), { eligible: true });
+  value.evidence.reviews = [];
+  assert.deepEqual(mergeEligibility(value), { eligible: false, reason: "policy approvals are not satisfied" });
+});
+
 test("approval and human policies are blockers", () => {
   const approvals = input();
   approvals.policy = { strategy: "approvals", approvals: 1, approvers: [] };

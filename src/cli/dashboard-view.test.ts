@@ -12,8 +12,8 @@ function ticket(overrides: Partial<OperatorTicket> = {}): OperatorTicket {
     ...overrides,
   } as OperatorTicket;
 }
-function blocked(reason: string, quietDeadline: string | null = null) {
-  return ticket({ mergeCandidate: { policy: "{}", blockingReason: reason, quietDeadline } });
+function blocked(reason: string, quietDeadline: string | null = null, policy = "{}") {
+  return ticket({ mergeCandidate: { policy, blockingReason: reason, quietDeadline } });
 }
 
 test("phase priority is paused, failed, current turn, no PR, then merge reason", () => {
@@ -34,8 +34,11 @@ test("phase priority is paused, failed, current turn, no PR, then merge reason",
 test("stored merge reasons map to actionable phases, including unknown reasons", () => {
   assert.equal(ticketPhase(blocked("policy approvals are not satisfied")).label, "Waiting for approval");
   assert.match(ticketPhase(blocked("policy approvals are not satisfied")).detail, /Only submitted reviews count/);
+  const stale = "Approved on 0e65021; the head is now 53975b6. Approve again to merge.";
+  assert.deepEqual(ticketPhase(blocked(stale)), { key: "approval", label: "Approval is out of date", tone: "amber", detail: stale });
   const deadline = "2026-11-16T15:40:00Z";
   assert.equal(ticketPhase(blocked("quiet period has not elapsed", deadline)).label, `Approved, merges after ${localTime(deadline)}`);
+  assert.equal(ticketPhase(blocked("quiet period has not elapsed", deadline, '{"strategy":"approvals"}')).label, `Waiting for approval, merges after ${localTime(deadline)}`);
   assert.equal(ticketPhase(blocked("quiet period has not elapsed")).label, "Approved, waiting for quiet period");
   assert.equal(ticketPhase(blocked("pull request is not clean at the captured head and base")).label, "Waiting for CI or a clean merge");
   assert.equal(ticketPhase(blocked("Worker is not idle")).label, "Worker revising");
