@@ -218,18 +218,19 @@ test("current-head approval by a write-permission person satisfies approval poli
   done(f, "ostrom");
 });
 
-for (const [name, change] of [
-  ["read-only reviewer", (f: Fixture) => { f.remote.permission = "read"; }],
-  ["bot reviewer", (f: Fixture) => { f.remote.reviews = [review({ type: "Bot" })]; }],
-  ["PR author", (f: Fixture) => { f.remote.reviews = [review({ login: "author" })]; }],
-  ["old-head approval", (f: Fixture) => { f.remote.reviews = [review({ head: "old" })]; }],
+for (const [name, change, reason] of [
+  ["read-only reviewer", (f: Fixture) => { f.remote.permission = "read"; }, undefined],
+  ["bot reviewer", (f: Fixture) => { f.remote.reviews = [review({ type: "Bot" })]; }, undefined],
+  ["PR author", (f: Fixture) => { f.remote.reviews = [review({ login: "author" })]; }, undefined],
+  ["old-head approval", (f: Fixture) => { f.remote.reviews = [review({ head: "old" })]; },
+    "Approved on old; the head is now head. Approve again to merge."],
 ] as const) test(`${name} does not satisfy approval policy`, async () => {
   const f = fixture({ strategy: "approvals", approvals: 1, approvers: [] });
   change(f);
   await ready(f);
   await mergePass(f.options());
   assert.equal(f.puts.length, 0);
-  assert.equal(f.store.mergeCandidateForAssignment(f.assignment)!.blockingReason, "policy approvals are not satisfied");
+  assert.equal(f.store.mergeCandidateForAssignment(f.assignment)!.blockingReason, reason ?? "policy approvals are not satisfied");
   unmerged(f);
 });
 
