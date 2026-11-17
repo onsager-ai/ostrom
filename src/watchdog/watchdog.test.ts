@@ -123,8 +123,10 @@ test("time budget excludes time waiting for review even when Semon reports a que
   const a = s.startWorker(1);
   s.store.setTicketBudget(a.ticketId, { timeMinutes: 60, idleMinutes: 30, turns: 20, tokens: 1_000_000, escalations: 0 });
   s.setSemon([semonStall(a.branch)]);
+  s.store.startWorkerTurn(a.assignmentId, "dispatch");
+  s.advance(61 * 60_000);
   const paused: number[] = [];
-  const pass = await watchdog({ ...s.options(), now: () => new Date(NOW.getTime() + 61 * 60_000), onBudgetPause: (id) => { paused.push(id); } });
+  const pass = await watchdog({ ...s.options(), onBudgetPause: (id) => { paused.push(id); } });
   assert.equal(pass.checked[0]!.stallId, null);
   assert.equal(s.store.getTicket(a.ticketId).state, "open");
   assert.equal(s.store.getTicket(a.ticketId).pauseCause, null);
@@ -138,10 +140,11 @@ test("time budget accumulates a completed turn and pauses after a review", async
   const a = s.startWorker(1);
   s.store.setTicketBudget(a.ticketId, { timeMinutes: 60, idleMinutes: 30, turns: 20, tokens: 1_000_000, escalations: 0 });
   s.store.beginTurn(a.assignmentId);
+  s.store.startWorkerTurn(a.assignmentId, "dispatch");
   s.advance(60 * 60_000);
   s.store.finishWorkerTurn(a.assignmentId, "completed", null);
   s.store.endTurn(a.assignmentId, null);
-  const reached = await watchdog({ ...s.options(), now: () => new Date(NOW.getTime() + 61 * 60_000) });
+  const reached = await watchdog(s.options());
   assert.equal(reached.checked[0]!.stallId, null);
   assert.equal(s.store.getTicket(a.ticketId).state, "paused");
   assert.equal(s.store.getTicket(a.ticketId).pauseCause, "budget reached: time");
