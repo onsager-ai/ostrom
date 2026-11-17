@@ -526,25 +526,32 @@ test("turn records retain requests, observations and failures without copying tr
 });
 
 test("a ticket budget persists limits and sums every assignment's turn usage", () => {
-  const { store, accept } = fixture();
+  const { store, accept, advance } = fixture();
   const ticketId = accept();
   store.setTicketBudget(ticketId, { timeMinutes: 90, idleMinutes: 15, turns: 4, tokens: 500, escalations: 1 });
   const first = store.createAssignment(ticketId);
   store.configureNativeAssignment(first, { harness: "codex", model: "m", worktree: "/w1", branch: "b1", machine: "h" });
   store.startNativeAssignment(first, "s1");
   store.beginTurn(first);
+  store.startWorkerTurn(first, "dispatch");
+  advance(20 * 60_000);
+  store.finishWorkerTurn(first, "completed", { inputTokens: 10, cachedInputTokens: 20, outputTokens: 30 });
   store.endTurn(first, { inputTokens: 10, cachedInputTokens: 20, outputTokens: 30 });
   store.endAssignment(first);
   const second = store.createAssignment(ticketId);
   store.configureNativeAssignment(second, { harness: "codex", model: "m", worktree: "/w2", branch: "b2", machine: "h" });
   store.startNativeAssignment(second, "s2");
   store.beginTurn(second);
+  store.startWorkerTurn(second, "follow_up");
+  advance(40 * 60_000);
+  store.finishWorkerTurn(second, "completed", { inputTokens: 1, cachedInputTokens: 2, outputTokens: 3 });
   store.endTurn(second, { inputTokens: 1, cachedInputTokens: 2, outputTokens: 3 });
   const budget = store.ticketBudget(ticketId);
   assert.deepEqual(
     [budget.ticketId, budget.timeMinutes, budget.idleMinutes, budget.turnLimit, budget.tokenLimit, budget.escalationLimit,
-      budget.escalations, budget.turns, budget.inputTokens, budget.cachedInputTokens, budget.outputTokens, budget.turnStartedAt],
-    [ticketId, 90, 15, 4, 500, 1, 0, 2, 11, 22, 33, null],
+      budget.escalations, budget.turns, budget.inputTokens, budget.cachedInputTokens, budget.outputTokens,
+      budget.completedTurnSeconds, budget.turnStartedAt],
+    [ticketId, 90, 15, 4, 500, 1, 0, 2, 11, 22, 33, 60 * 60, null],
   );
   store.pauseTicketForBudget(ticketId, "tokens");
   assert.equal(store.getTicket(ticketId).pauseCause, "budget reached: tokens");

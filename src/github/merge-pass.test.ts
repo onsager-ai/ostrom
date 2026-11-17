@@ -224,7 +224,14 @@ test("conflict recovery respects ticket state, durable idle work, budgets, stall
     ended: (f) => f.store.endTicket(f.ticket),
     busy: (f) => { f.store.beginTurn(f.assignment); },
     queued: (f) => { f.store.enqueueTurn({ assignmentId: f.assignment, deliveryKey: "other", kind: "follow_up", prompt: "work" }); },
-    budget: (f) => { f.store.setTicketBudget(f.ticket, { timeMinutes: 1, idleMinutes: 30, turns: 20, tokens: 1000, escalations: 0 }); f.advance(2 * MINUTE); },
+    budget: (f) => {
+      f.store.setTicketBudget(f.ticket, { timeMinutes: 1, idleMinutes: 30, turns: 20, tokens: 1000, escalations: 0 });
+      f.store.beginTurn(f.assignment);
+      f.store.startWorkerTurn(f.assignment, "dispatch");
+      f.advance(2 * MINUTE);
+      f.store.finishWorkerTurn(f.assignment, "completed", null);
+      f.store.endTurn(f.assignment, null);
+    },
     stalled: (f) => { f.store.recordStall({ assignmentId: f.assignment, semonReason: "idle", detail: null }); },
     closedIssue: (f) => { f.remote.issueState = "closed"; },
     ambiguousOwnership: (f) => { f.remote.openPulls = [2, 3]; },
@@ -251,7 +258,11 @@ test("review wait reaches time budget, extension resumes, and merge needs no hum
   const f = fixture();
   f.store.setTicketBudget(f.ticket, { timeMinutes: 60, idleMinutes: 30, turns: 20, tokens: 1_000_000, escalations: 0 });
   await ready(f);
-  f.advance(50 * MINUTE);
+  f.store.beginTurn(f.assignment);
+  f.store.startWorkerTurn(f.assignment, "follow_up");
+  f.advance(60 * MINUTE);
+  f.store.finishWorkerTurn(f.assignment, "completed", null);
+  f.store.endTurn(f.assignment, null);
   await watchdog({ store: f.store, idleMinutes: 20, now: f.now,
     semon: async () => ({ code: 0, stdout: JSON.stringify({ idle_minutes: 20, stalls: [] }), stderr: "" }) });
   assert.equal(f.store.getTicket(f.ticket).pauseCause, "budget reached: time");
@@ -262,6 +273,8 @@ test("review wait reaches time budget, extension resumes, and merge needs no hum
   assert.equal(f.puts.length, 0);
   f.store.extendTicketBudget(f.ticket, { timeMinutes: 60 });
   assert.equal(f.store.getTicket(f.ticket).state, "open");
+  // The follow-up turn reset the quiet window; waiting it out spends no time budget.
+  f.advance(11 * MINUTE);
   const result = await mergePass(f.options());
   assert.deepEqual(result.failed, []);
   assert.equal(f.puts.length, 1);

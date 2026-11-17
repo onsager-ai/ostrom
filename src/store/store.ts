@@ -147,6 +147,8 @@ export interface TicketBudget {
   inputTokens: number;
   cachedInputTokens: number;
   outputTokens: number;
+  /** Finished native-turn time accumulated for this ticket, in seconds. */
+  completedTurnSeconds: number;
   /** When the ticket's running turn started; null between turns. */
   turnStartedAt: string | null;
 }
@@ -830,6 +832,8 @@ export class Store {
               COALESCE(SUM(assignment.input_tokens), 0) AS input_tokens,
               COALESCE(SUM(assignment.cached_input_tokens), 0) AS cached_input_tokens,
               COALESCE(SUM(assignment.output_tokens), 0) AS output_tokens,
+              COALESCE((SELECT SUM(ROUND((julianday(ended_at) - julianday(started_at)) * 86400))
+                        FROM turn WHERE turn.ticket_id = ticket.id AND ended_at IS NOT NULL), 0) AS completed_turn_seconds,
               MAX(assignment.turn_started_at) AS turn_started_at
          FROM ticket LEFT JOIN assignment ON assignment.ticket_id = ticket.id WHERE ticket.id = ? GROUP BY ticket.id`,
       ticketId,
@@ -842,6 +846,7 @@ export class Store {
       escalationLimit: row["budget_escalations"] as number, escalations: row["escalations"] as number,
       turns: row["turns"] as number, inputTokens: row["input_tokens"] as number,
       cachedInputTokens: row["cached_input_tokens"] as number, outputTokens: row["output_tokens"] as number,
+      completedTurnSeconds: row["completed_turn_seconds"] as number,
       turnStartedAt: row["turn_started_at"] as string | null,
     };
   }
