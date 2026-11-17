@@ -54,8 +54,23 @@ subset of its discovered efforts and cost must be a positive relative weight. Im
 objective and all selections atomically after validating them against the local cached catalogs.
 An unavailable model cannot be added or edited, but an existing retired selection can be removed.
 Listing and export work from `OSTROM_DB` while the daemon is down; changes and refresh require it.
-These selections are stored for the next selection phase: they do not yet change the model or effort
-used for a turn. Outcome history is also a later phase.
+The Router chooses a model at acceptance using the allowed list, objective, cost and notes. Each
+Worker turn gets a separate small Router call choosing an allowed effort from its prompt and recent
+history. Invalid model answers fall back to the cheapest allowed model without approval; invalid
+effort answers use medium (or an allowed default). Decisions and inputs appear in `ostrom show
+<ticket> --json`; the status card and dashboard show the current turn and reasons. With no selected
+models, `OSTROM_WORKER_MODEL` remains the session model and effort is still chosen per turn.
+
+`ostrom model <ticket> <harness/model>` and `ostrom effort <ticket> <level>` set durable overrides
+through the daemon. On the issue or PR, use `@ostrom use <harness/model>` and `@ostrom effort
+<level>`; issue authors and collaborators with triage or higher may do this. Effort applies at the
+next turn. A session keeps its model: a model override after session start applies only to the next
+session. Overrides persist until replaced and must remain in the allowed list.
+
+The existing merge approval mechanism does not cover starting a model. An automatic choice that
+requires approval is recorded and falls back to the cheapest allowed model without approval. If
+none exists, dispatch waits. An explicit model override approves that model for this ticket. This
+approval does not grant permission to merge. Outcome history and escalation are later phases.
 
 Developer-only one-shot passes remain available as `ostromd dev <pass>`:
 `poll`, `send`, `dispatch <ticket>`, `observe`, `commands`, `route`, `watchdog`,

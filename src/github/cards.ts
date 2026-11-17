@@ -25,6 +25,8 @@ export function queueStatusCard(store: Store, ticketId: number, now = new Date()
   const warning = budgetWarning(budget, now);
   const pullRequest = store.ticketPullRequest(ticketId);
   const lastActivityAt = new Date(assignment.lastActivityAt ?? assignment.outcomeAt ?? assignment.startedAt ?? assignment.createdAt);
+  const turn = store.ticketTurns(ticketId).at(-1);
+  const modelChoice = store.selections.history(ticketId).findLast((choice) => choice.kind === "model" && choice.value === `${assignment.harness}/${assignment.model}`);
   store.enqueueStatusCard(
     context.thread.id,
     renderStatusCard({
@@ -36,6 +38,8 @@ export function queueStatusCard(store: Store, ticketId: number, now = new Date()
       ...(candidate === null || ticket.state === "ended" ? {} : { mergeStatus: `policy ${policy!.strategy}; head ${candidate.headSha}; ${candidate.blockingReason === "quiet period has not elapsed" && candidate.quietDeadline !== null ? `earliest merge ${candidate.quietDeadline}` : candidate.blockingReason === null ? "waiting for ready reply" : candidate.blockingReason}` }),
       harness: assignment.harness,
       model: assignment.model,
+      ...(turn === undefined ? {} : { effort: turn.requestedEffort }),
+      ...(!turn?.reason && !modelChoice?.reason ? {} : { selectionReason: turn?.reason ?? modelChoice!.reason }),
       lastActivityAt,
       now,
       markerId: `card-thread-${context.thread.id}`,
