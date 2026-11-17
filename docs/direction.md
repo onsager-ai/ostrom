@@ -206,9 +206,11 @@ the Router make model and effort judgements.
    the model. Codex's SDK does not, so the existing bounded rollout reader reads the latest
    `turn_context` model and effort from the native session ID's date-partitioned JSONL. Semon's query
    summary formats model names and does not expose per-turn effort, so it is unsuitable for this
-   exact check. Each Worker turn stores requested and observed values; a model mismatch fails the
-   turn with its reason. An unavailable source records null rather than claiming verification.
-   Claude observed effort stays null because its SDK does not report it.
+   exact check. Each Worker turn stores requested and observed values. Codex retains its existing
+   check: an unverified or mismatched model ends the assignment with its reason and records the
+   turn as failed. Claude's observed model is recorded without equality enforcement because aliases
+   and gateway IDs may resolve differently; its observed effort stays null because the SDK does
+   not report it.
 3. **Bot identity: answered 2026-11-11 by the operator.** Option B: a GitHub App, identified
    by App ID, never its changeable name or slug. The daemon, CLI GitHub reads and Worker GitHub
    commands use installation tokens when configured; see [running.md](running.md#github-app-identity).

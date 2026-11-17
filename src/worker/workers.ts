@@ -441,46 +441,54 @@ export class Workers {
     const { store } = this.#deps;
     const assignment = store.getAssignment(id);
     let observed = { model: result.model, effort: null as string | null };
+    let modelProblem: string | null = null;
     if (assignment.harness === "codex" && this.#deps.codexSessions !== undefined) {
-      try { observed = rolloutContext(this.#deps.codexSessions, assignment.sessionId!); }
-      catch (error) { this.#deps.log?.(`assignment ${id}: model unverified: ${error instanceof Error ? error.message : String(error)}`); }
+      try {
+        observed = rolloutContext(this.#deps.codexSessions, assignment.sessionId!);
+        if (observed.model === null) throw new Error("rollout records no turn model");
+        if (observed.model !== assignment.model) modelProblem = `model mismatch: asked for ${assignment.model}, ran ${observed.model}`;
+      } catch (error) {
+        modelProblem = `model unverified: ${error instanceof Error ? error.message : String(error)}`;
+      }
     }
-    const mismatch = observed.model !== null && observed.model !== assignment.model
-      ? `model mismatch: asked for ${assignment.model}, ran ${observed.model}` : null;
-    store.finishWorkerTurn(id, mismatch === null ? result.status : "failed", result.usage, observed, mismatch);
-    // A late result still counts its usage, but cannot clear a failure or act for an ended assignment.
-    store.endTurn(id, result.usage);
-    if (mismatch !== null) {
-      store.recordTurnError(id, mismatch);
-      this.#mark(id, "failed");
+    let failure: string | null = null;
+    try {
+      // A late result still counts its usage, but cannot clear a failure or act for an ended assignment.
+      store.endTurn(id, result.usage);
+      if (assignment.state !== "running" || assignment.outcome === "failed") return;
+      store.clearTurnError(id);
+      // A cancelled turn still counts toward the turn and token limits.
+      const reached = turnBudgetReached(store.ticketBudget(assignment.ticketId), new Date());
+      if (store.getTicket(assignment.ticketId).state === "open" && reached !== null && !this.#budgetPauses.has(id)) {
+        this.#budgetPauses.add(id);
+        store.pauseTicketForBudget(assignment.ticketId, reached);
+        this.deliver(
+          id,
+          `budget-pause-${assignment.ticketId}-${reached}`,
+          "The ticket budget has been reached. Push your work in progress, then stop and wait for Ostrom to resume you.",
+          () => {},
+        );
+        queueStatusCard(store, assignment.ticketId);
+        return;
+      }
+      if (store.getTicket(assignment.ticketId).state === "open") this.#budgetPauses.delete(id);
+      if (result.status === "cancelled") {
+        queueStatusCard(store, assignment.ticketId);
+        return;
+      }
+      if (modelProblem !== null) {
+        failure = modelProblem;
+        this.#deps.log?.(`assignment ${id}: ended: ${modelProblem}`);
+        store.endAssignment(id, modelProblem);
+        return;
+      }
+      // Ostrom only aborts a turn to replace it. That cancellation is bookkeeping, not a terminal
+      // Worker outcome: the next queued turn must still run on this assignment.
+      this.#mark(id, null);
       queueStatusCard(store, assignment.ticketId);
-      return;
+    } finally {
+      store.finishWorkerTurn(id, failure === null ? result.status : "failed", result.usage, observed, failure);
     }
-    if (assignment.state !== "running" || assignment.outcome === "failed") return;
-    store.clearTurnError(id);
-    // A cancelled turn still counts toward the turn and token limits.
-    const reached = turnBudgetReached(store.ticketBudget(assignment.ticketId), new Date());
-    if (store.getTicket(assignment.ticketId).state === "open" && reached !== null && !this.#budgetPauses.has(id)) {
-      this.#budgetPauses.add(id);
-      store.pauseTicketForBudget(assignment.ticketId, reached);
-      this.deliver(
-        id,
-        `budget-pause-${assignment.ticketId}-${reached}`,
-        "The ticket budget has been reached. Push your work in progress, then stop and wait for Ostrom to resume you.",
-        () => {},
-      );
-      queueStatusCard(store, assignment.ticketId);
-      return;
-    }
-    if (store.getTicket(assignment.ticketId).state === "open") this.#budgetPauses.delete(id);
-    if (result.status === "cancelled") {
-      queueStatusCard(store, assignment.ticketId);
-      return;
-    }
-    // Ostrom only aborts a turn to replace it. That cancellation is bookkeeping, not a terminal
-    // Worker outcome: the next queued turn must still run on this assignment.
-    this.#mark(id, null);
-    queueStatusCard(store, assignment.ticketId);
   }
 
   /** Records an outcome unless the Router ended the assignment while the turn ran. */

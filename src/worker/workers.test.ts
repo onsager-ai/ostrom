@@ -337,20 +337,21 @@ test("Codex: the recorded model matches, so the assignment carries on", async ()
   }
 });
 
-test("Codex: a mismatch fails the turn; an unavailable observation remains null", async () => {
-  for (const model of ["gpt-6-sol", null]) {
+test("Codex: a different model or an unreadable record ends the assignment with a recorded reason", async () => {
+  for (const [model, reason] of [["gpt-6-sol", /model mismatch: asked for gpt-6-luna, ran gpt-6-sol/], [null, /model unverified: no rollout record/]] as const) {
     const dir = rollout(model);
     try {
       const { store, ticketId, workers } = fixture({ codexSessions: dir });
       await workers.dispatch(ticketId);
       await workers.drain();
       const a = store.getAssignment(1);
-      assert.equal(a.state, "running");
-      assert.equal(a.outcome, model === null ? null : "failed");
+      assert.equal(a.state, "ended");
+      assert.match(a.endReason!, reason);
+      assert.equal(store.abandonedAssignments().length, 1, "the Router owes a reply");
       const turn = store.ticketTurns(ticketId)[0]!;
       assert.equal(turn.observedModel, model);
-      assert.equal(turn.status, model === null ? "completed" : "failed");
-      if (model !== null) assert.match(turn.result!, /model mismatch: asked for gpt-6-luna, ran gpt-6-sol/);
+      assert.equal(turn.status, "failed");
+      assert.equal(turn.result, a.endReason);
       assert.equal(a.inputTokens, 10);
     } finally {
       rmSync(dir, { recursive: true });
@@ -358,9 +359,42 @@ test("Codex: a mismatch fails the turn; an unavailable observation remains null"
   }
 });
 
-test("Claude turns are not checked against a rollout", async () => {
-  const { store, ticketId, workers } = fixture({ codexSessions: "/does/not/exist" }, "claude");
+test("Codex model enforcement stays after budget and cancellation checks", async () => {
+  const dir = rollout(null);
+  try {
+    const { store, ticketId, workers } = fixture({ codexSessions: dir });
+    store.setTicketBudget(ticketId, { timeMinutes: 480, idleMinutes: 30, turns: 1, tokens: 1_000_000, escalations: 0 });
+    await workers.dispatch(ticketId);
+    await workers.drain();
+    assert.equal(store.getTicket(ticketId).pauseCause, "budget reached: turns");
+    assert.deepEqual(store.ticketTurns(ticketId).map((turn) => [turn.kind, turn.status]), [["dispatch", "completed"], ["budget_pause", "failed"]]);
+    assert.match(store.getAssignment(1).endReason!, /model unverified: no rollout record/);
+
+    const cancelled = fixture({ codexSessions: dir });
+    cancelled.runner.hold = true;
+    await cancelled.workers.dispatch(cancelled.ticketId);
+    cancelled.workers.cancel(1);
+    await cancelled.workers.drain();
+    assert.equal(cancelled.store.getAssignment(1).state, "running");
+    assert.equal(cancelled.store.ticketTurns(cancelled.ticketId)[0]!.status, "cancelled");
+  } finally { rmSync(dir, { recursive: true }); }
+});
+
+test("Claude records a resolved model without enforcing equality or checking a rollout", async () => {
+  const { store, ticketId, workers, runner } = fixture({ codexSessions: "/does/not/exist" }, "claude");
+  const start = runner.start.bind(runner);
+  runner.start = (options) => {
+    const session = start(options);
+    const send = session.send.bind(session);
+    session.send = async (prompt, signal) => ({ ...await send(prompt, signal), model: "claude-resolved-model-id" });
+    return session;
+  };
   await workers.dispatch(ticketId);
   await workers.drain();
   assert.equal(store.getAssignment(1).state, "running");
+  assert.equal(store.getAssignment(1).outcome, null);
+  const turn = store.ticketTurns(ticketId)[0]!;
+  assert.equal(turn.observedModel, "claude-resolved-model-id");
+  assert.equal(turn.status, "completed");
+  assert.equal(turn.result, null);
 });

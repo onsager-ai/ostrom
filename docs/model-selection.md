@@ -20,10 +20,12 @@ PR 1 implementation (effort and turn records):
   `turn`; `ostrom show` includes these records. Existing source kinds distinguish dispatch, review,
   redirect, control, ordinary follow-up, budget pause, stuck handling and recovery. CI fixes and
   conflicts are not separately identified by today's call sites.
-- Claude's init message confirms its model; observed Claude effort remains null because the SDK
-  does not report it. Codex's last native rollout `turn_context` confirms raw model and effort using
-  the existing bounded reader. Semon's query summary lacks per-turn effort and formats model names,
-  so it cannot supply this check. Missing evidence stays null; a model mismatch fails the turn.
+- Claude's init message records its observed model without enforcing equality: aliases and gateway
+  IDs can resolve to a different ID. Observed Claude effort remains null because the SDK does not
+  report it. Codex's last native rollout `turn_context` supplies raw model and effort using the
+  existing bounded reader. Semon's query summary lacks per-turn effort and formats model names,
+  so it cannot supply this check. Codex retains its existing verification behaviour: an unverified
+  or mismatched model ends the assignment with the reason and records the turn as failed.
 - `src/budget/budgets.ts` has an `escalations` limit (`OSTROM_BUDGET_ESCALATIONS=0`), but nothing
   escalates, so it never counts.
 - `docs/experience.md` and `docs/direction.md` describe tiers per repository, per label and per
@@ -136,9 +138,10 @@ model waits for the operator. Moving across harnesses is deferred until a real t
   CLI. An override is recorded and holds until changed; escalation never lowers it.
 - `ostrom models` lists the allowed models and their outcome history. `ostrom replay` shows each
   selection decision with its input.
-- Every turn's real model is confirmed from the native session record, which closes
-  [open question 2](direction.md#open-questions). A mismatch is a turn failure, not a silent run on
-  another model.
+- Codex's real model is checked from the native session record, which closes
+  [open question 2](direction.md#open-questions). An unverified or mismatched model ends the
+  assignment and records a failed turn, preserving existing behaviour. Claude's observed model is
+  recorded without enforcing equality with its requested alias or gateway ID.
 
 ## Project rule 3
 
