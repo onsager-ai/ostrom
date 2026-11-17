@@ -118,12 +118,10 @@ test("the idle budget flags a turn that has run past it, never a Worker waiting 
   assert.deepEqual(s.store.unansweredStalls(), []);
 });
 
-test("time budget excludes time waiting for review even when Semon reports a question", async () => {
+test("time budget excludes wall-clock time between turns", async () => {
   const s = setup();
   const a = s.startWorker(1);
   s.store.setTicketBudget(a.ticketId, { timeMinutes: 60, idleMinutes: 30, turns: 20, tokens: 1_000_000, escalations: 0 });
-  s.setSemon([semonStall(a.branch)]);
-  s.store.startWorkerTurn(a.assignmentId, "dispatch");
   s.advance(61 * 60_000);
   const paused: number[] = [];
   const pass = await watchdog({ ...s.options(), onBudgetPause: (id) => { paused.push(id); } });

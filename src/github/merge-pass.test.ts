@@ -273,6 +273,8 @@ test("review wait reaches time budget, extension resumes, and merge needs no hum
   assert.equal(f.puts.length, 0);
   f.store.extendTicketBudget(f.ticket, { timeMinutes: 60 });
   assert.equal(f.store.getTicket(f.ticket).state, "open");
+  // The follow-up turn reset the quiet window; waiting it out spends no time budget.
+  f.advance(11 * MINUTE);
   const result = await mergePass(f.options());
   assert.deepEqual(result.failed, []);
   assert.equal(f.puts.length, 1);
