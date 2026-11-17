@@ -11,7 +11,7 @@ import { ghGet, type GhRunner } from "../github/gh.ts";
 import { renderReviewReply } from "../github/review-reply.ts";
 import { parseStuckReply, renderStuckReply } from "../watchdog/stuck.ts";
 import type { WorkerConfig } from "../ostromd/config.ts";
-import { rolloutModel } from "../session/rollout.ts";
+import { rolloutContext } from "../session/rollout.ts";
 import type { Runner, Session, TurnResult } from "../session/runner.ts";
 import { createWorktree } from "../session/worktree.ts";
 import type { Assignment, AssignmentOutcome, QueuedTurnKind, Store } from "../store/store.ts";
@@ -184,6 +184,7 @@ export class Workers {
     const { store } = this.#deps;
     const pass = { resumed: [] as number[], interrupted: [] as number[], abandoned: [] as number[] };
     for (const pending of store.pendingAssignments()) {
+      store.finishWorkerTurn(pending.id, "interrupted", null, undefined, "ostromd stopped before the session started");
       store.abandonAssignment(pending.id, "ostromd stopped before the session started");
       pass.abandoned.push(pending.id);
     }
@@ -194,6 +195,7 @@ export class Workers {
       if (assignment.turnStartedAt !== null) {
         const turnId = `${assignment.sessionId}:${assignment.turns}`;
         const reviews = store.reviewDeliveries(assignment.id, turnId);
+        store.finishWorkerTurn(assignment.id, "interrupted", null, undefined, "ostromd stopped during the turn");
         store.recordInterruption(assignment.id);
         store.finishRunningTurns(assignment.id);
         store.endTurn(assignment.id, null);
@@ -349,15 +351,18 @@ export class Workers {
     const { store } = this.#deps;
     const controller = new AbortController();
     this.#inFlight.set(id, controller);
+    store.startWorkerTurn(id, "dispatch");
     let result: TurnResult;
     try {
       result = await session.send(prompt, controller.signal);
     } catch (error) {
       if (this.#stopping) return;
       if (controller.signal.aborted) {
+        store.finishWorkerTurn(id, "cancelled", null);
         store.endTurn(id, null);
         store.clearTurnError(id);
       } else if (store.getAssignment(id).state === "pending") {
+        store.finishWorkerTurn(id, "failed", null, undefined, error instanceof Error ? error.message : String(error));
         store.abandonAssignment(id, error instanceof Error ? error.message : String(error));
       } else {
         this.#failed(id, error);
@@ -392,6 +397,8 @@ export class Workers {
     if (store.beginQueuedTurn(id, key, turnId) === null) return;
     const turn = store.beginTurn(id);
     if (turn !== nextTurn) throw new Error(`assignment ${id}: queued turn number changed`);
+    const kind = key.startsWith("stuck-recovery-") ? "recovery" : key.startsWith("redirect-") ? "redirect" : queued.kind;
+    store.startWorkerTurn(id, kind);
     onStart?.(turnId);
     const controller = new AbortController();
     this.#inFlight.set(id, controller);
@@ -402,6 +409,7 @@ export class Workers {
       if (this.#stopping) return;
       store.finishQueuedTurn(id, key);
       if (controller.signal.aborted) {
+        store.finishWorkerTurn(id, "cancelled", null);
         store.endTurn(id, null);
         store.clearTurnError(id);
       } else {
@@ -422,6 +430,7 @@ export class Workers {
   #failed(id: number, error: unknown): void {
     const message = error instanceof Error ? error.message : String(error);
     this.#deps.log?.(`assignment ${id}: turn failed: ${message}`);
+    this.#deps.store.finishWorkerTurn(id, "failed", null, undefined, message);
     this.#deps.store.endTurn(id, null);
     this.#deps.store.recordTurnError(id, message);
     this.#mark(id, "failed");
@@ -430,42 +439,56 @@ export class Workers {
 
   #finished(id: number, result: TurnResult): void {
     const { store } = this.#deps;
-    // A late result still counts its usage, but cannot clear a failure or act for an ended assignment.
-    store.endTurn(id, result.usage);
     const assignment = store.getAssignment(id);
-    if (assignment.state !== "running" || assignment.outcome === "failed") return;
-    store.clearTurnError(id);
-    // A cancelled turn still counts toward the turn and token limits.
-    const reached = turnBudgetReached(store.ticketBudget(assignment.ticketId), new Date());
-    if (store.getTicket(assignment.ticketId).state === "open" && reached !== null && !this.#budgetPauses.has(id)) {
-      this.#budgetPauses.add(id);
-      store.pauseTicketForBudget(assignment.ticketId, reached);
-      this.deliver(
-        id,
-        `budget-pause-${assignment.ticketId}-${reached}`,
-        "The ticket budget has been reached. Push your work in progress, then stop and wait for Ostrom to resume you.",
-        () => {},
-      );
-      queueStatusCard(store, assignment.ticketId);
-      return;
-    }
-    if (store.getTicket(assignment.ticketId).state === "open") this.#budgetPauses.delete(id);
-    if (result.status === "cancelled") {
-      queueStatusCard(store, assignment.ticketId);
-      return;
-    }
+    let observed = { model: result.model, effort: null as string | null };
+    let modelProblem: string | null = null;
     if (assignment.harness === "codex" && this.#deps.codexSessions !== undefined) {
-      const reason = this.#modelProblem(assignment, this.#deps.codexSessions);
-      if (reason !== null) {
-        this.#deps.log?.(`assignment ${id}: ended: ${reason}`);
-        store.endAssignment(id, reason);
-        return;
+      try {
+        observed = rolloutContext(this.#deps.codexSessions, assignment.sessionId!);
+        if (observed.model === null) throw new Error("rollout records no turn model");
+        if (observed.model !== assignment.model) modelProblem = `model mismatch: asked for ${assignment.model}, ran ${observed.model}`;
+      } catch (error) {
+        modelProblem = `model unverified: ${error instanceof Error ? error.message : String(error)}`;
       }
     }
-    // Ostrom only aborts a turn to replace it. That cancellation is bookkeeping, not a terminal
-    // Worker outcome: the next queued turn must still run on this assignment.
-    this.#mark(id, null);
-    queueStatusCard(store, assignment.ticketId);
+    let failure: string | null = null;
+    try {
+      // A late result still counts its usage, but cannot clear a failure or act for an ended assignment.
+      store.endTurn(id, result.usage);
+      if (assignment.state !== "running" || assignment.outcome === "failed") return;
+      store.clearTurnError(id);
+      // A cancelled turn still counts toward the turn and token limits.
+      const reached = turnBudgetReached(store.ticketBudget(assignment.ticketId), new Date());
+      if (store.getTicket(assignment.ticketId).state === "open" && reached !== null && !this.#budgetPauses.has(id)) {
+        this.#budgetPauses.add(id);
+        store.pauseTicketForBudget(assignment.ticketId, reached);
+        this.deliver(
+          id,
+          `budget-pause-${assignment.ticketId}-${reached}`,
+          "The ticket budget has been reached. Push your work in progress, then stop and wait for Ostrom to resume you.",
+          () => {},
+        );
+        queueStatusCard(store, assignment.ticketId);
+        return;
+      }
+      if (store.getTicket(assignment.ticketId).state === "open") this.#budgetPauses.delete(id);
+      if (result.status === "cancelled") {
+        queueStatusCard(store, assignment.ticketId);
+        return;
+      }
+      if (modelProblem !== null) {
+        failure = modelProblem;
+        this.#deps.log?.(`assignment ${id}: ended: ${modelProblem}`);
+        store.endAssignment(id, modelProblem);
+        return;
+      }
+      // Ostrom only aborts a turn to replace it. That cancellation is bookkeeping, not a terminal
+      // Worker outcome: the next queued turn must still run on this assignment.
+      this.#mark(id, null);
+      queueStatusCard(store, assignment.ticketId);
+    } finally {
+      store.finishWorkerTurn(id, failure === null ? result.status : "failed", result.usage, observed, failure);
+    }
   }
 
   /** Records an outcome unless the Router ended the assignment while the turn ran. */
@@ -473,15 +496,6 @@ export class Workers {
     if (this.#deps.store.getAssignment(id).state === "running") this.#deps.store.recordOutcome(id, outcome);
   }
 
-  #modelProblem(assignment: Assignment, root: string): string | null {
-    let model: string;
-    try {
-      model = rolloutModel(root, assignment.sessionId!);
-    } catch (error) {
-      return `model unverified: ${error instanceof Error ? error.message : String(error)}`;
-    }
-    return model === assignment.model ? null : `model mismatch: asked for ${assignment.model}, ran ${model}`;
-  }
 }
 
 async function openPullRequests(gh: GhRunner, repo: string, branch: string): Promise<string[]> {

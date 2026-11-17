@@ -178,11 +178,31 @@ export interface OperatorIntakeItem {
   reason: string | null;
 }
 
+export interface WorkerTurn {
+  id: number;
+  assignmentId: number;
+  ticketId: number;
+  startedAt: string;
+  endedAt: string | null;
+  harness: "claude" | "codex";
+  requestedModel: string;
+  requestedEffort: string | null;
+  observedModel: string | null;
+  observedEffort: string | null;
+  kind: string;
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  status: "running" | "completed" | "cancelled" | "failed" | "interrupted";
+  result: string | null;
+}
+
 export interface OperatorTicketDetail extends OperatorTicket {
   context: TicketContext;
   triggers: Trigger[];
   decisions: { id: number; verdict: Verdict; reason: string; decidedAt: string }[];
   assignments: Assignment[];
+  turns: WorkerTurn[];
   outbox: Reply[];
 }
 
@@ -638,7 +658,7 @@ export class Store {
        WHERE subscription.ticket_id = ? ORDER BY outbox.enqueued_at, outbox.id`,
       ticketId,
     ).map(toReply);
-    return { ...summary, context, triggers, decisions, assignments, outbox };
+    return { ...summary, context, triggers, decisions, assignments, turns: this.ticketTurns(ticketId), outbox };
   }
 
   /** The daemon-wide counter view. Time zone is SQLite's UTC day, matching stored timestamps. */
@@ -892,6 +912,41 @@ export class Store {
   /** Assignments created but not yet started, oldest first. */
   pendingAssignments(): Assignment[] {
     return this.#all("SELECT * FROM assignment WHERE state = 'pending' ORDER BY id").map(toAssignment);
+  }
+
+  /** Records a native invocation, including a first turn that fails before returning a session ID. */
+  startWorkerTurn(assignmentId: number, kind: string, effort: string | null = null): number {
+    const assignment = this.getAssignment(assignmentId);
+    if (assignment.harness === null || assignment.model === null) throw new Error("turn needs a configured native assignment");
+    const result = this.#run(
+      `INSERT INTO turn (assignment_id, ticket_id, started_at, harness, requested_model, requested_effort, kind, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'running')`,
+      assignmentId, assignment.ticketId, this.#stamp(), assignment.harness, assignment.model, effort, kind,
+    );
+    return Number(result.lastInsertRowid);
+  }
+
+  finishWorkerTurn(assignmentId: number, status: Exclude<WorkerTurn["status"], "running">,
+    usage: { inputTokens: number; cachedInputTokens: number; outputTokens: number } | null,
+    observed: { model: string | null; effort: string | null } = { model: null, effort: null }, result: string | null = null): void {
+    this.#run(
+      `UPDATE turn SET ended_at = ?, status = ?, observed_model = ?, observed_effort = ?,
+       input_tokens = ?, cached_input_tokens = ?, output_tokens = ?, result = ? WHERE assignment_id = ? AND status = 'running'`,
+      this.#stamp(), status, observed.model, observed.effort, usage?.inputTokens ?? 0, usage?.cachedInputTokens ?? 0,
+      usage?.outputTokens ?? 0, result, assignmentId,
+    );
+  }
+
+  ticketTurns(ticketId: number): WorkerTurn[] {
+    return this.#all("SELECT * FROM turn WHERE ticket_id = ? ORDER BY id", ticketId).map((row) => ({
+      id: row["id"] as number, assignmentId: row["assignment_id"] as number, ticketId: row["ticket_id"] as number,
+      startedAt: row["started_at"] as string, endedAt: row["ended_at"] as string | null,
+      harness: row["harness"] as WorkerTurn["harness"], requestedModel: row["requested_model"] as string,
+      requestedEffort: row["requested_effort"] as string | null, observedModel: row["observed_model"] as string | null,
+      observedEffort: row["observed_effort"] as string | null, kind: row["kind"] as string,
+      inputTokens: row["input_tokens"] as number, cachedInputTokens: row["cached_input_tokens"] as number,
+      outputTokens: row["output_tokens"] as number, status: row["status"] as WorkerTurn["status"], result: row["result"] as string | null,
+    }));
   }
 
   /** Marks a native turn as running and returns the assignment's turn number. */

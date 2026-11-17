@@ -34,6 +34,33 @@ test("read-only CLI falls back to the store", async () => {
   }
 });
 
+test("show renders turn model, effort and kind in text and JSON", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "ostrom-cli-turn-"));
+  const path = join(directory, "ostrom.db");
+  const original = process.stdout.write;
+  let output = "";
+  try {
+    const id = ticket(path);
+    const store = Store.open(path);
+    try {
+      const assignment = store.createAssignment(id);
+      store.configureNativeAssignment(assignment, { harness: "codex", model: "luna", worktree: "/w", branch: "b", machine: "h" });
+      store.startWorkerTurn(assignment, "dispatch", "low");
+      store.finishWorkerTurn(assignment, "completed", null, { model: "luna", effort: "low" });
+    } finally { store.close(); }
+    process.stdout.write = ((chunk: string) => { output += chunk; return true; }) as typeof process.stdout.write;
+    assert.equal(await main(["show", String(id)], { OSTROM_DB: path, HOME: directory }), 0);
+    assert.match(output, /turn 1  dispatch  completed  model luna \(requested luna\)  effort low/);
+    output = "";
+    assert.equal(await main(["show", String(id), "--json"], { OSTROM_DB: path, HOME: directory }), 0);
+    const view = JSON.parse(output) as { turns: { kind: string; observedModel: string; observedEffort: string }[] };
+    assert.deepEqual(view.turns.map((turn) => [turn.kind, turn.observedModel, turn.observedEffort]), [["dispatch", "luna", "low"]]);
+  } finally {
+    process.stdout.write = original;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("mutating CLI commands require a running daemon", async () => {
   const directory = mkdtempSync(join(tmpdir(), "ostrom-cli-"));
   const path = join(directory, "ostrom.db");

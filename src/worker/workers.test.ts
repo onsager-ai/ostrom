@@ -67,6 +67,27 @@ test("dispatch makes the worktree, starts the session with the brief and stores 
   await workers.drain();
   const done = store.getAssignment(1);
   assert.deepEqual([done.turnStartedAt, done.inputTokens, done.cachedInputTokens, done.outputTokens, done.outcome], [null, 10, 5, 2, null]);
+  const [turn] = store.operatorTicket(ticketId).turns;
+  assert.deepEqual([turn!.kind, turn!.status, turn!.requestedModel, turn!.requestedEffort, turn!.observedModel], ["dispatch", "completed", "gpt-6-luna", null, null]);
+  assert.deepEqual([turn!.inputTokens, turn!.cachedInputTokens, turn!.outputTokens], [10, 5, 2]);
+});
+
+test("every invoked follow-up records its source kind and failures retain a reason", async () => {
+  const { store, ticketId, workers, runner } = fixture();
+  await workers.dispatch(ticketId);
+  await workers.drain();
+  for (const key of ["review-1", "redirect-1", "stuck-recovery-1-1", "operator-pause-1", "budget-pause-1", "stuck-public-1", "ordinary"]) {
+    workers.deliver(1, key, "continue", () => {});
+  }
+  await workers.drain();
+  assert.deepEqual(store.ticketTurns(ticketId).map((turn) => turn.kind), ["dispatch", "review", "redirect", "recovery", "control", "budget_pause", "stuck", "follow_up"]);
+  assert.ok(store.ticketTurns(ticketId).every((turn) => turn.status === "completed"));
+  runner.sessions[0]!.failWith = new Error("provider failed");
+  workers.deliver(1, "failure", "continue", () => {});
+  await workers.drain();
+  const failed = store.ticketTurns(ticketId).at(-1)!;
+  assert.equal(failed.status, "failed");
+  assert.equal(failed.result, "provider failed");
 });
 
 test("linked worktrees grant only the Git paths a commit changes", () => {
@@ -91,6 +112,7 @@ test("cancelling an in-flight turn lets its queued replacement run without a can
   assert.equal(store.getAssignment(1).turnStartedAt, null);
   assert.equal(store.getAssignment(1).outcome, null);
   assert.equal(session.maxRunning, 1);
+  assert.deepEqual(store.ticketTurns(ticketId).map((turn) => turn.status), ["cancelled", "completed"]);
 });
 
 test("a reached ticket budget pauses after the current turn and asks the Worker to push WIP", async () => {
@@ -288,6 +310,7 @@ test("a stop cuts off the running turn, starts no queued one, and leaves the tur
   await restarted.drain();
   assert.deepEqual(runner.sessions.at(-1)!.prompts, [workerTurnPrompt(INTERRUPTED_PROMPT), workerTurnPrompt("next")]);
   assert.equal(store.getAssignment(1).turnStartedAt, null);
+  assert.deepEqual(store.ticketTurns(ticketId).map((turn) => [turn.kind, turn.status]), [["dispatch", "interrupted"], ["recovery", "completed"], ["follow_up", "completed"]]);
 });
 
 function rollout(model: string | null, thread = "sess-1") {
@@ -325,15 +348,53 @@ test("Codex: a different model or an unreadable record ends the assignment with 
       assert.equal(a.state, "ended");
       assert.match(a.endReason!, reason);
       assert.equal(store.abandonedAssignments().length, 1, "the Router owes a reply");
+      const turn = store.ticketTurns(ticketId)[0]!;
+      assert.equal(turn.observedModel, model);
+      assert.equal(turn.status, "failed");
+      assert.equal(turn.result, a.endReason);
+      assert.equal(a.inputTokens, 10);
     } finally {
       rmSync(dir, { recursive: true });
     }
   }
 });
 
-test("Claude turns are not checked against a rollout", async () => {
-  const { store, ticketId, workers } = fixture({ codexSessions: "/does/not/exist" }, "claude");
+test("Codex model enforcement stays after budget and cancellation checks", async () => {
+  const dir = rollout(null);
+  try {
+    const { store, ticketId, workers } = fixture({ codexSessions: dir });
+    store.setTicketBudget(ticketId, { timeMinutes: 480, idleMinutes: 30, turns: 1, tokens: 1_000_000, escalations: 0 });
+    await workers.dispatch(ticketId);
+    await workers.drain();
+    assert.equal(store.getTicket(ticketId).pauseCause, "budget reached: turns");
+    assert.deepEqual(store.ticketTurns(ticketId).map((turn) => [turn.kind, turn.status]), [["dispatch", "completed"], ["budget_pause", "failed"]]);
+    assert.match(store.getAssignment(1).endReason!, /model unverified: no rollout record/);
+
+    const cancelled = fixture({ codexSessions: dir });
+    cancelled.runner.hold = true;
+    await cancelled.workers.dispatch(cancelled.ticketId);
+    cancelled.workers.cancel(1);
+    await cancelled.workers.drain();
+    assert.equal(cancelled.store.getAssignment(1).state, "running");
+    assert.equal(cancelled.store.ticketTurns(cancelled.ticketId)[0]!.status, "cancelled");
+  } finally { rmSync(dir, { recursive: true }); }
+});
+
+test("Claude records a resolved model without enforcing equality or checking a rollout", async () => {
+  const { store, ticketId, workers, runner } = fixture({ codexSessions: "/does/not/exist" }, "claude");
+  const start = runner.start.bind(runner);
+  runner.start = (options) => {
+    const session = start(options);
+    const send = session.send.bind(session);
+    session.send = async (prompt, signal) => ({ ...await send(prompt, signal), model: "claude-resolved-model-id" });
+    return session;
+  };
   await workers.dispatch(ticketId);
   await workers.drain();
   assert.equal(store.getAssignment(1).state, "running");
+  assert.equal(store.getAssignment(1).outcome, null);
+  const turn = store.ticketTurns(ticketId)[0]!;
+  assert.equal(turn.observedModel, "claude-resolved-model-id");
+  assert.equal(turn.status, "completed");
+  assert.equal(turn.result, null);
 });
