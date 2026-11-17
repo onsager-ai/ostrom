@@ -56,7 +56,9 @@ Ostrom edits silently and posts a new comment only when someone needs to act.
   and sends them as one comment. A thread gets at most one new comment per 30 minutes. A blocking
   question goes out at once.
 - **One reply per review**, never one per review comment. Ostrom replies inline only where it
-  disagrees or asks a question.
+  disagrees or asks a question. Worker final messages are public replies for PR reviewers; the
+  outbox rewrites host paths to repository-relative text or links at the known PR head, and Ostrom
+  reports CI and merge state, including conflicts with the base, on the status card.
 
 ### Stop and redirect
 

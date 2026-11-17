@@ -81,6 +81,10 @@ async function consider(options: MergePassOptions, assignmentId: number, prNumbe
     candidate = candidateFor(options, assignmentId, prNumber, observation);
   }
   const wait = (reason: string) => {
+    const { pr } = observation.evidence;
+    if (pr.state === "OPEN" && (pr.mergeStateStatus === "DIRTY" || pr.mergeable === "CONFLICTING")) {
+      reason = `Conflicts with ${pr.base.ref}; the Worker needs to merge ${pr.base.ref}.`;
+    }
     saveReason(options, candidate, reason);
     result.waiting.push({ assignmentId, reason });
   };

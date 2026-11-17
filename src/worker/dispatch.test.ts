@@ -41,6 +41,10 @@ test("the brief is a summary plus pointers and asks for a PR that references the
   const { store, ticketId } = fixture();
   const brief = workerBrief(store.ticketContext(ticketId), "ostrom/ticket-1-1", "main");
   assert.match(brief, /fix the README typo/);
+  assert.match(brief, /final message is posted publicly on the pull request for its reviewers/);
+  assert.match(brief, /use repository-relative paths/);
+  assert.match(brief, /do not narrate your own process or what you did or did not post/);
+  assert.match(brief, /Do not claim CI or merge state; Ostrom reports those/);
   assert.match(brief, new RegExp(`issue #7: https://github.com/${REPO}/issues/7\n`));
   assert.match(brief, new RegExp(`- https://github.com/${REPO}/issues/7#issuecomment-1\n`));
   assert.match(brief, /branch ostrom\/ticket-1-1/);

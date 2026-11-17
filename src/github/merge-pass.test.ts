@@ -41,7 +41,7 @@ function fixture(policy: MergePolicy = { strategy: "unattended" }) {
   const pr = store.ensureThread({ sourceId: source.id, kind: "pull_request", number: 2, url: "https://github.com/o/r/pull/2" });
   store.subscribe(ticket, pr);
   const remote = {
-    merged: false, head: "head", issueState: "open", permission: "write", reviews: [review()], comments: [] as unknown[],
+    merged: false, head: "head", mergeable: "MERGEABLE", mergeStateStatus: "CLEAN", base: "main", issueState: "open", permission: "write", reviews: [review()], comments: [] as unknown[],
     putError: null as string | null, mergeBeforeError: false, mergedBy: { id: 42, login: "marvin" },
     refuse: false, failConfirmation: false, rules: [] as unknown[], protection: {} as Record<string, unknown>,
     openPulls: [2], onFinalRead: null as (() => void) | null,
@@ -67,8 +67,8 @@ function fixture(policy: MergePolicy = { strategy: "unattended" }) {
       const check = { __typename: "CheckRun", databaseId: 10, name: "check", status: "COMPLETED", conclusion: "SUCCESS",
         checkSuite: { databaseId: 1, app: { databaseId: 15368 } } };
       return JSON.stringify({ data: { repository: { pullRequest: {
-        number: 2, state: remote.merged ? "MERGED" : "OPEN", isDraft: false, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN",
-        reviewDecision: "APPROVED", author: { login: "author" }, headRefName: "b", headRefOid: remote.head, baseRefName: "main", baseRefOid: "base",
+        number: 2, state: remote.merged ? "MERGED" : "OPEN", isDraft: false, mergeable: remote.mergeable, mergeStateStatus: remote.mergeStateStatus,
+        reviewDecision: "APPROVED", author: { login: "author" }, headRefName: "b", headRefOid: remote.head, baseRefName: remote.base, baseRefOid: "base",
         reviewThreads: connection([]), reviews: connection(remote.reviews), commits: { nodes: [{ commit: {
           oid: remote.head, associatedPullRequests: connection([{ number: 2 }]), statusCheckRollup: { state: "SUCCESS", contexts: connection([check]) },
           checkSuites: connection([{ databaseId: 1, status: "COMPLETED", conclusion: "SUCCESS", repository: { nameWithOwner: "o/r" }, matchingPullRequests: connection([{ number: 2 }]),
@@ -152,6 +152,29 @@ function done(f: Fixture, origin: "ostrom" | "external" | "unknown") {
   else assert.doesNotMatch(body, /Ostrom .* merged/);
   if (origin === "unknown") assert.match(body, /whether Ostrom caused this merge is unknown/);
 }
+
+test("existing merge evidence reports conflicts on the card and clears them on the next clean read", async () => {
+  for (const strategy of ["unattended", "human"] as const) {
+    for (const conflict of ["DIRTY", "CONFLICTING"]) {
+      const f = fixture({ strategy });
+      try {
+        f.remote.base = "release";
+        if (conflict === "DIRTY") f.remote.mergeStateStatus = conflict;
+        else f.remote.mergeable = conflict;
+        const result = await mergePass({ ...f.options(), base: "release" });
+        assert.deepEqual(result.failed, []);
+        assert.equal(result.waiting[0]?.reason, "Conflicts with release; the Worker needs to merge release.");
+        assert.match(f.store.statusCardBody(f.issue)!, /Conflicts with release; the Worker needs to merge release\./);
+        assert.equal(f.reads(), 1, "the conflict uses the existing evidence read");
+        assert.equal(f.puts.length, 0);
+        f.remote.mergeStateStatus = "CLEAN";
+        f.remote.mergeable = "MERGEABLE";
+        await mergePass({ ...f.options(), base: "release" });
+        assert.doesNotMatch(f.store.statusCardBody(f.issue)!, /Conflicts with/);
+      } finally { f.store.close(); }
+    }
+  }
+});
 
 test("review wait reaches time budget, extension resumes, and merge needs no human comment", async () => {
   const f = fixture();
