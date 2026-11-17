@@ -95,8 +95,11 @@ one-line reason. Its input:
 - the allowed models, with their cost and approval flag;
 - a small table of past outcomes for this repository (below).
 
-Code checks the choice: it must be on the list, and an approval model waits for the operator. An
-invalid choice falls back to the cheapest model, and that fallback is recorded as a decision.
+Code checks the choice: it must be on the list. If the Router picks a model that needs approval,
+Ostrom starts on the cheapest model that does not, and posts on the ticket that the operator can
+approve the pick with `@ostrom use <model>`. If every allowed model needs approval, the ticket waits
+for that override. An invalid choice falls back to the cheapest model, and that fallback is recorded
+as a decision.
 
 The model stays fixed for the ticket's session. Changing models mid-session discards the cached
 context, and resuming a session on different settings already caused #715.
