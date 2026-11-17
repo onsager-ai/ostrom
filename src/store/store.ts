@@ -5,6 +5,7 @@ import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { budgetReached, budgetUsage, budgetWarning } from "../budget/budgets.ts";
 import type { BudgetDefaults } from "../budget/budgets.ts";
 import { migrate } from "./migrations.ts";
+import { ModelStore } from "./models.ts";
 
 export type SourceKind = "github";
 export type ThreadKind = "issue" | "pull_request";
@@ -367,6 +368,7 @@ export interface StoreOptions {
 type Row = Record<string, unknown>;
 
 export class Store {
+  readonly models: ModelStore;
   readonly #db: DatabaseSync;
   readonly #now: () => Date;
 
@@ -374,6 +376,7 @@ export class Store {
     this.#db = db;
     this.#now = options.now ?? (() => new Date());
     migrate(db, this.#now());
+    this.models = new ModelStore(db, this.#now);
   }
 
   /** Opens (creating if needed) the store at `path`; `:memory:` gives a throwaway store. */

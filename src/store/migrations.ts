@@ -586,6 +586,32 @@ export const migrations: readonly string[] = [
   CREATE INDEX turn_by_ticket ON turn(ticket_id, id);
   CREATE UNIQUE INDEX turn_running ON turn(assignment_id) WHERE status = 'running';
   `,
+
+  // 31: Harness discovery cache and operator model selections (not consumed by dispatch yet).
+  `
+  CREATE TABLE model_discovery (
+    harness TEXT PRIMARY KEY CHECK (harness IN ('claude', 'codex')),
+    models TEXT NOT NULL DEFAULT '[]',
+    discovered_at TEXT,
+    last_error TEXT
+  ) STRICT;
+  INSERT INTO model_discovery (harness) VALUES ('claude'), ('codex');
+  CREATE TABLE model_selection (
+    harness TEXT NOT NULL CHECK (harness IN ('claude', 'codex')),
+    model TEXT NOT NULL,
+    allowed INTEGER NOT NULL CHECK (allowed IN (0, 1)),
+    efforts TEXT NOT NULL,
+    approval INTEGER NOT NULL CHECK (approval IN (0, 1)),
+    cost REAL NOT NULL CHECK (cost > 0),
+    note TEXT NOT NULL,
+    PRIMARY KEY (harness, model)
+  ) STRICT, WITHOUT ROWID;
+  CREATE TABLE model_objective (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    objective TEXT NOT NULL CHECK (objective IN ('cost', 'balanced', 'quality'))
+  ) STRICT;
+  INSERT INTO model_objective VALUES (1, 'cost');
+  `,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */

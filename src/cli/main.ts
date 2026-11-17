@@ -5,6 +5,7 @@
 import { request } from "node:http";
 
 import { startDashboard } from "./dashboard.ts";
+import { modelsMain } from "./models.ts";
 
 import { defaultSocketPath } from "../api/server.ts";
 import { GitHubApp, loadAppConfig } from "../github/app.ts";
@@ -25,6 +26,7 @@ commands:
   extend <ticket> --time M [--turns N] [--tokens N]
   preview
   dashboard
+  models [allow|remove|set|objective|refresh|export|import]
 
 Read-only commands fall back to OSTROM_DB when ostromd is not running.`;
 
@@ -34,6 +36,7 @@ type Command =
   | { name: "extend"; ticketId: number; increases: { timeMinutes?: number; turns?: number; tokens?: number }; json: boolean };
 
 export async function main(argv: readonly string[], env: Record<string, string | undefined> = process.env): Promise<number> {
+  if (argv[0] === "models") return modelsMain(argv.slice(1), env, (method, path, body) => call(defaultSocketPath(env), method, path, body));
   if (argv.length === 1 && argv[0] === "dashboard") {
     try {
       const dashboard = await startDashboard(env);
