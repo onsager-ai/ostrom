@@ -12,12 +12,13 @@ function budget(overrides: Partial<TicketBudget> = {}): TicketBudget {
     ticketId: 1, openedAt: OPENED, timeMinutes: 60, idleMinutes: 30, turnLimit: 10,
     tokenLimit: 100, escalationLimit: 0, escalations: 0, turns: 8,
     inputTokens: 40, cachedInputTokens: 30, outputTokens: 10,
-    turnStartedAt: "2026-11-09T12:18:00.000Z", ...overrides,
+    completedTurnSeconds: 18 * 60, turnStartedAt: "2026-11-09T12:18:00.000Z", ...overrides,
   };
 }
 
 test("budget accounting excludes cached input from token limits but keeps it in stored usage", () => {
   assert.equal(budgetUsage(budget(), "tokens", NOW), 50);
+  assert.equal(budgetUsage(budget(), "time", NOW), 48);
   assert.equal(budgetWarning(budget(), NOW), "time");
   assert.equal(budgetReached(budget(), NOW), "idle");
   assert.equal(budgetReached(budget({ idleMinutes: 60, escalationLimit: 1, escalations: 1 }), NOW), "escalations");
@@ -27,7 +28,8 @@ test("budget accounting excludes cached input from token limits but keeps it in 
 test("idle time counts only while a turn runs, from that turn's start", () => {
   assert.equal(budgetUsage(budget(), "idle", NOW), 30);
   assert.equal(budgetUsage(budget({ turnStartedAt: null }), "idle", NOW), 0, "a Worker waiting for review is not idle");
-  assert.equal(budgetReached(budget({ turnStartedAt: null, timeMinutes: 120, turnLimit: 20 }), NOW), null);
+  assert.equal(budgetUsage(budget({ turnStartedAt: null }), "time", NOW), 18, "finished turns count while waiting for review");
+  assert.equal(budgetReached(budget({ turnStartedAt: null, completedTurnSeconds: 0, timeMinutes: 120, turnLimit: 20 }), NOW), null);
 });
 
 test("budget defaults are documented constants and env values are validated", () => {

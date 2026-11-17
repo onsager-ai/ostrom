@@ -533,18 +533,21 @@ test("a ticket budget persists limits and sums every assignment's turn usage", (
   store.configureNativeAssignment(first, { harness: "codex", model: "m", worktree: "/w1", branch: "b1", machine: "h" });
   store.startNativeAssignment(first, "s1");
   store.beginTurn(first);
+  advance(20 * 60_000);
   store.endTurn(first, { inputTokens: 10, cachedInputTokens: 20, outputTokens: 30 });
   store.endAssignment(first);
   const second = store.createAssignment(ticketId);
   store.configureNativeAssignment(second, { harness: "codex", model: "m", worktree: "/w2", branch: "b2", machine: "h" });
   store.startNativeAssignment(second, "s2");
   store.beginTurn(second);
+  advance(40 * 60_000);
   store.endTurn(second, { inputTokens: 1, cachedInputTokens: 2, outputTokens: 3 });
   const budget = store.ticketBudget(ticketId);
   assert.deepEqual(
     [budget.ticketId, budget.timeMinutes, budget.idleMinutes, budget.turnLimit, budget.tokenLimit, budget.escalationLimit,
-      budget.escalations, budget.turns, budget.inputTokens, budget.cachedInputTokens, budget.outputTokens, budget.turnStartedAt],
-    [ticketId, 90, 15, 4, 500, 1, 0, 2, 11, 22, 33, null],
+      budget.escalations, budget.turns, budget.inputTokens, budget.cachedInputTokens, budget.outputTokens,
+      budget.completedTurnSeconds, budget.turnStartedAt],
+    [ticketId, 90, 15, 4, 500, 1, 0, 2, 11, 22, 33, 60 * 60, null],
   );
   store.pauseTicketForBudget(ticketId, "tokens");
   assert.equal(store.getTicket(ticketId).pauseCause, "budget reached: tokens");

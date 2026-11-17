@@ -18,6 +18,10 @@ systemctl --user enable --now ostromd
 The daemon runs `ostromd run --interval 60`, restarts after failures, and writes
 logs to the user journal. Inspect it with `journalctl --user -u ostromd`.
 
+The per-ticket time budget counts time spent in Worker turns, including completed turns and any
+currently running turn. Time waiting between turns, such as for review or an operator answer, does
+not consume it; the idle budget applies only while a turn is running.
+
 The operator uses `ostrom status`, `tickets`, `show`, `pause`, `resume`, `stop`,
 `extend`, and `preview`. Run `ostrom dashboard` to open the read-only local dashboard while
 ostromd is running; it prints a private loopback URL and stays attached until interrupted. The local operator API also serves `GET /v1/intake?limit=50` with recent
