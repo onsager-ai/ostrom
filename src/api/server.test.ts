@@ -117,6 +117,13 @@ test("the local API serves status, tickets and a ticket over a 0600 Unix socket"
     assert.equal(shown.triggers[0]!.body, "please fix it");
     assert.equal(shown.outbox[0]!.id, "reply-1");
 
+    store.models.discovered("codex", [{ harness: "codex", id: "gpt-6-luna", displayName: "Luna", description: "", efforts: ["low", "high"], defaultEffort: "high" }]);
+    store.models.change({ action: "allow", harness: "codex", model: "gpt-6-luna" });
+    const modelOverride = await call(socketPath, "POST", `/v1/tickets/${ticketId}/model`, { value: "codex/gpt-6-luna" });
+    assert.equal(modelOverride.status, 200);
+    assert.match((modelOverride.body as { message: string }).message, /next session/);
+    assert.equal((await call(socketPath, "POST", `/v1/tickets/${ticketId}/effort`, { value: "low" })).status, 200);
+    assert.equal((await call(socketPath, "POST", `/v1/tickets/${ticketId}/effort`, { value: "max" })).status, 400);
     const paused = await call(socketPath, "POST", `/v1/tickets/${ticketId}/pause`);
     assert.equal(paused.status, 200);
     assert.equal((paused.body as { state: string }).state, "paused");

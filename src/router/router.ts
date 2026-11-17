@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import { DEFAULT_BUDGET, type BudgetDefaults } from "../budget/budgets.ts";
 import { join } from "node:path";
 
+import { allowedModels, recordModelChoice } from "./selection.ts";
 import { queueStatusCard } from "../github/cards.ts";
 import { readyPolicySentence, type MergePolicy } from "../github/merge-policy.ts";
 import { ghGet, type GhRunner } from "../github/gh.ts";
@@ -97,6 +98,8 @@ export interface RouterDecision {
   verdict: Verdict;
   reason: string;
   reply: string | null;
+  model?: unknown;
+  modelReason?: unknown;
 }
 
 export interface RouterStallAnswer {
@@ -172,7 +175,7 @@ export async function routeCandidates(options: RouteOptions): Promise<RoutePassR
   };
   if (batch.threads.length === 0 && batch.outcomes.length === 0) return result;
 
-  const asked = await askRouter(options, routerMessage(batch));
+  const asked = await askRouter(options, routerMessage(batch, { objective: store.models.view().objective, models: allowedModels(store) }));
   result.router = { sessionId: asked.sessionId };
   const answer = parseRouterAnswer(asked.reply, batch);
 
@@ -184,6 +187,7 @@ export async function routeCandidates(options: RouteOptions): Promise<RoutePassR
       reason: decision.reason,
       ...(decision.reply === null ? {} : { reply: decision.reply }),
     }, options.budget ?? DEFAULT_BUDGET);
+    if (recorded.ticketId !== null) recordModelChoice(store, recorded.ticketId, decision.model, decision.modelReason, { decision, batch });
     result.decisions.push({ ...recorded, thread: decision.thread, triggers: decision.triggers, verdict: decision.verdict });
   }
   const outcomes = new Map(batch.outcomes.map((outcome) => [outcome.key, outcome]));
@@ -410,8 +414,9 @@ const OUTCOME_MEANING: Record<OutcomeEvent, string> = {
 };
 
 /** The whole message for one Router turn: the contract, then the batch as JSON. */
-export function routerMessage(batch: Batch): string {
+export function routerMessage(batch: Batch, selection?: { objective: string; models: ReturnType<typeof allowedModels> }): string {
   const payload = {
+    selection,
     threads: batch.threads,
     outcomes: batch.outcomes.map((outcome) => ({
       key: outcome.key,
@@ -459,9 +464,12 @@ export function routerMessage(batch: Batch): string {
     "",
     "Answer with one JSON object and nothing else: no prose, no code fence. Its shape:",
     '{"decisions":[{"thread":<thread>,"triggers":[<trigger>,...],"verdict":"accept"|"ignore"|"stop",',
-    '"reason":"...","reply":"..."|null}],"outcomes":[{"key":"<key>","reply":"..."}],',
+    '"reason":"...","reply":"..."|null,"model":"harness/model","modelReason":"..."}],"outcomes":[{"key":"<key>","reply":"..."}],',
     '"stalls":[{"key":"<key>","action":"wait"|"stop","reply":"..."|null}]}',
     "",
+    "On accept, also choose model (harness/model) from selection.models and modelReason (one sentence).",
+    "Consider objective, relative cost, approval, allowed efforts and notes. With no history prefer the cheapest model that can merge the task.",
+    "Approval models require operator approval before use. If selection.models is empty, omit the model fields.",
     "The batch:",
     JSON.stringify(payload, null, 2),
   ].join("\n");
@@ -492,7 +500,7 @@ export function parseRouterAnswer(reply: string, batch: Batch): RouterAnswer {
   const decided = new Set<number>();
   const decisions = list(root["decisions"], "$.decisions").map((item, index): RouterDecision => {
     const path = `$.decisions[${index}]`;
-    const decision = object(item, path, ["thread", "triggers", "verdict", "reason", "reply"], ["thread", "triggers", "verdict", "reason"]);
+    const decision = object(item, path, ["thread", "triggers", "verdict", "reason", "reply", "model", "modelReason"], ["thread", "triggers", "verdict", "reason"]);
     const thread = integer(decision["thread"], `${path}.thread`);
     const triggers = list(decision["triggers"], `${path}.triggers`).map((id, i) => integer(id, `${path}.triggers[${i}]`));
     if (triggers.length === 0) throw new RouterOutputError(`${path}.triggers is empty`);
@@ -510,7 +518,7 @@ export function parseRouterAnswer(reply: string, batch: Batch): RouterAnswer {
     const reason = text(decision["reason"], `${path}.reason`);
     const replyText = decision["reply"] === undefined || decision["reply"] === null ? null : text(decision["reply"], `${path}.reply`);
     if (verdict === "accept" && replyText === null) throw new RouterOutputError(`${path}: an accept needs a reply`);
-    return { thread, triggers, verdict, reason, reply: replyText };
+    return { thread, triggers, verdict, reason, reply: replyText, ...(decision["model"] === undefined ? {} : { model: decision["model"] }), ...(decision["modelReason"] === undefined ? {} : { modelReason: decision["modelReason"] }) };
   });
   const undecided = [...threadOf.keys()].filter((trigger) => !decided.has(trigger));
   if (undecided.length > 0) throw new RouterOutputError(`triggers ${undecided.join(", ")} are not decided`);

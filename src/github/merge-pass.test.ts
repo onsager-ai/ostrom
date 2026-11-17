@@ -559,7 +559,7 @@ test("merge-enabled migration refreshes previously tracked, delivered opened rep
   assert.notEqual(store.readyReplySentAt(assignment), null);
   store.close();
   const upgrade = new DatabaseSync(path);
-  upgrade.exec("DROP TABLE model_objective; DROP TABLE model_selection; DROP TABLE model_discovery; DROP TABLE turn; DROP INDEX intake_receipt_recent; DROP TABLE intake_receipt;");
+  upgrade.exec("DROP TABLE selection_decision; DROP TABLE model_objective; DROP TABLE model_selection; DROP TABLE model_discovery; DROP TABLE turn; DROP INDEX intake_receipt_recent; DROP TABLE intake_receipt;");
   upgrade.prepare("DELETE FROM schema_version WHERE version >= 27").run();
   upgrade.close();
   store = Store.open(path, { now: () => now });

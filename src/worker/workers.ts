@@ -10,7 +10,8 @@ import { queueStatusCard } from "../github/cards.ts";
 import { ghGet, type GhRunner } from "../github/gh.ts";
 import { renderReviewReply } from "../github/review-reply.ts";
 import { parseStuckReply, renderStuckReply } from "../watchdog/stuck.ts";
-import type { WorkerConfig } from "../ostromd/config.ts";
+import { chooseEffort, sessionModel } from "../router/selection.ts";
+import type { RouterConfig, WorkerConfig } from "../ostromd/config.ts";
 import { rolloutContext } from "../session/rollout.ts";
 import type { Runner, Session, TurnResult } from "../session/runner.ts";
 import { createWorktree } from "../session/worktree.ts";
@@ -26,6 +27,7 @@ export interface Dispatched {
 export interface WorkersDeps {
   store: Store;
   config: WorkerConfig;
+  router?: RouterConfig;
   runners: Record<"claude" | "codex", Runner>;
   /** Where Codex writes rollout records; set to verify the Worker's model after each Codex turn. */
   codexSessions?: string;
@@ -94,17 +96,18 @@ export class Workers {
   async dispatch(ticketId: number): Promise<Dispatched> {
     const { store, config } = this.#deps;
     const context = store.ticketContext(ticketId);
+    const selected = sessionModel(store, ticketId, config);
     const id = store.createAssignment(ticketId);
     try {
       const suffix = randomUUID();
       const path = join(config.worktrees, `ticket-${ticketId}-${id}-${suffix}`);
       const branch = await (this.#deps.addWorktree ?? createWorktree)(config.repo, path, config.base, ticketId, id, suffix);
-      store.configureNativeAssignment(id, { harness: config.harness, model: config.model, worktree: path, branch, machine: config.machine });
+      store.configureNativeAssignment(id, { harness: selected.harness, model: selected.model, worktree: path, branch, machine: config.machine });
       let resolve!: (sessionId: string) => void;
       const started = new Promise<string>((r) => (resolve = r));
-      const session = this.#deps.runners[config.harness].start({
+      const session = this.#deps.runners[selected.harness].start({
         cwd: path,
-        model: config.model,
+        model: selected.model,
         writableDirs: gitDirs(config.repo, path),
         onSessionId: (sessionId) => {
           store.startNativeAssignment(id, sessionId);
@@ -352,10 +355,12 @@ export class Workers {
     const { store } = this.#deps;
     const controller = new AbortController();
     this.#inFlight.set(id, controller);
-    store.startWorkerTurn(id, "dispatch");
     let result: TurnResult;
     try {
-      result = await session.send(prompt, controller.signal);
+      const choice = await this.#effort(id, "dispatch", prompt, controller.signal);
+      if (controller.signal.aborted) throw new Error("Turn cancelled before Worker start");
+      store.startWorkerTurn(id, "dispatch", choice.effort, this.#selectionReason(id, choice.reason));
+      result = await session.send(prompt, controller.signal, choice.effort);
     } catch (error) {
       if (this.#stopping) return;
       if (controller.signal.aborted) {
@@ -399,13 +404,16 @@ export class Workers {
     const turn = store.beginTurn(id);
     if (turn !== nextTurn) throw new Error(`assignment ${id}: queued turn number changed`);
     const kind = key.startsWith("stuck-recovery-") ? "recovery" : key.startsWith("redirect-") ? "redirect" : queued.kind;
-    store.startWorkerTurn(id, kind);
     onStart?.(turnId);
     const controller = new AbortController();
     this.#inFlight.set(id, controller);
     let result: TurnResult;
     try {
-      result = await session.send(workerTurnPrompt(queued.prompt), controller.signal);
+      const choice = await this.#effort(id, kind, queued.prompt, controller.signal);
+      if (controller.signal.aborted) throw new Error("Turn cancelled before Worker start");
+      store.startWorkerTurn(id, kind, choice.effort, this.#selectionReason(id, choice.reason));
+      queueStatusCard(store, assignment.ticketId);
+      result = await session.send(workerTurnPrompt(queued.prompt), controller.signal, choice.effort);
     } catch (error) {
       if (this.#stopping) return;
       store.finishQueuedTurn(id, key);
@@ -426,6 +434,17 @@ export class Workers {
     const current = store.getAssignment(id);
     if (result.status === "completed" && current.state === "running" && current.outcome !== "failed") await onComplete?.(result);
     this.#callbacksByKey.delete(this.#callbackKey(id, key));
+  }
+
+  #selectionReason(id: number, effortReason: string): string {
+    const assignment = this.#deps.store.getAssignment(id);
+    const modelChoice = this.#deps.store.selections.history(assignment.ticketId).findLast((choice) => choice.kind === "model" && choice.value === `${assignment.harness}/${assignment.model}`);
+    return [modelChoice?.reason, effortReason].filter(Boolean).join(" ");
+  }
+
+  #effort(id: number, kind: string, prompt: string, signal: AbortSignal) {
+    if (!this.#deps.router) return Promise.resolve({ effort: null, reason: "Harness default effort (no Router configured)." });
+    return chooseEffort({ store: this.#deps.store, assignmentId: id, kind, prompt, signal, router: this.#deps.router, runners: this.#deps.runners });
   }
 
   #failed(id: number, error: unknown): void {

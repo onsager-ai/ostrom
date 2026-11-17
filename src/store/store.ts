@@ -6,6 +6,7 @@ import { budgetReached, budgetUsage, budgetWarning } from "../budget/budgets.ts"
 import type { BudgetDefaults } from "../budget/budgets.ts";
 import { migrate } from "./migrations.ts";
 import { ModelStore } from "./models.ts";
+import { TicketSelections, type SelectionDecision } from "./ticket-selection.ts";
 
 export type SourceKind = "github";
 export type ThreadKind = "issue" | "pull_request";
@@ -83,7 +84,7 @@ export interface ReviewDelivery {
   reviewId: string;
 }
 
-export type CommandReceiptName = "redirect" | "pause" | "resume" | "stop" | "forbidden" | "close_issue" | "close_pull_request" | "ignore_issue_state";
+export type CommandReceiptName = "use" | "effort" | "redirect" | "pause" | "resume" | "stop" | "forbidden" | "close_issue" | "close_pull_request" | "ignore_issue_state";
 
 export interface PendingCommand {
   trigger: Trigger;
@@ -188,6 +189,7 @@ export interface WorkerTurn {
   harness: "claude" | "codex";
   requestedModel: string;
   requestedEffort: string | null;
+  reason: string | null;
   observedModel: string | null;
   observedEffort: string | null;
   kind: string;
@@ -204,6 +206,7 @@ export interface OperatorTicketDetail extends OperatorTicket {
   decisions: { id: number; verdict: Verdict; reason: string; decidedAt: string }[];
   assignments: Assignment[];
   turns: WorkerTurn[];
+  selections: SelectionDecision[];
   outbox: Reply[];
 }
 
@@ -369,6 +372,7 @@ type Row = Record<string, unknown>;
 
 export class Store {
   readonly models: ModelStore;
+  readonly selections: TicketSelections;
   readonly #db: DatabaseSync;
   readonly #now: () => Date;
 
@@ -377,6 +381,7 @@ export class Store {
     this.#now = options.now ?? (() => new Date());
     migrate(db, this.#now());
     this.models = new ModelStore(db, this.#now);
+    this.selections = new TicketSelections(db, this.#now);
   }
 
   /** Opens (creating if needed) the store at `path`; `:memory:` gives a throwaway store. */
@@ -661,7 +666,7 @@ export class Store {
        WHERE subscription.ticket_id = ? ORDER BY outbox.enqueued_at, outbox.id`,
       ticketId,
     ).map(toReply);
-    return { ...summary, context, triggers, decisions, assignments, turns: this.ticketTurns(ticketId), outbox };
+    return { ...summary, context, triggers, decisions, assignments, turns: this.ticketTurns(ticketId), selections: this.selections.history(ticketId), outbox };
   }
 
   /** The daemon-wide counter view. Time zone is SQLite's UTC day, matching stored timestamps. */
@@ -935,13 +940,13 @@ export class Store {
   }
 
   /** Records a native invocation, including a first turn that fails before returning a session ID. */
-  startWorkerTurn(assignmentId: number, kind: string, effort: string | null = null): number {
+  startWorkerTurn(assignmentId: number, kind: string, effort: string | null = null, reason: string | null = null): number {
     const assignment = this.getAssignment(assignmentId);
     if (assignment.harness === null || assignment.model === null) throw new Error("turn needs a configured native assignment");
     const result = this.#run(
-      `INSERT INTO turn (assignment_id, ticket_id, started_at, harness, requested_model, requested_effort, kind, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'running')`,
-      assignmentId, assignment.ticketId, this.#stamp(), assignment.harness, assignment.model, effort, kind,
+      `INSERT INTO turn (assignment_id, ticket_id, started_at, harness, requested_model, requested_effort, kind, reason, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running')`,
+      assignmentId, assignment.ticketId, this.#stamp(), assignment.harness, assignment.model, effort, kind, reason,
     );
     return Number(result.lastInsertRowid);
   }
@@ -962,7 +967,7 @@ export class Store {
       id: row["id"] as number, assignmentId: row["assignment_id"] as number, ticketId: row["ticket_id"] as number,
       startedAt: row["started_at"] as string, endedAt: row["ended_at"] as string | null,
       harness: row["harness"] as WorkerTurn["harness"], requestedModel: row["requested_model"] as string,
-      requestedEffort: row["requested_effort"] as string | null, observedModel: row["observed_model"] as string | null,
+      requestedEffort: row["requested_effort"] as string | null, reason: row["reason"] as string | null, observedModel: row["observed_model"] as string | null,
       observedEffort: row["observed_effort"] as string | null, kind: row["kind"] as string,
       inputTokens: row["input_tokens"] as number, cachedInputTokens: row["cached_input_tokens"] as number,
       outputTokens: row["output_tokens"] as number, status: row["status"] as WorkerTurn["status"], result: row["result"] as string | null,

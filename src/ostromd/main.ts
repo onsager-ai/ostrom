@@ -205,6 +205,7 @@ function makeWorkers(deps: MainDeps, store: Store): Workers {
   return new Workers({
     store,
     config: loadWorkerConfig(deps.env),
+    router: loadRouterConfig(deps.env),
     runners: deps.runners ?? realRunners(deps.env),
     codexSessions: deps.codexSessions ?? codexSessionsDir(),
     ...(deps.addWorktree === undefined ? {} : { addWorktree: deps.addWorktree }),

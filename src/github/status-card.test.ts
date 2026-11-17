@@ -8,6 +8,8 @@ const base: Omit<StatusCard, "state"> = {
   pullRequest: "https://github.com/onsager-ai/ostrom/pull/42",
   harness: "codex",
   model: "gpt-6-luna",
+  effort: "medium",
+  selectionReason: "Cheapest suitable model. Moderate effort for the first work turn.",
   lastActivityAt: new Date("2026-11-09T12:13:00Z"),
   now: new Date("2026-11-09T12:18:59Z"),
   markerId: "card-thread-7",
