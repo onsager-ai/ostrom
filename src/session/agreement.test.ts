@@ -1,14 +1,15 @@
 import { strict as assert } from "node:assert";
 import { readFileSync } from "node:fs";
 import { execFile } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { test } from "node:test";
 import type { SDKResultSuccess, SDKSystemMessage } from "@anthropic-ai/claude-agent-sdk";
-import type { AgentMessageItem, ItemCompletedEvent, ThreadStartedEvent, TurnCompletedEvent } from "@openai/codex-sdk";
+import { Codex, type AgentMessageItem, type ItemCompletedEvent, type ThreadStartedEvent, type TurnCompletedEvent } from "@openai/codex-sdk";
+import { sessionConfig } from "./config.ts";
 
 // The fixture projections are the fields the runner reads. Referencing SDK types
 // here makes removal or type changes in those fields a compile-time failure.
@@ -34,6 +35,30 @@ test("pinned Codex CLI recognizes App shell controls as booleans", async () => {
     // Unknown keys may be ignored; invalid-type rejection proves these keys are recognized.
     await assert.rejects(run('allow_login_shell="invalid"'), /allow_login_shell|boolean/);
     await assert.rejects(run('features.shell_snapshot="invalid"'), /shell_snapshot|boolean/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("pinned Codex SDK applies provider overrides to start and resume before session creation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ostrom-codex-provider-agreement-"));
+  try {
+    // Neither provider exists: config resolution fails before auth, session creation or model calls.
+    await writeFile(join(root, "config.toml"), 'model_provider="file_provider_missing"\n');
+    const env = { PATH: process.env["PATH"], HOME: root, CODEX_HOME: root };
+    const run = async (provider: string | undefined, resume: boolean) => {
+      const codex = new Codex(sessionConfig({ ...env, OSTROM_CODEX_PROVIDER: provider }).codex);
+      const options = { workingDirectory: root, model: "offline-probe" };
+      const thread = resume
+        ? codex.resumeThread("00000000-0000-0000-0000-000000000000", options)
+        : codex.startThread(options);
+      const { events } = await thread.runStreamed("offline provider probe", { signal: AbortSignal.timeout(15_000) });
+      for await (const event of events) assert.fail(`unexpected session event: ${event.type}`);
+    };
+    for (const resume of [false, true]) {
+      await assert.rejects(run(undefined, resume), /Model provider `file_provider_missing` not found/);
+      await assert.rejects(run("override_provider_missing", resume), /Model provider `override_provider_missing` not found/);
+      // A valid override passes provider resolution and reaches the pre-session Git check.
+      await assert.rejects(run("openai", resume), /Not inside a trusted directory/);
+    }
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
