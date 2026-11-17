@@ -84,11 +84,17 @@ async function consider(options: MergePassOptions, assignmentId: number, prNumbe
     const { pr } = observation.evidence;
     if (pr.state === "OPEN" && (pr.mergeStateStatus === "DIRTY" || pr.mergeable === "CONFLICTING")) {
       reason = `Conflicts with ${pr.base.ref}; the Worker needs to merge ${pr.base.ref}.`;
+      deliverConflictTurn(options, assignmentId, observation);
     }
     saveReason(options, candidate, reason);
     result.waiting.push({ assignmentId, reason });
   };
   if (options.allowSend === false) { wait("an earlier prerequisite pass failed"); return; }
+  if (observation.evidence.pr.state === "OPEN" &&
+      (observation.evidence.pr.mergeStateStatus === "DIRTY" || observation.evidence.pr.mergeable === "CONFLICTING")) {
+    wait("pull request conflicts with its base");
+    return;
+  }
   const retryAt = options.store.mergeRetryAt(options.repo, prNumber);
   if (retryAt !== null && Date.parse(retryAt) > clock(options).getTime()) { wait(`merge retry after ${retryAt}`); return; }
   const eligibility = await eligibilityFor(options, assignmentId, observation, candidate);
@@ -148,6 +154,25 @@ async function consider(options: MergePassOptions, assignmentId: number, prNumbe
     complete(options, candidate, confirmed, attempt.id, sha === null ? "unknown" : "ostrom");
     result.merged.push(assignmentId);
   } catch (error) { result.failed.push({ assignmentId, error: message(error) }); }
+}
+
+function deliverConflictTurn(options: MergePassOptions, assignmentId: number, observation: Observation): void {
+  const { store } = options;
+  const assignment = store.getAssignment(assignmentId);
+  const ticket = store.getTicket(assignment.ticketId);
+  if (options.allowSend === false || !observation.owned || !observation.issueOpen || assignment.state !== "running" ||
+      assignment.outcome === "failed" || ticket.state !== "open" || ticket.stopRequestedAt !== null ||
+      budgetReached(store.ticketBudget(ticket.id), clock(options)) !== null ||
+      store.unansweredStalls().some((stall) => stall.assignmentId === assignmentId) || !store.assignmentWorkIdle(assignmentId)) return;
+  const { pr } = observation.evidence;
+  // The durable queue retains finished keys, so an unresolved conflict is not retried until the
+  // head or base moves. No await separates the local eligibility check from durable delivery.
+  const key = `conflict-a${assignmentId}-${pr.head.sha}-${pr.base.sha}`;
+  options.workers.deliver(assignmentId, key,
+    `Pull request #${pr.number} conflicts with its base branch ${pr.base.ref}. Merge the latest ${pr.base.ref} into the existing PR branch ${pr.head.ref} using git merge, ` +
+    "resolve the conflicts keeping both sides' intent, and keep every entry in append-only files such as CHANGELOG.md. " +
+    "Commit and push the result to the existing PR branch; do not open a new PR. This is a local branch merge, not permission to merge the pull request on GitHub.",
+    () => {});
 }
 
 async function observe(options: MergePassOptions, assignmentId: number, prNumber: number): Promise<Observation> {

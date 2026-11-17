@@ -41,7 +41,7 @@ function fixture(policy: MergePolicy = { strategy: "unattended" }) {
   const pr = store.ensureThread({ sourceId: source.id, kind: "pull_request", number: 2, url: "https://github.com/o/r/pull/2" });
   store.subscribe(ticket, pr);
   const remote = {
-    merged: false, head: "head", mergeable: "MERGEABLE", mergeStateStatus: "CLEAN", base: "main", issueState: "open", permission: "write", reviews: [review()], comments: [] as unknown[],
+    merged: false, head: "head", baseSha: "base", mergeable: "MERGEABLE", mergeStateStatus: "CLEAN", base: "main", issueState: "open", permission: "write", reviews: [review()], comments: [] as unknown[],
     putError: null as string | null, mergeBeforeError: false, mergedBy: { id: 42, login: "marvin" },
     refuse: false, failConfirmation: false, rules: [] as unknown[], protection: {} as Record<string, unknown>,
     openPulls: [2], onFinalRead: null as (() => void) | null,
@@ -68,7 +68,7 @@ function fixture(policy: MergePolicy = { strategy: "unattended" }) {
         checkSuite: { databaseId: 1, app: { databaseId: 15368 } } };
       return JSON.stringify({ data: { repository: { pullRequest: {
         number: 2, state: remote.merged ? "MERGED" : "OPEN", isDraft: false, mergeable: remote.mergeable, mergeStateStatus: remote.mergeStateStatus,
-        reviewDecision: "APPROVED", author: { login: "author" }, headRefName: "b", headRefOid: remote.head, baseRefName: remote.base, baseRefOid: "base",
+        reviewDecision: "APPROVED", author: { login: "author" }, headRefName: "b", headRefOid: remote.head, baseRefName: remote.base, baseRefOid: remote.baseSha,
         reviewThreads: connection([]), reviews: connection(remote.reviews), commits: { nodes: [{ commit: {
           oid: remote.head, associatedPullRequests: connection([{ number: 2 }]), statusCheckRollup: { state: "SUCCESS", contexts: connection([check]) },
           checkSuites: connection([{ databaseId: 1, status: "COMPLETED", conclusion: "SUCCESS", repository: { nameWithOwner: "o/r" }, matchingPullRequests: connection([{ number: 2 }]),
@@ -90,7 +90,7 @@ function fixture(policy: MergePolicy = { strategy: "unattended" }) {
     if (path.includes("/pulls?")) return JSON.stringify(remote.openPulls.map((number) => ({ number, html_url: `https://github.com/o/r/pull/${number}`,
       state: remote.merged ? "closed" : "open", merged_at: remote.merged ? now.toISOString() : null })));
     if (path === "repos/o/r/pulls/2") return JSON.stringify({
-      head: { ref: "b", sha: remote.head, repo: { full_name: "o/r" } }, base: { ref: "main", sha: "base", repo: { full_name: "o/r" } },
+      head: { ref: "b", sha: remote.head, repo: { full_name: "o/r" } }, base: { ref: remote.base, sha: remote.baseSha, repo: { full_name: "o/r" } },
       merge_commit_sha: remote.merged ? "merge" : null, merged_by: remote.merged ? remote.mergedBy : null,
       merged_at: remote.merged ? "2026-11-10T12:11:00.000Z" : null,
     });
@@ -98,7 +98,12 @@ function fixture(policy: MergePolicy = { strategy: "unattended" }) {
   };
   const released: number[] = [];
   const cancelled: number[] = [];
-  const workers = { release(id: number) { released.push(id); store.releaseAssignmentReservation(id); },
+  const deliveries: { key: string; prompt: string }[] = [];
+  const workers = { deliver(id: number, key: string, prompt: string) {
+      const added = store.enqueueTurn({ assignmentId: id, deliveryKey: key, prompt, kind: "conflict" });
+      if (!added.duplicate) deliveries.push({ key, prompt });
+      return !added.duplicate;
+    }, release(id: number) { released.push(id); store.releaseAssignmentReservation(id); },
     cancel(id: number) { cancelled.push(id); return false; }, wake() {} } as unknown as Workers;
   const options = (): MergePassOptions => ({ store, workers, gh, repo: "o/r", policy, now: () => now });
   const runner = new FakeRunner();
@@ -116,7 +121,7 @@ function fixture(policy: MergePolicy = { strategy: "unattended" }) {
   const send = () => sendDueReplies({ store, gh, repo: "o/r", now: () => now, batchWindowMs: 0, commentGapMs: 0 });
   const attempts = () => store.mergeAttempts("o/r", 2);
   const replies = () => store.pendingReplies().filter((reply) => !reply.id.startsWith("card-"));
-  return { store, assignment, ticket, issue, pr, source, remote, puts, calls, options, route, send, attempts, replies, runner, released, cancelled,
+  return { store, assignment, ticket, issue, pr, source, remote, puts, calls, options, route, send, attempts, replies, runner, released, cancelled, deliveries,
     now: () => now, advance(ms: number) { now = new Date(now.getTime() + ms); }, reads: () => graphqlReads };
 }
 type Fixture = ReturnType<typeof fixture>;
@@ -174,6 +179,72 @@ test("existing merge evidence reports conflicts on the card and clears them on t
       } finally { f.store.close(); }
     }
   }
+});
+
+test("conflicts deliver once per head and base, retain the wait after completion, and retry after base moves", async () => {
+  for (const conflict of ["DIRTY", "CONFLICTING"]) {
+    const f = fixture({ strategy: "approvals", approvals: 1, approvers: [] });
+    try {
+      if (conflict === "DIRTY") f.remote.mergeStateStatus = conflict;
+      else f.remote.mergeable = conflict;
+      assert.deepEqual((await mergePass(f.options())).failed, []);
+      assert.equal(f.deliveries.length, 1);
+      const { key, prompt } = f.deliveries[0]!;
+      assert.equal(key, `conflict-a${f.assignment}-head-base`);
+      assert.match(prompt, /Merge the latest main into the existing PR branch b using git merge/);
+      assert.match(prompt, /both sides' intent/);
+      assert.match(prompt, /keep every entry.*CHANGELOG\.md/);
+      assert.match(prompt, /push.*do not open a new PR/);
+      await mergePass(f.options());
+      assert.equal(f.deliveries.length, 1, "queued conflict is not delivered again");
+      f.store.beginQueuedTurn(f.assignment, key, "s:1");
+      f.store.finishQueuedTurn(f.assignment, key);
+      assert.equal(f.store.assignmentWorkIdle(f.assignment), true);
+      await mergePass(f.options());
+      assert.equal(f.deliveries.length, 1, "finished conflict key remains deduplicated");
+      assert.match(f.store.statusCardBody(f.issue)!, /Conflicts with main; the Worker needs to merge main\./);
+      f.remote.baseSha = "base-next";
+      await mergePass(f.options());
+      assert.equal(f.deliveries.length, 2);
+      assert.equal(f.deliveries[1]!.key, `conflict-a${f.assignment}-head-base-next`);
+      f.store.beginQueuedTurn(f.assignment, f.deliveries[1]!.key, "s:2");
+      f.store.finishQueuedTurn(f.assignment, f.deliveries[1]!.key);
+      f.remote.head = "head-next";
+      await mergePass(f.options());
+      assert.equal(f.deliveries.length, 3);
+      assert.equal(f.puts.length, 0);
+    } finally { f.store.close(); }
+  }
+});
+
+test("conflict recovery respects ticket state, durable idle work, budgets, stalls and prerequisite failures", async () => {
+  const blockers: Record<string, (f: Fixture) => void> = {
+    paused: (f) => f.store.pauseTicket(f.ticket, "operator"),
+    stopping: (f) => f.store.requestStop(f.ticket),
+    ended: (f) => f.store.endTicket(f.ticket),
+    busy: (f) => { f.store.beginTurn(f.assignment); },
+    queued: (f) => { f.store.enqueueTurn({ assignmentId: f.assignment, deliveryKey: "other", kind: "follow_up", prompt: "work" }); },
+    budget: (f) => { f.store.setTicketBudget(f.ticket, { timeMinutes: 1, idleMinutes: 30, turns: 20, tokens: 1000, escalations: 0 }); f.advance(2 * MINUTE); },
+    stalled: (f) => { f.store.recordStall({ assignmentId: f.assignment, semonReason: "idle", detail: null }); },
+    closedIssue: (f) => { f.remote.issueState = "closed"; },
+    ambiguousOwnership: (f) => { f.remote.openPulls = [2, 3]; },
+    clean: (f) => { f.remote.mergeStateStatus = "CLEAN"; },
+  };
+  for (const [name, block] of Object.entries(blockers)) {
+    const f = fixture();
+    try {
+      f.remote.mergeStateStatus = "DIRTY";
+      block(f);
+      assert.deepEqual((await mergePass(f.options())).failed, [], name);
+      assert.equal(f.deliveries.length, 0, name);
+    } finally { f.store.close(); }
+  }
+  const f = fixture();
+  try {
+    f.remote.mergeStateStatus = "DIRTY";
+    await mergePass({ ...f.options(), allowSend: false });
+    assert.equal(f.deliveries.length, 0);
+  } finally { f.store.close(); }
 });
 
 test("review wait reaches time budget, extension resumes, and merge needs no human comment", async () => {

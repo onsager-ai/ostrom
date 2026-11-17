@@ -61,6 +61,7 @@ export function workerTurnPrompt(prompt: string): string {
 
 function queuedTurnKind(key: string): QueuedTurnKind {
   if (key.startsWith("review-")) return "review";
+  if (key.startsWith("conflict-")) return "conflict";
   if (key.startsWith("budget-pause-")) return "budget_pause";
   if (key.startsWith("stuck-")) return "stuck";
   if (key.startsWith("recovery-")) return "recovery";
