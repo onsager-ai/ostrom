@@ -43,12 +43,16 @@ visible without a PM interpreting the store. It cannot see an unsubmitted GitHub
 
 ## What the operator sees
 
-Use ordinary text lists and a ticket detail panel. Keep raw state (`open`, `paused`, `ended`)
-alongside its explanation: a running assignment between turns is often waiting for review.
+Use one card per active ticket: issue/PR number, the latest decision's summary, a plain-language
+phase, numbered PR links, last completed turn, and small time/turn/token budget meters. Keep raw
+state, branch, native session ID, worktree and timelines in a collapsed Details disclosure per
+card. Show actionable attention items above the cards; keep Watchdog/machine status in a quiet
+footer. Failures use a compact table; intake and recently finished tickets start collapsed.
+Temperature needs attention at 75 °C or above.
 
 | View | Existing source and smallest addition |
 |---|---|
-| Attention | `/v1/status.stuckTickets` with cause and detection time; paused tickets with `pauseCause`; active tickets at 80% of a budget; failed Watchdog reads; local heat at or above 85 °C. Show counts and links to the relevant ticket. |
+| Attention | `/v1/status.stuckTickets` with cause and detection time; paused tickets with `pauseCause`; active tickets at 80% of a budget; failed Watchdog reads; local heat at or above 75 °C. Show counts and links to the relevant ticket. |
 | Active tickets | `/v1/tickets`: issue URL, state, harness/model/machine, `turnStartedAt`, `lastActivityAt`, session ID and budgets. Label last activity as **last completed turn**, with absolute time and age; null means no completed turn. Do not call it live session activity. |
 | PR and merge wait | Add subscribed PR thread URLs and the latest assignment's stored `MergeCandidate` summary to each ticket: policy, `blockingReason`, `quietDeadline`. Show the stored reason verbatim, including `policy approvals are not satisfied` and `quiet period has not elapsed`; null means no recorded reason, not permission to merge. |
 | Recent failures | Ticket detail already has all assignments: show `outcome=failed` with `lastError`/`outcomeAt`, and dispatch failures with `endReason`/`endedAt`. Add a compact latest-failure summary across assignments to list rows so failures remain visible after a ticket ends or another assignment starts. Keep the newest 20 failures visible. |
@@ -88,8 +92,8 @@ Serve one static HTML page with plain JavaScript and CSS from the CLI; no fronte
 asset CDN or frontend build step. Reuse the CLI socket client and the operator API types. Add only
 the projections and intake receipts above; the browser never opens SQLite or queries GitHub/Semon.
 
-Fetch status, ticket summaries and intake immediately, then every **5 seconds**; fetch the selected
-ticket detail on the same cycle. Do not overlap cycles. Show last successful refresh and daemon
+Fetch status, ticket summaries and intake immediately, then every **5 seconds**; fetch every active
+ticket's detail on the same cycle. Do not overlap cycles. Show last successful refresh and daemon
 observation times: a fresh page fetch does not imply a fresh GitHub or Semon poll. After a failed
 cycle, keep the last snapshot marked **stale** with the error until a full refresh succeeds. If the
 daemon is down, show that fact; the dashboard does not use the CLI's direct-store fallback.
