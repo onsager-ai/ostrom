@@ -168,6 +168,12 @@ daemon API: attention items, ticket progress, merge waits, failures, budgets and
 fixed before it finished: a Codex reconnect notice ended a ticket and its reason was lost, a turn
 budget cancelled the last allowed turn, and several page gaps. Worker placement is deferred.
 
+## First real-repository pilot
+
+Passed 2026-11-17. [Six issues on duhem and tolmap](pilot-1.md) became PRs that the App authored
+and merged, under the approvals policy and tolmap's required check. The run found the defects to fix
+before wider use: #725 and #729 to #733.
+
 ## Non-goals (for now)
 
 - Signed policy, gates, actor manifests, check catalogues, or verdict records.
