@@ -19,6 +19,12 @@ for (const state of ["working", "recovering", "paused", "stuck", "waiting_to_mer
   });
 }
 
+test("status card shows stale approvals instead of approval satisfaction", () => {
+  const rendered = renderStatusCard({ ...base, state: "waiting_to_merge", mergeStatus: "policy approvals; head 53975b6; Approved on 0e65021; the head is now 53975b6. Approve again to merge." });
+  assert.ok(rendered.includes("Approved on 0e65021; the head is now 53975b6. Approve again to merge."));
+  assert.doesNotMatch(rendered, /Approved, waiting to merge/);
+});
+
 test("status card snapshot: paused while waiting for a human merge", async () => {
   assert.equal(
     renderStatusCard({ ...base, state: "paused", mergeStatus: "policy human; head abc123; waiting for a human merge" }),

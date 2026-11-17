@@ -84,7 +84,25 @@ export function mergeEligibility(input: EligibilityInput): { eligible: true } | 
   if ([...effective.values()].some((review) => review.state === "CHANGES_REQUESTED") || evidence.threads.some((thread) => !thread.resolved) || evidence.pr.reviewDecision === "CHANGES_REQUESTED" || evidence.pr.reviewDecision === "REVIEW_REQUIRED") return { eligible: false, reason: "review requirements are not satisfied" };
   if (input.policy.strategy === "approvals") {
     const approval = input.approvals;
-    if (approval === undefined || countApprovals(evidence.reviews, input.expected.head, approval.authorLogin, approval.identities, input.policy.approvers) < input.policy.approvals) return { eligible: false, reason: "policy approvals are not satisfied" };
+    if (approval === undefined) return { eligible: false, reason: "policy approvals are not satisfied" };
+    const approved = effectiveReviews(evidence.reviews);
+    const allowed = new Set(input.policy.approvers.map((login) => login.toLowerCase()));
+    const eligibleReviews = [...approved.values()].filter((review) => {
+      const author = review.author;
+      if (review.state !== "APPROVED" || author === null || author.id === null || author.login === null) return false;
+      const identity = approval.identities.get(author.id);
+      return identity !== undefined && !identity.bot && identity.login.toLowerCase() !== approval.authorLogin.toLowerCase() &&
+        ["write", "maintain", "admin"].includes(identity.permission) &&
+        (allowed.size === 0 || allowed.has(identity.login.toLowerCase()));
+    });
+    if (countApprovals(evidence.reviews, input.expected.head, approval.authorLogin, approval.identities, input.policy.approvers) < input.policy.approvals) {
+      const stale = eligibleReviews.filter((review) => review.commitOid !== null && review.commitOid !== input.expected.head);
+      if (stale.length >= input.policy.approvals) {
+        const shas = [...new Set(stale.slice(0, input.policy.approvals).map((review) => review.commitOid!.slice(0, 7)))];
+        return { eligible: false, reason: `Approved on ${shas.join(", ")}; the head is now ${input.expected.head.slice(0, 7)}. Approve again to merge.` };
+      }
+      return { eligible: false, reason: "policy approvals are not satisfied" };
+    }
   }
   if (input.policy.strategy === "human") return { eligible: false, reason: "waiting for a human merge" };
   if (!local.readyReplySent || local.quietUntil === null || local.quietUntil > local.now) return { eligible: false, reason: "quiet period has not elapsed" };

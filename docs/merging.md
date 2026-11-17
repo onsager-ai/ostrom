@@ -163,7 +163,8 @@ come from it. Match logins case-insensitively; record stable user IDs when read.
 non-dismissed APPROVED reviews on this head from people with repository write/maintain/admin
 permission, excluding bots and the PR author. A later COMMENTED review does not cancel an approval;
 a later decisive request for changes blocks. A new head needs fresh approvals even if the repository
-does not dismiss stale reviews. GitHub's own stricter approval requirements always apply. [2][7][8]
+does not dismiss stale reviews; when only eligible approvals on older heads remain, the merge reason
+names their short SHAs and says to approve again. GitHub's own stricter approval requirements always apply. [2][7][8]
 
 Reject unknown strategies, inconsistent fields, invalid counts and duplicate/empty allowlist entries
 at startup, with non-zero exit. Human policy ignores CI readiness for performing merges because

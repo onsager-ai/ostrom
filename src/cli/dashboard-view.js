@@ -14,6 +14,7 @@ export function ticketPhase(ticket) {
   const reason = ticket.mergeCandidate?.blockingReason;
   if (!reason) return { key: "ready", label: "Ready to merge", tone: "green", detail: "" };
   const lower = reason.toLowerCase();
+  if (lower.startsWith("approved on ")) return { key: "approval", label: "Approval is out of date", tone: "amber", detail: reason };
   if (lower.includes("approvals are not satisfied")) return { key: "approval", label: "Waiting for approval", tone: "amber", detail: "Only submitted reviews count; check GitHub for an unsubmitted draft." };
   if (lower.includes("quiet period")) return {
     key: "quiet", label: ticket.mergeCandidate.quietDeadline ? `Approved, merges after ${localTime(ticket.mergeCandidate.quietDeadline)}` : "Approved, waiting for quiet period",
