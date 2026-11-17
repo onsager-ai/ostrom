@@ -1,3 +1,4 @@
+import { overrideSelection } from "../router/selection.ts";
 import { queueStatusCard } from "../github/cards.ts";
 import { ghGet, type GhRunner } from "../github/gh.ts";
 import type { Store, Trigger } from "../store/store.ts";
@@ -97,7 +98,14 @@ export async function routeCommands(
         pass.handled.push({ triggerId: pending.trigger.id, ticketId: pending.ticketId, command, allowed });
         continue;
       }
-      if (command === "close_pull_request") {
+      if ((command === "use" || command === "effort") && parsed.kind === "command" && "value" in parsed) {
+        let body: string;
+        try { body = overrideSelection(store, pending.ticketId, command === "use" ? "model" : "effort", parsed.value); }
+        catch (error) { body = `Override refused: ${message(error)}`; }
+        store.enqueueReply({ id: `selection-${pending.trigger.id}-${pending.ticketId}`, threadId: pending.trigger.threadId, body });
+        store.recordCommandReceipt(pending.trigger.id, pending.ticketId, command, true);
+        queueStatusCard(store, pending.ticketId);
+      } else if (command === "close_pull_request") {
         const assignment = store.latestAssignment(pending.ticketId);
         if (assignment?.state !== "running") throw new Error(`ticket ${pending.ticketId} has no running Worker`);
         // GitHub reports a merged PR as closed. A merge is the work done, which the Router's outcome

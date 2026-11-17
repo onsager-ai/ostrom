@@ -17,6 +17,8 @@ export interface StatusCard {
   pullRequest?: string;
   harness: "claude" | "codex";
   model: string;
+  effort?: string | null;
+  selectionReason?: string;
   lastActivityAt: Date;
   now: Date;
   /** Stable outbox id, embedded to recognise and recover the card after a crash. */
@@ -48,6 +50,8 @@ export function renderStatusCard(card: StatusCard): string {
   lines.push(
     "",
     `Harness: \`${card.harness}\` · Model: \`${card.model}\``,
+    ...(card.effort === undefined ? [] : [`Effort: \`${card.effort ?? "harness default"}\``]),
+    ...(card.selectionReason === undefined ? [] : [`Selection: ${card.selectionReason}`]),
     `Last activity: ${utcMinute(card.lastActivityAt)}`,
     controlsLine(),
     "",

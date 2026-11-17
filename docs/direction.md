@@ -146,8 +146,8 @@ nothing is built or tested locally on the operator's laptop. Milestone-1 budget 
 `OSTROM_BUDGET_TURNS=80`, `OSTROM_BUDGET_TOKENS=1000000` (fresh input plus output; cached input is
 recorded but not limited), and `OSTROM_BUDGET_ESCALATIONS=0`. A new ticket stores these values, so
 later environment changes do not alter existing work; `ostrom
-extend` raises an individual ticket's limits. Workers run on one configured model; choosing a model
-and effort per ticket is designed in [model-selection.md](model-selection.md).
+extend` raises an individual ticket's limits. The Router chooses a model per ticket and an effort per turn within the operator’s allowed selections;
+without selections the configured Worker model remains in use. See [model-selection.md](model-selection.md).
 
 ## Milestone 2
 
@@ -180,7 +180,10 @@ Accepted 2026-11-17. [The design](model-selection.md) lets Ostrom choose each ti
 each turn's effort within limits the operator sets, learn from past outcomes, and escalate within
 one harness when a ticket struggles. The operator chose the lowest cost that still merges as the
 default objective, and allowed models selected from those the harnesses report. Rule 3 now lets
-the Router make model and effort judgements.
+the Router make model and effort judgements. Discovery, stored selections, Router choices, durable
+overrides and reasons on the status card/dashboard are implemented. Outcome history and escalation
+remain planned. Models requiring approval fall back to a model without approval until explicitly
+overridden; with no such model, dispatch waits.
 
 ## Non-goals (for now)
 

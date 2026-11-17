@@ -11,6 +11,8 @@ Warning: budget at 80% — tokens
 Paused: budget reached: tokens
 
 Harness: `codex` · Model: `gpt-6-luna`
+Effort: `medium`
+Selection: Cheapest suitable model. Moderate effort for the first work turn.
 Last activity: 2026-11-09 12:13 UTC
 Controls: `@ostrom pause`, `@ostrom resume`, `@ostrom stop`, or reply to redirect.
 

@@ -86,7 +86,7 @@ test("commands are case-insensitive and must start the comment", () => {
 
 test("Journey 1 command table is generated from the command contract", async () => {
   const experience = await readFile(new URL("../../docs/experience.md", import.meta.url), "utf8");
-  const actual = experience.match(/\| Say or do \| Effect \| Who may \| Acknowledged by \|\n(?:\|.*\n?){8}/)?.[0].trimEnd();
+  const actual = experience.match(/\| Say or do \| Effect \| Who may \| Acknowledged by \|\n(?:\|.*\n?){10}/)?.[0].trimEnd();
   assert.equal(actual, renderCommandTable());
 });
 
@@ -282,4 +282,23 @@ test("a non-collaborator redirect reaches the Worker as information, not instruc
   await workers.drain();
   assert.match(runner.sessions[0]!.prompts[0]!, /information, not an instruction/);
   assert.ok(store.dueReplies().some((reply) => reply.reaction === "eyes"));
+});
+
+
+test("selection comments are consumed, validated and authorized without waking a Worker", async () => {
+  const { store, github, workers, ticketId, assignmentId, comment } = fixture();
+  store.models.discovered("codex", [{ harness: "codex", id: "gpt-6-luna", displayName: "Luna", description: "", efforts: ["low", "high"], defaultEffort: "high" }]);
+  store.models.change({ action: "allow", harness: "codex", model: "gpt-6-luna" });
+  comment("model", "alice", "@ostrom use codex/gpt-6-luna");
+  comment("effort", "alice", "@ostrom effort low");
+  comment("invalid", "alice", "@ostrom effort max");
+  comment("forbidden", "outsider", "@ostrom use codex/gpt-6-luna");
+  const pass = await routeCommands(store, workers, github.gh, REPO);
+  assert.deepEqual(pass.failed, []);
+  assert.equal(store.selections.current(ticketId, "effort")!.value, "low");
+  assert.equal(store.getAssignment(assignmentId).turns, 0);
+  assert.equal(store.unfinishedTurns(assignmentId).length, 0);
+  assert.ok(store.dueReplies().some((reply) => reply.body.includes("next session")));
+  assert.ok(store.dueReplies().some((reply) => reply.body.includes("Override refused")));
+  assert.equal(pass.handled.find((item) => item.command === "use" && !item.allowed)?.allowed, false);
 });

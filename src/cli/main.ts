@@ -26,6 +26,8 @@ commands:
   extend <ticket> --time M [--turns N] [--tokens N]
   preview
   dashboard
+  model <ticket> <model>
+  effort <ticket> <level>
   models [allow|remove|set|objective|refresh|export|import]
 
 Read-only commands fall back to OSTROM_DB when ostromd is not running.`;
@@ -33,6 +35,7 @@ Read-only commands fall back to OSTROM_DB when ostromd is not running.`;
 type Command =
   | { name: "status" | "tickets" | "preview"; json: boolean }
   | { name: "show" | "pause" | "resume" | "stop"; ticketId: number; json: boolean }
+  | { name: "model" | "effort"; ticketId: number; value: string; json: boolean }
   | { name: "extend"; ticketId: number; increases: { timeMinutes?: number; turns?: number; tokens?: number }; json: boolean };
 
 export async function main(argv: readonly string[], env: Record<string, string | undefined> = process.env): Promise<number> {
@@ -87,6 +90,7 @@ function parse(argv: readonly string[]): Command | null {
   if (args.length === 2 && (args[0] === "show" || args[0] === "pause" || args[0] === "resume" || args[0] === "stop") && /^[1-9]\d*$/.test(args[1]!)) {
     return { name: args[0], ticketId: Number(args[1]), json };
   }
+  if (args.length === 3 && (args[0] === "model" || args[0] === "effort") && /^[1-9]\d*$/.test(args[1]!)) return { name: args[0], ticketId: Number(args[1]), value: args[2]!, json };
   if (args[0] !== "extend" || !/^[1-9]\d*$/.test(args[1] ?? "")) return null;
   const increases: { timeMinutes?: number; turns?: number; tokens?: number } = {};
   for (let index = 2; index < args.length; index += 2) {
@@ -107,6 +111,7 @@ async function api(command: Command, env: Record<string, string | undefined>): P
   if (command.name === "tickets") return call(socketPath, "GET", "/v1/tickets");
   if (command.name === "show") return call(socketPath, "GET", `/v1/tickets/${command.ticketId}`);
   if (command.name === "preview") return call(socketPath, "GET", "/v1/preview");
+  if (command.name === "model" || command.name === "effort") return call(socketPath, "POST", `/v1/tickets/${command.ticketId}/${command.name}`, { value: command.value });
   if (command.name === "extend") return call(socketPath, "POST", `/v1/tickets/${command.ticketId}/extend`, command.increases);
   if (command.name === "pause" || command.name === "resume" || command.name === "stop") {
     return call(socketPath, "POST", `/v1/tickets/${command.ticketId}/${command.name}`);
@@ -165,6 +170,7 @@ async function direct(command: Command, path: string, env: Record<string, string
 }
 
 function output(command: Command, value: unknown): void {
+  if (!command.json && (command.name === "model" || command.name === "effort")) { process.stdout.write(`${(value as { message: string }).message}\n`); return; }
   if (command.json) {
     process.stdout.write(`${JSON.stringify(value)}\n`);
     return;
@@ -195,7 +201,8 @@ function show(ticket: OperatorTicketDetail): void {
   for (const decision of ticket.decisions) process.stdout.write(`decision ${decision.id}  ${decision.verdict}  ${decision.reason}\n`);
   for (const trigger of ticket.triggers) process.stdout.write(`trigger ${trigger.id}  ${trigger.kind}  ${trigger.url}\n`);
   for (const assignment of ticket.assignments) process.stdout.write(`assignment ${assignment.id}  ${assignment.state}  ${assignment.outcome ?? "-"}\n`);
-  for (const turn of ticket.turns) process.stdout.write(`turn ${turn.id}  ${turn.kind}  ${turn.status}  model ${turn.observedModel ?? "unverified"} (requested ${turn.requestedModel})  effort ${turn.observedEffort ?? "unverified"} (requested ${turn.requestedEffort ?? "default"})\n`);
+  for (const selection of ticket.selections) process.stdout.write(`selection ${selection.kind}  ${selection.value ?? "waiting"}  ${selection.source}  ${selection.reason}\n`);
+  for (const turn of ticket.turns) process.stdout.write(`turn ${turn.id}  ${turn.kind}  ${turn.status}  model ${turn.observedModel ?? "unverified"} (requested ${turn.requestedModel})  effort ${turn.observedEffort ?? "unverified"} (requested ${turn.requestedEffort ?? "default"})  ${turn.reason ?? ""}\n`);
   for (const reply of ticket.outbox) process.stdout.write(`outbox ${reply.id}  ${reply.kind}  ${reply.sentAt === null ? "pending" : "sent"}\n`);
 }
 

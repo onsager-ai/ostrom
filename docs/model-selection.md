@@ -1,7 +1,7 @@
 # Model selection
 
 Status: accepted, 2026-11-17. PR 1 implements effort and turn records; PR 2 implements discovery
-and stored operator selections. Selection consumption remains planned. The operator asked for
+and stored operator selections. PR 3 consumes selections and implements choices and overrides. The operator asked for
 selection that is smarter than a fixed tier table, optimised for the operator's experience. On
 2026-11-17 they chose: **the lowest cost that still merges** as the default objective, **escalation
 within one harness** at first, allowed models **selected by an admin from those the harnesses
@@ -95,8 +95,11 @@ one-line reason. Its input:
 - the allowed models, with their cost and approval flag;
 - a small table of past outcomes for this repository (below).
 
-Code checks the choice: it must be on the list, and an approval model waits for the operator. An
-invalid choice falls back to the cheapest model, and that fallback is recorded as a decision.
+Code checks the choice: it must be on the list. If the Router picks a model that needs approval,
+Ostrom starts on the cheapest model that does not, and posts on the ticket that the operator can
+approve the pick with `@ostrom use <model>`. If every allowed model needs approval, the ticket waits
+for that override. An invalid choice falls back to the cheapest model, and that fallback is recorded
+as a decision.
 
 The model stays fixed for the ticket's session. Changing models mid-session discards the cached
 context, and resuming a session on different settings already caused #715.

@@ -6,6 +6,8 @@ import { chmod, mkdir, rm } from "node:fs/promises";
 import { availableParallelism } from "node:os";
 import { createServer, type Server } from "node:http";
 import { dirname, join } from "node:path";
+import { overrideSelection } from "../router/selection.ts";
+import { queueStatusCard } from "../github/cards.ts";
 import type { Store } from "../store/store.ts";
 
 export interface LocalApi {
@@ -68,6 +70,15 @@ export function localApi(store: Store, options: LocalApiOptions): LocalApi {
       const ticket = /^\/v1\/tickets\/([1-9]\d*)$/.exec(url.pathname);
       if (request.method === "GET" && ticket !== null) return reply(response, 200, store.operatorTicket(Number(ticket[1])));
       if (request.method === "GET" && url.pathname === "/v1/preview") return reply(response, 200, { markdown: await options.control.preview() });
+      const selection = /^\/v1\/tickets\/([1-9]\d*)\/(model|effort)$/.exec(url.pathname);
+      if (request.method === "POST" && selection !== null) {
+        const value = await bodyJson(request) as { value?: unknown } | null;
+        if (typeof value?.value !== "string") throw new Error("value must be text");
+        const ticketId = Number(selection[1]);
+        const message = overrideSelection(store, ticketId, selection[2] as "model" | "effort", value.value);
+        queueStatusCard(store, ticketId);
+        return reply(response, 200, { message, ticket: store.operatorTicket(ticketId) });
+      }
       const action = /^\/v1\/tickets\/([1-9]\d*)\/(pause|resume|stop|extend)$/.exec(url.pathname);
       if (request.method === "POST" && action !== null) {
         const ticketId = Number(action[1]);

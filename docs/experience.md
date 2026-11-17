@@ -73,6 +73,8 @@ reaction, and the status card shows the result.
 | `@ostrom stop` | Graceful stop: push work in progress, turn the PR into a draft, post one summary of where it stopped. The ticket ends. | Issue author, or repo triage or higher | 👍 and one closing comment |
 | Close the issue | Same as stop. The branch is kept; reopening the issue asks the Router again. | Whoever can close it | Card **Stopped: issue closed** |
 | Close the PR | Ends that attempt only; the issue stays open for a new decision | Whoever can close it | Card updated, no new comment |
+| `@ostrom use <model>` | Overrides the ticket model; an existing session keeps its model until the next session | Issue author, or repo triage or higher | Reply with the effective session boundary |
+| `@ostrom effort <level>` | Overrides effort from the next turn until changed | Issue author, or repo triage or higher | Reply confirming the effort |
 | A command from someone without permission | Ignored | | 😕 only; no comment, so no noise and no argument |
 
 One table in code defines the commands, permissions and reactions. The parser, the help line on the
