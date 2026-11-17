@@ -151,7 +151,7 @@ no log or transcript viewer of its own: sessions are read with Semon (`semon ses
 
 Every ticket runs under a budget with several limits: wall-clock time, idle time, turns, tokens,
 estimated cost, and model escalations. Ostrom chooses each ticket's model and each turn's effort
-within the operator's limits ([model-selection.md](model-selection.md), proposed).
+within the operator's limits ([model-selection.md](model-selection.md)).
 
 - At 80% of any limit, the status card and dashboard show a warning.
 - At a limit, the Worker **pauses**. It is not killed: it pushes its work in progress, and the stuck

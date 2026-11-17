@@ -1,9 +1,10 @@
 # Model selection
 
-Status: proposed, 2026-11-17. This is a design; none of it exists yet. The operator asked for
+Status: accepted, 2026-11-17. This is a design; none of it exists yet. The operator asked for
 selection that is smarter than a fixed tier table, optimised for the operator's experience. On
-2026-11-17 they chose two defaults: **the lowest cost that still merges**, and **escalation within
-one harness** at first.
+2026-11-17 they chose: **the lowest cost that still merges** as the default objective, **escalation
+within one harness** at first, allowed models **selected by an admin from those the harnesses
+report**, and the rule-3 amendment below.
 
 ## Starting point
 
@@ -29,31 +30,46 @@ turns on duhem came from Ostrom's defects, not from the model failing the task.
 The operator states constraints. Ostrom chooses within them, says why, and learns from the result.
 The operator does not name models for routine work.
 
-### Constraints
+### Allowed models: discovered, then chosen by the operator
 
-A small file, `OSTROM_MODELS_FILE`, lists what Ostrom may use. Proposed shape (JSON, so it parses
-without a new dependency):
+The operator chose on 2026-11-17: an admin selects the allowed models from those the harnesses
+report, and can customise each one. Nobody types model IDs or effort lists by hand.
 
-```json
-{
-  "objective": "cost",
-  "models": [
-    { "harness": "codex", "model": "gpt-6-luna", "efforts": ["low", "medium", "high"], "cost": 1 },
-    { "harness": "codex", "model": "gpt-6.1-terra", "efforts": ["low", "medium", "high"], "cost": 2 },
-    { "harness": "codex", "model": "gpt-6.1-sol", "efforts": ["medium", "high"], "cost": 4 },
-    { "harness": "claude", "model": "claude-opus-5-5", "efforts": ["medium"], "cost": 16, "approval": true }
-  ]
-}
-```
+**Discovery.** Ostrom asks each harness, on the operator's login, which models it offers:
 
-- `cost` is a relative weight, not a price. Subscription plans have no per-call price, and the
-  measured token history below replaces the weight once it exists.
-- `approval: true` means Ostrom asks on the issue and waits before using that model.
-- `objective` is `cost` by default. `balanced` and `quality` let the Router start higher on work it
-  judges large or risky.
-- Without the file, Ostrom behaves as today: the one configured model, now with an effort chosen per
-  turn. Existing deployments keep working.
-- The Router's own model stays a single setting. It is one-shot, cheap and already bounded.
+- Claude Agent SDK: `supportedModels()` returns each model's ID, display name, description and
+  `supportedEffortLevels`.
+- Codex: the app-server's `model/list` returns each model's ID, display name, description,
+  `supportedReasoningEfforts` and `defaultReasoningEffort`. It is marked experimental and the Codex
+  SDK does not expose it, so Ostrom calls the app-server directly and pins the response shape with
+  an agreement test (rule 5).
+
+Discovery runs when `ostromd` starts and when the operator asks. Its result is cached in the store,
+so a failed discovery call keeps the last good list and is reported, not hidden.
+
+**Selection.** `ostrom models` shows every discovered model, marked allowed or not, with its efforts
+and outcome history. The operator allows or removes models there (`ostrom models allow
+codex/gpt-6.1-sol`, `ostrom models remove …`); the dashboard shows the same list read-only. A newly
+discovered model is not allowed until the operator allows it. An allowed model that a harness stops
+offering is skipped and flagged.
+
+**Customisation.** Per allowed model, the operator may set:
+
+- `efforts`: a subset of the discovered efforts, for example to forbid `max`;
+- `approval`: Ostrom asks on the issue and waits before using the model;
+- `cost`: a relative weight for the cold start, before measured token history exists;
+- `note`: free text the Router reads, for example "use for Rust changes".
+
+Repository-wide: `objective` is `cost` by default; `balanced` and `quality` let the Router start
+higher on work it judges large or risky.
+
+The selections live in the store, not in a hand-edited file, so the CLI validates every change
+against the discovered list. `ostrom models export` and `import` move them between machines as
+JSON.
+
+Without any selection, Ostrom behaves as today: the one configured model, now with an effort chosen
+per turn. Existing deployments keep working. The Router's own model stays a single setting. It is
+one-shot, cheap and already bounded.
 
 ### Model: once per ticket
 
@@ -100,7 +116,7 @@ Code detects struggle, deterministically:
 The first response raises effort for the next turn. If that does not help, Ostrom moves the ticket
 to the next model by cost **in the same harness**: the old session writes a short handoff, and a new
 session continues on the same branch and worktree. Each model change counts against the existing
-`escalations` budget. Its default becomes 2 when a models file is present. A move to an approval
+`escalations` budget. Its default becomes 2 once the operator has allowed more than one model. A move to an approval
 model waits for the operator. Moving across harnesses is deferred until a real ticket needs it.
 
 ### What the operator sees and controls
@@ -118,11 +134,10 @@ model waits for the operator. Moving across harnesses is deferred until a real t
 
 ## Project rule 3
 
-Rule 3 in `AGENTS.md` sends only accept/ignore judgements and reply wording to a model. Choosing a
-model and an effort is a judgement too, so this design needs the rule amended to: "Only
+Rule 3 in `AGENTS.md` sent only accept/ignore judgements and reply wording to a model. Choosing a
+model and an effort is a judgement too. The operator approved the amendment on 2026-11-17: "Only
 accept/ignore, model and effort judgements, and reply wording go to a model." Validation,
-escalation triggers, budgets and outcome statistics stay in code. The amendment is the operator's
-call and lands only with their approval.
+escalation triggers, budgets and outcome statistics stay in code.
 
 ## Plan
 
@@ -131,14 +146,17 @@ Each PR is reviewed and merged on green CI before the next starts.
 1. **Effort reaches the SDKs.** The runner passes an effort to both SDKs, covered by agreement
    tests. Turns record model and effort in a new `turn` table. Ostrom checks each turn's real model
    from the native session record.
-2. **Constraints and the Router's choice.** `OSTROM_MODELS_FILE`, the Router's model and per-turn
-   effort choices with reasons, validation and fallback, and the status card and dashboard lines.
-3. **Overrides.** The two commands, the two CLI verbs, and `ostrom models` without history.
+2. **Discovery and selection.** Both harnesses' model lists with agreement tests, the cached list
+   and the operator's selections in the store, and `ostrom models` with `allow`, `remove`, the
+   per-model settings, `export` and `import`.
+3. **The Router's choice and overrides.** The Router's model and per-turn effort choices with
+   reasons, validation and fallback, the status card and dashboard lines, and the two override
+   commands and CLI verbs.
 4. **Outcome history.** The statistics, the Router's input table, and history in `ostrom models`.
 5. **Escalation.** The triggers, the effort step, the same-harness model move with handoff, and the
    escalations budget.
 
-**Pass criterion:** on a pilot repository with a models file listing luna and sol, a small docs
+**Pass criterion:** on a pilot repository with luna and sol allowed through `ostrom models`, a small docs
 ticket and a larger code ticket run with different chosen efforts, both with reasons on the status
 card. An override on one ticket takes effect on its next turn. A scripted second CI failure raises
 effort, and a third moves the ticket to sol in a new session that continues the same branch and
