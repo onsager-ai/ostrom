@@ -9,7 +9,9 @@ export const MODELS_USAGE = `usage: ostrom models [--json]
        ostrom models refresh|export [--json]
        ostrom models import <file> [--json]`;
 
-type ModelsCommand = { action: "list" | "refresh" | "export"; json: boolean }
+type ModelsCommand = { action: "list"; json: boolean }
+  | { action: "refresh"; json: boolean }
+  | { action: "export"; json: boolean }
   | { action: "change"; change: ModelChange; json: boolean }
   | { action: "import"; file: string; json: boolean };
 
