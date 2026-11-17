@@ -154,8 +154,9 @@ estimated cost, and model escalations. Ostrom chooses each ticket's model and ea
 within the operator's limits ([model-selection.md](model-selection.md)).
 
 - At 80% of any limit, the status card and dashboard show a warning.
-- At a limit, the Worker **pauses**. It is not killed: it pushes its work in progress, and the stuck
-  ladder starts with the cause "budget reached". The operator can `ostrom extend` it or stop it.
+- At a limit, the Worker **pauses** with the cause `budget reached: <limit>` and pushes its work in
+  progress. Budget exhaustion never starts the stuck ladder. `ostrom extend` resumes a ticket paused
+  only for the raised budget once all limits clear; an operator pause stays paused.
 - Subscription plans have no per-call price, so Ostrom always enforces tokens and time, and treats
   cost as an estimate.
 

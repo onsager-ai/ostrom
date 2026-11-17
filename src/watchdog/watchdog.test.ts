@@ -112,7 +112,26 @@ test("the idle budget flags a turn that has run past it, never a Worker waiting 
   assert.equal((await watchdog(later)).checked[0]!.stallId, null, "45 minutes waiting for review is not idle");
   s.store.beginTurn(a.assignmentId);
   const hung = await watchdog(later);
-  assert.equal(s.store.getStall(hung.checked[0]!.stallId!).cause, "budget reached: idle");
+  assert.equal(hung.checked[0]!.stallId, null);
+  assert.equal(s.store.getTicket(a.ticketId).pauseCause, "budget reached: idle");
+  assert.deepEqual(s.store.unansweredStalls(), []);
+});
+
+test("time exhaustion during review pauses for budget even when Semon reports a question", async () => {
+  const s = setup();
+  const a = s.startWorker(1);
+  s.store.setTicketBudget(a.ticketId, { timeMinutes: 60, idleMinutes: 30, turns: 20, tokens: 1_000_000, escalations: 0 });
+  s.setSemon([semonStall(a.branch)]);
+  const paused: number[] = [];
+  const pass = await watchdog({ ...s.options(), now: () => new Date(NOW.getTime() + 61 * 60_000), onBudgetPause: (id) => { paused.push(id); } });
+  assert.equal(pass.checked[0]!.stallId, null);
+  assert.equal(s.store.getTicket(a.ticketId).state, "paused");
+  assert.equal(s.store.getTicket(a.ticketId).pauseCause, "budget reached: time");
+  assert.deepEqual(paused, [a.assignmentId]);
+  assert.deepEqual(s.store.unansweredStalls(), []);
+  const card = s.store.statusCardBody(s.store.ticketContext(a.ticketId).thread.id)!;
+  assert.match(card, /## Ostrom: Paused/);
+  assert.match(card, /Paused: budget reached: time/);
 });
 
 test("the turn budget never flags the last allowed turn while it runs", async () => {

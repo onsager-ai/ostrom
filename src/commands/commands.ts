@@ -2,7 +2,7 @@ import { queueStatusCard } from "../github/cards.ts";
 import { ghGet, type GhRunner } from "../github/gh.ts";
 import type { Store, Trigger } from "../store/store.ts";
 import { pullRequestsForBranch } from "../worker/dispatch.ts";
-import { followUpMessage } from "../worker/follow-up.ts";
+import { clearStallForHumanReply, followUpMessage } from "../worker/follow-up.ts";
 import type { Workers } from "../worker/workers.ts";
 import { parseComment } from "./parser.ts";
 
@@ -30,8 +30,14 @@ export function operatorControls(store: Store, workers: Workers, gh: GhRunner, r
       workers.deliver(assignment.id, `operator-pause-${ticketId}`, "Pause this ticket after the current work finishes. Push your work in progress, then stop and wait for Ostrom to resume you.", () => {});
     },
     async resume(ticketId) {
+      if (store.getTicket(ticketId).state === "ended") {
+        store.clearTicketStalls(ticketId);
+        queueStatusCard(store, ticketId);
+        return;
+      }
       const assignment = running(ticketId);
-      store.resumeTicket(ticketId);
+      if (store.getTicket(ticketId).state === "paused") store.resumeTicket(ticketId);
+      else store.clearTicketStalls(ticketId);
       queueStatusCard(store, ticketId);
       workers.wake(assignment.id);
       workers.deliver(assignment.id, `operator-resume-${ticketId}`, "This ticket has resumed. Continue your work.", () => {});
@@ -66,6 +72,7 @@ export async function routeCommands(
   workers: Workers,
   gh: GhRunner,
   repo: string,
+  allowlist: readonly string[] = [],
 ): Promise<CommandPass> {
   const pass: CommandPass = { handled: [], failed: [] };
   const permissions = new Map<string, Promise<boolean>>();
@@ -124,6 +131,9 @@ export async function routeCommands(
         store.recordCommandReceipt(pending.trigger.id, pending.ticketId, "close_issue", true);
         if (queued) workers.cancel(assignment.id);
       } else if (command === "redirect") {
+        if (allowlist.some((actor) => actor.toLowerCase() === pending.trigger.actor.toLowerCase())) {
+          clearStallForHumanReply(store, pending.ticketId);
+        }
         const assignment = store.latestAssignment(pending.ticketId);
         if (assignment?.state !== "running") throw new Error(`ticket ${pending.ticketId} has no running Worker`);
         const instruction = await collaborator(gh, repo, pending.trigger.actor, permissions);
@@ -157,7 +167,8 @@ export async function routeCommands(
       } else if (command === "resume") {
         const assignment = store.latestAssignment(pending.ticketId);
         if (assignment?.state !== "running") throw new Error(`ticket ${pending.ticketId} has no running Worker`);
-        store.resumeTicket(pending.ticketId);
+        if (store.getTicket(pending.ticketId).state === "paused") store.resumeTicket(pending.ticketId);
+        else store.clearTicketStalls(pending.ticketId);
         workers.wake(assignment.id);
         workers.deliver(assignment.id, `resume-${pending.trigger.id}-${assignment.id}`, "This ticket has resumed. Continue your work.", () => {});
         store.recordCommandReceipt(pending.trigger.id, pending.ticketId, "resume", true);
