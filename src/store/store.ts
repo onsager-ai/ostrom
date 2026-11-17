@@ -115,7 +115,7 @@ export interface Ticket {
   stopRequestedAt: string | null;
 }
 
-export type QueuedTurnKind = "follow_up" | "review" | "control" | "budget_pause" | "stuck" | "recovery";
+export type QueuedTurnKind = "follow_up" | "review" | "control" | "budget_pause" | "stuck" | "recovery" | "conflict";
 export type QueuedTurnState = "queued" | "running" | "finished" | "cancelled";
 
 /** A durable Worker prompt. Source pointers identify domain data, not a transcript. */

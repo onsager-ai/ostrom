@@ -76,11 +76,11 @@ test("every invoked follow-up records its source kind and failures retain a reas
   const { store, ticketId, workers, runner } = fixture();
   await workers.dispatch(ticketId);
   await workers.drain();
-  for (const key of ["review-1", "redirect-1", "stuck-recovery-1-1", "operator-pause-1", "budget-pause-1", "stuck-public-1", "ordinary"]) {
+  for (const key of ["review-1", "redirect-1", "stuck-recovery-1-1", "conflict-a1-head-base", "operator-pause-1", "budget-pause-1", "stuck-public-1", "ordinary"]) {
     workers.deliver(1, key, "continue", () => {});
   }
   await workers.drain();
-  assert.deepEqual(store.ticketTurns(ticketId).map((turn) => turn.kind), ["dispatch", "review", "redirect", "recovery", "control", "budget_pause", "stuck", "follow_up"]);
+  assert.deepEqual(store.ticketTurns(ticketId).map((turn) => turn.kind), ["dispatch", "review", "redirect", "recovery", "conflict", "control", "budget_pause", "stuck", "follow_up"]);
   assert.ok(store.ticketTurns(ticketId).every((turn) => turn.status === "completed"));
   runner.sessions[0]!.failWith = new Error("provider failed");
   workers.deliver(1, "failure", "continue", () => {});

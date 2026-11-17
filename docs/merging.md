@@ -116,6 +116,10 @@ The existing `pr_opened` reply becomes the ready reply and says whether Ostrom i
 automatically after the quiet window or is waiting for a human. It keeps the stable opened-outcome
 ID. Ordinary batching remains; the timer starts at confirmed delivery, never at enqueue time.
 Later revisions update the card rather than posting repeated ready comments.
+When an owned open PR conflicts with its base, an idle Worker on an open, unblocked ticket receives
+one turn per assignment/head/base SHA to merge the base into its existing branch, preserve both
+sides' intent (including every append-only entry), and push without opening another PR; a persisting
+conflict stays on the card and is not retried unless the head or base moves.
 
 On confirmed merge, both human and Ostrom merges yield the same `pr_merged` outcome and **Done**
 card. Keep `outcome-a<assignment>-pr<number>-merged` and one done reply on the originating thread.
