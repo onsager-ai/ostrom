@@ -65,6 +65,38 @@ test("migrations apply once and record their version", () => {
   );
 });
 
+test("approval receipt migration preserves existing version-31 receipts and widens the reason constraint", () => {
+  const db = database({ enableForeignKeyConstraints: false });
+  db.exec("CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL) STRICT");
+  for (const [index, sql] of migrations.slice(0, 31).entries()) {
+    db.exec(sql);
+    db.prepare("INSERT INTO schema_version VALUES (?, ?)").run(index + 1, "2026-11-17T00:00:00Z");
+  }
+  db.exec("PRAGMA foreign_keys = ON");
+  db.exec("INSERT INTO source (id, kind, name) VALUES (1, 'github', 'o/r')");
+  const insert = db.prepare("INSERT INTO intake_receipt VALUES (1, ?, ?, ?, ?)");
+  insert.run("missing", "https://github.com/o/r/issues/1", "2026-11-17T00:01:00Z", "missing @ostrom mention");
+  insert.run("unauthorized", "https://github.com/o/r/issues/2", "2026-11-17T00:02:00Z", "unauthorized author");
+  const before = db.prepare("SELECT * FROM intake_receipt ORDER BY source_event_id").all();
+  const indexBefore = db.prepare("SELECT sql FROM sqlite_schema WHERE name = 'intake_receipt_recent'").get();
+  const columnsBefore = db.prepare("PRAGMA table_info(intake_receipt)").all();
+  assert.throws(() => insert.run("approval", "https://github.com/o/r/pull/3", "2026-11-17T00:03:00Z", "approval without feedback"), /CHECK constraint/);
+
+  assert.equal(migrate(db), migrations.length);
+  assert.deepEqual(db.prepare("SELECT * FROM intake_receipt ORDER BY source_event_id").all(), before);
+  assert.deepEqual(db.prepare("PRAGMA table_info(intake_receipt)").all(), columnsBefore);
+  assert.deepEqual(db.prepare("SELECT sql FROM sqlite_schema WHERE name = 'intake_receipt_recent'").get(), indexBefore);
+  const table = db.prepare("PRAGMA table_list('intake_receipt')").get()!;
+  assert.equal(table["strict"], 1);
+  assert.equal(table["wr"], 1);
+  const store = new Store(db);
+  store.recordIntakeReceipt({ sourceId: 1, sourceEventId: "approval", url: "https://github.com/o/r/pull/3", observedAt: "2026-11-17T00:03:00Z", reason: "approval without feedback" });
+  assert.equal(store.operatorIntake().find((item) => item.eventId === "approval")!.reason, "approval without feedback");
+  assert.throws(() => db.prepare("INSERT INTO intake_receipt VALUES (1, 'invalid', 'url', 'now', 'unknown')").run(), /CHECK constraint/);
+  assert.equal(db.prepare("PRAGMA foreign_key_check").get(), undefined);
+  assert.equal(migrate(db), migrations.length);
+});
+
 test("queued-turn migration preserves every prior state and supports honest cancellation", () => {
   const db = database();
   // Build through migration 27, then migrate real queued/running/finished rows through 28.

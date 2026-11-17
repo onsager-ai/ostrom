@@ -612,6 +612,22 @@ export const migrations: readonly string[] = [
   ) STRICT;
   INSERT INTO model_objective VALUES (1, 'cost');
   `,
+
+  // 32: Record approval-only reviews without turning them into Worker follow-ups.
+  `
+  CREATE TABLE intake_receipt_v32 (
+    source_id       INTEGER NOT NULL REFERENCES source (id),
+    source_event_id TEXT NOT NULL,
+    url             TEXT NOT NULL,
+    observed_at     TEXT NOT NULL,
+    reason          TEXT NOT NULL CHECK (reason IN ('missing @ostrom mention', 'unauthorized author', 'approval without feedback')),
+    PRIMARY KEY (source_id, source_event_id)
+  ) STRICT, WITHOUT ROWID;
+  INSERT INTO intake_receipt_v32 SELECT * FROM intake_receipt;
+  DROP TABLE intake_receipt;
+  ALTER TABLE intake_receipt_v32 RENAME TO intake_receipt;
+  CREATE INDEX intake_receipt_recent ON intake_receipt (observed_at DESC);
+  `,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */

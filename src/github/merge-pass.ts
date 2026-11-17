@@ -1,5 +1,6 @@
 // Deterministic unattended merge and restart reconciliation. The Router never authorizes a merge.
 import { budgetReached } from "../budget/budgets.ts";
+import { isApprovalOnly } from "./approval.ts";
 import type { Workers } from "../worker/workers.ts";
 import type { MergeCandidate, Store } from "../store/store.ts";
 import { queueStatusCard } from "./cards.ts";
@@ -162,7 +163,8 @@ async function observe(options: MergePassOptions, assignmentId: number, prNumber
     issue: [issue["state"], issue["title"], issue["body"], issue["labels"]],
     pr: [pull["title"], pull["body"], pull["draft"], pull["requested_reviewers"], pull["labels"]],
     comments: comments.filter((c) => typeof c["body"] !== "string" || !c["body"].includes("<!-- ostrom:")).map((c) => [c["id"], c["body"], c["updated_at"]]),
-    reviews: evidence.reviews.map((r) => [r.id, r.state, r.submittedAt, r.commitOid]),
+    reviews: evidence.reviews.filter((r) => !isApprovalOnly(r.state, r.body, r.inlineComments))
+      .map((r) => [r.id, r.state, r.submittedAt, r.commitOid, r.body, r.inlineComments]),
     threads: evidence.threads,
   });
   return { evidence, issueOpen: issue["state"] === "open", activity,

@@ -13,6 +13,7 @@
 import type { Store, ThreadKind } from "../store/store.ts";
 import { ghGet, sinceParam, type GhRunner } from "./gh.ts";
 import { hasReplyMarker } from "./marker.ts";
+import { isApprovalOnly } from "./approval.ts";
 
 export type TriggerKind = "issue_opened" | "issue_comment" | "pull_request_review_comment" | "pull_request_review" | "issue_state";
 
@@ -125,7 +126,21 @@ export async function pollOnce(options: PollOptions): Promise<PollResult> {
     const pr = field(issue, "number", "number");
     for (const review of await listPages(gh, `repos/${repo}/pulls/${pr}/reviews`, perPage)) {
       const event = reviewEvent(review, pr);
-      if (event !== null && event.occurredAt.getTime() >= reviewsSince) events.push(event);
+      if (event === null || event.occurredAt.getTime() < reviewsSince) continue;
+      if (isApprovalOnly(String(review["state"]), event.body, 0)) {
+        // The repository comment stream is cursor-limited; read this review directly so older
+        // inline comments cannot make an approval look empty.
+        const path = `repos/${repo}/pulls/${pr}/reviews/${event.reviewId}/comments?per_page=1`;
+        const comments = asItems(await ghGet(gh, path), path);
+        const observedInline = reviewComments.some((comment) => String(comment["pull_request_review_id"]) === event.reviewId);
+        if (comments.length === 0 && !observedInline) {
+          if (classify(event, allowlist) !== "own") store.recordIntakeReceipt({
+            sourceId: source.id, sourceEventId: event.id, url: event.url, reason: "approval without feedback",
+          });
+          continue;
+        }
+      }
+      events.push(event);
     }
   }
   events.sort((a, b) => a.occurredAt.getTime() - b.occurredAt.getTime());

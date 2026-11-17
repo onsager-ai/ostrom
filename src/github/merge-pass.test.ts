@@ -19,9 +19,10 @@ import { sendDueReplies } from "./outbox.ts";
 const MINUTE = 60_000;
 const pageInfo = { hasNextPage: false, endCursor: null };
 const connection = (nodes: unknown[]) => ({ nodes, pageInfo });
-function review(overrides: { login?: string; type?: string; head?: string; at?: string; state?: string; id?: string } = {}) {
+function review(overrides: { login?: string; type?: string; head?: string; at?: string; state?: string; id?: string; body?: string; inlineComments?: number } = {}) {
   return {
     id: overrides.id ?? "R1", state: overrides.state ?? "APPROVED", submittedAt: overrides.at ?? "2026-11-10T12:00:00.000Z",
+    body: overrides.body ?? "", comments: { totalCount: overrides.inlineComments ?? 0 },
     author: { __typename: overrides.type ?? "User", id: "U1", login: overrides.login ?? "reviewer" }, commit: { oid: overrides.head ?? "head" },
   };
 }
@@ -230,6 +231,30 @@ for (const [name, change] of [
   assert.equal(f.puts.length, 0);
   assert.equal(f.store.mergeCandidateForAssignment(f.assignment)!.blockingReason, "policy approvals are not satisfied");
   unmerged(f);
+});
+
+for (const body of ["", "LGTM!", " looks good. "]) test(`approval without feedback counts without restarting quiet: ${body}`, async () => {
+  const f = fixture({ strategy: "approvals", approvals: 1, approvers: [] });
+  f.remote.reviews = [];
+  await ready(f);
+  const deadline = f.store.mergeCandidateForAssignment(f.assignment)!.quietDeadline;
+  f.remote.reviews.push(review({ body, at: f.now().toISOString() }));
+  const result = await mergePass(f.options());
+  assert.deepEqual(result.failed, []);
+  assert.equal(f.store.mergeCandidateForAssignment(f.assignment)!.quietDeadline, deadline);
+  assert.equal(f.puts.length, 1);
+  done(f, "ostrom");
+});
+
+for (const feedback of [{ body: "Please rename this" }, { inlineComments: 1 }]) test(`approval with feedback restarts quiet: ${JSON.stringify(feedback)}`, async () => {
+  const f = fixture();
+  await ready(f);
+  const previous = f.store.mergeCandidateForAssignment(f.assignment)!.quietDeadline!;
+  f.remote.reviews.push(review({ id: "R2", at: f.now().toISOString(), ...feedback }));
+  const result = await mergePass(f.options());
+  assert.deepEqual(result.failed, []);
+  assert.ok(f.store.mergeCandidateForAssignment(f.assignment)!.quietDeadline! > previous);
+  assert.equal(f.puts.length, 0);
 });
 
 for (const kind of ["comment trigger", "submitted review", "direct comment edit"] as const) test(`${kind} during the quiet window pushes its deadline out`, async () => {

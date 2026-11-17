@@ -184,6 +184,7 @@ export class FakeGitHub {
         }));
     } else if (route === "issues") items = [...this.issues.values()];
     else if ((match = route.match(/^issues\/(\d+)\/events$/))) items = this.issueEvents.get(Number(match[1])) ?? [];
+    else if ((match = route.match(/^pulls\/(\d+)\/reviews\/(\d+)\/comments$/))) items = this.reviewComments.filter((comment) => comment["pull_request_review_id"] === Number(match![2]));
     else if ((match = route.match(/^pulls\/(\d+)\/reviews$/))) items = this.reviews.get(Number(match[1])) ?? [];
     else if ((match = route.match(/^issues\/(\d+)\/comments$/))) items = this.commentsOn(Number(match[1]));
     else throw new Error(`fake gh: no route ${route}`);

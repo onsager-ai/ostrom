@@ -163,7 +163,7 @@ export interface OperatorTicket extends Ticket {
   recentFailures: { kind: "assignment" | "dispatch"; summary: string; at: string }[];
 }
 
-export type IntakeReason = "missing @ostrom mention" | "unauthorized author";
+export type IntakeReason = "missing @ostrom mention" | "unauthorized author" | "approval without feedback";
 export interface IntakeReceipt {
   sourceId: number;
   sourceEventId: string;
@@ -408,7 +408,7 @@ export class Store {
     if (Number(changes) !== 1) throw new Error(`no source ${sourceId}`);
   }
 
-  /** Records an excluded newly opened issue once, preserving its first observation time. */
+  /** Records an excluded intake event once, preserving its first observation time. */
   recordIntakeReceipt(receipt: Omit<IntakeReceipt, "observedAt"> & { observedAt?: string }): void {
     this.#run(
       `INSERT INTO intake_receipt (source_id, source_event_id, url, observed_at, reason)
