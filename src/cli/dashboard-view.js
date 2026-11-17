@@ -17,7 +17,7 @@ export function ticketPhase(ticket) {
   if (lower.startsWith("approved on ")) return { key: "approval", label: "Approval is out of date", tone: "amber", detail: reason };
   if (lower.includes("approvals are not satisfied")) return { key: "approval", label: "Waiting for approval", tone: "amber", detail: "Only submitted reviews count; check GitHub for an unsubmitted draft." };
   if (lower.includes("quiet period")) return {
-    key: "quiet", label: lower.includes("approvals strategy") ? (ticket.mergeCandidate.quietDeadline ? `Waiting for approval, merges after ${localTime(ticket.mergeCandidate.quietDeadline)}` : "Waiting for approval, quiet period") : ticket.mergeCandidate.quietDeadline ? `Approved, merges after ${localTime(ticket.mergeCandidate.quietDeadline)}` : "Approved, waiting for quiet period",
+    key: "quiet", label: ticket.mergeCandidate.quietDeadline ? `Approved, merges after ${localTime(ticket.mergeCandidate.quietDeadline)}` : "Approved, waiting for quiet period",
     tone: "green", detail: "",
   };
   if (lower.includes("not clean")) return { key: "ci", label: "Waiting for CI or a clean merge", tone: "amber", detail: "" };
