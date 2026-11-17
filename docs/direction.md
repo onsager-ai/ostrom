@@ -146,8 +146,8 @@ nothing is built or tested locally on the operator's laptop. Milestone-1 budget 
 `OSTROM_BUDGET_TURNS=80`, `OSTROM_BUDGET_TOKENS=1000000` (fresh input plus output; cached input is
 recorded but not limited), and `OSTROM_BUDGET_ESCALATIONS=0`. A new ticket stores these values, so
 later environment changes do not alter existing work; `ostrom
-extend` raises an individual ticket's limits. Workers run on cheap tiers (gpt-6-luna, Haiku) unless
-a ticket's budget says otherwise.
+extend` raises an individual ticket's limits. Workers run on one configured model; choosing a model
+and effort per ticket is proposed in [model-selection.md](model-selection.md).
 
 ## Milestone 2
 
@@ -173,6 +173,13 @@ budget cancelled the last allowed turn, and several page gaps. Worker placement 
 Passed 2026-11-17. [Six issues on duhem and tolmap](pilot-1.md) became PRs that the App authored
 and merged, under the approvals policy and tolmap's required check. The run found the defects to fix
 before wider use: #725 and #729 to #733.
+
+## Model selection
+
+Proposed 2026-11-17. [The design](model-selection.md) lets Ostrom choose each ticket's model and
+each turn's effort within limits the operator sets, learn from past outcomes, and escalate within
+one harness when a ticket struggles. The operator chose the lowest cost that still merges as the
+default objective. The design needs project rule 3 amended, which is the operator's call.
 
 ## Non-goals (for now)
 
