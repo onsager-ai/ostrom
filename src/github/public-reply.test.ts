@@ -30,6 +30,12 @@ test("URLs and repository-relative paths survive, and model text is never evalua
     "See https://github.com/o/r/pull/1 and [file](src/main.ts), `src/main.ts`, $(touch `secret`).");
 });
 
+test("absolute paths in link labels are rewritten too, and unknown assignments expose no host root", () => {
+  assert.equal(rewritePublicPaths(`[${worktree}/docs/spec.md](${worktree}/docs/spec.md)`, [context]),
+    "[`docs/spec.md`](https://github.com/onsager-ai/duhem/blob/6ce1fb8/docs/spec.md)");
+  assert.equal(rewritePublicPaths("[log](/home/operator/log.txt:12)", []), "`log.txt`");
+});
+
 test("Markdown targets with spaces and angle brackets are encoded as file URLs", () => {
   assert.equal(rewritePublicPaths(`[file](<${worktree}/docs/a file.md#L2>)`, [context]),
     "[file](https://github.com/onsager-ai/duhem/blob/6ce1fb8/docs/a%20file.md#L2)");

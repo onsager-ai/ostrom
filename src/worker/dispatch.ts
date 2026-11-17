@@ -6,6 +6,8 @@ import { queueStatusCard } from "../github/cards.ts";
 import { ghGet, type GhRunner } from "../github/gh.ts";
 import type { AssignmentOutcome, Store, TicketContext } from "../store/store.ts";
 
+export const PUBLIC_FINAL_MESSAGE = "Your final message is posted publicly on the pull request for its reviewers. Write for them: use repository-relative paths, describe the resulting changes and relevant validation, and do not narrate your own process or what you did or did not post. Do not claim CI or merge state; Ostrom reports those.";
+
 /**
  * The Worker's first message: a summary plus pointers ("Inline & Spill"). It quotes no comment
  * bodies; the Worker reads the thread itself.
@@ -30,6 +32,7 @@ export function workerBrief(context: TicketContext, branch: string, base: string
     "You run unattended: never stop to ask an interactive question. Decide, state your assumption in",
     "the pull request description, and carry on.",
     "If a normal commit fails, report the failure; do not create or push commit objects with Git plumbing.",
+    PUBLIC_FINAL_MESSAGE,
     ...(rules === undefined ? [] : ["", "House rules for this machine, which you must follow:", rules]),
   ].join("\n");
 }

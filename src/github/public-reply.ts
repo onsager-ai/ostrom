@@ -30,7 +30,7 @@ export function rewritePublicPaths(text: string, contexts: readonly ReplyWorktre
     (match: string, label: string | undefined, target: string | undefined, code: string | undefined) => {
       if (target !== undefined) {
         const rewritten = rewrite(target, true);
-        return rewritten.startsWith("https://") ? `${label}(${rewritten})` : rewritten;
+        return rewritten.startsWith("https://") ? `${rewritePublicPaths(label!, contexts)}(${rewritten})` : rewritten;
       }
       if (code !== undefined) return rewrite(code, false);
       // Sentence punctuation is not part of a bare path.

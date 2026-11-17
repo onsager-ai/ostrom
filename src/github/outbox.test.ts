@@ -47,6 +47,31 @@ test("a due reply is posted once, with its marker, and marked sent", async () =>
   assert.equal(posts(), 1);
 });
 
+test("the outbox rewrites all public comment and edit bodies using durable assignment context", async () => {
+  const { store, github, thread, send } = fixture();
+  const source = store.ensureSource("github", github.repo);
+  const trigger = store.insertTrigger({ sourceId: source.id, sourceEventId: "public-path", threadId: thread,
+    kind: "issue_comment", actor: "alice", url: "https://github.com/onsager-ai/ostrom/issues/7#issuecomment-1", occurredAt: new Date(T0) }).id;
+  const ticket = store.recordDecision({ threadId: thread, triggerIds: [trigger], verdict: "accept", reason: "work" }).ticketId!;
+  const assignment = store.createAssignment(ticket);
+  store.configureNativeAssignment(assignment, { harness: "codex", model: "m", worktree: "/wt/pilot", branch: "b", machine: "h" });
+  store.startNativeAssignment(assignment, "s");
+  store.upsertMergeCandidate({ assignmentId: assignment, repository: github.repo, prNumber: 8, headSha: "head", baseSha: "base",
+    policy: JSON.stringify({ strategy: "unattended" }), activityFingerprint: "a", activityAt: new Date(T0),
+    readyReplyId: null, readySentAt: null, quietDeadline: null, blockingReason: null });
+  const body = "See [file](/wt/pilot/src/main.ts:12) and /home/operator/private.log.";
+  const expected = `See [file](https://github.com/${github.repo}/blob/head/src/main.ts#L12) and \`private.log\`.`;
+  store.enqueueReply({ id: "review-1", threadId: thread, body });
+  store.enqueueReply({ id: "stopped-1", threadId: thread, body, blocking: true });
+  await send();
+  assert.equal(github.commentsOn(7).length, 2, "rewriting does not add comments");
+  for (const comment of github.commentsOn(7)) assert.ok(String(comment["body"]).startsWith(expected));
+  const comment = github.commentsOn(7)[0]!;
+  store.enqueueReply({ id: "public-edit", threadId: thread, body, kind: "edit", target: String(comment["id"]) });
+  assert.deepEqual((await send()).failed, []);
+  assert.equal(github.commentsOn(7)[0]!["body"], expected);
+});
+
 test("a failed send backs off, then the retry posts", async () => {
   const { store, github, thread, send, posts, reply, advance } = fixture();
   store.enqueueReply({ id: "ack-1", threadId: thread, body: "On it." });

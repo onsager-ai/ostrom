@@ -3,7 +3,7 @@ import { afterEach, test } from "node:test";
 
 import { Store } from "../store/store.ts";
 import { FakeRunner } from "./fake-runner.ts";
-import { followUpMessage, routeFollowUps } from "./follow-up.ts";
+import { followUpMessage, reviewFollowUpMessage, routeFollowUps } from "./follow-up.ts";
 import { workerTurnPrompt, Workers } from "./workers.ts";
 
 const REPO = "onsager-ai/ostrom";
@@ -198,6 +198,12 @@ test("the follow-up is a summary plus a pointer to the trigger", () => {
   assert.match(message, new RegExp(`^Follow-up for Ostrom ticket ${ticketId}: a new review \\(pull_request_review\\) by @alice\n`));
   assert.match(message, new RegExp(`on pull request #12: https://github.com/${REPO}/pull/12#event-${id}\n`));
   assert.match(message, /Read it with `gh`/);
+  for (const prompt of [message, reviewFollowUpMessage(ticketId, store.getThread(pr), [pending!.trigger])]) {
+    assert.match(prompt, /final message is posted publicly on the pull request for its reviewers/);
+    assert.match(prompt, /use repository-relative paths/);
+    assert.match(prompt, /do not narrate your own process or what you did or did not post/);
+    assert.match(prompt, /Do not claim CI or merge state; Ostrom reports those/);
+  }
   assert.match(message, /push\nto the branch of your existing pull request; do not open a new one/);
 });
 
