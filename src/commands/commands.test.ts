@@ -46,6 +46,35 @@ function fixture() {
   return { store, github, runner, workers, ticketId, assignmentId, comment };
 }
 
+test("operator resume acknowledges a public stall on paused and already-open tickets", async () => {
+  for (const state of ["open", "paused", "ended"] as const) {
+    const { store, github, workers, ticketId, assignmentId } = fixture();
+    const stall = store.recordStall({ assignmentId, semonReason: "waiting-question", detail: "?" }).id;
+    store.publishStall(stall);
+    if (state === "paused") store.pauseTicket(ticketId, "stuck turn reported by the Watchdog");
+    if (state === "ended") { store.endAssignment(assignmentId); store.endTicket(ticketId); }
+    await operatorControls(store, workers, github.gh, REPO).resume(ticketId);
+    assert.equal(store.getTicket(ticketId).state, state === "ended" ? "ended" : "open");
+    assert.notEqual(store.getStall(stall).clearedAt, null);
+    assert.equal(store.getAssignment(assignmentId).stallRecoveryAttempts, 0);
+    await workers.drain();
+  }
+});
+
+test("allowlisted issue redirects clear public stalls without an open-to-open transition", async () => {
+  for (const trusted of [true, false]) {
+    const { store, github, workers, ticketId, assignmentId, comment } = fixture();
+    const stall = store.recordStall({ assignmentId, semonReason: "waiting-question", detail: "?" }).id;
+    store.publishStall(stall);
+    comment("answer", "alice", "use red");
+    const pass = await routeCommands(store, workers, github.gh, REPO, trusted ? ["ALICE"] : ["bob"]);
+    assert.deepEqual(pass.failed, []);
+    assert.equal(store.getStall(stall).clearedAt !== null, trusted);
+    assert.equal(store.getTicket(ticketId).state, "open");
+    await workers.drain();
+  }
+});
+
 test("commands are case-insensitive and must start the comment", () => {
   assert.deepEqual(parseComment("@ostrom pause"), { kind: "command", command: "pause" });
   assert.deepEqual(parseComment("  @OSTROM ReSuMe until tomorrow"), { kind: "command", command: "resume" });

@@ -67,6 +67,51 @@ function fixture() {
   return { store, runner, workers, thread, issue, pr, trigger, accept, worker, ticketId, assignmentId };
 }
 
+test("trusted comments and reviews acknowledge public stalls in every ticket state", async () => {
+  for (const state of ["open", "paused", "ended"] as const) {
+    for (const review of [false, true]) {
+      const { store, workers, ticketId, assignmentId, issue, pr, trigger } = fixture();
+      const stall = store.recordStall({ assignmentId, semonReason: "waiting-question", detail: "?" }).id;
+      store.publishStall(stall);
+      if (state === "paused") store.pauseTicket(ticketId, "stuck turn reported by the Watchdog");
+      if (state === "ended") store.endTicket(ticketId);
+      trigger(review ? pr : issue, review ? "pull_request_review" : "issue_comment", review ? { reviewId: "R1" } : {});
+      const pass = routeFollowUps(store, workers, ["alice"]);
+      assert.deepEqual(pass.failed, []);
+      assert.notEqual(store.getStall(stall).clearedAt, null);
+      assert.equal(store.getTicket(ticketId).state, state === "ended" ? "ended" : "open");
+      await workers.drain();
+    }
+  }
+});
+
+test("a trusted reply clears the stall while preserving a separate pause", async () => {
+  for (const cause of ["paused by the operator", "budget reached: time"]) {
+    const { store, workers, ticketId, assignmentId, pr, trigger } = fixture();
+    const stall = store.recordStall({ assignmentId, semonReason: "waiting-question", detail: "?" }).id;
+    store.publishStall(stall);
+    store.pauseTicket(ticketId, cause);
+    trigger(pr, "pull_request_review", { reviewId: "R1" });
+    routeFollowUps(store, workers, ["alice"]);
+    assert.notEqual(store.getStall(stall).clearedAt, null);
+    assert.equal(store.getTicket(ticketId).state, "paused");
+    assert.equal(store.getTicket(ticketId).pauseCause, cause);
+    await workers.drain();
+  }
+});
+
+test("a non-allowlisted review cannot clear a public stall", async () => {
+  const { store, workers, ticketId, assignmentId, pr, trigger } = fixture();
+  const stall = store.recordStall({ assignmentId, semonReason: "waiting-question", detail: "?" }).id;
+  store.publishStall(stall);
+  store.pauseTicket(ticketId, "stuck turn reported by the Watchdog");
+  trigger(pr, "pull_request_review", { reviewId: "R1" });
+  routeFollowUps(store, workers, ["bob"]);
+  assert.equal(store.getStall(stall).clearedAt, null);
+  assert.equal(store.getTicket(ticketId).state, "paused");
+  await workers.drain();
+});
+
 test("a review on a subscribed PR goes to the ticket's Worker session, with no decision", async () => {
   const { store, runner, workers, pr, trigger, ticketId, assignmentId } = fixture();
   const review = trigger(pr, "pull_request_review_comment");
@@ -270,7 +315,7 @@ test("a trigger fans out to every open subscribed ticket; ended ones are skipped
   ]);
 });
 
-test("a ticket ended while paused at public Stuck is owed no follow-up", () => {
+test("a trusted reply clears an ended ticket's public stall without delivering work", () => {
   const { store, workers, pr, trigger, ticketId, assignmentId } = fixture();
   store.recordStall({ assignmentId, semonReason: "no-output", detail: null });
   const stall = store.unansweredStalls()[0]!;
@@ -279,8 +324,10 @@ test("a ticket ended while paused at public Stuck is owed no follow-up", () => {
   store.endTicket(ticketId);
   trigger(pr);
 
+  assert.equal(store.pendingDeliveries().length, 1);
+  assert.deepEqual(routeFollowUps(store, workers, ["alice"]), { queued: [], failed: [] });
+  assert.notEqual(store.getStall(stall.id).clearedAt, null);
   assert.deepEqual(store.pendingDeliveries(), []);
-  assert.deepEqual(routeFollowUps(store, workers), { queued: [], failed: [] });
 });
 
 test("an open ticket with no running Worker holds its follow-up and reports it", () => {

@@ -129,9 +129,9 @@ test("time exhaustion during review pauses for budget even when Semon reports a 
   assert.equal(s.store.getTicket(a.ticketId).pauseCause, "budget reached: time");
   assert.deepEqual(paused, [a.assignmentId]);
   assert.deepEqual(s.store.unansweredStalls(), []);
-  const card = s.store.dueReplies().find((reply) => reply.kind === "status_card")!;
-  assert.match(card.body, /## Ostrom: Paused/);
-  assert.match(card.body, /Paused: budget reached: time/);
+  const card = s.store.statusCardBody(s.store.ticketContext(a.ticketId).thread.id)!;
+  assert.match(card, /## Ostrom: Paused/);
+  assert.match(card, /Paused: budget reached: time/);
 });
 
 test("the turn budget never flags the last allowed turn while it runs", async () => {

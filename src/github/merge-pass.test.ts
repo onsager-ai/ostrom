@@ -6,6 +6,8 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import { Store } from "../store/store.ts";
+import { watchdog } from "../watchdog/watchdog.ts";
+import { advanceStuckLadder } from "../watchdog/stuck.ts";
 import { routeCandidates, type Batch } from "../router/router.ts";
 import { FakeRunner } from "../worker/fake-runner.ts";
 import type { Workers } from "../worker/workers.ts";
@@ -149,6 +151,27 @@ function done(f: Fixture, origin: "ostrom" | "external" | "unknown") {
   else assert.doesNotMatch(body, /Ostrom .* merged/);
   if (origin === "unknown") assert.match(body, /whether Ostrom caused this merge is unknown/);
 }
+
+test("review wait reaches time budget, extension resumes, and merge needs no human comment", async () => {
+  const f = fixture();
+  f.store.setTicketBudget(f.ticket, { timeMinutes: 60, idleMinutes: 30, turns: 20, tokens: 1_000_000, escalations: 0 });
+  await ready(f);
+  f.advance(50 * MINUTE);
+  await watchdog({ store: f.store, idleMinutes: 20, now: f.now,
+    semon: async () => ({ code: 0, stdout: JSON.stringify({ idle_minutes: 20, stalls: [] }), stderr: "" }) });
+  assert.equal(f.store.getTicket(f.ticket).pauseCause, "budget reached: time");
+  assert.deepEqual(await advanceStuckLadder(f.store, f.options().workers), { recovered: [], published: [] });
+  assert.deepEqual(f.store.unansweredStalls(), []);
+  assert.match(f.store.statusCardBody(f.issue)!, /Ostrom: Paused/);
+  await mergePass(f.options());
+  assert.equal(f.puts.length, 0);
+  f.store.extendTicketBudget(f.ticket, { timeMinutes: 60 });
+  assert.equal(f.store.getTicket(f.ticket).state, "open");
+  const result = await mergePass(f.options());
+  assert.deepEqual(result.failed, []);
+  assert.equal(f.puts.length, 1);
+  done(f, "ostrom");
+});
 
 test("one SHA-guarded squash PUT confirms an Ostrom merge and ends the ticket once", async () => {
   const f = fixture();

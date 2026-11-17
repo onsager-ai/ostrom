@@ -489,6 +489,34 @@ test("a ticket budget persists limits and sums every assignment's turn usage", (
   assert.equal(store.getTicket(ticketId).pauseCause, null);
 });
 
+test("extension resumes only the exhausted budget it raises, after every limit clears", () => {
+  const { store, accept } = fixture();
+  const ticketId = accept();
+  store.setTicketBudget(ticketId, { timeMinutes: 480, idleMinutes: 30, turns: 1, tokens: 10, escalations: 0 });
+  const assignment = store.createAssignment(ticketId);
+  store.configureNativeAssignment(assignment, { harness: "codex", model: "m", worktree: "/w", branch: "b", machine: "h" });
+  store.startNativeAssignment(assignment, "s");
+  store.beginTurn(assignment);
+  store.endTurn(assignment, { inputTokens: 20, cachedInputTokens: 0, outputTokens: 0 });
+  store.pauseTicketForBudget(ticketId, "tokens");
+  store.extendTicketBudget(ticketId, { timeMinutes: 60 });
+  assert.equal(store.getTicket(ticketId).state, "paused", "raising another budget does not resume");
+  store.extendTicketBudget(ticketId, { tokens: 5 });
+  assert.equal(store.getTicket(ticketId).state, "paused", "insufficient extension does not resume");
+  store.extendTicketBudget(ticketId, { tokens: 10 });
+  assert.equal(store.getTicket(ticketId).state, "paused", "the turn limit is still exhausted");
+  store.extendTicketBudget(ticketId, { tokens: 1, turns: 1 });
+  assert.equal(store.getTicket(ticketId).state, "open");
+  assert.equal(store.getTicket(ticketId).pauseCause, null);
+  for (const cause of ["paused by the operator", "paused by @alice on GitHub"]) {
+    store.pauseTicket(ticketId, cause);
+    store.extendTicketBudget(ticketId, { tokens: 10, turns: 1 });
+    assert.equal(store.getTicket(ticketId).state, "paused");
+    assert.equal(store.getTicket(ticketId).pauseCause, cause);
+    store.resumeTicket(ticketId);
+  }
+});
+
 test("a stopped native assignment ends with its reason and is owed a reply; a finished one is not", () => {
   const { store, accept } = fixture();
   const stopped = store.createAssignment(accept());

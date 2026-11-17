@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
 
 import { Store } from "../store/store.ts";
+import { queueStatusCard } from "../github/cards.ts";
 import { FakeRunner } from "../worker/fake-runner.ts";
 import { Workers } from "../worker/workers.ts";
 import { routeFollowUps } from "../worker/follow-up.ts";
@@ -70,6 +71,25 @@ test("malformed Worker reply gets a complete, honest fallback", () => {
   });
 });
 
+test("budget-paused tickets never advance an existing recovery or publish a stuck reply", async () => {
+  const { store, runner, workers, ticketId } = fixture();
+  await workers.dispatch(ticketId);
+  workers.cancel(1);
+  runner.sessions[0]!.auto = true;
+  await workers.drain();
+  const stall = store.recordStall({ assignmentId: 1, semonReason: "no-output", detail: null }).id;
+  store.pauseTicketForBudget(ticketId, "time");
+  assert.deepEqual(await advanceStuckLadder(store, workers), { recovered: [], published: [] });
+  assert.equal(store.getStall(stall).recoveryAttempts, 0);
+  assert.equal(store.getStall(stall).publicAt, null);
+  assert.equal(store.hasReply(`stuck-${stall}`), false);
+  queueStatusCard(store, ticketId);
+  assert.match(store.statusCardBody(store.ticketContext(ticketId).thread.id)!, /Ostrom: Paused/);
+  store.publishStall(stall);
+  queueStatusCard(store, ticketId);
+  assert.match(store.statusCardBody(store.ticketContext(ticketId).thread.id)!, /Ostrom: Paused/);
+});
+
 test("three stall episodes on one Worker recover twice, then queue its public stuck reply", async () => {
   const { store, runner, workers, ticketId } = fixture();
   await workers.dispatch(ticketId);
@@ -112,7 +132,7 @@ test("a human comment during a silent recovery reaches the Worker and leaves the
     sourceId: store.ensureSource("github", REPO).id, sourceEventId: "human-early", threadId, kind: "issue_comment", actor: "alice",
     url: `https://github.com/${REPO}/issues/7#issuecomment-early`, occurredAt: new Date("2026-11-09T12:01:00.000Z"), body: "try red",
   });
-  const pass = routeFollowUps(store, workers);
+  const pass = routeFollowUps(store, workers, ["alice"]);
   await workers.drain();
   assert.deepEqual(pass.failed, []);
   assert.equal(pass.queued.length, 1);
@@ -143,7 +163,7 @@ test("a human follow-up resets the Worker recovery count", async () => {
     sourceId: store.ensureSource("github", REPO).id, sourceEventId: "human", threadId, kind: "issue_comment", actor: "alice",
     url: `https://github.com/${REPO}/issues/7#issuecomment-human`, occurredAt: new Date("2026-11-09T12:01:00.000Z"), body: "try red",
   });
-  routeFollowUps(store, workers);
+  routeFollowUps(store, workers, ["alice"]);
   await workers.drain();
   assert.equal(store.getAssignment(assignmentId).stallRecoveryAttempts, 0);
 });
