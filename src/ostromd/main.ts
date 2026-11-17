@@ -328,7 +328,14 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
     }
     if (command === "watchdog") {
       const { idleMinutes } = loadWatchdogConfig(deps.env);
-      const pass = await watchdog({ store, semon: deps.semon, idleMinutes });
+      const pass = await watchdog({
+        store, semon: deps.semon, idleMinutes,
+        onBudgetPause: (assignmentId) => {
+          workers().cancel(assignmentId);
+          workers().deliver(assignmentId, `budget-pause-${assignmentId}-${Date.now()}`,
+            "The ticket budget has been reached. Push your work in progress, then stop and wait for Ostrom to resume you.", () => {});
+        },
+      });
       if (deps.watchdogHealth !== undefined && pass.failed.length > 0) deps.watchdogHealth.error = pass.failed[0]!.error.slice(0, 240);
       const ladder = await advanceStuckLadder(store, workers());
       for (const checked of pass.checked) deps.stdout(JSON.stringify(checked));

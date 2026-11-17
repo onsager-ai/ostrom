@@ -58,6 +58,8 @@ export function parseStuckReply(text: string, cause: string): StuckReply {
 export async function advanceStuckLadder(store: Store, workers: Workers): Promise<{ recovered: number[]; published: number[] }> {
   const result = { recovered: [] as number[], published: [] as number[] };
   for (const stall of store.unansweredStalls()) {
+    const ticket = store.getTicket(store.getAssignment(stall.assignmentId).ticketId);
+    if (ticket.state !== "open") continue;
     if (stall.recoveryAttempts < 2 && stall.publicAt === null) {
       const started = store.beginStallRecovery(stall.id);
       if (started === null) continue;
