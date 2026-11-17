@@ -1,5 +1,7 @@
-import { query, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
-import { Codex, type CodexOptions, type ThreadEvent } from "@openai/codex-sdk";
+import { query, type EffortLevel, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import { Codex, type CodexOptions, type ModelReasoningEffort, type ThreadEvent } from "@openai/codex-sdk";
+
+export type Effort = ModelReasoningEffort | EffortLevel;
 
 export interface TurnResult {
   sessionId: string | null;
@@ -12,12 +14,13 @@ export interface TurnResult {
 }
 
 export interface Session {
-  send(prompt: string, signal?: AbortSignal): Promise<TurnResult>;
+  send(prompt: string, signal?: AbortSignal, effort?: Effort | null): Promise<TurnResult>;
 }
 
 export interface SessionOptions {
   cwd: string;
   model: string;
+  effort?: Effort | null;
   sessionId?: string;
   onSessionId?: (id: string) => void;
   /** A Router uses a one-shot, read-only session; Workers retain their writable worktree. */
@@ -50,6 +53,11 @@ export function codexWorkerConfigOverrides(cwd: string, writableDirs: string[]):
   ];
 }
 
+function claudeEffort(effort: Effort): EffortLevel {
+  if (effort === "minimal" || effort === "ultra" || effort === "persistent") throw new Error(`Unsupported Claude effort: ${effort}`);
+  return effort;
+}
+
 function requireOptions(options: SessionOptions): void {
   if (!options.cwd || !options.model) throw new Error("cwd and model are required");
 }
@@ -59,7 +67,7 @@ export function claudeRunner(env: Record<string, string | undefined>, run: Claud
     requireOptions(options);
     let id = options.sessionId ?? null;
     let busy = false;
-    return { async send(prompt, signal) {
+    return { async send(prompt, signal, effort = options.effort) {
       if (busy) throw new Error("session already has a running turn");
       busy = true;
       const abortController = new AbortController();
@@ -71,6 +79,7 @@ export function claudeRunner(env: Record<string, string | undefined>, run: Claud
         if (signal?.aborted) return { sessionId: id, text: "", status: "cancelled", usage: null, model };
         for await (const message of run({ prompt, options: {
           cwd: options.cwd, model: options.model, env, abortController,
+          ...(effort == null ? {} : { effort: claudeEffort(effort) }),
           ...(options.sandbox === "read-only"
             ? { permissionMode: "plan" as const, disallowedTools: ["Bash", "Edit", "Write"] }
             : { permissionMode: "bypassPermissions" as const, allowDangerouslySkipPermissions: true }),
@@ -121,14 +130,20 @@ export function codexRunner(config: CodexOptions, makeClient: CodexClientFactory
       // A read-only session (the Router) runs in a scratch directory that is not a Git repository.
       ...(options.sandbox === "read-only" ? { skipGitRepoCheck: true } : {}),
     };
-    const thread: CodexThread = id === null ? codex.startThread(threadOptions) : codex.resumeThread(id, threadOptions);
-    return { async send(prompt, signal) {
+    let currentEffort = options.effort ?? null;
+    const withEffort = (effort: Effort | null) => ({ ...threadOptions, ...(effort === null ? {} : { modelReasoningEffort: effort }) });
+    let thread: CodexThread = id === null ? codex.startThread(withEffort(currentEffort)) : codex.resumeThread(id, withEffort(currentEffort));
+    return { async send(prompt, signal, effort = options.effort) {
       if (busy) throw new Error("session already has a running turn");
       busy = true;
       let text = "";
       let lastNotice: string | null = null;
       try {
         if (signal?.aborted) return { sessionId: id, text, status: "cancelled", usage: null, model: null };
+        if ((effort ?? null) !== currentEffort) {
+          currentEffort = effort ?? null;
+          thread = id === null ? codex.startThread(withEffort(currentEffort)) : codex.resumeThread(id, withEffort(currentEffort));
+        }
         const { events } = await thread.runStreamed(prompt, signal ? { signal } : {});
         for await (const event of events) {
           if (event.type === "thread.started") {

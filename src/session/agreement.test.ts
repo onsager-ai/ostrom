@@ -7,7 +7,9 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { test } from "node:test";
-import type { SDKResultSuccess, SDKSystemMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { Options, SDKMessage, SDKResultSuccess, SDKSystemMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { Codex, ThreadOptions } from "@openai/codex-sdk";
+import { claudeRunner, codexRunner } from "./runner.ts";
 import type { AgentMessageItem, ItemCompletedEvent, ThreadStartedEvent, TurnCompletedEvent } from "@openai/codex-sdk";
 
 // The fixture projections are the fields the runner reads. Referencing SDK types
@@ -35,6 +37,35 @@ test("pinned Codex CLI recognizes App shell controls as booleans", async () => {
     await assert.rejects(run('allow_login_shell="invalid"'), /allow_login_shell|boolean/);
     await assert.rejects(run('features.shell_snapshot="invalid"'), /shell_snapshot|boolean/);
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("effort options retain the pinned SDK names and values across same-session resumes", async () => {
+  const claudeCalls: Options[] = [];
+  const run = async function* (input: Parameters<typeof import("@anthropic-ai/claude-agent-sdk").query>[0]): AsyncGenerator<SDKMessage> {
+    claudeCalls.push(input.options!);
+    yield* fixture("claude") as SDKMessage[];
+  };
+  const claude = claudeRunner({}, run).resume({ cwd: "/tmp", model: "haiku", sessionId: "claude-id", effort: "low" });
+  await claude.send("first");
+  await claude.send("next", undefined, "max");
+  await claude.send("default", undefined, null);
+  assert.deepEqual(claudeCalls.map((options) => options.effort), ["low", "max", undefined]);
+  assert.equal("effort" in claudeCalls[2]!, false);
+
+  const calls: { id: string | null; options: ThreadOptions }[] = [];
+  const thread = { runStreamed: async () => ({ events: (async function* () { yield* fixture("codex") as import("@openai/codex-sdk").ThreadEvent[]; })() }) };
+  const client = {
+    startThread: (options: ThreadOptions) => { calls.push({ id: null, options }); return thread; },
+    resumeThread: (id: string, options: ThreadOptions) => { calls.push({ id, options }); return thread; },
+  } as unknown as Pick<Codex, "startThread" | "resumeThread">;
+  const codex = codexRunner({}, () => client).resume({ cwd: "/tmp", model: "luna", sessionId: "codex-id", effort: "minimal" });
+  await codex.send("first");
+  await codex.send("next", undefined, "xhigh");
+  await codex.send("default", undefined, null);
+  assert.deepEqual(calls.map(({ options }) => options.modelReasoningEffort), ["minimal", "xhigh", undefined]);
+  assert.equal(calls[0]!.id, "codex-id");
+  assert.ok(calls.every(({ id }) => id !== null));
+  assert.equal("modelReasoningEffort" in calls[2]!.options, false);
 });
 
 function fixture(name: string): unknown {
