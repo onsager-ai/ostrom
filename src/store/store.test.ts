@@ -526,7 +526,7 @@ test("turn records retain requests, observations and failures without copying tr
 });
 
 test("a ticket budget persists limits and sums every assignment's turn usage", () => {
-  const { store, accept } = fixture();
+  const { store, accept, advance } = fixture();
   const ticketId = accept();
   store.setTicketBudget(ticketId, { timeMinutes: 90, idleMinutes: 15, turns: 4, tokens: 500, escalations: 1 });
   const first = store.createAssignment(ticketId);
