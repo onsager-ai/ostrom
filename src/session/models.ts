@@ -106,7 +106,7 @@ export async function discoverModels(harness: Harness, env: Record<string, strin
     child.stdin.write(`${JSON.stringify({ id, method, params })}\n`);
   });
   try {
-    await send("initialize", { clientInfo: { name: "ostrom", version: "0.0.0" }, capabilities: { experimentalApi: true } });
+    await send("initialize", { clientInfo: { name: "ostrom", version: "0.0.0" }, capabilities: { experimentalApi: true, explicitGatewayOauth: true } });
     child.stdin.write(`${JSON.stringify({ method: "initialized" })}\n`);
     return await codexModels((params) => send("model/list", params));
   } finally { clearTimeout(timer); signal?.removeEventListener("abort", abort); lines.close(); child.kill(); }

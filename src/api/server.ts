@@ -27,6 +27,7 @@ export interface LocalApiOptions {
   temperature?: () => Promise<number | null>;
   watchdog?: () => { lastAttemptAt: string | null; lastSuccess: boolean | null; lastSuccessAt: string | null; error: string | null };
   tickIntervalSeconds?: number;
+  refreshModels?: () => Promise<unknown>;
 }
 
 export function defaultSocketPath(env: Record<string, string | undefined> = process.env): string {
@@ -48,6 +49,15 @@ export function localApi(store: Store, options: LocalApiOptions): LocalApi {
           temperature: await (options.temperature ?? latestTemperature)(),
         } });
       }
+      if (request.method === "GET" && url.pathname === "/v1/models") return reply(response, 200, store.models.view());
+      if (request.method === "GET" && url.pathname === "/v1/models/export") return reply(response, 200, store.models.export());
+      if (request.method === "POST" && url.pathname === "/v1/models/refresh") {
+        if (!options.refreshModels) throw new Error("model discovery is unavailable");
+        const view = await options.refreshModels();
+        if (store.models.view().discoveries.some((item) => item.lastError !== null)) throw new Error("model discovery failed; inspect ostrom models for per-harness errors (last good catalogs retained)");
+        return reply(response, 200, view);
+      }
+      if (request.method === "POST" && url.pathname === "/v1/models") return reply(response, 200, store.models.change(await bodyJson(request)));
       if (request.method === "GET" && url.pathname === "/v1/tickets") return reply(response, 200, store.operatorTickets());
       if (request.method === "GET" && url.pathname === "/v1/intake") {
         const raw = url.searchParams.get("limit");
@@ -76,10 +86,14 @@ export function localApi(store: Store, options: LocalApiOptions): LocalApi {
   return { start: () => listen(server, socketPath), close: () => close(server, socketPath) };
 }
 
-async function json(request: import("node:http").IncomingMessage): Promise<{ timeMinutes?: number; turns?: number; tokens?: number }> {
+async function bodyJson(request: import("node:http").IncomingMessage): Promise<unknown> {
   let body = "";
   for await (const chunk of request) body += chunk;
-  const parsed: unknown = JSON.parse(body);
+  return JSON.parse(body) as unknown;
+}
+
+async function json(request: import("node:http").IncomingMessage): Promise<{ timeMinutes?: number; turns?: number; tokens?: number }> {
+  const parsed = await bodyJson(request);
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error("expected a JSON object");
   const value = parsed as Record<string, unknown>;
   for (const key of ["timeMinutes", "turns", "tokens"]) {

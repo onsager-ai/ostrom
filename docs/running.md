@@ -28,6 +28,31 @@ the daemon's Unix socket at
 read-only commands can inspect `OSTROM_DB` directly while the daemon is down;
 mutating controls require the daemon.
 
+## Model discovery and selections
+
+`ostrom models` lists the cached Claude and Codex catalogs, allowed selections, efforts,
+custom settings and discovery errors. Add `--json` for structured output. Discovery runs in the
+background at daemon startup using the same harness environment as Workers; `ostrom models
+refresh` refreshes it on demand. A failed refresh exits nonzero and retains the last good catalog.
+New models start disallowed; retired allowed models are flagged in the list.
+
+```sh
+ostrom models allow codex/gpt-6.1-sol
+ostrom models set codex/gpt-6.1-sol --efforts low,high --approval on --cost 2 --note "Rust changes"
+ostrom models remove codex/gpt-6.1-sol
+ostrom models objective cost
+ostrom models export > models.json
+ostrom models import models.json
+```
+
+Use the IDs and efforts shown by discovery. Settings require an allowed model; efforts must be a
+subset of its discovered efforts and cost must be a positive relative weight. Import replaces the
+objective and all selections atomically after validating them against the local cached catalogs.
+An unavailable model cannot be added or edited, but an existing retired selection can be removed.
+Listing and export work from `OSTROM_DB` while the daemon is down; changes and refresh require it.
+These selections are stored for the next selection phase: they do not yet change the model or effort
+used for a turn. Outcome history is also a later phase.
+
 Developer-only one-shot passes remain available as `ostromd dev <pass>`:
 `poll`, `send`, `dispatch <ticket>`, `observe`, `commands`, `route`, `watchdog`,
 `merge`, `route-candidates`, and `tick`. They are retained for their existing tests and

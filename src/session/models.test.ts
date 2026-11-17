@@ -31,6 +31,12 @@ test("model/list request and consumed response fields agree with the pinned CLI 
   const root = await mkdtemp(join(tmpdir(), "ostrom-model-schema-"));
   try {
     await promisify(execFile)(process.execPath, [codexCli(), "app-server", "generate-json-schema", "--out", root], { timeout: 30_000 });
+    const requests = JSON.parse(await readFile(join(root, "ClientRequest.json"), "utf8"));
+    const initialize = requests.oneOf.find((request: { properties: { method: { enum: string[] } } }) => request.properties.method.enum.includes("initialize"));
+    assert.equal(initialize.properties.params.$ref, "#/definitions/InitializeParams");
+    assert.equal(requests.definitions.InitializeParams.properties.clientInfo.$ref, "#/definitions/ClientInfo");
+    for (const key of ["name", "version"]) assert.equal(requests.definitions.ClientInfo.properties[key].type, "string");
+    for (const key of ["experimentalApi", "explicitGatewayOauth"]) assert.equal(requests.definitions.InitializeCapabilities.properties[key].type, "boolean");
     const params = JSON.parse(await readFile(join(root, "v2/ModelListParams.json"), "utf8"));
     assert.deepEqual(params.properties.cursor.type, ["string", "null"]);
     assert.deepEqual(params.properties.limit.type, ["integer", "null"]);

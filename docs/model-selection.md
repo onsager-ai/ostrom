@@ -1,6 +1,7 @@
 # Model selection
 
-Status: accepted, 2026-11-17. This is a design; none of it exists yet. The operator asked for
+Status: accepted, 2026-11-17. PR 1 implements effort and turn records; PR 2 implements discovery
+and stored operator selections. Selection consumption remains planned. The operator asked for
 selection that is smarter than a fixed tier table, optimised for the operator's experience. On
 2026-11-17 they chose: **the lowest cost that still merges** as the default objective, **escalation
 within one harness** at first, allowed models **selected by an admin from those the harnesses
@@ -51,8 +52,12 @@ report, and can customise each one. Nobody types model IDs or effort lists by ha
   `supportedEffortLevels`.
 - Codex: the app-server's `model/list` returns each model's ID, display name, description,
   `supportedReasoningEfforts` and `defaultReasoningEffort`. It is marked experimental and the Codex
-  SDK does not expose it, so Ostrom calls the app-server directly and pins the response shape with
-  an agreement test (rule 5).
+  SDK does not expose it, so Ostrom starts the SDK-pinned CLI as a stdio app-server, initializes
+  its experimental API, then calls `model/list` through every pagination cursor. It pins the
+  request and response fields against the CLI-generated JSON schema in an agreement test (rule 5).
+  No login flow or inference turn is started. Claude discovery uses an open, empty prompt stream
+  for its control channel and closes the Query after `supportedModels()`; the SDK does not report
+  a default effort, so the normalized Claude default is null.
 
 Discovery runs when `ostromd` starts and when the operator asks. Its result is cached in the store,
 so a failed discovery call keeps the last good list and is reported, not hidden.

@@ -30,6 +30,7 @@ function deps(
     sleep: async () => {},
     stop: new AbortController().signal,
     runners: { claude: runner, codex: runner },
+    discoverModels: async () => [],
     addWorktree: async (_repo, _path, _base, ticket, assignment) => `ostrom/ticket-${ticket}-${assignment}`,
   };
   return { out, err, deps: d, runner };
@@ -477,3 +478,20 @@ test(
     assert.equal(run.err.filter((line) => line.startsWith("ostromd tick:")).length, 2);
   }),
 );
+
+
+test("startup discovery failures are logged without blocking daemon ticks", withDb(async (dbPath) => {
+  const github = new FakeGitHub(() => new Date());
+  const stop = new AbortController();
+  const run = deps(tickEnv(dbPath), github.gh, semonAnswer(20, []));
+  const discovered: string[] = [];
+  run.deps.stop = stop.signal;
+  run.deps.discoverModels = async (harness) => { discovered.push(harness); throw new Error("catalog offline"); };
+  run.deps.sleep = async () => { stop.abort(); };
+  assert.equal(await main(["run", "--interval", "30"], run.deps), 0);
+  assert.deepEqual(discovered.sort(), ["claude", "codex"]);
+  assert.equal(run.err.filter((line) => line.includes("model discovery failed: catalog offline")).length, 2);
+  const store = Store.open(dbPath);
+  try { assert.ok(store.models.view().discoveries.every((row) => row.lastError === "catalog offline")); }
+  finally { store.close(); }
+}));

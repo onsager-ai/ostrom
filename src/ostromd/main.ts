@@ -14,6 +14,7 @@ import { processRunner, type ProcessRunner } from "../process.ts";
 import { pollOnce } from "../github/poller.ts";
 import { routeCandidates } from "../router/router.ts";
 import { sessionConfig } from "../session/config.ts";
+import { modelDiscovery, type Discover } from "../session/model-discovery.ts";
 import { codexSessionsDir } from "../session/rollout.ts";
 import { claudeRunner, codexRunner, type Runner } from "../session/runner.ts";
 import { Store } from "../store/store.ts";
@@ -57,6 +58,7 @@ see docs/running.md. Developer passes retain their existing environment requirem
 `;
 
 export interface MainDeps {
+  discoverModels?: Discover;
   watchdogHealth?: { lastAttemptAt: string | null; lastSuccess: boolean | null; lastSuccessAt: string | null; error: string | null };
   env: Record<string, string | undefined>;
   gh: GhRunner;
@@ -162,7 +164,9 @@ async function run(intervalSeconds: number, deps: MainDeps): Promise<number> {
   const owned = openWorkers(deps);
   const controls = operatorControls(owned.store, owned.workers, deps.gh, config.repo);
   const watchdogHealth = { lastAttemptAt: null as string | null, lastSuccess: null as boolean | null, lastSuccessAt: null as string | null, error: null as string | null };
+  const discovery = modelDiscovery(owned.store, deps.env, (message) => deps.stderr(`ostromd: ${message}`), deps.discoverModels);
   const api = localApi(owned.store, {
+    refreshModels: () => discovery.refresh(),
     socketPath: defaultSocketPath(deps.env),
     watchdog: () => ({ ...watchdogHealth }),
     tickIntervalSeconds: intervalSeconds,
@@ -177,12 +181,14 @@ async function run(intervalSeconds: number, deps: MainDeps): Promise<number> {
   deps.stop.addEventListener("abort", () => owned.workers.stop(), { once: true });
   try {
     await api.start();
+    void discovery.refresh();
     while (!deps.stop.aborted) {
       code = await tick({ ...deps, workers: owned.workers, store: owned.store, watchdogHealth });
       if (deps.stop.aborted) break;
       await deps.sleep(intervalSeconds * 1000, deps.stop);
     }
   } finally {
+    await discovery.close();
     await api.close();
     await owned.close();
   }
