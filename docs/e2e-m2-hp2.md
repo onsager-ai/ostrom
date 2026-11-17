@@ -75,7 +75,9 @@ on each.
 
 - [#715](https://github.com/onsager-ai/ostrom/issues/715): the provider at start versus resume.
 - Ended tickets leave their worktrees on disk (`ticket-3-3-…` and `ticket-4-4-…` remain).
-- An approval that has a review body is queued to the Worker as a follow-up turn, which costs a turn
-  and restarts the quiet window. An approval with an empty body does not.
+- At this run's revision, approvals with either a body or an empty body were queued to the Worker,
+  costing a turn and restarting the quiet window. The earlier claim that empty approvals did not
+  queue a turn was incorrect; the M3 run and [#725](https://github.com/onsager-ai/ostrom/issues/725)
+  confirmed it. Approval-only reviews are now excluded as described in [merging.md](merging.md).
 - Not exercised here, as in the first run: resume-to-merge after a pause, protection gates at
   runtime, and reconciling a lost merge response.

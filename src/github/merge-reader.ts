@@ -15,6 +15,8 @@ export interface MergeReview {
   submittedAt: string | null;
   author: { id: string | null; login: string | null; type: string } | null;
   commitOid: string | null;
+  body: string;
+  inlineComments: number;
 }
 
 export interface MergeEvidence {
@@ -169,6 +171,7 @@ function decodeReview(value: unknown): MergeReview {
     id: string(row, "id"), state: string(row, "state"), submittedAt: nullableString(row, "submittedAt"),
     author: author === null ? null : { id: nullableString(author, "id"), login: nullableString(author, "login"), type: string(author, "__typename") },
     commitOid: commit === null ? null : nullableString(commit, "oid"),
+    body: string(row, "body"), inlineComments: number(object(row, "comments"), "totalCount"),
   };
 }
 

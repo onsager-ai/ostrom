@@ -50,9 +50,9 @@ test("reader finishes connections with different page counts without refetching 
     const value = (key: string) => args.find((arg) => arg.startsWith(`${key}=`))?.slice(key.length + 1);
     const threads = page(value("threadsAfter"), [{ id: "t1", isResolved: true }, { id: "t2", isResolved: true }], "t");
     const reviews = page(value("reviewsAfter"), [
-      { id: "r1", state: "COMMENTED", submittedAt: "2026-01-01T00:00:00Z", author: { __typename: "User", id: "u", login: "a" }, commit: { oid: "head" } },
-      { id: "r2", state: "COMMENTED", submittedAt: "2026-01-02T00:00:00Z", author: { __typename: "User", id: "u", login: "a" }, commit: { oid: "head" } },
-      { id: "r3", state: "COMMENTED", submittedAt: "2026-01-03T00:00:00Z", author: { __typename: "User", id: "u", login: "a" }, commit: { oid: "head" } },
+      { id: "r1", state: "COMMENTED", submittedAt: "2026-01-01T00:00:00Z", author: { __typename: "User", id: "u", login: "a" }, commit: { oid: "head" }, body: "feedback", comments: { totalCount: 2 } },
+      { id: "r2", state: "COMMENTED", submittedAt: "2026-01-02T00:00:00Z", author: { __typename: "User", id: "u", login: "a" }, commit: { oid: "head" }, body: "feedback", comments: { totalCount: 2 } },
+      { id: "r3", state: "COMMENTED", submittedAt: "2026-01-03T00:00:00Z", author: { __typename: "User", id: "u", login: "a" }, commit: { oid: "head" }, body: "feedback", comments: { totalCount: 2 } },
     ], "r");
     const contexts = page(value("contextsAfter"), [], "c");
     const suites = page(value("suitesAfter"), [], "s");
@@ -68,6 +68,7 @@ test("reader finishes connections with different page counts without refetching 
   assert.equal(calls.filter((call) => call[1] === "graphql").length, 3);
   assert.deepEqual(evidence.threads.map((thread) => thread.id), ["t1", "t2"]);
   assert.deepEqual(evidence.reviews.map((review) => review.id), ["r1", "r2", "r3"]);
+  assert.deepEqual(evidence.reviews.map((review) => [review.body, review.inlineComments]), [["feedback", 2], ["feedback", 2], ["feedback", 2]]);
   assert.deepEqual(evidence.rollup?.associatedPrNumbers, [1]);
 });
 

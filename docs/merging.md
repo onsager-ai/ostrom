@@ -87,7 +87,11 @@ not establish ownership. Human policy skips merge requests entirely. Otherwise a
 7. The ready reply has actually been posted, and ten quiet minutes have passed. The timer starts
    at the latest of that post, PR discovery, any head/base change, any completed Worker turn, and
    the latest observed human activity on the issue or PR. Activity includes comments/edits,
-   submitted/dismissed reviews, thread replies/resolutions, pushes, PR edits and controls. Refresh
+   submitted/dismissed reviews, thread replies/resolutions, pushes, PR edits and controls. An APPROVED
+   review with zero inline comments and a trimmed body that is empty or exactly `lgtm`, `approved`,
+   or `looks good` (case-insensitive, optionally followed by one `.` or `!`) is excluded from
+   activity and Worker follow-ups, but still counts toward approval policy. Intake records an
+   excluded receipt for it. Refresh
    these directly before merging; the intake cursor alone is insufficient. Newly observed changes
    with no reliable timestamp restart the timer at observation. Treat unmarked actor activity as
    human conservatively; Ostrom's marked cards/replies and CI updates do not restart it. Pending

@@ -5,6 +5,9 @@ import { Store } from "../store/store.ts";
 import { FakeGitHub } from "./fake-github.ts";
 import { replyMarker } from "./marker.ts";
 import { classify, pollOnce, type PollOptions } from "./poller.ts";
+import { routeFollowUps } from "../worker/follow-up.ts";
+import { FakeRunner } from "../worker/fake-runner.ts";
+import { Workers } from "../worker/workers.ts";
 
 const T0 = Date.parse("2026-11-09T12:00:00.000Z");
 const at = (minutes: number) => new Date(T0 + minutes * 60_000);
@@ -84,6 +87,76 @@ test("a pass stores all three comment kinds as triggers on their threads, in tim
     result.candidates.map((c) => c.triggerId),
     db.prepare(`SELECT id FROM "trigger" ORDER BY id`).all().map((r) => r["id"]),
   );
+});
+
+for (const body of ["", "  \n ", "LGTM", "approved!", "Looks good."]) test(`approval without feedback is receipted without a delivery: ${JSON.stringify(body)}`, async () => {
+  const { store, github, poll, count, setNow } = await fixture();
+  github.issue(8, true);
+  const source = store.ensureSource("github", github.repo);
+  const threadId = store.ensureThread({ sourceId: source.id, kind: "pull_request", number: 8, url: `https://github.com/${github.repo}/pull/8` });
+  const initial = store.insertTrigger({ sourceId: source.id, sourceEventId: "accepted", threadId, kind: "issue_comment", actor: "alice", url: "https://github.com/o/r/issues/1", occurredAt: at(0) }).id;
+  const ticket = store.recordDecision({ threadId, triggerIds: [initial], verdict: "accept", reason: "work" }).ticketId!;
+  const activity = store.ticketActivityAt(ticket);
+  const review = github.review(8, { login: "alice", state: "APPROVED", body, at: at(1) });
+  setNow(2);
+
+  assert.deepEqual((await poll()).candidates, []);
+  assert.deepEqual(store.pendingDeliveries(), []);
+  assert.equal(store.ticketActivityAt(ticket), activity);
+  assert.deepEqual(store.operatorIntake().filter((item) => item.eventId === review["node_id"]).map((item) => [item.disposition, item.reason]), [["excluded", "approval without feedback"]]);
+  await poll();
+  assert.equal(count("intake_receipt"), 1);
+  assert.equal(count("trigger"), 1);
+});
+
+for (const [state, body, inline] of [
+  ["APPROVED", "", true], ["APPROVED", "LGTM!", true],
+  ["APPROVED", "Looks good, but rename this", false], ["APPROVED", "LGTM?", false],
+  ["COMMENTED", "LGTM", false], ["CHANGES_REQUESTED", "", false],
+] as const) test(`${state} feedback remains deliverable: ${body}, inline=${inline}`, async () => {
+  const { store, github, poll, setNow } = await fixture();
+  github.issue(8, true);
+  const source = store.ensureSource("github", github.repo);
+  const threadId = store.ensureThread({ sourceId: source.id, kind: "pull_request", number: 8, url: `https://github.com/${github.repo}/pull/8` });
+  const initial = store.insertTrigger({ sourceId: source.id, sourceEventId: "accepted", threadId, kind: "issue_comment", actor: "alice", url: "https://github.com/o/r/issues/1", occurredAt: at(0) }).id;
+  const ticket = store.recordDecision({ threadId, triggerIds: [initial], verdict: "accept", reason: "work" }).ticketId!;
+  const assignment = store.createAssignment(ticket);
+  store.configureNativeAssignment(assignment, { harness: "codex", model: "m", worktree: "/wt", branch: "b", machine: "host" });
+  store.startNativeAssignment(assignment, "session-1");
+  const runner = new FakeRunner();
+  const workers = new Workers({ store, config: { repo: "/repo", base: "main", worktrees: "/wt", harness: "codex", model: "m", machine: "host" }, runners: { claude: runner, codex: runner } });
+  const review = github.review(8, { login: "alice", state, body, at: at(1) });
+  if (inline) github.reviewComment(8, { login: "alice", body: "rename this", at: at(1), reviewId: Number(review["id"]) });
+  setNow(2);
+  const result = await poll();
+  assert.equal(result.candidates.filter((candidate) => candidate.kind === "pull_request_review").length, 1);
+  assert.equal(store.pendingDeliveries().length, inline ? 2 : 1);
+  assert.equal(routeFollowUps(store, workers).queued.length, 1);
+  await workers.drain();
+  assert.equal(runner.sessions.length, 1);
+  assert.match(runner.sessions[0]!.prompts[0]!, /Review follow-up/);
+  assert.deepEqual(store.pendingDeliveries(), []);
+});
+
+test("approval inline comments older than the intake cursor still preserve the review follow-up", async () => {
+  const { github, poll, setNow } = await fixture();
+  github.issue(8, true);
+  const review = github.review(8, { login: "alice", state: "APPROVED", body: "LGTM", at: at(1) });
+  github.reviewComment(8, { login: "alice", body: "older inline feedback", at: at(-60), reviewId: Number(review["id"]) });
+  setNow(2);
+  assert.deepEqual((await poll()).candidates.map((candidate) => candidate.body), ["LGTM"]);
+});
+
+test("a failed inline-comment read cannot silently exclude an approval or advance the cursor", async () => {
+  const { github, poll, cursor, count, setNow } = await fixture();
+  github.issue(8, true);
+  github.review(8, { login: "alice", state: "APPROVED", body: "", at: at(1) });
+  setNow(2);
+  const before = cursor();
+  github.failWhen = (args) => args.some((arg) => /\/reviews\/\d+\/comments/.test(arg)) ? new Error("HTTP 502") : undefined;
+  await assert.rejects(poll(), /HTTP 502/);
+  assert.deepEqual(cursor(), before);
+  assert.equal(count("intake_receipt"), 0);
 });
 
 test("a newly opened issue that asks Ostrom becomes one allowlisted trigger", async () => {
@@ -268,7 +341,7 @@ test("a GitHub failure mid-pass leaves the cursor alone, so the next pass drops 
 
   github.failWhen = undefined;
   const retry = await poll();
-  assert.deepEqual(retry.candidates.map((c) => c.body), ["one", "looks good"]);
+  assert.deepEqual(retry.candidates.map((c) => c.body), ["one"]);
 });
 
 test("pagination reads every page, including a full page sharing one timestamp", async () => {
@@ -310,7 +383,7 @@ test("reviews: drafts and empty comment wrappers are skipped, old reviews are no
   github.review(8, { login: "bob", body: "", state: "APPROVED", at: at(3) });
   setNow(10);
   const result = await poll({ perPage: 2 });
-  assert.deepEqual(result.candidates.map((c) => [c.kind, c.body]), [["pull_request_review", ""]]);
+  assert.deepEqual(result.candidates, []);
 });
 
 test("a cursor that is not ours is refused, not reset", async () => {

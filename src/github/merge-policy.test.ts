@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 import { countApprovals, effectiveReviews, mergeEligibility, type EligibilityInput } from "./merge-policy.ts";
 import { readMergeEvidence, type MergeEvidence, type MergeReview } from "./merge-reader.ts";
 
-const review = (id: string, state: string, commitOid = "head", author = "alice"): MergeReview => ({ id, state, submittedAt: "2026-11-10T00:00:00Z", author: { id: `U_${author}`, login: author, type: "User" }, commitOid });
+const review = (id: string, state: string, commitOid = "head", author = "alice"): MergeReview => ({ id, state, submittedAt: "2026-11-10T00:00:00Z", author: { id: `U_${author}`, login: author, type: "User" }, commitOid, body: "", inlineComments: 0 });
 
 function evidence(): MergeEvidence {
   return {
