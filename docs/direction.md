@@ -202,9 +202,13 @@ the Router make model and effort judgements.
    The choice is configuration: `OSTROM_CLAUDE_AUTH=login` and `OSTROM_CODEX_PROVIDER=openai`. By
    default the operator's environment passes through unchanged, which on this machine means the
    gateway and the Magpie provider.
-2. **Model checks.** The Codex SDK reports token usage but not the model. Ostrom must confirm the
-   model each turn used (from the native session record) so that a resume never silently runs on an
-   expensive default, as happened once in the spike.
+2. **Model checks: answered 2026-11-17 (model-selection PR 1).** Claude's SDK init message reports
+   the model. Codex's SDK does not, so the existing bounded rollout reader reads the latest
+   `turn_context` model and effort from the native session ID's date-partitioned JSONL. Semon's query
+   summary formats model names and does not expose per-turn effort, so it is unsuitable for this
+   exact check. Each Worker turn stores requested and observed values; a model mismatch fails the
+   turn with its reason. An unavailable source records null rather than claiming verification.
+   Claude observed effort stays null because its SDK does not report it.
 3. **Bot identity: answered 2026-11-11 by the operator.** Option B: a GitHub App, identified
    by App ID, never its changeable name or slug. The daemon, CLI GitHub reads and Worker GitHub
    commands use installation tokens when configured; see [running.md](running.md#github-app-identity).

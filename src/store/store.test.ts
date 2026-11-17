@@ -440,6 +440,28 @@ test("a native turn is counted, marked while it runs, and its usage is added", (
   );
 });
 
+test("turn records retain requests, observations and failures without copying transcript text", () => {
+  const { store, accept } = fixture();
+  const ticketId = accept();
+  const id = store.createAssignment(ticketId);
+  store.configureNativeAssignment(id, { harness: "codex", model: "luna", worktree: "/w", branch: "b", machine: "h" });
+  store.startWorkerTurn(id, "dispatch", "low");
+  store.finishWorkerTurn(id, "failed", { inputTokens: 5, cachedInputTokens: 3, outputTokens: 2 },
+    { model: "sol", effort: "high" }, "model mismatch: asked for luna, ran sol");
+  store.startNativeAssignment(id, "sess");
+  store.startWorkerTurn(id, "recovery");
+  store.finishWorkerTurn(id, "interrupted", null);
+  const turns = store.operatorTicket(ticketId).turns;
+  assert.equal(turns.length, 2);
+  assert.deepEqual([turns[0]!.requestedModel, turns[0]!.requestedEffort, turns[0]!.observedModel, turns[0]!.observedEffort], ["luna", "low", "sol", "high"]);
+  assert.deepEqual([turns[0]!.status, turns[0]!.inputTokens, turns[0]!.cachedInputTokens, turns[0]!.outputTokens], ["failed", 5, 3, 2]);
+  assert.equal(turns[1]!.kind, "recovery");
+  assert.equal(turns[1]!.observedModel, null);
+  assert.equal(turns[1]!.requestedEffort, null);
+  assert.equal(turns[1]!.status, "interrupted");
+  assert.ok(turns.every((turn) => turn.endedAt !== null));
+});
+
 test("a ticket budget persists limits and sums every assignment's turn usage", () => {
   const { store, accept } = fixture();
   const ticketId = accept();

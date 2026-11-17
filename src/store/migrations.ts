@@ -561,6 +561,31 @@ export const migrations: readonly string[] = [
   ) STRICT, WITHOUT ROWID;
   CREATE INDEX intake_receipt_recent ON intake_receipt (observed_at DESC);
   `,
+
+  // 30: Per-turn requests, observations and usage; assignment totals remain budget authority.
+  `
+  CREATE TABLE turn (
+    id INTEGER PRIMARY KEY,
+    assignment_id INTEGER NOT NULL REFERENCES assignment(id),
+    ticket_id INTEGER NOT NULL REFERENCES ticket(id),
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    harness TEXT NOT NULL CHECK (harness IN ('claude', 'codex')),
+    requested_model TEXT NOT NULL,
+    requested_effort TEXT,
+    observed_model TEXT,
+    observed_effort TEXT,
+    kind TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL DEFAULT 0 CHECK (input_tokens >= 0),
+    cached_input_tokens INTEGER NOT NULL DEFAULT 0 CHECK (cached_input_tokens >= 0),
+    output_tokens INTEGER NOT NULL DEFAULT 0 CHECK (output_tokens >= 0),
+    status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'cancelled', 'failed', 'interrupted')),
+    result TEXT,
+    CHECK ((status = 'running') = (ended_at IS NULL))
+  ) STRICT;
+  CREATE INDEX turn_by_ticket ON turn(ticket_id, id);
+  CREATE UNIQUE INDEX turn_running ON turn(assignment_id) WHERE status = 'running';
+  `,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */

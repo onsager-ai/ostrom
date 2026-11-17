@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { rolloutModel } from "./rollout.ts";
+import { rolloutContext, rolloutModel } from "./rollout.ts";
 
 function root(): string {
   return mkdtempSync(join(tmpdir(), "rollout-"));
@@ -24,6 +24,22 @@ test("the model is the latest turn_context in the thread's rollout", () => {
   } finally {
     rmSync(dir, { recursive: true });
   }
+});
+
+test("Codex rollout agreement: date path and latest turn_context expose raw model and effort", () => {
+  const dir = root();
+  try {
+    const day = join(dir, "2026", "11", "17");
+    mkdirSync(day, { recursive: true });
+    writeFileSync(join(day, "rollout-2026-11-17T01-02-03-thread-id.jsonl"), [
+      line("turn_context", { model: "old", effort: "high" }),
+      JSON.stringify({ type: "turn_context", payload: { effort: "low", model: "gpt-6-luna" } }, null, 0),
+      line("event_msg", { message: '"type":"turn_context","payload":{"model":"wrong"}' }),
+    ].join("\n") + "\n");
+    assert.deepEqual(rolloutContext(dir, "thread-id"), { model: "gpt-6-luna", effort: "low" });
+    writeFileSync(join(day, "rollout-2026-11-17T01-02-03-thread-id.jsonl"), line("turn_context", { model: "gpt-6-luna" }));
+    assert.deepEqual(rolloutContext(dir, "thread-id"), { model: "gpt-6-luna", effort: null });
+  } finally { rmSync(dir, { recursive: true }); }
 });
 
 test("a missing rollout or one with no turn model throws", () => {

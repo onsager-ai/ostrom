@@ -13,6 +13,12 @@ export const codexSessionsDir = (): string => join(homedir(), ".codex", "session
  * names no model: an unreadable record is unverified, never assumed correct.
  */
 export function rolloutModel(root: string, threadId: string): string {
+  const context = rolloutContext(root, threadId);
+  if (context.model === null) throw new Error("rollout records no turn model");
+  return context.model;
+}
+
+export function rolloutContext(root: string, threadId: string): { model: string | null; effort: string | null } {
   const path = findRollout(root, threadId);
   const fd = openSync(path, "r");
   let text: string;
@@ -25,10 +31,21 @@ export function rolloutModel(root: string, threadId: string): string {
   } finally {
     closeSync(fd);
   }
-  let model: string | undefined;
-  for (const match of text.matchAll(/"type":"turn_context","payload":\{[^]*?"model":"([^"]+)"/g)) model = match[1];
-  if (model === undefined) throw new Error(`rollout ${path} records no turn model`);
-  return model;
+  let context: { model: string | null; effort: string | null } | undefined;
+  for (const line of text.split("\n")) {
+    let record: unknown;
+    try { record = JSON.parse(line); }
+    catch { continue; } // The bounded tail may start in the middle of a JSONL record.
+    if (typeof record !== "object" || record === null || !("type" in record) || record.type !== "turn_context" || !("payload" in record)) continue;
+    const payload = record.payload;
+    if (typeof payload !== "object" || payload === null) continue;
+    context = {
+      model: "model" in payload && typeof payload.model === "string" ? payload.model : null,
+      effort: "effort" in payload && typeof payload.effort === "string" ? payload.effort : null,
+    };
+  }
+  if (context === undefined) throw new Error(`rollout ${path} records no turn model`);
+  return context;
 }
 
 function findRollout(root: string, threadId: string): string {

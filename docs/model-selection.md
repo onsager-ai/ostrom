@@ -8,14 +8,22 @@ report**, and the rule-3 amendment below.
 
 ## Starting point
 
-Current code at `1e0474e`:
+PR 1 implementation (effort and turn records):
 
 - `src/ostromd/config.ts` reads one Worker model and one Router model from the environment
   (`OSTROM_WORKER_MODEL`, `OSTROM_ROUTER_MODEL`, both `gpt-6-luna` by default). Every ticket gets
   the same model. `assignment.model` records it.
-- `src/session/runner.ts` passes only the model. Neither SDK receives an effort, so Codex uses its
-  default. Both SDKs accept one: Codex `modelReasoningEffort` (`minimal` to `max`) as a thread
-  option, the Claude Agent SDK `effort` (`low` to `max`).
+- `src/session/runner.ts` accepts optional session and turn efforts, forwarding Codex
+  `modelReasoningEffort` as a thread option and Claude Agent SDK `effort`. A changed Codex effort
+  resumes the same native thread with new options. Null or absent effort leaves the harness default.
+- Every Worker invocation records requested and observed model/effort, kind, usage and status in
+  `turn`; `ostrom show` includes these records. Existing source kinds distinguish dispatch, review,
+  redirect, control, ordinary follow-up, budget pause, stuck handling and recovery. CI fixes and
+  conflicts are not separately identified by today's call sites.
+- Claude's init message confirms its model; observed Claude effort remains null because the SDK
+  does not report it. Codex's last native rollout `turn_context` confirms raw model and effort using
+  the existing bounded reader. Semon's query summary lacks per-turn effort and formats model names,
+  so it cannot supply this check. Missing evidence stays null; a model mismatch fails the turn.
 - `src/budget/budgets.ts` has an `escalations` limit (`OSTROM_BUDGET_ESCALATIONS=0`), but nothing
   escalates, so it never counts.
 - `docs/experience.md` and `docs/direction.md` describe tiers per repository, per label and per
