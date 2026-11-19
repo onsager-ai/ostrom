@@ -40,11 +40,11 @@ query MergeEvidence(
                 nodes {
                   __typename
                   ... on CheckRun {
-                    databaseId name status conclusion
+                    databaseId name status conclusion detailsUrl
                     checkSuite { databaseId status conclusion app { databaseId slug name } }
                   }
                   ... on StatusContext {
-                    context state
+                    context state targetUrl
                     creator { __typename login ... on User { id } ... on Bot { id } }
                   }
                 }

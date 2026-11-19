@@ -6,7 +6,7 @@ import type { MergeCandidate, Store } from "../store/store.ts";
 import { queueStatusCard } from "./cards.ts";
 import { ghMergeGet, ghSquashMerge, type GhRunner } from "./gh.ts";
 import { mergeEligibility, readyPolicySentence, type ApprovalIdentity, type MergePolicy } from "./merge-policy.ts";
-import { readMergeEvidence, type MergeEvidence } from "./merge-reader.ts";
+import { failedChecks, readMergeEvidence, type MergeEvidence } from "./merge-reader.ts";
 
 const QUIET_MS = 10 * 60_000;
 const RETRY_MS = 30_000;
@@ -85,6 +85,8 @@ async function consider(options: MergePassOptions, assignmentId: number, prNumbe
     if (pr.state === "OPEN" && (pr.mergeStateStatus === "DIRTY" || pr.mergeable === "CONFLICTING")) {
       reason = `Conflicts with ${pr.base.ref}; the Worker needs to merge ${pr.base.ref}.`;
       deliverConflictTurn(options, assignmentId, observation);
+    } else if (pr.state === "OPEN") {
+      deliverCiFixTurn(options, assignmentId, observation);
     }
     saveReason(options, candidate, reason);
     result.waiting.push({ assignmentId, reason });
@@ -156,14 +158,33 @@ async function consider(options: MergePassOptions, assignmentId: number, prNumbe
   } catch (error) { result.failed.push({ assignmentId, error: message(error) }); }
 }
 
-function deliverConflictTurn(options: MergePassOptions, assignmentId: number, observation: Observation): void {
+function automaticTurnAllowed(options: MergePassOptions, assignmentId: number, observation: Observation): boolean {
   const { store } = options;
   const assignment = store.getAssignment(assignmentId);
   const ticket = store.getTicket(assignment.ticketId);
   if (options.allowSend === false || !observation.owned || !observation.issueOpen || assignment.state !== "running" ||
       assignment.outcome === "failed" || ticket.state !== "open" || ticket.stopRequestedAt !== null ||
       budgetReached(store.ticketBudget(ticket.id), clock(options)) !== null ||
-      store.unansweredStalls().some((stall) => stall.assignmentId === assignmentId) || !store.assignmentWorkIdle(assignmentId)) return;
+      store.unansweredStalls().some((stall) => stall.assignmentId === assignmentId) ||
+      store.runningAssignments().some((other) => other.ticketId === ticket.id && !store.assignmentWorkIdle(other.id))) return false;
+  return true;
+}
+
+function deliverCiFixTurn(options: MergePassOptions, assignmentId: number, observation: Observation): void {
+  const failures = failedChecks(observation.evidence);
+  if (failures.length === 0 || !automaticTurnAllowed(options, assignmentId, observation)) return;
+  const { pr } = observation.evidence;
+  const checks = failures.map((check) => `- ${check.name}: ${check.url ?? `https://github.com/${options.repo}/pull/${pr.number}/checks`}`).join("\n");
+  options.workers.deliver(assignmentId, `ci-fix-a${assignmentId}-${pr.head.sha}`,
+    `CI checks failed on pull request #${pr.number} at head ${pr.head.sha}:\n${checks}\n\n` +
+    `Read the linked runs/logs and compare these failures with the current ${pr.base.ref} head before changing code. ` +
+    "If the same check fails on the base branch, report that evidence so you do not chase a failure this PR did not cause. " +
+    `Check the current PR head before acting; fix the failures that still apply, then commit and push to the existing PR branch ${pr.head.ref}. Do not open a new PR.`,
+    () => {});
+}
+
+function deliverConflictTurn(options: MergePassOptions, assignmentId: number, observation: Observation): void {
+  if (!automaticTurnAllowed(options, assignmentId, observation)) return;
   const { pr } = observation.evidence;
   // The durable queue retains finished keys, so an unresolved conflict is not retried until the
   // head or base moves. No await separates the local eligibility check from durable delivery.

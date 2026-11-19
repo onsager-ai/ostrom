@@ -14,7 +14,10 @@ export interface CommentInput {
 export type IssueInput = Partial<CommentInput>;
 
 export class FakeGitHub {
-  readonly repo = "onsager-ai/ostrom";
+  /** REST and GraphQL merge evidence for merge-pass tests. */
+  readonly mergePulls = new Map<number, { pull: Item; evidence: Item }>();
+  readonly mergeProtection: Item = {};
+  readonly mergeRules: Item[] = [];
   readonly issueComments: Item[] = [];
   readonly reviewComments: Item[] = [];
   readonly issues = new Map<number, Item>();
@@ -31,8 +34,11 @@ export class FakeGitHub {
   #ids = 1000;
   readonly #now: () => Date;
 
-  constructor(now: () => Date) {
+  readonly repo: string;
+
+  constructor(now: () => Date, repo = "onsager-ai/ostrom") {
     this.#now = now;
+    this.repo = repo;
   }
 
   issue(number: number, pr = false, input: IssueInput = {}): void {
@@ -128,7 +134,18 @@ export class FakeGitHub {
     this.calls.push([...args]);
     const failure = this.failWhen?.(args);
     if (failure) throw failure;
-    const [api, flag, method, path, ...rest] = args;
+    if (args[0] === "api" && args[1] === "graphql") {
+      const number = Number(args.find((arg) => arg.startsWith("number="))?.slice(7));
+      const pull = this.mergePulls.get(number);
+      if (!pull) throw new Error(`fake gh: no merge evidence for #${number}`);
+      return JSON.stringify({ data: { repository: { pullRequest: pull.evidence } } });
+    }
+    // Merge reads pin the REST API version with a header before --method.
+    const request = [...args];
+    for (let index = 1; index < request.length; index++) {
+      if (request[index] === "-H") request.splice(index--, 2);
+    }
+    const [api, flag, method, path, ...rest] = request;
     if (api !== "api" || flag !== "--method" || path === undefined) throw new Error(`fake gh: ${args.join(" ")}`);
     if (method === "POST") return JSON.stringify(this.#post(path, rest));
     if (method === "PATCH") return JSON.stringify(this.#patch(path, rest));
@@ -143,6 +160,12 @@ export class FakeGitHub {
     const route = path.slice(`repos/${this.repo}/`.length);
     let match: RegExpMatchArray | null;
     let found: Item | undefined;
+    if (path === `repos/${this.repo}`) return { allow_squash_merge: true };
+    if (/^branches\/[^/]+\/protection$/.test(route)) return this.mergeProtection;
+    if ((match = route.match(/^pulls\/(\d+)$/))) {
+      const pull = this.mergePulls.get(Number(match[1]));
+      if (pull) return pull.pull;
+    }
     if ((match = route.match(/^collaborators\/([^/]+)\/permission$/))) {
       return permissionBody(this.permissions.get(decodeURIComponent(match[1]!)) ?? "none");
     } else if ((match = route.match(/^issues\/(\d+)$/))) {
@@ -166,6 +189,7 @@ export class FakeGitHub {
     const prefix = `/repos/${this.repo}/`;
     if (!url.pathname.startsWith(prefix)) throw new Error(`fake gh: unknown repo in ${path}`);
     const route = url.pathname.slice(prefix.length);
+    if (/^rules\/branches\/[^/]+$/.test(route)) return this.mergeRules;
     const permission = route.match(/^collaborators\/([^/]+)\/permission$/);
     if (permission) return [permissionBody(this.permissions.get(decodeURIComponent(permission[1]!)) ?? "none")];
     let items: Item[];
@@ -186,6 +210,7 @@ export class FakeGitHub {
     } else if (route === "issues") items = [...this.issues.values()];
     else if ((match = route.match(/^issues\/(\d+)\/events$/))) items = this.issueEvents.get(Number(match[1])) ?? [];
     else if ((match = route.match(/^pulls\/(\d+)\/reviews\/(\d+)\/comments$/))) items = this.reviewComments.filter((comment) => comment["pull_request_review_id"] === Number(match![2]));
+    else if ((match = route.match(/^pulls\/(\d+)\/comments$/))) items = this.reviewComments.filter((comment) => (comment["pull_request_url"] as string).endsWith(`/pulls/${match![1]}`));
     else if ((match = route.match(/^pulls\/(\d+)\/reviews$/))) items = this.reviews.get(Number(match[1])) ?? [];
     else if ((match = route.match(/^issues\/(\d+)\/comments$/))) items = this.commentsOn(Number(match[1]));
     else throw new Error(`fake gh: no route ${route}`);

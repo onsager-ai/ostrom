@@ -36,6 +36,29 @@ test("reader decodes the recorded sandbox GraphQL and pinned REST shapes", async
   assert.equal(calls.filter((call) => call[1] !== "graphql").every((call) => call.includes("X-GitHub-Api-Version: 2022-11-28")), true);
 });
 
+test("reader keys legacy statuses by context and still validates CheckRun database IDs", async () => {
+  const graphql = fixture("merge-reader-graphql.json") as {
+    data: { repository: { pullRequest: { commits: { nodes: { commit: { statusCheckRollup: { contexts: { nodes: Record<string, unknown>[] } } } }[] } } } };
+  };
+  const contexts = graphql.data.repository.pullRequest.commits.nodes[0]!.commit.statusCheckRollup.contexts;
+  const status = { __typename: "StatusContext", context: "external", state: "FAILURE" };
+  contexts.nodes = [status, { ...status, context: "another" }];
+  const gh: GhRunner = async (args) => {
+    if (args[1] === "graphql") return JSON.stringify(graphql);
+    const path = args.at(-1)!;
+    if (path.endsWith("/pulls/8")) return JSON.stringify(fixture("merge-reader-pr.json"));
+    if (path.endsWith("/protection")) return "{}";
+    if (path.includes("/rules/")) return "[]";
+    return JSON.stringify(fixture("merge-reader-repository.json"));
+  };
+  const evidence = await readMergeEvidence(gh, "onsager-ai/ostrom-sandbox", 8);
+  assert.deepEqual(evidence.rollup?.contexts, contexts.nodes);
+  for (const databaseId of [undefined, "invalid"]) {
+    contexts.nodes = [{ __typename: "CheckRun", databaseId }];
+    await assert.rejects(readMergeEvidence(gh, "onsager-ai/ostrom-sandbox", 8), /invalid number databaseId/);
+  }
+});
+
 test("reader finishes connections with different page counts without refetching page one", async () => {
   const pull = { head: { ref: "branch", sha: "head", repo: { full_name: "o/r" } }, base: { ref: "main", sha: "base", repo: { full_name: "o/r" } } };
   const rest = { allow_squash_merge: true };
