@@ -32,7 +32,7 @@ drivers. A dedicated "promote to foreground" feature is deferred (operator, 2026
 
 An issue author or reviewer, who never sees Ostrom's internals.
 
-1. Opens an issue that mentions Ostrom, or mentions Ostrom in a comment on a thread without an active ticket. On a thread Ostrom already works on, later comments continue to reach the Worker without a mention.
+1. Opens an issue that mentions Ostrom, or mentions Ostrom in a comment on a thread without an active ticket. On a thread Ostrom already works on, comments after that ticket's start comment continue to reach the Worker without a mention.
 2. Within minutes Ostrom replies with "taking this" or "not for me, because …".
 3. A PR appears, linked to the issue. Ostrom checks its description and, for tickets started from an issue, fixes literal `\n` sequences and ensures exactly one `Closes #<issue>` line.
    If the Worker finishes its first turn or a follow-up without a PR for its branch or a new push

@@ -67,6 +67,18 @@ function fixture() {
   return { store, runner, workers, thread, issue, pr, trigger, accept, worker, ticketId, assignmentId };
 }
 
+test("a new ticket receives only comments after its start trigger", () => {
+  const { store, issue, trigger, ticketId: oldTicket } = fixture();
+  trigger(issue);
+  store.endTicket(oldTicket);
+
+  const newStart = trigger(issue);
+  const newTicket = store.recordDecision({ threadId: issue, triggerIds: [newStart], verdict: "accept", reason: "new work" }).ticketId!;
+  const newerComment = trigger(issue);
+
+  assert.deepEqual(store.pendingDeliveries().map((delivery) => [delivery.ticketId, delivery.trigger.id]), [[newTicket, newerComment]]);
+});
+
 test("trusted comments and reviews acknowledge public stalls in every ticket state", async () => {
   for (const state of ["open", "paused", "ended"] as const) {
     for (const review of [false, true]) {

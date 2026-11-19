@@ -1148,6 +1148,16 @@ export class Store {
        JOIN ticket ON ticket.id = subscription.ticket_id AND ticket.state IN ('open', 'paused')
        WHERE t.kind IN ('issue_comment', 'issue_state')
          AND (ticket.state = 'open' OR t.kind = 'issue_state' OR lower(ltrim(COALESCE(t.body, ''))) GLOB '@ostrom *')
+         AND NOT EXISTS (
+           SELECT 1 FROM decision_trigger AS start_decision
+           JOIN "trigger" AS start_trigger ON start_trigger.id = start_decision.trigger_id
+           WHERE start_decision.decision_id = ticket.decision_id
+             AND (t.occurred_at, t.id) < (start_trigger.occurred_at, start_trigger.id)
+             AND NOT EXISTS (
+               SELECT 1 FROM decision_trigger AS earlier_decision
+               JOIN "trigger" AS earlier_trigger ON earlier_trigger.id = earlier_decision.trigger_id
+               WHERE earlier_decision.decision_id = ticket.decision_id
+                 AND (earlier_trigger.occurred_at, earlier_trigger.id) < (start_trigger.occurred_at, start_trigger.id)))
          AND NOT EXISTS (SELECT 1 FROM decision_trigger WHERE trigger_id = t.id)
          AND NOT EXISTS (SELECT 1 FROM delivery WHERE delivery.trigger_id = t.id)
          AND NOT EXISTS (
@@ -1184,7 +1194,17 @@ export class Store {
            WHERE stalled.ticket_id = ticket.id AND stall.public_at IS NOT NULL AND stall.cleared_at IS NULL))
        LEFT JOIN assignment AS worker ON worker.id = (
          SELECT id FROM assignment WHERE ticket_id = ticket.id AND state = 'running' ORDER BY id DESC LIMIT 1)
-       WHERE NOT EXISTS (SELECT 1 FROM decision_trigger WHERE trigger_id = t.id)
+       WHERE NOT EXISTS (
+           SELECT 1 FROM decision_trigger AS start_decision
+           JOIN "trigger" AS start_trigger ON start_trigger.id = start_decision.trigger_id
+           WHERE start_decision.decision_id = ticket.decision_id
+             AND (t.occurred_at, t.id) < (start_trigger.occurred_at, start_trigger.id)
+             AND NOT EXISTS (
+               SELECT 1 FROM decision_trigger AS earlier_decision
+               JOIN "trigger" AS earlier_trigger ON earlier_trigger.id = earlier_decision.trigger_id
+               WHERE earlier_decision.decision_id = ticket.decision_id
+                 AND (earlier_trigger.occurred_at, earlier_trigger.id) < (start_trigger.occurred_at, start_trigger.id)))
+         AND NOT EXISTS (SELECT 1 FROM decision_trigger WHERE trigger_id = t.id)
          AND NOT EXISTS (
            SELECT 1 FROM command_receipt
            WHERE command_receipt.trigger_id = t.id AND command_receipt.ticket_id = ticket.id)
@@ -1279,6 +1299,16 @@ export class Store {
             JOIN ticket ON ticket.id = subscription.ticket_id
             WHERE ticket.id = (SELECT ticket_id FROM assignment WHERE id = ?)
               AND ticket.state IN ('open', 'paused')
+              AND NOT EXISTS (
+                SELECT 1 FROM decision_trigger AS start_decision
+                JOIN "trigger" AS start_trigger ON start_trigger.id = start_decision.trigger_id
+                WHERE start_decision.decision_id = ticket.decision_id
+                  AND (t.occurred_at, t.id) < (start_trigger.occurred_at, start_trigger.id)
+                  AND NOT EXISTS (
+                    SELECT 1 FROM decision_trigger AS earlier_decision
+                    JOIN "trigger" AS earlier_trigger ON earlier_trigger.id = earlier_decision.trigger_id
+                    WHERE earlier_decision.decision_id = ticket.decision_id
+                      AND (earlier_trigger.occurred_at, earlier_trigger.id) < (start_trigger.occurred_at, start_trigger.id)))
               AND NOT EXISTS (SELECT 1 FROM decision_trigger WHERE trigger_id = t.id)
               AND NOT EXISTS (SELECT 1 FROM delivery WHERE delivery.trigger_id = t.id)
               AND NOT EXISTS (SELECT 1 FROM command_receipt WHERE command_receipt.trigger_id = t.id AND command_receipt.ticket_id = ticket.id)
