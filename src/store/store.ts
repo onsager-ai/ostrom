@@ -843,7 +843,9 @@ export class Store {
               COALESCE(SUM(assignment.output_tokens), 0) AS output_tokens,
               COALESCE((SELECT SUM(ROUND((julianday(ended_at) - julianday(started_at)) * 86400))
                         FROM turn WHERE turn.ticket_id = ticket.id AND ended_at IS NOT NULL), 0) AS completed_turn_seconds,
-              MAX(assignment.turn_started_at) AS turn_started_at
+              MAX(CASE WHEN (SELECT status FROM turn WHERE turn.assignment_id = assignment.id
+                ORDER BY id DESC LIMIT 1) = 'interrupted'
+                THEN NULL ELSE assignment.turn_started_at END) AS turn_started_at
          FROM ticket LEFT JOIN assignment ON assignment.ticket_id = ticket.id WHERE ticket.id = ? GROUP BY ticket.id`,
       ticketId,
     );

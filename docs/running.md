@@ -18,11 +18,21 @@ systemctl --user enable --now ostromd
 The daemon runs `ostromd run --interval 60`, restarts after failures, and writes
 logs to the user journal. Inspect it with `journalctl --user -u ostromd`.
 
+On SIGTERM or SIGINT, the daemon stops scheduling turns, records active turns as interrupted at
+the stop time, and aborts them through the SDK cancellation signal. It allows five seconds for
+Worker cancellation to settle, with a ten-second deadline for the whole shutdown; a timeout exits
+nonzero. The next start resumes interrupted assignments by session ID. Claude 0.3.319 accepts an
+`abortController`; Codex 0.167.0 accepts a turn `signal` which terminates its `codex exec` process.
+That Codex SDK exposes no thread interrupt API that guarantees a `turn_aborted` session record,
+so native session readers may still report an unterminated turn even though Ostrom records its
+interruption.
+
 The per-ticket time budget counts time spent in Worker turns, including completed turns and any
 currently running turn. Time waiting between turns, such as for review or an operator answer, does
 not consume it; the idle budget applies only while a turn is running. After a crash, a recovered
 turn ends at its last recorded session activity (or its start if no later activity was observed),
-so daemon downtime does not consume the time budget.
+so daemon downtime does not consume the time budget. Reaching a budget pauses new work and queues
+a WIP prompt after the current turn finishes; it does not cancel that turn.
 
 The operator uses `ostrom status`, `tickets`, `show`, `pause`, `resume`, `stop`,
 `extend`, and `preview`. Run `ostrom dashboard` to open the read-only local dashboard while

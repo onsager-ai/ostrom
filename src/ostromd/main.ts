@@ -184,7 +184,7 @@ async function run(intervalSeconds: number, deps: MainDeps): Promise<number> {
     },
   });
   logRecovery(owned.workers.recover(), deps);
-  // A stop cuts off running turns rather than waiting for them; recovery resumes them on the next start.
+  // Record interruption and signal the SDK immediately; recovery resumes assignments next start.
   deps.stop.addEventListener("abort", () => owned.workers.stop(), { once: true });
   try {
     await api.start();
@@ -197,7 +197,10 @@ async function run(intervalSeconds: number, deps: MainDeps): Promise<number> {
   } finally {
     await discovery.close();
     await api.close();
-    await owned.close();
+    if (!await owned.close(true)) {
+      deps.stderr("ostromd stop: SDK cancellation did not settle within 5 seconds");
+      code = 1;
+    }
   }
   return code;
 }
@@ -237,9 +240,11 @@ function openWorkers(deps: MainDeps) {
   return {
     store,
     workers,
-    close: async () => {
+    close: async (stopping = false): Promise<boolean> => {
       try {
+        if (stopping) return await workers.shutdown();
         await workers.drain();
+        return true;
       } finally {
         store.close();
       }
@@ -359,7 +364,6 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
       const pass = await watchdog({
         store, semon: deps.semon, idleMinutes,
         onBudgetPause: (assignmentId) => {
-          workers().cancel(assignmentId);
           workers().deliver(assignmentId, `budget-pause-${assignmentId}-${Date.now()}`,
             "The ticket budget has been reached. Push your work in progress, then stop and wait for Ostrom to resume you.", () => {});
         },
@@ -449,9 +453,19 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
 
 if (import.meta.main) {
   const stop = new AbortController();
-  // Only `run` finishes its current tick on a signal; a second signal, or any other command, stops as usual.
+  // Bound the whole shutdown, including a tick or SDK subprocess that does not settle.
+  let deadline: ReturnType<typeof setTimeout> | undefined;
   if (process.argv[2] === "run") {
-    for (const signal of ["SIGINT", "SIGTERM"] as const) process.once(signal, () => stop.abort());
+    for (const signal of ["SIGINT", "SIGTERM"] as const) process.once(signal, () => {
+      if (stop.signal.aborted) return;
+      deadline = setTimeout(() => {
+        console.error("ostromd stop: shutdown exceeded 10 seconds");
+        process.exit(1);
+      }, 10_000);
+      stop.abort();
+    });
   }
   process.exitCode = await main(process.argv.slice(2), { ...defaults, stop: stop.signal });
+  clearTimeout(deadline);
+  if (stop.signal.aborted) process.exit(process.exitCode);
 }

@@ -316,7 +316,27 @@ test("a reservation blocks a new queued turn without consuming budget and releas
   assert.equal(store.assignmentWorkIdle(1), true);
 });
 
-test("a stop cuts off the running turn, starts no queued one, and leaves the turn for recovery", async () => {
+test("shutdown is bounded when the SDK ignores cancellation and late activity is ignored", async () => {
+  const { store, runner, ticketId, workers } = fixture();
+  runner.hold = true;
+  const start = runner.start.bind(runner);
+  runner.start = (options) => {
+    const session = start(options);
+    const send = session.send.bind(session);
+    session.send = (prompt) => send(prompt); // emulate an SDK that never settles on abort
+    return session;
+  };
+  await workers.dispatch(ticketId);
+  assert.equal(await workers.shutdown(1), false);
+  assert.equal(store.ticketTurns(ticketId)[0]!.status, "interrupted");
+  store.close();
+  stores.splice(stores.indexOf(store), 1);
+  runner.sessions[0]!.options.onActivity?.();
+  runner.sessions[0]!.release();
+  await workers.drain();
+});
+
+test("a stop records interruption now, starts no queued one, and leaves the assignment for recovery", async () => {
   const { store, runner, ticketId, workers, make } = fixture();
   runner.hold = true;
   await workers.dispatch(ticketId);
@@ -326,7 +346,10 @@ test("a stop cuts off the running turn, starts no queued one, and leaves the tur
   assert.deepEqual(runner.sessions[0]!.prompts.length, 1, "the queued turn never started");
   const a = store.getAssignment(1);
   assert.deepEqual([a.state, a.outcome, a.lastError], ["running", null, null]);
-  assert.notEqual(a.turnStartedAt, null, "the cut-off turn stays open");
+  assert.notEqual(a.turnStartedAt, null, "the assignment requests a recovery turn");
+  const stopped = store.ticketTurns(ticketId)[0]!;
+  assert.equal(stopped.status, "interrupted");
+  assert.equal(stopped.endedAt, "2026-11-09T12:00:00.000Z");
 
   runner.hold = false;
   const restarted = make();

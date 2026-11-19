@@ -550,6 +550,29 @@ test("recovery charges the last observed activity, excluding daemon downtime", (
   }
 });
 
+test("a graceful interruption keeps its recovery marker without charging stopped time twice", () => {
+  const { store, accept, advance } = fixture();
+  const ticketId = accept();
+  const id = store.createAssignment(ticketId);
+  store.configureNativeAssignment(id, { harness: "codex", model: "m", worktree: "/w", branch: "b", machine: "h" });
+  store.startNativeAssignment(id, "session");
+  store.beginTurn(id);
+  store.startWorkerTurn(id, "dispatch");
+  advance(5 * 60_000);
+  store.finishWorkerTurn(id, "interrupted", null);
+  advance(55 * 60_000);
+  assert.notEqual(store.getAssignment(id).turnStartedAt, null);
+  assert.equal(store.ticketBudget(ticketId).turnStartedAt, null);
+  assert.equal(store.ticketBudget(ticketId).completedTurnSeconds, 300);
+  const endedAt = store.ticketTurns(ticketId)[0]!.endedAt;
+  store.interruptRecoveredTurn(id, "daemon restarted");
+  assert.equal(store.ticketTurns(ticketId)[0]!.endedAt, endedAt, "recovery preserves an explicit stop time");
+  store.endTurn(id, null);
+  store.beginTurn(id);
+  store.startWorkerTurn(id, "recovery");
+  assert.notEqual(store.ticketBudget(ticketId).turnStartedAt, null);
+});
+
 test("a ticket budget persists limits and sums every assignment's turn usage", () => {
   const { store, accept, advance } = fixture();
   const ticketId = accept();
