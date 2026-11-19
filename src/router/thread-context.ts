@@ -11,7 +11,7 @@ export interface ThreadContext {
 
 export function excerptThreadBody(body: string): { bodyExcerpt: string; bodyTruncated: boolean } {
   return {
-    bodyExcerpt: body.length > THREAD_BODY_EXCERPT_CHARS ? `${body.slice(0, THREAD_BODY_EXCERPT_CHARS)}…` : body,
+    bodyExcerpt: body.length > THREAD_BODY_EXCERPT_CHARS ? body.slice(0, THREAD_BODY_EXCERPT_CHARS) : body,
     bodyTruncated: body.length > THREAD_BODY_EXCERPT_CHARS,
   };
 }

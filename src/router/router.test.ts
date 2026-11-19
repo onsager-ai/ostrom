@@ -512,11 +512,11 @@ test("a comment deleted since intake reaches the Router as deleted; long bodies 
   await routeCandidates(s.options());
   const thread = batchOf(s.routerSessions()[0]!.prompts[0]!).threads[0]!;
   const [deleted, long] = thread.candidates;
-  assert.equal(thread.bodyExcerpt.length, 2001);
+  assert.equal(thread.bodyExcerpt.length, 2000);
   assert.equal(thread.bodyTruncated, true);
   assert.match(deleted!.excerpt, /deleted from GitHub/);
   assert.equal(long!.truncated, true);
-  assert.equal(long!.excerpt.length, 601);
+  assert.equal(long!.excerpt.length, 600);
 });
 
 test("a flagged stall does not make the Router run", async () => {

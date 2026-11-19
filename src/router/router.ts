@@ -254,7 +254,7 @@ async function candidateThreads(options: RouteOptions): Promise<ThreadView[]> {
       actor: trigger.actor,
       url: trigger.url,
       occurredAt: trigger.occurredAt,
-      excerpt: body.length > EXCERPT_CHARS ? `${body.slice(0, EXCERPT_CHARS)}…` : body,
+      excerpt: body.length > EXCERPT_CHARS ? body.slice(0, EXCERPT_CHARS) : body,
       truncated: body.length > EXCERPT_CHARS,
     });
   }
