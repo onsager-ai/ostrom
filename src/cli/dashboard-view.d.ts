@@ -20,9 +20,13 @@ export function ticketPhase(ticket: Pick<OperatorTicket, "state" | "pauseCause" 
 export function phaseSummary(tickets: OperatorTicket[]): string;
 export function ticketSummary(detail?: Pick<OperatorTicketDetail, "decisions" | "context">): { full: string; short: string };
 export function pendingSelection(
-  detail: Pick<OperatorTicketDetail, "selections"> & { assignment?: Pick<NonNullable<OperatorTicket["assignment"]>, "harness" | "model"> | null },
+  detail: {
+    selections: Pick<OperatorTicketDetail["selections"][number], "id" | "kind" | "source" | "value">[];
+    assignment?: Pick<NonNullable<OperatorTicket["assignment"]>, "harness" | "model"> | null;
+  } | null | undefined,
   kind: "model" | "effort",
   current: string | null | undefined,
+  boundary?: string | null,
 ): string | null;
 export function budgetMeters(ticket: Pick<OperatorTicket, "budgetUsage" | "budget">): BudgetMeter[];
 export function attentionItems(
