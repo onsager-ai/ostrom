@@ -2,7 +2,10 @@
 // `workers.ts`; here a running Worker is followed through GitHub until its PR exists. Everything
 // here is deterministic; no model call is made by Ostrom itself.
 
+import { renameSession } from "@anthropic-ai/claude-agent-sdk";
+
 import { queueStatusCard } from "../github/cards.ts";
+import { appendSessionAnnotationIfChanged, rememberedAnnotation, truncateTitle } from "../session/annotations.ts";
 import { ghGet, type GhRunner } from "../github/gh.ts";
 import type { AssignmentOutcome, Store, TicketContext } from "../store/store.ts";
 
@@ -77,6 +80,12 @@ export interface ObservePass {
   failed: { assignmentId: number; error: string }[];
 }
 
+async function issueTitle(gh: GhRunner, repo: string, number: number): Promise<string | null> {
+  const issue = await ghGet(gh, `repos/${repo}/issues/${number}`);
+  const value = issue !== null && typeof issue === "object" ? (issue as Record<string, unknown>)["title"] : undefined;
+  return typeof value === "string" ? value : null;
+}
+
 /**
  * One pass over running Workers: find the PRs opened from each Worker's branch with `gh`,
  * subscribe its ticket to them, and report the outcome its turns recorded. A lookup that fails is
@@ -101,6 +110,45 @@ export async function observe(store: Store, gh: GhRunner, repo: string): Promise
     for (const pr of pullRequests) {
       const threadId = store.ensureThread({ sourceId: source.id, kind: "pull_request", number: pr.number, url: pr.url });
       if (!store.subscribe(assignment.ticketId, threadId).duplicate) newlySubscribed.push(pr.number);
+    }
+    // The annotation names one PR, the lowest-numbered. Naming each PR in turn would write a line on every pass.
+    const first = pullRequests[0];
+    if (first !== undefined) {
+      const context = store.ticketContext(assignment.ticketId);
+      const harness = assignment.harness!;
+      // The title is fetched once per session and PR number. A repeat pass with the same PR makes no lookup.
+      const remembered = rememberedAnnotation(harness, assignment.sessionId);
+      let title: string | null | undefined;
+      if (remembered !== undefined && remembered.pr === first.number) {
+        title = remembered.title;
+      } else {
+        try {
+          title = await issueTitle(gh, repo, context.thread.number);
+        } catch (error) {
+          // No title, no line: the next pass retries the lookup.
+          pass.failed.push({ assignmentId: assignment.id, error: `title lookup: ${error instanceof Error ? error.message : String(error)}` });
+        }
+      }
+      if (title !== undefined) {
+        let written = false;
+        try {
+          written = appendSessionAnnotationIfChanged({
+            harness, native_id: assignment.sessionId, system: "ostrom", repository: context.source.name,
+            ticket: String(context.ticket.id), issue: context.thread.kind === "issue" ? context.thread.number : null,
+            pr: first.number, title, updated_at: new Date().toISOString(),
+          });
+        } catch (error) {
+          pass.failed.push({ assignmentId: assignment.id, error: `annotation: ${error instanceof Error ? error.message : String(error)}` });
+        }
+        const label = truncateTitle(title);
+        if (written && harness === "claude" && label !== null) {
+          try {
+            await renameSession(assignment.sessionId, label);
+          } catch (error) {
+            pass.failed.push({ assignmentId: assignment.id, error: `rename: ${error instanceof Error ? error.message : String(error)}` });
+          }
+        }
+      }
     }
     // The card links the PR, so a new one refreshes it.
     if (newlySubscribed.length > 0) queueStatusCard(store, assignment.ticketId);

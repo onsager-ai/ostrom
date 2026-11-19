@@ -13,6 +13,7 @@ import { parseStuckReply, renderStuckReply } from "../watchdog/stuck.ts";
 import { chooseEffort, sessionModel } from "../router/selection.ts";
 import type { ThreadContext } from "../router/thread-context.ts";
 import type { RouterConfig, WorkerConfig } from "../ostromd/config.ts";
+import { appendSessionAnnotationIfChanged } from "../session/annotations.ts";
 import { rolloutContext } from "../session/rollout.ts";
 import type { Runner, Session, TurnResult } from "../session/runner.ts";
 import { createWorktree } from "../session/worktree.ts";
@@ -114,6 +115,7 @@ export class Workers {
         writableDirs: gitDirs(config.repo, path),
         onSessionId: (sessionId) => {
           store.startNativeAssignment(id, sessionId);
+          this.#annotate(id, sessionId, null, null);
           store.beginTurn(id);
           queueStatusCard(store, ticketId);
           this.#sessions.set(id, session);
@@ -437,6 +439,20 @@ export class Workers {
     const current = store.getAssignment(id);
     if (result.status === "completed" && current.state === "running" && current.outcome !== "failed") await onComplete?.(result);
     this.#callbacksByKey.delete(this.#callbackKey(id, key));
+  }
+
+  #annotate(id: number, nativeId: string, pr: number | null, title: string | null): void {
+    const { store } = this.#deps;
+    const context = store.ticketContext(store.getAssignment(id).ticketId);
+    try {
+      appendSessionAnnotationIfChanged({
+        harness: store.getAssignment(id).harness!, native_id: nativeId, system: "ostrom", repository: context.source.name,
+        ticket: String(context.ticket.id), issue: context.thread.kind === "issue" ? context.thread.number : null,
+        pr, title, updated_at: new Date().toISOString(),
+      });
+    } catch (error) {
+      this.#deps.log?.(`assignment ${id}: could not append Semon annotation: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   #selectionReason(id: number, effortReason: string): string {

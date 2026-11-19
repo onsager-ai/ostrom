@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
-import { afterEach, test } from "node:test";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { after, afterEach, test } from "node:test";
 
 import { FakeGitHub } from "../github/fake-github.ts";
 import { Store } from "../store/store.ts";
@@ -7,6 +10,10 @@ import { observe, pullRequestsForBranch, workerBrief } from "./dispatch.ts";
 
 const REPO = "onsager-ai/ostrom";
 const stores: Store[] = [];
+// Observe writes Semon annotations under XDG_STATE_HOME; keep test runs out of the operator's state.
+const stateHome = mkdtempSync(join(tmpdir(), "dispatch-state-"));
+process.env["XDG_STATE_HOME"] = stateHome;
+after(() => rmSync(stateHome, { recursive: true, force: true }));
 
 afterEach(() => {
   while (stores.length > 0) stores.pop()!.close();
@@ -16,6 +23,9 @@ function fixture() {
   const store = Store.open(":memory:", { now: () => new Date("2026-11-09T12:00:00.000Z") });
   stores.push(store);
   const github = new FakeGitHub(() => new Date("2026-11-09T12:00:00.000Z"));
+  // observe looks up the ticket's issue title when a PR appears, so the fake serves that issue.
+  github.issue(7);
+  github.issues.get(7)!["title"] = "README typo";
   const source = store.ensureSource("github", REPO);
   const issue = store.ensureThread({ sourceId: source.id, kind: "issue", number: 7, url: `https://github.com/${REPO}/issues/7` });
   const trigger = store.insertTrigger({
@@ -95,6 +105,46 @@ test("observe subscribes the ticket to the Worker's PRs, once across passes", as
 
   const second = await observe(store, github.gh, REPO);
   assert.deepEqual(second.observed[0]?.newlySubscribed, []);
+});
+
+test("observe writes a Semon line when the lowest PR changes, and looks up the title only then", async () => {
+  const { store, github, ticketId, worker } = fixture();
+  const id = worker("sess-1");
+  const branch = `ostrom/ticket-${ticketId}-${id}`;
+  const home = mkdtempSync(join(tmpdir(), "observe-annotations-"));
+  const saved = process.env["XDG_STATE_HOME"];
+  process.env["XDG_STATE_HOME"] = home;
+  const lines = () => readFileSync(join(home, "ostrom", "semon-annotations.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
+  try {
+    github.issue(7);
+    github.issues.get(7)!["title"] = "README typo";
+    const issueCalls = () => github.calls.filter((call) => call.some((arg) => arg.endsWith("/issues/7"))).length;
+    github.pulls.push({ branch, number: 12, state: "open" });
+    await observe(store, github.gh, REPO);
+    await observe(store, github.gh, REPO);
+    assert.equal(lines().length, 1);
+    assert.equal(lines()[0]?.["pr"], 12);
+    assert.equal(lines()[0]?.["title"], "README typo");
+    assert.equal(lines()[0]?.["native_id"], "sess-1");
+    assert.equal(issueCalls(), 1, "the title is fetched once for the PR");
+
+    // Title edits are picked up only when the PR number changes, so a repeat pass makes no lookup.
+    github.issues.get(7)!["title"] = "Updated title";
+    await observe(store, github.gh, REPO);
+    assert.equal(lines().length, 1);
+    assert.equal(issueCalls(), 1, "a repeat pass with an unchanged PR makes no title lookup");
+
+    github.pulls.push({ branch, number: 11, state: "open" });
+    await observe(store, github.gh, REPO);
+    assert.equal(issueCalls(), 2);
+    assert.equal(lines().length, 2);
+    assert.equal(lines()[1]?.["pr"], 11);
+    assert.equal(lines()[1]?.["title"], "Updated title");
+  } finally {
+    if (saved === undefined) delete process.env["XDG_STATE_HOME"];
+    else process.env["XDG_STATE_HOME"] = saved;
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test("a newly observed PR refreshes the status card with its link", async () => {

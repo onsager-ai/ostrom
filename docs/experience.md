@@ -151,6 +151,14 @@ attention list: stuck tickets, near-budget tickets, and machines that are offlin
 no log or transcript viewer of its own: sessions are read with Semon (`semon sessions --watch` or
 `--serve`, `semon query read_transcript <id>`), and the daemon's own logs go to journald.
 
+Semon also groups sessions by ticket. Ostrom writes that link to `$XDG_STATE_HOME/ostrom/semon-annotations.jsonl`
+(`~/.local/state` when unset or relative), one JSON line per event: when a Worker's session id first
+appears, and again when its PR number or issue title changes. Each line names the system, repository,
+ticket, issue, PR and the title. Semon only reads this file. Ostrom appends to it and never rewrites it.
+A Claude Worker is also renamed to the title, so Claude's own session list shows it. A failed write is
+logged once and does not fail the Worker's turn. The format is in
+onsager-ai/semon `docs/design/session-annotations.md`.
+
 ### Budgets per ticket
 
 Every ticket runs under a budget with several limits: wall-clock time, idle time, turns, tokens,
