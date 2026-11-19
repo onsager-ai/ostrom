@@ -382,7 +382,8 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
         ...(deps.appBotId === undefined ? {} : { appBotId: deps.appBotId }),
         refreshBeforeSend: async () => {
           // The final evidence read follows fresh intake and controls. Any failure suppresses HTTP.
-          await pollOnce({ store: openStore, gh: deps.gh, repo: config.repo, allowlist: config.allowlist });
+          await pollOnce({ store: openStore, gh: deps.gh, repo: config.repo, allowlist: config.allowlist,
+            approvalRouter: { router: loadRouterConfig(deps.env), runners: deps.runners ?? realRunners(deps.env) } });
           const controls = await routeCommands(openStore, workers(), deps.gh, config.repo, config.allowlist);
           if (controls.failed.length > 0) throw new Error("final controls failed");
         },
@@ -418,7 +419,8 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
       return pass.failed.length === 0 ? 0 : 1;
     }
     if (command === "poll") {
-      const result = await pollOnce({ store, gh: deps.gh, repo: config.repo, allowlist: config.allowlist });
+      const result = await pollOnce({ store, gh: deps.gh, repo: config.repo, allowlist: config.allowlist,
+        approvalRouter: { router: loadRouterConfig(deps.env), runners: deps.runners ?? realRunners(deps.env) } });
       for (const candidate of result.candidates) deps.stdout(JSON.stringify(candidate));
       deps.stderr(
         `ostromd poll: ${result.candidates.length} new, ${result.duplicates} already stored, ` +

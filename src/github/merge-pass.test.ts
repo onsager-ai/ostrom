@@ -354,6 +354,34 @@ for (const body of ["", "LGTM!", " looks good. "]) test(`approval without feedba
   done(f, "ostrom");
 });
 
+test("Router-excluded approval commentary does not restart quiet and still satisfies approval policy", async () => {
+  const f = fixture({ strategy: "approvals", approvals: 1, approvers: [] });
+  f.remote.reviews = [];
+  await ready(f);
+  const deadline = f.store.mergeCandidateForAssignment(f.assignment)!.quietDeadline;
+  f.remote.reviews.push(review({ id: "R2", body: "The requested check is clean. CI is green.", at: f.now().toISOString() }));
+  const source = f.store.ensureSource("github", "o/r");
+  f.store.recordIntakeReceipt({ sourceId: source.id, sourceEventId: "R2", url: "https://github.com/o/r/pull/2#pullrequestreview-2", reason: "approval without feedback" });
+  const result = await mergePass(f.options());
+  assert.deepEqual(result.failed, []);
+  assert.equal(f.store.mergeCandidateForAssignment(f.assignment)!.quietDeadline, deadline);
+  assert.equal(f.puts.length, 1);
+  done(f, "ostrom");
+});
+
+for (const feedback of [{ inlineComments: 1 }, { state: "CHANGES_REQUESTED" }]) test(`a receipt cannot hide new review feedback: ${JSON.stringify(feedback)}`, async () => {
+  const f = fixture();
+  await ready(f);
+  const previous = f.store.mergeCandidateForAssignment(f.assignment)!.quietDeadline!;
+  const source = f.store.ensureSource("github", "o/r");
+  f.store.recordIntakeReceipt({ sourceId: source.id, sourceEventId: "R2", url: "https://github.com/o/r/pull/2#pullrequestreview-2", reason: "approval without feedback" });
+  f.remote.reviews.push(review({ id: "R2", body: "Checked everything", at: f.now().toISOString(), ...feedback }));
+  const result = await mergePass(f.options());
+  assert.deepEqual(result.failed, []);
+  assert.ok(f.store.mergeCandidateForAssignment(f.assignment)!.quietDeadline! > previous);
+  assert.equal(f.puts.length, 0);
+});
+
 for (const feedback of [{ body: "Please rename this" }, { inlineComments: 1 }]) test(`approval with feedback restarts quiet: ${JSON.stringify(feedback)}`, async () => {
   const f = fixture();
   await ready(f);

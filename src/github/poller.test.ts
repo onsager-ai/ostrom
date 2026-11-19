@@ -109,8 +109,59 @@ for (const body of ["", "  \n ", "LGTM", "approved!", "Looks good."]) test(`appr
   assert.equal(count("trigger"), 1);
 });
 
+for (const verdict of ["ignore", "accept", "error", "invalid"] as const) test(`approval commentary Router ${verdict} preserves the right Worker delivery`, async () => {
+  const { store, github, poll, count, setNow } = await fixture();
+  github.issue(8, true);
+  const source = store.ensureSource("github", github.repo);
+  const threadId = store.ensureThread({ sourceId: source.id, kind: "pull_request", number: 8, url: `https://github.com/${github.repo}/pull/8` });
+  const initial = store.insertTrigger({ sourceId: source.id, sourceEventId: "accepted", threadId, kind: "issue_comment", actor: "alice", url: "https://github.com/o/r/issues/1", occurredAt: at(0) }).id;
+  const ticket = store.recordDecision({ threadId, triggerIds: [initial], verdict: "accept", reason: "work" }).ticketId!;
+  const assignment = store.createAssignment(ticket);
+  store.configureNativeAssignment(assignment, { harness: "codex", model: "m", worktree: "/wt", branch: "b", machine: "host" });
+  store.startNativeAssignment(assignment, "session-1");
+  const activity = store.ticketActivityAt(ticket);
+  const router = new FakeRunner();
+  if (verdict === "error") router.failAfterId = new Error("Router unavailable");
+  const start = router.start.bind(router);
+  router.start = (options) => {
+    const session = start(options);
+    session.reply = () => verdict === "invalid" ? "not JSON" : JSON.stringify({ verdict });
+    return session;
+  };
+  const worker = new FakeRunner();
+  const workers = new Workers({ store, config: { repo: "/repo", base: "main", worktrees: "/wt", harness: "codex", model: "m", machine: "host" }, runners: { claude: worker, codex: worker } });
+  const body = verdict === "ignore"
+    ? "Both docs now use the directory form, and the grep check comes back empty on this head. CI is green."
+    : "Looks good overall. Please rename this before merging.";
+  const review = github.review(8, { login: "alice", state: "APPROVED", body, at: at(1) });
+  setNow(2);
+  const approvalRouter = { router: { harness: "codex" as const, model: "router-model" }, runners: { claude: router, codex: router } };
+  const result = await poll({ approvalRouter });
+  assert.equal(router.sessions.length, 1);
+  assert.equal(router.sessions[0]!.options.sandbox, "read-only");
+  assert.equal(router.sessions[0]!.options.model, "router-model");
+  assert.match(router.sessions[0]!.prompts[0]!, /There are no inline comments/);
+  assert.ok(router.sessions[0]!.prompts[0]!.includes(body));
+  if (verdict === "ignore") {
+    assert.deepEqual(result.candidates, []);
+    assert.deepEqual(store.pendingDeliveries(), []);
+    assert.equal(store.ticketActivityAt(ticket), activity);
+    assert.equal(store.hasApprovalReceipt(source.id, String(review["node_id"])), true);
+    assert.equal(count("intake_receipt"), 1);
+    assert.deepEqual(routeFollowUps(store, workers).queued, []);
+  } else {
+    assert.equal(result.candidates.length, 1);
+    assert.equal(count("intake_receipt"), 0);
+    assert.equal(routeFollowUps(store, workers).queued.length, 1);
+  }
+  await workers.drain();
+  assert.equal(worker.sessions.length, verdict === "ignore" ? 0 : 1);
+  await poll({ approvalRouter });
+  assert.equal(router.sessions.length, 1, "overlap does not rejudge an excluded or delivered approval");
+});
+
 for (const [state, body, inline] of [
-  ["APPROVED", "", true], ["APPROVED", "LGTM!", true],
+  ["APPROVED", "", true], ["APPROVED", "LGTM!", true], ["APPROVED", "Everything checked out", true],
   ["APPROVED", "Looks good, but rename this", false], ["APPROVED", "LGTM?", false],
   ["COMMENTED", "LGTM", false], ["CHANGES_REQUESTED", "", false],
 ] as const) test(`${state} feedback remains deliverable: ${body}, inline=${inline}`, async () => {
