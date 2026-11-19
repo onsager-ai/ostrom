@@ -102,7 +102,7 @@ export async function routeCommands(
         let body: string;
         try { body = overrideSelection(store, pending.ticketId, command === "use" ? "model" : "effort", parsed.value); }
         catch (error) { body = `Override refused: ${message(error)}`; }
-        store.enqueueReply({ id: `selection-${pending.trigger.id}-${pending.ticketId}`, threadId: pending.trigger.threadId, body });
+        store.enqueueReply({ id: `selection-${pending.trigger.id}-${pending.ticketId}`, threadId: pending.trigger.threadId, body, blocking: true });
         store.recordCommandReceipt(pending.trigger.id, pending.ticketId, command, true);
         queueStatusCard(store, pending.ticketId);
       } else if (command === "close_pull_request") {

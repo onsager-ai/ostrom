@@ -296,15 +296,20 @@ test("selection comments are consumed, validated and authorized without waking a
   const { store, github, workers, ticketId, assignmentId, comment } = fixture();
   store.models.discovered("codex", [{ harness: "codex", id: "gpt-6-luna", displayName: "Luna", description: "", efforts: ["low", "high"], defaultEffort: "high" }]);
   store.models.change({ action: "allow", harness: "codex", model: "gpt-6-luna" });
-  comment("model", "alice", "@ostrom use codex/gpt-6-luna");
-  comment("effort", "alice", "@ostrom effort low");
-  comment("invalid", "alice", "@ostrom effort max");
+  const modelTrigger = comment("model", "alice", "@ostrom use codex/gpt-6-luna");
+  const effortTrigger = comment("effort", "alice", "@ostrom effort low");
+  const invalidTrigger = comment("invalid", "alice", "@ostrom effort max");
   comment("forbidden", "outsider", "@ostrom use codex/gpt-6-luna");
   const pass = await routeCommands(store, workers, github.gh, REPO);
   assert.deepEqual(pass.failed, []);
   assert.equal(store.selections.current(ticketId, "effort")!.value, "low");
   assert.equal(store.getAssignment(assignmentId).turns, 0);
   assert.equal(store.unfinishedTurns(assignmentId).length, 0);
+  const commandReplies = store.dueReplies().filter((reply) =>
+    [modelTrigger, effortTrigger, invalidTrigger].some((triggerId) => reply.id.startsWith(`selection-${triggerId}-${ticketId}`))
+  );
+  assert.equal(commandReplies.length, 3);
+  assert.ok(commandReplies.every((reply) => reply.blocking), "selection command replies bypass batching");
   assert.ok(store.dueReplies().some((reply) => reply.body.includes("next session")));
   assert.ok(store.dueReplies().some((reply) => reply.body.includes("Override refused")));
   assert.equal(pass.handled.find((item) => item.command === "use" && !item.allowed)?.allowed, false);
