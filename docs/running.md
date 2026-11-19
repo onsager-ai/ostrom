@@ -63,8 +63,9 @@ models, `OSTROM_WORKER_MODEL` remains the session model and effort is still chos
 
 `ostrom model <ticket> <harness/model>` and `ostrom effort <ticket> <level>` set durable overrides
 through the daemon. On the issue or PR, use `@ostrom use <harness/model>` and `@ostrom effort
-<level>`; issue authors and collaborators with triage or higher may do this. Effort applies at the
-next turn. A session keeps its model: a model override after session start applies only to the next
+<level>`; issue authors and collaborators with triage or higher may do this. Later effort overrides
+apply at the next turn; an override in the comment that starts a ticket applies on its first turn and
+is shown on the status card without a separate reply. A session keeps its model: a model override after session start applies only to the next
 session. Overrides persist until replaced and must remain in the allowed list.
 
 The existing merge approval mechanism does not cover starting a model. An automatic choice that

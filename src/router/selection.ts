@@ -42,7 +42,7 @@ export function sessionModel(store: Store, ticketId: number, config: WorkerConfi
   return fallback;
 }
 
-export function overrideSelection(store: Store, ticketId: number, kind: "model" | "effort", value: string): string {
+export function overrideSelection(store: Store, ticketId: number, kind: "model" | "effort", value: string, fromFirstTurn = false): string {
   store.getTicket(ticketId);
   const assignment = store.latestAssignment(ticketId);
   const models = allowedModels(store);
@@ -57,7 +57,7 @@ export function overrideSelection(store: Store, ticketId: number, kind: "model" 
   const key = assignment?.sessionId ? `${assignment.harness}/${assignment.model}` : store.selections.current(ticketId, "model")?.value;
   const model = models.find((model) => model.key === key) ?? (store.models.export().selections.every((model) => !model.allowed) ? store.models.view().models.find((model) => `${model.harness}/${model.id}` === key) : undefined);
   if (!model || !model.efforts.includes(value)) throw new Error(`effort must be allowed for the current session model (${model?.efforts.join(", ") ?? "no allowed model"})`);
-  const message = `Effort override: ${value}. Applies to the next turn and holds until changed.`;
+  const message = `Effort override: ${value}. Applies ${fromFirstTurn ? "from this turn" : "to the next turn"} and holds until changed.`;
   store.selections.record(ticketId, kind, value, message, "override", { model: key, value });
   return message;
 }

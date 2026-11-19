@@ -205,11 +205,13 @@ export async function routeCandidates(options: RouteOptions): Promise<RoutePassR
         for (const [index, parsed] of commands.entries()) {
           let body: string;
           try {
-            body = overrideSelection(store, recorded.ticketId, parsed.command === "use" ? "model" : "effort", parsed.value);
+            body = overrideSelection(store, recorded.ticketId, parsed.command === "use" ? "model" : "effort", parsed.value, trigger.kind === "issue_opened");
           } catch (error) {
             body = `Override refused: ${message(error)}`;
           }
-          store.enqueueReply({ id: `selection-${trigger.id}-${recorded.ticketId}-${index}`, threadId: trigger.threadId, body, blocking: true });
+          if (trigger.kind !== "issue_opened") {
+            store.enqueueReply({ id: `selection-${trigger.id}-${recorded.ticketId}-${index}`, threadId: trigger.threadId, body, blocking: true });
+          }
         }
       }
     }
