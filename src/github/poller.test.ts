@@ -100,7 +100,9 @@ for (const body of ["", "  \n ", "LGTM", "approved!", "Looks good."]) test(`appr
   const review = github.review(8, { login: "alice", state: "APPROVED", body, at: at(1) });
   setNow(2);
 
-  assert.deepEqual((await poll()).candidates, []);
+  const router = new FakeRunner();
+  assert.deepEqual((await poll({ approvalRouter: { router: { harness: "codex", model: "router-model" }, runners: { claude: router, codex: router } } })).candidates, []);
+  assert.equal(router.sessions.length, 0, "short approvals bypass the Router");
   assert.deepEqual(store.pendingDeliveries(), []);
   assert.equal(store.ticketActivityAt(ticket), activity);
   assert.deepEqual(store.operatorIntake().filter((item) => item.eventId === review["node_id"]).map((item) => [item.disposition, item.reason]), [["excluded", "approval without feedback"]]);
@@ -179,7 +181,9 @@ for (const [state, body, inline] of [
   const review = github.review(8, { login: "alice", state, body, at: at(1) });
   if (inline) github.reviewComment(8, { login: "alice", body: "rename this", at: at(1), reviewId: Number(review["id"]) });
   setNow(2);
-  const result = await poll();
+  const router = new FakeRunner();
+  const result = await poll({ approvalRouter: { router: { harness: "codex", model: "router-model" }, runners: { claude: router, codex: router } } });
+  if (inline || state !== "APPROVED") assert.equal(router.sessions.length, 0, "inline and non-approval feedback bypass the Router");
   assert.equal(result.candidates.filter((candidate) => candidate.kind === "pull_request_review").length, 1);
   assert.equal(store.pendingDeliveries().length, inline ? 2 : 1);
   assert.equal(routeFollowUps(store, workers).queued.length, 1);
