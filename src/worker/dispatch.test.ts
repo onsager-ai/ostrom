@@ -23,6 +23,9 @@ function fixture() {
   const store = Store.open(":memory:", { now: () => new Date("2026-11-09T12:00:00.000Z") });
   stores.push(store);
   const github = new FakeGitHub(() => new Date("2026-11-09T12:00:00.000Z"));
+  // observe looks up the ticket's issue title when a PR appears, so the fake serves that issue.
+  github.issue(7);
+  github.issues.get(7)!["title"] = "README typo";
   const source = store.ensureSource("github", REPO);
   const issue = store.ensureThread({ sourceId: source.id, kind: "issue", number: 7, url: `https://github.com/${REPO}/issues/7` });
   const trigger = store.insertTrigger({
