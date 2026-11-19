@@ -40,7 +40,7 @@ test("the first pass sets a baseline instead of replaying history", async () => 
   stores.push(store);
   const github = new FakeGitHub(() => now);
   github.issue(1);
-  github.comment(1, { login: "alice", body: "old", at: at(-60) });
+  github.comment(1, { login: "alice", body: "@ostrom old", at: at(-60) });
   const result = await pollOnce({ store, gh: github.gh, repo: github.repo, allowlist: ["alice"], now: () => now });
   assert.equal(result.candidates.length, 0);
   assert.deepEqual(JSON.parse(store.ensureSource("github", github.repo).cursor!), {
@@ -55,19 +55,19 @@ test("a pass stores all three comment kinds as triggers on their threads, in tim
   github.issue(7);
   github.issue(8, true);
   github.review(8, { login: "bob", body: "please rename", state: "CHANGES_REQUESTED", at: at(3) });
-  github.comment(7, { login: "alice", body: "can you fix this?", at: at(1) });
+  github.comment(7, { login: "alice", body: "@ostrom can you fix this?", at: at(1) });
   github.reviewComment(8, { login: "alice", body: "nit", at: at(2) });
-  github.comment(8, { login: "alice", body: "on the PR", at: at(4) });
+  github.comment(8, { login: "alice", body: "@ostrom on the PR", at: at(4) });
   setNow(10);
 
   const result = await poll();
   assert.deepEqual(
     result.candidates.map((c) => [c.kind, c.actor, c.body]),
     [
-      ["issue_comment", "alice", "can you fix this?"],
+      ["issue_comment", "alice", "@ostrom can you fix this?"],
       ["pull_request_review_comment", "alice", "nit"],
       ["pull_request_review", "bob", "please rename"],
-      ["issue_comment", "alice", "on the PR"],
+      ["issue_comment", "alice", "@ostrom on the PR"],
     ],
   );
   const threads = db.prepare("SELECT id, kind, number, url FROM thread ORDER BY number").all();
@@ -157,6 +157,40 @@ test("a failed inline-comment read cannot silently exclude an approval or advanc
   await assert.rejects(poll(), /HTTP 502/);
   assert.deepEqual(cursor(), before);
   assert.equal(count("intake_receipt"), 0);
+});
+
+test("an unmentioned comment on an unknown issue is dropped before the Router", async () => {
+  const { github, poll, count, setNow } = await fixture();
+  github.issue(7);
+  github.comment(7, { login: "alice", body: "old status update", at: at(1) });
+  setNow(10);
+
+  assert.deepEqual((await poll()).candidates, []);
+  assert.equal(count("trigger"), 0);
+  assert.equal(count("thread"), 0);
+});
+
+test("a mentioned comment on an unknown issue passes to the Router", async () => {
+  const { github, poll, count, setNow } = await fixture();
+  github.issue(7);
+  github.comment(7, { login: "alice", body: "@ostrom please help", at: at(1) });
+  setNow(10);
+
+  assert.deepEqual((await poll()).candidates.map((candidate) => candidate.body), ["@ostrom please help"]);
+  assert.equal(count("trigger"), 1);
+});
+
+test("an unmentioned comment on an actively subscribed thread still passes", async () => {
+  const { store, github, poll, setNow } = await fixture();
+  github.issue(7);
+  const source = store.ensureSource("github", github.repo);
+  const threadId = store.ensureThread({ sourceId: source.id, kind: "issue", number: 7, url: `https://github.com/${github.repo}/issues/7` });
+  const accepted = store.insertTrigger({ sourceId: source.id, sourceEventId: "accepted", threadId, kind: "issue_comment", actor: "alice", url: `https://github.com/${github.repo}/issues/7#issuecomment-1`, occurredAt: at(0) }).id;
+  store.recordDecision({ threadId, triggerIds: [accepted], verdict: "accept", reason: "work" });
+  github.comment(7, { login: "alice", body: "please also fix this", at: at(1) });
+  setNow(10);
+
+  assert.deepEqual((await poll()).candidates.map((candidate) => candidate.body), ["please also fix this"]);
 });
 
 test("a newly opened issue that asks Ostrom becomes one allowlisted trigger", async () => {
@@ -260,11 +294,11 @@ test("Ostrom's own replies and actors off the allowlist are dropped and not stor
   github.comment(7, { login: "alice", body: `On it.\n\n${replyMarker("ack-1")}`, at: at(1) });
   github.comment(9, { login: "mallory", body: "do something", at: at(2) });
   github.comment(9, { login: null, body: "ghost", at: at(3) });
-  github.comment(7, { login: "BOB", body: "case does not matter", at: at(4) });
+  github.comment(7, { login: "BOB", body: "@ostrom case does not matter", at: at(4) });
   setNow(10);
 
   const result = await poll();
-  assert.deepEqual(result.candidates.map((c) => c.body), ["case does not matter"]);
+  assert.deepEqual(result.candidates.map((c) => c.body), ["@ostrom case does not matter"]);
   assert.equal(result.droppedOwn, 1);
   assert.equal(result.droppedNotAllowed, 2);
   assert.equal(count("trigger"), 1);
@@ -282,16 +316,16 @@ test("classify checks the marker before the allowlist", () => {
 test("re-reading the overlap is absorbed by dedup, and the cursor moves per stream", async () => {
   const { github, poll, cursor, setNow } = await fixture();
   github.issue(7);
-  github.comment(7, { login: "alice", body: "one", at: at(1) });
+  github.comment(7, { login: "alice", body: "@ostrom one", at: at(1) });
   setNow(2);
   assert.equal((await poll()).candidates.length, 1);
   assert.equal(cursor()["issueComments"], at(1).toISOString());
   assert.equal(cursor()["reviewComments"], at(0).toISOString(), "an empty stream keeps its cursor");
 
-  github.comment(7, { login: "alice", body: "two", at: at(3) });
+  github.comment(7, { login: "alice", body: "@ostrom two", at: at(3) });
   setNow(4);
   const second = await poll();
-  assert.deepEqual(second.candidates.map((c) => c.body), ["two"]);
+  assert.deepEqual(second.candidates.map((c) => c.body), ["@ostrom two"]);
   assert.equal(second.duplicates, 1, "the first comment is inside the overlap and deduplicated");
   assert.equal(cursor()["issueComments"], at(3).toISOString());
 
@@ -303,8 +337,8 @@ test("re-reading the overlap is absorbed by dedup, and the cursor moves per stre
 test("a crash before the cursor advances replays the pass without storing anything twice", async () => {
   const { store, github, poll, cursor, count, setNow } = await fixture();
   github.issue(7);
-  github.comment(7, { login: "alice", body: "one", at: at(1) });
-  github.comment(7, { login: "bob", body: "two", at: at(2) });
+  github.comment(7, { login: "alice", body: "@ostrom one", at: at(1) });
+  github.comment(7, { login: "bob", body: "@ostrom two", at: at(2) });
   setNow(10);
   const before = cursor();
 
@@ -317,10 +351,10 @@ test("a crash before the cursor advances replays the pass without storing anythi
   assert.deepEqual(cursor(), before, "the cursor did not move");
   assert.equal(count("trigger"), 2, "the events were stored before the crash");
 
-  github.comment(7, { login: "alice", body: "three", at: at(11) });
+  github.comment(7, { login: "alice", body: "@ostrom three", at: at(11) });
   setNow(12);
   const replay = await poll();
-  assert.deepEqual(replay.candidates.map((c) => c.body), ["three"]);
+  assert.deepEqual(replay.candidates.map((c) => c.body), ["@ostrom three"]);
   assert.equal(replay.duplicates, 2);
   assert.equal(count("trigger"), 3);
   assert.equal(cursor()["issueComments"], at(11).toISOString());
@@ -330,7 +364,7 @@ test("a GitHub failure mid-pass leaves the cursor alone, so the next pass drops 
   const { github, poll, cursor, setNow } = await fixture();
   github.issue(7);
   github.issue(8, true);
-  github.comment(7, { login: "alice", body: "one", at: at(1) });
+  github.comment(7, { login: "alice", body: "@ostrom one", at: at(1) });
   github.review(8, { login: "bob", body: "looks good", state: "APPROVED", at: at(2) });
   setNow(10);
   const before = cursor();
@@ -341,37 +375,37 @@ test("a GitHub failure mid-pass leaves the cursor alone, so the next pass drops 
 
   github.failWhen = undefined;
   const retry = await poll();
-  assert.deepEqual(retry.candidates.map((c) => c.body), ["one"]);
+  assert.deepEqual(retry.candidates.map((c) => c.body), ["@ostrom one"]);
 });
 
 test("pagination reads every page, including a full page sharing one timestamp", async () => {
   const { github, poll, setNow } = await fixture();
   github.issue(7);
-  for (let i = 1; i <= 5; i++) github.comment(7, { login: "alice", body: `c${i}`, at: at(i) });
-  for (let i = 1; i <= 3; i++) github.comment(7, { login: "alice", body: `same${i}`, at: at(6) });
+  for (let i = 1; i <= 5; i++) github.comment(7, { login: "alice", body: `@ostrom c${i}`, at: at(i) });
+  for (let i = 1; i <= 3; i++) github.comment(7, { login: "alice", body: `@ostrom same${i}`, at: at(6) });
   setNow(10);
   const result = await poll({ perPage: 2 });
   assert.deepEqual(
     result.candidates.map((c) => c.body),
-    ["c1", "c2", "c3", "c4", "c5", "same1", "same2", "same3"],
+    ["@ostrom c1", "@ostrom c2", "@ostrom c3", "@ostrom c4", "@ostrom c5", "@ostrom same1", "@ostrom same2", "@ostrom same3"],
   );
 });
 
 test("a comment edited mid-pagination does not make another slip between pages", async () => {
   const { github, poll, setNow } = await fixture();
   github.issue(7);
-  const first = github.comment(7, { login: "alice", body: "a", at: at(1) });
-  for (const [i, body] of ["b", "c", "d"].entries()) github.comment(7, { login: "alice", body, at: at(i + 2) });
+  const first = github.comment(7, { login: "alice", body: "@ostrom a", at: at(1) });
+  for (const [i, body] of ["@ostrom b", "@ostrom c", "@ostrom d"].entries()) github.comment(7, { login: "alice", body, at: at(i + 2) });
   setNow(10);
   let edited = false;
   github.afterGet = (path) => {
     if (!edited && path.includes("issues/comments")) {
       edited = true;
-      github.edit(first, "a, edited", at(9));
+      github.edit(first, "@ostrom a, edited", at(9));
     }
   };
   const result = await poll({ perPage: 2 });
-  assert.deepEqual(result.candidates.map((c) => c.body).sort(), ["a, edited", "b", "c", "d"]);
+  assert.deepEqual(result.candidates.map((c) => c.body).sort(), ["@ostrom a, edited", "@ostrom b", "@ostrom c", "@ostrom d"]);
 });
 
 test("reviews: drafts and empty comment wrappers are skipped, old reviews are not re-read", async () => {

@@ -106,12 +106,12 @@ test(
     const github = new FakeGitHub(() => new Date());
     const env = { OSTROM_REPO: github.repo, OSTROM_ALLOWLIST: "alice", OSTROM_DB: dbPath };
     github.issue(7);
-    github.comment(7, { login: "alice", body: "hello", at: new Date() });
+    github.comment(7, { login: "alice", body: "@ostrom hello", at: new Date() });
 
     const ok = deps(env, github.gh);
     assert.equal(await main(["dev", "poll"], ok.deps), 0);
     assert.equal(ok.out.length, 1);
-    assert.equal(JSON.parse(ok.out[0]!).body, "hello");
+    assert.equal(JSON.parse(ok.out[0]!).body, "@ostrom hello");
 
     github.failWhen = () => new Error("HTTP 500");
     const failed = deps(env, github.gh);

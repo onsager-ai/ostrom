@@ -153,10 +153,12 @@ export async function pollOnce(options: PollOptions): Promise<PollResult> {
       continue;
     }
     const existing = store.findThread(source.id, event.number);
-    if (verdict === "not_allowed" && event.kind !== "issue_state" && (existing === null || !store.ticketsForThread(existing.id).some((ticket) => ticket.state === "open" || ticket.state === "paused"))) {
+    const hasActiveTicket = existing !== null && store.ticketsForThread(existing.id).some((ticket) => ticket.state === "open" || ticket.state === "paused");
+    if (verdict === "not_allowed" && event.kind !== "issue_state" && !hasActiveTicket) {
       result.droppedNotAllowed++;
       continue;
     }
+    if (event.kind === "issue_comment" && !hasActiveTicket && !/@ostrom\b/i.test(event.body)) continue;
     const threadId = existing?.id ?? store.ensureThread({
       sourceId: source.id,
       kind: event.threadKind,

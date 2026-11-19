@@ -73,7 +73,7 @@ function setup(dbPath = ":memory:") {
     runners: { claude: runner, codex: runner },
   });
   const comment = (body: string, minute = 58, issue = 7) =>
-    github.comment(issue, { login: "alice", body, at: new Date(`2026-11-09T11:${minute}:00Z`) });
+    github.comment(issue, { login: "alice", body: `@ostrom ${body}`, at: new Date(`2026-11-09T11:${minute}:00Z`) });
   const poll = () => pollOnce({ store, gh: github.gh, repo: github.repo, allowlist: ["alice"], now });
   const reopen = () => {
     store.close();
@@ -124,7 +124,7 @@ test("an accept records a ticket, dispatches a Worker and queues the Router's ac
   assert.equal(session?.options.sandbox, "read-only");
   assert.equal(session?.options.model, "gpt-6-luna");
   const sent = batchOf(session!.prompts[0]!);
-  assert.equal(sent.threads[0]?.candidates[0]?.excerpt, "please fix the typo in the README");
+  assert.equal(sent.threads[0]?.candidates[0]?.excerpt, "@ostrom please fix the typo in the README");
 
   assert.equal(pass.decisions.length, 1);
   const decision = pass.decisions[0]!;
