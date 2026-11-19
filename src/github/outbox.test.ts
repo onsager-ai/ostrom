@@ -154,7 +154,7 @@ test("a reply whose id cannot go in a marker fails instead of posting unmarked",
   assert.equal(posts(), 0);
 });
 
-test("ordinary comments batch while blocking replies skip an open window", async () => {
+test("ordinary comments batch while command, question, and turn result replies skip an open window", async () => {
   const { store, thread, send, github, advance } = fixture();
   store.enqueueReply({ id: "r1", threadId: thread, body: "first" });
   store.enqueueReply({ id: "r2", threadId: thread, body: "second" });
@@ -194,7 +194,7 @@ test("a ready reply is timestamped only after GitHub confirms delivery", async (
   const assignment = store.createAssignment(ticket);
   store.configureNativeAssignment(assignment, { harness: "codex", model: "m", worktree: "/w", branch: "b", machine: "h" });
   store.startNativeAssignment(assignment, "s");
-  store.enqueueReply({ id: "outcome-a1-pr12-opened", threadId: thread, body: "Ready." });
+  store.enqueueReply({ id: "outcome-a1-pr12-opened", threadId: thread, body: "Ready.", blocking: true });
   store.trackReadyReply(assignment, "outcome-a1-pr12-opened");
   assert.equal(store.readyReplySentAt(assignment), null);
   await send();
