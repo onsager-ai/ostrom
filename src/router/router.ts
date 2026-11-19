@@ -202,7 +202,7 @@ export async function routeCandidates(options: RouteOptions): Promise<RoutePassR
           } catch (error) {
             body = `Override refused: ${message(error)}`;
           }
-          store.enqueueReply({ id: `selection-${trigger.id}-${recorded.ticketId}-${index}`, threadId: trigger.threadId, body });
+          store.enqueueReply({ id: `selection-${trigger.id}-${recorded.ticketId}-${index}`, threadId: trigger.threadId, body, blocking: true });
         }
       }
     }
