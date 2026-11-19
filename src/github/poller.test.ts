@@ -159,6 +159,40 @@ test("a failed inline-comment read cannot silently exclude an approval or advanc
   assert.equal(count("intake_receipt"), 0);
 });
 
+test("an unmentioned comment on an unknown issue is dropped before the Router", async () => {
+  const { github, poll, count, setNow } = await fixture();
+  github.issue(7);
+  github.comment(7, { login: "alice", body: "old status update", at: at(1) });
+  setNow(10);
+
+  assert.deepEqual((await poll()).candidates, []);
+  assert.equal(count("trigger"), 0);
+  assert.equal(count("thread"), 0);
+});
+
+test("a mentioned comment on an unknown issue passes to the Router", async () => {
+  const { github, poll, count, setNow } = await fixture();
+  github.issue(7);
+  github.comment(7, { login: "alice", body: "@ostrom please help", at: at(1) });
+  setNow(10);
+
+  assert.deepEqual((await poll()).candidates.map((candidate) => candidate.body), ["@ostrom please help"]);
+  assert.equal(count("trigger"), 1);
+});
+
+test("an unmentioned comment on an actively subscribed thread still passes", async () => {
+  const { store, github, poll, setNow } = await fixture();
+  github.issue(7);
+  const source = store.ensureSource("github", github.repo);
+  const threadId = store.ensureThread({ sourceId: source.id, kind: "issue", number: 7, url: `https://github.com/${github.repo}/issues/7` });
+  const accepted = store.insertTrigger({ sourceId: source.id, sourceEventId: "accepted", threadId, kind: "issue_comment", actor: "alice", url: `https://github.com/${github.repo}/issues/7#issuecomment-1`, occurredAt: at(0) }).id;
+  store.recordDecision({ threadId, triggerIds: [accepted], verdict: "accept", reason: "work" });
+  github.comment(7, { login: "alice", body: "please also fix this", at: at(1) });
+  setNow(10);
+
+  assert.deepEqual((await poll()).candidates.map((candidate) => candidate.body), ["please also fix this"]);
+});
+
 test("a newly opened issue that asks Ostrom becomes one allowlisted trigger", async () => {
   const { store, github, poll, count, setNow } = await fixture();
   github.issue(7, false, { login: "Alice", body: "@ostrom please fix this", at: at(1) });
