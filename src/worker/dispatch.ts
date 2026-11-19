@@ -36,7 +36,7 @@ export function workerBrief(context: TicketContext, branch: string, base: string
     "the pull request description, and carry on.",
     "If a normal commit fails, report the failure; do not create or push commit objects with Git plumbing.",
     PUBLIC_FINAL_MESSAGE,
-    ...(rules === undefined ? [] : ["", "House rules for this machine, which you must follow:", rules]),
+    ...(rules === undefined ? [] : ["", "House rules for this machine, which you must follow:", rules, "If the work needs a change a repository or house rule forbids, say so in the pull request description when you push it: name the rule, the files, and why the change is needed, so the reviewer can decide."]),
   ].join("\n");
 }
 
