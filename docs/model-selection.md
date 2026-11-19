@@ -142,8 +142,11 @@ model waits for the operator. Moving across harnesses is deferred until a real t
 - The status card and the dashboard show the model and the effort of the current turn, with the
   reason.
 - `@ostrom use <model>` and `@ostrom effort <level>` on the issue or PR override for that ticket.
-  The same overrides are `ostrom model <ticket> <model>` and `ostrom effort <ticket> <level>` on the
-  CLI. An override is recorded and holds until changed; escalation never lowers it.
+  If either appears in the comment that starts the ticket, Ostrom applies it after acceptance and
+  before the first Worker turn. Invalid or approval-required model selections receive a refusal
+  reply; the accepted ticket still starts with the Router's model choice. The same overrides are
+  `ostrom model <ticket> <model>` and `ostrom effort <ticket> <level>` on the CLI. An override is
+  recorded and holds until changed; escalation never lowers it.
 - `ostrom models` lists the allowed models and their outcome history. `ostrom replay` shows each
   selection decision with its input.
 - Codex's real model is checked from the native session record, which closes

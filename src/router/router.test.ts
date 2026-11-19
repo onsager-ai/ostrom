@@ -7,6 +7,7 @@ import { Store } from "../store/store.ts";
 import { FakeRunner } from "../worker/fake-runner.ts";
 import { routeFollowUps } from "../worker/follow-up.ts";
 import { Workers } from "../worker/workers.ts";
+import { chooseEffort } from "./selection.ts";
 import {
   bodyPath,
   parseRouterAnswer,
@@ -143,6 +144,34 @@ test("an accept records a ticket, dispatches a Worker and queues the Router's ac
   const again = await routeCandidates(s.options());
   assert.equal(again.router, null);
   assert.equal(s.routerSessions().length, 1);
+});
+
+test("start comment effort override is recorded before the first Worker turn", async () => {
+  const s = setup();
+  s.store().models.discovered("codex", [{ harness: "codex", id: "gpt-6-luna", displayName: "Luna", description: "", efforts: ["low", "medium", "high"], defaultEffort: "medium" }]);
+  s.store().models.change({ action: "allow", harness: "codex", model: "gpt-6-luna" });
+  s.comment("@ostrom please take this issue.\n@ostrom effort high");
+  await s.poll();
+  const pass = await routeCandidates(s.options());
+  const ticketId = pass.decisions[0]!.ticketId!;
+  const assignment = s.store().latestAssignment(ticketId)!;
+  const chosen = await chooseEffort({ store: s.store(), assignmentId: assignment.id, prompt: "first turn", kind: "dispatch", router, runners: { claude: s.runner, codex: s.runner }, signal: new AbortController().signal });
+  assert.equal(chosen.effort, "high");
+  assert.equal(s.store().selections.current(ticketId, "effort")?.source, "override");
+  assert.ok(s.store().dueReplies().some((reply) => reply.body.includes("Effort override: high")));
+});
+
+test("invalid start comment model replies with refusal and keeps Router's model", async () => {
+  const s = setup();
+  s.store().models.discovered("codex", [{ harness: "codex", id: "gpt-6-luna", displayName: "Luna", description: "", efforts: ["low", "medium", "high"], defaultEffort: "medium" }]);
+  s.store().models.change({ action: "allow", harness: "codex", model: "gpt-6-luna" });
+  s.comment("@ostrom please take this issue. @ostrom use missing/model");
+  await s.poll();
+  const pass = await routeCandidates(s.options());
+  const ticketId = pass.decisions[0]!.ticketId!;
+  assert.equal(s.store().selections.current(ticketId, "model")?.value, "codex/gpt-6-luna");
+  assert.ok(s.store().dueReplies().some((reply) => reply.body.includes("Override refused")));
+  assert.deepEqual(pass.dispatched.map((item) => item.ticketId), [ticketId]);
 });
 
 test("an ignore is recorded with no ticket, no Worker and no reply", async () => {
