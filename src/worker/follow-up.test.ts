@@ -317,7 +317,8 @@ test("follow-ups queue behind a running turn, one at a time, and are never queue
   assert.equal(session.prompts.length, 2);
   assert.deepEqual(store.pendingDeliveries(), []);
   const firstResult = store.dueReplies().find((reply) => reply.id === `review-${assignmentId}-R1`);
-  assert.equal(firstResult?.blocking, true, "the first turn's result is ready before the next turn starts");
+  assert.equal(firstResult?.body, "ok", "the first review's result was enqueued before the next turn started");
+  assert.equal(firstResult?.blocking, true, "the first review's result bypasses batching");
   session.release();
   await workers.drain();
   assert.equal(session.maxRunning, 1);

@@ -180,7 +180,9 @@ test("a Worker turn result is due immediately while ordinary comments still wait
   store.enqueueReply({ id: "review-1-R1", threadId: thread, body: "Completed the review.", blocking: true });
 
   assert.deepEqual((await send({ batchWindowMs: 10 * 60_000 })).sent, ["review-1-R1"]);
-  assert.deepEqual(store.dueReplies().map((reply) => reply.id), ["progress"]);
+  const pending = store.pendingReplies();
+  assert.deepEqual(pending.map((reply) => reply.id), ["progress"]);
+  assert.equal(pending[0]!.nextAttemptAt, new Date(T0 + 10 * 60_000).toISOString());
 });
 
 test("a ready reply is timestamped only after GitHub confirms delivery", async () => {
