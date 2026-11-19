@@ -387,10 +387,44 @@ for (const feedback of [{ body: "Please rename this" }, { inlineComments: 1 }]) 
   await ready(f);
   const previous = f.store.mergeCandidateForAssignment(f.assignment)!.quietDeadline!;
   f.remote.reviews.push(review({ id: "R2", at: f.now().toISOString(), ...feedback }));
+  if (feedback.body !== undefined) f.store.insertTrigger({ sourceId: f.source.id, sourceEventId: "R2", threadId: f.pr,
+    kind: "pull_request_review", actor: "reviewer", url: "https://github.com/o/r/pull/2#pullrequestreview-2", occurredAt: f.now() });
   const result = await mergePass(f.options());
   assert.deepEqual(result.failed, []);
   assert.ok(f.store.mergeCandidateForAssignment(f.assignment)!.quietDeadline! > previous);
   assert.equal(f.puts.length, 0);
+});
+
+test("unjudged approval commentary holds the merge without restarting quiet when judged no-feedback", async () => {
+  const f = fixture();
+  await ready(f);
+  f.remote.reviews.push(review({ id: "R2", body: "Checked both headers", at: f.now().toISOString() }));
+  const before = f.store.mergeCandidateForAssignment(f.assignment)!.quietDeadline;
+  await mergePass(f.options());
+  const waiting = f.store.mergeCandidateForAssignment(f.assignment)!;
+  assert.equal(waiting.blockingReason, "approval commentary not yet judged");
+  assert.equal(waiting.quietDeadline, before);
+  assert.equal(f.puts.length, 0);
+  f.advance(MINUTE);
+  f.store.recordIntakeReceipt({ sourceId: f.source.id, sourceEventId: "R2", url: "https://github.com/o/r/pull/2#pullrequestreview-2", reason: "approval without feedback" });
+  await mergePass(f.options());
+  const after = f.store.mergeCandidateForAssignment(f.assignment)!;
+  assert.equal(after.quietDeadline, before);
+  assert.equal(f.puts.length, 1);
+  done(f, "ostrom");
+});
+
+test("a human comment after the last head restarts the quiet window", async () => {
+  const f = fixture();
+  await ready(f);
+  const previous = f.store.mergeCandidateForAssignment(f.assignment)!.quietDeadline!;
+  f.remote.comments.push({ id: 100, body: "Please take another look", updated_at: f.now().toISOString() });
+  await mergePass(f.options());
+  const deadline = f.store.mergeCandidateForAssignment(f.assignment)!.quietDeadline!;
+  assert.ok(deadline > previous);
+  assert.equal(deadline, new Date(f.now().getTime() + 10 * MINUTE).toISOString());
+  assert.equal(f.puts.length, 0);
+  unmerged(f);
 });
 
 for (const kind of ["comment trigger", "submitted review", "direct comment edit"] as const) test(`${kind} during the quiet window pushes its deadline out`, async () => {

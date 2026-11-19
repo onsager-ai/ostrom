@@ -12,7 +12,7 @@ const QUIET_MS = 10 * 60_000;
 const RETRY_MS = 30_000;
 
 type Json = Record<string, unknown>;
-interface Observation { evidence: MergeEvidence; issueOpen: boolean; activity: string; owned: boolean; }
+interface Observation { evidence: MergeEvidence; issueOpen: boolean; activity: string; owned: boolean; unjudgedApprovalCommentary: boolean; }
 export interface MergePassOptions {
   store: Store; workers: Workers; gh: GhRunner; repo: string; policy: MergePolicy; base?: string; now?: () => Date;
   /** Failed prerequisite passes suppress sends, but reconciliation must still run. */
@@ -187,17 +187,21 @@ async function observe(options: MergePassOptions, assignmentId: number, prNumber
   const pulls = await pages(options, `repos/${options.repo}/pulls?head=${encodeURIComponent(`${options.repo.split("/")[0]}:${assignment.branch}`)}&state=open`);
   const owners = options.store.runningAssignments().filter((other) => other.branch === assignment.branch && options.store.getTicket(other.ticketId).state !== "ended");
   const pull = evidence.rest.pull;
+  const unjudgedApprovalCommentary = evidence.reviews.some((review) => review.state === "APPROVED" && review.inlineComments === 0 &&
+    review.body.trim() !== "" && !isApprovalOnly(review.state, review.body, review.inlineComments) &&
+    !options.store.hasApprovalReceipt(context.thread.sourceId, review.id) && !options.store.hasTriggerEvent(context.thread.sourceId, review.id));
   const activity = JSON.stringify({
     local: options.store.ticketActivityAt(assignment.ticketId),
     issue: [issue["state"], issue["title"], issue["body"], issue["labels"]],
     pr: [pull["title"], pull["body"], pull["draft"], pull["requested_reviewers"], pull["labels"]],
     comments: comments.filter((c) => typeof c["body"] !== "string" || !c["body"].includes("<!-- ostrom:")).map((c) => [c["id"], c["body"], c["updated_at"]]),
     reviews: evidence.reviews.filter((r) => !isApprovalOnly(r.state, r.body, r.inlineComments) &&
-      !(r.state === "APPROVED" && r.inlineComments === 0 && options.store.hasApprovalReceipt(context.thread.sourceId, r.id)))
+      !(r.state === "APPROVED" && r.inlineComments === 0 && r.body.trim() !== "" &&
+        !options.store.hasTriggerEvent(context.thread.sourceId, r.id)))
       .map((r) => [r.id, r.state, r.submittedAt, r.commitOid, r.body, r.inlineComments]),
     threads: evidence.threads,
   });
-  return { evidence, issueOpen: issue["state"] === "open", activity,
+  return { evidence, issueOpen: issue["state"] === "open", activity, unjudgedApprovalCommentary,
     owned: owners.length === 1 && (evidence.pr.state === "MERGED" || (pulls.length === 1 && pulls[0]!["number"] === prNumber)) && evidence.pr.head.ref === assignment.branch &&
       evidence.pr.head.repository === options.repo && evidence.pr.base.repository === options.repo && evidence.pr.base.ref === (options.base ?? "main") };
 }
@@ -215,6 +219,7 @@ async function pages(options: MergePassOptions, path: string): Promise<Json[]> {
 async function eligibilityFor(options: MergePassOptions, assignmentId: number, observation: Observation, candidate: MergeCandidate) {
   if (!observation.owned) return { eligible: false as const, reason: "pull request ownership or base is ambiguous" };
   if (options.policy.strategy === "human") return { eligible: false as const, reason: "waiting for a human merge" };
+  if (observation.unjudgedApprovalCommentary) return { eligible: false as const, reason: "approval commentary not yet judged" };
   const { evidence } = observation;
   const approvals = { authorLogin: evidence.pr.authorLogin ?? "", identities: await approvalIdentities(options, evidence) };
   // Permission reads yield to the operator API; reread local controls after the last await.
