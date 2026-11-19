@@ -451,7 +451,8 @@ export class Workers {
     if (this.#deps.threadContext) {
       threadContext = await this.#deps.threadContext(this.#deps.store.getAssignment(id).ticketId);
     }
-    return chooseEffort({ store: this.#deps.store, assignmentId: id, kind, prompt, signal, router: this.#deps.router, runners: this.#deps.runners, threadContext });
+    return chooseEffort({ store: this.#deps.store, assignmentId: id, kind, prompt, signal, router: this.#deps.router, runners: this.#deps.runners,
+      ...(threadContext === undefined ? {} : { threadContext }) });
   }
 
   #failed(id: number, error: unknown): void {

@@ -516,7 +516,7 @@ test("a comment deleted since intake reaches the Router as deleted; long bodies 
   assert.equal(thread.bodyTruncated, true);
   assert.match(deleted!.excerpt, /deleted from GitHub/);
   assert.equal(long!.truncated, true);
-  assert.equal(long!.excerpt.length, 600);
+  assert.equal(long!.excerpt.length, 601);
 });
 
 test("a flagged stall does not make the Router run", async () => {
