@@ -90,8 +90,13 @@ not establish ownership. Human policy skips merge requests entirely. Otherwise a
    submitted/dismissed reviews, thread replies/resolutions, pushes, PR edits and controls. An APPROVED
    review with zero inline comments and a trimmed body that is empty or exactly `lgtm`, `approved`,
    or `looks good` (case-insensitive, optionally followed by one `.` or `!`) is excluded from
-   activity and Worker follow-ups, but still counts toward approval policy. Intake records an
-   excluded receipt for it. Refresh
+   activity and Worker follow-ups, but still counts toward approval policy. For any other APPROVED
+   body with zero inline comments, intake asks the configured Router whether the commentary asks
+   the Worker for anything. A judgement of `ignore` records the same excluded receipt and leaves
+   the Worker and quiet timer alone; `accept`, invalid output or a failed Router call preserves
+   normal delivery. Inline feedback and CHANGES_REQUESTED reviews bypass this judgement. The direct
+   merge evidence read honors approval receipts only while the review is APPROVED with no inline
+   comments. The empty/short approval path needs no Router call. Refresh
    these directly before merging; the intake cursor alone is insufficient. Newly observed changes
    with no reliable timestamp restart the timer at observation. Treat unmarked actor activity as
    human conservatively; Ostrom's marked cards/replies and CI updates do not restart it. Pending

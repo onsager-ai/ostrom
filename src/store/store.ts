@@ -424,6 +424,14 @@ export class Store {
     );
   }
 
+  hasApprovalReceipt(sourceId: number, sourceEventId: string): boolean {
+    return this.#get("SELECT 1 FROM intake_receipt WHERE source_id = ? AND source_event_id = ? AND reason = 'approval without feedback'", sourceId, sourceEventId) !== undefined;
+  }
+
+  hasTriggerEvent(sourceId: number, sourceEventId: string): boolean {
+    return this.#get('SELECT 1 FROM "trigger" WHERE source_id = ? AND source_event_id = ?', sourceId, sourceEventId) !== undefined;
+  }
+
   /** Recent triggers with their latest Router decision, plus excluded event receipts. */
   operatorIntake(limit = 50): OperatorIntakeItem[] {
     const triggers = this.#all(

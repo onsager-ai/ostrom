@@ -192,7 +192,8 @@ async function observe(options: MergePassOptions, assignmentId: number, prNumber
     issue: [issue["state"], issue["title"], issue["body"], issue["labels"]],
     pr: [pull["title"], pull["body"], pull["draft"], pull["requested_reviewers"], pull["labels"]],
     comments: comments.filter((c) => typeof c["body"] !== "string" || !c["body"].includes("<!-- ostrom:")).map((c) => [c["id"], c["body"], c["updated_at"]]),
-    reviews: evidence.reviews.filter((r) => !isApprovalOnly(r.state, r.body, r.inlineComments))
+    reviews: evidence.reviews.filter((r) => !isApprovalOnly(r.state, r.body, r.inlineComments) &&
+      !(r.state === "APPROVED" && r.inlineComments === 0 && options.store.hasApprovalReceipt(context.thread.sourceId, r.id)))
       .map((r) => [r.id, r.state, r.submittedAt, r.commitOid, r.body, r.inlineComments]),
     threads: evidence.threads,
   });

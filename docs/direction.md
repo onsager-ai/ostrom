@@ -87,7 +87,11 @@ deterministic step.
 A Worker runs in its own git worktree on a branch `ostrom/ticket-<ticket>-<assignment>`, so Semon
 can attribute its session to the repository and branch. A follow-up on a subscribed thread goes from
 the daemon straight to the Worker, as the next turn of the same session resumed by its ID, and never
-reaches the Router. After an `ostromd` restart, running Workers are resumed by their stored IDs.
+reaches the Router, except that intake first asks the Router whether a non-trivial APPROVED review
+with no inline comments asks the Worker for anything. Commentary judged `ignore` gets an excluded
+intake receipt and does not wake the Worker or restart the merge quiet window; Router errors keep
+normal delivery. Empty and short approval bodies use the deterministic fast path. After an
+`ostromd` restart, running Workers are resumed by their stored IDs.
 
 ## Data model
 
