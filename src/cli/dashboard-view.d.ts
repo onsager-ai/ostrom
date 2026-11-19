@@ -21,7 +21,7 @@ export function phaseSummary(tickets: OperatorTicket[]): string;
 export function ticketSummary(detail?: Pick<OperatorTicketDetail, "decisions" | "context">): { full: string; short: string };
 export function pendingSelection(
   detail: {
-    selections: Pick<OperatorTicketDetail["selections"][number], "id" | "kind" | "source" | "value">[];
+    selections: readonly Pick<OperatorTicketDetail["selections"][number], "id" | "kind" | "source" | "value">[];
     assignment?: Pick<NonNullable<OperatorTicket["assignment"]>, "harness" | "model"> | null;
   } | null | undefined,
   kind: "model" | "effort",
