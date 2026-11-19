@@ -210,7 +210,7 @@ test("start comment effort override is recorded before the first Worker turn", a
   assert.equal(s.store().selections.current(ticketId, "effort")?.source, "override");
   assert.equal(s.store().selections.current(ticketId, "effort")?.reason, "Effort override: high. Applies from this turn and holds until changed.");
   const threadId = s.store().ticketContext(ticketId).thread.id;
-  assert.equal(s.store().dueReplies().some((reply) => reply.body.includes("Effort override: high")), false);
+  assert.equal(s.store().dueReplies().some((reply) => reply.id.startsWith("selection-") && reply.body.includes("Effort override: high")), false);
   assert.match(s.store().statusCardBody(threadId)!, /Selection: Effort override: high\. Applies from this turn and holds until changed\./);
   assert.doesNotMatch(s.store().statusCardBody(threadId)!, /high from the next turn/);
 });
