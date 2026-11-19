@@ -103,6 +103,49 @@ const pr = (number: number, state: string) => ({
   state,
 });
 
+test("Router includes bounded repository history for allowed models and preserves it for replay", async () => {
+  const s = setup();
+  const store = s.store();
+  store.models.discovered("codex", ["allowed", "removed"].map((id) => ({ harness: "codex", id, displayName: id, description: "", efforts: ["medium"], defaultEffort: "medium" })));
+  store.models.change({ action: "allow", harness: "codex", model: "allowed" });
+  const seed = (repository: string, model: string, kind: string, number: number) => {
+    const source = store.ensureSource("github", repository);
+    const threadId = store.ensureThread({ sourceId: source.id, kind: "issue", number, url: "https://example.test/issue" });
+    const ticketId = store.recordDecision({ threadId, triggerIds: [], verdict: "accept", reason: "past work" }).ticketId!;
+    const id = store.createAssignment(ticketId);
+    store.configureNativeAssignment(id, { harness: "codex", model, worktree: "/tmp/work", branch: "past", machine: "test" });
+    store.startNativeAssignment(id, `past-${id}`);
+    store.startWorkerTurn(id, kind);
+    store.finishWorkerTurn(id, "failed", { inputTokens: 10, cachedInputTokens: 100, outputTokens: 5 });
+    store.endAssignment(id);
+    store.endTicket(ticketId);
+  };
+  for (let index = 0; index < 26; index++) seed(s.github.repo, "allowed", `kind-${String(index).padStart(2, "0")}`, 100 + index);
+  seed(s.github.repo, "removed", "dispatch", 200);
+  seed("other/repo", "allowed", "dispatch", 201);
+  s.comment("fix the typo");
+  await s.poll();
+  const pass = await routeCandidates(s.options());
+  const payload = JSON.parse(s.routerSessions()[0]!.prompts[0]!.split("The batch:\n")[1]!);
+  assert.equal(payload.selection.history.rows.length, 24);
+  assert.equal(payload.selection.history.omittedRows, 2);
+  assert.ok(payload.selection.history.rows.every((row: { repository: string; model: string }) => row.repository === s.github.repo && row.model === "allowed"));
+  assert.equal(payload.selection.history.rows[0].medianFreshTokens, 15);
+  assert.deepEqual(JSON.parse(store.selections.current(pass.decisions[0]!.ticketId!, "model")!.input).selection, payload.selection);
+});
+
+test("Router explicitly describes cold start when there is no outcome history", async () => {
+  const s = setup();
+  s.comment("fix the typo");
+  await s.poll();
+  await routeCandidates(s.options());
+  const prompt = s.routerSessions()[0]!.prompts[0]!;
+  const payload = JSON.parse(prompt.split("The batch:\n")[1]!);
+  assert.deepEqual(payload.selection.history.rows, []);
+  assert.equal(payload.selection.history.omittedRows, 0);
+  assert.match(payload.selection.history.note, /No outcome history.*cheapest model and a moderate effort/);
+});
+
 test("an opened issue reaches the Router with its current body", async () => {
   const s = setup();
   s.github.issue(9, false, { login: "alice", body: "@ostrom please fix this", at: new Date("2026-11-09T11:58:00Z") });

@@ -6,6 +6,7 @@ import { budgetReached, budgetUsage, budgetWarning } from "../budget/budgets.ts"
 import type { BudgetDefaults } from "../budget/budgets.ts";
 import { migrate } from "./migrations.ts";
 import { ModelStore } from "./models.ts";
+import { modelOutcomes, type ModelOutcome } from "./outcomes.ts";
 import { TicketSelections, type SelectionDecision } from "./ticket-selection.ts";
 
 export type SourceKind = "github";
@@ -973,6 +974,10 @@ export class Store {
       this.#stamp(), status, observed.model, observed.effort, usage?.inputTokens ?? 0, usage?.cachedInputTokens ?? 0,
       usage?.outputTokens ?? 0, result, assignmentId,
     );
+  }
+
+  modelOutcomes(repository?: string): ModelOutcome[] {
+    return modelOutcomes(this.#db, repository);
   }
 
   ticketTurns(ticketId: number): WorkerTurn[] {

@@ -1,7 +1,8 @@
 # Model selection
 
 Status: accepted, 2026-11-17. PR 1 implements effort and turn records; PR 2 implements discovery
-and stored operator selections. PR 3 consumes selections and implements choices and overrides. The operator asked for
+and stored operator selections. PR 3 consumes selections and implements choices and overrides.
+Step 4 implements computed outcome history in the Router input and `ostrom models`. The operator asked for
 selection that is smarter than a fixed tier table, optimised for the operator's experience. On
 2026-11-17 they chose: **the lowest cost that still merges** as the default objective, **escalation
 within one harness** at first, allowed models **selected by an admin from those the harnesses
@@ -121,7 +122,37 @@ merge records, code computes per repository and task kind: tickets merged, media
 fresh tokens, and review rounds per model. That table goes into the Router's input. Code computes
 the numbers; the Router makes the judgement.
 
-With no history, the Router starts on the cheapest model and a moderate effort.
+Implemented in step 4 without new tables. The statistics use recorded turns, tickets, assignments,
+PR subscriptions, merge candidates and `pr_merge`. A started sample is a ticket/model pair with at
+least one recorded turn, including failed first turns and work still running. The model key is the
+requested harness/model (the configured choice whose cost the operator controls), rather than an
+observed alias. All assignments for the same ticket/model contribute to one sample. Each ticket's
+first recorded turn `kind` is its task kind; these are invocation kinds such as `dispatch` and
+`recovery`, not inferred labels such as docs or code. Older tickets without turn records are omitted.
+
+For each repository, first-turn kind and model, code counts started tickets and tickets with a
+recorded merged PR. A merge is linked through the ticket's original PR thread, a subscribed PR, or
+an assignment's merge candidate; multiple PRs and merge attempts count a ticket only once. Medians
+are computed over ticket/model totals: number of recorded turns, fresh input plus output tokens
+(the runner already excludes cached input from `input_tokens`), and number of turns whose kind is
+`review`. Review rounds mean Worker review invocations, not individual GitHub review comments.
+Failed, interrupted and unfinished tickets remain in the sample; running turns count but their
+usage remains zero until reported. These are observed totals so far, not predictions of final cost.
+
+The model-choice input's `selection.history` contains `repository`, `rows`, `omittedRows` and a
+short explanatory `note`. Rows have `repository`, `kind`, `harness`, `model`, `started`, `merged`,
+`medianTurns`, `medianFreshTokens` and `medianReviewRounds`. Only currently usable allowed models
+in this Router's repository appear. At most 24 rows are sent, ordered by started count descending,
+then kind, harness and model; `omittedRows` reports truncation. Missing model/kind rows mean no
+recorded history. The exact selection input is stored with the model decision for `ostrom replay`.
+
+`ostrom models` and its JSON/API view show history for every allowed model, grouped by repository
+and first-turn kind, including allowed models no longer offered. Text output shows merged/started,
+median turns, median fresh tokens and median review rounds; models without samples explicitly show
+no recorded history. Read-only offline listing computes the same history from `OSTROM_DB`.
+
+With no history for allowed models in the repository, the input explicitly says so and directs the
+Router to start on the cheapest model and a moderate effort.
 
 ### Escalation
 
@@ -176,7 +207,8 @@ Each PR is reviewed and merged on green CI before the next starts.
 3. **The Router's choice and overrides.** The Router's model and per-turn effort choices with
    reasons, validation and fallback, the status card and dashboard lines, and the two override
    commands and CLI verbs.
-4. **Outcome history.** The statistics, the Router's input table, and history in `ostrom models`.
+4. **Outcome history — implemented.** Computed ticket/model statistics, the Router's repository
+   table capped at 24 rows, and per-repository/kind history in `ostrom models`.
 5. **Escalation.** The triggers, the effort step, the same-harness model move with handoff, and the
    escalations budget.
 

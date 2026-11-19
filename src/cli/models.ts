@@ -85,6 +85,10 @@ export function renderModels(view: ModelView): string {
     lines.push(`${model.harness}/${model.id}  ${model.allowed ? "allowed" : "not allowed"}  ${model.displayName}`);
     lines.push(`  efforts: ${model.efforts.join(",") || "default only"}; default: ${model.defaultEffort ?? "harness default"}`);
     if (model.selection) lines.push(`  selected efforts: ${model.selection.efforts.join(",") || "default only"}; approval: ${model.selection.approval ? "on" : "off"}; cost: ${model.selection.cost}; note: ${model.selection.note}`);
+    if (model.allowed) {
+      if (model.history.length === 0) lines.push("  history: no recorded history (0/0 merged/started)");
+      else for (const row of model.history) lines.push(`  history ${row.repository} / ${row.kind}: ${row.merged}/${row.started} merged/started; median turns: ${row.medianTurns}; median fresh tokens: ${row.medianFreshTokens}; median review rounds: ${row.medianReviewRounds}`);
+    }
     if (model.flags.length) lines.push(`  ${model.flags.join("; ")}`);
     if (model.description) lines.push(`  ${model.description}`);
   }
