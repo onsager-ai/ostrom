@@ -99,8 +99,11 @@ not establish ownership. Human policy skips merge requests entirely. Otherwise a
    comments. The empty/short approval path needs no Router call. Refresh
    these directly before merging; the intake cursor alone is insufficient. Newly observed changes
    with no reliable timestamp restart the timer at observation. Treat unmarked actor activity as
-   human conservatively; comments and reviews carrying Ostrom's hidden reply marker, status cards,
-   and CI updates do not restart it. Pending
+   human conservatively; comments carrying Ostrom's hidden reply marker, status cards, and CI
+   updates do not restart it. A nonempty APPROVED review with no inline comments is excluded from
+   the fingerprint while it awaits Router judgment, and is held with `approval commentary not yet
+   judged` until its receipt or trigger exists. A receipt keeps a no-feedback approval excluded; a
+   trigger makes commentary activity count normally. Pending
    review drafts are not visible reliably, so this window cannot promise time for an unseen review.
 
 Ten minutes is a fixed milestone-2 default, not another policy knob. A new head/base or changed

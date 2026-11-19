@@ -15,7 +15,6 @@ import { ghHttpStatus, mergePass, type MergePassOptions } from "./merge-pass.ts"
 import type { MergePolicy } from "./merge-policy.ts";
 import type { GhRunner } from "./gh.ts";
 import { sendDueReplies } from "./outbox.ts";
-import { replyMarker } from "./marker.ts";
 
 const MINUTE = 60_000;
 const pageInfo = { hasNextPage: false, endCursor: null };
@@ -394,14 +393,21 @@ for (const feedback of [{ body: "Please rename this" }, { inlineComments: 1 }]) 
   assert.equal(f.puts.length, 0);
 });
 
-test("Ostrom-marked comment after the last head does not restart the quiet window", async () => {
+test("unjudged approval commentary holds the merge without restarting quiet when judged no-feedback", async () => {
   const f = fixture();
   await ready(f);
-  const previous = f.store.mergeCandidateForAssignment(f.assignment)!.quietDeadline;
-  f.remote.comments.push({ id: 99, body: `PR is open. Ten quiet minutes from this notice.\n\n${replyMarker("ready-pr2")}`, updated_at: f.now().toISOString() });
-  const result = await mergePass(f.options());
-  assert.deepEqual(result.failed, []);
-  assert.equal(f.store.mergeCandidateForAssignment(f.assignment)!.quietDeadline, previous);
+  f.remote.reviews.push(review({ id: "R2", body: "Checked both headers", at: f.now().toISOString() }));
+  const before = f.store.mergeCandidateForAssignment(f.assignment)!.quietDeadline;
+  await mergePass(f.options());
+  const waiting = f.store.mergeCandidateForAssignment(f.assignment)!;
+  assert.equal(waiting.blockingReason, "approval commentary not yet judged");
+  assert.equal(waiting.quietDeadline, before);
+  assert.equal(f.puts.length, 0);
+  f.advance(MINUTE);
+  f.store.recordIntakeReceipt({ sourceId: f.source.id, sourceEventId: "R2", url: "https://github.com/o/r/pull/2#pullrequestreview-2", reason: "approval without feedback" });
+  await mergePass(f.options());
+  const after = f.store.mergeCandidateForAssignment(f.assignment)!;
+  assert.equal(after.quietDeadline, before);
   assert.equal(f.puts.length, 1);
   done(f, "ostrom");
 });
