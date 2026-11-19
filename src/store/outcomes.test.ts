@@ -77,9 +77,10 @@ for (const kind of ["issue", "pull_request"] as const) test(`outcomes link merge
     store.startNativeAssignment(id, "session");
     store.startWorkerTurn(id, "dispatch");
     store.finishWorkerTurn(id, "failed", { inputTokens: 5, cachedInputTokens: 10, outputTokens: 2 });
-    store.recordMergeAndOutcome({ repository: "o/r", prNumber: 1, headSha: "head", mergeSha: null, mergedAt: new Date(), mergedByLogin: null, mergedById: null, origin: "external", assignmentId: id, threadId, body: "merged", evidence: "test" });
+    const prNumber = kind === "issue" ? 2 : 1;
+    store.recordMergeAndOutcome({ repository: "o/r", prNumber, headSha: "head", mergeSha: null, mergedAt: new Date(), mergedByLogin: null, mergedById: null, origin: "external", assignmentId: id, threadId, body: "merged", evidence: "test" });
     if (kind === "issue") {
-      const pr = store.ensureThread({ sourceId: source.id, kind: "pull_request", number: 1, url: "https://example.test/pr" });
+      const pr = store.ensureThread({ sourceId: source.id, kind: "pull_request", number: prNumber, url: "https://example.test/pr" });
       store.subscribe(ticketId, pr);
     } else store.unsubscribeTicket(ticketId);
     assert.equal(store.modelOutcomes()[0]!.merged, 1);
