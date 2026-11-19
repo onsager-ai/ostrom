@@ -222,10 +222,9 @@ test("recovery folds newer reviews into the interrupted prompt and finishes thei
   resumed.release();
   await restarted.drain();
   assert.deepEqual(store.unfinishedTurns(1), []);
-  assert.deepEqual(
-    store.dueReplies().filter((reply) => reply.id.startsWith("review-")).map((reply) => reply.id).sort(),
-    ["review-1-44", "review-1-45"],
-  );
+  const results = store.dueReplies().filter((reply) => reply.id.startsWith("review-")).sort((a, b) => a.id.localeCompare(b.id));
+  assert.deepEqual(results.map((reply) => reply.id), ["review-1-44", "review-1-45"]);
+  assert.ok(results.every((reply) => reply.blocking), "recovery results include folded feedback and bypass batching");
 });
 
 test("interrupting recovery again preserves both review replies and prompts", async () => {
@@ -258,10 +257,9 @@ test("interrupting recovery again preserves both review replies and prompts", as
   assert.ok(prompts[0]!.indexOf("Earlier review.") > 0);
   assert.ok(prompts[0]!.indexOf("Newer review.") > prompts[0]!.indexOf("Earlier review."));
   assert.deepEqual(store.unfinishedTurns(1), []);
-  assert.deepEqual(
-    store.dueReplies().filter((reply) => reply.id.startsWith("review-")).map((reply) => reply.id).sort(),
-    ["review-1-44", "review-1-45"],
-  );
+  const results = store.dueReplies().filter((reply) => reply.id.startsWith("review-")).sort((a, b) => a.id.localeCompare(b.id));
+  assert.deepEqual(results.map((reply) => reply.id), ["review-1-44", "review-1-45"]);
+  assert.ok(results.every((reply) => reply.blocking), "recovery results include folded feedback and bypass batching");
 });
 
 test("the follow-up is a summary plus a pointer to the trigger", () => {
