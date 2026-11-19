@@ -154,7 +154,7 @@ test("a reply whose id cannot go in a marker fails instead of posting unmarked",
   assert.equal(posts(), 0);
 });
 
-test("ordinary comments batch while command replies skip an open window and question replies go out immediately", async () => {
+test("ordinary comments batch while blocking replies skip an open window", async () => {
   const { store, thread, send, github, advance } = fixture();
   store.enqueueReply({ id: "r1", threadId: thread, body: "first" });
   store.enqueueReply({ id: "r2", threadId: thread, body: "second" });
@@ -172,6 +172,15 @@ test("ordinary comments batch while command replies skip an open window and ques
 
   store.enqueueReply({ id: "q1", threadId: thread, body: "need a decision", blocking: true });
   assert.deepEqual((await send({ batchWindowMs: 10 * 60_000 })).sent, ["q1"]);
+});
+
+test("a Worker turn result is due immediately while ordinary comments still wait", async () => {
+  const { store, thread, send } = fixture();
+  store.enqueueReply({ id: "progress", threadId: thread, body: "Still working." });
+  store.enqueueReply({ id: "review-1-R1", threadId: thread, body: "Completed the review.", blocking: true });
+
+  assert.deepEqual((await send({ batchWindowMs: 10 * 60_000 })).sent, ["review-1-R1"]);
+  assert.deepEqual(store.dueReplies().map((reply) => reply.id), ["progress"]);
 });
 
 test("a ready reply is timestamped only after GitHub confirms delivery", async () => {

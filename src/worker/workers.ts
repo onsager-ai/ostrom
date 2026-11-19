@@ -221,6 +221,7 @@ export class Workers {
               id: `review-${assignment.id}-${review.reviewId}`,
               threadId: review.threadId,
               body: renderReviewReply(result.text),
+              blocking: true,
             });
           }
         }, "recovery", turnId);
@@ -297,7 +298,7 @@ export class Workers {
           }
         },
         onComplete: (result) => {
-          store.enqueueReply({ id: `review-${id}-${review.reviewId}`, threadId: review.threadId, body: renderReviewReply(result.text) });
+          store.enqueueReply({ id: `review-${id}-${review.reviewId}`, threadId: review.threadId, body: renderReviewReply(result.text), blocking: true });
         },
       };
     }
@@ -311,7 +312,7 @@ export class Workers {
         onStart: (recoveryTurnId) => store.recoverDeliveries(id, interruptedTurnId, recoveryTurnId),
         onComplete: (result) => {
           for (const review of reviews) {
-            store.enqueueReply({ id: `review-${id}-${review.reviewId}`, threadId: review.threadId, body: renderReviewReply(result.text) });
+            store.enqueueReply({ id: `review-${id}-${review.reviewId}`, threadId: review.threadId, body: renderReviewReply(result.text), blocking: true });
           }
         },
       };

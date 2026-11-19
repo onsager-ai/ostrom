@@ -301,10 +301,10 @@ test("a replayed pass sends nothing twice", async () => {
 });
 
 test("follow-ups queue behind a running turn, one at a time, and are never queued twice", async () => {
-  const { store, runner, workers, pr, trigger } = fixture();
+  const { store, runner, workers, pr, trigger, assignmentId } = fixture();
   runner.hold = true;
-  const first = trigger(pr);
-  const second = trigger(pr);
+  const first = trigger(pr, "pull_request_review", { reviewId: "R1" });
+  const second = trigger(pr, "pull_request_review", { reviewId: "R2" });
   assert.equal(routeFollowUps(store, workers).queued.length, 2);
   await tick();
   const session = runner.sessions[0]!;
@@ -316,6 +316,8 @@ test("follow-ups queue behind a running turn, one at a time, and are never queue
   await tick();
   assert.equal(session.prompts.length, 2);
   assert.deepEqual(store.pendingDeliveries(), []);
+  const firstResult = store.dueReplies().find((reply) => reply.id === `review-${assignmentId}-R1`);
+  assert.equal(firstResult?.blocking, true, "the first turn's result is ready before the next turn starts");
   session.release();
   await workers.drain();
   assert.equal(session.maxRunning, 1);
