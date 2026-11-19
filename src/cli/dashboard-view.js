@@ -41,6 +41,14 @@ export function ticketSummary(detail) {
   return { full, short: full.length > 120 ? `${full.slice(0, 119).trimEnd()}…` : full };
 }
 
+export function pendingSelection(detail, kind, current, boundary) {
+  const selections = detail?.selections ?? [];
+  const override = [...selections].reverse().find(choice => choice.kind === kind && choice.source === "override");
+  const effective = [...selections].reverse().find(choice => choice.kind === kind && (kind === "model" ? choice.value === `${detail?.assignment?.harness}/${detail?.assignment?.model}` : choice.source === "router"));
+  if (!override || override.id <= (effective?.id ?? 0) || override.value === current) return null;
+  return kind === "model" ? override.value?.split("/").at(-1) ?? null : override.value;
+}
+
 export function budgetMeters(ticket) {
   return [
     ["Time", ticket.budgetUsage.time, ticket.budget.timeMinutes, "min"],

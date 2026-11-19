@@ -141,7 +141,8 @@ model waits for the operator. Moving across harnesses is deferred until a real t
 ### What the operator sees and controls
 
 - The status card and the dashboard show the model and the effort of the current turn, with the
-  reason.
+  reason. If a newer override has not taken effect yet, they show it beside the current value and
+  name its boundary: the next turn for effort or the next session for model.
 - `@ostrom use <model>` and `@ostrom effort <level>` on the issue or PR override for that ticket.
   If either appears in the comment that starts the ticket, Ostrom applies it after acceptance and
   before the first Worker turn. Invalid or approval-required model selections receive a refusal

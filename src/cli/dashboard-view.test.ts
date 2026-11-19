@@ -56,6 +56,20 @@ test("headlines use the latest decision and keep the full summary", () => {
   assert.equal(ticketSummary({ ...detail, decisions: [] }).full, "original");
 });
 
+test("dashboard detects pending selection overrides after the current turn", async () => {
+  const { pendingSelection } = await import("./dashboard-view.js");
+  const detail = { selections: [
+    { kind: "effort", source: "router", value: "medium", at: "2026-11-16T00:00:00Z" },
+    { kind: "effort", source: "override", value: "high", at: "2026-11-16T01:00:00Z" },
+    { kind: "model", source: "override", value: "codex/sol", at: "2026-11-16T01:01:00Z" },
+  ] };
+  assert.equal(pendingSelection(detail, "effort", "medium"), "high");
+  assert.equal(pendingSelection({ ...detail, assignment: { harness: "codex", model: "luna" } }, "model", "codex/luna"), "sol");
+  assert.equal(pendingSelection(detail, "effort", "high"), null);
+  assert.equal(pendingSelection({ selections: [{ kind: "effort", source: "override", value: "high", id: 2 }, { kind: "effort", source: "router", value: "high", id: 3 }] }, "effort", "high"), null);
+  assert.equal(pendingSelection({ selections: [] }, "effort", "medium", null), null);
+});
+
 test("budget meters use fresh token totals and highlight at 80 percent", () => {
   const meters = budgetMeters(ticket({ budgetUsage: { time: 48, turns: 16, tokens: 801, idle: 0, escalations: 0 } }));
   assert.deepEqual(meters.map(m => m.text), ["48 / 60 min", "16 / 20", "80.1% of limit"]);

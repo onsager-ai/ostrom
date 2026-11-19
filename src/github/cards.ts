@@ -25,8 +25,16 @@ export function queueStatusCard(store: Store, ticketId: number, now = new Date()
   const warning = budgetWarning(budget, now);
   const pullRequest = store.ticketPullRequest(ticketId);
   const lastActivityAt = new Date(assignment.lastActivityAt ?? assignment.outcomeAt ?? assignment.startedAt ?? assignment.createdAt);
-  const turn = store.ticketTurns(ticketId).at(-1);
-  const modelChoice = store.selections.history(ticketId).findLast((choice) => choice.kind === "model" && choice.value === `${assignment.harness}/${assignment.model}`);
+  const turns = store.ticketTurns(ticketId);
+  const turn = turns.at(-1);
+  const selections = store.selections.history(ticketId);
+  const modelOverride = selections.findLast((choice) => choice.kind === "model" && choice.source === "override");
+  const effortOverride = selections.findLast((choice) => choice.kind === "effort" && choice.source === "override");
+  const modelBoundary = selections.findLast((choice) => choice.kind === "model" && choice.value === `${assignment.harness}/${assignment.model}`);
+  const pendingModel = modelOverride?.value && modelOverride.id > (modelBoundary?.id ?? 0) ? modelOverride.value.split("/").at(-1) : undefined;
+  const effortBoundary = selections.findLast((choice) => choice.kind === "effort" && choice.source === "router");
+  const pendingEffort = effortOverride && effortOverride.id > (effortBoundary?.id ?? 0) && effortOverride.value !== turn?.requestedEffort ? effortOverride.value : undefined;
+  const modelChoice = selections.findLast((choice) => choice.kind === "model" && choice.value === `${assignment.harness}/${assignment.model}`);
   store.enqueueStatusCard(
     context.thread.id,
     renderStatusCard({
@@ -38,7 +46,9 @@ export function queueStatusCard(store: Store, ticketId: number, now = new Date()
       ...(candidate === null || ticket.state === "ended" ? {} : { mergeStatus: `policy ${policy!.strategy}; head ${candidate.headSha}; ${candidate.blockingReason === "quiet period has not elapsed" && candidate.quietDeadline !== null ? `earliest merge ${candidate.quietDeadline}` : candidate.blockingReason === null ? "waiting for ready reply" : candidate.blockingReason}` }),
       harness: assignment.harness,
       model: assignment.model,
+      ...(pendingModel === undefined ? {} : { pendingModel }),
       ...(turn === undefined ? {} : { effort: turn.requestedEffort }),
+      ...(pendingEffort === undefined ? {} : { pendingEffort }),
       ...(!turn?.reason && !modelChoice?.reason ? {} : { selectionReason: turn?.reason ?? modelChoice!.reason }),
       lastActivityAt,
       now,

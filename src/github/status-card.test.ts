@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 import { renderStatusCard, type StatusCard, type StatusCardState } from "./status-card.ts";
+import { Store } from "../store/store.ts";
+import { queueStatusCard } from "./cards.ts";
 
 const base: Omit<StatusCard, "state"> = {
   plan: ["Inspect the failure", "Patch and verify the fix"],
@@ -20,6 +22,39 @@ for (const state of ["working", "recovering", "paused", "stuck", "waiting_to_mer
     assert.equal(renderStatusCard({ ...base, state }), await snapshot(state));
   });
 }
+
+test("status card derives pending effort and model overrides from ticket selection history", () => {
+  const store = Store.open(":memory:", { now: () => new Date("2026-11-09T12:00:00Z") });
+  try {
+    const source = store.ensureSource("github", "org/repo");
+    const threadId = store.ensureThread({ sourceId: source.id, kind: "issue", number: 7, url: "https://github.com/org/repo/issues/7" });
+    const trigger = store.insertTrigger({ sourceId: source.id, sourceEventId: "accepted", threadId, kind: "issue_comment", actor: "alice", url: "https://github.com/org/repo/issues/7#1", occurredAt: new Date() });
+    const ticketId = store.recordDecision({ threadId, triggerIds: [trigger.id], verdict: "accept", reason: "work" }).ticketId!;
+    const assignmentId = store.createAssignment(ticketId);
+    store.configureNativeAssignment(assignmentId, { harness: "codex", model: "luna", worktree: "/wt", branch: "b", machine: "host" });
+    store.startNativeAssignment(assignmentId, "session");
+    store.startWorkerTurn(assignmentId, "first_work", "medium", "router chose medium");
+    store.finishWorkerTurn(assignmentId, "completed", null);
+    store.selections.record(ticketId, "effort", "medium", "Router selected medium.", "router", {});
+    store.selections.record(ticketId, "effort", "high", "Effort override: high.", "override", {});
+    store.selections.record(ticketId, "model", "codex/luna", "Current model.", "router", {});
+    store.selections.record(ticketId, "model", "codex/sol", "Model override: codex/sol.", "override", {});
+    queueStatusCard(store, ticketId);
+    assert.match(store.statusCardBody(threadId)!, /Model: `luna` \(sol from the next session\)/);
+    assert.match(store.statusCardBody(threadId)!, /Effort: `medium` \(high from the next turn\)/);
+  } finally { store.close(); }
+});
+
+test("status card shows pending effort and model overrides", () => {
+  const rendered = renderStatusCard({ ...base, state: "working", pendingEffort: "high", pendingModel: "sol" });
+  assert.match(rendered, /Model: `gpt-6-luna` \(sol from the next session\)/);
+  assert.match(rendered, /Effort: `medium` \(high from the next turn\)/);
+});
+
+test("status card omits absent pending overrides", () => {
+  const rendered = renderStatusCard({ ...base, state: "working" });
+  assert.doesNotMatch(rendered, /from the next (turn|session)/);
+});
 
 test("status card shows stale approvals instead of approval satisfaction", () => {
   const rendered = renderStatusCard({ ...base, state: "waiting_to_merge", mergeStatus: "policy approvals; head 53975b6; Approved on 0e65021; the head is now 53975b6. Approve again to merge." });
