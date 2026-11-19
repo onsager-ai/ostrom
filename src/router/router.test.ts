@@ -212,6 +212,7 @@ test("start comment effort override is recorded before the first Worker turn", a
   const threadId = s.store().ticketContext(ticketId).thread.id;
   assert.equal(s.store().dueReplies().some((reply) => reply.body.includes("Effort override: high")), false);
   assert.match(s.store().statusCardBody(threadId)!, /Selection: Effort override: high\. Applies from this turn and holds until changed\./);
+  assert.doesNotMatch(s.store().statusCardBody(threadId)!, /high from the next turn/);
 });
 
 test("invalid start comment model replies with refusal and keeps Router's model", async () => {
