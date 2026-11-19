@@ -19,6 +19,11 @@ export interface BudgetMeter {
 export function ticketPhase(ticket: Pick<OperatorTicket, "state" | "pauseCause" | "assignment" | "latestFailure" | "budget" | "pullRequests" | "mergeCandidate">): TicketPhase;
 export function phaseSummary(tickets: OperatorTicket[]): string;
 export function ticketSummary(detail?: Pick<OperatorTicketDetail, "decisions" | "context">): { full: string; short: string };
+export function pendingSelection(
+  detail: Pick<OperatorTicketDetail, "selections"> & { assignment?: Pick<NonNullable<OperatorTicket["assignment"]>, "harness" | "model"> | null },
+  kind: "model" | "effort",
+  current: string | null | undefined,
+): string | null;
 export function budgetMeters(ticket: Pick<OperatorTicket, "budgetUsage" | "budget">): BudgetMeter[];
 export function attentionItems(
   status: {

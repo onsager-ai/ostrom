@@ -34,7 +34,7 @@ export function queueStatusCard(store: Store, ticketId: number, now = new Date()
   const pendingModel = modelOverride?.value && modelOverride.id > (modelBoundary?.id ?? 0) ? modelOverride.value.split("/").at(-1) : undefined;
   const effortBoundary = selections.findLast((choice) => choice.kind === "effort" && choice.source === "router");
   const pendingEffort = effortOverride && effortOverride.id > (effortBoundary?.id ?? 0) && effortOverride.value !== turn?.requestedEffort ? effortOverride.value : undefined;
-  const modelChoice = selections.findLast((choice) => choice.kind === "model" && choice.value === `${assignment.harness}/${assignment.model}`);
+  const modelChoice = modelBoundary;
   store.enqueueStatusCard(
     context.thread.id,
     renderStatusCard({
