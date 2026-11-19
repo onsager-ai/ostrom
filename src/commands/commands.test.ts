@@ -305,6 +305,8 @@ test("selection comments are consumed, validated and authorized without waking a
   assert.equal(store.selections.current(ticketId, "effort")!.value, "low");
   assert.equal(store.getAssignment(assignmentId).turns, 0);
   assert.equal(store.unfinishedTurns(assignmentId).length, 0);
+  assert.ok(store.dueReplies().filter((reply) => reply.body.includes("next session") || reply.body.includes("Override refused"))
+    .every((reply) => reply.blocking), "selection command replies bypass batching");
   assert.ok(store.dueReplies().some((reply) => reply.body.includes("next session")));
   assert.ok(store.dueReplies().some((reply) => reply.body.includes("Override refused")));
   assert.equal(pass.handled.find((item) => item.command === "use" && !item.allowed)?.allowed, false);

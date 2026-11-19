@@ -154,14 +154,21 @@ test("a reply whose id cannot go in a marker fails instead of posting unmarked",
   assert.equal(posts(), 0);
 });
 
-test("ordinary comments batch after the gathering window while a blocking question skips it", async () => {
+test("ordinary comments batch while command replies skip an open window and question replies go out immediately", async () => {
   const { store, thread, send, github, advance } = fixture();
   store.enqueueReply({ id: "r1", threadId: thread, body: "first" });
   store.enqueueReply({ id: "r2", threadId: thread, body: "second" });
   assert.deepEqual(await send({ batchWindowMs: 10 * 60_000 }), { sent: [], found: [], failed: [] });
+
+  store.enqueueReply({ id: "selection-command-1", threadId: thread, body: "Effort set to high.", blocking: true });
+  assert.deepEqual((await send({ batchWindowMs: 10 * 60_000 })).sent, ["selection-command-1"]);
+  assert.equal(github.commentsOn(7).length, 1);
+  assert.match(github.commentsOn(7)[0]!["body"] as string, /Effort set to high/);
+  assert.doesNotMatch(github.commentsOn(7)[0]!["body"] as string, /first|second/);
+
   advance(10 * 60_000);
   assert.deepEqual((await send()).sent, ["r1", "r2"]);
-  assert.match(github.commentsOn(7)[0]!["body"] as string, /first[\s\S]*---[\s\S]*second/);
+  assert.match(github.commentsOn(7)[1]!["body"] as string, /first[\s\S]*---[\s\S]*second/);
 
   store.enqueueReply({ id: "q1", threadId: thread, body: "need a decision", blocking: true });
   assert.deepEqual((await send({ batchWindowMs: 10 * 60_000 })).sent, ["q1"]);

@@ -102,7 +102,7 @@ Borrowed from the prototype's domain and narrowed to what milestone 1 needs:
 | `ticket` | One unit of accepted work | `open → paused → open → ended`; carries its budget and what it has used |
 | `assignment` | A Ticket bound to one Worker session | Harness, model, native session ID, worktree, branch and machine; `pending → running → ended`; a Ticket may have several |
 | `subscription` | Ticket ↔ thread (many-to-many) | Fan-out without a new Decision; an accept subscribes its own thread, and the Worker's PR thread is subscribed automatically |
-| `outbox` | Writes owed to GitHub: comments, card edits, reactions, labels | Batched per thread (10-minute window, at most one new comment per 30 minutes; blocking questions skip the wait); each sent once, retried with backoff |
+| `outbox` | Writes owed to GitHub: comments, card edits, reactions, labels | Batched per thread (10-minute window, at most one new ordinary comment per 30 minutes; blocking questions and control-command replies skip the wait); each sent once, retried with backoff |
 
 ## Milestone 1
 
