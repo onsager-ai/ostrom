@@ -199,15 +199,20 @@ test("start comment effort override is recorded before the first Worker turn", a
   const s = setup();
   s.store().models.discovered("codex", [{ harness: "codex", id: "gpt-6-luna", displayName: "Luna", description: "", efforts: ["low", "medium", "high"], defaultEffort: "medium" }]);
   s.store().models.change({ action: "allow", harness: "codex", model: "gpt-6-luna" });
-  s.comment("@ostrom please take this issue.\n@ostrom effort high");
+  s.github.issue(9, false, { login: "alice", body: "@ostrom please take this issue.\n@ostrom effort high", at: new Date("2026-11-09T11:58:00Z") });
   await s.poll();
   const pass = await routeCandidates(s.options());
   const ticketId = pass.decisions[0]!.ticketId!;
+  assert.equal(s.store().ticketContext(ticketId).thread.number, 9);
   const assignment = s.store().latestAssignment(ticketId)!;
   const chosen = await chooseEffort({ store: s.store(), assignmentId: assignment.id, prompt: "first turn", kind: "dispatch", router, runners: { claude: s.runner, codex: s.runner }, signal: new AbortController().signal });
   assert.equal(chosen.effort, "high");
   assert.equal(s.store().selections.current(ticketId, "effort")?.source, "override");
-  assert.ok(s.store().dueReplies().some((reply) => reply.body.includes("Effort override: high")));
+  assert.equal(s.store().selections.current(ticketId, "effort")?.reason, "Effort override: high. Applies from this turn and holds until changed.");
+  const threadId = s.store().ticketContext(ticketId).thread.id;
+  assert.equal(s.store().dueReplies().some((reply) => reply.id.startsWith("selection-") && reply.body.includes("Effort override: high")), false);
+  assert.match(s.store().statusCardBody(threadId)!, /Selection: Effort override: high\. Applies from this turn and holds until changed\./);
+  assert.doesNotMatch(s.store().statusCardBody(threadId)!, /high from the next turn/);
 });
 
 test("invalid start comment model replies with refusal and keeps Router's model", async () => {

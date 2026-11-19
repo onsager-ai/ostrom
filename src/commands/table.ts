@@ -59,8 +59,8 @@ export const COMMANDS: readonly CommandDefinition[] = [
   },
   {
     name: "effort", sayOrDo: "`@ostrom effort <level>`",
-    effect: "Overrides effort from the next turn until changed",
-    whoMay: "Issue author, or repo triage or higher", acknowledgement: "Reply confirming the effort",
+    effect: "Overrides effort from the next turn until changed; in the comment that starts a ticket, applies from its first turn",
+    whoMay: "Issue author, or repo triage or higher", acknowledgement: "Reply confirming the effort, except the start comment uses the status card",
   },
   {
     name: "forbidden",
