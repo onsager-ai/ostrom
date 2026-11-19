@@ -123,10 +123,11 @@ for (const verdict of ["ignore", "accept", "error", "invalid"] as const) test(`a
   store.startNativeAssignment(assignment, "session-1");
   const activity = store.ticketActivityAt(ticket);
   const router = new FakeRunner();
-  if (verdict === "error") router.failAfterId = new Error("Router unavailable");
   const start = router.start.bind(router);
   router.start = (options) => {
     const session = start(options);
+    // Fail inside send after it records the prompt, so the error case checks the actual request too.
+    if (verdict === "error") session.failWith = new Error("Router unavailable");
     session.reply = () => verdict === "invalid" ? "not JSON" : JSON.stringify({ verdict });
     return session;
   };
