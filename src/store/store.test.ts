@@ -128,10 +128,11 @@ test("queued-turn migration preserves every prior state and supports honest canc
   assert.equal(db.prepare("PRAGMA foreign_key_check").get(), undefined);
 });
 
-test("conflict migration preserves version-32 queued turns and widens only their kind constraint", () => {
+for (const [version, kind] of [[32, "conflict"], [34, "ci_fix"]] as const) {
+test(`${kind} migration preserves version-${version} queued turns and widens only their kind constraint`, () => {
   const db = database({ enableForeignKeyConstraints: false });
   db.exec("CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL) STRICT");
-  for (const [index, sql] of migrations.slice(0, 32).entries()) {
+  for (const [index, sql] of migrations.slice(0, version).entries()) {
     db.exec(sql);
     db.prepare("INSERT INTO schema_version VALUES (?, ?)").run(index + 1, "2026-11-17T00:00:00Z");
   }
@@ -145,7 +146,7 @@ test("conflict migration preserves version-32 queued turns and widens only their
   const before = db.prepare("SELECT * FROM queued_turn ORDER BY delivery_key").all();
   const columns = db.prepare("PRAGMA table_info(queued_turn)").all();
   const index = db.prepare("SELECT sql FROM sqlite_schema WHERE name = 'queued_turn_unfinished'").get();
-  assert.throws(() => insert.run("conflict", "conflict", "queued", null, null, null), /CHECK constraint/);
+  assert.throws(() => insert.run(kind, kind, "queued", null, null, null), /CHECK constraint/);
   assert.equal(migrate(db), migrations.length);
   assert.deepEqual(db.prepare("SELECT * FROM queued_turn ORDER BY delivery_key").all(), before);
   assert.deepEqual(db.prepare("PRAGMA table_info(queued_turn)").all(), columns);
@@ -153,11 +154,12 @@ test("conflict migration preserves version-32 queued turns and widens only their
   const table = db.prepare("PRAGMA table_list('queued_turn')").get()!;
   assert.equal(table["strict"], 1);
   assert.equal(table["wr"], 1);
-  insert.run("conflict", "conflict", "queued", null, null, null);
+  insert.run(kind, kind, "queued", null, null, null);
   assert.throws(() => insert.run("unknown", "unknown", "queued", null, null, null), /CHECK constraint/);
-  assert.throws(() => insert.run("invalid-state", "conflict", "finished", null, null, null), /CHECK constraint/);
+  assert.throws(() => insert.run("invalid-state", kind, "finished", null, null, null), /CHECK constraint/);
   assert.equal(migrate(db), migrations.length);
 });
+}
 
 test("assignment terminal paths cancel queued prompts and finish started ones", () => {
   for (const terminal of ["endAssignment", "abandonAssignment", "endTicket", "failed outcome"] as const) {

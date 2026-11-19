@@ -34,8 +34,11 @@ export class FakeGitHub {
   #ids = 1000;
   readonly #now: () => Date;
 
-  constructor(now: () => Date, readonly repo = "onsager-ai/ostrom") {
+  readonly repo: string;
+
+  constructor(now: () => Date, repo = "onsager-ai/ostrom") {
     this.#now = now;
+    this.repo = repo;
   }
 
   issue(number: number, pr = false, input: IssueInput = {}): void {
