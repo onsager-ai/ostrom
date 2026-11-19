@@ -17,6 +17,7 @@ import { join } from "node:path";
 
 import { allowedModels, overrideSelection, recordModelChoice } from "./selection.ts";
 import { parseSelectionCommands } from "../commands/parser.ts";
+import { excerptThreadBody, type ThreadContext } from "./thread-context.ts";
 import { queueStatusCard } from "../github/cards.ts";
 import { readyPolicySentence, type MergePolicy } from "../github/merge-policy.ts";
 import { ghGet, type GhRunner } from "../github/gh.ts";
@@ -42,11 +43,8 @@ export interface CandidateView {
   truncated: boolean;
 }
 
-export interface ThreadView {
+export interface ThreadView extends ThreadContext {
   thread: number;
-  kind: "issue" | "pull_request";
-  number: number;
-  url: string;
   candidates: CandidateView[];
 }
 
@@ -245,7 +243,8 @@ async function candidateThreads(options: RouteOptions): Promise<ThreadView[]> {
     let view = byThread.get(trigger.threadId);
     if (view === undefined) {
       const thread = options.store.getThread(trigger.threadId);
-      view = { thread: thread.id, kind: thread.kind, number: thread.number, url: thread.url, candidates: [] };
+      const metadata = await fetchThreadMetadata(options.gh, options.repo, thread.number);
+      view = { thread: thread.id, kind: thread.kind, number: thread.number, url: thread.url, ...metadata, candidates: [] };
       byThread.set(thread.id, view);
     }
     const body = trigger.kind === "issue_state" ? (trigger.body ?? "") : await fetchBody(options.gh, options.repo, trigger, view.number);
@@ -260,6 +259,14 @@ async function candidateThreads(options: RouteOptions): Promise<ThreadView[]> {
     });
   }
   return [...byThread.values()];
+}
+
+/** Fetch issue or PR context once for each Router thread view. */
+async function fetchThreadMetadata(gh: GhRunner, repo: string, number: number): Promise<Pick<ThreadView, "title" | "bodyExcerpt" | "bodyTruncated">> {
+  const item = await ghGet(gh, `repos/${repo}/issues/${number}`) as { title?: unknown; body?: unknown } | null;
+  const title = typeof item?.title === "string" ? item.title : "";
+  const body = typeof item?.body === "string" ? item.body : "";
+  return { title, ...excerptThreadBody(body) };
 }
 
 /** The REST path of the issue, comment or review a trigger's URL points to. */

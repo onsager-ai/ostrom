@@ -71,11 +71,13 @@ test("effort choices validate the subset, record inputs/reasons, and durable ove
   store.models.change({ action: "set", harness: "codex", model: "cheap", efforts: ["low", "medium"] });
   const calls: string[] = [];
   const runner = router('{"effort":"high","reason":"Not allowed"}', calls);
-  const options = { store, assignmentId: id, kind: "conflict", prompt: "Resolve the conflict", router: { harness: "codex" as const, model: "router" }, runners: { codex: runner, claude: runner }, signal: new AbortController().signal };
+  const options = { store, assignmentId: id, kind: "conflict", prompt: "Resolve the conflict", router: { harness: "codex" as const, model: "router" }, runners: { codex: runner, claude: runner }, signal: new AbortController().signal, threadContext: { kind: "issue" as const, number: 1, url: "https://example.test/issues/1", title: "Issue title", bodyExcerpt: "Bounded body", bodyTruncated: false } };
   const fallback = await chooseEffort(options);
   assert.equal(fallback.effort, "medium");
   assert.match(fallback.reason, /invalid effort answer/);
   assert.match(store.selections.history(ticket).at(-1)!.input, /Resolve the conflict/);
+  assert.match(store.selections.history(ticket).at(-1)!.input, /Issue title/);
+  assert.match(calls[0]!, /Bounded body/);
   overrideSelection(store, ticket, "effort", "low");
   assert.equal((await chooseEffort(options)).effort, "low");
   assert.equal(calls.length, 1);
