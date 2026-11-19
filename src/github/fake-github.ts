@@ -21,8 +21,8 @@ export class FakeGitHub {
   readonly reviews = new Map<number, Item[]>();
   readonly issueEvents = new Map<number, Item[]>();
   readonly permissions = new Map<string, string>();
-  /** Pull requests served by `pulls?head=`: head branch, number, state. */
-  readonly pulls: { branch: string; number: number; state: "open" | "closed" | "merged" }[] = [];
+  /** Pull requests served by `pulls?head=`: head branch, number, state and body. */
+  readonly pulls: { branch: string; number: number; state: "open" | "closed" | "merged"; body?: string }[] = [];
   readonly calls: string[][] = [];
   /** Throw this from the next call whose argv matches. */
   failWhen: ((args: readonly string[]) => Error | undefined) | undefined;
@@ -179,6 +179,7 @@ export class FakeGitHub {
         .map((pull) => ({
           number: pull.number,
           html_url: this.#threadUrl(pull.number, true),
+          body: pull.body ?? "",
           state: pull.state === "open" ? "open" : "closed",
           merged_at: pull.state === "merged" ? "2026-11-09T12:00:00Z" : null,
         }));
@@ -215,8 +216,15 @@ export class FakeGitHub {
   }
 
   #patch(path: string, rest: string[]): Item {
+    const pull = path.match(new RegExp(`^repos/${this.repo}/pulls/(\\d+)$`));
     const match = path.match(new RegExp(`^repos/${this.repo}/issues/comments/(\\d+)$`));
     const [flag, field] = rest;
+    if (pull && flag === "-f" && field?.startsWith("body=")) {
+      const pr = this.pulls.find((item) => item.number === Number(pull[1]));
+      if (pr === undefined) throw new Error("gh api failed: gh: Not Found (HTTP 404)");
+      pr.body = field.slice("body=".length);
+      return { number: pr.number, body: pr.body };
+    }
     if (!match || flag !== "-f" || !field?.startsWith("body=")) throw new Error(`fake gh: PATCH ${path}`);
     const comment = this.issueComments.find((item) => item["id"] === Number(match[1]));
     if (comment === undefined) throw new Error("gh api failed: gh: Not Found (HTTP 404)");

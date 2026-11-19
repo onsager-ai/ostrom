@@ -6,7 +6,7 @@ import { after, afterEach, test } from "node:test";
 
 import { FakeGitHub } from "../github/fake-github.ts";
 import { Store } from "../store/store.ts";
-import { observe, pullRequestsForBranch, workerBrief } from "./dispatch.ts";
+import { observe, pullRequestsForBranch, workerBrief, workerPullRequestBody } from "./dispatch.ts";
 
 const REPO = "onsager-ai/ostrom";
 const stores: Store[] = [];
@@ -77,14 +77,42 @@ test("the machine's house rules close the brief when configured, and are absent 
   assert.doesNotMatch(workerBrief(context, "b", "main"), /House rules/);
 });
 
+test("PR body normalization replaces literal newlines, adds one close line and removes duplicate close lines", () => {
+  assert.equal(workerPullRequestBody("Summary.\\n\\nRefs #7", 7), "Summary.\n\nRefs #7\nCloses #7");
+  assert.equal(workerPullRequestBody("Summary", 7), "Summary\nCloses #7");
+  assert.equal(workerPullRequestBody("Closes #7\nDetails\nCloses #7", 7), "Closes #7\nDetails");
+  assert.equal(workerPullRequestBody("Summary\nCloses #7", 7), "Summary\nCloses #7");
+});
+
 test("a branch's pull requests are read from GitHub with their state", async () => {
   const { github } = fixture();
   github.pulls.push({ branch: "ostrom/ticket-1-1", number: 12, state: "open" }, { branch: "ostrom/ticket-1-1", number: 11, state: "merged" },
     { branch: "ostrom/ticket-1-1", number: 13, state: "closed" }, { branch: "other", number: 14, state: "open" });
   assert.deepEqual(
-    (await pullRequestsForBranch(github.gh, REPO, "ostrom/ticket-1-1")).map((p) => [p.number, p.state]),
-    [[11, "merged"], [12, "open"], [13, "closed"]],
+    (await pullRequestsForBranch(github.gh, REPO, "ostrom/ticket-1-1")).map((p) => [p.number, p.state, p.body]),
+    [[11, "merged", ""], [12, "open", ""], [13, "closed", ""]],
   );
+});
+
+test("observe leaves a correct ticket PR body untouched", async () => {
+  const { store, github, ticketId, worker } = fixture();
+  const id = worker("sess-1");
+  github.pulls.push({ branch: `ostrom/ticket-${ticketId}-${id}`, number: 12, state: "open", body: "Summary\\nCloses #7" });
+  await observe(store, github.gh, REPO);
+  assert.equal(github.pulls[0]!.body, "Summary\\nCloses #7");
+  assert.equal(github.calls.some((call) => call[1] === "--method" && call[2] === "PATCH"), false);
+});
+
+test("observe repairs a ticket PR body once", async () => {
+  const { store, github, ticketId, worker } = fixture();
+  const id = worker("sess-1");
+  const branch = `ostrom/ticket-${ticketId}-${id}`;
+  github.pulls.push({ branch, number: 12, state: "open", body: "Summary.\\n\\nRefs #7\\nCloses #7\\nCloses #7" });
+  await observe(store, github.gh, REPO);
+  assert.equal(github.pulls[0]!.body, "Summary.\n\nRefs #7\nCloses #7");
+  assert.equal(github.calls.filter((call) => call[1] === "--method" && call[2] === "PATCH").length, 1);
+  await observe(store, github.gh, REPO);
+  assert.equal(github.calls.filter((call) => call[1] === "--method" && call[2] === "PATCH").length, 1);
 });
 
 test("observe subscribes the ticket to the Worker's PRs, once across passes", async () => {

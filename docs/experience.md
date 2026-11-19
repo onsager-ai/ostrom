@@ -34,7 +34,7 @@ An issue author or reviewer, who never sees Ostrom's internals.
 
 1. Opens an issue that mentions Ostrom, or mentions Ostrom in a comment on a thread without an active ticket. On a thread Ostrom already works on, later comments continue to reach the Worker without a mention.
 2. Within minutes Ostrom replies with "taking this" or "not for me, because …".
-3. A PR appears, linked to the issue.
+3. A PR appears, linked to the issue. Ostrom checks its description and, for tickets started from an issue, fixes literal `\n` sequences and ensures exactly one `Closes #<issue>` line.
 4. Their later comments and reviews reach the **same** Worker, through thread subscription.
 5. The Worker revises; Ostrom merges unattended by default, or waits for a human under the
    repository's policy. The proposed milestone-2 conditions and policy options are in
