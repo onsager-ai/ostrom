@@ -46,6 +46,23 @@ export interface BranchPullRequest {
   number: number;
   url: string;
   state: PullRequestState;
+  body?: string;
+}
+
+/** Normalize only the ticket's closing line; unrelated body content is preserved. */
+export function workerPullRequestBody(body: string, issueNumber: number): string {
+  const closeLine = `Closes #${issueNumber}`;
+  const normalized = body.replaceAll("\\n", "\n");
+  const lines = normalized.split("\n");
+  let found = false;
+  const result = lines.filter((line) => {
+    if (line.trim() !== closeLine) return true;
+    if (found) return false;
+    found = true;
+    return true;
+  });
+  if (!found) result.push(closeLine);
+  return result.join("\n");
 }
 
 /** The pull requests on `repo` whose head is `branch`, in any state, by number. */
@@ -59,7 +76,7 @@ export async function pullRequestsForBranch(gh: GhRunner, repo: string, branch: 
         throw new Error(`gh pulls for ${branch}: unexpected item ${JSON.stringify(item)}`);
       }
       const state: PullRequestState = item["merged_at"] != null ? "merged" : item["state"] === "closed" ? "closed" : "open";
-      return { number: item["number"], url: item["html_url"], state };
+      return { number: item["number"], url: item["html_url"], state, ...(typeof item["body"] === "string" ? { body: item["body"] } : item["body"] === null ? { body: "" } : {}) };
     })
     .sort((a, b) => a.number - b.number);
 }
@@ -107,7 +124,19 @@ export async function observe(store: Store, gh: GhRunner, repo: string): Promise
       continue;
     }
     const newlySubscribed: number[] = [];
+    const ticketThread = store.ticketContext(assignment.ticketId).thread;
     for (const pr of pullRequests) {
+      if (ticketThread.kind === "issue" && pr.body !== undefined) {
+        const body = workerPullRequestBody(pr.body, ticketThread.number);
+        if (body !== pr.body) {
+          try {
+            await gh(["api", "--method", "PATCH", `repos/${repo}/pulls/${pr.number}`, "-f", `body=${body}`]);
+          } catch (error) {
+            pass.failed.push({ assignmentId: assignment.id, error: `PR #${pr.number} body: ${error instanceof Error ? error.message : String(error)}` });
+            continue;
+          }
+        }
+      }
       const threadId = store.ensureThread({ sourceId: source.id, kind: "pull_request", number: pr.number, url: pr.url });
       if (!store.subscribe(assignment.ticketId, threadId).duplicate) newlySubscribed.push(pr.number);
     }
