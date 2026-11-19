@@ -6,7 +6,7 @@ import type { MergeCandidate, Store } from "../store/store.ts";
 import { queueStatusCard } from "./cards.ts";
 import { ghMergeGet, ghSquashMerge, type GhRunner } from "./gh.ts";
 import { mergeEligibility, readyPolicySentence, type ApprovalIdentity, type MergePolicy } from "./merge-policy.ts";
-import { failedRequiredChecks, readMergeEvidence, type MergeEvidence } from "./merge-reader.ts";
+import { failedChecks, readMergeEvidence, type MergeEvidence } from "./merge-reader.ts";
 
 const QUIET_MS = 10 * 60_000;
 const RETRY_MS = 30_000;
@@ -171,12 +171,12 @@ function automaticTurnAllowed(options: MergePassOptions, assignmentId: number, o
 }
 
 function deliverCiFixTurn(options: MergePassOptions, assignmentId: number, observation: Observation): void {
-  const failures = failedRequiredChecks(observation.evidence);
+  const failures = failedChecks(observation.evidence);
   if (failures.length === 0 || !automaticTurnAllowed(options, assignmentId, observation)) return;
   const { pr } = observation.evidence;
   const checks = failures.map((check) => `- ${check.name}: ${check.url ?? `https://github.com/${options.repo}/pull/${pr.number}/checks`}`).join("\n");
   options.workers.deliver(assignmentId, `ci-fix-a${assignmentId}-${pr.head.sha}`,
-    `Required CI checks failed on pull request #${pr.number} at head ${pr.head.sha}:\n${checks}\n\n` +
+    `CI checks failed on pull request #${pr.number} at head ${pr.head.sha}:\n${checks}\n\n` +
     `Read the linked runs/logs and compare these failures with the current ${pr.base.ref} head before changing code. ` +
     "If the same check fails on the base branch, report that evidence so you do not chase a failure this PR did not cause. " +
     `Check the current PR head before acting; fix the failures that still apply, then commit and push to the existing PR branch ${pr.head.ref}. Do not open a new PR.`,

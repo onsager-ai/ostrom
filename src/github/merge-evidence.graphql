@@ -41,12 +41,10 @@ query MergeEvidence(
                   __typename
                   ... on CheckRun {
                     databaseId name status conclusion detailsUrl
-                    isRequired(pullRequestNumber: $number)
                     checkSuite { databaseId status conclusion app { databaseId slug name } }
                   }
                   ... on StatusContext {
                     context state targetUrl
-                    isRequired(pullRequestNumber: $number)
                     creator { __typename login ... on User { id } ... on Bot { id } }
                   }
                 }

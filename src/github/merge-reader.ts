@@ -134,15 +134,15 @@ export async function readMergeEvidence(gh: GhRunner, repo: string, prNumber: nu
   return { pr: decoded, rollup, threads, reviews, rest: { pull, repository: object(repository), protection, rules } };
 }
 
-export interface FailedRequiredCheck { name: string; url: string | null; }
+export interface FailedCheck { name: string; url: string | null; }
 
-/** Only explicit failures on the current PR head can wake a Worker; pending checks wait. */
-export function failedRequiredChecks(evidence: MergeEvidence): FailedRequiredCheck[] {
+/** Only explicit failures on the current PR head can wake a Worker; pending checks wait. Any failure
+ * counts, because the merge needs the whole rollup to succeed, not only protection-required checks. */
+export function failedChecks(evidence: MergeEvidence): FailedCheck[] {
   if (evidence.rollup === null || evidence.rollup.oid !== evidence.pr.head.sha) return [];
-  const failed: FailedRequiredCheck[] = [];
+  const failed: FailedCheck[] = [];
   for (const value of evidence.rollup.contexts) {
     const check = object(value);
-    if (check["isRequired"] !== true) continue;
     if (check["__typename"] === "CheckRun" && check["status"] === "COMPLETED" &&
         ["FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE"].includes(String(check["conclusion"]))) {
       failed.push({ name: string(check, "name"), url: typeof check["detailsUrl"] === "string" ? check["detailsUrl"] : null });

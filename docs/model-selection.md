@@ -21,7 +21,7 @@ PR 1 implementation (effort and turn records):
 - Every Worker invocation records requested and observed model/effort, kind, usage and status in
   `turn`; `ostrom show` includes these records. Existing source kinds distinguish dispatch, review,
   redirect, control, ordinary follow-up, budget pause, stuck handling, recovery, conflict and CI fix.
-  The merge pass queues a `ci_fix` turn when a required check fails on the current PR head, once per
+  The merge pass queues a `ci_fix` turn when a check fails on the current PR head (any check, since the merge needs the whole rollup to pass), once per
   assignment and head SHA, including across restarts. It waits while any work for that ticket is
   running or queued, and skips paused, stopping, ended, stalled or exhausted tickets. The prompt
   includes failed check names and run/log links and asks the Worker to compare them with the current

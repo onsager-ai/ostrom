@@ -266,12 +266,12 @@ async function ciFixture() {
   github.mergePulls.set(2, { pull, evidence });
   const commit = evidence.commits.nodes[0].commit;
   const check = commit.statusCheckRollup.contexts.nodes[0];
-  Object.assign(check, { isRequired: true, conclusion: "FAILURE", detailsUrl: "https://github.com/o/r/actions/runs/3/job/4" });
+  Object.assign(check, { conclusion: "FAILURE", detailsUrl: "https://github.com/o/r/actions/runs/3/job/4" });
   const options = () => ({ ...f.options(), gh: github.gh });
   return { ...f, github, evidence, commit, check, options };
 }
 
-test("failed required CI wakes once per head, including after completion; passing CI never wakes", async () => {
+test("failed CI wakes once per head, including after completion; passing CI never wakes", async () => {
   const f = await ciFixture();
   try {
     assert.deepEqual((await mergePass(f.options())).failed, []);
@@ -300,7 +300,7 @@ test("failed required CI wakes once per head, including after completion; passin
   } finally { f.store.close(); }
 });
 
-test("CI wakes respect controls, idle work, ownership, and current required failures", async () => {
+test("CI wakes respect controls, idle work, ownership, and current failures", async () => {
   const blockers: Record<string, (f: Awaited<ReturnType<typeof ciFixture>>) => void> = {
     paused: (f) => f.store.pauseTicket(f.ticket, "operator"),
     ended: (f) => f.store.endTicket(f.ticket),
@@ -310,7 +310,6 @@ test("CI wakes respect controls, idle work, ownership, and current required fail
     stalled: (f) => { f.store.recordStall({ assignmentId: f.assignment, semonReason: "idle", detail: null }); },
     closed: (f) => f.github.close(1, f.now()),
     ownership: (f) => { f.evidence.headRefName = "other"; },
-    optional: (f) => { f.check.isRequired = false; },
     pending: (f) => { f.check.status = "IN_PROGRESS"; },
     staleHead: (f) => { f.commit.oid = "old-head"; },
   };
@@ -329,10 +328,10 @@ test("CI wakes respect controls, idle work, ownership, and current required fail
   } finally { f.store.close(); }
 });
 
-test("failed required legacy statuses carry their log link", async () => {
+test("failed legacy statuses carry their log link", async () => {
   const f = await ciFixture();
   try {
-    f.commit.statusCheckRollup.contexts.nodes = [{ __typename: "StatusContext", context: "external", state: "ERROR", isRequired: true, targetUrl: "https://ci.example/run/7" }];
+    f.commit.statusCheckRollup.contexts.nodes = [{ __typename: "StatusContext", context: "external", state: "ERROR", targetUrl: "https://ci.example/run/7" }];
     assert.deepEqual((await mergePass(f.options())).failed, []);
     assert.match(f.deliveries[0]!.prompt, /external: https:\/\/ci.example\/run\/7/);
   } finally { f.store.close(); }
