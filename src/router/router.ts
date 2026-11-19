@@ -221,7 +221,7 @@ export async function routeCandidates(options: RouteOptions): Promise<RoutePassR
   for (const { key, reply } of answer.outcomes) {
     const outcome = outcomes.get(key)!;
     const { ticketEnded } = store.enqueueOutcomeReply(
-      { id: key, threadId: outcome.thread, body: outcome.event === "pr_opened" ? `${reply}\n\n${readyPolicySentence(options.mergePolicy ?? { strategy: "unattended" })}` : reply },
+      { id: key, threadId: outcome.thread, body: outcome.event === "pr_opened" ? `${reply}\n\n${readyPolicySentence(options.mergePolicy ?? { strategy: "unattended" })}` : reply, blocking: true },
       outcome.terminal ? { assignmentId: outcome.assignmentId } : undefined,
     );
     if (outcome.event === "pr_opened") store.trackReadyReply(outcome.assignmentId, key);

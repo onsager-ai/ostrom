@@ -54,7 +54,8 @@ Ostrom edits silently and posts a new comment only when someone needs to act.
   stuck, and done or stopped.
 - **The outbox batches, in code.** It gathers ordinary events per thread over a window (10 minutes
   to start) and sends them as one comment. A thread gets at most one new ordinary comment per 30
-  minutes. A blocking question or a reply confirming a control command goes out at once.
+  minutes. Blocking questions, control-command replies, and Worker turn results go out at once, so
+  an earlier turn's result cannot arrive after a later turn has started.
 - **One reply per review**, never one per review comment. Ostrom replies inline only where it
   disagrees or asks a question. Worker final messages are public replies for PR reviewers; the
   outbox rewrites host paths to repository-relative text or links at the known PR head, and Ostrom
@@ -119,7 +120,7 @@ Decided by the operator on 2026-11-09:
 - The operator gets a 30-minute grace window before the public stuck reply. This comes in
   milestone 2; until then, the stuck reply goes out when the operator step is reached.
 - Batching defaults: a 10-minute gathering window, and at most one new comment per thread per 30
-  minutes. A blocking question skips the wait.
+  minutes. Blocking questions, control-command replies, and Worker turn results skip the wait.
 
 ## Journey 2: the operator
 

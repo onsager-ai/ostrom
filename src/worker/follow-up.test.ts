@@ -222,10 +222,9 @@ test("recovery folds newer reviews into the interrupted prompt and finishes thei
   resumed.release();
   await restarted.drain();
   assert.deepEqual(store.unfinishedTurns(1), []);
-  assert.deepEqual(
-    store.dueReplies().filter((reply) => reply.id.startsWith("review-")).map((reply) => reply.id).sort(),
-    ["review-1-44", "review-1-45"],
-  );
+  const results = store.dueReplies().filter((reply) => reply.id.startsWith("review-")).sort((a, b) => a.id.localeCompare(b.id));
+  assert.deepEqual(results.map((reply) => reply.id), ["review-1-44", "review-1-45"]);
+  assert.ok(results.every((reply) => reply.blocking), "recovery results include folded feedback and bypass batching");
 });
 
 test("interrupting recovery again preserves both review replies and prompts", async () => {
@@ -258,10 +257,9 @@ test("interrupting recovery again preserves both review replies and prompts", as
   assert.ok(prompts[0]!.indexOf("Earlier review.") > 0);
   assert.ok(prompts[0]!.indexOf("Newer review.") > prompts[0]!.indexOf("Earlier review."));
   assert.deepEqual(store.unfinishedTurns(1), []);
-  assert.deepEqual(
-    store.dueReplies().filter((reply) => reply.id.startsWith("review-")).map((reply) => reply.id).sort(),
-    ["review-1-44", "review-1-45"],
-  );
+  const results = store.dueReplies().filter((reply) => reply.id.startsWith("review-")).sort((a, b) => a.id.localeCompare(b.id));
+  assert.deepEqual(results.map((reply) => reply.id), ["review-1-44", "review-1-45"]);
+  assert.ok(results.every((reply) => reply.blocking), "recovery results include folded feedback and bypass batching");
 });
 
 test("the follow-up is a summary plus a pointer to the trigger", () => {
@@ -301,10 +299,10 @@ test("a replayed pass sends nothing twice", async () => {
 });
 
 test("follow-ups queue behind a running turn, one at a time, and are never queued twice", async () => {
-  const { store, runner, workers, pr, trigger } = fixture();
+  const { store, runner, workers, pr, trigger, assignmentId } = fixture();
   runner.hold = true;
-  const first = trigger(pr);
-  const second = trigger(pr);
+  const first = trigger(pr, "pull_request_review", { reviewId: "R1" });
+  const second = trigger(pr, "pull_request_review", { reviewId: "R2" });
   assert.equal(routeFollowUps(store, workers).queued.length, 2);
   await tick();
   const session = runner.sessions[0]!;
@@ -316,6 +314,9 @@ test("follow-ups queue behind a running turn, one at a time, and are never queue
   await tick();
   assert.equal(session.prompts.length, 2);
   assert.deepEqual(store.pendingDeliveries(), []);
+  const firstResult = store.dueReplies().find((reply) => reply.id === `review-${assignmentId}-R1`);
+  assert.equal(firstResult?.body, "ok", "the first review's result was enqueued before the next turn started");
+  assert.equal(firstResult?.blocking, true, "the first review's result bypasses batching");
   session.release();
   await workers.drain();
   assert.equal(session.maxRunning, 1);

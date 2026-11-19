@@ -66,6 +66,7 @@ export function routeFollowUps(store: Store, workers: Workers, allowlist: readon
             id: `review-${assignmentId}-${trigger.reviewId}`,
             threadId: trigger.threadId,
             body: renderReviewReply(result.text),
+            blocking: true,
           });
         },
         "review",

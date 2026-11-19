@@ -154,7 +154,7 @@ test("a reply whose id cannot go in a marker fails instead of posting unmarked",
   assert.equal(posts(), 0);
 });
 
-test("ordinary comments batch while command replies skip an open window and question replies go out immediately", async () => {
+test("ordinary comments batch while command, question, and turn result replies skip an open window", async () => {
   const { store, thread, send, github, advance } = fixture();
   store.enqueueReply({ id: "r1", threadId: thread, body: "first" });
   store.enqueueReply({ id: "r2", threadId: thread, body: "second" });
@@ -174,6 +174,17 @@ test("ordinary comments batch while command replies skip an open window and ques
   assert.deepEqual((await send({ batchWindowMs: 10 * 60_000 })).sent, ["q1"]);
 });
 
+test("a Worker turn result is due immediately while ordinary comments still wait", async () => {
+  const { store, thread, send } = fixture();
+  store.enqueueReply({ id: "progress", threadId: thread, body: "Still working." });
+  store.enqueueReply({ id: "review-1-R1", threadId: thread, body: "Completed the review.", blocking: true });
+
+  assert.deepEqual((await send({ batchWindowMs: 10 * 60_000 })).sent, ["review-1-R1"]);
+  const pending = store.pendingReplies();
+  assert.deepEqual(pending.map((reply) => reply.id), ["progress"]);
+  assert.equal(pending[0]!.nextAttemptAt, new Date(T0 + 10 * 60_000).toISOString());
+});
+
 test("a ready reply is timestamped only after GitHub confirms delivery", async () => {
   const { store, thread, send } = fixture();
   const source = store.ensureSource("github", "onsager-ai/ostrom");
@@ -185,7 +196,7 @@ test("a ready reply is timestamped only after GitHub confirms delivery", async (
   const assignment = store.createAssignment(ticket);
   store.configureNativeAssignment(assignment, { harness: "codex", model: "m", worktree: "/w", branch: "b", machine: "h" });
   store.startNativeAssignment(assignment, "s");
-  store.enqueueReply({ id: "outcome-a1-pr12-opened", threadId: thread, body: "Ready." });
+  store.enqueueReply({ id: "outcome-a1-pr12-opened", threadId: thread, body: "Ready.", blocking: true });
   store.trackReadyReply(assignment, "outcome-a1-pr12-opened");
   assert.equal(store.readyReplySentAt(assignment), null);
   await send();
