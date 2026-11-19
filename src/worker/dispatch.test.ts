@@ -74,8 +74,12 @@ test("the brief tells an unattended Worker never to block on a question or work 
 test("the machine's house rules close the brief when configured, and are absent otherwise", () => {
   const { store, ticketId } = fixture();
   const context = store.ticketContext(ticketId);
-  assert.match(workerBrief(context, "b", "main", "Run tests in CI only."), /House rules for this machine, which you must follow:\nRun tests in CI only\.$/);
-  assert.doesNotMatch(workerBrief(context, "b", "main"), /House rules/);
+  const withRules = workerBrief(context, "b", "main", "Run tests in CI only.");
+  assert.match(withRules, /House rules for this machine, which you must follow:\nRun tests in CI only\./);
+  assert.match(withRules, /If the work needs a change a repository or house rule forbids, say so in the pull request description when you push it: name the rule, the files, and why the change is needed, so the reviewer can decide\.$/);
+  const withoutRules = workerBrief(context, "b", "main");
+  assert.doesNotMatch(withoutRules, /House rules/);
+  assert.doesNotMatch(withoutRules, /repository or house rule forbids/);
 });
 
 test("PR body normalization replaces literal newlines, adds one close line and removes duplicate close lines", () => {
