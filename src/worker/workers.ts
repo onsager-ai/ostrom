@@ -115,6 +115,7 @@ export class Workers {
         cwd: path,
         model: selected.model,
         writableDirs: gitDirs(config.repo, path),
+        onActivity: () => store.recordWorkerActivity(id),
         onSessionId: (sessionId) => {
           store.startNativeAssignment(id, sessionId);
           this.#annotate(id, sessionId, null, null);
@@ -195,7 +196,7 @@ export class Workers {
     const { store } = this.#deps;
     const pass = { resumed: [] as number[], interrupted: [] as number[], abandoned: [] as number[] };
     for (const pending of store.pendingAssignments()) {
-      store.finishWorkerTurn(pending.id, "interrupted", null, undefined, "ostromd stopped before the session started");
+      store.interruptRecoveredTurn(pending.id, "ostromd stopped before the session started");
       store.abandonAssignment(pending.id, "ostromd stopped before the session started");
       pass.abandoned.push(pending.id);
     }
@@ -208,7 +209,7 @@ export class Workers {
         const reviews = store.reviewDeliveries(assignment.id, turnId);
         const interrupted = store.unfinishedTurns(assignment.id).filter((turn) => turn.state === "running");
         const prompt = [INTERRUPTED_PROMPT, ...interrupted.map((turn) => turn.prompt)].join("\n\n");
-        store.finishWorkerTurn(assignment.id, "interrupted", null, undefined, "ostromd stopped during the turn");
+        store.interruptRecoveredTurn(assignment.id, "ostromd stopped during the turn");
         store.recordInterruption(assignment.id);
         store.finishRunningTurns(assignment.id);
         store.endTurn(assignment.id, null);
@@ -243,6 +244,7 @@ export class Workers {
         cwd: assignment.worktree!,
         model: assignment.model!,
         sessionId: assignment.sessionId!,
+        onActivity: () => this.#deps.store.recordWorkerActivity(assignment.id),
         writableDirs: gitDirs(this.#deps.config.repo, assignment.worktree!),
       });
       this.#sessions.set(assignment.id, session);

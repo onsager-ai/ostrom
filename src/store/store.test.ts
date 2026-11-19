@@ -527,6 +527,29 @@ test("turn records retain requests, observations and failures without copying tr
   assert.ok(turns.every((turn) => turn.endedAt !== null));
 });
 
+test("recovery charges the last observed activity, excluding daemon downtime", () => {
+  for (const activityMinutes of [0, 5]) {
+    const { store, accept, advance } = fixture();
+    const ticketId = accept();
+    const id = store.createAssignment(ticketId);
+    store.configureNativeAssignment(id, { harness: "codex", model: "m", worktree: "/w", branch: "b", machine: "h" });
+    store.startNativeAssignment(id, "session");
+    store.recordWorkerActivity(id); // activity from before this turn must not extend it
+    advance(60_000);
+    store.beginTurn(id);
+    store.startWorkerTurn(id, "dispatch");
+    advance(activityMinutes * 60_000);
+    if (activityMinutes > 0) store.recordWorkerActivity(id);
+    advance((60 - activityMinutes) * 60_000);
+    store.interruptRecoveredTurn(id, "daemon stopped");
+    store.endTurn(id, null);
+    const turn = store.ticketTurns(ticketId)[0]!;
+    assert.equal(turn.status, "interrupted");
+    assert.equal(Date.parse(turn.endedAt!) - Date.parse(turn.startedAt), activityMinutes * 60_000);
+    assert.equal(store.ticketBudget(ticketId).completedTurnSeconds, activityMinutes * 60);
+  }
+});
+
 test("a ticket budget persists limits and sums every assignment's turn usage", () => {
   const { store, accept, advance } = fixture();
   const ticketId = accept();

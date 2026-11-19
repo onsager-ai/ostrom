@@ -20,7 +20,9 @@ logs to the user journal. Inspect it with `journalctl --user -u ostromd`.
 
 The per-ticket time budget counts time spent in Worker turns, including completed turns and any
 currently running turn. Time waiting between turns, such as for review or an operator answer, does
-not consume it; the idle budget applies only while a turn is running.
+not consume it; the idle budget applies only while a turn is running. After a crash, a recovered
+turn ends at its last recorded session activity (or its start if no later activity was observed),
+so daemon downtime does not consume the time budget.
 
 The operator uses `ostrom status`, `tickets`, `show`, `pause`, `resume`, `stop`,
 `extend`, and `preview`. Run `ostrom dashboard` to open the read-only local dashboard while

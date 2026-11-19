@@ -976,6 +976,20 @@ export class Store {
     );
   }
 
+  /** Session events are activity evidence; recovery must never charge daemon downtime. */
+  recordWorkerActivity(assignmentId: number): void {
+    this.#run("UPDATE assignment SET last_activity_at = ? WHERE id = ?", this.#stamp(), assignmentId);
+  }
+
+  interruptRecoveredTurn(assignmentId: number, reason: string): void {
+    this.#run(
+      `UPDATE turn SET ended_at = MAX(started_at, COALESCE(
+         (SELECT last_activity_at FROM assignment WHERE id = ?), started_at)),
+       status = 'interrupted', result = ? WHERE assignment_id = ? AND status = 'running'`,
+      assignmentId, reason, assignmentId,
+    );
+  }
+
   modelOutcomes(repository?: string): ModelOutcome[] {
     return modelOutcomes(this.#db, repository);
   }
