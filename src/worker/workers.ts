@@ -11,6 +11,7 @@ import { ghGet, type GhRunner } from "../github/gh.ts";
 import { renderReviewReply } from "../github/review-reply.ts";
 import { parseStuckReply, renderStuckReply } from "../watchdog/stuck.ts";
 import { chooseEffort, sessionModel } from "../router/selection.ts";
+import type { ThreadContext } from "../router/thread-context.ts";
 import type { RouterConfig, WorkerConfig } from "../ostromd/config.ts";
 import { rolloutContext } from "../session/rollout.ts";
 import type { Runner, Session, TurnResult } from "../session/runner.ts";
@@ -36,6 +37,8 @@ export interface WorkersDeps {
   /** GitHub access is needed only to restore stop cleanup after a daemon restart. */
   gh?: GhRunner;
   repo?: string;
+  /** Fresh issue or PR context for per-turn effort choices. */
+  threadContext?: (ticketId: number) => Promise<ThreadContext | undefined>;
 }
 
 /** The writable Git metadata for a linked worktree's ordinary commits. */
@@ -444,7 +447,10 @@ export class Workers {
 
   #effort(id: number, kind: string, prompt: string, signal: AbortSignal) {
     if (!this.#deps.router) return Promise.resolve({ effort: null, reason: "Harness default effort (no Router configured)." });
-    return chooseEffort({ store: this.#deps.store, assignmentId: id, kind, prompt, signal, router: this.#deps.router, runners: this.#deps.runners });
+    const options = { store: this.#deps.store, assignmentId: id, kind, prompt, signal, router: this.#deps.router, runners: this.#deps.runners };
+    if (!this.#deps.threadContext) return chooseEffort(options);
+    return this.#deps.threadContext(this.#deps.store.getAssignment(id).ticketId).then((threadContext) =>
+      chooseEffort({ ...options, ...(threadContext === undefined ? {} : { threadContext }) }));
   }
 
   #failed(id: number, error: unknown): void {

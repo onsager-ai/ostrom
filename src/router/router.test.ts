@@ -45,8 +45,8 @@ const NOW = new Date("2026-11-09T12:00:00.000Z");
 function setup(dbPath = ":memory:") {
   const now = () => NOW;
   const github = new FakeGitHub(now);
-  github.issue(7);
-  github.issue(8);
+  github.issue(7, false, { body: "Issue seven body" });
+  github.issue(8, false, { body: "Issue eight body" });
   const runner = new FakeRunner();
   let answer: (batch: Batch) => RouterAnswer | string = acceptAll;
   const start = runner.start.bind(runner);
@@ -106,16 +106,20 @@ const pr = (number: number, state: string) => ({
 test("an opened issue reaches the Router with its current body", async () => {
   const s = setup();
   s.github.issue(9, false, { login: "alice", body: "@ostrom please fix this", at: new Date("2026-11-09T11:58:00Z") });
+  s.github.issues.get(9)!["title"] = "Issue nine title";
   await s.poll();
   await routeCandidates(s.options());
 
-  const [candidate] = batchOf(s.routerSessions()[0]!.prompts[0]!).threads[0]!.candidates;
+  const thread = batchOf(s.routerSessions()[0]!.prompts[0]!).threads[0]!;
+  const [candidate] = thread.candidates;
+  assert.deepEqual([thread.title, thread.bodyExcerpt, thread.bodyTruncated], ["Issue nine title", "@ostrom please fix this", false]);
   assert.deepEqual([candidate!.kind, candidate!.excerpt], ["issue_opened", "@ostrom please fix this"]);
 });
 
 test("an accept records a ticket, dispatches a Worker and queues the Router's acknowledgement", async () => {
   const s = setup();
   s.comment("please fix the typo in the README");
+  s.github.issues.get(7)!["title"] = "README typo";
   await s.poll();
   const pass = await routeCandidates(s.options());
 
@@ -125,6 +129,8 @@ test("an accept records a ticket, dispatches a Worker and queues the Router's ac
   assert.equal(session?.options.model, "gpt-6-luna");
   const sent = batchOf(session!.prompts[0]!);
   assert.equal(sent.threads[0]?.candidates[0]?.excerpt, "@ostrom please fix the typo in the README");
+  assert.deepEqual([sent.threads[0]?.title, sent.threads[0]?.bodyExcerpt], ["README typo", "Issue seven body"]);
+  assert.equal(s.github.calls.filter((args) => args[3] === `repos/${s.github.repo}/issues/7`).length, 1);
 
   assert.equal(pass.decisions.length, 1);
   const decision = pass.decisions[0]!;
@@ -223,6 +229,9 @@ test("the answer must decide each candidate once, on its thread, and answer exac
         kind: "issue",
         number: 7,
         url: "u",
+        title: "Issue",
+        bodyExcerpt: "Body",
+        bodyTruncated: false,
         candidates: [
           { trigger: 10, kind: "issue_comment", actor: "a", url: "u", occurredAt: "t", excerpt: "x", truncated: false },
           { trigger: 11, kind: "issue_comment", actor: "a", url: "u", occurredAt: "t", excerpt: "y", truncated: false },
@@ -495,12 +504,16 @@ test("a trigger's body is fetched by the id in its URL", () => {
 
 test("a comment deleted since intake reaches the Router as deleted; long bodies are cut", async () => {
   const s = setup();
+  s.github.issues.get(7)!["body"] = "x".repeat(2500);
   const gone = s.comment("short-lived", 57);
   s.comment("x".repeat(1000), 58);
   await s.poll();
   s.github.issueComments.splice(s.github.issueComments.indexOf(gone), 1);
   await routeCandidates(s.options());
-  const [deleted, long] = batchOf(s.routerSessions()[0]!.prompts[0]!).threads[0]!.candidates;
+  const thread = batchOf(s.routerSessions()[0]!.prompts[0]!).threads[0]!;
+  const [deleted, long] = thread.candidates;
+  assert.equal(thread.bodyExcerpt.length, 2000);
+  assert.equal(thread.bodyTruncated, true);
   assert.match(deleted!.excerpt, /deleted from GitHub/);
   assert.equal(long!.truncated, true);
   assert.equal(long!.excerpt.length, 601);

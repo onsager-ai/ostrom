@@ -9,11 +9,12 @@ import { renderMergeEligibilityPreview } from "../github/preview.ts";
 import { mergePass } from "../github/merge-pass.ts";
 import { GitHubApp, loadAppConfig } from "../github/app.ts";
 import { workerAuth } from "../github/worker-auth.ts";
-import { execGh, githubRunner, type GhRunner } from "../github/gh.ts";
+import { execGh, ghGet, githubRunner, type GhRunner } from "../github/gh.ts";
 import { sendDueReplies } from "../github/outbox.ts";
 import { processRunner, type ProcessRunner } from "../process.ts";
 import { pollOnce } from "../github/poller.ts";
 import { routeCandidates } from "../router/router.ts";
+import { excerptThreadBody, THREAD_BODY_EXCERPT_CHARS, type ThreadContext } from "../router/thread-context.ts";
 import { sessionConfig } from "../session/config.ts";
 import { modelDiscovery, type Discover } from "../session/model-discovery.ts";
 import { codexSessionsDir } from "../session/rollout.ts";
@@ -211,6 +212,20 @@ function makeWorkers(deps: MainDeps, store: Store): Workers {
     ...(deps.addWorktree === undefined ? {} : { addWorktree: deps.addWorktree }),
     gh: deps.gh,
     repo: loadConfig(deps.env).repo,
+    threadContext: async (ticketId): Promise<ThreadContext | undefined> => {
+      const thread = store.ticketContext(ticketId).thread;
+      try {
+        const item = await ghGet(deps.gh, `repos/${loadConfig(deps.env).repo}/issues/${thread.number}`) as { title?: unknown; body?: unknown } | null;
+        const body = typeof item?.body === "string" ? item.body : "";
+        const bodyExcerpt = excerptThreadBody(body);
+        return {
+          kind: thread.kind, number: thread.number, url: thread.url, title: typeof item?.title === "string" ? item.title : "",
+          bodyExcerpt: bodyExcerpt.bodyExcerpt.slice(0, THREAD_BODY_EXCERPT_CHARS), bodyTruncated: bodyExcerpt.bodyTruncated,
+        };
+      } catch {
+        return undefined;
+      }
+    },
     log: (line) => deps.stderr(`ostromd: ${line}`),
   });
 }

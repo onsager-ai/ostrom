@@ -108,7 +108,8 @@ context, and resuming a session on different settings already caused #715.
 
 Turns within one ticket differ. A typo from review needs little thought, a merge conflict more, a
 second CI failure more again. Before each turn, the Router chooses an effort from the model's
-allowed list, from the turn's prompt and the ticket's history so far. Code enforces the list and any
+allowed list, from the turn's prompt, the issue or pull request title and a bounded 2,000-character
+body excerpt, and the ticket's history so far. Code enforces the list and any
 escalation floor (below). The effort goes to the SDK on that resume; it does not start a new
 session.
 

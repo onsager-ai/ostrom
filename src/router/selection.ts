@@ -2,6 +2,7 @@ import type { WorkerConfig, RouterConfig } from "../ostromd/config.ts";
 import type { Effort, Runner } from "../session/runner.ts";
 import type { Harness } from "../session/models.ts";
 import type { Store } from "../store/store.ts";
+import type { ThreadContext } from "./thread-context.ts";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -62,8 +63,8 @@ export function overrideSelection(store: Store, ticketId: number, kind: "model" 
 }
 
 export async function chooseEffort(options: { store: Store; assignmentId: number; prompt: string; kind: string;
-  router: RouterConfig; runners: Record<Harness, Runner>; signal: AbortSignal }): Promise<{ effort: Effort | null; reason: string }> {
-  const { store, assignmentId, prompt, kind, router, runners, signal } = options;
+  router: RouterConfig; runners: Record<Harness, Runner>; signal: AbortSignal; threadContext?: ThreadContext }): Promise<{ effort: Effort | null; reason: string }> {
+  const { store, assignmentId, prompt, kind, router, runners, signal, threadContext } = options;
   const assignment = store.getAssignment(assignmentId);
   const key = `${assignment.harness}/${assignment.model}`;
   const view = store.models.view();
@@ -78,6 +79,7 @@ export async function chooseEffort(options: { store: Store; assignmentId: number
     return { effort: override.value as Effort, reason: override.reason };
   }
   const input = { model: key, efforts, objective: view.objective, kind, prompt: prompt.slice(0, 12_000), request: store.ticketContext(assignment.ticketId).reason,
+    ...(threadContext === undefined ? {} : { thread: threadContext }),
     history: store.ticketTurns(assignment.ticketId).slice(-8).map((turn) => ({ kind: turn.kind, effort: turn.requestedEffort, status: turn.status, result: turn.result?.slice(0, 600) })) };
   const fallback = efforts.includes("medium") ? "medium" : efforts.includes(model?.defaultEffort ?? "") ? model!.defaultEffort : efforts[0] ?? null;
   let effort = fallback;
