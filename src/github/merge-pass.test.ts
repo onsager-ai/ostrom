@@ -387,6 +387,8 @@ for (const feedback of [{ body: "Please rename this" }, { inlineComments: 1 }]) 
   await ready(f);
   const previous = f.store.mergeCandidateForAssignment(f.assignment)!.quietDeadline!;
   f.remote.reviews.push(review({ id: "R2", at: f.now().toISOString(), ...feedback }));
+  if (feedback.body !== undefined) f.store.insertTrigger({ sourceId: f.source.id, sourceEventId: "R2", threadId: f.pr,
+    kind: "pull_request_review", actor: "reviewer", url: "https://github.com/o/r/pull/2#pullrequestreview-2", occurredAt: f.now() });
   const result = await mergePass(f.options());
   assert.deepEqual(result.failed, []);
   assert.ok(f.store.mergeCandidateForAssignment(f.assignment)!.quietDeadline! > previous);

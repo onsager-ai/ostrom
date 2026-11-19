@@ -188,8 +188,8 @@ async function observe(options: MergePassOptions, assignmentId: number, prNumber
   const owners = options.store.runningAssignments().filter((other) => other.branch === assignment.branch && options.store.getTicket(other.ticketId).state !== "ended");
   const pull = evidence.rest.pull;
   const unjudgedApprovalCommentary = evidence.reviews.some((review) => review.state === "APPROVED" && review.inlineComments === 0 &&
-    review.body.trim() !== "" && !options.store.hasApprovalReceipt(context.thread.sourceId, review.id) &&
-    !options.store.hasTriggerEvent(context.thread.sourceId, review.id));
+    review.body.trim() !== "" && !isApprovalOnly(review.state, review.body, review.inlineComments) &&
+    !options.store.hasApprovalReceipt(context.thread.sourceId, review.id) && !options.store.hasTriggerEvent(context.thread.sourceId, review.id));
   const activity = JSON.stringify({
     local: options.store.ticketActivityAt(assignment.ticketId),
     issue: [issue["state"], issue["title"], issue["body"], issue["labels"]],
