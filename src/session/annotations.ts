@@ -17,8 +17,13 @@ export interface SessionAnnotation {
 
 const KEYS = ["v", "harness", "native_id", "system", "repository", "ticket", "issue", "pr", "title", "updated_at"];
 
+/** Counts characters as code points, the same way validation does, so a title never splits a surrogate pair. */
+export function truncateTitle(title: string | null): string | null {
+  return title === null ? null : [...title].slice(0, 200).join("");
+}
+
 export function buildSessionAnnotation(input: Omit<SessionAnnotation, "v" | "title"> & { title: string | null }): string {
-  const record: SessionAnnotation = { v: 1, ...input, title: input.title?.slice(0, 200) ?? null };
+  const record: SessionAnnotation = { v: 1, ...input, title: truncateTitle(input.title) };
   validateSessionAnnotation(record);
   const line = `${JSON.stringify(record)}\n`;
   if (Buffer.byteLength(line, "utf8") > 4096) throw new Error("session annotation exceeds 4 KiB");
@@ -47,6 +52,23 @@ export function annotationsPath(env: Record<string, string | undefined>): string
   const xdg = env["XDG_STATE_HOME"];
   const stateHome = xdg && isAbsolute(xdg) ? xdg : join(env["HOME"] && isAbsolute(env["HOME"]) ? env["HOME"] : homedir(), ".local", "state");
   return join(stateHome, "ostrom", "semon-annotations.jsonl");
+}
+
+const lastAnnotationBySession = new Map<string, { pr: number | null; title: string | null }>();
+
+/**
+ * Appends a line only when the PR number or title differs from the last line this process wrote
+ * for the session. The memory is per process, so the first pass after a restart writes one line
+ * that repeats the last one; Semon keeps the latest line, so that is harmless.
+ */
+export function appendSessionAnnotationIfChanged(input: Parameters<typeof buildSessionAnnotation>[0], env = process.env): boolean {
+  const key = `${annotationsPath(env)}:${input.harness}:${input.native_id}`;
+  const next = { pr: input.pr, title: truncateTitle(input.title) };
+  const previous = lastAnnotationBySession.get(key);
+  if (previous && previous.pr === next.pr && previous.title === next.title) return false;
+  appendSessionAnnotation(input, env);
+  lastAnnotationBySession.set(key, next);
+  return true;
 }
 
 export function appendSessionAnnotation(input: Parameters<typeof buildSessionAnnotation>[0], env = process.env): void {

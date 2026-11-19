@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { annotationsPath, appendSessionAnnotation, buildSessionAnnotation, validateSessionAnnotation } from "./annotations.ts";
+import { annotationsPath, appendSessionAnnotation, appendSessionAnnotationIfChanged, buildSessionAnnotation, validateSessionAnnotation } from "./annotations.ts";
 
 const sample = {
   harness: "codex" as const, native_id: "native-1", system: "ostrom", repository: "owner/repo", ticket: "42",
@@ -50,5 +50,24 @@ test("appends one complete newline terminated record", () => {
     const lines = readFileSync(annotationsPath(env), "utf8").split("\n");
     assert.equal(lines.length, 3);
     assert.ok(lines.slice(0, 2).every((line) => JSON.parse(line).native_id === "native-1"));
+  } finally { rmSync(home, { recursive: true }); }
+});
+
+test("appendSessionAnnotationIfChanged writes only when the PR or title changes and counts title characters", () => {
+  const home = mkdtempSync(join(tmpdir(), "annotations-changed-"));
+  try {
+    const env = { HOME: home };
+    const input = { ...sample, native_id: "changed-1", pr: null, title: null };
+    assert.equal(appendSessionAnnotationIfChanged(input, env), true);
+    assert.equal(appendSessionAnnotationIfChanged(input, env), false);
+    assert.equal(appendSessionAnnotationIfChanged({ ...input, pr: 12 }, env), true);
+    assert.equal(appendSessionAnnotationIfChanged({ ...input, pr: 12 }, env), false);
+    const long = "😀".repeat(201);
+    assert.equal(appendSessionAnnotationIfChanged({ ...input, pr: 12, title: long }, env), true);
+    assert.equal(appendSessionAnnotationIfChanged({ ...input, pr: 12, title: long }, env), false);
+    const lines = readFileSync(annotationsPath(env), "utf8").trim().split("\n").map((text) => JSON.parse(text) as { title: string });
+    assert.equal(lines.length, 3);
+    assert.equal([...lines[2]!.title].length, 200);
+    assert.equal(lines[2]!.title, "😀".repeat(200));
   } finally { rmSync(home, { recursive: true }); }
 });

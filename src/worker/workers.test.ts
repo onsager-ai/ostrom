@@ -1,15 +1,20 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, test } from "node:test";
+import { after, afterEach, test } from "node:test";
 
 import { Store } from "../store/store.ts";
+import { annotationsPath } from "../session/annotations.ts";
 import { FakeRunner } from "./fake-runner.ts";
 import { workerBrief } from "./dispatch.ts";
 import { gitDirs, INTERRUPTED_PROMPT, workerTurnPrompt, Workers, type WorkersDeps } from "./workers.ts";
 
 const REPO = "onsager-ai/ostrom";
+// Dispatch writes Semon annotations under XDG_STATE_HOME; keep test runs out of the operator's state.
+const stateHome = mkdtempSync(join(tmpdir(), "workers-state-"));
+process.env["XDG_STATE_HOME"] = stateHome;
+after(() => rmSync(stateHome, { recursive: true, force: true }));
 const config = { repo: "/repo", base: "main", worktrees: "/wt", harness: "codex" as const, model: "gpt-6-luna", machine: "host" };
 const stores: Store[] = [];
 
@@ -397,4 +402,49 @@ test("Claude records a resolved model without enforcing equality or checking a r
   assert.equal(turn.observedModel, "claude-resolved-model-id");
   assert.equal(turn.status, "completed");
   assert.equal(turn.result, null);
+});
+
+test("the session start writes one Semon annotation line, and a failed write is logged once without failing the turn", async () => {
+  const home = mkdtempSync(join(tmpdir(), "workers-annotations-"));
+  const saved = process.env["XDG_STATE_HOME"];
+  process.env["XDG_STATE_HOME"] = home;
+  try {
+    const { store, ticketId, workers } = fixture();
+    await workers.dispatch(ticketId);
+    await workers.drain();
+    const [line] = readFileSync(annotationsPath(process.env), "utf8").trim().split("\n").map((text) => JSON.parse(text) as Record<string, unknown>);
+    const { updated_at, ...rest } = line!;
+    assert.equal(typeof updated_at, "string");
+    assert.deepEqual(rest, {
+      v: 1, harness: "codex", native_id: "sess-1", system: "ostrom", repository: REPO, ticket: String(ticketId), issue: 7, pr: null, title: null,
+    });
+    assert.equal(store.getAssignment(1).outcome, null);
+  } finally {
+    if (saved === undefined) delete process.env["XDG_STATE_HOME"];
+    else process.env["XDG_STATE_HOME"] = saved;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("an annotation that cannot be written is logged once and the Worker turn still completes", async () => {
+  const home = mkdtempSync(join(tmpdir(), "workers-annotations-"));
+  const blocker = join(home, "state-is-a-file");
+  writeFileSync(blocker, "");
+  const saved = process.env["XDG_STATE_HOME"];
+  process.env["XDG_STATE_HOME"] = blocker;
+  try {
+    const logs: string[] = [];
+    const { store, runner, ticketId, workers } = fixture({ log: (line) => logs.push(line) });
+    runner.hold = true;
+    await workers.dispatch(ticketId);
+    runner.sessions[0]!.release();
+    await workers.drain();
+    assert.equal(logs.filter((line) => line.includes("could not append Semon annotation")).length, 1);
+    assert.equal(store.getAssignment(1).turns, 1);
+    assert.equal(store.getAssignment(1).outcome, null);
+  } finally {
+    if (saved === undefined) delete process.env["XDG_STATE_HOME"];
+    else process.env["XDG_STATE_HOME"] = saved;
+    rmSync(home, { recursive: true, force: true });
+  }
 });
