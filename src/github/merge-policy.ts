@@ -72,7 +72,12 @@ export function mergeEligibility(input: EligibilityInput): { eligible: true } | 
   const { evidence, local } = input;
   if (!local.issueOpen || !local.ticketOpen || local.pausedOrStopping || local.stalledOrFailed || local.budgetReached) return { eligible: false, reason: "local work is not mergeable" };
   if (!local.workerIdle) return { eligible: false, reason: "Worker is not idle" };
-  if (evidence.pr.state !== "OPEN" || evidence.pr.draft || evidence.pr.head.sha !== input.expected.head || evidence.pr.base.sha !== input.expected.base || evidence.pr.mergeable !== "MERGEABLE" || evidence.pr.mergeStateStatus !== "CLEAN") return { eligible: false, reason: "pull request is not clean at the captured head and base" };
+  if (evidence.pr.state !== "OPEN") return { eligible: false, reason: `pull request state is ${evidence.pr.state}` };
+  if (evidence.pr.draft) return { eligible: false, reason: "pull request is a draft" };
+  if (evidence.pr.head.sha !== input.expected.head) return { eligible: false, reason: `pull request head moved from ${input.expected.head} to ${evidence.pr.head.sha}` };
+  if (evidence.pr.base.sha !== input.expected.base) return { eligible: false, reason: `pull request base moved from ${input.expected.base} to ${evidence.pr.base.sha}` };
+  if (evidence.pr.mergeable !== "MERGEABLE") return { eligible: false, reason: `pull request mergeable=${evidence.pr.mergeable}` };
+  if (evidence.pr.mergeStateStatus !== "CLEAN") return { eligible: false, reason: `pull request mergeStateStatus=${evidence.pr.mergeStateStatus}` };
   if (evidence.pr.head.repository !== evidence.pr.base.repository) return { eligible: false, reason: "pull request head is from a fork" };
   if (evidence.rollup === null || evidence.rollup.oid !== input.expected.head || evidence.rollup.state !== "SUCCESS") return { eligible: false, reason: "CI rollup is not successful for the captured head" };
   if (evidence.rollup.suites.some((suite) => incompleteSuite(suite))) return { eligible: false, reason: "a check suite is not complete" };

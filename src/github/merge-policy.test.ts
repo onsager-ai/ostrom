@@ -90,7 +90,12 @@ test("eligibility reports every blocker in design order", () => {
   const cases: [string, (value: ReturnType<typeof input>) => void][] = [
     ["local work is not mergeable", (v) => { v.local.issueOpen = false; }],
     ["Worker is not idle", (v) => { v.local.workerIdle = false; }],
-    ["pull request is not clean at the captured head and base", (v) => { v.evidence.pr.draft = true; }],
+    ["pull request state is CLOSED", (v) => { v.evidence.pr.state = "CLOSED"; }],
+    ["pull request is a draft", (v) => { v.evidence.pr.draft = true; }],
+    ["pull request head moved from head to new-head", (v) => { v.evidence.pr.head.sha = "new-head"; }],
+    ["pull request base moved from base to new-base", (v) => { v.evidence.pr.base.sha = "new-base"; }],
+    ["pull request mergeable=CONFLICTING", (v) => { v.evidence.pr.mergeable = "CONFLICTING"; }],
+    ["pull request mergeStateStatus=DIRTY", (v) => { v.evidence.pr.mergeStateStatus = "DIRTY"; }],
     ["pull request head is from a fork", (v) => { v.evidence.pr.head.repository = "fork/r"; }],
     ["CI rollup is not successful for the captured head", (v) => { v.evidence.rollup!.state = "FAILURE"; }],
     ["no successful pull_request workflow is evidenced for this PR", (v) => { v.evidence.rollup!.suites = []; }],
