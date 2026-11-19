@@ -17,7 +17,7 @@ import { appendSessionAnnotationIfChanged } from "../session/annotations.ts";
 import { rolloutContext } from "../session/rollout.ts";
 import type { Effort, Runner, Session, TurnResult } from "../session/runner.ts";
 import { createWorktree } from "../session/worktree.ts";
-import type { Assignment, AssignmentOutcome, NewReply, QueuedTurnKind, Store } from "../store/store.ts";
+import type { Assignment, NewReply, QueuedTurnKind, Store } from "../store/store.ts";
 import { pullRequestsForBranch, workerBrief } from "./dispatch.ts";
 
 export interface Dispatched {
@@ -533,7 +533,7 @@ export class Workers {
     this.#deps.store.finishWorkerTurn(id, "failed", null, undefined, message);
     this.#deps.store.endTurn(id, null);
     this.#deps.store.recordTurnError(id, message);
-    this.#mark(id, "failed");
+    if (this.#deps.store.getAssignment(id).state === "running") this.#deps.store.recordOutcome(id, "failed");
     queueStatusCard(this.#deps.store, this.#deps.store.getAssignment(id).ticketId);
   }
 
@@ -582,6 +582,7 @@ export class Workers {
     }
     let failure: string | null = null;
     let blockedReply: NewReply | undefined;
+    let refreshCard = false;
     try {
       // A late result still counts its usage, but cannot clear a failure or act for an ended assignment.
       store.endTurn(id, result.usage);
@@ -607,12 +608,12 @@ export class Workers {
           "The ticket budget has been reached. Push your work in progress, then stop and wait for Ostrom to resume you.",
           () => {},
         );
-        queueStatusCard(store, assignment.ticketId);
+        refreshCard = true;
         return;
       }
       if (store.getTicket(assignment.ticketId).state === "open") this.#budgetPauses.delete(id);
       if (result.status === "cancelled") {
-        queueStatusCard(store, assignment.ticketId);
+        refreshCard = true;
         return;
       }
       if (modelProblem !== null) {
@@ -621,22 +622,14 @@ export class Workers {
         store.endAssignment(id, modelProblem);
         return;
       }
-      // Ostrom only aborts a turn to replace it. That cancellation is bookkeeping, not a terminal
-      // Worker outcome: the next queued turn must still run on this assignment.
-      this.#mark(id, null);
-      queueStatusCard(store, assignment.ticketId);
+      if (blockedReply === undefined) store.recordOutcome(id, null);
+      refreshCard = true;
     } finally {
       store.finishWorkerTurn(id, failure === null ? result.status : "failed", result.usage, observed,
         failure ?? (result.status === "completed" ? result.text : null), blockedReply);
-      if (blockedReply !== undefined) queueStatusCard(store, assignment.ticketId);
+      if (refreshCard) queueStatusCard(store, assignment.ticketId);
     }
   }
-
-  /** Records an outcome unless the Router ended the assignment while the turn ran. */
-  #mark(id: number, outcome: AssignmentOutcome | null): void {
-    if (this.#deps.store.getAssignment(id).state === "running") this.#deps.store.recordOutcome(id, outcome);
-  }
-
 }
 
 async function branchHead(gh: GhRunner, repo: string, branch: string): Promise<string | null> {

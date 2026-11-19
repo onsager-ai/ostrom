@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, afterEach, test } from "node:test";
 
+import { FakeGitHub } from "../github/fake-github.ts";
+import { sendDueReplies } from "../github/outbox.ts";
 import { Store } from "../store/store.ts";
 import { annotationsPath } from "../session/annotations.ts";
 import { FakeRunner } from "./fake-runner.ts";
@@ -75,6 +77,110 @@ test("dispatch makes the worktree, starts the session with the brief and stores 
   const [turn] = store.operatorTicket(ticketId).turns;
   assert.deepEqual([turn!.kind, turn!.status, turn!.requestedModel, turn!.requestedEffort, turn!.observedModel], ["dispatch", "completed", "gpt-6-luna", null, null]);
   assert.deepEqual([turn!.inputTokens, turn!.cachedInputTokens, turn!.outputTokens], [10, 5, 2]);
+});
+
+for (const harness of ["claude", "codex"] as const) {
+  test(`${harness} dispatch records and immediately posts a blocked turn's final message`, async () => {
+    const now = () => new Date("2026-11-09T12:00:00.000Z");
+    const github = new FakeGitHub(now);
+    github.issue(7);
+    const { store, runner, ticketId, workers } = fixture({ gh: github.gh, repo: REPO }, harness);
+    const start = runner.start.bind(runner);
+    const finalMessage = "I need a decision on the generated schema.\n\nThe local generation step is unavailable.";
+    runner.start = (options) => {
+      const session = start(options);
+      session.reply = () => finalMessage;
+      return session;
+    };
+
+    const { assignmentId } = await workers.dispatch(ticketId);
+    await workers.drain();
+    const [turn] = store.ticketTurns(ticketId);
+    assert.equal(turn!.status, "completed");
+    assert.equal(turn!.result, finalMessage);
+    assert.equal(store.getAssignment(assignmentId).outcome, "waiting");
+    assert.equal(store.getTicket(ticketId).state, "open");
+
+    const { thread } = store.ticketContext(ticketId);
+    const reply = store.dueReplies().find((item) => item.id === `blocked-a${assignmentId}-turn-1`)!;
+    assert.equal(reply.threadId, thread.id);
+    assert.equal(reply.blocking, true);
+    assert.equal(reply.body, `The Worker stopped without opening a pull request:\n\n${finalMessage}\n\nReply here to redirect, or \`@ostrom stop\`.`);
+    const send = () => sendDueReplies({ store, gh: github.gh, repo: REPO, now, batchWindowMs: 60_000, commentGapMs: 60_000 });
+    assert.deepEqual((await send()).failed, []);
+    assert.deepEqual((await send()).sent, []);
+    const bodies = github.commentsOn(7).map((comment) => String(comment["body"]));
+    assert.equal(bodies.filter((body) => body.startsWith(reply.body)).length, 1);
+    assert.ok(bodies.some((body) => body.startsWith("## Ostrom: Blocked\n\nWaiting for direction.")));
+  });
+}
+
+test("redirect clears Blocked on start and an unchanged pushed head can block again", async () => {
+  const github = new FakeGitHub(() => new Date());
+  const { store, runner, ticketId, workers, make } = fixture({ gh: github.gh, repo: REPO });
+  const { assignmentId, branch } = await workers.dispatch(ticketId);
+  await workers.drain();
+  const { thread } = store.ticketContext(ticketId);
+  github.branchHeads.set(branch, "old-head");
+  const restarted = make();
+  restarted.recover();
+  const session = runner.sessions.at(-1)!;
+  session.reply = () => "Still waiting for the input.";
+  const checkStarted = () => {
+    assert.equal(store.getAssignment(assignmentId).outcome, null);
+    assert.match(store.statusCardBody(thread.id)!, /^## Ostrom: Working/);
+  };
+  assert.equal(restarted.deliver(assignmentId, "redirect-1", "Try again", checkStarted), true);
+  assert.equal(restarted.deliver(assignmentId, "redirect-1", "Try again", checkStarted), false);
+  await restarted.drain();
+  assert.equal(store.getAssignment(assignmentId).outcome, "waiting");
+  assert.match(store.statusCardBody(thread.id)!, /^## Ostrom: Blocked/);
+  assert.equal(store.ticketTurns(ticketId).at(-1)!.result, "Still waiting for the input.");
+  assert.deepEqual(store.dueReplies().filter((reply) => reply.id.startsWith("blocked-")).map((reply) => reply.id),
+    [`blocked-a${assignmentId}-turn-1`, `blocked-a${assignmentId}-turn-2`]);
+
+  session.reply = () => {
+    github.branchHeads.set(branch, "new-head");
+    return "Pushed work in progress.";
+  };
+  restarted.deliver(assignmentId, "follow-up", "Keep going", checkStarted);
+  await restarted.drain();
+  assert.equal(store.getAssignment(assignmentId).outcome, null);
+  assert.match(store.statusCardBody(thread.id)!, /^## Ostrom: Working/);
+  assert.equal(store.hasReply(`blocked-a${assignmentId}-turn-3`), false);
+});
+
+for (const delivery of ["push", "PR", "unreadable"] as const) {
+  test(`${delivery} does not trigger the blocked-turn reply`, async () => {
+    const github = new FakeGitHub(() => new Date());
+    if (delivery === "unreadable") {
+      github.failWhen = (args) => args.some((arg) => arg.includes("/git/matching-refs/")) ? new Error("GitHub unavailable") : undefined;
+    }
+    const { store, runner, ticketId, workers } = fixture({ gh: github.gh, repo: REPO });
+    runner.hold = true;
+    const { assignmentId, branch } = await workers.dispatch(ticketId);
+    const session = runner.sessions[0]!;
+    if (delivery === "push") github.branchHeads.set(branch, "first-head");
+    if (delivery === "PR") github.pulls.push({ branch, number: 8, state: "open" });
+    session.release();
+    await workers.drain();
+    assert.equal(store.hasReply(`blocked-a${assignmentId}-turn-1`), false);
+    assert.equal(store.getAssignment(assignmentId).outcome, null);
+  });
+}
+
+test("a review turn without a push still calls its normal reply handler", async () => {
+  const github = new FakeGitHub(() => new Date());
+  const { store, ticketId, workers } = fixture({ gh: github.gh, repo: REPO });
+  const { assignmentId } = await workers.dispatch(ticketId);
+  await workers.drain();
+  let reply: string | undefined;
+  workers.deliver(assignmentId, "review-8", "Please explain", () => {}, (result) => { reply = result.text; });
+  await workers.drain();
+  assert.equal(reply, "ok");
+  assert.equal(store.ticketTurns(ticketId).at(-1)!.result, "ok");
+  assert.equal(store.getAssignment(assignmentId).outcome, null);
+  assert.equal(store.hasReply(`blocked-a${assignmentId}-turn-2`), false);
 });
 
 test("every invoked follow-up records its source kind and failures retain a reason", async () => {
@@ -443,7 +549,7 @@ test("Claude records a resolved model without enforcing equality or checking a r
   const turn = store.ticketTurns(ticketId)[0]!;
   assert.equal(turn.observedModel, "claude-resolved-model-id");
   assert.equal(turn.status, "completed");
-  assert.equal(turn.result, null);
+  assert.equal(turn.result, "ok");
 });
 
 test("the session start writes one Semon annotation line, and a failed write is logged once without failing the turn", async () => {

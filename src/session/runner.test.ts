@@ -51,10 +51,11 @@ test("Codex constructs a Worker with its explicit profile and leaves the Router 
   ]);
 });
 
-test("Codex returns an unverified model and forwards resume options", async () => {
+test("Codex returns the last agent message, an unverified model, and forwards resume options", async () => {
   const events: ThreadEvent[] = [
     { type: "thread.started", thread_id: "id" },
-    { type: "item.completed", item: { type: "agent_message", id: "item", text: "ok" } },
+    { type: "item.completed", item: { type: "agent_message", id: "progress", text: "I will look into it." } },
+    { type: "item.completed", item: { type: "agent_message", id: "final", text: "I hit a blocker." } },
     { type: "turn.completed", usage: { input_tokens: 4, cached_input_tokens: 3, cache_write_input_tokens: 0, output_tokens: 2, reasoning_output_tokens: 0 } },
   ];
   let seen: unknown;
@@ -63,6 +64,7 @@ test("Codex returns an unverified model and forwards resume options", async () =
   const session = codexRunner({}, () => client).resume({ cwd: "/tmp", model: "luna", sessionId: "id", writableDirs: ["/repo/.git"] });
   const result = await session.send("hello");
   assert.equal(result.model, null);
+  assert.equal(result.text, "I hit a blocker.");
   assert.deepEqual(result.usage, { inputTokens: 1, cachedInputTokens: 3, outputTokens: 2 });
   assert.deepEqual(seen, { id: "id", options: { workingDirectory: "/tmp", model: "luna", networkAccessEnabled: true, approvalPolicy: "never" } });
 });
