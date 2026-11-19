@@ -9,6 +9,8 @@ test("fake GitHub serves version-pinned merge reads and PR review comments", asy
   const github = new FakeGitHub(() => now, "o/r");
   const pull = { number: 2, head: { sha: "head" } };
   github.mergePulls.set(2, { pull, evidence: {} });
+  github.issue(2, true);
+  github.issue(3, true);
   const comment = github.reviewComment(2, { login: "reviewer", body: "fix this", at: now });
   github.reviewComment(3, { login: "reviewer", body: "another PR", at: now });
 

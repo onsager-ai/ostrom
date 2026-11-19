@@ -106,7 +106,8 @@ export async function readMergeEvidence(gh: GhRunner, repo: string, prNumber: nu
       if (!state.contextsAfter.done) {
         for (const item of contextPage.nodes) {
           const row = object(item);
-          const key = `${string(row, "__typename")}:${nullableNumber(row, "databaseId") ?? nullableString(row, "context") ?? ""}`;
+          const type = string(row, "__typename");
+          const key = `${type}:${type === "StatusContext" ? string(row, "context") : nullableNumber(row, "databaseId")}`;
           if (seen.contexts.add(key)) contexts.push(item);
         }
         advance(state.contextsAfter, contextPage.page);
