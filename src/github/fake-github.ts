@@ -140,7 +140,12 @@ export class FakeGitHub {
       if (!pull) throw new Error(`fake gh: no merge evidence for #${number}`);
       return JSON.stringify({ data: { repository: { pullRequest: pull.evidence } } });
     }
-    const [api, flag, method, path, ...rest] = args;
+    // Merge reads pin the REST API version with a header before --method.
+    const request = [...args];
+    for (let index = 1; index < request.length; index++) {
+      if (request[index] === "-H") request.splice(index--, 2);
+    }
+    const [api, flag, method, path, ...rest] = request;
     if (api !== "api" || flag !== "--method" || path === undefined) throw new Error(`fake gh: ${args.join(" ")}`);
     if (method === "POST") return JSON.stringify(this.#post(path, rest));
     if (method === "PATCH") return JSON.stringify(this.#patch(path, rest));
@@ -204,6 +209,7 @@ export class FakeGitHub {
     } else if (route === "issues") items = [...this.issues.values()];
     else if ((match = route.match(/^issues\/(\d+)\/events$/))) items = this.issueEvents.get(Number(match[1])) ?? [];
     else if ((match = route.match(/^pulls\/(\d+)\/reviews\/(\d+)\/comments$/))) items = this.reviewComments.filter((comment) => comment["pull_request_review_id"] === Number(match![2]));
+    else if ((match = route.match(/^pulls\/(\d+)\/comments$/))) items = this.reviewComments.filter((comment) => (comment["pull_request_url"] as string).endsWith(`/pulls/${match![1]}`));
     else if ((match = route.match(/^pulls\/(\d+)\/reviews$/))) items = this.reviews.get(Number(match[1])) ?? [];
     else if ((match = route.match(/^issues\/(\d+)\/comments$/))) items = this.commentsOn(Number(match[1]));
     else throw new Error(`fake gh: no route ${route}`);
