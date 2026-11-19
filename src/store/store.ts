@@ -969,13 +969,20 @@ export class Store {
 
   finishWorkerTurn(assignmentId: number, status: Exclude<WorkerTurn["status"], "running">,
     usage: { inputTokens: number; cachedInputTokens: number; outputTokens: number } | null,
-    observed: { model: string | null; effort: string | null } = { model: null, effort: null }, result: string | null = null): void {
-    this.#run(
-      `UPDATE turn SET ended_at = ?, status = ?, observed_model = ?, observed_effort = ?,
-       input_tokens = ?, cached_input_tokens = ?, output_tokens = ?, result = ? WHERE assignment_id = ? AND status = 'running'`,
-      this.#stamp(), status, observed.model, observed.effort, usage?.inputTokens ?? 0, usage?.cachedInputTokens ?? 0,
-      usage?.outputTokens ?? 0, result, assignmentId,
-    );
+    observed: { model: string | null; effort: string | null } = { model: null, effort: null }, result: string | null = null,
+    blockedReply?: NewReply): void {
+    this.#transaction(() => {
+      const { changes } = this.#run(
+        `UPDATE turn SET ended_at = ?, status = ?, observed_model = ?, observed_effort = ?,
+         input_tokens = ?, cached_input_tokens = ?, output_tokens = ?, result = ? WHERE assignment_id = ? AND status = 'running'`,
+        this.#stamp(), status, observed.model, observed.effort, usage?.inputTokens ?? 0, usage?.cachedInputTokens ?? 0,
+        usage?.outputTokens ?? 0, result, assignmentId,
+      );
+      if (blockedReply !== undefined && Number(changes) === 1) {
+        this.recordOutcome(assignmentId, "waiting");
+        this.#insertReply(blockedReply);
+      }
+    });
   }
 
   /** Session events are activity evidence; recovery must never charge daemon downtime. */
@@ -1011,7 +1018,10 @@ export class Store {
   /** Marks a native turn as running and returns the assignment's turn number. */
   beginTurn(assignmentId: number): number {
     const row = this.#get(
-      "UPDATE assignment SET turns = turns + 1, turn_started_at = ? WHERE id = ? AND state = 'running' RETURNING turns",
+      `UPDATE assignment SET turns = turns + 1, turn_started_at = ?,
+       outcome = CASE WHEN outcome = 'waiting' THEN NULL ELSE outcome END,
+       outcome_at = CASE WHEN outcome = 'waiting' THEN NULL ELSE outcome_at END
+       WHERE id = ? AND state = 'running' RETURNING turns`,
       this.#stamp(),
       assignmentId,
     );

@@ -15,10 +15,10 @@ import type { ThreadContext } from "../router/thread-context.ts";
 import type { RouterConfig, WorkerConfig } from "../ostromd/config.ts";
 import { appendSessionAnnotationIfChanged } from "../session/annotations.ts";
 import { rolloutContext } from "../session/rollout.ts";
-import type { Runner, Session, TurnResult } from "../session/runner.ts";
+import type { Effort, Runner, Session, TurnResult } from "../session/runner.ts";
 import { createWorktree } from "../session/worktree.ts";
-import type { Assignment, AssignmentOutcome, QueuedTurnKind, Store } from "../store/store.ts";
-import { workerBrief } from "./dispatch.ts";
+import type { Assignment, NewReply, QueuedTurnKind, Store } from "../store/store.ts";
+import { pullRequestsForBranch, workerBrief } from "./dispatch.ts";
 
 export interface Dispatched {
   assignmentId: number;
@@ -35,7 +35,7 @@ export interface WorkersDeps {
   codexSessions?: string;
   addWorktree?: typeof createWorktree;
   log?: (line: string) => void;
-  /** GitHub access is needed only to restore stop cleanup after a daemon restart. */
+  /** GitHub access verifies turn delivery and restores stop cleanup after a daemon restart. */
   gh?: GhRunner;
   repo?: string;
   /** Fresh issue or PR context for per-turn effort choices. */
@@ -390,12 +390,12 @@ export class Workers {
     const { store } = this.#deps;
     const controller = new AbortController();
     this.#inFlight.set(id, controller);
-    let result: TurnResult;
+    let completed: { result: TurnResult; blocked: boolean };
     try {
       const choice = await this.#effort(id, "dispatch", prompt, controller.signal);
       if (controller.signal.aborted) throw new Error("Turn cancelled before Worker start");
       store.startWorkerTurn(id, "dispatch", choice.effort, this.#selectionReason(id, choice.reason));
-      result = await session.send(prompt, controller.signal, choice.effort);
+      completed = await this.#send(id, session, "dispatch", prompt, controller.signal, choice.effort);
     } catch (error) {
       if (this.#stopping) return;
       if (controller.signal.aborted) {
@@ -413,7 +413,7 @@ export class Workers {
       if (this.#inFlight.get(id) === controller) this.#inFlight.delete(id);
     }
     if (this.#stopping) return;
-    this.#finished(id, result);
+    this.#finished(id, completed.result, completed.blocked);
   }
 
   async #turn(
@@ -459,18 +459,19 @@ export class Workers {
     };
     const turn = store.beginTurn(id);
     if (turn !== nextTurn) throw new Error(`assignment ${id}: queued turn number changed`);
+    if (assignment.outcome === "waiting") queueStatusCard(store, assignment.ticketId);
     const kind = key.startsWith("stuck-recovery-") ? "recovery" : key.startsWith("redirect-") ? "redirect" : queued.kind;
     onStart?.(turnId);
     for (const delivery of deliveries) delivery.callbacks.onStart?.(turnId);
     const controller = new AbortController();
     this.#inFlight.set(id, controller);
-    let result: TurnResult;
+    let completed: { result: TurnResult; blocked: boolean };
     try {
       const choice = await this.#effort(id, kind, prompt, controller.signal);
       if (controller.signal.aborted) throw new Error("Turn cancelled before Worker start");
       store.startWorkerTurn(id, kind, choice.effort, this.#selectionReason(id, choice.reason));
       queueStatusCard(store, assignment.ticketId);
-      result = await session.send(workerTurnPrompt(prompt), controller.signal, choice.effort);
+      completed = await this.#send(id, session, kind, workerTurnPrompt(prompt), controller.signal, choice.effort);
     } catch (error) {
       if (this.#stopping) return;
       finish();
@@ -487,7 +488,8 @@ export class Workers {
     }
     if (this.#stopping) return;
     finish();
-    this.#finished(id, result);
+    const { result, blocked } = completed;
+    this.#finished(id, result, blocked);
     const current = store.getAssignment(id);
     if (result.status === "completed" && current.state === "running" && current.outcome !== "failed") {
       await onComplete?.(result);
@@ -531,11 +533,40 @@ export class Workers {
     this.#deps.store.finishWorkerTurn(id, "failed", null, undefined, message);
     this.#deps.store.endTurn(id, null);
     this.#deps.store.recordTurnError(id, message);
-    this.#mark(id, "failed");
+    if (this.#deps.store.getAssignment(id).state === "running") this.#deps.store.recordOutcome(id, "failed");
     queueStatusCard(this.#deps.store, this.#deps.store.getAssignment(id).ticketId);
   }
 
-  #finished(id: number, result: TurnResult): void {
+  async #send(id: number, session: Session, kind: string, prompt: string, signal: AbortSignal, effort: Effort | null):
+    Promise<{ result: TurnResult; blocked: boolean }> {
+    const { store, gh, repo } = this.#deps;
+    const branch = store.getAssignment(id).branch;
+    if (gh === undefined || repo === undefined || branch === null || !["dispatch", "follow_up", "redirect"].includes(kind)) {
+      return { result: await session.send(prompt, signal, effort), blocked: false };
+    }
+    // Undefined means the read failed; null is positive evidence that the ref is absent.
+    const before = await this.#deliveryEvidence(id, () => branchHead(gh, repo, branch));
+    if (signal.aborted) throw new Error("Turn cancelled before Worker start");
+    const result = await session.send(prompt, signal, effort);
+    if (result.status !== "completed" || signal.aborted || before === undefined) return { result, blocked: false };
+    const blocked = await this.#deliveryEvidence(id, async () => {
+      const after = await branchHead(gh, repo, branch);
+      if (after !== null && after !== before) return false;
+      return (await pullRequestsForBranch(gh, repo, branch)).length === 0;
+    });
+    return { result, blocked: blocked === true && !signal.aborted };
+  }
+
+  async #deliveryEvidence<T>(id: number, read: () => Promise<T>): Promise<T | undefined> {
+    try {
+      return await read();
+    } catch (error) {
+      this.#deps.log?.(`assignment ${id}: could not verify turn delivery: ${error instanceof Error ? error.message : String(error)}`);
+      return undefined;
+    }
+  }
+
+  #finished(id: number, result: TurnResult, blocked: boolean): void {
     const { store } = this.#deps;
     const assignment = store.getAssignment(id);
     let observed = { model: result.model, effort: null as string | null };
@@ -550,11 +581,22 @@ export class Workers {
       }
     }
     let failure: string | null = null;
+    let blockedReply: NewReply | undefined;
+    let refreshCard = false;
     try {
       // A late result still counts its usage, but cannot clear a failure or act for an ended assignment.
       store.endTurn(id, result.usage);
       if (assignment.state !== "running" || assignment.outcome === "failed") return;
       store.clearTurnError(id);
+      if (blocked && modelProblem === null && store.getTicket(assignment.ticketId).state === "open") {
+        blockedReply = {
+          id: `blocked-a${id}-turn-${assignment.turns}`,
+          threadId: store.ticketContext(assignment.ticketId).thread.id,
+          body: ["The Worker stopped without opening a pull request:", result.text.trim() || "The Worker left no final message.",
+            "Reply here to redirect, or `@ostrom stop`."].join("\n\n"),
+          blocking: true,
+        };
+      }
       // A cancelled turn still counts toward the turn and token limits.
       const reached = turnBudgetReached(store.ticketBudget(assignment.ticketId), new Date());
       if (store.getTicket(assignment.ticketId).state === "open" && reached !== null && !this.#budgetPauses.has(id)) {
@@ -566,12 +608,12 @@ export class Workers {
           "The ticket budget has been reached. Push your work in progress, then stop and wait for Ostrom to resume you.",
           () => {},
         );
-        queueStatusCard(store, assignment.ticketId);
+        refreshCard = true;
         return;
       }
       if (store.getTicket(assignment.ticketId).state === "open") this.#budgetPauses.delete(id);
       if (result.status === "cancelled") {
-        queueStatusCard(store, assignment.ticketId);
+        refreshCard = true;
         return;
       }
       if (modelProblem !== null) {
@@ -580,20 +622,27 @@ export class Workers {
         store.endAssignment(id, modelProblem);
         return;
       }
-      // Ostrom only aborts a turn to replace it. That cancellation is bookkeeping, not a terminal
-      // Worker outcome: the next queued turn must still run on this assignment.
-      this.#mark(id, null);
-      queueStatusCard(store, assignment.ticketId);
+      if (blockedReply === undefined) store.recordOutcome(id, null);
+      refreshCard = true;
     } finally {
-      store.finishWorkerTurn(id, failure === null ? result.status : "failed", result.usage, observed, failure);
+      store.finishWorkerTurn(id, failure === null ? result.status : "failed", result.usage, observed,
+        failure ?? (result.status === "completed" ? result.text : null), blockedReply);
+      if (refreshCard) queueStatusCard(store, assignment.ticketId);
     }
   }
+}
 
-  /** Records an outcome unless the Router ended the assignment while the turn ran. */
-  #mark(id: number, outcome: AssignmentOutcome | null): void {
-    if (this.#deps.store.getAssignment(id).state === "running") this.#deps.store.recordOutcome(id, outcome);
-  }
-
+async function branchHead(gh: GhRunner, repo: string, branch: string): Promise<string | null> {
+  // The matching-refs endpoint returns an empty list for an absent branch and can also return
+  // longer refs sharing the same prefix. Only the exact branch is delivery evidence.
+  const path = branch.split("/").map(encodeURIComponent).join("/");
+  const refs = await ghGet(gh, `repos/${repo}/git/matching-refs/heads/${path}`);
+  if (!Array.isArray(refs)) throw new Error("expected matching refs");
+  const ref = refs.find((value) => value?.ref === `refs/heads/${branch}`);
+  if (ref === undefined) return null;
+  const sha = ref.object?.sha;
+  if (typeof sha !== "string" || sha.length === 0) throw new Error("branch ref has no SHA");
+  return sha;
 }
 
 async function openPullRequests(gh: GhRunner, repo: string, branch: string): Promise<string[]> {

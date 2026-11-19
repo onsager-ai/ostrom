@@ -4,7 +4,7 @@
 import { controlsLine } from "../commands/table.ts";
 import { replyMarker } from "./marker.ts";
 
-export type StatusCardState = "working" | "recovering" | "paused" | "stuck" | "waiting_to_merge" | "waiting_for_human_merge" | "done" | "stopped" | "failed";
+export type StatusCardState = "working" | "blocked" | "recovering" | "paused" | "stuck" | "waiting_to_merge" | "waiting_for_human_merge" | "done" | "stopped" | "failed";
 
 export interface StatusCard {
   state: StatusCardState;
@@ -29,6 +29,7 @@ export interface StatusCard {
 
 const STATE_LABEL: Record<StatusCardState, string> = {
   working: "Working",
+  blocked: "Blocked",
   recovering: "Recovering",
   paused: "Paused",
   stuck: "Stuck",
@@ -42,6 +43,7 @@ const STATE_LABEL: Record<StatusCardState, string> = {
 /** Renders the exact Markdown stored in and edited on the GitHub status-card comment. */
 export function renderStatusCard(card: StatusCard): string {
   const lines = [`## Ostrom: ${card.stoppedReason === "issue closed" ? "Stopped: issue closed" : STATE_LABEL[card.state]}`];
+  if (card.state === "blocked") lines.push("", "Waiting for direction.");
   if (card.plan !== undefined && card.plan.length > 0) {
     lines.push("", "### Plan", ...card.plan.map((item) => `- [ ] ${item}`));
   }

@@ -272,7 +272,8 @@ test("the follow-up is a summary plus a pointer to the trigger", () => {
   assert.match(message, new RegExp(`on pull request #12: https://github.com/${REPO}/pull/12#event-${id}\n`));
   assert.match(message, /Read it with `gh`/);
   for (const prompt of [message, reviewFollowUpMessage(ticketId, store.getThread(pr), [pending!.trigger])]) {
-    assert.match(prompt, /final message is posted publicly on the pull request for its reviewers/);
+    assert.match(prompt, /Ostrom may post your final message publicly on the issue or pull request/);
+    assert.match(prompt, /explain what prevented delivery/);
     assert.match(prompt, /use repository-relative paths/);
     assert.match(prompt, /do not narrate your own process or what you did or did not post/);
     assert.match(prompt, /Do not claim CI or merge state; Ostrom reports those/);
