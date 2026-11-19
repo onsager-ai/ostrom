@@ -843,7 +843,9 @@ export class Store {
               COALESCE(SUM(assignment.output_tokens), 0) AS output_tokens,
               COALESCE((SELECT SUM(ROUND((julianday(ended_at) - julianday(started_at)) * 86400))
                         FROM turn WHERE turn.ticket_id = ticket.id AND ended_at IS NOT NULL), 0) AS completed_turn_seconds,
-              MAX(assignment.turn_started_at) AS turn_started_at
+              MAX(CASE WHEN (SELECT status FROM turn WHERE turn.assignment_id = assignment.id
+                ORDER BY id DESC LIMIT 1) = 'interrupted'
+                THEN NULL ELSE assignment.turn_started_at END) AS turn_started_at
          FROM ticket LEFT JOIN assignment ON assignment.ticket_id = ticket.id WHERE ticket.id = ? GROUP BY ticket.id`,
       ticketId,
     );
@@ -973,6 +975,20 @@ export class Store {
        input_tokens = ?, cached_input_tokens = ?, output_tokens = ?, result = ? WHERE assignment_id = ? AND status = 'running'`,
       this.#stamp(), status, observed.model, observed.effort, usage?.inputTokens ?? 0, usage?.cachedInputTokens ?? 0,
       usage?.outputTokens ?? 0, result, assignmentId,
+    );
+  }
+
+  /** Session events are activity evidence; recovery must never charge daemon downtime. */
+  recordWorkerActivity(assignmentId: number): void {
+    this.#run("UPDATE assignment SET last_activity_at = ? WHERE id = ?", this.#stamp(), assignmentId);
+  }
+
+  interruptRecoveredTurn(assignmentId: number, reason: string): void {
+    this.#run(
+      `UPDATE turn SET ended_at = MAX(started_at, COALESCE(
+         (SELECT last_activity_at FROM assignment WHERE id = ?), started_at)),
+       status = 'interrupted', result = ? WHERE assignment_id = ? AND status = 'running'`,
+      assignmentId, reason, assignmentId,
     );
   }
 

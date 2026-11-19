@@ -8,6 +8,7 @@ import { test } from "node:test";
 import { FakeGitHub } from "../github/fake-github.ts";
 import { Store } from "../store/store.ts";
 import { FakeRunner } from "../worker/fake-runner.ts";
+import { Workers } from "../worker/workers.ts";
 import { loadConfig, loadRouterConfig, loadWatchdogConfig, loadWorkerConfig } from "./config.ts";
 import { main, TICK, type MainDeps } from "./main.ts";
 
@@ -321,6 +322,34 @@ const semonAnswer = (minutes: number, stalls: unknown[]) => async () => ({
   code: 0, stdout: JSON.stringify({ idle_minutes: minutes, stalls }), stderr: "",
 });
 
+test("a watchdog time pause lets the current turn finish before the WIP turn", async () => {
+  const store = Store.open(":memory:", { now: () => new Date("2026-11-09T12:00:00Z") });
+  try {
+    const source = store.ensureSource("github", "o/r");
+    const issue = store.ensureThread({ sourceId: source.id, kind: "issue", number: 7, url: "https://github.com/o/r/issues/7" });
+    const trigger = store.insertTrigger({ sourceId: source.id, sourceEventId: "IC_1", threadId: issue, kind: "issue_comment",
+      actor: "alice", url: "https://github.com/o/r/issues/7#issuecomment-1", occurredAt: new Date() }).id;
+    const ticketId = store.recordDecision({ threadId: issue, triggerIds: [trigger], verdict: "accept", reason: "fix it" }).ticketId!;
+    store.setTicketBudget(ticketId, { timeMinutes: 1, idleMinutes: 1_000_000, turns: 100, tokens: 1_000_000, escalations: 0 });
+    const run = deps({ ...tickEnv("unused"), OSTROM_REPO: "o/r" }, async () => "[]", semonAnswer(20, []));
+    run.runner.hold = true;
+    const workers = new Workers({ store, config: loadWorkerConfig(run.deps.env), runners: run.deps.runners!, addWorktree: run.deps.addWorktree! });
+    const { assignmentId } = await workers.dispatch(ticketId);
+    assert.equal(await main(["dev", "watchdog"], { ...run.deps, store, workers }), 0);
+    const session = run.runner.sessions[0]!;
+    assert.equal(store.getTicket(ticketId).pauseCause, "budget reached: time");
+    assert.equal(session.running, 1);
+    assert.equal(store.ticketTurns(ticketId)[0]!.status, "running");
+    assert.equal(session.prompts.length, 1);
+    session.auto = true;
+    session.release();
+    await workers.drain();
+    assert.deepEqual(store.ticketTurns(ticketId).map((turn) => [turn.kind, turn.status]), [["dispatch", "completed"], ["budget_pause", "completed"]]);
+    assert.match(session.prompts[1]!, /Push your work in progress/);
+    assert.equal(store.getAssignment(assignmentId).outcome, null);
+  } finally { store.close(); }
+});
+
 test(
   "watchdog prints each check, flags a stall once, and a failed Semon read exits non-zero",
   withDb(async (dbPath) => {
@@ -424,7 +453,7 @@ test("run needs --interval with whole seconds", async () => {
 });
 
 test(
-  "a stopped run cuts off a running Worker turn instead of waiting for it, and leaves it open",
+  "a stopped run interrupts the Worker and retains its assignment for recovery",
   withDb(async (dbPath) => {
     const store = Store.open(dbPath);
     const source = store.ensureSource("github", "onsager-ai/ostrom");
@@ -444,8 +473,27 @@ test(
     const stop = new AbortController();
     const run = deps(tickEnv(dbPath), github.gh, semonAnswer(20, []));
     run.runner.hold = true;
+    // Effort selection uses Codex; only the resumed Claude Worker should hold its turn open.
+    run.deps.runners = { claude: run.runner, codex: new FakeRunner() };
+    let workerStarted!: () => void;
+    const started = new Promise<void>((resolve) => { workerStarted = resolve; });
+    const resume = run.runner.resume.bind(run.runner);
+    run.runner.resume = (options) => {
+      const session = resume(options);
+      const send = session.send.bind(session);
+      session.send = (prompt, signal) => {
+        const result = send(prompt, signal);
+        workerStarted();
+        return result;
+      };
+      return session;
+    };
     run.deps.stop = stop.signal;
-    run.deps.sleep = async () => { stop.abort(); };
+    run.deps.sleep = async () => {
+      await started;
+      assert.equal(run.runner.sessions[0]!.running, 1, "shutdown interrupts an active Worker SDK call");
+      stop.abort();
+    };
     await main(["run", "--interval", "30"], run.deps);
 
     const after = Store.open(dbPath);
@@ -453,6 +501,9 @@ test(
       const a = after.getAssignment(assignmentId);
       assert.deepEqual([a.state, a.outcome, a.interruptions], ["running", null, 1]);
       assert.notEqual(a.turnStartedAt, null, "the next start resumes it");
+      const turn = after.ticketTurns(ticketId!).at(-1)!;
+      assert.equal(turn.status, "interrupted");
+      assert.notEqual(turn.endedAt, null);
     } finally {
       after.close();
     }

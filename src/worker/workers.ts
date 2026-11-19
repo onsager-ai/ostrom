@@ -115,7 +115,9 @@ export class Workers {
         cwd: path,
         model: selected.model,
         writableDirs: gitDirs(config.repo, path),
+        onActivity: () => { if (!this.#stopping) store.recordWorkerActivity(id); },
         onSessionId: (sessionId) => {
+          if (this.#stopping) return;
           store.startNativeAssignment(id, sessionId);
           this.#annotate(id, sessionId, null, null);
           store.beginTurn(id);
@@ -178,13 +180,25 @@ export class Workers {
     return true;
   }
 
-  /**
-   * For an ostromd shutdown: cuts off every running turn and starts no queued one. A cut-off turn
-   * stays open in the store, so the next start resumes it by session ID (`recover`), as after a crash.
-   */
+  /** Stops SDK turns and records their stop time; the assignment marker requests recovery next start. */
   stop(): void {
     this.#stopping = true;
-    for (const controller of this.#inFlight.values()) controller.abort();
+    for (const [id, controller] of this.#inFlight) {
+      this.#deps.store.finishWorkerTurn(id, "interrupted", null, undefined, "ostromd stopped during the turn");
+      controller.abort();
+    }
+  }
+
+  /** SDK cancellation may stall; the daemon must still release its store and exit. */
+  async shutdown(timeoutMs = 5_000): Promise<boolean> {
+    this.stop();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        this.drain().then(() => true),
+        new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), timeoutMs); }),
+      ]);
+    } finally { clearTimeout(timer); }
   }
 
   /**
@@ -195,7 +209,7 @@ export class Workers {
     const { store } = this.#deps;
     const pass = { resumed: [] as number[], interrupted: [] as number[], abandoned: [] as number[] };
     for (const pending of store.pendingAssignments()) {
-      store.finishWorkerTurn(pending.id, "interrupted", null, undefined, "ostromd stopped before the session started");
+      store.interruptRecoveredTurn(pending.id, "ostromd stopped before the session started");
       store.abandonAssignment(pending.id, "ostromd stopped before the session started");
       pass.abandoned.push(pending.id);
     }
@@ -208,7 +222,7 @@ export class Workers {
         const reviews = store.reviewDeliveries(assignment.id, turnId);
         const interrupted = store.unfinishedTurns(assignment.id).filter((turn) => turn.state === "running");
         const prompt = [INTERRUPTED_PROMPT, ...interrupted.map((turn) => turn.prompt)].join("\n\n");
-        store.finishWorkerTurn(assignment.id, "interrupted", null, undefined, "ostromd stopped during the turn");
+        store.interruptRecoveredTurn(assignment.id, "ostromd stopped during the turn");
         store.recordInterruption(assignment.id);
         store.finishRunningTurns(assignment.id);
         store.endTurn(assignment.id, null);
@@ -243,6 +257,7 @@ export class Workers {
         cwd: assignment.worktree!,
         model: assignment.model!,
         sessionId: assignment.sessionId!,
+        onActivity: () => { if (!this.#stopping) this.#deps.store.recordWorkerActivity(assignment.id); },
         writableDirs: gitDirs(this.#deps.config.repo, assignment.worktree!),
       });
       this.#sessions.set(assignment.id, session);
@@ -371,6 +386,7 @@ export class Workers {
   }
 
   async #firstTurn(id: number, session: Session, prompt: string): Promise<void> {
+    if (this.#stopping) return;
     const { store } = this.#deps;
     const controller = new AbortController();
     this.#inFlight.set(id, controller);
@@ -406,6 +422,7 @@ export class Workers {
     onStart?: (turnId: string) => void,
     onComplete?: (result: TurnResult) => void | Promise<void>,
   ): Promise<void> {
+    if (this.#stopping) return;
     const { store } = this.#deps;
     const assignment = store.getAssignment(id);
     const queued = store.queuedTurn(id, key);

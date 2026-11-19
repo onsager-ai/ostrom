@@ -23,6 +23,7 @@ export interface SessionOptions {
   effort?: Effort | null;
   sessionId?: string;
   onSessionId?: (id: string) => void;
+  onActivity?: () => void;
   /** A Router uses a one-shot, read-only session; Workers retain their writable worktree. */
   sandbox?: "read-only" | "workspace-write";
   /** Git metadata paths a Codex Worker needs outside its worktree. */
@@ -85,6 +86,7 @@ export function claudeRunner(env: Record<string, string | undefined>, run: Claud
             : { permissionMode: "bypassPermissions" as const, allowDangerouslySkipPermissions: true }),
           ...(id === null ? {} : { resume: id }),
         } })) {
+          options.onActivity?.();
           if (message.type === "system" && message.subtype === "init") {
             if (id === null) options.onSessionId?.(message.session_id);
             id = message.session_id;
@@ -146,6 +148,7 @@ export function codexRunner(config: CodexOptions, makeClient: CodexClientFactory
         }
         const { events } = await thread.runStreamed(prompt, signal ? { signal } : {});
         for await (const event of events) {
+          options.onActivity?.();
           if (event.type === "thread.started") {
             if (id === null) options.onSessionId?.(event.thread_id);
             id = event.thread_id;
