@@ -192,7 +192,7 @@ test("conflicts deliver once per head and base, retain the wait after completion
       assert.equal(f.deliveries.length, 1);
       const { key, prompt } = f.deliveries[0]!;
       assert.equal(key, `conflict-a${f.assignment}-head-base`);
-      assert.match(prompt, /Merge the latest main into the existing PR branch b using git merge/);
+      assert.match(prompt, /Fetch origin\/main, then merge the latest origin\/main into the existing PR branch b using git merge/);
       assert.match(prompt, /both sides' intent/);
       assert.match(prompt, /keep every entry.*CHANGELOG\.md/);
       assert.match(prompt, /push.*do not open a new PR/);
@@ -279,7 +279,7 @@ test("failed CI wakes once per head, including after completion; passing CI neve
     const { key, prompt } = f.deliveries[0]!;
     assert.equal(key, `ci-fix-a${f.assignment}-head`);
     assert.match(prompt, /check: https:\/\/github.com\/o\/r\/actions\/runs\/3\/job\/4/);
-    assert.match(prompt, /compare these failures with the current main head/);
+    assert.match(prompt, /Fetch origin\/main and compare these failures with the current origin\/main head/);
     assert.equal(f.store.queuedTurn(f.assignment, key)?.kind, "ci_fix");
     await mergePass(f.options());
     assert.equal(f.deliveries.length, 1);
