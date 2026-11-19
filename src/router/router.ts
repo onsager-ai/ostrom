@@ -15,7 +15,8 @@ import { tmpdir } from "node:os";
 import { DEFAULT_BUDGET, type BudgetDefaults } from "../budget/budgets.ts";
 import { join } from "node:path";
 
-import { allowedModels, recordModelChoice } from "./selection.ts";
+import { allowedModels, overrideSelection, recordModelChoice } from "./selection.ts";
+import { parseSelectionCommands } from "../commands/parser.ts";
 import { queueStatusCard } from "../github/cards.ts";
 import { readyPolicySentence, type MergePolicy } from "../github/merge-policy.ts";
 import { ghGet, type GhRunner } from "../github/gh.ts";
@@ -187,7 +188,24 @@ export async function routeCandidates(options: RouteOptions): Promise<RoutePassR
       reason: decision.reason,
       ...(decision.reply === null ? {} : { reply: decision.reply }),
     }, options.budget ?? DEFAULT_BUDGET);
-    if (recorded.ticketId !== null) recordModelChoice(store, recorded.ticketId, decision.model, decision.modelReason, { decision, batch });
+    if (recorded.ticketId !== null) {
+      recordModelChoice(store, recorded.ticketId, decision.model, decision.modelReason, { decision, batch });
+      const acceptedTriggerIds = new Set(batch.threads.find((thread) => thread.thread === decision.thread)?.candidates.map((candidate) => candidate.trigger) ?? []);
+      for (const triggerId of decision.triggers) {
+        if (!acceptedTriggerIds.has(triggerId)) continue;
+        const trigger = store.getTrigger(triggerId);
+        const commands = parseSelectionCommands(trigger.body ?? "");
+        for (const [index, parsed] of commands.entries()) {
+          let body: string;
+          try {
+            body = overrideSelection(store, recorded.ticketId, parsed.command === "use" ? "model" : "effort", parsed.value);
+          } catch (error) {
+            body = `Override refused: ${message(error)}`;
+          }
+          store.enqueueReply({ id: `selection-${trigger.id}-${recorded.ticketId}-${index}`, threadId: trigger.threadId, body, blocking: true });
+        }
+      }
+    }
     result.decisions.push({ ...recorded, thread: decision.thread, triggers: decision.triggers, verdict: decision.verdict });
   }
   const outcomes = new Map(batch.outcomes.map((outcome) => [outcome.key, outcome]));

@@ -7,7 +7,7 @@ import { Store } from "../store/store.ts";
 import { FakeRunner } from "../worker/fake-runner.ts";
 import { Workers } from "../worker/workers.ts";
 import { operatorControls, routeCommands } from "./commands.ts";
-import { parseComment } from "./parser.ts";
+import { parseComment, parseSelectionCommands } from "./parser.ts";
 import { controlsLine, renderCommandTable } from "./table.ts";
 
 const REPO = "onsager-ai/ostrom";
@@ -73,6 +73,13 @@ test("allowlisted issue redirects clear public stalls without an open-to-open tr
     assert.equal(store.getTicket(ticketId).state, "open");
     await workers.drain();
   }
+});
+
+test("selection commands can appear within a start comment", () => {
+  assert.deepEqual(parseSelectionCommands("@ostrom please take this issue.\n@ostrom effort high and @ostrom use codex/luna"), [
+    { kind: "command", command: "effort", value: "high" },
+    { kind: "command", command: "use", value: "codex/luna" },
+  ]);
 });
 
 test("commands are case-insensitive and must start the comment", () => {
