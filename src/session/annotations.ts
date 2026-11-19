@@ -61,8 +61,17 @@ const lastAnnotationBySession = new Map<string, { pr: number | null; title: stri
  * for the session. The memory is per process, so the first pass after a restart writes one line
  * that repeats the last one; Semon keeps the latest line, so that is harmless.
  */
+function memoryKey(env: Record<string, string | undefined>, harness: SessionAnnotation["harness"], nativeId: string): string {
+  return `${annotationsPath(env)}:${harness}:${nativeId}`;
+}
+
+/** The PR and title this process last wrote for a session, or undefined before its first write. */
+export function rememberedAnnotation(harness: SessionAnnotation["harness"], nativeId: string, env = process.env): { pr: number | null; title: string | null } | undefined {
+  return lastAnnotationBySession.get(memoryKey(env, harness, nativeId));
+}
+
 export function appendSessionAnnotationIfChanged(input: Parameters<typeof buildSessionAnnotation>[0], env = process.env): boolean {
-  const key = `${annotationsPath(env)}:${input.harness}:${input.native_id}`;
+  const key = memoryKey(env, input.harness, input.native_id);
   const next = { pr: input.pr, title: truncateTitle(input.title) };
   const previous = lastAnnotationBySession.get(key);
   if (previous && previous.pr === next.pr && previous.title === next.title) return false;

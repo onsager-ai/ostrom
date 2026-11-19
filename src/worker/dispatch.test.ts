@@ -104,7 +104,7 @@ test("observe subscribes the ticket to the Worker's PRs, once across passes", as
   assert.deepEqual(second.observed[0]?.newlySubscribed, []);
 });
 
-test("observe writes a Semon line when the PR or the title changes, and none on a repeat pass", async () => {
+test("observe writes a Semon line when the lowest PR changes, and looks up the title only then", async () => {
   const { store, github, ticketId, worker } = fixture();
   const id = worker("sess-1");
   const branch = `ostrom/ticket-${ticketId}-${id}`;
@@ -115,6 +115,7 @@ test("observe writes a Semon line when the PR or the title changes, and none on 
   try {
     github.issue(7);
     github.issues.get(7)!["title"] = "README typo";
+    const issueCalls = () => github.calls.filter((call) => call.some((arg) => arg.endsWith("/issues/7"))).length;
     github.pulls.push({ branch, number: 12, state: "open" });
     await observe(store, github.gh, REPO);
     await observe(store, github.gh, REPO);
@@ -122,10 +123,19 @@ test("observe writes a Semon line when the PR or the title changes, and none on 
     assert.equal(lines()[0]?.["pr"], 12);
     assert.equal(lines()[0]?.["title"], "README typo");
     assert.equal(lines()[0]?.["native_id"], "sess-1");
+    assert.equal(issueCalls(), 1, "the title is fetched once for the PR");
 
+    // Title edits are picked up only when the PR number changes, so a repeat pass makes no lookup.
     github.issues.get(7)!["title"] = "Updated title";
     await observe(store, github.gh, REPO);
+    assert.equal(lines().length, 1);
+    assert.equal(issueCalls(), 1, "a repeat pass with an unchanged PR makes no title lookup");
+
+    github.pulls.push({ branch, number: 11, state: "open" });
+    await observe(store, github.gh, REPO);
+    assert.equal(issueCalls(), 2);
     assert.equal(lines().length, 2);
+    assert.equal(lines()[1]?.["pr"], 11);
     assert.equal(lines()[1]?.["title"], "Updated title");
   } finally {
     if (saved === undefined) delete process.env["XDG_STATE_HOME"];
