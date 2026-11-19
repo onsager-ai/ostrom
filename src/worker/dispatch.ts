@@ -76,7 +76,7 @@ export async function pullRequestsForBranch(gh: GhRunner, repo: string, branch: 
         throw new Error(`gh pulls for ${branch}: unexpected item ${JSON.stringify(item)}`);
       }
       const state: PullRequestState = item["merged_at"] != null ? "merged" : item["state"] === "closed" ? "closed" : "open";
-      return { number: item["number"], url: item["html_url"], state, body: item["body"] };
+      return { number: item["number"], url: item["html_url"], state, ...(typeof item["body"] === "string" ? { body: item["body"] } : item["body"] === null ? { body: "" } : {}) };
     })
     .sort((a, b) => a.number - b.number);
 }
