@@ -28,7 +28,7 @@ export function workerBrief(context: TicketContext, branch: string, base: string
     "",
     "Read that thread and those comments with `gh` for the full request; this message does not copy them.",
     `Do the work in this worktree on branch ${branch}. Commit, push the branch, and open a pull request`,
-    `on ${source.name} against ${base} whose description says "Refs #${thread.number}".`,
+    `on ${source.name} against ${base} whose description says "Refs #${thread.number}". Open it ready for review, not as a draft.`,
     "Do not comment on GitHub yourself: Ostrom replies to people. After the quiet window Ostrom may",
     "squash-merge your pull request, so do not merge it, enable auto-merge, dismiss reviews, or resolve",
     "human review threads yourself. Review comments on your pull request will reach you in this session as follow-up messages.",

@@ -59,6 +59,7 @@ test("the brief is a summary plus pointers and asks for a PR that references the
   assert.match(brief, new RegExp(`- https://github.com/${REPO}/issues/7#issuecomment-1\n`));
   assert.match(brief, /branch ostrom\/ticket-1-1/);
   assert.match(brief, new RegExp(`pull request\non ${REPO} against main whose description says "Refs #7"`));
+  assert.match(brief, /Open it ready for review, not as a draft/);
   assert.match(brief, /Ostrom may\nsquash-merge your pull request/);
   assert.match(brief, /do not merge it, enable auto-merge, dismiss reviews, or resolve\nhuman review threads/);
 });

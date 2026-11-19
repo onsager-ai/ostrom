@@ -55,10 +55,11 @@ not establish ownership. Human policy skips merge requests entirely. Otherwise a
 2. The Worker has no running or queued turn, undelivered follow-up, unhandled command, recovery or
    stop cleanup. Check durable work as well as the runner queue. Reserve that assignment while
    sending the merge request, so no local turn can start concurrently.
-3. The PR is open, not draft, and still has the captured head and base SHAs. GitHub reports
-   `mergeable=true` and GraphQL `mergeStateStatus=CLEAN`. Null/UNKNOWN waits for another tick;
-   conflicts, BEHIND, BLOCKED, UNSTABLE and HAS_HOOKS block this first implementation. CLEAN alone
-   is insufficient evidence of CI or protection compliance. [1][2]
+3. The Worker opens the PR ready for review, not as a draft. The PR must remain open and retain the
+   captured head and base SHAs. GitHub reports `mergeable=true` and GraphQL
+   `mergeStateStatus=CLEAN`. Null/UNKNOWN waits for another tick; conflicts, BEHIND, BLOCKED,
+   UNSTABLE and HAS_HOOKS block this first implementation and the refusal names the observed field
+   value or moved SHA. CLEAN alone is insufficient evidence of CI or protection compliance. [1][2]
 4. CI evidence comes primarily from the head commit's `statusCheckRollup`, in the same GraphQL
    query as merge/review state and threads. Require `commit.oid` to equal the captured head,
    `state=SUCCESS`, and read every page of `contexts` (CheckRun or StatusContext). Every required
