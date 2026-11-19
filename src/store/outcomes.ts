@@ -24,7 +24,7 @@ export function modelOutcomes(db: DatabaseSync, repository?: string): ModelOutco
   const rows = db.prepare(`
     SELECT source.name AS repository, first.kind, turn.harness, turn.requested_model AS model,
       turn.ticket_id, COUNT(*) AS turns,
-      SUM(MAX(0, turn.input_tokens - turn.cached_input_tokens) + turn.output_tokens) AS fresh_tokens,
+      SUM(turn.input_tokens + turn.output_tokens) AS fresh_tokens,
       SUM(CASE WHEN turn.kind = 'review' THEN 1 ELSE 0 END) AS reviews,
       EXISTS (
         SELECT 1 FROM pr_merge AS merged
@@ -45,7 +45,8 @@ export function modelOutcomes(db: DatabaseSync, repository?: string): ModelOutco
       ) AS merged
     FROM turn
     JOIN ticket ON ticket.id = turn.ticket_id
-    JOIN thread ON thread.id = ticket.thread_id
+    JOIN decision ON decision.id = ticket.decision_id
+    JOIN thread ON thread.id = decision.thread_id
     JOIN source ON source.id = thread.source_id
     JOIN turn AS first ON first.id = (SELECT MIN(id) FROM turn WHERE ticket_id = ticket.id)
     WHERE (? IS NULL OR source.name = ?)

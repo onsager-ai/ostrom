@@ -1,5 +1,6 @@
 import type { DatabaseSync } from "node:sqlite";
 import type { DiscoveredModel, Harness } from "../session/models.ts";
+import { modelOutcomes, type ModelOutcome } from "./outcomes.ts";
 
 export type Objective = "cost" | "balanced" | "quality";
 export interface ModelSelection {
@@ -15,7 +16,7 @@ export interface ModelExport { version: 1; objective: Objective; selections: Mod
 export interface ModelView {
   objective: Objective;
   discoveries: { harness: Harness; discoveredAt: string | null; lastError: string | null }[];
-  models: (DiscoveredModel & { selection: ModelSelection | null; allowed: boolean; flags: string[] })[];
+  models: (DiscoveredModel & { selection: ModelSelection | null; allowed: boolean; flags: string[]; history: ModelOutcome[] })[];
 }
 export type ModelChange =
   | { action: "allow" | "remove"; harness: Harness; model: string }
@@ -71,7 +72,7 @@ export class ModelStore {
   view(): ModelView {
     const settings = this.export();
     const discoveries: ModelView["discoveries"] = [];
-    const models: ModelView["models"] = [];
+    const models: Omit<ModelView["models"][number], "history">[] = [];
     for (const row of this.#db.prepare("SELECT * FROM model_discovery ORDER BY harness").all()) {
       discoveries.push({ harness: row["harness"] as Harness, discoveredAt: row["discovered_at"] as string | null, lastError: row["last_error"] as string | null });
       for (const model of JSON.parse(row["models"] as string) as DiscoveredModel[]) {
@@ -87,7 +88,11 @@ export class ModelStore {
       models.push({ harness: selected.harness, id: selected.model, displayName: selected.model, description: "", efforts: [], defaultEffort: null,
         selection: selected, allowed: selected.allowed, flags: selected.allowed ? ["allowed but no longer offered"] : ["not allowed", "no longer offered"] });
     }
-    return { objective: settings.objective, discoveries, models };
+    const allowed = new Set(models.filter((model) => model.allowed).map((model) => `${model.harness}/${model.id}`));
+    const outcomes = allowed.size ? modelOutcomes(this.#db) : [];
+    return { objective: settings.objective, discoveries, models: models.map((model) => ({ ...model,
+      history: model.allowed ? outcomes.filter((row) => row.harness === model.harness && row.model === model.id) : [],
+    })) };
   }
 
   /** Validate the entire request before mutating; import replaces all selections atomically. */

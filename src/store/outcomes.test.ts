@@ -20,7 +20,7 @@ test("outcomes aggregate ticket totals before medians, partition repositories/ki
   };
   const turn = (id: number, kind: string, fresh: number, status: "completed" | "failed" = "completed") => {
     store.startWorkerTurn(id, kind);
-    store.finishWorkerTurn(id, status, { inputTokens: fresh + 100, cachedInputTokens: 100, outputTokens: 10 });
+    store.finishWorkerTurn(id, status, { inputTokens: fresh, cachedInputTokens: 100, outputTokens: 10 });
   };
   try {
     assert.deepEqual(store.modelOutcomes(), []);
@@ -65,11 +65,11 @@ test("outcomes aggregate ticket totals before medians, partition repositories/ki
   } finally { store.close(); }
 });
 
-test("outcomes find a merge through a subscribed PR without a merge candidate", () => {
+for (const kind of ["issue", "pull_request"] as const) test(`outcomes link merges through ${kind === "issue" ? "a subscribed PR" : "the original PR thread"} without a candidate`, () => {
   const store = Store.open(":memory:");
   try {
     const source = store.ensureSource("github", "o/r");
-    const threadId = store.ensureThread({ sourceId: source.id, kind: "pull_request", number: 1, url: "https://example.test/pr" });
+    const threadId = store.ensureThread({ sourceId: source.id, kind, number: 1, url: "https://example.test/thread" });
     const trigger = store.insertTrigger({ sourceId: source.id, sourceEventId: "one", threadId, kind: "issue_comment", actor: "operator", url: "https://example.test/comment", occurredAt: new Date() }).id;
     const ticketId = store.recordDecision({ threadId, triggerIds: [trigger], verdict: "accept", reason: "work" }).ticketId!;
     const id = store.createAssignment(ticketId);
@@ -78,8 +78,11 @@ test("outcomes find a merge through a subscribed PR without a merge candidate", 
     store.startWorkerTurn(id, "dispatch");
     store.finishWorkerTurn(id, "failed", { inputTokens: 5, cachedInputTokens: 10, outputTokens: 2 });
     store.recordMergeAndOutcome({ repository: "o/r", prNumber: 1, headSha: "head", mergeSha: null, mergedAt: new Date(), mergedByLogin: null, mergedById: null, origin: "external", assignmentId: id, threadId, body: "merged", evidence: "test" });
-    store.unsubscribeTicket(ticketId);
+    if (kind === "issue") {
+      const pr = store.ensureThread({ sourceId: source.id, kind: "pull_request", number: 1, url: "https://example.test/pr" });
+      store.subscribe(ticketId, pr);
+    } else store.unsubscribeTicket(ticketId);
     assert.equal(store.modelOutcomes()[0]!.merged, 1);
-    assert.equal(store.modelOutcomes()[0]!.medianFreshTokens, 2);
+    assert.equal(store.modelOutcomes()[0]!.medianFreshTokens, 7);
   } finally { store.close(); }
 });

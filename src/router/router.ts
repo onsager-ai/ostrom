@@ -174,7 +174,16 @@ export async function routeCandidates(options: RouteOptions): Promise<RoutePassR
   };
   if (batch.threads.length === 0 && batch.outcomes.length === 0) return result;
 
-  const asked = await askRouter(options, routerMessage(batch, { objective: store.models.view().objective, models: allowedModels(store) }));
+  const models = allowedModels(store);
+  const keys = new Set(models.map((model) => model.key));
+  const history = store.modelOutcomes(options.repo)
+    .filter((row) => keys.has(`${row.harness}/${row.model}`))
+    .sort((a, b) => b.started - a.started || a.kind.localeCompare(b.kind) || a.harness.localeCompare(b.harness) || a.model.localeCompare(b.model));
+  const selection = { objective: store.models.view().objective, models,
+    history: { repository: options.repo, rows: history.slice(0, 24), omittedRows: Math.max(0, history.length - 24),
+      note: history.length === 0 ? "No outcome history for allowed models in this repository. Start on the cheapest model and a moderate effort." :
+        "Grouped by first recorded turn kind; medians per ticket/model include failed and unfinished work. Fresh tokens = uncached input + output; review rounds = review turns. Models/kinds without a row have no recorded history." } };
+  const asked = await askRouter(options, routerMessage(batch, selection));
   result.router = { sessionId: asked.sessionId };
   const answer = parseRouterAnswer(asked.reply, batch);
 
@@ -187,7 +196,7 @@ export async function routeCandidates(options: RouteOptions): Promise<RoutePassR
       ...(decision.reply === null ? {} : { reply: decision.reply }),
     }, options.budget ?? DEFAULT_BUDGET);
     if (recorded.ticketId !== null) {
-      recordModelChoice(store, recorded.ticketId, decision.model, decision.modelReason, { decision, batch });
+      recordModelChoice(store, recorded.ticketId, decision.model, decision.modelReason, { decision, batch, selection });
       const acceptedTriggerIds = new Set(batch.threads.find((thread) => thread.thread === decision.thread)?.candidates.map((candidate) => candidate.trigger) ?? []);
       for (const triggerId of decision.triggers) {
         if (!acceptedTriggerIds.has(triggerId)) continue;
@@ -459,7 +468,8 @@ const OUTCOME_MEANING: Record<OutcomeEvent, string> = {
 };
 
 /** The whole message for one Router turn: the contract, then the batch as JSON. */
-export function routerMessage(batch: Batch, selection?: { objective: string; models: ReturnType<typeof allowedModels> }): string {
+export function routerMessage(batch: Batch, selection?: { objective: string; models: ReturnType<typeof allowedModels>;
+  history: { repository: string; rows: ReturnType<Store["modelOutcomes"]>; omittedRows: number; note: string } }): string {
   const payload = {
     selection,
     threads: batch.threads,
@@ -513,7 +523,7 @@ export function routerMessage(batch: Batch, selection?: { objective: string; mod
     '"stalls":[{"key":"<key>","action":"wait"|"stop","reply":"..."|null}]}',
     "",
     "On accept, also choose model (harness/model) from selection.models and modelReason (one sentence).",
-    "Consider objective, relative cost, approval, allowed efforts and notes. With no history prefer the cheapest model that can merge the task.",
+    "Consider objective, relative cost, approval, allowed efforts, notes and selection.history. With no history start on the cheapest model and a moderate effort.",
     "Approval models require operator approval before use. If selection.models is empty, omit the model fields.",
     "The batch:",
     JSON.stringify(payload, null, 2),
