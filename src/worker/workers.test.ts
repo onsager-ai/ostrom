@@ -280,6 +280,26 @@ test("a queued turn survives a restart and runs exactly once", async () => {
   assert.deepEqual(resumed.prompts, [workerTurnPrompt(`${workerTurnPrompt(INTERRUPTED_PROMPT)}\n\n${workerTurnPrompt("next")}`)]);
 });
 
+test("a persisted recovery leads older queued feedback after another restart", async () => {
+  const { store, runner, ticketId, workers, make } = fixture();
+  runner.hold = true;
+  await workers.dispatch(ticketId);
+  workers.deliver(1, "queued", "next", () => {});
+  workers.stop();
+  await workers.drain();
+  store.pauseTicket(ticketId, "operator");
+  const paused = make();
+  paused.recover();
+  await paused.drain();
+  store.resumeTicket(ticketId);
+  runner.hold = false;
+  const restarted = make();
+  restarted.recover();
+  await restarted.drain();
+  assert.deepEqual(runner.sessions.at(-1)!.prompts, [workerTurnPrompt(`${workerTurnPrompt(INTERRUPTED_PROMPT)}\n\n${workerTurnPrompt("next")}`)]);
+  assert.deepEqual(store.unfinishedTurns(1), []);
+});
+
 test("a reservation blocks a new queued turn without consuming budget and release wakes it", async () => {
   const { store, runner, ticketId, workers } = fixture();
   await workers.dispatch(ticketId);

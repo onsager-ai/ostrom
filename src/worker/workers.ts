@@ -213,7 +213,9 @@ export class Workers {
         store.finishRunningTurns(assignment.id);
         store.endTurn(assignment.id, null);
         pass.interrupted.push(assignment.id);
-        this.deliver(assignment.id, `recovery-${assignment.interruptions + 1}`, prompt, () => {}, (result) => {
+        this.deliver(assignment.id, `recovery-${assignment.interruptions + 1}`, prompt, (recoveryTurnId) => {
+          store.recoverDeliveries(assignment.id, turnId, recoveryTurnId);
+        }, (result) => {
           for (const review of reviews) {
             store.enqueueReply({
               id: `review-${assignment.id}-${review.reviewId}`,
@@ -303,9 +305,12 @@ export class Workers {
     if (turn.kind === "budget_pause") return { onComplete: () => queueStatusCard(store, store.getAssignment(id).ticketId) };
     if (turn.kind === "stuck") return this.#restoredStuck(id, key);
     if (turn.kind === "recovery" && turn.sourcePointer !== null) {
+      const interruptedTurnId = turn.sourcePointer;
+      const reviews = store.reviewDeliveries(id, interruptedTurnId);
       return {
+        onStart: (recoveryTurnId) => store.recoverDeliveries(id, interruptedTurnId, recoveryTurnId),
         onComplete: (result) => {
-          for (const review of store.reviewDeliveries(id, turn.sourcePointer!)) {
+          for (const review of reviews) {
             store.enqueueReply({ id: `review-${id}-${review.reviewId}`, threadId: review.threadId, body: renderReviewReply(result.text) });
           }
         },
