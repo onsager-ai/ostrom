@@ -6,6 +6,7 @@ import type { MergeCandidate, Store } from "../store/store.ts";
 import { queueStatusCard } from "./cards.ts";
 import { ghMergeGet, ghSquashMerge, type GhRunner } from "./gh.ts";
 import { mergeEligibility, readyPolicySentence, type ApprovalIdentity, type MergePolicy } from "./merge-policy.ts";
+import { hasReplyMarker } from "./marker.ts";
 import { readMergeEvidence, type MergeEvidence } from "./merge-reader.ts";
 
 const QUIET_MS = 10 * 60_000;
@@ -191,8 +192,8 @@ async function observe(options: MergePassOptions, assignmentId: number, prNumber
     local: options.store.ticketActivityAt(assignment.ticketId),
     issue: [issue["state"], issue["title"], issue["body"], issue["labels"]],
     pr: [pull["title"], pull["body"], pull["draft"], pull["requested_reviewers"], pull["labels"]],
-    comments: comments.filter((c) => typeof c["body"] !== "string" || !c["body"].includes("<!-- ostrom:")).map((c) => [c["id"], c["body"], c["updated_at"]]),
-    reviews: evidence.reviews.filter((r) => !isApprovalOnly(r.state, r.body, r.inlineComments) &&
+    comments: comments.filter((c) => typeof c["body"] !== "string" || !hasReplyMarker(c["body"])).map((c) => [c["id"], c["body"], c["updated_at"]]),
+    reviews: evidence.reviews.filter((r) => !hasReplyMarker(r.body) && !isApprovalOnly(r.state, r.body, r.inlineComments) &&
       !(r.state === "APPROVED" && r.inlineComments === 0 && options.store.hasApprovalReceipt(context.thread.sourceId, r.id)))
       .map((r) => [r.id, r.state, r.submittedAt, r.commitOid, r.body, r.inlineComments]),
     threads: evidence.threads,

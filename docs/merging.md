@@ -99,7 +99,8 @@ not establish ownership. Human policy skips merge requests entirely. Otherwise a
    comments. The empty/short approval path needs no Router call. Refresh
    these directly before merging; the intake cursor alone is insufficient. Newly observed changes
    with no reliable timestamp restart the timer at observation. Treat unmarked actor activity as
-   human conservatively; Ostrom's marked cards/replies and CI updates do not restart it. Pending
+   human conservatively; comments and reviews carrying Ostrom's hidden reply marker, status cards,
+   and CI updates do not restart it. Pending
    review drafts are not visible reliably, so this window cannot promise time for an unseen review.
 
 Ten minutes is a fixed milestone-2 default, not another policy knob. A new head/base or changed

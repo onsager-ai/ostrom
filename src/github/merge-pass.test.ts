@@ -15,6 +15,7 @@ import { ghHttpStatus, mergePass, type MergePassOptions } from "./merge-pass.ts"
 import type { MergePolicy } from "./merge-policy.ts";
 import type { GhRunner } from "./gh.ts";
 import { sendDueReplies } from "./outbox.ts";
+import { replyMarker } from "./marker.ts";
 
 const MINUTE = 60_000;
 const pageInfo = { hasNextPage: false, endCursor: null };
@@ -391,6 +392,31 @@ for (const feedback of [{ body: "Please rename this" }, { inlineComments: 1 }]) 
   assert.deepEqual(result.failed, []);
   assert.ok(f.store.mergeCandidateForAssignment(f.assignment)!.quietDeadline! > previous);
   assert.equal(f.puts.length, 0);
+});
+
+test("Ostrom-marked comment after the last head does not restart the quiet window", async () => {
+  const f = fixture();
+  await ready(f);
+  const previous = f.store.mergeCandidateForAssignment(f.assignment)!.quietDeadline;
+  f.remote.comments.push({ id: 99, body: `PR is open. Ten quiet minutes from this notice.\n\n${replyMarker("ready-pr2")}`, updated_at: f.now().toISOString() });
+  const result = await mergePass(f.options());
+  assert.deepEqual(result.failed, []);
+  assert.equal(f.store.mergeCandidateForAssignment(f.assignment)!.quietDeadline, previous);
+  assert.equal(f.puts.length, 1);
+  done(f, "ostrom");
+});
+
+test("a human comment after the last head restarts the quiet window", async () => {
+  const f = fixture();
+  await ready(f);
+  const previous = f.store.mergeCandidateForAssignment(f.assignment)!.quietDeadline!;
+  f.remote.comments.push({ id: 100, body: "Please take another look", updated_at: f.now().toISOString() });
+  await mergePass(f.options());
+  const deadline = f.store.mergeCandidateForAssignment(f.assignment)!.quietDeadline!;
+  assert.ok(deadline > previous);
+  assert.equal(deadline, new Date(f.now().getTime() + 10 * MINUTE).toISOString());
+  assert.equal(f.puts.length, 0);
+  unmerged(f);
 });
 
 for (const kind of ["comment trigger", "submitted review", "direct comment edit"] as const) test(`${kind} during the quiet window pushes its deadline out`, async () => {
