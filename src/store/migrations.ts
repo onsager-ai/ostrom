@@ -682,6 +682,32 @@ export const migrations: readonly string[] = [
   ALTER TABLE command_receipt_v34 RENAME TO command_receipt;
   CREATE INDEX command_receipt_by_ticket ON command_receipt (ticket_id, trigger_id);
   `,
+  // 35: CI fixes are durable Worker turns, deduplicated by PR head.
+  `
+  CREATE TABLE queued_turn_v35 (
+    assignment_id INTEGER NOT NULL REFERENCES assignment (id),
+    delivery_key TEXT NOT NULL CHECK (delivery_key <> ''),
+    kind TEXT NOT NULL CHECK (kind IN ('follow_up', 'review', 'control', 'budget_pause', 'stuck', 'recovery', 'conflict', 'ci_fix')),
+    source_pointer TEXT,
+    prompt TEXT NOT NULL CHECK (prompt <> ''),
+    state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'finished', 'cancelled')),
+    turn_id TEXT,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    PRIMARY KEY (assignment_id, delivery_key),
+    CHECK (
+      (state = 'queued' AND started_at IS NULL AND finished_at IS NULL AND turn_id IS NULL) OR
+      (state = 'running' AND started_at IS NOT NULL AND finished_at IS NULL) OR
+      (state = 'finished' AND started_at IS NOT NULL AND finished_at IS NOT NULL) OR
+      (state = 'cancelled' AND started_at IS NULL AND finished_at IS NOT NULL AND turn_id IS NULL)
+    )
+  ) STRICT, WITHOUT ROWID;
+  INSERT INTO queued_turn_v35 SELECT * FROM queued_turn;
+  DROP TABLE queued_turn;
+  ALTER TABLE queued_turn_v35 RENAME TO queued_turn;
+  CREATE INDEX queued_turn_unfinished ON queued_turn (assignment_id, state) WHERE state IN ('queued', 'running');
+  `,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */

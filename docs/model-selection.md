@@ -20,8 +20,13 @@ PR 1 implementation (effort and turn records):
   resumes the same native thread with new options. Null or absent effort leaves the harness default.
 - Every Worker invocation records requested and observed model/effort, kind, usage and status in
   `turn`; `ostrom show` includes these records. Existing source kinds distinguish dispatch, review,
-  redirect, control, ordinary follow-up, budget pause, stuck handling and recovery. CI fixes and
-  conflicts are not separately identified by today's call sites.
+  redirect, control, ordinary follow-up, budget pause, stuck handling, recovery, conflict and CI fix.
+  The merge pass queues a `ci_fix` turn when a required check fails on the current PR head, once per
+  assignment and head SHA, including across restarts. It waits while any work for that ticket is
+  running or queued, and skips paused, stopping, ended, stalled or exhausted tickets. The prompt
+  includes failed check names and run/log links and asks the Worker to compare them with the current
+  base branch before fixing the existing PR. Base-branch check results are not fetched by the merge
+  pass. Like automatic conflict turns, CI fixes use the normal per-turn Router effort choice.
 - Claude's init message records its observed model without enforcing equality: aliases and gateway
   IDs can resolve to a different ID. Observed Claude effort remains null because the SDK does not
   report it. Codex's last native rollout `turn_context` supplies raw model and effort using the

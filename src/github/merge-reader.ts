@@ -133,6 +133,25 @@ export async function readMergeEvidence(gh: GhRunner, repo: string, prNumber: nu
   return { pr: decoded, rollup, threads, reviews, rest: { pull, repository: object(repository), protection, rules } };
 }
 
+export interface FailedRequiredCheck { name: string; url: string | null; }
+
+/** Only explicit failures on the current PR head can wake a Worker; pending checks wait. */
+export function failedRequiredChecks(evidence: MergeEvidence): FailedRequiredCheck[] {
+  if (evidence.rollup === null || evidence.rollup.oid !== evidence.pr.head.sha) return [];
+  const failed: FailedRequiredCheck[] = [];
+  for (const value of evidence.rollup.contexts) {
+    const check = object(value);
+    if (check["isRequired"] !== true) continue;
+    if (check["__typename"] === "CheckRun" && check["status"] === "COMPLETED" &&
+        ["FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE"].includes(String(check["conclusion"]))) {
+      failed.push({ name: string(check, "name"), url: typeof check["detailsUrl"] === "string" ? check["detailsUrl"] : null });
+    } else if (check["__typename"] === "StatusContext" && ["FAILURE", "ERROR"].includes(String(check["state"]))) {
+      failed.push({ name: string(check, "context"), url: typeof check["targetUrl"] === "string" ? check["targetUrl"] : null });
+    }
+  }
+  return failed;
+}
+
 async function optionalGet(gh: GhRunner, path: string, classicProtection = false): Promise<unknown> {
   try { return await ghMergeGet(gh, path); }
   catch (error) {

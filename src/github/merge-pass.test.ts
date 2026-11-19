@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
+import { FakeGitHub } from "./fake-github.ts";
 import { Store } from "../store/store.ts";
 import { watchdog } from "../watchdog/watchdog.ts";
 import { advanceStuckLadder } from "../watchdog/stuck.ts";
@@ -100,7 +101,7 @@ function fixture(policy: MergePolicy = { strategy: "unattended" }) {
   const cancelled: number[] = [];
   const deliveries: { key: string; prompt: string }[] = [];
   const workers = { deliver(id: number, key: string, prompt: string) {
-      const added = store.enqueueTurn({ assignmentId: id, deliveryKey: key, prompt, kind: "conflict" });
+      const added = store.enqueueTurn({ assignmentId: id, deliveryKey: key, prompt, kind: key.startsWith("ci-fix-") ? "ci_fix" : "conflict" });
       if (!added.duplicate) deliveries.push({ key, prompt });
       return !added.duplicate;
     }, release(id: number) { released.push(id); store.releaseAssignmentReservation(id); },
@@ -251,6 +252,89 @@ test("conflict recovery respects ticket state, durable idle work, budgets, stall
     f.remote.mergeStateStatus = "DIRTY";
     await mergePass({ ...f.options(), allowSend: false });
     assert.equal(f.deliveries.length, 0);
+  } finally { f.store.close(); }
+});
+
+async function ciFixture() {
+  const f = fixture({ strategy: "human" });
+  const github = new FakeGitHub(f.now, "o/r");
+  github.issue(1);
+  github.issue(2, true);
+  github.pulls.push({ branch: "b", number: 2, state: "open" });
+  const pull = JSON.parse(await f.options().gh(["api", "--method", "GET", "repos/o/r/pulls/2"]));
+  const evidence = JSON.parse(await f.options().gh(["api", "graphql"])).data.repository.pullRequest;
+  github.mergePulls.set(2, { pull, evidence });
+  const commit = evidence.commits.nodes[0].commit;
+  const check = commit.statusCheckRollup.contexts.nodes[0];
+  Object.assign(check, { isRequired: true, conclusion: "FAILURE", detailsUrl: "https://github.com/o/r/actions/runs/3/job/4" });
+  const options = () => ({ ...f.options(), gh: github.gh });
+  return { ...f, github, evidence, commit, check, options };
+}
+
+test("failed required CI wakes once per head, including after completion; passing CI never wakes", async () => {
+  const f = await ciFixture();
+  try {
+    assert.deepEqual((await mergePass(f.options())).failed, []);
+    assert.equal(f.deliveries.length, 1);
+    const { key, prompt } = f.deliveries[0]!;
+    assert.equal(key, `ci-fix-a${f.assignment}-head`);
+    assert.match(prompt, /check: https:\/\/github.com\/o\/r\/actions\/runs\/3\/job\/4/);
+    assert.match(prompt, /compare these failures with the current main head/);
+    assert.equal(f.store.queuedTurn(f.assignment, key)?.kind, "ci_fix");
+    await mergePass(f.options());
+    assert.equal(f.deliveries.length, 1);
+    f.store.beginQueuedTurn(f.assignment, key, "s:1");
+    f.store.finishQueuedTurn(f.assignment, key);
+    await mergePass(f.options());
+    assert.equal(f.deliveries.length, 1);
+    f.evidence.headRefOid = f.commit.oid = "next-head";
+    await mergePass(f.options());
+    assert.equal(f.deliveries.length, 2);
+    assert.equal(f.deliveries[1]!.key, `ci-fix-a${f.assignment}-next-head`);
+    f.store.beginQueuedTurn(f.assignment, f.deliveries[1]!.key, "s:2");
+    f.store.finishQueuedTurn(f.assignment, f.deliveries[1]!.key);
+    f.evidence.headRefOid = f.commit.oid = "passing-head";
+    f.check.conclusion = "SUCCESS";
+    await mergePass(f.options());
+    assert.equal(f.deliveries.length, 2);
+  } finally { f.store.close(); }
+});
+
+test("CI wakes respect controls, idle work, ownership, and current required failures", async () => {
+  const blockers: Record<string, (f: Awaited<ReturnType<typeof ciFixture>>) => void> = {
+    paused: (f) => f.store.pauseTicket(f.ticket, "operator"),
+    ended: (f) => f.store.endTicket(f.ticket),
+    stopping: (f) => f.store.requestStop(f.ticket),
+    running: (f) => { f.store.beginTurn(f.assignment); },
+    queued: (f) => { f.store.enqueueTurn({ assignmentId: f.assignment, deliveryKey: "other", kind: "review", prompt: "work" }); },
+    stalled: (f) => { f.store.recordStall({ assignmentId: f.assignment, semonReason: "idle", detail: null }); },
+    closed: (f) => f.github.close(1, f.now()),
+    ownership: (f) => { f.evidence.headRefName = "other"; },
+    optional: (f) => { f.check.isRequired = false; },
+    pending: (f) => { f.check.status = "IN_PROGRESS"; },
+    staleHead: (f) => { f.commit.oid = "old-head"; },
+  };
+  for (const [name, block] of Object.entries(blockers)) {
+    const f = await ciFixture();
+    try {
+      block(f);
+      assert.deepEqual((await mergePass(f.options())).failed, [], name);
+      assert.equal(f.deliveries.length, 0, name);
+    } finally { f.store.close(); }
+  }
+  const f = await ciFixture();
+  try {
+    await mergePass({ ...f.options(), allowSend: false });
+    assert.equal(f.deliveries.length, 0);
+  } finally { f.store.close(); }
+});
+
+test("failed required legacy statuses carry their log link", async () => {
+  const f = await ciFixture();
+  try {
+    f.commit.statusCheckRollup.contexts.nodes = [{ __typename: "StatusContext", context: "external", state: "ERROR", isRequired: true, targetUrl: "https://ci.example/run/7" }];
+    assert.deepEqual((await mergePass(f.options())).failed, []);
+    assert.match(f.deliveries[0]!.prompt, /external: https:\/\/ci.example\/run\/7/);
   } finally { f.store.close(); }
 });
 
