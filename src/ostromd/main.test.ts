@@ -473,8 +473,27 @@ test(
     const stop = new AbortController();
     const run = deps(tickEnv(dbPath), github.gh, semonAnswer(20, []));
     run.runner.hold = true;
+    // Effort selection uses Codex; only the resumed Claude Worker should hold its turn open.
+    run.deps.runners = { claude: run.runner, codex: new FakeRunner() };
+    let workerStarted!: () => void;
+    const started = new Promise<void>((resolve) => { workerStarted = resolve; });
+    const resume = run.runner.resume.bind(run.runner);
+    run.runner.resume = (options) => {
+      const session = resume(options);
+      const send = session.send.bind(session);
+      session.send = (prompt, signal) => {
+        const result = send(prompt, signal);
+        workerStarted();
+        return result;
+      };
+      return session;
+    };
     run.deps.stop = stop.signal;
-    run.deps.sleep = async () => { stop.abort(); };
+    run.deps.sleep = async () => {
+      await started;
+      assert.equal(run.runner.sessions[0]!.running, 1, "shutdown interrupts an active Worker SDK call");
+      stop.abort();
+    };
     await main(["run", "--interval", "30"], run.deps);
 
     const after = Store.open(dbPath);
