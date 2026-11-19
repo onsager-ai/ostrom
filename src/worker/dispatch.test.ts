@@ -97,9 +97,9 @@ test("a branch's pull requests are read from GitHub with their state", async () 
 test("observe leaves a correct ticket PR body untouched", async () => {
   const { store, github, ticketId, worker } = fixture();
   const id = worker("sess-1");
-  github.pulls.push({ branch: `ostrom/ticket-${ticketId}-${id}`, number: 12, state: "open", body: "Summary\\nCloses #7" });
+  github.pulls.push({ branch: `ostrom/ticket-${ticketId}-${id}`, number: 12, state: "open", body: "Summary\nCloses #7" });
   await observe(store, github.gh, REPO);
-  assert.equal(github.pulls[0]!.body, "Summary\\nCloses #7");
+  assert.equal(github.pulls[0]!.body, "Summary\nCloses #7");
   assert.equal(github.calls.some((call) => call[1] === "--method" && call[2] === "PATCH"), false);
 });
 

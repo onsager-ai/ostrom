@@ -46,7 +46,7 @@ export interface BranchPullRequest {
   number: number;
   url: string;
   state: PullRequestState;
-  body: string;
+  body?: string;
 }
 
 /** Normalize only the ticket's closing line; unrelated body content is preserved. */
@@ -72,7 +72,7 @@ export async function pullRequestsForBranch(gh: GhRunner, repo: string, branch: 
   if (!Array.isArray(found)) throw new Error(`gh pulls for ${branch}: expected a list`);
   return found
     .map((item: Record<string, unknown>) => {
-      if (typeof item["number"] !== "number" || typeof item["html_url"] !== "string" || typeof item["body"] !== "string") {
+      if (typeof item["number"] !== "number" || typeof item["html_url"] !== "string") {
         throw new Error(`gh pulls for ${branch}: unexpected item ${JSON.stringify(item)}`);
       }
       const state: PullRequestState = item["merged_at"] != null ? "merged" : item["state"] === "closed" ? "closed" : "open";
@@ -126,7 +126,7 @@ export async function observe(store: Store, gh: GhRunner, repo: string): Promise
     const newlySubscribed: number[] = [];
     const ticketThread = store.ticketContext(assignment.ticketId).thread;
     for (const pr of pullRequests) {
-      if (ticketThread.kind === "issue") {
+      if (ticketThread.kind === "issue" && pr.body !== undefined) {
         const body = workerPullRequestBody(pr.body, ticketThread.number);
         if (body !== pr.body) {
           try {
