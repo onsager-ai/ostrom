@@ -17,7 +17,9 @@ export interface StatusCard {
   pullRequest?: string;
   harness: "claude" | "codex";
   model: string;
+  pendingModel?: string;
   effort?: string | null;
+  pendingEffort?: string | null;
   selectionReason?: string;
   lastActivityAt: Date;
   now: Date;
@@ -49,8 +51,8 @@ export function renderStatusCard(card: StatusCard): string {
   if (card.mergeStatus !== undefined) lines.push("", `Merge: ${card.mergeStatus}`);
   lines.push(
     "",
-    `Harness: \`${card.harness}\` · Model: \`${card.model}\``,
-    ...(card.effort === undefined ? [] : [`Effort: \`${card.effort ?? "harness default"}\``]),
+    `Harness: \`${card.harness}\` · Model: \`${card.model}\`${card.pendingModel === undefined ? "" : ` (${card.pendingModel} from the next session)`}`,
+    ...(card.effort === undefined ? [] : [`Effort: \`${card.effort ?? "harness default"}\`${card.pendingEffort === undefined ? "" : ` (${card.pendingEffort} from the next turn)`}`]),
     ...(card.selectionReason === undefined ? [] : [`Selection: ${card.selectionReason}`]),
     `Last activity: ${utcMinute(card.lastActivityAt)}`,
     controlsLine(),
