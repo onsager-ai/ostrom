@@ -445,14 +445,12 @@ export class Workers {
     return [modelChoice?.reason, effortReason].filter(Boolean).join(" ");
   }
 
-  async #effort(id: number, kind: string, prompt: string, signal: AbortSignal) {
+  #effort(id: number, kind: string, prompt: string, signal: AbortSignal) {
     if (!this.#deps.router) return Promise.resolve({ effort: null, reason: "Harness default effort (no Router configured)." });
-    let threadContext: ThreadContext | undefined;
-    if (this.#deps.threadContext) {
-      threadContext = await this.#deps.threadContext(this.#deps.store.getAssignment(id).ticketId);
-    }
-    return chooseEffort({ store: this.#deps.store, assignmentId: id, kind, prompt, signal, router: this.#deps.router, runners: this.#deps.runners,
-      ...(threadContext === undefined ? {} : { threadContext }) });
+    const options = { store: this.#deps.store, assignmentId: id, kind, prompt, signal, router: this.#deps.router, runners: this.#deps.runners };
+    if (!this.#deps.threadContext) return chooseEffort(options);
+    return this.#deps.threadContext(this.#deps.store.getAssignment(id).ticketId).then((threadContext) =>
+      chooseEffort({ ...options, ...(threadContext === undefined ? {} : { threadContext }) }));
   }
 
   #failed(id: number, error: unknown): void {
