@@ -68,9 +68,8 @@ function fixture() {
 }
 
 test("a new ticket receives only comments after its start trigger", () => {
-  const { store, issue, trigger, accept } = fixture();
-  const oldTicket = accept(issue);
-  const oldComment = trigger(issue);
+  const { store, issue, trigger, ticketId: oldTicket } = fixture();
+  trigger(issue);
   store.endTicket(oldTicket);
 
   const newStart = trigger(issue);
