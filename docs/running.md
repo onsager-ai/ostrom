@@ -16,7 +16,11 @@ systemctl --user enable --now ostromd
 ```
 
 The daemon runs `ostromd run --interval 60`, restarts after failures, and writes
-logs to the user journal. Inspect it with `journalctl --user -u ostromd`.
+logs to the user journal. Inspect it with `journalctl --user -u ostromd`. Each ticket Worker gets a
+worktree in the configured repository clone. Ostrom fetches `origin/<OSTROM_WORKER_BASE>` before
+creating the ticket branch from that fetched ref; if the fetch fails, dispatch fails instead of using
+the clone's potentially stale local base branch. The Worker's pull request still targets
+`OSTROM_WORKER_BASE`.
 
 On SIGTERM or SIGINT, the daemon stops scheduling turns, records active turns as interrupted at
 the stop time, and aborts them through the SDK cancellation signal. It allows five seconds for

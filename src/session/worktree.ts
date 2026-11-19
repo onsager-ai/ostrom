@@ -11,7 +11,8 @@ export async function createWorktree(repo: string, path: string, base: string, t
   // Ticket/assignment IDs are local to one store. A fresh store must never adopt an old PR
   // merely because its IDs restart at one; the recorded branch remains the ownership identity.
   const branch = `ostrom/ticket-${ticket}-${assignment}-${suffix}`;
-  await exec("git", ["-C", repo, "worktree", "add", "-b", branch, "--", path, base]);
+  await exec("git", ["-C", repo, "fetch", "origin", base]);
+  await exec("git", ["-C", repo, "worktree", "add", "-b", branch, "--", path, `origin/${base}`]);
   return branch;
 }
 

@@ -177,8 +177,8 @@ function deliverCiFixTurn(options: MergePassOptions, assignmentId: number, obser
   const checks = failures.map((check) => `- ${check.name}: ${check.url ?? `https://github.com/${options.repo}/pull/${pr.number}/checks`}`).join("\n");
   options.workers.deliver(assignmentId, `ci-fix-a${assignmentId}-${pr.head.sha}`,
     `CI checks failed on pull request #${pr.number} at head ${pr.head.sha}:\n${checks}\n\n` +
-    `Read the linked runs/logs and compare these failures with the current ${pr.base.ref} head before changing code. ` +
-    "If the same check fails on the base branch, report that evidence so you do not chase a failure this PR did not cause. " +
+    `Fetch origin/${pr.base.ref} and compare these failures with the current origin/${pr.base.ref} head before changing code. ` +
+    `If the same check fails on origin/${pr.base.ref}, report that evidence so you do not chase a failure this PR did not cause. ` +
     `Check the current PR head before acting; fix the failures that still apply, then commit and push to the existing PR branch ${pr.head.ref}. Do not open a new PR.`,
     () => {});
 }
@@ -190,7 +190,7 @@ function deliverConflictTurn(options: MergePassOptions, assignmentId: number, ob
   // head or base moves. No await separates the local eligibility check from durable delivery.
   const key = `conflict-a${assignmentId}-${pr.head.sha}-${pr.base.sha}`;
   options.workers.deliver(assignmentId, key,
-    `Pull request #${pr.number} conflicts with its base branch ${pr.base.ref}. Merge the latest ${pr.base.ref} into the existing PR branch ${pr.head.ref} using git merge, ` +
+    `Pull request #${pr.number} conflicts with its base branch ${pr.base.ref}. Fetch origin/${pr.base.ref}, then merge the latest origin/${pr.base.ref} into the existing PR branch ${pr.head.ref} using git merge, ` +
     "resolve the conflicts keeping both sides' intent, and keep every entry in append-only files such as CHANGELOG.md. " +
     "Commit and push the result to the existing PR branch; do not open a new PR. This is a local branch merge, not permission to merge the pull request on GitHub.",
     () => {});
