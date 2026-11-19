@@ -9,7 +9,7 @@ import { appendSessionAnnotationIfChanged, rememberedAnnotation, truncateTitle }
 import { ghGet, type GhRunner } from "../github/gh.ts";
 import type { AssignmentOutcome, Store, TicketContext } from "../store/store.ts";
 
-export const PUBLIC_FINAL_MESSAGE = "Your final message is posted publicly on the pull request for its reviewers. Write for them: use repository-relative paths, describe the resulting changes and relevant validation, and do not narrate your own process or what you did or did not post. Do not claim CI or merge state; Ostrom reports those.";
+export const PUBLIC_FINAL_MESSAGE = "Ostrom may post your final message publicly on the issue or pull request. Write for readers there: use repository-relative paths, describe the resulting changes and relevant validation, or explain what prevented delivery, and do not narrate your own process or what you did or did not post. Do not claim CI or merge state; Ostrom reports those.";
 
 /**
  * The Worker's first message: a summary plus pointers ("Inline & Spill"). It quotes no comment

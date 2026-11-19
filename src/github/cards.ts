@@ -20,7 +20,8 @@ export function queueStatusCard(store: Store, ticketId: number, now = new Date()
         openStall !== undefined ? "recovering" :
           ticket.state === "paused" ? "paused" :
             assignment.outcome === "failed" ? "stuck" :
-              candidate !== null ? (policy?.strategy === "human" ? "waiting_for_human_merge" : "waiting_to_merge") : "working";
+              candidate !== null ? (policy?.strategy === "human" ? "waiting_for_human_merge" : "waiting_to_merge") :
+                assignment.outcome === "waiting" ? "blocked" : "working";
   const budget = store.ticketBudget(ticketId);
   const warning = budgetWarning(budget, now);
   const pullRequest = store.ticketPullRequest(ticketId);

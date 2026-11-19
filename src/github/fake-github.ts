@@ -24,6 +24,7 @@ export class FakeGitHub {
   readonly reviews = new Map<number, Item[]>();
   readonly issueEvents = new Map<number, Item[]>();
   readonly permissions = new Map<string, string>();
+  readonly branchHeads = new Map<string, string>();
   /** Pull requests served by `pulls?head=`: head branch, number, state and body. */
   readonly pulls: { branch: string; number: number; state: "open" | "closed" | "merged"; body?: string }[] = [];
   readonly calls: string[][] = [];
@@ -190,6 +191,11 @@ export class FakeGitHub {
     if (!url.pathname.startsWith(prefix)) throw new Error(`fake gh: unknown repo in ${path}`);
     const route = url.pathname.slice(prefix.length);
     if (/^rules\/branches\/[^/]+$/.test(route)) return this.mergeRules;
+    if (route.startsWith("git/matching-refs/heads/")) {
+      const branch = decodeURIComponent(route.slice("git/matching-refs/heads/".length));
+      return [...this.branchHeads].filter(([name]) => name.startsWith(branch))
+        .map(([name, sha]) => ({ ref: `refs/heads/${name}`, object: { sha } }));
+    }
     const permission = route.match(/^collaborators\/([^/]+)\/permission$/);
     if (permission) return [permissionBody(this.permissions.get(decodeURIComponent(permission[1]!)) ?? "none")];
     let items: Item[];
