@@ -231,8 +231,13 @@ overridden; with no such model, dispatch waits.
    conditions and policy options are proposed in [`merging.md`](merging.md), for milestone 2;
    Journey 1 now points to that design. Rule 1 holds gates back until the loop runs and a real
    failure calls for them; the loop now runs, and this policy is the operator's call.
-5. **Mid-turn crashes: narrowed.** A restart records an interrupted native turn and sends the
-   resumed session the recovery prompt; production still needs an observed mid-turn crash run.
+5. **Mid-turn crashes.** A restart records an interrupted native turn and resumes the session with
+   a note that the daemon stopped it, work may already be partly pushed, and the Worker must check
+   the current PR head and CI before acting. Recovery carries the interrupted delivery prompt,
+   followed in queue order by feedback already queued for the assignment when recovery starts.
+   Those deliveries are acknowledged and finished with the single recovery turn. Pause and stop
+   controls keep separate turns. With no delivery prompt or queued feedback, only the recovery
+   note is sent.
 6. **Semon readiness.** Today Semon exposes `list_sessions`, `get_session`, `read_transcript` and
    `stalls`. The Watchdog uses `stalls` through `semon query` (CLI, not MCP), matched to Workers by
    branch; see `docs/watchdog.md`. If the operator needs a ticket view in Semon, it is added there.
