@@ -57,8 +57,9 @@ export function gitDirs(repo: string, worktree: string): string[] {
 const RUNS_WHILE_PAUSED = ["budget-pause-", "stuck-", "operator-pause-", "operator-stop-", "pause-", "stop-", "close-issue-"];
 
 export const INTERRUPTED_PROMPT =
-  "You were interrupted while working on this ticket. Check your state (git status, your branch and " +
-  "pull request) and continue where you stopped.";
+  "The previous turn was interrupted by a daemon stop. Its work may be partly pushed. " +
+  "Check git status, the current PR head and CI before acting. " +
+  "The interrupted prompt and any newer queued feedback follow in order.";
 
 export function workerTurnPrompt(prompt: string): string {
   const contract = "Do not merge, enable auto-merge, dismiss reviews, or resolve human review threads.";
@@ -205,12 +206,16 @@ export class Workers {
       if (assignment.turnStartedAt !== null) {
         const turnId = `${assignment.sessionId}:${assignment.turns}`;
         const reviews = store.reviewDeliveries(assignment.id, turnId);
+        const interrupted = store.unfinishedTurns(assignment.id).filter((turn) => turn.state === "running");
+        const prompt = [INTERRUPTED_PROMPT, ...interrupted.map((turn) => turn.prompt)].join("\n\n");
         store.finishWorkerTurn(assignment.id, "interrupted", null, undefined, "ostromd stopped during the turn");
         store.recordInterruption(assignment.id);
         store.finishRunningTurns(assignment.id);
         store.endTurn(assignment.id, null);
         pass.interrupted.push(assignment.id);
-        this.deliver(assignment.id, `recovery-${assignment.interruptions + 1}`, INTERRUPTED_PROMPT, () => {}, (result) => {
+        this.deliver(assignment.id, `recovery-${assignment.interruptions + 1}`, prompt, (recoveryTurnId) => {
+          store.recoverDeliveries(assignment.id, turnId, recoveryTurnId);
+        }, (result) => {
           for (const review of reviews) {
             store.enqueueReply({
               id: `review-${assignment.id}-${review.reviewId}`,
@@ -249,8 +254,12 @@ export class Workers {
   }
 
   #scheduleQueued(id: number): void {
-    for (const turn of this.#deps.store.unfinishedTurns(id)) {
-      if (turn.state === "queued") this.#schedule(id, turn.deliveryKey);
+    const queued = this.#deps.store.unfinishedTurns(id).filter((turn) => turn.state === "queued");
+    for (const turn of queued.filter((turn) => turn.kind === "recovery" && turn.sourcePointer !== null)) {
+      this.#schedule(id, turn.deliveryKey);
+    }
+    for (const turn of queued.filter((turn) => turn.kind !== "recovery" || turn.sourcePointer === null)) {
+      this.#schedule(id, turn.deliveryKey);
     }
   }
 
@@ -296,9 +305,12 @@ export class Workers {
     if (turn.kind === "budget_pause") return { onComplete: () => queueStatusCard(store, store.getAssignment(id).ticketId) };
     if (turn.kind === "stuck") return this.#restoredStuck(id, key);
     if (turn.kind === "recovery" && turn.sourcePointer !== null) {
+      const interruptedTurnId = turn.sourcePointer;
+      const reviews = store.reviewDeliveries(id, interruptedTurnId);
       return {
+        onStart: (recoveryTurnId) => store.recoverDeliveries(id, interruptedTurnId, recoveryTurnId),
         onComplete: (result) => {
-          for (const review of store.reviewDeliveries(id, turn.sourcePointer!)) {
+          for (const review of reviews) {
             store.enqueueReply({ id: `review-${id}-${review.reviewId}`, threadId: review.threadId, body: renderReviewReply(result.text) });
           }
         },
@@ -407,22 +419,43 @@ export class Workers {
     const nextTurn = assignment.turns + 1;
     const turnId = `${assignment.sessionId}:${nextTurn}`;
     if (store.beginQueuedTurn(id, key, turnId) === null) return;
+    // Recovery leads queued feedback so stale work and newer reviews reach one native turn.
+    // Controls retain their own boundaries and side effects.
+    const folded = queued.kind === "recovery" && queued.sourcePointer !== null
+      ? store.unfinishedTurns(id).filter((turn) => turn.state === "queued" &&
+        ["follow_up", "review", "conflict", "ci_fix"].includes(turn.kind))
+      : [];
+    const deliveries = folded.map((turn) => ({
+      turn,
+      callbacks: this.#callbacksByKey.get(this.#callbackKey(id, turn.deliveryKey)) ?? this.#callbacks(id, turn.deliveryKey),
+    }));
+    for (const delivery of deliveries) {
+      if (store.beginQueuedTurn(id, delivery.turn.deliveryKey, turnId) === null) {
+        throw new Error(`assignment ${id}: recovery delivery could not be claimed`);
+      }
+    }
+    const prompt = [queued.prompt, ...folded.map((turn) => turn.prompt)].join("\n\n");
+    const finish = () => {
+      store.finishQueuedTurn(id, key);
+      for (const delivery of deliveries) store.finishQueuedTurn(id, delivery.turn.deliveryKey);
+    };
     const turn = store.beginTurn(id);
     if (turn !== nextTurn) throw new Error(`assignment ${id}: queued turn number changed`);
     const kind = key.startsWith("stuck-recovery-") ? "recovery" : key.startsWith("redirect-") ? "redirect" : queued.kind;
     onStart?.(turnId);
+    for (const delivery of deliveries) delivery.callbacks.onStart?.(turnId);
     const controller = new AbortController();
     this.#inFlight.set(id, controller);
     let result: TurnResult;
     try {
-      const choice = await this.#effort(id, kind, queued.prompt, controller.signal);
+      const choice = await this.#effort(id, kind, prompt, controller.signal);
       if (controller.signal.aborted) throw new Error("Turn cancelled before Worker start");
       store.startWorkerTurn(id, kind, choice.effort, this.#selectionReason(id, choice.reason));
       queueStatusCard(store, assignment.ticketId);
-      result = await session.send(workerTurnPrompt(queued.prompt), controller.signal, choice.effort);
+      result = await session.send(workerTurnPrompt(prompt), controller.signal, choice.effort);
     } catch (error) {
       if (this.#stopping) return;
-      store.finishQueuedTurn(id, key);
+      finish();
       if (controller.signal.aborted) {
         store.finishWorkerTurn(id, "cancelled", null);
         store.endTurn(id, null);
@@ -435,11 +468,15 @@ export class Workers {
       if (this.#inFlight.get(id) === controller) this.#inFlight.delete(id);
     }
     if (this.#stopping) return;
-    store.finishQueuedTurn(id, key);
+    finish();
     this.#finished(id, result);
     const current = store.getAssignment(id);
-    if (result.status === "completed" && current.state === "running" && current.outcome !== "failed") await onComplete?.(result);
+    if (result.status === "completed" && current.state === "running" && current.outcome !== "failed") {
+      await onComplete?.(result);
+      for (const delivery of deliveries) await delivery.callbacks.onComplete?.(result);
+    }
     this.#callbacksByKey.delete(this.#callbackKey(id, key));
+    for (const delivery of deliveries) this.#callbacksByKey.delete(this.#callbackKey(id, delivery.turn.deliveryKey));
   }
 
   #annotate(id: number, nativeId: string, pr: number | null, title: string | null): void {

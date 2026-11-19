@@ -189,6 +189,81 @@ test("a restart during a review turn posts its one reply when recovery completes
   );
 });
 
+test("recovery folds newer reviews into the interrupted prompt and finishes their deliveries together", async () => {
+  const { store, runner, workers, pr, trigger } = fixture();
+  runner.hold = true;
+  trigger(pr, "pull_request_review", { reviewId: "44", body: "Earlier review." });
+  routeFollowUps(store, workers);
+  await tick();
+  workers.stop();
+  await workers.drain();
+
+  trigger(pr, "pull_request_review", { reviewId: "45", body: "Newer review." });
+  routeFollowUps(store, workers);
+  const restarted = new Workers({
+    store,
+    config: { repo: "/repo", base: "main", worktrees: "/wt", harness: "codex", model: "gpt-6-luna", machine: "host" },
+    runners: { claude: runner, codex: runner },
+  });
+  restarted.recover();
+  await tick();
+  const resumed = runner.sessions.at(-1)!;
+  assert.equal(resumed.prompts.length, 1);
+  const prompt = resumed.prompts[0]!;
+  assert.match(prompt, /^The previous turn was interrupted by a daemon stop\./);
+  assert.match(prompt, /work may be partly pushed/);
+  assert.match(prompt, /current PR head and CI before acting/);
+  assert.ok(prompt.indexOf("Earlier review.") > 0);
+  assert.ok(prompt.indexOf("Newer review.") > prompt.indexOf("Earlier review."));
+  const running = store.unfinishedTurns(1);
+  assert.equal(running.length, 2);
+  assert.ok(running.every((turn) => turn.state === "running" && turn.turnId === "session-1:2"));
+  assert.deepEqual(store.pendingDeliveries(), []);
+  resumed.release();
+  await restarted.drain();
+  assert.deepEqual(store.unfinishedTurns(1), []);
+  assert.deepEqual(
+    store.dueReplies().filter((reply) => reply.id.startsWith("review-")).map((reply) => reply.id).sort(),
+    ["review-1-44", "review-1-45"],
+  );
+});
+
+test("interrupting recovery again preserves both review replies and prompts", async () => {
+  const { store, runner, workers, pr, trigger } = fixture();
+  const make = () => new Workers({
+    store,
+    config: { repo: "/repo", base: "main", worktrees: "/wt", harness: "codex", model: "gpt-6-luna", machine: "host" },
+    runners: { claude: runner, codex: runner },
+  });
+  runner.hold = true;
+  trigger(pr, "pull_request_review", { reviewId: "44", body: "Earlier review." });
+  routeFollowUps(store, workers);
+  await tick();
+  workers.stop();
+  await workers.drain();
+  trigger(pr, "pull_request_review", { reviewId: "45", body: "Newer review." });
+  routeFollowUps(store, workers);
+  const firstRecovery = make();
+  firstRecovery.recover();
+  await tick();
+  firstRecovery.stop();
+  await firstRecovery.drain();
+
+  runner.hold = false;
+  const secondRecovery = make();
+  secondRecovery.recover();
+  await secondRecovery.drain();
+  const prompts = runner.sessions.at(-1)!.prompts;
+  assert.equal(prompts.length, 1);
+  assert.ok(prompts[0]!.indexOf("Earlier review.") > 0);
+  assert.ok(prompts[0]!.indexOf("Newer review.") > prompts[0]!.indexOf("Earlier review."));
+  assert.deepEqual(store.unfinishedTurns(1), []);
+  assert.deepEqual(
+    store.dueReplies().filter((reply) => reply.id.startsWith("review-")).map((reply) => reply.id).sort(),
+    ["review-1-44", "review-1-45"],
+  );
+});
+
 test("the follow-up is a summary plus a pointer to the trigger", () => {
   const { store, pr, trigger, ticketId } = fixture();
   const id = trigger(pr, "pull_request_review");

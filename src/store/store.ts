@@ -1479,6 +1479,14 @@ export class Store {
     });
   }
 
+  /** Recovery takes responsibility for replies if it is itself interrupted again. */
+  recoverDeliveries(assignmentId: number, interruptedTurnId: string, recoveryTurnId: string): void {
+    this.#run(
+      "UPDATE delivery SET turn_id = ? WHERE assignment_id = ? AND turn_id = ?",
+      recoveryTurnId, assignmentId, interruptedTurnId,
+    );
+  }
+
   /** Submitted reviews delivered to one native turn. Recovery re-attaches their summary reply. */
   reviewDeliveries(assignmentId: number, turnId: string): ReviewDelivery[] {
     return this.#all(

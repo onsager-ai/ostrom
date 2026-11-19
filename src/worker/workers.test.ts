@@ -277,8 +277,27 @@ test("a queued turn survives a restart and runs exactly once", async () => {
   restarted.recover();
   await restarted.drain();
   const resumed = runner.sessions.at(-1)!;
-  assert.deepEqual(resumed.prompts, [workerTurnPrompt(INTERRUPTED_PROMPT), workerTurnPrompt("next")]);
-  assert.equal(resumed.prompts.filter((prompt) => prompt === workerTurnPrompt("next")).length, 1);
+  assert.deepEqual(resumed.prompts, [workerTurnPrompt(`${workerTurnPrompt(INTERRUPTED_PROMPT)}\n\n${workerTurnPrompt("next")}`)]);
+});
+
+test("a persisted recovery leads older queued feedback after another restart", async () => {
+  const { store, runner, ticketId, workers, make } = fixture();
+  runner.hold = true;
+  await workers.dispatch(ticketId);
+  workers.deliver(1, "queued", "next", () => {});
+  workers.stop();
+  await workers.drain();
+  store.pauseTicket(ticketId, "operator");
+  const paused = make();
+  paused.recover();
+  await paused.drain();
+  store.resumeTicket(ticketId);
+  runner.hold = false;
+  const restarted = make();
+  restarted.recover();
+  await restarted.drain();
+  assert.deepEqual(runner.sessions.at(-1)!.prompts, [workerTurnPrompt(`${workerTurnPrompt(INTERRUPTED_PROMPT)}\n\n${workerTurnPrompt("next")}`)]);
+  assert.deepEqual(store.unfinishedTurns(1), []);
 });
 
 test("a reservation blocks a new queued turn without consuming budget and release wakes it", async () => {
@@ -313,9 +332,9 @@ test("a stop cuts off the running turn, starts no queued one, and leaves the tur
   const restarted = make();
   assert.deepEqual(restarted.recover().interrupted, [1]);
   await restarted.drain();
-  assert.deepEqual(runner.sessions.at(-1)!.prompts, [workerTurnPrompt(INTERRUPTED_PROMPT), workerTurnPrompt("next")]);
+  assert.deepEqual(runner.sessions.at(-1)!.prompts, [workerTurnPrompt(`${workerTurnPrompt(INTERRUPTED_PROMPT)}\n\n${workerTurnPrompt("next")}`)]);
   assert.equal(store.getAssignment(1).turnStartedAt, null);
-  assert.deepEqual(store.ticketTurns(ticketId).map((turn) => [turn.kind, turn.status]), [["dispatch", "interrupted"], ["recovery", "completed"], ["follow_up", "completed"]]);
+  assert.deepEqual(store.ticketTurns(ticketId).map((turn) => [turn.kind, turn.status]), [["dispatch", "interrupted"], ["recovery", "completed"]]);
 });
 
 function rollout(model: string | null, thread = "sess-1") {
