@@ -1194,7 +1194,7 @@ export class Store {
            WHERE stalled.ticket_id = ticket.id AND stall.public_at IS NOT NULL AND stall.cleared_at IS NULL))
        LEFT JOIN assignment AS worker ON worker.id = (
          SELECT id FROM assignment WHERE ticket_id = ticket.id AND state = 'running' ORDER BY id DESC LIMIT 1)
-       AND NOT EXISTS (
+       WHERE NOT EXISTS (
            SELECT 1 FROM decision_trigger AS start_decision
            JOIN "trigger" AS start_trigger ON start_trigger.id = start_decision.trigger_id
            WHERE start_decision.decision_id = ticket.decision_id
