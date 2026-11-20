@@ -77,7 +77,7 @@ so a failed discovery call keeps the last good list and is reported, not hidden.
 
 **Selection.** `ostrom models` shows every discovered model, marked allowed or not, with its efforts
 and outcome history. The operator allows or removes models there (`ostrom models allow
-codex/gpt-6.1-sol`, `ostrom models remove …`); the dashboard shows the same list read-only. A newly
+codex/gpt-6.2-sol`, `ostrom models remove …`); the dashboard shows the same list read-only. A newly
 discovered model is not allowed until the operator allows it. An allowed model that a harness stops
 offering is skipped and flagged.
 
