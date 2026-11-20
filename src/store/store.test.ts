@@ -128,7 +128,7 @@ test("queued-turn migration preserves every prior state and supports honest canc
   assert.equal(db.prepare("PRAGMA foreign_key_check").get(), undefined);
 });
 
-for (const [version, kind] of [[32, "conflict"], [34, "ci_fix"]] as const) {
+for (const [version, kind] of [[32, "conflict"], [34, "ci_fix"], [35, "dispatched_run"]] as const) {
 test(`${kind} migration preserves version-${version} queued turns and widens only their kind constraint`, () => {
   const db = database({ enableForeignKeyConstraints: false });
   db.exec("CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL) STRICT");
