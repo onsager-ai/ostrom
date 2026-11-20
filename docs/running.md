@@ -26,7 +26,7 @@ On SIGTERM or SIGINT, the daemon stops scheduling turns, records active turns as
 the stop time, and aborts them through the SDK cancellation signal. It allows five seconds for
 Worker cancellation to settle, with a ten-second deadline for the whole shutdown; a timeout exits
 nonzero. The next start resumes interrupted assignments by session ID. Claude 0.3.319 accepts an
-`abortController`; Codex 0.167.0 accepts a turn `signal` which terminates its `codex exec` process.
+`abortController`; Codex 0.170.0 accepts a turn `signal` which terminates its `codex exec` process.
 That Codex SDK exposes no thread interrupt API that guarantees a `turn_aborted` session record,
 so native session readers may still report an unterminated turn even though Ostrom records its
 interruption.
@@ -57,9 +57,9 @@ refresh` refreshes it on demand. A failed refresh exits nonzero and retains the 
 New models start disallowed; retired allowed models are flagged in the list.
 
 ```sh
-ostrom models allow codex/gpt-6.1-sol
-ostrom models set codex/gpt-6.1-sol --efforts low,high --approval on --cost 2 --note "Rust changes"
-ostrom models remove codex/gpt-6.1-sol
+ostrom models allow codex/gpt-6.2-sol
+ostrom models set codex/gpt-6.2-sol --efforts low,high --approval on --cost 2 --note "Rust changes"
+ostrom models remove codex/gpt-6.2-sol
 ostrom models objective cost
 ostrom models export > models.json
 ostrom models import models.json
