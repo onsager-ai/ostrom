@@ -734,6 +734,18 @@ export const migrations: readonly string[] = [
   ALTER TABLE queued_turn_v36 RENAME TO queued_turn;
   CREATE INDEX queued_turn_unfinished ON queued_turn (assignment_id, state) WHERE state IN ('queued', 'running');
   `,
+
+  // 37: A review request is attempted at most once for each changed PR head and human reviewer.
+  `
+  CREATE TABLE review_request (
+    repository TEXT NOT NULL CHECK (repository <> ''),
+    pr_number INTEGER NOT NULL CHECK (pr_number > 0),
+    head_sha TEXT NOT NULL CHECK (head_sha <> ''),
+    reviewer TEXT NOT NULL CHECK (reviewer <> ''),
+    requested_at TEXT NOT NULL,
+    PRIMARY KEY (repository, pr_number, head_sha, reviewer)
+  ) STRICT, WITHOUT ROWID;
+  `,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */

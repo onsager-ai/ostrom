@@ -134,6 +134,21 @@ export async function readMergeEvidence(gh: GhRunner, repo: string, prNumber: nu
   return { pr: decoded, rollup, threads, reviews, rest: { pull, repository: object(repository), protection, rules } };
 }
 
+/** Reviewers to notify after the PR head advances beyond their latest change request. */
+export function reviewersToReRequest(evidence: MergeEvidence): string[] {
+  const latest = new Map<string, MergeReview>();
+  for (const review of evidence.reviews) {
+    const login = review.author?.login;
+    if (login === null || login === undefined || login === evidence.pr.authorLogin || login.endsWith("[bot]") ||
+        review.submittedAt === null) continue;
+    const previous = latest.get(login);
+    if (previous === undefined || (review.submittedAt > (previous.submittedAt ?? "")) ||
+        (review.submittedAt === previous.submittedAt && review.id > previous.id)) latest.set(login, review);
+  }
+  return [...latest].flatMap(([login, review]) =>
+    review.state === "CHANGES_REQUESTED" && review.commitOid !== null && review.commitOid !== evidence.pr.head.sha ? [login] : []);
+}
+
 export interface FailedCheck { name: string; url: string | null; }
 
 /** Only explicit failures on the current PR head can wake a Worker; pending checks wait. Any failure

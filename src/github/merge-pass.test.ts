@@ -770,6 +770,41 @@ test("first enable posts a distinct notice after an opened reply was sent before
   done(f, "ostrom");
 });
 
+test("a changed Worker head re-requests stale reviewers once and contains request failures", async () => {
+  const f = fixture({ strategy: "human" });
+  const github = new FakeGitHub(f.now, "o/r");
+  const logs: string[] = [];
+  try {
+    github.issue(1);
+    github.issue(2, true);
+    github.pulls.push({ branch: "b", number: 2, state: "open" });
+    const pull = JSON.parse(await f.options().gh(["api", "--method", "GET", "repos/o/r/pulls/2"]));
+    const evidence = JSON.parse(await f.options().gh(["api", "graphql"])).data.repository.pullRequest;
+    github.mergePulls.set(2, { pull, evidence });
+    const options = () => ({ ...f.options(), gh: github.gh, log: (line: string) => logs.push(line) });
+    await mergePass(options());
+
+    evidence.headRefOid = "new-head";
+    evidence.commits.nodes[0].commit.oid = "new-head";
+    pull.head.sha = "new-head";
+    evidence.reviews.nodes = [review({ state: "CHANGES_REQUESTED", head: "old-head", login: "reviewer" })];
+    assert.deepEqual((await mergePass(options())).failed, []);
+    assert.deepEqual(github.requestedReviewers.get(2), ["reviewer"]);
+    await mergePass(options());
+    assert.deepEqual(github.requestedReviewers.get(2), ["reviewer"]);
+
+    evidence.headRefOid = "third-head";
+    evidence.commits.nodes[0].commit.oid = "third-head";
+    pull.head.sha = "third-head";
+    github.failWhen = (args) => args.includes("POST") && args.some((arg) => arg.endsWith("/requested_reviewers")) ? new Error("request refused") : undefined;
+    assert.deepEqual((await mergePass(options())).failed, []);
+    assert.match(logs[0]!, /could not re-request review from reviewer: request refused/);
+    github.failWhen = undefined;
+    await mergePass(options());
+    assert.deepEqual(github.requestedReviewers.get(2), ["reviewer"]);
+  } finally { f.store.close(); }
+});
+
 test("merge-enabled migration refreshes previously tracked, delivered opened replies", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ostrom-merge-upgrade-"));
   const path = join(dir, "store.db");
@@ -791,7 +826,7 @@ test("merge-enabled migration refreshes previously tracked, delivered opened rep
   assert.notEqual(store.readyReplySentAt(assignment), null);
   store.close();
   const upgrade = new DatabaseSync(path);
-  upgrade.exec("DROP TABLE selection_decision; DROP TABLE model_objective; DROP TABLE model_selection; DROP TABLE model_discovery; DROP TABLE turn; DROP INDEX intake_receipt_recent; DROP TABLE intake_receipt;");
+  upgrade.exec("DROP TABLE review_request; DROP TABLE selection_decision; DROP TABLE model_objective; DROP TABLE model_selection; DROP TABLE model_discovery; DROP TABLE turn; DROP INDEX intake_receipt_recent; DROP TABLE intake_receipt;");
   upgrade.prepare("DELETE FROM schema_version WHERE version >= 27").run();
   upgrade.close();
   store = Store.open(path, { now: () => now });

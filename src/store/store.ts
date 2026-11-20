@@ -1389,6 +1389,14 @@ export class Store {
 
   // --- merge reconciliation ------------------------------------------------------------------
 
+  recordReviewRequest(repository: string, prNumber: number, headSha: string, reviewer: string): boolean {
+    const result = this.#run(
+      `INSERT OR IGNORE INTO review_request (repository, pr_number, head_sha, reviewer, requested_at)
+       VALUES (?, ?, ?, ?, ?)`, repository, prNumber, headSha, reviewer, this.#stamp(),
+    );
+    return result.changes === 1;
+  }
+
   mergeCandidate(assignmentId: number, repository: string, prNumber: number): MergeCandidate | null {
     const row = this.#get(
       "SELECT * FROM merge_candidate WHERE assignment_id = ? AND repository = ? AND pr_number = ?",
