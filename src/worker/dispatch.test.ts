@@ -79,10 +79,12 @@ test("the machine's house rules close the brief when configured, and are absent 
   const context = store.ticketContext(ticketId);
   const withRules = workerBrief(context, "b", "main", "Run tests in CI only.");
   assert.match(withRules, /House rules for this machine, which you must follow:\nRun tests in CI only\./);
-  assert.match(withRules, /If the work needs a change a repository or house rule forbids, say so in the pull request description when you push it: name the rule, the files, and why the change is needed, so the reviewer can decide\.$/);
+  assert.match(withRules, /If the work needs a change a repository or house rule forbids, say so in the pull request description when you push it: name the rule, the files, and why the change is needed, so the reviewer can decide\./);
+  assert.match(withRules, /If a file can only be produced by a build or generator these rules don't allow here, open the pull request first, then take the output from that pull request's CI \(an artifact or the failing diff\) and commit it\.$/);
   const withoutRules = workerBrief(context, "b", "main");
   assert.doesNotMatch(withoutRules, /House rules/);
   assert.doesNotMatch(withoutRules, /repository or house rule forbids/);
+  assert.doesNotMatch(withoutRules, /file can only be produced by a build or generator/);
 });
 
 test("PR body normalization replaces literal newlines, adds one close line and removes duplicate close lines", () => {

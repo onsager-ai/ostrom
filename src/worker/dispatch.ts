@@ -38,7 +38,7 @@ export function workerBrief(context: TicketContext, branch: string, base: string
     "If you start a workflow run on your branch, say it is pending in your reply while it runs.",
     "Do not claim results you have not seen. Ostrom wakes you when the run finishes.",
     PUBLIC_FINAL_MESSAGE,
-    ...(rules === undefined ? [] : ["", "House rules for this machine, which you must follow:", rules, "If the work needs a change a repository or house rule forbids, say so in the pull request description when you push it: name the rule, the files, and why the change is needed, so the reviewer can decide."]),
+    ...(rules === undefined ? [] : ["", "House rules for this machine, which you must follow:", rules, "If the work needs a change a repository or house rule forbids, say so in the pull request description when you push it: name the rule, the files, and why the change is needed, so the reviewer can decide.", "If a file can only be produced by a build or generator these rules don't allow here, open the pull request first, then take the output from that pull request's CI (an artifact or the failing diff) and commit it."]),
   ].join("\n");
 }
 
