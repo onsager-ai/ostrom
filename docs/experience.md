@@ -39,6 +39,10 @@ An issue author or reviewer, who never sees Ostrom's internals.
    during that turn, Ostrom posts the Worker's final message right away and shows **Blocked** on
    the status card. A reply starts a new turn with the same Worker and clears the blocked state.
 4. Their later comments and reviews reach the **same** Worker, through thread subscription.
+   A Worker that starts an on-demand GitHub Actions run reports it as pending while it runs.
+   Ostrom wakes the same Worker when the run succeeds or fails, with a link to the results
+   and the failed job names when applicable. If the ticket is paused, Ostrom keeps the result
+   for delivery after resume.
 5. The Worker revises; Ostrom merges unattended by default, or waits for a human under the
    repository's policy. The proposed milestone-2 conditions and policy options are in
    [`merging.md`](merging.md); milestone 1 used human merges.

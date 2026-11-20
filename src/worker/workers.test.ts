@@ -183,6 +183,25 @@ test("a review turn without a push still calls its normal reply handler", async 
   assert.equal(store.hasReply(`blocked-a${assignmentId}-turn-2`), false);
 });
 
+test("a recovered workflow result waits for an eligible merge pass and records its turn kind", async () => {
+  const { store, ticketId, workers, make } = fixture();
+  const { assignmentId } = await workers.dispatch(ticketId);
+  await workers.drain();
+  const key = `dispatched-run-a${assignmentId}-10`;
+  store.enqueueTurn({ assignmentId, deliveryKey: key, kind: "dispatched_run", prompt: "The run succeeded" });
+  const recovered = make();
+  recovered.recover();
+  await recovered.drain();
+  assert.equal(store.queuedTurn(assignmentId, key)?.state, "queued");
+  recovered.wakeDispatchedRun(assignmentId, key, () => false);
+  await recovered.drain();
+  assert.equal(store.queuedTurn(assignmentId, key)?.state, "queued");
+  recovered.wakeDispatchedRun(assignmentId, key, () => true);
+  await recovered.drain();
+  assert.equal(store.queuedTurn(assignmentId, key)?.state, "finished");
+  assert.equal(store.ticketTurns(ticketId).at(-1)?.kind, "dispatched_run");
+});
+
 test("every invoked follow-up records its source kind and failures retain a reason", async () => {
   const { store, ticketId, workers, runner } = fixture();
   await workers.dispatch(ticketId);

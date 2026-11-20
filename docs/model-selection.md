@@ -20,13 +20,19 @@ PR 1 implementation (effort and turn records):
   resumes the same native thread with new options. Null or absent effort leaves the harness default.
 - Every Worker invocation records requested and observed model/effort, kind, usage and status in
   `turn`; `ostrom show` includes these records. Existing source kinds distinguish dispatch, review,
-  redirect, control, ordinary follow-up, budget pause, stuck handling, recovery, conflict and CI fix.
+  redirect, control, ordinary follow-up, budget pause, stuck handling, recovery, conflict, CI fix and workflow completion.
   The merge pass queues a `ci_fix` turn when a check fails on the current PR head (any check, since the merge needs the whole rollup to pass), once per
   assignment and head SHA, including across restarts. It waits while any work for that ticket is
   running or queued, and skips paused, stopping, ended, stalled or exhausted tickets. The prompt
   includes failed check names and run/log links and asks the Worker to compare them with the current
   base branch before fixing the existing PR. Base-branch check results are not fetched by the merge
-  pass. Like automatic conflict turns, CI fixes use the normal per-turn Router effort choice.
+  pass. For each running Worker's branch, the merge pass reads up to 20 completed runs per pass
+  and ignores `pull_request` runs and runs whose last update is at or before the assignment start. It durably
+  records a `dispatched_run` turn once per assignment and run ID, including successful runs. The
+  prompt carries the workflow name, conclusion, head SHA and logs link, with one additional jobs
+  request for a failed run. Recorded results wait for the same local controls as CI fixes and
+  survive restarts, even after the run leaves the list. These turns use the normal per-turn Router
+  effort choice, as do conflict turns and CI fixes.
 - Claude's init message records its observed model without enforcing equality: aliases and gateway
   IDs can resolve to a different ID. Observed Claude effort remains null because the SDK does not
   report it. Codex's last native rollout `turn_context` supplies raw model and effort using the
@@ -122,7 +128,7 @@ session.
 ### Learning from outcomes
 
 A new `turn` record stores, for every turn: ticket, model, effort, kind (first work, review
-follow-up, CI fix, conflict, recovery), fresh tokens, and result. With the existing assignment and
+follow-up, CI fix, workflow completion, conflict, recovery), fresh tokens, and result. With the existing assignment and
 merge records, code computes per repository and task kind: tickets merged, median turns, median
 fresh tokens, and review rounds per model. That table goes into the Router's input. Code computes
 the numbers; the Router makes the judgement.

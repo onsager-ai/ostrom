@@ -172,6 +172,13 @@ export class Workers {
     this.#scheduleQueued(assignmentId);
   }
 
+  /** The merge pass rechecks the automatic-turn controls before a staged run result can start. */
+  wakeDispatchedRun(assignmentId: number, key: string, allowed: () => boolean): void {
+    void this.#enqueue(assignmentId, async () => {
+      if (allowed()) await this.#turn(assignmentId, key);
+    });
+  }
+
   /** Cancels the turn currently running for an assignment, if any. */
   cancel(assignmentId: number): boolean {
     const controller = this.#inFlight.get(assignmentId);
@@ -270,7 +277,8 @@ export class Workers {
   }
 
   #scheduleQueued(id: number): void {
-    const queued = this.#deps.store.unfinishedTurns(id).filter((turn) => turn.state === "queued");
+    // Workflow results wait for the merge pass, including after resume or a daemon restart.
+    const queued = this.#deps.store.unfinishedTurns(id).filter((turn) => turn.state === "queued" && turn.kind !== "dispatched_run");
     for (const turn of queued.filter((turn) => turn.kind === "recovery" && turn.sourcePointer !== null)) {
       this.#schedule(id, turn.deliveryKey);
     }
