@@ -51,7 +51,7 @@ What the pilot 3 fixes did:
 | [#784](https://github.com/onsager-ai/ostrom/issues/784) | Ticket branches were cut from the clone's local `main`, which was never fetched: tolmap from 2026-11-18 (missing #359 to #365), duhem from 2026-11-17. tolmap#368's fixture runs failed on a runner pin main had already fixed, and #367 documented 6 of 8 fields | Fixed, #786 |
 | [#782](https://github.com/onsager-ai/ostrom/issues/782) | Two duhem Workers stopped blocked by the no-local-build rule. Ostrom recorded an empty result, posted nothing and kept the card on Working for 85 minutes | Fixed, #787 |
 | [#783](https://github.com/onsager-ai/ostrom/issues/783) | The new ticket on duhem#392 received a 2026-11-17 comment from pilot 1's ticket on the same issue | Fixed, #785 |
-| [#788](https://github.com/onsager-ai/ostrom/issues/788) | Nothing wakes a Worker when a run it dispatched finishes. The tolmap#368 Worker didn't report two failed runs, then ended a turn with a run in progress; the tolmap Manager relayed the counts | Open |
+| [#788](https://github.com/onsager-ai/ostrom/issues/788) | Nothing wakes a Worker when a run it dispatched finishes. The tolmap#368 Worker didn't report two failed runs, then ended a turn with a run in progress; the tolmap Manager relayed the counts | Fixed, #790 |
 | — | duhem#392: CI runs only on pull requests, but the Manager's redirect asked the Worker to take the regenerated schema from CI before opening one. The Worker pushed the branch and stopped. A CI-only regeneration step needs the PR open first | Brief/redirect wording, not filed |
 
 Operational notes:
@@ -76,3 +76,29 @@ Operational notes:
 #788 first: on-demand runs are now the main way Workers get results that PR checks don't
 produce. duhem#709 still needs its review. The no-local-build rule plus generated files needs a
 documented CI route in the Worker brief before duhem gets more schema work.
+
+## After the write-up (2026-11-19 to 2026-11-20)
+
+- **duhem#709 (#379).** Ostrom woke the Worker after Duhem PM's review on its own. The Worker
+  pushed `b46a334` and `8ae19b4` at about 02:09 UTC, replied on the PR and CI went green. The PR
+  then waited about nine hours for a re-review, because nothing tells the reviewer that a fix
+  landed. Duhem PM approved it at `8ae19b4` after a nudge. The Worker had said it would ask about
+  the catalog-anchor design, then chose one on its own (nearest ancestor containing `.git`); the
+  reviewer accepted it.
+- **duhem#392.** Unfinished: branch pushed, no PR (see Defects found).
+- **Thermal stops.** The thermal gate stopped both daemons twice: at 90 °C (02:20 UTC) and at
+  86 °C (02:27 UTC). Both times the heat came from Semon's first `semon push --watch` sync for the
+  new phone viewer, not from Ostrom. No Worker turn was running either time. Semon's services
+  now run at nice 19 with CPU caps (20% push, 30% receive), and the daemons ran cool afterwards.
+- **Session links.** The status card and `ostrom show` link each Worker session to the
+  hp-code-2 Semon viewer when `OSTROM_SEMON_URL` is set (#792), through Semon's
+  `/session/by-native/<harness>/<id>` redirect. Sessions that are still running do not load yet;
+  Semon will fix that in its warehouse phase 3.
+- **Sol on gpt-6.2.** The pinned Codex SDK 0.167.0 bundled a CLI whose `model/list` lacked
+  gpt-6.2-sol. #794 moved the pin to 0.170.0. Both pilot stores now allow `codex/gpt-6.2-sol` with
+  the old sol settings, and `codex/gpt-6.1-sol` is removed.
+- **Restarts.** Besides the thermal restarts, the daemons stopped at their 4-hour limit once and
+  were stopped by hand for the Magpie upgrade to 0.1.4591.
+
+Still open: a way to tell the reviewer a fix landed (or to re-request review), and the
+generated-files CI route in the Worker brief.
