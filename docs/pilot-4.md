@@ -82,7 +82,9 @@ documented CI route in the Worker brief before duhem gets more schema work.
 - **duhem#709 (#379).** Ostrom woke the Worker after Duhem PM's review on its own. The Worker
   pushed `b46a334` and `8ae19b4` at about 02:09 UTC, replied on the PR and CI went green. The PR
   then waited about nine hours for a re-review, because nothing tells the reviewer that a fix
-  landed. It is still open at pilot close.
+  landed. Duhem PM approved it at `8ae19b4` after a nudge. The Worker had said it would ask about
+  the catalog-anchor design, then chose one on its own (nearest ancestor containing `.git`); the
+  reviewer accepted it.
 - **duhem#392.** Unfinished: branch pushed, no PR (see Defects found).
 - **Thermal stops.** The thermal gate stopped both daemons twice: at 90 °C (02:20 UTC) and at
   86 °C (02:27 UTC). Both times the heat came from Semon's first `semon push --watch` sync for the
