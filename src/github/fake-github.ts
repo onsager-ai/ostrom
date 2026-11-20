@@ -18,6 +18,8 @@ export class FakeGitHub {
   readonly mergePulls = new Map<number, { pull: Item; evidence: Item }>();
   readonly mergeProtection: Item = {};
   readonly mergeRules: Item[] = [];
+  readonly workflowRuns: Item[] = [];
+  readonly workflowJobs = new Map<number, Item[]>();
   readonly issueComments: Item[] = [];
   readonly reviewComments: Item[] = [];
   readonly issues = new Map<number, Item>();
@@ -184,12 +186,21 @@ export class FakeGitHub {
     return found;
   }
 
-  #get(path: string): Item[] {
+  #get(path: string): Item[] | Item {
     const url = new URL(`https://api.github.com/${path}`);
     const q = url.searchParams;
     const prefix = `/repos/${this.repo}/`;
     if (!url.pathname.startsWith(prefix)) throw new Error(`fake gh: unknown repo in ${path}`);
     const route = url.pathname.slice(prefix.length);
+    if (route === "actions/runs") {
+      const runs = this.workflowRuns.filter((run) => run["head_branch"] === q.get("branch") && run["status"] === q.get("status"));
+      return { total_count: runs.length, workflow_runs: runs.slice(0, Number(q.get("per_page"))) };
+    }
+    const runJobs = route.match(/^actions\/runs\/(\d+)\/jobs$/);
+    if (runJobs) {
+      const jobs = this.workflowJobs.get(Number(runJobs[1])) ?? [];
+      return { total_count: jobs.length, jobs: jobs.slice(0, Number(q.get("per_page"))) };
+    }
     if (/^rules\/branches\/[^/]+$/.test(route)) return this.mergeRules;
     if (route.startsWith("git/matching-refs/heads/")) {
       const branch = decodeURIComponent(route.slice("git/matching-refs/heads/".length));

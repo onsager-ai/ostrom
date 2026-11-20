@@ -28,7 +28,7 @@ function review(overrides: { login?: string; type?: string; head?: string; at?: 
   };
 }
 
-function fixture(policy: MergePolicy = { strategy: "unattended" }) {
+function fixture(policy: MergePolicy = { strategy: "unattended" }, subscribeToPr = true) {
   let now = new Date("2026-11-10T12:00:00.000Z");
   const store = Store.open(":memory:", { now: () => now });
   const source = store.ensureSource("github", "o/r");
@@ -40,7 +40,7 @@ function fixture(policy: MergePolicy = { strategy: "unattended" }) {
   store.configureNativeAssignment(assignment, { harness: "claude", model: "m", worktree: "/w", branch: "b", machine: "h" });
   store.startNativeAssignment(assignment, "s");
   const pr = store.ensureThread({ sourceId: source.id, kind: "pull_request", number: 2, url: "https://github.com/o/r/pull/2" });
-  store.subscribe(ticket, pr);
+  if (subscribeToPr) store.subscribe(ticket, pr);
   const remote = {
     merged: false, head: "head", baseSha: "base", mergeable: "MERGEABLE", mergeStateStatus: "CLEAN", base: "main", issueState: "open", permission: "write", reviews: [review()], comments: [] as unknown[],
     putError: null as string | null, mergeBeforeError: false, mergedBy: { id: 42, login: "marvin" },
@@ -77,6 +77,7 @@ function fixture(policy: MergePolicy = { strategy: "unattended" }) {
         } }] },
       } } } });
     }
+    if (path.startsWith("repos/o/r/actions/runs?")) return JSON.stringify({ workflow_runs: [] });
     if (path === "user") return JSON.stringify({ id: 42, login: "marvin" });
     if (path.endsWith("/permission")) return JSON.stringify({ permission: remote.permission });
     if (path === "repos/o/r") return JSON.stringify({ allow_squash_merge: true });
@@ -104,6 +105,8 @@ function fixture(policy: MergePolicy = { strategy: "unattended" }) {
       const added = store.enqueueTurn({ assignmentId: id, deliveryKey: key, prompt, kind: key.startsWith("ci-fix-") ? "ci_fix" : "conflict" });
       if (!added.duplicate) deliveries.push({ key, prompt });
       return !added.duplicate;
+    }, wakeDispatchedRun(id: number, key: string, allowed: () => boolean) {
+      if (allowed()) deliveries.push({ key, prompt: store.queuedTurn(id, key)!.prompt });
     }, release(id: number) { released.push(id); store.releaseAssignmentReservation(id); },
     cancel(id: number) { cancelled.push(id); return false; }, wake() {} } as unknown as Workers;
   const options = (): MergePassOptions => ({ store, workers, gh, repo: "o/r", policy, now: () => now });
@@ -270,6 +273,77 @@ async function ciFixture() {
   const options = () => ({ ...f.options(), gh: github.gh });
   return { ...f, github, evidence, commit, check, options };
 }
+
+function completedRun(id: number, overrides: Record<string, unknown> = {}) {
+  return { id, name: "Fixtures", status: "completed", event: "workflow_dispatch", conclusion: "success",
+    updated_at: "2026-11-10T12:01:00Z", head_branch: "b", head_sha: "run-head", html_url: `https://github.com/o/r/actions/runs/${id}`,
+    ...overrides };
+}
+
+const dispatchedRunsPath = "repos/o/r/actions/runs?branch=b&status=completed&per_page=20";
+
+test("a failed dispatched run wakes once with failed jobs, including on a later pass", async () => {
+  const f = await ciFixture();
+  try {
+    f.advance(MINUTE);
+    f.check.conclusion = "SUCCESS";
+    f.github.workflowRuns.push(completedRun(10, { conclusion: "failure" }));
+    f.github.workflowJobs.set(10, [{ name: "linux fixtures", conclusion: "failure" }, { name: "upload", conclusion: "success" }]);
+    assert.deepEqual((await mergePass(f.options())).failed, []);
+    assert.equal(f.deliveries.length, 1);
+    const { key, prompt } = f.deliveries[0]!;
+    assert.equal(key, `dispatched-run-a${f.assignment}-10`);
+    assert.match(prompt, /Fixtures completed with conclusion failure at head run-head/);
+    assert.match(prompt, /https:\/\/github.com\/o\/r\/actions\/runs\/10/);
+    assert.match(prompt, /Failed jobs:\n- linux fixtures/);
+    assert.doesNotMatch(prompt, /upload/);
+    assert.equal(f.store.queuedTurn(f.assignment, key)?.kind, "dispatched_run");
+    assert.ok(f.store.beginQueuedTurn(f.assignment, key, "s:1"));
+    f.store.finishQueuedTurn(f.assignment, key);
+    assert.deepEqual((await mergePass(f.options())).failed, []);
+    assert.equal(f.deliveries.length, 1);
+    assert.equal(f.github.calls.filter((args) => args.includes(dispatchedRunsPath)).length, 2);
+    assert.equal(f.github.calls.filter((args) => args.includes("repos/o/r/actions/runs/10/jobs?per_page=100")).length, 1);
+  } finally { f.store.close(); }
+});
+
+test("a successful dispatched run wakes before a PR, with no jobs call or wake for old or pull_request runs", async () => {
+  const f = fixture({ strategy: "human" }, false);
+  const github = new FakeGitHub(f.now, "o/r");
+  try {
+    f.advance(MINUTE);
+    github.workflowRuns.push(completedRun(10),
+      completedRun(11, { event: "pull_request", conclusion: "failure" }),
+      completedRun(12, { updated_at: "2026-11-10T11:59:59Z", conclusion: "failure" }));
+    assert.deepEqual((await mergePass({ ...f.options(), gh: github.gh })).failed, []);
+    assert.deepEqual(f.store.unfinishedTurns(f.assignment).map((turn) => turn.deliveryKey), [`dispatched-run-a${f.assignment}-10`]);
+    assert.equal(f.deliveries.length, 1);
+    assert.match(f.deliveries[0]!.prompt, /Fixtures completed with conclusion success at head run-head/);
+    assert.deepEqual(github.calls.map((args) => args.at(-1)), [dispatchedRunsPath]);
+  } finally { f.store.close(); }
+});
+
+test("a recorded workflow result survives pause, a busy turn, and eviction from the runs list", async () => {
+  const f = await ciFixture();
+  try {
+    f.advance(MINUTE);
+    f.check.conclusion = "SUCCESS";
+    f.github.workflowRuns.push(completedRun(10));
+    f.store.pauseTicket(f.ticket, "operator");
+    assert.deepEqual((await mergePass(f.options())).failed, []);
+    assert.equal(f.deliveries.length, 0);
+    const key = `dispatched-run-a${f.assignment}-10`;
+    assert.equal(f.store.queuedTurn(f.assignment, key)?.state, "queued");
+    f.github.workflowRuns.length = 0;
+    f.store.resumeTicket(f.ticket);
+    f.store.beginTurn(f.assignment);
+    assert.deepEqual((await mergePass(f.options())).failed, []);
+    assert.equal(f.deliveries.length, 0);
+    f.store.endTurn(f.assignment, null);
+    assert.deepEqual((await mergePass(f.options())).failed, []);
+    assert.deepEqual(f.deliveries.map((delivery) => delivery.key), [key]);
+  } finally { f.store.close(); }
+});
 
 test("failed CI wakes once per head, including after completion; passing CI never wakes", async () => {
   const f = await ciFixture();

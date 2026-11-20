@@ -2,7 +2,7 @@
 import { budgetReached } from "../budget/budgets.ts";
 import { isApprovalOnly } from "./approval.ts";
 import type { Workers } from "../worker/workers.ts";
-import type { MergeCandidate, Store } from "../store/store.ts";
+import type { Assignment, MergeCandidate, Store } from "../store/store.ts";
 import { queueStatusCard } from "./cards.ts";
 import { ghMergeGet, ghSquashMerge, type GhRunner } from "./gh.ts";
 import { mergeEligibility, readyPolicySentence, type ApprovalIdentity, type MergePolicy } from "./merge-policy.ts";
@@ -49,12 +49,15 @@ export async function mergePass(options: MergePassOptions): Promise<MergePassRes
   const unresolved = new Set(options.store.unresolvedMergeAttempts(options.repo).map((attempt) => attempt.candidateId));
   for (const assignment of options.store.runningAssignments()) {
     const candidate = options.store.mergeCandidateForAssignment(assignment.id);
-    if (candidate !== null && unresolved.has(candidate.id)) continue;
-    if (options.store.reservationHeld(assignment.id)) options.workers.release(assignment.id);
-    const pr = options.store.ticketPullRequest(assignment.ticketId);
-    if (pr === null) continue;
-    try { await consider(options, assignment.id, pr.number, result); }
-    catch (error) { result.failed.push({ assignmentId: assignment.id, error: message(error) }); }
+    const unsettled = candidate !== null && unresolved.has(candidate.id);
+    if (!unsettled && options.store.reservationHeld(assignment.id)) options.workers.release(assignment.id);
+    try {
+      await recordDispatchedRuns(options, assignment);
+      if (unsettled) continue;
+      const pr = options.store.ticketPullRequest(assignment.ticketId);
+      if (pr === null) deliverDispatchedRun(options, assignment.id);
+      else await consider(options, assignment.id, pr.number, result);
+    } catch (error) { result.failed.push({ assignmentId: assignment.id, error: message(error) }); }
   }
   return result;
 }
@@ -67,6 +70,7 @@ async function consider(options: MergePassOptions, assignmentId: number, prNumbe
     result.merged.push(assignmentId);
     return;
   }
+  if (observation.issueOpen) deliverDispatchedRun(options, assignmentId);
   // New PRs wait for the Router's pr_opened reply. Only an old, untracked opened reply needs a
   // separate first-enable notice: reusing its ID would never produce a fresh delivery timestamp.
   const openedId = `outcome-a${assignmentId}-pr${prNumber}-opened`;
@@ -158,21 +162,74 @@ async function consider(options: MergePassOptions, assignmentId: number, prNumbe
   } catch (error) { result.failed.push({ assignmentId, error: message(error) }); }
 }
 
-function automaticTurnAllowed(options: MergePassOptions, assignmentId: number, observation: Observation): boolean {
+function automaticTurnAllowed(
+  options: MergePassOptions, assignmentId: number, ignoreQueuedDispatchedRuns = false,
+): boolean {
   const { store } = options;
   const assignment = store.getAssignment(assignmentId);
   const ticket = store.getTicket(assignment.ticketId);
-  if (options.allowSend === false || !observation.owned || !observation.issueOpen || assignment.state !== "running" ||
-      assignment.outcome === "failed" || ticket.state !== "open" || ticket.stopRequestedAt !== null ||
+  if (options.allowSend === false || assignment.state !== "running" || assignment.outcome === "failed" ||
+      ticket.state !== "open" || ticket.stopRequestedAt !== null ||
       budgetReached(store.ticketBudget(ticket.id), clock(options)) !== null ||
       store.unansweredStalls().some((stall) => stall.assignmentId === assignmentId) ||
-      store.runningAssignments().some((other) => other.ticketId === ticket.id && !store.assignmentWorkIdle(other.id))) return false;
+      store.runningAssignments().some((other) => other.ticketId === ticket.id &&
+        !store.assignmentWorkIdle(other.id, { ignoreQueuedDispatchedRuns }))) return false;
   return true;
+}
+
+async function recordDispatchedRuns(options: MergePassOptions, assignment: Assignment): Promise<void> {
+  if (assignment.branch === null || assignment.startedAt === null) return;
+  const path = `repos/${options.repo}/actions/runs`;
+  const branch = encodeURIComponent(assignment.branch);
+  const response = object(await ghMergeGet(options.gh, `${path}?branch=${branch}&status=completed&per_page=20`));
+  const startedAt = Date.parse(assignment.startedAt);
+  for (const run of rows(response, "workflow_runs")) {
+    // Only runs a Worker started on its branch; push and pull_request runs are the PR's own CI.
+    if (run["event"] !== "workflow_dispatch") continue;
+    const { id, name, event, conclusion, updated_at: updatedAt, head_sha: head, html_url: url } = run;
+    if (typeof id !== "number" || typeof event !== "string" || typeof name !== "string" || typeof conclusion !== "string" ||
+        typeof head !== "string" || typeof url !== "string" || typeof updatedAt !== "string" || !Number.isFinite(Date.parse(updatedAt))) {
+      throw new Error("GitHub returned incomplete workflow run evidence");
+    }
+    // The completed runs API exposes updated_at, rather than a separate completion timestamp.
+    if (Date.parse(updatedAt) <= startedAt) continue;
+    const deliveryKey = `dispatched-run-a${assignment.id}-${id}`;
+    if (options.store.queuedTurn(assignment.id, deliveryKey) !== null) continue;
+    let failedJobs = "";
+    if (conclusion === "failure") {
+      const jobs = rows(object(await ghMergeGet(options.gh, `${path}/${id}/jobs?per_page=100`)), "jobs");
+      const names = jobs.flatMap((job) => {
+        if (job["conclusion"] !== "failure") return [];
+        if (typeof job["name"] !== "string") throw new Error("GitHub failed job is missing its name");
+        return [job["name"]];
+      });
+      if (names.length > 0) failedJobs = `\nFailed jobs:\n${names.map((job) => `- ${job}`).join("\n")}`;
+    }
+    // Record while blocked so delivery does not depend on the run staying in GitHub's latest 20.
+    const current = options.store.getAssignment(assignment.id);
+    if (current.state !== "running" || current.outcome === "failed" || options.store.getTicket(current.ticketId).state === "ended") return;
+    options.store.enqueueTurn({ assignmentId: assignment.id, deliveryKey, kind: "dispatched_run",
+      prompt: `Workflow ${name} completed with conclusion ${conclusion} at head ${head}.\nRun and logs: ${url}${failedJobs}\n\n` +
+        "Read the run results and follow up on the ticket as needed." });
+  }
+}
+
+function rows(response: Json, key: string): Json[] {
+  const value = response[key];
+  if (!Array.isArray(value)) throw new Error(`GitHub response is missing ${key}`);
+  return value.map(object);
+}
+
+function deliverDispatchedRun(options: MergePassOptions, assignmentId: number): void {
+  const turn = options.store.unfinishedTurns(assignmentId).find((item) => item.kind === "dispatched_run" && item.state === "queued");
+  if (turn === undefined) return;
+  const allowed = () => automaticTurnAllowed(options, assignmentId, true);
+  if (allowed()) options.workers.wakeDispatchedRun(assignmentId, turn.deliveryKey, allowed);
 }
 
 function deliverCiFixTurn(options: MergePassOptions, assignmentId: number, observation: Observation): void {
   const failures = failedChecks(observation.evidence);
-  if (failures.length === 0 || !automaticTurnAllowed(options, assignmentId, observation)) return;
+  if (failures.length === 0 || !observation.owned || !observation.issueOpen || !automaticTurnAllowed(options, assignmentId)) return;
   const { pr } = observation.evidence;
   const checks = failures.map((check) => `- ${check.name}: ${check.url ?? `https://github.com/${options.repo}/pull/${pr.number}/checks`}`).join("\n");
   options.workers.deliver(assignmentId, `ci-fix-a${assignmentId}-${pr.head.sha}`,
@@ -184,7 +241,7 @@ function deliverCiFixTurn(options: MergePassOptions, assignmentId: number, obser
 }
 
 function deliverConflictTurn(options: MergePassOptions, assignmentId: number, observation: Observation): void {
-  if (!automaticTurnAllowed(options, assignmentId, observation)) return;
+  if (!observation.owned || !observation.issueOpen || !automaticTurnAllowed(options, assignmentId)) return;
   const { pr } = observation.evidence;
   // The durable queue retains finished keys, so an unresolved conflict is not retried until the
   // head or base moves. No await separates the local eligibility check from durable delivery.

@@ -117,7 +117,7 @@ export interface Ticket {
   stopRequestedAt: string | null;
 }
 
-export type QueuedTurnKind = "follow_up" | "review" | "control" | "budget_pause" | "stuck" | "recovery" | "conflict" | "ci_fix";
+export type QueuedTurnKind = "follow_up" | "review" | "control" | "budget_pause" | "stuck" | "recovery" | "conflict" | "ci_fix" | "dispatched_run";
 export type QueuedTurnState = "queued" | "running" | "finished" | "cancelled";
 
 /** A durable Worker prompt. Source pointers identify domain data, not a transcript. */
@@ -1288,10 +1288,11 @@ export class Store {
   }
 
   /** True only when no durable/in-flight local work or undispatched receipts remain. */
-  assignmentWorkIdle(assignmentId: number, ignoreReservation = false): boolean {
+  assignmentWorkIdle(assignmentId: number, options: { ignoreReservation?: boolean; ignoreQueuedDispatchedRuns?: boolean } = {}): boolean {
     const row = this.#get(
       `SELECT (SELECT turn_started_at FROM assignment WHERE id = ?) IS NULL
-          AND NOT EXISTS (SELECT 1 FROM queued_turn WHERE assignment_id = ? AND state IN ('queued', 'running'))
+          AND NOT EXISTS (SELECT 1 FROM queued_turn WHERE assignment_id = ? AND state IN ('queued', 'running')
+            AND NOT (? AND kind = 'dispatched_run' AND state = 'queued'))
           AND (? OR NOT EXISTS (SELECT 1 FROM assignment_reservation WHERE assignment_id = ?))
           AND NOT EXISTS (SELECT 1 FROM merge_attempt WHERE candidate_id IN (SELECT id FROM merge_candidate WHERE assignment_id = ?) AND state IN ('pending', 'unknown'))
           AND NOT EXISTS (
@@ -1313,7 +1314,8 @@ export class Store {
               AND NOT EXISTS (SELECT 1 FROM delivery WHERE delivery.trigger_id = t.id)
               AND NOT EXISTS (SELECT 1 FROM command_receipt WHERE command_receipt.trigger_id = t.id AND command_receipt.ticket_id = ticket.id)
           ) AS idle`,
-      assignmentId, assignmentId, ignoreReservation ? 1 : 0, assignmentId, assignmentId, assignmentId,
+      assignmentId, assignmentId, options.ignoreQueuedDispatchedRuns ? 1 : 0, options.ignoreReservation ? 1 : 0,
+      assignmentId, assignmentId, assignmentId,
     );
     if (row === undefined) throw new Error(`no assignment ${assignmentId}`);
     return row["idle"] === 1;

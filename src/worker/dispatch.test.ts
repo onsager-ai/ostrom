@@ -55,6 +55,8 @@ test("the brief is a summary plus pointers and asks for a PR that references the
   assert.match(brief, /explain what prevented delivery/);
   assert.match(brief, /use repository-relative paths/);
   assert.match(brief, /do not narrate your own process or what you did or did not post/);
+  assert.match(brief, /If you start a workflow run on your branch, say it is pending in your reply while it runs/);
+  assert.match(brief, /Do not claim results you have not seen\. Ostrom wakes you when the run finishes/);
   assert.match(brief, /Do not claim CI or merge state; Ostrom reports those/);
   assert.match(brief, new RegExp(`issue #7: https://github.com/${REPO}/issues/7\n`));
   assert.match(brief, new RegExp(`- https://github.com/${REPO}/issues/7#issuecomment-1\n`));
