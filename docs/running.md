@@ -3,7 +3,7 @@
 `ostromd` is a user service. Install the two commands from a checkout with `npm link`
 (they run their TypeScript directly on Node 24). Put the runtime configuration in
 `~/.config/ostrom/env` (including `OSTROM_REPO`, `OSTROM_ALLOWLIST`, `OSTROM_DB`,
-worker, router, and Watchdog variables). It must also set `PATH`: systemd starts user services
+worker, router, Watchdog, and optional `OSTROM_SEMON_URL` variables). Set `OSTROM_SEMON_URL` to the Semon viewer base URL to add links to Worker sessions in the GitHub status card and `ostrom show`; a new session can return 404 for a few seconds while Semon indexes it. It must also set `PATH`: systemd starts user services
 with a minimal one, and the daemon and its Workers need `node`, `ostromd`, `git`, `gh`, `semon`,
 `codex` and `claude`. Copy your shell's value, for example with
 `echo "PATH=$PATH" >> ~/.config/ostrom/env`. Then install the checked-in unit:

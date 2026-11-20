@@ -8,6 +8,7 @@ import { queueStatusCard } from "./cards.ts";
 const base: Omit<StatusCard, "state"> = {
   plan: ["Inspect the failure", "Patch and verify the fix"],
   pullRequest: "https://github.com/onsager-ai/ostrom/pull/42",
+  sessionUrl: "https://semon.onsager.ai/session/by-native/codex/session-1",
   harness: "codex",
   model: "gpt-6-luna",
   effort: "medium",
@@ -42,6 +43,37 @@ test("status card derives pending effort and model overrides from ticket selecti
     queueStatusCard(store, ticketId);
     assert.match(store.statusCardBody(threadId)!, /Model: `luna` \(sol from the next session\)/);
     assert.match(store.statusCardBody(threadId)!, /Effort: `medium` \(high from the next turn\)/);
+  } finally { store.close(); }
+});
+
+test("status card omits the session link when session identifiers are missing", () => {
+  const store = Store.open(":memory:");
+  try {
+    const source = store.ensureSource("github", "org/repo");
+    const threadId = store.ensureThread({ sourceId: source.id, kind: "issue", number: 8, url: "https://github.com/org/repo/issues/8" });
+    const trigger = store.insertTrigger({ sourceId: source.id, sourceEventId: "accepted", threadId, kind: "issue_comment", actor: "alice", url: "https://github.com/org/repo/issues/8#1", occurredAt: new Date() });
+    const ticketId = store.recordDecision({ threadId, triggerIds: [trigger.id], verdict: "accept", reason: "work" }).ticketId!;
+    const assignmentId = store.createAssignment(ticketId);
+    store.configureNativeAssignment(assignmentId, { harness: "codex", model: "luna", worktree: "/wt", branch: "b", machine: "host" });
+    queueStatusCard(store, ticketId, new Date(), "https://semon.example");
+    assert.doesNotMatch(store.statusCardBody(threadId)!, /Session:/);
+  } finally { store.close(); }
+});
+
+test("status card links the latest native session when configured", () => {
+  const store = Store.open(":memory:");
+  try {
+    const source = store.ensureSource("github", "org/repo");
+    const threadId = store.ensureThread({ sourceId: source.id, kind: "issue", number: 7, url: "https://github.com/org/repo/issues/7" });
+    const trigger = store.insertTrigger({ sourceId: source.id, sourceEventId: "accepted", threadId, kind: "issue_comment", actor: "alice", url: "https://github.com/org/repo/issues/7#1", occurredAt: new Date() });
+    const ticketId = store.recordDecision({ threadId, triggerIds: [trigger.id], verdict: "accept", reason: "work" }).ticketId!;
+    const assignmentId = store.createAssignment(ticketId);
+    store.configureNativeAssignment(assignmentId, { harness: "claude", model: "sonnet", worktree: "/wt", branch: "b", machine: "host" });
+    store.startNativeAssignment(assignmentId, "a session");
+    queueStatusCard(store, ticketId, new Date(), "https://semon.example/");
+    assert.match(store.statusCardBody(threadId)!, /Session: \[View in Semon\]\(https:\/\/semon\.example\/session\/by-native\/claude\/a%20session\)/);
+    queueStatusCard(store, ticketId, new Date(), "");
+    assert.doesNotMatch(store.statusCardBody(threadId)!, /Session:/);
   } finally { store.close(); }
 });
 

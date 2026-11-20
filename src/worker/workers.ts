@@ -38,6 +38,7 @@ export interface WorkersDeps {
   /** GitHub access verifies turn delivery and restores stop cleanup after a daemon restart. */
   gh?: GhRunner;
   repo?: string;
+  semonUrl?: string;
   /** Fresh issue or PR context for per-turn effort choices. */
   threadContext?: (ticketId: number) => Promise<ThreadContext | undefined>;
 }
@@ -326,7 +327,7 @@ export class Workers {
       };
     }
     if (turn.kind === "control") return this.#restoredControl(id, key);
-    if (turn.kind === "budget_pause") return { onComplete: () => queueStatusCard(store, store.getAssignment(id).ticketId) };
+    if (turn.kind === "budget_pause") return { onComplete: () => queueStatusCard(store, store.getAssignment(id).ticketId, new Date(), this.#deps.semonUrl) };
     if (turn.kind === "stuck") return this.#restoredStuck(id, key);
     if (turn.kind === "recovery" && turn.sourcePointer !== null) {
       const interruptedTurnId = turn.sourcePointer;
@@ -363,7 +364,7 @@ export class Workers {
           body: result.text,
           blocking: true,
         });
-        queueStatusCard(store, assignment.ticketId);
+        queueStatusCard(store, assignment.ticketId, new Date(), this.#deps.semonUrl);
       },
     };
   }
@@ -379,7 +380,7 @@ export class Workers {
         const cause = stall.cause ?? stall.semonReason ?? "unknown";
         const reply = renderStuckReply(parseStuckReply(turn.text, cause));
         store.enqueueReply({ id: `stuck-${stall.id}`, threadId: store.ticketContext(assignment.ticketId).thread.id, body: reply, blocking: true });
-        queueStatusCard(store, assignment.ticketId);
+        queueStatusCard(store, assignment.ticketId, new Date(), this.#deps.semonUrl);
       },
     };
   }
@@ -467,7 +468,7 @@ export class Workers {
     };
     const turn = store.beginTurn(id);
     if (turn !== nextTurn) throw new Error(`assignment ${id}: queued turn number changed`);
-    if (assignment.outcome === "waiting") queueStatusCard(store, assignment.ticketId);
+    if (assignment.outcome === "waiting") queueStatusCard(store, assignment.ticketId, new Date(), this.#deps.semonUrl);
     const kind = key.startsWith("stuck-recovery-") ? "recovery" : key.startsWith("redirect-") ? "redirect" : queued.kind;
     onStart?.(turnId);
     for (const delivery of deliveries) delivery.callbacks.onStart?.(turnId);
@@ -478,7 +479,7 @@ export class Workers {
       const choice = await this.#effort(id, kind, prompt, controller.signal);
       if (controller.signal.aborted) throw new Error("Turn cancelled before Worker start");
       store.startWorkerTurn(id, kind, choice.effort, this.#selectionReason(id, choice.reason));
-      queueStatusCard(store, assignment.ticketId);
+      queueStatusCard(store, assignment.ticketId, new Date(), this.#deps.semonUrl);
       completed = await this.#send(id, session, kind, workerTurnPrompt(prompt), controller.signal, choice.effort);
     } catch (error) {
       if (this.#stopping) return;
@@ -542,7 +543,7 @@ export class Workers {
     this.#deps.store.endTurn(id, null);
     this.#deps.store.recordTurnError(id, message);
     if (this.#deps.store.getAssignment(id).state === "running") this.#deps.store.recordOutcome(id, "failed");
-    queueStatusCard(this.#deps.store, this.#deps.store.getAssignment(id).ticketId);
+    queueStatusCard(this.#deps.store, this.#deps.store.getAssignment(id).ticketId, new Date(), this.#deps.semonUrl);
   }
 
   async #send(id: number, session: Session, kind: string, prompt: string, signal: AbortSignal, effort: Effort | null):
@@ -635,7 +636,7 @@ export class Workers {
     } finally {
       store.finishWorkerTurn(id, failure === null ? result.status : "failed", result.usage, observed,
         failure ?? (result.status === "completed" ? result.text : null), blockedReply);
-      if (refreshCard) queueStatusCard(store, assignment.ticketId);
+      if (refreshCard) queueStatusCard(store, assignment.ticketId, new Date(), this.#deps.semonUrl);
     }
   }
 }
