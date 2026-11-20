@@ -13,6 +13,7 @@ import { execGh, githubRunner } from "../github/gh.ts";
 import { renderMergeEligibilityPreview } from "../github/preview.ts";
 import { loadConfig } from "../ostromd/config.ts";
 import { Store, type OperatorStatus, type OperatorTicket, type OperatorTicketDetail } from "../store/store.ts";
+import { semonSessionUrl } from "../session/semon-link.ts";
 
 const USAGE = `usage: ostrom <command> [--json]
 
@@ -57,7 +58,7 @@ export async function main(argv: readonly string[], env: Record<string, string |
   try {
     loadAppConfig(env);
     const result = await api(command, env);
-    output(command, result);
+    output(command, result, env);
     return 0;
   } catch (error) {
     if (!readOnly(command) || !unavailable(error)) return failure(error);
@@ -65,7 +66,7 @@ export async function main(argv: readonly string[], env: Record<string, string |
     if (path === "") return failure("ostromd is not running; set OSTROM_DB for read-only fallback");
     try {
       const result = await direct(command, path, env);
-      output(command, result);
+      output(command, result, env);
       return 0;
     } catch (fallback) {
       return failure(fallback);
@@ -169,15 +170,21 @@ async function direct(command: Command, path: string, env: Record<string, string
   }
 }
 
-function output(command: Command, value: unknown): void {
+function output(command: Command, value: unknown, env: Record<string, string | undefined>): void {
   if (!command.json && (command.name === "model" || command.name === "effort")) { process.stdout.write(`${(value as { message: string }).message}\n`); return; }
   if (command.json) {
+    if (command.name === "show") {
+      const ticket = value as OperatorTicketDetail;
+      const sessionUrl = latestSessionUrl(ticket, env["OSTROM_SEMON_URL"]?.trim() || undefined);
+      value = sessionUrl === undefined ? ticket : { ...ticket, sessionUrl };
+    }
     process.stdout.write(`${JSON.stringify(value)}\n`);
     return;
   }
   if (command.name === "status") return status(value as OperatorStatus);
   if (command.name === "tickets") return tickets(value as OperatorTicket[]);
-  if (command.name === "show" || command.name === "pause" || command.name === "resume" || command.name === "stop" || command.name === "extend") return show(value as OperatorTicketDetail);
+  if (command.name === "show") return show(value as OperatorTicketDetail, env["OSTROM_SEMON_URL"]?.trim() || undefined);
+  if (command.name === "pause" || command.name === "resume" || command.name === "stop" || command.name === "extend") return show(value as OperatorTicketDetail);
   process.stdout.write((value as { markdown: string }).markdown);
 }
 
@@ -193,11 +200,21 @@ function tickets(rows: OperatorTicket[]): void {
   for (const ticket of rows) process.stdout.write(`${String(ticket.id).padEnd(7)} ${ticket.state.padEnd(7)} ${(ticket.assignment?.harness ?? "-").padEnd(7)} ${ticket.assignment?.sessionId ?? "-"}\n`);
 }
 
-function show(ticket: OperatorTicketDetail): void {
+function latestSessionUrl(ticket: OperatorTicketDetail, baseUrl: string | undefined): string | undefined {
+  const assignment = ticket.assignments.at(-1);
+  if (baseUrl === undefined || assignment?.harness === null || assignment?.harness === undefined || assignment.sessionId === null) return undefined;
+  return semonSessionUrl(baseUrl, assignment.harness, assignment.sessionId);
+}
+
+function show(ticket: OperatorTicketDetail, baseUrl?: string): void {
   process.stdout.write(`ticket ${ticket.id}  ${ticket.state}\n`);
   process.stdout.write(`thread  ${ticket.thread.url}\n`);
   process.stdout.write(`budget  turns ${ticket.budget.turns}/${ticket.budget.turnLimit}  tokens ${ticket.budget.inputTokens + ticket.budget.outputTokens}/${ticket.budget.tokenLimit}\n`);
-  if (ticket.assignment?.sessionId !== null && ticket.assignment?.sessionId !== undefined) process.stdout.write(`session ${ticket.assignment.sessionId}\nsemon query read_transcript ${ticket.assignment.sessionId}\n`);
+  if (ticket.assignment?.sessionId !== null && ticket.assignment?.sessionId !== undefined) {
+    process.stdout.write(`session ${ticket.assignment.sessionId}\nsemon query read_transcript ${ticket.assignment.sessionId}\n`);
+    const sessionUrl = latestSessionUrl(ticket, baseUrl);
+    if (sessionUrl !== undefined) process.stdout.write(`Session: ${sessionUrl}\n`);
+  }
   for (const decision of ticket.decisions) process.stdout.write(`decision ${decision.id}  ${decision.verdict}  ${decision.reason}\n`);
   for (const trigger of ticket.triggers) process.stdout.write(`trigger ${trigger.id}  ${trigger.kind}  ${trigger.url}\n`);
   for (const assignment of ticket.assignments) process.stdout.write(`assignment ${assignment.id}  ${assignment.state}  ${assignment.outcome ?? "-"}\n`);

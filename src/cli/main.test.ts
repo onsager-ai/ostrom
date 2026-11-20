@@ -34,6 +34,37 @@ test("read-only CLI falls back to the store", async () => {
   }
 });
 
+test("show adds the Semon session link only when configured", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "ostrom-cli-semon-"));
+  const path = join(directory, "ostrom.db");
+  const original = process.stdout.write;
+  let output = "";
+  try {
+    const id = ticket(path);
+    const store = Store.open(path);
+    try {
+      const assignment = store.createAssignment(id);
+      store.configureNativeAssignment(assignment, { harness: "codex", model: "luna", worktree: "/w", branch: "b", machine: "h" });
+      store.startNativeAssignment(assignment, "session !'()* /?");
+    } finally { store.close(); }
+    process.stdout.write = ((chunk: string) => { output += chunk; return true; }) as typeof process.stdout.write;
+    assert.equal(await main(["show", String(id)], { OSTROM_DB: path, HOME: directory }), 0);
+    assert.doesNotMatch(output, /Session: https:\/\/semon/);
+    output = "";
+    assert.equal(await main(["show", String(id)], { OSTROM_DB: path, HOME: directory, OSTROM_SEMON_URL: "https://semon.example/" }), 0);
+    assert.match(output, /Session: https:\/\/semon\.example\/session\/by-native\/codex\/session%20%21%27%28%29%2A%20%2F%3F/);
+    output = "";
+    assert.equal(await main(["show", String(id), "--json"], { OSTROM_DB: path, HOME: directory, OSTROM_SEMON_URL: "https://semon.example" }), 0);
+    assert.equal((JSON.parse(output) as { sessionUrl: string }).sessionUrl, "https://semon.example/session/by-native/codex/session%20%21%27%28%29%2A%20%2F%3F");
+    output = "";
+    assert.equal(await main(["show", String(id), "--json"], { OSTROM_DB: path, HOME: directory }), 0);
+    assert.equal(Object.hasOwn(JSON.parse(output), "sessionUrl"), false);
+  } finally {
+    process.stdout.write = original;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("show renders turn model, effort and kind in text and JSON", async () => {
   const directory = mkdtempSync(join(tmpdir(), "ostrom-cli-turn-"));
   const path = join(directory, "ostrom.db");

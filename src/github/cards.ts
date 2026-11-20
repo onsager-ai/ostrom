@@ -3,9 +3,11 @@
 
 import { budgetWarning } from "../budget/budgets.ts";
 import type { Store } from "../store/store.ts";
+import { semonSessionUrl } from "../session/semon-link.ts";
 import { renderStatusCard, type StatusCardState } from "./status-card.ts";
 
-export function queueStatusCard(store: Store, ticketId: number, now = new Date()): void {
+export function queueStatusCard(store: Store, ticketId: number, now = new Date(), semonUrl = process.env["OSTROM_SEMON_URL"]): void {
+  const semonBase = semonUrl?.trim() || undefined;
   const context = store.ticketContext(ticketId);
   const ticket = context.ticket;
   const assignment = store.latestAssignment(ticketId);
@@ -43,6 +45,7 @@ export function queueStatusCard(store: Store, ticketId: number, now = new Date()
       state,
       ...(assignment.endReason === "issue closed" ? { stoppedReason: "issue closed" as const } : {}),
       ...(pullRequest === null ? {} : { pullRequest: pullRequest.url }),
+      ...(semonBase === undefined || assignment.sessionId === null ? {} : { sessionUrl: semonSessionUrl(semonBase, assignment.harness, assignment.sessionId) }),
       ...(warning === null ? {} : { budgetWarning: warning }),
       ...(ticket.pauseCause === null ? {} : { pauseCause: ticket.pauseCause }),
       ...(candidate === null || ticket.state === "ended" ? {} : { mergeStatus: `policy ${policy!.strategy}; head ${candidate.headSha}; ${candidate.blockingReason === "quiet period has not elapsed" && candidate.quietDeadline !== null ? `earliest merge ${candidate.quietDeadline}` : candidate.blockingReason === null ? "waiting for ready reply" : candidate.blockingReason}` }),

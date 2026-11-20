@@ -15,6 +15,7 @@ export interface StatusCard {
   /** The Worker's newest known checklist, in its order. Omit when it has not published one. */
   plan?: readonly string[];
   pullRequest?: string;
+  sessionUrl?: string;
   harness: "claude" | "codex";
   model: string;
   pendingModel?: string;
@@ -48,6 +49,7 @@ export function renderStatusCard(card: StatusCard): string {
     lines.push("", "### Plan", ...card.plan.map((item) => `- [ ] ${item}`));
   }
   if (card.pullRequest !== undefined) lines.push("", `PR: ${card.pullRequest}`);
+  if (card.sessionUrl !== undefined) lines.push(`Session: [View in Semon](${card.sessionUrl})`);
   if (card.budgetWarning !== undefined) lines.push("", `Warning: budget at 80% — ${card.budgetWarning}`);
   if (card.pauseCause !== undefined) lines.push("", `Paused: ${card.pauseCause}`);
   if (card.mergeStatus !== undefined) lines.push("", `Merge: ${card.mergeStatus}`);

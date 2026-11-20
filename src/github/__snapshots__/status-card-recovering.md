@@ -5,6 +5,7 @@
 - [ ] Patch and verify the fix
 
 PR: https://github.com/onsager-ai/ostrom/pull/42
+Session: [View in Semon](https://semon.onsager.ai/session/by-native/codex/session-1)
 
 Harness: `codex` · Model: `gpt-6-luna`
 Effort: `medium`
