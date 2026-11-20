@@ -384,6 +384,7 @@ export async function main(argv: readonly string[], deps: MainDeps = defaults): 
     if (command === "merge") {
       const pass = await mergePass({ store, workers: workers(), gh: deps.gh, repo: config.repo, policy: config.mergePolicy,
         base: loadWorkerConfig(deps.env).base, allowSend: deps.mergeAllowed ?? true,
+        log: (line) => deps.stderr(`ostromd merge: ${line}`),
         ...(deps.appBotId === undefined ? {} : { appBotId: deps.appBotId }),
         refreshBeforeSend: async () => {
           // The final evidence read follows fresh intake and controls. Any failure suppresses HTTP.

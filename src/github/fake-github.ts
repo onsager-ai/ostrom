@@ -24,6 +24,7 @@ export class FakeGitHub {
   readonly reviewComments: Item[] = [];
   readonly issues = new Map<number, Item>();
   readonly reviews = new Map<number, Item[]>();
+  readonly requestedReviewers = new Map<number, string[]>();
   readonly issueEvents = new Map<number, Item[]>();
   readonly permissions = new Map<string, string>();
   readonly branchHeads = new Map<string, string>();
@@ -249,7 +250,14 @@ export class FakeGitHub {
   #post(path: string, rest: string[]): Item {
     const issue = path.match(new RegExp(`^repos/${this.repo}/issues/(\\d+)/comments$`));
     const reaction = path.match(new RegExp(`^repos/${this.repo}/(issues/comments|pulls/comments)/(\\d+)/reactions$`));
+    const request = path.match(new RegExp(`^repos/${this.repo}/pulls/(\\d+)/requested_reviewers$`));
     const [flag, field] = rest;
+    if (request && flag === "-f" && field?.startsWith("reviewers[]=")) {
+      const number = Number(request[1]);
+      const reviewer = field.slice("reviewers[]=".length);
+      this.requestedReviewers.set(number, [...(this.requestedReviewers.get(number) ?? []), reviewer]);
+      return { reviewers: this.requestedReviewers.get(number) };
+    }
     if (issue && flag === "-f" && field?.startsWith("body=")) {
       return this.comment(Number(issue[1]), { login: "operator", body: field.slice("body=".length), at: this.#now() });
     }
