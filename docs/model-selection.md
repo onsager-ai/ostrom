@@ -27,7 +27,8 @@ PR 1 implementation (effort and turn records):
   includes failed check names and run/log links and asks the Worker to compare them with the current
   base branch before fixing the existing PR. Base-branch check results are not fetched by the merge
   pass. For each running Worker's branch, the merge pass reads up to 20 completed runs per pass
-  and ignores `pull_request` runs and runs whose last update is at or before the assignment start. It durably
+  and keeps only `workflow_dispatch` runs (push and `pull_request` runs are the PR's own CI) whose last
+  update is after the assignment start. It durably
   records a `dispatched_run` turn once per assignment and run ID, including successful runs. The
   prompt carries the workflow name, conclusion, head SHA and logs link, with one additional jobs
   request for a failed run. Recorded results wait for the same local controls as CI fixes and

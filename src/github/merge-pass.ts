@@ -184,7 +184,8 @@ async function recordDispatchedRuns(options: MergePassOptions, assignment: Assig
   const response = object(await ghMergeGet(options.gh, `${path}?branch=${branch}&status=completed&per_page=20`));
   const startedAt = Date.parse(assignment.startedAt);
   for (const run of rows(response, "workflow_runs")) {
-    if (run["event"] === "pull_request") continue;
+    // Only runs a Worker started on its branch; push and pull_request runs are the PR's own CI.
+    if (run["event"] !== "workflow_dispatch") continue;
     const { id, name, event, conclusion, updated_at: updatedAt, head_sha: head, html_url: url } = run;
     if (typeof id !== "number" || typeof event !== "string" || typeof name !== "string" || typeof conclusion !== "string" ||
         typeof head !== "string" || typeof url !== "string" || typeof updatedAt !== "string" || !Number.isFinite(Date.parse(updatedAt))) {
