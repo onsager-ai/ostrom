@@ -215,7 +215,7 @@ function makeWorkers(deps: MainDeps, store: Store): Workers {
     ...(deps.addWorktree === undefined ? {} : { addWorktree: deps.addWorktree }),
     gh: deps.gh,
     repo: loadConfig(deps.env).repo,
-    semonUrl: deps.env["OSTROM_SEMON_URL"]?.trim() || undefined,
+    ...(deps.env["OSTROM_SEMON_URL"]?.trim() ? { semonUrl: deps.env["OSTROM_SEMON_URL"].trim() } : {}),
     threadContext: async (ticketId): Promise<ThreadContext | undefined> => {
       const thread = store.ticketContext(ticketId).thread;
       try {
