@@ -1,16 +1,16 @@
 import { strict as assert } from "node:assert";
-import { readFileSync } from "node:fs";
+import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { execFile } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { test } from "node:test";
 import type { Options, SDKMessage, SDKResultSuccess, SDKSystemMessage } from "@anthropic-ai/claude-agent-sdk";
-import type { Codex, ThreadOptions, TurnOptions } from "@openai/codex-sdk";
+import { Codex, type AgentMessageItem, type ItemCompletedEvent, type ThreadOptions, type ThreadStartedEvent, type TurnCompletedEvent, type TurnOptions } from "@openai/codex-sdk";
+import { sessionConfig } from "./config.ts";
 import { claudeRunner, codexRunner } from "./runner.ts";
-import type { AgentMessageItem, ItemCompletedEvent, ThreadStartedEvent, TurnCompletedEvent } from "@openai/codex-sdk";
 
 // The fixture projections are the fields the runner reads. Referencing SDK types
 // here makes removal or type changes in those fields a compile-time failure.
@@ -36,6 +36,46 @@ test("pinned Codex CLI recognizes App shell controls as booleans", async () => {
     // Unknown keys may be ignored; invalid-type rejection proves these keys are recognized.
     await assert.rejects(run('allow_login_shell="invalid"'), /allow_login_shell|boolean/);
     await assert.rejects(run('features.shell_snapshot="invalid"'), /shell_snapshot|boolean/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("pinned Codex SDK applies provider overrides to start and resume before session creation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ostrom-codex-provider-agreement-"));
+  try {
+    const workingDirectory = realpathSync(root);
+    // Refuse to launch under a checkout, where the valid provider could pass the CLI's Git check.
+    for (let dir = workingDirectory; ; dir = dirname(dir)) {
+      const gitEntry = join(dir, ".git");
+      assert.equal(lstatSync(gitEntry, { throwIfNoEntry: false }), undefined, `Unexpected Git entry: ${gitEntry}`);
+      if (dir === dirname(dir)) break;
+    }
+    await writeFile(join(root, "config.toml"), [
+      'model_provider = "file_provider_missing"',
+      'analytics.enabled = false',
+      'otel.metrics_exporter = "none"',
+      '',
+    ].join("\n"));
+    const env = { PATH: process.env["PATH"], HOME: root, CODEX_HOME: root };
+    const config = (provider?: string) => sessionConfig({ ...env, OSTROM_CODEX_PROVIDER: provider }).codex;
+    const sessionId = "00000000-0000-0000-0000-000000000000";
+    const run = async (codex: Codex, resume: boolean) => {
+      const options = { workingDirectory, model: "offline-probe" };
+      const thread = resume ? codex.resumeThread(sessionId, options) : codex.startThread(options);
+      const { events } = await thread.runStreamed("offline provider probe", { signal: AbortSignal.timeout(15_000) });
+      for await (const event of events) assert.fail(`unexpected session event: ${event.type}`);
+    };
+    for (const resume of [false, true]) {
+      await assert.rejects(run(new Codex(config()), resume), /Model provider `file_provider_missing` not found/);
+      await assert.rejects(run(new Codex(config("override_provider_missing")), resume), /Model provider `override_provider_missing` not found/);
+      await assert.rejects(run(new Codex(config("openai")), resume), /Not inside a trusted directory/);
+    }
+
+    // Native preflight errors occur before session lookup, so capture the SDK's resume arguments separately.
+    const fakeCli = join(root, "record-codex-argv");
+    await writeFile(fakeCli, '#!/bin/sh\ncat >/dev/null\nprintf "%s\\n" "$@" > "$CODEX_HOME/resume-argv"\n', { mode: 0o700 });
+    await run(new Codex({ ...config("openai"), codexPathOverride: fakeCli }), true);
+    const argv = readFileSync(join(root, "resume-argv"), "utf8").trimEnd().split("\n");
+    assert.deepEqual(argv.slice(-2), ["resume", sessionId]);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

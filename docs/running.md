@@ -38,6 +38,14 @@ turn ends at its last recorded session activity (or its start if no later activi
 so daemon downtime does not consume the time budget. Reaching a budget pauses new work and queues
 a WIP prompt after the current turn finishes; it does not cancel that turn.
 
+Set `OSTROM_CODEX_PROVIDER` to override the operator's Codex `model_provider` for both new
+sessions and resumed turns. Ostrom passes it as the pinned SDK's `config.model_provider`
+(`codex exec --config model_provider=…`); when unset, Codex uses its own configuration.
+`OSTROM_CODEX_PROVIDER=openai` with no API key uses the ChatGPT login. Keep the provider stable
+for a Worker's lifetime: Codex refuses to resume a session created under another provider.
+Changing this variable does not migrate existing sessions. CI probes start and resume config
+resolution offline against a different file default, before any session or model call.
+
 The operator uses `ostrom status`, `tickets`, `show`, `pause`, `resume`, `stop`,
 `extend`, and `preview`. Run `ostrom dashboard` to open the read-only local dashboard while
 ostromd is running; it prints a private loopback URL and stays attached until interrupted. The local operator API also serves `GET /v1/intake?limit=50` with recent
