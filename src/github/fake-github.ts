@@ -222,6 +222,7 @@ export class FakeGitHub {
           number: pull.number,
           html_url: this.#threadUrl(pull.number, true),
           body: pull.body ?? "",
+          head: this.mergePulls.get(pull.number)?.pull["head"],
           state: pull.state === "open" ? "open" : "closed",
           merged_at: pull.state === "merged" ? "2026-11-09T12:00:00Z" : null,
         }));

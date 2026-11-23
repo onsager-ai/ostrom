@@ -11,7 +11,7 @@ import { watchdog } from "../watchdog/watchdog.ts";
 import { advanceStuckLadder } from "../watchdog/stuck.ts";
 import { routeCandidates, type Batch } from "../router/router.ts";
 import { FakeRunner } from "../worker/fake-runner.ts";
-import type { Workers } from "../worker/workers.ts";
+import { Workers } from "../worker/workers.ts";
 import { ghHttpStatus, mergePass, type MergePassOptions } from "./merge-pass.ts";
 import type { MergePolicy } from "./merge-policy.ts";
 import type { GhRunner } from "./gh.ts";
@@ -783,8 +783,85 @@ async function reviewFixture(policy?: MergePolicy) {
     f.store.finishWorkerTurn(f.assignment, "completed", null, undefined, null, undefined, head);
   };
   const posts = () => f.github.calls.filter((args) => args.includes("POST") && args.some((arg) => arg.endsWith("/requested_reviewers")));
-  return { ...f, setHead, workerPush, posts };
+  const runTurn = async (key: string, duringTurn: () => void) => {
+    const runner = new FakeRunner();
+    const workers = new Workers({ store: f.store, gh: f.github.gh, repo: "o/r", runners: { claude: runner, codex: runner },
+      config: { repo: "/repo", base: "main", worktrees: "/wt", harness: "claude", model: "m", machine: "h" } });
+    const resume = runner.resume.bind(runner);
+    runner.resume = (options) => {
+      const session = resume(options);
+      session.reply = () => { duringTurn(); return "Done."; };
+      return session;
+    };
+    assert.equal(workers.deliver(f.assignment, key, "Please address the review", () => {}), true);
+    await workers.drain();
+    assert.equal(f.store.ticketTurns(f.ticket).at(-1)?.status, "completed");
+  };
+  return { ...f, setHead, workerPush, posts, runTurn };
 }
+
+test("a GitHub PR head that moves across a Worker turn re-requests review", async () => {
+  const f = await reviewFixture();
+  try {
+    await f.runTurn("review-1", () => f.setHead("worker-head"));
+    assert.equal(f.store.workerTurnPushedHead(f.assignment, "worker-head"), true);
+    assert.deepEqual((await mergePass(f.options())).failed, []);
+    assert.deepEqual(f.github.requestedReviewers.get(2), ["reviewer"]);
+  } finally { f.store.close(); }
+});
+
+test("a GitHub PR head unchanged across a Worker turn does not re-request review", async () => {
+  const f = await reviewFixture();
+  try {
+    f.setHead("already-pushed");
+    await f.runTurn("review-1", () => {});
+    assert.equal(f.store.workerTurnPushedHead(f.assignment, "already-pushed"), false);
+    assert.deepEqual((await mergePass(f.options())).failed, []);
+    assert.deepEqual(f.posts(), []);
+  } finally { f.store.close(); }
+});
+
+test("a pause turn that pushes work in progress does not re-request review after resume", async () => {
+  const f = await reviewFixture();
+  try {
+    f.store.pauseTicket(f.ticket, "operator");
+    f.store.resumeTicket(f.ticket); // A queued pause turn can run after its ticket is resumed.
+    await f.runTurn("operator-pause-1", () => f.setHead("wip"));
+    assert.equal(f.store.workerTurnPushedHead(f.assignment, "wip"), false);
+    assert.deepEqual((await mergePass(f.options())).failed, []);
+    assert.deepEqual(f.posts(), []);
+  } finally { f.store.close(); }
+});
+
+for (const control of ["pause and resume", "stop"]) {
+  test(`a ${control} request during a Worker turn prevents recording the changed head`, async () => {
+    const f = await reviewFixture();
+    try {
+      await f.runTurn("review-1", () => {
+        if (control === "stop") f.store.requestStop(f.ticket);
+        else {
+          f.store.pauseTicket(f.ticket, "operator");
+          f.store.resumeTicket(f.ticket);
+        }
+        f.setHead("wip");
+      });
+      assert.equal(f.store.workerTurnPushedHead(f.assignment, "wip"), false);
+    } finally { f.store.close(); }
+  });
+}
+
+test("a paused ticket with a recorded head cannot re-request review until it resumes", async () => {
+  const f = await reviewFixture();
+  try {
+    f.workerPush("worker-head");
+    f.store.pauseTicket(f.ticket, "operator");
+    assert.deepEqual((await mergePass(f.options())).failed, []);
+    assert.deepEqual(f.posts(), []);
+    f.store.resumeTicket(f.ticket);
+    assert.deepEqual((await mergePass(f.options())).failed, []);
+    assert.deepEqual(f.github.requestedReviewers.get(2), ["reviewer"]);
+  } finally { f.store.close(); }
+});
 
 test("a head advance and a completed dispatched run in the same pass both get handled", async () => {
   const f = await reviewFixture();
@@ -898,7 +975,7 @@ test("merge-enabled migration refreshes previously tracked, delivered opened rep
   assert.notEqual(store.readyReplySentAt(assignment), null);
   store.close();
   const upgrade = new DatabaseSync(path);
-  upgrade.exec("DROP TABLE review_request; DROP TABLE selection_decision; DROP TABLE model_objective; DROP TABLE model_selection; DROP TABLE model_discovery; DROP TABLE turn; DROP INDEX intake_receipt_recent; DROP TABLE intake_receipt;");
+  upgrade.exec("ALTER TABLE ticket DROP COLUMN pause_count; DROP TABLE review_request; DROP TABLE selection_decision; DROP TABLE model_objective; DROP TABLE model_selection; DROP TABLE model_discovery; DROP TABLE turn; DROP INDEX intake_receipt_recent; DROP TABLE intake_receipt;");
   upgrade.prepare("DELETE FROM schema_version WHERE version >= 27").run();
   upgrade.close();
   store = Store.open(path, { now: () => now });

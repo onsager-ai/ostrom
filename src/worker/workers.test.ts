@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,7 +8,6 @@ import { FakeGitHub } from "../github/fake-github.ts";
 import { sendDueReplies } from "../github/outbox.ts";
 import { Store } from "../store/store.ts";
 import { annotationsPath } from "../session/annotations.ts";
-import { createWorktree } from "../session/worktree.ts";
 import { FakeRunner } from "./fake-runner.ts";
 import { workerBrief } from "./dispatch.ts";
 import { gitDirs, INTERRUPTED_PROMPT, workerTurnPrompt, Workers, type WorkersDeps } from "./workers.ts";
@@ -170,54 +168,6 @@ for (const delivery of ["push", "PR", "unreadable"] as const) {
     assert.equal(store.getAssignment(assignmentId).outcome, null);
   });
 }
-
-test("a review turn records its own Git push and ignores a fetch of an external push", async () => {
-  const root = mkdtempSync(join(tmpdir(), "workers-push-"));
-  const remote = join(root, "remote.git");
-  const repo = join(root, "repo");
-  const outside = join(root, "outside");
-  const git = (cwd: string, ...args: string[]) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
-  const commit = (cwd: string, message: string) => git(cwd, "-c", "user.name=Test", "-c", "user.email=test@example.com",
-    "commit", "--allow-empty", "-m", message);
-  try {
-    git(root, "init", "--bare", remote);
-    git(root, "init", "-b", "base", repo);
-    commit(repo, "base");
-    git(repo, "remote", "add", "origin", remote);
-    git(repo, "push", "origin", "base");
-
-    const github = new FakeGitHub(() => new Date());
-    const { store, runner, ticketId, workers } = fixture({
-      config: { ...config, repo, base: "base", worktrees: root }, addWorktree: createWorktree, gh: github.gh, repo: REPO,
-    });
-    const { assignmentId, branch } = await workers.dispatch(ticketId);
-    await workers.drain();
-    const worktree = store.getAssignment(assignmentId).worktree!;
-    const session = runner.sessions[0]!;
-    session.reply = () => {
-      commit(worktree, "worker fix");
-      git(worktree, "push", "origin", branch);
-      return "Pushed the fix.";
-    };
-    workers.deliver(assignmentId, "review-1", "Please fix", () => {});
-    await workers.drain();
-    const workerHead = git(worktree, "rev-parse", "HEAD");
-    assert.equal(store.workerTurnPushedHead(assignmentId, workerHead), true);
-
-    git(root, "clone", "--branch", branch, remote, outside);
-    commit(outside, "outside change");
-    git(outside, "push", "origin", branch);
-    const outsideHead = git(outside, "rev-parse", "HEAD");
-    session.reply = () => {
-      git(worktree, "fetch", "origin");
-      return "Read the latest remote changes.";
-    };
-    workers.deliver(assignmentId, "review-2", "Check the latest changes", () => {});
-    await workers.drain();
-    assert.equal(git(worktree, "rev-parse", `origin/${branch}`), outsideHead);
-    assert.equal(store.workerTurnPushedHead(assignmentId, outsideHead), false);
-  } finally { rmSync(root, { recursive: true, force: true }); }
-});
 
 test("a review turn without a push still calls its normal reply handler", async () => {
   const github = new FakeGitHub(() => new Date());

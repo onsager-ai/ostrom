@@ -742,10 +742,14 @@ export class Store {
     return { ticket, thread, source, reason: decision["reason"] as string, triggerUrls };
   }
 
+  ticketPauseCount(ticketId: number): number {
+    return this.#get("SELECT pause_count FROM ticket WHERE id = ?", ticketId)!["pause_count"] as number;
+  }
+
   /** Pauses an open ticket; the cause is shown to the operator until the ticket resumes. */
   pauseTicket(ticketId: number, cause: string): void {
     const { changes } = this.#run(
-      "UPDATE ticket SET state = 'paused', pause_cause = ? WHERE id = ? AND state = 'open'",
+      "UPDATE ticket SET state = 'paused', pause_cause = ?, pause_count = pause_count + 1 WHERE id = ? AND state = 'open'",
       cause, ticketId,
     );
     if (Number(changes) !== 1) {
@@ -801,7 +805,7 @@ export class Store {
   pauseTicketForBudget(ticketId: number, limit: string): void {
     const cause = `budget reached: ${limit}`;
     const { changes } = this.#run(
-      "UPDATE ticket SET state = 'paused', pause_cause = ? WHERE id = ? AND state = 'open'",
+      "UPDATE ticket SET state = 'paused', pause_cause = ?, pause_count = pause_count + 1 WHERE id = ? AND state = 'open'",
       cause, ticketId,
     );
     if (Number(changes) !== 1) throw new IllegalTransition(`ticket ${ticketId}: ${this.getTicket(ticketId).state} → paused is not allowed`);

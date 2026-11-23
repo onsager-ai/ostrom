@@ -171,7 +171,10 @@ async function reRequestReviews(options: MergePassOptions, assignmentId: number,
   if (options.allowSend === false || !observation.owned || pr.state !== "OPEN" ||
       !options.store.assignmentWorkIdle(assignmentId, { ignoreQueuedDispatchedRuns: true }) ||
       !options.store.workerTurnPushedHead(assignmentId, pr.head.sha)) return;
+  const { ticketId } = options.store.getAssignment(assignmentId);
   for (const reviewer of reviewersToReRequest(evidence)) {
+    const ticket = options.store.getTicket(ticketId);
+    if (ticket.state !== "open" || ticket.stopRequestedAt !== null) return;
     if (!options.store.recordReviewRequest(options.repo, pr.number, pr.head.sha, reviewer)) continue;
     try {
       await options.gh([

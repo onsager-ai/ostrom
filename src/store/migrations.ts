@@ -748,6 +748,11 @@ export const migrations: readonly string[] = [
   `,
   // 38: Remember the branch head pushed by a completed Worker turn for review re-requests.
   `ALTER TABLE turn ADD COLUMN pushed_head_sha TEXT CHECK (pushed_head_sha <> '');`,
+  // 39: Track pause requests across resumes and discard old reflog-based head evidence.
+  `
+  ALTER TABLE ticket ADD COLUMN pause_count INTEGER NOT NULL DEFAULT 0;
+  UPDATE turn SET pushed_head_sha = NULL WHERE pushed_head_sha IS NOT NULL;
+  `,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */

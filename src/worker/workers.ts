@@ -16,7 +16,7 @@ import type { RouterConfig, WorkerConfig } from "../ostromd/config.ts";
 import { appendSessionAnnotationIfChanged } from "../session/annotations.ts";
 import { rolloutContext } from "../session/rollout.ts";
 import type { Effort, Runner, Session, TurnResult } from "../session/runner.ts";
-import { createWorktree, lastPushedHead } from "../session/worktree.ts";
+import { createWorktree } from "../session/worktree.ts";
 import type { Assignment, NewReply, QueuedTurnKind, Store } from "../store/store.ts";
 import { pullRequestsForBranch, workerBrief } from "./dispatch.ts";
 
@@ -482,7 +482,8 @@ export class Workers {
       if (controller.signal.aborted) throw new Error("Turn cancelled before Worker start");
       store.startWorkerTurn(id, kind, choice.effort, this.#selectionReason(id, choice.reason));
       queueStatusCard(store, assignment.ticketId, new Date(), this.#deps.semonUrl);
-      completed = await this.#send(id, session, kind, workerTurnPrompt(prompt), controller.signal, choice.effort);
+      const pauseTurn = kind === "budget_pause" || key.startsWith("pause-") || key.startsWith("operator-pause-");
+      completed = await this.#send(id, session, kind, workerTurnPrompt(prompt), controller.signal, choice.effort, pauseTurn);
     } catch (error) {
       if (this.#stopping) return;
       finish();
@@ -548,26 +549,40 @@ export class Workers {
     queueStatusCard(this.#deps.store, this.#deps.store.getAssignment(id).ticketId, new Date(), this.#deps.semonUrl);
   }
 
-  async #send(id: number, session: Session, kind: string, prompt: string, signal: AbortSignal, effort: Effort | null): Promise<TurnCompletion> {
+  async #send(id: number, session: Session, kind: string, prompt: string, signal: AbortSignal, effort: Effort | null,
+    pauseTurn = false): Promise<TurnCompletion> {
     const { store, gh, repo } = this.#deps;
-    const { branch, worktree } = store.getAssignment(id);
+    const { branch, ticketId } = store.getAssignment(id);
+    const ticketAllowsRecording = () => {
+      const ticket = store.getTicket(ticketId);
+      return ticket.state === "open" && ticket.stopRequestedAt === null;
+    };
+    const pauseCount = store.ticketPauseCount(ticketId);
     const hasRemote = gh !== undefined && repo !== undefined && branch !== null;
     const verifyDelivery = hasRemote && ["dispatch", "follow_up", "redirect"].includes(kind);
     // Undefined means the read failed or was skipped; null is positive evidence that the ref is absent.
     const before = verifyDelivery ? await this.#deliveryEvidence(id, () => branchHead(gh, repo, branch)) : undefined;
-    const readPush = hasRemote && worktree !== null ? () => lastPushedHead(worktree, branch) : undefined;
-    const previousPush = readPush === undefined ? undefined : await this.#deliveryEvidence(id, readPush);
+    const readPulls = hasRemote ? () => this.#deliveryEvidence(id, () => pullRequestsForBranch(gh, repo, branch)) : undefined;
+    const beforePulls = !pauseTurn && ticketAllowsRecording() ? await readPulls?.() : undefined;
     if (signal.aborted) throw new Error("Turn cancelled before Worker start");
     const result = await session.send(prompt, signal, effort);
     if (result.status !== "completed" || signal.aborted) return { result, blocked: false, pushedHead: null };
-    const push = readPush === undefined || previousPush === undefined ? undefined : await this.#deliveryEvidence(id, readPush);
-    const pushedHead = push === undefined || push === previousPush ? null : push;
-    const blocked = !verifyDelivery || before === undefined ? false : await this.#deliveryEvidence(id, async () => {
-      const after = await branchHead(gh, repo, branch);
-      if (after !== null && after !== before) return false;
-      return (await pullRequestsForBranch(gh, repo, branch)).length === 0;
-    });
-    return { result, blocked: blocked === true && !signal.aborted, pushedHead: signal.aborted ? null : pushedHead };
+    const afterPulls = beforePulls !== undefined || (verifyDelivery && before !== undefined) ? await readPulls?.() : undefined;
+    const blocked = !verifyDelivery || before === undefined || afterPulls?.length !== 0 ? false :
+      await this.#deliveryEvidence(id, async () => {
+        const after = await branchHead(gh, repo, branch);
+        return after === null || after === before;
+      });
+    const startPrs = beforePulls?.filter((pr) => pr.state === "open");
+    const endPrs = afterPulls?.filter((pr) => pr.state === "open");
+    const startPr = startPrs?.[0];
+    const endPr = endPrs?.[0];
+    // A re-request needs two heads for the same PR. Opening a PR alone is not a head change.
+    const pushedHead = !signal.aborted && ticketAllowsRecording() && store.ticketPauseCount(ticketId) === pauseCount &&
+      startPrs?.length === 1 && endPrs?.length === 1 && startPr?.headSha !== undefined && endPr?.headSha !== undefined &&
+      startPr.number === endPr.number && startPr.headSha !== endPr.headSha
+      ? endPr.headSha : null;
+    return { result, blocked: blocked === true && !signal.aborted, pushedHead };
   }
 
   async #deliveryEvidence<T>(id: number, read: () => Promise<T>): Promise<T | undefined> {
@@ -638,8 +653,10 @@ export class Workers {
       if (blockedReply === undefined) store.recordOutcome(id, null);
       refreshCard = true;
     } finally {
+      const ticket = store.getTicket(assignment.ticketId);
       store.finishWorkerTurn(id, failure === null ? result.status : "failed", result.usage, observed,
-        failure ?? (result.status === "completed" ? result.text : null), blockedReply, pushedHead);
+        failure ?? (result.status === "completed" ? result.text : null), blockedReply,
+        ticket.state === "open" && ticket.stopRequestedAt === null ? pushedHead : null);
       if (refreshCard) queueStatusCard(store, assignment.ticketId, new Date(), this.#deps.semonUrl);
     }
   }
