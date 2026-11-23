@@ -258,8 +258,8 @@ test("conflict recovery respects ticket state, durable idle work, budgets, stall
   } finally { f.store.close(); }
 });
 
-async function ciFixture() {
-  const f = fixture({ strategy: "human" });
+async function ciFixture(policy: MergePolicy = { strategy: "human" }) {
+  const f = fixture(policy);
   const github = new FakeGitHub(f.now, "o/r");
   github.issue(1);
   github.issue(2, true);
@@ -271,7 +271,7 @@ async function ciFixture() {
   const check = commit.statusCheckRollup.contexts.nodes[0];
   Object.assign(check, { conclusion: "FAILURE", detailsUrl: "https://github.com/o/r/actions/runs/3/job/4" });
   const options = () => ({ ...f.options(), gh: github.gh });
-  return { ...f, github, evidence, commit, check, options };
+  return { ...f, github, pull, evidence, commit, check, options };
 }
 
 function completedRun(id: number, overrides: Record<string, unknown> = {}) {
@@ -770,38 +770,110 @@ test("first enable posts a distinct notice after an opened reply was sent before
   done(f, "ostrom");
 });
 
-test("a changed Worker head re-requests stale reviewers once and contains request failures", async () => {
-  const f = fixture({ strategy: "human" });
-  const github = new FakeGitHub(f.now, "o/r");
+async function reviewFixture(policy?: MergePolicy) {
+  const f = await ciFixture(policy);
+  f.check.conclusion = "SUCCESS";
+  const setHead = (head: string) => {
+    f.evidence.headRefOid = f.commit.oid = f.pull.head.sha = head;
+    f.evidence.reviews.nodes = [review({ state: "CHANGES_REQUESTED", head: "head" })];
+  };
+  const workerPush = (head: string) => {
+    f.store.startWorkerTurn(f.assignment, "review");
+    setHead(head);
+    f.store.finishWorkerTurn(f.assignment, "completed", null, undefined, null, undefined, head);
+  };
+  const posts = () => f.github.calls.filter((args) => args.includes("POST") && args.some((arg) => arg.endsWith("/requested_reviewers")));
+  return { ...f, setHead, workerPush, posts };
+}
+
+test("a head advance and a completed dispatched run in the same pass both get handled", async () => {
+  const f = await reviewFixture();
+  try {
+    await mergePass(f.options());
+    f.workerPush("new-head");
+    f.advance(MINUTE);
+    f.github.workflowRuns.push(completedRun(10, { head_sha: "new-head" }));
+    assert.deepEqual((await mergePass(f.options())).failed, []);
+    assert.deepEqual(f.deliveries.map((delivery) => delivery.key), [`dispatched-run-a${f.assignment}-10`]);
+    assert.deepEqual(f.github.requestedReviewers.get(2), ["reviewer"]);
+  } finally { f.store.close(); }
+});
+
+test("a Worker push before the first candidate still re-requests review", async () => {
+  const f = await reviewFixture();
+  try {
+    assert.equal(f.store.mergeCandidateForAssignment(f.assignment), null);
+    f.workerPush("first-worker-head");
+    assert.deepEqual((await mergePass(f.options())).failed, []);
+    assert.deepEqual(f.github.requestedReviewers.get(2), ["reviewer"]);
+  } finally { f.store.close(); }
+});
+
+test("a Worker push first observed during the final evidence refresh re-requests review", async () => {
+  const f = await reviewFixture({ strategy: "unattended" });
+  try {
+    await ready(f);
+    let refreshed = false;
+    const result = await mergePass({ ...f.options(), refreshBeforeSend: async () => {
+      refreshed = true;
+      f.workerPush("refreshed-head");
+    } });
+    assert.deepEqual(result.failed, []);
+    assert.equal(refreshed, true);
+    assert.equal(f.store.mergeCandidateForAssignment(f.assignment)?.headSha, "refreshed-head");
+    assert.deepEqual(f.github.requestedReviewers.get(2), ["reviewer"]);
+    unmerged(f);
+  } finally { f.store.close(); }
+});
+
+test("a push outside a Worker turn does not re-request review", async () => {
+  const f = await reviewFixture();
+  try {
+    await mergePass(f.options());
+    f.workerPush("worker-head");
+    f.setHead("outside-head");
+    assert.deepEqual((await mergePass(f.options())).failed, []);
+    assert.equal(f.store.mergeCandidateForAssignment(f.assignment)?.headSha, "outside-head");
+    assert.deepEqual(f.posts(), []);
+  } finally { f.store.close(); }
+});
+
+test("a suppressed or unowned review request can be sent in a later eligible pass", async () => {
+  const f = await reviewFixture();
+  try {
+    f.workerPush("new-head");
+    assert.deepEqual((await mergePass({ ...f.options(), allowSend: false })).failed, []);
+    assert.deepEqual(f.posts(), []);
+    f.github.pulls.push({ branch: "b", number: 3, state: "open" });
+    assert.deepEqual((await mergePass(f.options())).failed, []);
+    assert.deepEqual(f.posts(), []);
+    f.github.pulls.pop();
+    assert.deepEqual((await mergePass(f.options())).failed, []);
+    assert.deepEqual(f.github.requestedReviewers.get(2), ["reviewer"]);
+  } finally { f.store.close(); }
+});
+
+test("an already persisted request for the same head and reviewer prevents a replayed POST", async () => {
+  const f = await reviewFixture();
+  try {
+    f.workerPush("same-head");
+    assert.equal(f.store.recordReviewRequest("o/r", 2, "same-head", "reviewer"), true);
+    assert.deepEqual((await mergePass(f.options())).failed, []);
+    assert.deepEqual(f.posts(), []);
+  } finally { f.store.close(); }
+});
+
+test("a refused review re-request is logged and its attempt is deduplicated", async () => {
+  const f = await reviewFixture();
   const logs: string[] = [];
   try {
-    github.issue(1);
-    github.issue(2, true);
-    github.pulls.push({ branch: "b", number: 2, state: "open" });
-    const pull = JSON.parse(await f.options().gh(["api", "--method", "GET", "repos/o/r/pulls/2"]));
-    const evidence = JSON.parse(await f.options().gh(["api", "graphql"])).data.repository.pullRequest;
-    github.mergePulls.set(2, { pull, evidence });
-    const options = () => ({ ...f.options(), gh: github.gh, log: (line: string) => logs.push(line) });
-    await mergePass(options());
-
-    evidence.headRefOid = "new-head";
-    evidence.commits.nodes[0].commit.oid = "new-head";
-    pull.head.sha = "new-head";
-    evidence.reviews.nodes = [review({ state: "CHANGES_REQUESTED", head: "old-head", login: "reviewer" })];
-    assert.deepEqual((await mergePass(options())).failed, []);
-    assert.deepEqual(github.requestedReviewers.get(2), ["reviewer"]);
-    await mergePass(options());
-    assert.deepEqual(github.requestedReviewers.get(2), ["reviewer"]);
-
-    evidence.headRefOid = "third-head";
-    evidence.commits.nodes[0].commit.oid = "third-head";
-    pull.head.sha = "third-head";
-    github.failWhen = (args) => args.includes("POST") && args.some((arg) => arg.endsWith("/requested_reviewers")) ? new Error("request refused") : undefined;
-    assert.deepEqual((await mergePass(options())).failed, []);
+    f.workerPush("new-head");
+    f.github.failWhen = (args) => args.includes("POST") && args.some((arg) => arg.endsWith("/requested_reviewers")) ? new Error("request refused") : undefined;
+    assert.deepEqual((await mergePass({ ...f.options(), log: (line) => logs.push(line) })).failed, []);
     assert.match(logs[0]!, /could not re-request review from reviewer: request refused/);
-    github.failWhen = undefined;
-    await mergePass(options());
-    assert.deepEqual(github.requestedReviewers.get(2), ["reviewer"]);
+    f.github.failWhen = undefined;
+    assert.deepEqual((await mergePass(f.options())).failed, []);
+    assert.equal(f.posts().length, 1);
   } finally { f.store.close(); }
 });
 

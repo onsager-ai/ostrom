@@ -141,8 +141,8 @@ test("the committed query contains every paginated evidence connection", () => {
 
 test("re-request only the latest change requests from non-author human reviewers on older heads", async () => {
   const { reviewersToReRequest } = await import("./merge-reader.ts");
-  const makeReview = (login: string, state: string, commitOid: string, submittedAt: string, id: string) => ({
-    id, state, submittedAt, author: { id: null, login, type: "User" }, commitOid, body: "", inlineComments: 0,
+  const makeReview = (login: string, state: string, commitOid: string, submittedAt: string, id: string, type = "User") => ({
+    id, state, submittedAt, author: { id: null, login, type }, commitOid, body: "", inlineComments: 0,
   });
   const evidence = {
     pr: {
@@ -159,6 +159,7 @@ test("re-request only the latest change requests from non-author human reviewers
       makeReview("automation[bot]", "CHANGES_REQUESTED", "old", "2026-11-10T12:00:00Z", "6"),
       { ...makeReview("pending", "CHANGES_REQUESTED", "old", "", "7"), submittedAt: null },
       makeReview("reviewer-three", "CHANGES_REQUESTED", "old", "2026-11-10T12:00:00Z", "8"),
+      makeReview("automation", "CHANGES_REQUESTED", "old", "2026-11-10T12:00:00Z", "9", "Bot"),
     ],
   };
   assert.deepEqual(reviewersToReRequest(evidence), ["reviewer-three"]);

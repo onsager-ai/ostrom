@@ -970,19 +970,25 @@ export class Store {
   finishWorkerTurn(assignmentId: number, status: Exclude<WorkerTurn["status"], "running">,
     usage: { inputTokens: number; cachedInputTokens: number; outputTokens: number } | null,
     observed: { model: string | null; effort: string | null } = { model: null, effort: null }, result: string | null = null,
-    blockedReply?: NewReply): void {
+    blockedReply?: NewReply, pushedHead: string | null = null): void {
     this.#transaction(() => {
       const { changes } = this.#run(
         `UPDATE turn SET ended_at = ?, status = ?, observed_model = ?, observed_effort = ?,
-         input_tokens = ?, cached_input_tokens = ?, output_tokens = ?, result = ? WHERE assignment_id = ? AND status = 'running'`,
+         input_tokens = ?, cached_input_tokens = ?, output_tokens = ?, result = ?, pushed_head_sha = ?
+         WHERE assignment_id = ? AND status = 'running'`,
         this.#stamp(), status, observed.model, observed.effort, usage?.inputTokens ?? 0, usage?.cachedInputTokens ?? 0,
-        usage?.outputTokens ?? 0, result, assignmentId,
+        usage?.outputTokens ?? 0, result, pushedHead, assignmentId,
       );
       if (blockedReply !== undefined && Number(changes) === 1) {
         this.recordOutcome(assignmentId, "waiting");
         this.#insertReply(blockedReply);
       }
     });
+  }
+
+  workerTurnPushedHead(assignmentId: number, sha: string): boolean {
+    return this.#get("SELECT 1 FROM turn WHERE assignment_id = ? AND status = 'completed' AND pushed_head_sha = ? LIMIT 1",
+      assignmentId, sha) !== undefined;
   }
 
   /** Session events are activity evidence; recovery must never charge daemon downtime. */

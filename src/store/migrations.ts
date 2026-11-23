@@ -746,6 +746,8 @@ export const migrations: readonly string[] = [
     PRIMARY KEY (repository, pr_number, head_sha, reviewer)
   ) STRICT, WITHOUT ROWID;
   `,
+  // 38: Remember the branch head pushed by a completed Worker turn for review re-requests.
+  `ALTER TABLE turn ADD COLUMN pushed_head_sha TEXT CHECK (pushed_head_sha <> '');`,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */

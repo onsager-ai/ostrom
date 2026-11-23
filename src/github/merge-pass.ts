@@ -65,10 +65,6 @@ export async function mergePass(options: MergePassOptions): Promise<MergePassRes
 
 async function consider(options: MergePassOptions, assignmentId: number, prNumber: number, result: MergePassResult): Promise<void> {
   let observation = await observe(options, assignmentId, prNumber);
-  const previous = options.store.mergeCandidate(assignmentId, options.repo, prNumber);
-  const headMoved = previous !== null && previous.headSha !== observation.evidence.pr.head.sha;
-  if (headMoved && observation.evidence.pr.state === "OPEN" && !options.store.assignmentWorkIdle(assignmentId)) return;
-  if (headMoved && observation.evidence.pr.state === "OPEN") await reRequestReviews(options, observation.evidence);
   let candidate = candidateFor(options, assignmentId, prNumber, observation);
   if (observation.evidence.pr.state === "MERGED" && observation.owned) {
     complete(options, candidate, observation.evidence, undefined, "external");
@@ -76,6 +72,7 @@ async function consider(options: MergePassOptions, assignmentId: number, prNumbe
     return;
   }
   if (observation.issueOpen) deliverDispatchedRun(options, assignmentId);
+  await reRequestReviews(options, assignmentId, observation);
   // New PRs wait for the Router's pr_opened reply. Only an old, untracked opened reply needs a
   // separate first-enable notice: reusing its ID would never produce a fresh delivery timestamp.
   const openedId = `outcome-a${assignmentId}-pr${prNumber}-opened`;
@@ -113,6 +110,7 @@ async function consider(options: MergePassOptions, assignmentId: number, prNumbe
 
   await options.refreshBeforeSend?.();
   observation = await observe(options, assignmentId, prNumber);
+  await reRequestReviews(options, assignmentId, observation);
   candidate = candidateFor(options, assignmentId, prNumber, observation);
   if (observation.evidence.pr.state === "MERGED" && observation.owned) {
     complete(options, candidate, observation.evidence, undefined, "external");
@@ -167,8 +165,12 @@ async function consider(options: MergePassOptions, assignmentId: number, prNumbe
   } catch (error) { result.failed.push({ assignmentId, error: message(error) }); }
 }
 
-async function reRequestReviews(options: MergePassOptions, evidence: MergeEvidence): Promise<void> {
+async function reRequestReviews(options: MergePassOptions, assignmentId: number, observation: Observation): Promise<void> {
+  const { evidence } = observation;
   const { pr } = evidence;
+  if (options.allowSend === false || !observation.owned || pr.state !== "OPEN" ||
+      !options.store.assignmentWorkIdle(assignmentId, { ignoreQueuedDispatchedRuns: true }) ||
+      !options.store.workerTurnPushedHead(assignmentId, pr.head.sha)) return;
   for (const reviewer of reviewersToReRequest(evidence)) {
     if (!options.store.recordReviewRequest(options.repo, pr.number, pr.head.sha, reviewer)) continue;
     try {

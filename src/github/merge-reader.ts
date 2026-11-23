@@ -140,7 +140,7 @@ export function reviewersToReRequest(evidence: MergeEvidence): string[] {
   for (const review of evidence.reviews) {
     const login = review.author?.login;
     if (login === null || login === undefined || login === evidence.pr.authorLogin || login.endsWith("[bot]") ||
-        review.submittedAt === null) continue;
+        review.author?.type !== "User" || review.submittedAt === null) continue;
     const previous = latest.get(login);
     if (previous === undefined || (review.submittedAt > (previous.submittedAt ?? "")) ||
         (review.submittedAt === previous.submittedAt && review.id > previous.id)) latest.set(login, review);
