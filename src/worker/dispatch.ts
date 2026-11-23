@@ -28,17 +28,26 @@ export function workerBrief(context: TicketContext, branch: string, base: string
     "",
     "Read that thread and those comments with `gh` for the full request; this message does not copy them.",
     `Do the work in this worktree on branch ${branch}. Commit, push the branch, and open a pull request`,
-    `on ${source.name} against ${base} whose description says "Refs #${thread.number}". Open it ready for review, not as a draft.`,
+    `on ${source.name} against ${base} whose description says "Refs #${thread.number}".`,
+    rules === undefined ? "Open it ready for review." : "Open it ready for review unless the generated-file instructions below apply.",
     "Do not comment on GitHub yourself: Ostrom replies to people. After the quiet window Ostrom may",
     "squash-merge your pull request, so do not merge it, enable auto-merge, dismiss reviews, or resolve",
     "human review threads yourself. Review comments on your pull request will reach you in this session as follow-up messages.",
     "You run unattended: never stop to ask an interactive question. Decide, state your assumption in",
     "the pull request description, and carry on.",
     "If a normal commit fails, report the failure; do not create or push commit objects with Git plumbing.",
-    "If you start a workflow run on your branch, say it is pending in your reply while it runs.",
-    "Do not claim results you have not seen. Ostrom wakes you when the run finishes.",
+    "If you manually dispatch a workflow run on your branch, say it is pending in your reply while it runs.",
+    "Do not claim results you have not seen. Ostrom wakes you when a manually dispatched run finishes.",
     PUBLIC_FINAL_MESSAGE,
-    ...(rules === undefined ? [] : ["", "House rules for this machine, which you must follow:", rules, "If the work needs a change a repository or house rule forbids, say so in the pull request description when you push it: name the rule, the files, and why the change is needed, so the reviewer can decide."]),
+    ...(rules === undefined ? [] : [
+      "",
+      "House rules for this machine, which you must follow:",
+      rules,
+      "If the work needs a change a repository or house rule forbids, say so in the pull request description when you push it: name the rule, the files, and why the change is needed, so the reviewer can decide.",
+      "If a file can only be produced by a build or generator these rules don't allow here, ensure CI uploads the output or shows the diff, then open the pull request as a draft.",
+      "In the same turn, follow the pull request CI run for the draft's head commit until it finishes. Download the generated artifact or apply the diff shown by the check.",
+      "Commit the generated files and push to the same branch before marking the pull request ready for review.",
+    ]),
   ].join("\n");
 }
 
@@ -48,6 +57,7 @@ export interface BranchPullRequest {
   number: number;
   url: string;
   state: PullRequestState;
+  draft: boolean;
   body?: string;
 }
 
@@ -78,7 +88,10 @@ export async function pullRequestsForBranch(gh: GhRunner, repo: string, branch: 
         throw new Error(`gh pulls for ${branch}: unexpected item ${JSON.stringify(item)}`);
       }
       const state: PullRequestState = item["merged_at"] != null ? "merged" : item["state"] === "closed" ? "closed" : "open";
-      return { number: item["number"], url: item["html_url"], state, ...(typeof item["body"] === "string" ? { body: item["body"] } : item["body"] === null ? { body: "" } : {}) };
+      return {
+        number: item["number"], url: item["html_url"], state, draft: item["draft"] === true,
+        ...(typeof item["body"] === "string" ? { body: item["body"] } : item["body"] === null ? { body: "" } : {}),
+      };
     })
     .sort((a, b) => a.number - b.number);
 }

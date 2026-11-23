@@ -317,8 +317,8 @@ async function fetchBody(gh: GhRunner, repo: string, trigger: Trigger, number: n
  * Outcomes of accepted work not yet replied to. A running Worker's branch is looked up with `gh`
  * for its PRs and its turns' recorded outcome is read; an assignment that never started or was
  * stopped is a failure. Each assignment yields at most one terminal outcome per pass, and a PR
- * first seen merged or closed is not also reported as opened. A branch that cannot be read is
- * reported and skipped.
+ * first seen merged or closed is not also reported as opened. Open drafts are reported only when
+ * ready for review. A branch that cannot be read is reported and skipped.
  */
 async function pendingOutcomes(options: RouteOptions, result: RoutePassResult): Promise<Outcome[]> {
   const { store } = options;
@@ -348,6 +348,7 @@ async function pendingOutcomes(options: RouteOptions, result: RoutePassResult): 
     let terminal: Outcome | null = null;
     for (const pr of pullRequests) {
       if (context.thread.kind === "pull_request" && pr.number === context.thread.number) continue;
+      if (pr.state === "open" && pr.draft) continue;
       const event: OutcomeEvent = pr.state === "merged" ? "pr_merged" : pr.state === "closed" ? "pr_closed" : "pr_opened";
       const outcome: Outcome = {
         ...base,
