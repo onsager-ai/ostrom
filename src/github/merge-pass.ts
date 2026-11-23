@@ -6,7 +6,7 @@ import type { Assignment, MergeCandidate, Store } from "../store/store.ts";
 import { queueStatusCard } from "./cards.ts";
 import { ghMergeGet, ghSquashMerge, type GhRunner } from "./gh.ts";
 import { mergeEligibility, readyPolicySentence, type ApprovalIdentity, type MergePolicy } from "./merge-policy.ts";
-import { failedChecks, readMergeEvidence, type MergeEvidence } from "./merge-reader.ts";
+import { failedChecks, readMergeEvidence, reviewersToReRequest, type MergeEvidence } from "./merge-reader.ts";
 
 const QUIET_MS = 10 * 60_000;
 const RETRY_MS = 30_000;
@@ -21,6 +21,7 @@ export interface MergePassOptions {
   appBotId?: number;
   /** Intake and handle newly arrived controls before the final direct evidence read. */
   refreshBeforeSend?: () => Promise<void>;
+  log?: (line: string) => void;
 }
 export interface MergePassResult {
   merged: number[]; waiting: { assignmentId: number; reason: string }[];
@@ -71,6 +72,7 @@ async function consider(options: MergePassOptions, assignmentId: number, prNumbe
     return;
   }
   if (observation.issueOpen) deliverDispatchedRun(options, assignmentId);
+  await reRequestReviews(options, assignmentId, observation);
   // New PRs wait for the Router's pr_opened reply. Only an old, untracked opened reply needs a
   // separate first-enable notice: reusing its ID would never produce a fresh delivery timestamp.
   const openedId = `outcome-a${assignmentId}-pr${prNumber}-opened`;
@@ -108,6 +110,7 @@ async function consider(options: MergePassOptions, assignmentId: number, prNumbe
 
   await options.refreshBeforeSend?.();
   observation = await observe(options, assignmentId, prNumber);
+  await reRequestReviews(options, assignmentId, observation);
   candidate = candidateFor(options, assignmentId, prNumber, observation);
   if (observation.evidence.pr.state === "MERGED" && observation.owned) {
     complete(options, candidate, observation.evidence, undefined, "external");
@@ -160,6 +163,28 @@ async function consider(options: MergePassOptions, assignmentId: number, prNumbe
     complete(options, candidate, confirmed, attempt.id, sha === null ? "unknown" : "ostrom");
     result.merged.push(assignmentId);
   } catch (error) { result.failed.push({ assignmentId, error: message(error) }); }
+}
+
+async function reRequestReviews(options: MergePassOptions, assignmentId: number, observation: Observation): Promise<void> {
+  const { evidence } = observation;
+  const { pr } = evidence;
+  if (options.allowSend === false || !observation.owned || pr.state !== "OPEN" || pr.draft ||
+      !options.store.assignmentWorkIdle(assignmentId, { ignoreQueuedDispatchedRuns: true }) ||
+      !options.store.workerTurnPushedHead(assignmentId, pr.number, pr.head.sha)) return;
+  const { ticketId } = options.store.getAssignment(assignmentId);
+  for (const reviewer of reviewersToReRequest(evidence)) {
+    const ticket = options.store.getTicket(ticketId);
+    if (ticket.state !== "open" || ticket.stopRequestedAt !== null) return;
+    if (!options.store.recordReviewRequest(options.repo, pr.number, pr.head.sha, reviewer)) continue;
+    try {
+      await options.gh([
+        "api", "--method", "POST", `repos/${options.repo}/pulls/${pr.number}/requested_reviewers`,
+        "-f", `reviewers[]=${reviewer}`,
+      ]);
+    } catch (error) {
+      options.log?.(`pull request #${pr.number}: could not re-request review from ${reviewer}: ${message(error)}`);
+    }
+  }
 }
 
 function automaticTurnAllowed(

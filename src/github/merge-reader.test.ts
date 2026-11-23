@@ -138,3 +138,29 @@ test("the committed query contains every paginated evidence connection", () => {
   assert.match(MERGE_EVIDENCE_QUERY, /mergeable mergeStateStatus reviewDecision/);
   assert.match(MERGE_EVIDENCE_QUERY, /workflowRun \{ event runAttempt workflow/);
 });
+
+test("re-request only the latest change requests from non-author human reviewers on older heads", async () => {
+  const { reviewersToReRequest } = await import("./merge-reader.ts");
+  const makeReview = (login: string, state: string, commitOid: string, submittedAt: string, id: string, type = "User") => ({
+    id, state, submittedAt, author: { id: null, login, type }, commitOid, body: "", inlineComments: 0,
+  });
+  const evidence = {
+    pr: {
+      number: 1, state: "OPEN", draft: false, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN", reviewDecision: null,
+      head: { ref: "feature", sha: "new", repository: "o/r" }, base: { ref: "main", sha: "base", repository: "o/r" }, authorLogin: "author",
+    },
+    rollup: null, threads: [], rest: { pull: {}, repository: {}, protection: null, rules: null },
+    reviews: [
+      makeReview("reviewer", "CHANGES_REQUESTED", "old", "2026-11-10T10:00:00Z", "1"),
+      makeReview("reviewer", "COMMENTED", "old", "2026-11-10T11:00:00Z", "2"),
+      makeReview("reviewer-two", "CHANGES_REQUESTED", "old", "2026-11-10T09:00:00Z", "3"),
+      makeReview("reviewer-two", "CHANGES_REQUESTED", "new", "2026-11-10T12:00:00Z", "4"),
+      makeReview("author", "CHANGES_REQUESTED", "old", "2026-11-10T12:00:00Z", "5"),
+      makeReview("automation[bot]", "CHANGES_REQUESTED", "old", "2026-11-10T12:00:00Z", "6"),
+      { ...makeReview("pending", "CHANGES_REQUESTED", "old", "", "7"), submittedAt: null },
+      makeReview("reviewer-three", "CHANGES_REQUESTED", "old", "2026-11-10T12:00:00Z", "8"),
+      makeReview("automation", "CHANGES_REQUESTED", "old", "2026-11-10T12:00:00Z", "9", "Bot"),
+    ],
+  };
+  assert.deepEqual(reviewersToReRequest(evidence), ["reviewer-three"]);
+});

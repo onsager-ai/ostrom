@@ -309,6 +309,7 @@ test("a replayed pass sends nothing twice", async () => {
   const later = trigger(pr);
   const pass = routeFollowUps(store, workers);
   assert.deepEqual(pass.queued.map((d) => [d.triggerId, d.assignmentId]), [[later, second]]);
+  await workers.drain();
 });
 
 test("follow-ups queue behind a running turn, one at a time, and are never queued twice", async () => {
@@ -393,7 +394,7 @@ test("when every subscribed ticket has ended, the trigger goes to the Router, no
   assert.deepEqual(store.undecidedTriggers().map((t) => t.id), [afterEnd], "already delivered stays delivered");
 });
 
-test("a trigger fans out to every open subscribed ticket; ended ones are skipped", () => {
+test("a trigger fans out to every open subscribed ticket; ended ones are skipped", async () => {
   const { store, workers, issue, pr, trigger, accept, worker, ticketId, assignmentId } = fixture();
   const second = accept(issue);
   const secondWorker = worker(second, "session-2");
@@ -408,6 +409,7 @@ test("a trigger fans out to every open subscribed ticket; ended ones are skipped
     [id, ticketId, assignmentId],
     [id, second, secondWorker],
   ]);
+  await workers.drain();
 });
 
 test("a trusted reply clears an ended ticket's public stall without delivering work", () => {

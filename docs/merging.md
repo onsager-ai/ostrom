@@ -297,6 +297,12 @@ workflow run/attempt URLs, review URLs and merge SHA. Add an evidence document o
 | Restart/failure/racing human | Crash after accepted merge with lost response reconciles once; a concurrent human merge completes once with honest attribution; denied API returns non-zero |
 | Stop at send boundary | Pause before reservation prevents HTTP; pause after send reports possible in-flight merge and reconciles without a false promise |
 
+When a tracked Worker PR advances to a new head while its assignment is idle, the merge pass
+re-requests review from each human reviewer whose latest submitted review is `CHANGES_REQUESTED`
+on a different head. It skips the PR author and bot accounts. Each `(repository, PR, head, reviewer)`
+request is recorded before the POST, so a restart or an ambiguous/failed HTTP response will not send
+it again. A failed request is logged and does not fail the Worker turn.
+
 ## Implementation PRs
 
 1. **GitHub reader and policy data.** Add one GraphQL query for head rollup, merge/review state,

@@ -183,6 +183,8 @@ export interface OperatorIntakeItem {
   reason: string | null;
 }
 
+export interface PushedHead { prNumber: number; sha: string; }
+
 export interface WorkerTurn {
   id: number;
   assignmentId: number;
@@ -742,10 +744,14 @@ export class Store {
     return { ticket, thread, source, reason: decision["reason"] as string, triggerUrls };
   }
 
+  ticketPauseCount(ticketId: number): number {
+    return this.#get("SELECT pause_count FROM ticket WHERE id = ?", ticketId)!["pause_count"] as number;
+  }
+
   /** Pauses an open ticket; the cause is shown to the operator until the ticket resumes. */
   pauseTicket(ticketId: number, cause: string): void {
     const { changes } = this.#run(
-      "UPDATE ticket SET state = 'paused', pause_cause = ? WHERE id = ? AND state = 'open'",
+      "UPDATE ticket SET state = 'paused', pause_cause = ?, pause_count = pause_count + 1 WHERE id = ? AND state = 'open'",
       cause, ticketId,
     );
     if (Number(changes) !== 1) {
@@ -801,7 +807,7 @@ export class Store {
   pauseTicketForBudget(ticketId: number, limit: string): void {
     const cause = `budget reached: ${limit}`;
     const { changes } = this.#run(
-      "UPDATE ticket SET state = 'paused', pause_cause = ? WHERE id = ? AND state = 'open'",
+      "UPDATE ticket SET state = 'paused', pause_cause = ?, pause_count = pause_count + 1 WHERE id = ? AND state = 'open'",
       cause, ticketId,
     );
     if (Number(changes) !== 1) throw new IllegalTransition(`ticket ${ticketId}: ${this.getTicket(ticketId).state} → paused is not allowed`);
@@ -970,19 +976,25 @@ export class Store {
   finishWorkerTurn(assignmentId: number, status: Exclude<WorkerTurn["status"], "running">,
     usage: { inputTokens: number; cachedInputTokens: number; outputTokens: number } | null,
     observed: { model: string | null; effort: string | null } = { model: null, effort: null }, result: string | null = null,
-    blockedReply?: NewReply): void {
+    blockedReply?: NewReply, pushedHead: PushedHead | null = null): void {
     this.#transaction(() => {
       const { changes } = this.#run(
         `UPDATE turn SET ended_at = ?, status = ?, observed_model = ?, observed_effort = ?,
-         input_tokens = ?, cached_input_tokens = ?, output_tokens = ?, result = ? WHERE assignment_id = ? AND status = 'running'`,
+         input_tokens = ?, cached_input_tokens = ?, output_tokens = ?, result = ?, pushed_head_sha = ?, pushed_pr_number = ?
+         WHERE assignment_id = ? AND status = 'running'`,
         this.#stamp(), status, observed.model, observed.effort, usage?.inputTokens ?? 0, usage?.cachedInputTokens ?? 0,
-        usage?.outputTokens ?? 0, result, assignmentId,
+        usage?.outputTokens ?? 0, result, pushedHead?.sha ?? null, pushedHead?.prNumber ?? null, assignmentId,
       );
       if (blockedReply !== undefined && Number(changes) === 1) {
         this.recordOutcome(assignmentId, "waiting");
         this.#insertReply(blockedReply);
       }
     });
+  }
+
+  workerTurnPushedHead(assignmentId: number, prNumber: number, sha: string): boolean {
+    return this.#get(`SELECT 1 FROM turn WHERE assignment_id = ? AND status = 'completed'
+      AND pushed_pr_number = ? AND pushed_head_sha = ? LIMIT 1`, assignmentId, prNumber, sha) !== undefined;
   }
 
   /** Session events are activity evidence; recovery must never charge daemon downtime. */
@@ -1388,6 +1400,14 @@ export class Store {
   }
 
   // --- merge reconciliation ------------------------------------------------------------------
+
+  recordReviewRequest(repository: string, prNumber: number, headSha: string, reviewer: string): boolean {
+    const result = this.#run(
+      `INSERT OR IGNORE INTO review_request (repository, pr_number, head_sha, reviewer, requested_at)
+       VALUES (?, ?, ?, ?, ?)`, repository, prNumber, headSha, reviewer, this.#stamp(),
+    );
+    return result.changes === 1;
+  }
 
   mergeCandidate(assignmentId: number, repository: string, prNumber: number): MergeCandidate | null {
     const row = this.#get(

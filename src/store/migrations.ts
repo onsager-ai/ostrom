@@ -734,6 +734,27 @@ export const migrations: readonly string[] = [
   ALTER TABLE queued_turn_v36 RENAME TO queued_turn;
   CREATE INDEX queued_turn_unfinished ON queued_turn (assignment_id, state) WHERE state IN ('queued', 'running');
   `,
+
+  // 37: A review request is attempted at most once for each changed PR head and human reviewer.
+  `
+  CREATE TABLE review_request (
+    repository TEXT NOT NULL CHECK (repository <> ''),
+    pr_number INTEGER NOT NULL CHECK (pr_number > 0),
+    head_sha TEXT NOT NULL CHECK (head_sha <> ''),
+    reviewer TEXT NOT NULL CHECK (reviewer <> ''),
+    requested_at TEXT NOT NULL,
+    PRIMARY KEY (repository, pr_number, head_sha, reviewer)
+  ) STRICT, WITHOUT ROWID;
+  `,
+  // 38: Remember the branch head pushed by a completed Worker turn for review re-requests.
+  `ALTER TABLE turn ADD COLUMN pushed_head_sha TEXT CHECK (pushed_head_sha <> '');`,
+  // 39: Track pause requests across resumes and discard old reflog-based head evidence.
+  `
+  ALTER TABLE ticket ADD COLUMN pause_count INTEGER NOT NULL DEFAULT 0;
+  UPDATE turn SET pushed_head_sha = NULL WHERE pushed_head_sha IS NOT NULL;
+  `,
+  // 40: Review requests require evidence for the same PR as well as the same head.
+  `ALTER TABLE turn ADD COLUMN pushed_pr_number INTEGER CHECK (pushed_pr_number > 0);`,
 ];
 
 /** Applies every migration newer than the database's version. Returns the resulting version. */

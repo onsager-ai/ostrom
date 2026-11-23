@@ -58,6 +58,7 @@ export interface BranchPullRequest {
   url: string;
   state: PullRequestState;
   draft: boolean;
+  headSha?: string;
   body?: string;
 }
 
@@ -88,8 +89,10 @@ export async function pullRequestsForBranch(gh: GhRunner, repo: string, branch: 
         throw new Error(`gh pulls for ${branch}: unexpected item ${JSON.stringify(item)}`);
       }
       const state: PullRequestState = item["merged_at"] != null ? "merged" : item["state"] === "closed" ? "closed" : "open";
+      const head = item["head"] as { sha?: unknown } | null | undefined;
       return {
         number: item["number"], url: item["html_url"], state, draft: item["draft"] === true,
+        ...(typeof head?.sha === "string" && head.sha !== "" ? { headSha: head.sha } : {}),
         ...(typeof item["body"] === "string" ? { body: item["body"] } : item["body"] === null ? { body: "" } : {}),
       };
     })

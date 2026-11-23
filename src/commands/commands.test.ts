@@ -123,6 +123,7 @@ test("a collaborator with triage may pause and resume, with permissions cached f
   assert.deepEqual(pass.handled.map((item) => item.triggerId), [first, second]);
   assert.equal(store.getTicket(ticketId).state, "open");
   assert.equal(github.calls.filter((args) => args[3]?.includes("/collaborators/bob/permission")).length, 1);
+  await workers.drain();
 });
 
 test("a command without permission only gets a confused reaction", async () => {
